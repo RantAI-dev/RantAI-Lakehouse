@@ -1,0 +1,123 @@
+/**
+ * RantAI Design System — Animation & Transition Tokens
+ *
+ * Three animation layers:
+ *   1. CSS transitions — simple hover/state changes
+ *   2. tw-animate-css  — shadcn enter/exit (imported via globals.css)
+ *   3. motion/react    — complex viewport-driven animations (see components/motion.tsx)
+ *
+ * Imported automatically by globals.css — do not import directly.
+ */
+
+/* ─────────────────────────────────────────────
+   Transition speed tokens
+───────────────────────────────────────────── */
+:root {
+  --transition-fast:   150ms cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-normal: 200ms cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-slow:   300ms cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Motion/react defaults (mirrored from motion-variants.ts) */
+  --motion-duration-default: 0.6s;
+  --motion-duration-fast:    0.4s;
+  --motion-ease-default:     cubic-bezier(0, 0, 0.2, 1); /* "easeOut" */
+}
+
+/* ─────────────────────────────────────────────
+   CSS keyframes
+───────────────────────────────────────────── */
+
+/* Floating toolbar fade-in (editor) */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Generic fade-up for sections without motion/react */
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(32px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Scale-in for cards / badges */
+@keyframes scaleIn {
+  from {
+    opacity: 0;
+    transform: scale(0.9);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* ─────────────────────────────────────────────
+   Utility classes backed by keyframes above
+   Use when motion/react is not available
+───────────────────────────────────────────── */
+.animate-fade-in {
+  animation: fadeIn var(--transition-normal) both;
+}
+
+.animate-fade-in-up {
+  animation: fadeInUp 0.6s cubic-bezier(0, 0, 0.2, 1) both;
+}
+
+.animate-scale-in {
+  animation: scaleIn 0.5s cubic-bezier(0, 0, 0.2, 1) both;
+}
+
+/* ─────────────────────────────────────────────
+   tw-animate-css aliases (from shadcn)
+   These are provided automatically when you import tw-animate-css.
+   Listed here as reference — do NOT duplicate the import.
+
+   animate-in          → plays --tw-enter-* transforms
+   animate-out         → plays --tw-exit-* transforms
+   fade-in-0           → opacity 0 → current
+   zoom-in-95          → scale 0.95 → 1
+   slide-in-from-top-2 → translateY(-0.5rem) → 0
+   slide-in-from-left-2
+   slide-in-from-right-2
+   slide-in-from-bottom-2
+   duration-200        → 200ms
+───────────────────────────────────────────── */
+
+/* ─────────────────────────────────────────────
+   Interaction micro-animations (Tailwind classes)
+───────────────────────────────────────────── */
+/*
+  Hover lift (cards)       : hover:scale-105 transition-transform duration-200
+  Hover shadow             : hover:shadow-lg transition-shadow duration-200
+  Hover ring (cards)       : hover:ring-2 hover:ring-primary/30
+  Button press             : active:scale-95 active:translate-y-px
+  Button transition        : transition-all duration-150 ease-out
+  Link / text hover        : hover:text-foreground transition-colors duration-150
+*/
+
+/* ─────────────────────────────────────────────
+   motion/react viewport defaults
+   (mirrored from src/lib/motion-variants.ts)
+───────────────────────────────────────────── */
+/*
+  viewport = { once: true, margin: "-80px" }
+    → triggers when element is 80px inside the viewport,
+      fires once only (no re-trigger on scroll up)
+
+  Stagger children  : staggerChildren: 0.1, delayChildren: 0
+  FadeUp y offset   : y: 32 → 0
+  StaggerItem y     : y: 24 → 0
+  SlideIn x offset  : ±48 → 0
+*/

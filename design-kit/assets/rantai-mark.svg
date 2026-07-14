@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" role="img" aria-label="NQ">
+  <rect width="32" height="32" rx="4" fill="#ff5001"/>
+  <text
+    x="16"
+    y="21"
+    text-anchor="middle"
+    fill="#ffffff"
+    font-family="system-ui, -apple-system, sans-serif"
+    font-size="10"
+    font-weight="700"
+    letter-spacing="-0.02em"
+  >NQ</text>
+</svg>

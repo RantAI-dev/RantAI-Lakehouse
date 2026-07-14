@@ -1,0 +1,113 @@
+/**
+ * Rantai Lake — global stylesheet.
+ *
+ * All design tokens, the forced-dark theme, Tailwind @theme mappings, and the
+ * shadcn/radix-nova base come from the shared Rantai Design System.
+ */
+@import "../../design-system/globals.css";
+
+/* Legacy brand-font alias: pages using `var(--font-montserrat)` now render Geist. */
+:root {
+  --font-montserrat: var(--font-sans);
+}
+
+/**
+ * Heading + typography scale carried over from the previous app so existing
+ * bare <h1>–<h4> and utility classes keep their sizing — remapped onto the
+ * design-system font (Geist via --font-sans).
+ */
+@layer base {
+  h1 {
+    font-family: var(--font-sans);
+    font-weight: 700;
+    font-size: 48px;
+    line-height: 48px;
+    letter-spacing: -0.02em;
+  }
+  h2 {
+    font-family: var(--font-sans);
+    font-weight: 600;
+    font-size: 30px;
+    line-height: 36px;
+    letter-spacing: -0.01em;
+  }
+  h3 {
+    font-family: var(--font-sans);
+    font-weight: 600;
+    font-size: 24px;
+    line-height: 32px;
+  }
+  h4 {
+    font-family: var(--font-sans);
+    font-weight: 600;
+    font-size: 20px;
+    line-height: 28px;
+  }
+  p {
+    font-size: 16px;
+    line-height: 24px;
+  }
+  blockquote {
+    font-style: italic;
+    font-size: 16px;
+    line-height: 24px;
+  }
+  th {
+    font-weight: 500;
+    font-size: 14px;
+    line-height: 24px;
+  }
+  td {
+    font-size: 14px;
+    line-height: 24px;
+  }
+  li {
+    font-size: 16px;
+    line-height: 24px;
+  }
+  code {
+    font-family: var(--font-mono);
+    font-size: 14px;
+    line-height: 20px;
+  }
+
+  .text-lead {
+    font-size: 20px;
+    line-height: 28px;
+  }
+  .text-large {
+    font-weight: 600;
+    font-size: 18px;
+    line-height: 28px;
+  }
+  .text-small {
+    font-weight: 500;
+    font-size: 14px;
+    line-height: 14px;
+  }
+  .text-muted {
+    font-size: 14px;
+    line-height: 20px;
+    @apply text-muted-foreground;
+  }
+  .text-badge {
+    font-weight: 600;
+    font-size: 12px;
+    line-height: 16px;
+  }
+  .text-card-title {
+    font-weight: 600;
+    font-size: 24px;
+    line-height: 24px;
+  }
+  .text-kb-shortcut {
+    font-size: 12px;
+    line-height: 20px;
+  }
+  .inline-code {
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 14px;
+    line-height: 20px;
+  }
+}

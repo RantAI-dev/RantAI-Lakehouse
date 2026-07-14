@@ -1,0 +1,32 @@
+/**
+ * RantAI Design System — Typography Reference
+ *
+ * Font CSS variables are mapped in theme.css.
+ * Geist + Geist Mono are loaded via fonts/fonts.ts (next/font).
+ *
+ * Type scale (Tailwind classes):
+ *
+ *   Display hero H1
+ *     text-4xl sm:text-5xl md:text-6xl lg:text-7xl font-medium tracking-tight
+ *
+ *   Page H1
+ *     text-4xl sm:text-5xl lg:text-6xl font-medium tracking-tight
+ *
+ *   Section H2
+ *     text-3xl sm:text-4xl font-medium tracking-tight
+ *
+ *   Stats numbers
+ *     text-5xl md:text-[56px] font-medium tracking-tight
+ *
+ *   Body secondary
+ *     font-mono text-sm sm:text-lg text-muted-foreground
+ *
+ *   Meta labels
+ *     font-mono text-xs uppercase tracking-wider
+ *
+ *   UI controls
+ *     text-sm font-medium
+ *
+ *   Blog prose
+ *     prose max-w-none prose-invert prose-headings:font-medium prose-headings:tracking-tight
+ */

@@ -1,0 +1,62 @@
+{
+  "name": "@rantai/design-system",
+  "version": "1.0.0",
+  "private": true,
+  "description": "RantAI design tokens, shadcn/ui components (radix-nova), motion primitives, and fonts",
+  "type": "module",
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "exports": {
+    "./globals.css": "./globals.css",
+    "./tiptap.css": "./tiptap.css",
+    "./tokens/*": "./tokens/*",
+    "./fonts/*": "./fonts/*",
+    "./lib/*": "./lib/*",
+    "./hooks/*": "./hooks/*",
+    "./components/*": "./components/*",
+    "./ui": "./ui/index.ts",
+    "./ui/*": "./ui/*",
+    "./setup/*": "./setup/*"
+  },
+  "peerDependencies": {
+    "@radix-ui/react-icons": ">=1.3.0",
+    "@tailwindcss/postcss": "^4.0.0",
+    "@tailwindcss/typography": "^0.5.0",
+    "class-variance-authority": "^0.7.0",
+    "clsx": "^2.0.0",
+    "cmdk": "^1.0.0",
+    "date-fns": "^4.0.0",
+    "embla-carousel-react": "^8.0.0",
+    "lucide-react": ">=0.400.0",
+    "motion": "^12.0.0",
+    "next": ">=15.0.0",
+    "next-themes": "^0.4.0",
+    "radix-ui": "^1.4.0",
+    "react": ">=18.0.0",
+    "react-day-picker": "^10.0.0",
+    "react-dom": ">=18.0.0",
+    "react-resizable-panels": "^4.0.0",
+    "sonner": "^2.0.0",
+    "tailwind-merge": "^3.0.0",
+    "tailwindcss": "^4.0.0",
+    "tw-animate-css": "^1.0.0",
+    "vaul": "^1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@radix-ui/react-icons": { "optional": true },
+    "cmdk": { "optional": true },
+    "date-fns": { "optional": true },
+    "embla-carousel-react": { "optional": true },
+    "react-day-picker": { "optional": true },
+    "react-resizable-panels": { "optional": true },
+    "vaul": { "optional": true }
+  },
+  "keywords": [
+    "rantai",
+    "design-system",
+    "tailwindcss",
+    "shadcn",
+    "radix-nova"
+  ]
+}

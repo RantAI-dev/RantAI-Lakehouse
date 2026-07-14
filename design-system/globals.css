@@ -1,0 +1,37 @@
+/**
+ * RantAI Design System — Main Entry Point
+ *
+ * Import this file from your app's globals.css:
+ *   @import "../design-system/globals.css";
+ *
+ * Or copy this file to src/app/globals.css.
+ */
+
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@plugin "@tailwindcss/typography";
+
+@custom-variant dark (&:is(.dark *));
+
+@import "./tokens/colors.css";
+@import "./tokens/spacing.css";
+@import "./tokens/theme.css";
+@import "./tokens/animations.css";
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+
+  html {
+    @apply font-sans;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+}

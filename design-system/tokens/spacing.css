@@ -1,0 +1,13 @@
+/**
+ * RantAI Design System — Spacing & Radius Tokens
+ *
+ * Raw CSS variables only. Tailwind mappings live in theme.css.
+ */
+
+:root {
+  --radius: 0.45rem;
+
+  --sidebar-width:        16rem;
+  --sidebar-width-mobile: 18rem;
+  --sidebar-width-icon:    3rem;
+}

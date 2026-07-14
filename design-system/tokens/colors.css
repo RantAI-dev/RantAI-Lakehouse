@@ -1,0 +1,150 @@
+/**
+ * RantAI Design System — Color Tokens
+ *
+ * All semantic color tokens use OKLCH for perceptual uniformity.
+ * Brand colors use hex for WebGL/canvas use-cases.
+ *
+ * Imported automatically by globals.css — do not import directly.
+ */
+
+/* ─────────────────────────────────────────────
+   Light Mode (default)
+───────────────────────────────────────────── */
+:root {
+  /* Surfaces */
+  --background:         oklch(1 0 0);
+  --foreground:         oklch(0.148 0.004 228.8);
+
+  --card:               oklch(1 0 0);
+  --card-foreground:    oklch(0.148 0.004 228.8);
+
+  --popover:            oklch(1 0 0);
+  --popover-foreground: oklch(0.148 0.004 228.8);
+
+  /* Interactive */
+  --primary:            oklch(0.5 0.134 242.749);
+  --primary-foreground: oklch(0.977 0.013 236.62);
+
+  --secondary:            oklch(0.967 0.001 286.375);
+  --secondary-foreground: oklch(0.21 0.006 285.885);
+
+  --muted:            oklch(0.963 0.002 197.1);
+  --muted-foreground: oklch(0.56 0.021 213.5);
+
+  --accent:            oklch(0.963 0.002 197.1);
+  --accent-foreground: oklch(0.218 0.008 223.9);
+
+  --destructive: oklch(0.577 0.245 27.325);
+
+  /* Borders & Inputs */
+  --border: oklch(0.925 0.005 214.3);
+  --input:  oklch(0.925 0.005 214.3);
+  --ring:   oklch(0.723 0.014 214.4);
+
+  /* Data Visualization — blue scale */
+  --chart-1: oklch(0.828 0.111 230.318);
+  --chart-2: oklch(0.685 0.169 237.323);
+  --chart-3: oklch(0.588 0.158 241.966);
+  --chart-4: oklch(0.5 0.134 242.749);
+  --chart-5: oklch(0.443 0.11 240.79);
+
+  /* Sidebar */
+  --sidebar:                   oklch(0.987 0.002 197.1);
+  --sidebar-foreground:        oklch(0.148 0.004 228.8);
+  --sidebar-primary:           oklch(0.588 0.158 241.966);
+  --sidebar-primary-foreground: oklch(0.977 0.013 236.62);
+  --sidebar-accent:            oklch(0.963 0.002 197.1);
+  --sidebar-accent-foreground: oklch(0.218 0.008 223.9);
+  --sidebar-border:            oklch(0.925 0.005 214.3);
+  --sidebar-ring:              oklch(0.723 0.014 214.4);
+
+  /* Brand — hex for canvas/WebGL */
+  --brand-1: #5cb6f9;   /* sky blue highlight */
+  --brand-2: #050a30;   /* deep navy anchor */
+
+  /* Brand canvas blues (used in ColorBends WebGL backgrounds) */
+  --brand-canvas-dark:  #055794;
+  --brand-canvas-light: #5EB6FA;
+
+  /* Meta theme color (PWA / browser chrome) */
+  --meta-theme-color: #050A30;
+}
+
+/* ─────────────────────────────────────────────
+   Dark Mode
+   Applied via .dark class on <html> (next-themes)
+───────────────────────────────────────────── */
+.dark {
+  --background:         oklch(0.148 0.004 228.8);
+  --foreground:         oklch(0.987 0.002 197.1);
+
+  --card:               oklch(0.218 0.008 223.9);
+  --card-foreground:    oklch(0.987 0.002 197.1);
+
+  --popover:            oklch(0.218 0.008 223.9);
+  --popover-foreground: oklch(0.987 0.002 197.1);
+
+  --primary:            oklch(0.443 0.11 240.79);
+  --primary-foreground: oklch(0.977 0.013 236.62);
+
+  --secondary:            oklch(0.274 0.006 286.033);
+  --secondary-foreground: oklch(0.985 0 0);
+
+  --muted:            oklch(0.275 0.011 216.9);
+  --muted-foreground: oklch(0.723 0.014 214.4);
+
+  --accent:            oklch(0.275 0.011 216.9);
+  --accent-foreground: oklch(0.987 0.002 197.1);
+
+  --destructive: oklch(0.704 0.191 22.216);
+
+  --border: oklch(1 0 0 / 10%);
+  --input:  oklch(1 0 0 / 15%);
+  --ring:   oklch(0.56 0.021 213.5);
+
+  /* Charts unchanged in dark */
+  --chart-1: oklch(0.828 0.111 230.318);
+  --chart-2: oklch(0.685 0.169 237.323);
+  --chart-3: oklch(0.588 0.158 241.966);
+  --chart-4: oklch(0.5 0.134 242.749);
+  --chart-5: oklch(0.443 0.11 240.79);
+
+  --sidebar:                   oklch(0.218 0.008 223.9);
+  --sidebar-foreground:        oklch(0.987 0.002 197.1);
+  --sidebar-primary:           oklch(0.685 0.169 237.323);
+  --sidebar-primary-foreground: oklch(0.293 0.066 243.157);
+  --sidebar-accent:            oklch(0.275 0.011 216.9);
+  --sidebar-accent-foreground: oklch(0.987 0.002 197.1);
+  --sidebar-border:            oklch(1 0 0 / 10%);
+  --sidebar-ring:              oklch(0.56 0.021 213.5);
+
+  /* Brand hex tokens are unchanged in dark — defined once in :root */
+}
+
+/* ─────────────────────────────────────────────
+   Tag / Badge gradient presets
+   Use as Tailwind bg-gradient classes on elements.
+   Keys: blue | emerald | violet | amber | rose | slate
+───────────────────────────────────────────── */
+/*
+  blue    → from-blue-950 via-indigo-900 to-blue-900
+  emerald → from-emerald-950 via-teal-900 to-emerald-900
+  violet  → from-violet-950 via-purple-900 to-violet-900
+  amber   → from-amber-950 via-orange-900 to-amber-900
+  rose    → from-rose-950 via-pink-900 to-rose-900
+  slate   → from-zinc-900 via-zinc-800 to-zinc-900  (default)
+*/
+
+/* ─────────────────────────────────────────────
+   Thumbnail / avatar background presets (hex)
+───────────────────────────────────────────── */
+/*
+  #3A5A8C  steel blue
+  #8B5E3C  warm brown
+  #4A6741  forest green
+  #6B6B9A  muted violet
+  #4A5568  slate gray
+  #2C7A7B  teal
+  #7B2D3A  deep rose
+  #3D3D3D  charcoal
+*/

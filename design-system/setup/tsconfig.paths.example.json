@@ -1,0 +1,14 @@
+/**
+ * Merge these paths into your repo's tsconfig.json compilerOptions.paths.
+ *
+ * Option A — design-system at repo root (recommended):
+ */
+{
+  "compilerOptions": {
+    "paths": {
+      "@/*": ["./src/*"],
+      "@rantai/design-system": ["./design-system"],
+      "@rantai/design-system/*": ["./design-system/*"]
+    }
+  }
+}
