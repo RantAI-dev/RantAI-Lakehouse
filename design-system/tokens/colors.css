@@ -67,7 +67,7 @@
   --brand-canvas-light: #5EB6FA;
 
   /* Meta theme color (PWA / browser chrome) */
-  --meta-theme-color: #050A30;
+  --meta-theme-color: #ffffff;
 }
 
 /* ─────────────────────────────────────────────
@@ -119,6 +119,9 @@
   --sidebar-ring:              oklch(0.56 0.021 213.5);
 
   /* Brand hex tokens are unchanged in dark — defined once in :root */
+
+  /* Meta theme color (PWA / browser chrome) */
+  --meta-theme-color: #050A30;
 }
 
 /* ─────────────────────────────────────────────

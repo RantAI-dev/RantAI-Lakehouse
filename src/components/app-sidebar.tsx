@@ -1,5 +1,6 @@
 "use client"
 
+import Image from "next/image"
 import Link from "next/link"
 import { usePathname } from "next/navigation"
 import {
@@ -15,11 +16,12 @@ import {
   Library,
   Boxes,
   Brain,
-  Waves,
+  CircleUserRound,
 } from "lucide-react"
 import {
   Sidebar,
   SidebarContent,
+  SidebarFooter,
   SidebarGroup,
   SidebarGroupLabel,
   SidebarHeader,
@@ -46,7 +48,7 @@ const discoverNav = [
   { title: "Connectors", href: "/connectors", icon: Plug },
   { title: "Data Catalog", href: "/data-catalog", icon: Library },
   {
-    title: "Intellegance Knowladge",
+    title: "Intelligence Knowledge",
     href: "/intelligence-knowledge",
     icon: Brain,
   },
@@ -60,19 +62,23 @@ const adminNav = [
 ] as const
 
 /**
- * Rantai Lake brand mark shown in the sidebar header (32px).
- *
- * Uses the design-system primary color with a wave glyph to evoke the data
- * "lake". When the sidebar is collapsed to icons, the shadow is removed for a
- * cleaner appearance via `group-data-[collapsible=icon]:shadow-none`.
+ * Rantai brand mark shown in the sidebar header (32px).
+ * Uses the official logo from `/public/rantai.png`.
  */
 function BrandLogo() {
   return (
     <div
-      className="flex size-8 shrink-0 items-center justify-center overflow-hidden rounded-md bg-primary text-primary-foreground shadow-sm group-data-[collapsible=icon]:shadow-none"
+      className="relative size-8 shrink-0 overflow-hidden rounded-md"
       aria-hidden
     >
-      <Waves className="size-4.5" strokeWidth={2.5} />
+      <Image
+        src="/rantai.png"
+        alt=""
+        fill
+        sizes="32px"
+        className="object-cover"
+        priority
+      />
     </div>
   )
 }
@@ -97,17 +103,17 @@ export function AppSidebar() {
     <Sidebar
       collapsible="icon"
       side="left"
-      className="border-r border-sidebar-border bg-sidebar font-[family-name:var(--font-montserrat)] shadow-[0px_1px_2px_0px_rgba(0,0,0,0.05)]"
+      className="border-r border-sidebar-border bg-sidebar font-[family-name:var(--font-montserrat)] shadow-sm"
     >
-      <SidebarHeader className="flex flex-col border-b border-sidebar-border px-4 py-3 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-2 group-data-[collapsible=icon]:py-2">
+      <SidebarHeader className="flex flex-col border-b border-sidebar-border px-3 py-2.5 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-2 group-data-[collapsible=icon]:py-2">
         <div className="flex h-12 min-w-0 items-center justify-start gap-2 group-data-[collapsible=icon]:h-auto group-data-[collapsible=icon]:justify-center">
           <BrandLogo />
           <div className="grid min-w-0 flex-1 gap-0.5 leading-none group-data-[collapsible=icon]:hidden">
-            <span className="text-sm font-medium tracking-[-0.084px] text-sidebar-foreground">
-              Rantai
+            <span className="text-sm font-semibold tracking-[-0.084px] text-sidebar-foreground">
+              Rantai Lake
             </span>
-            <span className="text-xs font-normal tracking-[-0.072px] text-sidebar-foreground">
-              Lake
+            <span className="text-[11px] font-normal tracking-[-0.04px] text-sidebar-foreground/60">
+              Data Intelligence Platform
             </span>
           </div>
         </div>
@@ -131,9 +137,9 @@ export function AppSidebar() {
                     isActive={isActive}
                     tooltip={item.title}
                     className={cn(
-                      "h-8 rounded-md px-2 py-1.5 text-sm font-normal tracking-normal text-sidebar-foreground",
+                      "h-9 rounded-md px-2.5 py-1.5 text-sm font-normal tracking-normal text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
                       isActive &&
-                        "border border-sidebar-border bg-sidebar text-primary dark:border-sidebar-border dark:bg-sidebar-accent dark:text-sidebar-primary"
+                        "bg-sidebar-accent font-medium text-sidebar-primary shadow-sm ring-1 ring-sidebar-border"
                     )}
                     render={
                       <Link href={item.href}>
@@ -163,9 +169,9 @@ export function AppSidebar() {
                     isActive={isActive}
                     tooltip={item.title}
                     className={cn(
-                      "h-8 rounded-md px-2 py-1.5 text-sm font-normal tracking-normal text-sidebar-foreground",
+                      "h-9 rounded-md px-2.5 py-1.5 text-sm font-normal tracking-normal text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
                       isActive &&
-                        "border border-sidebar-border bg-sidebar text-primary dark:border-sidebar-border dark:bg-sidebar-accent dark:text-sidebar-primary"
+                        "bg-sidebar-accent font-medium text-sidebar-primary shadow-sm ring-1 ring-sidebar-border"
                     )}
                     render={
                       <Link href={item.href}>
@@ -193,9 +199,9 @@ export function AppSidebar() {
                     isActive={isActive}
                     tooltip={item.title}
                     className={cn(
-                      "h-8 rounded-md px-2 py-1.5 text-sm font-normal tracking-normal text-sidebar-foreground",
+                      "h-9 rounded-md px-2.5 py-1.5 text-sm font-normal tracking-normal text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
                       isActive &&
-                        "border border-sidebar-border bg-sidebar text-primary dark:border-sidebar-border dark:bg-sidebar-accent dark:text-sidebar-primary"
+                        "bg-sidebar-accent font-medium text-sidebar-primary shadow-sm ring-1 ring-sidebar-border"
                     )}
                     render={
                       <Link href={item.href}>
@@ -210,6 +216,33 @@ export function AppSidebar() {
           </SidebarMenu>
         </SidebarGroup>
       </SidebarContent>
+      <SidebarFooter className="border-t border-sidebar-border p-2">
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              size="lg"
+              tooltip="Admin User"
+              className="h-14 rounded-lg px-2 hover:bg-sidebar-accent group-data-[collapsible=icon]:size-10! group-data-[collapsible=icon]:h-10!"
+              render={
+                <div role="group" aria-label="Current user">
+                  <div className="relative flex size-9 shrink-0 items-center justify-center rounded-full bg-primary/12 text-primary ring-1 ring-primary/20">
+                    <CircleUserRound className="size-5" aria-hidden />
+                    <span className="absolute bottom-0 right-0 size-2.5 rounded-full border-2 border-sidebar bg-emerald-500" />
+                  </div>
+                  <div className="grid min-w-0 flex-1 text-left leading-tight group-data-[collapsible=icon]:hidden">
+                    <span className="truncate text-sm font-semibold text-sidebar-foreground">
+                      Admin User
+                    </span>
+                    <span className="truncate text-xs text-sidebar-foreground/60">
+                      admin@rantai.id
+                    </span>
+                  </div>
+                </div>
+              }
+            />
+          </SidebarMenuItem>
+        </SidebarMenu>
+      </SidebarFooter>
       <SidebarRail />
     </Sidebar>
   )

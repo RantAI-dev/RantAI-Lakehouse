@@ -1,7 +1,7 @@
 "use client"
 
 import Link from "next/link"
-import { useMemo, useState } from "react"
+import { useCallback, useMemo, useRef, useState } from "react"
 import { useParams } from "next/navigation"
 import {
   ArrowLeft,
@@ -9,6 +9,7 @@ import {
   Loader2,
   Play,
   Sparkles,
+  Terminal,
   Users,
 } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
@@ -22,7 +23,14 @@ import {
   BreadcrumbSeparator,
 } from "@/components/ui/breadcrumb"
 import { Card, CardContent, CardHeader } from "@/components/ui/card"
-import { Input } from "@/components/ui/input"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   Table,
@@ -33,6 +41,7 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { SqlEditor } from "@/components/sql-editor"
+import { NaturalLanguageChat } from "@/components/query-studio/natural-language-chat"
 import {
   getCollaborationProjectById,
   type Collaborator,
@@ -69,14 +78,53 @@ export default function CollaborativeQueryStudioPage() {
   )
 
   const [tab, setTab] = useState(TAB_NL)
-  const [nlPrompt, setNlPrompt] = useState("")
-  const [nlRunning, setNlRunning] = useState(false)
-  const [nlResult, setNlResult] = useState<string | null>(null)
   const [sqlQuery, setSqlQuery] = useState(SAMPLE_SQL)
+  const sqlDirtyRef = useRef(false)
+  const [pendingSqlLoad, setPendingSqlLoad] = useState<string | null>(null)
   const [sqlRunning, setSqlRunning] = useState(false)
   const [sqlRows, setSqlRows] = useState<
     Array<{ customer_id: string; total_amount: string; orders: number }>
   >([])
+
+  const handleSqlChange = useCallback((v: string) => {
+    sqlDirtyRef.current = true
+    setSqlQuery(v)
+  }, [])
+
+  const applySqlLoad = useCallback((sql: string) => {
+    setSqlQuery(sql)
+    sqlDirtyRef.current = false
+    setTab(TAB_SQL)
+  }, [])
+
+  /** Open in SQL Editor — never auto-runs; confirms before overwriting dirty edits. */
+  const requestOpenInEditor = useCallback(
+    (sql: string) => {
+      const current = sqlQuery.trim()
+      const hasUnsavedWork =
+        sqlDirtyRef.current && current !== "" && current !== sql.trim()
+      if (hasUnsavedWork) {
+        setPendingSqlLoad(sql)
+      } else {
+        applySqlLoad(sql)
+      }
+    },
+    [applySqlLoad, sqlQuery]
+  )
+
+  const runSql = () => {
+    if (sqlRunning) return
+    setSqlRunning(true)
+    setSqlRows([])
+    window.setTimeout(() => {
+      setSqlRows([
+        { customer_id: "C-1042", total_amount: "182340.20", orders: 53 },
+        { customer_id: "C-552", total_amount: "149002.51", orders: 49 },
+        { customer_id: "C-2201", total_amount: "121442.18", orders: 37 },
+      ])
+      setSqlRunning(false)
+    }, 1300)
+  }
 
   if (!project) {
     return (
@@ -92,33 +140,6 @@ export default function CollaborativeQueryStudioPage() {
         </CardContent>
       </Card>
     )
-  }
-
-  const runNl = () => {
-    const q = nlPrompt.trim()
-    if (!q || nlRunning) return
-    setNlRunning(true)
-    setNlResult(null)
-    window.setTimeout(() => {
-      setNlRunning(false)
-      setNlResult(
-        `Result preview for "${q}": 3 segments identified with strongest change in the last 30 days.`
-      )
-    }, 1500)
-  }
-
-  const runSql = () => {
-    if (sqlRunning) return
-    setSqlRunning(true)
-    setSqlRows([])
-    window.setTimeout(() => {
-      setSqlRows([
-        { customer_id: "C-1042", total_amount: "182340.20", orders: 53 },
-        { customer_id: "C-552", total_amount: "149002.51", orders: 49 },
-        { customer_id: "C-2201", total_amount: "121442.18", orders: 37 },
-      ])
-      setSqlRunning(false)
-    }, 1300)
   }
 
   return (
@@ -154,7 +175,7 @@ export default function CollaborativeQueryStudioPage() {
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
-        <div className="space-y-4">
+        <div className="min-w-0 space-y-4">
           <Card className="rounded-lg border border-border bg-card shadow-[0px_1px_2px_0px_rgba(0,0,0,0.05)]">
             <CardHeader className="border-b border-border">
               <h2 className="text-base font-medium text-primary">Query workspace</h2>
@@ -162,42 +183,43 @@ export default function CollaborativeQueryStudioPage() {
             <CardContent className="p-4">
               <Tabs value={tab} onValueChange={setTab} className="space-y-4">
                 <TabsList className="h-auto min-h-9 gap-1 rounded-md bg-secondary p-1">
-                  <TabsTrigger value={TAB_NL} className="gap-2 rounded px-3 py-2 text-xs">
+                  <TabsTrigger
+                    value={TAB_NL}
+                    className="gap-2 rounded px-3 py-2 text-xs data-active:bg-background data-active:text-primary data-active:shadow-sm sm:text-sm"
+                  >
                     <Sparkles className="size-4" />
                     Natural language
                   </TabsTrigger>
-                  <TabsTrigger value={TAB_SQL} className="gap-2 rounded px-3 py-2 text-xs">
+                  <TabsTrigger
+                    value={TAB_SQL}
+                    className="gap-2 rounded px-3 py-2 text-xs data-active:bg-background data-active:text-primary data-active:shadow-sm sm:text-sm"
+                  >
+                    <Terminal className="size-4" />
                     SQL editor
                   </TabsTrigger>
                 </TabsList>
 
-                <TabsContent value={TAB_NL} className="space-y-3">
-                  <Input
-                    value={nlPrompt}
-                    onChange={(e) => setNlPrompt(e.target.value)}
-                    placeholder="Ask in natural language within this project context..."
+                <TabsContent
+                  value={TAB_NL}
+                  className="mt-0 flex min-h-[min(560px,calc(100dvh-22rem))] flex-col data-[state=inactive]:hidden"
+                >
+                  <NaturalLanguageChat
+                    onOpenInEditor={requestOpenInEditor}
+                    emptyDescription={`Describe the data you need in plain language for “${project.name}”. The AI drafts the SQL — run it here, or open it in the SQL editor so the team can refine it together.`}
                   />
-                  <div className="flex justify-end">
-                    <Button onClick={runNl} disabled={!nlPrompt.trim() || nlRunning}>
-                      {nlRunning ? (
-                        <Loader2 className="size-4 animate-spin" />
-                      ) : (
-                        <Play className="size-4" />
-                      )}
-                      Run NL Query
-                    </Button>
-                  </div>
-                  {nlResult && (
-                    <div className="rounded-md border border-border bg-muted/20 p-3 text-sm text-foreground">
-                      {nlResult}
-                    </div>
-                  )}
                 </TabsContent>
 
-                <TabsContent value={TAB_SQL} className="space-y-3">
-                  <SqlEditor value={sqlQuery} onChange={setSqlQuery} minHeight="230px" />
+                <TabsContent
+                  value={TAB_SQL}
+                  className="mt-0 space-y-3 data-[state=inactive]:hidden"
+                >
+                  <SqlEditor
+                    value={sqlQuery}
+                    onChange={handleSqlChange}
+                    minHeight="230px"
+                  />
                   <div className="flex justify-end">
-                    <Button onClick={runSql} disabled={sqlRunning}>
+                    <Button onClick={runSql} disabled={sqlRunning || !sqlQuery.trim()}>
                       {sqlRunning ? (
                         <Loader2 className="size-4 animate-spin" />
                       ) : (
@@ -218,7 +240,10 @@ export default function CollaborativeQueryStudioPage() {
                       <TableBody>
                         {sqlRows.length === 0 ? (
                           <TableRow>
-                            <TableCell colSpan={3} className="text-center text-muted-foreground">
+                            <TableCell
+                              colSpan={3}
+                              className="text-center text-muted-foreground"
+                            >
                               {sqlRunning ? "Running query..." : "Run SQL to see rows."}
                             </TableCell>
                           </TableRow>
@@ -314,6 +339,46 @@ export default function CollaborativeQueryStudioPage() {
           </Card>
         </div>
       </div>
+
+      <Dialog
+        open={pendingSqlLoad !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingSqlLoad(null)
+        }}
+      >
+        <DialogContent className="sm:max-w-md" showCloseButton={false}>
+          <DialogHeader>
+            <DialogTitle>Replace the current SQL?</DialogTitle>
+            <DialogDescription>
+              The SQL editor has unsaved changes. Opening this query will
+              overwrite what you&apos;re working on.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="px-5 py-4">
+            <pre className="max-h-36 overflow-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-xs leading-relaxed text-muted-foreground">
+              {pendingSqlLoad ?? ""}
+            </pre>
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setPendingSqlLoad(null)}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              onClick={() => {
+                if (pendingSqlLoad !== null) applySqlLoad(pendingSqlLoad)
+                setPendingSqlLoad(null)
+              }}
+            >
+              Replace query
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

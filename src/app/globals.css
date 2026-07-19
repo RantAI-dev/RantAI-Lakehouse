@@ -1,7 +1,7 @@
 /**
  * Rantai Lake — global stylesheet.
  *
- * All design tokens, the forced-dark theme, Tailwind @theme mappings, and the
+ * All design tokens (light + dark), Tailwind @theme mappings, and the
  * shadcn/radix-nova base come from the shared Rantai Design System.
  */
 @import "../../design-system/globals.css";

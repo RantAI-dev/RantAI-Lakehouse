@@ -6,15 +6,15 @@ import { ThemeProvider as NextThemesProvider } from "next-themes";
 type ThemeProviderProps = React.ComponentProps<typeof NextThemesProvider>;
 
 /**
- * RantAI default theme provider — dark mode.
- * Remove `forcedTheme` to allow light/dark toggle.
+ * RantAI theme provider — light/dark via `next-themes` class strategy.
+ * Pass `forcedTheme` to lock a single mode when needed.
  */
 export function ThemeProvider({ children, ...props }: ThemeProviderProps) {
   return (
     <NextThemesProvider
       attribute="class"
       defaultTheme="dark"
-      forcedTheme="dark"
+      enableSystem
       disableTransitionOnChange
       {...props}
     >
