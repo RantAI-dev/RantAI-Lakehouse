@@ -3,8 +3,8 @@ import { geist, geistMono } from "@rantai/design-system/fonts/fonts";
 import { ThemeProvider } from "@rantai/design-system/components/theme-provider";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
-import { AppSidebar } from "@/components/app-sidebar";
-import { AppNavbar } from "@/components/app-navbar";
+import { AppSidebar } from "@/components/app-shell/app-sidebar";
+import { AppNavbar } from "@/components/app-shell/app-navbar";
 import "./globals.css";
 
 export const metadata: Metadata = {

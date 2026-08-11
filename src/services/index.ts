@@ -1,0 +1,29 @@
+/**
+ * Service registry — pages import from here, never from mock modules directly.
+ * Swap `mock*` for HTTP/Flight adapters when backends are ready.
+ */
+import { mockOverviewService } from "./mock/overview"
+import { mockAssetService } from "./mock/assets"
+import { mockPipelineService } from "./mock/pipelines"
+import { mockStreamingService } from "./mock/streaming"
+import { mockQueryService } from "./mock/queries"
+import { mockKnowledgeService } from "./mock/knowledge"
+import { mockAgentService } from "./mock/agents"
+import { mockGovernanceService } from "./mock/governance"
+import { mockOpsService } from "./mock/ops"
+import { mockIdentityService } from "./mock/identity"
+import { mockConnectorService } from "./mock/connectors"
+import { mockStorageService } from "./mock/storage"
+
+export const overviewService = mockOverviewService
+export const assetService = mockAssetService
+export const pipelineService = mockPipelineService
+export const streamingService = mockStreamingService
+export const queryService = mockQueryService
+export const knowledgeService = mockKnowledgeService
+export const agentService = mockAgentService
+export const governanceService = mockGovernanceService
+export const opsService = mockOpsService
+export const identityService = mockIdentityService
+export const connectorService = mockConnectorService
+export const storageService = mockStorageService

@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation"
 
-/** Old route — combined with semantic search. */
-export default function SimilarityExplorerRedirectPage() {
+/** Legacy route compatibility redirect. */
+export default function LegacyRedirect() {
   redirect("/semantic-search")
 }
