@@ -15,6 +15,7 @@ export function SectionCard({
   children,
   className,
   contentClassName,
+  size = "default",
 }: {
   title: string
   description?: string
@@ -22,9 +23,13 @@ export function SectionCard({
   children: React.ReactNode
   className?: string
   contentClassName?: string
+  size?: "default" | "sm"
 }) {
   return (
-    <Card className={cn("shadow-[0px_1px_2px_0px_rgba(0,0,0,0.05)]", className)}>
+    <Card
+      size={size}
+      className={cn("shadow-[0px_1px_2px_0px_rgba(0,0,0,0.05)]", className)}
+    >
       <CardHeader className="flex flex-row items-start justify-between gap-3 space-y-0">
         <div className="min-w-0">
           <CardTitle className="text-base font-semibold leading-6">

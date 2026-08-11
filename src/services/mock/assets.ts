@@ -345,9 +345,9 @@ function buildDetail(asset: Asset): AssetDetail {
       { id: "q3", name: "Freshness within SLA", dimension: "Freshness", status: asset.freshnessLagSeconds > 3600 ? "failed" : "passed", lastRun: agoIso(15) },
     ],
     policySummary: [
-      { id: "p1", name: "Tenant row isolation", effect: "Row filter by tenant_id" },
-      { id: "p2", name: `${asset.classification} column masking`, effect: "Masks contact and amount columns for non-privileged roles" },
-      { id: "p3", name: "Residency", effect: `Scans restricted to ${asset.residency}` },
+      { id: "pol-1", name: "Tenant row isolation", effect: "Row filter by tenant_id" },
+      { id: "pol-2", name: `${asset.classification} column masking`, effect: "Masks contact and amount columns for non-privileged roles" },
+      { id: "pol-residency", name: "Residency", effect: `Scans restricted to ${asset.residency}` },
     ],
     usage: {
       queries7d: 400 + (h % 4200),
@@ -355,13 +355,13 @@ function buildDetail(asset: Asset): AssetDetail {
       avgLatencyMs: 120 + (h % 700),
     },
     recentQueries: [
-      { id: "rq1", sql: `SELECT status, count() FROM ${asset.name} GROUP BY status`, user: "Rina Wijaya", at: agoIso(35) },
-      { id: "rq2", sql: `SELECT * FROM ${asset.name} WHERE created_at > now() - INTERVAL 1 DAY LIMIT 100`, user: "Bayu Pratama", at: agoIso(120) },
+      { id: "qh-1", sql: `SELECT status, count() FROM ${asset.name} GROUP BY status`, user: "Rina Wijaya", at: agoIso(35) },
+      { id: "qh-2", sql: `SELECT * FROM ${asset.name} WHERE created_at > now() - INTERVAL 1 DAY LIMIT 100`, user: "Bayu Pratama", at: agoIso(120) },
     ],
     dependents: [
-      { id: "dep1", name: "orders_hourly_rollup", kind: "Pipeline" },
-      { id: "dep2", name: "exec-revenue-dashboard", kind: "Dashboard query" },
-      { id: "dep3", name: "collections-copilot", kind: "Agent (retrieval)" },
+      { id: "pl-orders-rollup", name: "orders_hourly_rollup", kind: "Pipeline" },
+      { id: "sq-1", name: "exec-revenue-dashboard", kind: "Dashboard query" },
+      { id: "emp-collections", name: "collections-copilot", kind: "Agent (retrieval)" },
     ],
     changeHistory: [
       { id: "ch1", at: daysAgoIso(2), actor: "Bayu Pratama", summary: "Added column email_verified (Bool)" },

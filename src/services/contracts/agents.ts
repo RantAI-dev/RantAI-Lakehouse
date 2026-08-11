@@ -51,6 +51,7 @@ export type AgentRun = {
     detail: string
   }[]
   approvals: { id: string; status: ApprovalStatus; at?: string }[]
+  auditEventId?: string
 }
 
 export type AgentTool = {
@@ -70,10 +71,53 @@ export type ApprovalItem = {
   id: string
   employeeId: string
   employeeName: string
+  runId?: string
+  workflowId?: string
   action: string
+  resource?: string
+  reason?: string
+  impact?: string
+  evidence?: string[]
+  policy?: string
+  costEstimate?: number
+  expiresAt?: string
   requestedAt: string
   status: ApprovalStatus
   risk: string
+  decidedAt?: string
+  comment?: string
+  auditEventId?: string
+}
+
+export type DecideApprovalInput = {
+  decision: "approved" | "rejected"
+  comment?: string
+}
+
+export type CreateWorkflowInput = {
+  name: string
+  trigger: string
+  stepKinds: string[]
+  approvalRequired: boolean
+  owner?: string
+}
+
+export type CreateEmployeeInput = {
+  name: string
+  purpose: string
+  autonomy: AutonomyLevel
+  allowedTools: string[]
+  dataScope: string
+  budgetLimit: number
+  owner?: string
+}
+
+export type RegisterToolInput = {
+  name: string
+  version: string
+  publisher: string
+  permission: string
+  rateLimit: string
 }
 
 export interface AgentService {
@@ -84,4 +128,18 @@ export interface AgentService {
   getRun(id: string, signal?: AbortSignal): Promise<AgentRun>
   listTools(signal?: AbortSignal): Promise<AgentTool[]>
   listApprovals(employeeId?: string, signal?: AbortSignal): Promise<ApprovalItem[]>
+  decideApproval(
+    id: string,
+    input: DecideApprovalInput,
+    signal?: AbortSignal
+  ): Promise<ApprovalItem>
+  createWorkflow(input: CreateWorkflowInput, signal?: AbortSignal): Promise<AgentWorkflow>
+  createEmployee(
+    input: CreateEmployeeInput,
+    signal?: AbortSignal
+  ): Promise<DigitalEmployee>
+  registerTool(input: RegisterToolInput, signal?: AbortSignal): Promise<AgentTool>
+  suspendEmployee(id: string, signal?: AbortSignal): Promise<DigitalEmployee>
+  resumeEmployee(id: string, signal?: AbortSignal): Promise<DigitalEmployee>
+  revokeEmployee(id: string, signal?: AbortSignal): Promise<DigitalEmployee>
 }

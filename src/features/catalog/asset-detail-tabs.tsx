@@ -1,8 +1,10 @@
 "use client"
 
+import Link from "next/link"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { CheckBadge, Pill } from "@/components/patterns/status-badge"
+import { Button } from "@/components/ui/button"
 import {
   Table,
   TableBody,
@@ -16,7 +18,16 @@ import { formatCompactNumber, formatRelativeTime } from "@/lib/format"
 import type { AssetDetail } from "@/services/contracts/assets"
 
 function QuietEmpty({ title }: { title: string }) {
-  return <EmptyState title={title} className="py-8" />
+  return <EmptyState title={title} className="py-4" />
+}
+
+function dependentHref(id: string, kind: string) {
+  if (kind.toLowerCase().includes("pipeline")) return `/pipelines/${id}`
+  if (kind.toLowerCase().includes("agent")) return `/agents/employees/${id}`
+  if (kind.toLowerCase().includes("dashboard") || kind.toLowerCase().includes("query")) {
+    return `/query-studio?saved=${id}`
+  }
+  return `/data/assets/${id}`
 }
 
 /** Tab strip for the asset detail page: schema, sample, quality, and metadata. */
@@ -24,7 +35,7 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
   const sampleColumns = Object.keys(a.sample[0] ?? {})
 
   return (
-    <Tabs defaultValue="schema">
+    <Tabs defaultValue="schema" className="gap-1.5">
       <TabsList>
         <TabsTrigger value="schema">Schema</TabsTrigger>
         <TabsTrigger value="sample">Sample</TabsTrigger>
@@ -37,14 +48,14 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
         <TabsTrigger value="usage">Usage</TabsTrigger>
       </TabsList>
 
-      <TabsContent value="schema" className="mt-3 flex flex-col gap-3">
-        <SectionCard title="Columns">
+      <TabsContent value="schema" className="mt-2 flex flex-col gap-2">
+        <SectionCard size="sm" title="Columns">
           {a.schema.length === 0 ? (
             <QuietEmpty title="No columns registered" />
           ) : (
             <ul className="divide-y divide-border text-sm">
               {a.schema.map((c) => (
-                <li key={c.name} className="flex flex-wrap gap-2 py-2">
+                <li key={c.name} className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 py-1.5">
                   <span className="font-mono font-medium">{c.name}</span>
                   <span className="text-muted-foreground">{c.dataType}</span>
                   {c.masked ? (
@@ -61,6 +72,7 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
           )}
         </SectionCard>
         <SectionCard
+          size="sm"
           title="Schema versions"
           description="Registered schema changes, most recent first."
         >
@@ -69,7 +81,7 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
           ) : (
             <ul className="divide-y divide-border text-sm">
               {a.schemaVersions.map((v) => (
-                <li key={v.version} className="flex flex-wrap items-baseline gap-2 py-2">
+                <li key={v.version} className="flex flex-wrap items-baseline gap-2 py-1.5">
                   <span className="font-mono text-xs text-muted-foreground">
                     v{v.version}
                   </span>
@@ -84,8 +96,9 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
         </SectionCard>
       </TabsContent>
 
-      <TabsContent value="sample" className="mt-3">
+      <TabsContent value="sample" className="mt-2">
         <SectionCard
+          size="sm"
           title="Sample rows"
           description="Masked values applied where policy requires."
         >
@@ -107,7 +120,7 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
                   {a.sample.map((row, i) => (
                     <TableRow key={i}>
                       {sampleColumns.map((col) => (
-                        <TableCell key={col} className="py-2 font-mono text-xs">
+                        <TableCell key={col} className="py-1.5 font-mono text-xs">
                           {row[col] ?? "—"}
                         </TableCell>
                       ))}
@@ -120,14 +133,23 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
         </SectionCard>
       </TabsContent>
 
-      <TabsContent value="quality" className="mt-3">
-        <SectionCard title="Quality checks">
+      <TabsContent value="quality" className="mt-2">
+        <SectionCard
+          size="sm"
+          title="Quality checks"
+          description="Rules evaluated against this asset."
+          action={
+            <Button size="sm" variant="outline" render={<Link href="/governance/data-quality" />}>
+              Open data quality
+            </Button>
+          }
+        >
           {a.qualityChecks.length === 0 ? (
             <QuietEmpty title="No quality checks configured" />
           ) : (
             <ul className="divide-y divide-border text-sm">
               {a.qualityChecks.map((q) => (
-                <li key={q.id} className="flex flex-wrap items-center gap-2 py-2">
+                <li key={q.id} className="flex flex-wrap items-center gap-2 py-1.5">
                   <span>
                     {q.name} · <span className="text-muted-foreground">{q.dimension}</span>
                   </span>
@@ -144,18 +166,29 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
         </SectionCard>
       </TabsContent>
 
-      <TabsContent value="policies" className="mt-3">
+      <TabsContent value="policies" className="mt-2">
         <SectionCard
+          size="sm"
           title="Policies"
           description="Access, masking, and residency rules applied to this asset."
+          action={
+            <Button size="sm" variant="outline" render={<Link href="/governance/policies" />}>
+              Open policies
+            </Button>
+          }
         >
           {a.policySummary.length === 0 ? (
             <QuietEmpty title="No policies applied" />
           ) : (
             <ul className="divide-y divide-border text-sm">
               {a.policySummary.map((p) => (
-                <li key={p.id} className="py-2">
-                  <p className="font-medium">{p.name}</p>
+                <li key={p.id} className="py-1.5">
+                  <Link
+                    href={`/governance/policies?id=${p.id}`}
+                    className="font-medium text-primary hover:underline"
+                  >
+                    {p.name}
+                  </Link>
                   <p className="text-xs text-muted-foreground">{p.effect}</p>
                 </li>
               ))}
@@ -164,26 +197,55 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
         </SectionCard>
       </TabsContent>
 
-      <TabsContent value="lineage" className="mt-3">
-        <div className="grid gap-3 lg:grid-cols-2">
-          <SectionCard title="Upstream">
+      <TabsContent value="lineage" className="mt-2">
+        <div className="mb-2 flex flex-wrap gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            render={<Link href={`/lineage?focus=${a.id}`} />}
+          >
+            Open lineage graph
+          </Button>
+          <Button size="sm" variant="ghost" render={<Link href="/storage" />}>
+            Storage lifecycle
+          </Button>
+          <Button size="sm" variant="ghost" render={<Link href="/query-studio" />}>
+            Query this asset
+          </Button>
+        </div>
+        <div className="grid gap-2 lg:grid-cols-2">
+          <SectionCard size="sm" title="Upstream">
             {a.upstream.length === 0 ? (
               <QuietEmpty title="No upstream assets" />
             ) : (
               <ul className="space-y-1 text-sm">
                 {a.upstream.map((u) => (
-                  <li key={u.id}>{u.name}</li>
+                  <li key={u.id}>
+                    <Link
+                      href={`/data/assets/${u.id}`}
+                      className="text-primary hover:underline"
+                    >
+                      {u.name}
+                    </Link>
+                  </li>
                 ))}
               </ul>
             )}
           </SectionCard>
-          <SectionCard title="Downstream">
+          <SectionCard size="sm" title="Downstream">
             {a.downstream.length === 0 ? (
               <QuietEmpty title="No downstream assets" />
             ) : (
               <ul className="space-y-1 text-sm">
                 {a.downstream.map((u) => (
-                  <li key={u.id}>{u.name}</li>
+                  <li key={u.id}>
+                    <Link
+                      href={`/data/assets/${u.id}`}
+                      className="text-primary hover:underline"
+                    >
+                      {u.name}
+                    </Link>
+                  </li>
                 ))}
               </ul>
             )}
@@ -191,8 +253,9 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
         </div>
       </TabsContent>
 
-      <TabsContent value="dependents" className="mt-3">
+      <TabsContent value="dependents" className="mt-2">
         <SectionCard
+          size="sm"
           title="Dependents"
           description="Pipelines, dashboards, and agents consuming this asset."
         >
@@ -201,8 +264,13 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
           ) : (
             <ul className="divide-y divide-border text-sm">
               {a.dependents.map((d) => (
-                <li key={d.id} className="flex items-center gap-2 py-2">
-                  <span className="font-mono">{d.name}</span>
+                <li key={d.id} className="flex items-center gap-2 py-1.5">
+                  <Link
+                    href={dependentHref(d.id, d.kind)}
+                    className="font-mono text-primary hover:underline"
+                  >
+                    {d.name}
+                  </Link>
                   <Pill tone="neutral" className="ml-auto">
                     {d.kind}
                   </Pill>
@@ -213,14 +281,14 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
         </SectionCard>
       </TabsContent>
 
-      <TabsContent value="history" className="mt-3">
-        <SectionCard title="Change history">
+      <TabsContent value="history" className="mt-2">
+        <SectionCard size="sm" title="Change history">
           {a.changeHistory.length === 0 ? (
             <QuietEmpty title="No changes recorded" />
           ) : (
             <ul className="divide-y divide-border text-sm">
               {a.changeHistory.map((c) => (
-                <li key={c.id} className="flex flex-wrap items-baseline gap-2 py-2">
+                <li key={c.id} className="flex flex-wrap items-baseline gap-2 py-1.5">
                   <span className="font-medium">{c.actor}</span>
                   <span className="text-muted-foreground">{c.summary}</span>
                   <span className="ml-auto text-xs text-muted-foreground">
@@ -233,14 +301,14 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
         </SectionCard>
       </TabsContent>
 
-      <TabsContent value="snapshots" className="mt-3">
-        <SectionCard title="Snapshots / time travel">
+      <TabsContent value="snapshots" className="mt-2">
+        <SectionCard size="sm" title="Snapshots / time travel">
           {a.snapshots.length === 0 ? (
             <QuietEmpty title="No snapshots for this asset" />
           ) : (
             <ul className="divide-y divide-border text-sm">
               {a.snapshots.map((s) => (
-                <li key={s.id} className="flex justify-between gap-2 py-2">
+                <li key={s.id} className="flex justify-between gap-2 py-1.5">
                   <span>{s.operation}</span>
                   <span className="text-muted-foreground">
                     {formatRelativeTime(s.committedAt)} ·{" "}
@@ -253,8 +321,8 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
         </SectionCard>
       </TabsContent>
 
-      <TabsContent value="usage" className="mt-3">
-        <SectionCard title="Usage (7d)">
+      <TabsContent value="usage" className="mt-2">
+        <SectionCard size="sm" title="Usage (7d)">
           <p className="text-sm">
             {a.usage.queries7d} queries · {a.usage.users7d} users · avg{" "}
             {a.usage.avgLatencyMs} ms
@@ -262,10 +330,16 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
           {a.recentQueries.length === 0 ? (
             <QuietEmpty title="No recent queries" />
           ) : (
-            <ul className="mt-3 space-y-2 text-sm">
+            <ul className="mt-2 space-y-1.5 text-sm">
               {a.recentQueries.map((q) => (
-                <li key={q.id} className="font-mono text-xs text-muted-foreground">
-                  {q.sql}
+                <li key={q.id} className="flex flex-wrap items-center gap-2">
+                  <span className="font-mono text-xs text-muted-foreground">{q.sql}</span>
+                  <Link
+                    href={`/audit?event=aud-query-${q.id}`}
+                    className="ml-auto text-xs text-primary hover:underline"
+                  >
+                    Audit
+                  </Link>
                 </li>
               ))}
             </ul>

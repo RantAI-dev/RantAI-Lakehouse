@@ -1,5 +1,6 @@
 "use client"
 
+import Link from "next/link"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { StatusBadge } from "@/components/patterns/status-badge"
@@ -71,11 +72,11 @@ export function HistoryQuickList({
         ) : (
           <ul className="space-y-1">
             {state.data.slice(0, MAX_ITEMS).map((h) => (
-              <li key={h.id}>
+              <li key={h.id} className="rounded-md px-2 py-1.5 hover:bg-muted">
                 <button
                   type="button"
                   onClick={() => onLoadSql(h.sql)}
-                  className="flex w-full flex-col gap-1 rounded-md px-2 py-1.5 text-left hover:bg-muted"
+                  className="flex w-full flex-col gap-1 text-left"
                 >
                   <span className="flex items-center gap-2 text-xs text-muted-foreground">
                     <StatusBadge status={h.status} />
@@ -85,6 +86,15 @@ export function HistoryQuickList({
                   </span>
                   <span className="truncate font-mono text-xs">{h.sql}</span>
                 </button>
+                {h.auditEventId ? (
+                  <Link
+                    href={`/audit?event=${h.auditEventId}`}
+                    className="mt-1 inline-block text-xs text-primary hover:underline"
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    Audit
+                  </Link>
+                ) : null}
               </li>
             ))}
           </ul>

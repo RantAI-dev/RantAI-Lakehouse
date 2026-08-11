@@ -32,8 +32,9 @@ export function AssetDetailPage() {
   const a = state.data
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-3">
       <EntityHeader
+        className="pb-3"
         eyebrow={<Link href="/data" className="hover:underline">Data Explorer</Link>}
         title={a.name}
         titleAccessory={
@@ -46,8 +47,10 @@ export function AssetDetailPage() {
         description={a.description}
       />
       <MetadataList
+        density="compact"
+        columns={3}
         items={[
-          { label: "Namespace", value: a.namespace },
+          { label: "Namespace", value: <span className="font-mono text-xs">{a.namespace}</span> },
           { label: "Type", value: ASSET_TYPE_LABEL[a.type] },
           { label: "Layer", value: DATA_LAYER_LABEL[a.layer] },
           { label: "Format", value: a.format },

@@ -1,9 +1,14 @@
 import { ServiceError } from "../errors"
 import { mockCall } from "../transport"
 import { agoIso } from "./mock-time"
-import type { Connector, ConnectorService } from "../contracts/connectors"
+import { createStore } from "./mutable-store"
+import type {
+  Connector,
+  ConnectorService,
+  CreateConnectorInput,
+} from "../contracts/connectors"
 
-const CONNECTORS: Connector[] = [
+const store = createStore<Connector>([
   {
     id: "conn-pg-core",
     name: "postgres core-banking CDC",
@@ -43,25 +48,97 @@ const CONNECTORS: Connector[] = [
     capabilities: ["consume", "produce", "pushdown filters"],
     owner: "Payments Platform",
   },
-]
+])
+
+const DEPENDENTS: Record<
+  string,
+  { id: string; name: string; kind: "pipeline" | "streaming" }[]
+> = {
+  "conn-pg-core": [
+    { id: "pl-orders-rollup", name: "orders_hourly_rollup", kind: "pipeline" },
+  ],
+  "conn-s3-docs": [
+    { id: "pl-policy-docs", name: "credit_policy_ingest", kind: "pipeline" },
+  ],
+  "conn-kafka-payments": [
+    { id: "sj-payments-flow", name: "rt.payments_flow_mv", kind: "streaming" },
+  ],
+}
+
+const SCHEMAS: Record<
+  string,
+  { name: string; kind: "table" | "topic" | "prefix"; columnsOrFields: number }[]
+> = {
+  "conn-pg-core": [
+    { name: "public.orders_events", kind: "table", columnsOrFields: 18 },
+    { name: "public.accounts", kind: "table", columnsOrFields: 22 },
+  ],
+  "conn-s3-docs": [
+    { name: "s3://docs/credit-policy/", kind: "prefix", columnsOrFields: 0 },
+  ],
+  "conn-kafka-payments": [
+    { name: "payments.events", kind: "topic", columnsOrFields: 12 },
+    { name: "payments.settlements", kind: "topic", columnsOrFields: 9 },
+  ],
+}
 
 export const mockConnectorService: ConnectorService = {
   listConnectors(signal) {
-    return mockCall(() => CONNECTORS, { signal })
+    return mockCall(() => store.list(), { signal })
   },
   getConnector(id, signal) {
     return mockCall(() => {
-      const c = CONNECTORS.find((x) => x.id === id)
+      const c = store.get(id)
       if (!c) throw new ServiceError("not_found", `Connector ${id} not found`)
+      const schemas = SCHEMAS[id] ?? []
       return {
         ...c,
-        discoveredAssets: 14,
+        discoveredAssets: schemas.length || 14,
+        discoveredSchemas: schemas,
         recentErrors:
           c.health === "degraded"
             ? [{ at: agoIso(12), message: "Consumer lag growing on partition 3" }]
             : [],
-        dependentPipelines: ["orders_hourly_rollup", "rt.payments_flow_mv"],
+        dependentPipelines: DEPENDENTS[id] ?? [],
+        auditEventId: `aud-conn-${id}`,
       }
     }, { signal })
+  },
+  createConnector(input: CreateConnectorInput, signal) {
+    return mockCall(
+      () => {
+        const connector: Connector = {
+          id: `conn-${Date.now().toString(36)}`,
+          name: input.name,
+          type: input.type,
+          direction: input.direction,
+          health: "healthy",
+          environment: input.environment,
+          tenant: input.tenant,
+          lastTestAt: agoIso(0),
+          lastActivityAt: agoIso(0),
+          capabilities: input.capabilities,
+          owner: input.owner ?? "Current user",
+        }
+        return store.prepend(connector)
+      },
+      { signal, delayMs: 500 }
+    )
+  },
+  testConnection(id, signal) {
+    return mockCall(() => {
+      const c = store.get(id)
+      if (!c) throw new ServiceError("not_found", `Connector ${id} not found`)
+      const ok = c.health !== "unhealthy"
+      store.update(id, { lastTestAt: agoIso(0) })
+      return {
+        ok,
+        latencyMs: ok ? 84 : 2400,
+        message: ok
+          ? "Connection succeeded. Schema discovery available."
+          : "Connection failed: endpoint unreachable.",
+        testedAt: agoIso(0),
+      }
+    }, { signal, delayMs: 700 })
   },
 }

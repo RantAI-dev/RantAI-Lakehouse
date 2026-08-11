@@ -1,15 +1,22 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
 import { useRouter } from "next/navigation"
+import { PlusIcon } from "lucide-react"
 import { PageHeader } from "@/components/patterns/page-header"
+import { Button } from "@/components/ui/button"
 import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
 import {
   FilterSelect,
   FilterToolbar,
   SearchField,
 } from "@/components/patterns/filter-toolbar"
-import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import {
+  EmptyState,
+  ErrorState,
+  LoadingSkeleton,
+} from "@/components/patterns/page-states"
 import { StatusBadge } from "@/components/patterns/status-badge"
 import { useService } from "@/hooks/use-service"
 import {
@@ -61,6 +68,12 @@ export function StreamingPage() {
       <PageHeader
         title="Streaming Jobs"
         description="Real-time materialized views, lag, throughput, and agent triggers."
+        actions={
+          <Button size="sm" render={<Link href="/streaming/create" />}>
+            <PlusIcon data-icon="inline-start" />
+            Create Streaming Job
+          </Button>
+        }
       />
       <FilterToolbar>
         <SearchField
@@ -78,7 +91,18 @@ export function StreamingPage() {
       </FilterToolbar>
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
-      {state.status === "success" ? (
+      {state.status === "success" && (state.data?.length ?? 0) === 0 ? (
+        <EmptyState
+          title="No streaming jobs"
+          description="Create a streaming job for real-time materialized views and agent triggers."
+          action={
+            <Button size="sm" render={<Link href="/streaming/create" />}>
+              Create Streaming Job
+            </Button>
+          }
+        />
+      ) : null}
+      {state.status === "success" && (state.data?.length ?? 0) > 0 ? (
         <DataTable
           columns={columns}
           rows={filtered}

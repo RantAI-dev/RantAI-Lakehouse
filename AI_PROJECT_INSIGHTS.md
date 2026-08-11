@@ -1,24 +1,34 @@
 # AI Project Insights
 
-Ringkasan konteks repository **Rantai Lake** console setelah rebuild dan hardening UX/IA sesuai *New Repository Implementation Plan*. Update file ini hanya dengan fakta yang sudah terverifikasi di kode.
+Verified context for the **Rantai Lake** console after the lifecycle alignment pass. Update only with facts that are true in the repository.
 
 ---
 
 ## 1. Project Overview
 
-**Rantai Lake** adalah enterprise lakehouse console (UI preview) untuk:
+**Rantai Lake** is an enterprise lakehouse console (**frontend preview only**) for:
 
-- data across **Hot / Warm / Cold / AI** storage tiers (logical layers Raw→Semantic tetap sebagai filter sekunder);
-- pipelines, streaming jobs, vector/knowledge jobs;
-- Query Studio (NL + SQL) dengan execution transparency;
-- catalog, lineage, governance, residency, audit;
-- agent workflows, digital employees, tool registry, approvals;
+- ingest via connectors;
+- processing via data pipelines, streaming jobs, and knowledge/vector jobs;
+- storage across **Hot / Warm / Cold / AI** physical tiers (logical Raw→Semantic is a separate catalog dimension);
+- catalog, governance, residency, lineage, audit;
+- Query Studio (NL + SQL) with execution transparency and simple federated plans;
+- semantic search;
+- agent workflows, digital employees, approvals, tool registry;
 - workloads, observability, services, usage & budgets;
 - users, roles, tenants, service identities.
 
-**Status integrasi:** semua data melalui **typed service contracts** + **mock adapters** di `src/services/`. Tidak ada backend nyata. Jangan mengklaim kemampuan engine sebagai “live”.
+### Honesty labels (do not conflate)
 
-Visual identity: **Rantai Design System** (`design-system/`) — navy/blue OKLCH, Geist, dark default. Jangan ubah design system tokens/visual language saat menambah fitur.
+| Label | Meaning |
+|---|---|
+| **Implemented Frontend** | Routes, UX, navigation, and product copy exist |
+| **Mocked Backend Contract** | Typed service + mock adapter returns realistic shapes/delays |
+| **Not Yet Implemented** | No real engine, IdP, agent runtime, or HTTP API |
+
+**There is no real data engine, query engine, pipeline runner, vector database, streaming engine, governance enforcer, identity provider, agent runtime, or observability backend in this repository.**
+
+Visual identity: **Rantai Design System** (`design-system/`) — navy/blue OKLCH, Geist, dark default. Do not change design-system tokens when adding features.
 
 ---
 
@@ -49,17 +59,19 @@ src/
     patterns/             # PageHeader, DataTable, StatusBadge family, DetailDrawer, …
     ui/                   # shadcn primitives
   features/               # Feature modules (pages compose these)
-    overview|catalog|pipelines|streaming|queries|knowledge|
-    agents|governance|ops|admin|connectors|storage/
   services/
-    contracts/            # Typed interfaces
-    mock/                 # Mock adapters + fixtures
-    transport.ts          # Shared mockCall / mockProgress
+    contracts/            # Typed interfaces (swap target for real APIs)
+    mock/                 # Mock adapters + in-session stores
+    transport.ts          # mockCall / mockProgress
     errors.ts
-    index.ts              # Service registry (swap mocks later)
-  hooks/use-service.ts    # useService + useServiceAction
-  lib/status.ts           # Shared taxonomies + label maps
-  lib/format.ts           # Shared formatters
+    index.ts              # Service registry
+  hooks/use-service.ts
+  lib/status.ts           # Shared taxonomies (includes blocked, partial)
+  lib/format.ts
+docs/
+  UX_FLOWS.md
+  FEATURE_COVERAGE.md
+  RANTAI_LAKE_REPOSITORY_VALIDATION.md
 ```
 
 Pages must stay thin. Do not put large fixtures inside `app/**/page.tsx`.
@@ -73,14 +85,20 @@ Sidebar groups (`src/components/app-shell/nav-config.ts`):
 - **Overview:** `/`, `/activity`, `/alerts`
 - **Data:** `/data`, `/catalog`, `/storage`, `/connectors`
 - **Build:** `/pipelines`, `/streaming`, `/query-studio`
-- **Intelligence:** `/knowledge`, `/vector-jobs`, `/semantic-search`, `/agents/*`
+- **Intelligence:** `/knowledge`, `/vector-jobs`, `/semantic-search`, `/agents/workflows`, `/agents/employees`, `/agents/approvals`, `/agents/tools`
 - **Governance:** policies, classification, data-quality, lineage, audit, residency
 - **Operations:** workloads, observability, services, usage
 - **Administration:** users, roles, tenants, service-identities, settings
 
-**Secondary routes (not in sidebar):** `/query-studio/saved`, `/query-studio/collaboration` — reached via `QueryStudioTabs` under Query Studio. Titles resolve via `pageTitleFor`; active sidebar item stays Query Studio (`activeNavHref`).
+**Secondary routes:** `/query-studio/saved`, `/query-studio/collaboration`.
 
-See `FEATURE_COVERAGE.md` for the full matrix.
+Product lifecycle the UI must keep coherent:
+
+```text
+Connect → Process → Store → Govern → Discover → Query → Automate → Audit → Monitor
+```
+
+See `docs/FEATURE_COVERAGE.md` and `docs/RANTAI_LAKE_REPOSITORY_VALIDATION.md`.
 
 ---
 
@@ -89,16 +107,18 @@ See `FEATURE_COVERAGE.md` for the full matrix.
 ```
 Page (features/*)
   → useService(fetcher)           # list/detail loads
-  → useServiceAction(action)      # user-triggered mutations (run, ack, cancel, search)
+  → useServiceAction(action)      # mutations (run, ack, cancel, search, decide)
   → services/index.ts (registry)
   → mock adapter
   → mockCall(delay, abort)
   → typed result
 ```
 
-When wiring a real backend: add `services/clients/*` implementing the same contract and point `services/index.ts` at it. Pages should not change.
+When wiring a real backend: add `services/clients/*` implementing the same contract and point `services/index.ts` at it. Pages should not need redesign.
 
-**Service method naming (canonical):** `listX` / `getX` (e.g. `listPipelines`, `getPipeline`, `listJobs`, `getJob`, `listConnectors`, `getConnector`). Health fields use `health: Health` (not `status`) on connectors and platform services.
+Canonical service registry today: overview, asset, pipeline, streaming, query, knowledge, agent, governance, ops, identity, connector, storage.
+
+Folded names (by design): Catalog→AssetService, Lineage/Audit→GovernanceService, Observability/Usage→OpsService.
 
 ---
 
@@ -109,31 +129,43 @@ Prefer these over page-local inventions:
 - `PageHeader` / `EntityHeader`
 - `FilterToolbar` / `SearchField` / `FilterSelect`
 - `DataTable`
-- `StatusBadge` / `TierBadge` / `HealthBadge` / `AutonomyBadge` / `SeverityBadge`
-- `CheckBadge` / `ApprovalBadge` / `OutcomeBadge` / `AlertStatusBadge` / `WorkloadStatusBadge`
-- `Pill` (generic) for domain-local statuses
-- `FreshnessIndicator`
-- `MetricCard` / `MetricGrid`
-- `EmptyState` / `ErrorState` / `PermissionState` / `LoadingSkeleton` / `MetricSkeleton`
+- Status badge family (`StatusBadge`, `TierBadge`, `HealthBadge`, `ApprovalBadge`, …)
+- `FreshnessIndicator`, `MetricCard` / `MetricGrid`
+- `EmptyState` / `ErrorState` / `PermissionState` / `LoadingSkeleton`
 - `DetailDrawer`, `FlowCanvas`, `RunTimeline`, `CodeBlock`, `SectionCard`, `MetadataList`
+- `ConfirmActionDialog` (optional children for comment fields)
+- `FormStepLayout` / `CreateSheet` for create flows
 
-Status strings must come from `src/lib/status.ts` (includes `EntityStatus`, `Health`, `CheckStatus`, `ApprovalStatus`, `ActorKind`, `AuditOutcome`, `AlertStatus`, `WorkloadStatus`, …).
+Status strings must come from `src/lib/status.ts`.
 
-Copy rule: use **product-neutral** labels for engines/gateway (Hot analytical store, Federated compute, …). Infra names belong in advanced tooltips only.
+Copy rule: product-neutral engine labels (Hot analytical store, Federated compute, …). Infra names only in advanced/diagnostic copy.
 
-List pages follow: **PageHeader → FilterToolbar → loading/error → DataTable** (+ DetailDrawer when no detail route).
+List pages: **PageHeader → FilterToolbar → loading/error → DataTable** (+ DetailDrawer when no detail route).
+
+Physical storage tier ≠ logical data layer — UI must keep both distinct.
 
 ---
 
-## 7. Known Gaps (intentional deferrals)
+## 7. Known Gaps
 
-- Full pipeline / connector create wizards
-- Visual agent workflow builder canvas
+### Implemented Frontend + Mocked Backend Contract
+
+- Approvals inbox with approve/reject
+- Pipeline run cancel/retry + checkpoint/audit links
+- Query execution plan panel + audit handoff
+- Cross-links across connectors, pipelines, assets, streaming, knowledge, agents
+- Storage restore/rehydrate mock
+
+### Not Yet Implemented (deferrals)
+
+- Real HTTP adapters / engines / IdP / agent runtime
+- Dedicated connector detail route (drawer today)
+- Dedicated pipeline run route (drawer today)
+- Agent workflow detail canvas route
 - Observability metric/log/trace explorer
 - Collaboration project detail route
-- Playwright e2e suite (unit tests cover format helpers)
-- HTTP adapters for real APIs
-- Navbar command palette / global search (UI shell only)
+- Playwright e2e suite
+- Navbar command palette / global search (shell only)
 
 ---
 
@@ -143,11 +175,9 @@ List pages follow: **PageHeader → FilterToolbar → loading/error → DataTabl
 npm run dev
 npm run build
 npm run lint
-npm test          # node --test on src/lib/*.test.ts
+npm test
 npx tsc --noEmit
 ```
-
-Verified baseline (post IA/UX hardening): `tsc` clean, `eslint` 0 errors (1 pre-existing warning in `ui/sidebar.tsx`), `npm test` 3 pass, `next build` success (44 routes).
 
 ---
 
@@ -158,10 +188,12 @@ Verified baseline (post IA/UX hardening): `tsc` clean, `eslint` 0 errors (1 pre-
 3. Keep pages thin; logic lives in `features/` and `services/`.
 4. Reuse patterns; do not invent new table/status shells.
 5. Never claim mock behavior as production backend capability.
-6. Update `FEATURE_COVERAGE.md` and this file only with proven facts.
+6. Update `docs/FEATURE_COVERAGE.md`, `docs/RANTAI_LAKE_REPOSITORY_VALIDATION.md`, and this file only with proven facts.
 7. Preserve design-system tokens and dark product default.
-8. Prefer `useService` for loads and `useServiceAction` for mutations; do not invent page-local fetch state.
+8. Prefer `useService` / `useServiceAction`; do not invent page-local fetch state.
+9. Keep related entities navigable via shared IDs (pipeline ↔ asset ↔ audit ↔ agent).
+10. End-to-end create/ops UX flows: `docs/UX_FLOWS.md`.
 
 ---
 
-_Last reviewed: IA consolidation + cross-module UX hardening (filters, drawers, shared badges, contract cleanup) against RantAI-Lake-New-Repository-Implementation-Plan._
+_Last reviewed: lifecycle alignment — cross-links, approvals, query plans, storage restore, validation docs._

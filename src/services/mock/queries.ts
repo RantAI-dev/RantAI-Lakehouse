@@ -1,7 +1,30 @@
 import { mockCall, stableHash } from "../transport"
 import { agoIso } from "./mock-time"
-import type { QueryService } from "../contracts/queries"
+import { createStore } from "./mutable-store"
+import type {
+  CollaborationProject,
+  CreateCollaborationProjectInput,
+  QueryPlanStage,
+  QueryService,
+} from "../contracts/queries"
 import type { EngineCategory, WorkloadClass } from "@/lib/status"
+
+const collaborationStore = createStore<CollaborationProject>([
+  {
+    id: "col-finance",
+    name: "Finance analytics workspace",
+    members: 8,
+    updatedAt: agoIso(60),
+    description: "Shared revenue and collections queries.",
+  },
+  {
+    id: "col-risk",
+    name: "Risk investigation",
+    members: 5,
+    updatedAt: agoIso(200),
+    description: "Fraud and credit risk collaborative notebooks.",
+  },
+])
 
 function classify(sql: string): {
   workloadClass: WorkloadClass
@@ -24,6 +47,59 @@ function classify(sql: string): {
     engine: "hot-store",
     cacheEligible: !s.includes("now()"),
   }
+}
+
+function buildPlan(engine: EngineCategory, bytes: number): QueryPlanStage[] {
+  if (engine === "federated-compute") {
+    return [
+      {
+        id: "p1",
+        label: "Source A",
+        location: "Hot analytical store",
+        operation: "Filter + aggregate",
+        estimatedBytes: Math.round(bytes * 0.35),
+        status: "completed",
+      },
+      {
+        id: "p2",
+        label: "Source B",
+        location: "Open cold tables",
+        operation: "Filter + projection",
+        estimatedBytes: Math.round(bytes * 0.55),
+        status: "completed",
+      },
+      {
+        id: "p3",
+        label: "Combine",
+        location: "Federated compute",
+        operation: "Join → final result",
+        estimatedBytes: Math.round(bytes * 0.1),
+        status: "completed",
+      },
+    ]
+  }
+  if (engine === "ai-store") {
+    return [
+      {
+        id: "p1",
+        label: "Retrieve",
+        location: "AI retrieval store",
+        operation: "Vector + lexical search",
+        estimatedBytes: bytes,
+        status: "completed",
+      },
+    ]
+  }
+  return [
+    {
+      id: "p1",
+      label: "Scan",
+      location: "Hot analytical store",
+      operation: "Filter + aggregate",
+      estimatedBytes: bytes,
+      status: "completed",
+    },
+  ]
 }
 
 export const mockQueryService: QueryService = {
@@ -65,6 +141,7 @@ export const mockQueryService: QueryService = {
           workloadClass: "hot-analytics" as const,
           engine: "hot-store" as const,
           cacheAssisted: true,
+          auditEventId: "aud-query-qh-1",
         },
         {
           id: "qh-2",
@@ -78,6 +155,21 @@ export const mockQueryService: QueryService = {
           workloadClass: "federated" as const,
           engine: "federated-compute" as const,
           cacheAssisted: false,
+          auditEventId: "aud-query-qh-2",
+        },
+        {
+          id: "qh-3",
+          sql: "SELECT * FROM regulated_ledger WHERE region = 'EU'",
+          user: "Guest Analyst",
+          at: agoIso(90),
+          status: "blocked" as const,
+          durationMs: 12,
+          scannedBytes: 0,
+          costUnits: 0,
+          workloadClass: "hot-analytics" as const,
+          engine: "hot-store" as const,
+          cacheAssisted: false,
+          auditEventId: "aud-query-qh-3",
         },
       ],
       { signal }
@@ -101,6 +193,7 @@ export const mockQueryService: QueryService = {
           c.engine === "federated-compute"
             ? ["hot analytical store", "open cold tables"]
             : ["hot analytical store"],
+        plan: buildPlan(c.engine, bytes),
       }
     }, { signal, delayMs: 200 })
   },
@@ -108,7 +201,10 @@ export const mockQueryService: QueryService = {
     return mockCall(() => {
       const c = classify(sql)
       const h = stableHash(sql)
+      const scanned = 80_000_000 + (h % 40) * 10_000_000
+      const id = `qr-${Date.now().toString(36)}`
       return {
+        id,
         columns: ["region", "amount", "orders"],
         rows: [
           { region: "Jabodetabek", amount: "1284000000", orders: "84211" },
@@ -117,7 +213,7 @@ export const mockQueryService: QueryService = {
         ],
         metrics: {
           durationMs: 380 + (h % 900),
-          scannedBytes: 80_000_000 + (h % 40) * 10_000_000,
+          scannedBytes: scanned,
           costUnits: Number((0.01 + (h % 50) / 1000).toFixed(4)),
           engine: c.engine,
           workloadClass: c.workloadClass,
@@ -125,10 +221,12 @@ export const mockQueryService: QueryService = {
           pushdowns: ["filter", "projection", "partial aggregate"],
           policyObligations: ["column mask: email", "row filter: tenant_id"],
         },
+        plan: buildPlan(c.engine, scanned),
+        auditEventId: `aud-query-${id}`,
       }
     }, { signal, delayMs: 700 })
   },
-  generateSql(question, signal) {
+  generateSql(_question, signal) {
     return mockCall(
       () => ({
         sql: `SELECT region, sum(amount) AS revenue\nFROM gold.revenue\nWHERE order_date >= today() - 90\nGROUP BY region\nORDER BY revenue DESC`,
@@ -142,24 +240,21 @@ export const mockQueryService: QueryService = {
     )
   },
   listCollaboration(signal) {
+    return mockCall(() => collaborationStore.list(), { signal })
+  },
+  createCollaborationProject(input: CreateCollaborationProjectInput, signal) {
     return mockCall(
-      () => [
-        {
-          id: "col-finance",
-          name: "Finance analytics workspace",
-          members: 8,
-          updatedAt: agoIso(60),
-          description: "Shared revenue and collections queries.",
-        },
-        {
-          id: "col-risk",
-          name: "Risk investigation",
-          members: 5,
-          updatedAt: agoIso(200),
-          description: "Fraud and credit risk collaborative notebooks.",
-        },
-      ],
-      { signal }
+      () =>
+        collaborationStore.prepend({
+          id: `col-${Date.now().toString(36)}`,
+          name: input.name,
+          members: input.collaborators.length,
+          updatedAt: agoIso(0),
+          description:
+            input.description ||
+            `Collaborators: ${input.collaborators.join(", ")}`,
+        }),
+      { signal, delayMs: 400 }
     )
   },
 }

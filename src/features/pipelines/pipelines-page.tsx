@@ -1,22 +1,30 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
 import { useRouter } from "next/navigation"
+import { PlusIcon, SparklesIcon } from "lucide-react"
 import { PageHeader } from "@/components/patterns/page-header"
 import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
+import {
+  EmptyState,
+  ErrorState,
+  LoadingSkeleton,
+} from "@/components/patterns/page-states"
 import {
   FilterSelect,
   FilterToolbar,
   SearchField,
 } from "@/components/patterns/filter-toolbar"
 import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
-import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { StatusBadge } from "@/components/patterns/status-badge"
+import { Button } from "@/components/ui/button"
 import { useService } from "@/hooks/use-service"
 import { formatRelativeTime } from "@/lib/format"
 import { ENTITY_STATUS_LABEL } from "@/lib/status"
 import { pipelineService } from "@/services"
 import type { Pipeline, PipelineKind } from "@/services/contracts/pipelines"
+import { AgenticBuilderDialog } from "./agentic-builder-dialog"
 
 const KIND_OPTIONS: { value: PipelineKind; label: string }[] = [
   { value: "batch", label: "Batch" },
@@ -46,6 +54,7 @@ export function PipelinesPage() {
   const [search, setSearch] = React.useState("")
   const [kind, setKind] = React.useState("all")
   const [status, setStatus] = React.useState("all")
+  const [agenticOpen, setAgenticOpen] = React.useState(false)
 
   const statusOptions = React.useMemo(() => {
     const present = new Set(state.data?.map((p) => p.status) ?? [])
@@ -69,6 +78,18 @@ export function PipelinesPage() {
       <PageHeader
         title="Pipelines"
         description="Batch, incremental, document, and vector flows with run health and freshness."
+        actions={
+          <>
+            <Button variant="outline" size="sm" onClick={() => setAgenticOpen(true)}>
+              <SparklesIcon data-icon="inline-start" />
+              Agentic Builder
+            </Button>
+            <Button size="sm" render={<Link href="/pipelines/create" />}>
+              <PlusIcon data-icon="inline-start" />
+              Create Pipeline
+            </Button>
+          </>
+        }
       />
       <FilterToolbar>
         <SearchField
@@ -93,7 +114,18 @@ export function PipelinesPage() {
       </FilterToolbar>
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
-      {state.status === "success" ? (
+      {state.status === "success" && (state.data?.length ?? 0) === 0 ? (
+        <EmptyState
+          title="No pipelines"
+          description="Create a pipeline or generate one with the Agentic Builder."
+          action={
+            <Button size="sm" render={<Link href="/pipelines/create" />}>
+              Create Pipeline
+            </Button>
+          }
+        />
+      ) : null}
+      {state.status === "success" && (state.data?.length ?? 0) > 0 ? (
         <DataTable
           columns={columns}
           rows={filtered}
@@ -101,6 +133,11 @@ export function PipelinesPage() {
           onRowClick={(r) => router.push(`/pipelines/${r.id}`)}
         />
       ) : null}
+      <AgenticBuilderDialog
+        open={agenticOpen}
+        onOpenChange={setAgenticOpen}
+        onCreated={() => state.reload()}
+      />
     </div>
   )
 }

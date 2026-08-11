@@ -84,6 +84,40 @@ export type ResidencyRule = {
   violations7d: number
 }
 
+export type CreatePolicyInput = {
+  name: string
+  kind: string
+  subjects: string
+  resources: string
+  effect: string
+  conditions?: string
+  activate?: boolean
+  owner?: string
+}
+
+export type CreateQualityRuleInput = {
+  name: string
+  asset: string
+  dimension: string
+  threshold: string
+  severity: Severity
+}
+
+export type CreateClassificationRuleInput = {
+  asset: string
+  column?: string
+  classification: Classification
+  maskingRule?: string
+}
+
+export type CreateResidencyRuleInput = {
+  tenant: string
+  classification: Classification
+  approvedSites: string[]
+  crossSiteAllowed: boolean
+  allowedOutput: string
+}
+
 export interface GovernanceService {
   listPolicies(signal?: AbortSignal): Promise<Policy[]>
   listClassifications(signal?: AbortSignal): Promise<ClassificationRule[]>
@@ -91,4 +125,17 @@ export interface GovernanceService {
   getLineage(focusId: string, signal?: AbortSignal): Promise<LineageGraph>
   listAudit(signal?: AbortSignal): Promise<AuditEvent[]>
   listResidency(signal?: AbortSignal): Promise<ResidencyRule[]>
+  createPolicy(input: CreatePolicyInput, signal?: AbortSignal): Promise<Policy>
+  createQualityRule(
+    input: CreateQualityRuleInput,
+    signal?: AbortSignal
+  ): Promise<QualityRule>
+  createClassificationRule(
+    input: CreateClassificationRuleInput,
+    signal?: AbortSignal
+  ): Promise<ClassificationRule>
+  createResidencyRule(
+    input: CreateResidencyRuleInput,
+    signal?: AbortSignal
+  ): Promise<ResidencyRule>
 }

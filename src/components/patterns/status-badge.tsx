@@ -87,6 +87,8 @@ const STATUS_TONE: Record<EntityStatus, Tone> = {
   failed: "destructive",
   completed: "success",
   cancelled: "neutral",
+  blocked: "warning",
+  partial: "warning",
   archived: "neutral",
 }
 

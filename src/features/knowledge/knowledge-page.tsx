@@ -1,6 +1,9 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
+import { PlusIcon } from "lucide-react"
+import { CreateSheet } from "@/components/patterns/create-sheet"
 import { PageHeader } from "@/components/patterns/page-header"
 import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
@@ -17,9 +20,16 @@ import {
   Pill,
   StatusBadge,
 } from "@/components/patterns/status-badge"
-import { useService } from "@/hooks/use-service"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatCompactNumber, formatRelativeTime } from "@/lib/format"
-import { ENTITY_STATUS_LABEL } from "@/lib/status"
+import {
+  CLASSIFICATION_LABEL,
+  ENTITY_STATUS_LABEL,
+  type Classification,
+} from "@/lib/status"
 import { knowledgeService } from "@/services"
 import type {
   IndexStatus,
@@ -54,6 +64,13 @@ const KIND_OPTIONS: { value: KnowledgeSourceKind; label: string }[] = [
   { value: "manual", label: "Manual" },
 ]
 
+const CLASSIFICATION_OPTIONS = (
+  Object.keys(CLASSIFICATION_LABEL) as Classification[]
+).map((c) => ({ value: c, label: CLASSIFICATION_LABEL[c] }))
+
+const selectClassName =
+  "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+
 const columns: ColumnDef<KnowledgeSource>[] = [
   { key: "name", header: "Source", render: (r) => (
     <div><p className="font-medium">{r.name}</p><p className="text-xs text-muted-foreground">{r.kind} · {r.version}</p></div>
@@ -75,6 +92,16 @@ export function KnowledgePage() {
   const [kind, setKind] = React.useState("all")
   const [status, setStatus] = React.useState("all")
   const [selected, setSelected] = React.useState<KnowledgeSource | null>(null)
+  const [createOpen, setCreateOpen] = React.useState(false)
+  const [name, setName] = React.useState("")
+  const [formKind, setFormKind] = React.useState<KnowledgeSourceKind>("file")
+  const [embeddingModel, setEmbeddingModel] = React.useState("")
+  const [classification, setClassification] =
+    React.useState<Classification>("internal")
+  const create = useServiceAction(
+    (signal, input: Parameters<typeof knowledgeService.createSource>[0]) =>
+      knowledgeService.createSource(input, signal)
+  )
 
   const statusOptions = React.useMemo(() => {
     const present = new Set(state.data?.map((r) => r.status) ?? [])
@@ -91,11 +118,38 @@ export function KnowledgePage() {
     })
   }, [state.data, search, kind, status])
 
+  function resetForm() {
+    setName("")
+    setFormKind("file")
+    setEmbeddingModel("")
+    setClassification("internal")
+  }
+
+  async function handleCreate() {
+    const result = await create.run({
+      name: name.trim(),
+      kind: formKind,
+      embeddingModel: embeddingModel.trim(),
+      classification,
+    })
+    if (result) {
+      setCreateOpen(false)
+      resetForm()
+      state.reload()
+    }
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Knowledge"
         description="Governed knowledge sources with versions, embeddings, freshness, and dependent agents."
+        actions={
+          <Button size="sm" onClick={() => setCreateOpen(true)}>
+            <PlusIcon data-icon="inline-start" />
+            Add Source
+          </Button>
+        }
       />
       <FilterToolbar>
         <SearchField
@@ -163,9 +217,88 @@ export function KnowledgePage() {
                 },
               ]}
             />
+            <div className="flex flex-wrap gap-2">
+              {selected.vectorJobId ? (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  render={<Link href="/vector-jobs" />}
+                >
+                  Vector job {selected.vectorJobId}
+                </Button>
+              ) : null}
+              {selected.assetId ? (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  render={<Link href={`/data/assets/${selected.assetId}`} />}
+                >
+                  Catalog asset
+                </Button>
+              ) : null}
+              <Button
+                size="sm"
+                variant="ghost"
+                render={<Link href="/semantic-search" />}
+              >
+                Try in Semantic Search
+              </Button>
+            </div>
           </>
         ) : null}
       </DetailDrawer>
+      <CreateSheet
+        open={createOpen}
+        onOpenChange={(open) => {
+          setCreateOpen(open)
+          if (!open) resetForm()
+        }}
+        title="Add Source"
+        description="Register a governed knowledge source for embedding and retrieval."
+        canSubmit={Boolean(name.trim() && embeddingModel.trim())}
+        submitting={create.status === "pending"}
+        onSubmit={handleCreate}
+      >
+        <div className="space-y-1.5">
+          <Label htmlFor="ks-name">Name</Label>
+          <Input id="ks-name" value={name} onChange={(e) => setName(e.target.value)} />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="ks-kind">Kind</Label>
+          <select
+            id="ks-kind"
+            className={selectClassName}
+            value={formKind}
+            onChange={(e) => setFormKind(e.target.value as KnowledgeSourceKind)}
+          >
+            {KIND_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>{o.label}</option>
+            ))}
+          </select>
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="ks-model">Embedding model</Label>
+          <Input
+            id="ks-model"
+            value={embeddingModel}
+            onChange={(e) => setEmbeddingModel(e.target.value)}
+            placeholder="text-embedding-3-large"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="ks-class">Classification</Label>
+          <select
+            id="ks-class"
+            className={selectClassName}
+            value={classification}
+            onChange={(e) => setClassification(e.target.value as Classification)}
+          >
+            {CLASSIFICATION_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>{o.label}</option>
+            ))}
+          </select>
+        </div>
+      </CreateSheet>
     </div>
   )
 }

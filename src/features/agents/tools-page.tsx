@@ -1,6 +1,8 @@
 "use client"
 
 import * as React from "react"
+import { PlusIcon } from "lucide-react"
+import { CreateSheet } from "@/components/patterns/create-sheet"
 import { PageHeader } from "@/components/patterns/page-header"
 import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
@@ -16,7 +18,10 @@ import {
   HealthBadge,
   Pill,
 } from "@/components/patterns/status-badge"
-import { useService } from "@/hooks/use-service"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatCompactNumber } from "@/lib/format"
 import {
   APPROVAL_STATUS_LABEL,
@@ -59,6 +64,16 @@ export function ToolsPage() {
   const [approval, setApproval] = React.useState("all")
   const [health, setHealth] = React.useState("all")
   const [selected, setSelected] = React.useState<AgentTool | null>(null)
+  const [createOpen, setCreateOpen] = React.useState(false)
+  const [name, setName] = React.useState("")
+  const [version, setVersion] = React.useState("")
+  const [publisher, setPublisher] = React.useState("")
+  const [permission, setPermission] = React.useState("")
+  const [rateLimit, setRateLimit] = React.useState("")
+  const create = useServiceAction(
+    (signal, input: Parameters<typeof agentService.registerTool>[0]) =>
+      agentService.registerTool(input, signal)
+  )
 
   const filtered = React.useMemo(() => {
     const q = search.trim().toLowerCase()
@@ -72,11 +87,40 @@ export function ToolsPage() {
     })
   }, [state.data, search, approval, health])
 
+  function resetForm() {
+    setName("")
+    setVersion("")
+    setPublisher("")
+    setPermission("")
+    setRateLimit("")
+  }
+
+  async function handleCreate() {
+    const result = await create.run({
+      name: name.trim(),
+      version: version.trim(),
+      publisher: publisher.trim(),
+      permission: permission.trim(),
+      rateLimit: rateLimit.trim(),
+    })
+    if (result) {
+      setCreateOpen(false)
+      resetForm()
+      state.reload()
+    }
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Tool Registry"
         description="Governed tool inventory with permissions, health, and usage."
+        actions={
+          <Button size="sm" onClick={() => setCreateOpen(true)}>
+            <PlusIcon data-icon="inline-start" />
+            Register Tool
+          </Button>
+        }
       />
       <FilterToolbar>
         <SearchField
@@ -139,6 +183,65 @@ export function ToolsPage() {
           </>
         ) : null}
       </DetailDrawer>
+      <CreateSheet
+        open={createOpen}
+        onOpenChange={(open) => {
+          setCreateOpen(open)
+          if (!open) resetForm()
+        }}
+        title="Register Tool"
+        description="Add a governed tool with permission and rate limits."
+        canSubmit={Boolean(
+          name.trim() &&
+            version.trim() &&
+            publisher.trim() &&
+            permission.trim() &&
+            rateLimit.trim()
+        )}
+        submitting={create.status === "pending"}
+        onSubmit={handleCreate}
+        submitLabel="Register"
+      >
+        <div className="space-y-1.5">
+          <Label htmlFor="tool-name">Name</Label>
+          <Input id="tool-name" value={name} onChange={(e) => setName(e.target.value)} />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="tool-version">Version</Label>
+          <Input
+            id="tool-version"
+            value={version}
+            onChange={(e) => setVersion(e.target.value)}
+            placeholder="1.0.0"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="tool-publisher">Publisher</Label>
+          <Input
+            id="tool-publisher"
+            value={publisher}
+            onChange={(e) => setPublisher(e.target.value)}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="tool-permission">Permission</Label>
+          <Input
+            id="tool-permission"
+            value={permission}
+            onChange={(e) => setPermission(e.target.value)}
+            placeholder="tools.invoke"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="tool-rate">Rate limit</Label>
+          <Input
+            id="tool-rate"
+            value={rateLimit}
+            onChange={(e) => setRateLimit(e.target.value)}
+            placeholder="60/min"
+          />
+        </div>
+      </CreateSheet>
     </div>
   )
 }

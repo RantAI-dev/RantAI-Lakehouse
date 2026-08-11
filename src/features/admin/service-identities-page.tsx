@@ -1,6 +1,8 @@
 "use client"
 
 import * as React from "react"
+import { PlusIcon } from "lucide-react"
+import { CreateSheet } from "@/components/patterns/create-sheet"
 import { PageHeader } from "@/components/patterns/page-header"
 import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
 import {
@@ -10,7 +12,10 @@ import {
 } from "@/components/patterns/filter-toolbar"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Pill } from "@/components/patterns/status-badge"
-import { useService } from "@/hooks/use-service"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatRelativeTime } from "@/lib/format"
 import { identityService } from "@/services"
 import type { ServiceIdentity } from "@/services/contracts/identity"
@@ -73,6 +78,16 @@ export function ServiceIdentitiesPage() {
   const state = useService((s) => identityService.listServiceIdentities(s), [])
   const [search, setSearch] = React.useState("")
   const [rotation, setRotation] = React.useState("all")
+  const [createOpen, setCreateOpen] = React.useState(false)
+  const [name, setName] = React.useState("")
+  const [scopes, setScopes] = React.useState("")
+  const [environment, setEnvironment] = React.useState("")
+  const create = useServiceAction(
+    (
+      signal,
+      input: Parameters<typeof identityService.createServiceIdentity>[0]
+    ) => identityService.createServiceIdentity(input, signal)
+  )
 
   const filtered = React.useMemo(() => {
     const q = search.trim().toLowerCase()
@@ -86,11 +101,39 @@ export function ServiceIdentitiesPage() {
     })
   }, [state.data, search, rotation])
 
+  function resetForm() {
+    setName("")
+    setScopes("")
+    setEnvironment("")
+  }
+
+  async function handleCreate() {
+    const result = await create.run({
+      name: name.trim(),
+      scopes: scopes
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+      environment: environment.trim(),
+    })
+    if (result) {
+      setCreateOpen(false)
+      resetForm()
+      state.reload()
+    }
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Service Identities"
         description="Machine clients, scopes, rotation, and recent use."
+        actions={
+          <Button size="sm" onClick={() => setCreateOpen(true)}>
+            <PlusIcon data-icon="inline-start" />
+            Create Service Identity
+          </Button>
+        }
       />
       <FilterToolbar>
         <SearchField
@@ -113,6 +156,41 @@ export function ServiceIdentitiesPage() {
       {state.status === "success" ? (
         <DataTable columns={columns} rows={filtered} rowKey={(r) => r.id} />
       ) : null}
+      <CreateSheet
+        open={createOpen}
+        onOpenChange={(open) => {
+          setCreateOpen(open)
+          if (!open) resetForm()
+        }}
+        title="Create Service Identity"
+        description="Register a machine client with scopes and environment."
+        canSubmit={Boolean(name.trim() && scopes.trim() && environment.trim())}
+        submitting={create.status === "pending"}
+        onSubmit={handleCreate}
+      >
+        <div className="space-y-1.5">
+          <Label htmlFor="si-name">Name</Label>
+          <Input id="si-name" value={name} onChange={(e) => setName(e.target.value)} />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="si-scopes">Scopes (comma-separated)</Label>
+          <Input
+            id="si-scopes"
+            value={scopes}
+            onChange={(e) => setScopes(e.target.value)}
+            placeholder="pipelines:write, catalog:read"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="si-env">Environment</Label>
+          <Input
+            id="si-env"
+            value={environment}
+            onChange={(e) => setEnvironment(e.target.value)}
+            placeholder="production"
+          />
+        </div>
+      </CreateSheet>
     </div>
   )
 }

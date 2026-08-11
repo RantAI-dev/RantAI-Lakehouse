@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
 import { PageHeader } from "@/components/patterns/page-header"
 import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
 import {
@@ -101,7 +102,24 @@ export function SemanticSearchPage() {
             >
               <p className="text-sm">{h.snippet}</p>
               <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
-                <span className="font-mono">{h.source}</span>
+                {h.sourceId ? (
+                  <Link
+                    href={`/knowledge?source=${h.sourceId}`}
+                    className="font-mono text-primary hover:underline"
+                  >
+                    {h.source}
+                  </Link>
+                ) : (
+                  <span className="font-mono">{h.source}</span>
+                )}
+                {h.assetId ? (
+                  <Link
+                    href={`/data/assets/${h.assetId}`}
+                    className="text-primary hover:underline"
+                  >
+                    Catalog asset
+                  </Link>
+                ) : null}
                 <span>{h.version}</span>
                 <FreshnessIndicator lagSeconds={h.freshnessLagSeconds} />
               </div>

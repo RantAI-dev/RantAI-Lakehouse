@@ -17,6 +17,8 @@ export type EntityStatus =
   | "failed"
   | "completed"
   | "cancelled"
+  | "blocked"
+  | "partial"
   | "archived"
 
 export const ENTITY_STATUS_LABEL: Record<EntityStatus, string> = {
@@ -30,6 +32,8 @@ export const ENTITY_STATUS_LABEL: Record<EntityStatus, string> = {
   failed: "Failed",
   completed: "Completed",
   cancelled: "Cancelled",
+  blocked: "Blocked",
+  partial: "Partial success",
   archived: "Archived",
 }
 
@@ -44,6 +48,8 @@ export const ENTITY_STATUS_DESCRIPTION: Record<EntityStatus, string> = {
   failed: "The last execution ended with an error.",
   completed: "Finished successfully.",
   cancelled: "Stopped before completion.",
+  blocked: "Stopped by policy, quota, or approval gate.",
+  partial: "Finished with some accepted and some rejected work.",
   archived: "Retained for reference; no longer active.",
 }
 

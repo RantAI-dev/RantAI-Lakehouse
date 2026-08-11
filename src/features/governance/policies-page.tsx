@@ -1,7 +1,10 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
+import { PlusIcon } from "lucide-react"
 import { PageHeader } from "@/components/patterns/page-header"
+import { Button } from "@/components/ui/button"
 import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
 import {
@@ -10,7 +13,11 @@ import {
   SearchField,
 } from "@/components/patterns/filter-toolbar"
 import { MetadataList } from "@/components/patterns/metadata-list"
-import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import {
+  EmptyState,
+  ErrorState,
+  LoadingSkeleton,
+} from "@/components/patterns/page-states"
 import { StatusBadge } from "@/components/patterns/status-badge"
 import { useService } from "@/hooks/use-service"
 import { formatRelativeTime } from "@/lib/format"
@@ -64,6 +71,12 @@ export function PoliciesPage() {
       <PageHeader
         title="Policies"
         description="Access, agent, residency, retention, and budget policies."
+        actions={
+          <Button size="sm" render={<Link href="/governance/policies/create" />}>
+            <PlusIcon data-icon="inline-start" />
+            Create Policy
+          </Button>
+        }
       />
       <FilterToolbar>
         <SearchField
@@ -88,7 +101,18 @@ export function PoliciesPage() {
       </FilterToolbar>
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
-      {state.status === "success" ? (
+      {state.status === "success" && (state.data?.length ?? 0) === 0 ? (
+        <EmptyState
+          title="No policies"
+          description="Create an access, agent, residency, retention, or budget policy."
+          action={
+            <Button size="sm" render={<Link href="/governance/policies/create" />}>
+              Create Policy
+            </Button>
+          }
+        />
+      ) : null}
+      {state.status === "success" && (state.data?.length ?? 0) > 0 ? (
         <DataTable
           columns={columns}
           rows={filtered}

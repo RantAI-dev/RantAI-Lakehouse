@@ -49,10 +49,43 @@ export type WorkspaceSettings = {
   queryResultRetentionDays: number
 }
 
+export type InviteUserInput = {
+  name: string
+  email: string
+  roles: string[]
+  tenants: string[]
+}
+
+export type CreateRoleInput = {
+  name: string
+  permissions: string
+  description: string
+}
+
+export type CreateTenantInput = {
+  name: string
+  slug: string
+  plan: string
+  residency: string
+}
+
+export type CreateServiceIdentityInput = {
+  name: string
+  scopes: string[]
+  environment: string
+}
+
 export interface IdentityService {
   listUsers(signal?: AbortSignal): Promise<User[]>
   listRoles(signal?: AbortSignal): Promise<Role[]>
   listTenants(signal?: AbortSignal): Promise<Tenant[]>
   listServiceIdentities(signal?: AbortSignal): Promise<ServiceIdentity[]>
   getWorkspaceSettings(signal?: AbortSignal): Promise<WorkspaceSettings>
+  inviteUser(input: InviteUserInput, signal?: AbortSignal): Promise<User>
+  createRole(input: CreateRoleInput, signal?: AbortSignal): Promise<Role>
+  createTenant(input: CreateTenantInput, signal?: AbortSignal): Promise<Tenant>
+  createServiceIdentity(
+    input: CreateServiceIdentityInput,
+    signal?: AbortSignal
+  ): Promise<ServiceIdentity>
 }

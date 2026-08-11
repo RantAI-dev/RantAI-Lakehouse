@@ -1,6 +1,36 @@
 import { mockCall } from "../transport"
 import { agoIso } from "./mock-time"
-import type { StorageService } from "../contracts/storage"
+import { createStore } from "./mutable-store"
+import type {
+  CreateLifecyclePolicyInput,
+  LifecyclePolicy,
+  StorageService,
+} from "../contracts/storage"
+
+const policyStore = createStore<LifecyclePolicy>([
+  {
+    id: "lp-1",
+    name: "default_analytics_lifecycle",
+    scope: "core.* analytical tables",
+    hotDays: 14,
+    warmDays: 90,
+    coldAfterDays: 91,
+    status: "ready",
+    estimatedSavings: "68% vs all-hot",
+    lastAppliedAt: agoIso(300),
+  },
+  {
+    id: "lp-2",
+    name: "ai_derivative_retention",
+    scope: "ai.* vector datasets",
+    hotDays: 0,
+    warmDays: 0,
+    coldAfterDays: 365,
+    status: "draft",
+    estimatedSavings: "Rebuildable from lineage",
+    lastAppliedAt: agoIso(1000),
+  },
+])
 
 export const mockStorageService: StorageService = {
   getOverview(signal) {
@@ -20,33 +50,7 @@ export const mockStorageService: StorageService = {
     )
   },
   listPolicies(signal) {
-    return mockCall(
-      () => [
-        {
-          id: "lp-1",
-          name: "default_analytics_lifecycle",
-          scope: "core.* analytical tables",
-          hotDays: 14,
-          warmDays: 90,
-          coldAfterDays: 91,
-          status: "ready" as const,
-          estimatedSavings: "68% vs all-hot",
-          lastAppliedAt: agoIso(300),
-        },
-        {
-          id: "lp-2",
-          name: "ai_derivative_retention",
-          scope: "ai.* vector datasets",
-          hotDays: 0,
-          warmDays: 0,
-          coldAfterDays: 365,
-          status: "draft" as const,
-          estimatedSavings: "Rebuildable from lineage",
-          lastAppliedAt: agoIso(1000),
-        },
-      ],
-      { signal }
-    )
+    return mockCall(() => policyStore.list(), { signal })
   },
   listOperations(signal) {
     return mockCall(
@@ -54,6 +58,7 @@ export const mockStorageService: StorageService = {
         {
           id: "op-1",
           asset: "lake.sales.orders_history",
+          assetId: "ice-orders-history",
           from: "warm" as const,
           to: "cold" as const,
           status: "completed" as const,
@@ -63,14 +68,57 @@ export const mockStorageService: StorageService = {
         {
           id: "op-2",
           asset: "core.sales.orders_events",
+          assetId: "tbl-orders-events",
           from: "hot" as const,
           to: "warm" as const,
           status: "failed" as const,
           at: agoIso(40),
           detail: "Checksum mismatch on partition 2026-06-01",
         },
+        {
+          id: "op-3",
+          asset: "lake.sales.orders_history",
+          assetId: "ice-orders-history",
+          from: "cold" as const,
+          to: "hot" as const,
+          status: "running" as const,
+          at: agoIso(5),
+          detail: "Rehydrate Q1 2024 partitions to Hot for investigation",
+        },
       ],
       { signal }
+    )
+  },
+  createLifecyclePolicy(input: CreateLifecyclePolicyInput, signal) {
+    return mockCall(
+      () =>
+        policyStore.prepend({
+          id: `lp-${Date.now().toString(36)}`,
+          name: input.name,
+          scope: input.scope,
+          hotDays: input.hotDays,
+          warmDays: input.warmDays,
+          coldAfterDays: input.coldAfterDays,
+          status: "draft",
+          estimatedSavings: "Pending estimate",
+          lastAppliedAt: agoIso(0),
+        }),
+      { signal, delayMs: 400 }
+    )
+  },
+  restoreAsset(input, signal) {
+    return mockCall(
+      () => ({
+        id: `op-restore-${Date.now().toString(36)}`,
+        asset: input.assetName,
+        assetId: input.assetId,
+        from: input.from,
+        to: input.to ?? "hot",
+        status: "running" as const,
+        at: agoIso(0),
+        detail: `Restore / rehydrate requested to ${input.to ?? "hot"}`,
+      }),
+      { signal, delayMs: 500 }
     )
   },
 }

@@ -1,8 +1,11 @@
 "use client"
 
+import * as React from "react"
 import Link from "next/link"
 import { useParams } from "next/navigation"
+import { PauseIcon, PlayIcon } from "lucide-react"
 import { CodeBlock } from "@/components/patterns/code-block"
+import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { MetricCard, MetricGrid } from "@/components/patterns/metric-card"
@@ -14,8 +17,9 @@ import {
 } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { StatusBadge } from "@/components/patterns/status-badge"
+import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { useService } from "@/hooks/use-service"
+import { useService, useServiceAction } from "@/hooks/use-service"
 import {
   formatBytes,
   formatLagSeconds,
@@ -47,9 +51,17 @@ function MonoList({ items, ariaLabel }: { items: string[]; ariaLabel: string }) 
 export function StreamingDetailPage() {
   const { jobId } = useParams<{ jobId: string }>()
   const state = useService((s) => streamingService.getJob(jobId, s), [jobId])
+  const [pauseOpen, setPauseOpen] = React.useState(false)
+  const pauseAction = useServiceAction((signal, id: string) =>
+    streamingService.pauseJob(id, signal)
+  )
+  const resumeAction = useServiceAction((signal, id: string) =>
+    streamingService.resumeJob(id, signal)
+  )
   if (state.status === "loading") return <LoadingSkeleton rows={8} />
   if (state.status === "error") return <ErrorState error={state.error} onRetry={state.reload} />
   const j = state.data
+  const isPaused = j.status === "paused"
 
   return (
     <div className="flex flex-col gap-4">
@@ -57,6 +69,47 @@ export function StreamingDetailPage() {
         eyebrow={<Link href="/streaming" className="hover:underline">Streaming Jobs</Link>}
         title={j.name}
         titleAccessory={<StatusBadge status={j.status} />}
+        actions={
+          isPaused ? (
+            <Button
+              size="sm"
+              disabled={resumeAction.status === "pending"}
+              onClick={async () => {
+                const updated = await resumeAction.run(jobId)
+                if (updated) state.reload()
+              }}
+            >
+              <PlayIcon data-icon="inline-start" />
+              {resumeAction.status === "pending" ? "Resuming…" : "Resume"}
+            </Button>
+          ) : (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={pauseAction.status === "pending"}
+              onClick={() => setPauseOpen(true)}
+            >
+              <PauseIcon data-icon="inline-start" />
+              Pause
+            </Button>
+          )
+        }
+      />
+      <ConfirmActionDialog
+        open={pauseOpen}
+        onOpenChange={setPauseOpen}
+        title="Pause streaming job"
+        description={`Pause ${j.name}? Ingestion lag may grow until resumed.`}
+        impact="Checkpoints are retained; throughput drops to zero while paused."
+        confirmLabel="Pause job"
+        confirming={pauseAction.status === "pending"}
+        onConfirm={async () => {
+          const updated = await pauseAction.run(jobId)
+          if (updated) {
+            setPauseOpen(false)
+            state.reload()
+          }
+        }}
       />
       <Tabs defaultValue="overview">
         <TabsList>
@@ -96,7 +149,25 @@ export function StreamingDetailPage() {
               <MonoList items={j.sources} ariaLabel="Sources" />
             </SectionCard>
             <SectionCard title="Sinks">
-              <MonoList items={j.sinks} ariaLabel="Sinks" />
+              <ul className="space-y-1.5" aria-label="Sinks">
+                {j.sinks.map((sink, i) => {
+                  const assetId = j.sinkAssetIds?.[i]
+                  return (
+                    <li key={sink} className="font-mono text-sm">
+                      {assetId ? (
+                        <Link
+                          href={`/data/assets/${assetId}`}
+                          className="text-primary hover:underline"
+                        >
+                          {sink}
+                        </Link>
+                      ) : (
+                        sink
+                      )}
+                    </li>
+                  )
+                })}
+              </ul>
             </SectionCard>
           </div>
         </TabsContent>
@@ -113,8 +184,8 @@ export function StreamingDetailPage() {
                   <li key={t.id} className="flex flex-wrap items-center gap-2">
                     <span className="font-mono text-xs">{t.condition}</span>
                     <span className="text-muted-foreground" aria-hidden>→</span>
-                    {t.target.startsWith("/") ? (
-                      <Link href={t.target} className="text-primary hover:underline">
+                    {t.targetHref ? (
+                      <Link href={t.targetHref} className="text-primary hover:underline">
                         {t.target}
                       </Link>
                     ) : (

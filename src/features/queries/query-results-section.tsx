@@ -1,13 +1,16 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
 import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { Pill } from "@/components/patterns/status-badge"
 import { SectionCard } from "@/components/patterns/section-card"
+import { Button } from "@/components/ui/button"
 import { formatBytes, formatCost, formatDuration } from "@/lib/format"
 import { ENGINE_CATEGORY_LABEL, WORKLOAD_CLASS_LABEL } from "@/lib/status"
 import type { QueryResult } from "@/services/contracts/queries"
+import { QueryPlanPanel } from "./query-transparency-panel"
 
 type ResultRow = { key: string; cells: Record<string, string> }
 
@@ -43,7 +46,21 @@ export function QueryResultsSection({ result }: { result: QueryResult }) {
   )
 
   return (
-    <SectionCard title="Results" contentClassName="space-y-4">
+    <SectionCard
+      title="Results"
+      contentClassName="space-y-4"
+      action={
+        result.auditEventId ? (
+          <Button
+            size="sm"
+            variant="outline"
+            render={<Link href={`/audit?event=${result.auditEventId}`} />}
+          >
+            View in Audit
+          </Button>
+        ) : null
+      }
+    >
       <DataTable
         columns={columns}
         rows={rows}
@@ -60,9 +77,13 @@ export function QueryResultsSection({ result }: { result: QueryResult }) {
           { label: "Workload", value: WORKLOAD_CLASS_LABEL[result.metrics.workloadClass] },
           { label: "Cache", value: result.metrics.cacheHit ? "Hit" : "Miss" },
           { label: "Pushdowns", value: <PillList values={result.metrics.pushdowns} /> },
-          { label: "Policy obligations", value: <PillList values={result.metrics.policyObligations} /> },
+          {
+            label: "Policy obligations",
+            value: <PillList values={result.metrics.policyObligations} />,
+          },
         ]}
       />
+      <QueryPlanPanel plan={result.plan} />
     </SectionCard>
   )
 }

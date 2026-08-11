@@ -24,6 +24,10 @@ export type KnowledgeSource = {
   freshnessLagSeconds: number
   classification: Classification
   dependentAgents: number
+  /** Catalog asset for this knowledge corpus when registered. */
+  assetId?: string
+  /** Active vector job producing embeddings for this source. */
+  vectorJobId?: string
 }
 
 export type VectorJob = {
@@ -31,6 +35,10 @@ export type VectorJob = {
   name: string
   status: EntityStatus
   source: string
+  /** Knowledge source id when the job indexes a registered source. */
+  sourceId?: string
+  /** Resulting vector / knowledge asset in the catalog. */
+  outputAssetId?: string
   embeddingModel: string
   indexType: string
   lastRunAt: string
@@ -43,12 +51,31 @@ export type SearchHit = {
   snippet: string
   score: number
   source: string
+  sourceId?: string
+  assetId?: string
   strategy: SearchStrategy
   version: string
   freshnessLagSeconds: number
+  classification?: Classification
 }
 
 export type SearchStrategy = "semantic" | "lexical" | "hybrid"
+
+export type CreateKnowledgeSourceInput = {
+  name: string
+  kind: KnowledgeSourceKind
+  embeddingModel: string
+  classification: Classification
+  owner?: string
+}
+
+export type CreateVectorJobInput = {
+  name: string
+  source: string
+  embeddingModel: string
+  indexType: string
+  owner?: string
+}
 
 export interface KnowledgeService {
   listSources(signal?: AbortSignal): Promise<KnowledgeSource[]>
@@ -58,4 +85,9 @@ export interface KnowledgeService {
     strategy: SearchStrategy,
     signal?: AbortSignal
   ): Promise<SearchHit[]>
+  createSource(
+    input: CreateKnowledgeSourceInput,
+    signal?: AbortSignal
+  ): Promise<KnowledgeSource>
+  createVectorJob(input: CreateVectorJobInput, signal?: AbortSignal): Promise<VectorJob>
 }

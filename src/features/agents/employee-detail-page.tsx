@@ -1,7 +1,10 @@
 "use client"
 
+import * as React from "react"
 import Link from "next/link"
 import { useParams } from "next/navigation"
+import { BanIcon, PauseIcon, PlayIcon } from "lucide-react"
+import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { EntityHeader } from "@/components/patterns/page-header"
 import {
   EmptyState,
@@ -15,7 +18,8 @@ import {
   AutonomyBadge,
   StatusBadge,
 } from "@/components/patterns/status-badge"
-import { useService } from "@/hooks/use-service"
+import { Button } from "@/components/ui/button"
+import { useService, useServiceAction } from "@/hooks/use-service"
 import {
   formatCost,
   formatPercent,
@@ -25,6 +29,8 @@ import { agentService } from "@/services"
 import type { AgentRun, ApprovalItem } from "@/services/contracts/agents"
 
 function ApprovalsSection({ approvals }: { approvals: ApprovalItem[] }) {
+  const hasPending = approvals.some((a) => a.status === "pending")
+
   if (approvals.length === 0) {
     return (
       <EmptyState
@@ -34,25 +40,45 @@ function ApprovalsSection({ approvals }: { approvals: ApprovalItem[] }) {
     )
   }
   return (
-    <ul className="space-y-2 text-sm">
-      {approvals.map((a) => (
-        <li
-          key={a.id}
-          className="flex flex-wrap items-center justify-between gap-2 border-b border-border py-2 last:border-b-0"
-        >
-          <div className="min-w-0">
-            <p>{a.action}</p>
-            <p className="text-xs text-muted-foreground">Risk: {a.risk}</p>
-          </div>
-          <div className="flex shrink-0 items-center gap-2">
-            <ApprovalBadge status={a.status} />
-            <span className="text-xs text-muted-foreground">
-              {formatRelativeTime(a.requestedAt)}
-            </span>
-          </div>
-        </li>
-      ))}
-    </ul>
+    <div className="space-y-3">
+      {hasPending ? (
+        <p className="text-xs text-muted-foreground">
+          Pending requests can be approved or rejected in the{" "}
+          <Link href="/agents/approvals" className="font-medium hover:underline">
+            Approvals inbox
+          </Link>
+          .
+        </p>
+      ) : null}
+      <ul className="space-y-2 text-sm">
+        {approvals.map((a) => (
+          <li
+            key={a.id}
+            className="flex flex-wrap items-center justify-between gap-2 border-b border-border py-2 last:border-b-0"
+          >
+            <div className="min-w-0">
+              <p>
+                <Link
+                  href="/agents/approvals"
+                  className="font-medium hover:underline"
+                >
+                  {a.action}
+                </Link>
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {a.id} · Risk: {a.risk}
+              </p>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <ApprovalBadge status={a.status} />
+              <span className="text-xs text-muted-foreground">
+                {formatRelativeTime(a.requestedAt)}
+              </span>
+            </div>
+          </li>
+        ))}
+      </ul>
+    </div>
   )
 }
 
@@ -77,7 +103,19 @@ function RunsSection({ runs }: { runs: AgentRun[] }) {
                 on behalf of {r.delegatedUser}
               </span>
             ) : null}
-            <span className="ml-auto text-xs text-muted-foreground">
+            {r.auditEventId ? (
+              <Button
+                size="sm"
+                variant="ghost"
+                className="ml-auto"
+                render={<Link href={`/audit?event=${r.auditEventId}`} />}
+              >
+                Audit
+              </Button>
+            ) : null}
+            <span
+              className={`text-xs text-muted-foreground ${r.auditEventId ? "" : "ml-auto"}`}
+            >
               {formatCost(r.budgetConsumed)} · started{" "}
               {formatRelativeTime(r.startedAt)}
               {r.endedAt ? ` · ended ${formatRelativeTime(r.endedAt)}` : ""}
@@ -103,10 +141,22 @@ export function EmployeeDetailPage() {
   const employee = useService((s) => agentService.getEmployee(employeeId, s), [employeeId])
   const runs = useService((s) => agentService.listRuns(employeeId, s), [employeeId])
   const approvals = useService((s) => agentService.listApprovals(employeeId, s), [employeeId])
+  const [confirm, setConfirm] = React.useState<"suspend" | "revoke" | null>(null)
+  const suspendAction = useServiceAction((signal, id: string) =>
+    agentService.suspendEmployee(id, signal)
+  )
+  const resumeAction = useServiceAction((signal, id: string) =>
+    agentService.resumeEmployee(id, signal)
+  )
+  const revokeAction = useServiceAction((signal, id: string) =>
+    agentService.revokeEmployee(id, signal)
+  )
 
   if (employee.status === "loading") return <LoadingSkeleton rows={8} />
   if (employee.status === "error") return <ErrorState error={employee.error} onRetry={employee.reload} />
   const e = employee.data
+  const isPaused = e.status === "paused"
+  const isRevoked = e.status === "cancelled"
 
   return (
     <div className="flex flex-col gap-4">
@@ -115,6 +165,75 @@ export function EmployeeDetailPage() {
         title={e.name}
         titleAccessory={<><AutonomyBadge level={e.autonomy} /><StatusBadge status={e.status} /></>}
         description={e.purpose}
+        actions={
+          <>
+            {isPaused ? (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={resumeAction.status === "pending"}
+                onClick={async () => {
+                  const updated = await resumeAction.run(employeeId)
+                  if (updated) employee.reload()
+                }}
+              >
+                <PlayIcon data-icon="inline-start" />
+                {resumeAction.status === "pending" ? "Resuming…" : "Resume"}
+              </Button>
+            ) : (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={isRevoked}
+                onClick={() => setConfirm("suspend")}
+              >
+                <PauseIcon data-icon="inline-start" />
+                Suspend
+              </Button>
+            )}
+            <Button
+              variant="destructive"
+              size="sm"
+              disabled={isRevoked}
+              onClick={() => setConfirm("revoke")}
+            >
+              <BanIcon data-icon="inline-start" />
+              Revoke
+            </Button>
+          </>
+        }
+      />
+      <ConfirmActionDialog
+        open={confirm !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirm(null)
+        }}
+        title={confirm === "revoke" ? "Revoke employee" : "Suspend employee"}
+        description={
+          confirm === "revoke"
+            ? `Revoke ${e.name}? The employee cannot run again until re-provisioned.`
+            : `Suspend ${e.name}? New runs are blocked until resumed.`
+        }
+        impact={
+          confirm === "revoke"
+            ? "Active runs are cancelled; credentials and tool grants are revoked."
+            : "In-flight runs finish; scheduled triggers are held."
+        }
+        confirmLabel={confirm === "revoke" ? "Revoke" : "Suspend"}
+        destructive={confirm === "revoke"}
+        confirming={
+          suspendAction.status === "pending" || revokeAction.status === "pending"
+        }
+        onConfirm={async () => {
+          const updated =
+            confirm === "revoke"
+              ? await revokeAction.run(employeeId)
+              : await suspendAction.run(employeeId)
+          if (updated) {
+            setConfirm(null)
+            employee.reload()
+          }
+        }}
       />
       <div className="grid gap-3 lg:grid-cols-3">
         <SectionCard title="Budget">
