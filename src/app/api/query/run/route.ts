@@ -18,6 +18,14 @@ export async function POST(req: Request) {
   if (!sql || typeof sql !== "string") {
     return NextResponse.json({ error: "sql wajib diisi" }, { status: 400 });
   }
+  // Guard read-only: Query Studio hanya untuk SELECT/WITH/SHOW/DESCRIBE/EXPLAIN.
+  if (!/^\s*(with|select|show|describe|desc|explain)\b/i.test(sql) ||
+      /\b(insert|alter|drop|delete|update|create|truncate|rename|attach|detach|grant|revoke)\b/i.test(sql)) {
+    return NextResponse.json(
+      { error: "Hanya query baca (SELECT/SHOW/DESCRIBE/EXPLAIN) yang diizinkan di Query Studio." },
+      { status: 422 },
+    );
+  }
 
   const started = Date.now();
   try {
