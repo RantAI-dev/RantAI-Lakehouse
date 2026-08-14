@@ -17,7 +17,7 @@ import {
   SidebarRail,
 } from "@/components/ui/sidebar"
 import { cn } from "@/lib/utils"
-import { NAV_GROUPS, activeNavHref } from "./nav-config"
+import { visibleNavGroups, activeNavHref } from "./nav-config"
 
 /** Rantai brand mark shown in the sidebar header (32px). */
 function BrandLogo() {
@@ -67,7 +67,7 @@ export function AppSidebar() {
         </div>
       </SidebarHeader>
       <SidebarContent className="group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:flex-col group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:gap-0">
-        {NAV_GROUPS.map((group) => (
+        {visibleNavGroups().map((group) => (
           <SidebarGroup
             key={group.label}
             className="gap-0 px-2 py-2 group-data-[collapsible=icon]:w-full group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:px-2"

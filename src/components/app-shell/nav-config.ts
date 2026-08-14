@@ -38,6 +38,12 @@ export type NavItem = {
   title: string
   href: string
   icon: LucideIcon
+  /**
+   * true = halaman masih memakai data MOCK (belum tersambung engine nyata).
+   * Disembunyikan dari sidebar kecuali NEXT_PUBLIC_SHOW_PREVIEW="1".
+   * Hilangkan flag ini begitu service-nya sudah nyata.
+   */
+  preview?: boolean
 }
 
 export type NavGroup = {
@@ -65,7 +71,7 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [
       { title: "Overview", href: "/", icon: LayoutDashboard },
       { title: "Activity", href: "/activity", icon: Activity },
-      { title: "Alerts", href: "/alerts", icon: BellRing },
+      { title: "Alerts", href: "/alerts", icon: BellRing, preview: true },
     ],
   },
   {
@@ -74,46 +80,48 @@ export const NAV_GROUPS: NavGroup[] = [
       { title: "Data Explorer", href: "/data", icon: Database },
       { title: "Catalog", href: "/catalog", icon: Library },
       { title: "Storage Lifecycle", href: "/storage", icon: HardDrive },
-      { title: "Connectors", href: "/connectors", icon: Plug },
+      { title: "Connectors", href: "/connectors", icon: Plug, preview: true },
     ],
   },
   {
     label: "Build",
     items: [
       { title: "Pipelines", href: "/pipelines", icon: GitBranch },
-      { title: "Streaming Jobs", href: "/streaming", icon: Radio },
+      { title: "Streaming Jobs", href: "/streaming", icon: Radio, preview: true },
       { title: "Query Studio", href: "/query-studio", icon: SearchCode },
     ],
   },
   {
     label: "Intelligence",
     items: [
-      { title: "Knowledge", href: "/knowledge", icon: Sparkles },
-      { title: "Vector Jobs", href: "/vector-jobs", icon: Layers },
-      { title: "Semantic Search", href: "/semantic-search", icon: ScanSearch },
-      { title: "Agent Workflows", href: "/agents/workflows", icon: Workflow },
-      { title: "Digital Employees", href: "/agents/employees", icon: Bot },
-      { title: "Approvals", href: "/agents/approvals", icon: ClipboardCheck },
-      { title: "Tool Registry", href: "/agents/tools", icon: Wrench },
+      { title: "Knowledge", href: "/knowledge", icon: Sparkles, preview: true },
+      { title: "Vector Jobs", href: "/vector-jobs", icon: Layers, preview: true },
+      { title: "Semantic Search", href: "/semantic-search", icon: ScanSearch, preview: true },
+      { title: "Agent Workflows", href: "/agents/workflows", icon: Workflow, preview: true },
+      { title: "Digital Employees", href: "/agents/employees", icon: Bot, preview: true },
+      { title: "Approvals", href: "/agents/approvals", icon: ClipboardCheck, preview: true },
+      { title: "Tool Registry", href: "/agents/tools", icon: Wrench, preview: true },
     ],
   },
   {
     label: "Governance",
     items: [
-      { title: "Policies", href: "/governance/policies", icon: ShieldCheck },
+      { title: "Policies", href: "/governance/policies", icon: ShieldCheck, preview: true },
       {
         title: "Classification & Masking",
         href: "/governance/classification",
         icon: Tags,
+        preview: true,
       },
       {
         title: "Data Quality",
         href: "/governance/data-quality",
         icon: ListChecks,
+        preview: true,
       },
-      { title: "Lineage", href: "/lineage", icon: Waypoints },
-      { title: "Audit", href: "/audit", icon: FileText },
-      { title: "Residency", href: "/residency", icon: Globe2 },
+      { title: "Lineage", href: "/lineage", icon: Waypoints, preview: true },
+      { title: "Audit", href: "/audit", icon: FileText, preview: true },
+      { title: "Residency", href: "/residency", icon: Globe2, preview: true },
     ],
   },
   {
@@ -128,18 +136,37 @@ export const NAV_GROUPS: NavGroup[] = [
   {
     label: "Administration",
     items: [
-      { title: "Users", href: "/admin/users", icon: Users },
-      { title: "Teams & Roles", href: "/admin/roles", icon: Building2 },
-      { title: "Tenants", href: "/admin/tenants", icon: Boxes },
+      { title: "Users", href: "/admin/users", icon: Users, preview: true },
+      { title: "Teams & Roles", href: "/admin/roles", icon: Building2, preview: true },
+      { title: "Tenants", href: "/admin/tenants", icon: Boxes, preview: true },
       {
         title: "Service Identities",
         href: "/admin/service-identities",
         icon: KeyRound,
+        preview: true,
       },
       { title: "Settings", href: "/settings", icon: Settings },
     ],
   },
 ]
+
+/**
+ * Apakah item preview (mock) ditampilkan. Default TIDAK; set
+ * NEXT_PUBLIC_SHOW_PREVIEW="1" untuk memunculkan lagi semua halaman mock.
+ */
+export const SHOW_PREVIEW = process.env.NEXT_PUBLIC_SHOW_PREVIEW === "1"
+
+/**
+ * Grup nav yang tampil di sidebar. Menyaring item `preview` (kecuali
+ * SHOW_PREVIEW), lalu membuang grup yang jadi kosong.
+ */
+export function visibleNavGroups(): NavGroup[] {
+  if (SHOW_PREVIEW) return NAV_GROUPS
+  return NAV_GROUPS.map((g) => ({
+    ...g,
+    items: g.items.filter((it) => !it.preview),
+  })).filter((g) => g.items.length > 0)
+}
 
 /** Flat list of every sidebar nav item, used for active-state and command search. */
 export const ALL_NAV_ITEMS: NavItem[] = NAV_GROUPS.flatMap((g) => g.items)
