@@ -36,10 +36,24 @@ export const clickhouseQueryService: QueryService = {
     return postJson<QueryEstimate>("/api/query/estimate", sql, signal);
   },
 
+  // ── NYATA (agent text-to-SQL, LLM di-grounding ke skema lakehouse) ──────
+  async generateSql(question, signal) {
+    const res = await fetch("/api/agent/text-to-sql", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+      signal,
+    });
+    const json = await res.json();
+    if (!res.ok) {
+      throw new ServiceError("unavailable", json?.detail ?? json?.error ?? "Agent tak tersedia");
+    }
+    return { sql: json.sql, explanation: json.explanation ?? "", assumptions: json.assumptions ?? [] };
+  },
+
   // ── Sementara delegasi ke mock (fase berikutnya dibuat nyata) ───────────
   listSaved: (signal) => mockQueryService.listSaved(signal),
   listHistory: (signal) => mockQueryService.listHistory(signal),
-  generateSql: (question, signal) => mockQueryService.generateSql(question, signal),
   listCollaboration: (signal) => mockQueryService.listCollaboration(signal),
   createCollaborationProject: (input, signal) =>
     mockQueryService.createCollaborationProject(input, signal),

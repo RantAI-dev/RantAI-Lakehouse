@@ -8,6 +8,7 @@ import { mockPipelineService } from "./mock/pipelines"
 import { mockStreamingService } from "./mock/streaming"
 import { mockQueryService } from "./mock/queries"
 import { clickhouseQueryService } from "./clients/queries"
+import { clickhouseAssetService } from "./clients/assets"
 import { mockKnowledgeService } from "./mock/knowledge"
 import { mockAgentService } from "./mock/agents"
 import { mockGovernanceService } from "./mock/governance"
@@ -17,7 +18,8 @@ import { mockConnectorService } from "./mock/connectors"
 import { mockStorageService } from "./mock/storage"
 
 export const overviewService = mockOverviewService
-export const assetService = mockAssetService
+export const assetService = clickhouseAssetService
+void mockAssetService
 export const pipelineService = mockPipelineService
 export const streamingService = mockStreamingService
 // Query Studio kini NYATA — eksekusi SQL di ClickHouse (lakehouse kita).
