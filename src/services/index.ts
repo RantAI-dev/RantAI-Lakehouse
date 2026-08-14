@@ -7,6 +7,7 @@ import { mockAssetService } from "./mock/assets"
 import { mockPipelineService } from "./mock/pipelines"
 import { mockStreamingService } from "./mock/streaming"
 import { mockQueryService } from "./mock/queries"
+import { clickhouseQueryService } from "./clients/queries"
 import { mockKnowledgeService } from "./mock/knowledge"
 import { mockAgentService } from "./mock/agents"
 import { mockGovernanceService } from "./mock/governance"
@@ -19,7 +20,10 @@ export const overviewService = mockOverviewService
 export const assetService = mockAssetService
 export const pipelineService = mockPipelineService
 export const streamingService = mockStreamingService
-export const queryService = mockQueryService
+// Query Studio kini NYATA — eksekusi SQL di ClickHouse (lakehouse kita).
+// Sisanya masih mock sampai client-nya dibuat (fase berikutnya).
+export const queryService = clickhouseQueryService
+void mockQueryService
 export const knowledgeService = mockKnowledgeService
 export const agentService = mockAgentService
 export const governanceService = mockGovernanceService
