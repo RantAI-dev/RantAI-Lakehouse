@@ -10,6 +10,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { SqlEditor } from "@/components/sql-editor"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { queryService } from "@/services"
+import { askAgentSql, type AgentQueryResult } from "@/services/clients/agent-client"
 import { HistoryQuickList, SavedQuickList } from "./query-context-lists"
 import { QueryResultsSection } from "./query-results-section"
 import { QueryStudioTabs } from "./query-studio-tabs"
@@ -65,6 +66,26 @@ export function QueryStudioPage() {
     }
   }
 
+  // Agentic ask: NL → generate SQL → JALANKAN → koreksi diri bila error →
+  // jelaskan hasil. Satu tombol, loop penuh di server (/api/agent/query).
+  const [agentBusy, setAgentBusy] = React.useState(false)
+  const [agentResult, setAgentResult] = React.useState<AgentQueryResult | null>(null)
+  const [agentError, setAgentError] = React.useState<string | null>(null)
+  async function handleAsk() {
+    setAgentBusy(true)
+    setAgentError(null)
+    setAgentResult(null)
+    try {
+      const out = await askAgentSql(question)
+      setAgentResult(out)
+      setSql(out.sql) // muat SQL final ke editor untuk ditinjau/di-tweak
+    } catch (e) {
+      setAgentError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setAgentBusy(false)
+    }
+  }
+
   function loadSql(next: string) {
     setSql(next)
     setTab("sql")
@@ -98,18 +119,72 @@ export function QueryStudioPage() {
               <div className="flex items-center gap-3">
                 <Button
                   size="sm"
+                  onClick={handleAsk}
+                  disabled={agentBusy || !question.trim()}
+                >
+                  {agentBusy ? "Agent bekerja…" : "✦ Ask (agentic)"}
+                </Button>
+                <Button
+                  size="sm"
                   variant="outline"
                   onClick={handleGenerate}
                   disabled={generating || !question.trim()}
                 >
-                  {generating ? "Generating…" : "Generate SQL"}
+                  {generating ? "Generating…" : "Generate SQL only"}
                 </Button>
-                {generateAct.status === "error" ? (
-                  <p className="text-xs text-destructive">
-                    {generateAct.error.message}
-                  </p>
+                {agentError ? (
+                  <p className="text-xs text-destructive">{agentError}</p>
+                ) : generateAct.status === "error" ? (
+                  <p className="text-xs text-destructive">{generateAct.error.message}</p>
                 ) : null}
               </div>
+
+              {/* Hasil agentic: jawaban NL + jejak langkah (plan→act→correct) + preview */}
+              {agentResult ? (
+                <SectionCard title="Jawaban agent">
+                  <p className="text-sm">{agentResult.answer}</p>
+                  <p className="mt-2 text-xs text-muted-foreground">
+                    {agentResult.rowCount} baris · SQL final dimuat ke editor.
+                  </p>
+                  <details className="mt-3">
+                    <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
+                      Jejak agent ({agentResult.steps.length} langkah)
+                    </summary>
+                    <ol className="mt-2 space-y-1 text-xs text-muted-foreground">
+                      {agentResult.steps.map((s, i) => (
+                        <li key={i}>
+                          <span className="font-mono text-foreground">{s.step}</span>: {s.detail}
+                        </li>
+                      ))}
+                    </ol>
+                  </details>
+                  {agentResult.rows.length ? (
+                    <div className="mt-3 overflow-x-auto rounded-md border">
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr>
+                            {agentResult.columns.map((c) => (
+                              <th key={c} className="border-b px-2 py-1 text-left font-medium">{c}</th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {agentResult.rows.slice(0, 10).map((r, i) => (
+                            <tr key={i}>
+                              {agentResult.columns.map((c) => (
+                                <td key={c} className="border-b px-2 py-1 font-mono">
+                                  {String((r as Record<string, unknown>)[c] ?? "")}
+                                </td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : null}
+                </SectionCard>
+              ) : null}
+
               {generateAct.data ? (
                 <SectionCard title="Explanation">
                   <p className="text-sm">{generateAct.data.explanation}</p>
