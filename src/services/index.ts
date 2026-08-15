@@ -13,6 +13,7 @@ import { dagsterPipelineService } from "./clients/pipelines"
 import { clickhouseStorageService } from "./clients/storage"
 import { clickhouseOpsService } from "./clients/ops"
 import { clickhouseOverviewService } from "./clients/overview"
+import { clickhouseGovernanceService } from "./clients/governance"
 import { mockKnowledgeService } from "./mock/knowledge"
 import { mockAgentService } from "./mock/agents"
 import { mockGovernanceService } from "./mock/governance"
@@ -34,7 +35,8 @@ export const queryService = clickhouseQueryService
 void mockQueryService
 export const knowledgeService = mockKnowledgeService
 export const agentService = mockAgentService
-export const governanceService = mockGovernanceService
+export const governanceService = clickhouseGovernanceService
+void mockGovernanceService
 export const opsService = clickhouseOpsService
 void mockOpsService
 export const identityService = mockIdentityService
