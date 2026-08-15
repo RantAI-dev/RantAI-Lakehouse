@@ -1,12 +1,12 @@
 /**
- * Klien LLM (server-side) — OpenAI-compatible. Default menunjuk ke llm-node
- * kita (llama-swap, endpoint /v1). Endpoint & model dikonfigurasi via env
- * supaya bisa diarahkan ke node lain tanpa ubah kode.
+ * Klien LLM (server-side) — OpenAI-compatible. Default MiniMax (endpoint
+ * OpenAI-compatible). Bisa diarahkan ke node lain (llm-node dll) via env
+ * LLM_URL/LLM_MODEL/LLM_KEY tanpa ubah kode.
  */
 
-const LLM_URL = process.env.LLM_URL ?? "http://192.168.18.197:8080/v1";
-const LLM_MODEL = process.env.LLM_MODEL ?? "qwen2.5-coder";
-const LLM_KEY = process.env.LLM_KEY ?? "sk-node-KOyNu45PbpDUUgG3qPNw0REoql6N7P5f";
+const LLM_URL = process.env.LLM_URL ?? "https://api.minimax.io/v1";
+const LLM_MODEL = process.env.LLM_MODEL ?? "MiniMax-M2";
+const LLM_KEY = process.env.LLM_KEY ?? "";
 
 export type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 
@@ -34,7 +34,16 @@ export async function chat(
     throw new Error(`LLM ${res.status}: ${(await res.text()).slice(0, 200)}`);
   }
   const json = await res.json();
-  return json?.choices?.[0]?.message?.content ?? "";
+  const msg = json?.choices?.[0]?.message ?? {};
+  // Model reasoning (MiniMax-M2, dll) bisa menaruh "berpikir" di
+  // reasoning_content atau membungkusnya <think>...</think> di content.
+  // Kita hanya mau jawaban final.
+  let content: string = msg.content ?? "";
+  content = content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  if (!content && typeof msg.reasoning_content === "string") {
+    content = msg.reasoning_content;
+  }
+  return content;
 }
 
 export function llmConfigured(): { url: string; model: string } {
