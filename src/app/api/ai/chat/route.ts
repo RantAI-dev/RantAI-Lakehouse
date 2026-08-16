@@ -1,6 +1,34 @@
 import { NextResponse } from "next/server";
-import { chatWithTools, type LlmMessage } from "@/services/clients/llm";
+import { chatWithTools, type LlmMessage, type ToolCall } from "@/services/clients/llm";
 import { TOOL_SCHEMAS, runTool } from "@/services/clients/ai-tools";
+import { schemaContext } from "@/services/clients/agent-tools";
+
+/**
+ * MiniMax-M2 kadang memancarkan tool call sebagai XML di content, bukan field
+ * tool_calls standar OpenAI:
+ *   <minimax:tool_call><invoke name="run_sql">
+ *     <parameter name="sql">SELECT ...</parameter></invoke></minimax:tool_call>
+ * Parse itu jadi ToolCall standar supaya loop tetap jalan.
+ */
+function parseMinimaxToolCalls(content: string): ToolCall[] {
+  const calls: ToolCall[] = [];
+  const invokeRe = /<invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/invoke>/g;
+  let m: RegExpExecArray | null;
+  let idx = 0;
+  while ((m = invokeRe.exec(content))) {
+    const name = m[1];
+    const args: Record<string, string> = {};
+    const paramRe = /<parameter\s+name="([^"]+)"\s*>([\s\S]*?)<\/parameter>/g;
+    let p: RegExpExecArray | null;
+    while ((p = paramRe.exec(m[2]))) args[p[1]] = p[2].trim();
+    calls.push({ id: `mmx-${idx++}`, type: "function", function: { name, arguments: JSON.stringify(args) } });
+  }
+  return calls;
+}
+
+function stripToolXml(s: string): string {
+  return s.replace(/<minimax:tool_call>[\s\S]*?<\/minimax:tool_call>/gi, "").replace(/<\/?think>/gi, "").trim();
+}
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 120;
@@ -26,7 +54,7 @@ Panduan:
 - Jawab RINGKAS dalam Bahasa Indonesia, berdasarkan HASIL TOOL yang nyata.
   JANGAN mengarang angka atau tabel. Kalau tool error, katakan apa adanya.`;
 
-const MAX_ITER = 6;
+const MAX_ITER = 8;
 
 export async function POST(req: Request) {
   let history: LlmMessage[] = [];
@@ -41,7 +69,17 @@ export async function POST(req: Request) {
   }
   if (!history.length) return NextResponse.json({ error: "messages kosong" }, { status: 400 });
 
-  const messages: LlmMessage[] = [{ role: "system", content: SYSTEM }, ...history];
+  // Grounding skema mart NYATA di awal supaya agen langsung pakai serving.mart_*
+  // (bukan menebak tabel silver mentah).
+  let schema = "";
+  try {
+    schema = await schemaContext();
+  } catch {
+    /* lanjut tanpa skema */
+  }
+  const sys = schema ? `${SYSTEM}\n\nSKEMA TERSEDIA:\n${schema}` : SYSTEM;
+
+  const messages: LlmMessage[] = [{ role: "system", content: sys }, ...history];
   const toolTrace: { tool: string; args: unknown; ok: boolean }[] = [];
 
   try {
@@ -49,13 +87,20 @@ export async function POST(req: Request) {
       const msg = await chatWithTools(messages, TOOL_SCHEMAS, { signal: req.signal });
       messages.push(msg);
 
-      const calls = msg.tool_calls ?? [];
+      // Tool call bisa dari field standar ATAU format XML MiniMax di content.
+      const calls: ToolCall[] = [
+        ...(msg.tool_calls ?? []),
+        ...(typeof msg.content === "string" ? parseMinimaxToolCalls(msg.content) : []),
+      ];
       if (!calls.length) {
-        // Jawaban final.
-        return NextResponse.json({ answer: msg.content ?? "", toolTrace });
+        // Jawaban final (buang sisa XML tool bila ada).
+        return NextResponse.json({ answer: stripToolXml(msg.content ?? ""), toolTrace });
       }
 
       // Eksekusi tiap tool call → umpan balik ke model.
+      // Format respons berbeda: call standar (id bukan mmx-*) → role "tool"
+      // dengan tool_call_id; call XML MiniMax → role "user" (aman lintas format).
+      const xmlFeedback: string[] = [];
       for (const call of calls) {
         let args: Record<string, unknown> = {};
         try {
@@ -66,11 +111,17 @@ export async function POST(req: Request) {
         const result = await runTool(call.function.name, args);
         const ok = !(result && typeof result === "object" && "error" in (result as object));
         toolTrace.push({ tool: call.function.name, args, ok });
+        const payload = JSON.stringify(result).slice(0, 8000);
+        if (call.id.startsWith("mmx-")) {
+          xmlFeedback.push(`Hasil ${call.function.name}: ${payload}`);
+        } else {
+          messages.push({ role: "tool", tool_call_id: call.id, name: call.function.name, content: payload });
+        }
+      }
+      if (xmlFeedback.length) {
         messages.push({
-          role: "tool",
-          tool_call_id: call.id,
-          name: call.function.name,
-          content: JSON.stringify(result).slice(0, 8000),
+          role: "user",
+          content: `HASIL TOOL:\n${xmlFeedback.join("\n")}\n\nLanjutkan: pakai hasil ini untuk menjawab, atau panggil tool lain bila perlu.`,
         });
       }
     }

@@ -5,8 +5,9 @@
  */
 
 const LLM_URL = process.env.LLM_URL ?? "https://api.minimax.io/v1";
-const LLM_MODEL = process.env.LLM_MODEL ?? "MiniMax-M2";
-const LLM_KEY = process.env.LLM_KEY ?? "";
+const LLM_MODEL = process.env.LLM_MODEL ?? "MiniMax-M3";
+// Terima LLM_KEY atau MINIMAX_API_KEY (nama yang dipakai user).
+const LLM_KEY = process.env.LLM_KEY || process.env.MINIMAX_API_KEY || "";
 
 export type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
 
