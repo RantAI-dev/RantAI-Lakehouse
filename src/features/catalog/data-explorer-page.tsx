@@ -16,7 +16,6 @@ import { useService } from "@/hooks/use-service"
 import { formatBytes } from "@/lib/format"
 import {
   DATA_LAYER_LABEL,
-  DATA_LAYER_LABEL_ID,
   STORAGE_TIER_LABEL,
   type DataLayer,
   type StorageTier,
@@ -53,7 +52,6 @@ const columns: ColumnDef<Asset>[] = [
           {ASSET_TYPE_LABEL[r.type]}
           <span className="mx-1.5 text-border">·</span>
           {DATA_LAYER_LABEL[r.layer]}
-          <span className="text-muted-foreground/70"> ({DATA_LAYER_LABEL_ID[r.layer]})</span>
         </p>
       </div>
     ),
@@ -122,7 +120,7 @@ export function DataExplorerPage() {
     <div className="flex flex-col gap-5">
       <PageHeader
         title="Data Explorer"
-        description="Jelajahi aset per layer data — Bronze/Silver/Gold (Mentah → Bersih → Siap-Pakai)."
+        description="Browse governed assets by data layer (Raw → Gold)."
       />
 
       <div className="flex flex-col gap-3">
@@ -133,10 +131,7 @@ export function DataExplorerPage() {
         >
           {LAYERS.map((t) => {
             const selected = layer === t
-            const label =
-              t === "all"
-                ? "All"
-                : `${DATA_LAYER_LABEL[t]} · ${DATA_LAYER_LABEL_ID[t]}`
+            const label = t === "all" ? "All" : DATA_LAYER_LABEL[t]
             return (
               <button
                 key={t}
