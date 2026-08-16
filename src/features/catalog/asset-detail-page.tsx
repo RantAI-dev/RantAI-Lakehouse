@@ -13,7 +13,13 @@ import {
 } from "@/components/patterns/status-badge"
 import { useService } from "@/hooks/use-service"
 import { formatBytes, formatCompactNumber, formatRelativeTime } from "@/lib/format"
-import { DATA_LAYER_LABEL, ENGINE_CATEGORY_LABEL } from "@/lib/status"
+import {
+  DATA_ARCH_COMPONENT_LABEL,
+  DATA_LAYER_ARCH,
+  DATA_LAYER_LABEL,
+  DATA_LAYER_LABEL_ID,
+  ENGINE_CATEGORY_LABEL,
+} from "@/lib/status"
 import { assetService } from "@/services"
 import { ASSET_TYPE_LABEL } from "@/services/contracts/assets"
 import { AssetDetailTabs } from "./asset-detail-tabs"
@@ -52,7 +58,8 @@ export function AssetDetailPage() {
         items={[
           { label: "Namespace", value: <span className="font-mono text-xs">{a.namespace}</span> },
           { label: "Type", value: ASSET_TYPE_LABEL[a.type] },
-          { label: "Layer", value: DATA_LAYER_LABEL[a.layer] },
+          { label: "Layer", value: `${DATA_LAYER_LABEL[a.layer]} · ${DATA_LAYER_LABEL_ID[a.layer]}` },
+          { label: "Komponen", value: DATA_ARCH_COMPONENT_LABEL[DATA_LAYER_ARCH[a.layer]] },
           { label: "Format", value: a.format },
           { label: "Engine", value: ENGINE_CATEGORY_LABEL[a.engine] },
           { label: "Rows", value: formatCompactNumber(a.rows) },

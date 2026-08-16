@@ -16,6 +16,7 @@ import { useService } from "@/hooks/use-service"
 import { formatBytes } from "@/lib/format"
 import {
   DATA_LAYER_LABEL,
+  DATA_LAYER_LABEL_ID,
   STORAGE_TIER_LABEL,
   type DataLayer,
   type StorageTier,
@@ -45,6 +46,7 @@ const columns: ColumnDef<Asset>[] = [
           {ASSET_TYPE_LABEL[r.type]}
           <span className="mx-1.5 text-border">·</span>
           {DATA_LAYER_LABEL[r.layer]}
+          <span className="text-muted-foreground/70"> ({DATA_LAYER_LABEL_ID[r.layer]})</span>
         </p>
       </div>
     ),
@@ -163,7 +165,7 @@ export function DataExplorerPage() {
               onChange={(v) => setParam("layer", v)}
               options={Object.entries(DATA_LAYER_LABEL).map(([value, label]) => ({
                 value,
-                label,
+                label: `${label} · ${DATA_LAYER_LABEL_ID[value as DataLayer]}`,
               }))}
               className="min-w-28"
             />

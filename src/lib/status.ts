@@ -91,6 +91,51 @@ export const DATA_LAYER_LABEL: Record<DataLayer, string> = {
   semantic: "Semantic",
 }
 
+/**
+ * Alias Bahasa Indonesia untuk layer medallion — nama teknis (Bronze/Silver/
+ * Gold) tetap kanonik di kode & badge, alias ini untuk audiens non-teknis
+ * (Dinas). Sumbu ini soal KEMATANGAN data, bukan penempatan fisik.
+ */
+export const DATA_LAYER_LABEL_ID: Record<DataLayer, string> = {
+  raw: "Sumber",
+  bronze: "Mentah",
+  silver: "Bersih",
+  gold: "Siap-Pakai",
+  semantic: "Semantik",
+}
+
+/**
+ * Komponen arsitektur tempat tiap layer FISIK tinggal — sumbu berbeda dari
+ * kematangan (medallion) maupun suhu akses (hot/warm/cold). Ini yang dipakai
+ * saat menjelaskan "datanya di sistem mana": Data Lake (Iceberg) → Warehouse
+ * (ClickHouse) → Mart (serving).
+ */
+export type DataArchComponent = "landing" | "lake" | "warehouse" | "mart" | "ai"
+
+export const DATA_ARCH_COMPONENT_LABEL: Record<DataArchComponent, string> = {
+  landing: "Landing",
+  lake: "Data Lake",
+  warehouse: "Warehouse",
+  mart: "Mart",
+  ai: "AI Store",
+}
+
+export const DATA_LAYER_ARCH: Record<DataLayer, DataArchComponent> = {
+  raw: "landing",
+  bronze: "lake",
+  silver: "warehouse",
+  gold: "mart",
+  semantic: "ai",
+}
+
+export const DATA_LAYER_DESCRIPTION: Record<DataLayer, string> = {
+  raw: "Berkas & tarikan API apa adanya sebelum masuk lake.",
+  bronze: "Data mentah tervalidasi skema di Data Lake (Iceberg).",
+  silver: "Sudah dibersihkan & dikonformasi di Warehouse (ClickHouse).",
+  gold: "Metrik bisnis siap pakai — mart & dashboard.",
+  semantic: "Vektor & fitur untuk pencarian dan AI.",
+}
+
 /** Data classification levels used by policies and residency rules. */
 export type Classification =
   | "public"

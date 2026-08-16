@@ -21,7 +21,10 @@ import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatBytes, formatPercent, formatRelativeTime } from "@/lib/format"
 import {
+  DATA_ARCH_COMPONENT_LABEL,
+  DATA_LAYER_ARCH,
   DATA_LAYER_LABEL,
+  DATA_LAYER_LABEL_ID,
   STORAGE_TIER_LABEL,
   type DataLayer,
   type StorageTier,
@@ -221,13 +224,19 @@ export function StoragePage() {
             </div>
             <div className="mt-4 space-y-2">
               <p className="text-xs text-muted-foreground">
-                Logical layers classify curated value — not physical placement. A Gold
-                dataset may span Hot, Warm, and Cold depending on access patterns.
+                Three orthogonal axes: <strong>maturity</strong> (Bronze→Gold /
+                Mentah→Siap-Pakai), <strong>access temperature</strong> (Hot / Warm /
+                Cold), and <strong>architecture component</strong> (Data Lake →
+                Warehouse → Mart). A Gold dataset may still span Hot, Warm, and Cold.
               </p>
               <div className="flex flex-wrap items-center gap-2">
                 {DATA_LAYERS.map((layer) => (
                   <Pill key={layer} tone="neutral">
-                    {DATA_LAYER_LABEL[layer]}
+                    {DATA_LAYER_LABEL[layer]} · {DATA_LAYER_LABEL_ID[layer]}
+                    <span className="text-muted-foreground/70">
+                      {" "}
+                      — {DATA_ARCH_COMPONENT_LABEL[DATA_LAYER_ARCH[layer]]}
+                    </span>
                   </Pill>
                 ))}
               </div>
