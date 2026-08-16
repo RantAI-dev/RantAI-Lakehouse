@@ -29,7 +29,14 @@ import {
   type AssetType,
 } from "@/services/contracts/assets"
 
-const TIERS: (StorageTier | "all")[] = ["all", "hot", "warm", "cold", "ai"]
+const LAYERS: (DataLayer | "all")[] = [
+  "all",
+  "raw",
+  "bronze",
+  "silver",
+  "gold",
+  "semantic",
+]
 
 const columns: ColumnDef<Asset>[] = [
   {
@@ -75,7 +82,7 @@ const columns: ColumnDef<Asset>[] = [
   },
 ]
 
-/** Data Explorer — browse assets by tier (primary) and logical layer (secondary). */
+/** Data Explorer — browse assets by data layer (primary) and storage tier (secondary). */
 export function DataExplorerPage() {
   const router = useRouter()
   const params = useSearchParams()
@@ -115,25 +122,28 @@ export function DataExplorerPage() {
     <div className="flex flex-col gap-5">
       <PageHeader
         title="Data Explorer"
-        description="Browse governed assets across storage tiers."
+        description="Jelajahi aset per layer data — Bronze/Silver/Gold (Mentah → Bersih → Siap-Pakai)."
       />
 
       <div className="flex flex-col gap-3">
         <div
           className="flex flex-wrap gap-1 rounded-lg border border-border bg-muted/40 p-1"
           role="tablist"
-          aria-label="Storage tier"
+          aria-label="Data layer"
         >
-          {TIERS.map((t) => {
-            const selected = tier === t
-            const label = t === "all" ? "All" : STORAGE_TIER_LABEL[t]
+          {LAYERS.map((t) => {
+            const selected = layer === t
+            const label =
+              t === "all"
+                ? "All"
+                : `${DATA_LAYER_LABEL[t]} · ${DATA_LAYER_LABEL_ID[t]}`
             return (
               <button
                 key={t}
                 type="button"
                 role="tab"
                 aria-selected={selected}
-                onClick={() => setParam("tier", t)}
+                onClick={() => setParam("layer", t)}
                 className={cn(
                   "rounded-md px-3 py-1.5 text-sm transition-colors",
                   selected
@@ -159,13 +169,13 @@ export function DataExplorerPage() {
               className="max-w-sm"
             />
             <FilterSelect
-              ariaLabel="Filter by logical layer"
-              allLabel="All layers"
-              value={layer}
-              onChange={(v) => setParam("layer", v)}
-              options={Object.entries(DATA_LAYER_LABEL).map(([value, label]) => ({
+              ariaLabel="Filter by storage tier"
+              allLabel="All tiers"
+              value={tier}
+              onChange={(v) => setParam("tier", v)}
+              options={Object.entries(STORAGE_TIER_LABEL).map(([value, label]) => ({
                 value,
-                label: `${label} · ${DATA_LAYER_LABEL_ID[value as DataLayer]}`,
+                label,
               }))}
               className="min-w-28"
             />
