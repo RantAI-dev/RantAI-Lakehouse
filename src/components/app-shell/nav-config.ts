@@ -67,6 +67,12 @@ export type NavGroup = {
  */
 export const NAV_GROUPS: NavGroup[] = [
   {
+    label: "AI",
+    items: [
+      { title: "AI Copilot", href: "/copilot", icon: Sparkles },
+    ],
+  },
+  {
     label: "Overview",
     items: [
       { title: "Overview", href: "/", icon: LayoutDashboard },

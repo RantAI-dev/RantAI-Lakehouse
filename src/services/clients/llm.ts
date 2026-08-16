@@ -49,3 +49,45 @@ export async function chat(
 export function llmConfigured(): { url: string; model: string } {
   return { url: LLM_URL, model: LLM_MODEL };
 }
+
+export type ToolCall = { id: string; type: "function"; function: { name: string; arguments: string } };
+export type LlmMessage = {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | null;
+  tool_calls?: ToolCall[];
+  tool_call_id?: string;
+  name?: string;
+};
+
+/**
+ * Chat dengan function-calling. Mengembalikan message asisten mentah (bisa
+ * berisi tool_calls). Dipakai loop agentic AI Copilot.
+ */
+export async function chatWithTools(
+  messages: LlmMessage[],
+  tools: unknown[],
+  opts: { signal?: AbortSignal; maxTokens?: number; temperature?: number } = {},
+): Promise<LlmMessage> {
+  const res = await fetch(`${LLM_URL}/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${LLM_KEY}` },
+    body: JSON.stringify({
+      model: LLM_MODEL,
+      messages,
+      tools,
+      tool_choice: "auto",
+      temperature: opts.temperature ?? 0.2,
+      max_tokens: opts.maxTokens ?? 1200,
+      stream: false,
+    }),
+    signal: opts.signal,
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`LLM ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const json = await res.json();
+  const msg = json?.choices?.[0]?.message ?? { role: "assistant", content: "" };
+  if (typeof msg.content === "string") {
+    msg.content = msg.content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  }
+  return msg as LlmMessage;
+}
