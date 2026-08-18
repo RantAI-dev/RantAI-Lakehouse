@@ -15,8 +15,12 @@ const TOOL_LABEL: Record<string, string> = {
   get_build_status: "Status build",
   describe_mart: "Lihat mart Gold",
   create_chart: "Buat chart",
+  update_chart: "Ubah chart",
   list_charts: "Daftar chart",
   delete_chart: "Hapus chart",
+  create_board: "Buat board",
+  list_boards: "Daftar board",
+  suggest_dashboard: "Rancang dashboard",
 };
 
 function asObj(v: unknown): Record<string, unknown> {

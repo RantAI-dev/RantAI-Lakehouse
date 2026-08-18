@@ -74,7 +74,11 @@ MODE: BUILD. Selain menjawab, kamu bisa MENGOPERASIKAN lakehouse:
      Pakai parameter breakdown (dimensi ke-2) untuk multi-seri, mis. tren per
      kawasan (line + breakdown=kawasan) atau grouped bar per kategori.
   3) konfirmasi chart dibuat & sebut muncul di halaman Dashboards.
-  Pakai list_charts/delete_chart untuk mengelola kartu tersimpan.`;
+  Pakai list_charts/update_chart/delete_chart untuk mengelola kartu tersimpan.
+- Untuk "buatkan/sarankan dashboard soal X" tanpa detail: panggil suggest_dashboard
+  (dapat katalog semua mart+kolom), usulkan 3-5 kartu, lalu buat via create_chart.
+- Untuk mengelompokkan: create_board dulu, lalu create_chart dengan board=<id>.
+- Untuk mengubah kartu: update_chart (kirim semua field dengan nilai baru).`;
 
 const MAX_ITER = 8;
 
@@ -107,7 +111,9 @@ export async function POST(req: Request) {
   const sys = schema ? `${base}\n\nSKEMA TERSEDIA:\n${schema}` : base;
 
   // Ask = read-only: sembunyikan tool yang mengubah lakehouse / dashboard.
-  const WRITE_TOOLS = new Set(["trigger_lakehouse_build", "create_chart", "delete_chart"]);
+  const WRITE_TOOLS = new Set([
+    "trigger_lakehouse_build", "create_chart", "update_chart", "delete_chart", "create_board",
+  ]);
   const tools =
     mode === "build"
       ? TOOL_SCHEMAS

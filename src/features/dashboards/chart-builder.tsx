@@ -15,6 +15,13 @@ import {
 import type { ChartKind } from "@/lib/dashboard-specs";
 
 type Fields = { dimensions: string[]; measures: string[] };
+export type ChartDef = {
+  title?: string; subtitle?: string; mart?: string; kind?: ChartKind;
+  dimension?: string; measures?: string[]; breakdown?: string;
+  aggregate?: string; span?: 1 | 2; board?: string;
+};
+type BoardOpt = { id: string; name: string };
+
 const KINDS: { value: ChartKind; label: string }[] = [
   { value: "bar", label: "Batang" },
   { value: "hbar", label: "Batang horizontal (peringkat)" },
@@ -26,12 +33,29 @@ const KINDS: { value: ChartKind; label: string }[] = [
 const AGGS = ["sum", "avg", "max", "min", "count"];
 
 /**
- * Builder chart MANUAL (jalur "Tableau"): pilih mart Gold → kolom → tipe, server
- * menyusun SQL-nya. Menulis ke artefak yang SAMA dengan jalur chat (console.
- * bi_chart), jadi manual & AI selalu sinkron.
+ * Builder chart — jalur MANUAL (ala Tableau). Dipakai dua mode:
+ *  - BUAT (punya trigger sendiri "Chart baru"),
+ *  - EDIT (dikendalikan induk: `open`, `initial` berisi id+def).
+ * Menulis ke artefak yang SAMA dengan jalur chat (console.bi_chart).
  */
-export function ChartBuilder({ onCreated }: { onCreated: () => void }) {
-  const [open, setOpen] = React.useState(false);
+export function ChartBuilder({
+  onSaved, board = "default", boards = [], initial, editId,
+  open: openProp, onOpenChange, hideTrigger,
+}: {
+  onSaved: () => void;
+  board?: string;
+  boards?: BoardOpt[];
+  initial?: ChartDef;
+  editId?: string;
+  open?: boolean;
+  onOpenChange?: (o: boolean) => void;
+  hideTrigger?: boolean;
+}) {
+  const controlled = openProp !== undefined;
+  const [openState, setOpenState] = React.useState(false);
+  const open = controlled ? openProp! : openState;
+  const setOpen = (o: boolean) => { onOpenChange?.(o); if (!controlled) setOpenState(o); };
+
   const [marts, setMarts] = React.useState<{ name: string; rows: number }[]>([]);
   const [fields, setFields] = React.useState<Fields | null>(null);
   const [busy, setBusy] = React.useState(false);
@@ -46,62 +70,79 @@ export function ChartBuilder({ onCreated }: { onCreated: () => void }) {
   const [breakdown, setBreakdown] = React.useState("");
   const [aggregate, setAggregate] = React.useState("sum");
   const [span, setSpan] = React.useState<1 | 2>(1);
+  const [targetBoard, setTargetBoard] = React.useState(board);
   const canBreakdown = kind !== "pie" && kind !== "stacked";
+  const isEdit = !!editId;
 
-  // Muat daftar mart saat dialog dibuka.
+  async function loadFields(m: string): Promise<Fields> {
+    const j = await fetch(`/api/dashboard/fields?mart=${encodeURIComponent(m)}`).then((r) => r.json());
+    const f = { dimensions: j.dimensions ?? [], measures: j.measures ?? [] };
+    setFields(f);
+    return f;
+  }
+
+  // Saat dibuka: muat mart, dan bila EDIT prefill dari initial.
   React.useEffect(() => {
     if (!open) return;
-    void fetch("/api/dashboard/fields")
-      .then((r) => r.json())
-      .then((j) => setMarts(j.marts ?? []))
-      .catch(() => setMarts([]));
+    void fetch("/api/dashboard/fields").then((r) => r.json()).then((j) => setMarts(j.marts ?? [])).catch(() => setMarts([]));
+    if (initial) {
+      setTitle(initial.title ?? "");
+      setKind((initial.kind as ChartKind) ?? "hbar");
+      setAggregate(initial.aggregate ?? "sum");
+      setSpan(initial.span === 2 ? 2 : 1);
+      setBreakdown(initial.breakdown ?? "");
+      setTargetBoard(initial.board ?? board);
+      const m = initial.mart ?? "";
+      setMart(m);
+      if (m) {
+        void loadFields(m).then(() => {
+          setDimension(initial.dimension ?? "");
+          setMeasure(initial.measures?.[0] ?? "");
+          setMeasure2(initial.measures?.[1] ?? "");
+        });
+      }
+    } else {
+      setTargetBoard(board);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
-
-  // Muat kolom saat mart dipilih.
-  React.useEffect(() => {
-    if (!mart) return setFields(null);
-    setFields(null);
-    setDimension("");
-    setMeasure("");
-    setMeasure2("");
-    void fetch(`/api/dashboard/fields?mart=${encodeURIComponent(mart)}`)
-      .then((r) => r.json())
-      .then((j) => setFields({ dimensions: j.dimensions ?? [], measures: j.measures ?? [] }))
-      .catch(() => setError("Gagal memuat kolom."));
-  }, [mart]);
 
   function reset() {
     setTitle(""); setMart(""); setKind("hbar"); setDimension("");
     setMeasure(""); setMeasure2(""); setBreakdown(""); setAggregate("sum"); setSpan(1);
-    setFields(null); setError(null);
+    setTargetBoard(board); setFields(null); setError(null);
+  }
+
+  // Ganti mart oleh USER → reset pilihan kolom & muat ulang.
+  function onMartChange(m: string) {
+    setMart(m); setDimension(""); setMeasure(""); setMeasure2(""); setBreakdown("");
+    if (m) void loadFields(m); else setFields(null);
   }
 
   async function save() {
     setError(null);
     const measures = kind === "stacked" ? [measure, measure2].filter(Boolean) : [measure].filter(Boolean);
     if (!title || !mart || !dimension || measures.length === 0) {
-      setError("Lengkapi judul, mart, dimensi, dan measure.");
-      return;
+      setError("Lengkapi judul, mart, dimensi, dan measure."); return;
     }
-    if (kind === "stacked" && measures.length < 2) {
-      setError("Chart bertumpuk butuh 2 measure.");
-      return;
-    }
+    if (kind === "stacked" && measures.length < 2) { setError("Chart bertumpuk butuh 2 measure."); return; }
     setBusy(true);
     try {
+      const payload = {
+        title, mart, kind, dimension, measures, aggregate, span, board: targetBoard,
+        breakdown: canBreakdown && breakdown ? breakdown : undefined,
+        ...(isEdit ? { id: editId } : {}),
+      };
       const res = await fetch("/api/dashboard/specs", {
-        method: "POST",
+        method: isEdit ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          title, mart, kind, dimension, measures, aggregate, span,
-          breakdown: canBreakdown && breakdown ? breakdown : undefined,
-        }),
+        body: JSON.stringify(payload),
       });
       const json = await res.json();
-      if (!res.ok) throw new Error(json?.error ?? "Gagal membuat chart");
+      if (!res.ok) throw new Error(json?.error ?? "Gagal menyimpan chart");
       setOpen(false);
-      reset();
-      onCreated();
+      if (!isEdit) reset();
+      onSaved();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -110,13 +151,15 @@ export function ChartBuilder({ onCreated }: { onCreated: () => void }) {
   }
 
   return (
-    <Dialog open={open} onOpenChange={(o) => { setOpen(o); if (!o) reset(); }}>
-      <DialogTrigger render={<Button variant="outline" size="sm" />}>
-        <Plus className="size-4" /> Chart baru
-      </DialogTrigger>
+    <Dialog open={open} onOpenChange={(o) => { setOpen(o); if (!o && !isEdit) reset(); }}>
+      {hideTrigger ? null : (
+        <DialogTrigger render={<Button variant="outline" size="sm" />}>
+          <Plus className="size-4" /> Chart baru
+        </DialogTrigger>
+      )}
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Chart baru</DialogTitle>
+          <DialogTitle>{isEdit ? "Ubah chart" : "Chart baru"}</DialogTitle>
           <DialogDescription>
             Pilih mart Gold & kolom — server menyusun query-nya. Tersimpan di lakehouse dan langsung tampil.
           </DialogDescription>
@@ -131,7 +174,7 @@ export function ChartBuilder({ onCreated }: { onCreated: () => void }) {
           <div className="grid grid-cols-2 gap-3">
             <div className="grid gap-1.5">
               <Label>Mart (Gold)</Label>
-              <Select value={mart} onValueChange={(v) => setMart(v ?? "")}>
+              <Select value={mart} onValueChange={(v) => onMartChange(v ?? "")}>
                 <SelectTrigger><SelectValue placeholder="pilih mart" /></SelectTrigger>
                 <SelectContent>
                   {marts.map((m) => (
@@ -206,25 +249,37 @@ export function ChartBuilder({ onCreated }: { onCreated: () => void }) {
             )}
           </div>
 
-          {canBreakdown ? (
+          <div className="grid grid-cols-2 gap-3">
+            {canBreakdown ? (
+              <div className="grid gap-1.5">
+                <Label>Breakdown / seri (opsional)</Label>
+                <Select
+                  value={breakdown || "__none__"}
+                  onValueChange={(v) => setBreakdown(v === "__none__" ? "" : v ?? "")}
+                  disabled={!fields}
+                >
+                  <SelectTrigger><SelectValue placeholder="tanpa breakdown" /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none__">— tanpa breakdown —</SelectItem>
+                    {fields?.dimensions.filter((d) => d !== dimension).map((d) => (
+                      <SelectItem key={d} value={d}>{d}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            ) : <div />}
             <div className="grid gap-1.5">
-              <Label>Breakdown / seri (opsional)</Label>
-              <Select
-                value={breakdown || "__none__"}
-                onValueChange={(v) => setBreakdown(v === "__none__" ? "" : v ?? "")}
-                disabled={!fields}
-              >
-                <SelectTrigger><SelectValue placeholder="tanpa breakdown" /></SelectTrigger>
+              <Label>Board</Label>
+              <Select value={targetBoard} onValueChange={(v) => setTargetBoard(v ?? "default")}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="__none__">— tanpa breakdown —</SelectItem>
-                  {fields?.dimensions.filter((d) => d !== dimension).map((d) => (
-                    <SelectItem key={d} value={d}>{d}</SelectItem>
+                  {(boards.length ? boards : [{ id: "default", name: "Utama" }]).map((b) => (
+                    <SelectItem key={b.id} value={b.id}>{b.name}</SelectItem>
                   ))}
                 </SelectContent>
               </Select>
-              <p className="text-[11px] text-muted-foreground">Pecah jadi banyak seri (mis. per kawasan). Pakai 1 measure.</p>
             </div>
-          ) : null}
+          </div>
 
           {error ? <p className="text-sm text-destructive">{error}</p> : null}
         </div>
@@ -232,7 +287,7 @@ export function ChartBuilder({ onCreated }: { onCreated: () => void }) {
         <DialogFooter>
           <DialogClose render={<Button variant="ghost" size="sm" />}>Batal</DialogClose>
           <Button size="sm" onClick={() => void save()} disabled={busy}>
-            {busy ? "Menyimpan…" : "Buat chart"}
+            {busy ? "Menyimpan…" : isEdit ? "Simpan perubahan" : "Buat chart"}
           </Button>
         </DialogFooter>
       </DialogContent>

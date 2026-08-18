@@ -212,7 +212,12 @@ export const SPEC_SQL: Record<string, string> = Object.fromEntries(
 );
 
 /** Metadata render (tanpa SQL) — inilah yang dikirim ke klien. */
-export type ChartRenderSpec = Omit<ChartSpec, "sql"> & { source: ChartSource };
+export type ChartRenderSpec = Omit<ChartSpec, "sql"> & {
+  source: ChartSource;
+  board?: string;
+  /** Definisi terstruktur (ChartInput) untuk prefill saat edit. */
+  def?: unknown;
+};
 
 /** Buang SQL dari spec, tempel asalnya — untuk respons API ke browser. */
 export function toRenderSpec(spec: ChartSpec, source: ChartSource): ChartRenderSpec {

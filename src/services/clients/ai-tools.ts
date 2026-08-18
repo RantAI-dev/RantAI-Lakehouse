@@ -6,6 +6,8 @@ import {
   insertChart,
   listStoredCharts,
   deleteChart,
+  listBoards,
+  createBoard,
   type ChartInput,
 } from "./bi-store";
 
@@ -288,6 +290,7 @@ export const TOOLS: Record<string, ToolDef> = {
             aggregate: { type: "string", enum: ["sum", "avg", "max", "min", "count"] },
             limit: { type: "number", description: "maks kategori (default 20)" },
             span: { type: "number", enum: [1, 2], description: "2 = lebar penuh" },
+            board: { type: "string", description: "id board tujuan (opsional; default 'default'). Buat dulu via create_board bila perlu." },
           },
           required: ["title", "mart", "kind", "dimension", "measures"],
         },
@@ -303,12 +306,123 @@ export const TOOLS: Record<string, ToolDef> = {
           title: spec.title,
           kind: spec.kind,
           mart: spec.mart,
+          board: spec.board,
           url: "/dashboards",
           note: "Chart tersimpan & langsung tampil di halaman Dashboards.",
         };
       } catch (e) {
         return { error: e instanceof Error ? e.message : String(e) };
       }
+    },
+  },
+
+  update_chart: {
+    schema: {
+      type: "function",
+      function: {
+        name: "update_chart",
+        description:
+          "Ubah chart tersimpan (by id) — mempertahankan id, mengganti definisinya. Kirim SEMUA field " +
+          "seperti create_chart (title, mart, kind, dimension, measures, dst) dengan nilai baru. " +
+          "Pakai list_charts untuk tahu id.",
+        parameters: {
+          type: "object",
+          properties: {
+            id: { type: "string" },
+            title: { type: "string" },
+            subtitle: { type: "string" },
+            mart: { type: "string" },
+            kind: { type: "string", enum: ["bar", "hbar", "line", "area", "pie", "stacked"] },
+            dimension: { type: "string" },
+            measures: { type: "array", items: { type: "string" } },
+            breakdown: { type: "string" },
+            aggregate: { type: "string", enum: ["sum", "avg", "max", "min", "count"] },
+            limit: { type: "number" },
+            span: { type: "number", enum: [1, 2] },
+            board: { type: "string" },
+          },
+          required: ["id", "title", "mart", "kind", "dimension", "measures"],
+        },
+      },
+    },
+    async run(args) {
+      const id = String(args.id ?? "");
+      if (!id) return { error: "id wajib" };
+      try {
+        const spec = await specFromInput(args as unknown as ChartInput, "ai", "ai", id);
+        await insertChart(spec);
+        return { updated: true, id: spec.id, title: spec.title, kind: spec.kind, mart: spec.mart };
+      } catch (e) {
+        return { error: e instanceof Error ? e.message : String(e) };
+      }
+    },
+  },
+
+  create_board: {
+    schema: {
+      type: "function",
+      function: {
+        name: "create_board",
+        description: "Buat board (dashboard bernama) baru. Kembalikan id-nya untuk dipakai di create_chart.",
+        parameters: { type: "object", properties: { name: { type: "string" } }, required: ["name"] },
+      },
+    },
+    async run(args) {
+      try {
+        const board = await createBoard(String(args.name ?? ""));
+        return { created: true, id: board.id, name: board.name, note: "Pakai id ini di create_chart.board." };
+      } catch (e) {
+        return { error: e instanceof Error ? e.message : String(e) };
+      }
+    },
+  },
+
+  list_boards: {
+    schema: {
+      type: "function",
+      function: {
+        name: "list_boards",
+        description: "Daftar board (dashboard bernama) yang ada.",
+        parameters: { type: "object", properties: {} },
+      },
+    },
+    async run() {
+      const boards = await listBoards();
+      return { boards: [{ id: "default", name: "Utama" }, ...boards] };
+    },
+  },
+
+  suggest_dashboard: {
+    schema: {
+      type: "function",
+      function: {
+        name: "suggest_dashboard",
+        description:
+          "Ambil katalog SEMUA mart Gold beserta dimensi & measure-nya sekaligus — untuk MENGUSULKAN " +
+          "set kartu dashboard. Pakai saat user minta 'buatkan/sarankan dashboard' tanpa detail. Setelah " +
+          "ini, usulkan kartu lalu buat via create_chart.",
+        parameters: { type: "object", properties: {} },
+      },
+    },
+    async run() {
+      const marts = await chRows<{ name: string; total_rows: string }>(
+        `SELECT name, toString(total_rows) AS total_rows FROM system.tables
+          WHERE database='serving' AND name NOT LIKE '%\\_baru' ORDER BY name`,
+      );
+      const numeric = /Int|Float|Decimal/;
+      const out = [];
+      for (const m of marts) {
+        const cols = await chRows<{ name: string; type: string }>(
+          `SELECT name, type FROM system.columns WHERE database='serving' AND table='${m.name}' ORDER BY position`,
+        );
+        out.push({
+          mart: m.name,
+          rows: Number(m.total_rows),
+          dimensions: cols.filter((c) => !numeric.test(c.type)).map((c) => c.name),
+          measures: cols.filter((c) => numeric.test(c.type)).map((c) => c.name),
+        });
+      }
+      return { marts: out };
     },
   },
 

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { chQuery } from "@/services/clients/clickhouse";
 import { KPIS, CHARTS, toRenderSpec } from "@/lib/dashboard-specs";
-import { listStoredCharts, type StoredChartSpec } from "@/services/clients/bi-store";
+import { listStoredCharts, listBoards, sqlWithYear, type StoredChartSpec } from "@/services/clients/bi-store";
 
 export const dynamic = "force-dynamic";
 
@@ -21,33 +21,46 @@ async function runSpec(id: string, sql: string, signal: AbortSignal): Promise<[s
 /**
  * Data + daftar kartu dashboard. Menggabungkan spec BAWAAN (seed) dengan spec
  * TERSIMPAN (dibuat lewat chat/UI, dari console.bi_chart), menjalankan SQL tiap
- * spec PARALEL ke ClickHouse (akun read-only), lalu mengembalikan:
- *  - kpis   : metadata KPI (render)
- *  - charts : metadata chart (render, tanpa SQL) — builtin + tersimpan
- *  - results: hasil per id
- * Dengan begini chart baru dari AI/UI langsung muncul tanpa ubah kode.
+ * spec PARALEL ke ClickHouse (read-only). Mendukung:
+ *  - ?board=<id>  → hanya kartu board itu (default = board bawaan + seed).
+ *  - ?year=2024,2025 → filter tahun untuk kartu tersimpan yang punya kolom tahun.
  */
 export async function GET(req: Request) {
+  const url = new URL(req.url);
+  const board = url.searchParams.get("board") || "default";
+  const years = (url.searchParams.get("year") || "")
+    .split(",").map((s) => parseInt(s, 10)).filter((n) => Number.isFinite(n));
+
   let stored: StoredChartSpec[] = [];
+  let boards: { id: string; name: string }[] = [];
   let storeError: string | null = null;
   try {
-    stored = await listStoredCharts();
+    [stored, boards] = await Promise.all([listStoredCharts(), listBoards()]);
   } catch (e) {
     storeError = e instanceof Error ? e.message : String(e);
   }
 
-  const charts = [...CHARTS, ...stored];
+  const onDefault = board === "default" || board === "all";
+  const storedForBoard = board === "all" ? stored : stored.filter((c) => (c.board || "default") === board);
+  // Seed + KPI hanya tampil di board bawaan/semua.
+  const builtinCharts = onDefault ? CHARTS : [];
+  const kpis = onDefault ? KPIS : [];
+
   const jobs: Promise<[string, CellResult]>[] = [
-    ...KPIS.map((k) => runSpec(k.id, k.sql, req.signal)),
-    ...charts.map((c) => runSpec(c.id, c.sql, req.signal)),
+    ...kpis.map((k) => runSpec(k.id, k.sql, req.signal)),
+    ...builtinCharts.map((c) => runSpec(c.id, c.sql, req.signal)),
+    ...storedForBoard.map((c) => runSpec(c.id, sqlWithYear(c, years), req.signal)),
   ];
   const settled = await Promise.all(jobs);
 
   return NextResponse.json({
-    kpis: KPIS.map((k) => ({ id: k.id, title: k.title, caption: k.caption, format: k.format })),
+    board,
+    years,
+    boards: [{ id: "default", name: "Utama" }, ...boards.map((b) => ({ id: b.id, name: b.name }))],
+    kpis: kpis.map((k) => ({ id: k.id, title: k.title, caption: k.caption, format: k.format })),
     charts: [
-      ...CHARTS.map((c) => toRenderSpec(c, "builtin")),
-      ...stored.map((c) => toRenderSpec(c, c.source)),
+      ...builtinCharts.map((c) => ({ ...toRenderSpec(c, "builtin"), board: "default" })),
+      ...storedForBoard.map((c) => ({ ...toRenderSpec(c, c.source), board: c.board, def: c.def })),
     ],
     results: Object.fromEntries(settled),
     storeError,

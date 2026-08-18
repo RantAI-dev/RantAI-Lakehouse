@@ -29,8 +29,8 @@ const SUGGESTIONS: Record<Mode, string[]> = {
     "Ringkas kualitas data lakehouse",
   ],
   build: [
-    "Bikin chart wisman per kawasan",
-    "Buat dashboard top 10 negara asal wisman",
+    "Buatkan board dashboard ringkas soal wisman",
+    "Bikin chart tren wisman per bulan dipecah per kawasan",
     "Bangun ulang data lakehouse (Bronze→Silver→Gold)",
     "Cek status build terakhir",
   ],

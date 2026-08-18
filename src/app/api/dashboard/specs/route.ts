@@ -37,6 +37,25 @@ export async function POST(req: Request) {
   }
 }
 
+/** Edit chart tersimpan (pertahankan id). Body = {id, ...ChartInput}. */
+export async function PUT(req: Request) {
+  let body: ChartInput & { id?: string };
+  try {
+    body = (await req.json()) as ChartInput & { id?: string };
+  } catch {
+    return NextResponse.json({ error: "body JSON tidak valid" }, { status: 400 });
+  }
+  const id = String(body.id ?? "");
+  if (!id) return NextResponse.json({ error: "id wajib untuk edit" }, { status: 400 });
+  try {
+    const spec = await specFromInput(body, "ui", "ui", id);
+    await insertChart(spec);
+    return NextResponse.json({ ok: true, chart: toRenderSpec(spec, "ui") });
+  } catch (e) {
+    return NextResponse.json({ error: e instanceof Error ? e.message : String(e) }, { status: 400 });
+  }
+}
+
 /** Hapus chart tersimpan (?id=). Spec bawaan tak bisa dihapus. */
 export async function DELETE(req: Request) {
   const id = new URL(req.url).searchParams.get("id");
