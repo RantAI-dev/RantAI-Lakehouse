@@ -13,6 +13,10 @@ const TOOL_LABEL: Record<string, string> = {
   get_quality: "Kualitas data",
   trigger_lakehouse_build: "Bangun lakehouse",
   get_build_status: "Status build",
+  describe_mart: "Lihat mart Gold",
+  create_chart: "Buat chart",
+  list_charts: "Daftar chart",
+  delete_chart: "Hapus chart",
 };
 
 function asObj(v: unknown): Record<string, unknown> {
@@ -136,6 +140,41 @@ function StepBody({ step }: { step: ToolStep }) {
 
   if (step.tool === "get_lineage" && typeof res.chain === "string") {
     return <p className="mt-1 font-mono text-[11px] text-muted-foreground">{res.chain}</p>;
+  }
+
+  if (step.tool === "create_chart" && res.created) {
+    return (
+      <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px]">
+        <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 font-medium text-emerald-600 dark:text-emerald-400">
+          ✓ chart dibuat
+        </span>
+        <span className="font-medium text-foreground">{String(res.title ?? "")}</span>
+        <span className="text-muted-foreground">{String(res.kind ?? "")} · {String(res.mart ?? "")}</span>
+      </div>
+    );
+  }
+
+  if (step.tool === "describe_mart") {
+    const dims = Array.isArray(res.dimensions) ? (res.dimensions as string[]) : null;
+    const meas = Array.isArray(res.measures) ? (res.measures as string[]) : null;
+    const marts = Array.isArray(res.marts) ? (res.marts as { mart: string; rows: number }[]) : null;
+    if (marts) {
+      return (
+        <ul className="mt-1 space-y-0.5 text-[11px]">
+          {marts.map((m) => (
+            <li key={m.mart} className="truncate"><span className="font-mono">{m.mart}</span> <span className="text-muted-foreground">· {m.rows.toLocaleString("id-ID")} baris</span></li>
+          ))}
+        </ul>
+      );
+    }
+    if (dims || meas) {
+      return (
+        <div className="mt-1 space-y-1 text-[11px]">
+          <p><span className="text-muted-foreground">Dimensi:</span> {(dims ?? []).join(", ") || "—"}</p>
+          <p><span className="text-muted-foreground">Measure:</span> {(meas ?? []).join(", ") || "—"}</p>
+        </div>
+      );
+    }
   }
 
   // Default: JSON ringkas.

@@ -61,3 +61,26 @@ export async function chRows<T = Record<string, unknown>>(
 ): Promise<T[]> {
   return (await chQuery(sql, signal)).data as T[];
 }
+
+/**
+ * Jalankan statement NON-SELECT (DDL/DML: CREATE/INSERT/ALTER) apa adanya —
+ * tanpa membungkus FORMAT JSON (yang akan merusak INSERT/DDL). Melempar pada
+ * error. Tidak mengembalikan baris.
+ */
+export async function chExec(sql: string, signal?: AbortSignal): Promise<void> {
+  const auth = Buffer.from(`${CH_USER}:${CH_PASSWORD}`).toString("base64");
+  const res = await fetch(CH_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${auth}`,
+      "Content-Type": "text/plain; charset=utf-8",
+    },
+    body: sql,
+    signal,
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text.trim() || `ClickHouse HTTP ${res.status}`);
+  }
+}

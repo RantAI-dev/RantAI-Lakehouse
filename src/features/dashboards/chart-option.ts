@@ -1,6 +1,9 @@
 import type { EChartsOption } from "echarts";
 import type { ChartSpec } from "@/lib/dashboard-specs";
 
+/** buildOption hanya butuh cara render (bukan SQL) — muat ChartSpec & ChartRenderSpec. */
+type Renderable = Pick<ChartSpec, "kind" | "x" | "y">;
+
 /** Palet kategorikal konsol (indigo-led). Dipakai konsisten lintas chart. */
 const PALETTE = [
   "#6366f1", "#0ea5e9", "#10b981", "#f59e0b",
@@ -21,7 +24,7 @@ const num = (v: unknown) => Number(v ?? 0);
 const str = (v: unknown) => String(v ?? "");
 
 export function buildOption(
-  spec: ChartSpec,
+  spec: Renderable,
   rows: Row[],
   dark: boolean,
 ): EChartsOption {

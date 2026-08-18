@@ -1,6 +1,13 @@
 import { chQuery, chRows } from "./clickhouse";
 import { listJobs, listRuns, launchRun, mapRunStatus } from "./dagster";
 import { isReadOnlySql } from "./agent-tools";
+import {
+  specFromInput,
+  insertChart,
+  listStoredCharts,
+  deleteChart,
+  type ChartInput,
+} from "./bi-store";
 
 /**
  * Registry TOOL untuk AI Copilot lakehouse. Tiap tool membungkus kapabilitas
@@ -205,6 +212,140 @@ export const TOOLS: Record<string, ToolDef> = {
           startedAt: r.startTime ? new Date(r.startTime * 1000).toISOString() : null,
         })),
       };
+    },
+  },
+
+  // ── Dashboarding lewat chat (agentic BI) ────────────────────────────────
+  describe_mart: {
+    schema: {
+      type: "function",
+      function: {
+        name: "describe_mart",
+        description:
+          "Lihat mart Gold (serving.*) yang bisa divisualisasikan. Tanpa argumen: daftar semua mart. " +
+          "Dengan `mart`: kolom mart itu, terbagi dimensi (kategori/waktu) & measure (angka). " +
+          "PANGGIL INI DULU sebelum create_chart agar memilih kolom yang benar-benar ada.",
+        parameters: {
+          type: "object",
+          properties: { mart: { type: "string", description: "nama mart, mis. mart_wisman" } },
+        },
+      },
+    },
+    async run(args) {
+      const mart = String(args.mart ?? "").replace(/[^a-zA-Z0-9_]/g, "");
+      if (!mart) {
+        const rows = await chRows<{ name: string; total_rows: string }>(
+          `SELECT name, toString(total_rows) AS total_rows FROM system.tables
+            WHERE database='serving' AND name NOT LIKE '%\\_baru' ORDER BY name`,
+        );
+        return { marts: rows.map((r) => ({ mart: r.name, rows: Number(r.total_rows) })) };
+      }
+      const cols = await chRows<{ name: string; type: string }>(
+        `SELECT name, type FROM system.columns WHERE database='serving' AND table='${mart}' ORDER BY position`,
+      );
+      if (cols.length === 0) return { error: `mart '${mart}' tidak ditemukan di serving.` };
+      const numeric = /Int|Float|Decimal/;
+      return {
+        mart,
+        dimensions: cols.filter((c) => !numeric.test(c.type)).map((c) => c.name),
+        measures: cols.filter((c) => numeric.test(c.type)).map((c) => c.name),
+      };
+    },
+  },
+
+  create_chart: {
+    schema: {
+      type: "function",
+      function: {
+        name: "create_chart",
+        description:
+          "Buat kartu chart baru di dashboard (/dashboards) dari mart Gold. Server menyusun SQL-nya " +
+          "sendiri dari kolom yang kamu pilih (agregasi per dimensi) — kamu TIDAK menulis SQL. " +
+          "Panggil describe_mart dulu untuk tahu kolom valid. Chart langsung tersimpan & tampil.",
+        parameters: {
+          type: "object",
+          properties: {
+            title: { type: "string", description: "judul kartu" },
+            subtitle: { type: "string" },
+            mart: { type: "string", description: "nama mart Gold, mis. mart_wisman" },
+            kind: {
+              type: "string",
+              enum: ["bar", "hbar", "line", "area", "pie", "stacked"],
+              description: "hbar=bar horizontal (bagus untuk peringkat); stacked butuh ≥2 measure",
+            },
+            dimension: { type: "string", description: "kolom kategori/waktu untuk sumbu-X" },
+            measures: {
+              type: "array",
+              items: { type: "string" },
+              description: "kolom angka yang diagregasi (1 kolom; ≥2 untuk stacked)",
+            },
+            aggregate: { type: "string", enum: ["sum", "avg", "max", "min", "count"] },
+            limit: { type: "number", description: "maks kategori (default 20)" },
+            span: { type: "number", enum: [1, 2], description: "2 = lebar penuh" },
+          },
+          required: ["title", "mart", "kind", "dimension", "measures"],
+        },
+      },
+    },
+    async run(args) {
+      try {
+        const spec = await specFromInput(args as unknown as ChartInput, "ai", "ai");
+        await insertChart(spec);
+        return {
+          created: true,
+          id: spec.id,
+          title: spec.title,
+          kind: spec.kind,
+          mart: spec.mart,
+          url: "/dashboards",
+          note: "Chart tersimpan & langsung tampil di halaman Dashboards.",
+        };
+      } catch (e) {
+        return { error: e instanceof Error ? e.message : String(e) };
+      }
+    },
+  },
+
+  list_charts: {
+    schema: {
+      type: "function",
+      function: {
+        name: "list_charts",
+        description: "Daftar kartu chart tersimpan di dashboard (yang dibuat lewat chat/UI).",
+        parameters: { type: "object", properties: {} },
+      },
+    },
+    async run() {
+      const charts = await listStoredCharts();
+      return {
+        total: charts.length,
+        charts: charts.map((c) => ({ id: c.id, title: c.title, kind: c.kind, mart: c.mart, source: c.source })),
+      };
+    },
+  },
+
+  delete_chart: {
+    schema: {
+      type: "function",
+      function: {
+        name: "delete_chart",
+        description: "Hapus satu kartu chart tersimpan dari dashboard (by id). Spec bawaan tak bisa dihapus.",
+        parameters: {
+          type: "object",
+          properties: { id: { type: "string" } },
+          required: ["id"],
+        },
+      },
+    },
+    async run(args) {
+      const id = String(args.id ?? "");
+      if (!id) return { error: "id wajib" };
+      try {
+        await deleteChart(id);
+        return { deleted: true, id };
+      } catch (e) {
+        return { error: e instanceof Error ? e.message : String(e) };
+      }
     },
   },
 };

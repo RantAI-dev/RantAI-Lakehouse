@@ -1,6 +1,8 @@
 "use client";
 
 import * as React from "react";
+import Link from "next/link";
+import { BarChart3 } from "lucide-react";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -16,6 +18,7 @@ type Msg = {
   content: string;
   tools?: ToolStep[];
   buildRunId?: string;
+  chartCreated?: boolean;
 };
 
 const SUGGESTIONS: Record<Mode, string[]> = {
@@ -26,8 +29,9 @@ const SUGGESTIONS: Record<Mode, string[]> = {
     "Ringkas kualitas data lakehouse",
   ],
   build: [
+    "Bikin chart wisman per kawasan",
+    "Buat dashboard top 10 negara asal wisman",
     "Bangun ulang data lakehouse (Bronze→Silver→Gold)",
-    "Segarkan mart kuliner",
     "Cek status build terakhir",
   ],
 };
@@ -80,6 +84,7 @@ export function CopilotPage() {
           content: json.answer || "(tak ada jawaban)",
           tools: json.toolTrace ?? [],
           buildRunId: json.buildRunId,
+          chartCreated: json.chartCreated,
         },
       ]);
     } catch (e) {
@@ -151,6 +156,11 @@ export function CopilotPage() {
                   <div className="rounded-lg bg-muted px-3 py-2">
                     <MiniMarkdown text={m.content} />
                   </div>
+                  {m.chartCreated ? (
+                    <Button size="sm" variant="outline" render={<Link href="/dashboards" />}>
+                      <BarChart3 className="size-4" /> Buka Dashboards
+                    </Button>
+                  ) : null}
                 </div>
               ),
             )}
@@ -210,9 +220,10 @@ export function CopilotPage() {
                 </>
               ) : (
                 <>
+                  <li>Bikin chart/dashboard lewat chat (tersimpan otomatis)</li>
                   <li>Bangun/segarkan Bronze→Silver→Gold (Dagster)</li>
                   <li>Pantau pipeline live (per-step)</li>
-                  <li>Cek status build terakhir</li>
+                  <li>Kelola & hapus kartu dashboard</li>
                 </>
               )}
             </ul>

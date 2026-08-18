@@ -55,15 +55,24 @@ Panduan umum:
 const SYSTEM_ASK = `${SYSTEM_BASE}
 
 MODE: ASK (read-only). Kamu HANYA menjawab & menganalisis data — tidak
-mengubah/membangun apa pun. Kalau user minta membangun/menyegarkan data,
-sarankan pindah ke mode Build.`;
+mengubah/membangun apa pun (termasuk TIDAK membuat/menghapus chart). Kamu boleh
+melihat dashboard (describe_mart/list_charts). Kalau user minta membangun data
+atau membuat chart, sarankan pindah ke mode Build.`;
 
 const SYSTEM_BUILD = `${SYSTEM_BASE}
 
 MODE: BUILD. Selain menjawab, kamu bisa MENGOPERASIKAN lakehouse:
 - Untuk "bangun/segarkan Bronze/Silver/Gold" atau "refresh data":
   JELASKAN dulu rencananya singkat, lalu panggil trigger_lakehouse_build.
-- Setelah trigger, beri tahu user pipeline berjalan (statusnya tampil live).`;
+- Setelah trigger, beri tahu user pipeline berjalan (statusnya tampil live).
+- Untuk "bikin/tambah chart/dashboard soal X" (BI lewat chat):
+  1) panggil describe_mart (tanpa arg → lihat mart Gold; dengan mart → lihat
+     kolom valid, terbagi dimensi vs measure),
+  2) lalu create_chart dengan kolom yang BENAR-BENAR ADA. Kamu TIDAK menulis
+     SQL — server menyusunnya. Pilih kind yang cocok (hbar untuk peringkat,
+     line/area untuk tren waktu, pie untuk komposisi, stacked untuk ≥2 measure).
+  3) konfirmasi chart dibuat & sebut muncul di halaman Dashboards.
+  Pakai list_charts/delete_chart untuk mengelola kartu tersimpan.`;
 
 const MAX_ITER = 8;
 
@@ -95,15 +104,17 @@ export async function POST(req: Request) {
   const base = mode === "build" ? SYSTEM_BUILD : SYSTEM_ASK;
   const sys = schema ? `${base}\n\nSKEMA TERSEDIA:\n${schema}` : base;
 
-  // Ask = read-only: sembunyikan tool yang mengubah lakehouse.
+  // Ask = read-only: sembunyikan tool yang mengubah lakehouse / dashboard.
+  const WRITE_TOOLS = new Set(["trigger_lakehouse_build", "create_chart", "delete_chart"]);
   const tools =
     mode === "build"
       ? TOOL_SCHEMAS
-      : TOOL_SCHEMAS.filter((t) => t.function.name !== "trigger_lakehouse_build");
+      : TOOL_SCHEMAS.filter((t) => !WRITE_TOOLS.has(t.function.name));
 
   const messages: LlmMessage[] = [{ role: "system", content: sys }, ...history];
   const toolTrace: ToolStep[] = [];
   let buildRunId: string | undefined;
+  let chartCreated = false;
 
   try {
     for (let iter = 0; iter < MAX_ITER; iter++) {
@@ -117,7 +128,7 @@ export async function POST(req: Request) {
       ];
       if (!calls.length) {
         // Jawaban final (buang sisa XML tool bila ada).
-        return NextResponse.json({ answer: stripToolXml(msg.content ?? ""), toolTrace, buildRunId });
+        return NextResponse.json({ answer: stripToolXml(msg.content ?? ""), toolTrace, buildRunId, chartCreated });
       }
 
       // Eksekusi tiap tool call → umpan balik ke model.
@@ -139,6 +150,8 @@ export async function POST(req: Request) {
           const rid = (result as { runId?: unknown }).runId;
           if (typeof rid === "string") buildRunId = rid;
         }
+        // Tandai bila chart baru dibuat → UI tawarkan buka Dashboards.
+        if (call.function.name === "create_chart" && ok) chartCreated = true;
         const payload = JSON.stringify(result).slice(0, 8000);
         if (call.id.startsWith("mmx-")) {
           xmlFeedback.push(`Hasil ${call.function.name}: ${payload}`);
@@ -155,7 +168,7 @@ export async function POST(req: Request) {
     }
     // Kehabisan iterasi — minta jawaban akhir tanpa tool.
     const final = await chatWithTools([...messages, { role: "user", content: "Beri jawaban final ringkas dari hasil di atas." }], [], { signal: req.signal });
-    return NextResponse.json({ answer: final.content ?? "", toolTrace, buildRunId, note: "batas iterasi tool tercapai" });
+    return NextResponse.json({ answer: final.content ?? "", toolTrace, buildRunId, chartCreated, note: "batas iterasi tool tercapai" });
   } catch (e) {
     return NextResponse.json(
       { error: "AI Copilot tak tersedia", detail: String(e), hint: "Set LLM_KEY (MiniMax) di .env.local." },

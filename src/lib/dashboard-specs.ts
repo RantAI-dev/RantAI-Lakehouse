@@ -11,6 +11,8 @@
 
 export type ChartKind = "bar" | "hbar" | "line" | "area" | "pie" | "stacked";
 export type NumFmt = "int" | "float";
+/** Asal spec: bawaan (seed), dibuat AI lewat chat, atau manual lewat UI. */
+export type ChartSource = "builtin" | "ai" | "ui";
 
 /** KPI angka tunggal. SQL harus mengembalikan kolom `v` (dan boleh kolom lain). */
 export type KpiSpec = {
@@ -202,3 +204,12 @@ export const CHARTS: ChartSpec[] = [
 export const SPEC_SQL: Record<string, string> = Object.fromEntries(
   [...KPIS, ...CHARTS].map((s) => [s.id, s.sql]),
 );
+
+/** Metadata render (tanpa SQL) — inilah yang dikirim ke klien. */
+export type ChartRenderSpec = Omit<ChartSpec, "sql"> & { source: ChartSource };
+
+/** Buang SQL dari spec, tempel asalnya — untuk respons API ke browser. */
+export function toRenderSpec(spec: ChartSpec, source: ChartSource): ChartRenderSpec {
+  const { sql: _sql, ...rest } = spec;
+  return { ...rest, source };
+}
