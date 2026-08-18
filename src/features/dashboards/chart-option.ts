@@ -2,7 +2,7 @@ import type { EChartsOption } from "echarts";
 import type { ChartSpec } from "@/lib/dashboard-specs";
 
 /** buildOption hanya butuh cara render (bukan SQL) — muat ChartSpec & ChartRenderSpec. */
-type Renderable = Pick<ChartSpec, "kind" | "x" | "y">;
+type Renderable = Pick<ChartSpec, "kind" | "x" | "y" | "series">;
 
 /** Palet kategorikal konsol (indigo-led). Dipakai konsisten lintas chart. */
 const PALETTE = [
@@ -93,6 +93,47 @@ export function buildOption(
     axisLine: { lineStyle: { color: split } },
     axisTick: { show: false },
   };
+
+  // Breakdown (dimensi ke-2): data long-format (x, series, nilai) → banyak seri.
+  if (spec.series) {
+    const valueCol = Array.isArray(spec.y) ? spec.y[0] : spec.y;
+    const seriesCol = spec.series;
+    const cats: string[] = [];
+    const groups: string[] = [];
+    const lookup = new Map<string, number>();
+    for (const r of rows) {
+      const xv = str(r[spec.x]);
+      const gv = str(r[seriesCol]);
+      if (!cats.includes(xv)) cats.push(xv);
+      if (!groups.includes(gv)) groups.push(gv);
+      lookup.set(`${xv}||${gv}`, num(r[valueCol]));
+    }
+    const orderedCats = horizontal ? [...cats].reverse() : cats;
+    const isLine = spec.kind === "line" || spec.kind === "area";
+    const stack = spec.kind === "stacked";
+    const series = groups.map((g) => ({
+      name: g,
+      type: isLine ? "line" : "bar",
+      stack: stack ? "total" : undefined,
+      smooth: isLine,
+      showSymbol: spec.kind === "line",
+      symbolSize: 5,
+      areaStyle: spec.kind === "area" ? { opacity: 0.15 } : undefined,
+      emphasis: { focus: "series" },
+      barMaxWidth: 26,
+      itemStyle: !isLine ? { borderRadius: horizontal ? [0, 3, 3, 0] : [3, 3, 0, 0] } : undefined,
+      data: orderedCats.map((c) => lookup.get(`${c}||${g}`) ?? 0),
+    }));
+    return {
+      ...base,
+      tooltip: { ...base.tooltip, trigger: "axis", axisPointer: { type: isLine ? "line" : "shadow" } },
+      legend: { top: 0, type: "scroll", textStyle: { color: axis, fontSize: 11 }, icon: "circle" },
+      grid: { ...base.grid, top: 34 },
+      xAxis: horizontal ? valueAxis : { ...categoryAxis, data: orderedCats },
+      yAxis: horizontal ? { ...categoryAxis, data: orderedCats } : valueAxis,
+      series,
+    } as EChartsOption;
+  }
 
   // Stacked bar (mis. wisnus + wisman).
   if (spec.kind === "stacked" && Array.isArray(spec.y)) {

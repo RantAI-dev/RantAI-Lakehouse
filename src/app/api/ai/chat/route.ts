@@ -71,6 +71,8 @@ MODE: BUILD. Selain menjawab, kamu bisa MENGOPERASIKAN lakehouse:
   2) lalu create_chart dengan kolom yang BENAR-BENAR ADA. Kamu TIDAK menulis
      SQL — server menyusunnya. Pilih kind yang cocok (hbar untuk peringkat,
      line/area untuk tren waktu, pie untuk komposisi, stacked untuk ≥2 measure).
+     Pakai parameter breakdown (dimensi ke-2) untuk multi-seri, mis. tren per
+     kawasan (line + breakdown=kawasan) atau grouped bar per kategori.
   3) konfirmasi chart dibuat & sebut muncul di halaman Dashboards.
   Pakai list_charts/delete_chart untuk mengelola kartu tersimpan.`;
 

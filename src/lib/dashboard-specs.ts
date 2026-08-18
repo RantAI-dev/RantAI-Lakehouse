@@ -36,6 +36,12 @@ export type ChartSpec = {
   x: string;
   /** satu kolom (bar/line/pie) atau beberapa kolom (stacked). */
   y: string | string[];
+  /**
+   * Kolom breakdown opsional (dimensi ke-2): memecah y menjadi banyak seri per
+   * nilai kolom ini (mis. multi-line per kawasan, grouped bar per kategori).
+   * Bila diisi, `y` adalah satu measure & data long-format (x, series, nilai).
+   */
+  series?: string;
   format?: NumFmt;
   /** 2 = full width di grid. */
   span?: 1 | 2;

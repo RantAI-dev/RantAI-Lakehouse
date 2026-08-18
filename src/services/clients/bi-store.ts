@@ -27,6 +27,7 @@ export type ChartInput = {
   kind: ChartKind;
   dimension: string; // kolom sumbu-X / kategori
   measures: string[]; // kolom nilai; >1 untuk "stacked"
+  breakdown?: string; // dimensi ke-2 opsional → pecah jadi banyak seri
   aggregate?: "sum" | "avg" | "max" | "min" | "count";
   limit?: number;
   order?: "desc" | "asc" | "none";
@@ -127,15 +128,34 @@ export async function specFromInput(
   if (!AGGS.has(agg)) throw new Error(`aggregate tidak valid: ${agg}`);
   const limit = Math.min(Math.max(Number(input.limit ?? 20) || 20, 1), 100);
   const order = input.order ?? (kind === "line" || kind === "area" ? "none" : "desc");
+  const aggOf = (m: string) => (agg === "count" ? `count() AS ${m}` : `round(${agg}(${m})) AS ${m}`);
 
-  const selMeasures = measures
-    .map((m) => (agg === "count" ? `count() AS ${m}` : `round(${agg}(${m})) AS ${m}`))
-    .join(", ");
-  const orderClause =
-    order === "none" ? dimension : `${measures[0]} ${order === "asc" ? "ASC" : "DESC"}`;
-  const sql =
-    `SELECT ${dimension}, ${selMeasures} FROM serving.${mart} ` +
-    `GROUP BY ${dimension} ORDER BY ${orderClause} LIMIT ${limit}`;
+  // Breakdown (dimensi ke-2) → data long-format (dimensi, series, satu measure).
+  const breakdown = input.breakdown ? String(input.breakdown) : "";
+  if (breakdown) {
+    if (!IDENT.test(breakdown)) throw new Error(`kolom breakdown tidak valid: ${breakdown}`);
+    if (!cols.has(breakdown)) throw new Error(`kolom '${breakdown}' tidak ada di serving.${mart}.`);
+    if (breakdown === dimension) throw new Error("breakdown harus beda dari dimensi.");
+    if (kind === "pie") throw new Error("chart 'pie' tak mendukung breakdown.");
+    if (measures.length > 1) throw new Error("dengan breakdown, pakai tepat satu measure.");
+  }
+
+  let sql: string;
+  if (breakdown) {
+    const m = measures[0];
+    // Batasi kardinalitas dimensi-X ke top-N by measure agar chart terbaca.
+    sql =
+      `SELECT ${dimension}, ${breakdown}, ${aggOf(m)} FROM serving.${mart} ` +
+      `WHERE ${dimension} IN (SELECT ${dimension} FROM serving.${mart} ` +
+      `GROUP BY ${dimension} ORDER BY ${agg === "count" ? "count()" : `${agg}(${m})`} DESC LIMIT ${limit}) ` +
+      `GROUP BY ${dimension}, ${breakdown} ORDER BY ${dimension}, ${breakdown}`;
+  } else {
+    const selMeasures = measures.map(aggOf).join(", ");
+    const orderClause = order === "none" ? dimension : `${measures[0]} ${order === "asc" ? "ASC" : "DESC"}`;
+    sql =
+      `SELECT ${dimension}, ${selMeasures} FROM serving.${mart} ` +
+      `GROUP BY ${dimension} ORDER BY ${orderClause} LIMIT ${limit}`;
+  }
 
   const id = `u_${randomUUID().slice(0, 8)}`;
   const spec: ChartSpec = {
@@ -147,6 +167,7 @@ export async function specFromInput(
     sql,
     x: dimension,
     y: measures.length === 1 ? measures[0] : measures,
+    series: breakdown || undefined,
     format: "int",
     span: input.span === 2 ? 2 : 1,
   };
@@ -159,7 +180,8 @@ export async function insertChart(spec: StoredChartSpec): Promise<void> {
   await chQuery(spec.sql); // smoke test — melempar bila SQL gagal
   const clean: ChartSpec = {
     id: spec.id, title: spec.title, subtitle: spec.subtitle, kind: spec.kind,
-    mart: spec.mart, sql: spec.sql, x: spec.x, y: spec.y, format: spec.format, span: spec.span,
+    mart: spec.mart, sql: spec.sql, x: spec.x, y: spec.y, series: spec.series,
+    format: spec.format, span: spec.span,
   };
   const json = esc(JSON.stringify(clean));
   await chExec(

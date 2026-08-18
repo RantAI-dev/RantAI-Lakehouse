@@ -279,6 +279,12 @@ export const TOOLS: Record<string, ToolDef> = {
               items: { type: "string" },
               description: "kolom angka yang diagregasi (1 kolom; ≥2 untuk stacked)",
             },
+            breakdown: {
+              type: "string",
+              description:
+                "opsional: kolom dimensi ke-2 untuk memecah jadi banyak seri (mis. multi-line per kawasan, " +
+                "grouped/stacked bar per kategori). Pakai 1 measure saja. Tidak untuk pie.",
+            },
             aggregate: { type: "string", enum: ["sum", "avg", "max", "min", "count"] },
             limit: { type: "number", description: "maks kategori (default 20)" },
             span: { type: "number", enum: [1, 2], description: "2 = lebar penuh" },

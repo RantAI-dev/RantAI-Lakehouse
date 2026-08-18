@@ -43,8 +43,10 @@ export function ChartBuilder({ onCreated }: { onCreated: () => void }) {
   const [dimension, setDimension] = React.useState("");
   const [measure, setMeasure] = React.useState("");
   const [measure2, setMeasure2] = React.useState("");
+  const [breakdown, setBreakdown] = React.useState("");
   const [aggregate, setAggregate] = React.useState("sum");
   const [span, setSpan] = React.useState<1 | 2>(1);
+  const canBreakdown = kind !== "pie" && kind !== "stacked";
 
   // Muat daftar mart saat dialog dibuka.
   React.useEffect(() => {
@@ -70,7 +72,7 @@ export function ChartBuilder({ onCreated }: { onCreated: () => void }) {
 
   function reset() {
     setTitle(""); setMart(""); setKind("hbar"); setDimension("");
-    setMeasure(""); setMeasure2(""); setAggregate("sum"); setSpan(1);
+    setMeasure(""); setMeasure2(""); setBreakdown(""); setAggregate("sum"); setSpan(1);
     setFields(null); setError(null);
   }
 
@@ -90,7 +92,10 @@ export function ChartBuilder({ onCreated }: { onCreated: () => void }) {
       const res = await fetch("/api/dashboard/specs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title, mart, kind, dimension, measures, aggregate, span }),
+        body: JSON.stringify({
+          title, mart, kind, dimension, measures, aggregate, span,
+          breakdown: canBreakdown && breakdown ? breakdown : undefined,
+        }),
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json?.error ?? "Gagal membuat chart");
@@ -200,6 +205,26 @@ export function ChartBuilder({ onCreated }: { onCreated: () => void }) {
               </div>
             )}
           </div>
+
+          {canBreakdown ? (
+            <div className="grid gap-1.5">
+              <Label>Breakdown / seri (opsional)</Label>
+              <Select
+                value={breakdown || "__none__"}
+                onValueChange={(v) => setBreakdown(v === "__none__" ? "" : v ?? "")}
+                disabled={!fields}
+              >
+                <SelectTrigger><SelectValue placeholder="tanpa breakdown" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__none__">— tanpa breakdown —</SelectItem>
+                  {fields?.dimensions.filter((d) => d !== dimension).map((d) => (
+                    <SelectItem key={d} value={d}>{d}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-[11px] text-muted-foreground">Pecah jadi banyak seri (mis. per kawasan). Pakai 1 measure.</p>
+            </div>
+          ) : null}
 
           {error ? <p className="text-sm text-destructive">{error}</p> : null}
         </div>
