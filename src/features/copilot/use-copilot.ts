@@ -2,8 +2,11 @@
 
 import * as React from "react";
 import type { ToolStep } from "./tool-step";
+import { TOOL_CATALOG } from "./tool-catalog";
 
 export type Mode = "ask" | "build";
+
+const ALL_TOOL_NAMES = TOOL_CATALOG.map((t) => t.name);
 export type Msg = {
   role: "user" | "assistant";
   content: string;
@@ -26,6 +29,15 @@ export function useCopilot() {
   const [error, setError] = React.useState<string | null>(null);
   const [sessionId, setSessionId] = React.useState<string | null>(null);
   const [sessions, setSessions] = React.useState<SessionMeta[]>([]);
+  const [enabledTools, setEnabledTools] = React.useState<Set<string>>(() => new Set(ALL_TOOL_NAMES));
+
+  const toggleTool = React.useCallback((name: string) => {
+    setEnabledTools((prev) => {
+      const n = new Set(prev);
+      if (n.has(name)) n.delete(name); else n.add(name);
+      return n;
+    });
+  }, []);
 
   const refreshSessions = React.useCallback(async () => {
     try {
@@ -59,7 +71,11 @@ export function useCopilot() {
     try {
       const res = await fetch("/api/ai/chat", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode, messages: next.map((m) => ({ role: m.role, content: m.content })) }),
+        body: JSON.stringify({
+          mode,
+          tools: [...enabledTools],
+          messages: next.map((m) => ({ role: m.role, content: m.content })),
+        }),
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json?.hint ?? json?.detail ?? json?.error ?? "Copilot gagal");
@@ -77,7 +93,7 @@ export function useCopilot() {
     } finally {
       setBusy(false);
     }
-  }, [busy, messages, mode, sessionId, persist]);
+  }, [busy, messages, mode, sessionId, persist, enabledTools]);
 
   const newChat = React.useCallback(() => {
     setMessages([]); setSessionId(null); setError(null);
@@ -105,6 +121,7 @@ export function useCopilot() {
 
   return {
     mode, setMode, messages, busy, error, sessionId, sessions,
+    enabledTools, toggleTool,
     send, newChat, loadSession, removeSession, refreshSessions,
   };
 }

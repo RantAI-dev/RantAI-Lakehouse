@@ -100,7 +100,11 @@ export function CopilotPage() {
               <ChatMessages messages={c.messages} busy={c.busy} error={c.error} />
             )}
           </div>
-          <ChatComposer mode={c.mode} setMode={c.setMode} onSend={c.send} busy={c.busy} placeholder="Tanya apa saja soal data lakehouse…" />
+          <ChatComposer
+            mode={c.mode} setMode={c.setMode} onSend={c.send} busy={c.busy}
+            enabledTools={c.enabledTools} toggleTool={c.toggleTool}
+            placeholder="Tanya apa saja soal data lakehouse…"
+          />
         </div>
       </div>
     </div>

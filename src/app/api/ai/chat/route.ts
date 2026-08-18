@@ -87,9 +87,11 @@ type ToolStep = { tool: string; args: unknown; ok: boolean; result: unknown };
 export async function POST(req: Request) {
   let history: LlmMessage[] = [];
   let mode: "ask" | "build" = "ask";
+  let allow: string[] | null = null;
   try {
     const body = await req.json();
     if (body.mode === "build") mode = "build";
+    if (Array.isArray(body.tools) && body.tools.length) allow = body.tools.map(String);
     const incoming = Array.isArray(body.messages) ? body.messages : [];
     history = incoming
       .filter((m: { role: string; content: string }) => m.role === "user" || m.role === "assistant")
@@ -114,10 +116,13 @@ export async function POST(req: Request) {
   const WRITE_TOOLS = new Set([
     "trigger_lakehouse_build", "create_chart", "update_chart", "delete_chart", "create_board",
   ]);
-  const tools =
-    mode === "build"
-      ? TOOL_SCHEMAS
-      : TOOL_SCHEMAS.filter((t) => !WRITE_TOOLS.has(t.function.name));
+  const allowSet = allow ? new Set(allow) : null;
+  const tools = TOOL_SCHEMAS.filter((t) => {
+    const name = t.function.name;
+    if (mode !== "build" && WRITE_TOOLS.has(name)) return false; // Ask = read-only
+    if (allowSet && !allowSet.has(name)) return false; // pilihan user (menu Tools)
+    return true;
+  });
 
   const messages: LlmMessage[] = [{ role: "system", content: sys }, ...history];
   const toolTrace: ToolStep[] = [];
