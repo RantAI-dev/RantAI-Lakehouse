@@ -1,0 +1,110 @@
+"use client";
+
+import * as React from "react";
+import type { ToolStep } from "./tool-step";
+
+export type Mode = "ask" | "build";
+export type Msg = {
+  role: "user" | "assistant";
+  content: string;
+  tools?: ToolStep[];
+  buildRunId?: string;
+  chartCreated?: boolean;
+};
+export type SessionMeta = { id: string; title: string; mode: string; updatedAt?: string };
+
+/**
+ * Otak AI Copilot yang DIPAKAI BERSAMA oleh chat dock global (semua halaman) &
+ * halaman /copilot. Mengurus percakapan (mode Ask/Build, kirim, tool loop) DAN
+ * riwayat (simpan/muat sesi dari console.chat_session). Satu sumber kebenaran →
+ * dock & halaman selalu konsisten.
+ */
+export function useCopilot() {
+  const [mode, setMode] = React.useState<Mode>("ask");
+  const [messages, setMessages] = React.useState<Msg[]>([]);
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+  const [sessionId, setSessionId] = React.useState<string | null>(null);
+  const [sessions, setSessions] = React.useState<SessionMeta[]>([]);
+
+  const refreshSessions = React.useCallback(async () => {
+    try {
+      const res = await fetch("/api/ai/sessions", { cache: "no-store" });
+      const json = await res.json();
+      if (Array.isArray(json.sessions)) setSessions(json.sessions);
+    } catch { /* abaikan */ }
+  }, []);
+
+  React.useEffect(() => { void refreshSessions(); }, [refreshSessions]);
+
+  const persist = React.useCallback(async (msgs: Msg[], m: Mode, id: string | null) => {
+    try {
+      const res = await fetch("/api/ai/sessions", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: id ?? undefined, mode: m, messages: msgs }),
+      });
+      const json = await res.json();
+      if (json.id) setSessionId(json.id);
+      void refreshSessions();
+    } catch { /* abaikan */ }
+  }, [refreshSessions]);
+
+  const send = React.useCallback(async (text: string) => {
+    const q = text.trim();
+    if (!q || busy) return;
+    setError(null);
+    const next: Msg[] = [...messages, { role: "user", content: q }];
+    setMessages(next);
+    setBusy(true);
+    try {
+      const res = await fetch("/api/ai/chat", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode, messages: next.map((m) => ({ role: m.role, content: m.content })) }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json?.hint ?? json?.detail ?? json?.error ?? "Copilot gagal");
+      const full: Msg[] = [
+        ...next,
+        {
+          role: "assistant", content: json.answer || "(tak ada jawaban)",
+          tools: json.toolTrace ?? [], buildRunId: json.buildRunId, chartCreated: json.chartCreated,
+        },
+      ];
+      setMessages(full);
+      void persist(full, mode, sessionId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, messages, mode, sessionId, persist]);
+
+  const newChat = React.useCallback(() => {
+    setMessages([]); setSessionId(null); setError(null);
+  }, []);
+
+  const loadSession = React.useCallback(async (id: string) => {
+    setError(null);
+    try {
+      const res = await fetch(`/api/ai/sessions?id=${encodeURIComponent(id)}`, { cache: "no-store" });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json?.error ?? "Gagal memuat sesi");
+      setMessages((json.session.messages ?? []) as Msg[]);
+      if (json.session.mode === "build" || json.session.mode === "ask") setMode(json.session.mode);
+      setSessionId(json.session.id);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  const removeSession = React.useCallback(async (id: string) => {
+    await fetch(`/api/ai/sessions?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+    if (id === sessionId) newChat();
+    void refreshSessions();
+  }, [sessionId, newChat, refreshSessions]);
+
+  return {
+    mode, setMode, messages, busy, error, sessionId, sessions,
+    send, newChat, loadSession, removeSession, refreshSessions,
+  };
+}

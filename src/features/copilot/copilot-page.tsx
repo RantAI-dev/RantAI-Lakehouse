@@ -1,27 +1,15 @@
 "use client";
 
 import * as React from "react";
-import Link from "next/link";
-import { BarChart3 } from "lucide-react";
+import { Plus, MessageSquare, Trash2 } from "lucide-react";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
-import { SectionCard } from "@/components/patterns/section-card";
 import { cn } from "@/lib/utils";
-import { MiniMarkdown } from "./mini-markdown";
-import { ToolStepCard, type ToolStep } from "./tool-step";
-import { BuildTree } from "./build-tree";
+import { useCopilot } from "./use-copilot";
+import { ChatMessages } from "./chat-messages";
+import { ChatComposer } from "./chat-composer";
 
-type Mode = "ask" | "build";
-type Msg = {
-  role: "user" | "assistant";
-  content: string;
-  tools?: ToolStep[];
-  buildRunId?: string;
-  chartCreated?: boolean;
-};
-
-const SUGGESTIONS: Record<Mode, string[]> = {
+const SUGGESTIONS: Record<"ask" | "build", string[]> = {
   ask: [
     "Total kunjungan wisman per kawasan",
     "Dataset apa saja soal halal?",
@@ -36,198 +24,83 @@ const SUGGESTIONS: Record<Mode, string[]> = {
   ],
 };
 
-const PLACEHOLDER: Record<Mode, string> = {
-  ask: "Tanya soal data — angka, dataset, silsilah, kualitas…",
-  build: "Minta bangun/segarkan Bronze→Silver→Gold…",
-};
-
 /**
- * AI Copilot lakehouse — fitur utama. Dua mode:
- *  · Ask   → tanya & analisis data (read-only).
- *  · Build → operasikan lakehouse (bangun Bronze/Silver/Gold) lewat chat,
- *            dengan pohon pipeline live.
- * Backend /api/ai/chat menjalankan tool NYATA (ClickHouse/Dagster) dan
- * mengembalikan langkah + hasilnya, dirender kaya di sini.
+ * Halaman AI Copilot penuh — chat Ask/Build dengan render kaya, PLUS panel
+ * RIWAYAT (sesi tersimpan di lakehouse). Berbagi otak (useCopilot) dengan chat
+ * dock global, jadi percakapan sinkron di mana pun.
  */
 export function CopilotPage() {
-  const [mode, setMode] = React.useState<Mode>("ask");
-  const [messages, setMessages] = React.useState<Msg[]>([]);
-  const [input, setInput] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
-  const endRef = React.useRef<HTMLDivElement>(null);
-
-  React.useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, busy]);
-
-  async function send(text: string) {
-    const q = text.trim();
-    if (!q || busy) return;
-    setError(null);
-    const next: Msg[] = [...messages, { role: "user", content: q }];
-    setMessages(next);
-    setInput("");
-    setBusy(true);
-    try {
-      const res = await fetch("/api/ai/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode, messages: next.map((m) => ({ role: m.role, content: m.content })) }),
-      });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json?.hint ?? json?.detail ?? json?.error ?? "Copilot gagal");
-      setMessages((m) => [
-        ...m,
-        {
-          role: "assistant",
-          content: json.answer || "(tak ada jawaban)",
-          tools: json.toolTrace ?? [],
-          buildRunId: json.buildRunId,
-          chartCreated: json.chartCreated,
-        },
-      ]);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
+  const c = useCopilot();
 
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
         title="AI Copilot"
-        description="Tanya apa saja soal data lakehouse, atau bangun Bronze→Silver→Gold lewat chat. Agen menjalankan tool nyata di ClickHouse & Dagster."
+        description="Tanya soal data lakehouse, atau bangun Bronze→Silver→Gold & bikin dashboard lewat chat. Menjalankan tool nyata di ClickHouse & Dagster."
       />
 
-      {/* Toggle mode */}
-      <div className="flex items-center gap-3">
-        <div className="inline-flex rounded-lg border border-border bg-muted/40 p-1" role="tablist" aria-label="Mode Copilot">
-          {(["ask", "build"] as Mode[]).map((m) => (
-            <button
-              key={m}
-              type="button"
-              role="tab"
-              aria-selected={mode === m}
-              onClick={() => setMode(m)}
-              className={cn(
-                "rounded-md px-4 py-1.5 text-sm transition-colors",
-                mode === m ? "bg-background font-medium text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              {m === "ask" ? "Ask" : "Build"}
-            </button>
-          ))}
-        </div>
-        <p className="text-xs text-muted-foreground">
-          {mode === "ask" ? "Read-only — menjawab & menganalisis data." : "Mengoperasikan lakehouse — bisa membangun/menyegarkan data."}
-        </p>
-      </div>
-
-      <div className="grid gap-4 xl:grid-cols-[1fr_300px]">
-        <div className="flex min-h-[60vh] flex-col gap-3">
-          <div className="flex-1 space-y-4 overflow-y-auto rounded-lg border p-4">
-            {messages.length === 0 ? (
-              <div className="text-sm text-muted-foreground">
-                {mode === "ask"
-                  ? "Tanya angka, dataset, silsilah, atau kualitas. Copilot query ClickHouse & jelajah katalog."
-                  : "Minta bangun/segarkan data. Copilot menjalankan pipeline Dagster dan menampilkan progresnya live."}
-              </div>
-            ) : null}
-
-            {messages.map((m, i) =>
-              m.role === "user" ? (
-                <div key={i} className="text-right">
-                  <div className="inline-block max-w-[85%] whitespace-pre-wrap rounded-lg bg-primary px-3 py-2 text-sm text-primary-foreground">
-                    {m.content}
-                  </div>
-                </div>
-              ) : (
-                <div key={i} className="space-y-2">
-                  {m.tools && m.tools.length ? (
-                    <div className="space-y-1.5">
-                      {m.tools.map((t, j) => (
-                        <ToolStepCard key={j} step={t} />
-                      ))}
-                    </div>
-                  ) : null}
-                  {m.buildRunId ? <BuildTree runId={m.buildRunId} /> : null}
-                  <div className="rounded-lg bg-muted px-3 py-2">
-                    <MiniMarkdown text={m.content} />
-                  </div>
-                  {m.chartCreated ? (
-                    <Button size="sm" variant="outline" render={<Link href="/dashboards" />}>
-                      <BarChart3 className="size-4" /> Buka Dashboards
-                    </Button>
-                  ) : null}
-                </div>
-              ),
-            )}
-
-            {busy ? (
-              <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-primary" />
-                Copilot bekerja… (memanggil tool)
-              </div>
-            ) : null}
-            {error ? <p className="text-sm text-destructive">{error}</p> : null}
-            <div ref={endRef} />
-          </div>
-
-          <div className="flex items-end gap-2">
-            <Textarea
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  void send(input);
-                }
-              }}
-              rows={2}
-              placeholder={PLACEHOLDER[mode]}
-              aria-label="Pesan ke AI Copilot"
-            />
-            <Button onClick={() => void send(input)} disabled={busy || !input.trim()}>
-              Kirim
-            </Button>
-          </div>
-        </div>
-
-        <div className="space-y-3">
-          <SectionCard title={mode === "ask" ? "Contoh · Ask" : "Contoh · Build"}>
-            <div className="space-y-2">
-              {SUGGESTIONS[mode].map((s) => (
-                <button
-                  key={s}
-                  onClick={() => void send(s)}
-                  disabled={busy}
-                  className="block w-full rounded-md border px-3 py-2 text-left text-xs hover:bg-muted disabled:opacity-50"
+      <div className="grid gap-4 lg:grid-cols-[240px_1fr]">
+        {/* History */}
+        <aside className="flex flex-col gap-2">
+          <Button variant="outline" size="sm" onClick={c.newChat} className="justify-start">
+            <Plus className="size-4" /> Percakapan baru
+          </Button>
+          <div className="space-y-0.5 overflow-y-auto rounded-lg border p-1.5">
+            <p className="px-2 py-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Riwayat</p>
+            {c.sessions.length === 0 ? (
+              <p className="px-2 py-2 text-xs text-muted-foreground">Belum ada percakapan.</p>
+            ) : (
+              c.sessions.map((s) => (
+                <div
+                  key={s.id}
+                  className={cn(
+                    "group flex items-center gap-1.5 rounded-md px-2 py-1.5 text-xs",
+                    s.id === c.sessionId ? "bg-muted" : "hover:bg-muted/60",
+                  )}
                 >
-                  {s}
-                </button>
-              ))}
-            </div>
-          </SectionCard>
-          <SectionCard title="Bisa apa">
-            <ul className="list-disc space-y-1 pl-4 text-xs text-muted-foreground">
-              {mode === "ask" ? (
-                <>
-                  <li>Query data (SQL otomatis ke ClickHouse)</li>
-                  <li>Jelajah katalog & skema dataset</li>
-                  <li>Baca silsilah (lineage) & kualitas data</li>
-                </>
-              ) : (
-                <>
-                  <li>Bikin chart/dashboard lewat chat (tersimpan otomatis)</li>
-                  <li>Bangun/segarkan Bronze→Silver→Gold (Dagster)</li>
-                  <li>Pantau pipeline live (per-step)</li>
-                  <li>Kelola & hapus kartu dashboard</li>
-                </>
-              )}
-            </ul>
-          </SectionCard>
+                  <MessageSquare className="size-3.5 shrink-0 text-muted-foreground" />
+                  <button onClick={() => void c.loadSession(s.id)} className="flex-1 truncate text-left" title={s.title}>
+                    {s.title}
+                  </button>
+                  <button
+                    onClick={() => void c.removeSession(s.id)}
+                    aria-label="Hapus"
+                    className="shrink-0 text-muted-foreground opacity-0 hover:text-destructive group-hover:opacity-100"
+                  >
+                    <Trash2 className="size-3.5" />
+                  </button>
+                </div>
+              ))
+            )}
+          </div>
+        </aside>
+
+        {/* Chat */}
+        <div className="flex min-h-[62vh] flex-col gap-3">
+          <div className="flex-1 overflow-y-auto rounded-lg border p-4">
+            {c.messages.length === 0 ? (
+              <div className="space-y-4">
+                <p className="text-sm text-muted-foreground">
+                  {c.mode === "ask"
+                    ? "Tanya angka, dataset, silsilah, atau kualitas. Copilot query ClickHouse & jelajah katalog."
+                    : "Minta bikin chart/dashboard atau bangun data. Copilot menjalankan tool nyata & menampilkan hasilnya."}
+                </p>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {SUGGESTIONS[c.mode].map((s) => (
+                    <button
+                      key={s} onClick={() => void c.send(s)} disabled={c.busy}
+                      className="rounded-lg border px-3 py-2 text-left text-xs hover:bg-muted disabled:opacity-50"
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <ChatMessages messages={c.messages} busy={c.busy} error={c.error} />
+            )}
+          </div>
+          <ChatComposer mode={c.mode} setMode={c.setMode} onSend={c.send} busy={c.busy} placeholder="Tanya apa saja soal data lakehouse…" />
         </div>
       </div>
     </div>
