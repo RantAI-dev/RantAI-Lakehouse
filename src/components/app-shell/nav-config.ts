@@ -1,5 +1,6 @@
 import {
   Activity,
+  BarChart3,
   BellRing,
   Boxes,
   Bot,
@@ -76,6 +77,7 @@ export const NAV_GROUPS: NavGroup[] = [
     label: "Overview",
     items: [
       { title: "Overview", href: "/", icon: LayoutDashboard },
+      { title: "Dashboards", href: "/dashboards", icon: BarChart3 },
       { title: "Activity", href: "/activity", icon: Activity },
       { title: "Alerts", href: "/alerts", icon: BellRing, preview: true },
     ],
