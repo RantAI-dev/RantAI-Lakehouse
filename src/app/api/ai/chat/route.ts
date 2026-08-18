@@ -41,25 +41,40 @@ export const maxDuration = 120;
  * balik hasilnya sampai agen memberi jawaban final.
  */
 
-const SYSTEM = `Kamu AI Copilot untuk lakehouse pariwisata DKI Jakarta (RantAI Lakehouse).
-Kamu bisa MENJAWAB pertanyaan data dan MENGOPERASIKAN lakehouse lewat tool.
+const SYSTEM_BASE = `Kamu AI Copilot untuk lakehouse pariwisata DKI Jakarta (RantAI Lakehouse).
 
-Panduan:
+Panduan umum:
 - Untuk pertanyaan angka/data: pakai run_sql (SELECT ClickHouse). Cari tabel dulu
   via list_datasets/describe_dataset kalau belum tahu skema. Utamakan serving.mart_*.
 - Untuk "ada data apa / soal X": list_datasets atau describe_dataset.
 - Untuk silsilah data: get_lineage. Untuk kualitas: get_quality.
-- Untuk "bangun/segarkan Bronze/Silver/Gold" atau "refresh data": trigger_lakehouse_build,
-  lalu beri tahu user cara cek statusnya (get_build_status).
-- Jawab RINGKAS dalam Bahasa Indonesia, berdasarkan HASIL TOOL yang nyata.
-  JANGAN mengarang angka atau tabel. Kalau tool error, katakan apa adanya.`;
+- Jawab RINGKAS dalam Bahasa Indonesia (boleh Markdown: tabel, bold, list),
+  berdasarkan HASIL TOOL yang nyata. JANGAN mengarang angka atau tabel.
+  Kalau tool error, katakan apa adanya.`;
+
+const SYSTEM_ASK = `${SYSTEM_BASE}
+
+MODE: ASK (read-only). Kamu HANYA menjawab & menganalisis data — tidak
+mengubah/membangun apa pun. Kalau user minta membangun/menyegarkan data,
+sarankan pindah ke mode Build.`;
+
+const SYSTEM_BUILD = `${SYSTEM_BASE}
+
+MODE: BUILD. Selain menjawab, kamu bisa MENGOPERASIKAN lakehouse:
+- Untuk "bangun/segarkan Bronze/Silver/Gold" atau "refresh data":
+  JELASKAN dulu rencananya singkat, lalu panggil trigger_lakehouse_build.
+- Setelah trigger, beri tahu user pipeline berjalan (statusnya tampil live).`;
 
 const MAX_ITER = 8;
 
+type ToolStep = { tool: string; args: unknown; ok: boolean; result: unknown };
+
 export async function POST(req: Request) {
   let history: LlmMessage[] = [];
+  let mode: "ask" | "build" = "ask";
   try {
     const body = await req.json();
+    if (body.mode === "build") mode = "build";
     const incoming = Array.isArray(body.messages) ? body.messages : [];
     history = incoming
       .filter((m: { role: string; content: string }) => m.role === "user" || m.role === "assistant")
@@ -77,14 +92,22 @@ export async function POST(req: Request) {
   } catch {
     /* lanjut tanpa skema */
   }
-  const sys = schema ? `${SYSTEM}\n\nSKEMA TERSEDIA:\n${schema}` : SYSTEM;
+  const base = mode === "build" ? SYSTEM_BUILD : SYSTEM_ASK;
+  const sys = schema ? `${base}\n\nSKEMA TERSEDIA:\n${schema}` : base;
+
+  // Ask = read-only: sembunyikan tool yang mengubah lakehouse.
+  const tools =
+    mode === "build"
+      ? TOOL_SCHEMAS
+      : TOOL_SCHEMAS.filter((t) => t.function.name !== "trigger_lakehouse_build");
 
   const messages: LlmMessage[] = [{ role: "system", content: sys }, ...history];
-  const toolTrace: { tool: string; args: unknown; ok: boolean }[] = [];
+  const toolTrace: ToolStep[] = [];
+  let buildRunId: string | undefined;
 
   try {
     for (let iter = 0; iter < MAX_ITER; iter++) {
-      const msg = await chatWithTools(messages, TOOL_SCHEMAS, { signal: req.signal });
+      const msg = await chatWithTools(messages, tools, { signal: req.signal });
       messages.push(msg);
 
       // Tool call bisa dari field standar ATAU format XML MiniMax di content.
@@ -94,7 +117,7 @@ export async function POST(req: Request) {
       ];
       if (!calls.length) {
         // Jawaban final (buang sisa XML tool bila ada).
-        return NextResponse.json({ answer: stripToolXml(msg.content ?? ""), toolTrace });
+        return NextResponse.json({ answer: stripToolXml(msg.content ?? ""), toolTrace, buildRunId });
       }
 
       // Eksekusi tiap tool call → umpan balik ke model.
@@ -110,7 +133,12 @@ export async function POST(req: Request) {
         }
         const result = await runTool(call.function.name, args);
         const ok = !(result && typeof result === "object" && "error" in (result as object));
-        toolTrace.push({ tool: call.function.name, args, ok });
+        toolTrace.push({ tool: call.function.name, args, ok, result });
+        // Tangkap runId build supaya UI bisa render pohon pipeline live.
+        if (result && typeof result === "object" && "runId" in (result as object)) {
+          const rid = (result as { runId?: unknown }).runId;
+          if (typeof rid === "string") buildRunId = rid;
+        }
         const payload = JSON.stringify(result).slice(0, 8000);
         if (call.id.startsWith("mmx-")) {
           xmlFeedback.push(`Hasil ${call.function.name}: ${payload}`);
@@ -127,7 +155,7 @@ export async function POST(req: Request) {
     }
     // Kehabisan iterasi — minta jawaban akhir tanpa tool.
     const final = await chatWithTools([...messages, { role: "user", content: "Beri jawaban final ringkas dari hasil di atas." }], [], { signal: req.signal });
-    return NextResponse.json({ answer: final.content ?? "", toolTrace, note: "batas iterasi tool tercapai" });
+    return NextResponse.json({ answer: final.content ?? "", toolTrace, buildRunId, note: "batas iterasi tool tercapai" });
   } catch (e) {
     return NextResponse.json(
       { error: "AI Copilot tak tersedia", detail: String(e), hint: "Set LLM_KEY (MiniMax) di .env.local." },
