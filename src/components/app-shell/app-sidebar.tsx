@@ -176,7 +176,7 @@ export function AppSidebar() {
 
         {/* Slot bawah — RIWAYAT saat di AI Copilot, atau sub-menu section aktif. */}
         {!iconMode && onCopilot ? (
-          <SidebarGroup className="mt-1 min-h-0 flex-1 gap-0 border-t border-sidebar-border px-2 pb-1 pt-2">
+          <SidebarGroup className="mt-1 gap-0 border-t border-sidebar-border px-2 pb-1 pt-2">
             <div className="flex items-center justify-between pr-1">
               <SidebarGroupLabel className="h-6 px-2 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">
                 Riwayat
@@ -191,7 +191,7 @@ export function AppSidebar() {
                 <Plus className="size-4" />
               </button>
             </div>
-            <div className="mt-0.5 flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto">
+            <div className="mt-0.5 flex max-h-[46vh] flex-col gap-0.5 overflow-y-auto">
               {copilot.sessions.length === 0 ? (
                 <p className="px-2 py-1.5 text-xs text-sidebar-foreground/50">Belum ada percakapan.</p>
               ) : (
