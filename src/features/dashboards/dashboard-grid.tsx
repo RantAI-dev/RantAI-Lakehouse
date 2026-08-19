@@ -118,7 +118,7 @@ export function DashboardGrid({
   };
 
   return (
-    <div ref={ref} className="relative w-full" style={{ height: canvasH, minHeight: 200 }}>
+    <div ref={ref} className="dash-canvas relative w-full" style={{ height: canvasH, minHeight: 200 }}>
       {editable ? (
         <div
           className="pointer-events-none absolute inset-0 rounded-lg"
@@ -135,7 +135,7 @@ export function DashboardGrid({
         if (!b) return null;
         const dragging = drag?.id === it.id;
         return (
-          <div key={it.id} style={boxStyle(b)} className={cn("transition-[left,top,width,height]", dragging && "z-20 transition-none")}>
+          <div key={it.id} style={boxStyle(b)} className={cn("dash-tile transition-[left,top,width,height]", dragging && "z-20 transition-none")}>
             <div className={cn("flex h-full flex-col overflow-hidden rounded-xl border border-border bg-card shadow-[0px_1px_2px_0px_rgba(0,0,0,0.05)]", dragging && "ring-2 ring-primary/40")}>
               {/* Header / drag handle */}
               <div className={cn("flex items-center gap-2 border-b border-border px-3 py-1.5", editable && "cursor-move select-none bg-muted/40")}

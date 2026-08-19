@@ -22,6 +22,7 @@ export function AppNavbar() {
 
   return (
     <header
+      data-print-hide
       className={cn(
         "sticky top-0 z-20 flex h-16 shrink-0 items-center gap-4 border-b border-border bg-background/90 px-4 backdrop-blur-md sm:px-5"
       )}

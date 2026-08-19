@@ -3,7 +3,7 @@
 import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { RefreshCw, Sparkles, Download, Pencil, Eye, EyeOff, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Plus, Move, Share2, Link2, Check, Globe, Code2, KeyRound, Filter, Table2 } from "lucide-react";
+import { RefreshCw, Sparkles, Download, Pencil, Eye, EyeOff, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Plus, Move, Share2, Link2, Check, Globe, Code2, KeyRound, Filter, Table2, FileDown } from "lucide-react";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -171,6 +171,16 @@ export function DashboardPage() {
       setRecords({ columns: [], rows: [], value, loading: false });
     }
   }, []);
+
+  // Export PDF — pakai dialog print browser (Save as PDF). Print CSS mengubah
+  // kanvas tile jadi tumpukan rapi & menyembunyikan chrome konsol. Tanpa dep.
+  function doExportPdf() {
+    setMenuOpen(false);
+    setEdit(false);
+    const prev = document.title;
+    document.title = (dashName || "dashboard").replace(/[^\w\s-]/g, "").trim();
+    setTimeout(() => { window.print(); document.title = prev; }, 200);
+  }
 
   // Start in VIEW mode; user clicks "Edit layout" to arrange. Reset on board switch.
   React.useEffect(() => { setEdit(false); }, [board]);
@@ -359,7 +369,7 @@ export function DashboardPage() {
         title={dashName}
         description={isDefault ? "Built-in dashboard (demo). Create your own dashboard from the sidebar to arrange the layout." : "Dashboard canvas — drag & resize tiles in Edit mode. Saved automatically."}
         actions={
-          <>
+          <span data-print-hide className="contents">
             <Select value={year} onValueChange={(v) => setYear(v ?? "all")}>
               <SelectTrigger className="h-7 w-[120px] text-xs"><SelectValue /></SelectTrigger>
               <SelectContent>{YEARS.map((y) => <SelectItem key={y} value={y}>{y === "all" ? "All years" : `Year ${y}`}</SelectItem>)}</SelectContent>
@@ -396,6 +406,7 @@ export function DashboardPage() {
                     {!isDefault ? (
                       <button onClick={() => void openShare()} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Share2 className="size-4" /> Share…</button>
                     ) : null}
+                    <button onClick={doExportPdf} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><FileDown className="size-4" /> Export PDF (print)</button>
                     <a href="/api/dashboard/export" download className="flex items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Download className="size-4" /> Export YAML</a>
                     <button onClick={() => void duplicateDashboard()} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Copy className="size-4" /> Duplicate</button>
                     {!isDefault ? (
@@ -406,7 +417,7 @@ export function DashboardPage() {
               ) : null}
             </div>
             <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}><RefreshCw className={cn("size-4", loading && "animate-spin")} /></Button>
-          </>
+          </span>
         }
       />
 
@@ -414,7 +425,7 @@ export function DashboardPage() {
       {data?.storeError ? <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-2 text-xs text-amber-600 dark:text-amber-400">Could not load saved charts: {data.storeError}</div> : null}
 
       {data?.filterColumns?.length ? (
-        <div className="rounded-lg border border-border bg-card/50 px-3 py-2">
+        <div data-print-hide className="rounded-lg border border-border bg-card/50 px-3 py-2">
           <DashboardFilters columns={data.filterColumns} filters={filters} onChange={applyFilters} />
         </div>
       ) : null}

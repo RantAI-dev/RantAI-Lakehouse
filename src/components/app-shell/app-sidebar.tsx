@@ -181,7 +181,7 @@ export function AppSidebar() {
   const openGroup = groups.find((g) => g.label === flyout?.label)
 
   return (
-    <Sidebar collapsible="icon" side="left" className="border-r border-sidebar-border bg-sidebar shadow-sm">
+    <Sidebar data-print-hide collapsible="icon" side="left" className="border-r border-sidebar-border bg-sidebar shadow-sm">
       <SidebarHeader className="flex flex-col border-b border-sidebar-border px-3 py-2.5 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-2 group-data-[collapsible=icon]:py-2">
         <div className="flex h-12 min-w-0 items-center justify-start gap-2 group-data-[collapsible=icon]:h-auto group-data-[collapsible=icon]:justify-center">
           <BrandLogo />

@@ -111,3 +111,28 @@
     line-height: 20px;
   }
 }
+
+/* ── Print / Export PDF ──────────────────────────────────────────────────────
+   Sembunyikan chrome konsol; ubah kanvas dashboard (tile absolut) jadi tumpukan
+   vertikal yang rapi agar "Save as PDF" dari dialog print menghasilkan snapshot
+   bersih. Dipicu tombol Export → PDF (window.print()). */
+@media print {
+  [data-print-hide] { display: none !important; }
+  body { background: #fff !important; }
+  @page { margin: 10mm; }
+
+  .dash-canvas {
+    position: static !important;
+    height: auto !important;
+    min-height: 0 !important;
+  }
+  .dash-canvas > .dash-canvas-grid { display: none !important; } /* garis grid */
+  .dash-tile {
+    position: static !important;
+    left: auto !important; top: auto !important;
+    width: 100% !important; height: 360px !important;
+    margin: 0 0 12px 0 !important;
+    break-inside: avoid;
+    box-shadow: none !important;
+  }
+}
