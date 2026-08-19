@@ -86,49 +86,36 @@ export function DashboardGrid({
   const maxY = Math.max(0, ...Object.values(view).map((b) => b.y + b.h));
   const canvasH = MARGIN + maxY * unitY + (editable ? unitY : 0);
 
+  // Pasang listener move/up LANGSUNG (imperatif) di startDrag agar tak bergantung
+  // pada re-render/effect — event pointermove pertama pun tertangkap.
   const startDrag = (e: React.PointerEvent, id: string, mode: "move" | "resize") => {
-    if (!editable) return;
+    if (!editable || !colW) return;
     e.preventDefault();
-    setDrag({ id, mode, px: e.clientX, py: e.clientY, box: base[id] });
-    setPreview(base);
-  };
-
-  React.useEffect(() => {
-    if (!drag) return;
-    const move = (e: PointerEvent) => {
-      const dCols = Math.round((e.clientX - drag.px) / unitX);
-      const dRows = Math.round((e.clientY - drag.py) / unitY);
-      const b = drag.box;
-      let nb: TileBox;
-      if (drag.mode === "move") {
-        nb = {
-          x: Math.min(Math.max(0, b.x + dCols), COLS - b.w),
-          y: Math.max(0, b.y + dRows),
-          w: b.w, h: b.h,
-        };
-      } else {
-        nb = {
-          x: b.x, y: b.y,
-          w: Math.min(Math.max(2, b.w + dCols), COLS - b.x),
-          h: Math.max(3, b.h + dRows),
-        };
-      }
-      setPreview({ ...base, [drag.id]: nb });
+    const startBox = base[id];
+    if (!startBox) return;
+    const px = e.clientX, py = e.clientY;
+    setDrag({ id, mode, px, py, box: startBox });
+    let last: LayoutMap = base;
+    const move = (ev: PointerEvent) => {
+      const dCols = Math.round((ev.clientX - px) / unitX);
+      const dRows = Math.round((ev.clientY - py) / unitY);
+      const b = startBox;
+      const nb: TileBox = mode === "move"
+        ? { x: Math.min(Math.max(0, b.x + dCols), COLS - b.w), y: Math.max(0, b.y + dRows), w: b.w, h: b.h }
+        : { x: b.x, y: b.y, w: Math.min(Math.max(2, b.w + dCols), COLS - b.x), h: Math.max(3, b.h + dRows) };
+      last = { ...base, [id]: nb };
+      setPreview(last);
     };
     const up = () => {
-      setPreview((p) => {
-        if (p) onLayoutChange(p);
-        return null;
-      });
-      setDrag(null);
-    };
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up, { once: true });
-    return () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
+      setPreview(null);
+      setDrag(null);
+      onLayoutChange(last);
     };
-  }, [drag, base, unitX, unitY, onLayoutChange]);
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
 
   return (
     <div ref={ref} className="relative w-full" style={{ height: canvasH, minHeight: 200 }}>
