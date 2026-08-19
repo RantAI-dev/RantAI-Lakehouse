@@ -12,17 +12,32 @@ import * as echarts from "echarts";
 export function EChart({
   option,
   height = 280,
+  onDataClick,
 }: {
   option: echarts.EChartsOption;
   height?: number | string;
+  /** Klik titik data (bar/irisan/dll) → drill/cross-filter. `pos` = koordinat layar. */
+  onDataClick?: (name: string, pos: { x: number; y: number }) => void;
 }) {
   const elRef = React.useRef<HTMLDivElement>(null);
   const chartRef = React.useRef<echarts.ECharts | null>(null);
+  // Simpan callback di ref supaya handler klik selalu pakai versi terbaru
+  // tanpa re-init chart.
+  const clickRef = React.useRef(onDataClick);
+  React.useEffect(() => { clickRef.current = onDataClick; }, [onDataClick]);
 
   React.useEffect(() => {
     if (!elRef.current) return;
     const chart = echarts.init(elRef.current, undefined, { renderer: "canvas" });
     chartRef.current = chart;
+    chart.on("click", (p: unknown) => {
+      const o = p as { name?: string; event?: { event?: MouseEvent } };
+      const name = o?.name;
+      if (name && clickRef.current) {
+        const ev = o.event?.event;
+        clickRef.current(name, { x: ev?.clientX ?? 0, y: ev?.clientY ?? 0 });
+      }
+    });
     const ro = new ResizeObserver(() => chart.resize());
     ro.observe(elRef.current);
     return () => {
@@ -37,5 +52,5 @@ export function EChart({
     chartRef.current?.setOption(option, true);
   }, [option]);
 
-  return <div ref={elRef} style={{ width: "100%", height }} />;
+  return <div ref={elRef} style={{ width: "100%", height, cursor: onDataClick ? "pointer" : "default" }} />;
 }

@@ -3,7 +3,7 @@
 import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { RefreshCw, Sparkles, Download, Pencil, Eye, EyeOff, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Plus, Move, Share2, Link2, Check, Globe, Code2, KeyRound } from "lucide-react";
+import { RefreshCw, Sparkles, Download, Pencil, Eye, EyeOff, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Plus, Move, Share2, Link2, Check, Globe, Code2, KeyRound, Filter, Table2 } from "lucide-react";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -71,6 +71,9 @@ export function DashboardPage() {
   const [newName, setNewName] = React.useState("");
   const [fullscreen, setFullscreen] = React.useState(false);
   const [autoSec, setAutoSec] = React.useState("0");
+  // Drill / cross-filter: menu saat klik titik data + modal baris mentah.
+  const [drill, setDrill] = React.useState<{ name: string; column: string; mart: string; x: number; y: number } | null>(null);
+  const [records, setRecords] = React.useState<{ columns: string[]; rows: Record<string, unknown>[]; value: string; loading: boolean } | null>(null);
   const [shareOpen, setShareOpen] = React.useState(false);
   const [shareToken, setShareToken] = React.useState("");
   const [shareBusy, setShareBusy] = React.useState(false);
@@ -133,6 +136,42 @@ export function DashboardPage() {
     }
     void load();
   }, [board, isDefault, load]);
+  // Klik titik data pada chart (mode Lihat) → buka menu drill di posisi kursor.
+  const onTileClick = React.useCallback((column: string, mart: string) =>
+    (name: string, pos: { x: number; y: number }) => setDrill({ name, column, mart, x: pos.x, y: pos.y }), []);
+
+  // Cross-filter: toggle nilai di kolom → menyaring SEMUA tile yang punya kolom itu.
+  const crossFilter = React.useCallback((column: string, value: string) => {
+    const cur = filtersRef.current;
+    const ex = cur.find((f) => f.column === column);
+    let next: FilterDef[];
+    if (ex?.values.includes(value)) {
+      const vals = ex.values.filter((v) => v !== value);
+      next = vals.length ? cur.map((f) => (f.column === column ? { ...f, values: vals } : f)) : cur.filter((f) => f.column !== column);
+    } else if (ex) {
+      next = cur.map((f) => (f.column === column ? { ...f, values: [...f.values, value] } : f));
+    } else {
+      next = [...cur, { column, values: [value] }];
+    }
+    applyFilters(next);
+    setDrill(null);
+  }, [applyFilters]);
+
+  // Drill-down: tampilkan baris mentah Gold di balik nilai yang diklik.
+  const openRecords = React.useCallback(async (mart: string, column: string, value: string) => {
+    setDrill(null);
+    setRecords({ columns: [], rows: [], value, loading: true });
+    try {
+      const q = new URLSearchParams({ mart, column, value, limit: "100" });
+      const res = await fetch(`/api/dashboard/records?${q.toString()}`, { cache: "no-store" });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json?.error ?? "gagal");
+      setRecords({ columns: json.columns ?? [], rows: json.rows ?? [], value, loading: false });
+    } catch {
+      setRecords({ columns: [], rows: [], value, loading: false });
+    }
+  }, []);
+
   // Start in VIEW mode; user clicks "Edit layout" to arrange. Reset on board switch.
   React.useEffect(() => { setEdit(false); }, [board]);
   // Buka /dashboards (demo) → langsung ke dashboard user terbaru bila ada.
@@ -290,6 +329,9 @@ export function DashboardPage() {
   const items: GridItem[] = charts.map((spec) => {
     const cell = data?.results[spec.id];
     const badge = SOURCE_BADGE[spec.source];
+    const dim = (spec.def as ChartDef | undefined)?.dimension;
+    // Klik-drill hanya di mode Lihat, untuk chart yang punya dimensi kategori.
+    const clickable = !edit && !!dim && spec.kind !== "geomap" && spec.kind !== "table" && spec.kind !== "kpi" && spec.kind !== "gauge" && spec.kind !== "text";
     return {
       id: spec.id,
       title: spec.title,
@@ -306,7 +348,8 @@ export function DashboardPage() {
       ),
       onEdit: spec.source !== "builtin" && spec.def ? () => setEditing({ id: spec.id, def: spec.def as ChartDef }) : undefined,
       onRemove: spec.source !== "builtin" ? () => void remove(spec.id) : undefined,
-      body: <TileBody spec={spec} cell={cell} dark={dark} loading={loading} year={year} />,
+      body: <TileBody spec={spec} cell={cell} dark={dark} loading={loading} year={year}
+        onDataClick={clickable && dim ? onTileClick(dim, spec.mart) : undefined} />,
     };
   });
 
@@ -415,6 +458,47 @@ export function DashboardPage() {
           editId={editing.id} initial={editing.def} board={board} boards={boards}
           onSaved={() => { setEditing(null); void load(); }} />
       ) : null}
+
+      {/* Drill menu — muncul saat klik titik data (mode Lihat). */}
+      {drill ? (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setDrill(null)} />
+          <div
+            className="fixed z-50 w-60 rounded-lg border border-border bg-card p-1 shadow-xl"
+            style={{ left: Math.min(drill.x, (typeof window !== "undefined" ? window.innerWidth : 1200) - 250), top: Math.min(drill.y, (typeof window !== "undefined" ? window.innerHeight : 800) - 130) }}
+          >
+            <p className="truncate px-2 py-1 text-[11px] text-muted-foreground">{drill.column}: <span className="font-medium text-foreground">{drill.name}</span></p>
+            <button onClick={() => crossFilter(drill.column, drill.name)} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Filter className="size-4" /> Filter dashboard by this</button>
+            <button onClick={() => void openRecords(drill.mart, drill.column, drill.name)} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Table2 className="size-4" /> View records</button>
+          </div>
+        </>
+      ) : null}
+
+      {/* Drill-down: baris mentah Gold di balik nilai. */}
+      <Dialog open={!!records} onOpenChange={(o) => { if (!o) setRecords(null); }}>
+        <DialogContent className="max-h-[85vh] overflow-hidden sm:max-w-3xl">
+          <DialogHeader><DialogTitle className="flex items-center gap-2"><Table2 className="size-4" /> Records · {records?.value}</DialogTitle></DialogHeader>
+          {records?.loading ? (
+            <div className="h-40 animate-pulse rounded bg-muted/40" />
+          ) : records && records.rows.length ? (
+            <div className="max-h-[60vh] overflow-auto rounded-md border border-border">
+              <table className="w-full border-collapse text-xs">
+                <thead className="sticky top-0 bg-card"><tr className="border-b border-border">{records.columns.map((c) => <th key={c} className="px-2 py-1.5 text-left font-medium text-muted-foreground">{c}</th>)}</tr></thead>
+                <tbody>
+                  {records.rows.map((r, i) => (
+                    <tr key={i} className="border-b border-border/40 last:border-0">
+                      {records.columns.map((c) => <td key={c} className="whitespace-nowrap px-2 py-1 tabular-nums">{String(r[c] ?? "")}</td>)}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <p className="py-8 text-center text-sm text-muted-foreground">No records found.</p>
+          )}
+          {records && !records.loading && records.rows.length ? <p className="text-[11px] text-muted-foreground">Showing up to 100 rows.</p> : null}
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={shareOpen} onOpenChange={setShareOpen}>
         <DialogContent className="max-h-[85vh] overflow-y-auto overflow-x-hidden sm:max-w-md">

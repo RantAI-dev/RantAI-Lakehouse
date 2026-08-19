@@ -14,13 +14,15 @@ function hasRows(c: Cell | undefined): c is { columns: string[]; rows: Record<st
 
 /** Isi sebuah tile sesuai kind: text / kpi / table / chart. */
 export function TileBody({
-  spec, cell, dark, loading, year,
+  spec, cell, dark, loading, year, onDataClick,
 }: {
   spec: ChartRenderSpec & { text?: string; caption?: string };
   cell: Cell | undefined;
   dark: boolean;
   loading: boolean;
   year: string;
+  /** Klik titik data (bar/irisan/titik) → drill/cross-filter. */
+  onDataClick?: (name: string, pos: { x: number; y: number }) => void;
 }) {
   if (spec.kind === "text") {
     return <div className="h-full overflow-auto px-1 py-0.5 text-sm leading-relaxed"><MiniMarkdown text={spec.text ?? ""} /></div>;
@@ -56,7 +58,7 @@ export function TileBody({
   }
 
   // chart
-  if (hasRows(cell) && cell.rows.length) return <EChart option={buildOption(spec, cell.rows, dark)} height="100%" />;
+  if (hasRows(cell) && cell.rows.length) return <EChart option={buildOption(spec, cell.rows, dark)} height="100%" onDataClick={onDataClick} />;
   return <p className="grid h-full place-items-center text-xs text-muted-foreground">Tak ada data{year !== "all" ? ` (tahun ${year})` : ""}.</p>;
 }
 
