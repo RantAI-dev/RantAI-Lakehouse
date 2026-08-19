@@ -22,26 +22,35 @@ type Payload = {
  *  - satu chart saja bila `chartId` diberikan (?chart=<id>) — mengisi iframe.
  * Read-only, data dari mart Gold. Latar transparan agar menyatu dgn host.
  */
-export function EmbedView({ token, chartId }: { token: string; chartId?: string }) {
+export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: string; chartId?: string }) {
   const { resolvedTheme } = useTheme();
   const dark = resolvedTheme === "dark";
   const [data, setData] = React.useState<Payload | null>(null);
   const [state, setState] = React.useState<"loading" | "ok" | "notfound" | "error">("loading");
 
+  // Sumber data: token publik (GET, read-only) ATAU JWT signed embed (POST,
+  // filter terkunci server-side). Link publik: /embed/dashboard/<token>.
+  const linkBase = token ? `/public/dashboard/${token}` : "";
+
   React.useEffect(() => {
     let alive = true;
     (async () => {
       try {
-        const res = await fetch(`/api/public/dashboard/${encodeURIComponent(token)}`, { cache: "no-store" });
+        const res = jwt
+          ? await fetch(`/api/embed/data`, {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ jwt }), cache: "no-store",
+            })
+          : await fetch(`/api/public/dashboard/${encodeURIComponent(token ?? "")}`, { cache: "no-store" });
         if (!alive) return;
-        if (res.status === 404) { setState("notfound"); return; }
+        if (res.status === 404 || res.status === 403 || res.status === 401) { setState("notfound"); return; }
         if (!res.ok) { setState("error"); return; }
         setData(await res.json());
         setState("ok");
       } catch { if (alive) setState("error"); }
     })();
     return () => { alive = false; };
-  }, [token]);
+  }, [token, jwt]);
 
   if (state === "notfound" || state === "error") {
     return <div className="grid h-screen place-content-center px-4 text-center text-sm text-muted-foreground">Dashboard not available.</div>;
@@ -60,8 +69,12 @@ export function EmbedView({ token, chartId }: { token: string; chartId?: string 
         <div className="flex h-full flex-col overflow-hidden rounded-xl border border-border bg-card">
           <div className="flex items-center gap-2 border-b border-border px-3 py-1.5">
             <p className="min-w-0 flex-1 truncate text-sm font-semibold">{spec?.title ?? "…"}</p>
-            <a href={`/public/dashboard/${token}`} target="_blank" rel="noopener noreferrer"
-               className="text-[10px] font-medium text-muted-foreground hover:text-foreground">Rantai Lake ↗</a>
+            {linkBase ? (
+              <a href={linkBase} target="_blank" rel="noopener noreferrer"
+                 className="text-[10px] font-medium text-muted-foreground hover:text-foreground">Rantai Lake ↗</a>
+            ) : (
+              <span className="text-[10px] font-medium text-muted-foreground">Rantai Lake</span>
+            )}
           </div>
           <div className="min-h-0 flex-1 p-2">
             {spec ? <TileBody spec={spec} cell={data?.results[spec.id]} dark={dark} loading={state === "loading"} year="all" /> : null}

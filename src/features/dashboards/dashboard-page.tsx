@@ -3,7 +3,7 @@
 import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { RefreshCw, Sparkles, Download, Pencil, Eye, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Plus, Move, Share2, Link2, Check, Globe, Code2 } from "lucide-react";
+import { RefreshCw, Sparkles, Download, Pencil, Eye, EyeOff, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Plus, Move, Share2, Link2, Check, Globe, Code2, KeyRound } from "lucide-react";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -75,6 +75,10 @@ export function DashboardPage() {
   const [shareToken, setShareToken] = React.useState("");
   const [shareBusy, setShareBusy] = React.useState(false);
   const [copied, setCopied] = React.useState<string | false>(false);
+  const [embedEnabled, setEmbedEnabled] = React.useState(false);
+  const [embedSecret, setEmbedSecret] = React.useState("");
+  const [sampleToken, setSampleToken] = React.useState("");
+  const [showSecret, setShowSecret] = React.useState(false);
   const notifyChange = () => { try { window.dispatchEvent(new Event("dashboards:changed")); } catch { /* ignore */ } };
 
   const load = React.useCallback(async () => {
@@ -184,14 +188,32 @@ export function DashboardPage() {
   async function openShare() {
     setMenuOpen(false);
     if (isDefault) return;
-    setCopied(false);
+    setCopied(false); setShowSecret(false);
     try {
       const res = await fetch("/api/dashboard/boards", { cache: "no-store" });
       const json = await res.json();
       const b = (json?.boards ?? []).find((x: { id: string; publicToken?: string }) => x.id === board);
       setShareToken(b?.publicToken ?? "");
     } catch { setShareToken(""); }
+    try {
+      const res = await fetch(`/api/dashboard/embed-info?board=${encodeURIComponent(board)}`, { cache: "no-store" });
+      const json = await res.json();
+      setEmbedSecret(json?.secret ?? ""); setEmbedEnabled(!!json?.enabled); setSampleToken(json?.sampleToken ?? "");
+    } catch { setEmbedSecret(""); setEmbedEnabled(false); setSampleToken(""); }
     setShareOpen(true);
+  }
+  async function setEmbed(enable: boolean) {
+    setShareBusy(true);
+    try {
+      await fetch("/api/dashboard/boards", {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: board, embed: enable }),
+      });
+      setEmbedEnabled(enable);
+      // Refresh sample token (baru bermakna saat enabled).
+      const res = await fetch(`/api/dashboard/embed-info?board=${encodeURIComponent(board)}`, { cache: "no-store" });
+      const json = await res.json();
+      setEmbedSecret(json?.secret ?? ""); setSampleToken(json?.sampleToken ?? "");
+    } finally { setShareBusy(false); }
   }
   async function setPublic(enable: boolean) {
     setShareBusy(true);
@@ -210,6 +232,17 @@ export function DashboardPage() {
   const embedIframe = shareToken
     ? `<iframe src="${embedDashUrl}" width="100%" height="600" frameborder="0" style="border:1px solid #e5e7eb;border-radius:12px" title="Rantai Lake dashboard"></iframe>`
     : "";
+  const signedPreviewUrl = sampleToken ? `${origin}/embed/signed/${sampleToken}` : "";
+  const signSnippet = [
+    `// Node — sign a per-viewer embed token (KEEP THE SECRET SERVER-SIDE)`,
+    `import jwt from "jsonwebtoken";`,
+    `const token = jwt.sign({`,
+    `  resource: { dashboard: "${board}" },`,
+    `  params: { /* locked filters, e.g. */ kawasan: "Jakarta Pusat" },`,
+    `  exp: Math.floor(Date.now()/1000) + 60*10,`,
+    `}, EMBED_SECRET);`,
+    `const url = "${origin}/embed/signed/" + token;`,
+  ].join("\n");
   async function copyText(text: string, key: string) {
     if (!text) return;
     try { await navigator.clipboard.writeText(text); setCopied(key); setTimeout(() => setCopied(false), 1800); } catch { /* ignore */ }
@@ -384,7 +417,7 @@ export function DashboardPage() {
       ) : null}
 
       <Dialog open={shareOpen} onOpenChange={setShareOpen}>
-        <DialogContent className="sm:max-w-md">
+        <DialogContent className="max-h-[85vh] overflow-y-auto overflow-x-hidden sm:max-w-md">
           <DialogHeader><DialogTitle className="flex items-center gap-2"><Share2 className="size-4" /> Share “{dashName}”</DialogTitle></DialogHeader>
           <div className="space-y-3">
             <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 p-3">
@@ -444,6 +477,61 @@ export function DashboardPage() {
             ) : (
               <p className="text-xs text-muted-foreground">Turn on the switch to generate a shareable link.</p>
             )}
+
+            {/* ── Signed embedding (JWT, locked filters per viewer) ── */}
+            <div className="space-y-2 rounded-lg border border-border bg-muted/20 p-3">
+              <div className="flex items-start gap-3">
+                <KeyRound className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium">Signed embedding</p>
+                  <p className="text-xs text-muted-foreground">Your app signs a JWT with the secret to embed this dashboard with <span className="font-medium text-foreground">locked filters per viewer</span>. Revocable instantly.</p>
+                </div>
+                <button
+                  type="button" role="switch" aria-checked={embedEnabled} disabled={shareBusy}
+                  onClick={() => void setEmbed(!embedEnabled)}
+                  className={cn("relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition-colors disabled:opacity-50", embedEnabled ? "bg-primary" : "bg-muted-foreground/30")}
+                >
+                  <span className={cn("absolute top-0.5 size-4 rounded-full bg-white transition-all", embedEnabled ? "left-[18px]" : "left-0.5")} />
+                </button>
+              </div>
+
+              {embedEnabled ? (
+                <div className="space-y-2 pt-1">
+                  {/* Secret */}
+                  <div className="space-y-1">
+                    <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Embedding secret</p>
+                    <div className="flex items-center gap-2">
+                      <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2">
+                        <KeyRound className="size-3.5 shrink-0 text-muted-foreground" />
+                        <span className="truncate font-mono text-xs text-foreground">{showSecret ? embedSecret : "•".repeat(40)}</span>
+                      </div>
+                      <Button size="sm" variant="ghost" onClick={() => setShowSecret((s) => !s)} aria-label="Toggle secret">
+                        {showSecret ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                      </Button>
+                      <Button size="sm" variant="outline" onClick={() => void copyText(embedSecret, "secret")}>
+                        {copied === "secret" ? <Check className="size-4 text-emerald-500" /> : <Copy className="size-4" />}
+                      </Button>
+                    </div>
+                    <p className="text-[11px] text-destructive/80">Keep this server-side. Anyone with it can sign valid embeds.</p>
+                  </div>
+
+                  {/* Signing snippet */}
+                  <div className="space-y-1">
+                    <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Sign a token (server-side)</p>
+                    <div className="rounded-md border border-border bg-background p-2">
+                      <code className="block max-h-40 overflow-auto whitespace-pre font-mono text-[11px] leading-relaxed text-foreground">{signSnippet}</code>
+                    </div>
+                    <Button size="sm" variant="outline" onClick={() => void copyText(signSnippet, "snippet")}>
+                      {copied === "snippet" ? <Check className="size-4 text-emerald-500" /> : <Copy className="size-4" />}{copied === "snippet" ? "Copied" : "Copy code"}
+                    </Button>
+                  </div>
+
+                  {signedPreviewUrl ? (
+                    <a href={signedPreviewUrl} target="_blank" rel="noopener noreferrer" className="inline-block text-xs font-medium text-primary hover:underline">Preview signed embed (sample token, 1h) ↗</a>
+                  ) : null}
+                </div>
+              ) : null}
+            </div>
           </div>
           <DialogFooter>
             <DialogClose render={<Button variant="ghost" size="sm" />}>Close</DialogClose>

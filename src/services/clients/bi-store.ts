@@ -41,7 +41,7 @@ export type ChartInput = {
   caption?: string; // unit/caption (kind="kpi")
 };
 
-export type Board = { id: string; name: string; layout?: LayoutMap; filters?: FilterDef[]; createdAt?: string; publicToken?: string };
+export type Board = { id: string; name: string; layout?: LayoutMap; filters?: FilterDef[]; createdAt?: string; publicToken?: string; embedEnabled?: boolean };
 
 const IDENT = /^[a-zA-Z0-9_]+$/;
 const KINDS: ChartKind[] = ["bar", "hbar", "line", "area", "pie", "stacked", "kpi", "table", "text"];
@@ -76,6 +76,8 @@ export async function ensureBiTable(): Promise<void> {
   await chExec("ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS filters_json String DEFAULT '[]'");
   // Migrasi: token share publik (kosong = privat/tak dibagikan).
   await chExec("ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS public_token String DEFAULT ''");
+  // Migrasi: izin signed embedding (JWT) untuk board ini.
+  await chExec("ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS embed_enabled UInt8 DEFAULT 0");
   ensured = true;
 }
 
@@ -100,10 +102,10 @@ function parseFilters(s: string): FilterDef[] {
   catch { return []; }
 }
 
-const BOARD_COLS = "id, name, layout_json, filters_json, public_token, toString(created_at) AS created_at";
-type BoardRow = { id: string; name: string; layout_json: string; filters_json: string; public_token: string; created_at: string };
+const BOARD_COLS = "id, name, layout_json, filters_json, public_token, embed_enabled, toString(created_at) AS created_at";
+type BoardRow = { id: string; name: string; layout_json: string; filters_json: string; public_token: string; embed_enabled: number; created_at: string };
 function rowToBoard(r: BoardRow): Board {
-  return { id: r.id, name: r.name, layout: parseLayout(r.layout_json), filters: parseFilters(r.filters_json), createdAt: r.created_at, publicToken: r.public_token || "" };
+  return { id: r.id, name: r.name, layout: parseLayout(r.layout_json), filters: parseFilters(r.filters_json), createdAt: r.created_at, publicToken: r.public_token || "", embedEnabled: Number(r.embed_enabled) === 1 };
 }
 
 export async function listBoards(): Promise<Board[]> {
@@ -128,11 +130,15 @@ export async function createBoard(name: string): Promise<Board> {
 }
 
 // INSERT (bukan ALTER UPDATE) — ReplacingMergeTree, instan & konsisten.
-async function upsertBoard(id: string, name: string, layout: LayoutMap, filters: FilterDef[], publicToken = ""): Promise<void> {
+async function upsertBoard(id: string, name: string, layout: LayoutMap, filters: FilterDef[], publicToken = "", embedEnabled = false): Promise<void> {
   await chExec(
-    `INSERT INTO console.bi_board (id, name, layout_json, filters_json, public_token) VALUES ` +
-      `('${esc(id)}', '${esc(name)}', '${esc(JSON.stringify(layout ?? {}))}', '${esc(JSON.stringify(filters ?? []))}', '${esc(publicToken ?? "")}')`,
+    `INSERT INTO console.bi_board (id, name, layout_json, filters_json, public_token, embed_enabled) VALUES ` +
+      `('${esc(id)}', '${esc(name)}', '${esc(JSON.stringify(layout ?? {}))}', '${esc(JSON.stringify(filters ?? []))}', '${esc(publicToken ?? "")}', ${embedEnabled ? 1 : 0})`,
   );
+}
+async function saveBoardFrom(b: Board, patch: Partial<Board>): Promise<void> {
+  const m = { ...b, ...patch };
+  await upsertBoard(m.id, m.name ?? "Dashboard", m.layout ?? {}, m.filters ?? [], m.publicToken ?? "", !!m.embedEnabled);
 }
 
 export async function renameBoard(id: string, name: string): Promise<void> {
@@ -140,19 +146,19 @@ export async function renameBoard(id: string, name: string): Promise<void> {
   const clean = String(name ?? "").trim();
   if (!clean) throw new Error("nama wajib.");
   const b = await getBoard(id);
-  await upsertBoard(id, clean, b?.layout ?? {}, b?.filters ?? [], b?.publicToken ?? "");
+  if (b) await saveBoardFrom(b, { name: clean });
 }
 
 export async function updateBoardLayout(id: string, layout: LayoutMap): Promise<void> {
   await ensureBiTable();
   const b = await getBoard(id);
-  await upsertBoard(id, b?.name ?? "Dashboard", layout ?? {}, b?.filters ?? [], b?.publicToken ?? "");
+  await saveBoardFrom(b ?? { id, name: "Dashboard" }, { layout: layout ?? {} });
 }
 
 export async function updateBoardFilters(id: string, filters: FilterDef[]): Promise<void> {
   await ensureBiTable();
   const b = await getBoard(id);
-  await upsertBoard(id, b?.name ?? "Dashboard", b?.layout ?? {}, filters ?? [], b?.publicToken ?? "");
+  await saveBoardFrom(b ?? { id, name: "Dashboard" }, { filters: filters ?? [] });
 }
 
 /**
@@ -165,8 +171,17 @@ export async function setBoardPublic(id: string, enable: boolean): Promise<strin
   const b = await getBoard(id);
   if (!b) throw new Error("dashboard tidak ditemukan.");
   const token = enable ? (b.publicToken || `p_${randomUUID().replace(/-/g, "")}`) : "";
-  await upsertBoard(id, b.name, b.layout ?? {}, b.filters ?? [], token);
+  await saveBoardFrom(b, { publicToken: token });
   return token;
+}
+
+/** Aktif/nonaktifkan signed embedding (JWT) untuk sebuah dashboard. */
+export async function setBoardEmbed(id: string, enable: boolean): Promise<boolean> {
+  await ensureBiTable();
+  const b = await getBoard(id);
+  if (!b) throw new Error("dashboard tidak ditemukan.");
+  await saveBoardFrom(b, { embedEnabled: enable });
+  return enable;
 }
 
 /** Ambil dashboard dari token publik (read-only, tanpa auth). null bila tak dibagikan. */

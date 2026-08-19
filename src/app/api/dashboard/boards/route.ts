@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import {
   listBoards, createBoard, deleteBoard, renameBoard, updateBoardLayout, updateBoardFilters, duplicateBoard,
-  setBoardPublic,
+  setBoardPublic, setBoardEmbed,
   type LayoutMap, type FilterDef,
 } from "@/services/clients/bi-store";
 
@@ -31,7 +31,7 @@ export async function POST(req: Request) {
 /** Ubah dashboard: {id, name} rename, {id, layout} tata letak, {id, filters}, {id, public}. */
 export async function PUT(req: Request) {
   try {
-    const body = (await req.json()) as { id?: string; name?: string; layout?: LayoutMap; filters?: FilterDef[]; public?: boolean };
+    const body = (await req.json()) as { id?: string; name?: string; layout?: LayoutMap; filters?: FilterDef[]; public?: boolean; embed?: boolean };
     const id = String(body.id ?? "");
     if (!id || id === "default") return NextResponse.json({ error: "dashboard tidak valid" }, { status: 400 });
     if (typeof body.name === "string") await renameBoard(id, body.name);
@@ -41,6 +41,11 @@ export async function PUT(req: Request) {
     if (typeof body.public === "boolean") {
       const token = await setBoardPublic(id, body.public);
       return NextResponse.json({ ok: true, publicToken: token });
+    }
+    // Aktif/nonaktifkan signed embedding (JWT).
+    if (typeof body.embed === "boolean") {
+      const enabled = await setBoardEmbed(id, body.embed);
+      return NextResponse.json({ ok: true, embedEnabled: enabled });
     }
     return NextResponse.json({ ok: true });
   } catch (e) {
