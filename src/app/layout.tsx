@@ -6,6 +6,7 @@ import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/app-shell/app-sidebar";
 import { AppNavbar } from "@/components/app-shell/app-navbar";
 import { CopilotDock } from "@/features/copilot/copilot-dock";
+import { CommandPalette } from "@/components/command-palette";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -53,6 +54,7 @@ export default function RootLayout({
                 <div className="flex-1 p-4 sm:p-5 lg:p-6">{children}</div>
                 <CopilotDock />
               </SidebarInset>
+              <CommandPalette />
             </SidebarProvider>
           </TooltipProvider>
         </ThemeProvider>

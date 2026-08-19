@@ -9,6 +9,7 @@ import { Input } from "@/components/ui/input"
 import { ThemeToggle } from "@/components/theme-toggle"
 import { cn } from "@/lib/utils"
 import { pageTitleFor } from "./nav-config"
+import { openCommandPalette } from "@/components/command-palette"
 
 /**
  * Sticky top navbar rendered on every page.
@@ -47,9 +48,12 @@ export function AppNavbar() {
             />
             <Input
               type="search"
-              placeholder="Search assets, pipelines, agents..."
-              className="h-9 w-full rounded-lg border-border bg-muted/40 py-2 pl-9 pr-14 text-sm leading-5 shadow-none placeholder:text-muted-foreground focus-visible:bg-background"
-              aria-label="Search"
+              readOnly
+              onClick={() => openCommandPalette()}
+              onFocus={() => openCommandPalette()}
+              placeholder="Cari halaman, aksi… (⌘K)"
+              className="h-9 w-full cursor-pointer rounded-lg border-border bg-muted/40 py-2 pl-9 pr-14 text-sm leading-5 shadow-none placeholder:text-muted-foreground focus-visible:bg-background"
+              aria-label="Buka command palette"
             />
             <kbd className="pointer-events-none absolute right-2 top-1/2 hidden h-5 -translate-y-1/2 items-center rounded border border-border bg-background px-1.5 font-mono text-[10px] text-muted-foreground lg:flex">
               ⌘ K
