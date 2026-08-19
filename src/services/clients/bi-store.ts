@@ -39,12 +39,20 @@ export type ChartInput = {
   board?: string; // board tujuan (default "default")
   text?: string; // konten markdown (kind="text")
   caption?: string; // unit/caption (kind="kpi")
+  target?: number; // target/max (kind="gauge")
 };
 
 export type Board = { id: string; name: string; layout?: LayoutMap; filters?: FilterDef[]; createdAt?: string; publicToken?: string; embedEnabled?: boolean };
 
 const IDENT = /^[a-zA-Z0-9_]+$/;
-const KINDS: ChartKind[] = ["bar", "hbar", "line", "area", "pie", "stacked", "kpi", "table", "text"];
+const KINDS: ChartKind[] = [
+  "bar", "hbar", "line", "area", "stacked", "combo",
+  "pie", "rose", "funnel", "treemap",
+  "scatter", "bubble", "heatmap", "radar", "waterfall",
+  "kpi", "gauge", "table", "text",
+];
+/** Kind yang boleh punya breakdown (dimensi ke-2). heatmap WAJIB breakdown. */
+const BREAKDOWN_KINDS = new Set<ChartKind>(["bar", "hbar", "line", "area", "heatmap"]);
 const AGGS = new Set(["sum", "avg", "max", "min", "count"]);
 
 let ensured = false;
@@ -334,31 +342,38 @@ export async function specFromInput(
   if (measures.length === 0) throw new Error("minimal satu kolom measure.");
   if (measures.some((m) => !IDENT.test(m) || !cols.has(m))) throw new Error("kolom measure tidak valid / tak ada.");
 
-  // ── KPI — angka tunggal ──────────────────────────────────────────────────
-  if (kind === "kpi") {
+  // ── KPI / GAUGE — angka tunggal (tanpa dimensi) ──────────────────────────
+  if (kind === "kpi" || kind === "gauge") {
     const m = measures[0];
+    const target = kind === "gauge" && Number(input.target) > 0 ? Number(input.target) : undefined;
     const def: ChartInput = {
       title, kind, mart, dimension: "", measures: [m], aggregate: agg as ChartInput["aggregate"],
-      caption: input.caption?.trim() || undefined, span, board,
+      caption: input.caption?.trim() || undefined, target, span, board,
     };
     const sql = buildKpiSql({ mart, measure: m, agg });
-    const spec: ChartSpec = { id: newId, title, subtitle, kind, mart, sql, x: "", y: m, caption: def.caption, format: "int", span };
+    const spec: ChartSpec = { id: newId, title, subtitle, kind, mart, sql, x: "", y: "v", caption: def.caption, target, format: "int", span };
     return { ...spec, source, board, def, hasYear, createdBy };
   }
 
   // ── TABLE / CHART — perlu dimensi ────────────────────────────────────────
   const dimension = String(input.dimension ?? "");
   if (!IDENT.test(dimension) || !cols.has(dimension)) throw new Error(`kolom dimensi '${dimension}' tak valid / tak ada.`);
+
+  // Batas jumlah measure per kind.
   if (kind === "stacked" && measures.length < 2) throw new Error("chart 'stacked' butuh ≥2 measure.");
+  if ((kind === "scatter" || kind === "combo") && measures.length < 2) throw new Error(`chart '${kind}' butuh 2 measure (X & Y).`);
+  if (kind === "bubble" && measures.length < 3) throw new Error("chart 'bubble' butuh 3 measure (X, Y, ukuran).");
+
   const limit = Math.min(Math.max(Number(input.limit ?? 20) || 20, 1), 100);
   const order = input.order ?? (kind === "line" || kind === "area" ? "none" : "desc");
   const breakdown = input.breakdown ? String(input.breakdown) : "";
   if (breakdown) {
     if (!IDENT.test(breakdown) || !cols.has(breakdown)) throw new Error(`kolom breakdown '${breakdown}' tak valid / tak ada.`);
     if (breakdown === dimension) throw new Error("breakdown harus beda dari dimensi.");
-    if (kind === "pie" || kind === "table") throw new Error("breakdown tak didukung untuk pie/tabel.");
+    if (!BREAKDOWN_KINDS.has(kind)) throw new Error("breakdown hanya untuk bar/hbar/line/area/heatmap.");
     if (measures.length > 1) throw new Error("dengan breakdown, pakai tepat satu measure.");
   }
+  if (kind === "heatmap" && !breakdown) throw new Error("heatmap butuh breakdown (dimensi ke-2).");
 
   const def: ChartInput = {
     title, subtitle, mart, kind, dimension, measures,
@@ -397,7 +412,7 @@ export function sqlWithFilters(
   }
   if (!where.length) return spec.sql;
   const agg = d.aggregate ?? "sum";
-  if (spec.kind === "kpi") return buildKpiSql({ mart, measure: d.measures[0], agg }, where);
+  if (spec.kind === "kpi" || spec.kind === "gauge") return buildKpiSql({ mart, measure: d.measures[0], agg }, where);
   return buildSql(
     { mart, dimension: d.dimension, measures: d.measures, agg, order: d.order ?? "none", limit: d.limit ?? 20, breakdown: d.breakdown },
     where,
@@ -411,7 +426,7 @@ export async function insertChart(spec: StoredChartSpec): Promise<void> {
   const clean: ChartSpec = {
     id: spec.id, title: spec.title, subtitle: spec.subtitle, kind: spec.kind,
     mart: spec.mart, sql: spec.sql, x: spec.x, y: spec.y, series: spec.series,
-    format: spec.format, span: spec.span, text: spec.text, caption: spec.caption,
+    format: spec.format, span: spec.span, text: spec.text, caption: spec.caption, target: spec.target,
   };
   const payload = esc(JSON.stringify({ spec: clean, def: spec.def, hasYear: spec.hasYear }));
   await chExec(

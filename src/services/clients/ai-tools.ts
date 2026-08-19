@@ -272,22 +272,26 @@ export const TOOLS: Record<string, ToolDef> = {
             mart: { type: "string", description: "nama mart Gold, mis. mart_wisman" },
             kind: {
               type: "string",
-              enum: ["bar", "hbar", "line", "area", "pie", "stacked", "kpi", "table", "text"],
-              description: "hbar=peringkat; stacked butuh ≥2 measure; kpi=angka besar (mart+measure, tanpa dimensi); table=tabel; text=catatan markdown (isi `text`, tanpa mart)",
+              enum: ["bar", "hbar", "line", "area", "stacked", "combo", "pie", "rose", "funnel", "treemap", "scatter", "bubble", "heatmap", "radar", "waterfall", "kpi", "gauge", "table", "text"],
+              description:
+                "hbar=peringkat; stacked/combo butuh 2 measure (combo=bar+line); pie/rose/funnel/treemap/radar=komposisi 1 measure; " +
+                "scatter=2 measure (X,Y); bubble=3 measure (X,Y,ukuran); heatmap=butuh breakdown (2 dimensi) + 1 measure; " +
+                "waterfall=1 measure kumulatif; kpi/gauge=angka tunggal (mart+measure, tanpa dimensi; gauge boleh `target`); table=tabel; text=catatan markdown (isi `text`, tanpa mart)",
             },
             text: { type: "string", description: "konten markdown untuk kind=text" },
             caption: { type: "string", description: "caption/unit untuk kind=kpi" },
+            target: { type: "number", description: "target/max untuk kind=gauge (opsional)" },
             dimension: { type: "string", description: "kolom kategori/waktu untuk sumbu-X" },
             measures: {
               type: "array",
               items: { type: "string" },
-              description: "kolom angka yang diagregasi (1 kolom; ≥2 untuk stacked)",
+              description: "kolom angka yang diagregasi (1; 2 untuk stacked/combo/scatter; 3 untuk bubble)",
             },
             breakdown: {
               type: "string",
               description:
-                "opsional: kolom dimensi ke-2 untuk memecah jadi banyak seri (mis. multi-line per kawasan, " +
-                "grouped/stacked bar per kategori). Pakai 1 measure saja. Tidak untuk pie.",
+                "opsional: kolom dimensi ke-2 untuk memecah jadi banyak seri (multi-line/grouped/stacked bar) " +
+                "ATAU sumbu-Y untuk heatmap. Pakai 1 measure. Hanya untuk bar/hbar/line/area/heatmap.",
             },
             aggregate: { type: "string", enum: ["sum", "avg", "max", "min", "count"] },
             limit: { type: "number", description: "maks kategori (default 20)" },
@@ -334,10 +338,12 @@ export const TOOLS: Record<string, ToolDef> = {
             title: { type: "string" },
             subtitle: { type: "string" },
             mart: { type: "string" },
-            kind: { type: "string", enum: ["bar", "hbar", "line", "area", "pie", "stacked", "kpi", "table", "text"] },
+            kind: { type: "string", enum: ["bar", "hbar", "line", "area", "stacked", "combo", "pie", "rose", "funnel", "treemap", "scatter", "bubble", "heatmap", "radar", "waterfall", "kpi", "gauge", "table", "text"] },
             dimension: { type: "string" },
             measures: { type: "array", items: { type: "string" } },
             breakdown: { type: "string" },
+            caption: { type: "string" },
+            target: { type: "number" },
             aggregate: { type: "string", enum: ["sum", "avg", "max", "min", "count"] },
             limit: { type: "number" },
             span: { type: "number", enum: [1, 2] },

@@ -69,8 +69,13 @@ MODE: BUILD. Selain menjawab, kamu bisa MENGOPERASIKAN lakehouse:
   1) panggil describe_mart (tanpa arg → lihat mart Gold; dengan mart → lihat
      kolom valid, terbagi dimensi vs measure),
   2) lalu create_chart dengan kolom yang BENAR-BENAR ADA. Kamu TIDAK menulis
-     SQL — server menyusunnya. Pilih kind yang cocok (hbar untuk peringkat,
-     line/area untuk tren waktu, pie untuk komposisi, stacked untuk ≥2 measure).
+     SQL — server menyusunnya. Pilih kind paling tepat:
+     • peringkat → hbar; tren waktu → line/area; kumulatif → waterfall
+     • komposisi → pie/rose/funnel/treemap; korelasi 2 metrik → scatter;
+       3 metrik → bubble; profil multi-kategori → radar
+     • bandingkan 2 metrik beda skala → combo (bar+line); ≥2 measure ditumpuk → stacked
+     • intensitas 2 dimensi → heatmap (WAJIB breakdown = dimensi ke-2)
+     • angka tunggal → kpi; angka vs target → gauge (boleh set target)
      Pakai parameter breakdown (dimensi ke-2) untuk multi-seri, mis. tren per
      kawasan (line + breakdown=kawasan) atau grouped bar per kategori.
   3) konfirmasi chart dibuat & sebut muncul di halaman Dashboards.

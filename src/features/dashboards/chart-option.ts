@@ -2,7 +2,7 @@ import type { EChartsOption } from "echarts";
 import type { ChartSpec } from "@/lib/dashboard-specs";
 
 /** buildOption hanya butuh cara render (bukan SQL) — muat ChartSpec & ChartRenderSpec. */
-type Renderable = Pick<ChartSpec, "kind" | "x" | "y" | "series">;
+type Renderable = Pick<ChartSpec, "kind" | "x" | "y" | "series" | "target">;
 
 /** Palet kategorikal konsol (indigo-led). Dipakai konsisten lintas chart. */
 const PALETTE = [
@@ -70,6 +70,165 @@ export function buildOption(
         },
       ],
     };
+  }
+
+  // ── Kind non-sumbu-standar (Metabase/Tableau-parity) ─────────────────────
+  const yArr = Array.isArray(spec.y) ? spec.y : [spec.y];
+  const y0 = yArr[0];
+  const niceMax = (v: number) => {
+    if (v <= 0) return 100;
+    const p = Math.pow(10, Math.floor(Math.log10(v)));
+    return Math.ceil(v / p) * p;
+  };
+  const valAxis = (name?: string, right = false) => ({
+    type: "value" as const,
+    name, nameTextStyle: { color: axis, fontSize: 10 }, nameGap: 8,
+    position: (right ? "right" : "left") as "right" | "left",
+    axisLabel: { color: axis, fontSize: 11, formatter: (v: number) => fmtCompact(v) },
+    splitLine: { show: !right, lineStyle: { color: split } },
+    axisLine: { show: false }, axisTick: { show: false },
+  });
+  const catAxis = (data: string[]) => ({
+    type: "category" as const, data,
+    axisLabel: { color: axis, fontSize: 11, interval: 0, hideOverlap: true, rotate: data.length > 6 ? 28 : 0 },
+    axisLine: { lineStyle: { color: split } }, axisTick: { show: false },
+  });
+  type PieP = { name: string; value: number; percent: number };
+  type ItemP = { name: string; value: number[] };
+  type AxisPs = { dataIndex: number }[];
+
+  if (spec.kind === "rose") {
+    return { ...base, grid: undefined,
+      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as PieP; return `${o.name}<br/><b>${fmtInt(o.value)}</b> (${o.percent}%)`; } },
+      legend: { bottom: 0, type: "scroll", textStyle: { color: axis, fontSize: 11 }, icon: "circle" },
+      series: [{ type: "pie", roseType: "area", radius: ["15%", "72%"], center: ["50%", "44%"],
+        itemStyle: { borderColor: dark ? "#09090b" : "#fff", borderWidth: 2, borderRadius: 4 },
+        label: { show: false }, data: rows.map((r) => ({ name: str(r[spec.x]), value: num(r[y0]) })) }],
+    } as EChartsOption;
+  }
+
+  if (spec.kind === "funnel") {
+    return { ...base, grid: undefined,
+      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as PieP; return `${o.name}<br/><b>${fmtInt(o.value)}</b>`; } },
+      legend: { bottom: 0, type: "scroll", textStyle: { color: axis, fontSize: 11 }, icon: "circle" },
+      series: [{ type: "funnel", left: "8%", right: "8%", top: 10, bottom: 28, sort: "descending", gap: 2,
+        label: { show: true, position: "inside", color: "#fff", fontSize: 11, formatter: "{b}" },
+        itemStyle: { borderColor: dark ? "#09090b" : "#fff", borderWidth: 1 },
+        data: rows.map((r) => ({ name: str(r[spec.x]), value: num(r[y0]) })) }],
+    } as EChartsOption;
+  }
+
+  if (spec.kind === "treemap") {
+    return { ...base, grid: undefined,
+      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as PieP; return `${o.name}<br/><b>${fmtInt(o.value)}</b>`; } },
+      series: [{ type: "treemap", roam: false, nodeClick: false, breadcrumb: { show: false },
+        width: "100%", height: "100%", top: 4, left: 4, right: 4, bottom: 4,
+        label: { show: true, formatter: "{b}", color: "#fff", fontSize: 11 },
+        itemStyle: { borderColor: dark ? "#09090b" : "#fff", borderWidth: 2, gapWidth: 2 },
+        data: rows.map((r, i) => ({ name: str(r[spec.x]), value: num(r[y0]), itemStyle: { color: PALETTE[i % PALETTE.length] } })) }],
+    } as EChartsOption;
+  }
+
+  if (spec.kind === "radar") {
+    const maxVal = Math.max(1, ...rows.map((r) => num(r[y0])));
+    return { ...base, grid: undefined,
+      tooltip: { ...base.tooltip, trigger: "item" },
+      radar: { indicator: rows.map((r) => ({ name: str(r[spec.x]), max: maxVal * 1.1 })),
+        axisName: { color: axis, fontSize: 10 }, splitLine: { lineStyle: { color: split } },
+        splitArea: { show: false }, axisLine: { lineStyle: { color: split } } },
+      series: [{ type: "radar", symbolSize: 4, areaStyle: { opacity: 0.12 }, lineStyle: { width: 2 },
+        data: [{ value: rows.map((r) => num(r[y0])), name: String(y0) }] }],
+    } as EChartsOption;
+  }
+
+  if (spec.kind === "gauge") {
+    const v = num(rows[0]?.v ?? rows[0]?.[y0]);
+    const max = spec.target && spec.target > 0 ? spec.target : niceMax(v);
+    return { ...base, grid: undefined,
+      series: [{ type: "gauge", startAngle: 210, endAngle: -30, min: 0, max, radius: "92%", center: ["50%", "56%"],
+        progress: { show: true, width: 12, itemStyle: { color: PALETTE[0] } },
+        axisLine: { lineStyle: { width: 12, color: [[1, split]] } },
+        axisTick: { show: false }, splitLine: { length: 8, lineStyle: { color: axis } },
+        axisLabel: { color: axis, fontSize: 9, distance: 12, formatter: (x: number) => fmtCompact(x) },
+        pointer: { width: 4, itemStyle: { color: PALETTE[0] } },
+        anchor: { show: true, size: 8, itemStyle: { color: PALETTE[0] } },
+        detail: { valueAnimation: true, formatter: (x: number) => fmtInt(x), color: axis, fontSize: 22, offsetCenter: [0, "70%"] },
+        title: { show: false }, data: [{ value: v }] }],
+    } as EChartsOption;
+  }
+
+  if (spec.kind === "scatter" || spec.kind === "bubble") {
+    const xc = yArr[0], yc = yArr[1] ?? yArr[0], sc = yArr[2];
+    const maxS = spec.kind === "bubble" && sc ? Math.max(1, ...rows.map((r) => num(r[sc]))) : 1;
+    return { ...base,
+      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => {
+        const o = p as ItemP; const d = o.value;
+        return `${o.name}<br/>${xc}: <b>${fmtInt(d[0])}</b><br/>${yc}: <b>${fmtInt(d[1])}</b>${sc ? `<br/>${sc}: <b>${fmtInt(d[2])}</b>` : ""}`;
+      } },
+      xAxis: valAxis(xc), yAxis: valAxis(yc),
+      series: [{ type: "scatter",
+        symbolSize: spec.kind === "bubble" && sc ? (d: unknown) => { const a = d as number[]; return 8 + 38 * Math.sqrt((a[2] ?? 0) / maxS); } : 12,
+        itemStyle: { opacity: 0.75 },
+        data: rows.map((r) => ({ name: str(r[spec.x]), value: [num(r[xc]), num(r[yc]), sc ? num(r[sc]) : 0] })) }],
+    } as EChartsOption;
+  }
+
+  if (spec.kind === "combo") {
+    const m1 = yArr[0], m2 = yArr[1] ?? yArr[0];
+    return { ...base,
+      tooltip: { ...base.tooltip, trigger: "axis", axisPointer: { type: "cross" } },
+      legend: { top: 0, textStyle: { color: axis, fontSize: 11 }, icon: "circle" },
+      grid: { ...base.grid, top: 34 },
+      xAxis: catAxis(cat),
+      // alignTicks off — dua metrik beda skala (mis. jutaan vs ribuan).
+      yAxis: [{ ...valAxis(m1), alignTicks: false }, { ...valAxis(m2, true), alignTicks: false }],
+      series: [
+        { name: m1, type: "bar", data: rows.map((r) => num(r[m1])), barMaxWidth: 34, itemStyle: { borderRadius: [4, 4, 0, 0] } },
+        { name: m2, type: "line", yAxisIndex: 1, smooth: true, symbolSize: 6, lineStyle: { width: 2 }, data: rows.map((r) => num(r[m2])) },
+      ],
+    } as EChartsOption;
+  }
+
+  if (spec.kind === "waterfall") {
+    const vals = rows.map((r) => num(r[y0]));
+    const pad: number[] = []; const up: (number | "-")[] = []; const down: (number | "-")[] = [];
+    let acc = 0;
+    for (const v of vals) {
+      pad.push(v >= 0 ? acc : acc + v);
+      up.push(v >= 0 ? v : "-");
+      down.push(v < 0 ? -v : "-");
+      acc += v;
+    }
+    return { ...base,
+      tooltip: { ...base.tooltip, trigger: "axis", axisPointer: { type: "shadow" },
+        formatter: (ps: unknown) => { const a = ps as AxisPs; const i = a[0]?.dataIndex ?? 0; return `${cat[i]}<br/><b>${fmtInt(vals[i])}</b>`; } },
+      xAxis: catAxis(cat), yAxis: valAxis(),
+      series: [
+        { type: "bar", stack: "wf", itemStyle: { color: "transparent" }, emphasis: { itemStyle: { color: "transparent" } }, data: pad },
+        { name: "naik", type: "bar", stack: "wf", data: up, itemStyle: { color: PALETTE[2], borderRadius: [3, 3, 0, 0] } },
+        { name: "turun", type: "bar", stack: "wf", data: down, itemStyle: { color: PALETTE[4], borderRadius: [3, 3, 0, 0] } },
+      ],
+    } as EChartsOption;
+  }
+
+  if (spec.kind === "heatmap" && spec.series) {
+    const xCats: string[] = []; const yCats: string[] = [];
+    const seriesCol = spec.series;
+    const data: [number, number, number][] = [];
+    for (const r of rows) {
+      const xv = str(r[spec.x]); const yv = str(r[seriesCol]);
+      let xi = xCats.indexOf(xv); if (xi < 0) { xi = xCats.length; xCats.push(xv); }
+      let yi = yCats.indexOf(yv); if (yi < 0) { yi = yCats.length; yCats.push(yv); }
+      data.push([xi, yi, num(r[y0])]);
+    }
+    const maxV = Math.max(1, ...data.map((d) => d[2]));
+    return { ...base, grid: { ...base.grid, top: 8, bottom: 48, left: 8, right: 12 },
+      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as { value: number[] }; return `${xCats[o.value[0]]} · ${yCats[o.value[1]]}<br/><b>${fmtInt(o.value[2])}</b>`; } },
+      xAxis: { type: "category", data: xCats, splitArea: { show: true }, axisLabel: { color: axis, fontSize: 10, interval: 0, hideOverlap: true, rotate: xCats.length > 6 ? 30 : 0 }, axisLine: { lineStyle: { color: split } }, axisTick: { show: false } },
+      yAxis: { type: "category", data: yCats, splitArea: { show: true }, axisLabel: { color: axis, fontSize: 10 }, axisLine: { lineStyle: { color: split } }, axisTick: { show: false } },
+      visualMap: { min: 0, max: maxV, calculable: false, orient: "horizontal", left: "center", bottom: 0, itemHeight: 60, textStyle: { color: axis, fontSize: 10 }, inRange: { color: dark ? ["#1e1b4b", "#6366f1", "#a5b4fc"] : ["#eef2ff", "#818cf8", "#4338ca"] } },
+      series: [{ type: "heatmap", data, label: { show: false }, emphasis: { itemStyle: { shadowBlur: 6, shadowColor: "rgba(0,0,0,0.3)" } } }],
+    } as EChartsOption;
   }
 
   const horizontal = spec.kind === "hbar";
