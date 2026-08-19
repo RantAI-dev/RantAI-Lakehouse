@@ -101,7 +101,7 @@ export function ChatComposer({
   };
 
   return (
-    <div className="rounded-2xl border border-border bg-background p-1.5 shadow-sm focus-within:border-ring/60">
+    <div className="rounded-2xl border border-border/60 bg-muted/30 p-1.5 shadow-sm transition-all focus-within:border-foreground/20 focus-within:bg-muted/40 focus-within:shadow-md">
       <Textarea
         value={input}
         onChange={(e) => setInput(e.target.value)}
