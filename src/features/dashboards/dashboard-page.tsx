@@ -3,7 +3,7 @@
 import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { RefreshCw, Sparkles, Download, Pencil, Eye, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Plus, Move, Share2, Link2, Check, Globe } from "lucide-react";
+import { RefreshCw, Sparkles, Download, Pencil, Eye, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Plus, Move, Share2, Link2, Check, Globe, Code2 } from "lucide-react";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -74,7 +74,7 @@ export function DashboardPage() {
   const [shareOpen, setShareOpen] = React.useState(false);
   const [shareToken, setShareToken] = React.useState("");
   const [shareBusy, setShareBusy] = React.useState(false);
-  const [copied, setCopied] = React.useState(false);
+  const [copied, setCopied] = React.useState<string | false>(false);
   const notifyChange = () => { try { window.dispatchEvent(new Event("dashboards:changed")); } catch { /* ignore */ } };
 
   const load = React.useCallback(async () => {
@@ -204,10 +204,15 @@ export function DashboardPage() {
       setCopied(false);
     } finally { setShareBusy(false); }
   }
-  const shareUrl = shareToken && typeof window !== "undefined" ? `${window.location.origin}/public/dashboard/${shareToken}` : "";
-  async function copyShare() {
-    if (!shareUrl) return;
-    try { await navigator.clipboard.writeText(shareUrl); setCopied(true); setTimeout(() => setCopied(false), 1800); } catch { /* ignore */ }
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  const shareUrl = shareToken ? `${origin}/public/dashboard/${shareToken}` : "";
+  const embedDashUrl = shareToken ? `${origin}/embed/dashboard/${shareToken}` : "";
+  const embedIframe = shareToken
+    ? `<iframe src="${embedDashUrl}" width="100%" height="600" frameborder="0" style="border:1px solid #e5e7eb;border-radius:12px" title="Rantai Lake dashboard"></iframe>`
+    : "";
+  async function copyText(text: string, key: string) {
+    if (!text) return;
+    try { await navigator.clipboard.writeText(text); setCopied(key); setTimeout(() => setCopied(false), 1800); } catch { /* ignore */ }
   }
 
   async function saveRename() {
@@ -398,23 +403,42 @@ export function DashboardPage() {
             </div>
 
             {shareToken ? (
-              <div className="space-y-2">
-                <div className="flex items-center gap-2">
-                  <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2">
-                    <Link2 className="size-3.5 shrink-0 text-muted-foreground" />
-                    <span className="truncate text-xs text-foreground">{shareUrl}</span>
+              <div className="space-y-3">
+                {/* Public link */}
+                <div className="space-y-1.5">
+                  <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Public link</p>
+                  <div className="flex items-center gap-2">
+                    <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2">
+                      <Link2 className="size-3.5 shrink-0 text-muted-foreground" />
+                      <span className="truncate text-xs text-foreground">{shareUrl}</span>
+                    </div>
+                    <Button size="sm" variant="outline" onClick={() => void copyText(shareUrl, "link")}>
+                      {copied === "link" ? <Check className="size-4 text-emerald-500" /> : <Copy className="size-4" />}{copied === "link" ? "Copied" : "Copy"}
+                    </Button>
                   </div>
-                  <Button size="sm" variant="outline" onClick={() => void copyShare()}>
-                    {copied ? <Check className="size-4 text-emerald-500" /> : <Copy className="size-4" />}{copied ? "Copied" : "Copy"}
-                  </Button>
+                  <a href={shareUrl} target="_blank" rel="noopener noreferrer" className="inline-block text-xs font-medium text-primary hover:underline">Open preview ↗</a>
                 </div>
-                <div className="flex items-center gap-2">
-                  <a href={shareUrl} target="_blank" rel="noopener noreferrer" className="text-xs font-medium text-primary hover:underline">Open preview ↗</a>
-                  <span className="text-xs text-muted-foreground">·</span>
+
+                {/* Embed (iframe) — ala Metabase */}
+                <div className="space-y-1.5">
+                  <p className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground"><Code2 className="size-3.5" /> Embed in a website</p>
+                  <div className="rounded-md border border-border bg-muted/30 p-2">
+                    <code className="block max-h-20 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-foreground">{embedIframe}</code>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Button size="sm" variant="outline" onClick={() => void copyText(embedIframe, "embed")}>
+                      {copied === "embed" ? <Check className="size-4 text-emerald-500" /> : <Copy className="size-4" />}{copied === "embed" ? "Copied" : "Copy iframe"}
+                    </Button>
+                    <a href={embedDashUrl} target="_blank" rel="noopener noreferrer" className="text-xs font-medium text-primary hover:underline">Preview embed ↗</a>
+                  </div>
+                  <p className="text-[11px] text-muted-foreground">One chart only? Append <code className="rounded bg-muted px-1 font-mono">?chart=&lt;id&gt;</code> to the embed URL.</p>
+                </div>
+
+                <div className="flex items-center justify-between gap-2 border-t border-border pt-2">
                   <button onClick={() => void setPublic(false)} disabled={shareBusy} className="text-xs text-destructive hover:underline disabled:opacity-50">Revoke link</button>
                 </div>
                 <p className="rounded-md bg-amber-500/5 px-2.5 py-1.5 text-[11px] text-amber-600 dark:text-amber-400">
-                  This link works wherever the server is reachable. For the internet, expose the server (e.g. Cloudflare Tunnel / reverse proxy).
+                  Works wherever the server is reachable. For the public internet, expose the server (e.g. Cloudflare Tunnel / reverse proxy).
                 </p>
               </div>
             ) : (

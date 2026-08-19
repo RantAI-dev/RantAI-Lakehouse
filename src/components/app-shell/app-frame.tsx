@@ -16,7 +16,7 @@ import { CommandPalette } from "@/components/command-palette";
  */
 export function AppFrame({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  if (pathname?.startsWith("/public")) return <>{children}</>;
+  if (pathname?.startsWith("/public") || pathname?.startsWith("/embed")) return <>{children}</>;
 
   return (
     <SidebarProvider>
