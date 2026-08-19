@@ -5,20 +5,20 @@ import { ArrowUp, SlidersHorizontal, Check } from "lucide-react";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import type { Mode } from "./use-copilot";
-import { toolsForMode } from "./tool-catalog";
+import { capsForMode } from "./capabilities";
 
-/** Menu "Tools" — pilih tool mana yang boleh dipakai agen (ala RantAI-Agents). */
+/** Menu "Tools" — pilih KAPABILITAS (sesuai menu) yang boleh dipakai agen. */
 function ToolsMenu({
-  mode, enabledTools, toggleTool,
+  mode, enabledCaps, toggleCap,
 }: {
   mode: Mode;
-  enabledTools: Set<string>;
-  toggleTool: (name: string) => void;
+  enabledCaps: Set<string>;
+  toggleCap: (key: string) => void;
 }) {
   const [open, setOpen] = React.useState(false);
   const ref = React.useRef<HTMLDivElement>(null);
-  const avail = toolsForMode(mode);
-  const onCount = avail.filter((t) => enabledTools.has(t.name)).length;
+  const avail = capsForMode(mode);
+  const onCount = avail.filter((c) => enabledCaps.has(c.key)).length;
 
   React.useEffect(() => {
     if (!open) return;
@@ -41,28 +41,30 @@ function ToolsMenu({
         Tools <span className="text-[10px] opacity-70">{onCount}/{avail.length}</span>
       </button>
       {open ? (
-        <div className="absolute bottom-full left-0 z-10 mb-1.5 max-h-72 w-72 overflow-y-auto rounded-xl border border-border bg-card p-1.5 shadow-xl">
+        <div className="absolute bottom-full left-0 z-10 mb-1.5 w-72 overflow-hidden rounded-xl border border-border bg-card p-1.5 shadow-xl">
           <p className="px-2 py-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-            Tools · mode {mode === "ask" ? "Ask" : "Build"}
+            Kapabilitas · mode {mode === "ask" ? "Ask" : "Build"}
           </p>
-          {avail.map((t) => {
-            const on = enabledTools.has(t.name);
+          {avail.map((c) => {
+            const on = enabledCaps.has(c.key);
+            const Icon = c.icon;
             return (
               <button
-                key={t.name}
+                key={c.key}
                 type="button"
-                onClick={() => toggleTool(t.name)}
-                className="flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left hover:bg-muted"
+                onClick={() => toggleCap(c.key)}
+                className="flex w-full items-center gap-2.5 rounded-md px-2 py-2 text-left hover:bg-muted"
               >
+                <Icon className="size-4 shrink-0 text-muted-foreground" />
+                <span className="min-w-0 flex-1">
+                  <span className="block text-sm font-medium text-foreground">{c.label}</span>
+                  <span className="block truncate text-[11px] text-muted-foreground">{c.desc}</span>
+                </span>
                 <span className={cn(
-                  "mt-0.5 grid size-4 shrink-0 place-items-center rounded border",
+                  "grid size-4 shrink-0 place-items-center rounded border",
                   on ? "border-primary bg-primary text-primary-foreground" : "border-border",
                 )}>
                   {on ? <Check className="size-3" /> : null}
-                </span>
-                <span className="min-w-0">
-                  <span className="block text-xs font-medium text-foreground">{t.label}</span>
-                  <span className="block truncate text-[11px] text-muted-foreground">{t.desc}</span>
                 </span>
               </button>
             );
@@ -79,7 +81,7 @@ function ToolsMenu({
  */
 export function ChatComposer({
   mode, setMode, onSend, busy, placeholder, autoFocus, rows = 2,
-  enabledTools, toggleTool, onFocus,
+  enabledCaps, toggleCap, onFocus,
 }: {
   mode: Mode;
   setMode: (m: Mode) => void;
@@ -88,8 +90,8 @@ export function ChatComposer({
   placeholder?: string;
   autoFocus?: boolean;
   rows?: number;
-  enabledTools?: Set<string>;
-  toggleTool?: (name: string) => void;
+  enabledCaps?: Set<string>;
+  toggleCap?: (key: string) => void;
   onFocus?: () => void;
 }) {
   const [input, setInput] = React.useState("");
@@ -135,8 +137,8 @@ export function ChatComposer({
           ))}
         </div>
 
-        {enabledTools && toggleTool ? (
-          <ToolsMenu mode={mode} enabledTools={enabledTools} toggleTool={toggleTool} />
+        {enabledCaps && toggleCap ? (
+          <ToolsMenu mode={mode} enabledCaps={enabledCaps} toggleCap={toggleCap} />
         ) : null}
 
         <button

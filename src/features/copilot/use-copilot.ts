@@ -2,11 +2,9 @@
 
 import * as React from "react";
 import type { ToolStep } from "./tool-step";
-import { TOOL_CATALOG } from "./tool-catalog";
+import { ALL_CAP_KEYS, toolsFromCaps } from "./capabilities";
 
 export type Mode = "ask" | "build";
-
-const ALL_TOOL_NAMES = TOOL_CATALOG.map((t) => t.name);
 export type Msg = {
   role: "user" | "assistant";
   content: string;
@@ -29,12 +27,12 @@ function useCopilotState() {
   const [error, setError] = React.useState<string | null>(null);
   const [sessionId, setSessionId] = React.useState<string | null>(null);
   const [sessions, setSessions] = React.useState<SessionMeta[]>([]);
-  const [enabledTools, setEnabledTools] = React.useState<Set<string>>(() => new Set(ALL_TOOL_NAMES));
+  const [enabledCaps, setEnabledCaps] = React.useState<Set<string>>(() => new Set(ALL_CAP_KEYS));
 
-  const toggleTool = React.useCallback((name: string) => {
-    setEnabledTools((prev) => {
+  const toggleCap = React.useCallback((key: string) => {
+    setEnabledCaps((prev) => {
       const n = new Set(prev);
-      if (n.has(name)) n.delete(name); else n.add(name);
+      if (n.has(key)) n.delete(key); else n.add(key);
       return n;
     });
   }, []);
@@ -73,7 +71,7 @@ function useCopilotState() {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           mode,
-          tools: [...enabledTools],
+          tools: toolsFromCaps(enabledCaps, mode),
           messages: next.map((m) => ({ role: m.role, content: m.content })),
         }),
       });
@@ -93,7 +91,7 @@ function useCopilotState() {
     } finally {
       setBusy(false);
     }
-  }, [busy, messages, mode, sessionId, persist, enabledTools]);
+  }, [busy, messages, mode, sessionId, persist, enabledCaps]);
 
   const newChat = React.useCallback(() => {
     setMessages([]); setSessionId(null); setError(null);
@@ -121,7 +119,7 @@ function useCopilotState() {
 
   return {
     mode, setMode, messages, busy, error, sessionId, sessions,
-    enabledTools, toggleTool,
+    enabledCaps, toggleCap,
     send, newChat, loadSession, removeSession, refreshSessions,
   };
 }

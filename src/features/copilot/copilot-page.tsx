@@ -67,7 +67,7 @@ export function CopilotPage() {
         <div className="pt-3">
           <ChatComposer
             mode={c.mode} setMode={c.setMode} onSend={c.send} busy={c.busy}
-            enabledTools={c.enabledTools} toggleTool={c.toggleTool}
+            enabledCaps={c.enabledCaps} toggleCap={c.toggleCap}
             placeholder="Tanya apa saja soal data lakehouse…"
           />
         </div>

@@ -94,8 +94,8 @@ export function CopilotDock() {
           busy={c.busy}
           rows={1}
           placeholder="Tanya apa saja soal lakehouse…"
-          enabledTools={c.enabledTools}
-          toggleTool={c.toggleTool}
+          enabledCaps={c.enabledCaps}
+          toggleCap={c.toggleCap}
           onFocus={() => setExp(true)}
         />
       </div>
