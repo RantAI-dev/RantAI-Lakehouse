@@ -57,4 +57,4 @@ mode lihat, lalu editor & filter, lalu ekspor & agentic).
 
 ## Status
 - [x] Fase 0  - [x] Fase 1  - [x] Fase 2  - [ ] Fase 3
-- [ ] Fase 4  - [ ] Fase 5  - [ ] Fase 6  - [ ] Fase 7
+- [ ] Fase 4  - [ ] Fase 5  - [~] Fase 6  - [x] Fase 7

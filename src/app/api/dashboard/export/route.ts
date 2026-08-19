@@ -34,7 +34,18 @@ export async function GET() {
   const body =
     `# RantAI Lakehouse — dashboard as code\n` +
     `# boards & chart specs, diekspor dari console.bi_chart\n\n` +
-    `boards:\n${[{ id: "default", name: "Utama" }, ...boards].map((b) => `  - id: ${b.id}\n    name: ${yamlValue(b.name)}`).join("\n")}\n\n` +
+    `boards:\n${[{ id: "default", name: "Utama", layout: {} as Record<string, unknown> }, ...boards].map((b) => {
+      const lines = [`  - id: ${b.id}`, `    name: ${yamlValue(b.name)}`];
+      const layout = b.layout ?? {};
+      if (Object.keys(layout).length) {
+        lines.push("    layout:");
+        for (const [cid, box] of Object.entries(layout)) {
+          const bx = box as { x: number; y: number; w: number; h: number };
+          lines.push(`      ${cid}: { x: ${bx.x}, y: ${bx.y}, w: ${bx.w}, h: ${bx.h} }`);
+        }
+      }
+      return lines.join("\n");
+    }).join("\n")}\n\n` +
     `charts:\n${charts.map((c) => yamlChart({ id: c.id, title: c.title, board: c.board, def: c.def as Record<string, unknown> })).join("\n")}\n`;
   return new Response(body, {
     headers: {
