@@ -41,7 +41,7 @@ export type ChartInput = {
   caption?: string; // unit/caption (kind="kpi")
 };
 
-export type Board = { id: string; name: string; layout?: LayoutMap; createdAt?: string };
+export type Board = { id: string; name: string; layout?: LayoutMap; filters?: FilterDef[]; createdAt?: string };
 
 const IDENT = /^[a-zA-Z0-9_]+$/;
 const KINDS: ChartKind[] = ["bar", "hbar", "line", "area", "pie", "stacked", "kpi", "table", "text"];
@@ -67,18 +67,21 @@ export async function ensureBiTable(): Promise<void> {
   await chExec("ALTER TABLE console.bi_chart ADD COLUMN IF NOT EXISTS board String DEFAULT 'default'");
   await chExec(
     `CREATE TABLE IF NOT EXISTS console.bi_board (
-       id String, name String, layout_json String DEFAULT '{}',
+       id String, name String, layout_json String DEFAULT '{}', filters_json String DEFAULT '[]',
        created_at DateTime DEFAULT now(), is_deleted UInt8 DEFAULT 0
      ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id`,
   );
-  // Migrasi: tabel lama tanpa layout.
+  // Migrasi: tabel lama tanpa layout/filter.
   await chExec("ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS layout_json String DEFAULT '{}'");
+  await chExec("ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS filters_json String DEFAULT '[]'");
   ensured = true;
 }
 
 /** Posisi tile di kanvas grid (12 kolom). Key = chartId. */
 export type TileBox = { x: number; y: number; w: number; h: number };
 export type LayoutMap = Record<string, TileBox>;
+/** Filter dashboard: nilai kolom yang menyaring semua tile yang punya kolom itu. */
+export type FilterDef = { column: string; values: string[] };
 
 function esc(s: string): string {
   // Escape backslash dulu, baru petik-satu — wajib untuk JSON (spec_json).
@@ -90,24 +93,27 @@ function parseLayout(s: string): LayoutMap {
   try { const o = JSON.parse(s || "{}"); return o && typeof o === "object" ? (o as LayoutMap) : {}; }
   catch { return {}; }
 }
+function parseFilters(s: string): FilterDef[] {
+  try { const o = JSON.parse(s || "[]"); return Array.isArray(o) ? (o as FilterDef[]) : []; }
+  catch { return []; }
+}
+
+const BOARD_COLS = "id, name, layout_json, filters_json, toString(created_at) AS created_at";
+type BoardRow = { id: string; name: string; layout_json: string; filters_json: string; created_at: string };
+function rowToBoard(r: BoardRow): Board {
+  return { id: r.id, name: r.name, layout: parseLayout(r.layout_json), filters: parseFilters(r.filters_json), createdAt: r.created_at };
+}
 
 export async function listBoards(): Promise<Board[]> {
   await ensureBiTable();
-  const rows = await chRows<{ id: string; name: string; layout_json: string; created_at: string }>(
-    `SELECT id, name, layout_json, toString(created_at) AS created_at FROM console.bi_board FINAL
-      WHERE is_deleted = 0 ORDER BY created_at`,
-  );
-  return rows.map((r) => ({ id: r.id, name: r.name, layout: parseLayout(r.layout_json), createdAt: r.created_at }));
+  const rows = await chRows<BoardRow>(`SELECT ${BOARD_COLS} FROM console.bi_board FINAL WHERE is_deleted = 0 ORDER BY created_at`);
+  return rows.map(rowToBoard);
 }
 
 export async function getBoard(id: string): Promise<Board | null> {
   await ensureBiTable();
-  const rows = await chRows<{ id: string; name: string; layout_json: string; created_at: string }>(
-    `SELECT id, name, layout_json, toString(created_at) AS created_at FROM console.bi_board FINAL
-      WHERE is_deleted = 0 AND id='${esc(id)}' LIMIT 1`,
-  );
-  const r = rows[0];
-  return r ? { id: r.id, name: r.name, layout: parseLayout(r.layout_json), createdAt: r.created_at } : null;
+  const rows = await chRows<BoardRow>(`SELECT ${BOARD_COLS} FROM console.bi_board FINAL WHERE is_deleted = 0 AND id='${esc(id)}' LIMIT 1`);
+  return rows[0] ? rowToBoard(rows[0]) : null;
 }
 
 export async function createBoard(name: string): Promise<Board> {
@@ -116,13 +122,14 @@ export async function createBoard(name: string): Promise<Board> {
   if (!clean) throw new Error("nama dashboard wajib.");
   const id = `b_${randomUUID().slice(0, 8)}`;
   await chExec(`INSERT INTO console.bi_board (id, name) VALUES ('${esc(id)}', '${esc(clean)}')`);
-  return { id, name: clean, layout: {} };
+  return { id, name: clean, layout: {}, filters: [] };
 }
 
 // INSERT (bukan ALTER UPDATE) — ReplacingMergeTree, instan & konsisten.
-async function upsertBoard(id: string, name: string, layout: LayoutMap): Promise<void> {
+async function upsertBoard(id: string, name: string, layout: LayoutMap, filters: FilterDef[]): Promise<void> {
   await chExec(
-    `INSERT INTO console.bi_board (id, name, layout_json) VALUES ('${esc(id)}', '${esc(name)}', '${esc(JSON.stringify(layout ?? {}))}')`,
+    `INSERT INTO console.bi_board (id, name, layout_json, filters_json) VALUES ` +
+      `('${esc(id)}', '${esc(name)}', '${esc(JSON.stringify(layout ?? {}))}', '${esc(JSON.stringify(filters ?? []))}')`,
   );
 }
 
@@ -131,13 +138,19 @@ export async function renameBoard(id: string, name: string): Promise<void> {
   const clean = String(name ?? "").trim();
   if (!clean) throw new Error("nama wajib.");
   const b = await getBoard(id);
-  await upsertBoard(id, clean, b?.layout ?? {});
+  await upsertBoard(id, clean, b?.layout ?? {}, b?.filters ?? []);
 }
 
 export async function updateBoardLayout(id: string, layout: LayoutMap): Promise<void> {
   await ensureBiTable();
   const b = await getBoard(id);
-  await upsertBoard(id, b?.name ?? "Dashboard", layout ?? {});
+  await upsertBoard(id, b?.name ?? "Dashboard", layout ?? {}, b?.filters ?? []);
+}
+
+export async function updateBoardFilters(id: string, filters: FilterDef[]): Promise<void> {
+  await ensureBiTable();
+  const b = await getBoard(id);
+  await upsertBoard(id, b?.name ?? "Dashboard", b?.layout ?? {}, filters ?? []);
 }
 
 export async function deleteBoard(id: string): Promise<void> {
@@ -202,36 +215,35 @@ export async function listStoredCharts(): Promise<StoredChartSpec[]> {
   return out;
 }
 
-/** Susun klausa SQL dari identifier tervalidasi (+ filter tahun opsional). */
+/** Susun klausa SQL dari identifier tervalidasi (+ klausa WHERE opsional). */
 function buildSql(
   d: { mart: string; dimension: string; measures: string[]; agg: string; order: string; limit: number; breakdown?: string },
-  years?: number[],
+  where: string[] = [],
 ): string {
   const { mart, dimension, measures, agg, order, limit, breakdown } = d;
   const aggOf = (m: string) => (agg === "count" ? `count() AS ${m}` : `round(${agg}(${m})) AS ${m}`);
-  const yearWhere = years && years.length ? `tahun IN (${years.join(",")})` : "";
+  const w = where.length ? `WHERE ${where.join(" AND ")} ` : "";
   if (breakdown) {
     const m = measures[0];
-    const innerWhere = yearWhere ? `WHERE ${yearWhere}` : "";
-    const outerWhere = yearWhere ? `WHERE ${yearWhere} AND` : "WHERE";
+    const inner = where.length ? `WHERE ${where.join(" AND ")} ` : "";
+    const outer = where.length ? `WHERE ${where.join(" AND ")} AND` : "WHERE";
     return (
       `SELECT ${dimension}, ${breakdown}, ${aggOf(m)} FROM serving.${mart} ` +
-      `${outerWhere} ${dimension} IN (SELECT ${dimension} FROM serving.${mart} ${innerWhere} ` +
+      `${outer} ${dimension} IN (SELECT ${dimension} FROM serving.${mart} ${inner}` +
       `GROUP BY ${dimension} ORDER BY ${agg === "count" ? "count()" : `${agg}(${m})`} DESC LIMIT ${limit}) ` +
       `GROUP BY ${dimension}, ${breakdown} ORDER BY ${dimension}, ${breakdown}`
     );
   }
   const sel = measures.map(aggOf).join(", ");
   const orderClause = order === "none" ? dimension : `${measures[0]} ${order === "asc" ? "ASC" : "DESC"}`;
-  const where = yearWhere ? `WHERE ${yearWhere} ` : "";
-  return `SELECT ${dimension}, ${sel} FROM serving.${mart} ${where}GROUP BY ${dimension} ORDER BY ${orderClause} LIMIT ${limit}`;
+  return `SELECT ${dimension}, ${sel} FROM serving.${mart} ${w}GROUP BY ${dimension} ORDER BY ${orderClause} LIMIT ${limit}`;
 }
 
-/** SQL KPI (angka tunggal, kolom `v`) + filter tahun opsional. */
-function buildKpiSql(d: { mart: string; measure: string; agg: string }, years?: number[]): string {
+/** SQL KPI (angka tunggal, kolom `v`) + klausa WHERE opsional. */
+function buildKpiSql(d: { mart: string; measure: string; agg: string }, where: string[] = []): string {
   const val = d.agg === "count" ? "count()" : `round(${d.agg}(${d.measure}))`;
-  const where = years && years.length ? ` WHERE tahun IN (${years.join(",")})` : "";
-  return `SELECT ${val} AS v FROM serving.${d.mart}${where}`;
+  const w = where.length ? ` WHERE ${where.join(" AND ")}` : "";
+  return `SELECT ${val} AS v FROM serving.${d.mart}${w}`;
 }
 
 /**
@@ -319,16 +331,34 @@ export async function specFromInput(
   return { ...spec, source, board, def, hasYear, createdBy };
 }
 
-/** SQL untuk sebuah spec tersimpan dengan filter tahun runtime (dipakai /api/dashboard). */
-export function sqlWithYear(spec: StoredChartSpec, years: number[]): string {
+/**
+ * SQL untuk spec tersimpan dengan filter runtime (tahun + filter dimensi
+ * dashboard). `martCols` = mart→set kolomnya (untuk tahu filter mana berlaku).
+ */
+export function sqlWithFilters(
+  spec: StoredChartSpec,
+  years: number[],
+  filters: FilterDef[],
+  martCols: Map<string, Set<string>>,
+): string {
   if (spec.kind === "text") return "";
-  if (!spec.hasYear || !years.length || !spec.def?.mart) return spec.sql;
   const d = spec.def;
+  const mart = d?.mart;
+  if (!mart) return spec.sql;
+  const cols = martCols.get(mart) ?? new Set<string>();
+  const where: string[] = [];
+  if (years.length && cols.has("tahun")) where.push(`tahun IN (${years.join(",")})`);
+  for (const f of filters ?? []) {
+    if (f.values?.length && IDENT.test(f.column) && cols.has(f.column)) {
+      where.push(`${f.column} IN (${f.values.map((v) => `'${esc(String(v))}'`).join(",")})`);
+    }
+  }
+  if (!where.length) return spec.sql;
   const agg = d.aggregate ?? "sum";
-  if (spec.kind === "kpi") return buildKpiSql({ mart: d.mart, measure: d.measures[0], agg }, years);
+  if (spec.kind === "kpi") return buildKpiSql({ mart, measure: d.measures[0], agg }, where);
   return buildSql(
-    { mart: d.mart, dimension: d.dimension, measures: d.measures, agg, order: d.order ?? "none", limit: d.limit ?? 20, breakdown: d.breakdown },
-    years,
+    { mart, dimension: d.dimension, measures: d.measures, agg, order: d.order ?? "none", limit: d.limit ?? 20, breakdown: d.breakdown },
+    where,
   );
 }
 

@@ -15,18 +15,20 @@ import {
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
-import type { LayoutMap } from "@/services/clients/bi-store";
+import type { LayoutMap, FilterDef } from "@/services/clients/bi-store";
 import { fmtInt } from "./chart-option";
 import { ChartBuilder, type ChartDef } from "./chart-builder";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
 import { TileBody } from "./tile-body";
+import { DashboardFilters } from "./dashboard-filters";
 
 type Cell = { columns: string[]; rows: Record<string, unknown>[] } | { error: string };
 type KpiMeta = { id: string; title: string; caption?: string; format: string };
 type BoardOpt = { id: string; name: string };
 type ChartCard = ChartRenderSpec & { board?: string; def?: ChartDef };
 type Payload = {
-  board: string; years: number[]; layout: LayoutMap; boards: BoardOpt[]; kpis: KpiMeta[];
+  board: string; years: number[]; layout: LayoutMap; filters: FilterDef[]; filterColumns: string[];
+  boards: BoardOpt[]; kpis: KpiMeta[];
   charts: ChartCard[]; results: Record<string, Cell>; storeError?: string | null;
 };
 
@@ -59,6 +61,9 @@ export function DashboardPage() {
   const [year, setYear] = React.useState("all");
   const [edit, setEdit] = React.useState(false);
   const [layout, setLayout] = React.useState<LayoutMap>({});
+  const [filters, setFilters] = React.useState<FilterDef[]>([]);
+  const filtersRef = React.useRef<FilterDef[]>([]);
+  const adoptingRef = React.useRef(true);
   const [editing, setEditing] = React.useState<{ id: string; def: ChartDef } | null>(null);
   const [menuOpen, setMenuOpen] = React.useState(false);
   const [renameOpen, setRenameOpen] = React.useState(false);
@@ -70,11 +75,17 @@ export function DashboardPage() {
     try {
       const q = new URLSearchParams({ board });
       if (year !== "all") q.set("year", year);
+      if (!adoptingRef.current && filtersRef.current.length) q.set("filters", JSON.stringify(filtersRef.current));
       const res = await fetch(`/api/dashboard?${q.toString()}`, { cache: "no-store" });
       const json = (await res.json()) as Payload;
       if (!res.ok) throw new Error((json as { error?: string }).error ?? "Gagal memuat dashboard");
       setData(json);
       setLayout(json.layout ?? {});
+      if (adoptingRef.current) {
+        filtersRef.current = json.filters ?? [];
+        setFilters(json.filters ?? []);
+        adoptingRef.current = false;
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -82,7 +93,20 @@ export function DashboardPage() {
     }
   }, [board, year]);
 
+  // Ganti dashboard → adopsi ulang filter tersimpan board itu.
+  React.useEffect(() => { adoptingRef.current = true; filtersRef.current = []; setFilters([]); }, [board]);
   React.useEffect(() => { void load(); }, [load]);
+
+  const applyFilters = React.useCallback((next: FilterDef[]) => {
+    filtersRef.current = next;
+    setFilters(next);
+    if (!isDefault) {
+      void fetch("/api/dashboard/boards", {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: board, filters: next }),
+      });
+    }
+    void load();
+  }, [board, isDefault, load]);
   React.useEffect(() => { if (isDefault) setEdit(false); }, [isDefault]);
 
   // Simpan layout (debounced) untuk dashboard user.
@@ -201,6 +225,12 @@ export function DashboardPage() {
 
       {error ? <div className="rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">{error}</div> : null}
       {data?.storeError ? <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-2 text-xs text-amber-600 dark:text-amber-400">Chart tersimpan tak bisa dimuat: {data.storeError}</div> : null}
+
+      {data?.filterColumns?.length ? (
+        <div className="rounded-lg border border-border bg-card/50 px-3 py-2">
+          <DashboardFilters columns={data.filterColumns} filters={filters} onChange={applyFilters} />
+        </div>
+      ) : null}
 
       {/* KPI row (dashboard bawaan) */}
       {kpis.length ? (
