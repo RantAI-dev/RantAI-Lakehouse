@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import {
   listBoards, createBoard, deleteBoard, renameBoard, updateBoardLayout, updateBoardFilters, duplicateBoard,
+  setBoardPublic,
   type LayoutMap, type FilterDef,
 } from "@/services/clients/bi-store";
 
@@ -27,15 +28,20 @@ export async function POST(req: Request) {
   }
 }
 
-/** Ubah dashboard: {id, name} rename, {id, layout} tata letak, {id, filters}. */
+/** Ubah dashboard: {id, name} rename, {id, layout} tata letak, {id, filters}, {id, public}. */
 export async function PUT(req: Request) {
   try {
-    const body = (await req.json()) as { id?: string; name?: string; layout?: LayoutMap; filters?: FilterDef[] };
+    const body = (await req.json()) as { id?: string; name?: string; layout?: LayoutMap; filters?: FilterDef[]; public?: boolean };
     const id = String(body.id ?? "");
     if (!id || id === "default") return NextResponse.json({ error: "dashboard tidak valid" }, { status: 400 });
     if (typeof body.name === "string") await renameBoard(id, body.name);
     if (body.layout && typeof body.layout === "object") await updateBoardLayout(id, body.layout);
     if (Array.isArray(body.filters)) await updateBoardFilters(id, body.filters);
+    // Bagikan / cabut link publik read-only.
+    if (typeof body.public === "boolean") {
+      const token = await setBoardPublic(id, body.public);
+      return NextResponse.json({ ok: true, publicToken: token });
+    }
     return NextResponse.json({ ok: true });
   } catch (e) {
     return NextResponse.json({ error: e instanceof Error ? e.message : String(e) }, { status: 400 });

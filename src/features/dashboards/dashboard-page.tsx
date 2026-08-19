@@ -3,7 +3,7 @@
 import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { RefreshCw, Sparkles, Download, Pencil, Eye, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Plus, Move } from "lucide-react";
+import { RefreshCw, Sparkles, Download, Pencil, Eye, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Plus, Move, Share2, Link2, Check, Globe } from "lucide-react";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -71,6 +71,10 @@ export function DashboardPage() {
   const [newName, setNewName] = React.useState("");
   const [fullscreen, setFullscreen] = React.useState(false);
   const [autoSec, setAutoSec] = React.useState("0");
+  const [shareOpen, setShareOpen] = React.useState(false);
+  const [shareToken, setShareToken] = React.useState("");
+  const [shareBusy, setShareBusy] = React.useState(false);
+  const [copied, setCopied] = React.useState(false);
   const notifyChange = () => { try { window.dispatchEvent(new Event("dashboards:changed")); } catch { /* ignore */ } };
 
   const load = React.useCallback(async () => {
@@ -176,6 +180,36 @@ export function DashboardPage() {
     notifyChange();
     if (json?.board?.id) router.push(`/dashboards?board=${json.board.id}`);
   }
+  // ── Share (public read-only link) ─────────────────────────────────────────
+  async function openShare() {
+    setMenuOpen(false);
+    if (isDefault) return;
+    setCopied(false);
+    try {
+      const res = await fetch("/api/dashboard/boards", { cache: "no-store" });
+      const json = await res.json();
+      const b = (json?.boards ?? []).find((x: { id: string; publicToken?: string }) => x.id === board);
+      setShareToken(b?.publicToken ?? "");
+    } catch { setShareToken(""); }
+    setShareOpen(true);
+  }
+  async function setPublic(enable: boolean) {
+    setShareBusy(true);
+    try {
+      const res = await fetch("/api/dashboard/boards", {
+        method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: board, public: enable }),
+      });
+      const json = await res.json();
+      setShareToken(typeof json?.publicToken === "string" ? json.publicToken : "");
+      setCopied(false);
+    } finally { setShareBusy(false); }
+  }
+  const shareUrl = shareToken && typeof window !== "undefined" ? `${window.location.origin}/public/dashboard/${shareToken}` : "";
+  async function copyShare() {
+    if (!shareUrl) return;
+    try { await navigator.clipboard.writeText(shareUrl); setCopied(true); setTimeout(() => setCopied(false), 1800); } catch { /* ignore */ }
+  }
+
   async function saveRename() {
     const name = newName.trim();
     if (!name || isDefault) return;
@@ -278,6 +312,9 @@ export function DashboardPage() {
                     {!isDefault ? (
                       <button onClick={() => { setNewName(dashName); setRenameOpen(true); setMenuOpen(false); }} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Pencil className="size-4" /> Rename</button>
                     ) : null}
+                    {!isDefault ? (
+                      <button onClick={() => void openShare()} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Share2 className="size-4" /> Share…</button>
+                    ) : null}
                     <a href="/api/dashboard/export" download className="flex items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Download className="size-4" /> Export YAML</a>
                     <button onClick={() => void duplicateDashboard()} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Copy className="size-4" /> Duplicate</button>
                     {!isDefault ? (
@@ -340,6 +377,55 @@ export function DashboardPage() {
           editId={editing.id} initial={editing.def} board={board} boards={boards}
           onSaved={() => { setEditing(null); void load(); }} />
       ) : null}
+
+      <Dialog open={shareOpen} onOpenChange={setShareOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader><DialogTitle className="flex items-center gap-2"><Share2 className="size-4" /> Share “{dashName}”</DialogTitle></DialogHeader>
+          <div className="space-y-3">
+            <div className="flex items-start gap-3 rounded-lg border border-border bg-muted/30 p-3">
+              <Globe className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-medium">Public link</p>
+                <p className="text-xs text-muted-foreground">Anyone with the link can view this dashboard read-only — no sign-in. Charts stay live; they cannot edit anything.</p>
+              </div>
+              <button
+                type="button" role="switch" aria-checked={!!shareToken} disabled={shareBusy}
+                onClick={() => void setPublic(!shareToken)}
+                className={cn("relative mt-0.5 h-5 w-9 shrink-0 rounded-full transition-colors disabled:opacity-50", shareToken ? "bg-primary" : "bg-muted-foreground/30")}
+              >
+                <span className={cn("absolute top-0.5 size-4 rounded-full bg-white transition-all", shareToken ? "left-[18px]" : "left-0.5")} />
+              </button>
+            </div>
+
+            {shareToken ? (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2">
+                    <Link2 className="size-3.5 shrink-0 text-muted-foreground" />
+                    <span className="truncate text-xs text-foreground">{shareUrl}</span>
+                  </div>
+                  <Button size="sm" variant="outline" onClick={() => void copyShare()}>
+                    {copied ? <Check className="size-4 text-emerald-500" /> : <Copy className="size-4" />}{copied ? "Copied" : "Copy"}
+                  </Button>
+                </div>
+                <div className="flex items-center gap-2">
+                  <a href={shareUrl} target="_blank" rel="noopener noreferrer" className="text-xs font-medium text-primary hover:underline">Open preview ↗</a>
+                  <span className="text-xs text-muted-foreground">·</span>
+                  <button onClick={() => void setPublic(false)} disabled={shareBusy} className="text-xs text-destructive hover:underline disabled:opacity-50">Revoke link</button>
+                </div>
+                <p className="rounded-md bg-amber-500/5 px-2.5 py-1.5 text-[11px] text-amber-600 dark:text-amber-400">
+                  This link works wherever the server is reachable. For the internet, expose the server (e.g. Cloudflare Tunnel / reverse proxy).
+                </p>
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground">Turn on the switch to generate a shareable link.</p>
+            )}
+          </div>
+          <DialogFooter>
+            <DialogClose render={<Button variant="ghost" size="sm" />}>Close</DialogClose>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent className="sm:max-w-sm">

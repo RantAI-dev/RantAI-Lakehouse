@@ -2,12 +2,7 @@ import type { Metadata } from "next";
 import { geist, geistMono } from "@rantai/design-system/fonts/fonts";
 import { ThemeProvider } from "@rantai/design-system/components/theme-provider";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
-import { AppSidebar } from "@/components/app-shell/app-sidebar";
-import { AppNavbar } from "@/components/app-shell/app-navbar";
-import { CopilotDock } from "@/features/copilot/copilot-dock";
-import { CopilotProvider } from "@/features/copilot/use-copilot";
-import { CommandPalette } from "@/components/command-palette";
+import { AppFrame } from "@/components/app-shell/app-frame";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -54,17 +49,7 @@ export default function RootLayout({
       <body>
         <ThemeProvider>
           <TooltipProvider>
-            <SidebarProvider>
-              <CopilotProvider>
-                <AppSidebar />
-                <SidebarInset className="min-w-0 bg-muted/25">
-                  <AppNavbar />
-                  <div className="flex-1 p-4 sm:p-5 lg:p-6">{children}</div>
-                  <CopilotDock />
-                </SidebarInset>
-                <CommandPalette />
-              </CopilotProvider>
-            </SidebarProvider>
+            <AppFrame>{children}</AppFrame>
           </TooltipProvider>
         </ThemeProvider>
       </body>

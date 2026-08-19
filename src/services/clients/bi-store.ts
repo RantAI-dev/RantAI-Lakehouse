@@ -41,7 +41,7 @@ export type ChartInput = {
   caption?: string; // unit/caption (kind="kpi")
 };
 
-export type Board = { id: string; name: string; layout?: LayoutMap; filters?: FilterDef[]; createdAt?: string };
+export type Board = { id: string; name: string; layout?: LayoutMap; filters?: FilterDef[]; createdAt?: string; publicToken?: string };
 
 const IDENT = /^[a-zA-Z0-9_]+$/;
 const KINDS: ChartKind[] = ["bar", "hbar", "line", "area", "pie", "stacked", "kpi", "table", "text"];
@@ -74,6 +74,8 @@ export async function ensureBiTable(): Promise<void> {
   // Migrasi: tabel lama tanpa layout/filter.
   await chExec("ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS layout_json String DEFAULT '{}'");
   await chExec("ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS filters_json String DEFAULT '[]'");
+  // Migrasi: token share publik (kosong = privat/tak dibagikan).
+  await chExec("ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS public_token String DEFAULT ''");
   ensured = true;
 }
 
@@ -98,10 +100,10 @@ function parseFilters(s: string): FilterDef[] {
   catch { return []; }
 }
 
-const BOARD_COLS = "id, name, layout_json, filters_json, toString(created_at) AS created_at";
-type BoardRow = { id: string; name: string; layout_json: string; filters_json: string; created_at: string };
+const BOARD_COLS = "id, name, layout_json, filters_json, public_token, toString(created_at) AS created_at";
+type BoardRow = { id: string; name: string; layout_json: string; filters_json: string; public_token: string; created_at: string };
 function rowToBoard(r: BoardRow): Board {
-  return { id: r.id, name: r.name, layout: parseLayout(r.layout_json), filters: parseFilters(r.filters_json), createdAt: r.created_at };
+  return { id: r.id, name: r.name, layout: parseLayout(r.layout_json), filters: parseFilters(r.filters_json), createdAt: r.created_at, publicToken: r.public_token || "" };
 }
 
 export async function listBoards(): Promise<Board[]> {
@@ -126,10 +128,10 @@ export async function createBoard(name: string): Promise<Board> {
 }
 
 // INSERT (bukan ALTER UPDATE) — ReplacingMergeTree, instan & konsisten.
-async function upsertBoard(id: string, name: string, layout: LayoutMap, filters: FilterDef[]): Promise<void> {
+async function upsertBoard(id: string, name: string, layout: LayoutMap, filters: FilterDef[], publicToken = ""): Promise<void> {
   await chExec(
-    `INSERT INTO console.bi_board (id, name, layout_json, filters_json) VALUES ` +
-      `('${esc(id)}', '${esc(name)}', '${esc(JSON.stringify(layout ?? {}))}', '${esc(JSON.stringify(filters ?? []))}')`,
+    `INSERT INTO console.bi_board (id, name, layout_json, filters_json, public_token) VALUES ` +
+      `('${esc(id)}', '${esc(name)}', '${esc(JSON.stringify(layout ?? {}))}', '${esc(JSON.stringify(filters ?? []))}', '${esc(publicToken ?? "")}')`,
   );
 }
 
@@ -138,19 +140,44 @@ export async function renameBoard(id: string, name: string): Promise<void> {
   const clean = String(name ?? "").trim();
   if (!clean) throw new Error("nama wajib.");
   const b = await getBoard(id);
-  await upsertBoard(id, clean, b?.layout ?? {}, b?.filters ?? []);
+  await upsertBoard(id, clean, b?.layout ?? {}, b?.filters ?? [], b?.publicToken ?? "");
 }
 
 export async function updateBoardLayout(id: string, layout: LayoutMap): Promise<void> {
   await ensureBiTable();
   const b = await getBoard(id);
-  await upsertBoard(id, b?.name ?? "Dashboard", layout ?? {}, b?.filters ?? []);
+  await upsertBoard(id, b?.name ?? "Dashboard", layout ?? {}, b?.filters ?? [], b?.publicToken ?? "");
 }
 
 export async function updateBoardFilters(id: string, filters: FilterDef[]): Promise<void> {
   await ensureBiTable();
   const b = await getBoard(id);
-  await upsertBoard(id, b?.name ?? "Dashboard", b?.layout ?? {}, filters ?? []);
+  await upsertBoard(id, b?.name ?? "Dashboard", b?.layout ?? {}, filters ?? [], b?.publicToken ?? "");
+}
+
+/**
+ * Aktif/nonaktifkan link publik read-only untuk sebuah dashboard.
+ * enable=true → buat token (jika belum ada); enable=false → kosongkan (cabut).
+ * Mengembalikan token aktif ("" bila dicabut).
+ */
+export async function setBoardPublic(id: string, enable: boolean): Promise<string> {
+  await ensureBiTable();
+  const b = await getBoard(id);
+  if (!b) throw new Error("dashboard tidak ditemukan.");
+  const token = enable ? (b.publicToken || `p_${randomUUID().replace(/-/g, "")}`) : "";
+  await upsertBoard(id, b.name, b.layout ?? {}, b.filters ?? [], token);
+  return token;
+}
+
+/** Ambil dashboard dari token publik (read-only, tanpa auth). null bila tak dibagikan. */
+export async function getBoardByToken(token: string): Promise<Board | null> {
+  await ensureBiTable();
+  const t = String(token ?? "").trim();
+  if (!t) return null;
+  const rows = await chRows<BoardRow>(
+    `SELECT ${BOARD_COLS} FROM console.bi_board FINAL WHERE is_deleted = 0 AND public_token='${esc(t)}' LIMIT 1`,
+  );
+  return rows[0] ? rowToBoard(rows[0]) : null;
 }
 
 export async function deleteBoard(id: string): Promise<void> {
