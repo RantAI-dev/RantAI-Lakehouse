@@ -81,7 +81,7 @@ function ToolsMenu({
  */
 export function ChatComposer({
   mode, setMode, onSend, busy, placeholder, autoFocus, rows = 2,
-  enabledCaps, toggleCap, onFocus,
+  enabledCaps, toggleCap, onFocus, glass,
 }: {
   mode: Mode;
   setMode: (m: Mode) => void;
@@ -93,6 +93,8 @@ export function ChatComposer({
   enabledCaps?: Set<string>;
   toggleCap?: (key: string) => void;
   onFocus?: () => void;
+  /** Liquid-glass surface (opaque + frosted) — for the floating dock. */
+  glass?: boolean;
 }) {
   const [input, setInput] = React.useState("");
   const submit = () => {
@@ -103,7 +105,12 @@ export function ChatComposer({
   };
 
   return (
-    <div className="rounded-2xl border border-border/60 bg-muted/30 p-1.5 shadow-sm transition-all focus-within:border-foreground/20 focus-within:bg-muted/40 focus-within:shadow-md">
+    <div className={cn(
+      "rounded-2xl border p-1.5 transition-all",
+      glass
+        ? "border-border/70 bg-background/80 shadow-[0_8px_30px_rgba(0,0,0,0.14)] backdrop-blur-xl supports-[backdrop-filter]:bg-background/70 focus-within:border-foreground/25 focus-within:bg-background/85"
+        : "border-border/60 bg-muted/30 shadow-sm focus-within:border-foreground/20 focus-within:bg-muted/40 focus-within:shadow-md",
+    )}>
       <Textarea
         value={input}
         onChange={(e) => setInput(e.target.value)}

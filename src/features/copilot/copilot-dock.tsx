@@ -3,7 +3,6 @@
 import * as React from "react";
 import { usePathname } from "next/navigation";
 import { Sparkles, Plus, ChevronDown } from "lucide-react";
-import { cn } from "@/lib/utils";
 import { useCopilot } from "./use-copilot";
 import { ChatMessages } from "./chat-messages";
 import { ChatComposer } from "./chat-composer";
@@ -34,9 +33,9 @@ export function CopilotDock() {
   const showPanel = expanded;
 
   return (
-    <div className="fixed bottom-4 left-1/2 z-50 w-[min(94vw,720px)] -translate-x-1/2 print:hidden">
+    <div className="fixed bottom-4 left-1/2 z-50 w-[min(92vw,540px)] -translate-x-1/2 print:hidden">
       {showPanel ? (
-        <div className="mb-2 flex max-h-[62vh] flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-2xl">
+        <div className="mb-2 flex max-h-[58vh] flex-col overflow-hidden rounded-2xl border border-border/70 bg-card/90 shadow-[0_8px_40px_rgba(0,0,0,0.18)] backdrop-blur-xl supports-[backdrop-filter]:bg-card/80">
           <div className="flex items-center gap-2 border-b border-border px-3 py-2">
             <span className="grid size-6 place-items-center rounded-md bg-primary/10 text-primary">
               <Sparkles className="size-3.5" />
@@ -80,20 +79,19 @@ export function CopilotDock() {
         </div>
       ) : null}
 
-      {/* Bar input — selalu tampak, di tengah bawah */}
-      <div className={cn(!showPanel && "shadow-2xl", "rounded-2xl")}>
-        <ChatComposer
-          mode={c.mode}
-          setMode={c.setMode}
-          onSend={(t) => { setExp(true); void c.send(t); }}
-          busy={c.busy}
-          rows={1}
-          placeholder="Ask anything about your lakehouse…"
-          enabledCaps={c.enabledCaps}
-          toggleCap={c.toggleCap}
-          onFocus={() => setExp(true)}
-        />
-      </div>
+      {/* Bar input — glass, always visible, bottom-center */}
+      <ChatComposer
+        glass
+        mode={c.mode}
+        setMode={c.setMode}
+        onSend={(t) => { setExp(true); void c.send(t); }}
+        busy={c.busy}
+        rows={1}
+        placeholder="Ask anything about your lakehouse…"
+        enabledCaps={c.enabledCaps}
+        toggleCap={c.toggleCap}
+        onFocus={() => setExp(true)}
+      />
     </div>
   );
 }
