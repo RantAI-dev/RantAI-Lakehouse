@@ -60,7 +60,7 @@ export function DashboardPage() {
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
   const [year, setYear] = React.useState("all");
-  const [edit, setEdit] = React.useState(true);
+  const [edit, setEdit] = React.useState(false);
   const [layout, setLayout] = React.useState<LayoutMap>({});
   const [filters, setFilters] = React.useState<FilterDef[]>([]);
   const filtersRef = React.useRef<FilterDef[]>([]);
@@ -125,7 +125,8 @@ export function DashboardPage() {
     }
     void load();
   }, [board, isDefault, load]);
-  React.useEffect(() => { setEdit(!isDefault); }, [isDefault]);
+  // Start in VIEW mode; user clicks "Edit layout" to arrange. Reset on board switch.
+  React.useEffect(() => { setEdit(false); }, [board]);
   // Buka /dashboards (demo) → langsung ke dashboard user terbaru bila ada.
   React.useEffect(() => {
     if (data && isDefault && data.boards.length > 1) {
