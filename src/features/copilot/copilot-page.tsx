@@ -8,16 +8,16 @@ import { ChatComposer } from "./chat-composer";
 
 const SUGGESTIONS: Record<"ask" | "build", string[]> = {
   ask: [
-    "Total kunjungan wisman per kawasan",
-    "Dataset apa saja soal halal?",
-    "Silsilah data wisman per negara",
-    "Ringkas kualitas data lakehouse",
+    "Total foreign visitors by region",
+    "Which datasets are about halal?",
+    "Data lineage of visitors by country",
+    "Summarize lakehouse data quality",
   ],
   build: [
-    "Buatkan board dashboard ringkas soal wisman",
-    "Bikin chart tren wisman per bulan per kawasan",
-    "Bangun ulang lakehouse (Bronze→Silver→Gold)",
-    "Cek status build terakhir",
+    "Build a concise visitors dashboard",
+    "Create a monthly-visitors-by-region line chart",
+    "Rebuild the lakehouse (Bronze→Silver→Gold)",
+    "Check the latest build status",
   ],
 };
 
@@ -40,11 +40,11 @@ export function CopilotPage() {
               <div className="mb-4 grid size-12 place-items-center rounded-2xl border border-violet-500/20 bg-gradient-to-br from-violet-500/15 to-purple-600/15 text-violet-600 dark:text-violet-400">
                 <Sparkles className="size-6" />
               </div>
-              <h2 className="text-xl font-semibold text-foreground">Halo 👋 Ada yang bisa dibantu?</h2>
+              <h2 className="text-xl font-semibold text-foreground">Hi 👋 How can I help?</h2>
               <p className="mt-1.5 max-w-md text-sm text-muted-foreground">
                 {c.mode === "ask"
-                  ? "Tanya angka, dataset, silsilah, atau kualitas. Copilot query ClickHouse & jelajah katalog."
-                  : "Minta bikin chart/dashboard atau bangun data. Copilot menjalankan tool nyata & menampilkan hasilnya."}
+                  ? "Ask about numbers, datasets, lineage, or quality. Copilot queries ClickHouse and explores the catalog."
+                  : "Ask to build charts/dashboards or build data. Copilot runs real tools and shows the results."}
               </p>
               <div className="mt-5 flex flex-wrap justify-center gap-2">
                 {SUGGESTIONS[c.mode].map((s) => (
@@ -68,7 +68,7 @@ export function CopilotPage() {
           <ChatComposer
             mode={c.mode} setMode={c.setMode} onSend={c.send} busy={c.busy}
             enabledCaps={c.enabledCaps} toggleCap={c.toggleCap}
-            placeholder="Tanya apa saja soal data lakehouse…"
+            placeholder="Ask anything about your lakehouse data…"
           />
         </div>
       </div>

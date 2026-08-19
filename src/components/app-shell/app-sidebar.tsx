@@ -67,7 +67,7 @@ export function AppSidebar() {
   }, [loadDashboards])
   const newDashboard = async () => {
     const res = await fetch("/api/dashboard/boards", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "Dashboard baru" }),
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "New dashboard" }),
     })
     const j = await res.json()
     if (j?.board?.id) { router.push(`/dashboards?board=${j.board.id}`); loadDashboards() }
@@ -204,7 +204,7 @@ export function AppSidebar() {
           <SidebarGroup className="mt-1 gap-0 border-t border-sidebar-border px-2 pb-1 pt-2">
             <div className="flex items-center justify-between pr-1">
               <SidebarGroupLabel className="h-6 px-2 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">Dashboards</SidebarGroupLabel>
-              <button type="button" onClick={() => void newDashboard()} aria-label="Dashboard baru" title="Dashboard baru"
+              <button type="button" onClick={() => void newDashboard()} aria-label="New dashboard" title="New dashboard"
                 className="grid size-6 place-items-center rounded-md text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground">
                 <Plus className="size-4" />
               </button>
@@ -215,7 +215,7 @@ export function AppSidebar() {
                   <BarChart3 className="size-3.5 shrink-0 opacity-70" />
                   <button onClick={() => router.push(`/dashboards?board=${d.id}`)} className="flex-1 truncate text-left" title={d.name}>{d.name}</button>
                   {d.id !== "default" ? (
-                    <button onClick={() => void removeDashboard(d.id)} aria-label="Hapus" className="shrink-0 opacity-0 hover:text-destructive group-hover/dash:opacity-100"><X className="size-3.5" /></button>
+                    <button onClick={() => void removeDashboard(d.id)} aria-label="Delete" className="shrink-0 opacity-0 hover:text-destructive group-hover/dash:opacity-100"><X className="size-3.5" /></button>
                   ) : null}
                 </div>
               ))}
@@ -225,13 +225,13 @@ export function AppSidebar() {
           <SidebarGroup className="mt-1 gap-0 border-t border-sidebar-border px-2 pb-1 pt-2">
             <div className="flex items-center justify-between pr-1">
               <SidebarGroupLabel className="h-6 px-2 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">
-                Riwayat
+                History
               </SidebarGroupLabel>
               <button
                 type="button"
                 onClick={() => { copilot.newChat(); router.push("/copilot") }}
-                aria-label="Percakapan baru"
-                title="Percakapan baru"
+                aria-label="New chat"
+                title="New chat"
                 className="grid size-6 place-items-center rounded-md text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground"
               >
                 <Plus className="size-4" />
@@ -239,7 +239,7 @@ export function AppSidebar() {
             </div>
             <div className="mt-0.5 flex max-h-[46vh] flex-col gap-0.5 overflow-y-auto">
               {copilot.sessions.length === 0 ? (
-                <p className="px-2 py-1.5 text-xs text-sidebar-foreground/50">Belum ada percakapan.</p>
+                <p className="px-2 py-1.5 text-xs text-sidebar-foreground/50">No conversations yet.</p>
               ) : (
                 copilot.sessions.map((s) => {
                   const active = s.id === copilot.sessionId
@@ -261,7 +261,7 @@ export function AppSidebar() {
                       </button>
                       <button
                         onClick={() => void copilot.removeSession(s.id)}
-                        aria-label="Hapus"
+                        aria-label="Delete"
                         className="shrink-0 opacity-0 hover:text-destructive group-hover/hist:opacity-100"
                       >
                         <X className="size-3.5" />

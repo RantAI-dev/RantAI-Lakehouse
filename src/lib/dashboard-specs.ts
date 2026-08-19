@@ -56,43 +56,43 @@ const S = "serving";
 export const KPIS: KpiSpec[] = [
   {
     id: "kpi_wisman_total",
-    title: "Total Wisman",
+    title: "Total Foreign Visitors",
     mart: "mart_wisman",
     sql: `SELECT sum(jumlah) AS v FROM ${S}.mart_wisman`,
     format: "int",
-    caption: "kunjungan mancanegara (akumulasi)",
+    caption: "foreign visits (cumulative)",
   },
   {
     id: "kpi_dtw",
-    title: "Destinasi Terpantau",
+    title: "Tracked Destinations",
     mart: "mart_kunjungan_dtw",
     sql: `SELECT count(DISTINCT destinasi) AS v FROM ${S}.mart_kunjungan_dtw`,
     format: "int",
-    caption: "daya tarik wisata (DTW)",
+    caption: "tourist attractions (DTW)",
   },
   {
     id: "kpi_event",
-    title: "Event Tahun Terbaru",
+    title: "Events (Latest Year)",
     mart: "mart_event",
     sql: `SELECT jumlah_event AS v, tahun FROM ${S}.mart_event ORDER BY tahun DESC LIMIT 1`,
     format: "int",
-    caption: "jumlah event pada tahun terakhir",
+    caption: "number of events in the latest year",
   },
   {
     id: "kpi_gci",
-    title: "Indikator GCI Siap",
+    title: "GCI Indicators Ready",
     mart: "mart_gci_readiness",
     sql: `SELECT sum(data_tersedia) AS v, count() AS total FROM ${S}.mart_gci_readiness`,
     format: "int",
-    caption: "indikator dengan data tersedia",
+    caption: "indicators with data available",
   },
 ];
 
 export const CHARTS: ChartSpec[] = [
   {
     id: "wisman_tren",
-    title: "Tren Kunjungan Wisman",
-    subtitle: "Total per bulan lintas tahun",
+    title: "Foreign Visitor Trend",
+    subtitle: "Monthly total across years",
     kind: "area",
     mart: "mart_wisman",
     span: 2,
@@ -107,8 +107,8 @@ export const CHARTS: ChartSpec[] = [
   },
   {
     id: "wisman_negara",
-    title: "Top Negara Asal Wisman",
-    subtitle: "10 kebangsaan teratas",
+    title: "Top Source Countries",
+    subtitle: "Top 10 nationalities",
     kind: "hbar",
     mart: "mart_wisman",
     sql: `SELECT negara, round(sum(jumlah)) AS jumlah
@@ -120,8 +120,8 @@ export const CHARTS: ChartSpec[] = [
   },
   {
     id: "wisman_kawasan",
-    title: "Wisman per Kawasan",
-    subtitle: "Distribusi benua/kawasan",
+    title: "Visitors by Region",
+    subtitle: "Distribution by continent/region",
     kind: "pie",
     mart: "mart_wisman",
     sql: `SELECT kawasan, round(sum(jumlah)) AS jumlah
@@ -133,8 +133,8 @@ export const CHARTS: ChartSpec[] = [
   },
   {
     id: "wisman_pintu",
-    title: "Wisman per Pintu Masuk",
-    subtitle: "Titik kedatangan",
+    title: "Visitors by Entry Point",
+    subtitle: "Arrival points",
     kind: "bar",
     mart: "mart_wisman",
     sql: `SELECT pintu_masuk, round(sum(jumlah)) AS jumlah
@@ -146,8 +146,8 @@ export const CHARTS: ChartSpec[] = [
   },
   {
     id: "dtw_top",
-    title: "Kunjungan per Destinasi",
-    subtitle: "Wisnus vs Wisman, 8 destinasi teratas",
+    title: "Visits by Destination",
+    subtitle: "Domestic vs foreign, top 8 destinations",
     kind: "stacked",
     mart: "mart_kunjungan_dtw",
     span: 2,
@@ -160,8 +160,8 @@ export const CHARTS: ChartSpec[] = [
   },
   {
     id: "event_tren",
-    title: "Tren Jumlah Event",
-    subtitle: "Per tahun",
+    title: "Event Count Trend",
+    subtitle: "Per year",
     kind: "line",
     mart: "mart_event",
     sql: `SELECT toString(tahun) AS tahun, jumlah_event AS jumlah
@@ -172,8 +172,8 @@ export const CHARTS: ChartSpec[] = [
   },
   {
     id: "gci_readiness",
-    title: "Kesiapan Data GCI",
-    subtitle: "Distribusi status readiness",
+    title: "GCI Data Readiness",
+    subtitle: "Readiness status distribution",
     kind: "pie",
     mart: "mart_gci_readiness",
     sql: `SELECT readiness, count() AS n
@@ -185,8 +185,8 @@ export const CHARTS: ChartSpec[] = [
   },
   {
     id: "kuliner_wilayah",
-    title: "Usaha Kuliner per Wilayah",
-    subtitle: "Jumlah usaha terdaftar",
+    title: "Culinary Businesses by Area",
+    subtitle: "Registered businesses",
     kind: "bar",
     mart: "mart_kuliner",
     sql: `SELECT wilayah, sum(jumlah_usaha) AS jumlah
@@ -198,8 +198,8 @@ export const CHARTS: ChartSpec[] = [
   },
   {
     id: "atlas_poi",
-    title: "Titik Wisata (Atlas) per Kategori",
-    subtitle: "Jumlah POI",
+    title: "Tourism POIs by Category",
+    subtitle: "Number of POIs",
     kind: "hbar",
     mart: "mart_atlas",
     sql: `SELECT kategori, jumlah_poi AS jumlah

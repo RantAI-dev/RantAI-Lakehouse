@@ -20,15 +20,15 @@ export type Capability = {
 export const CAPABILITIES: Capability[] = [
   {
     key: "data",
-    label: "Tanya Data",
-    desc: "Query & jelajah katalog, silsilah, kualitas",
+    label: "Query Data",
+    desc: "Query & explore catalog, lineage, quality",
     icon: Database,
     tools: ["run_sql", "list_datasets", "describe_dataset", "get_lineage", "get_quality", "describe_mart"],
   },
   {
     key: "dashboard",
     label: "Dashboard Builder",
-    desc: "Bikin & atur chart / board",
+    desc: "Create & manage charts / boards",
     icon: BarChart3,
     write: true,
     tools: ["describe_mart", "list_charts", "list_boards", "suggest_dashboard", "create_chart", "update_chart", "delete_chart", "create_board"],
@@ -36,7 +36,7 @@ export const CAPABILITIES: Capability[] = [
   {
     key: "pipeline",
     label: "Pipeline Builder",
-    desc: "Bangun/segarkan Bronze→Silver→Gold",
+    desc: "Build/refresh Bronze→Silver→Gold",
     icon: GitBranch,
     write: true,
     tools: ["get_build_status", "trigger_lakehouse_build"],

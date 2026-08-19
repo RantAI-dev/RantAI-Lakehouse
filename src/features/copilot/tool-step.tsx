@@ -6,21 +6,21 @@ import { cn } from "@/lib/utils";
 export type ToolStep = { tool: string; args: unknown; ok: boolean; result: unknown };
 
 const TOOL_LABEL: Record<string, string> = {
-  run_sql: "Query SQL",
-  list_datasets: "Cari dataset",
-  describe_dataset: "Skema dataset",
-  get_lineage: "Silsilah data",
-  get_quality: "Kualitas data",
-  trigger_lakehouse_build: "Bangun lakehouse",
-  get_build_status: "Status build",
-  describe_mart: "Lihat mart Gold",
-  create_chart: "Buat chart",
-  update_chart: "Ubah chart",
-  list_charts: "Daftar chart",
-  delete_chart: "Hapus chart",
-  create_board: "Buat board",
-  list_boards: "Daftar board",
-  suggest_dashboard: "Rancang dashboard",
+  run_sql: "SQL query",
+  list_datasets: "Search datasets",
+  describe_dataset: "Dataset schema",
+  get_lineage: "Data lineage",
+  get_quality: "Data quality",
+  trigger_lakehouse_build: "Build lakehouse",
+  get_build_status: "Build status",
+  describe_mart: "View Gold mart",
+  create_chart: "Create chart",
+  update_chart: "Edit chart",
+  list_charts: "List charts",
+  delete_chart: "Delete chart",
+  create_board: "Create board",
+  list_boards: "List boards",
+  suggest_dashboard: "Design dashboard",
 };
 
 function asObj(v: unknown): Record<string, unknown> {
@@ -78,7 +78,7 @@ function ResultTable({ columns, rows }: { columns: string[]; rows: Record<string
         </tbody>
       </table>
       {rows.length > shown.length ? (
-        <p className="px-2 py-1 text-[10px] text-muted-foreground">+{rows.length - shown.length} baris lain…</p>
+        <p className="px-2 py-1 text-[10px] text-muted-foreground">+{rows.length - shown.length} more rows…</p>
       ) : null}
     </div>
   );
@@ -150,7 +150,7 @@ function StepBody({ step }: { step: ToolStep }) {
     return (
       <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px]">
         <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 font-medium text-emerald-600 dark:text-emerald-400">
-          ✓ chart dibuat
+          ✓ chart created
         </span>
         <span className="font-medium text-foreground">{String(res.title ?? "")}</span>
         <span className="text-muted-foreground">{String(res.kind ?? "")} · {String(res.mart ?? "")}</span>
@@ -166,7 +166,7 @@ function StepBody({ step }: { step: ToolStep }) {
       return (
         <ul className="mt-1 space-y-0.5 text-[11px]">
           {marts.map((m) => (
-            <li key={m.mart} className="truncate"><span className="font-mono">{m.mart}</span> <span className="text-muted-foreground">· {m.rows.toLocaleString("id-ID")} baris</span></li>
+            <li key={m.mart} className="truncate"><span className="font-mono">{m.mart}</span> <span className="text-muted-foreground">· {m.rows.toLocaleString("id-ID")} rows</span></li>
           ))}
         </ul>
       );
@@ -174,8 +174,8 @@ function StepBody({ step }: { step: ToolStep }) {
     if (dims || meas) {
       return (
         <div className="mt-1 space-y-1 text-[11px]">
-          <p><span className="text-muted-foreground">Dimensi:</span> {(dims ?? []).join(", ") || "—"}</p>
-          <p><span className="text-muted-foreground">Measure:</span> {(meas ?? []).join(", ") || "—"}</p>
+          <p><span className="text-muted-foreground">Dimensions:</span> {(dims ?? []).join(", ") || "—"}</p>
+          <p><span className="text-muted-foreground">Measures:</span> {(meas ?? []).join(", ") || "—"}</p>
         </div>
       );
     }

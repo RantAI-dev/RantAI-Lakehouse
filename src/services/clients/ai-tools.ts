@@ -390,7 +390,7 @@ export const TOOLS: Record<string, ToolDef> = {
     },
     async run() {
       const boards = await listBoards();
-      return { boards: [{ id: "default", name: "Utama" }, ...boards] };
+      return { boards: [{ id: "default", name: "Main" }, ...boards] };
     },
   },
 

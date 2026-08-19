@@ -85,7 +85,7 @@ export async function GET(req: Request) {
     layout,
     filters,
     filterColumns,
-    boards: [{ id: "default", name: "Utama" }, ...boards.map((b) => ({ id: b.id, name: b.name }))],
+    boards: [{ id: "default", name: "Main" }, ...boards.map((b) => ({ id: b.id, name: b.name }))],
     kpis: kpis.map((k) => ({ id: k.id, title: k.title, caption: k.caption, format: k.format })),
     charts: [
       ...builtinCharts.map((c) => ({ ...toRenderSpec(c, "builtin"), board: "default" })),

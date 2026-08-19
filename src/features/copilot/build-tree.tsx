@@ -6,19 +6,19 @@ import { cn } from "@/lib/utils";
 /**
  * Pohon pipeline lakehouse LIVE untuk mode Build. Polling /api/ai/build-status
  * dgn runId sampai run selesai; tiap step (Bronze→Silver→Gold) menghijau saat
- * berjalan. Ini yang bikin "bikin data lewat chat" kelihatan nyata.
+ * berjalan. Ini yang bikin "build data via chat" kelihatan nyata.
  */
 
 type Step = { key: string; status: string };
 
 const STEP_LABEL: Record<string, string> = {
-  bronze_files: "Bronze · berkas",
+  bronze_files: "Bronze · files",
   bronze_sdi: "Bronze · SDI",
   lake_db: "Lake DB",
-  functions_dim: "Silver · fungsi & dimensi",
+  functions_dim: "Silver · functions & dims",
   silver_auto: "Silver · auto-type",
   quality_gate: "Quality gate",
-  curated_gold: "Gold · kurasi",
+  curated_gold: "Gold · curated",
   gold_iceberg: "Gold · Iceberg",
 };
 const ORDER = Object.keys(STEP_LABEL);
@@ -75,7 +75,7 @@ export function BuildTree({ runId }: { runId: string }) {
 
   const done = steps.filter((s) => s.status === "SUCCESS").length;
   const overall =
-    status === "SUCCESS" ? "Selesai" : status === "FAILURE" ? "Gagal" : status === "CANCELED" ? "Dibatalkan" : "Berjalan…";
+    status === "SUCCESS" ? "Done" : status === "FAILURE" ? "Failed" : status === "CANCELED" ? "Canceled" : "Running…";
   const overallTone =
     status === "SUCCESS"
       ? "text-emerald-600 dark:text-emerald-400"
@@ -86,7 +86,7 @@ export function BuildTree({ runId }: { runId: string }) {
   return (
     <div className="mt-2 rounded-md border border-border bg-background/60 p-2.5">
       <div className="mb-2 flex items-center gap-2 text-xs">
-        <span className="font-medium">Pipeline lakehouse</span>
+        <span className="font-medium">Lakehouse pipeline</span>
         <span className={cn("font-medium", overallTone)}>{overall}</span>
         <span className="ml-auto font-mono text-[10px] text-muted-foreground">
           {done}/{ORDER.length}
@@ -99,8 +99,8 @@ export function BuildTree({ runId }: { runId: string }) {
             <span className={cn(s.status === "SUCCESS" ? "text-foreground" : "text-muted-foreground")}>
               {STEP_LABEL[s.key] ?? s.key}
             </span>
-            {s.status === "IN_PROGRESS" ? <span className="text-[10px] text-sky-500">berjalan</span> : null}
-            {s.status === "FAILURE" ? <span className="text-[10px] text-red-500">gagal</span> : null}
+            {s.status === "IN_PROGRESS" ? <span className="text-[10px] text-sky-500">running</span> : null}
+            {s.status === "FAILURE" ? <span className="text-[10px] text-red-500">failed</span> : null}
           </li>
         ))}
       </ol>

@@ -43,7 +43,7 @@ function ToolsMenu({
       {open ? (
         <div className="absolute bottom-full left-0 z-10 mb-1.5 w-72 overflow-hidden rounded-xl border border-border bg-card p-1.5 shadow-xl">
           <p className="px-2 py-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-            Kapabilitas · mode {mode === "ask" ? "Ask" : "Build"}
+            Capabilities · {mode === "ask" ? "Ask" : "Build"}
           </p>
           {avail.map((c) => {
             const on = enabledCaps.has(c.key);
@@ -113,13 +113,13 @@ export function ChatComposer({
         }}
         rows={rows}
         autoFocus={autoFocus}
-        placeholder={placeholder ?? "Tanya apa saja soal data lakehouse…"}
-        aria-label="Pesan ke AI Copilot"
+        placeholder={placeholder ?? "Ask anything about your lakehouse data…"}
+        aria-label="Message AI Copilot"
         className="resize-none border-0 bg-transparent px-2 py-1.5 shadow-none focus-visible:ring-0 dark:bg-transparent"
       />
       <div className="flex items-center gap-1.5 px-1 pb-0.5">
         {/* Toggle Ask/Build */}
-        <div className="inline-flex rounded-lg bg-muted/60 p-0.5" role="tablist" aria-label="Mode Copilot">
+        <div className="inline-flex rounded-lg bg-muted/60 p-0.5" role="tablist" aria-label="Copilot mode">
           {(["ask", "build"] as Mode[]).map((m) => (
             <button
               key={m}
@@ -145,7 +145,7 @@ export function ChatComposer({
           type="button"
           onClick={submit}
           disabled={busy || !input.trim()}
-          aria-label="Kirim"
+          aria-label="Send"
           className={cn(
             "ml-auto grid size-8 place-items-center rounded-lg transition-colors",
             busy || !input.trim() ? "bg-muted text-muted-foreground" : "bg-primary text-primary-foreground hover:bg-primary/85",

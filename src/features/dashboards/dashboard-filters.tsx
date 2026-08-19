@@ -64,7 +64,7 @@ export function DashboardFilters({
             <span className="max-w-[120px] truncate opacity-80">= {f.values.join(", ")}</span>
             <ChevronDown className="size-3" />
           </button>
-          <span onClick={() => removeFilter(f.column)} role="button" aria-label="Hapus filter" className="absolute -right-1 -top-1 grid size-4 cursor-pointer place-items-center rounded-full border bg-background text-muted-foreground hover:text-destructive">
+          <span onClick={() => removeFilter(f.column)} role="button" aria-label="Remove filter" className="absolute -right-1 -top-1 grid size-4 cursor-pointer place-items-center rounded-full border bg-background text-muted-foreground hover:text-destructive">
             <X className="size-2.5" />
           </span>
           {editing === f.column ? <ValuePanel col={f.column} loading={loading} valuesList={valuesList} picked={picked} setPicked={setPicked} onApply={() => apply(f.column)} /> : null}
@@ -112,8 +112,8 @@ function ValuePanel({
     <div className="absolute left-0 top-full z-20 mt-1 w-56 rounded-lg border border-border bg-card p-1 shadow-xl">
       <p className="px-2 py-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{col}</p>
       <div className="max-h-56 overflow-y-auto">
-        {loading ? <p className="px-2 py-2 text-xs text-muted-foreground">Memuat…</p> :
-          valuesList.length === 0 ? <p className="px-2 py-2 text-xs text-muted-foreground">Tak ada nilai.</p> :
+        {loading ? <p className="px-2 py-2 text-xs text-muted-foreground">Loading…</p> :
+          valuesList.length === 0 ? <p className="px-2 py-2 text-xs text-muted-foreground">No values.</p> :
           valuesList.map((v) => {
             const on = picked.has(v);
             return (
@@ -125,7 +125,7 @@ function ValuePanel({
           })}
       </div>
       <div className="flex justify-end gap-1 border-t border-border p-1">
-        <button onClick={onApply} className="rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/85">Terapkan</button>
+        <button onClick={onApply} className="rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/85">Apply</button>
       </div>
     </div>
   );

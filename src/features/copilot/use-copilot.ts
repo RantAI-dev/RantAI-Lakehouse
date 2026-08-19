@@ -80,7 +80,7 @@ function useCopilotState() {
       const full: Msg[] = [
         ...next,
         {
-          role: "assistant", content: json.answer || "(tak ada jawaban)",
+          role: "assistant", content: json.answer || "(no answer)",
           tools: json.toolTrace ?? [], buildRunId: json.buildRunId, chartCreated: json.chartCreated,
         },
       ];
@@ -102,7 +102,7 @@ function useCopilotState() {
     try {
       const res = await fetch(`/api/ai/sessions?id=${encodeURIComponent(id)}`, { cache: "no-store" });
       const json = await res.json();
-      if (!res.ok) throw new Error(json?.error ?? "Gagal memuat sesi");
+      if (!res.ok) throw new Error(json?.error ?? "Failed to load session");
       setMessages((json.session.messages ?? []) as Msg[]);
       if (json.session.mode === "build" || json.session.mode === "ask") setMode(json.session.mode);
       setSessionId(json.session.id);

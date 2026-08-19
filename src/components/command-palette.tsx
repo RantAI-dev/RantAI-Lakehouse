@@ -83,7 +83,7 @@ export function CommandPalette() {
         <Search className="size-4 shrink-0 text-muted-foreground" />
         <Command.Input
           autoFocus
-          placeholder="Cari halaman atau aksi…"
+          placeholder="Search pages or actions…"
           className="h-11 w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
         />
         <kbd className="hidden rounded border border-border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground sm:block">esc</kbd>
@@ -91,26 +91,26 @@ export function CommandPalette() {
 
       <Command.List className="max-h-[54vh] overflow-y-auto p-1.5">
         <Command.Empty className="px-3 py-6 text-center text-sm text-muted-foreground">
-          Tak ada hasil.
+          No results.
         </Command.Empty>
 
         {/* Aksi cepat */}
-        <Command.Group heading="Aksi cepat" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
-          <PaletteItem icon={Sparkles} label="Tanya / bikin lewat AI Copilot" value="ai copilot chat tanya bikin" onSelect={() => go("/copilot")} />
-          <PaletteItem icon={BarChart3} label="Buka Dashboards" value="dashboards visualisasi chart" onSelect={() => go("/dashboards")} />
-          <PaletteItem icon={Plus} label="Bikin chart baru" value="chart baru buat tambah dashboard" onSelect={() => go("/dashboards")} />
-          <PaletteItem icon={Download} label="Ekspor dashboard (YAML)" value="ekspor export yaml dashboard" onSelect={() => run(() => window.open("/api/dashboard/export", "_blank"))} />
+        <Command.Group heading="Quick actions" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
+          <PaletteItem icon={Sparkles} label="Ask / build via AI Copilot" value="ai copilot chat ask build" onSelect={() => go("/copilot")} />
+          <PaletteItem icon={BarChart3} label="Open Dashboards" value="dashboards visualization chart" onSelect={() => go("/dashboards")} />
+          <PaletteItem icon={Plus} label="Create a new chart" value="new chart add dashboard" onSelect={() => go("/dashboards")} />
+          <PaletteItem icon={Download} label="Export dashboard (YAML)" value="export yaml dashboard" onSelect={() => run(() => window.open("/api/dashboard/export", "_blank"))} />
           <PaletteItem
             icon={resolvedTheme === "dark" ? Sun : Moon}
-            label={`Ganti tema (${resolvedTheme === "dark" ? "terang" : "gelap"})`}
-            value="tema theme dark light gelap terang"
+            label={`Change theme (${resolvedTheme === "dark" ? "light" : "dark"})`}
+            value="theme dark light"
             onSelect={() => run(() => setTheme(resolvedTheme === "dark" ? "light" : "dark"))}
           />
         </Command.Group>
 
         {/* Recent */}
         {recents.length ? (
-          <Command.Group heading="Baru dibuka" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
+          <Command.Group heading="Recent" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
             {recents.map((r) => (
               <PaletteItem key={r.href} icon={Clock} label={r.title} value={`recent ${r.title} ${r.href}`} onSelect={() => go(r.href)} />
             ))}

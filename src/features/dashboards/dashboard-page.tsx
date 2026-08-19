@@ -80,7 +80,7 @@ export function DashboardPage() {
       if (!adoptingRef.current && filtersRef.current.length) q.set("filters", JSON.stringify(filtersRef.current));
       const res = await fetch(`/api/dashboard?${q.toString()}`, { cache: "no-store" });
       const json = (await res.json()) as Payload;
-      if (!res.ok) throw new Error((json as { error?: string }).error ?? "Gagal memuat dashboard");
+      if (!res.ok) throw new Error((json as { error?: string }).error ?? "Failed to load dashboard");
       setData(json);
       setLayout(json.layout ?? {});
       if (adoptingRef.current) {
@@ -168,7 +168,7 @@ export function DashboardPage() {
   }
   async function newDashboard() {
     const res = await fetch("/api/dashboard/boards", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "Dashboard baru" }),
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "New dashboard" }),
     });
     const json = await res.json();
     notifyChange();
@@ -185,7 +185,7 @@ export function DashboardPage() {
     void load();
   }
 
-  const boards = data?.boards ?? [{ id: "default", name: "Utama" }];
+  const boards = data?.boards ?? [{ id: "default", name: "Main" }];
   const dashName = boards.find((b) => b.id === board)?.name ?? "Dashboards";
   const kpis = data?.kpis ?? [];
   const charts = data?.charts ?? [];
@@ -218,30 +218,30 @@ export function DashboardPage() {
     <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6")}>
       <PageHeader
         title={dashName}
-        description={isDefault ? "Dashboard bawaan (contoh). Buat dashboard sendiri dari sidebar untuk mengatur tata letak." : "Kanvas dashboard — seret & ubah ukuran tile di mode Edit. Tersimpan otomatis."}
+        description={isDefault ? "Built-in dashboard (demo). Create your own dashboard from the sidebar to arrange the layout." : "Dashboard canvas — drag & resize tiles in Edit mode. Saved automatically."}
         actions={
           <>
             <Select value={year} onValueChange={(v) => setYear(v ?? "all")}>
               <SelectTrigger className="h-7 w-[120px] text-xs"><SelectValue /></SelectTrigger>
-              <SelectContent>{YEARS.map((y) => <SelectItem key={y} value={y}>{y === "all" ? "Semua tahun" : `Tahun ${y}`}</SelectItem>)}</SelectContent>
+              <SelectContent>{YEARS.map((y) => <SelectItem key={y} value={y}>{y === "all" ? "All years" : `Year ${y}`}</SelectItem>)}</SelectContent>
             </Select>
             <Select value={autoSec} onValueChange={(v) => setAutoSec(v ?? "0")}>
               <SelectTrigger className="h-7 w-[110px] text-xs"><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="0">Manual</SelectItem>
-                <SelectItem value="30">Tiap 30s</SelectItem>
-                <SelectItem value="60">Tiap 1m</SelectItem>
-                <SelectItem value="300">Tiap 5m</SelectItem>
+                <SelectItem value="30">Every 30s</SelectItem>
+                <SelectItem value="60">Every 1m</SelectItem>
+                <SelectItem value="300">Every 5m</SelectItem>
               </SelectContent>
             </Select>
-            <Button variant="outline" size="sm" onClick={() => setFullscreen((f) => !f)} aria-label="Layar penuh">
+            <Button variant="outline" size="sm" onClick={() => setFullscreen((f) => !f)} aria-label="Fullscreen">
               {fullscreen ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
             </Button>
             {isDefault ? (
-              <Button size="sm" onClick={() => void newDashboard()}><Plus className="size-4" /> Dashboard baru</Button>
+              <Button size="sm" onClick={() => void newDashboard()}><Plus className="size-4" /> New dashboard</Button>
             ) : (
               <Button variant={edit ? "default" : "outline"} size="sm" onClick={() => setEdit((e) => !e)}>
-                {edit ? <Eye className="size-4" /> : <Pencil className="size-4" />}{edit ? "Selesai atur" : "Atur tata letak"}
+                {edit ? <Eye className="size-4" /> : <Pencil className="size-4" />}{edit ? "Done" : "Edit layout"}
               </Button>
             )}
             <ChartBuilder board={board} boards={boards} onSaved={load} />
@@ -252,12 +252,12 @@ export function DashboardPage() {
                   <div className="fixed inset-0 z-10" onClick={() => setMenuOpen(false)} />
                   <div className="absolute right-0 z-20 mt-1 w-44 rounded-lg border border-border bg-card p-1 shadow-xl">
                     {!isDefault ? (
-                      <button onClick={() => { setNewName(dashName); setRenameOpen(true); setMenuOpen(false); }} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Pencil className="size-4" /> Ganti nama</button>
+                      <button onClick={() => { setNewName(dashName); setRenameOpen(true); setMenuOpen(false); }} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Pencil className="size-4" /> Rename</button>
                     ) : null}
-                    <a href="/api/dashboard/export" download className="flex items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Download className="size-4" /> Ekspor YAML</a>
-                    <button onClick={() => void duplicateDashboard()} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Copy className="size-4" /> Duplikat</button>
+                    <a href="/api/dashboard/export" download className="flex items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Download className="size-4" /> Export YAML</a>
+                    <button onClick={() => void duplicateDashboard()} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Copy className="size-4" /> Duplicate</button>
                     {!isDefault ? (
-                      <button onClick={() => void deleteDashboard()} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm text-destructive hover:bg-destructive/10"><Trash2 className="size-4" /> Hapus dashboard</button>
+                      <button onClick={() => void deleteDashboard()} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm text-destructive hover:bg-destructive/10"><Trash2 className="size-4" /> Delete dashboard</button>
                     ) : null}
                   </div>
                 </>
@@ -269,7 +269,7 @@ export function DashboardPage() {
       />
 
       {error ? <div className="rounded-lg border border-destructive/40 bg-destructive/5 px-4 py-3 text-sm text-destructive">{error}</div> : null}
-      {data?.storeError ? <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-2 text-xs text-amber-600 dark:text-amber-400">Chart tersimpan tak bisa dimuat: {data.storeError}</div> : null}
+      {data?.storeError ? <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-2 text-xs text-amber-600 dark:text-amber-400">Could not load saved charts: {data.storeError}</div> : null}
 
       {data?.filterColumns?.length ? (
         <div className="rounded-lg border border-border bg-card/50 px-3 py-2">
@@ -297,14 +297,14 @@ export function DashboardPage() {
       {/* Kanvas */}
       {!loading && charts.length === 0 ? (
         <div className="rounded-lg border border-dashed py-16 text-center text-sm text-muted-foreground">
-          Dashboard ini masih kosong. Klik <span className="font-medium text-foreground">Chart baru</span> atau minta AI Copilot: <span className="font-medium text-foreground">“bikin chart …”</span>.
+          This dashboard is empty. Click <span className="font-medium text-foreground">New chart</span> or ask AI Copilot: <span className="font-medium text-foreground">“create a chart …”</span>.
         </div>
       ) : (
         <>
           {edit && !isDefault ? (
             <div className="flex items-center gap-2 rounded-lg border border-dashed border-primary/30 bg-primary/5 px-3 py-1.5 text-xs text-muted-foreground">
               <Move className="size-3.5 text-primary" />
-              Mode atur: <span className="font-medium text-foreground">seret header</span> untuk pindah, <span className="font-medium text-foreground">tarik pojok kanan-bawah</span> untuk ubah ukuran. Ikon ✏️/🗑️ per tile untuk atur/hapus. Otomatis tersimpan.
+              Edit mode: <span className="font-medium text-foreground">drag the header</span> to move, <span className="font-medium text-foreground">drag the bottom-right corner</span> to resize. Use ✏️/🗑️ per tile to edit/delete. Saved automatically.
             </div>
           ) : null}
           <DashboardGrid items={items} layout={layout} editable={edit && !isDefault} onLayoutChange={persistLayout} />
@@ -319,10 +319,10 @@ export function DashboardPage() {
 
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent className="sm:max-w-sm">
-          <DialogHeader><DialogTitle>Ganti nama dashboard</DialogTitle></DialogHeader>
-          <Input autoFocus value={newName} onChange={(e) => setNewName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void saveRename(); }} placeholder="Nama dashboard" />
+          <DialogHeader><DialogTitle>Rename dashboard</DialogTitle></DialogHeader>
+          <Input autoFocus value={newName} onChange={(e) => setNewName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void saveRename(); }} placeholder="Dashboard name" />
           <DialogFooter>
-            <DialogClose render={<Button variant="ghost" size="sm" />}>Batal</DialogClose>
+            <DialogClose render={<Button variant="ghost" size="sm" />}>Cancel</DialogClose>
             <Button size="sm" onClick={() => void saveRename()}>Simpan</Button>
           </DialogFooter>
         </DialogContent>

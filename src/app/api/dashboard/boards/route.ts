@@ -10,7 +10,7 @@ export const dynamic = "force-dynamic";
 export async function GET() {
   try {
     const boards = await listBoards();
-    return NextResponse.json({ boards: [{ id: "default", name: "Utama", layout: {} }, ...boards] });
+    return NextResponse.json({ boards: [{ id: "default", name: "Main", layout: {} }, ...boards] });
   } catch (e) {
     return NextResponse.json({ error: e instanceof Error ? e.message : String(e) }, { status: 500 });
   }

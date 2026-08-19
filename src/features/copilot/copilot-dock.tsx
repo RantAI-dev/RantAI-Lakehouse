@@ -9,8 +9,8 @@ import { ChatMessages } from "./chat-messages";
 import { ChatComposer } from "./chat-composer";
 
 const QUICK: Record<string, string[]> = {
-  ask: ["Total kunjungan wisman per kawasan", "Ringkas kualitas data lakehouse"],
-  build: ["Bikin chart wisman per kawasan", "Buatkan board dashboard soal wisman"],
+  ask: ["Total foreign visitors by region", "Summarize lakehouse data quality"],
+  build: ["Create a visitors-by-region chart", "Build a visitors dashboard"],
 };
 
 /**
@@ -48,13 +48,13 @@ export function CopilotDock() {
             <span className="text-sm font-semibold">AI Copilot</span>
             <div className="ml-auto flex items-center gap-0.5">
               <button
-                type="button" onClick={c.newChat} aria-label="Percakapan baru"
+                type="button" onClick={c.newChat} aria-label="New chat"
                 className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
               >
                 <Plus className="size-4" />
               </button>
               <button
-                type="button" onClick={() => setExp(false)} aria-label="Tutup panel"
+                type="button" onClick={() => setExp(false)} aria-label="Close panel"
                 className="grid size-7 place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
               >
                 <ChevronDown className="size-4" />
@@ -65,7 +65,7 @@ export function CopilotDock() {
             {c.messages.length === 0 ? (
               <div className="space-y-3 pt-1">
                 <p className="text-sm text-muted-foreground">
-                  Tanya soal data, atau ke mode <span className="font-medium text-foreground">Build</span> untuk bikin chart/dashboard lewat chat.
+                  Ask about data, or switch to <span className="font-medium text-foreground">Build</span> mode to build charts/dashboards via chat.
                 </p>
                 <div className="grid gap-1.5 sm:grid-cols-2">
                   {QUICK[c.mode].map((s) => (
@@ -93,7 +93,7 @@ export function CopilotDock() {
           onSend={(t) => { setExp(true); void c.send(t); }}
           busy={c.busy}
           rows={1}
-          placeholder="Tanya apa saja soal lakehouse…"
+          placeholder="Ask anything about your lakehouse…"
           enabledCaps={c.enabledCaps}
           toggleCap={c.toggleCap}
           onFocus={() => setExp(true)}

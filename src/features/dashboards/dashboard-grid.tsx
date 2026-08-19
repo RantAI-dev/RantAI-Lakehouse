@@ -150,12 +150,12 @@ export function DashboardGrid({
                 {editable ? (
                   <div className="flex items-center gap-0.5" onPointerDown={(e) => e.stopPropagation()}>
                     {it.onEdit ? (
-                      <button type="button" onClick={it.onEdit} aria-label="Ubah" className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground">
+                      <button type="button" onClick={it.onEdit} aria-label="Edit" className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground">
                         <Pencil className="size-3.5" />
                       </button>
                     ) : null}
                     {it.onRemove ? (
-                      <button type="button" onClick={it.onRemove} aria-label="Hapus" className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive">
+                      <button type="button" onClick={it.onRemove} aria-label="Delete" className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive">
                         <Trash2 className="size-3.5" />
                       </button>
                     ) : null}
@@ -171,7 +171,7 @@ export function DashboardGrid({
                 onPointerDown={(e) => startDrag(e, it.id, "resize")}
                 className="absolute -bottom-1 -right-1 z-10 grid size-6 cursor-se-resize place-items-center rounded-md border border-border bg-card text-muted-foreground shadow-sm hover:bg-muted hover:text-foreground"
                 style={{ touchAction: "none" }}
-                title="Tarik untuk ubah ukuran"
+                title="Drag to resize"
               >
                 <svg viewBox="0 0 10 10" className="size-3"><path d="M9 3v6H3" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" /></svg>
               </div>

@@ -30,7 +30,7 @@ function Avatar({ ai }: { ai?: boolean }) {
 export function TypingDots({ className }: { className?: string }) {
   return (
     <div className={cn("flex items-center gap-1", className)}>
-      <span className="sr-only">Copilot mengetik…</span>
+      <span className="sr-only">Copilot is typing…</span>
       <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/50 [animation-delay:-0.3s]" />
       <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/50 [animation-delay:-0.15s]" />
       <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/50" />

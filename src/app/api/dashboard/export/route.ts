@@ -34,7 +34,7 @@ export async function GET() {
   const body =
     `# RantAI Lakehouse — dashboard as code\n` +
     `# boards & chart specs, diekspor dari console.bi_chart\n\n` +
-    `boards:\n${[{ id: "default", name: "Utama", layout: {} as Record<string, unknown> }, ...boards].map((b) => {
+    `boards:\n${[{ id: "default", name: "Main", layout: {} as Record<string, unknown> }, ...boards].map((b) => {
       const lines = [`  - id: ${b.id}`, `    name: ${yamlValue(b.name)}`];
       const layout = b.layout ?? {};
       if (Object.keys(layout).length) {

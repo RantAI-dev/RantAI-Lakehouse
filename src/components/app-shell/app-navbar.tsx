@@ -51,9 +51,9 @@ export function AppNavbar() {
               readOnly
               onClick={() => openCommandPalette()}
               onFocus={() => openCommandPalette()}
-              placeholder="Cari halaman, aksi… (⌘K)"
+              placeholder="Search pages, actions… (⌘K)"
               className="h-9 w-full cursor-pointer rounded-lg border-border bg-muted/40 py-2 pl-9 pr-14 text-sm leading-5 shadow-none placeholder:text-muted-foreground focus-visible:bg-background"
-              aria-label="Buka command palette"
+              aria-label="Open command palette"
             />
             <kbd className="pointer-events-none absolute right-2 top-1/2 hidden h-5 -translate-y-1/2 items-center rounded border border-border bg-background px-1.5 font-mono text-[10px] text-muted-foreground lg:flex">
               ⌘ K
