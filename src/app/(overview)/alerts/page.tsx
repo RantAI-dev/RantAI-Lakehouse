@@ -1,8 +1,9 @@
-"use client"
+import type { Metadata } from "next";
+import { AlertsPage } from "@/features/alerts/alerts-page";
 
-import { AlertsPage } from "@/features/overview/alerts-page"
+export const metadata: Metadata = { title: "Alerts & Digests · Rantai Lake" };
 
-/** Thin App Router page for AlertsPage. */
+/** Alerts & scheduled digests (real backend: console.alert_rule + webhook/email). */
 export default function Page() {
-  return <AlertsPage />
+  return <AlertsPage />;
 }

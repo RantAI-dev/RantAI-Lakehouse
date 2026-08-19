@@ -89,7 +89,7 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [
       { title: "Overview", href: "/", icon: LayoutDashboard },
       { title: "Activity", href: "/activity", icon: Activity },
-      { title: "Alerts", href: "/alerts", icon: BellRing, preview: true },
+      { title: "Alerts", href: "/alerts", icon: BellRing },
     ],
   },
   {
