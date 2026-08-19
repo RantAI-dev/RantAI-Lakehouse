@@ -22,7 +22,7 @@ export function AppBottomNav() {
   return (
     <nav
       aria-label="Sub-navigasi section"
-      className="sticky bottom-0 z-30 flex items-center gap-1 overflow-x-auto border-t border-border bg-background/95 px-3 py-1.5 backdrop-blur-md sm:px-4"
+      className="fixed inset-x-0 bottom-0 z-30 flex items-center gap-1 overflow-x-auto border-t border-border bg-background/95 px-3 py-1.5 backdrop-blur-md sm:px-4 md:left-(--sidebar-width)"
     >
       {items.map((it) => {
         const active = it.href === activeHref

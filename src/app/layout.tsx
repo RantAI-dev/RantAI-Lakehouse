@@ -52,7 +52,7 @@ export default function RootLayout({
               <AppSidebar />
               <SidebarInset className="min-w-0 bg-muted/25">
                 <AppNavbar />
-                <div className="flex-1 p-4 sm:p-5 lg:p-6">{children}</div>
+                <div className="flex-1 p-4 pb-16 sm:p-5 sm:pb-16 lg:p-6 lg:pb-16">{children}</div>
                 <AppBottomNav />
                 <CopilotDock />
               </SidebarInset>
