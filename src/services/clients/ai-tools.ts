@@ -272,7 +272,7 @@ export const TOOLS: Record<string, ToolDef> = {
             mart: { type: "string", description: "nama mart Gold, mis. mart_wisman" },
             kind: {
               type: "string",
-              enum: ["bar", "hbar", "line", "area", "stacked", "combo", "pie", "rose", "funnel", "treemap", "scatter", "bubble", "heatmap", "radar", "waterfall", "kpi", "gauge", "table", "text"],
+              enum: ["bar", "hbar", "line", "area", "stacked", "combo", "pie", "rose", "funnel", "treemap", "scatter", "bubble", "heatmap", "radar", "waterfall", "geomap", "kpi", "gauge", "table", "text"],
               description:
                 "hbar=peringkat; stacked/combo butuh 2 measure (combo=bar+line); pie/rose/funnel/treemap/radar=komposisi 1 measure; " +
                 "scatter=2 measure (X,Y); bubble=3 measure (X,Y,ukuran); heatmap=butuh breakdown (2 dimensi) + 1 measure; " +
@@ -338,7 +338,7 @@ export const TOOLS: Record<string, ToolDef> = {
             title: { type: "string" },
             subtitle: { type: "string" },
             mart: { type: "string" },
-            kind: { type: "string", enum: ["bar", "hbar", "line", "area", "stacked", "combo", "pie", "rose", "funnel", "treemap", "scatter", "bubble", "heatmap", "radar", "waterfall", "kpi", "gauge", "table", "text"] },
+            kind: { type: "string", enum: ["bar", "hbar", "line", "area", "stacked", "combo", "pie", "rose", "funnel", "treemap", "scatter", "bubble", "heatmap", "radar", "waterfall", "geomap", "kpi", "gauge", "table", "text"] },
             dimension: { type: "string" },
             measures: { type: "array", items: { type: "string" } },
             breakdown: { type: "string" },

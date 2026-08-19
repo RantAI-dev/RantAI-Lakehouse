@@ -1,5 +1,6 @@
 import type { EChartsOption } from "echarts";
 import type { ChartSpec } from "@/lib/dashboard-specs";
+import { JAKARTA_MAP, normalizeJakartaArea } from "./echarts-maps";
 
 /** buildOption hanya butuh cara render (bukan SQL) — muat ChartSpec & ChartRenderSpec. */
 type Renderable = Pick<ChartSpec, "kind" | "x" | "y" | "series" | "target">;
@@ -228,6 +229,21 @@ export function buildOption(
       yAxis: { type: "category", data: yCats, splitArea: { show: true }, axisLabel: { color: axis, fontSize: 10 }, axisLine: { lineStyle: { color: split } }, axisTick: { show: false } },
       visualMap: { min: 0, max: maxV, calculable: false, orient: "horizontal", left: "center", bottom: 0, itemHeight: 60, textStyle: { color: axis, fontSize: 10 }, inRange: { color: dark ? ["#1e1b4b", "#6366f1", "#a5b4fc"] : ["#eef2ff", "#818cf8", "#4338ca"] } },
       series: [{ type: "heatmap", data, label: { show: false }, emphasis: { itemStyle: { shadowBlur: 6, shadowColor: "rgba(0,0,0,0.3)" } } }],
+    } as EChartsOption;
+  }
+
+  if (spec.kind === "geomap") {
+    const data = rows.map((r) => ({ name: normalizeJakartaArea(str(r[spec.x])), value: num(r[y0]) }));
+    const maxV = Math.max(1, ...data.map((d) => d.value));
+    return { ...base, grid: undefined,
+      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as { name: string; value?: number }; return `${o.name}<br/><b>${o.value != null && !Number.isNaN(o.value) ? fmtInt(o.value) : "—"}</b>`; } },
+      visualMap: { min: 0, max: maxV, left: "left", bottom: 6, calculable: true, itemHeight: 70,
+        textStyle: { color: axis, fontSize: 10 },
+        inRange: { color: dark ? ["#1e1b4b", "#4f46e5", "#a5b4fc"] : ["#eef2ff", "#818cf8", "#3730a3"] } },
+      series: [{ type: "map", map: JAKARTA_MAP, roam: false, aspectScale: 1,
+        itemStyle: { borderColor: dark ? "#09090b" : "#ffffff", borderWidth: 1, areaColor: dark ? "#27272a" : "#f4f4f5" },
+        emphasis: { label: { show: true, color: dark ? "#fff" : "#111", fontSize: 10 }, itemStyle: { areaColor: PALETTE[3] } },
+        select: { disabled: true }, label: { show: false }, data }],
     } as EChartsOption;
   }
 

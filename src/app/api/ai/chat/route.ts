@@ -75,6 +75,7 @@ MODE: BUILD. Selain menjawab, kamu bisa MENGOPERASIKAN lakehouse:
        3 metrik → bubble; profil multi-kategori → radar
      • bandingkan 2 metrik beda skala → combo (bar+line); ≥2 measure ditumpuk → stacked
      • intensitas 2 dimensi → heatmap (WAJIB breakdown = dimensi ke-2)
+     • sebaran per wilayah Jakarta → geomap (dimension = kolom wilayah/kota, mis. mart_kuliner.wilayah)
      • angka tunggal → kpi; angka vs target → gauge (boleh set target)
      Pakai parameter breakdown (dimensi ke-2) untuk multi-seri, mis. tren per
      kawasan (line + breakdown=kawasan) atau grouped bar per kategori.

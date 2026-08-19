@@ -16,6 +16,8 @@ export type ChartKind =
   | "pie" | "rose" | "funnel" | "treemap"
   // korelasi & distribusi
   | "scatter" | "bubble" | "heatmap" | "radar" | "waterfall"
+  // geografis
+  | "geomap"
   // angka tunggal
   | "kpi" | "gauge"
   // non-grafik

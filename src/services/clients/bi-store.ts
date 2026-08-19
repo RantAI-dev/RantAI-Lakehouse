@@ -49,6 +49,7 @@ const KINDS: ChartKind[] = [
   "bar", "hbar", "line", "area", "stacked", "combo",
   "pie", "rose", "funnel", "treemap",
   "scatter", "bubble", "heatmap", "radar", "waterfall",
+  "geomap",
   "kpi", "gauge", "table", "text",
 ];
 /** Kind yang boleh punya breakdown (dimensi ke-2). heatmap WAJIB breakdown. */

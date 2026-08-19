@@ -5,6 +5,7 @@ import type { ChartRenderSpec } from "@/lib/dashboard-specs";
 import { MiniMarkdown } from "@/features/copilot/mini-markdown";
 import { EChart } from "./echart";
 import { buildOption, fmtInt } from "./chart-option";
+import { ensureMap } from "./echarts-maps";
 
 type Cell = { columns: string[]; rows: Record<string, unknown>[] } | { error: string };
 function hasRows(c: Cell | undefined): c is { columns: string[]; rows: Record<string, unknown>[] } {
@@ -46,9 +47,37 @@ export function TileBody({
     return <TableView columns={cell.columns} rows={cell.rows} />;
   }
 
+  // geomap — perlu registrasi peta dulu (GeoJSON lokal).
+  if (spec.kind === "geomap") {
+    if (!hasRows(cell) || cell.rows.length === 0) {
+      return <p className="grid h-full place-items-center text-xs text-muted-foreground">Tak ada data{year !== "all" ? ` (tahun ${year})` : ""}.</p>;
+    }
+    return <GeoChart spec={spec} rows={cell.rows} dark={dark} />;
+  }
+
   // chart
   if (hasRows(cell) && cell.rows.length) return <EChart option={buildOption(spec, cell.rows, dark)} height="100%" />;
   return <p className="grid h-full place-items-center text-xs text-muted-foreground">Tak ada data{year !== "all" ? ` (tahun ${year})` : ""}.</p>;
+}
+
+/** Choropleth — pastikan peta terdaftar sebelum render; pesan ramah bila GeoJSON belum ada. */
+function GeoChart({ spec, rows, dark }: { spec: ChartRenderSpec; rows: Record<string, unknown>[]; dark: boolean }) {
+  const [state, setState] = React.useState<"loading" | "ready" | "missing">("loading");
+  React.useEffect(() => {
+    let alive = true;
+    void ensureMap().then((ok) => { if (alive) setState(ok ? "ready" : "missing"); });
+    return () => { alive = false; };
+  }, []);
+  if (state === "loading") return <div className="h-full animate-pulse rounded bg-muted/40" />;
+  if (state === "missing") {
+    return (
+      <div className="grid h-full place-content-center px-4 text-center text-xs text-muted-foreground">
+        <p className="font-medium text-foreground">Map data not loaded</p>
+        <p className="mt-1">Add <code className="rounded bg-muted px-1 font-mono">public/geo/dki-jakarta.geojson</code> to enable the map.</p>
+      </div>
+    );
+  }
+  return <EChart option={buildOption(spec, rows, dark)} height="100%" />;
 }
 
 function TableView({ columns, rows }: { columns: string[]; rows: Record<string, unknown>[] }) {

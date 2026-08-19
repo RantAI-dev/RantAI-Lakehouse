@@ -49,6 +49,9 @@ const KIND_GROUPS: { group: string; items: { value: ChartKind; label: string }[]
     { value: "heatmap", label: "Heatmap (2 dimensions)" },
     { value: "radar", label: "Radar" },
   ] },
+  { group: "Geographic", items: [
+    { value: "geomap", label: "Map — Jakarta regions (choropleth)" },
+  ] },
   { group: "Single value", items: [
     { value: "kpi", label: "KPI — big number" },
     { value: "gauge", label: "Gauge" },
