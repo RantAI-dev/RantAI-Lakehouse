@@ -73,7 +73,8 @@ export async function ensureBiTable(): Promise<void> {
 }
 
 function esc(s: string): string {
-  return s.replace(/'/g, "''");
+  // Escape backslash dulu, baru petik-satu — wajib untuk JSON (spec_json).
+  return s.replace(/\\/g, "\\\\").replace(/'/g, "''");
 }
 
 // ── Boards ────────────────────────────────────────────────────────────────

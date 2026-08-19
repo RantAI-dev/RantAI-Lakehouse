@@ -37,7 +37,9 @@ async function ensure(): Promise<void> {
 }
 
 function esc(s: string): string {
-  return s.replace(/'/g, "''");
+  // Escape backslash DULU (biar tak dobel-proses), baru petik-satu. Wajib untuk
+  // JSON (yang penuh \" \n \\) agar tak rusak di literal string ClickHouse.
+  return s.replace(/\\/g, "\\\\").replace(/'/g, "''");
 }
 
 /** Daftar sesi (ringkas: tanpa isi pesan) untuk panel history. */
