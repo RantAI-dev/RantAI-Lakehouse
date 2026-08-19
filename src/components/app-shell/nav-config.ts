@@ -49,6 +49,8 @@ export type NavItem = {
 
 export type NavGroup = {
   label: string
+  /** Ikon section — untuk tombol flyout di sidebar. */
+  icon?: LucideIcon
   items: NavItem[]
 }
 
@@ -69,12 +71,14 @@ export type NavGroup = {
 export const NAV_GROUPS: NavGroup[] = [
   {
     label: "AI",
+    icon: Sparkles,
     items: [
       { title: "AI Copilot", href: "/copilot", icon: Sparkles },
     ],
   },
   {
     label: "Overview",
+    icon: LayoutDashboard,
     items: [
       { title: "Overview", href: "/", icon: LayoutDashboard },
       { title: "Dashboards", href: "/dashboards", icon: BarChart3 },
@@ -84,6 +88,7 @@ export const NAV_GROUPS: NavGroup[] = [
   },
   {
     label: "Data",
+    icon: Database,
     items: [
       { title: "Data Explorer", href: "/data", icon: Database },
       { title: "Catalog", href: "/catalog", icon: Library },
@@ -93,6 +98,7 @@ export const NAV_GROUPS: NavGroup[] = [
   },
   {
     label: "Build",
+    icon: GitBranch,
     items: [
       { title: "Pipelines", href: "/pipelines", icon: GitBranch },
       { title: "Streaming Jobs", href: "/streaming", icon: Radio, preview: true },
@@ -101,6 +107,7 @@ export const NAV_GROUPS: NavGroup[] = [
   },
   {
     label: "Intelligence",
+    icon: Bot,
     items: [
       { title: "Knowledge", href: "/knowledge", icon: Sparkles, preview: true },
       { title: "Vector Jobs", href: "/vector-jobs", icon: Layers, preview: true },
@@ -113,6 +120,7 @@ export const NAV_GROUPS: NavGroup[] = [
   },
   {
     label: "Governance",
+    icon: ShieldCheck,
     items: [
       { title: "Policies", href: "/governance/policies", icon: ShieldCheck, preview: true },
       {
@@ -132,6 +140,7 @@ export const NAV_GROUPS: NavGroup[] = [
   },
   {
     label: "Operations",
+    icon: Server,
     items: [
       { title: "Workloads", href: "/workloads", icon: CircleGauge },
       { title: "Observability", href: "/observability", icon: FileSearch },
@@ -141,6 +150,7 @@ export const NAV_GROUPS: NavGroup[] = [
   },
   {
     label: "Administration",
+    icon: Settings,
     items: [
       { title: "Users", href: "/admin/users", icon: Users, preview: true },
       { title: "Teams & Roles", href: "/admin/roles", icon: Building2, preview: true },
