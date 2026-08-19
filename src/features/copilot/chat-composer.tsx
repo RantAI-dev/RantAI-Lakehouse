@@ -81,7 +81,7 @@ function ToolsMenu({
  */
 export function ChatComposer({
   mode, setMode, onSend, busy, placeholder, autoFocus, rows = 2,
-  enabledCaps, toggleCap, onFocus, glass,
+  enabledCaps, toggleCap, onFocus, glass, compact,
 }: {
   mode: Mode;
   setMode: (m: Mode) => void;
@@ -93,8 +93,10 @@ export function ChatComposer({
   enabledCaps?: Set<string>;
   toggleCap?: (key: string) => void;
   onFocus?: () => void;
-  /** Liquid-glass surface (opaque + frosted) — for the floating dock. */
+  /** Liquid-glass surface (frosted, blurred) — for the floating dock. */
   glass?: boolean;
+  /** Compact single-line pill (collapsed dock, Google-style). */
+  compact?: boolean;
 }) {
   const [input, setInput] = React.useState("");
   const submit = () => {
@@ -104,12 +106,38 @@ export function ChatComposer({
     setInput("");
   };
 
+  const glassCls = glass
+    ? "border-white/15 bg-background/55 shadow-[0_8px_32px_rgba(0,0,0,0.22)] backdrop-blur-2xl supports-[backdrop-filter]:bg-background/45 ring-1 ring-inset ring-white/10 dark:border-white/10 dark:ring-white/5"
+    : "border-border/60 bg-muted/30 shadow-sm";
+
+  // COMPACT — single-line pill (input + send). Focus/typing expands via onFocus.
+  if (compact) {
+    return (
+      <div className={cn("flex items-center gap-2 rounded-full border py-2 pl-4 pr-2 transition-all", glassCls)}>
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onFocus={onFocus}
+          onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submit(); } }}
+          placeholder={placeholder ?? "Ask anything about your lakehouse…"}
+          aria-label="Message AI Copilot"
+          className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+        />
+        <button
+          type="button" onClick={submit} disabled={busy || !input.trim()} aria-label="Send"
+          className={cn("grid size-7 shrink-0 place-items-center rounded-full transition-colors",
+            busy || !input.trim() ? "text-muted-foreground" : "bg-primary text-primary-foreground hover:bg-primary/85")}
+        >
+          <ArrowUp className="size-4" />
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className={cn(
       "rounded-2xl border p-1.5 transition-all",
-      glass
-        ? "border-border/70 bg-background/80 shadow-[0_8px_30px_rgba(0,0,0,0.14)] backdrop-blur-xl supports-[backdrop-filter]:bg-background/70 focus-within:border-foreground/25 focus-within:bg-background/85"
-        : "border-border/60 bg-muted/30 shadow-sm focus-within:border-foreground/20 focus-within:bg-muted/40 focus-within:shadow-md",
+      glass ? `${glassCls} focus-within:bg-background/60` : `${glassCls} focus-within:border-foreground/20 focus-within:bg-muted/40 focus-within:shadow-md`,
     )}>
       <Textarea
         value={input}
