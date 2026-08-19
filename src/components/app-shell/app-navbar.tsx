@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { ThemeToggle } from "@/components/theme-toggle"
 import { cn } from "@/lib/utils"
-import { pageTitleFor } from "./nav-config"
+import { pageTitleFor, visibleNavGroups, activeNavHref } from "./nav-config"
 import { openCommandPalette } from "@/components/command-palette"
 
 /**
@@ -19,13 +19,14 @@ import { openCommandPalette } from "@/components/command-palette"
 export function AppNavbar() {
   const pathname = usePathname()
   const pageTitle = pageTitleFor(pathname)
+  const activeHref = activeNavHref(pathname)
+  const activeGroup = visibleNavGroups().find((g) => g.items.some((it) => it.href === activeHref))
+  // Sub-nav muncul saat section aktif punya >1 halaman.
+  const subItems = activeGroup && activeGroup.items.length > 1 ? activeGroup.items : []
 
   return (
-    <header
-      className={cn(
-        "sticky top-0 z-20 flex h-16 shrink-0 items-center gap-4 border-b border-border bg-background/90 px-4 backdrop-blur-md sm:px-5"
-      )}
-    >
+    <div className="sticky top-0 z-20 border-b border-border bg-background/90 backdrop-blur-md">
+    <header className={cn("flex h-16 shrink-0 items-center gap-4 px-4 sm:px-5")}>
       <div className="flex min-h-0 min-w-0 flex-1 items-center justify-between gap-3">
         <div className="flex min-w-0 flex-1 items-center gap-3">
           <SidebarTrigger
@@ -78,5 +79,31 @@ export function AppNavbar() {
         </div>
       </div>
     </header>
+
+    {subItems.length ? (
+      <nav
+        aria-label={`${activeGroup?.label} sub-navigasi`}
+        className="flex items-center gap-1 overflow-x-auto border-t border-border px-4 sm:px-5"
+      >
+        {subItems.map((it) => {
+          const active = it.href === activeHref
+          const Icon = it.icon
+          return (
+            <Link
+              key={it.href}
+              href={it.href}
+              className={cn(
+                "flex shrink-0 items-center gap-1.5 border-b-2 border-transparent px-2.5 py-2 text-sm text-muted-foreground transition-colors hover:text-foreground",
+                active && "border-primary font-medium text-foreground"
+              )}
+            >
+              <Icon className="size-4 shrink-0" />
+              {it.title}
+            </Link>
+          )
+        })}
+      </nav>
+    ) : null}
+    </div>
   )
 }
