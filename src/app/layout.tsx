@@ -5,6 +5,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/app-shell/app-sidebar";
 import { AppNavbar } from "@/components/app-shell/app-navbar";
+import { AppBottomNav } from "@/components/app-shell/app-bottom-nav";
 import { CopilotDock } from "@/features/copilot/copilot-dock";
 import { CommandPalette } from "@/components/command-palette";
 import "./globals.css";
@@ -52,6 +53,7 @@ export default function RootLayout({
               <SidebarInset className="min-w-0 bg-muted/25">
                 <AppNavbar />
                 <div className="flex-1 p-4 sm:p-5 lg:p-6">{children}</div>
+                <AppBottomNav />
                 <CopilotDock />
               </SidebarInset>
               <CommandPalette />

@@ -4,6 +4,8 @@ import * as React from "react";
 import { usePathname } from "next/navigation";
 import { Sparkles, Plus, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useSidebar } from "@/components/ui/sidebar";
+import { subNavItems } from "@/components/app-shell/nav-config";
 import { useCopilot } from "./use-copilot";
 import { ChatMessages } from "./chat-messages";
 import { ChatComposer } from "./chat-composer";
@@ -22,6 +24,8 @@ const QUICK: Record<string, string[]> = {
  */
 export function CopilotDock() {
   const pathname = usePathname();
+  const { state } = useSidebar();
+  const hasBottomNav = state === "expanded" && subNavItems(pathname).length > 0;
   const [expanded, setExpanded] = React.useState(false);
   const c = useCopilot();
 
@@ -38,7 +42,7 @@ export function CopilotDock() {
   const showPanel = expanded;
 
   return (
-    <div className="fixed bottom-4 left-1/2 z-50 w-[min(94vw,720px)] -translate-x-1/2 print:hidden">
+    <div className={cn("fixed left-1/2 z-50 w-[min(94vw,720px)] -translate-x-1/2 print:hidden", hasBottomNav ? "bottom-16" : "bottom-4")}>
       {showPanel ? (
         <div className="mb-2 flex max-h-[62vh] flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-2xl">
           <div className="flex items-center gap-2 border-b border-border px-3 py-2">

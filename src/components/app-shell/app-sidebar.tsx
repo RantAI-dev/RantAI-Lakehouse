@@ -1,5 +1,7 @@
 "use client"
 
+import * as React from "react"
+import { createPortal } from "react-dom"
 import Image from "next/image"
 import Link from "next/link"
 import { usePathname } from "next/navigation"
@@ -14,11 +16,11 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarRail,
+  useSidebar,
 } from "@/components/ui/sidebar"
 import { cn } from "@/lib/utils"
-import { visibleNavGroups, activeNavHref, type NavGroup } from "./nav-config"
+import { visibleNavGroups, activeNavHref, type NavGroup, type NavItem } from "./nav-config"
 
-/** Rantai brand mark shown in the sidebar header (32px). */
 function BrandLogo() {
   return (
     <div className="relative size-8 shrink-0 overflow-hidden rounded-md" aria-hidden>
@@ -27,44 +29,125 @@ function BrandLogo() {
   )
 }
 
+type FlyoutState = { label: string; top: number; left: number } | null
+
 /**
- * Primary sidebar — daftar SECTION (grup). Klik section = buka halaman pertama
- * section itu; sub-halaman lainnya muncul sebagai baris sub-nav di bawah navbar
- * (lihat AppNavbar). Section aktif ter-highlight. Grup 1-item jadi link langsung.
+ * Primary sidebar — daftar SECTION. Perilaku beda per mode:
+ *  · MELEBAR: klik section = buka halaman pertamanya; sub-halaman tampil sebagai
+ *    BOTTOM NAV (lihat AppBottomNav).
+ *  · DICIUTKAN (ikon): klik ikon section → FLYOUT sub-halaman ke kanan (klik),
+ *    karena bottom nav tak muat.
+ * Grup 1-item selalu link langsung.
  */
 export function AppSidebar() {
   const pathname = usePathname()
   const activeHref = activeNavHref(pathname)
   const groups = visibleNavGroups()
+  const { state } = useSidebar()
+  const iconMode = state === "collapsed"
+
+  const [flyout, setFlyout] = React.useState<FlyoutState>(null)
+  const flyoutRef = React.useRef<HTMLDivElement>(null)
+  const [mounted, setMounted] = React.useState(false)
+  React.useEffect(() => setMounted(true), [])
+  React.useEffect(() => setFlyout(null), [pathname])
+  React.useEffect(() => { if (!iconMode) setFlyout(null) }, [iconMode])
+
+  React.useEffect(() => {
+    if (!flyout) return
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node
+      if (flyoutRef.current?.contains(t)) return
+      if ((t as HTMLElement)?.closest?.("[data-section-trigger]")) return
+      setFlyout(null)
+    }
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setFlyout(null) }
+    document.addEventListener("mousedown", onDown)
+    document.addEventListener("keydown", onKey)
+    return () => {
+      document.removeEventListener("mousedown", onDown)
+      document.removeEventListener("keydown", onKey)
+    }
+  }, [flyout])
+
+  const openFlyout = (label: string, el: HTMLElement) => {
+    if (flyout?.label === label) return setFlyout(null)
+    const r = el.getBoundingClientRect()
+    setFlyout({ label, top: r.top, left: r.right + 8 })
+  }
+
+  const menuBtnClass = (active: boolean) =>
+    cn(
+      "h-8 rounded-md px-2.5 py-1.5 text-sm font-normal tracking-normal text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+      active && "bg-sidebar-accent font-medium text-sidebar-primary shadow-sm ring-1 ring-sidebar-border",
+    )
+
+  const linkRow = (item: NavItem, active: boolean) => {
+    const Icon = item.icon
+    return (
+      <Link
+        href={item.href}
+        onClick={() => setFlyout(null)}
+        className={cn(
+          "flex items-center gap-2 rounded-md px-2.5 py-1.5 text-sm text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+          active && "bg-sidebar-accent font-medium text-sidebar-primary shadow-sm ring-1 ring-sidebar-border",
+        )}
+      >
+        <Icon className="size-4 shrink-0" />
+        <span className="truncate">{item.title}</span>
+      </Link>
+    )
+  }
 
   const renderEntry = (group: NavGroup) => {
     const single = group.items.length === 1
-    const target = single ? group.items[0] : group.items[0]
-    const Icon = single ? target.icon : group.icon ?? target.icon
-    const label = single ? target.title : group.label
+    const first = group.items[0]
+    const Icon = single ? first.icon : group.icon ?? first.icon
+    const label = single ? first.title : group.label
     const active = group.items.some((it) => it.href === activeHref)
+
+    // Grup 1-item, atau mode melebar → link navigasi biasa.
+    if (single || !iconMode) {
+      return (
+        <SidebarMenuItem key={group.label} className="group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:justify-center">
+          <SidebarMenuButton
+            isActive={active}
+            tooltip={label}
+            className={menuBtnClass(active)}
+            render={
+              <Link href={first.href}>
+                <Icon className="size-4 shrink-0" />
+                <span className="truncate leading-5">{label}</span>
+              </Link>
+            }
+          />
+        </SidebarMenuItem>
+      )
+    }
+
+    // Mode ikon + multi-item → tombol flyout.
+    const isOpen = flyout?.label === group.label
     return (
-      <SidebarMenuItem
-        key={group.label}
-        className="group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:justify-center"
-      >
-        <SidebarMenuButton
-          isActive={active}
-          tooltip={label}
+      <SidebarMenuItem key={group.label} className="flex justify-center">
+        <button
+          type="button"
+          data-section-trigger
+          title={label}
+          aria-expanded={isOpen}
+          onClick={(e) => openFlyout(group.label, e.currentTarget)}
           className={cn(
-            "h-8 rounded-md px-2.5 py-1.5 text-sm font-normal tracking-normal text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
-            active && "bg-sidebar-accent font-medium text-sidebar-primary shadow-sm ring-1 ring-sidebar-border",
+            "grid size-8 place-items-center rounded-md text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+            (active || isOpen) && "bg-sidebar-accent text-sidebar-primary",
+            active && "shadow-sm ring-1 ring-sidebar-border",
           )}
-          render={
-            <Link href={target.href}>
-              <Icon className="size-4 shrink-0" />
-              <span className="truncate leading-5">{label}</span>
-            </Link>
-          }
-        />
+        >
+          <Icon className="size-4" />
+        </button>
       </SidebarMenuItem>
     )
   }
+
+  const openGroup = groups.find((g) => g.label === flyout?.label)
 
   return (
     <Sidebar collapsible="icon" side="left" className="border-r border-sidebar-border bg-sidebar shadow-sm">
@@ -85,6 +168,23 @@ export function AppSidebar() {
           </SidebarMenu>
         </SidebarGroup>
       </SidebarContent>
+
+      {/* Flyout (hanya mode ikon) */}
+      {mounted && flyout && openGroup
+        ? createPortal(
+            <div
+              ref={flyoutRef}
+              style={{ position: "fixed", top: Math.min(flyout.top, window.innerHeight - 40 - openGroup.items.length * 34), left: flyout.left }}
+              className="z-[60] w-56 rounded-xl border border-sidebar-border bg-sidebar p-1.5 shadow-2xl"
+            >
+              <p className="px-2 py-1 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">{openGroup.label}</p>
+              {openGroup.items.map((item) => (
+                <React.Fragment key={item.href}>{linkRow(item, item.href === activeHref)}</React.Fragment>
+              ))}
+            </div>,
+            document.body,
+          )
+        : null}
 
       <SidebarFooter className="border-t border-sidebar-border p-2">
         <SidebarMenu>

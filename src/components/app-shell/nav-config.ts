@@ -187,6 +187,18 @@ export function visibleNavGroups(): NavGroup[] {
 /** Flat list of every sidebar nav item, used for active-state and command search. */
 export const ALL_NAV_ITEMS: NavItem[] = NAV_GROUPS.flatMap((g) => g.items)
 
+/** Grup (section) yang memuat halaman aktif — untuk bottom-nav & sub-navigasi. */
+export function activeNavGroup(pathname: string): NavGroup | undefined {
+  const href = activeNavHref(pathname)
+  return visibleNavGroups().find((g) => g.items.some((it) => it.href === href))
+}
+
+/** Sub-halaman section aktif (kosong bila hanya 1 item). */
+export function subNavItems(pathname: string): NavItem[] {
+  const g = activeNavGroup(pathname)
+  return g && g.items.length > 1 ? g.items : []
+}
+
 /**
  * Routes that live under a sidebar entry but have their own page title
  * (for example Query Studio workspace tabs). They never appear in the sidebar;
