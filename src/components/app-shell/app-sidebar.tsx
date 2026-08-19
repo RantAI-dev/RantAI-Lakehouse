@@ -24,9 +24,11 @@ import { cn } from "@/lib/utils"
 import { visibleNavGroups, activeNavHref, type NavGroup, type NavItem } from "./nav-config"
 
 function BrandLogo() {
+  // Logo ikut tema: navy untuk sidebar terang, putih untuk sidebar gelap.
   return (
-    <div className="relative size-8 shrink-0 overflow-hidden rounded-md" aria-hidden>
-      <Image src="/rantai.png" alt="" fill sizes="32px" className="object-cover" priority />
+    <div className="relative size-8 shrink-0" aria-hidden>
+      <Image src="/logo-light.png" alt="Rantai Lake" fill sizes="32px" className="object-contain dark:hidden" priority />
+      <Image src="/logo-dark.png" alt="" fill sizes="32px" className="hidden object-contain dark:block" priority />
     </div>
   )
 }

@@ -13,6 +13,8 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "Rantai Lake",
   description: "Rantai Lake - Data platform",
+  manifest: "/site.webmanifest",
+  appleWebApp: { title: "Rantai Lake" },
 };
 
 /**
@@ -44,6 +46,10 @@ export default function RootLayout({
     >
       <head>
         <meta name="theme-color" content="#050A30" />
+        {/* Favicon ikut skema warna browser: terang=logo navy, gelap=logo putih. */}
+        <link rel="icon" type="image/png" href="/icon-light-32.png" media="(prefers-color-scheme: light)" />
+        <link rel="icon" type="image/png" href="/icon-dark-32.png" media="(prefers-color-scheme: dark)" />
+        <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
       </head>
       <body>
         <ThemeProvider>
