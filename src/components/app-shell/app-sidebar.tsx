@@ -11,6 +11,7 @@ import {
   SidebarContent,
   SidebarFooter,
   SidebarGroup,
+  SidebarGroupLabel,
   SidebarHeader,
   SidebarMenu,
   SidebarMenuButton,
@@ -45,6 +46,7 @@ export function AppSidebar() {
   const groups = visibleNavGroups()
   const { state } = useSidebar()
   const iconMode = state === "collapsed"
+  const activeGroup = groups.find((g) => g.items.some((it) => it.href === activeHref))
 
   const [flyout, setFlyout] = React.useState<FlyoutState>(null)
   const flyoutRef = React.useRef<HTMLDivElement>(null)
@@ -167,6 +169,20 @@ export function AppSidebar() {
             {groups.map(renderEntry)}
           </SidebarMenu>
         </SidebarGroup>
+
+        {/* Sub-menu section aktif — di bawah sidebar, dipisah garis (mode melebar). */}
+        {!iconMode && activeGroup && activeGroup.items.length > 1 ? (
+          <SidebarGroup className="mt-auto gap-0 border-t border-sidebar-border px-2 pb-1 pt-2">
+            <SidebarGroupLabel className="h-6 px-2 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">
+              {activeGroup.label}
+            </SidebarGroupLabel>
+            <div className="mt-0.5 flex flex-col gap-0.5">
+              {activeGroup.items.map((it) => (
+                <React.Fragment key={it.href}>{linkRow(it, it.href === activeHref)}</React.Fragment>
+              ))}
+            </div>
+          </SidebarGroup>
+        ) : null}
       </SidebarContent>
 
       {/* Flyout (hanya mode ikon) */}
