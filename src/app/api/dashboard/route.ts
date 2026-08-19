@@ -32,13 +32,14 @@ export async function GET(req: Request) {
     .split(",").map((s) => parseInt(s, 10)).filter((n) => Number.isFinite(n));
 
   let stored: StoredChartSpec[] = [];
-  let boards: { id: string; name: string }[] = [];
+  let boards: Awaited<ReturnType<typeof listBoards>> = [];
   let storeError: string | null = null;
   try {
     [stored, boards] = await Promise.all([listStoredCharts(), listBoards()]);
   } catch (e) {
     storeError = e instanceof Error ? e.message : String(e);
   }
+  const layout = boards.find((b) => b.id === board)?.layout ?? {};
 
   const onDefault = board === "default" || board === "all";
   const storedForBoard = board === "all" ? stored : stored.filter((c) => (c.board || "default") === board);
@@ -56,6 +57,7 @@ export async function GET(req: Request) {
   return NextResponse.json({
     board,
     years,
+    layout,
     boards: [{ id: "default", name: "Utama" }, ...boards.map((b) => ({ id: b.id, name: b.name }))],
     kpis: kpis.map((k) => ({ id: k.id, title: k.title, caption: k.caption, format: k.format })),
     charts: [

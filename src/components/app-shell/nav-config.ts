@@ -77,11 +77,17 @@ export const NAV_GROUPS: NavGroup[] = [
     ],
   },
   {
+    label: "Dashboards",
+    icon: BarChart3,
+    items: [
+      { title: "Dashboards", href: "/dashboards", icon: BarChart3 },
+    ],
+  },
+  {
     label: "Overview",
     icon: LayoutDashboard,
     items: [
       { title: "Overview", href: "/", icon: LayoutDashboard },
-      { title: "Dashboards", href: "/dashboards", icon: BarChart3 },
       { title: "Activity", href: "/activity", icon: Activity },
       { title: "Alerts", href: "/alerts", icon: BellRing, preview: true },
     ],

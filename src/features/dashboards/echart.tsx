@@ -14,7 +14,7 @@ export function EChart({
   height = 280,
 }: {
   option: echarts.EChartsOption;
-  height?: number;
+  height?: number | string;
 }) {
   const elRef = React.useRef<HTMLDivElement>(null);
   const chartRef = React.useRef<echarts.ECharts | null>(null);

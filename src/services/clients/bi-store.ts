@@ -39,7 +39,7 @@ export type ChartInput = {
   board?: string; // board tujuan (default "default")
 };
 
-export type Board = { id: string; name: string; createdAt?: string };
+export type Board = { id: string; name: string; layout?: LayoutMap; createdAt?: string };
 
 const IDENT = /^[a-zA-Z0-9_]+$/;
 const KINDS: ChartKind[] = ["bar", "hbar", "line", "area", "pie", "stacked"];
@@ -65,12 +65,18 @@ export async function ensureBiTable(): Promise<void> {
   await chExec("ALTER TABLE console.bi_chart ADD COLUMN IF NOT EXISTS board String DEFAULT 'default'");
   await chExec(
     `CREATE TABLE IF NOT EXISTS console.bi_board (
-       id String, name String,
+       id String, name String, layout_json String DEFAULT '{}',
        created_at DateTime DEFAULT now(), is_deleted UInt8 DEFAULT 0
      ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id`,
   );
+  // Migrasi: tabel lama tanpa layout.
+  await chExec("ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS layout_json String DEFAULT '{}'");
   ensured = true;
 }
+
+/** Posisi tile di kanvas grid (12 kolom). Key = chartId. */
+export type TileBox = { x: number; y: number; w: number; h: number };
+export type LayoutMap = Record<string, TileBox>;
 
 function esc(s: string): string {
   // Escape backslash dulu, baru petik-satu — wajib untuk JSON (spec_json).
@@ -78,32 +84,78 @@ function esc(s: string): string {
 }
 
 // ── Boards ────────────────────────────────────────────────────────────────
+function parseLayout(s: string): LayoutMap {
+  try { const o = JSON.parse(s || "{}"); return o && typeof o === "object" ? (o as LayoutMap) : {}; }
+  catch { return {}; }
+}
+
 export async function listBoards(): Promise<Board[]> {
   await ensureBiTable();
-  const rows = await chRows<{ id: string; name: string; created_at: string }>(
-    `SELECT id, name, toString(created_at) AS created_at FROM console.bi_board FINAL
+  const rows = await chRows<{ id: string; name: string; layout_json: string; created_at: string }>(
+    `SELECT id, name, layout_json, toString(created_at) AS created_at FROM console.bi_board FINAL
       WHERE is_deleted = 0 ORDER BY created_at`,
   );
-  return rows.map((r) => ({ id: r.id, name: r.name, createdAt: r.created_at }));
+  return rows.map((r) => ({ id: r.id, name: r.name, layout: parseLayout(r.layout_json), createdAt: r.created_at }));
+}
+
+export async function getBoard(id: string): Promise<Board | null> {
+  await ensureBiTable();
+  const rows = await chRows<{ id: string; name: string; layout_json: string; created_at: string }>(
+    `SELECT id, name, layout_json, toString(created_at) AS created_at FROM console.bi_board FINAL
+      WHERE is_deleted = 0 AND id='${esc(id)}' LIMIT 1`,
+  );
+  const r = rows[0];
+  return r ? { id: r.id, name: r.name, layout: parseLayout(r.layout_json), createdAt: r.created_at } : null;
 }
 
 export async function createBoard(name: string): Promise<Board> {
   await ensureBiTable();
   const clean = String(name ?? "").trim();
-  if (!clean) throw new Error("nama board wajib.");
+  if (!clean) throw new Error("nama dashboard wajib.");
   const id = `b_${randomUUID().slice(0, 8)}`;
-  await chExec(
-    `INSERT INTO console.bi_board (id, name) VALUES ('${esc(id)}', '${esc(clean)}')`,
-  );
-  return { id, name: clean };
+  await chExec(`INSERT INTO console.bi_board (id, name) VALUES ('${esc(id)}', '${esc(clean)}')`);
+  return { id, name: clean, layout: {} };
+}
+
+export async function renameBoard(id: string, name: string): Promise<void> {
+  await ensureBiTable();
+  const clean = String(name ?? "").trim();
+  if (!clean) throw new Error("nama wajib.");
+  await chExec(`ALTER TABLE console.bi_board UPDATE name='${esc(clean)}' WHERE id='${esc(id)}'`);
+}
+
+export async function updateBoardLayout(id: string, layout: LayoutMap): Promise<void> {
+  await ensureBiTable();
+  await chExec(`ALTER TABLE console.bi_board UPDATE layout_json='${esc(JSON.stringify(layout ?? {}))}' WHERE id='${esc(id)}'`);
 }
 
 export async function deleteBoard(id: string): Promise<void> {
   await ensureBiTable();
   const safe = esc(id);
   await chExec(`INSERT INTO console.bi_board (id, name, is_deleted) VALUES ('${safe}', '', 1)`);
-  // Chart-nya kembalikan ke default (jangan hilang).
-  await chExec(`ALTER TABLE console.bi_chart UPDATE board='default' WHERE board='${safe}'`);
+  // Hapus juga chart di dalamnya (soft-delete) biar tak yatim.
+  await chExec(`ALTER TABLE console.bi_chart UPDATE is_deleted=1 WHERE board='${safe}'`);
+}
+
+/** Duplikat dashboard beserta chart & tata letaknya (id baru). */
+export async function duplicateBoard(id: string): Promise<Board> {
+  await ensureBiTable();
+  const src = await getBoard(id);
+  if (!src) throw new Error("dashboard tidak ditemukan.");
+  const charts = (await listStoredCharts()).filter((c) => c.board === id);
+  const nb = await createBoard(`${src.name} (salinan)`);
+  const idMap: Record<string, string> = {};
+  for (const c of charts) {
+    const newId = `u_${randomUUID().slice(0, 8)}`;
+    idMap[c.id] = newId;
+    await insertChart({ ...c, id: newId, board: nb.id });
+  }
+  const newLayout: LayoutMap = {};
+  for (const [oldId, box] of Object.entries(src.layout ?? {})) {
+    if (idMap[oldId]) newLayout[idMap[oldId]] = box;
+  }
+  await updateBoardLayout(nb.id, newLayout);
+  return { ...nb, layout: newLayout };
 }
 
 // ── Charts ──────────────────────────────────────────────────────────────

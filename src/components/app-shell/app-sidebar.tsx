@@ -5,7 +5,7 @@ import { createPortal } from "react-dom"
 import Image from "next/image"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
-import { CircleUserRound, Plus, MessageSquare, X } from "lucide-react"
+import { CircleUserRound, Plus, MessageSquare, X, BarChart3 } from "lucide-react"
 import { useCopilot } from "@/features/copilot/use-copilot"
 import {
   Sidebar,
@@ -53,6 +53,24 @@ export function AppSidebar() {
   const router = useRouter()
   const copilot = useCopilot()
   const onCopilot = pathname.startsWith("/copilot")
+  const onDashboards = pathname.startsWith("/dashboards")
+
+  const [dashboards, setDashboards] = React.useState<{ id: string; name: string }[]>([])
+  const loadDashboards = React.useCallback(() => {
+    fetch("/api/dashboard/boards").then((r) => r.json()).then((j) => setDashboards(j.boards ?? [])).catch(() => {})
+  }, [])
+  React.useEffect(() => { if (onDashboards) loadDashboards() }, [onDashboards, loadDashboards])
+  const newDashboard = async () => {
+    const res = await fetch("/api/dashboard/boards", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "Dashboard baru" }),
+    })
+    const j = await res.json()
+    if (j?.board?.id) { router.push(`/dashboards?board=${j.board.id}`); loadDashboards() }
+  }
+  const removeDashboard = async (id: string) => {
+    await fetch(`/api/dashboard/boards?id=${encodeURIComponent(id)}`, { method: "DELETE" })
+    loadDashboards(); router.push("/dashboards")
+  }
 
   const [flyout, setFlyout] = React.useState<FlyoutState>(null)
   const flyoutRef = React.useRef<HTMLDivElement>(null)
@@ -176,8 +194,29 @@ export function AppSidebar() {
           </SidebarMenu>
         </SidebarGroup>
 
-        {/* Slot bawah — RIWAYAT saat di AI Copilot, atau sub-menu section aktif. */}
-        {!iconMode && onCopilot ? (
+        {/* Slot bawah — DAFTAR DASHBOARD, RIWAYAT chat, atau sub-menu section. */}
+        {!iconMode && onDashboards ? (
+          <SidebarGroup className="mt-1 gap-0 border-t border-sidebar-border px-2 pb-1 pt-2">
+            <div className="flex items-center justify-between pr-1">
+              <SidebarGroupLabel className="h-6 px-2 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">Dashboards</SidebarGroupLabel>
+              <button type="button" onClick={() => void newDashboard()} aria-label="Dashboard baru" title="Dashboard baru"
+                className="grid size-6 place-items-center rounded-md text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground">
+                <Plus className="size-4" />
+              </button>
+            </div>
+            <div className="mt-0.5 flex max-h-[46vh] flex-col gap-0.5 overflow-y-auto">
+              {dashboards.map((d) => (
+                <div key={d.id} className="group/dash flex items-center gap-1.5 rounded-md px-2 py-1.5 text-sm text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground">
+                  <BarChart3 className="size-3.5 shrink-0 opacity-70" />
+                  <button onClick={() => router.push(`/dashboards?board=${d.id}`)} className="flex-1 truncate text-left" title={d.name}>{d.name}</button>
+                  {d.id !== "default" ? (
+                    <button onClick={() => void removeDashboard(d.id)} aria-label="Hapus" className="shrink-0 opacity-0 hover:text-destructive group-hover/dash:opacity-100"><X className="size-3.5" /></button>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+          </SidebarGroup>
+        ) : !iconMode && onCopilot ? (
           <SidebarGroup className="mt-1 gap-0 border-t border-sidebar-border px-2 pb-1 pt-2">
             <div className="flex items-center justify-between pr-1">
               <SidebarGroupLabel className="h-6 px-2 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">
