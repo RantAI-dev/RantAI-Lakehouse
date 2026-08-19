@@ -9,7 +9,7 @@
  * dashboard — Raw/Bronze/Silver tidak).
  */
 
-export type ChartKind = "bar" | "hbar" | "line" | "area" | "pie" | "stacked";
+export type ChartKind = "bar" | "hbar" | "line" | "area" | "pie" | "stacked" | "kpi" | "table" | "text";
 export type NumFmt = "int" | "float";
 /** Asal spec: bawaan (seed), dibuat AI lewat chat, atau manual lewat UI. */
 export type ChartSource = "builtin" | "ai" | "ui";
@@ -45,6 +45,10 @@ export type ChartSpec = {
   format?: NumFmt;
   /** 2 = full width di grid. */
   span?: 1 | 2;
+  /** Konten markdown untuk tile kind="text" (tanpa SQL). */
+  text?: string;
+  /** Caption/unit untuk tile kind="kpi". */
+  caption?: string;
 };
 
 const S = "serving";

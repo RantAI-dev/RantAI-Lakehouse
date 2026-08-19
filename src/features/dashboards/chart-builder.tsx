@@ -9,6 +9,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
@@ -18,7 +19,7 @@ type Fields = { dimensions: string[]; measures: string[] };
 export type ChartDef = {
   title?: string; subtitle?: string; mart?: string; kind?: ChartKind;
   dimension?: string; measures?: string[]; breakdown?: string;
-  aggregate?: string; span?: 1 | 2; board?: string;
+  aggregate?: string; span?: 1 | 2; board?: string; text?: string; caption?: string;
 };
 type BoardOpt = { id: string; name: string };
 
@@ -29,6 +30,9 @@ const KINDS: { value: ChartKind; label: string }[] = [
   { value: "area", label: "Area (tren)" },
   { value: "pie", label: "Donat (komposisi)" },
   { value: "stacked", label: "Batang bertumpuk (≥2 measure)" },
+  { value: "kpi", label: "KPI — angka besar" },
+  { value: "table", label: "Tabel data" },
+  { value: "text", label: "Teks / catatan" },
 ];
 const AGGS = ["sum", "avg", "max", "min", "count"];
 
@@ -70,8 +74,12 @@ export function ChartBuilder({
   const [breakdown, setBreakdown] = React.useState("");
   const [aggregate, setAggregate] = React.useState("sum");
   const [span, setSpan] = React.useState<1 | 2>(1);
+  const [caption, setCaption] = React.useState("");
+  const [text, setText] = React.useState("");
   const [targetBoard, setTargetBoard] = React.useState(board);
-  const canBreakdown = kind !== "pie" && kind !== "stacked";
+  const isText = kind === "text";
+  const isKpi = kind === "kpi";
+  const canBreakdown = kind === "bar" || kind === "hbar" || kind === "line" || kind === "area";
   const isEdit = !!editId;
 
   async function loadFields(m: string): Promise<Fields> {
@@ -91,6 +99,8 @@ export function ChartBuilder({
       setAggregate(initial.aggregate ?? "sum");
       setSpan(initial.span === 2 ? 2 : 1);
       setBreakdown(initial.breakdown ?? "");
+      setCaption(initial.caption ?? "");
+      setText(initial.text ?? "");
       setTargetBoard(initial.board ?? board);
       const m = initial.mart ?? "";
       setMart(m);
@@ -110,6 +120,7 @@ export function ChartBuilder({
   function reset() {
     setTitle(""); setMart(""); setKind("hbar"); setDimension("");
     setMeasure(""); setMeasure2(""); setBreakdown(""); setAggregate("sum"); setSpan(1);
+    setCaption(""); setText("");
     setTargetBoard(board); setFields(null); setError(null);
   }
 
@@ -121,18 +132,26 @@ export function ChartBuilder({
 
   async function save() {
     setError(null);
-    const measures = kind === "stacked" ? [measure, measure2].filter(Boolean) : [measure].filter(Boolean);
-    if (!title || !mart || !dimension || measures.length === 0) {
-      setError("Lengkapi judul, mart, dimensi, dan measure."); return;
-    }
-    if (kind === "stacked" && measures.length < 2) { setError("Chart bertumpuk butuh 2 measure."); return; }
-    setBusy(true);
-    try {
-      const payload = {
+    if (!title) { setError("Judul wajib."); return; }
+    let payload: Record<string, unknown>;
+    if (isText) {
+      if (!text.trim()) { setError("Isi teks/catatan."); return; }
+      payload = { title, kind, text, span, board: targetBoard };
+    } else if (isKpi) {
+      if (!mart || !measure) { setError("Pilih mart & measure."); return; }
+      payload = { title, kind, mart, measures: [measure], aggregate, caption: caption || undefined, span, board: targetBoard };
+    } else {
+      const measures = kind === "stacked" ? [measure, measure2].filter(Boolean) : [measure].filter(Boolean);
+      if (!mart || !dimension || measures.length === 0) { setError("Lengkapi mart, dimensi, dan measure."); return; }
+      if (kind === "stacked" && measures.length < 2) { setError("Bertumpuk butuh 2 measure."); return; }
+      payload = {
         title, mart, kind, dimension, measures, aggregate, span, board: targetBoard,
         breakdown: canBreakdown && breakdown ? breakdown : undefined,
-        ...(isEdit ? { id: editId } : {}),
       };
+    }
+    if (isEdit) payload.id = editId;
+    setBusy(true);
+    try {
       const res = await fetch("/api/dashboard/specs", {
         method: isEdit ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
@@ -171,105 +190,17 @@ export function ChartBuilder({
             <Input id="ch-title" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="mis. Wisman per Kawasan" />
           </div>
 
+          {/* Tipe + Board */}
           <div className="grid grid-cols-2 gap-3">
-            <div className="grid gap-1.5">
-              <Label>Mart (Gold)</Label>
-              <Select value={mart} onValueChange={(v) => onMartChange(v ?? "")}>
-                <SelectTrigger><SelectValue placeholder="pilih mart" /></SelectTrigger>
-                <SelectContent>
-                  {marts.map((m) => (
-                    <SelectItem key={m.name} value={m.name}>{m.name} · {m.rows.toLocaleString("id-ID")}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
             <div className="grid gap-1.5">
               <Label>Tipe</Label>
               <Select value={kind} onValueChange={(v) => setKind(v as ChartKind)}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {KINDS.map((k) => <SelectItem key={k.value} value={k.value}>{k.label}</SelectItem>)}
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div className="grid gap-1.5">
-              <Label>Dimensi (X)</Label>
-              <Select value={dimension} onValueChange={(v) => setDimension(v ?? "")} disabled={!fields}>
-                <SelectTrigger><SelectValue placeholder={fields ? "pilih kolom" : "pilih mart dulu"} /></SelectTrigger>
-                <SelectContent>
-                  {fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
-                </SelectContent>
+                <SelectContent>{KINDS.map((k) => <SelectItem key={k.value} value={k.value}>{k.label}</SelectItem>)}</SelectContent>
               </Select>
             </div>
             <div className="grid gap-1.5">
-              <Label>Agregasi</Label>
-              <Select value={aggregate} onValueChange={(v) => setAggregate(v ?? "")}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {AGGS.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div className="grid gap-1.5">
-              <Label>Measure (Y)</Label>
-              <Select value={measure} onValueChange={(v) => setMeasure(v ?? "")} disabled={!fields}>
-                <SelectTrigger><SelectValue placeholder={fields ? "pilih kolom" : "pilih mart dulu"} /></SelectTrigger>
-                <SelectContent>
-                  {fields?.measures.map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}
-                </SelectContent>
-              </Select>
-            </div>
-            {kind === "stacked" ? (
-              <div className="grid gap-1.5">
-                <Label>Measure ke-2</Label>
-                <Select value={measure2} onValueChange={(v) => setMeasure2(v ?? "")} disabled={!fields}>
-                  <SelectTrigger><SelectValue placeholder="pilih kolom" /></SelectTrigger>
-                  <SelectContent>
-                    {fields?.measures.filter((m) => m !== measure).map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}
-                  </SelectContent>
-                </Select>
-              </div>
-            ) : (
-              <div className="grid gap-1.5">
-                <Label>Lebar</Label>
-                <Select value={String(span)} onValueChange={(v) => setSpan(v === "2" ? 2 : 1)}>
-                  <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="1">Setengah</SelectItem>
-                    <SelectItem value="2">Penuh</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-            )}
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            {canBreakdown ? (
-              <div className="grid gap-1.5">
-                <Label>Breakdown / seri (opsional)</Label>
-                <Select
-                  value={breakdown || "__none__"}
-                  onValueChange={(v) => setBreakdown(v === "__none__" ? "" : v ?? "")}
-                  disabled={!fields}
-                >
-                  <SelectTrigger><SelectValue placeholder="tanpa breakdown" /></SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="__none__">— tanpa breakdown —</SelectItem>
-                    {fields?.dimensions.filter((d) => d !== dimension).map((d) => (
-                      <SelectItem key={d} value={d}>{d}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            ) : <div />}
-            <div className="grid gap-1.5">
-              <Label>Board</Label>
+              <Label>Dashboard</Label>
               <Select value={targetBoard} onValueChange={(v) => setTargetBoard(v ?? "default")}>
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
@@ -280,6 +211,91 @@ export function ChartBuilder({
               </Select>
             </div>
           </div>
+
+          {isText ? (
+            <div className="grid gap-1.5">
+              <Label>Konten (markdown)</Label>
+              <Textarea rows={5} value={text} onChange={(e) => setText(e.target.value)} placeholder="Judul **tebal**, - poin, atau | tabel | GFM |." />
+            </div>
+          ) : (
+            <>
+              <div className="grid gap-1.5">
+                <Label>Mart (Gold)</Label>
+                <Select value={mart} onValueChange={(v) => onMartChange(v ?? "")}>
+                  <SelectTrigger><SelectValue placeholder="pilih mart" /></SelectTrigger>
+                  <SelectContent>
+                    {marts.map((m) => <SelectItem key={m.name} value={m.name}>{m.name} · {m.rows.toLocaleString("id-ID")}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {!isKpi ? (
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="grid gap-1.5">
+                    <Label>Dimensi (X)</Label>
+                    <Select value={dimension} onValueChange={(v) => setDimension(v ?? "")} disabled={!fields}>
+                      <SelectTrigger><SelectValue placeholder={fields ? "pilih kolom" : "pilih mart dulu"} /></SelectTrigger>
+                      <SelectContent>{fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}</SelectContent>
+                    </Select>
+                  </div>
+                  <div className="grid gap-1.5">
+                    <Label>Agregasi</Label>
+                    <Select value={aggregate} onValueChange={(v) => setAggregate(v ?? "")}>
+                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectContent>{AGGS.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}</SelectContent>
+                    </Select>
+                  </div>
+                </div>
+              ) : null}
+
+              <div className="grid grid-cols-2 gap-3">
+                <div className="grid gap-1.5">
+                  <Label>Measure (Y)</Label>
+                  <Select value={measure} onValueChange={(v) => setMeasure(v ?? "")} disabled={!fields}>
+                    <SelectTrigger><SelectValue placeholder={fields ? "pilih kolom" : "pilih mart dulu"} /></SelectTrigger>
+                    <SelectContent>{fields?.measures.map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
+                  </Select>
+                </div>
+                {isKpi ? (
+                  <div className="grid gap-1.5">
+                    <Label>Agregasi</Label>
+                    <Select value={aggregate} onValueChange={(v) => setAggregate(v ?? "")}>
+                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectContent>{AGGS.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}</SelectContent>
+                    </Select>
+                  </div>
+                ) : kind === "stacked" ? (
+                  <div className="grid gap-1.5">
+                    <Label>Measure ke-2</Label>
+                    <Select value={measure2} onValueChange={(v) => setMeasure2(v ?? "")} disabled={!fields}>
+                      <SelectTrigger><SelectValue placeholder="pilih kolom" /></SelectTrigger>
+                      <SelectContent>{fields?.measures.filter((m) => m !== measure).map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
+                    </Select>
+                  </div>
+                ) : <div />}
+              </div>
+
+              {isKpi ? (
+                <div className="grid gap-1.5">
+                  <Label>Caption (opsional)</Label>
+                  <Input value={caption} onChange={(e) => setCaption(e.target.value)} placeholder="mis. kunjungan mancanegara (akumulasi)" />
+                </div>
+              ) : null}
+
+              {canBreakdown ? (
+                <div className="grid gap-1.5">
+                  <Label>Breakdown / seri (opsional)</Label>
+                  <Select value={breakdown || "__none__"} onValueChange={(v) => setBreakdown(v === "__none__" ? "" : v ?? "")} disabled={!fields}>
+                    <SelectTrigger><SelectValue placeholder="tanpa breakdown" /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none__">— tanpa breakdown —</SelectItem>
+                      {fields?.dimensions.filter((d) => d !== dimension).map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </div>
+              ) : null}
+            </>
+          )}
 
           {error ? <p className="text-sm text-destructive">{error}</p> : null}
         </div>

@@ -12,10 +12,10 @@ import {
 import { cn } from "@/lib/utils";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import type { LayoutMap } from "@/services/clients/bi-store";
-import { EChart } from "./echart";
-import { buildOption, fmtInt } from "./chart-option";
+import { fmtInt } from "./chart-option";
 import { ChartBuilder, type ChartDef } from "./chart-builder";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
+import { TileBody } from "./tile-body";
 
 type Cell = { columns: string[]; rows: Record<string, unknown>[] } | { error: string };
 type KpiMeta = { id: string; title: string; caption?: string; format: string };
@@ -136,16 +136,7 @@ export function DashboardPage() {
       ),
       onEdit: spec.source !== "builtin" && spec.def ? () => setEditing({ id: spec.id, def: spec.def as ChartDef }) : undefined,
       onRemove: spec.source !== "builtin" ? () => void remove(spec.id) : undefined,
-      body:
-        cell && "error" in cell ? (
-          <p className="grid h-full place-items-center px-2 text-center text-xs text-destructive">{cell.error}</p>
-        ) : hasRows(cell) && cell.rows.length ? (
-          <EChart option={buildOption(spec, cell.rows, dark)} height="100%" />
-        ) : loading && !cell ? (
-          <div className="h-full animate-pulse rounded bg-muted/40" />
-        ) : (
-          <p className="grid h-full place-items-center text-xs text-muted-foreground">Tak ada data{year !== "all" ? ` (tahun ${year})` : ""}.</p>
-        ),
+      body: <TileBody spec={spec} cell={cell} dark={dark} loading={loading} year={year} />,
     };
   });
 

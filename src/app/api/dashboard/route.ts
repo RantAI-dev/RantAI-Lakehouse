@@ -10,6 +10,7 @@ type CellResult =
   | { error: string };
 
 async function runSpec(id: string, sql: string, signal: AbortSignal): Promise<[string, CellResult]> {
+  if (!sql) return [id, { columns: [], rows: [] }]; // tile text — tak perlu query
   try {
     const r = await chQuery(sql, signal);
     return [id, { columns: r.meta.map((m) => m.name), rows: r.data }];

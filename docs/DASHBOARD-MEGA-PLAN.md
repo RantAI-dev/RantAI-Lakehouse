@@ -56,5 +56,5 @@ tipe tile, filter interaktif, mode edit/lihat, tersimpan di lakehouse.
 mode lihat, lalu editor & filter, lalu ekspor & agentic).
 
 ## Status
-- [x] Fase 0  - [x] Fase 1  - [ ] Fase 2  - [ ] Fase 3
+- [x] Fase 0  - [x] Fase 1  - [x] Fase 2  - [ ] Fase 3
 - [ ] Fase 4  - [ ] Fase 5  - [ ] Fase 6  - [ ] Fase 7

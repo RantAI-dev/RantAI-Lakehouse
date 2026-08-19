@@ -37,12 +37,14 @@ export type ChartInput = {
   order?: "desc" | "asc" | "none";
   span?: 1 | 2;
   board?: string; // board tujuan (default "default")
+  text?: string; // konten markdown (kind="text")
+  caption?: string; // unit/caption (kind="kpi")
 };
 
 export type Board = { id: string; name: string; layout?: LayoutMap; createdAt?: string };
 
 const IDENT = /^[a-zA-Z0-9_]+$/;
-const KINDS: ChartKind[] = ["bar", "hbar", "line", "area", "pie", "stacked"];
+const KINDS: ChartKind[] = ["bar", "hbar", "line", "area", "pie", "stacked", "kpi", "table", "text"];
 const AGGS = new Set(["sum", "avg", "max", "min", "count"]);
 
 let ensured = false;
@@ -215,10 +217,17 @@ function buildSql(
   return `SELECT ${dimension}, ${sel} FROM serving.${mart} ${where}GROUP BY ${dimension} ORDER BY ${orderClause} LIMIT ${limit}`;
 }
 
+/** SQL KPI (angka tunggal, kolom `v`) + filter tahun opsional. */
+function buildKpiSql(d: { mart: string; measure: string; agg: string }, years?: number[]): string {
+  const val = d.agg === "count" ? "count()" : `round(${d.agg}(${d.measure}))`;
+  const where = years && years.length ? ` WHERE tahun IN (${years.join(",")})` : "";
+  return `SELECT ${val} AS v FROM serving.${d.mart}${where}`;
+}
+
 /**
  * Validasi input terhadap skema NYATA di ClickHouse lalu susun StoredChartSpec.
- * Melempar Error ramah bila mart/kolom tak valid. `id` opsional → untuk EDIT
- * (mempertahankan id lama).
+ * Melempar Error ramah bila mart/kolom tak valid. `id` opsional → untuk EDIT.
+ * Cabang per kind: text (tanpa SQL) / kpi (angka) / table & chart (grouped).
  */
 export async function specFromInput(
   input: ChartInput,
@@ -228,84 +237,87 @@ export async function specFromInput(
 ): Promise<StoredChartSpec> {
   const title = String(input.title ?? "").trim();
   if (!title) throw new Error("title wajib diisi.");
-  const mart = String(input.mart ?? "").replace(/^serving\./, "");
-  if (!IDENT.test(mart)) throw new Error(`nama mart tidak valid: ${input.mart}`);
   const kind = input.kind;
-  if (!KINDS.includes(kind)) throw new Error(`kind tidak valid: ${kind} (pilih ${KINDS.join("/")})`);
+  if (!KINDS.includes(kind)) throw new Error(`kind tidak valid: ${kind}`);
+  const newId = id ?? `u_${randomUUID().slice(0, 8)}`;
+  const board = input.board?.trim() || "default";
+  const span = (input.span === 2 ? 2 : 1) as 1 | 2;
+  const subtitle = input.subtitle?.trim() || undefined;
 
-  const dimension = String(input.dimension ?? "");
-  const measures = (input.measures ?? []).map(String);
-  if (!IDENT.test(dimension)) throw new Error(`kolom dimensi tidak valid: ${dimension}`);
-  if (measures.length === 0) throw new Error("minimal satu kolom measure.");
-  if (measures.some((m) => !IDENT.test(m))) throw new Error("kolom measure tidak valid.");
-  if (kind === "stacked" && measures.length < 2) throw new Error("chart 'stacked' butuh ≥2 measure.");
-
-  const exists = await chRows<{ n: string }>(
-    `SELECT toString(count()) AS n FROM system.tables
-      WHERE database='serving' AND name='${esc(mart)}' AND name NOT LIKE '%\\_baru'`,
-  );
-  if (Number(exists[0]?.n ?? 0) === 0) throw new Error(`mart Gold '${mart}' tidak ditemukan di serving.`);
-
-  const cols = new Set(
-    (
-      await chRows<{ name: string }>(
-        `SELECT name FROM system.columns WHERE database='serving' AND table='${esc(mart)}'`,
-      )
-    ).map((c) => c.name),
-  );
-  for (const c of [dimension, ...measures]) {
-    if (!cols.has(c)) throw new Error(`kolom '${c}' tidak ada di serving.${mart}.`);
+  // ── TEXT — tanpa SQL/mart ────────────────────────────────────────────────
+  if (kind === "text") {
+    const text = String(input.text ?? "").trim();
+    if (!text) throw new Error("konten teks wajib.");
+    const def: ChartInput = { title, kind, mart: "", dimension: "", measures: [], text, span, board };
+    const spec: ChartSpec = { id: newId, title, subtitle, kind, mart: "", sql: "", x: "", y: "", text, format: "int", span };
+    return { ...spec, source, board, def, hasYear: false, createdBy };
   }
 
+  // ── Butuh mart untuk kpi/table/chart ─────────────────────────────────────
+  const mart = String(input.mart ?? "").replace(/^serving\./, "");
+  if (!IDENT.test(mart)) throw new Error(`nama mart tidak valid: ${input.mart}`);
+  const exists = await chRows<{ n: string }>(
+    `SELECT toString(count()) AS n FROM system.tables WHERE database='serving' AND name='${esc(mart)}' AND name NOT LIKE '%\\_baru'`,
+  );
+  if (Number(exists[0]?.n ?? 0) === 0) throw new Error(`mart Gold '${mart}' tidak ditemukan di serving.`);
+  const cols = new Set(
+    (await chRows<{ name: string }>(`SELECT name FROM system.columns WHERE database='serving' AND table='${esc(mart)}'`)).map((c) => c.name),
+  );
+  const hasYear = cols.has("tahun");
   const agg = (input.aggregate ?? "sum").toLowerCase();
   if (!AGGS.has(agg)) throw new Error(`aggregate tidak valid: ${agg}`);
+  const measures = (input.measures ?? []).map(String);
+  if (measures.length === 0) throw new Error("minimal satu kolom measure.");
+  if (measures.some((m) => !IDENT.test(m) || !cols.has(m))) throw new Error("kolom measure tidak valid / tak ada.");
+
+  // ── KPI — angka tunggal ──────────────────────────────────────────────────
+  if (kind === "kpi") {
+    const m = measures[0];
+    const def: ChartInput = {
+      title, kind, mart, dimension: "", measures: [m], aggregate: agg as ChartInput["aggregate"],
+      caption: input.caption?.trim() || undefined, span, board,
+    };
+    const sql = buildKpiSql({ mart, measure: m, agg });
+    const spec: ChartSpec = { id: newId, title, subtitle, kind, mart, sql, x: "", y: m, caption: def.caption, format: "int", span };
+    return { ...spec, source, board, def, hasYear, createdBy };
+  }
+
+  // ── TABLE / CHART — perlu dimensi ────────────────────────────────────────
+  const dimension = String(input.dimension ?? "");
+  if (!IDENT.test(dimension) || !cols.has(dimension)) throw new Error(`kolom dimensi '${dimension}' tak valid / tak ada.`);
+  if (kind === "stacked" && measures.length < 2) throw new Error("chart 'stacked' butuh ≥2 measure.");
   const limit = Math.min(Math.max(Number(input.limit ?? 20) || 20, 1), 100);
   const order = input.order ?? (kind === "line" || kind === "area" ? "none" : "desc");
-
   const breakdown = input.breakdown ? String(input.breakdown) : "";
   if (breakdown) {
-    if (!IDENT.test(breakdown)) throw new Error(`kolom breakdown tidak valid: ${breakdown}`);
-    if (!cols.has(breakdown)) throw new Error(`kolom '${breakdown}' tidak ada di serving.${mart}.`);
+    if (!IDENT.test(breakdown) || !cols.has(breakdown)) throw new Error(`kolom breakdown '${breakdown}' tak valid / tak ada.`);
     if (breakdown === dimension) throw new Error("breakdown harus beda dari dimensi.");
-    if (kind === "pie") throw new Error("chart 'pie' tak mendukung breakdown.");
+    if (kind === "pie" || kind === "table") throw new Error("breakdown tak didukung untuk pie/tabel.");
     if (measures.length > 1) throw new Error("dengan breakdown, pakai tepat satu measure.");
   }
 
   const def: ChartInput = {
-    title, subtitle: input.subtitle?.trim() || undefined, mart, kind, dimension, measures,
+    title, subtitle, mart, kind, dimension, measures,
     breakdown: breakdown || undefined, aggregate: agg as ChartInput["aggregate"], limit,
-    order, span: input.span === 2 ? 2 : 1, board: input.board?.trim() || "default",
+    order, span, board,
   };
   const sql = buildSql({ mart, dimension, measures, agg, order, limit, breakdown: breakdown || undefined });
-
   const spec: ChartSpec = {
-    id: id ?? `u_${randomUUID().slice(0, 8)}`,
-    title,
-    subtitle: def.subtitle,
-    kind,
-    mart,
-    sql,
-    x: dimension,
-    y: measures.length === 1 ? measures[0] : measures,
-    series: breakdown || undefined,
-    format: "int",
-    span: def.span as 1 | 2,
+    id: newId, title, subtitle, kind, mart, sql, x: dimension,
+    y: measures.length === 1 ? measures[0] : measures, series: breakdown || undefined, format: "int", span,
   };
-  return {
-    ...spec, source, board: def.board!, def, hasYear: cols.has("tahun"), createdBy,
-  };
+  return { ...spec, source, board, def, hasYear, createdBy };
 }
 
 /** SQL untuk sebuah spec tersimpan dengan filter tahun runtime (dipakai /api/dashboard). */
 export function sqlWithYear(spec: StoredChartSpec, years: number[]): string {
+  if (spec.kind === "text") return "";
   if (!spec.hasYear || !years.length || !spec.def?.mart) return spec.sql;
   const d = spec.def;
+  const agg = d.aggregate ?? "sum";
+  if (spec.kind === "kpi") return buildKpiSql({ mart: d.mart, measure: d.measures[0], agg }, years);
   return buildSql(
-    {
-      mart: d.mart, dimension: d.dimension, measures: d.measures,
-      agg: (d.aggregate ?? "sum"), order: d.order ?? "none",
-      limit: d.limit ?? 20, breakdown: d.breakdown,
-    },
+    { mart: d.mart, dimension: d.dimension, measures: d.measures, agg, order: d.order ?? "none", limit: d.limit ?? 20, breakdown: d.breakdown },
     years,
   );
 }
@@ -313,11 +325,11 @@ export function sqlWithYear(spec: StoredChartSpec, years: number[]): string {
 /** Simpan/replace spec (smoke-test SQL dulu agar tak menyimpan yang rusak). */
 export async function insertChart(spec: StoredChartSpec): Promise<void> {
   await ensureBiTable();
-  await chQuery(spec.sql); // smoke test — melempar bila SQL gagal
+  if (spec.sql) await chQuery(spec.sql); // smoke test — melempar bila SQL gagal (skip untuk text)
   const clean: ChartSpec = {
     id: spec.id, title: spec.title, subtitle: spec.subtitle, kind: spec.kind,
     mart: spec.mart, sql: spec.sql, x: spec.x, y: spec.y, series: spec.series,
-    format: spec.format, span: spec.span,
+    format: spec.format, span: spec.span, text: spec.text, caption: spec.caption,
   };
   const payload = esc(JSON.stringify({ spec: clean, def: spec.def, hasYear: spec.hasYear }));
   await chExec(
