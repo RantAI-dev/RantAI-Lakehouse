@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 
 export const dynamic = "force-dynamic";
 
-const DAGSTER_URL = process.env.DAGSTER_URL ?? "http://192.168.18.187:13030/graphql";
+const DAGSTER_URL = process.env.DAGSTER_URL ?? "http://localhost:13030/graphql";
 
 /**
  * Status per-step sebuah run Dagster — untuk pohon pipeline live di AI Copilot

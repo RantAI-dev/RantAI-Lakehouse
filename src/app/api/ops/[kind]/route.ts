@@ -105,7 +105,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ kind: s
         }
       };
       const chOk = (await chRows(`SELECT 1`).then(() => true).catch(() => false));
-      const dagUrl = (process.env.DAGSTER_URL ?? "http://192.168.18.187:13030/graphql").replace("/graphql", "/server_info");
+      const dagUrl = (process.env.DAGSTER_URL ?? "http://localhost:13030/graphql").replace("/graphql", "/server_info");
       const dagOk = await check("dagster", dagUrl);
       const services = [
         { id: "clickhouse", name: "ClickHouse (Hot analytical store)", ok: chOk, deps: [] as string[] },

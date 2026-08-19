@@ -8,9 +8,9 @@
  * Tidak pakai dependency tambahan — cukup HTTP interface ClickHouse + fetch.
  */
 
-const CH_URL = process.env.CH_URL ?? "http://192.168.18.187:18123";
-const CH_USER = process.env.CH_USER ?? "dispar_app";
-const CH_PASSWORD = process.env.CH_PASSWORD ?? "disparapp";
+const CH_URL = process.env.CH_URL ?? "http://localhost:18123";
+const CH_USER = process.env.CH_USER ?? "default";
+const CH_PASSWORD = process.env.CH_PASSWORD ?? "";
 
 export type ChJsonResult = {
   meta: { name: string; type: string }[];

@@ -3,7 +3,7 @@
  * Job `refresh_lakehouse` (7 aset bronze→silver→gold) + jadwal harian.
  */
 
-const DAGSTER_URL = process.env.DAGSTER_URL ?? "http://192.168.18.187:13030/graphql";
+const DAGSTER_URL = process.env.DAGSTER_URL ?? "http://localhost:13030/graphql";
 const REPO = process.env.DAGSTER_REPO ?? "__repository__";
 const LOCATION = process.env.DAGSTER_LOCATION ?? "dispar_orchestrate.definitions";
 
