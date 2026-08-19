@@ -88,10 +88,12 @@ export async function POST(req: Request) {
   let history: LlmMessage[] = [];
   let mode: "ask" | "build" = "ask";
   let allow: string[] | null = null;
+  let pageCtx = "";
   try {
     const body = await req.json();
     if (body.mode === "build") mode = "build";
     if (Array.isArray(body.tools) && body.tools.length) allow = body.tools.map(String);
+    if (typeof body.context === "string") pageCtx = body.context.slice(0, 800);
     const incoming = Array.isArray(body.messages) ? body.messages : [];
     history = incoming
       .filter((m: { role: string; content: string }) => m.role === "user" || m.role === "assistant")
@@ -110,7 +112,8 @@ export async function POST(req: Request) {
     /* lanjut tanpa skema */
   }
   const base = mode === "build" ? SYSTEM_BUILD : SYSTEM_ASK;
-  const sys = schema ? `${base}\n\nSKEMA TERSEDIA:\n${schema}` : base;
+  const ctxLine = pageCtx ? `\n\nCURRENT PAGE CONTEXT: ${pageCtx}\nTailor your help, wording, and suggestions to where the user currently is.` : "";
+  const sys = (schema ? `${base}\n\nSKEMA TERSEDIA:\n${schema}` : base) + ctxLine;
 
   // Ask = read-only: sembunyikan tool yang mengubah lakehouse / dashboard.
   const WRITE_TOOLS = new Set([

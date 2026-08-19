@@ -8,10 +8,6 @@ import { useCopilot } from "./use-copilot";
 import { ChatMessages } from "./chat-messages";
 import { ChatComposer } from "./chat-composer";
 
-const QUICK: Record<string, string[]> = {
-  ask: ["Total foreign visitors by region", "Summarize lakehouse data quality"],
-  build: ["Create a visitors-by-region chart", "Build a visitors dashboard"],
-};
 
 /**
  * Chat dock GLOBAL — bar di TENGAH-BAWAH setiap halaman (gaya Google Cloud
@@ -64,11 +60,10 @@ export function CopilotDock() {
           <div className="flex-1 overflow-y-auto p-3">
             {c.messages.length === 0 ? (
               <div className="space-y-3 pt-1">
-                <p className="text-sm text-muted-foreground">
-                  Ask about data, or switch to <span className="font-medium text-foreground">Build</span> mode to build charts/dashboards via chat.
-                </p>
+                <p className="text-sm font-medium text-foreground">{c.pageContext.title}</p>
+                <p className="text-xs text-muted-foreground">{c.pageContext.hint}</p>
                 <div className="grid gap-1.5 sm:grid-cols-2">
-                  {QUICK[c.mode].map((s) => (
+                  {c.pageContext.suggest[c.mode].map((s) => (
                     <button
                       key={s} onClick={() => void c.send(s)} disabled={c.busy}
                       className="rounded-lg border px-3 py-2 text-left text-xs hover:bg-muted disabled:opacity-50"

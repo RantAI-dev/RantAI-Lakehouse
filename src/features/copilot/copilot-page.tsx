@@ -6,21 +6,6 @@ import { useCopilot } from "./use-copilot";
 import { ChatMessages } from "./chat-messages";
 import { ChatComposer } from "./chat-composer";
 
-const SUGGESTIONS: Record<"ask" | "build", string[]> = {
-  ask: [
-    "Total foreign visitors by region",
-    "Which datasets are about halal?",
-    "Data lineage of visitors by country",
-    "Summarize lakehouse data quality",
-  ],
-  build: [
-    "Build a concise visitors dashboard",
-    "Create a monthly-visitors-by-region line chart",
-    "Rebuild the lakehouse (Bronze→Silver→Gold)",
-    "Check the latest build status",
-  ],
-};
-
 /**
  * Halaman AI Copilot — tampilan chat ala RantAI-Agents: avatar per pesan,
  * welcome ketengah dengan pill saran, composer lembut. RIWAYAT dipindah jadi
@@ -40,14 +25,10 @@ export function CopilotPage() {
               <div className="mb-4 grid size-12 place-items-center rounded-2xl border border-violet-500/20 bg-gradient-to-br from-violet-500/15 to-purple-600/15 text-violet-600 dark:text-violet-400">
                 <Sparkles className="size-6" />
               </div>
-              <h2 className="text-xl font-semibold text-foreground">Hi 👋 How can I help?</h2>
-              <p className="mt-1.5 max-w-md text-sm text-muted-foreground">
-                {c.mode === "ask"
-                  ? "Ask about numbers, datasets, lineage, or quality. Copilot queries ClickHouse and explores the catalog."
-                  : "Ask to build charts/dashboards or build data. Copilot runs real tools and shows the results."}
-              </p>
+              <h2 className="text-xl font-semibold text-foreground">Hi 👋 {c.pageContext.title}</h2>
+              <p className="mt-1.5 max-w-md text-sm text-muted-foreground">{c.pageContext.hint}</p>
               <div className="mt-5 flex flex-wrap justify-center gap-2">
-                {SUGGESTIONS[c.mode].map((s) => (
+                {c.pageContext.suggest[c.mode].map((s) => (
                   <button
                     key={s}
                     onClick={() => void c.send(s)}

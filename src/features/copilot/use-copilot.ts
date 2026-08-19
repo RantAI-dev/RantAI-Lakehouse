@@ -1,8 +1,10 @@
 "use client";
 
 import * as React from "react";
+import { usePathname } from "next/navigation";
 import type { ToolStep } from "./tool-step";
 import { ALL_CAP_KEYS, toolsFromCaps } from "./capabilities";
+import { derivePageContext, type PageContext } from "./page-context";
 
 export type Mode = "ask" | "build";
 export type Msg = {
@@ -28,6 +30,12 @@ function useCopilotState() {
   const [sessionId, setSessionId] = React.useState<string | null>(null);
   const [sessions, setSessions] = React.useState<SessionMeta[]>([]);
   const [enabledCaps, setEnabledCaps] = React.useState<Set<string>>(() => new Set(ALL_CAP_KEYS));
+  const pathname = usePathname();
+  const [pageOverride, setPageOverride] = React.useState<PageContext | null>(null);
+  const pageContext = pageOverride ?? derivePageContext(pathname);
+  const pageContextRef = React.useRef(pageContext);
+  pageContextRef.current = pageContext;
+  const setPageContext = React.useCallback((ctx: PageContext | null) => setPageOverride(ctx), []);
 
   const toggleCap = React.useCallback((key: string) => {
     setEnabledCaps((prev) => {
@@ -72,6 +80,7 @@ function useCopilotState() {
         body: JSON.stringify({
           mode,
           tools: toolsFromCaps(enabledCaps, mode),
+          context: pageContextRef.current?.system,
           messages: next.map((m) => ({ role: m.role, content: m.content })),
         }),
       });
@@ -119,7 +128,7 @@ function useCopilotState() {
 
   return {
     mode, setMode, messages, busy, error, sessionId, sessions,
-    enabledCaps, toggleCap,
+    enabledCaps, toggleCap, pageContext, setPageContext,
     send, newChat, loadSession, removeSession, refreshSessions,
   };
 }

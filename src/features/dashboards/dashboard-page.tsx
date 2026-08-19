@@ -21,6 +21,7 @@ import { ChartBuilder, type ChartDef } from "./chart-builder";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
 import { TileBody } from "./tile-body";
 import { DashboardFilters } from "./dashboard-filters";
+import { useCopilot } from "@/features/copilot/use-copilot";
 
 type Cell = { columns: string[]; rows: Record<string, unknown>[] } | { error: string };
 type KpiMeta = { id: string; title: string; caption?: string; format: string };
@@ -189,6 +190,28 @@ export function DashboardPage() {
   const dashName = boards.find((b) => b.id === board)?.name ?? "Dashboards";
   const kpis = data?.kpis ?? [];
   const charts = data?.charts ?? [];
+
+  // Publish page context to the Copilot so it's aware of THIS dashboard.
+  const { setPageContext } = useCopilot();
+  React.useEffect(() => {
+    if (isDefault) { setPageContext(null); return; }
+    const tiles = charts.map((c) => `"${c.title}" (${c.kind}${c.source !== "builtin" ? `, id ${c.id}` : ""})`).join("; ");
+    setPageContext({
+      key: "dashboard-view",
+      title: `Working on "${dashName}"`,
+      hint: "Create a chart, edit a tile, or ask about this dashboard.",
+      suggest: {
+        ask: ["Explain the charts on this dashboard", "Which category leads here?"],
+        build: ["Add a KPI of total visitors", "Add a table of top countries", "Add a pie of visitors by region"],
+      },
+      system:
+        `The user is viewing the dashboard "${dashName}" (board id: ${board}). ` +
+        `Tiles: ${tiles || "none yet"}. ` +
+        `When creating a chart use board="${board}". To change a tile, use update_chart with its id. ` +
+        `You can also explain what the charts show.`,
+    });
+    return () => setPageContext(null);
+  }, [board, isDefault, dashName, charts, setPageContext]);
 
   // Bangun tile untuk grid.
   const items: GridItem[] = charts.map((spec) => {
