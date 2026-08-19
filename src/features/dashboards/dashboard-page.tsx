@@ -3,7 +3,7 @@
 import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { RefreshCw, Sparkles, Download, Pencil, Eye, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2 } from "lucide-react";
+import { RefreshCw, Sparkles, Download, Pencil, Eye, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Plus, Move } from "lucide-react";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -59,7 +59,7 @@ export function DashboardPage() {
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
   const [year, setYear] = React.useState("all");
-  const [edit, setEdit] = React.useState(false);
+  const [edit, setEdit] = React.useState(true);
   const [layout, setLayout] = React.useState<LayoutMap>({});
   const [filters, setFilters] = React.useState<FilterDef[]>([]);
   const filtersRef = React.useRef<FilterDef[]>([]);
@@ -124,7 +124,13 @@ export function DashboardPage() {
     }
     void load();
   }, [board, isDefault, load]);
-  React.useEffect(() => { if (isDefault) setEdit(false); }, [isDefault]);
+  React.useEffect(() => { setEdit(!isDefault); }, [isDefault]);
+  // Buka /dashboards (demo) → langsung ke dashboard user terbaru bila ada.
+  React.useEffect(() => {
+    if (data && isDefault && data.boards.length > 1) {
+      router.replace(`/dashboards?board=${data.boards[data.boards.length - 1].id}`);
+    }
+  }, [data, isDefault, router]);
 
   // Simpan layout (debounced) untuk dashboard user.
   const saveTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -159,6 +165,14 @@ export function DashboardPage() {
     await fetch(`/api/dashboard/boards?id=${encodeURIComponent(board)}`, { method: "DELETE" });
     notifyChange();
     router.push("/dashboards");
+  }
+  async function newDashboard() {
+    const res = await fetch("/api/dashboard/boards", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "Dashboard baru" }),
+    });
+    const json = await res.json();
+    notifyChange();
+    if (json?.board?.id) router.push(`/dashboards?board=${json.board.id}`);
   }
   async function saveRename() {
     const name = newName.trim();
@@ -223,11 +237,13 @@ export function DashboardPage() {
             <Button variant="outline" size="sm" onClick={() => setFullscreen((f) => !f)} aria-label="Layar penuh">
               {fullscreen ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
             </Button>
-            {!isDefault ? (
+            {isDefault ? (
+              <Button size="sm" onClick={() => void newDashboard()}><Plus className="size-4" /> Dashboard baru</Button>
+            ) : (
               <Button variant={edit ? "default" : "outline"} size="sm" onClick={() => setEdit((e) => !e)}>
-                {edit ? <Eye className="size-4" /> : <Pencil className="size-4" />}{edit ? "Selesai" : "Edit"}
+                {edit ? <Eye className="size-4" /> : <Pencil className="size-4" />}{edit ? "Selesai atur" : "Atur tata letak"}
               </Button>
-            ) : null}
+            )}
             <ChartBuilder board={board} boards={boards} onSaved={load} />
             <div className="relative">
               <Button variant="outline" size="sm" onClick={() => setMenuOpen((o) => !o)} aria-label="Menu"><MoreHorizontal className="size-4" /></Button>
@@ -284,7 +300,15 @@ export function DashboardPage() {
           Dashboard ini masih kosong. Klik <span className="font-medium text-foreground">Chart baru</span> atau minta AI Copilot: <span className="font-medium text-foreground">“bikin chart …”</span>.
         </div>
       ) : (
-        <DashboardGrid items={items} layout={layout} editable={edit && !isDefault} onLayoutChange={persistLayout} />
+        <>
+          {edit && !isDefault ? (
+            <div className="flex items-center gap-2 rounded-lg border border-dashed border-primary/30 bg-primary/5 px-3 py-1.5 text-xs text-muted-foreground">
+              <Move className="size-3.5 text-primary" />
+              Mode atur: <span className="font-medium text-foreground">seret header</span> untuk pindah, <span className="font-medium text-foreground">tarik pojok kanan-bawah</span> untuk ubah ukuran. Ikon ✏️/🗑️ per tile untuk atur/hapus. Otomatis tersimpan.
+            </div>
+          ) : null}
+          <DashboardGrid items={items} layout={layout} editable={edit && !isDefault} onLayoutChange={persistLayout} />
+        </>
       )}
 
       {editing ? (

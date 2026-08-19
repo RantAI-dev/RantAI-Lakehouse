@@ -57,6 +57,11 @@ export function DashboardGrid({
   const [drag, setDrag] = React.useState<Drag | null>(null);
   const [preview, setPreview] = React.useState<LayoutMap | null>(null);
 
+  // Ukur lebar SEKETIKA (useLayoutEffect) agar tile tak collapse di render awal,
+  // plus ResizeObserver untuk perubahan lebar.
+  React.useLayoutEffect(() => {
+    if (ref.current) setWidth(ref.current.getBoundingClientRect().width);
+  }, []);
   React.useEffect(() => {
     if (!ref.current) return;
     const ro = new ResizeObserver((e) => setWidth(e[0].contentRect.width));
@@ -146,9 +151,10 @@ export function DashboardGrid({
           <div key={it.id} style={boxStyle(b)} className={cn("transition-[left,top,width,height]", dragging && "z-20 transition-none")}>
             <div className={cn("flex h-full flex-col overflow-hidden rounded-xl border border-border bg-card shadow-[0px_1px_2px_0px_rgba(0,0,0,0.05)]", dragging && "ring-2 ring-primary/40")}>
               {/* Header / drag handle */}
-              <div className={cn("flex items-center gap-2 border-b border-border px-3 py-1.5", editable && "cursor-move select-none")}
+              <div className={cn("flex items-center gap-2 border-b border-border px-3 py-1.5", editable && "cursor-move select-none bg-muted/40")}
+                   style={editable ? { touchAction: "none" } : undefined}
                    onPointerDown={editable ? (e) => startDrag(e, it.id, "move") : undefined}>
-                {editable ? <GripVertical className="size-3.5 shrink-0 text-muted-foreground" /> : null}
+                {editable ? <GripVertical className="size-4 shrink-0 text-muted-foreground" /> : null}
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-semibold leading-tight">{it.title}</p>
                   {it.subtitle ? <p className="truncate text-[11px] text-muted-foreground">{it.subtitle}</p> : null}
@@ -172,14 +178,15 @@ export function DashboardGrid({
               {/* Body */}
               <div className="min-h-0 flex-1 p-2">{it.body}</div>
             </div>
-            {/* Resize handle */}
+            {/* Resize handle (pojok kanan-bawah, jelas) */}
             {editable ? (
               <div
                 onPointerDown={(e) => startDrag(e, it.id, "resize")}
-                className="absolute bottom-0 right-0 z-10 size-4 cursor-se-resize"
+                className="absolute -bottom-1 -right-1 z-10 grid size-6 cursor-se-resize place-items-center rounded-md border border-border bg-card text-muted-foreground shadow-sm hover:bg-muted hover:text-foreground"
                 style={{ touchAction: "none" }}
+                title="Tarik untuk ubah ukuran"
               >
-                <svg viewBox="0 0 10 10" className="size-full text-muted-foreground/60"><path d="M9 1v8H1" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" transform="translate(-0.5,0.5)" /></svg>
+                <svg viewBox="0 0 10 10" className="size-3"><path d="M9 3v6H3" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" /></svg>
               </div>
             ) : null}
           </div>
