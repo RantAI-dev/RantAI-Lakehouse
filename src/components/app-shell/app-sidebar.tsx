@@ -60,6 +60,11 @@ export function AppSidebar() {
     fetch("/api/dashboard/boards").then((r) => r.json()).then((j) => setDashboards(j.boards ?? [])).catch(() => {})
   }, [])
   React.useEffect(() => { if (onDashboards) loadDashboards() }, [onDashboards, loadDashboards])
+  React.useEffect(() => {
+    const h = () => loadDashboards()
+    window.addEventListener("dashboards:changed", h)
+    return () => window.removeEventListener("dashboards:changed", h)
+  }, [loadDashboards])
   const newDashboard = async () => {
     const res = await fetch("/api/dashboard/boards", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "Dashboard baru" }),

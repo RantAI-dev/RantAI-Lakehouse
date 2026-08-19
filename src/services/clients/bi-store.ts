@@ -119,24 +119,34 @@ export async function createBoard(name: string): Promise<Board> {
   return { id, name: clean, layout: {} };
 }
 
+// INSERT (bukan ALTER UPDATE) — ReplacingMergeTree, instan & konsisten.
+async function upsertBoard(id: string, name: string, layout: LayoutMap): Promise<void> {
+  await chExec(
+    `INSERT INTO console.bi_board (id, name, layout_json) VALUES ('${esc(id)}', '${esc(name)}', '${esc(JSON.stringify(layout ?? {}))}')`,
+  );
+}
+
 export async function renameBoard(id: string, name: string): Promise<void> {
   await ensureBiTable();
   const clean = String(name ?? "").trim();
   if (!clean) throw new Error("nama wajib.");
-  await chExec(`ALTER TABLE console.bi_board UPDATE name='${esc(clean)}' WHERE id='${esc(id)}'`);
+  const b = await getBoard(id);
+  await upsertBoard(id, clean, b?.layout ?? {});
 }
 
 export async function updateBoardLayout(id: string, layout: LayoutMap): Promise<void> {
   await ensureBiTable();
-  await chExec(`ALTER TABLE console.bi_board UPDATE layout_json='${esc(JSON.stringify(layout ?? {}))}' WHERE id='${esc(id)}'`);
+  const b = await getBoard(id);
+  await upsertBoard(id, b?.name ?? "Dashboard", layout ?? {});
 }
 
 export async function deleteBoard(id: string): Promise<void> {
   await ensureBiTable();
   const safe = esc(id);
   await chExec(`INSERT INTO console.bi_board (id, name, is_deleted) VALUES ('${safe}', '', 1)`);
-  // Hapus juga chart di dalamnya (soft-delete) biar tak yatim.
-  await chExec(`ALTER TABLE console.bi_chart UPDATE is_deleted=1 WHERE board='${safe}'`);
+  // Hapus chart di dalamnya via tombstone (konsisten, bukan mutasi async).
+  const charts = (await listStoredCharts()).filter((c) => c.board === id);
+  for (const c of charts) await deleteChart(c.id);
 }
 
 /** Duplikat dashboard beserta chart & tata letaknya (id baru). */

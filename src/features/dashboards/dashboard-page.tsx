@@ -6,9 +6,13 @@ import { useTheme } from "next-themes";
 import { RefreshCw, Sparkles, Download, Pencil, Eye, Copy, Trash2, MoreHorizontal } from "lucide-react";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogClose,
+} from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import type { LayoutMap } from "@/services/clients/bi-store";
@@ -57,6 +61,9 @@ export function DashboardPage() {
   const [layout, setLayout] = React.useState<LayoutMap>({});
   const [editing, setEditing] = React.useState<{ id: string; def: ChartDef } | null>(null);
   const [menuOpen, setMenuOpen] = React.useState(false);
+  const [renameOpen, setRenameOpen] = React.useState(false);
+  const [newName, setNewName] = React.useState("");
+  const notifyChange = () => { try { window.dispatchEvent(new Event("dashboards:changed")); } catch { /* ignore */ } };
 
   const load = React.useCallback(async () => {
     setLoading(true); setError(null);
@@ -102,13 +109,25 @@ export function DashboardPage() {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ duplicate: board }),
     });
     const json = await res.json();
+    notifyChange();
     if (json?.board?.id) router.push(`/dashboards?board=${json.board.id}`);
   }
   async function deleteDashboard() {
     setMenuOpen(false);
     if (isDefault) return;
     await fetch(`/api/dashboard/boards?id=${encodeURIComponent(board)}`, { method: "DELETE" });
+    notifyChange();
     router.push("/dashboards");
+  }
+  async function saveRename() {
+    const name = newName.trim();
+    if (!name || isDefault) return;
+    await fetch("/api/dashboard/boards", {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: board, name }),
+    });
+    setRenameOpen(false);
+    notifyChange();
+    void load();
   }
 
   const boards = data?.boards ?? [{ id: "default", name: "Utama" }];
@@ -163,6 +182,9 @@ export function DashboardPage() {
                 <>
                   <div className="fixed inset-0 z-10" onClick={() => setMenuOpen(false)} />
                   <div className="absolute right-0 z-20 mt-1 w-44 rounded-lg border border-border bg-card p-1 shadow-xl">
+                    {!isDefault ? (
+                      <button onClick={() => { setNewName(dashName); setRenameOpen(true); setMenuOpen(false); }} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Pencil className="size-4" /> Ganti nama</button>
+                    ) : null}
                     <a href="/api/dashboard/export" download className="flex items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Download className="size-4" /> Ekspor YAML</a>
                     <button onClick={() => void duplicateDashboard()} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Copy className="size-4" /> Duplikat</button>
                     {!isDefault ? (
@@ -211,6 +233,17 @@ export function DashboardPage() {
           editId={editing.id} initial={editing.def} board={board} boards={boards}
           onSaved={() => { setEditing(null); void load(); }} />
       ) : null}
+
+      <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader><DialogTitle>Ganti nama dashboard</DialogTitle></DialogHeader>
+          <Input autoFocus value={newName} onChange={(e) => setNewName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void saveRename(); }} placeholder="Nama dashboard" />
+          <DialogFooter>
+            <DialogClose render={<Button variant="ghost" size="sm" />}>Batal</DialogClose>
+            <Button size="sm" onClick={() => void saveRename()}>Simpan</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
