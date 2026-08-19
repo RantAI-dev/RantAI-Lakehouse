@@ -172,7 +172,7 @@ export function AppSidebar() {
 
         {/* Sub-menu section aktif — di bawah sidebar, dipisah garis (mode melebar). */}
         {!iconMode && activeGroup && activeGroup.items.length > 1 ? (
-          <SidebarGroup className="mt-auto gap-0 border-t border-sidebar-border px-2 pb-1 pt-2">
+          <SidebarGroup className="mt-1 gap-0 border-t border-sidebar-border px-2 pb-1 pt-2">
             <SidebarGroupLabel className="h-6 px-2 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">
               {activeGroup.label}
             </SidebarGroupLabel>
