@@ -1,9 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { Plus, Sparkles, X } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/utils";
+import { Sparkles } from "lucide-react";
 import { useCopilot } from "./use-copilot";
 import { ChatMessages } from "./chat-messages";
 import { ChatComposer } from "./chat-composer";
@@ -34,40 +32,7 @@ export function CopilotPage() {
 
   return (
     <div className="flex flex-col gap-3">
-      {/* Riwayat — bar horizontal di bawah navbar */}
-      <div className="flex items-center gap-1.5 overflow-x-auto border-b border-border pb-2">
-        <Button size="sm" variant="outline" className="shrink-0" onClick={c.newChat}>
-          <Plus className="size-4" /> Baru
-        </Button>
-        {c.sessions.map((s) => {
-          const active = s.id === c.sessionId;
-          return (
-            <div
-              key={s.id}
-              className={cn(
-                "group inline-flex shrink-0 items-center gap-1 rounded-full border px-3 py-1 text-xs",
-                active ? "border-primary/30 bg-primary/10 text-primary" : "border-border text-muted-foreground hover:bg-muted",
-              )}
-            >
-              <button onClick={() => void c.loadSession(s.id)} className="max-w-[160px] truncate" title={s.title}>
-                {s.title}
-              </button>
-              <button
-                onClick={() => void c.removeSession(s.id)}
-                aria-label="Hapus percakapan"
-                className="opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
-              >
-                <X className="size-3" />
-              </button>
-            </div>
-          );
-        })}
-        {c.sessions.length === 0 ? (
-          <span className="px-1 text-xs text-muted-foreground">Belum ada percakapan.</span>
-        ) : null}
-      </div>
-
-      {/* Chat */}
+      {/* Chat (riwayat ada di sidebar) */}
       <div className="mx-auto flex w-full max-w-3xl flex-col">
         <div className="min-h-[56vh] overflow-y-auto pr-0.5">
           {c.messages.length === 0 ? (

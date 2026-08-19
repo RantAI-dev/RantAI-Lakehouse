@@ -4,8 +4,9 @@ import * as React from "react"
 import { createPortal } from "react-dom"
 import Image from "next/image"
 import Link from "next/link"
-import { usePathname } from "next/navigation"
-import { CircleUserRound } from "lucide-react"
+import { usePathname, useRouter } from "next/navigation"
+import { CircleUserRound, Plus, MessageSquare, X } from "lucide-react"
+import { useCopilot } from "@/features/copilot/use-copilot"
 import {
   Sidebar,
   SidebarContent,
@@ -47,6 +48,9 @@ export function AppSidebar() {
   const { state } = useSidebar()
   const iconMode = state === "collapsed"
   const activeGroup = groups.find((g) => g.items.some((it) => it.href === activeHref))
+  const router = useRouter()
+  const copilot = useCopilot()
+  const onCopilot = pathname.startsWith("/copilot")
 
   const [flyout, setFlyout] = React.useState<FlyoutState>(null)
   const flyoutRef = React.useRef<HTMLDivElement>(null)
@@ -170,8 +174,59 @@ export function AppSidebar() {
           </SidebarMenu>
         </SidebarGroup>
 
-        {/* Sub-menu section aktif — di bawah sidebar, dipisah garis (mode melebar). */}
-        {!iconMode && activeGroup && activeGroup.items.length > 1 ? (
+        {/* Slot bawah — RIWAYAT saat di AI Copilot, atau sub-menu section aktif. */}
+        {!iconMode && onCopilot ? (
+          <SidebarGroup className="mt-1 min-h-0 flex-1 gap-0 border-t border-sidebar-border px-2 pb-1 pt-2">
+            <div className="flex items-center justify-between pr-1">
+              <SidebarGroupLabel className="h-6 px-2 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">
+                Riwayat
+              </SidebarGroupLabel>
+              <button
+                type="button"
+                onClick={() => { copilot.newChat(); router.push("/copilot") }}
+                aria-label="Percakapan baru"
+                title="Percakapan baru"
+                className="grid size-6 place-items-center rounded-md text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground"
+              >
+                <Plus className="size-4" />
+              </button>
+            </div>
+            <div className="mt-0.5 flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto">
+              {copilot.sessions.length === 0 ? (
+                <p className="px-2 py-1.5 text-xs text-sidebar-foreground/50">Belum ada percakapan.</p>
+              ) : (
+                copilot.sessions.map((s) => {
+                  const active = s.id === copilot.sessionId
+                  return (
+                    <div
+                      key={s.id}
+                      className={cn(
+                        "group/hist flex items-center gap-1.5 rounded-md px-2 py-1.5 text-sm",
+                        active ? "bg-sidebar-accent text-sidebar-primary" : "text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+                      )}
+                    >
+                      <MessageSquare className="size-3.5 shrink-0 opacity-70" />
+                      <button
+                        onClick={() => { void copilot.loadSession(s.id); router.push("/copilot") }}
+                        className="flex-1 truncate text-left"
+                        title={s.title}
+                      >
+                        {s.title}
+                      </button>
+                      <button
+                        onClick={() => void copilot.removeSession(s.id)}
+                        aria-label="Hapus"
+                        className="shrink-0 opacity-0 hover:text-destructive group-hover/hist:opacity-100"
+                      >
+                        <X className="size-3.5" />
+                      </button>
+                    </div>
+                  )
+                })
+              )}
+            </div>
+          </SidebarGroup>
+        ) : !iconMode && activeGroup && activeGroup.items.length > 1 ? (
           <SidebarGroup className="mt-1 gap-0 border-t border-sidebar-border px-2 pb-1 pt-2">
             <SidebarGroupLabel className="h-6 px-2 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">
               {activeGroup.label}

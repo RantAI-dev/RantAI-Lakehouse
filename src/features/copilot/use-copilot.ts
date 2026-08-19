@@ -17,12 +17,12 @@ export type Msg = {
 export type SessionMeta = { id: string; title: string; mode: string; updatedAt?: string };
 
 /**
- * Otak AI Copilot yang DIPAKAI BERSAMA oleh chat dock global (semua halaman) &
- * halaman /copilot. Mengurus percakapan (mode Ask/Build, kirim, tool loop) DAN
- * riwayat (simpan/muat sesi dari console.chat_session). Satu sumber kebenaran →
- * dock & halaman selalu konsisten.
+ * Otak AI Copilot yang DIPAKAI BERSAMA (lewat context) oleh chat dock global,
+ * halaman /copilot, DAN daftar riwayat di sidebar. Mengurus percakapan (mode
+ * Ask/Build, kirim, tool loop) DAN riwayat (simpan/muat sesi dari
+ * console.chat_session). Satu instance → semua tampilan konsisten.
  */
-export function useCopilot() {
+function useCopilotState() {
   const [mode, setMode] = React.useState<Mode>("ask");
   const [messages, setMessages] = React.useState<Msg[]>([]);
   const [busy, setBusy] = React.useState(false);
@@ -124,4 +124,20 @@ export function useCopilot() {
     enabledTools, toggleTool,
     send, newChat, loadSession, removeSession, refreshSessions,
   };
+}
+
+type CopilotValue = ReturnType<typeof useCopilotState>;
+const CopilotContext = React.createContext<CopilotValue | null>(null);
+
+/** Provider tunggal — bungkus app agar dock/halaman/sidebar berbagi 1 percakapan. */
+export function CopilotProvider({ children }: { children: React.ReactNode }) {
+  const value = useCopilotState();
+  return React.createElement(CopilotContext.Provider, { value }, children);
+}
+
+/** Akses otak Copilot bersama. */
+export function useCopilot(): CopilotValue {
+  const ctx = React.useContext(CopilotContext);
+  if (!ctx) throw new Error("useCopilot must be used within a CopilotProvider");
+  return ctx;
 }
