@@ -3,7 +3,7 @@
 import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { RefreshCw, Sparkles, Download, Pencil, Eye, Copy, Trash2, MoreHorizontal } from "lucide-react";
+import { RefreshCw, Sparkles, Download, Pencil, Eye, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2 } from "lucide-react";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -68,6 +68,8 @@ export function DashboardPage() {
   const [menuOpen, setMenuOpen] = React.useState(false);
   const [renameOpen, setRenameOpen] = React.useState(false);
   const [newName, setNewName] = React.useState("");
+  const [fullscreen, setFullscreen] = React.useState(false);
+  const [autoSec, setAutoSec] = React.useState("0");
   const notifyChange = () => { try { window.dispatchEvent(new Event("dashboards:changed")); } catch { /* ignore */ } };
 
   const load = React.useCallback(async () => {
@@ -96,6 +98,21 @@ export function DashboardPage() {
   // Ganti dashboard → adopsi ulang filter tersimpan board itu.
   React.useEffect(() => { adoptingRef.current = true; filtersRef.current = []; setFilters([]); }, [board]);
   React.useEffect(() => { void load(); }, [load]);
+
+  // Auto-refresh berkala (presentasi).
+  React.useEffect(() => {
+    const s = Number(autoSec);
+    if (!s) return;
+    const t = setInterval(() => void load(), s * 1000);
+    return () => clearInterval(t);
+  }, [autoSec, load]);
+  // Esc keluar fullscreen.
+  React.useEffect(() => {
+    if (!fullscreen) return;
+    const h = (e: KeyboardEvent) => { if (e.key === "Escape") setFullscreen(false); };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [fullscreen]);
 
   const applyFilters = React.useCallback((next: FilterDef[]) => {
     filtersRef.current = next;
@@ -184,7 +201,7 @@ export function DashboardPage() {
   });
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6")}>
       <PageHeader
         title={dashName}
         description={isDefault ? "Dashboard bawaan (contoh). Buat dashboard sendiri dari sidebar untuk mengatur tata letak." : "Kanvas dashboard — seret & ubah ukuran tile di mode Edit. Tersimpan otomatis."}
@@ -194,6 +211,18 @@ export function DashboardPage() {
               <SelectTrigger className="h-7 w-[120px] text-xs"><SelectValue /></SelectTrigger>
               <SelectContent>{YEARS.map((y) => <SelectItem key={y} value={y}>{y === "all" ? "Semua tahun" : `Tahun ${y}`}</SelectItem>)}</SelectContent>
             </Select>
+            <Select value={autoSec} onValueChange={(v) => setAutoSec(v ?? "0")}>
+              <SelectTrigger className="h-7 w-[110px] text-xs"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="0">Manual</SelectItem>
+                <SelectItem value="30">Tiap 30s</SelectItem>
+                <SelectItem value="60">Tiap 1m</SelectItem>
+                <SelectItem value="300">Tiap 5m</SelectItem>
+              </SelectContent>
+            </Select>
+            <Button variant="outline" size="sm" onClick={() => setFullscreen((f) => !f)} aria-label="Layar penuh">
+              {fullscreen ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
+            </Button>
             {!isDefault ? (
               <Button variant={edit ? "default" : "outline"} size="sm" onClick={() => setEdit((e) => !e)}>
                 {edit ? <Eye className="size-4" /> : <Pencil className="size-4" />}{edit ? "Selesai" : "Edit"}

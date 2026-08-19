@@ -20,6 +20,7 @@ export type ChartDef = {
   title?: string; subtitle?: string; mart?: string; kind?: ChartKind;
   dimension?: string; measures?: string[]; breakdown?: string;
   aggregate?: string; span?: 1 | 2; board?: string; text?: string; caption?: string;
+  order?: "desc" | "asc" | "none"; limit?: number;
 };
 type BoardOpt = { id: string; name: string };
 
@@ -76,6 +77,8 @@ export function ChartBuilder({
   const [span, setSpan] = React.useState<1 | 2>(1);
   const [caption, setCaption] = React.useState("");
   const [text, setText] = React.useState("");
+  const [order, setOrder] = React.useState<"desc" | "asc" | "none">("desc");
+  const [limit, setLimit] = React.useState(20);
   const [targetBoard, setTargetBoard] = React.useState(board);
   const isText = kind === "text";
   const isKpi = kind === "kpi";
@@ -101,6 +104,8 @@ export function ChartBuilder({
       setBreakdown(initial.breakdown ?? "");
       setCaption(initial.caption ?? "");
       setText(initial.text ?? "");
+      setOrder((initial.order as "desc" | "asc" | "none") ?? "desc");
+      setLimit(initial.limit ?? 20);
       setTargetBoard(initial.board ?? board);
       const m = initial.mart ?? "";
       setMart(m);
@@ -120,7 +125,7 @@ export function ChartBuilder({
   function reset() {
     setTitle(""); setMart(""); setKind("hbar"); setDimension("");
     setMeasure(""); setMeasure2(""); setBreakdown(""); setAggregate("sum"); setSpan(1);
-    setCaption(""); setText("");
+    setCaption(""); setText(""); setOrder("desc"); setLimit(20);
     setTargetBoard(board); setFields(null); setError(null);
   }
 
@@ -147,6 +152,7 @@ export function ChartBuilder({
       payload = {
         title, mart, kind, dimension, measures, aggregate, span, board: targetBoard,
         breakdown: canBreakdown && breakdown ? breakdown : undefined,
+        order, limit,
       };
     }
     if (isEdit) payload.id = editId;
@@ -280,7 +286,25 @@ export function ChartBuilder({
                   <Label>Caption (opsional)</Label>
                   <Input value={caption} onChange={(e) => setCaption(e.target.value)} placeholder="mis. kunjungan mancanegara (akumulasi)" />
                 </div>
-              ) : null}
+              ) : (
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="grid gap-1.5">
+                    <Label>Urutan</Label>
+                    <Select value={order} onValueChange={(v) => setOrder((v as "desc" | "asc" | "none") ?? "desc")}>
+                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="desc">Tertinggi dulu</SelectItem>
+                        <SelectItem value="asc">Terendah dulu</SelectItem>
+                        <SelectItem value="none">Alami (per dimensi)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="grid gap-1.5">
+                    <Label>Batas (Top N)</Label>
+                    <Input type="number" min={1} max={100} value={limit} onChange={(e) => setLimit(Math.max(1, Math.min(100, Number(e.target.value) || 20)))} />
+                  </div>
+                </div>
+              )}
 
               {canBreakdown ? (
                 <div className="grid gap-1.5">
