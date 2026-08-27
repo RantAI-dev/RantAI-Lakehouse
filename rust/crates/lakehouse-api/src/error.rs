@@ -17,13 +17,7 @@ use crate::json::ApiJson;
 /// Wraps an [`ApiError`] so it can be returned directly from an axum
 /// handler and rendered as `{"error": "<message>"}` at the right status
 /// code.
-///
-/// Not yet constructed outside tests: route handlers that produce it land
-/// in later tasks. `#[allow(dead_code)]` (not `#[expect(dead_code)]`, which
-/// would itself warn once a real handler starts using this) documents that
-/// this is intentional scaffolding, not an oversight.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct ApiRejection(pub ApiError);
 
 impl<E: Into<ApiError>> From<E> for ApiRejection {
@@ -35,11 +29,8 @@ impl<E: Into<ApiError>> From<E> for ApiRejection {
 /// The JSON body shape every error response takes, matching the
 /// TypeScript route handlers' `NextResponse.json({ error: msg }, { status })`.
 ///
-/// Constructed only from [`ApiRejection::into_response`], which itself is
-/// unreachable from `main` until later tasks add real handlers — see the
-/// note on [`ApiRejection`].
+/// Constructed only from [`ApiRejection::into_response`].
 #[derive(Debug, Serialize)]
-#[allow(dead_code)]
 struct ErrorBody {
     error: String,
 }
@@ -61,7 +52,6 @@ impl IntoResponse for ApiRejection {
 }
 
 /// The result type every route handler returns.
-#[allow(dead_code)]
 pub type ApiResult<T> = Result<T, ApiRejection>;
 
 #[cfg(test)]
