@@ -280,20 +280,42 @@ fn new_public_token() -> String {
 
 // ── DDL bootstrap ───────────────────────────────────────────────────────
 
+/// Process-wide once-only guard for [`ensure_bi_table`]'s DDL bootstrap,
+/// matching the TS module-level `let ensured = false` cache in
+/// `ensureBiTable` (`bi-store.ts:57`).
+///
+/// Measured against the live cluster, the 8-statement DDL sequence costs
+/// ~168ms per call; `ensure_bi_table` is invoked at the top of every public
+/// function in this module (14 call sites), so a single `GET
+/// /api/dashboard`-shaped request that touches boards and charts issued it
+/// repeatedly — ~335ms of pure no-op DDL round-trips before any real work,
+/// and `delete_board` on a 10-chart board issued ~96 DDL statements (~2s).
+/// Caching the *outcome* here (not just documenting the option) makes
+/// repeat calls free, matching the TS.
+static BI_TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
 /// Create the `console` database and `bi_chart`/`bi_board` tables if they do
 /// not already exist (idempotent). Ports `ensureBiTable` in `bi-store.ts`.
 ///
-/// Unlike the TS module-level `let ensured = false` cache (once per Node
-/// process), this always re-issues the `IF NOT EXISTS`/`ADD COLUMN IF NOT
-/// EXISTS` statements — they are naturally idempotent in `ClickHouse`, so the
-/// only cost of not caching is a handful of extra no-op DDL round-trips per
-/// call. Callers that want the TS's once-per-process behavior should cache
-/// at a higher layer (e.g. `OnceCell` in `AppState`).
+/// Runs the DDL bootstrap at most once per process (see
+/// [`BI_TABLE_ENSURED`]), matching the TS's once-per-process behavior. A
+/// failed attempt is not cached — the next call retries the DDL, since a
+/// transient failure (e.g. `ClickHouse` briefly unreachable) shouldn't
+/// permanently wedge every subsequent call into always failing.
 ///
 /// # Errors
 ///
 /// Returns [`ChError`] if any DDL statement fails.
 pub async fn ensure_bi_table(ch: &ChClient) -> Result<(), ChError> {
+    BI_TABLE_ENSURED
+        .get_or_try_init(|| ensure_bi_table_uncached(ch))
+        .await
+        .map(drop)
+}
+
+/// The actual DDL bootstrap, run at most once per process by
+/// [`ensure_bi_table`].
+async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
     ch.exec("CREATE DATABASE IF NOT EXISTS console", None)
         .await?;
     ch.exec(
@@ -1630,7 +1652,47 @@ impl StoredChartSpec {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
+
+    fn client(url: &str) -> ChClient {
+        ChClient::new(url.to_owned(), "default".to_owned(), String::new())
+    }
+
+    /// Regression test for H1 (`ensure_bi_table` re-issuing all 8 DDL
+    /// statements on every call): the first call to any public function
+    /// must run the DDL bootstrap, but every call after that — across the
+    /// whole process, matching the TS's module-level `ensured` flag — must
+    /// be free. `BI_TABLE_ENSURED` is a crate-wide static, so this is the
+    /// only test in the crate allowed to exercise `ensure_bi_table`
+    /// end-to-end (a second such test would observe an already-warm cache
+    /// and could pass for the wrong reason, or race depending on test
+    /// execution order).
+    #[tokio::test]
+    async fn ensure_bi_table_runs_ddl_at_most_once_per_process() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
+            .mount(&server)
+            .await;
+
+        let ch = client(&server.uri());
+        ensure_bi_table(&ch).await.unwrap();
+        let first_call_requests = server.received_requests().await.unwrap().len();
+        assert_eq!(
+            first_call_requests, 8,
+            "first call should issue all 8 DDL statements"
+        );
+
+        ensure_bi_table(&ch).await.unwrap();
+        let after_second_call = server.received_requests().await.unwrap().len();
+        assert_eq!(
+            after_second_call, first_call_requests,
+            "second call must be a no-op (cached), matching the TS's once-per-process guard"
+        );
+    }
 
     #[test]
     fn parse_layout_handles_empty_and_malformed_json() {
