@@ -11,10 +11,21 @@ mod overview;
 mod storage;
 mod support;
 
+use std::time::Duration;
+
 use axum::Router;
+use axum::http::StatusCode;
 use axum::routing::get;
+use tower_http::timeout::TimeoutLayer;
 
 use crate::state::AppState;
+
+/// Per-request timeout, matching `export const maxDuration = 60` on the
+/// TypeScript route handlers (e.g. `src/app/api/query/run/route.ts:5`).
+/// Next.js enforces that as a platform-level function deadline; here it's a
+/// `tower_http` middleware layer wrapping every route — different
+/// mechanism, same bound, so no request can hang the service past 60s.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Build the application router with `state` threaded through every
 /// handler.
@@ -40,6 +51,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/governance/lineage", get(governance::lineage))
         .route("/api/governance/{kind}", get(governance::get))
         .route("/api/storage", get(storage::get))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            REQUEST_TIMEOUT,
+        ))
         .with_state(state)
 }
 

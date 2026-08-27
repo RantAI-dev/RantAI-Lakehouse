@@ -137,10 +137,35 @@ pub struct ChClient {
 
 impl ChClient {
     /// Build a client targeting `url`, authenticating as `user`/`password`.
+    ///
+    /// The underlying `reqwest::Client` has a 60s request timeout, matching
+    /// `export const maxDuration = 60` on the TypeScript route handlers
+    /// (e.g. `src/app/api/query/run/route.ts:5`) — the two run under
+    /// different mechanisms (a platform-enforced function deadline in
+    /// Next.js vs. a client-side request timeout here) but bound the same
+    /// worst case: neither lets a single `ClickHouse` request hang the
+    /// service indefinitely.
+    ///
+    /// # Panics
+    ///
+    /// Never, in practice: `reqwest::ClientBuilder::build` only fails on a
+    /// malformed TLS backend configuration, which cannot occur with the
+    /// fixed `rustls-tls` feature set this crate builds with. `unwrap`s are
+    /// otherwise denied by this workspace's lints, so this is the one
+    /// deliberate exception, documented rather than silently allowed.
     #[must_use]
+    #[allow(
+        clippy::unwrap_used,
+        reason = "ClientBuilder::build cannot fail with this crate's fixed \
+                  TLS feature set; see the doc comment above"
+    )]
     pub fn new(url: String, user: String, password: String) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap();
         Self {
-            client: reqwest::Client::new(),
+            client,
             url,
             user,
             password,
