@@ -11,7 +11,7 @@
   "status": 200,
   "contentType": "application/json;charset=utf-8",
   "body": {
-    "sql": "<redacted:41>",
+    "sql": "SELECT * FROM serving.mart_wisman LIMIT 5",
     "explanation": "<redacted:101>",
     "assumptions": [
       "<redacted:67>",

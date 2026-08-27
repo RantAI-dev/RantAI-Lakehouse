@@ -10,8 +10,8 @@
   "status": 200,
   "contentType": "application/json;charset=utf-8",
   "body": {
-    "question": "<redacted:67>",
-    "sql": "<redacted:96>",
+    "question": "Berapa total jumlah wisatawan mancanegara per tahun di mart_wisman?",
+    "sql": "SELECT tahun, SUM(jumlah) AS total_wisman FROM serving.mart_wisman GROUP BY tahun ORDER BY tahun",
     "columns": [
       "tahun",
       "total_wisman"
@@ -31,15 +31,15 @@
     "steps": [
       {
         "step": "skema",
-        "detail": "<redacted:48>"
+        "detail": "Membaca skema mart Gold + Silver dari lakehouse."
       },
       {
         "step": "generate",
-        "detail": "<redacted:96>"
+        "detail": "SELECT tahun, SUM(jumlah) AS total_wisman FROM serving.mart_wisman GROUP BY tahun ORDER BY tahun"
       },
       {
         "step": "jalankan",
-        "detail": "<redacted:11>"
+        "detail": "OK, 1 baris"
       }
     ]
   }

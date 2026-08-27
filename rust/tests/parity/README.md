@@ -28,13 +28,27 @@ somebody re-captures. Three layers:
    tokens, bare 64-hex keys, and JWTs. This layer exists because the first real
    leak was the embed HMAC signing secret returned by `/api/dashboard/embed-info`
    — a value that was on nobody's list.
-3. **Free text** (`REDACT_TEXT_IN` × `REDACT_TEXT_KEYS`) — real chat sessions
-   and live model output become `<redacted:N>` length markers. Structure is
-   untouched, and the text was never assertable anyway since model output
-   varies per call.
+3. **Known credential keys** (`REDACT_KEYS_ALWAYS`) — `secret`, `sampleToken`,
+   and friends are redacted by NAME, everywhere, regardless of shape. This is
+   the primary defence for `/api/dashboard/embed-info`: `EMBED_SECRET` may be
+   operator-supplied as uppercase hex, base64, or a passphrase, and layer 2
+   would match none of those.
+4. **Sensitive free text** (`REDACT_TEXT_IN` × `REDACT_TEXT_KEYS`) — real chat
+   sessions and model prose become `<redacted:N>` length markers, preserving
+   structure.
 
-`check-no-secrets.sh` matches on shape, not on a known-value list, and exits
-non-zero on any hit. Run it in CI alongside the parity test.
+**Redaction is for sensitivity; normalization is for non-determinism.** These
+are separate problems with separate owners, and conflating them cost real
+assertion coverage twice during setup. A field that merely *varies* per call
+(generated SQL, timestamps, run ids) stays in the corpus and is normalized by
+the harness. Only what must not be persisted gets redacted. Concretely: `sql`
+and `question` are NOT redacted — public business SQL and our own synthetic
+test input — while `content` and `answer` are.
+
+`check-no-secrets.sh` matches on shape, not on a known-value list, covering
+hex secrets (any case), JWTs, provider keys, webhook URLs, credentials in URLs,
+and email addresses. It runs in CI as the `parity-corpus-secrets` job and
+should be run locally before committing any re-capture.
 
 ## Known non-deterministic captures
 

@@ -107,9 +107,28 @@ const REDACT_TEXT_IN = new Set([
 ])
 
 /**
- * Keys whose string values are free text. `detail`, `explanation`, and
- * `assumptions` are included because model output reaches them too — an
- * earlier hand-sanitization pass missed exactly those.
+ * Keys holding SENSITIVE free text: real user messages and model prose from
+ * persisted sessions.
+ *
+ * The distinction that matters here, and that two earlier passes got wrong:
+ * **redaction is for sensitivity, normalization is for non-determinism.**
+ * They are different problems with different owners. Redacting a field merely
+ * because it varies per call pushes work the parity harness already does into
+ * the corpus, and destroys assertable structure on the way. So this set holds
+ * only what must not be persisted — not everything that changes.
+ *
+ * Deliberately NOT included:
+ *  - `sql` — LLM-generated, but it is public business SQL over tourism marts,
+ *    carrying no credential or personal data. Redacting it while the identical
+ *    text sits in `steps[].detail` produced the inconsistency this comment
+ *    exists to prevent. Non-determinism here is the harness's job.
+ *  - `question` — in `agent/*` this is the synthetic question WE sent, echoed
+ *    verbatim by the handler, so it is deterministic and worth asserting on.
+ *    Real user questions in persisted sessions arrive under `content`, which
+ *    is redacted. Redacting it would also achieve nothing: the same plaintext
+ *    sits in `request.body.question`, since redaction applies only to responses.
+ *  - `detail` — only `steps[1].detail` is model-generated; the rest are
+ *    hardcoded literals the Rust port must reproduce byte-for-byte.
  */
 const REDACT_TEXT_KEYS = new Set([
   "content",
@@ -117,24 +136,53 @@ const REDACT_TEXT_KEYS = new Set([
   "answer",
   "text",
   "summary",
-  "sql",
-  "detail",
   "explanation",
   "assumptions",
-  "question",
 ])
 
-function redactText(value: unknown, key?: string): unknown {
+/**
+ * Response keys that are credentials by definition, redacted by NAME rather
+ * than by shape. Shape matching is defence in depth, but it cannot be the
+ * primary defence for a field already known to be a secret: `EMBED_SECRET` may
+ * be operator-supplied as uppercase hex, base64, or a passphrase, none of which
+ * the `SECRET_SHAPES` regexes match.
+ */
+const REDACT_KEYS_ALWAYS = new Set(["secret", "sampleToken", "token", "apiKey", "password"])
+
+const REDACTED_MARKER = /^<redacted:\d+>$/
+
+/**
+ * @param freeText - whether free-text keys are redacted too. Credential keys
+ *   are always redacted; free text only for the captures in `REDACT_TEXT_IN`.
+ */
+function redactText(value: unknown, key?: string, freeText = false): unknown {
   if (typeof value === "string") {
-    if (key && REDACT_TEXT_KEYS.has(key) && value.length > 0) {
+    // Idempotent: re-running over an already-sanitized corpus must not
+    // collapse "<redacted:220>" into "<redacted:14>".
+    if (REDACTED_MARKER.test(value)) return value
+    const shouldRedact =
+      key !== undefined &&
+      (REDACT_KEYS_ALWAYS.has(key) || (freeText && REDACT_TEXT_KEYS.has(key)))
+    if (shouldRedact && value.length > 0) {
       return `<redacted:${value.length}>`
     }
     return value
   }
-  if (Array.isArray(value)) return value.map((v) => redactText(v, key))
+  if (Array.isArray(value)) {
+    // Propagate the parent key only for string elements — `assumptions` is an
+    // array of free text and would otherwise never be reached. Arrays of
+    // objects re-key from their own fields in the branch below, and arrays of
+    // non-strings (ids, enums) must not inherit a redacting parent key.
+    return value.map((v) =>
+      typeof v === "string" ? redactText(v, key, freeText) : redactText(v, undefined, freeText),
+    )
+  }
   if (value && typeof value === "object") {
     return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, redactText(v, k)]),
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [
+        k,
+        redactText(v, k, freeText),
+      ]),
     )
   }
   return value
@@ -167,7 +215,8 @@ for (const r of requests as Req[]) {
   } catch {
     parsed = { __nonJsonBody: scrub(text) }
   }
-  if (REDACT_TEXT_IN.has(r.name)) parsed = redactText(parsed)
+  // Credential keys are redacted everywhere; free text only where it occurs.
+  parsed = redactText(parsed, undefined, REDACT_TEXT_IN.has(r.name))
 
   if (r.expectStatus !== undefined && res.status !== r.expectStatus) {
     console.error(`MISMATCH ${r.name}: expected ${r.expectStatus}, got ${res.status}`)

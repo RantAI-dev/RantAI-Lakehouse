@@ -8,8 +8,8 @@
   "status": 200,
   "contentType": "application/json;charset=utf-8",
   "body": {
-    "secret": "__HEX64_SECRET__",
+    "secret": "<redacted:16>",
     "enabled": true,
-    "sampleToken": "__JWT__"
+    "sampleToken": "<redacted:7>"
   }
 }
