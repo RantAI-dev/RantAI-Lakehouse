@@ -188,6 +188,18 @@ mod tests {
     /// "did the router send this to the right handler" even without a live
     /// `ClickHouse`.
     #[tokio::test]
+    async fn query_run_route_is_registered() {
+        let resp = post(test_router(), "/api/query/run").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn query_estimate_route_is_registered() {
+        let resp = post(test_router(), "/api/query/estimate").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn governance_lineage_route_does_not_fall_through_to_kind_dispatch() {
         let resp = get(test_router(), "/api/governance/lineage").await;
         assert_ne!(resp.status(), StatusCode::BAD_REQUEST);

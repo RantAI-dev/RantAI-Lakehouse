@@ -10,6 +10,7 @@ mod catalog;
 mod governance;
 mod ops;
 mod overview;
+mod query;
 mod storage;
 mod support;
 
@@ -65,6 +66,8 @@ pub fn router(state: AppState) -> Router {
                 .delete(alerts::delete),
         )
         .route("/api/alerts/run", get(alerts::run).post(alerts::run))
+        .route("/api/query/run", axum::routing::post(query::run))
+        .route("/api/query/estimate", axum::routing::post(query::estimate))
         .layer(from_fn(timeout_middleware))
         .with_state(state)
 }

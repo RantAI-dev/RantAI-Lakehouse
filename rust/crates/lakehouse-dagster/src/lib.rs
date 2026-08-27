@@ -22,6 +22,38 @@ pub struct DgRun {
     pub status: String,
     /// Unix seconds the run started, or `None` if it hasn't started yet.
     pub start_time: Option<f64>,
+    /// Unix seconds the run ended, or `None` if it hasn't finished yet.
+    #[serde(default)]
+    pub end_time: Option<f64>,
+}
+
+/// One `Dagster` schedule attached to a job, as returned by
+/// `repositoriesOrError`. Ported from the `DgJob["schedules"]` element
+/// shape in `src/services/clients/dagster.ts`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DgSchedule {
+    /// The schedule's cron expression (e.g. `"0 3 * * *"`).
+    pub cron_schedule: String,
+    /// The schedule's run state, e.g. `"RUNNING"`/`"STOPPED"`.
+    pub schedule_state: DgScheduleState,
+}
+
+/// A `Dagster` schedule's run state.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DgScheduleState {
+    /// The schedule state's status string.
+    pub status: String,
+}
+
+/// A `Dagster` job (pipeline) with its attached schedules, matching
+/// `DgJob` in `src/services/clients/dagster.ts`.
+#[derive(Debug, Clone)]
+pub struct DgJob {
+    /// The job's name.
+    pub name: String,
+    /// Schedules whose `pipelineName` matches this job's name.
+    pub schedules: Vec<DgSchedule>,
 }
 
 /// Errors produced while talking to `Dagster`.
@@ -107,11 +139,23 @@ struct ReposOrError {
 #[derive(Debug, Deserialize)]
 struct RepoNode {
     jobs: Vec<JobName>,
+    #[serde(default)]
+    schedules: Vec<ScheduleNode>,
 }
 
 #[derive(Debug, Deserialize)]
 struct JobName {
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleNode {
+    #[serde(rename = "cronSchedule")]
+    cron_schedule: String,
+    #[serde(rename = "scheduleState")]
+    schedule_state: DgScheduleState,
+    #[serde(rename = "jobName")]
+    job_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -234,6 +278,75 @@ impl DgClient {
             .into_iter()
             .map(|j| j.name)
             .filter(|n| !n.starts_with("__"))
+            .collect())
+    }
+
+    /// List up to `limit` runs belonging to `job_name`, most recent first
+    /// — matching `listRuns(jobName, limit)` in the TypeScript client when
+    /// `jobName` is given, used by `GET /api/pipelines/{id}/runs`.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::list_runs`].
+    pub async fn list_runs_for_job(
+        &self,
+        job_name: &str,
+        limit: u32,
+    ) -> Result<Vec<DgRun>, DgError> {
+        // `filter: { pipelineName: "<job_name>" }` — the TypeScript
+        // interpolates `jobName` into the query string unescaped
+        // (`dagster.ts`); reproduced verbatim rather than parameterized,
+        // since `job_name` here is always a path segment already resolved
+        // against known job names by the caller.
+        let query = format!(
+            "{{ runsOrError(filter: {{ pipelineName: \"{job_name}\" }}, limit: {limit}) {{ \
+             __typename ... on Runs {{ results {{ runId jobName status startTime endTime }} }} \
+             }} }}"
+        );
+        let data: RunsOrErrorData = self.execute(&query, None).await?;
+        Ok(data.runs_or_error.results.unwrap_or_default())
+    }
+
+    /// List jobs in the default repository together with each job's
+    /// attached schedules, matching `listJobs()` in the TypeScript client.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::list_runs`].
+    pub async fn list_jobs_with_schedules(&self) -> Result<Vec<DgJob>, DgError> {
+        let query = "{ repositoriesOrError { __typename ... on RepositoryConnection { nodes { \
+                      jobs { name } \
+                      schedules { cronSchedule scheduleState { status } jobName: pipelineName } \
+                      } } } }";
+        let data: ReposOrErrorData = self.execute(query, None).await?;
+        let Some(node) = data
+            .repositories_or_error
+            .nodes
+            .and_then(|n| n.into_iter().next())
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(node
+            .jobs
+            .into_iter()
+            .filter(|j| !j.name.starts_with("__"))
+            .map(|j| {
+                let schedules = node
+                    .schedules
+                    .iter()
+                    .filter(|s| s.job_name == j.name)
+                    .map(|s| DgSchedule {
+                        cron_schedule: s.cron_schedule.clone(),
+                        schedule_state: DgScheduleState {
+                            status: s.schedule_state.status.clone(),
+                        },
+                    })
+                    .collect();
+                DgJob {
+                    name: j.name,
+                    schedules,
+                }
+            })
             .collect())
     }
 
@@ -552,5 +665,55 @@ mod tests {
         let outcome = client.launch_run("refresh_lakehouse").await.unwrap();
         assert!(outcome.run_id.is_none());
         assert_eq!(outcome.error.as_deref(), Some("bad field a; bad field b"));
+    }
+
+    #[tokio::test]
+    async fn list_runs_for_job_parses_end_time() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runsOrError": { "__typename": "Runs", "results": [
+                    { "runId": "r1", "jobName": "refresh_lakehouse", "status": "SUCCESS",
+                      "startTime": 1.0, "endTime": 3.0 }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let runs = client
+            .list_runs_for_job("refresh_lakehouse", 30)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].end_time, Some(3.0));
+    }
+
+    #[tokio::test]
+    async fn list_jobs_with_schedules_attaches_matching_schedule_only() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "repositoriesOrError": { "__typename": "RepositoryConnection", "nodes": [
+                    { "jobs": [ { "name": "refresh_lakehouse" }, { "name": "other_job" }, { "name": "__ASSET_JOB" } ],
+                      "schedules": [
+                        { "cronSchedule": "0 3 * * *", "scheduleState": { "status": "RUNNING" }, "jobName": "refresh_lakehouse" }
+                      ] }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let jobs = client.list_jobs_with_schedules().await.unwrap();
+        assert_eq!(jobs.len(), 2);
+        let refresh = jobs.iter().find(|j| j.name == "refresh_lakehouse").unwrap();
+        assert_eq!(refresh.schedules.len(), 1);
+        assert_eq!(refresh.schedules[0].cron_schedule, "0 3 * * *");
+        assert_eq!(refresh.schedules[0].schedule_state.status, "RUNNING");
+        let other = jobs.iter().find(|j| j.name == "other_job").unwrap();
+        assert!(other.schedules.is_empty());
     }
 }
