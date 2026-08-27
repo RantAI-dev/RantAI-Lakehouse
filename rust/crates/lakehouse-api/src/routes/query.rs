@@ -8,8 +8,14 @@ use std::time::Instant;
 
 use axum::body::Bytes;
 use axum::extract::State;
+use axum::http::StatusCode;
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ApiError;
+use lakehouse_store::PgPool;
+use lakehouse_store::queries::{
+    self, CollaborationProject, CreateCollaborationProjectInput, QueryHistoryItem,
+    RecordHistoryInput, SavedQuery,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -163,9 +169,41 @@ pub async fn run(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJso
         .as_ref()
         .map_or_else(|| elapsed_ms(started), |s| seconds_to_ms(s.elapsed));
     let cost_units = std::cmp::max(1, bytes_to_cost_units(scanned_bytes));
+    let id = format!("q-{started_epoch_ms}");
+    let audit_event_id = format!("aud-query-{id}");
+
+    // Record this execution in query history — best-effort. A history-write
+    // failure (no Postgres pool configured, Postgres down, ...) must never
+    // turn an otherwise-successful query into an error response for the
+    // caller, who already has their result: log a warning and keep going.
+    // See `lakehouse_store::queries::record_history`'s doc comment.
+    if let Some(pool) = state.pg.as_deref() {
+        #[allow(
+            clippy::cast_possible_wrap,
+            clippy::cast_precision_loss,
+            reason = "scanned_bytes/duration_ms/cost_units are ClickHouse-reported sizes for \
+                      one query, well within i64/f64's exact-integer range"
+        )]
+        let input = RecordHistoryInput {
+            id: &id,
+            sql: &sql,
+            user: "anonymous",
+            status: "completed",
+            duration_ms: duration_ms as i64,
+            scanned_bytes: scanned_bytes as i64,
+            cost_units: cost_units as f64,
+            workload_class: "hot-analytics",
+            engine: "hot-store",
+            cache_assisted: false,
+            audit_event_id: Some(&audit_event_id),
+        };
+        if let Err(err) = queries::record_history(pool, &input).await {
+            tracing::warn!(%err, "failed to record query history (query itself succeeded)");
+        }
+    }
 
     Ok(ApiJson(json!({
-        "id": format!("q-{started_epoch_ms}"),
+        "id": id,
         "columns": columns,
         "rows": rows,
         "metrics": {
@@ -360,6 +398,94 @@ fn numeric_value(v: &Value) -> Option<f64> {
 fn strip_trailing_semicolon(sql: &str) -> &str {
     let trimmed_end = sql.trim_end();
     trimmed_end.strip_suffix(';').unwrap_or(trimmed_end)
+}
+
+// ── Postgres-backed writes (Task 2.4) ───────────────────────────────────
+//
+// `listSaved`/`listHistory`/`listCollaboration`/`createCollaborationProject`
+// back the methods `src/services/clients/queries.ts` used to delegate to
+// `mockQueryService`. No TypeScript server-side precedent exists for any of
+// them — like `routes::identity`/`routes::governance`'s Postgres-backed
+// additions, status codes are chosen to be correct rather than faithful.
+
+/// Borrow the Postgres pool, or fail with a 503 explaining why there isn't
+/// one. Mirrors `routes::identity::pool`.
+fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
+    state.pg.as_deref().ok_or_else(|| {
+        ApiError::Unavailable(
+            "query store unavailable: no Postgres pool is configured \
+             (DATABASE_URL is missing or not a valid Postgres connection string)"
+                .to_owned(),
+        )
+    })
+}
+
+fn parse_json_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
+    serde_json::from_slice(body).map_err(|err| ApiError::BadRequest(format!("invalid JSON: {err}")))
+}
+
+/// `GET /api/query/saved` — every saved query.
+///
+/// # Errors
+///
+/// 503 if no pool is configured; 500 on a database failure.
+pub async fn list_saved(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<SavedQuery>>> {
+    Ok(ApiJson(queries::list_saved(pool(&state)?).await?))
+}
+
+/// `GET /api/query/history` — recent, real query executions, recorded by
+/// [`run`] on success.
+///
+/// # Errors
+///
+/// 503 if no pool is configured; 500 on a database failure.
+pub async fn list_history(
+    State(state): State<AppState>,
+) -> ApiResult<ApiJson<Vec<QueryHistoryItem>>> {
+    Ok(ApiJson(queries::list_history(pool(&state)?).await?))
+}
+
+/// `GET /api/query/collaboration` — every collaboration project.
+///
+/// # Errors
+///
+/// 503 if no pool is configured; 500 on a database failure.
+pub async fn list_collaboration(
+    State(state): State<AppState>,
+) -> ApiResult<ApiJson<Vec<CollaborationProject>>> {
+    Ok(ApiJson(queries::list_collaboration(pool(&state)?).await?))
+}
+
+/// The `POST /api/query/collaboration` body. Mirrors
+/// `CreateCollaborationProjectInput`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCollaborationProjectBody {
+    name: String,
+    #[serde(default)]
+    collaborators: Vec<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// `POST /api/query/collaboration` — create a collaboration project.
+/// Returns 201.
+///
+/// # Errors
+///
+/// 400 on a malformed body; 503/500 as above.
+pub async fn create_collaboration_project(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, ApiJson<CollaborationProject>)> {
+    let body: CreateCollaborationProjectBody = parse_json_body(&body)?;
+    let input = CreateCollaborationProjectInput {
+        name: body.name,
+        collaborators: body.collaborators,
+        description: body.description,
+    };
+    let created = queries::create_collaboration_project(pool(&state)?, &input).await?;
+    Ok((StatusCode::CREATED, ApiJson(created)))
 }
 
 #[cfg(test)]
