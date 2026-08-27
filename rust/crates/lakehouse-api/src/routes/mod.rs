@@ -32,12 +32,37 @@ use serde::Serialize;
 use crate::json::ApiJson;
 use crate::state::AppState;
 
-/// Per-request timeout, matching `export const maxDuration = 60` on the
-/// TypeScript route handlers (e.g. `src/app/api/query/run/route.ts:5`).
-/// Next.js enforces that as a platform-level function deadline; here it's a
-/// `tower_http` middleware layer wrapping every route — different
-/// mechanism, same bound, so no request can hang the service past 60s.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default per-request timeout, used for every route whose TypeScript
+/// handler does not declare `export const maxDuration` (most of them — see
+/// [`route_timeout`]).
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Per-route request timeout, mirroring each TypeScript handler's `export
+/// const maxDuration` (grep of every `src/app/api/**/route.ts`):
+///
+/// | route                          | TS `maxDuration` |
+/// |---------------------------------|------------------|
+/// | `/api/ai/chat`                  | 120              |
+/// | `/api/agent/query`              | 90               |
+/// | `/api/agent/ask`                | 60               |
+/// | `/api/agent/text-to-sql`        | 60               |
+/// | `/api/alerts/run`               | 60               |
+/// | `/api/query/run`                | 60               |
+/// | everything else (no export)     | [`DEFAULT_REQUEST_TIMEOUT`] (60) |
+///
+/// The timeout is NOT uniform in the TypeScript — `ai/chat`'s 120s and
+/// `agent/query`'s 90s cover legitimate multi-round LLM tool loops that a
+/// blanket 60s bound would 408 mid-flight. Matched on `req.uri().path()`
+/// before route dispatch, so path params (`/api/catalog/{id}`, ...) never
+/// need to appear here — none of the parameterized routes declare a
+/// non-default `maxDuration` today.
+fn route_timeout(path: &str) -> Duration {
+    match path {
+        "/api/ai/chat" => Duration::from_secs(120),
+        "/api/agent/query" => Duration::from_secs(90),
+        _ => DEFAULT_REQUEST_TIMEOUT,
+    }
+}
 
 /// Build the application router with `state` threaded through every
 /// handler.
@@ -137,15 +162,16 @@ struct TimeoutBody {
     error: String,
 }
 
-/// Wraps every route in a [`REQUEST_TIMEOUT`] deadline, matching `export
-/// const maxDuration = 60` on the TypeScript route handlers. Unlike
-/// `tower_http::timeout::TimeoutLayer::with_status_code`, which returns an
-/// empty, content-type-less body on expiry — the one response path that
-/// violated the `{"error": "<message>"}` /
+/// Wraps every route in a per-route deadline (see [`route_timeout`]),
+/// matching each TypeScript route handler's `export const maxDuration`.
+/// Unlike `tower_http::timeout::TimeoutLayer::with_status_code`, which
+/// returns an empty, content-type-less body on expiry — the one response
+/// path that violated the `{"error": "<message>"}` /
 /// `application/json;charset=utf-8` contract every other response honors —
 /// this renders the same JSON error envelope via [`ApiJson`].
 async fn timeout_middleware(req: Request, next: Next) -> Response {
-    match tokio::time::timeout(REQUEST_TIMEOUT, next.run(req)).await {
+    let timeout = route_timeout(req.uri().path());
+    match tokio::time::timeout(timeout, next.run(req)).await {
         Ok(response) => response,
         Err(_elapsed) => (
             StatusCode::REQUEST_TIMEOUT,
@@ -154,5 +180,37 @@ async fn timeout_middleware(req: Request, next: Next) -> Response {
             }),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// D2 regression: the timeout was a uniform 60s across every route,
+    /// but the TypeScript declares longer `maxDuration`s for `ai/chat`
+    /// (120s, an 8-round LLM tool loop) and `agent/query` (90s) — a
+    /// blanket 60s bound 408'd a legitimate in-flight request. Pins the
+    /// per-route table to the TS `export const maxDuration` grep.
+    #[test]
+    fn route_timeout_matches_typescript_max_duration() {
+        assert_eq!(route_timeout("/api/ai/chat"), Duration::from_secs(120));
+        assert_eq!(route_timeout("/api/agent/query"), Duration::from_secs(90));
+        assert_eq!(
+            route_timeout("/api/agent/ask"),
+            DEFAULT_REQUEST_TIMEOUT,
+            "TS declares maxDuration = 60, same as the default"
+        );
+        assert_eq!(
+            route_timeout("/api/query/run"),
+            DEFAULT_REQUEST_TIMEOUT,
+            "TS declares maxDuration = 60, same as the default"
+        );
+        assert_eq!(
+            route_timeout("/api/dashboard/export"),
+            DEFAULT_REQUEST_TIMEOUT,
+            "no TS maxDuration export — falls back to the default"
+        );
+        assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(60));
     }
 }
