@@ -1,9 +1,12 @@
-//! Small helpers shared by the read-only route modules (`catalog`, `overview`,
-//! `ops`, `governance`, `storage`).
+//! Small helpers shared by the route modules.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 
-use serde_json::{Map, Value};
+use lakehouse_bi::specs::ChartSource;
+use lakehouse_bi::store;
+use lakehouse_clickhouse::{ChClient, ChError};
+use serde_json::{Map, Value, json};
 
 /// Render any JSON value the way `String(x)` renders it in `TypeScript`,
 /// with `null`/missing treated as `""` (matching `String(row[name] ?? "")`
@@ -66,6 +69,87 @@ pub(crate) fn prettify(s: &str) -> String {
 #[must_use]
 pub(crate) fn js_error(err: impl Display) -> String {
     format!("Error: {err}")
+}
+
+/// Render a *stored* chart spec (owned strings, `lakehouse_bi::store::ChartSpec`)
+/// the same way `lakehouse_bi::specs::to_render_spec` renders a built-in
+/// `&'static` one: everything except `sql`, plus its origin. There is no
+/// shared `to_render_spec` overload across the two `ChartSpec` types (one
+/// `&'static str`-backed for compile-time specs, one owned for
+/// runtime-assembled ones), so this mirrors that function's field set by
+/// hand. Shared by `dashboard` and `embed`, which both render stored chart
+/// lists.
+#[must_use]
+pub(crate) fn render_stored_spec(spec: &store::ChartSpec, source: ChartSource) -> Value {
+    let mut map = Map::new();
+    map.insert("id".to_owned(), json!(spec.id));
+    map.insert("title".to_owned(), json!(spec.title));
+    map.insert("kind".to_owned(), json!(spec.kind));
+    map.insert("mart".to_owned(), json!(spec.mart));
+    map.insert("x".to_owned(), json!(spec.x));
+    map.insert("y".to_owned(), json!(spec.y));
+    map.insert("source".to_owned(), json!(source));
+    if let Some(v) = &spec.subtitle {
+        map.insert("subtitle".to_owned(), json!(v));
+    }
+    if let Some(v) = &spec.series {
+        map.insert("series".to_owned(), json!(v));
+    }
+    if let Some(v) = spec.format {
+        map.insert("format".to_owned(), json!(v));
+    }
+    if let Some(v) = spec.span {
+        map.insert("span".to_owned(), json!(v));
+    }
+    if let Some(v) = &spec.text {
+        map.insert("text".to_owned(), json!(v));
+    }
+    if let Some(v) = &spec.caption {
+        map.insert("caption".to_owned(), json!(v));
+    }
+    if let Some(v) = spec.target {
+        map.insert("target".to_owned(), json!(v));
+    }
+    Value::Object(map)
+}
+
+/// `runSpec` in `dashboard/route.ts` (and its `embed`/`public` siblings): an
+/// empty `sql` (text tiles) needs no query; any other failure is captured
+/// per-tile rather than failing the whole response.
+pub(crate) async fn run_spec_sql(ch: &ChClient, id: &str, sql: &str) -> (String, Value) {
+    if sql.is_empty() {
+        return (id.to_owned(), json!({ "columns": [], "rows": [] }));
+    }
+    match ch.query(sql, None).await {
+        Ok(r) => {
+            let columns: Vec<String> = r.meta.iter().map(|m| m.name.clone()).collect();
+            (id.to_owned(), json!({ "columns": columns, "rows": r.data }))
+        }
+        Err(err) => (id.to_owned(), json!({ "error": err.to_string() })),
+    }
+}
+
+/// `SELECT table, name FROM system.columns WHERE database='serving'`,
+/// grouped into a mart → column-set map — used to decide which dashboard
+/// filters apply to which tile.
+pub(crate) async fn mart_columns(
+    ch: &ChClient,
+) -> Result<HashMap<String, HashSet<String>>, ChError> {
+    let rows = ch
+        .rows(
+            "SELECT table, name FROM system.columns WHERE database='serving'",
+            None,
+        )
+        .await?;
+    let mut m: HashMap<String, HashSet<String>> = HashMap::new();
+    for r in &rows {
+        let table = r.get("table").and_then(Value::as_str).unwrap_or("");
+        let name = r.get("name").and_then(Value::as_str).unwrap_or("");
+        m.entry(table.to_owned())
+            .or_default()
+            .insert(name.to_owned());
+    }
+    Ok(m)
 }
 
 #[cfg(test)]

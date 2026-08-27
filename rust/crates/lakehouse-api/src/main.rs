@@ -266,6 +266,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn embed_data_route_is_registered() {
+        let resp = post(test_router(), "/api/embed/data").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn public_dashboard_route_is_registered() {
+        let resp = get(test_router(), "/api/public/dashboard/some-token").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn governance_lineage_route_does_not_fall_through_to_kind_dispatch() {
         let resp = get(test_router(), "/api/governance/lineage").await;
         assert_ne!(resp.status(), StatusCode::BAD_REQUEST);

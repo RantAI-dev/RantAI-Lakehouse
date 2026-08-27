@@ -8,6 +8,7 @@
 mod alerts;
 mod catalog;
 mod dashboard;
+mod embed;
 mod governance;
 mod ops;
 mod overview;
@@ -96,6 +97,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/dashboard/values", get(dashboard::values))
         .route("/api/dashboard/export", get(dashboard::export))
         .route("/api/dashboard/embed-info", get(dashboard::embed_info))
+        .route("/api/embed/data", axum::routing::post(embed::data))
+        .route(
+            "/api/public/dashboard/{token}",
+            get(embed::public_dashboard),
+        )
         .layer(from_fn(timeout_middleware))
         .with_state(state)
 }
