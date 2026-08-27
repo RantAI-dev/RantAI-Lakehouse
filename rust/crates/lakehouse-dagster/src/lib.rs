@@ -27,9 +27,23 @@ pub struct DgRun {
 /// Errors produced while talking to `Dagster`.
 #[derive(Debug, Error)]
 pub enum DgError {
-    /// A transport-level failure surfaced by `reqwest`.
-    #[error(transparent)]
-    Transport(#[from] reqwest::Error),
+    /// A transport-level failure (connection refused, TLS error, timeout,
+    /// ...) surfaced by `reqwest`.
+    ///
+    /// The `Display` impl deliberately does NOT include `reqwest`'s message:
+    /// `reqwest::Error`'s `Display` appends `" for url (http://host:port/)"`,
+    /// which would leak the internal `Dagster` host/port to an
+    /// unauthenticated caller. `src/services/clients/dagster.ts` never sees
+    /// that URL either: Node's `fetch` (undici) rejects a connection failure
+    /// with a `TypeError` whose `.message` is the fixed string `"fetch
+    /// failed"` (the underlying cause lives on `.cause`, which the TS route
+    /// handlers never read). This variant reproduces that fixed string,
+    /// exactly the same treatment `ChError::Transport` got in
+    /// `lakehouse-clickhouse` (commit `9114abd`). The `reqwest::Error`
+    /// itself is kept as `#[source]` so `tracing` (or any structured
+    /// logger) can still record the real cause/URL server-side.
+    #[error("fetch failed")]
+    Transport(#[source] reqwest::Error),
     /// `Dagster` responded with a non-2xx status or a GraphQL error.
     ///
     /// When the failure is a GraphQL `errors` array, the message is the
@@ -41,6 +55,12 @@ pub enum DgError {
     /// shown in full).
     #[error("{0}")]
     Server(String),
+}
+
+impl From<reqwest::Error> for DgError {
+    fn from(err: reqwest::Error) -> Self {
+        Self::Transport(err)
+    }
 }
 
 /// Truncate `s` to at most 300 `char`s, matching JavaScript's
@@ -454,6 +474,32 @@ mod tests {
         assert_eq!(msg.chars().count(), 300);
         let expected_full = json!([ { "message": "x".repeat(500) } ]).to_string();
         assert_eq!(msg, truncate_300(&expected_full));
+    }
+
+    /// Regression test for B2 (transport errors leaking the internal
+    /// `Dagster` endpoint): connecting to a closed port must render as the
+    /// fixed `"fetch failed"` string, matching Node `fetch`'s
+    /// `TypeError.message`, never `reqwest`'s host/port-bearing message.
+    #[tokio::test]
+    async fn transport_error_display_does_not_leak_host_or_port() {
+        // Bind to an ephemeral port, then drop the listener immediately so
+        // nothing is listening there: connecting to it is guaranteed to be
+        // refused, producing a genuine `reqwest::Error` without relying on
+        // any specific closed port being free on the test host.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let dead_url = format!("http://{addr}/graphql");
+        let client = DgClient::new(dead_url);
+        let err = client.list_runs(25).await.unwrap_err();
+
+        assert!(matches!(err, DgError::Transport(_)));
+        let rendered = err.to_string();
+        assert_eq!(rendered, "fetch failed");
+        assert!(!rendered.contains("http"), "{rendered}");
+        assert!(!rendered.contains(&addr.ip().to_string()), "{rendered}");
+        assert!(!rendered.contains(&addr.port().to_string()), "{rendered}");
     }
 
     #[tokio::test]
