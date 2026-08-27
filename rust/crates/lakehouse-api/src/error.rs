@@ -7,11 +7,12 @@
 //! `src/app/api/query/run/route.ts:78` and
 //! `src/app/api/embed/data/route.ts:43`.
 
-use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use lakehouse_core::ApiError;
 use serde::Serialize;
+
+use crate::json::ApiJson;
 
 /// Wraps an [`ApiError`] so it can be returned directly from an axum
 /// handler and rendered as `{"error": "<message>"}` at the right status
@@ -55,7 +56,7 @@ impl IntoResponse for ApiRejection {
         let body = ErrorBody {
             error: self.0.to_string(),
         };
-        (status, Json(body)).into_response()
+        (status, ApiJson(body)).into_response()
     }
 }
 
@@ -76,6 +77,20 @@ mod tests {
     async fn body_json(resp: Response) -> Value {
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Asserts the exact `content-type` byte string recorded across the
+    /// parity corpus (`application/json;charset=utf-8`, no space before
+    /// `charset`) is what error responses actually send — see `json.rs`.
+    #[tokio::test]
+    async fn error_response_has_exact_content_type_header() {
+        let resp = ApiRejection(ApiError::NotFound("not_found".to_owned())).into_response();
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .unwrap(),
+            "application/json;charset=utf-8"
+        );
     }
 
     #[tokio::test]

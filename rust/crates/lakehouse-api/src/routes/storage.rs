@@ -5,25 +5,25 @@
 //! (`rows * 220` bytes, a fixed per-row estimate used across every ported
 //! domain); Cold/AI are always zero — nothing occupies those tiers yet.
 
-use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use lakehouse_clickhouse::{ChClient, ChError};
 use serde_json::{Value, json};
 
+use crate::json::ApiJson;
 use crate::routes::support::{js_error, num_or_zero};
 use crate::state::AppState;
 
 /// `GET /api/storage`.
 pub async fn get(State(state): State<AppState>) -> Response {
     match get_body(&state.clickhouse).await {
-        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         // `catch (e) { return NextResponse.json({ error: String(e) }, {
         // status: 503 }); }` in `storage/route.ts`.
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": js_error(err) })),
         )
             .into_response(),
     }

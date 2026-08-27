@@ -5,7 +5,6 @@
 //! `ClickHouse` aggregates with `Dagster` run history (`POST` is
 //! read-only despite the verb — it only lists recent runs).
 
-use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -13,6 +12,7 @@ use lakehouse_clickhouse::{ChClient, ChError};
 use serde_json::{Value, json};
 
 use crate::dagster::{DgClient, DgError, iso_from_unix_seconds, map_run_status};
+use crate::json::ApiJson;
 use crate::routes::support::{js_error, num_or_zero, str_col};
 use crate::state::AppState;
 
@@ -33,12 +33,12 @@ enum OverviewError {
 /// queries, and pipelines.
 pub async fn get(State(state): State<AppState>) -> Response {
     match get_body(&state.clickhouse, &state.dagster).await {
-        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         // `catch (e) { return NextResponse.json({ error: String(e) }, {
         // status: 503 }); }` in `overview/route.ts` GET.
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": js_error(err) })),
         )
             .into_response(),
     }
@@ -145,13 +145,13 @@ pub async fn refresh(State(state): State<AppState>) -> Response {
                     })
                 })
                 .collect();
-            (StatusCode::OK, Json(json!({ "activity": activity }))).into_response()
+            (StatusCode::OK, ApiJson(json!({ "activity": activity }))).into_response()
         }
         // `catch (e) { return NextResponse.json({ activity: [], error:
         // String(e) }, { status: 503 }); }` in `overview/route.ts` POST.
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "activity": [], "error": js_error(err) })),
+            ApiJson(json!({ "activity": [], "error": js_error(err) })),
         )
             .into_response(),
     }

@@ -5,7 +5,6 @@
 //! HTTP 400 with `{"error": "kind tak dikenal: <kind>"}`, verified against
 //! `ops-unknown-kind.json` in the parity corpus.
 
-use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -14,6 +13,7 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 
 use crate::dagster::{DgClient, DgError};
+use crate::json::ApiJson;
 use crate::routes::support::{js_error, num_or_zero, str_col};
 use crate::state::AppState;
 
@@ -58,16 +58,16 @@ pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Res
     match Kind::parse(&kind) {
         Kind::Unknown => (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": format!("kind tak dikenal: {kind}") })),
+            ApiJson(json!({ "error": format!("kind tak dikenal: {kind}") })),
         )
             .into_response(),
         parsed => match run(&state, parsed).await {
-            Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+            Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
             // Every branch shares one outer `catch (e)` returning
             // `{ error: String(e) }` at 503.
             Err(err) => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": js_error(err) })),
             )
                 .into_response(),
         },

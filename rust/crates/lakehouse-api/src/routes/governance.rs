@@ -7,7 +7,6 @@
 //! `{kind}` dispatch, matching Next.js's separate `lineage/route.ts` file —
 //! it is never reached by [`Kind::parse`].
 
-use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -16,6 +15,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::dagster::{DgClient, DgError, iso_from_unix_seconds, map_run_status};
+use crate::json::ApiJson;
 use crate::routes::support::{js_error, str_col};
 use crate::state::AppState;
 
@@ -62,16 +62,16 @@ pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Res
     match Kind::parse(&kind) {
         Kind::Unknown => (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": format!("kind tak dikenal: {kind}") })),
+            ApiJson(json!({ "error": format!("kind tak dikenal: {kind}") })),
         )
             .into_response(),
         parsed => match run(&state, parsed).await {
-            Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+            Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
             // Every branch shares one outer `catch (e)` returning
             // `{ error: String(e) }` at 503.
             Err(err) => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": js_error(err) })),
             )
                 .into_response(),
         },
@@ -228,12 +228,12 @@ pub struct LineageQuery {
 /// `GET /api/governance/lineage?focus=<slug>`.
 pub async fn lineage(State(state): State<AppState>, Query(q): Query<LineageQuery>) -> Response {
     match lineage_body(&state.clickhouse, &q.focus).await {
-        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         // `catch (e) { return NextResponse.json({ error: String(e), focus,
         // nodes: [], edges: [], columnMappings: [] }, { status: 503 }); }`.
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
+            ApiJson(json!({
                 "error": js_error(err),
                 "focus": q.focus,
                 "nodes": [],

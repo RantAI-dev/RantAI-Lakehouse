@@ -6,7 +6,6 @@
 //! assets are read directly off `ClickHouse`'s `system.tables` /
 //! `system.columns` / `system.parts`.
 
-use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -15,6 +14,7 @@ use lakehouse_core::ApiError;
 use serde_json::{Map, Value, json};
 
 use crate::error::{ApiRejection, ApiResult};
+use crate::json::ApiJson;
 use crate::routes::support::{js_error, js_string, num_or_zero, prettify, str_col};
 use crate::state::AppState;
 
@@ -33,12 +33,12 @@ const DEFAULT_OWNER: &str = "Dinas Pariwisata & Ekraf DKI Jakarta";
 /// `GET /api/catalog` — the full asset registry, grouped into namespaces.
 pub async fn list(State(state): State<AppState>) -> Response {
     match list_body(&state.clickhouse).await {
-        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         // `catch (e) { return NextResponse.json({ error: String(e), assets:
         // [], namespaces: [] }, { status: 503 }); }` in `catalog/route.ts`.
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": js_error(err), "assets": [], "namespaces": [] })),
+            ApiJson(json!({ "error": js_error(err), "assets": [], "namespaces": [] })),
         )
             .into_response(),
     }
@@ -386,18 +386,18 @@ async fn clickhouse_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response>
         "downstream": [],
         "lifecyclePolicy": "default",
     });
-    Ok((StatusCode::OK, Json(body)).into_response())
+    Ok((StatusCode::OK, ApiJson(body)).into_response())
 }
 
 async fn bronze_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response> {
     match bronze_asset_detail_body(ch, id).await {
-        Ok(Some(body)) => Ok((StatusCode::OK, Json(body)).into_response()),
+        Ok(Some(body)) => Ok((StatusCode::OK, ApiJson(body)).into_response()),
         Ok(None) => Err(not_found()),
         // `catch (e) { return NextResponse.json({ error: String(e) }, {
         // status: 503 }); }` in `catalog/[id]/route.ts`.
         Err(err) => Ok((
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": js_error(err) })),
         )
             .into_response()),
     }

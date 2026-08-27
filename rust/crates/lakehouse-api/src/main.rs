@@ -10,6 +10,7 @@
 mod config;
 mod dagster;
 mod error;
+mod json;
 mod routes;
 mod state;
 
