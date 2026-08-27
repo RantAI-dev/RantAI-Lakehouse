@@ -64,24 +64,63 @@ pub struct ChResult {
 #[derive(Debug, Error)]
 pub enum ChError {
     /// A transport-level failure (connection refused, TLS error, timeout,
-    /// cancellation, ...) surfaced by `reqwest`.
-    #[error(transparent)]
-    Transport(#[from] reqwest::Error),
+    /// ...) surfaced by `reqwest`.
+    ///
+    /// The `Display` impl deliberately does NOT include `reqwest`'s message:
+    /// `reqwest::Error`'s `Display` appends `" for url (http://host:port/)"`,
+    /// which — through `ChError -> ApiError::Unprocessable(err.to_string())`
+    /// — would leak the internal `ClickHouse` host/port to an unauthenticated
+    /// caller. `src/services/clients/clickhouse.ts` never sees that URL
+    /// either: Node's `fetch` (undici) rejects a connection failure with a
+    /// `TypeError` whose `.message` is the fixed string `"fetch failed"`
+    /// (the underlying cause lives on `.cause`, which the TS route handlers
+    /// never read), and that fixed string is what callers of `chQuery`
+    /// ultimately surface via `e instanceof Error ? e.message : String(e)`
+    /// (see `src/app/api/query/run/route.ts:73`). This variant reproduces
+    /// that fixed string. The `reqwest::Error` itself is kept as `#[source]`
+    /// so `tracing` (or any structured logger) can still record the real
+    /// cause/URL server-side.
+    #[error("fetch failed")]
+    Transport(#[source] reqwest::Error),
     /// `ClickHouse` responded with a non-2xx status. The message is the
     /// `ClickHouse` error body, trimmed, verbatim — callers surface it to
     /// users — falling back to `ClickHouse HTTP <status>` when the body is
     /// empty.
     #[error("{0}")]
     Server(String),
+    /// The request was cancelled via the caller-supplied
+    /// [`CancellationToken`] before `ClickHouse` responded.
+    ///
+    /// Distinct from [`ChError::Server`] so cancellation is never confused
+    /// with a genuine `ClickHouse` error message in logs. No corpus entry
+    /// and no TS code path produces a cancellation-visible HTTP response
+    /// (`AbortSignal`-triggered aborts surface as a generic fetch rejection
+    /// in the TS client, and none of the captured routes exercise that
+    /// path), so this mapping is unobservable against the parity corpus;
+    /// [`ApiError::Internal`] is the least surprising choice — a cancelled
+    /// request is a server-side condition, not a client input error.
+    #[error("request cancelled")]
+    Cancelled,
+}
+
+impl From<reqwest::Error> for ChError {
+    fn from(err: reqwest::Error) -> Self {
+        Self::Transport(err)
+    }
 }
 
 impl From<ChError> for ApiError {
     /// `ClickHouse` errors are almost always the caller's SQL, not our
-    /// outage, so they map to `422 Unprocessable` — matching
+    /// outage, so `Transport`/`Server` map to `422 Unprocessable` — matching
     /// `src/app/api/query/run/route.ts`, which returns 422 (not 500) when
-    /// `chQuery` throws.
+    /// `chQuery` throws. `Cancelled` is a server-side condition rather than
+    /// a client input error, so it maps to `500 Internal` instead — see the
+    /// doc comment on [`ChError::Cancelled`].
     fn from(err: ChError) -> Self {
-        Self::Unprocessable(err.to_string())
+        match err {
+            ChError::Cancelled => Self::Internal(err.to_string()),
+            other => Self::Unprocessable(other.to_string()),
+        }
     }
 }
 
@@ -212,7 +251,7 @@ where
         Some(token) => {
             tokio::select! {
                 res = fut => res,
-                () = token.cancelled() => Err(ChError::Server("request cancelled".to_owned())),
+                () = token.cancelled() => Err(ChError::Cancelled),
             }
         }
         None => fut.await,
@@ -492,6 +531,38 @@ mod tests {
         let api_err: ApiError = ChError::Server("bad sql".to_owned()).into();
         assert_eq!(api_err.status(), 422);
         assert_eq!(api_err.to_string(), "bad sql");
+    }
+
+    #[test]
+    fn cancelled_converts_to_internal_api_error() {
+        let api_err: ApiError = ChError::Cancelled.into();
+        assert_eq!(api_err.status(), 500);
+        assert_eq!(api_err.to_string(), "request cancelled");
+    }
+
+    /// A real transport failure (connection refused) must never leak the
+    /// internal `ClickHouse` host/port through `ChError`'s `Display` — that
+    /// would both diverge from the TS contract (`"fetch failed"`, fixed) and
+    /// disclose infrastructure details to an unauthenticated caller.
+    #[tokio::test]
+    async fn transport_error_display_does_not_leak_url() {
+        // Bind to an ephemeral port, then drop the listener immediately so
+        // nothing is listening there: connecting to it is guaranteed to be
+        // refused, producing a genuine `reqwest::Error` without relying on
+        // any specific closed port being free on the test host.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let dead_url = format!("http://{addr}/");
+        let err = client(&dead_url).query("SELECT 1", None).await.unwrap_err();
+
+        assert!(matches!(err, ChError::Transport(_)));
+        let rendered = err.to_string();
+        assert_eq!(rendered, "fetch failed");
+        assert!(!rendered.contains("http"));
+        assert!(!rendered.contains(&addr.ip().to_string()));
+        assert!(!rendered.contains(&addr.port().to_string()));
     }
 
     // -- FORMAT-clause detection edge cases -------------------------------
