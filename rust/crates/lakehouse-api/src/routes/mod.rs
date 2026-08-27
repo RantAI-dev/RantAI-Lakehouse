@@ -16,10 +16,14 @@ mod support;
 use std::time::Duration;
 
 use axum::Router;
+use axum::extract::Request;
 use axum::http::StatusCode;
+use axum::middleware::{Next, from_fn};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use tower_http::timeout::TimeoutLayer;
+use serde::Serialize;
 
+use crate::json::ApiJson;
 use crate::state::AppState;
 
 /// Per-request timeout, matching `export const maxDuration = 60` on the
@@ -61,14 +65,41 @@ pub fn router(state: AppState) -> Router {
                 .delete(alerts::delete),
         )
         .route("/api/alerts/run", get(alerts::run).post(alerts::run))
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            REQUEST_TIMEOUT,
-        ))
+        .layer(from_fn(timeout_middleware))
         .with_state(state)
 }
 
 /// `GET /health` — a plain liveness check, no dependencies.
 async fn health() -> &'static str {
     "ok"
+}
+
+/// The JSON body shape a request-timeout response takes — same
+/// `{"error": "<message>"}` envelope every other error response in this
+/// crate uses (see [`crate::error::ApiRejection`]), rather than the bare,
+/// content-type-less body `tower_http::timeout::TimeoutLayer` produces on
+/// its own.
+#[derive(Debug, Serialize)]
+struct TimeoutBody {
+    error: String,
+}
+
+/// Wraps every route in a [`REQUEST_TIMEOUT`] deadline, matching `export
+/// const maxDuration = 60` on the TypeScript route handlers. Unlike
+/// `tower_http::timeout::TimeoutLayer::with_status_code`, which returns an
+/// empty, content-type-less body on expiry — the one response path that
+/// violated the `{"error": "<message>"}` /
+/// `application/json;charset=utf-8` contract every other response honors —
+/// this renders the same JSON error envelope via [`ApiJson`].
+async fn timeout_middleware(req: Request, next: Next) -> Response {
+    match tokio::time::timeout(REQUEST_TIMEOUT, next.run(req)).await {
+        Ok(response) => response,
+        Err(_elapsed) => (
+            StatusCode::REQUEST_TIMEOUT,
+            ApiJson(TimeoutBody {
+                error: "request timeout".to_owned(),
+            }),
+        )
+            .into_response(),
+    }
 }
