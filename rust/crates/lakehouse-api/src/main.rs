@@ -8,6 +8,7 @@
 //! use `thiserror` typed errors instead.
 
 mod config;
+mod dagster;
 mod error;
 mod routes;
 mod state;
@@ -127,6 +128,30 @@ mod tests {
     #[tokio::test]
     async fn storage_route_is_registered() {
         let resp = get(test_router(), "/api/storage").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn post(app: axum::Router, uri: &str) -> axum::http::Response<axum::body::Body> {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn overview_get_route_is_registered() {
+        let resp = get(test_router(), "/api/overview").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn overview_post_route_is_registered() {
+        let resp = post(test_router(), "/api/overview").await;
         assert_ne!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

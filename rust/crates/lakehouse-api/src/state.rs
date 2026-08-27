@@ -6,25 +6,27 @@ use std::sync::Arc;
 use lakehouse_clickhouse::ChClient;
 
 use crate::config::Config;
+use crate::dagster::DgClient;
 
 /// State shared across all route handlers.
 ///
-/// Cheap to clone: both fields are behind an [`Arc`]. `lakehouse-clickhouse`
+/// Cheap to clone: every field is behind an [`Arc`]. `lakehouse-clickhouse`
 /// doesn't derive `Clone` on [`ChClient`] itself (it holds a pooled
 /// `reqwest::Client` but isn't `Clone` at the type level), so it's wrapped
 /// here rather than modifying that crate. Later tasks add more clients here
-/// (LLM, Dagster, ...); keep every addition similarly cheap to clone.
-///
-/// `#[allow(dead_code)]`: no handler reads these fields yet — route
-/// handlers that do land in later tasks; this crate only mounts `/health`,
-/// which needs no state.
+/// (LLM, ...); keep every addition similarly cheap to clone.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct AppState {
-    /// Resolved application configuration.
+    /// Resolved application configuration. Not yet read by any of the
+    /// read-only routes mounted so far (none needs a config value beyond
+    /// what already shaped `clickhouse`/`dagster` at construction time);
+    /// later tasks' handlers (embed JWT, alerts run token, ...) will.
+    #[allow(dead_code)]
     pub config: Arc<Config>,
     /// `ClickHouse` HTTP client.
     pub clickhouse: Arc<ChClient>,
+    /// `Dagster` GraphQL client.
+    pub dagster: Arc<DgClient>,
 }
 
 impl AppState {
@@ -36,9 +38,11 @@ impl AppState {
             config.ch_user.clone(),
             config.ch_password.clone(),
         );
+        let dagster = DgClient::new(config.dagster_url.clone());
         Self {
             config: Arc::new(config),
             clickhouse: Arc::new(clickhouse),
+            dagster: Arc::new(dagster),
         }
     }
 }

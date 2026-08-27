@@ -1,10 +1,11 @@
 //! Route mounting.
 //!
 //! Write-side routes (query/agent/dashboard/alerts/...) and the remaining
-//! three read-only domains land in later commits; this mounts the health
-//! check plus catalog and storage.
+//! two read-only domains land in later commits; this mounts the health
+//! check plus catalog, storage, and overview.
 
 mod catalog;
+mod overview;
 mod storage;
 mod support;
 
@@ -24,6 +25,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/api/catalog", get(catalog::list))
         .route("/api/catalog/{id}", get(catalog::detail))
+        .route("/api/overview", get(overview::get).post(overview::refresh))
         .route("/api/storage", get(storage::get))
         .with_state(state)
 }
