@@ -9,6 +9,7 @@ mod agent;
 mod ai;
 mod alerts;
 mod catalog;
+mod connectors;
 mod dashboard;
 mod embed;
 mod governance;
@@ -146,6 +147,21 @@ fn overview_alerts_router() -> Router<AppState> {
         )
 }
 
+/// The `/api/connectors/*` sub-router (Task 2.7), split out for the same
+/// `clippy::too_many_lines` reason as [`pipelines_router`].
+fn connectors_router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/connectors",
+            get(connectors::list).post(connectors::create),
+        )
+        .route("/api/connectors/{id}", get(connectors::detail))
+        .route(
+            "/api/connectors/{id}/test",
+            axum::routing::post(connectors::test_connection),
+        )
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -253,6 +269,8 @@ pub fn router(state: AppState) -> Router {
             "/api/identity/workspace-settings",
             get(identity::workspace_settings),
         )
+        // Phase 2, Task 2.7: connector definitions.
+        .merge(connectors_router())
         .layer(from_fn(timeout_middleware))
         .with_state(state)
 }

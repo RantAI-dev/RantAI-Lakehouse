@@ -28,6 +28,7 @@
 //! [`error::StoreError::Unavailable`] rather than reach for an `Option`
 //! that was never `Some`.
 
+pub mod connectors;
 pub mod error;
 pub mod governance;
 pub mod identity;
