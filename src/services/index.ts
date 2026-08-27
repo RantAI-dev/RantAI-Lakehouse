@@ -14,11 +14,11 @@ import { clickhouseStorageService } from "./clients/storage"
 import { clickhouseOpsService } from "./clients/ops"
 import { clickhouseOverviewService } from "./clients/overview"
 import { clickhouseGovernanceService } from "./clients/governance"
+import { postgresIdentityService } from "./clients/identity"
 import { mockKnowledgeService } from "./mock/knowledge"
 import { mockAgentService } from "./mock/agents"
 import { mockGovernanceService } from "./mock/governance"
 import { mockOpsService } from "./mock/ops"
-import { mockIdentityService } from "./mock/identity"
 import { mockConnectorService } from "./mock/connectors"
 import { mockStorageService } from "./mock/storage"
 
@@ -39,7 +39,9 @@ export const governanceService = clickhouseGovernanceService
 void mockGovernanceService
 export const opsService = clickhouseOpsService
 void mockOpsService
-export const identityService = mockIdentityService
+// Identity kini NYATA — pengguna/peran/tenant/service identity di Postgres.
+// Seluruh method kontrak terlayani, jadi mock/identity.ts sudah dihapus.
+export const identityService = postgresIdentityService
 export const connectorService = mockConnectorService
 export const storageService = clickhouseStorageService
 void mockStorageService
