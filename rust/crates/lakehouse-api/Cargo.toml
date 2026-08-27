@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 lakehouse-core = { path = "../lakehouse-core" }
 lakehouse-clickhouse = { path = "../lakehouse-clickhouse" }
+lakehouse-dagster = { path = "../lakehouse-dagster" }
 axum = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }

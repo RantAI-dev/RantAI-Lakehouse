@@ -12,10 +12,10 @@ use lakehouse_clickhouse::{ChClient, ChError};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
-use crate::dagster::{DgClient, DgError};
 use crate::json::ApiJson;
 use crate::routes::support::{js_error, num_or_zero, str_col};
 use crate::state::AppState;
+use lakehouse_dagster::{DgClient, DgError};
 
 /// The four recognized `ops/{kind}` values. Ported from the `if (kind ===
 /// ...)` chain in `ops/[kind]/route.ts`; anything else is [`Kind::Unknown`].
@@ -281,7 +281,7 @@ fn now_unix_millis() -> f64 {
     reason = "second-precision input to a millisecond-precision formatter"
 )]
 fn now_iso() -> String {
-    crate::dagster::iso_from_unix_seconds(OffsetDateTime::now_utc().unix_timestamp() as f64)
+    lakehouse_dagster::iso_from_unix_seconds(OffsetDateTime::now_utc().unix_timestamp() as f64)
 }
 
 #[cfg(test)]

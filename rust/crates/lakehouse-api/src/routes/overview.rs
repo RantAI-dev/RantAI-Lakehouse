@@ -11,10 +11,10 @@ use axum::response::{IntoResponse, Response};
 use lakehouse_clickhouse::{ChClient, ChError};
 use serde_json::{Value, json};
 
-use crate::dagster::{DgClient, DgError, iso_from_unix_seconds, map_run_status};
 use crate::json::ApiJson;
 use crate::routes::support::{js_error, num_or_zero, str_col};
 use crate::state::AppState;
+use lakehouse_dagster::{DgClient, DgError, iso_from_unix_seconds, map_run_status};
 
 /// Errors surfaced while building the overview: either `ClickHouse` or
 /// `Dagster` can fail, and — matching the TypeScript's single `try/catch`
@@ -83,7 +83,7 @@ async fn get_body(ch: &ChClient, dagster: &DgClient) -> Result<Value, OverviewEr
     let _jobs = dagster.list_jobs().await?;
 
     let now_ms = now_unix_millis();
-    let recent: Vec<&crate::dagster::DgRun> = runs
+    let recent: Vec<&lakehouse_dagster::DgRun> = runs
         .iter()
         .filter(|r| r.start_time.unwrap_or(0.0) * 1000.0 > now_ms - 864e5)
         .collect();

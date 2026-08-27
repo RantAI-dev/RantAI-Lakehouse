@@ -8,7 +8,6 @@
 //! use `thiserror` typed errors instead.
 
 mod config;
-mod dagster;
 mod error;
 mod json;
 mod routes;

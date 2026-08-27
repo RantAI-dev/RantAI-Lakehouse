@@ -4,9 +4,9 @@
 use std::sync::Arc;
 
 use lakehouse_clickhouse::ChClient;
+use lakehouse_dagster::DgClient;
 
 use crate::config::Config;
-use crate::dagster::DgClient;
 
 /// State shared across all route handlers.
 ///
@@ -38,7 +38,11 @@ impl AppState {
             config.ch_user.clone(),
             config.ch_password.clone(),
         );
-        let dagster = DgClient::new(config.dagster_url.clone());
+        let dagster = DgClient::with_repository(
+            config.dagster_url.clone(),
+            config.dagster_repo.clone(),
+            config.dagster_location.clone(),
+        );
         Self {
             config: Arc::new(config),
             clickhouse: Arc::new(clickhouse),

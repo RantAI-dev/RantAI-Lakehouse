@@ -14,10 +14,10 @@ use lakehouse_clickhouse::{ChClient, ChError};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::dagster::{DgClient, DgError, iso_from_unix_seconds, map_run_status};
 use crate::json::ApiJson;
 use crate::routes::support::{js_error, str_col};
 use crate::state::AppState;
+use lakehouse_dagster::{DgClient, DgError, iso_from_unix_seconds, map_run_status};
 
 /// The four recognized `governance/{kind}` values. Ported from the `if
 /// (kind === ...)` chain in `governance/[kind]/route.ts`; anything else is

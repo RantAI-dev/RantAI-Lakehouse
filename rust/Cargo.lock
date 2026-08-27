@@ -634,6 +634,7 @@ dependencies = [
  "axum",
  "lakehouse-clickhouse",
  "lakehouse-core",
+ "lakehouse-dagster",
  "reqwest",
  "serde",
  "serde_json",
@@ -683,6 +684,31 @@ dependencies = [
  "serde_json",
  "thiserror",
 ]
+
+[[package]]
+name = "lakehouse-dagster"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
+name = "lakehouse-embed"
+version = "0.1.0"
+
+[[package]]
+name = "lakehouse-llm"
+version = "0.1.0"
+
+[[package]]
+name = "lakehouse-notify"
+version = "0.1.0"
 
 [[package]]
 name = "lazy_static"
