@@ -129,6 +129,13 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conflict_renders_409_with_message() {
+        let resp = ApiRejection(ApiError::Conflict("duplicate".to_owned())).into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(resp).await, json!({"error": "duplicate"}));
+    }
+
+    #[tokio::test]
     async fn internal_renders_500_with_message() {
         let resp = ApiRejection(ApiError::Internal("boom".to_owned())).into_response();
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);

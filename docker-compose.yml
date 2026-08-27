@@ -1,4 +1,23 @@
 services:
+  # Phase 2 OLTP store (mutation state that ClickHouse — analytics-only, no
+  # transactions — is a poor fit for). ClickHouse remains the analytics
+  # store; this is additive. Not wired into `depends_on` for lakehouse-api:
+  # `lakehouse-api` deliberately boots and serves Phase 1 routes even when
+  # this container is down or not yet started (see
+  # `lakehouse_store::connect_lazy`'s doc comment) — an ordering dependency
+  # here would defeat that.
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-lakehouse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
+    ports:
+      - "5432:5432"
+    volumes:
+      - lakehouse_postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
   lakehouse-api:
     build:
       context: ./rust
@@ -27,4 +46,8 @@ services:
       SMTP_FROM: ${SMTP_FROM}
       ALERTS_RUN_TOKEN: ${ALERTS_RUN_TOKEN}
       PUBLIC_DASH_TOKEN: ${PUBLIC_DASH_TOKEN}
+      DATABASE_URL: ${DATABASE_URL}
     restart: unless-stopped
+
+volumes:
+  lakehouse_postgres_data:

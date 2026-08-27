@@ -48,6 +48,16 @@ pub enum ApiError {
     /// that fails validation or execution). Maps to HTTP 422.
     #[error("{0}")]
     Unprocessable(String),
+    /// The request conflicts with existing state (e.g. a unique-constraint
+    /// violation on a Postgres write). Maps to HTTP 409.
+    ///
+    /// Phase-2-only: unlike every other variant here, this has no
+    /// TypeScript precedent to reproduce — Phase 1 never wrote to
+    /// persistent storage, so no route ever needed a 409. It exists purely
+    /// for `lakehouse-store`'s `StoreError -> ApiError` mapping and is a
+    /// deliberate, REST-idiomatic addition rather than a ported behavior.
+    #[error("{0}")]
+    Conflict(String),
     /// An unexpected server-side failure. Maps to HTTP 500.
     #[error("{0}")]
     Internal(String),
@@ -77,6 +87,7 @@ impl ApiError {
             Self::Forbidden => 403,
             Self::NotFound(_) => 404,
             Self::Unprocessable(_) => 422,
+            Self::Conflict(_) => 409,
             Self::Internal(_) => 500,
         }
     }
@@ -126,5 +137,10 @@ mod tests {
     #[test]
     fn not_found_maps_to_404() {
         assert_eq!(ApiError::NotFound("not_found".to_owned()).status(), 404);
+    }
+
+    #[test]
+    fn conflict_maps_to_409() {
+        assert_eq!(ApiError::Conflict("duplicate".to_owned()).status(), 409);
     }
 }

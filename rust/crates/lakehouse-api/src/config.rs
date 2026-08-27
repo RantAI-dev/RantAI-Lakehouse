@@ -12,6 +12,10 @@
 //! `src/services/clients/clickhouse.ts`, `src/services/clients/dagster.ts`,
 //! `src/services/clients/llm.ts`, `src/services/clients/embed-jwt.ts`,
 //! `src/app/api/alerts/run/route.ts`, `src/services/clients/notify.ts`.
+//! [`Config::port`] and [`Config::database_url`] are the two exceptions:
+//! both have no TypeScript counterpart to port ([`Config::port`] is
+//! Rust-only, [`Config::database_url`] is Phase-2-only), and each says so
+//! on its own doc comment.
 
 use std::collections::HashMap;
 
@@ -36,7 +40,11 @@ pub enum ConfigError {
 ///
 /// `Debug` is implemented by hand (not derived) so secret fields
 /// (`ch_password`, `llm_key`, `embed_secret`, `alerts_run_token`,
-/// `smtp_pass`) never appear in a `{:?}`-formatted log line. `AppState`
+/// `smtp_pass`, `database_url`) never appear in a `{:?}`-formatted log
+/// line. `database_url` is redacted in full (not field-by-field like
+/// `ch_url`/`ch_password`) because Postgres connection strings embed the
+/// username and password inline (`postgres://user:pass@host/db`) — there
+/// is no separate "password field" to redact around. `AppState`
 /// carries an `Arc<Config>` into every handler, so a stray
 /// `tracing::debug!(?state)` (or any other ad-hoc debug dump) must not be
 /// able to leak these into JSON logs — this repo already runs
@@ -119,6 +127,17 @@ pub struct Config {
     /// TypeScript (which runs under Next.js), specific to this Rust
     /// service.
     pub port: u16,
+    /// Postgres connection string for Phase 2 OLTP storage (`lakehouse-store`).
+    /// Default `"postgres://lakehouse:lakehouse@localhost:5432/lakehouse"`
+    /// (`??` semantics, like every other URL field here). Rust/Phase-2-only:
+    /// no TypeScript equivalent exists, since Phase 1 never wrote to
+    /// persistent storage. An unreachable or misconfigured Postgres is
+    /// deliberately NOT a boot-time failure — see the doc comment on
+    /// `lakehouse_store::connect_lazy` — so, unlike `port`, this field has
+    /// no dedicated [`ConfigError`] variant either; whatever string is here
+    /// is handed to `connect_lazy` as-is and any problem with it surfaces
+    /// lazily, at first use, as an ordinary request-time error.
+    pub database_url: String,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -154,6 +173,7 @@ impl std::fmt::Debug for Config {
             .field("smtp_pass", &REDACTED)
             .field("smtp_from", &self.smtp_from)
             .field("port", &self.port)
+            .field("database_url", &REDACTED)
             .finish()
     }
 }
@@ -232,6 +252,11 @@ impl Config {
             smtp_pass: or_default(env, "SMTP_PASS", ""),
             smtp_from,
             port,
+            database_url: or_default(
+                env,
+                "DATABASE_URL",
+                "postgres://lakehouse:lakehouse@localhost:5432/lakehouse",
+            ),
         })
     }
 
@@ -268,6 +293,10 @@ mod tests {
             ("EMBED_SECRET", "s3cret-embed"),
             ("ALERTS_RUN_TOKEN", "s3cret-alerts-token"),
             ("SMTP_PASS", "s3cret-smtp-pass"),
+            (
+                "DATABASE_URL",
+                "postgres://u:s3cret-pg-pass@db.internal:5432/lakehouse",
+            ),
         ]);
         let cfg = Config::from_map(&env).unwrap();
         let rendered = format!("{cfg:?}");
@@ -277,6 +306,8 @@ mod tests {
             "s3cret-embed",
             "s3cret-alerts-token",
             "s3cret-smtp-pass",
+            "s3cret-pg-pass",
+            "db.internal",
         ] {
             assert!(
                 !rendered.contains(secret),
@@ -306,6 +337,17 @@ mod tests {
         assert_eq!(cfg.smtp_user, None);
         assert_eq!(cfg.smtp_pass, "");
         assert_eq!(cfg.smtp_from, "rantai-lake@localhost");
+        assert_eq!(
+            cfg.database_url,
+            "postgres://lakehouse:lakehouse@localhost:5432/lakehouse"
+        );
+    }
+
+    #[test]
+    fn database_url_is_overridable() {
+        let env = map(&[("DATABASE_URL", "postgres://x:y@example.com/z")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.database_url, "postgres://x:y@example.com/z");
     }
 
     #[test]
