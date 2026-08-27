@@ -16,8 +16,8 @@ use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_bi::builder::sql_with_filters;
-use lakehouse_bi::specs::{CHARTS, ChartSource, KPIS, to_render_spec};
-use lakehouse_bi::store::{self, ChartInput, FilterDef, StoredChartSpec, TileBox};
+use lakehouse_bi::specs::{CHARTS, ChartKind, ChartSource, KPIS, to_render_spec};
+use lakehouse_bi::store::{self, ChartInput, FilterDef, LayoutMap, StoredChartSpec};
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ApiError;
 use serde::Deserialize;
@@ -185,7 +185,7 @@ async fn get_body(
     }))
 }
 
-fn layout_to_json(layout: &HashMap<String, TileBox>) -> Value {
+fn layout_to_json(layout: &LayoutMap) -> Value {
     let mut m = Map::new();
     for (k, b) in layout {
         m.insert(k.clone(), json!({ "x": b.x, "y": b.y, "w": b.w, "h": b.h }));
@@ -244,37 +244,40 @@ pub async fn specs_create(State(state): State<AppState>, body: Bytes) -> ApiResu
     ))
 }
 
-/// `{...ChartInput, id?}` — the `PUT` body shape.
-#[derive(Debug, Deserialize)]
-struct ChartEditBody {
-    #[serde(flatten)]
-    input: ChartInput,
-    #[serde(default)]
-    id: Option<String>,
-}
-
 /// `PUT /api/dashboard/specs` — edit a stored chart, keeping its id.
+///
+/// The `TypeScript` handler (`specs/route.ts::PUT`) parses the body as
+/// loose JSON, checks `id` first, and only THEN builds/validates a
+/// `ChartInput` from it (`specFromInput` coerces missing fields with `??`
+/// rather than failing). Deserializing straight into a `#[serde(flatten)]
+/// ChartInput` here would invert that order — a body missing `mart`/`kind`/
+/// etc. but ALSO missing `id` would fail on the strict `ChartInput` shape
+/// before ever reaching the `id` check, reporting "body JSON tidak valid"
+/// instead of "id wajib untuk edit" (caught by the parity corpus:
+/// `dashboard-specs-edit-missing-id` sends `{"title":"x"}`). Parsing to a
+/// bare [`Value`] first and checking `id` before the strict decode restores
+/// the TS precedence.
 ///
 /// # Errors
 ///
 /// 400 on an unparseable body, a missing `id`, or a validation/`ClickHouse`
 /// failure.
 pub async fn specs_update(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
-    let parsed: ChartEditBody = serde_json::from_slice(&body)
+    let raw: Value = serde_json::from_slice(&body)
         .map_err(|_err| ApiError::BadRequest("body JSON tidak valid".to_owned()))?;
-    let id = parsed.id.unwrap_or_default();
-    if id.is_empty() {
+    let id = raw
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    let Some(id) = id else {
         return Err(ApiError::BadRequest("id wajib untuk edit".to_owned()).into());
-    }
-    let spec = store::spec_from_input(
-        &state.clickhouse,
-        &parsed.input,
-        ChartSource::Ui,
-        "ui",
-        Some(id),
-    )
-    .await
-    .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    };
+    let input: ChartInput = serde_json::from_value(raw)
+        .map_err(|_err| ApiError::BadRequest("body JSON tidak valid".to_owned()))?;
+    let spec = store::spec_from_input(&state.clickhouse, &input, ChartSource::Ui, "ui", Some(id))
+        .await
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
     store::insert_chart(&state.clickhouse, &spec)
         .await
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
@@ -373,7 +376,7 @@ struct BoardEditBody {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    layout: Option<HashMap<String, TileBox>>,
+    layout: Option<LayoutMap>,
     #[serde(default)]
     filters: Option<Vec<FilterDef>>,
     #[serde(default)]
@@ -740,7 +743,7 @@ fn yaml_value(v: &Value) -> String {
     }
 }
 
-fn yaml_board(id: &str, name: &str, layout: Option<&HashMap<String, TileBox>>) -> String {
+fn yaml_board(id: &str, name: &str, layout: Option<&LayoutMap>) -> String {
     let mut lines = vec![
         format!("  - id: {id}"),
         format!("    name: {}", yaml_value(&json!(name))),
@@ -759,25 +762,118 @@ fn yaml_board(id: &str, name: &str, layout: Option<&HashMap<String, TileBox>>) -
     lines.join("\n") + "\n"
 }
 
+/// Renders `n` the way `JSON.stringify` renders a JS `number`: a
+/// whole-valued float becomes the bare integer (`3000000`, not
+/// `3000000.0`, which is what `serde_json`'s own `Value::Number` `Display`
+/// gives an `f64`-backed number — verified directly, not assumed).
+fn js_number(n: f64) -> Value {
+    #[allow(clippy::cast_possible_truncation)]
+    if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e15 {
+        json!(n as i64)
+    } else {
+        json!(n)
+    }
+}
+
 fn yaml_chart(c: &StoredChartSpec) -> String {
     let mut lines = vec![
         format!("- id: {}", c.spec.id),
         format!("  board: {}", yaml_value(&json!(c.board))),
     ];
-    let def = serde_json::to_value(&c.def).unwrap_or_else(|_| json!({}));
-    if let Value::Object(map) = def {
-        for (k, val) in map {
-            match &val {
-                Value::Null => {}
-                Value::Array(items) => {
-                    let rendered = items.iter().map(yaml_value).collect::<Vec<_>>().join(", ");
-                    lines.push(format!("  {k}: [{rendered}]"));
-                }
-                other => lines.push(format!("  {k}: {}", yaml_value(other))),
+    for (k, val) in chart_def_fields(&c.def) {
+        match &val {
+            Value::Null => {}
+            Value::Array(items) => {
+                let rendered = items.iter().map(yaml_value).collect::<Vec<_>>().join(", ");
+                lines.push(format!("  {k}: [{rendered}]"));
             }
+            other => lines.push(format!("  {k}: {}", yaml_value(other))),
         }
     }
     lines.join("\n")
+}
+
+/// `def`'s field order, mirroring the `TypeScript` object-literal
+/// construction order in `bi-store.ts::specFromInput` — NOT `ChartInput`'s
+/// Rust struct declaration order, which the TS deliberately does not
+/// follow. Each `kind` branch there builds its own literal with its own key
+/// order (`mart` comes before `kind` for charts/tables, but after it for
+/// text/kpi/gauge), and `dashboard-export`'s captured corpus — taken from a
+/// live, TS-created board — reflects that exact order. Iterating
+/// `serde_json::to_value(def)` instead would silently reorder every field
+/// to match declaration order and fail parity nondeterministically (`kind`
+/// vs `mart`, `caption` vs `span`/`board`, ...).
+fn chart_def_fields(def: &ChartInput) -> Vec<(&'static str, Value)> {
+    let mut out: Vec<(&'static str, Value)> = Vec::new();
+    match def.kind {
+        ChartKind::Text => {
+            out.push(("title", json!(def.title)));
+            out.push(("kind", json!(def.kind)));
+            out.push(("mart", json!(def.mart)));
+            out.push(("dimension", json!(def.dimension)));
+            out.push(("measures", json!(def.measures)));
+            if let Some(text) = &def.text {
+                out.push(("text", json!(text)));
+            }
+            if let Some(span) = def.span {
+                out.push(("span", json!(span)));
+            }
+            if let Some(board) = &def.board {
+                out.push(("board", json!(board)));
+            }
+        }
+        ChartKind::Kpi | ChartKind::Gauge => {
+            out.push(("title", json!(def.title)));
+            out.push(("kind", json!(def.kind)));
+            out.push(("mart", json!(def.mart)));
+            out.push(("dimension", json!(def.dimension)));
+            out.push(("measures", json!(def.measures)));
+            if let Some(aggregate) = &def.aggregate {
+                out.push(("aggregate", json!(aggregate)));
+            }
+            if let Some(caption) = &def.caption {
+                out.push(("caption", json!(caption)));
+            }
+            if let Some(target) = def.target {
+                out.push(("target", js_number(target)));
+            }
+            if let Some(span) = def.span {
+                out.push(("span", json!(span)));
+            }
+            if let Some(board) = &def.board {
+                out.push(("board", json!(board)));
+            }
+        }
+        _ => {
+            out.push(("title", json!(def.title)));
+            if let Some(subtitle) = &def.subtitle {
+                out.push(("subtitle", json!(subtitle)));
+            }
+            out.push(("mart", json!(def.mart)));
+            out.push(("kind", json!(def.kind)));
+            out.push(("dimension", json!(def.dimension)));
+            out.push(("measures", json!(def.measures)));
+            if let Some(breakdown) = &def.breakdown {
+                out.push(("breakdown", json!(breakdown)));
+            }
+            if let Some(aggregate) = &def.aggregate {
+                out.push(("aggregate", json!(aggregate)));
+            }
+            if let Some(limit) = def.limit {
+                out.push(("limit", json!(limit)));
+            }
+            if let Some(order) = &def.order {
+                out.push(("order", json!(order)));
+            }
+            if let Some(span) = def.span {
+                out.push(("span", json!(span)));
+            }
+            if let Some(board) = &def.board {
+                out.push(("board", json!(board)));
+            }
+        }
+    }
+    out
 }
 
 // ── /api/dashboard/embed-info ───────────────────────────────────────────
@@ -913,10 +1009,10 @@ mod tests {
 
     #[test]
     fn yaml_board_renders_nonempty_layout() {
-        let mut layout = HashMap::new();
+        let mut layout = LayoutMap::new();
         layout.insert(
             "c1".to_owned(),
-            TileBox {
+            store::TileBox {
                 x: 0,
                 y: 0,
                 w: 3,

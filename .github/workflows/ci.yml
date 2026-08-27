@@ -72,6 +72,15 @@ jobs:
         with:
           workspaces: rust
 
+      # Needed by lakehouse-bi's specs_match_typescript drift guard, which
+      # shells out to `bun` to cross-check lakehouse_bi::specs against
+      # src/lib/dashboard-specs.ts. It skips cleanly without bun, but this
+      # job is where it should actually run.
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.12"
+
       - name: Format
         run: cargo fmt --check
         working-directory: rust

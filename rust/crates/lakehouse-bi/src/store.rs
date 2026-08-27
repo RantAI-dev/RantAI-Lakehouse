@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 
+use indexmap::IndexMap;
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ident::{Ident, SqlLiteral};
 use serde::{Deserialize, Serialize};
@@ -120,8 +121,36 @@ pub struct ChartSpec {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub caption: Option<String>,
     /// Target/max value for `kind: "gauge"` tiles.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "serialize_js_number"
+    )]
     pub target: Option<f64>,
+}
+
+/// Serializes `Option<f64>` the way `JSON.stringify` renders a JS `number`:
+/// a whole-valued float (e.g. `3_000_000.0`) becomes the bare integer
+/// `3000000`, not `3000000.0`. `serde_json`'s default `f64` `Serialize`
+/// always keeps the decimal point, which silently disagreed with the
+/// TS-captured corpus (`target: 3000000` in both `dashboard-specs-list` and
+/// `dashboard-export`) even though the underlying value was correct.
+#[allow(
+    clippy::ref_option,
+    reason = "serde's `serialize_with` contract requires `&Option<f64>`, not `Option<&f64>`"
+)]
+fn serialize_js_number<S: serde::Serializer>(
+    value: &Option<f64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        None => serializer.serialize_none(),
+        #[allow(clippy::cast_possible_truncation)]
+        Some(n) if n.is_finite() && n.fract() == 0.0 && n.abs() < 1e15 => {
+            serializer.serialize_i64(*n as i64)
+        }
+        Some(n) => serializer.serialize_f64(*n),
+    }
 }
 
 /// A stored chart spec, as read back from `console.bi_chart`.
@@ -186,7 +215,11 @@ pub struct ChartInput {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub caption: Option<String>,
     /// Target/max (`kind: "gauge"`).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        serialize_with = "serialize_js_number"
+    )]
     pub target: Option<f64>,
 }
 
@@ -236,7 +269,13 @@ pub struct TileBox {
 }
 
 /// Layout, keyed by chart id.
-pub type LayoutMap = HashMap<String, TileBox>;
+///
+/// Order-preserving (`IndexMap`, not `HashMap`): `/api/dashboard/export`
+/// renders this map directly into YAML by iterating it, and the corpus
+/// (`dashboard-export`) captures a specific, non-alphabetical key order
+/// straight from the `layout_json` column. A `HashMap` here would make that
+/// order effectively random per run and fail parity nondeterministically.
+pub type LayoutMap = IndexMap<String, TileBox>;
 
 /// A dashboard filter: a column's allowed values, applied to every tile that
 /// has that column.

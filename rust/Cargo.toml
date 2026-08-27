@@ -19,6 +19,7 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+indexmap = { version = "2", features = ["serde"] }
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
