@@ -26,7 +26,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::builder::{QueryBuilder, build_kpi_sql};
-use crate::specs::{ChartKind, ChartSource, ChartY, NumFmt};
+use crate::specs::{Aggregate, ChartKind, ChartSource, ChartY, NumFmt};
 
 /// Errors produced while validating input or talking to `ClickHouse` through
 /// this module. Ports the `Error` throws scattered through `bi-store.ts`.
@@ -942,7 +942,14 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         .map_err(|_| BiError::Validation("kolom measure tidak valid / tak ada.".to_owned()))?;
     let mart_ident = Ident::new(mart.as_str())
         .map_err(|_| BiError::Validation(format!("nama mart tidak valid: {mart}")))?;
-    let sql = build_kpi_sql(&mart_ident, &measure_ident, &agg, &[]);
+    // `agg` was already checked against `aggregate_allowed` above, so this
+    // conversion is exact (never hits the `Sum` fallback).
+    let sql = build_kpi_sql(
+        &mart_ident,
+        &measure_ident,
+        Aggregate::from_str_lossy(&agg),
+        &[],
+    );
     let spec = ChartSpec {
         id: new_id,
         title,
@@ -1162,9 +1169,11 @@ fn build_chart_sql(
         })?),
         None => None,
     };
+    // `agg` was already checked against `aggregate_allowed` by the caller
+    // (`spec_from_chart_input`), so this conversion is exact.
     Ok(QueryBuilder::new(mart_ident)
         .dimension(dimension_ident)
-        .aggregate(agg)
+        .aggregate(Aggregate::from_str_lossy(agg))
         .order(order)
         .limit(limit)
         .breakdown(breakdown_ident)

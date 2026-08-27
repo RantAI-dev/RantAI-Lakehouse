@@ -16,6 +16,7 @@ use std::marker::PhantomData;
 
 use lakehouse_core::ident::{Ident, SqlLiteral};
 
+use crate::specs::Aggregate;
 use crate::store::{ChartInput, FilterDef, StoredChartSpec};
 
 /// Typestate marker: a [`QueryBuilder`] that still needs its projection
@@ -37,7 +38,7 @@ pub struct QueryBuilder<S> {
     mart: Ident,
     dimension: Option<Ident>,
     measures: Vec<Ident>,
-    agg: String,
+    agg: Aggregate,
     order: String,
     limit: u32,
     breakdown: Option<Ident>,
@@ -54,7 +55,7 @@ impl QueryBuilder<NeedsProjection> {
             mart,
             dimension: None,
             measures: Vec::new(),
-            agg: "sum".to_owned(),
+            agg: Aggregate::Sum,
             order: "none".to_owned(),
             limit: 20,
             breakdown: None,
@@ -70,10 +71,10 @@ impl QueryBuilder<NeedsProjection> {
         self
     }
 
-    /// Set the aggregate function (`sum`, `avg`, `max`, `min`, `count`).
+    /// Set the aggregate function.
     #[must_use]
-    pub fn aggregate(mut self, agg: impl Into<String>) -> Self {
-        self.agg = agg.into();
+    pub fn aggregate(mut self, agg: Aggregate) -> Self {
+        self.agg = agg;
         self
     }
 
@@ -168,7 +169,7 @@ impl QueryBuilder<Ready> {
             } else {
                 format!("WHERE {} AND", self.where_clauses.join(" AND "))
             };
-            let order_expr = if self.agg == "count" {
+            let order_expr = if self.agg == Aggregate::Count {
                 "count()".to_owned()
             } else {
                 format!("{}({measure})", self.agg)
@@ -206,7 +207,7 @@ impl QueryBuilder<Ready> {
     }
 
     fn agg_of(&self, measure: &Ident) -> String {
-        if self.agg == "count" {
+        if self.agg == Aggregate::Count {
             format!("count() AS {measure}")
         } else {
             format!("round({}({measure})) AS {measure}", self.agg)
@@ -217,8 +218,13 @@ impl QueryBuilder<Ready> {
 /// KPI SQL (single number, column `v`) with an optional WHERE clause. Ports
 /// `buildKpiSql` in `bi-store.ts`.
 #[must_use]
-pub fn build_kpi_sql(mart: &Ident, measure: &Ident, agg: &str, where_clauses: &[String]) -> String {
-    let val = if agg == "count" {
+pub fn build_kpi_sql(
+    mart: &Ident,
+    measure: &Ident,
+    agg: Aggregate,
+    where_clauses: &[String],
+) -> String {
+    let val = if agg == Aggregate::Count {
         "count()".to_owned()
     } else {
         format!("round({agg}({measure}))")
@@ -306,7 +312,12 @@ where
         return spec.spec.sql.clone();
     }
 
-    let agg = def.aggregate.clone().unwrap_or_else(|| "sum".to_owned());
+    // `Aggregate::from_str_lossy` falls back to `Sum` for a missing OR
+    // unrecognized value — this is the untrusted path named in the H4
+    // finding (`def.aggregate` comes straight from stored `spec_json`, never
+    // re-checked against an allowlist), so it must never hand raw text to
+    // the SQL builder below.
+    let agg = Aggregate::from_str_lossy(def.aggregate.as_deref().unwrap_or("sum"));
     // `mart` was already validated as a well-formed identifier when the
     // spec was created via `specFromInput`, so re-validating here would
     // only ever fail on data corruption; fall back to the stored SQL rather
@@ -326,7 +337,7 @@ where
         let Ok(measure) = Ident::new(measure_raw.clone()) else {
             return spec.spec.sql.clone();
         };
-        return build_kpi_sql(&mart, &measure, &agg, &where_clauses);
+        return build_kpi_sql(&mart, &measure, agg, &where_clauses);
     }
 
     let Ok(dimension) = Ident::new(def.dimension.clone()) else {
