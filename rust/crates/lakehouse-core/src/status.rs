@@ -249,9 +249,55 @@ pub enum WorkloadStatus {
 
 #[cfg(test)]
 mod tests {
-    #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+    // `#[expect(...)]` would fire `unfulfilled_lint_expectations` on any test
+    // that happens not to unwrap, so `allow` is correct here.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    /// The three enums whose serde representation is NOT plain lowercase, and
+    /// which are therefore the easiest to get silently wrong. These strings are
+    /// a live contract: `metrics.engine` and `metrics.workloadClass` are
+    /// emitted by `src/app/api/query/run/route.ts:55-56` and asserted by the
+    /// captured parity corpus.
+    #[test]
+    fn workload_class_serializes_as_kebab_case() {
+        assert_eq!(
+            serde_json::to_string(&WorkloadClass::HotAnalytics).unwrap(),
+            "\"hot-analytics\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkloadClass::JoinHeavy).unwrap(),
+            "\"join-heavy\""
+        );
+    }
+
+    #[test]
+    fn engine_category_serializes_as_kebab_case() {
+        assert_eq!(
+            serde_json::to_string(&EngineCategory::HotStore).unwrap(),
+            "\"hot-store\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EngineCategory::FederatedCompute).unwrap(),
+            "\"federated-compute\""
+        );
+    }
+
+    #[test]
+    fn autonomy_level_keeps_uppercase_l_prefix() {
+        // Lowercasing would produce "l1" and break `src/services/contracts/agents.ts`.
+        assert_eq!(serde_json::to_string(&AutonomyLevel::L1).unwrap(), "\"L1\"");
+        assert_eq!(serde_json::to_string(&AutonomyLevel::L4).unwrap(), "\"L4\"");
+    }
+
+    #[test]
+    fn autonomy_level_round_trips() {
+        assert_eq!(
+            serde_json::from_str::<AutonomyLevel>("\"L3\"").unwrap(),
+            AutonomyLevel::L3
+        );
+    }
 
     #[test]
     fn health_serializes_to_lowercase_tag() {

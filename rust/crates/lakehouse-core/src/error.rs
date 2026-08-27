@@ -2,7 +2,17 @@
 //!
 //! Mirrors the status-code and message contract that the TypeScript route
 //! handlers currently return, e.g. `{"error": "invalid_or_expired"}` with
-//! HTTP 401 (see `src/app/api/embed/data/route.ts`).
+//! HTTP 401 (see `src/app/api/embed/data/route.ts:43`).
+//!
+//! # On 422 vs 500
+//!
+//! The TypeScript is deliberately over-broad here and we reproduce it. At
+//! `src/app/api/query/run/route.ts:72-74` the `catch` is unconditional
+//! `status: 422`, so a `ClickHouse` *connection* failure — genuinely our outage,
+//! not the user's SQL — surfaces as 422 alongside real syntax errors. Parity
+//! is the cutover gate, so [`Self::Unprocessable`] keeps that behavior and
+//! [`Self::Internal`] is reserved for Rust-side failures with no TypeScript
+//! counterpart. Revisit only after cutover, as a deliberate divergence.
 
 use thiserror::Error;
 
@@ -16,13 +26,19 @@ pub enum ApiError {
     BadRequest(String),
     /// Missing, invalid, or expired credentials. Maps to HTTP 401.
     ///
-    /// The message is fixed to match the TypeScript contract exactly.
-    #[error("invalid_or_expired")]
-    Unauthorized,
+    /// Carries its message because the TypeScript returns two different 401
+    /// bodies: `invalid_or_expired` from `src/app/api/embed/data/route.ts:43`
+    /// (bad or expired embed JWT) and `unauthorized` from
+    /// `src/app/api/alerts/run/route.ts:19` (bad `ALERTS_RUN_TOKEN`). Prefer
+    /// the [`Self::invalid_or_expired`] and [`Self::unauthorized`]
+    /// constructors over building the string at each call site.
+    #[error("{0}")]
+    Unauthorized(String),
     /// The caller is authenticated but not allowed to perform this action.
     /// Maps to HTTP 403.
     ///
-    /// The message is fixed to match the TypeScript contract exactly.
+    /// A unit variant because `embedding_disabled` is the only 403 body in the
+    /// codebase — verified by sweeping every handler under `src/app/api`.
     #[error("embedding_disabled")]
     Forbidden,
     /// The requested resource does not exist. Maps to HTTP 404.
@@ -38,12 +54,26 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// A 401 for a bad or expired embed JWT, matching
+    /// `src/app/api/embed/data/route.ts:43`.
+    #[must_use]
+    pub fn invalid_or_expired() -> Self {
+        Self::Unauthorized("invalid_or_expired".to_owned())
+    }
+
+    /// A 401 for a missing or wrong shared token, matching
+    /// `src/app/api/alerts/run/route.ts:19`.
+    #[must_use]
+    pub fn unauthorized() -> Self {
+        Self::Unauthorized("unauthorized".to_owned())
+    }
+
     /// The HTTP status code this error should be rendered with.
     #[must_use]
     pub const fn status(&self) -> u16 {
         match self {
             Self::BadRequest(_) => 400,
-            Self::Unauthorized => 401,
+            Self::Unauthorized(_) => 401,
             Self::Forbidden => 403,
             Self::NotFound(_) => 404,
             Self::Unprocessable(_) => 422,
@@ -70,8 +100,22 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_message_matches_ts_contract() {
-        assert_eq!(ApiError::Unauthorized.to_string(), "invalid_or_expired");
+    fn invalid_or_expired_matches_embed_route_contract() {
+        assert_eq!(
+            ApiError::invalid_or_expired().to_string(),
+            "invalid_or_expired"
+        );
+    }
+
+    #[test]
+    fn unauthorized_matches_alerts_run_route_contract() {
+        assert_eq!(ApiError::unauthorized().to_string(), "unauthorized");
+    }
+
+    #[test]
+    fn both_unauthorized_flavours_map_to_401() {
+        assert_eq!(ApiError::invalid_or_expired().status(), 401);
+        assert_eq!(ApiError::unauthorized().status(), 401);
     }
 
     #[test]

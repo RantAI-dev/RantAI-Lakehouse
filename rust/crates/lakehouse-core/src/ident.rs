@@ -6,6 +6,23 @@
 //! `esc()` function at the call site. Here the validation and escaping are
 //! baked into the type itself, so a raw, unchecked `String` can never reach
 //! a query builder as an identifier or literal.
+//!
+//! # Scope of the guarantee
+//!
+//! [`Ident`] guarantees **lexical** safety only — that the string cannot break
+//! out of its syntactic position. It does **not** guarantee the identifier is
+//! one the caller is allowed to reference. The TypeScript always pairs
+//! `IDENT.test(...)` with an existence check against `system.columns`
+//! (`bi-store.ts:337, 344, 361, 372, 410`) and callers here must keep doing
+//! the same. Concretely, `Ident::new("_part")` succeeds — a leading underscore
+//! is legal — and `_part`, `_shard_num`, `_partition_id`, and `_row_exists`
+//! are real `ClickHouse` virtual columns that never appear in `system.columns`.
+//! Dropping the allowlist because "the type is safe" would expose them.
+//!
+//! [`Ident`] is also slightly stricter than the TypeScript, which permits a
+//! leading digit (`IDENT = /^[a-zA-Z0-9_]+$/`, `bi-store.ts:47`). `ClickHouse`
+//! would reject `2024col` unquoted anyway, so the effect is only that the
+//! rejection becomes a clean 400 instead of a downstream query failure.
 
 use std::fmt;
 
