@@ -724,14 +724,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "lakehouse-alerts"
+version = "0.1.0"
+dependencies = [
+ "lakehouse-bi",
+ "lakehouse-clickhouse",
+ "lakehouse-core",
+ "lakehouse-notify",
+ "rand 0.8.8",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
 name = "lakehouse-api"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "lakehouse-alerts",
  "lakehouse-clickhouse",
  "lakehouse-core",
  "lakehouse-dagster",
+ "lakehouse-notify",
  "reqwest",
  "serde",
  "serde_json",
