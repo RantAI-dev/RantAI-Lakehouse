@@ -134,6 +134,15 @@ fn unordered_array_keys(name: &str) -> &'static [&'static str] {
         // `namespaces` is grouped from the same unordered `assets` scan, so
         // it inherits the same lack of ordering guarantee.
         "catalog-list" => &["assets", "namespaces"],
+        // `routes::governance::classification`'s ClickHouse-derived rows
+        // come from the identical shape of query as `catalog-list`
+        // (`SELECT ... FROM bronze_meta.dataset_catalog UNION ALL SELECT
+        // ... FROM bronze_meta_sec.dataset_catalog`, no `ORDER BY`) --
+        // confirmed live the same way: consecutive requests against an
+        // unmodified process returned different orderings. Pre-existing,
+        // not introduced by the Task 2.3/2.6 Postgres unions; it only
+        // surfaced once this entry's corpus needed re-capturing for those.
+        "gov-classification" => &["classifications"],
         _ => &[],
     }
 }

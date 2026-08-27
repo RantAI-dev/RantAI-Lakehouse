@@ -2,14 +2,31 @@ import type {
   OverviewService,
   OverviewSummary,
   ActivityItem,
+  AlertItem,
 } from "../contracts/overview";
-import { mockOverviewService } from "../mock/overview";
 import { ServiceError } from "../errors";
 
 /**
- * OverviewService: getSummary + listActivity NYATA (agregat lakehouse).
- * Alerts (list/ack/resolve) masih mock — belum ada alert engine.
+ * OverviewService NYATA sepenuhnya: getSummary + listActivity dari
+ * ClickHouse/Dagster; alerts (list/ack/resolve) dari Postgres (Task 2.6) —
+ * lihat `lakehouse_store::overview` untuk alasan instance alert disimpan di
+ * Postgres, bukan ClickHouse. mock/overview.ts sudah dihapus.
  */
+async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: body === undefined ? undefined : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal,
+  });
+  const json = await res.json();
+  if (!res.ok) {
+    const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
+    throw new ServiceError(kind, json?.error ?? `Gagal (${res.status})`);
+  }
+  return json as T;
+}
+
 export const clickhouseOverviewService: OverviewService = {
   async getSummary(signal) {
     const res = await fetch("/api/overview", { signal });
@@ -23,7 +40,16 @@ export const clickhouseOverviewService: OverviewService = {
     if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Activity gagal dimuat");
     return json.activity as ActivityItem[];
   },
-  listAlerts: (s) => mockOverviewService.listAlerts(s),
-  acknowledgeAlert: (id, s) => mockOverviewService.acknowledgeAlert(id, s),
-  resolveAlert: (id, note, s) => mockOverviewService.resolveAlert(id, note, s),
+  async listAlerts(signal) {
+    const res = await fetch("/api/overview/alerts", { signal });
+    const json = await res.json();
+    if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Alerts gagal dimuat");
+    return json as AlertItem[];
+  },
+  acknowledgeAlert(id, signal) {
+    return postJson<AlertItem>(`/api/overview/alerts/${encodeURIComponent(id)}/acknowledge`, undefined, signal);
+  },
+  resolveAlert(id, note, signal) {
+    return postJson<AlertItem>(`/api/overview/alerts/${encodeURIComponent(id)}/resolve`, { note }, signal);
+  },
 };

@@ -5,12 +5,18 @@
 //! `ClickHouse` aggregates with `Dagster` run history (`POST` is
 //! read-only despite the verb — it only lists recent runs).
 
-use axum::extract::State;
+use axum::body::Bytes;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use lakehouse_clickhouse::{ChClient, ChError};
+use lakehouse_core::ApiError;
+use lakehouse_store::PgPool;
+use lakehouse_store::overview::{self, AlertItem};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::support::{js_error, num_or_zero, str_col};
 use crate::state::AppState;
@@ -166,6 +172,103 @@ pub async fn refresh(State(state): State<AppState>) -> Response {
 )]
 fn now_unix_millis() -> f64 {
     time::OffsetDateTime::now_utc().unix_timestamp_nanos() as f64 / 1_000_000.0
+}
+
+// ── Alert instances (Task 2.6) ──────────────────────────────────────────
+//
+// See `lakehouse_store::overview`'s module doc comment for why these live
+// in Postgres rather than alongside `lakehouse_alerts`'s rule definitions
+// in ClickHouse.
+
+fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
+    state.pg.as_deref().ok_or_else(|| {
+        ApiError::Unavailable(
+            "overview alert store unavailable: no Postgres pool is configured \
+             (DATABASE_URL is missing or not a valid Postgres connection string)"
+                .to_owned(),
+        )
+    })
+}
+
+/// `GET /api/overview/alerts` — every alert instance, most recent first.
+///
+/// # Errors
+///
+/// 503 if no pool is configured; 500 on a database failure.
+pub async fn list_alerts(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<AlertItem>>> {
+    Ok(ApiJson(overview::list_alerts(pool(&state)?).await?))
+}
+
+/// `POST /api/overview/alerts/{id}/acknowledge`.
+///
+/// # Errors
+///
+/// 404 if `id` is unknown; 503/500 as above.
+pub async fn acknowledge_alert(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    match overview::acknowledge_alert(
+        match pool(&state) {
+            Ok(p) => p,
+            Err(err) => return crate::error::ApiRejection(err).into_response(),
+        },
+        &id,
+    )
+    .await
+    {
+        Ok(Some(alert)) => (StatusCode::OK, ApiJson(alert)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            ApiJson(json!({ "error": format!("Alert {id} not found") })),
+        )
+            .into_response(),
+        Err(err) => crate::error::ApiRejection(err.into()).into_response(),
+    }
+}
+
+/// The `POST /api/overview/alerts/{id}/resolve` body.
+#[derive(Debug, Deserialize)]
+pub struct ResolveAlertBody {
+    #[serde(default)]
+    note: String,
+}
+
+/// `POST /api/overview/alerts/{id}/resolve`.
+///
+/// # Errors
+///
+/// 400 on a malformed body; 404 if `id` is unknown; 503/500 as above.
+pub async fn resolve_alert(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let note: ResolveAlertBody = if body.is_empty() {
+        ResolveAlertBody {
+            note: String::new(),
+        }
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(b) => b,
+            Err(err) => {
+                return crate::error::ApiRejection(ApiError::BadRequest(format!(
+                    "invalid JSON: {err}"
+                )))
+                .into_response();
+            }
+        }
+    };
+    let pg = match pool(&state) {
+        Ok(p) => p,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    match overview::resolve_alert(pg, &id, &note.note).await {
+        Ok(Some(alert)) => (StatusCode::OK, ApiJson(alert)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            ApiJson(json!({ "error": format!("Alert {id} not found") })),
+        )
+            .into_response(),
+        Err(err) => crate::error::ApiRejection(err.into()).into_response(),
+    }
 }
 
 #[cfg(test)]

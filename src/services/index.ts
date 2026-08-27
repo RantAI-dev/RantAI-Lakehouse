@@ -2,7 +2,6 @@
  * Service registry — pages import from here, never from mock modules directly.
  * Swap `mock*` for HTTP/Flight adapters when backends are ready.
  */
-import { mockOverviewService } from "./mock/overview"
 import { mockAssetService } from "./mock/assets"
 import { mockStreamingService } from "./mock/streaming"
 import { clickhouseQueryService } from "./clients/queries"
@@ -15,12 +14,12 @@ import { clickhouseGovernanceService } from "./clients/governance"
 import { postgresIdentityService } from "./clients/identity"
 import { mockKnowledgeService } from "./mock/knowledge"
 import { mockAgentService } from "./mock/agents"
-import { mockOpsService } from "./mock/ops"
 import { mockConnectorService } from "./mock/connectors"
-import { mockStorageService } from "./mock/storage"
 
+// Overview kini NYATA sepenuhnya — summary/activity dari ClickHouse+Dagster,
+// alerts (list/ack/resolve) dari Postgres (Task 2.6). mock/overview.ts
+// sudah dihapus.
 export const overviewService = clickhouseOverviewService
-void mockOverviewService
 export const assetService = clickhouseAssetService
 void mockAssetService
 // Pipelines kini NYATA sepenuhnya — list/get/runs/trigger dari Dagster,
@@ -37,11 +36,15 @@ export const agentService = mockAgentService
 // Governance kini NYATA sepenuhnya — reads dari ClickHouse/Dagster,
 // policies + create*Rule dari Postgres. mock/governance.ts sudah dihapus.
 export const governanceService = clickhouseGovernanceService
+// Ops kini NYATA sepenuhnya — observability/usage/workloads/services dari
+// ClickHouse+Dagster, cancelWorkload adalah KILL QUERY nyata. mock/ops.ts
+// sudah dihapus.
 export const opsService = clickhouseOpsService
-void mockOpsService
 // Identity kini NYATA — pengguna/peran/tenant/service identity di Postgres.
 // Seluruh method kontrak terlayani, jadi mock/identity.ts sudah dihapus.
 export const identityService = postgresIdentityService
 export const connectorService = mockConnectorService
+// Storage kini NYATA sepenuhnya — overview dari ClickHouse/Iceberg,
+// policies/operations/restore dari Postgres (Task 2.6). mock/storage.ts
+// sudah dihapus.
 export const storageService = clickhouseStorageService
-void mockStorageService

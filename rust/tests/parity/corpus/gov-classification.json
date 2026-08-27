@@ -9,6 +9,118 @@
   "body": {
     "classifications": [
       {
+        "id": "c-artis-top-global-chart",
+        "asset": "Artis Top 10 Global Chart (Billboard & Spotify, 2021\u20132025)",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-bandara-ramah-muslim-jakarta",
+        "asset": "Bandara Ramah Muslim (melayani Jakarta)",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-capaian-pariwisata-ramah-muslim",
+        "asset": "Pengakuan & Capaian Pariwisata Ramah Muslim",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-pengunjung-event-2026",
+        "asset": "Jumlah Pengunjung Event 2026",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-hotel-ramah-muslim-jakarta",
+        "asset": "Hotel Ramah Muslim Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-inovasi-wisata-ramah-muslim-jakarta",
+        "asset": "Inovasi & Program Wisata Ramah Muslim Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-mall-ramah-muslim-jakarta",
+        "asset": "Mall & Fasilitas Ramah Muslim Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-produk-kreatif-makanan-halal-jakarta",
+        "asset": "Produk Kreatif Makanan Tersertifikasi Halal Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-restoran-halal-jakarta",
+        "asset": "Restoran & Zona KHAS Tersertifikasi Halal Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-rph-halal-jakarta",
+        "asset": "RPH Tersertifikasi Halal Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-restoran-tripadvisor-jakarta",
+        "asset": "Restoran Jakarta TripAdvisor (Kuliner GCI)",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-toko-suvenir-tripadvisor-2026",
+        "asset": "Toko Suvenir TripAdvisor 2026",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-warisan-islam-wisata-budaya-muslim-jakarta",
+        "asset": "Warisan Islam & Wisata Budaya Muslim Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-wisman-jakarta-per-bulan",
+        "asset": "Wisman DKI Jakarta per Bulan (total)",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-wisman-jakarta-per-negara",
+        "asset": "Wisman DKI Jakarta per Negara (BPS dibersihkan)",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-wisman-jakarta-per-pintu-masuk",
+        "asset": "Wisman per Pintu Masuk (dinormalisasi)",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
         "id": "c-jumlah-realisasi-investasi-pariwisata",
         "asset": "Jumlah Realisasi Investasi Pariwisata",
         "classification": "internal",
@@ -297,7 +409,7 @@
       },
       {
         "id": "c-jumlah-kunjungan-wisatawan-ke-obyek-wisata-unggulan-menurut-lokasi-di-dki-jakarta-tahun-2023",
-        "asset": "Jumlah Kunjungan Wisatawan ke Obyek Wisata Unggulan Menurut Lokasi di DKI Jakarta Tahun 2023",
+        "asset": "Jumlah Kunjungan Wisatawan ke Obyek Wisata Unggulan Menurut Lokasi\u00a0di\u00a0DKI\u00a0Jakarta Tahun 2023",
         "classification": "internal",
         "confidence": 1,
         "reviewStatus": "auto"
@@ -1290,116 +1402,22 @@
         "reviewStatus": "auto"
       },
       {
-        "id": "c-artis-top-global-chart",
-        "asset": "Artis Top 10 Global Chart (Billboard & Spotify, 2021–2025)",
-        "classification": "internal",
+        "id": "77777777-7777-4777-8777-000000000001",
+        "asset": "core.customer.customer_360",
+        "column": "email",
+        "classification": "confidential",
         "confidence": 1,
-        "reviewStatus": "auto"
+        "reviewStatus": "reviewed",
+        "maskingRule": "hash_email"
       },
       {
-        "id": "c-bandara-ramah-muslim-jakarta",
-        "asset": "Bandara Ramah Muslim (melayani Jakarta)",
-        "classification": "internal",
+        "id": "77777777-7777-4777-8777-000000000002",
+        "asset": "core.commerce.orders_enriched",
+        "column": "card_last4",
+        "classification": "restricted",
         "confidence": 1,
-        "reviewStatus": "auto"
-      },
-      {
-        "id": "c-capaian-pariwisata-ramah-muslim",
-        "asset": "Pengakuan & Capaian Pariwisata Ramah Muslim",
-        "classification": "internal",
-        "confidence": 1,
-        "reviewStatus": "auto"
-      },
-      {
-        "id": "c-jumlah-pengunjung-event-2026",
-        "asset": "Jumlah Pengunjung Event 2026",
-        "classification": "internal",
-        "confidence": 1,
-        "reviewStatus": "auto"
-      },
-      {
-        "id": "c-hotel-ramah-muslim-jakarta",
-        "asset": "Hotel Ramah Muslim Jakarta",
-        "classification": "internal",
-        "confidence": 1,
-        "reviewStatus": "auto"
-      },
-      {
-        "id": "c-inovasi-wisata-ramah-muslim-jakarta",
-        "asset": "Inovasi & Program Wisata Ramah Muslim Jakarta",
-        "classification": "internal",
-        "confidence": 1,
-        "reviewStatus": "auto"
-      },
-      {
-        "id": "c-mall-ramah-muslim-jakarta",
-        "asset": "Mall & Fasilitas Ramah Muslim Jakarta",
-        "classification": "internal",
-        "confidence": 1,
-        "reviewStatus": "auto"
-      },
-      {
-        "id": "c-produk-kreatif-makanan-halal-jakarta",
-        "asset": "Produk Kreatif Makanan Tersertifikasi Halal Jakarta",
-        "classification": "internal",
-        "confidence": 1,
-        "reviewStatus": "auto"
-      },
-      {
-        "id": "c-restoran-halal-jakarta",
-        "asset": "Restoran & Zona KHAS Tersertifikasi Halal Jakarta",
-        "classification": "internal",
-        "confidence": 1,
-        "reviewStatus": "auto"
-      },
-      {
-        "id": "c-rph-halal-jakarta",
-        "asset": "RPH Tersertifikasi Halal Jakarta",
-        "classification": "internal",
-        "confidence": 1,
-        "reviewStatus": "auto"
-      },
-      {
-        "id": "c-restoran-tripadvisor-jakarta",
-        "asset": "Restoran Jakarta TripAdvisor (Kuliner GCI)",
-        "classification": "internal",
-        "confidence": 1,
-        "reviewStatus": "auto"
-      },
-      {
-        "id": "c-toko-suvenir-tripadvisor-2026",
-        "asset": "Toko Suvenir TripAdvisor 2026",
-        "classification": "internal",
-        "confidence": 1,
-        "reviewStatus": "auto"
-      },
-      {
-        "id": "c-warisan-islam-wisata-budaya-muslim-jakarta",
-        "asset": "Warisan Islam & Wisata Budaya Muslim Jakarta",
-        "classification": "internal",
-        "confidence": 1,
-        "reviewStatus": "auto"
-      },
-      {
-        "id": "c-wisman-jakarta-per-bulan",
-        "asset": "Wisman DKI Jakarta per Bulan (total)",
-        "classification": "internal",
-        "confidence": 1,
-        "reviewStatus": "auto"
-      },
-      {
-        "id": "c-wisman-jakarta-per-negara",
-        "asset": "Wisman DKI Jakarta per Negara (BPS dibersihkan)",
-        "classification": "internal",
-        "confidence": 1,
-        "reviewStatus": "auto"
-      },
-      {
-        "id": "c-wisman-jakarta-per-pintu-masuk",
-        "asset": "Wisman per Pintu Masuk (dinormalisasi)",
-        "classification": "internal",
-        "confidence": 1,
-        "reviewStatus": "auto"
+        "reviewStatus": "needs-review",
+        "maskingRule": "show_last4"
       }
     ]
   }

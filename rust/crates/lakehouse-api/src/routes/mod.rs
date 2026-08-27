@@ -115,13 +115,49 @@ fn pipelines_router() -> Router<AppState> {
         )
 }
 
+/// The `/api/storage/*` sub-router (Task 2.6), split out for the same
+/// `clippy::too_many_lines` reason as [`pipelines_router`].
+fn storage_router() -> Router<AppState> {
+    Router::new()
+        .route("/api/storage", get(storage::get))
+        .route(
+            "/api/storage/policies",
+            get(storage::list_policies).post(storage::create_policy),
+        )
+        .route("/api/storage/operations", get(storage::list_operations))
+        .route(
+            "/api/storage/restore",
+            axum::routing::post(storage::restore_asset),
+        )
+}
+
+/// The `/api/overview/alerts/*` sub-router (Task 2.6), split out for the
+/// same `clippy::too_many_lines` reason as [`pipelines_router`].
+fn overview_alerts_router() -> Router<AppState> {
+    Router::new()
+        .route("/api/overview/alerts", get(overview::list_alerts))
+        .route(
+            "/api/overview/alerts/{id}/acknowledge",
+            axum::routing::post(overview::acknowledge_alert),
+        )
+        .route(
+            "/api/overview/alerts/{id}/resolve",
+            axum::routing::post(overview::resolve_alert),
+        )
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/catalog", get(catalog::list))
         .route("/api/catalog/{id}", get(catalog::detail))
         .route("/api/overview", get(overview::get).post(overview::refresh))
+        .merge(overview_alerts_router())
         .route("/api/ops/{kind}", get(ops::get))
+        .route(
+            "/api/ops/workloads/{id}/cancel",
+            axum::routing::post(ops::cancel_workload),
+        )
         .route("/api/governance/lineage", get(governance::lineage))
         .route(
             "/api/governance/policies",
@@ -131,7 +167,7 @@ pub fn router(state: AppState) -> Router {
             "/api/governance/{kind}",
             get(governance::get).post(governance::create_rule),
         )
-        .route("/api/storage", get(storage::get))
+        .merge(storage_router())
         .route(
             "/api/alerts",
             get(alerts::list)
