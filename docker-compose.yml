@@ -1,0 +1,30 @@
+services:
+  lakehouse-api:
+    build:
+      context: ./rust
+      dockerfile: Dockerfile
+    image: lakehouse-api:local
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env.local
+    environment:
+      PORT: "8080"
+      CH_URL: ${CH_URL}
+      CH_USER: ${CH_USER}
+      CH_PASSWORD: ${CH_PASSWORD}
+      DAGSTER_URL: ${DAGSTER_URL}
+      DAGSTER_REPO: ${DAGSTER_REPO}
+      DAGSTER_LOCATION: ${DAGSTER_LOCATION}
+      LLM_URL: ${LLM_URL}
+      LLM_MODEL: ${LLM_MODEL}
+      LLM_KEY: ${LLM_KEY}
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_SECURE: ${SMTP_SECURE}
+      SMTP_USER: ${SMTP_USER}
+      SMTP_PASS: ${SMTP_PASS}
+      SMTP_FROM: ${SMTP_FROM}
+      ALERTS_RUN_TOKEN: ${ALERTS_RUN_TOKEN}
+      PUBLIC_DASH_TOKEN: ${PUBLIC_DASH_TOKEN}
+    restart: unless-stopped
