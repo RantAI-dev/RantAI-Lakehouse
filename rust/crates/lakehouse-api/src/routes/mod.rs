@@ -6,6 +6,7 @@
 //! tasks.
 
 mod agent;
+mod ai;
 mod alerts;
 mod catalog;
 mod dashboard;
@@ -109,6 +110,14 @@ pub fn router(state: AppState) -> Router {
             "/api/agent/text-to-sql",
             axum::routing::post(agent::text_to_sql),
         )
+        .route("/api/ai/chat", axum::routing::post(ai::chat))
+        .route(
+            "/api/ai/sessions",
+            get(ai::sessions_get)
+                .post(ai::sessions_save)
+                .delete(ai::sessions_delete),
+        )
+        .route("/api/ai/build-status", get(ai::build_status))
         .layer(from_fn(timeout_middleware))
         .with_state(state)
 }

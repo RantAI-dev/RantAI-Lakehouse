@@ -18,6 +18,7 @@ lakehouse-notify = { path = "../lakehouse-notify" }
 lakehouse-bi = { path = "../lakehouse-bi" }
 lakehouse-embed = { path = "../lakehouse-embed" }
 lakehouse-llm = { path = "../lakehouse-llm" }
+rand = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }

@@ -187,6 +187,29 @@ struct LaunchRunError {
     message: String,
 }
 
+/// One `Dagster` execution step's status within a run, as reported by
+/// `stepStats`, matching `GET /api/ai/build-status`'s `{key, status}`
+/// output shape.
+#[derive(Debug, Clone)]
+pub struct RunStepStatus {
+    /// The step's key (e.g. `"bronze_sdi"`).
+    pub key: String,
+    /// The step's `Dagster` status string.
+    pub status: String,
+}
+
+/// A run's overall status plus its per-step statuses, returned by
+/// [`DgClient::pipeline_run_status`].
+#[derive(Debug, Clone)]
+pub struct RunStatusInfo {
+    /// The run's overall `Dagster` status string (e.g. `"SUCCESS"`) — NOT
+    /// passed through [`map_run_status`]; `GET /api/ai/build-status`
+    /// returns the raw `Dagster` string verbatim.
+    pub status: String,
+    /// Each step's key + status, in `Dagster`'s reported order.
+    pub steps: Vec<RunStepStatus>,
+}
+
 /// Outcome of [`DgClient::launch_run`], mirroring the TypeScript's
 /// `{ runId?: string; error?: string }` return shape (never a thrown
 /// error for a well-formed GraphQL response — failures are reported in
@@ -407,6 +430,69 @@ impl DgClient {
             run_id: None,
             error: Some(error),
         })
+    }
+
+    /// A single run's live status + per-step status, matching
+    /// `GET /api/ai/build-status`'s inline query (`pipelineRunOrError` on
+    /// `Run`).
+    ///
+    /// Unlike [`DgClient::list_runs`]/[`DgClient::list_jobs`], this does
+    /// NOT treat a GraphQL `errors` array or a non-`"Run"` `__typename`
+    /// (e.g. `RunNotFoundError`) as an [`Err`] — it returns `Ok(None)` for
+    /// both, matching the TypeScript route's own hand-rolled `fetch`,
+    /// which never inspects `json.errors` and simply falls through to its
+    /// "not found" branch when `json?.data?.pipelineRunOrError` is
+    /// `undefined` or not a `Run`. `Err` is reserved for a transport-level
+    /// failure or a response body that isn't valid `JSON` at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DgError::Transport`] on a network-level failure, or
+    /// [`DgError::Server`] when the response body isn't valid `JSON`.
+    pub async fn pipeline_run_status(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<RunStatusInfo>, DgError> {
+        let query = "query($rid:ID!){ pipelineRunOrError(runId:$rid){ __typename \
+                      ... on Run { status stepStats { stepKey status } } } }";
+        let body = json!({ "query": query, "variables": { "rid": run_id } });
+        let resp = self.client.post(&self.url).json(&body).send().await?;
+        let text = resp.text().await?;
+        let parsed: Value =
+            serde_json::from_str(&text).map_err(|e| DgError::Server(e.to_string()))?;
+        let run = parsed.pointer("/data/pipelineRunOrError");
+        let Some(run) = run else {
+            return Ok(None);
+        };
+        if run.get("__typename").and_then(Value::as_str) != Some("Run") {
+            return Ok(None);
+        }
+        let status = run
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
+        let steps = run
+            .get("stepStats")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|s| RunStepStatus {
+                        key: s
+                            .get("stepKey")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                        status: s
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Some(RunStatusInfo { status, steps }))
     }
 
     /// Whether the `Dagster` GraphQL endpoint is reachable, checked via its
@@ -715,5 +801,63 @@ mod tests {
         assert_eq!(refresh.schedules[0].schedule_state.status, "RUNNING");
         let other = jobs.iter().find(|j| j.name == "other_job").unwrap();
         assert!(other.schedules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pipeline_run_status_parses_steps() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "pipelineRunOrError": { "__typename": "Run", "status": "SUCCESS",
+                    "stepStats": [ { "stepKey": "bronze_sdi", "status": "SUCCESS" } ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let info = client
+            .pipeline_run_status("ead7470c-a36f-410f-95fe-ddef911805c9")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(info.status, "SUCCESS");
+        assert_eq!(info.steps.len(), 1);
+        assert_eq!(info.steps[0].key, "bronze_sdi");
+    }
+
+    #[tokio::test]
+    async fn pipeline_run_status_none_when_run_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "pipelineRunOrError": { "__typename": "RunNotFoundError" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let info = client.pipeline_run_status("nope").await.unwrap();
+        assert!(info.is_none());
+    }
+
+    #[tokio::test]
+    async fn pipeline_run_status_none_on_graphql_errors_not_err() {
+        // Unlike list_runs/list_jobs, a GraphQL `errors` array here does
+        // NOT become an `Err` — it becomes `Ok(None)`, matching the TS
+        // route which never inspects `json.errors`.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "errors": [ { "message": "boom" } ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let info = client.pipeline_run_status("x").await.unwrap();
+        assert!(info.is_none());
     }
 }

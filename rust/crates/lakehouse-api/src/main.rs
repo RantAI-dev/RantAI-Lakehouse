@@ -296,6 +296,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ai_chat_route_is_registered() {
+        let resp = post(test_router(), "/api/ai/chat").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ai_sessions_route_is_registered() {
+        let resp = get(test_router(), "/api/ai/sessions").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn ai_build_status_route_is_registered() {
+        let resp = get(test_router(), "/api/ai/build-status").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The final tally this task calls out explicitly: all 30 route paths
+    /// (8 pre-existing + alerts×2 + the 21 ported in this task) must be
+    /// mounted and reachable (concrete path segments substituted for
+    /// captures so the request actually resolves to a handler, not just
+    /// "some path"). A tripwire against silently dropping a route during a
+    /// future refactor of `routes::router` — every path here must yield a
+    /// non-404 status, and the list itself must have exactly 30 entries.
+    #[tokio::test]
+    async fn router_exposes_all_thirty_route_paths() {
+        const EXPECTED_PATHS: [&str; 30] = [
+            "/api/catalog",
+            "/api/catalog/some-id",
+            "/api/overview",
+            "/api/ops/workloads",
+            "/api/governance/lineage",
+            "/api/governance/quality",
+            "/api/storage",
+            "/api/alerts",
+            "/api/alerts/run",
+            "/api/query/run",
+            "/api/query/estimate",
+            "/api/pipelines",
+            "/api/pipelines/refresh_lakehouse/runs",
+            "/api/pipelines/refresh_lakehouse/trigger",
+            "/api/dashboard",
+            "/api/dashboard/specs",
+            "/api/dashboard/boards",
+            "/api/dashboard/fields",
+            "/api/dashboard/records",
+            "/api/dashboard/values",
+            "/api/dashboard/export",
+            "/api/dashboard/embed-info",
+            "/api/embed/data",
+            "/api/public/dashboard/some-token",
+            "/api/agent/ask",
+            "/api/agent/query",
+            "/api/agent/text-to-sql",
+            "/api/ai/chat",
+            "/api/ai/sessions",
+            "/api/ai/build-status",
+        ];
+        assert_eq!(EXPECTED_PATHS.len(), 30);
+        for uri in EXPECTED_PATHS {
+            // GET is enough to prove a path is mounted: axum returns 405
+            // Method Not Allowed (not 404) for a registered path hit with
+            // the wrong verb, so this still distinguishes "unmounted" from
+            // "mounted but wrong method" for the POST-only routes.
+            let resp = get(test_router(), uri).await;
+            assert_ne!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "path not mounted: {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn governance_lineage_route_does_not_fall_through_to_kind_dispatch() {
         let resp = get(test_router(), "/api/governance/lineage").await;
         assert_ne!(resp.status(), StatusCode::BAD_REQUEST);

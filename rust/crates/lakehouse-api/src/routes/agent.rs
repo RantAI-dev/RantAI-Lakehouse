@@ -49,7 +49,7 @@ fn system_msg(content: &str) -> ChatMessage {
 /// `text-to-sql/route.ts`): a plain-text description of every `serving.mart_*`
 /// table's columns, plus the list of `silver.*` table names, so the LLM
 /// never invents a table/column that doesn't exist.
-async fn schema_context(ch: &ChClient) -> Result<String, lakehouse_clickhouse::ChError> {
+pub(crate) async fn schema_context(ch: &ChClient) -> Result<String, lakehouse_clickhouse::ChError> {
     let mart_rows = ch.rows("SHOW TABLES FROM serving", None).await?;
     let mart_tables: Vec<String> = mart_rows
         .iter()
@@ -185,7 +185,7 @@ fn extract_first_brace_object(text: &str) -> Option<String> {
 /// — `isReadOnlySql` in `agent-tools.ts`, used by `agent/query`. Distinct
 /// from `query/run`'s guard (`routes::query::is_read_only`): only
 /// `with`/`select` are allowed here (no `show`/`describe`/`explain`).
-fn is_read_only_sql(sql: &str) -> bool {
+pub(crate) fn is_read_only_sql(sql: &str) -> bool {
     starts_with_with_or_select(sql) && !contains_denied_keyword_full(sql)
 }
 

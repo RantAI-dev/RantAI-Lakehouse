@@ -71,6 +71,28 @@ pub(crate) fn js_error(err: impl Display) -> String {
     format!("Error: {err}")
 }
 
+/// `ClickHouse` type-name substrings treated as numeric, matching
+/// `/Int|Float|Decimal/` in `dashboard/fields/route.ts` (and reused,
+/// identically, by `ai-tools.ts`'s `describe_mart`/`suggest_dashboard`
+/// tools).
+const NUMERIC_TYPE_MARKERS: [&str; 3] = ["Int", "Float", "Decimal"];
+
+/// `s.replace(/[^a-zA-Z0-9_]/g, "")` — strip (not reject) anything outside
+/// `[A-Za-z0-9_]`. Shared by every route that sanitizes a mart/column name
+/// this way rather than rejecting it outright.
+#[must_use]
+pub(crate) fn strip_non_ident(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect()
+}
+
+/// `NUMERIC.test(type)` — `/Int|Float|Decimal/` substring match.
+#[must_use]
+pub(crate) fn is_numeric_type(ty: &str) -> bool {
+    NUMERIC_TYPE_MARKERS.iter().any(|m| ty.contains(m))
+}
+
 /// Render a *stored* chart spec (owned strings, `lakehouse_bi::store::ChartSpec`)
 /// the same way `lakehouse_bi::specs::to_render_spec` renders a built-in
 /// `&'static` one: everything except `sql`, plus its origin. There is no

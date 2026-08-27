@@ -8,6 +8,7 @@
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 /// A single chat message, matching the TypeScript's `ChatMessage`.
@@ -174,6 +175,154 @@ impl LlmClient {
             }
         }
         Ok(content)
+    }
+}
+
+/// One tool call the model wants executed, matching the TypeScript's
+/// `ToolCall` (`llm.ts`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// The call's id (echoed back in the follow-up `tool` message).
+    pub id: String,
+    /// Always `"function"` for an `OpenAI`-compatible tool call.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// The function invocation itself.
+    pub function: ToolCallFunction,
+}
+
+/// A tool call's function name and (`JSON`-encoded) arguments string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallFunction {
+    /// The tool's name, matching one of the `tools` schemas passed to
+    /// [`LlmClient::chat_with_tools`].
+    pub name: String,
+    /// The call's arguments, as a raw `JSON` string (not yet parsed) —
+    /// matching the `OpenAI` wire format exactly.
+    pub arguments: String,
+}
+
+/// A chat message in the tool-calling loop, matching the TypeScript's
+/// `LlmMessage` (`llm.ts`). Distinct from [`ChatMessage`]: `content` is
+/// optional (a tool-calling assistant turn may carry only `tool_calls`),
+/// and a `"tool"` role plus `tool_call_id`/`name` are added for feeding
+/// tool results back to the model.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmMessage {
+    /// The message's role, including `"tool"` (absent from [`ChatRole`]).
+    pub role: LlmMessageRole,
+    /// The message text. `None` for an assistant turn that only calls
+    /// tools.
+    pub content: Option<String>,
+    /// Tool calls the assistant wants executed, present only on some
+    /// assistant turns.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// The [`ToolCall::id`] this message answers, present only on `"tool"`
+    /// role messages.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool_call_id: Option<String>,
+    /// The tool's name, present only on `"tool"` role messages.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub name: Option<String>,
+}
+
+/// [`LlmMessage`]'s role, matching the TypeScript union `"system" | "user" |
+/// "assistant" | "tool"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LlmMessageRole {
+    /// A system prompt.
+    System,
+    /// A user message.
+    User,
+    /// A prior (or current) assistant turn.
+    Assistant,
+    /// A tool result fed back to the model.
+    Tool,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatWithToolsRequest<'a> {
+    model: &'a str,
+    messages: &'a [LlmMessage],
+    tools: &'a [Value],
+    tool_choice: &'a str,
+    temperature: f64,
+    max_tokens: u32,
+    stream: bool,
+}
+
+impl LlmClient {
+    /// Chat with function-calling enabled, matching `chatWithTools` in
+    /// `llm.ts`. Returns the assistant's raw reply message — which may
+    /// carry `tool_calls` instead of (or in addition to) `content` — for
+    /// the caller's agentic loop to execute and feed back.
+    ///
+    /// Defaults differ from [`LlmClient::chat`]: `temperature` defaults to
+    /// `0.2` (not `0.1`) and `max_tokens` to `1200` (not `700`), matching
+    /// `chatWithTools`'s own `??` fallbacks.
+    ///
+    /// Any `<think>...</think>` block in the reply's `content` is stripped
+    /// the same way [`LlmClient::chat`] strips it — but unlike `chat`,
+    /// there is no `reasoning_content` fallback when that leaves `content`
+    /// empty, matching `chatWithTools` verbatim (it only trims
+    /// `msg.content`, never reads `reasoning_content`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::Transport`] on a network-level failure, or
+    /// [`LlmError::Api`] when the endpoint responds with a non-2xx status.
+    pub async fn chat_with_tools(
+        &self,
+        messages: &[LlmMessage],
+        tools: &[Value],
+        opts: ChatOptions,
+    ) -> Result<LlmMessage, LlmError> {
+        let body = ChatWithToolsRequest {
+            model: &self.model,
+            messages,
+            tools,
+            tool_choice: "auto",
+            temperature: opts.temperature.unwrap_or(0.2),
+            max_tokens: opts.max_tokens.unwrap_or(1200),
+            stream: false,
+        };
+        let resp = self
+            .client
+            .post(format!("{}/chat/completions", self.url))
+            .bearer_auth(&self.key)
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            let truncated: String = text.chars().take(200).collect();
+            return Err(LlmError::Api(format!(
+                "LLM {}: {truncated}",
+                status.as_u16()
+            )));
+        }
+        let parsed: Value = resp.json().await.unwrap_or_default();
+        let msg_value = parsed
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({ "role": "assistant", "content": "" }));
+        let mut msg: LlmMessage = serde_json::from_value(msg_value).unwrap_or(LlmMessage {
+            role: LlmMessageRole::Assistant,
+            content: Some(String::new()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        });
+        if let Some(content) = &msg.content {
+            let stripped = strip_think_blocks(content).trim().to_owned();
+            msg.content = Some(stripped);
+        }
+        Ok(msg)
     }
 }
 
@@ -362,5 +511,93 @@ mod tests {
             panic!("expected Api error");
         };
         assert_eq!(msg, format!("LLM 500: {}", &long_body[..200]));
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_returns_tool_calls_when_present() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [ { "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        { "id": "call_1", "type": "function",
+                          "function": { "name": "run_sql", "arguments": "{\"sql\":\"SELECT 1\"}" } }
+                    ]
+                } } ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::new(server.uri(), "m".to_owned(), "k".to_owned());
+        let msg = client
+            .chat_with_tools(
+                &[LlmMessage {
+                    role: LlmMessageRole::User,
+                    content: Some("hi".to_owned()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                }],
+                &[],
+                ChatOptions::default(),
+            )
+            .await
+            .unwrap();
+        assert!(msg.content.is_none());
+        let calls = msg.tool_calls.unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "run_sql");
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_strips_think_blocks_from_content() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [ { "message": {
+                    "role": "assistant",
+                    "content": "<think>hmm</think>final answer"
+                } } ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::new(server.uri(), "m".to_owned(), "k".to_owned());
+        let msg = client
+            .chat_with_tools(&[], &[], ChatOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(msg.content.as_deref(), Some("final answer"));
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_defaults_temperature_and_max_tokens() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_json(json!({
+                "model": "m",
+                "messages": [],
+                "tools": [],
+                "tool_choice": "auto",
+                "temperature": 0.2,
+                "max_tokens": 1200,
+                "stream": false,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [ { "message": { "role": "assistant", "content": "ok" } } ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::new(server.uri(), "m".to_owned(), "k".to_owned());
+        client
+            .chat_with_tools(&[], &[], ChatOptions::default())
+            .await
+            .unwrap();
     }
 }

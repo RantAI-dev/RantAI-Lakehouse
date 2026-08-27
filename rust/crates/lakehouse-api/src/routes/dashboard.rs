@@ -25,10 +25,10 @@ use serde_json::{Map, Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::routes::support::{mart_columns, render_stored_spec, run_spec_sql};
+use crate::routes::support::{
+    is_numeric_type, mart_columns, render_stored_spec, run_spec_sql, strip_non_ident,
+};
 use crate::state::AppState;
-
-const NUMERIC_TYPE_MARKERS: [&str; 3] = ["Int", "Float", "Decimal"];
 
 // ── GET /api/dashboard ──────────────────────────────────────────────────
 
@@ -460,19 +460,6 @@ pub async fn boards_delete(
 pub struct FieldsQuery {
     #[serde(default)]
     mart: Option<String>,
-}
-
-/// `s.replace(/[^a-zA-Z0-9_]/g, "")` — strip (not reject) anything outside
-/// `[A-Za-z0-9_]`, matching `fields/route.ts` and `values/route.ts`.
-fn strip_non_ident(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect()
-}
-
-/// `NUMERIC.test(type)` — `/Int|Float|Decimal/` substring match.
-fn is_numeric_type(ty: &str) -> bool {
-    NUMERIC_TYPE_MARKERS.iter().any(|m| ty.contains(m))
 }
 
 /// `GET /api/dashboard/fields` — mart list, or one mart's columns split
