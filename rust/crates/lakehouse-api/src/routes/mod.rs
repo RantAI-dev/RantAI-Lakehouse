@@ -7,6 +7,7 @@
 
 mod alerts;
 mod catalog;
+mod dashboard;
 mod governance;
 mod ops;
 mod overview;
@@ -75,6 +76,26 @@ pub fn router(state: AppState) -> Router {
             "/api/pipelines/{id}/trigger",
             axum::routing::post(pipelines::trigger),
         )
+        .route("/api/dashboard", get(dashboard::get))
+        .route(
+            "/api/dashboard/specs",
+            get(dashboard::specs_list)
+                .post(dashboard::specs_create)
+                .put(dashboard::specs_update)
+                .delete(dashboard::specs_delete),
+        )
+        .route(
+            "/api/dashboard/boards",
+            get(dashboard::boards_list)
+                .post(dashboard::boards_create)
+                .put(dashboard::boards_update)
+                .delete(dashboard::boards_delete),
+        )
+        .route("/api/dashboard/fields", get(dashboard::fields))
+        .route("/api/dashboard/records", get(dashboard::records))
+        .route("/api/dashboard/values", get(dashboard::values))
+        .route("/api/dashboard/export", get(dashboard::export))
+        .route("/api/dashboard/embed-info", get(dashboard::embed_info))
         .layer(from_fn(timeout_middleware))
         .with_state(state)
 }

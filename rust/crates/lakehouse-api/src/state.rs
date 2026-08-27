@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use lakehouse_clickhouse::ChClient;
 use lakehouse_dagster::DgClient;
+use lakehouse_embed::EmbedSecretResolver;
 
 use crate::config::Config;
 
@@ -24,6 +25,8 @@ pub struct AppState {
     pub clickhouse: Arc<ChClient>,
     /// `Dagster` GraphQL client.
     pub dagster: Arc<DgClient>,
+    /// Resolves and caches the signed-embedding (`JWT`) secret.
+    pub embed_secret: Arc<EmbedSecretResolver>,
 }
 
 impl AppState {
@@ -40,10 +43,14 @@ impl AppState {
             config.dagster_repo.clone(),
             config.dagster_location.clone(),
         );
+        let clickhouse = Arc::new(clickhouse);
+        let embed_secret =
+            EmbedSecretResolver::new(config.embed_secret.clone(), clickhouse.clone());
         Self {
             config: Arc::new(config),
-            clickhouse: Arc::new(clickhouse),
+            clickhouse,
             dagster: Arc::new(dagster),
+            embed_secret: Arc::new(embed_secret),
         }
     }
 }

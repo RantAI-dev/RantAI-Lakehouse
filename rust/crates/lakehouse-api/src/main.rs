@@ -218,6 +218,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dashboard_get_route_is_registered() {
+        let resp = get(test_router(), "/api/dashboard").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dashboard_specs_route_is_registered() {
+        let resp = get(test_router(), "/api/dashboard/specs").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dashboard_boards_route_is_registered() {
+        let resp = get(test_router(), "/api/dashboard/boards").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dashboard_fields_route_is_registered() {
+        let resp = get(test_router(), "/api/dashboard/fields").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dashboard_records_route_is_registered() {
+        let resp = get(test_router(), "/api/dashboard/records").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dashboard_values_route_is_registered() {
+        let resp = get(test_router(), "/api/dashboard/values").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dashboard_export_route_is_registered() {
+        let resp = get(test_router(), "/api/dashboard/export").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dashboard_embed_info_route_is_registered() {
+        let resp = get(test_router(), "/api/dashboard/embed-info").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn governance_lineage_route_does_not_fall_through_to_kind_dispatch() {
         let resp = get(test_router(), "/api/governance/lineage").await;
         assert_ne!(resp.status(), StatusCode::BAD_REQUEST);

@@ -15,6 +15,8 @@ lakehouse-clickhouse = { path = "../lakehouse-clickhouse" }
 lakehouse-dagster = { path = "../lakehouse-dagster" }
 lakehouse-alerts = { path = "../lakehouse-alerts" }
 lakehouse-notify = { path = "../lakehouse-notify" }
+lakehouse-bi = { path = "../lakehouse-bi" }
+lakehouse-embed = { path = "../lakehouse-embed" }
 axum = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
