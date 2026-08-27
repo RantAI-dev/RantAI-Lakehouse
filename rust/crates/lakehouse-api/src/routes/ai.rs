@@ -10,8 +10,6 @@
 //! validation, tool dispatch, and mode-based tool filtering are ported
 //! faithfully.
 
-use std::collections::HashMap as StdHashMap;
-
 use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -811,10 +809,13 @@ pub async fn chat(State(state): State<AppState>, body: Bytes) -> Response {
             let answer = strip_tool_xml(msg.content.as_deref().unwrap_or(""));
             return (
                 StatusCode::OK,
-                ApiJson(json!({
-                    "answer": answer, "toolTrace": tool_trace,
-                    "buildRunId": build_run_id, "chartCreated": chart_created,
-                })),
+                ApiJson(chat_response_body(
+                    &answer,
+                    &tool_trace,
+                    build_run_id.as_deref(),
+                    chart_created,
+                    None,
+                )),
             )
                 .into_response();
         }
@@ -882,15 +883,43 @@ pub async fn chat(State(state): State<AppState>, body: Bytes) -> Response {
     {
         Ok(final_msg) => (
             StatusCode::OK,
-            ApiJson(json!({
-                "answer": final_msg.content.unwrap_or_default(), "toolTrace": tool_trace,
-                "buildRunId": build_run_id, "chartCreated": chart_created,
-                "note": "batas iterasi tool tercapai",
-            })),
+            ApiJson(chat_response_body(
+                &final_msg.content.unwrap_or_default(),
+                &tool_trace,
+                build_run_id.as_deref(),
+                chart_created,
+                Some("batas iterasi tool tercapai"),
+            )),
         )
             .into_response(),
         Err(err) => llm_unavailable(&err),
     }
+}
+
+/// Builds the `/api/ai/chat` response body, matching the TypeScript's
+/// `{ answer, toolTrace, buildRunId, chartCreated, note? }` object literal:
+/// when `build_run_id` is `None` (the TS-side `undefined`), the key is
+/// omitted entirely rather than serialized as `null` — `JSON.stringify`
+/// drops `undefined`-valued object keys, so a bare `Option<String>` field
+/// in a `json!` macro call (which always emits `null`) would diverge.
+fn chat_response_body(
+    answer: &str,
+    tool_trace: &[Value],
+    build_run_id: Option<&str>,
+    chart_created: bool,
+    note: Option<&str>,
+) -> Value {
+    let mut body = Map::new();
+    body.insert("answer".to_owned(), json!(answer));
+    body.insert("toolTrace".to_owned(), json!(tool_trace));
+    if let Some(rid) = build_run_id {
+        body.insert("buildRunId".to_owned(), json!(rid));
+    }
+    body.insert("chartCreated".to_owned(), json!(chart_created));
+    if let Some(note) = note {
+        body.insert("note".to_owned(), json!(note));
+    }
+    Value::Object(body)
 }
 
 fn llm_unavailable(err: &lakehouse_llm::LlmError) -> Response {
@@ -930,7 +959,12 @@ fn parse_minimax_tool_calls(content: &str) -> Vec<ToolCall> {
         };
         let body = &content[body_start..body_start + end_rel];
 
-        let mut args = StdHashMap::new();
+        // `serde_json::Map` (not `HashMap`): the workspace's `preserve_order`
+        // feature makes this an order-preserving map, so the `arguments`
+        // JSON string and `toolTrace` reflect the XML's actual `<parameter>`
+        // order — a `HashMap` here randomized that key order across runs,
+        // unlike the rest of the codebase's `serde_json::Map` convention.
+        let mut args = Map::new();
         let mut param_pos = 0usize;
         while let Some(p_start_rel) = body[param_pos..].find("<parameter name=\"") {
             let p_name_start = param_pos + p_start_rel + "<parameter name=\"".len();
@@ -946,7 +980,7 @@ fn parse_minimax_tool_calls(content: &str) -> Vec<ToolCall> {
                 break;
             };
             let p_value = body[p_body_start..p_body_start + p_end_rel].trim();
-            args.insert(p_name.to_owned(), p_value.to_owned());
+            args.insert(p_name.to_owned(), Value::String(p_value.to_owned()));
             param_pos = p_body_start + p_end_rel + "</parameter>".len();
         }
 
@@ -984,12 +1018,28 @@ fn strip_tool_xml(s: &str) -> String {
         out.push_str(&s[pos..open]);
         pos = after_open + close_rel + "</minimax:tool_call>".len();
     }
-    out.replace("<think>", "")
-        .replace("</think>", "")
-        .replace("<THINK>", "")
-        .replace("</THINK>", "")
+    strip_ci(&strip_ci(&out, "<think>"), "</think>")
         .trim()
         .to_owned()
+}
+
+/// Case-insensitively removes every occurrence of `needle` from `s`,
+/// matching the `/gi` flags on the TypeScript's `/<\/?think>/gi` — a
+/// literal-case `.replace("<think>", "")` chain (ASCII-only lower/upper
+/// variants) would leave a mixed-case tag like `<Think>` in the output.
+/// `needle` must be ASCII (true of `<think>`/`</think>`, the only callers).
+fn strip_ci(s: &str, needle: &str) -> String {
+    let lower_s = s.to_ascii_lowercase();
+    let lower_needle = needle.to_ascii_lowercase();
+    let mut out = String::with_capacity(s.len());
+    let mut pos = 0usize;
+    while let Some(rel) = lower_s[pos..].find(&lower_needle) {
+        let start = pos + rel;
+        out.push_str(&s[pos..start]);
+        pos = start + needle.len();
+    }
+    out.push_str(&s[pos..]);
+    out
 }
 
 // ── /api/ai/sessions ────────────────────────────────────────────────────
@@ -1317,6 +1367,60 @@ mod tests {
     #[test]
     fn strip_tool_xml_trims_result() {
         assert_eq!(strip_tool_xml("  hello  "), "hello");
+    }
+
+    /// D4 regression: the TS strips `<think>`/`</think>` case-insensitively
+    /// (`/<\/?think>/gi`); the Rust port used a literal-case `.replace`
+    /// chain that only covered all-lowercase and all-uppercase, so a
+    /// mixed-case tag like `<Think>` survived into the answer.
+    #[test]
+    fn strip_tool_xml_removes_think_tags_case_insensitively() {
+        let s = "before <Think>hmm</Think>after";
+        assert_eq!(strip_tool_xml(s), "before hmmafter");
+        let s = "before <ThInK>hmm</thINK>after";
+        assert_eq!(strip_tool_xml(s), "before hmmafter");
+    }
+
+    /// D4 regression: `parse_minimax_tool_calls`' `args` map used to be a
+    /// `std::collections::HashMap`, randomizing the `arguments` JSON
+    /// string's key order across runs. `serde_json::Map` (with the
+    /// workspace's `preserve_order` feature) must preserve XML parameter
+    /// order instead.
+    #[test]
+    fn parse_minimax_tool_calls_preserves_parameter_order() {
+        let content = r#"<invoke name="create_chart"><parameter name="title">T</parameter><parameter name="kind">kpi</parameter><parameter name="mart">m</parameter></invoke>"#;
+        let calls = parse_minimax_tool_calls(content);
+        assert_eq!(
+            calls[0].function.arguments,
+            r#"{"title":"T","kind":"kpi","mart":"m"}"#
+        );
+    }
+
+    /// D4 regression: `buildRunId` must be omitted from the response body
+    /// when absent, matching the TS's `JSON.stringify` dropping an
+    /// `undefined`-valued key — a bare `Option<String>` field in a `json!`
+    /// macro call always serializes as `"buildRunId": null` instead.
+    #[test]
+    fn chat_response_body_omits_build_run_id_when_none() {
+        let body = chat_response_body("ok", &[], None, false, None);
+        let obj = body.as_object().unwrap();
+        assert!(!obj.contains_key("buildRunId"));
+        assert!(!obj.contains_key("note"));
+    }
+
+    #[test]
+    fn chat_response_body_includes_build_run_id_when_some() {
+        let body = chat_response_body(
+            "ok",
+            &[],
+            Some("r_1"),
+            true,
+            Some("batas iterasi tool tercapai"),
+        );
+        let obj = body.as_object().unwrap();
+        assert_eq!(obj.get("buildRunId").unwrap(), "r_1");
+        assert_eq!(obj.get("chartCreated").unwrap(), true);
+        assert_eq!(obj.get("note").unwrap(), "batas iterasi tool tercapai");
     }
 
     #[test]
