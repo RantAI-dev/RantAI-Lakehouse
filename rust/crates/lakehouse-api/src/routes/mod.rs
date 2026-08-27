@@ -1,10 +1,11 @@
 //! Route mounting.
 //!
 //! Write-side routes (query/agent/dashboard/alerts/...) and the remaining
-//! four read-only domains land in later commits; this mounts the health
-//! check plus catalog.
+//! three read-only domains land in later commits; this mounts the health
+//! check plus catalog and storage.
 
 mod catalog;
+mod storage;
 mod support;
 
 use axum::Router;
@@ -23,6 +24,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/api/catalog", get(catalog::list))
         .route("/api/catalog/{id}", get(catalog::detail))
+        .route("/api/storage", get(storage::get))
         .with_state(state)
 }
 

@@ -123,4 +123,10 @@ mod tests {
         let resp = get(test_router(), "/api/catalog/some-slug").await;
         assert_ne!(resp.status(), StatusCode::NOT_FOUND);
     }
+
+    #[tokio::test]
+    async fn storage_route_is_registered() {
+        let resp = get(test_router(), "/api/storage").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
 }
