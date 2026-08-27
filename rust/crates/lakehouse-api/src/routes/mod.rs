@@ -1,9 +1,11 @@
 //! Route mounting.
 //!
-//! Write-side routes (query/agent/dashboard/alerts/...) land in later
-//! tasks; this chassis mounts the health check plus the five read-only
-//! domains (catalog, overview, ops, governance, storage).
+//! Mounts the health check, the five read-only domains (catalog, overview,
+//! ops, governance, storage), and `alerts` (the first write-side domain).
+//! Remaining write-side routes (query/agent/dashboard/...) land in later
+//! tasks.
 
+mod alerts;
 mod catalog;
 mod governance;
 mod ops;
@@ -51,6 +53,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/governance/lineage", get(governance::lineage))
         .route("/api/governance/{kind}", get(governance::get))
         .route("/api/storage", get(storage::get))
+        .route(
+            "/api/alerts",
+            get(alerts::list)
+                .post(alerts::create)
+                .put(alerts::update)
+                .delete(alerts::delete),
+        )
+        .route("/api/alerts/run", get(alerts::run).post(alerts::run))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             REQUEST_TIMEOUT,

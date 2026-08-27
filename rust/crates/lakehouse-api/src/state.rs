@@ -17,11 +17,8 @@ use crate::config::Config;
 /// (LLM, ...); keep every addition similarly cheap to clone.
 #[derive(Clone)]
 pub struct AppState {
-    /// Resolved application configuration. Not yet read by any of the
-    /// read-only routes mounted so far (none needs a config value beyond
-    /// what already shaped `clickhouse`/`dagster` at construction time);
-    /// later tasks' handlers (embed JWT, alerts run token, ...) will.
-    #[allow(dead_code)]
+    /// Resolved application configuration. Read by the `/api/alerts/run`
+    /// handler (`ALERTS_RUN_TOKEN`, `SMTP_*`).
     pub config: Arc<Config>,
     /// `ClickHouse` HTTP client.
     pub clickhouse: Arc<ChClient>,
