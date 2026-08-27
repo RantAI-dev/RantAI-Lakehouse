@@ -6,6 +6,7 @@
 //! domain under `/api/identity/*`.
 
 mod agent;
+mod agents;
 mod ai;
 mod alerts;
 mod catalog;
@@ -212,6 +213,44 @@ fn knowledge_router() -> Router<AppState> {
         )
 }
 
+/// The `/api/agents/*` sub-router (Task 2.9), split out for the same
+/// `clippy::too_many_lines` reason as [`pipelines_router`].
+fn agents_router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/agents/workflows",
+            get(agents::list_workflows).post(agents::create_workflow),
+        )
+        .route(
+            "/api/agents/employees",
+            get(agents::list_employees).post(agents::create_employee),
+        )
+        .route("/api/agents/employees/{id}", get(agents::get_employee))
+        .route(
+            "/api/agents/employees/{id}/suspend",
+            axum::routing::post(agents::suspend_employee),
+        )
+        .route(
+            "/api/agents/employees/{id}/resume",
+            axum::routing::post(agents::resume_employee),
+        )
+        .route(
+            "/api/agents/employees/{id}/revoke",
+            axum::routing::post(agents::revoke_employee),
+        )
+        .route(
+            "/api/agents/tools",
+            get(agents::list_tools).post(agents::register_tool),
+        )
+        .route("/api/agents/runs", get(agents::list_runs))
+        .route("/api/agents/runs/{id}", get(agents::get_run))
+        .route("/api/agents/approvals", get(agents::list_approvals))
+        .route(
+            "/api/agents/approvals/{id}/decide",
+            axum::routing::post(agents::decide_approval),
+        )
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -298,6 +337,9 @@ pub fn router(state: AppState) -> Router {
         // only — no `search` route here, see `routes::knowledge`'s module
         // doc comment).
         .merge(knowledge_router())
+        // Phase 2, Task 2.9: digital employees, tools, workflows, runs,
+        // and approvals.
+        .merge(agents_router())
         .layer(from_fn(timeout_middleware))
         .with_state(state)
 }

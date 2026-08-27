@@ -13,8 +13,8 @@ import { clickhouseOverviewService } from "./clients/overview"
 import { clickhouseGovernanceService } from "./clients/governance"
 import { postgresIdentityService } from "./clients/identity"
 import { postgresConnectorService } from "./clients/connectors"
-import { mockKnowledgeService } from "./mock/knowledge"
-import { mockAgentService } from "./mock/agents"
+import { postgresKnowledgeService } from "./clients/knowledge"
+import { postgresAgentService } from "./clients/agents"
 
 // Overview kini NYATA sepenuhnya — summary/activity dari ClickHouse+Dagster,
 // alerts (list/ack/resolve) dari Postgres (Task 2.6). mock/overview.ts
@@ -40,8 +40,16 @@ export const streamingService = mockStreamingService
 // collaboration, dan generateSql semua lewat backend Rust (ClickHouse +
 // Postgres + LLM). mock/queries.ts sudah dihapus.
 export const queryService = clickhouseQueryService
-export const knowledgeService = mockKnowledgeService
-export const agentService = mockAgentService
+// Knowledge SEBAGIAN NYATA (Task 2.8) — sources/vector jobs (list+create)
+// dari Postgres. `search` TETAP mendelegasikan ke mock: tidak ada vector
+// database/mesin embedding/index pencarian di mana pun (lihat
+// `rust/crates/lakehouse-store/src/knowledge.rs`). mock/knowledge.ts TIDAK
+// dihapus karena `search` masih membutuhkannya.
+export const knowledgeService = postgresKnowledgeService
+// Agents kini NYATA sepenuhnya — employees/tools/workflows/runs/approvals
+// di Postgres (Task 2.9). Tidak ada runtime eksekusi agent/tool (kontrak
+// memang tidak memintanya). mock/agents.ts sudah dihapus.
+export const agentService = postgresAgentService
 // Governance kini NYATA sepenuhnya — reads dari ClickHouse/Dagster,
 // policies + create*Rule dari Postgres. mock/governance.ts sudah dihapus.
 export const governanceService = clickhouseGovernanceService
