@@ -108,29 +108,6 @@ mod tests {
         .unwrap()
     }
 
-    /// Registration tests: no live `ClickHouse` is required to prove a
-    /// route is *mounted* — a 503 (data-layer error) or 200 both prove
-    /// that, a 404 does not. These intentionally don't assert response
-    /// bodies; behavior-level fidelity is the parity harness's job (see
-    /// `rust/tests/parity`).
-    #[tokio::test]
-    async fn catalog_list_route_is_registered() {
-        let resp = get(test_router(), "/api/catalog").await;
-        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn catalog_detail_route_is_registered() {
-        let resp = get(test_router(), "/api/catalog/some-slug").await;
-        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn storage_route_is_registered() {
-        let resp = get(test_router(), "/api/storage").await;
-        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
-    }
-
     async fn post(app: axum::Router, uri: &str) -> axum::http::Response<axum::body::Body> {
         app.oneshot(
             Request::builder()
@@ -141,6 +118,23 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// Registration tests: no live `ClickHouse`/`Dagster` is required to
+    /// prove a route is *mounted* — a 503 (data-layer error) or 200 both
+    /// prove that, a 404 does not. These intentionally don't assert
+    /// response bodies; behavior-level fidelity is the parity harness's
+    /// job (see `rust/tests/parity`).
+    #[tokio::test]
+    async fn catalog_list_route_is_registered() {
+        let resp = get(test_router(), "/api/catalog").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn catalog_detail_route_is_registered() {
+        let resp = get(test_router(), "/api/catalog/some-slug").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -159,5 +153,49 @@ mod tests {
     async fn ops_kind_route_is_registered() {
         let resp = get(test_router(), "/api/ops/workloads").await;
         assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn governance_kind_route_is_registered() {
+        let resp = get(test_router(), "/api/governance/quality").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn governance_lineage_route_is_registered() {
+        let resp = get(test_router(), "/api/governance/lineage").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn storage_route_is_registered() {
+        let resp = get(test_router(), "/api/storage").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The routing subtlety this task calls out explicitly: axum must match
+    /// the static `/api/governance/lineage` segment before the
+    /// `/api/governance/{kind}` capture, so a request for `lineage` reaches
+    /// [`routes::governance::lineage`] and never the `{kind}` dispatch
+    /// (which would otherwise treat `"lineage"` as an unrecognized kind and
+    /// reply `400 {"error": "kind tak dikenal: lineage"}`).
+    ///
+    /// This holds regardless of `ClickHouse` availability: the `{kind}`
+    /// dispatch's unknown-kind branch never touches the network and always
+    /// replies 400 with that exact message; the `lineage` handler never
+    /// produces a 400 or that message under any failure mode (network
+    /// failures there 503, not 400). So this check is a reliable proxy for
+    /// "did the router send this to the right handler" even without a live
+    /// `ClickHouse`.
+    #[tokio::test]
+    async fn governance_lineage_route_does_not_fall_through_to_kind_dispatch() {
+        let resp = get(test_router(), "/api/governance/lineage").await;
+        assert_ne!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("kind tak dikenal"),
+            "lineage route fell through to the {{kind}} dispatch: {text}"
+        );
     }
 }
