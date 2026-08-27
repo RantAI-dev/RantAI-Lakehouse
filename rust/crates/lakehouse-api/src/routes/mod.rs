@@ -14,6 +14,7 @@ mod dashboard;
 mod embed;
 mod governance;
 mod identity;
+mod knowledge;
 mod ops;
 mod overview;
 mod pipelines;
@@ -162,6 +163,55 @@ fn connectors_router() -> Router<AppState> {
         )
 }
 
+/// The `/api/identity/*` sub-router (Phase 2 identity domain), split out
+/// for the same `clippy::too_many_lines` reason as [`pipelines_router`].
+///
+/// Grouped under a single `/api/identity` namespace rather than four
+/// top-level nouns (`/api/users`, `/api/tenants`, ...): every Phase 1
+/// route is already `/api/<domain>[/<sub>]` (`/api/governance/{kind}`,
+/// `/api/dashboard/specs`, `/api/alerts/run`), the console's
+/// `identityService` is a single contract, and top-level `/api/users`
+/// would be the first route whose path says nothing about which domain
+/// owns it. Collection paths are plural nouns with GET = list and POST =
+/// create, per REST.
+fn identity_router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/identity/users",
+            get(identity::list_users).post(identity::create_user),
+        )
+        .route(
+            "/api/identity/roles",
+            get(identity::list_roles).post(identity::create_role),
+        )
+        .route(
+            "/api/identity/tenants",
+            get(identity::list_tenants).post(identity::create_tenant),
+        )
+        .route(
+            "/api/identity/service-identities",
+            get(identity::list_service_identities).post(identity::create_service_identity),
+        )
+        .route(
+            "/api/identity/workspace-settings",
+            get(identity::workspace_settings),
+        )
+}
+
+/// The `/api/knowledge/*` sub-router (Task 2.8), split out for the same
+/// `clippy::too_many_lines` reason as [`pipelines_router`].
+fn knowledge_router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/knowledge/sources",
+            get(knowledge::list_sources).post(knowledge::create_source),
+        )
+        .route(
+            "/api/knowledge/vector-jobs",
+            get(knowledge::list_vector_jobs).post(knowledge::create_vector_job),
+        )
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -240,37 +290,14 @@ pub fn router(state: AppState) -> Router {
                 .delete(ai::sessions_delete),
         )
         .route("/api/ai/build-status", get(ai::build_status))
-        // Phase 2 identity domain. Grouped under a single `/api/identity`
-        // namespace rather than four top-level nouns (`/api/users`,
-        // `/api/tenants`, ...): every Phase 1 route is already
-        // `/api/<domain>[/<sub>]` (`/api/governance/{kind}`,
-        // `/api/dashboard/specs`, `/api/alerts/run`), the console's
-        // `identityService` is a single contract, and top-level `/api/users`
-        // would be the first route whose path says nothing about which
-        // domain owns it. Collection paths are plural nouns with GET =
-        // list and POST = create, per REST.
-        .route(
-            "/api/identity/users",
-            get(identity::list_users).post(identity::create_user),
-        )
-        .route(
-            "/api/identity/roles",
-            get(identity::list_roles).post(identity::create_role),
-        )
-        .route(
-            "/api/identity/tenants",
-            get(identity::list_tenants).post(identity::create_tenant),
-        )
-        .route(
-            "/api/identity/service-identities",
-            get(identity::list_service_identities).post(identity::create_service_identity),
-        )
-        .route(
-            "/api/identity/workspace-settings",
-            get(identity::workspace_settings),
-        )
+        // Phase 2 identity domain.
+        .merge(identity_router())
         // Phase 2, Task 2.7: connector definitions.
         .merge(connectors_router())
+        // Phase 2, Task 2.8: knowledge sources and vector jobs (metadata
+        // only — no `search` route here, see `routes::knowledge`'s module
+        // doc comment).
+        .merge(knowledge_router())
         .layer(from_fn(timeout_middleware))
         .with_state(state)
 }

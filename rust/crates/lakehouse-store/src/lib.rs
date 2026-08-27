@@ -32,6 +32,7 @@ pub mod connectors;
 pub mod error;
 pub mod governance;
 pub mod identity;
+pub mod knowledge;
 pub mod overview;
 pub mod pipelines;
 pub mod queries;
