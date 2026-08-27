@@ -1,0 +1,15 @@
+{
+  "request": {
+    "name": "dashboard-boards-create-bad-body",
+    "method": "POST",
+    "path": "/api/dashboard/boards",
+    "raw": "not json",
+    "comment": "MUTATING on success (POST inserts into console.bi_board). Only capturing the invalid-JSON validation error path.",
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "JSON Parse error: Unexpected identifier \"not\""
+  }
+}

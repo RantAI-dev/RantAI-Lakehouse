@@ -1,0 +1,61 @@
+{
+  "request": {
+    "name": "dashboard-boards-list",
+    "method": "GET",
+    "path": "/api/dashboard/boards"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "boards": [
+      {
+        "id": "default",
+        "name": "Main",
+        "layout": {}
+      },
+      {
+        "id": "b_5cbfb279",
+        "name": "Chart Gallery",
+        "layout": {},
+        "filters": [],
+        "createdAt": "2026-08-19 09:59:39",
+        "publicToken": "",
+        "embedEnabled": false
+      },
+      {
+        "id": "b_73c6fcc1",
+        "name": "Sample — Visitors",
+        "layout": {
+          "u_2dadfe2e": {
+            "x": 0,
+            "y": 0,
+            "w": 3,
+            "h": 5
+          },
+          "u_947f0756": {
+            "x": 3,
+            "y": 0,
+            "w": 9,
+            "h": 5
+          },
+          "u_f876308c": {
+            "x": 0,
+            "y": 5,
+            "w": 7,
+            "h": 6
+          },
+          "u_5c8e15d4": {
+            "x": 7,
+            "y": 5,
+            "w": 5,
+            "h": 6
+          }
+        },
+        "filters": [],
+        "createdAt": "2026-08-19 10:52:19",
+        "publicToken": "__PUBLIC_DASH_TOKEN__",
+        "embedEnabled": true
+      }
+    ]
+  }
+}

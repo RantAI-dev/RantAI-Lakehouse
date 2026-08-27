@@ -1,0 +1,68 @@
+{
+  "request": {
+    "name": "catalog-detail",
+    "method": "GET",
+    "path": "/api/catalog/jumlah-realisasi-investasi-pariwisata"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "id": "jumlah-realisasi-investasi-pariwisata",
+    "name": "Jumlah Realisasi Investasi Pariwisata",
+    "namespace": "sdi-primer",
+    "type": "iceberg-table",
+    "layer": "raw",
+    "tier": "warm",
+    "classification": "internal",
+    "owner": "Budi Supriyanto",
+    "domain": "pariwisata",
+    "description": "Jumlah Realisasi Investasi Pariwisata di Provinsi DKI Jakarta",
+    "format": "Apache Iceberg (Parquet)",
+    "engine": "hot-store",
+    "rows": 1,
+    "sizeBytes": 220,
+    "columnCount": 1,
+    "freshnessLagSeconds": 0,
+    "lastUpdated": "",
+    "health": "healthy",
+    "residency": "id-jakarta",
+    "schema": [
+      {
+        "name": "jumlah_realisasi",
+        "dataType": "Nullable(Float64)",
+        "description": "komponen"
+      }
+    ],
+    "sample": [
+      {
+        "periode_data": "2025",
+        "jumlah_realisasi": "7394939740609"
+      }
+    ],
+    "qualityChecks": [],
+    "policySummary": [],
+    "usage": {
+      "queries7d": 0,
+      "users7d": 0,
+      "avgLatencyMs": 0
+    },
+    "recentQueries": [],
+    "dependents": [],
+    "changeHistory": [],
+    "snapshots": [],
+    "schemaVersions": [],
+    "upstream": [],
+    "downstream": [
+      {
+        "id": "silver.jumlah_realisasi_investasi_pariwisata",
+        "name": "silver.jumlah_realisasi_investasi_pariwisata"
+      }
+    ],
+    "lifecyclePolicy": "default",
+    "_meta": {
+      "frekuensi": "1 Tahun Sekali",
+      "satuan": "rupiah",
+      "klasifikasi": "Penyajian"
+    }
+  }
+}

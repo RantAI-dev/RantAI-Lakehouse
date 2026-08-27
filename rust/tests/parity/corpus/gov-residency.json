@@ -1,0 +1,24 @@
+{
+  "request": {
+    "name": "gov-residency",
+    "method": "GET",
+    "path": "/api/governance/residency"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "residency": [
+      {
+        "id": "res-dispar-dki",
+        "tenant": "dispar-dki",
+        "classification": "internal",
+        "approvedSites": [
+          "Depok (187)"
+        ],
+        "crossSiteAllowed": false,
+        "allowedOutput": "on-premise DKI",
+        "violations7d": 0
+      }
+    ]
+  }
+}

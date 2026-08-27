@@ -1,0 +1,464 @@
+{
+  "request": {
+    "name": "dashboard-specs-list",
+    "method": "GET",
+    "path": "/api/dashboard/specs"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "charts": [
+      {
+        "id": "u_2dadfe2e",
+        "title": "Total Foreign Visitors",
+        "kind": "kpi",
+        "mart": "mart_wisman",
+        "x": "",
+        "y": "jumlah",
+        "format": "int",
+        "span": 1,
+        "caption": "cumulative visits",
+        "source": "ui",
+        "board": "b_73c6fcc1",
+        "def": {
+          "title": "Total Foreign Visitors",
+          "kind": "kpi",
+          "mart": "mart_wisman",
+          "dimension": "",
+          "measures": [
+            "jumlah"
+          ],
+          "aggregate": "sum",
+          "caption": "cumulative visits",
+          "span": 1,
+          "board": "b_73c6fcc1"
+        },
+        "hasYear": true,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 08:05:16"
+      },
+      {
+        "id": "u_5c8e15d4",
+        "title": "Visitors by Region",
+        "kind": "pie",
+        "mart": "mart_wisman",
+        "x": "kawasan",
+        "y": "jumlah",
+        "format": "int",
+        "span": 1,
+        "source": "ui",
+        "board": "b_73c6fcc1",
+        "def": {
+          "title": "Visitors by Region",
+          "mart": "mart_wisman",
+          "kind": "pie",
+          "dimension": "kawasan",
+          "measures": [
+            "jumlah"
+          ],
+          "aggregate": "sum",
+          "limit": 20,
+          "order": "desc",
+          "span": 1,
+          "board": "b_73c6fcc1"
+        },
+        "hasYear": true,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 08:05:16"
+      },
+      {
+        "id": "u_947f0756",
+        "title": "Monthly Visitor Trend",
+        "kind": "area",
+        "mart": "mart_wisman",
+        "x": "bulan",
+        "y": "jumlah",
+        "format": "int",
+        "span": 1,
+        "source": "ui",
+        "board": "b_73c6fcc1",
+        "def": {
+          "title": "Monthly Visitor Trend",
+          "mart": "mart_wisman",
+          "kind": "area",
+          "dimension": "bulan",
+          "measures": [
+            "jumlah"
+          ],
+          "aggregate": "sum",
+          "limit": 20,
+          "order": "none",
+          "span": 1,
+          "board": "b_73c6fcc1"
+        },
+        "hasYear": true,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 08:05:16"
+      },
+      {
+        "id": "u_f876308c",
+        "title": "Top Source Countries",
+        "kind": "hbar",
+        "mart": "mart_wisman",
+        "x": "negara",
+        "y": "jumlah",
+        "format": "int",
+        "span": 1,
+        "source": "ui",
+        "board": "b_73c6fcc1",
+        "def": {
+          "title": "Top Source Countries",
+          "mart": "mart_wisman",
+          "kind": "hbar",
+          "dimension": "negara",
+          "measures": [
+            "jumlah"
+          ],
+          "aggregate": "sum",
+          "limit": 10,
+          "order": "desc",
+          "span": 1,
+          "board": "b_73c6fcc1"
+        },
+        "hasYear": true,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 08:05:16"
+      },
+      {
+        "id": "u_3dc28d55",
+        "title": "Funnel · entry",
+        "kind": "funnel",
+        "mart": "mart_wisman",
+        "x": "pintu_masuk",
+        "y": "jumlah",
+        "format": "int",
+        "span": 1,
+        "source": "ui",
+        "board": "b_5cbfb279",
+        "def": {
+          "title": "Funnel · entry",
+          "mart": "mart_wisman",
+          "kind": "funnel",
+          "dimension": "pintu_masuk",
+          "measures": [
+            "jumlah"
+          ],
+          "aggregate": "sum",
+          "limit": 6,
+          "order": "desc",
+          "span": 1,
+          "board": "b_5cbfb279"
+        },
+        "hasYear": true,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 09:59:40"
+      },
+      {
+        "id": "u_a4419289",
+        "title": "Scatter · dtw",
+        "kind": "scatter",
+        "mart": "mart_kunjungan_dtw",
+        "x": "destinasi",
+        "y": [
+          "wisnus",
+          "wisman"
+        ],
+        "format": "int",
+        "span": 1,
+        "source": "ui",
+        "board": "b_5cbfb279",
+        "def": {
+          "title": "Scatter · dtw",
+          "mart": "mart_kunjungan_dtw",
+          "kind": "scatter",
+          "dimension": "destinasi",
+          "measures": [
+            "wisnus",
+            "wisman"
+          ],
+          "aggregate": "sum",
+          "limit": 30,
+          "order": "desc",
+          "span": 1,
+          "board": "b_5cbfb279"
+        },
+        "hasYear": false,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 09:59:40"
+      },
+      {
+        "id": "u_c083a0db",
+        "title": "Gauge · total",
+        "kind": "gauge",
+        "mart": "mart_wisman",
+        "x": "",
+        "y": "v",
+        "format": "int",
+        "span": 1,
+        "target": 3000000,
+        "source": "ui",
+        "board": "b_5cbfb279",
+        "def": {
+          "title": "Gauge · total",
+          "kind": "gauge",
+          "mart": "mart_wisman",
+          "dimension": "",
+          "measures": [
+            "jumlah"
+          ],
+          "aggregate": "sum",
+          "target": 3000000,
+          "span": 1,
+          "board": "b_5cbfb279"
+        },
+        "hasYear": true,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 09:59:40"
+      },
+      {
+        "id": "u_d9ba378d",
+        "title": "Radar · region",
+        "kind": "radar",
+        "mart": "mart_wisman",
+        "x": "kawasan",
+        "y": "jumlah",
+        "format": "int",
+        "span": 1,
+        "source": "ui",
+        "board": "b_5cbfb279",
+        "def": {
+          "title": "Radar · region",
+          "mart": "mart_wisman",
+          "kind": "radar",
+          "dimension": "kawasan",
+          "measures": [
+            "jumlah"
+          ],
+          "aggregate": "sum",
+          "limit": 20,
+          "order": "desc",
+          "span": 1,
+          "board": "b_5cbfb279"
+        },
+        "hasYear": true,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 09:59:40"
+      },
+      {
+        "id": "u_de5513c2",
+        "title": "Rose · region",
+        "kind": "rose",
+        "mart": "mart_wisman",
+        "x": "kawasan",
+        "y": "jumlah",
+        "format": "int",
+        "span": 1,
+        "source": "ui",
+        "board": "b_5cbfb279",
+        "def": {
+          "title": "Rose · region",
+          "mart": "mart_wisman",
+          "kind": "rose",
+          "dimension": "kawasan",
+          "measures": [
+            "jumlah"
+          ],
+          "aggregate": "sum",
+          "limit": 20,
+          "order": "desc",
+          "span": 1,
+          "board": "b_5cbfb279"
+        },
+        "hasYear": true,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 09:59:40"
+      },
+      {
+        "id": "u_f9ed9ad5",
+        "title": "Treemap · country",
+        "kind": "treemap",
+        "mart": "mart_wisman",
+        "x": "negara",
+        "y": "jumlah",
+        "format": "int",
+        "span": 1,
+        "source": "ui",
+        "board": "b_5cbfb279",
+        "def": {
+          "title": "Treemap · country",
+          "mart": "mart_wisman",
+          "kind": "treemap",
+          "dimension": "negara",
+          "measures": [
+            "jumlah"
+          ],
+          "aggregate": "sum",
+          "limit": 12,
+          "order": "desc",
+          "span": 1,
+          "board": "b_5cbfb279"
+        },
+        "hasYear": true,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 09:59:40"
+      },
+      {
+        "id": "u_2f1765f7",
+        "title": "Bubble · dtw",
+        "kind": "bubble",
+        "mart": "mart_kunjungan_dtw",
+        "x": "destinasi",
+        "y": [
+          "wisnus",
+          "wisman",
+          "total"
+        ],
+        "format": "int",
+        "span": 1,
+        "source": "ui",
+        "board": "b_5cbfb279",
+        "def": {
+          "title": "Bubble · dtw",
+          "mart": "mart_kunjungan_dtw",
+          "kind": "bubble",
+          "dimension": "destinasi",
+          "measures": [
+            "wisnus",
+            "wisman",
+            "total"
+          ],
+          "aggregate": "sum",
+          "limit": 30,
+          "order": "desc",
+          "span": 1,
+          "board": "b_5cbfb279"
+        },
+        "hasYear": false,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 09:59:41"
+      },
+      {
+        "id": "u_3f3c5d33",
+        "title": "Waterfall · region",
+        "kind": "waterfall",
+        "mart": "mart_wisman",
+        "x": "kawasan",
+        "y": "jumlah",
+        "format": "int",
+        "span": 1,
+        "source": "ui",
+        "board": "b_5cbfb279",
+        "def": {
+          "title": "Waterfall · region",
+          "mart": "mart_wisman",
+          "kind": "waterfall",
+          "dimension": "kawasan",
+          "measures": [
+            "jumlah"
+          ],
+          "aggregate": "sum",
+          "limit": 20,
+          "order": "desc",
+          "span": 1,
+          "board": "b_5cbfb279"
+        },
+        "hasYear": true,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 09:59:41"
+      },
+      {
+        "id": "u_f1b0fd25",
+        "title": "Combo · dtw",
+        "kind": "combo",
+        "mart": "mart_kunjungan_dtw",
+        "x": "destinasi",
+        "y": [
+          "wisnus",
+          "wisman"
+        ],
+        "format": "int",
+        "span": 1,
+        "source": "ui",
+        "board": "b_5cbfb279",
+        "def": {
+          "title": "Combo · dtw",
+          "mart": "mart_kunjungan_dtw",
+          "kind": "combo",
+          "dimension": "destinasi",
+          "measures": [
+            "wisnus",
+            "wisman"
+          ],
+          "aggregate": "sum",
+          "limit": 8,
+          "order": "desc",
+          "span": 1,
+          "board": "b_5cbfb279"
+        },
+        "hasYear": false,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 09:59:41"
+      },
+      {
+        "id": "u_fd533c0f",
+        "title": "Heatmap · entry×region",
+        "kind": "heatmap",
+        "mart": "mart_wisman",
+        "x": "pintu_masuk",
+        "y": "jumlah",
+        "series": "kawasan",
+        "format": "int",
+        "span": 1,
+        "source": "ui",
+        "board": "b_5cbfb279",
+        "def": {
+          "title": "Heatmap · entry×region",
+          "mart": "mart_wisman",
+          "kind": "heatmap",
+          "dimension": "pintu_masuk",
+          "measures": [
+            "jumlah"
+          ],
+          "breakdown": "kawasan",
+          "aggregate": "sum",
+          "limit": 20,
+          "order": "desc",
+          "span": 1,
+          "board": "b_5cbfb279"
+        },
+        "hasYear": true,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 09:59:41"
+      },
+      {
+        "id": "u_e491bf76",
+        "title": "Culinary by region (map)",
+        "kind": "geomap",
+        "mart": "mart_kuliner",
+        "x": "wilayah",
+        "y": "jumlah_usaha",
+        "format": "int",
+        "span": 2,
+        "source": "ui",
+        "board": "b_5cbfb279",
+        "def": {
+          "title": "Culinary by region (map)",
+          "mart": "mart_kuliner",
+          "kind": "geomap",
+          "dimension": "wilayah",
+          "measures": [
+            "jumlah_usaha"
+          ],
+          "aggregate": "sum",
+          "limit": 20,
+          "order": "desc",
+          "span": 2,
+          "board": "b_5cbfb279"
+        },
+        "hasYear": true,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 10:43:13"
+      }
+    ]
+  }
+}

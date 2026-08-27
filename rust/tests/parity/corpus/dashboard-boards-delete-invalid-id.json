@@ -1,0 +1,14 @@
+{
+  "request": {
+    "name": "dashboard-boards-delete-invalid-id",
+    "method": "DELETE",
+    "path": "/api/dashboard/boards",
+    "comment": "MUTATING on success (DELETE removes a board + its charts). Missing ?id is rejected before any write.",
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "dashboard tidak valid"
+  }
+}

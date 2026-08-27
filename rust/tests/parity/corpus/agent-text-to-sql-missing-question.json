@@ -1,0 +1,14 @@
+{
+  "request": {
+    "name": "agent-text-to-sql-missing-question",
+    "method": "POST",
+    "path": "/api/agent/text-to-sql",
+    "body": {},
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "question wajib"
+  }
+}

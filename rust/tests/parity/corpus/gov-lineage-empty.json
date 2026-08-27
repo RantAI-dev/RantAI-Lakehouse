@@ -1,0 +1,15 @@
+{
+  "request": {
+    "name": "gov-lineage-empty",
+    "method": "GET",
+    "path": "/api/governance/lineage"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "focus": "",
+    "nodes": [],
+    "edges": [],
+    "columnMappings": []
+  }
+}

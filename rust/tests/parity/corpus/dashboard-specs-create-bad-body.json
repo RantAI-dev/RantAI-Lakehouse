@@ -1,0 +1,15 @@
+{
+  "request": {
+    "name": "dashboard-specs-create-bad-body",
+    "method": "POST",
+    "path": "/api/dashboard/specs",
+    "raw": "not json",
+    "comment": "MUTATING on success (POST inserts a chart into console.bi_chart). Only capturing the invalid-JSON validation error path.",
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "body JSON tidak valid"
+  }
+}

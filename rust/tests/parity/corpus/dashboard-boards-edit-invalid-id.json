@@ -1,0 +1,18 @@
+{
+  "request": {
+    "name": "dashboard-boards-edit-invalid-id",
+    "method": "PUT",
+    "path": "/api/dashboard/boards",
+    "body": {
+      "id": "default",
+      "name": "x"
+    },
+    "comment": "MUTATING on success (PUT can rename/relayout/re-filter/publish a board). id=default is rejected by the handler before any write, so this only exercises the validation error path.",
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "dashboard tidak valid"
+  }
+}

@@ -1,0 +1,194 @@
+[
+  { "name": "catalog-list",             "method": "GET",  "path": "/api/catalog" },
+  { "name": "catalog-detail",           "method": "GET",  "path": "/api/catalog/jumlah-realisasi-investasi-pariwisata" },
+  { "name": "catalog-detail-gold",      "method": "GET",  "path": "/api/catalog/serving.mart_wisman" },
+  { "name": "catalog-detail-not-found", "method": "GET",  "path": "/api/catalog/does-not-exist-slug", "expectStatus": 404 },
+
+  { "name": "overview-get",             "method": "GET",  "path": "/api/overview" },
+  { "name": "overview-refresh",         "method": "POST", "path": "/api/overview" },
+
+  { "name": "storage-get",              "method": "GET",  "path": "/api/storage" },
+
+  { "name": "ops-observability",        "method": "GET",  "path": "/api/ops/observability" },
+  { "name": "ops-usage",                "method": "GET",  "path": "/api/ops/usage" },
+  { "name": "ops-workloads",            "method": "GET",  "path": "/api/ops/workloads" },
+  { "name": "ops-services",             "method": "GET",  "path": "/api/ops/services" },
+  { "name": "ops-unknown-kind",         "method": "GET",  "path": "/api/ops/bogus-kind", "expectStatus": 400 },
+
+  { "name": "gov-quality",              "method": "GET",  "path": "/api/governance/quality" },
+  { "name": "gov-classification",       "method": "GET",  "path": "/api/governance/classification" },
+  { "name": "gov-audit",                "method": "GET",  "path": "/api/governance/audit" },
+  { "name": "gov-residency",            "method": "GET",  "path": "/api/governance/residency" },
+  { "name": "gov-unknown-kind",         "method": "GET",  "path": "/api/governance/bogus-kind", "expectStatus": 400 },
+  { "name": "gov-lineage",              "method": "GET",  "path": "/api/governance/lineage?focus=jumlah-realisasi-investasi-pariwisata" },
+  { "name": "gov-lineage-empty",        "method": "GET",  "path": "/api/governance/lineage" },
+
+  { "name": "pipelines-list",           "method": "GET",  "path": "/api/pipelines" },
+  { "name": "pipeline-runs",            "method": "GET",  "path": "/api/pipelines/refresh_lakehouse/runs" },
+  {
+    "name": "pipeline-trigger-bad-id",
+    "method": "POST",
+    "path": "/api/pipelines/definitely-not-a-real-job/trigger",
+    "comment": "MUTATING handler (launches a real Dagster run on success). We deliberately use a job name that does not exist so Dagster rejects the launch (expected 422) instead of actually starting a pipeline. Do NOT capture the success path here — that would kick off a real Bronze->Silver->Gold build.",
+    "expectStatus": 422
+  },
+
+  { "name": "query-run-ok",             "method": "POST", "path": "/api/query/run", "body": { "sql": "SELECT 1 AS a" } },
+  { "name": "query-run-reject-dml",     "method": "POST", "path": "/api/query/run", "body": { "sql": "INSERT INTO x VALUES (1)" }, "expectStatus": 422 },
+  { "name": "query-run-bad-body",       "method": "POST", "path": "/api/query/run", "raw": "not json", "expectStatus": 400 },
+  { "name": "query-run-missing-sql",    "method": "POST", "path": "/api/query/run", "body": {}, "expectStatus": 400 },
+  { "name": "query-estimate",           "method": "POST", "path": "/api/query/estimate", "body": { "sql": "SELECT * FROM serving.mart_wisman" } },
+  { "name": "query-estimate-bad-body",  "method": "POST", "path": "/api/query/estimate", "raw": "not json", "expectStatus": 400 },
+
+  { "name": "dashboard-get",            "method": "GET",  "path": "/api/dashboard" },
+  {
+    "name": "dashboard-specs-list",
+    "method": "GET",
+    "path": "/api/dashboard/specs"
+  },
+  {
+    "name": "dashboard-specs-create-bad-body",
+    "method": "POST",
+    "path": "/api/dashboard/specs",
+    "raw": "not json",
+    "comment": "MUTATING on success (POST inserts a chart into console.bi_chart). Only capturing the invalid-JSON validation error path.",
+    "expectStatus": 400
+  },
+  {
+    "name": "dashboard-specs-edit-missing-id",
+    "method": "PUT",
+    "path": "/api/dashboard/specs",
+    "body": { "title": "x" },
+    "comment": "MUTATING on success (PUT upserts console.bi_chart). Only capturing the missing-id validation error path.",
+    "expectStatus": 400
+  },
+  {
+    "name": "dashboard-specs-delete-missing-id",
+    "method": "DELETE",
+    "path": "/api/dashboard/specs",
+    "comment": "MUTATING on success (DELETE removes a row from console.bi_chart). Only capturing the missing-id validation error path.",
+    "expectStatus": 400
+  },
+  { "name": "dashboard-boards-list",    "method": "GET",  "path": "/api/dashboard/boards" },
+  {
+    "name": "dashboard-boards-create-bad-body",
+    "method": "POST",
+    "path": "/api/dashboard/boards",
+    "raw": "not json",
+    "comment": "MUTATING on success (POST inserts into console.bi_board). Only capturing the invalid-JSON validation error path.",
+    "expectStatus": 400
+  },
+  {
+    "name": "dashboard-boards-edit-invalid-id",
+    "method": "PUT",
+    "path": "/api/dashboard/boards",
+    "body": { "id": "default", "name": "x" },
+    "comment": "MUTATING on success (PUT can rename/relayout/re-filter/publish a board). id=default is rejected by the handler before any write, so this only exercises the validation error path.",
+    "expectStatus": 400
+  },
+  {
+    "name": "dashboard-boards-delete-invalid-id",
+    "method": "DELETE",
+    "path": "/api/dashboard/boards",
+    "comment": "MUTATING on success (DELETE removes a board + its charts). Missing ?id is rejected before any write.",
+    "expectStatus": 400
+  },
+  { "name": "dashboard-fields-marts",   "method": "GET",  "path": "/api/dashboard/fields" },
+  { "name": "dashboard-fields-columns", "method": "GET",  "path": "/api/dashboard/fields?mart=mart_wisman" },
+  { "name": "dashboard-values",         "method": "GET",  "path": "/api/dashboard/values?column=kawasan" },
+  { "name": "dashboard-values-missing-column", "method": "GET", "path": "/api/dashboard/values", "expectStatus": 400 },
+  { "name": "dashboard-records",        "method": "GET",  "path": "/api/dashboard/records?mart=mart_wisman&column=kawasan&value=Asia&limit=5" },
+  { "name": "dashboard-records-invalid-mart", "method": "GET", "path": "/api/dashboard/records?mart=not!valid&column=x", "expectStatus": 400 },
+  { "name": "dashboard-export",         "method": "GET",  "path": "/api/dashboard/export" },
+  {
+    "name": "dashboard-embed-info",
+    "method": "GET",
+    "path": "/api/dashboard/embed-info?board=b_73c6fcc1",
+    "comment": "Uses a real, pre-existing board id (b_73c6fcc1 'Sample — Visitors', embed already enabled) found in console.bi_board — the literal string 'default' is rejected by this handler (400) so it cannot be used as the happy-path example."
+  },
+  { "name": "dashboard-embed-info-invalid-board", "method": "GET", "path": "/api/dashboard/embed-info?board=default", "expectStatus": 400 },
+  { "name": "dashboard-embed-info-not-found", "method": "GET", "path": "/api/dashboard/embed-info?board=b_does_not_exist", "expectStatus": 404 },
+
+  { "name": "embed-data-no-jwt",        "method": "POST", "path": "/api/embed/data", "body": {}, "expectStatus": 400 },
+  { "name": "embed-data-bad-jwt",       "method": "POST", "path": "/api/embed/data", "body": { "jwt": "a.b.c" }, "expectStatus": 401 },
+
+  { "name": "public-dash-ok",           "method": "GET",  "path": "/api/public/dashboard/__PUBLIC_DASH_TOKEN__" },
+  { "name": "public-dash-bad",          "method": "GET",  "path": "/api/public/dashboard/nonexistent", "expectStatus": 404 },
+
+  { "name": "ai-sessions-list",         "method": "GET",  "path": "/api/ai/sessions" },
+  { "name": "ai-sessions-detail",       "method": "GET",  "path": "/api/ai/sessions?id=c_81570a05" },
+  { "name": "ai-sessions-detail-not-found", "method": "GET", "path": "/api/ai/sessions?id=c_does_not_exist", "expectStatus": 404 },
+  {
+    "name": "ai-sessions-save-empty-messages",
+    "method": "POST",
+    "path": "/api/ai/sessions",
+    "body": { "mode": "ask", "messages": [] },
+    "comment": "MUTATING on success (POST upserts console.chat_session). Only capturing the empty-messages validation error path.",
+    "expectStatus": 400
+  },
+  {
+    "name": "ai-sessions-delete-missing-id",
+    "method": "DELETE",
+    "path": "/api/ai/sessions",
+    "comment": "MUTATING on success (DELETE removes a row from console.chat_session). Only capturing the missing-id validation error path.",
+    "expectStatus": 400
+  },
+
+  { "name": "ai-build-status-missing-runid", "method": "GET", "path": "/api/ai/build-status", "expectStatus": 400 },
+  { "name": "ai-build-status-ok",       "method": "GET",  "path": "/api/ai/build-status?runId=ead7470c-a36f-410f-95fe-ddef911805c9" },
+  { "name": "ai-build-status-not-found", "method": "GET", "path": "/api/ai/build-status?runId=00000000-0000-0000-0000-000000000000", "expectStatus": 404 },
+
+  {
+    "name": "ai-chat-ok",
+    "method": "POST",
+    "path": "/api/ai/chat",
+    "body": { "mode": "ask", "messages": [{ "role": "user", "content": "Ada dataset apa saja tentang wisatawan mancanegara?" }] },
+    "comment": "Calls the real MiniMax LLM (LLM_URL/LLM_KEY). Mode defaults/forced to 'ask' so write tools (trigger_lakehouse_build/create_chart/etc.) are filtered out server-side — this cannot mutate the lakehouse, but the answer text is inherently non-deterministic between captures."
+  },
+  { "name": "ai-chat-bad-body",         "method": "POST", "path": "/api/ai/chat", "raw": "not json", "expectStatus": 400 },
+  { "name": "ai-chat-empty-messages",   "method": "POST", "path": "/api/ai/chat", "body": { "messages": [] }, "expectStatus": 400 },
+
+  {
+    "name": "alerts-list",
+    "method": "GET",
+    "path": "/api/alerts"
+  },
+  {
+    "name": "alerts-create-bad-body",
+    "method": "POST",
+    "path": "/api/alerts",
+    "raw": "not json",
+    "comment": "MUTATING on success (POST inserts a rule into console.alert_rule). Only capturing the invalid-JSON validation error path.",
+    "expectStatus": 400
+  },
+  {
+    "name": "alerts-edit-missing-id",
+    "method": "PUT",
+    "path": "/api/alerts",
+    "body": { "name": "x" },
+    "comment": "MUTATING on success (PUT upserts console.alert_rule). Only capturing the missing-id validation error path.",
+    "expectStatus": 400
+  },
+  {
+    "name": "alerts-delete-missing-id",
+    "method": "DELETE",
+    "path": "/api/alerts",
+    "comment": "MUTATING on success (DELETE removes a rule from console.alert_rule). Only capturing the missing-id validation error path.",
+    "expectStatus": 400
+  },
+  {
+    "name": "_OMITTED_alerts-run",
+    "comment": "DELIBERATELY NOT CAPTURED. /api/alerts/run (GET and POST) evaluates every alert rule and can send REAL webhook/email notifications (see src/services/clients/alert-store.ts runRules). The handler's only safety gate is the ALERTS_RUN_TOKEN env var, which is UNSET in .env.local in this environment -- so the `if (need)` guard is skipped entirely and ANY request (even with a wrong/missing token) would execute for real. There is no safe error-path to capture here without either setting ALERTS_RUN_TOKEN first or accepting a real side effect, so this handler is skipped for both GET and POST. Revisit once ALERTS_RUN_TOKEN is configured, or capture with a mocked alert-store in the Rust parity harness instead.",
+    "skip": true
+  },
+
+  { "name": "agent-ask-ok",             "method": "POST", "path": "/api/agent/ask", "body": { "question": "Ada dataset apa saja tentang investasi pariwisata?" } },
+  { "name": "agent-ask-missing-question", "method": "POST", "path": "/api/agent/ask", "body": {}, "expectStatus": 400 },
+  { "name": "agent-ask-bad-body",       "method": "POST", "path": "/api/agent/ask", "raw": "not json", "expectStatus": 400 },
+
+  { "name": "agent-query-ok",           "method": "POST", "path": "/api/agent/query", "body": { "question": "Berapa total jumlah wisatawan mancanegara per tahun di mart_wisman?" } },
+  { "name": "agent-query-missing-question", "method": "POST", "path": "/api/agent/query", "body": {}, "expectStatus": 400 },
+
+  { "name": "agent-text-to-sql-ok",     "method": "POST", "path": "/api/agent/text-to-sql", "body": { "question": "Tampilkan 5 baris dari mart_wisman", "run": false } },
+  { "name": "agent-text-to-sql-missing-question", "method": "POST", "path": "/api/agent/text-to-sql", "body": {}, "expectStatus": 400 }
+]

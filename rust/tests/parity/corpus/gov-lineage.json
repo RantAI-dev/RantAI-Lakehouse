@@ -1,0 +1,55 @@
+{
+  "request": {
+    "name": "gov-lineage",
+    "method": "GET",
+    "path": "/api/governance/lineage?focus=jumlah-realisasi-investasi-pariwisata"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "focus": "jumlah-realisasi-investasi-pariwisata",
+    "nodes": [
+      {
+        "id": "src",
+        "label": "Satu Data Jakarta",
+        "kind": "source"
+      },
+      {
+        "id": "bronze.jumlah_realisasi_investasi_pariwisata",
+        "label": "Bronze · jumlah_realisasi_investasi_pariwisata",
+        "kind": "iceberg-table"
+      },
+      {
+        "id": "silver.jumlah_realisasi_investasi_pariwisata",
+        "label": "Silver · jumlah_realisasi_investasi_pariwisata",
+        "kind": "view"
+      }
+    ],
+    "edges": [
+      {
+        "id": "e1",
+        "from": "src",
+        "to": "bronze.jumlah_realisasi_investasi_pariwisata",
+        "kind": "pipeline"
+      },
+      {
+        "id": "e2",
+        "from": "bronze.jumlah_realisasi_investasi_pariwisata",
+        "to": "silver.jumlah_realisasi_investasi_pariwisata",
+        "kind": "transform"
+      }
+    ],
+    "columnMappings": [
+      {
+        "source": "bronze_sdi.jumlah_realisasi_investasi_pariwisata.jumlah_realisasi",
+        "target": "silver.jumlah_realisasi_investasi_pariwisata.jumlah_realisasi",
+        "transform": "angka_id (Decimal)"
+      },
+      {
+        "source": "bronze_sdi.jumlah_realisasi_investasi_pariwisata.periode_data",
+        "target": "silver.jumlah_realisasi_investasi_pariwisata.periode_data",
+        "transform": "angka_id (Decimal)"
+      }
+    ]
+  }
+}

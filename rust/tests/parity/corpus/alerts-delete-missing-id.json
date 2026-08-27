@@ -1,0 +1,14 @@
+{
+  "request": {
+    "name": "alerts-delete-missing-id",
+    "method": "DELETE",
+    "path": "/api/alerts",
+    "comment": "MUTATING on success (DELETE removes a rule from console.alert_rule). Only capturing the missing-id validation error path.",
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "id wajib"
+  }
+}

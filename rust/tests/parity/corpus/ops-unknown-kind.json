@@ -1,0 +1,13 @@
+{
+  "request": {
+    "name": "ops-unknown-kind",
+    "method": "GET",
+    "path": "/api/ops/bogus-kind",
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "kind tak dikenal: bogus-kind"
+  }
+}

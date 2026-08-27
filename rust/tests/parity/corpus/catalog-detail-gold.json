@@ -1,0 +1,131 @@
+{
+  "request": {
+    "name": "catalog-detail-gold",
+    "method": "GET",
+    "path": "/api/catalog/serving.mart_wisman"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "id": "serving.mart_wisman",
+    "name": "Mart Wisman",
+    "namespace": "serving",
+    "type": "table",
+    "layer": "gold",
+    "tier": "hot",
+    "classification": "internal",
+    "owner": "Dinas Pariwisata & Ekraf DKI Jakarta",
+    "domain": "pariwisata",
+    "description": "Mart Gold penyaji dashboard (agregat siap pakai).",
+    "format": "ClickHouse MergeTree",
+    "engine": "hot-store",
+    "rows": 276,
+    "sizeBytes": 60720,
+    "columnCount": 8,
+    "freshnessLagSeconds": 0,
+    "lastUpdated": "",
+    "health": "healthy",
+    "residency": "id-jakarta",
+    "schema": [
+      {
+        "name": "kode_negara",
+        "dataType": "String"
+      },
+      {
+        "name": "negara",
+        "dataType": "String"
+      },
+      {
+        "name": "kawasan",
+        "dataType": "String"
+      },
+      {
+        "name": "tahun",
+        "dataType": "UInt16"
+      },
+      {
+        "name": "bulan_no",
+        "dataType": "UInt8"
+      },
+      {
+        "name": "bulan",
+        "dataType": "String"
+      },
+      {
+        "name": "pintu_masuk",
+        "dataType": "String"
+      },
+      {
+        "name": "jumlah",
+        "dataType": "Float64"
+      }
+    ],
+    "sample": [
+      {
+        "kode_negara": "ARE",
+        "negara": "Uni Emirat Arab",
+        "kawasan": "Timur Tengah",
+        "tahun": "2014",
+        "bulan_no": "1",
+        "bulan": "Januari",
+        "pintu_masuk": "Soekarno-Hatta",
+        "jumlah": "476"
+      },
+      {
+        "kode_negara": "ARE",
+        "negara": "Uni Emirat Arab",
+        "kawasan": "Timur Tengah",
+        "tahun": "2014",
+        "bulan_no": "2",
+        "bulan": "Februari",
+        "pintu_masuk": "Soekarno-Hatta",
+        "jumlah": "615"
+      },
+      {
+        "kode_negara": "ARE",
+        "negara": "Uni Emirat Arab",
+        "kawasan": "Timur Tengah",
+        "tahun": "2014",
+        "bulan_no": "3",
+        "bulan": "Maret",
+        "pintu_masuk": "Soekarno-Hatta",
+        "jumlah": "860"
+      },
+      {
+        "kode_negara": "ARE",
+        "negara": "Uni Emirat Arab",
+        "kawasan": "Timur Tengah",
+        "tahun": "2014",
+        "bulan_no": "4",
+        "bulan": "April",
+        "pintu_masuk": "Soekarno-Hatta",
+        "jumlah": "1082"
+      },
+      {
+        "kode_negara": "ARE",
+        "negara": "Uni Emirat Arab",
+        "kawasan": "Timur Tengah",
+        "tahun": "2014",
+        "bulan_no": "5",
+        "bulan": "Mei",
+        "pintu_masuk": "Soekarno-Hatta",
+        "jumlah": "794"
+      }
+    ],
+    "qualityChecks": [],
+    "policySummary": [],
+    "usage": {
+      "queries7d": 0,
+      "users7d": 0,
+      "avgLatencyMs": 0
+    },
+    "recentQueries": [],
+    "dependents": [],
+    "changeHistory": [],
+    "snapshots": [],
+    "schemaVersions": [],
+    "upstream": [],
+    "downstream": [],
+    "lifecyclePolicy": "default"
+  }
+}

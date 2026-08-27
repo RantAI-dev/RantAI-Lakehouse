@@ -1,0 +1,16 @@
+{
+  "request": {
+    "name": "query-run-reject-dml",
+    "method": "POST",
+    "path": "/api/query/run",
+    "body": {
+      "sql": "INSERT INTO x VALUES (1)"
+    },
+    "expectStatus": 422
+  },
+  "status": 422,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "Hanya query baca (SELECT/SHOW/DESCRIBE/EXPLAIN) yang diizinkan di Query Studio."
+  }
+}

@@ -1,0 +1,535 @@
+{
+  "request": {
+    "name": "dashboard-get",
+    "method": "GET",
+    "path": "/api/dashboard"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "board": "default",
+    "years": [],
+    "layout": {},
+    "filters": [],
+    "filterColumns": [],
+    "boards": [
+      {
+        "id": "default",
+        "name": "Main"
+      },
+      {
+        "id": "b_5cbfb279",
+        "name": "Chart Gallery"
+      },
+      {
+        "id": "b_73c6fcc1",
+        "name": "Sample — Visitors"
+      }
+    ],
+    "kpis": [
+      {
+        "id": "kpi_wisman_total",
+        "title": "Total Foreign Visitors",
+        "caption": "foreign visits (cumulative)",
+        "format": "int"
+      },
+      {
+        "id": "kpi_dtw",
+        "title": "Tracked Destinations",
+        "caption": "tourist attractions (DTW)",
+        "format": "int"
+      },
+      {
+        "id": "kpi_event",
+        "title": "Events (Latest Year)",
+        "caption": "number of events in the latest year",
+        "format": "int"
+      },
+      {
+        "id": "kpi_gci",
+        "title": "GCI Indicators Ready",
+        "caption": "indicators with data available",
+        "format": "int"
+      }
+    ],
+    "charts": [
+      {
+        "id": "wisman_tren",
+        "title": "Foreign Visitor Trend",
+        "subtitle": "Monthly total across years",
+        "kind": "area",
+        "mart": "mart_wisman",
+        "span": 2,
+        "x": "periode",
+        "y": "jumlah",
+        "format": "int",
+        "source": "builtin",
+        "board": "default"
+      },
+      {
+        "id": "wisman_negara",
+        "title": "Top Source Countries",
+        "subtitle": "Top 10 nationalities",
+        "kind": "hbar",
+        "mart": "mart_wisman",
+        "x": "negara",
+        "y": "jumlah",
+        "format": "int",
+        "source": "builtin",
+        "board": "default"
+      },
+      {
+        "id": "wisman_kawasan",
+        "title": "Visitors by Region",
+        "subtitle": "Distribution by continent/region",
+        "kind": "pie",
+        "mart": "mart_wisman",
+        "x": "kawasan",
+        "y": "jumlah",
+        "format": "int",
+        "source": "builtin",
+        "board": "default"
+      },
+      {
+        "id": "wisman_pintu",
+        "title": "Visitors by Entry Point",
+        "subtitle": "Arrival points",
+        "kind": "bar",
+        "mart": "mart_wisman",
+        "x": "pintu_masuk",
+        "y": "jumlah",
+        "format": "int",
+        "source": "builtin",
+        "board": "default"
+      },
+      {
+        "id": "dtw_top",
+        "title": "Visits by Destination",
+        "subtitle": "Domestic vs foreign, top 8 destinations",
+        "kind": "stacked",
+        "mart": "mart_kunjungan_dtw",
+        "span": 2,
+        "x": "destinasi",
+        "y": [
+          "wisnus",
+          "wisman"
+        ],
+        "format": "int",
+        "source": "builtin",
+        "board": "default"
+      },
+      {
+        "id": "event_tren",
+        "title": "Event Count Trend",
+        "subtitle": "Per year",
+        "kind": "line",
+        "mart": "mart_event",
+        "x": "tahun",
+        "y": "jumlah",
+        "format": "int",
+        "source": "builtin",
+        "board": "default"
+      },
+      {
+        "id": "gci_readiness",
+        "title": "GCI Data Readiness",
+        "subtitle": "Readiness status distribution",
+        "kind": "pie",
+        "mart": "mart_gci_readiness",
+        "x": "readiness",
+        "y": "n",
+        "format": "int",
+        "source": "builtin",
+        "board": "default"
+      },
+      {
+        "id": "kuliner_wilayah",
+        "title": "Culinary Businesses by Area",
+        "subtitle": "Registered businesses",
+        "kind": "bar",
+        "mart": "mart_kuliner",
+        "x": "wilayah",
+        "y": "jumlah",
+        "format": "int",
+        "source": "builtin",
+        "board": "default"
+      },
+      {
+        "id": "atlas_poi",
+        "title": "Tourism POIs by Category",
+        "subtitle": "Number of POIs",
+        "kind": "hbar",
+        "mart": "mart_atlas",
+        "x": "kategori",
+        "y": "jumlah",
+        "format": "int",
+        "source": "builtin",
+        "board": "default"
+      }
+    ],
+    "results": {
+      "kpi_wisman_total": {
+        "columns": [
+          "v"
+        ],
+        "rows": [
+          {
+            "v": 2223452
+          }
+        ]
+      },
+      "kpi_dtw": {
+        "columns": [
+          "v"
+        ],
+        "rows": [
+          {
+            "v": 31
+          }
+        ]
+      },
+      "kpi_event": {
+        "columns": [
+          "v",
+          "tahun"
+        ],
+        "rows": [
+          {
+            "v": 218,
+            "tahun": 2019
+          }
+        ]
+      },
+      "kpi_gci": {
+        "columns": [
+          "v",
+          "total"
+        ],
+        "rows": [
+          {
+            "v": 19,
+            "total": 28
+          }
+        ]
+      },
+      "wisman_tren": {
+        "columns": [
+          "periode",
+          "jumlah"
+        ],
+        "rows": [
+          {
+            "periode": "2014-01",
+            "jumlah": 184646
+          },
+          {
+            "periode": "2014-02",
+            "jumlah": 178739
+          },
+          {
+            "periode": "2014-03",
+            "jumlah": 192822
+          },
+          {
+            "periode": "2014-04",
+            "jumlah": 178820
+          },
+          {
+            "periode": "2014-05",
+            "jumlah": 182393
+          },
+          {
+            "periode": "2014-06",
+            "jumlah": 206181
+          },
+          {
+            "periode": "2014-07",
+            "jumlah": 166849
+          },
+          {
+            "periode": "2014-08",
+            "jumlah": 216700
+          },
+          {
+            "periode": "2014-09",
+            "jumlah": 172637
+          },
+          {
+            "periode": "2014-10",
+            "jumlah": 175838
+          },
+          {
+            "periode": "2014-11",
+            "jumlah": 178925
+          },
+          {
+            "periode": "2014-12",
+            "jumlah": 188902
+          }
+        ]
+      },
+      "wisman_negara": {
+        "columns": [
+          "negara",
+          "jumlah"
+        ],
+        "rows": [
+          {
+            "negara": "Malaysia",
+            "jumlah": 319855
+          },
+          {
+            "negara": "Lainnya",
+            "jumlah": 252076
+          },
+          {
+            "negara": "Tiongkok",
+            "jumlah": 240622
+          },
+          {
+            "negara": "Jepang",
+            "jumlah": 210568
+          },
+          {
+            "negara": "Singapura",
+            "jumlah": 184779
+          },
+          {
+            "negara": "Arab Saudi",
+            "jumlah": 141009
+          },
+          {
+            "negara": "Crew (WNA)",
+            "jumlah": 111675
+          },
+          {
+            "negara": "Korea Selatan",
+            "jumlah": 93235
+          },
+          {
+            "negara": "Amerika Serikat",
+            "jumlah": 85815
+          },
+          {
+            "negara": "India",
+            "jumlah": 74379
+          }
+        ]
+      },
+      "wisman_kawasan": {
+        "columns": [
+          "kawasan",
+          "jumlah"
+        ],
+        "rows": [
+          {
+            "kawasan": "Asia",
+            "jumlah": 1310934
+          },
+          {
+            "kawasan": "Lainnya",
+            "jumlah": 363751
+          },
+          {
+            "kawasan": "Eropa",
+            "jumlah": 235750
+          },
+          {
+            "kawasan": "Timur Tengah",
+            "jumlah": 152938
+          },
+          {
+            "kawasan": "Amerika",
+            "jumlah": 85815
+          },
+          {
+            "kawasan": "Oseania",
+            "jumlah": 69579
+          },
+          {
+            "kawasan": "Afrika",
+            "jumlah": 4685
+          }
+        ]
+      },
+      "wisman_pintu": {
+        "columns": [
+          "pintu_masuk",
+          "jumlah"
+        ],
+        "rows": [
+          {
+            "pintu_masuk": "Soekarno-Hatta",
+            "jumlah": 2223452
+          }
+        ]
+      },
+      "dtw_top": {
+        "columns": [
+          "destinasi",
+          "wisnus",
+          "wisman"
+        ],
+        "rows": [
+          {
+            "destinasi": "Kawasan Kota Tua Jakarta",
+            "wisnus": 97700,
+            "wisman": 1963
+          },
+          {
+            "destinasi": "Taman Lapangan Banteng",
+            "wisnus": 0,
+            "wisman": 0
+          },
+          {
+            "destinasi": "Taman Mini Indonesia Indah (TMII)",
+            "wisnus": 0,
+            "wisman": 0
+          },
+          {
+            "destinasi": "Jakarta Aquarium Safari (Neo Soho)",
+            "wisnus": 0,
+            "wisman": 0
+          },
+          {
+            "destinasi": "TIJA Ancol (Taman Impian Jaya Ancol) — PJAA",
+            "wisnus": 720000,
+            "wisman": 0
+          },
+          {
+            "destinasi": "Museum Perumusan Naskah Proklamasi",
+            "wisnus": 0,
+            "wisman": 0
+          },
+          {
+            "destinasi": "Planetarium Jakarta (TIM)",
+            "wisnus": 0,
+            "wisman": 0
+          },
+          {
+            "destinasi": "Perkampungan Budaya Betawi Setu Babakan",
+            "wisnus": 0,
+            "wisman": 0
+          }
+        ]
+      },
+      "event_tren": {
+        "columns": [
+          "tahun",
+          "jumlah"
+        ],
+        "rows": [
+          {
+            "tahun": "2011",
+            "jumlah": 139
+          },
+          {
+            "tahun": "2012",
+            "jumlah": 146
+          },
+          {
+            "tahun": "2013",
+            "jumlah": 57
+          },
+          {
+            "tahun": "2014",
+            "jumlah": 128
+          },
+          {
+            "tahun": "2015",
+            "jumlah": 85
+          },
+          {
+            "tahun": "2016",
+            "jumlah": 100
+          },
+          {
+            "tahun": "2017",
+            "jumlah": 53
+          },
+          {
+            "tahun": "2018",
+            "jumlah": 465
+          },
+          {
+            "tahun": "2019",
+            "jumlah": 218
+          }
+        ]
+      },
+      "gci_readiness": {
+        "columns": [
+          "readiness",
+          "n"
+        ],
+        "rows": [
+          {
+            "readiness": "partial",
+            "n": 11
+          },
+          {
+            "readiness": "gap",
+            "n": 9
+          },
+          {
+            "readiness": "ready",
+            "n": 8
+          }
+        ]
+      },
+      "kuliner_wilayah": {
+        "columns": [
+          "wilayah",
+          "jumlah"
+        ],
+        "rows": [
+          {
+            "wilayah": "Jakarta Selatan",
+            "jumlah": 1570
+          },
+          {
+            "wilayah": "Jakarta Pusat",
+            "jumlah": 921
+          },
+          {
+            "wilayah": "Jakarta Utara",
+            "jumlah": 705
+          },
+          {
+            "wilayah": "Jakarta Barat",
+            "jumlah": 542
+          },
+          {
+            "wilayah": "Jakarta Timur",
+            "jumlah": 219
+          }
+        ]
+      },
+      "atlas_poi": {
+        "columns": [
+          "kategori",
+          "jumlah"
+        ],
+        "rows": [
+          {
+            "kategori": "Pertunjukan",
+            "jumlah": 170
+          },
+          {
+            "kategori": "Restoran",
+            "jumlah": 84
+          },
+          {
+            "kategori": "Nightlife",
+            "jumlah": 76
+          },
+          {
+            "kategori": "Souvenir",
+            "jumlah": 67
+          }
+        ]
+      }
+    },
+    "storeError": null
+  }
+}

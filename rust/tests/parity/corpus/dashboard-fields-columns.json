@@ -1,0 +1,58 @@
+{
+  "request": {
+    "name": "dashboard-fields-columns",
+    "method": "GET",
+    "path": "/api/dashboard/fields?mart=mart_wisman"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "mart": "mart_wisman",
+    "dimensions": [
+      "kode_negara",
+      "negara",
+      "kawasan",
+      "bulan",
+      "pintu_masuk"
+    ],
+    "measures": [
+      "tahun",
+      "bulan_no",
+      "jumlah"
+    ],
+    "columns": [
+      {
+        "name": "kode_negara",
+        "type": "String"
+      },
+      {
+        "name": "negara",
+        "type": "String"
+      },
+      {
+        "name": "kawasan",
+        "type": "String"
+      },
+      {
+        "name": "tahun",
+        "type": "UInt16"
+      },
+      {
+        "name": "bulan_no",
+        "type": "UInt8"
+      },
+      {
+        "name": "bulan",
+        "type": "String"
+      },
+      {
+        "name": "pintu_masuk",
+        "type": "String"
+      },
+      {
+        "name": "jumlah",
+        "type": "Float64"
+      }
+    ]
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "request": {
+    "name": "embed-data-no-jwt",
+    "method": "POST",
+    "path": "/api/embed/data",
+    "body": {},
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "jwt wajib"
+  }
+}

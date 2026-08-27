@@ -1,0 +1,14 @@
+{
+  "request": {
+    "name": "query-run-missing-sql",
+    "method": "POST",
+    "path": "/api/query/run",
+    "body": {},
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "sql wajib diisi"
+  }
+}

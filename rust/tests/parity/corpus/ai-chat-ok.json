@@ -1,0 +1,244 @@
+{
+  "request": {
+    "name": "ai-chat-ok",
+    "method": "POST",
+    "path": "/api/ai/chat",
+    "body": {
+      "mode": "ask",
+      "messages": [
+        {
+          "role": "user",
+          "content": "<redacted:51>"
+        }
+      ]
+    },
+    "comment": "Calls the real MiniMax LLM (LLM_URL/LLM_KEY). Mode defaults/forced to 'ask' so write tools (trigger_lakehouse_build/create_chart/etc.) are filtered out server-side — this cannot mutate the lakehouse, but the answer text is inherently non-deterministic between captures."
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "answer": "<redacted:3730>",
+    "toolTrace": [
+      {
+        "tool": "list_datasets",
+        "args": {
+          "search": "wisman"
+        },
+        "ok": true,
+        "result": {
+          "total": 9,
+          "datasets": [
+            {
+              "slug": "data-rata-rata-lama-menginap-wisman-di-hotel-berbintang-di-dki-jakarta",
+              "title": "<redacted:70>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-jumlah-kunjungan-wisman-ke-indonesia-berdasarkan-pintu-masuk-di-dki-jakarta",
+              "title": "<redacted:80>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-jumlah-kunjungan-wisman-indonesia-jakarta-dan-share-wisman-jakarta-terhadap-indonesia-di-dki-jakarta",
+              "title": "<redacted:105>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-proyeksi-penerimaan-devisa-dari-wisman-dan-akumulasi-belanja-wisatawan-nusantara",
+              "title": "<redacted:85>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-jumlah-kunjungan-wisman-ke-dki-jakarta",
+              "title": "<redacted:43>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-kunjungan-wisman-ke-jakarta-melalui-pintu-soekarno-hatta-berdasarkan-kebangsaan",
+              "title": "<redacted:84>",
+              "tier": "primer"
+            },
+            {
+              "slug": "wisman-jakarta-per-bulan",
+              "title": "<redacted:36>",
+              "tier": "sekunder"
+            },
+            {
+              "slug": "wisman-jakarta-per-negara",
+              "title": "<redacted:47>",
+              "tier": "sekunder"
+            },
+            {
+              "slug": "wisman-jakarta-per-pintu-masuk",
+              "title": "<redacted:38>",
+              "tier": "sekunder"
+            }
+          ]
+        }
+      },
+      {
+        "tool": "list_datasets",
+        "args": {
+          "search": "mancanegara"
+        },
+        "ok": true,
+        "result": {
+          "total": 30,
+          "datasets": [
+            {
+              "slug": "data-kunjungan-wisatawan-nusantara-dan-wisatawan-mancanegara-ke-tourist-information-center-tic-provinsi-dki-jakarta",
+              "title": "<redacted:117>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-jumlah-wisatawan-mancanegara-berdasarkan-kebangsaan",
+              "title": "<redacted:56>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-kunjungan-wisatawan-nusantara-dan-wisatawan-mancanegara-ke-tourist-information-center-tic-provinsi-dki-jakarta-tahun-2024",
+              "title": "<redacted:128>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-rata-rata-lama-menginap-wisatawan-mancanegara-dan-wisatawan-nusantara-pada-hotel-berbintang-di-provinsi-dki-jakarta",
+              "title": "<redacted:120>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-jumlah-kunjungan-dan-pertumbuhan-wisatawan-mancanegara-ke-indonesia-berdasarkan-wilayah",
+              "title": "<redacted:92>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-jumlah-kunjungan-dan-pertumbuhan-wisatawan-mancanegara-ke-indonesia-berdasarkan-bulan",
+              "title": "<redacted:90>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-target-kunjungan-wisata-mancanegara-ke-jakarta",
+              "title": "<redacted:51>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-jumlah-kunjungan-wisatawan-mancanegara-tahun-2019",
+              "title": "<redacted:54>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-rata-rata-lama-menginap-wisatawan-mancanegara-pada-hotel-berbintang-di-provinsi-dki-jakarta",
+              "title": "<redacted:96>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-wisatawan-mancanegara-ke-dki-jakarta",
+              "title": "<redacted:41>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-kunjungan-wisatawan-mancanegara-ke-provinsi-dki-jakarta-tahun-2018",
+              "title": "<redacted:71>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-jumlah-kunjungan-wisatawan-mancanegara-tahun-2020",
+              "title": "<redacted:54>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-kunjungan-wisatawan-nusantara-dan-wisatawan-mancanegara-ke-tic-dki-jakarta-tahun-2018",
+              "title": "<redacted:90>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-jumlah-kunjungan-wisatawan-mancanegara-ke-destinasi-wisata-di-provinsi-dki-jakarta-tahun-2021",
+              "title": "<redacted:98>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-rata-rata-lama-menginap-wisatawan-mancanegara-pada-hotel-berbintang-di-dki-jakarta",
+              "title": "<redacted:87>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-kunjungan-wisatawan-nusantara-dan-wisatawan-mancanegara-ke-tic-dki-jakarta-tahun-2023",
+              "title": "<redacted:90>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-jumlah-wisatawan-mancanegara-berdasarkan-kebangsaan-tahun-2023",
+              "title": "<redacted:67>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-kunjungan-wisatawan-nusantara-dan-wisatawan-mancanegara-ke-tic-dki-jakarta-titik",
+              "title": "<redacted:80>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-kunjungan-wisata-mancanegara-ke-dki-jakarta-melalui-3-pintu-masuk-soekarno-hatta-tanjung-priok-halim-perdana-kusumah",
+              "title": "<redacted:121>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-rata-rata-lama-menginap-wisatawan-mancanegara-pada-hotel-berbintang-di-provinsi-dki-jakarta-titik",
+              "title": "<redacted:97>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-kunjungan-wisatawan-mancanegara-ke-provinsi-dki-jakarta",
+              "title": "<redacted:61>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-kunjungan-wisatawan-mancanegara-ke-jakarta",
+              "title": "<redacted:47>",
+              "tier": "primer"
+            },
+            {
+              "slug": "rata-rata-lama-tinggal-wisatawan-mancanegara-di-dki-jakarta",
+              "title": "<redacted:59>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-jumlah-kunjungan-dan-pertumbuhan-wisatawan-mancanegara-di-provinsi-dki-jakarta",
+              "title": "<redacted:83>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-kunjungan-wisatawan-mancanegara-ke-provinsi-dki-jakarta-tahun-2020-melalui-2-pintu-masuk",
+              "title": "<redacted:93>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-kunjungan-wisatawan-mancanegara-provinsi-dki-jakarta",
+              "title": "<redacted:57>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-jumlah-kunjungan-dan-ranking-wisatawan-mancanegara-ke-provinsi-dki-jakarta-melalui-pintu-soekarno-hatta-berdasarkan-kebangsaan",
+              "title": "<redacted:131>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-jumlah-kunjungan-wisatawan-mancanegara-ke-destinasi-wisata-di-provinsi-dki-jakarta-tahun-2020",
+              "title": "<redacted:98>",
+              "tier": "primer"
+            },
+            {
+              "slug": "data-presentase-jumlah-wisatawan-mancanegara-dan-wisatawan-nusantara-di-dki-jakarta",
+              "title": "<redacted:83>",
+              "tier": "primer"
+            },
+            {
+              "slug": "kunjungan-wisatawan-mancanegara-ke-dki-jakarta-menurut-pintu-masuk-tahun-2015",
+              "title": "<redacted:77>",
+              "tier": "primer"
+            }
+          ]
+        }
+      }
+    ],
+    "chartCreated": false
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "request": {
+    "name": "ops-observability",
+    "method": "GET",
+    "path": "/api/ops/observability"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "queryP95Ms": 1233,
+    "queryErrorRate": 0,
+    "ingestLagSeconds": 0,
+    "streamingLagSeconds": 0,
+    "cacheHitRate": 0,
+    "policyDecisionP95Ms": 0,
+    "agentSuccessRate": 0,
+    "activeIncidents": 0,
+    "slos": [
+      {
+        "name": "Query p95 < 2s",
+        "target": "2000ms",
+        "current": "1233ms",
+        "ok": true
+      },
+      {
+        "name": "Query error rate < 1%",
+        "target": "1%",
+        "current": "0.00%",
+        "ok": true
+      }
+    ]
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "request": {
+    "name": "ai-build-status-ok",
+    "method": "GET",
+    "path": "/api/ai/build-status?runId=ead7470c-a36f-410f-95fe-ddef911805c9"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "runId": "ead7470c-a36f-410f-95fe-ddef911805c9",
+    "status": "SUCCESS",
+    "steps": [
+      {
+        "key": "bronze_sdi",
+        "status": "SUCCESS"
+      },
+      {
+        "key": "bronze_files",
+        "status": "SUCCESS"
+      },
+      {
+        "key": "lake_db",
+        "status": "SUCCESS"
+      },
+      {
+        "key": "functions_dim",
+        "status": "SUCCESS"
+      },
+      {
+        "key": "silver_auto",
+        "status": "SUCCESS"
+      },
+      {
+        "key": "quality_gate",
+        "status": "SUCCESS"
+      },
+      {
+        "key": "curated_gold",
+        "status": "SUCCESS"
+      },
+      {
+        "key": "gold_iceberg",
+        "status": "SUCCESS"
+      }
+    ]
+  }
+}

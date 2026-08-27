@@ -1,0 +1,46 @@
+{
+  "request": {
+    "name": "agent-query-ok",
+    "method": "POST",
+    "path": "/api/agent/query",
+    "body": {
+      "question": "Berapa total jumlah wisatawan mancanegara per tahun di mart_wisman?"
+    }
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "question": "<redacted:67>",
+    "sql": "<redacted:96>",
+    "columns": [
+      "tahun",
+      "total_wisman"
+    ],
+    "rows": [
+      {
+        "tahun": 2014,
+        "total_wisman": 2223452
+      }
+    ],
+    "rowCount": 1,
+    "answer": "<redacted:220>",
+    "assumptions": [
+      "<redacted:142>",
+      "<redacted:84>"
+    ],
+    "steps": [
+      {
+        "step": "skema",
+        "detail": "<redacted:48>"
+      },
+      {
+        "step": "generate",
+        "detail": "<redacted:96>"
+      },
+      {
+        "step": "jalankan",
+        "detail": "<redacted:11>"
+      }
+    ]
+  }
+}

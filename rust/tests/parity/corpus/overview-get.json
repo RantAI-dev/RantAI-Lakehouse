@@ -1,0 +1,60 @@
+{
+  "request": {
+    "name": "overview-get",
+    "method": "GET",
+    "path": "/api/overview"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "assetsTotal": 199,
+    "staleAssets": 7,
+    "assetsByTier": {
+      "hot": {
+        "count": 6,
+        "bytes": 11701
+      },
+      "warm": {
+        "count": 193,
+        "bytes": 55779460
+      },
+      "cold": {
+        "count": 0,
+        "bytes": 0
+      },
+      "ai": {
+        "count": 0,
+        "bytes": 0
+      }
+    },
+    "pipelines": {
+      "active": 0,
+      "failed": 0,
+      "delayed": 0
+    },
+    "streaming": {
+      "jobs": 0,
+      "maxLagSeconds": 0,
+      "unhealthy": 0
+    },
+    "queries": {
+      "volume24h": 11647,
+      "p95Ms": 1233,
+      "failureRate": 0,
+      "cacheAssistRate": 0,
+      "scannedBytes24h": 190194125
+    },
+    "policyViolations7d": 0,
+    "pendingApprovals": 0,
+    "agents": {
+      "activeRuns": 0,
+      "budgetUsedRate": 0
+    },
+    "services": {
+      "healthy": 4,
+      "degraded": 0,
+      "unhealthy": 0
+    },
+    "incidents": []
+  }
+}

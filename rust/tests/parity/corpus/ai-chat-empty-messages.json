@@ -1,0 +1,16 @@
+{
+  "request": {
+    "name": "ai-chat-empty-messages",
+    "method": "POST",
+    "path": "/api/ai/chat",
+    "body": {
+      "messages": []
+    },
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "messages kosong"
+  }
+}

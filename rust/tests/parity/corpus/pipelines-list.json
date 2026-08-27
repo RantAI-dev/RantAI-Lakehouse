@@ -1,0 +1,39 @@
+{
+  "request": {
+    "name": "pipelines-list",
+    "method": "GET",
+    "path": "/api/pipelines"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "pipelines": [
+      {
+        "id": "ops_backup_maintenance",
+        "name": "ops_backup_maintenance",
+        "kind": "batch",
+        "status": "completed",
+        "owner": "Dinas Pariwisata & Ekraf DKI Jakarta",
+        "source": "Satu Data Jakarta + berkas",
+        "target": "serving.mart_* (Gold)",
+        "schedule": "cron: 0 4 * * * (RUNNING)",
+        "lastRunAt": "2026-08-27T04:00:10.075Z",
+        "slaOk": true,
+        "freshnessLagSeconds": 0
+      },
+      {
+        "id": "refresh_lakehouse",
+        "name": "refresh_lakehouse",
+        "kind": "batch",
+        "status": "completed",
+        "owner": "Dinas Pariwisata & Ekraf DKI Jakarta",
+        "source": "Satu Data Jakarta + berkas",
+        "target": "serving.mart_* (Gold)",
+        "schedule": "cron: 0 2 * * * (RUNNING)",
+        "lastRunAt": "2026-08-27T02:00:14.772Z",
+        "slaOk": true,
+        "freshnessLagSeconds": 0
+      }
+    ]
+  }
+}

@@ -1,0 +1,193 @@
+{
+  "request": {
+    "name": "overview-refresh",
+    "method": "POST",
+    "path": "/api/overview"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "activity": [
+      {
+        "id": "478d298a-7ea7-4ff9-baef-1aa0de89fbe2",
+        "at": "2026-08-27T04:00:10.075Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "ops_backup_maintenance",
+        "category": "pipeline"
+      },
+      {
+        "id": "ead7470c-a36f-410f-95fe-ddef911805c9",
+        "at": "2026-08-27T02:00:14.772Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "refresh_lakehouse",
+        "category": "pipeline"
+      },
+      {
+        "id": "61674edb-b85d-4a7b-9c6c-826f119622d6",
+        "at": "2026-08-26T04:00:10.239Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "ops_backup_maintenance",
+        "category": "pipeline"
+      },
+      {
+        "id": "46e7681f-84f4-4e6b-a7c7-6cef5debd567",
+        "at": "2026-08-26T02:00:14.168Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "refresh_lakehouse",
+        "category": "pipeline"
+      },
+      {
+        "id": "23f6ac57-2846-449b-a40f-14cfd48f1220",
+        "at": "2026-08-25T04:00:11.407Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "ops_backup_maintenance",
+        "category": "pipeline"
+      },
+      {
+        "id": "f1dff02a-707c-4a1f-8457-9068912e4e4d",
+        "at": "2026-08-25T02:00:12.714Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "refresh_lakehouse",
+        "category": "pipeline"
+      },
+      {
+        "id": "fb66ffd4-f89f-43eb-82cf-ec994226b4fb",
+        "at": "2026-08-24T04:00:17.907Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "ops_backup_maintenance",
+        "category": "pipeline"
+      },
+      {
+        "id": "3c739b4a-7f26-40c8-b1a3-1b9458094164",
+        "at": "2026-08-24T02:00:13.194Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "refresh_lakehouse",
+        "category": "pipeline"
+      },
+      {
+        "id": "5eae0f01-32c4-4dda-8667-c3914d9fb2fe",
+        "at": "2026-08-23T04:00:12.310Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "ops_backup_maintenance",
+        "category": "pipeline"
+      },
+      {
+        "id": "c315aa23-4f74-485e-8981-ad1eb5f0518b",
+        "at": "2026-08-23T02:00:11.723Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "refresh_lakehouse",
+        "category": "pipeline"
+      },
+      {
+        "id": "feb29931-27c2-4e56-9c16-7b23e0e30b16",
+        "at": "2026-08-22T04:00:14.143Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "ops_backup_maintenance",
+        "category": "pipeline"
+      },
+      {
+        "id": "69f189e1-b408-48d5-962e-1fbba4a38b6f",
+        "at": "2026-08-22T02:00:09.705Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "refresh_lakehouse",
+        "category": "pipeline"
+      },
+      {
+        "id": "b608e3b6-2822-45da-8084-c4487f3edba6",
+        "at": "2026-08-21T04:00:08.142Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "ops_backup_maintenance",
+        "category": "pipeline"
+      },
+      {
+        "id": "47f12f27-3f55-4834-9bb8-fc1a8b907053",
+        "at": "2026-08-21T02:00:12.733Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "refresh_lakehouse",
+        "category": "pipeline"
+      },
+      {
+        "id": "b99e81c6-dd30-44ce-8cdd-07b0a798ac73",
+        "at": "2026-08-20T04:00:08.767Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "ops_backup_maintenance",
+        "category": "pipeline"
+      },
+      {
+        "id": "d8ba6f6f-70cc-46b6-8279-9171c7d92956",
+        "at": "2026-08-20T02:00:12.452Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "refresh_lakehouse",
+        "category": "pipeline"
+      },
+      {
+        "id": "120872ed-e288-4e99-9204-08e1857d2b61",
+        "at": "2026-08-19T04:00:12.181Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "ops_backup_maintenance",
+        "category": "pipeline"
+      },
+      {
+        "id": "002f5bb1-a3e2-4e8f-b635-cdddd2c52866",
+        "at": "2026-08-19T02:00:13.406Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "refresh_lakehouse",
+        "category": "pipeline"
+      },
+      {
+        "id": "7c4f712a-0da8-4edc-ad1e-4251fcf456c5",
+        "at": "2026-08-18T04:00:13.590Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "ops_backup_maintenance",
+        "category": "pipeline"
+      },
+      {
+        "id": "9a71e41a-9bd4-4fb5-9286-849b01fba49c",
+        "at": "2026-08-18T02:00:12.827Z",
+        "actor": "Dagster",
+        "actorKind": "service",
+        "action": "pipeline completed",
+        "target": "refresh_lakehouse",
+        "category": "pipeline"
+      }
+    ]
+  }
+}

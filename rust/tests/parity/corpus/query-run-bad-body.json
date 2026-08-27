@@ -1,0 +1,14 @@
+{
+  "request": {
+    "name": "query-run-bad-body",
+    "method": "POST",
+    "path": "/api/query/run",
+    "raw": "not json",
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "Body harus JSON {sql}"
+  }
+}

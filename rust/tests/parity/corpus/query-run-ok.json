@@ -1,0 +1,43 @@
+{
+  "request": {
+    "name": "query-run-ok",
+    "method": "POST",
+    "path": "/api/query/run",
+    "body": {
+      "sql": "SELECT 1 AS a"
+    }
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "id": "q-1787828495536",
+    "columns": [
+      "a"
+    ],
+    "rows": [
+      {
+        "a": "1"
+      }
+    ],
+    "metrics": {
+      "durationMs": 1,
+      "scannedBytes": 1,
+      "costUnits": 1,
+      "engine": "hot-store",
+      "workloadClass": "hot-analytics",
+      "cacheHit": false,
+      "pushdowns": [],
+      "policyObligations": []
+    },
+    "plan": [
+      {
+        "id": "s1",
+        "label": "ClickHouse (Hot analytical store)",
+        "location": "clickhouse@lakehouse",
+        "operation": "scan + aggregate",
+        "estimatedBytes": 1,
+        "status": "completed"
+      }
+    ]
+  }
+}
