@@ -183,12 +183,22 @@ pub struct ChartInput {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub subtitle: Option<String>,
     /// Mart name, without the `serving.` prefix (e.g. `mart_wisman`).
+    ///
+    /// `#[serde(default)]`: the AI tool schema (`ai.rs`) only requires
+    /// `title`/`kind` — `text`/`kpi` charts legitimately omit `mart` — so
+    /// decoding must be lenient here and let [`spec_from_input`]'s
+    /// downstream validation (which mirrors `specFromInput` in
+    /// `bi-store.ts`) produce the proper Indonesian error message instead
+    /// of failing at deserialization with "missing field `mart`".
+    #[serde(default)]
     pub mart: String,
     /// How to render the data.
     pub kind: ChartKind,
     /// X-axis / category column.
+    #[serde(default)]
     pub dimension: String,
     /// Value column(s); more than one only for `stacked`.
+    #[serde(default)]
     pub measures: Vec<String>,
     /// Optional 2nd dimension: splits into multiple series.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -1853,5 +1863,43 @@ mod tests {
         assert!(json.get("created_at").is_none());
         assert!(json.get("public_token").is_none());
         assert!(json.get("embed_enabled").is_none());
+    }
+
+    /// D1 regression: the AI tool schema for `create_chart`/`update_chart`
+    /// (`ai.rs`) only advertises `required: ["title", "kind"]` — a
+    /// schema-valid call for a `text` chart genuinely omits `mart`,
+    /// `dimension`, and `measures`. Before `#[serde(default)]` was added to
+    /// those fields, this failed at deserialization with `missing field
+    /// 'mart'` rather than reaching [`spec_from_input`]'s validation, making
+    /// `kind: "text"` charts unreachable via AI chat (a functional
+    /// regression vs. the lenient `specFromInput` in `bi-store.ts`).
+    #[test]
+    fn chart_input_decodes_minimal_text_tool_args() {
+        let input: ChartInput = serde_json::from_value(
+            serde_json::json!({ "title": "Catatan", "kind": "text" }),
+        )
+        .expect("minimal text tool args must decode, not fail on missing mart/dimension/measures");
+        assert_eq!(input.kind, ChartKind::Text);
+        assert_eq!(input.mart, "");
+        assert_eq!(input.dimension, "");
+        assert!(input.measures.is_empty());
+    }
+
+    /// Same D1 regression, for `kind: "kpi"`: the tool schema doesn't
+    /// require `dimension` (KPIs are dimensionless), so a schema-valid call
+    /// omits it — decoding must not fail on that either.
+    #[test]
+    fn chart_input_decodes_minimal_kpi_tool_args() {
+        let input: ChartInput = serde_json::from_value(serde_json::json!({
+            "title": "Total Kunjungan",
+            "kind": "kpi",
+            "mart": "mart_wisman",
+            "measures": ["total"],
+        }))
+        .expect("minimal kpi tool args (no dimension) must decode");
+        assert_eq!(input.kind, ChartKind::Kpi);
+        assert_eq!(input.mart, "mart_wisman");
+        assert_eq!(input.dimension, "");
+        assert_eq!(input.measures, vec!["total".to_owned()]);
     }
 }
