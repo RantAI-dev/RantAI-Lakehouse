@@ -23,7 +23,8 @@ use lakehouse_store::StoreError;
 use lakehouse_store::governance::{
     CreateClassificationRuleInput, CreatePolicyInput, CreateQualityRuleInput,
     CreateResidencyRuleInput, create_classification_rule, create_policy, create_quality_rule,
-    create_residency_rule, list_policies,
+    create_residency_rule, list_classification_rules, list_policies, list_quality_rules,
+    list_residency_rules,
 };
 use sqlx::PgPool;
 
@@ -187,6 +188,78 @@ async fn create_residency_rule_starts_zero_violations(pool: PgPool) -> sqlx::Res
     .unwrap();
     assert_eq!(rule.violations7d, 0);
     assert_eq!(rule.approved_sites, vec!["Jakarta on-prem".to_owned()]);
+    Ok(())
+}
+
+/// **Gap fix.** A rule created via `create_quality_rule` must appear in
+/// `list_quality_rules` — the store-layer half of the fix for "an authored
+/// rule created a 201 that never showed up anywhere" (see the module doc
+/// comment on `lakehouse_store::governance` and
+/// `routes::governance::quality`).
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires a live Postgres; see module doc comment"]
+async fn list_quality_rules_surfaces_an_authored_rule(pool: PgPool) -> sqlx::Result<()> {
+    let before = list_quality_rules(&pool).await.unwrap().len();
+    create_quality_rule(
+        &pool,
+        &CreateQualityRuleInput {
+            name: "gap_fix_test_rule".to_owned(),
+            asset: "serving.demo".to_owned(),
+            dimension: "completeness".to_owned(),
+            threshold: ">= 90%".to_owned(),
+            severity: "high".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    let after = list_quality_rules(&pool).await.unwrap();
+    assert_eq!(after.len(), before + 1);
+    assert!(after.iter().any(|r| r.name == "gap_fix_test_rule"));
+    Ok(())
+}
+
+/// Same fix, classification side.
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires a live Postgres; see module doc comment"]
+async fn list_classification_rules_surfaces_an_authored_rule(pool: PgPool) -> sqlx::Result<()> {
+    let before = list_classification_rules(&pool).await.unwrap().len();
+    create_classification_rule(
+        &pool,
+        &CreateClassificationRuleInput {
+            asset: "gap.fix.asset".to_owned(),
+            column: None,
+            classification: "internal".to_owned(),
+            masking_rule: None,
+        },
+    )
+    .await
+    .unwrap();
+    let after = list_classification_rules(&pool).await.unwrap();
+    assert_eq!(after.len(), before + 1);
+    assert!(after.iter().any(|r| r.asset == "gap.fix.asset"));
+    Ok(())
+}
+
+/// Same fix, residency side.
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires a live Postgres; see module doc comment"]
+async fn list_residency_rules_surfaces_an_authored_rule(pool: PgPool) -> sqlx::Result<()> {
+    let before = list_residency_rules(&pool).await.unwrap().len();
+    create_residency_rule(
+        &pool,
+        &CreateResidencyRuleInput {
+            tenant: "gap-fix-tenant".to_owned(),
+            classification: "internal".to_owned(),
+            approved_sites: vec!["Jakarta on-prem".to_owned()],
+            cross_site_allowed: false,
+            allowed_output: "Aggregates only".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    let after = list_residency_rules(&pool).await.unwrap();
+    assert_eq!(after.len(), before + 1);
+    assert!(after.iter().any(|r| r.tenant == "gap-fix-tenant"));
     Ok(())
 }
 

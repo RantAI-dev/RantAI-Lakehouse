@@ -17,20 +17,27 @@
 //!   `ClickHouse`-backed read for policies at all (`listPolicies` was 100%
 //!   mock), so this is a plain authored-config CRUD, the same shape as
 //!   `identity::Tenant`/`Role`.
-//! * **`QualityRule`, `ClassificationRule`, `ResidencyRule`** — only
-//!   `create_*` lives here. The `GET /api/governance/{quality,
-//!   classification, residency}` reads stay exactly as Phase 1 left them,
-//!   deriving their rows from `_silver_meta.quality` / the dataset catalog /
-//!   a hardcoded policy respectively — those are *observed* facts about
-//!   what actually ran, not authored config, and migrating them into
-//!   Postgres would both contradict this task's explicit instruction and
-//!   throw away real signal. A rule created through this module therefore
-//!   will not appear in the `ClickHouse`-backed list — the contract's
-//!   `QualityRule`/`ClassificationRule`/`ResidencyRule` types are shared
-//!   between two genuinely different sources (authored intent vs. observed
-//!   outcome) with no reconciliation layer in either the TypeScript or this
-//!   port. That is a pre-existing modeling gap in the contract, not
-//!   something introduced here.
+//! * **`QualityRule`, `ClassificationRule`, `ResidencyRule`** — `create_*`
+//!   lives here, same as `Policy`. So do `list_quality_rules`/
+//!   `list_classification_rules`/`list_residency_rules`: **gap fix** (see
+//!   `routes::governance::{quality, classification, residency}`) — a rule
+//!   authored through `create_*` is unioned into the `GET
+//!   /api/governance/{kind}` response on top of the `ClickHouse`-derived
+//!   observations, rather than only ever living in Postgres unseen. The two
+//!   sources stay genuinely distinct (authored intent vs. observed
+//!   outcome), so there is no true join key between them — dedup is by the
+//!   only field both a Postgres row and its `ClickHouse` id-namespace can
+//!   never collide on today (`ClickHouse` ids are `"q-<n>"`/`"c-<slug>"`
+//!   synthesized per-row, `Policy`/rule ids from Postgres are `UUID`s), so
+//!   union-by-id is a no-op in practice and a safety net if that ever
+//!   changes. An authored rule that has never been evaluated is presented
+//!   with the same "not yet run" defaults `create_*` already gives it —
+//!   `lastStatus: "warning"` / `lastRunAt: now()` for quality,
+//!   `reviewStatus: "needs-review"` for classification,
+//!   `violations7d: 0` for residency — the contract has no "unevaluated"
+//!   state, so this is the most honest value already representable: it
+//!   reads as "authored, not yet contradicted by evidence" rather than
+//!   fabricating a pass/fail verdict nobody observed.
 
 use serde::Serialize;
 use sqlx::FromRow;
@@ -123,6 +130,58 @@ impl From<PolicyRow> for Policy {
 /// clause around them.
 const POLICY_COLUMNS: &str =
     "id, name, status, kind, subjects, resources, effect, version, owner, updated_at";
+
+/// List every authored quality rule, newest first. Used by
+/// `GET /api/governance/quality` to union authored rules on top of the
+/// `ClickHouse`-derived observations — see the gap-fix note on
+/// `routes::governance::quality`.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn list_quality_rules(pool: &PgPool) -> Result<Vec<QualityRule>, StoreError> {
+    let rows: Vec<QualityRuleRow> = sqlx::query_as(
+        "SELECT id, name, asset, dimension, threshold, severity, last_status, last_run_at \
+         FROM quality_rule ORDER BY created_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(QualityRule::from).collect())
+}
+
+/// List every authored classification rule, newest first. Used by
+/// `GET /api/governance/classification`; see [`list_quality_rules`].
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn list_classification_rules(
+    pool: &PgPool,
+) -> Result<Vec<ClassificationRule>, StoreError> {
+    let rows: Vec<ClassificationRuleRow> = sqlx::query_as(
+        "SELECT id, asset, column_name, classification, confidence, review_status, masking_rule \
+         FROM classification_rule ORDER BY created_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(ClassificationRule::from).collect())
+}
+
+/// List every authored residency rule, newest first. Used by
+/// `GET /api/governance/residency`; see [`list_quality_rules`].
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn list_residency_rules(pool: &PgPool) -> Result<Vec<ResidencyRule>, StoreError> {
+    let rows: Vec<ResidencyRuleRow> = sqlx::query_as(
+        "SELECT id, tenant, classification, approved_sites, cross_site_allowed, \
+         allowed_output, violations_7d FROM residency_rule ORDER BY created_at DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(ResidencyRule::from).collect())
+}
 
 /// List every authored policy, newest first.
 ///

@@ -64,6 +64,13 @@ enum GovError {
     ClickHouse(#[from] ChError),
     #[error("{0}")]
     Dagster(#[from] DgError),
+    /// A Postgres failure while fetching authored rules to union into the
+    /// list. Note this is distinct from "no pool configured" — that case
+    /// is *not* an error: an environment without `DATABASE_URL` simply
+    /// gets the `ClickHouse`-only view, matching pre-gap-fix behavior
+    /// rather than turning every governance list into a 503.
+    #[error("{0}")]
+    Store(#[from] lakehouse_store::StoreError),
 }
 
 /// `GET /api/governance/{kind}`.
@@ -89,10 +96,10 @@ pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Res
 
 async fn run(state: &AppState, kind: Kind) -> Result<Value, GovError> {
     match kind {
-        Kind::Quality => quality(&state.clickhouse).await,
+        Kind::Quality => quality(&state.clickhouse, state.pg.as_deref()).await,
         Kind::Audit => audit(&state.dagster).await,
-        Kind::Classification => classification(&state.clickhouse).await,
-        Kind::Residency => Ok(residency_body()),
+        Kind::Classification => classification(&state.clickhouse, state.pg.as_deref()).await,
+        Kind::Residency => residency(state.pg.as_deref()).await,
         Kind::Unknown => unreachable!("Kind::Unknown is handled before `run` is called"),
     }
 }
@@ -117,7 +124,22 @@ fn severity_of(verdict: &str) -> &'static str {
     }
 }
 
-async fn quality(ch: &ChClient) -> Result<Value, GovError> {
+/// **Gap fix.** `GET /api/governance/quality` — before this fix, a rule
+/// authored via `POST /api/governance/quality` (`create_quality_rule`)
+/// was written to Postgres but this handler only ever read `ClickHouse`
+/// observations, so an authored rule silently never appeared: a 201 that
+/// led nowhere. Now the authored rows (via
+/// [`lakehouse_store::governance::list_quality_rules`]) are unioned onto
+/// the `ClickHouse`-derived list — appended after it, so the
+/// `ClickHouse`-observed rows (which is what the UI showed before) keep
+/// their existing order and an authored-but-unevaluated rule reads as
+/// "newly added", not as displacing real signal. See the module doc
+/// comment on `lakehouse_store::governance` for the dedup rule and how an
+/// unevaluated rule is represented. When `state.pg` is `None` (no
+/// `DATABASE_URL`), this degrades to the pre-fix `ClickHouse`-only view
+/// rather than erroring — an authored rule simply cannot exist in that
+/// configuration.
+async fn quality(ch: &ChClient, pg: Option<&PgPool>) -> Result<Value, GovError> {
     let rows = ch
         .rows(
             "SELECT tabel, cek, argMax(verdict, dibuat_pada) verdict,
@@ -127,7 +149,7 @@ async fn quality(ch: &ChClient) -> Result<Value, GovError> {
             None,
         )
         .await?;
-    let quality: Vec<Value> = rows
+    let mut quality: Vec<Value> = rows
         .iter()
         .enumerate()
         .map(|(i, r)| {
@@ -159,6 +181,10 @@ async fn quality(ch: &ChClient) -> Result<Value, GovError> {
             })
         })
         .collect();
+    if let Some(pg) = pg {
+        let authored = governance::list_quality_rules(pg).await?;
+        quality.extend(authored.iter().filter_map(|r| serde_json::to_value(r).ok()));
+    }
     Ok(json!({ "quality": quality }))
 }
 
@@ -185,7 +211,9 @@ async fn audit(dagster: &DgClient) -> Result<Value, GovError> {
     Ok(json!({ "audit": audit }))
 }
 
-async fn classification(ch: &ChClient) -> Result<Value, GovError> {
+/// **Gap fix** — same shape as [`quality`], unioning authored classification
+/// rules onto the `ClickHouse`-derived per-asset list.
+async fn classification(ch: &ChClient, pg: Option<&PgPool>) -> Result<Value, GovError> {
     let rows = ch
         .rows(
             "SELECT slug, title, tier FROM lake.`bronze_meta.dataset_catalog`
@@ -193,7 +221,7 @@ async fn classification(ch: &ChClient) -> Result<Value, GovError> {
             None,
         )
         .await?;
-    let classifications: Vec<Value> = rows
+    let mut classifications: Vec<Value> = rows
         .iter()
         .map(|r| {
             json!({
@@ -205,23 +233,31 @@ async fn classification(ch: &ChClient) -> Result<Value, GovError> {
             })
         })
         .collect();
+    if let Some(pg) = pg {
+        let authored = governance::list_classification_rules(pg).await?;
+        classifications.extend(authored.iter().filter_map(|r| serde_json::to_value(r).ok()));
+    }
     Ok(json!({ "classifications": classifications }))
 }
 
-fn residency_body() -> Value {
-    json!({
-        "residency": [
-            {
-                "id": "res-dispar-dki",
-                "tenant": "dispar-dki",
-                "classification": "internal",
-                "approvedSites": ["Depok (187)"],
-                "crossSiteAllowed": false,
-                "allowedOutput": "on-premise DKI",
-                "violations7d": 0,
-            },
-        ],
-    })
+/// **Gap fix** — same shape as [`quality`], unioning authored residency
+/// rules onto the (previously entirely hardcoded, single-row) residency
+/// policy list.
+async fn residency(pg: Option<&PgPool>) -> Result<Value, GovError> {
+    let mut residency: Vec<Value> = vec![json!({
+        "id": "res-dispar-dki",
+        "tenant": "dispar-dki",
+        "classification": "internal",
+        "approvedSites": ["Depok (187)"],
+        "crossSiteAllowed": false,
+        "allowedOutput": "on-premise DKI",
+        "violations7d": 0,
+    })];
+    if let Some(pg) = pg {
+        let authored = governance::list_residency_rules(pg).await?;
+        residency.extend(authored.iter().filter_map(|r| serde_json::to_value(r).ok()));
+    }
+    Ok(json!({ "residency": residency }))
 }
 
 /// Query parameters accepted by `GET /api/governance/lineage`.
