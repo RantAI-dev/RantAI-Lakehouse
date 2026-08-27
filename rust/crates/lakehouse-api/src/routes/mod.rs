@@ -79,6 +79,42 @@ fn route_timeout(path: &str) -> Duration {
 /// No `#[must_use]` here: `axum::Router` is already `#[must_use]`, and
 /// repeating the attribute without a message trips
 /// `clippy::double_must_use`.
+/// The `/api/pipelines/*` sub-router (Task 2.5), split out of [`router`]
+/// purely to keep that function under `clippy::too_many_lines` — it merges
+/// straight back in, with no separate middleware/state of its own.
+fn pipelines_router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/pipelines",
+            get(pipelines::list).post(pipelines::create),
+        )
+        .route(
+            "/api/pipelines/generate",
+            axum::routing::post(pipelines::generate),
+        )
+        .route("/api/pipelines/{id}/runs", get(pipelines::runs))
+        .route(
+            "/api/pipelines/{id}/trigger",
+            axum::routing::post(pipelines::trigger),
+        )
+        .route(
+            "/api/pipelines/{id}/pause",
+            axum::routing::post(pipelines::pause),
+        )
+        .route(
+            "/api/pipelines/{id}/resume",
+            axum::routing::post(pipelines::resume),
+        )
+        .route(
+            "/api/pipelines/runs/{runId}/cancel",
+            axum::routing::post(pipelines::cancel_run),
+        )
+        .route(
+            "/api/pipelines/runs/{runId}/retry",
+            axum::routing::post(pipelines::retry_run),
+        )
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -112,12 +148,7 @@ pub fn router(state: AppState) -> Router {
             "/api/query/collaboration",
             get(query::list_collaboration).post(query::create_collaboration_project),
         )
-        .route("/api/pipelines", get(pipelines::list))
-        .route("/api/pipelines/{id}/runs", get(pipelines::runs))
-        .route(
-            "/api/pipelines/{id}/trigger",
-            axum::routing::post(pipelines::trigger),
-        )
+        .merge(pipelines_router())
         .route("/api/dashboard", get(dashboard::get))
         .route(
             "/api/dashboard/specs",

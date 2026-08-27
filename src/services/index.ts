@@ -4,7 +4,6 @@
  */
 import { mockOverviewService } from "./mock/overview"
 import { mockAssetService } from "./mock/assets"
-import { mockPipelineService } from "./mock/pipelines"
 import { mockStreamingService } from "./mock/streaming"
 import { clickhouseQueryService } from "./clients/queries"
 import { clickhouseAssetService } from "./clients/assets"
@@ -24,8 +23,10 @@ export const overviewService = clickhouseOverviewService
 void mockOverviewService
 export const assetService = clickhouseAssetService
 void mockAssetService
+// Pipelines kini NYATA sepenuhnya — list/get/runs/trigger dari Dagster,
+// create/generate dari Postgres + LLM, cancel/retry/pause/resume adalah
+// mutation Dagster nyata. mock/pipelines.ts sudah dihapus.
 export const pipelineService = dagsterPipelineService
-void mockPipelineService
 export const streamingService = mockStreamingService
 // Query Studio kini NYATA sepenuhnya — eksekusi SQL, saved/history/
 // collaboration, dan generateSql semua lewat backend Rust (ClickHouse +

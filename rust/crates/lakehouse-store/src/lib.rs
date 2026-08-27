@@ -31,6 +31,7 @@
 pub mod error;
 pub mod governance;
 pub mod identity;
+pub mod pipelines;
 pub mod queries;
 
 pub use error::StoreError;

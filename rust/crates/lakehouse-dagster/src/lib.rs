@@ -33,6 +33,11 @@ pub struct DgRun {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DgSchedule {
+    /// The schedule's own name, needed to target it with
+    /// `startSchedule`/`stopRunningSchedule` (Phase 2, Task 2.5) — not read
+    /// by anything ported in Phase 1, which only ever displayed
+    /// `cronSchedule`/`scheduleState`.
+    pub name: String,
     /// The schedule's cron expression (e.g. `"0 3 * * *"`).
     pub cron_schedule: String,
     /// The schedule's run state, e.g. `"RUNNING"`/`"STOPPED"`.
@@ -150,6 +155,7 @@ struct JobName {
 
 #[derive(Debug, Deserialize)]
 struct ScheduleNode {
+    name: String,
     #[serde(rename = "cronSchedule")]
     cron_schedule: String,
     #[serde(rename = "scheduleState")]
@@ -185,6 +191,45 @@ struct LaunchedRun {
 #[derive(Debug, Deserialize)]
 struct LaunchRunError {
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminateRunData {
+    #[serde(rename = "terminateRun")]
+    terminate_run: TerminateRunResultBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminateRunResultBody {
+    #[serde(rename = "__typename")]
+    typename: String,
+    #[serde(default)]
+    run: Option<LaunchedRun>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LaunchReexecutionData {
+    #[serde(rename = "launchRunReexecution")]
+    launch_run_reexecution: LaunchRunResult,
+}
+
+#[derive(Debug, Deserialize)]
+struct ScheduleMutationResultBody {
+    #[serde(rename = "__typename")]
+    typename: String,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// Outcome of a schedule start/stop mutation.
+#[derive(Debug, Clone)]
+pub struct ScheduleOutcome {
+    /// Whether the schedule was successfully started/stopped.
+    pub ok: bool,
+    /// A human-readable failure reason, present when `ok` is `false`.
+    pub error: Option<String>,
 }
 
 /// One `Dagster` execution step's status within a run, as reported by
@@ -339,7 +384,7 @@ impl DgClient {
     pub async fn list_jobs_with_schedules(&self) -> Result<Vec<DgJob>, DgError> {
         let query = "{ repositoriesOrError { __typename ... on RepositoryConnection { nodes { \
                       jobs { name } \
-                      schedules { cronSchedule scheduleState { status } jobName: pipelineName } \
+                      schedules { name cronSchedule scheduleState { status } jobName: pipelineName } \
                       } } } }";
         let data: ReposOrErrorData = self.execute(query, None).await?;
         let Some(node) = data
@@ -359,6 +404,7 @@ impl DgClient {
                     .iter()
                     .filter(|s| s.job_name == j.name)
                     .map(|s| DgSchedule {
+                        name: s.name.clone(),
                         cron_schedule: s.cron_schedule.clone(),
                         schedule_state: DgScheduleState {
                             status: s.schedule_state.status.clone(),
@@ -429,6 +475,155 @@ impl DgClient {
         Ok(LaunchOutcome {
             run_id: None,
             error: Some(error),
+        })
+    }
+
+    /// Terminate a running run, matching `mutation { terminateRun(runId:
+    /// ...) }`. Used by `cancelRun` (Phase 2, Task 2.5). Uses
+    /// `SAFE_TERMINATE` (the default `terminatePolicy`) rather than
+    /// `MARK_AS_CANCELED_IMMEDIATELY`: it lets `Dagster` shut the run down
+    /// cleanly instead of abandoning it mid-step, matching what an
+    /// operator clicking "cancel" in the `Dagster` UI gets by default.
+    ///
+    /// Like [`DgClient::launch_run`], a typed `Dagster`-side failure
+    /// (`RunNotFoundError`, `TerminateRunFailure`, ...) is reported via
+    /// `Ok(LaunchOutcome { error: Some(..), .. })`, not `Err` — `Err` is
+    /// reserved for transport failures and malformed GraphQL responses.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`].
+    pub async fn terminate_run(&self, run_id: &str) -> Result<LaunchOutcome, DgError> {
+        let query = "mutation($runId: String!) { \
+                      terminateRun(runId: $runId, terminatePolicy: SAFE_TERMINATE) { \
+                      __typename \
+                      ... on TerminateRunSuccess { run { runId } } \
+                      ... on TerminateRunFailure { message } \
+                      ... on PythonError { message } \
+                      } }";
+        let data: TerminateRunData = self
+            .execute(query, Some(json!({ "runId": run_id })))
+            .await?;
+        let r = data.terminate_run;
+        if r.typename == "TerminateRunSuccess" {
+            if let Some(run) = r.run {
+                return Ok(LaunchOutcome {
+                    run_id: Some(run.run_id),
+                    error: None,
+                });
+            }
+        }
+        Ok(LaunchOutcome {
+            run_id: None,
+            error: Some(r.message.unwrap_or(r.typename)),
+        })
+    }
+
+    /// Re-execute a finished (failed/cancelled) run from the start, matching
+    /// `mutation { launchRunReexecution(reexecutionParams: { parentRunId,
+    /// strategy: ALL_STEPS }) }`. Used by `retryRun` (Phase 2, Task 2.5).
+    /// `ALL_STEPS`, not `FROM_FAILURE`: the mock's `retryRun` restarts the
+    /// whole run (`processed`/`accepted`/... reset to 0), which
+    /// `ALL_STEPS` is the closer match for.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`].
+    pub async fn launch_reexecution(&self, parent_run_id: &str) -> Result<LaunchOutcome, DgError> {
+        let query = "mutation($parentRunId: String!) { \
+                      launchRunReexecution(reexecutionParams: { parentRunId: $parentRunId, \
+                      strategy: ALL_STEPS }) { \
+                      __typename \
+                      ... on LaunchRunSuccess { run { runId } } \
+                      ... on PythonError { message } \
+                      ... on RunConfigValidationInvalid { errors { message } } \
+                      } }";
+        let data: LaunchReexecutionData = self
+            .execute(query, Some(json!({ "parentRunId": parent_run_id })))
+            .await?;
+        let r = data.launch_run_reexecution;
+        if r.typename == "LaunchRunSuccess" {
+            if let Some(run) = r.run {
+                return Ok(LaunchOutcome {
+                    run_id: Some(run.run_id),
+                    error: None,
+                });
+            }
+        }
+        let error = r
+            .message
+            .or_else(|| {
+                r.errors.map(|errs| {
+                    errs.into_iter()
+                        .map(|e| e.message)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+            })
+            .unwrap_or(r.typename);
+        Ok(LaunchOutcome {
+            run_id: None,
+            error: Some(error),
+        })
+    }
+
+    /// Start (unpause) a schedule, matching `mutation { startSchedule(...) }`.
+    /// Used by `resumePipeline` (Phase 2, Task 2.5).
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`].
+    pub async fn start_schedule(&self, schedule_name: &str) -> Result<ScheduleOutcome, DgError> {
+        self.schedule_mutation("startSchedule", schedule_name).await
+    }
+
+    /// Stop (pause) a running schedule, matching `mutation {
+    /// stopRunningSchedule(...) }`. Used by `pausePipeline` (Phase 2, Task
+    /// 2.5).
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`].
+    pub async fn stop_schedule(&self, schedule_name: &str) -> Result<ScheduleOutcome, DgError> {
+        self.schedule_mutation("stopRunningSchedule", schedule_name)
+            .await
+    }
+
+    async fn schedule_mutation(
+        &self,
+        mutation: &str,
+        schedule_name: &str,
+    ) -> Result<ScheduleOutcome, DgError> {
+        let query = format!(
+            "mutation($sel: ScheduleSelector!) {{ {mutation}(scheduleSelector: $sel) {{ \
+             __typename \
+             ... on ScheduleStateResult {{ scheduleState {{ status }} }} \
+             ... on ScheduleNotFoundError {{ message }} \
+             ... on PythonError {{ message }} \
+             ... on UnauthorizedError {{ message }} \
+             }} }}"
+        );
+        let variables = json!({
+            "sel": {
+                "repositoryName": self.repo,
+                "repositoryLocationName": self.location,
+                "scheduleName": schedule_name,
+            }
+        });
+        let data: std::collections::HashMap<String, ScheduleMutationResultBody> =
+            self.execute(&query, Some(variables)).await?;
+        let r = data.into_values().next().ok_or_else(|| {
+            DgError::Server("Dagster response missing schedule mutation result".to_owned())
+        })?;
+        if r.typename == "ScheduleStateResult" {
+            return Ok(ScheduleOutcome {
+                ok: true,
+                error: None,
+            });
+        }
+        Ok(ScheduleOutcome {
+            ok: false,
+            error: Some(r.message.unwrap_or(r.typename)),
         })
     }
 
@@ -785,7 +980,7 @@ mod tests {
                 "data": { "repositoriesOrError": { "__typename": "RepositoryConnection", "nodes": [
                     { "jobs": [ { "name": "refresh_lakehouse" }, { "name": "other_job" }, { "name": "__ASSET_JOB" } ],
                       "schedules": [
-                        { "cronSchedule": "0 3 * * *", "scheduleState": { "status": "RUNNING" }, "jobName": "refresh_lakehouse" }
+                        { "name": "refresh_lakehouse_schedule", "cronSchedule": "0 3 * * *", "scheduleState": { "status": "RUNNING" }, "jobName": "refresh_lakehouse" }
                       ] }
                 ] } }
             })))
@@ -859,5 +1054,138 @@ mod tests {
         let client = DgClient::new(format!("{}/graphql", server.uri()));
         let info = client.pipeline_run_status("x").await.unwrap();
         assert!(info.is_none());
+    }
+
+    // ── Task 2.5: cancel/retry/pause/resume mutations ──────────────────
+    //
+    // These verify the mutation wiring (query shape, response parsing)
+    // against a local `wiremock` server only. No test in this crate ever
+    // talks to a live Dagster instance's mutation surface — the CRITICAL
+    // SAFETY constraint in the Task 2.5 brief.
+
+    #[tokio::test]
+    async fn terminate_run_success_returns_run_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "terminateRun": { "__typename": "TerminateRunSuccess",
+                    "run": { "runId": "r1" } } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client.terminate_run("r1").await.unwrap();
+        assert_eq!(outcome.run_id.as_deref(), Some("r1"));
+        assert!(outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn terminate_run_not_found_is_error_not_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "terminateRun": { "__typename": "RunNotFoundError" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client.terminate_run("nope").await.unwrap();
+        assert!(outcome.run_id.is_none());
+        assert_eq!(outcome.error.as_deref(), Some("RunNotFoundError"));
+    }
+
+    #[tokio::test]
+    async fn terminate_run_failure_reports_message() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "terminateRun": { "__typename": "TerminateRunFailure",
+                    "message": "already finished" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client.terminate_run("r1").await.unwrap();
+        assert_eq!(outcome.error.as_deref(), Some("already finished"));
+    }
+
+    #[tokio::test]
+    async fn launch_reexecution_success_returns_new_run_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "launchRunReexecution": { "__typename": "LaunchRunSuccess",
+                    "run": { "runId": "r2" } } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client.launch_reexecution("r1").await.unwrap();
+        assert_eq!(outcome.run_id.as_deref(), Some("r2"));
+    }
+
+    #[tokio::test]
+    async fn launch_reexecution_python_error_returns_error_not_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "launchRunReexecution": { "__typename": "PythonError",
+                    "message": "boom" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client.launch_reexecution("r1").await.unwrap();
+        assert!(outcome.run_id.is_none());
+        assert_eq!(outcome.error.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
+    async fn start_schedule_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "startSchedule": { "__typename": "ScheduleStateResult",
+                    "scheduleState": { "status": "RUNNING" } } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .start_schedule("refresh_lakehouse_schedule")
+            .await
+            .unwrap();
+        assert!(outcome.ok);
+        assert!(outcome.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_schedule_not_found_is_error_not_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "stopRunningSchedule": { "__typename": "ScheduleNotFoundError",
+                    "message": "no such schedule" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client.stop_schedule("nope").await.unwrap();
+        assert!(!outcome.ok);
+        assert_eq!(outcome.error.as_deref(), Some("no such schedule"));
     }
 }
