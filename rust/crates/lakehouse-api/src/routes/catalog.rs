@@ -11,6 +11,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
+use lakehouse_core::ident::SqlLiteral;
 use serde_json::{Map, Value, json};
 
 use crate::error::{ApiRejection, ApiResult};
@@ -411,14 +412,14 @@ async fn bronze_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response> {
               the port"
 )]
 async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Value>, ChError> {
-    let escaped_id = id.replace('\'', "");
+    let escaped_id = SqlLiteral::from(id);
     let sync_sql = format!(
         "SELECT slug, title, description, tier, table_name, toString(total) total,
                 author, frekuensi, satuan, klasifikasi, updated_at FROM (
            SELECT slug,title,description,'primer' tier,table_name,total,author,frekuensi,satuan,klasifikasi,'' updated_at FROM lake.`bronze_meta.dataset_sync` s
            UNION ALL
            SELECT slug,title,description,'sekunder' tier,table_name,total,author,frekuensi,satuan,klasifikasi,'' updated_at FROM lake.`bronze_meta_sec.dataset_sync`
-         ) WHERE slug = '{escaped_id}' LIMIT 1"
+         ) WHERE slug = {escaped_id} LIMIT 1"
     );
     let sync_rows = ch.rows(&sync_sql, None).await?;
     let Some(sync) = sync_rows.first() else {
@@ -426,8 +427,8 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
     };
 
     let cols_sql = format!(
-        "SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta.dataset_column` WHERE slug='{escaped_id}'
-       UNION ALL SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta_sec.dataset_column` WHERE slug='{escaped_id}'"
+        "SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta.dataset_column` WHERE slug={escaped_id}
+       UNION ALL SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta_sec.dataset_column` WHERE slug={escaped_id}"
     );
     let cols = ch.rows(&cols_sql, None).await?;
 

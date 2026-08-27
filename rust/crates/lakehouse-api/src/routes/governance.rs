@@ -11,6 +11,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use lakehouse_clickhouse::{ChClient, ChError};
+use lakehouse_core::ident::SqlLiteral;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -246,10 +247,10 @@ pub async fn lineage(State(state): State<AppState>, Query(q): Query<LineageQuery
 }
 
 async fn lineage_body(ch: &ChClient, focus: &str) -> Result<Value, ChError> {
-    let escaped_focus = focus.replace('\'', "");
+    let escaped_focus = SqlLiteral::from(focus);
     let meta_sql = format!(
-        "SELECT table_name, title, tier FROM lake.`bronze_meta.dataset_catalog` WHERE slug='{escaped_focus}'
-         UNION ALL SELECT table_name, title, tier FROM lake.`bronze_meta_sec.dataset_catalog` WHERE slug='{escaped_focus}' LIMIT 1"
+        "SELECT table_name, title, tier FROM lake.`bronze_meta.dataset_catalog` WHERE slug={escaped_focus}
+         UNION ALL SELECT table_name, title, tier FROM lake.`bronze_meta_sec.dataset_catalog` WHERE slug={escaped_focus} LIMIT 1"
     );
     let meta_rows = ch.rows(&meta_sql, None).await?;
     let Some(meta) = meta_rows.first() else {
@@ -260,9 +261,9 @@ async fn lineage_body(ch: &ChClient, focus: &str) -> Result<Value, ChError> {
     let sekunder = str_col(meta, "tier") == "sekunder";
     let bronze_ns = if sekunder { "bronze_sec" } else { "bronze_sdi" };
 
-    let escaped_table = table.replace('\'', "");
+    let escaped_table = SqlLiteral::from(table);
     let cols_sql = format!(
-        "SELECT kolom, tipe FROM _silver_meta.kolom_tipe WHERE tabel='{escaped_table}' LIMIT 200"
+        "SELECT kolom, tipe FROM _silver_meta.kolom_tipe WHERE tabel={escaped_table} LIMIT 200"
     );
     let cols = ch.rows(&cols_sql, None).await?;
 

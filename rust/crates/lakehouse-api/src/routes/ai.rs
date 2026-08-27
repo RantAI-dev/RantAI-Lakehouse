@@ -20,6 +20,7 @@ use lakehouse_bi::specs::ChartSource;
 use lakehouse_bi::store::{self, ChartInput};
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ApiError;
+use lakehouse_core::ident::SqlLiteral;
 use lakehouse_llm::{ChatOptions, LlmMessage, LlmMessageRole, ToolCall, ToolCallFunction};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -288,11 +289,11 @@ async fn tool_list_datasets(ch: &ChClient, args: &Map<String, Value>) -> Value {
 }
 
 async fn tool_describe_dataset(ch: &ChClient, args: &Map<String, Value>) -> Value {
-    let slug = arg_str(args, "slug").replace('\'', "");
+    let slug = SqlLiteral::from(arg_str(args, "slug"));
     let meta_rows = match ch
         .rows(
             &format!(
-                "SELECT title, table_name, tier FROM {CATALOG_UNION} WHERE slug='{slug}' LIMIT 1"
+                "SELECT title, table_name, tier FROM {CATALOG_UNION} WHERE slug={slug} LIMIT 1"
             ),
             None,
         )
@@ -308,8 +309,8 @@ async fn tool_describe_dataset(ch: &ChClient, args: &Map<String, Value>) -> Valu
     let cols = match ch
         .rows(
             &format!(
-                "SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta.dataset_column` WHERE slug='{slug}' \
-                 UNION ALL SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta_sec.dataset_column` WHERE slug='{slug}'"
+                "SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta.dataset_column` WHERE slug={slug} \
+                 UNION ALL SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta_sec.dataset_column` WHERE slug={slug}"
             ),
             None,
         )
@@ -341,10 +342,10 @@ async fn tool_describe_dataset(ch: &ChClient, args: &Map<String, Value>) -> Valu
 }
 
 async fn tool_get_lineage(ch: &ChClient, args: &Map<String, Value>) -> Value {
-    let slug = arg_str(args, "slug").replace('\'', "");
+    let slug = SqlLiteral::from(arg_str(args, "slug"));
     let meta_rows = match ch
         .rows(
-            &format!("SELECT table_name, tier FROM {CATALOG_UNION} WHERE slug='{slug}' LIMIT 1"),
+            &format!("SELECT table_name, tier FROM {CATALOG_UNION} WHERE slug={slug} LIMIT 1"),
             None,
         )
         .await
@@ -361,10 +362,10 @@ async fn tool_get_lineage(ch: &ChClient, args: &Map<String, Value>) -> Value {
         .unwrap_or("")
         .to_owned();
     let sekunder = meta.get("tier").and_then(Value::as_str) == Some("sekunder");
-    let escaped_table = table.replace('\'', "");
+    let escaped_table = SqlLiteral::from(table.as_str());
     let cols = match ch
         .rows(
-            &format!("SELECT kolom, tipe FROM _silver_meta.kolom_tipe WHERE tabel='{escaped_table}' LIMIT 100"),
+            &format!("SELECT kolom, tipe FROM _silver_meta.kolom_tipe WHERE tabel={escaped_table} LIMIT 100"),
             None,
         )
         .await
