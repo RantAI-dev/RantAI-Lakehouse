@@ -87,4 +87,40 @@ mod tests {
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&bytes[..], b"ok");
     }
+
+    /// Build a fresh router for a registration test. Each test gets its own
+    /// `Router` (routers aren't `Clone`-shared across `oneshot` calls here)
+    /// so tests can run concurrently without interfering.
+    fn test_router() -> axum::Router {
+        let cfg = Config::from_map(&std::collections::HashMap::new()).unwrap();
+        routes::router(AppState::new(cfg))
+    }
+
+    async fn get(app: axum::Router, uri: &str) -> axum::http::Response<axum::body::Body> {
+        app.oneshot(
+            Request::builder()
+                .uri(uri)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Registration tests: no live `ClickHouse` is required to prove a
+    /// route is *mounted* — a 503 (data-layer error) or 200 both prove
+    /// that, a 404 does not. These intentionally don't assert response
+    /// bodies; behavior-level fidelity is the parity harness's job (see
+    /// `rust/tests/parity`).
+    #[tokio::test]
+    async fn catalog_list_route_is_registered() {
+        let resp = get(test_router(), "/api/catalog").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn catalog_detail_route_is_registered() {
+        let resp = get(test_router(), "/api/catalog/some-slug").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
 }

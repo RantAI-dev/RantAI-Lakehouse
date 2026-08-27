@@ -1,7 +1,11 @@
 //! Route mounting.
 //!
-//! Real data routes land in later tasks; this chassis only mounts the
-//! health check.
+//! Write-side routes (query/agent/dashboard/alerts/...) and the remaining
+//! four read-only domains land in later commits; this mounts the health
+//! check plus catalog.
+
+mod catalog;
+mod support;
 
 use axum::Router;
 use axum::routing::get;
@@ -17,6 +21,8 @@ use crate::state::AppState;
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/api/catalog", get(catalog::list))
+        .route("/api/catalog/{id}", get(catalog::detail))
         .with_state(state)
 }
 
