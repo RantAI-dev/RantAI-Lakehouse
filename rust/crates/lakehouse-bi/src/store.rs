@@ -191,7 +191,15 @@ pub struct ChartInput {
 }
 
 /// A dashboard.
+///
+/// `#[serde(rename_all = "camelCase")]`: the TS `Board` type
+/// (`bi-store.ts:44`) uses `createdAt`/`publicToken`/`embedEnabled` — the
+/// same `camelCase`/`snake_case` mismatch class as `hasYear` (see
+/// [`StoredEnvelope`]). This struct isn't wired to an HTTP response yet
+/// (dashboard routes land in a later task), but it WILL be the JSON body
+/// once they do, so the mismatch is fixed here before it can ship.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Board {
     /// Stable identifier.
     pub id: String,
@@ -748,14 +756,52 @@ pub async fn duplicate_board(ch: &ChClient, id: &str) -> Result<Board, BiError> 
 /// Envelope stored in `spec_json`. Supports the new `{spec, def, hasYear}`
 /// format as well as the old bare-`ChartSpec` format, mirroring the TS
 /// `parsed.spec ?? (parsed as ChartSpec)` fallback.
-#[derive(Debug, Deserialize)]
+///
+/// A `#[derive(Deserialize)]` with `#[serde(flatten)]` on `spec` cannot
+/// express this: `flatten` always tries to read the fields directly off the
+/// top-level object, so it only ever matches the LEGACY bare-`ChartSpec`
+/// shape and silently fails (or worse, partially matches) on the new
+/// `{spec, def, hasYear}` envelope — which is exactly how every live row in
+/// `console.bi_chart` was previously dropped. This manual impl inspects the
+/// JSON shape first, exactly mirroring the TS `parsed.spec ?? (parsed as
+/// ChartSpec)` fallback: prefer the nested `spec` key; otherwise treat the
+/// whole object as a bare `ChartSpec`.
+#[derive(Debug)]
 struct StoredEnvelope {
-    #[serde(flatten)]
     spec: ChartSpec,
-    #[serde(default)]
     def: Option<ChartInput>,
-    #[serde(default)]
     has_year: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for StoredEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        if let Some(spec_value) = value.get("spec").cloned() {
+            let spec: ChartSpec =
+                serde_json::from_value(spec_value).map_err(serde::de::Error::custom)?;
+            let def: Option<ChartInput> = value
+                .get("def")
+                .cloned()
+                .and_then(|d| serde_json::from_value(d).ok());
+            let has_year = value.get("hasYear").and_then(Value::as_bool);
+            Ok(Self {
+                spec,
+                def,
+                has_year,
+            })
+        } else {
+            let spec: ChartSpec =
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+            Ok(Self {
+                spec,
+                def: None,
+                has_year: None,
+            })
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -784,8 +830,16 @@ pub async fn list_stored_charts(ch: &ChClient) -> Result<Vec<StoredChartSpec>, C
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
         let spec_json = row_str(row, "spec_json");
-        let Ok(parsed) = serde_json::from_str::<StoredEnvelope>(spec_json) else {
-            continue;
+        let parsed = match serde_json::from_str::<StoredEnvelope>(spec_json) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                tracing::warn!(
+                    id = row_str(row, "id"),
+                    error = %err,
+                    "skipping console.bi_chart row with unparseable spec_json"
+                );
+                continue;
+            }
         };
         let created_by = row_str(row, "created_by").to_owned();
         let source = if created_by == "ai" {
@@ -1630,5 +1684,73 @@ mod tests {
         let parsed: StoredEnvelope = serde_json::from_value(legacy).unwrap();
         assert_eq!(parsed.spec.id, "u_1");
         assert!(parsed.def.is_none());
+    }
+
+    /// Regression test for B1 (`lakehouse-bi` was dropping 100% of live
+    /// stored charts): the NEW `{spec, def, hasYear}` envelope, captured
+    /// verbatim from a real row in `console.bi_chart` on the live cluster
+    /// (`id = "u_f1b0fd25"`) via a read-only `SELECT`. Before the fix, this
+    /// literal failed to deserialize under the old `#[serde(flatten)]`
+    /// struct (it expects `id`/`title`/... at the top level, not nested
+    /// under `spec`), so every live row like this one was silently
+    /// skipped — a total data loss, not a partial one, since all 15 live
+    /// rows use this shape.
+    #[test]
+    fn stored_envelope_supports_new_spec_def_has_year_format() {
+        let live_row = r#"{"spec":{"id":"u_f1b0fd25","title":"Combo · dtw","kind":"combo","mart":"mart_kunjungan_dtw","sql":"SELECT destinasi, round(sum(wisnus)) AS wisnus, round(sum(wisman)) AS wisman FROM serving.mart_kunjungan_dtw GROUP BY destinasi ORDER BY wisnus DESC LIMIT 8","x":"destinasi","y":["wisnus","wisman"],"format":"int","span":1},"def":{"title":"Combo · dtw","mart":"mart_kunjungan_dtw","kind":"combo","dimension":"destinasi","measures":["wisnus","wisman"],"aggregate":"sum","limit":8,"order":"desc","span":1,"board":"b_5cbfb279"},"hasYear":false}"#;
+        let parsed: StoredEnvelope = serde_json::from_str(live_row).unwrap();
+        assert_eq!(parsed.spec.id, "u_f1b0fd25");
+        assert_eq!(parsed.spec.kind, ChartKind::Combo);
+        assert_eq!(parsed.spec.mart, "mart_kunjungan_dtw");
+        assert_eq!(
+            parsed.spec.y,
+            ChartY::Multi(vec!["wisnus".to_owned(), "wisman".to_owned()])
+        );
+        let def = parsed.def.expect("def must be present in the new envelope");
+        assert_eq!(def.dimension, "destinasi");
+        assert_eq!(def.measures, vec!["wisnus".to_owned(), "wisman".to_owned()]);
+        assert_eq!(parsed.has_year, Some(false));
+    }
+
+    /// `hasYear: true` must round-trip as `Some(true)` — this is the
+    /// specific field the bug report called out as silently defaulting to
+    /// `false` even after fixing the envelope shape (missing `#[serde(rename
+    /// = "hasYear")]`, now handled by the manual `Deserialize` impl reading
+    /// the `"hasYear"` key directly).
+    #[test]
+    fn stored_envelope_reads_has_year_true() {
+        let with_year = serde_json::json!({
+            "spec": {"id": "u_2", "title": "T", "kind": "bar", "mart": "mart_x",
+                      "sql": "SELECT 1", "x": "a", "y": "b"},
+            "def": {"title": "T", "mart": "mart_x", "kind": "bar", "dimension": "a", "measures": ["b"]},
+            "hasYear": true
+        });
+        let parsed: StoredEnvelope = serde_json::from_value(with_year).unwrap();
+        assert_eq!(parsed.has_year, Some(true));
+    }
+
+    /// `Board`'s JSON wire shape must match the TS `Board` type
+    /// (`createdAt`/`publicToken`/`embedEnabled`, not `snake_case`) — this
+    /// struct isn't wired to a route yet, but when it is, the mismatch
+    /// found in the B1 audit would otherwise silently drop these fields
+    /// from every dashboard API response.
+    #[test]
+    fn board_serializes_camel_case() {
+        let board = Board {
+            id: "b_1".to_owned(),
+            name: "Dash".to_owned(),
+            layout: None,
+            filters: None,
+            created_at: Some("2026-01-01 00:00:00".to_owned()),
+            public_token: Some("p_abc".to_owned()),
+            embed_enabled: Some(true),
+        };
+        let json = serde_json::to_value(&board).unwrap();
+        assert_eq!(json.get("createdAt").unwrap(), "2026-01-01 00:00:00");
+        assert_eq!(json.get("publicToken").unwrap(), "p_abc");
+        assert_eq!(json.get("embedEnabled").unwrap(), true);
+        assert!(json.get("created_at").is_none());
+        assert!(json.get("public_token").is_none());
+        assert!(json.get("embed_enabled").is_none());
     }
 }
