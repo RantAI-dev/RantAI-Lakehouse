@@ -16,13 +16,20 @@
 //! | [`StoreError::Conflict`]   | `Conflict`            | 409    | caller-supplied data collides with a unique constraint         |
 //! | [`StoreError::ForeignKeyViolation`] | `BadRequest`  | 400    | caller referenced a row that doesn't exist                     |
 //! | [`StoreError::NotFound`]   | `NotFound`            | 404    | caller asked for a row that doesn't exist                      |
-//! | [`StoreError::Unavailable`]| `Internal`            | 500    | no pool configured (see [`crate::connect_lazy`])                |
+//! | [`StoreError::Unavailable`]| `Unavailable`         | 503    | no pool configured at all (see [`crate::connect_lazy`])         |
 //! | [`StoreError::Database`]   | `Internal`            | 500    | anything else — connection refused, timeout, syntax error, ...  |
 //! | [`StoreError::Migration`]  | `Internal`            | 500    | `sqlx::migrate!` failed to apply                                |
 //!
 //! The first three are genuinely the caller's fault (4xx); the rest are
 //! this service's problem (5xx) — the split a blanket 422/500 mapping would
-//! erase. [`ApiError::Internal`]'s message is deliberately generic (`"{0}"`
+//! erase. Within the 5xx group, [`StoreError::Unavailable`] is further
+//! separated out as a 503: it means `AppState::pg` is `None` — the pool was
+//! never constructed, because `DATABASE_URL` did not parse — which is a
+//! deployment/configuration problem that a caller can sensibly retry once
+//! the deployment is fixed, not an unexpected bug in a code path that was
+//! supposed to work. A genuine connection failure (Postgres down while the
+//! pool exists) stays [`StoreError::Database`] -> 500, matching the
+//! `ClickHouse` side's treatment of an outage. [`ApiError::Internal`]'s message is deliberately generic (`"{0}"`
 //! renders [`StoreError`]'s own `Display`, which never includes the
 //! `#[source]` error text) so a raw `sqlx::Error` — which can embed the
 //! connection string, host, or driver-internal detail — never reaches an
@@ -99,9 +106,8 @@ impl From<StoreError> for ApiError {
             StoreError::Conflict => Self::Conflict(message),
             StoreError::ForeignKeyViolation => Self::BadRequest(message),
             StoreError::NotFound => Self::NotFound(message),
-            StoreError::Unavailable | StoreError::Database(_) | StoreError::Migration(_) => {
-                Self::Internal(message)
-            }
+            StoreError::Unavailable => Self::Unavailable(message),
+            StoreError::Database(_) | StoreError::Migration(_) => Self::Internal(message),
         }
     }
 }
@@ -130,10 +136,14 @@ mod tests {
         assert_eq!(api.status(), 404);
     }
 
+    /// `Unavailable` is the one 5xx that is NOT a 500: "there is no pool
+    /// at all" is a configuration problem worth retrying, and the routes
+    /// that hit it must say 503 rather than claim an internal bug.
     #[test]
-    fn unavailable_maps_to_500() {
+    fn unavailable_maps_to_503() {
         let api: ApiError = StoreError::Unavailable.into();
-        assert_eq!(api.status(), 500);
+        assert_eq!(api.status(), 503);
+        assert_eq!(api.to_string(), "database is not available");
     }
 
     #[test]

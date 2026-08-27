@@ -82,21 +82,25 @@ async fn foreign_key_rejects_orphan_row(pool: PgPool) -> sqlx::Result<()> {
 /// attempt, classified as [`StoreError::Conflict`] and rendered as HTTP 409
 /// — this is the exact case the module doc comment on
 /// `lakehouse_store::error` argues should NOT blanket-map to 500/422.
+///
+/// Uses a synthetic `constraint-probe` slug rather than a seeded one: as of
+/// the `0002_seed_identity` migration the test database is not empty, and
+/// the point here is to observe the SECOND insert failing, not the first.
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires a live Postgres; see module doc comment"]
 async fn unique_constraint_rejects_duplicate(pool: PgPool) -> sqlx::Result<()> {
     let insert = "INSERT INTO tenant (name, slug, plan, residency) VALUES ($1, $2, $3, $4)";
     sqlx::query(insert)
-        .bind("Meridian Group")
-        .bind("meridian-group")
+        .bind("Constraint Probe")
+        .bind("constraint-probe")
         .bind("Enterprise")
         .bind("Jakarta (ID)")
         .execute(&pool)
         .await?;
 
     let dup = sqlx::query(insert)
-        .bind("Meridian Group (duplicate slug)")
-        .bind("meridian-group")
+        .bind("Constraint Probe (duplicate slug)")
+        .bind("constraint-probe")
         .bind("Enterprise")
         .bind("Jakarta (ID)")
         .execute(&pool)
@@ -115,38 +119,45 @@ async fn unique_constraint_rejects_duplicate(pool: PgPool) -> sqlx::Result<()> {
 
 /// `app_user.email` is unique, `role.name` is unique, and
 /// `service_identity.name` is unique — each domain's own natural key.
+///
+/// Every value inserted here is a deliberately synthetic `constraint-probe`
+/// rather than a realistic name: since Task 2.2 added the
+/// `0002_seed_identity` migration, `#[sqlx::test]` provisions a database
+/// that already contains the demo fixtures, so probing a constraint with a
+/// name the seed also uses would collide on the FIRST insert and fail the
+/// test for the wrong reason.
 /// Covers the other two `UNIQUE` constraints the migration adds beyond
 /// `tenant.slug`, so a future edit narrowing any one of them to a
 /// non-unique column is caught here.
 #[sqlx::test(migrations = "../../migrations")]
 #[ignore = "requires a live Postgres; see module doc comment"]
 async fn unique_constraints_cover_every_natural_key(pool: PgPool) -> sqlx::Result<()> {
-    sqlx::query("INSERT INTO app_user (name, email) VALUES ('Rina', 'rina@example.com')")
+    sqlx::query("INSERT INTO app_user (name, email) VALUES ('Probe', 'probe@example.com')")
         .execute(&pool)
         .await?;
     let dup_email =
-        sqlx::query("INSERT INTO app_user (name, email) VALUES ('Rina 2', 'rina@example.com')")
+        sqlx::query("INSERT INTO app_user (name, email) VALUES ('Probe 2', 'probe@example.com')")
             .execute(&pool)
             .await;
     assert!(dup_email.is_err());
 
-    sqlx::query("INSERT INTO role (name) VALUES ('Analyst')")
+    sqlx::query("INSERT INTO role (name) VALUES ('Constraint Probe')")
         .execute(&pool)
         .await?;
-    let dup_role = sqlx::query("INSERT INTO role (name) VALUES ('Analyst')")
+    let dup_role = sqlx::query("INSERT INTO role (name) VALUES ('Constraint Probe')")
         .execute(&pool)
         .await;
     assert!(dup_role.is_err());
 
     sqlx::query(
         "INSERT INTO service_identity (name, environment, expires_at) \
-         VALUES ('bi-dashboard-reader', 'production', now())",
+         VALUES ('constraint-probe', 'production', now())",
     )
     .execute(&pool)
     .await?;
     let dup_service = sqlx::query(
         "INSERT INTO service_identity (name, environment, expires_at) \
-         VALUES ('bi-dashboard-reader', 'staging', now())",
+         VALUES ('constraint-probe', 'staging', now())",
     )
     .execute(&pool)
     .await;

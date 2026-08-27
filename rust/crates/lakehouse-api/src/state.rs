@@ -39,13 +39,9 @@ pub struct AppState {
     /// must not stop `lakehouse-api` from booting and serving the Phase 1
     /// routes, none of which touch Postgres. When this is `None`, a Phase 2
     /// handler must reply with `lakehouse_store::StoreError::Unavailable`
-    /// (-> `ApiError::Internal`, 500) rather than panic on `.unwrap()`.
-    #[allow(
-        dead_code,
-        reason = "this task (2.1) only builds the OLTP foundation; no route \
-                  handler reads this field yet — the first Phase 2 domain \
-                  migrated onto Postgres will be its first reader"
-    )]
+    /// (-> `ApiError::Unavailable`, 503) rather than panic on `.unwrap()` —
+    /// see `routes::identity::pool`, the first (and so far only) reader of
+    /// this field.
     pub pg: Option<Arc<PgPool>>,
 }
 

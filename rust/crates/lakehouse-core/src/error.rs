@@ -58,6 +58,21 @@ pub enum ApiError {
     /// deliberate, REST-idiomatic addition rather than a ported behavior.
     #[error("{0}")]
     Conflict(String),
+    /// A dependency this request needs is not configured or not reachable,
+    /// and the request may well succeed if retried once it is. Maps to HTTP
+    /// 503.
+    ///
+    /// Phase-2-only, like [`Self::Conflict`], and for the same reason: no
+    /// Phase 1 route has a dependency it can *know* is absent before trying
+    /// (a `ClickHouse` outage surfaces as a failed query, not as a missing
+    /// client). The Postgres pool is different — `AppState::pg` is
+    /// `Option`, so a handler can tell "there is no pool at all" apart from
+    /// "the pool failed", and the two deserve different answers: the former
+    /// is a deployment/configuration problem the caller should retry
+    /// against a fixed deployment (503), not an unexpected server bug
+    /// (500).
+    #[error("{0}")]
+    Unavailable(String),
     /// An unexpected server-side failure. Maps to HTTP 500.
     #[error("{0}")]
     Internal(String),
@@ -89,6 +104,7 @@ impl ApiError {
             Self::Unprocessable(_) => 422,
             Self::Conflict(_) => 409,
             Self::Internal(_) => 500,
+            Self::Unavailable(_) => 503,
         }
     }
 }
@@ -142,5 +158,13 @@ mod tests {
     #[test]
     fn conflict_maps_to_409() {
         assert_eq!(ApiError::Conflict("duplicate".to_owned()).status(), 409);
+    }
+
+    #[test]
+    fn unavailable_maps_to_503() {
+        assert_eq!(
+            ApiError::Unavailable("database is not available".to_owned()).status(),
+            503
+        );
     }
 }

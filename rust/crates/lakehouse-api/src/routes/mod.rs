@@ -1,9 +1,9 @@
 //! Route mounting.
 //!
 //! Mounts the health check, the five read-only domains (catalog, overview,
-//! ops, governance, storage), and `alerts` (the first write-side domain).
-//! Remaining write-side routes (query/agent/dashboard/...) land in later
-//! tasks.
+//! ops, governance, storage), the write-side domains (alerts, query, agent,
+//! dashboard, ...), and — new in Phase 2 — the Postgres-backed `identity`
+//! domain under `/api/identity/*`.
 
 mod agent;
 mod ai;
@@ -12,6 +12,7 @@ mod catalog;
 mod dashboard;
 mod embed;
 mod governance;
+mod identity;
 mod ops;
 mod overview;
 mod pipelines;
@@ -143,6 +144,35 @@ pub fn router(state: AppState) -> Router {
                 .delete(ai::sessions_delete),
         )
         .route("/api/ai/build-status", get(ai::build_status))
+        // Phase 2 identity domain. Grouped under a single `/api/identity`
+        // namespace rather than four top-level nouns (`/api/users`,
+        // `/api/tenants`, ...): every Phase 1 route is already
+        // `/api/<domain>[/<sub>]` (`/api/governance/{kind}`,
+        // `/api/dashboard/specs`, `/api/alerts/run`), the console's
+        // `identityService` is a single contract, and top-level `/api/users`
+        // would be the first route whose path says nothing about which
+        // domain owns it. Collection paths are plural nouns with GET =
+        // list and POST = create, per REST.
+        .route(
+            "/api/identity/users",
+            get(identity::list_users).post(identity::create_user),
+        )
+        .route(
+            "/api/identity/roles",
+            get(identity::list_roles).post(identity::create_role),
+        )
+        .route(
+            "/api/identity/tenants",
+            get(identity::list_tenants).post(identity::create_tenant),
+        )
+        .route(
+            "/api/identity/service-identities",
+            get(identity::list_service_identities).post(identity::create_service_identity),
+        )
+        .route(
+            "/api/identity/workspace-settings",
+            get(identity::workspace_settings),
+        )
         .layer(from_fn(timeout_middleware))
         .with_state(state)
 }
