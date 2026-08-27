@@ -5,6 +5,7 @@
 //! Remaining write-side routes (query/agent/dashboard/...) land in later
 //! tasks.
 
+mod agent;
 mod alerts;
 mod catalog;
 mod dashboard;
@@ -101,6 +102,12 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/public/dashboard/{token}",
             get(embed::public_dashboard),
+        )
+        .route("/api/agent/ask", axum::routing::post(agent::ask))
+        .route("/api/agent/query", axum::routing::post(agent::query))
+        .route(
+            "/api/agent/text-to-sql",
+            axum::routing::post(agent::text_to_sql),
         )
         .layer(from_fn(timeout_middleware))
         .with_state(state)

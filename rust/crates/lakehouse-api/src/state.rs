@@ -6,6 +6,7 @@ use std::sync::Arc;
 use lakehouse_clickhouse::ChClient;
 use lakehouse_dagster::DgClient;
 use lakehouse_embed::EmbedSecretResolver;
+use lakehouse_llm::LlmClient;
 
 use crate::config::Config;
 
@@ -27,6 +28,8 @@ pub struct AppState {
     pub dagster: Arc<DgClient>,
     /// Resolves and caches the signed-embedding (`JWT`) secret.
     pub embed_secret: Arc<EmbedSecretResolver>,
+    /// `OpenAI`-compatible chat-completions client.
+    pub llm: Arc<LlmClient>,
 }
 
 impl AppState {
@@ -46,11 +49,17 @@ impl AppState {
         let clickhouse = Arc::new(clickhouse);
         let embed_secret =
             EmbedSecretResolver::new(config.embed_secret.clone(), clickhouse.clone());
+        let llm = LlmClient::new(
+            config.llm_url.clone(),
+            config.llm_model.clone(),
+            config.llm_key.clone(),
+        );
         Self {
             config: Arc::new(config),
             clickhouse,
             dagster: Arc::new(dagster),
             embed_secret: Arc::new(embed_secret),
+            llm: Arc::new(llm),
         }
     }
 }

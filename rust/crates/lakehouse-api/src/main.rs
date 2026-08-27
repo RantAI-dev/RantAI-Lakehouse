@@ -278,6 +278,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_ask_route_is_registered() {
+        let resp = post(test_router(), "/api/agent/ask").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn agent_query_route_is_registered() {
+        let resp = post(test_router(), "/api/agent/query").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn agent_text_to_sql_route_is_registered() {
+        let resp = post(test_router(), "/api/agent/text-to-sql").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn governance_lineage_route_does_not_fall_through_to_kind_dispatch() {
         let resp = get(test_router(), "/api/governance/lineage").await;
         assert_ne!(resp.status(), StatusCode::BAD_REQUEST);
