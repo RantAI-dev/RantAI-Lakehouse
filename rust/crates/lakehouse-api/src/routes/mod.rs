@@ -10,6 +10,7 @@ mod catalog;
 mod governance;
 mod ops;
 mod overview;
+mod pipelines;
 mod query;
 mod storage;
 mod support;
@@ -68,6 +69,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/alerts/run", get(alerts::run).post(alerts::run))
         .route("/api/query/run", axum::routing::post(query::run))
         .route("/api/query/estimate", axum::routing::post(query::estimate))
+        .route("/api/pipelines", get(pipelines::list))
+        .route("/api/pipelines/{id}/runs", get(pipelines::runs))
+        .route(
+            "/api/pipelines/{id}/trigger",
+            axum::routing::post(pipelines::trigger),
+        )
         .layer(from_fn(timeout_middleware))
         .with_state(state)
 }
