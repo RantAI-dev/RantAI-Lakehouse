@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "UNLICENSED"
+
+[workspace.dependencies]
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "timeout"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls-tls", "builder", "tokio1-rustls-tls"] }
+wiremock = "0.6"
+insta = { version = "1", features = ["json", "redactions"] }
+
+[workspace.lints.rust]
+future-incompatible = "warn"
+nonstandard_style = { level = "deny", priority = -1 }
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = 10 }
+redundant_clone = { level = "deny", priority = 9 }
+needless_collect = { level = "deny", priority = 9 }
+large_enum_variant = { level = "deny", priority = 9 }
+unwrap_used = { level = "deny", priority = 8 }
+expect_used = { level = "deny", priority = 8 }
+pedantic = { level = "warn", priority = 3 }
