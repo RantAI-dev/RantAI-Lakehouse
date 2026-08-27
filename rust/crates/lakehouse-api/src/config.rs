@@ -33,7 +33,15 @@ pub enum ConfigError {
 }
 
 /// Resolved application configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` is implemented by hand (not derived) so secret fields
+/// (`ch_password`, `llm_key`, `embed_secret`, `alerts_run_token`,
+/// `smtp_pass`) never appear in a `{:?}`-formatted log line. `AppState`
+/// carries an `Arc<Config>` into every handler, so a stray
+/// `tracing::debug!(?state)` (or any other ad-hoc debug dump) must not be
+/// able to leak these into JSON logs — this repo already runs
+/// `check-no-secrets.sh` in CI because a secret leaked once.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     /// `ClickHouse` HTTP interface URL. Default
     /// `"http://localhost:18123"` (`clickhouse.ts:11`, `??`).
@@ -86,12 +94,17 @@ pub struct Config {
     /// `PORT` (below) is the one field that legitimately still hard-fails,
     /// since it is Rust-only and load-bearing.
     pub smtp_port: u16,
-    /// Whether to use implicit TLS. `true` only when `SMTP_SECURE` is
-    /// exactly the string `"true"` (`notify.ts:40`, strict `===`
-    /// comparison — an unset or differently-cased value is `false`). The
-    /// TypeScript additionally treats `port === 465` as secure at the call
-    /// site; that OR is send-time business logic, not a config default, and
-    /// is left to the caller.
+    /// Whether to use implicit TLS: the *effective* value nodemailer would
+    /// use, matching `notify.ts:40` in full —
+    /// `SMTP_SECURE === "true" || port === 465`, not just the raw env var.
+    ///
+    /// H2: the TS call site ORs in a `port === 465` rule that a bare
+    /// `SMTP_SECURE` passthrough would silently drop, leaving it as an
+    /// obligation on whatever caller eventually sends email — a caller that
+    /// doesn't exist yet, and so has no chance to enforce it. Folding the
+    /// rule in here, at config-resolution time (where `smtp_port` is
+    /// already known), means this field is always the complete, correct
+    /// answer and there is nothing left for a future caller to get wrong.
     pub smtp_secure: bool,
     /// SMTP auth username. `None` when unset, in which case the
     /// TypeScript sends no auth at all (`notify.ts:41`, truthy check).
@@ -106,6 +119,43 @@ pub struct Config {
     /// TypeScript (which runs under Next.js), specific to this Rust
     /// service.
     pub port: u16,
+}
+
+/// Placeholder shown for secret fields instead of their real value.
+const REDACTED: &str = "<redacted>";
+
+impl std::fmt::Debug for Config {
+    /// Renders every field verbatim except the secret ones, which are
+    /// rendered as `"<redacted>"` regardless of whether they're set — see
+    /// the type-level doc comment for why this can't be `#[derive(Debug)]`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("ch_url", &self.ch_url)
+            .field("ch_user", &self.ch_user)
+            .field("ch_password", &REDACTED)
+            .field("dagster_url", &self.dagster_url)
+            .field("dagster_repo", &self.dagster_repo)
+            .field("dagster_location", &self.dagster_location)
+            .field("llm_url", &self.llm_url)
+            .field("llm_model", &self.llm_model)
+            .field("llm_key", &REDACTED)
+            .field(
+                "embed_secret",
+                &self.embed_secret.as_ref().map(|_| REDACTED),
+            )
+            .field(
+                "alerts_run_token",
+                &self.alerts_run_token.as_ref().map(|_| REDACTED),
+            )
+            .field("smtp_host", &self.smtp_host)
+            .field("smtp_port", &self.smtp_port)
+            .field("smtp_secure", &self.smtp_secure)
+            .field("smtp_user", &self.smtp_user)
+            .field("smtp_pass", &REDACTED)
+            .field("smtp_from", &self.smtp_from)
+            .field("port", &self.port)
+            .finish()
+    }
 }
 
 /// `??`-style lookup: fall back to `default` only when `key` is absent from
@@ -176,7 +226,8 @@ impl Config {
             alerts_run_token: truthy(env, "ALERTS_RUN_TOKEN"),
             smtp_host: truthy(env, "SMTP_HOST"),
             smtp_port,
-            smtp_secure: env.get("SMTP_SECURE").is_some_and(|v| v == "true"),
+            // notify.ts:40 in full: `SMTP_SECURE === "true" || port === 465`.
+            smtp_secure: env.get("SMTP_SECURE").is_some_and(|v| v == "true") || smtp_port == 465,
             smtp_user: truthy(env, "SMTP_USER"),
             smtp_pass: or_default(env, "SMTP_PASS", ""),
             smtp_from,
@@ -206,6 +257,33 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect()
+    }
+
+    /// H1: `{:?}` must never leak a secret value, however it's populated.
+    #[test]
+    fn debug_redacts_all_secret_fields() {
+        let env = map(&[
+            ("CH_PASSWORD", "s3cret-ch-pass"),
+            ("LLM_KEY", "s3cret-llm-key"),
+            ("EMBED_SECRET", "s3cret-embed"),
+            ("ALERTS_RUN_TOKEN", "s3cret-alerts-token"),
+            ("SMTP_PASS", "s3cret-smtp-pass"),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        let rendered = format!("{cfg:?}");
+        for secret in [
+            "s3cret-ch-pass",
+            "s3cret-llm-key",
+            "s3cret-embed",
+            "s3cret-alerts-token",
+            "s3cret-smtp-pass",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "Debug output leaked secret {secret:?}: {rendered}"
+            );
+        }
+        assert!(rendered.contains("<redacted>"));
     }
 
     #[test]
@@ -287,6 +365,23 @@ mod tests {
         let env = map(&[("SMTP_SECURE", "TRUE")]);
         let cfg = Config::from_map(&env).unwrap();
         assert!(!cfg.smtp_secure);
+    }
+
+    /// H2: `smtp_secure` is the *effective* nodemailer value —
+    /// `notify.ts:40`'s `port === 465` half of the OR must be folded in even
+    /// when `SMTP_SECURE` itself is unset.
+    #[test]
+    fn smtp_secure_is_true_when_port_465_even_without_smtp_secure_env() {
+        let env = map(&[("SMTP_PORT", "465")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert!(cfg.smtp_secure);
+    }
+
+    #[test]
+    fn smtp_secure_true_env_wins_regardless_of_port() {
+        let env = map(&[("SMTP_SECURE", "true"), ("SMTP_PORT", "25")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert!(cfg.smtp_secure);
     }
 
     /// B3: an unparseable `SMTP_PORT` must NOT prevent the process from
