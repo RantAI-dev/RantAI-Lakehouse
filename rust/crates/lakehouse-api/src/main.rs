@@ -154,4 +154,10 @@ mod tests {
         let resp = post(test_router(), "/api/overview").await;
         assert_ne!(resp.status(), StatusCode::NOT_FOUND);
     }
+
+    #[tokio::test]
+    async fn ops_kind_route_is_registered() {
+        let resp = get(test_router(), "/api/ops/workloads").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
 }

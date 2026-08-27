@@ -144,9 +144,6 @@ impl DgClient {
     /// `/server_info` REST endpoint with a 3-second timeout — matching the
     /// `check("dagster", dagUrl)` helper in
     /// `src/app/api/ops/[kind]/route.ts`.
-    // Used starting with the `ops` commit; harmless to land ahead of its
-    // first caller since it's part of this client's public surface.
-    #[allow(dead_code)]
     pub async fn is_alive(&self) -> bool {
         let server_info_url = self.url.replace("/graphql", "/server_info");
         let Ok(resp) = self
