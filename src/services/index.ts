@@ -6,7 +6,6 @@ import { mockOverviewService } from "./mock/overview"
 import { mockAssetService } from "./mock/assets"
 import { mockPipelineService } from "./mock/pipelines"
 import { mockStreamingService } from "./mock/streaming"
-import { mockQueryService } from "./mock/queries"
 import { clickhouseQueryService } from "./clients/queries"
 import { clickhouseAssetService } from "./clients/assets"
 import { dagsterPipelineService } from "./clients/pipelines"
@@ -17,7 +16,6 @@ import { clickhouseGovernanceService } from "./clients/governance"
 import { postgresIdentityService } from "./clients/identity"
 import { mockKnowledgeService } from "./mock/knowledge"
 import { mockAgentService } from "./mock/agents"
-import { mockGovernanceService } from "./mock/governance"
 import { mockOpsService } from "./mock/ops"
 import { mockConnectorService } from "./mock/connectors"
 import { mockStorageService } from "./mock/storage"
@@ -29,14 +27,15 @@ void mockAssetService
 export const pipelineService = dagsterPipelineService
 void mockPipelineService
 export const streamingService = mockStreamingService
-// Query Studio kini NYATA — eksekusi SQL di ClickHouse (lakehouse kita).
-// Sisanya masih mock sampai client-nya dibuat (fase berikutnya).
+// Query Studio kini NYATA sepenuhnya — eksekusi SQL, saved/history/
+// collaboration, dan generateSql semua lewat backend Rust (ClickHouse +
+// Postgres + LLM). mock/queries.ts sudah dihapus.
 export const queryService = clickhouseQueryService
-void mockQueryService
 export const knowledgeService = mockKnowledgeService
 export const agentService = mockAgentService
+// Governance kini NYATA sepenuhnya — reads dari ClickHouse/Dagster,
+// policies + create*Rule dari Postgres. mock/governance.ts sudah dihapus.
 export const governanceService = clickhouseGovernanceService
-void mockGovernanceService
 export const opsService = clickhouseOpsService
 void mockOpsService
 // Identity kini NYATA — pengguna/peran/tenant/service identity di Postgres.

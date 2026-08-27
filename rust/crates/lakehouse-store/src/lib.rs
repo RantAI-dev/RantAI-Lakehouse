@@ -29,7 +29,9 @@
 //! that was never `Some`.
 
 pub mod error;
+pub mod governance;
 pub mod identity;
+pub mod queries;
 
 pub use error::StoreError;
 

@@ -87,7 +87,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/overview", get(overview::get).post(overview::refresh))
         .route("/api/ops/{kind}", get(ops::get))
         .route("/api/governance/lineage", get(governance::lineage))
-        .route("/api/governance/{kind}", get(governance::get))
+        .route(
+            "/api/governance/policies",
+            get(governance::list_policies).post(governance::create_policy),
+        )
+        .route(
+            "/api/governance/{kind}",
+            get(governance::get).post(governance::create_rule),
+        )
         .route("/api/storage", get(storage::get))
         .route(
             "/api/alerts",
@@ -99,6 +106,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/alerts/run", get(alerts::run).post(alerts::run))
         .route("/api/query/run", axum::routing::post(query::run))
         .route("/api/query/estimate", axum::routing::post(query::estimate))
+        .route("/api/query/saved", get(query::list_saved))
+        .route("/api/query/history", get(query::list_history))
+        .route(
+            "/api/query/collaboration",
+            get(query::list_collaboration).post(query::create_collaboration_project),
+        )
         .route("/api/pipelines", get(pipelines::list))
         .route("/api/pipelines/{id}/runs", get(pipelines::runs))
         .route(

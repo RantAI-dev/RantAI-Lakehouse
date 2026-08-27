@@ -7,14 +7,22 @@
 //! `{kind}` dispatch, matching Next.js's separate `lineage/route.ts` file —
 //! it is never reached by [`Kind::parse`].
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use lakehouse_clickhouse::{ChClient, ChError};
+use lakehouse_core::ApiError;
 use lakehouse_core::ident::SqlLiteral;
+use lakehouse_store::PgPool;
+use lakehouse_store::governance::{
+    self, ClassificationRule, CreateClassificationRuleInput, CreatePolicyInput,
+    CreateQualityRuleInput, CreateResidencyRuleInput, Policy, QualityRule, ResidencyRule,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::support::{js_error, str_col};
 use crate::state::AppState;
@@ -305,6 +313,228 @@ async fn lineage_body(ch: &ChClient, focus: &str) -> Result<Value, ChError> {
         "edges": edges,
         "columnMappings": column_mappings,
     }))
+}
+
+// ── Postgres-backed writes (Task 2.3) ───────────────────────────────────
+//
+// Policies (list + create) and the three `create*Rule` handlers below back
+// the methods `src/services/clients/governance.ts` used to delegate to
+// `mockGovernanceService`. There is no TypeScript server-side precedent for
+// any of them (the mock was purely in-browser), so — like
+// `routes::identity` — status codes are chosen to be correct rather than
+// faithful: 201 on create, 503 when there is no database pool.
+
+/// Borrow the Postgres pool, or fail with a 503 explaining why there isn't
+/// one. Mirrors `routes::identity::pool`.
+fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
+    state.pg.as_deref().ok_or_else(|| {
+        ApiError::Unavailable(
+            "governance store unavailable: no Postgres pool is configured \
+             (DATABASE_URL is missing or not a valid Postgres connection string)"
+                .to_owned(),
+        )
+    })
+}
+
+fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
+    serde_json::from_slice(body).map_err(|err| ApiError::BadRequest(format!("invalid JSON: {err}")))
+}
+
+/// `POST /api/governance/{kind}` — author a new rule for `kind` (`quality`,
+/// `classification`, or `residency`; `audit` has no writer, and anything
+/// else is unrecognized).
+///
+/// Dispatches on the same `{kind}` path segment [`get`] reads from, so
+/// `GET`/`POST` on one path stay symmetric with every other multi-method
+/// route in this router (`/api/alerts`, `/api/dashboard/specs`, ...).
+///
+/// # Errors
+///
+/// 400 for an unrecognized `kind` or a malformed body; 503/500 as above.
+pub async fn create_rule(
+    State(state): State<AppState>,
+    Path(kind): Path<String>,
+    body: Bytes,
+) -> Response {
+    match Kind::parse(&kind) {
+        Kind::Quality => match create_quality_rule(State(state), body).await {
+            Ok(resp) => resp.into_response(),
+            Err(err) => err.into_response(),
+        },
+        Kind::Classification => match create_classification_rule(State(state), body).await {
+            Ok(resp) => resp.into_response(),
+            Err(err) => err.into_response(),
+        },
+        Kind::Residency => match create_residency_rule(State(state), body).await {
+            Ok(resp) => resp.into_response(),
+            Err(err) => err.into_response(),
+        },
+        Kind::Audit | Kind::Unknown => (
+            StatusCode::BAD_REQUEST,
+            ApiJson(
+                json!({ "error": format!("kind tak dikenal atau tidak bisa ditulis: {kind}") }),
+            ),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/governance/policies` — every authored policy.
+///
+/// # Errors
+///
+/// 503 if no pool is configured; 500 on a database failure.
+pub async fn list_policies(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<Policy>>> {
+    Ok(ApiJson(governance::list_policies(pool(&state)?).await?))
+}
+
+/// The `POST /api/governance/policies` body. Mirrors `CreatePolicyInput`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePolicyBody {
+    name: String,
+    kind: String,
+    subjects: String,
+    resources: String,
+    effect: String,
+    #[serde(default)]
+    conditions: Option<String>,
+    #[serde(default)]
+    activate: bool,
+    #[serde(default)]
+    owner: Option<String>,
+}
+
+/// `POST /api/governance/policies` — author a new policy. Returns 201.
+///
+/// # Errors
+///
+/// 400 on a malformed body; 409 if the name is taken; 503/500 as above.
+pub async fn create_policy(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, ApiJson<Policy>)> {
+    let body: CreatePolicyBody = parse_body(&body)?;
+    let input = CreatePolicyInput {
+        name: body.name,
+        kind: body.kind,
+        subjects: body.subjects,
+        resources: body.resources,
+        effect: body.effect,
+        conditions: body.conditions,
+        activate: body.activate,
+        owner: body.owner,
+    };
+    let created = governance::create_policy(pool(&state)?, &input).await?;
+    Ok((StatusCode::CREATED, ApiJson(created)))
+}
+
+/// The `POST /api/governance/quality` body. Mirrors `CreateQualityRuleInput`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateQualityRuleBody {
+    name: String,
+    asset: String,
+    dimension: String,
+    threshold: String,
+    severity: String,
+}
+
+/// `POST /api/governance/quality` — author a new data-quality rule. Returns
+/// 201.
+///
+/// Distinct from `GET /api/governance/quality` ([`get`] with
+/// `Kind::Quality`), which stays `ClickHouse`-backed and unaffected by this
+/// handler — see the module doc comment on `lakehouse_store::governance`.
+///
+/// # Errors
+///
+/// 400 on a malformed body; 409 if the name is taken; 503/500 as above.
+pub async fn create_quality_rule(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, ApiJson<QualityRule>)> {
+    let body: CreateQualityRuleBody = parse_body(&body)?;
+    let input = CreateQualityRuleInput {
+        name: body.name,
+        asset: body.asset,
+        dimension: body.dimension,
+        threshold: body.threshold,
+        severity: body.severity,
+    };
+    let created = governance::create_quality_rule(pool(&state)?, &input).await?;
+    Ok((StatusCode::CREATED, ApiJson(created)))
+}
+
+/// The `POST /api/governance/classification` body. Mirrors
+/// `CreateClassificationRuleInput`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateClassificationRuleBody {
+    asset: String,
+    #[serde(default)]
+    column: Option<String>,
+    classification: String,
+    #[serde(default, rename = "maskingRule")]
+    masking_rule: Option<String>,
+}
+
+/// `POST /api/governance/classification` — author a new classification/
+/// masking rule. Returns 201.
+///
+/// # Errors
+///
+/// 400 on a malformed body; 503/500 as above.
+pub async fn create_classification_rule(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, ApiJson<ClassificationRule>)> {
+    let body: CreateClassificationRuleBody = parse_body(&body)?;
+    let input = CreateClassificationRuleInput {
+        asset: body.asset,
+        column: body.column,
+        classification: body.classification,
+        masking_rule: body.masking_rule,
+    };
+    let created = governance::create_classification_rule(pool(&state)?, &input).await?;
+    Ok((StatusCode::CREATED, ApiJson(created)))
+}
+
+/// The `POST /api/governance/residency` body. Mirrors
+/// `CreateResidencyRuleInput`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateResidencyRuleBody {
+    tenant: String,
+    classification: String,
+    #[serde(default)]
+    approved_sites: Vec<String>,
+    #[serde(default)]
+    cross_site_allowed: bool,
+    #[serde(default)]
+    allowed_output: String,
+}
+
+/// `POST /api/governance/residency` — author a new residency rule. Returns
+/// 201.
+///
+/// # Errors
+///
+/// 400 on a malformed body; 503/500 as above.
+pub async fn create_residency_rule(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, ApiJson<ResidencyRule>)> {
+    let body: CreateResidencyRuleBody = parse_body(&body)?;
+    let input = CreateResidencyRuleInput {
+        tenant: body.tenant,
+        classification: body.classification,
+        approved_sites: body.approved_sites,
+        cross_site_allowed: body.cross_site_allowed,
+        allowed_output: body.allowed_output,
+    };
+    let created = governance::create_residency_rule(pool(&state)?, &input).await?;
+    Ok((StatusCode::CREATED, ApiJson(created)))
 }
 
 #[cfg(test)]
