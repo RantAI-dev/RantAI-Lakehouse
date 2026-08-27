@@ -19,14 +19,17 @@ use thiserror::Error;
 
 /// Errors that can occur while resolving [`Config`] from environment
 /// variables.
+///
+/// Only `PORT` can fail resolution: it is load-bearing and Rust-only (the
+/// TypeScript backend runs under Next.js and never binds a port itself), so
+/// an unparseable value refusing to boot is the correct, Rust-specific
+/// failure mode. `SMTP_PORT` deliberately has no equivalent error variant —
+/// see the doc comment on [`Config::smtp_port`].
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
     /// `PORT` was set but is not a valid `u16`.
     #[error("PORT must be a valid u16, got {0:?}")]
     InvalidPort(String),
-    /// `SMTP_PORT` was set but is not a valid `u16`.
-    #[error("SMTP_PORT must be a valid u16, got {0:?}")]
-    InvalidSmtpPort(String),
 }
 
 /// Resolved application configuration.
@@ -73,7 +76,15 @@ pub struct Config {
     /// SMTP host. `None` when unset — email delivery is disabled
     /// (`notify.ts:32-33`, truthy check).
     pub smtp_host: Option<String>,
-    /// SMTP port. Default `587` (`notify.ts:37`, `??`).
+    /// SMTP port. Default `587` (`notify.ts:37`, `??`). An unparseable
+    /// `SMTP_PORT` also falls back to `587` (with a `tracing::warn!` naming
+    /// the bad value) rather than failing config resolution: the
+    /// TypeScript's `Number(process.env.SMTP_PORT ?? 587)` never throws — a
+    /// bad value there degrades to a broken email send, not a boot failure.
+    /// SMTP is not load-bearing for the API surface, so in a big-bang
+    /// cutover a stray `SMTP_PORT=` must not take the whole process down;
+    /// `PORT` (below) is the one field that legitimately still hard-fails,
+    /// since it is Rust-only and load-bearing.
     pub smtp_port: u16,
     /// Whether to use implicit TLS. `true` only when `SMTP_SECURE` is
     /// exactly the string `"true"` (`notify.ts:40`, strict `===`
@@ -115,13 +126,18 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError`] if `PORT` or `SMTP_PORT` is set to a value
-    /// that does not parse as a `u16`.
+    /// Returns [`ConfigError`] if `PORT` is set to a value that does not
+    /// parse as a `u16`. An unparseable `SMTP_PORT` does NOT error — see
+    /// [`Config::smtp_port`].
     pub fn from_map(env: &HashMap<String, String>) -> Result<Self, ConfigError> {
         let smtp_port = match env.get("SMTP_PORT") {
-            Some(raw) => raw
-                .parse::<u16>()
-                .map_err(|_| ConfigError::InvalidSmtpPort(raw.clone()))?,
+            Some(raw) => raw.parse::<u16>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    smtp_port = %raw,
+                    "SMTP_PORT is not a valid u16; falling back to 587"
+                );
+                587
+            }),
             None => 587,
         };
         let port = match env.get("PORT") {
@@ -273,10 +289,39 @@ mod tests {
         assert!(!cfg.smtp_secure);
     }
 
+    /// B3: an unparseable `SMTP_PORT` must NOT prevent the process from
+    /// booting — it degrades to the default port (587), matching the
+    /// TypeScript's `Number(x ?? 587)`, which never throws. Only `PORT`
+    /// (Rust-only, load-bearing) is allowed to hard-fail config resolution.
     #[test]
-    fn invalid_smtp_port_is_an_error() {
+    fn invalid_smtp_port_falls_back_to_default_instead_of_erroring() {
         let env = map(&[("SMTP_PORT", "nope")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.smtp_port, 587);
+    }
+
+    #[test]
+    fn empty_smtp_port_falls_back_to_default_instead_of_erroring() {
+        let env = map(&[("SMTP_PORT", "")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.smtp_port, 587);
+    }
+
+    /// A wildly out-of-range value (`u16::MAX` + 1) also falls back rather
+    /// than erroring, exactly like the empty/non-numeric cases above.
+    #[test]
+    fn out_of_range_smtp_port_falls_back_to_default_instead_of_erroring() {
+        let env = map(&[("SMTP_PORT", "70000")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.smtp_port, 587);
+    }
+
+    /// `PORT` remains hard-failing: it is Rust-only and load-bearing, unlike
+    /// `SMTP_PORT`.
+    #[test]
+    fn invalid_port_still_hard_fails_config_resolution() {
+        let env = map(&[("PORT", "nope")]);
         let err = Config::from_map(&env).unwrap_err();
-        assert_eq!(err, ConfigError::InvalidSmtpPort("nope".to_owned()));
+        assert_eq!(err, ConfigError::InvalidPort("nope".to_owned()));
     }
 }
