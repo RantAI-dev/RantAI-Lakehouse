@@ -27,10 +27,12 @@ rand = "0.8"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls-tls", "builder", "tokio1-rustls-tls"] }
 wiremock = "0.6"
-insta = { version = "1", features = ["json", "redactions"] }
 tokio-util = "0.7"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "time", "json", "macros", "migrate"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+async-trait = "0.1"
+argon2 = "0.5"
+subtle = "2"
 
 [workspace.lints.rust]
 future-incompatible = "warn"
