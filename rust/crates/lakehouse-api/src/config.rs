@@ -151,6 +151,52 @@ pub struct Config {
     /// unset. Never logged or rendered — see the [`Config`] type doc
     /// comment.
     pub auth_bootstrap_password: Option<String>,
+    /// `OIDC` issuer URL (Task 3.5). `None` when unset — `OIDC` is treated
+    /// as unconfigured and [`crate::state::AuthState::oidc`] stays `None`,
+    /// exactly as if this field never existed (local password auth keeps
+    /// working; nothing fails at boot). Both this AND
+    /// [`Self::oidc_client_id`] must be set for `OIDC` to be considered
+    /// configured — see `crate::state::AppState::new`.
+    pub oidc_issuer: Option<String>,
+    /// This application's client id as registered with the `OIDC`
+    /// provider. `None` when unset.
+    pub oidc_client_id: Option<String>,
+    /// `OIDC` client secret. `None` when unset. Reserved for a future
+    /// authorization-code exchange (a login-UI concern, out of this task's
+    /// scope) — `lakehouse_auth::oidc::OidcAuthenticator` verifies already-
+    /// issued bearer tokens against the provider's public JWKS and needs no
+    /// shared secret to do that, so this field is parsed (and kept out of
+    /// `Debug`) but not currently read by anything.
+    pub oidc_client_secret: Option<String>,
+    /// A short, operator-chosen label for the configured provider (e.g.
+    /// `"okta"`, `"entra"`). Combined with `"oidc:"` to form
+    /// `auth_identity.provider`. Default `"default"`.
+    pub oidc_provider_name: String,
+    /// Explicit override for the JWKS endpoint URL. `None` when unset, in
+    /// which case `crate::state::AppState::new` derives
+    /// `"{issuer}/.well-known/jwks.json"` — the conventional `OIDC`
+    /// discovery-document location every provider this crate documents
+    /// (Okta, Entra, Google, Keycloak) publishes at.
+    pub oidc_jwks_url: Option<String>,
+    /// Whether an unrecognized `OIDC` subject is allowed to provision a new
+    /// `app_user`. Default `false` — see
+    /// `lakehouse_auth::oidc::OidcConfig::jit_provisioning`'s doc comment
+    /// for why the default matters. `true` only when `OIDC_JIT_PROVISIONING`
+    /// is exactly `"true"`.
+    pub oidc_jit_provisioning: bool,
+    /// Maps an `OIDC` group/role claim value to a local `role.name`, parsed
+    /// from `OIDC_ROLE_MAP` (e.g.
+    /// `"lakehouse-admins=Platform Admin,analysts=Analyst"`). Empty when
+    /// unset. See [`parse_role_map`].
+    pub oidc_role_map: HashMap<String, String>,
+    /// Which claim in an `OIDC` token carries the caller's groups/roles.
+    /// Default `"groups"`.
+    pub oidc_groups_claim: String,
+    /// Clock-skew tolerance (seconds) `OIDC` token validation applies to
+    /// `exp`/`nbf`. Default `60`. An unparseable value falls back to the
+    /// default (like [`Self::smtp_port`], not load-bearing enough to fail
+    /// boot over).
+    pub oidc_clock_skew_seconds: u64,
     /// Postgres connection string for Phase 2 OLTP storage (`lakehouse-store`).
     /// Default `"postgres://lakehouse:lakehouse@localhost:5432/lakehouse"`
     /// (`??` semantics, like every other URL field here). Rust/Phase-2-only:
@@ -203,6 +249,18 @@ impl std::fmt::Debug for Config {
                 "auth_bootstrap_password",
                 &self.auth_bootstrap_password.as_ref().map(|_| REDACTED),
             )
+            .field("oidc_issuer", &self.oidc_issuer)
+            .field("oidc_client_id", &self.oidc_client_id)
+            .field(
+                "oidc_client_secret",
+                &self.oidc_client_secret.as_ref().map(|_| REDACTED),
+            )
+            .field("oidc_provider_name", &self.oidc_provider_name)
+            .field("oidc_jwks_url", &self.oidc_jwks_url)
+            .field("oidc_jit_provisioning", &self.oidc_jit_provisioning)
+            .field("oidc_role_map", &self.oidc_role_map)
+            .field("oidc_groups_claim", &self.oidc_groups_claim)
+            .field("oidc_clock_skew_seconds", &self.oidc_clock_skew_seconds)
             .field("database_url", &REDACTED)
             .finish()
     }
@@ -218,6 +276,27 @@ fn or_default(env: &HashMap<String, String>, key: &str, default: &str) -> String
 /// when `key` is absent *or* present-but-empty.
 fn truthy(env: &HashMap<String, String>, key: &str) -> Option<String> {
     env.get(key).filter(|v| !v.is_empty()).cloned()
+}
+
+/// Parse `OIDC_ROLE_MAP`'s `"group1=Role One,group2=Role Two"` format into
+/// a lookup from external group name to local `role.name`. A malformed
+/// entry (no `=`, or an empty group/role name) is skipped rather than
+/// failing config resolution — the same "operator-edited free text degrades
+/// gracefully" stance `lakehouse_auth::permissions::PermissionSet::parse`
+/// takes for `role.permissions`, and for the same reason: a broken mapping
+/// entry silently granting nothing is a safer failure mode than refusing to
+/// boot over a typo in one group name.
+fn parse_role_map(raw: &str) -> HashMap<String, String> {
+    raw.split(',')
+        .filter_map(|entry| {
+            let (group, role) = entry.split_once('=')?;
+            let (group, role) = (group.trim(), role.trim());
+            if group.is_empty() || role.is_empty() {
+                return None;
+            }
+            Some((group.to_owned(), role.to_owned()))
+        })
+        .collect()
 }
 
 impl Config {
@@ -288,6 +367,20 @@ impl Config {
                 .is_some_and(|v| v == "development" || v == "local"),
             auth_bootstrap_email: truthy(env, "AUTH_BOOTSTRAP_EMAIL"),
             auth_bootstrap_password: truthy(env, "AUTH_BOOTSTRAP_PASSWORD"),
+            oidc_issuer: truthy(env, "OIDC_ISSUER"),
+            oidc_client_id: truthy(env, "OIDC_CLIENT_ID"),
+            oidc_client_secret: truthy(env, "OIDC_CLIENT_SECRET"),
+            oidc_provider_name: or_default(env, "OIDC_PROVIDER_NAME", "default"),
+            oidc_jwks_url: truthy(env, "OIDC_JWKS_URL"),
+            oidc_jit_provisioning: env
+                .get("OIDC_JIT_PROVISIONING")
+                .is_some_and(|v| v == "true"),
+            oidc_role_map: parse_role_map(env.get("OIDC_ROLE_MAP").map_or("", String::as_str)),
+            oidc_groups_claim: or_default(env, "OIDC_GROUPS_CLAIM", "groups"),
+            oidc_clock_skew_seconds: env
+                .get("OIDC_CLOCK_SKEW_SECONDS")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(60),
             database_url: or_default(
                 env,
                 "DATABASE_URL",
@@ -377,6 +470,71 @@ mod tests {
             cfg.database_url,
             "postgres://lakehouse:lakehouse@localhost:5432/lakehouse"
         );
+        // OIDC unconfigured by default — graceful degradation, see the
+        // `oidc_issuer`/`oidc_client_id` field doc comments.
+        assert_eq!(cfg.oidc_issuer, None);
+        assert_eq!(cfg.oidc_client_id, None);
+        assert_eq!(cfg.oidc_client_secret, None);
+        assert_eq!(cfg.oidc_provider_name, "default");
+        assert_eq!(cfg.oidc_jwks_url, None);
+        assert!(!cfg.oidc_jit_provisioning);
+        assert!(cfg.oidc_role_map.is_empty());
+        assert_eq!(cfg.oidc_groups_claim, "groups");
+        assert_eq!(cfg.oidc_clock_skew_seconds, 60);
+    }
+
+    #[test]
+    fn oidc_role_map_parses_the_documented_format() {
+        let env = map(&[(
+            "OIDC_ROLE_MAP",
+            "lakehouse-admins=Platform Admin,analysts=Analyst",
+        )]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(
+            cfg.oidc_role_map
+                .get("lakehouse-admins")
+                .map(String::as_str),
+            Some("Platform Admin")
+        );
+        assert_eq!(
+            cfg.oidc_role_map.get("analysts").map(String::as_str),
+            Some("Analyst")
+        );
+    }
+
+    #[test]
+    fn oidc_role_map_skips_malformed_entries() {
+        let env = map(&[("OIDC_ROLE_MAP", "no-equals-sign,=empty-group,role-only=")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert!(cfg.oidc_role_map.is_empty());
+    }
+
+    #[test]
+    fn oidc_jit_provisioning_requires_the_exact_string_true() {
+        let env = map(&[("OIDC_JIT_PROVISIONING", "TRUE")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert!(!cfg.oidc_jit_provisioning);
+
+        let env = map(&[("OIDC_JIT_PROVISIONING", "true")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert!(cfg.oidc_jit_provisioning);
+    }
+
+    #[test]
+    fn invalid_oidc_clock_skew_falls_back_to_default_instead_of_erroring() {
+        let env = map(&[("OIDC_CLOCK_SKEW_SECONDS", "not-a-number")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.oidc_clock_skew_seconds, 60);
+    }
+
+    /// H1 for the new secret field: `{:?}` must never leak
+    /// `OIDC_CLIENT_SECRET`.
+    #[test]
+    fn debug_redacts_oidc_client_secret() {
+        let env = map(&[("OIDC_CLIENT_SECRET", "s3cret-oidc-client-secret")]);
+        let cfg = Config::from_map(&env).unwrap();
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("s3cret-oidc-client-secret"));
     }
 
     #[test]

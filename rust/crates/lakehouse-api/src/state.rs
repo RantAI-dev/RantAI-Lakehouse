@@ -3,7 +3,10 @@
 
 use std::sync::Arc;
 
-use lakehouse_auth::{LocalPasswordAuthenticator, ServiceTokenAuthenticator, SessionAuthenticator};
+use lakehouse_auth::{
+    LocalPasswordAuthenticator, OidcAuthenticator, OidcConfig, ServiceTokenAuthenticator,
+    SessionAuthenticator,
+};
 use lakehouse_clickhouse::ChClient;
 use lakehouse_dagster::DgClient;
 use lakehouse_embed::EmbedSecretResolver;
@@ -18,9 +21,12 @@ use crate::config::Config;
 /// cannot function without Postgres either, since every identity, session,
 /// and service-credential row lives there.
 ///
-/// Adding `OIDC` (Task 3.5) means adding one more field here and one more
-/// branch in `crate::auth::AuthenticatedPrincipal`'s bearer-token loop — no
-/// change to [`AppState`] itself, [`crate::auth`], or any handler.
+/// Task 3.5 added exactly what this doc comment always said it would: one
+/// more field ([`Self::oidc`]) and one more branch in
+/// `crate::auth::AuthenticatedPrincipal`'s bearer-token loop — no change to
+/// [`AppState`] itself, [`crate::auth`]'s [`AuthenticatedPrincipal`] type,
+/// or any handler. See this task's final report for the complete
+/// "what actually had to change" accounting.
 #[derive(Clone)]
 pub struct AuthState {
     /// Verifies `{ email, password }` against `auth_identity` — used only
@@ -30,6 +36,13 @@ pub struct AuthState {
     pub session: Arc<SessionAuthenticator>,
     /// Verifies the opaque `Authorization: Bearer` service token.
     pub service: Arc<ServiceTokenAuthenticator>,
+    /// Verifies a `JWT` `Authorization: Bearer` id token against a
+    /// configured `OIDC` provider's `JWKS` (Task 3.5). `None` when
+    /// `OIDC_ISSUER`/`OIDC_CLIENT_ID` are not both set — see
+    /// [`AppState::new`]. When `None`, `crate::auth`'s bearer dispatch
+    /// simply never tries the `OIDC` path, which is exactly what "OIDC
+    /// unconfigured behaves like today" requires.
+    pub oidc: Option<Arc<OidcAuthenticator>>,
 }
 
 /// State shared across all route handlers.
@@ -72,6 +85,33 @@ pub struct AppState {
     pub auth: Option<AuthState>,
 }
 
+/// Translate [`Config`]'s flat `oidc_*` env-derived fields into
+/// [`lakehouse_auth::OidcConfig`], or `None` if `OIDC` is not configured.
+///
+/// `OIDC` is considered configured only when BOTH `OIDC_ISSUER` and
+/// `OIDC_CLIENT_ID` are set — see [`Config::oidc_issuer`]'s doc comment.
+/// This is the one place that decision is made; every other piece of this
+/// module and `crate::auth` just reacts to [`AuthState::oidc`] being
+/// present or absent.
+fn oidc_config(config: &Config) -> Option<OidcConfig> {
+    let issuer = config.oidc_issuer.as_ref()?;
+    let client_id = config.oidc_client_id.as_ref()?;
+    let jwks_url = config
+        .oidc_jwks_url
+        .clone()
+        .unwrap_or_else(|| format!("{}/.well-known/jwks.json", issuer.trim_end_matches('/')));
+    Some(OidcConfig {
+        issuer: issuer.clone(),
+        client_id: client_id.clone(),
+        provider_name: config.oidc_provider_name.clone(),
+        jwks_url,
+        jit_provisioning: config.oidc_jit_provisioning,
+        role_map: config.oidc_role_map.clone(),
+        groups_claim: config.oidc_groups_claim.clone(),
+        clock_skew_seconds: config.oidc_clock_skew_seconds,
+    })
+}
+
 impl AppState {
     /// Build application state from a resolved [`Config`].
     #[must_use]
@@ -110,6 +150,8 @@ impl AppState {
             local: Arc::new(LocalPasswordAuthenticator::new((**pool).clone())),
             session: Arc::new(SessionAuthenticator::new((**pool).clone())),
             service: Arc::new(ServiceTokenAuthenticator::new((**pool).clone())),
+            oidc: oidc_config(&config)
+                .map(|oidc_config| Arc::new(OidcAuthenticator::new(oidc_config, (**pool).clone()))),
         });
         Self {
             config: Arc::new(config),

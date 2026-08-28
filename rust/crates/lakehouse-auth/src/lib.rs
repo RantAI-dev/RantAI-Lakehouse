@@ -29,16 +29,17 @@
 //!
 //! # What is (and is NOT) implemented here
 //!
-//! Three [`Authenticator`]s: [`password::LocalPasswordAuthenticator`],
-//! [`session::SessionAuthenticator`], and
-//! [`service_token::ServiceTokenAuthenticator`]. `OIDC` is deliberately
-//! absent — that is Task 3.5, and its clean arrival on top of the seam
-//! built here is the proof the seam works. [`credential::Credential`]
-//! already reserves a [`credential::Credential::Bearer`] variant for it.
+//! Four [`Authenticator`]s: [`password::LocalPasswordAuthenticator`],
+//! [`session::SessionAuthenticator`], [`service_token::ServiceTokenAuthenticator`],
+//! and (Task 3.5) [`oidc::OidcAuthenticator`] — the concrete `OIDC`
+//! implementor [`authenticator::Authenticator`]'s doc comment sketched, and
+//! the proof that sketch actually works. See [`oidc`]'s module doc comment
+//! for what it required.
 
 pub mod authenticator;
 pub mod credential;
 pub mod error;
+pub mod oidc;
 pub mod password;
 pub mod permissions;
 pub mod principal;
@@ -51,6 +52,7 @@ mod token;
 pub use authenticator::Authenticator;
 pub use credential::Credential;
 pub use error::AuthError;
+pub use oidc::{OidcAuthenticator, OidcConfig};
 pub use password::LocalPasswordAuthenticator;
 pub use permissions::PermissionSet;
 pub use principal::{Principal, PrincipalId};

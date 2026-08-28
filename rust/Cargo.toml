@@ -33,6 +33,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
 argon2 = "0.5"
 subtle = "2"
+jsonwebtoken = "9"
 
 [workspace.lints.rust]
 future-incompatible = "warn"
