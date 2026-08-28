@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { cn } from "@/lib/utils";
+import { apiFetch } from "@/services/http";
 
 /**
  * Pohon pipeline lakehouse LIVE untuk mode Build. Polling /api/ai/build-status
@@ -50,7 +51,7 @@ export function BuildTree({ runId }: { runId: string }) {
 
     async function tick() {
       try {
-        const res = await fetch(`/api/ai/build-status?runId=${encodeURIComponent(runId)}`, { cache: "no-store" });
+        const res = await apiFetch(`/api/ai/build-status?runId=${encodeURIComponent(runId)}`, { cache: "no-store" });
         const json = await res.json();
         if (!alive) return;
         if (json.status) setStatus(json.status);

@@ -22,6 +22,7 @@ import { DashboardGrid, type GridItem } from "./dashboard-grid";
 import { TileBody } from "./tile-body";
 import { DashboardFilters } from "./dashboard-filters";
 import { useCopilot } from "@/features/copilot/use-copilot";
+import { apiFetch } from "@/services/http";
 
 type Cell = { columns: string[]; rows: Record<string, unknown>[] } | { error: string };
 type KpiMeta = { id: string; title: string; caption?: string; format: string };
@@ -88,7 +89,7 @@ export function DashboardPage() {
       const q = new URLSearchParams({ board });
       if (year !== "all") q.set("year", year);
       if (!adoptingRef.current && filtersRef.current.length) q.set("filters", JSON.stringify(filtersRef.current));
-      const res = await fetch(`/api/dashboard?${q.toString()}`, { cache: "no-store" });
+      const res = await apiFetch(`/api/dashboard?${q.toString()}`, { cache: "no-store" });
       const json = (await res.json()) as Payload;
       if (!res.ok) throw new Error((json as { error?: string }).error ?? "Failed to load dashboard");
       setData(json);
@@ -128,7 +129,7 @@ export function DashboardPage() {
     filtersRef.current = next;
     setFilters(next);
     if (!isDefault) {
-      void fetch("/api/dashboard/boards", {
+      void apiFetch("/api/dashboard/boards", {
         method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: board, filters: next }),
       });
     }
@@ -161,7 +162,7 @@ export function DashboardPage() {
     setRecords({ columns: [], rows: [], value, loading: true });
     try {
       const q = new URLSearchParams({ mart, column, value, limit: "100" });
-      const res = await fetch(`/api/dashboard/records?${q.toString()}`, { cache: "no-store" });
+      const res = await apiFetch(`/api/dashboard/records?${q.toString()}`, { cache: "no-store" });
       const json = await res.json();
       if (!res.ok) throw new Error(json?.error ?? "gagal");
       setRecords({ columns: json.columns ?? [], rows: json.rows ?? [], value, loading: false });
@@ -196,7 +197,7 @@ export function DashboardPage() {
     if (isDefault) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      void fetch("/api/dashboard/boards", {
+      void apiFetch("/api/dashboard/boards", {
         method: "PUT", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: board, layout: next }),
       });
@@ -204,12 +205,12 @@ export function DashboardPage() {
   }, [board, isDefault]);
 
   async function remove(id: string) {
-    await fetch(`/api/dashboard/specs?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+    await apiFetch(`/api/dashboard/specs?id=${encodeURIComponent(id)}`, { method: "DELETE" });
     void load();
   }
   async function duplicateDashboard() {
     setMenuOpen(false);
-    const res = await fetch("/api/dashboard/boards", {
+    const res = await apiFetch("/api/dashboard/boards", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ duplicate: board }),
     });
     const json = await res.json();
@@ -219,12 +220,12 @@ export function DashboardPage() {
   async function deleteDashboard() {
     setMenuOpen(false);
     if (isDefault) return;
-    await fetch(`/api/dashboard/boards?id=${encodeURIComponent(board)}`, { method: "DELETE" });
+    await apiFetch(`/api/dashboard/boards?id=${encodeURIComponent(board)}`, { method: "DELETE" });
     notifyChange();
     router.push("/dashboards");
   }
   async function newDashboard() {
-    const res = await fetch("/api/dashboard/boards", {
+    const res = await apiFetch("/api/dashboard/boards", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "New dashboard" }),
     });
     const json = await res.json();
@@ -237,13 +238,13 @@ export function DashboardPage() {
     if (isDefault) return;
     setCopied(false);
     try {
-      const res = await fetch("/api/dashboard/boards", { cache: "no-store" });
+      const res = await apiFetch("/api/dashboard/boards", { cache: "no-store" });
       const json = await res.json();
       const b = (json?.boards ?? []).find((x: { id: string; publicToken?: string }) => x.id === board);
       setShareToken(b?.publicToken ?? "");
     } catch { setShareToken(""); }
     try {
-      const res = await fetch(`/api/dashboard/embed-info?board=${encodeURIComponent(board)}`, { cache: "no-store" });
+      const res = await apiFetch(`/api/dashboard/embed-info?board=${encodeURIComponent(board)}`, { cache: "no-store" });
       const json = await res.json();
       setEmbedEnabled(!!json?.enabled); setSampleToken(json?.sampleToken ?? "");
     } catch { setEmbedEnabled(false); setSampleToken(""); }
@@ -252,12 +253,12 @@ export function DashboardPage() {
   async function setEmbed(enable: boolean) {
     setShareBusy(true);
     try {
-      await fetch("/api/dashboard/boards", {
+      await apiFetch("/api/dashboard/boards", {
         method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: board, embed: enable }),
       });
       setEmbedEnabled(enable);
       // Refresh sample token (baru bermakna saat enabled).
-      const res = await fetch(`/api/dashboard/embed-info?board=${encodeURIComponent(board)}`, { cache: "no-store" });
+      const res = await apiFetch(`/api/dashboard/embed-info?board=${encodeURIComponent(board)}`, { cache: "no-store" });
       const json = await res.json();
       setSampleToken(json?.sampleToken ?? "");
     } finally { setShareBusy(false); }
@@ -265,7 +266,7 @@ export function DashboardPage() {
   async function setPublic(enable: boolean) {
     setShareBusy(true);
     try {
-      const res = await fetch("/api/dashboard/boards", {
+      const res = await apiFetch("/api/dashboard/boards", {
         method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: board, public: enable }),
       });
       const json = await res.json();
@@ -298,7 +299,7 @@ export function DashboardPage() {
   async function saveRename() {
     const name = newName.trim();
     if (!name || isDefault) return;
-    await fetch("/api/dashboard/boards", {
+    await apiFetch("/api/dashboard/boards", {
       method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: board, name }),
     });
     setRenameOpen(false);

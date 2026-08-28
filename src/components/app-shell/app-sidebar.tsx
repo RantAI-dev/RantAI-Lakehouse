@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/sidebar"
 import { cn } from "@/lib/utils"
 import { visibleNavGroups, activeNavHref, type NavGroup, type NavItem } from "./nav-config"
+import { apiFetch } from "@/services/http"
 
 function BrandLogo() {
   // Logo ikut tema: navy untuk sidebar terang, putih untuk sidebar gelap.
@@ -59,7 +60,7 @@ export function AppSidebar() {
 
   const [dashboards, setDashboards] = React.useState<{ id: string; name: string }[]>([])
   const loadDashboards = React.useCallback(() => {
-    fetch("/api/dashboard/boards").then((r) => r.json()).then((j) => setDashboards(j.boards ?? [])).catch(() => {})
+    apiFetch("/api/dashboard/boards").then((r) => r.json()).then((j) => setDashboards(j.boards ?? [])).catch(() => {})
   }, [])
   React.useEffect(() => { if (onDashboards) loadDashboards() }, [onDashboards, loadDashboards])
   React.useEffect(() => {
@@ -68,14 +69,14 @@ export function AppSidebar() {
     return () => window.removeEventListener("dashboards:changed", h)
   }, [loadDashboards])
   const newDashboard = async () => {
-    const res = await fetch("/api/dashboard/boards", {
+    const res = await apiFetch("/api/dashboard/boards", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "New dashboard" }),
     })
     const j = await res.json()
     if (j?.board?.id) { router.push(`/dashboards?board=${j.board.id}`); loadDashboards() }
   }
   const removeDashboard = async (id: string) => {
-    await fetch(`/api/dashboard/boards?id=${encodeURIComponent(id)}`, { method: "DELETE" })
+    await apiFetch(`/api/dashboard/boards?id=${encodeURIComponent(id)}`, { method: "DELETE" })
     loadDashboards(); router.push("/dashboards")
   }
 

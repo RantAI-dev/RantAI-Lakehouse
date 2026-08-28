@@ -10,6 +10,7 @@ import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter, DialogClose,
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
+import { apiFetch } from "@/services/http";
 
 type Rule = {
   id: string; name: string; type: "alert" | "digest";
@@ -37,18 +38,18 @@ export function AlertsPage() {
 
   const load = React.useCallback(async () => {
     const [r, b] = await Promise.all([
-      fetch("/api/alerts", { cache: "no-store" }).then((x) => x.json()),
-      fetch("/api/dashboard/boards", { cache: "no-store" }).then((x) => x.json()),
+      apiFetch("/api/alerts", { cache: "no-store" }).then((x) => x.json()),
+      apiFetch("/api/dashboard/boards", { cache: "no-store" }).then((x) => x.json()),
     ]);
     setRules(r.rules ?? []);
     setBoards((b.boards ?? []).filter((x: { id: string }) => x.id !== "default"));
-    fetch("/api/dashboard/fields").then((x) => x.json()).then((j) => setMarts((j.marts ?? []).map((m: { name: string }) => m.name))).catch(() => {});
+    apiFetch("/api/dashboard/fields").then((x) => x.json()).then((j) => setMarts((j.marts ?? []).map((m: { name: string }) => m.name))).catch(() => {});
   }, []);
   React.useEffect(() => { void load(); }, [load]);
 
   async function loadFields(mart: string) {
     if (!mart) { setFields([]); return; }
-    const j = await fetch(`/api/dashboard/fields?mart=${encodeURIComponent(mart)}`).then((x) => x.json());
+    const j = await apiFetch(`/api/dashboard/fields?mart=${encodeURIComponent(mart)}`).then((x) => x.json());
     setFields(j.measures ?? []);
   }
 
@@ -68,7 +69,7 @@ export function AlertsPage() {
     if (!f.target.trim()) { setErr("Webhook URL / email required."); return; }
     setBusy(true);
     try {
-      const res = await fetch("/api/alerts", {
+      const res = await apiFetch("/api/alerts", {
         method: edit ? "PUT" : "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(edit ? { ...f, id: edit.id } : f),
       });
@@ -80,18 +81,18 @@ export function AlertsPage() {
   }
 
   async function remove(id: string) {
-    await fetch(`/api/alerts?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+    await apiFetch(`/api/alerts?id=${encodeURIComponent(id)}`, { method: "DELETE" });
     await load();
   }
   async function toggle(r: Rule) {
-    await fetch("/api/alerts", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...r, enabled: !r.enabled }) });
+    await apiFetch("/api/alerts", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...r, enabled: !r.enabled }) });
     await load();
   }
   async function run(only?: string) {
     setBusy(true); setResults(null);
     try {
       const q = only ? `?id=${encodeURIComponent(only)}` : "";
-      const j = await fetch(`/api/alerts/run${q}`, { method: "POST" }).then((x) => x.json());
+      const j = await apiFetch(`/api/alerts/run${q}`, { method: "POST" }).then((x) => x.json());
       setResults(j.results ?? []);
     } finally { setBusy(false); }
   }

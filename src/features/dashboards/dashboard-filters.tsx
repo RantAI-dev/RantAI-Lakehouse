@@ -4,6 +4,7 @@ import * as React from "react";
 import { Filter, Plus, X, Check, ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { FilterDef } from "@/services/clients/bi-store";
+import { apiFetch } from "@/services/http";
 
 /**
  * Bar filter dashboard (lintas-tile) ala Tableau/Metabase. Pilih kolom dimensi
@@ -35,7 +36,7 @@ export function DashboardFilters({
     setPicked(new Set(filters.find((f) => f.column === col)?.values ?? []));
     setLoading(true);
     try {
-      const j = await fetch(`/api/dashboard/values?column=${encodeURIComponent(col)}`).then((r) => r.json());
+      const j = await apiFetch(`/api/dashboard/values?column=${encodeURIComponent(col)}`).then((r) => r.json());
       setValuesList(j.values ?? []);
     } catch { setValuesList([]); } finally { setLoading(false); }
   };
