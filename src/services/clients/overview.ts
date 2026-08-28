@@ -4,6 +4,7 @@ import type {
   ActivityItem,
   AlertItem,
 } from "../contracts/overview";
+import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
@@ -13,7 +14,7 @@ import { ServiceError } from "../errors";
  * Postgres, bukan ClickHouse. mock/overview.ts sudah dihapus.
  */
 async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(url, {
+  const res = await apiFetch(url, {
     method: "POST",
     headers: body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -29,19 +30,19 @@ async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Pr
 
 export const clickhouseOverviewService: OverviewService = {
   async getSummary(signal) {
-    const res = await fetch("/api/overview", { signal });
+    const res = await apiFetch("/api/overview", { signal });
     const json = await res.json();
     if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Overview gagal dimuat");
     return json as OverviewSummary;
   },
   async listActivity(signal) {
-    const res = await fetch("/api/overview", { method: "POST", signal });
+    const res = await apiFetch("/api/overview", { method: "POST", signal });
     const json = await res.json();
     if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Activity gagal dimuat");
     return json.activity as ActivityItem[];
   },
   async listAlerts(signal) {
-    const res = await fetch("/api/overview/alerts", { signal });
+    const res = await apiFetch("/api/overview/alerts", { signal });
     const json = await res.json();
     if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Alerts gagal dimuat");
     return json as AlertItem[];

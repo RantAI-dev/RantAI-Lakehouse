@@ -1,15 +1,24 @@
 "use client"
 
 import Link from "next/link"
-import { Search, Bell } from "lucide-react"
+import { Search, Bell, LogOut, KeyRound, CircleUserRound } from "lucide-react"
 import { usePathname } from "next/navigation"
 import { SidebarTrigger } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { ThemeToggle } from "@/components/theme-toggle"
 import { cn } from "@/lib/utils"
 import { pageTitleFor } from "./nav-config"
 import { openCommandPalette } from "@/components/command-palette"
+import { useAuth } from "@/features/auth/auth-provider"
 
 /**
  * Sticky top navbar rendered on every page.
@@ -19,6 +28,7 @@ import { openCommandPalette } from "@/components/command-palette"
 export function AppNavbar() {
   const pathname = usePathname()
   const pageTitle = pageTitleFor(pathname)
+  const { user, logout } = useAuth()
 
   return (
     <header
@@ -76,8 +86,53 @@ export function AppNavbar() {
               </Link>
             }
           />
+          <UserMenu userName={user?.name} userEmail={user?.email} onLogout={logout} />
         </div>
       </div>
     </header>
+  )
+}
+
+/** Who's signed in, with a logout affordance. Renders once `AuthProvider` has resolved a user (see `AppFrame`). */
+function UserMenu({
+  userName,
+  userEmail,
+  onLogout,
+}: {
+  userName: string | undefined
+  userEmail: string | null | undefined
+  onLogout: () => void | Promise<void>
+}) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-9 rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
+            aria-label="Account menu"
+          />
+        }
+      >
+        <CircleUserRound className="size-5" />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent>
+        <DropdownMenuLabel>
+          <p className="truncate text-sm font-medium text-foreground">{userName ?? "Signed in"}</p>
+          {userEmail ? <p className="truncate text-xs font-normal text-muted-foreground">{userEmail}</p> : null}
+        </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem render={<Link href="/account/change-password" />}>
+          <KeyRound />
+          Change password
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem variant="destructive" onClick={() => void onLogout()}>
+          <LogOut />
+          Sign out
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }

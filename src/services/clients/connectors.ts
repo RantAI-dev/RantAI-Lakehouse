@@ -5,6 +5,7 @@ import type {
   ConnectorTestResult,
   CreateConnectorInput,
 } from "../contracts/connectors";
+import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
@@ -23,7 +24,7 @@ import { ServiceError } from "../errors";
  */
 
 async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
+  const res = await apiFetch(url, init);
   const json = await res.json();
   if (!res.ok) {
     const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
@@ -33,7 +34,7 @@ async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(url, {
+  const res = await apiFetch(url, {
     method: "POST",
     headers: body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),

@@ -7,6 +7,7 @@ import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
 import { CircleUserRound, Plus, MessageSquare, X, BarChart3 } from "lucide-react"
 import { useCopilot } from "@/features/copilot/use-copilot"
+import { useAuth } from "@/features/auth/auth-provider"
 import {
   Sidebar,
   SidebarContent,
@@ -49,6 +50,7 @@ export function AppSidebar() {
   const groups = visibleNavGroups()
   const { state } = useSidebar()
   const iconMode = state === "collapsed"
+  const { user } = useAuth()
   const activeGroup = groups.find((g) => g.items.some((it) => it.href === activeHref))
   const router = useRouter()
   const copilot = useCopilot()
@@ -308,7 +310,7 @@ export function AppSidebar() {
           <SidebarMenuItem>
             <SidebarMenuButton
               size="lg"
-              tooltip="Admin User"
+              tooltip={user?.name ?? "Signed in"}
               className="h-14 rounded-lg px-2 hover:bg-sidebar-accent group-data-[collapsible=icon]:size-10! group-data-[collapsible=icon]:h-10!"
               render={
                 <div role="group" aria-label="Current user">
@@ -317,8 +319,8 @@ export function AppSidebar() {
                     <span className="absolute bottom-0 right-0 size-2.5 rounded-full border-2 border-sidebar bg-emerald-500" />
                   </div>
                   <div className="grid min-w-0 flex-1 text-left leading-tight group-data-[collapsible=icon]:hidden">
-                    <span className="truncate text-sm font-semibold text-sidebar-foreground">Admin User</span>
-                    <span className="truncate text-xs text-sidebar-foreground/60">admin@rantai.id</span>
+                    <span className="truncate text-sm font-semibold text-sidebar-foreground">{user?.name ?? "Signed in"}</span>
+                    <span className="truncate text-xs text-sidebar-foreground/60">{user?.email ?? ""}</span>
                   </div>
                 </div>
               }

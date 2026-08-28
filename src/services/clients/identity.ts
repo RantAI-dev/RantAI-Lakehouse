@@ -10,6 +10,7 @@ import type {
   User,
   WorkspaceSettings,
 } from "../contracts/identity";
+import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
@@ -38,7 +39,7 @@ async function request<T>(
   init: RequestInit,
   fallback: string
 ): Promise<T> {
-  const res = await fetch(url, init);
+  const res = await apiFetch(url, init);
   const json = await res.json().catch(() => null);
   if (!res.ok) {
     throw errorFor(res.status, json?.error ?? fallback);

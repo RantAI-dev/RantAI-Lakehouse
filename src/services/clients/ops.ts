@@ -5,6 +5,7 @@ import type {
   WorkloadItem,
   PlatformService,
 } from "../contracts/ops";
+import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
@@ -13,7 +14,7 @@ import { ServiceError } from "../errors";
  * lewat `/api/ops/workloads/{id}/cancel`. mock/ops.ts sudah dihapus.
  */
 async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(url, { signal });
+  const res = await apiFetch(url, { signal });
   const json = await res.json();
   if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Ops gagal dimuat");
   return json as T;
@@ -29,7 +30,7 @@ export const clickhouseOpsService: OpsService = {
     return (await get<{ services: PlatformService[] }>("/api/ops/services", s)).services;
   },
   async cancelWorkload(id, signal) {
-    const res = await fetch(`/api/ops/workloads/${encodeURIComponent(id)}/cancel`, {
+    const res = await apiFetch(`/api/ops/workloads/${encodeURIComponent(id)}/cancel`, {
       method: "POST",
       signal,
     });

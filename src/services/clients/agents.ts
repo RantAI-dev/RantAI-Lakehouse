@@ -10,6 +10,7 @@ import type {
   DigitalEmployee,
   RegisterToolInput,
 } from "../contracts/agents"
+import { apiFetch } from "../http"
 import { ServiceError } from "../errors"
 
 /**
@@ -34,7 +35,7 @@ function errorFor(status: number, message: string): ServiceError {
 }
 
 async function request<T>(url: string, init: RequestInit, fallback: string): Promise<T> {
-  const res = await fetch(url, init)
+  const res = await apiFetch(url, init)
   const json = await res.json().catch(() => null)
   if (!res.ok) {
     throw errorFor(res.status, json?.error ?? fallback)

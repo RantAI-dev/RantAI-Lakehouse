@@ -11,6 +11,7 @@ import type {
   CreateClassificationRuleInput,
   CreateResidencyRuleInput,
 } from "../contracts/governance";
+import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
@@ -38,14 +39,14 @@ function errorFor(status: number, message: string): ServiceError {
 }
 
 async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(url, { signal });
+  const res = await apiFetch(url, { signal });
   const json = await res.json().catch(() => null);
   if (!res.ok) throw errorFor(res.status, json?.error ?? "Governance gagal dimuat");
   return json as T;
 }
 
 async function post<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(url, {
+  const res = await apiFetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),

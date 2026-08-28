@@ -6,6 +6,7 @@ import type {
   CreatePipelineInput,
   GeneratePipelineInput,
 } from "../contracts/pipelines";
+import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
@@ -17,14 +18,14 @@ import { ServiceError } from "../errors";
  */
 
 async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
+  const res = await apiFetch(url, init);
   const json = await res.json();
   if (!res.ok) throw new ServiceError("unavailable", json?.error ?? `Gagal (${res.status})`);
   return json as T;
 }
 
 async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(url, {
+  const res = await apiFetch(url, {
     method: "POST",
     headers: body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),

@@ -6,6 +6,7 @@ import type {
   CreateLifecyclePolicyInput,
   RestoreAssetInput,
 } from "../contracts/storage";
+import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
@@ -14,14 +15,14 @@ import { ServiceError } from "../errors";
  * sudah dihapus.
  */
 async function getJson<T>(url: string, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(url, { signal });
+  const res = await apiFetch(url, { signal });
   const json = await res.json();
   if (!res.ok) throw new ServiceError("unavailable", json?.error ?? `Gagal (${res.status})`);
   return json as T;
 }
 
 async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(url, {
+  const res = await apiFetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),

@@ -1,3 +1,4 @@
+import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
@@ -20,7 +21,7 @@ export type AgentQueryResult = {
 };
 
 export async function askAgentSql(question: string, signal?: AbortSignal): Promise<AgentQueryResult> {
-  const res = await fetch("/api/agent/query", {
+  const res = await apiFetch("/api/agent/query", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ question }),

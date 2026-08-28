@@ -7,6 +7,7 @@ import type {
   CollaborationProject,
   CreateCollaborationProjectInput,
 } from "../contracts/queries";
+import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
@@ -33,14 +34,14 @@ function errorFor(status: number, message: string): ServiceError {
 }
 
 async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(url, { signal });
+  const res = await apiFetch(url, { signal });
   const json = await res.json().catch(() => null);
   if (!res.ok) throw errorFor(res.status, json?.error ?? `Query gagal (${res.status})`);
   return json as T;
 }
 
 async function postJson<T>(url: string, sql: string, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(url, {
+  const res = await apiFetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ sql }),
@@ -54,7 +55,7 @@ async function postJson<T>(url: string, sql: string, signal?: AbortSignal): Prom
 }
 
 async function post<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(url, {
+  const res = await apiFetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -78,7 +79,7 @@ export const clickhouseQueryService: QueryService = {
 
   // ── NYATA (agent text-to-SQL, LLM di-grounding ke skema lakehouse) ──────
   async generateSql(question, signal) {
-    const res = await fetch("/api/agent/text-to-sql", {
+    const res = await apiFetch("/api/agent/text-to-sql", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ question }),

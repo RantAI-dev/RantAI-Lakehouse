@@ -19,6 +19,7 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatBytes, formatCompactNumber, formatNumber, formatPercent } from "@/lib/format"
 import { identityService } from "@/services"
 import type { Tenant } from "@/services/contracts/identity"
+import { useAuth } from "@/features/auth/auth-provider"
 
 function computeQuota(r: Tenant): string {
   const used = formatCompactNumber(r.usedCompute)
@@ -56,6 +57,8 @@ const columns: ColumnDef<Tenant>[] = [
 ]
 
 export function TenantsPage() {
+  const { hasPermission } = useAuth()
+  const canWrite = hasPermission("identity:write")
   const state = useService((s) => identityService.listTenants(s), [])
   const [search, setSearch] = React.useState("")
   const [selected, setSelected] = React.useState<Tenant | null>(null)
@@ -104,7 +107,12 @@ export function TenantsPage() {
         title="Tenants"
         description="Tenant identity, residency, quotas, agents, and storage posture."
         actions={
-          <Button size="sm" onClick={() => setCreateOpen(true)}>
+          <Button
+            size="sm"
+            onClick={() => setCreateOpen(true)}
+            disabled={!canWrite}
+            title={canWrite ? undefined : "You don't have permission to create tenants."}
+          >
             <PlusIcon data-icon="inline-start" />
             Create Tenant
           </Button>
