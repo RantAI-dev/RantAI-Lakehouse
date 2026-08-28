@@ -7,9 +7,11 @@
 //! (`lakehouse-core`, `lakehouse-clickhouse`, and this crate's own modules)
 //! use `thiserror` typed errors instead.
 
+mod auth;
 mod config;
 mod error;
 mod json;
+mod policy;
 mod routes;
 mod state;
 
@@ -31,6 +33,12 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env().context("failed to resolve configuration from environment")?;
     let port = config.port;
     let state = AppState::new(config);
+
+    // Task 3.2: idempotently seed the one bootstrap admin, from
+    // `AUTH_BOOTSTRAP_EMAIL`/`AUTH_BOOTSTRAP_PASSWORD` — see
+    // `bootstrap_admin`'s doc comment for what happens when either is unset.
+    bootstrap_admin(&state).await;
+
     let app = routes::router(state);
 
     let addr = format!("0.0.0.0:{port}");
@@ -45,6 +53,81 @@ async fn main() -> anyhow::Result<()> {
         .context("server error")?;
 
     Ok(())
+}
+
+/// Idempotently seed exactly one bootstrap admin account from
+/// `AUTH_BOOTSTRAP_EMAIL`/`AUTH_BOOTSTRAP_PASSWORD`
+/// ([`Config::auth_bootstrap_email`]/[`Config::auth_bootstrap_password`]),
+/// so a fresh deployment has a way in before any other account exists.
+///
+/// # Idempotent by construction, not by a pre-check
+///
+/// This does not check "does the bootstrap admin already exist" before
+/// inserting — it just tries the insert and treats the natural outcome of
+/// re-running it (`app_user.email` already taken, surfaced as
+/// [`lakehouse_store::StoreError::Conflict`] from
+/// [`lakehouse_store::identity::create_user`]) as "already seeded, nothing
+/// to do", logged at `info`. Every other failure logs at `error` and
+/// leaves the process to boot anyway — a broken bootstrap-admin seed must
+/// not stop [`main`] from serving the rest of the API.
+///
+/// # What happens when the env vars are absent
+///
+/// Logs a `tracing::warn!` naming exactly which two variables to set and
+/// returns, seeding nothing. Never a hardcoded fallback credential — an
+/// unset bootstrap admin means "no way in yet", not "log in with a value
+/// nobody typed".
+///
+/// The created identity is `must_change_password = true` (see
+/// `0019_auth.sql`/[`lakehouse_auth::password`]'s doc comments): it can log
+/// in, but [`crate::routes::auth::change_password`] refuses to let it stay
+/// on that credential without proving a fresh password client-side.
+async fn bootstrap_admin(state: &AppState) {
+    let (Some(email), Some(password)) = (
+        state.config.auth_bootstrap_email.clone(),
+        state.config.auth_bootstrap_password.clone(),
+    ) else {
+        tracing::warn!(
+            "no bootstrap admin configured: set AUTH_BOOTSTRAP_EMAIL and \
+             AUTH_BOOTSTRAP_PASSWORD to create one on next startup"
+        );
+        return;
+    };
+    let Some(pool) = state.pg.as_deref() else {
+        tracing::warn!("cannot seed bootstrap admin: no Postgres pool is configured");
+        return;
+    };
+
+    let input = lakehouse_store::identity::InviteUserInput {
+        name: "Bootstrap Admin".to_owned(),
+        email,
+        roles: vec!["Platform Admin".to_owned()],
+        tenants: Vec::new(),
+    };
+    let user = match lakehouse_store::identity::create_user(pool, &input).await {
+        Ok(user) => user,
+        Err(lakehouse_store::StoreError::Conflict) => {
+            tracing::info!("bootstrap admin already exists; nothing to seed");
+            return;
+        }
+        Err(err) => {
+            tracing::error!(%err, "failed to seed bootstrap admin");
+            return;
+        }
+    };
+
+    let Ok(user_id) = user.id.parse() else {
+        tracing::error!("bootstrap admin was created but its id did not parse as a UUID");
+        return;
+    };
+    let password = lakehouse_auth::Secret::new(password);
+    if let Err(err) =
+        lakehouse_auth::password::create_local_identity(pool, user_id, &password, true).await
+    {
+        tracing::error!(%err, "bootstrap admin user was created but its password identity was not");
+        return;
+    }
+    tracing::info!("bootstrap admin seeded; must_change_password = true");
 }
 
 /// Resolves once ctrl-c is received, so `axum::serve` can shut down

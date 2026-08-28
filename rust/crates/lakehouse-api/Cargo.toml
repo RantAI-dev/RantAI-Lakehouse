@@ -19,6 +19,7 @@ lakehouse-bi = { path = "../lakehouse-bi" }
 lakehouse-embed = { path = "../lakehouse-embed" }
 lakehouse-llm = { path = "../lakehouse-llm" }
 lakehouse-store = { path = "../lakehouse-store" }
+lakehouse-auth = { path = "../lakehouse-auth" }
 rand = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
@@ -32,10 +33,12 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 time = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
+sqlx = { workspace = true }
 
 [lints]
 workspace = true

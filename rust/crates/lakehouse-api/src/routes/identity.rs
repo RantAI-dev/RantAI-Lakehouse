@@ -20,14 +20,26 @@
 //! `User[]`/`Role[]`/... as bare JSON arrays — not wrapped in an envelope,
 //! because the contract's methods return arrays directly).
 //!
-//! # No authentication, deliberately
+//! # Authentication (Task 3.2)
 //!
-//! There is no auth layer anywhere in this service, and this task does not
-//! add one — see the task's scope. Every endpoint below is reachable by
-//! anyone who can reach the port, including the three `POST`s that create
-//! real directory rows. That is a known, escalated product gap, not an
-//! oversight of this module; it is called out again on each mutating
-//! handler.
+//! Every route in this module now requires an authenticated
+//! [`lakehouse_auth::Principal`] — see `crate::policy::POLICY_TABLE`. None
+//! of them require a *specific* permission: the real seeded permission
+//! data (`lakehouse_auth::permissions`'s doc comment) has no resource for
+//! "manage users/roles/tenants", so requiring only authentication (rather
+//! than inventing an ungrounded permission string) is this task's
+//! deliberate, documented choice — any authenticated principal, not just
+//! an admin, can still create users/roles/tenants/service identities.
+//! That remains a real, named gap for a later task to close once a
+//! grounded permission exists for it, not an oversight of this module.
+//!
+//! This means every handler below now runs behind `crate::policy::auth_gate`,
+//! which itself requires `AppState::auth` (built only when
+//! `AppState::pg` is `Some`) — so a Postgres outage now surfaces as 503
+//! from the auth gate itself, before a handler like
+//! [`workspace_settings`] (which otherwise needs no database at all) ever
+//! runs. See `workspace_settings_serve_without_a_database`'s updated doc
+//! comment for the concrete before/after.
 
 use axum::body::Bytes;
 use axum::extract::{Query, State};
@@ -487,10 +499,18 @@ mod tests {
         }
     }
 
-    /// Workspace settings are deliberately NOT database-backed, so they
-    /// must still answer 200 when every other identity route is 503-ing.
+    /// Before Task 3.2, workspace settings answered 200 without a database
+    /// pool at all (the handler itself needs no query). Task 3.2 changed
+    /// what "without a database" means for EVERY route including this one:
+    /// `crate::policy::auth_gate` now runs first and requires
+    /// `AppState::auth`, which is only built when `AppState::pg` is
+    /// `Some` — so a missing pool now surfaces as 503 from the auth gate
+    /// itself, before this handler's own no-database-needed logic ever
+    /// gets a chance to run. This is the correct, spec'd behavior (an
+    /// unauthenticated caller must never reach a handler, database-backed
+    /// or not), not a regression in this handler.
     #[tokio::test]
-    async fn workspace_settings_serve_without_a_database() {
+    async fn workspace_settings_is_503_without_a_database_because_auth_itself_needs_one() {
         use axum::body::to_bytes;
         use axum::http::Request;
         use axum::response::IntoResponse;
@@ -506,7 +526,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let bytes = to_bytes(
             workspace_settings().await.into_response().into_body(),

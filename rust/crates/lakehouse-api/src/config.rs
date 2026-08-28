@@ -127,6 +127,30 @@ pub struct Config {
     /// TypeScript (which runs under Next.js), specific to this Rust
     /// service.
     pub port: u16,
+    /// Whether this process is running in local development. Controls
+    /// ONLY the `Secure` attribute on the auth session cookie (see
+    /// `routes::auth`) — never any other request behavior, and NEVER
+    /// bypasses authentication itself (there is no such flag in this
+    /// codebase; see Task 3.2's report for why `AUTH_DISABLED`-style
+    /// escape hatches were rejected).
+    ///
+    /// Resolved from `APP_ENV`, falling back to `NODE_ENV` (the same
+    /// variable the Next.js frontend already sets) — `true` only when the
+    /// value is exactly `"development"` or `"local"`; `false` (the safe
+    /// default) otherwise, including when both are unset. Failing closed
+    /// to `Secure=true` on a misconfigured/unset environment is the right
+    /// default: a deployment that forgot to set `APP_ENV` must not
+    /// silently ship a cookie that survives plaintext HTTP.
+    pub is_dev: bool,
+    /// Email for the idempotent bootstrap admin account (see
+    /// `main::bootstrap_admin`). `None` when unset — no bootstrap admin is
+    /// created, and startup logs instructions for setting this and
+    /// [`Self::auth_bootstrap_password`].
+    pub auth_bootstrap_email: Option<String>,
+    /// Password for the idempotent bootstrap admin account. `None` when
+    /// unset. Never logged or rendered — see the [`Config`] type doc
+    /// comment.
+    pub auth_bootstrap_password: Option<String>,
     /// Postgres connection string for Phase 2 OLTP storage (`lakehouse-store`).
     /// Default `"postgres://lakehouse:lakehouse@localhost:5432/lakehouse"`
     /// (`??` semantics, like every other URL field here). Rust/Phase-2-only:
@@ -173,6 +197,12 @@ impl std::fmt::Debug for Config {
             .field("smtp_pass", &REDACTED)
             .field("smtp_from", &self.smtp_from)
             .field("port", &self.port)
+            .field("is_dev", &self.is_dev)
+            .field("auth_bootstrap_email", &self.auth_bootstrap_email)
+            .field(
+                "auth_bootstrap_password",
+                &self.auth_bootstrap_password.as_ref().map(|_| REDACTED),
+            )
             .field("database_url", &REDACTED)
             .finish()
     }
@@ -252,6 +282,12 @@ impl Config {
             smtp_pass: or_default(env, "SMTP_PASS", ""),
             smtp_from,
             port,
+            is_dev: env
+                .get("APP_ENV")
+                .or_else(|| env.get("NODE_ENV"))
+                .is_some_and(|v| v == "development" || v == "local"),
+            auth_bootstrap_email: truthy(env, "AUTH_BOOTSTRAP_EMAIL"),
+            auth_bootstrap_password: truthy(env, "AUTH_BOOTSTRAP_PASSWORD"),
             database_url: or_default(
                 env,
                 "DATABASE_URL",

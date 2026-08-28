@@ -37,10 +37,24 @@ pub enum ApiError {
     /// The caller is authenticated but not allowed to perform this action.
     /// Maps to HTTP 403.
     ///
-    /// A unit variant because `embedding_disabled` is the only 403 body in the
-    /// codebase — verified by sweeping every handler under `src/app/api`.
+    /// A unit variant because `embedding_disabled` is the only 403 body the
+    /// TypeScript ever produced — verified by sweeping every handler under
+    /// `src/app/api`. [`Self::PermissionDenied`] (Task 3.2, Rust/Phase
+    /// 3-only) is the other 403, kept as a separate variant rather than
+    /// reused here specifically so this one keeps its fixed, ported body.
     #[error("embedding_disabled")]
     Forbidden,
+    /// The caller is authenticated but lacks a permission the route policy
+    /// (`lakehouse-api::policy`) requires. Maps to HTTP 403.
+    ///
+    /// Phase-3-only, like [`Self::Unavailable`]/[`Self::Conflict`]: no
+    /// TypeScript route ever checked a permission, so there is no ported
+    /// body to match. Carries the missing permission string so a client
+    /// can tell what to request, rather than folding into
+    /// [`Self::Forbidden`]'s fixed `embedding_disabled` body, which would
+    /// make the two unrelated 403 causes indistinguishable.
+    #[error("permission_denied: {0}")]
+    PermissionDenied(String),
     /// The requested resource does not exist. Maps to HTTP 404.
     #[error("{0}")]
     NotFound(String),
@@ -99,7 +113,7 @@ impl ApiError {
         match self {
             Self::BadRequest(_) => 400,
             Self::Unauthorized(_) => 401,
-            Self::Forbidden => 403,
+            Self::Forbidden | Self::PermissionDenied(_) => 403,
             Self::NotFound(_) => 404,
             Self::Unprocessable(_) => 422,
             Self::Conflict(_) => 409,

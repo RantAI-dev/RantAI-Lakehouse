@@ -101,6 +101,21 @@ impl PermissionSet {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Every granted `"resource:action"` token, rendered back into its
+    /// original string form. For a caller that needs to *list* what a
+    /// principal can do (e.g. `GET /api/auth/me`, Task 3.2) rather than
+    /// check one permission via [`Self::has`] — [`Self::has`] alone cannot
+    /// serve that use case, since it only ever answers yes/no for a single
+    /// query. Order is insertion order (parse-then-merge order), not
+    /// sorted; a caller that needs a stable order should sort it.
+    #[must_use]
+    pub fn as_strings(&self) -> Vec<String> {
+        self.0
+            .iter()
+            .map(|(resource, action)| format!("{resource}:{action}"))
+            .collect()
+    }
 }
 
 impl fmt::Debug for PermissionSet {
@@ -186,6 +201,17 @@ mod tests {
         assert!(set.has("dashboard:read"));
         assert!(!set.has("dashboard:write"));
         assert!(!set.has("query:read"));
+    }
+
+    #[test]
+    fn as_strings_round_trips_every_granted_token() {
+        let set = PermissionSet::parse("query:read, catalog:read");
+        let mut strings = set.as_strings();
+        strings.sort();
+        assert_eq!(
+            strings,
+            vec!["catalog:read".to_owned(), "query:read".to_owned()]
+        );
     }
 
     #[test]

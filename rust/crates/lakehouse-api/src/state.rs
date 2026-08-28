@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use lakehouse_auth::{LocalPasswordAuthenticator, ServiceTokenAuthenticator, SessionAuthenticator};
 use lakehouse_clickhouse::ChClient;
 use lakehouse_dagster::DgClient;
 use lakehouse_embed::EmbedSecretResolver;
@@ -10,6 +11,26 @@ use lakehouse_llm::LlmClient;
 use lakehouse_store::PgPool;
 
 use crate::config::Config;
+
+/// The three [`lakehouse_auth::Authenticator`]s this service configures,
+/// bundled together so [`AppState::auth`] can stay a single `Option` field
+/// mirroring [`AppState::pg`]'s "no Postgres, no Phase 2" pattern — auth
+/// cannot function without Postgres either, since every identity, session,
+/// and service-credential row lives there.
+///
+/// Adding `OIDC` (Task 3.5) means adding one more field here and one more
+/// branch in `crate::auth::AuthenticatedPrincipal`'s bearer-token loop — no
+/// change to [`AppState`] itself, [`crate::auth`], or any handler.
+#[derive(Clone)]
+pub struct AuthState {
+    /// Verifies `{ email, password }` against `auth_identity` — used only
+    /// by `POST /api/auth/login`.
+    pub local: Arc<LocalPasswordAuthenticator>,
+    /// Verifies the opaque session cookie.
+    pub session: Arc<SessionAuthenticator>,
+    /// Verifies the opaque `Authorization: Bearer` service token.
+    pub service: Arc<ServiceTokenAuthenticator>,
+}
 
 /// State shared across all route handlers.
 ///
@@ -43,6 +64,12 @@ pub struct AppState {
     /// see `routes::identity::pool`, the first (and so far only) reader of
     /// this field.
     pub pg: Option<Arc<PgPool>>,
+    /// The configured authenticators, or `None` under the exact same
+    /// condition as [`Self::pg`] being `None` (no Postgres pool). When
+    /// `None`, `crate::auth::AuthenticatedPrincipal` and every protected
+    /// route reply 503 rather than panic — see
+    /// `crate::auth::authenticators`.
+    pub auth: Option<AuthState>,
 }
 
 impl AppState {
@@ -79,6 +106,11 @@ impl AppState {
                 None
             }
         };
+        let auth = pg.as_ref().map(|pool| AuthState {
+            local: Arc::new(LocalPasswordAuthenticator::new((**pool).clone())),
+            session: Arc::new(SessionAuthenticator::new((**pool).clone())),
+            service: Arc::new(ServiceTokenAuthenticator::new((**pool).clone())),
+        });
         Self {
             config: Arc::new(config),
             clickhouse,
@@ -86,6 +118,7 @@ impl AppState {
             embed_secret: Arc::new(embed_secret),
             llm: Arc::new(llm),
             pg,
+            auth,
         }
     }
 }

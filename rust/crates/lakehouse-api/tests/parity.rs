@@ -29,6 +29,37 @@
 //! valid public dashboard token) to exercise `public-dash-ok`; without it,
 //! that single entry is skipped with a clear message.
 //!
+//! # Task 3.2: replaying against an authenticated service
+//!
+//! The corpus was captured from an unauthenticated TypeScript backend, but
+//! this Rust service now requires authentication on every route except the
+//! four `Policy::Public` entries in `lakehouse_api::policy::POLICY_TABLE`
+//! (not reachable from here — this is a separate binary crate's
+//! integration test — so this file keeps its own short mirror of just the
+//! fact that matters: a valid principal is needed). This harness solves
+//! that the same way any other authenticated API caller would: it sends
+//! `Authorization: Bearer <token>` for a real
+//! [`lakehouse_auth::ServiceTokenAuthenticator`]-backed service credential
+//! on every request (see [`resolve_service_token`]) — it does NOT bypass
+//! auth, use a test-only header, or rely on any `AUTH_DISABLED`-style
+//! escape hatch (there is no such flag in this codebase). The service
+//! identity's scopes are `["*:*"]`: this harness's job is to prove
+//! response-shape parity across ~70 corpus entries spanning almost every
+//! permission in `POLICY_TABLE`, not to test authorization decisions
+//! themselves (that's `routes::route_policy_tests` and the task's curl
+//! transcripts), so a narrower scope set would just be extra bookkeeping
+//! with no parity-signal benefit — this is a fixture, not a production
+//! credential, and it is never issued outside test setup.
+//!
+//! Set `PARITY_SERVICE_TOKEN` to reuse an already-issued token. If unset,
+//! [`resolve_service_token`] idempotently provisions its own
+//! `service_identity`/`service_credential` fixture row (named
+//! `"parity-harness"`) directly against `DATABASE_URL`, the same database
+//! the target server itself uses — mirroring how `main::bootstrap_admin`
+//! seeds its own fixture identity. If neither a token nor a reachable
+//! database is available, every non-public corpus entry is skipped with a
+//! clear per-entry message rather than failing opaquely.
+//!
 //! The corpus contains only validation/error paths for every mutating
 //! handler (`alerts`, `dashboard/boards`, `dashboard/specs`, `ai/sessions`,
 //! `pipelines/{id}/trigger`) plus read-only queries, so a full replay against
@@ -461,6 +492,63 @@ fn diff_text(name: &str, expected: &str, actual: &str) -> String {
     format!("{name}: yaml body mismatch\n{}", diffs.join("\n"))
 }
 
+/// The fixed name of the fixture `service_identity` this harness
+/// provisions for itself when `PARITY_SERVICE_TOKEN` isn't set. Unique
+/// (`service_identity_name_unique`), so a second run finds the same row
+/// instead of erroring or creating a duplicate — the same idempotency
+/// shape `main::bootstrap_admin` uses for its own fixture.
+const PARITY_SERVICE_IDENTITY_NAME: &str = "parity-harness";
+
+/// Resolve an `Authorization: Bearer` token to replay the corpus as an
+/// authenticated caller. See the module doc comment ("Task 3.2: replaying
+/// against an authenticated service") for the full reasoning.
+///
+/// Prefers `PARITY_SERVICE_TOKEN` if set (reusing an already-issued
+/// token — useful in CI, where provisioning a fresh one on every run is
+/// unnecessary). Otherwise connects to `DATABASE_URL` (defaulting the same
+/// way `lakehouse_api::config::Config` does) and idempotently provisions
+/// its own fixture. Returns `None` (never panics) if neither path
+/// produces a usable token — the caller degrades to skipping non-public
+/// entries with a clear message rather than failing opaquely.
+async fn resolve_service_token() -> Option<String> {
+    if let Ok(token) = std::env::var("PARITY_SERVICE_TOKEN") {
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://lakehouse:lakehouse@localhost:5432/lakehouse".to_owned());
+    let pool = lakehouse_store::connect_lazy(&database_url).ok()?;
+
+    let existing: Option<(uuid::Uuid,)> =
+        sqlx::query_as("SELECT id FROM service_identity WHERE name = $1")
+            .bind(PARITY_SERVICE_IDENTITY_NAME)
+            .fetch_optional(&pool)
+            .await
+            .ok()?;
+    let service_identity_id = if let Some((id,)) = existing {
+        id
+    } else {
+        let inserted: (uuid::Uuid,) = sqlx::query_as(
+            "INSERT INTO service_identity (name, scopes, environment, expires_at) \
+             VALUES ($1, $2, 'test', now() + interval '10 years') RETURNING id",
+        )
+        .bind(PARITY_SERVICE_IDENTITY_NAME)
+        .bind(vec!["*:*".to_owned()])
+        .fetch_one(&pool)
+        .await
+        .ok()?;
+        inserted.0
+    };
+
+    let token =
+        lakehouse_auth::service_token::create_service_credential(&pool, service_identity_id)
+            .await
+            .ok()?;
+    Some(token.expose().to_owned())
+}
+
 fn load_corpus() -> Vec<(String, CorpusEntry)> {
     let dir = corpus_dir();
     let mut entries: Vec<(String, CorpusEntry)> = std::fs::read_dir(&dir)
@@ -488,6 +576,14 @@ async fn parity_replays_corpus_against_live_service() {
     let target =
         std::env::var("PARITY_TARGET").unwrap_or_else(|_| "http://localhost:8080".to_owned());
     let public_dash_token = std::env::var("PUBLIC_DASH_TOKEN").ok();
+    let service_token = resolve_service_token().await;
+    if service_token.is_none() {
+        eprintln!(
+            "WARNING: no PARITY_SERVICE_TOKEN and no reachable DATABASE_URL to provision one — \
+             every entry requiring authentication will be skipped. See this file's module doc \
+             comment."
+        );
+    }
 
     let entries = load_corpus();
     assert!(
@@ -532,10 +628,27 @@ async fn parity_replays_corpus_against_live_service() {
             raw_path
         };
 
+        // Every corpus entry except the embed/public-dashboard ones now
+        // needs authentication (Task 3.2) — see this file's module doc
+        // comment. Those two ARE self-authenticated (a signed embed JWT / a
+        // share-link token IS the credential), so they never need the
+        // bearer header and must keep working with no service token at
+        // all.
+        let is_self_authenticated_entry =
+            name.starts_with("embed-data") || name.starts_with("public-dash");
+        if !is_self_authenticated_entry && service_token.is_none() {
+            eprintln!("SKIP {name}: no service token available to authenticate this request");
+            skipped += 1;
+            continue;
+        }
+
         replayed += 1;
         let url = format!("{}{path}", target.trim_end_matches('/'));
         let http_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
         let mut req = client.request(http_method, &url);
+        if let Some(token) = &service_token {
+            req = req.bearer_auth(token);
+        }
         if let Some(raw) = &entry.request.raw {
             req = req
                 .header(reqwest::header::CONTENT_TYPE, "application/json")

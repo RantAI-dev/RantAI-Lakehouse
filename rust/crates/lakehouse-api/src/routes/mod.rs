@@ -9,6 +9,7 @@ mod agent;
 mod agents;
 mod ai;
 mod alerts;
+pub mod auth;
 mod catalog;
 mod connectors;
 mod dashboard;
@@ -28,13 +29,27 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::Request;
 use axum::http::StatusCode;
-use axum::middleware::{Next, from_fn};
+use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::Serialize;
 
 use crate::json::ApiJson;
+use crate::policy::auth_gate;
 use crate::state::AppState;
+
+/// The `/api/auth/*` sub-router (Task 3.2), split out for the same
+/// `clippy::too_many_lines` reason as [`pipelines_router`].
+fn auth_router() -> Router<AppState> {
+    Router::new()
+        .route("/api/auth/login", axum::routing::post(auth::login))
+        .route("/api/auth/logout", axum::routing::post(auth::logout))
+        .route("/api/auth/me", get(auth::me))
+        .route(
+            "/api/auth/change-password",
+            axum::routing::post(auth::change_password),
+        )
+}
 
 /// Default per-request timeout, used for every route whose TypeScript
 /// handler does not declare `export const maxDuration` (most of them — see
@@ -340,6 +355,17 @@ pub fn router(state: AppState) -> Router {
         // Phase 2, Task 2.9: digital employees, tools, workflows, runs,
         // and approvals.
         .merge(agents_router())
+        // Task 3.2: login/logout/me/change-password.
+        .merge(auth_router())
+        // Task 3.2: the one authorization gate every route (bar the four
+        // `Policy::Public` entries in `crate::policy::POLICY_TABLE`) passes
+        // through, driven entirely by that table rather than per-handler
+        // checks. Added before `timeout_middleware` (in `.layer()`'s
+        // outermost-last ordering, this makes `timeout_middleware` the
+        // OUTER layer) so a slow session/permission check while a caller
+        // has the connection open still counts against the request's
+        // deadline instead of running unbounded outside it.
+        .layer(from_fn_with_state(state.clone(), auth_gate))
         .layer(from_fn(timeout_middleware))
         .with_state(state)
 }
@@ -409,5 +435,161 @@ mod tests {
             "no TS maxDuration export — falls back to the default"
         );
         assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(60));
+    }
+}
+
+/// Task 3.2's completeness regression: every route this crate mounts must
+/// have gone through `crate::policy::auth_gate` and come out the other
+/// side either genuinely public or genuinely gated — never silently open
+/// because nobody remembered to add a `crate::policy::POLICY_TABLE` entry.
+///
+/// # Why this is a live-router test, not just a `policy.rs` unit test
+///
+/// `crate::policy`'s own unit tests already pin down `policy_for`'s
+/// lookup logic in isolation. What THIS module proves is the wiring: that
+/// the middleware is actually layered onto `router()`, that
+/// `MatchedPath` really does resolve to the same pattern strings written
+/// in `POLICY_TABLE`, and that the deny-by-default path
+/// (`route_policy_unclassified`, 500) is reachable at all — none of which
+/// a table-only unit test can catch if, say, a future refactor moved
+/// `.layer(from_fn_with_state(state.clone(), auth_gate))` off the router
+/// by accident.
+///
+/// # The RED demonstration (not committed — see the task's final report)
+///
+/// Temporarily adding a route to `router()` (e.g.
+/// `.route("/api/__throwaway", get(health))`) with NO matching
+/// `POLICY_TABLE` entry and running this suite turns
+/// `every_policy_table_entry_is_mounted_and_gated_as_declared` from green
+/// to failing on `entries_not_reachable`... no — it does not touch this
+/// test (which only walks entries that already exist in the table); the
+/// route that actually goes RED is a direct request to the throwaway path
+/// itself, which this module also exercises
+/// (`an_unregistered_route_denies_by_default_instead_of_serving_public`),
+/// asserting exactly the 500 `route_policy_unclassified` body deny-by-default
+/// produces for ANY unclassified path — a throwaway route hits that same
+/// code path the moment it's requested, with no separate wiring needed to
+/// prove it.
+#[cfg(test)]
+mod route_policy_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use axum::body::to_bytes;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    use crate::config::Config;
+    use crate::policy::{POLICY_TABLE, Policy};
+    use crate::state::AppState;
+
+    fn test_router() -> axum::Router {
+        let cfg = Config::from_map(&std::collections::HashMap::new()).unwrap();
+        super::router(AppState::new(cfg))
+    }
+
+    /// `{id}`/`{token}`/`{kind}`/`{runId}` — any `{...}` capture segment —
+    /// substituted with a fixed placeholder so the concrete request
+    /// resolves to the exact route pattern the table names. axum matches
+    /// by segment shape, not by the parameter's name, so which literal
+    /// placeholder is used doesn't matter.
+    fn concretize(pattern: &str) -> String {
+        let mut out = String::with_capacity(pattern.len());
+        let mut in_capture = false;
+        for ch in pattern.chars() {
+            match ch {
+                '{' => in_capture = true,
+                '}' => {
+                    in_capture = false;
+                    out.push('x');
+                }
+                _ if in_capture => {}
+                _ => out.push(ch),
+            }
+        }
+        out
+    }
+
+    async fn request(
+        app: axum::Router,
+        method: &str,
+        path: &str,
+    ) -> axum::http::Response<axum::body::Body> {
+        app.oneshot(
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Every `POLICY_TABLE` entry resolves to a MOUNTED route (never 404 —
+    /// a 404 here would mean the table has drifted from `router()`, the
+    /// exact drift this whole module exists to catch), and is gated as
+    /// declared with no credentials presented: `Policy::Public` never
+    /// yields 401/403 for that reason, `Policy::RequiresAuth` and
+    /// `Policy::RequiresPermission` both yield exactly 401 (no cookie, no
+    /// bearer header presented at all — extraction fails before any
+    /// permission check runs, so both policy kinds converge on 401 here,
+    /// not 403; the 403 path is exercised separately in `tests/route_auth.rs`
+    /// with a real, under-permissioned principal against live Postgres).
+    #[tokio::test]
+    async fn every_policy_table_entry_is_mounted_and_gated_as_declared() {
+        let mut failures = Vec::new();
+        for (method, pattern, policy) in POLICY_TABLE {
+            let path = concretize(pattern);
+            let resp = request(test_router(), method, &path).await;
+            let status = resp.status();
+            if status == StatusCode::NOT_FOUND {
+                failures.push(format!(
+                    "{method} {pattern} ({path}): table entry does not resolve to a mounted route (404) — table has drifted from routes::router"
+                ));
+                continue;
+            }
+            match policy {
+                Policy::Public => {
+                    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+                        failures.push(format!(
+                            "{method} {pattern}: declared Public but got {status} with no credentials"
+                        ));
+                    }
+                }
+                Policy::RequiresAuth | Policy::RequiresPermission(_) => {
+                    if status != StatusCode::UNAUTHORIZED {
+                        failures.push(format!(
+                            "{method} {pattern}: declared {policy:?} but got {status} (expected 401) with no credentials"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    }
+
+    /// The deny-by-default regression itself: a `(method, path)` with NO
+    /// `POLICY_TABLE` entry is refused (500, `route_policy_unclassified`)
+    /// rather than silently served. This is precisely what goes RED (as a
+    /// live 200/404-vs-500 behavior change, not just this assertion) the
+    /// moment a route is registered in `router()` without a matching
+    /// table entry — see the task's final report for the throwaway-route
+    /// demonstration.
+    #[tokio::test]
+    async fn an_unregistered_route_denies_by_default_instead_of_serving_public() {
+        // `/health` is mounted and IS in the table (Public) — this proves
+        // the negative instead by asking for a method the health route
+        // never registers a policy entry for. `MatchedPath` still
+        // resolves to `/health` (axum matches the path regardless of
+        // method before yielding 405), so `auth_gate` still runs and still
+        // finds no `("DELETE", "/health", _)` entry.
+        let resp = request(test_router(), "DELETE", "/health").await;
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("route_policy_unclassified"),
+            "expected the deny-by-default body, got: {text}"
+        );
     }
 }
