@@ -89,6 +89,35 @@ const WRITE_TOOLS: [&str; 5] = [
     "create_board",
 ];
 
+/// D3: the dispatch-site enforcement of [`WRITE_TOOLS`], called from inside
+/// the tool-execution loop in [`chat`] for EVERY call about to be executed —
+/// not only ones the model was offered in its `tools` schema. Advertising a
+/// filtered tool list to the model (`ask` mode never lists `WRITE_TOOLS`)
+/// stops a well-behaved model from choosing one, but does nothing about a
+/// `MiniMax` XML `<invoke name="delete_chart">` embedded in free-form model
+/// text (`parse_minimax_tool_calls` extracts calls from text unconditionally,
+/// regardless of what was advertised) or a hallucinated `tool_calls` entry —
+/// both reach the dispatch loop looking exactly like a legitimate call. This
+/// function is the actual gate: `Some(refusal)` means "do not call
+/// [`run_tool`], return this JSON instead"; `None` means the call is
+/// authorized for the current mode and dispatch should proceed normally.
+///
+/// The refusal is a normal tool RESULT (`{"error": ..., "refused": true}`),
+/// fed back into the conversation exactly like any other tool result — the
+/// model sees it was denied and can tell the user, rather than the call
+/// being dropped silently and the model assuming it happened.
+#[must_use]
+fn write_tool_refusal(is_build: bool, tool_name: &str) -> Option<Value> {
+    if is_build || !WRITE_TOOLS.contains(&tool_name) {
+        return None;
+    }
+    Some(json!({
+        "error": "ditolak: mode ask tidak boleh menjalankan tool tulis",
+        "refused": true,
+        "tool": tool_name,
+    }))
+}
+
 const CATALOG_UNION: &str = "(SELECT slug,title,description,tier,table_name FROM lake.`bronze_meta.dataset_catalog` \
      UNION ALL SELECT slug,title,description,tier,table_name FROM lake.`bronze_meta_sec.dataset_catalog`)";
 
@@ -824,7 +853,22 @@ pub async fn chat(State(state): State<AppState>, body: Bytes) -> Response {
         for call in &calls {
             let args: Map<String, Value> =
                 serde_json::from_str(&call.function.arguments).unwrap_or_default();
-            let result = run_tool(&state, &call.function.name, &args).await;
+            // D3: `ask` mode filters `WRITE_TOOLS` out of the schema
+            // ADVERTISED to the model (above, building `tools`), but that
+            // alone is not enforcement — a `MiniMax` XML `<invoke
+            // name="delete_chart">` embedded in model TEXT (parsed by
+            // `parse_minimax_tool_calls` regardless of what was advertised)
+            // or a hallucinated `tool_calls` entry reaches this dispatch
+            // loop exactly like any legitimate call. Re-check the write-tool
+            // list HERE, at the one place execution actually happens
+            // ([`write_tool_refusal`]), and refuse rather than execute — the
+            // model must see the refusal (not have the call silently
+            // dropped) so it can tell the user instead of assuming a write
+            // it never got.
+            let result = match write_tool_refusal(is_build, &call.function.name) {
+                Some(refusal) => refusal,
+                None => run_tool(&state, &call.function.name, &args).await,
+            };
             let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
             tool_trace.push(json!({
                 "tool": call.function.name, "args": args, "ok": ok, "result": result,
@@ -1318,6 +1362,43 @@ mod tests {
         }
         assert!(!WRITE_TOOLS.contains(&"run_sql"));
         assert!(!WRITE_TOOLS.contains(&"list_datasets"));
+    }
+
+    /// D3: a forged write-tool invocation (whether a hallucinated
+    /// `tool_calls` entry or a `MiniMax` XML `<invoke>` the model was never
+    /// offered — `write_tool_refusal` doesn't care how the call arrived,
+    /// only its name and the current mode) is refused, not executed, in
+    /// `ask` mode.
+    #[test]
+    fn write_tool_is_refused_in_ask_mode() {
+        for name in WRITE_TOOLS {
+            let refusal =
+                write_tool_refusal(false, name).expect("write tool must be refused in ask mode");
+            assert_eq!(refusal["refused"], json!(true));
+            assert_eq!(refusal["tool"], json!(name));
+            assert!(refusal.get("error").is_some());
+        }
+    }
+
+    /// D3: the same forged call, replayed in `mode: "build"` (the
+    /// write-capable mode), is authorized — `write_tool_refusal` returns
+    /// `None` and dispatch proceeds to `run_tool` normally.
+    #[test]
+    fn write_tool_is_allowed_in_build_mode() {
+        for name in WRITE_TOOLS {
+            assert_eq!(
+                write_tool_refusal(true, name),
+                None,
+                "{name} must be allowed to dispatch in build mode"
+            );
+        }
+    }
+
+    /// A non-write tool is never refused, in either mode.
+    #[test]
+    fn read_only_tool_is_never_refused() {
+        assert_eq!(write_tool_refusal(false, "run_sql"), None);
+        assert_eq!(write_tool_refusal(true, "run_sql"), None);
     }
 
     #[test]
