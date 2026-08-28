@@ -5,9 +5,10 @@
 //! `src/app/api/alerts/run/route.ts`.
 
 use axum::body::Bytes;
-use axum::extract::{Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::HeaderMap;
 use lakehouse_alerts::AlertRuleInput;
+use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
 use lakehouse_notify::{EmailSender, SmtpConfig};
 use serde::Deserialize;
@@ -123,31 +124,48 @@ pub struct RunQuery {
     token: Option<String>,
 }
 
-/// The shared-token guard for `/api/alerts/run`, split out of the handler
-/// so it can be exercised without a live `ClickHouse` connection or ever
-/// calling `run_rules`. Ports `alerts/run/route.ts:16-20`.
+/// The `/api/alerts/run` guard, split out of the handler so it can be
+/// exercised without a live `ClickHouse` connection or ever calling
+/// `run_rules`. Was a straight port of `alerts/run/route.ts:16-20`; is now
+/// (D4) fail-closed instead of fail-open — see the module-level "D4" doc
+/// comment on [`run`] for the full rationale.
 ///
 /// # Security property
 ///
-/// When `configured` is `None` (`ALERTS_RUN_TOKEN` unset), this ALWAYS
-/// returns `Ok(())` — the endpoint is completely unauthenticated, and any
-/// caller can trigger a real evaluation run that can send real webhooks/
-/// emails. This is not a bug: it is the exact `TypeScript` contract
-/// (`if (need) { ... }` — the whole check is skipped when the env var is
-/// unset), reproduced faithfully. Operators who want this endpoint guarded
-/// must set `ALERTS_RUN_TOKEN`.
+/// * `configured: Some(token)` — unchanged from the `TypeScript`: the
+///   caller's header/query token must match, or this is a 401.
+/// * `configured: None` (`ALERTS_RUN_TOKEN` unset) — the `TypeScript`
+///   (and this handler, pre-D4) skipped the check entirely, making the
+///   route completely unauthenticated: any caller could trigger a real
+///   evaluation run that sends real webhooks/emails. D4 closes that: with
+///   no shared token configured, only a **service-identity** principal
+///   (`PrincipalId::Service` — the cron/scheduler's own credential, not a
+///   logged-in human's session) is allowed through; anyone/anything else
+///   is refused with 503. A human session principal is deliberately NOT
+///   sufficient here even though the router's `Policy::RequiresAuth`
+///   already requires ONE — this guard's whole job is to stop an ordinary
+///   authenticated user (any signed-up account, not just an operator) from
+///   firing every registered alert channel just by hitting this URL.
 fn check_run_token(
     configured: Option<&str>,
     header_token: Option<&str>,
     query_token: Option<&str>,
+    principal: Option<&Principal>,
 ) -> Result<(), ApiError> {
-    let Some(need) = configured else {
-        return Ok(());
-    };
-    if header_token.or(query_token) == Some(need) {
-        Ok(())
-    } else {
-        Err(ApiError::unauthorized())
+    if let Some(need) = configured {
+        return if header_token.or(query_token) == Some(need) {
+            Ok(())
+        } else {
+            Err(ApiError::unauthorized())
+        };
+    }
+    match principal {
+        Some(p) if matches!(p.id, PrincipalId::Service(_)) => Ok(()),
+        _ => Err(ApiError::Unavailable(
+            "alerts run tidak dikonfigurasi: set ALERTS_RUN_TOKEN, atau panggil dengan \
+             kredensial service identity (bukan sesi pengguna manusia)"
+                .to_owned(),
+        )),
     }
 }
 
@@ -172,32 +190,49 @@ fn smtp_config(config: &Config) -> SmtpConfig {
 /// `POST` or a real `SMTP` email. It is NOT captured in the parity corpus
 /// for exactly this reason — see `rust/tests/parity/README.md`'s
 /// "Deliberate omissions" section. Do not call this against production
-/// infrastructure while testing; only the 401-rejection path (wrong/
-/// missing token, with `ALERTS_RUN_TOKEN` set) is safe to exercise.
+/// infrastructure while testing; only the rejection paths (wrong/missing
+/// token with `ALERTS_RUN_TOKEN` set; no token configured and no
+/// service-identity principal) are safe to exercise.
+///
+/// # D4: fail closed when `ALERTS_RUN_TOKEN` is unset
+///
+/// The `TypeScript` original — and this handler, before this fix — skipped
+/// its shared-token check entirely when `ALERTS_RUN_TOKEN` was unset,
+/// which is precisely the state of this environment: the guard was a
+/// no-op, and any caller (any signed-up user, once auth landed; literally
+/// anyone, before it) could trigger every alert rule and fire real
+/// webhooks/emails. [`check_run_token`] now fails closed: with no token
+/// configured, only a `PrincipalId::Service` principal — a
+/// `service_identity` credential meant for the cron/scheduler that runs
+/// this on a timer, not a human's browser session — is let through;
+/// everyone else gets a 503. The 503 (not 401) is deliberate: this is a
+/// missing-configuration state ("nobody set up how this route should be
+/// called"), the same idiom `routes::identity::pool` uses for "no
+/// `DATABASE_URL`" — not a bad-credential state, which is what 401 means
+/// everywhere else in this crate. The token path (`ALERTS_RUN_TOKEN` set)
+/// is unchanged, so an existing cron/scheduler integration keeps working
+/// exactly as before.
 ///
 /// # Errors
 ///
 /// Returns a 401 [`ApiError::unauthorized`] when `ALERTS_RUN_TOKEN` is set
-/// and the caller's token doesn't match, or a 500 [`ApiError::Internal`] on
-/// a `ClickHouse` failure while listing rules.
+/// and the caller's token doesn't match; a 503 [`ApiError::Unavailable`]
+/// when it is unset and the caller is not an authenticated service-identity
+/// principal; or a 500 [`ApiError::Internal`] on a `ClickHouse` failure
+/// while listing rules.
 pub async fn run(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<RunQuery>,
+    principal: Option<Extension<Principal>>,
 ) -> ApiResult<ApiJson<Value>> {
     let header_token = headers.get("x-run-token").and_then(|v| v.to_str().ok());
     check_run_token(
         state.config.alerts_run_token.as_deref(),
         header_token,
         query.token.as_deref(),
+        principal.as_ref().map(|Extension(p)| p),
     )?;
-    if state.config.alerts_run_token.is_none() {
-        tracing::warn!(
-            "/api/alerts/run was called with ALERTS_RUN_TOKEN unset — this endpoint is \
-             completely unauthenticated and any caller can trigger real webhook/email \
-             deliveries"
-        );
-    }
 
     let http = reqwest::Client::new();
     let email = EmailSender::new(smtp_config(&state.config));
@@ -212,47 +247,102 @@ pub async fn run(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use lakehouse_auth::PermissionSet;
+    use uuid::Uuid;
+
     use super::*;
+
+    fn service_principal() -> Principal {
+        Principal {
+            id: PrincipalId::Service(Uuid::nil()),
+            tenant_ids: Vec::new(),
+            display_name: "alerts-cron".to_owned(),
+            permissions: PermissionSet::default(),
+            provider: "service".to_owned(),
+        }
+    }
+
+    fn user_principal() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::nil()),
+            tenant_ids: Vec::new(),
+            display_name: "Rina Wijaya".to_owned(),
+            permissions: PermissionSet::parse("*:*"),
+            provider: "session".to_owned(),
+        }
+    }
 
     #[test]
     fn run_endpoint_rejects_wrong_token_with_401() {
-        let err = check_run_token(Some("secret"), None, Some("wrong")).unwrap_err();
+        let err = check_run_token(Some("secret"), None, Some("wrong"), None).unwrap_err();
         assert_eq!(err.to_string(), "unauthorized");
         assert_eq!(err.status(), 401);
     }
 
     #[test]
     fn run_endpoint_rejects_missing_token_with_401() {
-        let err = check_run_token(Some("secret"), None, None).unwrap_err();
+        let err = check_run_token(Some("secret"), None, None, None).unwrap_err();
         assert_eq!(err.to_string(), "unauthorized");
     }
 
     #[test]
     fn run_endpoint_accepts_matching_header_token() {
-        assert!(check_run_token(Some("secret"), Some("secret"), None).is_ok());
+        assert!(check_run_token(Some("secret"), Some("secret"), None, None).is_ok());
     }
 
     #[test]
     fn run_endpoint_accepts_matching_query_token_as_fallback() {
-        assert!(check_run_token(Some("secret"), None, Some("secret")).is_ok());
+        assert!(check_run_token(Some("secret"), None, Some("secret"), None).is_ok());
     }
 
     #[test]
     fn run_endpoint_prefers_header_token_over_query_token() {
         // `req.headers.get("x-run-token") || url.searchParams.get("token")`
         // — the header wins when both are present, matching JS `||`.
-        assert!(check_run_token(Some("secret"), Some("secret"), Some("wrong")).is_ok());
+        assert!(check_run_token(Some("secret"), Some("secret"), Some("wrong"), None).is_ok());
     }
 
-    /// H1 / security property: with `ALERTS_RUN_TOKEN` unset, the guard
-    /// passes regardless of what token (if any) the caller supplies —
-    /// including a deliberately wrong one. This is the exact `TypeScript`
-    /// contract (`alerts/run/route.ts:16-20`'s `if (need) { ... }`), not an
-    /// oversight; see the doc comment on `check_run_token`.
+    /// A token, once configured, is still checked even when the caller
+    /// happens to also be a service-identity principal — the token path and
+    /// the no-token-configured fallback are mutually exclusive branches,
+    /// not additive.
     #[test]
-    fn run_endpoint_is_unguarded_when_token_unset() {
-        assert!(check_run_token(None, None, None).is_ok());
-        assert!(check_run_token(None, Some("anything"), None).is_ok());
-        assert!(check_run_token(None, None, Some("wrong")).is_ok());
+    fn configured_token_still_required_even_for_a_service_principal() {
+        let service = service_principal();
+        let err = check_run_token(Some("secret"), None, Some("wrong"), Some(&service)).unwrap_err();
+        assert_eq!(err.status(), 401);
+    }
+
+    /// D4 regression: with `ALERTS_RUN_TOKEN` unset, the guard used to pass
+    /// unconditionally (see git history / the pre-D4 doc comment) —
+    /// including for a caller presenting no token at all and no principal.
+    /// It must now fail closed: 503, not a silent pass.
+    #[test]
+    fn run_endpoint_fails_closed_when_token_unset_and_no_principal() {
+        let err = check_run_token(None, None, None, None).unwrap_err();
+        assert_eq!(err.status(), 503);
+        let err_with_wrong_token = check_run_token(None, Some("anything"), None, None).unwrap_err();
+        assert_eq!(err_with_wrong_token.status(), 503);
+    }
+
+    /// D4: a human session principal (however highly privileged — even
+    /// `*:*`) is still refused when no token is configured. This guard's
+    /// whole point is that "some authenticated user" is not enough for a
+    /// route that fires real webhooks/emails; only the dedicated
+    /// service-identity door is.
+    #[test]
+    fn run_endpoint_fails_closed_for_a_human_principal_even_with_wildcard_permissions() {
+        let user = user_principal();
+        let err = check_run_token(None, None, None, Some(&user)).unwrap_err();
+        assert_eq!(err.status(), 503);
+    }
+
+    /// D4: the new, intended long-term door — a service-identity principal
+    /// (e.g. the cron/scheduler's own credential) is let through even with
+    /// no shared token configured.
+    #[test]
+    fn run_endpoint_allows_a_service_identity_principal_when_token_unset() {
+        let service = service_principal();
+        assert!(check_run_token(None, None, None, Some(&service)).is_ok());
     }
 }

@@ -132,9 +132,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/storage/restore",     Policy::RequiresAuth),
 
     // ── Alerts (CRUD + run trigger): no seeded resource — auth only. Note
-    //    `/api/alerts/run` ALSO still requires its existing
-    //    `ALERTS_RUN_TOKEN` shared-secret check inside the handler; this
-    //    adds a Principal requirement on top rather than replacing it. ────
+    //    `/api/alerts/run` ALSO still runs its own, stricter
+    //    `routes::alerts::check_run_token` guard inside the handler (D4):
+    //    with `ALERTS_RUN_TOKEN` set, a matching token is required as
+    //    before; with it unset, only a `PrincipalId::Service` principal is
+    //    allowed through, not merely `RequiresAuth`'s "any authenticated
+    //    principal" — this table entry is a floor, not the whole guard. ──
     ("GET",    "/api/alerts",      Policy::RequiresAuth),
     ("POST",   "/api/alerts",      Policy::RequiresAuth),
     ("PUT",    "/api/alerts",      Policy::RequiresAuth),
