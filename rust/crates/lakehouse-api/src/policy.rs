@@ -39,6 +39,23 @@
 //! principal ([`Policy::RequiresAuth`]) rather than a guessed permission —
 //! see this task's final report for the explicit list of which routes that
 //! applies to and why.
+//!
+//! `identity:read`/`identity:write` are the one pair of permission strings
+//! in this table that are NOT copied from `0002_seed_identity.sql` — no
+//! seeded role grants either token by name. They exist to close a real
+//! privilege-escalation hole: before this change, every `/api/identity/*`
+//! route (create users, mint roles with arbitrary permission strings
+//! including `*:*`, attach roles to users, register service identities)
+//! was merely `Policy::RequiresAuth`, so any authenticated principal —
+//! including a low-privilege Analyst — could create a `*:*` role and
+//! attach it to itself. Introducing `identity:read`/`identity:write`
+//! requires no seed-data migration: Platform Admin's existing `"*:*"`
+//! already satisfies both by the resource-wildcard rule in
+//! `lakehouse_auth::permissions`, and no other seeded role's tokens
+//! (`policy:*`, `residency:*`, `audit:read`, `pipeline:*`, `catalog:write`,
+//! `connector:manage`, `query:read`, `catalog:read`, `lineage:read`,
+//! `agent:approve`, `dashboard:read`) match `identity:*` under those
+//! semantics — see `identity_permissions_require_no_seed_change` below.
 
 use axum::extract::{FromRequestParts, MatchedPath, Request, State};
 use axum::middleware::Next;
@@ -174,19 +191,20 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("DELETE", "/api/ai/sessions",       Policy::RequiresAuth),
     ("GET",  "/api/ai/build-status",     Policy::RequiresAuth),
 
-    // ── Identity (Phase 2 directory): no seeded "manage users" resource in
-    //    the permission seed data — auth only. Flagged in the task report
-    //    as a real gap: today any authenticated principal, not just an
-    //    admin, can create users/roles/tenants/service identities. ───────
-    ("GET",  "/api/identity/users",                  Policy::RequiresAuth),
-    ("POST", "/api/identity/users",                  Policy::RequiresAuth),
-    ("GET",  "/api/identity/roles",                  Policy::RequiresAuth),
-    ("POST", "/api/identity/roles",                  Policy::RequiresAuth),
-    ("GET",  "/api/identity/tenants",                Policy::RequiresAuth),
-    ("POST", "/api/identity/tenants",                Policy::RequiresAuth),
-    ("GET",  "/api/identity/service-identities",     Policy::RequiresAuth),
-    ("POST", "/api/identity/service-identities",     Policy::RequiresAuth),
-    ("GET",  "/api/identity/workspace-settings",     Policy::RequiresAuth),
+    // ── Identity (Phase 2 directory): permission-gated (D1 fix). Reads
+    //    require `identity:read`, mutations (create user/role/tenant/
+    //    service-identity — the last of which can mint a `*:*` role and
+    //    attach it to a caller) require `identity:write`. Only Platform
+    //    Admin's `*:*` grants either today; see the module doc comment. ───
+    ("GET",  "/api/identity/users",                  Policy::RequiresPermission("identity:read")),
+    ("POST", "/api/identity/users",                  Policy::RequiresPermission("identity:write")),
+    ("GET",  "/api/identity/roles",                  Policy::RequiresPermission("identity:read")),
+    ("POST", "/api/identity/roles",                  Policy::RequiresPermission("identity:write")),
+    ("GET",  "/api/identity/tenants",                Policy::RequiresPermission("identity:read")),
+    ("POST", "/api/identity/tenants",                Policy::RequiresPermission("identity:write")),
+    ("GET",  "/api/identity/service-identities",     Policy::RequiresPermission("identity:read")),
+    ("POST", "/api/identity/service-identities",     Policy::RequiresPermission("identity:write")),
+    ("GET",  "/api/identity/workspace-settings",     Policy::RequiresPermission("identity:read")),
 
     // ── Connectors: seeded Data Engineer permission `connector:manage`. ──
     ("GET",  "/api/connectors",             Policy::RequiresPermission("connector:manage")),
@@ -323,6 +341,88 @@ mod tests {
         assert_eq!(
             policy_for("GET", "/api/catalog"),
             Some(Policy::RequiresPermission("catalog:read"))
+        );
+    }
+
+    /// D1 regression: `/api/identity/*` must be permission-gated, not
+    /// merely `RequiresAuth` — see the module doc comment.
+    #[test]
+    fn identity_routes_require_identity_permissions() {
+        assert_eq!(
+            policy_for("GET", "/api/identity/roles"),
+            Some(Policy::RequiresPermission("identity:read"))
+        );
+        assert_eq!(
+            policy_for("POST", "/api/identity/roles"),
+            Some(Policy::RequiresPermission("identity:write"))
+        );
+        assert_eq!(
+            policy_for("POST", "/api/identity/users"),
+            Some(Policy::RequiresPermission("identity:write"))
+        );
+        assert_eq!(
+            policy_for("POST", "/api/identity/service-identities"),
+            Some(Policy::RequiresPermission("identity:write"))
+        );
+    }
+
+    /// D1: proves the new `identity:read`/`identity:write` tokens need no
+    /// seed-data migration — every currently-seeded role's grants (per
+    /// `lakehouse_auth::permissions`'s module doc comment) either matches
+    /// neither, or (Platform Admin's `"*:*"`) matches both.
+    #[test]
+    fn identity_permissions_require_no_seed_change() {
+        use lakehouse_auth::PermissionSet;
+
+        let non_admin_roles = [
+            ("Analyst", "query:read, catalog:read, lineage:read"),
+            ("Approver", "agent:approve, policy:review"),
+            ("Governance Admin", "policy:*, residency:*, audit:read"),
+            (
+                "Data Engineer",
+                "pipeline:*, catalog:write, connector:manage",
+            ),
+            ("Data Scientist", "query:read, feature:write, notebook:run"),
+            ("Dashboard Viewer", "dashboard:read"),
+        ];
+        for (name, raw) in non_admin_roles {
+            let set = PermissionSet::parse(raw);
+            assert!(
+                !set.has("identity:read") && !set.has("identity:write"),
+                "{name} unexpectedly grants an identity permission"
+            );
+        }
+
+        let platform_admin = PermissionSet::parse("*:*");
+        assert!(platform_admin.has("identity:read"));
+        assert!(platform_admin.has("identity:write"));
+    }
+
+    /// D1: the same 403-vs-200 distinction `auth_gate` enforces
+    /// (`Principal::has` on the route's `RequiresPermission` string),
+    /// exercised directly against an Analyst-shaped and a Platform-Admin-
+    /// shaped permission set — an Analyst must be denied
+    /// `POST /api/identity/roles` (privilege escalation: minting a `*:*`
+    /// role) while a `*:*` principal is let through.
+    #[test]
+    fn analyst_is_denied_identity_write_platform_admin_is_allowed() {
+        use lakehouse_auth::PermissionSet;
+
+        let Some(Policy::RequiresPermission(required)) = policy_for("POST", "/api/identity/roles")
+        else {
+            panic!("POST /api/identity/roles must require a permission");
+        };
+
+        let analyst = PermissionSet::parse("query:read, catalog:read, lineage:read");
+        assert!(
+            !analyst.has(required),
+            "an Analyst must be denied (403) POST /api/identity/roles"
+        );
+
+        let platform_admin = PermissionSet::parse("*:*");
+        assert!(
+            platform_admin.has(required),
+            "a Platform Admin (*:*) must be allowed through POST /api/identity/roles"
         );
     }
 

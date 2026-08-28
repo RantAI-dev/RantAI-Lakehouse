@@ -20,18 +20,20 @@
 //! `User[]`/`Role[]`/... as bare JSON arrays — not wrapped in an envelope,
 //! because the contract's methods return arrays directly).
 //!
-//! # Authentication (Task 3.2)
+//! # Authentication and authorization (Task 3.2, then D1)
 //!
-//! Every route in this module now requires an authenticated
-//! [`lakehouse_auth::Principal`] — see `crate::policy::POLICY_TABLE`. None
-//! of them require a *specific* permission: the real seeded permission
-//! data (`lakehouse_auth::permissions`'s doc comment) has no resource for
-//! "manage users/roles/tenants", so requiring only authentication (rather
-//! than inventing an ungrounded permission string) is this task's
-//! deliberate, documented choice — any authenticated principal, not just
-//! an admin, can still create users/roles/tenants/service identities.
-//! That remains a real, named gap for a later task to close once a
-//! grounded permission exists for it, not an oversight of this module.
+//! Every route in this module requires an authenticated
+//! [`lakehouse_auth::Principal`] holding `identity:read` (list/get routes)
+//! or `identity:write` (create routes) — see `crate::policy::POLICY_TABLE`.
+//! Earlier, every route here was merely `Policy::RequiresAuth`: any
+//! authenticated principal, not just an admin, could create users, mint a
+//! role with `*:*` permissions, and attach that role to itself — a
+//! privilege-escalation hole. `identity:read`/`identity:write` close it.
+//! Neither token is granted by any seeded role's `role.permissions` value
+//! except Platform Admin's `"*:*"` (which already satisfies both by the
+//! resource-wildcard rule), so closing this hole required no seed-data
+//! migration — see `crate::policy`'s module doc comment and
+//! `identity_permissions_require_no_seed_change` for the proof.
 //!
 //! This means every handler below now runs behind `crate::policy::auth_gate`,
 //! which itself requires `AppState::auth` (built only when
@@ -156,9 +158,7 @@ pub struct InviteUserBody {
 ///
 /// # Security
 ///
-/// Unauthenticated, like every route in this service: any caller who can
-/// reach this port can add a person to the directory and grant them roles
-/// in any tenant. See the module doc comment.
+/// Requires `identity:write` — see the module doc comment.
 ///
 /// # Errors
 ///
@@ -208,9 +208,10 @@ pub struct CreateRoleBody {
 ///
 /// # Security
 ///
-/// Unauthenticated — see the module doc comment. This one is the sharpest
-/// of the three creates: it mints a permission bundle (`"*:*"` is a legal
-/// value) that a subsequent invite can attach to a user.
+/// Requires `identity:write` — see the module doc comment. This one is the
+/// sharpest of the three creates: it mints a permission bundle (`"*:*"` is
+/// a legal value) that a subsequent invite can attach to a user, which is
+/// exactly the escalation path `identity:write` exists to gate.
 ///
 /// # Errors
 ///
@@ -274,7 +275,7 @@ pub struct CreateTenantBody {
 ///
 /// # Security
 ///
-/// Unauthenticated — see the module doc comment.
+/// Requires `identity:write` — see the module doc comment.
 ///
 /// # Errors
 ///
@@ -348,7 +349,7 @@ pub struct CreateServiceIdentityBody {
 ///
 /// # Security
 ///
-/// Unauthenticated — see the module doc comment.
+/// Requires `identity:write` — see the module doc comment.
 ///
 /// # Errors
 ///
