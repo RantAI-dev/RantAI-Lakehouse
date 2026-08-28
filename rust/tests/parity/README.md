@@ -176,3 +176,26 @@ Set `PUBLIC_DASH_TOKEN` (same as the capture command above) to also exercise
 `public-dash-ok`; without it, that one entry is skipped with a clear message
 and every other entry still runs. `_OMITTED_alerts-run` is never replayed —
 it isn't in the corpus at all (see "Deliberate omissions").
+
+## Append-only live history (corpus decay)
+
+Two entries assert against **unbounded, continuously-growing** `Dagster` run
+history rather than a fixed dataset:
+
+- `gov-audit.audit` — derived from run history
+- `pipeline-runs.runs` — literally the run list
+
+These decayed within a day of capture (`audit` 26 → 28, `runs` 14 → 15), and a
+run recorded as `failed` at capture time later became `completed` after a
+retry, which also shifts every subsequent index. Asserting array length or
+per-index values was never going to hold for them.
+
+`parity.rs::append_only_array_keys` compares these by **element shape** — the
+sorted set of distinct `field:type` signatures across the array. A renamed
+field, a dropped field, or a changed type still fails; only growth and
+reordering are tolerated. They are deliberately NOT added to `STRUCTURE_ONLY`,
+which would drop value assertions on the whole response including the stable
+scalars around these arrays.
+
+If you ever need exact-value assertions back for these paths, re-capture the
+corpus against a quiesced `Dagster` instead of widening the normalizer further.

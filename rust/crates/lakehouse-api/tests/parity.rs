@@ -147,6 +147,59 @@ fn unordered_array_keys(name: &str) -> &'static [&'static str] {
     }
 }
 
+/// Per-entry arrays that are APPEND-ONLY LIVE HISTORY: every new `Dagster`
+/// run adds elements, and a run that was `failed` at capture time can later be
+/// `completed` after a retry, which also shifts every subsequent index.
+///
+/// Asserting length or per-index values here was never going to hold — the
+/// corpus is a snapshot of an unbounded, continuously-growing dataset, and it
+/// decayed within a day of capture (`gov-audit` 26 → 28 entries,
+/// `pipeline-runs` 14 → 15).
+///
+/// These are compared by ELEMENT SHAPE instead: the set of distinct
+/// key → JSON-type signatures across the array. A renamed field, a dropped
+/// field, or a changed type still fails, which is what this harness exists to
+/// catch. Only growth and reordering are tolerated.
+///
+/// Deliberately NOT `STRUCTURE_ONLY`: that would drop every value assertion on
+/// the whole response, including the stable scalars around these arrays.
+fn append_only_array_keys(name: &str) -> &'static [&'static str] {
+    match name {
+        // routes::governance::audit — derived from Dagster run history.
+        "gov-audit" => &["audit"],
+        // routes::pipelines::runs — literally the Dagster run list.
+        "pipeline-runs" => &["runs"],
+        _ => &[],
+    }
+}
+
+/// Replaces `value[key]` (an array of objects) with the sorted set of distinct
+/// `field:type` signatures of its elements, so growth and reordering compare
+/// equal while a schema change does not.
+fn reduce_array_to_element_shapes(value: &mut Value, key: &str) {
+    let Some(items) = value.get_mut(key).and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut shapes: Vec<String> = items
+        .iter()
+        .map(|item| match item {
+            Value::Object(map) => {
+                let mut fields: Vec<String> = map
+                    .iter()
+                    .map(|(k, v)| format!("{k}:{}", json_kind(v)))
+                    .collect();
+                fields.sort();
+                fields.join(",")
+            }
+            other => json_kind(other).to_owned(),
+        })
+        .collect();
+    shapes.sort();
+    shapes.dedup();
+    *value.get_mut(key).unwrap_or(&mut Value::Null) =
+        Value::Array(shapes.into_iter().map(Value::String).collect());
+}
+
 /// Sorts `value.get(key)` (a JSON array of objects) by each element's `id`
 /// field, in place, if present. Used to compare an inherently-unordered
 /// array (see [`unordered_array_keys`]) without caring about position.
@@ -562,6 +615,10 @@ async fn parity_replays_corpus_against_live_service() {
         for unordered_key in unordered_array_keys(&name) {
             sort_array_by_id(&mut norm_expected, unordered_key);
             sort_array_by_id(&mut norm_actual, unordered_key);
+        }
+        for history_key in append_only_array_keys(&name) {
+            reduce_array_to_element_shapes(&mut norm_expected, history_key);
+            reduce_array_to_element_shapes(&mut norm_actual, history_key);
         }
 
         if norm_expected == norm_actual {
