@@ -885,14 +885,26 @@ pub struct EmbedInfoQuery {
     board: Option<String>,
 }
 
-/// `GET /api/dashboard/embed-info` — the embedding secret, this board's
-/// embed status, and a freshly-signed sample token.
+/// `GET /api/dashboard/embed-info` — this board's embed status and a
+/// freshly-signed sample token.
 ///
-/// Exposes the signing secret directly to the caller (matching the
-/// `TypeScript`, which treats the console itself as the trusted surface —
-/// see the doc comment on `embed-info/route.ts`); flagged for follow-up
-/// review, not fixed here, since parity with the captured corpus is the
-/// pre-cutover priority.
+/// # D2 (post-cutover): the signing secret is no longer returned
+///
+/// The `TypeScript` original (and this route, pre-fix) returned the raw
+/// HMAC signing secret in the response body — `{"secret": "<64-hex>",
+/// "enabled": bool, "sampleToken": "<jwt>"}`. That treated the console as
+/// the only trusted surface, which stopped being true once this route sat
+/// behind real authentication: any authenticated caller (not just an
+/// admin) could read the key that signs EVERY embed JWT for EVERY
+/// dashboard and forge tokens offline, bypassing `routes::embed::data`'s
+/// verification entirely. A signing key must never cross the wire.
+///
+/// The fix keeps `enabled` and `sampleToken` — minting a sample token
+/// server-side for an authenticated console user is the legitimate use
+/// case the secret was being exposed for — and simply omits `secret`.
+/// `rust/tests/parity/corpus/dashboard-embed-info.json` and
+/// `rust/tests/parity/README.md` are updated accordingly; this is a
+/// deliberate, documented parity divergence, not drift.
 ///
 /// # Errors
 ///
@@ -942,8 +954,11 @@ async fn embed_info_body(
         exp: Some(exp),
     };
     let sample_token = lakehouse_embed::sign_embed(&claims, &secret);
+    // D2: `secret` is deliberately NOT included in the response — see this
+    // function's doc comment. Only `enabled` and a freshly-signed
+    // `sampleToken` (the legitimate use case the secret used to serve) go
+    // over the wire.
     Ok(Some(json!({
-        "secret": secret,
         "enabled": board.embed_enabled.unwrap_or(false),
         "sampleToken": sample_token,
     })))

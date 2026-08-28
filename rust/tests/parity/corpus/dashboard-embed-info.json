@@ -3,12 +3,11 @@
     "name": "dashboard-embed-info",
     "method": "GET",
     "path": "/api/dashboard/embed-info?board=b_73c6fcc1",
-    "comment": "Uses a real, pre-existing board id (b_73c6fcc1 'Sample — Visitors', embed already enabled) found in console.bi_board — the literal string 'default' is rejected by this handler (400) so it cannot be used as the happy-path example."
+    "comment": "Uses a real, pre-existing board id (b_73c6fcc1 'Sample — Visitors', embed already enabled) found in console.bi_board — the literal string 'default' is rejected by this handler (400) so it cannot be used as the happy-path example. D2 (post-cutover): the captured TypeScript response also had a top-level `secret` field (the raw HMAC embed-signing key) which the Rust handler deliberately no longer returns — see rust/tests/parity/README.md's 'Intentional post-cutover divergences' section. This is the one corpus entry edited to remove a field rather than merely normalize its value."
   },
   "status": 200,
   "contentType": "application/json;charset=utf-8",
   "body": {
-    "secret": "<redacted:16>",
     "enabled": true,
     "sampleToken": "<redacted:7>"
   }

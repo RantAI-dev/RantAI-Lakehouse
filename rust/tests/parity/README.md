@@ -62,9 +62,10 @@ The harness must normalize these rather than compare them by value:
   return a different number of results, which a fixed-shape leaf normalizer
   can't tolerate.
 - **Re-signed tokens** — `dashboard-embed-info.sampleToken` carries a fresh
-  `exp` on every request; `dashboard-embed-info.secret` (the embed HMAC
-  signing secret) is redacted at capture time (`REDACT_KEYS_ALWAYS`) and so
-  can never be compared against a live value either.
+  `exp` on every request. (`dashboard-embed-info` used to also have a
+  `secret` field, redacted at capture time; see "Intentional post-cutover
+  divergences" below — it is gone from both the corpus and the live
+  response now, not merely normalized.)
 - **Clock/id-derived** — `query-run-ok.id` (`q-<epoch ms>`), `metrics.durationMs`,
   Dagster run ids and `startedAt`/`endedAt` in `pipelines-*` and `overview-*`,
   `ops-workloads.workloads[].elapsedMs` (an in-flight query's live elapsed
@@ -102,12 +103,51 @@ The harness must normalize these rather than compare them by value:
   (`JSON Parse error: Unexpected identifier "not"`), which a Rust service
   cannot reproduce. Normalize the `error` field for these two.
 
+## Intentional post-cutover divergences
+
+The corpus captures the pre-cutover `TypeScript` backend's *exact* response
+shapes, including its bugs, because parity with that baseline was the
+cutover gate. A small number of those bugs are deliberately NOT reproduced
+forever — they get fixed once auth exists to make the fix safe, and the
+corpus entry is edited (not just normalized) to match. This is drift in the
+literal sense (the Rust response shape differs from the captured baseline)
+but not the harmful kind the harness exists to catch; treat entries listed
+here as intentional, reviewed exceptions, not as evidence the harness is
+broken.
+
+- **`dashboard-embed-info` no longer returns `secret`.** The captured
+  `TypeScript` response was `{"secret": "<64-hex>", "enabled": bool,
+  "sampleToken": "<jwt>"}` — the raw HMAC key that signs every embed JWT for
+  every dashboard, returned to any caller who could reach the route. Once
+  the route sat behind real authentication (Task 3.2), that stopped being
+  merely "the console is the trusted surface" and became "any authenticated
+  principal can read the key and forge embed tokens offline, bypassing
+  `/api/embed/data`'s verification entirely" — a signing secret must never
+  cross the wire. The fix (D2) drops `secret` from the response and keeps
+  `enabled`/`sampleToken` (minting a sample token server-side for an
+  authenticated console user was the legitimate use case `secret` was being
+  exposed to serve). `corpus/dashboard-embed-info.json`'s `body` no longer
+  has a `secret` key at all — previously it held the capture-time redaction
+  marker `<redacted:16>`, now it is simply absent, and the harness's
+  independent-tree normalization (see `normalize`'s doc comment in
+  `tests/parity.rs`) means a corpus entry that *has* a key the live response
+  lacks fails loudly rather than being silently tolerated, which is the
+  correct behavior for any future accidental field removal — this one just
+  happens to be intentional.
+
 ## Deliberate omissions
 
-- `/api/alerts/run` (GET + POST) is not captured at all. Its only guard is
-  `ALERTS_RUN_TOKEN`, which is unset in this environment, so *any* request —
-  including one with a deliberately bad token — evaluates every alert rule and
-  can fire real webhooks and emails. There is no safe error path to capture.
+- `/api/alerts/run` (GET + POST) is not captured at all. `ALERTS_RUN_TOKEN` is
+  unset in this environment; before D4, that meant *any* request — including
+  one with a deliberately bad token — evaluated every alert rule and could
+  fire real webhooks and emails, so there was no safe success path to
+  capture. D4 made the route fail closed when the token is unset (only a
+  service-identity principal is let through, everyone else gets 503 — see
+  `routes::alerts::check_run_token`'s doc comment), which is a safe path in
+  principle, but this corpus is a fixed, versioned baseline, not a place to
+  add new captures after cutover — the rejection paths are covered by unit
+  tests in `routes/alerts.rs` instead, and the success path still fires real
+  webhooks/emails, so it stays out of both the corpus and any replay.
 - Success paths of all mutating handlers. Only validation/error paths are
   captured for POST/PUT/DELETE on `alerts`, `dashboard/specs`,
   `dashboard/boards`, `ai/sessions`, and `pipelines/{id}/trigger`.

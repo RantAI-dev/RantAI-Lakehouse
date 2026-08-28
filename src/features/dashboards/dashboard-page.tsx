@@ -3,7 +3,7 @@
 import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { RefreshCw, Sparkles, Download, Pencil, Eye, EyeOff, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Plus, Move, Share2, Link2, Check, Globe, Code2, KeyRound, Filter, Table2, FileDown } from "lucide-react";
+import { RefreshCw, Sparkles, Download, Pencil, Eye, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Plus, Move, Share2, Link2, Check, Globe, Code2, KeyRound, Filter, Table2, FileDown } from "lucide-react";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -79,9 +79,7 @@ export function DashboardPage() {
   const [shareBusy, setShareBusy] = React.useState(false);
   const [copied, setCopied] = React.useState<string | false>(false);
   const [embedEnabled, setEmbedEnabled] = React.useState(false);
-  const [embedSecret, setEmbedSecret] = React.useState("");
   const [sampleToken, setSampleToken] = React.useState("");
-  const [showSecret, setShowSecret] = React.useState(false);
   const notifyChange = () => { try { window.dispatchEvent(new Event("dashboards:changed")); } catch { /* ignore */ } };
 
   const load = React.useCallback(async () => {
@@ -237,7 +235,7 @@ export function DashboardPage() {
   async function openShare() {
     setMenuOpen(false);
     if (isDefault) return;
-    setCopied(false); setShowSecret(false);
+    setCopied(false);
     try {
       const res = await fetch("/api/dashboard/boards", { cache: "no-store" });
       const json = await res.json();
@@ -247,8 +245,8 @@ export function DashboardPage() {
     try {
       const res = await fetch(`/api/dashboard/embed-info?board=${encodeURIComponent(board)}`, { cache: "no-store" });
       const json = await res.json();
-      setEmbedSecret(json?.secret ?? ""); setEmbedEnabled(!!json?.enabled); setSampleToken(json?.sampleToken ?? "");
-    } catch { setEmbedSecret(""); setEmbedEnabled(false); setSampleToken(""); }
+      setEmbedEnabled(!!json?.enabled); setSampleToken(json?.sampleToken ?? "");
+    } catch { setEmbedEnabled(false); setSampleToken(""); }
     setShareOpen(true);
   }
   async function setEmbed(enable: boolean) {
@@ -261,7 +259,7 @@ export function DashboardPage() {
       // Refresh sample token (baru bermakna saat enabled).
       const res = await fetch(`/api/dashboard/embed-info?board=${encodeURIComponent(board)}`, { cache: "no-store" });
       const json = await res.json();
-      setEmbedSecret(json?.secret ?? ""); setSampleToken(json?.sampleToken ?? "");
+      setSampleToken(json?.sampleToken ?? "");
     } finally { setShareBusy(false); }
   }
   async function setPublic(enable: boolean) {
@@ -592,23 +590,10 @@ export function DashboardPage() {
 
               {embedEnabled ? (
                 <div className="space-y-2 pt-1">
-                  {/* Secret */}
-                  <div className="space-y-1">
-                    <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Embedding secret</p>
-                    <div className="flex items-center gap-2">
-                      <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2">
-                        <KeyRound className="size-3.5 shrink-0 text-muted-foreground" />
-                        <span className="truncate font-mono text-xs text-foreground">{showSecret ? embedSecret : "•".repeat(40)}</span>
-                      </div>
-                      <Button size="sm" variant="ghost" onClick={() => setShowSecret((s) => !s)} aria-label="Toggle secret">
-                        {showSecret ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
-                      </Button>
-                      <Button size="sm" variant="outline" onClick={() => void copyText(embedSecret, "secret")}>
-                        {copied === "secret" ? <Check className="size-4 text-emerald-500" /> : <Copy className="size-4" />}
-                      </Button>
-                    </div>
-                    <p className="text-[11px] text-destructive/80">Keep this server-side. Anyone with it can sign valid embeds.</p>
-                  </div>
+                  {/* The signing secret itself is never sent to the browser — see
+                      /api/dashboard/embed-info. Set EMBED_SECRET server-side from
+                      the same value the backend uses to sign tokens. */}
+                  <p className="text-[11px] text-muted-foreground">The signing secret is kept server-side and is never exposed to the console. Set <code className="rounded bg-muted px-1 font-mono">EMBED_SECRET</code> in your server environment to the same value the backend signs with.</p>
 
                   {/* Signing snippet */}
                   <div className="space-y-1">

@@ -136,9 +136,11 @@ fn extra_normalize_keys(name: &str) -> HashSet<&'static str> {
         // compared by value.
         "ai-sessions-list" => HashSet::from(["title"]),
         "ai-sessions-detail" => HashSet::from(["title", "content", "sql"]),
-        // The embed HMAC signing secret (`REDACT_KEYS_ALWAYS` in
-        // capture.ts) — redacted at capture time for the same reason.
-        "dashboard-embed-info" => HashSet::from(["secret"]),
+        // D2 (post-cutover): `dashboard-embed-info`'s captured corpus entry
+        // no longer has a `secret` key at all (edited out, not just
+        // normalized) — the Rust handler deliberately stops returning the
+        // embed HMAC signing key. See this corpus entry's `comment` and
+        // rust/tests/parity/README.md. Nothing left here to normalize.
         // Live SLO snapshot text (e.g. `"1233ms"`), embedded in a string
         // rather than a bare number so the generic numeric-leaf rule can't
         // catch it. Same "live cluster aggregate" category as
