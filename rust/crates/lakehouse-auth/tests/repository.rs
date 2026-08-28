@@ -74,3 +74,47 @@ async fn an_unknown_user_id_is_not_found(pool: PgPool) -> sqlx::Result<()> {
     assert!(matches!(err, AuthError::NotFound));
     Ok(())
 }
+
+/// `0020_extend_role_grants.sql` end to end: Bayu Pratama (seeded Data
+/// Engineer) must hold the two tokens that migration adds to that role
+/// (`workload:cancel`, `alert:write` — gating `POST /api/ops/workloads/{id}/
+/// cancel` and `/api/alerts` CRUD in `lakehouse_api::policy`), but neither
+/// of the two deliberately Platform-Admin-only tokens from the same
+/// change (`agent:manage`, `storage:restore`) — this is a real column
+/// read, not just a parsed literal, so it catches the migration failing to
+/// apply as much as it catches a typo in the token string.
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires a live Postgres; see module doc comment"]
+async fn data_engineer_gains_workload_cancel_and_alert_write_from_0020(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let bayu_id = Uuid::parse_str("33333333-3333-4333-8333-000000000002").unwrap();
+    let principal = load_principal_for_user(&pool, bayu_id, "local".to_owned())
+        .await
+        .unwrap();
+
+    assert!(principal.has("pipeline:read"), "still holds pipeline:*");
+    assert!(principal.has("workload:cancel"));
+    assert!(principal.has("alert:write"));
+    assert!(!principal.has("agent:manage"));
+    assert!(!principal.has("storage:restore"));
+    Ok(())
+}
+
+/// The same migration, from the other side: Platform Admin's `*:*` still
+/// satisfies every one of the four new tokens, including the two
+/// deliberately admin-only ones with no explicit grant row.
+#[sqlx::test(migrations = "../../migrations")]
+#[ignore = "requires a live Postgres; see module doc comment"]
+async fn platform_admin_satisfies_all_four_new_tokens_from_0020(pool: PgPool) -> sqlx::Result<()> {
+    let fajar_id = Uuid::parse_str("33333333-3333-4333-8333-000000000006").unwrap();
+    let principal = load_principal_for_user(&pool, fajar_id, "local".to_owned())
+        .await
+        .unwrap();
+
+    assert!(principal.has("agent:manage"));
+    assert!(principal.has("workload:cancel"));
+    assert!(principal.has("storage:restore"));
+    assert!(principal.has("alert:write"));
+    Ok(())
+}

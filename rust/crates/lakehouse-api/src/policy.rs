@@ -56,6 +56,44 @@
 //! `connector:manage`, `query:read`, `catalog:read`, `lineage:read`,
 //! `agent:approve`, `dashboard:read`) match `identity:*` under those
 //! semantics — see `identity_permissions_require_no_seed_change` below.
+//!
+//! # `agent:manage` / `workload:cancel` / `storage:restore` / `alert:write`
+//!
+//! Four more route groups had the identical problem: any authenticated
+//! principal, including a read-only Analyst, could suspend/resume/revoke a
+//! digital employee, cancel a running `ClickHouse` workload, restore storage
+//! from a snapshot, or mutate alert rules that fire real webhooks and
+//! emails. `migrations/0020_extend_role_grants.sql` extends the seed data
+//! alongside these table entries rather than gating them behind a token
+//! nothing can hold:
+//!
+//! * `agent:manage` (`/api/agents/employees/{id}/{suspend,resume,revoke}`)
+//!   — same `agent` resource family as Approver's seeded `agent:approve`,
+//!   but a different action: lifecycle control of the employee identity
+//!   itself (a kill switch), not approving one action it proposed.
+//!   Deliberately gets NO seed grant: Approver's remit is narrow
+//!   per-decision approval, not blanket administration of the employees
+//!   themselves, and no other seeded role plausibly owns "agent
+//!   operations" — reachable only via Platform Admin's `*:*`, same as
+//!   `identity:write`.
+//! * `workload:cancel` (`/api/ops/workloads/{id}/cancel`) — granted to
+//!   Data Engineer (`0020`) alongside its existing `pipeline:*`: Data
+//!   Engineer is the role that operates pipelines end-to-end and is the
+//!   one that would need to kill a runaway query a pipeline it owns
+//!   launched.
+//! * `storage:restore` (`/api/storage/restore`) — deliberately gets NO
+//!   seed grant. It is destructive/irreversible and no seeded role
+//!   represents storage/backup operations at all (Data Engineer's
+//!   `pipeline:*`/`catalog:write`/`connector:manage` stop short of
+//!   storage); reachable only via Platform Admin's `*:*`.
+//! * `alert:write` (`/api/alerts` `POST`/`PUT`/`DELETE`) — granted to Data
+//!   Engineer (`0020`): alert rules are operational tooling over the same
+//!   pipelines/connectors Data Engineer already manages, and it is the
+//!   natural owner of "define a threshold alert on a data pipeline".
+//!
+//! See `migrations/0020_extend_role_grants.sql` for the exact `UPDATE`
+//! statements and `agent_workload_storage_alert_permissions_seed_alignment`
+//! below for the corresponding grant assertions.
 
 use axum::extract::{FromRequestParts, MatchedPath, Request, State};
 use axum::middleware::Next;
@@ -111,9 +149,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/overview/alerts/{id}/resolve",             Policy::RequiresAuth),
 
     // ── Ops: `{kind}` fans out to several logical resources with no single
-    //    seeded permission — auth only (see module doc comment). ─────────
+    //    seeded permission — auth only (see module doc comment). Cancelling
+    //    a workload (kills a real ClickHouse query) requires the seeded
+    //    Data Engineer permission `workload:cancel` (0020). ───────────────
     ("GET",  "/api/ops/{kind}",                    Policy::RequiresAuth),
-    ("POST", "/api/ops/workloads/{id}/cancel",     Policy::RequiresAuth),
+    ("POST", "/api/ops/workloads/{id}/cancel",     Policy::RequiresPermission("workload:cancel")),
 
     // ── Governance: seeded `policy:*` / `lineage:read`. `{kind}` (quality,
     //    classification, audit, residency) has the same fan-out problem as
@@ -124,14 +164,18 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/governance/{kind}",    Policy::RequiresAuth),
     ("POST", "/api/governance/{kind}",    Policy::RequiresAuth),
 
-    // ── Storage: no seeded resource — auth only. ─────────────────────────
+    // ── Storage: no seeded resource — auth only. Restore (destructive)
+    //    requires `storage:restore`, deliberately Platform-Admin-only —
+    //    see module doc comment. ───────────────────────────────────────
     ("GET",  "/api/storage",             Policy::RequiresAuth),
     ("GET",  "/api/storage/policies",    Policy::RequiresAuth),
     ("POST", "/api/storage/policies",    Policy::RequiresAuth),
     ("GET",  "/api/storage/operations",  Policy::RequiresAuth),
-    ("POST", "/api/storage/restore",     Policy::RequiresAuth),
+    ("POST", "/api/storage/restore",     Policy::RequiresPermission("storage:restore")),
 
-    // ── Alerts (CRUD + run trigger): no seeded resource — auth only. Note
+    // ── Alerts (CRUD + run trigger): reads have no seeded resource — auth
+    //    only. Rule CRUD (fires real webhooks/emails) requires the seeded
+    //    Data Engineer permission `alert:write` (0020). Note
     //    `/api/alerts/run` ALSO still runs its own, stricter
     //    `routes::alerts::check_run_token` guard inside the handler (D4):
     //    with `ALERTS_RUN_TOKEN` set, a matching token is required as
@@ -139,9 +183,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    allowed through, not merely `RequiresAuth`'s "any authenticated
     //    principal" — this table entry is a floor, not the whole guard. ──
     ("GET",    "/api/alerts",      Policy::RequiresAuth),
-    ("POST",   "/api/alerts",      Policy::RequiresAuth),
-    ("PUT",    "/api/alerts",      Policy::RequiresAuth),
-    ("DELETE", "/api/alerts",      Policy::RequiresAuth),
+    ("POST",   "/api/alerts",      Policy::RequiresPermission("alert:write")),
+    ("PUT",    "/api/alerts",      Policy::RequiresPermission("alert:write")),
+    ("DELETE", "/api/alerts",      Policy::RequiresPermission("alert:write")),
     ("GET",    "/api/alerts/run",  Policy::RequiresAuth),
     ("POST",   "/api/alerts/run",  Policy::RequiresAuth),
 
@@ -223,15 +267,17 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
 
     // ── Agents (digital employees / workflows / tools / runs): no seeded
     //    resource for most of this domain — auth only. `approvals` maps to
-    //    the seeded Approver permission `agent:approve`. ──────────────────
+    //    the seeded Approver permission `agent:approve`. Employee lifecycle
+    //    control (suspend/resume/revoke) requires `agent:manage`,
+    //    deliberately Platform-Admin-only — see module doc comment. ──────
     ("GET",  "/api/agents/workflows",                Policy::RequiresAuth),
     ("POST", "/api/agents/workflows",                Policy::RequiresAuth),
     ("GET",  "/api/agents/employees",                Policy::RequiresAuth),
     ("POST", "/api/agents/employees",                Policy::RequiresAuth),
     ("GET",  "/api/agents/employees/{id}",           Policy::RequiresAuth),
-    ("POST", "/api/agents/employees/{id}/suspend",   Policy::RequiresAuth),
-    ("POST", "/api/agents/employees/{id}/resume",    Policy::RequiresAuth),
-    ("POST", "/api/agents/employees/{id}/revoke",    Policy::RequiresAuth),
+    ("POST", "/api/agents/employees/{id}/suspend",   Policy::RequiresPermission("agent:manage")),
+    ("POST", "/api/agents/employees/{id}/resume",    Policy::RequiresPermission("agent:manage")),
+    ("POST", "/api/agents/employees/{id}/revoke",    Policy::RequiresPermission("agent:manage")),
     ("GET",  "/api/agents/tools",                    Policy::RequiresAuth),
     ("POST", "/api/agents/tools",                    Policy::RequiresAuth),
     ("GET",  "/api/agents/runs",                     Policy::RequiresAuth),
@@ -427,6 +473,172 @@ mod tests {
             platform_admin.has(required),
             "a Platform Admin (*:*) must be allowed through POST /api/identity/roles"
         );
+    }
+
+    /// Shared shape for the four new-in-this-task route groups: a
+    /// `PermissionSet` WITHOUT the route's required permission must be
+    /// denied (this is exactly `auth_gate`'s 403 branch —
+    /// `!principal.has(permission)`), and the intended role's
+    /// `PermissionSet` must be allowed. Mirrors
+    /// `analyst_is_denied_identity_write_platform_admin_is_allowed` above.
+    fn assert_denied_then_allowed(
+        method: &str,
+        path: &str,
+        denied: &lakehouse_auth::PermissionSet,
+        denied_label: &str,
+        allowed: &lakehouse_auth::PermissionSet,
+        allowed_label: &str,
+    ) {
+        let Some(Policy::RequiresPermission(required)) = policy_for(method, path) else {
+            panic!("{method} {path} must require a permission");
+        };
+        assert!(
+            !denied.has(required),
+            "{denied_label} must be denied (403) {method} {path}, required {required}"
+        );
+        assert!(
+            allowed.has(required),
+            "{allowed_label} must be allowed through {method} {path}, required {required}"
+        );
+    }
+
+    /// #1: digital-employee lifecycle control (`agent:manage`) is
+    /// deliberately Platform-Admin-only — an Analyst (and even Approver,
+    /// whose `agent:approve` is a narrower per-decision grant) must be
+    /// denied; only `*:*` gets through.
+    #[test]
+    fn agent_lifecycle_routes_deny_analyst_and_approver_allow_platform_admin() {
+        use lakehouse_auth::PermissionSet;
+
+        for path in [
+            "/api/agents/employees/{id}/suspend",
+            "/api/agents/employees/{id}/resume",
+            "/api/agents/employees/{id}/revoke",
+        ] {
+            assert_denied_then_allowed(
+                "POST",
+                path,
+                &PermissionSet::parse("query:read, catalog:read, lineage:read"),
+                "an Analyst",
+                &PermissionSet::parse("*:*"),
+                "a Platform Admin (*:*)",
+            );
+            assert_denied_then_allowed(
+                "POST",
+                path,
+                &PermissionSet::parse("agent:approve, policy:review"),
+                "an Approver (agent:approve only)",
+                &PermissionSet::parse("*:*"),
+                "a Platform Admin (*:*)",
+            );
+        }
+    }
+
+    /// #2: cancelling a workload (`workload:cancel`) is granted to Data
+    /// Engineer (0020) — an Analyst must be denied, Data Engineer allowed.
+    #[test]
+    fn workload_cancel_denies_analyst_allows_data_engineer() {
+        use lakehouse_auth::PermissionSet;
+
+        assert_denied_then_allowed(
+            "POST",
+            "/api/ops/workloads/{id}/cancel",
+            &PermissionSet::parse("query:read, catalog:read, lineage:read"),
+            "an Analyst",
+            &PermissionSet::parse("pipeline:*, catalog:write, connector:manage, workload:cancel"),
+            "a Data Engineer",
+        );
+    }
+
+    /// #3: storage restore (`storage:restore`) is deliberately
+    /// Platform-Admin-only — Data Engineer, despite operating pipelines and
+    /// connectors, must still be denied; only `*:*` gets through.
+    #[test]
+    fn storage_restore_denies_data_engineer_allows_platform_admin() {
+        use lakehouse_auth::PermissionSet;
+
+        assert_denied_then_allowed(
+            "POST",
+            "/api/storage/restore",
+            &PermissionSet::parse("pipeline:*, catalog:write, connector:manage"),
+            "a Data Engineer",
+            &PermissionSet::parse("*:*"),
+            "a Platform Admin (*:*)",
+        );
+    }
+
+    /// #4: alert rule CRUD (`alert:write`) is granted to Data Engineer
+    /// (0020) — an Analyst must be denied on all three mutating methods,
+    /// Data Engineer allowed.
+    #[test]
+    fn alert_crud_denies_analyst_allows_data_engineer() {
+        use lakehouse_auth::PermissionSet;
+
+        for method in ["POST", "PUT", "DELETE"] {
+            assert_denied_then_allowed(
+                method,
+                "/api/alerts",
+                &PermissionSet::parse("query:read, catalog:read, lineage:read"),
+                "an Analyst",
+                &PermissionSet::parse("pipeline:*, catalog:write, connector:manage, alert:write"),
+                "a Data Engineer",
+            );
+        }
+    }
+
+    /// Proves `0020_extend_role_grants.sql`'s intent at the `PermissionSet`
+    /// level (mirrors `identity_permissions_require_no_seed_change` above):
+    /// `agent:manage` and `storage:restore` are satisfied by NO non-admin
+    /// seeded role (deliberately Platform-Admin-only), while
+    /// `workload:cancel` and `alert:write` are satisfied by Data Engineer
+    /// specifically (once the roles it's granted are read post-migration)
+    /// and by no other non-admin role.
+    #[test]
+    fn agent_workload_storage_alert_permissions_seed_alignment() {
+        use lakehouse_auth::PermissionSet;
+
+        let non_admin_roles = [
+            ("Analyst", "query:read, catalog:read, lineage:read"),
+            ("Approver", "agent:approve, policy:review"),
+            ("Governance Admin", "policy:*, residency:*, audit:read"),
+            ("Data Scientist", "query:read, feature:write, notebook:run"),
+            ("Dashboard Viewer", "dashboard:read"),
+        ];
+        for (name, raw) in non_admin_roles {
+            let set = PermissionSet::parse(raw);
+            assert!(
+                !set.has("agent:manage"),
+                "{name} unexpectedly grants agent:manage"
+            );
+            assert!(
+                !set.has("workload:cancel"),
+                "{name} unexpectedly grants workload:cancel"
+            );
+            assert!(
+                !set.has("storage:restore"),
+                "{name} unexpectedly grants storage:restore"
+            );
+            assert!(
+                !set.has("alert:write"),
+                "{name} unexpectedly grants alert:write"
+            );
+        }
+
+        // Data Engineer, post-0020: gains workload:cancel and alert:write,
+        // but never the two deliberately admin-only tokens.
+        let data_engineer = PermissionSet::parse(
+            "pipeline:*, catalog:write, connector:manage, workload:cancel, alert:write",
+        );
+        assert!(data_engineer.has("workload:cancel"));
+        assert!(data_engineer.has("alert:write"));
+        assert!(!data_engineer.has("agent:manage"));
+        assert!(!data_engineer.has("storage:restore"));
+
+        let platform_admin = PermissionSet::parse("*:*");
+        assert!(platform_admin.has("agent:manage"));
+        assert!(platform_admin.has("workload:cancel"));
+        assert!(platform_admin.has("storage:restore"));
+        assert!(platform_admin.has("alert:write"));
     }
 
     #[test]
