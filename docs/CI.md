@@ -34,17 +34,18 @@ regressions that the day-to-day toolchain wouldn't.
 
 ## `history-scan`: currently RED, and correctly so
 
-A Phase 1 audit found a real internal LLM API key (`sk-node-…` prefix) leaked
-in git history, on 2 commits reachable from both `main` and
-`feat/rust-backend`, together with internal LAN hosts
-(`192.168.18.187`, `192.168.18.197`).
+A Phase 1 audit found a real internal LLM API key leaked in git history, on 2 commits
+reachable from both `main` and `feat/rust-backend`, together with two
+internal LAN hostnames. The exact values are deliberately not reproduced
+here — see the rule definitions in `.gitleaks.toml`.
 
 **gitleaks' default ruleset does not match either pattern.** Scanned with
 defaults, `history-scan` came back green — a false negative. That is worse
 than no scan at all: it tells a reviewer history is clean when it is not.
 
 `.gitleaks.toml` therefore adds two custom rules (`rantai-llm-node-api-key`,
-`rantai-internal-lan-host`). With them, the scan reports the truth:
+`rantai-internal-lan-host`) matching the key prefix and host range. With
+them, the scan reports the truth:
 
 ```
 $ gitleaks detect --config .gitleaks.toml
