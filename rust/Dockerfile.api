@@ -1,0 +1,33 @@
+# Compose-referenced build for lakehouse-api.
+#
+# This is a NEW file, not an edit to `rust/Dockerfile` (which has an
+# in-progress, uncommitted fix by another author — see
+# docs/OPERATIONS.md for why the two are kept separate for now).
+#
+# Base image pin: `rust:1.85-slim` (the version in the committed
+# `rust/Dockerfile`) cannot build this workspace — `Cargo.lock` pulls in
+# `time@0.3.55`, which requires rustc >= 1.88. Rather than guessing the
+# minimum that happens to satisfy today's lockfile, this pins the exact
+# toolchain the workspace already commits to in `rust-toolchain.toml`
+# (`channel = "1.96.1"`), so the Docker build and local dev/CI builds are
+# guaranteed to use the same compiler.
+FROM rust:1.96.1-slim AS builder
+WORKDIR /build
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config && rm -rf /var/lib/apt/lists/*
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+# `sqlx::migrate!("../../migrations")` (lakehouse-store/src/lib.rs) embeds
+# the migration SQL into the binary at *compile* time, so the directory
+# must exist in the build context before `cargo build` runs, or the build
+# fails outright.
+COPY migrations ./migrations
+RUN cargo build --release --locked -p lakehouse-api
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/lakehouse-api /usr/local/bin/lakehouse-api
+# Not required at runtime (the migrations are already embedded in the
+# binary above), but copied in anyway for parity/debuggability.
+COPY migrations ./migrations
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/lakehouse-api"]

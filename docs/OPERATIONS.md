@@ -4,46 +4,32 @@ This document covers running the backend stack locally with `docker
 compose`, backing up/restoring Postgres, and the operational traps in this
 codebase worth knowing about before you run it against real data.
 
-## KNOWN BLOCKER: `feat/rust-backend` does not currently build from a clean clone
+## Dockerfile note: `rust/Dockerfile.api` vs `rust/Dockerfile`
 
-At the time this document was written, `docker compose up --build` (and
-`cargo build -p lakehouse-api` generally) fails on a genuinely clean clone
-of this branch, for two independent, pre-existing reasons — neither
-introduced by this change, and neither is this document's compose/env/
-script work at fault:
+`docker-compose.yml` builds `lakehouse-api` from **`rust/Dockerfile.api`**,
+not `rust/Dockerfile`. This is deliberate, and temporary.
 
-1. **`rust/Dockerfile` pins `rust:1.85-slim`, but `Cargo.lock` requires
-   1.88.** `time@0.3.55` (a transitive dependency) needs rustc 1.88;
-   building with 1.85 fails immediately with `error: rustc 1.85.1 is not
-   supported by the following packages`. The committed Dockerfile also
-   doesn't `COPY migrations ./migrations`, which `lakehouse-store`'s
-   `sqlx::migrate!("../../migrations")` needs at compile time.
-2. **`crates/lakehouse-api/src/lib.rs` declares `pub mod tenant;`
-   (added in commit `4c3c663`), but `tenant.rs` itself was never
-   committed** — it only exists as an untracked file in whoever's
-   working tree added it. A clean clone hits `error[E0583]: file not
-   found for module 'tenant'` and the build stops there.
+The committed `rust/Dockerfile` pinned `rust:1.85-slim` and never copied
+`rust/migrations/` into the build context, which broke a clean-clone build
+two ways: `Cargo.lock` requires a toolchain new enough for `time@0.3.55`
+(rustc >= 1.88 — see the `rust-toolchain.toml` `channel = "1.96.1"` pin,
+which is what the workspace actually builds with), and `sqlx::migrate!
+("../../migrations")` in `lakehouse-store/src/lib.rs` embeds the
+migrations directory at *compile* time, so it must exist in the build
+context or `cargo build` fails outright.
 
-Both fixes already exist, uncommitted, in this repo's working tree as of
-this writing (a corrected `rust/Dockerfile` pinning 1.88 and adding the
-migrations `COPY`, and the untracked `tenant.rs` itself) — they belong to
-another in-progress change and were explicitly out of scope to touch or
-commit here. This was verified directly: building the committed
-`rust/Dockerfile` against a fresh clone reproduces failure (1) verbatim;
-temporarily substituting the working tree's corrected Dockerfile
-reproduces failure (2) verbatim; the two together are consistent with "the
-working tree's uncommitted fixes are exactly what's missing."
+`rust/Dockerfile.api` is a new file that fixes both: it pins
+`rust:1.96.1-slim` to match `rust-toolchain.toml`, and adds `COPY
+migrations ./migrations` before the build step.
 
-**Practical takeaway:** everything in this document (docker-compose.yml,
-.env.example, the backup/restore scripts) is correct and was verified
-against real, running containers — Postgres and a standalone ClickHouse
-were both exercised directly. The one piece that could NOT be verified
-end-to-end in this pass is `lakehouse-api` actually running inside
-`docker compose up`, because the image doesn't build yet on a clean
-checkout of this branch. Once the two fixes above land (commit
-`rust/Dockerfile`'s version bump + migrations COPY, and commit
-`tenant.rs`), `docker compose up --build` should be re-verified against a
-fresh clone before this blocker note is removed.
+Separately, `rust/Dockerfile` itself has **in-progress, uncommitted edits
+by another author** that fix this same problem a different way. That file
+was intentionally left untouched here rather than edited, to avoid
+entangling two authors' changes in one file. **Once that author's fix
+lands as a commit, `rust/Dockerfile.api` and `rust/Dockerfile` should be
+converged into one file** (most likely: delete `Dockerfile.api` and point
+compose back at `Dockerfile`) rather than maintained in parallel
+indefinitely.
 
 ## Local stack: what's in `docker-compose.yml`
 
