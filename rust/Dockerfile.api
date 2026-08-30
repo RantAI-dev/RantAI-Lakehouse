@@ -13,7 +13,7 @@
 # guaranteed to use the same compiler.
 FROM rust:1.96.1-slim AS builder
 WORKDIR /build
-RUN apt-get update && apt-get install -y --no-install-recommends pkg-config && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 # `sqlx::migrate!("../../migrations")` (lakehouse-store/src/lib.rs) embeds
@@ -22,12 +22,19 @@ COPY crates ./crates
 # fails outright.
 COPY migrations ./migrations
 RUN cargo build --release --locked -p lakehouse-api
+# `sqlx-cli`, pinned to the same version as the workspace's `sqlx`
+# dependency, for the migration step in entrypoint.api.sh — see that
+# file's doc comment for why the API binary itself doesn't run
+# migrations at boot.
+RUN cargo install sqlx-cli --version 0.8.6 --no-default-features --features rustls,postgres --locked
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
 COPY --from=builder /build/target/release/lakehouse-api /usr/local/bin/lakehouse-api
-# Not required at runtime (the migrations are already embedded in the
-# binary above), but copied in anyway for parity/debuggability.
+COPY --from=builder /usr/local/cargo/bin/sqlx /usr/local/bin/sqlx
 COPY migrations ./migrations
+COPY entrypoint.api.sh /usr/local/bin/entrypoint.api.sh
+RUN chmod +x /usr/local/bin/entrypoint.api.sh
 EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/lakehouse-api"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.api.sh"]
