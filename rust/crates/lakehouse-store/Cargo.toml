@@ -17,6 +17,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 tokio = { workspace = true }
+lakehouse-test-support = { path = "../lakehouse-test-support" }
 
 [lints]
 workspace = true

@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "lakehouse_api"
+path = "src/lib.rs"
+
 [[bin]]
 name = "lakehouse-api"
 path = "src/main.rs"
@@ -39,6 +43,8 @@ uuid = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
 sqlx = { workspace = true }
+uuid = { workspace = true }
+lakehouse-test-support = { path = "../lakehouse-test-support" }
 
 [lints]
 workspace = true

@@ -1,18 +1,23 @@
 //! Integration tests for `lakehouse_store::connectors` against a real
 //! Postgres.
 //!
-//! # Why every test here is `#[ignore]`d
+//! # Postgres backing
 //!
-//! Same reason as `tests/identity.rs`: `#[sqlx::test]` needs a live
-//! Postgres reachable via `DATABASE_URL`. Run explicitly with:
-//!
-//! ```sh
-//! docker compose up -d postgres
-//! DATABASE_URL=postgres://lakehouse:lakehouse@localhost:5432/lakehouse \
-//!   cargo test -p lakehouse-store -- --ignored
-//! ```
+//! These are `#[sqlx::test(migrations = "../../migrations")]` tests: each
+//! one gets a freshly migrated, isolated database. The Postgres *server*
+//! itself is started once per test binary by the `lakehouse-test-support`
+//! dev-dependency, which spins up a `testcontainers`-managed Postgres and
+//! points `DATABASE_URL` at it before any test runs — no manual
+//! `docker compose up`, no external database required. Docker must be
+//! reachable from the environment running `cargo test`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+// Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+// testcontainer bootstrap actually runs for this test binary (an
+// unreferenced dev-dependency's rlib member can otherwise be dropped
+// by the linker before its ctor section is ever considered).
+use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
 use lakehouse_store::connectors::{
@@ -23,7 +28,6 @@ use sqlx::PgPool;
 
 /// The seed lands the full `mock/connectors.ts` fixture set.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn seed_populates_connector_list(pool: PgPool) -> sqlx::Result<()> {
     let connectors = list_connectors(&pool).await.unwrap();
     assert_eq!(connectors.len(), 28);
@@ -34,7 +38,6 @@ async fn seed_populates_connector_list(pool: PgPool) -> sqlx::Result<()> {
 /// The whole point of this domain: no read path can round-trip a `host` or
 /// `secretRef` back to a caller, no matter how the row was created.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn created_connector_never_carries_host_or_secret_ref_on_the_wire(
     pool: PgPool,
 ) -> sqlx::Result<()> {
@@ -76,7 +79,6 @@ async fn created_connector_never_carries_host_or_secret_ref_on_the_wire(
 /// A duplicate name is a 409, matching `pipeline_definition_name_unique`'s
 /// treatment.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn create_connector_rejects_duplicate_name(pool: PgPool) -> sqlx::Result<()> {
     let input = CreateConnectorInput {
         name: "order management system (CDC)".to_owned(), // seeded name
@@ -99,7 +101,6 @@ async fn create_connector_rejects_duplicate_name(pool: PgPool) -> sqlx::Result<(
 /// `pipeline_definition.connector_id`, live — not from a stored/denormalized
 /// column.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn dependent_pipelines_are_derived_from_pipeline_definition(
     pool: PgPool,
 ) -> sqlx::Result<()> {
@@ -156,7 +157,6 @@ async fn dependent_pipelines_are_derived_from_pipeline_definition(
 /// `test_connection` reports `ok` from the connector's stored `health`, and
 /// stamps `lastTestAt` forward.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn test_connection_reflects_stored_health_and_stamps_last_test_at(
     pool: PgPool,
 ) -> sqlx::Result<()> {
@@ -177,7 +177,6 @@ async fn test_connection_reflects_stored_health_and_stamps_last_test_at(
 /// Testing a connector that doesn't exist is a `NotFound`, not a panic or a
 /// silently-empty success.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn test_connection_not_found_for_unknown_id(pool: PgPool) -> sqlx::Result<()> {
     let err = test_connection(&pool, "conn-does-not-exist")
         .await
@@ -188,7 +187,6 @@ async fn test_connection_not_found_for_unknown_id(pool: PgPool) -> sqlx::Result<
 
 /// Fetching an unknown connector's detail returns `None`, not an error.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn get_connector_none_for_unknown_id(pool: PgPool) -> sqlx::Result<()> {
     let detail = get_connector(&pool, "conn-does-not-exist").await.unwrap();
     assert!(detail.is_none());

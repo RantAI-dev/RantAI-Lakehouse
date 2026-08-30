@@ -1,23 +1,26 @@
 //! Integration tests for `lakehouse_store::governance` against a real
 //! Postgres.
 //!
-//! # Why every test here is `#[ignore]`d
+//! # Postgres backing
 //!
-//! Same reason as `tests/identity.rs`/`tests/schema.rs`: `#[sqlx::test]`
-//! needs a live Postgres reachable via `DATABASE_URL`, and
-//! `cargo test --workspace --locked` must stay green on a machine that has
-//! none. Run them explicitly with:
-//!
-//! ```sh
-//! docker compose up -d postgres
-//! DATABASE_URL=postgres://lakehouse:lakehouse@localhost:5432/lakehouse \
-//!   cargo test -p lakehouse-store -- --ignored
-//! ```
+//! These are `#[sqlx::test(migrations = "../../migrations")]` tests: each
+//! one gets a freshly migrated, isolated database. The Postgres *server*
+//! itself is started once per test binary by the `lakehouse-test-support`
+//! dev-dependency, which spins up a `testcontainers`-managed Postgres and
+//! points `DATABASE_URL` at it before any test runs — no manual
+//! `docker compose up`, no external database required. Docker must be
+//! reachable from the environment running `cargo test`.
 //!
 //! Every test below provisions a database with all migrations applied, so
 //! the `0003_governance` seed fixtures are present.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+// Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+// testcontainer bootstrap actually runs for this test binary (an
+// unreferenced dev-dependency's rlib member can otherwise be dropped
+// by the linker before its ctor section is ever considered).
+use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
 use lakehouse_store::governance::{
@@ -31,7 +34,6 @@ use sqlx::PgPool;
 /// The seed lands the two `mock/governance.ts` policy fixtures, in fixture
 /// order.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn seed_populates_policies(pool: PgPool) -> sqlx::Result<()> {
     let policies = list_policies(&pool).await.unwrap();
     assert_eq!(policies.len(), 2);
@@ -44,7 +46,6 @@ async fn seed_populates_policies(pool: PgPool) -> sqlx::Result<()> {
 /// `owner` falls back to `"Current user"` — the exact defaults
 /// `mock/governance.ts`'s `createPolicy` used.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn create_policy_applies_mock_defaults(pool: PgPool) -> sqlx::Result<()> {
     let draft = create_policy(
         &pool,
@@ -88,7 +89,6 @@ async fn create_policy_applies_mock_defaults(pool: PgPool) -> sqlx::Result<()> {
 /// Policy names are unique, matching `mock/governance.ts`'s fixture set
 /// (every name distinct).
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn duplicate_policy_name_is_a_conflict(pool: PgPool) -> sqlx::Result<()> {
     let err = create_policy(
         &pool,
@@ -112,7 +112,6 @@ async fn duplicate_policy_name_is_a_conflict(pool: PgPool) -> sqlx::Result<()> {
 /// A freshly authored quality rule starts `"warning"`/`now()`, matching
 /// `mock/governance.ts`'s `createQualityRule` — it hasn't been run yet.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn create_quality_rule_starts_warning(pool: PgPool) -> sqlx::Result<()> {
     let rule = create_quality_rule(
         &pool,
@@ -136,7 +135,6 @@ async fn create_quality_rule_starts_warning(pool: PgPool) -> sqlx::Result<()> {
 /// `createClassificationRule`. Optional fields round-trip when present and
 /// absent alike.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn create_classification_rule_starts_needs_review(pool: PgPool) -> sqlx::Result<()> {
     let with_column = create_classification_rule(
         &pool,
@@ -172,7 +170,6 @@ async fn create_classification_rule_starts_needs_review(pool: PgPool) -> sqlx::R
 /// A freshly authored residency rule starts `violations7d: 0`, matching
 /// `mock/governance.ts`'s `createResidencyRule`.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn create_residency_rule_starts_zero_violations(pool: PgPool) -> sqlx::Result<()> {
     let rule = create_residency_rule(
         &pool,
@@ -197,7 +194,6 @@ async fn create_residency_rule_starts_zero_violations(pool: PgPool) -> sqlx::Res
 /// comment on `lakehouse_store::governance` and
 /// `routes::governance::quality`).
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn list_quality_rules_surfaces_an_authored_rule(pool: PgPool) -> sqlx::Result<()> {
     let before = list_quality_rules(&pool).await.unwrap().len();
     create_quality_rule(
@@ -220,7 +216,6 @@ async fn list_quality_rules_surfaces_an_authored_rule(pool: PgPool) -> sqlx::Res
 
 /// Same fix, classification side.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn list_classification_rules_surfaces_an_authored_rule(pool: PgPool) -> sqlx::Result<()> {
     let before = list_classification_rules(&pool).await.unwrap().len();
     create_classification_rule(
@@ -242,7 +237,6 @@ async fn list_classification_rules_surfaces_an_authored_rule(pool: PgPool) -> sq
 
 /// Same fix, residency side.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn list_residency_rules_surfaces_an_authored_rule(pool: PgPool) -> sqlx::Result<()> {
     let before = list_residency_rules(&pool).await.unwrap().len();
     create_residency_rule(
@@ -266,7 +260,6 @@ async fn list_residency_rules_surfaces_an_authored_rule(pool: PgPool) -> sqlx::R
 /// The `0003_governance` seed is safe to apply twice, same convention as
 /// `tests/identity.rs`'s `seed_is_idempotent_when_applied_twice`.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn seed_is_idempotent_when_applied_twice(pool: PgPool) -> sqlx::Result<()> {
     let seed = include_str!("../../../migrations/0004_seed_governance.sql");
     sqlx::raw_sql(seed).execute(&pool).await?;

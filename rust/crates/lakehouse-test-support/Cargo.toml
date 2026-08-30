@@ -1,0 +1,23 @@
+[package]
+name = "lakehouse-test-support"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# NOTE: this crate is test-only infrastructure. It is intentionally a
+# normal (non-dev) dependency of the crates that use it, because the
+# `#[ctor]` startup hook must be linked into the final test binary; a
+# `[dev-dependencies]`-only crate is linked too, but keeping this crate
+# entirely free of any non-test code keeps the intent obvious.
+
+[dependencies]
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+ctor = "0.2"
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

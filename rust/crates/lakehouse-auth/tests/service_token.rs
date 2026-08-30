@@ -1,15 +1,23 @@
 //! Integration tests for `lakehouse_auth::service_token` against a real
 //! Postgres.
 //!
-//! Same `#[ignore]` rationale as `tests/repository.rs`. Run with:
+//! # Postgres backing
 //!
-//! ```sh
-//! docker compose up -d postgres
-//! DATABASE_URL=postgres://lakehouse:lakehouse@localhost:5432/lakehouse \
-//!   cargo test -p lakehouse-auth -- --ignored
-//! ```
+//! These are `#[sqlx::test(migrations = "../../migrations")]` tests: each
+//! one gets a freshly migrated, isolated database. The Postgres *server*
+//! itself is started once per test binary by the `lakehouse-test-support`
+//! dev-dependency, which spins up a `testcontainers`-managed Postgres and
+//! points `DATABASE_URL` at it before any test runs — no manual
+//! `docker compose up`, no external database required. Docker must be
+//! reachable from the environment running `cargo test`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+// Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+// testcontainer bootstrap actually runs for this test binary (an
+// unreferenced dev-dependency's rlib member can otherwise be dropped
+// by the linker before its ctor section is ever considered).
+use lakehouse_test_support as _;
 
 use lakehouse_auth::AuthError;
 use lakehouse_auth::principal::PrincipalId;
@@ -26,7 +34,6 @@ const BI_DASHBOARD_READER: &str = "44444444-4444-4444-8444-000000000001";
 const EXPIRED_IDENTITY: &str = "44444444-4444-4444-8444-000000000006";
 
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn a_freshly_issued_token_verifies_with_the_identitys_scopes_as_permissions(
     pool: PgPool,
 ) -> sqlx::Result<()> {
@@ -44,7 +51,6 @@ async fn a_freshly_issued_token_verifies_with_the_identitys_scopes_as_permission
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn a_revoked_service_token_is_rejected(pool: PgPool) -> sqlx::Result<()> {
     let service_id = Uuid::parse_str(BI_DASHBOARD_READER).unwrap();
     let token = create_service_credential(&pool, service_id).await.unwrap();
@@ -59,7 +65,6 @@ async fn a_revoked_service_token_is_rejected(pool: PgPool) -> sqlx::Result<()> {
 /// seeded `price-crawler-agent`) must not verify, even if the credential
 /// row itself was never explicitly revoked.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn a_token_for_an_expired_service_identity_is_rejected(pool: PgPool) -> sqlx::Result<()> {
     let service_id = Uuid::parse_str(EXPIRED_IDENTITY).unwrap();
     let token = create_service_credential(&pool, service_id).await.unwrap();

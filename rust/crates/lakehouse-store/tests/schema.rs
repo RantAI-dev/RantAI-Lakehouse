@@ -1,27 +1,27 @@
 //! Integration tests against a real Postgres, exercising the `0001_init`
 //! migration and the [`StoreError`] classification it feeds.
 //!
-//! # Why every test here is `#[ignore]`d
+//! # Postgres backing
 //!
-//! `#[sqlx::test]` needs a live Postgres reachable via `DATABASE_URL` (it
-//! provisions and tears down an isolated database per test). CI, and any
-//! contributor's machine without `docker compose up -d postgres` running,
-//! has no such thing — and `cargo test --workspace --locked` must stay
-//! green in that environment, exactly as it did before this crate existed.
-//! So every test below is `#[ignore]`d: `cargo test --workspace` skips them
-//! by default, and they are run explicitly, with Postgres up, via:
-//!
-//! ```sh
-//! docker compose up -d postgres
-//! DATABASE_URL=postgres://lakehouse:lakehouse@localhost:5432/lakehouse \
-//!   cargo test -p lakehouse-store -- --ignored
-//! ```
+//! These are `#[sqlx::test(migrations = "../../migrations")]` tests: each
+//! one gets a freshly migrated, isolated database. The Postgres *server*
+//! itself is started once per test binary by the `lakehouse-test-support`
+//! dev-dependency, which spins up a `testcontainers`-managed Postgres and
+//! points `DATABASE_URL` at it before any test runs — no manual
+//! `docker compose up`, no external database required. Docker must be
+//! reachable from the environment running `cargo test`.
 //!
 //! This is a deliberate gap in default `cargo test` coverage, not an
 //! oversight — see the crate's root doc comment for the boot-behavior
 //! reasoning this mirrors.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+// Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+// testcontainer bootstrap actually runs for this test binary (an
+// unreferenced dev-dependency's rlib member can otherwise be dropped
+// by the linker before its ctor section is ever considered).
+use lakehouse_test_support as _;
 
 use lakehouse_core::ApiError;
 use lakehouse_store::StoreError;
@@ -32,7 +32,6 @@ use sqlx::PgPool;
 /// database and fails the test if they don't apply), but this test pins it
 /// down explicitly and independently of any table-specific behavior.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn migrations_apply_cleanly_from_empty(pool: PgPool) -> sqlx::Result<()> {
     let tables: Vec<(String,)> = sqlx::query_as(
         "SELECT table_name FROM information_schema.tables \
@@ -58,7 +57,6 @@ async fn migrations_apply_cleanly_from_empty(pool: PgPool) -> sqlx::Result<()> {
 /// references `app_user`/`tenant` by id, and inserting a row that points at
 /// ids nothing else in the database has ever inserted must fail.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn foreign_key_rejects_orphan_row(pool: PgPool) -> sqlx::Result<()> {
     let result = sqlx::query("INSERT INTO app_user_tenant (user_id, tenant_id) VALUES ($1, $2)")
         .bind(uuid::Uuid::new_v4())
@@ -87,7 +85,6 @@ async fn foreign_key_rejects_orphan_row(pool: PgPool) -> sqlx::Result<()> {
 /// the `0002_seed_identity` migration the test database is not empty, and
 /// the point here is to observe the SECOND insert failing, not the first.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn unique_constraint_rejects_duplicate(pool: PgPool) -> sqlx::Result<()> {
     let insert = "INSERT INTO tenant (name, slug, plan, residency) VALUES ($1, $2, $3, $4)";
     sqlx::query(insert)
@@ -130,7 +127,6 @@ async fn unique_constraint_rejects_duplicate(pool: PgPool) -> sqlx::Result<()> {
 /// `tenant.slug`, so a future edit narrowing any one of them to a
 /// non-unique column is caught here.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn unique_constraints_cover_every_natural_key(pool: PgPool) -> sqlx::Result<()> {
     sqlx::query("INSERT INTO app_user (name, email) VALUES ('Probe', 'probe@example.com')")
         .execute(&pool)
@@ -171,7 +167,6 @@ async fn unique_constraints_cover_every_natural_key(pool: PgPool) -> sqlx::Resul
 /// database boundary, not just by whichever service-layer code happens to
 /// validate it first.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn app_user_status_check_rejects_unknown_value(pool: PgPool) -> sqlx::Result<()> {
     let result = sqlx::query(
         "INSERT INTO app_user (name, email, status) VALUES ('X', 'x@example.com', 'pending')",
@@ -188,7 +183,6 @@ async fn app_user_status_check_rejects_unknown_value(pool: PgPool) -> sqlx::Resu
 /// on the `app_user` side, where deleting the user is what should clean up
 /// its membership rows.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn tenant_delete_is_restricted_while_a_user_belongs_to_it(pool: PgPool) -> sqlx::Result<()> {
     let (tenant_id,): (uuid::Uuid,) = sqlx::query_as(
         "INSERT INTO tenant (name, slug, plan, residency) \

@@ -1,18 +1,23 @@
 //! Integration tests for `lakehouse_store::agents` against a real
 //! Postgres.
 //!
-//! # Why every test here is `#[ignore]`d
+//! # Postgres backing
 //!
-//! Same reason as `tests/connectors.rs`: `#[sqlx::test]` needs a live
-//! Postgres reachable via `DATABASE_URL`. Run explicitly with:
-//!
-//! ```sh
-//! docker compose up -d postgres
-//! DATABASE_URL=postgres://lakehouse:lakehouse@localhost:5432/lakehouse \
-//!   cargo test -p lakehouse-store -- --ignored
-//! ```
+//! These are `#[sqlx::test(migrations = "../../migrations")]` tests: each
+//! one gets a freshly migrated, isolated database. The Postgres *server*
+//! itself is started once per test binary by the `lakehouse-test-support`
+//! dev-dependency, which spins up a `testcontainers`-managed Postgres and
+//! points `DATABASE_URL` at it before any test runs — no manual
+//! `docker compose up`, no external database required. Docker must be
+//! reachable from the environment running `cargo test`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+// Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+// testcontainer bootstrap actually runs for this test binary (an
+// unreferenced dev-dependency's rlib member can otherwise be dropped
+// by the linker before its ctor section is ever considered).
+use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
 use lakehouse_store::agents::{
@@ -23,7 +28,6 @@ use lakehouse_store::agents::{
 use sqlx::PgPool;
 
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn seed_populates_every_agents_list(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(list_workflows(&pool).await.unwrap().len(), 2);
     assert_eq!(list_employees(&pool).await.unwrap().len(), 2);
@@ -34,7 +38,6 @@ async fn seed_populates_every_agents_list(pool: PgPool) -> sqlx::Result<()> {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn list_runs_filters_by_employee(pool: PgPool) -> sqlx::Result<()> {
     let runs = list_runs(&pool, Some("emp-risk")).await.unwrap();
     assert_eq!(runs.len(), 1);
@@ -45,7 +48,6 @@ async fn list_runs_filters_by_employee(pool: PgPool) -> sqlx::Result<()> {
 /// A run's `approvals[]` is derived from `approval_item.run_id`, not
 /// duplicated state — this is the regression test for that join.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn run_embeds_its_approvals(pool: PgPool) -> sqlx::Result<()> {
     let run = get_run(&pool, "run-col-01").await.unwrap().unwrap();
     assert_eq!(run.approvals.len(), 2);
@@ -64,14 +66,12 @@ async fn run_embeds_its_approvals(pool: PgPool) -> sqlx::Result<()> {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn get_employee_none_for_unknown_id(pool: PgPool) -> sqlx::Result<()> {
     assert!(get_employee(&pool, "emp-nope").await.unwrap().is_none());
     Ok(())
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn duplicate_employee_name_is_a_conflict(pool: PgPool) -> sqlx::Result<()> {
     let input = CreateEmployeeInput {
         name: "inventory-copilot".to_owned(),
@@ -90,7 +90,6 @@ async fn duplicate_employee_name_is_a_conflict(pool: PgPool) -> sqlx::Result<()>
 /// Suspend -> resume -> revoke each transition `status` and round-trip
 /// through `get_employee`.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn employee_lifecycle_transitions(pool: PgPool) -> sqlx::Result<()> {
     let suspended = suspend_employee(&pool, "emp-inventory").await.unwrap();
     assert_eq!(suspended.status, "paused");
@@ -102,7 +101,6 @@ async fn employee_lifecycle_transitions(pool: PgPool) -> sqlx::Result<()> {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn suspend_unknown_employee_is_not_found(pool: PgPool) -> sqlx::Result<()> {
     let err = suspend_employee(&pool, "emp-nope").await.unwrap_err();
     assert!(matches!(err, StoreError::NotFound));
@@ -112,7 +110,6 @@ async fn suspend_unknown_employee_is_not_found(pool: PgPool) -> sqlx::Result<()>
 /// The core approval-lifecycle guarantee the task brief calls out: an
 /// already-decided approval cannot be re-decided.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn deciding_an_already_decided_approval_is_a_conflict(pool: PgPool) -> sqlx::Result<()> {
     // ap-02 is seeded already "approved".
     let err = decide_approval(&pool, "ap-02", Decision::Rejected, None)
@@ -123,7 +120,6 @@ async fn deciding_an_already_decided_approval_is_a_conflict(pool: PgPool) -> sql
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn deciding_a_pending_approval_stamps_decided_at_and_status(
     pool: PgPool,
 ) -> sqlx::Result<()> {
@@ -145,7 +141,6 @@ async fn deciding_a_pending_approval_stamps_decided_at_and_status(
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn decide_unknown_approval_is_not_found(pool: PgPool) -> sqlx::Result<()> {
     let err = decide_approval(&pool, "ap-nope", Decision::Approved, None)
         .await

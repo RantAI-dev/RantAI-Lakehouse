@@ -1,18 +1,23 @@
 //! Integration tests for `lakehouse_store::queries` against a real
 //! Postgres.
 //!
-//! # Why every test here is `#[ignore]`d
+//! # Postgres backing
 //!
-//! Same reason as `tests/identity.rs`/`tests/governance.rs`: `#[sqlx::test]`
-//! needs a live Postgres reachable via `DATABASE_URL`. Run explicitly with:
-//!
-//! ```sh
-//! docker compose up -d postgres
-//! DATABASE_URL=postgres://lakehouse:lakehouse@localhost:5432/lakehouse \
-//!   cargo test -p lakehouse-store -- --ignored
-//! ```
+//! These are `#[sqlx::test(migrations = "../../migrations")]` tests: each
+//! one gets a freshly migrated, isolated database. The Postgres *server*
+//! itself is started once per test binary by the `lakehouse-test-support`
+//! dev-dependency, which spins up a `testcontainers`-managed Postgres and
+//! points `DATABASE_URL` at it before any test runs — no manual
+//! `docker compose up`, no external database required. Docker must be
+//! reachable from the environment running `cargo test`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+// Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+// testcontainer bootstrap actually runs for this test binary (an
+// unreferenced dev-dependency's rlib member can otherwise be dropped
+// by the linker before its ctor section is ever considered).
+use lakehouse_test_support as _;
 
 use lakehouse_store::queries::{
     CreateCollaborationProjectInput, RecordHistoryInput, create_collaboration_project,
@@ -22,7 +27,6 @@ use sqlx::PgPool;
 
 /// The seed lands the two `mock/queries.ts` saved-query fixtures.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn seed_populates_saved_queries(pool: PgPool) -> sqlx::Result<()> {
     let saved = list_saved(&pool).await.unwrap();
     assert_eq!(saved.len(), 2);
@@ -34,7 +38,6 @@ async fn seed_populates_saved_queries(pool: PgPool) -> sqlx::Result<()> {
 /// and a create adds a third with `members` set from the collaborator
 /// count.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn seed_and_create_collaboration_projects(pool: PgPool) -> sqlx::Result<()> {
     let seeded = list_collaboration(&pool).await.unwrap();
     assert_eq!(seeded.len(), 2);
@@ -60,7 +63,6 @@ async fn seed_and_create_collaboration_projects(pool: PgPool) -> sqlx::Result<()
 /// `record_history` writes a row `list_history` then returns, most recent
 /// first — the round trip `routes::query::run` depends on.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<()> {
     assert!(list_history(&pool).await.unwrap().is_empty());
 
@@ -98,7 +100,6 @@ async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<(
 /// than a 500 that would (per `routes::query::run`'s contract) still not
 /// surface to the caller, but would spam logs unnecessarily.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn record_history_is_idempotent_per_id(pool: PgPool) -> sqlx::Result<()> {
     let input = RecordHistoryInput {
         id: "q-dup",

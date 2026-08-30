@@ -1,14 +1,22 @@
 //! Integration tests for `lakehouse_auth::session` against a real Postgres.
 //!
-//! Same `#[ignore]` rationale as `tests/repository.rs`. Run with:
+//! # Postgres backing
 //!
-//! ```sh
-//! docker compose up -d postgres
-//! DATABASE_URL=postgres://lakehouse:lakehouse@localhost:5432/lakehouse \
-//!   cargo test -p lakehouse-auth -- --ignored
-//! ```
+//! These are `#[sqlx::test(migrations = "../../migrations")]` tests: each
+//! one gets a freshly migrated, isolated database. The Postgres *server*
+//! itself is started once per test binary by the `lakehouse-test-support`
+//! dev-dependency, which spins up a `testcontainers`-managed Postgres and
+//! points `DATABASE_URL` at it before any test runs — no manual
+//! `docker compose up`, no external database required. Docker must be
+//! reachable from the environment running `cargo test`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+// Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+// testcontainer bootstrap actually runs for this test binary (an
+// unreferenced dev-dependency's rlib member can otherwise be dropped
+// by the linker before its ctor section is ever considered).
+use lakehouse_test_support as _;
 
 use lakehouse_auth::AuthError;
 use lakehouse_auth::session::{
@@ -21,7 +29,6 @@ use uuid::Uuid;
 const RINA: &str = "33333333-3333-4333-8333-000000000001";
 
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn a_freshly_created_session_validates_to_its_owner(pool: PgPool) -> sqlx::Result<()> {
     let rina_id = Uuid::parse_str(RINA).unwrap();
     let token = create_session(
@@ -41,7 +48,6 @@ async fn a_freshly_created_session_validates_to_its_owner(pool: PgPool) -> sqlx:
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn an_expired_session_is_rejected(pool: PgPool) -> sqlx::Result<()> {
     let rina_id = Uuid::parse_str(RINA).unwrap();
     let token = create_session(&pool, rina_id, Duration::seconds(-1), None, None)
@@ -54,7 +60,6 @@ async fn an_expired_session_is_rejected(pool: PgPool) -> sqlx::Result<()> {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn a_revoked_session_is_rejected(pool: PgPool) -> sqlx::Result<()> {
     let rina_id = Uuid::parse_str(RINA).unwrap();
     let token = create_session(&pool, rina_id, Duration::hours(1), None, None)
@@ -71,7 +76,6 @@ async fn a_revoked_session_is_rejected(pool: PgPool) -> sqlx::Result<()> {
 /// Revoking an already-revoked (or never-existed) token is a no-op, not an
 /// error — see `revoke_session`'s doc comment.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn revoking_twice_is_not_an_error(pool: PgPool) -> sqlx::Result<()> {
     let rina_id = Uuid::parse_str(RINA).unwrap();
     let token = create_session(&pool, rina_id, Duration::hours(1), None, None)
@@ -83,7 +87,6 @@ async fn revoking_twice_is_not_an_error(pool: PgPool) -> sqlx::Result<()> {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn revoke_all_sessions_invalidates_every_live_session_for_the_user(
     pool: PgPool,
 ) -> sqlx::Result<()> {
@@ -105,7 +108,6 @@ async fn revoke_all_sessions_invalidates_every_live_session_for_the_user(
 /// A random guessed token (never issued) is rejected exactly like an
 /// expired/revoked one — no distinguishing error.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn an_unknown_token_is_rejected(pool: PgPool) -> sqlx::Result<()> {
     let err = validate_session(&pool, &lakehouse_auth::Secret::new("not-a-real-token"))
         .await

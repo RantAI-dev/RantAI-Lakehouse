@@ -124,6 +124,6 @@ mod tests {
 
     // Migration-application correctness (`migrate` against a real,
     // freshly-provisioned database) is covered by the `#[sqlx::test]`s in
-    // `tests/schema.rs`, which are `#[ignore]`d by default — see that
-    // file's module doc comment for why, and how to run them.
+    // `tests/schema.rs`, which run against the `lakehouse-test-support`
+    // testcontainers Postgres — see that file's module doc comment.
 }

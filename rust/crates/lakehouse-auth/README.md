@@ -209,9 +209,9 @@ Every one of these is tested against a locally generated RSA keypair and a
 See that file's module doc comment for exactly which failure modes are
 tested (wrong `iss`, wrong `aud`, expired, `nbf` in the future, `alg: none`,
 a signature from the wrong key, an unknown `kid`, a missing `kid`) and which
-tests need a live Postgres (identity resolution, JIT, role mapping — run
-with `cargo test -p lakehouse-auth -- --ignored`, per that file's doc
-comment).
+tests need Postgres (identity resolution, JIT, role mapping — these run
+against the `lakehouse-test-support` testcontainers-managed Postgres, no
+manual setup required; see that file's doc comment).
 
 ## Disambiguating a service token from an `OIDC` token
 

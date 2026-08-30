@@ -1,18 +1,15 @@
 //! Integration tests for `lakehouse_store::identity` against a real
 //! Postgres.
 //!
-//! # Why every test here is `#[ignore]`d
+//! # Postgres backing
 //!
-//! Same reason as `tests/schema.rs`: `#[sqlx::test]` needs a live Postgres
-//! reachable via `DATABASE_URL` (it provisions and tears down an isolated
-//! database per test), and `cargo test --workspace --locked` must stay
-//! green on a machine that has none. Run them explicitly with:
-//!
-//! ```sh
-//! docker compose up -d postgres
-//! DATABASE_URL=postgres://lakehouse:lakehouse@localhost:5432/lakehouse \
-//!   cargo test -p lakehouse-store -- --ignored
-//! ```
+//! These are `#[sqlx::test(migrations = "../../migrations")]` tests: each
+//! one gets a freshly migrated, isolated database. The Postgres *server*
+//! itself is started once per test binary by the `lakehouse-test-support`
+//! dev-dependency, which spins up a `testcontainers`-managed Postgres and
+//! points `DATABASE_URL` at it before any test runs — no manual
+//! `docker compose up`, no external database required. Docker must be
+//! reachable from the environment running `cargo test`.
 //!
 //! Every test below provisions a database with BOTH migrations applied, so
 //! the `0002_seed_identity` fixtures are present — which is the point: the
@@ -20,6 +17,12 @@
 //! asserting against rather than hand-rolling fixtures per test.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+// Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+// testcontainer bootstrap actually runs for this test binary (an
+// unreferenced dev-dependency's rlib member can otherwise be dropped
+// by the linker before its ctor section is ever considered).
+use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
 use lakehouse_store::identity::{
@@ -34,7 +37,6 @@ use sqlx::PgPool;
 /// return it in the fixture's own order (newest `created_at` first, which
 /// the staggered seed timestamps reproduce).
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn seed_populates_every_identity_list(pool: PgPool) -> sqlx::Result<()> {
     let users = list_users(&pool, &UserFilter::default()).await.unwrap();
     assert_eq!(users.len(), 12);
@@ -58,7 +60,6 @@ async fn seed_populates_every_identity_list(pool: PgPool) -> sqlx::Result<()> {
 /// and must move when a membership does. This is the test that would fail
 /// if someone "optimized" either into a denormalized column.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn counts_are_derived_from_the_join_tables(pool: PgPool) -> sqlx::Result<()> {
     let tenants = list_tenants(&pool, &TenantFilter::default()).await.unwrap();
     let group = tenants
@@ -112,7 +113,6 @@ async fn counts_are_derived_from_the_join_tables(pool: PgPool) -> sqlx::Result<(
 /// created user comes back with those names populated — the round trip the
 /// console's invite dialog depends on.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn create_user_links_roles_and_tenants_by_name(pool: PgPool) -> sqlx::Result<()> {
     let user = create_user(
         &pool,
@@ -145,7 +145,6 @@ async fn create_user_links_roles_and_tenants_by_name(pool: PgPool) -> sqlx::Resu
 /// 400-mapped [`StoreError::ForeignKeyViolation`], with the whole invite
 /// rolled back rather than a half-created user left behind.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn create_user_rejects_an_unknown_role_and_rolls_back(pool: PgPool) -> sqlx::Result<()> {
     let err = create_user(
         &pool,
@@ -175,7 +174,6 @@ async fn create_user_rejects_an_unknown_role_and_rolls_back(pool: PgPool) -> sql
 /// `StoreError` mapping exists for, exercised through the repository rather
 /// than through raw SQL.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn duplicate_natural_keys_are_conflicts(pool: PgPool) -> sqlx::Result<()> {
     let dup_email = create_user(
         &pool,
@@ -235,7 +233,6 @@ async fn duplicate_natural_keys_are_conflicts(pool: PgPool) -> sqlx::Result<()> 
 /// New rows land with the defaults `mock/identity.ts` used, so a create
 /// through the real backend looks like a create always did.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn creates_use_the_mock_fixtures_defaults(pool: PgPool) -> sqlx::Result<()> {
     let tenant = create_tenant(
         &pool,
@@ -288,7 +285,6 @@ async fn creates_use_the_mock_fixtures_defaults(pool: PgPool) -> sqlx::Result<()
 /// The list filters narrow on the server rather than shipping everything to
 /// the caller.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn list_filters_narrow_results(pool: PgPool) -> sqlx::Result<()> {
     let inactive = list_users(
         &pool,
@@ -345,7 +341,6 @@ async fn list_filters_narrow_results(pool: PgPool) -> sqlx::Result<()> {
 /// count drops) and a subsequent read is a 404-mapped `NotFound`, not a
 /// 500. A junk id is the same `NotFound`, never a decode error.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn delete_user_cascades_memberships(pool: PgPool) -> sqlx::Result<()> {
     let users = list_users(
         &pool,
@@ -393,7 +388,6 @@ async fn delete_user_cascades_memberships(pool: PgPool) -> sqlx::Result<()> {
 /// operator creates by hand when re-seeding an environment. Nothing may
 /// fail, and nothing may double up.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn seed_is_idempotent_when_applied_twice(pool: PgPool) -> sqlx::Result<()> {
     let seed = include_str!("../../../migrations/0002_seed_identity.sql");
     sqlx::raw_sql(seed).execute(&pool).await?;

@@ -17,11 +17,17 @@
 //! Anything that reaches a successful `authenticate` (a correctly signed
 //! token, JWKS caching/rotation, JIT provisioning, role mapping) needs a
 //! real `auth_identity`/`app_user`/`role` schema, so those tests follow the
-//! same `#[sqlx::test(migrations = "../../migrations")]` + `#[ignore]`
-//! pattern as `tests/repository.rs` and `tests/session.rs` — see those
-//! files' doc comments for how to run them.
+//! same `#[sqlx::test(migrations = "../../migrations")]` pattern as
+//! `tests/repository.rs` and `tests/session.rs` — see those files' doc
+//! comments for how the backing Postgres is provided.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+// Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
+// testcontainer bootstrap actually runs for this test binary (an
+// unreferenced dev-dependency's rlib member can otherwise be dropped
+// by the linker before its ctor section is ever considered).
+use lakehouse_test_support as _;
 
 use std::time::Duration;
 
@@ -329,7 +335,6 @@ async fn a_non_bearer_credential_is_unsupported() {
 const RINA: &str = "33333333-3333-4333-8333-000000000001";
 
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn a_correctly_signed_token_validates(pool: PgPool) -> sqlx::Result<()> {
     let server = MockServer::start().await;
     let key = TestKey::generate("kid-1");
@@ -347,7 +352,6 @@ async fn a_correctly_signed_token_validates(pool: PgPool) -> sqlx::Result<()> {
 /// configured clock-skew leeway) is accepted — this is what "small
 /// configurable clock skew" means in practice.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn a_token_within_the_configured_clock_skew_is_accepted(pool: PgPool) -> sqlx::Result<()> {
     let server = MockServer::start().await;
     let key = TestKey::generate("kid-1");
@@ -373,7 +377,6 @@ async fn a_token_within_the_configured_clock_skew_is_accepted(pool: PgPool) -> s
 /// JWKS caching: two validations against the same `kid` within the cache
 /// TTL must hit the network exactly once.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn a_second_validation_within_ttl_does_not_refetch_the_jwks(
     pool: PgPool,
 ) -> sqlx::Result<()> {
@@ -403,7 +406,6 @@ async fn a_second_validation_within_ttl_does_not_refetch_the_jwks(
 /// refetch, and the newly rotated key is accepted immediately — no waiting
 /// out the cache TTL.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn a_rotated_key_is_picked_up_on_first_use_without_waiting_out_the_ttl(
     pool: PgPool,
 ) -> sqlx::Result<()> {
@@ -440,7 +442,6 @@ async fn a_rotated_key_is_picked_up_on_first_use_without_waiting_out_the_ttl(
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn an_unknown_subject_is_rejected_when_jit_is_off(pool: PgPool) -> sqlx::Result<()> {
     let server = MockServer::start().await;
     let key = TestKey::generate("kid-1");
@@ -457,7 +458,6 @@ async fn an_unknown_subject_is_rejected_when_jit_is_off(pool: PgPool) -> sqlx::R
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn an_unknown_subject_is_provisioned_and_linked_when_jit_is_on(
     pool: PgPool,
 ) -> sqlx::Result<()> {
@@ -496,7 +496,6 @@ async fn an_unknown_subject_is_provisioned_and_linked_when_jit_is_on(
 /// A subject whose email already belongs to an existing local account links
 /// to it instead of creating a duplicate.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn jit_links_to_an_existing_user_with_the_same_email(pool: PgPool) -> sqlx::Result<()> {
     let server = MockServer::start().await;
     let key = TestKey::generate("kid-1");
@@ -522,7 +521,6 @@ async fn jit_links_to_an_existing_user_with_the_same_email(pool: PgPool) -> sqlx
 /// user's locally-assigned roles already grant (union, not replacement) —
 /// see `OidcAuthenticator::mapped_permissions`'s doc comment for why.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn a_mapped_group_grants_its_roles_permissions(pool: PgPool) -> sqlx::Result<()> {
     let server = MockServer::start().await;
     let key = TestKey::generate("kid-1");
@@ -565,7 +563,6 @@ async fn a_mapped_group_grants_its_roles_permissions(pool: PgPool) -> sqlx::Resu
 
 /// An unmapped group is ignored, not fatal.
 #[sqlx::test(migrations = "../../migrations")]
-#[ignore = "requires a live Postgres; see module doc comment"]
 async fn an_unmapped_group_grants_nothing_extra(pool: PgPool) -> sqlx::Result<()> {
     let server = MockServer::start().await;
     let key = TestKey::generate("kid-1");
