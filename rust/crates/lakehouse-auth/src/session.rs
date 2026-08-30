@@ -87,19 +87,34 @@ pub async fn create_session(
 /// other failure.
 pub async fn validate_session(pool: &PgPool, token: &Secret) -> Result<Principal, AuthError> {
     let token_hash = hash_token(token);
-    let row: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT app_user_id FROM session \
-         WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()",
+    // `LEFT JOIN auth_identity` (rather than a second, separate query
+    // after this one) so a session minted for a `must_change_password`
+    // local identity carries that flag through to the returned
+    // `Principal` without adding a round trip to the hottest path in this
+    // crate — see `Principal::must_change_password`'s doc comment. Most
+    // sessions have no matching `local` row's flag set, hence the
+    // `COALESCE` to `false` rather than requiring one.
+    let row: Option<(Uuid, bool)> = sqlx::query_as(
+        "SELECT s.app_user_id, COALESCE(ai.must_change_password, false) \
+         FROM session s \
+         LEFT JOIN auth_identity ai \
+             ON ai.app_user_id = s.app_user_id AND ai.provider = 'local' \
+         WHERE s.token_hash = $1 AND s.revoked_at IS NULL AND s.expires_at > now()",
     )
     .bind(token_hash)
     .fetch_optional(pool)
     .await?;
-    let Some((app_user_id,)) = row else {
+    let Some((app_user_id, must_change_password)) = row else {
         return Err(AuthError::SessionInvalid);
     };
-    repository::load_principal_for_user(pool, app_user_id, "session".to_owned())
-        .await
-        .map_err(|_| AuthError::SessionInvalid)
+    repository::load_principal_for_user(
+        pool,
+        app_user_id,
+        "session".to_owned(),
+        must_change_password,
+    )
+    .await
+    .map_err(|_| AuthError::SessionInvalid)
 }
 
 /// Revoke `token` (sign-out). Idempotent: revoking an already-revoked,

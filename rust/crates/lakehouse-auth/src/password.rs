@@ -172,8 +172,8 @@ pub async fn verify(
     identifier: &str,
     password: &Secret,
 ) -> Result<Principal, AuthError> {
-    let row: Option<(Uuid, String)> = sqlx::query_as(
-        "SELECT ai.app_user_id, ai.password_hash FROM auth_identity ai \
+    let row: Option<(Uuid, String, bool)> = sqlx::query_as(
+        "SELECT ai.app_user_id, ai.password_hash, ai.must_change_password FROM auth_identity ai \
          JOIN app_user u ON u.id = ai.app_user_id \
          WHERE u.email = $1 AND ai.provider = 'local'",
     )
@@ -181,7 +181,7 @@ pub async fn verify(
     .fetch_optional(pool)
     .await?;
 
-    let Some((app_user_id, stored_hash)) = row else {
+    let Some((app_user_id, stored_hash, must_change_password)) = row else {
         // No such identity: verify against the dummy hash anyway, so this
         // branch costs the same as a real verification, then fail exactly
         // as a wrong password would.
@@ -193,7 +193,7 @@ pub async fn verify(
         return Err(AuthError::InvalidCredentials);
     }
 
-    repository::load_principal_for_user(pool, app_user_id, "local".to_owned())
+    repository::load_principal_for_user(pool, app_user_id, "local".to_owned(), must_change_password)
         .await
         .map_err(|_| AuthError::InvalidCredentials)
 }

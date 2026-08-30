@@ -52,7 +52,7 @@ use crate::principal::Principal;
 ///         ).await?;
 ///         // 3. Load the normalized Principal exactly like every other
 ///         //    authenticator does.
-///         repository::load_principal_for_user(&self.pool, app_user_id, self.provider_id().to_owned()).await
+///         repository::load_principal_for_user(&self.pool, app_user_id, self.provider_id().to_owned(), false).await
 ///     }
 /// }
 /// ```

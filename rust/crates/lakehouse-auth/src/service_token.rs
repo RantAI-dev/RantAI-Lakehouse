@@ -102,6 +102,10 @@ pub async fn verify_service_token(pool: &PgPool, token: &Secret) -> Result<Princ
         display_name: name,
         permissions,
         provider: "service".to_owned(),
+        // A service identity has no `local` `auth_identity` row (and
+        // cannot itself change a password), so there is nothing for this
+        // flag to mean here — always `false`.
+        must_change_password: false,
     })
 }
 

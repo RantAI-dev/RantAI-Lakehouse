@@ -61,6 +61,20 @@ pub struct Principal {
     /// application logic on this value — see the module doc comment — it
     /// exists purely so an audit log line can say how someone got in.
     pub provider: String,
+    /// Whether this principal's `local` credential is still flagged
+    /// `auth_identity.must_change_password` (see
+    /// [`crate::password`]'s module doc comment). `true` for a
+    /// bootstrapped-but-not-yet-rotated local login or a session minted
+    /// from one; always `false` for a service token or an OIDC login,
+    /// neither of which has a `local` `auth_identity` row to be flagged
+    /// on.
+    ///
+    /// This is populated by the authenticator, not computed on every
+    /// permission check, precisely so `crate::policy::auth_gate` (or
+    /// equivalent middleware in a consuming crate) can gate on it without
+    /// an extra database round trip beyond what identifying the caller
+    /// already costs.
+    pub must_change_password: bool,
 }
 
 impl Principal {
@@ -92,6 +106,7 @@ mod tests {
             display_name: "Rina Wijaya".to_owned(),
             permissions: PermissionSet::parse("query:read, catalog:read"),
             provider: "local".to_owned(),
+            must_change_password: false,
         }
     }
 

@@ -297,6 +297,25 @@ pub fn policy_for(method: &str, path: &str) -> Option<Policy> {
         .map(|(_, _, policy)| *policy)
 }
 
+/// `(method, registered route pattern)` pairs a
+/// [`lakehouse_auth::Principal`] with `must_change_password == true` may
+/// still reach. See [`auth_gate`]'s doc comment for why exactly these
+/// three and no others.
+const ALLOWED_WHILE_MUST_CHANGE_PASSWORD: &[(&str, &str)] = &[
+    ("POST", "/api/auth/change-password"),
+    ("POST", "/api/auth/logout"),
+    ("GET", "/api/auth/me"),
+];
+
+/// Whether `(method, path)` stays reachable for a principal that still
+/// must rotate its password. See [`auth_gate`]'s doc comment.
+#[must_use]
+fn allowed_while_must_change_password(method: &str, path: &str) -> bool {
+    ALLOWED_WHILE_MUST_CHANGE_PASSWORD
+        .iter()
+        .any(|(m, p)| *m == method && *p == path)
+}
+
 /// The one middleware layered onto the whole router (`routes::router`).
 /// Looks up [`POLICY_TABLE`] for the request's matched route and either
 /// lets it through (`Policy::Public`), requires and checks a
@@ -304,12 +323,33 @@ pub fn policy_for(method: &str, path: &str) -> Option<Policy> {
 /// `Policy::RequiresPermission`), or — if the route has no policy entry at
 /// all — refuses it outright rather than defaulting to public.
 ///
+/// # `must_change_password` enforcement
+///
+/// A [`lakehouse_auth::Principal`] whose `must_change_password` is `true`
+/// (a bootstrapped local identity, or a session minted from one, that has
+/// never rotated its credential — see
+/// [`lakehouse_auth::Principal::must_change_password`]'s doc comment) is
+/// refused with a 403 on every route EXCEPT the three in
+/// [`ALLOWED_WHILE_MUST_CHANGE_PASSWORD`]:
+/// `POST /api/auth/change-password` (the only way out of this state),
+/// `POST /api/auth/logout` (a caller stuck here must still be able to sign
+/// out), and `GET /api/auth/me` (the frontend `AuthProvider` calls this on
+/// every page load to learn who is signed in and whether a rotation is
+/// pending — refusing it would break a plain page refresh mid-rotation; it
+/// only ever returns the caller's own identity and this same flag, so
+/// allowing it leaks nothing a rejected request wouldn't already have
+/// implied). This check runs AFTER `Policy::RequiresPermission`'s own
+/// check and applies regardless of that route's permission — even a
+/// Platform Admin bootstrap account cannot use `*:*` to route around its
+/// own pending rotation.
+///
 /// # Errors
 ///
 /// Returns a 500 `route_policy_unclassified` [`ApiRejection`] if the
 /// matched route has no [`POLICY_TABLE`] entry, a 401 if
 /// [`crate::auth::AuthenticatedPrincipal`] extraction fails, or a 403 if
-/// the extracted principal lacks a required permission.
+/// the extracted principal lacks a required permission, or still has a
+/// password rotation pending and this route isn't one of the three above.
 pub async fn auth_gate(
     State(state): State<AppState>,
     matched_path: MatchedPath,
@@ -336,6 +376,14 @@ pub async fn auth_gate(
                 if !principal.has(permission) {
                     return Err(ApiError::PermissionDenied(permission.to_owned()).into());
                 }
+            }
+            if principal.must_change_password
+                && !allowed_while_must_change_password(&method, matched_path.as_str())
+            {
+                return Err(ApiError::PermissionDenied(
+                    "password rotation required before this route is reachable".to_owned(),
+                )
+                .into());
             }
             parts.extensions.insert(principal);
             let req = Request::from_parts(parts, body);

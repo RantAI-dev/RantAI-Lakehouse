@@ -468,6 +468,10 @@ impl OidcAuthenticator {
             &self.pool,
             app_user_id,
             self.provider_label.clone(),
+            // An OIDC-provisioned/linked login is never a `local`
+            // identity, so it has no `must_change_password` to inherit —
+            // always `false`, same as `service_token`.
+            false,
         )
         .await
         .map_err(|_| AuthError::InvalidCredentials)?;

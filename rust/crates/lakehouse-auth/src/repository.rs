@@ -35,7 +35,17 @@ pub use lakehouse_store::PgPool;
 
 /// Load the normalized [`Principal`] for `user_id`, tagging it with
 /// `provider` (the authenticator that identified this user — `"local"`,
-/// `"session"`, or a future `"oidc:*"`).
+/// `"session"`, or a future `"oidc:*"`) and `must_change_password`.
+///
+/// `must_change_password` is taken as a parameter rather than queried
+/// here: the caller (a `local` password verification, a session lookup,
+/// an OIDC resolution) either already has this value from a query it ran
+/// anyway (a `local` `auth_identity` row it just joined against), or
+/// knows by construction that it must be `false` (a non-`local` login has
+/// no `auth_identity.must_change_password` to be flagged on). Querying it
+/// again in here would add a database round trip to the hottest path in
+/// this crate — session validation, run on every authenticated request —
+/// for a value the caller can supply for free.
 ///
 /// Merges `role.permissions` across every role the user holds (see
 /// [`crate::permissions`] for the parsing/merge semantics) and collects
@@ -49,6 +59,7 @@ pub async fn load_principal_for_user(
     pool: &PgPool,
     user_id: Uuid,
     provider: String,
+    must_change_password: bool,
 ) -> Result<Principal, AuthError> {
     let name: Option<(String,)> = sqlx::query_as("SELECT name FROM app_user WHERE id = $1")
         .bind(user_id)
@@ -83,6 +94,7 @@ pub async fn load_principal_for_user(
         display_name,
         permissions,
         provider,
+        must_change_password,
     })
 }
 

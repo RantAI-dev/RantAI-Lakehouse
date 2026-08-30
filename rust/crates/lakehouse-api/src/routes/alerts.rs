@@ -259,6 +259,7 @@ mod tests {
             display_name: "alerts-cron".to_owned(),
             permissions: PermissionSet::default(),
             provider: "service".to_owned(),
+            must_change_password: false,
         }
     }
 
@@ -269,6 +270,7 @@ mod tests {
             display_name: "Rina Wijaya".to_owned(),
             permissions: PermissionSet::parse("*:*"),
             provider: "session".to_owned(),
+            must_change_password: false,
         }
     }
 
