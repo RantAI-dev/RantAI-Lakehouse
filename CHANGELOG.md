@@ -6,12 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project intends to adhere to [Semantic Versioning](https://semver.org/)
 once a first release is tagged.
 
-No version has been tagged yet — everything below reflects the commit
-history reconstructed from `main..feat/rust-backend` (66 commits) and is
-grouped under a single `[Unreleased]` heading. A future phase will cut
-`v0.1.0`.
-
 ## [Unreleased]
+
+## [0.1.0] - 2026-08-30
+
+First tagged release. Everything below reflects the commit history on
+`main..feat/rust-backend` (84 commits, merged via #1) — a full backend port
+from the original TypeScript/Next.js API routes to a Rust/axum service, plus
+the CI/security work done to prepare the repository for its first release.
 
 ### Added
 
@@ -70,6 +72,17 @@ grouped under a single `[Unreleased]` heading. A future phase will cut
   PDF export via print (no added dependency), a self-contained Jakarta
   choropleth geomap (no external tile dependency).
 - Threshold alerts and scheduled digests (webhook + email delivery).
+- Self-contained `docker compose` backend stack (Postgres, ClickHouse,
+  `lakehouse-api`) with migrations run at container boot via the entrypoint,
+  plus operations docs.
+- `lakehouse-test-support` crate; Postgres integration tests de-ignored;
+  named regression tests for four specific security properties; HTTP-level
+  authorization contract tests exercising the real router end to end.
+- CI restructured into fast-feedback and heavy workflows: `cargo audit`,
+  `cargo deny check`, `gitleaks` (working tree and full-history scan),
+  `cargo llvm-cov` coverage + CycloneDX SBOM generation, and a Docker
+  build/smoke-test job — see `docs/CI.md`.
+- Release-prep hygiene for open-sourcing: license, docs, and CI templates.
 
 ### Changed
 
@@ -86,6 +99,9 @@ grouped under a single `[Unreleased]` heading. A future phase will cut
   the response.
 - Infra endpoint URLs and credentials made env-only — no internal defaults
   baked into source.
+- Remaining admin routes gated on the new permissions model; ad-hoc
+  `/api/*` fetch calls in the frontend routed through the central
+  `apiFetch` (and its 401 handling) instead of calling `fetch` directly.
 
 ### Fixed
 
@@ -102,6 +118,16 @@ grouped under a single `[Unreleased]` heading. A future phase will cut
 - Stale `#[allow(dead_code)]` on `ApiRejection`/`ErrorBody` removed once no
   longer needed.
 - BI: stopped dropping every live stored chart on the new envelope shape.
+- Stale `pub mod tenant;` dropped from `lib.rs` (the tenant module is not
+  wired into any route — see the Security section of the release notes for
+  what this does and does not mean for tenant isolation).
+- `docker compose`: `lakehouse-api`'s runtime base image matched to the
+  builder's OS; built from a pinned Rust 1.96.1 `Dockerfile`.
+- Nested `if let` chains collapsed for clippy on current stable.
+- `must_change_password` now enforced server-side, not just as a UI hint.
+- `gitleaks`'s full-history job fixed to actually detect the key it was
+  missing, then to stop flagging its own scanner config and docs as new
+  matches.
 
 ### Security
 
@@ -128,3 +154,6 @@ grouped under a single `[Unreleased]` heading. A future phase will cut
   `smtp_pass`, `database_url`) can never leak into a `{:?}`-formatted log
   line; enforced further by a `check-no-secrets.sh` CI script after a
   secret was leaked once during development.
+
+[Unreleased]: https://github.com/RantAI-dev/RantAI-Lakehouse/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/RantAI-dev/RantAI-Lakehouse/releases/tag/v0.1.0
