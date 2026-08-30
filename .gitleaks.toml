@@ -11,6 +11,32 @@ title = "RantAI Lakehouse gitleaks config"
 [extend]
 useDefault = true
 
+# ---------------------------------------------------------------------------
+# Custom rules
+#
+# gitleaks' default ruleset does NOT match every key format this project has
+# actually leaked. The `history-scan` job initially reported GREEN across all
+# of git history even though a real internal LLM API key sits in two commits
+# reachable from both `main` and `feat/rust-backend` — because that key uses an
+# `sk-node-` prefix, which no default rule covers.
+#
+# A green scan that misses a known-present secret is worse than no scan: it
+# tells a reviewer history is clean when it is not. These rules exist so the
+# scan reports the truth.
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "rantai-llm-node-api-key"
+description = "Internal LLM node API key (sk-node-… prefix; not covered by gitleaks defaults)"
+regex = '''sk-node-[A-Za-z0-9]{24,}'''
+tags = ["key", "llm", "internal"]
+
+[[rules]]
+id = "rantai-internal-lan-host"
+description = "Internal infrastructure host baked into source (should be env-only)"
+regex = '''192\.168\.18\.(187|197)'''
+tags = ["internal", "infrastructure"]
+
 [[allowlists]]
 description = "Build artifacts and vendored dependencies, not source"
 paths = [
