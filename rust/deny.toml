@@ -1,0 +1,39 @@
+# cargo-deny configuration for RantAI Lakehouse.
+#
+# Scope: licenses only for now (`cargo deny check licenses`). Advisory/ban/
+# source checks are intentionally not configured here yet — turning those on
+# is future work, not part of this release-prep pass.
+#
+# A Phase 1 license audit found zero GPL/AGPL/SSPL-licensed crates across
+# the 295 crates in this workspace's dependency graph. This config encodes
+# the permissive set actually in use and denies anything else by default,
+# so a future dependency change that pulls in a copyleft license fails CI
+# instead of silently landing.
+
+[graph]
+targets = []
+
+[licenses]
+version = 2
+# Anything not explicitly allowed below is a hard failure.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "0BSD",
+    "CDLA-Permissive-2.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"

@@ -1,0 +1,13 @@
+# CODEOWNERS
+#
+# TODO: confirm — replace the placeholder team handle below with a real
+# GitHub team under the RantAI-dev org (or individual maintainer handles)
+# before relying on this file for review routing. GitHub requires the team
+# to exist and have write access to this repository for these rules to take
+# effect.
+
+* @RantAI-dev/maintainers
+
+/rust/ @RantAI-dev/maintainers
+/src/ @RantAI-dev/maintainers
+/.github/ @RantAI-dev/maintainers

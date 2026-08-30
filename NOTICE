@@ -1,0 +1,48 @@
+RantAI Lakehouse
+Copyright 2026 RantAI
+
+This product is licensed under the Apache License, Version 2.0.
+See the LICENSE file for the full license text.
+
+================================================================================
+Third-party notices
+================================================================================
+
+This project depends on open-source software from the Rust and JavaScript/npm
+ecosystems. The vast majority of these dependencies are permissively licensed
+(MIT, Apache-2.0, BSD-2/3-Clause, ISC, Unicode-3.0, 0BSD, CDLA-Permissive-2.0,
+Zlib). `rust/deny.toml` encodes and enforces the allowed license set for the
+Rust dependency graph via `cargo deny check licenses`; a Phase 1 license audit
+found zero GPL/AGPL/SSPL-licensed crates across the 295 crates in that graph.
+
+--------------------------------------------------------------------------------
+sharp-libvips (LGPL-3.0-or-later) — transitive, JS dependency tree
+--------------------------------------------------------------------------------
+
+`sharp`, an image-processing library present in this project's JavaScript
+dependency tree (`bun.lock`), bundles prebuilt native binaries of
+`libvips` via the optional `@img/sharp-libvips-*` packages. `libvips` itself
+is distributed under LGPL-3.0-or-later.
+
+- `sharp`'s own JavaScript bindings are Apache-2.0.
+- The `@img/sharp-libvips-*` binaries are LGPL-3.0-or-later, dynamically
+  linked (not statically compiled into this project's own code).
+- LGPL-3.0 permits dynamic linking from a project under a different license
+  (including Apache-2.0) without imposing the LGPL on the linking project's
+  own source, provided the LGPL-covered component itself remains replaceable
+  and its license/source-availability obligations are respected.
+- Upstream source for `libvips` is available at
+  https://github.com/libvips/libvips and for the `sharp-libvips` packaging at
+  https://github.com/lovell/sharp-libvips.
+
+This dependency was surfaced in a license audit prior to open-sourcing this
+repository and is called out here for transparency; it does not affect the
+license of this project's own source code (Apache-2.0).
+
+--------------------------------------------------------------------------------
+Full dependency license texts
+--------------------------------------------------------------------------------
+
+Full license texts for individual dependencies are available from their
+respective package registries (npmjs.com, crates.io) and source repositories,
+and are not reproduced in full here.
