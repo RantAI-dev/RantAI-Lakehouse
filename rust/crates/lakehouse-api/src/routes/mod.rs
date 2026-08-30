@@ -266,6 +266,12 @@ fn agents_router() -> Router<AppState> {
         )
 }
 
+/// Build the application router with `state` threaded through every
+/// handler. See this function's original placement doc comment above
+/// [`pipelines_router`] for the `/api/governance/lineage` static-vs-capture
+/// routing note; this one-liner exists only to satisfy `missing_docs` now
+/// that the `lakehouse-api` library target (`src/lib.rs`) makes `routes` a
+/// `pub mod`, and this the crate's one public router constructor.
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
