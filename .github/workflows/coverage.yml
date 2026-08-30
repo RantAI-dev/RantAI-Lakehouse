@@ -1,0 +1,81 @@
+name: Coverage & SBOM
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: coverage-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    name: cargo llvm-cov (lcov)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      # Needs Docker (testcontainers-backed Postgres integration tests) —
+      # available by default on ubuntu-latest, same as the `test` job in
+      # ci.yml.
+      - name: cargo llvm-cov
+        run: cargo llvm-cov --workspace --locked --lcov --output-path lcov.info
+        working-directory: rust
+
+      - name: Upload lcov as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lcov-report
+          path: rust/lcov.info
+          retention-days: 30
+
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          cache-targets: false
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+
+      # One CycloneDX JSON document per crate (cargo-cyclonedx's default
+      # output layout: crates/<name>/<name>.cdx.json). Consumed in Phase 6
+      # to attach to the GitHub release.
+      - name: Generate SBOM
+        run: cargo cyclonedx --format json --all
+        working-directory: rust
+
+      - name: Upload SBOM as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: rust/crates/*/*.cdx.json
+          retention-days: 30

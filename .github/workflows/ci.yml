@@ -10,9 +10,13 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+  # ── Frontend ──────────────────────────────────────────────────────────
   verify:
-    name: Lint · Typecheck · Test · Build
+    name: Frontend · Lint · Typecheck · Test · Build
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -54,10 +58,11 @@ jobs:
       - name: Scan corpus for credential-shaped values
         run: ./rust/tests/parity/check-no-secrets.sh
 
-  rust:
-    name: Rust · fmt · clippy · test
+  # ── Rust: fast feedback ──────────────────────────────────────────────
+  fmt:
+    name: Rust · fmt
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -65,12 +70,86 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+        working-directory: rust
+
+  clippy:
+    name: Rust · clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+        working-directory: rust
+
+  build:
+    name: Rust · build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: cargo build --locked
+        run: cargo build --locked
+        working-directory: rust
+
+  # ── Rust: tests (Docker/testcontainers required — Postgres) ─────────
+  test:
+    name: Rust · test (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        # "stable" for the current toolchain the project actually ships
+        # with; the workspace's declared MSRV (rust/Cargo.toml
+        # `rust-version`) so a regression there fails CI honestly instead
+        # of silently drifting. See docs/CI.md for how 1.88 was derived.
+        toolchain: ["stable", "1.88.0"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: ${{ matrix.toolchain }}
 
       # Needed by lakehouse-bi's specs_match_typescript drift guard, which
       # shells out to `bun` to cross-check lakehouse_bi::specs against
@@ -81,14 +160,8 @@ jobs:
         with:
           bun-version: "1.3.12"
 
-      - name: Format
-        run: cargo fmt --check
-        working-directory: rust
-
-      - name: Clippy
-        run: cargo clippy --all-targets --all-features --locked -- -D warnings
-        working-directory: rust
-
-      - name: Test
+      # ubuntu-latest ships Docker; lakehouse-test-support's integration
+      # tests spin up real Postgres via testcontainers.
+      - name: cargo test --workspace --locked
         run: cargo test --workspace --locked
         working-directory: rust

@@ -1,8 +1,6 @@
 # cargo-deny configuration for RantAI Lakehouse.
 #
-# Scope: licenses only for now (`cargo deny check licenses`). Advisory/ban/
-# source checks are intentionally not configured here yet — turning those on
-# is future work, not part of this release-prep pass.
+# Scope: `cargo deny check all` (advisories, bans, licenses, sources).
 #
 # A Phase 1 license audit found zero GPL/AGPL/SSPL-licensed crates across
 # the 295 crates in this workspace's dependency graph. This config encodes
@@ -12,6 +10,16 @@
 
 [graph]
 targets = []
+
+[advisories]
+# RUSTSEC-2023-0071 ("Marvin Attack" timing side-channel in `rsa` 0.9.10):
+# pulled in solely as a dev-dependency of lakehouse-auth
+# (crates/lakehouse-auth/tests/oidc.rs, to mint an RSA key for OIDC test
+# fixtures). It is never linked into a shipped binary, and upstream has
+# published no fix ("No safe upgrade is available!" per the advisory) —
+# `cargo update -p rsa --dry-run` confirms 0.9.10 is already latest.
+# Re-evaluate when RustCrypto/RSA ships a constant-time implementation.
+ignore = ["RUSTSEC-2023-0071"]
 
 [licenses]
 version = 2

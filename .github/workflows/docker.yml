@@ -1,0 +1,102 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke-test:
+    name: Build lakehouse-api image · smoke test /health
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: rust
+          file: rust/Dockerfile.api
+          push: false
+          load: true
+          tags: lakehouse-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # No DATABASE_URL: the entrypoint skips migrations when it's unset,
+      # and lakehouse-api is designed to boot and serve its
+      # Postgres/ClickHouse-independent routes (including /health) even
+      # without either dependency running — see entrypoint.api.sh and
+      # lakehouse_store::connect_lazy's doc comment. This intentionally
+      # smoke-tests the container's own boot path, not the full
+      # docker-compose stack.
+      - name: Run container
+        run: |
+          docker run -d --name lakehouse-api -p 8080:8080 lakehouse-api:ci
+          for i in $(seq 1 30); do
+            if docker inspect -f '{{.State.Running}}' lakehouse-api 2>/dev/null | grep -q true; then
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Wait for /health and assert 200
+        run: |
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/health || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "got 200 from /health"
+              exit 0
+            fi
+            echo "attempt $i: got $code, retrying..."
+            sleep 2
+          done
+          echo "::error::/health never returned 200"
+          exit 1
+
+      - name: Container logs (always, for debugging)
+        if: always()
+        run: docker logs lakehouse-api || true
+
+      - name: Stop container
+        if: always()
+        run: docker rm -f lakehouse-api || true
+
+  # Not run today: gated on tags only, and inert even then — no registry
+  # credentials are configured, so a tag push would fail loudly at
+  # `docker/login-action` rather than silently publishing. Publishing to
+  # GHCR is a deliberate, separate decision for a later release phase; see
+  # docs/CI.md.
+  push-ghcr:
+    name: Push to GHCR (tags only — currently inert)
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build-and-smoke-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Not wired up yet
+        run: |
+          echo "::notice::GHCR publishing is intentionally not enabled yet."
+          echo "This job is gated on tag pushes so it stays inert on every"
+          echo "normal branch/PR run. Actually publishing requires a"
+          echo "deliberate follow-up: add docker/login-action with a GHCR"
+          echo "credential, then docker/build-push-action with push: true."
+          echo "Not done here — see docs/CI.md and the Phase 5 handoff notes."
+          exit 0

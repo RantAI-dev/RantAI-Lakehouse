@@ -4,7 +4,12 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+# Real floor, not the edition-2024 minimum (1.85). Verified by building
+# --locked against progressively newer toolchains: 1.85 fails because
+# testcontainers/testcontainers-modules require 1.88, time/time-core/
+# time-macros require 1.88.0, etcetera requires 1.87.0, and ferroid
+# requires 1.85.1. 1.88.0 builds clean. See docs/CI.md.
+rust-version = "1.88"
 license = "Apache-2.0"
 
 [workspace.dependencies]
