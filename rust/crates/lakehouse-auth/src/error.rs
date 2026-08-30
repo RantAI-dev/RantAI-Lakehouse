@@ -70,10 +70,10 @@ impl From<sqlx::Error> for AuthError {
         if matches!(err, sqlx::Error::RowNotFound) {
             return Self::NotFound;
         }
-        if let sqlx::Error::Database(db_err) = &err {
-            if db_err.is_unique_violation() {
-                return Self::Conflict("a record with that value already exists".to_owned());
-            }
+        if let sqlx::Error::Database(db_err) = &err
+            && db_err.is_unique_violation()
+        {
+            return Self::Conflict("a record with that value already exists".to_owned());
         }
         Self::Database(err)
     }

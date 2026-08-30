@@ -288,10 +288,11 @@ fn is_globally_volatile_key(key: &str) -> bool {
 /// also live under a key literally called `id` and must keep being compared
 /// exactly — a shape-based rule is what lets those coexist safely.
 fn looks_like_generated_id(s: &str) -> bool {
-    if let Some(rest) = s.strip_prefix("q-") {
-        if rest.len() >= 10 && rest.bytes().all(|b| b.is_ascii_digit()) {
-            return true;
-        }
+    if let Some(rest) = s.strip_prefix("q-")
+        && rest.len() >= 10
+        && rest.bytes().all(|b| b.is_ascii_digit())
+    {
+        return true;
     }
     let parts: Vec<&str> = s.split('-').collect();
     parts.len() == 5
@@ -513,10 +514,10 @@ const PARITY_SERVICE_IDENTITY_NAME: &str = "parity-harness";
 /// produces a usable token — the caller degrades to skipping non-public
 /// entries with a clear message rather than failing opaquely.
 async fn resolve_service_token() -> Option<String> {
-    if let Ok(token) = std::env::var("PARITY_SERVICE_TOKEN") {
-        if !token.is_empty() {
-            return Some(token);
-        }
+    if let Ok(token) = std::env::var("PARITY_SERVICE_TOKEN")
+        && !token.is_empty()
+    {
+        return Some(token);
     }
 
     let database_url = std::env::var("DATABASE_URL")

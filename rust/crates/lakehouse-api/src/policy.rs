@@ -372,10 +372,10 @@ pub async fn auth_gate(
             let (mut parts, body) = req.into_parts();
             let AuthenticatedPrincipal(principal) =
                 AuthenticatedPrincipal::from_request_parts(&mut parts, &state).await?;
-            if let Policy::RequiresPermission(permission) = policy {
-                if !principal.has(permission) {
-                    return Err(ApiError::PermissionDenied(permission.to_owned()).into());
-                }
+            if let Policy::RequiresPermission(permission) = policy
+                && !principal.has(permission)
+            {
+                return Err(ApiError::PermissionDenied(permission.to_owned()).into());
             }
             if principal.must_change_password
                 && !allowed_while_must_change_password(&method, matched_path.as_str())

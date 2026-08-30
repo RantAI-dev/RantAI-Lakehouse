@@ -748,15 +748,15 @@ fn yaml_board(id: &str, name: &str, layout: Option<&LayoutMap>) -> String {
         format!("  - id: {id}"),
         format!("    name: {}", yaml_value(&json!(name))),
     ];
-    if let Some(layout) = layout {
-        if !layout.is_empty() {
-            lines.push("    layout:".to_owned());
-            for (cid, bx) in layout {
-                lines.push(format!(
-                    "      {cid}: {{ x: {}, y: {}, w: {}, h: {} }}",
-                    bx.x, bx.y, bx.w, bx.h
-                ));
-            }
+    if let Some(layout) = layout
+        && !layout.is_empty()
+    {
+        lines.push("    layout:".to_owned());
+        for (cid, bx) in layout {
+            lines.push(format!(
+                "      {cid}: {{ x: {}, y: {}, w: {}, h: {} }}",
+                bx.x, bx.y, bx.w, bx.h
+            ));
         }
     }
     lines.join("\n") + "\n"

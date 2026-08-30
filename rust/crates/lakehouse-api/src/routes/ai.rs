@@ -797,10 +797,10 @@ pub async fn chat(State(state): State<AppState>, body: Bytes) -> Response {
             if !is_build && WRITE_TOOLS.contains(&name) {
                 return false;
             }
-            if let Some(allow) = &allow {
-                if !allow.contains(name) {
-                    return false;
-                }
+            if let Some(allow) = &allow
+                && !allow.contains(name)
+            {
+                return false;
             }
             true
         })
@@ -873,10 +873,10 @@ pub async fn chat(State(state): State<AppState>, body: Bytes) -> Response {
             tool_trace.push(json!({
                 "tool": call.function.name, "args": args, "ok": ok, "result": result,
             }));
-            if let Value::Object(m) = &result {
-                if let Some(Value::String(rid)) = m.get("runId") {
-                    build_run_id = Some(rid.clone());
-                }
+            if let Value::Object(m) = &result
+                && let Some(Value::String(rid)) = m.get("runId")
+            {
+                build_run_id = Some(rid.clone());
             }
             if call.function.name == "create_chart" && ok {
                 chart_created = true;

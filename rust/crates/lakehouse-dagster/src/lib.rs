@@ -453,13 +453,13 @@ impl DgClient {
         });
         let data: LaunchRunData = self.execute(query, Some(variables)).await?;
         let r = data.launch_run;
-        if r.typename == "LaunchRunSuccess" {
-            if let Some(run) = r.run {
-                return Ok(LaunchOutcome {
-                    run_id: Some(run.run_id),
-                    error: None,
-                });
-            }
+        if r.typename == "LaunchRunSuccess"
+            && let Some(run) = r.run
+        {
+            return Ok(LaunchOutcome {
+                run_id: Some(run.run_id),
+                error: None,
+            });
         }
         let error = r
             .message
@@ -505,13 +505,13 @@ impl DgClient {
             .execute(query, Some(json!({ "runId": run_id })))
             .await?;
         let r = data.terminate_run;
-        if r.typename == "TerminateRunSuccess" {
-            if let Some(run) = r.run {
-                return Ok(LaunchOutcome {
-                    run_id: Some(run.run_id),
-                    error: None,
-                });
-            }
+        if r.typename == "TerminateRunSuccess"
+            && let Some(run) = r.run
+        {
+            return Ok(LaunchOutcome {
+                run_id: Some(run.run_id),
+                error: None,
+            });
         }
         Ok(LaunchOutcome {
             run_id: None,
@@ -542,13 +542,13 @@ impl DgClient {
             .execute(query, Some(json!({ "parentRunId": parent_run_id })))
             .await?;
         let r = data.launch_run_reexecution;
-        if r.typename == "LaunchRunSuccess" {
-            if let Some(run) = r.run {
-                return Ok(LaunchOutcome {
-                    run_id: Some(run.run_id),
-                    error: None,
-                });
-            }
+        if r.typename == "LaunchRunSuccess"
+            && let Some(run) = r.run
+        {
+            return Ok(LaunchOutcome {
+                run_id: Some(run.run_id),
+                error: None,
+            });
         }
         let error = r
             .message

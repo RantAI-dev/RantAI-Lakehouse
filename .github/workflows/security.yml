@@ -73,8 +73,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # taiki-e/install-action doesn't package gitleaks, so install the
+      # pinned binary release directly instead of trusting a floating
+      # third-party wrapper action.
       - name: Install gitleaks
-        uses: taiki-e/install-action@gitleaks
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
 
       - name: gitleaks detect (working tree only, --no-git)
         run: gitleaks detect --no-git --source . --config .gitleaks.toml --redact -v
@@ -138,7 +146,12 @@ jobs:
           EOF
 
       - name: Install gitleaks
-        uses: taiki-e/install-action@gitleaks
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
 
       # Same .gitleaks.toml as the working-tree job (only excludes the two
       # verified-synthetic test-fixture JWTs and gitignored build dirs —
@@ -148,8 +161,20 @@ jobs:
       - name: gitleaks detect (full history)
         run: gitleaks detect --source . --config .gitleaks.toml --redact -v
 
+  # Known limitation, not fixable from a workflow file: `dependency-review-
+  # action` calls GitHub's Dependency Graph diff API, which for *private*
+  # repositories requires GitHub Advanced Security. This org
+  # (RantAI-dev) is on the free plan (`plan.name: "free"`,
+  # `advanced_security_enabled_for_new_repositories: false` — verified via
+  # `gh api orgs/RantAI-dev`), so this job fails at the "Dependency review"
+  # step with "Dependency review is not supported on this repository."
+  # regardless of how it's configured. Enabling it requires either
+  # upgrading the org's billing plan to include GHAS, or making the repo
+  # public (explicitly out of scope — see the hard rules this CI pass
+  # operates under). Left in place, and left failing honestly, rather than
+  # silently dropped — see docs/CI.md. Not part of required status checks.
   dependency-review:
-    name: Dependency review (PR only)
+    name: "Dependency review (PR only) — requires GHAS, not available on this plan"
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10

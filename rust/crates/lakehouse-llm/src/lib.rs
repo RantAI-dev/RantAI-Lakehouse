@@ -169,10 +169,10 @@ impl LlmClient {
 
         let raw_content = msg.content.unwrap_or_default();
         let mut content = strip_think_blocks(&raw_content).trim().to_owned();
-        if content.is_empty() {
-            if let Some(reasoning) = msg.reasoning_content {
-                content = reasoning;
-            }
+        if content.is_empty()
+            && let Some(reasoning) = msg.reasoning_content
+        {
+            content = reasoning;
         }
         Ok(content)
     }
