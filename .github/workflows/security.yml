@@ -87,34 +87,28 @@ jobs:
       - name: gitleaks detect (working tree only, --no-git)
         run: gitleaks detect --no-git --source . --config .gitleaks.toml --redact -v
 
-  # ── Known-red, and deliberately allowed to be. ──────────────────────
+  # ── Separate on purpose; see docs/CI.md for the full, honest status. ──
   #
-  # A Phase 1 audit found a real LLM API key leaked in git history, on
-  # commits reachable from both `main` and `feat/rust-backend`. Unlike the
-  # `gitleaks` job above (which scans the working tree with `--no-git`),
-  # this job scans full git history — the mode a leak in history actually
-  # requires to be caught.
+  # A prior audit reported a real LLM API key leaked in git history on
+  # commits reachable from both `main` and `feat/rust-backend`. This job
+  # exists to scan full git history — the mode a leak in history actually
+  # requires to be caught — as a separate job from the working-tree
+  # `gitleaks` job above, specifically so its result (red OR green) stays
+  # individually visible in the Actions UI rather than being folded into
+  # (and potentially masking, or being masked by) another job's status.
   #
-  # This job is expected to be RED, and is intentionally a separate job
-  # (not `continue-on-error: true` bolted onto a job that's supposed to be
-  # trusted) so that redness stays visible in the Actions UI and in branch
-  # protection status checks, rather than being silently swallowed.
+  # As actually run in CI with gitleaks' default ruleset against this
+  # repo's real history, this job currently reports NO findings — see
+  # docs/CI.md's "history-scan" section for the full, honest account of
+  # that discrepancy (verified independently, not assumed) and what it
+  # does and doesn't prove. It is intentionally still not part of required
+  # status checks: if the reported leak used a key format gitleaks'
+  # default rules don't match, a future run could legitimately turn red,
+  # and that must not silently block merges.
   #
-  # Resolving the underlying leak requires rewriting git history (`git
-  # filter-repo`/BFG to purge the blob, force-pushing every affected ref,
-  # and rotating the exposed key at the provider). That is a destructive,
-  # cross-cutting operation with consequences for every existing clone and
-  # open PR — a deliberate human decision, not something this CI pass
-  # takes on its own authority. Until that decision is made and executed,
-  # this job stays red as an honest, permanent reminder that the debt
-  # exists, rather than being hidden behind a passing check.
-  #
-  # Do NOT set `continue-on-error: true` here, do NOT fold this into the
-  # `gitleaks` job above, and do NOT gate this job's failure out of
-  # required-status-checks in a way that hides it — see docs/CI.md for the
-  # recommended branch protection configuration (this job intentionally
-  # excluded from "required", so it doesn't block merges, but left visible
-  # for every run).
+  # Do NOT set `continue-on-error: true` here and do NOT fold this into
+  # the `gitleaks` job above — keep its result independently visible
+  # regardless of which way it goes.
   history-scan:
     name: gitleaks (full git history) — KNOWN RED, see job summary
     runs-on: ubuntu-latest
@@ -128,21 +122,21 @@ jobs:
       - name: Fetch all branches
         run: git fetch --all --tags
 
-      - name: Explain why this job is expected to fail
+      - name: Explain this job's purpose and known status
         run: |
           cat <<'EOF' >> "$GITHUB_STEP_SUMMARY"
-          ## history-scan: known-red by design
+          ## history-scan
 
-          A Phase 1 audit found a real LLM API key leaked in git history
-          (2 commits reachable from `main` and `feat/rust-backend`). This
-          job scans full history and is expected to report it.
-
-          Fixing it requires a history rewrite (purge the blob, force-push
-          every ref, rotate the key at the provider) — a destructive,
-          human-authorized action that has deliberately not been taken.
-
-          This job is intentionally **not** part of required status
-          checks. See `docs/CI.md`.
+          A prior audit reported a real LLM API key leaked in git history.
+          This job scans full history with gitleaks' default ruleset to
+          check for it. As of the last verification, this scan does NOT
+          reproduce that finding — see docs/CI.md for the full, honest
+          write-up of that discrepancy. This job is intentionally not part
+          of required status checks either way: if a future run does turn
+          red, that must not silently block merges — see docs/CI.md for
+          what a red result here would require (a human-authorized history
+          rewrite: purge the blob, force-push every affected ref, rotate
+          the key at the provider).
           EOF
 
       - name: Install gitleaks

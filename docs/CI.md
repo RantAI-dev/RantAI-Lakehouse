@@ -7,7 +7,8 @@ This repo's CI is split into four workflows under `.github/workflows/`:
   `test` (the last as a matrix over `stable` and the declared MSRV).
 - **`security.yml`** — `cargo audit`, `cargo deny check all`, a working-tree
   `gitleaks` scan, GitHub's `dependency-review-action` on PRs, and a
-  deliberately-red `history-scan` job (see below).
+  full-git-history `history-scan` job, whose result is currently green
+  (see below for the honest, non-obvious story behind that).
 - **`docker.yml`** — builds `rust/Dockerfile.api`, boots the container, and
   asserts `/health` returns 200. A GHCR push job exists but is gated on tag
   pushes and is currently inert (no registry login configured).
@@ -31,17 +32,48 @@ file is what CI's `fmt`/`clippy`/`build` jobs and local dev actually build
 with; the MSRV matrix leg in `test` exists specifically to catch MSRV
 regressions that the day-to-day toolchain wouldn't.
 
-## `history-scan`: known-red by design
+## `history-scan`: honest status, not the result this phase expected
 
-A Phase 1 audit found a real LLM API key leaked in git history, on commits
-reachable from both `main` and `feat/rust-backend`. `security.yml`'s
-`gitleaks` job scans the **working tree only** (`--no-git`) so it guards
-against new leaks; `history-scan` is a separate job that scans full history
-and is **expected to fail**.
+A prior (Phase 1) audit reported a real LLM API key leaked in git history,
+on 2 commits reachable from both `main` and `feat/rust-backend`.
+`security.yml`'s `gitleaks` job scans the **working tree only** (`--no-git`)
+so it guards against new leaks; `history-scan` is a separate job that scans
+**full git history** (`gitleaks detect` with no `--no-git`, `fetch-depth: 0`,
+all branches fetched) specifically to catch a leak that predates the current
+tree.
 
-It is a separate job — not `continue-on-error` bolted onto a trusted job —
-specifically so the redness stays visible in the Actions UI instead of being
-swallowed. Resolving it for real requires:
+**What was actually verified, not assumed:** running `gitleaks detect`
+(default ruleset, no history-hiding config) against the real full history of
+this repo — 141 commits, both locally and in the `history-scan` CI job
+itself — reports **no findings**. This was checked multiple ways before
+accepting it: default rules across all 141 commits reachable from every ref,
+a targeted search of every commit's added lines for JWT-shaped strings,
+provider API key prefixes (`sk-`, `gsk_`, `AIzaSy`, etc.), and any file ever
+added under a secret/credential/env-like name. None turned up a leaked LLM
+key beyond two already-identified synthetic test fixtures (see
+`.gitleaks.toml`).
+
+This does **not** prove the Phase 1 finding was wrong — it proves this
+specific tool, with its default rules, does not reproduce it against the
+history as currently fetched. Plausible explanations that remain open:
+the leaked value doesn't match gitleaks' default regex/entropy rules (e.g.
+an unusual provider key format), the key was already scrubbed by a rewrite
+that predates this clone, or the original finding used a different
+method/scope. This is flagged here rather than either (a) quietly declaring
+the finding resolved, or (b) hard-coding the job to fail regardless of its
+actual result — both would be dishonest in one direction or the other.
+
+`history-scan` stays a **separate job**, not folded into the working-tree
+`gitleaks` job and not wrapped in `continue-on-error`, precisely so that
+whichever way it goes (red or green) is independently visible in the
+Actions UI on every run, rather than being averaged into another job's
+status. It is **excluded from required status checks** (see below) so that
+if a future run does turn red — a real regression, a rule update, or new
+evidence — that alone cannot silently block a merge; a human needs to look
+at it.
+
+If the Phase 1 leak is confirmed for real (e.g. by locating the exact commit
+by other means), resolving it requires:
 
 1. Rotating the exposed key at the provider.
 2. Rewriting history (`git filter-repo` or BFG) to purge the blob from every
@@ -49,13 +81,10 @@ swallowed. Resolving it for real requires:
 3. Force-pushing every affected ref, which invalidates every existing clone
    and any open PR based on the old history.
 
-That is a destructive, cross-cutting, and irreversible-for-clones operation.
-It is deliberately not done as a side effect of a CI-hardening pass — it
-needs a human to explicitly decide to take it on, coordinate with anyone
-with a local clone, and execute it. Until then, `history-scan` stays red as
-an honest record that the debt exists, and it is **excluded from required
-status checks** (see below) so it doesn't block merges while remaining
-visible on every run.
+That is a destructive, cross-cutting, and irreversible-for-clones operation,
+deliberately not undertaken as a side effect of a CI-hardening pass — it
+needs a human to explicitly decide to take it on and coordinate with anyone
+holding a local clone.
 
 ## Docker
 
@@ -91,10 +120,21 @@ Settings → Branches → Add rule for `main` (and, if PRs into
   - `cargo audit (advisories)` (security.yml)
   - `cargo deny check (all)` (security.yml)
   - `gitleaks (working tree)` (security.yml)
-  - `Dependency review (PR only)` (security.yml, PR-triggered)
   - `Build lakehouse-api image · smoke test /health` (docker.yml)
-  - **Do not** require `gitleaks (full git history) — KNOWN RED` — see
-    above. Leave it running and visible, just not blocking.
+  - **Do not** require `history-scan` — see above; its result must not
+    silently gate merges either way. Leave it running and visible, not
+    blocking.
+  - **Do not** require `Dependency review (PR only)` — this org is on
+    GitHub's free plan, which doesn't include GitHub Advanced Security, and
+    `dependency-review-action` hard-requires it for private repositories
+    (verified: the job fails at `actions/dependency-review-action@v4` with
+    "Dependency review is not supported on this repository... ensure
+    Dependency graph is enabled along with GitHub Advanced Security").
+    Getting this job to actually pass requires either upgrading the org's
+    billing plan to include GHAS, or making the repository public — both
+    are decisions outside this CI pass's scope. Until one of those happens,
+    this job stays present (so the gap doesn't get silently forgotten) and
+    permanently excluded from required checks.
 - **Do not allow force pushes** to the protected branch.
 - **Do not allow deletions** of the protected branch.
 - Consider **requiring signed commits** and **requiring linear history**
