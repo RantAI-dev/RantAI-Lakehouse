@@ -110,7 +110,7 @@ jobs:
   # the `gitleaks` job above — keep its result independently visible
   # regardless of which way it goes.
   history-scan:
-    name: gitleaks (full git history) — KNOWN RED, see job summary
+    name: gitleaks (full git history) — see job summary and docs/CI.md
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
