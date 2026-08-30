@@ -6,6 +6,7 @@ Styling & tema mengikuti **Rantai Design System** (`design-system/`): token warn
 
 ## Tech Stack
 
+- **Bun** (runtime, package manager, test runner)
 - **Next.js** (App Router)
 - **TypeScript**
 - **Tailwind CSS**
@@ -27,24 +28,50 @@ src/
 └── types/               # TypeScript types/interfaces
 ```
 
+## Runtime: Bun
+
+Project ini berjalan di atas **Bun** (bukan Node.js). Butuh Bun `>= 1.3.0`
+([install](https://bun.sh/docs/installation)):
+
+```bash
+curl -fsSL https://bun.sh/install | bash
+```
+
+Semua script (`dev`, `build`, `start`, `lint`, `typecheck`) memakai flag
+`--bun` supaya Next.js dieksekusi oleh runtime Bun, bukan Node. Lockfile-nya
+`bun.lock` — jangan pakai `npm install`, karena akan membuat `package-lock.json`
+yang tidak sinkron.
+
+> Catatan: di `ps`, proses server tampil sebagai `node` karena Bun sengaja
+> menyamar demi kompatibilitas tooling. Untuk memastikan, cek
+> `readlink /proc/<pid>/exe` — hasilnya menunjuk ke binary `bun`.
+
 ## Menjalankan Server Lokal
 
 ```bash
 # Install dependencies (jika belum)
-npm install
+bun install
 
 # Development
-npm run dev
+bun run dev
 ```
 
 Buka [http://localhost:3000](http://localhost:3000).
 
 ```bash
 # Build production
-npm run build
+bun run build
 
 # Jalankan production
-npm start
+bun start
+```
+
+## Test, Lint, Typecheck
+
+```bash
+bun run test       # bun test (unit test di src/lib)
+bun run lint       # eslint
+bun run typecheck  # tsc --noEmit
 ```
 
 ## Menambah Komponen shadcn Pertama Kali
@@ -54,13 +81,13 @@ npm start
 
 2. **Tambahkan komponen via CLI**
    ```bash
-   npx shadcn@latest add <nama-komponen>
+   bunx shadcn@latest add <nama-komponen>
    ```
    Contoh:
    ```bash
-   npx shadcn@latest add card
-   npx shadcn@latest add dialog
-   npx shadcn@latest add input
+   bunx shadcn@latest add card
+   bunx shadcn@latest add dialog
+   bunx shadcn@latest add input
    ```
 
 3. **Lokasi file**
