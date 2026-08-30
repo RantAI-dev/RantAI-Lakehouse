@@ -1,11 +1,14 @@
 services:
   # Phase 2 OLTP store (mutation state that ClickHouse — analytics-only, no
   # transactions — is a poor fit for). ClickHouse remains the analytics
-  # store; this is additive. Not wired into `depends_on` for lakehouse-api:
-  # `lakehouse-api` deliberately boots and serves Phase 1 routes even when
-  # this container is down or not yet started (see
-  # `lakehouse_store::connect_lazy`'s doc comment) — an ordering dependency
-  # here would defeat that.
+  # store; this is additive. Not wired into `depends_on` for lakehouse-api
+  # as a hard *ordering* requirement in the "must be healthy before the API
+  # even starts" sense — `lakehouse-api` deliberately boots and serves
+  # Phase 1 routes even when this container is down (see
+  # `lakehouse_store::connect_lazy`'s doc comment). We do still wait for it
+  # to report healthy before starting the API purely so first-boot
+  # migrations and the bootstrap-admin seed (which both need Postgres) have
+  # a real chance to run instead of racing container start order.
   postgres:
     image: postgres:16
     environment:
@@ -13,41 +16,98 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
       POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - lakehouse_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lakehouse} -d ${POSTGRES_DB:-lakehouse}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # Analytics store. Most read routes (catalog, overview, governance,
+  # dashboards, ...) go through ClickHouse and return 503 without it, so
+  # unlike Postgres this one is a genuinely required local dependency, not
+  # an optional Phase 2 add-on.
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment:
+      CLICKHOUSE_USER: ${CH_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CH_PASSWORD:-}
+      CLICKHOUSE_DB: ${CH_DB:-default}
+      # Local dev only: lets the default user connect without a password
+      # when CH_PASSWORD is left empty (the documented default).
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "${CH_HTTP_HOST_PORT:-8123}:8123"
+      - "${CH_NATIVE_HOST_PORT:-9000}:9000"
+    volumes:
+      - lakehouse_clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
     restart: unless-stopped
 
   lakehouse-api:
     build:
       context: ./rust
       dockerfile: Dockerfile
-    image: lakehouse-api:local
     ports:
-      - "8080:8080"
-    env_file:
-      - .env.local
+      - "${API_HOST_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
     environment:
       PORT: "8080"
-      CH_URL: ${CH_URL}
-      CH_USER: ${CH_USER}
-      CH_PASSWORD: ${CH_PASSWORD}
-      DAGSTER_URL: ${DAGSTER_URL}
-      DAGSTER_REPO: ${DAGSTER_REPO}
-      DAGSTER_LOCATION: ${DAGSTER_LOCATION}
-      LLM_URL: ${LLM_URL}
-      LLM_MODEL: ${LLM_MODEL}
-      LLM_KEY: ${LLM_KEY}
-      SMTP_HOST: ${SMTP_HOST}
-      SMTP_PORT: ${SMTP_PORT}
-      SMTP_SECURE: ${SMTP_SECURE}
-      SMTP_USER: ${SMTP_USER}
-      SMTP_PASS: ${SMTP_PASS}
-      SMTP_FROM: ${SMTP_FROM}
-      ALERTS_RUN_TOKEN: ${ALERTS_RUN_TOKEN}
-      PUBLIC_DASH_TOKEN: ${PUBLIC_DASH_TOKEN}
-      DATABASE_URL: ${DATABASE_URL}
+      APP_ENV: ${APP_ENV:-local}
+      # ── ClickHouse: points at the compose service by default ──
+      CH_URL: ${CH_URL:-http://clickhouse:8123}
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      # ── Dagster: out of scope for the local stack. Left unset/unreachable
+      #    on purpose — orchestration-backed routes (pipeline trigger/runs)
+      #    degrade to 503 rather than the API refusing to boot. See
+      #    docs/OPERATIONS.md "Unavailable in the local stack". ──
+      DAGSTER_URL: ${DAGSTER_URL:-http://dagster.invalid:13030/graphql}
+      DAGSTER_REPO: ${DAGSTER_REPO:-__repository__}
+      DAGSTER_LOCATION: ${DAGSTER_LOCATION:-dispar_orchestrate.definitions}
+      # ── LLM: out of scope for the local stack. Needs a real API key, so
+      #    AI/agent routes degrade to 503 unless you set LLM_KEY yourself
+      #    (e.g. in a local .env). See docs/OPERATIONS.md. ──
+      LLM_URL: ${LLM_URL:-https://api.minimax.io/v1}
+      LLM_MODEL: ${LLM_MODEL:-MiniMax-M3}
+      LLM_KEY: ${LLM_KEY:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-rantai-lake@localhost}
+      ALERTS_RUN_TOKEN: ${ALERTS_RUN_TOKEN:-}
+      EMBED_SECRET: ${EMBED_SECRET:-}
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_PROVIDER_NAME: ${OIDC_PROVIDER_NAME:-default}
+      OIDC_JWKS_URL: ${OIDC_JWKS_URL:-}
+      OIDC_JIT_PROVISIONING: ${OIDC_JIT_PROVISIONING:-false}
+      OIDC_ROLE_MAP: ${OIDC_ROLE_MAP:-}
+      OIDC_GROUPS_CLAIM: ${OIDC_GROUPS_CLAIM:-groups}
+      OIDC_CLOCK_SKEW_SECONDS: ${OIDC_CLOCK_SKEW_SECONDS:-60}
+      # ── Bootstrap admin: REQUIRED to be able to log in at all. There is
+      #    deliberately no default credential — see docs/OPERATIONS.md. ──
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${POSTGRES_DB:-lakehouse}}
     restart: unless-stopped
 
 volumes:
   lakehouse_postgres_data:
+  lakehouse_clickhouse_data:

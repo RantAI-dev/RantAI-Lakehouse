@@ -59,19 +59,22 @@ git clone https://github.com/RantAI-dev/RantAI-Lakehouse.git
 cd RantAI-Lakehouse
 bun install
 
-# 3. Bring up Postgres, ClickHouse, and Dagster (bring your own compose
-#    file / images for these — none are vendored in this repo yet; see
-#    the Configuration table below for the connection env vars each
-#    service needs).
+# 3. Configure the backend stack. Copy the example env file and set (at
+#    minimum) AUTH_BOOTSTRAP_EMAIL / AUTH_BOOTSTRAP_PASSWORD — without
+#    those there is deliberately no way to log in. Every other variable
+#    has a safe local default; see .env.example and the Configuration
+#    table below.
+cp .env.example .env
+$EDITOR .env
 
-# 4. Build and run the Rust backend
-cd rust
-cargo run -p lakehouse-api
-# by default it listens on :8080 — see the Configuration table for PORT
-# and every other env var it reads.
+# 4. Bring up Postgres, ClickHouse, and the Rust API (built from
+#    rust/Dockerfile). Dagster and a real LLM are NOT part of this stack —
+#    see docs/OPERATIONS.md for what that means and how to add them.
+docker compose up --build
+# lakehouse-api listens on :8080 once postgres and clickhouse report
+# healthy. Check with: curl -sf localhost:8080/health
 
 # 5. In a separate terminal, point the frontend at the backend and run it
-cd ..
 RUST_API_URL=http://localhost:8080 bun --bun next dev
 ```
 
@@ -80,6 +83,20 @@ bootstrap admin account you configured via `AUTH_BOOTSTRAP_EMAIL` /
 `AUTH_BOOTSTRAP_PASSWORD` (see the Configuration table) — without those set,
 no admin account is created and you'll need to seed one directly in
 Postgres.
+
+See [docs/OPERATIONS.md](docs/OPERATIONS.md) for what's in/out of the
+compose stack, what `/health` actually checks, the Postgres backup/restore
+procedure, and the biggest operational trap in this codebase (Postgres
+being down fails quietly, not loudly).
+
+Prefer running the Rust API directly instead of in a container (e.g. for
+faster iteration)? The old path still works:
+
+```bash
+# Bring up just the data stores from compose, then run the API on the host
+docker compose up postgres clickhouse
+cd rust && cargo run -p lakehouse-api
+```
 
 ### Runtime: Bun
 
