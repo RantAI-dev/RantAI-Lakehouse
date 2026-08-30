@@ -211,6 +211,10 @@ setup instructions (Okta, Entra, Google, Keycloak).
 This is a young, honestly-scoped project. Please read this before filing an
 issue about any of the following — they're known, not bugs:
 
+- **`rust/Dockerfile` does not currently build from a clean clone**
+  (wrong rustc pin + a `pub mod tenant;` in `lib.rs` whose source file
+  isn't committed yet). See the "KNOWN BLOCKER" section at the top of
+  [docs/OPERATIONS.md](docs/OPERATIONS.md) for the exact errors and status.
 - **`streaming` is mocked.** There is no Kafka/Redpanda/Pulsar/Flink
   anywhere in this project. The streaming domain in the UI is backed by
   `src/services/mock/streaming.ts`.
