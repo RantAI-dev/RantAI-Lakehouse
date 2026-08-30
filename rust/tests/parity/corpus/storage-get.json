@@ -1,0 +1,36 @@
+{
+  "request": {
+    "name": "storage-get",
+    "method": "GET",
+    "path": "/api/storage"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "byTier": {
+      "hot": {
+        "bytes": 11701,
+        "assets": 6,
+        "growth7d": 0
+      },
+      "warm": {
+        "bytes": 55779460,
+        "assets": 193,
+        "growth7d": 0
+      },
+      "cold": {
+        "bytes": 0,
+        "assets": 0,
+        "growth7d": 0
+      },
+      "ai": {
+        "bytes": 0,
+        "assets": 0,
+        "growth7d": 0
+      }
+    },
+    "savingsVsAllHot": 100,
+    "failedTieringOps": 0,
+    "pendingRestores": 0
+  }
+}

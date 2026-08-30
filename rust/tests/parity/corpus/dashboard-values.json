@@ -1,0 +1,21 @@
+{
+  "request": {
+    "name": "dashboard-values",
+    "method": "GET",
+    "path": "/api/dashboard/values?column=kawasan"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "column": "kawasan",
+    "values": [
+      "Afrika",
+      "Amerika",
+      "Asia",
+      "Eropa",
+      "Lainnya",
+      "Oseania",
+      "Timur Tengah"
+    ]
+  }
+}

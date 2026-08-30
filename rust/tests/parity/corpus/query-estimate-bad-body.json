@@ -1,0 +1,14 @@
+{
+  "request": {
+    "name": "query-estimate-bad-body",
+    "method": "POST",
+    "path": "/api/query/estimate",
+    "raw": "not json",
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "Body harus JSON {sql}"
+  }
+}

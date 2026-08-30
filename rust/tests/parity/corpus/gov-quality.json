@@ -1,0 +1,3513 @@
+{
+  "request": {
+    "name": "gov-quality",
+    "method": "GET",
+    "path": "/api/governance/quality"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "quality": [
+      {
+        "id": "q-0",
+        "name": "row_count",
+        "asset": "artis_top_global_chart",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:15"
+      },
+      {
+        "id": "q-1",
+        "name": "row_count",
+        "asset": "atlas",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:15"
+      },
+      {
+        "id": "q-2",
+        "name": "Konversi kolom jumlah_ulasan",
+        "asset": "atlas_nightlife",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:12:16"
+      },
+      {
+        "id": "q-3",
+        "name": "Konversi kolom rating",
+        "asset": "atlas_nightlife",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:12:16"
+      },
+      {
+        "id": "q-4",
+        "name": "row_count",
+        "asset": "atlas_nightlife",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:15"
+      },
+      {
+        "id": "q-5",
+        "name": "row_count",
+        "asset": "atlas_pertunjukan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:17"
+      },
+      {
+        "id": "q-6",
+        "name": "Konversi kolom jumlah_ulasan",
+        "asset": "atlas_restoran",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:12:20"
+      },
+      {
+        "id": "q-7",
+        "name": "row_count",
+        "asset": "atlas_restoran",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:20"
+      },
+      {
+        "id": "q-8",
+        "name": "Konversi kolom jumlah_ulasan",
+        "asset": "atlas_souvenir",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:12:21"
+      },
+      {
+        "id": "q-9",
+        "name": "Konversi kolom rating",
+        "asset": "atlas_souvenir",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:12:21"
+      },
+      {
+        "id": "q-10",
+        "name": "row_count",
+        "asset": "atlas_souvenir",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:20"
+      },
+      {
+        "id": "q-11",
+        "name": "row_count",
+        "asset": "bandara_ramah_muslim_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:21"
+      },
+      {
+        "id": "q-12",
+        "name": "Konversi kolom tahun",
+        "asset": "capaian_pariwisata_ramah_muslim",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:12:21"
+      },
+      {
+        "id": "q-13",
+        "name": "row_count",
+        "asset": "capaian_pariwisata_ramah_muslim",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:21"
+      },
+      {
+        "id": "q-14",
+        "name": "row_count",
+        "asset": "daftar_dokumen_standar_layanan_dan_pengelolaan_di_sektor_pariwisata",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:22"
+      },
+      {
+        "id": "q-15",
+        "name": "row_count",
+        "asset": "data_daftar_kegiatan_pameran_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:25"
+      },
+      {
+        "id": "q-16",
+        "name": "row_count",
+        "asset": "data_desa_wisata",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:32"
+      },
+      {
+        "id": "q-17",
+        "name": "row_count",
+        "asset": "data_destinasi_pariwisata_yang_memiliki_aksesibilitas_amenitas_atau_atraksi",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:34"
+      },
+      {
+        "id": "q-18",
+        "name": "Konversi kolom tanggal_terkumpul",
+        "asset": "data_dinas_pariwisata",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:12:45"
+      },
+      {
+        "id": "q-19",
+        "name": "row_count",
+        "asset": "data_dinas_pariwisata",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:40"
+      },
+      {
+        "id": "q-20",
+        "name": "row_count",
+        "asset": "data_event_pariwisata_dan_kebudayaan_dki_jakarta_2011_2019",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:45"
+      },
+      {
+        "id": "q-21",
+        "name": "row_count",
+        "asset": "data_golf",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:46"
+      },
+      {
+        "id": "q-22",
+        "name": "row_count",
+        "asset": "data_inbound_outbound_melalui_pintu_soekarno_hatta_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:46"
+      },
+      {
+        "id": "q-23",
+        "name": "row_count",
+        "asset": "data_industri_pariwisata",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:48"
+      },
+      {
+        "id": "q-24",
+        "name": "row_count",
+        "asset": "data_industri_pariwisata_dki_jakarta_2014",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:52"
+      },
+      {
+        "id": "q-25",
+        "name": "row_count",
+        "asset": "data_jumlah_hotel_berbintang_dan_non_bintang_di_provinsi_dki_jakarta_tahun_2020",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:53"
+      },
+      {
+        "id": "q-26",
+        "name": "row_count",
+        "asset": "data_jumlah_industri_pariwisata_di_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:53"
+      },
+      {
+        "id": "q-27",
+        "name": "row_count",
+        "asset": "data_jumlah_kunjungan_dan_pertumbuhan_wisatawan_mancanegara_di_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:53"
+      },
+      {
+        "id": "q-28",
+        "name": "row_count",
+        "asset": "data_jumlah_kunjungan_dan_pertumbuhan_wisatawan_mancanegara_ke_indonesia_berdasarkan_bulan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:54"
+      },
+      {
+        "id": "q-29",
+        "name": "row_count",
+        "asset": "data_jumlah_kunjungan_dan_pertumbuhan_wisatawan_mancanegara_ke_indonesia_berdasarkan_wilayah",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:54"
+      },
+      {
+        "id": "q-30",
+        "name": "row_count",
+        "asset": "data_jumlah_kunjungan_dan_ranking_wisatawan_mancanegara_ke_provinsi_dki_jakarta_melalui_pintu_soekarno_hatta_berdasarkan_kebangsaan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:54"
+      },
+      {
+        "id": "q-31",
+        "name": "row_count",
+        "asset": "data_jumlah_kunjungan_wisatawan_mancanegara_ke_destinasi_wisata_di_provinsi_dki_jakarta_tahun_2020",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:54"
+      },
+      {
+        "id": "q-32",
+        "name": "row_count",
+        "asset": "data_jumlah_kunjungan_wisatawan_mancanegara_ke_destinasi_wisata_di_provinsi_dki_jakarta_tahun_2021",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:12:56"
+      },
+      {
+        "id": "q-33",
+        "name": "row_count",
+        "asset": "data_jumlah_kunjungan_wisatawan_mancanegara_tahun_2019",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:01"
+      },
+      {
+        "id": "q-34",
+        "name": "row_count",
+        "asset": "data_jumlah_kunjungan_wisatawan_mancanegara_tahun_2020",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:08"
+      },
+      {
+        "id": "q-35",
+        "name": "row_count",
+        "asset": "data_jumlah_kunjungan_wisatawan_nusantara_ke_kepulauan_seribu",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:12"
+      },
+      {
+        "id": "q-36",
+        "name": "row_count",
+        "asset": "data_jumlah_kunjungan_wisatawan_nusantara_ke_taman_mini_indonesia_indah",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:12"
+      },
+      {
+        "id": "q-37",
+        "name": "row_count",
+        "asset": "data_jumlah_kunjungan_wisawatan_nusantara_ke_taman_impian_jaya_ancol",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:12"
+      },
+      {
+        "id": "q-38",
+        "name": "row_count",
+        "asset": "data_jumlah_kunjungan_wisawatan_nusantara_ke_taman_marga_satwa_ragunan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:13"
+      },
+      {
+        "id": "q-39",
+        "name": "row_count",
+        "asset": "data_jumlah_kunjungan_wisman_indonesia_jakarta_dan_share_wisman_jakarta_terhadap_indonesia_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:14"
+      },
+      {
+        "id": "q-40",
+        "name": "row_count",
+        "asset": "data_jumlah_kunjungan_wisman_ke_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:21"
+      },
+      {
+        "id": "q-41",
+        "name": "row_count",
+        "asset": "data_jumlah_kunjungan_wisman_ke_indonesia_berdasarkan_pintu_masuk_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:22"
+      },
+      {
+        "id": "q-42",
+        "name": "row_count",
+        "asset": "data_jumlah_penyedia_pelayanan_makanan_dan_minum_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:26"
+      },
+      {
+        "id": "q-43",
+        "name": "row_count",
+        "asset": "data_jumlah_peserta_pelatihan_profesi_kepariwisataan_di_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:26"
+      },
+      {
+        "id": "q-44",
+        "name": "row_count",
+        "asset": "data_jumlah_rekapitulasi_usaha_dan_kamar_hotel",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:28"
+      },
+      {
+        "id": "q-45",
+        "name": "row_count",
+        "asset": "data_jumlah_sdm_industri_pariwisata_bersertifikat_tahun_2019",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:31"
+      },
+      {
+        "id": "q-46",
+        "name": "Konversi kolom persentase_graha_wisata_ragunan",
+        "asset": "data_jumlah_tamu_yang_menginap_di_graha_wisata_provinsi_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:13:40"
+      },
+      {
+        "id": "q-47",
+        "name": "Konversi kolom persentase_graha_wisata_tmii",
+        "asset": "data_jumlah_tamu_yang_menginap_di_graha_wisata_provinsi_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:13:42"
+      },
+      {
+        "id": "q-48",
+        "name": "row_count",
+        "asset": "data_jumlah_tamu_yang_menginap_di_graha_wisata_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:32"
+      },
+      {
+        "id": "q-49",
+        "name": "row_count",
+        "asset": "data_jumlah_usaha_akomodasi_dan_tenaga_kerja_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:43"
+      },
+      {
+        "id": "q-50",
+        "name": "row_count",
+        "asset": "data_jumlah_usaha_jasa_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:43"
+      },
+      {
+        "id": "q-51",
+        "name": "row_count",
+        "asset": "data_jumlah_usaha_jasa_pariwisata",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:43"
+      },
+      {
+        "id": "q-52",
+        "name": "row_count",
+        "asset": "data_jumlah_usaha_pariwisata_bidang_hiburan_dan_rekreasi_menurut_jenis_usaha_dan_kecamatan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:43"
+      },
+      {
+        "id": "q-53",
+        "name": "row_count",
+        "asset": "data_jumlah_usaha_pariwisata_bidang_hiburan_dan_rekreasi_menurut_jenis_usaha_dan_kecamatan_titik",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:43"
+      },
+      {
+        "id": "q-54",
+        "name": "row_count",
+        "asset": "data_jumlah_usaha_wisata_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:44"
+      },
+      {
+        "id": "q-55",
+        "name": "row_count",
+        "asset": "data_jumlah_wisatawan_mancanegara_berdasarkan_kebangsaan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:45"
+      },
+      {
+        "id": "q-56",
+        "name": "row_count",
+        "asset": "data_jumlah_wisatawan_mancanegara_berdasarkan_kebangsaan_tahun_2023",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:13:52"
+      },
+      {
+        "id": "q-57",
+        "name": "row_count",
+        "asset": "data_jumlah_wisatawan_pengunjung_museum",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:01"
+      },
+      {
+        "id": "q-58",
+        "name": "row_count",
+        "asset": "data_kabupatenkota_kreatif_yang_dikembangkan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:05"
+      },
+      {
+        "id": "q-59",
+        "name": "row_count",
+        "asset": "data_kategori_event_jakarta_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:05"
+      },
+      {
+        "id": "q-60",
+        "name": "row_count",
+        "asset": "data_kategori_event_jakarta_perbulan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:05"
+      },
+      {
+        "id": "q-61",
+        "name": "row_count",
+        "asset": "data_kegiatan_pameran_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:05"
+      },
+      {
+        "id": "q-62",
+        "name": "row_count",
+        "asset": "data_kegiatan_pemberdayaan_masyarakat_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:06"
+      },
+      {
+        "id": "q-63",
+        "name": "row_count",
+        "asset": "data_kegiatan_promosi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:06"
+      },
+      {
+        "id": "q-64",
+        "name": "row_count",
+        "asset": "data_kegiatan_promosi_dki_jakarta_2011_2015",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:06"
+      },
+      {
+        "id": "q-65",
+        "name": "Konversi kolom jumlah",
+        "asset": "data_kunjungan_daya_tarik_wisata_di_provinsi_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:14:06"
+      },
+      {
+        "id": "q-66",
+        "name": "row_count",
+        "asset": "data_kunjungan_daya_tarik_wisata_di_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:06"
+      },
+      {
+        "id": "q-67",
+        "name": "Konversi kolom wisman",
+        "asset": "data_kunjungan_daya_tarik_wisata_provinsi_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:14:07"
+      },
+      {
+        "id": "q-68",
+        "name": "row_count",
+        "asset": "data_kunjungan_daya_tarik_wisata_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:07"
+      },
+      {
+        "id": "q-69",
+        "name": "row_count",
+        "asset": "data_kunjungan_tamu_graha_wisata_tmii_dan_ragunan_berdasarkan_status_tamu",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:07"
+      },
+      {
+        "id": "q-70",
+        "name": "row_count",
+        "asset": "data_kunjungan_wisata_mancanegara_ke_dki_jakarta_melalui_3_pintu_masuk_soekarno_hatta_tanjung_priok_halim_perdana_kusumah",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:07"
+      },
+      {
+        "id": "q-71",
+        "name": "row_count",
+        "asset": "data_kunjungan_wisatawan_mancanegara_ke_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:08"
+      },
+      {
+        "id": "q-72",
+        "name": "row_count",
+        "asset": "data_kunjungan_wisatawan_mancanegara_ke_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:09"
+      },
+      {
+        "id": "q-73",
+        "name": "Konversi kolom jumlah",
+        "asset": "data_kunjungan_wisatawan_mancanegara_ke_provinsi_dki_jakarta_tahun_2018",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:14:20"
+      },
+      {
+        "id": "q-74",
+        "name": "row_count",
+        "asset": "data_kunjungan_wisatawan_mancanegara_ke_provinsi_dki_jakarta_tahun_2018",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:16"
+      },
+      {
+        "id": "q-75",
+        "name": "row_count",
+        "asset": "data_kunjungan_wisatawan_mancanegara_ke_provinsi_dki_jakarta_tahun_2020_melalui_2_pintu_masuk",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:23"
+      },
+      {
+        "id": "q-76",
+        "name": "row_count",
+        "asset": "data_kunjungan_wisatawan_mancanegara_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:23"
+      },
+      {
+        "id": "q-77",
+        "name": "row_count",
+        "asset": "data_kunjungan_wisatawan_nusantara_dan_wisatawan_mancanegara_ke_tic_dki_jakarta_tahun_2018",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:25"
+      },
+      {
+        "id": "q-78",
+        "name": "row_count",
+        "asset": "data_kunjungan_wisatawan_nusantara_dan_wisatawan_mancanegara_ke_tic_dki_jakarta_tahun_2023",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:30"
+      },
+      {
+        "id": "q-79",
+        "name": "row_count",
+        "asset": "data_kunjungan_wisatawan_nusantara_dan_wisatawan_mancanegara_ke_tic_dki_jakarta_titik",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:37"
+      },
+      {
+        "id": "q-80",
+        "name": "row_count",
+        "asset": "data_kunjungan_wisatawan_nusantara_dan_wisatawan_mancanegara_ke_tourist_information_center_tic_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:40"
+      },
+      {
+        "id": "q-81",
+        "name": "row_count",
+        "asset": "data_kunjungan_wisatawan_nusantara_dan_wisatawan_mancanegara_ke_tourist_information_center_tic_provinsi_dki_jakarta_tahun_2024",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:44"
+      },
+      {
+        "id": "q-82",
+        "name": "Konversi kolom pertumbuhan",
+        "asset": "data_kunjungan_wisatawan_nusantara_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:14:46"
+      },
+      {
+        "id": "q-83",
+        "name": "row_count",
+        "asset": "data_kunjungan_wisatawan_nusantara_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:46"
+      },
+      {
+        "id": "q-84",
+        "name": "Konversi kolom jumlah",
+        "asset": "data_kunjungan_wisatawan_nusantara_ke_destinasi_wisata_di_provinsi_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:14:47"
+      },
+      {
+        "id": "q-85",
+        "name": "row_count",
+        "asset": "data_kunjungan_wisatawan_nusantara_ke_destinasi_wisata_di_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:46"
+      },
+      {
+        "id": "q-86",
+        "name": "row_count",
+        "asset": "data_kunjungan_wisman_ke_jakarta_melalui_pintu_soekarno_hatta_berdasarkan_kebangsaan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:47"
+      },
+      {
+        "id": "q-87",
+        "name": "row_count",
+        "asset": "data_lokasi_pusat_pelayanan_informasi_pariwisata_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:48"
+      },
+      {
+        "id": "q-88",
+        "name": "row_count",
+        "asset": "data_pad_pariwisata_dki_jakarta_tahun_2010",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:48"
+      },
+      {
+        "id": "q-89",
+        "name": "row_count",
+        "asset": "data_pelatihan_profesi_kepariwisataan_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:48"
+      },
+      {
+        "id": "q-90",
+        "name": "row_count",
+        "asset": "data_pelatihan_tenaga_kerja_profesi_kepariwisataan_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:48"
+      },
+      {
+        "id": "q-91",
+        "name": "Konversi kolom tanggal_pemberian_rekomendasi",
+        "asset": "data_pemberian_rekomendasi_penyelenggaraan_pertunjukan_musik",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:15:02"
+      },
+      {
+        "id": "q-92",
+        "name": "row_count",
+        "asset": "data_pemberian_rekomendasi_penyelenggaraan_pertunjukan_musik",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:14:51"
+      },
+      {
+        "id": "q-93",
+        "name": "row_count",
+        "asset": "data_pendapatan_asli_daerah_pad_sektor_pariwisata",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:15:03"
+      },
+      {
+        "id": "q-94",
+        "name": "row_count",
+        "asset": "data_pendapatan_asli_daerah_pad_sektor_pariwisata_tahun_2023",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:15:16"
+      },
+      {
+        "id": "q-95",
+        "name": "row_count",
+        "asset": "data_penerimaan_pendapatan_asli_daerah_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:15:30"
+      },
+      {
+        "id": "q-96",
+        "name": "row_count",
+        "asset": "data_penerimaan_pendapatan_asli_daerah_pad_sektor_pariwisata_pemerintah_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:15:30"
+      },
+      {
+        "id": "q-97",
+        "name": "row_count",
+        "asset": "data_penerimaan_retribusi_daerah_dinas_pariwisata_kebudayaan_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:15:30"
+      },
+      {
+        "id": "q-98",
+        "name": "row_count",
+        "asset": "data_pengunjung_museum_menurut_jenis_museum_di_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:15:31"
+      },
+      {
+        "id": "q-99",
+        "name": "Konversi kolom jumlah",
+        "asset": "data_pengunjung_tic_bandara_soetta_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:15:35"
+      },
+      {
+        "id": "q-100",
+        "name": "row_count",
+        "asset": "data_pengunjung_tic_bandara_soetta_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:15:33"
+      },
+      {
+        "id": "q-101",
+        "name": "Konversi kolom jumlah",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:15:42"
+      },
+      {
+        "id": "q-102",
+        "name": "Konversi kolom tgl_1",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:15:46"
+      },
+      {
+        "id": "q-103",
+        "name": "Konversi kolom tgl_10",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:15:48"
+      },
+      {
+        "id": "q-104",
+        "name": "Konversi kolom tgl_11",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:15:51"
+      },
+      {
+        "id": "q-105",
+        "name": "Konversi kolom tgl_12",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:15:54"
+      },
+      {
+        "id": "q-106",
+        "name": "Konversi kolom tgl_13",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:15:56"
+      },
+      {
+        "id": "q-107",
+        "name": "Konversi kolom tgl_14",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:15:59"
+      },
+      {
+        "id": "q-108",
+        "name": "Konversi kolom tgl_15",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:01"
+      },
+      {
+        "id": "q-109",
+        "name": "Konversi kolom tgl_16",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:04"
+      },
+      {
+        "id": "q-110",
+        "name": "Konversi kolom tgl_17",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:07"
+      },
+      {
+        "id": "q-111",
+        "name": "Konversi kolom tgl_18",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:09"
+      },
+      {
+        "id": "q-112",
+        "name": "Konversi kolom tgl_19",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:12"
+      },
+      {
+        "id": "q-113",
+        "name": "Konversi kolom tgl_2",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:15"
+      },
+      {
+        "id": "q-114",
+        "name": "Konversi kolom tgl_20",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:18"
+      },
+      {
+        "id": "q-115",
+        "name": "Konversi kolom tgl_21",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:20"
+      },
+      {
+        "id": "q-116",
+        "name": "Konversi kolom tgl_22",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:23"
+      },
+      {
+        "id": "q-117",
+        "name": "Konversi kolom tgl_23",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:25"
+      },
+      {
+        "id": "q-118",
+        "name": "Konversi kolom tgl_24",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:28"
+      },
+      {
+        "id": "q-119",
+        "name": "Konversi kolom tgl_25",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:31"
+      },
+      {
+        "id": "q-120",
+        "name": "Konversi kolom tgl_26",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:33"
+      },
+      {
+        "id": "q-121",
+        "name": "Konversi kolom tgl_27",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:36"
+      },
+      {
+        "id": "q-122",
+        "name": "Konversi kolom tgl_28",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:39"
+      },
+      {
+        "id": "q-123",
+        "name": "Konversi kolom tgl_29",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:41"
+      },
+      {
+        "id": "q-124",
+        "name": "Konversi kolom tgl_3",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:44"
+      },
+      {
+        "id": "q-125",
+        "name": "Konversi kolom tgl_30",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:46"
+      },
+      {
+        "id": "q-126",
+        "name": "Konversi kolom tgl_31",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:49"
+      },
+      {
+        "id": "q-127",
+        "name": "Konversi kolom tgl_4",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:52"
+      },
+      {
+        "id": "q-128",
+        "name": "Konversi kolom tgl_5",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:54"
+      },
+      {
+        "id": "q-129",
+        "name": "Konversi kolom tgl_6",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:57"
+      },
+      {
+        "id": "q-130",
+        "name": "Konversi kolom tgl_7",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:16:59"
+      },
+      {
+        "id": "q-131",
+        "name": "Konversi kolom tgl_8",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:02"
+      },
+      {
+        "id": "q-132",
+        "name": "Konversi kolom tgl_9",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:04"
+      },
+      {
+        "id": "q-133",
+        "name": "row_count",
+        "asset": "data_pengunjung_tic_jakarta_theter_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:15:39"
+      },
+      {
+        "id": "q-134",
+        "name": "Konversi kolom tgl_1",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:10"
+      },
+      {
+        "id": "q-135",
+        "name": "Konversi kolom tgl_10",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:13"
+      },
+      {
+        "id": "q-136",
+        "name": "Konversi kolom tgl_11",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:15"
+      },
+      {
+        "id": "q-137",
+        "name": "Konversi kolom tgl_12",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:18"
+      },
+      {
+        "id": "q-138",
+        "name": "Konversi kolom tgl_13",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:20"
+      },
+      {
+        "id": "q-139",
+        "name": "Konversi kolom tgl_14",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:23"
+      },
+      {
+        "id": "q-140",
+        "name": "Konversi kolom tgl_15",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:26"
+      },
+      {
+        "id": "q-141",
+        "name": "Konversi kolom tgl_16",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:28"
+      },
+      {
+        "id": "q-142",
+        "name": "Konversi kolom tgl_17",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:31"
+      },
+      {
+        "id": "q-143",
+        "name": "Konversi kolom tgl_18",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:33"
+      },
+      {
+        "id": "q-144",
+        "name": "Konversi kolom tgl_19",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:36"
+      },
+      {
+        "id": "q-145",
+        "name": "Konversi kolom tgl_2",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:39"
+      },
+      {
+        "id": "q-146",
+        "name": "Konversi kolom tgl_20",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:41"
+      },
+      {
+        "id": "q-147",
+        "name": "Konversi kolom tgl_21",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:44"
+      },
+      {
+        "id": "q-148",
+        "name": "Konversi kolom tgl_22",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:46"
+      },
+      {
+        "id": "q-149",
+        "name": "Konversi kolom tgl_23",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:49"
+      },
+      {
+        "id": "q-150",
+        "name": "Konversi kolom tgl_24",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:52"
+      },
+      {
+        "id": "q-151",
+        "name": "Konversi kolom tgl_25",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:54"
+      },
+      {
+        "id": "q-152",
+        "name": "Konversi kolom tgl_26",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:57"
+      },
+      {
+        "id": "q-153",
+        "name": "Konversi kolom tgl_27",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:17:59"
+      },
+      {
+        "id": "q-154",
+        "name": "Konversi kolom tgl_28",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:18:02"
+      },
+      {
+        "id": "q-155",
+        "name": "Konversi kolom tgl_29",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:18:05"
+      },
+      {
+        "id": "q-156",
+        "name": "Konversi kolom tgl_3",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:18:08"
+      },
+      {
+        "id": "q-157",
+        "name": "Konversi kolom tgl_30",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:18:11"
+      },
+      {
+        "id": "q-158",
+        "name": "Konversi kolom tgl_4",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:18:13"
+      },
+      {
+        "id": "q-159",
+        "name": "Konversi kolom tgl_5",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:18:16"
+      },
+      {
+        "id": "q-160",
+        "name": "Konversi kolom tgl_6",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:18:18"
+      },
+      {
+        "id": "q-161",
+        "name": "Konversi kolom tgl_7",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:18:21"
+      },
+      {
+        "id": "q-162",
+        "name": "Konversi kolom tgl_8",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:18:24"
+      },
+      {
+        "id": "q-163",
+        "name": "Konversi kolom tgl_9",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:18:26"
+      },
+      {
+        "id": "q-164",
+        "name": "row_count",
+        "asset": "data_pengunjung_tic_kota_tua_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:17:06"
+      },
+      {
+        "id": "q-165",
+        "name": "row_count",
+        "asset": "data_pengunjung_tic_tourist_information_center_bali",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:26"
+      },
+      {
+        "id": "q-166",
+        "name": "Konversi kolom jumlah",
+        "asset": "data_pengunjung_tic_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:18:30"
+      },
+      {
+        "id": "q-167",
+        "name": "Konversi kolom periode_data",
+        "asset": "data_pengunjung_tic_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:18:33"
+      },
+      {
+        "id": "q-168",
+        "name": "row_count",
+        "asset": "data_pengunjung_tic_upt_pusat_pengembangan_dan_pelayanan_informasi_pariwisata",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:28"
+      },
+      {
+        "id": "q-169",
+        "name": "row_count",
+        "asset": "data_pengunjung_tourist_information_center_tic_djakartatheatre_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:35"
+      },
+      {
+        "id": "q-170",
+        "name": "Konversi kolom jumlah",
+        "asset": "data_pengunjung_tourist_information_center_tic_up_kawasan_kota_tua_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:18:35"
+      },
+      {
+        "id": "q-171",
+        "name": "row_count",
+        "asset": "data_pengunjung_tourist_information_center_tic_up_kawasan_kota_tua_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:35"
+      },
+      {
+        "id": "q-172",
+        "name": "row_count",
+        "asset": "data_pengunjung_tourist_information_center_tic_up_monumen_nasional_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:35"
+      },
+      {
+        "id": "q-173",
+        "name": "row_count",
+        "asset": "data_pengunjung_tourist_information_center_tic_up_museum_tekstil_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:35"
+      },
+      {
+        "id": "q-174",
+        "name": "row_count",
+        "asset": "data_pengunjung_tourist_information_service_tis_bandara_soekarno_hatta_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:36"
+      },
+      {
+        "id": "q-175",
+        "name": "row_count",
+        "asset": "data_penyelenggaraan_event_pariwisata_dan_budaya_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:36"
+      },
+      {
+        "id": "q-176",
+        "name": "row_count",
+        "asset": "data_penyelenggaraan_event_pariwisata_dan_budaya_dki_jakarta_2015",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:36"
+      },
+      {
+        "id": "q-177",
+        "name": "row_count",
+        "asset": "data_perpasaran_swasta_pasar_swalayan_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:36"
+      },
+      {
+        "id": "q-178",
+        "name": "row_count",
+        "asset": "data_potensi_dan_masalah_pengembangan_pariwisata_di_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:37"
+      },
+      {
+        "id": "q-179",
+        "name": "row_count",
+        "asset": "data_potensi_daya_tarik_wisata_unggulan_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:37"
+      },
+      {
+        "id": "q-180",
+        "name": "row_count",
+        "asset": "data_presentase_jumlah_wisatawan_mancanegara_dan_wisatawan_nusantara_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:37"
+      },
+      {
+        "id": "q-181",
+        "name": "row_count",
+        "asset": "data_program_sub_program_dan_komponen_kegiatan_kepariwisataan_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:37"
+      },
+      {
+        "id": "q-182",
+        "name": "Konversi kolom laju_wisatawan_nusantara",
+        "asset": "data_proyeksi_penerimaan_devisa_dari_wisman_dan_akumulasi_belanja_wisatawan_nusantara",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:18:38"
+      },
+      {
+        "id": "q-183",
+        "name": "row_count",
+        "asset": "data_proyeksi_penerimaan_devisa_dari_wisman_dan_akumulasi_belanja_wisatawan_nusantara",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:37"
+      },
+      {
+        "id": "q-184",
+        "name": "row_count",
+        "asset": "data_rata_rata_lama_menginap_wisatawan_mancanegara_dan_wisatawan_nusantara_pada_hotel_berbintang_di_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:39"
+      },
+      {
+        "id": "q-185",
+        "name": "row_count",
+        "asset": "data_rata_rata_lama_menginap_wisatawan_mancanegara_pada_hotel_berbintang_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:44"
+      },
+      {
+        "id": "q-186",
+        "name": "row_count",
+        "asset": "data_rata_rata_lama_menginap_wisatawan_mancanegara_pada_hotel_berbintang_di_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:49"
+      },
+      {
+        "id": "q-187",
+        "name": "row_count",
+        "asset": "data_rata_rata_lama_menginap_wisatawan_mancanegara_pada_hotel_berbintang_di_provinsi_dki_jakarta_titik",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:49"
+      },
+      {
+        "id": "q-188",
+        "name": "row_count",
+        "asset": "data_rata_rata_lama_menginap_wisatawan_nusantara_pada_hotel_berbintang_di_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:51"
+      },
+      {
+        "id": "q-189",
+        "name": "row_count",
+        "asset": "data_rata_rata_lama_menginap_wisatawan_nusantara_pada_hotel_berbintang_di_provinsi_dki_jakarta_berdasarkan_jenis_hotel",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:18:57"
+      },
+      {
+        "id": "q-190",
+        "name": "row_count",
+        "asset": "data_rata_rata_lama_menginap_wisman_di_hotel_berbintang_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:02"
+      },
+      {
+        "id": "q-191",
+        "name": "row_count",
+        "asset": "data_rata_rata_tingkat_hunian_kamar_pada_hotel_berbintang_di_dki_jakarta_tahun_2023",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:04"
+      },
+      {
+        "id": "q-192",
+        "name": "row_count",
+        "asset": "data_rata_rata_tingkat_hunian_kamar_pada_hotel_berbintang_di_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:10"
+      },
+      {
+        "id": "q-193",
+        "name": "row_count",
+        "asset": "data_rata_rata_tingkat_hunian_kamar_pada_hotel_berbintang_di_provinsi_dki_jakarta_tahun_2011_2018",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:13"
+      },
+      {
+        "id": "q-194",
+        "name": "Konversi kolom agustus",
+        "asset": "data_rekap_pendistribusian_brosur_pariwisata_bulan_januari_sd_desember_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:19:18"
+      },
+      {
+        "id": "q-195",
+        "name": "Konversi kolom april",
+        "asset": "data_rekap_pendistribusian_brosur_pariwisata_bulan_januari_sd_desember_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:19:20"
+      },
+      {
+        "id": "q-196",
+        "name": "Konversi kolom februari",
+        "asset": "data_rekap_pendistribusian_brosur_pariwisata_bulan_januari_sd_desember_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:19:24"
+      },
+      {
+        "id": "q-197",
+        "name": "Konversi kolom januari",
+        "asset": "data_rekap_pendistribusian_brosur_pariwisata_bulan_januari_sd_desember_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:19:27"
+      },
+      {
+        "id": "q-198",
+        "name": "Konversi kolom juli",
+        "asset": "data_rekap_pendistribusian_brosur_pariwisata_bulan_januari_sd_desember_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:19:29"
+      },
+      {
+        "id": "q-199",
+        "name": "Konversi kolom juni",
+        "asset": "data_rekap_pendistribusian_brosur_pariwisata_bulan_januari_sd_desember_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:19:32"
+      },
+      {
+        "id": "q-200",
+        "name": "Konversi kolom maret",
+        "asset": "data_rekap_pendistribusian_brosur_pariwisata_bulan_januari_sd_desember_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:19:34"
+      },
+      {
+        "id": "q-201",
+        "name": "Konversi kolom mei",
+        "asset": "data_rekap_pendistribusian_brosur_pariwisata_bulan_januari_sd_desember_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:19:37"
+      },
+      {
+        "id": "q-202",
+        "name": "Konversi kolom november",
+        "asset": "data_rekap_pendistribusian_brosur_pariwisata_bulan_januari_sd_desember_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:19:39"
+      },
+      {
+        "id": "q-203",
+        "name": "Konversi kolom oktober",
+        "asset": "data_rekap_pendistribusian_brosur_pariwisata_bulan_januari_sd_desember_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:19:42"
+      },
+      {
+        "id": "q-204",
+        "name": "Konversi kolom september",
+        "asset": "data_rekap_pendistribusian_brosur_pariwisata_bulan_januari_sd_desember_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:19:47"
+      },
+      {
+        "id": "q-205",
+        "name": "row_count",
+        "asset": "data_rekap_pendistribusian_brosur_pariwisata_bulan_januari_sd_desember_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:15"
+      },
+      {
+        "id": "q-206",
+        "name": "row_count",
+        "asset": "data_rekap_pengunjung_tourist_information_center_tic_djakarta_theatre",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:48"
+      },
+      {
+        "id": "q-207",
+        "name": "row_count",
+        "asset": "data_rekomendasi_penyelenggaraan_pertunjukan_musik",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:49"
+      },
+      {
+        "id": "q-208",
+        "name": "row_count",
+        "asset": "data_rencana_narasumber_rdpu_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:49"
+      },
+      {
+        "id": "q-209",
+        "name": "row_count",
+        "asset": "data_resto_cafe_dan_cakes",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:50"
+      },
+      {
+        "id": "q-210",
+        "name": "row_count",
+        "asset": "data_seni_pertunjukan_dan_visual",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:53"
+      },
+      {
+        "id": "q-211",
+        "name": "row_count",
+        "asset": "data_statistik_wisata_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:53"
+      },
+      {
+        "id": "q-212",
+        "name": "row_count",
+        "asset": "data_sumber_daya_manusia_sdm_yang_bekerja_di_bidang_industri_pariwisata",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:54"
+      },
+      {
+        "id": "q-213",
+        "name": "row_count",
+        "asset": "data_target_kunjungan_wisata_mancanegara_ke_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:54"
+      },
+      {
+        "id": "q-214",
+        "name": "row_count",
+        "asset": "data_toko_serba_ada_toserba_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:54"
+      },
+      {
+        "id": "q-215",
+        "name": "row_count",
+        "asset": "data_usaha_hiburan_dan_rekreasi_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:54"
+      },
+      {
+        "id": "q-216",
+        "name": "Konversi kolom jumlah",
+        "asset": "data_usaha_hiburan_dan_rekreasi_di_dki_jakarta_2018",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:19:55"
+      },
+      {
+        "id": "q-217",
+        "name": "row_count",
+        "asset": "data_usaha_hiburan_dan_rekreasi_di_dki_jakarta_2018",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:55"
+      },
+      {
+        "id": "q-218",
+        "name": "Konversi kolom rt",
+        "asset": "data_usaha_jasa_akomodasi_di_dki_jakarta_tahun_2014",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:19:55"
+      },
+      {
+        "id": "q-219",
+        "name": "Konversi kolom rw",
+        "asset": "data_usaha_jasa_akomodasi_di_dki_jakarta_tahun_2014",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:19:55"
+      },
+      {
+        "id": "q-220",
+        "name": "row_count",
+        "asset": "data_usaha_jasa_akomodasi_di_dki_jakarta_tahun_2014",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:55"
+      },
+      {
+        "id": "q-221",
+        "name": "row_count",
+        "asset": "data_usaha_jasa_akomodasi_hotel_bintang",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:56"
+      },
+      {
+        "id": "q-222",
+        "name": "row_count",
+        "asset": "data_usaha_jasa_akomodasi_jenis_usaha_motel_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:56"
+      },
+      {
+        "id": "q-223",
+        "name": "row_count",
+        "asset": "data_usaha_jasa_makanan_dan_minuman_jenis_usaha_restoran_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:56"
+      },
+      {
+        "id": "q-224",
+        "name": "row_count",
+        "asset": "data_usaha_jasa_makanan_minuman_food_court",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:56"
+      },
+      {
+        "id": "q-225",
+        "name": "row_count",
+        "asset": "data_usaha_jasa_makanan_minuman_jenis_usaha_bar_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:56"
+      },
+      {
+        "id": "q-226",
+        "name": "Konversi kolom rt",
+        "asset": "data_usaha_jasa_makanan_minuman_jenis_usaha_cafetaria_di_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:19:57"
+      },
+      {
+        "id": "q-227",
+        "name": "Konversi kolom rw",
+        "asset": "data_usaha_jasa_makanan_minuman_jenis_usaha_cafetaria_di_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:19:57"
+      },
+      {
+        "id": "q-228",
+        "name": "row_count",
+        "asset": "data_usaha_jasa_makanan_minuman_jenis_usaha_cafetaria_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:57"
+      },
+      {
+        "id": "q-229",
+        "name": "row_count",
+        "asset": "data_usaha_jasa_makanan_minuman_jenis_usaha_cafetaria_di_dki_jakarta_titik",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:57"
+      },
+      {
+        "id": "q-230",
+        "name": "row_count",
+        "asset": "data_usaha_jasa_travel_jenis_usaha_biro_perjalanan_wisata_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:19:59"
+      },
+      {
+        "id": "q-231",
+        "name": "row_count",
+        "asset": "data_usaha_jasa_travel_jenis_usaha_cabang_biro_perjalanan_wisata_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:03"
+      },
+      {
+        "id": "q-232",
+        "name": "row_count",
+        "asset": "data_usaha_jasa_travel_jenis_usaha_gerai_travel_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:06"
+      },
+      {
+        "id": "q-233",
+        "name": "row_count",
+        "asset": "data_usaha_pariwisata_bidang_penyediaan_makanan_dan_minuman_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:06"
+      },
+      {
+        "id": "q-234",
+        "name": "row_count",
+        "asset": "data_usaha_pariwisata_bidang_penyediaan_makanan_dan_minuman_di_dki_jakarta_titik",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:06"
+      },
+      {
+        "id": "q-235",
+        "name": "row_count",
+        "asset": "data_usaha_pariwisata_bidang_usaha_penyediaan_akomodasi_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:07"
+      },
+      {
+        "id": "q-236",
+        "name": "row_count",
+        "asset": "data_wisatawan_mancanegara_ke_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:07"
+      },
+      {
+        "id": "q-237",
+        "name": "row_count",
+        "asset": "data_wiswan_per_kebangsaan_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:09"
+      },
+      {
+        "id": "q-238",
+        "name": "row_count",
+        "asset": "data_wiswan_per_kebangsaan_dki_jakarta_titik",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:13"
+      },
+      {
+        "id": "q-239",
+        "name": "row_count",
+        "asset": "dim_bulan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:16"
+      },
+      {
+        "id": "q-240",
+        "name": "row_count",
+        "asset": "dim_indikator",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:16"
+      },
+      {
+        "id": "q-241",
+        "name": "row_count",
+        "asset": "dim_negara",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:16"
+      },
+      {
+        "id": "q-242",
+        "name": "row_count",
+        "asset": "dim_periode",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:16"
+      },
+      {
+        "id": "q-243",
+        "name": "row_count",
+        "asset": "dim_wilayah",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:16"
+      },
+      {
+        "id": "q-244",
+        "name": "row_count",
+        "asset": "event",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:17"
+      },
+      {
+        "id": "q-245",
+        "name": "row_count",
+        "asset": "gci_gpci_compliance_sheet",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:17"
+      },
+      {
+        "id": "q-246",
+        "name": "row_count",
+        "asset": "gci_gpci_indicators",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:17"
+      },
+      {
+        "id": "q-247",
+        "name": "row_count",
+        "asset": "gci_gpci_pariwisata_data_ada",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:17"
+      },
+      {
+        "id": "q-248",
+        "name": "row_count",
+        "asset": "gci_gpci_pariwisata_data_gaada",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:17"
+      },
+      {
+        "id": "q-249",
+        "name": "row_count",
+        "asset": "gci_gpci_pariwisata_sheet",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:17"
+      },
+      {
+        "id": "q-250",
+        "name": "row_count",
+        "asset": "halal_crawl",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:18"
+      },
+      {
+        "id": "q-251",
+        "name": "Konversi kolom lat",
+        "asset": "hotel_ramah_muslim_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:20:18"
+      },
+      {
+        "id": "q-252",
+        "name": "Konversi kolom lon",
+        "asset": "hotel_ramah_muslim_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:20:18"
+      },
+      {
+        "id": "q-253",
+        "name": "row_count",
+        "asset": "hotel_ramah_muslim_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:18"
+      },
+      {
+        "id": "q-254",
+        "name": "Konversi kolom pemeliharaan_rehabilitas_sarana_dan_prasarana_pendukung_gedung_kantor",
+        "asset": "indeks_kepuasan_layanan_penunjang_urusan_pemerintahan_daerah_dinas_pariwisata_dan_ekonomi_kreatif_tahun_2023",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:20:41"
+      },
+      {
+        "id": "q-255",
+        "name": "Konversi kolom pemeliharaan_rehabilitasi_gedung_kantor_dan_bangunan",
+        "asset": "indeks_kepuasan_layanan_penunjang_urusan_pemerintahan_daerah_dinas_pariwisata_dan_ekonomi_kreatif_tahun_2023",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:20:44"
+      },
+      {
+        "id": "q-256",
+        "name": "row_count",
+        "asset": "indeks_kepuasan_layanan_penunjang_urusan_pemerintahan_daerah_dinas_pariwisata_dan_ekonomi_kreatif_tahun_2023",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:20"
+      },
+      {
+        "id": "q-257",
+        "name": "row_count",
+        "asset": "indeks_kepuasan_layanan_penunjang_urusan_pemerintahan_daerah_pada_dinas_pariwisata_dan_ekonomi_kreatif",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:54"
+      },
+      {
+        "id": "q-258",
+        "name": "Konversi kolom lat",
+        "asset": "inovasi_wisata_ramah_muslim_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:20:58"
+      },
+      {
+        "id": "q-259",
+        "name": "Konversi kolom lon",
+        "asset": "inovasi_wisata_ramah_muslim_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:20:58"
+      },
+      {
+        "id": "q-260",
+        "name": "row_count",
+        "asset": "inovasi_wisata_ramah_muslim_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:58"
+      },
+      {
+        "id": "q-261",
+        "name": "row_count",
+        "asset": "jumlah_data_statistik_pariwisata_dan_ekonomi_kreatif_yang_tersedia_dalam_format_database",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:58"
+      },
+      {
+        "id": "q-262",
+        "name": "row_count",
+        "asset": "jumlah_e_tourism",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:59"
+      },
+      {
+        "id": "q-263",
+        "name": "row_count",
+        "asset": "jumlah_e_tourism_titik",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:59"
+      },
+      {
+        "id": "q-264",
+        "name": "row_count",
+        "asset": "jumlah_fasilitasi_kegiatan_peningkatan_kapasitas_dan_sertifikasi_kompetensi_pada_pelaku_ekonomi_kreatif",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:59"
+      },
+      {
+        "id": "q-265",
+        "name": "row_count",
+        "asset": "jumlah_industri_pariwisata_yang_memiliki_tdup_tanda_daftar_usaha_pariwisata",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:20:59"
+      },
+      {
+        "id": "q-266",
+        "name": "Konversi kolom jumlah_kunjungan",
+        "asset": "jumlah_kunjungan_wisatawan_ke_obyek_wisata_menurut_lokasi_di_provinsi_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:21:04"
+      },
+      {
+        "id": "q-267",
+        "name": "row_count",
+        "asset": "jumlah_kunjungan_wisatawan_ke_obyek_wisata_menurut_lokasi_di_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:01"
+      },
+      {
+        "id": "q-268",
+        "name": "row_count",
+        "asset": "jumlah_kunjungan_wisatawan_ke_obyek_wisata_unggulan_menurut_lokasi_di_dki_jakarta_tahun_2023",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:08"
+      },
+      {
+        "id": "q-269",
+        "name": "row_count",
+        "asset": "jumlah_kunjungan_wisatawan_ke_obyek_wisata_unggulan_menurut_lokasi_di_provinsi_dki_jakarta_tahun_2024",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:10"
+      },
+      {
+        "id": "q-270",
+        "name": "row_count",
+        "asset": "jumlah_pelaku_usaha_pariwisata_dan_ekonomi_kreatif_yang_difasilitasi_terkait_industri_halal_dan_ekonomi_syariah",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:13"
+      },
+      {
+        "id": "q-271",
+        "name": "row_count",
+        "asset": "jumlah_pendidikan_dan_pelatihan_pemasaran_digital",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:13"
+      },
+      {
+        "id": "q-272",
+        "name": "row_count",
+        "asset": "jumlah_pengunjung_e_tourism",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:14"
+      },
+      {
+        "id": "q-273",
+        "name": "row_count",
+        "asset": "jumlah_pengunjung_e_tourism_tahun_2023",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:26"
+      },
+      {
+        "id": "q-274",
+        "name": "row_count",
+        "asset": "jumlah_pengunjung_event",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:41"
+      },
+      {
+        "id": "q-275",
+        "name": "Konversi kolom lat",
+        "asset": "jumlah_pengunjung_event_2026",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:21:45"
+      },
+      {
+        "id": "q-276",
+        "name": "Konversi kolom lon",
+        "asset": "jumlah_pengunjung_event_2026",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:21:45"
+      },
+      {
+        "id": "q-277",
+        "name": "row_count",
+        "asset": "jumlah_pengunjung_event_2026",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:45"
+      },
+      {
+        "id": "q-278",
+        "name": "row_count",
+        "asset": "jumlah_pengunjung_event_tahun_2023",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:47"
+      },
+      {
+        "id": "q-279",
+        "name": "row_count",
+        "asset": "jumlah_penyelenggaraan_event",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:52"
+      },
+      {
+        "id": "q-280",
+        "name": "Konversi kolom kelas",
+        "asset": "jumlah_produkjasa_ekonomi_kreatif_yang_didaftarkan_kekayaan_intelektualnya",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:21:52"
+      },
+      {
+        "id": "q-281",
+        "name": "row_count",
+        "asset": "jumlah_produkjasa_ekonomi_kreatif_yang_didaftarkan_kekayaan_intelektualnya",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:52"
+      },
+      {
+        "id": "q-282",
+        "name": "row_count",
+        "asset": "jumlah_realisasi_investasi_pariwisata",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:52"
+      },
+      {
+        "id": "q-283",
+        "name": "row_count",
+        "asset": "jumlah_restoran_per_kelurahan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:53"
+      },
+      {
+        "id": "q-284",
+        "name": "row_count",
+        "asset": "jumlah_tenaga_kerja_pariwisata_dan_ekonomi_kreatif_yang_tersertifikasi",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:53"
+      },
+      {
+        "id": "q-285",
+        "name": "row_count",
+        "asset": "jumlah_tenaga_kerja_pariwisata_dan_ekonomi_kreatif_yang_tersertifikasi_tahun_2023_dan_2024",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:53"
+      },
+      {
+        "id": "q-286",
+        "name": "Konversi kolom pertumbuhan_jumlah_pelaku_usaha_dibanding_tahun_sebelumnya",
+        "asset": "jumlah_usaha_ekonomi_kreatif",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:21:53"
+      },
+      {
+        "id": "q-287",
+        "name": "row_count",
+        "asset": "jumlah_usaha_ekonomi_kreatif",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:53"
+      },
+      {
+        "id": "q-288",
+        "name": "Konversi kolom pertumbuhan_jumlah_pelaku_usaha_dibanding_tahun_sebelumnya",
+        "asset": "jumlah_usaha_ekonomi_kreatif_tahun_2023",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:21:54"
+      },
+      {
+        "id": "q-289",
+        "name": "row_count",
+        "asset": "jumlah_usaha_ekonomi_kreatif_tahun_2023",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:54"
+      },
+      {
+        "id": "q-290",
+        "name": "Konversi kolom jumlah_tki",
+        "asset": "jumlah_usaha_jasa_makanan_dan_minuman_pariwisata_yang_memiliki_perizinan",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:21:54"
+      },
+      {
+        "id": "q-291",
+        "name": "row_count",
+        "asset": "jumlah_usaha_jasa_makanan_dan_minuman_pariwisata_yang_memiliki_perizinan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:54"
+      },
+      {
+        "id": "q-292",
+        "name": "row_count",
+        "asset": "jumlah_usaha_jasa_perjalanan_wisata_pariwisata_yang_memiliki_perizinan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:55"
+      },
+      {
+        "id": "q-293",
+        "name": "Konversi kolom jumlah",
+        "asset": "jumlah_usaha_pariwisata_bidang_hiburan_dan_rekreasi_menurut_jenis_usaha_di_dki_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:21:55"
+      },
+      {
+        "id": "q-294",
+        "name": "row_count",
+        "asset": "jumlah_usaha_pariwisata_bidang_hiburan_dan_rekreasi_menurut_jenis_usaha_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:55"
+      },
+      {
+        "id": "q-295",
+        "name": "row_count",
+        "asset": "jumlah_usaha_pariwisata_bidang_rumah_makan_dan_kantin_menurut_kecamatan_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:56"
+      },
+      {
+        "id": "q-296",
+        "name": "row_count",
+        "asset": "jumlah_usaha_pariwisata_yang_memiliki_perizinan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:21:57"
+      },
+      {
+        "id": "q-297",
+        "name": "row_count",
+        "asset": "jumlah_usaha_penyediaan_akomodasi_pariwisata_yang_memiliki_perizinan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:00"
+      },
+      {
+        "id": "q-298",
+        "name": "row_count",
+        "asset": "jumlah_usaha_penyelenggaraan_kegiatan_hiburan_dan_rekreasi_pariwisata_yang_memiliki_perizinan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:00"
+      },
+      {
+        "id": "q-299",
+        "name": "row_count",
+        "asset": "jumlah_usaha_penyelenggaraan_pertemuan_perjalanan_insentif_konferensi_dan_pameran_pariwisata_yang_memiliki_perizinan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:01"
+      },
+      {
+        "id": "q-300",
+        "name": "row_count",
+        "asset": "jumlah_usaha_spa_yang_memiliki_perizinan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:01"
+      },
+      {
+        "id": "q-301",
+        "name": "row_count",
+        "asset": "jumlah_wisatawan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:03"
+      },
+      {
+        "id": "q-302",
+        "name": "row_count",
+        "asset": "jumlah_wisatawan_nusantara_2019",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:08"
+      },
+      {
+        "id": "q-303",
+        "name": "row_count",
+        "asset": "jumlah_wisatawan_nusantara_tahun_2018",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:12"
+      },
+      {
+        "id": "q-304",
+        "name": "row_count",
+        "asset": "jumlah_wisatawan_nusantara_tahun_2020",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:13"
+      },
+      {
+        "id": "q-305",
+        "name": "row_count",
+        "asset": "kontak_pengelola_31_dtw",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:13"
+      },
+      {
+        "id": "q-306",
+        "name": "Konversi kolom total",
+        "asset": "kunjungan_31_dtw_juli_2026_sumber_mentah",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:22:13"
+      },
+      {
+        "id": "q-307",
+        "name": "Konversi kolom wisman",
+        "asset": "kunjungan_31_dtw_juli_2026_sumber_mentah",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "high",
+        "lastStatus": "failed",
+        "lastRunAt": "2026-08-27 02:22:13"
+      },
+      {
+        "id": "q-308",
+        "name": "row_count",
+        "asset": "kunjungan_31_dtw_juli_2026_sumber_mentah",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:13"
+      },
+      {
+        "id": "q-309",
+        "name": "row_count",
+        "asset": "kunjungan_dtw",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:15"
+      },
+      {
+        "id": "q-310",
+        "name": "row_count",
+        "asset": "kunjungan_wisatawan_mancanegara_ke_dki_jakarta_menurut_pintu_masuk_tahun_2015",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:15"
+      },
+      {
+        "id": "q-311",
+        "name": "row_count",
+        "asset": "mall_ramah_muslim_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:16"
+      },
+      {
+        "id": "q-312",
+        "name": "row_count",
+        "asset": "mom_artis",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:16"
+      },
+      {
+        "id": "q-313",
+        "name": "row_count",
+        "asset": "mom_tripadvisor",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:16"
+      },
+      {
+        "id": "q-314",
+        "name": "row_count",
+        "asset": "nilai_kepuasan_pengunjung_objek_wisata",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:18"
+      },
+      {
+        "id": "q-315",
+        "name": "row_count",
+        "asset": "nilai_kepuasan_pengunjung_objek_wisata_tahun_2023",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:23"
+      },
+      {
+        "id": "q-316",
+        "name": "row_count",
+        "asset": "nilai_ketertarikan_masyarakat_terhadap_pariwisata_dki_jakarta_tahun_2023",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:28"
+      },
+      {
+        "id": "q-317",
+        "name": "row_count",
+        "asset": "nilai_ketertarikan_masyarakat_terhadap_pariwisata_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:28"
+      },
+      {
+        "id": "q-318",
+        "name": "row_count",
+        "asset": "persentase_pertumbuhan_pdrb_sektor_pariwisata_akomodasi_dan_makan_minum_tahun_2023",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:30"
+      },
+      {
+        "id": "q-319",
+        "name": "row_count",
+        "asset": "persentase_pertumbuhan_produk_domestik_regional_bruto_pdrb_sektor_pariwisata_akomodasi_dan_makan_minum",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:36"
+      },
+      {
+        "id": "q-320",
+        "name": "row_count",
+        "asset": "persentase_pertumbuhan_usaha_ekonomi_kreatif_di_dki_jakarta_tahun_2023",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:43"
+      },
+      {
+        "id": "q-321",
+        "name": "row_count",
+        "asset": "persentase_pertumbuhan_usaha_ekonomi_kreatif_di_provinsi_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:43"
+      },
+      {
+        "id": "q-322",
+        "name": "row_count",
+        "asset": "persentase_tingkat_pengaruh_wisata_belanjakulinermalam_sebagai_alasan_utama_berwisata",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:44"
+      },
+      {
+        "id": "q-323",
+        "name": "row_count",
+        "asset": "produk_kreatif_makanan_halal_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:44"
+      },
+      {
+        "id": "q-324",
+        "name": "row_count",
+        "asset": "ragunan_harian_juli_2026",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:46"
+      },
+      {
+        "id": "q-325",
+        "name": "row_count",
+        "asset": "rata_rata_lama_tinggal_wisatawan_mancanegara_di_dki_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:51"
+      },
+      {
+        "id": "q-326",
+        "name": "row_count",
+        "asset": "rata_rata_pengeluaran_kunjungan_wisatawan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:51"
+      },
+      {
+        "id": "q-327",
+        "name": "row_count",
+        "asset": "restoran",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:52"
+      },
+      {
+        "id": "q-328",
+        "name": "Konversi kolom lat",
+        "asset": "restoran_halal_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:22:52"
+      },
+      {
+        "id": "q-329",
+        "name": "Konversi kolom lon",
+        "asset": "restoran_halal_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:22:52"
+      },
+      {
+        "id": "q-330",
+        "name": "row_count",
+        "asset": "restoran_halal_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:52"
+      },
+      {
+        "id": "q-331",
+        "name": "row_count",
+        "asset": "restoran_tripadvisor_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:52"
+      },
+      {
+        "id": "q-332",
+        "name": "Konversi kolom lat",
+        "asset": "rph_halal_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:22:53"
+      },
+      {
+        "id": "q-333",
+        "name": "Konversi kolom lon",
+        "asset": "rph_halal_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:22:53"
+      },
+      {
+        "id": "q-334",
+        "name": "row_count",
+        "asset": "rph_halal_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:53"
+      },
+      {
+        "id": "q-335",
+        "name": "Konversi kolom jumlah_ulasan",
+        "asset": "toko_suvenir_tripadvisor_2026",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:22:53"
+      },
+      {
+        "id": "q-336",
+        "name": "Konversi kolom lat",
+        "asset": "toko_suvenir_tripadvisor_2026",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:22:54"
+      },
+      {
+        "id": "q-337",
+        "name": "Konversi kolom lon",
+        "asset": "toko_suvenir_tripadvisor_2026",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:22:54"
+      },
+      {
+        "id": "q-338",
+        "name": "Konversi kolom rating",
+        "asset": "toko_suvenir_tripadvisor_2026",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:22:54"
+      },
+      {
+        "id": "q-339",
+        "name": "row_count",
+        "asset": "toko_suvenir_tripadvisor_2026",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:53"
+      },
+      {
+        "id": "q-340",
+        "name": "Konversi kolom lat",
+        "asset": "warisan_islam_wisata_budaya_muslim_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:22:54"
+      },
+      {
+        "id": "q-341",
+        "name": "Konversi kolom lon",
+        "asset": "warisan_islam_wisata_budaya_muslim_jakarta",
+        "dimension": "validity",
+        "threshold": "null <5%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:22:55"
+      },
+      {
+        "id": "q-342",
+        "name": "row_count",
+        "asset": "warisan_islam_wisata_budaya_muslim_jakarta",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:54"
+      },
+      {
+        "id": "q-343",
+        "name": "row_count",
+        "asset": "wisman",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:55"
+      },
+      {
+        "id": "q-344",
+        "name": "row_count",
+        "asset": "wisman_jakarta_per_bulan",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:22:56"
+      },
+      {
+        "id": "q-345",
+        "name": "row_count",
+        "asset": "wisman_jakarta_per_negara",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:23:03"
+      },
+      {
+        "id": "q-346",
+        "name": "row_count",
+        "asset": "wisman_jakarta_per_pintu_masuk",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "info",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27 02:23:07"
+      },
+      {
+        "id": "q-347",
+        "name": "row_count",
+        "asset": "wisman_karantina",
+        "dimension": "completeness",
+        "threshold": "row_count > 0 & tidak anjlok >50%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27 02:23:11"
+      },
+      {
+        "id": "66666666-6666-4666-8666-000000000001",
+        "name": "email_verified_completeness",
+        "asset": "serving.mart_customer_segment",
+        "dimension": "completeness",
+        "threshold": ">= 95%",
+        "severity": "medium",
+        "lastStatus": "warning",
+        "lastRunAt": "2026-08-27T14:31:18.761Z"
+      },
+      {
+        "id": "66666666-6666-4666-8666-000000000002",
+        "name": "orders_uniqueness",
+        "asset": "silver.orders_enriched",
+        "dimension": "uniqueness",
+        "threshold": "payment_id unique",
+        "severity": "high",
+        "lastStatus": "passed",
+        "lastRunAt": "2026-08-27T15:11:18.761Z"
+      }
+    ]
+  }
+}

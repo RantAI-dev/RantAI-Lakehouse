@@ -1,0 +1,17 @@
+{
+  "request": {
+    "name": "alerts-edit-missing-id",
+    "method": "PUT",
+    "path": "/api/alerts",
+    "body": {
+      "name": "x"
+    },
+    "comment": "MUTATING on success (PUT upserts console.alert_rule). Only capturing the missing-id validation error path.",
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "id wajib"
+  }
+}

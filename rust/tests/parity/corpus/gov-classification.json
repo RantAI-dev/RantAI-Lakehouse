@@ -1,0 +1,1424 @@
+{
+  "request": {
+    "name": "gov-classification",
+    "method": "GET",
+    "path": "/api/governance/classification"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "classifications": [
+      {
+        "id": "c-artis-top-global-chart",
+        "asset": "Artis Top 10 Global Chart (Billboard & Spotify, 2021\u20132025)",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-bandara-ramah-muslim-jakarta",
+        "asset": "Bandara Ramah Muslim (melayani Jakarta)",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-capaian-pariwisata-ramah-muslim",
+        "asset": "Pengakuan & Capaian Pariwisata Ramah Muslim",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-pengunjung-event-2026",
+        "asset": "Jumlah Pengunjung Event 2026",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-hotel-ramah-muslim-jakarta",
+        "asset": "Hotel Ramah Muslim Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-inovasi-wisata-ramah-muslim-jakarta",
+        "asset": "Inovasi & Program Wisata Ramah Muslim Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-mall-ramah-muslim-jakarta",
+        "asset": "Mall & Fasilitas Ramah Muslim Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-produk-kreatif-makanan-halal-jakarta",
+        "asset": "Produk Kreatif Makanan Tersertifikasi Halal Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-restoran-halal-jakarta",
+        "asset": "Restoran & Zona KHAS Tersertifikasi Halal Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-rph-halal-jakarta",
+        "asset": "RPH Tersertifikasi Halal Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-restoran-tripadvisor-jakarta",
+        "asset": "Restoran Jakarta TripAdvisor (Kuliner GCI)",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-toko-suvenir-tripadvisor-2026",
+        "asset": "Toko Suvenir TripAdvisor 2026",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-warisan-islam-wisata-budaya-muslim-jakarta",
+        "asset": "Warisan Islam & Wisata Budaya Muslim Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-wisman-jakarta-per-bulan",
+        "asset": "Wisman DKI Jakarta per Bulan (total)",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-wisman-jakarta-per-negara",
+        "asset": "Wisman DKI Jakarta per Negara (BPS dibersihkan)",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-wisman-jakarta-per-pintu-masuk",
+        "asset": "Wisman per Pintu Masuk (dinormalisasi)",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-realisasi-investasi-pariwisata",
+        "asset": "Jumlah Realisasi Investasi Pariwisata",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-seni-pertunjukan-dan-visual",
+        "asset": "Data Seni Pertunjukan dan Visual",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-rekomendasi-penyelenggaraan-pertunjukan-musik",
+        "asset": "Data Rekomendasi Penyelenggaraan Pertunjukan Musik",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-persentase-tingkat-pengaruh-wisata-belanjakulinermalam-sebagai-alasan-utama-berwisata",
+        "asset": "Persentase Tingkat Pengaruh Wisata Belanja/Kuliner/Malam sebagai Alasan Utama Berwisata",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-pelaku-usaha-pariwisata-dan-ekonomi-kreatif-yang-difasilitasi-terkait-industri-halal-dan-ekonomi-syariah",
+        "asset": "Jumlah Pelaku Usaha Pariwisata dan Ekonomi Kreatif yang Difasilitasi Terkait Industri Halal dan Ekonomi Syariah",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-daftar-dokumen-standar-layanan-dan-pengelolaan-di-sektor-pariwisata",
+        "asset": "Daftar Dokumen Standar Layanan dan Pengelolaan di Sektor Pariwisata",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-rata-rata-pengeluaran-kunjungan-wisatawan",
+        "asset": "Rata-rata Pengeluaran Kunjungan Wisatawan",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-tenaga-kerja-pariwisata-dan-ekonomi-kreatif-yang-tersertifikasi",
+        "asset": "Jumlah Tenaga Kerja Pariwisata dan Ekonomi Kreatif yang Tersertifikasi",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-restoran-per-kelurahan",
+        "asset": "Jumlah Restoran per Kelurahan",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-pemberian-rekomendasi-penyelenggaraan-pertunjukan-musik",
+        "asset": "Data Pemberian Rekomendasi Penyelenggaraan Pertunjukan Musik",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-fasilitasi-kegiatan-peningkatan-kapasitas-dan-sertifikasi-kompetensi-pada-pelaku-ekonomi-kreatif",
+        "asset": "Jumlah Fasilitasi Kegiatan Peningkatan Kapasitas dan Sertifikasi Kompetensi pada Pelaku Ekonomi Kreatif",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-pendidikan-dan-pelatihan-pemasaran-digital",
+        "asset": "Jumlah Pendidikan dan Pelatihan Pemasaran Digital",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kabupatenkota-kreatif-yang-dikembangkan",
+        "asset": "Data Kabupaten/Kota Kreatif yang Dikembangkan",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kunjungan-wisatawan-nusantara-dan-wisatawan-mancanegara-ke-tourist-information-center-tic-provinsi-dki-jakarta",
+        "asset": "Data Kunjungan Wisatawan Nusantara dan Wisatawan Mancanegara ke Tourist Information Center (TIC) Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-data-statistik-pariwisata-dan-ekonomi-kreatif-yang-tersedia-dalam-format-database",
+        "asset": "Jumlah Data Statistik Pariwisata dan Ekonomi Kreatif yang Tersedia dalam Format Database",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-kunjungan-wisatawan-ke-obyek-wisata-menurut-lokasi-di-provinsi-dki-jakarta",
+        "asset": "Jumlah Kunjungan Wisatawan ke Obyek Wisata Menurut Lokasi di Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-desa-wisata",
+        "asset": "Data Desa Wisata",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-destinasi-pariwisata-yang-memiliki-aksesibilitas-amenitas-atau-atraksi",
+        "asset": "Data Destinasi Pariwisata yang Memiliki Aksesibilitas, Amenitas, atau Atraksi",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-penyelenggaraan-event",
+        "asset": "Jumlah Penyelenggaraan Event",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-nilai-ketertarikan-masyarakat-terhadap-pariwisata-provinsi-dki-jakarta",
+        "asset": "Nilai Ketertarikan Masyarakat Terhadap Pariwisata Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-usaha-ekonomi-kreatif",
+        "asset": "Jumlah Usaha Ekonomi Kreatif",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-persentase-pertumbuhan-usaha-ekonomi-kreatif-di-provinsi-dki-jakarta",
+        "asset": "Persentase Pertumbuhan Usaha Ekonomi Kreatif di Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-persentase-pertumbuhan-produk-domestik-regional-bruto-pdrb-sektor-pariwisata-akomodasi-dan-makan-minum",
+        "asset": "Persentase Pertumbuhan Produk Domestik Regional Bruto (PDRB) Sektor Pariwisata (Akomodasi dan Makan Minum)",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-pengunjung-event",
+        "asset": "Jumlah Pengunjung Event",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-indeks-kepuasan-layanan-penunjang-urusan-pemerintahan-daerah-pada-dinas-pariwisata-dan-ekonomi-kreatif",
+        "asset": "Indeks Kepuasan Layanan Penunjang Urusan Pemerintahan Daerah pada Dinas Pariwisata dan Ekonomi Kreatif",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-nilai-kepuasan-pengunjung-objek-wisata",
+        "asset": "Nilai Kepuasan Pengunjung Objek Wisata",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-wisatawan-mancanegara-berdasarkan-kebangsaan",
+        "asset": "Data Jumlah Wisatawan Mancanegara Berdasarkan Kebangsaan",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-rata-rata-tingkat-hunian-kamar-pada-hotel-berbintang-di-provinsi-dki-jakarta",
+        "asset": "Data Rata-rata Tingkat Hunian Kamar pada Hotel Berbintang di Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-usaha-jasa-makanan-dan-minuman-pariwisata-yang-memiliki-perizinan",
+        "asset": "Jumlah Usaha Jasa Makanan dan Minuman Pariwisata yang Memiliki Perizinan",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-usaha-jasa-perjalanan-wisata-pariwisata-yang-memiliki-perizinan",
+        "asset": "Jumlah Usaha Jasa Perjalanan Wisata Pariwisata yang Memiliki Perizinan",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-usaha-penyediaan-akomodasi-pariwisata-yang-memiliki-perizinan",
+        "asset": "Jumlah Usaha Penyediaan Akomodasi Pariwisata yang Memiliki Perizinan",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-usaha-penyelenggaraan-kegiatan-hiburan-dan-rekreasi-pariwisata-yang-memiliki-perizinan",
+        "asset": "Jumlah Usaha Penyelenggaraan Kegiatan Hiburan dan Rekreasi Pariwisata yang Memiliki Perizinan",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-usaha-penyelenggaraan-pertemuan-perjalanan-insentif-konferensi-dan-pameran-pariwisata-yang-memiliki-perizinan",
+        "asset": "Jumlah Usaha Penyelenggaraan Pertemuan, Perjalanan Insentif, Konferensi dan Pameran Pariwisata yang Memiliki Perizinan",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-usaha-spa-yang-memiliki-perizinan",
+        "asset": "Jumlah Usaha SPA yang Memiliki Perizinan",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-pendapatan-asli-daerah-pad-sektor-pariwisata",
+        "asset": "Data Pendapatan Asli Daerah (PAD) Sektor Pariwisata",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-pengunjung-e-tourism",
+        "asset": "Jumlah Pengunjung e-Tourism",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kunjungan-wisatawan-nusantara-dan-wisatawan-mancanegara-ke-tourist-information-center-tic-provinsi-dki-jakarta-tahun-2024",
+        "asset": "Data Kunjungan Wisatawan Nusantara dan Wisatawan Mancanegara ke Tourist Information Center (TIC) Provinsi DKI Jakarta Tahun 2024",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-kunjungan-wisatawan-ke-obyek-wisata-unggulan-menurut-lokasi-di-provinsi-dki-jakarta-tahun-2024",
+        "asset": "Jumlah Kunjungan Wisatawan ke Obyek Wisata Unggulan Menurut Lokasi di Provinsi DKI Jakarta Tahun 2024",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-rata-rata-lama-menginap-wisatawan-mancanegara-dan-wisatawan-nusantara-pada-hotel-berbintang-di-provinsi-dki-jakarta",
+        "asset": "Data Rata-rata Lama Menginap Wisatawan Mancanegara dan Wisatawan Nusantara pada Hotel Berbintang di Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-usaha-pariwisata-bidang-rumah-makan-dan-kantin-menurut-kecamatan-di-dki-jakarta",
+        "asset": "jumlah usaha pariwisata bidang rumah makan dan kantin menurut kecamatan di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-usaha-pariwisata-bidang-hiburan-dan-rekreasi-menurut-jenis-usaha-di-dki-jakarta",
+        "asset": "jumlah usaha pariwisata bidang hiburan dan rekreasi menurut jenis usaha di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-kunjungan-wisatawan-ke-obyek-wisata-unggulan-menurut-lokasi-di-dki-jakarta-tahun-2023",
+        "asset": "Jumlah Kunjungan Wisatawan ke Obyek Wisata Unggulan Menurut Lokasi\u00a0di\u00a0DKI\u00a0Jakarta Tahun 2023",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-usaha-hiburan-dan-rekreasi-di-dki-jakarta",
+        "asset": "Data Usaha Hiburan dan Rekreasi di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-usaha-ekonomi-kreatif-tahun-2023",
+        "asset": "Jumlah Usaha Ekonomi Kreatif Tahun 2023",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-persentase-pertumbuhan-usaha-ekonomi-kreatif-di-dki-jakarta-tahun-2023",
+        "asset": "Persentase Pertumbuhan Usaha Ekonomi Kreatif di DKI Jakarta Tahun 2023",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-sumber-daya-manusia-sdm-yang-bekerja-di-bidang-industri-pariwisata",
+        "asset": "Data Sumber Daya Manusia (SDM) yang Bekerja di Bidang Industri Pariwisata",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-golf",
+        "asset": "Data Golf",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-tenaga-kerja-pariwisata-dan-ekonomi-kreatif-yang-tersertifikasi-tahun-2023-dan-2024",
+        "asset": "Jumlah Tenaga Kerja Pariwisata dan Ekonomi Kreatif yang Tersertifikasi Tahun 2023 dan 2024",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-produkjasa-ekonomi-kreatif-yang-didaftarkan-kekayaan-intelektualnya",
+        "asset": "Jumlah Produk/Jasa Ekonomi Kreatif yang Didaftarkan Kekayaan Intelektualnya",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-nilai-ketertarikan-masyarakat-terhadap-pariwisata-dki-jakarta-tahun-2023",
+        "asset": "Nilai Ketertarikan Masyarakat Terhadap Pariwisata DKI Jakarta Tahun 2023",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-pengunjung-tic-upt-pusat-pengembangan-dan-pelayanan-informasi-pariwisata",
+        "asset": "Data Pengunjung TIC UPT Pusat Pengembangan Dan Pelayanan Informasi Pariwisata",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-pengunjung-tourist-information-center-tic-up-kawasan-kota-tua-dki-jakarta",
+        "asset": "Data Pengunjung Tourist Information Center TIC Up Kawasan Kota Tua DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-kunjungan-dan-pertumbuhan-wisatawan-mancanegara-ke-indonesia-berdasarkan-wilayah",
+        "asset": "Data Jumlah Kunjungan Dan Pertumbuhan Wisatawan Mancanegara ke Indonesia berdasarkan Wilayah",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-kunjungan-dan-pertumbuhan-wisatawan-mancanegara-ke-indonesia-berdasarkan-bulan",
+        "asset": "Data Jumlah Kunjungan Dan Pertumbuhan Wisatawan Mancanegara ke Indonesia berdasarkan Bulan",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-peserta-pelatihan-profesi-kepariwisataan-di-provinsi-dki-jakarta",
+        "asset": "Data Jumlah Peserta Pelatihan Profesi Kepariwisataan di Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-target-kunjungan-wisata-mancanegara-ke-jakarta",
+        "asset": "Data Target Kunjungan Wisata Mancanegara ke Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-rata-rata-lama-menginap-wisman-di-hotel-berbintang-di-dki-jakarta",
+        "asset": "Data Rata-Rata Lama Menginap Wisman Di Hotel Berbintang Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-kunjungan-wisman-ke-indonesia-berdasarkan-pintu-masuk-di-dki-jakarta",
+        "asset": "Data Jumlah Kunjungan Wisman Ke Indonesia Berdasarkan Pintu Masuk Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-pengunjung-tic-bandara-soetta-upt-pusat-pengembangan-dan-pelayanan-informasi-pariwisata-dki-jakarta",
+        "asset": "Data Pengunjung TIC Bandara Soetta UPT Pusat Pengembangan Dan Pelayanan Informasi Pariwisata DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-pad-pariwisata-dki-jakarta-tahun-2010",
+        "asset": "Data PAD Pariwisata DKI Jakarta Tahun 2010",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-pengunjung-tic-kota-tua-upt-pusat-pengembangan-dan-pelayanan-informasi-pariwisata-dki-jakarta",
+        "asset": "Data Pengunjung TIC Kota Tua UPT Pusat Pengembangan Dan Pelayanan Informasi Pariwisata Dki Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-pengunjung-tic-jakarta-theter-upt-pusat-pengembangan-dan-pelayanan-informasi-pariwisata-dki-jakarta",
+        "asset": "Data Pengunjung TIC Jakarta Theter UPT Pusat Pengembangan Dan Pelayanan Informasi Pariwisata DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-kunjungan-wisman-indonesia-jakarta-dan-share-wisman-jakarta-terhadap-indonesia-di-dki-jakarta",
+        "asset": "Data Jumlah Kunjungan Wisman Indonesia Jakarta Dan Share Wisman Jakarta Terhadap Indonesia Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-penyelenggaraan-event-pariwisata-dan-budaya-dki-jakarta-2015",
+        "asset": "Data Penyelenggaraan Event Pariwisata dan Budaya DKI Jakarta 2015",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-penerimaan-retribusi-daerah-dinas-pariwisata-kebudayaan-provinsi-dki-jakarta",
+        "asset": "Data Penerimaan Retribusi Daerah Dinas Pariwisata Kebudayaan Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kegiatan-promosi-dki-jakarta-2011-2015",
+        "asset": "Data Kegiatan Promosi DKI Jakarta 2011-2015",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kegiatan-promosi-dki-jakarta",
+        "asset": "Data Kegiatan Promosi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-tamu-yang-menginap-di-graha-wisata-provinsi-dki-jakarta",
+        "asset": "Data Jumlah Tamu Yang Menginap Di Graha Wisata Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-program-sub-program-dan-komponen-kegiatan-kepariwisataan-di-dki-jakarta",
+        "asset": "Data Program Sub Program Dan Komponen Kegiatan Kepariwisataan Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-usaha-akomodasi-dan-tenaga-kerja-di-dki-jakarta",
+        "asset": "Data Jumlah Usaha Akomodasi Dan Tenaga Kerja Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kunjungan-wisatawan-nusantara-ke-destinasi-wisata-di-provinsi-dki-jakarta",
+        "asset": "Data Kunjungan Wisatawan Nusantara ke Destinasi Wisata di Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-potensi-daya-tarik-wisata-unggulan-provinsi-dki-jakarta",
+        "asset": "Data Potensi Daya Tarik Wisata Unggulan Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-rekap-pendistribusian-brosur-pariwisata-bulan-januari-sd-desember-dki-jakarta",
+        "asset": "Data Rekap Pendistribusian Brosur Pariwisata Bulan Januari s/d Desember DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-proyeksi-penerimaan-devisa-dari-wisman-dan-akumulasi-belanja-wisatawan-nusantara",
+        "asset": "Data Proyeksi Penerimaan Devisa Dari Wisman Dan Akumulasi Belanja Wisatawan Nusantara",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-rata-rata-lama-menginap-wisatawan-nusantara-pada-hotel-berbintang-di-provinsi-dki-jakarta-berdasarkan-jenis-hotel",
+        "asset": "Data Rata-rata Lama Menginap Wisatawan Nusantara Pada Hotel Berbintang di Provinsi DKI Jakarta Berdasarkan Jenis Hotel",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-rata-rata-lama-menginap-wisatawan-nusantara-pada-hotel-berbintang-di-provinsi-dki-jakarta",
+        "asset": "Data Rata-Rata Lama Menginap Wisatawan Nusantara Pada Hotel Berbintang di Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-penyelenggaraan-event-pariwisata-dan-budaya-dki-jakarta",
+        "asset": "Data Penyelenggaraan Event Pariwisata dan Budaya DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-event-pariwisata-dan-kebudayaan-dki-jakarta-2011-2019",
+        "asset": "Data Event Pariwisata dan Kebudayaan DKI Jakarta 2011-2019",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-industri-pariwisata-dki-jakarta-2014",
+        "asset": "Data Industri Pariwisata DKI Jakarta 2014",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-e-tourism",
+        "asset": "Jumlah E-Tourism",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-usaha-pariwisata-bidang-hiburan-dan-rekreasi-menurut-jenis-usaha-dan-kecamatan",
+        "asset": "Data Jumlah Usaha Pariwisata Bidang Hiburan dan Rekreasi Menurut Jenis Usaha dan Kecamatan",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-wiswan-per-kebangsaan-dki-jakarta",
+        "asset": "Data Wiswan Per Kebangsaan DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-kunjungan-wisatawan-mancanegara-tahun-2019",
+        "asset": "Data Jumlah Kunjungan Wisatawan Mancanegara Tahun 2019",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-usaha-pariwisata-bidang-penyediaan-makanan-dan-minuman-di-dki-jakarta",
+        "asset": "Data Usaha Pariwisata Bidang Penyediaan Makanan Dan Minuman Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-rata-rata-lama-menginap-wisatawan-mancanegara-pada-hotel-berbintang-di-provinsi-dki-jakarta",
+        "asset": "Data Rata-Rata Lama Menginap Wisatawan Mancanegara Pada Hotel Berbintang di Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-usaha-jasa-makanan-minuman-jenis-usaha-cafetaria-di-dki-jakarta",
+        "asset": "Data Usaha Jasa Makanan Minuman Jenis Usaha Cafetaria Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-wisatawan-mancanegara-ke-dki-jakarta",
+        "asset": "Data Wisatawan Mancanegara Ke DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kunjungan-wisatawan-mancanegara-ke-provinsi-dki-jakarta-tahun-2018",
+        "asset": "Data Kunjungan Wisatawan Mancanegara ke Provinsi DKI Jakarta Tahun 2018",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-usaha-hiburan-dan-rekreasi-di-dki-jakarta-2018",
+        "asset": "Data Usaha Hiburan Dan Rekreasi Di DKI Jakarta 2018",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-pelatihan-profesi-kepariwisataan-dki-jakarta",
+        "asset": "Data Pelatihan Profesi Kepariwisataan DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-kunjungan-wisatawan-mancanegara-tahun-2020",
+        "asset": "Data Jumlah Kunjungan Wisatawan Mancanegara Tahun 2020",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kunjungan-wisatawan-nusantara-dan-wisatawan-mancanegara-ke-tic-dki-jakarta-tahun-2018",
+        "asset": "Data Kunjungan Wisatawan Nusantara dan Wisatawan Mancanegara ke TIC DKI Jakarta Tahun 2018",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-wisatawan-nusantara-2019",
+        "asset": "Jumlah Wisatawan Nusantara 2019",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kunjungan-daya-tarik-wisata-di-provinsi-dki-jakarta",
+        "asset": "Data Kunjungan Daya Tarik Wisata di Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-kunjungan-wisatawan-mancanegara-ke-destinasi-wisata-di-provinsi-dki-jakarta-tahun-2021",
+        "asset": "Data Jumlah Kunjungan Wisatawan Mancanegara ke Destinasi Wisata di Provinsi DKI Jakarta Tahun 2021",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-wisatawan",
+        "asset": "Jumlah Wisatawan",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-industri-pariwisata",
+        "asset": "Data Industri Pariwisata",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-nilai-kepuasan-pengunjung-objek-wisata-tahun-2023",
+        "asset": "Nilai Kepuasan Pengunjung Objek Wisata Tahun 2023",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-resto-cafe-dan-cakes",
+        "asset": "Data Resto, Cafe dan Cakes",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-usaha-pariwisata-yang-memiliki-perizinan",
+        "asset": "Jumlah Usaha Pariwisata yang Memiliki Perizinan",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-persentase-pertumbuhan-pdrb-sektor-pariwisata-akomodasi-dan-makan-minum-tahun-2023",
+        "asset": "Persentase Pertumbuhan PDRB Sektor Pariwisata (Akomodasi dan Makan Minum) Tahun 2023",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-pengunjung-event-tahun-2023",
+        "asset": "Jumlah Pengunjung Event Tahun 2023",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-indeks-kepuasan-layanan-penunjang-urusan-pemerintahan-daerah-dinas-pariwisata-dan-ekonomi-kreatif-tahun-2023",
+        "asset": "Indeks Kepuasan Layanan Penunjang Urusan Pemerintahan Daerah Dinas Pariwisata dan Ekonomi Kreatif Tahun 2023",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-pengunjung-e-tourism-tahun-2023",
+        "asset": "Jumlah Pengunjung e-Tourism Tahun 2023",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-rata-rata-tingkat-hunian-kamar-pada-hotel-berbintang-di-dki-jakarta-tahun-2023",
+        "asset": "Data Rata-rata Tingkat Hunian Kamar pada Hotel Berbintang di DKI Jakarta Tahun 2023",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-rata-rata-lama-menginap-wisatawan-mancanegara-pada-hotel-berbintang-di-dki-jakarta",
+        "asset": "Data Rata-rata Lama Menginap Wisatawan Mancanegara pada Hotel Berbintang di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-pendapatan-asli-daerah-pad-sektor-pariwisata-tahun-2023",
+        "asset": "Data Pendapatan Asli Daerah (PAD) Sektor Pariwisata Tahun 2023",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kunjungan-wisatawan-nusantara-dan-wisatawan-mancanegara-ke-tic-dki-jakarta-tahun-2023",
+        "asset": "Data Kunjungan Wisatawan Nusantara dan Wisatawan Mancanegara ke TIC DKI Jakarta Tahun 2023",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-wisatawan-mancanegara-berdasarkan-kebangsaan-tahun-2023",
+        "asset": "Data Jumlah Wisatawan Mancanegara Berdasarkan Kebangsaan Tahun 2023",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-rekapitulasi-usaha-dan-kamar-hotel",
+        "asset": "Data Jumlah Rekapitulasi Usaha dan Kamar Hotel",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-DISPAREKRAF",
+        "asset": "Dinas Pariwisata Dan Ekonomi Kreatif",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kunjungan-wisatawan-nusantara-dan-wisatawan-mancanegara-ke-tic-dki-jakarta-titik",
+        "asset": "Data Kunjungan Wisatawan Nusantara dan Wisatawan Mancanegara ke TIC DKI Jakarta.",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-pengunjung-museum-menurut-jenis-museum-di-provinsi-dki-jakarta",
+        "asset": "Data Pengunjung Museum Menurut Jenis Museum di Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kunjungan-wisata-mancanegara-ke-dki-jakarta-melalui-3-pintu-masuk-soekarno-hatta-tanjung-priok-halim-perdana-kusumah",
+        "asset": "Data Kunjungan Wisata Mancanegara Ke DKI Jakarta Melalui 3 Pintu Masuk Soekarno Hatta Tanjung Priok Halim Perdana Kusumah",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-e-tourism-titik",
+        "asset": "Jumlah E-Tourism.",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-usaha-pariwisata-bidang-hiburan-dan-rekreasi-menurut-jenis-usaha-dan-kecamatan-titik",
+        "asset": "Data Jumlah Usaha Pariwisata Bidang Hiburan dan Rekreasi Menurut Jenis Usaha dan Kecamatan.",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-wiswan-per-kebangsaan-dki-jakarta-titik",
+        "asset": "Data Wiswan Per Kebangsaan DKI Jakarta.",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-usaha-pariwisata-bidang-penyediaan-makanan-dan-minuman-di-dki-jakarta-titik",
+        "asset": "Data Usaha Pariwisata Bidang Penyediaan Makanan Dan Minuman Di DKI Jakarta.",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-rata-rata-lama-menginap-wisatawan-mancanegara-pada-hotel-berbintang-di-provinsi-dki-jakarta-titik",
+        "asset": "Data Rata-Rata Lama Menginap Wisatawan Mancanegara Pada Hotel Berbintang di Provinsi DKI Jakarta.",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-usaha-jasa-makanan-minuman-jenis-usaha-cafetaria-di-dki-jakarta-titik",
+        "asset": "Data Usaha Jasa Makanan Minuman Jenis Usaha Cafetaria Di DKI Jakarta.",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kunjungan-wisatawan-mancanegara-ke-provinsi-dki-jakarta",
+        "asset": "Data Kunjungan Wisatawan Mancanegara ke Provinsi DKI Jakarta.",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kunjungan-wisatawan-mancanegara-ke-jakarta",
+        "asset": "Data Kunjungan Wisatawan Mancanegara ke Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kategori-event-jakarta-di-dki-jakarta",
+        "asset": "Data Kategori Event Jakarta di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-kunjungan-wisawatan-nusantara-ke-taman-marga-satwa-ragunan",
+        "asset": "Data Jumlah Kunjungan Wisawatan Nusantara ke Taman Marga Satwa Ragunan",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-usaha-wisata-di-dki-jakarta",
+        "asset": "Data Jumlah Usaha Wisata Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-usaha-pariwisata-bidang-usaha-penyediaan-akomodasi-di-dki-jakarta",
+        "asset": "Data Usaha Pariwisata Bidang Usaha Penyediaan Akomodasi Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-lokasi-pusat-pelayanan-informasi-pariwisata-di-dki-jakarta",
+        "asset": "Data Lokasi Pusat Pelayanan Informasi Pariwisata Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-penerimaan-pendapatan-asli-daerah-dki-jakarta",
+        "asset": "Data Penerimaan Pendapatan Asli Daerah DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-usaha-jasa-travel-jenis-usaha-biro-perjalanan-wisata-dki-jakarta",
+        "asset": "Data Usaha Jasa Travel Jenis Usaha Biro Perjalanan Wisata DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-kunjungan-wisman-ke-dki-jakarta",
+        "asset": "Data Jumlah Kunjungan Wisman Ke DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-rata-rata-lama-tinggal-wisatawan-mancanegara-di-dki-jakarta",
+        "asset": "Rata-Rata Lama Tinggal Wisatawan Mancanegara Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-sdm-industri-pariwisata-bersertifikat-tahun-2019",
+        "asset": "Data Jumlah SDM Industri Pariwisata Bersertifikat Tahun 2019",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kunjungan-wisman-ke-jakarta-melalui-pintu-soekarno-hatta-berdasarkan-kebangsaan",
+        "asset": "Data Kunjungan Wisman Ke Jakarta Melalui Pintu Soekarno Hatta Berdasarkan Kebangsaan",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kunjungan-daya-tarik-wisata-provinsi-dki-jakarta",
+        "asset": "Data Kunjungan Daya Tarik Wisata Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-rencana-narasumber-rdpu-dki-jakarta",
+        "asset": "Data Rencana Narasumber RDPU DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-toko-serba-ada-toserba-dki-jakarta",
+        "asset": "Data Toko Serba Ada (TOSERBA) DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-kunjungan-wisatawan-nusantara-ke-kepulauan-seribu",
+        "asset": "Data Jumlah Kunjungan Wisatawan Nusantara ke Kepulauan Seribu",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-pengunjung-tic-tourist-information-center-bali",
+        "asset": "Data Pengunjung TIC Tourist Information Center Bali",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kategori-event-jakarta-perbulan",
+        "asset": "Data Kategori Event Jakarta Perbulan",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-statistik-wisata-provinsi-dki-jakarta",
+        "asset": "Data Statistik Wisata Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-kunjungan-wisawatan-nusantara-ke-taman-impian-jaya-ancol",
+        "asset": "Data Jumlah Kunjungan Wisawatan Nusantara ke Taman Impian Jaya Ancol",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-usaha-jasa-travel-jenis-usaha-gerai-travel-di-dki-jakarta",
+        "asset": "Data Usaha Jasa Travel Jenis Usaha Gerai Travel Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-kunjungan-wisatawan-nusantara-ke-taman-mini-indonesia-indah",
+        "asset": "Data Jumlah Kunjungan wisatawan Nusantara ke Taman Mini Indonesia Indah",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-industri-pariwisata-di-provinsi-dki-jakarta",
+        "asset": "Data Jumlah Industri Pariwisata di Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-kunjungan-dan-pertumbuhan-wisatawan-mancanegara-di-provinsi-dki-jakarta",
+        "asset": "Data Jumlah Kunjungan dan Pertumbuhan Wisatawan Mancanegara di Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-pelatihan-tenaga-kerja-profesi-kepariwisataan-di-dki-jakarta",
+        "asset": "Data Pelatihan Tenaga Kerja Profesi Kepariwisataan Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-wisatawan-pengunjung-museum",
+        "asset": "Data Jumlah Wisatawan Pengunjung Museum",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kunjungan-wisatawan-mancanegara-ke-provinsi-dki-jakarta-tahun-2020-melalui-2-pintu-masuk",
+        "asset": "Data Kunjungan Wisatawan Mancanegara ke Provinsi DKI Jakarta Tahun 2020 Melalui 2 Pintu Masuk",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-wisatawan-nusantara-tahun-2020",
+        "asset": "Jumlah Wisatawan Nusantara Tahun 2020",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-stakeholder-pariwisata-dki-jakarta",
+        "asset": "Data Stakeholder Pariwisata DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kunjungan-wisatawan-nusantara-dki-jakarta",
+        "asset": "Data Kunjungan Wisatawan Nusantara DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-usaha-jasa-travel-jenis-usaha-cabang-biro-perjalanan-wisata-di-dki-jakarta",
+        "asset": "Data Usaha Jasa Travel Jenis Usaha Cabang Biro Perjalanan Wisata Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kunjungan-wisatawan-mancanegara-provinsi-dki-jakarta",
+        "asset": "Data Kunjungan Wisatawan Mancanegara Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-pengunjung-tourist-information-center-tic-up-museum-tekstil-dki-jakarta",
+        "asset": "Data Pengunjung Tourist Information Center TIC Up Museum Tekstil DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-usaha-jasa-makanan-minuman-food-court",
+        "asset": "Data Usaha Jasa Makanan Minuman Food Court",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-industri-pariwisata-yang-memiliki-tdup-tanda-daftar-usaha-pariwisata",
+        "asset": "Jumlah Industri Pariwisata yang memiliki TDUP (Tanda Daftar Usaha Pariwisata)",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-perpasaran-swasta-pasar-swalayan-provinsi-dki-jakarta",
+        "asset": "Data Perpasaran Swasta Pasar Swalayan Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-usaha-jasa-di-dki-jakarta",
+        "asset": "Data Jumlah Usaha Jasa Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-usaha-jasa-makanan-minuman-jenis-usaha-bar-di-dki-jakarta",
+        "asset": "Data Usaha Jasa Makanan Minuman Jenis Usaha Bar Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-penerimaan-pendapatan-asli-daerah-pad-sektor-pariwisata-pemerintah-provinsi-dki-jakarta",
+        "asset": "Data Penerimaan Pendapatan Asli Daerah (PAD) Sektor Pariwisata Pemerintah Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-kunjungan-dan-ranking-wisatawan-mancanegara-ke-provinsi-dki-jakarta-melalui-pintu-soekarno-hatta-berdasarkan-kebangsaan",
+        "asset": "Data Jumlah Kunjungan dan Ranking Wisatawan Mancanegara Ke Provinsi DKI Jakarta Melalui Pintu Soekarno Hatta Berdasarkan Kebangsaan",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-daftar-kegiatan-pameran-di-dki-jakarta",
+        "asset": "Data Daftar Kegiatan Pameran Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kegiatan-pameran-dki-jakarta",
+        "asset": "Data Kegiatan Pameran DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-pengunjung-tourist-information-service-tis-bandara-soekarno-hatta-dki-jakarta",
+        "asset": "Data Pengunjung Tourist Information Service TIS Bandara Soekarno Hatta DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-kunjungan-wisatawan-mancanegara-ke-destinasi-wisata-di-provinsi-dki-jakarta-tahun-2020",
+        "asset": "Data Jumlah Kunjungan Wisatawan Mancanegara ke Destinasi Wisata di Provinsi DKI Jakarta Tahun 2020",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-pengunjung-tourist-information-center-tic-djakartatheatre-dki-jakarta",
+        "asset": "Data Pengunjung Tourist Information Center TIC DjakartaTheatre DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-rata-rata-tingkat-hunian-kamar-pada-hotel-berbintang-di-provinsi-dki-jakarta-tahun-2011-2018",
+        "asset": "Data Rata-Rata Tingkat Hunian Kamar Pada Hotel Berbintang di Provinsi DKI Jakarta Tahun 2011-2018",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-usaha-jasa-akomodasi-jenis-usaha-motel-di-dki-jakarta",
+        "asset": "Data Usaha Jasa Akomodasi Jenis Usaha Motel Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-presentase-jumlah-wisatawan-mancanegara-dan-wisatawan-nusantara-di-dki-jakarta",
+        "asset": "Data Presentase Jumlah Wisatawan Mancanegara Dan Wisatawan Nusantara Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-penyedia-pelayanan-makanan-dan-minum-di-dki-jakarta",
+        "asset": "Data Jumlah Penyedia Pelayanan Makanan Dan Minum Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-potensi-dan-masalah-pengembangan-pariwisata-di-provinsi-dki-jakarta",
+        "asset": "Data Potensi Dan Masalah Pengembangan Pariwisata Di Provinsi DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-jumlah-wisatawan-nusantara-tahun-2018",
+        "asset": "Jumlah Wisatawan Nusantara Tahun 2018",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-usaha-jasa-akomodasi-hotel-bintang",
+        "asset": "Data Usaha Jasa Akomodasi Hotel Bintang",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kunjungan-tamu-graha-wisata-tmii-dan-ragunan-berdasarkan-status-tamu",
+        "asset": "Data Kunjungan Tamu Graha Wisata TMII dan Ragunan Berdasarkan Status Tamu",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-usaha-jasa-akomodasi-di-dki-jakarta-tahun-2014",
+        "asset": "Data Usaha Jasa Akomodasi Di DKI Jakarta Tahun 2014",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-usaha-jasa-pariwisata",
+        "asset": "Data Jumlah Usaha Jasa Pariwisata",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-usaha-jasa-makanan-dan-minuman-jenis-usaha-restoran-di-dki-jakarta",
+        "asset": "Data Usaha Jasa Makanan Dan Minuman Jenis Usaha Restoran Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-jumlah-hotel-berbintang-dan-non-bintang-di-provinsi-dki-jakarta-tahun-2020",
+        "asset": "Data Jumlah Hotel Berbintang dan Non Bintang di Provinsi DKI Jakarta Tahun 2020",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-kegiatan-pemberdayaan-masyarakat-di-dki-jakarta",
+        "asset": "Data Kegiatan Pemberdayaan Masyarakat Di DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-inbound-outbound-melalui-pintu-soekarno-hatta-dki-jakarta",
+        "asset": "Data Inbound Outbound Melalui Pintu Soekarno Hatta DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-rekap-pengunjung-tourist-information-center-tic-djakarta-theatre",
+        "asset": "Data Rekap Pengunjung Tourist Information Center (TIC) Djakarta Theatre",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-data-pengunjung-tourist-information-center-tic-up-monumen-nasional-dki-jakarta",
+        "asset": "Data Pengunjung Tourist Information Center TIC Up Monumen Nasional DKI Jakarta",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "c-kunjungan-wisatawan-mancanegara-ke-dki-jakarta-menurut-pintu-masuk-tahun-2015",
+        "asset": "Kunjungan Wisatawan Mancanegara Ke DKI Jakarta Menurut Pintu Masuk Tahun 2015",
+        "classification": "internal",
+        "confidence": 1,
+        "reviewStatus": "auto"
+      },
+      {
+        "id": "77777777-7777-4777-8777-000000000001",
+        "asset": "core.customer.customer_360",
+        "column": "email",
+        "classification": "confidential",
+        "confidence": 1,
+        "reviewStatus": "reviewed",
+        "maskingRule": "hash_email"
+      },
+      {
+        "id": "77777777-7777-4777-8777-000000000002",
+        "asset": "core.commerce.orders_enriched",
+        "column": "card_last4",
+        "classification": "restricted",
+        "confidence": 1,
+        "reviewStatus": "needs-review",
+        "maskingRule": "show_last4"
+      }
+    ]
+  }
+}

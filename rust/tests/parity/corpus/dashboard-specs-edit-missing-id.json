@@ -1,0 +1,17 @@
+{
+  "request": {
+    "name": "dashboard-specs-edit-missing-id",
+    "method": "PUT",
+    "path": "/api/dashboard/specs",
+    "body": {
+      "title": "x"
+    },
+    "comment": "MUTATING on success (PUT upserts console.bi_chart). Only capturing the missing-id validation error path.",
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "id wajib untuk edit"
+  }
+}

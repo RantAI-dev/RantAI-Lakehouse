@@ -1,0 +1,24 @@
+{
+  "request": {
+    "name": "ops-workloads",
+    "method": "GET",
+    "path": "/api/ops/workloads"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "workloads": [
+      {
+        "id": "w-0",
+        "principal": "dispar",
+        "tenant": "dispar-dki",
+        "class": "hot-analytics",
+        "engine": "hot-store",
+        "status": "running",
+        "elapsedMs": 3,
+        "estimatedCost": 1,
+        "startedAt": "2026-08-27T11:01:34.476Z"
+      }
+    ]
+  }
+}

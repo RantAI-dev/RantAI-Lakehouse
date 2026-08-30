@@ -21,6 +21,7 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatRelativeTime } from "@/lib/format"
 import { identityService } from "@/services"
 import type { User } from "@/services/contracts/identity"
+import { useAuth } from "@/features/auth/auth-provider"
 
 const STATUS_OPTIONS = [
   { value: "active", label: "Active" },
@@ -78,6 +79,8 @@ const columns: ColumnDef<User>[] = [
 ]
 
 export function UsersPage() {
+  const { hasPermission } = useAuth()
+  const canWrite = hasPermission("identity:write")
   const state = useService((s) => identityService.listUsers(s), [])
   const [search, setSearch] = React.useState("")
   const [status, setStatus] = React.useState("all")
@@ -141,7 +144,12 @@ export function UsersPage() {
         title="Users"
         description="People, roles, tenant membership, and recent activity."
         actions={
-          <Button size="sm" onClick={() => setCreateOpen(true)}>
+          <Button
+            size="sm"
+            onClick={() => setCreateOpen(true)}
+            disabled={!canWrite}
+            title={canWrite ? undefined : "You don't have permission to invite users."}
+          >
             <PlusIcon data-icon="inline-start" />
             Invite User
           </Button>

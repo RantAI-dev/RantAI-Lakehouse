@@ -1,0 +1,18 @@
+{
+  "request": {
+    "name": "ai-sessions-save-empty-messages",
+    "method": "POST",
+    "path": "/api/ai/sessions",
+    "body": {
+      "mode": "ask",
+      "messages": []
+    },
+    "comment": "MUTATING on success (POST upserts console.chat_session). Only capturing the empty-messages validation error path.",
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "messages kosong"
+  }
+}

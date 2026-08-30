@@ -5,15 +5,16 @@ import type {
   WorkloadItem,
   PlatformService,
 } from "../contracts/ops";
-import { mockOpsService } from "../mock/ops";
+import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
- * OpsService NYATA: observability/usage/workloads/services dari ClickHouse
- * system.* + Dagster. cancelWorkload delegasi mock.
+ * OpsService NYATA sepenuhnya: observability/usage/workloads/services dari
+ * ClickHouse system.* + Dagster. cancelWorkload adalah `KILL QUERY` nyata
+ * lewat `/api/ops/workloads/{id}/cancel`. mock/ops.ts sudah dihapus.
  */
 async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
-  const res = await fetch(url, { signal });
+  const res = await apiFetch(url, { signal });
   const json = await res.json();
   if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Ops gagal dimuat");
   return json as T;
@@ -28,5 +29,16 @@ export const clickhouseOpsService: OpsService = {
   async listServices(s) {
     return (await get<{ services: PlatformService[] }>("/api/ops/services", s)).services;
   },
-  cancelWorkload: (id, s) => mockOpsService.cancelWorkload(id, s),
+  async cancelWorkload(id, signal) {
+    const res = await apiFetch(`/api/ops/workloads/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+      signal,
+    });
+    const json = await res.json();
+    if (!res.ok) {
+      const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
+      throw new ServiceError(kind, json?.error ?? `Gagal (${res.status})`);
+    }
+    return json as WorkloadItem;
+  },
 };

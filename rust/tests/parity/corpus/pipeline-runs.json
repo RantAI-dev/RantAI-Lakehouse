@@ -1,0 +1,181 @@
+{
+  "request": {
+    "name": "pipeline-runs",
+    "method": "GET",
+    "path": "/api/pipelines/refresh_lakehouse/runs"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "runs": [
+      {
+        "id": "ead7470c-a36f-410f-95fe-ddef911805c9",
+        "pipelineId": "refresh_lakehouse",
+        "status": "completed",
+        "startedAt": "2026-08-27T02:00:14.772Z",
+        "endedAt": "2026-08-27T02:23:31.958Z",
+        "processed": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "retried": 0,
+        "costUnits": 1397
+      },
+      {
+        "id": "46e7681f-84f4-4e6b-a7c7-6cef5debd567",
+        "pipelineId": "refresh_lakehouse",
+        "status": "completed",
+        "startedAt": "2026-08-26T02:00:14.168Z",
+        "endedAt": "2026-08-26T02:27:47.796Z",
+        "processed": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "retried": 0,
+        "costUnits": 1654
+      },
+      {
+        "id": "f1dff02a-707c-4a1f-8457-9068912e4e4d",
+        "pipelineId": "refresh_lakehouse",
+        "status": "completed",
+        "startedAt": "2026-08-25T02:00:12.714Z",
+        "endedAt": "2026-08-25T02:26:30.649Z",
+        "processed": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "retried": 0,
+        "costUnits": 1578
+      },
+      {
+        "id": "3c739b4a-7f26-40c8-b1a3-1b9458094164",
+        "pipelineId": "refresh_lakehouse",
+        "status": "completed",
+        "startedAt": "2026-08-24T02:00:13.194Z",
+        "endedAt": "2026-08-24T02:26:28.945Z",
+        "processed": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "retried": 0,
+        "costUnits": 1576
+      },
+      {
+        "id": "c315aa23-4f74-485e-8981-ad1eb5f0518b",
+        "pipelineId": "refresh_lakehouse",
+        "status": "completed",
+        "startedAt": "2026-08-23T02:00:11.723Z",
+        "endedAt": "2026-08-23T02:27:45.564Z",
+        "processed": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "retried": 0,
+        "costUnits": 1654
+      },
+      {
+        "id": "69f189e1-b408-48d5-962e-1fbba4a38b6f",
+        "pipelineId": "refresh_lakehouse",
+        "status": "completed",
+        "startedAt": "2026-08-22T02:00:09.705Z",
+        "endedAt": "2026-08-22T02:26:07.452Z",
+        "processed": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "retried": 0,
+        "costUnits": 1558
+      },
+      {
+        "id": "47f12f27-3f55-4834-9bb8-fc1a8b907053",
+        "pipelineId": "refresh_lakehouse",
+        "status": "completed",
+        "startedAt": "2026-08-21T02:00:12.733Z",
+        "endedAt": "2026-08-21T02:24:55.703Z",
+        "processed": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "retried": 0,
+        "costUnits": 1483
+      },
+      {
+        "id": "d8ba6f6f-70cc-46b6-8279-9171c7d92956",
+        "pipelineId": "refresh_lakehouse",
+        "status": "completed",
+        "startedAt": "2026-08-20T02:00:12.452Z",
+        "endedAt": "2026-08-20T02:24:28.302Z",
+        "processed": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "retried": 0,
+        "costUnits": 1456
+      },
+      {
+        "id": "002f5bb1-a3e2-4e8f-b635-cdddd2c52866",
+        "pipelineId": "refresh_lakehouse",
+        "status": "completed",
+        "startedAt": "2026-08-19T02:00:13.406Z",
+        "endedAt": "2026-08-19T02:25:47.099Z",
+        "processed": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "retried": 0,
+        "costUnits": 1534
+      },
+      {
+        "id": "9a71e41a-9bd4-4fb5-9286-849b01fba49c",
+        "pipelineId": "refresh_lakehouse",
+        "status": "completed",
+        "startedAt": "2026-08-18T02:00:12.827Z",
+        "endedAt": "2026-08-18T02:24:52.177Z",
+        "processed": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "retried": 0,
+        "costUnits": 1479
+      },
+      {
+        "id": "0b5275c7-2750-4490-844b-434133df5c4e",
+        "pipelineId": "refresh_lakehouse",
+        "status": "completed",
+        "startedAt": "2026-08-17T02:00:08.970Z",
+        "endedAt": "2026-08-17T02:24:24.179Z",
+        "processed": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "retried": 0,
+        "costUnits": 1455
+      },
+      {
+        "id": "5b17d2db-71b7-40be-8cd6-ae8c4e4ff602",
+        "pipelineId": "refresh_lakehouse",
+        "status": "completed",
+        "startedAt": "2026-08-16T05:29:17.522Z",
+        "endedAt": "2026-08-16T05:53:31.018Z",
+        "processed": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "retried": 0,
+        "costUnits": 1453
+      },
+      {
+        "id": "59bf5083-c5e7-4db7-b16d-c6595e9b3df6",
+        "pipelineId": "refresh_lakehouse",
+        "status": "failed",
+        "startedAt": "2026-08-16T04:33:35.260Z",
+        "endedAt": "2026-08-16T04:58:36.985Z",
+        "processed": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "retried": 0,
+        "costUnits": 1502
+      },
+      {
+        "id": "46ce7fcb-df4e-44c2-90a7-893b5ff6f5ca",
+        "pipelineId": "refresh_lakehouse",
+        "status": "failed",
+        "startedAt": "2026-08-16T02:00:13.423Z",
+        "endedAt": "2026-08-16T02:24:48.794Z",
+        "processed": 0,
+        "accepted": 0,
+        "rejected": 0,
+        "retried": 0,
+        "costUnits": 1475
+      }
+    ]
+  }
+}

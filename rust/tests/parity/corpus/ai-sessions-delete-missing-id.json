@@ -1,0 +1,14 @@
+{
+  "request": {
+    "name": "ai-sessions-delete-missing-id",
+    "method": "DELETE",
+    "path": "/api/ai/sessions",
+    "comment": "MUTATING on success (DELETE removes a row from console.chat_session). Only capturing the missing-id validation error path.",
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "id wajib"
+  }
+}

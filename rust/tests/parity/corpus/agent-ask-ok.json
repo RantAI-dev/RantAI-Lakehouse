@@ -1,0 +1,89 @@
+{
+  "request": {
+    "name": "agent-ask-ok",
+    "method": "POST",
+    "path": "/api/agent/ask",
+    "body": {
+      "question": "Ada dataset apa saja tentang investasi pariwisata?"
+    }
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "answer": "<redacted:622>",
+    "datasets": [
+      {
+        "id": "jumlah-pendidikan-dan-pelatihan-pemasaran-digital",
+        "title": "<redacted:49>",
+        "tier": "primer",
+        "rows": 2
+      },
+      {
+        "id": "data-desa-wisata",
+        "title": "<redacted:16>",
+        "tier": "primer",
+        "rows": 48
+      },
+      {
+        "id": "persentase-pertumbuhan-produk-domestik-regional-bruto-pdrb-sektor-pariwisata-akomodasi-dan-makan-minum",
+        "title": "<redacted:106>",
+        "tier": "primer",
+        "rows": 7
+      },
+      {
+        "id": "data-pendapatan-asli-daerah-pad-sektor-pariwisata",
+        "title": "<redacted:51>",
+        "tier": "primer",
+        "rows": 30
+      },
+      {
+        "id": "nilai-ketertarikan-masyarakat-terhadap-pariwisata-dki-jakarta-tahun-2023",
+        "title": "<redacted:72>",
+        "tier": "primer",
+        "rows": 1
+      },
+      {
+        "id": "persentase-pertumbuhan-pdrb-sektor-pariwisata-akomodasi-dan-makan-minum-tahun-2023",
+        "title": "<redacted:84>",
+        "tier": "primer",
+        "rows": 0
+      },
+      {
+        "id": "data-pendapatan-asli-daerah-pad-sektor-pariwisata-tahun-2023",
+        "title": "<redacted:62>",
+        "tier": "primer",
+        "rows": 12
+      },
+      {
+        "id": "data-lokasi-pusat-pelayanan-informasi-pariwisata-di-dki-jakarta",
+        "title": "<redacted:63>",
+        "tier": "primer",
+        "rows": 66
+      },
+      {
+        "id": "data-toko-serba-ada-toserba-dki-jakarta",
+        "title": "<redacted:41>",
+        "tier": "primer",
+        "rows": 25
+      },
+      {
+        "id": "data-jumlah-industri-pariwisata-di-provinsi-dki-jakarta",
+        "title": "<redacted:55>",
+        "tier": "primer",
+        "rows": 82
+      },
+      {
+        "id": "data-penerimaan-pendapatan-asli-daerah-pad-sektor-pariwisata-pemerintah-provinsi-dki-jakarta",
+        "title": "<redacted:94>",
+        "tier": "primer",
+        "rows": 20
+      },
+      {
+        "id": "data-potensi-dan-masalah-pengembangan-pariwisata-di-provinsi-dki-jakarta",
+        "title": "<redacted:72>",
+        "tier": "primer",
+        "rows": 14
+      }
+    ]
+  }
+}

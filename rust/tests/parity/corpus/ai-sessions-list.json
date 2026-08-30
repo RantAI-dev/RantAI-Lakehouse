@@ -1,0 +1,19 @@
+{
+  "request": {
+    "name": "ai-sessions-list",
+    "method": "GET",
+    "path": "/api/ai/sessions"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "sessions": [
+      {
+        "id": "c_81570a05",
+        "title": "<redacted:32>",
+        "mode": "ask",
+        "updatedAt": "2026-08-26 12:23:30"
+      }
+    ]
+  }
+}

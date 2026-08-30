@@ -1,0 +1,50 @@
+[package]
+name = "lakehouse-api"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "lakehouse_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lakehouse-api"
+path = "src/main.rs"
+
+[dependencies]
+lakehouse-core = { path = "../lakehouse-core" }
+lakehouse-clickhouse = { path = "../lakehouse-clickhouse" }
+lakehouse-dagster = { path = "../lakehouse-dagster" }
+lakehouse-alerts = { path = "../lakehouse-alerts" }
+lakehouse-notify = { path = "../lakehouse-notify" }
+lakehouse-bi = { path = "../lakehouse-bi" }
+lakehouse-embed = { path = "../lakehouse-embed" }
+lakehouse-llm = { path = "../lakehouse-llm" }
+lakehouse-store = { path = "../lakehouse-store" }
+lakehouse-auth = { path = "../lakehouse-auth" }
+rand = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+wiremock = { workspace = true }
+sqlx = { workspace = true }
+uuid = { workspace = true }
+lakehouse-test-support = { path = "../lakehouse-test-support" }
+
+[lints]
+workspace = true

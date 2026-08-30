@@ -1,0 +1,61 @@
+{
+  "request": {
+    "name": "ops-services",
+    "method": "GET",
+    "path": "/api/ops/services"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "services": [
+      {
+        "id": "clickhouse",
+        "name": "ClickHouse (Hot analytical store)",
+        "health": "healthy",
+        "version": "-",
+        "site": "Depok (187)",
+        "replicas": 1,
+        "errorRate": 0,
+        "latencyMs": 0,
+        "dependencies": []
+      },
+      {
+        "id": "dagster",
+        "name": "Dagster (Orchestration)",
+        "health": "healthy",
+        "version": "-",
+        "site": "Depok (187)",
+        "replicas": 1,
+        "errorRate": 0,
+        "latencyMs": 0,
+        "dependencies": [
+          "clickhouse"
+        ]
+      },
+      {
+        "id": "iceberg",
+        "name": "Iceberg + Lakekeeper (Open tables)",
+        "health": "healthy",
+        "version": "-",
+        "site": "Depok (187)",
+        "replicas": 1,
+        "errorRate": 0,
+        "latencyMs": 0,
+        "dependencies": [
+          "rustfs"
+        ]
+      },
+      {
+        "id": "rustfs",
+        "name": "RustFS (Object storage)",
+        "health": "healthy",
+        "version": "-",
+        "site": "Depok (187)",
+        "replicas": 1,
+        "errorRate": 0,
+        "latencyMs": 0,
+        "dependencies": []
+      }
+    ]
+  }
+}

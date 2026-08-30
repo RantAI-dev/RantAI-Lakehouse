@@ -1,0 +1,74 @@
+{
+  "request": {
+    "name": "ai-sessions-detail",
+    "method": "GET",
+    "path": "/api/ai/sessions?id=c_81570a05"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "session": {
+      "id": "c_81570a05",
+      "title": "<redacted:32>",
+      "mode": "ask",
+      "messages": [
+        {
+          "role": "user",
+          "content": "<redacted:32>"
+        },
+        {
+          "role": "assistant",
+          "content": "<redacted:585>",
+          "tools": [
+            {
+              "tool": "run_sql",
+              "args": {
+                "sql": "<redacted:112>"
+              },
+              "ok": true,
+              "result": {
+                "columns": [
+                  "kawasan",
+                  "total_wisman"
+                ],
+                "rows": [
+                  {
+                    "kawasan": "Asia",
+                    "total_wisman": 1310934
+                  },
+                  {
+                    "kawasan": "Lainnya",
+                    "total_wisman": 363751
+                  },
+                  {
+                    "kawasan": "Eropa",
+                    "total_wisman": 235750
+                  },
+                  {
+                    "kawasan": "Timur Tengah",
+                    "total_wisman": 152938
+                  },
+                  {
+                    "kawasan": "Amerika",
+                    "total_wisman": 85815
+                  },
+                  {
+                    "kawasan": "Oseania",
+                    "total_wisman": 69579
+                  },
+                  {
+                    "kawasan": "Afrika",
+                    "total_wisman": 4685
+                  }
+                ],
+                "rowCount": 7
+              }
+            }
+          ],
+          "chartCreated": false
+        }
+      ],
+      "updatedAt": "2026-08-26 12:23:30"
+    }
+  }
+}

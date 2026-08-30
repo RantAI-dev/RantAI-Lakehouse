@@ -17,6 +17,7 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatNumber } from "@/lib/format"
 import { identityService } from "@/services"
 import type { Role } from "@/services/contracts/identity"
+import { useAuth } from "@/features/auth/auth-provider"
 
 const columns: ColumnDef<Role>[] = [
   { key: "name", header: "Role", render: (r) => r.name },
@@ -34,6 +35,8 @@ const columns: ColumnDef<Role>[] = [
 ]
 
 export function RolesPage() {
+  const { hasPermission } = useAuth()
+  const canWrite = hasPermission("identity:write")
   const state = useService((s) => identityService.listRoles(s), [])
   const [search, setSearch] = React.useState("")
   const [createOpen, setCreateOpen] = React.useState(false)
@@ -80,7 +83,12 @@ export function RolesPage() {
         title="Teams & Roles"
         description="Role templates, permissions, and membership."
         actions={
-          <Button size="sm" onClick={() => setCreateOpen(true)}>
+          <Button
+            size="sm"
+            onClick={() => setCreateOpen(true)}
+            disabled={!canWrite}
+            title={canWrite ? undefined : "You don't have permission to create roles."}
+          >
             <PlusIcon data-icon="inline-start" />
             Create Role
           </Button>

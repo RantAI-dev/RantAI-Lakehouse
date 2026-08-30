@@ -3,7 +3,7 @@
 import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { RefreshCw, Sparkles, Download, Pencil, Eye, EyeOff, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Plus, Move, Share2, Link2, Check, Globe, Code2, KeyRound, Filter, Table2, FileDown } from "lucide-react";
+import { RefreshCw, Sparkles, Download, Pencil, Eye, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Plus, Move, Share2, Link2, Check, Globe, Code2, KeyRound, Filter, Table2, FileDown } from "lucide-react";
 import { PageHeader } from "@/components/patterns/page-header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -22,6 +22,7 @@ import { DashboardGrid, type GridItem } from "./dashboard-grid";
 import { TileBody } from "./tile-body";
 import { DashboardFilters } from "./dashboard-filters";
 import { useCopilot } from "@/features/copilot/use-copilot";
+import { apiFetch } from "@/services/http";
 
 type Cell = { columns: string[]; rows: Record<string, unknown>[] } | { error: string };
 type KpiMeta = { id: string; title: string; caption?: string; format: string };
@@ -79,9 +80,7 @@ export function DashboardPage() {
   const [shareBusy, setShareBusy] = React.useState(false);
   const [copied, setCopied] = React.useState<string | false>(false);
   const [embedEnabled, setEmbedEnabled] = React.useState(false);
-  const [embedSecret, setEmbedSecret] = React.useState("");
   const [sampleToken, setSampleToken] = React.useState("");
-  const [showSecret, setShowSecret] = React.useState(false);
   const notifyChange = () => { try { window.dispatchEvent(new Event("dashboards:changed")); } catch { /* ignore */ } };
 
   const load = React.useCallback(async () => {
@@ -90,7 +89,7 @@ export function DashboardPage() {
       const q = new URLSearchParams({ board });
       if (year !== "all") q.set("year", year);
       if (!adoptingRef.current && filtersRef.current.length) q.set("filters", JSON.stringify(filtersRef.current));
-      const res = await fetch(`/api/dashboard?${q.toString()}`, { cache: "no-store" });
+      const res = await apiFetch(`/api/dashboard?${q.toString()}`, { cache: "no-store" });
       const json = (await res.json()) as Payload;
       if (!res.ok) throw new Error((json as { error?: string }).error ?? "Failed to load dashboard");
       setData(json);
@@ -130,7 +129,7 @@ export function DashboardPage() {
     filtersRef.current = next;
     setFilters(next);
     if (!isDefault) {
-      void fetch("/api/dashboard/boards", {
+      void apiFetch("/api/dashboard/boards", {
         method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: board, filters: next }),
       });
     }
@@ -163,7 +162,7 @@ export function DashboardPage() {
     setRecords({ columns: [], rows: [], value, loading: true });
     try {
       const q = new URLSearchParams({ mart, column, value, limit: "100" });
-      const res = await fetch(`/api/dashboard/records?${q.toString()}`, { cache: "no-store" });
+      const res = await apiFetch(`/api/dashboard/records?${q.toString()}`, { cache: "no-store" });
       const json = await res.json();
       if (!res.ok) throw new Error(json?.error ?? "gagal");
       setRecords({ columns: json.columns ?? [], rows: json.rows ?? [], value, loading: false });
@@ -198,7 +197,7 @@ export function DashboardPage() {
     if (isDefault) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      void fetch("/api/dashboard/boards", {
+      void apiFetch("/api/dashboard/boards", {
         method: "PUT", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: board, layout: next }),
       });
@@ -206,12 +205,12 @@ export function DashboardPage() {
   }, [board, isDefault]);
 
   async function remove(id: string) {
-    await fetch(`/api/dashboard/specs?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+    await apiFetch(`/api/dashboard/specs?id=${encodeURIComponent(id)}`, { method: "DELETE" });
     void load();
   }
   async function duplicateDashboard() {
     setMenuOpen(false);
-    const res = await fetch("/api/dashboard/boards", {
+    const res = await apiFetch("/api/dashboard/boards", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ duplicate: board }),
     });
     const json = await res.json();
@@ -221,12 +220,12 @@ export function DashboardPage() {
   async function deleteDashboard() {
     setMenuOpen(false);
     if (isDefault) return;
-    await fetch(`/api/dashboard/boards?id=${encodeURIComponent(board)}`, { method: "DELETE" });
+    await apiFetch(`/api/dashboard/boards?id=${encodeURIComponent(board)}`, { method: "DELETE" });
     notifyChange();
     router.push("/dashboards");
   }
   async function newDashboard() {
-    const res = await fetch("/api/dashboard/boards", {
+    const res = await apiFetch("/api/dashboard/boards", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "New dashboard" }),
     });
     const json = await res.json();
@@ -237,37 +236,37 @@ export function DashboardPage() {
   async function openShare() {
     setMenuOpen(false);
     if (isDefault) return;
-    setCopied(false); setShowSecret(false);
+    setCopied(false);
     try {
-      const res = await fetch("/api/dashboard/boards", { cache: "no-store" });
+      const res = await apiFetch("/api/dashboard/boards", { cache: "no-store" });
       const json = await res.json();
       const b = (json?.boards ?? []).find((x: { id: string; publicToken?: string }) => x.id === board);
       setShareToken(b?.publicToken ?? "");
     } catch { setShareToken(""); }
     try {
-      const res = await fetch(`/api/dashboard/embed-info?board=${encodeURIComponent(board)}`, { cache: "no-store" });
+      const res = await apiFetch(`/api/dashboard/embed-info?board=${encodeURIComponent(board)}`, { cache: "no-store" });
       const json = await res.json();
-      setEmbedSecret(json?.secret ?? ""); setEmbedEnabled(!!json?.enabled); setSampleToken(json?.sampleToken ?? "");
-    } catch { setEmbedSecret(""); setEmbedEnabled(false); setSampleToken(""); }
+      setEmbedEnabled(!!json?.enabled); setSampleToken(json?.sampleToken ?? "");
+    } catch { setEmbedEnabled(false); setSampleToken(""); }
     setShareOpen(true);
   }
   async function setEmbed(enable: boolean) {
     setShareBusy(true);
     try {
-      await fetch("/api/dashboard/boards", {
+      await apiFetch("/api/dashboard/boards", {
         method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: board, embed: enable }),
       });
       setEmbedEnabled(enable);
       // Refresh sample token (baru bermakna saat enabled).
-      const res = await fetch(`/api/dashboard/embed-info?board=${encodeURIComponent(board)}`, { cache: "no-store" });
+      const res = await apiFetch(`/api/dashboard/embed-info?board=${encodeURIComponent(board)}`, { cache: "no-store" });
       const json = await res.json();
-      setEmbedSecret(json?.secret ?? ""); setSampleToken(json?.sampleToken ?? "");
+      setSampleToken(json?.sampleToken ?? "");
     } finally { setShareBusy(false); }
   }
   async function setPublic(enable: boolean) {
     setShareBusy(true);
     try {
-      const res = await fetch("/api/dashboard/boards", {
+      const res = await apiFetch("/api/dashboard/boards", {
         method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: board, public: enable }),
       });
       const json = await res.json();
@@ -300,7 +299,7 @@ export function DashboardPage() {
   async function saveRename() {
     const name = newName.trim();
     if (!name || isDefault) return;
-    await fetch("/api/dashboard/boards", {
+    await apiFetch("/api/dashboard/boards", {
       method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: board, name }),
     });
     setRenameOpen(false);
@@ -592,23 +591,10 @@ export function DashboardPage() {
 
               {embedEnabled ? (
                 <div className="space-y-2 pt-1">
-                  {/* Secret */}
-                  <div className="space-y-1">
-                    <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Embedding secret</p>
-                    <div className="flex items-center gap-2">
-                      <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-background px-2.5 py-2">
-                        <KeyRound className="size-3.5 shrink-0 text-muted-foreground" />
-                        <span className="truncate font-mono text-xs text-foreground">{showSecret ? embedSecret : "•".repeat(40)}</span>
-                      </div>
-                      <Button size="sm" variant="ghost" onClick={() => setShowSecret((s) => !s)} aria-label="Toggle secret">
-                        {showSecret ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
-                      </Button>
-                      <Button size="sm" variant="outline" onClick={() => void copyText(embedSecret, "secret")}>
-                        {copied === "secret" ? <Check className="size-4 text-emerald-500" /> : <Copy className="size-4" />}
-                      </Button>
-                    </div>
-                    <p className="text-[11px] text-destructive/80">Keep this server-side. Anyone with it can sign valid embeds.</p>
-                  </div>
+                  {/* The signing secret itself is never sent to the browser — see
+                      /api/dashboard/embed-info. Set EMBED_SECRET server-side from
+                      the same value the backend uses to sign tokens. */}
+                  <p className="text-[11px] text-muted-foreground">The signing secret is kept server-side and is never exposed to the console. Set <code className="rounded bg-muted px-1 font-mono">EMBED_SECRET</code> in your server environment to the same value the backend signs with.</p>
 
                   {/* Signing snippet */}
                   <div className="space-y-1">

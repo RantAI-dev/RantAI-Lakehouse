@@ -1,0 +1,37 @@
+{
+  "request": {
+    "name": "dashboard-fields-marts",
+    "method": "GET",
+    "path": "/api/dashboard/fields"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "marts": [
+      {
+        "name": "mart_atlas",
+        "rows": 4
+      },
+      {
+        "name": "mart_event",
+        "rows": 9
+      },
+      {
+        "name": "mart_gci_readiness",
+        "rows": 28
+      },
+      {
+        "name": "mart_kuliner",
+        "rows": 5
+      },
+      {
+        "name": "mart_kunjungan_dtw",
+        "rows": 35
+      },
+      {
+        "name": "mart_wisman",
+        "rows": 276
+      }
+    ]
+  }
+}

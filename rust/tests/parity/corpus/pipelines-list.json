@@ -1,0 +1,102 @@
+{
+  "request": {
+    "name": "pipelines-list",
+    "method": "GET",
+    "path": "/api/pipelines"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "pipelines": [
+      {
+        "id": "ops_backup_maintenance",
+        "name": "ops_backup_maintenance",
+        "kind": "batch",
+        "status": "completed",
+        "owner": "Dinas Pariwisata & Ekraf DKI Jakarta",
+        "source": "Satu Data Jakarta + berkas",
+        "target": "serving.mart_* (Gold)",
+        "schedule": "cron: 0 4 * * * (RUNNING)",
+        "lastRunAt": "2026-08-27T04:00:10.075Z",
+        "slaOk": true,
+        "freshnessLagSeconds": 0
+      },
+      {
+        "id": "refresh_lakehouse",
+        "name": "refresh_lakehouse",
+        "kind": "batch",
+        "status": "completed",
+        "owner": "Dinas Pariwisata & Ekraf DKI Jakarta",
+        "source": "Satu Data Jakarta + berkas",
+        "target": "serving.mart_* (Gold)",
+        "schedule": "cron: 0 2 * * * (RUNNING)",
+        "lastRunAt": "2026-08-27T02:00:14.772Z",
+        "slaOk": true,
+        "freshnessLagSeconds": 0
+      },
+      {
+        "id": "pl-orders-rollup",
+        "name": "orders_hourly_rollup",
+        "kind": "incremental",
+        "status": "ready",
+        "owner": "Data Platform",
+        "source": "core.sales.orders_events",
+        "target": "core.sales.orders_hourly",
+        "connectorId": "conn-pg-core",
+        "sourceAssetId": "tbl-orders-events",
+        "targetAssetId": "tbl-orders-enriched",
+        "schedule": "Every hour",
+        "lastRunAt": "2026-08-27T11:45:09.150Z",
+        "nextRunAt": "2026-08-27T16:41:09.150Z",
+        "slaOk": true,
+        "freshnessLagSeconds": 120
+      },
+      {
+        "id": "pl-erp-inventory",
+        "name": "erp_inventory_sync",
+        "kind": "batch",
+        "status": "failed",
+        "owner": "Bayu Pratama",
+        "source": "ERP Inventory API",
+        "target": "bronze.inventory_snapshot",
+        "sourceAssetId": "ext-legacy-warehouse",
+        "targetAssetId": "tbl-inventory-snapshot",
+        "schedule": "Daily 02:00",
+        "lastRunAt": "2026-08-25T15:45:09.150Z",
+        "slaOk": false,
+        "freshnessLagSeconds": 86400
+      },
+      {
+        "id": "pl-policy-docs",
+        "name": "supplier_docs_ingest",
+        "kind": "document",
+        "status": "running",
+        "owner": "Risk Analytics",
+        "source": "s3://meridian-docs/supplier-policy/",
+        "target": "ai.supplier_doc_chunks",
+        "connectorId": "conn-s3-docs",
+        "targetAssetId": "kn-supplier-policy",
+        "schedule": "On object create",
+        "lastRunAt": "2026-08-27T13:45:09.150Z",
+        "slaOk": true,
+        "freshnessLagSeconds": 40
+      },
+      {
+        "id": "pl-embed-faq",
+        "name": "faq_embedding_refresh",
+        "kind": "vector",
+        "status": "scheduled",
+        "owner": "Support AI",
+        "source": "knowledge.faq_articles",
+        "target": "ai.faq_vectors",
+        "sourceAssetId": "kn-supplier-policy",
+        "targetAssetId": "vec-support-kb",
+        "schedule": "Every 6 hours",
+        "lastRunAt": "2026-08-27T12:45:09.150Z",
+        "nextRunAt": "2026-08-27T18:45:09.150Z",
+        "slaOk": true,
+        "freshnessLagSeconds": 10800
+      }
+    ]
+  }
+}

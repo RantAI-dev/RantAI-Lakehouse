@@ -1,0 +1,311 @@
+{
+  "request": {
+    "name": "public-dash-ok",
+    "method": "GET",
+    "path": "/api/public/dashboard/__PUBLIC_DASH_TOKEN__"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "board": {
+      "id": "b_73c6fcc1",
+      "name": "Sample — Visitors"
+    },
+    "layout": {
+      "u_2dadfe2e": {
+        "x": 0,
+        "y": 0,
+        "w": 3,
+        "h": 5
+      },
+      "u_947f0756": {
+        "x": 3,
+        "y": 0,
+        "w": 9,
+        "h": 5
+      },
+      "u_f876308c": {
+        "x": 0,
+        "y": 5,
+        "w": 7,
+        "h": 6
+      },
+      "u_5c8e15d4": {
+        "x": 7,
+        "y": 5,
+        "w": 5,
+        "h": 6
+      }
+    },
+    "charts": [
+      {
+        "id": "u_2dadfe2e",
+        "title": "Total Foreign Visitors",
+        "kind": "kpi",
+        "mart": "mart_wisman",
+        "x": "",
+        "y": "jumlah",
+        "format": "int",
+        "span": 1,
+        "caption": "cumulative visits",
+        "source": "ui",
+        "board": "b_73c6fcc1",
+        "def": {
+          "title": "Total Foreign Visitors",
+          "kind": "kpi",
+          "mart": "mart_wisman",
+          "dimension": "",
+          "measures": [
+            "jumlah"
+          ],
+          "aggregate": "sum",
+          "caption": "cumulative visits",
+          "span": 1,
+          "board": "b_73c6fcc1"
+        },
+        "hasYear": true,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 08:05:16"
+      },
+      {
+        "id": "u_5c8e15d4",
+        "title": "Visitors by Region",
+        "kind": "pie",
+        "mart": "mart_wisman",
+        "x": "kawasan",
+        "y": "jumlah",
+        "format": "int",
+        "span": 1,
+        "source": "ui",
+        "board": "b_73c6fcc1",
+        "def": {
+          "title": "Visitors by Region",
+          "mart": "mart_wisman",
+          "kind": "pie",
+          "dimension": "kawasan",
+          "measures": [
+            "jumlah"
+          ],
+          "aggregate": "sum",
+          "limit": 20,
+          "order": "desc",
+          "span": 1,
+          "board": "b_73c6fcc1"
+        },
+        "hasYear": true,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 08:05:16"
+      },
+      {
+        "id": "u_947f0756",
+        "title": "Monthly Visitor Trend",
+        "kind": "area",
+        "mart": "mart_wisman",
+        "x": "bulan",
+        "y": "jumlah",
+        "format": "int",
+        "span": 1,
+        "source": "ui",
+        "board": "b_73c6fcc1",
+        "def": {
+          "title": "Monthly Visitor Trend",
+          "mart": "mart_wisman",
+          "kind": "area",
+          "dimension": "bulan",
+          "measures": [
+            "jumlah"
+          ],
+          "aggregate": "sum",
+          "limit": 20,
+          "order": "none",
+          "span": 1,
+          "board": "b_73c6fcc1"
+        },
+        "hasYear": true,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 08:05:16"
+      },
+      {
+        "id": "u_f876308c",
+        "title": "Top Source Countries",
+        "kind": "hbar",
+        "mart": "mart_wisman",
+        "x": "negara",
+        "y": "jumlah",
+        "format": "int",
+        "span": 1,
+        "source": "ui",
+        "board": "b_73c6fcc1",
+        "def": {
+          "title": "Top Source Countries",
+          "mart": "mart_wisman",
+          "kind": "hbar",
+          "dimension": "negara",
+          "measures": [
+            "jumlah"
+          ],
+          "aggregate": "sum",
+          "limit": 10,
+          "order": "desc",
+          "span": 1,
+          "board": "b_73c6fcc1"
+        },
+        "hasYear": true,
+        "createdBy": "ui",
+        "createdAt": "2026-08-19 08:05:16"
+      }
+    ],
+    "results": {
+      "u_2dadfe2e": {
+        "columns": [
+          "v"
+        ],
+        "rows": [
+          {
+            "v": 2223452
+          }
+        ]
+      },
+      "u_5c8e15d4": {
+        "columns": [
+          "kawasan",
+          "jumlah"
+        ],
+        "rows": [
+          {
+            "kawasan": "Asia",
+            "jumlah": 1310934
+          },
+          {
+            "kawasan": "Lainnya",
+            "jumlah": 363751
+          },
+          {
+            "kawasan": "Eropa",
+            "jumlah": 235750
+          },
+          {
+            "kawasan": "Timur Tengah",
+            "jumlah": 152938
+          },
+          {
+            "kawasan": "Amerika",
+            "jumlah": 85815
+          },
+          {
+            "kawasan": "Oseania",
+            "jumlah": 69579
+          },
+          {
+            "kawasan": "Afrika",
+            "jumlah": 4685
+          }
+        ]
+      },
+      "u_947f0756": {
+        "columns": [
+          "bulan",
+          "jumlah"
+        ],
+        "rows": [
+          {
+            "bulan": "Agustus",
+            "jumlah": 216700
+          },
+          {
+            "bulan": "April",
+            "jumlah": 178820
+          },
+          {
+            "bulan": "Desember",
+            "jumlah": 188902
+          },
+          {
+            "bulan": "Februari",
+            "jumlah": 178739
+          },
+          {
+            "bulan": "Januari",
+            "jumlah": 184646
+          },
+          {
+            "bulan": "Juli",
+            "jumlah": 166849
+          },
+          {
+            "bulan": "Juni",
+            "jumlah": 206181
+          },
+          {
+            "bulan": "Maret",
+            "jumlah": 192822
+          },
+          {
+            "bulan": "Mei",
+            "jumlah": 182393
+          },
+          {
+            "bulan": "November",
+            "jumlah": 178925
+          },
+          {
+            "bulan": "Oktober",
+            "jumlah": 175838
+          },
+          {
+            "bulan": "September",
+            "jumlah": 172637
+          }
+        ]
+      },
+      "u_f876308c": {
+        "columns": [
+          "negara",
+          "jumlah"
+        ],
+        "rows": [
+          {
+            "negara": "Malaysia",
+            "jumlah": 319855
+          },
+          {
+            "negara": "Lainnya",
+            "jumlah": 252076
+          },
+          {
+            "negara": "Tiongkok",
+            "jumlah": 240622
+          },
+          {
+            "negara": "Jepang",
+            "jumlah": 210568
+          },
+          {
+            "negara": "Singapura",
+            "jumlah": 184779
+          },
+          {
+            "negara": "Arab Saudi",
+            "jumlah": 141009
+          },
+          {
+            "negara": "Crew (WNA)",
+            "jumlah": 111675
+          },
+          {
+            "negara": "Korea Selatan",
+            "jumlah": 93235
+          },
+          {
+            "negara": "Amerika Serikat",
+            "jumlah": 85815
+          },
+          {
+            "negara": "India",
+            "jumlah": 74379
+          }
+        ]
+      }
+    }
+  }
+}

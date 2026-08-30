@@ -1,0 +1,76 @@
+{
+  "request": {
+    "name": "dashboard-records",
+    "method": "GET",
+    "path": "/api/dashboard/records?mart=mart_wisman&column=kawasan&value=Asia&limit=5"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "columns": [
+      "kode_negara",
+      "negara",
+      "kawasan",
+      "tahun",
+      "bulan_no",
+      "bulan",
+      "pintu_masuk",
+      "jumlah"
+    ],
+    "rows": [
+      {
+        "kode_negara": "CHN",
+        "negara": "Tiongkok",
+        "kawasan": "Asia",
+        "tahun": 2014,
+        "bulan_no": 1,
+        "bulan": "Januari",
+        "pintu_masuk": "Soekarno-Hatta",
+        "jumlah": 22356
+      },
+      {
+        "kode_negara": "CHN",
+        "negara": "Tiongkok",
+        "kawasan": "Asia",
+        "tahun": 2014,
+        "bulan_no": 2,
+        "bulan": "Februari",
+        "pintu_masuk": "Soekarno-Hatta",
+        "jumlah": 24704
+      },
+      {
+        "kode_negara": "CHN",
+        "negara": "Tiongkok",
+        "kawasan": "Asia",
+        "tahun": 2014,
+        "bulan_no": 3,
+        "bulan": "Maret",
+        "pintu_masuk": "Soekarno-Hatta",
+        "jumlah": 20436
+      },
+      {
+        "kode_negara": "CHN",
+        "negara": "Tiongkok",
+        "kawasan": "Asia",
+        "tahun": 2014,
+        "bulan_no": 4,
+        "bulan": "April",
+        "pintu_masuk": "Soekarno-Hatta",
+        "jumlah": 17564
+      },
+      {
+        "kode_negara": "CHN",
+        "negara": "Tiongkok",
+        "kawasan": "Asia",
+        "tahun": 2014,
+        "bulan_no": 5,
+        "bulan": "Mei",
+        "pintu_masuk": "Soekarno-Hatta",
+        "jumlah": 17972
+      }
+    ],
+    "mart": "mart_wisman",
+    "column": "kawasan",
+    "value": "Asia"
+  }
+}

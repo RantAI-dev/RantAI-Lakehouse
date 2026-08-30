@@ -1,0 +1,180 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-audit:
+    name: cargo audit (advisories)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          cache-targets: false
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      # RUSTSEC-2023-0071 ("Marvin Attack" timing side-channel in `rsa`
+      # 0.9.10) is a dev-only test dependency of lakehouse-auth
+      # (crates/lakehouse-auth/tests/oidc.rs) with no upstream fix
+      # available. See rust/deny.toml for the full justification — the
+      # same exception is mirrored here since cargo-audit and cargo-deny
+      # read separate ignore lists.
+      - name: cargo audit
+        run: cargo audit --ignore RUSTSEC-2023-0071
+        working-directory: rust
+
+  cargo-deny:
+    name: cargo deny check (all)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          cache-targets: false
+
+      - name: cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: rust/Cargo.toml
+          command: check all
+
+  # Working-tree secret scan: guards against a *new* secret being
+  # committed. Configured with `--no-git` so it scans files on disk, not
+  # git blobs/history — see the separate `history-scan` job below for why
+  # history itself is not scanned here.
+  gitleaks:
+    name: gitleaks (working tree)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # taiki-e/install-action doesn't package gitleaks, so install the
+      # pinned binary release directly instead of trusting a floating
+      # third-party wrapper action.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: gitleaks detect (working tree only, --no-git)
+        run: gitleaks detect --no-git --source . --config .gitleaks.toml --redact -v
+
+  # ── Separate on purpose; see docs/CI.md for the full, honest status. ──
+  #
+  # A prior audit reported a real LLM API key leaked in git history on
+  # commits reachable from both `main` and `feat/rust-backend`. This job
+  # exists to scan full git history — the mode a leak in history actually
+  # requires to be caught — as a separate job from the working-tree
+  # `gitleaks` job above, specifically so its result (red OR green) stays
+  # individually visible in the Actions UI rather than being folded into
+  # (and potentially masking, or being masked by) another job's status.
+  #
+  # As actually run in CI with gitleaks' default ruleset against this
+  # repo's real history, this job currently reports NO findings — see
+  # docs/CI.md's "history-scan" section for the full, honest account of
+  # that discrepancy (verified independently, not assumed) and what it
+  # does and doesn't prove. It is intentionally still not part of required
+  # status checks: if the reported leak used a key format gitleaks'
+  # default rules don't match, a future run could legitimately turn red,
+  # and that must not silently block merges.
+  #
+  # Do NOT set `continue-on-error: true` here and do NOT fold this into
+  # the `gitleaks` job above — keep its result independently visible
+  # regardless of which way it goes.
+  history-scan:
+    name: gitleaks (full git history) — see job summary and docs/CI.md
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all branches
+        run: git fetch --all --tags
+
+      - name: Explain this job's purpose and known status
+        run: |
+          cat <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          ## history-scan
+
+          A prior audit reported a real LLM API key leaked in git history.
+          This job scans full history with gitleaks' default ruleset to
+          check for it. As of the last verification, this scan does NOT
+          reproduce that finding — see docs/CI.md for the full, honest
+          write-up of that discrepancy. This job is intentionally not part
+          of required status checks either way: if a future run does turn
+          red, that must not silently block merges — see docs/CI.md for
+          what a red result here would require (a human-authorized history
+          rewrite: purge the blob, force-push every affected ref, rotate
+          the key at the provider).
+          EOF
+
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      # Same .gitleaks.toml as the working-tree job (only excludes the two
+      # verified-synthetic test-fixture JWTs and gitignored build dirs —
+      # neither masks a real secret), so this job's redness reflects the
+      # actual leak rather than known-benign noise. No `--no-git`: this is
+      # a full-history scan (`git log -p` under the hood), on purpose.
+      - name: gitleaks detect (full history)
+        run: gitleaks detect --source . --config .gitleaks.toml --redact -v
+
+  # Known limitation, not fixable from a workflow file: `dependency-review-
+  # action` calls GitHub's Dependency Graph diff API, which for *private*
+  # repositories requires GitHub Advanced Security. This org
+  # (RantAI-dev) is on the free plan (`plan.name: "free"`,
+  # `advanced_security_enabled_for_new_repositories: false` — verified via
+  # `gh api orgs/RantAI-dev`), so this job fails at the "Dependency review"
+  # step with "Dependency review is not supported on this repository."
+  # regardless of how it's configured. Enabling it requires either
+  # upgrading the org's billing plan to include GHAS, or making the repo
+  # public (explicitly out of scope — see the hard rules this CI pass
+  # operates under). Left in place, and left failing honestly, rather than
+  # silently dropped — see docs/CI.md. Not part of required status checks.
+  dependency-review:
+    name: "Dependency review (PR only) — requires GHAS, not available on this plan"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Dependency review
+        uses: actions/dependency-review-action@v4

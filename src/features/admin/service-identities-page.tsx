@@ -19,6 +19,7 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatRelativeTime } from "@/lib/format"
 import { identityService } from "@/services"
 import type { ServiceIdentity } from "@/services/contracts/identity"
+import { useAuth } from "@/features/auth/auth-provider"
 
 const ROTATION_OPTIONS = [
   { value: "current", label: "Current" },
@@ -75,6 +76,8 @@ const columns: ColumnDef<ServiceIdentity>[] = [
 ]
 
 export function ServiceIdentitiesPage() {
+  const { hasPermission } = useAuth()
+  const canWrite = hasPermission("identity:write")
   const state = useService((s) => identityService.listServiceIdentities(s), [])
   const [search, setSearch] = React.useState("")
   const [rotation, setRotation] = React.useState("all")
@@ -129,7 +132,12 @@ export function ServiceIdentitiesPage() {
         title="Service Identities"
         description="Machine clients, scopes, rotation, and recent use."
         actions={
-          <Button size="sm" onClick={() => setCreateOpen(true)}>
+          <Button
+            size="sm"
+            onClick={() => setCreateOpen(true)}
+            disabled={!canWrite}
+            title={canWrite ? undefined : "You don't have permission to create service identities."}
+          >
             <PlusIcon data-icon="inline-start" />
             Create Service Identity
           </Button>

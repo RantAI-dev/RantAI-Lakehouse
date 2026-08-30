@@ -1,0 +1,14 @@
+{
+  "request": {
+    "name": "agent-query-missing-question",
+    "method": "POST",
+    "path": "/api/agent/query",
+    "body": {},
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "question wajib"
+  }
+}

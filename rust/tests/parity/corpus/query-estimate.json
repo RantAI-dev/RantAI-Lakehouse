@@ -1,0 +1,35 @@
+{
+  "request": {
+    "name": "query-estimate",
+    "method": "POST",
+    "path": "/api/query/estimate",
+    "body": {
+      "sql": "SELECT * FROM serving.mart_wisman"
+    }
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "estimatedBytes": 17664,
+    "estimatedCostMin": 1,
+    "estimatedCostMax": 1,
+    "workloadClass": "hot-analytics",
+    "engine": "hot-store",
+    "cacheEligible": true,
+    "freshnessLagSeconds": 0,
+    "policyObligations": [],
+    "sources": [
+      "serving.mart_wisman"
+    ],
+    "plan": [
+      {
+        "id": "p0",
+        "label": "serving.mart_wisman",
+        "location": "clickhouse@lakehouse",
+        "operation": "scan",
+        "estimatedBytes": 0,
+        "status": "completed"
+      }
+    ]
+  }
+}

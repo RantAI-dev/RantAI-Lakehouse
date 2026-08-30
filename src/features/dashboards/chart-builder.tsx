@@ -14,6 +14,7 @@ import {
   Select, SelectContent, SelectGroup, SelectLabel, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import type { ChartKind } from "@/lib/dashboard-specs";
+import { apiFetch } from "@/services/http";
 
 type Fields = { dimensions: string[]; measures: string[] };
 export type ChartDef = {
@@ -127,7 +128,7 @@ export function ChartBuilder({
   const isEdit = !!editId;
 
   async function loadFields(m: string): Promise<Fields> {
-    const j = await fetch(`/api/dashboard/fields?mart=${encodeURIComponent(m)}`).then((r) => r.json());
+    const j = await apiFetch(`/api/dashboard/fields?mart=${encodeURIComponent(m)}`).then((r) => r.json());
     const f = { dimensions: j.dimensions ?? [], measures: j.measures ?? [] };
     setFields(f);
     return f;
@@ -136,7 +137,7 @@ export function ChartBuilder({
   // Saat dibuka: muat mart, dan bila EDIT prefill dari initial.
   React.useEffect(() => {
     if (!open) return;
-    void fetch("/api/dashboard/fields").then((r) => r.json()).then((j) => setMarts(j.marts ?? [])).catch(() => setMarts([]));
+    void apiFetch("/api/dashboard/fields").then((r) => r.json()).then((j) => setMarts(j.marts ?? [])).catch(() => setMarts([]));
     if (initial) {
       setTitle(initial.title ?? "");
       setKind((initial.kind as ChartKind) ?? "hbar");
@@ -207,7 +208,7 @@ export function ChartBuilder({
     if (isEdit) payload.id = editId;
     setBusy(true);
     try {
-      const res = await fetch("/api/dashboard/specs", {
+      const res = await apiFetch("/api/dashboard/specs", {
         method: isEdit ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),

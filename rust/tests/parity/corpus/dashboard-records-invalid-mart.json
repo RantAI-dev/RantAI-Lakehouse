@@ -1,0 +1,13 @@
+{
+  "request": {
+    "name": "dashboard-records-invalid-mart",
+    "method": "GET",
+    "path": "/api/dashboard/records?mart=not!valid&column=x",
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "mart/column tidak valid"
+  }
+}

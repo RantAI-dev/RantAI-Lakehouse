@@ -1,0 +1,73 @@
+# gitleaks config for RantAI Lakehouse.
+#
+# This is the *working-tree* scan (CI's `security.yml` runs it with
+# `--no-git`, i.e. against files on disk, not git history/blobs). It exists
+# to catch a new secret before it's committed. See `security.yml` and
+# docs/CI.md for the separate, allowed-to-fail `history-scan` job that
+# covers git history, where a real leaked key predates this workflow and
+# resolving it requires a history rewrite (not yet done).
+title = "RantAI Lakehouse gitleaks config"
+
+[extend]
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# Custom rules
+#
+# gitleaks' default ruleset does NOT match every key format this project has
+# actually leaked. The `history-scan` job initially reported GREEN across all
+# of git history even though a real internal LLM API key sits in two commits
+# reachable from both `main` and `feat/rust-backend` — because that key uses an
+# `sk-node-` prefix, which no default rule covers.
+#
+# A green scan that misses a known-present secret is worse than no scan: it
+# tells a reviewer history is clean when it is not. These rules exist so the
+# scan reports the truth.
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "rantai-llm-node-api-key"
+description = "Internal LLM node API key (sk-node-… prefix; not covered by gitleaks defaults)"
+regex = '''sk-node-[A-Za-z0-9]{24,}'''
+tags = ["key", "llm", "internal"]
+
+[[rules]]
+id = "rantai-internal-lan-host"
+description = "Internal infrastructure host baked into source (should be env-only)"
+regex = '''192\.168\.18\.(187|197)'''
+tags = ["internal", "infrastructure"]
+
+[[allowlists]]
+description = "Build artifacts and vendored dependencies, not source"
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)rust/target/''',
+  '''(^|/)target/''',
+  '''(^|/)\.next/''',
+  '''(^|/)dist/''',
+  '''(^|/)build/''',
+  '''(^|/)\.git/''',
+  '''(^|/)coverage/''',
+  '''(^|/)bun\.lock$''',
+]
+
+# Two synthetic JWTs used as `#[cfg(test)]` fixtures to exercise
+# bearer-token-shape classification/redaction logic — not real credentials
+# (no signing key exists for them; verified by reading both call sites).
+[[allowlists]]
+description = "test fixture JWT: rust/crates/lakehouse-api/src/auth.rs:226 (bearer_credential_kind classification test)"
+regexes = ['''eyJhbGciOiJSUzI1NiJ9\.eyJzdWIiOiJ1c2VyIn0\.c2lnbmF0dXJl''']
+
+[[allowlists]]
+description = "test fixture JWT: rust/crates/lakehouse-store/src/connectors.rs:624 (looks_like_raw_secret redaction test)"
+regexes = ['''eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxMjM0NTY3ODkwIn0\.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U''']
+
+# The rule file necessarily contains the very patterns it matches, and
+# docs/CI.md references the key prefix when explaining why history-scan is
+# red. Neither is a leak; without this the scanner flags its own config.
+[[allowlists]]
+description = "gitleaks config and CI docs legitimately reference the patterns"
+paths = [
+  '''^\.gitleaks\.toml$''',
+  '''^docs/CI\.md$''',
+]

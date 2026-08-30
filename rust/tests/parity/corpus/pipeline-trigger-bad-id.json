@@ -1,0 +1,14 @@
+{
+  "request": {
+    "name": "pipeline-trigger-bad-id",
+    "method": "POST",
+    "path": "/api/pipelines/definitely-not-a-real-job/trigger",
+    "comment": "MUTATING handler (launches a real Dagster run on success). We deliberately use a job name that does not exist so Dagster rejects the launch (expected 422) instead of actually starting a pipeline. Do NOT capture the success path here — that would kick off a real Bronze->Silver->Gold build.",
+    "expectStatus": 422
+  },
+  "status": 422,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "PipelineNotFoundError"
+  }
+}

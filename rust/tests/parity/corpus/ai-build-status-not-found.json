@@ -1,0 +1,15 @@
+{
+  "request": {
+    "name": "ai-build-status-not-found",
+    "method": "GET",
+    "path": "/api/ai/build-status?runId=00000000-0000-0000-0000-000000000000",
+    "expectStatus": 404
+  },
+  "status": 404,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "run tidak ditemukan",
+    "status": "unknown",
+    "steps": []
+  }
+}

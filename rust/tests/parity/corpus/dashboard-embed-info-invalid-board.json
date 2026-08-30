@@ -1,0 +1,13 @@
+{
+  "request": {
+    "name": "dashboard-embed-info-invalid-board",
+    "method": "GET",
+    "path": "/api/dashboard/embed-info?board=default",
+    "expectStatus": 400
+  },
+  "status": 400,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "error": "dashboard tidak valid"
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "request": {
+    "name": "gov-residency",
+    "method": "GET",
+    "path": "/api/governance/residency"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "residency": [
+      {
+        "id": "res-dispar-dki",
+        "tenant": "dispar-dki",
+        "classification": "internal",
+        "approvedSites": [
+          "Depok (187)"
+        ],
+        "crossSiteAllowed": false,
+        "allowedOutput": "on-premise DKI",
+        "violations7d": 0
+      },
+      {
+        "id": "88888888-8888-4888-8888-000000000001",
+        "tenant": "meridian-group",
+        "classification": "restricted",
+        "approvedSites": [
+          "Jakarta on-prem"
+        ],
+        "crossSiteAllowed": false,
+        "allowedOutput": "Aggregates only after declassification",
+        "violations7d": 1
+      },
+      {
+        "id": "88888888-8888-4888-8888-000000000002",
+        "tenant": "meridian-group",
+        "classification": "confidential",
+        "approvedSites": [
+          "Jakarta on-prem",
+          "Singapore (SG)"
+        ],
+        "crossSiteAllowed": true,
+        "allowedOutput": "Masked rows may cross sites",
+        "violations7d": 0
+      }
+    ]
+  }
+}

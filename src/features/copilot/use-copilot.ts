@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import type { ToolStep } from "./tool-step";
 import { ALL_CAP_KEYS, toolsFromCaps } from "./capabilities";
 import { derivePageContext, type PageContext } from "./page-context";
+import { apiFetch } from "@/services/http";
 
 export type Mode = "ask" | "build";
 export type Msg = {
@@ -47,7 +48,7 @@ function useCopilotState() {
 
   const refreshSessions = React.useCallback(async () => {
     try {
-      const res = await fetch("/api/ai/sessions", { cache: "no-store" });
+      const res = await apiFetch("/api/ai/sessions", { cache: "no-store" });
       const json = await res.json();
       if (Array.isArray(json.sessions)) setSessions(json.sessions);
     } catch { /* abaikan */ }
@@ -57,7 +58,7 @@ function useCopilotState() {
 
   const persist = React.useCallback(async (msgs: Msg[], m: Mode, id: string | null) => {
     try {
-      const res = await fetch("/api/ai/sessions", {
+      const res = await apiFetch("/api/ai/sessions", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: id ?? undefined, mode: m, messages: msgs }),
       });
@@ -75,7 +76,7 @@ function useCopilotState() {
     setMessages(next);
     setBusy(true);
     try {
-      const res = await fetch("/api/ai/chat", {
+      const res = await apiFetch("/api/ai/chat", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           mode,
@@ -109,7 +110,7 @@ function useCopilotState() {
   const loadSession = React.useCallback(async (id: string) => {
     setError(null);
     try {
-      const res = await fetch(`/api/ai/sessions?id=${encodeURIComponent(id)}`, { cache: "no-store" });
+      const res = await apiFetch(`/api/ai/sessions?id=${encodeURIComponent(id)}`, { cache: "no-store" });
       const json = await res.json();
       if (!res.ok) throw new Error(json?.error ?? "Failed to load session");
       setMessages((json.session.messages ?? []) as Msg[]);
@@ -121,7 +122,7 @@ function useCopilotState() {
   }, []);
 
   const removeSession = React.useCallback(async (id: string) => {
-    await fetch(`/api/ai/sessions?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+    await apiFetch(`/api/ai/sessions?id=${encodeURIComponent(id)}`, { method: "DELETE" });
     if (id === sessionId) newChat();
     void refreshSessions();
   }, [sessionId, newChat, refreshSessions]);

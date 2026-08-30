@@ -1,0 +1,30 @@
+{
+  "request": {
+    "name": "ops-usage",
+    "method": "GET",
+    "path": "/api/ops/usage"
+  },
+  "status": 200,
+  "contentType": "application/json;charset=utf-8",
+  "body": {
+    "computeUnits7d": 96428,
+    "scannedBytes7d": 459098539,
+    "storageByTier": {
+      "hot": 11701,
+      "warm": 55779460,
+      "cold": 0,
+      "ai": 0
+    },
+    "pipelineRuns7d": 14,
+    "agentBudgetUsedRate": 0,
+    "tenants": [
+      {
+        "id": "dispar-dki",
+        "name": "Dinas Pariwisata & Ekraf DKI Jakarta",
+        "computeUnits": 96428,
+        "budgetLimit": 100000,
+        "budgetSpent": 96428
+      }
+    ]
+  }
+}

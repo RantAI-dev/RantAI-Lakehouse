@@ -3,6 +3,7 @@ import { geist, geistMono } from "@rantai/design-system/fonts/fonts";
 import { ThemeProvider } from "@rantai/design-system/components/theme-provider";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AppFrame } from "@/components/app-shell/app-frame";
+import { AuthProvider } from "@/features/auth/auth-provider";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -49,7 +50,9 @@ export default function RootLayout({
       <body>
         <ThemeProvider>
           <TooltipProvider>
-            <AppFrame>{children}</AppFrame>
+            <AuthProvider>
+              <AppFrame>{children}</AppFrame>
+            </AuthProvider>
           </TooltipProvider>
         </ThemeProvider>
       </body>

@@ -1,0 +1,57 @@
+name: Feature request
+description: Suggest an idea or enhancement for RantAI Lakehouse.
+title: "feat: <short description>"
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Please search existing issues first to
+        avoid duplicates.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: What's the motivation? What's currently painful or missing?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      multiple: true
+      options:
+        - Frontend (Next.js / src/)
+        - Rust backend (rust/lakehouse-api)
+        - Rust backend (other crate)
+        - Auth / OIDC
+        - Dashboards / BI
+        - Pipelines / Dagster
+        - Alerts / notifications
+        - Docs
+        - CI / build
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and this isn't a duplicate.
+          required: true
+        - label: I'm willing to help implement this (optional).
+          required: false
