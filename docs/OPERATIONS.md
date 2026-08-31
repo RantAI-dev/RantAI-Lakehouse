@@ -31,13 +31,18 @@ pins `rust:1.96.1-slim` to match `rust-toolchain.toml`, copies
 docker compose up --build
 ```
 
-brings up three services:
+brings up:
 
 | Service | Image | Purpose |
 | --- | --- | --- |
 | `postgres` | `postgres:16` | OLTP store (identity, governance, pipelines, connectors, alerts, ...) |
-| `clickhouse` | `clickhouse/clickhouse-server:24.8` | Analytics store (catalog, overview, governance, dashboards, ...) |
+| `clickhouse` | `clickhouse/clickhouse-server:26.3` | Analytics store (catalog, overview, governance, dashboards, ...); also the Iceberg query engine once `DataLakeCatalog` is wired up in P1b |
 | `lakehouse-api` | built from `rust/Dockerfile` | the axum API, port 8080 |
+| `rustfs` | `rustfs/rustfs:1.0.0-rc.4` | S3-compatible object store for the lakehouse warehouse (P1 infrastructure; not yet wired into `lakehouse-api`) |
+| `rustfs-bucket-init` | `amazon/aws-cli:2.36.34` | One-shot: creates the warehouse bucket via the plain S3 API (`s3api create-bucket`) — never RustFS's admin API |
+| `lakekeeper-db-init` | `postgres:16` | One-shot: creates Lakekeeper's own database on the existing `postgres` service |
+| `lakekeeper-migrate` | `quay.io/lakekeeper/catalog:v0.13.3` | One-shot: Lakekeeper's own `migrate` subcommand against its database |
+| `lakekeeper` | `quay.io/lakekeeper/catalog:v0.13.3` | Iceberg REST catalog (Rust, Apache-2.0); the only path for Iceberg writes — no path-based `IcebergS3` tables |
 
 Both data stores have healthchecks; `lakehouse-api` waits for both to
 report healthy (`depends_on: condition: service_healthy`) before starting,
@@ -46,9 +51,82 @@ Postgres) get a real chance to run instead of racing container startup.
 This is a start-order convenience, not a hard runtime dependency — see
 "Postgres-down is quiet," below.
 
+`rustfs`, `lakekeeper`, and their bootstrap jobs are **not yet wired into
+`lakehouse-api`** — that lands in P1b with the `lakehouse-iceberg` crate.
+In this phase they exist purely as verified infrastructure: the warehouse
+bucket exists in RustFS (verified via the S3 API), and Lakekeeper answers
+its Iceberg REST config endpoint with its schema applied in its own
+Postgres database. Neither failing affects `lakehouse-api`'s own boot or
+its existing Postgres/ClickHouse-backed routes in this phase.
+
+### ClickHouse 24.8 → 26.3: what changed and what was verified
+
+Bumped because Iceberg writes via ClickHouse's `DataLakeCatalog` need
+`clickhouse-server >= 26.2` (for `allow_database_iceberg`); 26.3 is the
+current LTS tag. Verified clean:
+
+- All 7 `demo/clickhouse/*.sql` files (`01_databases.sql` through
+  `07_meta.sql`) apply without error against a fresh 26.3 container —
+  `clickhouse-client --multiquery < demo/clickhouse/NN_*.sql` for each,
+  exit code 0, no DDL/DML syntax breakage across the version jump.
+- The documented password-less local-dev login
+  (`CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1` + empty `CLICKHOUSE_PASSWORD`)
+  still works over the HTTP interface in 26.3 — `curl --user "default:"`
+  against a **freshly created** container returns `200`. (During
+  verification, a botched `docker restart` left a stale server process
+  holding the listening ports while a second process failed to bind
+  alongside it — that stale process gave misleading `REQUIRED_PASSWORD`
+  errors that had nothing to do with the version bump. Recreating the
+  container cleanly resolved it. If you ever see `REQUIRED_PASSWORD` with
+  an empty `CH_PASSWORD` locally, recreate the container — `docker compose
+  up -d --force-recreate clickhouse` — rather than `docker restart`.)
+- `SET allow_database_iceberg = 1` is accepted (`allow_database_iceberg`
+  is present in `system.settings` in 26.3).
+- `cargo test --all-features` (see below) passes unchanged — no test in
+  the workspace runs a live ClickHouse via testcontainers;
+  `lakehouse-api`'s route tests point `CH_URL` at a dead upstream on
+  purpose (`rust/crates/lakehouse-api/tests/common/mod.rs`), so response-
+  shape assertions are exercised against fixtures/mocks, not a real
+  server, and were unaffected by the bump.
+
 Copy `.env.example` to `.env` first (`docker compose` auto-loads `.env`
 from the project root) and set at minimum `AUTH_BOOTSTRAP_EMAIL` /
 `AUTH_BOOTSTRAP_PASSWORD`. Every other variable has a safe local default.
+
+### RustFS: failure mode
+
+RustFS is the default self-hosted S3-compatible object store (MinIO is
+explicitly not a supported target). If it's down: the `rustfs-bucket-init`
+one-shot job fails and the warehouse bucket is never created (surfaces as
+a non-zero exit / crash-loop on that container, visible in `docker compose
+ps`); once P1b wires up `lakehouse-iceberg`, Iceberg reads/writes fail
+closed with connection errors from the `object_store` client. It does not
+affect `lakehouse-api`'s own boot — nothing in this phase makes RustFS a
+hard startup dependency for the API.
+
+### Lakekeeper: failure mode
+
+If Lakekeeper is down: its own REST endpoints (`/catalog/v1/*`,
+`/management/v1/*`) are unreachable, so once P1b wires up
+`lakehouse-iceberg`, every Iceberg catalog operation (create table, commit
+snapshot, list tables) and any ClickHouse `DataLakeCatalog` database
+pointed at it fail closed. It does not affect `lakehouse-api`'s own boot
+or its existing Postgres/ClickHouse-backed routes, which have no
+dependency on Lakekeeper in this phase.
+
+**DNS gotcha found during verification:** on a host whose own
+`/etc/resolv.conf` carries a DNS search domain (VPN/corporate DNS,
+Tailscale MagicDNS, etc.), that suffix leaks into every container's
+`resolv.conf`, including `lakekeeper`'s. Lakekeeper's Rust DNS resolver
+does not fall back to the bare name the way glibc-based images (e.g. the
+`postgres:16` image used by `lakekeeper-db-init`/`lakekeeper-migrate`) do,
+so `postgres` gets expanded to `postgres.<search-suffix>`, NXDOMAINs, and
+the `lakekeeper` container exits immediately with `error communicating
+with database: failed to lookup address information: Temporary failure in
+name resolution` — then restart-loops. `docker-compose.yml` sets
+`dns_search: ["."]` on the `lakekeeper` service specifically to prevent
+search-domain expansion; this was reproduced and confirmed as the fix
+during P1a verification.
 
 ### What's deliberately NOT in the stack
 
