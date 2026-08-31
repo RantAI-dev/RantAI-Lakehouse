@@ -40,7 +40,7 @@ jobs:
         working-directory: rust
 
       - name: Upload lcov as artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lcov-report
           path: rust/lcov.info
@@ -74,7 +74,7 @@ jobs:
         working-directory: rust
 
       - name: Upload SBOM as artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom-cyclonedx
           path: rust/crates/*/*.cdx.json
