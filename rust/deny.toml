@@ -56,6 +56,14 @@ allow = [
     "0BSD",
     "CDLA-Permissive-2.0",
     "Zlib",
+    # Public-domain dedication, compatible with distributing the combined
+    # work under AGPL-3.0. Reached only transitively and unavoidably:
+    # `tiny-keccak` comes in via `arrow-array -> ahash -> const-random ->
+    # const-random-macro`, and `arrow` is required by `iceberg`. Allowed
+    # globally rather than as a per-crate exception because CC0 is
+    # public-domain-equivalent for every crate that could carry it, so a
+    # narrower rule would only mean repeating this decision later.
+    "CC0-1.0",
 ]
 confidence-threshold = 0.8
 
