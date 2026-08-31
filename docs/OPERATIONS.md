@@ -43,6 +43,7 @@ brings up:
 | `lakekeeper-db-init` | `postgres:16` | One-shot: creates Lakekeeper's own database on the existing `postgres` service |
 | `lakekeeper-migrate` | `quay.io/lakekeeper/catalog:v0.13.3` | One-shot: Lakekeeper's own `migrate` subcommand against its database |
 | `lakekeeper` | `quay.io/lakekeeper/catalog:v0.13.3` | Iceberg REST catalog (Rust, Apache-2.0); the only path for Iceberg writes — no path-based `IcebergS3` tables |
+| `lakekeeper-warehouse-init` | `alpine:3.20` | One-shot (P1b): bootstraps the Lakekeeper server (`/management/v1/bootstrap`) and creates the `LAKEKEEPER_WAREHOUSE` warehouse against the RustFS bucket, with `sts-enabled: true` — required for Lakekeeper to vend real S3 credentials on `X-Iceberg-Access-Delegation: vended-credentials`; see `docker-compose.yml`'s comment on this service and `lakehouse-iceberg::catalog`'s module doc |
 
 Both data stores have healthchecks; `lakehouse-api` waits for both to
 report healthy (`depends_on: condition: service_healthy`) before starting,

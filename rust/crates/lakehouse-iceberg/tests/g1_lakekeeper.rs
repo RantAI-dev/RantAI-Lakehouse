@@ -35,6 +35,40 @@
 //! from INSIDE the compose network, because that is where the `clickhouse`
 //! container itself resolves `lakekeeper`/`rustfs` — see [`G1Env`].
 //!
+//! The `lakekeeper-warehouse-init` compose service (see
+//! `docker-compose.yml`) bootstraps the Lakekeeper server and creates the
+//! `LAKEKEEPER_WAREHOUSE` warehouse automatically on `docker compose up`;
+//! nothing needs to be curled by hand.
+//!
+//! **Running `cargo test` on the host, not in a container on the compose
+//! network:** Lakekeeper vends this crate the S3 endpoint it knows the
+//! object store by — `http://rustfs:9000`, the compose service DNS name —
+//! regardless of who's asking. A test process running directly on the
+//! host (as opposed to inside a container on `p1bcheck_default`) cannot
+//! resolve `rustfs` unless something makes it resolvable, e.g. an
+//! `/etc/hosts` entry pointing at the `rustfs` container's bridge-network
+//! IP (`docker inspect <project>-rustfs-1 --format
+//! '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'`) — that
+//! bridge IP is reachable directly from the host without going through
+//! the container's host-port mapping, since the mapped port differs. CI
+//! should instead run this test itself inside a container attached to the
+//! compose network, avoiding the workaround entirely.
+//!
+//! # Half (b) status: currently blocked on a ClickHouse crash, not Lakekeeper
+//!
+//! As of ClickHouse 26.3.26.3, half (b) does not pass — but not because of
+//! Lakekeeper. See the P1b report for the full finding: `CREATE TABLE`
+//! without an explicit `ENGINE` inside a `DataLakeCatalog` database never
+//! reaches Lakekeeper at all (it silently falls back to a default
+//! `MergeTree` table and fails), and `INSERT INTO` an *existing*
+//! catalog-registered table (one this crate created) segfaults the
+//! server inside `DB::IcebergStorageSink::consume` /
+//! `DB::ChunkPartitioner::partitionChunk`. Per the task brief's stop
+//! condition, this is reported rather than worked around with a
+//! path-based `IcebergS3` fallback — the two `#[ignore]`d tests below are
+//! written to the spec regardless, so they start passing the moment
+//! ClickHouse's write path is fixed.
+//!
 //! # Why this actually proves vended credentials, not just connectivity
 //!
 //! Half (a)'s `object_store` client is never handed `RUSTFS_ACCESS_KEY`/

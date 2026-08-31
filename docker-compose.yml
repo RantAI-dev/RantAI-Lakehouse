@@ -248,6 +248,78 @@ services:
       start_period: 15s
     restart: unless-stopped
 
+  # P1b — one-shot: bootstrap the Lakekeeper SERVER (accept-terms-of-use,
+  # idempotent — a second call against an already-bootstrapped server is
+  # tolerated, not retried into an error) and register the
+  # `lakehouse-iceberg` warehouse against the RustFS bucket
+  # `rustfs-bucket-init` created above.
+  #
+  # `sts-enabled: true` is deliberate, not a placeholder: P1b's G1
+  # verification found that Lakekeeper only returns short-lived
+  # `s3.access-key-id`/`s3.secret-access-key`/`s3.session-token` values on
+  # `X-Iceberg-Access-Delegation: vended-credentials` when the warehouse's
+  # storage profile has STS enabled. With `sts-enabled: false` (the
+  # profile's own default), Lakekeeper instead responds with a
+  # `remote-signing` configuration (`s3.signer.uri`/`s3.signer.endpoint`,
+  # no key material at all) — a different delegation mechanism this
+  # crate deliberately does not implement (see
+  # `lakehouse-iceberg::catalog`'s module doc and ADR 0002). RustFS accepts
+  # `sts-role-arn` as an opaque string and does not validate it against a
+  # real IAM identity, so the placeholder ARN below is sufficient for a
+  # local/CI RustFS-backed warehouse; a real AWS S3 deployment would need a
+  # real assumable role instead.
+  lakekeeper-warehouse-init:
+    image: alpine:3.20
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      rustfs-bucket-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEKEEPER_BASE_URI: ${LAKEKEEPER_BASE_URI:-http://localhost:8181}
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        apk add --no-cache curl jq >/dev/null
+        base="http://lakekeeper:8181"
+        already=$$(curl -fsS "$$base/management/v1/info" | jq -r '.bootstrapped')
+        if [ "$$already" != "true" ]; then
+          curl -fsS -X POST "$$base/management/v1/bootstrap" \
+            -H 'Content-Type: application/json' \
+            -d '{"accept-terms-of-use": true}'
+        fi
+        exists=$$(curl -fsS "$$base/management/v1/warehouse" | \
+          jq -r --arg name "$$LAKEKEEPER_WAREHOUSE" \
+          '.warehouses[]? | select(.name == $$name) | .name')
+        if [ "$$exists" != "$$LAKEKEEPER_WAREHOUSE" ]; then
+          curl -fsS -X POST "$$base/management/v1/warehouse" \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "warehouse-name": "'"$$LAKEKEEPER_WAREHOUSE"'",
+              "storage-profile": {
+                "type": "s3",
+                "bucket": "'"$$LAKEHOUSE_WAREHOUSE_BUCKET"'",
+                "region": "us-east-1",
+                "endpoint": "http://rustfs:9000",
+                "path-style-access": true,
+                "sts-enabled": true,
+                "sts-role-arn": "arn:aws:iam::000000000000:role/lakekeeper"
+              },
+              "storage-credential": {
+                "type": "s3",
+                "credential-type": "access-key",
+                "aws-access-key-id": "'"$$RUSTFS_ACCESS_KEY"'",
+                "aws-secret-access-key": "'"$$RUSTFS_SECRET_KEY"'"
+              }
+            }'
+        fi
+    restart: "no"
+
 volumes:
   lakehouse_postgres_data:
   lakehouse_clickhouse_data:
