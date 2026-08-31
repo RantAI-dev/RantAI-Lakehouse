@@ -223,6 +223,23 @@ listed here because you need them to run the console at all:
 See `rust/crates/lakehouse-auth/README.md` for detailed, per-provider OIDC
 setup instructions (Okta, Entra, Google, Keycloak).
 
+A further set of variables live only in `docker-compose.yml` — they
+configure the P1 object store (RustFS) and Iceberg REST catalog
+(Lakekeeper) services and are **not yet read by `config.rs`** (that wiring
+is P1b, alongside the `lakehouse-iceberg` crate):
+
+| Variable | Purpose | Default | Required? |
+| --- | --- | --- | --- |
+| `RUSTFS_ACCESS_KEY` | RustFS S3 API access key | `rustfsadmin` (public, well-known) | No, but override before exposing RustFS beyond localhost |
+| `RUSTFS_SECRET_KEY` | RustFS S3 API secret key | `rustfsadmin` (public, well-known) | No, but override before exposing RustFS beyond localhost |
+| `RUSTFS_HOST_PORT` | Host port mapped to RustFS's S3 API (container port 9000) | `9010` | No |
+| `RUSTFS_CONSOLE_HOST_PORT` | Host port mapped to RustFS's web console (container port 9001) | `9011` | No |
+| `LAKEHOUSE_WAREHOUSE_BUCKET` | Bucket the `rustfs-bucket-init` one-shot job creates via the plain S3 API | `lakehouse-warehouse` | No |
+| `LAKEKEEPER_PG_DB` | Name of Lakekeeper's own Postgres database on the existing `postgres` service (separate from the `lakehouse` app database's `console` schema) | `lakekeeper` | No |
+| `LAKEKEEPER_ENCRYPTION_KEY` | Encrypts secrets in Lakekeeper's own schema | Lakekeeper's own placeholder — **change before any non-throwaway use** | No |
+| `LAKEKEEPER_BASE_URI` | Base URL Lakekeeper advertises in its own REST responses | `http://localhost:8181` | No |
+| `LAKEKEEPER_HOST_PORT` | Host port mapped to Lakekeeper's REST API (container port 8181) | `8181` | No |
+
 ## Status / Known limitations
 
 This is a young, honestly-scoped project. Please read this before filing an
