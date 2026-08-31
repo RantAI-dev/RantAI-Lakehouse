@@ -54,9 +54,9 @@
 //! should instead run this test itself inside a container attached to the
 //! compose network, avoiding the workaround entirely.
 //!
-//! # Half (b) status: currently blocked on a ClickHouse crash, not Lakekeeper
+//! # Half (b) status: currently blocked on a `ClickHouse` crash, not Lakekeeper
 //!
-//! As of ClickHouse 26.3.26.3, half (b) does not pass — but not because of
+//! As of `ClickHouse` 26.3.26.3, half (b) does not pass — but not because of
 //! Lakekeeper. See the P1b report for the full finding: `CREATE TABLE`
 //! without an explicit `ENGINE` inside a `DataLakeCatalog` database never
 //! reaches Lakekeeper at all (it silently falls back to a default
@@ -67,7 +67,7 @@
 //! condition, this is reported rather than worked around with a
 //! path-based `IcebergS3` fallback — the two `#[ignore]`d tests below are
 //! written to the spec regardless, so they start passing the moment
-//! ClickHouse's write path is fixed.
+//! `ClickHouse`'s write path is fixed.
 //!
 //! # Why this actually proves vended credentials, not just connectivity
 //!
