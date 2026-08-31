@@ -40,8 +40,14 @@ pub enum ConfigError {
 ///
 /// `Debug` is implemented by hand (not derived) so secret fields
 /// (`ch_password`, `llm_key`, `embed_secret`, `alerts_run_token`,
-/// `smtp_pass`, `database_url`) never appear in a `{:?}`-formatted log
-/// line. `database_url` is redacted in full (not field-by-field like
+/// `smtp_pass`, `database_url`, `lakekeeper_credential_secret_ref`,
+/// `rustfs_access_key_secret_ref`, `rustfs_secret_key_secret_ref`) never
+/// appear in a `{:?}`-formatted log line. The three `*_secret_ref` fields
+/// are references, not values (see `lakehouse_core::secret`'s module doc),
+/// but are redacted anyway as defense in depth against a caller pasting a
+/// raw secret into a reference field by mistake — the same stance
+/// `lakehouse_store::connectors::ConnectorRow` takes for its own
+/// `secret_ref` field. `database_url` is redacted in full (not field-by-field like
 /// `ch_url`/`ch_password`) because Postgres connection strings embed the
 /// username and password inline (`postgres://user:pass@host/db`) — there
 /// is no separate "password field" to redact around. `AppState`
@@ -197,6 +203,51 @@ pub struct Config {
     /// default (like [`Self::smtp_port`], not load-bearing enough to fail
     /// boot over).
     pub oidc_clock_skew_seconds: u64,
+    /// Lakekeeper Iceberg REST catalog base URI (P1,
+    /// `lakehouse-iceberg::IcebergClientConfig::catalog_uri`). Default
+    /// matches `docker-compose.yml`'s `lakekeeper` service port mapping.
+    /// Rust/Phase-1b-only: no TypeScript equivalent, since the original
+    /// backend never spoke to a catalog.
+    pub lakekeeper_catalog_uri: String,
+    /// Lakekeeper warehouse identifier this deployment writes Bronze
+    /// tables into. Already the fully-resolved warehouse name — see ADR
+    /// 0003 for the `TENANT_ID` → warehouse naming convention; this field
+    /// is NOT `TENANT_ID` itself, callers that need the mapping applied
+    /// combine `tenant::TENANT_ID` with the convention ADR 0003 defines.
+    /// Default `"default"`.
+    pub lakekeeper_warehouse: String,
+    /// `secretRef` (see `lakehouse_core::secret`) for Lakekeeper's own
+    /// `OAuth2` client-credential, when Lakekeeper authorization is enabled.
+    /// `None` when unset, meaning Lakekeeper is assumed to be running in
+    /// no-auth (open) mode — see the P1b report for R1's status in this
+    /// deployment. This field carries a REFERENCE (an `env:VAR_NAME`
+    /// string), never a credential value — same guarantee
+    /// `lakehouse_store::connectors`'s `secret_ref` field carries, and
+    /// resolved the same way, through a
+    /// `lakehouse_core::secret::SecretResolver`.
+    pub lakekeeper_credential_secret_ref: Option<String>,
+    /// S3-compatible object store endpoint backing the Lakekeeper
+    /// warehouse (`RustFS` by default; `SeaweedFS` in P2 — see
+    /// `docs/STORAGE-COMPATIBILITY.md`, once P2 lands). Default matches
+    /// `docker-compose.yml`'s `rustfs` service port mapping.
+    pub rustfs_s3_endpoint: String,
+    /// S3 region string sent to the object store client. `RustFS` does not
+    /// enforce AWS region semantics, but the S3 API requires *a* value.
+    /// Default `"us-east-1"`.
+    pub rustfs_s3_region: String,
+    /// Bucket the lakehouse warehouse's Iceberg tables live under. Default
+    /// matches `docker-compose.yml`'s `LAKEHOUSE_WAREHOUSE_BUCKET` default.
+    pub lakehouse_warehouse_bucket: String,
+    /// `secretRef` for the `RustFS`/S3 access key. Only used as a fallback
+    /// when Lakekeeper is not vending per-table credentials (e.g. a direct
+    /// `object_store` health check outside the catalog path) — the G1 test
+    /// itself must NOT use this field on the write path; see
+    /// `lakehouse-iceberg`'s crate doc comment on why vended credentials,
+    /// not static ones, are the point. `None` when unset.
+    pub rustfs_access_key_secret_ref: Option<String>,
+    /// `secretRef` for the `RustFS`/S3 secret key. Same caveat as
+    /// [`Self::rustfs_access_key_secret_ref`].
+    pub rustfs_secret_key_secret_ref: Option<String>,
     /// Postgres connection string for Phase 2 OLTP storage (`lakehouse-store`).
     /// Default `"postgres://lakehouse:lakehouse@localhost:5432/lakehouse"`
     /// (`??` semantics, like every other URL field here). Rust/Phase-2-only:
@@ -242,6 +293,29 @@ impl std::fmt::Debug for Config {
             .field("smtp_user", &self.smtp_user)
             .field("smtp_pass", &REDACTED)
             .field("smtp_from", &self.smtp_from)
+            .field("lakekeeper_catalog_uri", &self.lakekeeper_catalog_uri)
+            .field("lakekeeper_warehouse", &self.lakekeeper_warehouse)
+            .field(
+                "lakekeeper_credential_secret_ref",
+                &self
+                    .lakekeeper_credential_secret_ref
+                    .as_ref()
+                    .map(|_| REDACTED),
+            )
+            .field("rustfs_s3_endpoint", &self.rustfs_s3_endpoint)
+            .field("rustfs_s3_region", &self.rustfs_s3_region)
+            .field(
+                "lakehouse_warehouse_bucket",
+                &self.lakehouse_warehouse_bucket,
+            )
+            .field(
+                "rustfs_access_key_secret_ref",
+                &self.rustfs_access_key_secret_ref.as_ref().map(|_| REDACTED),
+            )
+            .field(
+                "rustfs_secret_key_secret_ref",
+                &self.rustfs_secret_key_secret_ref.as_ref().map(|_| REDACTED),
+            )
             .field("port", &self.port)
             .field("is_dev", &self.is_dev)
             .field("auth_bootstrap_email", &self.auth_bootstrap_email)
@@ -381,6 +455,22 @@ impl Config {
                 .get("OIDC_CLOCK_SKEW_SECONDS")
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(60),
+            lakekeeper_catalog_uri: or_default(
+                env,
+                "LAKEKEEPER_CATALOG_URI",
+                "http://localhost:8181/catalog",
+            ),
+            lakekeeper_warehouse: or_default(env, "LAKEKEEPER_WAREHOUSE", "default"),
+            lakekeeper_credential_secret_ref: truthy(env, "LAKEKEEPER_CREDENTIAL_SECRET_REF"),
+            rustfs_s3_endpoint: or_default(env, "RUSTFS_S3_ENDPOINT", "http://localhost:9010"),
+            rustfs_s3_region: or_default(env, "RUSTFS_S3_REGION", "us-east-1"),
+            lakehouse_warehouse_bucket: or_default(
+                env,
+                "LAKEHOUSE_WAREHOUSE_BUCKET",
+                "lakehouse-warehouse",
+            ),
+            rustfs_access_key_secret_ref: truthy(env, "RUSTFS_ACCESS_KEY_SECRET_REF"),
+            rustfs_secret_key_secret_ref: truthy(env, "RUSTFS_SECRET_KEY_SECRET_REF"),
             database_url: or_default(
                 env,
                 "DATABASE_URL",
@@ -470,6 +560,14 @@ mod tests {
             cfg.database_url,
             "postgres://lakehouse:lakehouse@localhost:5432/lakehouse"
         );
+        assert_eq!(cfg.lakekeeper_catalog_uri, "http://localhost:8181/catalog");
+        assert_eq!(cfg.lakekeeper_warehouse, "default");
+        assert_eq!(cfg.lakekeeper_credential_secret_ref, None);
+        assert_eq!(cfg.rustfs_s3_endpoint, "http://localhost:9010");
+        assert_eq!(cfg.rustfs_s3_region, "us-east-1");
+        assert_eq!(cfg.lakehouse_warehouse_bucket, "lakehouse-warehouse");
+        assert_eq!(cfg.rustfs_access_key_secret_ref, None);
+        assert_eq!(cfg.rustfs_secret_key_secret_ref, None);
         // OIDC unconfigured by default — graceful degradation, see the
         // `oidc_issuer`/`oidc_client_id` field doc comments.
         assert_eq!(cfg.oidc_issuer, None);
@@ -535,6 +633,56 @@ mod tests {
         let cfg = Config::from_map(&env).unwrap();
         let rendered = format!("{cfg:?}");
         assert!(!rendered.contains("s3cret-oidc-client-secret"));
+    }
+
+    /// H1 for the new `secretRef`-shaped fields: `{:?}` must never leak the
+    /// reference string, even though it is not a value — see the type-level
+    /// doc comment for why these are redacted anyway.
+    #[test]
+    fn debug_redacts_secret_ref_fields() {
+        let env = map(&[
+            (
+                "LAKEKEEPER_CREDENTIAL_SECRET_REF",
+                "env:LAKEKEEPER_CREDENTIAL",
+            ),
+            ("RUSTFS_ACCESS_KEY_SECRET_REF", "env:RUSTFS_ACCESS_KEY"),
+            ("RUSTFS_SECRET_KEY_SECRET_REF", "env:RUSTFS_SECRET_KEY"),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        let rendered = format!("{cfg:?}");
+        for secret_ref in [
+            "env:LAKEKEEPER_CREDENTIAL",
+            "env:RUSTFS_ACCESS_KEY",
+            "env:RUSTFS_SECRET_KEY",
+        ] {
+            assert!(
+                !rendered.contains(secret_ref),
+                "Debug output leaked secretRef {secret_ref:?}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn lakekeeper_and_rustfs_fields_are_overridable() {
+        let env = map(&[
+            (
+                "LAKEKEEPER_CATALOG_URI",
+                "http://lakekeeper.internal:8181/catalog",
+            ),
+            ("LAKEKEEPER_WAREHOUSE", "tenant-acme"),
+            ("RUSTFS_S3_ENDPOINT", "http://rustfs.internal:9000"),
+            ("RUSTFS_S3_REGION", "eu-west-1"),
+            ("LAKEHOUSE_WAREHOUSE_BUCKET", "acme-warehouse"),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(
+            cfg.lakekeeper_catalog_uri,
+            "http://lakekeeper.internal:8181/catalog"
+        );
+        assert_eq!(cfg.lakekeeper_warehouse, "tenant-acme");
+        assert_eq!(cfg.rustfs_s3_endpoint, "http://rustfs.internal:9000");
+        assert_eq!(cfg.rustfs_s3_region, "eu-west-1");
+        assert_eq!(cfg.lakehouse_warehouse_bucket, "acme-warehouse");
     }
 
     #[test]
