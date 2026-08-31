@@ -291,6 +291,21 @@ impl BronzeTable {
         self.table.metadata().format_version()
     }
 
+    /// The table's current Iceberg schema.
+    ///
+    /// Callers building a `RecordBatch` for [`Self::append`] MUST derive
+    /// their Arrow schema from this (via
+    /// `iceberg::arrow::schema_to_arrow_schema`), not hand-write one:
+    /// `iceberg-rust`'s Parquet writer maps columns to the Iceberg schema
+    /// using the `PARQUET:field_id` metadata that conversion attaches to
+    /// each Arrow field, and a hand-written schema without that metadata
+    /// fails the write with `DataInvalid => Field id N not found in struct
+    /// array`.
+    #[must_use]
+    pub fn schema(&self) -> &iceberg::spec::Schema {
+        self.table.metadata().current_schema()
+    }
+
     /// Appends `batch` as one new Parquet data file, in one fast-append
     /// snapshot, committed through `catalog`.
     ///
@@ -329,8 +344,17 @@ impl BronzeTable {
             file_name_generator,
         );
         let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
+        // Every Bronze table is partitioned by `day(_ingested_at)` (see
+        // `bronze::ingestion_day_partition_spec`), so the writer needs the
+        // partition value for THIS file up front — `iceberg-rust` does not
+        // derive it from the data automatically. `bronze::partition_key_for`
+        // computes it from `batch`'s `_ingested_at` column; see that
+        // function's doc comment for the one-partition-per-batch assumption
+        // this makes.
+        let partition_key = bronze::partition_key_for(metadata, &batch)
+            .map_err(|e| IcebergError::Bronze(e.to_string()))?;
         let mut writer: data_file_writer::DataFileWriter<_, _, _> = data_file_writer_builder
-            .build(None)
+            .build(Some(partition_key))
             .await
             .map_err(|e| IcebergError::Write(e.to_string()))?;
 

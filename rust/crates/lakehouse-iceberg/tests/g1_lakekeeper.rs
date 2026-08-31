@@ -51,8 +51,7 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
-use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
-use iceberg::spec::{NestedField, PrimitiveType, Type};
+use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
 use lakehouse_iceberg::catalog::{IcebergClient, IcebergClientConfig};
 
 fn env_or(key: &str, default: &str) -> String {
@@ -142,16 +141,22 @@ fn domain_fields() -> Vec<NestedField> {
     ]
 }
 
-fn test_batch(ingested_at_micros: i64, rows: &[(i64, &str)]) -> RecordBatch {
-    let schema = Arc::new(ArrowSchema::new(vec![
-        Field::new(
-            lakehouse_iceberg::bronze::INGESTED_AT_COLUMN,
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            false,
-        ),
-        Field::new("id", DataType::Int64, false),
-        Field::new("label", DataType::Utf8, false),
-    ]));
+/// Builds a `RecordBatch` whose Arrow schema is derived from the Iceberg
+/// schema via `iceberg::arrow::schema_to_arrow_schema` (rather than a
+/// hand-written `arrow_schema::Schema`), because `iceberg-rust`'s Parquet
+/// writer maps columns to the Iceberg schema by the `PARQUET:field_id`
+/// metadata that conversion attaches to each Arrow field — a hand-written
+/// schema without that metadata fails the write with
+/// `DataInvalid => Field id N not found in struct array`.
+fn test_batch(
+    iceberg_schema: &IcebergSchema,
+    ingested_at_micros: i64,
+    rows: &[(i64, &str)],
+) -> RecordBatch {
+    let schema = Arc::new(
+        iceberg::arrow::schema_to_arrow_schema(iceberg_schema)
+            .expect("iceberg schema converts to an arrow schema"),
+    );
     let ingested_at: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
         ingested_at_micros;
         rows.len()
@@ -196,7 +201,11 @@ async fn g1_half_a_rust_writes_clickhouse_reads() {
         "G1 verification: table must be format-version 2"
     );
 
-    let batch = test_batch(1_735_000_000_000_000, &[(1, "alpha"), (2, "beta")]);
+    let batch = test_batch(
+        table.schema(),
+        1_735_000_000_000_000,
+        &[(1, "alpha"), (2, "beta")],
+    );
     let expected_rows = batch.num_rows();
     table
         .append(client.as_catalog(), batch)

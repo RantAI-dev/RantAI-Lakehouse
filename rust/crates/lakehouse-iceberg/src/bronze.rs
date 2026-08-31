@@ -3,8 +3,19 @@
 //! (`docs/adr/0004-bronze-naming-partitioning-retention.md`). Read that ADR
 //! for the rationale; this module only carries the implementation.
 
-use iceberg::spec::{NestedField, PrimitiveType, Schema, Transform, Type, UnboundPartitionSpec};
+use arrow_array::{Array, RecordBatch, TimestampMicrosecondArray};
+use iceberg::spec::{
+    Literal, NestedField, PartitionKey, PrimitiveType, Schema, Struct, TableMetadata, Transform,
+    Type, UnboundPartitionSpec,
+};
 use iceberg::{Error, ErrorKind, NamespaceIdent, Result};
+
+/// Number of microseconds in one day, used to derive the `day(_ingested_at)`
+/// partition value (days since the Unix epoch) straight from the
+/// microseconds-since-epoch values already in [`INGESTED_AT_COLUMN`],
+/// matching the Iceberg spec's definition of the `day` transform on a
+/// `timestamp` source column.
+const MICROS_PER_DAY: i64 = 86_400_000_000;
 
 /// Every Bronze table lives in this single-level namespace.
 ///
@@ -138,6 +149,68 @@ pub fn ingestion_day_partition_spec(schema: &Schema) -> Result<UnboundPartitionS
                 ),
             )
         })
+}
+
+/// Computes the [`PartitionKey`] for one data file written from `batch`.
+///
+/// **One partition value per batch, not per row**: this reads
+/// [`INGESTED_AT_COLUMN`]'s first non-null value and uses it for the whole
+/// file. `iceberg-rust` 0.10.x's `DataFileWriter` (unlike its Spark/Java
+/// counterparts) takes one partition value per file up front, not a
+/// per-row partitioner that fans out into multiple files — so a caller
+/// whose batch spans more than one ingestion day gets every row filed
+/// under the *first* row's day, which is wrong metadata (not a crash).
+/// Acceptable for Bronze append batches, which are one ingestion run's
+/// output and so share a single `_ingested_at` value by construction (see
+/// `catalog::IcebergClient::create_bronze_table`'s callers); revisit if a
+/// caller ever needs a genuinely multi-day batch in one `append` call.
+///
+/// # Errors
+///
+/// Returns [`IcebergError`]-mappable errors (via the caller's
+/// `.map_err`) if `batch` has no [`INGESTED_AT_COLUMN`], the column is not
+/// a microsecond timestamp, or every value in it is null.
+pub fn partition_key_for(metadata: &TableMetadata, batch: &RecordBatch) -> Result<PartitionKey> {
+    let ingested_at = batch
+        .column_by_name(INGESTED_AT_COLUMN)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("batch has no {INGESTED_AT_COLUMN} column"),
+            )
+        })?
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("{INGESTED_AT_COLUMN} is not a microsecond timestamp array"),
+            )
+        })?;
+    let micros = (0..ingested_at.len())
+        .find_map(|i| ingested_at.is_valid(i).then(|| ingested_at.value(i)))
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("{INGESTED_AT_COLUMN} has no non-null values to partition by"),
+            )
+        })?;
+    // Iceberg's `day` transform on a `timestamp` source truncates to whole
+    // days since the epoch; `div_euclid` (not plain integer division)
+    // rounds towards negative infinity, matching that definition for
+    // instants before 1970.
+    let days = i32::try_from(micros.div_euclid(MICROS_PER_DAY)).map_err(|e| {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!("ingestion day out of i32 range: {e}"),
+        )
+    })?;
+    let partition_value = Struct::from_iter([Some(Literal::date(days))]);
+    Ok(PartitionKey::new(
+        metadata.default_partition_spec().as_ref().clone(),
+        metadata.current_schema().clone(),
+        partition_value,
+    ))
 }
 
 #[cfg(test)]
