@@ -169,3 +169,39 @@ jobs:
       - name: cargo test --workspace --locked
         run: cargo test --workspace --locked
         working-directory: rust
+
+  # ── Rust: G1 acceptance (docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md §3,
+  # G1-RESULT.md) — half (a) only, run INSIDE the compose network via the
+  # `g1-test-runner` service (docker-compose.yml). Half (b) stays
+  # `#[ignore]`d; it is blocked on an upstream ClickHouse defect, not
+  # something this job should chase. ──
+  g1-rustfs:
+    name: Rust · G1 acceptance (RustFS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write CI-only .env
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          EOF
+
+      # `docker compose run` honors `depends_on` conditions for whatever
+      # it's given, so this single command brings up the whole RustFS →
+      # Lakekeeper → ClickHouse dependency chain itself (no separate
+      # `up -d` needed) before running the test in-network.
+      - name: Run G1 half (a) inside the compose network
+        run: docker compose -p g1ci --profile test run --rm g1-test-runner
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g1ci logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -p g1ci down -v
