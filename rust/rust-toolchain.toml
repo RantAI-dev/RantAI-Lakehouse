@@ -1,10 +1,10 @@
 [toolchain]
 # Pinned to the toolchain this workspace is actually built, tested, and
 # linted with in CI and local dev. This is intentionally newer than the
-# `rust-version = "1.85"` MSRV floor declared in Cargo.toml (the minimum
-# edition-2024-capable toolchain the workspace promises to still compile
-# on) — see README.md's Configuration/MSRV note for why the two numbers
-# differ.
+# `rust-version = "1.88"` MSRV floor declared in Cargo.toml (the real
+# floor the workspace promises to still compile on — see that field's
+# comment for how it was verified) — see README.md's Configuration/MSRV
+# note for why the two numbers differ.
 channel = "1.96.1"
 components = ["rustfmt", "clippy"]
 profile = "default"
