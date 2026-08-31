@@ -343,11 +343,18 @@ services:
   # Usage (RustFS, the default store):
   #   docker compose -p <project> --profile test run --rm g1-test-runner
   #
-  # Usage (SeaweedFS, G2 matrix — env/config only, no compose file edit):
-  #   docker compose -p <project> --profile test --profile seaweedfs run --rm \
-  #     -e LAKEKEEPER_WAREHOUSE=seaweedfs \
-  #     -e CH_RUSTFS_S3_ENDPOINT=http://seaweedfs:8333 \
-  #     g1-test-runner
+  # Usage (SeaweedFS, G2 matrix — env/config only, no compose file edit).
+  # BOTH steps are required: `run` only starts this service's own
+  # `depends_on` chain, which covers `lakekeeper-warehouse-init` (the
+  # `default`/RustFS warehouse) but NOT
+  # `lakekeeper-warehouse-init-seaweedfs`. Skipping step 1 fails with
+  # `A warehouse 'seaweedfs' does not exist` (404 NoSuchWarehouseException).
+  #   1. docker compose -p <project> --profile seaweedfs up -d
+  #   2. docker compose -p <project> --profile test --profile seaweedfs run --rm \
+  #        -e LAKEKEEPER_WAREHOUSE=seaweedfs \
+  #        -e CH_RUSTFS_S3_ENDPOINT=http://seaweedfs:8333 \
+  #        g1-test-runner
+  # This is what `.github/workflows/ci.yml`'s `g2-seaweedfs` job does.
   g1-test-runner:
     profiles: ["test"]
     image: rust:1.96.1-slim
