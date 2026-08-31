@@ -16,6 +16,7 @@ use time::OffsetDateTime;
 use crate::json::ApiJson;
 use crate::routes::support::{js_error, num_or_zero, str_col};
 use crate::state::AppState;
+use crate::tenant::{TENANT_ID, TENANT_OWNER, TENANT_SITE};
 use lakehouse_dagster::{DgClient, DgError};
 
 /// The four recognized `ops/{kind}` values. Ported from the `if (kind ===
@@ -172,8 +173,8 @@ async fn usage(ch: &ChClient, dagster: &DgClient) -> Result<Value, OpsError> {
         "agentBudgetUsedRate": 0,
         "tenants": [
             {
-                "id": "dispar-dki",
-                "name": "Dinas Pariwisata & Ekraf DKI Jakarta",
+                "id": TENANT_ID.as_str(),
+                "name": TENANT_OWNER.as_str(),
                 "computeUnits": units,
                 "budgetLimit": 100_000,
                 "budgetSpent": units,
@@ -199,7 +200,7 @@ async fn workloads(ch: &ChClient) -> Result<Value, OpsError> {
             json!({
                 "id": format!("w-{i}"),
                 "principal": str_col(p, "user"),
-                "tenant": "dispar-dki",
+                "tenant": TENANT_ID.as_str(),
                 "class": "hot-analytics",
                 "engine": "hot-store",
                 "status": "running",
@@ -244,7 +245,7 @@ async fn services(ch: &ChClient, dagster: &DgClient) -> Result<Value, OpsError> 
                 "name": name,
                 "health": if ok { "healthy" } else { "unhealthy" },
                 "version": "-",
-                "site": "Depok (187)",
+                "site": TENANT_SITE.as_str(),
                 "replicas": 1,
                 "errorRate": 0,
                 "latencyMs": 0,
@@ -358,7 +359,7 @@ async fn cancel_workload_body(ch: &ChClient, id: &str) -> Result<Option<Value>, 
     Ok(Some(json!({
         "id": id,
         "principal": str_col(row, "user"),
-        "tenant": "dispar-dki",
+        "tenant": TENANT_ID.as_str(),
         "class": "hot-analytics",
         "engine": "hot-store",
         "status": "cancelled",

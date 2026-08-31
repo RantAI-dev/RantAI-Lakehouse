@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::tenant::BUILTIN_DASHBOARD_ENABLED;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
@@ -96,7 +97,9 @@ async fn get_body(
         .or_else(|| board_obj.and_then(|b| b.filters.clone()))
         .unwrap_or_default();
 
-    let on_default = board == "default" || board == "all";
+    // Tile bawaan hanya disajikan bila deployment ini memang punya mart-nya;
+    // lihat `BUILTIN_DASHBOARD_ENABLED`.
+    let on_default = (board == "default" || board == "all") && *BUILTIN_DASHBOARD_ENABLED;
     let stored_for_board: Vec<&StoredChartSpec> = if board == "all" {
         stored.iter().collect()
     } else {

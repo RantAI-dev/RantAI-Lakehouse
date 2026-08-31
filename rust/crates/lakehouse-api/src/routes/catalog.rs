@@ -19,17 +19,9 @@ use crate::json::ApiJson;
 use crate::routes::support::{js_error, js_string, num_or_zero, prettify, str_col};
 use crate::state::AppState;
 
-/// Dataset slugs whose Bronze registry entry is curated (SDI-derived and
-/// promoted a layer), everything else in the registry is raw. Ported
-/// verbatim from the `BRONZE_CURATED` set in both TypeScript route files.
-const BRONZE_CURATED: &[&str] = &[
-    "wisman-jakarta-per-bulan",
-    "wisman-jakarta-per-negara",
-    "wisman-jakarta-per-pintu-masuk",
-    "jumlah-pengunjung-event-2026",
-];
-
-const DEFAULT_OWNER: &str = "Dinas Pariwisata & Ekraf DKI Jakarta";
+use crate::tenant::{
+    NAMESPACE_META, TENANT_DOMAIN, TENANT_OWNER, TENANT_RESIDENCY, is_curated_bronze,
+};
 
 /// `GET /api/catalog` — the full asset registry, grouped into namespaces.
 pub async fn list(State(state): State<AppState>) -> Response {
@@ -110,11 +102,11 @@ async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
                 "name": str_col(c, "title"),
                 "namespace": if sekunder { "sekunder" } else { "sdi-primer" },
                 "type": "iceberg-table",
-                "layer": if BRONZE_CURATED.contains(&slug) { "bronze" } else { "raw" },
+                "layer": if is_curated_bronze(slug) { "bronze" } else { "raw" },
                 "tier": "warm",
                 "classification": "internal",
-                "owner": if owner.is_empty() { DEFAULT_OWNER } else { owner.as_str() },
-                "domain": "pariwisata",
+                "owner": if owner.is_empty() { TENANT_OWNER.as_str() } else { owner.as_str() },
+                "domain": TENANT_DOMAIN.as_str(),
                 "description": description,
                 "format": "Apache Iceberg (Parquet)",
                 "engine": "hot-store",
@@ -124,7 +116,7 @@ async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
                 "freshnessLagSeconds": 0,
                 "lastUpdated": updated_at,
                 "health": if rows > 0 { "healthy" } else { "degraded" },
-                "residency": "id-jakarta",
+                "residency": TENANT_RESIDENCY.as_str(),
             })
         })
         .collect();
@@ -179,8 +171,8 @@ async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
                 "layer": "silver",
                 "tier": "warm",
                 "classification": "internal",
-                "owner": DEFAULT_OWNER,
-                "domain": "pariwisata",
+                "owner": TENANT_OWNER.as_str(),
+                "domain": TENANT_DOMAIN.as_str(),
                 "description": "Model Silver terkurasi (bersih & terkonform) di ClickHouse.",
                 "format": if engine == "View" { "ClickHouse View".to_owned() } else { format!("ClickHouse {engine}") },
                 "engine": "hot-store",
@@ -190,7 +182,7 @@ async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
                 "freshnessLagSeconds": 0,
                 "lastUpdated": "",
                 "health": "healthy",
-                "residency": "id-jakarta",
+                "residency": TENANT_RESIDENCY.as_str(),
             }));
         } else {
             if name.ends_with("_baru") {
@@ -205,8 +197,8 @@ async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
                 "layer": "gold",
                 "tier": "hot",
                 "classification": "internal",
-                "owner": DEFAULT_OWNER,
-                "domain": "pariwisata",
+                "owner": TENANT_OWNER.as_str(),
+                "domain": TENANT_DOMAIN.as_str(),
                 "description": "Mart Gold penyaji dashboard (agregat siap pakai).",
                 "format": format!("ClickHouse {engine}"),
                 "engine": "hot-store",
@@ -216,7 +208,7 @@ async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
                 "freshnessLagSeconds": 0,
                 "lastUpdated": "",
                 "health": if rows > 0 { "healthy" } else { "degraded" },
-                "residency": "id-jakarta",
+                "residency": TENANT_RESIDENCY.as_str(),
             }));
         }
     }
@@ -225,28 +217,14 @@ async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
     Ok(json!({ "assets": assets, "namespaces": namespaces }))
 }
 
-/// Namespace metadata: display name and description. Ported from `NS_META`
-/// in `catalog/route.ts`; unlisted namespaces fall back to `(name, "")`.
-fn ns_meta(name: &str) -> (&'static str, &'static str) {
-    match name {
-        "sdi-primer" => (
-            "SDI Primer (Satu Data Jakarta)",
-            "Dataset primer ditarik dari Satu Data Jakarta ke Bronze/Iceberg.",
-        ),
-        "sekunder" => (
-            "Data Sekunder (olahan)",
-            "Dataset sekunder olahan (wisman bersih, TripAdvisor, halal, dll).",
-        ),
-        "silver" => (
-            "Silver (kurasi)",
-            "Model bersih & terkonform di ClickHouse — dimensi, wisman, restoran, event, dst.",
-        ),
-        "serving" => (
-            "Gold (mart penyaji)",
-            "Mart agregat penyaji dashboard — mart_wisman, mart_kuliner, mart_event, dll.",
-        ),
-        _ => ("", ""),
-    }
+/// Namespace metadata: display name and description. Overridable per
+/// deployment via `CATALOG_NAMESPACE_META` — see `crate::tenant`.
+/// Unlisted namespaces fall back to `(name, "")`.
+fn ns_meta(name: &str) -> (String, String) {
+    NAMESPACE_META
+        .get(name)
+        .map(|m| (m.name.clone(), m.description.clone()))
+        .unwrap_or_default()
 }
 
 /// Group `assets` by `namespace`, counting each, in first-seen order —
@@ -266,13 +244,20 @@ fn build_namespaces(assets: &[Value]) -> Vec<Value> {
         .into_iter()
         .map(|name| {
             let (meta_name, description) = ns_meta(&name);
+            // Dihitung sebelum `json!`, karena `"id": name` memindahkan `name`.
+            let display = if meta_name.is_empty() {
+                name.clone()
+            } else {
+                meta_name
+            };
+            let asset_count = counts[&name];
             json!({
                 "id": name,
-                "name": if meta_name.is_empty() { name.clone() } else { meta_name.to_owned() },
+                "name": display,
                 "description": description,
-                "assetCount": counts[&name],
-                "owner": DEFAULT_OWNER,
-                "residency": "id-jakarta",
+                "assetCount": asset_count,
+                "owner": TENANT_OWNER.as_str(),
+                "residency": TENANT_RESIDENCY.as_str(),
                 "sourceEngine": "ClickHouse + Iceberg",
             })
         })
@@ -357,8 +342,8 @@ async fn clickhouse_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response>
         "layer": if is_gold { "gold" } else { "silver" },
         "tier": if is_gold { "hot" } else { "warm" },
         "classification": "internal",
-        "owner": DEFAULT_OWNER,
-        "domain": "pariwisata",
+        "owner": TENANT_OWNER.as_str(),
+        "domain": TENANT_DOMAIN.as_str(),
         "description": if is_gold {
             "Mart Gold penyaji dashboard (agregat siap pakai)."
         } else {
@@ -372,7 +357,7 @@ async fn clickhouse_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response>
         "freshnessLagSeconds": 0,
         "lastUpdated": "",
         "health": if schema.is_empty() { "degraded" } else { "healthy" },
-        "residency": "id-jakarta",
+        "residency": TENANT_RESIDENCY.as_str(),
         "schema": schema,
         "sample": sample,
         "qualityChecks": [],
@@ -505,11 +490,11 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
         "name": str_col(sync, "title"),
         "namespace": if sekunder { "sekunder" } else { "sdi-primer" },
         "type": "iceberg-table",
-        "layer": if BRONZE_CURATED.contains(&slug) { "bronze" } else { "raw" },
+        "layer": if is_curated_bronze(slug) { "bronze" } else { "raw" },
         "tier": "warm",
         "classification": "internal",
-        "owner": if owner.is_empty() { DEFAULT_OWNER } else { owner },
-        "domain": "pariwisata",
+        "owner": if owner.is_empty() { TENANT_OWNER.as_str() } else { owner },
+        "domain": TENANT_DOMAIN.as_str(),
         "description": description,
         "format": "Apache Iceberg (Parquet)",
         "engine": "hot-store",
@@ -519,7 +504,7 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
         "freshnessLagSeconds": 0,
         "lastUpdated": updated_at,
         "health": if rows > 0 { "healthy" } else { "degraded" },
-        "residency": "id-jakarta",
+        "residency": TENANT_RESIDENCY.as_str(),
         "schema": schema,
         "sample": sample,
         "qualityChecks": [],
@@ -592,7 +577,7 @@ mod tests {
 
     #[test]
     fn ns_meta_falls_back_to_empty_for_unknown_namespace() {
-        assert_eq!(ns_meta("mystery"), ("", ""));
+        assert_eq!(ns_meta("mystery"), (String::new(), String::new()));
     }
 
     #[test]
