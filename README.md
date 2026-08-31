@@ -1,4 +1,17 @@
-# RantAI Lakehouse
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="public/logo-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="public/logo-light.png">
+    <img alt="RantAI Lakehouse logo" src="public/logo-light.png" width="160">
+  </picture>
+</p>
+
+<h1 align="center">RantAI Lakehouse</h1>
+
+<p align="center">
+  A data-lakehouse console for browsing a catalog, running pipelines,
+  building dashboards, and chatting with an LLM over your data.
+</p>
 
 RantAI Lakehouse is a data-lakehouse console: a web UI for browsing a data
 catalog, running and scheduling pipelines, building dashboards, managing
@@ -259,8 +272,10 @@ a vulnerability privately.
 
 ## License
 
-Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE) (including a
-transitive LGPL-3.0 note for `sharp-libvips`).
+AGPL-3.0-or-later — see [LICENSE](LICENSE) and [NOTICE](NOTICE) (including a
+transitive LGPL-3.0 note for `sharp-libvips`, which is compatible with
+AGPL-3.0). `v0.1.0` was released under Apache-2.0; the project relicensed to
+AGPL-3.0-or-later afterward — see [CHANGELOG.md](CHANGELOG.md).
 
 ---
 

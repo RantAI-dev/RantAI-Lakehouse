@@ -8,6 +8,22 @@ once a first release is tagged.
 
 ## [Unreleased]
 
+### Changed
+
+- **Relicensed the project from Apache-2.0 to AGPL-3.0-or-later.**
+  `v0.1.0` was released and remains distributed under Apache-2.0 — that
+  historical release is unaffected. All source as of this change is
+  licensed AGPL-3.0-or-later: `LICENSE` now carries the full AGPLv3 text
+  (copyright RantAI), `rust/Cargo.toml`'s `[workspace.package] license`
+  (inherited by all 12 `lakehouse-*` crates) is `AGPL-3.0-or-later`,
+  `package.json` now declares `"license": "AGPL-3.0-or-later"`,
+  `rust/deny.toml` carries per-crate exceptions so `cargo deny check
+  licenses` accepts the first-party AGPL declaration without loosening the
+  permissive-only allowlist for third-party dependencies, and `NOTICE` /
+  `README.md` reflect the new license. A dependency re-audit
+  (`cargo deny check licenses`) found no dependency license incompatible
+  with distributing the combined work under AGPL-3.0.
+
 ## [0.1.0] - 2026-08-30
 
 First tagged release. Everything below reflects the commit history on

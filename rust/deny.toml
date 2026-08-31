@@ -7,6 +7,16 @@
 # the permissive set actually in use and denies anything else by default,
 # so a future dependency change that pulls in a copyleft license fails CI
 # instead of silently landing.
+#
+# The project's outbound license is AGPL-3.0-or-later (see LICENSE), so the
+# 12 first-party `lakehouse-*` workspace crates declare
+# `license = "AGPL-3.0-or-later"` (via `[workspace.package]` in the root
+# Cargo.toml). AGPL is deliberately NOT in the global `allow` list below —
+# that list governs third-party *dependencies*, which remain permissive-only
+# by policy. Instead each workspace crate gets a narrow per-crate exception
+# so `cargo deny check licenses` accepts our own AGPL declaration without
+# opening the door to a copyleft dependency slipping in under the same
+# allowance.
 
 [graph]
 targets = []
@@ -37,6 +47,57 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.8
+
+# Per-crate exceptions: the 12 first-party workspace crates only. This does
+# NOT add AGPL-3.0-or-later to the global `allow` list above, so a
+# third-party dependency under AGPL/GPL would still fail the check.
+[[licenses.exceptions]]
+allow = ["AGPL-3.0-or-later"]
+name = "lakehouse-alerts"
+
+[[licenses.exceptions]]
+allow = ["AGPL-3.0-or-later"]
+name = "lakehouse-api"
+
+[[licenses.exceptions]]
+allow = ["AGPL-3.0-or-later"]
+name = "lakehouse-auth"
+
+[[licenses.exceptions]]
+allow = ["AGPL-3.0-or-later"]
+name = "lakehouse-bi"
+
+[[licenses.exceptions]]
+allow = ["AGPL-3.0-or-later"]
+name = "lakehouse-clickhouse"
+
+[[licenses.exceptions]]
+allow = ["AGPL-3.0-or-later"]
+name = "lakehouse-core"
+
+[[licenses.exceptions]]
+allow = ["AGPL-3.0-or-later"]
+name = "lakehouse-dagster"
+
+[[licenses.exceptions]]
+allow = ["AGPL-3.0-or-later"]
+name = "lakehouse-embed"
+
+[[licenses.exceptions]]
+allow = ["AGPL-3.0-or-later"]
+name = "lakehouse-llm"
+
+[[licenses.exceptions]]
+allow = ["AGPL-3.0-or-later"]
+name = "lakehouse-notify"
+
+[[licenses.exceptions]]
+allow = ["AGPL-3.0-or-later"]
+name = "lakehouse-store"
+
+[[licenses.exceptions]]
+allow = ["AGPL-3.0-or-later"]
+name = "lakehouse-test-support"
 
 [bans]
 multiple-versions = "allow"

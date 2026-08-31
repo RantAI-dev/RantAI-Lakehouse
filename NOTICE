@@ -1,8 +1,13 @@
 RantAI Lakehouse
 Copyright 2026 RantAI
 
-This product is licensed under the Apache License, Version 2.0.
+This product is licensed under the GNU Affero General Public License,
+Version 3 (or, at your option, any later version) — AGPL-3.0-or-later.
 See the LICENSE file for the full license text.
+
+As of 2026-08-31, this project relicensed from Apache-2.0 to
+AGPL-3.0-or-later. `v0.1.0` and earlier were distributed under Apache-2.0;
+that historical release is unaffected. See CHANGELOG.md.
 
 ================================================================================
 Third-party notices
@@ -28,16 +33,21 @@ is distributed under LGPL-3.0-or-later.
 - The `@img/sharp-libvips-*` binaries are LGPL-3.0-or-later, dynamically
   linked (not statically compiled into this project's own code).
 - LGPL-3.0 permits dynamic linking from a project under a different license
-  (including Apache-2.0) without imposing the LGPL on the linking project's
-  own source, provided the LGPL-covered component itself remains replaceable
-  and its license/source-availability obligations are respected.
+  (including a copyleft one) without imposing additional restrictions on the
+  linking project's own source, provided the LGPL-covered component itself
+  remains replaceable and its license/source-availability obligations are
+  respected. LGPL-3.0 is explicitly compatible with GNU AGPL-3.0 (both are
+  GPL-family licenses from the FSF; LGPL is a permissive relaxation of GPL,
+  and AGPL is GPL plus a network-use clause) — this dependency does not
+  create a licensing conflict with this project's own AGPL-3.0-or-later
+  license.
 - Upstream source for `libvips` is available at
   https://github.com/libvips/libvips and for the `sharp-libvips` packaging at
   https://github.com/lovell/sharp-libvips.
 
 This dependency was surfaced in a license audit prior to open-sourcing this
-repository and is called out here for transparency; it does not affect the
-license of this project's own source code (Apache-2.0).
+repository and is called out here for transparency; it remains accurate and
+non-conflicting after the project's relicense to AGPL-3.0-or-later.
 
 --------------------------------------------------------------------------------
 Full dependency license texts
