@@ -10,7 +10,7 @@ For environment variables and a running-system quickstart, see
 
 ## Module map
 
-The Rust backend (`rust/crates/`) is 11 crates. `lakehouse-api` is the only
+The Rust backend (`rust/crates/`) is 12 crates. `lakehouse-api` is the only
 binary; everything else is a library crate it depends on.
 
 | Crate | Owns |
@@ -25,6 +25,7 @@ binary; everything else is a library crate it depends on.
 | `lakehouse-embed` | Signed embedding (Metabase-style): HS256 JWT carrying a dashboard resource plus locked filter params, hand-rolled (no external JWT crate), matching the original TypeScript. |
 | `lakehouse-notify` | Delivery to webhook (Slack/Discord/generic incoming webhook) and email (SMTP via `lettre`), used by alerts and digests. |
 | `lakehouse-alerts` | Threshold alerts and scheduled digests over `serving.*` ClickHouse marts, persisted in `console.alert_rule`, delivered via `lakehouse-notify`. |
+| `lakehouse-iceberg` | P1: `object_store`-backed S3 client, Lakekeeper Iceberg REST catalog client, Bronze table create + append. No route calls it yet (P6). See its crate doc comment and `docs/adr/0002`–`0004`. |
 | `lakehouse-api` | The axum HTTP service: config resolution, middleware, routing, policy, and every handler. The only crate with `main()`. |
 
 ## Request lifecycle
