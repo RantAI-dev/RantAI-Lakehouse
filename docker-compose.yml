@@ -325,7 +325,180 @@ services:
         fi
     restart: "no"
 
+  # P2 — runs the G1 acceptance suite
+  # (`lakehouse-iceberg/tests/g1_lakekeeper.rs`) INSIDE the compose network,
+  # where `rustfs`/`lakekeeper`/`clickhouse` resolve by their compose
+  # service DNS names. This is the fix for the "not CI-runnable" defect
+  # recorded in docs/plans/G1-RESULT.md: Lakekeeper vends this test's S3
+  # client the `http://rustfs:9000` endpoint (the compose-internal name),
+  # which only resolves from inside this network — a host-run `cargo test`
+  # cannot reach it without editing /etc/hosts. Never starts on a plain
+  # `docker compose up` (opt-in `test` profile).
+  #
+  # Only half (a) is run here (`-- g1_half_a`) — half (b) stays
+  # `#[ignore]`d and is a standing marker for the upstream ClickHouse
+  # defect documented in G1-RESULT.md; it is not expected to pass and is
+  # deliberately excluded from this regression guard.
+  #
+  # Usage (RustFS, the default store):
+  #   docker compose -p <project> --profile test run --rm g1-test-runner
+  #
+  # Usage (SeaweedFS, G2 matrix — env/config only, no compose file edit):
+  #   docker compose -p <project> --profile test --profile seaweedfs run --rm \
+  #     -e LAKEKEEPER_WAREHOUSE=seaweedfs \
+  #     -e CH_RUSTFS_S3_ENDPOINT=http://seaweedfs:8333 \
+  #     g1-test-runner
+  g1-test-runner:
+    profiles: ["test"]
+    image: rust:1.96.1-slim
+    working_dir: /workspace
+    volumes:
+      - ./rust:/workspace
+      - lakehouse_g1_cargo_registry:/usr/local/cargo/registry
+      - lakehouse_g1_target:/workspace/target
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      lakekeeper-warehouse-init:
+        condition: service_completed_successfully
+    environment:
+      # These four all resolve from INSIDE the compose network (this
+      # container's own perspective), unlike the host-facing defaults in
+      # `.env.example` — see the module doc on `g1_lakekeeper.rs`'s
+      # `G1Env` for why the host-facing and container-facing values must
+      # not be collapsed into one.
+      LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      CH_LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        set -eu &&
+        apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev >/dev/null &&
+        cargo test -p lakehouse-iceberg --test g1_lakekeeper --locked -- --ignored --nocapture g1_half_a
+    restart: "no"
+
+  # P2 (G2) — SeaweedFS: a second S3-compatible store used to prove the
+  # storage boundary. Opt-in via the `seaweedfs` profile; never starts on a
+  # plain `docker compose up` (RustFS stays the default). Image confirmed
+  # to exist on Docker Hub as `chrislusf/seaweedfs:4.44` (pulled and
+  # inspected during P2 verification — see docs/STORAGE-COMPATIBILITY.md).
+  #
+  # `weed server -s3` runs master+volume+filer+the S3 gateway in one
+  # process — sufficient for this matrix check, not a production topology.
+  seaweedfs:
+    profiles: ["seaweedfs"]
+    image: chrislusf/seaweedfs:4.44
+    command:
+      - server
+      - -dir=/data
+      - -s3
+      - -s3.port=8333
+      - -s3.iam.config=/etc/seaweedfs/iam.json
+      - -s3.iam.readOnly=false
+      - -master.volumeSizeLimitMB=100
+    volumes:
+      - lakehouse_seaweedfs_data:/data
+      - ./ops/seaweedfs/iam.json:/etc/seaweedfs/iam.json:ro
+    ports:
+      - "${SEAWEEDFS_S3_HOST_PORT:-8333}:8333"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8333/ || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 15s
+    restart: unless-stopped
+
+  # P2 (G2) — mirrors `rustfs-bucket-init`: create the warehouse bucket via
+  # the plain S3 API only. Opt-in with `seaweedfs`.
+  seaweedfs-bucket-init:
+    profiles: ["seaweedfs"]
+    image: amazon/aws-cli:2.36.34
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${SEAWEEDFS_ACCESS_KEY:-seaweedfsadmin}
+      AWS_SECRET_ACCESS_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfsadmin}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        aws --endpoint-url http://seaweedfs:8333 s3api head-bucket
+        --bucket ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse} 2>/dev/null ||
+        aws --endpoint-url http://seaweedfs:8333 s3api create-bucket
+        --bucket ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
+    restart: "no"
+
+  # P2 (G2) — mirrors `lakekeeper-warehouse-init` exactly (same bootstrap +
+  # warehouse-registration shape), pointed at SeaweedFS instead of RustFS
+  # and registered under a DIFFERENT warehouse name (`seaweedfs`, not
+  # `default`) so both stores' warehouses can coexist under one Lakekeeper
+  # server without colliding. This is config, not a code fork: the only
+  # deltas from `lakekeeper-warehouse-init` are the endpoint, credentials,
+  # and warehouse name baked into the JSON body.
+  lakekeeper-warehouse-init-seaweedfs:
+    profiles: ["seaweedfs"]
+    image: alpine:3.20
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      seaweedfs-bucket-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEKEEPER_WAREHOUSE: seaweedfs
+      LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
+      SEAWEEDFS_ACCESS_KEY: ${SEAWEEDFS_ACCESS_KEY:-seaweedfsadmin}
+      SEAWEEDFS_SECRET_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfsadmin}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        apk add --no-cache curl jq >/dev/null
+        base="http://lakekeeper:8181"
+        already=$$(curl -fsS "$$base/management/v1/info" | jq -r '.bootstrapped')
+        if [ "$$already" != "true" ]; then
+          curl -fsS -X POST "$$base/management/v1/bootstrap" \
+            -H 'Content-Type: application/json' \
+            -d '{"accept-terms-of-use": true}'
+        fi
+        exists=$$(curl -fsS "$$base/management/v1/warehouse" | \
+          jq -r --arg name "$$LAKEKEEPER_WAREHOUSE" \
+          '.warehouses[]? | select(.name == $$name) | .name')
+        if [ "$$exists" != "$$LAKEKEEPER_WAREHOUSE" ]; then
+          curl -fsS -X POST "$$base/management/v1/warehouse" \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "warehouse-name": "'"$$LAKEKEEPER_WAREHOUSE"'",
+              "storage-profile": {
+                "type": "s3",
+                "bucket": "'"$$LAKEHOUSE_WAREHOUSE_BUCKET"'",
+                "region": "us-east-1",
+                "endpoint": "http://seaweedfs:8333",
+                "path-style-access": true,
+                "sts-enabled": true,
+                "sts-role-arn": "arn:aws:iam::000000000000:role/lakekeeper"
+              },
+              "storage-credential": {
+                "type": "s3",
+                "credential-type": "access-key",
+                "aws-access-key-id": "'"$$SEAWEEDFS_ACCESS_KEY"'",
+                "aws-secret-access-key": "'"$$SEAWEEDFS_SECRET_KEY"'"
+              }
+            }'
+        fi
+    restart: "no"
+
 volumes:
   lakehouse_postgres_data:
   lakehouse_clickhouse_data:
   lakehouse_rustfs_data:
+  lakehouse_seaweedfs_data:
+  lakehouse_g1_cargo_registry:
+  lakehouse_g1_target:
