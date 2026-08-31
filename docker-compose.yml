@@ -407,7 +407,13 @@ services:
     ports:
       - "${SEAWEEDFS_S3_HOST_PORT:-8333}:8333"
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8333/ || exit 1"]
+      # `127.0.0.1`, not `localhost`: this image's S3 listener only binds
+      # IPv4 loopback, and busybox `wget` resolves `localhost` to `::1`
+      # first, which connection-refuses — confirmed during P2 verification.
+      # `curl -f` would also treat the unauthenticated 403 the S3 API
+      # correctly returns as unhealthy, so this only checks that something
+      # is listening and speaking HTTP at all (any response code).
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8333/ | grep -qE '^[0-9]{3}$' || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 15

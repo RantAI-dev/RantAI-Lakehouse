@@ -13,7 +13,7 @@
     "tokenDuration": "1h",
     "maxSessionLength": "12h",
     "issuer": "seaweedfs-sts",
-    "signingKey": "p2-matrix-local-only-signing-key-not-a-secret"
+    "signingKey": "cDItbWF0cml4LWxvY2FsLW9ubHktc2lnbmluZy1rZXktbm90LWEtc2VjcmV0"
   },
   "policy": {
     "defaultEffect": "Deny",
