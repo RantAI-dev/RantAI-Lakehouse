@@ -103,48 +103,88 @@ even when that condition is met, does not actually push anywhere — there is
 no `docker/login-action` step and no registry credential configured. Wiring
 up real publishing is an explicit, separate decision for a later phase.
 
-## Recommended branch protection (cannot be set by this pass — apply manually)
+## Recommended branch protection (attempted, blocked — apply manually)
 
-Settings → Branches → Add rule for `main` (and, if PRs into
-`feat/rust-backend` become the norm before it merges, that branch too):
+An attempt was made to set this via `gh api` during the public-release
+hardening pass; it was blocked by a permission classifier even though the
+acting account has org-admin rights. Rather than fight that, here is the
+exact command an owner can run themselves, and the reasoning behind each
+choice, so it can be applied (or adjusted) in one step instead of clicking
+through the UI.
 
-- **Require a pull request before merging**, with at least 1 approving
-  review; dismiss stale approvals on new commits.
-- **Require status checks to pass before merging**, and require branches to
-  be up to date. Required checks:
-  - `Frontend · Lint · Typecheck · Test · Build` (`verify`, ci.yml)
-  - `Parity corpus · no leaked credentials` (ci.yml)
-  - `Rust · fmt` (ci.yml)
-  - `Rust · clippy` (ci.yml)
-  - `Rust · build` (ci.yml)
-  - `Rust · test (stable)` and `Rust · test (1.88.0)` (ci.yml, both matrix
-    legs)
-  - `cargo audit (advisories)` (security.yml)
-  - `cargo deny check (all)` (security.yml)
-  - `gitleaks (working tree)` (security.yml)
-  - `Build lakehouse-api image · smoke test /health` (docker.yml)
-  - **Do not** require `history-scan` — see above; its result must not
-    silently gate merges either way. Leave it running and visible, not
-    blocking.
-  - **Do not** require `Dependency review (PR only)` — this org is on
-    GitHub's free plan, which doesn't include GitHub Advanced Security, and
-    `dependency-review-action` hard-requires it for private repositories
-    (verified: the job fails at `actions/dependency-review-action@v4` with
-    "Dependency review is not supported on this repository... ensure
-    Dependency graph is enabled along with GitHub Advanced Security").
-    Getting this job to actually pass requires either upgrading the org's
-    billing plan to include GHAS, or making the repository public — both
-    are decisions outside this CI pass's scope. Until one of those happens,
-    this job stays present (so the gap doesn't get silently forgotten) and
-    permanently excluded from required checks.
-- **Do not allow force pushes** to the protected branch.
-- **Do not allow deletions** of the protected branch.
-- Consider **requiring signed commits** and **requiring linear history**
-  once the team's workflow is settled; neither is load-bearing for this
-  phase.
-- Restrict who can push directly (no direct pushes bypassing PRs), including
-  for repo admins if the team wants that strict a guarantee.
+```sh
+gh api \
+  --method PUT \
+  -H "Accept: application/vnd.github+json" \
+  repos/RantAI-dev/RantAI-Lakehouse/branches/main/protection \
+  -f 'required_status_checks[strict]=true' \
+  -f 'required_status_checks[checks][][context]=Frontend · Lint · Typecheck · Test · Build' \
+  -f 'required_status_checks[checks][][context]=Parity corpus · no leaked credentials' \
+  -f 'required_status_checks[checks][][context]=Rust · fmt' \
+  -f 'required_status_checks[checks][][context]=Rust · clippy' \
+  -f 'required_status_checks[checks][][context]=Rust · build' \
+  -f 'required_status_checks[checks][][context]=Rust · test (stable)' \
+  -f 'required_status_checks[checks][][context]=Rust · test (1.88.0)' \
+  -f 'required_status_checks[checks][][context]=cargo audit (advisories)' \
+  -f 'required_status_checks[checks][][context]=cargo deny check (all)' \
+  -f 'required_status_checks[checks][][context]=gitleaks (working tree)' \
+  -f 'required_status_checks[checks][][context]=Build lakehouse-api image · smoke test /health' \
+  -F 'enforce_admins=false' \
+  -F 'required_pull_request_reviews=null' \
+  -F 'restrictions=null' \
+  -F 'allow_force_pushes=false' \
+  -F 'allow_deletions=false'
+```
 
-This has to be done in the GitHub UI (or via `gh api
-repos/:owner/:repo/branches/main/protection`) by someone with admin rights on
-the repo — it is not something a workflow file can configure for itself.
+The check names above are the real `name:` values from
+`.github/workflows/{ci,security,docker}.yml` as of this writing — not
+guessed. If a workflow's job names change, this list needs to be updated to
+match, or `strict` mode will block merges on a check that no longer reports.
+
+Why each choice:
+
+- **Required checks are the honest-green ones only.** `Frontend...Build`,
+  `Parity corpus...`, all `Rust ·` jobs, `cargo audit`, `cargo deny`,
+  `gitleaks (working tree)`, and the Docker smoke test are the jobs that
+  are expected to actually pass on a healthy `main`.
+- **`gitleaks (full git history)` is deliberately NOT in this list.** It is
+  expected to stay red (see "Known exposure" in
+  [SECURITY.md](../SECURITY.md) and the `history-scan`/history section
+  above). Requiring it would either block every future merge forever, or
+  pressure someone into silencing a real finding — neither is acceptable.
+  It stays present and visible in the Actions UI, not gating.
+- **`Dependency review (PR only)` is also NOT in this list**, even though
+  it can now pass on a public repo (GHAS dependency review is free for
+  public repositories — see the section below for the actual PR run that
+  verified this). It's left optional for now rather than required so a
+  future job rename or dependency-graph hiccup can't silently block merges
+  before anyone's had a chance to watch it run a few times; promote it to
+  required once it's proven stable.
+- **`enforce_admins: false` is deliberate**, not an oversight. This is
+  presently a solo/small-team project; enforcing admin restrictions too
+  early risks locking the owner out of their own repo during a hotfix. It
+  is worth flipping to `true` once there is more than one active
+  maintainer and a real PR review culture, at which point requiring PR
+  reviews (`required_pull_request_reviews`, currently left `null`/off
+  above) is also worth turning on.
+- **Force pushes and branch deletion are blocked** (`allow_force_pushes:
+  false`, `allow_deletions: false`) regardless of the above — those are
+  cheap to disallow and protect against both accidents and, given the
+  history-rewrite decision this repo is deliberately deferring (see
+  above), against an *accidental* force-push doing that rewrite before a
+  human has actually signed off on it.
+- **Push protection matters here too.** GitHub secret-scanning push
+  protection is now enabled on this repository, independently of branch
+  protection: a future commit containing a recognized secret pattern
+  (including the two custom patterns in `.gitleaks.toml`'s rules, once/if
+  they're also expressed as a GitHub secret-scanning custom pattern) will
+  be blocked at push time, before it ever reaches `main`. This is a
+  second, earlier line of defense, not a replacement for branch protection.
+- Consider **requiring signed commits** and **linear history** once the
+  team's workflow is settled; neither is load-bearing for this phase.
+
+This has to be applied by someone with admin rights on the repo — it is not
+something a workflow file can configure for itself, and (as noted above) it
+could not be applied programmatically during this pass either.
+
+<!-- dependency-review probe: throwaway, will be reverted before merge -->
