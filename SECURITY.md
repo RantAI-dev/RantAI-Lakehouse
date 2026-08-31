@@ -5,11 +5,18 @@
 If you believe you've found a security vulnerability in RantAI Lakehouse,
 please report it privately rather than opening a public issue.
 
-**Contact:** `security@rantai.dev` — **TODO: confirm.** This address has not
-yet been verified as monitored; until this line is updated, please instead
-open a [private security advisory](https://github.com/RantAI-dev/RantAI-Lakehouse/security/advisories/new)
-on this repository (GitHub Security Advisories), which notifies maintainers
-without disclosing the report publicly.
+**Preferred channel: GitHub private vulnerability reporting.** This
+repository has private vulnerability reporting enabled. Go to the
+[Security tab](https://github.com/RantAI-dev/RantAI-Lakehouse/security) →
+["Report a vulnerability"](https://github.com/RantAI-dev/RantAI-Lakehouse/security/advisories/new)
+to open a private advisory. This notifies maintainers directly and does
+not disclose the report publicly, and it does not require you to have an
+email address for the project.
+
+*(Optional, not yet set up: the maintaining org may add a monitored
+security-contact email address here in the future. None is published today
+— do not send reports to a guessed address such as `security@rantai.dev`;
+it is not confirmed to be monitored.)*
 
 Please include:
 
@@ -25,14 +32,39 @@ respond.
 ## Response Expectations
 
 This is an early-stage, actively developed project without a dedicated
-security team. As a best-effort target (**TODO: confirm** against whatever
-SLA the maintaining org eventually commits to):
+security team, and **no formal SLA is offered yet.** Reports will be
+triaged on a best-effort basis by whoever is available; there is currently
+no committed acknowledgement or fix timeline. If that changes, this
+section will be updated with a real, kept target rather than an aspirational
+one.
 
-- **Acknowledgement:** within 5 business days.
-- **Initial assessment** (severity, whether it's accepted as a
-  vulnerability): within 10 business days.
-- **Fix or mitigation timeline:** communicated once the assessment is
-  complete, prioritized by severity.
+## Known exposure: leaked secret in git history
+
+Being direct about this because the repository is public and anyone who
+looks at `git log` will find it anyway:
+
+- A previously-internal LLM API key is present in git history, on **2
+  commits reachable from `main`**. Internal LAN hostnames are also present
+  in history, across roughly 10 commits.
+- Both predate this repository going public.
+- **The key must be treated as compromised and rotated at its provider.**
+  Removing it from git history does not un-leak it — it was already
+  world-readable the moment the repo went public, and likely cached by
+  forks, clones, and crawlers before any history rewrite could happen.
+- CI's `gitleaks (full git history)` job (`security.yml`) is **intentionally
+  red** because of this — it is a custom rule specifically added so the
+  scan reports the leak truthfully instead of silently passing. See
+  [docs/CI.md](docs/CI.md) for the full, honest account, including why it
+  is deliberately excluded from required status checks.
+- Actually clearing the history requires a `git filter-repo` (or BFG)
+  rewrite plus a force-push to every affected ref — a destructive,
+  cross-cutting operation that invalidates every existing clone and open
+  PR based on the old history. That is a maintainer decision, deliberately
+  not taken automatically as part of routine hardening work; see
+  [docs/CI.md](docs/CI.md) for what it would involve.
+
+If you find this key still active, please report it via the private
+vulnerability reporting channel above rather than opening a public issue.
 
 ## Supported Versions
 

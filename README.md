@@ -257,6 +257,12 @@ issue about any of the following — they're known, not bugs:
 - **Sessions and service tokens have no rotation/cleanup job.** Nothing
   today expires or garbage-collects them beyond whatever TTL logic exists
   at issuance/verification time.
+- **A previously-internal API key and internal LAN hostnames are present
+  in git history** (2 and ~10 commits reachable from `main`,
+  respectively), predating this repo going public. The key must be, and
+  has been treated as, compromised. See the "Known exposure" section of
+  [SECURITY.md](SECURITY.md) and [docs/CI.md](docs/CI.md) (the
+  `gitleaks (full git history)` job is intentionally red because of this).
 - **The backend was ported from TypeScript to Rust by an AI agent
   workflow**, reviewed by AI reviewers, task by task, with a parity harness
   comparing responses against the original TypeScript backend along the

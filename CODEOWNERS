@@ -1,13 +1,20 @@
 # CODEOWNERS
 #
-# TODO: confirm — replace the placeholder team handle below with a real
-# GitHub team under the RantAI-dev org (or individual maintainer handles)
-# before relying on this file for review routing. GitHub requires the team
-# to exist and have write access to this repository for these rules to take
-# effect.
+# `@RantAI-dev/maintainers` does not exist: verified via
+# `gh api orgs/RantAI-dev/teams --jq '.[].slug'`, which returns an empty
+# list — the org currently has no teams at all. Referencing a nonexistent
+# team here is a silent no-op (GitHub ignores CODEOWNERS rules whose owner
+# doesn't exist/have write access), so this points at a real org owner
+# instead: @kleopasevan (verified admin via
+# `gh api orgs/RantAI-dev/memberships/kleopasevan --jq '.role'` => "admin").
+#
+# To route reviews through a team instead once one exists: create
+# `maintainers` under https://github.com/orgs/RantAI-dev/teams, grant it
+# write access to this repository, then replace the handle below with
+# `@RantAI-dev/maintainers`.
 
-* @RantAI-dev/maintainers
+* @kleopasevan
 
-/rust/ @RantAI-dev/maintainers
-/src/ @RantAI-dev/maintainers
-/.github/ @RantAI-dev/maintainers
+/rust/ @kleopasevan
+/src/ @kleopasevan
+/.github/ @kleopasevan

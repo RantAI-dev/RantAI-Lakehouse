@@ -155,20 +155,19 @@ jobs:
       - name: gitleaks detect (full history)
         run: gitleaks detect --source . --config .gitleaks.toml --redact -v
 
-  # Known limitation, not fixable from a workflow file: `dependency-review-
-  # action` calls GitHub's Dependency Graph diff API, which for *private*
-  # repositories requires GitHub Advanced Security. This org
-  # (RantAI-dev) is on the free plan (`plan.name: "free"`,
-  # `advanced_security_enabled_for_new_repositories: false` — verified via
-  # `gh api orgs/RantAI-dev`), so this job fails at the "Dependency review"
-  # step with "Dependency review is not supported on this repository."
-  # regardless of how it's configured. Enabling it requires either
-  # upgrading the org's billing plan to include GHAS, or making the repo
-  # public (explicitly out of scope — see the hard rules this CI pass
-  # operates under). Left in place, and left failing honestly, rather than
-  # silently dropped — see docs/CI.md. Not part of required status checks.
+  # `dependency-review-action` calls GitHub's Dependency Graph diff API,
+  # which historically required GitHub Advanced Security for *private*
+  # repositories — this org was on the free plan, so the job failed at the
+  # "Dependency review" step with "Dependency review is not supported on
+  # this repository." As of the repository going public, GHAS dependency
+  # review is free for public repos, and this was verified directly: a
+  # throwaway PR (#23, closed without merging) ran this job and it passed.
+  # See docs/CI.md for the verification details. Left out of required
+  # status checks for now (not because it's expected to fail — it isn't —
+  # but so it can prove itself stable over a few real PRs first); promote
+  # it once that's established.
   dependency-review:
-    name: "Dependency review (PR only) — requires GHAS, not available on this plan"
+    name: "Dependency review (PR only)"
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
