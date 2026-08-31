@@ -9,7 +9,7 @@ This repo's CI is split into four workflows under `.github/workflows/`:
   `gitleaks` scan, GitHub's `dependency-review-action` on PRs, and a
   full-git-history `history-scan` job, which is currently **RED for a real
   reason** (see below) and is deliberately excluded from required checks.
-- **`docker.yml`** — builds `rust/Dockerfile.api`, boots the container, and
+- **`docker.yml`** — builds `rust/Dockerfile`, boots the container, and
   asserts `/health` returns 200. A GHCR push job exists but is gated on tag
   pushes and is currently inert (no registry login configured).
 - **`coverage.yml`** — `cargo llvm-cov` (lcov, uploaded as a workflow

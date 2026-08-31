@@ -27,7 +27,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: rust
-          file: rust/Dockerfile.api
+          file: rust/Dockerfile
           push: false
           load: true
           tags: lakehouse-api:ci
