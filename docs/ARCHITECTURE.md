@@ -10,8 +10,10 @@ For environment variables and a running-system quickstart, see
 
 ## Module map
 
-The Rust backend (`rust/crates/`) is 12 crates. `lakehouse-api` is the only
-binary; everything else is a library crate it depends on.
+The Rust backend (`rust/crates/`) is 13 crates (`lakehouse-iceberg` was
+added in P1; the table below already listed it, but the prose above it had
+not been updated until P6). `lakehouse-api` is the only binary; everything
+else is a library crate it depends on.
 
 | Crate | Owns |
 | --- | --- |
@@ -25,7 +27,7 @@ binary; everything else is a library crate it depends on.
 | `lakehouse-embed` | Signed embedding (Metabase-style): HS256 JWT carrying a dashboard resource plus locked filter params, hand-rolled (no external JWT crate), matching the original TypeScript. |
 | `lakehouse-notify` | Delivery to webhook (Slack/Discord/generic incoming webhook) and email (SMTP via `lettre`), used by alerts and digests. |
 | `lakehouse-alerts` | Threshold alerts and scheduled digests over `serving.*` ClickHouse marts, persisted in `console.alert_rule`, delivered via `lakehouse-notify`. |
-| `lakehouse-iceberg` | P1: `object_store`-backed S3 client, Lakekeeper Iceberg REST catalog client, Bronze table create + append. No route calls it yet (P6). See its crate doc comment and `docs/adr/0002`–`0004`. |
+| `lakehouse-iceberg` | P1: `object_store`-backed S3 client, Lakekeeper Iceberg REST catalog client, Bronze table create + append. **Still no route calls it as of P6** — Bronze is surfaced in the console by reading `bronze_meta.*` (ClickHouse) directly, via `routes::catalog`/`routes::governance`/`routes::storage`, not through this crate. It is exercised today by the G1/G3a/G4 gate test runners and (indirectly) by Debezium Server/dlt as REST-catalog clients, not by `lakehouse-api` itself. See its crate doc comment and `docs/adr/0002`–`0004`. |
 | `lakehouse-api` | The axum HTTP service: config resolution, middleware, routing, policy, and every handler. The only crate with `main()`. |
 
 ## Request lifecycle
@@ -98,6 +100,42 @@ Two stores, deliberately not merged, because they solve different problems:
 `identity`, `governance`, `pipelines`, `connectors`, `knowledge`, `agents`,
 `queries`, `overview`, `storage` — one module per Postgres-backed domain,
 plus shared `error` and `connectors`-adjacent plumbing.
+
+### A third store: Bronze Iceberg on object storage (P1–P5)
+
+P1–P5 added a third data path that is neither Postgres nor ClickHouse
+`MergeTree`: **Bronze**, stored as Apache Iceberg tables on an S3-compatible
+object store (RustFS by default; SeaweedFS is a verified drop-in swap, see
+`docs/STORAGE-COMPATIBILITY.md`), registered in Lakekeeper's Iceberg REST
+catalog. Two independent writers populate it — Dagster/dlt for batch
+ingest (P3) and Debezium Server for CDC (P5) — both writing through
+Lakekeeper, never through ClickHouse. ClickHouse reads Bronze back out via
+a `DataLakeCatalog` database (`allow_database_iceberg = 1`) pointed at the
+same Lakekeeper catalog; this read path works and is what
+`routes::catalog`, `routes::governance` (`maintenance`/`replication`
+kinds), and `routes::storage`'s Warm-tier estimate all rely on.
+
+**ClickHouse cannot reliably write to this catalog itself** on 26.3:
+`CREATE TABLE` inside a `DataLakeCatalog` database never reaches
+Lakekeeper, and `INSERT` into a partitioned catalog-registered table
+segfaults the server (see `docs/plans/G1-RESULT.md`). This is why Gold
+export was moved to Rust (`lakehouse-iceberg`, ADR 0010) instead of going
+through ClickHouse's Iceberg write path, and why in-engine Bronze
+maintenance is limited to `expire_snapshots` (`docs/plans/G3-RESULT.md`,
+ADR 0009's Trino-as-cron escape hatch for the small-file compaction
+`OPTIMIZE` cannot do).
+
+A parallel Bronze *metadata registry* — `lake.bronze_meta.*` and
+`lake.bronze_meta_sec.*` (dataset catalog, column, sync, plus P4/P5's
+`maintenance_run`/`replication_slot` tables) — lives in ClickHouse
+`MergeTree`, not Iceberg. This is what every console route above actually
+queries; it is the reason the "never emit a bare `count()` against a Bronze
+Iceberg table" rule (R11, see `docs/plans/P5-RESULT.md`) has not bitten any
+existing product code — the registry is a `MergeTree` table, immune to the
+Iceberg-specific equality-delete counting bug. Two independent owners write
+this schema's DDL today — `demo/clickhouse/04_registry.sql` and
+`dagster/dispar_orchestrate/bronze_catalog.py` — verified byte-identical
+but not enforced as such (R10); this document does not add a third.
 
 ### Boot behavior: Postgres down is not fatal
 
