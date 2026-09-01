@@ -20,11 +20,14 @@
 //!
 //! # No caching of the resolved catalog credential
 //!
-//! [`IcebergClientConfig::catalog_credential`] (Lakekeeper's own `OAuth2`
-//! client-credential, when authorization is enabled — see ADR 0002 and the
-//! P1b report's R1 finding) is handed to `iceberg-catalog-rest` as-is and
-//! never stored anywhere else in this crate; `iceberg-catalog-rest` owns
-//! the token exchange and refresh internally.
+//! [`IcebergClientConfig::catalog_credential`] and
+//! [`IcebergClientConfig::catalog_token`] (Lakekeeper's authorization —
+//! see ADR 0002 and ADR 0011) are handed to `iceberg-catalog-rest` as-is
+//! and never stored anywhere else in this crate; `iceberg-catalog-rest`
+//! owns any token exchange/refresh internally. R1 (ADR 0011) uses
+//! `catalog_token` (a pre-minted static bearer token, sent as-is on every
+//! request) — `catalog_credential`'s `OAuth2` client-credential exchange
+//! is not exercised by anything in this build.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -104,10 +107,23 @@ pub struct IcebergClientConfig {
     /// `TENANT_ID` itself.
     pub warehouse: String,
     /// `OAuth2` client-credential (`"client_id:client_secret"`) for
-    /// Lakekeeper's catalog API, when Lakekeeper authorization is enabled.
-    /// `None` when Lakekeeper is running with no-auth (open) mode — see the
-    /// P1b report for whether that is the case in this deployment.
+    /// Lakekeeper's catalog API. Not used by anything in this build today —
+    /// see [`Self::catalog_token`], which R1 (ADR 0011) uses instead.
+    /// `iceberg-catalog-rest` supports both; a client-credential exchange
+    /// against `POST {catalog_uri}/v1/oauth/tokens` needs Lakekeeper itself
+    /// to broker that exchange against a real identity provider, which
+    /// this build's principals do not need (they hold a pre-minted static
+    /// token already).
     pub catalog_credential: Option<SecretValue>,
+    /// A pre-minted static bearer token for Lakekeeper's catalog API,
+    /// forwarded to `iceberg-catalog-rest` as its `token` property (used
+    /// as-is for every request's `Authorization: Bearer` header, no
+    /// exchange, no refresh — see `iceberg_catalog_rest::catalog::Config::
+    /// token`). `None` when Lakekeeper's authorization is not enforced.
+    /// R1 (ADR 0011): every principal this build's writers authenticate as
+    /// holds one of these, minted once by `ops/oidc-mock` at compose
+    /// startup.
+    pub catalog_token: Option<SecretValue>,
 }
 
 /// A connected Lakekeeper Iceberg REST catalog client, with the
@@ -155,6 +171,9 @@ impl IcebergClient {
                 "credential".to_owned(),
                 credential.expose_secret().to_owned(),
             );
+        }
+        if let Some(token) = &config.catalog_token {
+            props.insert("token".to_owned(), token.expose_secret().to_owned());
         }
 
         let catalog = RestCatalogBuilder::default()

@@ -262,6 +262,11 @@ talks to it:
 | `LAKEKEEPER_ENCRYPTION_KEY` | Encrypts secrets in Lakekeeper's own schema | Lakekeeper's own placeholder — **change before any non-throwaway use** | No |
 | `LAKEKEEPER_BASE_URI` | Base URL Lakekeeper advertises in its own REST responses | `http://localhost:8181` | No |
 | `LAKEKEEPER_HOST_PORT` | Host port mapped to Lakekeeper's REST API (container port 8181) | `8181` | No |
+| `LAKEKEEPER_OPENFGA_STORE_NAME` | Name of the OpenFGA store Lakekeeper's authorization model lives in | `lakekeeper` | No |
+| `OPENFGA_PG_DB` | Name of OpenFGA's own Postgres database on the existing `postgres` service | `openfga` | No |
+| `OPENFGA_HTTP_HOST_PORT` | Host port mapped to OpenFGA's HTTP API (container port 8080) | `8082` | No |
+| `OPENFGA_GRPC_HOST_PORT` | Host port mapped to OpenFGA's gRPC API (container port 8081) — this is the port Lakekeeper's `LAKEKEEPER__OPENFGA__ENDPOINT` actually talks to | `8083` | No |
+| `OIDC_MOCK_HOST_PORT` | Host port mapped to `ops/oidc-mock`'s discovery/JWKS/token endpoints (container port 8090) | `8090` | No |
 
 P1b (`lakehouse-iceberg`) adds the client-side counterparts below, read by
 `config.rs` — these are what a Rust process (not the container) uses to
@@ -346,13 +351,20 @@ issue about any of the following — they're known, not bugs:
   silent wrong answer, not an error; no code added in this repository
   emits a bare `count()` against a Bronze Iceberg table (R11). See
   `docs/plans/P5-RESULT.md`.
-- **Lakekeeper authorization is not enabled — R1 is not retired.**
-  Lakekeeper runs with `authz-backend: "allow-all"`; anyone who can reach
-  its REST API can read/write any warehouse it manages. Enabling real
-  authorization (OpenFGA or the OPA bridge, plus an authorization model
-  and grants for every existing writer — Rust, dlt, Debezium, the G1/G3a/
-  G4 test runners) is scoped but not built; see `docs/plans/P5-REPORT.md`
-  for the concrete step-by-step estimate of what remains.
+- **Lakekeeper authorization is enabled by default — `authz-backend:
+  "openfga"`, not `"allow-all"`.** `docker compose up` now brings up
+  OpenFGA and a mock OIDC issuer (`ops/oidc-mock`) alongside Lakekeeper,
+  and every writer this repo's own tests exercise (the Rust `g1-lakekeeper`
+  test path, `debezium-server`, the dlt pipeline) authenticates as a
+  granted principal — see `docs/adr/0011-lakekeeper-authorization.md` for
+  the model, the grants, and the default-posture decision. **What is still
+  open:** ClickHouse's `CREATE TABLE`/`INSERT` through the catalog do not
+  work on this ClickHouse version at all (a ClickHouse defect, independent
+  of authorization — see above and `docs/plans/G1-RESULT.md`), so R1's
+  original framing ("ClickHouse catalog-registered
+  writes fail against Lakekeeper's authz on metadata updates") is still
+  untestable; and the `trino` compose profile is not granted a principal
+  yet, so it does not work together with authorization enabled.
 - **`getWorkspaceSettings` returns a fixed response.** The contract has no
   setter; workspace settings are not actually persisted or configurable
   yet.

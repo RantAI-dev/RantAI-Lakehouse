@@ -86,10 +86,24 @@ class BronzeIngestConfig:
     rustfs_access_key: str
     rustfs_secret_key: str
     warehouse_bucket: str
+    # R1 (ADR 0011): a pre-minted static bearer token for the `dlt`
+    # principal (granted create/modify/select on the warehouse), read from
+    # a file rather than an env var — this dataclass is constructed once
+    # at process start inside a long-running `dagster api grpc` server, so
+    # (unlike a one-shot compose job) there is no shell step between
+    # container start and this code to interpolate a file's contents into
+    # an env var. Empty string on a pre-R1 or authz-disabled stack, where
+    # `/tokens/dlt.jwt` is not mounted.
+    lakekeeper_token: str
 
     @classmethod
     def from_env(cls) -> "BronzeIngestConfig":
         source_table = _env("BRONZE_SOURCE_TABLE", "orders")
+        token_file = _env("LAKEKEEPER_TOKEN_FILE", "")
+        lakekeeper_token = ""
+        if token_file and os.path.exists(token_file):
+            with open(token_file, encoding="utf-8") as f:
+                lakekeeper_token = f.read().strip()
         return cls(
             # `postgresql://`, not `postgres://` — this goes through
             # SQLAlchemy (dlt's `sql_database` source), which does not
@@ -110,6 +124,7 @@ class BronzeIngestConfig:
             rustfs_access_key=_env("RUSTFS_ACCESS_KEY", "rustfsadmin"),
             rustfs_secret_key=_env("RUSTFS_SECRET_KEY", "rustfsadmin"),
             warehouse_bucket=_env("LAKEHOUSE_WAREHOUSE_BUCKET", "lakehouse-warehouse"),
+            lakekeeper_token=lakekeeper_token,
         )
 
 
@@ -140,19 +155,24 @@ def _install_catalog_env(config: BronzeIngestConfig) -> None:
     """
     os.environ["ICEBERG_CATALOG__ICEBERG_CATALOG_NAME"] = "default"
     os.environ["ICEBERG_CATALOG__ICEBERG_CATALOG_TYPE"] = "rest"
-    os.environ["ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG"] = json.dumps(
-        {
-            "type": "rest",
-            "uri": config.lakekeeper_catalog_uri,
-            "warehouse": config.lakekeeper_warehouse,
-            "s3.endpoint": config.rustfs_endpoint,
-            "s3.access-key-id": config.rustfs_access_key,
-            "s3.secret-access-key": config.rustfs_secret_key,
-            "s3.region": "us-east-1",
-            "s3.path-style-access": "true",
-            "s3.force-virtual-addressing": "false",
-        }
-    )
+    catalog_config: dict[str, str] = {
+        "type": "rest",
+        "uri": config.lakekeeper_catalog_uri,
+        "warehouse": config.lakekeeper_warehouse,
+        "s3.endpoint": config.rustfs_endpoint,
+        "s3.access-key-id": config.rustfs_access_key,
+        "s3.secret-access-key": config.rustfs_secret_key,
+        "s3.region": "us-east-1",
+        "s3.path-style-access": "true",
+        "s3.force-virtual-addressing": "false",
+    }
+    if config.lakekeeper_token:
+        # R1 (ADR 0011): pyiceberg's `RestCatalog` accepts a raw static
+        # bearer `token` the same way `iceberg-catalog-rest` (Rust) does —
+        # sent as-is on every request, no OAuth2 exchange. `None`/absent
+        # on a pre-R1 or authz-disabled stack.
+        catalog_config["token"] = config.lakekeeper_token
+    os.environ["ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG"] = json.dumps(catalog_config)
 
 
 def _stamp_ingested_at(record: dict[str, Any]) -> dict[str, Any]:

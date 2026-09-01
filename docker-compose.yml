@@ -216,17 +216,153 @@ services:
 
   # P1 — one-shot: Lakekeeper's own `migrate` subcommand, not hand-written
   # DDL. Must complete before `lakekeeper` (serve) starts.
+  # R1 — `migrate` is also where Lakekeeper provisions its OpenFGA store
+  # and writes its authorization model (confirmed empirically: `serve`
+  # against an authz-backend=openfga config with no existing store fails
+  # closed with `StoreNotFound`, not a lazy auto-create — so `migrate` must
+  # run with the same `LAKEKEEPER__OPENFGA__*`/`LAKEKEEPER__AUTHZ_BACKEND`
+  # env this file's `lakekeeper` service uses, not just the Postgres vars
+  # every other phase needed). Depends on `openfga-ready`, not `openfga`
+  # itself — see that service's comment on why (distroless image, no
+  # `healthcheck:` possible).
   lakekeeper-migrate:
     image: quay.io/lakekeeper/catalog:v0.13.3
     depends_on:
       lakekeeper-db-init:
         condition: service_completed_successfully
+      openfga-ready:
+        condition: service_completed_successfully
     environment:
       LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_ENCRYPTION_KEY:-this-is-not-a-secure-key-change-me}
       LAKEKEEPER__PG_DATABASE_URL_READ: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
       LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
+      LAKEKEEPER__AUTHZ_BACKEND: openfga
+      LAKEKEEPER__OPENFGA__ENDPOINT: http://openfga:8081
+      LAKEKEEPER__OPENFGA__STORE_NAME: ${LAKEKEEPER_OPENFGA_STORE_NAME:-lakekeeper}
     command: ["migrate"]
     restart: "no"
+
+  # R1 — OpenFGA's own Postgres database, on the EXISTING `postgres`
+  # service. Mirrors `lakekeeper-db-init` exactly: a dedicated database, not
+  # a schema mixed into another service's database.
+  openfga-db-init:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGDATABASE: ${POSTGRES_DB:-lakehouse}
+      OPENFGA_PG_DB: ${OPENFGA_PG_DB:-openfga}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        psql -v ON_ERROR_STOP=1 -tc
+        "SELECT 1 FROM pg_database WHERE datname = '$${OPENFGA_PG_DB}'" |
+        grep -q 1 ||
+        psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$${OPENFGA_PG_DB}\""
+    restart: "no"
+
+  # R1 — one-shot: OpenFGA's own `migrate` subcommand (its schema, not
+  # hand-written DDL), mirroring `lakekeeper-migrate`. Must complete before
+  # `openfga` (run) starts.
+  openfga-migrate:
+    image: openfga/openfga:v1.8
+    depends_on:
+      openfga-db-init:
+        condition: service_completed_successfully
+    command:
+      - migrate
+      - --datastore-engine=postgres
+      - --datastore-uri=postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${OPENFGA_PG_DB:-openfga}?sslmode=disable
+    restart: "no"
+
+  # R1 — OpenFGA: Lakekeeper's native authorization backend (the
+  # alternative is an OPA bridge; OpenFGA is the choice made here — see
+  # ADR 0011 for the justification, in short: it is Lakekeeper's own
+  # first-class integration, ships its own Postgres-backed store like every
+  # other stateful service in this compose file, and needs no separate
+  # policy-authoring language on top of the relations Lakekeeper's
+  # Management API already exposes). Backed by its own database
+  # (`openfga-db-init`, above) on the existing `postgres` service, matching
+  # every other new-service convention in this file.
+  #
+  # `--playground-enabled=false`: this is a backend service, not a
+  # developer console; the Management API + `docs/adr/0011` are the
+  # interface operators use.
+  openfga:
+    image: openfga/openfga:v1.8
+    depends_on:
+      openfga-migrate:
+        condition: service_completed_successfully
+    command:
+      - run
+      - --datastore-engine=postgres
+      - --datastore-uri=postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${OPENFGA_PG_DB:-openfga}?sslmode=disable
+      - --http-addr=0.0.0.0:8080
+      - --grpc-addr=0.0.0.0:8081
+      - --playground-enabled=false
+    ports:
+      - "${OPENFGA_HTTP_HOST_PORT:-8082}:8080"
+      - "${OPENFGA_GRPC_HOST_PORT:-8083}:8081"
+    restart: unless-stopped
+
+  # R1 — `openfga`'s image is distroless (no shell, no wget/curl — verified
+  # empirically), so it cannot carry its own `healthcheck:` the way every
+  # other new service in this file does. This one-shot polls its HTTP
+  # `/healthz` from a real shell image instead, and everything that needs
+  # OpenFGA actually reachable (`lakekeeper`) depends on THIS completing,
+  # not on `openfga` itself reporting healthy.
+  openfga-ready:
+    image: curlimages/curl:8.10.1
+    depends_on:
+      openfga:
+        condition: service_started
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        for i in $$(seq 1 30); do
+          curl -fsS http://openfga:8080/healthz && exit 0;
+          sleep 1;
+        done;
+        exit 1
+    restart: "no"
+
+  # R1 — mock OIDC discovery + JWKS issuer. Lakekeeper's ONLY generic
+  # (non-Trino, non-Kubernetes) authentication mechanism is OIDC bearer
+  # tokens validated against `openid_provider_uri`'s discovery document —
+  # confirmed by inspecting the shipped binary's config surface (there is
+  # no "static API key" or "client-credentials" authn mode). This service
+  # is not a real identity provider: it generates one RSA keypair and
+  # pre-mints one long-lived token per principal this build needs
+  # (`ops/oidc-mock/server.py`'s `PRINCIPALS`) into the
+  # `lakehouse_oidc_tokens` volume, which every writer below mounts
+  # read-only and reads its own token from directly — no login flow, no
+  # token refresh. See ADR 0011 for why this simplification is acceptable
+  # for a self-hosted dev/CI stack and what a production deployment would
+  # need instead (a real IdP).
+  oidc-mock:
+    build:
+      context: ./ops/oidc-mock
+    environment:
+      OIDC_MOCK_ISSUER: http://oidc-mock:8090
+      OIDC_MOCK_AUDIENCE: lakekeeper
+      OIDC_MOCK_PORT: "8090"
+    ports:
+      - "${OIDC_MOCK_HOST_PORT:-8090}:8090"
+    volumes:
+      - lakehouse_oidc_data:/data
+      - lakehouse_oidc_tokens:/tokens
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/.well-known/openid-configuration', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
 
   # P1 — Iceberg REST catalog (Rust, Apache-2.0). Only path for Iceberg
   # writes — no path-based `IcebergS3` tables in product code. Backed by
@@ -239,6 +375,13 @@ services:
   # out; it does not affect `lakehouse-api`'s own boot or its existing
   # Postgres/ClickHouse-backed routes, which have no dependency on this
   # service in this phase.
+  #
+  # R1 — authorization enforced by default, not profile-gated: `openfga`
+  # (relation storage) + `oidc-mock` (principal identity) below are core
+  # services now, and this container will not become healthy until both
+  # are. See ADR 0011 for the default-posture decision — leaving
+  # enforcement opt-in was exactly how `allow-all` shipped as this stack's
+  # default for five phases; the shipped default must be the secure one.
   lakekeeper:
     image: quay.io/lakekeeper/catalog:v0.13.3
     # Empty search domain: on hosts whose own /etc/resolv.conf carries a
@@ -252,11 +395,27 @@ services:
     depends_on:
       lakekeeper-migrate:
         condition: service_completed_successfully
+      openfga-ready:
+        condition: service_completed_successfully
+      oidc-mock:
+        condition: service_healthy
     environment:
       LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_ENCRYPTION_KEY:-this-is-not-a-secure-key-change-me}
       LAKEKEEPER__PG_DATABASE_URL_READ: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
       LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
       LAKEKEEPER__BASE_URI: ${LAKEKEEPER_BASE_URI:-http://localhost:8181}
+      # R1 — authorization: OpenFGA backend, OIDC-identified principals.
+      # `LAKEKEEPER__INSTANCE_ADMINS` bootstraps a full-access identity
+      # (the `admin` principal minted by `oidc-mock`) so the one-shot init
+      # jobs below can bootstrap the server and grant every other
+      # principal without a chicken-and-egg "who grants the first grant"
+      # problem — see ADR 0011.
+      LAKEKEEPER__AUTHZ_BACKEND: openfga
+      LAKEKEEPER__OPENFGA__ENDPOINT: http://openfga:8081
+      LAKEKEEPER__OPENFGA__STORE_NAME: ${LAKEKEEPER_OPENFGA_STORE_NAME:-lakekeeper}
+      LAKEKEEPER__OPENID_PROVIDER_URI: http://oidc-mock:8090
+      LAKEKEEPER__OPENID_AUDIENCE: lakekeeper
+      LAKEKEEPER__INSTANCE_ADMINS: '["oidc~admin"]'
     command: ["serve"]
     ports:
       - "${LAKEKEEPER_HOST_PORT:-8181}:8181"
@@ -288,6 +447,16 @@ services:
   # real IAM identity, so the placeholder ARN below is sufficient for a
   # local/CI RustFS-backed warehouse; a real AWS S3 deployment would need a
   # real assumable role instead.
+  # R1 — `Authorization: Bearer $$(cat /tokens/admin.jwt)` on every call:
+  # under enforcement, `bootstrap` and `warehouse` creation are
+  # control-plane actions that need SOME authenticated identity.
+  # `LAKEKEEPER__INSTANCE_ADMINS: '["oidc~admin"]'` (the `lakekeeper`
+  # service's env) makes the `admin` principal bypass authorization for
+  # control-plane actions, so it can bootstrap and create the warehouse
+  # with no prior grant — confirmed empirically: `POST /management/v1/
+  # bootstrap` also self-registers its caller as a Lakekeeper `User`, so
+  # no separate self-registration call is needed for `admin` here (unlike
+  # the other principals, see `lakekeeper-authz-init` below).
   lakekeeper-warehouse-init:
     image: alpine:3.20
     depends_on:
@@ -295,29 +464,35 @@ services:
         condition: service_healthy
       rustfs-bucket-init:
         condition: service_completed_successfully
+      oidc-mock:
+        condition: service_healthy
     environment:
       LAKEKEEPER_BASE_URI: ${LAKEKEEPER_BASE_URI:-http://localhost:8181}
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+    volumes:
+      - lakehouse_oidc_tokens:/tokens:ro
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -eu
         apk add --no-cache curl jq >/dev/null
         base="http://lakekeeper:8181"
-        already=$$(curl -fsS "$$base/management/v1/info" | jq -r '.bootstrapped')
+        admin_token="$$(cat /tokens/admin.jwt)"
+        auth="Authorization: Bearer $$admin_token"
+        already=$$(curl -fsS -H "$$auth" "$$base/management/v1/info" | jq -r '.bootstrapped')
         if [ "$$already" != "true" ]; then
-          curl -fsS -X POST "$$base/management/v1/bootstrap" \
+          curl -fsS -X POST -H "$$auth" "$$base/management/v1/bootstrap" \
             -H 'Content-Type: application/json' \
             -d '{"accept-terms-of-use": true}'
         fi
-        exists=$$(curl -fsS "$$base/management/v1/warehouse" | \
+        exists=$$(curl -fsS -H "$$auth" "$$base/management/v1/warehouse" | \
           jq -r --arg name "$$LAKEKEEPER_WAREHOUSE" \
           '.warehouses[]? | select(.name == $$name) | .name')
         if [ "$$exists" != "$$LAKEKEEPER_WAREHOUSE" ]; then
-          curl -fsS -X POST "$$base/management/v1/warehouse" \
+          curl -fsS -X POST -H "$$auth" "$$base/management/v1/warehouse" \
             -H 'Content-Type: application/json' \
             -d '{
               "warehouse-name": "'"$$LAKEKEEPER_WAREHOUSE"'",
@@ -338,6 +513,91 @@ services:
               }
             }'
         fi
+    restart: "no"
+
+  # R1 — one-shot: self-register every non-admin principal
+  # (`ops/oidc-mock/server.py`'s `PRINCIPALS`) as a Lakekeeper `User` (each
+  # principal must call `POST /management/v1/user` WITH ITS OWN token —
+  # Lakekeeper derives the user id from the caller's token, so `admin`
+  # cannot register on another principal's behalf), then grant the ones
+  # this build's writers actually need on the `LAKEKEEPER_WAREHOUSE`
+  # warehouse via `POST /management/v1/permissions/warehouse/{id}/
+  # assignments`. See ADR 0011 for the relation choices and why
+  # `unauthorized-test` is deliberately left with none.
+  #
+  # Grants (warehouse-scoped, per ADR 0003's "isolation enforced once, at
+  # the warehouse boundary"):
+  #   - `rust-iceberg` (G1: create Bronze tables, append via vended
+  #     credentials): create, modify, select.
+  #   - `debezium` (P5 CDC into Bronze via `debezium-server-iceberg`):
+  #     create, modify, select — it creates the table on first snapshot
+  #     write, same as `rust-iceberg`.
+  #   - `dlt` (P3 dlt pipeline, Dagster code location): create, modify,
+  #     select — same shape, it is also a Bronze table writer.
+  #   - `clickhouse-reader` (every gate's ClickHouse read path, PLUS the
+  #     P4 maintenance job's `expire_snapshots` — see
+  #     `dagster/dispar_orchestrate/maintenance.py`): select AND modify.
+  #     `modify` is a deliberate, narrow over-grant beyond "read path":
+  #     `expire_snapshots` is a genuine catalog metadata WRITE, and it is
+  #     the one ClickHouse write verb that does work on this ClickHouse
+  #     version (`docs/plans/G3-RESULT.md`) — `CREATE TABLE`/`INSERT`
+  #     still do not (G1-RESULT.md). A fifth principal
+  #     (`clickhouse-maintenance`) scoped to `modify` only was not worth
+  #     the added compose/oidc-mock complexity for this build; noted here
+  #     rather than silently granting it. No `create`: nothing in this
+  #     build has ClickHouse creating Bronze tables.
+  #   - `unauthorized-test`: registered (Lakekeeper knows who it is) but
+  #     NEVER granted anything — the negative-test principal.
+  lakekeeper-authz-init:
+    image: alpine:3.20
+    depends_on:
+      lakekeeper-warehouse-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+    volumes:
+      - lakehouse_oidc_tokens:/tokens:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        apk add --no-cache curl jq >/dev/null
+        base="http://lakekeeper:8181"
+        admin_token="$$(cat /tokens/admin.jwt)"
+        admin_auth="Authorization: Bearer $$admin_token"
+
+        for principal in rust-iceberg debezium dlt clickhouse-reader unauthorized-test; do
+          ptoken="$$(cat /tokens/$$principal.jwt)"
+          code=$$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $$ptoken" -H 'Content-Type: application/json' \
+            -d '{}' "$$base/management/v1/user")
+          # 201 created, 409 already registered by a previous run — both fine.
+          case "$$code" in 201|409) ;; *) echo "self-register $$principal failed: HTTP $$code" >&2; exit 1 ;; esac
+        done
+
+        wh_id=$$(curl -fsS -H "$$admin_auth" "$$base/management/v1/warehouse" | \
+          jq -r --arg name "$$LAKEKEEPER_WAREHOUSE" '.warehouses[]? | select(.name == $$name) | .id')
+        if [ -z "$$wh_id" ]; then
+          echo "warehouse $$LAKEKEEPER_WAREHOUSE not found" >&2
+          exit 1
+        fi
+
+        grant() {
+          user="$$1"; shift
+          writes="$$(printf '{"type":"%s","user":"oidc~'"$$user"'"},' "$$@" | sed 's/,$$//')"
+          code=$$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$$admin_auth" \
+            -H 'Content-Type: application/json' \
+            -d '{"writes":['"$$writes"']}' \
+            "$$base/management/v1/permissions/warehouse/$$wh_id/assignments")
+          # 204 granted, 409 an identical tuple already exists (re-running
+          # this job against an already-granted stack) — both fine.
+          case "$$code" in 204|409) ;; *) echo "grant $$user failed: HTTP $$code" >&2; exit 1 ;; esac
+        }
+        grant rust-iceberg create modify select
+        grant debezium create modify select
+        grant dlt create modify select
+        grant clickhouse-reader select modify
+        # unauthorized-test: deliberately no grant call.
     restart: "no"
 
   # P2 — runs the G1 acceptance suite
@@ -378,10 +638,11 @@ services:
       - ./rust:/workspace
       - lakehouse_g1_cargo_registry:/usr/local/cargo/registry
       - lakehouse_g1_target:/workspace/target
+      - lakehouse_oidc_tokens:/tokens:ro
     depends_on:
       clickhouse:
         condition: service_healthy
-      lakekeeper-warehouse-init:
+      lakekeeper-authz-init:
         condition: service_completed_successfully
     environment:
       # These four all resolve from INSIDE the compose network (this
@@ -396,12 +657,17 @@ services:
       CH_URL: http://clickhouse:8123
       CH_USER: ${CH_USER:-default}
       CH_PASSWORD: ${CH_PASSWORD:-}
+      CH_OAUTH_CLIENT_ID: clickhouse-reader
+      CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
         set -eu &&
         apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev >/dev/null &&
-        cargo test -p lakehouse-iceberg --test g1_lakekeeper --locked -- --ignored --nocapture g1_half_a
+        export LAKEKEEPER_TOKEN="$$(cat /tokens/rust-iceberg.jwt)" &&
+        export LAKEKEEPER_UNAUTHORIZED_TOKEN="$$(cat /tokens/unauthorized-test.jwt)" &&
+        cargo test -p lakehouse-iceberg --test g1_lakekeeper --locked -- --ignored --nocapture g1_half_a &&
+        cargo test -p lakehouse-iceberg --test g1_lakekeeper --locked -- --ignored --nocapture g1_negative
     restart: "no"
 
   # P2 (G2) — SeaweedFS: a second S3-compatible store used to prove the
@@ -501,28 +767,34 @@ services:
         condition: service_healthy
       seaweedfs-bucket-init:
         condition: service_completed_successfully
+      oidc-mock:
+        condition: service_healthy
     environment:
       LAKEKEEPER_WAREHOUSE: seaweedfs
       LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
       SEAWEEDFS_ACCESS_KEY: ${SEAWEEDFS_ACCESS_KEY:-seaweedfsadmin}
       SEAWEEDFS_SECRET_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfsadmin}
+    volumes:
+      - lakehouse_oidc_tokens:/tokens:ro
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -eu
         apk add --no-cache curl jq >/dev/null
         base="http://lakekeeper:8181"
-        already=$$(curl -fsS "$$base/management/v1/info" | jq -r '.bootstrapped')
+        admin_token="$$(cat /tokens/admin.jwt)"
+        auth="Authorization: Bearer $$admin_token"
+        already=$$(curl -fsS -H "$$auth" "$$base/management/v1/info" | jq -r '.bootstrapped')
         if [ "$$already" != "true" ]; then
-          curl -fsS -X POST "$$base/management/v1/bootstrap" \
+          curl -fsS -X POST -H "$$auth" "$$base/management/v1/bootstrap" \
             -H 'Content-Type: application/json' \
             -d '{"accept-terms-of-use": true}'
         fi
-        exists=$$(curl -fsS "$$base/management/v1/warehouse" | \
+        exists=$$(curl -fsS -H "$$auth" "$$base/management/v1/warehouse" | \
           jq -r --arg name "$$LAKEKEEPER_WAREHOUSE" \
           '.warehouses[]? | select(.name == $$name) | .name')
         if [ "$$exists" != "$$LAKEKEEPER_WAREHOUSE" ]; then
-          curl -fsS -X POST "$$base/management/v1/warehouse" \
+          curl -fsS -X POST -H "$$auth" "$$base/management/v1/warehouse" \
             -H 'Content-Type: application/json' \
             -d '{
               "warehouse-name": "'"$$LAKEKEEPER_WAREHOUSE"'",
@@ -543,6 +815,51 @@ services:
               }
             }'
         fi
+    restart: "no"
+
+  # R1 (ADR 0011) — grants for the SEAWEEDFS warehouse. Grants are
+  # per-warehouse-id (ADR 0003: isolation enforced at the warehouse
+  # boundary), so the `default`/RustFS grants `lakekeeper-authz-init` makes
+  # do not cover this second, G2-only warehouse — mirrors
+  # `lakekeeper-warehouse-init-seaweedfs` being a near-duplicate of
+  # `lakekeeper-warehouse-init` for the same reason. Principals are already
+  # self-registered by `lakekeeper-authz-init` (registration is global, not
+  # per-warehouse); this job only grants.
+  lakekeeper-authz-init-seaweedfs:
+    profiles: ["seaweedfs"]
+    image: alpine:3.20
+    depends_on:
+      lakekeeper-warehouse-init-seaweedfs:
+        condition: service_completed_successfully
+      lakekeeper-authz-init:
+        condition: service_completed_successfully
+    volumes:
+      - lakehouse_oidc_tokens:/tokens:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        apk add --no-cache curl jq >/dev/null
+        base="http://lakekeeper:8181"
+        admin_token="$$(cat /tokens/admin.jwt)"
+        admin_auth="Authorization: Bearer $$admin_token"
+        wh_id=$$(curl -fsS -H "$$admin_auth" "$$base/management/v1/warehouse" | \
+          jq -r '.warehouses[]? | select(.name == "seaweedfs") | .id')
+        if [ -z "$$wh_id" ]; then
+          echo "warehouse seaweedfs not found" >&2
+          exit 1
+        fi
+        grant() {
+          user="$$1"; shift
+          writes="$$(printf '{"type":"%s","user":"oidc~'"$$user"'"},' "$$@" | sed 's/,$$//')"
+          code=$$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$$admin_auth" \
+            -H 'Content-Type: application/json' \
+            -d '{"writes":['"$$writes"']}' \
+            "$$base/management/v1/permissions/warehouse/$$wh_id/assignments")
+          case "$$code" in 204|409) ;; *) echo "grant $$user failed: HTTP $$code" >&2; exit 1 ;; esac
+        }
+        grant rust-iceberg create modify select
+        grant clickhouse-reader select modify
     restart: "no"
 
   # P3 (G3a) — Dagster's own run/event-log/schedule storage, on the
@@ -588,8 +905,10 @@ services:
     depends_on:
       dagster-db-init:
         condition: service_completed_successfully
-      lakekeeper-warehouse-init:
+      lakekeeper-authz-init:
         condition: service_completed_successfully
+    volumes:
+      - lakehouse_oidc_tokens:/tokens:ro
     environment:
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
@@ -606,6 +925,13 @@ services:
       BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
       LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      # R1 (ADR 0011): the `dlt` principal's pre-minted token, read from
+      # this file at run time by `dlt_pipeline.py`'s `BronzeIngestConfig`
+      # — see that module for why a file, not an env var directly (this
+      # container's `command:` is a fixed exec array, not a shell script,
+      # so there is no step to interpolate a file into an env var before
+      # `dagster api grpc` starts).
+      LAKEKEEPER_TOKEN_FILE: /tokens/dlt.jwt
       CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
@@ -613,6 +939,10 @@ services:
       CH_URL: ${CH_URL:-http://clickhouse:8123}
       CH_USER: ${CH_USER:-default}
       CH_PASSWORD: ${CH_PASSWORD:-}
+      # R1 (ADR 0011): `maintenance.py`'s `expire_snapshots` write path —
+      # see that module's `MaintenanceConfig.ch_auth_settings`.
+      CH_OAUTH_CLIENT_ID: clickhouse-reader
+      CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
     command: ["dagster", "api", "grpc", "-h", "0.0.0.0", "-p", "4000", "-m", "dispar_orchestrate.definitions"]
     restart: unless-stopped
 
@@ -757,6 +1087,11 @@ services:
       CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
+      # R1 (ADR 0011): see `ops/g3a/g3a_test.py`'s module-level comment —
+      # ClickHouse's read path authenticates as `clickhouse-reader` via
+      # OAuth2 client-credentials against `ops/oidc-mock`'s `/token`.
+      CH_OAUTH_CLIENT_ID: clickhouse-reader
+      CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "pip install -q requests && python g3a_test.py"
@@ -807,6 +1142,15 @@ services:
   # single-node Trino, scoped to ONE catalog (`iceberg`, rendered below at
   # container start) — it never touches Silver/Gold (ClickHouse MergeTree,
   # not Iceberg).
+  # R1 (ADR 0011) gap, noted rather than silently left: `trino` is not one
+  # of the principals `lakekeeper-authz-init` grants. It was out of scope
+  # for R1's re-run list (the task's five gates do not exercise the
+  # `trino` profile), and Trino's own identity story (per-user impersonation
+  # vs. one static service identity) is a real design question this build
+  # has not made yet. Today: any catalog call `trino`/
+  # `trino-maintenance-cron` makes will be DENIED under enforcement — the
+  # `trino` profile is not usable together with R1 authorization until a
+  # principal is minted and granted for it, mirroring the others below.
   trino:
     profiles: ["trino"]
     image: trinodb/trino:483
@@ -944,7 +1288,7 @@ services:
     depends_on:
       g4-source-init:
         condition: service_completed_successfully
-      lakekeeper-warehouse-init:
+      lakekeeper-authz-init:
         condition: service_completed_successfully
     environment:
       LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
@@ -957,20 +1301,30 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
     volumes:
       - lakehouse_debezium_data:/debezium/data
+      - lakehouse_oidc_tokens:/tokens:ro
     # Same reason `trino`'s command renders its catalog properties inline:
     # the base image has no templating tool, so `sh` interpolates this
     # container's own `environment:` values directly. `$$` stops compose's
     # OWN `${VAR}` interpolation at parse time so the literal reaches this
-    # container's shell.
+    # container's shell. R1 (ADR 0011): `LAKEKEEPER_TOKEN` is read from the
+    # `debezium` principal's pre-minted token file (mounted read-only
+    # above, same file `lakekeeper-authz-init` granted create/modify/select
+    # to) and rendered into `debezium.sink.iceberg.token` — the standard
+    # Apache Iceberg Java REST catalog client's static-bearer-token
+    # property (same mechanism as `iceberg-catalog-rest`'s `token` and
+    # pyiceberg's `token`, per the Iceberg REST spec).
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
+        set -eu
+        LAKEKEEPER_TOKEN="$$(cat /tokens/debezium.jwt 2>/dev/null || true)"
         mkdir -p /debezium/config && cat > /debezium/config/application.properties <<EOF
         debezium.sink.type=iceberg
         debezium.sink.iceberg.catalog-name=lakekeeper
         debezium.sink.iceberg.type=rest
         debezium.sink.iceberg.uri=$${LAKEKEEPER_CATALOG_URI}
         debezium.sink.iceberg.warehouse=$${LAKEKEEPER_WAREHOUSE}
+        debezium.sink.iceberg.token=$${LAKEKEEPER_TOKEN}
         debezium.sink.iceberg.io-impl=org.apache.iceberg.aws.s3.S3FileIO
         debezium.sink.iceberg.s3.endpoint=$${CH_RUSTFS_S3_ENDPOINT}
         debezium.sink.iceberg.s3.path-style-access=true
@@ -1043,6 +1397,9 @@ services:
       CH_LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
       CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      # R1 (ADR 0011): see `ops/g3a/g3a_test.py`'s module-level comment.
+      CH_OAUTH_CLIENT_ID: clickhouse-reader
+      CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
       PGHOST: postgres
       PGPORT: "5432"
       PGUSER: ${POSTGRES_USER:-lakehouse}
@@ -1061,3 +1418,5 @@ volumes:
   lakehouse_g1_cargo_registry:
   lakehouse_g1_target:
   lakehouse_debezium_data:
+  lakehouse_oidc_data:
+  lakehouse_oidc_tokens:

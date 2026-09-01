@@ -50,6 +50,21 @@ CH_PASSWORD = os.environ.get("CH_PASSWORD", "")
 LAKEKEEPER_CATALOG_URI = os.environ.get("CH_LAKEKEEPER_CATALOG_URI", "http://lakekeeper:8181/catalog")
 RUSTFS_S3_ENDPOINT = os.environ.get("CH_RUSTFS_S3_ENDPOINT", "http://rustfs:9000")
 LAKEKEEPER_WAREHOUSE = os.environ.get("LAKEKEEPER_WAREHOUSE", "default")
+# R1 (ADR 0011): see `ops/g3a/g3a_test.py`'s identical comment —
+# `catalog_credential` needs the OAuth2 `client_id:client_secret` form,
+# pointed at `ops/oidc-mock`'s `/token` endpoint. Empty on a pre-R1 or
+# authz-disabled stack.
+CH_OAUTH_CLIENT_ID = os.environ.get("CH_OAUTH_CLIENT_ID", "")
+CH_OAUTH_SERVER_URI = os.environ.get("CH_OAUTH_SERVER_URI", "")
+
+
+def ch_auth_settings() -> str:
+    if not CH_OAUTH_CLIENT_ID:
+        return ""
+    return (
+        f", catalog_credential = '{CH_OAUTH_CLIENT_ID}:unused', "
+        f"oauth_server_uri = '{CH_OAUTH_SERVER_URI}'"
+    )
 
 CATALOG_DB = "icecat_g4"
 TABLE = "`default.p5cdc_p5_cdc_orders`"
@@ -109,7 +124,7 @@ def step_create_catalog_database() -> None:
         f"CREATE DATABASE IF NOT EXISTS {CATALOG_DB} "
         f"ENGINE = DataLakeCatalog('{LAKEKEEPER_CATALOG_URI}') "
         f"SETTINGS catalog_type = 'rest', warehouse = '{LAKEKEEPER_WAREHOUSE}', "
-        f"storage_endpoint = '{RUSTFS_S3_ENDPOINT}' "
+        f"storage_endpoint = '{RUSTFS_S3_ENDPOINT}'{ch_auth_settings()} "
         "SETTINGS allow_database_iceberg = 1"
     )
 

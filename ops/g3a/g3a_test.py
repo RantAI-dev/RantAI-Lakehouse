@@ -39,6 +39,22 @@ JOB_NAME = os.environ.get("BRONZE_JOB_NAME", "bronze_ingest_job")
 BRONZE_TABLE_NAME = os.environ.get("BRONZE_TABLE_NAME", "g3a_orders")
 AUTH_EMAIL = os.environ.get("AUTH_BOOTSTRAP_EMAIL", "ci@example.com")
 AUTH_PASSWORD = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "ci-password-not-real-123")
+# R1 (ADR 0011): ClickHouse's `catalog_credential` setting only accepts the
+# Iceberg REST spec's OAuth2 `client_id:client_secret` form, never a raw
+# static token — `CH_OAUTH_SERVER_URI` points it at `ops/oidc-mock`'s
+# `/token` endpoint instead of Lakekeeper's own (unverified) one. Empty on
+# a pre-R1 or authz-disabled stack, where no auth settings are added.
+CH_OAUTH_CLIENT_ID = os.environ.get("CH_OAUTH_CLIENT_ID", "")
+CH_OAUTH_SERVER_URI = os.environ.get("CH_OAUTH_SERVER_URI", "")
+
+
+def ch_auth_settings() -> str:
+    if not CH_OAUTH_CLIENT_ID:
+        return ""
+    return (
+        f", catalog_credential = '{CH_OAUTH_CLIENT_ID}:unused', "
+        f"oauth_server_uri = '{CH_OAUTH_SERVER_URI}'"
+    )
 
 # One session for every `lakehouse-api` call after login, so the session
 # cookie `POST /api/auth/login` sets is carried on every subsequent
@@ -188,7 +204,7 @@ def step_verify_rows_in_clickhouse() -> int:
         "CREATE DATABASE IF NOT EXISTS icecat_g3a "
         f"ENGINE = DataLakeCatalog('{LAKEKEEPER_CATALOG_URI}') "
         f"SETTINGS catalog_type = 'rest', warehouse = '{LAKEKEEPER_WAREHOUSE}', "
-        f"storage_endpoint = '{CH_RUSTFS_S3_ENDPOINT}' "
+        f"storage_endpoint = '{CH_RUSTFS_S3_ENDPOINT}'{ch_auth_settings()} "
         "SETTINGS allow_database_iceberg = 1"
     )
     count_text = ch_query(

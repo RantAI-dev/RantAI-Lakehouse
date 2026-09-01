@@ -118,6 +118,24 @@ struct G1Env {
     ch_url: String,
     ch_user: String,
     ch_password: String,
+    /// R1 (ADR 0011): this crate's own bearer token — the `rust-iceberg`
+    /// principal, granted `create`/`modify`/`select` on the warehouse.
+    /// Empty string when unset (`IcebergClientConfig::catalog_token`
+    /// treats an empty token the same as `None` via `Self::token_or_none`
+    /// below), which is what a pre-R1 or authz-disabled stack looks like.
+    catalog_token: String,
+    /// R1 (ADR 0011): the `clickhouse-reader` principal's token, granted
+    /// `select` only. Used with `oauth_server_uri` pointed at
+    /// `ops/oidc-mock`'s `/token` endpoint — `ClickHouse`'s
+    /// `catalog_credential` setting only accepts the Iceberg REST spec's
+    /// `client_id:client_secret` `OAuth2` form (measured empirically; see
+    /// ADR 0011), never a raw static token the way this crate's own
+    /// `token` property does.
+    ch_oauth_client_id: String,
+    ch_oauth_server_uri: String,
+    /// R1 (ADR 0011): the negative-test principal — self-registered with
+    /// Lakekeeper but never granted any relation on the warehouse.
+    unauthorized_token: String,
 }
 
 impl G1Env {
@@ -133,6 +151,20 @@ impl G1Env {
             ch_url: env_or("CH_URL", "http://localhost:8123"),
             ch_user: env_or("CH_USER", "default"),
             ch_password: env_or("CH_PASSWORD", ""),
+            catalog_token: env_or("LAKEKEEPER_TOKEN", ""),
+            ch_oauth_client_id: env_or("CH_OAUTH_CLIENT_ID", "clickhouse-reader"),
+            ch_oauth_server_uri: env_or("CH_OAUTH_SERVER_URI", "http://oidc-mock:8090/token"),
+            unauthorized_token: env_or("LAKEKEEPER_UNAUTHORIZED_TOKEN", ""),
+        }
+    }
+
+    /// `IcebergClientConfig::catalog_token` wants `None`, not `Some("")`,
+    /// on a stack that isn't running R1's authorization at all.
+    fn token_or_none(token: &str) -> Option<lakehouse_core::secret::SecretValue> {
+        if token.trim().is_empty() {
+            None
+        } else {
+            Some(lakehouse_core::secret::SecretValue::new(token.to_owned()))
         }
     }
 }
@@ -214,6 +246,7 @@ async fn g1_half_a_rust_writes_clickhouse_reads() {
         catalog_uri: env.catalog_uri.clone(),
         warehouse: env.warehouse.clone(),
         catalog_credential: None,
+        catalog_token: G1Env::token_or_none(&env.catalog_token),
     })
     .await
     .expect("connect to Lakekeeper");
@@ -247,13 +280,28 @@ async fn g1_half_a_rust_writes_clickhouse_reads() {
         .expect("append using Lakekeeper-vended credentials");
 
     // ClickHouse side: a DataLakeCatalog database over the same Lakekeeper
-    // warehouse, reading the table Rust just wrote.
+    // warehouse, reading the table Rust just wrote. R1 (ADR 0011): when
+    // Lakekeeper authorization is enforced, ClickHouse authenticates as
+    // the `clickhouse-reader` principal (`select`-only) via the Iceberg
+    // REST spec's OAuth2 client-credentials form — `catalog_credential`
+    // does not accept a raw bearer token here (measured; see ADR 0011),
+    // so `oauth_server_uri` points at `ops/oidc-mock`'s `/token` endpoint
+    // instead of Lakekeeper's own (unverified) `/v1/oauth/tokens`.
     let ch_db = "g1_lakekeeper_a";
+    let ch_auth_settings = if env.catalog_token.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            ", catalog_credential = '{client_id}:unused', oauth_server_uri = '{oauth_uri}'",
+            client_id = env.ch_oauth_client_id,
+            oauth_uri = env.ch_oauth_server_uri,
+        )
+    };
     let create_db_sql = format!(
         "CREATE DATABASE IF NOT EXISTS {ch_db} \
          ENGINE = DataLakeCatalog('{catalog_uri}') \
          SETTINGS catalog_type = 'rest', warehouse = '{warehouse}', \
-         storage_endpoint = '{storage_endpoint}' \
+         storage_endpoint = '{storage_endpoint}'{ch_auth_settings} \
          SETTINGS allow_database_iceberg = 1",
         catalog_uri = env.ch_catalog_uri,
         warehouse = env.warehouse,
@@ -323,6 +371,7 @@ async fn g1_half_b_clickhouse_writes_rust_reads() {
         catalog_uri: env.catalog_uri.clone(),
         warehouse: env.warehouse.clone(),
         catalog_credential: None,
+        catalog_token: G1Env::token_or_none(&env.catalog_token),
     })
     .await
     .expect("connect to Lakekeeper");
@@ -359,5 +408,54 @@ async fn g1_half_b_clickhouse_writes_rust_reads() {
     assert!(
         seen_ids.contains(&1) && seen_ids.contains(&2),
         "seen_ids = {seen_ids:?}"
+    );
+}
+
+/// R1 (ADR 0011) negative test: a principal with NO grant on the
+/// warehouse must be **denied**, proving enforcement is real rather than
+/// merely configured. `unauthorized-test` (see `ops/oidc-mock/server.py`'s
+/// `PRINCIPALS`) is self-registered with Lakekeeper by
+/// `lakekeeper-authz-init` — Lakekeeper knows who it is — but never
+/// receives a `POST /management/v1/permissions/warehouse/{id}/assignments`
+/// grant. Skipped (not `#[ignore]`d silently-pass) when
+/// `LAKEKEEPER_UNAUTHORIZED_TOKEN` is unset, i.e. against a pre-R1 or
+/// authz-disabled stack, where this scenario does not apply.
+#[tokio::test]
+#[ignore = "needs a live docker compose stack with R1 authorization enabled; see this file's module doc"]
+async fn g1_negative_ungranted_principal_is_denied() {
+    let env = G1Env::from_process_env();
+    assert!(
+        !env.unauthorized_token.trim().is_empty(),
+        "LAKEKEEPER_UNAUTHORIZED_TOKEN must be set to run this test — it only applies \
+         to a stack with R1 authorization enabled"
+    );
+
+    let client = IcebergClient::connect(&IcebergClientConfig {
+        catalog_uri: env.catalog_uri.clone(),
+        warehouse: env.warehouse.clone(),
+        catalog_credential: None,
+        catalog_token: G1Env::token_or_none(&env.unauthorized_token),
+    })
+    .await
+    .expect("connect to Lakekeeper (connecting itself does not touch the warehouse)");
+
+    // Any metadata write is denied — `ensure_bronze_namespace` is the
+    // cheapest one this crate exposes. Capture and print the ACTUAL
+    // denial error, not just assert failure, per the task's own
+    // instruction that this is the headline proof.
+    let result = client.ensure_bronze_namespace().await;
+    let err = result.expect_err(
+        "expected the ungranted `unauthorized-test` principal to be DENIED creating a \
+         namespace, but the call succeeded — authorization is not actually enforced",
+    );
+    println!("g1_negative: captured denial error: {err}");
+    let message = err.to_string();
+    assert!(
+        message.contains("403")
+            || message.contains("404")
+            || message.to_lowercase().contains("forbidden")
+            || message.to_lowercase().contains("not exist")
+            || message.to_lowercase().contains("not found"),
+        "expected an authorization-denial-shaped error (403/404/forbidden/not found), got: {message}"
     );
 }
