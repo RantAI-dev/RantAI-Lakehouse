@@ -19,7 +19,6 @@ actually broken rather than sharing a bug with it.
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 import time
@@ -38,8 +37,6 @@ LAKEKEEPER_WAREHOUSE = os.environ.get("LAKEKEEPER_WAREHOUSE", "default")
 CH_RUSTFS_S3_ENDPOINT = os.environ.get("CH_RUSTFS_S3_ENDPOINT", "http://rustfs:9000")
 JOB_NAME = os.environ.get("BRONZE_JOB_NAME", "bronze_ingest_job")
 BRONZE_TABLE_NAME = os.environ.get("BRONZE_TABLE_NAME", "g3a_orders")
-SOURCE_SCHEMA = os.environ.get("BRONZE_SOURCE_SCHEMA", "ingest_demo")
-SOURCE_TABLE = os.environ.get("BRONZE_SOURCE_TABLE", "orders")
 AUTH_EMAIL = os.environ.get("AUTH_BOOTSTRAP_EMAIL", "ci@example.com")
 AUTH_PASSWORD = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "ci-password-not-real-123")
 

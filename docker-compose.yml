@@ -742,8 +742,6 @@ services:
       CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
-      BRONZE_SOURCE_SCHEMA: ${BRONZE_SOURCE_SCHEMA:-ingest_demo}
-      BRONZE_SOURCE_TABLE: ${BRONZE_SOURCE_TABLE:-orders}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "pip install -q requests && python g3a_test.py"
