@@ -129,6 +129,65 @@ name resolution` — then restart-loops. `docker-compose.yml` sets
 search-domain expansion; this was reproduced and confirmed as the fix
 during P1a verification.
 
+### Dagster (opt-in, P3)
+
+Behind the `dagster` compose profile — never starts on a plain `docker
+compose up`. Brings up `dagster-db-init` (one-shot: creates Dagster's own
+`dagster` database on the existing `postgres` service), `dagster-code-location`
+(a gRPC server serving `dispar_orchestrate.definitions`, built from
+`dagster/Dockerfile` — see ADR 0005), `dagster-webserver` (GraphQL API +
+UI, port `3000`), and `dagster-daemon` (schedules/sensors/run queueing).
+
+```bash
+DAGSTER_URL=http://dagster-webserver:3000/graphql \
+  docker compose --profile dagster up -d --build \
+    lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+```
+
+`DAGSTER_URL` must be exported (or set in `.env`) **before** bringing
+`lakehouse-api` up with the `dagster` profile — its own default
+(`http://dagster.invalid:13030/graphql`) is a deliberately-unreachable
+placeholder (see the service definition's comment), so pipeline routes
+stay `503` unless an operator opts in explicitly.
+
+**Failure mode:** if `dagster-webserver`/`dagster-code-location` are down,
+`lakehouse-dagster::DgClient` calls fail exactly the way they already do
+when `DAGSTER_URL` points nowhere — `GET /api/pipelines` returns `503`,
+`POST /api/pipelines/{id}/trigger` returns `503`. Nothing in this phase
+makes Dagster a hard dependency for `lakehouse-api`'s own boot.
+
+**The G3a acceptance test** (`ops/g3a/g3a_test.py`, `docs/plans/
+LAKEHOUSE-FOUNDATION-PLAN.md` §3) runs inside the compose network via the
+`g3a-test-runner` service, the same reason `g1-test-runner` does: the dlt
+pipeline (`dagster/dispar_orchestrate/dlt_pipeline.py`) resolves
+`rustfs`/`lakekeeper` by their compose-internal names, which only resolve
+from inside this network.
+
+```bash
+# From a clean stack, project name your own scratch value:
+DAGSTER_URL=http://dagster-webserver:3000/graphql \
+  docker compose -p <project> --profile dagster up -d --build \
+    lakehouse-api dagster-code-location dagster-webserver dagster-daemon \
+    g3a-source-init
+docker compose -p <project> --profile dagster run --rm g3a-test-runner
+docker compose -p <project> down -v   # tear down when done
+```
+
+**`LAKEKEEPER_BASE_URI` gotcha, specific to dlt/pyiceberg (not just
+ClickHouse's DNS quirk above).** pyiceberg's `RestCatalog` honors the
+canonical catalog URI Lakekeeper reports in its own `/v1/config` response
+(driven by `LAKEKEEPER__BASE_URI`) for every subsequent call. If
+`LAKEKEEPER_BASE_URI` is left at its host-facing default
+(`http://localhost:8181`), a catalog client running **inside** the
+compose network (the dlt pipeline, in `dagster-code-location`) times out
+resolving/connecting to that address — this was reproduced directly
+during P3 verification. `docker-compose.yml`'s own defaults are
+unaffected in the default (non-`dagster`) stack; when bringing up the
+`dagster` profile, set `LAKEKEEPER_BASE_URI=http://lakekeeper:8181`
+(matching the compose-internal name), exactly as `.github/workflows/
+ci.yml`'s `g1-rustfs`/`g2-seaweedfs`/`g3a-dagster` jobs already do for
+the same underlying reason.
+
 ### What's deliberately NOT in the stack
 
 - **The Next.js frontend.** Its Dockerfile is untracked, ad hoc work in
@@ -139,9 +198,13 @@ during P1a verification.
   RUST_API_URL=http://localhost:8080 bun --bun next dev
   ```
   against the backend stack `docker compose up` brought up.
-- **Dagster.** Heavy (webserver + daemon + a code-location container) and
-  out of scope for a local dev loop. Pipeline trigger/run-status routes
-  return `503` without it.
+- **Dagster, by default.** Heavy (webserver + daemon + a code-location
+  container) and out of scope for the *default* local dev loop — a plain
+  `docker compose up` still doesn't start it, and pipeline trigger/run-
+  status routes still return `503` without it. **P3 adds it behind an
+  opt-in `dagster` compose profile** (mirroring how P2 gated `seaweedfs`
+  behind its own profile) — see "Dagster (opt-in, P3)" below and
+  `docs/adr/0005-dagster-code-location-ownership-and-packaging.md`.
 - **A real LLM.** Needs a paid API key. AI chat / agent / text-to-SQL
   routes return `503` without `LLM_KEY` (or `MINIMAX_API_KEY`) set to a
   working key.
@@ -231,7 +294,7 @@ check.
 
 | Feature | Needs | Symptom without it | To enable |
 | --- | --- | --- | --- |
-| Pipeline trigger / run status | Dagster | `503` from `/api/pipelines/*` | Point `DAGSTER_URL`/`DAGSTER_REPO`/`DAGSTER_LOCATION` at a real Dagster instance |
+| Pipeline trigger / run status | Dagster | `503` from `/api/pipelines/*` | Bring up the `dagster` compose profile (see "Dagster (opt-in, P3)" above) and point `DAGSTER_URL`/`DAGSTER_REPO`/`DAGSTER_LOCATION` at it |
 | AI chat / agent / text-to-SQL | LLM API key | `503` from `/api/ai/*`, `/api/agent/*` | Set `LLM_URL`/`LLM_MODEL`/`LLM_KEY` (or `MINIMAX_API_KEY`) to a real OpenAI-compatible provider |
 | Alert digests / threshold emails | SMTP | Alerts still evaluate; email delivery silently no-ops | Set `SMTP_HOST` (and friends) to a real SMTP relay |
 | Signed dashboard embeds | `EMBED_SECRET` | Embed routes unavailable | Set `EMBED_SECRET` |

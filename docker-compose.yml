@@ -530,6 +530,225 @@ services:
         fi
     restart: "no"
 
+  # P3 (G3a) — Dagster's own run/event-log/schedule storage, on the
+  # EXISTING `postgres` service via a dedicated database (mirrors
+  # `lakekeeper-db-init` exactly — separate database, not a schema mixed
+  # into the `lakehouse` app database). See
+  # docs/adr/0005-dagster-code-location-ownership-and-packaging.md.
+  dagster-db-init:
+    profiles: ["dagster"]
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGDATABASE: ${POSTGRES_DB:-lakehouse}
+      DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        psql -v ON_ERROR_STOP=1 -tc
+        "SELECT 1 FROM pg_database WHERE datname = '$${DAGSTER_PG_DB}'" |
+        grep -q 1 ||
+        psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$${DAGSTER_PG_DB}\""
+    restart: "no"
+
+  # P3 (G3a) — the code location: a gRPC server serving
+  # `dispar_orchestrate.definitions` (built from `dagster/Dockerfile`, see
+  # ADR 0005). This is also where a launched run actually EXECUTES (Dagster's
+  # `DefaultRunLauncher` calls back into the code location's own process),
+  # so it carries every env var the dlt pipeline
+  # (`dagster/dispar_orchestrate/dlt_pipeline.py`) and the catalog
+  # registration step (`bronze_catalog.py`) need — the Postgres source, the
+  # Lakekeeper catalog, the RustFS/SeaweedFS S3 endpoint, and ClickHouse.
+  dagster-code-location:
+    profiles: ["dagster"]
+    build:
+      context: ./dagster
+      dockerfile: Dockerfile
+    depends_on:
+      dagster-db-init:
+        condition: service_completed_successfully
+      lakekeeper-warehouse-init:
+        condition: service_completed_successfully
+    environment:
+      DAGSTER_PG_HOST: postgres
+      DAGSTER_PG_PORT: "5432"
+      DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
+      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
+      # `postgresql://`, not `postgres://` — dlt's `sql_database` source
+      # goes through SQLAlchemy, which (unlike `sqlx`, used for
+      # `DATABASE_URL` elsewhere in this file) does not recognize the
+      # `postgres://` scheme alias.
+      BRONZE_SOURCE_DATABASE_URL: postgresql://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${POSTGRES_DB:-lakehouse}
+      BRONZE_SOURCE_SCHEMA: ${BRONZE_SOURCE_SCHEMA:-ingest_demo}
+      BRONZE_SOURCE_TABLE: ${BRONZE_SOURCE_TABLE:-orders}
+      BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
+      LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
+      CH_URL: ${CH_URL:-http://clickhouse:8123}
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+    command: ["dagster", "api", "grpc", "-h", "0.0.0.0", "-p", "4000", "-m", "dispar_orchestrate.definitions"]
+    restart: unless-stopped
+
+  # P3 (G3a) — webserver (GraphQL API + UI). `DAGSTER_URL` (see
+  # `lakehouse-api::config::Config`) points at
+  # `http://dagster-webserver:3000/graphql` from inside the compose
+  # network, `http://localhost:${DAGSTER_WEBSERVER_HOST_PORT}/graphql` from
+  # the host.
+  dagster-webserver:
+    profiles: ["dagster"]
+    build:
+      context: ./dagster
+      dockerfile: Dockerfile
+    depends_on:
+      dagster-code-location:
+        condition: service_started
+    environment:
+      DAGSTER_PG_HOST: postgres
+      DAGSTER_PG_PORT: "5432"
+      DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
+      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
+    command: ["dagster-webserver", "-h", "0.0.0.0", "-p", "3000", "-w", "/opt/dagster/app/workspace.yaml"]
+    ports:
+      - "${DAGSTER_WEBSERVER_HOST_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/server_info"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+
+  # P3 (G3a) — daemon (schedules, sensors, run queueing). Not strictly
+  # needed for a manually-triggered run (G3a triggers via
+  # `POST /api/pipelines/{id}/trigger`, which calls `launchRun` directly),
+  # but every real Dagster deployment runs one, and P4's maintenance
+  # schedules (future) will need it — included now so the topology doesn't
+  # change again in P4.
+  dagster-daemon:
+    profiles: ["dagster"]
+    build:
+      context: ./dagster
+      dockerfile: Dockerfile
+    depends_on:
+      dagster-code-location:
+        condition: service_started
+    environment:
+      DAGSTER_PG_HOST: postgres
+      DAGSTER_PG_PORT: "5432"
+      DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
+      DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
+    command: ["dagster-daemon", "run", "-w", "/opt/dagster/app/workspace.yaml"]
+    restart: unless-stopped
+
+  # P3 (G3a) — one-shot: create the Postgres table G3a's dlt pipeline
+  # reads ("a real Postgres table", per the task brief), in its own
+  # `ingest_demo` schema — kept out of `rust/migrations` deliberately:
+  # those migrations are `lakehouse-api`'s own product schema
+  # (`sqlx::migrate!`-embedded into the binary); this is throwaway demo
+  # *source* data for the ingestion acceptance test, not product state.
+  g3a-source-init:
+    # `dagster`, not `test`: `g3a-test-runner` (below) depends on
+    # `dagster-webserver`, which is itself gated behind the `dagster`
+    # profile. Docker Compose validates a service's ENTIRE depends_on
+    # closure against whichever profiles are active, even for an unrelated
+    # `run <other-service>` invocation — so if this (and `g3a-test-runner`)
+    # were tagged `test` instead, plain `--profile test run --rm
+    # g1-test-runner` (the G1/G2 usage documented in
+    # docs/STORAGE-COMPATIBILITY.md and exercised by `.github/workflows/
+    # ci.yml`'s `g1-rustfs`/`g2-seaweedfs` jobs) would start failing with
+    # "service g3a-test-runner depends on undefined service
+    # dagster-webserver" the moment this file added a `dagster`-gated
+    # dependency anywhere under the `test` profile. This was caught during
+    # P3 verification precisely because that regression check was run.
+    profiles: ["dagster"]
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGDATABASE: ${POSTGRES_DB:-lakehouse}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        psql -v ON_ERROR_STOP=1 -c "
+        CREATE SCHEMA IF NOT EXISTS ingest_demo;
+        CREATE TABLE IF NOT EXISTS ingest_demo.orders (
+          id bigserial PRIMARY KEY,
+          customer text NOT NULL,
+          amount numeric(12,2) NOT NULL,
+          created_at timestamptz NOT NULL DEFAULT now()
+        );
+        INSERT INTO ingest_demo.orders (customer, amount)
+        SELECT 'customer_' || (g % 500), (g % 1000)::numeric + 0.5
+        FROM generate_series(1, 2000) AS g
+        WHERE NOT EXISTS (SELECT 1 FROM ingest_demo.orders);
+        "
+    restart: "no"
+
+  # P3 (G3a) — end-to-end acceptance test (`ops/g3a/g3a_test.py`), same
+  # `g1-test-runner` shape: bind-mounted script, stock base image, runs
+  # INSIDE the compose network. `dagster` profile, not `test` — see
+  # `g3a-source-init`'s comment on why sharing `test` with `g1-test-runner`
+  # would break the unrelated G1/G2 usage.
+  #
+  # Usage (from a clean stack; brings `lakehouse-api` up with `DAGSTER_URL`
+  # pointed at the real webserver via the `.env`/shell override below —
+  # verified end-to-end against a clean stack during P3):
+  #   DAGSTER_URL=http://dagster-webserver:3000/graphql \
+  #     docker compose -p <project> --profile dagster up -d --build \
+  #       lakehouse-api dagster-code-location dagster-webserver \
+  #       dagster-daemon g3a-source-init
+  #   docker compose -p <project> --profile dagster run --rm g3a-test-runner
+  g3a-test-runner:
+    profiles: ["dagster"]
+    image: python:3.12-slim
+    working_dir: /work
+    volumes:
+      - ./ops/g3a:/work
+    depends_on:
+      lakehouse-api:
+        condition: service_started
+      dagster-webserver:
+        condition: service_healthy
+      g3a-source-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      DAGSTER_URL: http://dagster-webserver:3000/graphql
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      CH_LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
+      BRONZE_SOURCE_SCHEMA: ${BRONZE_SOURCE_SCHEMA:-ingest_demo}
+      BRONZE_SOURCE_TABLE: ${BRONZE_SOURCE_TABLE:-orders}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "pip install -q requests && python g3a_test.py"
+    restart: "no"
+
 volumes:
   lakehouse_postgres_data:
   lakehouse_clickhouse_data:
