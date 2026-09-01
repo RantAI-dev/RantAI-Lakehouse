@@ -1,9 +1,19 @@
 # Feature Coverage
 
+**Updated in P6.** This file predates the Rust backend cutover (P0–P6) and
+previously described every domain as a mock adapter. That was already false
+before P6 (10 of 12 `src/services/index.ts` domains were already real) and
+is more false now that the lakehouse layer (Bronze Iceberg/Lakekeeper/
+RustFS, CDC via Debezium, Dagster-run maintenance) is surfaced through the
+Catalog, Storage, and Governance domains. The table below reflects the
+actual `src/services/index.ts` wiring, verified against
+`src/services/clients/*` and the Rust routes they call.
+
 Status tags:
 
-- `[COMPLETE]` — frontend represents the product behavior end-to-end (mocked backend)
+- `[COMPLETE]` — frontend represents the product behavior end-to-end
 - `[PARTIAL]` — primary surface exists; depth or cross-links still limited
+- `[REAL]` — backed by the real Rust API (ClickHouse/Postgres/Dagster), not a mock
 - `[MOCKED]` — contract + mock adapter only; no real backend
 - `[MISSING]` — not represented in the UI yet
 
@@ -11,52 +21,59 @@ Update only with verified repository facts.
 
 | Domain | Feature | Route | Status | Backend |
 |---|---|---|---|---|
-| Overview | Platform overview | `/` | [COMPLETE] | [MOCKED] |
-| Overview | Activity feed | `/activity` | [COMPLETE] | [MOCKED] |
-| Overview | Alerts triage | `/alerts` | [COMPLETE] | [MOCKED] |
-| Data | Data Explorer (tier + layer) | `/data` | [COMPLETE] | [MOCKED] |
-| Data | Asset detail tabs | `/data/assets/[assetId]` | [COMPLETE] | [MOCKED] |
-| Data | Catalog namespaces | `/catalog` | [COMPLETE] | [MOCKED] |
-| Data | Storage lifecycle + restore | `/storage` | [COMPLETE] | [MOCKED] |
-| Data | Connectors list / create / test / discover | `/connectors` | [COMPLETE] | [MOCKED] |
-| Build | Pipelines list / create / agentic draft | `/pipelines` | [COMPLETE] | [MOCKED] |
-| Build | Pipeline detail + graph + runs | `/pipelines/[pipelineId]` | [COMPLETE] | [MOCKED] |
-| Build | Pipeline run cancel / retry | (run drawer) | [COMPLETE] | [MOCKED] |
-| Build | Streaming jobs | `/streaming` | [COMPLETE] | [MOCKED] |
-| Build | Streaming detail / triggers | `/streaming/[jobId]` | [COMPLETE] | [MOCKED] |
-| Build | Query Studio NL + SQL | `/query-studio` | [COMPLETE] | [MOCKED] |
-| Build | Federated execution plan | `/query-studio` | [COMPLETE] | [MOCKED] |
-| Build | Saved queries | `/query-studio/saved` | [COMPLETE] | [MOCKED] |
-| Build | Collaboration projects | `/query-studio/collaboration` | [PARTIAL] | [MOCKED] |
-| Intelligence | Knowledge sources | `/knowledge` | [COMPLETE] | [MOCKED] |
-| Intelligence | Vector jobs | `/vector-jobs` | [COMPLETE] | [MOCKED] |
-| Intelligence | Semantic search | `/semantic-search` | [COMPLETE] | [MOCKED] |
-| Intelligence | Agent workflows | `/agents/workflows` | [PARTIAL] | [MOCKED] |
-| Intelligence | Digital employees | `/agents/employees` | [COMPLETE] | [MOCKED] |
-| Intelligence | Approvals inbox | `/agents/approvals` | [COMPLETE] | [MOCKED] |
-| Intelligence | Tool registry | `/agents/tools` | [COMPLETE] | [MOCKED] |
-| Governance | Policies | `/governance/policies` | [PARTIAL] | [MOCKED] |
-| Governance | Classification & masking | `/governance/classification` | [COMPLETE] | [MOCKED] |
-| Governance | Data quality | `/governance/data-quality` | [COMPLETE] | [MOCKED] |
-| Governance | Lineage | `/lineage` | [PARTIAL] | [MOCKED] |
-| Governance | Audit | `/audit` | [PARTIAL] | [MOCKED] |
-| Governance | Residency | `/residency` | [COMPLETE] | [MOCKED] |
-| Operations | Workloads | `/workloads` | [COMPLETE] | [MOCKED] |
-| Operations | Observability | `/observability` | [PARTIAL] | [MOCKED] |
-| Operations | Services | `/services` | [COMPLETE] | [MOCKED] |
-| Operations | Usage & budgets | `/usage` | [COMPLETE] | [MOCKED] |
-| Admin | Users / roles / tenants / service identities / settings | `/admin/*`, `/settings` | [COMPLETE] | [MOCKED] |
+| Overview | Platform overview | `/` | [COMPLETE] | [REAL] |
+| Overview | Activity feed | `/activity` | [COMPLETE] | [REAL] |
+| Overview | Alerts triage | `/alerts` | [COMPLETE] | [REAL] |
+| Data | Data Explorer (tier + layer) | `/data` | [COMPLETE] | [REAL] |
+| Data | Asset detail tabs | `/data/assets/[assetId]` | [COMPLETE] | [REAL] |
+| Data | Catalog namespaces (incl. Bronze Iceberg tables) | `/catalog` | [COMPLETE] | [REAL] |
+| Data | Storage lifecycle + restore (Hot/Warm real; Cold/AI always 0 — see README limitations) | `/storage` | [COMPLETE] | [REAL] |
+| Data | Connectors list / create / test / discover | `/connectors` | [COMPLETE] | [REAL] (CRUD is real Postgres; `testConnection` returns hardcoded latency — see `lakehouse-store/src/connectors.rs`, not a live socket check) |
+| Build | Pipelines list / create / agentic draft | `/pipelines` | [COMPLETE] | [REAL] |
+| Build | Pipeline detail + graph + runs | `/pipelines/[pipelineId]` | [COMPLETE] | [REAL] |
+| Build | Pipeline run cancel / retry | (run drawer) | [COMPLETE] | [REAL] |
+| Build | Streaming jobs | `/streaming` | [COMPLETE] | [MOCKED] — deliberate; no Kafka/Redpanda/Pulsar/Flink anywhere in this stack. CDC (Debezium, P5) is a change-data-capture pipe into Bronze, not a streaming engine, and is not relabeled as one. |
+| Build | Streaming detail / triggers | `/streaming/[jobId]` | [COMPLETE] | [MOCKED] — same reason as above |
+| Build | Query Studio NL + SQL | `/query-studio` | [COMPLETE] | [REAL] |
+| Build | Federated execution plan | `/query-studio` | [COMPLETE] | [PARTIAL] — query execution itself is real (ClickHouse); "federated" is UI copy, not multi-engine execution (Trino exists only as a background Bronze compactor, per ADR 0009, and is never in the query-serving path) |
+| Build | Saved queries | `/query-studio/saved` | [COMPLETE] | [REAL] |
+| Build | Collaboration projects | `/query-studio/collaboration` | [PARTIAL] | [REAL] |
+| Intelligence | Knowledge sources | `/knowledge` | [COMPLETE] | [REAL] |
+| Intelligence | Vector jobs | `/vector-jobs` | [COMPLETE] | [REAL] |
+| Intelligence | Semantic search | `/semantic-search` | [COMPLETE] | [MOCKED] — deliberate; no vector store/embedding index exists (`rust/crates/lakehouse-store/src/knowledge.rs`) |
+| Intelligence | Agent workflows | `/agents/workflows` | [PARTIAL] | [REAL] (definitions/runs/approvals persisted in Postgres; there is no agent/tool *execution* runtime) |
+| Intelligence | Digital employees | `/agents/employees` | [COMPLETE] | [REAL] |
+| Intelligence | Approvals inbox | `/agents/approvals` | [COMPLETE] | [REAL] |
+| Intelligence | Tool registry | `/agents/tools` | [COMPLETE] | [REAL] |
+| Governance | Policies | `/governance/policies` | [PARTIAL] | [REAL] |
+| Governance | Classification & masking | `/governance/classification` | [COMPLETE] | [REAL] |
+| Governance | Data quality | `/governance/data-quality` | [COMPLETE] | [REAL] |
+| Governance | Lineage | `/lineage` | [PARTIAL] | [REAL] |
+| Governance | Audit | `/audit` | [PARTIAL] | [REAL] (Dagster run history) |
+| Governance | Residency | `/residency` | [COMPLETE] | [REAL] |
+| Governance | Bronze maintenance (`expire_snapshots` dry-run/applied; P6 addition) | `/governance/data-quality` (Maintenance tab) | [PARTIAL] | [REAL] — `GET /api/governance/maintenance`, reading `lake.bronze_meta.maintenance_run` |
+| Governance | CDC replication slot health (P6 addition) | `/governance/data-quality` (Ingestion tab) | [PARTIAL] | [REAL] — `GET /api/governance/replication`, reading `lake.bronze_meta.replication_slot` |
+| Operations | Workloads | `/workloads` | [COMPLETE] | [REAL] |
+| Operations | Observability | `/observability` | [PARTIAL] | [REAL] |
+| Operations | Services | `/services` | [COMPLETE] | [REAL] |
+| Operations | Usage & budgets | `/usage` | [COMPLETE] | [REAL] |
+| Admin | Users / roles / tenants / service identities | `/admin/*` | [COMPLETE] | [REAL] |
+| Admin | Workspace settings | `/settings` | [COMPLETE] | [MOCKED] — `getWorkspaceSettings` returns a fixed response; there is no setter and nothing is persisted |
 
-## Intentionally missing (not product blockers for FE preview)
+## Intentionally missing / still mocked
 
 | Item | Status |
 |---|---|
-| Real connectors / engines / IdP / agent runtime | [MISSING] (backend) |
+| Real streaming engine (Kafka/Flink/etc.) | [MISSING] (backend) — CDC via Debezium exists but is not a streaming engine |
+| Vector store / embedding-backed semantic search | [MISSING] (backend) |
+| Live connector health checks (`testConnection` dials nothing) | [MISSING] (backend) |
 | Dedicated connector detail route | [PARTIAL] (drawer sufficient for preview) |
 | Dedicated pipeline run route | [PARTIAL] (drawer + actions) |
 | Workflow detail canvas route | [PARTIAL] |
+| Agent/tool execution runtime | [MISSING] |
 | Observability log/trace explorer | [MISSING] |
-| HTTP service adapters | [MISSING] |
+| Lakekeeper authorization (R1) — runs `allow-all`, not enforced | [MISSING] — see `docs/plans/P5-REPORT.md` |
+| Cold/AI storage tiers (always report 0 bytes) | [MISSING] — see README "Status / Known limitations" |
 
 ## Cross-domain connections (must stay linked)
 
