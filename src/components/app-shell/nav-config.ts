@@ -8,6 +8,7 @@ import {
   CircleGauge,
   ClipboardCheck,
   Database,
+  DatabaseZap,
   FileSearch,
   FileText,
   GitBranch,
@@ -142,6 +143,16 @@ export const NAV_GROUPS: NavGroup[] = [
       { title: "Lineage", href: "/lineage", icon: Waypoints },
       { title: "Audit", href: "/audit", icon: FileText },
       { title: "Residency", href: "/residency", icon: Globe2 },
+      {
+        title: "Bronze Maintenance",
+        href: "/governance/maintenance",
+        icon: Wrench,
+      },
+      {
+        title: "Ingestion (CDC)",
+        href: "/governance/ingestion",
+        icon: DatabaseZap,
+      },
     ],
   },
   {
