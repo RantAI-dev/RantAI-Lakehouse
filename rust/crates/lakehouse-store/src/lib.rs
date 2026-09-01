@@ -29,6 +29,7 @@
 //! that was never `Some`.
 
 pub mod agents;
+pub mod cdc;
 pub mod connectors;
 pub mod error;
 pub mod governance;

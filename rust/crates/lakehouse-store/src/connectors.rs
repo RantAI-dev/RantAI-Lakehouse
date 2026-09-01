@@ -463,6 +463,36 @@ pub async fn test_connection(pool: &PgPool, id: &str) -> Result<ConnectorTestRes
     })
 }
 
+/// Delete a connector by id. Returns `Ok(false)` (not an error) if `id`
+/// does not name a connector — matching the idempotent-delete convention
+/// most of this codebase's `DELETE` handlers already use.
+///
+/// # What this does NOT do
+///
+/// This does NOT connect to the connector's `host` and drop any
+/// replication slot/publication a P5 CDC connector may have created there.
+/// Doing so would mean this crate resolving `secret_ref` to a live
+/// credential and originating an outbound connection to an
+/// operator-configured external system — exactly what
+/// [`test_connection`]'s doc comment already declines to do, for the same
+/// reason. Slot/WAL cleanup for a removed CDC connector is an operational
+/// step performed against the source database directly (see
+/// `ops/debezium/deprovision_connector.sh` and the P5 report's G4 section)
+/// — a real, told-straight gap, not a silent one: deleting a connector row
+/// here does not, by itself, stop WAL from being pinned if a Debezium
+/// Server process for it is still running.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn delete_connector(pool: &PgPool, id: &str) -> Result<bool, StoreError> {
+    let result = sqlx::query("DELETE FROM connector WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// A slug-based id, same shape `pipelines::slug_id` uses
 /// (`"conn-<slug>-<base36 millis>"`).
 fn slug_id(name: &str) -> String {

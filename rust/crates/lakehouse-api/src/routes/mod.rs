@@ -172,7 +172,10 @@ fn connectors_router() -> Router<AppState> {
             "/api/connectors",
             get(connectors::list).post(connectors::create),
         )
-        .route("/api/connectors/{id}", get(connectors::detail))
+        .route(
+            "/api/connectors/{id}",
+            get(connectors::detail).delete(connectors::delete),
+        )
         .route(
             "/api/connectors/{id}/test",
             axum::routing::post(connectors::test_connection),

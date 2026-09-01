@@ -178,6 +178,26 @@ pub async fn test_connection(
     }
 }
 
+/// `DELETE /api/connectors/{id}` — remove a connector registration.
+///
+/// Does not itself contact the connector's source system — see
+/// `lakehouse_store::connectors::delete_connector`'s doc comment for why,
+/// and for the CDC slot-cleanup gap this leaves (P5).
+///
+/// # Errors
+///
+/// 404 if `id` is unknown; 503/500 as above.
+pub async fn delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    let deleted = connectors::delete_connector(pool(&state)?, &id).await?;
+    if !deleted {
+        return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

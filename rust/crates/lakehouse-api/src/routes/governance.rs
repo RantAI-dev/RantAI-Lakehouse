@@ -52,6 +52,19 @@ enum Kind {
     /// mechanism `register_bronze_table` already uses, per the task
     /// brief's "reuse that mechanism; do not invent a parallel one."
     Maintenance,
+    /// `governance/replication` — **P5 addition, not a TS-port kind**, same
+    /// shape as `maintenance`'s "Gap fix" precedent. Surfaces
+    /// `lake.bronze_meta.replication_slot` — the per-connector Postgres
+    /// replication-slot lag/WAL-retention snapshot
+    /// `dagster/dispar_orchestrate/replication_metrics.py` writes on a
+    /// schedule, via the SAME `bronze_meta.*` registry mechanism
+    /// `register_bronze_table`/`record_maintenance_run` already use. R5 in
+    /// the risk register ("a stuck or lagging replication slot pins WAL and
+    /// fills the customer's production database disk") is the reason this
+    /// exists: it is the first-class metrics surface for that risk, reusing
+    /// the P4 maintenance surface's mechanism rather than inventing a
+    /// parallel one, per R10.
+    Replication,
     /// Anything else, which the TypeScript rejects with HTTP 400.
     Unknown,
 }
@@ -64,6 +77,7 @@ impl Kind {
             "classification" => Self::Classification,
             "residency" => Self::Residency,
             "maintenance" => Self::Maintenance,
+            "replication" => Self::Replication,
             _ => Self::Unknown,
         }
     }
@@ -112,6 +126,7 @@ async fn run(state: &AppState, kind: Kind) -> Result<Value, GovError> {
         Kind::Classification => classification(&state.clickhouse, state.pg.as_deref()).await,
         Kind::Residency => residency(state.pg.as_deref()).await,
         Kind::Maintenance => maintenance(&state.clickhouse).await,
+        Kind::Replication => replication(&state.clickhouse).await,
         Kind::Unknown => unreachable!("Kind::Unknown is handled before `run` is called"),
     }
 }
@@ -318,6 +333,41 @@ async fn maintenance(ch: &ChClient) -> Result<Value, GovError> {
     Ok(json!({ "maintenance": runs }))
 }
 
+/// `GET /api/governance/replication` — R5's slot-lag/WAL-retention metrics
+/// surface. Reads `lake.bronze_meta.replication_slot` directly (Dagster-
+/// written only, same posture as `maintenance` — no `pg` union). On a
+/// deployment where no CDC connector has ever run, this table does not
+/// exist yet and the query fails, surfaced as the standard 503 every other
+/// `kind` already gives — not a special case.
+async fn replication(ch: &ChClient) -> Result<Value, GovError> {
+    let rows = ch
+        .rows(
+            "SELECT connector_id, slot_name, checked_at, active, \
+                toString(wal_retained_bytes) wal_retained_bytes, \
+                toString(confirmed_flush_lag_bytes) confirmed_flush_lag_bytes, \
+                status \
+             FROM lake.`bronze_meta.replication_slot` \
+             ORDER BY checked_at DESC LIMIT 500",
+            None,
+        )
+        .await?;
+    let slots: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "connectorId": str_col(r, "connector_id"),
+                "slotName": str_col(r, "slot_name"),
+                "checkedAt": str_col(r, "checked_at"),
+                "active": str_col(r, "active") == "1" || str_col(r, "active") == "true",
+                "walRetainedBytes": str_col(r, "wal_retained_bytes"),
+                "confirmedFlushLagBytes": str_col(r, "confirmed_flush_lag_bytes"),
+                "status": str_col(r, "status"),
+            })
+        })
+        .collect();
+    Ok(json!({ "replicationSlots": slots }))
+}
+
 /// Query parameters accepted by `GET /api/governance/lineage`.
 #[derive(Debug, Deserialize)]
 pub struct LineageQuery {
@@ -463,7 +513,7 @@ pub async fn create_rule(
             Ok(resp) => resp.into_response(),
             Err(err) => err.into_response(),
         },
-        Kind::Audit | Kind::Maintenance | Kind::Unknown => (
+        Kind::Audit | Kind::Maintenance | Kind::Replication | Kind::Unknown => (
             StatusCode::BAD_REQUEST,
             ApiJson(
                 json!({ "error": format!("kind tak dikenal atau tidak bisa ditulis: {kind}") }),
@@ -644,6 +694,7 @@ mod tests {
         assert_eq!(Kind::parse("classification"), Kind::Classification);
         assert_eq!(Kind::parse("residency"), Kind::Residency);
         assert_eq!(Kind::parse("maintenance"), Kind::Maintenance);
+        assert_eq!(Kind::parse("replication"), Kind::Replication);
     }
 
     #[test]
