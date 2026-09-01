@@ -3,7 +3,26 @@
 //! Ports `src/app/api/storage/route.ts`. Hot is measured directly from
 //! `system.parts`; Warm is estimated from the Bronze registry's row counts
 //! (`rows * 220` bytes, a fixed per-row estimate used across every ported
-//! domain); Cold/AI are always zero — nothing occupies those tiers yet.
+//! domain); Cold/AI are always zero.
+//!
+//! **P6 note on Cold, revisited now that object storage (RustFS/SeaweedFS)
+//! exists.** Before P1 there was nowhere cold to put anything, which is why
+//! Cold/AI hardcoded to zero. That infrastructure gap is gone, but the data
+//! gap is not: the only thing living in `RustFS` today is Bronze Iceberg data,
+//! and that is already counted above, in **Warm** (`bronze_meta.*` row
+//! counts) — see `routes::catalog::list_body`, which likewise reports every
+//! Bronze Iceberg table's `tier` as `"warm"`, not `"cold"`. There is no
+//! second, genuinely colder tier in this design: no lifecycle rule
+//! demotes aged Iceberg snapshots to a separate cold bucket/storage class,
+//! and `lakehouse-iceberg` (the crate that could read a bucket's actual
+//! object sizes via its `object_store` client) is not called from any route
+//! yet. Reporting a real `RustFS` bucket-size number here would double-count
+//! the same bytes Warm already reports, under a tier label that does not
+//! correspond to any distinct storage behavior today. So Cold/AI stay at
+//! zero — not because they are unmeasurable, but because there is honestly
+//! nothing distinct to measure yet. This will need revisiting the day a
+//! real cold tier (e.g. an Iceberg lifecycle/archival policy, or a genuinely
+//! separate object-storage class) exists.
 
 use axum::body::Bytes;
 use axum::extract::State;
