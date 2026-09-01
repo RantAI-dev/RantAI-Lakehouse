@@ -11,6 +11,21 @@ services:
   # a real chance to run instead of racing container start order.
   postgres:
     image: postgres:16
+    # `wal_level=logical` (+ enough slots/senders for a handful of CDC
+    # connectors): P5 needs Postgres logical replication for
+    # `debezium-server` to capture `p5_cdc.orders` at all — `replica`
+    # (the image's own default) cannot create a logical replication slot.
+    # This is on by default for every deployment of this stack now, not
+    # gated behind the `dagster` profile, because it is a server restart
+    # to change later — cheaper to always run with it than to make an
+    # operator recreate this container the first time they need CDC.
+    command:
+      [
+        "postgres",
+        "-c", "wal_level=logical",
+        "-c", "max_wal_senders=10",
+        "-c", "max_replication_slots=10",
+      ]
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-lakehouse}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
@@ -857,6 +872,174 @@ services:
     entrypoint: ["/bin/sh", "/opt/optimize_bronze.sh"]
     restart: unless-stopped
 
+  # P5 (G4) — one-shot: create the Postgres table the demo CDC connector
+  # captures. Own `p5_cdc` schema, `REPLICA IDENTITY FULL` (Debezium needs
+  # this to emit full before/after images for UPDATE/DELETE, per
+  # `docs/plans/P5-RESULT.md`'s measured connector config), and a
+  # publication scoped to that one table — never `FOR ALL TABLES`, so a
+  # demo connector cannot see product schema. `dagster` profile, not
+  # `test`, mirroring `g3a-source-init`'s reasoning exactly (this service
+  # sits behind `debezium-server`, which is itself `dagster`-gated below).
+  g4-source-init:
+    profiles: ["dagster"]
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGDATABASE: ${POSTGRES_DB:-lakehouse}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        psql -v ON_ERROR_STOP=1 -c "
+        CREATE SCHEMA IF NOT EXISTS p5_cdc;
+        CREATE TABLE IF NOT EXISTS p5_cdc.orders (
+          id bigint PRIMARY KEY,
+          customer text NOT NULL,
+          amount numeric(12,2) NOT NULL,
+          updated_at timestamptz NOT NULL DEFAULT now()
+        );
+        ALTER TABLE p5_cdc.orders REPLICA IDENTITY FULL;
+        INSERT INTO p5_cdc.orders (id, customer, amount)
+        SELECT g, 'customer_' || g, (g % 100)::numeric + 0.5
+        FROM generate_series(1, 5) AS g
+        WHERE NOT EXISTS (SELECT 1 FROM p5_cdc.orders);
+        " &&
+        psql -v ON_ERROR_STOP=1 -tc
+        "SELECT 1 FROM pg_publication WHERE pubname = 'p5cdc_pub'" |
+        grep -q 1 ||
+        psql -v ON_ERROR_STOP=1 -c
+        "CREATE PUBLICATION p5cdc_pub FOR TABLE p5_cdc.orders;"
+    restart: "no"
+
+  # P5 (G4) — Debezium Server + `debezium-server-iceberg` (memiiso), pinned
+  # by digest (R4: community-maintained, no versioned tag exists upstream —
+  # see `docs/plans/P5-RESULT.md`). Captures `p5_cdc.orders` via Postgres
+  # logical replication (`pgoutput`), upsert mode, initial snapshot then
+  # streaming, straight into Bronze through the SAME Lakekeeper/RustFS
+  # stack every other Bronze writer in this repo uses. This is a single,
+  # statically-configured demo connector (ADR 0007: "no dynamic
+  # per-connector provisioning" this phase) — it proves the config shape
+  # `lakehouse_store::cdc::render_debezium_properties` designs, not a
+  # production connector-management control plane.
+  #
+  # `LAKEKEEPER_BASE_URI` MUST be set to the in-network name
+  # (`http://lakekeeper:8181`) or every REST-catalog call this container
+  # makes after the first one fails with "Connection refused:
+  # localhost:8181" — see `docs/plans/P5-RESULT.md`'s measured trap. Put it
+  # in `.env`, not a one-off prefix (same reasoning as `DAGSTER_URL`'s
+  # existing warning elsewhere in this file).
+  debezium-server:
+    profiles: ["dagster"]
+    image: ghcr.io/memiiso/debezium-server-iceberg@sha256:c49ebdaae01762a5509804926710d6a831e45d56f70ce98cf69bac57cc6a6bf9
+    depends_on:
+      g4-source-init:
+        condition: service_completed_successfully
+      lakekeeper-warehouse-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      POSTGRES_USER: ${POSTGRES_USER:-lakehouse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
+    volumes:
+      - lakehouse_debezium_data:/debezium/data
+    # Same reason `trino`'s command renders its catalog properties inline:
+    # the base image has no templating tool, so `sh` interpolates this
+    # container's own `environment:` values directly. `$$` stops compose's
+    # OWN `${VAR}` interpolation at parse time so the literal reaches this
+    # container's shell.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mkdir -p /debezium/config && cat > /debezium/config/application.properties <<EOF
+        debezium.sink.type=iceberg
+        debezium.sink.iceberg.catalog-name=lakekeeper
+        debezium.sink.iceberg.type=rest
+        debezium.sink.iceberg.uri=$${LAKEKEEPER_CATALOG_URI}
+        debezium.sink.iceberg.warehouse=$${LAKEKEEPER_WAREHOUSE}
+        debezium.sink.iceberg.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+        debezium.sink.iceberg.s3.endpoint=$${CH_RUSTFS_S3_ENDPOINT}
+        debezium.sink.iceberg.s3.path-style-access=true
+        debezium.sink.iceberg.s3.access-key-id=$${RUSTFS_ACCESS_KEY}
+        debezium.sink.iceberg.s3.secret-access-key=$${RUSTFS_SECRET_KEY}
+        debezium.sink.iceberg.client.region=us-east-1
+        debezium.sink.iceberg.upsert=true
+        debezium.sink.iceberg.upsert-keep-deletes=true
+        debezium.sink.iceberg.destination-uppercase-table-names=false
+        debezium.sink.iceberg.write.format.default=parquet
+        debezium.source.connector.class=io.debezium.connector.postgresql.PostgresConnector
+        debezium.source.offset.storage=org.apache.kafka.connect.storage.FileOffsetBackingStore
+        debezium.source.offset.storage.file.filename=/debezium/data/p5cdc-offsets.dat
+        debezium.source.offset.flush.interval.ms=0
+        debezium.source.database.hostname=postgres
+        debezium.source.database.port=5432
+        debezium.source.database.user=$${POSTGRES_USER}
+        debezium.source.database.password=$${POSTGRES_PASSWORD}
+        debezium.source.database.dbname=$${POSTGRES_DB}
+        debezium.source.topic.prefix=p5cdc
+        debezium.source.schema.include.list=p5_cdc
+        debezium.source.table.include.list=p5_cdc.orders
+        debezium.source.plugin.name=pgoutput
+        debezium.source.slot.name=p5cdc_slot
+        debezium.source.publication.name=p5cdc_pub
+        debezium.source.publication.autocreate.mode=disabled
+        debezium.source.schema.history.internal=io.debezium.storage.file.history.FileSchemaHistory
+        debezium.source.schema.history.internal.file.filename=/debezium/data/p5cdc-schema-history.dat
+        EOF
+        exec /debezium/run.sh
+    restart: unless-stopped
+
+  # P5 (G4) — end-to-end acceptance test: INSERT/UPDATE/DELETE on the
+  # source are visible in ClickHouse within the agreed latency, AND
+  # replication-slot cleanup on connector removal is verified. Same
+  # `g1-test-runner`/`g3a-test-runner` shape (bind-mounted script, stock
+  # base image, runs inside the compose network). `dagster` profile (not
+  # `test`), for the same reason `g3a-source-init`'s comment gives.
+  #
+  # Usage (from a clean stack):
+  #   docker compose -p <project> --profile dagster up -d
+  #     postgres clickhouse rustfs rustfs-bucket-init lakekeeper-db-init
+  #     lakekeeper-migrate lakekeeper lakekeeper-warehouse-init
+  #     g4-source-init debezium-server
+  #   docker compose -p <project> --profile dagster run --rm g4-test-runner
+  g4-test-runner:
+    profiles: ["dagster"]
+    image: python:3.12-slim
+    working_dir: /work
+    volumes:
+      - ./ops/g4:/work
+      - ./ops/debezium/deprovision_connector.sh:/work/deprovision_connector.sh:ro
+    depends_on:
+      debezium-server:
+        condition: service_started
+      g4-source-init:
+        condition: service_completed_successfully
+    environment:
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      CH_LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGDATABASE: ${POSTGRES_DB:-lakehouse}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null && pip install -q requests && python g4_test.py"
+    restart: "no"
+
 volumes:
   lakehouse_postgres_data:
   lakehouse_clickhouse_data:
@@ -864,3 +1047,4 @@ volumes:
   lakehouse_seaweedfs_data:
   lakehouse_g1_cargo_registry:
   lakehouse_g1_target:
+  lakehouse_debezium_data:
