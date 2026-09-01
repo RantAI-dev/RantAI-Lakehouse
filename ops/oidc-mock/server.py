@@ -68,6 +68,7 @@ PRINCIPALS = [
     "debezium",
     "dlt",
     "clickhouse-reader",
+    "trino",
     "unauthorized-test",
 ]
 

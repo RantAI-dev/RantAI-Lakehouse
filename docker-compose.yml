@@ -546,6 +546,12 @@ services:
   #     the added compose/oidc-mock complexity for this build; noted here
   #     rather than silently granting it. No `create`: nothing in this
   #     build has ClickHouse creating Bronze tables.
+  #   - `trino` (ADR 0009's compaction escape hatch —
+  #     `trino-maintenance-cron`'s `EXECUTE optimize`): `select`, `modify`.
+  #     No `create`: `optimize` rewrites existing data files into a new
+  #     snapshot of an EXISTING table — it never creates a namespace or
+  #     table, so `create` would be an over-grant with no code path to use
+  #     it, same reasoning as `clickhouse-reader`'s missing `create`.
   #   - `unauthorized-test`: registered (Lakekeeper knows who it is) but
   #     NEVER granted anything — the negative-test principal.
   lakekeeper-authz-init:
@@ -566,7 +572,7 @@ services:
         admin_token="$$(cat /tokens/admin.jwt)"
         admin_auth="Authorization: Bearer $$admin_token"
 
-        for principal in rust-iceberg debezium dlt clickhouse-reader unauthorized-test; do
+        for principal in rust-iceberg debezium dlt clickhouse-reader trino unauthorized-test; do
           ptoken="$$(cat /tokens/$$principal.jwt)"
           code=$$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $$ptoken" -H 'Content-Type: application/json' \
@@ -597,6 +603,7 @@ services:
         grant debezium create modify select
         grant dlt create modify select
         grant clickhouse-reader select modify
+        grant trino select modify
         # unauthorized-test: deliberately no grant call.
     restart: "no"
 
@@ -1142,20 +1149,27 @@ services:
   # single-node Trino, scoped to ONE catalog (`iceberg`, rendered below at
   # container start) — it never touches Silver/Gold (ClickHouse MergeTree,
   # not Iceberg).
-  # R1 (ADR 0011) gap, noted rather than silently left: `trino` is not one
-  # of the principals `lakekeeper-authz-init` grants. It was out of scope
-  # for R1's re-run list (the task's five gates do not exercise the
-  # `trino` profile), and Trino's own identity story (per-user impersonation
-  # vs. one static service identity) is a real design question this build
-  # has not made yet. Today: any catalog call `trino`/
-  # `trino-maintenance-cron` makes will be DENIED under enforcement — the
-  # `trino` profile is not usable together with R1 authorization until a
-  # principal is minted and granted for it, mirroring the others below.
+  # R1 (ADR 0011): `trino` authenticates to Lakekeeper as its own
+  # principal, granted `select`+`modify` on the warehouse by
+  # `lakekeeper-authz-init` — the same shape as `debezium`/`dlt`, since
+  # `EXECUTE optimize` reads existing data files and commits a new Iceberg
+  # snapshot (a `modify`-shaped operation), not a table/namespace create.
+  # `iceberg.rest-catalog.security=OAUTH2` +
+  # `iceberg.rest-catalog.oauth2.token=<static token>` is Trino's own
+  # static-bearer-token property (measured directly from the shipped
+  # `IcebergRestCatalogConfig`/`OAuth2SecurityConfig` classes in
+  # `trinodb/trino:483`'s `trino-iceberg` plugin jar — `oauth2.token` sends
+  # the value as-is, same mechanism `iceberg-catalog-rest`'s `token`
+  # property and pyiceberg's `token` use, no OAuth2 exchange). Mirrors
+  # `debezium-server`'s `LAKEKEEPER_TOKEN="$$(cat /tokens/...)"` pattern —
+  # this container's `command:` is a shell script, so the token file is
+  # read into a shell variable before being interpolated into the
+  # properties heredoc.
   trino:
     profiles: ["trino"]
     image: trinodb/trino:483
     depends_on:
-      lakekeeper-warehouse-init:
+      lakekeeper-authz-init:
         condition: service_completed_successfully
     environment:
       LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
@@ -1163,6 +1177,8 @@ services:
       CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+    volumes:
+      - lakehouse_oidc_tokens:/tokens:ro
     entrypoint: ["/bin/sh", "-c"]
     # Trino's base image has no `envsubst`/`python3` (RHEL UBI, verified
     # empirically), so the catalog properties file is written directly
@@ -1174,12 +1190,16 @@ services:
     # so the literal `${VAR}` reaches the container's shell instead.
     command:
       - |
+        set -eu
+        TRINO_TOKEN="$$(cat /tokens/trino.jwt 2>/dev/null || true)"
         mkdir -p /etc/trino/catalog && cat > /etc/trino/catalog/iceberg.properties <<EOF
         connector.name=iceberg
         iceberg.catalog.type=rest
         iceberg.rest-catalog.uri=$${LAKEKEEPER_CATALOG_URI}
         iceberg.rest-catalog.warehouse=$${LAKEKEEPER_WAREHOUSE}
         iceberg.rest-catalog.vended-credentials-enabled=true
+        iceberg.rest-catalog.security=OAUTH2
+        iceberg.rest-catalog.oauth2.token=$${TRINO_TOKEN}
         fs.s3.enabled=true
         s3.endpoint=$${CH_RUSTFS_S3_ENDPOINT}
         s3.region=us-east-1

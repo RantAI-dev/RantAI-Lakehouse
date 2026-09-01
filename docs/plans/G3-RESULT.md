@@ -122,6 +122,25 @@ dropped from ~1.05s to ~0.053s — matching the control table, i.e. full
 recovery. See `docker-compose.yml`'s `trino` / `trino-maintenance-cron`
 services (`trino` profile) and ADR 0009.
 
+## Update (R1): Trino now authenticates to Lakekeeper
+
+The measurement above predates R1 (`docs/adr/0011-lakekeeper-authorization.md`)
+and was taken against a Lakekeeper running `authz-backend: "allow-all"`.
+Since R1, Lakekeeper authorization is enforced by default, and the `trino`
+compose service authenticates as its own principal (granted `select` +
+`modify` on the warehouse) via `iceberg.rest-catalog.oauth2.token` in
+`docker-compose.yml`'s `trino` service — no operator action needed beyond
+bringing the `trino` profile up normally (`--profile trino up -d`, then
+`--profile trino run --rm` or letting `trino-maintenance-cron` run on its
+schedule); `lakekeeper-authz-init` grants the `trino` principal
+automatically as part of the same bring-up every other principal in this
+build uses. A second, smaller re-measurement under enforcement (`docs/adr/
+0011-lakekeeper-authorization.md`'s "Trino, granted" section):
+`bronze.g1_rust_write`, 3 data files -> 1 after `EXECUTE optimize`, run as
+the `trino` principal (not an instance-admin/superuser identity) — same
+compaction shape as the 280 -> 14 measurement above, smaller only because
+it reused G1's own fixture table rather than a synthetic load.
+
 ## Scope note
 
 This is the one-time performance measurement that decided the escape

@@ -129,6 +129,7 @@ warehouse:
 | `debezium` | `create`, `modify`, `select` | P5 CDC (`debezium-server-iceberg`): creates the table on first snapshot, upserts continuously. |
 | `dlt` | `create`, `modify`, `select` | P3 dlt pipeline (Dagster code location): same shape as `rust-iceberg` — a Bronze table writer. |
 | `clickhouse-reader` | `select`, `modify` | Every gate's ClickHouse read path (`select`), **plus** `modify` for `maintenance.py`'s `expire_snapshots` — the one ClickHouse catalog WRITE that works on this ClickHouse version (`docs/plans/G3-RESULT.md`; `CREATE TABLE`/`INSERT` still do not, per `G1-RESULT.md`). See "Over-grants" below. |
+| `trino` | `select`, `modify` | ADR 0009's compaction escape hatch (`trino-maintenance-cron`'s `ALTER TABLE ... EXECUTE optimize`): reads existing Bronze data files and commits a rewritten snapshot — a `select`+`modify` shape, not a `create` one (it never creates a namespace or table). See "Trino" below for the measured proof. |
 | `unauthorized-test` | none | The negative-test principal — self-registered with Lakekeeper (it has an identity) but never granted anything. |
 | `admin` | none (instance-admin bypass) | `LAKEKEEPER__INSTANCE_ADMINS=["oidc~admin"]` — bypasses authorization for control-plane actions only (confirmed via Lakekeeper's own startup log: "these principals bypass authorization for all control-plane actions (but not for `CatalogTableAction::ReadData`/`WriteData`)"). Used only by the one-shot init jobs to bootstrap Lakekeeper and grant the others; never used by a running writer, and cannot itself read or write Bronze data. |
 
@@ -148,11 +149,49 @@ deployment wants read and maintenance identities cryptographically
 separated, `ops/oidc-mock`'s `PRINCIPALS` list and
 `lakekeeper-authz-init`'s grant calls are the two places to split it.
 
-**Not granted at all: `trino`.** The `trino`/`trino-maintenance-cron`
-profile services are not part of this session's re-run list (none of the
-five gates exercise them) and are not granted a principal. Using the
-`trino` profile together with R1 authorization today means every catalog
-call Trino makes is denied — a real, open gap, not silently papered over.
+**Trino, granted (closing an earlier gap in this ADR):** an initial
+version of this ADR left `trino` ungranted — ADR 0009's compaction escape
+hatch (the *only* working remedy for Bronze small-file accumulation on
+this ClickHouse version: `OPTIMIZE` fails `403`, `remove_orphan_files`
+does not exist) would have been silently denied under R1's enforced-by-
+default posture, which is worse than either problem alone. `trino` is now
+granted `select`+`modify` the same way as the other writers. Trino's
+`trino-iceberg` plugin (measured directly from the shipped
+`IcebergRestCatalogConfig`/`OAuth2SecurityConfig` classes in
+`trinodb/trino:483`'s plugin jar) supports a static bearer token exactly
+like `iceberg-catalog-rest`'s and pyiceberg's `token` properties:
+`iceberg.rest-catalog.security=OAUTH2` +
+`iceberg.rest-catalog.oauth2.token=<token>` sends the token as-is, no
+OAuth2 exchange. `docker-compose.yml`'s `trino` service reads the
+`trino` principal's pre-minted token from the shared token volume
+(`ops/oidc-mock`) into that property the same way `debezium-server`
+does. Measured proof:
+
+Measured against a clean stack (`bronze.g1_rust_write`, built by running
+`g1-test-runner`'s `g1_half_a` five times against the same table — each
+run either creates the table or appends to it):
+
+```
+$ trino --execute 'SELECT count(*) FROM iceberg.bronze."g1_rust_write$files"'
+"3"
+$ trino --execute "ALTER TABLE iceberg.bronze.g1_rust_write EXECUTE optimize"
+ALTER TABLE EXECUTE
+"rewritten_data_files_count","3"
+"removed_delete_files_count","0"
+"added_data_files_count","1"
+$ trino --execute 'SELECT count(*) FROM iceberg.bronze."g1_rust_write$files"'
+"1"
+$ trino --execute "SELECT count(*) FROM iceberg.bronze.g1_rust_write"
+"6"
+```
+
+**3 data files -> 1**, row count unchanged (6, matching the 3 successful
+appends' 2 rows each) — the same compaction shape as the pre-R1
+measurement in `docs/plans/G3-RESULT.md` (280 -> 14), run smaller here
+only because this stack's own G1 fixture is a much smaller table than
+G3's synthetic load. `trino --execute` ran as the `trino` principal, over
+the exact `iceberg.rest-catalog.oauth2.token` wiring `docker-compose.yml`
+ships — this is not a superuser/instance-admin path.
 
 ## Decision 5 — the negative test
 
@@ -229,8 +268,8 @@ that ClickHouse's READ path (and its one working write verb,
 unauthorized caller is genuinely denied — not that R1's original sentence
 was fully exercised.
 
-Also not exercised this session: the `trino` profile under enforcement
-(Decision 4), and Lakekeeper's own `/v1/oauth/tokens` endpoint (this
-build's ClickHouse principal bypasses it entirely via `oauth_server_uri`
-pointed at `ops/oidc-mock` — whether Lakekeeper's own endpoint works at
-all, with what identity provider wiring, is unknown).
+Also not exercised: Lakekeeper's own `/v1/oauth/tokens` endpoint (both
+ClickHouse's and Trino's principals bypass it entirely via
+`oauth_server_uri`/a static `oauth2.token`, pointed at `ops/oidc-mock` —
+whether Lakekeeper's own endpoint works at all, with what identity
+provider wiring, is unknown).

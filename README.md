@@ -363,8 +363,10 @@ issue about any of the following — they're known, not bugs:
   of authorization — see above and `docs/plans/G1-RESULT.md`), so R1's
   original framing ("ClickHouse catalog-registered
   writes fail against Lakekeeper's authz on metadata updates") is still
-  untestable; and the `trino` compose profile is not granted a principal
-  yet, so it does not work together with authorization enabled.
+  untestable. The `trino` compose profile (ADR 0009's small-file-
+  compaction escape hatch) is granted its own principal too — `EXECUTE
+  optimize` measured working under enforcement (3 data files -> 1 on a
+  live Bronze table; see ADR 0011 and `docs/plans/G3-RESULT.md`).
 - **`getWorkspaceSettings` returns a fixed response.** The contract has no
   setter; workspace settings are not actually persisted or configurable
   yet.
