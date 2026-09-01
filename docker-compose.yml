@@ -1017,13 +1017,21 @@ services:
     working_dir: /work
     volumes:
       - ./ops/g4:/work
-      - ./ops/debezium/deprovision_connector.sh:/work/deprovision_connector.sh:ro
+      # Mounted OUTSIDE `/work` deliberately: `/work` itself is a bind
+      # mount (above) to `./ops/g4` on the host, and a nested bind mount
+      # under an already-bind-mounted directory makes Docker create the
+      # mount point ON THE HOST at that path (an empty
+      # `ops/g4/deprovision_connector.sh` file, observed during P5
+      # verification) — mounting it at `/opt/...` instead avoids leaving
+      # that stray artifact in the repo tree.
+      - ./ops/debezium/deprovision_connector.sh:/opt/deprovision_connector.sh:ro
     depends_on:
       debezium-server:
         condition: service_started
       g4-source-init:
         condition: service_completed_successfully
     environment:
+      DEPROVISION_SCRIPT: /opt/deprovision_connector.sh
       CH_URL: http://clickhouse:8123
       CH_USER: ${CH_USER:-default}
       CH_PASSWORD: ${CH_PASSWORD:-}

@@ -202,7 +202,7 @@ def step_verify_slot_cleanup_on_connector_delete() -> None:
     )
     print(f"[g4] slot 'p5cdc_slot' exists before deprovisioning, wal_retained_bytes={wal_retained_before}")
 
-    script = os.environ.get("DEPROVISION_SCRIPT", "/work/deprovision_connector.sh")
+    script = os.environ.get("DEPROVISION_SCRIPT", "/opt/deprovision_connector.sh")
     result = subprocess.run(["sh", script, "p5cdc"], capture_output=True, text=True, check=False)
     print(result.stdout)
     if result.returncode != 0:
