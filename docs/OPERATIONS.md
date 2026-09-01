@@ -138,17 +138,32 @@ compose up`. Brings up `dagster-db-init` (one-shot: creates Dagster's own
 `dagster/Dockerfile` — see ADR 0005), `dagster-webserver` (GraphQL API +
 UI, port `3000`), and `dagster-daemon` (schedules/sensors/run queueing).
 
+Put `DAGSTER_URL` in `.env` — do **not** rely on prefixing it onto a single
+command:
+
 ```bash
-DAGSTER_URL=http://dagster-webserver:3000/graphql \
-  docker compose --profile dagster up -d --build \
-    lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+# .env
+DAGSTER_URL=http://dagster-webserver:3000/graphql
+```
+```bash
+docker compose --profile dagster up -d --build \
+  lakehouse-api dagster-code-location dagster-webserver dagster-daemon
 ```
 
-`DAGSTER_URL` must be exported (or set in `.env`) **before** bringing
-`lakehouse-api` up with the `dagster` profile — its own default
-(`http://dagster.invalid:13030/graphql`) is a deliberately-unreachable
-placeholder (see the service definition's comment), so pipeline routes
-stay `503` unless an operator opts in explicitly.
+`lakehouse-api`'s own default (`http://dagster.invalid:13030/graphql`) is a
+deliberately-unreachable placeholder (see the service definition's comment),
+so pipeline routes stay `503` unless an operator opts in explicitly.
+
+**Why `.env` and not a one-off `VAR=… docker compose up`:** a later
+`docker compose run` (for example the `g3a-test-runner`) re-creates
+`lakehouse-api` as part of resolving its `depends_on` chain. A value that
+existed only in the environment of the earlier `up` invocation is not
+present for that re-creation, so the container comes back on the
+`dagster.invalid` default and every Dagster-backed route silently reverts to
+`503`. This was observed as `GET /api/governance/audit` returning
+`503 {"error":"Error: fetch failed"}` mid-way through an otherwise-passing
+G3a run — the ingest itself succeeded, so the symptom appears only on the
+routes that reach Dagster, not on the ones that read ClickHouse.
 
 **Failure mode:** if `dagster-webserver`/`dagster-code-location` are down,
 `lakehouse-dagster::DgClient` calls fail exactly the way they already do
