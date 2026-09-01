@@ -285,3 +285,43 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose -p g3aci down -v
+
+  # ── P4 (G3) acceptance (docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md §3) —
+  # the Bronze maintenance job (expire_snapshots, the one measured-working
+  # verb — see docs/plans/G3-RESULT.md for why remove_orphan_files and
+  # OPTIMIZE are NOT run in-engine) and the dry_run metrics console
+  # surface (GET /api/governance/maintenance). Same shape as g3a-dagster
+  # above; see ops/g3/g3_test.py. ──
+  g3-maintenance:
+    name: Rust · G3 Bronze maintenance job
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write CI-only .env
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          EOF
+
+      - name: Bring up lakehouse-api + Dagster + the G3a source table
+        run: >
+          docker compose -p g3ci --profile dagster up -d --build
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+          g3a-source-init
+
+      - name: Run the G3/P4 maintenance acceptance test inside the compose network
+        run: docker compose -p g3ci --profile dagster run --rm g3-maintenance-test-runner
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g3ci logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -p g3ci down -v

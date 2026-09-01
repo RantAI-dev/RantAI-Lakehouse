@@ -747,6 +747,116 @@ services:
       - "pip install -q requests && python g3a_test.py"
     restart: "no"
 
+  # P4 (G3) — functional acceptance test for the maintenance job + the
+  # `dry_run` metrics console surface (`GET /api/governance/maintenance`).
+  # `docs/plans/G3-RESULT.md` has the one-time synthetic-load performance
+  # measurement that decided the Trino escape hatch below; this is the
+  # CI-repeatable correctness check, same `g1-test-runner`/`g3a-test-runner`
+  # shape. `dagster` profile (not `test`) for the same reason
+  # `g3a-source-init`'s comment gives: it depends on `dagster-webserver`,
+  # itself `dagster`-gated.
+  g3-maintenance-test-runner:
+    profiles: ["dagster"]
+    image: python:3.12-slim
+    working_dir: /work
+    volumes:
+      - ./ops/g3:/work
+    depends_on:
+      lakehouse-api:
+        condition: service_started
+      dagster-webserver:
+        condition: service_healthy
+    environment:
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      DAGSTER_URL: http://dagster-webserver:3000/graphql
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "pip install -q requests && python g3_test.py"
+    restart: "no"
+
+  # P4 (G3) — the pre-authorized escape hatch (ADR 0009). ClickHouse 26.3
+  # has NO working small-file-compaction path against a catalog-registered
+  # Iceberg table (`OPTIMIZE` parses but always fails at runtime with an
+  # S3 403 — measured, not assumed; see `docs/plans/G3-RESULT.md`), and
+  # `expire_snapshots` (the one maintenance verb that DOES work) does not
+  # compact files either — it reclaims old snapshots/manifests. Trino's own
+  # `ALTER TABLE ... EXECUTE optimize` against the SAME Lakekeeper/RustFS
+  # stack measured working (280 tiny files -> 14, one per partition,
+  # restoring query-planning time to baseline). This is a coordinator-only,
+  # single-node Trino, scoped to ONE catalog (`iceberg`, rendered below at
+  # container start) — it never touches Silver/Gold (ClickHouse MergeTree,
+  # not Iceberg).
+  trino:
+    profiles: ["trino"]
+    image: trinodb/trino:483
+    depends_on:
+      lakekeeper-warehouse-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+    entrypoint: ["/bin/sh", "-c"]
+    # Trino's base image has no `envsubst`/`python3` (RHEL UBI, verified
+    # empirically), so the catalog properties file is written directly
+    # here via an UNQUOTED heredoc — `sh` expands `$LAKEKEEPER_CATALOG_URI`
+    # etc. itself (from this service's own `environment:` block above), no
+    # extra tooling needed. `$$` (not `$`) in front of each variable below
+    # is deliberate: it stops docker compose's OWN `${VAR}` interpolation
+    # from resolving these against the host/`.env` at compose-parse time,
+    # so the literal `${VAR}` reaches the container's shell instead.
+    command:
+      - |
+        mkdir -p /etc/trino/catalog && cat > /etc/trino/catalog/iceberg.properties <<EOF
+        connector.name=iceberg
+        iceberg.catalog.type=rest
+        iceberg.rest-catalog.uri=$${LAKEKEEPER_CATALOG_URI}
+        iceberg.rest-catalog.warehouse=$${LAKEKEEPER_WAREHOUSE}
+        iceberg.rest-catalog.vended-credentials-enabled=true
+        fs.s3.enabled=true
+        s3.endpoint=$${CH_RUSTFS_S3_ENDPOINT}
+        s3.region=us-east-1
+        s3.path-style-access=true
+        s3.aws-access-key=$${RUSTFS_ACCESS_KEY}
+        s3.aws-secret-key=$${RUSTFS_SECRET_KEY}
+        EOF
+        exec /usr/lib/trino/bin/run-trino
+    ports:
+      - "${TRINO_HOST_PORT:-8090}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+  # P4 (G3) — the cron loop itself (`ops/trino/optimize_bronze.sh`):
+  # `SHOW TABLES FROM iceberg.bronze` then `ALTER TABLE ... EXECUTE
+  # optimize` per table, on `TRINO_CRON_INTERVAL_SECONDS` (default 6h).
+  # Same image as `trino` (already has the `trino` CLI), no coordinator
+  # role of its own.
+  trino-maintenance-cron:
+    profiles: ["trino"]
+    image: trinodb/trino:483
+    depends_on:
+      trino:
+        condition: service_healthy
+    environment:
+      TRINO_CRON_INTERVAL_SECONDS: ${TRINO_CRON_INTERVAL_SECONDS:-21600}
+    volumes:
+      - ./ops/trino/optimize_bronze.sh:/opt/optimize_bronze.sh:ro
+    entrypoint: ["/bin/sh", "/opt/optimize_bronze.sh"]
+    restart: unless-stopped
+
 volumes:
   lakehouse_postgres_data:
   lakehouse_clickhouse_data:
