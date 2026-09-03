@@ -207,9 +207,17 @@ def step_verify_rows_in_clickhouse() -> int:
         f"storage_endpoint = '{CH_RUSTFS_S3_ENDPOINT}'{ch_auth_settings()} "
         "SETTINGS allow_database_iceberg = 1"
     )
+    # Never a bare, unqualified row-count query here: ClickHouse 26.3
+    # takes a metadata-only fast path against a merge-on-read Iceberg
+    # table that overcounts on equality deletes (P5-RESULT.md; R11 in the
+    # risk register, enforced by the ops/lint R11 guard script). This
+    # table has no deletes today, but the WHERE-qualified form is the
+    # only sanctioned shape for any Bronze Iceberg row count, regardless
+    # of whether the bug is currently observable for this particular
+    # table.
     count_text = ch_query(
         f"SELECT count() FROM icecat_g3a.`bronze.{BRONZE_TABLE_NAME}` "
-        "SETTINGS allow_database_iceberg = 1 FORMAT TabSeparated"
+        "WHERE 1 SETTINGS allow_database_iceberg = 1 FORMAT TabSeparated"
     )
     count = int(count_text.strip())
     if count <= 0:

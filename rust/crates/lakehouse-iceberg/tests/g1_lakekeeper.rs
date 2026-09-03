@@ -309,8 +309,14 @@ async fn g1_half_a_rust_writes_clickhouse_reads() {
     );
     ch_query(&env, &create_db_sql).await;
 
+    // Never a bare, unqualified row-count query against a Bronze Iceberg
+    // table: ClickHouse 26.3 takes a metadata-only fast path that
+    // overcounts once equality deletes are present (P5-RESULT.md; R11 in
+    // the risk register, enforced by the ops/lint R11 guard script). This
+    // table is append-only today, but the WHERE-qualified form is the
+    // only sanctioned shape.
     let select_sql = format!(
-        "SELECT count() FROM {ch_db}.`bronze.{table_name}` SETTINGS allow_database_iceberg = 1 FORMAT TabSeparated"
+        "SELECT count() FROM {ch_db}.`bronze.{table_name}` WHERE 1 SETTINGS allow_database_iceberg = 1 FORMAT TabSeparated"
     );
     let count_text = ch_query(&env, &select_sql).await;
     let count: usize = count_text
