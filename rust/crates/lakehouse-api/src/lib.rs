@@ -25,6 +25,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod connector_probe;
 pub mod error;
 pub mod json;
 pub mod policy;

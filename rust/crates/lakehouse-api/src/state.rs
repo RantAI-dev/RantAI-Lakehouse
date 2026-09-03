@@ -8,6 +8,7 @@ use lakehouse_auth::{
     SessionAuthenticator,
 };
 use lakehouse_clickhouse::ChClient;
+use lakehouse_core::secret::{DynSecretResolver, EnvSecretResolver};
 use lakehouse_dagster::DgClient;
 use lakehouse_embed::EmbedSecretResolver;
 use lakehouse_llm::LlmClient;
@@ -77,6 +78,15 @@ pub struct AppState {
     /// see `routes::identity::pool`, the first (and so far only) reader of
     /// this field.
     pub pg: Option<Arc<PgPool>>,
+    /// Resolves a connector's `secretRef` to an actual credential value —
+    /// [`crate::connector_probe`]'s only source of one, per ADR 0002. Always
+    /// [`EnvSecretResolver`] today (the only implementation that exists;
+    /// see `lakehouse_core::secret`'s module doc comment for the operator
+    /// guidance that goes with that). `Arc<dyn DynSecretResolver>`, not a
+    /// concrete type, so a later `FileSecretResolver`/external-provider
+    /// implementation swaps in here without changing this field's type or
+    /// any reader of it.
+    pub secret_resolver: Arc<dyn DynSecretResolver>,
     /// The configured authenticators, or `None` under the exact same
     /// condition as [`Self::pg`] being `None` (no Postgres pool). When
     /// `None`, `crate::auth::AuthenticatedPrincipal` and every protected
@@ -160,6 +170,7 @@ impl AppState {
             embed_secret: Arc::new(embed_secret),
             llm: Arc::new(llm),
             pg,
+            secret_resolver: Arc::new(EnvSecretResolver::new()),
             auth,
         }
     }

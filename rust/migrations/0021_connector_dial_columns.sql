@@ -1,0 +1,11 @@
+-- P6: a real connectivity probe (`lakehouse-api`'s `connector_probe`
+-- module) needs, for connector types that authenticate with two distinct
+-- credential parts (e.g. S3's access key id + secret access key), a SECOND
+-- `secretRef`-shaped reference alongside the one `0013_connectors.sql`
+-- already has. `secret_ref` keeps meaning "the primary credential
+-- reference" (a password, or an access key id); `secret_ref_secondary` is
+-- `NULL` for every connector type that only ever needs one (PostgreSQL,
+-- most REST APIs) and holds a second REFERENCE NAME — never a credential
+-- value, same rule as `secret_ref` itself, see `0013_connectors.sql`'s
+-- header comment — for the ones that need two.
+ALTER TABLE connector ADD COLUMN secret_ref_secondary TEXT;

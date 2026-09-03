@@ -43,14 +43,21 @@ store). Both are deliberate and documented.
 
 ### Stubbed — looks real, is not
 
-- **`connectors`** is a CRUD registry. `connectors::test_connection`
-  (`lakehouse-store/src/connectors.rs:444`) opens no socket: it bumps
-  `last_test_at` and returns stored health with hardcoded latency
-  (84ms / 2400ms). `secretRef` is never resolved to a credential.
-- **`0014_seed_connectors.sql`** seeds 28 connectors — Kafka, MQTT, MongoDB,
-  Oracle, SAP, SFTP, Iceberg, S3 — **none of which can dial**. Treat this as
-  demo fixture, not a requirements list; it shrinks to match reality in P6.
 - **Storage Cold/AI tiers** always report zero.
+
+**Resolved in P6:** `connectors::test_connection` used to open no socket —
+it bumped `last_test_at` and returned stored health with a hardcoded
+latency (84ms / 2400ms), and `0014_seed_connectors.sql` seeded 28
+connectors (Kafka, MQTT, MongoDB, Oracle, SAP, SFTP, Iceberg, S3) none of
+which could dial. As of P6: `POST /api/connectors/{id}/test` genuinely
+dials **PostgreSQL** and **S3-compatible object storage** (`lakehouse-api`'s
+new `connector_probe` module, resolving `secretRef` via ADR 0002's
+`SecretResolver`) and reports real measured latency; every other connector
+`type` returns `supported: false` with an honest message, never a
+fabricated result. `0022_prune_connector_seed.sql` shrank the seed to the
+two connectors this build can actually dial against the compose stack
+(`conn-pg-lakehouse`, `conn-s3-warehouse`) — see that migration and
+`connector_probe.rs`'s module doc comments for the full record.
 
 ### Doc accuracy
 

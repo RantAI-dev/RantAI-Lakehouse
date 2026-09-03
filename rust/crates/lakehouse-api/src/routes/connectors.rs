@@ -155,12 +155,11 @@ pub async fn create(
 
 /// `POST /api/connectors/{id}/test` — test a connector's connection.
 ///
-/// Does NOT open a real network connection — see
-/// `lakehouse_store::connectors::test_connection`'s doc comment for why
-/// (this service never resolves a `secretRef` to an actual credential, and
-/// is not permitted to originate connections to operator-configured
-/// external systems in this environment). The result reflects the
-/// connector's last known stored health.
+/// Opens a REAL, bounded (5s, no retries) connectivity probe for
+/// `PostgreSQL` and S3-compatible object-storage connectors — see
+/// `crate::connector_probe`'s module doc comment for exactly what that
+/// does and does not cover. Every other connector `type` gets an honest
+/// `supported: false` result, never a fabricated latency or success.
 ///
 /// # Errors
 ///
@@ -169,7 +168,21 @@ pub async fn test_connection(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<connectors::ConnectorTestResult>> {
-    match connectors::test_connection(pool(&state)?, &id).await {
+    let dial_info = connectors::get_connector_dial_info(pool(&state)?, &id).await?;
+    let Some(dial_info) = dial_info else {
+        return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
+    };
+    let outcome = crate::connector_probe::probe(&dial_info, state.secret_resolver.as_ref()).await;
+    match connectors::record_test_result(
+        pool(&state)?,
+        &id,
+        outcome.ok,
+        outcome.supported,
+        outcome.latency_ms,
+        &outcome.message,
+    )
+    .await
+    {
         Ok(result) => Ok(ApiJson(result)),
         Err(lakehouse_store::StoreError::NotFound) => {
             Err(ApiError::NotFound(format!("Connector {id} not found")).into())

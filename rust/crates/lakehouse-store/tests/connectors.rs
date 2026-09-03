@@ -21,18 +21,21 @@ use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
 use lakehouse_store::connectors::{
-    CreateConnectorInput, create_connector, delete_connector, get_connector, list_connectors,
-    test_connection,
+    CreateConnectorInput, create_connector, delete_connector, get_connector,
+    get_connector_dial_info, list_connectors, record_test_result,
 };
 use lakehouse_store::pipelines::{CreatePipelineInput, create_pipeline};
 use sqlx::PgPool;
 
-/// The seed lands the full `mock/connectors.ts` fixture set.
+/// P6 shrank the seed to the two connector types this build can actually
+/// dial (`0022_prune_connector_seed.sql`) — see that migration's header
+/// comment for why the 28-row `mock/connectors.ts` fixture was removed.
 #[sqlx::test(migrations = "../../migrations")]
 async fn seed_populates_connector_list(pool: PgPool) -> sqlx::Result<()> {
     let connectors = list_connectors(&pool).await.unwrap();
-    assert_eq!(connectors.len(), 28);
-    assert!(connectors.iter().any(|c| c.id == "conn-pg-oms"));
+    assert_eq!(connectors.len(), 2);
+    assert!(connectors.iter().any(|c| c.id == "conn-pg-lakehouse"));
+    assert!(connectors.iter().any(|c| c.id == "conn-s3-warehouse"));
     Ok(())
 }
 
@@ -82,7 +85,7 @@ async fn created_connector_never_carries_host_or_secret_ref_on_the_wire(
 #[sqlx::test(migrations = "../../migrations")]
 async fn create_connector_rejects_duplicate_name(pool: PgPool) -> sqlx::Result<()> {
     let input = CreateConnectorInput {
-        name: "order management system (CDC)".to_owned(), // seeded name
+        name: "Lakehouse OLTP (Postgres)".to_owned(), // seeded name
         kind: "REST API".to_owned(),
         direction: "source".to_owned(),
         host: "h".to_owned(),
@@ -155,31 +158,118 @@ async fn dependent_pipelines_are_derived_from_pipeline_definition(
     Ok(())
 }
 
-/// `test_connection` reports `ok` from the connector's stored `health`, and
-/// stamps `lastTestAt` forward.
+/// `get_connector_dial_info` hands back exactly the fields a real probe
+/// needs — including `secret_ref_secondary` for the S3 connector, which
+/// `get_connector`/`list_connectors` never expose at all.
 #[sqlx::test(migrations = "../../migrations")]
-async fn test_connection_reflects_stored_health_and_stamps_last_test_at(
-    pool: PgPool,
-) -> sqlx::Result<()> {
-    let before = get_connector(&pool, "conn-pg-oms").await.unwrap().unwrap();
-    let result = test_connection(&pool, "conn-pg-oms").await.unwrap();
-    assert!(result.ok, "conn-pg-oms is seeded healthy");
-    let after = get_connector(&pool, "conn-pg-oms").await.unwrap().unwrap();
-    assert_ne!(
-        before.connector.last_test_at, after.connector.last_test_at,
-        "testConnection must stamp lastTestAt forward"
+async fn dial_info_returns_type_host_and_secret_refs(pool: PgPool) -> sqlx::Result<()> {
+    let pg = get_connector_dial_info(&pool, "conn-pg-lakehouse")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pg.kind, "PostgreSQL");
+    assert_eq!(pg.host, "lakehouse@postgres:5432/lakehouse");
+    assert_eq!(pg.secret_ref, "env:POSTGRES_PASSWORD");
+    assert_eq!(pg.secret_ref_secondary, None);
+
+    let s3 = get_connector_dial_info(&pool, "conn-s3-warehouse")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s3.kind, "Object storage");
+    assert_eq!(
+        s3.secret_ref_secondary.as_deref(),
+        Some("env:RUSTFS_SECRET_KEY")
     );
 
-    let unhealthy = test_connection(&pool, "conn-gsheets-ops").await.unwrap();
-    assert!(!unhealthy.ok, "conn-gsheets-ops is seeded unhealthy");
+    assert!(
+        get_connector_dial_info(&pool, "conn-does-not-exist")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    Ok(())
+}
+
+/// `record_test_result` persists exactly what the caller measured — never
+/// derives `ok`/`latency_ms` itself — and stamps `lastTestAt` forward.
+/// `health` follows `ok` only when `supported` is `true`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_test_result_persists_outcome_and_stamps_last_test_at(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let before = get_connector(&pool, "conn-pg-lakehouse")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let ok_result = record_test_result(&pool, "conn-pg-lakehouse", true, true, Some(12), "ok")
+        .await
+        .unwrap();
+    assert!(ok_result.ok);
+    assert!(ok_result.supported);
+    assert_eq!(ok_result.latency_ms, Some(12));
+    let after_ok = get_connector(&pool, "conn-pg-lakehouse")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_ok.connector.health, "healthy");
+    assert_ne!(
+        before.connector.last_test_at, after_ok.connector.last_test_at,
+        "record_test_result must stamp lastTestAt forward"
+    );
+
+    let fail_result = record_test_result(
+        &pool,
+        "conn-pg-lakehouse",
+        false,
+        true,
+        Some(4999),
+        "refused",
+    )
+    .await
+    .unwrap();
+    assert!(!fail_result.ok);
+    let after_fail = get_connector(&pool, "conn-pg-lakehouse")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_fail.connector.health, "unhealthy");
+
+    // Unsupported: health is left untouched, and no latency is recorded.
+    let before_unsupported = get_connector(&pool, "conn-pg-lakehouse")
+        .await
+        .unwrap()
+        .unwrap();
+    let unsupported_result = record_test_result(
+        &pool,
+        "conn-pg-lakehouse",
+        false,
+        false,
+        None,
+        "unsupported",
+    )
+    .await
+    .unwrap();
+    assert!(!unsupported_result.ok);
+    assert!(!unsupported_result.supported);
+    assert_eq!(unsupported_result.latency_ms, None);
+    let after_unsupported = get_connector(&pool, "conn-pg-lakehouse")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after_unsupported.connector.health, before_unsupported.connector.health,
+        "an unsupported test must not change stored health"
+    );
     Ok(())
 }
 
 /// Testing a connector that doesn't exist is a `NotFound`, not a panic or a
 /// silently-empty success.
 #[sqlx::test(migrations = "../../migrations")]
-async fn test_connection_not_found_for_unknown_id(pool: PgPool) -> sqlx::Result<()> {
-    let err = test_connection(&pool, "conn-does-not-exist")
+async fn record_test_result_not_found_for_unknown_id(pool: PgPool) -> sqlx::Result<()> {
+    let err = record_test_result(&pool, "conn-does-not-exist", true, true, Some(1), "x")
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::NotFound));

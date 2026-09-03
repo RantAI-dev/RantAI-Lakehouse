@@ -38,11 +38,18 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
+sqlx = { workspace = true }
+# `connector_probe`'s real S3-compatible connectivity test — same crate,
+# same version, and the same `aws` feature `lakehouse-iceberg` already uses
+# for RustFS. Not a `lakehouse-iceberg` dependency: that crate's Iceberg
+# `Storage`/catalog machinery is unrelated to a cheap "can this build reach
+# this bucket" probe, and `lakehouse-api` does not otherwise depend on
+# `lakehouse-iceberg` (P6 doesn't wire routes to it).
+object_store = { version = "0.14", features = ["aws"] }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
-sqlx = { workspace = true }
 uuid = { workspace = true }
 lakehouse-test-support = { path = "../lakehouse-test-support" }
 

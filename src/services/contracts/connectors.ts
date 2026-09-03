@@ -35,8 +35,16 @@ export type ConnectorDetail = Connector & {
 }
 
 export type ConnectorTestResult = {
+  /** Whether a real connectivity probe succeeded. Always `false` when `supported` is `false`. */
   ok: boolean
-  latencyMs: number
+  /**
+   * Whether this build knows how to dial this connector's type at all.
+   * `false` for every type except PostgreSQL and S3-compatible object
+   * storage today — see `rust/crates/lakehouse-api/src/connector_probe.rs`.
+   */
+  supported: boolean
+  /** Real measured latency in milliseconds; `null` when `supported` is `false` (no attempt was made). */
+  latencyMs: number | null
   message: string
   testedAt: string
 }

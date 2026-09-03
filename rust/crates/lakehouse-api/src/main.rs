@@ -9,6 +9,7 @@
 
 mod auth;
 mod config;
+mod connector_probe;
 mod error;
 mod json;
 mod policy;

@@ -19,11 +19,12 @@
 //!    a future edit could accidentally remove. [`Connector`]'s shape is
 //!    exactly `contracts/connectors.ts`'s `Connector` type, which likewise
 //!    has no such field.
-//! 2. [`ConnectorRow`] (the only place `host`/`secret_ref` are held
-//!    in-process) has a hand-written [`std::fmt::Debug`] that redacts both,
-//!    so an errant `tracing::debug!(?row)` or test failure message never
-//!    prints either — same pattern `lakehouse-api::config::Config` already
-//!    uses for `ch_password`/`llm_key`/`database_url`.
+//! 2. [`ConnectorRow`] and [`ConnectorDialInfo`] (the only two places
+//!    `host`/`secret_ref` are held in-process) never print either value:
+//!    `ConnectorRow` has a hand-written [`std::fmt::Debug`] that redacts
+//!    both — same pattern `lakehouse-api::config::Config` already uses for
+//!    `ch_password`/`llm_key`/`database_url` — and `ConnectorDialInfo` goes
+//!    further, having no `Debug` impl at all (see its doc comment).
 //! 3. [`create_connector`] rejects a `secret_ref` that is *shaped* like a
 //!    raw secret (long hex/base64 blob, JWT, PEM block, `user:pass@host`)
 //!    via [`looks_like_raw_secret`] — defense in depth against a caller
@@ -32,6 +33,14 @@
 //!    no way to read `secret_ref` back out through any GET response), but
 //!    rejecting it at the write is strictly better than accepting garbage
 //!    that violates this module's whole reason for existing.
+//!
+//! As of P6, [`get_connector_dial_info`] hands `host`/`secret_ref` to
+//! exactly one caller — `lakehouse-api`'s `connector_probe` module — so a
+//! real connectivity test can resolve the referenced credential via
+//! [`lakehouse_core::secret::SecretResolver`] (ADR 0002) and attempt a
+//! bounded, timed-out dial. That module still never logs or serializes the
+//! resolved value; it only ever reports whether the dial succeeded, how
+//! long it took, and a human-readable message.
 
 use serde::Serialize;
 use sqlx::FromRow;
@@ -154,10 +163,12 @@ pub struct RecentError {
     pub message: String,
 }
 
-/// The row [`list_connectors`]/[`get_connector`]/[`create_connector`]/
-/// [`test_connection`] select. Holds `host`/`secret_ref` — the only place
-/// in this crate that does — hence the hand-written [`std::fmt::Debug`]
-/// below that redacts both. See the module doc comment, guarantee 2.
+/// The row [`list_connectors`]/[`get_connector`]/[`create_connector`]
+/// select. Holds `host`/`secret_ref` — hence the hand-written
+/// [`std::fmt::Debug`] below that redacts both. See the module doc
+/// comment, guarantee 2. [`get_connector_dial_info`] deliberately does NOT
+/// go through this type — it runs its own narrower query into
+/// [`ConnectorDialInfo`], which has no `Debug` impl at all.
 #[derive(FromRow)]
 struct ConnectorRow {
     id: String,
@@ -406,60 +417,137 @@ pub async fn create_connector(
     Ok(row.into())
 }
 
-/// The outcome of [`test_connection`]. Mirrors `ConnectorTestResult`.
+/// The outcome of a connectivity test. Mirrors `ConnectorTestResult`.
+///
+/// As of P6, this is only ever built from a REAL probe result
+/// (`lakehouse-api`'s `connector_probe` module) via
+/// [`record_test_result`] — never fabricated here. `latency_ms` is `None`
+/// exactly when `supported` is `false`: an untested connector type must
+/// never report a latency it did not measure.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectorTestResult {
-    /// Whether the (simulated) test succeeded.
+    /// Whether a real connectivity probe succeeded. Always `false` when
+    /// `supported` is `false` — an unsupported type is never reported as a
+    /// success.
     pub ok: bool,
-    /// Simulated latency, milliseconds.
-    pub latency_ms: i64,
-    /// Human-readable result message.
+    /// Whether this build knows how to dial this connector's type at all.
+    /// `false` for every type besides `PostgreSQL` and S3-compatible object
+    /// storage today — see `connector_probe`'s module doc comment for the
+    /// full list and why.
+    pub supported: bool,
+    /// Real measured latency in milliseconds, or `None` when `supported`
+    /// is `false` (no attempt was made, so no latency exists to report).
+    pub latency_ms: Option<i64>,
+    /// Human-readable result message. For an unsupported type, states
+    /// plainly that this build cannot test it — never a fabricated
+    /// success/failure message.
     pub message: String,
     /// When the test ran, ISO 8601.
     pub tested_at: String,
 }
 
-/// "Test" a connector's connection and stamp `lastTestAt`.
+/// Fetch the connectivity-relevant fields (`type`, `host`, `secret_ref`,
+/// `secret_ref_secondary`) needed to attempt a real dial. Returns
+/// `Ok(None)` if `id` does not name a connector.
 ///
-/// # What this does NOT do
+/// Deliberately returns a dedicated [`ConnectorDialInfo`] rather than
+/// [`Connector`] or [`ConnectorRow`] — see that type's doc comment for why
+/// it has no `Debug` impl at all.
 ///
-/// This does not open a real network connection to the connector's `host`
-/// using the credential `secret_ref` points at. Nothing in this service
-/// resolves `secret_ref` to an actual credential (see the module doc
-/// comment) or is permitted to originate outbound connections to
-/// operator-configured external systems in this environment. The result
-/// reported is therefore derived from the connector's last known stored
-/// `health`, exactly the synthetic behavior `mock/connectors.ts`'s
-/// `testConnection` had — this is a real, told-straight limitation (see
-/// the task brief's demand not to fabricate live behavior this service
-/// cannot actually provide), not a regression introduced by this task. A
-/// genuine connectivity probe belongs in whatever runtime actually holds
-/// the resolved credential.
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn get_connector_dial_info(
+    pool: &PgPool,
+    id: &str,
+) -> Result<Option<ConnectorDialInfo>, StoreError> {
+    let row: Option<(String, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT type, host, secret_ref, secret_ref_secondary FROM connector WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(
+        |(kind, host, secret_ref, secret_ref_secondary)| ConnectorDialInfo {
+            kind,
+            host,
+            secret_ref,
+            secret_ref_secondary,
+        },
+    ))
+}
+
+/// Everything a real connectivity probe needs. Returned only to the one
+/// caller that is about to attempt a dial (`lakehouse-api`'s
+/// `connector_probe` module, via [`get_connector_dial_info`]) — never
+/// logged, never serialized, never returned from any HTTP response.
+///
+/// Deliberately has NO [`std::fmt::Debug`] impl at all — not even a
+/// hand-written redacting one like [`ConnectorRow`]'s. A caller that tries
+/// `{:?}` on this fails to compile instead of needing to remember a
+/// runtime redaction, the same compile-time-guarantee pattern
+/// `lakehouse_core::secret::SecretValue` uses for a resolved credential
+/// (see the module doc comment, guarantee 2, and ADR 0002).
+#[derive(Clone)]
+pub struct ConnectorDialInfo {
+    /// Connector type label (e.g. `"PostgreSQL"`, `"Object storage"`),
+    /// used to decide whether/how to dial.
+    pub kind: String,
+    /// Connection target. Never a credential by itself, but still handled
+    /// with the same care as `secret_ref` here — see the module doc
+    /// comment.
+    pub host: String,
+    /// Reference to the primary credential (e.g. a password, or an S3
+    /// access key id secretRef).
+    pub secret_ref: String,
+    /// Reference to a secondary credential, for connector types that need
+    /// two (e.g. S3 access key id + secret access key). `None` for types
+    /// that only ever need one.
+    pub secret_ref_secondary: Option<String>,
+}
+
+/// Persist the outcome of a real connectivity probe and stamp
+/// `lastTestAt`. Called by `lakehouse-api`'s `connector_probe` module
+/// AFTER it has actually attempted (or declined to attempt, for an
+/// unsupported type) a dial — this function never decides `ok`/`supported`
+/// itself, only records what the caller measured.
+///
+/// `health` is updated to `"healthy"`/`"unhealthy"` only when `supported`
+/// is `true` — an unsupported type's last-known health is left untouched,
+/// since declining to test a connector is not evidence about whether it is
+/// healthy.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::NotFound`] if `id` does not name a connector, or
 /// [`StoreError::Database`] on any other failure.
-pub async fn test_connection(pool: &PgPool, id: &str) -> Result<ConnectorTestResult, StoreError> {
-    let sql = format!(
-        "UPDATE connector SET last_test_at = now() WHERE id = $1 RETURNING {CONNECTOR_COLUMNS}"
-    );
-    let row: Option<ConnectorRow> = sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?;
-    let Some(row) = row else {
+pub async fn record_test_result(
+    pool: &PgPool,
+    id: &str,
+    ok: bool,
+    supported: bool,
+    latency_ms: Option<i64>,
+    message: &str,
+) -> Result<ConnectorTestResult, StoreError> {
+    let sql = "UPDATE connector SET last_test_at = now(), health = CASE WHEN $2 THEN (CASE WHEN \
+               $3 THEN 'healthy' ELSE 'unhealthy' END) ELSE health END WHERE id = $1 RETURNING \
+               last_test_at";
+    let row: Option<(OffsetDateTime,)> = sqlx::query_as(sql)
+        .bind(id)
+        .bind(supported)
+        .bind(ok)
+        .fetch_optional(pool)
+        .await?;
+    let Some((tested_at,)) = row else {
         return Err(StoreError::NotFound);
     };
-    let ok = row.health != "unhealthy";
-    let tested_at = iso_millis(row.last_test_at);
     Ok(ConnectorTestResult {
         ok,
-        latency_ms: if ok { 84 } else { 2400 },
-        message: if ok {
-            "Connection succeeded. Schema discovery available.".to_owned()
-        } else {
-            "Connection failed: endpoint unreachable.".to_owned()
-        },
-        tested_at,
+        supported,
+        latency_ms,
+        message: message.to_owned(),
+        tested_at: iso_millis(tested_at),
     })
 }
 
@@ -473,9 +561,10 @@ pub async fn test_connection(pool: &PgPool, id: &str) -> Result<ConnectorTestRes
 /// replication slot/publication a P5 CDC connector may have created there.
 /// Doing so would mean this crate resolving `secret_ref` to a live
 /// credential and originating an outbound connection to an
-/// operator-configured external system — exactly what
-/// [`test_connection`]'s doc comment already declines to do, for the same
-/// reason. Slot/WAL cleanup for a removed CDC connector is an operational
+/// operator-configured external system — the same category of operation
+/// `lakehouse-api`'s `connector_probe` module now does, but only for
+/// PostgreSQL/S3 connectivity tests, and only there, not here. Slot/WAL
+/// cleanup for a removed CDC connector is an operational
 /// step performed against the source database directly (see
 /// `ops/debezium/deprovision_connector.sh` and the P5 report's G4 section)
 /// — a real, told-straight gap, not a silent one: deleting a connector row

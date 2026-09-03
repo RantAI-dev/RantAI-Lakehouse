@@ -130,6 +130,17 @@ services:
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
       AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
       DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${POSTGRES_DB:-lakehouse}}
+      # ── secretRef-resolvable credentials for `connector_probe`'s real
+      #    PostgreSQL/S3 connectivity tests (P6, ADR 0002). The seeded
+      #    `conn-pg-lakehouse`/`conn-s3-warehouse` connectors reference
+      #    these exact env var names via `env:` secretRefs — see
+      #    `0022_prune_connector_seed.sql`. Not new secrets: same values
+      #    `DATABASE_URL`/RustFS's own service block already use above,
+      #    just also exposed under their own names for `EnvSecretResolver`
+      #    to resolve. ──
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
     restart: unless-stopped
 
   # P1 — S3-compatible object store, the default self-hosted implementation

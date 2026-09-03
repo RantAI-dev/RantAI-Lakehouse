@@ -10,9 +10,11 @@
 //! not open a network connection anywhere, and does not persist anything.
 //! [`reject_unsupported_column_types`] is a pure function over a
 //! caller-supplied column list (whatever discovers that list — a future
-//! console "test connection + inspect schema" flow — is out of scope here,
-//! matching `connectors::test_connection`'s existing "no real connectivity"
-//! posture). [`render_debezium_properties`] is a pure string-template
+//! console "test connection + inspect schema" flow — is out of scope here;
+//! `lakehouse-api`'s `connector_probe` module added a real PostgreSQL/S3
+//! connectivity *test* in P6, but it does not do schema discovery, which
+//! stays exactly as out of scope as before). [`render_debezium_properties`]
+//! is a pure string-template
 //! function over already-resolved inputs; the caller resolves `secretRef`
 //! via [`lakehouse_core::secret::SecretResolver`] (ADR 0002) before calling
 //! it. Actually running a generated config (creating a new
