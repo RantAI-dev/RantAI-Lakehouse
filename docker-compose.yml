@@ -88,6 +88,15 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
+      # ADR 0010/0011 — Gold export (`routes::gold`) needs the `gold-export`
+      # principal registered/granted and its token minted before it can do
+      # anything useful; both happen in this one-shot job. Not required for
+      # every OTHER route this service serves (they have no Lakekeeper
+      # dependency), but Lakekeeper's whole stack is already a core,
+      # always-on part of `docker compose up` since ADR 0011 — this just
+      # sequences `lakehouse-api` after it instead of racing it.
+      lakekeeper-authz-init:
+        condition: service_completed_successfully
     environment:
       PORT: "8080"
       APP_ENV: ${APP_ENV:-local}
@@ -151,6 +160,23 @@ services:
       CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:-lakehouse}}
       CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:-rustfsadmin}}
       CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:-rustfsadmin}}
+      # ── ADR 0010 — Gold export to Iceberg (`routes::gold`). Points at the
+      #    compose-internal Lakekeeper hostname (NOT `LAKEKEEPER_BASE_URI`,
+      #    which is host-facing) — same distinction `g1-test-runner`'s env
+      #    block documents. `LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE` is read
+      #    from the `gold-export` principal's pre-minted token on the
+      #    shared volume mounted below (ADR 0011); `GOLD_EXPORT_RUN_TOKEN`
+      #    is left unset by default, so `dagster/dispar_orchestrate/
+      #    gold_export.py`'s scheduled trigger must authenticate as a
+      #    service-identity principal instead (D4 shape, same as
+      #    ALERTS_RUN_TOKEN). ──
+      LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE: /tokens/gold-export.jwt
+      GOLD_SOURCE_SCHEMA: ${GOLD_SOURCE_SCHEMA:-serving}
+      GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
+    volumes:
+      - lakehouse_oidc_tokens:/tokens:ro
     restart: unless-stopped
 
   # P1 — S3-compatible object store, the default self-hosted implementation
@@ -573,6 +599,10 @@ services:
   #     snapshot of an EXISTING table — it never creates a namespace or
   #     table, so `create` would be an over-grant with no code path to use
   #     it, same reasoning as `clickhouse-reader`'s missing `create`.
+  #   - `gold-export` (ADR 0010, P6+: `lakehouse-api`'s `routes::gold`):
+  #     create, modify, select — same shape as `rust-iceberg`, own
+  #     principal so it is independently auditable/revocable, scoped to
+  #     the `gold` Iceberg namespace's export path only.
   #   - `unauthorized-test`: registered (Lakekeeper knows who it is) but
   #     NEVER granted anything — the negative-test principal.
   lakekeeper-authz-init:
@@ -593,7 +623,7 @@ services:
         admin_token="$$(cat /tokens/admin.jwt)"
         admin_auth="Authorization: Bearer $$admin_token"
 
-        for principal in rust-iceberg debezium dlt clickhouse-reader trino unauthorized-test; do
+        for principal in rust-iceberg debezium dlt clickhouse-reader trino gold-export unauthorized-test; do
           ptoken="$$(cat /tokens/$$principal.jwt)"
           code=$$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $$ptoken" -H 'Content-Type: application/json' \
@@ -625,6 +655,15 @@ services:
         grant dlt create modify select
         grant clickhouse-reader select modify
         grant trino select modify
+        # ADR 0010 — Gold export to Iceberg from Rust: `lakehouse-api`'s
+        # `routes::gold` creates the `gold` namespace/table on first
+        # export, appends a new snapshot on every subsequent one, and
+        # reads it back (`GET /api/gold/export/{mart}`, the round-trip
+        # proof `ops/gold_export/gold_export_test.py` checks) — the same
+        # create+modify+select shape as `rust-iceberg`, scoped to its own
+        # principal per the note on `PRINCIPALS` in
+        # `ops/oidc-mock/server.py`.
+        grant gold-export create modify select
         # unauthorized-test: deliberately no grant call.
     restart: "no"
 
@@ -696,6 +735,51 @@ services:
         export LAKEKEEPER_UNAUTHORIZED_TOKEN="$$(cat /tokens/unauthorized-test.jwt)" &&
         cargo test -p lakehouse-iceberg --test g1_lakekeeper --locked -- --ignored --nocapture g1_half_a &&
         cargo test -p lakehouse-iceberg --test g1_lakekeeper --locked -- --ignored --nocapture g1_negative
+    restart: "no"
+
+  # ADR 0010 — end-to-end acceptance test for Gold export to Iceberg:
+  # `ops/gold_export/gold_export_test.py`. `test` profile, not `dagster`
+  # — this path has no dependency on `dagster-webserver` (the export
+  # itself is triggered directly over HTTP, matching how
+  # `dagster/dispar_orchestrate/gold_export.py`'s scheduled job also
+  # calls it, just without Dagster in the loop for this test). Same
+  # `g1-test-runner`/`g3a-test-runner` shape otherwise.
+  #
+  # Usage (from a clean stack — `GOLD_EXPORT_RUN_TOKEN` must be set
+  # identically for both `lakehouse-api` and this runner, e.g. in `.env`,
+  # the same reason the brief's `DAGSTER_URL`/`LAKEKEEPER_BASE_URI` note
+  # gives: a one-off command-line override here would not also reach the
+  # already-running `lakehouse-api` container):
+  #   echo 'GOLD_EXPORT_RUN_TOKEN=gold-export-ci-not-a-real-secret' >> .env
+  #   docker compose -p <project> up -d --build lakehouse-api
+  #   docker compose -p <project> --profile test run --rm gold-export-test-runner
+  gold-export-test-runner:
+    profiles: ["test"]
+    image: python:3.12-slim
+    working_dir: /work
+    volumes:
+      - ./ops/gold_export:/work
+      - lakehouse_oidc_tokens:/tokens:ro
+    depends_on:
+      lakehouse-api:
+        condition: service_started
+      lakekeeper-authz-init:
+        condition: service_completed_successfully
+    environment:
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      LAKEKEEPER_BASE_URI: http://lakekeeper:8181
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      LAKEKEEPER_TOKENS_DIR: /tokens
+      GOLD_SOURCE_SCHEMA: ${GOLD_SOURCE_SCHEMA:-serving}
+      GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
+      GOLD_MART_NAME: ${GOLD_MART_NAME:-gold_export_smoke}
+      GOLD_EXPORT_ROW_COUNT: ${GOLD_EXPORT_ROW_COUNT:-7}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "pip install -q requests && python gold_export_test.py"
     restart: "no"
 
   # P2 (G2) — SeaweedFS: a second S3-compatible store used to prove the
@@ -971,6 +1055,16 @@ services:
       # see that module's `MaintenanceConfig.ch_auth_settings`.
       CH_OAUTH_CLIENT_ID: clickhouse-reader
       CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
+      # ADR 0010 — `gold_export.py`'s scheduled trigger: which mart(s) to
+      # export, where `lakehouse-api` lives, and the shared token
+      # `routes::gold::check_export_token` requires when set (must match
+      # `lakehouse-api`'s own `GOLD_EXPORT_RUN_TOKEN` — both read the same
+      # host-level `.env` value; see `gold-export-test-runner`'s usage
+      # comment for why a one-off override here would not reach the
+      # already-running `lakehouse-api` container).
+      LAKEHOUSE_API_URL: ${LAKEHOUSE_API_URL:-http://lakehouse-api:8080}
+      GOLD_EXPORT_MARTS: ${GOLD_EXPORT_MARTS:-gold_export_smoke}
+      GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
     command: ["dagster", "api", "grpc", "-h", "0.0.0.0", "-p", "4000", "-m", "dispar_orchestrate.definitions"]
     restart: unless-stopped
 
