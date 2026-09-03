@@ -280,6 +280,33 @@ pub struct Config {
     /// is handed to `connect_lazy` as-is and any problem with it surfaces
     /// lazily, at first use, as an ordinary request-time error.
     pub database_url: String,
+    /// ADR 0010/0011 — path to a file holding the `gold-export` Lakekeeper
+    /// principal's pre-minted static bearer token (`iceberg-catalog-rest`'s
+    /// `token` property — see `lakehouse-iceberg::catalog`'s module doc on
+    /// why this build uses a static token, not an `OAuth2` exchange).
+    /// Deliberately a **file path**, not a `secretRef`: the token is
+    /// minted at compose bring-up by `ops/oidc-mock` onto a shared volume
+    /// (`lakehouse_oidc_tokens`) every writer in this stack already reads
+    /// directly from disk the same way (`docker-compose.yml`'s
+    /// `g1-test-runner`, `debezium-server`, `trino`, ...) — there is no
+    /// static value to put behind an `env:` `secretRef` ahead of time.
+    /// Always set to a default path — `/tokens/gold-export.jwt`, matching
+    /// where `docker-compose.yml`'s `lakehouse-api` service mounts the
+    /// shared token volume — rather than `None`-when-unset: unlike a real
+    /// secret, there is no meaningful "intentionally absent" state here,
+    /// only "the file isn't there (yet)", which `routes::gold` treats as
+    /// Gold export being unconfigured (503) at request time, when it
+    /// actually tries to read the file.
+    pub lakekeeper_gold_export_token_file: String,
+    /// `ClickHouse` schema Gold marts live in (ADR 0010: `serving.*`).
+    /// `routes::gold`'s export route reads `{gold_source_schema}.{mart}`.
+    /// Default `"serving"`.
+    pub gold_source_schema: String,
+    /// Shared token gating `POST /api/gold/export/{mart}`, same D4 shape
+    /// as [`Self::alerts_run_token`]: with this set, a matching
+    /// `x-run-token` header/`?token=` is required; with it unset, only a
+    /// service-identity principal is let through. `None` when unset.
+    pub gold_export_run_token: Option<String>,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -361,6 +388,15 @@ impl std::fmt::Debug for Config {
             )
             .field("oidc_clock_skew_seconds", &self.oidc_clock_skew_seconds)
             .field("database_url", &REDACTED)
+            .field(
+                "lakekeeper_gold_export_token_file",
+                &self.lakekeeper_gold_export_token_file,
+            )
+            .field("gold_source_schema", &self.gold_source_schema)
+            .field(
+                "gold_export_run_token",
+                &self.gold_export_run_token.as_ref().map(|_| REDACTED),
+            )
             .finish()
     }
 }
@@ -504,6 +540,13 @@ impl Config {
                 "DATABASE_URL",
                 "postgres://lakehouse:lakehouse@localhost:5432/lakehouse",
             ),
+            lakekeeper_gold_export_token_file: or_default(
+                env,
+                "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE",
+                "/tokens/gold-export.jwt",
+            ),
+            gold_source_schema: or_default(env, "GOLD_SOURCE_SCHEMA", "serving"),
+            gold_export_run_token: truthy(env, "GOLD_EXPORT_RUN_TOKEN"),
         })
     }
 
@@ -607,6 +650,12 @@ mod tests {
         assert!(cfg.oidc_role_map.is_empty());
         assert_eq!(cfg.oidc_groups_claim, "groups");
         assert_eq!(cfg.oidc_clock_skew_seconds, 60);
+        assert_eq!(
+            cfg.lakekeeper_gold_export_token_file,
+            "/tokens/gold-export.jwt"
+        );
+        assert_eq!(cfg.gold_source_schema, "serving");
+        assert_eq!(cfg.gold_export_run_token, None);
     }
 
     #[test]

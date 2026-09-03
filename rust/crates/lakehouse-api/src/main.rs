@@ -11,6 +11,7 @@ mod auth;
 mod config;
 mod connector_probe;
 mod error;
+mod gold_export;
 mod json;
 mod policy;
 mod routes;

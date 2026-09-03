@@ -27,6 +27,7 @@ pub mod auth;
 pub mod config;
 pub mod connector_probe;
 pub mod error;
+pub mod gold_export;
 pub mod json;
 pub mod policy;
 pub mod routes;
