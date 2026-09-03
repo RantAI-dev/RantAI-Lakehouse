@@ -167,6 +167,52 @@ def step_maintenance_job_listed() -> None:
     print(f"[g3] {MAINTENANCE_JOB_NAME!r} is visible via GET /api/pipelines")
 
 
+def step_verify_r10_schema_drift_guard() -> None:
+    """R10 (`docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md` §5): the
+    `bronze_meta.*` registry schema now has exactly one owner —
+    `dagster/dispar_orchestrate/bronze_catalog.py`'s `EXPECTED_SCHEMAS` —
+    and a mismatch between that owner's expectation and the table
+    actually sitting in ClickHouse must fail loudly, not be silently
+    tolerated by a bare `CREATE TABLE IF NOT EXISTS`.
+
+    This constructs a deliberately WRONG `TableSchema` for the real,
+    already-existing `lake.bronze_meta.dataset_catalog` table (extra
+    bogus column) and asserts `_assert_or_create_schema` raises
+    `SchemaDriftError` — proving the guard fires on a real mismatch — then
+    re-checks the CORRECT schema to prove a matching schema passes clean
+    and the table itself was never touched.
+    """
+    import bronze_catalog  # mounted alongside this script — see docker-compose.yml
+
+    target = bronze_catalog.ClickHouseTarget(url=CH_URL, user=CH_USER, password=CH_PASSWORD)
+
+    real_schema = next(
+        s for s in bronze_catalog.EXPECTED_SCHEMAS if s.table_name == "bronze_meta.dataset_catalog"
+    )
+    mismatched_schema = bronze_catalog.TableSchema(
+        table_name=real_schema.table_name,
+        columns=real_schema.columns + (("bogus_extra_column", "String"),),
+        engine=real_schema.engine,
+        order_by=real_schema.order_by,
+    )
+    try:
+        bronze_catalog._assert_or_create_schema(target, mismatched_schema)
+    except bronze_catalog.SchemaDriftError as exc:
+        print(f"[g3] R10 guard correctly raised SchemaDriftError on a deliberate mismatch: {exc}")
+    else:
+        raise G3Failure(
+            "R10 guard failed to fire: _assert_or_create_schema accepted a "
+            "TableSchema with an extra bogus column against the real "
+            "bronze_meta.dataset_catalog table"
+        )
+
+    # The guard must also pass clean against the CORRECT schema — proving
+    # this isn't just permanently broken/always-raising, and that the
+    # mismatch check above never mutated the real table.
+    bronze_catalog._assert_or_create_schema(target, real_schema)
+    print("[g3] R10 guard passes clean against the correct schema")
+
+
 def step_verify_metrics_surfaced() -> None:
     resp = API.get(f"{API_URL}/api/governance/maintenance", timeout=10)
     if not resp.ok:
@@ -186,6 +232,7 @@ def main() -> int:
         step_wait_for_services()
         step_login()
         step_ensure_bronze_table_exists()
+        step_verify_r10_schema_drift_guard()
         step_maintenance_job_listed()
         trigger_and_wait(MAINTENANCE_JOB_NAME, 180)
         step_verify_metrics_surfaced()

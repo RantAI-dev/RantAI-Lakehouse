@@ -1129,6 +1129,12 @@ services:
     working_dir: /work
     volumes:
       - ./ops/g3:/work
+      # R10 regression (step_verify_r10_schema_drift_guard): imports the
+      # SAME schema-ownership module Dagster runs
+      # (`dagster/dispar_orchestrate/bronze_catalog.py`) directly — it has
+      # no dagster SDK dependency (just `requests`), so a bare file mount
+      # is enough, no package install needed.
+      - ./dagster/dispar_orchestrate/bronze_catalog.py:/work/bronze_catalog.py:ro
     depends_on:
       lakehouse-api:
         condition: service_started
