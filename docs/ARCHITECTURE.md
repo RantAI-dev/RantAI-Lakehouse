@@ -27,7 +27,7 @@ else is a library crate it depends on.
 | `lakehouse-embed` | Signed embedding (Metabase-style): HS256 JWT carrying a dashboard resource plus locked filter params, hand-rolled (no external JWT crate), matching the original TypeScript. |
 | `lakehouse-notify` | Delivery to webhook (Slack/Discord/generic incoming webhook) and email (SMTP via `lettre`), used by alerts and digests. |
 | `lakehouse-alerts` | Threshold alerts and scheduled digests over `serving.*` ClickHouse marts, persisted in `console.alert_rule`, delivered via `lakehouse-notify`. |
-| `lakehouse-iceberg` | P1: `object_store`-backed S3 client, Lakekeeper Iceberg REST catalog client, Bronze table create + append. **Still no route calls it as of P6** — Bronze is surfaced in the console by reading `bronze_meta.*` (ClickHouse) directly, via `routes::catalog`/`routes::governance`/`routes::storage`, not through this crate. It is exercised today by the G1/G3a/G4 gate test runners and (indirectly) by Debezium Server/dlt as REST-catalog clients, not by `lakehouse-api` itself. See its crate doc comment and `docs/adr/0002`–`0004`. |
+| `lakehouse-iceberg` | P1: `object_store`-backed S3 client, Lakekeeper Iceberg REST catalog client, Bronze table create + append, and (ADR 0010) Gold export create/append/read-back. **`lakehouse-api` depends on it as of the Gold export work**: `routes::gold` (`POST`/`GET /api/gold/export/{mart}`, glued together by `gold_export.rs`) is its first real caller — Bronze itself is still surfaced in the console by reading `bronze_meta.*` (ClickHouse) directly, via `routes::catalog`/`routes::governance`/`routes::storage`, never through this crate. It is also exercised by the G1/G3a/G4/Gold-export gate test runners and (indirectly) by Debezium Server/dlt as REST-catalog clients. See its crate doc comment and `docs/adr/0002`–`0004`, `0010`. |
 | `lakehouse-api` | The axum HTTP service: config resolution, middleware, routing, policy, and every handler. The only crate with `main()`. |
 
 ## Request lifecycle
@@ -124,6 +124,19 @@ through ClickHouse's Iceberg write path, and why in-engine Bronze
 maintenance is limited to `expire_snapshots` (`docs/plans/G3-RESULT.md`,
 ADR 0009's Trino-as-cron escape hatch for the small-file compaction
 `OPTIMIZE` cannot do).
+
+**Gold export is built** (ADR 0010): `routes::gold` reads a `serving.*`
+Gold mart from ClickHouse `MergeTree`, then appends it as a new Iceberg
+snapshot to its own `gold` namespace through Lakekeeper — the same
+vended-credentials write path G1(a) proved, exercised from
+`lakehouse-api` instead of a test runner for the first time. It is
+append-only, matching `iceberg-rust` 0.10.x's capabilities: a re-export
+does not replace the table's rows, it adds another snapshot, tagged by
+`_exported_at` — see `lakehouse-iceberg::gold`'s module doc for the
+consequence of running it on a schedule. Triggered by `dagster/dispar_orchestrate/gold_export.py` (daily schedule,
+calling the Rust route over HTTP — Dagster has no `iceberg-rust` binding
+of its own) or directly via the route. See ADR 0010 for the full record,
+including the principal/grant and the namespace-naming decision.
 
 A parallel Bronze *metadata registry* — `lake.bronze_meta.*` and
 `lake.bronze_meta_sec.*` (dataset catalog, column, sync, plus P4/P5's

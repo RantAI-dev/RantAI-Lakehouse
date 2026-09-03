@@ -73,12 +73,16 @@ model.
 
 The lakehouse layer (Lakekeeper, RustFS/SeaweedFS, Debezium, Trino) is real
 infrastructure, verified end to end (see `docs/plans/G1-RESULT.md` through
-`docs/plans/P5-RESULT.md`), but is compose-profile opt-in (`dagster`,
-`trino`) and is not yet called from any `lakehouse-api` route — no route
-uses the `lakehouse-iceberg` crate as of P6. The console reads Bronze
-through ClickHouse's `DataLakeCatalog`/the `bronze_meta.*` registry, not
-through `lakehouse-iceberg` directly. See "Status / Known limitations"
-below for the specific defects this surfaced on ClickHouse 26.3.
+`docs/plans/P5-RESULT.md`), and is compose-profile opt-in for the
+Dagster/Trino pieces (`dagster`, `trino`). **`lakehouse-iceberg` now has a
+real caller**: `POST`/`GET /api/gold/export/{mart}`
+(`lakehouse-api::routes::gold`, ADR 0010) reads a Gold mart from
+ClickHouse `MergeTree` and appends it to its own `gold` Iceberg namespace
+through Lakekeeper, and reads it back through `iceberg-rust` — the console
+still reads *Bronze* through ClickHouse's `DataLakeCatalog`/the
+`bronze_meta.*` registry, not through `lakehouse-iceberg` directly, since
+that read path already works on ClickHouse 26.3 (see "Status / Known
+limitations" below for the write-path defects that do not).
 
 ## Quickstart
 
@@ -270,18 +274,19 @@ talks to it:
 
 P1b (`lakehouse-iceberg`) adds the client-side counterparts below, read by
 `config.rs` — these are what a Rust process (not the container) uses to
-*connect to* RustFS/Lakekeeper. Nothing in `lakehouse-api` calls
-`lakehouse-iceberg` yet (that wiring is P6); these fields exist on
-`Config` today so the crate can be constructed from them once a route
-needs it, and so the G1 test and any manual `cargo run` usage have a
-documented, consistent source for the same values docker-compose already
-uses:
+*connect to* RustFS/Lakekeeper. `lakehouse-api`'s Gold export route
+(`routes::gold`, ADR 0010) is the first route to actually build an
+`IcebergClient` from these fields; the G1 test and any manual `cargo run`
+usage share the same documented source docker-compose already uses:
 
 | Variable | Purpose | Default | Required? |
 | --- | --- | --- | --- |
 | `LAKEKEEPER_CATALOG_URI` | Lakekeeper's Iceberg REST catalog base URI, as reached from the Rust process | `http://localhost:8181/catalog` | No |
 | `LAKEKEEPER_WAREHOUSE` | Lakekeeper warehouse this deployment writes Bronze tables into — see ADR 0003 for the `TENANT_ID` naming convention | `default` | No |
 | `LAKEKEEPER_CREDENTIAL_SECRET_REF` | `secretRef` (see `lakehouse_core::secret`, ADR 0002) for Lakekeeper's OAuth2 client-credential, when Lakekeeper authorization is enabled | unset (no-auth mode assumed) | No |
+| `LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE` | File path to the `gold-export` Lakekeeper principal's pre-minted static bearer token (ADR 0011), read at export-request time — not a `secretRef`, see the field's doc comment for why | `/tokens/gold-export.jwt` | No |
+| `GOLD_SOURCE_SCHEMA` | ClickHouse schema `routes::gold` reads Gold marts from | `serving` | No |
+| `GOLD_EXPORT_RUN_TOKEN` | Shared token gating `POST`/`GET /api/gold/export/{mart}` (same D4 shape as `ALERTS_RUN_TOKEN`); unset means only a service-identity principal may call it | unset | No |
 | `RUSTFS_S3_ENDPOINT` | S3-compatible endpoint the `lakehouse-iceberg` `object_store` client targets | `http://localhost:9010` | No |
 | `RUSTFS_S3_REGION` | Region string sent to the S3 client (RustFS does not enforce AWS region semantics, but the S3 API requires a value) | `us-east-1` | No |
 | `LAKEHOUSE_WAREHOUSE_BUCKET` | Bucket the lakehouse warehouse's Iceberg tables live under — also read by the compose `rustfs-bucket-init` job | `lakehouse-warehouse` | No |
