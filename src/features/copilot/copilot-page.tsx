@@ -5,19 +5,31 @@ import { Sparkles } from "lucide-react";
 import { useCopilot } from "./use-copilot";
 import { ChatMessages } from "./chat-messages";
 import { ChatComposer } from "./chat-composer";
+import { CopilotHistoryMenu } from "./history-menu";
 
 /**
  * Halaman AI Copilot — tampilan chat ala RantAI-Agents: avatar per pesan,
- * welcome ketengah dengan pill saran, composer lembut. RIWAYAT dipindah jadi
- * bar horizontal di bawah navbar (bukan sidebar kiri). Otak & riwayat dibagi
- * dengan chat dock global lewat useCopilot.
+ * welcome ketengah dengan pill saran, composer lembut.
+ *
+ * RIWAYAT ada di atas chat (`CopilotHistoryMenu`), bukan di sidebar kiri:
+ * daftar itu dulu hanya muncul ketika sudah berada di /copilot, jadi ia
+ * memakai ruang navigasi untuk isi halaman, dan ikut hilang saat sidebar
+ * diciutkan. Otak & riwayat tetap dibagi dengan chat dock global lewat
+ * useCopilot.
  */
 export function CopilotPage() {
   const c = useCopilot();
 
   return (
     <div className="flex flex-col gap-3">
-      {/* Chat (riwayat ada di sidebar) */}
+      {/* Riwayat percakapan — hanya tampil bila sudah ada sesi tersimpan. */}
+      <CopilotHistoryMenu
+        sessions={c.sessions}
+        activeId={c.sessionId}
+        onSelect={(id) => void c.loadSession(id)}
+        onNew={() => c.newChat()}
+        onDelete={(id) => void c.removeSession(id)}
+      />
       <div className="mx-auto flex w-full max-w-3xl flex-col">
         <div className="min-h-[56vh] overflow-y-auto pr-0.5">
           {c.messages.length === 0 ? (

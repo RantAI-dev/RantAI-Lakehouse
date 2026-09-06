@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
 import { RefreshCw, Sparkles, Download, Pencil, Eye, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Move, Share2, Link2, Check, Globe, Code2, KeyRound, Filter, Table2, FileDown, ChartColumn } from "lucide-react";
 import { PageHeader } from "@/components/patterns/page-header";
+import { BoardSwitcher } from "./board-switcher";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -224,11 +225,19 @@ export function DashboardPage() {
     notifyChange();
     router.push("/dashboards");
   }
-  // Membuat dashboard baru sengaja TIDAK ada di sini. Aksinya sudah dimiliki
-  // sidebar (`app-sidebar.tsx`, tombol "+" di grup Dashboards), yang memang
-  // mengelola koleksi dashboard — sementara halaman ini mengelola satu
-  // dashboard yang sedang dibuka. Sebelumnya kedua tempat memuat fungsi yang
-  // identik.
+  // Membuat dashboard baru ADA DI SINI, di pemilih board pada judul halaman.
+  // Sebelumnya hanya ada di sidebar, sehingga aksinya hilang begitu sidebar
+  // diciutkan jadi ikon — padahal ini satu-satunya cara membuat dashboard.
+  async function createDashboard() {
+    const res = await apiFetch("/api/dashboard/boards", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "New dashboard" }),
+    });
+    const json = await res.json();
+    notifyChange();
+    if (json?.board?.id) router.push(`/dashboards?board=${json.board.id}`);
+  }
   // ── Share (public read-only link) ─────────────────────────────────────────
   async function openShare() {
     if (isDefault) return;
@@ -361,9 +370,17 @@ export function DashboardPage() {
   return (
     <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6")}>
       <PageHeader
-        title={dashName}
+        title={
+          <BoardSwitcher
+            boards={boards}
+            activeId={board}
+            activeName={dashName}
+            onSelect={(id) => router.push(`/dashboards?board=${id}`)}
+            onCreate={() => void createDashboard()}
+          />
+        }
         description={isDefault
-          ? "Built-in dashboard (demo) — its layout is fixed. Use “+” next to Dashboards in the sidebar to create your own, then arrange it freely."
+          ? "Built-in dashboard (demo) — its layout is fixed. Pick “New dashboard” from the title menu to create your own, then arrange it freely."
           : "Dashboard canvas — drag & resize tiles in Edit mode. Saved automatically."}
         actions={
           <span data-print-hide className="contents">

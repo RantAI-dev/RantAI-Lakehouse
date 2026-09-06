@@ -44,12 +44,17 @@ export function AppNavbar() {
             size="icon"
             className="size-9 shrink-0 rounded-lg border-border bg-background shadow-xs"
           />
+          {/* Judul halaman saja. Dulu ada baris kedua bertuliskan "Rantai
+              Lake workspace" — teks tetap yang tidak pernah berubah, jadi
+              tidak menyampaikan apa pun, sekaligus mengulang merek yang
+              sudah tertera di header sidebar tepat di sebelahnya. Posisi
+              itu biasanya dipakai untuk breadcrumb atau nama workspace
+              aktif, sehingga label statis di sana justru menjanjikan
+              multi-workspace yang belum ada (`workspaceName` baru dipakai
+              di Settings, dan Tenants masih preview). */}
           <div className="hidden min-w-0 sm:block">
             <p className="truncate text-sm font-semibold text-foreground">
               {pageTitle}
-            </p>
-            <p className="truncate text-xs text-muted-foreground">
-              Rantai Lake workspace
             </p>
           </div>
           <div className="relative ml-auto hidden w-full max-w-[360px] md:block">
