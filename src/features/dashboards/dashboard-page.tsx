@@ -18,6 +18,7 @@ import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import type { LayoutMap, FilterDef } from "@/services/clients/bi-store";
 import { fmtInt } from "./chart-option";
 import { ChartBuilder, type ChartDef } from "./chart-builder";
+import { REFRESH_INTERVALS, useAutoRefresh } from "./auto-refresh";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
 import { TileBody } from "./tile-body";
 import { DashboardFilters } from "./dashboard-filters";
@@ -81,6 +82,8 @@ export function DashboardPage() {
   const [copied, setCopied] = React.useState<string | false>(false);
   const [embedEnabled, setEmbedEnabled] = React.useState(false);
   const [sampleToken, setSampleToken] = React.useState("");
+  /** Interval auto-refresh dalam ms; 0 = mati. Tidak disimpan antar sesi. */
+  const [refreshMs, setRefreshMs] = React.useState(0);
   const notifyChange = () => { try { window.dispatchEvent(new Event("dashboards:changed")); } catch { /* ignore */ } };
 
   const load = React.useCallback(async () => {
@@ -109,6 +112,7 @@ export function DashboardPage() {
   // Ganti dashboard → adopsi ulang filter tersimpan board itu.
   React.useEffect(() => { adoptingRef.current = true; filtersRef.current = []; setFilters([]); }, [board]);
   React.useEffect(() => { void load(); }, [load]);
+  useAutoRefresh(refreshMs, load);
 
   // Auto-refresh berkala (presentasi).
   React.useEffect(() => {
@@ -415,7 +419,21 @@ export function DashboardPage() {
                 </>
               ) : null}
             </div>
-            <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}><RefreshCw className={cn("size-4", loading && "animate-spin")} /></Button>
+            <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading} aria-label="Refresh now"><RefreshCw className={cn("size-4", loading && "animate-spin")} /></Button>
+            {/* Auto-refresh sisi klien — bukan penjadwalan server. Lihat
+                catatan di `auto-refresh.ts` untuk batasannya. */}
+            <select
+              value={refreshMs}
+              onChange={(e) => setRefreshMs(Number(e.target.value))}
+              aria-label="Auto-refresh interval"
+              className="h-8 rounded-md border border-border bg-background px-2 text-sm text-muted-foreground"
+            >
+              {REFRESH_INTERVALS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.value === 0 ? "Auto-refresh: off" : `Every ${opt.label}`}
+                </option>
+              ))}
+            </select>
           </span>
         }
       />
