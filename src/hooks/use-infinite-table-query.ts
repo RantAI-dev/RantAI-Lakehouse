@@ -12,7 +12,14 @@ export { flattenInfinitePages, getInfiniteTableNextPageParam };
 
 interface UseInfiniteTableQueryOptions<T> {
   queryKey: unknown[];
-  queryFn: (page: number) => Promise<Pagination<T>>;
+  /**
+   * Fetches one page. The `signal` is React Query's own — forwarding it to
+   * the service call means an abandoned request (the user retyped the
+   * search, or left the page) is actually cancelled rather than left to
+   * resolve into a cache nobody is reading. Every service adapter in
+   * `services/clients` already accepts one.
+   */
+  queryFn: (page: number, signal: AbortSignal) => Promise<Pagination<T>>;
   enabled?: boolean;
 }
 
@@ -23,7 +30,7 @@ export function useInfiniteTableQuery<T>({
 }: UseInfiniteTableQueryOptions<T>) {
   const query = useInfiniteQuery({
     queryKey,
-    queryFn: ({ pageParam }) => queryFn(pageParam as number),
+    queryFn: ({ pageParam, signal }) => queryFn(pageParam as number, signal),
     initialPageParam: 1,
     getNextPageParam: getInfiniteTableNextPageParam,
     enabled,

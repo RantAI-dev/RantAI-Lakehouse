@@ -1,120 +1,154 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useEffect, useMemo } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
+import { ExternalLink, Copy, Boxes } from "lucide-react"
+
 import { PageHeader } from "@/components/patterns/page-header"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
+import { DataTable } from "@/components/data-table/data-table"
+import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
+import { DataTableSearch } from "@/components/data-table/data-table-search"
+import { DataTableSkeleton } from "@/components/data-table/data-table-skeleton"
 import {
-  FilterSelect,
-  FilterToolbar,
-  SearchField,
-} from "@/components/patterns/filter-toolbar"
-import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
-import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
-import { TierBadge } from "@/components/patterns/status-badge"
-import { useService } from "@/hooks/use-service"
-import { formatBytes } from "@/lib/format"
+  ContextMenuItem,
+  ContextMenuSeparator,
+} from "@/components/ui/context-menu"
+import { ErrorState } from "@/components/patterns/page-states"
+import { useDataTable } from "@/hooks/use-data-table"
+import { useInfiniteTableQuery } from "@/hooks/use-infinite-table-query"
 import {
-  DATA_LAYER_LABEL,
-  STORAGE_TIER_LABEL,
-  type DataLayer,
-  type StorageTier,
-} from "@/lib/status"
-import { cn } from "@/lib/utils"
+  toInfiniteQueryParams,
+  useTableUrlState,
+} from "@/hooks/use-table-url-state"
+import { notifyError, notifySuccess } from "@/lib/notify"
 import { assetService } from "@/services"
-import {
-  ASSET_TYPE_LABEL,
-  type Asset,
-  type AssetType,
-} from "@/services/contracts/assets"
+import type { Asset } from "@/services/contracts/assets"
+import { toServiceError } from "@/services/errors"
+import { dataExplorerColumns } from "./data-explorer-columns"
 
-const LAYERS: (DataLayer | "all")[] = [
-  "all",
-  "raw",
-  "bronze",
-  "silver",
-  "gold",
-  "semantic",
-]
+/**
+ * Legacy `?q/layer/tier/type` params, mapped onto the names the advanced
+ * table uses. Links to this page predate the table rewrite (the sidebar and
+ * several dashboard cards still build them), so they are translated once on
+ * arrival instead of being silently dropped.
+ */
+function legacyParamsToTableState(
+  params: URLSearchParams
+): URLSearchParams | null {
+  const search = params.get("q")
+  const facets = (["layer", "tier", "type"] as const).flatMap((id) => {
+    const value = params.get(id)
+    return value && value !== "all"
+      ? [{ id, value: [value], variant: "multiSelect", operator: "inArray" }]
+      : []
+  })
+  if (!search && facets.length === 0) return null
 
-const columns: ColumnDef<Asset>[] = [
-  {
-    key: "name",
-    header: "Name",
-    render: (r) => (
-      <div className="min-w-0 py-0.5">
-        <p className="truncate font-medium tracking-tight text-foreground">
-          {r.name}
-        </p>
-        <p className="mt-0.5 truncate text-xs text-muted-foreground">
-          <span className="font-mono">{r.namespace}</span>
-          <span className="mx-1.5 text-border">·</span>
-          {ASSET_TYPE_LABEL[r.type]}
-          <span className="mx-1.5 text-border">·</span>
-          {DATA_LAYER_LABEL[r.layer]}
-        </p>
-      </div>
-    ),
-  },
-  {
-    key: "tier",
-    header: "Tier",
-    className: "w-24",
-    render: (r) => <TierBadge tier={r.tier} />,
-  },
-  {
-    key: "fresh",
-    header: "Freshness",
-    className: "w-36",
-    render: (r) => <FreshnessIndicator lagSeconds={r.freshnessLagSeconds} />,
-  },
-  {
-    key: "size",
-    header: "Size",
-    className: "w-24 text-right",
-    render: (r) => (
-      <span className="tabular-nums text-muted-foreground">
-        {formatBytes(r.sizeBytes)}
-      </span>
-    ),
-  },
-]
+  const next = new URLSearchParams(params)
+  for (const key of ["q", "layer", "tier", "type", "classification"]) {
+    next.delete(key)
+  }
+  if (search) next.set("search", search)
+  if (facets.length > 0) next.set("filters", JSON.stringify(facets))
+  return next
+}
 
-/** Data Explorer — browse assets by data layer (primary) and storage tier (secondary). */
+/** Data Explorer — browse governed assets by layer, tier, type, and freshness. */
 export function DataExplorerPage() {
   const router = useRouter()
-  const params = useSearchParams()
-  const [search, setSearch] = useState(params.get("q") ?? "")
-  const tier = (params.get("tier") as StorageTier | "all" | null) ?? "all"
-  const layer = (params.get("layer") as DataLayer | "all" | null) ?? "all"
-  const type = (params.get("type") as AssetType | "all" | null) ?? "all"
+  const searchParams = useSearchParams()
+  const tableUrlState = useTableUrlState()
 
-  const filter = useMemo(
+  // Rewrite legacy links before the table reads the URL. `replace` keeps the
+  // old address out of history, so Back still leaves the page.
+  useEffect(() => {
+    const migrated = legacyParamsToTableState(
+      new URLSearchParams(searchParams.toString())
+    )
+    if (migrated) router.replace(`/data?${migrated.toString()}`)
+  }, [router, searchParams])
+
+  // Only the query-shaping state belongs in the key. Column order, widths
+  // and visibility also live in the URL but must not refetch when changed.
+  const assetsQueryKey = useMemo(
+    () => [
+      "catalog-assets",
+      tableUrlState.search,
+      tableUrlState.sort,
+      tableUrlState.filters,
+      tableUrlState.joinOperator,
+      tableUrlState.groupBy,
+    ],
+    [
+      tableUrlState.search,
+      tableUrlState.sort,
+      tableUrlState.filters,
+      tableUrlState.joinOperator,
+      tableUrlState.groupBy,
+    ]
+  )
+
+  const {
+    rows,
+    totalItems,
+    groupSummaries,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+    isLoading,
+    error,
+    refetch,
+  } = useInfiniteTableQuery<Asset>({
+    queryKey: assetsQueryKey,
+    queryFn: (page, signal) =>
+      assetService.listAssetsPage(
+        toInfiniteQueryParams(tableUrlState, page),
+        signal
+      ),
+  })
+
+  const { table } = useDataTable({
+    data: rows,
+    columns: dataExplorerColumns,
+    // -1 because the server never counts the pages for an infinite table;
+    // `hasNextPage` is what ends the scroll.
+    pageCount: -1,
+    rowCount: totalItems,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    // The URL is the source of truth for the query, so navigation has to
+    // reach the server component too — `shallow: false` is what makes a
+    // filter change actually refetch.
+    shallow: false,
+    getRowId: (row) => row.id,
+    initialState: {
+      // `id` stays available in the column menu and filters; it is just
+      // noise beside `name`, which already shows the namespace.
+      columnVisibility: { id: false },
+    },
+  })
+
+  const infiniteState = useMemo(
     () => ({
-      search,
-      tier,
-      layer,
-      type,
-      classification: "all" as const,
+      onLoadMore: () => {
+        void fetchNextPage()
+      },
+      hasNextPage: Boolean(hasNextPage),
+      isFetchingNextPage,
+      totalItems,
+      loadedCount: rows.length,
     }),
-    [search, tier, layer, type]
+    [fetchNextPage, hasNextPage, isFetchingNextPage, rows.length, totalItems]
   )
 
-  const state = useService(
-    (s) => assetService.listAssets(filter, s),
-    [filter.search, filter.tier, filter.layer, filter.type]
-  )
-
-  function setParam(key: string, value: string) {
-    const next = new URLSearchParams(params.toString())
-    if (value === "all" || value === "") next.delete(key)
-    else next.set(key, value)
-    // Drop legacy classification filter from the URL when browsing.
-    next.delete("classification")
-    router.replace(`/data?${next.toString()}`)
+  async function copyToClipboard(value: string, label: string) {
+    try {
+      await navigator.clipboard.writeText(value)
+      notifySuccess(`${label} copied`)
+    } catch (err) {
+      notifyError(`Failed to copy ${label.toLowerCase()}`, err)
+    }
   }
-
-  const count = state.status === "success" ? state.data.length : null
 
   return (
     <div className="flex flex-col gap-5">
@@ -123,90 +157,55 @@ export function DataExplorerPage() {
         description="Browse governed assets by data layer (Raw → Gold)."
       />
 
-      <div className="flex flex-col gap-3">
-        <div
-          className="flex flex-wrap gap-1 rounded-lg border border-border bg-muted/40 p-1"
-          role="tablist"
-          aria-label="Data layer"
-        >
-          {LAYERS.map((t) => {
-            const selected = layer === t
-            const label = t === "all" ? "All" : DATA_LAYER_LABEL[t]
-            return (
-              <button
-                key={t}
-                type="button"
-                role="tab"
-                aria-selected={selected}
-                onClick={() => setParam("layer", t)}
-                className={cn(
-                  "rounded-md px-3 py-1.5 text-sm transition-colors",
-                  selected
-                    ? "bg-background font-medium text-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground"
-                )}
-              >
-                {label}
-              </button>
-            )
-          })}
-        </div>
-
-        <FilterToolbar className="justify-between gap-3">
-          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
-            <SearchField
-              value={search}
-              onChange={(v) => {
-                setSearch(v)
-                setParam("q", v)
-              }}
-              placeholder="Search by name or namespace…"
-              className="max-w-sm"
-            />
-            <FilterSelect
-              ariaLabel="Filter by storage tier"
-              allLabel="All tiers"
-              value={tier}
-              onChange={(v) => setParam("tier", v)}
-              options={Object.entries(STORAGE_TIER_LABEL).map(([value, label]) => ({
-                value,
-                label,
-              }))}
-              className="min-w-28"
-            />
-            <FilterSelect
-              ariaLabel="Filter by asset type"
-              allLabel="All types"
-              value={type}
-              onChange={(v) => setParam("type", v)}
-              options={Object.entries(ASSET_TYPE_LABEL).map(([value, label]) => ({
-                value,
-                label,
-              }))}
-              className="min-w-28"
-            />
-          </div>
-          {count != null ? (
-            <p className="shrink-0 text-xs tabular-nums text-muted-foreground">
-              {count} {count === 1 ? "asset" : "assets"}
-            </p>
-          ) : null}
-        </FilterToolbar>
-      </div>
-
-      {state.status === "loading" ? <LoadingSkeleton /> : null}
-      {state.status === "error" ? (
-        <ErrorState error={state.error} onRetry={state.reload} />
-      ) : null}
-      {state.status === "success" ? (
-        <DataTable
-          columns={columns}
-          rows={state.data}
-          rowKey={(r) => r.id}
-          onRowClick={(r) => router.push(`/data/assets/${r.id}`)}
-          emptyMessage="No assets match these filters."
+      {error ? (
+        // React Query widens whatever was thrown to `Error`; `ErrorState`
+        // branches on `ServiceError.code` (a 403 renders as a permission
+        // notice, not a generic failure), so it is narrowed back here.
+        <ErrorState
+          error={toServiceError(error)}
+          onRetry={() => void refetch()}
         />
-      ) : null}
+      ) : isLoading ? (
+        <DataTableSkeleton
+          columnCount={dataExplorerColumns.length}
+          rowCount={8}
+          filterCount={2}
+        />
+      ) : (
+        <DataTable
+          table={table}
+          groupSummaries={groupSummaries}
+          infinite={infiniteState}
+          onRowClick={(row) => router.push(`/data/assets/${row.id}`)}
+          renderRowContextMenu={(row) => (
+            <>
+              <ContextMenuItem
+                onSelect={() => router.push(`/data/assets/${row.id}`)}
+              >
+                <ExternalLink />
+                Open asset
+              </ContextMenuItem>
+              <ContextMenuSeparator />
+              <ContextMenuItem
+                onSelect={() => void copyToClipboard(row.id, "Asset ID")}
+              >
+                <Copy />
+                Copy asset ID
+              </ContextMenuItem>
+              <ContextMenuItem
+                onSelect={() => void copyToClipboard(row.namespace, "Namespace")}
+              >
+                <Boxes />
+                Copy namespace
+              </ContextMenuItem>
+            </>
+          )}
+        >
+          <DataTableAdvancedToolbar table={table}>
+            <DataTableSearch placeholder="Search assets by name, namespace, or owner…" />
+          </DataTableAdvancedToolbar>
+        </DataTable>
+      )}
     </div>
   )
 }

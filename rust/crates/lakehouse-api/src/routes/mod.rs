@@ -11,6 +11,7 @@ mod ai;
 mod alerts;
 pub mod auth;
 mod catalog;
+mod catalog_query;
 mod connectors;
 mod dashboard;
 mod embed;
@@ -276,6 +277,10 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/catalog", get(catalog::list))
+        // Registered before `/{id}`: axum prefers static segments over
+        // params, but keeping them adjacent in this order makes it obvious
+        // that `query` is a literal path and not an asset called "query".
+        .route("/api/catalog/query", get(catalog::query))
         .route("/api/catalog/{id}", get(catalog::detail))
         .route("/api/overview", get(overview::get).post(overview::refresh))
         .merge(overview_alerts_router())

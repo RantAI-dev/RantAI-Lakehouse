@@ -96,8 +96,24 @@ export type CatalogNamespace = {
   sourceEngine: string
 }
 
+import type { Pagination, PaginationQuery } from "./pagination"
+
 export interface AssetService {
   listAssets(filter: AssetFilter, signal?: AbortSignal): Promise<Asset[]>
+  /**
+   * One page of assets, with search/filter/sort/grouping applied on the
+   * server (`GET /api/catalog/query`).
+   *
+   * Coexists with [`listAssets`] rather than replacing it: that method
+   * returns the whole catalog and several screens still want exactly
+   * that. This one backs the Advanced Data Table, where the query state
+   * is richer than `AssetFilter` can express (multi-column sort, 14
+   * filter operators, and/or joins) and the result set is paged.
+   */
+  listAssetsPage(
+    query: PaginationQuery,
+    signal?: AbortSignal
+  ): Promise<Pagination<Asset>>
   getAsset(id: string, signal?: AbortSignal): Promise<AssetDetail>
   listNamespaces(signal?: AbortSignal): Promise<CatalogNamespace[]>
 }

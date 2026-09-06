@@ -139,6 +139,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
 
     // ── Catalog: seeded Analyst permission `catalog:read`. ───────────────
     ("GET", "/api/catalog",       Policy::RequiresPermission("catalog:read")),
+    ("GET", "/api/catalog/query", Policy::RequiresPermission("catalog:read")),
     ("GET", "/api/catalog/{id}",  Policy::RequiresPermission("catalog:read")),
 
     // ── Overview / alerts: no seeded resource maps to these — auth only. ─

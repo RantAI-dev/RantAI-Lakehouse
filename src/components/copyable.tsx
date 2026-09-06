@@ -1,9 +1,12 @@
 "use client";
 
 import { Copy } from "lucide-react";
-import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+// `lib/notify` is this codebase's single door to `sonner` — going straight
+// to `toast()` (as the upstream version of this file did) would sidestep
+// the shared error-message translation and the `aborted` suppression.
+import { notifyError, notifySuccess } from "@/lib/notify";
 import { cn } from "@/lib/utils";
 
 const TOAST_VALUE_MAX = 48;
@@ -31,9 +34,11 @@ export function Copyable({ value, children, className }: CopyableProps) {
 
     try {
       await navigator.clipboard.writeText(copyValue);
-      toast.success(formatCopiedToast(copyValue));
-    } catch {
-      toast.error("Failed to copy");
+      notifySuccess(formatCopiedToast(copyValue));
+    } catch (err) {
+      // Usually a denied clipboard permission or a non-secure origin;
+      // `notifyError` turns whichever it was into a readable description.
+      notifyError("Failed to copy", err);
     }
   };
 
