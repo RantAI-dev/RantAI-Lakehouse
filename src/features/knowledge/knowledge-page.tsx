@@ -24,6 +24,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { formatCompactNumber, formatRelativeTime } from "@/lib/format"
 import {
   CLASSIFICATION_LABEL,
@@ -99,8 +100,11 @@ export function KnowledgePage() {
   const [classification, setClassification] =
     React.useState<Classification>("internal")
   const create = useServiceAction(
-    (signal, input: Parameters<typeof knowledgeService.createSource>[0]) =>
-      knowledgeService.createSource(input, signal)
+    withNotify(
+      { success: "Knowledge source created", error: "Failed to create source" },
+      (signal, input: Parameters<typeof knowledgeService.createSource>[0]) =>
+        knowledgeService.createSource(input, signal)
+    )
   )
 
   const statusOptions = React.useMemo(() => {

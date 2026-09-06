@@ -17,6 +17,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { formatNumber, formatRelativeTime } from "@/lib/format"
 import { queryService } from "@/services"
 import type { CollaborationProject } from "@/services/contracts/queries"
@@ -37,8 +38,12 @@ export function CollaborationPage() {
   const [name, setName] = React.useState("")
   const [collaborators, setCollaborators] = React.useState("")
   const [formError, setFormError] = React.useState<string | null>(null)
-  const create = useServiceAction((signal, input: Parameters<typeof queryService.createCollaborationProject>[0]) =>
-    queryService.createCollaborationProject(input, signal)
+  const create = useServiceAction(
+    withNotify(
+      { success: "Project created", error: "Failed to create project" },
+      (signal, input: Parameters<typeof queryService.createCollaborationProject>[0]) =>
+        queryService.createCollaborationProject(input, signal)
+    )
   )
 
   const filtered = React.useMemo(() => {

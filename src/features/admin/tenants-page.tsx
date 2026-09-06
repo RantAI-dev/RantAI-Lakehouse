@@ -16,6 +16,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { formatBytes, formatCompactNumber, formatNumber, formatPercent } from "@/lib/format"
 import { identityService } from "@/services"
 import type { Tenant } from "@/services/contracts/identity"
@@ -68,8 +69,11 @@ export function TenantsPage() {
   const [plan, setPlan] = React.useState("")
   const [residency, setResidency] = React.useState("")
   const create = useServiceAction(
-    (signal, input: Parameters<typeof identityService.createTenant>[0]) =>
-      identityService.createTenant(input, signal)
+    withNotify(
+      { success: "Tenant created", error: "Failed to create tenant" },
+      (signal, input: Parameters<typeof identityService.createTenant>[0]) =>
+        identityService.createTenant(input, signal)
+    )
   )
 
   const filtered = React.useMemo(() => {

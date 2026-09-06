@@ -21,6 +21,7 @@ import { StatusBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import {
   formatCompactNumber,
   formatCost,
@@ -83,11 +84,17 @@ function RunDrawer({
   onClose: () => void
   onChanged: () => void
 }) {
-  const cancelAction = useServiceAction((signal, runId: string) =>
-    pipelineService.cancelRun(runId, signal)
+  const cancelAction = useServiceAction(
+    withNotify(
+      { success: "Run cancelled", error: "Failed to cancel run" },
+      (signal, runId: string) => pipelineService.cancelRun(runId, signal)
+    )
   )
-  const retryAction = useServiceAction((signal, runId: string) =>
-    pipelineService.retryRun(runId, signal)
+  const retryAction = useServiceAction(
+    withNotify(
+      { success: "Run retried", error: "Failed to retry run" },
+      (signal, runId: string) => pipelineService.retryRun(runId, signal)
+    )
   )
   const [cancelOpen, setCancelOpen] = React.useState(false)
 
@@ -219,14 +226,23 @@ export function PipelineDetailPage() {
   )
   const [selectedRun, setSelectedRun] = React.useState<PipelineRun | null>(null)
   const [pauseOpen, setPauseOpen] = React.useState(false)
-  const runAction = useServiceAction((signal, id: string) =>
-    pipelineService.triggerRun(id, signal)
+  const runAction = useServiceAction(
+    withNotify(
+      { success: "Run triggered", error: "Failed to trigger run" },
+      (signal, id: string) => pipelineService.triggerRun(id, signal)
+    )
   )
-  const pauseAction = useServiceAction((signal, id: string) =>
-    pipelineService.pausePipeline(id, signal)
+  const pauseAction = useServiceAction(
+    withNotify(
+      { success: "Pipeline paused", error: "Failed to pause pipeline" },
+      (signal, id: string) => pipelineService.pausePipeline(id, signal)
+    )
   )
-  const resumeAction = useServiceAction((signal, id: string) =>
-    pipelineService.resumePipeline(id, signal)
+  const resumeAction = useServiceAction(
+    withNotify(
+      { success: "Pipeline resumed", error: "Failed to resume pipeline" },
+      (signal, id: string) => pipelineService.resumePipeline(id, signal)
+    )
   )
 
   if (state.status === "loading") return <LoadingSkeleton rows={8} />

@@ -16,6 +16,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { formatRelativeTime } from "@/lib/format"
 import {
   CHECK_STATUS_LABEL,
@@ -59,8 +60,11 @@ export function DataQualityPage() {
   const [threshold, setThreshold] = React.useState("")
   const [severity, setSeverity] = React.useState<Severity>("medium")
   const create = useServiceAction(
-    (signal, input: Parameters<typeof governanceService.createQualityRule>[0]) =>
-      governanceService.createQualityRule(input, signal)
+    withNotify(
+      { success: "Quality rule created", error: "Failed to create quality rule" },
+      (signal, input: Parameters<typeof governanceService.createQualityRule>[0]) =>
+        governanceService.createQualityRule(input, signal)
+    )
   )
 
   const dimensionOptions = React.useMemo(() => {

@@ -11,6 +11,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { pipelineService } from "@/services"
 import type { PipelineKind } from "@/services/contracts/pipelines"
@@ -49,8 +50,12 @@ export function PipelineCreatePage() {
   const [targetZone, setTargetZone] = React.useState("silver")
   const [targetTable, setTargetTable] = React.useState("")
   const [schedule, setSchedule] = React.useState("Every hour")
-  const create = useServiceAction((signal, input: Parameters<typeof pipelineService.createPipeline>[0]) =>
-    pipelineService.createPipeline(input, signal)
+  const create = useServiceAction(
+    withNotify(
+      { success: "Pipeline created", error: "Failed to create pipeline" },
+      (signal, input: Parameters<typeof pipelineService.createPipeline>[0]) =>
+        pipelineService.createPipeline(input, signal)
+    )
   )
 
   const canProceed = React.useMemo(() => {

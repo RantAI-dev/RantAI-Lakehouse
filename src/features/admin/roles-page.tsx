@@ -14,6 +14,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { formatNumber } from "@/lib/format"
 import { identityService } from "@/services"
 import type { Role } from "@/services/contracts/identity"
@@ -44,8 +45,11 @@ export function RolesPage() {
   const [permissions, setPermissions] = React.useState("")
   const [description, setDescription] = React.useState("")
   const create = useServiceAction(
-    (signal, input: Parameters<typeof identityService.createRole>[0]) =>
-      identityService.createRole(input, signal)
+    withNotify(
+      { success: "Role created", error: "Failed to create role" },
+      (signal, input: Parameters<typeof identityService.createRole>[0]) =>
+        identityService.createRole(input, signal)
+    )
   )
 
   const filtered = React.useMemo(() => {

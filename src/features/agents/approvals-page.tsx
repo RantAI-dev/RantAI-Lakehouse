@@ -22,6 +22,7 @@ import { ApprovalBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { formatCost, formatRelativeTime } from "@/lib/format"
 import { APPROVAL_STATUS_LABEL, type ApprovalStatus } from "@/lib/status"
 import { agentService } from "@/services"
@@ -65,8 +66,11 @@ export function ApprovalsPage() {
   )
   const [comment, setComment] = React.useState("")
   const decide = useServiceAction(
-    (signal, id: string, input: { decision: "approved" | "rejected"; comment?: string }) =>
-      agentService.decideApproval(id, input, signal)
+    withNotify(
+      { success: "Decision recorded", error: "Failed to record decision" },
+      (signal, id: string, input: { decision: "approved" | "rejected"; comment?: string }) =>
+        agentService.decideApproval(id, input, signal)
+    )
   )
 
   const rows = React.useMemo(() => {

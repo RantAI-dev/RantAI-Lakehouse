@@ -11,6 +11,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Textarea } from "@/components/ui/textarea"
 import { useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { streamingService } from "@/services"
 
@@ -33,8 +34,12 @@ export function StreamingCreatePage() {
   )
   const [watermarkIntervalSec, setWatermarkIntervalSec] = React.useState("5")
   const [triggerCondition, setTriggerCondition] = React.useState("lag_seconds > 30")
-  const create = useServiceAction((signal, input: Parameters<typeof streamingService.createStreamingJob>[0]) =>
-    streamingService.createStreamingJob(input, signal)
+  const create = useServiceAction(
+    withNotify(
+      { success: "Streaming job created", error: "Failed to create streaming job" },
+      (signal, input: Parameters<typeof streamingService.createStreamingJob>[0]) =>
+        streamingService.createStreamingJob(input, signal)
+    )
   )
 
   const canProceed =

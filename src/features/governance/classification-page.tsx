@@ -19,6 +19,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { formatPercent } from "@/lib/format"
 import { CLASSIFICATION_LABEL, type Classification } from "@/lib/status"
 import { governanceService } from "@/services"
@@ -70,10 +71,16 @@ export function ClassificationPage() {
     React.useState<Classification>("internal")
   const [maskingRule, setMaskingRule] = React.useState("")
   const create = useServiceAction(
-    (
-      signal,
-      input: Parameters<typeof governanceService.createClassificationRule>[0]
-    ) => governanceService.createClassificationRule(input, signal)
+    withNotify(
+      {
+        success: "Classification rule created",
+        error: "Failed to create classification rule",
+      },
+      (
+        signal,
+        input: Parameters<typeof governanceService.createClassificationRule>[0]
+      ) => governanceService.createClassificationRule(input, signal)
+    )
   )
 
   const filtered = React.useMemo(() => {

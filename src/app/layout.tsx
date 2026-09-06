@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { geist, geistMono } from "@rantai/design-system/fonts/fonts";
 import { ThemeProvider } from "@rantai/design-system/components/theme-provider";
+import { Toaster } from "@rantai/design-system/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AppFrame } from "@/components/app-shell/app-frame";
 import { AuthProvider } from "@/features/auth/auth-provider";
@@ -53,6 +54,10 @@ export default function RootLayout({
             <AuthProvider>
               <AppFrame>{children}</AppFrame>
             </AuthProvider>
+            {/* Umpan balik aksi mutasi (simpan/hapus/test) — dipanggil lewat
+                `notify` di `@/lib/notify`, bukan `toast()` langsung, supaya
+                pesan error ServiceError diterjemahkan seragam. */}
+            <Toaster position="bottom-right" richColors closeButton />
           </TooltipProvider>
         </ThemeProvider>
       </body>

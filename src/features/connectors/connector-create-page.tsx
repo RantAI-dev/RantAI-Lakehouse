@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { connectorService } from "@/services"
 import type { Connector } from "@/services/contracts/connectors"
@@ -39,8 +40,12 @@ export function ConnectorCreatePage() {
   const [environment, setEnvironment] = React.useState("production")
   const [tenant, setTenant] = React.useState("Nusantara Finance")
   const [residency, setResidency] = React.useState("Jakarta (ID)")
-  const create = useServiceAction((signal, input: Parameters<typeof connectorService.createConnector>[0]) =>
-    connectorService.createConnector(input, signal)
+  const create = useServiceAction(
+    withNotify(
+      { success: "Connector created", error: "Failed to create connector" },
+      (signal, input: Parameters<typeof connectorService.createConnector>[0]) =>
+        connectorService.createConnector(input, signal)
+    )
   )
 
   const canProceed =
