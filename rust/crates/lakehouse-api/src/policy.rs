@@ -215,6 +215,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    it in the seed (Platform Admin's `*:*` still satisfies it). ──────
     ("GET",    "/api/dashboard",              Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/specs/preview", Policy::RequiresPermission("dashboard:read")),
     ("POST",   "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:write")),
     ("PUT",    "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:write")),
     ("DELETE", "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:write")),

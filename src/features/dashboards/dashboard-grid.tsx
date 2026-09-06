@@ -72,19 +72,23 @@ export function DashboardGrid({
   const base = React.useMemo(() => resolve(items, layout), [items, layout]);
   const view = preview ?? base;
 
-  const colW = width > 0 ? (width - MARGIN * (COLS + 1)) / COLS : 0;
+  // Margin hanya menjadi gap ANTAR kolom/baris. Kanvas tidak menambahkan
+  // inset luar agar tepi tile sejajar dengan KPI dan konten dashboard lain.
+  const colW = width > 0 ? (width - MARGIN * (COLS - 1)) / COLS : 0;
   const unitX = colW + MARGIN;
   const unitY = ROW_H + MARGIN;
   const boxStyle = (b: TileBox): React.CSSProperties => ({
     position: "absolute",
-    left: MARGIN + b.x * unitX,
-    top: MARGIN + b.y * unitY,
+    left: b.x * unitX,
+    top: b.y * unitY,
     width: b.w * colW + (b.w - 1) * MARGIN,
     height: b.h * ROW_H + (b.h - 1) * MARGIN,
   });
 
   const maxY = Math.max(0, ...Object.values(view).map((b) => b.y + b.h));
-  const canvasH = MARGIN + maxY * unitY + (editable ? unitY : 0);
+  const canvasH = maxY > 0
+    ? maxY * ROW_H + (maxY - 1) * MARGIN + (editable ? unitY : 0)
+    : 0;
 
   // Pasang listener move/up LANGSUNG (imperatif) di startDrag agar tak bergantung
   // pada re-render/effect — event pointermove pertama pun tertangkap.
@@ -125,7 +129,7 @@ export function DashboardGrid({
           style={{
             backgroundImage: `linear-gradient(90deg, var(--border) 1px, transparent 1px)`,
             backgroundSize: `${unitX}px 100%`,
-            backgroundPosition: `${MARGIN}px 0`,
+            backgroundPosition: "0 0",
             opacity: 0.25,
           }}
         />

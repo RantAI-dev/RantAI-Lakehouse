@@ -17,13 +17,15 @@ import * as React from "react";
  * "Schedule", supaya harapan penggunanya tidak keliru.
  */
 
-/** Pilihan interval; `0` berarti mati. */
+/**
+ * Pilihan interval, dalam DETIK sebagai string agar cocok dengan nilai
+ * `Select`. `"0"` berarti penyegaran manual.
+ */
 export const REFRESH_INTERVALS = [
-  { value: 0, label: "Off" },
-  { value: 30_000, label: "30s" },
-  { value: 60_000, label: "1m" },
-  { value: 300_000, label: "5m" },
-  { value: 900_000, label: "15m" },
+  { value: "0", label: "Manual" },
+  { value: "30", label: "Every 30s" },
+  { value: "60", label: "Every 1m" },
+  { value: "300", label: "Every 5m" },
 ] as const;
 
 /**

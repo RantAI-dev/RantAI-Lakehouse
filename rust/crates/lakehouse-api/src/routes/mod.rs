@@ -320,6 +320,10 @@ pub fn router(state: AppState) -> Router {
                 .delete(dashboard::specs_delete),
         )
         .route(
+            "/api/dashboard/specs/preview",
+            axum::routing::post(dashboard::specs_preview),
+        )
+        .route(
             "/api/dashboard/boards",
             get(dashboard::boards_list)
                 .post(dashboard::boards_create)

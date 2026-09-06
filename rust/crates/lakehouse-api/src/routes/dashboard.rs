@@ -116,11 +116,13 @@ async fn get_body(
     let mut results = Map::new();
     if on_default {
         for k in KPIS.iter() {
-            let (id, val) = run_spec_sql(ch, k.id, k.sql).await;
+            let sql = sql_with_builtin_years(k.sql, k.mart, &years, &cols);
+            let (id, val) = run_spec_sql(ch, k.id, &sql).await;
             results.insert(id, val);
         }
         for c in CHARTS.iter() {
-            let (id, val) = run_spec_sql(ch, c.id, c.sql).await;
+            let sql = sql_with_builtin_years(c.sql, c.mart, &years, &cols);
+            let (id, val) = run_spec_sql(ch, c.id, &sql).await;
             results.insert(id, val);
         }
     }
@@ -185,6 +187,24 @@ async fn get_body(
     }))
 }
 
+/// Apply the global year filter to built-in specs without rebuilding their
+/// hand-written aggregation SQL. The source table becomes a filtered
+/// subquery, so each chart keeps its original projection, grouping and order.
+fn sql_with_builtin_years(
+    sql: &str,
+    mart: &str,
+    years: &[i64],
+    mart_cols: &HashMap<String, HashSet<String>>,
+) -> String {
+    if years.is_empty() || !mart_cols.get(mart).is_some_and(|cols| cols.contains("tahun")) {
+        return sql.to_owned();
+    }
+    let years_csv = years.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
+    let table = format!("serving.{mart}");
+    let filtered = format!("(SELECT * FROM {table} WHERE tahun IN ({years_csv})) AS filtered_mart");
+    sql.replacen(&table, &filtered, 1)
+}
+
 fn layout_to_json(layout: &LayoutMap) -> Value {
     let mut m = Map::new();
     for (k, b) in layout {
@@ -242,6 +262,24 @@ pub async fn specs_create(State(state): State<AppState>, body: Bytes) -> ApiResu
     Ok(ApiJson(
         json!({ "ok": true, "chart": render_stored_spec(&spec.spec, ChartSource::Ui) }),
     ))
+}
+
+/// `POST /api/dashboard/specs/preview` — validate and execute a chart input
+/// without persisting it. The builder uses this to show the user the actual
+/// result before the chart is added to a dashboard.
+pub async fn specs_preview(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    let input = parse_chart_input(&body)?;
+    let spec = store::spec_from_input(&state.clickhouse, &input, ChartSource::Ui, "ui", None)
+        .await
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    let (_, result) = run_spec_sql(&state.clickhouse, &spec.spec.id, &spec.spec.sql).await;
+    Ok(ApiJson(json!({
+        "spec": render_stored_spec(&spec.spec, ChartSource::Ui),
+        "result": result,
+    })))
 }
 
 /// `PUT /api/dashboard/specs` — edit a stored chart, keeping its id.
