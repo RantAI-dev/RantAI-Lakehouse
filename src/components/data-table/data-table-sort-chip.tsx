@@ -47,7 +47,7 @@ import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
-} from "@rantai/design-system/ui/tooltip";
+} from "@/components/ui/tooltip";
 import { useDataTableSorting } from "@/hooks/use-data-table-sorting";
 import { cn } from "@/lib/utils";
 import type { FilterVariant } from "@/types/data-table";
@@ -397,7 +397,7 @@ export function DataTableSortButton<TData>({
   if (hasSorting) {
     return (
       <Tooltip>
-        <TooltipTrigger asChild>{button}</TooltipTrigger>
+        <TooltipTrigger render={button} />
         <TooltipContent>Sort</TooltipContent>
       </Tooltip>
     );
@@ -406,9 +406,7 @@ export function DataTableSortButton<TData>({
   return (
     <Popover open={pickerOpen} onOpenChange={handlePickerOpenChange}>
       <Tooltip>
-        <TooltipTrigger asChild>
-          <PopoverAnchor asChild>{button}</PopoverAnchor>
-        </TooltipTrigger>
+        <TooltipTrigger render={<PopoverAnchor asChild>{button}</PopoverAnchor>} />
         <TooltipContent>Sort</TooltipContent>
       </Tooltip>
       <PopoverContent align="start" className="w-56 p-0">

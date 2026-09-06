@@ -26,7 +26,7 @@ import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
-} from "@rantai/design-system/ui/tooltip";
+} from "@/components/ui/tooltip";
 import { useDataTableFilters } from "@/hooks/use-data-table-filters";
 import { cn } from "@/lib/utils";
 
@@ -148,7 +148,7 @@ export function DataTablePropertyBarToggle<TData>({
   if (hasActiveFilters) {
     return (
       <Tooltip>
-        <TooltipTrigger asChild>{button}</TooltipTrigger>
+        <TooltipTrigger render={button} />
         <TooltipContent>Filter</TooltipContent>
       </Tooltip>
     );
@@ -157,9 +157,7 @@ export function DataTablePropertyBarToggle<TData>({
   return (
     <Popover open={pickerOpen} onOpenChange={handlePickerOpenChange}>
       <Tooltip>
-        <TooltipTrigger asChild>
-          <PopoverAnchor asChild>{button}</PopoverAnchor>
-        </TooltipTrigger>
+        <TooltipTrigger render={<PopoverAnchor asChild>{button}</PopoverAnchor>} />
         <TooltipContent>Filter</TooltipContent>
       </Tooltip>
       <PopoverContent align="start" className="w-52 p-0">

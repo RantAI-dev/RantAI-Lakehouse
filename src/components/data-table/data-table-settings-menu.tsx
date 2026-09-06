@@ -39,7 +39,7 @@ import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
-} from "@rantai/design-system/ui/tooltip";
+} from "@/components/ui/tooltip";
 
 interface DataTableSettingsMenuProps<TData> {
   table: Table<TData>;
@@ -118,19 +118,25 @@ export function DataTableSettingsMenu<TData>({
 
   return (
     <DropdownMenu>
+      {/* `TooltipTrigger` takes `render` (base-ui) while `DropdownMenuTrigger`
+          takes `asChild` (radix) — the two primitives come from different
+          libraries, so the composition props differ even though they are
+          doing the same job here. */}
       <Tooltip>
-        <TooltipTrigger asChild>
-          <DropdownMenuTrigger asChild>
-            <Button
-              aria-label="Table settings"
-              variant="outline"
-              size="icon"
-              disabled={disabled}
-            >
-              <Settings2 className="text-muted-foreground" />
-            </Button>
-          </DropdownMenuTrigger>
-        </TooltipTrigger>
+        <TooltipTrigger
+          render={
+            <DropdownMenuTrigger asChild>
+              <Button
+                aria-label="Table settings"
+                variant="outline"
+                size="icon"
+                disabled={disabled}
+              >
+                <Settings2 className="text-muted-foreground" />
+              </Button>
+            </DropdownMenuTrigger>
+          }
+        />
         <TooltipContent>Settings</TooltipContent>
       </Tooltip>
 
@@ -196,56 +202,67 @@ export function DataTableSettingsMenu<TData>({
                                 role="listitem"
                                 className="flex items-center gap-1 rounded-sm py-1 pr-1 pl-1 text-sm data-[dragging=true]:opacity-80"
                               >
-                                <Tooltip delayDuration={400}>
-                                  <TooltipTrigger asChild>
-                                    <SortableItemHandle asChild>
-                                      <Button
-                                        variant="ghost"
-                                        size="icon-xs"
-                                        aria-label={`Drag ${label} to reorder`}
-                                        className="text-muted-foreground cursor-grab data-[dragging=true]:cursor-grabbing"
-                                      >
-                                        <GripVertical />
-                                      </Button>
-                                    </SortableItemHandle>
-                                  </TooltipTrigger>
+                                {/* Upstream set `delayDuration={400}` per
+                                    tooltip. base-ui has no per-root delay —
+                                    it is configured once on the provider in
+                                    `app/layout.tsx` — so these now use the
+                                    app-wide delay like every other tooltip. */}
+                                <Tooltip>
+                                  <TooltipTrigger
+                                    render={
+                                      <SortableItemHandle asChild>
+                                        <Button
+                                          variant="ghost"
+                                          size="icon-xs"
+                                          aria-label={`Drag ${label} to reorder`}
+                                          className="text-muted-foreground cursor-grab data-[dragging=true]:cursor-grabbing"
+                                        >
+                                          <GripVertical />
+                                        </Button>
+                                      </SortableItemHandle>
+                                    }
+                                  />
                                   <TooltipContent>
                                     Drag to reorder
                                   </TooltipContent>
                                 </Tooltip>
                                 <span className="flex-1 truncate">{label}</span>
-                                <Tooltip delayDuration={400}>
-                                  <TooltipTrigger asChild>
-                                    <Button
-                                      variant="ghost"
-                                      size="icon-xs"
-                                      // Specific for screen readers, where a column of
-                                      // repeated "Move up" would say nothing.
-                                      aria-label={`Move ${label} up`}
-                                      disabled={index === 0}
-                                      className="text-muted-foreground"
-                                      onClick={() => moveColumn(index, -1)}
-                                    >
-                                      <ChevronUp />
-                                    </Button>
-                                  </TooltipTrigger>
+                                <Tooltip>
+                                  <TooltipTrigger
+                                    render={
+                                      <Button
+                                        variant="ghost"
+                                        size="icon-xs"
+                                        // Specific for screen readers, where a column of
+                                        // repeated "Move up" would say nothing.
+                                        aria-label={`Move ${label} up`}
+                                        disabled={index === 0}
+                                        className="text-muted-foreground"
+                                        onClick={() => moveColumn(index, -1)}
+                                      >
+                                        <ChevronUp />
+                                      </Button>
+                                    }
+                                  />
                                   <TooltipContent>Move up</TooltipContent>
                                 </Tooltip>
-                                <Tooltip delayDuration={400}>
-                                  <TooltipTrigger asChild>
-                                    <Button
-                                      variant="ghost"
-                                      size="icon-xs"
-                                      aria-label={`Move ${label} down`}
-                                      disabled={
-                                        index === movableColumns.length - 1
-                                      }
-                                      className="text-muted-foreground"
-                                      onClick={() => moveColumn(index, 1)}
-                                    >
-                                      <ChevronDown />
-                                    </Button>
-                                  </TooltipTrigger>
+                                <Tooltip>
+                                  <TooltipTrigger
+                                    render={
+                                      <Button
+                                        variant="ghost"
+                                        size="icon-xs"
+                                        aria-label={`Move ${label} down`}
+                                        disabled={
+                                          index === movableColumns.length - 1
+                                        }
+                                        className="text-muted-foreground"
+                                        onClick={() => moveColumn(index, 1)}
+                                      >
+                                        <ChevronDown />
+                                      </Button>
+                                    }
+                                  />
                                   <TooltipContent>Move down</TooltipContent>
                                 </Tooltip>
                               </div>
