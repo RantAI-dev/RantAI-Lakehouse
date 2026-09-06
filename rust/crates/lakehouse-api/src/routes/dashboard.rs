@@ -196,10 +196,18 @@ fn sql_with_builtin_years(
     years: &[i64],
     mart_cols: &HashMap<String, HashSet<String>>,
 ) -> String {
-    if years.is_empty() || !mart_cols.get(mart).is_some_and(|cols| cols.contains("tahun")) {
+    if years.is_empty()
+        || !mart_cols
+            .get(mart)
+            .is_some_and(|cols| cols.contains("tahun"))
+    {
         return sql.to_owned();
     }
-    let years_csv = years.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
+    let years_csv = years
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
     let table = format!("serving.{mart}");
     let filtered = format!("(SELECT * FROM {table} WHERE tahun IN ({years_csv})) AS filtered_mart");
     sql.replacen(&table, &filtered, 1)
