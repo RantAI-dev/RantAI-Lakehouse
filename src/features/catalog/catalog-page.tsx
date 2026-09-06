@@ -18,12 +18,33 @@ const columns: ColumnDef<CatalogNamespace>[] = [
     key: "name",
     header: "Namespace",
     render: (r) => <span className="font-mono text-sm">{r.name}</span>,
+    sortValue: (r) => r.name,
   },
   { key: "desc", header: "Description", render: (r) => r.description },
-  { key: "assets", header: "Assets", render: (r) => r.assetCount },
-  { key: "owner", header: "Owner", render: (r) => r.owner },
-  { key: "engine", header: "Source engine", render: (r) => r.sourceEngine },
-  { key: "res", header: "Residency", render: (r) => r.residency },
+  {
+    key: "assets",
+    header: "Assets",
+    render: (r) => r.assetCount,
+    sortValue: (r) => r.assetCount,
+  },
+  {
+    key: "owner",
+    header: "Owner",
+    render: (r) => r.owner,
+    sortValue: (r) => r.owner,
+  },
+  {
+    key: "engine",
+    header: "Source engine",
+    render: (r) => r.sourceEngine,
+    sortValue: (r) => r.sourceEngine,
+  },
+  {
+    key: "res",
+    header: "Residency",
+    render: (r) => r.residency,
+    sortValue: (r) => r.residency,
+  },
 ]
 
 /** Unified catalog namespaces with ownership and residency metadata. */
@@ -64,6 +85,7 @@ export function CatalogPage() {
           rows={rows}
           rowKey={(r) => r.id}
           onRowClick={setSelected}
+          pageSize={25}
         />
       ) : null}
 
