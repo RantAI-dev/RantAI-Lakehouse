@@ -175,6 +175,24 @@ services:
       LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE: /tokens/gold-export.jwt
       GOLD_SOURCE_SCHEMA: ${GOLD_SOURCE_SCHEMA:-serving}
       GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
+      # ── Tenant identity (see `lakehouse-api/src/tenant.rs`) ──
+      # Passed through explicitly because otherwise a non-Dispar deployment
+      # cannot override them at all. Each resolves to its historical Dispar
+      # literal when empty (`tenant.rs`'s `env_or` treats blank as unset), so
+      # listing them here changes nothing for an existing deployment.
+      #
+      # `BUILTIN_DASHBOARD_ENABLED` must be `0` on any tenant without a
+      # `serving.mart_wisman` mart: the built-in "Main" board's tiles are
+      # hardcoded to the Dispar marts and paint red before redirecting.
+      TENANT_OWNER: ${TENANT_OWNER:-}
+      TENANT_ID: ${TENANT_ID:-}
+      TENANT_DOMAIN: ${TENANT_DOMAIN:-}
+      TENANT_RESIDENCY: ${TENANT_RESIDENCY:-}
+      TENANT_SITE: ${TENANT_SITE:-}
+      TENANT_SOURCE: ${TENANT_SOURCE:-}
+      BRONZE_CURATED_SLUGS: ${BRONZE_CURATED_SLUGS:-}
+      CATALOG_NAMESPACE_META: ${CATALOG_NAMESPACE_META:-}
+      BUILTIN_DASHBOARD_ENABLED: ${BUILTIN_DASHBOARD_ENABLED:-1}
     volumes:
       - lakehouse_oidc_tokens:/tokens:ro
     restart: unless-stopped
