@@ -247,7 +247,7 @@ export function ChartBuilder({
           </div>
 
           {/* Tipe + Board */}
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div className="grid gap-1.5">
               <Label>Tipe</Label>
               <Select value={kind} onValueChange={(v) => setKind(v as ChartKind)}>
@@ -293,7 +293,7 @@ export function ChartBuilder({
               </div>
 
               {!isSingle ? (
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <div className="grid gap-1.5">
                     <Label>Dimension (X)</Label>
                     <Select value={dimension} onValueChange={(v) => setDimension(v ?? "")} disabled={!fields}>
@@ -311,7 +311,7 @@ export function ChartBuilder({
                 </div>
               ) : null}
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <div className="grid gap-1.5">
                   <Label>{mLabels[0]}</Label>
                   <Select value={measure} onValueChange={(v) => setMeasure(v ?? "")} disabled={!fields}>
@@ -359,7 +359,7 @@ export function ChartBuilder({
                   <Input type="number" min={0} value={target} onChange={(e) => setTarget(e.target.value)} placeholder="auto from value if empty" />
                 </div>
               ) : (
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <div className="grid gap-1.5">
                     <Label>Sort</Label>
                     <Select value={order} onValueChange={(v) => setOrder((v as "desc" | "asc" | "none") ?? "desc")}>
