@@ -64,7 +64,7 @@ export function CopilotDock() {
                 <div className="grid gap-1.5 sm:grid-cols-2">
                   {c.pageContext.suggest[c.mode].map((s) => (
                     <button
-                      key={s} onClick={() => void c.send(s)} disabled={c.busy}
+                      key={s} onClick={() => c.requestSend(s)} disabled={c.busy}
                       className="rounded-lg border px-3 py-2 text-left text-xs hover:bg-muted disabled:opacity-50"
                     >
                       {s}
@@ -85,7 +85,7 @@ export function CopilotDock() {
         compact={!showPanel}
         mode={c.mode}
         setMode={c.setMode}
-        onSend={(t) => { setExp(true); void c.send(t); }}
+        onSend={(t) => { setExp(true); c.requestSend(t); }}
         busy={c.busy}
         rows={1}
         placeholder="Ask anything about your lakehouse…"
