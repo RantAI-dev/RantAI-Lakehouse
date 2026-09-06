@@ -845,7 +845,12 @@ services:
         EOF
         exec /usr/lib/trino/bin/run-trino
     ports:
-      - "${TRINO_HOST_PORT:-8090}:8080"
+      # 8091, not 8090: `oidc-mock` (always-on, not profile-gated) already
+      # publishes host 8090, so an 8090 default here collides the moment the
+      # `trino` profile runs alongside the base stack — which is exactly what
+      # a full deployment does. The clash never surfaced during the build
+      # because `trino` was only ever exercised on its own.
+      - "${TRINO_HOST_PORT:-8091}:8080"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/v1/info"]
       interval: 10s

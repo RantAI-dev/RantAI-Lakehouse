@@ -294,7 +294,7 @@ their opt-in compose profiles:
 | --- | --- | --- | --- |
 | `SEAWEEDFS_ACCESS_KEY` | SeaweedFS S3 API access key | `seaweedfsadmin` (public, well-known) | No, but override before exposing SeaweedFS beyond localhost |
 | `SEAWEEDFS_SECRET_KEY` | SeaweedFS S3 API secret key | `seaweedfsadmin` (public, well-known) | No, but override before exposing SeaweedFS beyond localhost |
-| `TRINO_HOST_PORT` | Host port mapped to Trino's coordinator UI/API (`trino` profile) | `8090` | No |
+| `TRINO_HOST_PORT` | Host port mapped to Trino's coordinator UI/API (`trino` profile). Not `8090` — `oidc-mock` already publishes that, and the two collide when the `trino` profile runs alongside the base stack | `8091` | No |
 | `TRINO_CRON_INTERVAL_SECONDS` | How often `trino-maintenance-cron` runs `ALTER TABLE ... EXECUTE optimize` against every Bronze table (`trino` profile) | `21600` (6h) | No |
 
 Debezium Server's image (`ghcr.io/memiiso/debezium-server-iceberg`) is
