@@ -737,13 +737,28 @@ export function DataTable<TData>({
         modifiers={[restrictToHorizontalAxis]}
         onDragEnd={onDragEnd}
       >
+        {/*
+          Deliberately no `overflow-x` wrapper.
+
+          It is tempting — a wide table should scroll in its own box rather
+          than widening the page — but it cannot be done here. An overflow
+          ancestor becomes the containing block for `position: sticky`, so
+          the header's `top: 56px` would resolve against this div instead
+          of the viewport and scroll away with the rows. And
+          `overflow-y: visible` cannot rescue it: per spec the browser
+          forces it to `auto` as soon as `overflow-x` is not `visible`
+          (measured — computed `overflow-y` came back `auto`, header
+          dropped from 107px to 163px).
+
+          Making the header sticky against this box instead (`top: 0`,
+          capped height) does work, but it would move the table off the
+          window scroll that `useWindowVirtualizer` depends on.
+
+          So pages keep the table narrow enough to fit instead: hide the
+          columns that do not earn their width at small sizes. See
+          `columnVisibility` in `data-explorer-page.tsx`.
+        */}
         <div ref={tableContainerRef} className="min-w-0">
-          {/*
-            No overflow-x wrapper here — any overflow ancestor traps sticky
-            headers so they scroll away with the page. Horizontal overflow is
-            rare on these tables; pinned columns still use sticky left/right
-            against the viewport.
-          */}
           <table
             data-slot="table"
             className="w-full caption-bottom border-separate border-spacing-0 text-sm"
