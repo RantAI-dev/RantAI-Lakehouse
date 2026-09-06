@@ -6,6 +6,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { AppFrame } from "@/components/app-shell/app-frame";
 import { TableProviders } from "@/components/app-shell/table-providers";
 import { AuthProvider } from "@/features/auth/auth-provider";
+import { ReactGrabDev } from "@/components/app-shell/react-grab-dev";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -63,6 +64,9 @@ export default function RootLayout({
                 `notify` di `@/lib/notify`, bukan `toast()` langsung, supaya
                 pesan error ServiceError diterjemahkan seragam. */}
             <Toaster position="bottom-right" richColors closeButton />
+            {/* Dev-only: hover an element + ⌘C to copy its source location
+                for a coding agent. Compiles away in production builds. */}
+            <ReactGrabDev />
           </TooltipProvider>
         </ThemeProvider>
       </body>
