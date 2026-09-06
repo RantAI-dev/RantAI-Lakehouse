@@ -1,10 +1,16 @@
 "use client";
 
 import * as React from "react";
-import { Loader2 } from "lucide-react";
+import { Eye, EyeOff, Lock } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+import { Field, FieldLabel } from "@/components/ui/field";
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupButton,
+  InputGroupInput,
+} from "@/components/ui/input-group";
+import { Spinner } from "@/components/ui/spinner";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import * as authClient from "@/services/clients/auth";
 import { toServiceError } from "@/services/errors";
@@ -21,6 +27,72 @@ import { toServiceError } from "@/services/errors";
  * /api/auth/change-password` doesn't require/read `oldPassword` for a
  * forced rotation, so this component doesn't collect it either.
  */
+/**
+ * One masked field with its own reveal toggle. Each field owns its toggle
+ * rather than sharing one for the whole form: revealing "new password" to
+ * check a typo should not also expose the current one on a shared screen.
+ */
+function PasswordField({
+  id,
+  label,
+  value,
+  onChange,
+  autoComplete,
+  disabled,
+  invalid,
+  describedBy,
+  minLength,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  autoComplete: string;
+  disabled: boolean;
+  invalid: boolean;
+  describedBy?: string;
+  minLength?: number;
+}) {
+  const [show, setShow] = React.useState(false);
+  return (
+    <Field data-invalid={invalid}>
+      <FieldLabel htmlFor={id} className="text-sm">
+        {label}
+      </FieldLabel>
+      <InputGroup className="h-11">
+        <InputGroupAddon className="pl-3">
+          <Lock />
+        </InputGroupAddon>
+        <InputGroupInput
+          id={id}
+          type={show ? "text" : "password"}
+          autoComplete={autoComplete}
+          required
+          minLength={minLength}
+          placeholder="••••••••"
+          className="text-sm"
+          aria-invalid={invalid}
+          aria-describedby={describedBy}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          disabled={disabled}
+        />
+        <InputGroupAddon align="inline-end" className="pr-2">
+          <InputGroupButton
+            size="icon-sm"
+            tabIndex={-1}
+            disabled={disabled}
+            onClick={() => setShow((v) => !v)}
+            aria-label={show ? `Hide ${label.toLowerCase()}` : `Show ${label.toLowerCase()}`}
+          >
+            {show ? <EyeOff /> : <Eye />}
+          </InputGroupButton>
+        </InputGroupAddon>
+      </InputGroup>
+    </Field>
+  );
+}
+
 export function ChangePasswordStep({
   forced,
   onDone,
@@ -73,55 +145,62 @@ export function ChangePasswordStep({
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <form onSubmit={onSubmit} className="flex flex-col gap-4">
+          <form onSubmit={onSubmit} className="flex flex-col gap-5" noValidate>
             {!forced ? (
-              <div className="flex flex-col gap-1.5">
-                <Label htmlFor="old-password">Current password</Label>
-                <Input
-                  id="old-password"
-                  type="password"
-                  autoComplete="current-password"
-                  required
-                  value={oldPassword}
-                  onChange={(e) => setOldPassword(e.target.value)}
-                  disabled={submitting}
-                />
-              </div>
+              <PasswordField
+                id="old-password"
+                label="Current password"
+                autoComplete="current-password"
+                value={oldPassword}
+                onChange={setOldPassword}
+                disabled={submitting}
+                invalid={!!error}
+                describedBy={error ? "change-password-error" : undefined}
+              />
             ) : null}
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="new-password">New password</Label>
-              <Input
-                id="new-password"
-                type="password"
-                autoComplete="new-password"
-                required
-                minLength={8}
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-                disabled={submitting}
-              />
-            </div>
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="confirm-password">Confirm new password</Label>
-              <Input
-                id="confirm-password"
-                type="password"
-                autoComplete="new-password"
-                required
-                minLength={8}
-                value={confirm}
-                onChange={(e) => setConfirm(e.target.value)}
-                disabled={submitting}
-              />
-            </div>
+
+            <PasswordField
+              id="new-password"
+              label="New password"
+              autoComplete="new-password"
+              minLength={8}
+              value={newPassword}
+              onChange={setNewPassword}
+              disabled={submitting}
+              invalid={!!error}
+              describedBy={error ? "change-password-error" : undefined}
+            />
+
+            <PasswordField
+              id="confirm-password"
+              label="Confirm new password"
+              autoComplete="new-password"
+              minLength={8}
+              value={confirm}
+              onChange={setConfirm}
+              disabled={submitting}
+              invalid={!!error}
+              describedBy={error ? "change-password-error" : undefined}
+            />
+
             {error ? (
-              <p role="alert" className="text-sm text-destructive">
+              <p
+                id="change-password-error"
+                role="alert"
+                className="rounded-lg bg-destructive/10 px-3.5 py-2.5 text-sm text-destructive"
+              >
                 {error}
               </p>
             ) : null}
-            <Button type="submit" className="w-full" disabled={submitting}>
-              {submitting ? <Loader2 className="size-4 animate-spin" /> : null}
-              Update password
+
+            <Button
+              type="submit"
+              size="lg"
+              className="h-11 w-full"
+              disabled={submitting}
+            >
+              {submitting ? <Spinner /> : null}
+              {submitting ? "Updating…" : "Update password"}
             </Button>
           </form>
         </CardContent>
