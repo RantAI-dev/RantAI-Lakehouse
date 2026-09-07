@@ -88,6 +88,23 @@ pub enum SecretError {
         /// Which resolver reported the miss.
         resolver: &'static str,
     },
+    /// The reference was understood and could plausibly resolve, but is not
+    /// on the caller's explicit allowlist — see [`AllowlistedSecretResolver`].
+    ///
+    /// Distinct from [`SecretError::NotFound`]: `NotFound` means "this
+    /// resolver looked and there was nothing there"; `NotAllowed` means
+    /// "this resolver refuses to even look, because this caller is not
+    /// permitted to resolve this reference". Keeping them separate matters
+    /// for diagnosability — a connector operator who typos a secretRef
+    /// should see `NotFound`, not be told the (correctly spelled) name is
+    /// forbidden.
+    #[error("secretRef {secret_ref:?} is not on the {resolver} allowlist")]
+    NotAllowed {
+        /// The offending `secretRef`.
+        secret_ref: String,
+        /// Which resolver rejected it.
+        resolver: &'static str,
+    },
 }
 
 /// Resolves a `secretRef` string to a [`SecretValue`].
@@ -241,6 +258,80 @@ impl SecretResolver for EnvSecretResolver {
     }
 }
 
+/// Wraps a [`SecretResolver`] with an explicit allowlist of `secretRef`
+/// strings it may resolve, rejecting anything else with
+/// [`SecretError::NotAllowed`] before ever consulting the inner resolver.
+///
+/// # Why this exists (addendum to ADR 0002)
+///
+/// ADR 0002 designed [`SecretResolver`] for callers where the resolved
+/// value's DESTINATION is fixed and operator-controlled — Lakekeeper's own
+/// storage credential, dialing `RustFS`; a future Debezium source credential,
+/// dialing a database an operator configured. In that shape, "which env var
+/// can this caller name" was never a meaningful attack surface: the caller
+/// choosing a `secretRef` is the same operator who configured the
+/// destination.
+///
+/// `lakehouse-api::connector_probe` breaks that assumption: a
+/// `connector:manage` principal supplies BOTH the `secretRef` AND the `host`
+/// a probe dials, through `POST /api/connectors` and `POST
+/// /api/connectors/{id}/test`. Handing `EnvSecretResolver` (which resolves
+/// ANY `env:NAME`) to that code path means the principal can name
+/// `env:DATABASE_URL`, `env:CH_PASSWORD`, `env:OIDC_CLIENT_SECRET`, or any
+/// other process secret, point `host` at infrastructure they control, and
+/// have this service dial out and authenticate with the resolved value —
+/// exfiltrating it via a cleartext-password auth handshake (`sqlx`'s
+/// Postgres wire protocol does not require TLS by default) or an S3
+/// `Authorization` header. This wrapper closes that: `connector_probe`
+/// is handed an `AllowlistedSecretResolver` restricted to exactly the
+/// `secretRef`s this deployment's OWN seeded connectors use
+/// (`rust/migrations/0022_prune_connector_seed.sql`), never the general
+/// unrestricted [`EnvSecretResolver`] the rest of the process uses.
+///
+/// A `secretRef` outside the allowlist is rejected — never silently
+/// ignored, never falls through to the inner resolver — so a caller gets a
+/// clear, testable [`SecretError::NotAllowed`], not a confusing
+/// [`SecretError::NotFound`] that looks like a typo.
+#[derive(Debug)]
+pub struct AllowlistedSecretResolver<R> {
+    inner: R,
+    allowed_refs: std::collections::HashSet<String>,
+    /// Name surfaced in [`SecretError`] variants for diagnosability across
+    /// a chain of resolvers — same rationale as [`EnvSecretResolver`]'s use
+    /// of `"env"`.
+    name: &'static str,
+}
+
+impl<R> AllowlistedSecretResolver<R> {
+    /// Wrap `inner`, permitting only the exact `secretRef` strings in
+    /// `allowed_refs`. `name` identifies this resolver in error messages
+    /// (e.g. `"connector-allowlist"`).
+    #[must_use]
+    pub fn new(
+        inner: R,
+        allowed_refs: impl IntoIterator<Item = String>,
+        name: &'static str,
+    ) -> Self {
+        Self {
+            inner,
+            allowed_refs: allowed_refs.into_iter().collect(),
+            name,
+        }
+    }
+}
+
+impl<R: SecretResolver> SecretResolver for AllowlistedSecretResolver<R> {
+    async fn resolve(&self, secret_ref: &str) -> Result<SecretValue, SecretError> {
+        if !self.allowed_refs.contains(secret_ref) {
+            return Err(SecretError::NotAllowed {
+                secret_ref: secret_ref.to_owned(),
+                resolver: self.name,
+            });
+        }
+        self.inner.resolve(secret_ref).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -303,5 +394,58 @@ mod tests {
         let resolver: Arc<dyn DynSecretResolver> = Arc::new(EnvSecretResolver::with_map(map));
         let value = resolver.resolve_dyn("env:MY_VAR").await.unwrap();
         assert_eq!(value.expose_secret(), "the-value");
+    }
+
+    /// The exact attack `AllowlistedSecretResolver` exists to stop: a
+    /// caller who can name any `env:` ref (here, `env:DATABASE_URL` — one
+    /// of the reviewer's cited examples) must be refused even though the
+    /// inner `EnvSecretResolver` would happily resolve it.
+    #[tokio::test]
+    async fn out_of_scope_env_ref_is_rejected_not_silently_resolved() {
+        let mut map = HashMap::new();
+        map.insert("DATABASE_URL".to_owned(), "s3cret-dsn".to_owned());
+        map.insert("POSTGRES_PASSWORD".to_owned(), "allowed-value".to_owned());
+        let inner = EnvSecretResolver::with_map(map);
+        let resolver = AllowlistedSecretResolver::new(
+            inner,
+            ["env:POSTGRES_PASSWORD".to_owned()],
+            "connector-allowlist",
+        );
+
+        let err = resolver.resolve("env:DATABASE_URL").await.unwrap_err();
+        assert!(
+            matches!(err, SecretError::NotAllowed { .. }),
+            "expected NotAllowed, got {err:?}"
+        );
+        assert!(!err.to_string().contains("s3cret-dsn"));
+    }
+
+    #[tokio::test]
+    async fn allowlisted_ref_still_resolves_through_the_inner_resolver() {
+        let mut map = HashMap::new();
+        map.insert("POSTGRES_PASSWORD".to_owned(), "allowed-value".to_owned());
+        let inner = EnvSecretResolver::with_map(map);
+        let resolver = AllowlistedSecretResolver::new(
+            inner,
+            ["env:POSTGRES_PASSWORD".to_owned()],
+            "connector-allowlist",
+        );
+
+        let value = resolver.resolve("env:POSTGRES_PASSWORD").await.unwrap();
+        assert_eq!(value.expose_secret(), "allowed-value");
+    }
+
+    /// A name that would resolve fine through the inner resolver, but was
+    /// never added to the allowlist, must fail closed — never silently
+    /// fall through to the inner resolver's answer.
+    #[tokio::test]
+    async fn empty_allowlist_rejects_everything() {
+        let mut map = HashMap::new();
+        map.insert("ANYTHING".to_owned(), "value".to_owned());
+        let inner = EnvSecretResolver::with_map(map);
+        let resolver =
+            AllowlistedSecretResolver::new(inner, Vec::<String>::new(), "connector-allowlist");
+        let err = resolver.resolve("env:ANYTHING").await.unwrap_err();
+        assert!(matches!(err, SecretError::NotAllowed { .. }));
     }
 }
