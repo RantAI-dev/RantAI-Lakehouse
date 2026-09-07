@@ -306,6 +306,28 @@ their opt-in compose profiles:
 | `SEAWEEDFS_SECRET_KEY` | SeaweedFS S3 API secret key | `seaweedfsadmin` (public, well-known) | No, but override before exposing SeaweedFS beyond localhost |
 | `TRINO_HOST_PORT` | Host port mapped to Trino's coordinator UI/API (`trino` profile). Not `8090` — `oidc-mock` already publishes that, and the two collide when the `trino` profile runs alongside the base stack | `8091` | No |
 | `TRINO_CRON_INTERVAL_SECONDS` | How often `trino-maintenance-cron` runs `ALTER TABLE ... EXECUTE optimize` against every Bronze table (`trino` profile) | `21600` (6h) | No |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Credentials and database for the compose `postgres` service. `POSTGRES_PASSWORD` is also passed into `lakehouse-api`, because the seeded `conn-pg-lakehouse` connector's `secretRef` resolves it | `lakehouse` / `lakehouse` / `lakehouse` | No |
+| `POSTGRES_HOST_PORT` | Host port for Postgres | `5432` | No |
+| `CH_HTTP_HOST_PORT` / `CH_NATIVE_HOST_PORT` | Host ports for ClickHouse's HTTP and native interfaces | `8123` / `9000` | No |
+| `CH_DB` | ClickHouse default database created at first boot | `default` | No |
+| `API_HOST_PORT` | Host port for `lakehouse-api` | `8080` | No |
+| `DAGSTER_WEBSERVER_HOST_PORT` | Host port for the Dagster webserver (`dagster` profile) | `3000` | No |
+| `SEAWEEDFS_S3_HOST_PORT` | Host port for SeaweedFS's S3 API (`seaweedfs` profile) | `8333` | No |
+| `DAGSTER_PG_DB` | Dagster's own Postgres database, created on the existing `postgres` service | `dagster` | No |
+| `OPENFGA_PG_DB` | OpenFGA's own Postgres database | `openfga` | No |
+| `LAKEKEEPER_OPENFGA_STORE_NAME` | Name of the OpenFGA store holding the catalog authorization model | `lakekeeper` | No |
+| `BRONZE_SOURCE_SCHEMA` / `BRONZE_SOURCE_TABLE` | Source schema and table the dlt batch-ingest job reads (`dagster` profile) | `ingest_demo` / `orders` | No |
+| `BRONZE_TABLE_NAME` | Bronze Iceberg table the ingest job writes | `g3a_orders` | No |
+| `LAKEHOUSE_API_URL` | In-network address Dagster jobs use to call the API back | `http://lakehouse-api:8080` | No |
+| `CH_RUSTFS_S3_ENDPOINT` | S3 endpoint Iceberg clients use for object I/O. Switching this to the SeaweedFS service is what makes the G2 storage matrix a config-only change | `http://rustfs:9000` | No |
+| `TENANT_OWNER` / `TENANT_ID` / `TENANT_DOMAIN` / `TENANT_RESIDENCY` / `TENANT_SITE` / `TENANT_SOURCE` | Tenant identity surfaced on catalog assets, audit and quota records (`lakehouse-api/src/tenant.rs`). Each falls back to its historical default when blank | unset (historical defaults apply) | No |
+| `BRONZE_CURATED_SLUGS` | Comma-separated dataset slugs presented as curated rather than raw Bronze | unset | No |
+| `CATALOG_NAMESPACE_META` | JSON object overriding catalog namespace display names/descriptions. Malformed JSON is ignored in favour of the defaults — a bad label is cosmetic, refusing to serve the catalog is an outage | unset | No |
+| `BUILTIN_DASHBOARD_ENABLED` | Set `0` on any tenant **without** a `serving.mart_wisman` mart: the built-in "Main" dashboard's tiles are hardcoded to it and paint red before the UI redirects | `1` | No, but effectively required off-tenant |
+| `GOLD_SOURCE_SCHEMA` | ClickHouse schema Gold export reads marts from | `serving` | No |
+| `GOLD_EXPORT_MARTS` | Comma-separated marts the scheduled Gold export job exports | `gold_export_smoke` | No |
+| `GOLD_EXPORT_RUN_TOKEN` | Shared token required by `POST /api/gold/export/{mart}`. Generate your own | unset | No |
+| `GOLD_MART_NAME` / `GOLD_EXPORT_ROW_COUNT` | Mart name and row count the Gold export acceptance test seeds | `gold_export_smoke` / `7` | No |
 
 Debezium Server's image (`ghcr.io/memiiso/debezium-server-iceberg`) is
 pinned by digest in `docker-compose.yml`, not by an env var — see the
