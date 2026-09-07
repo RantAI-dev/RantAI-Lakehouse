@@ -366,24 +366,40 @@ issue about any of the following — they're known, not bugs:
   shrunk to match: two connectors, `conn-pg-lakehouse` and
   `conn-s3-warehouse`, pointing at the compose stack's own Postgres and
   RustFS.
-- **ClickHouse cannot write Iceberg through the catalog on 26.3.**
-  `CREATE TABLE` inside a `DataLakeCatalog` database never reaches
-  Lakekeeper (falls back to `MergeTree`, `Code: 79`); `INSERT` into a
-  **partitioned** catalog-registered table **segfaults the server**
-  (signal 11 in `IcebergStorageSink::consume`); `INSERT` into an
-  unpartitioned one fails cleanly (`Code: 1000`). Bronze ingestion
-  (Debezium/dlt/Rust → Iceberg → ClickHouse reads) is unaffected — only
-  ClickHouse-*originated* writes are. Gold export was moved to Rust as a
-  result (ADR 0010). See `docs/plans/G1-RESULT.md`.
-- **`remove_orphan_files` does not exist for Iceberg tables, and `OPTIMIZE`
-  fails at runtime with an HTTP 403 on a catalog-registered Iceberg
-  table.** Of the maintenance chain the plan assumed, only
-  `expire_snapshots` actually works on ClickHouse 26.3 — it does not
-  compact small data files. Small-file compaction on Bronze runs
-  out-of-band via a Trino-as-cron container instead (`trino` compose
-  profile, ADR 0009); a deployment that never enables that profile
-  accumulates small Bronze files unbounded. See `docs/plans/G3-RESULT.md`.
-- **A bare `count()` overcounts on CDC-fed Bronze tables.** On ClickHouse
+- **ClickHouse cannot `CREATE TABLE` through the catalog, on 26.3 or
+  26.8.** `CREATE TABLE` inside a `DataLakeCatalog` database never reaches
+  Lakekeeper — it falls back to `MergeTree` and fails with `Code: 79` on
+  both versions. `INSERT` is the part that changed: on 26.3 a partitioned
+  catalog-registered table **segfaulted the server** and an unpartitioned
+  one failed with `Code: 1000`; on the pinned 26.8 both now succeed. Gold
+  export still goes through Rust (ADR 0010), because `CREATE TABLE` —
+  the half that has to work for ClickHouse to own a table's lifecycle —
+  still does not. See `docs/plans/CLICKHOUSE-26.8-REMEASUREMENT.md` for the
+  re-measurement and `docs/plans/G1-RESULT.md` for the original 26.3 run.
+- **`OPTIMIZE` runs but does not bin-pack, and `expire_snapshots` is now
+  refused.** On the pinned 26.8, `remove_orphan_files` works (it did not
+  exist on 26.3) and `OPTIMIZE` returns OK but leaves the file count
+  unchanged — 7 files in, 7 files out — so it is not compaction. Moving
+  the other way, `expire_snapshots` worked on 26.3 and is **unsupported
+  for transactional catalogs** on 26.8. Small-file compaction on Bronze
+  therefore still runs out-of-band via a Trino-as-cron container (`trino`
+  compose profile, ADR 0009); a deployment that never enables that profile
+  accumulates small Bronze files unbounded.
+- **Bronze snapshot history is currently unbounded.** This follows from the
+  line above and is an operational gap now, not a future one: nothing
+  expires snapshots. ClickHouse 26.8 refuses `expire_snapshots` for
+  catalog-backed tables, the maintenance job probes it each run and logs
+  the live refusal rather than skipping silently, and Lakekeeper-side
+  expiry does not exist yet. ADR 0004 deferred retention to P4; with P5
+  CDC volume landing continuously, metadata grows without a bound until
+  that is built. See `docs/plans/CLICKHOUSE-26.8-REMEASUREMENT.md` and
+  `docs/plans/G3-RESULT.md`.
+- **A bare `count()` overcounts on CDC-fed Bronze tables — measured on
+  26.3, not re-verified on the pinned 26.8.** Reproducing it needs a
+  CDC-fed table carrying merge-on-read equality deletes, i.e. the full
+  Debezium path rather than a hand-built table, so the 26.8 re-measurement
+  did not cover it. Treat it as open, not fixed: the lint that guards it
+  (R11) is version-independent and stays either way. On ClickHouse
   26.3, `SELECT count()` / `count(*)` / `count(<col>)` against a Bronze
   Iceberg table with merge-on-read equality deletes (i.e. any
   Debezium-fed table) takes a metadata-only fast path that does not
