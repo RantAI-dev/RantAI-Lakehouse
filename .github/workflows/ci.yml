@@ -231,6 +231,21 @@ jobs:
           docker compose -p g2ci --profile seaweedfs up -d
           seaweedfs seaweedfs-bucket-init lakekeeper-warehouse-init-seaweedfs
 
+      # R1 (ADR 0011) flipped Lakekeeper's authz backend to `openfga`, so a
+      # principal with no relation on a warehouse gets 404
+      # NoSuchWarehouseException (Lakekeeper hides existence rather than
+      # returning 403). Grants are per-warehouse-id, so the `default`/RustFS
+      # grants made by `lakekeeper-authz-init` do NOT cover the `seaweedfs`
+      # warehouse — without this step the G1 suite fails with
+      # "A warehouse 'seaweedfs' does not exist". Run (not `up -d`) so the
+      # step blocks until the grants are actually applied: `g1-test-runner`
+      # only `depends_on` the default `lakekeeper-authz-init`, so nothing
+      # else sequences this one.
+      - name: Grant the test principals on the SeaweedFS warehouse
+        run: >
+          docker compose -p g2ci --profile seaweedfs run --rm
+          lakekeeper-authz-init-seaweedfs
+
       - name: Run G1 half (a) inside the compose network, against SeaweedFS
         run: >
           docker compose -p g2ci --profile test --profile seaweedfs run --rm
