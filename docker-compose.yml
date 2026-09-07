@@ -138,9 +138,19 @@ services:
       #    `DATABASE_URL`/RustFS's own service block already use above,
       #    just also exposed under their own names for `EnvSecretResolver`
       #    to resolve. ──
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      # CONNECTOR-DEDICATED credentials, deliberately NOT the API's own
+      # secrets. Only these three names are on
+      # `CONNECTOR_ALLOWED_SECRET_REFS`, which is what stops a
+      # `connector:manage` principal creating a connector that names
+      # `env:POSTGRES_PASSWORD` (the console's own database password) with a
+      # caller-chosen external host and having the API authenticate to it.
+      # They default to the same values so the local stack still works —
+      # separate NAMES, not necessarily separate values. Point them at
+      # least-privilege credentials in any deployment that accepts connector
+      # definitions from callers you do not fully trust.
+      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:-lakehouse}}
+      CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:-rustfsadmin}}
+      CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:-rustfsadmin}}
     restart: unless-stopped
 
   # P1 — S3-compatible object store, the default self-hosted implementation

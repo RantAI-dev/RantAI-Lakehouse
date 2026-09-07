@@ -109,6 +109,36 @@ pub struct CreateConnectorBody {
 
 const VALID_DIRECTIONS: [&str; 3] = ["source", "sink", "bidirectional"];
 
+/// Refuse a caller-supplied `secretRef` that names one of the deployment's
+/// connector credentials ([`crate::state::CONNECTOR_ALLOWED_SECRET_REFS`]).
+///
+/// Those refs are the only ones `AppState::connector_secret_resolver` will
+/// resolve, and they exist for the connectors seeded by migration — the ones
+/// this deployment operates itself. A user-created connector naming one would
+/// have the API authenticate to a caller-chosen `host` with the deployment's
+/// own connector credentials. `connector_probe`'s SSRF guard does not prevent
+/// that: it blocks internal address ranges, and exfiltration wants an
+/// EXTERNAL host, which is exactly what it permits.
+///
+/// So the allowlist answers "which refs may resolve at all" and this answers
+/// "who may name them". Neither alone is sufficient: without the allowlist a
+/// connector could name `env:DATABASE_URL`; without this check it could name
+/// the connector credentials and point them anywhere.
+///
+/// Deliberately compared case-sensitively and after trimming, matching how
+/// the ref is stored and later handed to the resolver — a check that
+/// normalized more aggressively than the resolver would leave a gap between
+/// what this rejects and what that accepts.
+fn reject_allowlisted_secret_ref(field: &str, value: &str) -> Result<(), ApiError> {
+    if crate::state::CONNECTOR_ALLOWED_SECRET_REFS.contains(&value.trim()) {
+        return Err(ApiError::BadRequest(format!(
+            "{field} must not name a deployment connector credential; those are reserved for \
+             connectors this deployment seeds itself"
+        )));
+    }
+    Ok(())
+}
+
 /// `POST /api/connectors` — register a connector. Returns 201.
 ///
 /// # Security
@@ -122,7 +152,9 @@ const VALID_DIRECTIONS: [&str; 3] = ["source", "sink", "bidirectional"];
 /// 400 on a malformed body, a blank required field, an unrecognized
 /// `direction`, or a `secretRef` shaped like a raw credential (see
 /// `lakehouse_store::connectors::looks_like_raw_secret`); 409 if the name
-/// is taken; 503/500 as above.
+/// is taken; 503/500 as above. Also 400 if `secretRef`/`secretRefSecondary`
+/// names a deployment connector credential — see
+/// [`reject_allowlisted_secret_ref`].
 pub async fn create(
     State(state): State<AppState>,
     body: Bytes,
@@ -144,6 +176,7 @@ pub async fn create(
         )
         .into());
     }
+    reject_allowlisted_secret_ref("secretRef", &secret_ref)?;
     let secret_ref_secondary = match body.secret_ref_secondary {
         Some(raw) if !raw.trim().is_empty() => {
             let trimmed = raw.trim().to_owned();
@@ -155,6 +188,7 @@ pub async fn create(
                 )
                 .into());
             }
+            reject_allowlisted_secret_ref("secretRefSecondary", &trimmed)?;
             Some(trimmed)
         }
         _ => None,
@@ -351,5 +385,66 @@ mod tests {
             "postgres://admin:hunter2@db.internal:5432/oms"
         ));
         assert!(!connectors::looks_like_raw_secret("env:MY_SECRET"));
+    }
+
+    /// The exfiltration path this check exists to close: a
+    /// `connector:manage` principal naming a deployment connector credential
+    /// on a connector whose `host` they choose. Every allowlisted ref must be
+    /// refused, so adding one to the allowlist without widening this check
+    /// fails here rather than silently opening the hole again.
+    #[test]
+    fn user_created_connector_cannot_name_a_deployment_connector_credential() {
+        for r in crate::state::CONNECTOR_ALLOWED_SECRET_REFS {
+            assert!(
+                reject_allowlisted_secret_ref("secretRef", r).is_err(),
+                "allowlisted ref {r:?} must be refused on a user-created connector"
+            );
+            // Whitespace must not be a bypass: the value is trimmed before
+            // storage, so a padded ref would reach the resolver identically.
+            assert!(
+                reject_allowlisted_secret_ref("secretRef", &format!("  {r}  ")).is_err(),
+                "padded {r:?} must be refused too"
+            );
+        }
+    }
+
+    /// The check must not over-reach: an ordinary `env:` ref is still
+    /// accepted here. It will fail later at resolution (it is not on the
+    /// allowlist), which is a different, honest error — "this deployment
+    /// will not resolve that", not "you may not say that".
+    #[test]
+    fn ordinary_secret_refs_are_still_accepted_by_this_check() {
+        for r in [
+            "env:MY_SECRET",
+            "vault:secret/data/x",
+            "env:POSTGRES_PASSWORD_2",
+        ] {
+            assert!(
+                reject_allowlisted_secret_ref("secretRef", r).is_ok(),
+                "{r:?} is not a deployment connector credential and must pass this check"
+            );
+        }
+    }
+
+    /// The allowlist must never name one of the API's own secrets again.
+    /// This is the regression guard for the finding itself: the previous
+    /// list was `env:POSTGRES_PASSWORD` / `env:RUSTFS_ACCESS_KEY` /
+    /// `env:RUSTFS_SECRET_KEY`, and re-adding any of them would restore the
+    /// exfiltration path no matter what the route-level check does.
+    #[test]
+    fn allowlist_never_names_the_apis_own_secrets() {
+        for forbidden in [
+            "env:POSTGRES_PASSWORD",
+            "env:RUSTFS_ACCESS_KEY",
+            "env:RUSTFS_SECRET_KEY",
+            "env:DATABASE_URL",
+            "env:CH_PASSWORD",
+        ] {
+            assert!(
+                !crate::state::CONNECTOR_ALLOWED_SECRET_REFS.contains(&forbidden),
+                "{forbidden:?} is one of the API's own secrets and must never be \
+                 connector-resolvable"
+            );
+        }
     }
 }

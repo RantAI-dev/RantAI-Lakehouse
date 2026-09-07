@@ -107,17 +107,31 @@ pub struct AppState {
 /// The exact `secretRef`s [`AppState::connector_secret_resolver`] may
 /// resolve — see that field's doc comment and ADR 0002's addendum. This is
 /// deliberately a fixed, hardcoded list, not derived from configuration:
-/// it names the `secretRef`s `0022_prune_connector_seed.sql`'s two seeded
-/// connectors use (`conn-pg-lakehouse`, `conn-s3-warehouse`), the only
-/// connectors this build can actually dial today (see
-/// `connector_probe`'s module doc comment). Widening this list is a
-/// deliberate code change to make and review, not something a request or
-/// an environment variable can do — a `connector:manage` principal must
+/// widening it is a code change to make and review, not something a request
+/// or an environment variable can do — a `connector:manage` principal must
 /// never be able to expand their own reach.
-const CONNECTOR_ALLOWED_SECRET_REFS: [&str; 3] = [
-    "env:POSTGRES_PASSWORD",
-    "env:RUSTFS_ACCESS_KEY",
-    "env:RUSTFS_SECRET_KEY",
+///
+/// These are CONNECTOR-DEDICATED variables, deliberately NOT the API's own
+/// secrets. The earlier list named `env:POSTGRES_PASSWORD` (the console's
+/// own database password) and `env:RUSTFS_ACCESS_KEY`/`env:RUSTFS_SECRET_KEY`
+/// (the object store's root keys). Allowlisting those made the guard far
+/// weaker than it read: `POST /api/connectors` takes a caller-chosen `host`,
+/// and `connector_probe`'s SSRF guard blocks only internal ranges, so a
+/// `connector:manage` principal could point a connector at infrastructure
+/// they own and have the API authenticate to it with the console's real
+/// database password. The allowlist stopped arbitrary refs; it did not stop
+/// the refs that mattered most.
+///
+/// A deployment MAY set these equal to the real credentials — that is its
+/// choice to make explicitly, in its own environment — but the API's own
+/// secrets are no longer reachable through a connector by name. Combined
+/// with [`crate::routes::connectors::rejects_allowlisted_secret_ref`], which
+/// refuses a USER-created connector that names one of these, the only
+/// connectors that can dial with them are the ones seeded by migration.
+pub(crate) const CONNECTOR_ALLOWED_SECRET_REFS: [&str; 3] = [
+    "env:CONNECTOR_PG_PASSWORD",
+    "env:CONNECTOR_S3_ACCESS_KEY",
+    "env:CONNECTOR_S3_SECRET_KEY",
 ];
 
 /// Translate [`Config`]'s flat `oidc_*` env-derived fields into
