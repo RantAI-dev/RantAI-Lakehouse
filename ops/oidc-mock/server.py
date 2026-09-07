@@ -21,10 +21,11 @@ caller, pointed at directly via ClickHouse's `oauth_server_uri` setting
 openfga/openid mode is unverified — see ADR 0011). It is a client-
 credentials grant in name only: it does not check `client_secret` against
 anything (there is nothing else in this stack it could check it against),
-it only requires `client_id` to name one of PRINCIPALS and mints that
-principal's token on demand. This is a deliberate simplification for a
-self-hosted dev/CI stack, not a production identity provider; see ADR
-0011.
+it only requires `client_id` to name one of TOKEN_ENDPOINT_PRINCIPALS
+(every PRINCIPAL except `admin`, which this endpoint refuses to mint —
+see that list's own comment) and mints that principal's token on demand.
+This is a deliberate simplification for a self-hosted dev/CI stack, not a
+production identity provider; see ADR 0011.
 
 Idempotent: if keys/tokens already exist on the shared volume (a restart,
 not a fresh volume), they are reused rather than regenerated, so already-
@@ -48,13 +49,25 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization
 
 DATA_DIR = Path(os.environ.get("OIDC_MOCK_DATA_DIR", "/data"))
+# The HTTP handler below only ever serves PUBLIC_DIR, never DATA_DIR itself.
+# `private_key.pem` lives directly in DATA_DIR (a sibling of PUBLIC_DIR, not
+# a parent of it), so there is no path under the served document root that
+# reaches it. See `ensure_keys`/`Handler` — PR #33 review, blocker 1: the
+# key used to sit inside the served directory tree and was fetchable over
+# the published host port.
+PUBLIC_DIR = DATA_DIR / "public"
 TOKENS_DIR = Path(os.environ.get("OIDC_MOCK_TOKENS_DIR", "/tokens"))
 ISSUER = os.environ["OIDC_MOCK_ISSUER"]  # e.g. http://oidc-mock:8090
 AUDIENCE = os.environ.get("OIDC_MOCK_AUDIENCE", "lakekeeper")
 KEY_ID = "oidc-mock-1"
-# 10 years: this stack is dev/CI-lived; short-lived tokens would need a
-# refresh mechanism this mock deliberately does not build (see module doc).
-TOKEN_LIFETIME_SECONDS = 10 * 365 * 24 * 3600
+# 30 days, not 10 years (PR #33 review, blocker 2): this mock still has no
+# token-refresh mechanism (see module doc), so the lifetime has to outlive
+# a normal dev/CI stack's uptime without operator intervention. 30 days
+# comfortably covers a sprint-length local stack or a long-running demo
+# environment while bounding how long a leaked token stays valid to weeks,
+# not a decade. A stack left running past that needs `oidc-mock` restarted
+# with a fresh `lakehouse_oidc_tokens` volume anyway (see docs/OPERATIONS.md).
+TOKEN_LIFETIME_SECONDS = 30 * 24 * 3600
 
 # Every principal this build needs Lakekeeper to recognize under
 # enforcement, plus one deliberately ungranted principal for the negative
@@ -72,6 +85,17 @@ PRINCIPALS = [
     "unauthorized-test",
 ]
 
+# `/token` (the client-credentials endpoint, below) must never mint an
+# `admin` token: `admin` is Lakekeeper's instance-admin bypass identity
+# (LAKEKEEPER__INSTANCE_ADMINS=["oidc~admin"]), and this endpoint has no
+# secret check at all (see its own docstring) — anyone who can reach it
+# could otherwise mint an admin-bypass token on demand. The one-shot init
+# jobs that need `admin` (`lakekeeper-warehouse-init`, `lakekeeper-authz-
+# init`) already read `admin.jwt` straight off the shared token volume
+# `mint_tokens` below writes to disk at container start; they never call
+# `/token`. PR #33 review, blocker 2.
+TOKEN_ENDPOINT_PRINCIPALS = [p for p in PRINCIPALS if p != "admin"]
+
 
 def b64url_uint(value: int) -> str:
     raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
@@ -79,6 +103,8 @@ def b64url_uint(value: int) -> str:
 
 
 def ensure_keys() -> rsa.RSAPrivateKey:
+    # Deliberately DATA_DIR, not PUBLIC_DIR: this is the private signing
+    # key, and PUBLIC_DIR is the only directory the HTTP handler serves.
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     key_path = DATA_DIR / "private_key.pem"
     if key_path.exists():
@@ -95,6 +121,7 @@ def ensure_keys() -> rsa.RSAPrivateKey:
 
 
 def write_jwks(key: rsa.RSAPrivateKey) -> None:
+    PUBLIC_DIR.mkdir(parents=True, exist_ok=True)
     pub = key.public_key().public_numbers()
     jwks = {
         "keys": [
@@ -108,7 +135,7 @@ def write_jwks(key: rsa.RSAPrivateKey) -> None:
             }
         ]
     }
-    (DATA_DIR / "jwks.json").write_text(json.dumps(jwks))
+    (PUBLIC_DIR / "jwks.json").write_text(json.dumps(jwks))
 
 
 def write_discovery() -> None:
@@ -116,11 +143,14 @@ def write_discovery() -> None:
         "issuer": ISSUER,
         "jwks_uri": f"{ISSUER}/jwks.json",
         "authorization_endpoint": f"{ISSUER}/authorize",
+        # PyJWT/most OIDC-aware clients look this up before trying a
+        # hardcoded path; Lakekeeper's own OIDC client is one of them.
+        "token_endpoint": f"{ISSUER}/token",
         "response_types_supported": ["id_token"],
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["RS256"],
     }
-    well_known = DATA_DIR / ".well-known"
+    well_known = PUBLIC_DIR / ".well-known"
     well_known.mkdir(parents=True, exist_ok=True)
     (well_known / "openid-configuration").write_text(json.dumps(doc))
 
@@ -153,7 +183,9 @@ def mint_tokens(key: rsa.RSAPrivateKey) -> None:
 class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, private_key=None, **kwargs):
         self._private_key = private_key
-        super().__init__(*args, directory=str(DATA_DIR), **kwargs)
+        # PUBLIC_DIR only — never DATA_DIR, which also holds
+        # private_key.pem. See the DATA_DIR/PUBLIC_DIR module comment.
+        super().__init__(*args, directory=str(PUBLIC_DIR), **kwargs)
 
     def end_headers(self):
         self.send_header("Content-Type", "application/json")
@@ -175,7 +207,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         # Client-credentials grant in name only — see module doc: this
         # exists purely so ClickHouse's `oauth_server_uri` has something to
         # call, and does not check `client_secret` against anything.
-        if client_id not in PRINCIPALS:
+        # Deliberately TOKEN_ENDPOINT_PRINCIPALS, not PRINCIPALS: `admin`
+        # must never be mintable through this unauthenticated endpoint (PR
+        # #33 review, blocker 2) — see that list's own comment.
+        if client_id not in TOKEN_ENDPOINT_PRINCIPALS:
             self.send_response(401)
             self.end_headers()
             self.wfile.write(
