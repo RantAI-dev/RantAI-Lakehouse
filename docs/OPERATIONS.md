@@ -36,7 +36,7 @@ brings up:
 | Service | Image | Purpose |
 | --- | --- | --- |
 | `postgres` | `postgres:16` | OLTP store (identity, governance, pipelines, connectors, alerts, ...) |
-| `clickhouse` | `clickhouse/clickhouse-server:26.3` | Analytics store (catalog, overview, governance, dashboards, ...); also the Iceberg query engine once `DataLakeCatalog` is wired up in P1b |
+| `clickhouse` | `clickhouse/clickhouse-server:26.8` | Analytics store (catalog, overview, governance, dashboards, ...); also the Iceberg query engine once `DataLakeCatalog` is wired up in P1b |
 | `lakehouse-api` | built from `rust/Dockerfile` | the axum API, port 8080 |
 | `rustfs` | `rustfs/rustfs:1.0.0-rc.4` | S3-compatible object store for the lakehouse warehouse (P1 infrastructure; not yet wired into `lakehouse-api`) |
 | `rustfs-bucket-init` | `amazon/aws-cli:2.36.34` | One-shot: creates the warehouse bucket via the plain S3 API (`s3api create-bucket`) — never RustFS's admin API |
@@ -70,11 +70,17 @@ gate harnesses, not part of the running product — each proves one gate
 compose run --rm <name>`), never by a plain `docker compose up`. See
 `docs/plans/*-RESULT.md` for what each gate measured.
 
-### ClickHouse 24.8 → 26.3: what changed and what was verified
+### ClickHouse 24.8 → 26.3 → 26.8: what changed and what was verified
 
-Bumped because Iceberg writes via ClickHouse's `DataLakeCatalog` need
-`clickhouse-server >= 26.2` (for `allow_database_iceberg`); 26.3 is the
-current LTS tag. Verified clean:
+Bumped to 26.3 because Iceberg reads via ClickHouse's `DataLakeCatalog`
+need `clickhouse-server >= 26.2` (for `allow_database_iceberg`), then to
+**26.8 LTS**, which materially changes what the Iceberg write and
+maintenance paths can do — see
+[`docs/plans/CLICKHOUSE-26.8-REMEASUREMENT.md`](plans/CLICKHOUSE-26.8-REMEASUREMENT.md)
+for every finding re-run on 26.8, including the one that BREAKS the P4
+maintenance job as originally written (`expire_snapshots` is now refused
+for catalog-backed tables). Verified clean on the 26.3 bump, and the same
+checks still hold on 26.8:
 
 - All 7 `demo/clickhouse/*.sql` files (`01_databases.sql` through
   `07_meta.sql`) apply without error against a fresh 26.3 container —

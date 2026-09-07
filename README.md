@@ -40,7 +40,7 @@ flowchart LR
     end
 
     Postgres[("Postgres\n(OLTP: identity, governance,\npipelines, connectors, ...\nalso the CDC source, wal_level=logical)")]
-    ClickHouse[("ClickHouse 26.3\n(analytics: serving.* marts,\ncatalog, lineage, BI;\nalso reads Bronze via DataLakeCatalog)")]
+    ClickHouse[("ClickHouse 26.8\n(analytics: serving.* marts,\ncatalog, lineage, BI;\nalso reads Bronze via DataLakeCatalog)")]
     Dagster["Dagster\n(orchestration, opt-in profile:\nbatch ingest + Bronze maintenance)"]
     LLM["LLM\n(OpenAI-compatible)"]
 
@@ -81,8 +81,10 @@ ClickHouse `MergeTree` and appends it to its own `gold` Iceberg namespace
 through Lakekeeper, and reads it back through `iceberg-rust` — the console
 still reads *Bronze* through ClickHouse's `DataLakeCatalog`/the
 `bronze_meta.*` registry, not through `lakehouse-iceberg` directly, since
-that read path already works on ClickHouse 26.3 (see "Status / Known
-limitations" below for the write-path defects that do not).
+that read path works on both 26.3 and 26.8 (see "Status / Known
+limitations" below for the write-path defects, and
+`docs/plans/CLICKHOUSE-26.8-REMEASUREMENT.md` for which of them 26.8
+fixes).
 
 ## Quickstart
 
