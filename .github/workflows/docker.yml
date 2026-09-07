@@ -5,7 +5,11 @@ on:
     branches: [main]
     tags: ["v*"]
   pull_request:
-    branches: [main]
+    # `lakehouse/**` as well as main: the lakehouse foundation work ships as a
+    # stack of PRs that target each other rather than main, so a `[main]`-only
+    # filter means every PR above the first gets ZERO check runs and merges
+    # unverified.
+    branches: [main, 'lakehouse/**']
 
 concurrency:
   group: docker-${{ github.workflow }}-${{ github.ref }}
