@@ -125,6 +125,55 @@ pointed at it fail closed. It does not affect `lakehouse-api`'s own boot
 or its existing Postgres/ClickHouse-backed routes, which have no
 dependency on Lakekeeper in this phase.
 
+### OpenFGA: failure mode
+
+OpenFGA is Lakekeeper's authorization-relation store (ADR 0011) — core,
+not profile-gated. If it's down (or `openfga-migrate`/`openfga-ready`
+never complete): `lakekeeper-migrate` cannot write Lakekeeper's own
+authorization model into the store and fails outright, so `lakekeeper`
+itself never becomes healthy (it depends on `openfga-ready`, not just
+`openfga` reporting started) and nothing downstream of it — every
+`lakekeeper-*-init` job, every Bronze writer, ClickHouse's and Trino's
+Iceberg read/write paths — starts either. This is a hard, visible failure
+at bring-up, not a degraded mode: a plain `docker compose up` will not
+finish coming up with OpenFGA down. Once the stack IS up, OpenFGA going
+down mid-run makes every *new* authorization check Lakekeeper performs
+fail (existing, already-open connections and already-cached decisions are
+unaffected until Lakekeeper needs to check again).
+
+`openfga` publishes no host port by default (PR #33 review, blocker 2) —
+it has no authentication of its own, and its Management-API-shaped grant
+interface is meant to be reached through Lakekeeper's own
+`/management/v1/permissions/...`, not directly. If you need to inspect it
+directly for debugging, use `docker compose exec` or attach a one-off
+container to the compose network rather than republishing
+`OPENFGA_HTTP_HOST_PORT`/`OPENFGA_GRPC_HOST_PORT`.
+
+### oidc-mock: failure mode
+
+`ops/oidc-mock` is the mock OIDC issuer every principal in this stack
+authenticates through (ADR 0011) — also core, not profile-gated. If it's
+down: `lakekeeper` never becomes healthy (it depends on `oidc-mock`
+reporting healthy, since `LAKEKEEPER__OPENID_PROVIDER_URI` points at it
+and Lakekeeper needs its discovery/JWKS documents to validate any bearer
+token at all), so the same downstream failure as OpenFGA-down applies.
+Once up, if `oidc-mock` goes down mid-run: every pre-minted token already
+on the `lakehouse_oidc_tokens` volume keeps working (Lakekeeper validates
+signatures against JWKS it already fetched; nothing re-fetches per
+request), but ClickHouse's `oauth_server_uri` calls to `/token` start
+failing, which breaks ClickHouse's `DataLakeCatalog` Iceberg read path the
+next time it needs a fresh token — this is the one caller in this build
+that actually depends on `oidc-mock` staying up, not just having started
+once (see ADR 0011's "what a real IdP swap has to account for" for why
+this is a real gap, not just a mock-specific one).
+
+`oidc-mock` publishes no host port by default (PR #33 review, blockers 1
+and 2) — it holds the private key that everything else's token
+verification trusts, and (before this review) its `/token` endpoint could
+mint an admin-bypass token for anyone who could reach it with no
+credential. Reach it via `docker compose exec` or a container on the
+compose network for debugging, not by republishing `OIDC_MOCK_HOST_PORT`.
+
 ### SeaweedFS (opt-in, P2 — storage-compatibility matrix only)
 
 `seaweedfs`, `seaweedfs-bucket-init`, and

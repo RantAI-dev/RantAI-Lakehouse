@@ -91,14 +91,17 @@ practice.
 - A standard OIDC discovery document (`/.well-known/openid-configuration`)
   and JWKS (`/jwks.json`), so Lakekeeper's own OIDC client validates
   tokens exactly the way it would against a real IdP.
-- One long-lived (10-year) RS256 token pre-minted per principal
-  (`ops/oidc-mock/server.py`'s `PRINCIPALS`) at boot, written to a shared
-  volume (`lakehouse_oidc_tokens`) every writer mounts read-only and reads
-  directly — no login flow, no refresh.
+- One long-lived (30-day, see PR #33 review below) RS256 token pre-minted
+  per principal (`ops/oidc-mock/server.py`'s `PRINCIPALS`) at boot,
+  written to a shared volume (`lakehouse_oidc_tokens`) every writer mounts
+  read-only (as a per-principal single-file subpath mount, not the whole
+  volume — see "PR #33 review" below) and reads directly — no login flow,
+  no refresh.
 - A `/token` endpoint implementing an OAuth2 client-credentials grant *in
   name only* (it does not check `client_secret` against anything — there
-  is nothing else in this stack to check it against). This exists for
-  exactly one caller: ClickHouse's `DataLakeCatalog` REST engine, whose
+  is nothing else in this stack to check it against, and it refuses to
+  mint a token for `admin`, see below). This exists for exactly one
+  caller: ClickHouse's `DataLakeCatalog` REST engine, whose
   `catalog_credential` setting only accepts the Iceberg REST spec's
   `client_id:client_secret` form and performs a real OAuth2 exchange —
   measured empirically (`catalog_credential` set to a raw token is
@@ -107,12 +110,66 @@ practice.
   bypassing Lakekeeper's own (unverified in this build) `/v1/oauth/tokens`.
 
 This is **not a production identity provider** and is not meant to be
-read as one. A real deployment replaces `ops/oidc-mock` with a real IdP
-(Keycloak, Dex, the customer's own OIDC provider) and Lakekeeper's
-`openid_provider_uri`/`openid_audience` point at it instead — nothing else
-in this design changes, because every writer already authenticates via
-the standard OIDC bearer-token / OAuth2-client-credentials mechanisms a
-real IdP also speaks.
+read as one.
+
+**Corrected claim (PR #33 review):** an earlier version of this ADR said
+"nothing else in this design changes" when `ops/oidc-mock` is swapped for
+a real IdP. That is false, and worth saying plainly instead of leaving it
+implied by the rest of this ADR:
+
+- **There is no token refresh anywhere in this build.** Every writer reads
+  a single pre-minted token once (at process start, or once per `/token`
+  call for ClickHouse) and holds it for the rest of its process lifetime.
+  A real IdP-backed deployment needs each writer's client to implement
+  actual OAuth2 token refresh (or short-lived-token reissuance) before a
+  30-day (or shorter, if a real IdP issues shorter-lived tokens, which
+  most do) token expiring mid-run becomes a real operational failure
+  mode. Nothing in this codebase does that today.
+- **Trino and Debezium use static bearer tokens, not an OAuth2 client
+  they own.** `trino`'s `iceberg.rest-catalog.oauth2.token` and
+  `debezium-server`'s `debezium.sink.iceberg.token` are both rendered
+  once, at container start, from the token file on
+  `lakehouse_oidc_tokens` — see `docker-compose.yml`. Neither Trino's nor
+  Debezium's Iceberg client re-fetches or refreshes it. Swapping in a
+  real IdP does not fix this by itself; it just changes who signed the
+  (still-static, still-never-refreshed) token these two services start
+  with.
+- **ClickHouse's `oauth_server_uri` points at `ops/oidc-mock` specifically
+  (`http://oidc-mock:8090/token`), not at Lakekeeper or a generic OIDC
+  endpoint.** A real-IdP deployment has to repoint this setting at
+  whatever OAuth2 client-credentials endpoint the real IdP exposes (most
+  do have one), and confirm that endpoint accepts a bare `client_id`
+  naming a known principal the way this mock does — a real IdP will
+  legitimately require a `client_secret`, which ClickHouse's
+  `catalog_credential` setting already supports (`client_id:client_secret`)
+  but this build never had reason to configure, since the mock never
+  checks it.
+
+A real deployment replacing `ops/oidc-mock` with a real IdP (Keycloak,
+Dex, the customer's own OIDC provider) has to account for all three of
+the above, not just repoint `openid_provider_uri`/`openid_audience`.
+
+**Port posture (PR #33 review, blocker 2):** `oidc-mock` (container port
+8090) and `openfga` (container ports 8080/8081) publish **no host ports**
+by default — no `ports:` entry in `docker-compose.yml` at all, so both are
+reachable only from other containers on the compose network. This was not
+true before this review: both were published
+(`${OIDC_MOCK_HOST_PORT:-8090}:8090`,
+`${OPENFGA_HTTP_HOST_PORT:-8082}:8080`,
+`${OPENFGA_GRPC_HOST_PORT:-8083}:8081`), which on a plain `docker compose
+up` meant anyone who could reach the host could fetch `oidc-mock`'s
+private signing key (blocker 1) and, before the `/token` fix above, mint
+an `admin` token with no credential at all — the two together were a
+straight path to a Lakekeeper instance-admin bypass identity from outside
+the stack. Nothing in this build's own CI or test-profile services needs
+host access to either: `lakekeeper`, every `lakekeeper-*-init` job, and
+every writer's `CH_OAUTH_SERVER_URI` already resolve `oidc-mock`/`openfga`
+by compose service name from inside the network, and the G1/G2/G3a/G4 test
+runners (`g1-test-runner`, `gold-export-test-runner`, etc.) run as compose
+services themselves, not from the host. An operator who genuinely needs to
+inspect either from the host for debugging should use `docker compose exec`
+or a one-off container attached to the compose network, not republish
+these ports.
 
 ## Decision 4 — grants, per principal, on the ADR-0003-named warehouse
 
@@ -131,7 +188,7 @@ warehouse:
 | `clickhouse-reader` | `select`, `modify` | Every gate's ClickHouse read path (`select`), **plus** `modify` for `maintenance.py`'s `expire_snapshots` — the one ClickHouse catalog WRITE that works on this ClickHouse version (`docs/plans/G3-RESULT.md`; `CREATE TABLE`/`INSERT` still do not, per `G1-RESULT.md`). See "Over-grants" below. |
 | `trino` | `select`, `modify` | ADR 0009's compaction escape hatch (`trino-maintenance-cron`'s `ALTER TABLE ... EXECUTE optimize`): reads existing Bronze data files and commits a rewritten snapshot — a `select`+`modify` shape, not a `create` one (it never creates a namespace or table). See "Trino" below for the measured proof. |
 | `unauthorized-test` | none | The negative-test principal — self-registered with Lakekeeper (it has an identity) but never granted anything. |
-| `admin` | none (instance-admin bypass) | `LAKEKEEPER__INSTANCE_ADMINS=["oidc~admin"]` — bypasses authorization for control-plane actions only (confirmed via Lakekeeper's own startup log: "these principals bypass authorization for all control-plane actions (but not for `CatalogTableAction::ReadData`/`WriteData`)"). Used only by the one-shot init jobs to bootstrap Lakekeeper and grant the others; never used by a running writer, and cannot itself read or write Bronze data. |
+| `admin` | none (instance-admin bypass) | `LAKEKEEPER__INSTANCE_ADMINS=["oidc~admin"]` — bypasses authorization for control-plane actions only (confirmed via Lakekeeper's own startup log: "these principals bypass authorization for all control-plane actions (but not for `CatalogTableAction::ReadData`/`WriteData`)"). Used only by the one-shot init jobs to bootstrap Lakekeeper and grant the others; never used by a running writer, and cannot itself read or write Bronze data. **PR #33 review:** `admin.jwt` is still pre-minted to `lakehouse_oidc_tokens` at `oidc-mock` boot (the init jobs read it straight off that volume), but `ops/oidc-mock`'s `/token` endpoint refuses to mint an `admin` token on request — that endpoint has no secret check at all, so leaving `admin` mintable through it would have let any caller that could reach the port (before the same review's port-unpublishing fix) obtain the instance-admin bypass identity outright. |
 
 No principal holds a blanket grant across all resource levels or all
 warehouses — `unauthorized-test` proves this (Decision 5), and every
