@@ -115,27 +115,6 @@ const ASSETS: Asset[] = [
     residency: "Jakarta (ID)",
   },
   {
-    id: "mv-payments-flow",
-    name: "payments_flow_mv",
-    namespace: "rt.finance",
-    type: "streaming-view",
-    layer: "gold",
-    tier: "hot",
-    classification: "confidential",
-    owner: "Finance Data",
-    domain: "Finance",
-    description: "Continuously maintained payment aggregates with upserts.",
-    format: "Streaming MV",
-    engine: "streaming",
-    rows: 1_200_000,
-    sizeBytes: 8 * 1024 ** 3,
-    columnCount: 16,
-    freshnessLagSeconds: 42,
-    lastUpdated: agoIso(1),
-    health: "degraded",
-    residency: "Jakarta (ID)",
-  },
-  {
     id: "vec-support-kb",
     name: "support_kb_chunks",
     namespace: "ai.support",
@@ -292,15 +271,6 @@ const NAMESPACES: CatalogNamespace[] = [
     sourceEngine: "Open lake catalog",
   },
   {
-    id: "ns-rt-finance",
-    name: "rt.finance",
-    description: "Real-time materialized views for finance serving.",
-    assetCount: 7,
-    owner: "Finance Data",
-    residency: "Jakarta (ID)",
-    sourceEngine: "Real-time streaming",
-  },
-  {
     id: "ns-ai-support",
     name: "ai.support",
     description: "Vector datasets and knowledge chunks for support AI.",
@@ -386,7 +356,6 @@ function buildDetail(asset: Asset): AssetDetail {
     ],
     downstream: [
       { id: "tbl-customer-360", name: "customer_360" },
-      { id: "mv-payments-flow", name: "payments_flow_mv" },
     ].filter((d) => d.id !== asset.id),
     lifecyclePolicy:
       asset.tier === "hot"

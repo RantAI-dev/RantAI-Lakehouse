@@ -51,7 +51,7 @@ Data Source → Connector → Processing → Storage → Catalog & Governance
 Processing paths:
 
 ```text
-Data Pipeline | Streaming Pipeline | Knowledge / Vector Pipeline
+Data Pipeline | Knowledge / Vector Pipeline
 ```
 
 Consumption paths:
@@ -75,7 +75,7 @@ Trigger → Resolve Context → Query / Retrieve → Analyze → Risk / Policy
 |---|---|---|---|---|---|
 | Connectors | `/connectors`, `/connectors/create` | Partial → improved | List, configure, test, discover, activate | Drawer detail (no dedicated route); test/discover mocked | P1 route |
 | Pipelines | `/pipelines`, create, detail | Partial → improved | Graph, runs, cancel/retry, asset links | Dedicated run route deferred | P1 |
-| Streaming | `/streaming`, create, detail | Partial → improved | Lag/throughput, checkpoints, triggers → agents | Live animation intentionally avoided | — |
+| Streaming | *(removed)* | Removed | — | This surface fabricated `kafka.*` topics, lag, throughput, and checkpoint data for an engine that doesn't exist in this stack; removed rather than kept mocked. See `AI_PROJECT_INSIGHTS.md` §1. | — |
 | Knowledge / Vector | `/knowledge`, `/vector-jobs` | Partial → improved | Source → index → search links | Re-index/re-embed actions still light | P1 |
 | Semantic Search | `/semantic-search` | Partial → improved | Hybrid strategies + citations + catalog links | Filters limited | P1 |
 | Catalog / Explorer | `/catalog`, `/data`, asset detail | Partial → improved | Namespace → asset → linked tabs | Sample always mocked | — |
@@ -111,7 +111,6 @@ None of the P0 product domains are entirely missing as routes. Deferred / still 
 
 - Governance policy impact / conflict simulation
 - Lineage column-level depth
-- Streaming → materialized view asset always linked by index order
 - Audit event corpus not exhaustively correlated for every mock action
 - System states: Empty / Failed / Permission Denied exist; Blocked seeded in query history; Partial on some pipeline runs; Cancelled via workloads/run cancel
 
@@ -123,7 +122,6 @@ None of the P0 product domains are entirely missing as routes. Deferred / still 
 - Pipeline/run contracts gained relationship + cancel/retry fields
 - Query estimate/result gained `plan` + `auditEventId`
 - Knowledge/vector/search share `sourceId` / `assetId`
-- Streaming triggers use `targetHref`
 - Storage restore via `StorageService.restoreAsset`
 - Agent `decideApproval` + Approvals inbox
 - EntityStatus gained `blocked` and `partial`
@@ -156,7 +154,6 @@ Extended (still mock-backed):
 - `PipelineService.cancelRun`, `retryRun`, asset/connector IDs on models
 - `QueryService` plan stages + audit ids on results/history
 - `KnowledgeService` relationship IDs on sources/jobs/hits
-- `StreamingService` `targetHref`, `sinkAssetIds`
 - `StorageService.restoreAsset`
 - `AgentService.decideApproval`, richer `ApprovalItem`
 
@@ -189,7 +186,6 @@ Do **not** redesign pages when wiring backends. Introduce `services/clients/*` a
 
 ```text
 Connector → Pipeline → Run → Dataset → Catalog → Lineage
-Streaming Source → Job → Materialized View → Trigger → Agent
 Document → Knowledge Source → Vector Job → Semantic Search
 Query Studio → Execute → Result → Metrics → History → Audit
 Agent → Query / Retrieve → Approval → Action → Audit

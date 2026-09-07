@@ -17,7 +17,7 @@ export type Connector = {
 export type ConnectorDependent = {
   id: string
   name: string
-  kind: "pipeline" | "streaming"
+  kind: "pipeline"
 }
 
 export type DiscoveredSchema = {

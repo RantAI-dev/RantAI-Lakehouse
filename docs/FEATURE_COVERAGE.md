@@ -32,8 +32,6 @@ Update only with verified repository facts.
 | Build | Pipelines list / create / agentic draft | `/pipelines` | [COMPLETE] | [REAL] |
 | Build | Pipeline detail + graph + runs | `/pipelines/[pipelineId]` | [COMPLETE] | [REAL] |
 | Build | Pipeline run cancel / retry | (run drawer) | [COMPLETE] | [REAL] |
-| Build | Streaming jobs | `/streaming` | [COMPLETE] | [MOCKED] — deliberate; no Kafka/Redpanda/Pulsar/Flink anywhere in this stack. CDC (Debezium, P5) is a change-data-capture pipe into Bronze, not a streaming engine, and is not relabeled as one. |
-| Build | Streaming detail / triggers | `/streaming/[jobId]` | [COMPLETE] | [MOCKED] — same reason as above |
 | Build | Query Studio NL + SQL | `/query-studio` | [COMPLETE] | [REAL] |
 | Build | Federated execution plan | `/query-studio` | [COMPLETE] | [PARTIAL] — query execution itself is real (ClickHouse); "federated" is UI copy, not multi-engine execution (Trino exists only as a background Bronze compactor, per ADR 0009, and is never in the query-serving path) |
 | Build | Saved queries | `/query-studio/saved` | [COMPLETE] | [REAL] |
@@ -64,7 +62,7 @@ Update only with verified repository facts.
 
 | Item | Status |
 |---|---|
-| Real streaming engine (Kafka/Flink/etc.) | [MISSING] (backend) — CDC via Debezium exists but is not a streaming engine |
+| Real streaming engine (Kafka/Flink/etc.) | [MISSING] (backend) — CDC via Debezium exists but is not a streaming engine. The mocked streaming UI surface was removed (not kept as a mock) rather than fabricate lag/throughput numbers for an engine that doesn't exist. |
 | Vector store / embedding-backed semantic search | [MISSING] (backend) |
 | Live connector health checks (`testConnection` dials nothing) | [MISSING] (backend) |
 | Dedicated connector detail route | [PARTIAL] (drawer sufficient for preview) |
@@ -79,10 +77,9 @@ Update only with verified repository facts.
 
 | From | To | Status |
 |---|---|---|
-| Connector | Pipeline / Streaming | [COMPLETE] |
+| Connector | Pipeline | [COMPLETE] |
 | Pipeline / Run | Dataset / Lineage / Audit | [COMPLETE] |
 | Dataset | Policies / Lineage / Query / Storage | [COMPLETE] |
-| Streaming trigger | Agent workflow / employee | [COMPLETE] |
 | Knowledge | Vector job / Semantic search / Catalog | [COMPLETE] |
 | Query result / history | Audit | [COMPLETE] |
 | Agent run | Approval / Audit | [COMPLETE] |

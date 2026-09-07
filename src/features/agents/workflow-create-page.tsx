@@ -105,7 +105,7 @@ export function WorkflowCreatePage() {
               <Input
                 value={trigger}
                 onChange={(e) => setTrigger(e.target.value)}
-                placeholder="Streaming event: lag_seconds > 30"
+                placeholder="Pipeline event: quality_check_failed"
               />
             </Field>
           </div>

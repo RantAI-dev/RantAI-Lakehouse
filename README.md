@@ -309,10 +309,11 @@ connector-registry (ADR 0007), not from top-level env vars.
 This is a young, honestly-scoped project. Please read this before filing an
 issue about any of the following — they're known, not bugs:
 
-- **`streaming` is mocked.** There is no Kafka/Redpanda/Pulsar/Flink
-  anywhere in this project. The streaming domain in the UI is backed by
-  `src/services/mock/streaming.ts`. **CDC (Debezium, P5) is not a
-  streaming engine** and is deliberately not relabeled as one — it's a
+- **There is no streaming surface.** There is no Kafka/Redpanda/Pulsar/Flink
+  anywhere in this project. The console previously had a mocked
+  `streaming` domain fabricating lag/throughput/checkpoint numbers; it has
+  been removed rather than kept as a mock. **CDC (Debezium, P5) is not a
+  streaming engine** and is not relabeled as one — it's a
   change-data-capture pipe from Postgres into Bronze Iceberg, surfaced
   instead under Governance → "Ingestion (CDC)".
 - **`knowledge.search` is mocked.** There is no vector store or embeddings

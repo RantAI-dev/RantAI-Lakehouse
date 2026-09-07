@@ -20,7 +20,6 @@ import {
   Library,
   ListChecks,
   Plug,
-  Radio,
   ScanSearch,
   SearchCode,
   Server,
@@ -108,7 +107,6 @@ export const NAV_GROUPS: NavGroup[] = [
     icon: GitBranch,
     items: [
       { title: "Pipelines", href: "/pipelines", icon: GitBranch },
-      { title: "Streaming Jobs", href: "/streaming", icon: Radio, preview: true },
       { title: "Query Studio", href: "/query-studio", icon: SearchCode },
     ],
   },

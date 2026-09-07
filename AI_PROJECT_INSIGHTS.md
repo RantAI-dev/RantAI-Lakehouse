@@ -16,7 +16,7 @@ frontend backed by a real Rust (axum) API over Postgres, ClickHouse, and
 (optionally) Dagster/Debezium/Trino — for:
 
 - ingest via connectors;
-- processing via data pipelines, streaming jobs, and knowledge/vector jobs;
+- processing via data pipelines and knowledge/vector jobs;
 - storage across **Hot / Warm / Cold / AI** physical tiers (logical Raw→Semantic is a separate catalog dimension);
 - catalog, governance, residency, lineage, audit;
 - Query Studio (NL + SQL) with execution transparency and simple federated plans;
@@ -45,7 +45,7 @@ frontend backed by a real Rust (axum) API over Postgres, ClickHouse, and
 
 ### What is NOT real (still genuinely mocked or missing)
 
-- **No streaming engine.** No Kafka/Redpanda/Pulsar/Flink anywhere in this repository. `streamingService` stays mocked (`src/services/mock/streaming.ts`). CDC via Debezium Server exists and is real, but a change-data-capture pipe into Bronze Iceberg is not a streaming engine and is never described as one.
+- **No streaming engine.** No Kafka/Redpanda/Pulsar/Flink anywhere in this repository. The console's `streaming` domain (`src/services/mock/streaming.ts`, `/streaming` routes) fabricated `kafka.*` topics, lag, throughput, and checkpoint data and rendered it as if real — that was a locked-decision violation, so it was removed outright rather than kept mocked. CDC via Debezium Server exists and is real, but a change-data-capture pipe into Bronze Iceberg is not a streaming engine and is never described as one.
 - **No vector database / embedding-backed search.** `knowledgeService.search` stays mocked; knowledge *sources* and *vector jobs* are real (Postgres), the search-query path is not.
 - **No agent/tool execution runtime.** Digital-employee/agent definitions, runs, and approvals are real (Postgres), but nothing actually executes an agent or a tool.
 - **No live connector health checks.** `testConnection` bumps a timestamp and returns hardcoded latency; it dials nothing (`lakehouse-store/src/connectors.rs`).
@@ -108,7 +108,7 @@ Sidebar groups (`src/components/app-shell/nav-config.ts`):
 
 - **Overview:** `/`, `/activity`, `/alerts`
 - **Data:** `/data`, `/catalog`, `/storage`, `/connectors`
-- **Build:** `/pipelines`, `/streaming`, `/query-studio`
+- **Build:** `/pipelines`, `/query-studio`
 - **Intelligence:** `/knowledge`, `/vector-jobs`, `/semantic-search`, `/agents/workflows`, `/agents/employees`, `/agents/approvals`, `/agents/tools`
 - **Governance:** policies, classification, data-quality, lineage, audit, residency
 - **Operations:** workloads, observability, services, usage
@@ -133,18 +133,18 @@ Page (features/*)
   → useService(fetcher)           # list/detail loads
   → useServiceAction(action)      # mutations (run, ack, cancel, search, decide)
   → services/index.ts (registry)
-  → services/clients/* (real, most domains) or services/mock/* (streaming, knowledge.search)
+  → services/clients/* (real, most domains) or services/mock/* (knowledge.search)
   → apiFetch → /api/* → next.config.ts rewrite → lakehouse-api (Rust)  — or mockCall(delay, abort) for mocked domains
   → typed result
 ```
 
-10 of 12 domains already go through `services/clients/*` to the real Rust
+10 of 11 domains already go through `services/clients/*` to the real Rust
 API, not `mock adapter`/`mockCall` — see §1's "What is real". When wiring a
 still-mocked domain: add `services/clients/*` implementing the same
 contract and point `services/index.ts` at it. Pages should not need
 redesign.
 
-Canonical service registry today: overview, asset, pipeline, streaming, query, knowledge, agent, governance, ops, identity, connector, storage.
+Canonical service registry today: overview, asset, pipeline, query, knowledge, agent, governance, ops, identity, connector, storage.
 
 Folded names (by design): Catalog→AssetService, Lineage/Audit→GovernanceService, Observability/Usage→OpsService.
 
@@ -182,7 +182,6 @@ product as mocked. Kept only for the items still genuinely gaps:
 
 ### Genuinely still mocked or missing
 
-- Streaming domain (no streaming engine — see §1)
 - Semantic search (no vector store — see §1)
 - Agent/tool execution runtime (definitions/runs are real; nothing executes)
 - Live connector health checks (`testConnection` dials nothing)
@@ -190,7 +189,7 @@ product as mocked. Kept only for the items still genuinely gaps:
 
 ### Not Yet Implemented (deferrals)
 
-- Streaming engine / vector store / agent execution runtime / live connector dialing (see §1)
+- Vector store / agent execution runtime / live connector dialing (see §1)
 - Dedicated connector detail route (drawer today)
 - Dedicated pipeline run route (drawer today)
 - Agent workflow detail canvas route

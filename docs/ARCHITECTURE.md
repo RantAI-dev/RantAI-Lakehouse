@@ -203,7 +203,7 @@ checks that are easy to forget on a new route.
 shapes the frontend codebase was originally written against (one file per
 domain: `governance.ts`, `pipelines.ts`, `identity.ts`, `overview.ts`,
 `queries.ts`, `storage.ts`, `connectors.ts`, `agents.ts`, `knowledge.ts`,
-`assets.ts`, `streaming.ts`, ...). Frontend components call these
+`assets.ts`, ...). Frontend components call these
 contracts, not `fetch` directly.
 
 After the Rust cutover, `src/services/clients/*` implementations of these
@@ -223,5 +223,7 @@ historical) parity harness.
 
 `src/services/mock/*` remains the implementation for domains that are
 still mocked rather than backed by a real Rust route — see README's
-"Status / Known limitations" for exactly which ones (`streaming`,
-`knowledge.search`).
+"Status / Known limitations" for exactly which ones (`knowledge.search`).
+The `streaming` domain was removed outright rather than kept mocked —
+there is no streaming engine anywhere in this stack, so faking one in the
+UI was a locked-decision violation, not a limitation to document.
