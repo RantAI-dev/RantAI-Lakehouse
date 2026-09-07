@@ -180,7 +180,7 @@ export function AlertsPage() {
           </DialogHeader>
           <div className="grid gap-3">
             <div className="grid gap-1.5"><Label>Name</Label><Input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} placeholder="e.g. Foreign visitors dropped" /></div>
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div className="grid gap-1.5"><Label>Type</Label>
                 <Select value={f.type} onValueChange={(v) => setF({ ...f, type: (v as "alert" | "digest") })}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
@@ -197,7 +197,7 @@ export function AlertsPage() {
 
             {f.type === "alert" ? (
               <>
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <div className="grid gap-1.5"><Label>Mart (Gold)</Label>
                     <Select value={f.mart ?? ""} onValueChange={(v) => { const mv = v ?? ""; setF({ ...f, mart: mv, measure: "" }); void loadFields(mv); }}>
                       <SelectTrigger><SelectValue placeholder="pick a mart" /></SelectTrigger>
@@ -211,7 +211,7 @@ export function AlertsPage() {
                     </Select>
                   </div>
                 </div>
-                <div className="grid grid-cols-3 gap-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
                   <div className="grid gap-1.5"><Label>Aggregate</Label>
                     <Select value={f.agg ?? "sum"} onValueChange={(v) => setF({ ...f, agg: v ?? "sum" })}>
                       <SelectTrigger><SelectValue /></SelectTrigger><SelectContent>{AGGS.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}</SelectContent>

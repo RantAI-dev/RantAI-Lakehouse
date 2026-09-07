@@ -139,6 +139,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
 
     // ── Catalog: seeded Analyst permission `catalog:read`. ───────────────
     ("GET", "/api/catalog",       Policy::RequiresPermission("catalog:read")),
+    ("GET", "/api/catalog/query", Policy::RequiresPermission("catalog:read")),
     ("GET", "/api/catalog/{id}",  Policy::RequiresPermission("catalog:read")),
 
     // ── Overview / alerts: no seeded resource maps to these — auth only. ─
@@ -215,6 +216,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    it in the seed (Platform Admin's `*:*` still satisfies it). ──────
     ("GET",    "/api/dashboard",              Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/specs/preview", Policy::RequiresPermission("dashboard:read")),
     ("POST",   "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:write")),
     ("PUT",    "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:write")),
     ("DELETE", "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:write")),

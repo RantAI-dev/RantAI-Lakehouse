@@ -1,9 +1,12 @@
 import type { Metadata } from "next";
 import { geist, geistMono } from "@rantai/design-system/fonts/fonts";
 import { ThemeProvider } from "@rantai/design-system/components/theme-provider";
+import { Toaster } from "@rantai/design-system/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AppFrame } from "@/components/app-shell/app-frame";
+import { TableProviders } from "@/components/app-shell/table-providers";
 import { AuthProvider } from "@/features/auth/auth-provider";
+import { ReactGrabDev } from "@/components/app-shell/react-grab-dev";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -18,7 +21,9 @@ export const metadata: Metadata = {
  *
  * Wires up the global providers in this exact order (outer → inner):
  * `ThemeProvider` (light/dark via next-themes, from the Rantai Design System) →
- * `TooltipProvider` (shadcn tooltips) → `SidebarProvider` (collapsible sidebar
+ * `TooltipProvider` (shadcn tooltips) → `AuthProvider` (session + route
+ * guard) → `TableProviders` (nuqs URL state + React Query cache for the
+ * Advanced Data Table) → `SidebarProvider` (collapsible sidebar
  * context). Inside, every page gets the `AppSidebar` on the left and the
  * `AppNavbar` on top, with the routed page rendered inside the
  * `<div className="flex-1 p-4">{children}</div>` container.
@@ -51,8 +56,17 @@ export default function RootLayout({
         <ThemeProvider>
           <TooltipProvider>
             <AuthProvider>
-              <AppFrame>{children}</AppFrame>
+              <TableProviders>
+                <AppFrame>{children}</AppFrame>
+              </TableProviders>
             </AuthProvider>
+            {/* Umpan balik aksi mutasi (simpan/hapus/test) — dipanggil lewat
+                `notify` di `@/lib/notify`, bukan `toast()` langsung, supaya
+                pesan error ServiceError diterjemahkan seragam. */}
+            <Toaster position="bottom-right" richColors closeButton />
+            {/* Dev-only: hover an element + ⌘C to copy its source location
+                for a coding agent. Compiles away in production builds. */}
+            <ReactGrabDev />
           </TooltipProvider>
         </ThemeProvider>
       </body>

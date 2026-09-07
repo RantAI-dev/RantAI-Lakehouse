@@ -9,7 +9,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { SqlEditor } from "@/components/sql-editor"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { queryService } from "@/services"
+import { assetService, queryService } from "@/services"
 import { askAgentSql, type AgentQueryResult } from "@/services/clients/agent-client"
 import { HistoryQuickList, SavedQuickList } from "./query-context-lists"
 import { QueryResultsSection } from "./query-results-section"
@@ -34,6 +34,26 @@ export function QueryStudioPage() {
     queryService.run(s, signal)
   )
   const savedState = useService((s) => queryService.listSaved(s), [])
+
+  // Skema untuk autocomplete editor, diambil dari katalog nyata supaya saran
+  // tidak melenceng saat katalog berubah.
+  //
+  // Hanya NAMA TABEL yang dilengkapi, bukan kolomnya: daftar kolom hanya ada
+  // di `AssetDetail`, dan mengambilnya berarti satu request per aset — biaya
+  // yang tidak sepadan hanya untuk melengkapi saran. Kolom bisa menyusul bila
+  // backend menyediakan endpoint skema massal.
+  //
+  // Kegagalan di sini sengaja tidak ditampilkan sebagai error halaman:
+  // autocomplete adalah penyempurna, dan Query Studio tetap berguna tanpanya.
+  const assetsState = useService((s) => assetService.listAssets({}, s), [])
+  const sqlSchema = React.useMemo(() => {
+    if (assetsState.status !== "success") return undefined
+    const schema: Record<string, string[]> = {}
+    for (const asset of assetsState.data) {
+      schema[`${asset.namespace}.${asset.name}`] = []
+    }
+    return Object.keys(schema).length > 0 ? schema : undefined
+  }, [assetsState.status, assetsState.data])
 
   const runEstimate = estimateAct.run
   React.useEffect(() => {
@@ -199,7 +219,7 @@ export function QueryStudioPage() {
               ) : null}
             </TabsContent>
             <TabsContent value="sql" className="mt-3 space-y-3">
-              <SqlEditor value={sql} onChange={setSql} />
+              <SqlEditor value={sql} onChange={setSql} schema={sqlSchema} />
               <div className="flex items-center gap-2">
                 <Button
                   size="sm"

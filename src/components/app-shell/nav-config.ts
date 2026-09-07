@@ -52,6 +52,29 @@ export type NavGroup = {
   /** Ikon section — untuk tombol flyout di sidebar. */
   icon?: LucideIcon
   items: NavItem[]
+  /**
+   * Grup ini terbuka saat kunjungan pertama (sebelum ada pilihan user yang
+   * tersimpan). Grup yang memuat halaman aktif selalu terbuka, jadi flag
+   * ini hanya soal kesan pertama.
+   */
+  defaultOpen?: boolean
+  /**
+   * DITURUNKAN, bukan ditulis tangan. Diisi `visibleNavGroups()` ketika
+   * SEMUA item grup masih `preview` — grup tetap tampil (disabled, badge
+   * "Soon") alih-alih lenyap tanpa jejak.
+   */
+  comingSoon?: boolean
+  /**
+   * DITURUNKAN. `true` bila sebagian item disembunyikan sebagai preview.
+   *
+   * Dipakai sidebar untuk memilih label. Grup yang memang dideklarasikan
+   * 1 item (mis. "AI" → "AI Copilot") memakai judul itemnya, karena itu
+   * yang lebih deskriptif. Tapi grup yang MENJADI 1 item karena
+   * penyaringan harus tetap memakai label grupnya — kalau tidak,
+   * "Administration" berubah nama jadi "Settings" hanya karena empat
+   * halamannya yang lain masih mock.
+   */
+  partiallyHidden?: boolean
 }
 
 /**
@@ -86,6 +109,7 @@ export const NAV_GROUPS: NavGroup[] = [
   {
     label: "Overview",
     icon: LayoutDashboard,
+    defaultOpen: true,
     items: [
       { title: "Overview", href: "/", icon: LayoutDashboard },
       { title: "Activity", href: "/activity", icon: Activity },
@@ -95,6 +119,7 @@ export const NAV_GROUPS: NavGroup[] = [
   {
     label: "Data",
     icon: Database,
+    defaultOpen: true,
     items: [
       { title: "Data Explorer", href: "/data", icon: Database },
       { title: "Catalog", href: "/catalog", icon: Library },
@@ -179,31 +204,29 @@ export const NAV_GROUPS: NavGroup[] = [
 export const SHOW_PREVIEW = process.env.NEXT_PUBLIC_SHOW_PREVIEW === "1"
 
 /**
- * Grup nav yang tampil di sidebar. Menyaring item `preview` (kecuali
- * SHOW_PREVIEW), lalu membuang grup yang jadi kosong.
+ * Grup nav yang tampil di sidebar, dengan item `preview` disaring kecuali
+ * SHOW_PREVIEW menyala.
+ *
+ * Grup yang SEMUA itemnya preview tidak dibuang, melainkan ditandai
+ * `comingSoon` dan tetap dirender (disabled, badge "Soon"). Sebelumnya
+ * grup begitu lenyap sama sekali — "Intelligence" punya 7 halaman dan
+ * satu pun tak pernah muncul, sehingga peta produk di config berbeda dari
+ * yang dilihat user, tanpa petunjuk apa pun bahwa ada yang hilang.
  */
 export function visibleNavGroups(): NavGroup[] {
   if (SHOW_PREVIEW) return NAV_GROUPS
-  return NAV_GROUPS.map((g) => ({
-    ...g,
-    items: g.items.filter((it) => !it.preview),
-  })).filter((g) => g.items.length > 0)
+  return NAV_GROUPS.map((g) => {
+    const items = g.items.filter((it) => !it.preview)
+    return items.length > 0
+      ? { ...g, items, partiallyHidden: items.length < g.items.length }
+      : // Item preview dipertahankan supaya flyout/label punya isi untuk
+        // ditampilkan; `comingSoon` yang mencegahnya bisa dinavigasi.
+        { ...g, comingSoon: true }
+  })
 }
 
 /** Flat list of every sidebar nav item, used for active-state and command search. */
 export const ALL_NAV_ITEMS: NavItem[] = NAV_GROUPS.flatMap((g) => g.items)
-
-/** Grup (section) yang memuat halaman aktif — untuk bottom-nav & sub-navigasi. */
-export function activeNavGroup(pathname: string): NavGroup | undefined {
-  const href = activeNavHref(pathname)
-  return visibleNavGroups().find((g) => g.items.some((it) => it.href === href))
-}
-
-/** Sub-halaman section aktif (kosong bila hanya 1 item). */
-export function subNavItems(pathname: string): NavItem[] {
-  const g = activeNavGroup(pathname)
-  return g && g.items.length > 1 ? g.items : []
-}
 
 /**
  * Routes that live under a sidebar entry but have their own page title

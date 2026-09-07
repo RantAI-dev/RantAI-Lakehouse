@@ -16,6 +16,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { formatRelativeTime } from "@/lib/format"
 import { identityService } from "@/services"
 import type { ServiceIdentity } from "@/services/contracts/identity"
@@ -86,10 +87,16 @@ export function ServiceIdentitiesPage() {
   const [scopes, setScopes] = React.useState("")
   const [environment, setEnvironment] = React.useState("")
   const create = useServiceAction(
-    (
-      signal,
-      input: Parameters<typeof identityService.createServiceIdentity>[0]
-    ) => identityService.createServiceIdentity(input, signal)
+    withNotify(
+      {
+        success: "Service identity created",
+        error: "Failed to create service identity",
+      },
+      (
+        signal,
+        input: Parameters<typeof identityService.createServiceIdentity>[0]
+      ) => identityService.createServiceIdentity(input, signal)
+    )
   )
 
   const filtered = React.useMemo(() => {

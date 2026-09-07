@@ -4,26 +4,26 @@ import * as React from "react"
 import { createPortal } from "react-dom"
 import Image from "next/image"
 import Link from "next/link"
-import { usePathname, useRouter } from "next/navigation"
-import { CircleUserRound, Plus, MessageSquare, X, BarChart3 } from "lucide-react"
-import { useCopilot } from "@/features/copilot/use-copilot"
+import { usePathname } from "next/navigation"
+import { CircleUserRound, ChevronRight } from "lucide-react"
 import { useAuth } from "@/features/auth/auth-provider"
 import {
   Sidebar,
   SidebarContent,
   SidebarFooter,
   SidebarGroup,
-  SidebarGroupLabel,
   SidebarHeader,
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
+  SidebarMenuSub,
+  SidebarMenuSubItem,
   SidebarRail,
   useSidebar,
 } from "@/components/ui/sidebar"
+import { useSidebarGroups } from "@/hooks/use-sidebar-groups"
 import { cn } from "@/lib/utils"
 import { visibleNavGroups, activeNavHref, type NavGroup, type NavItem } from "./nav-config"
-import { apiFetch } from "@/services/http"
 
 function BrandLogo() {
   // Logo ikut tema: navy untuk sidebar terang, putih untuk sidebar gelap.
@@ -38,12 +38,19 @@ function BrandLogo() {
 type FlyoutState = { label: string; top: number; left: number } | null
 
 /**
- * Primary sidebar — daftar SECTION. Perilaku beda per mode:
- *  · MELEBAR: klik section = buka halaman pertamanya; sub-halaman tampil sebagai
- *    BOTTOM NAV (lihat AppBottomNav).
- *  · DICIUTKAN (ikon): klik ikon section → FLYOUT sub-halaman ke kanan (klik),
- *    karena bottom nav tak muat.
- * Grup 1-item selalu link langsung.
+ * Primary sidebar — daftar SECTION, dua mode:
+ *
+ *  · MELEBAR: klik header section = BUKA/TUTUP section itu di tempat;
+ *    sub-halamannya bersarang di bawahnya. Beberapa section boleh terbuka
+ *    sekaligus, pilihannya diingat (`useSidebarGroups`), dan section yang
+ *    memuat halaman aktif selalu terbuka.
+ *  · DICIUTKAN (ikon): klik ikon section → FLYOUT sub-halaman ke kanan,
+ *    karena tidak ada ruang untuk menampilkannya di tempat.
+ *
+ * Grup 1-item selalu link langsung — tidak ada yang perlu dibuka.
+ *
+ * Section yang SELURUH halamannya masih mock tampil disabled dengan badge
+ * "Soon" (lihat `comingSoon` di nav-config), bukan disembunyikan.
  */
 export function AppSidebar() {
   const pathname = usePathname()
@@ -53,33 +60,14 @@ export function AppSidebar() {
   const iconMode = state === "collapsed"
   const { user } = useAuth()
   const activeGroup = groups.find((g) => g.items.some((it) => it.href === activeHref))
-  const router = useRouter()
-  const copilot = useCopilot()
-  const onCopilot = pathname.startsWith("/copilot")
-  const onDashboards = pathname.startsWith("/dashboards")
-
-  const [dashboards, setDashboards] = React.useState<{ id: string; name: string }[]>([])
-  const loadDashboards = React.useCallback(() => {
-    apiFetch("/api/dashboard/boards").then((r) => r.json()).then((j) => setDashboards(j.boards ?? [])).catch(() => {})
-  }, [])
-  React.useEffect(() => { if (onDashboards) loadDashboards() }, [onDashboards, loadDashboards])
-  React.useEffect(() => {
-    const h = () => loadDashboards()
-    window.addEventListener("dashboards:changed", h)
-    return () => window.removeEventListener("dashboards:changed", h)
-  }, [loadDashboards])
-  const newDashboard = async () => {
-    const res = await apiFetch("/api/dashboard/boards", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "New dashboard" }),
-    })
-    const j = await res.json()
-    if (j?.board?.id) { router.push(`/dashboards?board=${j.board.id}`); loadDashboards() }
-  }
-  const removeDashboard = async (id: string) => {
-    await apiFetch(`/api/dashboard/boards?id=${encodeURIComponent(id)}`, { method: "DELETE" })
-    loadDashboards(); router.push("/dashboards")
-  }
-
+  const defaultOpenLabels = React.useMemo(
+    () => groups.filter((g) => g.defaultOpen).map((g) => g.label),
+    [groups]
+  )
+  const { isOpen: isGroupOpen, toggle: toggleGroup } = useSidebarGroups({
+    activeLabel: activeGroup?.label,
+    defaultOpenLabels,
+  })
   const [flyout, setFlyout] = React.useState<FlyoutState>(null)
   const flyoutRef = React.useRef<HTMLDivElement>(null)
   const [mounted, setMounted] = React.useState(false)
@@ -116,7 +104,16 @@ export function AppSidebar() {
       active && "bg-sidebar-accent font-medium text-sidebar-primary shadow-sm ring-1 ring-sidebar-border",
     )
 
-  const linkRow = (item: NavItem, active: boolean) => {
+  /**
+   * Satu baris halaman.
+   *
+   * `showIcon` mati di sub-menu: ikon section sudah ada di header tepat di
+   * atasnya, dan `SidebarMenuSub` menandai kedalaman dengan garis kiri —
+   * ikon per item hanya mengulang keduanya. Flyout mode ikon tetap
+   * memakainya, karena panel itu melayang lepas dari sidebar dan headernya
+   * cuma label teks kecil, jadi tanpa ikon isinya kehilangan jangkar.
+   */
+  const linkRow = (item: NavItem, active: boolean, showIcon = true) => {
     const Icon = item.icon
     return (
       <Link
@@ -127,7 +124,7 @@ export function AppSidebar() {
           active && "bg-sidebar-accent font-medium text-sidebar-primary shadow-sm ring-1 ring-sidebar-border",
         )}
       >
-        <Icon className="size-4 shrink-0" />
+        {showIcon ? <Icon className="size-4 shrink-0" /> : null}
         <span className="truncate">{item.title}</span>
       </Link>
     )
@@ -136,12 +133,44 @@ export function AppSidebar() {
   const renderEntry = (group: NavGroup) => {
     const single = group.items.length === 1
     const first = group.items[0]
-    const Icon = single ? first.icon : group.icon ?? first.icon
-    const label = single ? first.title : group.label
+    const Icon = group.icon ?? first.icon
+    // A group declared with one page shows that page's title, which is the
+    // more descriptive of the two ("AI Copilot" over "AI"). A group that
+    // was REDUCED to one page by the preview filter keeps its own label —
+    // otherwise "Administration" silently renames itself to "Settings"
+    // just because its other four pages are still mocks.
+    const label = single && !group.partiallyHidden ? first.title : group.label
     const active = group.items.some((it) => it.href === activeHref)
 
-    // Grup 1-item, atau mode melebar → link navigasi biasa.
-    if (single || !iconMode) {
+    // Every page in this section is still a mock. Shown, but inert — the
+    // alternative was the whole section vanishing with no explanation.
+    if (group.comingSoon) {
+      return (
+        <SidebarMenuItem key={group.label}>
+          <div
+            title={`${group.label} — coming soon`}
+            aria-disabled
+            className={cn(
+              "flex h-8 cursor-default items-center gap-2 rounded-md px-2.5 py-1.5 text-sm text-sidebar-foreground/40",
+              iconMode && "justify-center px-0"
+            )}
+          >
+            <Icon className="size-4 shrink-0" />
+            {!iconMode ? (
+              <>
+                <span className="flex-1 truncate">{group.label}</span>
+                <span className="rounded bg-sidebar-accent px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-sidebar-foreground/50">
+                  Soon
+                </span>
+              </>
+            ) : null}
+          </div>
+        </SidebarMenuItem>
+      )
+    }
+
+    // One page, or icon mode with one page: nothing to expand.
+    if (single) {
       return (
         <SidebarMenuItem key={group.label} className="group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:justify-center">
           <SidebarMenuButton
@@ -155,6 +184,50 @@ export function AppSidebar() {
               </Link>
             }
           />
+        </SidebarMenuItem>
+      )
+    }
+
+    // Expanded mode, several pages → the header expands the section in
+    // place instead of navigating. Previously it was a link to the first
+    // page, so simply looking at what a section contained cost a page
+    // load, and only the active section could ever be seen.
+    if (!iconMode) {
+      const expanded = isGroupOpen(group.label)
+      return (
+        <SidebarMenuItem key={group.label}>
+          <SidebarMenuButton
+            isActive={active && !expanded}
+            className={menuBtnClass(active && !expanded)}
+            render={
+              <button
+                type="button"
+                aria-expanded={expanded}
+                onClick={() => toggleGroup(group.label)}
+              >
+                <Icon className="size-4 shrink-0" />
+                <span className="flex-1 truncate text-left leading-5">
+                  {label}
+                </span>
+                <ChevronRight
+                  className={cn(
+                    "size-3.5 shrink-0 text-sidebar-foreground/50 transition-transform duration-150",
+                    expanded && "rotate-90"
+                  )}
+                  aria-hidden
+                />
+              </button>
+            }
+          />
+          {expanded ? (
+            <SidebarMenuSub className="mr-0 gap-0.5 border-sidebar-border pr-0">
+              {group.items.map((item) => (
+                <SidebarMenuSubItem key={item.href}>
+                  {linkRow(item, item.href === activeHref, false)}
+                </SidebarMenuSubItem>
+              ))}
+            </SidebarMenuSub>
+          ) : null}
         </SidebarMenuItem>
       )
     }
@@ -185,8 +258,14 @@ export function AppSidebar() {
 
   return (
     <Sidebar data-print-hide collapsible="icon" side="left" className="border-r border-sidebar-border bg-sidebar shadow-sm">
-      <SidebarHeader className="flex flex-col border-b border-sidebar-border px-3 py-2.5 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-2 group-data-[collapsible=icon]:py-2">
-        <div className="flex h-12 min-w-0 items-center justify-start gap-2 group-data-[collapsible=icon]:h-auto group-data-[collapsible=icon]:justify-center">
+      {/* `h-16` supaya persis setinggi navbar (`app-navbar.tsx` juga
+          `h-16`), sehingga garis bawah keduanya menyambung jadi satu
+          garis lurus di seluruh lebar layar. Sebelumnya tinggi header ini
+          dihitung dari isinya (padding + baris logo) dan jatuh di 69px —
+          5px lebih rendah dari navbar, dan patahannya terlihat tepat di
+          pertemuan sidebar dengan konten. */}
+      <SidebarHeader className="flex h-16 shrink-0 flex-col justify-center border-b border-sidebar-border px-3 py-0 group-data-[collapsible=icon]:px-2">
+        <div className="flex min-w-0 items-center justify-start gap-2 group-data-[collapsible=icon]:justify-center">
           <BrandLogo />
           <div className="grid min-w-0 flex-1 gap-0.5 leading-none group-data-[collapsible=icon]:hidden">
             <span className="text-sm font-semibold tracking-[-0.084px] text-sidebar-foreground">Rantai Lake</span>
@@ -202,91 +281,16 @@ export function AppSidebar() {
           </SidebarMenu>
         </SidebarGroup>
 
-        {/* Slot bawah — DAFTAR DASHBOARD, RIWAYAT chat, atau sub-menu section. */}
-        {!iconMode && onDashboards ? (
-          <SidebarGroup className="mt-1 gap-0 border-t border-sidebar-border px-2 pb-1 pt-2">
-            <div className="flex items-center justify-between pr-1">
-              <SidebarGroupLabel className="h-6 px-2 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">Dashboards</SidebarGroupLabel>
-              <button type="button" onClick={() => void newDashboard()} aria-label="New dashboard" title="New dashboard"
-                className="grid size-6 place-items-center rounded-md text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground">
-                <Plus className="size-4" />
-              </button>
-            </div>
-            <div className="mt-0.5 flex max-h-[46vh] flex-col gap-0.5 overflow-y-auto">
-              {dashboards.map((d) => (
-                <div key={d.id} className="group/dash flex items-center gap-1.5 rounded-md px-2 py-1.5 text-sm text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground">
-                  <BarChart3 className="size-3.5 shrink-0 opacity-70" />
-                  <button onClick={() => router.push(`/dashboards?board=${d.id}`)} className="flex-1 truncate text-left" title={d.name}>{d.name}</button>
-                  {d.id !== "default" ? (
-                    <button onClick={() => void removeDashboard(d.id)} aria-label="Delete" className="shrink-0 opacity-0 hover:text-destructive group-hover/dash:opacity-100"><X className="size-3.5" /></button>
-                  ) : null}
-                </div>
-              ))}
-            </div>
-          </SidebarGroup>
-        ) : !iconMode && onCopilot ? (
-          <SidebarGroup className="mt-1 gap-0 border-t border-sidebar-border px-2 pb-1 pt-2">
-            <div className="flex items-center justify-between pr-1">
-              <SidebarGroupLabel className="h-6 px-2 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">
-                History
-              </SidebarGroupLabel>
-              <button
-                type="button"
-                onClick={() => { copilot.newChat(); router.push("/copilot") }}
-                aria-label="New chat"
-                title="New chat"
-                className="grid size-6 place-items-center rounded-md text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground"
-              >
-                <Plus className="size-4" />
-              </button>
-            </div>
-            <div className="mt-0.5 flex max-h-[46vh] flex-col gap-0.5 overflow-y-auto">
-              {copilot.sessions.length === 0 ? (
-                <p className="px-2 py-1.5 text-xs text-sidebar-foreground/50">No conversations yet.</p>
-              ) : (
-                copilot.sessions.map((s) => {
-                  const active = s.id === copilot.sessionId
-                  return (
-                    <div
-                      key={s.id}
-                      className={cn(
-                        "group/hist flex items-center gap-1.5 rounded-md px-2 py-1.5 text-sm",
-                        active ? "bg-sidebar-accent text-sidebar-primary" : "text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
-                      )}
-                    >
-                      <MessageSquare className="size-3.5 shrink-0 opacity-70" />
-                      <button
-                        onClick={() => { void copilot.loadSession(s.id); router.push("/copilot") }}
-                        className="flex-1 truncate text-left"
-                        title={s.title}
-                      >
-                        {s.title}
-                      </button>
-                      <button
-                        onClick={() => void copilot.removeSession(s.id)}
-                        aria-label="Delete"
-                        className="shrink-0 opacity-0 hover:text-destructive group-hover/hist:opacity-100"
-                      >
-                        <X className="size-3.5" />
-                      </button>
-                    </div>
-                  )
-                })
-              )}
-            </div>
-          </SidebarGroup>
-        ) : !iconMode && activeGroup && activeGroup.items.length > 1 ? (
-          <SidebarGroup className="mt-1 gap-0 border-t border-sidebar-border px-2 pb-1 pt-2">
-            <SidebarGroupLabel className="h-6 px-2 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">
-              {activeGroup.label}
-            </SidebarGroupLabel>
-            <div className="mt-0.5 flex flex-col gap-0.5">
-              {activeGroup.items.map((it) => (
-                <React.Fragment key={it.href}>{linkRow(it, it.href === activeHref)}</React.Fragment>
-              ))}
-            </div>
-          </SidebarGroup>
-        ) : null}
+        {/* Daftar dashboard dan riwayat Copilot DULU ada di sini. Keduanya
+            hanya muncul ketika sudah berada di halamannya masing-masing,
+            jadi tak pernah bisa dipakai untuk MENUJU ke sana — itu isi
+            halaman yang menempati ruang navigasi, dan ikut hilang begitu
+            sidebar diciutkan jadi ikon. Sekarang keduanya ada di header
+            halamannya sendiri (`BoardSwitcher`, `CopilotHistoryMenu`), dan
+            sidebar murni membaca `nav-config` tanpa pengecualian per-rute. */}
+        {/* The active section's pages used to be repeated down here, in a
+            separate block. They now sit inside their own group above, so
+            the section that is open is the one you are reading. */}
       </SidebarContent>
 
       {/* Flyout (hanya mode ikon) */}

@@ -3,9 +3,16 @@
 import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
-import { RefreshCw, Sparkles, Download, Pencil, Eye, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Plus, Move, Share2, Link2, Check, Globe, Code2, KeyRound, Filter, Table2, FileDown } from "lucide-react";
+import { RefreshCw, Sparkles, Download, Pencil, Eye, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Move, Share2, Link2, Check, Globe, Code2, KeyRound, Filter, Table2, FileDown, ChartColumn } from "lucide-react";
 import { PageHeader } from "@/components/patterns/page-header";
+import { BoardSwitcher } from "./board-switcher";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuGroupLabel, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
@@ -18,6 +25,7 @@ import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import type { LayoutMap, FilterDef } from "@/services/clients/bi-store";
 import { fmtInt } from "./chart-option";
 import { ChartBuilder, type ChartDef } from "./chart-builder";
+import { REFRESH_INTERVALS, useAutoRefresh } from "./auto-refresh";
 import { DashboardGrid, type GridItem } from "./dashboard-grid";
 import { TileBody } from "./tile-body";
 import { DashboardFilters } from "./dashboard-filters";
@@ -67,7 +75,6 @@ export function DashboardPage() {
   const filtersRef = React.useRef<FilterDef[]>([]);
   const adoptingRef = React.useRef(true);
   const [editing, setEditing] = React.useState<{ id: string; def: ChartDef } | null>(null);
-  const [menuOpen, setMenuOpen] = React.useState(false);
   const [renameOpen, setRenameOpen] = React.useState(false);
   const [newName, setNewName] = React.useState("");
   const [fullscreen, setFullscreen] = React.useState(false);
@@ -81,6 +88,7 @@ export function DashboardPage() {
   const [copied, setCopied] = React.useState<string | false>(false);
   const [embedEnabled, setEmbedEnabled] = React.useState(false);
   const [sampleToken, setSampleToken] = React.useState("");
+  const [newChartOpen, setNewChartOpen] = React.useState(false);
   const notifyChange = () => { try { window.dispatchEvent(new Event("dashboards:changed")); } catch { /* ignore */ } };
 
   const load = React.useCallback(async () => {
@@ -110,13 +118,9 @@ export function DashboardPage() {
   React.useEffect(() => { adoptingRef.current = true; filtersRef.current = []; setFilters([]); }, [board]);
   React.useEffect(() => { void load(); }, [load]);
 
-  // Auto-refresh berkala (presentasi).
-  React.useEffect(() => {
-    const s = Number(autoSec);
-    if (!s) return;
-    const t = setInterval(() => void load(), s * 1000);
-    return () => clearInterval(t);
-  }, [autoSec, load]);
+  // Auto-refresh berkala (presentasi). Hook-nya menjeda diri saat tab
+  // tersembunyi — lihat `auto-refresh.ts`.
+  useAutoRefresh(Number(autoSec) * 1000, load);
   // Esc keluar fullscreen.
   React.useEffect(() => {
     if (!fullscreen) return;
@@ -174,7 +178,6 @@ export function DashboardPage() {
   // Export PDF — pakai dialog print browser (Save as PDF). Print CSS mengubah
   // kanvas tile jadi tumpukan rapi & menyembunyikan chrome konsol. Tanpa dep.
   function doExportPdf() {
-    setMenuOpen(false);
     setEdit(false);
     const prev = document.title;
     document.title = (dashName || "dashboard").replace(/[^\w\s-]/g, "").trim();
@@ -209,7 +212,6 @@ export function DashboardPage() {
     void load();
   }
   async function duplicateDashboard() {
-    setMenuOpen(false);
     const res = await apiFetch("/api/dashboard/boards", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ duplicate: board }),
     });
@@ -218,15 +220,19 @@ export function DashboardPage() {
     if (json?.board?.id) router.push(`/dashboards?board=${json.board.id}`);
   }
   async function deleteDashboard() {
-    setMenuOpen(false);
     if (isDefault) return;
     await apiFetch(`/api/dashboard/boards?id=${encodeURIComponent(board)}`, { method: "DELETE" });
     notifyChange();
     router.push("/dashboards");
   }
-  async function newDashboard() {
+  // Membuat dashboard baru ADA DI SINI, di pemilih board pada judul halaman.
+  // Sebelumnya hanya ada di sidebar, sehingga aksinya hilang begitu sidebar
+  // diciutkan jadi ikon — padahal ini satu-satunya cara membuat dashboard.
+  async function createDashboard() {
     const res = await apiFetch("/api/dashboard/boards", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "New dashboard" }),
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "New dashboard" }),
     });
     const json = await res.json();
     notifyChange();
@@ -234,7 +240,6 @@ export function DashboardPage() {
   }
   // ── Share (public read-only link) ─────────────────────────────────────────
   async function openShare() {
-    setMenuOpen(false);
     if (isDefault) return;
     setCopied(false);
     try {
@@ -365,57 +370,110 @@ export function DashboardPage() {
   return (
     <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6")}>
       <PageHeader
-        title={dashName}
-        description={isDefault ? "Built-in dashboard (demo). Create your own dashboard from the sidebar to arrange the layout." : "Dashboard canvas — drag & resize tiles in Edit mode. Saved automatically."}
+        title={
+          <BoardSwitcher
+            boards={boards}
+            activeId={board}
+            activeName={dashName}
+            onSelect={(id) => router.push(`/dashboards?board=${id}`)}
+            onCreate={() => void createDashboard()}
+          />
+        }
+        description={isDefault
+          ? "Built-in dashboard (demo) — its layout is fixed. Pick “New dashboard” from the title menu to create your own, then arrange it freely."
+          : "Dashboard canvas — drag & resize tiles in Edit mode. Saved automatically."}
         actions={
           <span data-print-hide className="contents">
-            <Select value={year} onValueChange={(v) => setYear(v ?? "all")}>
-              <SelectTrigger className="h-7 w-[120px] text-xs"><SelectValue /></SelectTrigger>
-              <SelectContent>{YEARS.map((y) => <SelectItem key={y} value={y}>{y === "all" ? "All years" : `Year ${y}`}</SelectItem>)}</SelectContent>
-            </Select>
-            <Select value={autoSec} onValueChange={(v) => setAutoSec(v ?? "0")}>
-              <SelectTrigger className="h-7 w-[110px] text-xs"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="0">Manual</SelectItem>
-                <SelectItem value="30">Every 30s</SelectItem>
-                <SelectItem value="60">Every 1m</SelectItem>
-                <SelectItem value="300">Every 5m</SelectItem>
-              </SelectContent>
-            </Select>
-            <Button variant="outline" size="sm" onClick={() => setFullscreen((f) => !f)} aria-label="Fullscreen">
-              {fullscreen ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
-            </Button>
-            {isDefault ? (
-              <Button size="sm" onClick={() => void newDashboard()}><Plus className="size-4" /> New dashboard</Button>
-            ) : (
+            {/* Aksi header dibatasi pada scope halaman ini: satu dashboard
+                yang sedang dibuka. Membuat dashboard BARU adalah operasi
+                tingkat koleksi dan sudah tersedia di sidebar, jadi tidak
+                diduplikasi di sini. Yang tersisa sebagai aksi utama adalah
+                "New chart" — isi dari dashboard ini sendiri. */}
+            {!isDefault ? (
               <Button variant={edit ? "default" : "outline"} size="sm" onClick={() => setEdit((e) => !e)}>
                 {edit ? <Eye className="size-4" /> : <Pencil className="size-4" />}{edit ? "Done" : "Edit layout"}
               </Button>
-            )}
-            <ChartBuilder board={board} boards={boards} onSaved={load} />
+            ) : null}
+            <Select value={year} onValueChange={(v) => setYear(v ?? "all")}>
+              <SelectTrigger className="h-8 w-[130px] text-xs" aria-label="Filter by year"><SelectValue /></SelectTrigger>
+              <SelectContent>{YEARS.map((y) => <SelectItem key={y} value={y}>{y === "all" ? "All years" : `Year ${y}`}</SelectItem>)}</SelectContent>
+            </Select>
             <div className="relative">
-              <Button variant="outline" size="sm" onClick={() => setMenuOpen((o) => !o)} aria-label="Menu"><MoreHorizontal className="size-4" /></Button>
-              {menuOpen ? (
-                <>
-                  <div className="fixed inset-0 z-10" onClick={() => setMenuOpen(false)} />
-                  <div className="absolute right-0 z-20 mt-1 w-44 rounded-lg border border-border bg-card p-1 shadow-xl">
+              <DropdownMenu>
+                <DropdownMenuTrigger render={<Button variant="outline" size="sm" aria-label="More actions" />}>
+                  <MoreHorizontal className="size-4" />
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-56">
+                  <DropdownMenuGroup>
+                    <DropdownMenuItem onClick={() => void load()} disabled={loading}>
+                      <RefreshCw className={cn("size-4", loading && "animate-spin")} />
+                      {loading ? "Refreshing…" : "Refresh now"}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => setFullscreen((f) => !f)}>
+                      {fullscreen ? <Minimize2 className="size-4" /> : <Maximize2 className="size-4" />}
+                      {fullscreen ? "Exit fullscreen" : "Fullscreen"}
+                    </DropdownMenuItem>
+                  </DropdownMenuGroup>
+                  <DropdownMenuSeparator />
+                  {/* Auto-refresh: kontrolnya jarang diubah sehingga wajar
+                      tersembunyi, tapi statusnya harus tetap terbaca — pilihan
+                      aktif diberi centang, dan tombol memasang titik penanda
+                      saat interval menyala. */}
+                  <DropdownMenuGroup>
+                    <DropdownMenuGroupLabel>Auto-refresh</DropdownMenuGroupLabel>
+                    {REFRESH_INTERVALS.map((opt) => (
+                      <DropdownMenuItem key={opt.value} onClick={() => setAutoSec(opt.value)}>
+                        <Check className={cn("size-4", autoSec === opt.value ? "opacity-100" : "opacity-0")} aria-hidden />
+                        {opt.label}
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuGroup>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuGroup>
                     {!isDefault ? (
-                      <button onClick={() => { setNewName(dashName); setRenameOpen(true); setMenuOpen(false); }} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Pencil className="size-4" /> Rename</button>
+                      <DropdownMenuItem onClick={() => { setNewName(dashName); setRenameOpen(true); }}>
+                        <Pencil className="size-4" /> Rename
+                      </DropdownMenuItem>
                     ) : null}
                     {!isDefault ? (
-                      <button onClick={() => void openShare()} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Share2 className="size-4" /> Share…</button>
+                      <DropdownMenuItem onClick={() => void openShare()}>
+                        <Share2 className="size-4" /> Share…
+                      </DropdownMenuItem>
                     ) : null}
-                    <button onClick={doExportPdf} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><FileDown className="size-4" /> Export PDF (print)</button>
-                    <a href="/api/dashboard/export" download className="flex items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Download className="size-4" /> Export YAML</a>
-                    <button onClick={() => void duplicateDashboard()} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted"><Copy className="size-4" /> Duplicate</button>
-                    {!isDefault ? (
-                      <button onClick={() => void deleteDashboard()} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm text-destructive hover:bg-destructive/10"><Trash2 className="size-4" /> Delete dashboard</button>
-                    ) : null}
-                  </div>
-                </>
+                    <DropdownMenuItem onClick={doExportPdf}>
+                      <FileDown className="size-4" /> Export PDF (print)
+                    </DropdownMenuItem>
+                    <DropdownMenuItem render={<a href="/api/dashboard/export" download />}>
+                      <Download className="size-4" /> Export YAML
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => void duplicateDashboard()}>
+                      <Copy className="size-4" /> Duplicate
+                    </DropdownMenuItem>
+                  </DropdownMenuGroup>
+                  {!isDefault ? (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuGroup>
+                        <DropdownMenuItem variant="destructive" onClick={() => void deleteDashboard()}>
+                          <Trash2 className="size-4" /> Delete dashboard
+                        </DropdownMenuItem>
+                      </DropdownMenuGroup>
+                    </>
+                  ) : null}
+                </DropdownMenuContent>
+              </DropdownMenu>
+              {/* Penanda status auto-refresh, di luar menu supaya terlihat
+                  tanpa harus membukanya. */}
+              {autoSec !== "0" ? (
+                <span
+                  className="pointer-events-none absolute -right-0.5 -top-0.5 size-2 rounded-full bg-primary ring-2 ring-background"
+                  aria-hidden
+                />
               ) : null}
             </div>
-            <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}><RefreshCw className={cn("size-4", loading && "animate-spin")} /></Button>
+            <Button variant={isDefault ? "default" : "outline"} size="sm" onClick={() => setNewChartOpen(true)}>
+              <ChartColumn className="size-4" /> New chart
+            </Button>
           </span>
         }
       />
@@ -424,7 +482,7 @@ export function DashboardPage() {
       {data?.storeError ? <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 px-4 py-2 text-xs text-amber-600 dark:text-amber-400">Could not load saved charts: {data.storeError}</div> : null}
 
       {data?.filterColumns?.length ? (
-        <div data-print-hide className="rounded-lg border border-border bg-card/50 px-3 py-2">
+        <div data-print-hide className="flex flex-wrap items-center gap-3 rounded-lg border border-border bg-card/50 px-3 py-2">
           <DashboardFilters columns={data.filterColumns} filters={filters} onChange={applyFilters} />
         </div>
       ) : null}
@@ -467,6 +525,15 @@ export function DashboardPage() {
         <ChartBuilder hideTrigger open={!!editing} onOpenChange={(o) => { if (!o) setEditing(null); }}
           editId={editing.id} initial={editing.def} board={board} boards={boards}
           onSaved={() => { setEditing(null); void load(); }} />
+      ) : null}
+
+      {/* Builder untuk chart BARU, dibuka dari dropdown tipe di header.
+          `initial` hanya membawa `kind`, sehingga dialog terbuka dengan tipe
+          itu sudah terpilih dan sisa isiannya kosong. */}
+      {newChartOpen ? (
+        <ChartBuilder hideTrigger open onOpenChange={setNewChartOpen}
+          board={board} boards={boards}
+          onSaved={() => { setNewChartOpen(false); void load(); }} />
       ) : null}
 
       {/* Drill menu — muncul saat klik titik data (mode Lihat). */}

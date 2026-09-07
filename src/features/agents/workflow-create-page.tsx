@@ -12,6 +12,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { agentService } from "@/services"
 
@@ -40,8 +41,12 @@ export function WorkflowCreatePage() {
   const [trigger, setTrigger] = React.useState("")
   const [stepKinds, setStepKinds] = React.useState<string[]>(["retrieval", "data query"])
   const [approvalRequired, setApprovalRequired] = React.useState(true)
-  const create = useServiceAction((signal, input: Parameters<typeof agentService.createWorkflow>[0]) =>
-    agentService.createWorkflow(input, signal)
+  const create = useServiceAction(
+    withNotify(
+      { success: "Workflow created", error: "Failed to create workflow" },
+      (signal, input: Parameters<typeof agentService.createWorkflow>[0]) =>
+        agentService.createWorkflow(input, signal)
+    )
   )
 
   const canProceed =

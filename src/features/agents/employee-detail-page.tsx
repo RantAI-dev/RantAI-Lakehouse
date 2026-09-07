@@ -20,6 +20,7 @@ import {
 } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import {
   formatCost,
   formatPercent,
@@ -142,14 +143,23 @@ export function EmployeeDetailPage() {
   const runs = useService((s) => agentService.listRuns(employeeId, s), [employeeId])
   const approvals = useService((s) => agentService.listApprovals(employeeId, s), [employeeId])
   const [confirm, setConfirm] = React.useState<"suspend" | "revoke" | null>(null)
-  const suspendAction = useServiceAction((signal, id: string) =>
-    agentService.suspendEmployee(id, signal)
+  const suspendAction = useServiceAction(
+    withNotify(
+      { success: "Employee suspended", error: "Failed to suspend employee" },
+      (signal, id: string) => agentService.suspendEmployee(id, signal)
+    )
   )
-  const resumeAction = useServiceAction((signal, id: string) =>
-    agentService.resumeEmployee(id, signal)
+  const resumeAction = useServiceAction(
+    withNotify(
+      { success: "Employee resumed", error: "Failed to resume employee" },
+      (signal, id: string) => agentService.resumeEmployee(id, signal)
+    )
   )
-  const revokeAction = useServiceAction((signal, id: string) =>
-    agentService.revokeEmployee(id, signal)
+  const revokeAction = useServiceAction(
+    withNotify(
+      { success: "Employee revoked", error: "Failed to revoke employee" },
+      (signal, id: string) => agentService.revokeEmployee(id, signal)
+    )
   )
 
   if (employee.status === "loading") return <LoadingSkeleton rows={8} />

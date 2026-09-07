@@ -20,6 +20,7 @@ import { StatusBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import {
   formatBytes,
   formatLagSeconds,
@@ -52,11 +53,17 @@ export function StreamingDetailPage() {
   const { jobId } = useParams<{ jobId: string }>()
   const state = useService((s) => streamingService.getJob(jobId, s), [jobId])
   const [pauseOpen, setPauseOpen] = React.useState(false)
-  const pauseAction = useServiceAction((signal, id: string) =>
-    streamingService.pauseJob(id, signal)
+  const pauseAction = useServiceAction(
+    withNotify(
+      { success: "Job paused", error: "Failed to pause job" },
+      (signal, id: string) => streamingService.pauseJob(id, signal)
+    )
   )
-  const resumeAction = useServiceAction((signal, id: string) =>
-    streamingService.resumeJob(id, signal)
+  const resumeAction = useServiceAction(
+    withNotify(
+      { success: "Job resumed", error: "Failed to resume job" },
+      (signal, id: string) => streamingService.resumeJob(id, signal)
+    )
   )
   if (state.status === "loading") return <LoadingSkeleton rows={8} />
   if (state.status === "error") return <ErrorState error={state.error} onRetry={state.reload} />

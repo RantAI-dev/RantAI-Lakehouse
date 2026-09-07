@@ -2,11 +2,13 @@
 
 import * as React from "react"
 import Link from "next/link"
+import { Download } from "lucide-react"
 import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { Pill } from "@/components/patterns/status-badge"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Button } from "@/components/ui/button"
+import { downloadCsv, toCsv } from "@/lib/csv"
 import { formatBytes, formatCost, formatDuration } from "@/lib/format"
 import { ENGINE_CATEGORY_LABEL, WORKLOAD_CLASS_LABEL } from "@/lib/status"
 import type { QueryResult } from "@/services/contracts/queries"
@@ -50,15 +52,31 @@ export function QueryResultsSection({ result }: { result: QueryResult }) {
       title="Results"
       contentClassName="space-y-4"
       action={
-        result.auditEventId ? (
+        <div className="flex flex-wrap items-center gap-2">
           <Button
             size="sm"
             variant="outline"
-            render={<Link href={`/audit?event=${result.auditEventId}`} />}
+            disabled={rows.length === 0}
+            onClick={() =>
+              downloadCsv(
+                `query-results-${new Date().toISOString().slice(0, 10)}.csv`,
+                toCsv(result.columns, result.rows)
+              )
+            }
           >
-            View in Audit
+            <Download className="size-4" aria-hidden />
+            Export CSV
           </Button>
-        ) : null
+          {result.auditEventId ? (
+            <Button
+              size="sm"
+              variant="outline"
+              render={<Link href={`/audit?event=${result.auditEventId}`} />}
+            >
+              View in Audit
+            </Button>
+          ) : null}
+        </div>
       }
     >
       <DataTable

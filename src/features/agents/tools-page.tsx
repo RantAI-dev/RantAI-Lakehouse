@@ -22,6 +22,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { formatCompactNumber } from "@/lib/format"
 import {
   APPROVAL_STATUS_LABEL,
@@ -71,8 +72,11 @@ export function ToolsPage() {
   const [permission, setPermission] = React.useState("")
   const [rateLimit, setRateLimit] = React.useState("")
   const create = useServiceAction(
-    (signal, input: Parameters<typeof agentService.registerTool>[0]) =>
-      agentService.registerTool(input, signal)
+    withNotify(
+      { success: "Tool registered", error: "Failed to register tool" },
+      (signal, input: Parameters<typeof agentService.registerTool>[0]) =>
+        agentService.registerTool(input, signal)
+    )
   )
 
   const filtered = React.useMemo(() => {

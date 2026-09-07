@@ -400,6 +400,24 @@ function buildDetail(asset: Asset): AssetDetail {
 }
 
 /** Mock adapter for Data Explorer, asset detail, and catalog namespaces. */
+/**
+ * First entry of a serialised sorting state, or `null` if absent or
+ * malformed. Bad JSON is ignored rather than thrown: the mock's job is to
+ * keep the UI running, and the real adapter is where a malformed `sort`
+ * earns a 400.
+ */
+function parseMockSort(raw?: string): { id: string; desc: boolean } | null {
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw)
+    const first = Array.isArray(parsed) ? parsed[0] : null
+    if (!first || typeof first.id !== "string") return null
+    return { id: first.id, desc: Boolean(first.desc) }
+  } catch {
+    return null
+  }
+}
+
 export const mockAssetService: AssetService = {
   listAssets(filter, signal) {
     return mockCall(() => {
@@ -420,6 +438,43 @@ export const mockAssetService: AssetService = {
         }
         return true
       })
+    }, { signal })
+  },
+  listAssetsPage(query, signal) {
+    return mockCall(() => {
+      // Search and sort only. The mock backs demo mode and the empty/error
+      // states, so it needs to return a well-shaped `Pagination<Asset>` —
+      // not to re-implement all fourteen filter operators, which are
+      // covered by the Rust unit tests that own that logic.
+      const q = query.search?.trim().toLowerCase() ?? ""
+      const matched = q
+        ? ASSETS.filter((a) =>
+            `${a.name} ${a.namespace} ${a.domain} ${a.owner} ${a.description}`
+              .toLowerCase()
+              .includes(q)
+          )
+        : [...ASSETS]
+
+      const sort = parseMockSort(query.sort)
+      if (sort) {
+        matched.sort((a, b) => {
+          const left = String(a[sort.id as keyof Asset] ?? "")
+          const right = String(b[sort.id as keyof Asset] ?? "")
+          const cmp = left.localeCompare(right, undefined, { numeric: true })
+          return sort.desc ? -cmp : cmp
+        })
+      }
+
+      const pageSize = Math.max(1, query.pageSize)
+      const page = Math.max(1, query.page)
+      const start = (page - 1) * pageSize
+      return {
+        items: matched.slice(start, start + pageSize),
+        totalItems: matched.length,
+        totalPages: Math.ceil(matched.length / pageSize),
+        page,
+        pageSize,
+      }
     }, { signal })
   },
   getAsset(id, signal) {

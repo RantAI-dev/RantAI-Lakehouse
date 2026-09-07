@@ -12,6 +12,7 @@ import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
 import { useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { governanceService } from "@/services"
 
@@ -35,8 +36,12 @@ export function PolicyCreatePage() {
   const [effect, setEffect] = React.useState("Permit with obligation")
   const [conditions, setConditions] = React.useState("")
   const [activate, setActivate] = React.useState(false)
-  const create = useServiceAction((signal, input: Parameters<typeof governanceService.createPolicy>[0]) =>
-    governanceService.createPolicy(input, signal)
+  const create = useServiceAction(
+    withNotify(
+      { success: "Policy created", error: "Failed to create policy" },
+      (signal, input: Parameters<typeof governanceService.createPolicy>[0]) =>
+        governanceService.createPolicy(input, signal)
+    )
   )
 
   const canProceed =

@@ -19,6 +19,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { formatBytes, formatPercent, formatRelativeTime } from "@/lib/format"
 import {
   DATA_LAYER_LABEL,
@@ -107,12 +108,18 @@ export function StoragePage() {
   const [warmDays, setWarmDays] = React.useState("")
   const [coldAfterDays, setColdAfterDays] = React.useState("")
   const create = useServiceAction(
-    (signal, input: Parameters<typeof storageService.createLifecyclePolicy>[0]) =>
-      storageService.createLifecyclePolicy(input, signal)
+    withNotify(
+      { success: "Lifecycle policy created", error: "Failed to create policy" },
+      (signal, input: Parameters<typeof storageService.createLifecyclePolicy>[0]) =>
+        storageService.createLifecyclePolicy(input, signal)
+    )
   )
   const restore = useServiceAction(
-    (signal, input: Parameters<typeof storageService.restoreAsset>[0]) =>
-      storageService.restoreAsset(input, signal)
+    withNotify(
+      { success: "Restore started", error: "Failed to start restore" },
+      (signal, input: Parameters<typeof storageService.restoreAsset>[0]) =>
+        storageService.restoreAsset(input, signal)
+    )
   )
 
   function resetForm() {

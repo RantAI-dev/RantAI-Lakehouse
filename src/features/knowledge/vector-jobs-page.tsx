@@ -19,6 +19,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { formatRelativeTime } from "@/lib/format"
 import { ENTITY_STATUS_LABEL } from "@/lib/status"
 import { knowledgeService } from "@/services"
@@ -45,8 +46,11 @@ export function VectorJobsPage() {
   const [embeddingModel, setEmbeddingModel] = React.useState("")
   const [indexType, setIndexType] = React.useState("")
   const create = useServiceAction(
-    (signal, input: Parameters<typeof knowledgeService.createVectorJob>[0]) =>
-      knowledgeService.createVectorJob(input, signal)
+    withNotify(
+      { success: "Vector job queued", error: "Failed to queue vector job" },
+      (signal, input: Parameters<typeof knowledgeService.createVectorJob>[0]) =>
+        knowledgeService.createVectorJob(input, signal)
+    )
   )
 
   const statusOptions = React.useMemo(() => {

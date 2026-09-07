@@ -18,6 +18,7 @@ import {
   LoadingSkeleton,
 } from "@/components/patterns/page-states"
 import { HealthBadge, Pill } from "@/components/patterns/status-badge"
+import { withNotify } from "@/lib/notify"
 import { Button } from "@/components/ui/button"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatRelativeTime } from "@/lib/format"
@@ -43,19 +44,32 @@ const columns: ColumnDef<Connector>[] = [
         <p className="text-xs text-muted-foreground">{r.type}</p>
       </div>
     ),
+    sortValue: (r) => r.name,
   },
   {
     key: "dir",
     header: "Direction",
     render: (r) => DIRECTION_LABEL[r.direction],
+    sortValue: (r) => DIRECTION_LABEL[r.direction],
   },
   {
     key: "health",
     header: "Health",
     render: (r) => <HealthBadge health={r.health} />,
+    sortValue: (r) => r.health,
   },
-  { key: "env", header: "Environment", render: (r) => r.environment },
-  { key: "tenant", header: "Tenant", render: (r) => r.tenant },
+  {
+    key: "env",
+    header: "Environment",
+    render: (r) => r.environment,
+    sortValue: (r) => r.environment,
+  },
+  {
+    key: "tenant",
+    header: "Tenant",
+    render: (r) => r.tenant,
+    sortValue: (r) => r.tenant,
+  },
   {
     key: "test",
     header: "Last test",
@@ -64,6 +78,9 @@ const columns: ColumnDef<Connector>[] = [
         {formatRelativeTime(r.lastTestAt)}
       </span>
     ),
+    // Urutkan pakai timestamp mentah, bukan teks "2 hours ago" yang
+    // diformat — teks relatif tidak terurut secara kronologis.
+    sortValue: (r) => r.lastTestAt,
   },
   {
     key: "activity",
@@ -73,6 +90,7 @@ const columns: ColumnDef<Connector>[] = [
         {formatRelativeTime(r.lastActivityAt)}
       </span>
     ),
+    sortValue: (r) => r.lastActivityAt,
   },
 ]
 
@@ -83,8 +101,12 @@ function dependentHref(kind: "pipeline" | "streaming", id: string) {
 /** Drawer body — fetches full connector detail for the selected row. */
 function ConnectorDetail({ id }: { id: string }) {
   const state = useService((s) => connectorService.getConnector(id, s), [id])
-  const testAction = useServiceAction((signal, connectorId: string) =>
-    connectorService.testConnection(connectorId, signal)
+  const testAction = useServiceAction(
+    withNotify(
+      { success: "Connection test passed", error: "Connection test failed" },
+      (signal, connectorId: string) =>
+        connectorService.testConnection(connectorId, signal)
+    )
   )
 
   if (state.status === "loading") return <LoadingSkeleton rows={4} />
@@ -304,6 +326,7 @@ export function ConnectorsPage() {
           rows={rows}
           rowKey={(r) => r.id}
           onRowClick={setSelected}
+          pageSize={25}
         />
       ) : null}
 

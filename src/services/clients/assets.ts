@@ -5,6 +5,7 @@ import type {
   AssetFilter,
   CatalogNamespace,
 } from "../contracts/assets";
+import type { Pagination } from "../contracts/pagination";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
@@ -36,6 +37,32 @@ export const clickhouseAssetService: AssetService = {
         a.id.toLowerCase().includes(term)
       );
     });
+  },
+  async listAssetsPage(query, signal) {
+    // Only non-empty params are sent: the backend applies its own
+    // defaults, and a URL full of `filters=` blanks makes the React Query
+    // cache key noisier than the state it represents.
+    const params = new URLSearchParams();
+    params.set("page", String(query.page));
+    params.set("pageSize", String(query.pageSize));
+    if (query.search?.trim()) params.set("search", query.search.trim());
+    if (query.sort) params.set("sort", query.sort);
+    if (query.filters) params.set("filters", query.filters);
+    if (query.joinOperator) params.set("joinOperator", query.joinOperator);
+    if (query.groupBy) params.set("groupBy", query.groupBy);
+    if (query.skipListMeta) params.set("skipListMeta", "true");
+
+    const res = await apiFetch(`/api/catalog/query?${params}`, { signal });
+    const json = await res.json();
+    if (!res.ok) {
+      // 400 means this client sent a field the server does not allow —
+      // a bug here, not a transient outage, so it is not "unavailable".
+      throw new ServiceError(
+        res.status === 400 ? "invalid_request" : "unavailable",
+        json?.error ?? "Katalog gagal dimuat"
+      );
+    }
+    return json as Pagination<Asset>;
   },
   async getAsset(id, signal) {
     const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}`, { signal });

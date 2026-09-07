@@ -17,6 +17,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { formatCost, formatPercent } from "@/lib/format"
 import {
   AUTONOMY_LABEL,
@@ -69,8 +70,11 @@ export function EmployeesPage() {
   const [dataScope, setDataScope] = React.useState("")
   const [budgetLimit, setBudgetLimit] = React.useState("")
   const create = useServiceAction(
-    (signal, input: Parameters<typeof agentService.createEmployee>[0]) =>
-      agentService.createEmployee(input, signal)
+    withNotify(
+      { success: "Employee created", error: "Failed to create employee" },
+      (signal, input: Parameters<typeof agentService.createEmployee>[0]) =>
+        agentService.createEmployee(input, signal)
+    )
   )
 
   const statusOptions = React.useMemo(() => {

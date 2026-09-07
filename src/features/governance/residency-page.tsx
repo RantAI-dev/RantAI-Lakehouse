@@ -19,6 +19,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { CLASSIFICATION_LABEL, type Classification } from "@/lib/status"
 import { governanceService } from "@/services"
 import type { ResidencyRule } from "@/services/contracts/governance"
@@ -69,10 +70,16 @@ export function ResidencyPage() {
   const [crossSiteAllowed, setCrossSiteAllowed] = React.useState("no")
   const [allowedOutput, setAllowedOutput] = React.useState("")
   const create = useServiceAction(
-    (
-      signal,
-      input: Parameters<typeof governanceService.createResidencyRule>[0]
-    ) => governanceService.createResidencyRule(input, signal)
+    withNotify(
+      {
+        success: "Residency rule created",
+        error: "Failed to create residency rule",
+      },
+      (
+        signal,
+        input: Parameters<typeof governanceService.createResidencyRule>[0]
+      ) => governanceService.createResidencyRule(input, signal)
+    )
   )
 
   const filtered = React.useMemo(() => {

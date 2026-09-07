@@ -69,6 +69,32 @@ export function formatDateTime(iso: string): string {
   }).format(d)
 }
 
+/**
+ * Date only, with the parts caller-selectable — used by the data table's
+ * date/date-range filter chips, which render compact labels like
+ * `"Mar 4 - Mar 18"` rather than the fixed shape [`formatDateTime`] emits.
+ *
+ * Accepts a `Date`, an ISO string, or an epoch number because filter
+ * values arrive from the URL as strings but from the calendar as `Date`s.
+ * Returns `""` (not `"—"`) for missing/invalid input: the callers here
+ * concatenate the result into a chip label, where an em dash would read as
+ * a real value.
+ */
+export function formatDate(
+  date: Date | string | number | undefined,
+  opts: Intl.DateTimeFormatOptions = {}
+): string {
+  if (!date) return ""
+  const d = new Date(date)
+  if (Number.isNaN(d.getTime())) return ""
+  return Intl.DateTimeFormat("en", {
+    month: opts.month ?? "long",
+    day: opts.day ?? "numeric",
+    year: opts.year ?? "numeric",
+    ...opts,
+  }).format(d)
+}
+
 /** ISO timestamp → relative age, e.g. "4m ago", "3h ago", "2d ago". */
 export function formatRelativeTime(iso: string, now = Date.now()): string {
   const t = new Date(iso).getTime()

@@ -42,6 +42,31 @@ function DropdownMenuContent({
   )
 }
 
+/**
+ * Mengelompokkan item yang berkaitan di dalam satu menu. Pembaca layar
+ * mengumumkan grup sebagai satu kesatuan, dan `DropdownMenuGroupLabel` bisa
+ * dipakai untuk memberinya judul.
+ */
+function DropdownMenuGroup({ ...props }: MenuPrimitive.Group.Props) {
+  return <MenuPrimitive.Group data-slot="dropdown-menu-group" {...props} />
+}
+
+function DropdownMenuGroupLabel({
+  className,
+  ...props
+}: MenuPrimitive.GroupLabel.Props) {
+  return (
+    <MenuPrimitive.GroupLabel
+      data-slot="dropdown-menu-group-label"
+      className={cn(
+        "px-2 py-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
 function DropdownMenuItem({
   className,
   variant = "default",
@@ -85,6 +110,8 @@ export {
   DropdownMenuTrigger,
   DropdownMenuPortal,
   DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuGroupLabel,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSeparator,

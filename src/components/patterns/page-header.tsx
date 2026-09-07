@@ -10,7 +10,13 @@ export function PageHeader({
   actions,
   className,
 }: {
-  title: string
+  /**
+   * Usually a plain string. Accepts a node so a page whose title IS the
+   * thing being chosen can put a picker here - the Dashboards header
+   * renders its board switcher as the title rather than bolting a second
+   * control onto the side.
+   */
+  title: React.ReactNode
   description?: string
   actions?: React.ReactNode
   className?: string
