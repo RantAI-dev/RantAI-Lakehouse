@@ -160,6 +160,15 @@ services:
       CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:-lakehouse}}
       CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:-rustfsadmin}}
       CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:-rustfsadmin}}
+      # The connector connectivity probe blocks private/internal address
+      # ranges by DEFAULT (SSRF guard — otherwise a `connector:manage`
+      # principal gets an internal port scanner with output). This stack's own
+      # seeded connectors legitimately point at `postgres:5432` and
+      # `http://rustfs:9000`, which resolve inside those ranges, so the demo
+      # opts out EXPLICITLY. Keeping the safe posture as the default and making
+      # the exception visible here is the point — do NOT carry this into a
+      # deployment that accepts connector definitions from untrusted callers.
+      CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS: ${CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS:-true}
       # ── ADR 0010 — Gold export to Iceberg (`routes::gold`). Points at the
       #    compose-internal Lakekeeper hostname (NOT `LAKEKEEPER_BASE_URI`,
       #    which is host-facing) — same distinction `g1-test-runner`'s env
