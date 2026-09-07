@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import requests
-from dagster import Definitions, ScheduleDefinition, job, op
+from dagster import Definitions, job, op
 
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, record_maintenance_run
 
@@ -139,12 +139,34 @@ def gold_export_job() -> None:
 # freshly-maintained Bronze table is what most Gold marts are ultimately
 # built from; arbitrary but conservative cadence, same reasoning
 # `bronze_maintenance_schedule` gives.
-gold_export_schedule = ScheduleDefinition(
-    job=gold_export_job,
-    cron_schedule="0 4 * * *",
-)
+# NOT scheduled — the job cannot authenticate yet, and a schedule that 401s
+# every night at 04:00 is worse than no schedule, because the failure is
+# silent unless somebody reads the run log.
+#
+# `POST /api/gold/export/{mart}` is `Policy::RequiresAuth` in `POLICY_TABLE`,
+# and `auth_gate` enforces that BEFORE the handler runs. This job sends only
+# `x-run-token`, which the handler's own `check_export_token` would accept —
+# but execution never reaches the handler. That layering is deliberate and
+# mirrors `/api/alerts/run`: `RequiresAuth` is a floor that stops an ordinary
+# authenticated user firing the endpoint, and the run token is the stricter
+# operator check on top. The floor needs an actual credential; a shared token
+# is not one.
+#
+# The acceptance test passes only because it logs in as the bootstrap admin
+# first, which a scheduled job must not do.
+#
+# To schedule this, give the job a real identity — `service_credential` in
+# `rust/migrations/0019_auth.sql` already models one — provision a token for
+# it, send it as `Authorization: Bearer …` alongside `x-run-token`, and then
+# restore the ScheduleDefinition below. Tracked as a follow-up rather than
+# worked around by loosening the route's policy, which would remove the floor
+# for every caller.
+#
+# gold_export_schedule = ScheduleDefinition(
+#     job=gold_export_job,
+#     cron_schedule="0 4 * * *",
+# )
 
 gold_export_defs = Definitions(
     jobs=[gold_export_job],
-    schedules=[gold_export_schedule],
 )
