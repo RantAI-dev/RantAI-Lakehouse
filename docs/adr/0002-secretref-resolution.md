@@ -129,3 +129,98 @@ rejected; an unset variable is `NotFound`, not a silent empty string; the
 `DynSecretResolver` wrapper delegates correctly. `cargo clippy --all-targets
 --all-features --locked -- -D warnings` is clean for the new module (see
 the P1b report for actual captured output).
+
+## Addendum (P6 hardening): restricting connector secretRefs
+
+**Status:** Accepted
+**Date:** 2026-09-07
+
+### Context
+
+This ADR's design was written for callers where the resolved secret's
+DESTINATION is fixed and operator-controlled — Lakekeeper's own storage
+credential, dialing RustFS; a future Debezium source credential, dialing a
+database an operator configured. Under that assumption, "which env var can
+this caller name" was never a meaningful attack surface, because the
+caller choosing a `secretRef` was the same operator who configured the
+destination it would be used against.
+
+P6 (`lakehouse-api::connector_probe`) broke that assumption without this
+ADR being revisited at the time. `POST /api/connectors` lets a
+`connector:manage` principal set BOTH `host` AND `secretRef` on a
+connector, and `POST /api/connectors/{id}/test` then resolves `secretRef`
+and dials `host` with it. Handing that code path the unrestricted
+`EnvSecretResolver` — resolving ANY `env:NAME` in the process environment
+— meant a `connector:manage` principal could set `secretRef:
+"env:DATABASE_URL"` (or `CH_PASSWORD`, `OIDC_CLIENT_SECRET`,
+`EMBED_SECRET`, `ALERTS_RUN_TOKEN`, `SMTP_PASS`, `LLM_KEY`, ...) and `host`
+pointed at infrastructure they control, press "Test", and have this
+service authenticate to their host with the resolved secret —
+`sqlx`'s Postgres wire protocol negotiates cleartext-password auth by
+default, so the value would arrive at the attacker's host in the clear.
+This was flagged in PR #34 code review as a Blocker.
+
+### Decision
+
+**A caller whose destination is caller-controlled must be handed a
+resolver restricted to an explicit allowlist, never the general-purpose
+one.** Concretely:
+
+- `lakehouse_core::secret::AllowlistedSecretResolver<R>` wraps any
+  `SecretResolver` with an explicit `HashSet<String>` of permitted
+  `secretRef` strings. A reference outside the set is rejected with the
+  new `SecretError::NotAllowed` variant — BEFORE the inner resolver is
+  ever consulted, never a silent fall-through and never confusable with
+  `NotFound` (a correctly-scoped but misspelled reference).
+- `lakehouse_api::state::AppState` now carries
+  `connector_secret_resolver: Arc<dyn DynSecretResolver>` — always an
+  `AllowlistedSecretResolver` wrapping `EnvSecretResolver`, scoped to the
+  fixed constant `CONNECTOR_ALLOWED_SECRET_REFS` (`env:POSTGRES_PASSWORD`,
+  `env:RUSTFS_ACCESS_KEY`, `env:RUSTFS_SECRET_KEY` — exactly the refs
+  `0022_prune_connector_seed.sql`'s two dialable seeded connectors use).
+  `connector_probe::probe` is handed this resolver, never the general
+  `EnvSecretResolver` any other part of the process might use.
+- The allowlist is a hardcoded Rust constant, not derived from
+  configuration or a database row: widening it is a deliberate code
+  change subject to review, not something a `connector:manage` principal
+  (or an operator fat-fingering an env var) can expand at runtime.
+
+This does not change anything about `SecretResolver`/`EnvSecretResolver`
+themselves, or any other caller of this ADR's original design — Lakekeeper's
+storage-credential resolution, and any future Debezium/dlt caller, are
+still free to use the unrestricted resolver, because their destination is
+NOT caller-controlled. `AllowlistedSecretResolver` is an opt-in wrapper for
+the one shape of caller (today: exactly `connector_probe`) where it is.
+
+### Consequences
+
+- `lakehouse-core::secret` gains `AllowlistedSecretResolver` and
+  `SecretError::NotAllowed`.
+- `lakehouse-api::state::AppState::secret_resolver` is renamed
+  `connector_secret_resolver` and its type's construction changes from
+  `Arc::new(EnvSecretResolver::new())` to an `AllowlistedSecretResolver`
+  wrapping the same. No other caller existed to migrate.
+- **Operator guidance, added to the existing "Consequences" section
+  above:** any FUTURE caller of `SecretResolver` where the caller who
+  chooses the `secretRef` also controls (or influences) where the
+  resolved value is used — a webhook target, a user-supplied endpoint,
+  anything not fixed at deploy time by an operator — MUST go through
+  `AllowlistedSecretResolver` (or an equivalent explicit scoping
+  mechanism), never the bare resolver. This is now the litmus test this
+  ADR uses for "does a new caller need scoping": ask whether the entity
+  choosing the `secretRef` is the same entity that controls where it's
+  used. If yes (Lakekeeper's own config), the bare resolver is fine. If
+  no (a caller-registered connector, a caller-registered webhook), it is
+  not.
+
+### Verification
+
+`cargo test -p lakehouse-core` — `secret::tests` adds:
+`out_of_scope_env_ref_is_rejected_not_silently_resolved` (the exact
+Blocker 1 scenario: `env:DATABASE_URL` is on the inner resolver but not
+the allowlist, and is refused, not silently resolved),
+`allowlisted_ref_still_resolves_through_the_inner_resolver`, and
+`empty_allowlist_rejects_everything`. `cargo test -p lakehouse-api` covers
+`connector_probe`'s use of the scoped resolver via its existing
+credential-resolution tests (unchanged: they already exercise `env:`
+lookups through whatever resolver `probe` is handed).

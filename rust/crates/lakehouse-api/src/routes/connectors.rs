@@ -174,7 +174,7 @@ pub async fn test_connection(
     };
     let outcome = crate::connector_probe::probe(
         &dial_info,
-        state.secret_resolver.as_ref(),
+        state.connector_secret_resolver.as_ref(),
         state.config.connector_probe_allow_internal_hosts,
     )
     .await;

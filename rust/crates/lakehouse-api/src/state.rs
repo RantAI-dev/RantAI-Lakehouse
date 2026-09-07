@@ -8,7 +8,7 @@ use lakehouse_auth::{
     SessionAuthenticator,
 };
 use lakehouse_clickhouse::ChClient;
-use lakehouse_core::secret::{DynSecretResolver, EnvSecretResolver};
+use lakehouse_core::secret::{AllowlistedSecretResolver, DynSecretResolver, EnvSecretResolver};
 use lakehouse_dagster::DgClient;
 use lakehouse_embed::EmbedSecretResolver;
 use lakehouse_llm::LlmClient;
@@ -79,14 +79,23 @@ pub struct AppState {
     /// this field.
     pub pg: Option<Arc<PgPool>>,
     /// Resolves a connector's `secretRef` to an actual credential value —
-    /// [`crate::connector_probe`]'s only source of one, per ADR 0002. Always
-    /// [`EnvSecretResolver`] today (the only implementation that exists;
-    /// see `lakehouse_core::secret`'s module doc comment for the operator
-    /// guidance that goes with that). `Arc<dyn DynSecretResolver>`, not a
-    /// concrete type, so a later `FileSecretResolver`/external-provider
-    /// implementation swaps in here without changing this field's type or
-    /// any reader of it.
-    pub secret_resolver: Arc<dyn DynSecretResolver>,
+    /// [`crate::connector_probe`]'s only source of one, per ADR 0002 (see
+    /// its "Restricting connector secretRefs" addendum). **Deliberately
+    /// NOT the general-purpose [`EnvSecretResolver`]** the rest of this
+    /// process would use: `connector_probe` dials a `host` the SAME
+    /// caller who supplies `secretRef` also controls, so handing it an
+    /// unrestricted resolver would let a `connector:manage` principal name
+    /// any process secret (`env:DATABASE_URL`, `env:CH_PASSWORD`, ...) and
+    /// exfiltrate it to infrastructure they own. Always an
+    /// [`AllowlistedSecretResolver`] wrapping [`EnvSecretResolver`],
+    /// scoped to exactly [`CONNECTOR_ALLOWED_SECRET_REFS`] — the
+    /// `secretRef`s this deployment's OWN seeded connectors use
+    /// (`rust/migrations/0022_prune_connector_seed.sql`), nothing else.
+    /// `Arc<dyn DynSecretResolver>`, not a concrete type, so a later
+    /// `FileSecretResolver`/external-provider implementation swaps in
+    /// (still allowlisted) without changing this field's type or any
+    /// reader of it.
+    pub connector_secret_resolver: Arc<dyn DynSecretResolver>,
     /// The configured authenticators, or `None` under the exact same
     /// condition as [`Self::pg`] being `None` (no Postgres pool). When
     /// `None`, `crate::auth::AuthenticatedPrincipal` and every protected
@@ -94,6 +103,22 @@ pub struct AppState {
     /// `crate::auth::authenticators`.
     pub auth: Option<AuthState>,
 }
+
+/// The exact `secretRef`s [`AppState::connector_secret_resolver`] may
+/// resolve — see that field's doc comment and ADR 0002's addendum. This is
+/// deliberately a fixed, hardcoded list, not derived from configuration:
+/// it names the `secretRef`s `0022_prune_connector_seed.sql`'s two seeded
+/// connectors use (`conn-pg-lakehouse`, `conn-s3-warehouse`), the only
+/// connectors this build can actually dial today (see
+/// `connector_probe`'s module doc comment). Widening this list is a
+/// deliberate code change to make and review, not something a request or
+/// an environment variable can do — a `connector:manage` principal must
+/// never be able to expand their own reach.
+const CONNECTOR_ALLOWED_SECRET_REFS: [&str; 3] = [
+    "env:POSTGRES_PASSWORD",
+    "env:RUSTFS_ACCESS_KEY",
+    "env:RUSTFS_SECRET_KEY",
+];
 
 /// Translate [`Config`]'s flat `oidc_*` env-derived fields into
 /// [`lakehouse_auth::OidcConfig`], or `None` if `OIDC` is not configured.
@@ -170,7 +195,13 @@ impl AppState {
             embed_secret: Arc::new(embed_secret),
             llm: Arc::new(llm),
             pg,
-            secret_resolver: Arc::new(EnvSecretResolver::new()),
+            connector_secret_resolver: Arc::new(AllowlistedSecretResolver::new(
+                EnvSecretResolver::new(),
+                CONNECTOR_ALLOWED_SECRET_REFS
+                    .iter()
+                    .map(|s| (*s).to_owned()),
+                "connector-allowlist",
+            )),
             auth,
         }
     }
