@@ -55,6 +55,13 @@ export type CreateConnectorInput = {
   direction: Connector["direction"]
   host: string
   secretRef: string
+  /**
+   * Optional secondary reference, e.g. the secret-access-key half of an S3
+   * connector's access-key/secret-key pair. Without this, an API-created S3
+   * connector can never be tested — `connector_probe::probe_s3` requires
+   * both `secretRef` and `secretRefSecondary` to be set.
+   */
+  secretRefSecondary?: string
   environment: string
   tenant: string
   residency: string

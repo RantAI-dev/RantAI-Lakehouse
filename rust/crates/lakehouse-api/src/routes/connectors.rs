@@ -90,6 +90,13 @@ pub struct CreateConnectorBody {
     direction: String,
     host: String,
     secret_ref: String,
+    /// Optional secondary reference, e.g. the secret-access-key half of an
+    /// S3 connector's access-key/secret-key pair (see
+    /// `lakehouse_store::connectors::ConnectorDialInfo::secret_ref_secondary`'s
+    /// doc comment). Without this, an API-created S3 connector's `/test`
+    /// can never succeed — `probe_s3` requires both.
+    #[serde(default)]
+    secret_ref_secondary: Option<String>,
     environment: String,
     tenant: String,
     #[serde(default)]
@@ -137,12 +144,28 @@ pub async fn create(
         )
         .into());
     }
+    let secret_ref_secondary = match body.secret_ref_secondary {
+        Some(raw) if !raw.trim().is_empty() => {
+            let trimmed = raw.trim().to_owned();
+            if connectors::looks_like_raw_secret(&trimmed) {
+                return Err(ApiError::BadRequest(
+                    "secretRefSecondary must be a reference to a credential, not the credential \
+                     itself"
+                        .to_owned(),
+                )
+                .into());
+            }
+            Some(trimmed)
+        }
+        _ => None,
+    };
     let input = CreateConnectorInput {
         name: required("name", &body.name)?,
         kind: required("type", &body.kind)?,
         direction,
         host: required("host", &body.host)?,
         secret_ref,
+        secret_ref_secondary,
         environment: required("environment", &body.environment)?,
         tenant: required("tenant", &body.tenant)?,
         residency: body.residency,
@@ -273,6 +296,7 @@ mod tests {
             direction: "sideways".to_owned(),
             host: "h".to_owned(),
             secret_ref: "env:X".to_owned(),
+            secret_ref_secondary: None,
             environment: "production".to_owned(),
             tenant: "t".to_owned(),
             residency: String::new(),
@@ -280,6 +304,43 @@ mod tests {
             owner: None,
         };
         assert!(!VALID_DIRECTIONS.contains(&body.direction.as_str()));
+    }
+
+    /// D5/Should-fix: `secretRefSecondary` must parse through the request
+    /// body (camelCase, per the struct's `rename_all`) and reach
+    /// `CreateConnectorInput` — otherwise an API-created S3 connector can
+    /// never be tested, since `probe_s3` requires both refs.
+    #[test]
+    fn secret_ref_secondary_round_trips_through_the_request_body() {
+        let json = serde_json::json!({
+            "name": "n",
+            "type": "Object storage",
+            "direction": "sink",
+            "host": "http://rustfs:9000|bucket",
+            "secretRef": "env:AK",
+            "secretRefSecondary": "env:SK",
+            "environment": "production",
+            "tenant": "t",
+        });
+        let body: CreateConnectorBody = serde_json::from_value(json).unwrap();
+        assert_eq!(body.secret_ref_secondary.as_deref(), Some("env:SK"));
+    }
+
+    /// Absent `secretRefSecondary` (e.g. a `PostgreSQL` connector, which
+    /// only ever needs one credential) must still parse.
+    #[test]
+    fn secret_ref_secondary_is_optional() {
+        let json = serde_json::json!({
+            "name": "n",
+            "type": "PostgreSQL",
+            "direction": "bidirectional",
+            "host": "u@host:5432/db",
+            "secretRef": "env:PW",
+            "environment": "production",
+            "tenant": "t",
+        });
+        let body: CreateConnectorBody = serde_json::from_value(json).unwrap();
+        assert_eq!(body.secret_ref_secondary, None);
     }
 
     /// The defense-in-depth check from `looks_like_raw_secret` is wired

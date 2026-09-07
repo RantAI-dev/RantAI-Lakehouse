@@ -314,6 +314,14 @@ pub struct CreateConnectorInput {
     /// A REFERENCE NAME to where a credential lives, never the credential
     /// itself. See the module doc comment.
     pub secret_ref: String,
+    /// An optional second REFERENCE NAME (e.g. the secret-access-key half
+    /// of an S3 connector's access-key/secret-key pair — see
+    /// [`ConnectorDialInfo::secret_ref_secondary`]). `None` for connector
+    /// types that need only one credential (e.g. `PostgreSQL`). Without
+    /// this, an S3 connector created through the API could never be
+    /// tested: [`get_connector_dial_info`] always reads this column, and
+    /// `lakehouse-api::connector_probe::probe_s3` requires it.
+    pub secret_ref_secondary: Option<String>,
     /// Deployment environment.
     pub environment: String,
     /// Owning tenant's display name.
@@ -396,8 +404,8 @@ pub async fn create_connector(
     let owner = input.owner.as_deref().unwrap_or(DEFAULT_OWNER);
     let sql = format!(
         "INSERT INTO connector (id, name, type, direction, health, environment, tenant, host, \
-         secret_ref, residency, capabilities, owner) \
-         VALUES ($1, $2, $3, $4, 'healthy', $5, $6, $7, $8, $9, $10, $11) \
+         secret_ref, secret_ref_secondary, residency, capabilities, owner) \
+         VALUES ($1, $2, $3, $4, 'healthy', $5, $6, $7, $8, $9, $10, $11, $12) \
          RETURNING {CONNECTOR_COLUMNS}"
     );
     let row: ConnectorRow = sqlx::query_as(&sql)
@@ -409,6 +417,7 @@ pub async fn create_connector(
         .bind(&input.tenant)
         .bind(&input.host)
         .bind(&input.secret_ref)
+        .bind(&input.secret_ref_secondary)
         .bind(&input.residency)
         .bind(&input.capabilities)
         .bind(owner)
