@@ -194,7 +194,17 @@ services:
       CATALOG_NAMESPACE_META: ${CATALOG_NAMESPACE_META:-}
       BUILTIN_DASHBOARD_ENABLED: ${BUILTIN_DASHBOARD_ENABLED:-1}
     volumes:
-      - lakehouse_oidc_tokens:/tokens:ro
+      # PR #33 review, should-fix: a single-file subpath mount, not the
+      # whole `lakehouse_oidc_tokens` volume — this service only ever
+      # reads `gold-export.jwt` (LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE above),
+      # so it should not also be able to read `admin.jwt` or any other
+      # principal's token off the shared volume.
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/gold-export.jwt
+        volume:
+          subpath: gold-export.jwt
+        read_only: true
     restart: unless-stopped
 
   # P1 — S3-compatible object store, the default self-hosted implementation
@@ -370,9 +380,17 @@ services:
       - --http-addr=0.0.0.0:8080
       - --grpc-addr=0.0.0.0:8081
       - --playground-enabled=false
-    ports:
-      - "${OPENFGA_HTTP_HOST_PORT:-8082}:8080"
-      - "${OPENFGA_GRPC_HOST_PORT:-8083}:8081"
+    # PR #33 review, blocker 2: no `ports:` mapping — OpenFGA has no authn
+    # of its own (Lakekeeper's Management API is the only intended grant
+    # interface; see ADR 0011), so publishing 8082/8083 on the host handed
+    # anyone who could reach them read/write access to the whole
+    # authorization store on a plain `docker compose up`. Every caller that
+    # actually needs OpenFGA (`lakekeeper`, `lakekeeper-migrate`) resolves
+    # it by its compose service name and never leaves this network.
+    # `OPENFGA_HTTP_HOST_PORT`/`OPENFGA_GRPC_HOST_PORT` are gone with it —
+    # if you need to reach OpenFGA's Playground/API directly from the host
+    # for debugging, use `docker compose exec` or a one-off `docker run
+    # --network <project>_default` instead of republishing these.
     restart: unless-stopped
 
   # R1 — `openfga`'s image is distroless (no shell, no wget/curl — verified
@@ -416,8 +434,17 @@ services:
       OIDC_MOCK_ISSUER: http://oidc-mock:8090
       OIDC_MOCK_AUDIENCE: lakekeeper
       OIDC_MOCK_PORT: "8090"
-    ports:
-      - "${OIDC_MOCK_HOST_PORT:-8090}:8090"
+    # PR #33 review, blocker 1 + 2: no `ports:` mapping. This container
+    # holds the private signing key every principal's token is verified
+    # against and (until blocker 2's fix) minted arbitrary tokens for any
+    # `client_id` with no secret check — publishing it on the host let
+    # anyone who could reach the port mint a Lakekeeper-trusted identity.
+    # Every caller that needs it (`lakekeeper`, the `lakekeeper-*-init`
+    # jobs, every writer's `CH_OAUTH_SERVER_URI`) resolves `oidc-mock` by
+    # its compose service name and stays inside this network.
+    # `OIDC_MOCK_HOST_PORT` is gone with it — see docs/OPERATIONS.md for
+    # how to reach `/token` or the JWKS/discovery docs from the host for
+    # debugging without republishing the port (`docker compose exec`).
     volumes:
       - lakehouse_oidc_data:/data
       - lakehouse_oidc_tokens:/tokens
@@ -538,7 +565,14 @@ services:
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
     volumes:
-      - lakehouse_oidc_tokens:/tokens:ro
+      # PR #33 review, should-fix: single-file subpath mount — this job
+      # only ever needs `admin.jwt`.
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/admin.jwt
+        volume:
+          subpath: admin.jwt
+        read_only: true
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -631,7 +665,60 @@ services:
     environment:
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
     volumes:
-      - lakehouse_oidc_tokens:/tokens:ro
+      # PR #33 review, should-fix: this job is the one caller that
+      # legitimately needs many principals' tokens (it self-registers each
+      # of them, then grants with `admin`) — one subpath mount per file it
+      # actually reads, instead of the whole `lakehouse_oidc_tokens`
+      # volume (which would also expose every OTHER principal's token,
+      # e.g. `gold-export.jwt`, that this job has no reason to touch).
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/admin.jwt
+        volume:
+          subpath: admin.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/rust-iceberg.jwt
+        volume:
+          subpath: rust-iceberg.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/debezium.jwt
+        volume:
+          subpath: debezium.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/dlt.jwt
+        volume:
+          subpath: dlt.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/clickhouse-reader.jwt
+        volume:
+          subpath: clickhouse-reader.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/trino.jwt
+        volume:
+          subpath: trino.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/gold-export.jwt
+        volume:
+          subpath: gold-export.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/unauthorized-test.jwt
+        volume:
+          subpath: unauthorized-test.jwt
+        read_only: true
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -723,7 +810,20 @@ services:
       - ./rust:/workspace
       - lakehouse_g1_cargo_registry:/usr/local/cargo/registry
       - lakehouse_g1_target:/workspace/target
-      - lakehouse_oidc_tokens:/tokens:ro
+      # PR #33 review, should-fix: only the two tokens this runner reads
+      # below (`rust-iceberg.jwt`, `unauthorized-test.jwt`).
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/rust-iceberg.jwt
+        volume:
+          subpath: rust-iceberg.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/unauthorized-test.jwt
+        volume:
+          subpath: unauthorized-test.jwt
+        read_only: true
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -777,7 +877,20 @@ services:
     working_dir: /work
     volumes:
       - ./ops/gold_export:/work
-      - lakehouse_oidc_tokens:/tokens:ro
+      # PR #33 review, should-fix: only the two tokens
+      # `gold_export_test.py` reads (`admin.jwt`, `gold-export.jwt`).
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/admin.jwt
+        volume:
+          subpath: admin.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/gold-export.jwt
+        volume:
+          subpath: gold-export.jwt
+        read_only: true
     depends_on:
       lakehouse-api:
         condition: service_started
@@ -905,7 +1018,14 @@ services:
       SEAWEEDFS_ACCESS_KEY: ${SEAWEEDFS_ACCESS_KEY:-seaweedfsadmin}
       SEAWEEDFS_SECRET_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfsadmin}
     volumes:
-      - lakehouse_oidc_tokens:/tokens:ro
+      # PR #33 review, should-fix: single-file subpath mount — `admin.jwt`
+      # only.
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/admin.jwt
+        volume:
+          subpath: admin.jwt
+        read_only: true
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -964,7 +1084,15 @@ services:
       lakekeeper-authz-init:
         condition: service_completed_successfully
     volumes:
-      - lakehouse_oidc_tokens:/tokens:ro
+      # PR #33 review, should-fix: single-file subpath mount — this job
+      # only grants (with `admin`); the principals it grants to are
+      # already self-registered by `lakekeeper-authz-init`.
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/admin.jwt
+        volume:
+          subpath: admin.jwt
+        read_only: true
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -1038,7 +1166,14 @@ services:
       lakekeeper-authz-init:
         condition: service_completed_successfully
     volumes:
-      - lakehouse_oidc_tokens:/tokens:ro
+      # PR #33 review, should-fix: single-file subpath mount — this
+      # service only reads `dlt.jwt` (LAKEKEEPER_TOKEN_FILE below).
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/dlt.jwt
+        volume:
+          subpath: dlt.jwt
+        read_only: true
     environment:
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
@@ -1317,7 +1452,15 @@ services:
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
     volumes:
-      - lakehouse_oidc_tokens:/tokens:ro
+      # PR #33 review, should-fix: single-file subpath mount — this
+      # service only reads `trino.jwt` (interpolated into
+      # iceberg.rest-catalog.oauth2.token below).
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/trino.jwt
+        volume:
+          subpath: trino.jwt
+        read_only: true
     entrypoint: ["/bin/sh", "-c"]
     # Trino's base image has no `envsubst`/`python3` (RHEL UBI, verified
     # empirically), so the catalog properties file is written directly
@@ -1460,7 +1603,15 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
     volumes:
       - lakehouse_debezium_data:/debezium/data
-      - lakehouse_oidc_tokens:/tokens:ro
+      # PR #33 review, should-fix: single-file subpath mount — this
+      # service only reads `debezium.jwt` (interpolated into
+      # debezium.sink.iceberg.token below).
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/debezium.jwt
+        volume:
+          subpath: debezium.jwt
+        read_only: true
     # Same reason `trino`'s command renders its catalog properties inline:
     # the base image has no templating tool, so `sh` interpolates this
     # container's own `environment:` values directly. `$$` stops compose's
