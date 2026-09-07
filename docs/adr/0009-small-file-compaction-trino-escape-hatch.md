@@ -34,6 +34,39 @@ single-partition `COUNT` with the Iceberg metadata cache disabled) than a
 1-file/partition control with identical row totals — far past the plan's
 2x threshold.
 
+### Correction after re-measuring on 26.8 — the decision holds, the reason above does not
+
+Everything above was measured on 26.3. Re-run on `26.8.2.7`
+([`docs/plans/CLICKHOUSE-26.8-REMEASUREMENT.md`](../plans/CLICKHOUSE-26.8-REMEASUREMENT.md)),
+two of the three premises changed:
+
+- **The `OPTIMIZE` S3 403 is fixed.** It returns OK on 26.8.
+- **`remove_orphan_files` now exists** and works.
+- (And `expire_snapshots`, the one verb that *did* work on 26.3, is now
+  explicitly refused for catalog-backed tables.)
+
+So "OPTIMIZE fails with a 403" is no longer true and must not be cited as the
+reason for this ADR.
+
+**The decision is unchanged, because the real reason was never the 403.**
+Measured on 26.8: seven Parquet data files in a single day partition,
+`OPTIMIZE` returns OK, and **seven files remain**. ClickHouse's `OPTIMIZE`
+merges *position-delete* files into data files; it does not bin-pack small
+data files, and never claimed to — the original task brief said plainly
+"NOT available in ClickHouse: bin-pack rewrite of small data files."
+
+The 403 masked that on 26.3: a command that errors and a command that
+succeeds without compacting are indistinguishable from the outside if you
+only check the exit status. The correct statement of this ADR's premise is:
+
+> ClickHouse has no bin-pack rewrite of small Iceberg data files at any
+> version tested, so the small-file degradation G3 measured has no in-engine
+> remedy.
+
+That is a capability gap rather than a defect, which makes it *less* likely
+to disappear in a future release — if anything it strengthens the case for
+the escape hatch rather than weakening it.
+
 ## Decision
 
 **Add Trino as a cron-driven compaction runner, scoped to Bronze only.**

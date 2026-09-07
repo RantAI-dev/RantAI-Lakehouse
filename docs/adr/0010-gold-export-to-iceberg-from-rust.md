@@ -58,6 +58,40 @@ vended credentials.
   reproducible from a clean stack with the versions recorded in
   `G1-RESULT.md`.
 
+## Correction after re-measuring on 26.8 — decision re-based, not reverted
+
+This ADR's original premise was that ClickHouse **crashed the server** on
+`INSERT` into a partitioned catalog-registered Iceberg table. Re-measured on
+`26.8.2.7`
+([`docs/plans/CLICKHOUSE-26.8-REMEASUREMENT.md`](../plans/CLICKHOUSE-26.8-REMEASUREMENT.md)):
+
+- **The segfault is fixed.** `INSERT` into a partitioned catalog table
+  succeeds and the rows read back.
+- `INSERT` into an unpartitioned catalog table also works (was `Code 1000`).
+
+So the crash-based justification is gone, and it would be wrong to keep
+citing it.
+
+**The decision still stands on a narrower basis.** `CREATE TABLE` inside a
+`DataLakeCatalog` database is **unchanged on 26.8** — it still falls back to
+MergeTree and fails `Code 79`, and the catalog is never contacted (verified
+via the catalog's own REST API: the namespace is not created). ClickHouse can
+now *append to* a catalog-registered table it did not create, but still
+cannot *create* one.
+
+Gold export needs both. The Rust path does both, is proven end to end by
+G1(a), and does not depend on an experimental setting. Restating the premise
+honestly:
+
+> Gold export happens in Rust because ClickHouse cannot create
+> catalog-registered Iceberg tables — not because it crashes on insert, which
+> was true on 26.3 and is not on 26.8.
+
+**Consequence worth naming:** the "ClickHouse only for compute" constraint is
+now *less* strained than when this ADR was written. If a future version fixes
+catalog `CREATE TABLE`, the whole export could move engine-side and this ADR
+should be revisited rather than assumed permanent.
+
 ## Not decided here (as of the original decision — now built; see below)
 
 When Gold export is built. It is not on the P0–P6 critical path — no gate
