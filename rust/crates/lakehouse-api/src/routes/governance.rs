@@ -26,6 +26,7 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::support::{js_error, str_col};
 use crate::state::AppState;
+use crate::tenant::{TENANT_ID, TENANT_SITE};
 use lakehouse_dagster::{DgClient, DgError, iso_from_unix_seconds, map_run_status};
 
 /// The four recognized `governance/{kind}` values. Ported from the `if
@@ -198,7 +199,7 @@ async fn audit(dagster: &DgClient) -> Result<Value, GovError> {
                 "at": r.start_time.map_or_else(String::new, iso_from_unix_seconds),
                 "actor": "Dagster",
                 "actorKind": "service",
-                "tenant": "dispar-dki",
+                "tenant": TENANT_ID.as_str(),
                 "action": format!("pipeline {}: {}", map_run_status(&r.status), r.job_name),
                 "resource": r.job_name,
                 "outcome": if r.status == "FAILURE" { "error" } else { "success" },
@@ -246,9 +247,9 @@ async fn classification(ch: &ChClient, pg: Option<&PgPool>) -> Result<Value, Gov
 async fn residency(pg: Option<&PgPool>) -> Result<Value, GovError> {
     let mut residency: Vec<Value> = vec![json!({
         "id": "res-dispar-dki",
-        "tenant": "dispar-dki",
+        "tenant": TENANT_ID.as_str(),
         "classification": "internal",
-        "approvedSites": ["Depok (187)"],
+        "approvedSites": [TENANT_SITE.as_str()],
         "crossSiteAllowed": false,
         "allowedOutput": "on-premise DKI",
         "violations7d": 0,

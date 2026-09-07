@@ -4,32 +4,26 @@ This document covers running the backend stack locally with `docker
 compose`, backing up/restoring Postgres, and the operational traps in this
 codebase worth knowing about before you run it against real data.
 
-## Dockerfile note: `rust/Dockerfile.api` vs `rust/Dockerfile`
+## Dockerfile note: `rust/Dockerfile`
 
-`docker-compose.yml` builds `lakehouse-api` from **`rust/Dockerfile.api`**,
-not `rust/Dockerfile`. This is deliberate, and temporary.
+`docker-compose.yml` builds `lakehouse-api` from `rust/Dockerfile`. This
+file used to fork into two competing versions — a committed
+`rust/Dockerfile` pinned to `rust:1.85-slim` that never copied
+`rust/migrations/` into the build context, and a separate
+`rust/Dockerfile.api` that fixed the same clean-clone build problem —
+they have since been converged onto this single file, and
+`Dockerfile.api` is gone.
 
-The committed `rust/Dockerfile` pinned `rust:1.85-slim` and never copied
-`rust/migrations/` into the build context, which broke a clean-clone build
-two ways: `Cargo.lock` requires a toolchain new enough for `time@0.3.55`
-(rustc >= 1.88 — see the `rust-toolchain.toml` `channel = "1.96.1"` pin,
-which is what the workspace actually builds with), and `sqlx::migrate!
+The old committed `rust/Dockerfile` broke a clean-clone build two ways:
+`Cargo.lock` requires a toolchain new enough for `time@0.3.55` (rustc
+>= 1.88 — see the `rust-toolchain.toml` `channel = "1.96.1"` pin, which
+is what the workspace actually builds with), and `sqlx::migrate!
 ("../../migrations")` in `lakehouse-store/src/lib.rs` embeds the
 migrations directory at *compile* time, so it must exist in the build
-context or `cargo build` fails outright.
-
-`rust/Dockerfile.api` is a new file that fixes both: it pins
-`rust:1.96.1-slim` to match `rust-toolchain.toml`, and adds `COPY
-migrations ./migrations` before the build step.
-
-Separately, `rust/Dockerfile` itself has **in-progress, uncommitted edits
-by another author** that fix this same problem a different way. That file
-was intentionally left untouched here rather than edited, to avoid
-entangling two authors' changes in one file. **Once that author's fix
-lands as a commit, `rust/Dockerfile.api` and `rust/Dockerfile` should be
-converged into one file** (most likely: delete `Dockerfile.api` and point
-compose back at `Dockerfile`) rather than maintained in parallel
-indefinitely.
+context or `cargo build` fails outright. The current `rust/Dockerfile`
+pins `rust:1.96.1-slim` to match `rust-toolchain.toml`, copies
+`migrations/` into the build context before the build step, installs
+`sqlx-cli`, and uses `entrypoint.api.sh` to apply migrations at boot.
 
 ## Local stack: what's in `docker-compose.yml`
 

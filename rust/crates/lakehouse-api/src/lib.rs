@@ -30,3 +30,4 @@ pub mod json;
 pub mod policy;
 pub mod routes;
 pub mod state;
+pub mod tenant;

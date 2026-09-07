@@ -158,12 +158,16 @@ cargo deny check licenses
 
 ### Rust toolchain / MSRV
 
-The workspace declares `rust-version = "1.85"` in `rust/Cargo.toml` — that's
-the minimum edition-2024-capable toolchain this code promises to compile
-on. `rust/rust-toolchain.toml` pins the toolchain actually used for local
-dev/CI (currently `1.96.1`, newer than the MSRV floor) so contributors and
-CI build with the same compiler; `rustup` will fetch it automatically the
-first time you run `cargo` inside `rust/`.
+The workspace declares `rust-version = "1.88"` in `rust/Cargo.toml` — that's
+the real floor this code has been verified to compile on (`Cargo.lock`
+pulls in `time@0.3.55`, which needs rustc >= 1.88, plus
+`testcontainers`/`etcetera`/`ferroid` transitively pushing past the raw
+edition-2024 minimum of `1.85`; see `rust/Cargo.toml`'s comment and
+`docs/CI.md` for how that was verified). `rust/rust-toolchain.toml` pins
+the toolchain actually used for local dev/CI (currently `1.96.1`, newer
+than the MSRV floor) so contributors and CI build with the same compiler;
+`rustup` will fetch it automatically the first time you run `cargo` inside
+`rust/`.
 
 ## Configuration
 
@@ -224,10 +228,6 @@ setup instructions (Okta, Entra, Google, Keycloak).
 This is a young, honestly-scoped project. Please read this before filing an
 issue about any of the following — they're known, not bugs:
 
-- **`rust/Dockerfile` does not currently build from a clean clone**
-  (wrong rustc pin + a `pub mod tenant;` in `lib.rs` whose source file
-  isn't committed yet). See the "KNOWN BLOCKER" section at the top of
-  [docs/OPERATIONS.md](docs/OPERATIONS.md) for the exact errors and status.
 - **`streaming` is mocked.** There is no Kafka/Redpanda/Pulsar/Flink
   anywhere in this project. The streaming domain in the UI is backed by
   `src/services/mock/streaming.ts`.

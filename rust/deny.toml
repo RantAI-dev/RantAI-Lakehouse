@@ -29,7 +29,18 @@ targets = []
 # published no fix ("No safe upgrade is available!" per the advisory) —
 # `cargo update -p rsa --dry-run` confirms 0.9.10 is already latest.
 # Re-evaluate when RustCrypto/RSA ships a constant-time implementation.
-ignore = ["RUSTSEC-2023-0071"]
+#
+# RUSTSEC-2024-0436 (`paste` is no longer maintained): an *unmaintained*
+# advisory, not a vulnerability — there is no CVE and no exploit path, only a
+# dead upstream. It arrives transitively and unavoidably:
+#
+#   paste (proc-macro) <- parquet <- iceberg <- lakehouse-iceberg
+#
+# `paste` is a proc-macro, so it runs at compile time and is not linked into
+# any shipped binary. Removing it would mean dropping `iceberg`, which is the
+# whole point of this workspace. Re-evaluate when arrow/parquet drops the
+# dependency or upstream transfers maintenance.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2024-0436"]
 
 [licenses]
 version = 2

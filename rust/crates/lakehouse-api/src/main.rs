@@ -14,6 +14,7 @@ mod json;
 mod policy;
 mod routes;
 mod state;
+mod tenant;
 
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;
@@ -33,6 +34,24 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env().context("failed to resolve configuration from environment")?;
     let port = config.port;
     let state = AppState::new(config);
+
+    // Bring the OLTP schema up to date before serving. `migrate` is idempotent
+    // (`sqlx` records applied versions in `_sqlx_migrations`), so this is safe
+    // on every boot.
+    //
+    // A failure is logged rather than fatal, matching the reasoning on
+    // `AppState::pg`: the Phase 1 routes (catalog, overview, query, storage)
+    // only need ClickHouse and Dagster, and an unreachable Postgres must not
+    // take the whole console down. The Phase 2 routes then degrade to 503 via
+    // `StoreError::Unavailable` instead of serving an empty schema.
+    if let Some(pool) = state.pg.as_ref() {
+        match lakehouse_store::migrate(pool).await {
+            Ok(()) => tracing::info!("database migrations applied"),
+            Err(err) => tracing::error!(%err, "failed to apply database migrations"),
+        }
+    } else {
+        tracing::warn!("no Postgres pool configured; Phase 2 routes will be unavailable");
+    }
 
     // Task 3.2: idempotently seed the one bootstrap admin, from
     // `AUTH_BOOTSTRAP_EMAIL`/`AUTH_BOOTSTRAP_PASSWORD` — see
