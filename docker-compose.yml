@@ -441,12 +441,34 @@ services:
       AWS_DEFAULT_REGION: us-east-1
       AWS_EC2_METADATA_DISABLED: "true"
     entrypoint: ["/bin/sh", "-c"]
+    # Retries instead of trying once. `seaweedfs`'s healthcheck curls
+    # 127.0.0.1 from INSIDE its own container, which proves something in
+    # that container speaks HTTP — not that the S3 listener is reachable
+    # from a peer container. `server -s3` brings up master/volume/filer/s3
+    # in sequence, so there is a window where the healthcheck passes and a
+    # peer still gets "Could not connect to the endpoint URL" (observed:
+    # this job failed on one branch and passed on another with identical
+    # code). Widening the healthcheck cannot close that window from inside;
+    # retrying from the client side does.
     command:
-      - >
-        aws --endpoint-url http://seaweedfs:8333 s3api head-bucket
-        --bucket ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse} 2>/dev/null ||
-        aws --endpoint-url http://seaweedfs:8333 s3api create-bucket
-        --bucket ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
+      - |
+        set -eu
+        bucket="${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}"
+        endpoint="http://seaweedfs:8333"
+        for attempt in $$(seq 1 30); do
+          if aws --endpoint-url "$$endpoint" s3api head-bucket --bucket "$$bucket" 2>/dev/null; then
+            echo "bucket $$bucket already present"; exit 0
+          fi
+          if aws --endpoint-url "$$endpoint" s3api create-bucket --bucket "$$bucket" 2>/dev/null; then
+            echo "created bucket $$bucket"; exit 0
+          fi
+          echo "seaweedfs S3 not usable yet (attempt $$attempt/30), retrying" >&2
+          sleep 2
+        done
+        echo "seaweedfs S3 endpoint never became usable after 60s" >&2
+        # One last unsuppressed attempt so the actual AWS CLI error is in
+        # the logs rather than swallowed by 2>/dev/null.
+        aws --endpoint-url "$$endpoint" s3api create-bucket --bucket "$$bucket"
     restart: "no"
 
   # P2 (G2) — mirrors `lakekeeper-warehouse-init` exactly (same bootstrap +
