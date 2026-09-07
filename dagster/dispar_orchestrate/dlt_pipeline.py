@@ -215,7 +215,21 @@ def run_bronze_ingest(config: BronzeIngestConfig | None = None) -> dict[str, Any
     resource = source.resources[cfg.source_table]
     resource.apply_hints(table_name=cfg.bronze_table_name)
     resource.add_map(_stamp_ingested_at)
-    iceberg_adapter(resource, partition=[iceberg_partition.day("_ingested_at")])
+    iceberg_adapter(
+        resource,
+        partition=[iceberg_partition.day("_ingested_at")],
+        # PR #29 review: format-version 2 was claimed "confirmed" without
+        # ever being set or asserted. dlt's iceberg destination does not
+        # default this itself (pyiceberg's own table-creation default is
+        # already v2, but that is pyiceberg's default, not a guarantee this
+        # pipeline makes) — set it explicitly, at table-creation time, so
+        # the guarantee is this module's own rather than inherited
+        # incidentally from whatever pyiceberg happens to default to.
+        # `ops/g3a/g3a_test.py::step_verify_format_version_2` asserts this
+        # against the catalog's own REST metadata, not against what dlt
+        # reports back.
+        table_properties={"format-version": "2"},
+    )
 
     pipeline = dlt.pipeline(
         pipeline_name=f"bronze_ingest_{cfg.bronze_table_name}",

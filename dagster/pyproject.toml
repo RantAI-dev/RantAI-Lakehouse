@@ -11,6 +11,13 @@ dependencies = [
     "dagster-webserver==1.13.20",
     "dagster-postgres==0.29.20",
     "dlt[pyiceberg,s3,postgres]==1.30.0",
+    # dlt[pyiceberg]==1.30.0 pulls pyiceberg via a range (>=0.9.1); pin the
+    # exact version it currently resolves to (verified with `pip install
+    # --dry-run "dlt[pyiceberg]==1.30.0"`) so this repro's own promise of
+    # exact pins (this file's own comment above) actually covers the
+    # library `dlt_pipeline.py`/`ops/g3/g3_loadgen.py` both depend on
+    # directly, not just `dlt` itself.
+    "pyiceberg==0.12.0",
     "psycopg2-binary==2.9.10",
     "sqlalchemy==2.0.36",
     "requests==2.32.3",
