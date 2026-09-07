@@ -11,7 +11,7 @@ auto-names the one repository this code location exposes `__repository__`
 from dagster import Definitions
 
 from dispar_orchestrate.assets import bronze_ingest_job
-from dispar_orchestrate.gold_export import gold_export_job, gold_export_schedule
+from dispar_orchestrate.gold_export import gold_export_job
 from dispar_orchestrate.maintenance import bronze_maintenance_job, bronze_maintenance_schedule
 from dispar_orchestrate.replication_metrics import (
     replication_slot_check_job,
@@ -28,9 +28,15 @@ from dispar_orchestrate.replication_metrics import (
 # not new top-level directories").
 defs = Definitions(
     jobs=[bronze_ingest_job, bronze_maintenance_job, replication_slot_check_job, gold_export_job],
+    # `gold_export_job` is registered WITHOUT a schedule: it cannot
+    # authenticate yet (`POST /api/gold/export/{mart}` is
+    # `Policy::RequiresAuth`, enforced before the handler's own run-token
+    # check), so a nightly schedule would 401 silently. See `gold_export.py`
+    # for the full reasoning and how to restore the schedule once the job
+    # has a service identity. The job stays registered so it remains
+    # launchable on demand.
     schedules=[
         bronze_maintenance_schedule,
         replication_slot_check_schedule,
-        gold_export_schedule,
     ],
 )

@@ -79,6 +79,23 @@ jobs:
       - name: Check for bare count() against Bronze Iceberg tables
         run: python3 ops/lint/check_bare_iceberg_count.py
 
+  dagster-intra-package-imports:
+    name: Dagster · intra-package imports resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # A dangling `from dispar_orchestrate.X import Y` is an ImportError at
+      # code-location load, which takes down EVERY job in the location — the
+      # visible symptom is G3a failing with "'bronze_ingest_job' not in
+      # GET /api/pipelines", which points nowhere near the cause. `py_compile`
+      # cannot catch it (per-file syntax only, no import resolution). See
+      # ops/lint/check_intra_package_imports.py for the limits of this check.
+      - name: Check intra-package imports
+        run: python3 ops/lint/check_intra_package_imports.py
+
   # ── Rust: fast feedback ──────────────────────────────────────────────
   fmt:
     name: Rust · fmt
