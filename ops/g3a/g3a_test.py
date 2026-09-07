@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """G3a end-to-end acceptance test — `docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md`
 §3: dlt, running inside Dagster, reads a real Postgres table and writes it
-to Bronze Iceberg through Lakekeeper; the result is visible in the console
-catalog, and lineage is recorded.
+to Bronze Iceberg through Lakekeeper at format-version 2; the result is
+visible in the console catalog, the run is audited, and the dataset is
+traceable through the console's lineage surface.
 
 Run inside the compose network (the `g3a-test-runner` service in
 `docker-compose.yml`), the same reason `g1_lakekeeper.rs`'s G1 test and
@@ -238,10 +239,94 @@ def step_verify_catalog_visibility() -> None:
     print(f"[g3a] {slug!r} is visible in GET /api/catalog")
 
 
-def step_verify_lineage_recorded() -> None:
-    """The run is recorded as an audit/lineage event via the EXISTING
-    governance/audit surface (Dagster runs), per the task brief's "do not
-    invent a parallel mechanism.\""""
+def _mint_lakekeeper_read_token() -> str | None:
+    """Mint a short-lived bearer token from `ops/oidc-mock`'s
+    client-credentials endpoint (see that module's own doc: it exists so
+    ClickHouse's `oauth_server_uri` has something to call, but any
+    `TOKEN_ENDPOINT_PRINCIPAL` client_id works the same way) so this test
+    can call Lakekeeper's REST catalog directly, the same identity
+    ClickHouse's read path already authenticates as. Returns `None` on a
+    pre-R1 or authz-disabled stack (`CH_OAUTH_CLIENT_ID` unset there too),
+    where `step_verify_format_version_2` degrades to a skip rather than a
+    failure."""
+    if not CH_OAUTH_CLIENT_ID:
+        return None
+    resp = requests.post(
+        CH_OAUTH_SERVER_URI, data={"client_id": CH_OAUTH_CLIENT_ID}, timeout=10
+    )
+    if not resp.ok:
+        raise G3aFailure(f"minting a Lakekeeper read token failed: {resp.status_code} {resp.text}")
+    token = resp.json().get("access_token")
+    if not token:
+        raise G3aFailure(f"token endpoint returned no access_token: {resp.json()}")
+    return token
+
+
+def step_verify_format_version_2() -> None:
+    """PR #29 review: the body claimed format-version 2 was "confirmed"
+    while `dlt_pipeline.py` never set it and nothing asserted it. This
+    reads the table's OWN metadata straight from Lakekeeper's Iceberg REST
+    catalog (`GET /v1/{prefix}/namespaces/bronze/tables/{table}`, the
+    exact spec surface `iceberg-rust`'s `table.metadata().format_version()`
+    reads from on the Rust side — see `lakehouse-iceberg/tests/
+    g1_lakekeeper.rs`) — never through ClickHouse and never by trusting
+    what dlt's own `load_info` reports back, since dlt reporting success
+    says nothing about what property value actually landed in the
+    catalog's metadata document."""
+    token = _mint_lakekeeper_read_token()
+    if not token:
+        print(
+            "[g3a] no CH_OAUTH_CLIENT_ID set (pre-R1/authz-disabled stack) — "
+            "skipping the direct REST format-version check"
+        )
+        return
+    headers = {"Authorization": f"Bearer {token}"}
+    config_resp = requests.get(
+        f"{LAKEKEEPER_CATALOG_URI}/v1/config",
+        params={"warehouse": LAKEKEEPER_WAREHOUSE},
+        headers=headers,
+        timeout=10,
+    )
+    if not config_resp.ok:
+        raise G3aFailure(f"catalog /v1/config failed: {config_resp.status_code} {config_resp.text}")
+    config_body = config_resp.json()
+    prefix = {**config_body.get("defaults", {}), **config_body.get("overrides", {})}.get("prefix")
+    if not prefix:
+        raise G3aFailure(f"catalog /v1/config returned no warehouse prefix: {config_body}")
+
+    table_resp = requests.get(
+        f"{LAKEKEEPER_CATALOG_URI}/v1/{prefix}/namespaces/bronze/tables/{BRONZE_TABLE_NAME}",
+        headers=headers,
+        timeout=10,
+    )
+    if not table_resp.ok:
+        raise G3aFailure(
+            f"catalog table-metadata GET failed for bronze.{BRONZE_TABLE_NAME}: "
+            f"{table_resp.status_code} {table_resp.text}"
+        )
+    format_version = table_resp.json().get("metadata", {}).get("format-version")
+    if format_version != 2:
+        raise G3aFailure(
+            f"expected format-version 2 from the catalog's own REST metadata "
+            f"for bronze.{BRONZE_TABLE_NAME}, got {format_version!r}"
+        )
+    print(
+        f"[g3a] catalog REST metadata confirms format-version={format_version} "
+        f"for bronze.{BRONZE_TABLE_NAME}"
+    )
+
+
+def step_verify_run_audited() -> None:
+    """The run is recorded via the governance/audit surface (Dagster run
+    history) — a run-list check, distinct from lineage (see
+    `step_verify_lineage_recorded` below). PR #29 review: this step used
+    to be labeled "lineage recorded" while reading `/api/governance/audit`
+    (a run list), never `/api/governance/lineage` — that claim is corrected
+    here by naming this step for what it actually checks, and adding a
+    real lineage check alongside it rather than in place of it, since this
+    audit trail is still a real, useful assertion on its own ("do not
+    invent a parallel mechanism" — this reuses the existing audit surface,
+    exactly as before)."""
     resp = API.get(f"{API_URL}/api/governance/audit", timeout=10)
     if not resp.ok:
         raise G3aFailure(f"GET /api/governance/audit failed: {resp.status_code} {resp.text}")
@@ -249,7 +334,35 @@ def step_verify_lineage_recorded() -> None:
     resources = [a.get("resource") for a in body.get("audit", [])]
     if JOB_NAME not in resources:
         raise G3aFailure(f"no audit entry for job {JOB_NAME!r}: {resources}")
-    print(f"[g3a] run recorded in GET /api/governance/audit")
+    print("[g3a] run recorded in GET /api/governance/audit")
+
+
+def step_verify_lineage_recorded() -> None:
+    """The REAL lineage surface (PR #29 review): `GET
+    /api/governance/lineage?focus=<slug>` — `rust/crates/lakehouse-api/src/
+    routes/governance.rs::lineage_body` builds a source -> Bronze -> Silver
+    -> Gold graph from `lake.bronze_meta.dataset_catalog`, which
+    `dagster/dispar_orchestrate/bronze_catalog.py::register_bronze_table`
+    populates as part of this same G3a run (`assets.py`'s
+    `bronze_ingest_job` calls it after the dlt load succeeds). An empty
+    lineage graph for this slug means the dataset never actually became
+    traceable, whatever the audit run-list above says."""
+    slug = BRONZE_TABLE_NAME.replace("_", "-")
+    resp = API.get(f"{API_URL}/api/governance/lineage", params={"focus": slug}, timeout=10)
+    if not resp.ok:
+        raise G3aFailure(f"GET /api/governance/lineage failed: {resp.status_code} {resp.text}")
+    body = resp.json()
+    nodes = body.get("nodes", [])
+    if not nodes:
+        raise G3aFailure(f"GET /api/governance/lineage?focus={slug} returned an empty graph: {body}")
+    node_ids = [n.get("id") for n in nodes]
+    bronze_node = f"bronze.{BRONZE_TABLE_NAME}"
+    if bronze_node not in node_ids:
+        raise G3aFailure(
+            f"GET /api/governance/lineage?focus={slug} nodes {node_ids} do not "
+            f"include the Bronze node {bronze_node!r}"
+        )
+    print(f"[g3a] GET /api/governance/lineage?focus={slug} shows nodes: {node_ids}")
 
 
 def main() -> int:
@@ -260,7 +373,9 @@ def main() -> int:
         run_id = step_trigger_run_via_lakehouse_api()
         step_wait_for_run_success(run_id)
         step_verify_rows_in_clickhouse()
+        step_verify_format_version_2()
         step_verify_catalog_visibility()
+        step_verify_run_audited()
         step_verify_lineage_recorded()
     except G3aFailure as exc:
         print(f"[g3a] FAILED: {exc}", file=sys.stderr)
