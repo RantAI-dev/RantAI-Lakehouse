@@ -257,6 +257,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/connectors",             Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/connectors",             Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}",        Policy::RequiresPermission("connector:manage")),
+    // Was missing entirely while `routes::mod` registered `.delete(...)` on
+    // this pattern, so `auth_gate` classified every DELETE as unclassified and
+    // returned a hard 500 — the deny-by-default branch doing exactly its job,
+    // on a route that was simply never added here. See
+    // `tests/route_auth.rs::every_registered_route_has_a_policy_entry`.
+    ("DELETE", "/api/connectors/{id}",      Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/connectors/{id}/test",   Policy::RequiresPermission("connector:manage")),
 
     // ── Knowledge: no seeded resource — auth only. ───────────────────────
