@@ -172,7 +172,12 @@ pub async fn test_connection(
     let Some(dial_info) = dial_info else {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
     };
-    let outcome = crate::connector_probe::probe(&dial_info, state.secret_resolver.as_ref()).await;
+    let outcome = crate::connector_probe::probe(
+        &dial_info,
+        state.secret_resolver.as_ref(),
+        state.config.connector_probe_allow_internal_hosts,
+    )
+    .await;
     match connectors::record_test_result(
         pool(&state)?,
         &id,

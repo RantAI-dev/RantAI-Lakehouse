@@ -56,7 +56,28 @@ pub enum ConfigError {
 /// able to leak these into JSON logs — this repo already runs
 /// `check-no-secrets.sh` in CI because a secret leaked once.
 #[derive(Clone, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool here is an independent, unrelated env-derived toggle \
+              (SMTP_SECURE, dev-mode cookie posture, OIDC JIT provisioning, \
+              the connector-probe SSRF opt-out) — a state machine or enum \
+              would have to model every combination of a set that is not \
+              actually a state machine"
+)]
 pub struct Config {
+    /// Whether [`crate::connector_probe`] may dial private/internal address
+    /// ranges (RFC1918, loopback, link-local including the cloud metadata
+    /// endpoint, IPv6 unique-local) named by a connector's `host`.
+    ///
+    /// Default `false` — SSRF-safe by default. `POST /api/connectors` lets
+    /// the caller choose that `host`, so without this a `connector:manage`
+    /// principal gets an internal port scanner with output. This
+    /// deployment's own seeded connectors (`postgres:5432`,
+    /// `http://rustfs:9000`) ARE internal names, so the compose stack opts
+    /// out explicitly — an opt-out rather than a default, so the safe
+    /// posture is what a deployment gets unless it says otherwise. `true`
+    /// only when the env var is exactly `"true"`.
+    pub connector_probe_allow_internal_hosts: bool,
     /// `ClickHouse` HTTP interface URL. Default
     /// `"http://localhost:18123"` (`clickhouse.ts:11`, `??`).
     pub ch_url: String,
@@ -334,6 +355,10 @@ impl std::fmt::Debug for Config {
             .field("oidc_jit_provisioning", &self.oidc_jit_provisioning)
             .field("oidc_role_map", &self.oidc_role_map)
             .field("oidc_groups_claim", &self.oidc_groups_claim)
+            .field(
+                "connector_probe_allow_internal_hosts",
+                &self.connector_probe_allow_internal_hosts,
+            )
             .field("oidc_clock_skew_seconds", &self.oidc_clock_skew_seconds)
             .field("database_url", &REDACTED)
             .finish()
@@ -451,6 +476,9 @@ impl Config {
                 .is_some_and(|v| v == "true"),
             oidc_role_map: parse_role_map(env.get("OIDC_ROLE_MAP").map_or("", String::as_str)),
             oidc_groups_claim: or_default(env, "OIDC_GROUPS_CLAIM", "groups"),
+            connector_probe_allow_internal_hosts: env
+                .get("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS")
+                .is_some_and(|v| v == "true"),
             oidc_clock_skew_seconds: env
                 .get("OIDC_CLOCK_SKEW_SECONDS")
                 .and_then(|v| v.parse::<u64>().ok())
