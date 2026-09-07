@@ -339,18 +339,35 @@ async fn maintenance(ch: &ChClient) -> Result<Value, GovError> {
 /// deployment where no CDC connector has ever run, this table does not
 /// exist yet and the query fails, surfaced as the standard 503 every other
 /// `kind` already gives — not a special case.
+/// The `SELECT` behind [`replication`], pulled out so the
+/// `toString(active)` wrapping is assertable — the bug it fixes is invisible
+/// in the response shape (a slot just reads inactive) and only reproduces
+/// against a real `ClickHouse`, so a unit test on the query text is the
+/// cheapest thing that actually guards it.
+const REPLICATION_SLOTS_SQL: &str = "SELECT connector_id, slot_name, checked_at, \
+     toString(active) active, \
+     toString(wal_retained_bytes) wal_retained_bytes, \
+     toString(confirmed_flush_lag_bytes) confirmed_flush_lag_bytes, \
+     status \
+     FROM lake.`bronze_meta.replication_slot` \
+     ORDER BY checked_at DESC LIMIT 500";
+
+/// Read a `ClickHouse` boolean-ish column that has been stringified with
+/// `toString`.
+///
+/// `ClickHouse` has no `Bool` in this schema — `active` is `UInt8`, rendered
+/// in JSON as the NUMBER `1`/`0`. [`str_col`] is `Value::as_str`, which is
+/// `None` for a number, so reading such a column WITHOUT `toString` in the
+/// query silently yields `""` and therefore `false`. That is what made every
+/// replication slot show as disconnected. Wrapping in `toString` is the fix;
+/// this function is the other half of the contract, and accepts `"true"` as
+/// well so a future `Bool` column does not silently regress the same way.
+fn ch_bool(row: &serde_json::Map<String, Value>, key: &str) -> bool {
+    matches!(str_col(row, key), "1" | "true")
+}
+
 async fn replication(ch: &ChClient) -> Result<Value, GovError> {
-    let rows = ch
-        .rows(
-            "SELECT connector_id, slot_name, checked_at, active, \
-                toString(wal_retained_bytes) wal_retained_bytes, \
-                toString(confirmed_flush_lag_bytes) confirmed_flush_lag_bytes, \
-                status \
-             FROM lake.`bronze_meta.replication_slot` \
-             ORDER BY checked_at DESC LIMIT 500",
-            None,
-        )
-        .await?;
+    let rows = ch.rows(REPLICATION_SLOTS_SQL, None).await?;
     let slots: Vec<Value> = rows
         .iter()
         .map(|r| {
@@ -358,7 +375,7 @@ async fn replication(ch: &ChClient) -> Result<Value, GovError> {
                 "connectorId": str_col(r, "connector_id"),
                 "slotName": str_col(r, "slot_name"),
                 "checkedAt": str_col(r, "checked_at"),
-                "active": str_col(r, "active") == "1" || str_col(r, "active") == "true",
+                "active": ch_bool(r, "active"),
                 "walRetainedBytes": str_col(r, "wal_retained_bytes"),
                 "confirmedFlushLagBytes": str_col(r, "confirmed_flush_lag_bytes"),
                 "status": str_col(r, "status"),
@@ -719,5 +736,56 @@ mod tests {
         assert_eq!(severity_of("fail"), "high");
         assert_eq!(severity_of("warn"), "medium");
         assert_eq!(severity_of("pass"), "info");
+    }
+
+    /// The bug this guards: `active` is `UInt8`, so `ClickHouse` renders it as
+    /// a JSON NUMBER. `str_col` is `Value::as_str` -> `None` for a number ->
+    /// `""` -> false, and every replication slot showed as disconnected on
+    /// the Ingestion page, healthy ones included. Only `toString(active)` in
+    /// the query makes the value a string this can read at all.
+    #[test]
+    fn replication_query_stringifies_every_numeric_column() {
+        for col in ["active", "wal_retained_bytes", "confirmed_flush_lag_bytes"] {
+            assert!(
+                REPLICATION_SLOTS_SQL.contains(&format!("toString({col})")),
+                "{col} is numeric in ClickHouse and must be wrapped in toString(), \
+                 or str_col reads it as an empty string"
+            );
+        }
+    }
+
+    #[test]
+    fn ch_bool_reads_a_stringified_uint8() {
+        let mut row = serde_json::Map::new();
+        row.insert("active".into(), Value::from("1"));
+        assert!(ch_bool(&row, "active"));
+        row.insert("active".into(), Value::from("0"));
+        assert!(!ch_bool(&row, "active"));
+        // A future Bool column stringifies as "true"/"false".
+        row.insert("active".into(), Value::from("true"));
+        assert!(ch_bool(&row, "active"));
+        row.insert("active".into(), Value::from("false"));
+        assert!(!ch_bool(&row, "active"));
+    }
+
+    /// The failure mode itself: an UNWRAPPED numeric column arrives as a JSON
+    /// number and reads false, whatever its real value. This asserts the
+    /// broken behaviour deliberately, so the reason the query must wrap the
+    /// column is documented in an executable form rather than only in a
+    /// comment.
+    #[test]
+    fn ch_bool_cannot_read_a_bare_numeric_column() {
+        let mut row = serde_json::Map::new();
+        row.insert("active".into(), Value::from(1));
+        assert!(
+            !ch_bool(&row, "active"),
+            "a bare UInt8 arrives as a JSON number and is unreadable as a string — \
+             this is why the query wraps it"
+        );
+    }
+
+    #[test]
+    fn ch_bool_is_false_for_a_missing_column() {
+        assert!(!ch_bool(&serde_json::Map::new(), "active"));
     }
 }
