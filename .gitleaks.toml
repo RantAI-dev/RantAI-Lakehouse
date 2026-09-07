@@ -71,3 +71,7 @@ paths = [
   '''^\.gitleaks\.toml$''',
   '''^docs/CI\.md$''',
 ]
+
+[[allowlists]]
+description = "SeaweedFS STS signing key for the G2 storage-compatibility matrix: ops/seaweedfs/iam.json. Local/CI only — it base64-decodes to the literal string 'p2-matrix-local-only-signing-key-not-a-secret' and sits alongside the seaweedfsadmin/seaweedfsadmin credentials that mirror RustFS's own well-known defaults. SeaweedFS requires a literal signingKey in its IAM config file, so this cannot be env-driven."
+regexes = ['''cDItbWF0cml4LWxvY2FsLW9ubHktc2lnbmluZy1rZXktbm90LWEtc2VjcmV0''']
