@@ -307,6 +307,45 @@ pub struct Config {
     /// `x-run-token` header/`?token=` is required; with it unset, only a
     /// service-identity principal is let through. `None` when unset.
     pub gold_export_run_token: Option<String>,
+    /// Hard cap on how many source rows a single `POST
+    /// /api/gold/export/{mart}` call will export (code-review fix: the
+    /// prior implementation read an entire mart into memory with no limit
+    /// at all, and a large mart could OOM the whole API process — not
+    /// just the export request, every route it serves). Checked against
+    /// `ClickHouse`'s `count()` for the source table BEFORE any row data
+    /// is read (`gold_export::export_mart`); a mart over the cap fails
+    /// the export outright with an error naming both the mart and the cap,
+    /// rather than silently truncating — silent truncation would publish
+    /// a partial mart to Iceberg as if it were the complete one, which is
+    /// worse than refusing. Not parsed as a genuinely load-bearing value
+    /// (like [`Self::port`]): an unparsable override falls back to the
+    /// default rather than failing config resolution, same posture as
+    /// [`Self::oidc_clock_skew_seconds`]. Default `5_000_000`.
+    pub gold_export_max_rows: u64,
+    /// How many source rows `gold_export::export_mart` reads from
+    /// `ClickHouse` and appends to Iceberg per batch, instead of
+    /// materializing the whole mart at once (the same OOM defect
+    /// [`Self::gold_export_max_rows`] documents). Each batch is one
+    /// `SELECT ... LIMIT n OFFSET n FORMAT JSON` round trip and one
+    /// `GoldTable::append` (one new Parquet file/snapshot). Same
+    /// non-load-bearing parsing posture as
+    /// [`Self::gold_export_max_rows`]. Default `20_000`.
+    pub gold_export_batch_size: u64,
+    /// Whether `crate::connector_probe` is allowed to dial private/internal
+    /// address ranges (RFC1918, loopback, link-local incl. cloud metadata
+    /// endpoints, IPv6 unique-local) named by a connector's `host`.
+    ///
+    /// Default `false` — SSRF-safe by default: a connector `/test` probe
+    /// resolves `host` and refuses to dial it if any resolved address falls
+    /// in a blocked range. This deployment's OWN seeded connectors
+    /// (`postgres:5432`, `http://rustfs:9000` —
+    /// `rust/migrations/0022_prune_connector_seed.sql`) are themselves
+    /// internal-network names, so a compose stack that wants those `/test`
+    /// buttons to work must set `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true`
+    /// explicitly — an opt-out, not the default, so the safe posture is
+    /// what a deployment gets unless it says otherwise. `true` only when
+    /// this env var is exactly `"true"`.
+    pub connector_probe_allow_internal_hosts: bool,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -397,6 +436,12 @@ impl std::fmt::Debug for Config {
                 "gold_export_run_token",
                 &self.gold_export_run_token.as_ref().map(|_| REDACTED),
             )
+            .field("gold_export_max_rows", &self.gold_export_max_rows)
+            .field("gold_export_batch_size", &self.gold_export_batch_size)
+            .field(
+                "connector_probe_allow_internal_hosts",
+                &self.connector_probe_allow_internal_hosts,
+            )
             .finish()
     }
 }
@@ -411,6 +456,17 @@ fn or_default(env: &HashMap<String, String>, key: &str, default: &str) -> String
 /// when `key` is absent *or* present-but-empty.
 fn truthy(env: &HashMap<String, String>, key: &str) -> Option<String> {
     env.get(key).filter(|v| !v.is_empty()).cloned()
+}
+
+/// Parses `key` as a `u64`, falling back to `default` when absent or
+/// unparseable. Same non-load-bearing posture as
+/// [`Config::oidc_clock_skew_seconds`]: a garbage override must not fail
+/// config resolution, only silently keep the documented default. Used by
+/// [`Config::gold_export_max_rows`]/[`Config::gold_export_batch_size`].
+fn parse_u64_or_default(env: &HashMap<String, String>, key: &str, default: u64) -> u64 {
+    env.get(key)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
 /// Parse `OIDC_ROLE_MAP`'s `"group1=Role One,group2=Role Two"` format into
@@ -547,6 +603,11 @@ impl Config {
             ),
             gold_source_schema: or_default(env, "GOLD_SOURCE_SCHEMA", "serving"),
             gold_export_run_token: truthy(env, "GOLD_EXPORT_RUN_TOKEN"),
+            gold_export_max_rows: parse_u64_or_default(env, "GOLD_EXPORT_MAX_ROWS", 5_000_000),
+            gold_export_batch_size: parse_u64_or_default(env, "GOLD_EXPORT_BATCH_SIZE", 20_000),
+            connector_probe_allow_internal_hosts: env
+                .get("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS")
+                .is_some_and(|v| v == "true"),
         })
     }
 
@@ -656,6 +717,49 @@ mod tests {
         );
         assert_eq!(cfg.gold_source_schema, "serving");
         assert_eq!(cfg.gold_export_run_token, None);
+        assert_eq!(cfg.gold_export_max_rows, 5_000_000);
+        assert_eq!(cfg.gold_export_batch_size, 20_000);
+        // Safe-by-default: SSRF blocking is ON unless explicitly disabled.
+        assert!(!cfg.connector_probe_allow_internal_hosts);
+    }
+
+    #[test]
+    fn gold_export_max_rows_and_batch_size_are_overridable() {
+        let env = map(&[
+            ("GOLD_EXPORT_MAX_ROWS", "123"),
+            ("GOLD_EXPORT_BATCH_SIZE", "7"),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.gold_export_max_rows, 123);
+        assert_eq!(cfg.gold_export_batch_size, 7);
+    }
+
+    /// Same non-load-bearing posture as `OIDC_CLOCK_SKEW_SECONDS`: a
+    /// garbage override must not fail config resolution — it falls back to
+    /// the documented default instead.
+    #[test]
+    fn invalid_gold_export_row_settings_fall_back_to_defaults_instead_of_erroring() {
+        let env = map(&[
+            ("GOLD_EXPORT_MAX_ROWS", "not-a-number"),
+            ("GOLD_EXPORT_BATCH_SIZE", "also-not-a-number"),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.gold_export_max_rows, 5_000_000);
+        assert_eq!(cfg.gold_export_batch_size, 20_000);
+    }
+
+    /// The compose stack's documented opt-out — only the literal string
+    /// `"true"` flips the default, matching every other boolean flag in
+    /// this config (`OIDC_JIT_PROVISIONING`, `SMTP_SECURE`).
+    #[test]
+    fn connector_probe_allow_internal_hosts_requires_the_literal_string_true() {
+        let cfg =
+            Config::from_map(&map(&[("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS", "yes")])).unwrap();
+        assert!(!cfg.connector_probe_allow_internal_hosts);
+
+        let cfg =
+            Config::from_map(&map(&[("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS", "true")])).unwrap();
+        assert!(cfg.connector_probe_allow_internal_hosts);
     }
 
     #[test]

@@ -36,7 +36,12 @@ lakehouse-iceberg = { path = "../lakehouse-iceberg" }
 iceberg = "=0.10.1"
 rand = { workspace = true }
 axum = { workspace = true }
-tokio = { workspace = true }
+# `sync` (Mutex/OnceCell/Barrier): explicit here, not left to incidental
+# workspace feature unification, because `gold_lock::MartLocks`
+# (`tokio::sync::Mutex`/`OwnedMutexGuard`) and its tests
+# (`tokio::sync::Barrier`) need it directly, and this crate should compile
+# correctly on its own, not only as part of the whole-workspace build.
+tokio = { workspace = true, features = ["sync"] }
 tower = { workspace = true }
 tower-http = { workspace = true }
 reqwest = { workspace = true }

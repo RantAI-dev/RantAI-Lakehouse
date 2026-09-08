@@ -24,6 +24,48 @@
 //! is the one place a `ClickHouse` type name is translated to an Iceberg
 //! [`iceberg::spec::Type`]; unsupported types fail the export loudly
 //! rather than silently dropping or mis-typing a column.
+//!
+//! # Why batches, a row cap, and `toTimeZone(..., 'UTC')` — three code-review fixes
+//!
+//! [`export_mart`] used to read an entire mart into memory in one
+//! `ClickHouse` response, then build one Arrow `RecordBatch` from all of
+//! it, then hand that whole batch to the Parquet writer — three full
+//! copies of the mart alive at once, with no limit on how big the mart
+//! could be. A large mart OOMs the whole `lakehouse-api` process, taking
+//! down every other route it serves, not just this export. Three fixes,
+//! all in this module:
+//!
+//! 1. **A hard row cap, checked before any row data is read.**
+//!    [`export_mart`] first runs `SELECT count() FROM <mart>` and compares
+//!    it against `GOLD_EXPORT_MAX_ROWS`
+//!    (`crate::config::Config::gold_export_max_rows`); a mart over the cap
+//!    fails with [`GoldExportError::RowCapExceeded`], naming both the mart
+//!    and the cap, rather than silently truncating — truncating would
+//!    publish a partial mart to Iceberg as though it were complete, which
+//!    is a worse failure than refusing outright.
+//! 2. **Bounded batches, not one whole-mart materialization.** Rows are
+//!    read `GOLD_EXPORT_BATCH_SIZE`
+//!    (`crate::config::Config::gold_export_batch_size`) at a time
+//!    (`SELECT ... LIMIT n OFFSET n FORMAT JSON`) and appended to Iceberg
+//!    per batch (one `GoldTable::append` — one new Parquet file/snapshot —
+//!    per batch), so peak memory is bounded by one batch, not the whole
+//!    mart. This is `LIMIT`/`OFFSET` pagination over repeated HTTP
+//!    requests, not a single streaming response — a true single-pass
+//!    streaming rewrite (reading `ClickHouse`'s `FORMAT JSONEachRow` as an
+//!    incremental byte stream) would remove the pagination-stability
+//!    caveat below, but requires a new streaming response mode on
+//!    `lakehouse-clickhouse::ChClient` (which today always buffers a full
+//!    response body — see that crate's `query`); this build accepts the
+//!    caveat instead of taking on that broader change. Every batch query
+//!    also carries an explicit `ORDER BY` over every source column (see
+//!    [`export_mart`]'s "why `ORDER BY` every column" note) so that, absent
+//!    concurrent writes to the SOURCE mart during the export (a separate
+//!    concern from the single-flight guard on concurrent EXPORTS —
+//!    `crate::gold_lock` — which only serializes callers of THIS API, not
+//!    whatever else may be writing into `ClickHouse`), each `OFFSET` page
+//!    reads a stable, non-overlapping slice.
+//! 3. **`toTimeZone(col, 'UTC')` instead of blindly appending `Z`.** See
+//!    [`select_projection`]'s doc comment.
 
 use std::sync::Arc;
 
@@ -64,6 +106,25 @@ pub enum GoldExportError {
     /// The Iceberg catalog/write path failed.
     #[error("Iceberg export failed: {0}")]
     Iceberg(#[from] IcebergError),
+    /// The source mart has more rows than `GOLD_EXPORT_MAX_ROWS` allows.
+    /// Refusing outright — rather than exporting the first `max_rows` rows
+    /// and calling it done — is deliberate: a silently truncated mart in
+    /// Iceberg looks complete to every downstream reader, and there is no
+    /// way for them to tell it isn't. See the module doc comment's "Why
+    /// batches, a row cap, ..." section.
+    #[error(
+        "mart {mart:?} has {row_count} rows, exceeding GOLD_EXPORT_MAX_ROWS \
+         ({cap}); refusing to export a partial mart silently — raise \
+         GOLD_EXPORT_MAX_ROWS or export a smaller mart"
+    )]
+    RowCapExceeded {
+        /// The mart name the cap was checked against.
+        mart: String,
+        /// The source mart's actual row count (`SELECT count()`).
+        row_count: u64,
+        /// The configured `GOLD_EXPORT_MAX_ROWS` value.
+        cap: u64,
+    },
 }
 
 /// One column's resolved Iceberg + Arrow shape, plus enough to parse a
@@ -233,6 +294,25 @@ fn cell_as_date_days(row: &Map<String, Value>, name: &str) -> Result<Option<i32>
 
 /// Microseconds since the Unix epoch for a `ClickHouse`
 /// `DateTime`/`DateTime64` string (`"YYYY-MM-DD HH:MM:SS[.ffffff]"`).
+///
+/// # Why appending `Z` is safe HERE and was not before
+///
+/// This function still appends a literal `Z` when the string carries no
+/// offset of its own — but by the time a value reaches this function, it
+/// was read through [`select_projection`]'s `toString(toTimeZone(col,
+/// 'UTC'))` wrapper for every `DateTime`/`DateTime64` column (see
+/// [`export_mart`]). That is what makes appending `Z` correct: the string
+/// genuinely IS UTC, converted by `ClickHouse` itself (which owns the
+/// correct IANA timezone database for the column's declared zone, or its
+/// server-default zone when the column has none), not merely assumed to
+/// be. The prior version of this function appended `Z` directly to
+/// whatever `ClickHouse` rendered a `DateTime`/`DateTime64` column as —
+/// which, for a column with an explicit (or server-default) non-UTC
+/// timezone, is a string in THAT timezone, not UTC — silently shifting
+/// every value in the column by the zone's offset. Do not call this
+/// function on a raw (non-`toTimeZone`-wrapped) `ClickHouse` `DateTime`
+/// string and rely on its `Z`-appending fallback to be correct; it is only
+/// correct because [`export_mart`] guarantees the projection upstream.
 fn cell_as_timestamp_micros(
     row: &Map<String, Value>,
     name: &str,
@@ -256,6 +336,100 @@ fn cell_as_timestamp_micros(
     Ok(Some(
         odt.unix_timestamp() * 1_000_000 + i64::from(odt.microsecond()),
     ))
+}
+
+/// Parses a `ClickHouse` `UInt64`/`Int64` cell (rendered as a quoted
+/// string in `FORMAT JSON`, to avoid the precision loss a JS/JSON number
+/// would suffer past 2^53 — same reason `ClickHouse`'s JSON output always
+/// quotes 64-bit integers). Used only for `SELECT count()`'s result.
+fn cell_as_u64(row: &Map<String, Value>, name: &str) -> Result<u64, GoldExportError> {
+    match row.get(name) {
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| GoldExportError::Batch(format!("{name}: {n} does not fit in u64"))),
+        Some(Value::String(s)) => s
+            .parse::<u64>()
+            .map_err(|e| GoldExportError::Batch(format!("{name}: {s:?} is not a valid u64: {e}"))),
+        other => Err(GoldExportError::Batch(format!(
+            "{name}: expected an unsigned integer, got {other:?}"
+        ))),
+    }
+}
+
+/// Builds one column's `SELECT` projection for the per-batch data query
+/// [`export_mart`] issues.
+///
+/// # Why `toTimeZone(col, 'UTC')`, not appending `Z` in Rust
+///
+/// `ClickHouse` `DateTime`/`DateTime64` columns are either explicitly
+/// typed with a timezone (`DateTime('Asia/Jakarta')`,
+/// `DateTime64(3, 'Asia/Jakarta')`) or fall back to the server's default
+/// timezone — there is no such thing as a genuinely timezone-free
+/// `ClickHouse` `DateTime` value; `FORMAT JSON` always renders one as a
+/// string in ITS zone. The code this replaces appended a literal `Z` to
+/// that string regardless, asserting it was already UTC — for any column
+/// whose zone is not UTC, that silently shifted every exported value by
+/// the zone's offset (e.g. `Asia/Jakarta` is UTC+7: a row timestamped
+/// `03:00` local reads as `03:00Z`, seven hours off). Rather than
+/// reimplementing an IANA timezone database in Rust to compute the
+/// correct offset ourselves (including the DST-transition cases a named
+/// zone can have), this reprojects the column through `ClickHouse`'s OWN
+/// `toTimeZone` function before reading it back — `ClickHouse` already
+/// carries the full timezone database and does this conversion correctly
+/// for any zone, named or server-default. After this projection the
+/// string genuinely IS UTC, which is what makes
+/// [`cell_as_timestamp_micros`]'s `Z`-append correct again.
+///
+/// Every other column type is selected unchanged (correctness for those
+/// types was never in question — only `DateTime`/`DateTime64` carries an
+/// ambiguous, non-UTC-by-default timezone). `Nullable(DateTime...)` is
+/// handled the same way: `toTimeZone` on a `NULL` `DateTime` still
+/// produces `NULL` (`ClickHouse`'s datetime functions are null-preserving
+/// over `Nullable` arguments), so no separate branch is needed.
+fn select_projection(col: &ChColumn) -> String {
+    let (base, _nullable) = unwrap_nullable(&col.ty);
+    let quoted = format!("`{}`", col.name);
+    if base == "DateTime" || base.starts_with("DateTime64(") || base.starts_with("DateTime(") {
+        format!("toString(toTimeZone({quoted}, 'UTC')) AS {quoted}")
+    } else {
+        quoted
+    }
+}
+
+/// Builds the full `SELECT <projections> FROM <source_table>` prefix
+/// shared by every batch query — see [`select_projection`] for what each
+/// column's projection is.
+fn select_clause(source_table: &str, columns: &[ChColumn]) -> String {
+    let projections = columns
+        .iter()
+        .map(select_projection)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("SELECT {projections} FROM {source_table}")
+}
+
+/// Builds an `ORDER BY` clause over every source column, quoted, in
+/// `ClickHouse`'s own column order.
+///
+/// # Why `ORDER BY` every column
+///
+/// [`export_mart`] pages through the mart with repeated `LIMIT n OFFSET n`
+/// queries rather than one single-pass streaming read (see the module doc
+/// comment's "Why batches..." section for why). Plain `LIMIT`/`OFFSET`
+/// with no `ORDER BY` has no defined row order in `ClickHouse` (or any
+/// SQL engine) — successive queries are not guaranteed to partition the
+/// table consistently, which could read some rows twice and miss others
+/// entirely across page boundaries. Ordering by every column, rather than
+/// e.g. just a primary key the mart may not even have, guarantees a
+/// deterministic, reproducible order for ANY mart shape as long as the
+/// underlying data does not change between batch queries — the accepted
+/// caveat this module doc comment names for the `LIMIT`/`OFFSET` fallback.
+fn order_by_clause(columns: &[ChColumn]) -> String {
+    columns
+        .iter()
+        .map(|c| format!("`{}`", c.name))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Builds one Arrow [`ArrayRef`] for `plan` from every row in `rows`.
@@ -328,7 +502,13 @@ pub struct GoldExportResult {
 
 /// Reads every row of `source_table` (a fully-qualified `ClickHouse`
 /// table name, e.g. `"serving.sales_by_region"`) and appends it to the
-/// Gold Iceberg table named `mart_name` (ADR 0010).
+/// Gold Iceberg table named `mart_name` (ADR 0010), in batches of at most
+/// `batch_size` rows, refusing outright if the source has more than
+/// `max_rows` rows — see the module doc comment's "Why batches, a row
+/// cap, ..." section for why both exist, and [`crate::config::Config`]'s
+/// `gold_export_max_rows`/`gold_export_batch_size` doc comments for where
+/// callers should source these two values from (`routes::gold::export`
+/// does, from `AppState::config`).
 ///
 /// If the source query returns zero rows, this is a no-op: no namespace
 /// or table is created, no snapshot is committed. `iceberg-rust`'s
@@ -340,22 +520,47 @@ pub struct GoldExportResult {
 ///
 /// # Errors
 ///
-/// See [`GoldExportError`]'s variants.
+/// See [`GoldExportError`]'s variants. In particular,
+/// [`GoldExportError::RowCapExceeded`] is returned (and no `ClickHouse` row
+/// data is read at all) when `source_table` has more than `max_rows` rows.
 pub async fn export_mart(
     ch: &ChClient,
     iceberg_config: &IcebergClientConfig,
     source_table: &str,
     mart_name: &str,
+    max_rows: u64,
+    batch_size: u64,
 ) -> Result<GoldExportResult, GoldExportError> {
-    let result = ch
-        .query(&format!("SELECT * FROM {source_table} FORMAT JSON"), None)
-        .await?;
-
     let namespace = gold::GOLD_NAMESPACE.to_owned();
     let sanitized_table =
         gold::sanitize_mart_name(mart_name).map_err(|e| GoldExportError::Batch(e.to_string()))?;
 
-    if result.data.is_empty() {
+    // Zero is never a useful batch size (it would loop forever re-reading
+    // offset 0) — clamp rather than fail the export over a misconfigured
+    // env var, same "don't refuse to boot/run over a non-load-bearing
+    // knob" posture `Config::gold_export_batch_size` documents.
+    let batch_size = batch_size.max(1);
+
+    // Fix (1/3): the row cap is checked BEFORE any row data is read — a
+    // mart already over the cap must never start streaming batches only
+    // to be cut off midway (which would look, from the caller's
+    // perspective, exactly like the silent truncation this cap exists to
+    // prevent).
+    let count_result = ch
+        .query(&format!("SELECT count() AS c FROM {source_table}"), None)
+        .await?;
+    let total_rows = match count_result.data.first() {
+        Some(row) => cell_as_u64(row, "c")?,
+        None => 0,
+    };
+    if total_rows > max_rows {
+        return Err(GoldExportError::RowCapExceeded {
+            mart: mart_name.to_owned(),
+            row_count: total_rows,
+            cap: max_rows,
+        });
+    }
+    if total_rows == 0 {
         return Ok(GoldExportResult {
             namespace,
             table: sanitized_table,
@@ -364,7 +569,14 @@ pub async fn export_mart(
         });
     }
 
-    let plan = plan_columns(&result.meta)?;
+    // Discover the column set/types with a zero-row query — `FORMAT
+    // JSON`'s `meta` is populated regardless of how many rows `LIMIT`
+    // allows through, so this is a schema-only round trip, not a second
+    // whole-mart read.
+    let schema_probe = ch
+        .query(&format!("SELECT * FROM {source_table} LIMIT 0"), None)
+        .await?;
+    let plan = plan_columns(&schema_probe.meta)?;
     let domain_fields = plan_to_iceberg_fields(&plan);
 
     let client = IcebergClient::connect(iceberg_config).await?;
@@ -372,29 +584,67 @@ pub async fn export_mart(
         .create_or_load_gold_table(mart_name, domain_fields)
         .await?;
 
-    let arrow_schema = iceberg::arrow::schema_to_arrow_schema(table.schema())
-        .map_err(|e| GoldExportError::Batch(format!("schema_to_arrow_schema failed: {e}")))?;
+    let arrow_schema = Arc::new(
+        iceberg::arrow::schema_to_arrow_schema(table.schema())
+            .map_err(|e| GoldExportError::Batch(format!("schema_to_arrow_schema failed: {e}")))?,
+    );
 
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(plan.len() + 1);
-    // `_exported_at` is the same instant for every row in this batch —
-    // matches the "one partition value per batch" assumption
-    // `gold::partition_key_for` documents.
-    let now_micros = time::OffsetDateTime::now_utc().unix_timestamp() * 1_000_000;
-    arrays.push(Arc::new(TimestampMicrosecondArray::from(vec![
-        now_micros;
-        result
-            .data
-            .len()
-    ])));
-    for column in &plan {
-        arrays.push(build_array(column, &result.data)?);
+    let select_clause = select_clause(source_table, &schema_probe.meta);
+    let order_by = order_by_clause(&schema_probe.meta);
+
+    let mut offset = 0u64;
+    let mut rows_exported = 0usize;
+    loop {
+        // `ORDER BY` every column — see `order_by_clause`'s doc comment
+        // for why this, not just a mart-specific key, is needed for
+        // `LIMIT`/`OFFSET` pagination to be well-defined at all.
+        let batch_sql = if order_by.is_empty() {
+            format!("{select_clause} LIMIT {batch_size} OFFSET {offset} FORMAT JSON")
+        } else {
+            format!(
+                "{select_clause} ORDER BY {order_by} LIMIT {batch_size} OFFSET {offset} \
+                 FORMAT JSON"
+            )
+        };
+        let batch_result = ch.query(&batch_sql, None).await?;
+        if batch_result.data.is_empty() {
+            break;
+        }
+        let batch_rows = batch_result.data.len();
+
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(plan.len() + 1);
+        // `_exported_at` is the same instant for every row within THIS
+        // batch — matches the "one partition value per batch" assumption
+        // `gold::partition_key_for` documents (each batch is one Parquet
+        // file/append, so each needs exactly one partition value derived
+        // from it). Recomputed per batch rather than once for the whole
+        // run: consecutive batches of one export may therefore carry
+        // microseconds-apart `_exported_at` values rather than one
+        // identical instant — an acceptable, cosmetic divergence from the
+        // pre-batching behavior (a caller filtering `max(_exported_at)`
+        // per day-partition still sees them as the same run).
+        let now_micros = time::OffsetDateTime::now_utc().unix_timestamp() * 1_000_000;
+        arrays.push(Arc::new(TimestampMicrosecondArray::from(vec![
+            now_micros;
+            batch_rows
+        ])));
+        for column in &plan {
+            arrays.push(build_array(column, &batch_result.data)?);
+        }
+
+        let record_batch = RecordBatch::try_new(arrow_schema.clone(), arrays)
+            .map_err(|e| GoldExportError::Batch(format!("RecordBatch::try_new failed: {e}")))?;
+
+        table.append(client.as_catalog(), record_batch).await?;
+        rows_exported += batch_rows;
+
+        if (batch_rows as u64) < batch_size {
+            // A short page means this was the last one — no need to issue
+            // one more query that would just come back empty.
+            break;
+        }
+        offset += batch_size;
     }
-
-    let batch = RecordBatch::try_new(Arc::new(arrow_schema), arrays)
-        .map_err(|e| GoldExportError::Batch(format!("RecordBatch::try_new failed: {e}")))?;
-
-    let rows_exported = result.data.len();
-    table.append(client.as_catalog(), batch).await?;
 
     Ok(GoldExportResult {
         namespace,
@@ -438,5 +688,188 @@ pub fn iceberg_config(
         warehouse,
         catalog_credential: None,
         catalog_token,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn row_with(name: &str, value: Value) -> Map<String, Value> {
+        let mut row = Map::new();
+        row.insert(name.to_owned(), value);
+        row
+    }
+
+    fn ch_column(name: &str, ty: &str) -> ChColumn {
+        ChColumn {
+            name: name.to_owned(),
+            ty: ty.to_owned(),
+        }
+    }
+
+    // -- select_projection: the actual fix for defect (3) ------------------
+
+    #[test]
+    fn select_projection_wraps_datetime_in_to_time_zone_utc() {
+        let col = ch_column("created_at", "DateTime('Asia/Jakarta')");
+        assert_eq!(
+            select_projection(&col),
+            "toString(toTimeZone(`created_at`, 'UTC')) AS `created_at`"
+        );
+    }
+
+    #[test]
+    fn select_projection_wraps_datetime64_in_to_time_zone_utc() {
+        let col = ch_column("created_at", "DateTime64(3, 'Asia/Jakarta')");
+        assert_eq!(
+            select_projection(&col),
+            "toString(toTimeZone(`created_at`, 'UTC')) AS `created_at`"
+        );
+    }
+
+    #[test]
+    fn select_projection_wraps_bare_datetime_with_no_explicit_zone() {
+        // No explicit zone still means "the server's default zone", not
+        // "no zone" — see the doc comment on select_projection. It must
+        // still be routed through toTimeZone.
+        let col = ch_column("created_at", "DateTime");
+        assert_eq!(
+            select_projection(&col),
+            "toString(toTimeZone(`created_at`, 'UTC')) AS `created_at`"
+        );
+    }
+
+    #[test]
+    fn select_projection_wraps_nullable_datetime() {
+        let col = ch_column("created_at", "Nullable(DateTime('Asia/Jakarta'))");
+        assert_eq!(
+            select_projection(&col),
+            "toString(toTimeZone(`created_at`, 'UTC')) AS `created_at`"
+        );
+    }
+
+    #[test]
+    fn select_projection_leaves_non_datetime_columns_unchanged() {
+        assert_eq!(
+            select_projection(&ch_column("region", "String")),
+            "`region`"
+        );
+        assert_eq!(
+            select_projection(&ch_column("amount", "Float64")),
+            "`amount`"
+        );
+        assert_eq!(select_projection(&ch_column("day", "Date")), "`day`");
+        assert_eq!(
+            select_projection(&ch_column("count", "Nullable(UInt64)")),
+            "`count`"
+        );
+    }
+
+    #[test]
+    fn select_clause_projects_every_column() {
+        let columns = vec![ch_column("region", "String"), ch_column("ts", "DateTime")];
+        assert_eq!(
+            select_clause("serving.sales", &columns),
+            "SELECT `region`, toString(toTimeZone(`ts`, 'UTC')) AS `ts` FROM serving.sales"
+        );
+    }
+
+    #[test]
+    fn order_by_clause_lists_every_column_quoted() {
+        let columns = vec![ch_column("region", "String"), ch_column("ts", "DateTime")];
+        assert_eq!(order_by_clause(&columns), "`region`, `ts`");
+    }
+
+    #[test]
+    fn order_by_clause_is_empty_for_no_columns() {
+        assert_eq!(order_by_clause(&[]), "");
+    }
+
+    // -- the tz-shift bug itself: proof the fix removes it ------------------
+
+    /// The actual defect: appending `Z` directly to a `ClickHouse`
+    /// `DateTime` string rendered in a non-UTC zone silently shifts every
+    /// value by that zone's offset. `select_projection` closes this by
+    /// making sure the string [`cell_as_timestamp_micros`] ever sees for a
+    /// `DateTime`/`DateTime64` column has already been converted to UTC BY
+    /// `ClickHouse` (`toTimeZone`) — this test proves what the shift would
+    /// have been had that projection been skipped, by feeding
+    /// [`cell_as_timestamp_micros`] both strings directly and diffing them.
+    #[test]
+    fn naive_z_append_on_a_non_utc_local_string_would_have_shifted_by_the_zone_offset() {
+        // "Asia/Jakarta" is UTC+7: a row whose true instant is 03:00 UTC
+        // renders as 10:00 in that zone. `select_projection` guarantees
+        // only the FIRST string ever reaches `cell_as_timestamp_micros` in
+        // this codebase; the second represents what the pre-fix code path
+        // would have parsed instead, had it been given the raw
+        // (non-`toTimeZone`-converted) local rendering.
+        let correctly_projected_utc =
+            row_with("ts", Value::String("2024-01-02 03:00:00".to_owned()));
+        let raw_local_jakarta_rendering =
+            row_with("ts", Value::String("2024-01-02 10:00:00".to_owned()));
+
+        let correct = cell_as_timestamp_micros(&correctly_projected_utc, "ts")
+            .unwrap()
+            .unwrap();
+        let would_have_been_wrong = cell_as_timestamp_micros(&raw_local_jakarta_rendering, "ts")
+            .unwrap()
+            .unwrap();
+
+        let seven_hours_in_micros: i64 = 7 * 3600 * 1_000_000;
+        assert_eq!(
+            would_have_been_wrong - correct,
+            seven_hours_in_micros,
+            "this is exactly the corruption defect (3) describes: a whole \
+             zone-offset shift from blindly appending Z to a non-UTC string"
+        );
+    }
+
+    #[test]
+    fn timestamp_parses_utc_projected_string_to_the_matching_instant() {
+        let row = row_with("ts", Value::String("2024-01-02 03:04:05".to_owned()));
+        let micros = cell_as_timestamp_micros(&row, "ts").unwrap().unwrap();
+        let expected = time::OffsetDateTime::parse("2024-01-02T03:04:05Z", &Iso8601::DEFAULT)
+            .unwrap()
+            .unix_timestamp()
+            * 1_000_000;
+        assert_eq!(micros, expected);
+    }
+
+    // -- cell_as_u64: SELECT count() parsing --------------------------------
+
+    #[test]
+    fn cell_as_u64_parses_quoted_string_uint64() {
+        let row = row_with("c", Value::String("123456789012".to_owned()));
+        assert_eq!(cell_as_u64(&row, "c").unwrap(), 123_456_789_012);
+    }
+
+    #[test]
+    fn cell_as_u64_parses_json_number() {
+        let row = row_with("c", Value::Number(42.into()));
+        assert_eq!(cell_as_u64(&row, "c").unwrap(), 42);
+    }
+
+    #[test]
+    fn cell_as_u64_rejects_non_numeric_string() {
+        let row = row_with("c", Value::String("nope".to_owned()));
+        assert!(cell_as_u64(&row, "c").is_err());
+    }
+
+    // -- RowCapExceeded: the error must name both the mart and the cap ------
+
+    #[test]
+    fn row_cap_exceeded_error_names_mart_and_cap() {
+        let err = GoldExportError::RowCapExceeded {
+            mart: "sales_by_region".to_owned(),
+            row_count: 10_000_000,
+            cap: 5_000_000,
+        };
+        let message = err.to_string();
+        assert!(message.contains("sales_by_region"));
+        assert!(message.contains("5000000") || message.contains("5_000_000"));
+        assert!(message.contains("GOLD_EXPORT_MAX_ROWS"));
     }
 }

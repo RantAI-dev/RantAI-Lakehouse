@@ -88,15 +88,27 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
-      # ADR 0010/0011 — Gold export (`routes::gold`) needs the `gold-export`
-      # principal registered/granted and its token minted before it can do
-      # anything useful; both happen in this one-shot job. Not required for
-      # every OTHER route this service serves (they have no Lakekeeper
-      # dependency), but Lakekeeper's whole stack is already a core,
-      # always-on part of `docker compose up` since ADR 0011 — this just
-      # sequences `lakehouse-api` after it instead of racing it.
-      lakekeeper-authz-init:
-        condition: service_completed_successfully
+      # Code-review fix: this used to ALSO depend on
+      # `lakekeeper-authz-init: condition: service_completed_successfully`
+      # (ADR 0010/0011 — Gold export needs the `gold-export` principal
+      # registered/granted and its token minted before it can do anything
+      # useful). That coupled this service's BOOT to a one-shot job's exit
+      # code, contradicting this crate's whole documented posture
+      # (`lakehouse_store::connect_lazy`'s doc comment, `AppState::pg`'s
+      # doc comment): the API boots and serves every route it can even
+      # when a dependency is down or not yet provisioned, degrading only
+      # the routes that actually need it (503), rather than refusing to
+      # start at all. `routes::gold::export`/`read_back` already check
+      # their Lakekeeper precondition at REQUEST time
+      # (`lakehouse-api/src/routes/gold.rs`'s `read_catalog_token` — 503,
+      # naming the unread token file, if Gold export is not provisioned
+      # yet), so nothing is lost by not also gating boot on it: every
+      # OTHER route this service serves has no Lakekeeper dependency at
+      # all, and a slow/failed `lakekeeper-authz-init` should not be able
+      # to take those down too. `postgres`/`clickhouse` above are
+      # pre-existing `depends_on` entries, unchanged by this fix — only
+      # the Gold-export-specific `lakekeeper-authz-init` entry is removed
+      # here.
     environment:
       PORT: "8080"
       APP_ENV: ${APP_ENV:-local}
@@ -662,8 +674,32 @@ services:
   #     it, same reasoning as `clickhouse-reader`'s missing `create`.
   #   - `gold-export` (ADR 0010, P6+: `lakehouse-api`'s `routes::gold`):
   #     create, modify, select — same shape as `rust-iceberg`, own
-  #     principal so it is independently auditable/revocable, scoped to
-  #     the `gold` Iceberg namespace's export path only.
+  #     principal so it is independently auditable/revocable.
+  #     Code-review fix: this grant is WAREHOUSE-scoped (the
+  #     `permissions/warehouse/{id}/assignments` endpoint below), same as
+  #     every other principal in this list — it is NOT narrowed to the
+  #     `gold` namespace. A previous version of this comment claimed
+  #     "scoped to the `gold` Iceberg namespace's export path only", which
+  #     overstated the actual restriction: `gold-export`'s token can
+  #     create/modify/select ANY namespace or table in this warehouse,
+  #     including `bronze`, exactly like `rust-iceberg`'s token can.
+  #     Narrowing this specific grant to the `gold` namespace was
+  #     considered and not done: this build's whole authorization design
+  #     (ADR 0003, "isolation enforced once, at the warehouse boundary")
+  #     grants every principal here at warehouse scope, never
+  #     namespace/table scope, and Lakekeeper's namespace itself does not
+  #     exist yet at grant time (it is created lazily by the first
+  #     export — `IcebergClient::create_or_load_gold_table`), so a
+  #     namespace-scoped grant would need this job to also pre-create the
+  #     `gold` namespace as `admin` before granting into it — a real
+  #     capability Lakekeeper's permission model likely supports (it has
+  #     namespace- and table-level assignment endpoints alongside the
+  #     warehouse-level one used here), but a change to this build's
+  #     established grant shape big enough, and different enough from
+  #     every other principal here, that it deserves its own review
+  #     rather than being slipped into this fix. Tracked as follow-up
+  #     work, not done here; this comment is honest about the CURRENT
+  #     scope in the meantime.
   #   - `unauthorized-test`: registered (Lakekeeper knows who it is) but
   #     NEVER granted anything — the negative-test principal.
   lakekeeper-authz-init:
@@ -774,9 +810,11 @@ services:
         # export, appends a new snapshot on every subsequent one, and
         # reads it back (`GET /api/gold/export/{mart}`, the round-trip
         # proof `ops/gold_export/gold_export_test.py` checks) — the same
-        # create+modify+select shape as `rust-iceberg`, scoped to its own
-        # principal per the note on `PRINCIPALS` in
-        # `ops/oidc-mock/server.py`.
+        # create+modify+select shape as `rust-iceberg`, own principal per
+        # the note on `PRINCIPALS` in `ops/oidc-mock/server.py`. This is a
+        # WAREHOUSE-scoped grant (see the "Grants" list above this job's
+        # doc comment): `gold-export`'s token is not restricted to the
+        # `gold` namespace by this call.
         grant gold-export create modify select
         # unauthorized-test: deliberately no grant call.
     restart: "no"

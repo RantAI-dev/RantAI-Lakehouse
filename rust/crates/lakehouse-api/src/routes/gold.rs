@@ -25,6 +25,28 @@
 //! never unauthenticated. `POLICY_TABLE` still requires `RequiresAuth` as
 //! the floor (see `crate::policy`), matching `/api/alerts/run`'s own
 //! belt-and-suspenders shape.
+//!
+//! # This route's boot posture: no hard dependency on Lakekeeper being provisioned
+//!
+//! `docker-compose.yml`'s `lakehouse-api` service does not (any more) wait
+//! on `lakekeeper-authz-init` finishing before it starts — this crate's
+//! whole documented posture (`lakehouse_store::connect_lazy`,
+//! `AppState::pg`'s doc comment) is that the process boots and serves
+//! every route it can even when a dependency is down, degrading only the
+//! routes that need it. [`export`]/[`read_back`] report the missing
+//! precondition at REQUEST time instead: [`read_catalog_token`] returns
+//! `503 Unavailable` naming the unread token file (ADR 0011) when Gold
+//! export has not been provisioned on this deployment yet, rather than the
+//! whole process refusing to start over one route's dependency.
+//!
+//! # Single-flight: concurrent exports of the SAME mart
+//!
+//! [`export`] acquires a per-mart lock (`AppState::gold_export_locks` —
+//! `crate::gold_lock`) before doing anything else; a second concurrent
+//! call for the SAME mart gets `409 Conflict` immediately rather than
+//! racing the first (both would read `ClickHouse` and append to Iceberg,
+//! duplicating every row). See [`export`]'s own doc comment for the
+//! design tradeoff (409, not queueing).
 
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::HeaderMap;
@@ -44,9 +66,14 @@ impl From<GoldExportError> for ApiError {
     fn from(err: GoldExportError) -> Self {
         match err {
             GoldExportError::ClickHouse(e) => Self::from(e),
-            GoldExportError::UnsupportedColumn { .. } | GoldExportError::Batch(_) => {
-                Self::Unprocessable(err.to_string())
-            }
+            GoldExportError::UnsupportedColumn { .. }
+            | GoldExportError::Batch(_)
+            // The mart is over `GOLD_EXPORT_MAX_ROWS` — a well-formed
+            // request against real (too-large) data, same "caller's input,
+            // not our outage" shape as the other `Unprocessable` variants,
+            // not a 500: the fix is retrying with a smaller mart or a
+            // deliberately raised cap, not anything server-side.
+            | GoldExportError::RowCapExceeded { .. } => Self::Unprocessable(err.to_string()),
             GoldExportError::Iceberg(e) => Self::Internal(e.to_string()),
         }
     }
@@ -108,11 +135,25 @@ async fn read_catalog_token(path: &str) -> Result<SecretValue, ApiError> {
 
 /// `POST /api/gold/export/{mart}` — run the export.
 ///
+/// # Single-flight: only one export of a given mart runs at a time
+///
+/// A per-mart lock (`AppState::gold_export_locks` — see
+/// `crate::gold_lock`'s module doc comment) is acquired before anything
+/// else happens. If a second call for the SAME mart arrives while the
+/// first is still running, this returns `409 Conflict` immediately rather
+/// than letting both calls read `ClickHouse` and append to Iceberg — two
+/// concurrent exports of the same mart would each append the mart's
+/// current rows, duplicating them in the target table (`GoldTable::append`
+/// has no dedup). A DIFFERENT mart is unaffected — the lock is keyed by
+/// mart name.
+///
 /// # Errors
 ///
-/// Returns 401/503 from [`check_export_token`], 503 if the Lakekeeper
-/// token cannot be read, 422 for an unsupported source column or a bad
-/// `ClickHouse` query, or 500 for an Iceberg catalog/write failure.
+/// Returns 401/503 from [`check_export_token`], `409` if an export of the
+/// SAME mart is already in flight, 503 if the Lakekeeper token cannot be
+/// read, 422 for an unsupported source column, a source mart over
+/// `GOLD_EXPORT_MAX_ROWS`, or a bad `ClickHouse` query, or 500 for an
+/// Iceberg catalog/write failure.
 pub async fn export(
     State(state): State<AppState>,
     Path(mart): Path<String>,
@@ -130,6 +171,22 @@ pub async fn export(
 
     let mart_ident =
         Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("mart tidak valid: {e}")))?;
+
+    // Held for the rest of this handler (dropped at function return,
+    // success or error alike) — see this function's "Single-flight" doc
+    // section above for why acquiring it is the very first thing done
+    // after validating the mart name.
+    let _export_guard = state
+        .gold_export_locks
+        .try_acquire(mart_ident.as_str())
+        .await
+        .map_err(|_| {
+            ApiError::Conflict(format!(
+                "export mart {:?} sedang berjalan; tunggu sampai selesai sebelum mencoba lagi",
+                mart_ident.as_str()
+            ))
+        })?;
+
     let source_table = format!(
         "{}.`{}`",
         state.config.gold_source_schema,
@@ -148,6 +205,8 @@ pub async fn export(
         &iceberg_config,
         &source_table,
         mart_ident.as_str(),
+        state.config.gold_export_max_rows,
+        state.config.gold_export_batch_size,
     )
     .await
     .map_err(ApiError::from)?;

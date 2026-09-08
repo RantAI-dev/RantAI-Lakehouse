@@ -289,6 +289,8 @@ usage share the same documented source docker-compose already uses:
 | `LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE` | File path to the `gold-export` Lakekeeper principal's pre-minted static bearer token (ADR 0011), read at export-request time — not a `secretRef`, see the field's doc comment for why | `/tokens/gold-export.jwt` | No |
 | `GOLD_SOURCE_SCHEMA` | ClickHouse schema `routes::gold` reads Gold marts from | `serving` | No |
 | `GOLD_EXPORT_RUN_TOKEN` | Shared token gating `POST`/`GET /api/gold/export/{mart}` (same D4 shape as `ALERTS_RUN_TOKEN`); unset means only a service-identity principal may call it | unset | No |
+| `GOLD_EXPORT_MAX_ROWS` | Hard cap on rows a single Gold export will read/append; a mart over this fails outright (error names the mart and the cap) instead of silently truncating | `5000000` | No |
+| `GOLD_EXPORT_BATCH_SIZE` | Rows read from ClickHouse and appended to Iceberg per batch, instead of materializing the whole mart in memory at once | `20000` | No |
 | `RUSTFS_S3_ENDPOINT` | S3-compatible endpoint the `lakehouse-iceberg` `object_store` client targets | `http://localhost:9010` | No |
 | `RUSTFS_S3_REGION` | Region string sent to the S3 client (RustFS does not enforce AWS region semantics, but the S3 API requires a value) | `us-east-1` | No |
 | `LAKEHOUSE_WAREHOUSE_BUCKET` | Bucket the lakehouse warehouse's Iceberg tables live under — also read by the compose `rustfs-bucket-init` job | `lakehouse-warehouse` | No |
