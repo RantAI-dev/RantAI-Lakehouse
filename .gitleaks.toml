@@ -72,9 +72,23 @@ paths = [
   '''^docs/CI\.md$''',
 ]
 
-# The allowlist entry that used to sit here (a committed SeaweedFS STS
-# signing key in ops/seaweedfs/iam.json) is gone along with that file:
-# credential-hygiene fix, see docker-compose.yml's `seaweedfs`/
-# `seaweedfs-iam-init` services. iam.json is now rendered at bring-up
-# from ops/seaweedfs/iam.template.json (no working key ever committed),
-# so there is nothing left here for gitleaks to need an exception for.
+# The SeaweedFS STS signing key that used to live in ops/seaweedfs/iam.json
+# is gone from HEAD — iam.json is now rendered at bring-up from
+# ops/seaweedfs/iam.template.json, and when SEAWEEDFS_STS_SIGNING_KEY is
+# unset the init generates a random key per deployment rather than shipping
+# a known one (see docker-compose.yml's `seaweedfs-iam-init`).
+#
+# This entry still has to exist, though, because deleting a file does not
+# delete it from git HISTORY: the literal is still in commit b2ad885, and
+# the Security workflow scans the FULL history, not the working tree. It was
+# briefly removed on the theory that removing the file was enough — it is
+# not, and the scan failed. Rewriting history to excise it is not worth it
+# for a key that was self-describing as non-secret
+# ("p2-matrix-local-only-signing-key-not-a-secret" in base64) and is now
+# unused by anything.
+#
+# Delete this entry only together with a history rewrite that removes the
+# literal, not before.
+[[allowlists]]
+description = "historical SeaweedFS STS signing key, removed from HEAD but still present in commit b2ad885"
+regexes = ['''cDItbWF0cml4LWxvY2FsLW9ubHktc2lnbmluZy1rZXktbm90LWEtc2VjcmV0''']
