@@ -30,6 +30,7 @@ function useCopilotState() {
   const [error, setError] = React.useState<string | null>(null);
   const [sessionId, setSessionId] = React.useState<string | null>(null);
   const [sessions, setSessions] = React.useState<SessionMeta[]>([]);
+  const [confirmingKey, setConfirmingKey] = React.useState<string | null>(null);
   const [enabledCaps, setEnabledCaps] = React.useState<Set<string>>(() => new Set(ALL_CAP_KEYS));
   const pathname = usePathname();
   const [pageOverride, setPageOverride] = React.useState<PageContext | null>(null);
@@ -103,6 +104,57 @@ function useCopilotState() {
     }
   }, [busy, messages, mode, sessionId, persist, enabledCaps]);
 
+  /** Confirm/Cancel a `needs_confirmation` tool step (T0.4). */
+  const confirmTool = React.useCallback(async (messageIndex: number, stepIndex: number) => {
+    const step = messages[messageIndex]?.tools?.[stepIndex];
+    if (!step) return;
+    const pending = (step.result ?? {}) as { tool?: string; args?: Record<string, unknown> };
+    const toolName = pending.tool ?? step.tool;
+    const key = `${messageIndex}:${stepIndex}`;
+    setConfirmingKey(key);
+    try {
+      const res = await apiFetch("/api/ai/tool", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          tool: toolName,
+          args: { ...(pending.args ?? {}), confirmed: true },
+          mode,
+          sessionId: sessionId ?? undefined,
+        }),
+      });
+      const json = await res.json();
+      setMessages((prev) => {
+        const copy = prev.slice();
+        const msg = copy[messageIndex];
+        if (!msg?.tools?.[stepIndex]) return prev;
+        const tools = msg.tools.slice();
+        tools[stepIndex] = {
+          ...tools[stepIndex],
+          ok: res.ok && json.outcome !== "failed" && json.outcome !== "refused",
+          result: json.result ?? json,
+        };
+        copy[messageIndex] = { ...msg, tools };
+        return copy;
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setConfirmingKey((k) => (k === key ? null : k));
+    }
+  }, [messages, mode, sessionId]);
+
+  const cancelTool = React.useCallback((messageIndex: number, stepIndex: number) => {
+    setMessages((prev) => {
+      const copy = prev.slice();
+      const msg = copy[messageIndex];
+      if (!msg?.tools?.[stepIndex]) return prev;
+      const tools = msg.tools.slice();
+      tools[stepIndex] = { ...tools[stepIndex], ok: false, result: { cancelled: true } };
+      copy[messageIndex] = { ...msg, tools };
+      return copy;
+    });
+  }, []);
+
   const newChat = React.useCallback(() => {
     setMessages([]); setSessionId(null); setError(null);
   }, []);
@@ -131,6 +183,7 @@ function useCopilotState() {
     mode, setMode, messages, busy, error, sessionId, sessions,
     enabledCaps, toggleCap, pageContext, setPageContext,
     send, newChat, loadSession, removeSession, refreshSessions,
+    confirmTool, cancelTool, confirmingKey,
   };
 }
 

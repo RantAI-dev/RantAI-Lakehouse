@@ -73,7 +73,10 @@ export function CopilotDock() {
                 </div>
               </div>
             ) : (
-              <ChatMessages messages={c.messages} busy={c.busy} error={c.error} />
+              <ChatMessages
+                messages={c.messages} busy={c.busy} error={c.error}
+                onConfirmTool={c.confirmTool} onCancelTool={c.cancelTool} confirmingKey={c.confirmingKey}
+              />
             )}
           </div>
         </div>
