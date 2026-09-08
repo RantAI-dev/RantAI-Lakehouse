@@ -49,3 +49,8 @@ next-env.d.ts
 
 # postgres backups (scripts/backup-postgres.sh) — local artifacts, never committed
 /backups/
+
+# Python bytecode — never useful in the repo, and it dirties the working
+# tree on every test run, which silently blocks rebases.
+__pycache__/
+*.pyc
