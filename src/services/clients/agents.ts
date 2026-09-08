@@ -7,6 +7,7 @@ import type {
   CreateEmployeeInput,
   CreateWorkflowInput,
   DecideApprovalInput,
+  DecideApprovalResult,
   DigitalEmployee,
   RegisterToolInput,
 } from "../contracts/agents"
@@ -98,7 +99,7 @@ export const postgresAgentService: AgentService = {
     return get<ApprovalItem[]>(`/api/agents/approvals${qs}`, signal, "Daftar approval gagal dimuat")
   },
   decideApproval(id, input: DecideApprovalInput, signal) {
-    return post<ApprovalItem>(
+    return post<DecideApprovalResult>(
       `/api/agents/approvals/${encodeURIComponent(id)}/decide`,
       input,
       signal,

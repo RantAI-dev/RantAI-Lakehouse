@@ -1,6 +1,7 @@
 "use client";
 
 import * as React from "react";
+import Link from "next/link";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 
@@ -134,6 +135,21 @@ function StepBody({
     return <p className="mt-1 text-[11px] text-muted-foreground">Dibatalkan.</p>;
   }
 
+  if (res.needs_approval) {
+    const approvalId = String(res.approval_id ?? "");
+    return (
+      <div className="mt-1 space-y-2 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[11px]">
+        <p className="text-foreground">{String(res.summary ?? "Tindakan ini butuh persetujuan.")}</p>
+        <Link
+          href={approvalId ? `/agents/approvals?id=${encodeURIComponent(approvalId)}` : "/agents/approvals"}
+          className="inline-flex items-center gap-1 font-medium text-amber-700 underline underline-offset-2 dark:text-amber-400"
+        >
+          Lihat di Approvals →
+        </Link>
+      </div>
+    );
+  }
+
   if ("error" in res) {
     return <p className="mt-1 text-[11px] text-destructive">{String(res.error)}</p>;
   }
@@ -230,9 +246,12 @@ export function ToolStepCard({
   confirming?: boolean;
 }) {
   const res = asObj(step.result);
-  const [open, setOpen] = React.useState(step.tool === "run_sql" || Boolean(res.needs_confirmation));
+  const needsApproval = Boolean(res.needs_approval);
+  const [open, setOpen] = React.useState(
+    step.tool === "run_sql" || Boolean(res.needs_confirmation) || needsApproval,
+  );
   const label = TOOL_LABEL[step.tool] ?? step.tool;
-  const pending = Boolean(res.needs_confirmation);
+  const pending = Boolean(res.needs_confirmation) || needsApproval;
   return (
     <div className="rounded-md border border-border bg-background/60">
       <button
@@ -247,7 +266,11 @@ export function ToolStepCard({
           )}
         />
         <span className="font-medium">{label}</span>
-        {pending ? (
+        {needsApproval ? (
+          <span className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
+            menunggu approval
+          </span>
+        ) : res.needs_confirmation ? (
           <span className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
             perlu konfirmasi
           </span>

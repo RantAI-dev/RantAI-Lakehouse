@@ -94,6 +94,24 @@ export type DecideApprovalInput = {
   comment?: string
 }
 
+/**
+ * `POST /api/agents/approvals/{id}/decide`'s response (T0.5 of the
+ * copilot-operations-handover plan): the decided approval, whether the
+ * linked run's tool call actually executed, and — only when it did — the
+ * tool's own result, so the UI can show what happened inline rather than
+ * making the reviewer go look it up.
+ *
+ * `executed` is `false` for a reject, for an approval with no linked run,
+ * and for an approve where the approver lacked the underlying tool's own
+ * permission (the approval itself still gets decided; the tool never
+ * runs).
+ */
+export type DecideApprovalResult = {
+  approval: ApprovalItem
+  executed: boolean
+  result?: unknown
+}
+
 export type CreateWorkflowInput = {
   name: string
   trigger: string
@@ -132,7 +150,7 @@ export interface AgentService {
     id: string,
     input: DecideApprovalInput,
     signal?: AbortSignal
-  ): Promise<ApprovalItem>
+  ): Promise<DecideApprovalResult>
   createWorkflow(input: CreateWorkflowInput, signal?: AbortSignal): Promise<AgentWorkflow>
   createEmployee(
     input: CreateEmployeeInput,

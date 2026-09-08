@@ -64,6 +64,10 @@ export function ApprovalsPage() {
     null
   )
   const [comment, setComment] = React.useState("")
+  const [executionResult, setExecutionResult] = React.useState<{
+    executed: boolean
+    result?: unknown
+  } | null>(null)
   const decide = useServiceAction(
     (signal, id: string, input: { decision: "approved" | "rejected"; comment?: string }) =>
       agentService.decideApproval(id, input, signal)
@@ -84,14 +88,15 @@ export function ApprovalsPage() {
 
   async function confirmDecision() {
     if (!selected || !decision) return
-    const updated = await decide.run(selected.id, {
+    const outcome = await decide.run(selected.id, {
       decision,
       comment: comment.trim() || undefined,
     })
-    if (updated) {
+    if (outcome) {
       setDecision(null)
       setComment("")
-      setSelected(updated)
+      setSelected(outcome.approval)
+      setExecutionResult({ executed: outcome.executed, result: outcome.result })
       state.reload()
     }
   }
@@ -134,14 +139,20 @@ export function ApprovalsPage() {
           columns={columns}
           rows={rows}
           rowKey={(r) => r.id}
-          onRowClick={setSelected}
+          onRowClick={(r) => {
+            setExecutionResult(null)
+            setSelected(r)
+          }}
         />
       ) : null}
 
       <DetailDrawer
         open={selected !== null}
         onOpenChange={(open) => {
-          if (!open) setSelected(null)
+          if (!open) {
+            setSelected(null)
+            setExecutionResult(null)
+          }
         }}
         title="Approval request"
         description={selected?.action}
@@ -190,6 +201,10 @@ export function ApprovalsPage() {
                   ),
                 },
                 {
+                  // No `/agents/runs/[id]` detail page exists yet (T3.4 of
+                  // the copilot-operations-handover plan, not this task) —
+                  // showing the run id as plain text rather than a link
+                  // that would 404.
                   label: "Run",
                   value: selected.runId ? (
                     <span className="font-mono text-xs">{selected.runId}</span>
@@ -254,6 +269,20 @@ export function ApprovalsPage() {
                     <li key={e}>{e}</li>
                   ))}
                 </ul>
+              </div>
+            ) : null}
+            {executionResult ? (
+              <div>
+                <p className="text-xs font-medium text-muted-foreground">
+                  {executionResult.executed
+                    ? "Execution result"
+                    : "Decision recorded — not executed"}
+                </p>
+                <pre className="mt-1 max-h-64 overflow-auto rounded bg-muted/60 px-2 py-1.5 font-mono text-[11px] text-muted-foreground">
+                  {executionResult.executed
+                    ? JSON.stringify(executionResult.result, null, 2)
+                    : "The tool was never executed — either the action was rejected, or the approver lacked the underlying tool's own permission."}
+                </pre>
               </div>
             ) : null}
           </>
