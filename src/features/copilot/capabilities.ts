@@ -1,5 +1,5 @@
 import type { LucideIcon } from "lucide-react";
-import { Database, BarChart3, GitBranch, Bell, Plug, Bookmark } from "lucide-react";
+import { Database, BarChart3, GitBranch, Bell, Plug, Bookmark, ShieldCheck, Server } from "lucide-react";
 import type { Mode } from "./use-copilot";
 
 /**
@@ -80,6 +80,32 @@ export const CAPABILITIES: Capability[] = [
     icon: Bookmark,
     write: true,
     tools: ["save_query", "list_saved_queries", "run_saved_query"],
+  },
+  {
+    key: "governance",
+    label: "Governance",
+    desc: "Audit history, quality/classification rules, CDC & maintenance health, draft new policies/rules",
+    icon: ShieldCheck,
+    write: true,
+    tools: [
+      "get_audit_history",
+      "list_classification_rules",
+      "list_quality_rules",
+      "get_cdc_health",
+      "get_maintenance_metrics",
+      "run_bronze_maintenance",
+      "draft_policy",
+      "draft_classification_rule",
+      "draft_quality_rule",
+    ],
+  },
+  {
+    key: "operations",
+    label: "Operations",
+    desc: "Inspect running workloads, kill queries, export & read back Gold marts",
+    icon: Server,
+    write: true,
+    tools: ["list_workloads", "kill_query", "export_gold_mart", "get_gold_export"],
   },
 ];
 
