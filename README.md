@@ -254,8 +254,8 @@ talks to it:
 
 | Variable | Purpose | Default | Required? |
 | --- | --- | --- | --- |
-| `RUSTFS_ACCESS_KEY` | RustFS S3 API access key | `rustfsadmin` (public, well-known) | No, but override before exposing RustFS beyond localhost |
-| `RUSTFS_SECRET_KEY` | RustFS S3 API secret key | `rustfsadmin` (public, well-known) | No, but override before exposing RustFS beyond localhost |
+| `RUSTFS_ACCESS_KEY` | RustFS S3 API access key. Also passed into `lakehouse-api`'s own container env, where `conn-s3-warehouse`'s `secretRef` (`env:RUSTFS_ACCESS_KEY`) resolves it for a real connectivity test | `rustfsadmin` (public, well-known) | No, but override before exposing RustFS beyond localhost |
+| `RUSTFS_SECRET_KEY` | RustFS S3 API secret key. Same "also passed into `lakehouse-api`" note as `RUSTFS_ACCESS_KEY` above (`env:RUSTFS_SECRET_KEY`) | `rustfsadmin` (public, well-known) | No, but override before exposing RustFS beyond localhost |
 | `RUSTFS_HOST_PORT` | Host port mapped to RustFS's S3 API (container port 9000) | `9010` | No |
 | `RUSTFS_CONSOLE_HOST_PORT` | Host port mapped to RustFS's web console (container port 9001) | `9011` | No |
 | `LAKEKEEPER_PG_DB` | Name of Lakekeeper's own Postgres database on the existing `postgres` service (separate from the `lakehouse` app database's `console` schema) | `lakekeeper` | No |
@@ -325,6 +325,18 @@ issue about any of the following — they're known, not bugs:
   API wired up. Knowledge *sources* and *vector jobs* ARE real, backed by
   Postgres (`lakehouse-store::knowledge`) — only the search-query path
   itself is mocked.
+- **Connector "Test connection" genuinely dials only PostgreSQL and
+  S3-compatible object storage.** `POST /api/connectors/{id}/test`
+  (`lakehouse-api`'s `connector_probe` module) opens a real, 5s-bounded
+  connection and measures real latency for those two types, resolving the
+  connector's `secretRef` via `EnvSecretResolver` (ADR 0002). Every other
+  connector `type` (Kafka, MQTT, MongoDB, Oracle, SAP/ERP, SFTP, a vendor
+  REST API, ...) has no dial implementation in this build and returns
+  `{ supported: false }` with a message saying so — never a fabricated
+  latency or success. The seed (`0022_prune_connector_seed.sql`) was
+  shrunk to match: two connectors, `conn-pg-lakehouse` and
+  `conn-s3-warehouse`, pointing at the compose stack's own Postgres and
+  RustFS.
 - **ClickHouse cannot write Iceberg through the catalog on 26.3.**
   `CREATE TABLE` inside a `DataLakeCatalog` database never reaches
   Lakekeeper (falls back to `MergeTree`, `Code: 79`); `INSERT` into a

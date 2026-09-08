@@ -130,6 +130,27 @@ services:
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
       AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
       DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${POSTGRES_DB:-lakehouse}}
+      # ── secretRef-resolvable credentials for `connector_probe`'s real
+      #    PostgreSQL/S3 connectivity tests (P6, ADR 0002). The seeded
+      #    `conn-pg-lakehouse`/`conn-s3-warehouse` connectors reference
+      #    these exact env var names via `env:` secretRefs — see
+      #    `0022_prune_connector_seed.sql`. Not new secrets: same values
+      #    `DATABASE_URL`/RustFS's own service block already use above,
+      #    just also exposed under their own names for `EnvSecretResolver`
+      #    to resolve. ──
+      # CONNECTOR-DEDICATED credentials, deliberately NOT the API's own
+      # secrets. Only these three names are on
+      # `CONNECTOR_ALLOWED_SECRET_REFS`, which is what stops a
+      # `connector:manage` principal creating a connector that names
+      # `env:POSTGRES_PASSWORD` (the console's own database password) with a
+      # caller-chosen external host and having the API authenticate to it.
+      # They default to the same values so the local stack still works —
+      # separate NAMES, not necessarily separate values. Point them at
+      # least-privilege credentials in any deployment that accepts connector
+      # definitions from callers you do not fully trust.
+      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:-lakehouse}}
+      CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:-rustfsadmin}}
+      CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:-rustfsadmin}}
     restart: unless-stopped
 
   # P1 — S3-compatible object store, the default self-hosted implementation
@@ -1118,6 +1139,12 @@ services:
     working_dir: /work
     volumes:
       - ./ops/g3:/work
+      # R10 regression (step_verify_r10_schema_drift_guard): imports the
+      # SAME schema-ownership module Dagster runs
+      # (`dagster/dispar_orchestrate/bronze_catalog.py`) directly — it has
+      # no dagster SDK dependency (just `requests`), so a bare file mount
+      # is enough, no package install needed.
+      - ./dagster/dispar_orchestrate/bronze_catalog.py:/work/bronze_catalog.py:ro
     depends_on:
       lakehouse-api:
         condition: service_started

@@ -122,12 +122,21 @@ function ConnectorDetail({ id }: { id: string }) {
       {testAction.data ? (
         <p
           className={
-            testAction.data.ok
-              ? "text-sm text-emerald-600 dark:text-emerald-400"
-              : "text-sm text-destructive"
+            !testAction.data.supported
+              ? "text-sm text-muted-foreground"
+              : testAction.data.ok
+                ? "text-sm text-emerald-600 dark:text-emerald-400"
+                : "text-sm text-destructive"
           }
         >
-          {testAction.data.message} · {testAction.data.latencyMs} ms
+          {testAction.data.supported ? (
+            <>
+              {testAction.data.message}
+              {testAction.data.latencyMs !== null ? ` · ${testAction.data.latencyMs} ms` : ""}
+            </>
+          ) : (
+            <>Not testable · {testAction.data.message}</>
+          )}
         </p>
       ) : null}
       <MetadataList

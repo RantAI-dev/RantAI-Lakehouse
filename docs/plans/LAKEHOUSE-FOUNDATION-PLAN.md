@@ -43,14 +43,21 @@ store). Both are deliberate and documented.
 
 ### Stubbed — looks real, is not
 
-- **`connectors`** is a CRUD registry. `connectors::test_connection`
-  (`lakehouse-store/src/connectors.rs:444`) opens no socket: it bumps
-  `last_test_at` and returns stored health with hardcoded latency
-  (84ms / 2400ms). `secretRef` is never resolved to a credential.
-- **`0014_seed_connectors.sql`** seeds 28 connectors — Kafka, MQTT, MongoDB,
-  Oracle, SAP, SFTP, Iceberg, S3 — **none of which can dial**. Treat this as
-  demo fixture, not a requirements list; it shrinks to match reality in P6.
 - **Storage Cold/AI tiers** always report zero.
+
+**Resolved in P6:** `connectors::test_connection` used to open no socket —
+it bumped `last_test_at` and returned stored health with a hardcoded
+latency (84ms / 2400ms), and `0014_seed_connectors.sql` seeded 28
+connectors (Kafka, MQTT, MongoDB, Oracle, SAP, SFTP, Iceberg, S3) none of
+which could dial. As of P6: `POST /api/connectors/{id}/test` genuinely
+dials **PostgreSQL** and **S3-compatible object storage** (`lakehouse-api`'s
+new `connector_probe` module, resolving `secretRef` via ADR 0002's
+`SecretResolver`) and reports real measured latency; every other connector
+`type` returns `supported: false` with an honest message, never a
+fabricated result. `0022_prune_connector_seed.sql` shrank the seed to the
+two connectors this build can actually dial against the compose stack
+(`conn-pg-lakehouse`, `conn-s3-warehouse`) — see that migration and
+`connector_probe.rs`'s module doc comments for the full record.
 
 ### Doc accuracy
 
@@ -162,8 +169,8 @@ credentials, and dlt all block on it.
 | R7 | Nested struct/array/map type changes are not readable by ClickHouse | Medium | Enforce in the connector contract; reject at registration, not at read time |
 | R8 | New services inherit "Postgres-down is quiet" — failures surface only as request-time 503s | Medium | Healthcheck per service; revisit `GET /health/ready` (proposed in `OPERATIONS.md`) |
 | R9 | Six new components for a stack with zero object storage today | Medium | Strict gate order; no phase starts before the prior gate passes |
-| R11 | **Added in P5. Silent wrong answers, not errors — the most dangerous class in this build.** On ClickHouse 26.3, a bare `count()` / `count(*)` / `count(<col>)` against an Iceberg table with merge-on-read equality deletes (i.e. any CDC-fed Bronze table) takes a metadata-only fast path and **overcounts**, returning every physical row Debezium ever wrote including superseded ones — measured 6 where the correct answer is 4. Adding *any* `WHERE` or `GROUP BY` forces the row-scan path and is correct. Audited P5: no existing product code is affected, because the console reads the `bronze_meta.*` registry (MergeTree), not the Iceberg tables. **P6 is exactly when this bites** — surfacing Bronze in the console is the first time product code would count an Iceberg table | **High** | Never emit an unqualified `count()` against a Bronze Iceberg table. Use `count() … WHERE <always-true>` or `GROUP BY`. See [P5-RESULT.md](P5-RESULT.md); enforced today in `ops/g4/g4_test.py` and `bronze_catalog.py`. A lint or a shared helper in `lakehouse-clickhouse` would be better than convention |
-| R10 | **Added in P3.** The `bronze_meta.*` registry schema is now defined in two places — `demo/clickhouse/04_registry.sql` and `dagster/dispar_orchestrate/bronze_catalog.py`'s `CREATE TABLE IF NOT EXISTS`. Verified byte-identical today (same columns, types, `ReplacingMergeTree`, `ORDER BY`), but nothing enforces that. If one drifts, `IF NOT EXISTS` silently keeps the stale table and the console reads wrong data | Medium | The Dagster-side DDL exists because a bare compose stack never applies `demo/clickhouse/*.sql`. Fix properly by giving the registry schema one owner — either ship it as a migration the compose stack applies, or have the Dagster path assert the schema instead of creating it |
+| R11 | **Added in P5. Silent wrong answers, not errors — the most dangerous class in this build. Now enforced, not just conventional.** On ClickHouse 26.3, a bare `count()` / `count(*)` / `count(<col>)` against an Iceberg table with merge-on-read equality deletes (i.e. any CDC-fed Bronze table) takes a metadata-only fast path and **overcounts**, returning every physical row Debezium ever wrote including superseded ones — measured 6 where the correct answer is 4 (8 vs. 6 in the P5 stack that first hit it — see [P5-RESULT.md](P5-RESULT.md)). Adding *any* `WHERE` or `GROUP BY` forces the row-scan path and is correct. | **High** | `ops/lint/check_bare_iceberg_count.py`, a CI job (`.github/workflows/ci.yml`, `r11-bare-iceberg-count`), scans Python/Rust/TypeScript sources for a bare `count()`/`count(*)`/`count(<col>)` against a `DataLakeCatalog`/`icecat*`/`` `bronze.*` `` target lacking a `WHERE`/`GROUP BY`, and fails the build. Verified firing: running it cold caught two real pre-existing violations (`ops/g3a/g3a_test.py`, `rust/crates/lakehouse-iceberg/tests/g1_lakekeeper.rs`, both fixed to `WHERE 1`), and it was separately demonstrated catching a deliberately injected violation and clearing after removal. It never flags `bronze_meta.*`/`silver.*`/`serving.*`/`system.*` (MergeTree, safe) — see the script's own docstring for the exact false-positive/false-negative boundary of this text-based heuristic (not a SQL parser). |
+| R10 | **Added in P3. Now enforced, not just conventional.** The `bronze_meta.*` registry schema was defined in two places — `demo/clickhouse/04_registry.sql` and `dagster/dispar_orchestrate/bronze_catalog.py`'s `CREATE TABLE IF NOT EXISTS`. Verified byte-identical at the time (same columns, types, `ReplacingMergeTree`, `ORDER BY`), but nothing enforced that. If one drifted, `IF NOT EXISTS` would silently keep the stale table and the console would read wrong data with no error. | Medium | `demo/clickhouse/04_registry.sql` is out of scope for this build to edit, so a shared migration file was not an option. Instead, `bronze_catalog.py` is now the schema's single owner: `EXPECTED_SCHEMAS`/`_MAINTENANCE_RUN_SCHEMA` are the canonical column/engine/`ORDER BY` definitions, and `_assert_or_create_schema` either creates a missing table (the bare-compose-stack bootstrap case) or, if the table already exists, reads its actual shape back from `system.columns`/`system.tables` and raises `SchemaDriftError` on any mismatch instead of silently trusting an `IF NOT EXISTS` no-op. Verified against a live ClickHouse 26.3: a correct table passes clean, a deliberately mismatched expected schema (extra column, and separately a wrong `ORDER BY`) raises loudly, and a from-scratch bootstrap still creates all four tables (including P4's `bronze_meta.maintenance_run`, folded into the same ownership model). `ops/g3/g3_test.py`'s `step_verify_r10_schema_drift_guard` runs this same drift-detection call against the real, already-ingested `bronze_meta.dataset_catalog` table in CI. |
 
 R1 and R2 are the two that can force a redesign. Both are measured before
 anything is built on top of them.

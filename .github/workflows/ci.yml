@@ -62,6 +62,23 @@ jobs:
       - name: Scan corpus for credential-shaped values
         run: ./rust/tests/parity/check-no-secrets.sh
 
+  r11-bare-iceberg-count:
+    name: R11 · no bare count() against Bronze Iceberg tables
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md §5, R11 (measured in
+      # docs/plans/P5-RESULT.md): ClickHouse 26.3's bare, unqualified
+      # count() against a merge-on-read Iceberg table silently overcounts
+      # once equality deletes are present — a wrong number, not an error.
+      # See ops/lint/check_bare_iceberg_count.py for exactly what this
+      # does and does not cover.
+      - name: Check for bare count() against Bronze Iceberg tables
+        run: python3 ops/lint/check_bare_iceberg_count.py
+
   # ── Rust: fast feedback ──────────────────────────────────────────────
   fmt:
     name: Rust · fmt

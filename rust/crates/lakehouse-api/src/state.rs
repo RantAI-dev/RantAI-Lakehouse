@@ -8,6 +8,7 @@ use lakehouse_auth::{
     SessionAuthenticator,
 };
 use lakehouse_clickhouse::ChClient;
+use lakehouse_core::secret::{AllowlistedSecretResolver, DynSecretResolver, EnvSecretResolver};
 use lakehouse_dagster::DgClient;
 use lakehouse_embed::EmbedSecretResolver;
 use lakehouse_llm::LlmClient;
@@ -77,6 +78,24 @@ pub struct AppState {
     /// see `routes::identity::pool`, the first (and so far only) reader of
     /// this field.
     pub pg: Option<Arc<PgPool>>,
+    /// Resolves a connector's `secretRef` to an actual credential value —
+    /// [`crate::connector_probe`]'s only source of one, per ADR 0002 (see
+    /// its "Restricting connector secretRefs" addendum). **Deliberately
+    /// NOT the general-purpose [`EnvSecretResolver`]** the rest of this
+    /// process would use: `connector_probe` dials a `host` the SAME
+    /// caller who supplies `secretRef` also controls, so handing it an
+    /// unrestricted resolver would let a `connector:manage` principal name
+    /// any process secret (`env:DATABASE_URL`, `env:CH_PASSWORD`, ...) and
+    /// exfiltrate it to infrastructure they own. Always an
+    /// [`AllowlistedSecretResolver`] wrapping [`EnvSecretResolver`],
+    /// scoped to exactly [`CONNECTOR_ALLOWED_SECRET_REFS`] — the
+    /// `secretRef`s this deployment's OWN seeded connectors use
+    /// (`rust/migrations/0022_prune_connector_seed.sql`), nothing else.
+    /// `Arc<dyn DynSecretResolver>`, not a concrete type, so a later
+    /// `FileSecretResolver`/external-provider implementation swaps in
+    /// (still allowlisted) without changing this field's type or any
+    /// reader of it.
+    pub connector_secret_resolver: Arc<dyn DynSecretResolver>,
     /// The configured authenticators, or `None` under the exact same
     /// condition as [`Self::pg`] being `None` (no Postgres pool). When
     /// `None`, `crate::auth::AuthenticatedPrincipal` and every protected
@@ -84,6 +103,36 @@ pub struct AppState {
     /// `crate::auth::authenticators`.
     pub auth: Option<AuthState>,
 }
+
+/// The exact `secretRef`s [`AppState::connector_secret_resolver`] may
+/// resolve — see that field's doc comment and ADR 0002's addendum. This is
+/// deliberately a fixed, hardcoded list, not derived from configuration:
+/// widening it is a code change to make and review, not something a request
+/// or an environment variable can do — a `connector:manage` principal must
+/// never be able to expand their own reach.
+///
+/// These are CONNECTOR-DEDICATED variables, deliberately NOT the API's own
+/// secrets. The earlier list named `env:POSTGRES_PASSWORD` (the console's
+/// own database password) and `env:RUSTFS_ACCESS_KEY`/`env:RUSTFS_SECRET_KEY`
+/// (the object store's root keys). Allowlisting those made the guard far
+/// weaker than it read: `POST /api/connectors` takes a caller-chosen `host`,
+/// and `connector_probe`'s SSRF guard blocks only internal ranges, so a
+/// `connector:manage` principal could point a connector at infrastructure
+/// they own and have the API authenticate to it with the console's real
+/// database password. The allowlist stopped arbitrary refs; it did not stop
+/// the refs that mattered most.
+///
+/// A deployment MAY set these equal to the real credentials — that is its
+/// choice to make explicitly, in its own environment — but the API's own
+/// secrets are no longer reachable through a connector by name. Combined
+/// with [`crate::routes::connectors::rejects_allowlisted_secret_ref`], which
+/// refuses a USER-created connector that names one of these, the only
+/// connectors that can dial with them are the ones seeded by migration.
+pub(crate) const CONNECTOR_ALLOWED_SECRET_REFS: [&str; 3] = [
+    "env:CONNECTOR_PG_PASSWORD",
+    "env:CONNECTOR_S3_ACCESS_KEY",
+    "env:CONNECTOR_S3_SECRET_KEY",
+];
 
 /// Translate [`Config`]'s flat `oidc_*` env-derived fields into
 /// [`lakehouse_auth::OidcConfig`], or `None` if `OIDC` is not configured.
@@ -160,6 +209,13 @@ impl AppState {
             embed_secret: Arc::new(embed_secret),
             llm: Arc::new(llm),
             pg,
+            connector_secret_resolver: Arc::new(AllowlistedSecretResolver::new(
+                EnvSecretResolver::new(),
+                CONNECTOR_ALLOWED_SECRET_REFS
+                    .iter()
+                    .map(|s| (*s).to_owned()),
+                "connector-allowlist",
+            )),
             auth,
         }
     }

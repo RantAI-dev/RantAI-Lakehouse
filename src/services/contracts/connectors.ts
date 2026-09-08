@@ -35,8 +35,16 @@ export type ConnectorDetail = Connector & {
 }
 
 export type ConnectorTestResult = {
+  /** Whether a real connectivity probe succeeded. Always `false` when `supported` is `false`. */
   ok: boolean
-  latencyMs: number
+  /**
+   * Whether this build knows how to dial this connector's type at all.
+   * `false` for every type except PostgreSQL and S3-compatible object
+   * storage today — see `rust/crates/lakehouse-api/src/connector_probe.rs`.
+   */
+  supported: boolean
+  /** Real measured latency in milliseconds; `null` when `supported` is `false` (no attempt was made). */
+  latencyMs: number | null
   message: string
   testedAt: string
 }
@@ -47,6 +55,13 @@ export type CreateConnectorInput = {
   direction: Connector["direction"]
   host: string
   secretRef: string
+  /**
+   * Optional secondary reference, e.g. the secret-access-key half of an S3
+   * connector's access-key/secret-key pair. Without this, an API-created S3
+   * connector can never be tested — `connector_probe::probe_s3` requires
+   * both `secretRef` and `secretRefSecondary` to be set.
+   */
+  secretRefSecondary?: string
   environment: string
   tenant: string
   residency: string
