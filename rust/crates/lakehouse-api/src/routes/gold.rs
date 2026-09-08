@@ -123,7 +123,13 @@ fn check_export_token(
 /// export is not provisioned on this deployment — see ADR 0011: the
 /// `gold-export` principal's token is minted by `ops/oidc-mock` at compose
 /// bring-up onto a volume this service must have mounted).
-async fn read_catalog_token(path: &str) -> Result<SecretValue, ApiError> {
+///
+/// `pub(crate)` (not private) so `routes::ai::tools::gold` (T2.4 of the
+/// copilot-operations-handover plan) can read the SAME token this route
+/// reads, rather than a second copy of this file-read — see that module's
+/// doc comment for why the copilot tool calls this directly instead of
+/// going through [`export`]/[`read_back`]'s [`check_export_token`] guard.
+pub(crate) async fn read_catalog_token(path: &str) -> Result<SecretValue, ApiError> {
     let raw = tokio::fs::read_to_string(path).await.map_err(|err| {
         ApiError::Unavailable(format!(
             "Lakekeeper gold-export token tidak dapat dibaca dari {path:?}: {err} \

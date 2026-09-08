@@ -121,7 +121,12 @@ pub fn resource_for(
     match tool_name {
         "create_chart" | "update_chart" | "delete_chart" => (Some("chart"), str_field("id")),
         "create_board" => (Some("board"), str_field("id")),
-        "trigger_lakehouse_build" => (Some("pipeline"), str_field("runId")),
+        "trigger_lakehouse_build" | "run_bronze_maintenance" => {
+            (Some("pipeline"), str_field("runId"))
+        }
+        "kill_query" => (Some("workload"), str_field("id")),
+        "export_gold_mart" | "get_gold_export" => (Some("gold_mart"), str_field("mart")),
+        "draft_policy" => (Some("policy"), str_field("id")),
         _ => (None, None),
     }
 }

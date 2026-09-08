@@ -55,6 +55,31 @@ pub(super) async fn get_build_status(dagster: &lakehouse_dagster::DgClient) -> V
     }
 }
 
+// ── T2.2 Maintenance (see the copilot-operations-handover plan's C2) ────
+
+/// Launches `bronze_maintenance_job` — the SAME job `DgClient::launch_run`
+/// call [`trigger_build`] already makes for `refresh_lakehouse`, just a
+/// different job name. There is deliberately no run-config here: per C2,
+/// `launch_run` accepts a job name only, and the job itself always runs
+/// its dry pass then its applied pass in one go — there is no way to ask
+/// for only the dry half.
+pub(super) async fn run_bronze_maintenance(dagster: &lakehouse_dagster::DgClient) -> Value {
+    match dagster.launch_run("bronze_maintenance_job").await {
+        Ok(outcome) => {
+            if let Some(error) = outcome.error {
+                return json!({ "error": error });
+            }
+            json!({
+                "launched": true,
+                "runId": outcome.run_id,
+                "note": "Maintenance Bronze dijalankan: file data/manifest Iceberg yatim akan \
+                         dihapus. Cek hasilnya dengan get_maintenance_metrics.",
+            })
+        }
+        Err(err) => json!({ "error": err.to_string() }),
+    }
+}
+
 // ── T1.3 pipeline-operations tools ──────────────────────────────────────
 
 pub(super) async fn list_pipelines(state: &AppState) -> Value {

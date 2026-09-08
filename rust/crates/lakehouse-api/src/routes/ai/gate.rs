@@ -131,6 +131,13 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             "Menghapus chart {} dari dashboard secara permanen.",
             s("id")
         ),
+        "run_bronze_maintenance" => "Menjalankan maintenance Bronze: menghapus file data/manifest \
+            Iceberg yatim secara permanen (bukan dry run)."
+            .to_owned(),
+        "kill_query" => format!(
+            "Menghentikan paksa query ClickHouse {} (KILL QUERY sungguhan).",
+            s("id")
+        ),
         _ => format!(
             "Menjalankan tool berisiko tinggi {} yang butuh persetujuan manusia.",
             spec.name

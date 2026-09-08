@@ -412,6 +412,143 @@ fn run_saved_query_schema() -> Value {
             "required": ["id"] } } })
 }
 
+// ── T2.1 Governance reads ────────────────────────────────────────────────
+
+fn get_audit_history_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "get_audit_history",
+        "description": "Riwayat audit gabungan: run pipeline Dagster + aksi copilot/console (audit_event) — siapa/apa melakukan apa, kapan, dan hasilnya.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn list_classification_rules_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_classification_rules",
+        "description": "Daftar klasifikasi data per aset/kolom (public/internal/confidential/restricted) — hasil observasi ClickHouse digabung dengan aturan yang sudah ditulis (authored).",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn list_quality_rules_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_quality_rules",
+        "description": "Daftar aturan & hasil kualitas data (completeness/uniqueness/dll) — hasil observasi ClickHouse digabung dengan aturan yang sudah ditulis (authored).",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn get_cdc_health_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "get_cdc_health",
+        "description": "Kesehatan replication slot CDC (lag, WAL retained, status) per connector — untuk mendeteksi slot yang macet/tertinggal sebelum memenuhi disk database sumber.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn get_maintenance_metrics_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "get_maintenance_metrics",
+        "description": "Riwayat run maintenance Bronze (remove_orphan_files): file data/manifest yatim yang dihapus, per tabel. Catatan: expire_snapshots DITOLAK ClickHouse untuk tabel Iceberg berkatalog (Code: 48), jadi verb itu hanya tercatat sebagai skip, bukan hasil. Baca-saja — pakai run_bronze_maintenance untuk benar-benar menjalankan maintenance.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+// ── T2.2 Maintenance ─────────────────────────────────────────────────────
+//
+// See the copilot-operations-handover plan, section 3.7 correction C2:
+// there is no dry-run-only trigger. `bronze_maintenance_job`
+// (`dagster/dispar_orchestrate/maintenance.py:297-299`) always runs a dry
+// pass AND THEN the applied pass in the same job, and
+// `DgClient::launch_run` takes a job name only, with no run-config
+// override to split the two. So there is exactly ONE maintenance tool,
+// `WriteHigh` (it genuinely deletes orphan Iceberg data/manifest files),
+// never advertised as a "dry run".
+
+fn run_bronze_maintenance_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "run_bronze_maintenance",
+        "description": "Jalankan maintenance Bronze SEKARANG (job Dagster bronze_maintenance_job). Tindakan ini MENERAPKAN perubahan — menghapus file data/manifest Iceberg yatim (orphan) yang sudah tidak dipakai snapshot mana pun. Ini BUKAN dry run: tidak ada mode dry-run terpisah di build ini (satu job selalu menjalankan dry-run lalu applied run sekaligus). Tindakan ini butuh persetujuan manusia sebelum dijalankan.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+// ── T2.3 Workloads ───────────────────────────────────────────────────────
+
+fn list_workloads_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_workloads",
+        "description": "Daftar query ClickHouse yang sedang berjalan sekarang (workload), beserta id (\"w-<n>\") yang dipakai kill_query.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn kill_query_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "kill_query",
+        "description": "Hentikan paksa satu query ClickHouse yang sedang berjalan (KILL QUERY sungguhan, by id dari list_workloads, mis. \"w-0\"). Tindakan ini butuh persetujuan manusia sebelum dijalankan.",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
+}
+
+// ── T2.4 Gold export ─────────────────────────────────────────────────────
+
+fn export_gold_mart_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "export_gold_mart",
+        "description": "Ekspor satu mart Gold (serving.<mart>) ke tabel Iceberg Gold lewat Lakekeeper. PENTING: ekspor ini APPEND-ONLY — menjalankan ulang akan MENAMBAH baris baru (dengan timestamp _exported_at baru), bukan menggantikan yang lama. Konsumen tabel Iceberg-nya harus memfilter _exported_at sendiri; tool ini tidak idempoten.",
+        "parameters": { "type": "object", "properties": {
+            "mart": { "type": "string", "description": "nama mart Gold, mis. mart_wisman" } },
+            "required": ["mart"] } } })
+}
+
+fn get_gold_export_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "get_gold_export",
+        "description": "Baca balik tabel Iceberg Gold (by mart) lewat Lakekeeper: jumlah baris & format version saat ini — bukti independen dari klaim export_gold_mart, tidak menyentuh ClickHouse sama sekali.",
+        "parameters": { "type": "object", "properties": {
+            "mart": { "type": "string", "description": "nama mart Gold, mis. mart_wisman" } },
+            "required": ["mart"] } } })
+}
+
+// ── T2.5 Governance draft tools ──────────────────────────────────────────
+//
+// All three create a record in the least-active state the underlying
+// store can express, never anything a human would recognise as "already
+// active": `draft_policy` always forces `activate: false` (status
+// `"draft"` — `policy.status_check` also allows `"ready"`, which this
+// tool never produces). `quality_rule`/`classification_rule` have NO
+// activation concept in the schema at all (`0003_governance.sql`: no
+// `enabled`/`active` column, no `POST .../activate` route anywhere in
+// `routes::governance`) — every row `create_quality_rule`/
+// `create_classification_rule` inserts starts `last_status = 'warning'` /
+// `review_status = 'needs-review'` (an authored-but-unevaluated fact, per
+// `lakehouse_store::governance`'s module doc comment) and there is no API
+// path in this codebase that ever promotes one further. So these two
+// tools cannot accidentally create something "more active" than a human
+// clicking the same console form would — draft-only is already the only
+// state reachable.
+
+fn draft_policy_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "draft_policy",
+        "description": "Buat DRAFT kebijakan (policy) governance baru — SELALU berstatus draft, tidak pernah langsung aktif. Mengaktifkan kebijakan tetap aksi manusia di console (Governance → Policies).",
+        "parameters": { "type": "object", "properties": {
+            "name": { "type": "string" },
+            "kind": { "type": "string", "description": "mis. \"Row filter\", \"Agent autonomy\"" },
+            "subjects": { "type": "string", "description": "siapa/apa yang dikenai kebijakan" },
+            "resources": { "type": "string", "description": "apa yang dikenai kebijakan" },
+            "effect": { "type": "string", "description": "mis. \"Permit with obligation\", \"Require approval\"" },
+            "conditions": { "type": "string" },
+            "owner": { "type": "string" } },
+            "required": ["name", "kind", "subjects", "resources", "effect"] } } })
+}
+
+fn draft_classification_rule_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "draft_classification_rule",
+        "description": "Tulis aturan klasifikasi/masking baru untuk sebuah aset (opsional kolom tertentu). Selalu masuk sebagai \"needs-review\" — tidak ada status aktif terpisah di build ini; peninjauan tetap aksi manusia di console.",
+        "parameters": { "type": "object", "properties": {
+            "asset": { "type": "string" },
+            "column": { "type": "string" },
+            "classification": { "type": "string", "enum": ["public", "internal", "confidential", "restricted"] },
+            "maskingRule": { "type": "string" } },
+            "required": ["asset", "classification"] } } })
+}
+
+fn draft_quality_rule_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "draft_quality_rule",
+        "description": "Tulis aturan kualitas data baru untuk sebuah aset. Rule yang baru ditulis SELALU berstatus \"warning\" (belum pernah dievaluasi) — tidak ada status aktif terpisah di build ini.",
+        "parameters": { "type": "object", "properties": {
+            "name": { "type": "string" },
+            "asset": { "type": "string" },
+            "dimension": { "type": "string", "description": "mis. completeness, uniqueness, accuracy" },
+            "threshold": { "type": "string", "description": "mis. \">= 95%\"" },
+            "severity": { "type": "string", "enum": ["critical", "high", "medium", "low", "info"] } },
+            "required": ["name", "asset", "dimension", "threshold", "severity"] } } })
+}
+
 /// The AI Copilot's full tool table, in the exact order the LLM sees them
 /// in — [`tool_schemas`] preserves this order verbatim, and it is
 /// load-bearing for the committed snapshot in
@@ -650,6 +787,102 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "query:read",
     },
+    // ── T2.1 Governance reads ─────────────────────────────────────────
+    // `GET /api/governance/{kind}` is `RequiresAuth` for every kind
+    // (policy.rs:164, C1) — no narrower permission to carry.
+    ToolSpec {
+        name: "get_audit_history",
+        schema: get_audit_history_schema,
+        risk: Risk::Read,
+        permission: "",
+    },
+    ToolSpec {
+        name: "list_classification_rules",
+        schema: list_classification_rules_schema,
+        risk: Risk::Read,
+        permission: "",
+    },
+    ToolSpec {
+        name: "list_quality_rules",
+        schema: list_quality_rules_schema,
+        risk: Risk::Read,
+        permission: "",
+    },
+    ToolSpec {
+        name: "get_cdc_health",
+        schema: get_cdc_health_schema,
+        risk: Risk::Read,
+        permission: "",
+    },
+    ToolSpec {
+        name: "get_maintenance_metrics",
+        schema: get_maintenance_metrics_schema,
+        risk: Risk::Read,
+        permission: "",
+    },
+    // ── T2.2 Maintenance (C2: exactly one tool, see its schema doc) ────
+    ToolSpec {
+        name: "run_bronze_maintenance",
+        schema: run_bronze_maintenance_schema,
+        risk: Risk::WriteHigh,
+        permission: "",
+    },
+    // ── T2.3 Workloads ──────────────────────────────────────────────
+    // `GET /api/ops/workloads` is `RequiresAuth`; cancelling one requires
+    // `workload:cancel` (policy.rs:156, C1).
+    ToolSpec {
+        name: "list_workloads",
+        schema: list_workloads_schema,
+        risk: Risk::Read,
+        permission: "",
+    },
+    ToolSpec {
+        name: "kill_query",
+        schema: kill_query_schema,
+        risk: Risk::WriteHigh,
+        permission: "workload:cancel",
+    },
+    // ── T2.4 Gold export ────────────────────────────────────────────
+    // `GET`/`POST /api/gold/export/{mart}` are both `RequiresAuth`
+    // (policy.rs:197-198, C1) — the route's OWN `x-run-token`/service-
+    // identity guard is a separate, stricter door for the Dagster
+    // scheduler (ADR 0011), not something the copilot goes through; see
+    // `tools::gold`'s module doc comment for why bypassing it here is the
+    // same precedent as `run_alert_rule` bypassing `check_run_token`.
+    ToolSpec {
+        name: "export_gold_mart",
+        schema: export_gold_mart_schema,
+        risk: Risk::WriteLow,
+        permission: "",
+    },
+    ToolSpec {
+        name: "get_gold_export",
+        schema: get_gold_export_schema,
+        risk: Risk::Read,
+        permission: "",
+    },
+    // ── T2.5 Governance draft tools ─────────────────────────────────
+    // `POST /api/governance/policies` requires `policy:write`
+    // (policy.rs:163); `POST /api/governance/{kind}` (quality,
+    // classification) is `RequiresAuth` only (policy.rs:165, C1).
+    ToolSpec {
+        name: "draft_policy",
+        schema: draft_policy_schema,
+        risk: Risk::WriteLow,
+        permission: "policy:write",
+    },
+    ToolSpec {
+        name: "draft_classification_rule",
+        schema: draft_classification_rule_schema,
+        risk: Risk::WriteLow,
+        permission: "",
+    },
+    ToolSpec {
+        name: "draft_quality_rule",
+        schema: draft_quality_rule_schema,
+        risk: Risk::WriteLow,
+        permission: "",
+    },
 ];
 
 /// The `OpenAI`-compatible `tools` schema array, matching
@@ -700,10 +933,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_has_thirty_four_entries() {
+    fn tool_schemas_has_forty_seven_entries() {
         // 15 pre-T1 tools + 19 Tier 1 operations tools (5 alerts + 4
-        // connectors + 7 pipelines + 3 saved queries).
-        assert_eq!(tool_schemas().len(), 34);
+        // connectors + 7 pipelines + 3 saved queries) + 13 Tier 2 tools
+        // (5 governance reads + 1 maintenance + 2 workloads + 2 gold
+        // export + 3 governance drafts).
+        assert_eq!(tool_schemas().len(), 47);
     }
 
     /// Characterization snapshot (T0.1): `tool_schemas()`, now derived
@@ -809,12 +1044,30 @@ mod tests {
             .iter()
             .map(|v| v["function"]["name"].as_str().expect("name").to_owned())
             .collect();
-        // `get_quality` and `list_alert_rules` (T1.1: `GET /api/alerts` is
-        // `RequiresAuth`, no narrower permission) are the only two tools
-        // with an empty `permission` today, in `TOOLS` order.
+        // Every tool whose `permission` is `""` ("authenticated only"), in
+        // `TOOLS` order: `get_quality`/`list_alert_rules` (T1.1) plus the
+        // Tier 2 tools that carry no narrower permission than
+        // `RequiresAuth` (C1) — every T2.1 governance read,
+        // `run_bronze_maintenance`, `list_workloads`, both gold export
+        // tools, and the two rule-level draft tools (`draft_policy` needs
+        // `policy:write`, so it is NOT in this list).
         assert_eq!(
             offered_names,
-            vec!["get_quality".to_owned(), "list_alert_rules".to_owned()]
+            vec![
+                "get_quality".to_owned(),
+                "list_alert_rules".to_owned(),
+                "get_audit_history".to_owned(),
+                "list_classification_rules".to_owned(),
+                "list_quality_rules".to_owned(),
+                "get_cdc_health".to_owned(),
+                "get_maintenance_metrics".to_owned(),
+                "run_bronze_maintenance".to_owned(),
+                "list_workloads".to_owned(),
+                "export_gold_mart".to_owned(),
+                "get_gold_export".to_owned(),
+                "draft_classification_rule".to_owned(),
+                "draft_quality_rule".to_owned(),
+            ]
         );
     }
 
@@ -843,6 +1096,34 @@ mod tests {
             ("save_query", Risk::WriteLow, "query:read"),
             ("list_saved_queries", Risk::Read, "query:read"),
             ("run_saved_query", Risk::Read, "query:read"),
+        ];
+        for (name, risk, permission) in expected {
+            let spec = find(name).unwrap_or_else(|| panic!("{name} must be registered"));
+            assert_eq!(spec.risk, *risk, "{name} risk");
+            assert_eq!(spec.permission, *permission, "{name} permission");
+        }
+    }
+
+    /// T2.1-T2.5: every Tier 2 tool has exactly the risk and permission
+    /// specified in the copilot-operations-handover plan's section 3.7 C1
+    /// table (verified against `policy.rs::POLICY_TABLE`), with
+    /// `run_bronze_maintenance` and `kill_query` per C2/C1 as `WriteHigh`.
+    #[test]
+    fn tier2_tools_have_the_documented_risk_and_permission() {
+        let expected: &[(&str, Risk, &str)] = &[
+            ("get_audit_history", Risk::Read, ""),
+            ("list_classification_rules", Risk::Read, ""),
+            ("list_quality_rules", Risk::Read, ""),
+            ("get_cdc_health", Risk::Read, ""),
+            ("get_maintenance_metrics", Risk::Read, ""),
+            ("run_bronze_maintenance", Risk::WriteHigh, ""),
+            ("list_workloads", Risk::Read, ""),
+            ("kill_query", Risk::WriteHigh, "workload:cancel"),
+            ("export_gold_mart", Risk::WriteLow, ""),
+            ("get_gold_export", Risk::Read, ""),
+            ("draft_policy", Risk::WriteLow, "policy:write"),
+            ("draft_classification_rule", Risk::WriteLow, ""),
+            ("draft_quality_rule", Risk::WriteLow, ""),
         ];
         for (name, risk, permission) in expected {
             let spec = find(name).unwrap_or_else(|| panic!("{name} must be registered"));

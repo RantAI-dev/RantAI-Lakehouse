@@ -10,11 +10,19 @@
 //! - [`alerts`] — Tier 1 alert-rule tools (T1.1).
 //! - [`connectors`] — Tier 1 connector tools (T1.2).
 //! - [`queries`] — Tier 1 saved-query tools (T1.4).
+//! - [`governance`] — Tier 2 governance reads + draft tools (T2.1, T2.5).
+//! - [`ops`] — Tier 2 workload tools (T2.3).
+//! - [`gold`] — Tier 2 Gold export tools (T2.4). `run_bronze_maintenance`
+//!   (T2.2) lives in [`pipelines`] alongside the other `DgClient::launch_run`
+//!   caller (`trigger_build`), rather than a one-tool `maintenance` module.
 
 mod alerts;
 mod connectors;
 mod dashboards;
 mod data;
+mod gold;
+mod governance;
+mod ops;
 mod pipelines;
 mod queries;
 
@@ -118,6 +126,19 @@ pub(in crate::routes) async fn run_tool(
         "save_query" => queries::save_query(state, args).await,
         "list_saved_queries" => queries::list_saved_queries(state).await,
         "run_saved_query" => queries::run_saved_query(state, args).await,
+        "get_audit_history" => governance::get_audit_history(state).await,
+        "list_classification_rules" => governance::list_classification_rules(state).await,
+        "list_quality_rules" => governance::list_quality_rules(state).await,
+        "get_cdc_health" => governance::get_cdc_health(state).await,
+        "get_maintenance_metrics" => governance::get_maintenance_metrics(state).await,
+        "run_bronze_maintenance" => pipelines::run_bronze_maintenance(&state.dagster).await,
+        "list_workloads" => ops::list_workloads(state).await,
+        "kill_query" => ops::kill_query(state, args).await,
+        "export_gold_mart" => gold::export_gold_mart(state, args).await,
+        "get_gold_export" => gold::get_gold_export(state, args).await,
+        "draft_policy" => governance::draft_policy(state, args).await,
+        "draft_classification_rule" => governance::draft_classification_rule(state, args).await,
+        "draft_quality_rule" => governance::draft_quality_rule(state, args).await,
         other => {
             unreachable!(
                 "registry::find recognised {other:?} but run_tool has no dispatch arm for it"
