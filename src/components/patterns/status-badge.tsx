@@ -1,5 +1,7 @@
 import { cn } from "@/lib/utils"
 import {
+  AGENT_RUN_STATUS_DESCRIPTION,
+  AGENT_RUN_STATUS_LABEL,
   ALERT_STATUS_LABEL,
   APPROVAL_STATUS_LABEL,
   AUDIT_OUTCOME_LABEL,
@@ -9,9 +11,11 @@ import {
   ENTITY_STATUS_DESCRIPTION,
   ENTITY_STATUS_LABEL,
   HEALTH_LABEL,
+  RUN_STEP_STATUS_LABEL,
   SEVERITY_LABEL,
   STORAGE_TIER_LABEL,
   WORKLOAD_STATUS_LABEL,
+  type AgentRunStatus,
   type AlertStatus,
   type ApprovalStatus,
   type AuditOutcome,
@@ -20,6 +24,7 @@ import {
   type Classification,
   type EntityStatus,
   type Health,
+  type RunStepStatus,
   type Severity,
   type StorageTier,
   type WorkloadStatus,
@@ -264,6 +269,61 @@ export function ApprovalBadge({
   return (
     <Pill tone={APPROVAL_TONE[status]} className={className}>
       {APPROVAL_STATUS_LABEL[status]}
+    </Pill>
+  )
+}
+
+const AGENT_RUN_STATUS_TONE: Record<AgentRunStatus, Tone> = {
+  running: "info",
+  succeeded: "success",
+  failed: "destructive",
+  waiting_approval: "warning",
+  rejected: "destructive",
+}
+
+/** Lifecycle pill for a digital-employee `agent_run` — distinct from
+ * `StatusBadge`/`EntityStatus` because a run can be `waiting_approval` or
+ * `rejected`, neither of which is a generic entity status. */
+export function AgentRunStatusBadge({
+  status,
+  className,
+}: {
+  status: AgentRunStatus
+  className?: string
+}) {
+  return (
+    <Pill
+      tone={AGENT_RUN_STATUS_TONE[status]}
+      title={AGENT_RUN_STATUS_DESCRIPTION[status]}
+      className={className}
+    >
+      {status === "running" ? (
+        <span className="size-1.5 animate-pulse rounded-full bg-current" aria-hidden />
+      ) : null}
+      {AGENT_RUN_STATUS_LABEL[status]}
+    </Pill>
+  )
+}
+
+const RUN_STEP_STATUS_TONE: Record<RunStepStatus, Tone> = {
+  pending: "warning",
+  succeeded: "success",
+  failed: "destructive",
+  refused: "warning",
+}
+
+/** Status pill for one step in an `agent_run.steps` trace (see
+ * `RunTimeline`). */
+export function RunStepStatusBadge({
+  status,
+  className,
+}: {
+  status: RunStepStatus
+  className?: string
+}) {
+  return (
+    <Pill tone={RUN_STEP_STATUS_TONE[status]} className={className}>
+      {RUN_STEP_STATUS_LABEL[status]}
     </Pill>
   )
 }

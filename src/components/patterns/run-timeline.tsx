@@ -1,11 +1,11 @@
 import { cn } from "@/lib/utils"
-import type { EntityStatus } from "@/lib/status"
-import { StatusBadge } from "./status-badge"
+import type { RunStepStatus } from "@/lib/status"
+import { RunStepStatusBadge } from "./status-badge"
 
 export type TimelineStep = {
   id: string
   label: string
-  status: EntityStatus
+  status: RunStepStatus
   at?: string
   description?: string
   meta?: React.ReactNode
@@ -35,13 +35,10 @@ export function RunTimeline({
           <span
             className={cn(
               "mt-1 size-[15px] shrink-0 rounded-full border-2 border-background ring-1",
-              step.status === "completed" && "bg-emerald-500 ring-emerald-500/40",
-              step.status === "running" && "animate-pulse bg-primary ring-primary/40",
+              step.status === "succeeded" && "bg-emerald-500 ring-emerald-500/40",
               step.status === "failed" && "bg-destructive ring-destructive/40",
-              step.status === "degraded" && "bg-amber-500 ring-amber-500/40",
-              !["completed", "running", "failed", "degraded"].includes(
-                step.status
-              ) && "bg-muted-foreground/40 ring-border"
+              (step.status === "pending" || step.status === "refused") &&
+                "bg-amber-500 ring-amber-500/40"
             )}
             aria-hidden
           />
@@ -50,7 +47,7 @@ export function RunTimeline({
               <span className="text-sm font-medium text-foreground">
                 {step.label}
               </span>
-              <StatusBadge status={step.status} />
+              <RunStepStatusBadge status={step.status} />
               {step.at ? (
                 <span className="text-xs text-muted-foreground">{step.at}</span>
               ) : null}

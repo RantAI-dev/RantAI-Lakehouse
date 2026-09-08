@@ -1,8 +1,10 @@
 import type {
+  AgentRunStatus,
   ApprovalStatus,
   AutonomyLevel,
   EntityStatus,
   Health,
+  RunStepStatus,
 } from "@/lib/status"
 
 export type AgentWorkflow = {
@@ -31,13 +33,33 @@ export type DigitalEmployee = {
   approvalRate: number
   successRate: number
   recentRuns: number
+  /**
+   * The instruction a headless run (`POST
+   * /api/agents/employees/{id}/run`) sends to the copilot. `null`/absent
+   * means this employee has no prompt and cannot run without a
+   * per-call override in the run request body.
+   */
+  prompt: string | null
+  /** Cron expression for a Dagster schedule, or `null` for manual-only. */
+  scheduleCron: string | null
+  /** The copilot mode a run uses. */
+  mode: "ask" | "build"
+  /**
+   * Ceiling on what this employee's runs may do, as a comma-separated
+   * `resource:action` list (same format as `role.permissions`). Empty
+   * string means authenticated-only, no permissioned tools — this is a
+   * CEILING, not a grant: it never gives the triggering user (or the
+   * schedule token) any permission they don't already have, it only
+   * narrows what the run itself may call.
+   */
+  permissions: string
 }
 
 export type AgentRun = {
   id: string
   employeeId: string
   workflowId?: string
-  status: EntityStatus
+  status: AgentRunStatus
   trigger: string
   actor: string
   delegatedUser?: string
@@ -47,11 +69,17 @@ export type AgentRun = {
   steps: {
     id: string
     label: string
-    status: EntityStatus
+    status: RunStepStatus
     detail: string
   }[]
   approvals: { id: string; status: ApprovalStatus; at?: string }[]
   auditEventId?: string
+}
+
+/** Optional body for `POST /api/agents/employees/{id}/run`. */
+export type RunEmployeeInput = {
+  /** Overrides the employee's own `prompt` for this run only. */
+  prompt?: string
 }
 
 export type AgentTool = {
@@ -160,4 +188,16 @@ export interface AgentService {
   suspendEmployee(id: string, signal?: AbortSignal): Promise<DigitalEmployee>
   resumeEmployee(id: string, signal?: AbortSignal): Promise<DigitalEmployee>
   revokeEmployee(id: string, signal?: AbortSignal): Promise<DigitalEmployee>
+  /**
+   * `POST /api/agents/employees/{id}/run` — runs the employee headlessly
+   * ("Run now"). Refuses with `invalid_request` for a suspended/revoked
+   * employee (409), a missing prompt with no override (400), and the
+   * reserved `emp-copilot` row (400) — the thrown `ServiceError.message`
+   * is the backend's own specific reason in every case.
+   */
+  runEmployee(
+    id: string,
+    input?: RunEmployeeInput,
+    signal?: AbortSignal
+  ): Promise<AgentRun>
 }
