@@ -10,56 +10,59 @@ job is to be the scheduled trigger: call
 result. See `gold_export.py`'s module doc for why an HTTP call to
 `lakehouse-api` rather than reimplementing anything here.
 
-# Why there is no live schedule factory in this module
+# Corrected 2026-09-09: `AGENT_RUN_TOKEN` now IS a real credential
 
-The plan (`docs/superpowers/plans/2026-09-08-copilot-operations-handover.md`,
-§3.4) describes building one `ScheduleDefinition` per employee by reading
-`GET /api/agents/employees` at Dagster code-load time. That route is
-`Policy::RequiresAuth` in `rust/crates/lakehouse-api/src/policy.rs` —
-verified directly against `rust/crates/lakehouse-api/src/policy.rs::auth_gate`
-and its own test suite: `auth_gate` demands a REAL credential (a session
-cookie or an `Authorization: Bearer` service/OIDC token) BEFORE the handler
-ever runs, for every `RequiresAuth`/`RequiresPermission` route. `AGENT_RUN_TOKEN`
-(the `x-run-token` header this module sends) is not such a credential — it is
-checked only inside `run_employee`'s own body, which `auth_gate` never
-reaches without a bearer/cookie first. `rust/crates/lakehouse-api/tests/agents_run.rs::valid_token_runs_the_employee_to_a_terminal_status_with_steps`
-proves this directly: even a VALID `x-run-token` still 401s without an
-accompanying session cookie in the test, and the comment there says so
-explicitly ("The router's `Policy::RequiresAuth` floor still needs a REAL
-credential ... regardless of `x-run-token`").
+Earlier revisions of this module explained why no schedule factory could be
+written here: `POST /api/agents/employees/{id}/run`'s
+`Policy::RequiresAuth` entry in `rust/crates/lakehouse-api/src/policy.rs`
+is a FLOOR — `auth_gate` demands a real, authenticated
+`lakehouse_auth::Principal` before the handler's own `x-run-token` check
+ever runs, and this compose stack minted no such credential for Dagster.
 
-This compose stack provisions no service-identity bearer token for Dagster
-(no `service_credential` row, no minted token file mounted into the
-`dagster-code-location` container) — exactly the same gap `gold_export_job`
-documents for itself. So:
+That gap is now closed: `lakehouse-api::main::bootstrap_agent_run_service`
+idempotently seeds a `service_identity` ("agent-run-scheduler", scoped
+ONLY to `agent:manage` — never `*:*`) plus a matching `service_credential`
+from `AGENT_RUN_TOKEN` on every boot. This module now sends that SAME
+value two ways on every call (see `_headers` below):
 
-* Building a schedule factory that calls `GET /api/agents/employees` at
-  code-load time would, on this stack, ALWAYS get a 401 back. Doing that
-  unconditionally would either (a) crash the whole code location the moment
-  Dagster loads it (breaking bronze ingest, maintenance, and the slot check
-  too — unacceptable), or (b) require swallowing every error into "zero
-  schedules" — at which point the factory is dead code that can never
-  produce a schedule under any config this repo actually ships, which is
-  worse than not writing it: a reader sees a factory function and
-  reasonably assumes it sometimes fires.
-* Per the plan's own instruction for this exact situation ("if you cannot
-  authenticate ... follow the gold_export_job precedent: register the job
-  WITHOUT schedules, document precisely why"), `agent_run_job` below is
-  registered in `definitions.py` with NO schedule attached, and none is
-  invented here.
+* `Authorization: Bearer <AGENT_RUN_TOKEN>` — an opaque (non-JWT-shaped)
+  bearer token, which `lakehouse-api::auth`'s shape-based dispatch routes
+  to `lakehouse_auth::service_token::ServiceTokenAuthenticator` (see that
+  module's doc comment on "Cookie vs. bearer, and disambiguating a service
+  token from an OIDC token"). This is what clears `auth_gate`'s
+  `Policy::RequiresAuth` floor.
+* `x-run-token: <AGENT_RUN_TOKEN>` — `routes::agents::check_employee_run_auth`'s
+  OWN check inside the handler body, which (when it matches) sets
+  `agent_run.trigger = "schedule"` rather than `"manual"`.
 
-To enable real schedules: give Dagster a genuine credential — mint a
-`service_credential` for a `schedule` principal (same primitive
-`gold_export.py`'s Lakekeeper-side token file uses, just for `lakehouse-api`
-auth instead), mount it into `dagster-code-location` the way
-`LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE` is mounted, send it as
-`Authorization: Bearer <token>` from a schedule-factory HTTP call to
-`GET /api/agents/employees` at code-load time, and STILL wrap that call so a
-transient failure yields zero schedules and a loud `context.log`-equivalent
-warning (Dagster evaluates code locations synchronously at load time, so
-`print`/`warnings.warn` is what is available outside an op/job body) rather
-than an exception — that half of the plan's caution applies regardless of
-how auth eventually gets solved.
+With `AGENT_RUN_TOKEN` unset, both `_headers` and the schedule factory
+below degrade to their old inert posture: no bearer, no `x-run-token`, and
+(see `_fetch_schedulable_employees`) zero schedules — nothing here assumes
+a token is present.
+
+# The schedule factory, and why it cannot ever crash this code location
+
+Per the plan (§3.4): at Dagster CODE-LOAD time (module import — this file
+runs top-level code the moment the code location loads, no op/job
+execution involved), read `GET /api/agents/employees` and build one
+`ScheduleDefinition` per employee with a non-NULL `scheduleCron`
+(`lakehouse_store::agents::DigitalEmployee::schedule_cron`, camelCase over
+the wire).
+
+Dagster evaluates every job/schedule in ONE code location at once — a
+`bronze_ingest_job`, `bronze_maintenance_job`, and
+`replication_slot_check_job` all live here too (`definitions.py`). An
+uncaught exception importing this module would take ALL of them down, not
+just the agent-run schedules. So `_fetch_schedulable_employees` below
+catches every failure mode this HTTP call can hit — unreachable
+`lakehouse-api` (`requests.RequestException`), a non-2xx response
+(`requests.HTTPError` from `raise_for_status()`, covering 401 when the
+token is wrong/stale as much as any other status), and a malformed/non-list
+JSON body — and returns `[]` in every case, after a `print`-based warning
+(there is no `context.log` outside an op/job body at import time; `print`
+is what Dagster's own code-location loader captures into its own logs).
+`test_agent_runs.py` proves both the "unreachable" and the "401" cases
+load with zero schedules and no exception.
 """
 
 from __future__ import annotations
@@ -70,7 +73,7 @@ from typing import Any
 
 import requests
 
-from dagster import Definitions, Field, job, op
+from dagster import Definitions, Field, ScheduleDefinition, job, op
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, record_maintenance_run
 
 
@@ -82,15 +85,11 @@ def _env(name: str, default: str) -> str:
 @dataclass(frozen=True)
 class AgentRunConfig:
     api_url: str
-    # D4 shape (`routes::agents::check_employee_run_auth`): a shared token,
-    # set identically here and on `lakehouse-api` (both read
-    # `AGENT_RUN_TOKEN` from the same compose `.env`). As the module doc
-    # above explains, this token alone does NOT clear `auth_gate`'s
-    # `Policy::RequiresAuth` floor on `POST /api/agents/employees/{id}/run`
-    # — a real bearer/session credential is also required, which this job
-    # does not carry today. Kept anyway (never invented away) so the run
-    # at least reaches the handler's own token check the moment a service
-    # credential is added, without a second code change here.
+    # D4 shape (`routes::agents::check_employee_run_auth`), PLUS (as of
+    # the fix described in the module doc above) the bearer credential
+    # that clears `auth_gate`'s `Policy::RequiresAuth` floor in the first
+    # place: a shared token, set identically here and on `lakehouse-api`
+    # (both read `AGENT_RUN_TOKEN` from the same compose `.env`).
     run_token: str
 
     @classmethod
@@ -103,8 +102,17 @@ class AgentRunConfig:
 
 def _headers(cfg: AgentRunConfig) -> dict[str, str]:
     # Never log this value — see `run_agent_employee`'s use of it below,
-    # which only ever logs the header's PRESENCE, never its content.
-    return {"x-run-token": cfg.run_token} if cfg.run_token else {}
+    # which only ever logs the header's PRESENCE, never its content. Both
+    # headers carry the SAME token: `Authorization: Bearer` authenticates
+    # the call at all (`auth_gate`'s floor); `x-run-token` is
+    # `check_employee_run_auth`'s own belt-and-suspenders check inside the
+    # handler (see the module doc comment above).
+    if not cfg.run_token:
+        return {}
+    return {
+        "x-run-token": cfg.run_token,
+        "Authorization": f"Bearer {cfg.run_token}",
+    }
 
 
 def post_run(cfg: AgentRunConfig, employee_id: str) -> requests.Response:
@@ -237,18 +245,126 @@ def run_agent_employee(context) -> dict[str, Any]:
 def agent_run_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `agent_run_job`. Launch with run
     config `{"ops": {"run_agent_employee": {"config": {"employee_id": "..."}}}}`
-    — either from the Dagster launchpad for an on-demand run, or from a
-    future schedule's `run_config_fn` once a real service credential lets a
-    schedule authenticate (see this module's doc comment)."""
+    — either from the Dagster launchpad for an on-demand run, or from one
+    of `agent_run_schedules` below."""
     run_agent_employee()
 
 
-# NOT scheduled — see this module's doc comment for the full reasoning.
-# `agent_run_job` is registered in `definitions.py` so it remains launchable
-# on demand (e.g. an operator triggering one employee's run manually from
-# the Dagster UI), exactly how `gold_export_job` stays registered without a
-# schedule.
+def _employee_run_config(employee_id: str) -> dict[str, Any]:
+    """The run config `agent_run_job` needs for one `employee_id` — shared
+    by every generated `ScheduleDefinition` so there is exactly one place
+    that knows this job's config shape."""
+    return {"ops": {"run_agent_employee": {"config": {"employee_id": employee_id}}}}
+
+
+def _fetch_schedulable_employees(cfg: AgentRunConfig) -> list[dict[str, Any]]:
+    """`GET /api/agents/employees` (with the same `Authorization: Bearer`
+    credential `post_run` sends), filtered to employees carrying a
+    non-empty `scheduleCron`. Returns `[]` on ANY failure — see the module
+    doc comment ("The schedule factory, and why it cannot ever crash this
+    code location") for why this must never raise: it runs at Dagster
+    code-load time, alongside every other job/schedule in this code
+    location.
+
+    Also returns `[]` immediately, with no HTTP call at all, when
+    `cfg.run_token` is empty — an unset `AGENT_RUN_TOKEN` means "digital
+    employee schedules are inert", not "try anonymously and see what
+    happens" (the route is `Policy::RequiresAuth`; an unauthenticated call
+    would 401 every single time regardless)."""
+    if not cfg.run_token:
+        print(
+            "dispar_orchestrate.agent_runs: AGENT_RUN_TOKEN is unset; "
+            "loading with zero digital-employee schedules"
+        )
+        return []
+
+    try:
+        resp = requests.get(
+            f"{cfg.api_url}/api/agents/employees",
+            headers=_headers(cfg),
+            timeout=10,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        print(
+            f"WARNING: dispar_orchestrate.agent_runs: could not reach "
+            f"lakehouse-api to build digital-employee schedules ({exc}); "
+            "loading with zero agent schedules"
+        )
+        return []
+
+    try:
+        employees = resp.json()
+    except ValueError as exc:
+        print(
+            f"WARNING: dispar_orchestrate.agent_runs: lakehouse-api returned "
+            f"a non-JSON /api/agents/employees body ({exc}); loading with "
+            "zero agent schedules"
+        )
+        return []
+
+    if not isinstance(employees, list):
+        print(
+            "WARNING: dispar_orchestrate.agent_runs: /api/agents/employees "
+            f"returned {type(employees).__name__}, expected a list; loading "
+            "with zero agent schedules"
+        )
+        return []
+
+    return [
+        employee
+        for employee in employees
+        if isinstance(employee, dict) and employee.get("id") and employee.get("scheduleCron")
+    ]
+
+
+def _schedule_name(employee_id: str) -> str:
+    """A Dagster-legal schedule name derived from `employee_id`. Dagster
+    names must match `^[A-Za-z0-9_]+$` (`dagster._core.definitions.utils.check_valid_chars`)
+    — `agent_employee.id` values in this repo are conventionally
+    hyphenated (e.g. `emp-daily-quality-check`, `emp-copilot`), so hyphens
+    (and any other non-matching character) are replaced with `_` rather
+    than rejected outright. Collisions between two employee ids that only
+    differ by hyphen-vs-underscore are not a concern this schema's own
+    `agent_employee.id` primary key already rules out (two distinct ids
+    can't exist), so this mapping never needs to be reversed."""
+    return "agent_run_schedule__" + "".join(
+        char if char.isalnum() or char == "_" else "_" for char in employee_id
+    )
+
+
+def build_agent_run_schedules(cfg: AgentRunConfig) -> list[ScheduleDefinition]:
+    """One `ScheduleDefinition` per employee `_fetch_schedulable_employees`
+    returns, named after the employee id (via `_schedule_name`) so two
+    employees never collide and a schedule's identity is stable across
+    reloads. Never raises (see `_fetch_schedulable_employees`)."""
+    schedules: list[ScheduleDefinition] = []
+    for employee in _fetch_schedulable_employees(cfg):
+        employee_id = employee["id"]
+        cron = employee["scheduleCron"]
+        schedules.append(
+            ScheduleDefinition(
+                name=_schedule_name(employee_id),
+                cron_schedule=cron,
+                job=agent_run_job,
+                run_config=_employee_run_config(employee_id),
+            )
+        )
+    return schedules
+
+
+# Built once, at code-load time (module import), per the plan (§3.4):
+# "a schedule factory that reads employees with schedule_cron from
+# lakehouse-api ... at code-load time and builds one ScheduleDefinition
+# per employee". See `build_agent_run_schedules`/
+# `_fetch_schedulable_employees` for why this expression can never raise —
+# it degrades to `[]` instead. `agent_run_job` stays registered in
+# `definitions.py` regardless of whether any schedule was built, so it
+# remains launchable on demand from the Dagster UI, exactly how
+# `gold_export_job` does.
+agent_run_schedules: list[ScheduleDefinition] = build_agent_run_schedules(AgentRunConfig.from_env())
 
 agent_runs_defs = Definitions(
     jobs=[agent_run_job],
+    schedules=agent_run_schedules,
 )

@@ -507,3 +507,95 @@ async fn tenant_membership_is_not_used_to_scope_any_domain_query() {
          to assert the new, correct behavior instead of this documented gap"
     );
 }
+
+/// Seeds a service identity + credential the exact same way
+/// `main::bootstrap_agent_run_service` does (same production functions,
+/// same single `agent:manage` scope) — this file can't call that function
+/// directly (private in the `bin` crate; see `create_bootstrap_admin`
+/// above for the identical constraint), so it reuses the real
+/// `lakehouse_store::identity::create_service_identity`/
+/// `lakehouse_auth::service_token::ensure_service_credential` calls
+/// instead of reimplementing the shape by hand.
+async fn seed_agent_run_service_credential(pool: &sqlx::PgPool, token: &str) {
+    let identity = lakehouse_store::identity::create_service_identity(
+        pool,
+        &lakehouse_store::identity::CreateServiceIdentityInput {
+            name: "test-agent-run-scheduler".to_owned(),
+            scopes: vec!["agent:manage".to_owned()],
+            environment: "test".to_owned(),
+        },
+    )
+    .await
+    .expect("seed the agent-run service identity fixture");
+    let service_identity_id: Uuid = identity.id.parse().expect("a UUID identity id");
+    lakehouse_auth::service_token::ensure_service_credential(
+        pool,
+        service_identity_id,
+        &Secret::new(token.to_owned()),
+    )
+    .await
+    .expect("seed the agent-run service credential fixture");
+}
+
+/// Named security regression for the copilot-operations-handover bootstrap
+/// (`main::bootstrap_agent_run_service`): the service identity Dagster's
+/// digital-employee schedules authenticate as is scoped to EXACTLY
+/// `agent:manage` — it authenticates
+/// `POST /api/agents/employees/{id}/run` (the one thing it exists for),
+/// but the SAME credential is refused a route needing a permission it was
+/// never granted (`identity:write`). This is the invariant that makes
+/// bootstrapping the credential safe: closing the "Dagster has no way to
+/// authenticate" gap must never imply "and now Dagster's token can do
+/// anything a Platform Admin can."
+#[tokio::test]
+async fn agent_run_service_identity_cannot_do_more_than_agent_manage() {
+    const TOKEN: &str = "svc-agent-run-bootstrap-fixture-token";
+    let TestApp { router, pool } = spin_up().await;
+    seed_agent_run_service_credential(&pool, TOKEN).await;
+
+    sqlx::query(
+        "INSERT INTO agent_employee (id, name, purpose, autonomy, status, prompt, mode, \
+         permissions) VALUES ('emp-scope-test', 'scope-test-employee', 'test purpose', \
+         'L1', 'ready', 'p', 'ask', '')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed a headless-runnable employee fixture");
+
+    // The bearer credential authenticates and REACHES the run route (the
+    // one thing this identity is scoped for) — not a 401/403. Whatever the
+    // headless loop itself then does (the LLM upstream is the fail-fast
+    // dead one `spin_up` always points at) is irrelevant to this
+    // assertion; only the auth outcome is.
+    let run_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/agents/employees/emp-scope-test/run")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::from("{}"))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_ne!(run_resp.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(run_resp.status(), StatusCode::FORBIDDEN);
+
+    // But the SAME credential is refused a route needing `identity:write`
+    // — the bootstrap identity's `agent:manage` scope is a ceiling.
+    let write_resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/identity/users")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(Body::from("{}"))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+    assert_eq!(write_resp.status(), StatusCode::FORBIDDEN);
+}

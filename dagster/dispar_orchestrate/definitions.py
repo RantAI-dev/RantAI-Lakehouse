@@ -9,7 +9,7 @@ auto-names the one repository this code location exposes `__repository__`
 """
 
 from dagster import Definitions
-from dispar_orchestrate.agent_runs import agent_run_job
+from dispar_orchestrate.agent_runs import agent_run_job, agent_run_schedules
 from dispar_orchestrate.assets import bronze_ingest_job
 from dispar_orchestrate.gold_export import gold_export_job
 from dispar_orchestrate.maintenance import (
@@ -25,13 +25,26 @@ from dispar_orchestrate.replication_metrics import (
 # `replication_slot_check_job` (R5's slot-lag/WAL-retention metrics), ADR
 # 0010 adds `gold_export_job` (the scheduled trigger for Gold export to
 # Iceberg, itself implemented in Rust — see `gold_export.py`'s module doc),
-# and the copilot-operations-handover plan's T3.3 adds `agent_run_job` (the
-# scheduled trigger for a digital employee's headless run, implemented in
-# Rust as `routes::agents::run_employee` — see `agent_runs.py`'s module
-# doc), all to the SAME code location as P3's `bronze_ingest_job` — one
-# code location, one package, per ADR 0005 ("A future P4 [and P5] ... adds
-# modules under the same `dispar_orchestrate` package and the same image,
-# not new top-level directories").
+# and the copilot-operations-handover plan's T3.3 adds `agent_run_job` +
+# `agent_run_schedules` (one `ScheduleDefinition` per digital employee that
+# has a `schedule_cron` set, built from `GET /api/agents/employees` at
+# code-load time — see `agent_runs.py`'s module doc for the full design and
+# why that HTTP call can never crash this code location), all to the SAME
+# code location as P3's `bronze_ingest_job` — one code location, one
+# package, per ADR 0005 ("A future P4 [and P5] ... adds modules under the
+# same `dispar_orchestrate` package and the same image, not new top-level
+# directories").
+#
+# `gold_export_job` is STILL registered without a schedule (a separate,
+# larger change would be needed to give it the same service-credential
+# treatment `agent_run_job` got here — see `gold_export.py`'s module doc),
+# so it remains launchable on demand from the Dagster UI, same as before.
+# `agent_run_job`'s own schedules are no longer permanently empty: with
+# `AGENT_RUN_TOKEN` set (see `lakehouse-api::main::bootstrap_agent_run_service`
+# and this repo's `.env.example`), `agent_run_schedules` holds one entry
+# per scheduled employee; with it unset, `agent_run_schedules` is `[]` and
+# `agent_run_job` stays launchable on demand only, exactly like
+# `gold_export_job`.
 defs = Definitions(
     jobs=[
         bronze_ingest_job,
@@ -40,21 +53,9 @@ defs = Definitions(
         gold_export_job,
         agent_run_job,
     ],
-    # `gold_export_job` and `agent_run_job` are BOTH registered WITHOUT a
-    # schedule, for the identical reason: the route each one calls
-    # (`POST /api/gold/export/{mart}`, `POST /api/agents/employees/{id}/run`)
-    # is `Policy::RequiresAuth` in `rust/crates/lakehouse-api/src/policy.rs`,
-    # enforced by `auth_gate` BEFORE the handler's own run-token check ever
-    # runs — a nightly schedule would 401 silently, every time, because
-    # `auth_gate` demands a real session/bearer credential that neither job
-    # carries. See `gold_export.py`'s and `agent_runs.py`'s module docs for
-    # the full reasoning (the latter also explains why NO schedule-factory
-    # code exists here either, per the copilot-operations-handover plan's
-    # own instruction for this situation: register the job, invent no
-    # workaround, document precisely why). Both jobs stay registered so
-    # they remain launchable on demand from the Dagster UI.
     schedules=[
         bronze_maintenance_schedule,
         replication_slot_check_schedule,
+        *agent_run_schedules,
     ],
 )

@@ -136,15 +136,19 @@ services:
       SMTP_PASS: ${SMTP_PASS:-}
       SMTP_FROM: ${SMTP_FROM:-rantai-lake@localhost}
       ALERTS_RUN_TOKEN: ${ALERTS_RUN_TOKEN:-}
-      # ── T3.3 (copilot-operations-handover) — shared token required by the
-      #    handler's OWN check inside `POST /api/agents/employees/{id}/run`
-      #    (`routes::agents::check_employee_run_auth`), same D4 shape as
-      #    `ALERTS_RUN_TOKEN`/`GOLD_EXPORT_RUN_TOKEN`. Left unset by default;
-      #    note this alone is NOT sufficient for Dagster's schedule/job to
-      #    authenticate — the route is also `Policy::RequiresAuth`, enforced
-      #    before this check even runs (see `dagster/dispar_orchestrate/
-      #    agent_runs.py`'s module doc for the full reasoning and what a
-      #    real fix needs). ──
+      # ── T3.3 (copilot-operations-handover) — this ONE value does double
+      #    duty: `main::bootstrap_agent_run_service` idempotently seeds a
+      #    service_identity ("agent-run-scheduler", scoped ONLY to
+      #    `agent:manage`) + a matching `service_credential` from it on
+      #    every boot, which is what lets Dagster's `Authorization: Bearer
+      #    <AGENT_RUN_TOKEN>` clear this route's `Policy::RequiresAuth`
+      #    floor; the SAME value is also what
+      #    `routes::agents::check_employee_run_auth`'s own `x-run-token`
+      #    check inside the handler requires, same D4 shape as
+      #    `ALERTS_RUN_TOKEN`/`GOLD_EXPORT_RUN_TOKEN`. Left unset by
+      #    default, in which case bootstrap seeds nothing and every
+      #    digital-employee schedule stays inert (see
+      #    `dagster/dispar_orchestrate/agent_runs.py`'s module doc). ──
       AGENT_RUN_TOKEN: ${AGENT_RUN_TOKEN:-}
       EMBED_SECRET: ${EMBED_SECRET:-}
       OIDC_ISSUER: ${OIDC_ISSUER:-}
@@ -1383,11 +1387,15 @@ services:
       # T3.3 (copilot-operations-handover) — `agent_runs.py`'s scheduled
       # trigger for a digital employee's headless run: which
       # `lakehouse-api` to call (reuses `LAKEHOUSE_API_URL` above) and the
-      # shared token `routes::agents::check_employee_run_auth` requires
-      # when set (must match `lakehouse-api`'s own `AGENT_RUN_TOKEN` — same
-      # single-`.env`-value reasoning `GOLD_EXPORT_RUN_TOKEN` documents
-      # above). No schedule reads this today — see `agent_runs.py`'s module
-      # doc for why — but the job is launchable on demand and needs the
+      # shared token this job sends BOTH as `Authorization: Bearer` (to
+      # authenticate as the `agent-run-scheduler` service identity
+      # `lakehouse-api`'s `main::bootstrap_agent_run_service` seeds from
+      # this same value) AND as `x-run-token` (for
+      # `routes::agents::check_employee_run_auth`'s own check) — must match
+      # `lakehouse-api`'s own `AGENT_RUN_TOKEN` — same single-`.env`-value
+      # reasoning `GOLD_EXPORT_RUN_TOKEN` documents above. With this unset,
+      # the schedule factory builds zero schedules (see `agent_runs.py`'s
+      # module doc) but the job is still launchable on demand and needs the
       # var wired regardless.
       AGENT_RUN_TOKEN: ${AGENT_RUN_TOKEN:-}
     command: ["dagster", "api", "grpc", "-h", "0.0.0.0", "-p", "4000", "-m", "dispar_orchestrate.definitions"]
