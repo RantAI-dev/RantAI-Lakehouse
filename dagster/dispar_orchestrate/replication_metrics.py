@@ -102,19 +102,31 @@ def _utc_now_iso() -> str:
 @dataclass(frozen=True)
 class ReplicationConfig:
     ch: ClickHouseTarget
-    source_dsn: str
+    # CREDENTIAL HYGIENE (review finding): this used to read
+    # `BRONZE_SOURCE_DATABASE_URL` — a full `postgresql://user:password@
+    # host/db` DSN passed through docker-compose.yml as one plaintext env
+    # var (visible whole to `docker inspect`). That var is gone; these
+    # four components match `dlt_pipeline.py`'s `BronzeIngestConfig` (see
+    # its field comment) and `docker-compose.yml`'s `dagster-code-location`
+    # env block, which now sets `BRONZE_SOURCE_DB_HOST`/`_PORT`/`_USER`/
+    # `_PASSWORD`/`_NAME` instead of one DSN. The connection string is
+    # assembled in-process below (`psycopg2.connect` accepts discrete
+    # kwargs directly, so it is never even joined into one string here).
+    source_db_host: str
+    source_db_port: str
+    source_db_user: str
+    source_db_password: str
+    source_db_name: str
 
     @classmethod
     def from_env(cls) -> "ReplicationConfig":
         return cls(
             ch=ClickHouseTarget.from_env(),
-            # `postgresql://`, matching `BRONZE_SOURCE_DATABASE_URL`'s own
-            # scheme convention (SQLAlchemy-compatible, set by
-            # `docker-compose.yml`'s `dagster-code-location` service).
-            source_dsn=_env(
-                "BRONZE_SOURCE_DATABASE_URL",
-                "postgresql://lakehouse:lakehouse@postgres:5432/lakehouse",
-            ),
+            source_db_host=_env("BRONZE_SOURCE_DB_HOST", "postgres"),
+            source_db_port=_env("BRONZE_SOURCE_DB_PORT", "5432"),
+            source_db_user=_env("BRONZE_SOURCE_DB_USER", "lakehouse"),
+            source_db_password=_env("BRONZE_SOURCE_DB_PASSWORD", "lakehouse"),
+            source_db_name=_env("BRONZE_SOURCE_DB_NAME", "lakehouse"),
         )
 
 
@@ -205,7 +217,13 @@ def check_replication_slots(cfg: ReplicationConfig) -> list[dict[str, Any]]:
     Postgres being reachable, matching `bronze_catalog.py`'s existing
     posture of talking to exactly the systems a check needs and no more."""
     results: list[dict[str, Any]] = []
-    conn = psycopg2.connect(cfg.source_dsn)
+    conn = psycopg2.connect(
+        host=cfg.source_db_host,
+        port=cfg.source_db_port,
+        user=cfg.source_db_user,
+        password=cfg.source_db_password,
+        dbname=cfg.source_db_name,
+    )
     try:
         conn.set_session(readonly=True, autocommit=True)
         with conn.cursor() as cur:

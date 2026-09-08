@@ -14,9 +14,12 @@ actually connects. P5 needs exactly that, twice over: a connector row must
 be able to generate (a) a Debezium Server `application.properties` body for
 CDC connectors, and (b) a dlt pipeline config for batch connectors (P3's
 existing shape, `dagster/dispar_orchestrate/dlt_pipeline.py`, which today
-takes its Postgres source from `BRONZE_SOURCE_DATABASE_URL` — a compose env
-var, not a registry row — this ADR's dlt half is therefore a design record
-for the mapping, not a code change to a hardcoded demo pipeline).
+takes its Postgres source from `BRONZE_SOURCE_DB_HOST`/`_PORT`/`_USER`/
+`_PASSWORD`/`_NAME` — discrete compose env vars, not a registry row, and
+not (as of the credential-hygiene fix that split the single
+`BRONZE_SOURCE_DATABASE_URL` DSN into these components) a single
+connection-string var either — this ADR's dlt half is therefore a design
+record for the mapping, not a code change to a hardcoded demo pipeline).
 
 ## Decision — where the mapping lives, and in what shape
 

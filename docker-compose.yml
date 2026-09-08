@@ -928,11 +928,81 @@ services:
   # to exist on Docker Hub as `chrislusf/seaweedfs:4.44` (pulled and
   # inspected during P2 verification — see docs/STORAGE-COMPATIBILITY.md).
   #
+  # P2 (G2) — one-shot: render `ops/seaweedfs/iam.template.json` into the
+  # `lakehouse_seaweedfs_iam` volume, substituting the access key, secret
+  # key, and STS signing key from env — this is what stops a committed
+  # `iam.json` (see `seaweedfs`'s comment below) from shipping a working
+  # STS signing key with every checkout. Mirrors the shape of every other
+  # one-shot `*-init` service in this file (alpine + a `/bin/sh -c` script,
+  # `restart: "no"`), just rendering a config file instead of calling an
+  # HTTP API.
+  #
+  # The crux: when `SEAWEEDFS_STS_SIGNING_KEY` is UNSET, this GENERATES a
+  # random key (`head -c 32 /dev/urandom | base64`) rather than falling
+  # back to any constant — an operator who configures nothing must not get
+  # a key anyone else running this same compose file also gets. The
+  # generated key is then read back out of the volume's existing
+  # `iam.json` on every subsequent run (still with the env var unset), so
+  # a plain `docker compose up` restart does not silently rotate the key
+  # and invalidate every STS token issued since the last one — only a
+  # genuinely empty volume (first boot, or `docker compose down -v`)
+  # mints fresh randomness. Setting `SEAWEEDFS_STS_SIGNING_KEY` in `.env`
+  # pins it explicitly instead, e.g. for a multi-host deployment where
+  # more than one container needs to agree on the same key.
+  seaweedfs-iam-init:
+    profiles: ["seaweedfs"]
+    image: alpine:3.20
+    environment:
+      SEAWEEDFS_ACCESS_KEY: ${SEAWEEDFS_ACCESS_KEY:-seaweedfsadmin}
+      SEAWEEDFS_SECRET_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfsadmin}
+      # CHANGE ME (or leave unset) BEFORE ANY DEPLOYMENT: see docs comment
+      # above — unset is safe (a random key is generated per deployment),
+      # a shared/known value here is not.
+      SEAWEEDFS_STS_SIGNING_KEY: ${SEAWEEDFS_STS_SIGNING_KEY:-}
+    volumes:
+      - ./ops/seaweedfs/iam.template.json:/templates/iam.template.json:ro
+      - lakehouse_seaweedfs_iam:/rendered
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        signing_key="$$SEAWEEDFS_STS_SIGNING_KEY"
+        if [ -z "$$signing_key" ] && [ -f /rendered/iam.json ]; then
+          signing_key="$$(sed -n 's/.*"signingKey": *"\([^"]*\)".*/\1/p' /rendered/iam.json | head -n1)"
+        fi
+        if [ -z "$$signing_key" ]; then
+          signing_key="$$(head -c 32 /dev/urandom | base64)"
+          echo "seaweedfs-iam-init: SEAWEEDFS_STS_SIGNING_KEY not set — generated a random per-deployment key (see .env.example)." >&2
+        fi
+        sed \
+          -e "s#__SEAWEEDFS_ACCESS_KEY__#$$SEAWEEDFS_ACCESS_KEY#g" \
+          -e "s#__SEAWEEDFS_SECRET_KEY__#$$SEAWEEDFS_SECRET_KEY#g" \
+          -e "s#__SEAWEEDFS_STS_SIGNING_KEY__#$$signing_key#g" \
+          /templates/iam.template.json > /rendered/iam.json
+    restart: "no"
+
   # `weed server -s3` runs master+volume+filer+the S3 gateway in one
   # process — sufficient for this matrix check, not a production topology.
+  #
+  # SECURITY (credential-hygiene review): this used to bind-mount a
+  # COMMITTED `ops/seaweedfs/iam.json` straight off the repo tree, which
+  # hard-coded `seaweedfsadmin`/`seaweedfsadmin` *and* a working STS
+  # signing key (base64 of a self-describing placeholder string) into
+  # every checkout. That file's own comment said "local/CI only", but
+  # this compose file doubles as the deployment template — so a real
+  # deployment that never touched `iam.json` inherited a PUBLICLY KNOWN
+  # STS signing key, letting anyone who can reach this listener mint STS
+  # tokens against it. `iam.json` is gone from the tree; `seaweedfs-iam-init`
+  # (below) renders `ops/seaweedfs/iam.template.json` into a volume at
+  # bring-up instead, generating a random signing key per deployment when
+  # `SEAWEEDFS_STS_SIGNING_KEY` is left unset. `depends_on` below is what
+  # makes that render happen before this container ever reads the file.
   seaweedfs:
     profiles: ["seaweedfs"]
     image: chrislusf/seaweedfs:4.44
+    depends_on:
+      seaweedfs-iam-init:
+        condition: service_completed_successfully
     command:
       - server
       - -dir=/data
@@ -943,7 +1013,7 @@ services:
       - -master.volumeSizeLimitMB=100
     volumes:
       - lakehouse_seaweedfs_data:/data
-      - ./ops/seaweedfs/iam.json:/etc/seaweedfs/iam.json:ro
+      - lakehouse_seaweedfs_iam:/etc/seaweedfs:ro
     ports:
       - "${SEAWEEDFS_S3_HOST_PORT:-8333}:8333"
     healthcheck:
@@ -1189,11 +1259,29 @@ services:
       DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
       DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
-      # `postgresql://`, not `postgres://` — dlt's `sql_database` source
-      # goes through SQLAlchemy, which (unlike `sqlx`, used for
-      # `DATABASE_URL` elsewhere in this file) does not recognize the
-      # `postgres://` scheme alias.
-      BRONZE_SOURCE_DATABASE_URL: postgresql://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${POSTGRES_DB:-lakehouse}
+      # CREDENTIAL HYGIENE (review finding): this used to be a single
+      # `BRONZE_SOURCE_DATABASE_URL` env var carrying a full
+      # `postgresql://user:password@host/db` DSN — a plaintext password
+      # embedded in one compose environment value, visible whole to
+      # `docker inspect` and to any process that can read this
+      # container's environment (a URL is also just easier to grep for
+      # than a same-named discrete var). Split into components instead,
+      # matching `CONNECTOR_PG_PASSWORD`'s existing pattern above
+      # (`lakehouse-api`'s own least-privilege connector secrets, NOT
+      # `lakehouse-api`'s own `DATABASE_URL`, which stays a single string
+      # because it is never handed to a caller-chosen destination the way
+      # a connector/source definition is). `dlt_pipeline.py`'s
+      # `run_bronze_ingest` assembles these into dlt's `sql_database`
+      # credentials dict in-process — the DSN itself never exists as one
+      # env var. `postgresql://`, not `postgres://`, once assembled — dlt's
+      # `sql_database` source goes through SQLAlchemy, which (unlike
+      # `sqlx`, used for `DATABASE_URL` elsewhere in this file) does not
+      # recognize the `postgres://` scheme alias.
+      BRONZE_SOURCE_DB_HOST: postgres
+      BRONZE_SOURCE_DB_PORT: "5432"
+      BRONZE_SOURCE_DB_USER: ${POSTGRES_USER:-lakehouse}
+      BRONZE_SOURCE_DB_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:-lakehouse}}
+      BRONZE_SOURCE_DB_NAME: ${POSTGRES_DB:-lakehouse}
       BRONZE_SOURCE_SCHEMA: ${BRONZE_SOURCE_SCHEMA:-ingest_demo}
       BRONZE_SOURCE_TABLE: ${BRONZE_SOURCE_TABLE:-orders}
       BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
@@ -1207,8 +1295,25 @@ services:
       # `dagster api grpc` starts).
       LAKEKEEPER_TOKEN_FILE: /tokens/dlt.jwt
       CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      # CREDENTIAL HYGIENE (review finding): both `dlt_pipeline.py` (dlt's
+      # static-credential fallback path, used because dlt writes Parquet
+      # to `s3://.../bronze` directly, outside the vended-STS path
+      # Lakekeeper otherwise provides) and `ops/g3/g3_loadgen.py` (run
+      # inside THIS container per `docs/plans/G3-RESULT.md`) used to read
+      # `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` directly — RustFS's own
+      # ROOT credentials, the same ones `rustfs-bucket-init` and every
+      # other admin-shaped job in this file use. Neither tool needs
+      # root: both only ever PUT/GET objects under the one warehouse
+      # bucket. Point them at the connector-scoped names instead — same
+      # vars `CONNECTOR_S3_ACCESS_KEY`/`CONNECTOR_S3_SECRET_KEY` already
+      # defined for `lakehouse-api` above, defaulting to the same RustFS
+      # root key ONLY because this stack has no narrower RustFS identity
+      # to hand out (RustFS 1.0.0-rc.4 exposes no non-root S3 principal —
+      # see .env.example's note by these vars). A deployment that can
+      # mint a scoped RustFS/S3 identity should set these two to it
+      # without touching `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` at all.
+      CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:-rustfsadmin}}
+      CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:-rustfsadmin}}
       LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
       CH_URL: ${CH_URL:-http://clickhouse:8123}
       CH_USER: ${CH_USER:-default}
@@ -1734,6 +1839,7 @@ volumes:
   lakehouse_clickhouse_data:
   lakehouse_rustfs_data:
   lakehouse_seaweedfs_data:
+  lakehouse_seaweedfs_iam:
   lakehouse_g1_cargo_registry:
   lakehouse_g1_target:
   lakehouse_debezium_data:

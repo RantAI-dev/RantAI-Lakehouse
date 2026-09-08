@@ -96,8 +96,21 @@ def _catalog():
         "uri": _env("LAKEKEEPER_CATALOG_URI", "http://lakekeeper:8181/catalog"),
         "warehouse": _env("LAKEKEEPER_WAREHOUSE", "default"),
         "s3.endpoint": _env("CH_RUSTFS_S3_ENDPOINT", "http://rustfs:9000"),
-        "s3.access-key-id": _env("RUSTFS_ACCESS_KEY", "rustfsadmin"),
-        "s3.secret-access-key": _env("RUSTFS_SECRET_KEY", "rustfsadmin"),
+        # CREDENTIAL HYGIENE (review finding): this used to read
+        # `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` directly — RustFS's own
+        # ROOT credentials — even though this script only ever
+        # creates/appends to Iceberg tables under the one warehouse
+        # bucket. Reads the connector-scoped names instead
+        # (`CONNECTOR_S3_ACCESS_KEY`/`CONNECTOR_S3_SECRET_KEY`, set in
+        # `docker-compose.yml`'s `dagster-code-location` env block — this
+        # script runs INSIDE that same container per `docs/plans/
+        # G3-RESULT.md`). Those vars default to the RustFS root key only
+        # because this stack's RustFS version has no non-proprietary-API
+        # way to mint a narrower S3 identity (see `dlt_pipeline.py`'s
+        # matching comment) — a deployment that can provision one only
+        # needs to set the two vars, no script change.
+        "s3.access-key-id": _env("CONNECTOR_S3_ACCESS_KEY", "rustfsadmin"),
+        "s3.secret-access-key": _env("CONNECTOR_S3_SECRET_KEY", "rustfsadmin"),
         "s3.region": "us-east-1",
         "s3.path-style-access": "true",
         "s3.force-virtual-addressing": "false",

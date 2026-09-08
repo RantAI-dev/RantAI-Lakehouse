@@ -72,6 +72,9 @@ paths = [
   '''^docs/CI\.md$''',
 ]
 
-[[allowlists]]
-description = "SeaweedFS STS signing key for the G2 storage-compatibility matrix: ops/seaweedfs/iam.json. Local/CI only — it base64-decodes to the literal string 'p2-matrix-local-only-signing-key-not-a-secret' and sits alongside the seaweedfsadmin/seaweedfsadmin credentials that mirror RustFS's own well-known defaults. SeaweedFS requires a literal signingKey in its IAM config file, so this cannot be env-driven."
-regexes = ['''cDItbWF0cml4LWxvY2FsLW9ubHktc2lnbmluZy1rZXktbm90LWEtc2VjcmV0''']
+# The allowlist entry that used to sit here (a committed SeaweedFS STS
+# signing key in ops/seaweedfs/iam.json) is gone along with that file:
+# credential-hygiene fix, see docker-compose.yml's `seaweedfs`/
+# `seaweedfs-iam-init` services. iam.json is now rendered at bring-up
+# from ops/seaweedfs/iam.template.json (no working key ever committed),
+# so there is nothing left here for gitleaks to need an exception for.
