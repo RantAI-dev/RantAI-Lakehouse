@@ -131,7 +131,12 @@ export function ApprovalsPage() {
       {state.status === "success" && rows.length === 0 ? (
         <EmptyState
           title="No approvals"
-          description="Pending and resolved approval requests appear here."
+          description="A request lands here whenever a run — from the copilot chat, Run now, or a schedule — hits a high-risk (WriteHigh) tool call. Nothing is waiting on you right now."
+          action={
+            <Button size="sm" variant="outline" render={<Link href="/agents/runs" />}>
+              View agent runs
+            </Button>
+          }
         />
       ) : null}
       {state.status === "success" && rows.length > 0 ? (
@@ -201,13 +206,17 @@ export function ApprovalsPage() {
                   ),
                 },
                 {
-                  // No `/agents/runs/[id]` detail page exists yet (T3.4 of
-                  // the copilot-operations-handover plan, not this task) —
-                  // showing the run id as plain text rather than a link
-                  // that would 404.
+                  // T3.4 of the copilot-operations-handover plan added
+                  // `/agents/runs/[id]`, so this links there now instead of
+                  // showing the run id as plain text.
                   label: "Run",
                   value: selected.runId ? (
-                    <span className="font-mono text-xs">{selected.runId}</span>
+                    <Link
+                      href={`/agents/runs/${encodeURIComponent(selected.runId)}`}
+                      className="font-mono text-xs text-primary hover:underline"
+                    >
+                      {selected.runId}
+                    </Link>
                   ) : (
                     "—"
                   ),
