@@ -258,6 +258,10 @@ fn agents_router() -> Router<AppState> {
             axum::routing::post(agents::revoke_employee),
         )
         .route(
+            "/api/agents/employees/{id}/run",
+            axum::routing::post(agents::run_employee),
+        )
+        .route(
             "/api/agents/tools",
             get(agents::list_tools).post(agents::register_tool),
         )

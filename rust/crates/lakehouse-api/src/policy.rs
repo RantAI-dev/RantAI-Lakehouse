@@ -293,6 +293,16 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/agents/employees/{id}/suspend",   Policy::RequiresPermission("agent:manage")),
     ("POST", "/api/agents/employees/{id}/resume",    Policy::RequiresPermission("agent:manage")),
     ("POST", "/api/agents/employees/{id}/revoke",    Policy::RequiresPermission("agent:manage")),
+    // `/employees/{id}/run` (T3.2, copilot-operations-handover plan): same
+    // "floor" shape as `/api/alerts/run`/`/api/gold/export/{mart}` —
+    // `RequiresAuth` here, PLUS `routes::agents::check_employee_run_auth`'s
+    // own stricter guard inside the handler (a matching `x-run-token`
+    // against `AGENT_RUN_TOKEN`, OR an authenticated principal holding
+    // `agent:manage` — unlike gold/alerts, the no-token fallback is a
+    // PERMISSION check, not a service-identity check, because a human
+    // clicking "Run now" is a legitimate caller here, not only a
+    // scheduler). ────────────────────────────────────────────────────────
+    ("POST", "/api/agents/employees/{id}/run",       Policy::RequiresAuth),
     ("GET",  "/api/agents/tools",                    Policy::RequiresAuth),
     ("POST", "/api/agents/tools",                    Policy::RequiresAuth),
     ("GET",  "/api/agents/runs",                     Policy::RequiresAuth),

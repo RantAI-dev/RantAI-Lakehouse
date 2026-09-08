@@ -23,7 +23,7 @@
 //!   redaction step is needed here for the tool output to stay credential-free.
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
 use serde_json::{Map, Value, json};
 
@@ -66,7 +66,18 @@ pub(super) async fn delete_connector(state: &AppState, args: &Map<String, Value>
     if id.is_empty() {
         return json!({ "error": "id wajib diisi" });
     }
-    match crate::routes::connectors::delete(State(state.clone()), Path(id)).await {
+    // `DeleteQuery::default()` is `force: false`: if CDC deprovisioning
+    // fails, the registry row stays and the copilot reports the failure
+    // rather than orphaning a replication slot. Forcing past a failed
+    // deprovision is a deliberate human override (`?force=true` on the
+    // console route), never something an agent decides on its own.
+    match crate::routes::connectors::delete(
+        State(state.clone()),
+        Path(id),
+        Query(crate::routes::connectors::DeleteQuery::default()),
+    )
+    .await
+    {
         Ok(_status) => json!({ "ok": true }),
         Err(err) => super::response_to_value(err.into_response()).await,
     }

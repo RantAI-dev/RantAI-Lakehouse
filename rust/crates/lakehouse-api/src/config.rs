@@ -331,6 +331,18 @@ pub struct Config {
     /// non-load-bearing parsing posture as
     /// [`Self::gold_export_max_rows`]. Default `20_000`.
     pub gold_export_batch_size: u64,
+    /// Shared token gating `POST /api/agents/employees/{id}/run`
+    /// (Tier 3, copilot-operations-handover plan), same D4 shape as
+    /// [`Self::gold_export_run_token`]/[`Self::alerts_run_token`]: with
+    /// this set, a matching `x-run-token` header/`?token=` runs the
+    /// employee headlessly with `trigger = "schedule"` (this is what
+    /// `dagster/dispar_orchestrate`'s digital-employee schedule factory
+    /// authenticates with, mirroring `gold_export_job`). Unlike gold/alerts,
+    /// the fallback when this is unset (or the token doesn't match) is NOT
+    /// "service-identity principal only" — an authenticated principal
+    /// holding `agent:manage` (a human clicking "Run now" in the console)
+    /// is also accepted, with `trigger = "manual"`. `None` when unset.
+    pub agent_run_token: Option<String>,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -423,6 +435,10 @@ impl std::fmt::Debug for Config {
             )
             .field("gold_export_max_rows", &self.gold_export_max_rows)
             .field("gold_export_batch_size", &self.gold_export_batch_size)
+            .field(
+                "agent_run_token",
+                &self.agent_run_token.as_ref().map(|_| REDACTED),
+            )
             .finish()
     }
 }
@@ -586,6 +602,7 @@ impl Config {
             gold_export_run_token: truthy(env, "GOLD_EXPORT_RUN_TOKEN"),
             gold_export_max_rows: parse_u64_or_default(env, "GOLD_EXPORT_MAX_ROWS", 5_000_000),
             gold_export_batch_size: parse_u64_or_default(env, "GOLD_EXPORT_BATCH_SIZE", 20_000),
+            agent_run_token: truthy(env, "AGENT_RUN_TOKEN"),
         })
     }
 
@@ -622,6 +639,7 @@ mod tests {
             ("EMBED_SECRET", "s3cret-embed"),
             ("ALERTS_RUN_TOKEN", "s3cret-alerts-token"),
             ("SMTP_PASS", "s3cret-smtp-pass"),
+            ("AGENT_RUN_TOKEN", "s3cret-agent-run-token"),
             (
                 "DATABASE_URL",
                 "postgres://u:s3cret-pg-pass@db.internal:5432/lakehouse",
@@ -635,6 +653,7 @@ mod tests {
             "s3cret-embed",
             "s3cret-alerts-token",
             "s3cret-smtp-pass",
+            "s3cret-agent-run-token",
             "s3cret-pg-pass",
             "db.internal",
         ] {
@@ -697,6 +716,7 @@ mod tests {
         assert_eq!(cfg.gold_export_run_token, None);
         assert_eq!(cfg.gold_export_max_rows, 5_000_000);
         assert_eq!(cfg.gold_export_batch_size, 20_000);
+        assert_eq!(cfg.agent_run_token, None);
         // Safe-by-default: SSRF blocking is ON unless explicitly disabled.
         assert!(!cfg.connector_probe_allow_internal_hosts);
     }

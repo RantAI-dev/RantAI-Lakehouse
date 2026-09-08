@@ -2,16 +2,24 @@
 //! tools, workflows, run history, and the approval lifecycle. Postgres
 //! backing for `src/services/mock/agents.ts`.
 //!
-//! # Scope: configuration and history, not an execution runtime
+//! # T3.2 update: a real (headless) execution runtime now exists
 //!
-//! There is no agent runtime, orchestrator, or tool-invocation engine
-//! anywhere in this repository (see `AI_PROJECT_INSIGHTS.md`). This module
-//! persists *definitions* (employees, tools, workflows) and *records*
-//! (past runs, approval decisions) — it never launches an agent, invokes a
-//! tool, or produces a run that didn't already exist. `AgentService` (the
-//! contract this backs) has no "run this agent" or "invoke this tool"
-//! method, so nothing here is a scoped-down stand-in for one; the contract
-//! itself never asked for an execution runtime.
+//! Earlier revisions of this module doc comment said there was no agent
+//! runtime anywhere in this repository, and that `agent_run` was "never
+//! written to by a live execution path, only seeded / read". That stopped
+//! being true with T0.5 (the copilot's `WriteHigh` approval flow, see
+//! [`create_pending_approval`]/[`record_run_outcome`]) and, with T3.2
+//! (`POST /api/agents/employees/{id}/run`, `routes::agents::run_employee`),
+//! a digital employee's `agent_run` rows now come from an actual headless
+//! run of the copilot's tool-calling loop — not just interactive chat's
+//! `WriteHigh` calls. [`create_run`]/[`append_run_step`]/
+//! [`mark_run_waiting_approval`]/[`create_linked_approval`] are that
+//! path's store surface: they create a run up front (`"running"`),
+//! append one step per tool call as the loop goes, and end it at a
+//! terminal status (`"succeeded"`/`"failed"`) or `"waiting_approval"` when
+//! a `WriteHigh` tool call inside the run needs a human decision — see
+//! `routes::agents::run_employee`'s own doc comment (`lakehouse-api`) for
+//! the full flow.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -266,6 +274,10 @@ pub async fn list_scheduled_employees(pool: &PgPool) -> Result<Vec<DigitalEmploy
 pub struct EmployeeRunConfig {
     /// `agent_employee.id`.
     pub id: String,
+    /// Display name — used as `agent_run.actor` for a token-triggered
+    /// (`trigger = "schedule"`) run, and as `approval_item.employee_name`
+    /// for a `WriteHigh` call the run's loop hits.
+    pub name: String,
     /// Lifecycle status (`EntityStatus`); a run route must refuse anything
     /// other than a runnable status.
     pub status: String,
@@ -290,7 +302,7 @@ pub async fn get_employee_run_config(
     id: &str,
 ) -> Result<Option<EmployeeRunConfig>, StoreError> {
     let row: Option<EmployeeRunConfig> = sqlx::query_as(
-        "SELECT id, status, prompt, mode, permissions FROM agent_employee WHERE id = $1",
+        "SELECT id, name, status, prompt, mode, permissions FROM agent_employee WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -993,14 +1005,22 @@ pub struct PendingToolCall {
     pub args: Value,
 }
 
-/// Recovers the [`PendingToolCall`] [`create_pending_approval`] stored in
-/// `run.steps[0].detail`. `None` if the run has no steps, or its first
+/// Recovers the [`PendingToolCall`] stored in a `waiting_approval` run's
+/// LAST step's `detail`. `None` if the run has no steps, or its last
 /// step's `detail` isn't the JSON shape this module writes (e.g. a run
 /// this module never created).
+///
+/// The LAST step, not the first: [`create_pending_approval`] (the
+/// interactive-copilot path) always creates a run with exactly one step,
+/// so first/last are the same row there — but a headless run (T3.2,
+/// `routes::agents::run_employee`) already has zero or more earlier steps
+/// (every tool call executed before the `WriteHigh` one that paused it)
+/// by the time it appends its own pending-call step and stops; that
+/// pending call is always the most recent step, never the first.
 #[must_use]
 pub fn pending_tool_call(run: &AgentRun) -> Option<PendingToolCall> {
-    let first = run.steps.first()?;
-    serde_json::from_str(&first.detail).ok()
+    let last = run.steps.last()?;
+    serde_json::from_str(&last.detail).ok()
 }
 
 /// Appends one outcome step to a run's `steps` and sets its terminal
@@ -1038,6 +1058,171 @@ pub async fn record_run_outcome(
         return Err(StoreError::NotFound);
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Headless employee runs (T3.2, copilot-operations-handover plan)
+// ---------------------------------------------------------------------
+
+/// Creates the `agent_run` row a headless `POST
+/// /api/agents/employees/{id}/run` starts with: `status = "running"`,
+/// `steps = []`, `id` caller-supplied so the route can keep referring to
+/// it (matches the `run-appr-<uuid>` id shape [`create_pending_approval`]
+/// already uses for the interactive-copilot equivalent, but this one is
+/// generated by the caller rather than returned — see
+/// `routes::agents::run_employee`).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the insert fails (e.g. `employee_id`
+/// does not reference an existing `agent_employee` row).
+pub async fn create_run(
+    pool: &PgPool,
+    id: &str,
+    employee_id: &str,
+    trigger: &str,
+    actor: &str,
+) -> Result<(), StoreError> {
+    sqlx::query(
+        "INSERT INTO agent_run (id, employee_id, status, trigger, actor, steps) \
+         VALUES ($1, $2, 'running', $3, $4, '[]'::jsonb)",
+    )
+    .bind(id)
+    .bind(employee_id)
+    .bind(trigger)
+    .bind(actor)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Appends one step to a run's `steps` WITHOUT touching `status` or
+/// `ended_at` — for a headless run's tool-call trace, recorded as the loop
+/// goes rather than only at the end (unlike [`record_run_outcome`], which
+/// always sets a terminal status).
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `run_id` does not exist, or
+/// [`StoreError::Database`] on any other failure.
+pub async fn append_run_step(pool: &PgPool, run_id: &str, step: RunStep) -> Result<(), StoreError> {
+    let result = sqlx::query("UPDATE agent_run SET steps = steps || $2::jsonb WHERE id = $1")
+        .bind(run_id)
+        .bind(Json(vec![step]))
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
+/// Sets a run's terminal `status` (`"succeeded"` | `"failed"`) and
+/// `ended_at`, without appending a step — used when the headless loop's
+/// own steps already recorded everything worth showing (via
+/// [`append_run_step`]) and only the final status/timestamp remain to be
+/// set. Kept distinct from [`record_run_outcome`] (which always appends
+/// one more step) because a headless run's LAST step IS its final
+/// tool-call result; adding a second, redundant "done" step on top of it
+/// would double up the trace.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `run_id` does not exist, or
+/// [`StoreError::Database`] on any other failure.
+pub async fn finish_run(pool: &PgPool, run_id: &str, status: &str) -> Result<(), StoreError> {
+    let result = sqlx::query("UPDATE agent_run SET status = $2, ended_at = now() WHERE id = $1")
+        .bind(run_id)
+        .bind(status)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
+/// Sets a run's status to `"waiting_approval"` WITHOUT setting `ended_at`
+/// — the run isn't over, it's paused until a human decides the linked
+/// [`ApprovalItem`] (`POST /api/agents/approvals/{id}/decide`); that route
+/// is what eventually calls [`finish_run`] on the SAME run id.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `run_id` does not exist, or
+/// [`StoreError::Database`] on any other failure.
+pub async fn mark_run_waiting_approval(pool: &PgPool, run_id: &str) -> Result<(), StoreError> {
+    let result = sqlx::query("UPDATE agent_run SET status = 'waiting_approval' WHERE id = $1")
+        .bind(run_id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
+/// Everything [`create_linked_approval`] needs to create a `pending`
+/// `approval_item` for one `WriteHigh` tool call hit by an ALREADY-EXISTING
+/// headless run (unlike [`NewApprovalRequest`]/[`create_pending_approval`],
+/// which always create a brand-new `agent_run` attributed to the reserved
+/// `emp-copilot` row — a headless run already has its own `agent_run`,
+/// created by [`create_run`], and its own real employee id/name).
+#[derive(Debug, Clone)]
+pub struct LinkedApprovalRequest<'a> {
+    /// The employee this run belongs to — `approval_item.employee_id`.
+    pub employee_id: &'a str,
+    /// That employee's display name — `approval_item.employee_name`
+    /// (denormalized at request time, matching every other approval).
+    pub employee_name: &'a str,
+    /// The already-existing `agent_run.id` this approval is linked to.
+    pub run_id: &'a str,
+    /// The tool name — becomes `approval_item.action`.
+    pub tool: &'a str,
+    /// The target resource id, if knowable ahead of execution.
+    pub resource: Option<&'a str>,
+    /// A deterministic, human-readable reason sentence.
+    pub reason: &'a str,
+    /// A human-readable risk statement.
+    pub risk: &'a str,
+    /// The tool call's REDACTED arguments — the caller must have already
+    /// run these through `routes::ai::audit::redact`.
+    pub redacted_args: &'a Value,
+}
+
+/// Creates one `pending` `approval_item` linked to an existing run (see
+/// [`LinkedApprovalRequest`]) — does NOT touch the run's own `steps`/
+/// `status`; the caller is responsible for calling [`append_run_step`]
+/// with the pending tool call and [`mark_run_waiting_approval`] itself, so
+/// the two writes stay independently retryable rather than hidden inside
+/// one all-or-nothing transaction the caller cannot see into.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the insert fails (e.g. `run_id`/
+/// `employee_id` do not reference existing rows).
+pub async fn create_linked_approval(
+    pool: &PgPool,
+    req: LinkedApprovalRequest<'_>,
+) -> Result<String, StoreError> {
+    let approval_id = format!("appr-{}", Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO approval_item \
+         (id, employee_id, employee_name, run_id, action, resource, reason, evidence, status, risk) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9)",
+    )
+    .bind(&approval_id)
+    .bind(req.employee_id)
+    .bind(req.employee_name)
+    .bind(req.run_id)
+    .bind(req.tool)
+    .bind(req.resource)
+    .bind(req.reason)
+    .bind(vec![serde_json::to_string(req.redacted_args).unwrap_or_default()])
+    .bind(req.risk)
+    .execute(pool)
+    .await?;
+    Ok(approval_id)
 }
 
 #[cfg(test)]

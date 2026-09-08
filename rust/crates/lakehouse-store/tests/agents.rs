@@ -21,18 +21,20 @@ use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
 use lakehouse_store::agents::{
-    COPILOT_EMPLOYEE_ID, CreateEmployeeInput, CreatedApproval, Decision, NewApprovalRequest,
-    create_employee, create_pending_approval, decide_approval, get_employee,
+    COPILOT_EMPLOYEE_ID, CreateEmployeeInput, CreatedApproval, Decision, LinkedApprovalRequest,
+    NewApprovalRequest, RunStep, append_run_step, create_employee, create_linked_approval,
+    create_pending_approval, create_run, decide_approval, finish_run, get_employee,
     get_employee_run_config, get_run, list_approvals, list_employees, list_runs,
-    list_scheduled_employees, list_tools, list_workflows, pending_tool_call, record_run_outcome,
-    resume_employee, revoke_employee, suspend_employee,
+    list_scheduled_employees, list_tools, list_workflows, mark_run_waiting_approval,
+    pending_tool_call, record_run_outcome, resume_employee, revoke_employee, suspend_employee,
 };
 use serde_json::json;
 use sqlx::PgPool;
 
-/// Insert a minimal `agent_run` row directly, bypassing the store (there is
-/// no `create_run` — see the module doc comment: this domain has no live
-/// execution path yet). Test-only fixture helper.
+/// Insert a minimal `agent_run` row directly, bypassing the store's own
+/// [`create_run`] (kept as a plain-SQL fixture helper for tests that only
+/// care about a run existing, not about `create_run`'s own contract, which
+/// gets its own tests below). Test-only fixture helper.
 async fn insert_run(pool: &PgPool, id: &str, employee_id: &str) {
     sqlx::query(
         "INSERT INTO agent_run (id, employee_id, status, trigger, actor, steps) \
@@ -408,6 +410,7 @@ async fn emp_copilot_exists_and_is_manual_only(pool: PgPool) -> sqlx::Result<()>
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(config.name, "Copilot (interactive)");
     assert_eq!(config.status, "ready");
     assert_eq!(config.prompt, None);
     assert_eq!(config.mode, "build");
@@ -437,6 +440,7 @@ async fn get_employee_run_config_round_trips(pool: PgPool) -> sqlx::Result<()> {
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(config.name, "runnable-copilot");
     assert_eq!(config.status, "draft");
     assert_eq!(config.prompt.as_deref(), Some("Do the thing."));
     assert_eq!(config.mode, "ask");
@@ -550,5 +554,221 @@ async fn record_run_outcome_unknown_run_is_not_found(pool: PgPool) -> sqlx::Resu
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::NotFound));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Headless employee runs (T3.2, copilot-operations-handover plan)
+// ---------------------------------------------------------------------
+
+/// `create_run` inserts a `"running"` run with empty `steps`, attributed
+/// to the given trigger/actor.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_run_inserts_running_row(pool: PgPool) -> sqlx::Result<()> {
+    create_run(
+        &pool,
+        "run-headless-01",
+        "emp-risk",
+        "schedule",
+        "risk-sentinel",
+    )
+    .await
+    .unwrap();
+    let run = get_run(&pool, "run-headless-01").await.unwrap().unwrap();
+    assert_eq!(run.employee_id, "emp-risk");
+    assert_eq!(run.status, "running");
+    assert_eq!(run.trigger, "schedule");
+    assert_eq!(run.actor, "risk-sentinel");
+    assert!(run.steps.is_empty());
+    assert!(run.ended_at.is_none());
+    Ok(())
+}
+
+/// `append_run_step` adds to `steps` without touching `status`/`ended_at`,
+/// and can be called more than once.
+#[sqlx::test(migrations = "../../migrations")]
+async fn append_run_step_accumulates_without_finishing(pool: PgPool) -> sqlx::Result<()> {
+    create_run(
+        &pool,
+        "run-headless-02",
+        "emp-risk",
+        "manual",
+        "Fajar Nugroho",
+    )
+    .await
+    .unwrap();
+    append_run_step(
+        &pool,
+        "run-headless-02",
+        RunStep {
+            id: "step-1".to_owned(),
+            label: "run_sql".to_owned(),
+            status: "succeeded".to_owned(),
+            detail: "{}".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    append_run_step(
+        &pool,
+        "run-headless-02",
+        RunStep {
+            id: "step-2".to_owned(),
+            label: "list_datasets".to_owned(),
+            status: "succeeded".to_owned(),
+            detail: "{}".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let run = get_run(&pool, "run-headless-02").await.unwrap().unwrap();
+    assert_eq!(run.status, "running");
+    assert!(run.ended_at.is_none());
+    assert_eq!(run.steps.len(), 2);
+    assert_eq!(run.steps[0].label, "run_sql");
+    assert_eq!(run.steps[1].label, "list_datasets");
+    Ok(())
+}
+
+/// `append_run_step` against an unknown run id is `NotFound`, not a
+/// silent no-op.
+#[sqlx::test(migrations = "../../migrations")]
+async fn append_run_step_unknown_run_is_not_found(pool: PgPool) -> sqlx::Result<()> {
+    let err = append_run_step(
+        &pool,
+        "run-nope",
+        RunStep {
+            id: "step-1".to_owned(),
+            label: "x".to_owned(),
+            status: "succeeded".to_owned(),
+            detail: "{}".to_owned(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound));
+    Ok(())
+}
+
+/// `finish_run` sets a terminal status and `ended_at`, WITHOUT appending a
+/// step — unlike `record_run_outcome`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn finish_run_sets_terminal_status_without_a_step(pool: PgPool) -> sqlx::Result<()> {
+    create_run(
+        &pool,
+        "run-headless-03",
+        "emp-risk",
+        "manual",
+        "Fajar Nugroho",
+    )
+    .await
+    .unwrap();
+    append_run_step(
+        &pool,
+        "run-headless-03",
+        RunStep {
+            id: "step-1".to_owned(),
+            label: "run_sql".to_owned(),
+            status: "succeeded".to_owned(),
+            detail: "{}".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    finish_run(&pool, "run-headless-03", "succeeded")
+        .await
+        .unwrap();
+
+    let run = get_run(&pool, "run-headless-03").await.unwrap().unwrap();
+    assert_eq!(run.status, "succeeded");
+    assert!(run.ended_at.is_some());
+    // Still exactly the one step `append_run_step` added — `finish_run`
+    // must not add a second one.
+    assert_eq!(run.steps.len(), 1);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn finish_run_unknown_run_is_not_found(pool: PgPool) -> sqlx::Result<()> {
+    let err = finish_run(&pool, "run-nope", "failed").await.unwrap_err();
+    assert!(matches!(err, StoreError::NotFound));
+    Ok(())
+}
+
+/// `mark_run_waiting_approval` sets the status WITHOUT setting `ended_at`
+/// — the run is paused, not over.
+#[sqlx::test(migrations = "../../migrations")]
+async fn mark_run_waiting_approval_does_not_end_the_run(pool: PgPool) -> sqlx::Result<()> {
+    create_run(
+        &pool,
+        "run-headless-04",
+        "emp-risk",
+        "schedule",
+        "risk-sentinel",
+    )
+    .await
+    .unwrap();
+    mark_run_waiting_approval(&pool, "run-headless-04")
+        .await
+        .unwrap();
+    let run = get_run(&pool, "run-headless-04").await.unwrap().unwrap();
+    assert_eq!(run.status, "waiting_approval");
+    assert!(run.ended_at.is_none());
+    Ok(())
+}
+
+/// `create_linked_approval` creates a `pending` approval attributed to the
+/// REAL employee (not `emp-copilot`), linked to an ALREADY-EXISTING run,
+/// and does not itself touch that run's `steps`/`status`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_linked_approval_attaches_to_existing_run_and_real_employee(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    create_run(
+        &pool,
+        "run-headless-05",
+        "emp-risk",
+        "schedule",
+        "risk-sentinel",
+    )
+    .await
+    .unwrap();
+    let args = json!({ "id": "wl-1" });
+    let approval_id = create_linked_approval(
+        &pool,
+        LinkedApprovalRequest {
+            employee_id: "emp-risk",
+            employee_name: "risk-sentinel",
+            run_id: "run-headless-05",
+            tool: "cancel_pipeline",
+            resource: Some("wl-1"),
+            reason: "Membatalkan pipeline wl-1.",
+            risk: "tinggi",
+            redacted_args: &args,
+        },
+    )
+    .await
+    .unwrap();
+
+    let approvals = list_approvals(&pool, Some("emp-risk")).await.unwrap();
+    let approval = approvals
+        .iter()
+        .find(|a| a.id == approval_id)
+        .expect("the created approval is listed under the REAL employee");
+    assert_eq!(approval.employee_id, "emp-risk");
+    assert_eq!(approval.employee_name, "risk-sentinel");
+    assert_eq!(approval.run_id.as_deref(), Some("run-headless-05"));
+    assert_eq!(approval.action, "cancel_pipeline");
+    assert_eq!(approval.status, "pending");
+
+    // The run itself is untouched by `create_linked_approval` alone.
+    let run = get_run(&pool, "run-headless-05").await.unwrap().unwrap();
+    assert_eq!(run.status, "running");
+    assert!(run.steps.is_empty());
+    // But the run's own `approvals[]` projection already sees it, via the
+    // `run_id` join — same mechanism `run_embeds_its_approvals` covers.
+    assert_eq!(run.approvals.len(), 1);
+    assert_eq!(run.approvals[0].id, approval_id);
     Ok(())
 }
