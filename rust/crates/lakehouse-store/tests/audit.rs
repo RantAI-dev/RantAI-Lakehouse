@@ -149,15 +149,30 @@ async fn list_respects_limit(pool: PgPool) -> sqlx::Result<()> {
 /// `run_id` references `agent_run(id) ON DELETE SET NULL` — deleting the
 /// referenced run must null out the audit row's `run_id`, not fail the
 /// delete or orphan the audit row.
+///
+/// Uses a freshly-inserted `agent_run` row rather than a seeded fixture id:
+/// migration `0025_drop_seeded_agent_runs.sql` (copilot-operations T3.1)
+/// removes the `0018_seed_agents.sql` fixture rows (`run-col-01` /
+/// `ap-01`), since they were fabricated demo history, not real runs — see
+/// that migration's header comment.
 #[sqlx::test(migrations = "../../migrations")]
 async fn deleting_referenced_run_nulls_out_run_id(pool: PgPool) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO agent_run (id, employee_id, status, trigger, actor, steps) \
+         VALUES ('run-audit-fixture', 'emp-inventory', 'running', 'test', 'test-actor', \
+         '[]'::jsonb)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
     let mut event = sample("run_tool");
-    event.run_id = Some("run-col-01".to_owned());
+    event.run_id = Some("run-audit-fixture".to_owned());
     let written = insert(&pool, event).await.unwrap();
-    assert_eq!(written.run_id.as_deref(), Some("run-col-01"));
+    assert_eq!(written.run_id.as_deref(), Some("run-audit-fixture"));
 
     sqlx::query("DELETE FROM agent_run WHERE id = $1")
-        .bind("run-col-01")
+        .bind("run-audit-fixture")
         .execute(&pool)
         .await
         .unwrap();
@@ -169,16 +184,27 @@ async fn deleting_referenced_run_nulls_out_run_id(pool: PgPool) -> sqlx::Result<
 }
 
 /// Same `ON DELETE SET NULL` guarantee for `approval_id` ->
-/// `approval_item(id)`.
+/// `approval_item(id)`. See [`deleting_referenced_run_nulls_out_run_id`]
+/// for why this uses a freshly-inserted fixture rather than the
+/// now-removed seeded `ap-01`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn deleting_referenced_approval_nulls_out_approval_id(pool: PgPool) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO approval_item (id, employee_id, employee_name, action, status) \
+         VALUES ('ap-audit-fixture', 'emp-inventory', 'inventory-copilot', 'test action', \
+         'pending')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
     let mut event = sample("decide_approval");
-    event.approval_id = Some("ap-01".to_owned());
+    event.approval_id = Some("ap-audit-fixture".to_owned());
     let written = insert(&pool, event).await.unwrap();
-    assert_eq!(written.approval_id.as_deref(), Some("ap-01"));
+    assert_eq!(written.approval_id.as_deref(), Some("ap-audit-fixture"));
 
     sqlx::query("DELETE FROM approval_item WHERE id = $1")
-        .bind("ap-01")
+        .bind("ap-audit-fixture")
         .execute(&pool)
         .await
         .unwrap();

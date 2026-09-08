@@ -201,11 +201,23 @@ pub struct DigitalEmployee {
     pub success_rate: f64,
     /// Number of recent runs.
     pub recent_runs: i64,
+    /// The instruction a headless run sends to the copilot. `None` means
+    /// this employee is not runnable.
+    pub prompt: Option<String>,
+    /// Cron expression for a Dagster schedule, or `None` for manual-only.
+    pub schedule_cron: Option<String>,
+    /// The copilot mode a run uses: `"ask"` or `"build"`.
+    pub mode: String,
+    /// Ceiling on what this employee's runs may do, as a comma-separated
+    /// `resource:action` list in the same format as `role.permissions`
+    /// (see `lakehouse_auth::permissions::PermissionSet::parse`). Empty
+    /// means authenticated-only, no permissioned tools.
+    pub permissions: String,
 }
 
 const EMPLOYEE_COLUMNS: &str = "id, name, purpose, owner, autonomy, status, budget_limit, \
      budget_spent, budget_reserved, allowed_tools, data_scope, approval_rate, success_rate, \
-     recent_runs";
+     recent_runs, prompt, schedule_cron, mode, permissions";
 
 /// List every digital employee, newest first.
 ///
@@ -227,6 +239,63 @@ pub async fn get_employee(pool: &PgPool, id: &str) -> Result<Option<DigitalEmplo
     Ok(sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?)
 }
 
+/// List every digital employee that has a `schedule_cron` set, newest
+/// first. This is exactly the set T3.3's Dagster schedule factory needs
+/// to build one `ScheduleDefinition` per employee — a `NULL` cron means
+/// manual-only and is excluded.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn list_scheduled_employees(pool: &PgPool) -> Result<Vec<DigitalEmployee>, StoreError> {
+    let sql = format!(
+        "SELECT {EMPLOYEE_COLUMNS} FROM agent_employee WHERE schedule_cron IS NOT NULL \
+         ORDER BY created_at DESC"
+    );
+    Ok(sqlx::query_as(&sql).fetch_all(pool).await?)
+}
+
+/// The subset of an employee's columns a headless run needs: what to send
+/// the copilot, which mode to run it in, the permission ceiling to scope
+/// its synthetic principal to, and whether the employee is even eligible
+/// to run right now (`status`; T3.2 must refuse a run for a suspended
+/// (`"paused"`) or revoked (`"cancelled"`) employee).
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub struct EmployeeRunConfig {
+    /// `agent_employee.id`.
+    pub id: String,
+    /// Lifecycle status (`EntityStatus`); a run route must refuse anything
+    /// other than a runnable status.
+    pub status: String,
+    /// The instruction a headless run sends to the copilot. `None` means
+    /// this employee is not runnable.
+    pub prompt: Option<String>,
+    /// The copilot mode a run uses: `"ask"` or `"build"`.
+    pub mode: String,
+    /// Ceiling on what this employee's runs may do, in `role.permissions`
+    /// format.
+    pub permissions: String,
+}
+
+/// Fetch just the run-configuration columns for one employee — `prompt`,
+/// `mode`, `permissions`, `status` — without the rest of [`DigitalEmployee`].
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn get_employee_run_config(
+    pool: &PgPool,
+    id: &str,
+) -> Result<Option<EmployeeRunConfig>, StoreError> {
+    let row: Option<EmployeeRunConfig> = sqlx::query_as(
+        "SELECT id, status, prompt, mode, permissions FROM agent_employee WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 /// Everything [`create_employee`] needs. Mirrors `CreateEmployeeInput`.
 #[derive(Debug, Clone)]
 pub struct CreateEmployeeInput {
@@ -244,7 +313,20 @@ pub struct CreateEmployeeInput {
     pub budget_limit: f64,
     /// Owner; defaults to [`DEFAULT_OWNER`] when absent.
     pub owner: Option<String>,
+    /// The instruction a headless run sends to the copilot. `None` means
+    /// this employee is not runnable.
+    pub prompt: Option<String>,
+    /// Cron expression for a Dagster schedule, or `None` for manual-only.
+    pub schedule_cron: Option<String>,
+    /// The copilot mode a run uses (`"ask"` or `"build"`); defaults to
+    /// `"build"` when absent.
+    pub mode: Option<String>,
+    /// Ceiling on what this employee's runs may do, in `role.permissions`
+    /// format; defaults to `""` (authenticated-only) when absent.
+    pub permissions: Option<String>,
 }
+
+const DEFAULT_MODE: &str = "build";
 
 /// Create a digital employee. `status` starts `"draft"`, all counters
 /// start at `0` — same as `mock/agents.ts`'s `createEmployee`.
@@ -258,10 +340,12 @@ pub async fn create_employee(
 ) -> Result<DigitalEmployee, StoreError> {
     let id = slug_id("emp", &input.name);
     let owner = input.owner.as_deref().unwrap_or(DEFAULT_OWNER);
+    let mode = input.mode.as_deref().unwrap_or(DEFAULT_MODE);
+    let permissions = input.permissions.as_deref().unwrap_or("");
     let sql = format!(
         "INSERT INTO agent_employee (id, name, purpose, owner, autonomy, status, budget_limit, \
-         allowed_tools, data_scope) \
-         VALUES ($1, $2, $3, $4, $5, 'draft', $6, $7, $8) \
+         allowed_tools, data_scope, prompt, schedule_cron, mode, permissions) \
+         VALUES ($1, $2, $3, $4, $5, 'draft', $6, $7, $8, $9, $10, $11, $12) \
          RETURNING {EMPLOYEE_COLUMNS}"
     );
     Ok(sqlx::query_as(&sql)
@@ -273,6 +357,10 @@ pub async fn create_employee(
         .bind(input.budget_limit)
         .bind(&input.allowed_tools)
         .bind(&input.data_scope)
+        .bind(&input.prompt)
+        .bind(&input.schedule_cron)
+        .bind(mode)
+        .bind(permissions)
         .fetch_one(pool)
         .await?)
 }

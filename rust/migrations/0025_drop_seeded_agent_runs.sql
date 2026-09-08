@@ -1,0 +1,38 @@
+-- Task T3.1 (copilot operations handover, plan section 3.4): drop the
+-- SEEDED FIXTURE run/approval history from `0018_seed_agents.sql`.
+--
+-- WHY: `0017_agents.sql`'s header comment is explicit that `agent_run` is
+-- "never written to by a live execution path, only seeded / read" — there
+-- has never been an execution runtime in this repository, so every row in
+-- `agent_run` and every `approval_item` row that references one of those
+-- runs is fabricated demo history, not something that ever actually
+-- happened. T3.2 (this same plan, next task) adds the first LIVE run path
+-- (`POST /api/agents/employees/{id}/run`). From that point on, `agent_run`
+-- will contain a mix of genuinely-executed runs and these invented ones
+-- with no way for a viewer of `/agents/runs` to tell them apart — a demo
+-- would show fabricated agent activity presented as if it were real. So
+-- the fixture rows are removed now, before any real row can exist,
+-- resolving the ambiguity in the honest direction rather than leaving it
+-- for later.
+--
+-- WHAT IS NOT TOUCHED: `agent_employee`, `agent_workflow`, and `agent_tool`
+-- seeded rows (`emp-inventory`, `emp-risk`, `wf-dunning`, `wf-lag-triage`,
+-- the three `tool-*` rows) are DEFINITIONS, not fabricated activity — they
+-- stay, same as `0017_agents.sql` intended, and are still valid targets for
+-- a real, scheduled run once T3.3 lands.
+--
+-- PRECISION: this deletes ONLY the exact ids `0018_seed_agents.sql`
+-- inserted, matched by id, never a blanket `DELETE FROM`. Approvals are
+-- deleted before their runs (though `approval_item.run_id` and
+-- `audit_event.run_id`/`approval_id` are all `ON DELETE SET NULL`, so the
+-- order is not load-bearing for referential integrity — it just keeps the
+-- two statements readable in the same order the rows relate to each
+-- other).
+--
+-- Seeded approval ids (`0018_seed_agents.sql`): ap-01, ap-02 (reference
+-- run-col-01), ap-03 (references no run).
+DELETE FROM approval_item WHERE id IN ('ap-01', 'ap-02', 'ap-03');
+
+-- Seeded run ids (`0018_seed_agents.sql`): run-col-01 (emp-inventory /
+-- wf-dunning), run-risk-01 (emp-risk).
+DELETE FROM agent_run WHERE id IN ('run-col-01', 'run-risk-01');

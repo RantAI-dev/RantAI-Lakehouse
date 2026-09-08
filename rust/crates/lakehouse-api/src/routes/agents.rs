@@ -148,6 +148,14 @@ pub struct CreateEmployeeBody {
     budget_limit: f64,
     #[serde(default)]
     owner: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    schedule_cron: Option<String>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    permissions: Option<String>,
 }
 
 /// `POST /api/agents/employees` — create a digital employee. Returns 201.
@@ -176,6 +184,10 @@ pub async fn create_employee(
         data_scope: required("dataScope", &body.data_scope)?,
         budget_limit: body.budget_limit,
         owner: body.owner,
+        prompt: body.prompt,
+        schedule_cron: body.schedule_cron,
+        mode: body.mode,
+        permissions: body.permissions,
     };
     let created = agents::create_employee(pool(&state)?, &input).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
@@ -440,6 +452,10 @@ mod tests {
             data_scope: "d".to_owned(),
             budget_limit: 0.0,
             owner: None,
+            prompt: None,
+            schedule_cron: None,
+            mode: None,
+            permissions: None,
         };
         assert!(!VALID_AUTONOMY.contains(&body.autonomy.as_str()));
     }
