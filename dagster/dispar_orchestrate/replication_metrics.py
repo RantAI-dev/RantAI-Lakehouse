@@ -23,6 +23,37 @@ actual thing at risk, and it already exposes this via a system view with no
 extra component required — asking Debezium instead would mean trusting a
 CDC connector's own self-report of a risk that manifests on a database it
 does not control.
+
+# Delivery — how a breached threshold actually reaches a human
+
+Measuring is only half of R5. Until this job also exposed
+`serving.replication_slot_health`, a breach produced a row and a log line
+and nothing else: `_status_for` computed "warning"/"critical" that no one
+was told about, so the operator's first notification that WAL was pinned
+would be the source disk filling. A metric nobody is paged on is not a
+mitigation.
+
+`lakehouse_alerts::run_rules` evaluates every rule as
+`SELECT {aggregate}({measure}) AS v FROM serving.{mart}` — it can only read
+`serving.*`, which is precisely why a `lake.bronze_meta.*` table was
+invisible to it. The view this job creates puts the same numbers in reach of
+that existing engine, so breaches deliver through the existing channels
+(email/webhook, `POST /api/alerts/run`) with no second delivery path to
+maintain — R10's "reuse the mechanism, do not invent a parallel one".
+
+The rule is NOT auto-created, deliberately: seeding a rule that emails
+people is not a decision a metrics job should make on an operator's behalf.
+Create it once, via `POST /api/alerts/rules` or the console:
+
+    mart      = replication_slot_health
+    aggregate = max
+    measure   = unhealthy
+    operator  = gt
+    threshold = 0
+
+which fires whenever any slot's latest check is `warning` or `critical`. To
+alert on an absolute size instead, use `measure = wal_retained_bytes` with
+`aggregate = max` and a byte threshold.
 """
 
 from __future__ import annotations
@@ -104,6 +135,39 @@ _REPLICATION_SLOT_DDL = (
     ") ENGINE = ReplacingMergeTree ORDER BY (connector_id, checked_at)"
 )
 
+# R5's delivery half. Before this, a breached WAL threshold produced a row in
+# the table above and a log line — and nothing else. `_status_for` computed
+# "warning"/"critical" that no one was ever told about, which is the failure
+# mode R5 exists to prevent wearing the costume of its own mitigation: the
+# operator learns their source disk is filling by the source disk filling.
+#
+# Rather than build a second delivery path, this exposes the metric where the
+# EXISTING alerts engine can already see it. `lakehouse_alerts::run_rules`
+# evaluates every rule as `SELECT {agg}({measure}) AS v FROM serving.{mart}`
+# — it can only read `serving.*`, which is why a `lake.bronze_meta.*` table
+# was unreachable to it. This view puts the same numbers in reach, so a
+# normal alert rule delivers them through the normal channels (email/webhook,
+# `POST /api/alerts/run`) with no new mechanism to maintain. Per R10: reuse
+# the mechanism, do not invent a parallel one.
+#
+# One row per slot, latest check only (`argMax` over `checked_at`), because
+# an alert should fire on the CURRENT state of a slot, not on a stale row
+# from before it recovered. `unhealthy` is 0/1 so `max(unhealthy) > 0` is the
+# natural rule for "any slot is unhealthy", and `wal_retained_bytes` is
+# exposed directly so an operator can alert on an absolute byte threshold
+# instead if they prefer.
+_REPLICATION_SLOT_HEALTH_VIEW_DDL = (
+    "CREATE OR REPLACE VIEW serving.replication_slot_health AS "
+    "SELECT connector_id, slot_name, "
+    "argMax(status, checked_at) AS status, "
+    "argMax(wal_retained_bytes, checked_at) AS wal_retained_bytes, "
+    "argMax(confirmed_flush_lag_bytes, checked_at) AS confirmed_flush_lag_bytes, "
+    "argMax(active, checked_at) AS active, "
+    "if(argMax(status, checked_at) IN ('warning', 'critical'), 1, 0) AS unhealthy "
+    "FROM lake.`bronze_meta.replication_slot` "
+    "GROUP BY connector_id, slot_name"
+)
+
 # Conservative, arbitrary thresholds — this is a first-class metric, not a
 # tuned alert; an operator with real WAL volume data should override these
 # via env vars rather than this job hardcoding a "correct" number nothing
@@ -179,6 +243,11 @@ def record_replication_slot_metrics(
     ch = target or ClickHouseTarget.from_env()
     _ch_exec(ch, "CREATE DATABASE IF NOT EXISTS lake")
     _ch_exec(ch, _REPLICATION_SLOT_DDL)
+    # `serving` must exist before a view can be created in it. It does in
+    # every deployment that has run the demo schema, but this job must not
+    # depend on that having happened first.
+    _ch_exec(ch, "CREATE DATABASE IF NOT EXISTS serving")
+    _ch_exec(ch, _REPLICATION_SLOT_HEALTH_VIEW_DDL)
 
     if not slots:
         return
