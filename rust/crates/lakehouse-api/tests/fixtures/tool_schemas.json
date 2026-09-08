@@ -1,0 +1,386 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "run_sql",
+      "description": "Jalankan query SELECT ClickHouse (read-only) untuk menjawab pertanyaan data. Gunakan tabel serving.mart_* (Gold) untuk agregasi atau silver.`<nama>` untuk detail. Selalu SELECT saja, LIMIT wajar.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "sql": {
+            "type": "string",
+            "description": "Query SELECT ClickHouse"
+          }
+        },
+        "required": [
+          "sql"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_datasets",
+      "description": "Daftar dataset di katalog lakehouse (opsional filter kata kunci / tier primer|sekunder).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "search": {
+            "type": "string"
+          },
+          "tier": {
+            "type": "string",
+            "enum": [
+              "primer",
+              "sekunder"
+            ]
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "describe_dataset",
+      "description": "Metadata + skema kolom + jumlah baris satu dataset (by slug).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "slug"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_lineage",
+      "description": "Silsilah sebuah dataset: source → Bronze → Silver + mapping kolom (by slug).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "slug"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_quality",
+      "description": "Ringkasan kualitas data lakehouse (jumlah cek pass/warn/fail + contoh masalah).",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "trigger_lakehouse_build",
+      "description": "BANGUN ULANG lakehouse: tarik data SDI+berkas ke Bronze, generate Silver bertipe, build mart Gold. Menjalankan job Dagster 'refresh_lakehouse'. Pakai saat user minta membangun/menyegarkan data Bronze/Silver/Gold.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_build_status",
+      "description": "Status run pipeline lakehouse terakhir (Dagster).",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "describe_mart",
+      "description": "Lihat mart Gold (serving.*) yang bisa divisualisasikan. Tanpa argumen: daftar semua mart. Dengan `mart`: kolom mart itu, terbagi dimensi (kategori/waktu) & measure (angka). PANGGIL INI DULU sebelum create_chart agar memilih kolom yang benar-benar ada.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "mart": {
+            "type": "string",
+            "description": "nama mart, mis. mart_wisman"
+          }
+        }
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_chart",
+      "description": "Buat kartu chart baru di dashboard (/dashboards) dari mart Gold. Server menyusun SQL-nya sendiri dari kolom yang kamu pilih (agregasi per dimensi) — kamu TIDAK menulis SQL. Panggil describe_mart dulu untuk tahu kolom valid. Chart langsung tersimpan & tampil.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "subtitle": {
+            "type": "string"
+          },
+          "mart": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "bar",
+              "hbar",
+              "line",
+              "area",
+              "stacked",
+              "combo",
+              "pie",
+              "rose",
+              "funnel",
+              "treemap",
+              "scatter",
+              "bubble",
+              "heatmap",
+              "radar",
+              "waterfall",
+              "geomap",
+              "kpi",
+              "gauge",
+              "table",
+              "text"
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "caption": {
+            "type": "string"
+          },
+          "target": {
+            "type": "number"
+          },
+          "dimension": {
+            "type": "string"
+          },
+          "measures": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "breakdown": {
+            "type": "string"
+          },
+          "aggregate": {
+            "type": "string",
+            "enum": [
+              "sum",
+              "avg",
+              "max",
+              "min",
+              "count"
+            ]
+          },
+          "limit": {
+            "type": "number"
+          },
+          "span": {
+            "type": "number",
+            "enum": [
+              1,
+              2
+            ]
+          },
+          "board": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "kind"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "update_chart",
+      "description": "Ubah chart tersimpan (by id) — mempertahankan id, mengganti definisinya. Kirim SEMUA field seperti create_chart dengan nilai baru. Pakai list_charts untuk tahu id.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "subtitle": {
+            "type": "string"
+          },
+          "mart": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "bar",
+              "hbar",
+              "line",
+              "area",
+              "stacked",
+              "combo",
+              "pie",
+              "rose",
+              "funnel",
+              "treemap",
+              "scatter",
+              "bubble",
+              "heatmap",
+              "radar",
+              "waterfall",
+              "geomap",
+              "kpi",
+              "gauge",
+              "table",
+              "text"
+            ]
+          },
+          "dimension": {
+            "type": "string"
+          },
+          "measures": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "breakdown": {
+            "type": "string"
+          },
+          "caption": {
+            "type": "string"
+          },
+          "target": {
+            "type": "number"
+          },
+          "aggregate": {
+            "type": "string",
+            "enum": [
+              "sum",
+              "avg",
+              "max",
+              "min",
+              "count"
+            ]
+          },
+          "limit": {
+            "type": "number"
+          },
+          "span": {
+            "type": "number",
+            "enum": [
+              1,
+              2
+            ]
+          },
+          "board": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "kind"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_board",
+      "description": "Buat board (dashboard bernama) baru. Kembalikan id-nya untuk dipakai di create_chart.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_boards",
+      "description": "Daftar board (dashboard bernama) yang ada.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "suggest_dashboard",
+      "description": "Ambil katalog SEMUA mart Gold beserta dimensi & measure-nya sekaligus — untuk MENGUSULKAN set kartu dashboard.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_charts",
+      "description": "Daftar kartu chart tersimpan di dashboard (yang dibuat lewat chat/UI).",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_chart",
+      "description": "Hapus satu kartu chart tersimpan dari dashboard (by id). Spec bawaan tak bisa dihapus.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  }
+]

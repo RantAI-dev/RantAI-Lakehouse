@@ -1342,7 +1342,93 @@ pub async fn sessions_delete(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::collections::HashMap;
+
     use super::*;
+    use crate::config::Config;
+    use crate::state::AppState;
+
+    /// Characterization snapshot (T0.1 step 1): the EXACT
+    /// `tool_schemas()` output at the moment the registry refactor began,
+    /// captured before any production code was touched. The upcoming
+    /// registry refactor (`routes/ai/registry.rs` + friends) must derive
+    /// `tool_schemas()` from the new `TOOLS` table and still reproduce this
+    /// file byte-for-byte — this test is the proof.
+    #[test]
+    fn tool_schemas_snapshot_is_byte_identical() {
+        let expected = include_str!("../../tests/fixtures/tool_schemas.json");
+        let actual = serde_json::to_string_pretty(&tool_schemas()).unwrap();
+        assert_eq!(
+            actual, expected,
+            "tool_schemas() output drifted from the committed snapshot \
+             (rust/crates/lakehouse-api/tests/fixtures/tool_schemas.json) — \
+             regenerate the fixture ONLY if the drift is an intentional, \
+             reviewed schema change, never to make this test pass during \
+             the registry refactor"
+        );
+    }
+
+    /// Characterization snapshot (T0.1 step 1): every tool name
+    /// [`run_tool`] actually dispatches, captured pre-refactor. The
+    /// post-refactor registry-driven dispatch must accept exactly this set
+    /// (no more, no fewer) and must still refuse an unrecognised name with
+    /// the same `{"error": "tool tak dikenal: <name>"}` shape.
+    const KNOWN_TOOL_NAMES: [&str; 15] = [
+        "run_sql",
+        "list_datasets",
+        "describe_dataset",
+        "get_lineage",
+        "get_quality",
+        "trigger_lakehouse_build",
+        "get_build_status",
+        "describe_mart",
+        "create_chart",
+        "update_chart",
+        "create_board",
+        "list_boards",
+        "suggest_dashboard",
+        "list_charts",
+        "delete_chart",
+    ];
+
+    /// Builds an [`AppState`] that never blocks on, or requires, a live
+    /// Postgres/`ClickHouse`/`Dagster`/LLM — see
+    /// `state.rs`'s `app_state_boots_with_default_database_url_and_no_live_postgres`
+    /// for why `Config::from_map(&HashMap::new())` is safe to build
+    /// `AppState` from directly in a `#[tokio::test]`, with no
+    /// `testcontainers` harness needed. Every downstream call in this test
+    /// hits an unreachable default upstream and errors fast; only the
+    /// dispatch *shape* (did `run_tool` recognise the name at all) is
+    /// asserted.
+    fn dispatch_test_state() -> AppState {
+        AppState::new(Config::from_map(&HashMap::new()).unwrap())
+    }
+
+    /// D3.5 (T0.1 step 1): every name in [`KNOWN_TOOL_NAMES`] reaches a
+    /// real dispatch arm in [`run_tool`] — none of them fall through to the
+    /// `other => tool tak dikenal` branch — and an unrecognised name gets
+    /// exactly that refusal shape. This is the pre-refactor baseline; the
+    /// post-refactor version of this test (against the `TOOLS` registry)
+    /// must keep asserting the identical set of names.
+    #[tokio::test]
+    async fn run_tool_dispatches_every_known_name_and_refuses_unknown() {
+        assert_eq!(KNOWN_TOOL_NAMES.len(), tool_schemas().len());
+        let state = dispatch_test_state();
+        for name in KNOWN_TOOL_NAMES {
+            let result = run_tool(&state, name, &Map::new()).await;
+            if let Some(err) = result.get("error").and_then(Value::as_str) {
+                assert!(
+                    !err.starts_with("tool tak dikenal"),
+                    "{name} unexpectedly hit the unknown-tool dispatch arm: {err}"
+                );
+            }
+        }
+        let unknown = run_tool(&state, "not_a_real_tool", &Map::new()).await;
+        assert_eq!(
+            unknown,
+            json!({ "error": "tool tak dikenal: not_a_real_tool" })
+        );
+    }
 
     #[test]
     fn tool_schemas_has_fifteen_entries() {
