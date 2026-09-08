@@ -331,21 +331,6 @@ pub struct Config {
     /// non-load-bearing parsing posture as
     /// [`Self::gold_export_max_rows`]. Default `20_000`.
     pub gold_export_batch_size: u64,
-    /// Whether `crate::connector_probe` is allowed to dial private/internal
-    /// address ranges (RFC1918, loopback, link-local incl. cloud metadata
-    /// endpoints, IPv6 unique-local) named by a connector's `host`.
-    ///
-    /// Default `false` — SSRF-safe by default: a connector `/test` probe
-    /// resolves `host` and refuses to dial it if any resolved address falls
-    /// in a blocked range. This deployment's OWN seeded connectors
-    /// (`postgres:5432`, `http://rustfs:9000` —
-    /// `rust/migrations/0022_prune_connector_seed.sql`) are themselves
-    /// internal-network names, so a compose stack that wants those `/test`
-    /// buttons to work must set `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true`
-    /// explicitly — an opt-out, not the default, so the safe posture is
-    /// what a deployment gets unless it says otherwise. `true` only when
-    /// this env var is exactly `"true"`.
-    pub connector_probe_allow_internal_hosts: bool,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -438,10 +423,6 @@ impl std::fmt::Debug for Config {
             )
             .field("gold_export_max_rows", &self.gold_export_max_rows)
             .field("gold_export_batch_size", &self.gold_export_batch_size)
-            .field(
-                "connector_probe_allow_internal_hosts",
-                &self.connector_probe_allow_internal_hosts,
-            )
             .finish()
     }
 }
@@ -605,9 +586,6 @@ impl Config {
             gold_export_run_token: truthy(env, "GOLD_EXPORT_RUN_TOKEN"),
             gold_export_max_rows: parse_u64_or_default(env, "GOLD_EXPORT_MAX_ROWS", 5_000_000),
             gold_export_batch_size: parse_u64_or_default(env, "GOLD_EXPORT_BATCH_SIZE", 20_000),
-            connector_probe_allow_internal_hosts: env
-                .get("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS")
-                .is_some_and(|v| v == "true"),
         })
     }
 
