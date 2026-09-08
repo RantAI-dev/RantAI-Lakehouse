@@ -10,6 +10,7 @@ import type {
   DecideApprovalResult,
   DigitalEmployee,
   RegisterToolInput,
+  RunEmployeeInput,
 } from "../contracts/agents"
 import { apiFetch } from "../http"
 import { ServiceError } from "../errors"
@@ -19,12 +20,15 @@ import { ServiceError } from "../errors"
  * riwayat run, dan siklus approval semuanya tersimpan di Postgres lewat
  * route `/api/agents/*` (crate `lakehouse-store`, Task 2.9).
  *
- * CATATAN CAKUPAN: tidak ada runtime eksekusi agent/tool di mana pun dalam
- * repo ini. `listRuns`/`getRun` menyajikan RIWAYAT run (data seed, sama
- * seperti fixture `mock/agents.ts`) — tidak ada kode di sini yang benar-
- * benar menjalankan agent atau memanggil tool. `AgentService` sendiri
- * tidak punya method "run agent ini"/"panggil tool ini", jadi tidak ada
- * bagian kontrak yang dipangkas cakupannya di sini.
+ * UPDATE (T3.2/T3.4, copilot-operations-handover plan): ada runtime
+ * eksekusi headless sekarang — `runEmployee` memanggil `POST
+ * /api/agents/employees/{id}/run`, yang benar-benar menjalankan loop
+ * tool-calling copilot untuk satu digital employee tanpa pengawasan
+ * interaktif, menulis `agent_run`/`steps`/`audit_event` yang nyata.
+ * `listRuns`/`getRun` sekarang bisa menyajikan riwayat run yang benar-
+ * benar terjadi, bukan cuma seed — lihat migrasi `0025_drop_seeded_
+ * agent_runs.sql`, yang menghapus seed run/approval lama supaya halaman
+ * ini tidak menyesatkan.
  */
 
 function errorFor(status: number, message: string): ServiceError {
@@ -143,5 +147,15 @@ export const postgresAgentService: AgentService = {
       signal,
       "Mencabut digital employee gagal"
     )
+  },
+  async runEmployee(id, input: RunEmployeeInput | undefined, signal) {
+    const body = input?.prompt?.trim() ? { prompt: input.prompt.trim() } : undefined
+    const { run } = await post<{ run: AgentRun }>(
+      `/api/agents/employees/${encodeURIComponent(id)}/run`,
+      body,
+      signal,
+      "Menjalankan digital employee gagal"
+    )
+    return run
   },
 }
