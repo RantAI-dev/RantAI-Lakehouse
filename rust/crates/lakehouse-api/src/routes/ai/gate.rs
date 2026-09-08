@@ -48,7 +48,7 @@
 //! regression test.
 
 use lakehouse_auth::PermissionSet;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::registry::{Risk, ToolSpec};
 
@@ -76,6 +76,98 @@ fn permission_refusal(tool_name: &str, required: &str) -> Value {
         "reason": "permission",
         "required": required,
     })
+}
+
+/// T0.4: the pending-confirmation shape for a [`Risk::WriteLow`] tool call
+/// that did not carry `"confirmed": true` in its arguments. The model
+/// relays this to the user; the frontend renders `summary` with a Confirm /
+/// Cancel pair, and Confirm re-sends the SAME call (via
+/// `POST /api/ai/tool`, [`super::tool_call`]) with `confirmed: true` merged
+/// into `args`. Nothing executes when this is returned.
+fn needs_confirmation(spec: &ToolSpec, args: &Map<String, Value>) -> Value {
+    json!({
+        "needs_confirmation": true,
+        "tool": spec.name,
+        "args": args,
+        "summary": summary_for(spec, args),
+    })
+}
+
+/// T0.4 placeholder for [`Risk::WriteHigh`]: the approvals-inbox flow
+/// (T0.5 of the copilot-operations-handover plan) does not exist yet, so a
+/// `WriteHigh` call must neither execute nor silently pass through a
+/// confirmation path meant for [`Risk::WriteLow`] — it is refused with a
+/// clear "not implemented yet" reason instead. Replace this arm with the
+/// real approval-item creation when T0.5 lands.
+fn write_high_not_implemented(tool_name: &str) -> Value {
+    json!({
+        "error": "ditolak: tool ini butuh persetujuan (approval) yang belum tersedia",
+        "refused": true,
+        "tool": tool_name,
+        "reason": "not_implemented",
+    })
+}
+
+/// A short, deterministic Indonesian sentence describing exactly what a
+/// [`Risk::WriteLow`] tool call is about to do, generated from the tool
+/// name and its (not yet stripped of `confirmed`) arguments — NEVER from
+/// asking the LLM, so the summary can't drift from what will actually
+/// execute. One arm per `WriteLow` tool; an unlisted tool (there is none
+/// today, but a future `WriteLow` addition that forgets to extend this
+/// falls through here rather than failing to compile) gets a generic
+/// fallback.
+fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
+    let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
+    match spec.name {
+        "trigger_lakehouse_build" => {
+            "Menjalankan build ulang lakehouse (Bronze → Silver → Gold).".to_owned()
+        }
+        "create_chart" => format!(
+            "Membuat chart baru \"{}\" ({}) dari mart {}.",
+            s("title"),
+            s("kind"),
+            s("mart")
+        ),
+        "update_chart" => format!(
+            "Mengubah chart {} menjadi \"{}\" ({}).",
+            s("id"),
+            s("title"),
+            s("kind")
+        ),
+        "create_board" => format!("Membuat board baru bernama \"{}\".", s("name")),
+        _ => format!(
+            "Menjalankan tool {} dengan argumen yang diberikan.",
+            spec.name
+        ),
+    }
+}
+
+/// Strips the `confirmed` key that [`decide`] reads out of a `WriteLow`
+/// call's args before those args ever reach a tool body — no tool
+/// implementation should see it as a real argument (T0.4). Safe to call on
+/// args for ANY tool, not only `WriteLow` ones: a no-op when the key is
+/// absent.
+#[must_use]
+pub fn strip_confirmed(args: &Map<String, Value>) -> Map<String, Value> {
+    let mut out = args.clone();
+    out.remove("confirmed");
+    out
+}
+
+/// Classifies a [`decide`]/[`decide_by_name`] result into the
+/// `audit_event.outcome` string it corresponds to, for the "gate refused
+/// or asked for confirmation, so there is no run to classify by success"
+/// half of the audit story (`super::audit::record`'s callers use this for
+/// `Some(refusal)`; the "actually ran" half is classified by the caller
+/// from whether [`super::tools::run_tool`]'s result carries an `"error"`
+/// key, matching the trace's existing `ok` computation).
+#[must_use]
+pub fn outcome_of(refusal: &Value) -> &'static str {
+    if refusal.get("needs_confirmation").and_then(Value::as_bool) == Some(true) {
+        "needs_confirmation"
+    } else {
+        "refused"
+    }
 }
 
 /// D3: the dispatch-site enforcement of the tool registry's risk tier
@@ -121,8 +213,27 @@ fn permission_refusal(tool_name: &str, required: &str) -> Value {
 /// An unregistered tool name is never refused here (`None`): it isn't a
 /// write tool, it's not a tool at all, and `run_tool` reports it as
 /// unrecognised instead.
+///
+/// # T0.4: risk-tier branching (checked last, only once mode+permission
+/// both pass)
+///
+/// - [`Risk::Read`] → allowed (`None`).
+/// - [`Risk::WriteLow`] → allowed if `args["confirmed"] == true`;
+///   otherwise a [`needs_confirmation`] result — nothing executes, and the
+///   model/frontend must resend the identical call with `confirmed: true`
+///   (see `POST /api/ai/tool`, [`super::tool_call`]).
+/// - [`Risk::WriteHigh`] → always [`write_high_not_implemented`] for now;
+///   the real approvals-inbox flow is T0.5, not this task. This is
+///   deliberately NOT the same as executing, and NOT the `WriteLow`
+///   confirmation path — a `WriteHigh` call must never slip through by
+///   carrying `confirmed: true`.
 #[must_use]
-pub fn decide(is_build: bool, perms: Option<&PermissionSet>, spec: &ToolSpec) -> Option<Value> {
+pub fn decide(
+    is_build: bool,
+    perms: Option<&PermissionSet>,
+    spec: &ToolSpec,
+    args: &Map<String, Value>,
+) -> Option<Value> {
     if !is_build && spec.risk != Risk::Read {
         return Some(ask_mode_refusal(spec.name));
     }
@@ -132,7 +243,18 @@ pub fn decide(is_build: bool, perms: Option<&PermissionSet>, spec: &ToolSpec) ->
             return Some(permission_refusal(spec.name, spec.permission));
         }
     }
-    None
+    match spec.risk {
+        Risk::Read => None,
+        Risk::WriteHigh => Some(write_high_not_implemented(spec.name)),
+        Risk::WriteLow => {
+            let confirmed = args.get("confirmed") == Some(&Value::Bool(true));
+            if confirmed {
+                None
+            } else {
+                Some(needs_confirmation(spec, args))
+            }
+        }
+    }
 }
 
 /// [`decide`] by tool name, looking the [`ToolSpec`] up via
@@ -143,9 +265,10 @@ pub fn decide_by_name(
     is_build: bool,
     perms: Option<&PermissionSet>,
     tool_name: &str,
+    args: &Map<String, Value>,
 ) -> Option<Value> {
     let spec = super::registry::find(tool_name)?;
-    decide(is_build, perms, spec)
+    decide(is_build, perms, spec, args)
 }
 
 #[cfg(test)]
@@ -181,6 +304,21 @@ mod tests {
         registry::find(name).expect("registered tool")
     }
 
+    /// An empty args map — the common case for tests that don't care about
+    /// `confirmed` (ask-mode and permission checks run before the
+    /// risk-tier branch, so they're unaffected by it).
+    fn no_args() -> Map<String, Value> {
+        Map::new()
+    }
+
+    /// `{"confirmed": true}` — what a resent `WriteLow` call carries after
+    /// the user hits Confirm (T0.4).
+    fn confirmed_args() -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert("confirmed".to_owned(), json!(true));
+        m
+    }
+
     /// D3: a forged write-tool invocation (whether a hallucinated
     /// `tool_calls` entry or a `MiniMax` XML `<invoke>` the model was never
     /// offered — [`decide`] doesn't care how the call arrived, only its
@@ -190,8 +328,8 @@ mod tests {
     fn write_tool_is_refused_in_ask_mode() {
         let perms = admin_perms();
         for name in WRITE_TOOLS {
-            let refused =
-                decide(false, Some(&perms), spec(name)).expect("write tool must be refused");
+            let refused = decide(false, Some(&perms), spec(name), &no_args())
+                .expect("write tool must be refused");
             assert_eq!(refused["refused"], json!(true));
             assert_eq!(refused["tool"], json!(name));
             assert!(refused.get("error").is_some());
@@ -202,20 +340,94 @@ mod tests {
         }
     }
 
-    /// D3: the same forged call, replayed in `mode: "build"` (the
+    /// T0.4: the same forged call, replayed in `mode: "build"` (the
     /// write-capable mode) with a principal that has every permission, is
-    /// authorized — [`decide`] returns `None` and dispatch proceeds to
-    /// `run_tool` normally.
+    /// authorized for the four `WriteLow` tools ONLY once `confirmed: true`
+    /// is present — [`decide`] returns `None` and dispatch proceeds to
+    /// `run_tool` normally. `delete_chart` (`WriteHigh`) is covered
+    /// separately: it is never allowed by this path.
     #[test]
-    fn write_tool_is_allowed_in_build_mode_for_admin() {
+    fn write_low_tool_confirmed_is_allowed_in_build_mode_for_admin() {
         let perms = admin_perms();
-        for name in WRITE_TOOLS {
+        for name in [
+            "trigger_lakehouse_build",
+            "create_chart",
+            "update_chart",
+            "create_board",
+        ] {
             assert_eq!(
-                decide(true, Some(&perms), spec(name)),
+                decide(true, Some(&perms), spec(name), &confirmed_args()),
                 None,
-                "{name} must be allowed to dispatch in build mode for an admin"
+                "{name} must be allowed to dispatch in build mode for an admin once confirmed"
             );
         }
+    }
+
+    /// T0.4: a `WriteLow` call in build mode for an admin, WITHOUT
+    /// `confirmed: true`, executes nothing — it gets the
+    /// `needs_confirmation` shape instead of `None`.
+    #[test]
+    fn write_low_tool_without_confirmed_needs_confirmation_and_does_not_execute() {
+        let perms = admin_perms();
+        for name in [
+            "trigger_lakehouse_build",
+            "create_chart",
+            "update_chart",
+            "create_board",
+        ] {
+            let result = decide(true, Some(&perms), spec(name), &no_args())
+                .expect("unconfirmed WriteLow call must not return None (i.e. must not execute)");
+            assert_eq!(result["needs_confirmation"], json!(true));
+            assert_eq!(result["tool"], json!(name));
+            assert_eq!(result["args"], json!(no_args()));
+            let summary = result["summary"]
+                .as_str()
+                .expect("summary must be a string");
+            assert!(!summary.is_empty(), "{name} must have a non-empty summary");
+        }
+    }
+
+    /// T0.4: `confirmed: false` (present but not `true`) is treated
+    /// identically to absent — still needs confirmation.
+    #[test]
+    fn write_low_tool_confirmed_false_still_needs_confirmation() {
+        let perms = admin_perms();
+        let mut args = Map::new();
+        args.insert("confirmed".to_owned(), json!(false));
+        let result =
+            decide(true, Some(&perms), spec("create_board"), &args).expect("must not execute");
+        assert_eq!(result["needs_confirmation"], json!(true));
+    }
+
+    /// T0.4: the `create_chart` summary is generated deterministically from
+    /// its own args (title/kind/mart), not the LLM.
+    #[test]
+    fn create_chart_summary_reflects_its_own_args() {
+        let perms = admin_perms();
+        let mut args = Map::new();
+        args.insert("title".to_owned(), json!("Kunjungan Harian"));
+        args.insert("kind".to_owned(), json!("bar"));
+        args.insert("mart".to_owned(), json!("mart_wisman"));
+        let result =
+            decide(true, Some(&perms), spec("create_chart"), &args).expect("must not execute");
+        let summary = result["summary"].as_str().expect("summary string");
+        assert!(summary.contains("Kunjungan Harian"));
+        assert!(summary.contains("bar"));
+        assert!(summary.contains("mart_wisman"));
+    }
+
+    /// T0.4: `WriteHigh` (`delete_chart`) is never executed by this gate,
+    /// even with `confirmed: true` — that flag only means something for
+    /// `WriteLow`. It gets a distinct `reason: "not_implemented"` refusal,
+    /// not the ask-mode or permission shape, and not `needs_confirmation`.
+    #[test]
+    fn write_high_tool_is_refused_not_implemented_even_when_confirmed() {
+        let perms = admin_perms();
+        let refused = decide(true, Some(&perms), spec("delete_chart"), &confirmed_args())
+            .expect("WriteHigh must never return None (i.e. must never execute) from this gate");
+        assert_eq!(refused["refused"], json!(true));
+        assert_eq!(refused["reason"], json!("not_implemented"));
+        assert!(refused.get("needs_confirmation").is_none());
     }
 
     /// A non-write tool is never refused for ask-mode reasons, in either
@@ -223,8 +435,14 @@ mod tests {
     #[test]
     fn read_only_tool_is_never_refused_for_admin() {
         let perms = admin_perms();
-        assert_eq!(decide(false, Some(&perms), spec("run_sql")), None);
-        assert_eq!(decide(true, Some(&perms), spec("run_sql")), None);
+        assert_eq!(
+            decide(false, Some(&perms), spec("run_sql"), &no_args()),
+            None
+        );
+        assert_eq!(
+            decide(true, Some(&perms), spec("run_sql"), &no_args()),
+            None
+        );
     }
 
     /// An unregistered name is never refused by the gate — it isn't a
@@ -232,8 +450,14 @@ mod tests {
     /// unrecognised.
     #[test]
     fn unregistered_tool_is_never_refused() {
-        assert_eq!(decide_by_name(false, None, "not_a_real_tool"), None);
-        assert_eq!(decide_by_name(true, None, "not_a_real_tool"), None);
+        assert_eq!(
+            decide_by_name(false, None, "not_a_real_tool", &no_args()),
+            None
+        );
+        assert_eq!(
+            decide_by_name(true, None, "not_a_real_tool", &no_args()),
+            None
+        );
     }
 
     /// T0.2 invariant 1 (plan 3.6): an Analyst-like `PermissionSet`
@@ -242,19 +466,23 @@ mod tests {
     #[test]
     fn analyst_is_refused_create_chart_for_permission() {
         let perms = analyst_perms();
-        let refused = decide(true, Some(&perms), spec("create_chart")).expect("must be refused");
+        let refused = decide(true, Some(&perms), spec("create_chart"), &confirmed_args())
+            .expect("must be refused");
         assert_eq!(refused["refused"], json!(true));
         assert_eq!(refused["tool"], json!("create_chart"));
         assert_eq!(refused["reason"], json!("permission"));
         assert_eq!(refused["required"], json!("dashboard:write"));
     }
 
-    /// T0.2 invariant 2: a Platform Admin `PermissionSet` (`*:*`) is
-    /// allowed `create_chart`.
+    /// T0.2 invariant 2 (extended for T0.4): a Platform Admin
+    /// `PermissionSet` (`*:*`) is allowed `create_chart` once confirmed.
     #[test]
-    fn platform_admin_is_allowed_create_chart() {
+    fn platform_admin_is_allowed_create_chart_when_confirmed() {
         let perms = admin_perms();
-        assert_eq!(decide(true, Some(&perms), spec("create_chart")), None);
+        assert_eq!(
+            decide(true, Some(&perms), spec("create_chart"), &confirmed_args()),
+            None
+        );
     }
 
     /// Ask-mode precedes the permission check: a principal WITH
@@ -264,7 +492,8 @@ mod tests {
     #[test]
     fn ask_mode_refusal_precedes_permission_check() {
         let perms = PermissionSet::parse("dashboard:write");
-        let refused = decide(false, Some(&perms), spec("create_chart")).expect("must be refused");
+        let refused =
+            decide(false, Some(&perms), spec("create_chart"), &no_args()).expect("must be refused");
         assert_eq!(
             refused,
             ask_mode_refusal("create_chart"),
@@ -280,7 +509,7 @@ mod tests {
         let perms = analyst_perms();
         let read_spec = spec("describe_mart");
         assert_eq!(read_spec.risk, Risk::Read);
-        let refused = decide(true, Some(&perms), read_spec).expect("must be refused");
+        let refused = decide(true, Some(&perms), read_spec, &no_args()).expect("must be refused");
         assert_eq!(refused["reason"], json!("permission"));
         assert_eq!(refused["required"], json!("dashboard:read"));
     }
@@ -293,7 +522,10 @@ mod tests {
         let perms = PermissionSet::default();
         let empty_perm_spec = spec("get_quality");
         assert_eq!(empty_perm_spec.permission, "");
-        assert_eq!(decide(true, Some(&perms), empty_perm_spec), None);
+        assert_eq!(
+            decide(true, Some(&perms), empty_perm_spec, &no_args()),
+            None
+        );
     }
 
     /// Named regression test for the privilege-escalation this task
@@ -310,7 +542,7 @@ mod tests {
     #[test]
     fn analyst_cannot_create_chart_the_console_would_refuse() {
         let perms = analyst_perms();
-        let refused = decide(true, Some(&perms), spec("create_chart"))
+        let refused = decide(true, Some(&perms), spec("create_chart"), &confirmed_args())
             .expect("an Analyst must not be able to create a chart via the copilot");
         assert_eq!(refused["reason"], json!("permission"));
         assert_eq!(refused["required"], json!("dashboard:write"));
@@ -322,7 +554,7 @@ mod tests {
     #[test]
     fn absent_principal_is_refused_every_permissioned_tool() {
         for t in registry::TOOLS.iter().filter(|t| !t.permission.is_empty()) {
-            let refused = decide(true, None, t);
+            let refused = decide(true, None, t, &confirmed_args());
             assert!(
                 refused.is_some(),
                 "{} must be refused with no principal",
@@ -339,6 +571,39 @@ mod tests {
     /// behaves like "authenticated, no grants", not like Ask mode.
     #[test]
     fn absent_principal_is_allowed_empty_permission_tool() {
-        assert_eq!(decide(true, None, spec("get_quality")), None);
+        assert_eq!(decide(true, None, spec("get_quality"), &no_args()), None);
+    }
+
+    /// [`strip_confirmed`] removes only the `confirmed` key, leaving every
+    /// other argument untouched, and is a no-op when the key is absent.
+    #[test]
+    fn strip_confirmed_removes_only_that_key() {
+        let mut args = Map::new();
+        args.insert("confirmed".to_owned(), json!(true));
+        args.insert("title".to_owned(), json!("T"));
+        let stripped = strip_confirmed(&args);
+        assert!(!stripped.contains_key("confirmed"));
+        assert_eq!(stripped.get("title"), Some(&json!("T")));
+
+        let no_confirmed = strip_confirmed(&no_args());
+        assert!(no_confirmed.is_empty());
+    }
+
+    /// [`outcome_of`] classifies the two refusal shapes [`decide`] can
+    /// produce: `needs_confirmation` vs everything else ("refused").
+    #[test]
+    fn outcome_of_classifies_needs_confirmation_vs_refused() {
+        let perms = admin_perms();
+        let needs_confirm = decide(true, Some(&perms), spec("create_board"), &no_args())
+            .expect("must need confirmation");
+        assert_eq!(outcome_of(&needs_confirm), "needs_confirmation");
+
+        let refused = decide(false, Some(&perms), spec("create_board"), &no_args())
+            .expect("must be refused (ask mode)");
+        assert_eq!(outcome_of(&refused), "refused");
+
+        let not_implemented = decide(true, Some(&perms), spec("delete_chart"), &confirmed_args())
+            .expect("must be refused (not implemented)");
+        assert_eq!(outcome_of(&not_implemented), "refused");
     }
 }

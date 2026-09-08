@@ -241,6 +241,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/agent/query",         Policy::RequiresAuth),
     ("POST", "/api/agent/text-to-sql",   Policy::RequiresAuth),
     ("POST", "/api/ai/chat",             Policy::RequiresAuth),
+    ("POST", "/api/ai/tool",             Policy::RequiresAuth),
     ("GET",    "/api/ai/sessions",       Policy::RequiresAuth),
     ("POST",   "/api/ai/sessions",       Policy::RequiresAuth),
     ("DELETE", "/api/ai/sessions",       Policy::RequiresAuth),

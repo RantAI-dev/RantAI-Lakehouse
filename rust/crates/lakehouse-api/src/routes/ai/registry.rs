@@ -28,14 +28,17 @@ pub enum Risk {
     Read,
     /// Mutates something, but is judged safe enough for an inline
     /// chat-side confirmation rather than a human-approval queue.
-    /// **Not enforced yet** — today this is treated identically to
-    /// [`Risk::WriteHigh`] by the Ask-mode gate (both are simply
-    /// "non-`Read`"); the distinction becomes load-bearing once the
-    /// inline-confirmation flow lands.
+    /// Enforced by [`super::gate::decide`] (T0.4): a call without
+    /// `"confirmed": true` in its args gets a `needs_confirmation` result
+    /// instead of executing.
     WriteLow,
     /// Mutates something destructively or irreversibly enough that it
     /// should require routing through a human-approval queue rather than
-    /// an inline confirmation. **Not enforced yet** — see [`Risk::WriteLow`].
+    /// an inline confirmation. The real approvals-inbox flow is T0.5 of
+    /// the copilot-operations-handover plan and does not exist yet — until
+    /// then, [`super::gate::decide`] refuses every `WriteHigh` call with a
+    /// clear "not implemented" reason rather than executing it or letting
+    /// it through the `WriteLow` confirmation path.
     WriteHigh,
 }
 

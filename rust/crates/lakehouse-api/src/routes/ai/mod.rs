@@ -10,6 +10,7 @@
 //! validation, tool dispatch, and mode-based tool filtering are ported
 //! faithfully.
 
+mod audit;
 mod gate;
 mod registry;
 mod tools;
@@ -295,10 +296,30 @@ pub async fn chat(
             // have the call silently dropped) so it can tell the user
             // instead of assuming a write (or a read it wasn't allowed)
             // it never got.
-            let result = match gate::decide_by_name(is_build, perms, &call.function.name) {
-                Some(refusal) => refusal,
-                None => tools::run_tool(&state, &call.function.name, &args).await,
+            let gate_result = gate::decide_by_name(is_build, perms, &call.function.name, &args);
+            let (result, outcome) = if let Some(refusal) = gate_result {
+                let outcome = gate::outcome_of(&refusal);
+                (refusal, outcome)
+            } else {
+                let clean_args = gate::strip_confirmed(&args);
+                let result = tools::run_tool(&state, &call.function.name, &clean_args).await;
+                let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
+                (result, if ok { "executed" } else { "failed" })
             };
+            let (resource_kind, resource_id) =
+                audit::resource_for(&call.function.name, &args, &result);
+            audit::record(
+                state.pg.as_deref(),
+                principal.as_ref().map(|Extension(p)| p),
+                None,
+                &call.function.name,
+                resource_kind,
+                resource_id.as_deref(),
+                &Value::Object(args.clone()),
+                outcome,
+                None,
+            )
+            .await;
             let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
             tool_trace.push(json!({
                 "tool": call.function.name, "args": args, "ok": ok, "result": result,
@@ -368,6 +389,94 @@ pub async fn chat(
             .into_response(),
         Err(err) => llm_unavailable(&err),
     }
+}
+
+// ── POST /api/ai/tool ───────────────────────────────────────────────────
+
+/// `POST /api/ai/tool` request body.
+#[derive(Debug, Deserialize)]
+struct ToolCallBody {
+    tool: String,
+    #[serde(default)]
+    args: Map<String, Value>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default, rename = "sessionId")]
+    session_id: Option<String>,
+}
+
+/// `POST /api/ai/tool` — executes exactly ONE gated tool call and returns
+/// its result (T0.4 of the copilot-operations-handover plan).
+///
+/// This exists so the frontend's Confirm button (on a `needs_confirmation`
+/// result from [`chat`]) doesn't have to re-prompt the LLM to re-emit the
+/// same call: it resends the identical `{tool, args}` here with
+/// `confirmed: true` merged in.
+///
+/// This is NOT a bypass of [`gate::decide`] — it is the exact same
+/// ask-mode check, permission check, and confirmation check the chat loop
+/// runs, with the SAME refusal/`needs_confirmation` shapes. The only thing
+/// that lets a call through here that the chat loop would have blocked a
+/// moment ago is `args["confirmed"] == true`, which is precisely the
+/// signal a `WriteLow` call needs to actually execute (see [`gate::decide`]).
+///
+/// # Errors
+///
+/// Returns 400 for an unparseable body or an unregistered `tool` name.
+pub async fn tool_call(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    body: Bytes,
+) -> Response {
+    let perms = principal.as_ref().map(|Extension(p)| &p.permissions);
+    let parsed: ToolCallBody = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                ApiJson(json!({ "error": "Body harus JSON {tool, args}" })),
+            )
+                .into_response();
+        }
+    };
+    let Some(spec) = registry::find(&parsed.tool) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            ApiJson(json!({ "error": format!("tool tak dikenal: {}", parsed.tool) })),
+        )
+            .into_response();
+    };
+    let is_build = parsed.mode.as_deref() == Some("build");
+
+    let gate_result = gate::decide(is_build, perms, spec, &parsed.args);
+    let (result, outcome) = if let Some(refusal) = gate_result {
+        let outcome = gate::outcome_of(&refusal);
+        (refusal, outcome)
+    } else {
+        let clean_args = gate::strip_confirmed(&parsed.args);
+        let result = tools::run_tool(&state, &parsed.tool, &clean_args).await;
+        let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
+        (result, if ok { "executed" } else { "failed" })
+    };
+    let (resource_kind, resource_id) = audit::resource_for(&parsed.tool, &parsed.args, &result);
+    audit::record(
+        state.pg.as_deref(),
+        principal.as_ref().map(|Extension(p)| p),
+        parsed.session_id.as_deref(),
+        &parsed.tool,
+        resource_kind,
+        resource_id.as_deref(),
+        &Value::Object(parsed.args.clone()),
+        outcome,
+        None,
+    )
+    .await;
+
+    (
+        StatusCode::OK,
+        ApiJson(json!({ "tool": parsed.tool, "outcome": outcome, "result": result })),
+    )
+        .into_response()
 }
 
 /// Builds the `/api/ai/chat` response body, matching the TypeScript's

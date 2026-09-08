@@ -351,6 +351,7 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(agent::text_to_sql),
         )
         .route("/api/ai/chat", axum::routing::post(ai::chat))
+        .route("/api/ai/tool", axum::routing::post(ai::tool_call))
         .route(
             "/api/ai/sessions",
             get(ai::sessions_get)
