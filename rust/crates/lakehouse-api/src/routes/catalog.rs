@@ -281,6 +281,12 @@ fn build_namespaces(assets: &[Value]) -> Vec<Value> {
 
 /// `GET /api/catalog/{id}` — one asset's metadata, schema, and a data
 /// sample.
+///
+/// # Errors
+///
+/// Whatever `clickhouse_asset_detail`/`bronze_asset_detail` return: 404 for
+/// an unknown asset, otherwise the `ClickHouse` failure mapped through
+/// `ApiError`.
 pub async fn detail(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult<Response> {
     if id.starts_with("silver.") || id.starts_with("serving.") {
         return clickhouse_asset_detail(&state.clickhouse, &id).await;
