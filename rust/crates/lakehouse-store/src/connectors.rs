@@ -566,19 +566,20 @@ pub async fn record_test_result(
 ///
 /// # What this does NOT do
 ///
-/// This does NOT connect to the connector's `host` and drop any
-/// replication slot/publication a P5 CDC connector may have created there.
-/// Doing so would mean this crate resolving `secret_ref` to a live
-/// credential and originating an outbound connection to an
-/// operator-configured external system — the same category of operation
-/// `lakehouse-api`'s `connector_probe` module now does, but only for
-/// PostgreSQL/S3 connectivity tests, and only there, not here. Slot/WAL
-/// cleanup for a removed CDC connector is an operational
-/// step performed against the source database directly (see
-/// `ops/debezium/deprovision_connector.sh` and the P5 report's G4 section)
-/// — a real, told-straight gap, not a silent one: deleting a connector row
-/// here does not, by itself, stop WAL from being pinned if a Debezium
-/// Server process for it is still running.
+/// This function itself never connects to the connector's `host` and never
+/// drops any replication slot/publication a `PostgreSQL` CDC connector may
+/// have created there — this repository layer only ever touches the
+/// registry row, same as every other function in this module. That is no
+/// longer a gap in practice: `lakehouse-api`'s
+/// `routes::connectors::delete` (the only caller) resolves the connector's
+/// `secret_ref`, dials its `host`, and drops the slot/publication via
+/// `connector_deprovision::drop_slot_and_publication` BEFORE calling this
+/// function for a `PostgreSQL`-kind connector — see that handler's doc
+/// comment for the full 409/`force` contract. If that deprovisioning
+/// fails, the caller does not call this function at all (unless
+/// `?force=true`), which is what keeps the registry row around as the
+/// visible record of an orphaned slot instead of this function silently
+/// deleting it anyway.
 ///
 /// # Errors
 ///

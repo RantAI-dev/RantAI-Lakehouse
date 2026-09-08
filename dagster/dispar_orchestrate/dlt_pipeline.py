@@ -76,13 +76,45 @@ class BronzeIngestConfig:
     container's environment (matching how every other service in
     `docker-compose.yml` is configured — no baked-in secrets.toml)."""
 
-    source_database_url: str
+    # CREDENTIAL HYGIENE (review finding): these five replace what used to
+    # be a single `source_database_url` field built from
+    # `BRONZE_SOURCE_DATABASE_URL` — a full `postgresql://user:password@
+    # host/db` DSN passed through docker-compose.yml as ONE env var, so
+    # the password was visible whole to `docker inspect` and to anything
+    # that can read this container's environment. The DSN itself is now
+    # only ever assembled in-process (see `run_bronze_ingest`, below),
+    # from components that already existed elsewhere in the compose file
+    # (`POSTGRES_USER`/`POSTGRES_DB`) plus the connector-dedicated
+    # password (`BRONZE_SOURCE_DB_PASSWORD`, which docker-compose.yml
+    # defaults from `CONNECTOR_PG_PASSWORD` — the same least-privilege
+    # secret name `lakehouse-api`'s own connector definitions use, not
+    # the console's own `POSTGRES_PASSWORD`).
+    source_db_host: str
+    source_db_port: str
+    source_db_user: str
+    source_db_password: str
+    source_db_name: str
     source_schema: str
     source_table: str
     bronze_table_name: str
     lakekeeper_catalog_uri: str
     lakekeeper_warehouse: str
     rustfs_endpoint: str
+    # CREDENTIAL HYGIENE (review finding): these used to read
+    # `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` directly — RustFS's own ROOT
+    # credentials, the same ones the bucket-bootstrap/admin-shaped jobs in
+    # docker-compose.yml use. dlt only ever PUTs/GETs objects under the
+    # warehouse bucket's `bronze/` prefix, so it does not need root. Read
+    # the connector-scoped names instead (`CONNECTOR_S3_ACCESS_KEY`/
+    # `CONNECTOR_S3_SECRET_KEY` — see docker-compose.yml's
+    # `dagster-code-location` env block for why these still default to
+    # the RustFS root key today: this stack's RustFS version has no
+    # non-proprietary-admin-API way to mint a narrower S3 identity, and
+    # this project's locked decision is "plain S3 API only, never a
+    # store's proprietary admin call" — see the `rustfs` service's own
+    # comment in docker-compose.yml). A deployment that CAN provision a
+    # least-privilege RustFS/S3 identity only needs to point these two
+    # vars at it; no code change here.
     rustfs_access_key: str
     rustfs_secret_key: str
     warehouse_bucket: str
@@ -105,14 +137,11 @@ class BronzeIngestConfig:
             with open(token_file, encoding="utf-8") as f:
                 lakekeeper_token = f.read().strip()
         return cls(
-            # `postgresql://`, not `postgres://` — this goes through
-            # SQLAlchemy (dlt's `sql_database` source), which does not
-            # recognize the `postgres://` scheme `DATABASE_URL` elsewhere
-            # in this repo uses for `sqlx`.
-            source_database_url=_env(
-                "BRONZE_SOURCE_DATABASE_URL",
-                "postgresql://lakehouse:lakehouse@postgres:5432/lakehouse",
-            ),
+            source_db_host=_env("BRONZE_SOURCE_DB_HOST", "postgres"),
+            source_db_port=_env("BRONZE_SOURCE_DB_PORT", "5432"),
+            source_db_user=_env("BRONZE_SOURCE_DB_USER", "lakehouse"),
+            source_db_password=_env("BRONZE_SOURCE_DB_PASSWORD", "lakehouse"),
+            source_db_name=_env("BRONZE_SOURCE_DB_NAME", "lakehouse"),
             source_schema=_env("BRONZE_SOURCE_SCHEMA", "ingest_demo"),
             source_table=source_table,
             bronze_table_name=_env("BRONZE_TABLE_NAME", source_table),
@@ -121,8 +150,8 @@ class BronzeIngestConfig:
             ),
             lakekeeper_warehouse=_env("LAKEKEEPER_WAREHOUSE", "default"),
             rustfs_endpoint=_env("CH_RUSTFS_S3_ENDPOINT", "http://rustfs:9000"),
-            rustfs_access_key=_env("RUSTFS_ACCESS_KEY", "rustfsadmin"),
-            rustfs_secret_key=_env("RUSTFS_SECRET_KEY", "rustfsadmin"),
+            rustfs_access_key=_env("CONNECTOR_S3_ACCESS_KEY", "rustfsadmin"),
+            rustfs_secret_key=_env("CONNECTOR_S3_SECRET_KEY", "rustfsadmin"),
             warehouse_bucket=_env("LAKEHOUSE_WAREHOUSE_BUCKET", "lakehouse-warehouse"),
             lakekeeper_token=lakekeeper_token,
         )
@@ -207,15 +236,45 @@ def run_bronze_ingest(config: BronzeIngestConfig | None = None) -> dict[str, Any
         },
     )
 
+    # Assembled here, in-process, from discrete components (`from_env`,
+    # above) — this dict is the ONE place a full Postgres DSN exists for
+    # this pipeline; it is never passed through docker-compose.yml (or any
+    # other environment) as a single connection-string value. dlt's
+    # `sql_database` source accepts this shape directly (a
+    # `ConnectionStringCredentials`-compatible mapping), same as it would
+    # accept a raw `postgresql://...` string — SQLAlchemy builds the DSN
+    # from these fields internally either way.
+    source_credentials = {
+        "drivername": "postgresql",
+        "username": cfg.source_db_user,
+        "password": cfg.source_db_password,
+        "host": cfg.source_db_host,
+        "port": int(cfg.source_db_port),
+        "database": cfg.source_db_name,
+    }
     source = sql_database(
-        credentials=cfg.source_database_url,
+        credentials=source_credentials,
         schema=cfg.source_schema,
         table_names=[cfg.source_table],
     )
     resource = source.resources[cfg.source_table]
     resource.apply_hints(table_name=cfg.bronze_table_name)
     resource.add_map(_stamp_ingested_at)
-    iceberg_adapter(resource, partition=[iceberg_partition.day("_ingested_at")])
+    iceberg_adapter(
+        resource,
+        partition=[iceberg_partition.day("_ingested_at")],
+        # PR #29 review: format-version 2 was claimed "confirmed" without
+        # ever being set or asserted. dlt's iceberg destination does not
+        # default this itself (pyiceberg's own table-creation default is
+        # already v2, but that is pyiceberg's default, not a guarantee this
+        # pipeline makes) — set it explicitly, at table-creation time, so
+        # the guarantee is this module's own rather than inherited
+        # incidentally from whatever pyiceberg happens to default to.
+        # `ops/g3a/g3a_test.py::step_verify_format_version_2` asserts this
+        # against the catalog's own REST metadata, not against what dlt
+        # reports back.
+        table_properties={"format-version": "2"},
+    )
 
     pipeline = dlt.pipeline(
         pipeline_name=f"bronze_ingest_{cfg.bronze_table_name}",

@@ -15,6 +15,7 @@ use lakehouse_llm::LlmClient;
 use lakehouse_store::PgPool;
 
 use crate::config::Config;
+use crate::gold_lock::MartLocks;
 
 /// The three [`lakehouse_auth::Authenticator`]s this service configures,
 /// bundled together so [`AppState::auth`] can stay a single `Option` field
@@ -102,6 +103,12 @@ pub struct AppState {
     /// route reply 503 rather than panic — see
     /// `crate::auth::authenticators`.
     pub auth: Option<AuthState>,
+    /// Per-mart single-flight guard for `POST /api/gold/export/{mart}` —
+    /// see [`crate::gold_lock`]'s module doc comment for the duplicate-row
+    /// defect this closes. Always populated (unlike [`Self::pg`]/
+    /// [`Self::auth`]): it needs no external dependency, just an
+    /// in-process map.
+    pub gold_export_locks: MartLocks,
 }
 
 /// The exact `secretRef`s [`AppState::connector_secret_resolver`] may
@@ -217,6 +224,7 @@ impl AppState {
                 "connector-allowlist",
             )),
             auth,
+            gold_export_locks: MartLocks::default(),
         }
     }
 }

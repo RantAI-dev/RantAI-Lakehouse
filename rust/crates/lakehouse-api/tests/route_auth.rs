@@ -353,7 +353,9 @@ fn every_registered_route_has_a_policy_entry() {
         rest = &rest[at + ".route(".len()..];
         // The pattern is the first string literal in the call.
         let Some(open) = rest.find('"') else { break };
-        let Some(close) = rest[open + 1..].find('"') else { break };
+        let Some(close) = rest[open + 1..].find('"') else {
+            break;
+        };
         let pattern = &rest[open + 1..open + 1 + close];
         if !pattern.starts_with("/api/") && pattern != "/health" {
             continue;
@@ -385,11 +387,7 @@ fn every_registered_route_has_a_policy_entry() {
 
     let missing: Vec<_> = registered
         .iter()
-        .filter(|(m, p)| {
-            !POLICY_TABLE
-                .iter()
-                .any(|(pm, pp, _)| pm == m && pp == p)
-        })
+        .filter(|(m, p)| !POLICY_TABLE.iter().any(|(pm, pp, _)| pm == m && pp == p))
         .collect();
 
     assert!(

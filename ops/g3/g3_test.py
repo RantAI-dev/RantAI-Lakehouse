@@ -7,8 +7,11 @@ escape hatch). This test proves, on every CI run, that:
 1. `bronze_maintenance_job` is visible and triggerable through the SAME
    `lakehouse-dagster`-backed pipeline routes G3a already proved work.
 2. It runs the measured-working subset of the maintenance chain
-   (`expire_snapshots`, dry-run then applied) over a real Bronze table
-   without erroring.
+   (`remove_orphan_files`, dry-run then applied — `expire_snapshots` is no
+   longer supported for Iceberg tables backed by a transactional catalog
+   as of ClickHouse 26.8, see `docs/plans/CLICKHOUSE-26.8-REMEASUREMENT.md`
+   and `dagster/dispar_orchestrate/maintenance.py`'s module doc) over a
+   real Bronze table without erroring.
 3. The resulting `dry_run`/applied metrics are visible through
    `GET /api/governance/maintenance` — the console-facing surface this
    phase adds — proving the metrics-surfacing mechanism, not just the

@@ -9,8 +9,11 @@
 
 mod auth;
 mod config;
+mod connector_deprovision;
 mod connector_probe;
 mod error;
+mod gold_export;
+mod gold_lock;
 mod json;
 mod policy;
 mod routes;

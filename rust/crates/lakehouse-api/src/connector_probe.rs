@@ -270,14 +270,20 @@ async fn resolve_checked(host: &str, port: u16, allow_internal_hosts: bool) -> R
 /// a `host`/`database` value that smuggled `sslmode=disable`,
 /// `options=...`, or a `?`-query string cannot reach `sqlx` as anything
 /// other than a literal hostname/database name.
-struct PgDialTarget<'a> {
-    user: &'a str,
-    host: &'a str,
-    port: u16,
-    database: &'a str,
+///
+/// `pub(crate)`, not private: `crate::connector_deprovision` parses the
+/// exact same `host` shape to build the `PgTarget` it dials to drop a
+/// deleted connector's replication slot/publication — reusing this parser
+/// rather than duplicating the `<user>@<host>:<port>/<database>` split
+/// keeps there being exactly one place that shape is defined.
+pub(crate) struct PgDialTarget<'a> {
+    pub(crate) user: &'a str,
+    pub(crate) host: &'a str,
+    pub(crate) port: u16,
+    pub(crate) database: &'a str,
 }
 
-fn parse_postgres_host(host: &str) -> Option<PgDialTarget<'_>> {
+pub(crate) fn parse_postgres_host(host: &str) -> Option<PgDialTarget<'_>> {
     let (user, rest) = host.split_once('@')?;
     if user.is_empty() {
         return None;

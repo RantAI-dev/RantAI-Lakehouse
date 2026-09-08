@@ -20,6 +20,63 @@ check it, and what this project has actually verified vs. left untested.
 An untested row is written as untested — it is not marked green because
 "it's S3-compatible" is a marketing claim, not a measurement.
 
+## G2 gate scope — a narrowing that was real but never written down
+
+**What the plan originally asked for.** `docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md`
+§3 defines P2/G2 as: *"Same suite against SeaweedFS by env/config change
+only... Accept: matrix green on both stores."* "Same suite" means the
+full G1 acceptance test as P1 defined it — **both** halves: (a) Rust
+creates a Bronze table and appends via vended STS credentials, ClickHouse
+reads the rows back; AND (b) ClickHouse itself `CREATE TABLE`s and
+`INSERT`s through the catalog, read back via `iceberg-rust`.
+
+**What the G2 CI job actually runs today.** `.github/workflows/ci.yml`'s
+`g2-seaweedfs` job runs `g1-test-runner` (docker-compose.yml) with
+`-- --ignored --nocapture g1_half_a` (plus the separate `g1_negative`
+authorization check) against SeaweedFS. Half (b) is never invoked here —
+it stays `#[ignore]`d in `g1_lakekeeper.rs`, for SeaweedFS exactly as it
+already does for the default RustFS-backed `g1-test-runner` run.
+
+**Why.** `docs/plans/G1-RESULT.md` measured half (b) failing against
+ClickHouse `26.3` for reasons that have nothing to do with the storage
+backend: `CREATE TABLE` inside a `DataLakeCatalog` database silently
+falls back to the default MergeTree engine instead of routing to
+Lakekeeper, and `INSERT` into a partitioned catalog-registered table
+segfaults the server outright (an unpartitioned table fails cleanly
+instead of crashing, but still fails). Both are genuine upstream
+ClickHouse defects in its Iceberg write path, reproduced against RustFS
+first and never fixed since. Gating G2 on half (b) would not test
+anything SeaweedFS-specific — it would just fail identically against
+*any* store, including RustFS, on this ClickHouse version, because the
+break is entirely on the ClickHouse-writes-Iceberg side of the boundary,
+before any request reaches the object store at all. Running it anyway
+would not add signal; it would only make the SeaweedFS job red for a
+reason already tracked (and already excluded from the RustFS regression
+guard) elsewhere.
+
+**What this means the G2 gate has, and has NOT, proven.** It proves the
+path this project's write side actually depends on — Rust writes Iceberg
+through Lakekeeper with vended STS credentials, ClickHouse reads it back —
+is portable across two independent S3-compatible stores with **no Rust
+code change**, only env/config (`LAKEKEEPER_WAREHOUSE`,
+`CH_RUSTFS_S3_ENDPOINT`). It does **not** prove ClickHouse can write
+Iceberg through the catalog against SeaweedFS specifically, because
+that write path does not work against *any* store yet — that gap is
+tracked once, in G1-RESULT.md, not re-tracked per storage backend. Put
+another way: G2 answers "is the storage boundary real" (yes, for the read
+path); it does not and cannot currently answer "does the full G1 suite
+pass on SeaweedFS," because no store passes the full G1 suite on this
+ClickHouse version.
+
+**What would widen it.** The moment `g1_lakekeeper.rs`'s `g1_half_b` test
+stops being `#[ignore]`d for RustFS — i.e. the day ClickHouse's Iceberg
+write path is fixed upstream (or worked around) and G1-RESULT.md is
+updated to reflect a passing half (b) — `g2-seaweedfs`'s existing command
+needs no separate change to pick it up: `g1-test-runner`'s test filter
+is store-agnostic, so widening G1 automatically widens G2 to match. No
+SeaweedFS-specific work is anticipated; the gap is entirely upstream of
+the storage layer.
+
 ## How to run the reference test yourself
 
 The whole matrix below is measured through one acceptance suite:

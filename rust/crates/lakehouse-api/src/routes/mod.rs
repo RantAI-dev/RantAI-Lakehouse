@@ -14,6 +14,7 @@ mod catalog;
 mod connectors;
 mod dashboard;
 mod embed;
+mod gold;
 mod governance;
 mod identity;
 mod knowledge;
@@ -305,6 +306,10 @@ pub fn router(state: AppState) -> Router {
                 .delete(alerts::delete),
         )
         .route("/api/alerts/run", get(alerts::run).post(alerts::run))
+        .route(
+            "/api/gold/export/{mart}",
+            get(gold::read_back).post(gold::export),
+        )
         .route("/api/query/run", axum::routing::post(query::run))
         .route("/api/query/estimate", axum::routing::post(query::estimate))
         .route("/api/query/saved", get(query::list_saved))

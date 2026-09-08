@@ -72,21 +72,53 @@ def _env(name: str, default: str) -> str:
     return value if value else default
 
 
+def _lakekeeper_token() -> str:
+    """R1 (ADR 0011): Lakekeeper authorization is enforced by default in
+    this stack (no "allow-all" mode) -- a bare unauthenticated `RestCatalog`
+    call now 401s at `/v1/config` before this script can do anything.
+    Mirrors `dagster/dispar_orchestrate/dlt_pipeline.py`'s
+    `LAKEKEEPER_TOKEN_FILE` pattern (a pre-minted static bearer token read
+    from a file, since this script is a one-shot process with no
+    long-running shell step to interpolate a file into an env var itself)
+    plus a direct `LAKEKEEPER_TOKEN` for callers that already hold the
+    token value (e.g. a `docker compose run -e` invocation). Empty string
+    on a pre-R1 or authz-disabled stack, exactly like `dlt_pipeline.py`."""
+    token_file = _env("LAKEKEEPER_TOKEN_FILE", "")
+    if token_file and os.path.exists(token_file):
+        with open(token_file, encoding="utf-8") as f:
+            return f.read().strip()
+    return _env("LAKEKEEPER_TOKEN", "")
+
+
 def _catalog():
-    return load_catalog(
-        "default",
-        **{
-            "type": "rest",
-            "uri": _env("LAKEKEEPER_CATALOG_URI", "http://lakekeeper:8181/catalog"),
-            "warehouse": _env("LAKEKEEPER_WAREHOUSE", "default"),
-            "s3.endpoint": _env("CH_RUSTFS_S3_ENDPOINT", "http://rustfs:9000"),
-            "s3.access-key-id": _env("RUSTFS_ACCESS_KEY", "rustfsadmin"),
-            "s3.secret-access-key": _env("RUSTFS_SECRET_KEY", "rustfsadmin"),
-            "s3.region": "us-east-1",
-            "s3.path-style-access": "true",
-            "s3.force-virtual-addressing": "false",
-        },
-    )
+    conf: dict[str, str] = {
+        "type": "rest",
+        "uri": _env("LAKEKEEPER_CATALOG_URI", "http://lakekeeper:8181/catalog"),
+        "warehouse": _env("LAKEKEEPER_WAREHOUSE", "default"),
+        "s3.endpoint": _env("CH_RUSTFS_S3_ENDPOINT", "http://rustfs:9000"),
+        # CREDENTIAL HYGIENE (review finding): this used to read
+        # `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` directly — RustFS's own
+        # ROOT credentials — even though this script only ever
+        # creates/appends to Iceberg tables under the one warehouse
+        # bucket. Reads the connector-scoped names instead
+        # (`CONNECTOR_S3_ACCESS_KEY`/`CONNECTOR_S3_SECRET_KEY`, set in
+        # `docker-compose.yml`'s `dagster-code-location` env block — this
+        # script runs INSIDE that same container per `docs/plans/
+        # G3-RESULT.md`). Those vars default to the RustFS root key only
+        # because this stack's RustFS version has no non-proprietary-API
+        # way to mint a narrower S3 identity (see `dlt_pipeline.py`'s
+        # matching comment) — a deployment that can provision one only
+        # needs to set the two vars, no script change.
+        "s3.access-key-id": _env("CONNECTOR_S3_ACCESS_KEY", "rustfsadmin"),
+        "s3.secret-access-key": _env("CONNECTOR_S3_SECRET_KEY", "rustfsadmin"),
+        "s3.region": "us-east-1",
+        "s3.path-style-access": "true",
+        "s3.force-virtual-addressing": "false",
+    }
+    token = _lakekeeper_token()
+    if token:
+        conf["token"] = token
+    return load_catalog("default", **conf)
 
 
 SCHEMA = Schema(
@@ -168,30 +200,121 @@ def generate() -> None:
     )
 
 
-def measure_files() -> None:
-    """Data file count per partition — via `table.inspect.files()`, the
-    exact per-data-file manifest listing pyiceberg exposes (partition
-    column values included), not an approximation."""
-    cat = _catalog()
-    table = cat.load_table((NAMESPACE, TABLE_NAME))
-    table.refresh()
+def _per_partition_file_counts(table) -> dict[str, int]:
     files_tbl = table.inspect.files()
     partition_col = files_tbl.column("partition")
     per_partition: dict[str, int] = {}
     for value in partition_col.to_pylist():
         key = str(value)
         per_partition[key] = per_partition.get(key, 0) + 1
-    print(
-        json.dumps(
-            {
-                "event": "file_count",
-                "total_data_files": files_tbl.num_rows,
-                "partitions": len(per_partition),
-                "per_partition": per_partition,
-            },
-            default=str,
+    return per_partition
+
+
+def measure_files(table_name: str = TABLE_NAME) -> dict:
+    """Data file count per partition — via `table.inspect.files()`, the
+    exact per-data-file manifest listing pyiceberg exposes (partition
+    column values included), not an approximation."""
+    cat = _catalog()
+    table = cat.load_table((NAMESPACE, table_name))
+    table.refresh()
+    per_partition = _per_partition_file_counts(table)
+    result = {
+        "event": "file_count",
+        "table": f"{NAMESPACE}.{table_name}",
+        "total_data_files": sum(per_partition.values()),
+        "partitions": len(per_partition),
+        "per_partition": per_partition,
+    }
+    print(json.dumps(result, default=str))
+    return result
+
+
+def _measure_planning(table_name: str) -> dict:
+    """Planning-time proxy: the wall-clock cost of enumerating
+    `table.scan().plan_files()` — pyiceberg's own manifest-list + manifest
+    walk that produces the `FileScanTask`s a query engine would then read.
+    This is the same class of work ClickHouse's `DataLakeCatalog` engine
+    does before it can read a single row of an Iceberg-registered table
+    (list manifests -> list data files -> intersect with the query), so it
+    is a reasonable engine-agnostic proxy for "how much does small-file
+    accumulation degrade query planning", without requiring a query engine
+    to be up at all. `list(...)` forces full enumeration (a generator
+    alone would not pay the real cost)."""
+    cat = _catalog()
+    table = cat.load_table((NAMESPACE, table_name))
+    table.refresh()
+    t0 = time.time()
+    tasks = list(table.scan().plan_files())
+    elapsed = time.time() - t0
+    return {
+        "table": f"{NAMESPACE}.{table_name}",
+        "planned_file_scan_tasks": len(tasks),
+        "planning_s": round(elapsed, 4),
+    }
+
+
+def measure_planning(table_name: str = TABLE_NAME) -> dict:
+    result = {"event": "planning_time", **_measure_planning(table_name)}
+    print(json.dumps(result, default=str))
+    return result
+
+
+def compare(threshold: float) -> None:
+    """The actual G3 acceptance measurement: file count per partition and
+    the planning-time proxy, BEFORE (`bronze.g3_control` — one commit per
+    partition, the layout compaction would produce if any measured
+    ClickHouse verb could bin-pack) and AFTER (`TABLE_NAME` —
+    `COMMITS_PER_DAY` small commits per partition, the actual accumulated
+    shape with no working in-engine compaction), with the plan's own 2x
+    threshold asserted for real rather than existing only in prose. Both
+    tables must already exist (`generate` then `generate-control`, or
+    `docker-compose.yml`'s `g3-test-runner` running both).
+
+    Reports the numbers it actually measures either way — including a
+    failing/below-threshold ratio — rather than silently passing or
+    tuning itself to match any previously-recorded figure."""
+    cat = _catalog()
+    small = _measure_planning(TABLE_NAME)
+    small["file_counts"] = measure_files(TABLE_NAME)
+    control_ident = (NAMESPACE, "g3_control")
+    if not cat.table_exists(control_ident):
+        raise SystemExit(
+            f"g3_control table does not exist — run 'generate-control' first "
+            f"(compare needs both the small-file table {small['table']!r} and "
+            "the compacted-baseline control to compute a ratio)"
         )
-    )
+    control = _measure_planning("g3_control")
+    control["file_counts"] = measure_files("g3_control")
+
+    ratio = (small["planning_s"] / control["planning_s"]) if control["planning_s"] > 0 else float("inf")
+    passed = ratio >= threshold
+    result = {
+        "event": "compare",
+        "small_file": small,
+        "control": control,
+        "planning_time_ratio": round(ratio, 3) if ratio != float("inf") else "inf",
+        "threshold": threshold,
+        "passed": passed,
+    }
+    # Always print the real numbers BEFORE deciding pass/fail — per the
+    # task brief: report what was actually measured, even if it does not
+    # reproduce the prose figures, rather than tuning the test to match them.
+    print(json.dumps(result, default=str))
+    if not passed:
+        raise SystemExit(
+            f"G3 FAILED: planning-time ratio {result['planning_time_ratio']} "
+            f"is below the {threshold}x threshold "
+            f"(small-file: {small['planning_s']}s over {small['file_counts']['total_data_files']} "
+            f"files; control: {control['planning_s']}s over {control['file_counts']['total_data_files']} files)"
+        )
+    small_avg = small["file_counts"]["total_data_files"] / max(small["file_counts"]["partitions"], 1)
+    control_avg = control["file_counts"]["total_data_files"] / max(control["file_counts"]["partitions"], 1)
+    if small_avg <= control_avg:
+        raise SystemExit(
+            f"G3 FAILED: small-file table has {small_avg:.1f} files/partition on "
+            f"average, not more than control's {control_avg:.1f} — the load "
+            "generator did not actually produce a small-file accumulation to measure"
+        )
 
 
 def generate_control() -> None:
@@ -224,12 +347,30 @@ def generate_control() -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "action", choices=["generate", "measure-files", "generate-control"]
+        "action",
+        choices=[
+            "generate",
+            "generate-control",
+            "measure-files",
+            "measure-planning",
+            "compare",
+        ],
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=float(os.environ.get("G3_PLANNING_RATIO_THRESHOLD", "2.0")),
+        help="compare: minimum small-file/control planning-time ratio to pass (default 2.0x, "
+        "matching the plan's own G3 gate)",
     )
     args = parser.parse_args()
     if args.action == "generate":
         generate()
     elif args.action == "generate-control":
         generate_control()
-    else:
+    elif args.action == "measure-files":
         measure_files()
+    elif args.action == "measure-planning":
+        measure_planning()
+    else:
+        compare(args.threshold)

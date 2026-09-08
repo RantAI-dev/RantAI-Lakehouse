@@ -58,7 +58,20 @@ def register_in_catalog(context, summary: dict) -> None:
 
 
 def _count_source_rows(cfg: BronzeIngestConfig) -> int:
-    with psycopg2.connect(cfg.source_database_url) as conn:
+    # Discrete kwargs, not a DSN string — see `BronzeIngestConfig`'s field
+    # comment in `dlt_pipeline.py` on why this pipeline stopped assembling
+    # a single `postgresql://user:password@host/db` connection string
+    # (that string used to travel through docker-compose.yml as one
+    # plaintext env var; the credential-hygiene fix splits it into
+    # components and only ever joins them back together in-process, here
+    # and in `run_bronze_ingest`).
+    with psycopg2.connect(
+        host=cfg.source_db_host,
+        port=cfg.source_db_port,
+        user=cfg.source_db_user,
+        password=cfg.source_db_password,
+        dbname=cfg.source_db_name,
+    ) as conn:
         with conn.cursor() as cur:
             cur.execute(f'SELECT count(*) FROM "{cfg.source_schema}"."{cfg.source_table}"')
             row = cur.fetchone()

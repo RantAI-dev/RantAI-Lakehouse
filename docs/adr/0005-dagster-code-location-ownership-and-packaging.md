@@ -35,7 +35,7 @@ dagster/
   dispar_orchestrate/
     __init__.py
     definitions.py           # `defs = Definitions(...)` — the code location's entrypoint
-    assets.py                 # @asset materializing the Bronze ingest
+    assets.py                 # @op/@job materializing the Bronze ingest
     dlt_pipeline.py            # dlt.pipeline(...) + sql_database source + iceberg destination
   Dockerfile
 ```
@@ -160,9 +160,13 @@ regardless of which phase added which function to it.
 - `docker-compose.yml` gains: `dagster-db-init` (one-shot, mirrors
   `lakekeeper-db-init`), `dagster-webserver`, `dagster-daemon`,
   `dagster-code-location` — all behind the `dagster` profile — plus a
-  `g3a-test-runner` service behind the existing `test` profile, following
-  the `g1-test-runner` pattern (runs inside the compose network, brings up
-  its own `depends_on` chain).
+  `g3a-test-runner` service, also behind the `dagster` profile (not `test`
+  — it depends on `dagster-webserver`, itself `dagster`-gated, and Compose
+  validates a service's entire `depends_on` closure against active
+  profiles even for an unrelated `run <other-service>` invocation; see
+  `g3a-source-init`'s comment in `docker-compose.yml`), following the
+  `g1-test-runner` pattern otherwise (runs inside the compose network,
+  brings up its own `depends_on` chain).
 - `lakehouse-api`'s `DAGSTER_URL`/`DAGSTER_REPO`/`DAGSTER_LOCATION`
   defaults (`http://localhost:13030/graphql` / `__repository__` /
   `dispar_orchestrate.definitions`) now correspond to a real, buildable

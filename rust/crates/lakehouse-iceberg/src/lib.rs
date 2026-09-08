@@ -54,12 +54,15 @@
 //! - Tenant → warehouse mapping. See ADR 0003. The caller supplies the
 //!   already-resolved Lakekeeper warehouse identifier; this crate does not
 //!   know what a `TENANT_ID` is.
-//! - Console/route wiring. Nothing in `lakehouse-api` calls this crate yet
-//!   (P6 does that). P1b's job is the client and the G1 proof, not the UI
-//!   surface.
+//! - Console/route wiring. `lakehouse-api`'s Gold export route
+//!   (`routes::gold`, ADR 0010) is the first real caller of this crate —
+//!   see `gold`'s module doc comment for the export shape it builds on.
+//!   Bronze ingestion itself (Debezium/dlt) still writes Iceberg directly,
+//!   never through this crate or `lakehouse-api`.
 
 pub mod bronze;
 pub mod catalog;
+pub mod gold;
 pub mod storage;
 
-pub use catalog::{BronzeTable, IcebergClient, IcebergClientConfig, IcebergError};
+pub use catalog::{BronzeTable, GoldTable, IcebergClient, IcebergClientConfig, IcebergError};

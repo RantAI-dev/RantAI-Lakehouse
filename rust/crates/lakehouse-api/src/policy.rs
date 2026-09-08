@@ -189,6 +189,14 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",    "/api/alerts/run",  Policy::RequiresAuth),
     ("POST",   "/api/alerts/run",  Policy::RequiresAuth),
 
+    // ── Gold export (ADR 0010, Rust/Phase-P6-only — no TypeScript route to
+    //    port): same "floor" shape as `/api/alerts/run` — `RequiresAuth`
+    //    here, PLUS `routes::gold::check_export_token`'s own stricter D4
+    //    guard inside the handler (shared-token match, or a service-
+    //    identity principal when `GOLD_EXPORT_RUN_TOKEN` is unset). ──────
+    ("GET",  "/api/gold/export/{mart}",  Policy::RequiresAuth),
+    ("POST", "/api/gold/export/{mart}",  Policy::RequiresAuth),
+
     // ── Query: seeded Analyst permission `query:read`. `collaboration` has
     //    no seeded resource — auth only. ──────────────────────────────────
     ("POST", "/api/query/run",            Policy::RequiresPermission("query:read")),

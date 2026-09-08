@@ -280,6 +280,57 @@ pub struct Config {
     /// is handed to `connect_lazy` as-is and any problem with it surfaces
     /// lazily, at first use, as an ordinary request-time error.
     pub database_url: String,
+    /// ADR 0010/0011 — path to a file holding the `gold-export` Lakekeeper
+    /// principal's pre-minted static bearer token (`iceberg-catalog-rest`'s
+    /// `token` property — see `lakehouse-iceberg::catalog`'s module doc on
+    /// why this build uses a static token, not an `OAuth2` exchange).
+    /// Deliberately a **file path**, not a `secretRef`: the token is
+    /// minted at compose bring-up by `ops/oidc-mock` onto a shared volume
+    /// (`lakehouse_oidc_tokens`) every writer in this stack already reads
+    /// directly from disk the same way (`docker-compose.yml`'s
+    /// `g1-test-runner`, `debezium-server`, `trino`, ...) — there is no
+    /// static value to put behind an `env:` `secretRef` ahead of time.
+    /// Always set to a default path — `/tokens/gold-export.jwt`, matching
+    /// where `docker-compose.yml`'s `lakehouse-api` service mounts the
+    /// shared token volume — rather than `None`-when-unset: unlike a real
+    /// secret, there is no meaningful "intentionally absent" state here,
+    /// only "the file isn't there (yet)", which `routes::gold` treats as
+    /// Gold export being unconfigured (503) at request time, when it
+    /// actually tries to read the file.
+    pub lakekeeper_gold_export_token_file: String,
+    /// `ClickHouse` schema Gold marts live in (ADR 0010: `serving.*`).
+    /// `routes::gold`'s export route reads `{gold_source_schema}.{mart}`.
+    /// Default `"serving"`.
+    pub gold_source_schema: String,
+    /// Shared token gating `POST /api/gold/export/{mart}`, same D4 shape
+    /// as [`Self::alerts_run_token`]: with this set, a matching
+    /// `x-run-token` header/`?token=` is required; with it unset, only a
+    /// service-identity principal is let through. `None` when unset.
+    pub gold_export_run_token: Option<String>,
+    /// Hard cap on how many source rows a single `POST
+    /// /api/gold/export/{mart}` call will export (code-review fix: the
+    /// prior implementation read an entire mart into memory with no limit
+    /// at all, and a large mart could OOM the whole API process — not
+    /// just the export request, every route it serves). Checked against
+    /// `ClickHouse`'s `count()` for the source table BEFORE any row data
+    /// is read (`gold_export::export_mart`); a mart over the cap fails
+    /// the export outright with an error naming both the mart and the cap,
+    /// rather than silently truncating — silent truncation would publish
+    /// a partial mart to Iceberg as if it were the complete one, which is
+    /// worse than refusing. Not parsed as a genuinely load-bearing value
+    /// (like [`Self::port`]): an unparsable override falls back to the
+    /// default rather than failing config resolution, same posture as
+    /// [`Self::oidc_clock_skew_seconds`]. Default `5_000_000`.
+    pub gold_export_max_rows: u64,
+    /// How many source rows `gold_export::export_mart` reads from
+    /// `ClickHouse` and appends to Iceberg per batch, instead of
+    /// materializing the whole mart at once (the same OOM defect
+    /// [`Self::gold_export_max_rows`] documents). Each batch is one
+    /// `SELECT ... LIMIT n OFFSET n FORMAT JSON` round trip and one
+    /// `GoldTable::append` (one new Parquet file/snapshot). Same
+    /// non-load-bearing parsing posture as
+    /// [`Self::gold_export_max_rows`]. Default `20_000`.
+    pub gold_export_batch_size: u64,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -361,6 +412,17 @@ impl std::fmt::Debug for Config {
             )
             .field("oidc_clock_skew_seconds", &self.oidc_clock_skew_seconds)
             .field("database_url", &REDACTED)
+            .field(
+                "lakekeeper_gold_export_token_file",
+                &self.lakekeeper_gold_export_token_file,
+            )
+            .field("gold_source_schema", &self.gold_source_schema)
+            .field(
+                "gold_export_run_token",
+                &self.gold_export_run_token.as_ref().map(|_| REDACTED),
+            )
+            .field("gold_export_max_rows", &self.gold_export_max_rows)
+            .field("gold_export_batch_size", &self.gold_export_batch_size)
             .finish()
     }
 }
@@ -375,6 +437,17 @@ fn or_default(env: &HashMap<String, String>, key: &str, default: &str) -> String
 /// when `key` is absent *or* present-but-empty.
 fn truthy(env: &HashMap<String, String>, key: &str) -> Option<String> {
     env.get(key).filter(|v| !v.is_empty()).cloned()
+}
+
+/// Parses `key` as a `u64`, falling back to `default` when absent or
+/// unparseable. Same non-load-bearing posture as
+/// [`Config::oidc_clock_skew_seconds`]: a garbage override must not fail
+/// config resolution, only silently keep the documented default. Used by
+/// [`Config::gold_export_max_rows`]/[`Config::gold_export_batch_size`].
+fn parse_u64_or_default(env: &HashMap<String, String>, key: &str, default: u64) -> u64 {
+    env.get(key)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
 /// Parse `OIDC_ROLE_MAP`'s `"group1=Role One,group2=Role Two"` format into
@@ -504,6 +577,15 @@ impl Config {
                 "DATABASE_URL",
                 "postgres://lakehouse:lakehouse@localhost:5432/lakehouse",
             ),
+            lakekeeper_gold_export_token_file: or_default(
+                env,
+                "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE",
+                "/tokens/gold-export.jwt",
+            ),
+            gold_source_schema: or_default(env, "GOLD_SOURCE_SCHEMA", "serving"),
+            gold_export_run_token: truthy(env, "GOLD_EXPORT_RUN_TOKEN"),
+            gold_export_max_rows: parse_u64_or_default(env, "GOLD_EXPORT_MAX_ROWS", 5_000_000),
+            gold_export_batch_size: parse_u64_or_default(env, "GOLD_EXPORT_BATCH_SIZE", 20_000),
         })
     }
 
@@ -607,6 +689,55 @@ mod tests {
         assert!(cfg.oidc_role_map.is_empty());
         assert_eq!(cfg.oidc_groups_claim, "groups");
         assert_eq!(cfg.oidc_clock_skew_seconds, 60);
+        assert_eq!(
+            cfg.lakekeeper_gold_export_token_file,
+            "/tokens/gold-export.jwt"
+        );
+        assert_eq!(cfg.gold_source_schema, "serving");
+        assert_eq!(cfg.gold_export_run_token, None);
+        assert_eq!(cfg.gold_export_max_rows, 5_000_000);
+        assert_eq!(cfg.gold_export_batch_size, 20_000);
+        // Safe-by-default: SSRF blocking is ON unless explicitly disabled.
+        assert!(!cfg.connector_probe_allow_internal_hosts);
+    }
+
+    #[test]
+    fn gold_export_max_rows_and_batch_size_are_overridable() {
+        let env = map(&[
+            ("GOLD_EXPORT_MAX_ROWS", "123"),
+            ("GOLD_EXPORT_BATCH_SIZE", "7"),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.gold_export_max_rows, 123);
+        assert_eq!(cfg.gold_export_batch_size, 7);
+    }
+
+    /// Same non-load-bearing posture as `OIDC_CLOCK_SKEW_SECONDS`: a
+    /// garbage override must not fail config resolution — it falls back to
+    /// the documented default instead.
+    #[test]
+    fn invalid_gold_export_row_settings_fall_back_to_defaults_instead_of_erroring() {
+        let env = map(&[
+            ("GOLD_EXPORT_MAX_ROWS", "not-a-number"),
+            ("GOLD_EXPORT_BATCH_SIZE", "also-not-a-number"),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.gold_export_max_rows, 5_000_000);
+        assert_eq!(cfg.gold_export_batch_size, 20_000);
+    }
+
+    /// The compose stack's documented opt-out — only the literal string
+    /// `"true"` flips the default, matching every other boolean flag in
+    /// this config (`OIDC_JIT_PROVISIONING`, `SMTP_SECURE`).
+    #[test]
+    fn connector_probe_allow_internal_hosts_requires_the_literal_string_true() {
+        let cfg =
+            Config::from_map(&map(&[("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS", "yes")])).unwrap();
+        assert!(!cfg.connector_probe_allow_internal_hosts);
+
+        let cfg =
+            Config::from_map(&map(&[("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS", "true")])).unwrap();
+        assert!(cfg.connector_probe_allow_internal_hosts);
     }
 
     #[test]

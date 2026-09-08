@@ -172,7 +172,13 @@ async fn dial_info_returns_type_host_and_secret_refs(pool: PgPool) -> sqlx::Resu
         .unwrap();
     assert_eq!(pg.kind, "PostgreSQL");
     assert_eq!(pg.host, "lakehouse@postgres:5432/lakehouse");
-    assert_eq!(pg.secret_ref, "env:POSTGRES_PASSWORD");
+    // Connector-DEDICATED refs, not the API's own secrets — migration 0023.
+    // The seed used to name `env:POSTGRES_PASSWORD` (the console's own
+    // database password) and the RustFS root keys, which made them reachable
+    // by name from a caller-created connector pointed at a host of the
+    // caller's choosing. Asserting the new names here keeps that regression
+    // visible: re-seeding the API's own secrets fails this test.
+    assert_eq!(pg.secret_ref, "env:CONNECTOR_PG_PASSWORD");
     assert_eq!(pg.secret_ref_secondary, None);
 
     let s3 = get_connector_dial_info(&pool, "conn-s3-warehouse")
@@ -180,9 +186,10 @@ async fn dial_info_returns_type_host_and_secret_refs(pool: PgPool) -> sqlx::Resu
         .unwrap()
         .unwrap();
     assert_eq!(s3.kind, "Object storage");
+    assert_eq!(s3.secret_ref, "env:CONNECTOR_S3_ACCESS_KEY");
     assert_eq!(
         s3.secret_ref_secondary.as_deref(),
-        Some("env:RUSTFS_SECRET_KEY")
+        Some("env:CONNECTOR_S3_SECRET_KEY")
     );
 
     assert!(

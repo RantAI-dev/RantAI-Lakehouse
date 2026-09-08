@@ -171,12 +171,31 @@ pub fn ingestion_day_partition_spec(schema: &Schema) -> Result<UnboundPartitionS
 /// `.map_err`) if `batch` has no [`INGESTED_AT_COLUMN`], the column is not
 /// a microsecond timestamp, or every value in it is null.
 pub fn partition_key_for(metadata: &TableMetadata, batch: &RecordBatch) -> Result<PartitionKey> {
-    let ingested_at = batch
-        .column_by_name(INGESTED_AT_COLUMN)
+    day_partition_key_for(metadata, batch, INGESTED_AT_COLUMN)
+}
+
+/// Shared implementation behind [`partition_key_for`] and
+/// `gold::partition_key_for`: computes a `day(<column>)` [`PartitionKey`]
+/// from `batch`'s first non-null value in `column`. Kept as one function
+/// (rather than duplicated per layer) so the "one partition value per
+/// batch, not per row" caveat documented on [`partition_key_for`] only has
+/// to be written, and gotten right, once.
+///
+/// # Errors
+///
+/// Returns an error if `batch` has no `column`, the column is not a
+/// microsecond timestamp, or every value in it is null.
+pub(crate) fn day_partition_key_for(
+    metadata: &TableMetadata,
+    batch: &RecordBatch,
+    column: &str,
+) -> Result<PartitionKey> {
+    let values = batch
+        .column_by_name(column)
         .ok_or_else(|| {
             Error::new(
                 ErrorKind::DataInvalid,
-                format!("batch has no {INGESTED_AT_COLUMN} column"),
+                format!("batch has no {column} column"),
             )
         })?
         .as_any()
@@ -184,15 +203,15 @@ pub fn partition_key_for(metadata: &TableMetadata, batch: &RecordBatch) -> Resul
         .ok_or_else(|| {
             Error::new(
                 ErrorKind::DataInvalid,
-                format!("{INGESTED_AT_COLUMN} is not a microsecond timestamp array"),
+                format!("{column} is not a microsecond timestamp array"),
             )
         })?;
-    let micros = (0..ingested_at.len())
-        .find_map(|i| ingested_at.is_valid(i).then(|| ingested_at.value(i)))
+    let micros = (0..values.len())
+        .find_map(|i| values.is_valid(i).then(|| values.value(i)))
         .ok_or_else(|| {
             Error::new(
                 ErrorKind::DataInvalid,
-                format!("{INGESTED_AT_COLUMN} has no non-null values to partition by"),
+                format!("{column} has no non-null values to partition by"),
             )
         })?;
     // Iceberg's `day` transform on a `timestamp` source truncates to whole
@@ -202,7 +221,7 @@ pub fn partition_key_for(metadata: &TableMetadata, batch: &RecordBatch) -> Resul
     let days = i32::try_from(micros.div_euclid(MICROS_PER_DAY)).map_err(|e| {
         Error::new(
             ErrorKind::DataInvalid,
-            format!("ingestion day out of i32 range: {e}"),
+            format!("partition day out of i32 range: {e}"),
         )
     })?;
     let partition_value = Struct::from_iter([Some(Literal::date(days))]);

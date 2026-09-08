@@ -88,6 +88,27 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
+      # Code-review fix: this used to ALSO depend on
+      # `lakekeeper-authz-init: condition: service_completed_successfully`
+      # (ADR 0010/0011 — Gold export needs the `gold-export` principal
+      # registered/granted and its token minted before it can do anything
+      # useful). That coupled this service's BOOT to a one-shot job's exit
+      # code, contradicting this crate's whole documented posture
+      # (`lakehouse_store::connect_lazy`'s doc comment, `AppState::pg`'s
+      # doc comment): the API boots and serves every route it can even
+      # when a dependency is down or not yet provisioned, degrading only
+      # the routes that actually need it (503), rather than refusing to
+      # start at all. `routes::gold::export`/`read_back` already check
+      # their Lakekeeper precondition at REQUEST time
+      # (`lakehouse-api/src/routes/gold.rs`'s `read_catalog_token` — 503,
+      # naming the unread token file, if Gold export is not provisioned
+      # yet), so nothing is lost by not also gating boot on it: every
+      # OTHER route this service serves has no Lakekeeper dependency at
+      # all, and a slow/failed `lakekeeper-authz-init` should not be able
+      # to take those down too. `postgres`/`clickhouse` above are
+      # pre-existing `depends_on` entries, unchanged by this fix — only
+      # the Gold-export-specific `lakekeeper-authz-init` entry is removed
+      # here.
     environment:
       PORT: "8080"
       APP_ENV: ${APP_ENV:-local}
@@ -151,6 +172,60 @@ services:
       CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:-lakehouse}}
       CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:-rustfsadmin}}
       CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:-rustfsadmin}}
+      # The connector connectivity probe blocks private/internal address
+      # ranges by DEFAULT (SSRF guard — otherwise a `connector:manage`
+      # principal gets an internal port scanner with output). This stack's own
+      # seeded connectors legitimately point at `postgres:5432` and
+      # `http://rustfs:9000`, which resolve inside those ranges, so the demo
+      # opts out EXPLICITLY. Keeping the safe posture as the default and making
+      # the exception visible here is the point — do NOT carry this into a
+      # deployment that accepts connector definitions from untrusted callers.
+      CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS: ${CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS:-true}
+      # ── ADR 0010 — Gold export to Iceberg (`routes::gold`). Points at the
+      #    compose-internal Lakekeeper hostname (NOT `LAKEKEEPER_BASE_URI`,
+      #    which is host-facing) — same distinction `g1-test-runner`'s env
+      #    block documents. `LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE` is read
+      #    from the `gold-export` principal's pre-minted token on the
+      #    shared volume mounted below (ADR 0011); `GOLD_EXPORT_RUN_TOKEN`
+      #    is left unset by default, so `dagster/dispar_orchestrate/
+      #    gold_export.py`'s scheduled trigger must authenticate as a
+      #    service-identity principal instead (D4 shape, same as
+      #    ALERTS_RUN_TOKEN). ──
+      LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE: /tokens/gold-export.jwt
+      GOLD_SOURCE_SCHEMA: ${GOLD_SOURCE_SCHEMA:-serving}
+      GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
+      # ── Tenant identity (see `lakehouse-api/src/tenant.rs`) ──
+      # Passed through explicitly because otherwise a non-Dispar deployment
+      # cannot override them at all. Each resolves to its historical Dispar
+      # literal when empty (`tenant.rs`'s `env_or` treats blank as unset), so
+      # listing them here changes nothing for an existing deployment.
+      #
+      # `BUILTIN_DASHBOARD_ENABLED` must be `0` on any tenant without a
+      # `serving.mart_wisman` mart: the built-in "Main" board's tiles are
+      # hardcoded to the Dispar marts and paint red before redirecting.
+      TENANT_OWNER: ${TENANT_OWNER:-}
+      TENANT_ID: ${TENANT_ID:-}
+      TENANT_DOMAIN: ${TENANT_DOMAIN:-}
+      TENANT_RESIDENCY: ${TENANT_RESIDENCY:-}
+      TENANT_SITE: ${TENANT_SITE:-}
+      TENANT_SOURCE: ${TENANT_SOURCE:-}
+      BRONZE_CURATED_SLUGS: ${BRONZE_CURATED_SLUGS:-}
+      CATALOG_NAMESPACE_META: ${CATALOG_NAMESPACE_META:-}
+      BUILTIN_DASHBOARD_ENABLED: ${BUILTIN_DASHBOARD_ENABLED:-1}
+    volumes:
+      # PR #33 review, should-fix: a single-file subpath mount, not the
+      # whole `lakehouse_oidc_tokens` volume — this service only ever
+      # reads `gold-export.jwt` (LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE above),
+      # so it should not also be able to read `admin.jwt` or any other
+      # principal's token off the shared volume.
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/gold-export.jwt
+        volume:
+          subpath: gold-export.jwt
+        read_only: true
     restart: unless-stopped
 
   # P1 — S3-compatible object store, the default self-hosted implementation
@@ -326,9 +401,17 @@ services:
       - --http-addr=0.0.0.0:8080
       - --grpc-addr=0.0.0.0:8081
       - --playground-enabled=false
-    ports:
-      - "${OPENFGA_HTTP_HOST_PORT:-8082}:8080"
-      - "${OPENFGA_GRPC_HOST_PORT:-8083}:8081"
+    # PR #33 review, blocker 2: no `ports:` mapping — OpenFGA has no authn
+    # of its own (Lakekeeper's Management API is the only intended grant
+    # interface; see ADR 0011), so publishing 8082/8083 on the host handed
+    # anyone who could reach them read/write access to the whole
+    # authorization store on a plain `docker compose up`. Every caller that
+    # actually needs OpenFGA (`lakekeeper`, `lakekeeper-migrate`) resolves
+    # it by its compose service name and never leaves this network.
+    # `OPENFGA_HTTP_HOST_PORT`/`OPENFGA_GRPC_HOST_PORT` are gone with it —
+    # if you need to reach OpenFGA's Playground/API directly from the host
+    # for debugging, use `docker compose exec` or a one-off `docker run
+    # --network <project>_default` instead of republishing these.
     restart: unless-stopped
 
   # R1 — `openfga`'s image is distroless (no shell, no wget/curl — verified
@@ -372,8 +455,17 @@ services:
       OIDC_MOCK_ISSUER: http://oidc-mock:8090
       OIDC_MOCK_AUDIENCE: lakekeeper
       OIDC_MOCK_PORT: "8090"
-    ports:
-      - "${OIDC_MOCK_HOST_PORT:-8090}:8090"
+    # PR #33 review, blocker 1 + 2: no `ports:` mapping. This container
+    # holds the private signing key every principal's token is verified
+    # against and (until blocker 2's fix) minted arbitrary tokens for any
+    # `client_id` with no secret check — publishing it on the host let
+    # anyone who could reach the port mint a Lakekeeper-trusted identity.
+    # Every caller that needs it (`lakekeeper`, the `lakekeeper-*-init`
+    # jobs, every writer's `CH_OAUTH_SERVER_URI`) resolves `oidc-mock` by
+    # its compose service name and stays inside this network.
+    # `OIDC_MOCK_HOST_PORT` is gone with it — see docs/OPERATIONS.md for
+    # how to reach `/token` or the JWKS/discovery docs from the host for
+    # debugging without republishing the port (`docker compose exec`).
     volumes:
       - lakehouse_oidc_data:/data
       - lakehouse_oidc_tokens:/tokens
@@ -494,7 +586,14 @@ services:
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
     volumes:
-      - lakehouse_oidc_tokens:/tokens:ro
+      # PR #33 review, should-fix: single-file subpath mount — this job
+      # only ever needs `admin.jwt`.
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/admin.jwt
+        volume:
+          subpath: admin.jwt
+        read_only: true
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -573,6 +672,34 @@ services:
   #     snapshot of an EXISTING table — it never creates a namespace or
   #     table, so `create` would be an over-grant with no code path to use
   #     it, same reasoning as `clickhouse-reader`'s missing `create`.
+  #   - `gold-export` (ADR 0010, P6+: `lakehouse-api`'s `routes::gold`):
+  #     create, modify, select — same shape as `rust-iceberg`, own
+  #     principal so it is independently auditable/revocable.
+  #     Code-review fix: this grant is WAREHOUSE-scoped (the
+  #     `permissions/warehouse/{id}/assignments` endpoint below), same as
+  #     every other principal in this list — it is NOT narrowed to the
+  #     `gold` namespace. A previous version of this comment claimed
+  #     "scoped to the `gold` Iceberg namespace's export path only", which
+  #     overstated the actual restriction: `gold-export`'s token can
+  #     create/modify/select ANY namespace or table in this warehouse,
+  #     including `bronze`, exactly like `rust-iceberg`'s token can.
+  #     Narrowing this specific grant to the `gold` namespace was
+  #     considered and not done: this build's whole authorization design
+  #     (ADR 0003, "isolation enforced once, at the warehouse boundary")
+  #     grants every principal here at warehouse scope, never
+  #     namespace/table scope, and Lakekeeper's namespace itself does not
+  #     exist yet at grant time (it is created lazily by the first
+  #     export — `IcebergClient::create_or_load_gold_table`), so a
+  #     namespace-scoped grant would need this job to also pre-create the
+  #     `gold` namespace as `admin` before granting into it — a real
+  #     capability Lakekeeper's permission model likely supports (it has
+  #     namespace- and table-level assignment endpoints alongside the
+  #     warehouse-level one used here), but a change to this build's
+  #     established grant shape big enough, and different enough from
+  #     every other principal here, that it deserves its own review
+  #     rather than being slipped into this fix. Tracked as follow-up
+  #     work, not done here; this comment is honest about the CURRENT
+  #     scope in the meantime.
   #   - `unauthorized-test`: registered (Lakekeeper knows who it is) but
   #     NEVER granted anything — the negative-test principal.
   lakekeeper-authz-init:
@@ -583,7 +710,60 @@ services:
     environment:
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
     volumes:
-      - lakehouse_oidc_tokens:/tokens:ro
+      # PR #33 review, should-fix: this job is the one caller that
+      # legitimately needs many principals' tokens (it self-registers each
+      # of them, then grants with `admin`) — one subpath mount per file it
+      # actually reads, instead of the whole `lakehouse_oidc_tokens`
+      # volume (which would also expose every OTHER principal's token,
+      # e.g. `gold-export.jwt`, that this job has no reason to touch).
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/admin.jwt
+        volume:
+          subpath: admin.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/rust-iceberg.jwt
+        volume:
+          subpath: rust-iceberg.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/debezium.jwt
+        volume:
+          subpath: debezium.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/dlt.jwt
+        volume:
+          subpath: dlt.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/clickhouse-reader.jwt
+        volume:
+          subpath: clickhouse-reader.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/trino.jwt
+        volume:
+          subpath: trino.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/gold-export.jwt
+        volume:
+          subpath: gold-export.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/unauthorized-test.jwt
+        volume:
+          subpath: unauthorized-test.jwt
+        read_only: true
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -593,7 +773,7 @@ services:
         admin_token="$$(cat /tokens/admin.jwt)"
         admin_auth="Authorization: Bearer $$admin_token"
 
-        for principal in rust-iceberg debezium dlt clickhouse-reader trino unauthorized-test; do
+        for principal in rust-iceberg debezium dlt clickhouse-reader trino gold-export unauthorized-test; do
           ptoken="$$(cat /tokens/$$principal.jwt)"
           code=$$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $$ptoken" -H 'Content-Type: application/json' \
@@ -625,6 +805,17 @@ services:
         grant dlt create modify select
         grant clickhouse-reader select modify
         grant trino select modify
+        # ADR 0010 — Gold export to Iceberg from Rust: `lakehouse-api`'s
+        # `routes::gold` creates the `gold` namespace/table on first
+        # export, appends a new snapshot on every subsequent one, and
+        # reads it back (`GET /api/gold/export/{mart}`, the round-trip
+        # proof `ops/gold_export/gold_export_test.py` checks) — the same
+        # create+modify+select shape as `rust-iceberg`, own principal per
+        # the note on `PRINCIPALS` in `ops/oidc-mock/server.py`. This is a
+        # WAREHOUSE-scoped grant (see the "Grants" list above this job's
+        # doc comment): `gold-export`'s token is not restricted to the
+        # `gold` namespace by this call.
+        grant gold-export create modify select
         # unauthorized-test: deliberately no grant call.
     restart: "no"
 
@@ -666,7 +857,20 @@ services:
       - ./rust:/workspace
       - lakehouse_g1_cargo_registry:/usr/local/cargo/registry
       - lakehouse_g1_target:/workspace/target
-      - lakehouse_oidc_tokens:/tokens:ro
+      # PR #33 review, should-fix: only the two tokens this runner reads
+      # below (`rust-iceberg.jwt`, `unauthorized-test.jwt`).
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/rust-iceberg.jwt
+        volume:
+          subpath: rust-iceberg.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/unauthorized-test.jwt
+        volume:
+          subpath: unauthorized-test.jwt
+        read_only: true
     depends_on:
       clickhouse:
         condition: service_healthy
@@ -698,17 +902,145 @@ services:
         cargo test -p lakehouse-iceberg --test g1_lakekeeper --locked -- --ignored --nocapture g1_negative
     restart: "no"
 
+  # ADR 0010 — end-to-end acceptance test for Gold export to Iceberg:
+  # `ops/gold_export/gold_export_test.py`. `test` profile, not `dagster`
+  # — this path has no dependency on `dagster-webserver` (the export
+  # itself is triggered directly over HTTP, matching how
+  # `dagster/dispar_orchestrate/gold_export.py`'s scheduled job also
+  # calls it, just without Dagster in the loop for this test). Same
+  # `g1-test-runner`/`g3a-test-runner` shape otherwise.
+  #
+  # Usage (from a clean stack — `GOLD_EXPORT_RUN_TOKEN` must be set
+  # identically for both `lakehouse-api` and this runner, e.g. in `.env`,
+  # the same reason the brief's `DAGSTER_URL`/`LAKEKEEPER_BASE_URI` note
+  # gives: a one-off command-line override here would not also reach the
+  # already-running `lakehouse-api` container):
+  #   echo 'GOLD_EXPORT_RUN_TOKEN=gold-export-ci-not-a-real-secret' >> .env
+  #   docker compose -p <project> up -d --build lakehouse-api
+  #   docker compose -p <project> --profile test run --rm gold-export-test-runner
+  gold-export-test-runner:
+    profiles: ["test"]
+    image: python:3.12-slim
+    working_dir: /work
+    volumes:
+      - ./ops/gold_export:/work
+      # PR #33 review, should-fix: only the two tokens
+      # `gold_export_test.py` reads (`admin.jwt`, `gold-export.jwt`).
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/admin.jwt
+        volume:
+          subpath: admin.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/gold-export.jwt
+        volume:
+          subpath: gold-export.jwt
+        read_only: true
+    depends_on:
+      lakehouse-api:
+        condition: service_started
+      lakekeeper-authz-init:
+        condition: service_completed_successfully
+    environment:
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      LAKEKEEPER_BASE_URI: http://lakekeeper:8181
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      LAKEKEEPER_TOKENS_DIR: /tokens
+      GOLD_SOURCE_SCHEMA: ${GOLD_SOURCE_SCHEMA:-serving}
+      GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
+      GOLD_MART_NAME: ${GOLD_MART_NAME:-gold_export_smoke}
+      GOLD_EXPORT_ROW_COUNT: ${GOLD_EXPORT_ROW_COUNT:-7}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "pip install -q requests && python gold_export_test.py"
+    restart: "no"
+
   # P2 (G2) — SeaweedFS: a second S3-compatible store used to prove the
   # storage boundary. Opt-in via the `seaweedfs` profile; never starts on a
   # plain `docker compose up` (RustFS stays the default). Image confirmed
   # to exist on Docker Hub as `chrislusf/seaweedfs:4.44` (pulled and
   # inspected during P2 verification — see docs/STORAGE-COMPATIBILITY.md).
   #
+  # P2 (G2) — one-shot: render `ops/seaweedfs/iam.template.json` into the
+  # `lakehouse_seaweedfs_iam` volume, substituting the access key, secret
+  # key, and STS signing key from env — this is what stops a committed
+  # `iam.json` (see `seaweedfs`'s comment below) from shipping a working
+  # STS signing key with every checkout. Mirrors the shape of every other
+  # one-shot `*-init` service in this file (alpine + a `/bin/sh -c` script,
+  # `restart: "no"`), just rendering a config file instead of calling an
+  # HTTP API.
+  #
+  # The crux: when `SEAWEEDFS_STS_SIGNING_KEY` is UNSET, this GENERATES a
+  # random key (`head -c 32 /dev/urandom | base64`) rather than falling
+  # back to any constant — an operator who configures nothing must not get
+  # a key anyone else running this same compose file also gets. The
+  # generated key is then read back out of the volume's existing
+  # `iam.json` on every subsequent run (still with the env var unset), so
+  # a plain `docker compose up` restart does not silently rotate the key
+  # and invalidate every STS token issued since the last one — only a
+  # genuinely empty volume (first boot, or `docker compose down -v`)
+  # mints fresh randomness. Setting `SEAWEEDFS_STS_SIGNING_KEY` in `.env`
+  # pins it explicitly instead, e.g. for a multi-host deployment where
+  # more than one container needs to agree on the same key.
+  seaweedfs-iam-init:
+    profiles: ["seaweedfs"]
+    image: alpine:3.20
+    environment:
+      SEAWEEDFS_ACCESS_KEY: ${SEAWEEDFS_ACCESS_KEY:-seaweedfsadmin}
+      SEAWEEDFS_SECRET_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfsadmin}
+      # CHANGE ME (or leave unset) BEFORE ANY DEPLOYMENT: see docs comment
+      # above — unset is safe (a random key is generated per deployment),
+      # a shared/known value here is not.
+      SEAWEEDFS_STS_SIGNING_KEY: ${SEAWEEDFS_STS_SIGNING_KEY:-}
+    volumes:
+      - ./ops/seaweedfs/iam.template.json:/templates/iam.template.json:ro
+      - lakehouse_seaweedfs_iam:/rendered
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        signing_key="$$SEAWEEDFS_STS_SIGNING_KEY"
+        if [ -z "$$signing_key" ] && [ -f /rendered/iam.json ]; then
+          signing_key="$$(sed -n 's/.*"signingKey": *"\([^"]*\)".*/\1/p' /rendered/iam.json | head -n1)"
+        fi
+        if [ -z "$$signing_key" ]; then
+          signing_key="$$(head -c 32 /dev/urandom | base64)"
+          echo "seaweedfs-iam-init: SEAWEEDFS_STS_SIGNING_KEY not set — generated a random per-deployment key (see .env.example)." >&2
+        fi
+        sed \
+          -e "s#__SEAWEEDFS_ACCESS_KEY__#$$SEAWEEDFS_ACCESS_KEY#g" \
+          -e "s#__SEAWEEDFS_SECRET_KEY__#$$SEAWEEDFS_SECRET_KEY#g" \
+          -e "s#__SEAWEEDFS_STS_SIGNING_KEY__#$$signing_key#g" \
+          /templates/iam.template.json > /rendered/iam.json
+    restart: "no"
+
   # `weed server -s3` runs master+volume+filer+the S3 gateway in one
   # process — sufficient for this matrix check, not a production topology.
+  #
+  # SECURITY (credential-hygiene review): this used to bind-mount a
+  # COMMITTED `ops/seaweedfs/iam.json` straight off the repo tree, which
+  # hard-coded `seaweedfsadmin`/`seaweedfsadmin` *and* a working STS
+  # signing key (base64 of a self-describing placeholder string) into
+  # every checkout. That file's own comment said "local/CI only", but
+  # this compose file doubles as the deployment template — so a real
+  # deployment that never touched `iam.json` inherited a PUBLICLY KNOWN
+  # STS signing key, letting anyone who can reach this listener mint STS
+  # tokens against it. `iam.json` is gone from the tree; `seaweedfs-iam-init`
+  # (below) renders `ops/seaweedfs/iam.template.json` into a volume at
+  # bring-up instead, generating a random signing key per deployment when
+  # `SEAWEEDFS_STS_SIGNING_KEY` is left unset. `depends_on` below is what
+  # makes that render happen before this container ever reads the file.
   seaweedfs:
     profiles: ["seaweedfs"]
     image: chrislusf/seaweedfs:4.44
+    depends_on:
+      seaweedfs-iam-init:
+        condition: service_completed_successfully
     command:
       - server
       - -dir=/data
@@ -719,7 +1051,7 @@ services:
       - -master.volumeSizeLimitMB=100
     volumes:
       - lakehouse_seaweedfs_data:/data
-      - ./ops/seaweedfs/iam.json:/etc/seaweedfs/iam.json:ro
+      - lakehouse_seaweedfs_iam:/etc/seaweedfs:ro
     ports:
       - "${SEAWEEDFS_S3_HOST_PORT:-8333}:8333"
     healthcheck:
@@ -803,7 +1135,14 @@ services:
       SEAWEEDFS_ACCESS_KEY: ${SEAWEEDFS_ACCESS_KEY:-seaweedfsadmin}
       SEAWEEDFS_SECRET_KEY: ${SEAWEEDFS_SECRET_KEY:-seaweedfsadmin}
     volumes:
-      - lakehouse_oidc_tokens:/tokens:ro
+      # PR #33 review, should-fix: single-file subpath mount — `admin.jwt`
+      # only.
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/admin.jwt
+        volume:
+          subpath: admin.jwt
+        read_only: true
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -862,7 +1201,15 @@ services:
       lakekeeper-authz-init:
         condition: service_completed_successfully
     volumes:
-      - lakehouse_oidc_tokens:/tokens:ro
+      # PR #33 review, should-fix: single-file subpath mount — this job
+      # only grants (with `admin`); the principals it grants to are
+      # already self-registered by `lakekeeper-authz-init`.
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/admin.jwt
+        volume:
+          subpath: admin.jwt
+        read_only: true
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -936,18 +1283,43 @@ services:
       lakekeeper-authz-init:
         condition: service_completed_successfully
     volumes:
-      - lakehouse_oidc_tokens:/tokens:ro
+      # PR #33 review, should-fix: single-file subpath mount — this
+      # service only reads `dlt.jwt` (LAKEKEEPER_TOKEN_FILE below).
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/dlt.jwt
+        volume:
+          subpath: dlt.jwt
+        read_only: true
     environment:
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
       DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
       DAGSTER_PG_PASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
       DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
-      # `postgresql://`, not `postgres://` — dlt's `sql_database` source
-      # goes through SQLAlchemy, which (unlike `sqlx`, used for
-      # `DATABASE_URL` elsewhere in this file) does not recognize the
-      # `postgres://` scheme alias.
-      BRONZE_SOURCE_DATABASE_URL: postgresql://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${POSTGRES_DB:-lakehouse}
+      # CREDENTIAL HYGIENE (review finding): this used to be a single
+      # `BRONZE_SOURCE_DATABASE_URL` env var carrying a full
+      # `postgresql://user:password@host/db` DSN — a plaintext password
+      # embedded in one compose environment value, visible whole to
+      # `docker inspect` and to any process that can read this
+      # container's environment (a URL is also just easier to grep for
+      # than a same-named discrete var). Split into components instead,
+      # matching `CONNECTOR_PG_PASSWORD`'s existing pattern above
+      # (`lakehouse-api`'s own least-privilege connector secrets, NOT
+      # `lakehouse-api`'s own `DATABASE_URL`, which stays a single string
+      # because it is never handed to a caller-chosen destination the way
+      # a connector/source definition is). `dlt_pipeline.py`'s
+      # `run_bronze_ingest` assembles these into dlt's `sql_database`
+      # credentials dict in-process — the DSN itself never exists as one
+      # env var. `postgresql://`, not `postgres://`, once assembled — dlt's
+      # `sql_database` source goes through SQLAlchemy, which (unlike
+      # `sqlx`, used for `DATABASE_URL` elsewhere in this file) does not
+      # recognize the `postgres://` scheme alias.
+      BRONZE_SOURCE_DB_HOST: postgres
+      BRONZE_SOURCE_DB_PORT: "5432"
+      BRONZE_SOURCE_DB_USER: ${POSTGRES_USER:-lakehouse}
+      BRONZE_SOURCE_DB_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:-lakehouse}}
+      BRONZE_SOURCE_DB_NAME: ${POSTGRES_DB:-lakehouse}
       BRONZE_SOURCE_SCHEMA: ${BRONZE_SOURCE_SCHEMA:-ingest_demo}
       BRONZE_SOURCE_TABLE: ${BRONZE_SOURCE_TABLE:-orders}
       BRONZE_TABLE_NAME: ${BRONZE_TABLE_NAME:-g3a_orders}
@@ -961,8 +1333,25 @@ services:
       # `dagster api grpc` starts).
       LAKEKEEPER_TOKEN_FILE: /tokens/dlt.jwt
       CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
-      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
-      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      # CREDENTIAL HYGIENE (review finding): both `dlt_pipeline.py` (dlt's
+      # static-credential fallback path, used because dlt writes Parquet
+      # to `s3://.../bronze` directly, outside the vended-STS path
+      # Lakekeeper otherwise provides) and `ops/g3/g3_loadgen.py` (run
+      # inside THIS container per `docs/plans/G3-RESULT.md`) used to read
+      # `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` directly — RustFS's own
+      # ROOT credentials, the same ones `rustfs-bucket-init` and every
+      # other admin-shaped job in this file use. Neither tool needs
+      # root: both only ever PUT/GET objects under the one warehouse
+      # bucket. Point them at the connector-scoped names instead — same
+      # vars `CONNECTOR_S3_ACCESS_KEY`/`CONNECTOR_S3_SECRET_KEY` already
+      # defined for `lakehouse-api` above, defaulting to the same RustFS
+      # root key ONLY because this stack has no narrower RustFS identity
+      # to hand out (RustFS 1.0.0-rc.4 exposes no non-root S3 principal —
+      # see .env.example's note by these vars). A deployment that can
+      # mint a scoped RustFS/S3 identity should set these two to it
+      # without touching `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` at all.
+      CONNECTOR_S3_ACCESS_KEY: ${CONNECTOR_S3_ACCESS_KEY:-${RUSTFS_ACCESS_KEY:-rustfsadmin}}
+      CONNECTOR_S3_SECRET_KEY: ${CONNECTOR_S3_SECRET_KEY:-${RUSTFS_SECRET_KEY:-rustfsadmin}}
       LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
       CH_URL: ${CH_URL:-http://clickhouse:8123}
       CH_USER: ${CH_USER:-default}
@@ -971,6 +1360,16 @@ services:
       # see that module's `MaintenanceConfig.ch_auth_settings`.
       CH_OAUTH_CLIENT_ID: clickhouse-reader
       CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
+      # ADR 0010 — `gold_export.py`'s scheduled trigger: which mart(s) to
+      # export, where `lakehouse-api` lives, and the shared token
+      # `routes::gold::check_export_token` requires when set (must match
+      # `lakehouse-api`'s own `GOLD_EXPORT_RUN_TOKEN` — both read the same
+      # host-level `.env` value; see `gold-export-test-runner`'s usage
+      # comment for why a one-off override here would not reach the
+      # already-running `lakehouse-api` container).
+      LAKEHOUSE_API_URL: ${LAKEHOUSE_API_URL:-http://lakehouse-api:8080}
+      GOLD_EXPORT_MARTS: ${GOLD_EXPORT_MARTS:-gold_export_smoke}
+      GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
     command: ["dagster", "api", "grpc", "-h", "0.0.0.0", "-p", "4000", "-m", "dispar_orchestrate.definitions"]
     restart: unless-stopped
 
@@ -1192,6 +1591,22 @@ services:
   # this container's `command:` is a shell script, so the token file is
   # read into a shell variable before being interpolated into the
   # properties heredoc.
+  # SECURITY (code review finding): `trino` has NO authentication of its own
+  # in this configuration (no `http-server.authentication.type`, no
+  # password/LDAP/OAuth2 front door) — it is a bare coordinator. Anyone who
+  # can reach its port gets full `iceberg` catalog query access, i.e. read
+  # access to every Bronze table (and, since it authenticates to Lakekeeper
+  # with `select`+`modify`, the ability to mutate them too). That is fine
+  # INSIDE the compose network, where only `trino-maintenance-cron` talks to
+  # it (see below) — it stops being fine the moment `ports:` publishes it to
+  # the host, because the host port has none of the auth this stack's other
+  # public surfaces require (contrast `lakehouse-api`'s OIDC/bootstrap-admin
+  # gate). `TRINO_PUBLISH_HOST_PORT` below controls that publication and
+  # defaults OFF for exactly this reason; see `trino-host-port` further down
+  # for the mechanics (Compose has no way to make a `ports:` entry
+  # conditional in place — verified: an unset/empty interpolated port string
+  # fails compose's own parser with "no port specified: <empty>" — so the
+  # publish is split into its own opt-in-profiled sidecar instead).
   trino:
     profiles: ["trino"]
     image: trinodb/trino:483
@@ -1202,10 +1617,49 @@ services:
       LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
+      # CHANGE ME BEFORE ANY NON-LOCAL DEPLOYMENT. These are the SAME
+      # well-known RustFS defaults `rustfs`'s own service block warns about
+      # above — reused here, not freshly duplicated risk, but the reuse
+      # means overriding `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` once fixes
+      # both places.
+      #
+      # Why static keys at all, given `iceberg.rest-catalog.vended-
+      # credentials-enabled=true` two lines below in `command:` — doesn't
+      # Lakekeeper hand Trino scoped, per-principal S3 credentials the same
+      # way it hands `rust-iceberg`/`debezium` their catalog tokens? Per
+      # Trino's own `trino-iceberg` plugin docs, when vended credentials are
+      # enabled the REST catalog's per-request credentials are supposed to
+      # supersede these for actual file I/O — but `trinodb/trino#27416`
+      # (open against a coordinator-vs-Spark comparison) documents Trino NOT
+      # honoring vended credentials from a `LoadTableResponse` in some
+      # catalog/connector combinations, and this repo has no measured proof
+      # (no `docs/plans/*-RESULT.md` entry, unlike every other credential
+      # claim in this file) that `trinodb/trino:483` against Lakekeeper
+      # actually exercises the vended path rather than silently falling back
+      # to these. Removing the fallback on an unverified assumption risks
+      # silently breaking `trino-maintenance-cron` (ADR 0009's only working
+      # compaction path — see the block comment above `trino-maintenance-
+      # cron` below), which this fix is required NOT to weaken. So: kept,
+      # documented, flagged for change. `CONNECTOR_S3_ACCESS_KEY`/
+      # `CONNECTOR_S3_SECRET_KEY` (used by `lakehouse-api`'s connector
+      # probe, above) were considered and rejected here — those names are
+      # deliberately scoped to the connector allowlist boundary
+      # (`CONNECTOR_ALLOWED_SECRET_REFS`), a DIFFERENT trust boundary than
+      # Trino's own file I/O, and reusing them would blur that boundary
+      # rather than reduce actual risk (both ultimately default to the same
+      # `RUSTFS_*` value anyway).
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
     volumes:
-      - lakehouse_oidc_tokens:/tokens:ro
+      # PR #33 review, should-fix: single-file subpath mount — this
+      # service only reads `trino.jwt` (interpolated into
+      # iceberg.rest-catalog.oauth2.token below).
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/trino.jwt
+        volume:
+          subpath: trino.jwt
+        read_only: true
     entrypoint: ["/bin/sh", "-c"]
     # Trino's base image has no `envsubst`/`python3` (RHEL UBI, verified
     # empirically), so the catalog properties file is written directly
@@ -1235,6 +1689,71 @@ services:
         s3.aws-secret-key=$${RUSTFS_SECRET_KEY}
         EOF
         exec /usr/lib/trino/bin/run-trino
+    # NO `ports:` HERE — this is the fix. `trino-maintenance-cron` (below)
+    # is the only consumer of this coordinator, and it reaches it as
+    # `http://trino:8080` over the compose network, which needs no published
+    # host port at all. Publishing was the security defect (see the block
+    # comment above this service): an unauthenticated Trino on the host
+    # network gives anyone who can reach it full `iceberg` catalog query
+    # access. If you genuinely need host access (ad-hoc `trino` CLI /
+    # DBeaver against this catalog outside the network), opt in with
+    # `TRINO_PUBLISH_HOST_PORT=trino` — see `trino-host-port` below for how
+    # that publishes the SAME port without adding it here by default.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+  # SECURITY — opt-in host publication for `trino`, split into its own
+  # service because Compose cannot make a single service's `ports:` entry
+  # conditional on an env var: an unset/empty interpolated port string
+  # fails Compose's own parser with "no port specified: <empty>" (verified
+  # empirically against this exact shape while building this fix) — there
+  # is no "publish nothing" value you can hand `ports:` itself.
+  #
+  # `profiles:` looked like the natural place to move the toggle instead,
+  # but has its OWN empirically-verified trap: an interpolated profile
+  # entry that evaluates to the empty string (e.g. `"${VAR:+trino}"` with
+  # `VAR` unset) does not behave like "no profile" — it makes Compose treat
+  # the service as unconditionally active (`docker compose config
+  # --services` lists it even with zero `--profile` flags given), and
+  # WORSE, `docker compose config -q` with NO profile active then fails
+  # outright (`service "trino-host-port" depends on undefined service
+  # "trino"`) because the depends_on target genuinely isn't in the
+  # unfiltered project. So the toggle below uses `:-` (default-if-UNSET),
+  # never `:+`, and the default value is a real, never-requested profile
+  # name (`trino-host-port-disabled`), not empty: `TRINO_PUBLISH_HOST_PORT`
+  # unset -> profile `trino-host-port-disabled`, matches nothing, this
+  # service never exists, nothing is published (the default, and the fix
+  # for the finding above). Set `TRINO_PUBLISH_HOST_PORT=trino` (in `.env`)
+  # and the profile becomes `trino` — the SAME profile you already pass to
+  # run `trino` at all — so this starts automatically alongside it with no
+  # extra `--profile` flag. (Yes, the enabling value must be the literal
+  # string `trino`, not `true`/`1` — it IS the Compose profile name being
+  # matched, by construction; any other value leaves this disabled, safely,
+  # rather than erroring.)
+  #
+  # `network_mode: "service:trino"` joins `trino`'s network namespace
+  # directly (same IP/ports as the coordinator container) rather than
+  # duplicating the whole service definition — Compose forbids two service
+  # blocks with the same key, so this couldn't just be a second `trino:`
+  # entry with `ports:` added. The container itself does nothing (`sleep
+  # infinity`); its only job is to hold the `ports:` mapping into the
+  # namespace it shares with `trino`. CHANGE ME BEFORE ANY NON-LOCAL
+  # DEPLOYMENT: publishing this at all re-opens the unauthenticated-access
+  # finding this fix addresses — only set `TRINO_PUBLISH_HOST_PORT=trino`
+  # on a host you trust every network-adjacent actor on.
+  trino-host-port:
+    profiles: ["${TRINO_PUBLISH_HOST_PORT:-trino-host-port-disabled}"]
+    image: alpine:3.20
+    network_mode: "service:trino"
+    depends_on:
+      trino:
+        condition: service_healthy
+    command: ["sleep", "infinity"]
     ports:
       # 8091, not 8090: `oidc-mock` (always-on, not profile-gated) already
       # publishes host 8090, so an 8090 default here collides the moment the
@@ -1242,12 +1761,6 @@ services:
       # a full deployment does. The clash never surfaced during the build
       # because `trino` was only ever exercised on its own.
       - "${TRINO_HOST_PORT:-8091}:8080"
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/v1/info"]
-      interval: 10s
-      timeout: 5s
-      retries: 20
-      start_period: 20s
     restart: unless-stopped
 
   # P4 (G3) — the cron loop itself (`ops/trino/optimize_bronze.sh`):
@@ -1348,7 +1861,15 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
     volumes:
       - lakehouse_debezium_data:/debezium/data
-      - lakehouse_oidc_tokens:/tokens:ro
+      # PR #33 review, should-fix: single-file subpath mount — this
+      # service only reads `debezium.jwt` (interpolated into
+      # debezium.sink.iceberg.token below).
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/debezium.jwt
+        volume:
+          subpath: debezium.jwt
+        read_only: true
     # Same reason `trino`'s command renders its catalog properties inline:
     # the base image has no templating tool, so `sh` interpolates this
     # container's own `environment:` values directly. `$$` stops compose's
@@ -1462,6 +1983,7 @@ volumes:
   lakehouse_clickhouse_data:
   lakehouse_rustfs_data:
   lakehouse_seaweedfs_data:
+  lakehouse_seaweedfs_iam:
   lakehouse_g1_cargo_registry:
   lakehouse_g1_target:
   lakehouse_debezium_data:

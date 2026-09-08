@@ -54,6 +54,7 @@ use parquet::file::properties::WriterProperties;
 use thiserror::Error;
 
 use crate::bronze;
+use crate::gold;
 use crate::storage::ObjectStoreS3StorageFactory;
 
 /// Iceberg REST catalog property that requests vended storage credentials
@@ -273,6 +274,108 @@ impl IcebergClient {
         Ok(BronzeTable { table })
     }
 
+    /// Ensures the flat `gold` namespace (ADR 0010) exists, creating it if
+    /// not. Idempotent, same shape as [`Self::ensure_bronze_namespace`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IcebergError::Catalog`] for any failure other than the
+    /// namespace already existing.
+    pub async fn ensure_gold_namespace(&self) -> Result<NamespaceIdent, IcebergError> {
+        let namespace = gold::gold_namespace().map_err(|e| IcebergError::Bronze(e.to_string()))?;
+        if self.catalog.namespace_exists(&namespace).await? {
+            return Ok(namespace);
+        }
+        match self
+            .catalog
+            .create_namespace(&namespace, HashMap::new())
+            .await
+        {
+            Ok(_) => Ok(namespace),
+            Err(err)
+                if self
+                    .catalog
+                    .namespace_exists(&namespace)
+                    .await
+                    .unwrap_or(false) =>
+            {
+                let _ = err;
+                Ok(namespace)
+            }
+            Err(err) => Err(IcebergError::from(err)),
+        }
+    }
+
+    /// Creates a Gold export table named `mart_name` (sanitized per
+    /// `gold::sanitize_mart_name`) in the `gold` namespace (ADR 0010), with
+    /// `domain_fields` plus the standard `_exported_at` column, partitioned
+    /// by `day(_exported_at)`, **always at Iceberg format-version 2**.
+    /// Fails if the table already exists — use [`Self::load_gold_table`]
+    /// for idempotent create-or-load.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IcebergError::Bronze`] if the name/schema/partition spec
+    /// cannot be constructed, or [`IcebergError::Catalog`] if the catalog
+    /// call fails (including `TableAlreadyExists`).
+    pub async fn create_gold_table(
+        &self,
+        mart_name: &str,
+        domain_fields: Vec<NestedField>,
+    ) -> Result<GoldTable, IcebergError> {
+        let namespace = self.ensure_gold_namespace().await?;
+        let sanitized =
+            gold::sanitize_mart_name(mart_name).map_err(|e| IcebergError::Bronze(e.to_string()))?;
+        let schema =
+            gold::gold_schema(domain_fields).map_err(|e| IcebergError::Bronze(e.to_string()))?;
+        let partition_spec = gold::export_day_partition_spec(&schema)
+            .map_err(|e| IcebergError::Bronze(e.to_string()))?;
+
+        let creation = TableCreation::builder()
+            .name(sanitized)
+            .schema(schema)
+            .partition_spec(partition_spec)
+            .format_version(FormatVersion::V2)
+            .build();
+
+        let table = self.catalog.create_table(&namespace, creation).await?;
+        Ok(GoldTable { table })
+    }
+
+    /// Loads an existing Gold export table by mart name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IcebergError::Catalog`] if the table does not exist or the
+    /// catalog call fails.
+    pub async fn load_gold_table(&self, mart_name: &str) -> Result<GoldTable, IcebergError> {
+        let namespace = gold::gold_namespace().map_err(|e| IcebergError::Bronze(e.to_string()))?;
+        let sanitized =
+            gold::sanitize_mart_name(mart_name).map_err(|e| IcebergError::Bronze(e.to_string()))?;
+        let ident = TableIdent::new(namespace, sanitized);
+        let table = self.catalog.load_table(&ident).await?;
+        Ok(GoldTable { table })
+    }
+
+    /// Creates the Gold table if it does not already exist, or loads it if
+    /// it does. Every export run after the first hits the `load` branch —
+    /// the schema/partition spec passed here only matters for the table's
+    /// first creation.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::create_gold_table`] and [`Self::load_gold_table`].
+    pub async fn create_or_load_gold_table(
+        &self,
+        mart_name: &str,
+        domain_fields: Vec<NestedField>,
+    ) -> Result<GoldTable, IcebergError> {
+        match self.load_gold_table(mart_name).await {
+            Ok(table) => Ok(table),
+            Err(_) => self.create_gold_table(mart_name, domain_fields).await,
+        }
+    }
+
     /// Borrows the underlying [`Catalog`] — needed because
     /// [`Transaction::commit`] takes `&dyn Catalog`, and [`BronzeTable`]
     /// (deliberately) does not hold a reference back to the client that
@@ -400,6 +503,121 @@ impl BronzeTable {
     /// through Lakekeeper (not path-based) must be readable back through
     /// this crate's `iceberg-rust`-backed client, over the same
     /// `object_store` `Storage` implementation this crate uses for writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IcebergError::Write`] if the scan cannot be built or the
+    /// underlying Parquet/Arrow read fails.
+    pub async fn read_all(&self) -> Result<Vec<RecordBatch>, IcebergError> {
+        let scan = self
+            .table
+            .scan()
+            .build()
+            .map_err(|e| IcebergError::Write(e.to_string()))?;
+        let stream = scan
+            .to_arrow()
+            .await
+            .map_err(|e| IcebergError::Write(e.to_string()))?;
+        futures::TryStreamExt::try_collect(stream)
+            .await
+            .map_err(|e| IcebergError::Write(e.to_string()))
+    }
+}
+
+/// A loaded or newly-created Gold export table (ADR 0010), ready to
+/// append to.
+///
+/// Same append-only shape as [`BronzeTable`] and for the same reason
+/// (`iceberg-rust` 0.10.x has no `UPDATE`/`DELETE`) — see `gold`'s module
+/// doc comment for what that means for a mart re-exported on a schedule.
+#[derive(Debug)]
+pub struct GoldTable {
+    table: Table,
+}
+
+impl GoldTable {
+    /// The table's fully-qualified identifier.
+    #[must_use]
+    pub fn identifier(&self) -> &TableIdent {
+        self.table.identifier()
+    }
+
+    /// The table's current format version. Always [`FormatVersion::V2`]
+    /// for a table this crate created — see [`IcebergClient::create_gold_table`].
+    #[must_use]
+    pub fn format_version(&self) -> FormatVersion {
+        self.table.metadata().format_version()
+    }
+
+    /// The table's current Iceberg schema. Callers building a
+    /// `RecordBatch` for [`Self::append`] MUST derive their Arrow schema
+    /// from this — see [`BronzeTable::schema`]'s doc comment for why.
+    #[must_use]
+    pub fn schema(&self) -> &iceberg::spec::Schema {
+        self.table.metadata().current_schema()
+    }
+
+    /// Appends `batch` as one new Parquet data file, in one fast-append
+    /// snapshot, committed through `catalog`. Same mechanics as
+    /// [`BronzeTable::append`], partitioned by `day(_exported_at)` instead
+    /// of `day(_ingested_at)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IcebergError::Write`] if writing the Parquet data file
+    /// fails, or [`IcebergError::Catalog`] if the commit fails.
+    pub async fn append(
+        &mut self,
+        catalog: &dyn Catalog,
+        batch: RecordBatch,
+    ) -> Result<(), IcebergError> {
+        let metadata = self.table.metadata();
+        let location_generator = DefaultLocationGenerator::new(metadata)
+            .map_err(|e| IcebergError::Write(e.to_string()))?;
+        let file_name_generator = DefaultFileNameGenerator::new(
+            "gold".to_owned(),
+            Some(uuid::Uuid::new_v4().to_string()),
+            DataFileFormat::Parquet,
+        );
+
+        let parquet_writer_builder = ParquetWriterBuilder::new(
+            WriterProperties::builder().build(),
+            metadata.current_schema().clone(),
+        );
+        let rolling_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+            parquet_writer_builder,
+            self.table.file_io().clone(),
+            location_generator,
+            file_name_generator,
+        );
+        let data_file_writer_builder = DataFileWriterBuilder::new(rolling_writer_builder);
+        let partition_key = gold::partition_key_for(metadata, &batch)
+            .map_err(|e| IcebergError::Bronze(e.to_string()))?;
+        let mut writer: data_file_writer::DataFileWriter<_, _, _> = data_file_writer_builder
+            .build(Some(partition_key))
+            .await
+            .map_err(|e| IcebergError::Write(e.to_string()))?;
+
+        writer
+            .write(batch)
+            .await
+            .map_err(|e| IcebergError::Write(e.to_string()))?;
+        let data_files = writer
+            .close()
+            .await
+            .map_err(|e| IcebergError::Write(e.to_string()))?;
+
+        let txn = Transaction::new(&self.table);
+        let action = txn.fast_append().add_data_files(data_files);
+        let txn = action.apply(txn).map_err(IcebergError::from)?;
+        self.table = txn.commit(catalog).await.map_err(IcebergError::from)?;
+
+        Ok(())
+    }
+
+    /// Reads every row currently visible in the table's latest snapshot —
+    /// used to prove the Gold export round trip: rows this crate appended
+    /// through Lakekeeper must be readable back through `iceberg-rust`.
     ///
     /// # Errors
     ///

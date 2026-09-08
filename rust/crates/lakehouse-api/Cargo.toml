@@ -24,9 +24,24 @@ lakehouse-embed = { path = "../lakehouse-embed" }
 lakehouse-llm = { path = "../lakehouse-llm" }
 lakehouse-store = { path = "../lakehouse-store" }
 lakehouse-auth = { path = "../lakehouse-auth" }
+# ADR 0010 — Gold export to Iceberg happens in Rust: `routes::gold` (and
+# `gold_export`, the ClickHouse-read -> Arrow -> Iceberg-append glue) is
+# the first real caller of this crate. See the crate's own doc comment,
+# which used to say nothing in the workspace depended on it.
+lakehouse-iceberg = { path = "../lakehouse-iceberg" }
+# Same exact pin `lakehouse-iceberg` uses (see that crate's Cargo.toml
+# comment on why `=0.10.1`, not `0.10`) — needed directly here for
+# `iceberg::spec` types and `iceberg::arrow::schema_to_arrow_schema`,
+# which `lakehouse-iceberg` does not re-export.
+iceberg = "=0.10.1"
 rand = { workspace = true }
 axum = { workspace = true }
-tokio = { workspace = true }
+# `sync` (Mutex/OnceCell/Barrier): explicit here, not left to incidental
+# workspace feature unification, because `gold_lock::MartLocks`
+# (`tokio::sync::Mutex`/`OwnedMutexGuard`) and its tests
+# (`tokio::sync::Barrier`) need it directly, and this crate should compile
+# correctly on its own, not only as part of the whole-workspace build.
+tokio = { workspace = true, features = ["sync"] }
 tower = { workspace = true }
 tower-http = { workspace = true }
 reqwest = { workspace = true }
@@ -36,16 +51,22 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-time = { workspace = true }
+time = { workspace = true, features = ["macros"] }
 uuid = { workspace = true }
 sqlx = { workspace = true }
 # `connector_probe`'s real S3-compatible connectivity test — same crate,
 # same version, and the same `aws` feature `lakehouse-iceberg` already uses
-# for RustFS. Not a `lakehouse-iceberg` dependency: that crate's Iceberg
-# `Storage`/catalog machinery is unrelated to a cheap "can this build reach
-# this bucket" probe, and `lakehouse-api` does not otherwise depend on
-# `lakehouse-iceberg` (P6 doesn't wire routes to it).
+# for RustFS. Kept as its own direct dependency (not routed through
+# `lakehouse-iceberg`) because that crate's Iceberg `Storage`/catalog
+# machinery is unrelated to a cheap "can this build reach this bucket"
+# probe — `connector_probe` never touches a table or a catalog.
 object_store = { version = "0.14", features = ["aws"] }
+# Building the Arrow `RecordBatch`es `lakehouse-iceberg::GoldTable::append`
+# writes from `ClickHouse` `FORMAT JSON` rows (`gold_export`). Same
+# versions `lakehouse-iceberg` pins, so an Arrow upgrade only ever needs to
+# happen in one place at a time.
+arrow-array = "58"
+arrow-schema = "58"
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

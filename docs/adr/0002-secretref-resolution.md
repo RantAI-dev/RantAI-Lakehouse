@@ -180,6 +180,9 @@ one.** Concretely:
   `0022_prune_connector_seed.sql`'s two dialable seeded connectors use).
   `connector_probe::probe` is handed this resolver, never the general
   `EnvSecretResolver` any other part of the process might use.
+  **This allowlist was itself corrected six days later — see the second
+  addendum below; do not copy these three ref names as the current
+  state.**
 - The allowlist is a hardcoded Rust constant, not derived from
   configuration or a database row: widening it is a deliberate code
   change subject to review, not something a `connector:manage` principal
@@ -224,3 +227,91 @@ the allowlist, and is refused, not silently resolved),
 `connector_probe`'s use of the scoped resolver via its existing
 credential-resolution tests (unchanged: they already exercise `env:`
 lookups through whatever resolver `probe` is handed).
+
+## Addendum 2 (P6 hardening, continued): the allowlist still named the API's own secrets
+
+**Status:** Accepted
+**Date:** 2026-09-07
+
+### Context
+
+The addendum above closed the "any process secret" hole but did not close
+the one that mattered most: `CONNECTOR_ALLOWED_SECRET_REFS` named
+`env:POSTGRES_PASSWORD` (`lakehouse-api`'s own database password) and
+`env:RUSTFS_ACCESS_KEY`/`env:RUSTFS_SECRET_KEY` (RustFS's own ROOT keys) —
+because those were exactly the refs the seeded connectors
+(`0022_prune_connector_seed.sql`) happened to use. Restricting the
+resolver to those three names stopped a `connector:manage` principal from
+naming an *arbitrary* secret, but did nothing to stop them naming *these*
+three: `POST /api/connectors` still accepts a caller-chosen `host`, and
+`connector_probe`'s SSRF guard still blocks only INTERNAL address ranges.
+A `connector:manage` principal could create a connector with
+`secretRef: "env:POSTGRES_PASSWORD"` and `host` pointing at infrastructure
+they control, press "Test", and have this service authenticate to their
+host with the console's real database password (or, for the S3 pair,
+RustFS's real root keys). Allowlisting by name is only as safe as the
+names on the list — and the list named the API's own credentials.
+
+### Decision
+
+**The allowlist must never name a secret the API's own process depends
+on.** Concretely:
+
+- The seeded connectors were re-pointed at connector-dedicated secret
+  names — `env:CONNECTOR_PG_PASSWORD`, `env:CONNECTOR_S3_ACCESS_KEY`,
+  `env:CONNECTOR_S3_SECRET_KEY` — via
+  `0023_connector_dedicated_secret_refs.sql`, a targeted `UPDATE` keyed on
+  the exact old value (so a deployment that already re-pointed these by
+  hand keeps its own value rather than having it silently overwritten).
+- `CONNECTOR_ALLOWED_SECRET_REFS` now lists exactly those three dedicated
+  names, not the API's own `POSTGRES_PASSWORD`/`RUSTFS_*` variables.
+- A deployment MAY set `CONNECTOR_PG_PASSWORD`/`CONNECTOR_S3_ACCESS_KEY`/
+  `CONNECTOR_S3_SECRET_KEY` equal to the very same values as
+  `POSTGRES_PASSWORD`/`RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` — the local
+  compose stack's `.env.example` does exactly that. What changed is not
+  that the values must differ; it is that they are reachable by a
+  *different name*, so the API's own secrets are no longer reachable by
+  name through a connector at all, regardless of what value an operator
+  happens to choose for either side.
+- A new regression test, `allowlist_never_names_the_apis_own_secrets`
+  (`lakehouse-api::routes::connectors`), fails the build if the allowlist
+  ever again contains one of the API's own secret names (`POSTGRES_*`,
+  `RUSTFS_*`, `DATABASE_URL`, `CH_PASSWORD`, ...) — turning this class of
+  regression into a compile-time-adjacent check rather than something only
+  a future code review might catch.
+
+This does not reopen or revisit Addendum 1's core decision
+(`AllowlistedSecretResolver`, rejecting refs outside an explicit set
+before ever consulting the inner resolver) — that mechanism is sound and
+unchanged. What was wrong was the *membership* of the set, not the
+enforcement of it.
+
+### Consequences
+
+- `lakehouse_api::state::CONNECTOR_ALLOWED_SECRET_REFS` is
+  `["env:CONNECTOR_PG_PASSWORD", "env:CONNECTOR_S3_ACCESS_KEY",
+  "env:CONNECTOR_S3_SECRET_KEY"]` — see that constant's doc comment for the
+  restated attack path.
+- `.env.example` documents `CONNECTOR_PG_PASSWORD`/`CONNECTOR_S3_ACCESS_KEY`/
+  `CONNECTOR_S3_SECRET_KEY` as the seeded connectors' dedicated credentials,
+  defaulting to the same values as `POSTGRES_PASSWORD`/`RUSTFS_ACCESS_KEY`/
+  `RUSTFS_SECRET_KEY` for the local stack, with guidance to use
+  least-privilege values in a real deployment.
+- **Operator guidance, added to Addendum 1's litmus test:** it is not
+  enough that a caller-controlled destination goes through
+  `AllowlistedSecretResolver` — the allowlist itself must never contain a
+  ref that also names a secret the API's own process authenticates with
+  (its database password, its object-store root keys, `DATABASE_URL`,
+  `CH_PASSWORD`, `OIDC_CLIENT_SECRET`, ...). If a new allowlisted use case
+  needs a real credential, mint or provision a dedicated one under a
+  dedicated name, even if it is set to the same value in a given
+  deployment's environment.
+
+### Verification
+
+`cargo test -p lakehouse-api` — `routes::connectors::tests` adds
+`allowlist_never_names_the_apis_own_secrets`, which asserts none of
+`CONNECTOR_ALLOWED_SECRET_REFS` matches a fixed list of the API's own
+secret-bearing env var names. The existing
+`reject_allowlisted_secret_ref` tests continue to cover that a
+user-created connector cannot name any allowlisted ref (padded or not).

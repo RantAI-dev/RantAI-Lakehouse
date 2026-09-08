@@ -82,6 +82,17 @@ PRINCIPALS = [
     "dlt",
     "clickhouse-reader",
     "trino",
+    # ADR 0010 — Gold export to Iceberg from Rust: `lakehouse-api`'s
+    # `routes::gold` reads a Gold mart from ClickHouse and appends it to
+    # the `gold` Iceberg namespace through Lakekeeper, the same
+    # write/read-back shape `rust-iceberg` already proves for Bronze in
+    # G1. A separate principal (not a reuse of `rust-iceberg`) so this
+    # identity is independently auditable/revocable even though ADR
+    # 0011's grants are warehouse-scoped (not per-namespace) — the same
+    # identity-separation rationale ADR 0011 gives for keeping
+    # `rust-iceberg`/`debezium`/`dlt` as three principals instead of one,
+    # despite all three holding the same relation set today.
+    "gold-export",
     "unauthorized-test",
 ]
 
