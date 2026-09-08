@@ -6,6 +6,8 @@ import type {
   AuditEvent,
   ClassificationRule,
   ResidencyRule,
+  MaintenanceRun,
+  ReplicationSlot,
   CreatePolicyInput,
   CreateQualityRuleInput,
   CreateClassificationRuleInput,
@@ -72,6 +74,15 @@ export const clickhouseGovernanceService: GovernanceService = {
   },
   async getLineage(focusId, signal) {
     return get<LineageGraph>(`/api/governance/lineage?focus=${encodeURIComponent(focusId)}`, signal);
+  },
+  // P6: Bronze maintenance (P4) and CDC replication-slot health (P5),
+  // surfaced through the same `bronze_meta.*`-backed governance endpoints
+  // the Rust side already exposes — no new backend route added here.
+  async listMaintenanceRuns(signal) {
+    return (await get<{ maintenance: MaintenanceRun[] }>("/api/governance/maintenance", signal)).maintenance;
+  },
+  async listReplicationSlots(signal) {
+    return (await get<{ replicationSlots: ReplicationSlot[] }>("/api/governance/replication", signal)).replicationSlots;
   },
 
   // ── Postgres (authored config) ──────────────────────────────────────────

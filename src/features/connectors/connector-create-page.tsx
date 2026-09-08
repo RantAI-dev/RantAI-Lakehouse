@@ -23,7 +23,7 @@ const STEPS: FormStep[] = [
   { id: "review", label: "Review", description: "Confirm" },
 ]
 
-const TYPES = ["PostgreSQL CDC", "Kafka", "Object storage", "SaaS REST", "JDBC"]
+const TYPES = ["PostgreSQL CDC", "Object storage", "SaaS REST", "JDBC"]
 const CAPABILITIES = ["CDC", "schema discovery", "checkpoint", "consume", "produce", "list", "read"]
 
 export function ConnectorCreatePage() {

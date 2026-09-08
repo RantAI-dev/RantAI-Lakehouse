@@ -415,6 +415,23 @@ pub async fn lineage(State(state): State<AppState>, Query(q): Query<LineageQuery
     }
 }
 
+/// Does this `ClickHouse` server error mean the database or table simply is
+/// not there?
+///
+/// `ChError::Server` carries the raw `ClickHouse` error body verbatim with no
+/// structured code, so this matches on it. Both the numeric code and the
+/// symbolic name are required: the codes alone (60, 81) appear in unrelated
+/// text, and matching the name alone would fire on a query that merely
+/// mentioned it. `ClickHouse` formats these as, e.g.
+///
+/// ```text
+/// Code: 81. DB::Exception: Database _silver_meta does not exist. (UNKNOWN_DATABASE)
+/// ```
+fn missing_ch_object(msg: &str) -> bool {
+    (msg.contains("Code: 81") && msg.contains("UNKNOWN_DATABASE"))
+        || (msg.contains("Code: 60") && msg.contains("UNKNOWN_TABLE"))
+}
+
 async fn lineage_body(ch: &ChClient, focus: &str) -> Result<Value, ChError> {
     let escaped_focus = SqlLiteral::from(focus);
     let meta_sql = format!(
@@ -434,7 +451,23 @@ async fn lineage_body(ch: &ChClient, focus: &str) -> Result<Value, ChError> {
     let cols_sql = format!(
         "SELECT kolom, tipe FROM _silver_meta.kolom_tipe WHERE tabel={escaped_table} LIMIT 200"
     );
-    let cols = ch.rows(&cols_sql, None).await?;
+    // Column mappings are ENRICHMENT: `nodes` and `edges` below — the lineage
+    // graph itself, and the only thing the console needs to draw it — are
+    // built entirely from `bronze_meta.dataset_catalog` above. `_silver_meta`
+    // is a legacy Silver-layer database that the lakehouse compose stack does
+    // not create, so propagating this error meant `GET /api/governance/lineage`
+    // returned 503 with empty nodes/edges for EVERY dataset there — the whole
+    // lineage surface dark because an optional detail table was absent.
+    //
+    // Narrow on purpose: only a missing database/table degrades to "no column
+    // detail". A connection failure, a permission error, or a malformed query
+    // still propagates, because those mean the answer is unknown rather than
+    // legitimately empty.
+    let cols = match ch.rows(&cols_sql, None).await {
+        Ok(rows) => rows,
+        Err(ChError::Server(msg)) if missing_ch_object(&msg) => Vec::new(),
+        Err(err) => return Err(err),
+    };
 
     let src_label = if sekunder {
         "Sumber sekunder (olahan)"
@@ -787,5 +820,40 @@ mod tests {
     #[test]
     fn ch_bool_is_false_for_a_missing_column() {
         assert!(!ch_bool(&serde_json::Map::new(), "active"));
+    }
+
+    #[test]
+    fn missing_ch_object_recognizes_absent_database_and_table() {
+        // Verbatim from the G3a failure this was written for.
+        assert!(missing_ch_object(
+            "Code: 81. DB::Exception: Database _silver_meta does not exist. \
+             (UNKNOWN_DATABASE) (version 26.8.2.7 (official build))"
+        ));
+        assert!(missing_ch_object(
+            "Code: 60. DB::Exception: Table _silver_meta.kolom_tipe does not exist. \
+             (UNKNOWN_TABLE) (version 26.8.2.7 (official build))"
+        ));
+    }
+
+    #[test]
+    fn missing_ch_object_does_not_swallow_other_failures() {
+        // These mean "the answer is unknown", not "legitimately empty", so
+        // lineage must still fail loudly rather than report no columns.
+        assert!(!missing_ch_object(
+            "Code: 497. DB::Exception: user is not allowed to SELECT. (ACCESS_DENIED)"
+        ));
+        assert!(!missing_ch_object(
+            "Code: 62. DB::Exception: Syntax error: failed at position 8. (SYNTAX_ERROR)"
+        ));
+        assert!(!missing_ch_object("fetch failed"));
+        // Code without the symbolic name, and name without the code: neither
+        // is conclusive on its own, since both forms show up in unrelated
+        // message text.
+        assert!(!missing_ch_object(
+            "Code: 81. DB::Exception: something else entirely"
+        ));
+        assert!(!missing_ch_object(
+            "query mentioning UNKNOWN_DATABASE in passing"
+        ));
     }
 }

@@ -39,10 +39,17 @@ flowchart LR
         API["lakehouse-api (axum)"]
     end
 
-    Postgres[("Postgres\n(OLTP: identity, governance,\npipelines, connectors, ...)")]
-    ClickHouse[("ClickHouse\n(analytics: serving.* marts,\ncatalog, lineage, BI)")]
-    Dagster["Dagster\n(orchestration)"]
+    Postgres[("Postgres\n(OLTP: identity, governance,\npipelines, connectors, ...\nalso the CDC source, wal_level=logical)")]
+    ClickHouse[("ClickHouse 26.3\n(analytics: serving.* marts,\ncatalog, lineage, BI;\nalso reads Bronze via DataLakeCatalog)")]
+    Dagster["Dagster\n(orchestration, opt-in profile:\nbatch ingest + Bronze maintenance)"]
     LLM["LLM\n(OpenAI-compatible)"]
+
+    subgraph Lakehouse["Lakehouse layer (P1-P5)"]
+        Lakekeeper["Lakekeeper\n(Iceberg REST catalog)"]
+        RustFS[("RustFS / SeaweedFS\n(S3-compatible object store)")]
+        Debezium["Debezium Server\n(CDC, opt-in profile)"]
+        Trino["Trino-as-cron\n(Bronze compaction only,\nopt-in profile, ADR 0009)"]
+    end
 
     Browser --> UI
     UI --> Rewrite
@@ -51,12 +58,27 @@ flowchart LR
     API --> ClickHouse
     API --> Dagster
     API --> LLM
+    Dagster --> Lakekeeper
+    Debezium --> Lakekeeper
+    Debezium --> Postgres
+    Lakekeeper --> RustFS
+    ClickHouse -. reads Bronze via .-> Lakekeeper
+    Trino -. compacts Bronze via .-> Lakekeeper
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full module map (11
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full module map (13
 Rust crates), the request lifecycle (browser → rewrite → axum middleware →
 policy check → handler → store/client), and the Postgres-vs-ClickHouse data
 model.
+
+The lakehouse layer (Lakekeeper, RustFS/SeaweedFS, Debezium, Trino) is real
+infrastructure, verified end to end (see `docs/plans/G1-RESULT.md` through
+`docs/plans/P5-RESULT.md`), but is compose-profile opt-in (`dagster`,
+`trino`) and is not yet called from any `lakehouse-api` route — no route
+uses the `lakehouse-iceberg` crate as of P6. The console reads Bronze
+through ClickHouse's `DataLakeCatalog`/the `bronze_meta.*` registry, not
+through `lakehouse-iceberg` directly. See "Status / Known limitations"
+below for the specific defects this surfaced on ClickHouse 26.3.
 
 ## Quickstart
 
@@ -261,18 +283,76 @@ uses:
 | `RUSTFS_ACCESS_KEY_SECRET_REF` | `secretRef` for a static RustFS/S3 access key, used only as a fallback outside the vended-credentials write path (see `lakehouse-iceberg`'s crate doc) | unset | No |
 | `RUSTFS_SECRET_KEY_SECRET_REF` | `secretRef` for the matching static secret key | unset | No |
 
+A further batch of compose-only variables were added in P2–P5 for
+SeaweedFS (the P2 storage-compatibility target, matrix-profile only),
+Trino (the P4 small-file-compaction escape hatch, ADR 0009), and Debezium
+Server (P5 CDC). None of these are read by `config.rs` — they configure the
+containers themselves, and (for Trino/Debezium) are only relevant behind
+their opt-in compose profiles:
+
+| Variable | Purpose | Default | Required? |
+| --- | --- | --- | --- |
+| `SEAWEEDFS_ACCESS_KEY` | SeaweedFS S3 API access key | `seaweedfsadmin` (public, well-known) | No, but override before exposing SeaweedFS beyond localhost |
+| `SEAWEEDFS_SECRET_KEY` | SeaweedFS S3 API secret key | `seaweedfsadmin` (public, well-known) | No, but override before exposing SeaweedFS beyond localhost |
+| `TRINO_HOST_PORT` | Host port mapped to Trino's coordinator UI/API (`trino` profile). Not `8090` — `oidc-mock` already publishes that, and the two collide when the `trino` profile runs alongside the base stack | `8091` | No |
+| `TRINO_CRON_INTERVAL_SECONDS` | How often `trino-maintenance-cron` runs `ALTER TABLE ... EXECUTE optimize` against every Bronze table (`trino` profile) | `21600` (6h) | No |
+
+Debezium Server's image (`ghcr.io/memiiso/debezium-server-iceberg`) is
+pinned by digest in `docker-compose.yml`, not by an env var — see the
+service definition's comment and R4 in the risk register for why (no
+versioned tag is published upstream). Its config
+(`ops/debezium/application.properties.tmpl`) is rendered from the
+connector-registry (ADR 0007), not from top-level env vars.
+
 ## Status / Known limitations
 
 This is a young, honestly-scoped project. Please read this before filing an
 issue about any of the following — they're known, not bugs:
 
-- **`streaming` is mocked.** There is no Kafka/Redpanda/Pulsar/Flink
-  anywhere in this project. The streaming domain in the UI is backed by
-  `src/services/mock/streaming.ts`.
+- **There is no streaming surface.** There is no Kafka/Redpanda/Pulsar/Flink
+  anywhere in this project. The console previously had a mocked
+  `streaming` domain fabricating lag/throughput/checkpoint numbers; it has
+  been removed rather than kept as a mock. **CDC (Debezium, P5) is not a
+  streaming engine** and is not relabeled as one — it's a
+  change-data-capture pipe from Postgres into Bronze Iceberg, surfaced
+  instead under Governance → "Ingestion (CDC)".
 - **`knowledge.search` is mocked.** There is no vector store or embeddings
   API wired up. Knowledge *sources* and *vector jobs* ARE real, backed by
   Postgres (`lakehouse-store::knowledge`) — only the search-query path
   itself is mocked.
+- **ClickHouse cannot write Iceberg through the catalog on 26.3.**
+  `CREATE TABLE` inside a `DataLakeCatalog` database never reaches
+  Lakekeeper (falls back to `MergeTree`, `Code: 79`); `INSERT` into a
+  **partitioned** catalog-registered table **segfaults the server**
+  (signal 11 in `IcebergStorageSink::consume`); `INSERT` into an
+  unpartitioned one fails cleanly (`Code: 1000`). Bronze ingestion
+  (Debezium/dlt/Rust → Iceberg → ClickHouse reads) is unaffected — only
+  ClickHouse-*originated* writes are. Gold export was moved to Rust as a
+  result (ADR 0010). See `docs/plans/G1-RESULT.md`.
+- **`remove_orphan_files` does not exist for Iceberg tables, and `OPTIMIZE`
+  fails at runtime with an HTTP 403 on a catalog-registered Iceberg
+  table.** Of the maintenance chain the plan assumed, only
+  `expire_snapshots` actually works on ClickHouse 26.3 — it does not
+  compact small data files. Small-file compaction on Bronze runs
+  out-of-band via a Trino-as-cron container instead (`trino` compose
+  profile, ADR 0009); a deployment that never enables that profile
+  accumulates small Bronze files unbounded. See `docs/plans/G3-RESULT.md`.
+- **A bare `count()` overcounts on CDC-fed Bronze tables.** On ClickHouse
+  26.3, `SELECT count()` / `count(*)` / `count(<col>)` against a Bronze
+  Iceberg table with merge-on-read equality deletes (i.e. any
+  Debezium-fed table) takes a metadata-only fast path that does not
+  subtract deleted rows — measured returning 6 where 4 was correct. Any
+  `WHERE` or `GROUP BY` forces the correct row-scan path. This is a
+  silent wrong answer, not an error; no code added in this repository
+  emits a bare `count()` against a Bronze Iceberg table (R11). See
+  `docs/plans/P5-RESULT.md`.
+- **Lakekeeper authorization is not enabled — R1 is not retired.**
+  Lakekeeper runs with `authz-backend: "allow-all"`; anyone who can reach
+  its REST API can read/write any warehouse it manages. Enabling real
+  authorization (OpenFGA or the OPA bridge, plus an authorization model
+  and grants for every existing writer — Rust, dlt, Debezium, the G1/G3a/
+  G4 test runners) is scoped but not built; see `docs/plans/P5-REPORT.md`
+  for the concrete step-by-step estimate of what remains.
 - **`getWorkspaceSettings` returns a fixed response.** The contract has no
   setter; workspace settings are not actually persisted or configurable
   yet.

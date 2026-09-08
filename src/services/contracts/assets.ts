@@ -11,7 +11,6 @@ export type AssetType =
   | "table"
   | "view"
   | "iceberg-table"
-  | "streaming-view"
   | "vector-dataset"
   | "external-source"
   | "knowledge-source"
@@ -20,7 +19,6 @@ export const ASSET_TYPE_LABEL: Record<AssetType, string> = {
   table: "Table",
   view: "View",
   "iceberg-table": "Open table",
-  "streaming-view": "Streaming view",
   "vector-dataset": "Vector dataset",
   "external-source": "External source",
   "knowledge-source": "Knowledge source",

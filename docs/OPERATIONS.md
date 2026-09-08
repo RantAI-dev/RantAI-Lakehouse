@@ -52,13 +52,19 @@ Postgres) get a real chance to run instead of racing container startup.
 This is a start-order convenience, not a hard runtime dependency — see
 "Postgres-down is quiet," below.
 
-`rustfs`, `lakekeeper`, and their bootstrap jobs are **not yet wired into
-`lakehouse-api`** — that lands in P1b with the `lakehouse-iceberg` crate.
-In this phase they exist purely as verified infrastructure: the warehouse
-bucket exists in RustFS (verified via the S3 API), and Lakekeeper answers
-its Iceberg REST config endpoint with its schema applied in its own
-Postgres database. Neither failing affects `lakehouse-api`'s own boot or
-its existing Postgres/ClickHouse-backed routes in this phase.
+`rustfs`, `lakekeeper`, and their bootstrap jobs are **still not called
+from any `lakehouse-api` route as of P6** — see the module map in
+`docs/ARCHITECTURE.md`. The console surfaces Bronze by reading
+`bronze_meta.*`/ClickHouse's `DataLakeCatalog`, not `lakehouse-iceberg`
+directly. Neither RustFS nor Lakekeeper failing affects `lakehouse-api`'s
+own boot or its Postgres/ClickHouse-backed routes.
+
+`g1-test-runner`, `g3a-test-runner`, `g3-maintenance-test-runner`, and
+`g4-test-runner` (plus their one-shot `*-source-init` companions) are CI
+gate harnesses, not part of the running product — each proves one gate
+(G1/G3a/G3/G4) from a clean stack and is invoked explicitly by name (`docker
+compose run --rm <name>`), never by a plain `docker compose up`. See
+`docs/plans/*-RESULT.md` for what each gate measured.
 
 ### ClickHouse 24.8 → 26.3: what changed and what was verified
 
@@ -114,6 +120,73 @@ snapshot, list tables) and any ClickHouse `DataLakeCatalog` database
 pointed at it fail closed. It does not affect `lakehouse-api`'s own boot
 or its existing Postgres/ClickHouse-backed routes, which have no
 dependency on Lakekeeper in this phase.
+
+### SeaweedFS (opt-in, P2 — storage-compatibility matrix only)
+
+`seaweedfs`, `seaweedfs-bucket-init`, and
+`lakekeeper-warehouse-init-seaweedfs` are the P2 proof that the RustFS
+dependency is a genuine boundary, not an assumption: the exact same G1
+integration suite runs against SeaweedFS by env/config change only, no
+code diff (`docs/STORAGE-COMPATIBILITY.md`). None of these three services
+start on a plain `docker compose up` — they exist purely so the matrix can
+be re-run; RustFS remains the default target for every other profile
+(`dagster`, `trino`). **Failure mode:** if SeaweedFS is down while its
+services are the active target, the same failure shape as RustFS applies —
+`seaweedfs-bucket-init` fails to create the warehouse bucket, and any
+Iceberg client pointed at it (currently only the G2 test runner; no
+`lakehouse-api` route uses either object store directly as of P6) gets
+connection errors from `object_store`. It does not affect
+`lakehouse-api`'s own boot.
+
+### Trino-as-cron (opt-in, `trino` profile — P4, ADR 0009)
+
+`trino` (a single-node coordinator with exactly one catalog, `iceberg`,
+pointed at the same Lakekeeper/RustFS-or-SeaweedFS backend every other
+Bronze consumer uses) and `trino-maintenance-cron` (a loop running `ALTER
+TABLE iceberg.bronze."<table>" EXECUTE optimize` against every Bronze table
+on a `TRINO_CRON_INTERVAL_SECONDS` cadence, default 6h). Added because
+measurement showed **zero working in-engine small-file compaction exists
+on ClickHouse 26.3** — `remove_orphan_files` doesn't exist for Iceberg
+tables and `OPTIMIZE` fails at runtime with an HTTP 403 against a
+catalog-registered table (`docs/plans/G3-RESULT.md`). Neither service
+starts on a plain `docker compose up`; both are behind the `trino` profile,
+matching every other opt-in profile in this stack (`dagster`, `seaweedfs`).
+**Failure mode:** if `trino`/`trino-maintenance-cron` are down (or the
+`trino` profile is simply never enabled), Bronze small-file compaction does
+not happen at all — files accumulate unbounded from CDC/dlt writes, and
+query planning time over Bronze degrades (measured ~15-20x at a 20-file/
+partition synthetic load vs. a 1-file/partition control). This is a real
+operational requirement, not a nicety, for any deployment taking CDC-rate
+or dlt-batch writes into Bronze at meaningful volume — see ADR 0009. It
+does not affect `lakehouse-api`'s own boot or any of its existing routes;
+`dagster/dispar_orchestrate/maintenance.py`'s `expire_snapshots` chain is
+independent of Trino and keeps running either way (it does not compact
+data files, only aged snapshot/manifest metadata).
+
+### Debezium Server (opt-in, `dagster` profile — P5, CDC)
+
+`debezium-server`, pinned by **digest** (not `:latest` — no versioned tag
+is published upstream for `ghcr.io/memiiso/debezium-server-iceberg`, see R4
+in the risk register). Captures Postgres logical-replication changes
+(initial snapshot, then streaming; ADR 0008) and writes them into Bronze
+Iceberg through the same Lakekeeper REST catalog every other writer uses —
+upsert mode with merge-on-read equality deletes. Config is rendered from
+the connector registry (ADR 0007) into
+`ops/debezium/application.properties.tmpl`, mounted at
+`/debezium/config/application.properties` (this is a Quarkus app, not a
+classic Kafka Connect worker — `conf/` is the wrong path and does not exist
+in the image). Needs `postgres` running with `wal_level=logical` (already
+the compose default, unconditionally, not profile-gated) and a replication
+slot on the source (see `g4-source-init`/`ops/debezium/
+deprovision_connector.sh` for provision/deprovision). **Failure mode:** if
+`debezium-server` is down, CDC simply stops flowing — no new rows land in
+the affected Bronze tables — while its Postgres replication slot keeps
+existing and pinning WAL at its last `restart_lsn` regardless (R5); this is
+exactly why slot-lag/WAL-retention are first-class metrics
+(`dagster/dispar_orchestrate/replication_metrics.py`, surfaced via `GET
+/api/governance/replication`, console page Governance → "Ingestion
+(CDC)") rather than something only discovered when the source disk fills
+up. Does not affect `lakehouse-api`'s own boot.
 
 **DNS gotcha found during verification:** on a host whose own
 `/etc/resolv.conf` carries a DNS search domain (VPN/corporate DNS,

@@ -151,14 +151,12 @@ export const WORKLOAD_CLASS_LABEL: Record<WorkloadClass, string> = {
 export type EngineCategory =
   | "hot-store"
   | "federated-compute"
-  | "streaming"
   | "ai-store"
   | "telemetry-store"
 
 export const ENGINE_CATEGORY_LABEL: Record<EngineCategory, string> = {
   "hot-store": "Hot analytical store",
   "federated-compute": "Federated compute",
-  streaming: "Real-time streaming",
   "ai-store": "AI retrieval store",
   "telemetry-store": "Telemetry store",
 }

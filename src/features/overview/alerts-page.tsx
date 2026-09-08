@@ -115,7 +115,7 @@ export function AlertsPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Alerts"
-        description="Acknowledge and investigate platform incidents across ingestion, streaming, residency, and agents."
+        description="Acknowledge and investigate platform incidents across ingestion, residency, and agents."
       />
       <FilterToolbar>
         <SearchField
