@@ -15,9 +15,10 @@ mod registry;
 mod tools;
 
 use axum::body::Bytes;
-use axum::extract::{Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use lakehouse_auth::Principal;
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ApiError;
 use lakehouse_llm::{ChatOptions, LlmMessage, LlmMessageRole, ToolCall, ToolCallFunction};
@@ -119,13 +120,38 @@ struct ChatBody {
 /// `messages`. A downstream LLM failure is NOT an [`ApiResult`] error path
 /// — it renders its own 503 body directly (see [`chat`]'s body), matching
 /// the `TypeScript`'s single `catch` around the whole loop.
+///
+/// # Absent-principal behaviour (T0.2)
+///
+/// `principal` follows the exact `Option<Extension<Principal>>` pattern
+/// used by `routes::gold::export` and `routes::alerts::run` — it is
+/// populated by the auth middleware whenever a principal was resolved.
+/// `POST /api/ai/chat` is `Policy::RequiresAuth` (`policy.rs`), so in
+/// practice a principal is always present here; the middleware would have
+/// already rejected an unauthenticated request before this handler runs.
+///
+/// Nonetheless `chat` treats `None` deliberately, rather than assuming it
+/// can't happen: [`gate::decide`] (and [`registry::tool_schemas_for`]) is
+/// handed `principal.as_ref().map(|Extension(p)| &p.permissions)`, and an
+/// absent `PermissionSet` is treated as "authenticated, but zero grants" —
+/// fail closed. Every tool whose `permission` is non-empty is refused;
+/// only tools with an empty `permission` (`""`, "authenticated only" — see
+/// [`registry::ToolSpec::permission`]) still run. This mirrors how the
+/// rest of the API treats a policy layer bug or a middleware gap: never
+/// silently grant, always require the narrower of "no principal" and "no
+/// permissions".
 #[allow(
     clippy::too_many_lines,
     reason = "one straight-line port of a single TS handler's iterative \
               tool-calling loop; splitting it up would scatter one \
               sequential loop across helpers with no independent reuse"
 )]
-pub async fn chat(State(state): State<AppState>, body: Bytes) -> Response {
+pub async fn chat(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    body: Bytes,
+) -> Response {
+    let perms = principal.as_ref().map(|Extension(p)| &p.permissions);
     let parsed: ChatBody = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(_) => {
@@ -190,7 +216,7 @@ pub async fn chat(State(state): State<AppState>, body: Bytes) -> Response {
         .tools
         .filter(|t| !t.is_empty())
         .map(|t| t.into_iter().collect());
-    let tools: Vec<Value> = registry::tool_schemas()
+    let tools: Vec<Value> = registry::tool_schemas_for(perms)
         .into_iter()
         .filter(|t| {
             let name = t["function"]["name"].as_str().unwrap_or("");
@@ -255,19 +281,21 @@ pub async fn chat(State(state): State<AppState>, body: Bytes) -> Response {
         for call in &calls {
             let args: Map<String, Value> =
                 serde_json::from_str(&call.function.arguments).unwrap_or_default();
-            // D3: `ask` mode filters non-Read tools out of the schema
+            // D3: `ask` mode filters non-Read tools, and permission
+            // filters tools the principal lacks, out of the schema
             // ADVERTISED to the model (above, building `tools`), but that
             // alone is not enforcement — a `MiniMax` XML `<invoke
             // name="delete_chart">` embedded in model TEXT (parsed by
             // `parse_minimax_tool_calls` regardless of what was advertised)
             // or a hallucinated `tool_calls` entry reaches this dispatch
-            // loop exactly like any legitimate call. Re-check the risk tier
-            // HERE, at the one place execution actually happens
-            // ([`gate::refusal`]), and refuse rather than execute — the
-            // model must see the refusal (not have the call silently
-            // dropped) so it can tell the user instead of assuming a write
+            // loop exactly like any legitimate call. Re-check both the
+            // risk tier AND the permission HERE, at the one place
+            // execution actually happens ([`gate::decide`]), and refuse
+            // rather than execute — the model must see the refusal (not
+            // have the call silently dropped) so it can tell the user
+            // instead of assuming a write (or a read it wasn't allowed)
             // it never got.
-            let result = match gate::refusal(is_build, &call.function.name) {
+            let result = match gate::decide_by_name(is_build, perms, &call.function.name) {
                 Some(refusal) => refusal,
                 None => tools::run_tool(&state, &call.function.name, &args).await,
             };

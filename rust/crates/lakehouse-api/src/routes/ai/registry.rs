@@ -61,16 +61,12 @@ pub struct ToolSpec {
     /// permission (authenticated only); there is nothing narrower to
     /// carry for that tool today.
     ///
-    /// **Not enforced by this task.** Wiring this into the gate so a
-    /// principal can never do more via the copilot than via the console
-    /// is a later task (permission + principal gate); here it is only
-    /// data, carried so that task doesn't have to rediscover it.
-    #[allow(
-        dead_code,
-        reason = "carried now, read by the permission gate landing in T0.2 \
-                  (see the copilot-operations-handover plan); not read by \
-                  any code yet"
-    )]
+    /// Enforced by [`super::gate::decide`] (T0.2 of the
+    /// copilot-operations-handover plan): a principal whose merged
+    /// `PermissionSet` lacks this permission has every call to this tool
+    /// refused at dispatch, regardless of chat mode. Also used, as a pure
+    /// optimisation (dispatch remains the real enforcement), to filter the
+    /// tool list advertised to the model in [`tool_schemas_for`].
     pub permission: &'static str,
 }
 
@@ -348,6 +344,28 @@ pub fn find(name: &str) -> Option<&'static ToolSpec> {
     TOOLS.iter().find(|t| t.name == name)
 }
 
+/// The tool schemas a principal with `perms` should be OFFERED, given
+/// `perms` — an optimisation only, not enforcement: a tool this filters
+/// out is still refused by [`super::gate::decide`] at dispatch if it
+/// somehow reaches `run_tool` anyway (a hallucinated `tool_calls` entry, or
+/// `MiniMax` XML extracted from free text). Unlike [`tool_schemas`], which
+/// is pinned byte-identical to `tests/fixtures/tool_schemas.json` and must
+/// never change, this is a fresh accessor so that snapshot stays untouched.
+///
+/// `perms: None` matches [`super::gate::decide`]'s absent-principal
+/// contract: treated as "authenticated, no grants" — every tool with a
+/// non-empty `permission` is filtered out, every tool with an empty one
+/// (`""`, "authenticated only") is kept.
+#[must_use]
+pub fn tool_schemas_for(perms: Option<&lakehouse_auth::PermissionSet>) -> Vec<Value> {
+    TOOLS
+        .iter()
+        .zip(tool_schemas())
+        .filter(|(t, _)| t.permission.is_empty() || perms.is_some_and(|p| p.has(t.permission)))
+        .map(|(_, schema)| schema)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -426,5 +444,43 @@ mod tests {
     #[test]
     fn find_returns_none_for_unknown_name() {
         assert!(find("not_a_real_tool").is_none());
+    }
+
+    /// `tool_schemas_for` is an optimisation over the same [`TOOLS`] table:
+    /// a Platform Admin (`*:*`) is offered every tool.
+    #[test]
+    fn tool_schemas_for_admin_offers_every_tool() {
+        let perms = lakehouse_auth::PermissionSet::parse("*:*");
+        assert_eq!(tool_schemas_for(Some(&perms)).len(), TOOLS.len());
+    }
+
+    /// An Analyst (`query:read, catalog:read, lineage:read`) is offered
+    /// only the tools with an empty `permission` or one of those three —
+    /// no `dashboard:*` tool.
+    #[test]
+    fn tool_schemas_for_analyst_excludes_dashboard_tools() {
+        let perms = lakehouse_auth::PermissionSet::parse("query:read, catalog:read, lineage:read");
+        let offered = tool_schemas_for(Some(&perms));
+        let offered_names: Vec<&str> = offered
+            .iter()
+            .map(|v| v["function"]["name"].as_str().expect("name"))
+            .collect();
+        assert!(offered_names.contains(&"run_sql"));
+        assert!(offered_names.contains(&"list_datasets"));
+        assert!(offered_names.contains(&"get_lineage"));
+        assert!(!offered_names.contains(&"describe_mart"));
+        assert!(!offered_names.contains(&"create_chart"));
+        assert!(!offered_names.contains(&"list_boards"));
+    }
+
+    /// With no principal at all, only empty-`permission` tools are offered.
+    #[test]
+    fn tool_schemas_for_none_offers_only_empty_permission_tools() {
+        let offered_names: Vec<String> = tool_schemas_for(None)
+            .iter()
+            .map(|v| v["function"]["name"].as_str().expect("name").to_owned())
+            .collect();
+        // Only `get_quality` has an empty `permission` today.
+        assert_eq!(offered_names, vec!["get_quality".to_owned()]);
     }
 }
