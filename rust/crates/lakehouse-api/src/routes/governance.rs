@@ -122,7 +122,7 @@ pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Res
 async fn run(state: &AppState, kind: Kind) -> Result<Value, GovError> {
     match kind {
         Kind::Quality => quality(&state.clickhouse, state.pg.as_deref()).await,
-        Kind::Audit => audit(&state.dagster).await,
+        Kind::Audit => audit(&state.dagster, state.pg.as_deref()).await,
         Kind::Classification => classification(&state.clickhouse, state.pg.as_deref()).await,
         Kind::Residency => residency(state.pg.as_deref()).await,
         Kind::Maintenance => maintenance(&state.clickhouse).await,
@@ -215,9 +215,51 @@ async fn quality(ch: &ChClient, pg: Option<&PgPool>) -> Result<Value, GovError> 
     Ok(json!({ "quality": quality }))
 }
 
-async fn audit(dagster: &DgClient) -> Result<Value, GovError> {
+/// `principal_kind`/`outcome` on `audit_event` are a wider vocabulary than
+/// the TS `ActorKind` (`"user" | "service" | "agent"`) this response's
+/// `actorKind` field is typed as. Map the copilot's `"copilot"` and
+/// `"schedule"` principal kinds onto `"agent"` — the closest existing
+/// meaning — rather than emit a value the frontend type doesn't know,
+/// preserving the existing response shape for existing consumers.
+fn actor_kind_of(principal_kind: Option<&str>) -> &'static str {
+    match principal_kind {
+        Some("user") => "user",
+        Some("service") => "service",
+        // "copilot" and "schedule" are both non-human actors from the
+        // frontend's point of view.
+        _ => "agent",
+    }
+}
+
+/// Same narrowing for `outcome`: `audit_event.outcome` has eight values,
+/// the TS `AuditOutcome` union has three (`"success" | "denied" |
+/// "error"`). `needs_confirmation`/`needs_approval` are in-flight, not yet
+/// allowed, so they map to `"denied"` rather than `"success"` — a viewer
+/// scanning for problems should not read a still-pending gate as clean.
+fn outcome_of(outcome: &str) -> &'static str {
+    match outcome {
+        "allowed" | "executed" | "approved" => "success",
+        "failed" => "error",
+        // "refused" | "rejected" | "needs_confirmation" | "needs_approval"
+        _ => "denied",
+    }
+}
+
+/// `GET /api/governance/audit`. Unions `audit_event` rows (copilot/console
+/// actions) onto the `Dagster`-run-derived pipeline history, adding a
+/// `source: "copilot" | "pipeline"` field so a consumer can filter by
+/// origin. This is additive: every field the pre-existing response shape
+/// had is still present with the same meaning, so
+/// `src/services/clients/governance.ts` and the `/audit` page keep
+/// working unchanged (see `AuditEvent` in
+/// `src/services/contracts/governance.ts` — it declares no `source`
+/// field, so TypeScript simply ignores the extra JSON property; nothing
+/// currently narrows on it). When `pg` is `None` (no `DATABASE_URL`), this
+/// degrades to the pre-fix `Dagster`-only view, matching `quality`'s and
+/// `classification`'s same-shaped gap fixes.
+async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovError> {
     let runs = dagster.list_runs(50).await?;
-    let audit: Vec<Value> = runs
+    let mut audit: Vec<Value> = runs
         .iter()
         .map(|r| {
             json!({
@@ -232,9 +274,45 @@ async fn audit(dagster: &DgClient) -> Result<Value, GovError> {
                 "policyDecision": "allow",
                 "obligations": [],
                 "engineCategory": "hot-store",
+                "source": "pipeline",
             })
         })
         .collect();
+    if let Some(pg) = pg {
+        let events =
+            lakehouse_store::audit::list(pg, lakehouse_store::audit::AuditFilter::default())
+                .await?;
+        audit.extend(events.iter().map(|e| {
+            let resource = match (&e.resource_kind, &e.resource_id) {
+                (Some(kind), Some(id)) => format!("{kind}:{id}"),
+                (Some(kind), None) => kind.clone(),
+                (None, Some(id)) => id.clone(),
+                (None, None) => e.action.clone(),
+            };
+            json!({
+                "id": e.id,
+                "at": e.at,
+                "actor": e.actor_label.clone().or_else(|| e.principal_id.clone()).unwrap_or_else(|| "Copilot".to_owned()),
+                "actorKind": actor_kind_of(e.principal_kind.as_deref()),
+                "tenant": TENANT_ID.as_str(),
+                "action": e.action,
+                "resource": resource,
+                "outcome": outcome_of(&e.outcome),
+                "policyDecision": if outcome_of(&e.outcome) == "success" { "allow" } else { "deny" },
+                "obligations": [],
+                "approvalId": e.approval_id,
+                "source": "copilot",
+            })
+        }));
+    }
+    // Newest first across both sources: both `at` values are the same
+    // fixed-width `YYYY-MM-DDTHH:MM:SS.mmmZ` format, so lexicographic
+    // string order is chronological order.
+    audit.sort_by(|a, b| {
+        let a_at = a.get("at").and_then(Value::as_str).unwrap_or_default();
+        let b_at = b.get("at").and_then(Value::as_str).unwrap_or_default();
+        b_at.cmp(a_at)
+    });
     Ok(json!({ "audit": audit }))
 }
 
@@ -855,5 +933,55 @@ mod tests {
         assert!(!missing_ch_object(
             "query mentioning UNKNOWN_DATABASE in passing"
         ));
+    }
+
+    #[test]
+    fn actor_kind_of_narrows_copilot_principal_kinds_to_agent() {
+        assert_eq!(actor_kind_of(Some("user")), "user");
+        assert_eq!(actor_kind_of(Some("service")), "service");
+        // Neither "copilot" nor "schedule" is a value the frontend's
+        // `ActorKind` union knows; both must collapse to "agent" rather
+        // than leak an unrecognized string into a typed field.
+        assert_eq!(actor_kind_of(Some("copilot")), "agent");
+        assert_eq!(actor_kind_of(Some("schedule")), "agent");
+        assert_eq!(actor_kind_of(None), "agent");
+    }
+
+    #[test]
+    fn outcome_of_treats_pending_gates_as_denied_not_success() {
+        assert_eq!(outcome_of("allowed"), "success");
+        assert_eq!(outcome_of("executed"), "success");
+        assert_eq!(outcome_of("approved"), "success");
+        assert_eq!(outcome_of("failed"), "error");
+        assert_eq!(outcome_of("refused"), "denied");
+        assert_eq!(outcome_of("rejected"), "denied");
+        // The regression this test guards: a still-pending gate decision
+        // must never read as "success" just because it isn't a hard
+        // refusal yet.
+        assert_eq!(outcome_of("needs_confirmation"), "denied");
+        assert_eq!(outcome_of("needs_approval"), "denied");
+    }
+
+    /// The merge sort in [`audit`] compares `at` strings lexicographically;
+    /// this is the regression test for that assumption holding across rows
+    /// from both sources (`Dagster`-derived and `audit_event`-derived use
+    /// the same `YYYY-MM-DDTHH:MM:SS.mmmZ` format).
+    #[test]
+    fn audit_rows_sort_newest_first_by_at_string() {
+        let mut rows = [
+            json!({ "id": "a", "at": "2026-09-08T10:00:00.000Z" }),
+            json!({ "id": "b", "at": "2026-09-08T12:00:00.000Z" }),
+            json!({ "id": "c", "at": "2026-09-08T11:00:00.000Z" }),
+        ];
+        rows.sort_by(|a, b| {
+            let a_at = a.get("at").and_then(Value::as_str).unwrap_or_default();
+            let b_at = b.get("at").and_then(Value::as_str).unwrap_or_default();
+            b_at.cmp(a_at)
+        });
+        let ids: Vec<&str> = rows
+            .iter()
+            .map(|r| r.get("id").and_then(Value::as_str).unwrap())
+            .collect();
+        assert_eq!(ids, vec!["b", "c", "a"]);
     }
 }
