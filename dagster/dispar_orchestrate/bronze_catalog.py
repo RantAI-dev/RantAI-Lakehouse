@@ -159,6 +159,28 @@ _MAINTENANCE_RUN_SCHEMA = TableSchema(
         ("applied_deleted_manifest_files", "UInt64"),
         ("applied_deleted_manifest_lists", "UInt64"),
         ("skipped_verbs", "String"),
+        # ClickHouse 26.8 REFUSES `expire_snapshots` for catalog-backed
+        # Iceberg tables (`Code: 48 ... not supported for Iceberg tables
+        # backed by a transactional catalog` — deliberate: a REST catalog
+        # should own snapshot expiry), and `remove_orphan_files` reclaims
+        # unreferenced FILES, never accumulated SNAPSHOTS. Nothing in this
+        # stack currently reclaims them (see
+        # `dagster/dispar_orchestrate/maintenance.py`'s module doc for the
+        # Lakekeeper Management API investigation that confirmed this is a
+        # real, tracked gap, not an oversight). These three columns are
+        # `maintenance.py::measure_snapshot_growth`'s per-run measurement of
+        # that unbounded growth — snapshot/metadata-log entry counts read
+        # straight from the Iceberg REST catalog's own table-metadata
+        # document, so the growth is VISIBLE and trending in
+        # `GET /api/governance/maintenance` history rather than silent.
+        # `snapshot_growth_measured=0` distinguishes "measured, currently
+        # zero" from "not measured this run" (e.g. a pre-R1/authz-disabled
+        # stack with no `CH_OAUTH_CLIENT_ID` to mint a catalog read token
+        # with) — a bare `0` in the count columns alone could not tell
+        # those two apart.
+        ("bronze_snapshot_count", "UInt64"),
+        ("bronze_metadata_log_count", "UInt64"),
+        ("snapshot_growth_measured", "UInt8"),
     ),
     engine="ReplacingMergeTree",
     order_by=("table_name", "run_at"),
@@ -358,6 +380,7 @@ def record_maintenance_run(
     dry_run_metrics: dict,
     applied_metrics: dict,
     skipped_verbs: list[str],
+    snapshot_growth: dict | None = None,
     target: "ClickHouseTarget | None" = None,
 ) -> None:
     """Upsert one maintenance run's dry-run + applied metrics into
@@ -366,10 +389,17 @@ def record_maintenance_run(
     `lakehouse-api::routes::governance::maintenance`) that
     `register_bronze_table` already uses for the dataset catalog, per the
     task brief's "reuse that mechanism; do not invent a parallel one."
+
+    `snapshot_growth` is `maintenance.py::measure_snapshot_growth`'s output
+    shape (`{"measured": bool, "snapshot_count": int,
+    "metadata_log_count": int}`) — optional and defaulting to "not
+    measured" so any OTHER future caller of this function does not have to
+    know about the snapshot-growth gap-tracking columns to keep working.
     """
     ch = target or ClickHouseTarget.from_env()
     _assert_or_create_all(ch, (_MAINTENANCE_RUN_SCHEMA,))
 
+    growth = snapshot_growth or {}
     run_at = _utc_now_iso()
     values = (
         f"({_sql_string_literal(table_name)}, {_sql_string_literal(run_at)}, "
@@ -379,7 +409,10 @@ def record_maintenance_run(
         f"{int(applied_metrics.get('deleted_data_files_count', 0))}, "
         f"{int(applied_metrics.get('deleted_manifest_files_count', 0))}, "
         f"{int(applied_metrics.get('deleted_manifest_lists_count', 0))}, "
-        f"{_sql_string_literal('; '.join(skipped_verbs))})"
+        f"{_sql_string_literal('; '.join(skipped_verbs))}, "
+        f"{int(growth.get('snapshot_count', 0))}, "
+        f"{int(growth.get('metadata_log_count', 0))}, "
+        f"{1 if growth.get('measured') else 0})"
     )
     _ch_exec(
         ch,
@@ -387,5 +420,7 @@ def record_maintenance_run(
         "(table_name, run_at, dry_run_deleted_data_files, "
         "dry_run_deleted_manifest_files, dry_run_deleted_manifest_lists, "
         "applied_deleted_data_files, applied_deleted_manifest_files, "
-        "applied_deleted_manifest_lists, skipped_verbs) VALUES " + values,
+        "applied_deleted_manifest_lists, skipped_verbs, "
+        "bronze_snapshot_count, bronze_metadata_log_count, "
+        "snapshot_growth_measured) VALUES " + values,
     )

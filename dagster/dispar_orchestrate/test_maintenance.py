@@ -76,5 +76,107 @@ class DiscoverBronzeTablesTest(unittest.TestCase):
         self.assertEqual(tables, ["bronze.real"])
 
 
+class MeasureSnapshotGrowthTest(unittest.TestCase):
+    """Unit tests for the snapshot/metadata-log growth measurement this fix
+    adds (see `maintenance.py`'s module doc, "Lakekeeper-side snapshot
+    expiry"): `expire_snapshots` is unsupported on 26.8 for catalog-backed
+    tables and nothing in this stack reclaims accumulated snapshots, so
+    this function's job is to make that growth VISIBLE, not to reclaim it.
+    """
+
+    def test_no_oauth_client_id_skips_without_any_http_call(self) -> None:
+        """A pre-R1/authz-disabled stack (`ch_oauth_client_id` unset, same
+        condition `probe_expire_snapshots_skip`'s caller already tolerates)
+        must degrade to "not measured" rather than fail — and must not
+        attempt to mint a token or call the catalog at all."""
+        cfg = _cfg()  # ch_oauth_client_id="" in the shared fixture
+        with mock.patch("requests.post") as mocked_post, mock.patch(
+            "requests.get"
+        ) as mocked_get:
+            result = maintenance.measure_snapshot_growth(cfg, "bronze.g3a_orders")
+        self.assertEqual(
+            result, {"measured": False, "snapshot_count": 0, "metadata_log_count": 0}
+        )
+        mocked_post.assert_not_called()
+        mocked_get.assert_not_called()
+
+    def test_measures_snapshot_and_metadata_log_counts(self) -> None:
+        """With auth configured: mint a token, resolve the warehouse
+        prefix, then read the table's own metadata document and count
+        `snapshots`/`metadata-log` entries — never derive these numbers
+        from anything else."""
+        cfg = maintenance.MaintenanceConfig(
+            ch=maintenance.ClickHouseTarget(url="http://ch.invalid", user="default", password=""),
+            lakekeeper_catalog_uri="http://lakekeeper.invalid/catalog",
+            lakekeeper_warehouse="default",
+            rustfs_endpoint="http://rustfs.invalid:9000",
+            ch_oauth_client_id="clickhouse-reader",
+            ch_oauth_server_uri="http://oidc-mock.invalid/token",
+        )
+
+        token_resp = mock.Mock()
+        token_resp.raise_for_status = mock.Mock()
+        token_resp.json.return_value = {"access_token": "fake-token"}
+
+        config_resp = mock.Mock()
+        config_resp.raise_for_status = mock.Mock()
+        config_resp.json.return_value = {"defaults": {"prefix": "wh-prefix"}}
+
+        table_resp = mock.Mock()
+        table_resp.raise_for_status = mock.Mock()
+        table_resp.json.return_value = {
+            "metadata": {
+                "snapshots": [{"snapshot-id": 1}, {"snapshot-id": 2}, {"snapshot-id": 3}],
+                "metadata-log": [{"metadata-file": "a"}, {"metadata-file": "b"}],
+            }
+        }
+
+        with mock.patch("requests.post", return_value=token_resp) as mocked_post, mock.patch(
+            "requests.get", side_effect=[config_resp, table_resp]
+        ) as mocked_get:
+            result = maintenance.measure_snapshot_growth(cfg, "bronze.g3a_orders")
+
+        self.assertEqual(
+            result,
+            {"measured": True, "snapshot_count": 3, "metadata_log_count": 2},
+        )
+        mocked_post.assert_called_once()
+        self.assertEqual(mocked_get.call_count, 2)
+        table_call_url = mocked_get.call_args_list[1].args[0]
+        self.assertIn("/v1/wh-prefix/namespaces/bronze/tables/g3a_orders", table_call_url)
+
+    def test_missing_snapshots_and_metadata_log_count_as_zero(self) -> None:
+        """A table metadata document with no `snapshots`/`metadata-log`
+        keys at all (not just empty lists) must count as zero, not raise —
+        `dict.get(...) or []` covers both `None` and a missing key."""
+        cfg = maintenance.MaintenanceConfig(
+            ch=maintenance.ClickHouseTarget(url="http://ch.invalid", user="default", password=""),
+            lakekeeper_catalog_uri="http://lakekeeper.invalid/catalog",
+            lakekeeper_warehouse="default",
+            rustfs_endpoint="http://rustfs.invalid:9000",
+            ch_oauth_client_id="clickhouse-reader",
+            ch_oauth_server_uri="http://oidc-mock.invalid/token",
+        )
+
+        token_resp = mock.Mock()
+        token_resp.raise_for_status = mock.Mock()
+        token_resp.json.return_value = {"access_token": "fake-token"}
+        config_resp = mock.Mock()
+        config_resp.raise_for_status = mock.Mock()
+        config_resp.json.return_value = {"overrides": {"prefix": "wh-prefix"}}
+        table_resp = mock.Mock()
+        table_resp.raise_for_status = mock.Mock()
+        table_resp.json.return_value = {"metadata": {}}
+
+        with mock.patch("requests.post", return_value=token_resp), mock.patch(
+            "requests.get", side_effect=[config_resp, table_resp]
+        ):
+            result = maintenance.measure_snapshot_growth(cfg, "bronze.g3a_orders")
+
+        self.assertEqual(
+            result, {"measured": True, "snapshot_count": 0, "metadata_log_count": 0}
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

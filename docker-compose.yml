@@ -1591,6 +1591,22 @@ services:
   # this container's `command:` is a shell script, so the token file is
   # read into a shell variable before being interpolated into the
   # properties heredoc.
+  # SECURITY (code review finding): `trino` has NO authentication of its own
+  # in this configuration (no `http-server.authentication.type`, no
+  # password/LDAP/OAuth2 front door) — it is a bare coordinator. Anyone who
+  # can reach its port gets full `iceberg` catalog query access, i.e. read
+  # access to every Bronze table (and, since it authenticates to Lakekeeper
+  # with `select`+`modify`, the ability to mutate them too). That is fine
+  # INSIDE the compose network, where only `trino-maintenance-cron` talks to
+  # it (see below) — it stops being fine the moment `ports:` publishes it to
+  # the host, because the host port has none of the auth this stack's other
+  # public surfaces require (contrast `lakehouse-api`'s OIDC/bootstrap-admin
+  # gate). `TRINO_PUBLISH_HOST_PORT` below controls that publication and
+  # defaults OFF for exactly this reason; see `trino-host-port` further down
+  # for the mechanics (Compose has no way to make a `ports:` entry
+  # conditional in place — verified: an unset/empty interpolated port string
+  # fails compose's own parser with "no port specified: <empty>" — so the
+  # publish is split into its own opt-in-profiled sidecar instead).
   trino:
     profiles: ["trino"]
     image: trinodb/trino:483
@@ -1601,6 +1617,37 @@ services:
       LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       CH_RUSTFS_S3_ENDPOINT: ${CH_RUSTFS_S3_ENDPOINT:-http://rustfs:9000}
+      # CHANGE ME BEFORE ANY NON-LOCAL DEPLOYMENT. These are the SAME
+      # well-known RustFS defaults `rustfs`'s own service block warns about
+      # above — reused here, not freshly duplicated risk, but the reuse
+      # means overriding `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY` once fixes
+      # both places.
+      #
+      # Why static keys at all, given `iceberg.rest-catalog.vended-
+      # credentials-enabled=true` two lines below in `command:` — doesn't
+      # Lakekeeper hand Trino scoped, per-principal S3 credentials the same
+      # way it hands `rust-iceberg`/`debezium` their catalog tokens? Per
+      # Trino's own `trino-iceberg` plugin docs, when vended credentials are
+      # enabled the REST catalog's per-request credentials are supposed to
+      # supersede these for actual file I/O — but `trinodb/trino#27416`
+      # (open against a coordinator-vs-Spark comparison) documents Trino NOT
+      # honoring vended credentials from a `LoadTableResponse` in some
+      # catalog/connector combinations, and this repo has no measured proof
+      # (no `docs/plans/*-RESULT.md` entry, unlike every other credential
+      # claim in this file) that `trinodb/trino:483` against Lakekeeper
+      # actually exercises the vended path rather than silently falling back
+      # to these. Removing the fallback on an unverified assumption risks
+      # silently breaking `trino-maintenance-cron` (ADR 0009's only working
+      # compaction path — see the block comment above `trino-maintenance-
+      # cron` below), which this fix is required NOT to weaken. So: kept,
+      # documented, flagged for change. `CONNECTOR_S3_ACCESS_KEY`/
+      # `CONNECTOR_S3_SECRET_KEY` (used by `lakehouse-api`'s connector
+      # probe, above) were considered and rejected here — those names are
+      # deliberately scoped to the connector allowlist boundary
+      # (`CONNECTOR_ALLOWED_SECRET_REFS`), a DIFFERENT trust boundary than
+      # Trino's own file I/O, and reusing them would blur that boundary
+      # rather than reduce actual risk (both ultimately default to the same
+      # `RUSTFS_*` value anyway).
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
     volumes:
@@ -1642,6 +1689,71 @@ services:
         s3.aws-secret-key=$${RUSTFS_SECRET_KEY}
         EOF
         exec /usr/lib/trino/bin/run-trino
+    # NO `ports:` HERE — this is the fix. `trino-maintenance-cron` (below)
+    # is the only consumer of this coordinator, and it reaches it as
+    # `http://trino:8080` over the compose network, which needs no published
+    # host port at all. Publishing was the security defect (see the block
+    # comment above this service): an unauthenticated Trino on the host
+    # network gives anyone who can reach it full `iceberg` catalog query
+    # access. If you genuinely need host access (ad-hoc `trino` CLI /
+    # DBeaver against this catalog outside the network), opt in with
+    # `TRINO_PUBLISH_HOST_PORT=trino` — see `trino-host-port` below for how
+    # that publishes the SAME port without adding it here by default.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+  # SECURITY — opt-in host publication for `trino`, split into its own
+  # service because Compose cannot make a single service's `ports:` entry
+  # conditional on an env var: an unset/empty interpolated port string
+  # fails Compose's own parser with "no port specified: <empty>" (verified
+  # empirically against this exact shape while building this fix) — there
+  # is no "publish nothing" value you can hand `ports:` itself.
+  #
+  # `profiles:` looked like the natural place to move the toggle instead,
+  # but has its OWN empirically-verified trap: an interpolated profile
+  # entry that evaluates to the empty string (e.g. `"${VAR:+trino}"` with
+  # `VAR` unset) does not behave like "no profile" — it makes Compose treat
+  # the service as unconditionally active (`docker compose config
+  # --services` lists it even with zero `--profile` flags given), and
+  # WORSE, `docker compose config -q` with NO profile active then fails
+  # outright (`service "trino-host-port" depends on undefined service
+  # "trino"`) because the depends_on target genuinely isn't in the
+  # unfiltered project. So the toggle below uses `:-` (default-if-UNSET),
+  # never `:+`, and the default value is a real, never-requested profile
+  # name (`trino-host-port-disabled`), not empty: `TRINO_PUBLISH_HOST_PORT`
+  # unset -> profile `trino-host-port-disabled`, matches nothing, this
+  # service never exists, nothing is published (the default, and the fix
+  # for the finding above). Set `TRINO_PUBLISH_HOST_PORT=trino` (in `.env`)
+  # and the profile becomes `trino` — the SAME profile you already pass to
+  # run `trino` at all — so this starts automatically alongside it with no
+  # extra `--profile` flag. (Yes, the enabling value must be the literal
+  # string `trino`, not `true`/`1` — it IS the Compose profile name being
+  # matched, by construction; any other value leaves this disabled, safely,
+  # rather than erroring.)
+  #
+  # `network_mode: "service:trino"` joins `trino`'s network namespace
+  # directly (same IP/ports as the coordinator container) rather than
+  # duplicating the whole service definition — Compose forbids two service
+  # blocks with the same key, so this couldn't just be a second `trino:`
+  # entry with `ports:` added. The container itself does nothing (`sleep
+  # infinity`); its only job is to hold the `ports:` mapping into the
+  # namespace it shares with `trino`. CHANGE ME BEFORE ANY NON-LOCAL
+  # DEPLOYMENT: publishing this at all re-opens the unauthenticated-access
+  # finding this fix addresses — only set `TRINO_PUBLISH_HOST_PORT=trino`
+  # on a host you trust every network-adjacent actor on.
+  trino-host-port:
+    profiles: ["${TRINO_PUBLISH_HOST_PORT:-trino-host-port-disabled}"]
+    image: alpine:3.20
+    network_mode: "service:trino"
+    depends_on:
+      trino:
+        condition: service_healthy
+    command: ["sleep", "infinity"]
     ports:
       # 8091, not 8090: `oidc-mock` (always-on, not profile-gated) already
       # publishes host 8090, so an 8090 default here collides the moment the
@@ -1649,12 +1761,6 @@ services:
       # a full deployment does. The clash never surfaced during the build
       # because `trino` was only ever exercised on its own.
       - "${TRINO_HOST_PORT:-8091}:8080"
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/v1/info"]
-      interval: 10s
-      timeout: 5s
-      retries: 20
-      start_period: 20s
     restart: unless-stopped
 
   # P4 (G3) — the cron loop itself (`ops/trino/optimize_bronze.sh`):
