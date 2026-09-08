@@ -1,0 +1,24 @@
+[project]
+name = "dispar-orchestrate"
+version = "0.1.0"
+description = "P3 Dagster code location: dlt sql_database -> Bronze Iceberg through Lakekeeper. See docs/adr/0005-dagster-code-location-ownership-and-packaging.md."
+requires-python = ">=3.11"
+dependencies = [
+    # Pinned exact versions (not ranges): this package has no shared
+    # lockfile with the Rust workspace (ADR 0005 "versioning" section) --
+    # the pin here IS the reproducibility guarantee.
+    "dagster==1.13.20",
+    "dagster-webserver==1.13.20",
+    "dagster-postgres==0.29.20",
+    "dlt[pyiceberg,s3,postgres]==1.30.0",
+    "psycopg2-binary==2.9.10",
+    "sqlalchemy==2.0.36",
+    "requests==2.32.3",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["dispar_orchestrate*"]

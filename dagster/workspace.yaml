@@ -1,0 +1,9 @@
+# Points the webserver/daemon at the code-location gRPC server
+# (`dagster-code-location`, `docker-compose.yml`) by its compose service
+# DNS name — matching `DAGSTER_LOCATION=dispar_orchestrate.definitions`'s
+# existing default in `lakehouse-api::config::Config`.
+load_from:
+  - grpc_server:
+      host: dagster-code-location
+      port: 4000
+      location_name: dispar_orchestrate.definitions

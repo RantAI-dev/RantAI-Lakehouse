@@ -245,3 +245,43 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose -p g2ci down -v
+
+  # ── G3a acceptance (docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md §3) — dlt,
+  # running inside Dagster, reads a real Postgres table and writes it to
+  # Bronze Iceberg through Lakekeeper; the result is visible in the
+  # console catalog, and lineage is recorded. See
+  # docs/adr/0005-dagster-code-location-ownership-and-packaging.md and
+  # ops/g3a/g3a_test.py. ──
+  g3a-dagster:
+    name: Rust · G3a Dagster + dlt Bronze ingest
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write CI-only .env
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          EOF
+
+      - name: Bring up lakehouse-api + Dagster + the G3a source table
+        run: >
+          docker compose -p g3aci --profile dagster up -d --build
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+          g3a-source-init
+
+      - name: Run the G3a end-to-end test inside the compose network
+        run: docker compose -p g3aci --profile dagster run --rm g3a-test-runner
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g3aci logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -p g3aci down -v

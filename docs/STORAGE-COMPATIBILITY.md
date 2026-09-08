@@ -102,19 +102,44 @@ confirm it lands intact; at the S3 API level,
 `aws s3api create-multipart-upload` / `upload-part` /
 `complete-multipart-upload` against the target bucket.
 
-**Result: untested.** Every file this suite writes (Parquet data, Avro
-manifests, JSON table metadata) is a few KB — well under any multipart
-threshold — so multipart was never triggered on either store. This is a
-real gap, not a formality: SeaweedFS's public issue tracker has an
-interop report specifically about Lakekeeper-vended sessions failing
-multipart writes because Lakekeeper's generated session policy omits the
-multipart actions (`CreateMultipartUpload` etc.) — see [seaweedfs/seaweedfs
-discussion #8312](https://github.com/seaweedfs/seaweedfs/discussions/8312).
-The fix landed upstream in SeaweedFS (treating multipart actions as
-implied by `PutObject`, per that discussion's linked PRs) and this
-project's SeaweedFS image (`chrislusf/seaweedfs:4.44`) postdates that fix,
-but it was **not independently re-verified here** — do not treat this row
-as passing until it is.
+**Result: RustFS — pass (measured in P3). SeaweedFS — pass (measured in
+P3).** Measured directly at the S3 API level against both stores (per
+this row's own "How to test" — `aws s3api create-multipart-upload` /
+`upload-part` / `complete-multipart-upload`), using the exact static
+credentials each store's warehouse init already provisions
+(`rustfsadmin`/`rustfsadmin`, `seaweedfsadmin`/`seaweedfsadmin`): a 3-part,
+30 MiB object (well past `object_store`'s single-PUT threshold) uploaded
+and completed cleanly on both, confirmed by a `head-object` showing the
+full 31,457,280-byte size and a multipart-shaped ETag
+(`"<hash>-3"`, the suffix S3-compatible stores use to mark a
+multipart-assembled object, as opposed to a single-part upload's plain
+MD5 ETag).
+
+Two things worth being precise about, since this is a narrower claim than
+"multipart works end-to-end through the product's own write path":
+
+- This exercised the plain S3 API directly (`aws s3api`), not
+  `lakehouse-iceberg`'s own `object_store` client mid-append — P3's G3a
+  ingestion volume (2,000–4,000 rows via dlt) still produces
+  few-KB/tens-of-KB Parquet files per run, well under any multipart
+  threshold, so the *product's own write path* still has not been
+  observed triggering multipart organically. This row is now measured as
+  "the stores support multipart" (the S3-compatibility claim this row is
+  actually about), not as "P3's ingestion volume was large enough to
+  trigger it" — those are different claims, and only the first one is
+  settled here.
+- Credentials were static (each store's warehouse-init access key/secret),
+  not Lakekeeper-vended STS credentials — this row is about the store's
+  multipart *support*, independent of the credential-delegation path row
+  6 already covers separately. The previously-cited SeaweedFS/Lakekeeper
+  interop bug (session policies omitting multipart actions specifically
+  under STS-vended sessions — [seaweedfs/seaweedfs discussion
+  #8312](https://github.com/seaweedfs/seaweedfs/discussions/8312)) is
+  therefore **still not independently re-verified** for the STS-vended
+  case specifically; this project's `chrislusf/seaweedfs:4.44` image
+  postdates the linked fix, but a customer relying on STS-vended
+  multipart writes on an older SeaweedFS build should still verify that
+  combination directly.
 
 ### 4. Range `GET`
 
@@ -235,7 +260,7 @@ not because anything in this project currently needs it.
 | - | --- | --- | --- |
 | 1 | SigV4 signing | Pass (measured) | Pass (measured) |
 | 2 | `ListObjectsV2` | Untested | Untested |
-| 3 | Multipart upload | Untested | Untested (known past interop bug, fix unverified here) |
+| 3 | Multipart upload | Pass (measured directly at the S3 API level, P3) | Pass (measured directly at the S3 API level, P3); STS-vended multipart specifically still unverified |
 | 4 | Range `GET` | Likely pass (not independently confirmed) | Likely pass (not independently confirmed) |
 | 5 | Conditional writes | Not applicable to this architecture / untested | Not applicable to this architecture / untested |
 | 6 | STS-vended credentials | Pass (measured) | Pass (measured) |
@@ -246,10 +271,12 @@ not because anything in this project currently needs it.
 Rows 1 and 6 are the ones this project's write path actually depends on
 today, and both are measured green on two different stores using the same
 Rust code — that is the load-bearing evidence for "S3 is the boundary."
-Rows 2, 3, 5, and 7 are not exercised by anything this project currently
-does; a customer whose own tooling depends on them (bucket lifecycle
-policies, S3-side conditional writes, high-volume CDC triggering
-multipart) should verify those independently against their chosen store
-before relying on this document as a green light. Row 4 sits in between:
+Row 3 is now measured at the plain S3 API level on both stores (P3), but
+not yet observed through the product's own write path at real volume (see
+that row's own caveats). Rows 2, 5, and 7 are not exercised by anything
+this project currently does; a customer whose own tooling depends on them
+(bucket lifecycle policies, S3-side conditional writes) should verify
+those independently against their chosen store before relying on this
+document as a green light. Row 4 sits in between:
 behavior is consistent with correct support, but this project has not
 instrumented the wire traffic to prove it.

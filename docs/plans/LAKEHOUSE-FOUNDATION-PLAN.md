@@ -161,6 +161,7 @@ credentials, and dlt all block on it.
 | R7 | Nested struct/array/map type changes are not readable by ClickHouse | Medium | Enforce in the connector contract; reject at registration, not at read time |
 | R8 | New services inherit "Postgres-down is quiet" — failures surface only as request-time 503s | Medium | Healthcheck per service; revisit `GET /health/ready` (proposed in `OPERATIONS.md`) |
 | R9 | Six new components for a stack with zero object storage today | Medium | Strict gate order; no phase starts before the prior gate passes |
+| R10 | **Added in P3.** The `bronze_meta.*` registry schema is now defined in two places — `demo/clickhouse/04_registry.sql` and `dagster/dispar_orchestrate/bronze_catalog.py`'s `CREATE TABLE IF NOT EXISTS`. Verified byte-identical today (same columns, types, `ReplacingMergeTree`, `ORDER BY`), but nothing enforces that. If one drifts, `IF NOT EXISTS` silently keeps the stale table and the console reads wrong data | Medium | The Dagster-side DDL exists because a bare compose stack never applies `demo/clickhouse/*.sql`. Fix properly by giving the registry schema one owner — either ship it as a migration the compose stack applies, or have the Dagster path assert the schema instead of creating it |
 
 R1 and R2 are the two that can force a redesign. Both are measured before
 anything is built on top of them.
