@@ -325,3 +325,45 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose -p g3ci down -v
+
+  # ── P5 (G4) acceptance (docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md §3,
+  # docs/plans/P5-RESULT.md) — Debezium Server + debezium-server-iceberg
+  # captures a real Postgres table via logical replication; INSERT/UPDATE/
+  # DELETE are all visible in ClickHouse within the agreed latency, and
+  # replication-slot cleanup on connector delete is verified. Does not
+  # need the Dagster webserver/daemon (debezium-server has no dependency
+  # on them), so this job is lighter than g3a-dagster/g3-maintenance
+  # above. See ops/g4/g4_test.py. ──
+  g4-cdc:
+    name: Rust · G4 Debezium CDC into Bronze
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write CI-only .env
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          EOF
+
+      - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, the demo CDC source, and Debezium Server
+        run: >
+          docker compose -p g4ci --profile dagster up -d
+          postgres clickhouse rustfs rustfs-bucket-init
+          lakekeeper-db-init lakekeeper-migrate lakekeeper lakekeeper-warehouse-init
+          g4-source-init debezium-server
+
+      - name: Run the G4 acceptance test inside the compose network
+        run: docker compose -p g4ci --profile dagster run --rm g4-test-runner
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g4ci logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -p g4ci down -v

@@ -318,3 +318,83 @@ fn policy_table_is_non_trivial_and_every_entry_is_walked_by_construction() {
         POLICY_TABLE.len()
     );
 }
+
+/// Every route the router actually registers must have a `POLICY_TABLE`
+/// entry — the direction the two loops above do NOT cover.
+///
+/// They iterate `POLICY_TABLE` and prove each entry behaves correctly, which
+/// says nothing about a route that was registered and then never classified.
+/// `auth_gate` denies an unclassified route with a hard 500 rather than a
+/// silent allow, so the failure mode is loud at runtime but invisible to the
+/// test suite — `DELETE /api/connectors/{id}` shipped exactly that way, 500ing
+/// on every call.
+///
+/// `axum::Router` exposes no way to enumerate its routes, so this reads
+/// `routes/mod.rs` at compile time via `include_str!` and extracts the
+/// `.route("<pattern>", get(..).post(..).delete(..))` registrations. Parsing
+/// source is unlovely, but the alternative is a hand-maintained list that
+/// drifts in exactly the same way the bug it is catching did.
+#[test]
+fn every_registered_route_has_a_policy_entry() {
+    const ROUTES_SRC: &str = include_str!("../src/routes/mod.rs");
+
+    // Strip comment lines first. `routes/mod.rs`'s own doc comments contain a
+    // worked example of a deliberately-unclassified route
+    // (`/api/__throwaway`), which a naive scan reports as a real registration.
+    let code: String = ROUTES_SRC
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut registered: Vec<(String, String)> = Vec::new();
+    let mut rest = code.as_str();
+    while let Some(at) = rest.find(".route(") {
+        rest = &rest[at + ".route(".len()..];
+        // The pattern is the first string literal in the call.
+        let Some(open) = rest.find('"') else { break };
+        let Some(close) = rest[open + 1..].find('"') else { break };
+        let pattern = &rest[open + 1..open + 1 + close];
+        if !pattern.starts_with("/api/") && pattern != "/health" {
+            continue;
+        }
+        // Method handlers appear between the pattern and the closing paren of
+        // this `.route(` call; a following `.route(` bounds the search.
+        let tail = &rest[open + 1 + close..];
+        let bound = tail.find(".route(").unwrap_or(tail.len());
+        let handlers = &tail[..bound];
+        for (needle, method) in [
+            ("get(", "GET"),
+            ("post(", "POST"),
+            ("put(", "PUT"),
+            ("patch(", "PATCH"),
+            ("delete(", "DELETE"),
+        ] {
+            if handlers.contains(needle) {
+                registered.push((method.to_owned(), pattern.to_owned()));
+            }
+        }
+    }
+
+    assert!(
+        registered.len() > 50,
+        "parsed only {} routes from routes/mod.rs — the extractor is probably \
+         broken rather than the router being tiny",
+        registered.len()
+    );
+
+    let missing: Vec<_> = registered
+        .iter()
+        .filter(|(m, p)| {
+            !POLICY_TABLE
+                .iter()
+                .any(|(pm, pp, _)| pm == m && pp == p)
+        })
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "these routes are registered but absent from POLICY_TABLE, so auth_gate \
+         will 500 on every call to them: {missing:?}"
+    );
+}

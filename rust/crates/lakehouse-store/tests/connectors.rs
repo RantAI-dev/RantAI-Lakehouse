@@ -21,7 +21,8 @@ use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
 use lakehouse_store::connectors::{
-    CreateConnectorInput, create_connector, get_connector, list_connectors, test_connection,
+    CreateConnectorInput, create_connector, delete_connector, get_connector, list_connectors,
+    test_connection,
 };
 use lakehouse_store::pipelines::{CreatePipelineInput, create_pipeline};
 use sqlx::PgPool;
@@ -190,5 +191,39 @@ async fn test_connection_not_found_for_unknown_id(pool: PgPool) -> sqlx::Result<
 async fn get_connector_none_for_unknown_id(pool: PgPool) -> sqlx::Result<()> {
     let detail = get_connector(&pool, "conn-does-not-exist").await.unwrap();
     assert!(detail.is_none());
+    Ok(())
+}
+
+/// `delete_connector` actually removes the row, and reports `true`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn delete_connector_removes_the_row(pool: PgPool) -> sqlx::Result<()> {
+    let input = CreateConnectorInput {
+        name: "delete me".to_owned(),
+        kind: "REST API".to_owned(),
+        direction: "source".to_owned(),
+        host: "h".to_owned(),
+        secret_ref: "env:DELETE_ME".to_owned(),
+        environment: "staging".to_owned(),
+        tenant: "Meridian Group".to_owned(),
+        residency: String::new(),
+        capabilities: vec![],
+        owner: None,
+    };
+    let created = create_connector(&pool, &input).await.unwrap();
+
+    let deleted = delete_connector(&pool, &created.id).await.unwrap();
+    assert!(deleted);
+    assert!(get_connector(&pool, &created.id).await.unwrap().is_none());
+    Ok(())
+}
+
+/// Deleting an unknown id is `Ok(false)`, not an error — idempotent-delete
+/// convention.
+#[sqlx::test(migrations = "../../migrations")]
+async fn delete_connector_unknown_id_is_false_not_an_error(pool: PgPool) -> sqlx::Result<()> {
+    let deleted = delete_connector(&pool, "conn-does-not-exist")
+        .await
+        .unwrap();
+    assert!(!deleted);
     Ok(())
 }
