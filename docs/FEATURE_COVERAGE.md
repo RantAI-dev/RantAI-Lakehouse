@@ -39,15 +39,16 @@ Update only with verified repository facts.
 | Intelligence | Knowledge sources | `/knowledge` | [COMPLETE] | [REAL] |
 | Intelligence | Vector jobs | `/vector-jobs` | [COMPLETE] | [REAL] |
 | Intelligence | Semantic search | `/semantic-search` | [COMPLETE] | [MOCKED] — deliberate; no vector store/embedding index exists (`rust/crates/lakehouse-store/src/knowledge.rs`) |
-| Intelligence | Agent workflows | `/agents/workflows` | [PARTIAL] | [REAL] (definitions/runs/approvals persisted in Postgres; there is no agent/tool *execution* runtime) |
-| Intelligence | Digital employees | `/agents/employees` | [COMPLETE] | [REAL] |
-| Intelligence | Approvals inbox | `/agents/approvals` | [COMPLETE] | [REAL] |
+| Intelligence | Agent workflows | `/agents/workflows` | [PARTIAL] | [REAL] (definitions/runs/approvals persisted in Postgres; runs actually execute the copilot's 47 registered tools — see `docs/adr/0012-copilot-tool-governance.md`) |
+| Intelligence | Digital employees | `/agents/employees` | [COMPLETE] | [REAL] — prompt/cron/mode/permissions fields, "Run now" triggers a real headless run (`POST /api/agents/employees/{id}/run`) |
+| Intelligence | Agent run history | `/agents/runs`, `/agents/runs/[id]` | [COMPLETE] | [REAL] — real `agent_run` rows (seeded fixtures dropped in migration `0025`), steps rendered with the same tool-step component the copilot uses |
+| Intelligence | Approvals inbox | `/agents/approvals` | [COMPLETE] | [REAL] — approving a `WriteHigh` copilot tool call executes it (through the same dispatch path as chat), re-checking the approver's own permission first |
 | Intelligence | Tool registry | `/agents/tools` | [COMPLETE] | [REAL] |
 | Governance | Policies | `/governance/policies` | [PARTIAL] | [REAL] |
 | Governance | Classification & masking | `/governance/classification` | [COMPLETE] | [REAL] |
 | Governance | Data quality | `/governance/data-quality` | [COMPLETE] | [REAL] |
 | Governance | Lineage | `/lineage` | [PARTIAL] | [REAL] |
-| Governance | Audit | `/audit` | [PARTIAL] | [REAL] (Dagster run history) |
+| Governance | Audit | `/audit` | [PARTIAL] | [REAL] (Dagster run history, unioned with the copilot's own append-only `audit_event` table — `source: "copilot"`, see ADR 0012) |
 | Governance | Residency | `/residency` | [COMPLETE] | [REAL] |
 | Governance | Bronze maintenance (`expire_snapshots` dry-run/applied; P6 addition) | `/governance/data-quality` (Maintenance tab) | [PARTIAL] | [REAL] — `GET /api/governance/maintenance`, reading `lake.bronze_meta.maintenance_run` |
 | Governance | CDC replication slot health (P6 addition) | `/governance/data-quality` (Ingestion tab) | [PARTIAL] | [REAL] — `GET /api/governance/replication`, reading `lake.bronze_meta.replication_slot` |
@@ -68,7 +69,6 @@ Update only with verified repository facts.
 | Dedicated connector detail route | [PARTIAL] (drawer sufficient for preview) |
 | Dedicated pipeline run route | [PARTIAL] (drawer + actions) |
 | Workflow detail canvas route | [PARTIAL] |
-| Agent/tool execution runtime | [MISSING] |
 | Observability log/trace explorer | [MISSING] |
 | Lakekeeper authorization (R1) — runs `allow-all`, not enforced | [MISSING] — see `docs/plans/P5-REPORT.md` |
 | Cold/AI storage tiers (always report 0 bytes) | [MISSING] — see README "Status / Known limitations" |
