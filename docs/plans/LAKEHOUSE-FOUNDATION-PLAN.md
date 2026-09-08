@@ -143,6 +143,7 @@ fictional connector seed; update `FEATURE_COVERAGE.md`, `ARCHITECTURE.md`,
 | 0007 | Connector registry → Debezium/dlt config generation | P5 |
 | 0008 | Initial snapshot/backfill for large tables | P5 |
 | 0009 | Small-file compaction (outcome of G3) | P4 |
+| 0010 | Gold export to Iceberg happens in Rust, not ClickHouse | **Done** (P1) |
 
 ADR 0002 is load-bearing: Lakekeeper storage secrets, Debezium source
 credentials, and dlt all block on it.
@@ -151,8 +152,8 @@ credentials, and dlt all block on it.
 
 | # | Risk | Severity | Mitigation |
 | --- | --- | --- | --- |
-| R1 | ClickHouse catalog-registered writes fail against Lakekeeper's authz on metadata updates | **Critical** | G1 stop condition — found in P1, before anything depends on it |
-| R2 | No bin-pack rewrite in ClickHouse; Bronze accumulates small files from CDC | **High** | G3 measures it; Trino-as-cron is the pre-authorized escape hatch |
+| R1 | ClickHouse catalog-registered writes fail against Lakekeeper's authz on metadata updates | **Critical** | **Measured in P1: moot as framed.** ClickHouse cannot write through the catalog at all (see [G1-RESULT.md](G1-RESULT.md)), so the writes never reach Lakekeeper's authz. Gold export moves to Rust ([ADR 0010](../adr/0010-gold-export-to-iceberg-from-rust.md)). Lakekeeper ran `allow-all`; standing up OpenFGA is **deferred to P5**, when CDC and dlt are writing through the catalog under load and authz on metadata updates actually bites |
+| R2 | No bin-pack rewrite in ClickHouse; Bronze accumulates small files from CDC. **Raised in P1a:** `OPTIMIZE … MANIFEST` is also a syntax error on 26.3, so two assumed mitigations are unavailable — see [CLICKHOUSE-MAINTENANCE-FINDINGS.md](CLICKHOUSE-MAINTENANCE-FINDINGS.md) | **High** | G3 measures it; Trino-as-cron is the pre-authorized escape hatch, and is now more likely to be needed |
 | R3 | RustFS is young; storage is the durability layer | **High** | S3 API is the boundary; G2 proves the swap; customer S3 is first-class |
 | R4 | `debezium-server-iceberg` is community-maintained (Memiiso), not Debezium-official | Medium | Pin version; isolate behind the connector-registry config seam so it is replaceable |
 | R5 | Debezium replication slot pins WAL and fills a customer's primary disk | **High** | Slot lag + WAL retention as first-class alerts (P5); verified slot cleanup on delete |

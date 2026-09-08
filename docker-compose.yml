@@ -31,8 +31,17 @@ services:
   # dashboards, ...) go through ClickHouse and return 503 without it, so
   # unlike Postgres this one is a genuinely required local dependency, not
   # an optional Phase 2 add-on.
+  #
+  # Pinned to 26.8 (LTS), not 24.8: Iceberg writes via `DataLakeCatalog`
+  # need >= 26.2 (`allow_database_iceberg`), and 26.8 is the version whose
+  # behaviour the rest of this stack is actually built against —
+  # `docs/plans/CLICKHOUSE-26.8-REMEASUREMENT.md` re-measured every 26.3
+  # finding here. It matters at THIS point in the stack rather than later:
+  # the Bronze maintenance job's verb set (`remove_orphan_files` works,
+  # `expire_snapshots` is refused) is a 26.8 fact, so a branch running 26.3
+  # with 26.8-shaped verbs fails its own gate.
   clickhouse:
-    image: clickhouse/clickhouse-server:24.8
+    image: clickhouse/clickhouse-server:26.8
     environment:
       CLICKHOUSE_USER: ${CH_USER:-default}
       CLICKHOUSE_PASSWORD: ${CH_PASSWORD:-}
@@ -108,6 +117,215 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${POSTGRES_DB:-lakehouse}}
     restart: unless-stopped
 
+  # P1 — S3-compatible object store, the default self-hosted implementation
+  # for the lakehouse warehouse. RustFS, not MinIO (locked decision: MinIO
+  # is not a supported target). All access — including bucket bootstrap
+  # below — goes through the plain S3 API, never a proprietary admin call.
+  #
+  # Failure mode: if this is down, Iceberg reads/writes through Lakekeeper
+  # fail (object I/O has nowhere to land); it surfaces as connection
+  # errors from `lakehouse-iceberg` (P1b) and from Lakekeeper's own REST
+  # calls, not as a `lakehouse-api` boot failure — nothing in this phase
+  # wires RustFS into the API's own startup path.
+  rustfs:
+    image: rustfs/rustfs:1.0.0-rc.4
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
+      # SECURITY: these defaults are public and well-known — override
+      # before exposing this listener beyond localhost.
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      RUSTFS_OBS_LOGGER_LEVEL: info
+    ports:
+      - "${RUSTFS_HOST_PORT:-9010}:9000"
+      - "${RUSTFS_CONSOLE_HOST_PORT:-9011}:9001"
+    volumes:
+      - lakehouse_rustfs_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  # One-shot: create the lakehouse warehouse bucket via the plain S3 API
+  # (aws-cli `s3api create-bucket`) — never RustFS's admin API. Idempotent:
+  # re-running against an already-created bucket is a no-op success.
+  rustfs-bucket-init:
+    image: amazon/aws-cli:2.36.34
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: "true"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        aws --endpoint-url http://rustfs:9000 s3api head-bucket
+        --bucket ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse} 2>/dev/null ||
+        aws --endpoint-url http://rustfs:9000 s3api create-bucket
+        --bucket ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
+    restart: "no"
+
+  # P1 — one-shot: create Lakekeeper's own Postgres database on the
+  # EXISTING `postgres` service. Deliberately a separate database, not a
+  # schema mixed into the `lakehouse` application database's `console`
+  # schema — Lakekeeper owns and migrates its own schema independently.
+  lakekeeper-db-init:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGDATABASE: ${POSTGRES_DB:-lakehouse}
+      LAKEKEEPER_PG_DB: ${LAKEKEEPER_PG_DB:-lakekeeper}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        psql -v ON_ERROR_STOP=1 -tc
+        "SELECT 1 FROM pg_database WHERE datname = '$${LAKEKEEPER_PG_DB}'" |
+        grep -q 1 ||
+        psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$${LAKEKEEPER_PG_DB}\""
+    restart: "no"
+
+  # P1 — one-shot: Lakekeeper's own `migrate` subcommand, not hand-written
+  # DDL. Must complete before `lakekeeper` (serve) starts.
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:v0.13.3
+    depends_on:
+      lakekeeper-db-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_ENCRYPTION_KEY:-this-is-not-a-secure-key-change-me}
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
+    command: ["migrate"]
+    restart: "no"
+
+  # P1 — Iceberg REST catalog (Rust, Apache-2.0). Only path for Iceberg
+  # writes — no path-based `IcebergS3` tables in product code. Backed by
+  # its own database (`lakekeeper-db-init`, above) on the existing
+  # `postgres` service.
+  #
+  # Failure mode: if this is down, `lakehouse-iceberg` (P1b) and any
+  # ClickHouse `DataLakeCatalog` database pointed at it fail closed —
+  # metadata operations (create table, commit snapshot, list tables) error
+  # out; it does not affect `lakehouse-api`'s own boot or its existing
+  # Postgres/ClickHouse-backed routes, which have no dependency on this
+  # service in this phase.
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:v0.13.3
+    # Empty search domain: on hosts whose own /etc/resolv.conf carries a
+    # search suffix (VPN/corporate DNS, Tailscale MagicDNS, ...), that
+    # suffix leaks into the container's resolv.conf too. Lakekeeper's
+    # Rust DNS resolver does not fall back to the bare name the way glibc
+    # does, so `postgres` gets expanded to `postgres.<suffix>`, NXDOMAINs,
+    # and the process exits — verified against this exact failure mode
+    # during P1a verification. See docs/OPERATIONS.md.
+    dns_search: ["."]
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+    environment:
+      LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_ENCRYPTION_KEY:-this-is-not-a-secure-key-change-me}
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://${POSTGRES_USER:-lakehouse}:${POSTGRES_PASSWORD:-lakehouse}@postgres:5432/${LAKEKEEPER_PG_DB:-lakekeeper}
+      LAKEKEEPER__BASE_URI: ${LAKEKEEPER_BASE_URI:-http://localhost:8181}
+    command: ["serve"]
+    ports:
+      - "${LAKEKEEPER_HOST_PORT:-8181}:8181"
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: unless-stopped
+
+  # P1b — one-shot: bootstrap the Lakekeeper SERVER (accept-terms-of-use,
+  # idempotent — a second call against an already-bootstrapped server is
+  # tolerated, not retried into an error) and register the
+  # `lakehouse-iceberg` warehouse against the RustFS bucket
+  # `rustfs-bucket-init` created above.
+  #
+  # `sts-enabled: true` is deliberate, not a placeholder: P1b's G1
+  # verification found that Lakekeeper only returns short-lived
+  # `s3.access-key-id`/`s3.secret-access-key`/`s3.session-token` values on
+  # `X-Iceberg-Access-Delegation: vended-credentials` when the warehouse's
+  # storage profile has STS enabled. With `sts-enabled: false` (the
+  # profile's own default), Lakekeeper instead responds with a
+  # `remote-signing` configuration (`s3.signer.uri`/`s3.signer.endpoint`,
+  # no key material at all) — a different delegation mechanism this
+  # crate deliberately does not implement (see
+  # `lakehouse-iceberg::catalog`'s module doc and ADR 0002). RustFS accepts
+  # `sts-role-arn` as an opaque string and does not validate it against a
+  # real IAM identity, so the placeholder ARN below is sufficient for a
+  # local/CI RustFS-backed warehouse; a real AWS S3 deployment would need a
+  # real assumable role instead.
+  lakekeeper-warehouse-init:
+    image: alpine:3.20
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      rustfs-bucket-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEKEEPER_BASE_URI: ${LAKEKEEPER_BASE_URI:-http://localhost:8181}
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        apk add --no-cache curl jq >/dev/null
+        base="http://lakekeeper:8181"
+        already=$$(curl -fsS "$$base/management/v1/info" | jq -r '.bootstrapped')
+        if [ "$$already" != "true" ]; then
+          curl -fsS -X POST "$$base/management/v1/bootstrap" \
+            -H 'Content-Type: application/json' \
+            -d '{"accept-terms-of-use": true}'
+        fi
+        exists=$$(curl -fsS "$$base/management/v1/warehouse" | \
+          jq -r --arg name "$$LAKEKEEPER_WAREHOUSE" \
+          '.warehouses[]? | select(.name == $$name) | .name')
+        if [ "$$exists" != "$$LAKEKEEPER_WAREHOUSE" ]; then
+          curl -fsS -X POST "$$base/management/v1/warehouse" \
+            -H 'Content-Type: application/json' \
+            -d '{
+              "warehouse-name": "'"$$LAKEKEEPER_WAREHOUSE"'",
+              "storage-profile": {
+                "type": "s3",
+                "bucket": "'"$$LAKEHOUSE_WAREHOUSE_BUCKET"'",
+                "region": "us-east-1",
+                "endpoint": "http://rustfs:9000",
+                "path-style-access": true,
+                "sts-enabled": true,
+                "sts-role-arn": "arn:aws:iam::000000000000:role/lakekeeper"
+              },
+              "storage-credential": {
+                "type": "s3",
+                "credential-type": "access-key",
+                "aws-access-key-id": "'"$$RUSTFS_ACCESS_KEY"'",
+                "aws-secret-access-key": "'"$$RUSTFS_SECRET_KEY"'"
+              }
+            }'
+        fi
+    restart: "no"
+
 volumes:
   lakehouse_postgres_data:
   lakehouse_clickhouse_data:
+  lakehouse_rustfs_data:

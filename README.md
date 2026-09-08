@@ -223,6 +223,44 @@ listed here because you need them to run the console at all:
 See `rust/crates/lakehouse-auth/README.md` for detailed, per-provider OIDC
 setup instructions (Okta, Entra, Google, Keycloak).
 
+A further set of variables live only in `docker-compose.yml` — they
+configure the P1 object store (RustFS) and Iceberg REST catalog
+(Lakekeeper) *services themselves* (ports, Lakekeeper's own Postgres
+database, its encryption key) and are not read by `config.rs`, because
+they configure the container, not the `lakehouse-iceberg` client that
+talks to it:
+
+| Variable | Purpose | Default | Required? |
+| --- | --- | --- | --- |
+| `RUSTFS_ACCESS_KEY` | RustFS S3 API access key | `rustfsadmin` (public, well-known) | No, but override before exposing RustFS beyond localhost |
+| `RUSTFS_SECRET_KEY` | RustFS S3 API secret key | `rustfsadmin` (public, well-known) | No, but override before exposing RustFS beyond localhost |
+| `RUSTFS_HOST_PORT` | Host port mapped to RustFS's S3 API (container port 9000) | `9010` | No |
+| `RUSTFS_CONSOLE_HOST_PORT` | Host port mapped to RustFS's web console (container port 9001) | `9011` | No |
+| `LAKEKEEPER_PG_DB` | Name of Lakekeeper's own Postgres database on the existing `postgres` service (separate from the `lakehouse` app database's `console` schema) | `lakekeeper` | No |
+| `LAKEKEEPER_ENCRYPTION_KEY` | Encrypts secrets in Lakekeeper's own schema | Lakekeeper's own placeholder — **change before any non-throwaway use** | No |
+| `LAKEKEEPER_BASE_URI` | Base URL Lakekeeper advertises in its own REST responses | `http://localhost:8181` | No |
+| `LAKEKEEPER_HOST_PORT` | Host port mapped to Lakekeeper's REST API (container port 8181) | `8181` | No |
+
+P1b (`lakehouse-iceberg`) adds the client-side counterparts below, read by
+`config.rs` — these are what a Rust process (not the container) uses to
+*connect to* RustFS/Lakekeeper. Nothing in `lakehouse-api` calls
+`lakehouse-iceberg` yet (that wiring is P6); these fields exist on
+`Config` today so the crate can be constructed from them once a route
+needs it, and so the G1 test and any manual `cargo run` usage have a
+documented, consistent source for the same values docker-compose already
+uses:
+
+| Variable | Purpose | Default | Required? |
+| --- | --- | --- | --- |
+| `LAKEKEEPER_CATALOG_URI` | Lakekeeper's Iceberg REST catalog base URI, as reached from the Rust process | `http://localhost:8181/catalog` | No |
+| `LAKEKEEPER_WAREHOUSE` | Lakekeeper warehouse this deployment writes Bronze tables into — see ADR 0003 for the `TENANT_ID` naming convention | `default` | No |
+| `LAKEKEEPER_CREDENTIAL_SECRET_REF` | `secretRef` (see `lakehouse_core::secret`, ADR 0002) for Lakekeeper's OAuth2 client-credential, when Lakekeeper authorization is enabled | unset (no-auth mode assumed) | No |
+| `RUSTFS_S3_ENDPOINT` | S3-compatible endpoint the `lakehouse-iceberg` `object_store` client targets | `http://localhost:9010` | No |
+| `RUSTFS_S3_REGION` | Region string sent to the S3 client (RustFS does not enforce AWS region semantics, but the S3 API requires a value) | `us-east-1` | No |
+| `LAKEHOUSE_WAREHOUSE_BUCKET` | Bucket the lakehouse warehouse's Iceberg tables live under — also read by the compose `rustfs-bucket-init` job | `lakehouse-warehouse` | No |
+| `RUSTFS_ACCESS_KEY_SECRET_REF` | `secretRef` for a static RustFS/S3 access key, used only as a fallback outside the vended-credentials write path (see `lakehouse-iceberg`'s crate doc) | unset | No |
+| `RUSTFS_SECRET_KEY_SECRET_REF` | `secretRef` for the matching static secret key | unset | No |
+
 ## Status / Known limitations
 
 This is a young, honestly-scoped project. Please read this before filing an

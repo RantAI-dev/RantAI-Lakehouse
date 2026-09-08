@@ -181,3 +181,23 @@ jobs:
 
       - name: Dependency review
         uses: actions/dependency-review-action@v4
+        with:
+          # GHSA-2f9f-gq7v-9h6m (moderate) — `thrift` 0.17.0, reached only as
+          # parquet <- iceberg <- lakehouse-iceberg. There is no version to
+          # bump to: `parquet` 58.4.0 declares `thrift ^0.17`, and no fixed
+          # 0.17.x exists (0.24 is the first fixed line and is
+          # semver-incompatible with that requirement). Verified with
+          # `cargo tree -i thrift` and `cargo update -p thrift`, which locks
+          # 0 packages.
+          #
+          # Not reachable from this codebase's own use: `thrift` is the
+          # Parquet *footer* metadata codec, exercised on files written and
+          # read inside the warehouse via `iceberg-rust`. The advisory
+          # concerns a decoder fed hostile input; the input here is Parquet
+          # this stack produced, in a bucket only this stack writes.
+          #
+          # `cargo audit`/`cargo deny` pass because RustSec has not mirrored
+          # this GHSA — so this exception is what keeps the finding VISIBLE
+          # and dated rather than silently absent. Re-check when arrow/parquet
+          # bumps its thrift requirement; drop this line the moment it does.
+          allow-ghsas: GHSA-2f9f-gq7v-9h6m
