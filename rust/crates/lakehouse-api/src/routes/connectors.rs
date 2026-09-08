@@ -18,13 +18,16 @@
 //! `ConnectorDetail` have no such field to serialize.
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
-use lakehouse_store::connectors::{self, ConnectorDetail, CreateConnectorInput};
+use lakehouse_store::cdc::ConnectorSlug;
+use lakehouse_store::connectors::{self, ConnectorDetail, ConnectorDialInfo, CreateConnectorInput};
 use serde::Deserialize;
 
+use crate::connector_deprovision::{self, DeprovisionError, Deprovisioned, PgTarget};
+use crate::connector_probe;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
@@ -253,19 +256,176 @@ pub async fn test_connection(
     }
 }
 
+/// `?force=true` on `DELETE /api/connectors/{id}` — see [`delete`]'s doc
+/// comment for what this overrides and why it exists at all.
+#[derive(Debug, Default, Deserialize)]
+pub struct DeleteQuery {
+    /// Delete the registry row even if CDC deprovisioning failed.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Derive the [`ConnectorSlug`] a `PostgreSQL` CDC connector's replication
+/// slot/publication would be named after, from the connector's own
+/// registry `id`.
+///
+/// There is no separate "Debezium slug" column: ADR 0007 never grew
+/// dynamic per-connector provisioning (see `lakehouse_store::cdc`'s module
+/// doc comment — "Callers"), so `connector.id`
+/// (`connectors::slug_id`'s output, e.g. `"conn-orders-pg-abc123"`) is the
+/// only identifier a real connector has, and it already uses exactly the
+/// charset a slug needs MINUS the separator: lowercase ASCII alphanumerics
+/// and `-`. Converting `-` to `_` maps it onto [`ConnectorSlug`]'s
+/// allowed shape (`^[a-z0-9][a-z0-9_]{0,62}$`) losslessly and
+/// deterministically — the same `id` always produces the same slug, so
+/// deprovisioning a connector always targets the slot/publication that
+/// connector's own id would have named if/when a real provisioning flow
+/// existed to create them.
+fn connector_slug_for_id(id: &str) -> Result<ConnectorSlug, ApiError> {
+    ConnectorSlug::new(&id.replace('-', "_")).map_err(|err| {
+        // `connector.id` is always `slug_id`-generated (see that
+        // function's doc comment), so this should be unreachable in
+        // practice; if it ever isn't, this is a 500 (a data-shape problem
+        // this deployment has, not something the caller did wrong), not a
+        // silent skip of deprovisioning.
+        ApiError::Internal(format!(
+            "connector id {id:?} does not map to a valid CDC slug: {err}"
+        ))
+    })
+}
+
+/// Attempt to drop `id`'s `PostgreSQL` CDC replication slot/publication —
+/// the real work behind [`delete`]'s pre-delete deprovision step. Resolves
+/// `dial_info`'s host/credential exactly the way
+/// [`crate::connector_probe::probe`] does for `POST
+/// /api/connectors/{id}/test` (same parser, same allowlisted resolver),
+/// because dropping a slot needs the same "safely resolve this
+/// connector's own secretRef and dial its own host" capability a
+/// connectivity test already has — see `connector_deprovision`'s module
+/// doc comment for why this makes
+/// `ops/debezium/deprovision_connector.sh`'s "the API has no such
+/// mechanism" comment obsolete.
+async fn deprovision_postgres_connector(
+    state: &AppState,
+    id: &str,
+    dial_info: &ConnectorDialInfo,
+) -> Result<Deprovisioned, ApiError> {
+    let slug = connector_slug_for_id(id)?;
+    let Some(target) = connector_probe::parse_postgres_host(&dial_info.host) else {
+        return Err(ApiError::Internal(format!(
+            "connector {id} is registered as PostgreSQL but its host is not shaped \
+             \"<user>@<host>:<port>/<database>\", so CDC deprovisioning cannot even attempt to \
+             dial it"
+        )));
+    };
+    let password = state
+        .connector_secret_resolver
+        .resolve_dyn(&dial_info.secret_ref)
+        .await
+        .map_err(|err| {
+            ApiError::Internal(format!(
+                "could not resolve connector {id}'s credential to deprovision its CDC slot: {err}"
+            ))
+        })?;
+    let pg_target = PgTarget {
+        host: target.host.to_owned(),
+        port: target.port,
+        user: target.user.to_owned(),
+        password,
+        database: target.database.to_owned(),
+    };
+    connector_deprovision::drop_slot_and_publication(&pg_target, &slug)
+        .await
+        .map_err(|err| ApiError::Internal(deprovision_error_message(id, &slug, &err)))
+}
+
+/// Render a [`DeprovisionError`] into text safe to put in a 409/500 body or
+/// a log line — never the credential [`deprovision_postgres_connector`]
+/// resolved, only the slot/publication names and the error's own
+/// `Display` (which, per [`DeprovisionError`]'s doc comment, never
+/// includes connection credentials).
+fn deprovision_error_message(id: &str, slug: &ConnectorSlug, err: &DeprovisionError) -> String {
+    format!(
+        "deprovisioning connector {id}'s CDC replication slot ({slug}_slot) and publication \
+         ({slug}_pub) failed: {err}"
+    )
+}
+
 /// `DELETE /api/connectors/{id}` — remove a connector registration.
 ///
-/// Does not itself contact the connector's source system — see
-/// `lakehouse_store::connectors::delete_connector`'s doc comment for why,
-/// and for the CDC slot-cleanup gap this leaves (P5).
+/// # `PostgreSQL` CDC deprovisioning happens FIRST
+///
+/// For a `PostgreSQL`-kind connector, this now attempts to drop its
+/// replication slot/publication on the source database (see
+/// [`deprovision_postgres_connector`]) BEFORE removing the registry row —
+/// the fix for the exact gap `lakehouse_store::connectors::delete_connector`
+/// used to describe: silently deleting the row while the slot survived
+/// left it pinning WAL on the customer's source database until disk filled,
+/// forever, with nothing in the registry to show it. Deprovisioning is
+/// idempotent (an already-absent slot/publication is success), so a
+/// connector that was never fully provisioned, or was already cleaned up
+/// by a previous attempt, still deletes cleanly.
+///
+/// - Deprovision succeeds (or the connector is not `PostgreSQL`) -> the row
+///   is deleted -> 204, same as before.
+/// - Deprovision fails and `?force` is absent/false -> the row is KEPT and
+///   this returns 409, naming the slot/publication in the message. This is
+///   deliberate: the whole point is that an orphaned slot must stay
+///   visible (as a connector row still in the registry) rather than
+///   vanish along with the only record that it needs cleaning up.
+/// - Deprovision fails and `?force=true` is given -> the row is deleted
+///   anyway (204) and a `tracing::error!` names the slot, publication, and
+///   host as a deliberately loud, greppable record of the orphan this
+///   just created. `force` exists because a connector can end up pointing
+///   at a decommissioned or now-unreachable host — deprovisioning can
+///   never succeed there, and an operator who already knows that needs a
+///   way to remove the row anyway rather than being stuck forever.
 ///
 /// # Errors
 ///
-/// 404 if `id` is unknown; 503/500 as above.
+/// 404 if `id` is unknown; 409 if `PostgreSQL` CDC deprovisioning failed
+/// and `force` was not given; 503/500 as above.
 pub async fn delete(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<DeleteQuery>,
 ) -> ApiResult<StatusCode> {
+    let dial_info = connectors::get_connector_dial_info(pool(&state)?, &id).await?;
+    let Some(dial_info) = dial_info else {
+        return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
+    };
+
+    if dial_info.kind.to_lowercase().contains("postgres")
+        && let Err(err) = deprovision_postgres_connector(&state, &id, &dial_info).await
+    {
+        if query.force {
+            let slug = connector_slug_for_id(&id).ok();
+            tracing::error!(
+                connector_id = %id,
+                slot = %slug.as_ref().map_or_else(|| "<unknown>".to_owned(), |s| format!("{s}_slot")),
+                publication = %slug.as_ref().map_or_else(|| "<unknown>".to_owned(), |s| format!("{s}_pub")),
+                host = %dial_info.host,
+                error = %err,
+                "force-deleting connector despite failed CDC deprovision: the replication \
+                 slot/publication above may still exist on the source database and will \
+                 keep pinning WAL until cleaned up manually"
+            );
+        } else {
+            let slug_hint = connector_slug_for_id(&id).map_or_else(
+                |_| "its CDC slot/publication".to_owned(),
+                |s| format!("slot {s}_slot / publication {s}_pub"),
+            );
+            return Err(ApiError::Conflict(format!(
+                "connector {id} was NOT deleted: dropping {slug_hint} failed ({err}); the \
+                 registry row is kept deliberately so this orphaned slot stays visible instead \
+                 of silently pinning WAL on the source database forever. Retry once the source \
+                 is reachable, or pass ?force=true to delete the row anyway (the \
+                 slot/publication will then have to be cleaned up manually)."
+            ))
+            .into());
+        }
+    }
+
     let deleted = connectors::delete_connector(pool(&state)?, &id).await?;
     if !deleted {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
