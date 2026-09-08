@@ -48,6 +48,8 @@
 //! regression test.
 
 use lakehouse_auth::PermissionSet;
+use lakehouse_store::PgPool;
+use lakehouse_store::agents::{self as store_agents, NewApprovalRequest};
 use serde_json::{Map, Value, json};
 
 use super::registry::{Risk, ToolSpec};
@@ -93,19 +95,116 @@ fn needs_confirmation(spec: &ToolSpec, args: &Map<String, Value>) -> Value {
     })
 }
 
-/// T0.4 placeholder for [`Risk::WriteHigh`]: the approvals-inbox flow
-/// (T0.5 of the copilot-operations-handover plan) does not exist yet, so a
-/// `WriteHigh` call must neither execute nor silently pass through a
-/// confirmation path meant for [`Risk::WriteLow`] — it is refused with a
-/// clear "not implemented yet" reason instead. Replace this arm with the
-/// real approval-item creation when T0.5 lands.
-fn write_high_not_implemented(tool_name: &str) -> Value {
+/// T0.5: [`decide`]'s internal signal for a [`Risk::WriteHigh`] call that
+/// has passed both the ask-mode and permission checks. This is NEVER
+/// returned to the model/frontend as-is — it only tells the caller (the
+/// chat loop / `POST /api/ai/tool`) "create the approval now, then build
+/// the real `needs_approval` response" (see [`create_write_high_approval`]
+/// and [`is_write_high_pending`]). Kept as a `decide`-produced value
+/// (rather than a third enum variant) so `decide` stays a single pure,
+/// synchronous function — approval creation is an async database write
+/// and does not belong inside it.
+fn write_high_pending_marker(tool_name: &str) -> Value {
     json!({
-        "error": "ditolak: tool ini butuh persetujuan (approval) yang belum tersedia",
-        "refused": true,
+        "__write_high_pending__": true,
         "tool": tool_name,
-        "reason": "not_implemented",
     })
+}
+
+/// `true` for exactly the marker [`write_high_pending_marker`] produces —
+/// distinguishes "this call needs a real `WriteHigh` approval created" from
+/// every other [`decide`] result (a genuine refusal, or `needs_confirmation`).
+#[must_use]
+pub fn is_write_high_pending(value: &Value) -> bool {
+    value.get("__write_high_pending__").and_then(Value::as_bool) == Some(true)
+}
+
+/// A short, deterministic Indonesian reason sentence for a [`Risk::WriteHigh`]
+/// approval request — the same "never ask the LLM" discipline as
+/// [`summary_for`], with its own match arms since a `WriteHigh` tool's
+/// phrasing ("menghapus", "tidak dapat dibatalkan") reads differently from
+/// a `WriteLow` confirmation.
+fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
+    let s = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
+    match spec.name {
+        "delete_chart" => format!(
+            "Menghapus chart {} dari dashboard secara permanen.",
+            s("id")
+        ),
+        _ => format!(
+            "Menjalankan tool berisiko tinggi {} yang butuh persetujuan manusia.",
+            spec.name
+        ),
+    }
+}
+
+/// Fixed Indonesian risk statement stored on every `WriteHigh` approval —
+/// there is exactly one `WriteHigh` tool today (`delete_chart`); a future
+/// one gets this same generic statement unless refined.
+const WRITE_HIGH_RISK: &str =
+    "Tindakan berisiko tinggi (WriteHigh): tidak dapat dibatalkan setelah dijalankan.";
+
+/// T0.5: the real approvals-inbox flow for a [`Risk::WriteHigh`] call that
+/// [`decide`] has already flagged with [`write_high_pending_marker`] (mode
+/// and permission checks already passed). Creates the linked `agent_run`
+/// (`waiting_approval`, attributed to `emp-copilot`) + `approval_item`
+/// (`pending`) pair and returns the `needs_approval` JSON the model/frontend
+/// see — **nothing executes here or until a human approves it** (see
+/// `routes::agents::decide_approval`).
+///
+/// `redacted_args` MUST already be redacted (plan invariant 5 — see
+/// `super::audit::redact`); this function stores them verbatim into
+/// `approval_item.evidence` and the linked run's stored tool call.
+///
+/// With no Postgres pool configured, this fails closed: a `refused` result
+/// is returned and NOTHING is created — there is nowhere durable to put an
+/// approval a human could later see and act on, so silently allowing the
+/// call through would be worse than refusing it.
+pub async fn create_write_high_approval(
+    pg: Option<&PgPool>,
+    actor: &str,
+    spec: &ToolSpec,
+    raw_args: &Map<String, Value>,
+    redacted_args: &Value,
+    resource_id: Option<&str>,
+) -> Value {
+    let Some(pool) = pg else {
+        return json!({
+            "error": "ditolak: approval tidak tersedia (Postgres tidak dikonfigurasi)",
+            "refused": true,
+            "tool": spec.name,
+        });
+    };
+    let reason = reason_for_write_high(spec, raw_args);
+    let req = NewApprovalRequest {
+        tool: spec.name,
+        actor,
+        resource: resource_id,
+        reason: &reason,
+        risk: WRITE_HIGH_RISK,
+        redacted_args,
+    };
+    match store_agents::create_pending_approval(pool, req).await {
+        Ok(created) => json!({
+            "needs_approval": true,
+            "approval_id": created.approval_id,
+            "run_id": created.run_id,
+            "tool": spec.name,
+            "summary": reason,
+        }),
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                tool = spec.name,
+                "copilot: failed to create WriteHigh approval; refusing the call"
+            );
+            json!({
+                "error": "ditolak: gagal membuat approval",
+                "refused": true,
+                "tool": spec.name,
+            })
+        }
+    }
 }
 
 /// A short, deterministic Indonesian sentence describing exactly what a
@@ -222,11 +321,12 @@ pub fn outcome_of(refusal: &Value) -> &'static str {
 ///   otherwise a [`needs_confirmation`] result — nothing executes, and the
 ///   model/frontend must resend the identical call with `confirmed: true`
 ///   (see `POST /api/ai/tool`, [`super::tool_call`]).
-/// - [`Risk::WriteHigh`] → always [`write_high_not_implemented`] for now;
-///   the real approvals-inbox flow is T0.5, not this task. This is
-///   deliberately NOT the same as executing, and NOT the `WriteLow`
-///   confirmation path — a `WriteHigh` call must never slip through by
-///   carrying `confirmed: true`.
+/// - [`Risk::WriteHigh`] → always [`write_high_pending_marker`] — an
+///   internal signal, never returned to the model/frontend as-is, that
+///   tells the caller to create a real approval via
+///   [`create_write_high_approval`] (T0.5). This is deliberately NOT the
+///   same as executing, and NOT the `WriteLow` confirmation path — a
+///   `WriteHigh` call must never slip through by carrying `confirmed: true`.
 #[must_use]
 pub fn decide(
     is_build: bool,
@@ -245,7 +345,7 @@ pub fn decide(
     }
     match spec.risk {
         Risk::Read => None,
-        Risk::WriteHigh => Some(write_high_not_implemented(spec.name)),
+        Risk::WriteHigh => Some(write_high_pending_marker(spec.name)),
         Risk::WriteLow => {
             let confirmed = args.get("confirmed") == Some(&Value::Bool(true));
             if confirmed {
@@ -416,18 +516,20 @@ mod tests {
         assert!(summary.contains("mart_wisman"));
     }
 
-    /// T0.4: `WriteHigh` (`delete_chart`) is never executed by this gate,
+    /// T0.5: `WriteHigh` (`delete_chart`) is never executed by this gate,
     /// even with `confirmed: true` — that flag only means something for
-    /// `WriteLow`. It gets a distinct `reason: "not_implemented"` refusal,
-    /// not the ask-mode or permission shape, and not `needs_confirmation`.
+    /// `WriteLow`. It gets the internal [`write_high_pending_marker`]
+    /// signal, distinct from both the ask-mode/permission refusal shape and
+    /// `needs_confirmation` — the caller must turn it into a real approval
+    /// via [`create_write_high_approval`], not treat it as a refusal.
     #[test]
-    fn write_high_tool_is_refused_not_implemented_even_when_confirmed() {
+    fn write_high_tool_is_pending_approval_even_when_confirmed() {
         let perms = admin_perms();
-        let refused = decide(true, Some(&perms), spec("delete_chart"), &confirmed_args())
+        let pending = decide(true, Some(&perms), spec("delete_chart"), &confirmed_args())
             .expect("WriteHigh must never return None (i.e. must never execute) from this gate");
-        assert_eq!(refused["refused"], json!(true));
-        assert_eq!(refused["reason"], json!("not_implemented"));
-        assert!(refused.get("needs_confirmation").is_none());
+        assert!(is_write_high_pending(&pending));
+        assert!(pending.get("refused").is_none());
+        assert!(pending.get("needs_confirmation").is_none());
     }
 
     /// A non-write tool is never refused for ask-mode reasons, in either
@@ -601,9 +703,17 @@ mod tests {
         let refused = decide(false, Some(&perms), spec("create_board"), &no_args())
             .expect("must be refused (ask mode)");
         assert_eq!(outcome_of(&refused), "refused");
+    }
 
-        let not_implemented = decide(true, Some(&perms), spec("delete_chart"), &confirmed_args())
-            .expect("must be refused (not implemented)");
-        assert_eq!(outcome_of(&not_implemented), "refused");
+    /// The `WriteHigh` pending marker is not a [`decide`]/[`outcome_of`]
+    /// refusal at all — callers must check [`is_write_high_pending`]
+    /// BEFORE calling [`outcome_of`] on a `decide` result (the chat loop
+    /// and `POST /api/ai/tool` dispatch do exactly that).
+    #[test]
+    fn write_high_pending_is_not_classified_by_outcome_of() {
+        let perms = admin_perms();
+        let pending = decide(true, Some(&perms), spec("delete_chart"), &confirmed_args())
+            .expect("must be pending approval");
+        assert!(is_write_high_pending(&pending));
     }
 }

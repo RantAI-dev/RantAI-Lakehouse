@@ -195,10 +195,13 @@ async fn write_low_tool_confirmed_passes_the_gate_and_is_audited_as_executed_or_
     assert_ne!(ours[0].outcome, "needs_confirmation");
 }
 
-/// `WriteHigh` (`delete_chart`) is refused — never executed, never let
-/// through by `confirmed: true` — and audited as `refused`.
+/// `WriteHigh` (`delete_chart`) is NEVER executed by `POST /api/ai/tool`,
+/// even with `confirmed: true` (that flag only means something for
+/// `WriteLow`) — instead it creates a pending `agent_run` +
+/// `approval_item` pair (T0.5) and is audited `needs_approval`, linked by
+/// `run_id`/`approval_id`.
 #[tokio::test]
-async fn write_high_tool_is_refused_even_when_confirmed_and_is_audited() {
+async fn write_high_tool_creates_a_pending_approval_and_never_executes() {
     let TestApp { router, pool } = spin_up().await;
     let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
 
@@ -210,8 +213,35 @@ async fn write_high_tool_is_refused_even_when_confirmed_and_is_audited() {
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = json_body(resp).await;
-    assert_eq!(body["outcome"], json!("refused"));
-    assert_eq!(body["result"]["reason"], json!("not_implemented"));
+    assert_eq!(body["outcome"], json!("needs_approval"));
+    assert_eq!(body["result"]["needs_approval"], json!(true));
+    assert_eq!(body["result"]["tool"], json!("delete_chart"));
+    let approval_id = body["result"]["approval_id"]
+        .as_str()
+        .expect("approval_id present")
+        .to_owned();
+    let run_id = body["result"]["run_id"]
+        .as_str()
+        .expect("run_id present")
+        .to_owned();
+
+    // Exactly one approval + one run, and NOTHING executed (the chart
+    // still doesn't exist, but more importantly there is no way to tell
+    // from this response alone — the run's own status proves it).
+    let approvals = lakehouse_store::agents::list_approvals(&pool, None)
+        .await
+        .expect("list approvals");
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0].id, approval_id);
+    assert_eq!(approvals[0].status, "pending");
+    assert_eq!(approvals[0].action, "delete_chart");
+
+    let run = lakehouse_store::agents::get_run(&pool, &run_id)
+        .await
+        .expect("get run")
+        .expect("run exists");
+    assert_eq!(run.status, "waiting_approval");
+    assert_eq!(run.employee_id, "emp-copilot");
 
     let events = list(&pool, AuditFilter::default())
         .await
@@ -221,7 +251,9 @@ async fn write_high_tool_is_refused_even_when_confirmed_and_is_audited() {
         .filter(|e| e.action == "delete_chart")
         .collect();
     assert_eq!(ours.len(), 1);
-    assert_eq!(ours[0].outcome, "refused");
+    assert_eq!(ours[0].outcome, "needs_approval");
+    assert_eq!(ours[0].run_id.as_deref(), Some(run_id.as_str()));
+    assert_eq!(ours[0].approval_id.as_deref(), Some(approval_id.as_str()));
 }
 
 /// Plan invariant 5: a secret-shaped argument is never stored in

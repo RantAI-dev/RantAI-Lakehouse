@@ -10,10 +10,19 @@
 //! validation, tool dispatch, and mode-based tool filtering are ported
 //! faithfully.
 
-mod audit;
+// T0.5: `audit`, `registry`, and `tools` are `pub(in crate::routes)` (not
+// merely `pub(super)`) so `routes::agents::decide_approval` — a SIBLING
+// module of `routes::ai`, not a descendant — can reach the tool registry
+// (to check the approver's own permission for the tool being approved),
+// the shared redact/audit-record helpers, and the SAME tool dispatch
+// (`tools::run_tool`) the chat loop and `POST /api/ai/tool` use, so an
+// approved `WriteHigh` call executes through the identical code path
+// rather than a second, divergent one. `gate` stays private: approval
+// CREATION only ever happens from inside this module's own dispatch.
+pub(in crate::routes) mod audit;
 mod gate;
-mod registry;
-mod tools;
+pub(in crate::routes) mod registry;
+pub(in crate::routes) mod tools;
 
 use axum::body::Bytes;
 use axum::extract::{Extension, Query, State};
@@ -297,14 +306,54 @@ pub async fn chat(
             // instead of assuming a write (or a read it wasn't allowed)
             // it never got.
             let gate_result = gate::decide_by_name(is_build, perms, &call.function.name, &args);
-            let (result, outcome) = if let Some(refusal) = gate_result {
-                let outcome = gate::outcome_of(&refusal);
-                (refusal, outcome)
+            let (result, outcome, run_id, approval_id) = if let Some(refusal) = gate_result {
+                if gate::is_write_high_pending(&refusal) {
+                    let Some(spec) = registry::find(&call.function.name) else {
+                        unreachable!("is_write_high_pending only set for a registered tool")
+                    };
+                    let (_, resource_id) =
+                        audit::resource_for(&call.function.name, &args, &json!({}));
+                    let redacted = audit::redact(&Value::Object(args.clone()));
+                    let actor = principal.as_ref().map_or_else(
+                        || "unknown".to_owned(),
+                        |Extension(p)| p.display_name.clone(),
+                    );
+                    let approval_result = gate::create_write_high_approval(
+                        state.pg.as_deref(),
+                        &actor,
+                        spec,
+                        &args,
+                        &redacted,
+                        resource_id.as_deref(),
+                    )
+                    .await;
+                    let (run_id, approval_id) = if approval_result
+                        .get("needs_approval")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    {
+                        (
+                            approval_result["run_id"].as_str().map(str::to_owned),
+                            approval_result["approval_id"].as_str().map(str::to_owned),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    let outcome = if run_id.is_some() {
+                        "needs_approval"
+                    } else {
+                        "failed"
+                    };
+                    (approval_result, outcome, run_id, approval_id)
+                } else {
+                    let outcome = gate::outcome_of(&refusal);
+                    (refusal, outcome, None, None)
+                }
             } else {
                 let clean_args = gate::strip_confirmed(&args);
                 let result = tools::run_tool(&state, &call.function.name, &clean_args).await;
                 let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
-                (result, if ok { "executed" } else { "failed" })
+                (result, if ok { "executed" } else { "failed" }, None, None)
             };
             let (resource_kind, resource_id) =
                 audit::resource_for(&call.function.name, &args, &result);
@@ -318,6 +367,8 @@ pub async fn chat(
                 &Value::Object(args.clone()),
                 outcome,
                 None,
+                run_id.as_deref(),
+                approval_id.as_deref(),
             )
             .await;
             let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
@@ -449,14 +500,50 @@ pub async fn tool_call(
     let is_build = parsed.mode.as_deref() == Some("build");
 
     let gate_result = gate::decide(is_build, perms, spec, &parsed.args);
-    let (result, outcome) = if let Some(refusal) = gate_result {
-        let outcome = gate::outcome_of(&refusal);
-        (refusal, outcome)
+    let (result, outcome, run_id, approval_id) = if let Some(refusal) = gate_result {
+        if gate::is_write_high_pending(&refusal) {
+            let (_, resource_id) = audit::resource_for(&parsed.tool, &parsed.args, &json!({}));
+            let redacted = audit::redact(&Value::Object(parsed.args.clone()));
+            let actor = principal.as_ref().map_or_else(
+                || "unknown".to_owned(),
+                |Extension(p)| p.display_name.clone(),
+            );
+            let approval_result = gate::create_write_high_approval(
+                state.pg.as_deref(),
+                &actor,
+                spec,
+                &parsed.args,
+                &redacted,
+                resource_id.as_deref(),
+            )
+            .await;
+            let (run_id, approval_id) = if approval_result
+                .get("needs_approval")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                (
+                    approval_result["run_id"].as_str().map(str::to_owned),
+                    approval_result["approval_id"].as_str().map(str::to_owned),
+                )
+            } else {
+                (None, None)
+            };
+            let outcome = if run_id.is_some() {
+                "needs_approval"
+            } else {
+                "failed"
+            };
+            (approval_result, outcome, run_id, approval_id)
+        } else {
+            let outcome = gate::outcome_of(&refusal);
+            (refusal, outcome, None, None)
+        }
     } else {
         let clean_args = gate::strip_confirmed(&parsed.args);
         let result = tools::run_tool(&state, &parsed.tool, &clean_args).await;
         let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
-        (result, if ok { "executed" } else { "failed" })
+        (result, if ok { "executed" } else { "failed" }, None, None)
     };
     let (resource_kind, resource_id) = audit::resource_for(&parsed.tool, &parsed.args, &result);
     audit::record(
@@ -469,6 +556,8 @@ pub async fn tool_call(
         &Value::Object(parsed.args.clone()),
         outcome,
         None,
+        run_id.as_deref(),
+        approval_id.as_deref(),
     )
     .await;
 

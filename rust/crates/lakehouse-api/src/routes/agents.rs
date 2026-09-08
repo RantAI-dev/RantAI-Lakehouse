@@ -19,8 +19,9 @@
 //! `lakehouse_store::agents`'s module doc comment.
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
+use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::agents::{
@@ -28,9 +29,11 @@ use lakehouse_store::agents::{
     CreateWorkflowInput, Decision, DigitalEmployee, RegisterToolInput,
 };
 use serde::Deserialize;
+use serde_json::{Map, Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::ai::{audit as ai_audit, registry as ai_registry, tools as ai_tools};
 use crate::state::AppState;
 
 /// Borrow the Postgres pool, or fail with a 503. Mirrors
@@ -357,6 +360,37 @@ pub struct DecideApprovalBody {
 /// `POST /api/agents/approvals/{id}/decide` — approve or reject a pending
 /// approval.
 ///
+/// # T0.5: approve executes the linked run's stored tool call
+///
+/// `lakehouse_store::agents::decide_approval` does `SELECT ... FOR UPDATE`
+/// on the approval row, checks `status == "pending"`, and only then flips
+/// it — so of any number of concurrent `decide` calls on the SAME
+/// approval, exactly one can ever observe `Ok(_)` from that call; every
+/// other one gets [`lakehouse_store::StoreError::Conflict`] (409) and
+/// returns here BEFORE any execution logic runs. That is the entire
+/// exactly-once guarantee this handler relies on: only the single call
+/// that wins the pending→approved transition ever reaches the execution
+/// code below, so a second `decide` on an already-decided approval can
+/// never execute the tool a second time (see the invariant's HTTP-level
+/// test, `decide_approval_double_decide_executes_at_most_once`).
+///
+/// On **approve**, after that transition succeeds:
+/// 1. The APPROVER's own permission for the tool being approved is
+///    checked — `agent:approve` (this route's own policy) does NOT imply
+///    the approver may perform the underlying action. A missing
+///    permission means the tool is NEVER executed: the run is recorded
+///    `failed`/"not executed", audited, and this returns 403.
+/// 2. The linked run's stored tool call (`lakehouse_store::agents::
+///    pending_tool_call`, recorded verbatim by `gate::create_write_high_approval`
+///    at request time) is replayed through the SAME tool dispatch
+///    (`routes::ai::tools::run_tool`) the chat loop and
+///    `POST /api/ai/tool` use — never a second, divergent execution path.
+/// 3. The result is appended to `agent_run.steps`, the run's terminal
+///    status is set, and an `audit_event` records the outcome, linked by
+///    `run_id`/`approval_id`.
+///
+/// On **reject**, the run is marked `rejected` and nothing executes.
+///
 /// # Errors
 ///
 /// 400 on a malformed body or a `decision` other than `"approved"`/
@@ -364,12 +398,23 @@ pub struct DecideApprovalBody {
 /// been decided (mirrors `mock/agents.ts`'s "already {status}" guard — a
 /// state conflict, not a bad request, hence 409 rather than the mock's
 /// 400: see `lakehouse_store::agents::decide_approval`'s doc comment);
+/// 403 if the approval was approved but the approver lacks the underlying
+/// tool's own permission (the tool is never executed in that case);
 /// 503/500 as above.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one straight-line sequence of terminal outcomes (reject / \
+              unknown tool / approver lacks permission / execute), each of \
+              which records a run outcome and an audit event before \
+              returning; splitting it up would scatter that one linear \
+              decision tree across helpers with no independent reuse"
+)]
 pub async fn decide_approval(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Extension(principal): Extension<Principal>,
     body: Bytes,
-) -> ApiResult<ApiJson<ApprovalItem>> {
+) -> ApiResult<ApiJson<Value>> {
     let body: DecideApprovalBody = parse_body(&body)?;
     let decision = match body.decision.as_str() {
         "approved" => Decision::Approved,
@@ -381,16 +426,153 @@ pub async fn decide_approval(
             .into());
         }
     };
-    match agents::decide_approval(pool(&state)?, &id, decision, body.comment.as_deref()).await {
-        Ok(updated) => Ok(ApiJson(updated)),
+    let pg = pool(&state)?;
+
+    let approval = match agents::decide_approval(pg, &id, decision, body.comment.as_deref()).await {
+        Ok(updated) => updated,
         Err(lakehouse_store::StoreError::NotFound) => {
-            Err(ApiError::NotFound(format!("Approval {id} not found")).into())
+            return Err(ApiError::NotFound(format!("Approval {id} not found")).into());
         }
         Err(lakehouse_store::StoreError::Conflict) => {
-            Err(ApiError::Conflict(format!("Approval {id} has already been decided")).into())
+            return Err(
+                ApiError::Conflict(format!("Approval {id} has already been decided")).into(),
+            );
         }
-        Err(err) => Err(ApiError::from(err).into()),
+        Err(err) => return Err(ApiError::from(err).into()),
+    };
+
+    let decide_outcome = match decision {
+        Decision::Approved => "approved",
+        Decision::Rejected => "rejected",
+    };
+    ai_audit::record(
+        Some(pg),
+        Some(&principal),
+        None,
+        &approval.action,
+        Some("approval"),
+        Some(&id),
+        &json!({ "comment": body.comment }),
+        decide_outcome,
+        None,
+        approval.run_id.as_deref(),
+        Some(&id),
+    )
+    .await;
+
+    // Approvals the copilot creates always carry a `run_id` (see
+    // `create_pending_approval`); one that doesn't (a manually-inserted or
+    // future non-copilot approval) has nothing to execute — return the
+    // decision as-is.
+    let Some(run_id) = approval.run_id.clone() else {
+        return Ok(ApiJson(json!({ "approval": approval, "executed": false })));
+    };
+
+    if decision == Decision::Rejected {
+        if let Err(err) = agents::record_run_outcome(
+            pg,
+            &run_id,
+            "rejected",
+            "Ditolak",
+            body.comment.as_deref().unwrap_or(""),
+        )
+        .await
+        {
+            tracing::warn!(%err, run_id, "failed to record rejected-run outcome");
+        }
+        return Ok(ApiJson(json!({ "approval": approval, "executed": false })));
     }
+
+    // Approved: check the APPROVER's own permission for the tool BEFORE
+    // executing anything — `agent:approve` is a narrower, per-decision
+    // grant that does not imply the approver may perform the underlying
+    // action (plan invariant 3 / the copilot-operations-handover plan's
+    // permission rule).
+    let Some(spec) = ai_registry::find(&approval.action) else {
+        let detail = format!("tool tidak dikenal: {}", approval.action);
+        if let Err(err) =
+            agents::record_run_outcome(pg, &run_id, "failed", "Tidak dieksekusi", &detail).await
+        {
+            tracing::warn!(%err, run_id, "failed to record not-executed outcome");
+        }
+        return Err(ApiError::Internal(detail).into());
+    };
+
+    if !spec.permission.is_empty() && !principal.permissions.has(spec.permission) {
+        let detail = format!(
+            "approval disetujui, TAPI tidak dieksekusi: approver tidak punya izin '{}' untuk \
+             menjalankan tool ini",
+            spec.permission
+        );
+        if let Err(err) =
+            agents::record_run_outcome(pg, &run_id, "failed", "Tidak dieksekusi", &detail).await
+        {
+            tracing::warn!(%err, run_id, "failed to record permission-denied outcome");
+        }
+        ai_audit::record(
+            Some(pg),
+            Some(&principal),
+            None,
+            &approval.action,
+            None,
+            approval.resource.as_deref(),
+            &json!({}),
+            "failed",
+            Some(&detail),
+            Some(&run_id),
+            Some(&id),
+        )
+        .await;
+        return Err(ApiError::PermissionDenied(detail).into());
+    }
+
+    // Load the run and replay its stored tool call through the SAME
+    // dispatch every other execution path uses.
+    let run = agents::get_run(pg, &run_id)
+        .await?
+        .ok_or_else(|| ApiError::Internal(format!("linked run {run_id} vanished")))?;
+    let Some(pending) = agents::pending_tool_call(&run) else {
+        let detail = "run yang disetujui tidak menyimpan tool call".to_owned();
+        if let Err(err) =
+            agents::record_run_outcome(pg, &run_id, "failed", "Tidak dieksekusi", &detail).await
+        {
+            tracing::warn!(%err, run_id, "failed to record missing-tool-call outcome");
+        }
+        return Err(ApiError::Internal(detail).into());
+    };
+    let args: Map<String, Value> = pending.args.as_object().cloned().unwrap_or_default();
+    let result = ai_tools::run_tool(&state, &pending.tool, &args).await;
+    let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
+    let status = if ok { "succeeded" } else { "failed" };
+    if let Err(err) = agents::record_run_outcome(
+        pg,
+        &run_id,
+        status,
+        "Eksekusi setelah disetujui",
+        &serde_json::to_string(&result).unwrap_or_default(),
+    )
+    .await
+    {
+        tracing::warn!(%err, run_id, "failed to record execution outcome");
+    }
+    ai_audit::record(
+        Some(pg),
+        Some(&principal),
+        None,
+        &pending.tool,
+        None,
+        approval.resource.as_deref(),
+        &json!({}),
+        if ok { "executed" } else { "failed" },
+        None,
+        Some(&run_id),
+        Some(&id),
+    )
+    .await;
+
+    Ok(ApiJson(
+        json!({ "approval": approval, "executed": true, "result": result }),
+    ))
 }
 
 #[cfg(test)]

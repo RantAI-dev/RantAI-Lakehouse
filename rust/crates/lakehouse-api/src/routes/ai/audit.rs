@@ -159,6 +159,8 @@ pub async fn record(
     args: &Value,
     outcome: &str,
     detail: Option<&str>,
+    run_id: Option<&str>,
+    approval_id: Option<&str>,
 ) {
     let Some(pool) = pg else {
         tracing::warn!(
@@ -178,8 +180,8 @@ pub async fn record(
         args: Some(redact(args)),
         outcome: outcome.to_owned(),
         detail: detail.map(str::to_owned),
-        run_id: None,
-        approval_id: None,
+        run_id: run_id.map(str::to_owned),
+        approval_id: approval_id.map(str::to_owned),
         session_id: session_id.map(str::to_owned),
     };
     if let Err(err) = audit::insert(pool, event).await {
@@ -283,6 +285,8 @@ mod tests {
             Some("b-1"),
             &json!({ "name": "Test" }),
             "executed",
+            None,
+            None,
             None,
         )
         .await;

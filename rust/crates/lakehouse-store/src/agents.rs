@@ -13,10 +13,12 @@
 //! method, so nothing here is a scoped-down stand-in for one; the contract
 //! itself never asked for an execution runtime.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::FromRow;
 use sqlx::types::Json;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::{PgPool, StoreError};
 
@@ -861,6 +863,181 @@ pub async fn decide_approval(
         .await?;
     tx.commit().await?;
     Ok(row.into())
+}
+
+// ---------------------------------------------------------------------
+// WriteHigh copilot approvals (T0.5, copilot-operations-handover plan)
+// ---------------------------------------------------------------------
+
+/// The reserved interactive-copilot employee row `0024_agent_schedule.sql`
+/// inserts — every `WriteHigh` copilot call is attributed to this id.
+pub const COPILOT_EMPLOYEE_ID: &str = "emp-copilot";
+
+/// [`COPILOT_EMPLOYEE_ID`]'s display name, denormalized into
+/// `approval_item.employee_name` at request time (matching every other
+/// approval's `employee_name`, which is never re-derived from
+/// `agent_employee` after the fact).
+pub const COPILOT_EMPLOYEE_NAME: &str = "Copilot (interactive)";
+
+/// Everything [`create_pending_approval`] needs to create the linked
+/// `agent_run` (`waiting_approval`) + `approval_item` (`pending`) pair for
+/// one `WriteHigh` copilot tool call.
+#[derive(Debug, Clone)]
+pub struct NewApprovalRequest<'a> {
+    /// The tool name — becomes `approval_item.action`, and is looked back
+    /// up in the tool registry when the approval is later decided.
+    pub tool: &'a str,
+    /// Display label for whoever/whatever triggered this call (e.g. the
+    /// chat principal's display name).
+    pub actor: &'a str,
+    /// The target resource id, if knowable ahead of execution (see
+    /// `routes::ai::audit::resource_for`).
+    pub resource: Option<&'a str>,
+    /// A deterministic, human-readable reason sentence (never LLM-authored
+    /// — see `routes::ai::gate`).
+    pub reason: &'a str,
+    /// A human-readable risk statement.
+    pub risk: &'a str,
+    /// The tool call's REDACTED arguments (plan invariant 5 — the caller
+    /// must have already run these through `routes::ai::audit::redact`).
+    /// Stored twice: once as `approval_item.evidence` (as a single JSON
+    /// string element, since the column is `TEXT[]`), and once inside the
+    /// linked run's first step, so [`pending_tool_call`] can replay the
+    /// exact call later.
+    pub redacted_args: &'a Value,
+}
+
+/// The ids [`create_pending_approval`] created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedApproval {
+    /// The new `agent_run.id` (status `waiting_approval`).
+    pub run_id: String,
+    /// The new `approval_item.id` (status `pending`).
+    pub approval_id: String,
+}
+
+/// Creates the linked `agent_run` + `approval_item` pair for a `WriteHigh`
+/// copilot tool call that has already passed the ask-mode and permission
+/// checks (`routes::ai::gate::decide`) — nothing executes here, and
+/// nothing executes until a later `POST /api/agents/approvals/{id}/decide`
+/// approves it (see `routes::agents::decide_approval`).
+///
+/// Both rows are created in one transaction: either both exist or
+/// neither does, so `approval_item.run_id` never dangles.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if either insert fails (e.g. the
+/// `emp-copilot` row is missing — it should never be, see
+/// `0024_agent_schedule.sql`).
+pub async fn create_pending_approval(
+    pool: &PgPool,
+    req: NewApprovalRequest<'_>,
+) -> Result<CreatedApproval, StoreError> {
+    let mut tx = pool.begin().await?;
+
+    let run_id = format!("run-appr-{}", Uuid::new_v4());
+    let pending = serde_json::json!({ "tool": req.tool, "args": req.redacted_args });
+    let step = RunStep {
+        id: "step-1".to_owned(),
+        label: format!("Menunggu persetujuan: {}", req.tool),
+        status: "pending".to_owned(),
+        detail: serde_json::to_string(&pending).unwrap_or_default(),
+    };
+    sqlx::query(
+        "INSERT INTO agent_run (id, employee_id, status, trigger, actor, steps) \
+         VALUES ($1, $2, 'waiting_approval', 'copilot', $3, $4)",
+    )
+    .bind(&run_id)
+    .bind(COPILOT_EMPLOYEE_ID)
+    .bind(req.actor)
+    .bind(Json(vec![step]))
+    .execute(&mut *tx)
+    .await?;
+
+    let approval_id = format!("appr-{}", Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO approval_item \
+         (id, employee_id, employee_name, run_id, action, resource, reason, evidence, status, risk) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9)",
+    )
+    .bind(&approval_id)
+    .bind(COPILOT_EMPLOYEE_ID)
+    .bind(COPILOT_EMPLOYEE_NAME)
+    .bind(&run_id)
+    .bind(req.tool)
+    .bind(req.resource)
+    .bind(req.reason)
+    .bind(vec![serde_json::to_string(req.redacted_args).unwrap_or_default()])
+    .bind(req.risk)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(CreatedApproval {
+        run_id,
+        approval_id,
+    })
+}
+
+/// The tool call [`create_pending_approval`] recorded into a
+/// `waiting_approval` run's first step, recovered so
+/// `routes::agents::decide_approval` can replay it EXACTLY on approval —
+/// never re-derived from the model or the approver's own input.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PendingToolCall {
+    /// The tool name to execute.
+    pub tool: String,
+    /// The (already redacted at request time — see [`NewApprovalRequest`])
+    /// arguments to execute it with.
+    pub args: Value,
+}
+
+/// Recovers the [`PendingToolCall`] [`create_pending_approval`] stored in
+/// `run.steps[0].detail`. `None` if the run has no steps, or its first
+/// step's `detail` isn't the JSON shape this module writes (e.g. a run
+/// this module never created).
+#[must_use]
+pub fn pending_tool_call(run: &AgentRun) -> Option<PendingToolCall> {
+    let first = run.steps.first()?;
+    serde_json::from_str(&first.detail).ok()
+}
+
+/// Appends one outcome step to a run's `steps` and sets its terminal
+/// `status`/`ended_at` — used for every way a `WriteHigh` approval's story
+/// can end: rejected, approved-but-not-executed (approver lacks the
+/// tool's own permission), or executed (`succeeded`/`failed`).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the run id does not exist or the
+/// update fails.
+pub async fn record_run_outcome(
+    pool: &PgPool,
+    run_id: &str,
+    status: &str,
+    label: &str,
+    detail: &str,
+) -> Result<(), StoreError> {
+    let step = RunStep {
+        id: "step-2".to_owned(),
+        label: label.to_owned(),
+        status: status.to_owned(),
+        detail: detail.to_owned(),
+    };
+    let result = sqlx::query(
+        "UPDATE agent_run SET status = $2, ended_at = now(), steps = steps || $3::jsonb \
+         WHERE id = $1",
+    )
+    .bind(run_id)
+    .bind(status)
+    .bind(Json(vec![step]))
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

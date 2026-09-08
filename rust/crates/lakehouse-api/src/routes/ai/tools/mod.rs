@@ -26,7 +26,11 @@ use crate::state::AppState;
 /// [`registry::find`] recognises but this `match` has no arm for hits the
 /// `unreachable!` below instead of silently falling through to "tool tak
 /// dikenal", which would be a bug worth crashing a test over, not masking.
-pub(super) async fn run_tool(state: &AppState, name: &str, args: &Map<String, Value>) -> Value {
+pub(in crate::routes) async fn run_tool(
+    state: &AppState,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Value {
     if registry::find(name).is_none() {
         return json!({ "error": format!("tool tak dikenal: {name}") });
     }

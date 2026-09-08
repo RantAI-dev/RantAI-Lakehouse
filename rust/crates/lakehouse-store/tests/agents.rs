@@ -21,11 +21,13 @@ use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
 use lakehouse_store::agents::{
-    CreateEmployeeInput, Decision, create_employee, decide_approval, get_employee,
+    COPILOT_EMPLOYEE_ID, CreateEmployeeInput, CreatedApproval, Decision, NewApprovalRequest,
+    create_employee, create_pending_approval, decide_approval, get_employee,
     get_employee_run_config, get_run, list_approvals, list_employees, list_runs,
-    list_scheduled_employees, list_tools, list_workflows, resume_employee, revoke_employee,
-    suspend_employee,
+    list_scheduled_employees, list_tools, list_workflows, pending_tool_call, record_run_outcome,
+    resume_employee, revoke_employee, suspend_employee,
 };
+use serde_json::json;
 use sqlx::PgPool;
 
 /// Insert a minimal `agent_run` row directly, bypassing the store (there is
@@ -439,5 +441,114 @@ async fn get_employee_run_config_round_trips(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(config.prompt.as_deref(), Some("Do the thing."));
     assert_eq!(config.mode, "ask");
     assert_eq!(config.permissions, "query:read");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// WriteHigh copilot approvals (T0.5, copilot-operations-handover plan)
+// ---------------------------------------------------------------------
+
+/// `create_pending_approval` creates exactly one `agent_run`
+/// (`waiting_approval`, attributed to `emp-copilot`) and one linked
+/// `approval_item` (`pending`), and the run's stored tool call round-trips
+/// through `pending_tool_call` exactly.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_pending_approval_creates_linked_run_and_approval(pool: PgPool) -> sqlx::Result<()> {
+    let args = json!({ "id": "c-1" });
+    let CreatedApproval {
+        run_id,
+        approval_id,
+    } = create_pending_approval(
+        &pool,
+        NewApprovalRequest {
+            tool: "delete_chart",
+            actor: "Fajar Nugroho",
+            resource: Some("c-1"),
+            reason: "Menghapus chart c-1.",
+            risk: "tinggi",
+            redacted_args: &args,
+        },
+    )
+    .await
+    .unwrap();
+
+    let run = get_run(&pool, &run_id).await.unwrap().unwrap();
+    assert_eq!(run.employee_id, COPILOT_EMPLOYEE_ID);
+    assert_eq!(run.status, "waiting_approval");
+    assert_eq!(run.trigger, "copilot");
+    assert_eq!(run.actor, "Fajar Nugroho");
+    assert_eq!(run.approvals.len(), 1);
+    assert_eq!(run.approvals[0].id, approval_id);
+    assert_eq!(run.approvals[0].status, "pending");
+
+    let pending = pending_tool_call(&run).expect("pending tool call recorded");
+    assert_eq!(pending.tool, "delete_chart");
+    assert_eq!(pending.args, args);
+
+    let approvals = list_approvals(&pool, Some(COPILOT_EMPLOYEE_ID))
+        .await
+        .unwrap();
+    let approval = approvals
+        .iter()
+        .find(|a| a.id == approval_id)
+        .expect("the created approval is listed");
+    assert_eq!(approval.run_id.as_deref(), Some(run_id.as_str()));
+    assert_eq!(approval.action, "delete_chart");
+    assert_eq!(approval.resource.as_deref(), Some("c-1"));
+    assert_eq!(approval.status, "pending");
+    assert_eq!(
+        approval.evidence.as_deref(),
+        Some([serde_json::to_string(&args).unwrap()].as_slice())
+    );
+    Ok(())
+}
+
+/// `record_run_outcome` appends a step and sets the terminal status —
+/// proven here for the "rejected" ending.
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_run_outcome_sets_status_and_appends_step(pool: PgPool) -> sqlx::Result<()> {
+    let CreatedApproval { run_id, .. } = create_pending_approval(
+        &pool,
+        NewApprovalRequest {
+            tool: "delete_chart",
+            actor: "Fajar Nugroho",
+            resource: Some("c-1"),
+            reason: "Menghapus chart c-1.",
+            risk: "tinggi",
+            redacted_args: &json!({ "id": "c-1" }),
+        },
+    )
+    .await
+    .unwrap();
+
+    record_run_outcome(
+        &pool,
+        &run_id,
+        "rejected",
+        "Ditolak",
+        "tidak sesuai kebijakan",
+    )
+    .await
+    .unwrap();
+
+    let run = get_run(&pool, &run_id).await.unwrap().unwrap();
+    assert_eq!(run.status, "rejected");
+    assert!(run.ended_at.is_some());
+    assert_eq!(run.steps.len(), 2);
+    assert_eq!(run.steps[1].status, "rejected");
+    assert_eq!(run.steps[1].detail, "tidak sesuai kebijakan");
+    // The original pending-call step must still be there, untouched.
+    assert_eq!(run.steps[0].status, "pending");
+    Ok(())
+}
+
+/// `record_run_outcome` against an unknown run id is a
+/// [`StoreError::NotFound`], not a silent no-op.
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_run_outcome_unknown_run_is_not_found(pool: PgPool) -> sqlx::Result<()> {
+    let err = record_run_outcome(&pool, "run-nope", "failed", "x", "y")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound));
     Ok(())
 }
