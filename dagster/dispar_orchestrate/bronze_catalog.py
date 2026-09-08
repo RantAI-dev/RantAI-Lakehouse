@@ -163,3 +163,76 @@ def _utc_now_iso() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ── P4: maintenance-run metrics ─────────────────────────────────────────
+#
+# `lake.bronze_meta.maintenance_run` is a NEW table, introduced by P4's
+# maintenance job (`dispar_orchestrate/maintenance.py`). Per R10 in
+# `docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md` (the `bronze_meta.*` schema
+# already being defined in two places — this file and
+# `demo/clickhouse/04_registry.sql` — is a known drift risk), this table's
+# DDL is defined in EXACTLY ONE place: here. It is deliberately NOT
+# mirrored into `demo/clickhouse/04_registry.sql` — that file is out of
+# scope for this phase's change set (see the P4 task brief's "do not
+# touch" list), so mirroring it would mean editing a file this phase is
+# not permitted to touch, or leaving a second copy to drift immediately.
+# A production deployment that applies `demo/clickhouse/*.sql` by hand and
+# never runs this Dagster job will not have this table until either (a)
+# the maintenance job runs once (`IF NOT EXISTS` creates it, same as the
+# three existing tables' bootstrap story for a bare compose stack), or (b)
+# a follow-up change ports this DDL into `04_registry.sql` for production
+# parity — noted here explicitly so it is a tracked gap, not a silent one.
+_MAINTENANCE_RUN_DDL = (
+    "CREATE TABLE IF NOT EXISTS lake.`bronze_meta.maintenance_run` ("
+    "table_name String, "
+    "run_at String, "
+    "dry_run_deleted_data_files UInt64, "
+    "dry_run_deleted_manifest_files UInt64, "
+    "dry_run_deleted_manifest_lists UInt64, "
+    "applied_deleted_data_files UInt64, "
+    "applied_deleted_manifest_files UInt64, "
+    "applied_deleted_manifest_lists UInt64, "
+    "skipped_verbs String"
+    ") ENGINE = ReplacingMergeTree ORDER BY (table_name, run_at)"
+)
+
+
+def record_maintenance_run(
+    *,
+    table_name: str,
+    dry_run_metrics: dict,
+    applied_metrics: dict,
+    skipped_verbs: list[str],
+    target: "ClickHouseTarget | None" = None,
+) -> None:
+    """Upsert one maintenance run's dry-run + applied metrics into
+    `lake.bronze_meta.maintenance_run` — the SAME registry mechanism
+    (`lake.bronze_meta.*` via plain `INSERT`, read by
+    `lakehouse-api::routes::governance::maintenance`) that
+    `register_bronze_table` already uses for the dataset catalog, per the
+    task brief's "reuse that mechanism; do not invent a parallel one."
+    """
+    ch = target or ClickHouseTarget.from_env()
+    _ch_exec(ch, "CREATE DATABASE IF NOT EXISTS lake")
+    _ch_exec(ch, _MAINTENANCE_RUN_DDL)
+
+    run_at = _utc_now_iso()
+    values = (
+        f"({_sql_string_literal(table_name)}, {_sql_string_literal(run_at)}, "
+        f"{int(dry_run_metrics.get('deleted_data_files_count', 0))}, "
+        f"{int(dry_run_metrics.get('deleted_manifest_files_count', 0))}, "
+        f"{int(dry_run_metrics.get('deleted_manifest_lists_count', 0))}, "
+        f"{int(applied_metrics.get('deleted_data_files_count', 0))}, "
+        f"{int(applied_metrics.get('deleted_manifest_files_count', 0))}, "
+        f"{int(applied_metrics.get('deleted_manifest_lists_count', 0))}, "
+        f"{_sql_string_literal('; '.join(skipped_verbs))})"
+    )
+    _ch_exec(
+        ch,
+        "INSERT INTO lake.`bronze_meta.maintenance_run` "
+        "(table_name, run_at, dry_run_deleted_data_files, "
+        "dry_run_deleted_manifest_files, dry_run_deleted_manifest_lists, "
+        "applied_deleted_data_files, applied_deleted_manifest_files, "
+        "applied_deleted_manifest_lists, skipped_verbs) VALUES " + values,
+    )

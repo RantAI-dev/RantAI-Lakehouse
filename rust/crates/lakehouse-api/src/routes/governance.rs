@@ -43,6 +43,15 @@ enum Kind {
     Classification,
     /// `governance/residency` — static tenant residency policy.
     Residency,
+    /// `governance/maintenance` — **P4 addition, not a TS-port kind** (like
+    /// the `quality`/`classification`/`residency` "Gap fix" unions above,
+    /// this extends beyond the original four-kind TS dispatch). Surfaces
+    /// `lake.bronze_meta.maintenance_run` — the dry-run/applied
+    /// `expire_snapshots` metrics `dagster/dispar_orchestrate/
+    /// maintenance.py` writes via the SAME `bronze_meta.*` registry
+    /// mechanism `register_bronze_table` already uses, per the task
+    /// brief's "reuse that mechanism; do not invent a parallel one."
+    Maintenance,
     /// Anything else, which the TypeScript rejects with HTTP 400.
     Unknown,
 }
@@ -54,6 +63,7 @@ impl Kind {
             "audit" => Self::Audit,
             "classification" => Self::Classification,
             "residency" => Self::Residency,
+            "maintenance" => Self::Maintenance,
             _ => Self::Unknown,
         }
     }
@@ -101,6 +111,7 @@ async fn run(state: &AppState, kind: Kind) -> Result<Value, GovError> {
         Kind::Audit => audit(&state.dagster).await,
         Kind::Classification => classification(&state.clickhouse, state.pg.as_deref()).await,
         Kind::Residency => residency(state.pg.as_deref()).await,
+        Kind::Maintenance => maintenance(&state.clickhouse).await,
         Kind::Unknown => unreachable!("Kind::Unknown is handled before `run` is called"),
     }
 }
@@ -261,6 +272,52 @@ async fn residency(pg: Option<&PgPool>) -> Result<Value, GovError> {
     Ok(json!({ "residency": residency }))
 }
 
+/// `GET /api/governance/maintenance` — P4's `dry_run` metrics surface.
+/// Reads `lake.bronze_meta.maintenance_run` directly (that table has no
+/// authored/Postgres counterpart — it is Dagster-written only — so there
+/// is no `pg` union here, unlike `quality`/`classification`/`residency`).
+/// The table itself is created by `dagster/dispar_orchestrate/
+/// bronze_catalog.py::record_maintenance_run` (`CREATE TABLE IF NOT
+/// EXISTS`, single owner — see that module's doc comment on why it is not
+/// mirrored into `demo/clickhouse/04_registry.sql`), so on a deployment
+/// where the P4 maintenance job has never run, this table does not exist
+/// yet and the query below fails — surfaced as the standard 503 `run`
+/// already gives every other kind, not a special case.
+async fn maintenance(ch: &ChClient) -> Result<Value, GovError> {
+    let rows = ch
+        .rows(
+            "SELECT table_name, run_at, \
+                toString(dry_run_deleted_data_files) dry_data, \
+                toString(dry_run_deleted_manifest_files) dry_manifests, \
+                toString(applied_deleted_data_files) applied_data, \
+                toString(applied_deleted_manifest_files) applied_manifests, \
+                skipped_verbs \
+             FROM lake.`bronze_meta.maintenance_run` \
+             ORDER BY run_at DESC LIMIT 500",
+            None,
+        )
+        .await?;
+    let runs: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "tableName": str_col(r, "table_name"),
+                "runAt": str_col(r, "run_at"),
+                "dryRun": {
+                    "deletedDataFiles": str_col(r, "dry_data"),
+                    "deletedManifestFiles": str_col(r, "dry_manifests"),
+                },
+                "applied": {
+                    "deletedDataFiles": str_col(r, "applied_data"),
+                    "deletedManifestFiles": str_col(r, "applied_manifests"),
+                },
+                "skippedVerbs": str_col(r, "skipped_verbs"),
+            })
+        })
+        .collect();
+    Ok(json!({ "maintenance": runs }))
+}
+
 /// Query parameters accepted by `GET /api/governance/lineage`.
 #[derive(Debug, Deserialize)]
 pub struct LineageQuery {
@@ -406,7 +463,7 @@ pub async fn create_rule(
             Ok(resp) => resp.into_response(),
             Err(err) => err.into_response(),
         },
-        Kind::Audit | Kind::Unknown => (
+        Kind::Audit | Kind::Maintenance | Kind::Unknown => (
             StatusCode::BAD_REQUEST,
             ApiJson(
                 json!({ "error": format!("kind tak dikenal atau tidak bisa ditulis: {kind}") }),
@@ -586,6 +643,7 @@ mod tests {
         assert_eq!(Kind::parse("audit"), Kind::Audit);
         assert_eq!(Kind::parse("classification"), Kind::Classification);
         assert_eq!(Kind::parse("residency"), Kind::Residency);
+        assert_eq!(Kind::parse("maintenance"), Kind::Maintenance);
     }
 
     #[test]

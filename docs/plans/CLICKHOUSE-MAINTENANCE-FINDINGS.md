@@ -48,6 +48,14 @@ NOT_IMPLEMENTED dispatch as `expire_snapshots`, so the verb plausibly
 exists and simply is not setting-gated on this version. Unverified either
 way until P4 runs it against a real Iceberg table.
 
+> **SUPERSEDED in P4 — the guess above was wrong.** Measured against a real
+> catalog-registered Iceberg table, `remove_orphan_files` does **not**
+> exist: `Code: 36. Unknown EXECUTE command 'remove_orphan_files' for
+> Iceberg table. (BAD_ARGUMENTS)`. That is a *per-engine* rejection,
+> distinct from the generic `NOT_IMPLEMENTED` a MergeTree table returns for
+> any Iceberg-only verb — which is why the MergeTree probe could not tell
+> them apart. See [G3-RESULT.md](G3-RESULT.md).
+
 ## Correction 2 — `OPTIMIZE TABLE … MANIFEST` is a syntax error
 
 This is the harder finding. It is step 4 of the briefed four-command
@@ -67,11 +75,31 @@ commands, not four.
 Note `DRY RUN` **is** accepted — that is the mechanism for P4's
 "`dry_run` metrics surfaced in console" requirement.
 
+> **SUPERSEDED in P4 — wrong for the only case that matters.** `DRY RUN` is
+> accepted by the *generic* `OPTIMIZE` grammar, which is what the error
+> message above enumerates, but it is not usable on an Iceberg table: bare
+> `DRY RUN` errors `Expected PARTS`, and with `PARTS` supplied it errors
+> `Code: 36 … OPTIMIZE DRY RUN is only supported for MergeTree family
+> tables.` The actual dry-run mechanism is
+> `ALTER TABLE … EXECUTE expire_snapshots(dry_run=1)`, which returns the
+> same 7-row `key`/`value` result set with `dry_run` echoed as `1`. See
+> [G3-RESULT.md](G3-RESULT.md).
+>
+> Reading a keyword out of a parser's "expected one of" list proves the
+> grammar accepts it, not that the storage engine implements it. Both
+> corrections on this page come from that same mistake.
+
 ## Consequences for P4
 
 - The chain becomes `expire_snapshots` → `remove_orphan_files` →
   `OPTIMIZE` (Iceberg, experimental). Manifest rewriting is not available
   as briefed and needs either a different mechanism or an accepted gap.
+  > **SUPERSEDED in P4:** the chain is **one** command, not three.
+  > `remove_orphan_files` does not exist for Iceberg, and `OPTIMIZE` parses
+  > but fails at runtime with `Code: 499 … HTTP response code: 403` —
+  > reproduced with both vended and static admin credentials, so not a
+  > permissions problem. Only `expire_snapshots` works, and it does not
+  > touch data files. See [G3-RESULT.md](G3-RESULT.md).
 - Combined with the already-known absence of bin-pack rewrite of small data
   files, **two** of the small-file mitigations assumed in the plan are
   unavailable in-engine. This raises the prior probability that G3 fails
