@@ -485,6 +485,52 @@ mod tests {
         assert_eq!(err.column, "tags");
     }
 
+    /// The R7 gate's relationship to something real.
+    ///
+    /// `reject_unsupported_column_types` has no product caller: nothing in
+    /// this build introspects a source schema, because the connector
+    /// registry stores a host but no table name, so there is nothing to
+    /// introspect at registration or probe time. Rather than invent a caller
+    /// (a worse outcome than none — a fabricated call site would imply a
+    /// guarantee the product does not make), this pins the gate to the one
+    /// source schema the stack actually ships: `p5_cdc.orders`, created by
+    /// `docker-compose.yml`'s CDC seed and streamed by the demo connector.
+    ///
+    /// So the gate is exercised against the real columns that really flow
+    /// through Debezium into Bronze. If someone adds a `jsonb` or array
+    /// column to that seed, this fails and says so — which is exactly the
+    /// moment the gate was written to catch, arriving as a test failure
+    /// rather than as unreadable Bronze data discovered later.
+    #[test]
+    fn the_shipped_cdc_source_schema_passes_the_r7_gate() {
+        // Mirrors docker-compose.yml's `CREATE TABLE p5_cdc.orders`.
+        let columns = [
+            col("id", "bigint"),
+            col("customer", "text"),
+            col("amount", "numeric(12,2)"),
+            col("updated_at", "timestamptz"),
+        ];
+        assert!(
+            reject_unsupported_column_types(&columns).is_ok(),
+            "the demo CDC table's own columns must pass the gate that decides \
+             whether a connector may stream into Bronze"
+        );
+    }
+
+    /// The same schema with one realistic addition that MUST be refused, so
+    /// the test above cannot pass by the gate being permissive.
+    #[test]
+    fn adding_a_nested_column_to_that_schema_is_refused() {
+        let columns = [
+            col("id", "bigint"),
+            col("customer", "text"),
+            col("metadata", "jsonb[]"),
+        ];
+        let err =
+            reject_unsupported_column_types(&columns).expect_err("an array column must be refused");
+        assert_eq!(err.column, "metadata");
+    }
+
     #[test]
     fn nested_struct_is_rejected() {
         for type_name in ["struct", "record", "composite", "map<string,string>", "ROW"] {
