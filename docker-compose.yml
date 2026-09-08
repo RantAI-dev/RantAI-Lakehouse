@@ -32,11 +32,16 @@ services:
   # unlike Postgres this one is a genuinely required local dependency, not
   # an optional Phase 2 add-on.
   #
-  # Pinned to 26.3 (LTS), not 24.8: Iceberg writes via `DataLakeCatalog`
-  # need >= 26.2 (`allow_database_iceberg`). See docs/OPERATIONS.md for
-  # what was verified in the 24.8 -> 26.3 bump.
+  # Pinned to 26.8 (LTS), not 24.8: Iceberg writes via `DataLakeCatalog`
+  # need >= 26.2 (`allow_database_iceberg`), and 26.8 is the version whose
+  # behaviour the rest of this stack is actually built against —
+  # `docs/plans/CLICKHOUSE-26.8-REMEASUREMENT.md` re-measured every 26.3
+  # finding here. It matters at THIS point in the stack rather than later:
+  # the Bronze maintenance job's verb set (`remove_orphan_files` works,
+  # `expire_snapshots` is refused) is a 26.8 fact, so a branch running 26.3
+  # with 26.8-shaped verbs fails its own gate.
   clickhouse:
-    image: clickhouse/clickhouse-server:26.3
+    image: clickhouse/clickhouse-server:26.8
     environment:
       CLICKHOUSE_USER: ${CH_USER:-default}
       CLICKHOUSE_PASSWORD: ${CH_PASSWORD:-}
