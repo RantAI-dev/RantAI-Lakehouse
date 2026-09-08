@@ -34,6 +34,10 @@ export function PublicDashboard({ token }: { token: string }) {
     let alive = true;
     (async () => {
       try {
+        // Deliberately NOT `apiFetch`: this is the unauthenticated public
+        // share view. A 401/403/404 here means "no such share", rendered
+        // below as not-found — `apiFetch`'s 401 -> /login redirect would be
+        // wrong for a viewer who has no account to log into.
         const res = await fetch(`/api/public/dashboard/${encodeURIComponent(token)}`, { cache: "no-store" });
         if (!alive) return;
         if (res.status === 404) { setState("notfound"); return; }

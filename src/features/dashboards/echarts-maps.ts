@@ -15,6 +15,8 @@ export function ensureMap(name = JAKARTA_MAP, url = JAKARTA_GEOJSON_URL): Promis
   if (echarts.getMap(name)) return Promise.resolve(true);
   let p = loading.get(name);
   if (!p) {
+    // Deliberately NOT `apiFetch`: a static GeoJSON asset, not an `/api/*`
+    // call — there is no auth state to react to.
     p = fetch(url, { cache: "force-cache" })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error("geojson not found"))))
       .then((gj) => { echarts.registerMap(name, gj as Parameters<typeof echarts.registerMap>[1]); return true; })

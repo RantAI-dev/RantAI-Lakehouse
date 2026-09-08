@@ -684,6 +684,10 @@ pub async fn values(
 /// `GET /api/dashboard/export` — every board + stored chart, as a minimal
 /// hand-rolled `YAML` document. The only non-`JSON` response in this crate:
 /// returned directly as `text/yaml`, bypassing [`ApiJson`].
+///
+/// # Errors
+///
+/// 500 (`ApiError::Internal`) if either `ClickHouse` listing fails.
 pub async fn export(State(state): State<AppState>) -> ApiResult<Response> {
     let (charts, boards) = tokio::try_join!(
         store::list_stored_charts(&state.clickhouse),
