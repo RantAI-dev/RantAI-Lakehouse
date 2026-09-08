@@ -220,6 +220,198 @@ fn delete_chart_schema() -> Value {
             "required": ["id"] } } })
 }
 
+// ── T1.1 Alerts ──────────────────────────────────────────────────────────
+
+/// The five comparison operators an alert rule may use, mirroring
+/// `lakehouse_alerts::AlertOp` — shared between [`create_alert_rule_schema`]
+/// and [`update_alert_rule_schema`] so the two lists cannot drift apart.
+fn alert_op_enum() -> Value {
+    json!([">", ">=", "<", "<=", "=="])
+}
+
+/// The five aggregate functions an alert rule may watch, mirroring
+/// `lakehouse_alerts::AGGS`.
+fn alert_agg_enum() -> Value {
+    json!(["sum", "avg", "max", "min", "count"])
+}
+
+fn list_alert_rules_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_alert_rules",
+        "description": "Daftar semua aturan alert (peringatan ambang batas) dan digest (ringkasan berkala) yang terpasang, beserta status aktif/nonaktifnya.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn create_alert_rule_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "create_alert_rule",
+        "description": "Buat aturan alert atau digest baru. Untuk type=alert: isi mart, measure, agg (agregat), op (operator pembanding), threshold — rule ini akan memantau nilai agregat itu. Untuk type=digest: isi board (id dashboard yang diringkas). Pengiriman lewat channel webhook (target=URL) atau email (target=alamat).",
+        "parameters": { "type": "object", "properties": {
+            "name": { "type": "string" },
+            "type": { "type": "string", "enum": ["alert", "digest"] },
+            "mart": { "type": "string", "description": "nama mart Gold, untuk type=alert" },
+            "measure": { "type": "string", "description": "kolom ukuran yang dipantau, untuk type=alert" },
+            "agg": { "type": "string", "enum": alert_agg_enum() },
+            "op": { "type": "string", "enum": alert_op_enum() },
+            "threshold": { "type": "number" },
+            "board": { "type": "string", "description": "id board dashboard, untuk type=digest" },
+            "channel": { "type": "string", "enum": ["webhook", "email"] },
+            "target": { "type": "string", "description": "URL webhook atau alamat email tujuan" },
+            "enabled": { "type": "boolean" } },
+            "required": ["name", "type", "channel", "target"] } } })
+}
+
+fn update_alert_rule_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "update_alert_rule",
+        "description": "Ubah aturan alert/digest tersimpan (by id) — kirim semua field seperti create_alert_rule dengan nilai baru. Pakai list_alert_rules untuk tahu id.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string" },
+            "name": { "type": "string" },
+            "type": { "type": "string", "enum": ["alert", "digest"] },
+            "mart": { "type": "string" },
+            "measure": { "type": "string" },
+            "agg": { "type": "string", "enum": alert_agg_enum() },
+            "op": { "type": "string", "enum": alert_op_enum() },
+            "threshold": { "type": "number" },
+            "board": { "type": "string" },
+            "channel": { "type": "string", "enum": ["webhook", "email"] },
+            "target": { "type": "string" },
+            "enabled": { "type": "boolean" } },
+            "required": ["id"] } } })
+}
+
+fn delete_alert_rule_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "delete_alert_rule",
+        "description": "Hapus aturan alert/digest secara permanen (by id). Tindakan ini butuh persetujuan manusia sebelum dijalankan.",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
+}
+
+fn run_alert_rule_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "run_alert_rule",
+        "description": "Jalankan evaluasi satu aturan alert/digest sekarang (by id) — bila kondisinya terpenuhi, webhook/email BENERAN terkirim ke target.",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
+}
+
+// ── T1.2 Connectors ──────────────────────────────────────────────────────
+
+fn connector_direction_enum() -> Value {
+    json!(["source", "sink", "bidirectional"])
+}
+
+fn list_connectors_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_connectors",
+        "description": "Daftar semua connector (sumber/tujuan data) yang terdaftar beserta status kesehatannya.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn create_connector_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "create_connector",
+        "description": "Daftarkan connector baru. PENTING: secretRef HARUS berupa referensi kredensial (mis. \"env:NAMA_SECRET\" atau \"vault://path\"), JANGAN PERNAH kredensial mentah (password/token asli) — permintaan akan ditolak jika terlihat seperti kredensial asli.",
+        "parameters": { "type": "object", "properties": {
+            "name": { "type": "string" },
+            "type": { "type": "string", "description": "mis. PostgreSQL, Object storage, Kafka" },
+            "direction": { "type": "string", "enum": connector_direction_enum() },
+            "host": { "type": "string", "description": "target koneksi (host:port atau endpoint)" },
+            "secretRef": { "type": "string", "description": "REFERENSI kredensial, mis. env:DB_PASSWORD atau vault://secret/data/x — bukan kredensial asli" },
+            "secretRefSecondary": { "type": "string", "description": "referensi kredensial kedua (mis. secret key S3), opsional" },
+            "environment": { "type": "string" },
+            "tenant": { "type": "string" },
+            "residency": { "type": "string" },
+            "capabilities": { "type": "array", "items": { "type": "string" } },
+            "owner": { "type": "string" } },
+            "required": ["name", "type", "direction", "host", "secretRef", "environment", "tenant"] } } })
+}
+
+fn test_connector_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "test_connector",
+        "description": "Tes koneksi nyata ke connector (by id). Hanya PostgreSQL dan Object storage (S3-compatible) yang benar-benar bisa dites di build ini — tipe lain akan mengembalikan supported:false, bukan hasil palsu.",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
+}
+
+fn delete_connector_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "delete_connector",
+        "description": "Hapus registrasi connector secara permanen (by id). Tindakan ini butuh persetujuan manusia sebelum dijalankan.",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
+}
+
+// ── T1.3 Pipelines (additions) ───────────────────────────────────────────
+
+fn list_pipelines_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_pipelines",
+        "description": "Daftar semua pipeline (job Dagster + pipeline yang dibuat via chat/UI) beserta status & jadwalnya.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn list_pipeline_runs_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_pipeline_runs",
+        "description": "Daftar run terbaru (maks 30) dari satu pipeline (by id).",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
+}
+
+fn trigger_pipeline_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "trigger_pipeline",
+        "description": "Jalankan satu pipeline tertentu sekarang (by id) — berbeda dari trigger_lakehouse_build yang selalu menjalankan pipeline utama Bronze→Silver→Gold.",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
+}
+
+fn retry_pipeline_run_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "retry_pipeline_run",
+        "description": "Jalankan ulang satu run pipeline yang sudah selesai dari awal (by runId).",
+        "parameters": { "type": "object", "properties": { "runId": { "type": "string" } },
+            "required": ["runId"] } } })
+}
+
+fn pause_pipeline_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "pause_pipeline",
+        "description": "Jeda jadwal terjadwal sebuah pipeline (by id). Tindakan ini butuh persetujuan manusia sebelum dijalankan.",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
+}
+
+fn resume_pipeline_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "resume_pipeline",
+        "description": "Aktifkan kembali jadwal terjadwal sebuah pipeline yang sebelumnya dijeda (by id).",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
+}
+
+fn cancel_pipeline_run_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "cancel_pipeline_run",
+        "description": "Hentikan paksa satu run pipeline yang sedang berjalan (by runId). Tindakan ini butuh persetujuan manusia sebelum dijalankan.",
+        "parameters": { "type": "object", "properties": { "runId": { "type": "string" } },
+            "required": ["runId"] } } })
+}
+
+// ── T1.4 Saved queries ───────────────────────────────────────────────────
+
+fn save_query_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "save_query",
+        "description": "Simpan query SQL sebagai saved query bernama, untuk dijalankan ulang lewat run_saved_query kapan saja.",
+        "parameters": { "type": "object", "properties": {
+            "title": { "type": "string" },
+            "sql": { "type": "string", "description": "Query SELECT ClickHouse" },
+            "tags": { "type": "array", "items": { "type": "string" } },
+            "owner": { "type": "string" } },
+            "required": ["title", "sql"] } } })
+}
+
+fn list_saved_queries_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_saved_queries",
+        "description": "Daftar semua saved query yang tersimpan.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn run_saved_query_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "run_saved_query",
+        "description": "Jalankan satu saved query tersimpan (by id) dan kembalikan hasilnya. Hanya query baca (SELECT/WITH/SHOW/DESCRIBE/EXPLAIN) yang diizinkan, sama seperti Query Studio.",
+        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
+            "required": ["id"] } } })
+}
+
 /// The AI Copilot's full tool table, in the exact order the LLM sees them
 /// in — [`tool_schemas`] preserves this order verbatim, and it is
 /// load-bearing for the committed snapshot in
@@ -326,6 +518,138 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::WriteHigh,
         permission: "dashboard:write",
     },
+    // ── T1.1 Alerts (Tier 1 of the copilot-operations-handover plan) ────
+    // Permission strings verified against `policy.rs::POLICY_TABLE`
+    // (plan section 3.7 C1): `GET /api/alerts` is `RequiresAuth` (no
+    // narrower permission — empty string, same convention as
+    // `get_quality`), `POST`/`PUT`/`DELETE /api/alerts` and the live
+    // `/api/alerts/run` evaluation all require `alert:write`.
+    ToolSpec {
+        name: "list_alert_rules",
+        schema: list_alert_rules_schema,
+        risk: Risk::Read,
+        permission: "",
+    },
+    ToolSpec {
+        name: "create_alert_rule",
+        schema: create_alert_rule_schema,
+        risk: Risk::WriteLow,
+        permission: "alert:write",
+    },
+    ToolSpec {
+        name: "update_alert_rule",
+        schema: update_alert_rule_schema,
+        risk: Risk::WriteLow,
+        permission: "alert:write",
+    },
+    ToolSpec {
+        name: "delete_alert_rule",
+        schema: delete_alert_rule_schema,
+        risk: Risk::WriteHigh,
+        permission: "alert:write",
+    },
+    ToolSpec {
+        name: "run_alert_rule",
+        schema: run_alert_rule_schema,
+        risk: Risk::WriteLow,
+        permission: "alert:write",
+    },
+    // ── T1.2 Connectors ───────────────────────────────────────────────
+    // Every `/api/connectors*` route — including `GET` and `/test` —
+    // requires `connector:manage` (policy.rs:266-275); there is no
+    // narrower read permission to carry here.
+    ToolSpec {
+        name: "list_connectors",
+        schema: list_connectors_schema,
+        risk: Risk::Read,
+        permission: "connector:manage",
+    },
+    ToolSpec {
+        name: "create_connector",
+        schema: create_connector_schema,
+        risk: Risk::WriteLow,
+        permission: "connector:manage",
+    },
+    ToolSpec {
+        name: "test_connector",
+        schema: test_connector_schema,
+        risk: Risk::WriteLow,
+        permission: "connector:manage",
+    },
+    ToolSpec {
+        name: "delete_connector",
+        schema: delete_connector_schema,
+        risk: Risk::WriteHigh,
+        permission: "connector:manage",
+    },
+    // ── T1.3 Pipelines (additions) ────────────────────────────────────
+    // `pipeline:read` for the two list tools, `pipeline:write` for every
+    // mutation (policy.rs:210-218) — same split `trigger_lakehouse_build`/
+    // `get_build_status` already use above.
+    ToolSpec {
+        name: "list_pipelines",
+        schema: list_pipelines_schema,
+        risk: Risk::Read,
+        permission: "pipeline:read",
+    },
+    ToolSpec {
+        name: "list_pipeline_runs",
+        schema: list_pipeline_runs_schema,
+        risk: Risk::Read,
+        permission: "pipeline:read",
+    },
+    ToolSpec {
+        name: "trigger_pipeline",
+        schema: trigger_pipeline_schema,
+        risk: Risk::WriteLow,
+        permission: "pipeline:write",
+    },
+    ToolSpec {
+        name: "retry_pipeline_run",
+        schema: retry_pipeline_run_schema,
+        risk: Risk::WriteLow,
+        permission: "pipeline:write",
+    },
+    ToolSpec {
+        name: "pause_pipeline",
+        schema: pause_pipeline_schema,
+        risk: Risk::WriteHigh,
+        permission: "pipeline:write",
+    },
+    ToolSpec {
+        name: "resume_pipeline",
+        schema: resume_pipeline_schema,
+        risk: Risk::WriteLow,
+        permission: "pipeline:write",
+    },
+    ToolSpec {
+        name: "cancel_pipeline_run",
+        schema: cancel_pipeline_run_schema,
+        risk: Risk::WriteHigh,
+        permission: "pipeline:write",
+    },
+    // ── T1.4 Saved queries ────────────────────────────────────────────
+    // `POST /api/query/run`, `GET /api/query/saved` and `/history` all
+    // require the SAME `query:read` (policy.rs:202-205) — there is no
+    // separate write permission for saved queries in `POLICY_TABLE`.
+    ToolSpec {
+        name: "save_query",
+        schema: save_query_schema,
+        risk: Risk::WriteLow,
+        permission: "query:read",
+    },
+    ToolSpec {
+        name: "list_saved_queries",
+        schema: list_saved_queries_schema,
+        risk: Risk::Read,
+        permission: "query:read",
+    },
+    ToolSpec {
+        name: "run_saved_query",
+        schema: run_saved_query_schema,
+        risk: Risk::Read,
+        permission: "query:read",
+    },
 ];
 
 /// The `OpenAI`-compatible `tools` schema array, matching
@@ -376,8 +700,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_has_fifteen_entries() {
-        assert_eq!(tool_schemas().len(), 15);
+    fn tool_schemas_has_thirty_four_entries() {
+        // 15 pre-T1 tools + 19 Tier 1 operations tools (5 alerts + 4
+        // connectors + 7 pipelines + 3 saved queries).
+        assert_eq!(tool_schemas().len(), 34);
     }
 
     /// Characterization snapshot (T0.1): `tool_schemas()`, now derived
@@ -483,7 +809,45 @@ mod tests {
             .iter()
             .map(|v| v["function"]["name"].as_str().expect("name").to_owned())
             .collect();
-        // Only `get_quality` has an empty `permission` today.
-        assert_eq!(offered_names, vec!["get_quality".to_owned()]);
+        // `get_quality` and `list_alert_rules` (T1.1: `GET /api/alerts` is
+        // `RequiresAuth`, no narrower permission) are the only two tools
+        // with an empty `permission` today, in `TOOLS` order.
+        assert_eq!(
+            offered_names,
+            vec!["get_quality".to_owned(), "list_alert_rules".to_owned()]
+        );
+    }
+
+    /// T1.1-T1.4: every new operations tool has exactly the risk and
+    /// permission specified in the copilot-operations-handover plan's
+    /// section 3.7 C1 table (verified against `policy.rs::POLICY_TABLE`).
+    #[test]
+    fn tier1_tools_have_the_documented_risk_and_permission() {
+        let expected: &[(&str, Risk, &str)] = &[
+            ("list_alert_rules", Risk::Read, ""),
+            ("create_alert_rule", Risk::WriteLow, "alert:write"),
+            ("update_alert_rule", Risk::WriteLow, "alert:write"),
+            ("delete_alert_rule", Risk::WriteHigh, "alert:write"),
+            ("run_alert_rule", Risk::WriteLow, "alert:write"),
+            ("list_connectors", Risk::Read, "connector:manage"),
+            ("create_connector", Risk::WriteLow, "connector:manage"),
+            ("test_connector", Risk::WriteLow, "connector:manage"),
+            ("delete_connector", Risk::WriteHigh, "connector:manage"),
+            ("list_pipelines", Risk::Read, "pipeline:read"),
+            ("list_pipeline_runs", Risk::Read, "pipeline:read"),
+            ("trigger_pipeline", Risk::WriteLow, "pipeline:write"),
+            ("retry_pipeline_run", Risk::WriteLow, "pipeline:write"),
+            ("pause_pipeline", Risk::WriteHigh, "pipeline:write"),
+            ("resume_pipeline", Risk::WriteLow, "pipeline:write"),
+            ("cancel_pipeline_run", Risk::WriteHigh, "pipeline:write"),
+            ("save_query", Risk::WriteLow, "query:read"),
+            ("list_saved_queries", Risk::Read, "query:read"),
+            ("run_saved_query", Risk::Read, "query:read"),
+        ];
+        for (name, risk, permission) in expected {
+            let spec = find(name).unwrap_or_else(|| panic!("{name} must be registered"));
+            assert_eq!(spec.risk, *risk, "{name} risk");
+            assert_eq!(spec.permission, *permission, "{name} permission");
+        }
     }
 }

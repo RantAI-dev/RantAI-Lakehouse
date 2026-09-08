@@ -5,16 +5,64 @@
 //!   `get_lineage`, `get_quality`, `describe_mart`.
 //! - [`dashboards`] — `create_chart`, `update_chart`, `delete_chart`,
 //!   `create_board`, `list_boards`, `list_charts`, `suggest_dashboard`.
-//! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`.
+//! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`, plus
+//!   the Tier 1 pipeline-operations tools (T1.3).
+//! - [`alerts`] — Tier 1 alert-rule tools (T1.1).
+//! - [`connectors`] — Tier 1 connector tools (T1.2).
+//! - [`queries`] — Tier 1 saved-query tools (T1.4).
 
+mod alerts;
+mod connectors;
 mod dashboards;
 mod data;
 mod pipelines;
+mod queries;
 
+use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value, json};
 
 use super::registry;
+use crate::error::ApiResult;
 use crate::state::AppState;
+
+/// Turns an axum [`Response`] into the [`Value`] a copilot tool returns,
+/// by reading its (always-`ApiJson`, hence always-JSON) body back out.
+///
+/// This is how the Tier 1 tools (T1.1-T1.4) REUSE the actual console route
+/// handlers — `routes::pipelines::{list,runs,trigger,pause,resume,
+/// cancel_run,retry_run}` already return a plain [`Response`], built with
+/// [`crate::json::ApiJson`] — rather than re-implementing their branching
+/// (authored-vs-Dagster dispatch, 404/409/503 mapping, ...) a second time
+/// for the copilot. Calling the handler directly means a guard or a bug fix
+/// applied to the console route is automatically applied to the copilot
+/// tool too, with no risk of the two drifting apart.
+///
+/// A malformed/non-JSON body (never true for an `ApiJson` response in
+/// practice) falls back to `{}` rather than panicking — `unwrap`/`expect`
+/// are denied outside test modules, and a copilot tool must always return
+/// *some* JSON `Value`, not fail the whole chat turn over its own
+/// response-parsing.
+pub(super) async fn response_to_value(resp: Response) -> Value {
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default();
+    serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({}))
+}
+
+/// Same as [`response_to_value`], for the handlers (`routes::connectors::*`,
+/// `routes::query::run`, `routes::alerts::{list,create,update,delete}`)
+/// that return [`ApiResult<T>`] rather than a bare [`Response`] — `T`'s own
+/// [`IntoResponse`] impl (`ApiJson<T>`, or a tuple like
+/// `(StatusCode, ApiJson<T>)`) and [`crate::error::ApiRejection`]'s both
+/// produce a JSON body, so routing either arm through
+/// [`response_to_value`] gives the same "call the real handler, read its
+/// JSON back" reuse as pipelines' bare-`Response` handlers.
+pub(super) async fn api_result_to_value<T: IntoResponse>(result: ApiResult<T>) -> Value {
+    match result {
+        Ok(ok) => response_to_value(ok.into_response()).await,
+        Err(err) => response_to_value(err.into_response()).await,
+    }
+}
 
 /// Dispatch one tool call by name, matching `runTool` in `ai-tools.ts`.
 /// Unknown tool names return `{"error": "tool tak dikenal: <name>"}` rather
@@ -51,6 +99,25 @@ pub(in crate::routes) async fn run_tool(
         "suggest_dashboard" => dashboards::suggest_dashboard(ch).await,
         "list_charts" => dashboards::list_charts(ch).await,
         "delete_chart" => dashboards::delete_chart(ch, args).await,
+        "list_alert_rules" => alerts::list_alert_rules(ch).await,
+        "create_alert_rule" => alerts::create_alert_rule(ch, args).await,
+        "update_alert_rule" => alerts::update_alert_rule(ch, args).await,
+        "delete_alert_rule" => alerts::delete_alert_rule(ch, args).await,
+        "run_alert_rule" => alerts::run_alert_rule(state, args).await,
+        "list_connectors" => connectors::list_connectors(state).await,
+        "create_connector" => connectors::create_connector(state, args).await,
+        "test_connector" => connectors::test_connector(state, args).await,
+        "delete_connector" => connectors::delete_connector(state, args).await,
+        "list_pipelines" => pipelines::list_pipelines(state).await,
+        "list_pipeline_runs" => pipelines::list_pipeline_runs(state, args).await,
+        "trigger_pipeline" => pipelines::trigger_pipeline(state, args).await,
+        "retry_pipeline_run" => pipelines::retry_pipeline_run(state, args).await,
+        "pause_pipeline" => pipelines::pause_pipeline(state, args).await,
+        "resume_pipeline" => pipelines::resume_pipeline(state, args).await,
+        "cancel_pipeline_run" => pipelines::cancel_pipeline_run(state, args).await,
+        "save_query" => queries::save_query(state, args).await,
+        "list_saved_queries" => queries::list_saved_queries(state).await,
+        "run_saved_query" => queries::run_saved_query(state, args).await,
         other => {
             unreachable!(
                 "registry::find recognised {other:?} but run_tool has no dispatch arm for it"

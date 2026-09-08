@@ -382,5 +382,495 @@
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_alert_rules",
+      "description": "Daftar semua aturan alert (peringatan ambang batas) dan digest (ringkasan berkala) yang terpasang, beserta status aktif/nonaktifnya.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_alert_rule",
+      "description": "Buat aturan alert atau digest baru. Untuk type=alert: isi mart, measure, agg (agregat), op (operator pembanding), threshold — rule ini akan memantau nilai agregat itu. Untuk type=digest: isi board (id dashboard yang diringkas). Pengiriman lewat channel webhook (target=URL) atau email (target=alamat).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "alert",
+              "digest"
+            ]
+          },
+          "mart": {
+            "type": "string",
+            "description": "nama mart Gold, untuk type=alert"
+          },
+          "measure": {
+            "type": "string",
+            "description": "kolom ukuran yang dipantau, untuk type=alert"
+          },
+          "agg": {
+            "type": "string",
+            "enum": [
+              "sum",
+              "avg",
+              "max",
+              "min",
+              "count"
+            ]
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              ">",
+              ">=",
+              "<",
+              "<=",
+              "=="
+            ]
+          },
+          "threshold": {
+            "type": "number"
+          },
+          "board": {
+            "type": "string",
+            "description": "id board dashboard, untuk type=digest"
+          },
+          "channel": {
+            "type": "string",
+            "enum": [
+              "webhook",
+              "email"
+            ]
+          },
+          "target": {
+            "type": "string",
+            "description": "URL webhook atau alamat email tujuan"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "type",
+          "channel",
+          "target"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "update_alert_rule",
+      "description": "Ubah aturan alert/digest tersimpan (by id) — kirim semua field seperti create_alert_rule dengan nilai baru. Pakai list_alert_rules untuk tahu id.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "alert",
+              "digest"
+            ]
+          },
+          "mart": {
+            "type": "string"
+          },
+          "measure": {
+            "type": "string"
+          },
+          "agg": {
+            "type": "string",
+            "enum": [
+              "sum",
+              "avg",
+              "max",
+              "min",
+              "count"
+            ]
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              ">",
+              ">=",
+              "<",
+              "<=",
+              "=="
+            ]
+          },
+          "threshold": {
+            "type": "number"
+          },
+          "board": {
+            "type": "string"
+          },
+          "channel": {
+            "type": "string",
+            "enum": [
+              "webhook",
+              "email"
+            ]
+          },
+          "target": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_alert_rule",
+      "description": "Hapus aturan alert/digest secara permanen (by id). Tindakan ini butuh persetujuan manusia sebelum dijalankan.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "run_alert_rule",
+      "description": "Jalankan evaluasi satu aturan alert/digest sekarang (by id) — bila kondisinya terpenuhi, webhook/email BENERAN terkirim ke target.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_connectors",
+      "description": "Daftar semua connector (sumber/tujuan data) yang terdaftar beserta status kesehatannya.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_connector",
+      "description": "Daftarkan connector baru. PENTING: secretRef HARUS berupa referensi kredensial (mis. \"env:NAMA_SECRET\" atau \"vault://path\"), JANGAN PERNAH kredensial mentah (password/token asli) — permintaan akan ditolak jika terlihat seperti kredensial asli.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "description": "mis. PostgreSQL, Object storage, Kafka"
+          },
+          "direction": {
+            "type": "string",
+            "enum": [
+              "source",
+              "sink",
+              "bidirectional"
+            ]
+          },
+          "host": {
+            "type": "string",
+            "description": "target koneksi (host:port atau endpoint)"
+          },
+          "secretRef": {
+            "type": "string",
+            "description": "REFERENSI kredensial, mis. env:DB_PASSWORD atau vault://secret/data/x — bukan kredensial asli"
+          },
+          "secretRefSecondary": {
+            "type": "string",
+            "description": "referensi kredensial kedua (mis. secret key S3), opsional"
+          },
+          "environment": {
+            "type": "string"
+          },
+          "tenant": {
+            "type": "string"
+          },
+          "residency": {
+            "type": "string"
+          },
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "owner": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "type",
+          "direction",
+          "host",
+          "secretRef",
+          "environment",
+          "tenant"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "test_connector",
+      "description": "Tes koneksi nyata ke connector (by id). Hanya PostgreSQL dan Object storage (S3-compatible) yang benar-benar bisa dites di build ini — tipe lain akan mengembalikan supported:false, bukan hasil palsu.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "delete_connector",
+      "description": "Hapus registrasi connector secara permanen (by id). Tindakan ini butuh persetujuan manusia sebelum dijalankan.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_pipelines",
+      "description": "Daftar semua pipeline (job Dagster + pipeline yang dibuat via chat/UI) beserta status & jadwalnya.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_pipeline_runs",
+      "description": "Daftar run terbaru (maks 30) dari satu pipeline (by id).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "trigger_pipeline",
+      "description": "Jalankan satu pipeline tertentu sekarang (by id) — berbeda dari trigger_lakehouse_build yang selalu menjalankan pipeline utama Bronze→Silver→Gold.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "retry_pipeline_run",
+      "description": "Jalankan ulang satu run pipeline yang sudah selesai dari awal (by runId).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "runId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "runId"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "pause_pipeline",
+      "description": "Jeda jadwal terjadwal sebuah pipeline (by id). Tindakan ini butuh persetujuan manusia sebelum dijalankan.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "resume_pipeline",
+      "description": "Aktifkan kembali jadwal terjadwal sebuah pipeline yang sebelumnya dijeda (by id).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "cancel_pipeline_run",
+      "description": "Hentikan paksa satu run pipeline yang sedang berjalan (by runId). Tindakan ini butuh persetujuan manusia sebelum dijalankan.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "runId": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "runId"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "save_query",
+      "description": "Simpan query SQL sebagai saved query bernama, untuk dijalankan ulang lewat run_saved_query kapan saja.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "sql": {
+            "type": "string",
+            "description": "Query SELECT ClickHouse"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "owner": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "sql"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_saved_queries",
+      "description": "Daftar semua saved query yang tersimpan.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "run_saved_query",
+      "description": "Jalankan satu saved query tersimpan (by id) dan kembalikan hasilnya. Hanya query baca (SELECT/WITH/SHOW/DESCRIBE/EXPLAIN) yang diizinkan, sama seperti Query Studio.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ]
+      }
+    }
   }
 ]
