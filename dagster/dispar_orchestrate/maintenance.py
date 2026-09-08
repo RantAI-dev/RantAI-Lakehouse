@@ -91,6 +91,13 @@ class MaintenanceConfig:
     lakekeeper_catalog_uri: str
     lakekeeper_warehouse: str
     rustfs_endpoint: str
+    # R1 (ADR 0011): `expire_snapshots` is a genuine catalog metadata
+    # write ClickHouse performs on this stack's behalf, authenticated as
+    # `clickhouse-reader` (granted `modify` for exactly this — see
+    # `docker-compose.yml`'s `lakekeeper-authz-init`). Empty on a pre-R1
+    # or authz-disabled stack.
+    ch_oauth_client_id: str
+    ch_oauth_server_uri: str
 
     @classmethod
     def from_env(cls) -> "MaintenanceConfig":
@@ -101,6 +108,16 @@ class MaintenanceConfig:
             ),
             lakekeeper_warehouse=_env("LAKEKEEPER_WAREHOUSE", "default"),
             rustfs_endpoint=_env("CH_RUSTFS_S3_ENDPOINT", "http://rustfs:9000"),
+            ch_oauth_client_id=_env("CH_OAUTH_CLIENT_ID", ""),
+            ch_oauth_server_uri=_env("CH_OAUTH_SERVER_URI", ""),
+        )
+
+    def ch_auth_settings(self) -> str:
+        if not self.ch_oauth_client_id:
+            return ""
+        return (
+            f", catalog_credential = '{self.ch_oauth_client_id}:unused', "
+            f"oauth_server_uri = '{self.ch_oauth_server_uri}'"
         )
 
 
@@ -122,7 +139,7 @@ def _ensure_catalog_database(cfg: MaintenanceConfig) -> None:
         f"CREATE DATABASE IF NOT EXISTS {CATALOG_DB} "
         f"ENGINE = DataLakeCatalog('{cfg.lakekeeper_catalog_uri}') "
         f"SETTINGS catalog_type = 'rest', warehouse = '{cfg.lakekeeper_warehouse}', "
-        f"storage_endpoint = '{cfg.rustfs_endpoint}' "
+        f"storage_endpoint = '{cfg.rustfs_endpoint}'{cfg.ch_auth_settings()} "
         "SETTINGS allow_database_iceberg = 1",
     )
 

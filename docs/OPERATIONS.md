@@ -43,7 +43,11 @@ brings up:
 | `lakekeeper-db-init` | `postgres:16` | One-shot: creates Lakekeeper's own database on the existing `postgres` service |
 | `lakekeeper-migrate` | `quay.io/lakekeeper/catalog:v0.13.3` | One-shot: Lakekeeper's own `migrate` subcommand against its database |
 | `lakekeeper` | `quay.io/lakekeeper/catalog:v0.13.3` | Iceberg REST catalog (Rust, Apache-2.0); the only path for Iceberg writes — no path-based `IcebergS3` tables |
-| `lakekeeper-warehouse-init` | `alpine:3.20` | One-shot (P1b): bootstraps the Lakekeeper server (`/management/v1/bootstrap`) and creates the `LAKEKEEPER_WAREHOUSE` warehouse against the RustFS bucket, with `sts-enabled: true` — required for Lakekeeper to vend real S3 credentials on `X-Iceberg-Access-Delegation: vended-credentials`; see `docker-compose.yml`'s comment on this service and `lakehouse-iceberg::catalog`'s module doc |
+| `lakekeeper-warehouse-init` | `alpine:3.20` | One-shot (P1b): bootstraps the Lakekeeper server (`/management/v1/bootstrap`) and creates the `LAKEKEEPER_WAREHOUSE` warehouse against the RustFS bucket, with `sts-enabled: true` — required for Lakekeeper to vend real S3 credentials on `X-Iceberg-Access-Delegation: vended-credentials`; authenticates as the `admin` principal under R1 (see `docker-compose.yml`'s comment on this service and `lakehouse-iceberg::catalog`'s module doc) |
+| `openfga-db-init` / `openfga-migrate` / `openfga` | `openfga/openfga:v1.8` | R1: Lakekeeper's authorization backend — own Postgres database, `openfga migrate` schema, `openfga run` (HTTP :8080, gRPC :8081). Distroless (no shell/curl), so it has no `healthcheck:` of its own — see `openfga-ready`, next |
+| `openfga-ready` | `curlimages/curl:8.10.1` | R1: one-shot that polls `openfga`'s `/healthz` from a real shell image (see above) — everything downstream depends on THIS completing, not on `openfga` reporting healthy |
+| `oidc-mock` | built from `ops/oidc-mock` | R1: mock OIDC discovery/JWKS/token issuer — Lakekeeper's only generic authentication mechanism is OIDC bearer tokens, and this stack has no other identity provider. Mints one long-lived token per principal at boot; **not a production identity provider** — see ADR 0011 |
+| `lakekeeper-authz-init` (+ `-seaweedfs`) | `alpine:3.20` | R1: one-shot — self-registers every non-admin principal with Lakekeeper, then grants each the warehouse-scoped relations it needs (`docker-compose.yml`'s comment on this service has the full table; ADR 0011 has the rationale) |
 
 Both data stores have healthchecks; `lakehouse-api` waits for both to
 report healthy (`depends_on: condition: service_healthy`) before starting,
@@ -120,6 +124,55 @@ snapshot, list tables) and any ClickHouse `DataLakeCatalog` database
 pointed at it fail closed. It does not affect `lakehouse-api`'s own boot
 or its existing Postgres/ClickHouse-backed routes, which have no
 dependency on Lakekeeper in this phase.
+
+### OpenFGA: failure mode
+
+OpenFGA is Lakekeeper's authorization-relation store (ADR 0011) — core,
+not profile-gated. If it's down (or `openfga-migrate`/`openfga-ready`
+never complete): `lakekeeper-migrate` cannot write Lakekeeper's own
+authorization model into the store and fails outright, so `lakekeeper`
+itself never becomes healthy (it depends on `openfga-ready`, not just
+`openfga` reporting started) and nothing downstream of it — every
+`lakekeeper-*-init` job, every Bronze writer, ClickHouse's and Trino's
+Iceberg read/write paths — starts either. This is a hard, visible failure
+at bring-up, not a degraded mode: a plain `docker compose up` will not
+finish coming up with OpenFGA down. Once the stack IS up, OpenFGA going
+down mid-run makes every *new* authorization check Lakekeeper performs
+fail (existing, already-open connections and already-cached decisions are
+unaffected until Lakekeeper needs to check again).
+
+`openfga` publishes no host port by default (PR #33 review, blocker 2) —
+it has no authentication of its own, and its Management-API-shaped grant
+interface is meant to be reached through Lakekeeper's own
+`/management/v1/permissions/...`, not directly. If you need to inspect it
+directly for debugging, use `docker compose exec` or attach a one-off
+container to the compose network rather than republishing
+`OPENFGA_HTTP_HOST_PORT`/`OPENFGA_GRPC_HOST_PORT`.
+
+### oidc-mock: failure mode
+
+`ops/oidc-mock` is the mock OIDC issuer every principal in this stack
+authenticates through (ADR 0011) — also core, not profile-gated. If it's
+down: `lakekeeper` never becomes healthy (it depends on `oidc-mock`
+reporting healthy, since `LAKEKEEPER__OPENID_PROVIDER_URI` points at it
+and Lakekeeper needs its discovery/JWKS documents to validate any bearer
+token at all), so the same downstream failure as OpenFGA-down applies.
+Once up, if `oidc-mock` goes down mid-run: every pre-minted token already
+on the `lakehouse_oidc_tokens` volume keeps working (Lakekeeper validates
+signatures against JWKS it already fetched; nothing re-fetches per
+request), but ClickHouse's `oauth_server_uri` calls to `/token` start
+failing, which breaks ClickHouse's `DataLakeCatalog` Iceberg read path the
+next time it needs a fresh token — this is the one caller in this build
+that actually depends on `oidc-mock` staying up, not just having started
+once (see ADR 0011's "what a real IdP swap has to account for" for why
+this is a real gap, not just a mock-specific one).
+
+`oidc-mock` publishes no host port by default (PR #33 review, blockers 1
+and 2) — it holds the private key that everything else's token
+verification trusts, and (before this review) its `/token` endpoint could
+mint an admin-bypass token for anyone who could reach it with no
+credential. Reach it via `docker compose exec` or a container on the
+compose network for debugging, not by republishing `OIDC_MOCK_HOST_PORT`.
 
 ### SeaweedFS (opt-in, P2 — storage-compatibility matrix only)
 
