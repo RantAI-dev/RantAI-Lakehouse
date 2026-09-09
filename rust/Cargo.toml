@@ -28,7 +28,7 @@ indexmap = { version = "2", features = ["serde"] }
 hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
-rand = "0.8"
+rand = "0.10"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls-tls", "builder", "tokio1-rustls-tls"] }
 wiremock = "0.6"
