@@ -180,7 +180,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Dependency review
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5
         with:
           # GHSA-2f9f-gq7v-9h6m (moderate) — `thrift` 0.17.0, reached only as
           # parquet <- iceberg <- lakehouse-iceberg. There is no version to
