@@ -66,7 +66,7 @@ fn required(field: &str, value: &str) -> Result<String, ApiError> {
 const VALID_AUTONOMY: [&str; 4] = ["L1", "L2", "L3", "L4"];
 
 /// `agent_employee.mode`'s `CHECK` constraint values
-/// (`0024_agent_schedule.sql`) — a headless run uses this to pick the
+/// (`0025_agent_schedule.sql`) — a headless run uses this to pick the
 /// copilot's `SYSTEM_ASK_SUFFIX`/`SYSTEM_BUILD_SUFFIX` equivalent.
 const VALID_MODE: [&str; 2] = ["ask", "build"];
 
@@ -174,7 +174,7 @@ pub struct CreateEmployeeBody {
 /// # T3.2 fix: `mode` used to reach the database unvalidated
 ///
 /// `agent_employee.mode` carries a `CHECK (mode IN ('ask', 'build'))`
-/// constraint (`0024_agent_schedule.sql`), but nothing validated `body.mode`
+/// constraint (`0025_agent_schedule.sql`), but nothing validated `body.mode`
 /// before this handler handed it to [`agents::create_employee`] — an
 /// invalid value (`{"mode": "sleep"}`) surfaced as a raw Postgres
 /// constraint-violation error (an opaque 500) instead of a clean 400,

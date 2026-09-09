@@ -125,7 +125,7 @@ it rather than inventing a second one.
 
 ## Decision 4 — the audit sink
 
-Migration `0023_audit_event.sql` adds an append-only `audit_event` table
+Migration `0024_audit_event.sql` adds an append-only `audit_event` table
 (`principal_id`, `principal_kind`, `action`, `resource_kind`/`resource_id`,
 `args` JSONB, `outcome`, `run_id`, `approval_id`, `session_id`).
 `lakehouse-store::audit` provides `insert`/`list`; `GET
@@ -153,7 +153,7 @@ branch.
 
 ## Decision 5 — headless digital-employee runs, with a permission ceiling
 
-Migration `0024_agent_schedule.sql` adds `prompt`, `schedule_cron`, `mode`,
+Migration `0025_agent_schedule.sql` adds `prompt`, `schedule_cron`, `mode`,
 `permissions` to `agent_employee` and reserves `emp-copilot` ("Copilot
 (interactive)") for approvals created from interactive chat. Migration
 `0025` drops the seeded fixture `agent_run`/`approval_item` rows, so

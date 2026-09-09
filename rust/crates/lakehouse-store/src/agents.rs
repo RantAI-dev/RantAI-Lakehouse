@@ -881,7 +881,7 @@ pub async fn decide_approval(
 // WriteHigh copilot approvals (T0.5, copilot-operations-handover plan)
 // ---------------------------------------------------------------------
 
-/// The reserved interactive-copilot employee row `0024_agent_schedule.sql`
+/// The reserved interactive-copilot employee row `0025_agent_schedule.sql`
 /// inserts — every `WriteHigh` copilot call is attributed to this id.
 pub const COPILOT_EMPLOYEE_ID: &str = "emp-copilot";
 
@@ -941,7 +941,7 @@ pub struct CreatedApproval {
 ///
 /// Returns [`StoreError::Database`] if either insert fails (e.g. the
 /// `emp-copilot` row is missing — it should never be, see
-/// `0024_agent_schedule.sql`).
+/// `0025_agent_schedule.sql`).
 pub async fn create_pending_approval(
     pool: &PgPool,
     req: NewApprovalRequest<'_>,

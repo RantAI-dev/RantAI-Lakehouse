@@ -26,7 +26,7 @@ import { ServiceError } from "../errors"
  * tool-calling copilot untuk satu digital employee tanpa pengawasan
  * interaktif, menulis `agent_run`/`steps`/`audit_event` yang nyata.
  * `listRuns`/`getRun` sekarang bisa menyajikan riwayat run yang benar-
- * benar terjadi, bukan cuma seed — lihat migrasi `0025_drop_seeded_
+ * benar terjadi, bukan cuma seed — lihat migrasi `0026_drop_seeded_
  * agent_runs.sql`, yang menghapus seed run/approval lama supaya halaman
  * ini tidak menyesatkan.
  */

@@ -151,7 +151,7 @@ async fn list_respects_limit(pool: PgPool) -> sqlx::Result<()> {
 /// delete or orphan the audit row.
 ///
 /// Uses a freshly-inserted `agent_run` row rather than a seeded fixture id:
-/// migration `0025_drop_seeded_agent_runs.sql` (copilot-operations T3.1)
+/// migration `0026_drop_seeded_agent_runs.sql` (copilot-operations T3.1)
 /// removes the `0018_seed_agents.sql` fixture rows (`run-col-01` /
 /// `ap-01`), since they were fabricated demo history, not real runs — see
 /// that migration's header comment.

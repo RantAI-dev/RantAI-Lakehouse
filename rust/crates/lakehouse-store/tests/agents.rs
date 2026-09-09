@@ -291,7 +291,7 @@ async fn decide_unknown_approval_is_not_found(pool: PgPool) -> sqlx::Result<()> 
 }
 
 // ---------------------------------------------------------------------
-// T3.1: schedulable digital employees (migration 0024/0025)
+// T3.1: schedulable digital employees (migration 0025/0026)
 // ---------------------------------------------------------------------
 
 /// The four new columns round-trip through `create_employee` and
@@ -394,14 +394,14 @@ async fn list_scheduled_employees_returns_only_cron_set(pool: PgPool) -> sqlx::R
     Ok(())
 }
 
-/// `emp-copilot` exists after migration 0024, is manual-only, and is not
+/// `emp-copilot` exists after migration 0025, is manual-only, and is not
 /// runnable (no prompt).
 #[sqlx::test(migrations = "../../migrations")]
 async fn emp_copilot_exists_and_is_manual_only(pool: PgPool) -> sqlx::Result<()> {
     let copilot = get_employee(&pool, "emp-copilot")
         .await
         .unwrap()
-        .expect("emp-copilot must exist after migration 0024");
+        .expect("emp-copilot must exist after migration 0025");
     assert_eq!(copilot.schedule_cron, None);
     assert_eq!(copilot.prompt, None);
     assert_eq!(copilot.permissions, "");

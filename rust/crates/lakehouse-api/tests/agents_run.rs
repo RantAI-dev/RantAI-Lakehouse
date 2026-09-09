@@ -333,7 +333,7 @@ async fn revoked_employee_is_refused_with_409() {
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 }
 
-/// The reserved `emp-copilot` row (seeded by `0024_agent_schedule.sql`)
+/// The reserved `emp-copilot` row (seeded by `0025_agent_schedule.sql`)
 /// can never be run headlessly.
 #[tokio::test]
 async fn emp_copilot_cannot_be_run_headlessly() {
