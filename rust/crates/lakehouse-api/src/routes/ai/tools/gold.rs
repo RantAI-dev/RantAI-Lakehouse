@@ -76,6 +76,13 @@ pub(super) async fn export_gold_mart(state: &AppState, args: &Map<String, Value>
         &iceberg_config,
         &source_table,
         mart_ident.as_str(),
+        // The same row cap and batch size `POST /api/gold/export/{mart}`
+        // applies, read from config rather than hardcoded here: a mart the
+        // console would refuse to export for exceeding the cap must not
+        // become exportable just because the request arrived through the
+        // copilot instead.
+        state.config.gold_export_max_rows,
+        state.config.gold_export_batch_size,
     )
     .await
     {
