@@ -1,7 +1,6 @@
 import type {
   PipelineService,
   Pipeline,
-  PipelineDetail,
   PipelineRun,
   CreatePipelineInput,
   GeneratePipelineInput,
@@ -54,22 +53,12 @@ export const dagsterPipelineService: PipelineService = {
   async getPipeline(id, signal) {
     const [list, runs] = await Promise.all([this.listPipelines(signal), this.listRuns(id, signal)]);
     const base = list.find((p) => p.id === id);
-    if (!base) throw new ServiceError("not_found", "Pipeline tidak ditemukan");
-    const detail: PipelineDetail = {
-      ...base,
-      description: "Job Dagster: refresh lakehouse Bronze→Silver→Gold (dlt + SQLMesh).",
-      graph: [
-        { id: "bronze", label: "Bronze (dlt)", kind: "ingest", status: "completed" },
-        { id: "silver", label: "Silver (typed)", kind: "transform", status: "completed" },
-        { id: "gold", label: "Gold (mart)", kind: "publish", status: "completed" },
-      ],
-      runs,
-      configSummary: [
-        { key: "engine", value: "Dagster" },
-        { key: "schedule", value: base.schedule },
-      ],
-    };
-    return detail;
+    if (!base) throw new ServiceError("not_found", "Pipeline not found");
+    // WS1 task 1.1: the description, op graph and config summary used to be
+    // invented here. The API cannot yet report them (WS4 adds the Dagster
+    // graph query), so the detail is the list row plus its real runs and the
+    // graph tab renders an empty state.
+    return { ...base, runs };
   },
 
   createPipeline(input: CreatePipelineInput, signal) {

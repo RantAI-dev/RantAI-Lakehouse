@@ -336,7 +336,7 @@ export function PipelineDetailPage() {
                 { label: "Next run", value: p.nextRunAt ? formatRelativeTime(p.nextRunAt) : "—" },
                 { label: "SLA", value: p.slaOk ? "OK" : "Breached" },
                 { label: "Freshness", value: <FreshnessIndicator lagSeconds={p.freshnessLagSeconds} /> },
-                ...p.configSummary.map((c) => ({
+                ...(p.configSummary ?? []).map((c) => ({
                   label: c.key,
                   value: <span className="font-mono text-xs">{c.value}</span>,
                 })),
@@ -345,14 +345,21 @@ export function PipelineDetailPage() {
           </SectionCard>
         </TabsContent>
         <TabsContent value="graph" className="mt-3">
-          <FlowCanvas
-            nodes={p.graph.map((n) => ({
-              id: n.id,
-              label: n.label,
-              kind: n.kind,
-              status: n.status,
-            }))}
-          />
+          {p.graph && p.graph.length > 0 ? (
+            <FlowCanvas
+              nodes={p.graph.map((n) => ({
+                id: n.id,
+                label: n.label,
+                kind: n.kind,
+                status: n.status,
+              }))}
+            />
+          ) : (
+            <EmptyState
+              title="This pipeline has no graph yet"
+              description="The op graph is read from Dagster and is not available for this build."
+            />
+          )}
         </TabsContent>
         <TabsContent value="runs" className="mt-3">
           {p.runs.length === 0 ? (

@@ -41,10 +41,13 @@ export type PipelineRun = {
 }
 
 export type PipelineDetail = Pipeline & {
-  description: string
-  graph: { id: string; label: string; kind: string; status: EntityStatus }[]
+  /** Populated by WS4 from the Dagster op graph. Absent until then. */
+  graph?: { id: string; label: string; kind: string; status: EntityStatus }[]
+  /** Populated by WS4 from the job definition. Absent until then. */
+  description?: string
+  /** Populated by WS4 from the run config. Absent until then. */
+  configSummary?: { key: string; value: string }[]
   runs: PipelineRun[]
-  configSummary: { key: string; value: string }[]
 }
 
 export type CreatePipelineInput = {
