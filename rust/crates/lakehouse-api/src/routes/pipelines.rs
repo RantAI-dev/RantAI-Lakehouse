@@ -137,10 +137,13 @@ fn run_to_json(r: &DgRun, pipeline_id: &str) -> Value {
         "status": map_run_status(&r.status),
         "startedAt": r.start_time.map_or_else(String::new, iso_from_unix_seconds),
         "endedAt": r.end_time.map(iso_from_unix_seconds),
-        "processed": 0,
-        "accepted": 0,
-        "rejected": 0,
-        "retried": 0,
+        // WS1 task 1.2: Dagster's run record carries no row counts. WS4 reads
+        // them from step materializations; until then null says "not
+        // measured" rather than 0 claiming "measured none".
+        "processed": Value::Null,
+        "accepted": Value::Null,
+        "rejected": Value::Null,
+        "retried": Value::Null,
         "costUnits": cost_units(r.start_time, r.end_time),
     })
 }
@@ -182,11 +185,13 @@ pub async fn trigger(State(state): State<AppState>, Path(id): Path<String>) -> R
                 "pipelineId": id,
                 "status": map_run_status("STARTED"),
                 "startedAt": now_iso(),
-                "processed": 0,
-                "accepted": 0,
-                "rejected": 0,
-                "retried": 0,
-                "costUnits": 0,
+                // Same as run_to_json: see the note there.
+                "processed": Value::Null,
+                "accepted": Value::Null,
+                "rejected": Value::Null,
+                "retried": Value::Null,
+                // A just-launched run's cost is not yet knowable.
+                "costUnits": Value::Null,
             });
             (StatusCode::OK, ApiJson(body)).into_response()
         }
@@ -575,11 +580,14 @@ fn run_mutation_body(run_id: &str, status: &str) -> Value {
         "pipelineId": "",
         "status": status,
         "startedAt": now_iso(),
-        "processed": 0,
-        "accepted": 0,
-        "rejected": 0,
-        "retried": 0,
-        "costUnits": 0,
+        // Same as run_to_json: see the note there.
+        "processed": Value::Null,
+        "accepted": Value::Null,
+        "rejected": Value::Null,
+        "retried": Value::Null,
+        // A cancelled or retried run has consumed real compute (finding J4);
+        // reporting its cost as 0 would understate it, so it stays unmeasured.
+        "costUnits": Value::Null,
     })
 }
 
@@ -613,6 +621,29 @@ mod tests {
             status: status.to_owned(),
             start_time: start,
             end_time: end,
+        }
+    }
+
+    #[test]
+    fn run_to_json_emits_null_for_untracked_counters() {
+        let v = run_to_json(&run("j", "SUCCESS", Some(1.0), Some(61.0)), "p1");
+
+        // Dagster's run record carries no row counts. Emitting 0 would read as
+        // "this run processed nothing", which is a different claim from "we
+        // did not measure it".
+        for key in ["processed", "accepted", "rejected", "retried"] {
+            assert!(v[key].is_null(), "{key} must be null, got {}", v[key]);
+        }
+        // costUnits IS derived from the run's own duration, so it stays real.
+        assert!(!v["costUnits"].is_null());
+    }
+
+    #[test]
+    fn run_mutation_body_emits_null_for_unmeasured_fields() {
+        let v = run_mutation_body("r1", "cancelled");
+
+        for key in ["processed", "accepted", "rejected", "retried", "costUnits"] {
+            assert!(v[key].is_null(), "{key} must be null, got {}", v[key]);
         }
     }
 

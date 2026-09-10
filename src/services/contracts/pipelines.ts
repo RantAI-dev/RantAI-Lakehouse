@@ -1,3 +1,4 @@
+import type { Measured } from "@/lib/measured"
 import type { EntityStatus } from "@/lib/status"
 
 export type PipelineKind = "batch" | "incremental" | "document" | "vector"
@@ -28,11 +29,13 @@ export type PipelineRun = {
   status: EntityStatus
   startedAt: string
   endedAt?: string
-  processed: number
-  accepted: number
-  rejected: number
-  retried: number
-  costUnits: number
+  /** Row counts are not tracked yet — WS4 reads them from step materializations. */
+  processed: Measured
+  accepted: Measured
+  rejected: Measured
+  retried: Measured
+  /** Null for a just-launched run and for cancel/retry responses. */
+  costUnits: Measured
   error?: string
   checkpoint?: string
   auditEventId?: string

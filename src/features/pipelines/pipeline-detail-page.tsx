@@ -28,6 +28,7 @@ import {
   formatDuration,
   formatRelativeTime,
 } from "@/lib/format"
+import { fmtMeasured } from "@/lib/measured"
 import { pipelineService } from "@/services"
 import type { PipelineRun } from "@/services/contracts/pipelines"
 
@@ -42,15 +43,15 @@ const runColumns: ColumnDef<PipelineRun>[] = [
   { key: "status", header: "Status", render: (r) => <StatusBadge status={r.status} /> },
   { key: "started", header: "Started", render: (r) => formatRelativeTime(r.startedAt) },
   { key: "duration", header: "Duration", render: (r) => runDuration(r) },
-  { key: "processed", header: "Processed", render: (r) => formatCompactNumber(r.processed) },
-  { key: "accepted", header: "Accepted", render: (r) => formatCompactNumber(r.accepted) },
+  { key: "processed", header: "Processed", render: (r) => fmtMeasured(r.processed, formatCompactNumber) },
+  { key: "accepted", header: "Accepted", render: (r) => fmtMeasured(r.accepted, formatCompactNumber) },
   { key: "rejected", header: "Rejected", render: (r) => (
-    <span className={r.rejected > 0 ? "text-destructive" : undefined}>
-      {formatCompactNumber(r.rejected)}
+    <span className={r.rejected !== null && r.rejected > 0 ? "text-destructive" : undefined}>
+      {fmtMeasured(r.rejected, formatCompactNumber)}
     </span>
   )},
-  { key: "retried", header: "Retried", render: (r) => formatCompactNumber(r.retried) },
-  { key: "cost", header: "Cost", render: (r) => formatCost(r.costUnits) },
+  { key: "retried", header: "Retried", render: (r) => fmtMeasured(r.retried, formatCompactNumber) },
+  { key: "cost", header: "Cost", render: (r) => fmtMeasured(r.costUnits, formatCost) },
   { key: "error", header: "Error", render: (r) =>
     r.error ? (
       <span className="block max-w-52 truncate text-destructive" title={r.error}>
@@ -161,11 +162,11 @@ function RunDrawer({
                   value: run.endedAt ? formatDateTime(run.endedAt) : "running",
                 },
                 { label: "Duration", value: runDuration(run) },
-                { label: "Processed", value: formatCompactNumber(run.processed) },
-                { label: "Accepted", value: formatCompactNumber(run.accepted) },
-                { label: "Rejected", value: formatCompactNumber(run.rejected) },
-                { label: "Retried", value: formatCompactNumber(run.retried) },
-                { label: "Cost", value: formatCost(run.costUnits) },
+                { label: "Processed", value: fmtMeasured(run.processed, formatCompactNumber) },
+                { label: "Accepted", value: fmtMeasured(run.accepted, formatCompactNumber) },
+                { label: "Rejected", value: fmtMeasured(run.rejected, formatCompactNumber) },
+                { label: "Retried", value: fmtMeasured(run.retried, formatCompactNumber) },
+                { label: "Cost", value: fmtMeasured(run.costUnits, formatCost) },
                 {
                   label: "Checkpoint",
                   value: run.checkpoint ? (
