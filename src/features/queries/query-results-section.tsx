@@ -14,7 +14,13 @@ import { QueryPlanPanel } from "./query-transparency-panel"
 
 type ResultRow = { key: string; cells: Record<string, string> }
 
-function PillList({ values }: { values: string[] }) {
+/**
+ * `values === null` means "not measured" (WS1 task 1.6: no pushdown
+ * computation and no policy engine exist yet) — a distinct claim from an
+ * empty list, which would read as "we checked and there were none."
+ */
+function PillList({ values }: { values: string[] | null }) {
+  if (values === null) return <span className="text-muted-foreground">Not measured</span>
   if (values.length === 0) return <span className="text-muted-foreground">None</span>
   return (
     <span className="flex flex-wrap gap-1">
@@ -75,7 +81,12 @@ export function QueryResultsSection({ result }: { result: QueryResult }) {
           { label: "Cost", value: formatCost(result.metrics.costUnits) },
           { label: "Engine", value: ENGINE_CATEGORY_LABEL[result.metrics.engine] },
           { label: "Workload", value: WORKLOAD_CLASS_LABEL[result.metrics.workloadClass] },
-          { label: "Cache", value: result.metrics.cacheHit ? "Hit" : "Miss" },
+          {
+            label: "Cache",
+            // WS1 task 1.6: ClickHouse's response carries no cache-hit flag —
+            // null renders "—" rather than a fabricated "Miss".
+            value: result.metrics.cacheHit === null ? "—" : result.metrics.cacheHit ? "Hit" : "Miss",
+          },
           { label: "Pushdowns", value: <PillList values={result.metrics.pushdowns} /> },
           {
             label: "Policy obligations",

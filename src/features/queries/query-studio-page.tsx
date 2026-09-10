@@ -14,7 +14,6 @@ import { askAgentSql, type AgentQueryResult } from "@/services/clients/agent-cli
 import { HistoryQuickList, SavedQuickList } from "./query-context-lists"
 import { QueryResultsSection } from "./query-results-section"
 import { QueryStudioTabs } from "./query-studio-tabs"
-import { QueryTransparencyPanel } from "./query-transparency-panel"
 
 const STARTER_SQL = "-- Write SQL here, or generate it from a question"
 
@@ -27,18 +26,10 @@ export function QueryStudioPage() {
   const generateAct = useServiceAction((signal, q: string) =>
     queryService.generateSql(q, signal)
   )
-  const estimateAct = useServiceAction((signal, s: string) =>
-    queryService.estimate(s, signal)
-  )
   const runAct = useServiceAction((signal, s: string) =>
     queryService.run(s, signal)
   )
   const savedState = useService((s) => queryService.listSaved(s), [])
-
-  const runEstimate = estimateAct.run
-  React.useEffect(() => {
-    if (sql.trim()) void runEstimate(sql)
-  }, [sql, runEstimate])
 
   // Handoff from Saved Queries: /query-studio?saved=<id> loads that SQL.
   // Read from window.location to avoid a useSearchParams Suspense boundary.
@@ -98,7 +89,7 @@ export function QueryStudioPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Query Studio"
-        description="Ask questions or write SQL. Pre-run checks show workload class, engine category, freshness, policy obligations, and cost."
+        description="Ask questions or write SQL, then run it against the hot analytical store."
       />
       <QueryStudioTabs />
       <div className="grid gap-4 xl:grid-cols-[1fr_320px]">
@@ -208,14 +199,6 @@ export function QueryStudioPage() {
                 >
                   {running ? "Running…" : "Run query"}
                 </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() => void runEstimate(sql)}
-                  disabled={estimateAct.status === "pending" || !sql.trim()}
-                >
-                  Estimate
-                </Button>
               </div>
             </TabsContent>
           </Tabs>
@@ -228,10 +211,6 @@ export function QueryStudioPage() {
           {runAct.data ? <QueryResultsSection result={runAct.data} /> : null}
         </div>
         <div className="space-y-3">
-          <QueryTransparencyPanel
-            state={estimateAct}
-            onRetry={() => void runEstimate(sql)}
-          />
           <SavedQuickList state={savedState} onLoadSql={loadSql} />
           <HistoryQuickList onLoadSql={loadSql} />
         </div>

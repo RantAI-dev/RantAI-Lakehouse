@@ -202,7 +202,30 @@ pub async fn run(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJso
         }
     }
 
-    Ok(ApiJson(json!({
+    Ok(ApiJson(run_result_json(
+        &id,
+        &json!(columns),
+        &json!(rows),
+        duration_ms,
+        scanned_bytes,
+        cost_units,
+    )))
+}
+
+/// Build the `/api/query/run` response body from already-computed values.
+///
+/// Extracted from [`run`] so the transparency-panel contract — which fields
+/// are real measurements versus `null` — is unit-testable without a live
+/// `ClickHouse` connection.
+fn run_result_json(
+    id: &str,
+    columns: &Value,
+    rows: &Value,
+    duration_ms: u64,
+    scanned_bytes: u64,
+    cost_units: u64,
+) -> Value {
+    json!({
         "id": id,
         "columns": columns,
         "rows": rows,
@@ -212,21 +235,21 @@ pub async fn run(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJso
             "costUnits": cost_units,
             "engine": "hot-store",
             "workloadClass": "hot-analytics",
-            "cacheHit": false,
-            "pushdowns": [],
-            "policyObligations": [],
+            // WS1 task 1.6: `ClickHouse`'s response carries no cache-hit flag
+            // and no pushdown list, and there is no policy engine to produce
+            // obligations (`WS7` builds one). Null says "not measured"; the
+            // old constants (`false`, `[]`, `[]`) claimed a measurement that
+            // was never taken.
+            "cacheHit": Value::Null,
+            "pushdowns": Value::Null,
+            "policyObligations": Value::Null,
         },
-        "plan": [
-            {
-                "id": "s1",
-                "label": "ClickHouse (Hot analytical store)",
-                "location": "clickhouse@lakehouse",
-                "operation": "scan + aggregate",
-                "estimatedBytes": scanned_bytes,
-                "status": "completed",
-            }
-        ],
-    })))
+        // WS1 task 1.6: the old `plan` was a single hardcoded stage claiming
+        // "scan + aggregate" and status "completed" for every query,
+        // regardless of what `ClickHouse` actually did. Null until a real
+        // plan is computed.
+        "plan": Value::Null,
+    })
 }
 
 /// Current time as Unix milliseconds, matching JavaScript's `Date.now()`
@@ -312,35 +335,43 @@ pub async fn estimate(State(state): State<AppState>, body: Bytes) -> ApiResult<A
     let sources_out: Vec<String> = if sources.is_empty() {
         vec!["clickhouse@lakehouse".to_owned()]
     } else {
-        sources.clone()
+        sources
     };
-    let plan: Vec<Value> = sources
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            json!({
-                "id": format!("p{i}"),
-                "label": s,
-                "location": "clickhouse@lakehouse",
-                "operation": "scan",
-                "estimatedBytes": 0,
-                "status": "completed",
-            })
-        })
-        .collect();
 
-    Ok(ApiJson(json!({
+    Ok(ApiJson(estimate_result_json(
+        estimated_bytes,
+        cost_min,
+        cost_max,
+        &json!(sources_out),
+    )))
+}
+
+/// Build the `/api/query/estimate` response body from already-computed
+/// values. See [`run_result_json`] for why this is extracted.
+fn estimate_result_json(
+    estimated_bytes: i64,
+    cost_min: u64,
+    cost_max: u64,
+    sources_out: &Value,
+) -> Value {
+    json!({
         "estimatedBytes": estimated_bytes,
         "estimatedCostMin": cost_min,
         "estimatedCostMax": cost_max,
         "workloadClass": "hot-analytics",
         "engine": "hot-store",
-        "cacheEligible": true,
-        "freshnessLagSeconds": 0,
-        "policyObligations": [],
+        // WS1 task 1.6: no cache-eligibility check runs and no
+        // freshness-lag measurement exists, and there is no policy engine
+        // yet (`WS7` builds one). The old `plan` marked stages that had
+        // *not run* as status "completed" with `estimatedBytes: 0` — a
+        // fabricated measurement of work that was never done. Null says
+        // "not measured".
+        "cacheEligible": Value::Null,
+        "freshnessLagSeconds": Value::Null,
+        "policyObligations": Value::Null,
         "sources": sources_out,
-        "plan": plan,
-    })))
+        "plan": Value::Null,
+    })
 }
 
 /// Runs `EXPLAIN ESTIMATE <sql>` (with any trailing `;` stripped) and
@@ -576,5 +607,47 @@ mod tests {
         assert_eq!(numeric_value(&json!(5)), Some(5.0));
         assert_eq!(numeric_value(&json!("7")), Some(7.0));
         assert_eq!(numeric_value(&json!(null)), None);
+    }
+
+    #[test]
+    fn run_result_emits_null_for_unmeasured_transparency_fields() {
+        let v = run_result_json("q-1", &json!([]), &json!([]), 12, 34, 1);
+
+        // The transparency panel exists to tell the reader what actually
+        // happened. ClickHouse's response carries no cache-hit flag and no
+        // pushdown list, and no policy engine exists yet (WS7), so these are
+        // not measurements.
+        for key in ["cacheHit", "pushdowns", "policyObligations"] {
+            assert!(
+                v["metrics"][key].is_null(),
+                "{key} must be null, got {}",
+                v["metrics"][key]
+            );
+        }
+        assert!(
+            v["plan"].is_null(),
+            "the plan was one invented stage, not a real plan"
+        );
+
+        // Genuinely measured values survive.
+        assert_eq!(v["metrics"]["durationMs"], json!(12));
+        assert_eq!(v["metrics"]["scannedBytes"], json!(34));
+        assert_eq!(v["metrics"]["costUnits"], json!(1));
+    }
+
+    #[test]
+    fn estimate_result_emits_null_for_unmeasured_fields() {
+        let v = estimate_result_json(100, 1, 2, &json!([]));
+
+        for key in [
+            "cacheEligible",
+            "freshnessLagSeconds",
+            "policyObligations",
+            "plan",
+        ] {
+            assert!(v[key].is_null(), "{key} must be null, got {}", v[key]);
+        }
+        // The EXPLAIN ESTIMATE numbers are real.
+        assert_eq!(v["estimatedBytes"], json!(100));
     }
 }

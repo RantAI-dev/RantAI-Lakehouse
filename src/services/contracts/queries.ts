@@ -1,3 +1,4 @@
+import type { Measured } from "@/lib/measured"
 import type { EngineCategory, EntityStatus, WorkloadClass } from "@/lib/status"
 
 export type SavedQuery = {
@@ -40,11 +41,21 @@ export type QueryEstimate = {
   estimatedCostMax: number
   workloadClass: WorkloadClass
   engine: EngineCategory
-  cacheEligible: boolean
-  freshnessLagSeconds: number
-  policyObligations: string[]
+  /**
+   * `EXPLAIN ESTIMATE` doesn't report cache eligibility — null until a
+   * real cache-eligibility check exists.
+   */
+  cacheEligible: boolean | null
+  /** No freshness-lag measurement exists yet. */
+  freshnessLagSeconds: Measured
+  /** No policy engine exists yet — WS7 builds one. */
+  policyObligations: string[] | null
   sources: string[]
-  plan: QueryPlanStage[]
+  /**
+   * WS1 task 1.6: the old plan marked stages that had not run as
+   * `status: "completed"`. Null until a real plan exists.
+   */
+  plan: QueryPlanStage[] | null
 }
 
 export type QueryResult = {
@@ -57,11 +68,18 @@ export type QueryResult = {
     costUnits: number
     engine: EngineCategory
     workloadClass: WorkloadClass
-    cacheHit: boolean
-    pushdowns: string[]
-    policyObligations: string[]
+    /** ClickHouse's response carries no cache-hit flag — not measured. */
+    cacheHit: boolean | null
+    /** No pushdown computation exists — not measured. */
+    pushdowns: string[] | null
+    /** No policy engine exists yet — WS7 builds one. */
+    policyObligations: string[] | null
   }
-  plan: QueryPlanStage[]
+  /**
+   * WS1 task 1.6: the old plan was a single hardcoded stage claiming
+   * "scan + aggregate" for every query. Null until a real plan exists.
+   */
+  plan: QueryPlanStage[] | null
   auditEventId?: string
 }
 
