@@ -4,7 +4,7 @@ import * as React from "react"
 import { PageHeader } from "@/components/patterns/page-header"
 import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
 import { FlowCanvas } from "@/components/patterns/flow-canvas"
-import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Pill } from "@/components/patterns/status-badge"
 import { Input } from "@/components/ui/input"
@@ -52,7 +52,14 @@ export function LineagePage() {
       />
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
-      {state.status === "success" ? (
+      {state.status === "success" && !state.data.supported ? (
+        // The build has no lineage capture. Show the API's own reason
+        // rather than an empty graph canvas next to it — an empty canvas
+        // would read as "this dataset has no lineage" instead of "lineage
+        // capture is not implemented".
+        <EmptyState title="Lineage not available" description={state.data.reason} />
+      ) : null}
+      {state.status === "success" && state.data.supported ? (
         <>
           <SectionCard title="Graph">
             <FlowCanvas

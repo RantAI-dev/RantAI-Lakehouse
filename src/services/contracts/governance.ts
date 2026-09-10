@@ -54,6 +54,9 @@ export type LineageGraph = {
   nodes: { id: string; label: string; kind: string }[]
   edges: LineageEdge[]
   columnMappings: { source: string; target: string; transform: string }[]
+  /** False when the build has no lineage capture; `reason` says why. */
+  supported: boolean
+  reason?: string
 }
 
 export type AuditEvent = {

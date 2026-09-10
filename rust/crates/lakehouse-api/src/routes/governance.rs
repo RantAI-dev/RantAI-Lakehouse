@@ -13,7 +13,6 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
-use lakehouse_core::ident::SqlLiteral;
 use lakehouse_store::PgPool;
 use lakehouse_store::governance::{
     self, ClassificationRule, CreateClassificationRuleInput, CreatePolicyInput,
@@ -473,118 +472,37 @@ pub struct LineageQuery {
     focus: String,
 }
 
-/// `GET /api/governance/lineage?focus=<slug>`.
-pub async fn lineage(State(state): State<AppState>, Query(q): Query<LineageQuery>) -> Response {
-    match lineage_body(&state.clickhouse, &q.focus).await {
-        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
-        // `catch (e) { return NextResponse.json({ error: String(e), focus,
-        // nodes: [], edges: [], columnMappings: [] }, { status: 503 }); }`.
-        Err(err) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({
-                "error": js_error(err),
-                "focus": q.focus,
-                "nodes": [],
-                "edges": [],
-                "columnMappings": [],
-            })),
-        )
-            .into_response(),
-    }
-}
-
-/// Does this `ClickHouse` server error mean the database or table simply is
-/// not there?
+/// The lineage response for a build with no lineage capture.
 ///
-/// `ChError::Server` carries the raw `ClickHouse` error body verbatim with no
-/// structured code, so this matches on it. Both the numeric code and the
-/// symbolic name are required: the codes alone (60, 81) appear in unrelated
-/// text, and matching the name alone would fire on a query that merely
-/// mentioned it. `ClickHouse` formats these as, e.g.
-///
-/// ```text
-/// Code: 81. DB::Exception: Database _silver_meta does not exist. (UNKNOWN_DATABASE)
-/// ```
-fn missing_ch_object(msg: &str) -> bool {
-    (msg.contains("Code: 81") && msg.contains("UNKNOWN_DATABASE"))
-        || (msg.contains("Code: 60") && msg.contains("UNKNOWN_TABLE"))
-}
-
-async fn lineage_body(ch: &ChClient, focus: &str) -> Result<Value, ChError> {
-    let escaped_focus = SqlLiteral::from(focus);
-    let meta_sql = format!(
-        "SELECT table_name, title, tier FROM lake.`bronze_meta.dataset_catalog` WHERE slug={escaped_focus}
-         UNION ALL SELECT table_name, title, tier FROM lake.`bronze_meta_sec.dataset_catalog` WHERE slug={escaped_focus} LIMIT 1"
-    );
-    let meta_rows = ch.rows(&meta_sql, None).await?;
-    let Some(meta) = meta_rows.first() else {
-        return Ok(json!({ "focus": focus, "nodes": [], "edges": [], "columnMappings": [] }));
-    };
-
-    let table = str_col(meta, "table_name");
-    let sekunder = str_col(meta, "tier") == "sekunder";
-    let bronze_ns = if sekunder { "bronze_sec" } else { "bronze_sdi" };
-
-    let escaped_table = SqlLiteral::from(table);
-    let cols_sql = format!(
-        "SELECT kolom, tipe FROM _silver_meta.kolom_tipe WHERE tabel={escaped_table} LIMIT 200"
-    );
-    // Column mappings are ENRICHMENT: `nodes` and `edges` below — the lineage
-    // graph itself, and the only thing the console needs to draw it — are
-    // built entirely from `bronze_meta.dataset_catalog` above. `_silver_meta`
-    // is a legacy Silver-layer database that the lakehouse compose stack does
-    // not create, so propagating this error meant `GET /api/governance/lineage`
-    // returned 503 with empty nodes/edges for EVERY dataset there — the whole
-    // lineage surface dark because an optional detail table was absent.
-    //
-    // Narrow on purpose: only a missing database/table degrades to "no column
-    // detail". A connection failure, a permission error, or a malformed query
-    // still propagates, because those mean the answer is unknown rather than
-    // legitimately empty.
-    let cols = match ch.rows(&cols_sql, None).await {
-        Ok(rows) => rows,
-        Err(ChError::Server(msg)) if missing_ch_object(&msg) => Vec::new(),
-        Err(err) => return Err(err),
-    };
-
-    let src_label = if sekunder {
-        "Sumber sekunder (olahan)"
-    } else {
-        "Satu Data Jakarta"
-    };
-    let nodes = json!([
-        { "id": "src", "label": src_label, "kind": "source" },
-        { "id": format!("bronze.{table}"), "label": format!("Bronze · {table}"), "kind": "iceberg-table" },
-        { "id": format!("silver.{table}"), "label": format!("Silver · {table}"), "kind": "view" },
-    ]);
-    let edges = json!([
-        { "id": "e1", "from": "src", "to": format!("bronze.{table}"), "kind": "pipeline" },
-        { "id": "e2", "from": format!("bronze.{table}"), "to": format!("silver.{table}"), "kind": "transform" },
-    ]);
-    let column_mappings: Vec<Value> = cols
-        .iter()
-        .map(|c| {
-            let kolom = str_col(c, "kolom");
-            let tipe = str_col(c, "tipe");
-            let transform = match tipe {
-                "teks" => "bersih_teks (String)",
-                "angka" => "angka_id (Decimal)",
-                _ => "tanggal_id (Date)",
-            };
-            json!({
-                "source": format!("{bronze_ns}.{table}.{kolom}"),
-                "target": format!("silver.{table}.{kolom}"),
-                "transform": transform,
-            })
-        })
-        .collect();
-
-    Ok(json!({
+/// `WS1` task 1.5: this route used to derive a three-node
+/// `source → Bronze → Silver` chain from the catalog's naming conventions and
+/// return it as lineage, with per-column transform text chosen by a three-way
+/// match on the column's declared type. Nothing captured any of it, so the
+/// arrows and the transforms were guesses that read as fact — and a lineage
+/// graph is precisely the surface a reader assumes is authoritative. `WS4`
+/// builds real lineage from `Dagster` op dependencies; until then this route
+/// reports the capability as absent and names the reason.
+fn lineage_unsupported(focus: &str) -> Value {
+    json!({
         "focus": focus,
-        "nodes": nodes,
-        "edges": edges,
-        "columnMappings": column_mappings,
-    }))
+        "nodes": [{ "id": focus, "label": focus, "kind": "focus" }],
+        "edges": [],
+        "columnMappings": [],
+        "supported": false,
+        "reason": "lineage capture not implemented",
+    })
+}
+
+/// `GET /api/governance/lineage?focus=<slug>`.
+///
+/// `state` is unused: lineage capture is not implemented (see
+/// [`lineage_unsupported`]), so this handler no longer queries `ClickHouse`.
+/// It is kept as a parameter (rather than dropped from the signature) only
+/// because dropping it would be signature churn unrelated to this fix and
+/// axum's `Handler` blanket impl still requires an `async fn`; `WS4` makes
+/// this parameter live again when it builds real lineage.
+pub async fn lineage(State(_state): State<AppState>, Query(q): Query<LineageQuery>) -> Response {
+    (StatusCode::OK, ApiJson(lineage_unsupported(&q.focus))).into_response()
 }
 
 // ── Postgres-backed writes (Task 2.3) ───────────────────────────────────
@@ -816,6 +734,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lineage_reports_unsupported_not_a_template() {
+        let v = lineage_unsupported("serving.mart_revenue");
+
+        assert_eq!(v["supported"], json!(false));
+        assert!(
+            v["reason"].as_str().is_some_and(|r| !r.is_empty()),
+            "an unsupported capability must say why"
+        );
+        // The focus node is the only honest node: it is the table the caller
+        // asked about. Anything else would be invented.
+        assert_eq!(v["nodes"].as_array().map(Vec::len), Some(1));
+        assert_eq!(v["edges"].as_array().map(Vec::len), Some(0));
+        assert_eq!(v["columnMappings"].as_array().map(Vec::len), Some(0));
+        assert_eq!(v["focus"], json!("serving.mart_revenue"));
+    }
+
+    #[test]
     fn kind_parses_known_values() {
         assert_eq!(Kind::parse("quality"), Kind::Quality);
         assert_eq!(Kind::parse("audit"), Kind::Audit);
@@ -898,41 +833,6 @@ mod tests {
     #[test]
     fn ch_bool_is_false_for_a_missing_column() {
         assert!(!ch_bool(&serde_json::Map::new(), "active"));
-    }
-
-    #[test]
-    fn missing_ch_object_recognizes_absent_database_and_table() {
-        // Verbatim from the G3a failure this was written for.
-        assert!(missing_ch_object(
-            "Code: 81. DB::Exception: Database _silver_meta does not exist. \
-             (UNKNOWN_DATABASE) (version 26.8.2.7 (official build))"
-        ));
-        assert!(missing_ch_object(
-            "Code: 60. DB::Exception: Table _silver_meta.kolom_tipe does not exist. \
-             (UNKNOWN_TABLE) (version 26.8.2.7 (official build))"
-        ));
-    }
-
-    #[test]
-    fn missing_ch_object_does_not_swallow_other_failures() {
-        // These mean "the answer is unknown", not "legitimately empty", so
-        // lineage must still fail loudly rather than report no columns.
-        assert!(!missing_ch_object(
-            "Code: 497. DB::Exception: user is not allowed to SELECT. (ACCESS_DENIED)"
-        ));
-        assert!(!missing_ch_object(
-            "Code: 62. DB::Exception: Syntax error: failed at position 8. (SYNTAX_ERROR)"
-        ));
-        assert!(!missing_ch_object("fetch failed"));
-        // Code without the symbolic name, and name without the code: neither
-        // is conclusive on its own, since both forms show up in unrelated
-        // message text.
-        assert!(!missing_ch_object(
-            "Code: 81. DB::Exception: something else entirely"
-        ));
-        assert!(!missing_ch_object(
-            "query mentioning UNKNOWN_DATABASE in passing"
-        ));
     }
 
     #[test]
