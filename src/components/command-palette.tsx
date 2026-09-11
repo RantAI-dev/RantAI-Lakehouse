@@ -8,7 +8,7 @@ import { useTheme } from "next-themes";
 import {
   Search, Sparkles, BarChart3, Plus, Download, Moon, Sun, Clock,
 } from "lucide-react";
-import { visibleNavGroups, pageTitleFor } from "@/components/app-shell/nav-config";
+import { NAV_GROUPS, pageTitleFor } from "@/components/app-shell/nav-config";
 
 const OPEN_EVENT = "rantai:open-command";
 /** Panggil dari mana saja (mis. box search navbar) untuk membuka palette. */
@@ -36,7 +36,7 @@ export function CommandPalette() {
   const pathname = usePathname();
   const { resolvedTheme, setTheme } = useTheme();
 
-  const groups = visibleNavGroups();
+  const groups = NAV_GROUPS;
 
   // Buka via ⌘K / Ctrl+K, dan via event dari box search navbar.
   React.useEffect(() => {

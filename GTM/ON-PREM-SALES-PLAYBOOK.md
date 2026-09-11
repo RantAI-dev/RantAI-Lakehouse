@@ -116,10 +116,10 @@ codebase. Sell it as indemnity, support, and upgrades.
 
 ## 5. The honest demo script
 
-Run the compose stack with the `dagster` and `trino` profiles and set
-`NEXT_PUBLIC_SHOW_PREVIEW=1` at build time, otherwise Connectors, Agents,
-Policies, and Admin pages are hidden by a stale nav flag. Set the
-`TENANT_*` variables so the console carries the prospect's name.
+Run the compose stack with the `dagster` and `trino` profiles. Connectors,
+Agents, Policies, and Admin pages are visible in every build — no nav flag
+hides them. Set the `TENANT_*` variables so the console carries the
+prospect's name.
 
 1. **Connectors**: show the PostgreSQL and S3 connectors, run "Test
    connection". Both genuinely dial. Do not click test on any other type;

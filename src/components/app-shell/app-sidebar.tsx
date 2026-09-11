@@ -22,7 +22,7 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar"
 import { cn } from "@/lib/utils"
-import { visibleNavGroups, activeNavHref, type NavGroup, type NavItem } from "./nav-config"
+import { NAV_GROUPS, activeNavHref, type NavGroup, type NavItem } from "./nav-config"
 import { apiFetch } from "@/services/http"
 
 function BrandLogo() {
@@ -48,7 +48,7 @@ type FlyoutState = { label: string; top: number; left: number } | null
 export function AppSidebar() {
   const pathname = usePathname()
   const activeHref = activeNavHref(pathname)
-  const groups = visibleNavGroups()
+  const groups = NAV_GROUPS
   const { state } = useSidebar()
   const iconMode = state === "collapsed"
   const { user } = useAuth()
@@ -315,9 +315,8 @@ export function AppSidebar() {
               className="h-14 rounded-lg px-2 hover:bg-sidebar-accent group-data-[collapsible=icon]:size-10! group-data-[collapsible=icon]:h-10!"
               render={
                 <div role="group" aria-label="Current user">
-                  <div className="relative flex size-9 shrink-0 items-center justify-center rounded-full bg-primary/12 text-primary ring-1 ring-primary/20">
+                  <div className="flex size-9 shrink-0 items-center justify-center rounded-full bg-primary/12 text-primary ring-1 ring-primary/20">
                     <CircleUserRound className="size-5" aria-hidden />
-                    <span className="absolute bottom-0 right-0 size-2.5 rounded-full border-2 border-sidebar bg-emerald-500" />
                   </div>
                   <div className="grid min-w-0 flex-1 text-left leading-tight group-data-[collapsible=icon]:hidden">
                     <span className="truncate text-sm font-semibold text-sidebar-foreground">{user?.name ?? "Signed in"}</span>

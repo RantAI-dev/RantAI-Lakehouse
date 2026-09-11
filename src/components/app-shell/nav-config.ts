@@ -34,12 +34,6 @@ export type NavItem = {
   title: string
   href: string
   icon: LucideIcon
-  /**
-   * true = halaman masih memakai data MOCK (belum tersambung engine nyata).
-   * Disembunyikan dari sidebar kecuali NEXT_PUBLIC_SHOW_PREVIEW="1".
-   * Hilangkan flag ini begitu service-nya sudah nyata.
-   */
-  preview?: boolean
 }
 
 export type NavGroup = {
@@ -93,7 +87,7 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [
       { title: "Data Explorer", href: "/data", icon: Database },
       { title: "Catalog", href: "/catalog", icon: Library },
-      { title: "Connectors", href: "/connectors", icon: Plug, preview: true },
+      { title: "Connectors", href: "/connectors", icon: Plug },
     ],
   },
   {
@@ -108,16 +102,16 @@ export const NAV_GROUPS: NavGroup[] = [
     label: "Intelligence",
     icon: Bot,
     items: [
-      { title: "Digital Employees", href: "/agents/employees", icon: Bot, preview: true },
-      { title: "Agent Runs", href: "/agents/runs", icon: History, preview: true },
-      { title: "Approvals", href: "/agents/approvals", icon: ClipboardCheck, preview: true },
+      { title: "Digital Employees", href: "/agents/employees", icon: Bot },
+      { title: "Agent Runs", href: "/agents/runs", icon: History },
+      { title: "Approvals", href: "/agents/approvals", icon: ClipboardCheck },
     ],
   },
   {
     label: "Governance",
     icon: ShieldCheck,
     items: [
-      { title: "Policies", href: "/governance/policies", icon: ShieldCheck, preview: true },
+      { title: "Policies", href: "/governance/policies", icon: ShieldCheck },
       {
         title: "Classification & Masking",
         href: "/governance/classification",
@@ -155,36 +149,17 @@ export const NAV_GROUPS: NavGroup[] = [
     label: "Administration",
     icon: Settings,
     items: [
-      { title: "Users", href: "/admin/users", icon: Users, preview: true },
-      { title: "Teams & Roles", href: "/admin/roles", icon: Building2, preview: true },
-      { title: "Tenants", href: "/admin/tenants", icon: Boxes, preview: true },
+      { title: "Users", href: "/admin/users", icon: Users },
+      { title: "Teams & Roles", href: "/admin/roles", icon: Building2 },
+      { title: "Tenants", href: "/admin/tenants", icon: Boxes },
       {
         title: "Service Identities",
         href: "/admin/service-identities",
         icon: KeyRound,
-        preview: true,
       },
     ],
   },
 ]
-
-/**
- * Apakah item preview (mock) ditampilkan. Default TIDAK; set
- * NEXT_PUBLIC_SHOW_PREVIEW="1" untuk memunculkan lagi semua halaman mock.
- */
-export const SHOW_PREVIEW = process.env.NEXT_PUBLIC_SHOW_PREVIEW === "1"
-
-/**
- * Grup nav yang tampil di sidebar. Menyaring item `preview` (kecuali
- * SHOW_PREVIEW), lalu membuang grup yang jadi kosong.
- */
-export function visibleNavGroups(): NavGroup[] {
-  if (SHOW_PREVIEW) return NAV_GROUPS
-  return NAV_GROUPS.map((g) => ({
-    ...g,
-    items: g.items.filter((it) => !it.preview),
-  })).filter((g) => g.items.length > 0)
-}
 
 /** Flat list of every sidebar nav item, used for active-state and command search. */
 export const ALL_NAV_ITEMS: NavItem[] = NAV_GROUPS.flatMap((g) => g.items)
@@ -192,7 +167,7 @@ export const ALL_NAV_ITEMS: NavItem[] = NAV_GROUPS.flatMap((g) => g.items)
 /** Grup (section) yang memuat halaman aktif — untuk bottom-nav & sub-navigasi. */
 export function activeNavGroup(pathname: string): NavGroup | undefined {
   const href = activeNavHref(pathname)
-  return visibleNavGroups().find((g) => g.items.some((it) => it.href === href))
+  return NAV_GROUPS.find((g) => g.items.some((it) => it.href === href))
 }
 
 /** Sub-halaman section aktif (kosong bila hanya 1 item). */
