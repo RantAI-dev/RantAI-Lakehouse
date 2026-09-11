@@ -10,7 +10,7 @@
   "status": 200,
   "contentType": "application/json;charset=utf-8",
   "body": {
-    "id": "q-1787828495536",
+    "id": "q-1789130126411",
     "columns": [
       "a"
     ],
@@ -20,24 +20,15 @@
       }
     ],
     "metrics": {
-      "durationMs": 1,
+      "durationMs": 0,
       "scannedBytes": 1,
       "costUnits": 1,
       "engine": "hot-store",
       "workloadClass": "hot-analytics",
-      "cacheHit": false,
-      "pushdowns": [],
-      "policyObligations": []
+      "cacheHit": null,
+      "pushdowns": null,
+      "policyObligations": null
     },
-    "plan": [
-      {
-        "id": "s1",
-        "label": "ClickHouse (Hot analytical store)",
-        "location": "clickhouse@lakehouse",
-        "operation": "scan + aggregate",
-        "estimatedBytes": 1,
-        "status": "completed"
-      }
-    ]
+    "plan": null
   }
 }

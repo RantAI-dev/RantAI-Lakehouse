@@ -2,7 +2,9 @@
   "request": {
     "name": "ops-usage",
     "method": "GET",
-    "path": "/api/ops/usage"
+    "path": "/api/ops/usage",
+    "skip": true,
+    "comment": "WS1 T17b: this route serves a page WS1 cut, so no client reads it."
   },
   "status": 200,
   "contentType": "application/json;charset=utf-8",

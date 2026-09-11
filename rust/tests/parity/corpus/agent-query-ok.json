@@ -5,7 +5,9 @@
     "path": "/api/agent/query",
     "body": {
       "question": "Berapa total jumlah wisatawan mancanegara per tahun di mart_wisman?"
-    }
+    },
+    "skip": true,
+    "comment": "WS1 T17b: no LLM configured in the hybrid re-capture; model output is non-deterministic."
   },
   "status": 200,
   "contentType": "application/json;charset=utf-8",

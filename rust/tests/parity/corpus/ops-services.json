@@ -12,22 +12,24 @@
         "id": "clickhouse",
         "name": "ClickHouse (Hot analytical store)",
         "health": "healthy",
-        "version": "-",
+        "checked": true,
+        "version": null,
         "site": "Depok (187)",
-        "replicas": 1,
-        "errorRate": 0,
-        "latencyMs": 0,
+        "replicas": null,
+        "errorRate": null,
+        "latencyMs": null,
         "dependencies": []
       },
       {
         "id": "dagster",
         "name": "Dagster (Orchestration)",
         "health": "healthy",
-        "version": "-",
+        "checked": true,
+        "version": null,
         "site": "Depok (187)",
-        "replicas": 1,
-        "errorRate": 0,
-        "latencyMs": 0,
+        "replicas": null,
+        "errorRate": null,
+        "latencyMs": null,
         "dependencies": [
           "clickhouse"
         ]
@@ -35,12 +37,13 @@
       {
         "id": "iceberg",
         "name": "Iceberg + Lakekeeper (Open tables)",
-        "health": "healthy",
-        "version": "-",
+        "health": "unknown",
+        "checked": false,
+        "version": null,
         "site": "Depok (187)",
-        "replicas": 1,
-        "errorRate": 0,
-        "latencyMs": 0,
+        "replicas": null,
+        "errorRate": null,
+        "latencyMs": null,
         "dependencies": [
           "rustfs"
         ]
@@ -48,12 +51,13 @@
       {
         "id": "rustfs",
         "name": "RustFS (Object storage)",
-        "health": "healthy",
-        "version": "-",
+        "health": "unknown",
+        "checked": false,
+        "version": null,
         "site": "Depok (187)",
-        "replicas": 1,
-        "errorRate": 0,
-        "latencyMs": 0,
+        "replicas": null,
+        "errorRate": null,
+        "latencyMs": null,
         "dependencies": []
       }
     ]

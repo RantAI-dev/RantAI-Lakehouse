@@ -9,6 +9,6 @@
   "status": 400,
   "contentType": "application/json;charset=utf-8",
   "body": {
-    "error": "id wajib"
+    "error": "id is required"
   }
 }

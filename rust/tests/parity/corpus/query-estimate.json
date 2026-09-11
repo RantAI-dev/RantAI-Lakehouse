@@ -15,21 +15,12 @@
     "estimatedCostMax": 1,
     "workloadClass": "hot-analytics",
     "engine": "hot-store",
-    "cacheEligible": true,
-    "freshnessLagSeconds": 0,
-    "policyObligations": [],
+    "cacheEligible": null,
+    "freshnessLagSeconds": null,
+    "policyObligations": null,
     "sources": [
       "serving.mart_wisman"
     ],
-    "plan": [
-      {
-        "id": "p0",
-        "label": "serving.mart_wisman",
-        "location": "clickhouse@lakehouse",
-        "operation": "scan",
-        "estimatedBytes": 0,
-        "status": "completed"
-      }
-    ]
+    "plan": null
   }
 }

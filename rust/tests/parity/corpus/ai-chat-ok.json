@@ -12,7 +12,8 @@
         }
       ]
     },
-    "comment": "Calls the real MiniMax LLM (LLM_URL/LLM_KEY). Mode defaults/forced to 'ask' so write tools (trigger_lakehouse_build/create_chart/etc.) are filtered out server-side — this cannot mutate the lakehouse, but the answer text is inherently non-deterministic between captures."
+    "comment": "Calls the real MiniMax LLM (LLM_URL/LLM_KEY). Mode defaults/forced to 'ask' so write tools (trigger_lakehouse_build/create_chart/etc.) are filtered out server-side \u2014 this cannot mutate the lakehouse, but the answer text is inherently non-deterministic between captures. WS1 T17b: no LLM configured in the hybrid re-capture; model output is non-deterministic.",
+    "skip": true
   },
   "status": 200,
   "contentType": "application/json;charset=utf-8",

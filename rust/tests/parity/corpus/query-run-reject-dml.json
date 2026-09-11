@@ -11,6 +11,6 @@
   "status": 422,
   "contentType": "application/json;charset=utf-8",
   "body": {
-    "error": "Hanya query baca (SELECT/SHOW/DESCRIBE/EXPLAIN) yang diizinkan di Query Studio."
+    "error": "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
   }
 }

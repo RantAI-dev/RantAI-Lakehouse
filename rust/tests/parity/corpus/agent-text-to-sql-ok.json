@@ -6,7 +6,9 @@
     "body": {
       "question": "Tampilkan 5 baris dari mart_wisman",
       "run": false
-    }
+    },
+    "skip": true,
+    "comment": "WS1 T17b: no LLM configured in the hybrid re-capture; model output is non-deterministic."
   },
   "status": 200,
   "contentType": "application/json;charset=utf-8",

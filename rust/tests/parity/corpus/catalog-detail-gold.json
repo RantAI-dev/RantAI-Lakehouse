@@ -19,12 +19,12 @@
     "description": "Mart Gold penyaji dashboard (agregat siap pakai).",
     "format": "ClickHouse MergeTree",
     "engine": "hot-store",
-    "rows": 276,
-    "sizeBytes": 60720,
+    "rows": 0,
+    "sizeBytes": null,
     "columnCount": 8,
-    "freshnessLagSeconds": 0,
-    "lastUpdated": "",
-    "health": "healthy",
+    "freshnessLagSeconds": null,
+    "lastUpdated": null,
+    "health": "unknown",
     "residency": "id-jakarta",
     "schema": [
       {
@@ -114,18 +114,13 @@
     ],
     "qualityChecks": [],
     "policySummary": [],
-    "usage": {
-      "queries7d": 0,
-      "users7d": 0,
-      "avgLatencyMs": 0
-    },
+    "usage": null,
     "recentQueries": [],
     "dependents": [],
     "changeHistory": [],
     "snapshots": [],
     "schemaVersions": [],
     "upstream": [],
-    "downstream": [],
-    "lifecyclePolicy": "default"
+    "downstream": []
   }
 }

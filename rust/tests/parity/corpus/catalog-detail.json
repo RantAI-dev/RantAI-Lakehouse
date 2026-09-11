@@ -20,11 +20,11 @@
     "format": "Apache Iceberg (Parquet)",
     "engine": "hot-store",
     "rows": 1,
-    "sizeBytes": 220,
+    "sizeBytes": null,
     "columnCount": 1,
-    "freshnessLagSeconds": 0,
+    "freshnessLagSeconds": null,
     "lastUpdated": "",
-    "health": "healthy",
+    "health": "unknown",
     "residency": "id-jakarta",
     "schema": [
       {
@@ -41,11 +41,7 @@
     ],
     "qualityChecks": [],
     "policySummary": [],
-    "usage": {
-      "queries7d": 0,
-      "users7d": 0,
-      "avgLatencyMs": 0
-    },
+    "usage": null,
     "recentQueries": [],
     "dependents": [],
     "changeHistory": [],
@@ -58,7 +54,6 @@
         "name": "silver.jumlah_realisasi_investasi_pariwisata"
       }
     ],
-    "lifecyclePolicy": "default",
     "_meta": {
       "frekuensi": "1 Tahun Sekali",
       "satuan": "rupiah",

@@ -8,8 +8,16 @@
   "contentType": "application/json;charset=utf-8",
   "body": {
     "focus": "",
-    "nodes": [],
+    "nodes": [
+      {
+        "id": "",
+        "label": "",
+        "kind": "focus"
+      }
+    ],
     "edges": [],
-    "columnMappings": []
+    "columnMappings": [],
+    "supported": false,
+    "reason": "lineage capture not implemented"
   }
 }

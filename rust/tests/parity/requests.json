@@ -10,7 +10,13 @@
   { "name": "storage-get",              "method": "GET",  "path": "/api/storage" },
 
   { "name": "ops-observability",        "method": "GET",  "path": "/api/ops/observability" },
-  { "name": "ops-usage",                "method": "GET",  "path": "/api/ops/usage" },
+  {
+    "name": "ops-usage",
+    "method": "GET",
+    "path": "/api/ops/usage",
+    "comment": "WS1 T17b: this route serves a page WS1 cut, so no client reads it. Skipped rather than re-captured.",
+    "skip": true
+  },
   { "name": "ops-workloads",            "method": "GET",  "path": "/api/ops/workloads" },
   { "name": "ops-services",             "method": "GET",  "path": "/api/ops/services" },
   { "name": "ops-unknown-kind",         "method": "GET",  "path": "/api/ops/bogus-kind", "expectStatus": 400 },
@@ -143,7 +149,8 @@
     "method": "POST",
     "path": "/api/ai/chat",
     "body": { "mode": "ask", "messages": [{ "role": "user", "content": "Ada dataset apa saja tentang wisatawan mancanegara?" }] },
-    "comment": "Calls the real MiniMax LLM (LLM_URL/LLM_KEY). Mode defaults/forced to 'ask' so write tools (trigger_lakehouse_build/create_chart/etc.) are filtered out server-side — this cannot mutate the lakehouse, but the answer text is inherently non-deterministic between captures."
+    "comment": "Calls the real MiniMax LLM (LLM_URL/LLM_KEY). Mode defaults/forced to 'ask' so write tools (trigger_lakehouse_build/create_chart/etc.) are filtered out server-side — this cannot mutate the lakehouse, but the answer text is inherently non-deterministic between captures. WS1 T17b: skipped in the hybrid re-capture — no LLM is configured there.",
+    "skip": true
   },
   { "name": "ai-chat-bad-body",         "method": "POST", "path": "/api/ai/chat", "raw": "not json", "expectStatus": 400 },
   { "name": "ai-chat-empty-messages",   "method": "POST", "path": "/api/ai/chat", "body": { "messages": [] }, "expectStatus": 400 },
@@ -182,13 +189,34 @@
     "skip": true
   },
 
-  { "name": "agent-ask-ok",             "method": "POST", "path": "/api/agent/ask", "body": { "question": "Ada dataset apa saja tentang investasi pariwisata?" } },
+  {
+    "name": "agent-ask-ok",
+    "method": "POST",
+    "path": "/api/agent/ask",
+    "body": { "question": "Ada dataset apa saja tentang investasi pariwisata?" },
+    "comment": "WS1 T17b: no LLM configured in the hybrid re-capture; model output is non-deterministic.",
+    "skip": true
+  },
   { "name": "agent-ask-missing-question", "method": "POST", "path": "/api/agent/ask", "body": {}, "expectStatus": 400 },
   { "name": "agent-ask-bad-body",       "method": "POST", "path": "/api/agent/ask", "raw": "not json", "expectStatus": 400 },
 
-  { "name": "agent-query-ok",           "method": "POST", "path": "/api/agent/query", "body": { "question": "Berapa total jumlah wisatawan mancanegara per tahun di mart_wisman?" } },
+  {
+    "name": "agent-query-ok",
+    "method": "POST",
+    "path": "/api/agent/query",
+    "body": { "question": "Berapa total jumlah wisatawan mancanegara per tahun di mart_wisman?" },
+    "comment": "WS1 T17b: no LLM configured in the hybrid re-capture; model output is non-deterministic.",
+    "skip": true
+  },
   { "name": "agent-query-missing-question", "method": "POST", "path": "/api/agent/query", "body": {}, "expectStatus": 400 },
 
-  { "name": "agent-text-to-sql-ok",     "method": "POST", "path": "/api/agent/text-to-sql", "body": { "question": "Tampilkan 5 baris dari mart_wisman", "run": false } },
+  {
+    "name": "agent-text-to-sql-ok",
+    "method": "POST",
+    "path": "/api/agent/text-to-sql",
+    "body": { "question": "Tampilkan 5 baris dari mart_wisman", "run": false },
+    "comment": "WS1 T17b: no LLM configured in the hybrid re-capture; model output is non-deterministic.",
+    "skip": true
+  },
   { "name": "agent-text-to-sql-missing-question", "method": "POST", "path": "/api/agent/text-to-sql", "body": {}, "expectStatus": 400 }
 ]

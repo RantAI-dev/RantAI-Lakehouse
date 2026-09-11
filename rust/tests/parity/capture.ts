@@ -205,6 +205,19 @@ for (const r of requests as Req[]) {
     init.body = JSON.stringify(r.body)
     init.headers = { "Content-Type": "application/json" }
   }
+  // WS1 T17b: the Rust `lakehouse-api` requires authentication on every
+  // route except the public/embed ones (this file was written against the
+  // unauthenticated TypeScript backend, which needed no such header). The
+  // token is minted by the replay harness's own path
+  // (`tests/parity.rs::mint_parity_capture_token`) and handed in only
+  // through the process environment — never written to a file, this
+  // script, or the corpus.
+  if (process.env.PARITY_CAPTURE_TOKEN) {
+    init.headers = {
+      ...(init.headers as Record<string, string> | undefined),
+      Authorization: `Bearer ${process.env.PARITY_CAPTURE_TOKEN}`,
+    }
+  }
 
   const res = await fetch(`${base}${resolveSecrets(r.path)}`, init)
   const text = await res.text()

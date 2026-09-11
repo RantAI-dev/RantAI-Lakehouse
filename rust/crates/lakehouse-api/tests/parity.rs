@@ -571,6 +571,29 @@ fn load_corpus() -> Vec<(String, CorpusEntry)> {
     entries
 }
 
+/// WS1 T17b helper: mint a `parity-harness` service token and print ONLY the
+/// token to stdout, for a shell variable to capture (`PARITY_CAPTURE_TOKEN`).
+/// Reuses [`resolve_service_token`]'s exact minting path (same fixture
+/// identity, same `create_service_credential` call) rather than duplicating
+/// token hashing in TypeScript — `capture.ts` sends the token as a bearer
+/// header but never mints or hashes one itself. `#[ignore]`d because, like
+/// the replay test above, it needs `DATABASE_URL` pointed at a real,
+/// migrated Postgres and is opt-in tooling, not part of `cargo test
+/// --workspace`.
+///
+/// ```bash
+/// DATABASE_URL=postgres://... cargo test -p lakehouse-api --test parity \
+///   mint_parity_capture_token -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "prints a fresh parity-harness service token to stdout; needs DATABASE_URL"]
+async fn mint_parity_capture_token() {
+    let token = resolve_service_token()
+        .await
+        .expect("resolve_service_token: DATABASE_URL must point at a reachable, migrated Postgres");
+    println!("{token}");
+}
+
 #[tokio::test]
 #[ignore = "needs a live `lakehouse-api` server; see module docs for the opt-in command"]
 #[allow(clippy::too_many_lines)] // one linear replay-and-assert loop; splitting it up would
