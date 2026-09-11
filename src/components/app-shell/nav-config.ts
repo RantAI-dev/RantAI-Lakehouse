@@ -15,12 +15,10 @@ import {
   Globe2,
   History,
   KeyRound,
-  Layers,
   LayoutDashboard,
   Library,
   ListChecks,
   Plug,
-  ScanSearch,
   SearchCode,
   Server,
   Settings,
@@ -62,7 +60,7 @@ export type NavGroup = {
  * - Overview: monitor the whole platform (dashboard, feed, alerts).
  * - Data: where data lives (explore, catalog, ingress).
  * - Build: author and operate data movement and queries.
- * - Intelligence: knowledge flow — sources → indexing → retrieval → agents.
+ * - Intelligence: digital employees, their runs and approvals.
  * - Governance: control and evidence.
  * - Operations: platform runtime health and spend.
  * - Administration: identity and workspace configuration.
@@ -112,9 +110,6 @@ export const NAV_GROUPS: NavGroup[] = [
     label: "Intelligence",
     icon: Bot,
     items: [
-      { title: "Knowledge", href: "/knowledge", icon: Sparkles, preview: true },
-      { title: "Vector Jobs", href: "/vector-jobs", icon: Layers, preview: true },
-      { title: "Semantic Search", href: "/semantic-search", icon: ScanSearch, preview: true },
       { title: "Agent Workflows", href: "/agents/workflows", icon: Workflow, preview: true },
       { title: "Digital Employees", href: "/agents/employees", icon: Bot, preview: true },
       { title: "Agent Runs", href: "/agents/runs", icon: History, preview: true },

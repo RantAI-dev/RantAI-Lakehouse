@@ -29,8 +29,6 @@ import { AgenticBuilderDialog } from "./agentic-builder-dialog"
 const KIND_OPTIONS: { value: PipelineKind; label: string }[] = [
   { value: "batch", label: "Batch" },
   { value: "incremental", label: "Incremental" },
-  { value: "document", label: "Document" },
-  { value: "vector", label: "Vector" },
 ]
 
 const columns: ColumnDef<Pipeline>[] = [
@@ -77,7 +75,7 @@ export function PipelinesPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Pipelines"
-        description="Batch, incremental, document, and vector flows with run health and freshness."
+        description="Batch and incremental flows with run health and freshness."
         actions={
           <>
             <Button variant="outline" size="sm" onClick={() => setAgenticOpen(true)}>

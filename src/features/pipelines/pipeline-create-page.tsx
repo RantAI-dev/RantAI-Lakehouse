@@ -34,7 +34,7 @@ const TRANSFORM_CHIPS = [
   "Deduplicate",
 ]
 
-const KIND_OPTIONS: PipelineKind[] = ["batch", "incremental", "document", "vector"]
+const KIND_OPTIONS: PipelineKind[] = ["batch", "incremental"]
 
 export function PipelineCreatePage() {
   const router = useRouter()

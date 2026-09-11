@@ -1,12 +1,14 @@
 import type { Measured } from "@/lib/measured"
 import type { EntityStatus } from "@/lib/status"
 
-export type PipelineKind = "batch" | "incremental" | "document" | "vector"
+/** The kinds a pipeline can be authored as. */
+export type PipelineKind = "batch" | "incremental"
 
 export type Pipeline = {
   id: string
   name: string
-  kind: PipelineKind
+  /** Widened: rows authored before WS1 may still carry `document` or `vector`, which the database constraint still permits. */
+  kind: PipelineKind | string
   status: EntityStatus
   owner: string
   /** Null for a Dagster job: no per-job lineage exists until WS4 reads the op graph. Authored pipelines keep their real user-entered source. */

@@ -19,6 +19,14 @@
 //! delegating to `mockKnowledgeService.search` rather than this crate
 //! fabricating similarity scores against content that isn't actually
 //! indexed anywhere.
+//!
+//! # Console surface removed
+//!
+//! `WS1` task 1.10 removed the Knowledge, Vector Jobs and Semantic Search
+//! pages: search was a documented mock and no embedding model, vector
+//! database or index exists. These routes still serve real `Postgres` CRUD
+//! for knowledge sources and vector jobs, stay registered and
+//! `POLICY_TABLE`-classified, and are left for `WS7` to reuse or retire.
 
 use axum::body::Bytes;
 use axum::extract::State;
