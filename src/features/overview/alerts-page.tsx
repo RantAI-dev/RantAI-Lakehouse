@@ -86,6 +86,12 @@ export function AlertsPage() {
     })
   }, [state.status, state.data, search, severity, status])
 
+  // Judge finding J21: with no filter applied, an empty list means no
+  // alert has fired, not "nothing matches a filter" — the two states read
+  // very differently to an operator, so DataTable's default filter-shaped
+  // empty message must not appear when no filter is active.
+  const noFilterActive = !search.trim() && severity === "all" && status === "all"
+
   function openAlert(alert: AlertItem) {
     ack.reset()
     resolve.reset()
@@ -154,6 +160,11 @@ export function AlertsPage() {
           rows={rows}
           rowKey={(r) => r.id}
           onRowClick={openAlert}
+          emptyMessage={
+            noFilterActive
+              ? "No alerts have fired"
+              : "No results match the current filters."
+          }
         />
       ) : null}
 

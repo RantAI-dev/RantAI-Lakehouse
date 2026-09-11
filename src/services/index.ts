@@ -12,6 +12,7 @@ import { clickhouseGovernanceService } from "./clients/governance"
 import { postgresIdentityService } from "./clients/identity"
 import { postgresConnectorService } from "./clients/connectors"
 import { postgresAgentService } from "./clients/agents"
+import { clickhouseAlertRuleService } from "./clients/alerts"
 
 // Overview kini NYATA sepenuhnya — summary/activity dari ClickHouse+Dagster,
 // alerts (list/ack/resolve) dari Postgres (Task 2.6). mock/overview.ts
@@ -47,3 +48,8 @@ export const identityService = postgresIdentityService
 // `rust/crates/lakehouse-store/src/connectors.rs` untuk catatan keputusan.
 // mock/connectors.ts sudah dihapus.
 export const connectorService = postgresConnectorService
+// Alert rules (WS1 task 1.15) — CRUD + run over `console.alert_rule` in
+// ClickHouse, ported by `lakehouse_alerts`. No mock ever existed for this
+// service; the feature previously fetched `/api/alerts` directly with no
+// `res.ok` check.
+export const alertRuleService = clickhouseAlertRuleService
