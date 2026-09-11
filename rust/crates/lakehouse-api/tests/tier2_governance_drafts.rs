@@ -5,7 +5,11 @@
 //! `activate: true`; `draft_classification_rule`/`draft_quality_rule` have
 //! no activation concept at all, so this proves they land in the same
 //! unevaluated state a human authoring the same rule through the console
-//! would get (`review_status = "needs-review"` / `last_status = "warning"`).
+//! would get: `review_status = "needs-review"` for classification, and for
+//! quality a `null` `lastStatus`/`lastRunAt` (WS1 finding J18) — the API
+//! never surfaces the `quality_rule.last_status` column's NOT NULL
+//! `'warning'` default, since no evaluator anywhere in the workspace ever
+//! runs a quality rule.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -124,9 +128,15 @@ async fn draft_classification_rule_is_never_reviewed_or_auto() {
     assert_eq!(review_status, "needs-review");
 }
 
-/// `draft_quality_rule` always lands `last_status = "warning"` — the only
-/// value `create_quality_rule` ever inserts, matching "authored, not yet
-/// contradicted by evidence" rather than a real passed/failed verdict.
+/// `draft_quality_rule` is never `"passed"` or `"failed"` — that guarantee
+/// still holds, but the honest value is `null`, not `"warning"` (WS1
+/// finding J18). No evaluator anywhere in the workspace ever writes
+/// `quality_rule.last_status`, so a copilot draft carries no verdict at
+/// all; `create_quality_rule` originally asserted the fabricated
+/// `"warning"` here, which this test corrected. The stored placeholder
+/// (the NOT NULL column's `'warning'` default) is still checked, but only
+/// for what it is guaranteed not to be — a real passed/failed verdict —
+/// since the API never surfaces it.
 #[tokio::test]
 async fn draft_quality_rule_is_never_passed_or_failed() {
     let TestApp { router, pool } = spin_up().await;
@@ -143,7 +153,7 @@ async fn draft_quality_rule_is_never_passed_or_failed() {
         }),
     )
     .await;
-    assert_eq!(result["lastStatus"], "warning", "{result}");
+    assert!(result["lastStatus"].is_null(), "{result}");
 
     let (last_status,): (String,) = sqlx::query_as(
         "SELECT last_status FROM quality_rule WHERE name = 'copilot_drafted_quality_rule'",
@@ -151,5 +161,6 @@ async fn draft_quality_rule_is_never_passed_or_failed() {
     .fetch_one(&pool)
     .await
     .expect("row must exist");
-    assert_eq!(last_status, "warning");
+    assert_ne!(last_status, "passed");
+    assert_ne!(last_status, "failed");
 }

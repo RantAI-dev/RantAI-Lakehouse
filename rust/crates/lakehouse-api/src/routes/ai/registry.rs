@@ -503,14 +503,18 @@ fn get_gold_export_schema() -> Value {
 // tool never produces). `quality_rule`/`classification_rule` have NO
 // activation concept in the schema at all (`0003_governance.sql`: no
 // `enabled`/`active` column, no `POST .../activate` route anywhere in
-// `routes::governance`) — every row `create_quality_rule`/
-// `create_classification_rule` inserts starts `last_status = 'warning'` /
-// `review_status = 'needs-review'` (an authored-but-unevaluated fact, per
-// `lakehouse_store::governance`'s module doc comment) and there is no API
-// path in this codebase that ever promotes one further. So these two
-// tools cannot accidentally create something "more active" than a human
-// clicking the same console form would — draft-only is already the only
-// state reachable.
+// `routes::governance`) — every row `create_classification_rule` inserts
+// starts `review_status = 'needs-review'` (an authored-but-unevaluated
+// fact, per `lakehouse_store::governance`'s module doc comment), and
+// every row `create_quality_rule` inserts leaves the NOT NULL
+// `last_status`/`last_run_at` columns at their `'warning'`/`now()`
+// placeholder defaults, which the API never surfaces — no evaluator
+// exists anywhere in the workspace, so `QualityRule` always reports both
+// as `null` (WS1 finding J18). Either way there is no API path in this
+// codebase that ever promotes one further. So these two tools cannot
+// accidentally create something "more active" than a human clicking the
+// same console form would — draft-only is already the only state
+// reachable.
 
 fn draft_policy_schema() -> Value {
     json!({ "type": "function", "function": { "name": "draft_policy",

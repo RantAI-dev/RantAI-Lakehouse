@@ -31,13 +31,14 @@
 //!   synthesized per-row, `Policy`/rule ids from Postgres are `UUID`s), so
 //!   union-by-id is a no-op in practice and a safety net if that ever
 //!   changes. An authored rule that has never been evaluated is presented
-//!   with the same "not yet run" defaults `create_*` already gives it —
-//!   `lastStatus: "warning"` / `lastRunAt: now()` for quality,
-//!   `reviewStatus: "needs-review"` for classification,
-//!   `violations7d: 0` for residency — the contract has no "unevaluated"
-//!   state, so this is the most honest value already representable: it
-//!   reads as "authored, not yet contradicted by evidence" rather than
-//!   fabricating a pass/fail verdict nobody observed.
+//!   honestly: `reviewStatus: "needs-review"` for classification and
+//!   `violations7d: 0` for residency are real facts about an authored,
+//!   not-yet-reviewed record, but `QualityRule.last_status`/`last_run_at`
+//!   report `null` (WS1 finding J18) — nothing in this workspace ever
+//!   executes a quality rule or writes a result, so the NOT NULL
+//!   `quality_rule.last_status`/`last_run_at` columns and their
+//!   `'warning'`/`now()` defaults are inert placeholders, not verdicts. A
+//!   future workstream that actually runs checks makes them real.
 
 use serde::Serialize;
 use sqlx::FromRow;
@@ -141,7 +142,7 @@ const POLICY_COLUMNS: &str =
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_quality_rules(pool: &PgPool) -> Result<Vec<QualityRule>, StoreError> {
     let rows: Vec<QualityRuleRow> = sqlx::query_as(
-        "SELECT id, name, asset, dimension, threshold, severity, last_status, last_run_at \
+        "SELECT id, name, asset, dimension, threshold, severity \
          FROM quality_rule ORDER BY created_at DESC",
     )
     .fetch_all(pool)
@@ -268,12 +269,17 @@ pub struct QualityRule {
     pub threshold: String,
     /// Severity if the rule fails.
     pub severity: String,
-    /// Most recent verdict. Always `"warning"` for a freshly authored rule
-    /// (see [`create_quality_rule`]). Serializes as `lastStatus`.
-    pub last_status: String,
-    /// When the rule was last (attempted to be) run, ISO 8601. Serializes
-    /// as `lastRunAt`.
-    pub last_run_at: String,
+    /// Most recent verdict, or `None` if the rule has never been
+    /// evaluated. Always `None` today (WS1 finding J18): no evaluator
+    /// exists anywhere in the workspace, so `quality_rule.last_status`'s
+    /// NOT NULL `'warning'` default is a placeholder, never a real
+    /// verdict — reporting it would fabricate a check result nobody ran.
+    /// Serializes as `lastStatus`.
+    pub last_status: Option<String>,
+    /// When the rule was last (attempted to be) run, ISO 8601, or `None`
+    /// if it never has been. Always `None` today, for the same reason as
+    /// [`Self::last_status`]. Serializes as `lastRunAt`.
+    pub last_run_at: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -284,8 +290,6 @@ struct QualityRuleRow {
     dimension: String,
     threshold: String,
     severity: String,
-    last_status: String,
-    last_run_at: OffsetDateTime,
 }
 
 impl From<QualityRuleRow> for QualityRule {
@@ -297,8 +301,11 @@ impl From<QualityRuleRow> for QualityRule {
             dimension: row.dimension,
             threshold: row.threshold,
             severity: row.severity,
-            last_status: row.last_status,
-            last_run_at: iso_millis(row.last_run_at),
+            // No evaluator writes `last_status`/`last_run_at` anywhere in
+            // the workspace, so the NOT NULL column defaults are never a
+            // real verdict or run time — report both honestly as unknown.
+            last_status: None,
+            last_run_at: None,
         }
     }
 }
@@ -318,9 +325,10 @@ pub struct CreateQualityRuleInput {
     pub severity: String,
 }
 
-/// Create a quality rule. Freshly authored rules start `"warning"` /
-/// `now()`, matching `mock/governance.ts`'s `createQualityRule` (a rule
-/// nobody has run yet has no real verdict).
+/// Create a quality rule. The row lands with the schema's `'warning'`/
+/// `now()` defaults, but [`QualityRule`] reports `last_status`/
+/// `last_run_at` as `None` regardless — a rule nobody has run yet has no
+/// real verdict (WS1 finding J18; see the module doc comment).
 ///
 /// # Errors
 ///
@@ -333,7 +341,7 @@ pub async fn create_quality_rule(
     let row: QualityRuleRow = sqlx::query_as(
         "INSERT INTO quality_rule (name, asset, dimension, threshold, severity) \
          VALUES ($1, $2, $3, $4, $5) \
-         RETURNING id, name, asset, dimension, threshold, severity, last_status, last_run_at",
+         RETURNING id, name, asset, dimension, threshold, severity",
     )
     .bind(&input.name)
     .bind(&input.asset)
@@ -585,8 +593,8 @@ mod tests {
             dimension: "d".to_owned(),
             threshold: "t".to_owned(),
             severity: "high".to_owned(),
-            last_status: "warning".to_owned(),
-            last_run_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            last_status: None,
+            last_run_at: None,
         };
         let value = serde_json::to_value(&quality).unwrap();
         for key in [
@@ -601,6 +609,11 @@ mod tests {
         ] {
             assert!(value.get(key).is_some(), "QualityRule is missing `{key}`");
         }
+        // `Option<String>` fields serialize as JSON `null`, not omitted
+        // keys (no `skip_serializing_if` on either) — the check above only
+        // proves the key exists, so also assert the value itself.
+        assert!(value["lastStatus"].is_null());
+        assert!(value["lastRunAt"].is_null());
 
         let residency = ResidencyRule {
             id: "r".to_owned(),
@@ -623,6 +636,32 @@ mod tests {
         ] {
             assert!(value.get(key).is_some(), "ResidencyRule is missing `{key}`");
         }
+    }
+
+    /// WS1 finding J18: no evaluator anywhere in the workspace ever writes
+    /// `quality_rule.last_status`/`last_run_at`, so a mapped `QualityRule`
+    /// must report both as `null` regardless of what the NOT NULL
+    /// columns' `'warning'`/`now()` defaults hold underneath — the row
+    /// fixture below deliberately does not carry those columns at all
+    /// (`QualityRuleRow` dropped them once the compiler reported them
+    /// dead, per the module's fix), so this test also stands as the
+    /// record that the store never reads them back into the wire type.
+    #[test]
+    fn quality_rules_report_no_verdict_or_run_time_until_something_evaluates_them() {
+        let row = QualityRuleRow {
+            id: Uuid::nil(),
+            name: "n".to_owned(),
+            asset: "a".to_owned(),
+            dimension: "d".to_owned(),
+            threshold: "t".to_owned(),
+            severity: "high".to_owned(),
+        };
+        let quality = QualityRule::from(row);
+        assert_eq!(quality.last_status, None);
+        assert_eq!(quality.last_run_at, None);
+        let value = serde_json::to_value(&quality).unwrap();
+        assert!(value["lastStatus"].is_null());
+        assert!(value["lastRunAt"].is_null());
     }
 
     /// `ClassificationRule.column`/`maskingRule` are optional in the

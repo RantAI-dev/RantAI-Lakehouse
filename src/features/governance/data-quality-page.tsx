@@ -43,8 +43,23 @@ const columns: ColumnDef<QualityRule>[] = [
   { key: "dim", header: "Dimension", render: (r) => r.dimension },
   { key: "thr", header: "Threshold", render: (r) => r.threshold },
   { key: "sev", header: "Severity", render: (r) => <SeverityBadge severity={r.severity} /> },
-  { key: "status", header: "Last status", render: (r) => <CheckBadge status={r.lastStatus} /> },
-  { key: "last", header: "Last run", render: (r) => formatRelativeTime(r.lastRunAt) },
+  {
+    key: "status",
+    header: "Last status",
+    // A rule nobody has evaluated has no verdict to badge (WS1 finding
+    // J18) — render that honestly instead of guessing a `CheckStatus`.
+    render: (r) =>
+      r.lastStatus === null ? (
+        <span className="text-muted-foreground">Not evaluated</span>
+      ) : (
+        <CheckBadge status={r.lastStatus} />
+      ),
+  },
+  {
+    key: "last",
+    header: "Last run",
+    render: (r) => (r.lastRunAt === null ? "—" : formatRelativeTime(r.lastRunAt)),
+  },
 ]
 
 export function DataQualityPage() {

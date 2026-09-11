@@ -109,10 +109,14 @@ async fn duplicate_policy_name_is_a_conflict(pool: PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
-/// A freshly authored quality rule starts `"warning"`/`now()`, matching
-/// `mock/governance.ts`'s `createQualityRule` — it hasn't been run yet.
+/// A freshly authored quality rule reports no verdict or run time at all
+/// (WS1 finding J18) — nothing in the workspace ever evaluates a quality
+/// rule, so `create_quality_rule` cannot honestly hand back a `"warning"`
+/// verdict or a run timestamp, even though the underlying row's NOT NULL
+/// columns default to `'warning'`/`now()`. Renamed from
+/// `create_quality_rule_starts_warning`, which asserted the fabrication.
 #[sqlx::test(migrations = "../../migrations")]
-async fn create_quality_rule_starts_warning(pool: PgPool) -> sqlx::Result<()> {
+async fn create_quality_rule_reports_no_verdict_or_run_time(pool: PgPool) -> sqlx::Result<()> {
     let rule = create_quality_rule(
         &pool,
         &CreateQualityRuleInput {
@@ -125,8 +129,8 @@ async fn create_quality_rule_starts_warning(pool: PgPool) -> sqlx::Result<()> {
     )
     .await
     .unwrap();
-    assert_eq!(rule.last_status, "warning");
-    assert!(rule.last_run_at.ends_with('Z'));
+    assert_eq!(rule.last_status, None);
+    assert_eq!(rule.last_run_at, None);
     Ok(())
 }
 

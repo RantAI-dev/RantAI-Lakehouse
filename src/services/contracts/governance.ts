@@ -38,8 +38,11 @@ export type QualityRule = {
   dimension: string
   threshold: string
   severity: Severity
-  lastStatus: CheckStatus
-  lastRunAt: string
+  // `null` until something actually evaluates the rule — WS1 finding J18,
+  // no evaluator exists anywhere in the workspace yet.
+  lastStatus: CheckStatus | null
+  // `null` for the same reason as `lastStatus`.
+  lastRunAt: string | null
 }
 
 export type LineageEdge = {
