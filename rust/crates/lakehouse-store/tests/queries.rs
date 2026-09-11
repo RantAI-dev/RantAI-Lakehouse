@@ -19,10 +19,7 @@
 // by the linker before its ctor section is ever considered).
 use lakehouse_test_support as _;
 
-use lakehouse_store::queries::{
-    CreateCollaborationProjectInput, RecordHistoryInput, create_collaboration_project,
-    list_collaboration, list_history, list_saved, record_history,
-};
+use lakehouse_store::queries::{RecordHistoryInput, list_history, list_saved, record_history};
 use sqlx::PgPool;
 
 /// The seed lands the two `mock/queries.ts` saved-query fixtures.
@@ -31,32 +28,6 @@ async fn seed_populates_saved_queries(pool: PgPool) -> sqlx::Result<()> {
     let saved = list_saved(&pool).await.unwrap();
     assert_eq!(saved.len(), 2);
     assert!(saved.iter().any(|q| q.title == "Revenue by region"));
-    Ok(())
-}
-
-/// The seed lands the two `mock/queries.ts` collaboration-project fixtures,
-/// and a create adds a third with `members` set from the collaborator
-/// count.
-#[sqlx::test(migrations = "../../migrations")]
-async fn seed_and_create_collaboration_projects(pool: PgPool) -> sqlx::Result<()> {
-    let seeded = list_collaboration(&pool).await.unwrap();
-    assert_eq!(seeded.len(), 2);
-
-    let created = create_collaboration_project(
-        &pool,
-        &CreateCollaborationProjectInput {
-            name: "Growth pod".to_owned(),
-            collaborators: vec!["Rina".to_owned(), "Bayu".to_owned(), "Dewi".to_owned()],
-            description: None,
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(created.members, 3);
-    assert_eq!(created.description, "Collaborators: Rina, Bayu, Dewi");
-
-    let all = list_collaboration(&pool).await.unwrap();
-    assert_eq!(all.len(), 3);
     Ok(())
 }
 

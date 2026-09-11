@@ -8,14 +8,10 @@ use std::time::Instant;
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
-use lakehouse_store::queries::{
-    self, CollaborationProject, CreateCollaborationProjectInput, QueryHistoryItem,
-    RecordHistoryInput, SavedQuery,
-};
+use lakehouse_store::queries::{self, QueryHistoryItem, RecordHistoryInput, SavedQuery};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -433,11 +429,11 @@ fn strip_trailing_semicolon(sql: &str) -> &str {
 
 // ── Postgres-backed writes (Task 2.4) ───────────────────────────────────
 //
-// `listSaved`/`listHistory`/`listCollaboration`/`createCollaborationProject`
-// back the methods `src/services/clients/queries.ts` used to delegate to
-// `mockQueryService`. No TypeScript server-side precedent exists for any of
-// them — like `routes::identity`/`routes::governance`'s Postgres-backed
-// additions, status codes are chosen to be correct rather than faithful.
+// `listSaved`/`listHistory` back the methods `src/services/clients/queries.ts`
+// used to delegate to `mockQueryService`. No TypeScript server-side
+// precedent exists for either — like `routes::identity`/
+// `routes::governance`'s Postgres-backed additions, status codes are chosen
+// to be correct rather than faithful.
 
 /// Borrow the Postgres pool, or fail with a 503 explaining why there isn't
 /// one. Mirrors `routes::identity::pool`.
@@ -449,10 +445,6 @@ fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
                 .to_owned(),
         )
     })
-}
-
-fn parse_json_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
-    serde_json::from_slice(body).map_err(|err| ApiError::BadRequest(format!("invalid JSON: {err}")))
 }
 
 /// `GET /api/query/saved` — every saved query.
@@ -474,49 +466,6 @@ pub async fn list_history(
     State(state): State<AppState>,
 ) -> ApiResult<ApiJson<Vec<QueryHistoryItem>>> {
     Ok(ApiJson(queries::list_history(pool(&state)?).await?))
-}
-
-/// `GET /api/query/collaboration` — every collaboration project.
-///
-/// # Errors
-///
-/// 503 if no pool is configured; 500 on a database failure.
-pub async fn list_collaboration(
-    State(state): State<AppState>,
-) -> ApiResult<ApiJson<Vec<CollaborationProject>>> {
-    Ok(ApiJson(queries::list_collaboration(pool(&state)?).await?))
-}
-
-/// The `POST /api/query/collaboration` body. Mirrors
-/// `CreateCollaborationProjectInput`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateCollaborationProjectBody {
-    name: String,
-    #[serde(default)]
-    collaborators: Vec<String>,
-    #[serde(default)]
-    description: Option<String>,
-}
-
-/// `POST /api/query/collaboration` — create a collaboration project.
-/// Returns 201.
-///
-/// # Errors
-///
-/// 400 on a malformed body; 503/500 as above.
-pub async fn create_collaboration_project(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> ApiResult<(StatusCode, ApiJson<CollaborationProject>)> {
-    let body: CreateCollaborationProjectBody = parse_json_body(&body)?;
-    let input = CreateCollaborationProjectInput {
-        name: body.name,
-        collaborators: body.collaborators,
-        description: body.description,
-    };
-    let created = queries::create_collaboration_project(pool(&state)?, &input).await?;
-    Ok((StatusCode::CREATED, ApiJson(created)))
 }
 
 #[cfg(test)]

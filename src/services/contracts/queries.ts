@@ -83,29 +83,10 @@ export type QueryResult = {
   auditEventId?: string
 }
 
-export type CollaborationProject = {
-  id: string
-  name: string
-  members: number
-  updatedAt: string
-  description: string
-}
-
-export type CreateCollaborationProjectInput = {
-  name: string
-  collaborators: string[]
-  description?: string
-}
-
 export interface QueryService {
   listSaved(signal?: AbortSignal): Promise<SavedQuery[]>
   listHistory(signal?: AbortSignal): Promise<QueryHistoryItem[]>
   estimate(sql: string, signal?: AbortSignal): Promise<QueryEstimate>
   run(sql: string, signal?: AbortSignal): Promise<QueryResult>
   generateSql(question: string, signal?: AbortSignal): Promise<{ sql: string; explanation: string; assumptions: string[] }>
-  listCollaboration(signal?: AbortSignal): Promise<CollaborationProject[]>
-  createCollaborationProject(
-    input: CreateCollaborationProjectInput,
-    signal?: AbortSignal
-  ): Promise<CollaborationProject>
 }

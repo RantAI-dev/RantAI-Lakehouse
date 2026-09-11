@@ -4,8 +4,6 @@ import type {
   QueryEstimate,
   SavedQuery,
   QueryHistoryItem,
-  CollaborationProject,
-  CreateCollaborationProjectInput,
 } from "../contracts/queries";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
@@ -14,9 +12,9 @@ import { ServiceError } from "../errors";
  * QueryService NYATA — `run`/`estimate` mengeksekusi SQL di ClickHouse
  * (lakehouse kita) lewat route server `/api/query/*`; `generateSql` lewat
  * `/api/agent/text-to-sql` (LLM di-grounding ke skema lakehouse, Fase 1).
- * `listSaved`/`listHistory`/`listCollaboration`/`createCollaborationProject`
- * kini NYATA juga, tersimpan di Postgres lewat crate `lakehouse-store`
- * (Fase 2, Task 2.4) — menggantikan seluruh `mock/queries.ts`.
+ * `listSaved`/`listHistory` kini NYATA juga, tersimpan di Postgres lewat
+ * crate `lakehouse-store` (Fase 2, Task 2.4) — menggantikan seluruh
+ * `mock/queries.ts`.
  *
  * `listHistory` bukan lagi fixture: setiap `run` yang sukses dicatat oleh
  * backend (`routes::query::run` -> `lakehouse_store::queries::record_history`),
@@ -45,20 +43,6 @@ async function postJson<T>(url: string, sql: string, signal?: AbortSignal): Prom
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ sql }),
-    signal,
-  });
-  const json = await res.json().catch(() => null);
-  if (!res.ok) {
-    throw errorFor(res.status, json?.error ?? `Query gagal (${res.status})`);
-  }
-  return json as T;
-}
-
-async function post<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
-  const res = await apiFetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
     signal,
   });
   const json = await res.json().catch(() => null);
@@ -98,11 +82,5 @@ export const clickhouseQueryService: QueryService = {
   },
   listHistory(signal) {
     return get<QueryHistoryItem[]>("/api/query/history", signal);
-  },
-  listCollaboration(signal) {
-    return get<CollaborationProject[]>("/api/query/collaboration", signal);
-  },
-  createCollaborationProject(input: CreateCollaborationProjectInput, signal) {
-    return post<CollaborationProject>("/api/query/collaboration", input, signal);
   },
 };

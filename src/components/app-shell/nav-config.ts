@@ -223,7 +223,6 @@ export function subNavItems(pathname: string): NavItem[] {
  */
 const SECONDARY_ROUTES: { title: string; href: string }[] = [
   { title: "Saved Queries", href: "/query-studio/saved" },
-  { title: "Collaboration", href: "/query-studio/collaboration" },
 ]
 
 function bestMatch<T extends { href: string }>(

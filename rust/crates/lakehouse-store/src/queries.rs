@@ -1,18 +1,17 @@
 //! Repository layer for the write-side halves of the queries domain: saved
-//! queries, query-run history, and collaboration projects.
+//! queries and query-run history.
 //!
 //! # Postgres vs `ClickHouse`, method by method
 //!
 //! `src/services/clients/queries.ts` splits `QueryService` into a real half
 //! (`run`/`estimate`, `ClickHouse`-backed, ported in Phase 1;
 //! `generateSql`, LLM-backed, also ported in Phase 1 as
-//! `/api/agent/text-to-sql`) and a mock half (`listSaved`, `listHistory`,
-//! `listCollaboration`, `createCollaborationProject`). This module is the
-//! Postgres backing for that mock half, plus one addition:
-//! `routes::query::run` calls [`record_history`] after a successful
-//! `ClickHouse` execution, so [`list_history`] returns *real* past
-//! executions instead of fabricated fixtures — see [`record_history`]'s
-//! doc comment for how that write is made non-fatal.
+//! `/api/agent/text-to-sql`) and a mock half (`listSaved`, `listHistory`).
+//! This module is the Postgres backing for that mock half, plus one
+//! addition: `routes::query::run` calls [`record_history`] after a
+//! successful `ClickHouse` execution, so [`list_history`] returns *real*
+//! past executions instead of fabricated fixtures — see
+//! [`record_history`]'s doc comment for how that write is made non-fatal.
 //!
 //! `SavedQuery` has no `create`/`update`/`delete` method anywhere in the
 //! `QueryService` contract — [`list_saved`] is genuinely read-only,
@@ -302,111 +301,6 @@ pub async fn record_history(
     Ok(())
 }
 
-// ── Collaboration project ───────────────────────────────────────────────
-
-/// A shared query workspace. Mirrors `CollaborationProject` in
-/// `contracts/queries.ts`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CollaborationProject {
-    /// `collaboration_project.id`, as a string.
-    pub id: String,
-    /// Display name.
-    pub name: String,
-    /// Collaborator count, set once at creation (see [`create_collaboration_project`]).
-    pub members: i32,
-    /// When the project was last updated, ISO 8601. Serializes as
-    /// `updatedAt`.
-    pub updated_at: String,
-    /// Free-text description.
-    pub description: String,
-}
-
-#[derive(Debug, FromRow)]
-struct CollaborationProjectRow {
-    id: Uuid,
-    name: String,
-    members: i32,
-    updated_at: OffsetDateTime,
-    description: String,
-}
-
-impl From<CollaborationProjectRow> for CollaborationProject {
-    fn from(row: CollaborationProjectRow) -> Self {
-        Self {
-            id: row.id.to_string(),
-            name: row.name,
-            members: row.members,
-            updated_at: iso_millis(row.updated_at),
-            description: row.description,
-        }
-    }
-}
-
-/// List every collaboration project, most recently updated first.
-///
-/// # Errors
-///
-/// Returns [`StoreError::Database`] if the query fails.
-pub async fn list_collaboration(pool: &PgPool) -> Result<Vec<CollaborationProject>, StoreError> {
-    let rows: Vec<CollaborationProjectRow> = sqlx::query_as(
-        "SELECT id, name, members, updated_at, description FROM collaboration_project \
-         ORDER BY updated_at DESC, name",
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows.into_iter().map(CollaborationProject::from).collect())
-}
-
-/// Everything [`create_collaboration_project`] needs. Mirrors
-/// `CreateCollaborationProjectInput`.
-#[derive(Debug, Clone)]
-pub struct CreateCollaborationProjectInput {
-    /// Display name.
-    pub name: String,
-    /// Collaborator names; only the count is retained (see
-    /// [`CollaborationProject::members`]).
-    pub collaborators: Vec<String>,
-    /// Free-text description; falls back to a "Collaborators: ..." sentence
-    /// when absent.
-    pub description: Option<String>,
-}
-
-/// Create a collaboration project. `members` is stored as the collaborator
-/// count at creation time (`mock/queries.ts`'s
-/// `input.collaborators.length`) — the contract has no method to add or
-/// remove a member later, so there is nothing for a derived `COUNT(*)`
-/// subquery to stay in sync with.
-///
-/// # Errors
-///
-/// Returns [`StoreError::Database`] on any failure.
-pub async fn create_collaboration_project(
-    pool: &PgPool,
-    input: &CreateCollaborationProjectInput,
-) -> Result<CollaborationProject, StoreError> {
-    #[allow(
-        clippy::cast_possible_wrap,
-        clippy::cast_possible_truncation,
-        reason = "a collaborator list from one request body cannot approach i32::MAX"
-    )]
-    let members = input.collaborators.len() as i32;
-    let description = input
-        .description
-        .clone()
-        .unwrap_or_else(|| format!("Collaborators: {}", input.collaborators.join(", ")));
-    let row: CollaborationProjectRow = sqlx::query_as(
-        "INSERT INTO collaboration_project (name, members, description) \
-         VALUES ($1, $2, $3) RETURNING id, name, members, updated_at, description",
-    )
-    .bind(&input.name)
-    .bind(members)
-    .bind(&description)
-    .fetch_one(pool)
-    .await?;
-    Ok(row.into())
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -464,21 +358,6 @@ mod tests {
                 "QueryHistoryItem is missing `{key}`"
             );
         }
-
-        let collab = CollaborationProject {
-            id: "c".to_owned(),
-            name: "n".to_owned(),
-            members: 3,
-            updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
-            description: "d".to_owned(),
-        };
-        let value = serde_json::to_value(&collab).unwrap();
-        for key in ["id", "name", "members", "updatedAt", "description"] {
-            assert!(
-                value.get(key).is_some(),
-                "CollaborationProject is missing `{key}`"
-            );
-        }
     }
 
     /// `auditEventId` is optional in the contract; a history row recorded
@@ -501,23 +380,5 @@ mod tests {
         };
         let value = serde_json::to_value(&item).unwrap();
         assert!(value.get("auditEventId").is_none());
-    }
-
-    /// `description` falls back to a "Collaborators: ..." sentence when
-    /// absent, matching `mock/queries.ts`'s `createCollaborationProject` —
-    /// pinned down here since the fallback logic lives in application code,
-    /// not SQL, and has no direct integration-test coverage of its own.
-    #[test]
-    fn collaboration_description_fallback_matches_mock_behavior() {
-        let input = CreateCollaborationProjectInput {
-            name: "n".to_owned(),
-            collaborators: vec!["Rina".to_owned(), "Bayu".to_owned()],
-            description: None,
-        };
-        let description = input
-            .description
-            .clone()
-            .unwrap_or_else(|| format!("Collaborators: {}", input.collaborators.join(", ")));
-        assert_eq!(description, "Collaborators: Rina, Bayu");
     }
 }

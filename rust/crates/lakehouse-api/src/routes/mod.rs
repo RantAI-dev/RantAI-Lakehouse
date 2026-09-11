@@ -318,10 +318,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/query/estimate", axum::routing::post(query::estimate))
         .route("/api/query/saved", get(query::list_saved))
         .route("/api/query/history", get(query::list_history))
-        .route(
-            "/api/query/collaboration",
-            get(query::list_collaboration).post(query::create_collaboration_project),
-        )
         .merge(pipelines_router())
         .route("/api/dashboard", get(dashboard::get))
         .route(

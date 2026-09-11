@@ -8,7 +8,6 @@ import { cn } from "@/lib/utils"
 const TABS = [
   { href: "/query-studio", label: "Studio" },
   { href: "/query-studio/saved", label: "Saved Queries" },
-  { href: "/query-studio/collaboration", label: "Collaboration" },
 ] as const
 
 /** Internal navigation between the Query Studio surfaces. */

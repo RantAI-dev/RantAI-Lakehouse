@@ -25,9 +25,9 @@ void mockAssetService
 // create/generate dari Postgres + LLM, cancel/retry/pause/resume adalah
 // mutation Dagster nyata. mock/pipelines.ts sudah dihapus.
 export const pipelineService = dagsterPipelineService
-// Query Studio kini NYATA sepenuhnya — eksekusi SQL, saved/history/
-// collaboration, dan generateSql semua lewat backend Rust (ClickHouse +
-// Postgres + LLM). mock/queries.ts sudah dihapus.
+// Query Studio kini NYATA sepenuhnya — eksekusi SQL, saved/history, dan
+// generateSql semua lewat backend Rust (ClickHouse + Postgres + LLM).
+// mock/queries.ts sudah dihapus.
 export const queryService = clickhouseQueryService
 // Knowledge SEBAGIAN NYATA (Task 2.8) — sources/vector jobs (list+create)
 // dari Postgres. `search` TETAP mendelegasikan ke mock: tidak ada vector

@@ -197,14 +197,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/gold/export/{mart}",  Policy::RequiresAuth),
     ("POST", "/api/gold/export/{mart}",  Policy::RequiresAuth),
 
-    // ── Query: seeded Analyst permission `query:read`. `collaboration` has
-    //    no seeded resource — auth only. ──────────────────────────────────
+    // ── Query: seeded Analyst permission `query:read`. ───────────────────
     ("POST", "/api/query/run",            Policy::RequiresPermission("query:read")),
     ("POST", "/api/query/estimate",       Policy::RequiresPermission("query:read")),
     ("GET",  "/api/query/saved",          Policy::RequiresPermission("query:read")),
     ("GET",  "/api/query/history",        Policy::RequiresPermission("query:read")),
-    ("GET",  "/api/query/collaboration",  Policy::RequiresAuth),
-    ("POST", "/api/query/collaboration",  Policy::RequiresAuth),
 
     // ── Pipelines: seeded Data Engineer permission `pipeline:*`. ─────────
     ("GET",  "/api/pipelines",                        Policy::RequiresPermission("pipeline:read")),
