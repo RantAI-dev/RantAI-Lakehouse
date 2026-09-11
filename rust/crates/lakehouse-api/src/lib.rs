@@ -24,6 +24,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 pub mod auth;
+pub mod bounded;
 pub mod config;
 pub mod connector_deprovision;
 pub mod connector_probe;
@@ -31,6 +32,7 @@ pub mod error;
 pub mod gold_export;
 pub mod gold_lock;
 pub mod json;
+pub mod lakehouse_catalog;
 pub mod lakekeeper_token;
 pub mod policy;
 pub mod routes;

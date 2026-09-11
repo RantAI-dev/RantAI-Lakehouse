@@ -8,6 +8,7 @@
 //! use `thiserror` typed errors instead.
 
 mod auth;
+mod bounded;
 mod config;
 mod connector_deprovision;
 mod connector_probe;
@@ -15,6 +16,7 @@ mod error;
 mod gold_export;
 mod gold_lock;
 mod json;
+mod lakehouse_catalog;
 mod lakekeeper_token;
 mod policy;
 mod routes;

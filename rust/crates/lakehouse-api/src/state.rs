@@ -11,8 +11,10 @@ use lakehouse_clickhouse::ChClient;
 use lakehouse_core::secret::{AllowlistedSecretResolver, DynSecretResolver, EnvSecretResolver};
 use lakehouse_dagster::DgClient;
 use lakehouse_embed::EmbedSecretResolver;
+use lakehouse_iceberg::IcebergClient;
 use lakehouse_llm::LlmClient;
 use lakehouse_store::PgPool;
+use tokio::sync::RwLock;
 
 use crate::config::Config;
 use crate::gold_lock::MartLocks;
@@ -109,6 +111,15 @@ pub struct AppState {
     /// [`Self::auth`]): it needs no external dependency, just an
     /// in-process map.
     pub gold_export_locks: MartLocks,
+    /// The shared, lazily-connected Lakekeeper Iceberg REST client used by
+    /// `routes::lakehouse` (WS2 §4). Starts empty (`None` inside): the
+    /// first `/api/lakehouse/*` request connects it, a failed connect is
+    /// never cached, and a stale cached client is dropped and reconnected
+    /// once on a `RestError::Catalog` — see `crate::lakehouse_catalog`'s
+    /// module doc comment. An `RwLock`, not a plain `Mutex`, because most
+    /// requests only need to read the cached client; only a (re)connect
+    /// needs exclusive access.
+    pub iceberg: Arc<RwLock<Option<Arc<IcebergClient>>>>,
 }
 
 /// The exact `secretRef`s [`AppState::connector_secret_resolver`] may
@@ -225,6 +236,7 @@ impl AppState {
             )),
             auth,
             gold_export_locks: MartLocks::default(),
+            iceberg: Arc::new(RwLock::new(None)),
         }
     }
 }

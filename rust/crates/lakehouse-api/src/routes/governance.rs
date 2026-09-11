@@ -19,7 +19,7 @@ use lakehouse_store::governance::{
     CreateQualityRuleInput, CreateResidencyRuleInput, Policy, QualityRule, ResidencyRule,
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
@@ -386,38 +386,73 @@ async fn residency(pg: Option<&PgPool>) -> Result<Value, GovError> {
 /// yet and the query below fails — surfaced as the standard 503 `run`
 /// already gives every other kind, not a special case.
 async fn maintenance(ch: &ChClient) -> Result<Value, GovError> {
-    let rows = ch
-        .rows(
-            "SELECT table_name, run_at, \
-                toString(dry_run_deleted_data_files) dry_data, \
-                toString(dry_run_deleted_manifest_files) dry_manifests, \
-                toString(applied_deleted_data_files) applied_data, \
-                toString(applied_deleted_manifest_files) applied_manifests, \
-                skipped_verbs \
-             FROM lake.`bronze_meta.maintenance_run` \
-             ORDER BY run_at DESC LIMIT 500",
-            None,
-        )
-        .await?;
-    let runs: Vec<Value> = rows
-        .iter()
-        .map(|r| {
-            json!({
-                "tableName": str_col(r, "table_name"),
-                "runAt": str_col(r, "run_at"),
-                "dryRun": {
-                    "deletedDataFiles": str_col(r, "dry_data"),
-                    "deletedManifestFiles": str_col(r, "dry_manifests"),
-                },
-                "applied": {
-                    "deletedDataFiles": str_col(r, "applied_data"),
-                    "deletedManifestFiles": str_col(r, "applied_manifests"),
-                },
-                "skippedVerbs": str_col(r, "skipped_verbs"),
-            })
-        })
-        .collect();
+    let runs = latest_maintenance_run(ch, None).await?;
     Ok(json!({ "maintenance": runs }))
+}
+
+/// Builds the `SELECT` behind [`latest_maintenance_run`]. `table_name`
+/// narrows to one table (`WHERE table_name = {SqlLiteral} ... LIMIT 1`);
+/// `None` keeps the all-tables query byte-identical to what
+/// `GET /api/governance/maintenance` has always run (`ORDER BY run_at DESC
+/// LIMIT 500`, no `WHERE`).
+fn maintenance_run_query(table_name: Option<&str>) -> String {
+    const COLUMNS: &str = "table_name, run_at, \
+        toString(dry_run_deleted_data_files) dry_data, \
+        toString(dry_run_deleted_manifest_files) dry_manifests, \
+        toString(applied_deleted_data_files) applied_data, \
+        toString(applied_deleted_manifest_files) applied_manifests, \
+        skipped_verbs";
+    match table_name {
+        Some(name) => format!(
+            "SELECT {COLUMNS} FROM lake.`bronze_meta.maintenance_run` \
+             WHERE table_name = {} ORDER BY run_at DESC LIMIT 1",
+            lakehouse_core::ident::SqlLiteral::from(name)
+        ),
+        None => format!(
+            "SELECT {COLUMNS} FROM lake.`bronze_meta.maintenance_run` \
+             ORDER BY run_at DESC LIMIT 500"
+        ),
+    }
+}
+
+/// Shared by `GET /api/governance/maintenance` (all tables) and
+/// `GET /api/lakehouse/tables/{ns}/{table}/maintenance` (`lastRun`, one
+/// table) — the latter narrows the same query rather than re-deriving it.
+/// Returns the raw `ChError` (not `GovError`): the lakehouse route
+/// classifies it into a fixed 503 itself (never forwarding `ClickHouse`'s
+/// own error text), while this module's own `maintenance` handler still
+/// converts it into `GovError` via `?`, unchanged from before this
+/// extraction.
+///
+/// # Errors
+/// Returns [`ChError`] if the query fails (including the table not
+/// existing yet — see this module's doc comment on `maintenance`).
+pub(crate) async fn latest_maintenance_run(
+    ch: &ChClient,
+    table_name: Option<&str>,
+) -> Result<Vec<Value>, ChError> {
+    let rows = ch.rows(&maintenance_run_query(table_name), None).await?;
+    Ok(rows.iter().map(maintenance_run_row_json).collect())
+}
+
+/// Maps one `bronze_meta.maintenance_run` row to the JSON shape
+/// `GET /api/governance/maintenance` has always returned per row, and that
+/// `GET /api/lakehouse/tables/{ns}/{table}/maintenance` reuses verbatim for
+/// its `lastRun` field.
+pub(crate) fn maintenance_run_row_json(row: &Map<String, Value>) -> Value {
+    json!({
+        "tableName": str_col(row, "table_name"),
+        "runAt": str_col(row, "run_at"),
+        "dryRun": {
+            "deletedDataFiles": str_col(row, "dry_data"),
+            "deletedManifestFiles": str_col(row, "dry_manifests"),
+        },
+        "applied": {
+            "deletedDataFiles": str_col(row, "applied_data"),
+            "deletedManifestFiles": str_col(row, "applied_manifests"),
+        },
+        "skippedVerbs": str_col(row, "skipped_verbs"),
+    })
 }
 
 /// `GET /api/governance/replication` — R5's slot-lag/WAL-retention metrics
@@ -740,6 +775,66 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    fn maintenance_fixture_row() -> Map<String, Value> {
+        let mut row = Map::new();
+        row.insert("table_name".to_owned(), json!("orders"));
+        row.insert("run_at".to_owned(), json!("2026-01-01T00:00:00Z"));
+        row.insert("dry_data".to_owned(), json!("3"));
+        row.insert("dry_manifests".to_owned(), json!("1"));
+        row.insert("applied_data".to_owned(), json!("2"));
+        row.insert("applied_manifests".to_owned(), json!("0"));
+        row.insert("skipped_verbs".to_owned(), json!(""));
+        row
+    }
+
+    #[test]
+    fn maintenance_run_row_json_matches_the_existing_per_row_shape() {
+        let row = maintenance_fixture_row();
+
+        let value = maintenance_run_row_json(&row);
+
+        assert_eq!(
+            value,
+            json!({
+                "tableName": "orders",
+                "runAt": "2026-01-01T00:00:00Z",
+                "dryRun": {
+                    "deletedDataFiles": "3",
+                    "deletedManifestFiles": "1",
+                },
+                "applied": {
+                    "deletedDataFiles": "2",
+                    "deletedManifestFiles": "0",
+                },
+                "skippedVerbs": "",
+            })
+        );
+    }
+
+    #[test]
+    fn maintenance_run_query_for_all_tables_has_no_where_and_keeps_limit_500() {
+        let sql = maintenance_run_query(None);
+
+        assert!(!sql.contains("WHERE"));
+        assert!(sql.contains("ORDER BY run_at DESC LIMIT 500"));
+    }
+
+    #[test]
+    fn maintenance_run_query_for_one_table_filters_and_limits_to_one() {
+        let sql = maintenance_run_query(Some("orders"));
+
+        assert!(sql.contains("WHERE table_name = 'orders'"));
+        assert!(sql.contains("ORDER BY run_at DESC LIMIT 1"));
+        assert!(!sql.contains("LIMIT 500"));
+    }
+
+    #[test]
+    fn maintenance_run_query_escapes_a_quote_in_the_table_name() {
+        let sql = maintenance_run_query(Some("o'rders"));
+
+        assert!(sql.contains("WHERE table_name = 'o''rders'"));
+    }
 
     #[test]
     fn lineage_reports_unsupported_not_a_template() {
