@@ -92,7 +92,7 @@ const MAP: { test: (p: string) => boolean; ctx: PageContext }[] = [
     },
   },
   {
-    test: (p) => p.startsWith("/governance") || p.startsWith("/lineage") || p.startsWith("/audit") || p.startsWith("/residency"),
+    test: (p) => p.startsWith("/governance") || p.startsWith("/lineage") || p.startsWith("/audit"),
     ctx: {
       key: "governance",
       title: "Governance & quality",
@@ -101,7 +101,7 @@ const MAP: { test: (p: string) => boolean; ctx: PageContext }[] = [
         ask: ["Summarize lakehouse data quality", "Show data lineage of visitors by country", "Which datasets have quality issues?"],
         build: ["Refresh the lakehouse (Bronze→Silver→Gold)"],
       },
-      system: "The user is in Governance (quality, lineage, audit, residency). Prefer get_quality / get_lineage.",
+      system: "The user is in Governance (quality, lineage, audit). Prefer get_quality / get_lineage.",
     },
   },
 ];

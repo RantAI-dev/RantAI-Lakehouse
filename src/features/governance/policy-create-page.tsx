@@ -19,7 +19,6 @@ const STEPS: FormStep[] = [
   { id: "basics", label: "Basics", description: "Name and kind" },
   { id: "scope", label: "Scope", description: "Subjects and resources" },
   { id: "rules", label: "Rules", description: "Effect and conditions" },
-  { id: "impact", label: "Impact", description: "Preview" },
   { id: "review", label: "Review", description: "Activate optional" },
 ]
 
@@ -43,8 +42,7 @@ export function PolicyCreatePage() {
     (step === 0 && Boolean(name.trim() && kind)) ||
     (step === 1 && Boolean(subjects.trim() && resources.trim())) ||
     (step === 2 && Boolean(effect.trim())) ||
-    step === 3 ||
-    step === 4
+    step === 3
 
   async function handleSubmit() {
     const result = await create.run({
@@ -131,16 +129,6 @@ export function PolicyCreatePage() {
           </div>
         ) : null}
         {step === 3 ? (
-          <div className="space-y-3 rounded-lg border border-border bg-muted/30 p-4 text-sm">
-            <p className="font-medium">Impact preview (mock)</p>
-            <ul className="list-inside list-disc text-muted-foreground">
-              <li>~24 users matching subjects</li>
-              <li>~18 assets matching resources</li>
-              <li>No conflicting active policies detected</li>
-            </ul>
-          </div>
-        ) : null}
-        {step === 4 ? (
           <>
             <FormReviewSummary
               sections={[

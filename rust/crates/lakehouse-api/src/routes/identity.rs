@@ -1,5 +1,5 @@
-//! `/api/identity/*` — users, roles, tenants, service identities, and
-//! workspace settings, backed by Postgres (`lakehouse-store`).
+//! `/api/identity/*` — users, roles, tenants, and service identities,
+//! backed by Postgres (`lakehouse-store`).
 //!
 //! # Not a port
 //!
@@ -38,10 +38,9 @@
 //! This means every handler below now runs behind `crate::policy::auth_gate`,
 //! which itself requires `AppState::auth` (built only when
 //! `AppState::pg` is `Some`) — so a Postgres outage now surfaces as 503
-//! from the auth gate itself, before a handler like
-//! [`workspace_settings`] (which otherwise needs no database at all) ever
-//! runs. See `workspace_settings_serve_without_a_database`'s updated doc
-//! comment for the concrete before/after.
+//! from the auth gate itself, before any handler's own database logic ever
+//! runs. See `every_database_backed_route_returns_503_without_a_pool` for
+//! the concrete proof, exercised end to end through the real router.
 
 use axum::body::Bytes;
 use axum::extract::{Query, State};
@@ -52,7 +51,7 @@ use lakehouse_store::identity::{
     self, CreateRoleInput, CreateServiceIdentityInput, CreateTenantInput, InviteUserInput, Role,
     ServiceIdentity, ServiceIdentityFilter, Tenant, TenantFilter, User, UserFilter,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
@@ -369,71 +368,13 @@ pub async fn create_service_identity(
     Ok((StatusCode::CREATED, ApiJson(created)))
 }
 
-// ── Workspace settings ──────────────────────────────────────────────────
-
-/// Mirrors `WorkspaceSettings` in `contracts/identity.ts`.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceSettings {
-    /// Display name of the workspace.
-    workspace_name: &'static str,
-    /// Environment new work defaults to.
-    default_environment: &'static str,
-    /// Slug of the tenant the console opens in.
-    default_tenant: &'static str,
-    /// `"dark" | "light" | "system"`.
-    interface_theme: &'static str,
-    /// `"mock" | "http"` — which service adapter the console is running
-    /// against.
-    service_adapter: &'static str,
-    /// Audit retention, in days.
-    audit_retention_days: u32,
-    /// Query-result retention, in days.
-    query_result_retention_days: u32,
-}
-
-/// `GET /api/identity/workspace-settings` — workspace-wide console
-/// configuration.
-///
-/// # Why this one is not Postgres-backed
-///
-/// `0001_init.sql` deliberately left `WorkspaceSettings` out of the schema,
-/// and that call still holds: the contract exposes it as a *read-only*
-/// getter (there is no `updateWorkspaceSettings`), so there is nothing a
-/// table would let a caller do that a constant does not. Adding a
-/// singleton-row table plus a migration to serve seven values nothing can
-/// change would be schema for its own sake. It is app configuration, not
-/// identity data — a later task that actually introduces an editable
-/// settings screen is the one that should give it a home.
-///
-/// The values are the mock's, with one deliberate correction:
-/// `serviceAdapter` reports `"http"`, not `"mock"`. That field names the
-/// adapter the console is actually talking to, and as of this task that is
-/// the real HTTP backend — reporting `"mock"` from the real backend would
-/// be a self-contradicting response.
-///
-/// Serving this from the process rather than the database also means it
-/// keeps working when `pool` would 503, which is the right behavior for a
-/// value the console reads on boot to decide how to render itself.
-pub async fn workspace_settings() -> ApiJson<WorkspaceSettings> {
-    ApiJson(WorkspaceSettings {
-        workspace_name: "Rantai Lake",
-        default_environment: "production",
-        default_tenant: "meridian-group",
-        interface_theme: "dark",
-        service_adapter: "http",
-        audit_retention_days: 365,
-        query_result_retention_days: 30,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::collections::HashMap;
 
-    use serde_json::{Value, json};
+    use serde_json::Value;
 
     use super::*;
     use crate::config::Config;
@@ -498,57 +439,6 @@ mod tests {
                 "{path} should use the {{\"error\": ...}} envelope"
             );
         }
-    }
-
-    /// Before Task 3.2, workspace settings answered 200 without a database
-    /// pool at all (the handler itself needs no query). Task 3.2 changed
-    /// what "without a database" means for EVERY route including this one:
-    /// `crate::policy::auth_gate` now runs first and requires
-    /// `AppState::auth`, which is only built when `AppState::pg` is
-    /// `Some` — so a missing pool now surfaces as 503 from the auth gate
-    /// itself, before this handler's own no-database-needed logic ever
-    /// gets a chance to run. This is the correct, spec'd behavior (an
-    /// unauthenticated caller must never reach a handler, database-backed
-    /// or not), not a regression in this handler.
-    #[tokio::test]
-    async fn workspace_settings_is_503_without_a_database_because_auth_itself_needs_one() {
-        use axum::body::to_bytes;
-        use axum::http::Request;
-        use axum::response::IntoResponse;
-        use tower::ServiceExt;
-
-        let app = crate::routes::router(state_without_pool());
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/identity/workspace-settings")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-        let bytes = to_bytes(
-            workspace_settings().await.into_response().into_body(),
-            usize::MAX,
-        )
-        .await
-        .unwrap();
-        let body: Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
-            body,
-            json!({
-                "workspaceName": "Rantai Lake",
-                "defaultEnvironment": "production",
-                "defaultTenant": "meridian-group",
-                "interfaceTheme": "dark",
-                "serviceAdapter": "http",
-                "auditRetentionDays": 365,
-                "queryResultRetentionDays": 30
-            }),
-            "keys must match `WorkspaceSettings` in contracts/identity.ts exactly"
-        );
     }
 
     /// A blank or whitespace-only required field is the caller's mistake,

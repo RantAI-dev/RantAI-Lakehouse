@@ -212,10 +212,6 @@ fn identity_router() -> Router<AppState> {
             "/api/identity/service-identities",
             get(identity::list_service_identities).post(identity::create_service_identity),
         )
-        .route(
-            "/api/identity/workspace-settings",
-            get(identity::workspace_settings),
-        )
 }
 
 /// The `/api/knowledge/*` sub-router (Task 2.8), split out for the same

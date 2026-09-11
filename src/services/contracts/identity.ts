@@ -39,16 +39,6 @@ export type ServiceIdentity = {
   lastUsedAt: string
 }
 
-export type WorkspaceSettings = {
-  workspaceName: string
-  defaultEnvironment: string
-  defaultTenant: string
-  interfaceTheme: "dark" | "light" | "system"
-  serviceAdapter: "mock" | "http"
-  auditRetentionDays: number
-  queryResultRetentionDays: number
-}
-
 export type InviteUserInput = {
   name: string
   email: string
@@ -80,7 +70,6 @@ export interface IdentityService {
   listRoles(signal?: AbortSignal): Promise<Role[]>
   listTenants(signal?: AbortSignal): Promise<Tenant[]>
   listServiceIdentities(signal?: AbortSignal): Promise<ServiceIdentity[]>
-  getWorkspaceSettings(signal?: AbortSignal): Promise<WorkspaceSettings>
   inviteUser(input: InviteUserInput, signal?: AbortSignal): Promise<User>
   createRole(input: CreateRoleInput, signal?: AbortSignal): Promise<Role>
   createTenant(input: CreateTenantInput, signal?: AbortSignal): Promise<Tenant>

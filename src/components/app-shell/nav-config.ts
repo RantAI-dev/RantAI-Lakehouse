@@ -12,7 +12,6 @@ import {
   FileSearch,
   FileText,
   GitBranch,
-  Globe2,
   History,
   KeyRound,
   LayoutDashboard,
@@ -131,7 +130,6 @@ export const NAV_GROUPS: NavGroup[] = [
       },
       { title: "Lineage", href: "/lineage", icon: Waypoints },
       { title: "Audit", href: "/audit", icon: FileText },
-      { title: "Residency", href: "/residency", icon: Globe2 },
       {
         title: "Bronze Maintenance",
         href: "/governance/maintenance",
@@ -166,7 +164,6 @@ export const NAV_GROUPS: NavGroup[] = [
         icon: KeyRound,
         preview: true,
       },
-      { title: "Settings", href: "/settings", icon: Settings },
     ],
   },
 ]

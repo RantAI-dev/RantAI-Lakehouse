@@ -41,6 +41,16 @@ enum Kind {
     /// always `"internal"`).
     Classification,
     /// `governance/residency` — static tenant residency policy.
+    ///
+    /// # Console surface removed
+    ///
+    /// `WS1` task 1.12 removed the Residency page: no query path, engine, or
+    /// policy check anywhere in the workspace actually enforces a residency
+    /// rule, so the page presented authored rows as if they were applied
+    /// policy. This route still serves real `Postgres` rows (authored
+    /// residency rules, unioned with one hardcoded row — see [`residency`])
+    /// and stays registered and `POLICY_TABLE`-classified, kept for `WS7`'s
+    /// policy engine to enforce.
     Residency,
     /// `governance/maintenance` — **P4 addition, not a TS-port kind** (like
     /// the `quality`/`classification`/`residency` "Gap fix" unions above,

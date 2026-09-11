@@ -5,13 +5,11 @@ import type {
   LineageGraph,
   AuditEvent,
   ClassificationRule,
-  ResidencyRule,
   MaintenanceRun,
   ReplicationSlot,
   CreatePolicyInput,
   CreateQualityRuleInput,
   CreateClassificationRuleInput,
-  CreateResidencyRuleInput,
 } from "../contracts/governance";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
@@ -25,9 +23,9 @@ import { ServiceError } from "../errors";
  * 2.3) — menggantikan seluruh `mock/governance.ts`.
  *
  * Catatan penting: rule yang dibuat lewat `create*Rule` TIDAK muncul di
- * `listQuality`/`listClassifications`/`listResidency` — dua sisi itu
- * sengaja punya sumber data berbeda (config yang ditulis manusia vs. hasil
- * observasi ClickHouse), sesuai desain backend Rust-nya.
+ * `listQuality`/`listClassifications` — dua sisi itu sengaja punya sumber
+ * data berbeda (config yang ditulis manusia vs. hasil observasi ClickHouse),
+ * sesuai desain backend Rust-nya.
  */
 
 /** Map an error response body onto the ServiceError code its status implies. */
@@ -69,9 +67,6 @@ export const clickhouseGovernanceService: GovernanceService = {
   async listClassifications(signal) {
     return (await get<{ classifications: ClassificationRule[] }>("/api/governance/classification", signal)).classifications;
   },
-  async listResidency(signal) {
-    return (await get<{ residency: ResidencyRule[] }>("/api/governance/residency", signal)).residency;
-  },
   async getLineage(focusId, signal) {
     return get<LineageGraph>(`/api/governance/lineage?focus=${encodeURIComponent(focusId)}`, signal);
   },
@@ -97,8 +92,5 @@ export const clickhouseGovernanceService: GovernanceService = {
   },
   createClassificationRule(input: CreateClassificationRuleInput, signal) {
     return post<ClassificationRule>("/api/governance/classification", input, signal);
-  },
-  createResidencyRule(input: CreateResidencyRuleInput, signal) {
-    return post<ResidencyRule>("/api/governance/residency", input, signal);
   },
 };

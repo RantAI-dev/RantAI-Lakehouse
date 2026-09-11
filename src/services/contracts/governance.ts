@@ -80,16 +80,6 @@ export type AuditEvent = {
   approvalId?: string
 }
 
-export type ResidencyRule = {
-  id: string
-  tenant: string
-  classification: Classification
-  approvedSites: string[]
-  crossSiteAllowed: boolean
-  allowedOutput: string
-  violations7d: number
-}
-
 export type CreatePolicyInput = {
   name: string
   kind: string
@@ -114,14 +104,6 @@ export type CreateClassificationRuleInput = {
   column?: string
   classification: Classification
   maskingRule?: string
-}
-
-export type CreateResidencyRuleInput = {
-  tenant: string
-  classification: Classification
-  approvedSites: string[]
-  crossSiteAllowed: boolean
-  allowedOutput: string
 }
 
 /**
@@ -167,7 +149,6 @@ export interface GovernanceService {
   listQuality(signal?: AbortSignal): Promise<QualityRule[]>
   getLineage(focusId: string, signal?: AbortSignal): Promise<LineageGraph>
   listAudit(signal?: AbortSignal): Promise<AuditEvent[]>
-  listResidency(signal?: AbortSignal): Promise<ResidencyRule[]>
   /** Bronze Iceberg maintenance runs (P4/P6) — `GET /api/governance/maintenance`. */
   listMaintenanceRuns(signal?: AbortSignal): Promise<MaintenanceRun[]>
   /** CDC replication slot health (P5/P6) — `GET /api/governance/replication`. */
@@ -181,8 +162,4 @@ export interface GovernanceService {
     input: CreateClassificationRuleInput,
     signal?: AbortSignal
   ): Promise<ClassificationRule>
-  createResidencyRule(
-    input: CreateResidencyRuleInput,
-    signal?: AbortSignal
-  ): Promise<ResidencyRule>
 }

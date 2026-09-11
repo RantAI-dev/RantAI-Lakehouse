@@ -8,7 +8,6 @@ import type {
   ServiceIdentity,
   Tenant,
   User,
-  WorkspaceSettings,
 } from "../contracts/identity";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
@@ -84,13 +83,6 @@ export const postgresIdentityService: IdentityService = {
       "/api/identity/service-identities",
       signal,
       "Daftar service identity gagal dimuat"
-    );
-  },
-  getWorkspaceSettings(signal) {
-    return get<WorkspaceSettings>(
-      "/api/identity/workspace-settings",
-      signal,
-      "Pengaturan workspace gagal dimuat"
     );
   },
   inviteUser(input: InviteUserInput, signal) {

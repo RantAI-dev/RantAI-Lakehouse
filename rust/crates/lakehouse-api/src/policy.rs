@@ -257,7 +257,6 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/identity/tenants",                Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/service-identities",     Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/service-identities",     Policy::RequiresPermission("identity:write")),
-    ("GET",  "/api/identity/workspace-settings",     Policy::RequiresPermission("identity:read")),
 
     // ── Connectors: seeded Data Engineer permission `connector:manage`. ──
     ("GET",  "/api/connectors",             Policy::RequiresPermission("connector:manage")),
