@@ -25,6 +25,7 @@
 
 pub mod auth;
 pub mod bounded;
+pub mod bronze_stats_cache;
 pub mod config;
 pub mod connector_deprovision;
 pub mod connector_probe;

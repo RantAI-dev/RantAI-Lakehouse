@@ -16,6 +16,7 @@ use lakehouse_llm::LlmClient;
 use lakehouse_store::PgPool;
 use tokio::sync::RwLock;
 
+use crate::bronze_stats_cache::BronzeStatsCache;
 use crate::config::Config;
 use crate::gold_lock::MartLocks;
 
@@ -120,6 +121,13 @@ pub struct AppState {
     /// requests only need to read the cached client; only a (re)connect
     /// needs exclusive access.
     pub iceberg: Arc<RwLock<Option<Arc<IcebergClient>>>>,
+    /// The 60 s TTL cache `routes::catalog::list` uses to enrich Bronze
+    /// rows with `sizeBytes`/`freshnessLagSeconds` without a Lakekeeper
+    /// round trip on every warm request — see
+    /// [`crate::bronze_stats_cache`]'s module doc comment. Always
+    /// populated (same pattern as [`Self::gold_export_locks`]): it needs
+    /// no external dependency, just an in-process map.
+    pub bronze_stats_cache: Arc<BronzeStatsCache>,
 }
 
 /// The exact `secretRef`s [`AppState::connector_secret_resolver`] may
@@ -237,6 +245,7 @@ impl AppState {
             auth,
             gold_export_locks: MartLocks::default(),
             iceberg: Arc::new(RwLock::new(None)),
+            bronze_stats_cache: Arc::new(BronzeStatsCache::new()),
         }
     }
 }

@@ -9,6 +9,7 @@
 
 mod auth;
 mod bounded;
+mod bronze_stats_cache;
 mod config;
 mod connector_deprovision;
 mod connector_probe;

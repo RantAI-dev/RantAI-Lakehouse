@@ -57,7 +57,7 @@ pub(crate) enum CatalogAccessError {
 /// The purpose label and env var [`read_token_file`] names in its fixed
 /// 503 text when the reader token is unavailable — matches the token file
 /// `docker-compose.yml`'s `lakekeeper-authz-init` mounts for this
-/// principal (ADR 0011, WS2 task A0).
+/// principal (ADR 0011).
 const READER_PURPOSE: &str = "lakehouse-api-reader";
 const READER_TOKEN_ENV_VAR: &str = "LAKEKEEPER_READ_TOKEN_FILE";
 

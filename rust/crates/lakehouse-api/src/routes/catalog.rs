@@ -6,16 +6,28 @@
 //! assets are read directly off `ClickHouse`'s `system.tables` /
 //! `system.columns` / `system.parts`.
 
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use iceberg::{NamespaceIdent, TableIdent};
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_core::ident::SqlLiteral;
+use lakehouse_iceberg::IcebergClient;
+use lakehouse_iceberg::rest;
 use serde_json::{Map, Value, json};
+use tokio::time::Instant;
 
+use crate::bounded;
+use crate::bronze_stats_cache::{BronzeStatsCache, CachedTableStats};
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
+use crate::lakehouse_catalog::{self, CatalogAccessError};
 use crate::routes::support::{js_error, js_string, num_or_zero, prettify, str_col};
 use crate::state::AppState;
 
@@ -26,7 +38,10 @@ use crate::tenant::{
 /// `GET /api/catalog` — the full asset registry, grouped into namespaces.
 pub async fn list(State(state): State<AppState>) -> Response {
     match list_body(&state.clickhouse).await {
-        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Ok((mut body, bronze_pairs)) => {
+            enrich_bronze_assets(&state, &mut body, bronze_pairs).await;
+            (StatusCode::OK, ApiJson(body)).into_response()
+        }
         // `catch (e) { return NextResponse.json({ error: String(e), assets:
         // [], namespaces: [] }, { status: 503 }); }` in `catalog/route.ts`.
         Err(err) => (
@@ -44,7 +59,10 @@ pub async fn list(State(state): State<AppState>) -> Response {
               with no independent reuse, hurting rather than helping \
               readability of the port"
 )]
-async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
+/// Returns the catalog body plus every Bronze row's `(slug, table_name)`
+/// pair, straight from the `cat` registry rows — `list` hands these to
+/// [`enrich_bronze_assets`] rather than re-deriving slugs from table names.
+async fn list_body(ch: &ChClient) -> Result<(Value, Vec<(String, String)>), ChError> {
     let cat = ch
         .rows(
             "SELECT slug, title, description, tier, updated_at, table_name FROM lake.`bronze_meta.dataset_catalog`
@@ -110,8 +128,20 @@ async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
         })
         .collect();
 
-    let bronze_table_names: std::collections::HashSet<&str> =
-        cat.iter().map(|c| str_col(c, "table_name")).collect();
+    let bronze_table_names: HashSet<&str> = cat.iter().map(|c| str_col(c, "table_name")).collect();
+    // Handed back to `list` for `enrich_bronze_assets` — taken from `cat`
+    // directly rather than re-derived from the `assets` rows above, so a
+    // future change to `bronze_catalog_row`'s shape can never silently
+    // break the slug/table_name pairing this depends on.
+    let bronze_pairs: Vec<(String, String)> = cat
+        .iter()
+        .map(|c| {
+            (
+                str_col(c, "slug").to_owned(),
+                str_col(c, "table_name").to_owned(),
+            )
+        })
+        .collect();
 
     let (tbl_rows, col_count_rows, part_rows) = tokio::try_join!(
         ch.rows(
@@ -172,7 +202,298 @@ async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
     }
 
     let namespaces = build_namespaces(&assets);
-    Ok(json!({ "assets": assets, "namespaces": namespaces }))
+    Ok((
+        json!({ "assets": assets, "namespaces": namespaces }),
+        bronze_pairs,
+    ))
+}
+
+// WS2 — filling Bronze `sizeBytes`/`freshnessLagSeconds` from Iceberg.
+//
+// `dataset_catalog.table_name` (read by `list_body` above as the second
+// element of each `bronze_pairs` entry) is written by two different
+// producers, with two different meanings, and no registry column records
+// which one wrote a given row:
+//
+// - The demo seed (`demo/clickhouse/04_registry.sql:64-91`) sets
+//   `table_name` to a plain `ClickHouse` table living in database `lake`
+//   (e.g. `'commerce_orders'`) — confirmed by the same file's `total`/
+//   column backfill, which joins `system.parts`/`system.columns` `WHERE
+//   database = 'lake'` on that exact name (`:125-128`, `:160-164`). No
+//   Bronze Iceberg table by that name exists in Lakekeeper for these rows.
+// - The Dagster/dlt ingest path
+//   (`dagster/dispar_orchestrate/assets.py:44-53` calling
+//   `bronze_catalog.py::register_bronze_table` at `:311-323`) sets
+//   `table_name` to `summary["bronze_table_name"]`, the exact string dlt
+//   uses as the destination table name (`dlt_pipeline.py:261`,
+//   `resource.apply_hints(table_name=cfg.bronze_table_name)`) when writing
+//   through Lakekeeper's REST catalog into the flat `bronze` namespace
+//   (`dlt_pipeline.py:281-286`, `dataset_name="bronze"` — the same flat
+//   namespace `docs/adr/0004-bronze-naming-partitioning-retention.md`
+//   establishes). For these rows, `table_name` genuinely is the Bronze
+//   Iceberg table name.
+//
+// Because the registry cannot tell the two apart, enrichment never trusts
+// `table_name` on its own: `iceberg_candidates` only keeps a pair whose
+// `table_name` is confirmed present in a real listing of Lakekeeper's
+// `bronze` namespace (`rest::list_table_idents`, cached alongside the
+// per-table stats — see `crate::bronze_stats_cache`). A demo-seed row's
+// `table_name` (a `lake.*` table) is excluded and its Bronze fields stay
+// `null`, never guessed at.
+//
+// Known limitation: if a demo-seed `table_name` ever collides with a real
+// Bronze Iceberg table name (a future Dagster ingest genuinely creating
+// `bronze.commerce_orders`, say), that unrelated row would receive that
+// table's stats. This is judged acceptable because the collision requires
+// an exact match against a table that actually exists, and the far more
+// common failure mode — no match — is handled correctly by never
+// fabricating a value for it.
+
+/// Per-request budget for enriching the catalog LIST from Iceberg —
+/// deliberately short: this route is on the page-load path, and a slow or
+/// unreachable Lakekeeper must degrade to `null` Bronze fields, never a
+/// slow page. Covers the connect, the (possibly cached) namespace listing,
+/// and the per-table loads together, not each separately.
+const ICEBERG_ENRICHMENT_BUDGET: Duration = Duration::from_millis(300);
+/// At most this many concurrent Lakekeeper `load_table` calls at once.
+const ICEBERG_ENRICHMENT_MAX_CONCURRENT: usize = 8;
+
+/// Keeps only the `(slug, table_name)` pairs whose `table_name` is
+/// confirmed present in `bronze_tables` — see the module comment above for
+/// why `dataset_catalog.table_name` cannot be trusted without this check.
+fn iceberg_candidates(
+    pairs: &[(String, String)],
+    bronze_tables: &HashSet<String>,
+) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .filter(|(_, table_name)| bronze_tables.contains(table_name))
+        .cloned()
+        .collect()
+}
+
+/// Sets `sizeBytes`/`freshnessLagSeconds` on every Bronze row (`"type":
+/// "iceberg-table"`) whose `id` (slug) is a key in `by_slug`. Every other
+/// row, and every other field on a matching row, is untouched — `health`
+/// stays `"unknown"` (WS2 does not measure health; see the module comment
+/// above [`bronze_catalog_row`]).
+///
+/// `freshnessLagSeconds` is `(now_ms - last_updated_ms) / 1000`, computed
+/// here at response time (never cached, never `0` as a stand-in for
+/// "unknown") — `null` when there is no snapshot timestamp, or when the
+/// computed lag would be negative (clock skew between this service and
+/// whatever wrote the snapshot), never a fabricated non-negative number.
+fn apply_iceberg_enrichment(
+    assets: &mut [Value],
+    by_slug: &HashMap<String, CachedTableStats>,
+    now_ms: i64,
+) {
+    for asset in assets.iter_mut() {
+        let Some(obj) = asset.as_object_mut() else {
+            continue;
+        };
+        if obj.get("type").and_then(Value::as_str) != Some("iceberg-table") {
+            continue;
+        }
+        let Some(slug) = obj.get("id").and_then(Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        let Some(stats) = by_slug.get(&slug) else {
+            continue;
+        };
+        obj.insert(
+            "sizeBytes".to_owned(),
+            stats.total_bytes.map_or(Value::Null, |bytes| json!(bytes)),
+        );
+        let lag_seconds = stats.last_updated_ms.and_then(|updated_ms| {
+            let lag_ms = now_ms - updated_ms;
+            if lag_ms < 0 {
+                None
+            } else {
+                Some(lag_ms / 1000)
+            }
+        });
+        obj.insert(
+            "freshnessLagSeconds".to_owned(),
+            lag_seconds.map_or(Value::Null, |lag| json!(lag)),
+        );
+    }
+}
+
+/// Current time in epoch milliseconds, for [`apply_iceberg_enrichment`]'s
+/// freshness computation. Falls back to `0` (a maximal, honestly-wrong-in-a-
+/// safe-direction lag) only if the system clock is somehow before the Unix
+/// epoch — never panics.
+fn now_millis() -> i64 {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
+/// The bounded, budgeted, cache-aware core of Bronze Iceberg enrichment.
+///
+/// `connect` is the one injectable seam: production passes
+/// `lakehouse_catalog::client`, and the budget test below passes a future
+/// that never resolves, proving the whole pipeline degrades to "no
+/// enrichment" within `budget` rather than hanging the response — without
+/// a live Lakekeeper. Once connected, this function ALWAYS talks to the
+/// real `lakehouse_iceberg::rest` surface directly (never
+/// `lakehouse_catalog::call`, never a retry) — see
+/// `crate::lakehouse_catalog::call`'s own doc comment on why a per-item
+/// fan-out call must not go through it.
+///
+/// # Errors
+/// Never returns an error: a connect timeout/failure, a listing
+/// timeout/failure, or an unfinished per-table load all degrade to an
+/// empty (or partial) map rather than failing the request. The cause is
+/// logged once per request at the point it happens.
+async fn enrich_bronze_stats<ConnectFut>(
+    pairs: Vec<(String, String)>,
+    cache: &BronzeStatsCache,
+    budget: Duration,
+    max_concurrent: usize,
+    bronze_ns: &NamespaceIdent,
+    connect: impl FnOnce() -> ConnectFut,
+) -> HashMap<String, CachedTableStats>
+where
+    ConnectFut: Future<Output = Result<Arc<IcebergClient>, CatalogAccessError>>,
+{
+    if pairs.is_empty() {
+        return HashMap::new();
+    }
+
+    let start = Instant::now();
+    let client = match tokio::time::timeout(budget, connect()).await {
+        Ok(Ok(client)) => client,
+        Ok(Err(err)) => {
+            tracing::warn!(
+                ?err,
+                "Iceberg enrichment: could not connect to Lakekeeper; the catalog list is unchanged"
+            );
+            return HashMap::new();
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                "Iceberg enrichment: connecting to Lakekeeper exceeded the request budget; \
+                 the catalog list is unchanged"
+            );
+            return HashMap::new();
+        }
+    };
+
+    let bronze_tables = if let Some(names) = cache.get_bronze_table_names(Instant::now()) {
+        names
+    } else {
+        let remaining = budget.saturating_sub(Instant::now().saturating_duration_since(start));
+        match tokio::time::timeout(remaining, rest::list_table_idents(&client, bronze_ns)).await {
+            Ok(Ok(idents)) => {
+                let names: HashSet<String> = idents
+                    .into_iter()
+                    .map(|ident| ident.name().to_owned())
+                    .collect();
+                cache.put_bronze_table_names(names.clone(), Instant::now());
+                names
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    ?err,
+                    "Iceberg enrichment: could not list the bronze namespace; the catalog list is unchanged"
+                );
+                return HashMap::new();
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    "Iceberg enrichment: listing the bronze namespace exceeded the request \
+                     budget; the catalog list is unchanged"
+                );
+                return HashMap::new();
+            }
+        }
+    };
+
+    let candidates = iceberg_candidates(&pairs, &bronze_tables);
+    if candidates.is_empty() {
+        return HashMap::new();
+    }
+
+    let now = Instant::now();
+    let mut by_slug = HashMap::new();
+    let mut miss_table_names = Vec::new();
+    let mut slug_by_table: HashMap<String, String> = HashMap::new();
+    for (slug, table_name) in candidates {
+        if let Some(stats) = cache.get_stats(&table_name, now) {
+            by_slug.insert(slug, stats);
+        } else {
+            slug_by_table.insert(table_name.clone(), slug);
+            miss_table_names.push(table_name);
+        }
+    }
+    if miss_table_names.is_empty() {
+        return by_slug;
+    }
+
+    let remaining = budget.saturating_sub(Instant::now().saturating_duration_since(start));
+    let loaded = bounded::run_with_budget(miss_table_names, remaining, max_concurrent, {
+        let client = client.clone();
+        let bronze_ns = bronze_ns.clone();
+        move |table_name: String| {
+            let client = client.clone();
+            let ident = TableIdent::new(bronze_ns.clone(), table_name);
+            async move {
+                rest::load_table_summary(&client, &ident)
+                    .await
+                    .ok()
+                    .map(|summary| CachedTableStats {
+                        total_bytes: summary.stats.total_bytes,
+                        last_updated_ms: summary.last_updated_ms,
+                    })
+            }
+        }
+    })
+    .await;
+
+    let write_now = Instant::now();
+    for (table_name, stats) in loaded {
+        cache.put_stats(table_name.clone(), stats, write_now);
+        if let Some(slug) = slug_by_table.get(&table_name) {
+            by_slug.insert(slug.clone(), stats);
+        }
+    }
+    by_slug
+}
+
+/// Wires [`enrich_bronze_stats`] to production: the real cache on
+/// `AppState`, the real budget/concurrency constants, and
+/// `lakehouse_catalog::client` as the connect seam. Mutates `body`'s
+/// `assets` array in place; a body with no `assets` array (never happens
+/// in practice — `list_body` always sets it) is left untouched.
+async fn enrich_bronze_assets(
+    state: &AppState,
+    body: &mut Value,
+    bronze_pairs: Vec<(String, String)>,
+) {
+    if bronze_pairs.is_empty() {
+        return;
+    }
+    let Ok(bronze_ns) = NamespaceIdent::from_strs(["bronze"]) else {
+        return;
+    };
+    let by_slug = enrich_bronze_stats(
+        bronze_pairs,
+        &state.bronze_stats_cache,
+        ICEBERG_ENRICHMENT_BUDGET,
+        ICEBERG_ENRICHMENT_MAX_CONCURRENT,
+        &bronze_ns,
+        || lakehouse_catalog::client(state),
+    )
+    .await;
+    if by_slug.is_empty() {
+        return;
+    }
+    if let Some(assets) = body.get_mut("assets").and_then(Value::as_array_mut) {
+        apply_iceberg_enrichment(assets, &by_slug, now_millis());
+    }
 }
 
 // WS1 task 1.9 — `sizeBytes` and `freshnessLagSeconds` are `null` and
@@ -807,5 +1128,145 @@ mod tests {
         assert_eq!(namespaces[0]["assetCount"], 2);
         assert_eq!(namespaces[1]["id"], "silver");
         assert_eq!(namespaces[1]["assetCount"], 1);
+    }
+
+    // WS2 A4 — `dataset_catalog.table_name` is written by two producers
+    // with two different meanings (see the module comment above
+    // `iceberg_candidates`); a pair must only survive when its
+    // `table_name` is confirmed present in Lakekeeper's real `bronze`
+    // listing.
+    #[test]
+    fn iceberg_candidates_excludes_a_seed_like_name_absent_from_the_listing() {
+        let pairs = vec![("commerce-orders".to_owned(), "commerce_orders".to_owned())];
+        let bronze_tables: HashSet<String> = HashSet::new();
+        assert!(iceberg_candidates(&pairs, &bronze_tables).is_empty());
+    }
+
+    #[test]
+    fn iceberg_candidates_includes_a_dlt_like_name_present_in_the_listing() {
+        let pairs = vec![("orders".to_owned(), "orders".to_owned())];
+        let bronze_tables: HashSet<String> = ["orders".to_owned()].into_iter().collect();
+        assert_eq!(
+            iceberg_candidates(&pairs, &bronze_tables),
+            vec![("orders".to_owned(), "orders".to_owned())]
+        );
+    }
+
+    #[test]
+    fn iceberg_candidates_is_empty_when_the_listing_is_empty() {
+        let pairs = vec![
+            ("a".to_owned(), "a".to_owned()),
+            ("b".to_owned(), "b".to_owned()),
+        ];
+        assert!(iceberg_candidates(&pairs, &HashSet::new()).is_empty());
+    }
+
+    fn bronze_row_with_id(slug: &str) -> Value {
+        bronze_catalog_row(
+            slug,
+            "Title",
+            false,
+            "owner",
+            "desc",
+            1,
+            1,
+            "2026-01-01T00:00:00Z",
+        )
+    }
+
+    #[test]
+    fn apply_iceberg_enrichment_fills_a_matching_bronze_row() {
+        let mut assets = vec![bronze_row_with_id("orders")];
+        let mut by_slug = HashMap::new();
+        by_slug.insert(
+            "orders".to_owned(),
+            CachedTableStats {
+                total_bytes: Some(1_000),
+                last_updated_ms: Some(500),
+            },
+        );
+        // now_ms - last_updated_ms = 60_500 ms = 60s.
+        apply_iceberg_enrichment(&mut assets, &by_slug, 61_000);
+        assert_eq!(assets[0]["sizeBytes"], json!(1_000));
+        assert_eq!(assets[0]["freshnessLagSeconds"], json!(60));
+        assert_eq!(assets[0]["health"], json!("unknown"));
+    }
+
+    #[test]
+    fn apply_iceberg_enrichment_leaves_a_non_bronze_row_untouched() {
+        let mut assets = vec![silver_catalog_row("mart_wisman", "View", 1)];
+        let mut by_slug = HashMap::new();
+        by_slug.insert(
+            "silver.mart_wisman".to_owned(),
+            CachedTableStats {
+                total_bytes: Some(1),
+                last_updated_ms: Some(1),
+            },
+        );
+        apply_iceberg_enrichment(&mut assets, &by_slug, 1_000);
+        assert_eq!(assets[0]["sizeBytes"], Value::Null);
+        assert_eq!(assets[0]["freshnessLagSeconds"], Value::Null);
+    }
+
+    #[test]
+    fn apply_iceberg_enrichment_null_size_when_total_bytes_is_none() {
+        let mut assets = vec![bronze_row_with_id("orders")];
+        let mut by_slug = HashMap::new();
+        by_slug.insert(
+            "orders".to_owned(),
+            CachedTableStats {
+                total_bytes: None,
+                last_updated_ms: Some(1),
+            },
+        );
+        apply_iceberg_enrichment(&mut assets, &by_slug, 1_000);
+        assert_eq!(assets[0]["sizeBytes"], Value::Null);
+    }
+
+    #[test]
+    fn apply_iceberg_enrichment_null_lag_for_a_future_timestamp() {
+        let mut assets = vec![bronze_row_with_id("orders")];
+        let mut by_slug = HashMap::new();
+        by_slug.insert(
+            "orders".to_owned(),
+            CachedTableStats {
+                total_bytes: Some(1),
+                // last_updated_ms is AFTER now_ms — clock skew, not a
+                // negative-but-real lag.
+                last_updated_ms: Some(2_000),
+            },
+        );
+        apply_iceberg_enrichment(&mut assets, &by_slug, 1_000);
+        assert_eq!(
+            assets[0]["freshnessLagSeconds"],
+            Value::Null,
+            "a future last_updated_ms must never render as a negative lag"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn enrich_bronze_stats_leaves_the_list_unchanged_when_the_connect_never_resolves() {
+        let cache = BronzeStatsCache::new();
+        let bronze_ns = NamespaceIdent::from_strs(["bronze"]).expect("valid namespace");
+        let pairs = vec![("orders".to_owned(), "orders".to_owned())];
+
+        let result = enrich_bronze_stats(
+            pairs,
+            &cache,
+            Duration::from_millis(100),
+            8,
+            &bronze_ns,
+            // Never resolves — proves the timeout, not the connector, is
+            // what bounds this function. No live Lakekeeper is reachable
+            // from a unit test, so the type is named without ever
+            // constructing a real value.
+            std::future::pending::<Result<Arc<IcebergClient>, CatalogAccessError>>,
+        )
+        .await;
+
+        assert!(
+            result.is_empty(),
+            "a connect that never resolves must leave enrichment empty, not hang"
+        );
     }
 }
