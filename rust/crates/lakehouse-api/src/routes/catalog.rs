@@ -975,7 +975,7 @@ fn bronze_detail_body(
         "upstream": [],
         "downstream": downstream,
         // The registry's own table_name — a true registry fact, not an
-        // Iceberg-verified one (see the WS2 A4 module comment above
+        // Iceberg-verified one (see the module comment above
         // `iceberg_candidates` for why this string may or may not name a
         // real Bronze Iceberg table). The frontend uses it to try loading
         // Iceberg snapshots for this asset, and handles a 404 quietly.
@@ -1173,7 +1173,7 @@ mod tests {
         assert_eq!(namespaces[1]["assetCount"], 1);
     }
 
-    // WS2 A4 — `dataset_catalog.table_name` is written by two producers
+    // WS2 §4 — `dataset_catalog.table_name` is written by two producers
     // with two different meanings (see the module comment above
     // `iceberg_candidates`); a pair must only survive when its
     // `table_name` is confirmed present in Lakekeeper's real `bronze`

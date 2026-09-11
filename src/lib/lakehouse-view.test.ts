@@ -16,7 +16,7 @@ import type { LakehouseMaintenance, LakehouseSnapshot } from "@/services/contrac
 
 function snapshot(partial: Partial<LakehouseSnapshot>): LakehouseSnapshot {
   return {
-    id: 1,
+    id: "1",
     parentId: null,
     timestampMs: 0,
     operation: "append",
@@ -89,21 +89,32 @@ describe("lakehouseTableHref", () => {
 describe("snapshotsNewestFirst", () => {
   it("sorts by timestampMs descending", () => {
     const oldestFirst = [
-      snapshot({ id: 1, timestampMs: 1_000 }),
-      snapshot({ id: 2, timestampMs: 3_000 }),
-      snapshot({ id: 3, timestampMs: 2_000 }),
+      snapshot({ id: "1", timestampMs: 1_000 }),
+      snapshot({ id: "2", timestampMs: 3_000 }),
+      snapshot({ id: "3", timestampMs: 2_000 }),
     ]
-    expect(snapshotsNewestFirst(oldestFirst).map((s) => s.id)).toEqual([2, 3, 1])
+    expect(snapshotsNewestFirst(oldestFirst).map((s) => s.id)).toEqual(["2", "3", "1"])
   })
 
   it("never mutates the input array", () => {
     const oldestFirst = [
-      snapshot({ id: 1, timestampMs: 1_000 }),
-      snapshot({ id: 2, timestampMs: 2_000 }),
+      snapshot({ id: "1", timestampMs: 1_000 }),
+      snapshot({ id: "2", timestampMs: 2_000 }),
     ]
     const copy = [...oldestFirst]
     snapshotsNewestFirst(oldestFirst)
     expect(oldestFirst).toEqual(copy)
+  })
+
+  // A5-F1: a snapshot id above Number.MAX_SAFE_INTEGER (2^53−1) must
+  // survive the sort exactly, as a string — never coerced through `Number`.
+  it("preserves a 64-bit snapshot id string exactly, past Number.MAX_SAFE_INTEGER", () => {
+    const bigId = "9007199254740993"
+    const oldestFirst = [
+      snapshot({ id: bigId, timestampMs: 1_000 }),
+      snapshot({ id: "2", timestampMs: 2_000 }),
+    ]
+    expect(snapshotsNewestFirst(oldestFirst).map((s) => s.id)).toEqual(["2", bigId])
   })
 })
 

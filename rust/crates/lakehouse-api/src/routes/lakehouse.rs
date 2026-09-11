@@ -162,13 +162,21 @@ fn namespaces_body(names: &[String], table_counts: &HashMap<String, usize>) -> V
     })
 }
 
+/// `currentSnapshotId` and (in [`snapshot_json`]) `id`/`parentId` are all
+/// Iceberg snapshot ids: 64-bit (`i64`), normally random, and routinely
+/// larger than JavaScript's `Number.MAX_SAFE_INTEGER` (2^53−1). Emitted as
+/// a JSON number they would be silently rounded by the browser's
+/// `JSON.parse`, corrupting the id everywhere it is used — a rendered
+/// value, a React `key`, and eventually a `FOR VERSION AS OF <id>` SQL
+/// literal. Emitting them as JSON strings instead means they round-trip
+/// exactly.
 fn table_row(namespace: &str, name: &str, summary: Option<&TableSummary>) -> Value {
     match summary {
         Some(s) => json!({
             "namespace": s.namespace,
             "name": s.name,
             "formatVersion": s.format_version,
-            "currentSnapshotId": s.current_snapshot_id,
+            "currentSnapshotId": s.current_snapshot_id.map(|id| id.to_string()),
             "lastUpdatedAt": last_updated_at(s.last_updated_ms),
             "fileCount": s.stats.file_count,
             "recordCount": s.stats.record_count,
@@ -202,10 +210,12 @@ fn tables_body(
     json!({ "tables": tables })
 }
 
+/// See [`table_row`]'s doc comment: `id` and `parentId` are also 64-bit
+/// Iceberg snapshot ids and are emitted as strings for the same reason.
 fn snapshot_json(s: &SnapshotDetail) -> Value {
     json!({
-        "id": s.id,
-        "parentId": s.parent_id,
+        "id": s.id.to_string(),
+        "parentId": s.parent_id.map(|id| id.to_string()),
         "timestampMs": s.timestamp_ms,
         "operation": s.operation,
         "summary": {
@@ -560,7 +570,7 @@ mod tests {
         let rows = body["tables"].as_array().expect("tables array");
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["name"], json!("orders"));
-        assert_eq!(rows[0]["currentSnapshotId"], json!(42));
+        assert_eq!(rows[0]["currentSnapshotId"], json!("42"));
         assert_eq!(rows[0]["fileCount"], json!(3));
         assert_eq!(rows[0]["lastUpdatedAt"], json!("2023-11-14T22:13:20Z"));
         assert_eq!(rows[1]["namespace"], json!("bronze"));
@@ -568,6 +578,34 @@ mod tests {
         assert_eq!(rows[1]["currentSnapshotId"], Value::Null);
         assert_eq!(rows[1]["fileCount"], Value::Null);
         assert_eq!(rows[1]["lastUpdatedAt"], Value::Null);
+    }
+
+    /// A5-F1: Iceberg snapshot ids are `i64`, normally random and far above
+    /// `Number.MAX_SAFE_INTEGER` (2^53−1 = `9_007_199_254_740_991`). Any id
+    /// past that point must survive as a JSON *string* — a JSON number
+    /// would be rounded by the browser's `JSON.parse`.
+    #[test]
+    fn table_row_emits_current_snapshot_id_as_a_string_above_javascript_safe_integer() {
+        let idents = vec![ident("bronze", "orders")];
+        let mut summaries = HashMap::new();
+        summaries.insert(
+            "orders".to_owned(),
+            TableSummary {
+                namespace: "bronze".to_owned(),
+                name: "orders".to_owned(),
+                format_version: 2,
+                current_snapshot_id: Some(9_007_199_254_740_993_i64),
+                last_updated_ms: None,
+                stats: TableStats::default(),
+            },
+        );
+
+        let body = tables_body("bronze", &idents, &summaries);
+
+        assert_eq!(
+            body["tables"][0]["currentSnapshotId"],
+            json!("9007199254740993")
+        );
     }
 
     #[test]
@@ -615,6 +653,8 @@ mod tests {
         assert_eq!(body["schema"][0]["name"], json!("id"));
         assert_eq!(body["schema"][0]["required"], json!(true));
         assert_eq!(body["partitionSpec"][0]["sourceId"], json!(2));
+        assert_eq!(body["snapshots"][0]["id"], json!("1"));
+        assert_eq!(body["snapshots"][0]["parentId"], Value::Null);
         assert_eq!(body["snapshots"][0]["summary"]["addedRecords"], json!(100));
         assert_eq!(
             body["snapshots"][0]["summary"]["deletedRecords"],
@@ -625,6 +665,49 @@ mod tests {
         assert_eq!(body["stats"]["smallFileThresholdBytes"], Value::Null);
         assert_eq!(body["stats"]["snapshotCount"], json!(1));
         assert_eq!(body["stats"]["metadataLogCount"], json!(1));
+    }
+
+    /// A5-F1: `id` and `parentId` must both survive as strings past
+    /// `Number.MAX_SAFE_INTEGER`, and a `None` `parentId` must still be
+    /// `null` rather than the string `"null"`.
+    #[test]
+    fn snapshot_json_emits_id_and_parent_id_as_strings_above_javascript_safe_integer() {
+        let snapshot = SnapshotDetail {
+            id: 9_007_199_254_740_993_i64,
+            parent_id: Some(9_007_199_254_740_993_i64),
+            timestamp_ms: 1_700_000_000_000,
+            operation: "append".to_owned(),
+            added_records: None,
+            deleted_records: None,
+            total_records: None,
+            total_data_files: None,
+            stats: TableStats::default(),
+        };
+
+        let body = snapshot_json(&snapshot);
+
+        assert_eq!(body["id"], json!("9007199254740993"));
+        assert_eq!(body["parentId"], json!("9007199254740993"));
+    }
+
+    #[test]
+    fn snapshot_json_nulls_parent_id_for_the_first_snapshot() {
+        let snapshot = SnapshotDetail {
+            id: 1,
+            parent_id: None,
+            timestamp_ms: 1_700_000_000_000,
+            operation: "append".to_owned(),
+            added_records: None,
+            deleted_records: None,
+            total_records: None,
+            total_data_files: None,
+            stats: TableStats::default(),
+        };
+
+        let body = snapshot_json(&snapshot);
+
+        assert_eq!(body["id"], json!("1"));
+        assert_eq!(body["parentId"], Value::Null);
     }
 
     #[test]

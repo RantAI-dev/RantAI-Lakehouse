@@ -40,7 +40,12 @@ export type LakehouseTableSummary = {
   name: string
   /** `null` when the per-table load did not finish in budget or failed. */
   formatVersion: Measured
-  currentSnapshotId: Measured
+  /**
+   * A 64-bit Iceberg snapshot id, sent as a string because it routinely
+   * exceeds `Number.MAX_SAFE_INTEGER` and a JSON number would be rounded
+   * by `JSON.parse`. Not a `Measured` — it is an identifier, not a metric.
+   */
+  currentSnapshotId: string | null
   lastUpdatedAt: string | null
   fileCount: Measured
   recordCount: Measured
@@ -69,8 +74,9 @@ export type LakehouseSnapshotSummary = {
 }
 
 export type LakehouseSnapshot = {
-  id: number
-  parentId: number | null
+  /** A 64-bit Iceberg snapshot id — a string, for the reason documented on `currentSnapshotId` above. */
+  id: string
+  parentId: string | null
   timestampMs: number
   // Iceberg snapshot operation — known values widened with `| string` since
   // the catalog is free to report an operation this contract doesn't list.

@@ -36,7 +36,9 @@ const tableColumns: ColumnDef<LakehouseTableSummary>[] = [
   {
     key: "currentSnapshotId",
     header: "Current snapshot",
-    render: (t) => fmtMeasured(t.currentSnapshotId),
+    // Not a `Measured` (it's an id, not a metric) — render the string as
+    // is, never through `Number()`, so it keeps its full 64-bit precision.
+    render: (t) => t.currentSnapshotId ?? "—",
   },
   {
     key: "lastUpdatedAt",

@@ -1,6 +1,6 @@
 /**
  * Pure view logic for the Lakehouse tables/table-detail pages and the
- * catalog Snapshots tab's Iceberg branch (WS2 §4 Task A5). Kept out of the
+ * catalog Snapshots tab's Iceberg branch (WS2 §4). Kept out of the
  * page components so it can be unit-tested with `bun test` — the
  * component-test harness (H0) does not exist on this branch.
  */
@@ -50,7 +50,7 @@ export function snapshotsNewestFirst(snapshots: LakehouseSnapshot[]): LakehouseS
 /**
  * An asset can only have Iceberg snapshots surfaced when it is a Bronze
  * asset AND the registry recorded a (possibly Iceberg, possibly not —
- * see the WS2 A4 module comment in `catalog.rs`) `tableName` for it. The
+ * see the module comment in `catalog.rs`) `tableName` for it. The
  * actual existence check happens server-side via a 404 on
  * `getTableDetail`.
  */

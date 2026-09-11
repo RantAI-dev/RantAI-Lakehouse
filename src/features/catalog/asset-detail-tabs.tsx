@@ -31,7 +31,7 @@ function QuietEmpty({ title }: { title: string }) {
 
 /**
  * Iceberg snapshots for a Bronze asset whose registry `tableName` may or
- * may not name a real Bronze Iceberg table (see the WS2 A4 module comment
+ * may not name a real Bronze Iceberg table (see the module comment
  * above `iceberg_candidates` in `catalog.rs`). A `not_found` result means
  * this asset's `tableName` does not exist in the `bronze` namespace — a
  * quiet empty state, not an error. A separate child component, because
