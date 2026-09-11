@@ -20,14 +20,6 @@
 //! `HashMap` owned by the caller, and nothing is shared across tasks except
 //! the semaphore.
 
-// This module is wired up by `GET /api/lakehouse/{namespaces,tables}`
-// (`routes::lakehouse`, WS2 §4), landing in the next commit on this
-// branch — until then, `run_with_budget` has no non-test caller.
-#![allow(
-    dead_code,
-    reason = "consumed by routes::lakehouse in the next commit on this branch"
-)]
-
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::Hash;

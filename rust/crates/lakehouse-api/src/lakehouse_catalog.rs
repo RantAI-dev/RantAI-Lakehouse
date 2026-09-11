@@ -24,23 +24,35 @@
 //! request tries again rather than the service remembering "not
 //! configured" forever.
 
-// This module is wired up by `routes::lakehouse`'s five handlers (WS2 §4),
-// landing in the next commit on this branch — until then, `client`/`call`
-// have no non-test caller.
-#![allow(
-    dead_code,
-    reason = "consumed by routes::lakehouse in the next commit on this branch"
-)]
-
 use std::future::Future;
 use std::sync::Arc;
 
+use lakehouse_core::ApiError;
 use lakehouse_iceberg::rest::RestError;
-use lakehouse_iceberg::{IcebergClient, IcebergClientConfig, IcebergError};
+use lakehouse_iceberg::{IcebergClient, IcebergClientConfig};
 
 use crate::gold_export::iceberg_config;
 use crate::lakekeeper_token::read_token_file;
 use crate::state::AppState;
+
+/// The two ways [`client`]/[`call`] can fail to reach the catalog, kept
+/// apart so a handler can surface each with its own fixed text instead of
+/// collapsing both into the generic "lakehouse catalog unavailable" 503.
+///
+/// A token failure is never retried: [`call`]'s `is_retryable` predicate
+/// only matches [`Self::Rest`]`(`[`RestError::Catalog`]`)`, so a missing or
+/// unreadable token file fails fast on the first attempt.
+#[derive(Debug)]
+pub(crate) enum CatalogAccessError {
+    /// [`read_token_file`] could not read the `lakehouse-api-reader`
+    /// bearer token. Carries the [`ApiError::Unavailable`] it already
+    /// built (fixed text naming [`READER_TOKEN_ENV_VAR`]) — callers
+    /// forward it unchanged rather than reclassifying it.
+    Token(ApiError),
+    /// Every other catalog failure: a failed connect once the token is in
+    /// hand, or a failed call against an already-connected client.
+    Rest(RestError),
+}
 
 /// The purpose label and env var [`read_token_file`] names in its fixed
 /// 503 text when the reader token is unavailable — matches the token file
@@ -52,18 +64,20 @@ const READER_TOKEN_ENV_VAR: &str = "LAKEKEEPER_READ_TOKEN_FILE";
 /// Connects a fresh [`IcebergClient`] using the configured Lakekeeper
 /// catalog URI/warehouse and the `lakehouse-api-reader` bearer token.
 ///
-/// A failed token read or a failed connect both come back as
-/// [`RestError::Catalog`] — both are "the catalog is not currently
-/// reachable with this deployment's configuration", and `classify_rest_error`
-/// (`routes::lakehouse`) turns either into the same fixed 503 text.
-async fn connect(state: &AppState) -> Result<IcebergClient, RestError> {
+/// A failed token read is kept as [`CatalogAccessError::Token`] rather than
+/// folded into [`RestError::Catalog`]: the token helper already built a
+/// fixed 503 naming `LAKEKEEPER_READ_TOKEN_FILE`, and that text must reach
+/// the caller unchanged, not be replaced by the generic "lakehouse catalog
+/// unavailable" message `classify_rest_error` (`routes::lakehouse`) gives
+/// every [`RestError::Catalog`].
+async fn connect(state: &AppState) -> Result<IcebergClient, CatalogAccessError> {
     let token = read_token_file(
         &state.config.lakekeeper_read_token_file,
         READER_PURPOSE,
         READER_TOKEN_ENV_VAR,
     )
     .await
-    .map_err(|err| RestError::Catalog(IcebergError::Catalog(err.to_string())))?;
+    .map_err(CatalogAccessError::Token)?;
     let config: IcebergClientConfig = iceberg_config(
         state.config.lakekeeper_catalog_uri.clone(),
         state.config.lakekeeper_warehouse.clone(),
@@ -71,7 +85,7 @@ async fn connect(state: &AppState) -> Result<IcebergClient, RestError> {
     );
     IcebergClient::connect(&config)
         .await
-        .map_err(RestError::Catalog)
+        .map_err(|err| CatalogAccessError::Rest(RestError::Catalog(err)))
 }
 
 /// Returns the cached client, connecting one if none is cached yet.
@@ -80,20 +94,30 @@ async fn connect(state: &AppState) -> Result<IcebergClient, RestError> {
 /// next one) tries again.
 ///
 /// # Errors
-/// Returns [`RestError::Catalog`] if the token cannot be read or the
-/// connect itself fails.
-pub(crate) async fn client(state: &AppState) -> Result<Arc<IcebergClient>, RestError> {
+/// Returns [`CatalogAccessError::Token`] if the reader token cannot be
+/// read, or [`CatalogAccessError::Rest`] if the connect itself fails.
+pub(crate) async fn client(state: &AppState) -> Result<Arc<IcebergClient>, CatalogAccessError> {
     get_or_connect(&state.iceberg, || connect(state)).await
 }
 
 /// Runs `f` against the shared cached client, reconnecting once and
 /// retrying once if `f` fails with [`RestError::Catalog`] (see the module
-/// doc comment). [`RestError::NotFound`] is returned immediately, never
-/// retried.
+/// doc comment). [`RestError::NotFound`] and a token failure
+/// ([`CatalogAccessError::Token`]) are both returned immediately, never
+/// retried — a missing table isn't a credential problem, and a token that
+/// couldn't be read off disk won't read differently a second time.
+///
+/// Meant for the ONE top-level catalog call each `routes::lakehouse`
+/// handler makes; a per-item call inside a
+/// [`crate::bounded::run_with_budget`] fan-out must use [`client`] once and
+/// call `lakehouse_iceberg::rest` directly instead — see that module's
+/// callers. Retrying (and, on failure, evicting the shared cache) inside a
+/// fan-out would let one item's catalog error tear down the client every
+/// other in-flight item is using.
 ///
 /// # Errors
 /// Returns whatever `f` (or a failed reconnect) returns.
-pub(crate) async fn call<T, F, Fut>(state: &AppState, f: F) -> Result<T, RestError>
+pub(crate) async fn call<T, F, Fut>(state: &AppState, f: F) -> Result<T, CatalogAccessError>
 where
     F: Fn(Arc<IcebergClient>) -> Fut,
     Fut: Future<Output = Result<T, RestError>>,
@@ -101,10 +125,20 @@ where
     call_with_retry(
         &state.iceberg,
         || connect(state),
-        f,
-        |err| matches!(err, RestError::Catalog(_)),
+        move |client| {
+            let fut = f(client);
+            async move { fut.await.map_err(CatalogAccessError::Rest) }
+        },
+        is_retryable_access_error,
     )
     .await
+}
+
+/// Only a [`RestError::Catalog`] on an already-connected client is worth a
+/// reconnect-and-retry — see [`call`]'s doc comment for why
+/// [`CatalogAccessError::Token`] and [`RestError::NotFound`] are excluded.
+fn is_retryable_access_error(err: &CatalogAccessError) -> bool {
+    matches!(err, CatalogAccessError::Rest(RestError::Catalog(_)))
 }
 
 /// Returns the cached client in `cache`, or connects and caches one via
@@ -325,5 +359,140 @@ mod tests {
         .await
         .map(|client| *client);
         assert_eq!(second, Ok(42));
+    }
+
+    /// A stand-in for [`CatalogAccessError`], so `call_with_retry`'s
+    /// production `is_retryable_access_error` predicate can be exercised
+    /// against the real enum without a live catalog — `connect`/`call`
+    /// bind `E` to a fake `u32` client here rather than a real
+    /// [`IcebergClient`], the same trick the tests above use.
+    fn fake_token_error() -> CatalogAccessError {
+        CatalogAccessError::Token(ApiError::Unavailable(
+            "Lakekeeper lakehouse-api-reader token is unavailable (check \
+             LAKEKEEPER_READ_TOKEN_FILE; see ADR 0011)"
+                .to_owned(),
+        ))
+    }
+
+    fn fake_rest_catalog_error() -> CatalogAccessError {
+        CatalogAccessError::Rest(RestError::Catalog(
+            lakehouse_iceberg::IcebergError::Catalog("connection refused".to_owned()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_token_failure_surfaces_its_message_and_is_never_retried() {
+        let cache: RwLock<Option<Arc<u32>>> = RwLock::new(None);
+        let connect_calls = AtomicUsize::new(0);
+
+        let result: Result<u32, CatalogAccessError> = call_with_retry(
+            &cache,
+            || {
+                connect_calls.fetch_add(1, Ordering::SeqCst);
+                async { Err(fake_token_error()) }
+            },
+            |_client| async { Ok(1_u32) },
+            is_retryable_access_error,
+        )
+        .await;
+
+        match result {
+            Err(CatalogAccessError::Token(err)) => {
+                assert!(
+                    err.to_string().contains("LAKEKEEPER_READ_TOKEN_FILE"),
+                    "expected the fixed token-unavailable text, got: {err}"
+                );
+            }
+            Err(CatalogAccessError::Rest(_)) | Ok(_) => {
+                panic!("expected CatalogAccessError::Token, got a different result")
+            }
+        }
+        assert_eq!(
+            connect_calls.load(Ordering::SeqCst),
+            1,
+            "a token failure must not trigger a reconnect attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rest_catalog_failure_still_retries_once() {
+        let cache: RwLock<Option<Arc<u32>>> = RwLock::new(None);
+        let connect_calls = AtomicUsize::new(0);
+        let call_attempt = AtomicUsize::new(0);
+
+        let result: Result<u32, CatalogAccessError> = call_with_retry(
+            &cache,
+            || {
+                let n =
+                    u32::try_from(connect_calls.fetch_add(1, Ordering::SeqCst)).unwrap_or(u32::MAX);
+                async move { Ok(n + 1) }
+            },
+            |client| {
+                let attempt = call_attempt.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt == 0 {
+                        Err(fake_rest_catalog_error())
+                    } else {
+                        Ok(*client * 100)
+                    }
+                }
+            },
+            is_retryable_access_error,
+        )
+        .await;
+
+        assert!(matches!(result, Ok(200)));
+        assert_eq!(
+            connect_calls.load(Ordering::SeqCst),
+            2,
+            "a Rest(Catalog) failure must still reconnect and retry exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fan_out_items_direct_use_of_the_shared_client_never_evicts_the_cache() {
+        // Models `routes::lakehouse::namespaces`/`tables`: the client is
+        // resolved ONCE (what `client()` does), then every fan-out item
+        // works directly against that `Arc` — never through
+        // `call`/`call_with_retry` — so a failing item has no path back
+        // into the cache at all, unlike the old per-item `call` pattern
+        // exercised by `a_rest_catalog_failure_still_retries_once` above.
+        let cache: RwLock<Option<Arc<u32>>> = RwLock::new(None);
+        let connect_calls = AtomicUsize::new(0);
+
+        let client = get_or_connect(&cache, || {
+            connect_calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<u32, CatalogAccessError>(7) }
+        })
+        .await
+        .expect("first connect succeeds");
+
+        // Three "items" sharing the one resolved client; the middle one
+        // fails. None of these touch `cache` — that is the point.
+        let item = |ok: bool| -> Result<u32, RestError> {
+            if ok {
+                Ok(*client)
+            } else {
+                Err(RestError::NotFound)
+            }
+        };
+        assert!(item(true).is_ok());
+        assert!(item(false).is_err());
+        assert!(item(true).is_ok());
+
+        let still_cached = cache
+            .read()
+            .await
+            .clone()
+            .expect("cache still holds a client");
+        assert!(
+            Arc::ptr_eq(&client, &still_cached),
+            "an item's failure must never evict the shared client from the cache"
+        );
+        assert_eq!(
+            connect_calls.load(Ordering::SeqCst),
+            1,
+            "no reconnect should be triggered by a per-item failure"
+        );
     }
 }

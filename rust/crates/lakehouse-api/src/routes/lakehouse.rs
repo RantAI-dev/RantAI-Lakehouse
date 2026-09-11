@@ -77,11 +77,34 @@ fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
 /// Classifies a [`RestError`] into a fixed [`ApiError`], logging the real
 /// cause first — `IcebergError`'s own `Display` text never reaches an HTTP
 /// response body (AGENTS.md rule 4 / WS2's error-forwarding rule).
-pub(crate) fn classify_rest_error(err: &RestError) -> ApiError {
-    tracing::warn!(%err, "lakehouse catalog read failed");
+///
+/// `resource` names what a [`RestError::NotFound`] refers to at this call
+/// site — `list_table_idents` returns the SAME `NotFound` for a missing
+/// namespace as `load_table_summary`/`load_table_detail` do for a missing
+/// table, so the caller (which knows which one it just asked for) supplies
+/// the word.
+pub(crate) fn classify_rest_error(err: &RestError, resource: &'static str) -> ApiError {
+    tracing::warn!(%err, resource, "lakehouse catalog read failed");
     match err {
-        RestError::NotFound => ApiError::NotFound("table not found".to_owned()),
+        RestError::NotFound => ApiError::NotFound(format!("{resource} not found")),
         RestError::Catalog(_) => ApiError::Unavailable("lakehouse catalog unavailable".to_owned()),
+    }
+}
+
+/// Maps [`lakehouse_catalog::CatalogAccessError`] to the [`ApiError`] a
+/// handler returns: a token failure's fixed 503
+/// ([`crate::lakekeeper_token::read_token_file`]'s own message, naming
+/// `LAKEKEEPER_READ_TOKEN_FILE`) forwarded unchanged, or a catalog failure
+/// run through [`classify_rest_error`] with `resource`.
+fn classify_catalog_access_error(
+    err: lakehouse_catalog::CatalogAccessError,
+    resource: &'static str,
+) -> ApiError {
+    match err {
+        lakehouse_catalog::CatalogAccessError::Token(api_err) => api_err,
+        lakehouse_catalog::CatalogAccessError::Rest(rest_err) => {
+            classify_rest_error(&rest_err, resource)
+        }
     }
 }
 
@@ -263,7 +286,7 @@ fn maintenance_body(
 pub async fn warehouses(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
     let client = lakehouse_catalog::client(&state)
         .await
-        .map_err(|err| classify_rest_error(&err))?;
+        .map_err(|err| classify_catalog_access_error(err, "warehouse"))?;
     // Infallible — an unreachable warehouse is reported as
     // `reachable: false`, never as an error (see `rest::list_warehouses`).
     let warehouses = rest::list_warehouses(&client, &state.config.lakekeeper_warehouse).await;
@@ -279,10 +302,9 @@ pub struct NamespacesQuery {
 /// `GET /api/lakehouse/namespaces?warehouse=`.
 ///
 /// # Errors
-/// 400 if `warehouse` is present but not `[a-z0-9_]+`-shaped isn't
-/// required here (warehouse identity is opaque), 404 if it names a
-/// warehouse other than the one configured, 503 if the catalog cannot be
-/// reached.
+/// 404 if `warehouse` names anything other than the configured warehouse,
+/// 503 if the catalog cannot be reached, or if the reader token is
+/// unavailable.
 pub async fn namespaces(
     State(state): State<AppState>,
     Query(query): Query<NamespacesQuery>,
@@ -293,22 +315,27 @@ pub async fn namespaces(
         rest::list_namespaces(&client).await
     })
     .await
-    .map_err(|err| classify_rest_error(&err))?;
+    .map_err(|err| classify_catalog_access_error(err, "namespace"))?;
     let names: Vec<String> = idents.iter().map(NamespaceIdent::to_url_string).collect();
 
+    // One client, fetched ONCE, shared by every fan-out item below: each
+    // item calls `rest::list_table_idents` directly on it, never through
+    // `lakehouse_catalog::call`, so one namespace's catalog error can never
+    // evict the shared cache out from under the other in-flight lookups
+    // (a failed or unfinished item is simply a `null` `tableCount` — see
+    // `namespaces_body`).
+    let client = lakehouse_catalog::client(&state)
+        .await
+        .map_err(|err| classify_catalog_access_error(err, "namespace"))?;
     let table_counts = bounded::run_with_budget(names.clone(), Duration::from_secs(2), 8, {
-        let state = state.clone();
         move |name: String| {
-            let state = state.clone();
+            let client = client.clone();
             async move {
                 let ns = NamespaceIdent::from_strs([name.as_str()]).ok()?;
-                lakehouse_catalog::call(&state, |client| {
-                    let ns = ns.clone();
-                    async move { rest::list_table_idents(&client, &ns).await }
-                })
-                .await
-                .ok()
-                .map(|idents| idents.len())
+                rest::list_table_idents(&client, &ns)
+                    .await
+                    .ok()
+                    .map(|idents| idents.len())
             }
         }
     })
@@ -351,23 +378,21 @@ pub async fn tables(
         }
     })
     .await
-    .map_err(|err| classify_rest_error(&err))?;
+    .map_err(|err| classify_catalog_access_error(err, "namespace"))?;
 
     let names: Vec<String> = idents.iter().map(|ident| ident.name().to_owned()).collect();
+    // One client, fetched ONCE, shared by every fan-out item below — see
+    // `namespaces`' matching comment for why a per-item call must not go
+    // through `lakehouse_catalog::call`.
+    let client = lakehouse_catalog::client(&state)
+        .await
+        .map_err(|err| classify_catalog_access_error(err, "table"))?;
     let summaries = bounded::run_with_budget(names, Duration::from_secs(2), 8, {
-        let state = state.clone();
         let ns = ns.clone();
         move |name: String| {
-            let state = state.clone();
+            let client = client.clone();
             let ident = TableIdent::new(ns.clone(), name);
-            async move {
-                lakehouse_catalog::call(&state, |client| {
-                    let ident = ident.clone();
-                    async move { rest::load_table_summary(&client, &ident).await }
-                })
-                .await
-                .ok()
-            }
+            async move { rest::load_table_summary(&client, &ident).await.ok() }
         }
     })
     .await;
@@ -398,9 +423,20 @@ pub async fn table_detail(
         }
     })
     .await
-    .map_err(|err| classify_rest_error(&err))?;
+    .map_err(|err| classify_catalog_access_error(err, "table"))?;
 
     Ok(ApiJson(table_detail_body(&detail)))
+}
+
+/// `true` only for `bronze`: the P4 maintenance job (and its
+/// `bronze_meta.maintenance_run` history table) only ever compacts
+/// `bronze` tables, and that table has no namespace column — a
+/// `table_name`-only filter would attribute `bronze/orders`' run to
+/// `silver/orders` if both existed. [`maintenance`] uses this to decide
+/// whether to query `ClickHouse` at all for a given namespace, rather than
+/// returning a row that merely happens to share the table's name.
+fn last_run_applies(ns: &str) -> bool {
+    ns == "bronze"
 }
 
 /// `GET /api/lakehouse/tables/{ns}/{table}/maintenance`.
@@ -422,11 +458,20 @@ pub async fn maintenance(
 
     let policy = maintenance_policy::get_policy(pool(&state)?, &ns, &table).await?;
 
-    let last_run = latest_maintenance_run(&state.clickhouse, Some(&table))
-        .await
-        .map_err(|err| classify_ch_error(&err))?
-        .into_iter()
-        .next();
+    // `bronze_meta.maintenance_run` has no namespace column and the job
+    // only maintains `bronze` — see `last_run_applies`. For any other
+    // namespace, `lastRun` is honestly `null` without querying
+    // `ClickHouse` at all, rather than risking another namespace's
+    // same-named table's run.
+    let last_run = if last_run_applies(&ns) {
+        latest_maintenance_run(&state.clickhouse, Some(&table))
+            .await
+            .map_err(|err| classify_ch_error(&err))?
+            .into_iter()
+            .next()
+    } else {
+        None
+    };
 
     Ok(ApiJson(maintenance_body(
         &ns,
@@ -614,21 +659,153 @@ mod tests {
     }
 
     #[test]
-    fn classify_rest_error_maps_not_found_to_404_with_no_upstream_text() {
-        let err = classify_rest_error(&RestError::NotFound);
+    fn classify_rest_error_maps_not_found_to_404_naming_the_table() {
+        let err = classify_rest_error(&RestError::NotFound, "table");
         assert_eq!(err.status(), 404);
         assert_eq!(err.to_string(), "table not found");
     }
 
     #[test]
+    fn classify_rest_error_maps_not_found_to_404_naming_the_namespace() {
+        // `list_table_idents`'s `NotFound` means the NAMESPACE is missing,
+        // not a table — `tables` must pass the right word rather than the
+        // fixed "table not found" every `NotFound` used to get.
+        let err = classify_rest_error(&RestError::NotFound, "namespace");
+        assert_eq!(err.status(), 404);
+        assert_eq!(err.to_string(), "namespace not found");
+    }
+
+    #[test]
     fn classify_rest_error_maps_catalog_failure_to_503_with_fixed_text() {
-        let err = classify_rest_error(&RestError::Catalog(
-            lakehouse_iceberg::IcebergError::Catalog(
+        let err = classify_rest_error(
+            &RestError::Catalog(lakehouse_iceberg::IcebergError::Catalog(
                 "connection refused to internal-host:1234".to_owned(),
-            ),
-        ));
+            )),
+            "table",
+        );
         assert_eq!(err.status(), 503);
         assert_eq!(err.to_string(), "lakehouse catalog unavailable");
         assert!(!err.to_string().contains("internal-host"));
+    }
+
+    #[test]
+    fn last_run_applies_only_to_bronze() {
+        assert!(last_run_applies("bronze"));
+        assert!(!last_run_applies("silver"));
+        assert!(!last_run_applies("gold"));
+    }
+
+    /// Exercises `namespaces` end to end against a real (local, throwaway)
+    /// HTTP server standing in for Lakekeeper — no live catalog, matching
+    /// `lakehouse_iceberg::rest`'s own wiremock test style — to prove the
+    /// fan-out fix at the level the bug actually lived at: `routes::
+    /// lakehouse`'s per-item calls, not `lakehouse_catalog`'s retry
+    /// mechanism in isolation.
+    mod wiremock_tests {
+        use std::collections::HashMap;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+        use crate::config::Config;
+
+        fn temp_token_file() -> std::path::PathBuf {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock before epoch")
+                .as_nanos();
+            std::env::temp_dir().join(format!("lakehouse-catalog-test-token-{nanos}"))
+        }
+
+        async fn state_pointed_at(server: &MockServer) -> AppState {
+            let token_path = temp_token_file();
+            tokio::fs::write(&token_path, "test-reader-token")
+                .await
+                .expect("write a throwaway token file");
+
+            let mut env = HashMap::new();
+            env.insert("LAKEKEEPER_CATALOG_URI".to_owned(), server.uri());
+            env.insert("LAKEKEEPER_WAREHOUSE".to_owned(), "default".to_owned());
+            env.insert(
+                "LAKEKEEPER_READ_TOKEN_FILE".to_owned(),
+                token_path.to_string_lossy().into_owned(),
+            );
+            AppState::new(Config::from_map(&env).expect("a valid test config"))
+        }
+
+        #[tokio::test]
+        async fn one_namespaces_catalog_error_never_evicts_the_shared_client() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/config"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(r#"{"defaults":{},"overrides":{}}"#),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/v1/namespaces"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"{"namespaces":[["bronze"],["broken"]]}"#),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/v1/namespaces/bronze/tables"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"{"identifiers":[{"namespace":["bronze"],"name":"orders"}]}"#,
+                ))
+                .mount(&server)
+                .await;
+            // "broken" always 500s: a `RestError::Catalog`, not `NotFound`.
+            // Under the old per-item `lakehouse_catalog::call` pattern this
+            // would evict the shared client (see `bounded::run_with_budget`
+            // §4 follow-up finding 1) and force a reconnect; the fix must
+            // leave `/v1/config` hit exactly once no matter how many items
+            // fail this way.
+            Mock::given(method("GET"))
+                .and(path("/v1/namespaces/broken/tables"))
+                .respond_with(ResponseTemplate::new(500).set_body_string(
+                    r#"{"error":{"message":"boom","type":"InternalServerError","code":500}}"#,
+                ))
+                .mount(&server)
+                .await;
+
+            let state = state_pointed_at(&server).await;
+
+            let body = namespaces(State(state), Query(NamespacesQuery { warehouse: None }))
+                .await
+                .expect("namespaces succeeds even though one item fails")
+                .0;
+
+            assert_eq!(body["namespaces"][0]["name"], json!("bronze"));
+            assert_eq!(body["namespaces"][0]["tableCount"], json!(1));
+            assert_eq!(body["namespaces"][1]["name"], json!("broken"));
+            assert_eq!(body["namespaces"][1]["tableCount"], Value::Null);
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("wiremock records requests by default");
+            let config_hits = requests
+                .iter()
+                .filter(|r| r.url.path() == "/v1/config")
+                .count();
+            let broken_hits = requests
+                .iter()
+                .filter(|r| r.url.path() == "/v1/namespaces/broken/tables")
+                .count();
+            assert_eq!(
+                config_hits, 1,
+                "one item's catalog error must not force a reconnect"
+            );
+            assert_eq!(
+                broken_hits, 1,
+                "a fan-out item must not be retried by lakehouse_catalog::call"
+            );
+        }
     }
 }
