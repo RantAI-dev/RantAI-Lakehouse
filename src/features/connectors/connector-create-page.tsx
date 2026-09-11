@@ -2,10 +2,11 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { useRouter } from "next/navigation"
+import { ErrorState } from "@/components/patterns/page-states"
 import { FormReviewSummary } from "@/components/patterns/form-review-summary"
 import { FormStepLayout, type FormStep } from "@/components/patterns/form-step-layout"
 import { PageHeader } from "@/components/patterns/page-header"
+import { SectionCard } from "@/components/patterns/section-card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -17,7 +18,6 @@ import type { Connector } from "@/services/contracts/connectors"
 const STEPS: FormStep[] = [
   { id: "type", label: "Type", description: "Connector kind" },
   { id: "connection", label: "Connection", description: "Host and secret" },
-  { id: "test", label: "Test", description: "Validate connectivity" },
   { id: "discover", label: "Discover", description: "Capabilities" },
   { id: "scope", label: "Scope", description: "Tenant and residency" },
   { id: "review", label: "Review", description: "Confirm" },
@@ -27,29 +27,31 @@ const TYPES = ["PostgreSQL CDC", "Object storage", "SaaS REST", "JDBC"]
 const CAPABILITIES = ["CDC", "schema discovery", "checkpoint", "consume", "produce", "list", "read"]
 
 export function ConnectorCreatePage() {
-  const router = useRouter()
   const [step, setStep] = React.useState(0)
   const [name, setName] = React.useState("")
   const [type, setType] = React.useState(TYPES[0])
   const [direction, setDirection] = React.useState<Connector["direction"]>("source")
   const [host, setHost] = React.useState("")
-  const [secretRef, setSecretRef] = React.useState("vault://connectors/")
-  const [tested, setTested] = React.useState(false)
+  const [secretRef, setSecretRef] = React.useState("")
   const [capabilities, setCapabilities] = React.useState<string[]>(["schema discovery"])
   const [environment, setEnvironment] = React.useState("production")
   const [tenant, setTenant] = React.useState("Nusantara Finance")
-  const [residency, setResidency] = React.useState("Jakarta (ID)")
+  const [residency, setResidency] = React.useState("")
+  const [createdId, setCreatedId] = React.useState<string | null>(null)
   const create = useServiceAction((signal, input: Parameters<typeof connectorService.createConnector>[0]) =>
     connectorService.createConnector(input, signal)
   )
+  // The real probe (POST /api/connectors/{id}/test) needs a connector id, so
+  // it can only run after `create` succeeds — never before, as a mock step
+  // used to imply.
+  const test = useServiceAction((signal, id: string) => connectorService.testConnection(id, signal))
 
   const canProceed =
     (step === 0 && Boolean(name.trim() && type)) ||
     (step === 1 && Boolean(host.trim() && secretRef.trim())) ||
-    (step === 2 && tested) ||
-    (step === 3 && capabilities.length > 0) ||
-    (step === 4 && Boolean(environment.trim() && tenant.trim() && residency.trim())) ||
-    step === 5
+    (step === 2 && capabilities.length > 0) ||
+    (step === 3 && Boolean(environment.trim() && tenant.trim() && residency.trim())) ||
+    step === 4
 
   async function handleSubmit() {
     const result = await create.run({
@@ -63,14 +65,78 @@ export function ConnectorCreatePage() {
       residency: residency.trim(),
       capabilities,
     })
-    if (result) router.push("/connectors")
+    if (result) {
+      setCreatedId(result.id)
+      await test.run(result.id)
+    }
+  }
+
+  // Creation succeeded: show the real test outcome instead of redirecting
+  // past it. `createdId` only gets set once `create.run` returns a
+  // connector, so this branch never claims a test happened before creation.
+  if (createdId) {
+    return (
+      <div className="flex flex-col gap-4">
+        <PageHeader
+          title="New Connector"
+          description="Configure a source or sink with discovery and residency scope, then verify connectivity."
+          actions={
+            <Button variant="outline" size="sm" render={<Link href="/connectors" />}>
+              View connectors
+            </Button>
+          }
+        />
+        <SectionCard
+          title="Connector created"
+          description={`"${name.trim()}" was created. Here is the result of the connection test.`}
+        >
+          <div className="space-y-3">
+            {test.status === "pending" ? (
+              <p className="text-sm text-muted-foreground">Testing connection…</p>
+            ) : test.status === "error" ? (
+              <ErrorState error={test.error} onRetry={() => test.run(createdId)} />
+            ) : test.data ? (
+              <p
+                className={
+                  !test.data.supported
+                    ? "text-sm text-muted-foreground"
+                    : test.data.ok
+                      ? "text-sm text-emerald-600 dark:text-emerald-400"
+                      : "text-sm text-destructive"
+                }
+              >
+                {!test.data.supported
+                  ? `This connector type cannot be tested yet · ${test.data.message}`
+                  : test.data.ok
+                    ? `Connection test passed · ${test.data.message}`
+                    : `Connection test failed · ${test.data.message}`}
+              </p>
+            ) : null}
+            <div className="flex flex-wrap gap-2">
+              <Button size="sm" render={<Link href="/connectors" />}>
+                View connectors
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={test.status === "pending"}
+                onClick={() => test.run(createdId)}
+              >
+                Run test again
+              </Button>
+            </div>
+          </div>
+        </SectionCard>
+      </div>
+    )
   }
 
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
         title="New Connector"
-        description="Configure a source or sink with test, discovery, and residency scope."
+        description="Configure a source or sink with discovery and residency scope, then verify connectivity."
         actions={
           <Button variant="outline" size="sm" render={<Link href="/connectors" />}>
             Cancel
@@ -124,7 +190,7 @@ export function ConnectorCreatePage() {
               <Input
                 value={secretRef}
                 onChange={(e) => setSecretRef(e.target.value)}
-                placeholder="vault://connectors/pg-core"
+                placeholder="env:CONNECTOR_PG_PASSWORD"
               />
             </Field>
             <p className="text-xs text-muted-foreground">
@@ -133,21 +199,6 @@ export function ConnectorCreatePage() {
           </div>
         ) : null}
         {step === 2 ? (
-          <div className="space-y-3">
-            <p className="text-sm text-muted-foreground">
-              Run a mock connectivity and authentication check against {host || "the endpoint"}.
-            </p>
-            <Button
-              type="button"
-              size="sm"
-              variant={tested ? "secondary" : "default"}
-              onClick={() => setTested(true)}
-            >
-              {tested ? "Test passed" : "Test connection"}
-            </Button>
-          </div>
-        ) : null}
-        {step === 3 ? (
           <div className="space-y-2">
             <p className="text-sm font-medium">Capabilities</p>
             <div className="flex flex-wrap gap-2">
@@ -176,7 +227,7 @@ export function ConnectorCreatePage() {
             </div>
           </div>
         ) : null}
-        {step === 4 ? (
+        {step === 3 ? (
           <div className="grid gap-3 sm:grid-cols-2">
             <Field label="Environment">
               <Input value={environment} onChange={(e) => setEnvironment(e.target.value)} />
@@ -189,7 +240,7 @@ export function ConnectorCreatePage() {
             </Field>
           </div>
         ) : null}
-        {step === 5 ? (
+        {step === 4 ? (
           <FormReviewSummary
             sections={[
               {
