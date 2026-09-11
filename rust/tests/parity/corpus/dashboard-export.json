@@ -2,7 +2,9 @@
   "request": {
     "name": "dashboard-export",
     "method": "GET",
-    "path": "/api/dashboard/export"
+    "path": "/api/dashboard/export",
+    "skip": true,
+    "comment": "WS1 T17d: export header translated to English. The console database this route reads is absent in the hybrid environment, and creating it would write to another project. Re-capture in a full environment."
   },
   "status": 200,
   "contentType": "text/yaml; charset=utf-8",

@@ -2,7 +2,9 @@
   "request": {
     "name": "overview-get",
     "method": "GET",
-    "path": "/api/overview"
+    "path": "/api/overview",
+    "skip": true,
+    "comment": "WS1 T7: tiles -> null, incidents removed. The hybrid re-capture's read-only ClickHouse user cannot read system.parts/system.query_log this route queries. Re-capture in a full environment."
   },
   "status": 200,
   "contentType": "application/json;charset=utf-8",
