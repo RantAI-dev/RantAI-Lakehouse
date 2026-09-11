@@ -79,6 +79,25 @@ jobs:
       - name: Check for bare count() against Bronze Iceberg tables
         run: python3 ops/lint/check_bare_iceberg_count.py
 
+  compose-init-readiness:
+    name: WS0 · compose init containers probe TCP and retry
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # WS0 items 8-9: the postgres healthcheck must probe TCP (not the
+      # image's temporary init-phase Unix-socket-only server), and
+      # openfga-db-init must retry its CREATE DATABASE instead of
+      # failing outright on a transient race. See
+      # ops/lint/check_compose_init_readiness.py for exactly what this
+      # does and does not cover — it is a static check on the checked-in
+      # YAML, not a substitute for the `docker compose up` proof in this
+      # task's own commit body.
+      - name: Check compose init-container readiness
+        run: python3 ops/lint/check_compose_init_readiness.py
+
   dagster-intra-package-imports:
     name: Dagster · intra-package imports resolve
     runs-on: ubuntu-latest
