@@ -63,6 +63,7 @@
 pub mod bronze;
 pub mod catalog;
 pub mod gold;
+pub mod rest;
 pub mod storage;
 
 pub use catalog::{BronzeTable, GoldTable, IcebergClient, IcebergClientConfig, IcebergError};

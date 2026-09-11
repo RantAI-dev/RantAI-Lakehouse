@@ -36,6 +36,10 @@ url = "2"
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 reqwest = { workspace = true }
+# rest.rs's wiremock tests exercise a real HTTP round trip against a fake
+# Lakekeeper — see nine other crates (e.g. `lakehouse-clickhouse`) that
+# already pin this workspace version the same way.
+wiremock = { workspace = true }
 
 [lints]
 workspace = true
