@@ -4,33 +4,34 @@ import type {
   Severity,
   StorageTier,
 } from "@/lib/status"
+import type { Measured } from "@/lib/measured"
 
-/** Executive-operational summary shown on the Overview page. */
+/**
+ * Executive-operational summary shown on the Overview page.
+ *
+ * WS1 task 1.8: most fields below became `Measured` because nothing in the
+ * API measures them yet (schedule lateness, cache-hit rate, the policy
+ * engine, Postgres-backed approvals, agent-run accounting, service probes —
+ * owned by WS5/WS7). `streaming` and `incidents` were dropped rather than
+ * nulled: neither was ever measured, and the incidents list had no consumer
+ * beyond the now-removed incidents card.
+ */
 export type OverviewSummary = {
   assetsTotal: number
   staleAssets: number
-  assetsByTier: Record<StorageTier, { count: number; bytes: number }>
-  pipelines: { active: number; failed: number; delayed: number }
+  assetsByTier: Record<StorageTier, { count: Measured; bytes: Measured }>
+  pipelines: { active: number; failed: number; delayed: Measured }
   queries: {
     volume24h: number
     p95Ms: number
     failureRate: number
-    cacheAssistRate: number
+    cacheAssistRate: Measured
     scannedBytes24h: number
   }
-  policyViolations7d: number
-  pendingApprovals: number
-  agents: { activeRuns: number; budgetUsedRate: number }
-  services: { healthy: number; degraded: number; unhealthy: number }
-  incidents: OverviewIncident[]
-}
-
-export type OverviewIncident = {
-  id: string
-  title: string
-  severity: Severity
-  source: string
-  at: string
+  policyViolations7d: Measured
+  pendingApprovals: Measured
+  agents: { activeRuns: Measured; budgetUsedRate: Measured }
+  services: { healthy: Measured; degraded: Measured; unhealthy: Measured }
 }
 
 export type ActivityCategory =

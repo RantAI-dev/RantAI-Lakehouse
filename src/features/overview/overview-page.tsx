@@ -9,7 +9,7 @@ import {
   MetricSkeleton,
 } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
-import { SeverityBadge, TierBadge } from "@/components/patterns/status-badge"
+import { TierBadge } from "@/components/patterns/status-badge"
 import { useService } from "@/hooks/use-service"
 import {
   formatBytes,
@@ -17,6 +17,7 @@ import {
   formatPercent,
   formatRelativeTime,
 } from "@/lib/format"
+import { fmtMeasured } from "@/lib/measured"
 import { STORAGE_TIER_LABEL, type StorageTier } from "@/lib/status"
 import { overviewService } from "@/services"
 
@@ -51,12 +52,12 @@ export function OverviewPage() {
             <MetricCard
               label="Pipelines"
               value={summary.data.pipelines.active}
-              hint={`${summary.data.pipelines.failed} failed · ${summary.data.pipelines.delayed} delayed`}
+              hint={`${summary.data.pipelines.failed} failed · ${fmtMeasured(summary.data.pipelines.delayed)} delayed`}
             />
             <MetricCard
               label="Query volume (24h)"
               value={formatCompactNumber(summary.data.queries.volume24h)}
-              hint={`p95 ${summary.data.queries.p95Ms} ms · cache ${formatPercent(summary.data.queries.cacheAssistRate)}`}
+              hint={`p95 ${summary.data.queries.p95Ms} ms · cache ${fmtMeasured(summary.data.queries.cacheAssistRate, formatPercent)}`}
             />
           </MetricGrid>
           <MetricGrid className="lg:grid-cols-4">
@@ -68,17 +69,23 @@ export function OverviewPage() {
             />
             <MetricCard
               label="Policy violations (7d)"
-              value={summary.data.policyViolations7d}
-              trendTone={summary.data.policyViolations7d > 0 ? "negative" : "positive"}
+              value={fmtMeasured(summary.data.policyViolations7d)}
+              trendTone={
+                summary.data.policyViolations7d === null
+                  ? "neutral"
+                  : summary.data.policyViolations7d > 0
+                    ? "negative"
+                    : "positive"
+              }
             />
             <MetricCard
               label="Pending approvals"
-              value={summary.data.pendingApprovals}
+              value={fmtMeasured(summary.data.pendingApprovals)}
             />
             <MetricCard
               label="Agent runs"
-              value={summary.data.agents.activeRuns}
-              hint={`${formatPercent(summary.data.agents.budgetUsedRate)} budget used`}
+              value={fmtMeasured(summary.data.agents.activeRuns)}
+              hint={`${fmtMeasured(summary.data.agents.budgetUsedRate, formatPercent)} budget used`}
             />
           </MetricGrid>
 
@@ -98,11 +105,11 @@ export function OverviewPage() {
                     <div className="flex items-center justify-between gap-2">
                       <TierBadge tier={tier} />
                       <span className="text-xs text-muted-foreground">
-                        {t.count} assets
+                        {fmtMeasured(t.count)} assets
                       </span>
                     </div>
                     <p className="mt-2 text-lg font-semibold tabular-nums">
-                      {formatBytes(t.bytes)}
+                      {fmtMeasured(t.bytes, formatBytes)}
                     </p>
                     <p className="text-xs text-muted-foreground">
                       {STORAGE_TIER_LABEL[tier]} tier
@@ -113,60 +120,25 @@ export function OverviewPage() {
             </div>
           </SectionCard>
 
-          <div className="grid gap-4 lg:grid-cols-2">
-            <SectionCard
-              title="Service health"
-              description="Access layer, stores, and retrieval planes."
-            >
-              <div className="flex flex-wrap gap-3 text-sm">
-                <span className="text-emerald-600 dark:text-emerald-400">
-                  {summary.data.services.healthy} healthy
-                </span>
-                <span className="text-amber-600 dark:text-amber-400">
-                  {summary.data.services.degraded} degraded
-                </span>
-                <span className="text-destructive">
-                  {summary.data.services.unhealthy} unhealthy
-                </span>
-                <Link href="/services" className="ml-auto text-primary hover:underline">
-                  View services
-                </Link>
-              </div>
-            </SectionCard>
-            <SectionCard
-              title="Recent incidents"
-              action={
-                <Link href="/alerts" className="text-sm text-primary hover:underline">
-                  View alerts
-                </Link>
-              }
-            >
-              {summary.data.incidents.length === 0 ? (
-                <p className="text-sm text-muted-foreground">
-                  No open incidents right now.
-                </p>
-              ) : (
-                <ul className="space-y-1">
-                  {summary.data.incidents.map((inc) => (
-                    <li key={inc.id}>
-                      <Link
-                        href="/alerts"
-                        className="-mx-2 flex items-start gap-2 rounded-md px-2 py-1.5 text-sm transition-colors hover:bg-muted/40"
-                      >
-                        <SeverityBadge severity={inc.severity} />
-                        <span className="min-w-0">
-                          <span className="block font-medium">{inc.title}</span>
-                          <span className="block text-xs text-muted-foreground">
-                            {inc.source} · {formatRelativeTime(inc.at)}
-                          </span>
-                        </span>
-                      </Link>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </SectionCard>
-          </div>
+          <SectionCard
+            title="Service health"
+            description="Access layer, stores, and retrieval planes."
+          >
+            <div className="flex flex-wrap gap-3 text-sm">
+              <span className="text-emerald-600 dark:text-emerald-400">
+                {fmtMeasured(summary.data.services.healthy)} healthy
+              </span>
+              <span className="text-amber-600 dark:text-amber-400">
+                {fmtMeasured(summary.data.services.degraded)} degraded
+              </span>
+              <span className="text-destructive">
+                {fmtMeasured(summary.data.services.unhealthy)} unhealthy
+              </span>
+              <Link href="/services" className="ml-auto text-primary hover:underline">
+                View services
+              </Link>
+            </div>
+          </SectionCard>
         </>
       ) : null}
 

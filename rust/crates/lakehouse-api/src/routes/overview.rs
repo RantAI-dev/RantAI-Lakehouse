@@ -67,9 +67,13 @@ async fn get_body(ch: &ChClient, dagster: &DgClient) -> Result<Value, OverviewEr
             None,
         )
         .await?;
+    // WS1 task 1.8: only `assets` (the tier's dataset count) is read here.
+    // A `rows` column used to feed `warm.bytes` via an invented
+    // rows-times-220-bytes constant; that estimate is gone (see below), so
+    // the column that only fed it is gone too.
     let warm_row = ch
         .rows(
-            "SELECT toString(sum(total)) rows, toString(count()) assets FROM (SELECT total FROM lake.`bronze_meta.dataset_sync` UNION ALL SELECT total FROM lake.`bronze_meta_sec.dataset_sync`)",
+            "SELECT toString(count()) assets FROM (SELECT total FROM lake.`bronze_meta.dataset_sync` UNION ALL SELECT total FROM lake.`bronze_meta_sec.dataset_sync`)",
             None,
         )
         .await?;
@@ -103,32 +107,60 @@ async fn get_body(ch: &ChClient, dagster: &DgClient) -> Result<Value, OverviewEr
     let hot_row = hot_row.first();
     let warm_row = warm_row.first();
     let q_row = q_row.first();
-    let warm_rows = num_or_zero(warm_row, "rows");
 
-    Ok(json!({
+    Ok(summary_json(
+        assets_row, hot_row, warm_row, q_row, active, failed,
+    ))
+}
+
+/// Builds the `GET /api/overview` summary body from already-fetched rows and
+/// counts. Pulled out of `get_body` so the JSON shape — in particular which
+/// fields are real measurements versus `null` — is assertable without a
+/// `ClickHouse`/`Dagster` connection.
+///
+/// WS1 task 1.8: `pipelines.delayed`, `queries.cacheAssistRate`,
+/// `policyViolations7d`, `pendingApprovals`, `agents.*`,
+/// `services.healthy/degraded/unhealthy`, and the `cold`/`ai` tiers are
+/// `null` because nothing in this route measures them today — no lateness
+/// computation, no cache-hit signal, no policy engine, no Postgres pool for
+/// approvals, no agent-run accounting, and no service probes. `warm.bytes`
+/// is `null` because `rows * 220` was an invented per-row byte size, not a
+/// measurement. WS5 is expected to wire up schedule lateness, approvals, and
+/// service probes; WS7 owns the policy engine and agent budgets. The
+/// `streaming` and `incidents` structures are dropped entirely (not
+/// nulled): neither was ever measured, and — apart from the incidents
+/// card, removed alongside this — nothing in the `TypeScript` client reads
+/// either one.
+fn summary_json(
+    assets_row: Option<&serde_json::Map<String, Value>>,
+    hot_row: Option<&serde_json::Map<String, Value>>,
+    warm_row: Option<&serde_json::Map<String, Value>>,
+    q_row: Option<&serde_json::Map<String, Value>>,
+    active: usize,
+    failed: usize,
+) -> Value {
+    json!({
         "assetsTotal": num_or_zero(assets_row, "n"),
         "staleAssets": num_or_zero(assets_row, "stale"),
         "assetsByTier": {
             "hot": { "count": num_or_zero(hot_row, "assets"), "bytes": num_or_zero(hot_row, "bytes") },
-            "warm": { "count": num_or_zero(warm_row, "assets"), "bytes": warm_rows * 220 },
-            "cold": { "count": 0, "bytes": 0 },
-            "ai": { "count": 0, "bytes": 0 },
+            "warm": { "count": num_or_zero(warm_row, "assets"), "bytes": Value::Null },
+            "cold": { "count": Value::Null, "bytes": Value::Null },
+            "ai": { "count": Value::Null, "bytes": Value::Null },
         },
-        "pipelines": { "active": active, "failed": failed, "delayed": 0 },
-        "streaming": { "jobs": 0, "maxLagSeconds": 0, "unhealthy": 0 },
+        "pipelines": { "active": active, "failed": failed, "delayed": Value::Null },
         "queries": {
             "volume24h": num_or_zero(q_row, "vol"),
             "p95Ms": num_or_zero(q_row, "p95"),
             "failureRate": q_row.and_then(|r| str_col(r, "err").parse::<f64>().ok()).unwrap_or(0.0),
-            "cacheAssistRate": 0,
+            "cacheAssistRate": Value::Null,
             "scannedBytes24h": num_or_zero(q_row, "scan"),
         },
-        "policyViolations7d": 0,
-        "pendingApprovals": 0,
-        "agents": { "activeRuns": 0, "budgetUsedRate": 0 },
-        "services": { "healthy": 4, "degraded": 0, "unhealthy": 0 },
-        "incidents": [],
-    }))
+        "policyViolations7d": Value::Null,
+        "pendingApprovals": Value::Null,
+        "agents": { "activeRuns": Value::Null, "budgetUsedRate": Value::Null },
+        "services": { "healthy": Value::Null, "degraded": Value::Null, "unhealthy": Value::Null },
+    })
 }
 
 /// `POST /api/overview` — recent activity, sourced entirely from `Dagster`
@@ -282,5 +314,47 @@ mod tests {
         // Sanity bound: some time after this file was written, well before
         // any realistic clock error.
         assert!(now_unix_millis() > 1_700_000_000_000.0);
+    }
+
+    #[test]
+    fn overview_reports_every_unmeasured_tile_as_null_and_drops_fabricated_structures() {
+        let v = summary_json(None, None, None, None, 0, 0);
+
+        assert!(
+            v["assetsByTier"]["warm"]["bytes"].is_null(),
+            "rows * 220 is not a measurement"
+        );
+        for tier in ["cold", "ai"] {
+            assert!(v["assetsByTier"][tier]["count"].is_null());
+            assert!(v["assetsByTier"][tier]["bytes"].is_null());
+        }
+        assert!(v["pipelines"]["delayed"].is_null());
+        assert!(v["queries"]["cacheAssistRate"].is_null());
+        assert!(v["policyViolations7d"].is_null());
+        assert!(
+            v["pendingApprovals"].is_null(),
+            "0 is false whenever approvals are waiting"
+        );
+        assert!(v["agents"]["activeRuns"].is_null());
+        assert!(v["agents"]["budgetUsedRate"].is_null());
+        for k in ["healthy", "degraded", "unhealthy"] {
+            assert!(
+                v["services"][k].is_null(),
+                "services.{k} was a guessed literal"
+            );
+        }
+        assert!(
+            v.get("streaming").is_none(),
+            "streaming is removed, not nulled"
+        );
+        assert!(
+            v.get("incidents").is_none(),
+            "incidents is removed, not nulled"
+        );
+        // Real values survive.
+        assert!(!v["assetsTotal"].is_null());
+        assert!(!v["assetsByTier"]["hot"]["bytes"].is_null());
+        assert!(!v["assetsByTier"]["warm"]["count"].is_null());
+        assert!(!v["pipelines"]["failed"].is_null());
     }
 }
