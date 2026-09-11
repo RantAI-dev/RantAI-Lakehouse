@@ -17,13 +17,7 @@
     "comment": "WS1 T7: tiles -> null, incidents removed. The hybrid re-capture's read-only ClickHouse user cannot read system.parts/system.query_log this route queries. Re-capture in a full environment.",
     "skip": true
   },
-  {
-    "name": "overview-refresh",
-    "method": "POST",
-    "path": "/api/overview",
-    "comment": "WS1 T7 changed only GET /api/overview's tiles; this POST route's activity list (sourced entirely from Dagster run history) is unaffected. The hybrid re-capture could not produce it because that environment's Dagster location defines a different, smaller job roster than the one the corpus was captured against -- a data-source mismatch, not a ClickHouse system-table restriction and not a WS1 change. Re-capture in a full environment.",
-    "skip": true
-  },
+  { "name": "overview-refresh",         "method": "POST", "path": "/api/overview" },
 
   { "name": "storage-get",              "method": "GET",  "path": "/api/storage" },
 
