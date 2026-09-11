@@ -23,6 +23,15 @@
 //! nothing distinct to measure yet. This will need revisiting the day a
 //! real cold tier (e.g. an Iceberg lifecycle/archival policy, or a genuinely
 //! separate object-storage class) exists.
+//!
+//! # Deprecated
+//!
+//! `WS1` task 1.3 removed the console's Storage tiering page: its tier
+//! assignments were not computed by the backend and its "Restore to Hot"
+//! action always submitted one hardcoded, fictitious asset. `WS2` replaces
+//! this surface with `/api/lakehouse/capacity`, read from `Lakekeeper` and
+//! `RustFS`. These routes stay registered and `POLICY_TABLE`-classified until
+//! then so no client breaks; nothing in the console calls them.
 
 use axum::body::Bytes;
 use axum::extract::State;

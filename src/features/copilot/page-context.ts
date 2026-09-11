@@ -53,7 +53,7 @@ const MAP: { test: (p: string) => boolean; ctx: PageContext }[] = [
     },
   },
   {
-    test: (p) => p.startsWith("/data") || p.startsWith("/catalog") || p.startsWith("/storage"),
+    test: (p) => p.startsWith("/data") || p.startsWith("/catalog"),
     ctx: {
       key: "data",
       title: "Explore or build data",
@@ -62,7 +62,7 @@ const MAP: { test: (p: string) => boolean; ctx: PageContext }[] = [
         ask: ["What datasets are about halal?", "Describe the wisman dataset", "Show data lineage of visitors by country"],
         build: ["Refresh the lakehouse (Bronze→Silver→Gold)", "Check the latest build status"],
       },
-      system: "The user is exploring Data / Catalog / Storage. Help them query, describe datasets, inspect lineage/quality, or build/refresh data.",
+      system: "The user is exploring Data / Catalog. Help them query, describe datasets, inspect lineage/quality, or build/refresh data.",
     },
   },
   {

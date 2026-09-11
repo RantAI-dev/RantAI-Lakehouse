@@ -13,7 +13,6 @@ import {
   FileText,
   GitBranch,
   Globe2,
-  HardDrive,
   History,
   KeyRound,
   Layers,
@@ -61,7 +60,7 @@ export type NavGroup = {
  *
  * Grouping rationale:
  * - Overview: monitor the whole platform (dashboard, feed, alerts).
- * - Data: where data lives (explore, catalog, lifecycle, ingress).
+ * - Data: where data lives (explore, catalog, ingress).
  * - Build: author and operate data movement and queries.
  * - Intelligence: knowledge flow — sources → indexing → retrieval → agents.
  * - Governance: control and evidence.
@@ -98,7 +97,6 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [
       { title: "Data Explorer", href: "/data", icon: Database },
       { title: "Catalog", href: "/catalog", icon: Library },
-      { title: "Storage Lifecycle", href: "/storage", icon: HardDrive },
       { title: "Connectors", href: "/connectors", icon: Plug, preview: true },
     ],
   },

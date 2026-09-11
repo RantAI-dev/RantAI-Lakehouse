@@ -6,7 +6,6 @@ import { mockAssetService } from "./mock/assets"
 import { clickhouseQueryService } from "./clients/queries"
 import { clickhouseAssetService } from "./clients/assets"
 import { dagsterPipelineService } from "./clients/pipelines"
-import { clickhouseStorageService } from "./clients/storage"
 import { clickhouseOpsService } from "./clients/ops"
 import { clickhouseOverviewService } from "./clients/overview"
 import { clickhouseGovernanceService } from "./clients/governance"
@@ -55,7 +54,3 @@ export const identityService = postgresIdentityService
 // `rust/crates/lakehouse-store/src/connectors.rs` untuk catatan keputusan.
 // mock/connectors.ts sudah dihapus.
 export const connectorService = postgresConnectorService
-// Storage kini NYATA sepenuhnya — overview dari ClickHouse/Iceberg,
-// policies/operations/restore dari Postgres (Task 2.6). mock/storage.ts
-// sudah dihapus.
-export const storageService = clickhouseStorageService

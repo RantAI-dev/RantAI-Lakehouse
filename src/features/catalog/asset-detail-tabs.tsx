@@ -206,9 +206,6 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
           >
             Open lineage graph
           </Button>
-          <Button size="sm" variant="ghost" render={<Link href="/storage" />}>
-            Storage lifecycle
-          </Button>
           <Button size="sm" variant="ghost" render={<Link href="/query-studio" />}>
             Query this asset
           </Button>
