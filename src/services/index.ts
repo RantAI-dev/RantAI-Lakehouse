@@ -13,6 +13,7 @@ import { postgresIdentityService } from "./clients/identity"
 import { postgresConnectorService } from "./clients/connectors"
 import { postgresAgentService } from "./clients/agents"
 import { clickhouseAlertRuleService } from "./clients/alerts"
+import { icebergLakehouseService } from "./clients/lakehouse"
 
 // Overview is now fully real — summary/activity from ClickHouse+Dagster,
 // alerts (list/ack/resolve) from Postgres (Task 2.6). mock/overview.ts
@@ -54,3 +55,6 @@ export const connectorService = postgresConnectorService
 // service; the feature previously fetched `/api/alerts` directly with no
 // `res.ok` check.
 export const alertRuleService = clickhouseAlertRuleService
+// Lakehouse (WS2 §4) — the read-only Iceberg warehouse/namespace/table
+// surface over `/api/lakehouse/*`. No mock ever existed for this service.
+export const lakehouseService = icebergLakehouseService

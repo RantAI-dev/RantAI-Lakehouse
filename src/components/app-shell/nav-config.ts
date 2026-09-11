@@ -15,6 +15,7 @@ import {
   History,
   KeyRound,
   LayoutDashboard,
+  Layers,
   Library,
   ListChecks,
   Plug,
@@ -89,6 +90,11 @@ export const NAV_GROUPS: NavGroup[] = [
       { title: "Catalog", href: "/catalog", icon: Library },
       { title: "Connectors", href: "/connectors", icon: Plug },
     ],
+  },
+  {
+    label: "Lakehouse",
+    icon: Layers,
+    items: [{ title: "Tables", href: "/lakehouse/tables", icon: Layers }],
   },
   {
     label: "Build",

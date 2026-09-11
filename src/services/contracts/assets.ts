@@ -85,6 +85,15 @@ export type AssetDetail = Asset & {
    * fixture `src/services/mock/assets.ts` still sets it.
    */
   lifecyclePolicy?: string
+  /**
+   * WS2 §4 — the registry's own `table_name` for a Bronze asset, used to
+   * try loading Iceberg snapshots for it (see `isIcebergCandidate` in
+   * `@/lib/lakehouse-view`). The real API always sends this field (a
+   * `string` or `null`) on the Bronze detail route; it is optional here
+   * only because the dead in-browser fixture `src/services/mock/assets.ts`
+   * does not set it. Consumers must treat `undefined` exactly like `null`.
+   */
+  tableName?: string | null
 }
 
 export type AssetFilter = {

@@ -1,7 +1,7 @@
 "use client"
 
 import Link from "next/link"
-import { EmptyState } from "@/components/patterns/page-states"
+import { EmptyState, ErrorState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { CheckBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
@@ -14,11 +14,59 @@ import {
   TableRow,
 } from "@/components/ui/table"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { useService } from "@/hooks/use-service"
 import { formatCompactNumber, formatRelativeTime } from "@/lib/format"
+import {
+  isIcebergCandidate,
+  snapshotRelativeTime,
+  snapshotsNewestFirst,
+} from "@/lib/lakehouse-view"
+import { fmtMeasured } from "@/lib/measured"
+import { lakehouseService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 
 function QuietEmpty({ title }: { title: string }) {
   return <EmptyState title={title} className="py-4" />
+}
+
+/**
+ * Iceberg snapshots for a Bronze asset whose registry `tableName` may or
+ * may not name a real Bronze Iceberg table (see the WS2 A4 module comment
+ * above `iceberg_candidates` in `catalog.rs`). A `not_found` result means
+ * this asset's `tableName` does not exist in the `bronze` namespace — a
+ * quiet empty state, not an error. A separate child component, because
+ * `useService` cannot be called conditionally in the parent.
+ */
+function IcebergSnapshots({ tableName }: { tableName: string }) {
+  const state = useService(
+    (s) => lakehouseService.getTableDetail("bronze", tableName, s),
+    [tableName]
+  )
+
+  if (state.status === "loading") return <QuietEmpty title="Loading snapshots…" />
+  if (state.status === "error") {
+    if (state.error.code === "not_found") {
+      return <QuietEmpty title="No Iceberg table for this asset" />
+    }
+    return <ErrorState error={state.error} onRetry={state.reload} />
+  }
+
+  const snapshots = snapshotsNewestFirst(state.data.snapshots)
+  if (snapshots.length === 0) return <QuietEmpty title="No snapshots for this asset" />
+
+  return (
+    <ul className="divide-y divide-border text-sm">
+      {snapshots.map((s) => (
+        <li key={s.id} className="flex justify-between gap-2 py-1.5">
+          <span>{s.operation}</span>
+          <span className="text-muted-foreground">
+            {snapshotRelativeTime(s.timestampMs)} ·{" "}
+            {fmtMeasured(s.summary.totalRecords, formatCompactNumber)} records
+          </span>
+        </li>
+      ))}
+    </ul>
+  )
 }
 
 function dependentHref(id: string, kind: string) {
@@ -300,7 +348,9 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
 
       <TabsContent value="snapshots" className="mt-2">
         <SectionCard size="sm" title="Snapshots / time travel">
-          {a.snapshots.length === 0 ? (
+          {isIcebergCandidate(a) && typeof a.tableName === "string" ? (
+            <IcebergSnapshots tableName={a.tableName} />
+          ) : a.snapshots.length === 0 ? (
             <QuietEmpty title="No snapshots for this asset" />
           ) : (
             <ul className="divide-y divide-border text-sm">
