@@ -2,7 +2,7 @@
 //! `services`.
 //!
 //! Ports `src/app/api/ops/[kind]/route.ts`. An unrecognized `kind` returns
-//! HTTP 400 with `{"error": "kind tak dikenal: <kind>"}`, verified against
+//! HTTP 400 with `{"error": "unknown kind: <kind>"}`, verified against
 //! `ops-unknown-kind.json` in the parity corpus.
 //!
 //! `usage` was cut in WS1: storage-by-tier used an invented
@@ -64,7 +64,7 @@ pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Res
     match Kind::parse(&kind) {
         Kind::Unknown => (
             StatusCode::BAD_REQUEST,
-            ApiJson(json!({ "error": format!("kind tak dikenal: {kind}") })),
+            ApiJson(json!({ "error": format!("unknown kind: {kind}") })),
         )
             .into_response(),
         parsed => match run(&state, parsed).await {

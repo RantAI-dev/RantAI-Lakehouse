@@ -239,7 +239,7 @@ pub async fn deliver(
             // difference left to reproduce.
             email.send(target, title, &html).await
         }
-        other => DeliverResult::err(format!("channel tak dikenal: {other}")),
+        other => DeliverResult::err(format!("unknown channel: {other}")),
     }
 }
 
@@ -386,7 +386,7 @@ mod tests {
         let result = deliver(&http, &email, "carrier-pigeon", "target", "t", "x").await;
         assert_eq!(
             result,
-            DeliverResult::err("channel tak dikenal: carrier-pigeon")
+            DeliverResult::err("unknown channel: carrier-pigeon")
         );
     }
 }

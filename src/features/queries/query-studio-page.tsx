@@ -135,7 +135,7 @@ export function QueryStudioPage() {
                 <SectionCard title="Jawaban agent">
                   <p className="text-sm">{agentResult.answer}</p>
                   <p className="mt-2 text-xs text-muted-foreground">
-                    {agentResult.rowCount} baris · SQL final dimuat ke editor.
+                    {agentResult.rowCount} rows · final SQL loaded into the editor.
                   </p>
                   <details className="mt-3">
                     <summary className="cursor-pointer text-xs font-medium text-muted-foreground">

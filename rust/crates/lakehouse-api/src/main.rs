@@ -446,7 +446,7 @@ mod tests {
     /// `/api/governance/{kind}` capture, so a request for `lineage` reaches
     /// [`routes::governance::lineage`] and never the `{kind}` dispatch
     /// (which would otherwise treat `"lineage"` as an unrecognized kind and
-    /// reply `400 {"error": "kind tak dikenal: lineage"}`).
+    /// reply `400 {"error": "unknown kind: lineage"}`).
     ///
     /// This holds regardless of `ClickHouse` availability: the `{kind}`
     /// dispatch's unknown-kind branch never touches the network and always
@@ -644,7 +644,7 @@ mod tests {
         let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let text = String::from_utf8_lossy(&bytes);
         assert!(
-            !text.contains("kind tak dikenal"),
+            !text.contains("unknown kind"),
             "lineage route fell through to the {{kind}} dispatch: {text}"
         );
     }

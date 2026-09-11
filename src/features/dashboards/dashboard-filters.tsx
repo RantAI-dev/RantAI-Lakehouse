@@ -84,7 +84,7 @@ export function DashboardFilters({
           </button>
           {editing === "__add__" ? (
             <div className="absolute left-0 top-full z-20 mt-1 w-44 rounded-lg border border-border bg-card p-1 shadow-xl">
-              <p className="px-2 py-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Kolom</p>
+              <p className="px-2 py-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Column</p>
               {available.map((c) => (
                 <button key={c} onClick={() => void openColumn(c)} className="block w-full rounded-md px-2 py-1.5 text-left text-sm hover:bg-muted">{c}</button>
               ))}

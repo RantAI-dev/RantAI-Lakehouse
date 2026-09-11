@@ -194,7 +194,7 @@ async fn quality(ch: &ChClient, pg: Option<&PgPool>) -> Result<Value, GovError> 
             let verdict = str_col(r, "verdict");
             let at = str_col(r, "at");
             let (name, dimension) = if let Some(col) = cek.strip_prefix("null_rate:") {
-                (format!("Konversi kolom {col}"), "validity")
+                (format!("Column conversion {col}"), "validity")
             } else if cek == "row_count" {
                 (cek.to_owned(), "completeness")
             } else {

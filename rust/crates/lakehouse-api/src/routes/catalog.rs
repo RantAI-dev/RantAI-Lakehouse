@@ -395,7 +395,7 @@ async fn clickhouse_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response>
     );
     let rows = match ch.rows(&rows_sql, None).await {
         Ok(rr) => num_or_zero(rr.first(), "r"),
-        Err(_) => 0, // "view: tak ada parts" — swallowed in the TypeScript too.
+        Err(_) => 0, // "view: no parts" — swallowed in the TypeScript too.
     };
 
     let body = clickhouse_detail_body(id, &table, &db, is_gold, rows, &schema, &sample);
@@ -469,7 +469,7 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
             }
             (sample, type_of)
         }
-        Err(_) => (Vec::new(), Map::new()), // "silver belum ada" — swallowed in the TypeScript too.
+        Err(_) => (Vec::new(), Map::new()), // "silver not yet available" — swallowed in the TypeScript too.
     };
 
     let schema: Vec<Value> = cols

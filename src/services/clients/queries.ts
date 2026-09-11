@@ -34,7 +34,7 @@ function errorFor(status: number, message: string): ServiceError {
 async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
   const res = await apiFetch(url, { signal });
   const json = await res.json().catch(() => null);
-  if (!res.ok) throw errorFor(res.status, json?.error ?? `Query gagal (${res.status})`);
+  if (!res.ok) throw errorFor(res.status, json?.error ?? `Query failed (${res.status})`);
   return json as T;
 }
 
@@ -47,7 +47,7 @@ async function postJson<T>(url: string, sql: string, signal?: AbortSignal): Prom
   });
   const json = await res.json().catch(() => null);
   if (!res.ok) {
-    throw errorFor(res.status, json?.error ?? `Query gagal (${res.status})`);
+    throw errorFor(res.status, json?.error ?? `Query failed (${res.status})`);
   }
   return json as T;
 }

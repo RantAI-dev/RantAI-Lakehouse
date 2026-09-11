@@ -42,7 +42,7 @@ export default function RootLayout({
     >
       <head>
         <meta name="theme-color" content="#050A30" />
-        {/* Favicon ikut skema warna browser: terang=logo navy, gelap=logo putih. */}
+        {/* The favicon follows the browser colour scheme: light = navy logo, dark = white logo. */}
         <link rel="icon" type="image/png" href="/icon-light-32.png" media="(prefers-color-scheme: light)" />
         <link rel="icon" type="image/png" href="/icon-dark-32.png" media="(prefers-color-scheme: dark)" />
         <link rel="apple-touch-icon" href="/apple-touch-icon.png" />

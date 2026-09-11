@@ -696,7 +696,7 @@ pub async fn export(State(state): State<AppState>) -> ApiResult<Response> {
 
     let mut out = String::new();
     out.push_str("# RantAI Lakehouse — dashboard as code\n");
-    out.push_str("# boards & chart specs, diekspor dari console.bi_chart\n\n");
+    out.push_str("# boards & chart specs, exported from console.bi_chart\n\n");
     out.push_str("boards:\n");
     out.push_str(&yaml_board("default", "Main", None));
     for b in &boards {

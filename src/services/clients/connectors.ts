@@ -32,7 +32,7 @@ async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
   const json = await res.json();
   if (!res.ok) {
     const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
-    throw new ServiceError(kind, json?.error ?? `Gagal (${res.status})`);
+    throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`);
   }
   return json as T;
 }
@@ -47,7 +47,7 @@ async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Pr
   const json = await res.json();
   if (!res.ok) {
     const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
-    throw new ServiceError(kind, json?.error ?? `Gagal (${res.status})`);
+    throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`);
   }
   return json as T;
 }
