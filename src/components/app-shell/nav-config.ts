@@ -27,7 +27,6 @@ import {
   Tags,
   Users,
   Waypoints,
-  Workflow,
   Wrench,
   type LucideIcon,
 } from "lucide-react"
@@ -110,11 +109,9 @@ export const NAV_GROUPS: NavGroup[] = [
     label: "Intelligence",
     icon: Bot,
     items: [
-      { title: "Agent Workflows", href: "/agents/workflows", icon: Workflow, preview: true },
       { title: "Digital Employees", href: "/agents/employees", icon: Bot, preview: true },
       { title: "Agent Runs", href: "/agents/runs", icon: History, preview: true },
       { title: "Approvals", href: "/agents/approvals", icon: ClipboardCheck, preview: true },
-      { title: "Tool Registry", href: "/agents/tools", icon: Wrench, preview: true },
     ],
   },
   {

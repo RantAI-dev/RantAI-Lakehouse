@@ -14,6 +14,7 @@ import { AgentRunStatusBadge, ApprovalBadge } from "@/components/patterns/status
 import { Button } from "@/components/ui/button"
 import { useService } from "@/hooks/use-service"
 import { formatCost, formatDateTime, formatRelativeTime } from "@/lib/format"
+import { fmtMeasured } from "@/lib/measured"
 import { agentService } from "@/services"
 
 /**
@@ -109,7 +110,10 @@ export function RunDetailPage() {
                 ? `${formatDateTime(r.endedAt)} (${formatRelativeTime(r.endedAt)})`
                 : "Still running / awaiting a decision",
             },
-            { label: "Budget consumed", value: formatCost(r.budgetConsumed) },
+            {
+              label: "Budget consumed",
+              value: fmtMeasured(r.budgetConsumed, formatCost),
+            },
             {
               label: "Audit event",
               value: r.auditEventId ? (

@@ -20,6 +20,7 @@ import { AgentRunStatusBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { useService } from "@/hooks/use-service"
 import { formatCost, formatRelativeTime } from "@/lib/format"
+import { fmtMeasured } from "@/lib/measured"
 import { AGENT_RUN_STATUS_LABEL, type AgentRunStatus } from "@/lib/status"
 import { agentService } from "@/services"
 import type { AgentRun } from "@/services/contracts/agents"
@@ -57,7 +58,9 @@ const columns: ColumnDef<AgentRun>[] = [
   {
     key: "cost",
     header: "Cost",
-    render: (r) => <span className="tabular-nums">{formatCost(r.budgetConsumed)}</span>,
+    render: (r) => (
+      <span className="tabular-nums">{fmtMeasured(r.budgetConsumed, formatCost)}</span>
+    ),
   },
 ]
 

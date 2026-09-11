@@ -17,6 +17,14 @@
 //! *records* (seeded the same way every other Phase 2 domain seeds its
 //! fixtures) — nothing here launches an agent or a tool. See
 //! `lakehouse_store::agents`'s module doc comment.
+//!
+//! # Console surface removed
+//!
+//! `WS1` task 1.11 removed the Agent Workflows and Tool Registry pages:
+//! nothing executes an authored workflow, and the agent runtime never
+//! reads the tool registry. `/api/agents/workflows` and `/api/agents/tools`
+//! still serve real `Postgres` CRUD, stay registered and
+//! `POLICY_TABLE`-classified, and are left for `WS7` to reuse or retire.
 
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query, State};

@@ -1,15 +1,11 @@
 import type {
   AgentRun,
   AgentService,
-  AgentTool,
-  AgentWorkflow,
   ApprovalItem,
   CreateEmployeeInput,
-  CreateWorkflowInput,
   DecideApprovalInput,
   DecideApprovalResult,
   DigitalEmployee,
-  RegisterToolInput,
   RunEmployeeInput,
 } from "../contracts/agents"
 import { apiFetch } from "../http"
@@ -71,9 +67,6 @@ function post<T>(
 }
 
 export const postgresAgentService: AgentService = {
-  listWorkflows(signal) {
-    return get<AgentWorkflow[]>("/api/agents/workflows", signal, "Daftar workflow gagal dimuat")
-  },
   listEmployees(signal) {
     return get<DigitalEmployee[]>(
       "/api/agents/employees",
@@ -95,9 +88,6 @@ export const postgresAgentService: AgentService = {
   getRun(id, signal) {
     return get<AgentRun>(`/api/agents/runs/${encodeURIComponent(id)}`, signal, "Detail run gagal dimuat")
   },
-  listTools(signal) {
-    return get<AgentTool[]>("/api/agents/tools", signal, "Daftar tools gagal dimuat")
-  },
   listApprovals(employeeId, signal) {
     const qs = employeeId ? `?employeeId=${encodeURIComponent(employeeId)}` : ""
     return get<ApprovalItem[]>(`/api/agents/approvals${qs}`, signal, "Daftar approval gagal dimuat")
@@ -110,9 +100,6 @@ export const postgresAgentService: AgentService = {
       "Memutuskan approval gagal"
     )
   },
-  createWorkflow(input: CreateWorkflowInput, signal) {
-    return post<AgentWorkflow>("/api/agents/workflows", input, signal, "Membuat workflow gagal")
-  },
   createEmployee(input: CreateEmployeeInput, signal) {
     return post<DigitalEmployee>(
       "/api/agents/employees",
@@ -120,9 +107,6 @@ export const postgresAgentService: AgentService = {
       signal,
       "Membuat digital employee gagal"
     )
-  },
-  registerTool(input: RegisterToolInput, signal) {
-    return post<AgentTool>("/api/agents/tools", input, signal, "Mendaftarkan tool gagal")
   },
   suspendEmployee(id, signal) {
     return post<DigitalEmployee>(

@@ -3,7 +3,6 @@ import type {
   Pipeline,
   PipelineRun,
   CreatePipelineInput,
-  GeneratePipelineInput,
 } from "../contracts/pipelines";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
@@ -11,7 +10,7 @@ import { ServiceError } from "../errors";
 /**
  * PipelineService NYATA — job Dagster (orkestrasi lakehouse) lewat route
  * `/api/pipelines`, plus (Task 2.5) pipeline definitions yang diauthor lewat
- * Postgres (`createPipeline`/`generatePipelineFromPrompt`) dan mutation
+ * Postgres (`createPipeline`) dan mutation
  * Dagster nyata untuk cancel/retry/pause/resume. Tidak ada lagi delegasi ke
  * mock — setiap method di sini memanggil backend Rust.
  */
@@ -63,9 +62,6 @@ export const dagsterPipelineService: PipelineService = {
 
   createPipeline(input: CreatePipelineInput, signal) {
     return postJson<Pipeline>("/api/pipelines", input, signal);
-  },
-  generatePipelineFromPrompt(input: GeneratePipelineInput, signal) {
-    return postJson<Pipeline>("/api/pipelines/generate", input, signal);
   },
   cancelRun(runId, signal) {
     return postJson<PipelineRun>(`/api/pipelines/runs/${encodeURIComponent(runId)}/cancel`, undefined, signal);

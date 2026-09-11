@@ -18,6 +18,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatCost, formatPercent } from "@/lib/format"
+import { fmtMeasured } from "@/lib/measured"
 import {
   AUTONOMY_LABEL,
   ENTITY_STATUS_LABEL,
@@ -40,6 +41,15 @@ const columns: ColumnDef<DigitalEmployee>[] = [
   { key: "autonomy", header: "Autonomy", render: (r) => <AutonomyBadge level={r.autonomy} /> },
   { key: "status", header: "Status", render: (r) => <StatusBadge status={r.status} /> },
   { key: "budget", header: "Budget", render: (r) => {
+    // budgetSpent/budgetReserved are unmeasured (WS1 task 1.11) until WS7
+    // tracks spend per tool call — show a dash rather than a false 0/pct.
+    if (r.budgetSpent === null || r.budgetReserved === null) {
+      return (
+        <span className="tabular-nums">
+          — / {formatCost(r.budgetLimit)}
+        </span>
+      )
+    }
     const used = r.budgetSpent + r.budgetReserved
     return (
       <span className="tabular-nums">
@@ -50,8 +60,8 @@ const columns: ColumnDef<DigitalEmployee>[] = [
       </span>
     )
   }},
-  { key: "success", header: "Success", render: (r) => formatPercent(r.successRate) },
-  { key: "approval", header: "Approval rate", render: (r) => formatPercent(r.approvalRate) },
+  { key: "success", header: "Success", render: (r) => fmtMeasured(r.successRate, formatPercent) },
+  { key: "approval", header: "Approval rate", render: (r) => fmtMeasured(r.approvalRate, formatPercent) },
   { key: "owner", header: "Owner", render: (r) => r.owner },
 ]
 

@@ -1,22 +1,11 @@
+import type { Measured } from "@/lib/measured"
 import type {
   AgentRunStatus,
   ApprovalStatus,
   AutonomyLevel,
   EntityStatus,
-  Health,
   RunStepStatus,
 } from "@/lib/status"
-
-export type AgentWorkflow = {
-  id: string
-  name: string
-  status: EntityStatus
-  owner: string
-  trigger: string
-  steps: number
-  lastRunAt: string
-  approvalRequired: boolean
-}
 
 export type DigitalEmployee = {
   id: string
@@ -26,13 +15,19 @@ export type DigitalEmployee = {
   autonomy: AutonomyLevel
   status: EntityStatus
   budgetLimit: number
-  budgetSpent: number
-  budgetReserved: number
   allowedTools: string[]
   dataScope: string
-  approvalRate: number
-  successRate: number
-  recentRuns: number
+  /**
+   * `budgetSpent`, `budgetReserved`, `approvalRate`, `successRate` and
+   * `recentRuns` are null until `WS7` tracks spend per tool call: the
+   * backing Postgres columns exist but nothing ever updates them, so the
+   * API no longer serves their insert-time defaults as measurements.
+   */
+  budgetSpent: Measured
+  budgetReserved: Measured
+  approvalRate: Measured
+  successRate: Measured
+  recentRuns: Measured
   /**
    * The instruction a headless run (`POST
    * /api/agents/employees/{id}/run`) sends to the copilot. `null`/absent
@@ -65,7 +60,11 @@ export type AgentRun = {
   delegatedUser?: string
   startedAt: string
   endedAt?: string
-  budgetConsumed: number
+  /**
+   * Null until `WS7` tracks spend per tool call: `agent_run.budget_consumed`
+   * exists but nothing ever updates it.
+   */
+  budgetConsumed: Measured
   steps: {
     id: string
     label: string
@@ -80,19 +79,6 @@ export type AgentRun = {
 export type RunEmployeeInput = {
   /** Overrides the employee's own `prompt` for this run only. */
   prompt?: string
-}
-
-export type AgentTool = {
-  id: string
-  name: string
-  version: string
-  publisher: string
-  permission: string
-  health: Health
-  approvalStatus: ApprovalStatus
-  deprecated: boolean
-  rateLimit: string
-  usage30d: number
 }
 
 export type ApprovalItem = {
@@ -140,14 +126,6 @@ export type DecideApprovalResult = {
   result?: unknown
 }
 
-export type CreateWorkflowInput = {
-  name: string
-  trigger: string
-  stepKinds: string[]
-  approvalRequired: boolean
-  owner?: string
-}
-
 export type CreateEmployeeInput = {
   name: string
   purpose: string
@@ -158,33 +136,21 @@ export type CreateEmployeeInput = {
   owner?: string
 }
 
-export type RegisterToolInput = {
-  name: string
-  version: string
-  publisher: string
-  permission: string
-  rateLimit: string
-}
-
 export interface AgentService {
-  listWorkflows(signal?: AbortSignal): Promise<AgentWorkflow[]>
   listEmployees(signal?: AbortSignal): Promise<DigitalEmployee[]>
   getEmployee(id: string, signal?: AbortSignal): Promise<DigitalEmployee>
   listRuns(employeeId?: string, signal?: AbortSignal): Promise<AgentRun[]>
   getRun(id: string, signal?: AbortSignal): Promise<AgentRun>
-  listTools(signal?: AbortSignal): Promise<AgentTool[]>
   listApprovals(employeeId?: string, signal?: AbortSignal): Promise<ApprovalItem[]>
   decideApproval(
     id: string,
     input: DecideApprovalInput,
     signal?: AbortSignal
   ): Promise<DecideApprovalResult>
-  createWorkflow(input: CreateWorkflowInput, signal?: AbortSignal): Promise<AgentWorkflow>
   createEmployee(
     input: CreateEmployeeInput,
     signal?: AbortSignal
   ): Promise<DigitalEmployee>
-  registerTool(input: RegisterToolInput, signal?: AbortSignal): Promise<AgentTool>
   suspendEmployee(id: string, signal?: AbortSignal): Promise<DigitalEmployee>
   resumeEmployee(id: string, signal?: AbortSignal): Promise<DigitalEmployee>
   revokeEmployee(id: string, signal?: AbortSignal): Promise<DigitalEmployee>

@@ -772,3 +772,72 @@ async fn create_linked_approval_attaches_to_existing_run_and_real_employee(
     assert_eq!(run.approvals[0].id, approval_id);
     Ok(())
 }
+
+// ---------------------------------------------------------------------
+// WS1 task 1.11: unmeasured budget/outcome metrics are `None`, not
+// insert-time defaults presented as measurements.
+// ---------------------------------------------------------------------
+
+/// `agent_employee.budget_spent`, `budget_reserved`, `approval_rate`,
+/// `success_rate` and `recent_runs` are real columns nothing ever updates.
+/// The store must not select them back as `0`/`0.0` — they come back
+/// `None`, and serialize to JSON `null` (not omitted).
+#[sqlx::test(migrations = "../../migrations")]
+async fn unmeasured_employee_metrics_are_none_not_insert_time_defaults(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let input = CreateEmployeeInput {
+        name: "unmeasured-metrics-employee".to_owned(),
+        purpose: "p".to_owned(),
+        autonomy: "L1".to_owned(),
+        allowed_tools: vec![],
+        data_scope: "d".to_owned(),
+        budget_limit: 100.0,
+        owner: None,
+        prompt: None,
+        schedule_cron: None,
+        mode: None,
+        permissions: None,
+    };
+    let created = create_employee(&pool, &input).await.unwrap();
+    assert_eq!(created.budget_spent, None);
+    assert_eq!(created.budget_reserved, None);
+    assert_eq!(created.approval_rate, None);
+    assert_eq!(created.success_rate, None);
+    assert_eq!(created.recent_runs, None);
+
+    // Also true when fetched back through `get_employee`, not just the
+    // `RETURNING` row from the insert.
+    let fetched = get_employee(&pool, &created.id).await.unwrap().unwrap();
+    assert_eq!(fetched.budget_spent, None);
+    assert_eq!(fetched.budget_reserved, None);
+    assert_eq!(fetched.approval_rate, None);
+    assert_eq!(fetched.success_rate, None);
+    assert_eq!(fetched.recent_runs, None);
+
+    let value = serde_json::to_value(&fetched).unwrap();
+    assert_eq!(value["budgetSpent"], serde_json::Value::Null);
+    assert_eq!(value["budgetReserved"], serde_json::Value::Null);
+    assert_eq!(value["approvalRate"], serde_json::Value::Null);
+    assert_eq!(value["successRate"], serde_json::Value::Null);
+    assert_eq!(value["recentRuns"], serde_json::Value::Null);
+    // The keys are present, not omitted — `null` on the wire, not a
+    // missing field a client would have to distinguish from `undefined`.
+    assert!(value.as_object().unwrap().contains_key("budgetSpent"));
+    Ok(())
+}
+
+/// `agent_run.budget_consumed` is the same story: a real column nothing
+/// ever updates, so a run fetched through the store reports it `None`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unmeasured_run_budget_consumed_is_none_not_insert_time_default(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    insert_run(&pool, "run-unmeasured-budget", "emp-risk").await;
+    let run = get_run(&pool, "run-unmeasured-budget")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.budget_consumed, None);
+    Ok(())
+}

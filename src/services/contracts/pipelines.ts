@@ -74,22 +74,11 @@ export type CreatePipelineInput = {
   owner?: string
 }
 
-export type GeneratePipelineInput = {
-  model: string
-  instruction: string
-  fileName?: string
-  database: string
-}
-
 export interface PipelineService {
   listPipelines(signal?: AbortSignal): Promise<Pipeline[]>
   getPipeline(id: string, signal?: AbortSignal): Promise<PipelineDetail>
   listRuns(pipelineId: string, signal?: AbortSignal): Promise<PipelineRun[]>
   createPipeline(input: CreatePipelineInput, signal?: AbortSignal): Promise<Pipeline>
-  generatePipelineFromPrompt(
-    input: GeneratePipelineInput,
-    signal?: AbortSignal
-  ): Promise<Pipeline>
   triggerRun(id: string, signal?: AbortSignal): Promise<PipelineRun>
   cancelRun(runId: string, signal?: AbortSignal): Promise<PipelineRun>
   retryRun(runId: string, signal?: AbortSignal): Promise<PipelineRun>

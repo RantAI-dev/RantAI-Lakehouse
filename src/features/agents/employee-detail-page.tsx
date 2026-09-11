@@ -28,6 +28,7 @@ import {
   formatPercent,
   formatRelativeTime,
 } from "@/lib/format"
+import { fmtMeasured } from "@/lib/measured"
 import { agentService } from "@/services"
 import type { AgentRun, ApprovalItem } from "@/services/contracts/agents"
 
@@ -130,7 +131,7 @@ function RunsSection({ runs }: { runs: AgentRun[] }) {
             <span
               className={`text-xs text-muted-foreground ${r.auditEventId ? "" : "ml-auto"}`}
             >
-              {formatCost(r.budgetConsumed)} · started{" "}
+              {fmtMeasured(r.budgetConsumed, formatCost)} · started{" "}
               {formatRelativeTime(r.startedAt)}
               {r.endedAt ? ` · ended ${formatRelativeTime(r.endedAt)}` : ""}
             </span>
@@ -423,13 +424,16 @@ export function EmployeeDetailPage() {
       <div className="grid gap-3 lg:grid-cols-3">
         <SectionCard title="Budget">
           <p className="text-2xl font-semibold tabular-nums">
-            {formatCost(e.budgetSpent + e.budgetReserved)}
+            {e.budgetSpent === null || e.budgetReserved === null
+              ? "—"
+              : formatCost(e.budgetSpent + e.budgetReserved)}
             <span className="text-base text-muted-foreground">
               {" "}/ {formatCost(e.budgetLimit)}
             </span>
           </p>
           <p className="mt-1 text-xs text-muted-foreground">
-            Spent {formatCost(e.budgetSpent)} · Reserved {formatCost(e.budgetReserved)}
+            Spent {fmtMeasured(e.budgetSpent, formatCost)} · Reserved{" "}
+            {fmtMeasured(e.budgetReserved, formatCost)}
           </p>
         </SectionCard>
         <SectionCard title="Scope">
@@ -437,8 +441,13 @@ export function EmployeeDetailPage() {
           <p className="mt-2 text-xs text-muted-foreground">Tools: {e.allowedTools.join(", ")}</p>
         </SectionCard>
         <SectionCard title="Outcomes">
-          <p className="text-sm">Success {formatPercent(e.successRate)} · Approval {formatPercent(e.approvalRate)}</p>
-          <p className="mt-1 text-xs text-muted-foreground">{e.recentRuns} recent runs</p>
+          <p className="text-sm">
+            Success {fmtMeasured(e.successRate, formatPercent)} · Approval{" "}
+            {fmtMeasured(e.approvalRate, formatPercent)}
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {fmtMeasured(e.recentRuns)} recent runs
+          </p>
         </SectionCard>
       </div>
       <SectionCard title="Approval queue">

@@ -197,20 +197,35 @@ pub struct DigitalEmployee {
     pub status: String,
     /// Budget ceiling.
     pub budget_limit: f64,
-    /// Budget spent to date.
-    pub budget_spent: f64,
-    /// Budget currently reserved (in-flight).
-    pub budget_reserved: f64,
+    /// `None` until `WS7` tracks spend per tool call: the column exists but
+    /// nothing ever updates it, so its value would be an insert-time
+    /// default, not a measurement (WS1 task 1.11).
+    #[sqlx(skip)]
+    pub budget_spent: Option<f64>,
+    /// `None` until `WS7` tracks spend per tool call: the column exists but
+    /// nothing ever updates it, so its value would be an insert-time
+    /// default, not a measurement (WS1 task 1.11).
+    #[sqlx(skip)]
+    pub budget_reserved: Option<f64>,
     /// Tool names this employee may invoke.
     pub allowed_tools: Vec<String>,
     /// Human-readable data-access scope.
     pub data_scope: String,
-    /// Fraction of actions that required approval.
-    pub approval_rate: f64,
-    /// Fraction of runs that succeeded.
-    pub success_rate: f64,
-    /// Number of recent runs.
-    pub recent_runs: i64,
+    /// `None` until `WS7` tracks spend per tool call: the column exists but
+    /// nothing ever updates it, so its value would be an insert-time
+    /// default, not a measurement (WS1 task 1.11).
+    #[sqlx(skip)]
+    pub approval_rate: Option<f64>,
+    /// `None` until `WS7` tracks spend per tool call: the column exists but
+    /// nothing ever updates it, so its value would be an insert-time
+    /// default, not a measurement (WS1 task 1.11).
+    #[sqlx(skip)]
+    pub success_rate: Option<f64>,
+    /// `None` until `WS7` tracks spend per tool call: the column exists but
+    /// nothing ever updates it, so its value would be an insert-time
+    /// default, not a measurement (WS1 task 1.11).
+    #[sqlx(skip)]
+    pub recent_runs: Option<i64>,
     /// The instruction a headless run sends to the copilot. `None` means
     /// this employee is not runnable.
     pub prompt: Option<String>,
@@ -225,9 +240,13 @@ pub struct DigitalEmployee {
     pub permissions: String,
 }
 
+// WS1 task 1.11: budget_spent, budget_reserved, approval_rate, success_rate
+// and recent_runs are dropped from this SELECT list — nothing ever writes
+// them, so selecting them would just re-serve the insert-time default as a
+// measurement. The columns themselves stay (WS7 may reuse them); see
+// `DigitalEmployee`'s field docs.
 const EMPLOYEE_COLUMNS: &str = "id, name, purpose, owner, autonomy, status, budget_limit, \
-     budget_spent, budget_reserved, allowed_tools, data_scope, approval_rate, success_rate, \
-     recent_runs, prompt, schedule_cron, mode, permissions";
+     allowed_tools, data_scope, prompt, schedule_cron, mode, permissions";
 
 /// List every digital employee, newest first.
 ///
@@ -573,8 +592,10 @@ pub struct AgentRun {
     /// When the run ended, ISO 8601, if it has.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<String>,
-    /// Budget units consumed so far.
-    pub budget_consumed: f64,
+    /// `None` until `WS7` tracks spend per tool call: the column exists but
+    /// nothing ever updates it, so its value would be an insert-time
+    /// default, not a measurement (WS1 task 1.11).
+    pub budget_consumed: Option<f64>,
     /// The recorded step trace.
     pub steps: Vec<RunStep>,
     /// Approvals requested in connection with this run.
@@ -595,13 +616,16 @@ struct RunRow {
     delegated_user: Option<String>,
     started_at: OffsetDateTime,
     ended_at: Option<OffsetDateTime>,
-    budget_consumed: f64,
     steps: Json<Vec<RunStep>>,
     audit_event_id: Option<String>,
 }
 
+// WS1 task 1.11: budget_consumed is dropped from this SELECT list — nothing
+// ever writes it, so selecting it would just re-serve the insert-time
+// default as a measurement. `hydrate_run` sets `AgentRun::budget_consumed`
+// to `None` directly. The column itself stays (WS7 may reuse it).
 const RUN_COLUMNS: &str = "id, employee_id, workflow_id, status, trigger, actor, delegated_user, \
-     started_at, ended_at, budget_consumed, steps, audit_event_id";
+     started_at, ended_at, steps, audit_event_id";
 
 /// Fetch the `{id, status, at}` approval refs for one or more runs.
 async fn approvals_for_run(pool: &PgPool, run_id: &str) -> Result<Vec<RunApprovalRef>, StoreError> {
@@ -633,7 +657,10 @@ async fn hydrate_run(pool: &PgPool, row: RunRow) -> Result<AgentRun, StoreError>
         delegated_user: row.delegated_user,
         started_at: iso_millis(row.started_at),
         ended_at: iso_opt(row.ended_at),
-        budget_consumed: row.budget_consumed,
+        // WS1 task 1.11: nothing ever updates agent_run.budget_consumed, so
+        // it is no longer selected — this is `None`, not a re-served
+        // insert-time default.
+        budget_consumed: None,
         steps: row.steps.0,
         approvals,
         audit_event_id: row.audit_event_id,

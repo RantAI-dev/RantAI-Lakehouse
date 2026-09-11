@@ -365,6 +365,11 @@ fn derive_pipeline_name(text: &str) -> String {
 /// this endpoint into a 503 when the mock-equivalent behavior never needed
 /// the LLM to succeed at all.
 ///
+/// The console's only caller of this route, the pipelines page's Agentic
+/// Builder dialog, was removed in `WS1` task 1.11 (it produced a draft
+/// "from mock agent phases", not a real generation). The route stays
+/// registered, unchanged, for `WS7`'s copilot to call instead.
+///
 /// # Errors
 ///
 /// 400 on a malformed body; 409 if the derived name collides; 503/500 as
