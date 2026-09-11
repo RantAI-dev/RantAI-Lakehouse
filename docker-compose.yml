@@ -1406,6 +1406,17 @@ services:
       # module doc) but the job is still launchable on demand and needs the
       # var wired regardless.
       AGENT_RUN_TOKEN: ${AGENT_RUN_TOKEN:-}
+      # WS0 item 11 — `alerts_run.py`'s scheduled trigger for
+      # `POST /api/alerts/run`: the shared token this job sends BOTH as
+      # `Authorization: Bearer` (to authenticate as the
+      # `alerts-run-scheduler` service identity `lakehouse-api`'s
+      # `main::bootstrap_alerts_run_service` seeds from this same value)
+      # AND as `x-run-token` (for `routes::alerts::check_run_token`'s own
+      # check) — must match `lakehouse-api`'s own `ALERTS_RUN_TOKEN`,
+      # same single-`.env`-value reasoning `AGENT_RUN_TOKEN` documents
+      # above. With this unset, the schedule stays registered but every
+      # run it triggers fails visibly (401/503), never silently.
+      ALERTS_RUN_TOKEN: ${ALERTS_RUN_TOKEN:-}
     command: ["dagster", "api", "grpc", "-h", "0.0.0.0", "-p", "4000", "-m", "dispar_orchestrate.definitions"]
     restart: unless-stopped
 

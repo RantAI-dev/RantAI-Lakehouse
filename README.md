@@ -217,7 +217,7 @@ guessed.
 | `LLM_KEY` | LLM API key. Falls back to `MINIMAX_API_KEY` if unset **or empty** (`||` semantics, not `??`) | `""` | No (but AI features won't work without it) |
 | `MINIMAX_API_KEY` | Fallback for `LLM_KEY` | — | No |
 | `EMBED_SECRET` | HMAC signing secret for signed dashboard embeds | unset (embedding disabled) | No |
-| `ALERTS_RUN_TOKEN` | Shared bearer token required to call `POST /api/alerts/run` | unset | No, but the endpoint fails closed (401) when unset — see Security notes below |
+| `ALERTS_RUN_TOKEN` | Shared bearer token required to call `POST /api/alerts/run`; when set, also seeds the scope-less `alerts-run-scheduler` service identity Dagster's `alerts_run_schedule` authenticates as | unset | No, but unset means the endpoint replies 503 to anyone except an authenticated service-identity principal (not 401) — see Security notes below |
 | `SMTP_HOST` | SMTP host for alert/digest email delivery | unset (email disabled) | No |
 | `SMTP_PORT` | SMTP port. Invalid values log a warning and fall back to the default rather than failing boot | `587` | No |
 | `SMTP_SECURE` | Force implicit TLS (`"true"`). Effective value is also `true` whenever `SMTP_PORT` is `465`, even if this is unset | `false` | No |

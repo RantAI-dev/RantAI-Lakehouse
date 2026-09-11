@@ -68,6 +68,12 @@ async fn main() -> anyhow::Result<()> {
     // for what happens when it's unset.
     bootstrap_agent_run_service(&state).await;
 
+    // WS0 item 11: same shape, for Dagster's `alerts_run_schedule`
+    // (`dagster/dispar_orchestrate/alerts_run.py`), from
+    // `ALERTS_RUN_TOKEN` — see `bootstrap_alerts_run_service`'s doc
+    // comment for what happens when it's unset.
+    bootstrap_alerts_run_service(&state).await;
+
     let app = routes::router(state);
 
     let addr = format!("0.0.0.0:{port}");
@@ -167,6 +173,11 @@ async fn bootstrap_admin(state: &AppState) {
 /// for its own (`PARITY_SERVICE_IDENTITY_NAME`).
 const AGENT_RUN_SERVICE_IDENTITY_NAME: &str = "agent-run-scheduler";
 
+/// Fixed name of the service identity [`bootstrap_alerts_run_service`]
+/// provisions — same `<domain>-run-scheduler` shape as
+/// [`AGENT_RUN_SERVICE_IDENTITY_NAME`].
+const ALERTS_RUN_SERVICE_IDENTITY_NAME: &str = "alerts-run-scheduler";
+
 /// Idempotently seed the ONE service identity + credential that lets
 /// Dagster's digital-employee schedule factory
 /// (`dagster/dispar_orchestrate/agent_runs.py`) authenticate against
@@ -231,17 +242,106 @@ const AGENT_RUN_SERVICE_IDENTITY_NAME: &str = "agent-run-scheduler";
 /// vars are unset. Scheduled digital employees simply cannot run yet,
 /// which is the existing, safe, documented (`gold_export_job`-precedent)
 /// posture this task is closing, not weakening.
+///
+/// The body below delegates to [`bootstrap_service_run_identity`], the
+/// shared core [`bootstrap_alerts_run_service`] also calls (WS0 item 11) —
+/// this function's own signature and behavior are unchanged by that
+/// extraction, so every existing test that calls it directly keeps
+/// passing unmodified.
 async fn bootstrap_agent_run_service(state: &AppState) {
-    let Some(token) = state.config.agent_run_token.clone() else {
+    bootstrap_service_run_identity(
+        state,
+        state.config.agent_run_token.clone(),
+        AGENT_RUN_SERVICE_IDENTITY_NAME,
+        // ONLY `agent:manage` — never `*:*`. This identity must not be
+        // able to do anything beyond running a digital employee.
+        // `routes::agents::run_employee` DOES check this permission.
+        vec!["agent:manage".to_owned()],
+        "AGENT_RUN_TOKEN",
+    )
+    .await;
+}
+
+/// Lets `dagster/dispar_orchestrate/alerts_run.py`'s scheduled trigger
+/// authenticate against `POST /api/alerts/run`'s `Policy::RequiresAuth`
+/// floor, from [`Config::agent_run_token`]'s sibling,
+/// `Config::alerts_run_token` — the exact same `auth_gate`-floor problem
+/// [`bootstrap_agent_run_service`] solves for digital-employee runs,
+/// reusing the identical mechanism rather than a second, near-duplicate
+/// implementation.
+///
+/// # Why this identity gets NO scopes
+///
+/// Unlike the agent-run identity, this one is seeded with an EMPTY scope
+/// list. `POST`/`GET /api/alerts/run` is `Policy::RequiresAuth`
+/// (`policy::POLICY_TABLE`) — any authenticated principal clears that
+/// floor — and `routes::alerts::run`'s handler body checks no permission
+/// at all: `routes::alerts::check_run_token` only compares the
+/// `x-run-token` header (or falls back to requiring a
+/// `PrincipalId::Service` principal) once `ALERTS_RUN_TOKEN` is set, which
+/// it is here. The `x-run-token` check is what actually gates this route;
+/// authenticating at all is enough to clear the floor. Granting this
+/// identity `alert:write` (the permission `POST`/`PUT`/`DELETE
+/// /api/alerts` require) would be strictly more privilege than the route
+/// it authenticates for ever inspects — a leaked `ALERTS_RUN_TOKEN` would
+/// then also let its holder create, edit, or delete alert rules, not just
+/// trigger a run. An empty [`lakehouse_auth::PermissionSet`] still
+/// authenticates (`verify_service_token` builds it from
+/// `service_identity.scopes` regardless of whether that array is empty)
+/// and satisfies `RequiresAuth`; it simply satisfies no
+/// `RequiresPermission` check, which this route never performs.
+async fn bootstrap_alerts_run_service(state: &AppState) {
+    bootstrap_service_run_identity(
+        state,
+        state.config.alerts_run_token.clone(),
+        ALERTS_RUN_SERVICE_IDENTITY_NAME,
+        Vec::new(),
+        "ALERTS_RUN_TOKEN",
+    )
+    .await;
+}
+
+/// Idempotently seed ONE service identity + credential that lets a
+/// Dagster schedule authenticate against a token-guarded, `RequiresAuth`
+/// route — the shared core [`bootstrap_agent_run_service`] and
+/// [`bootstrap_alerts_run_service`] both call. See
+/// [`bootstrap_agent_run_service`]'s doc comment for the full "why this
+/// exists at all" rationale — both callers hit the identical `auth_gate`
+/// floor problem, on `POST /api/agents/employees/{id}/run` and
+/// `POST /api/alerts/run` respectively.
+///
+/// `identity_name` must be a fixed, unique `service_identity.name` (its
+/// own `UNIQUE` constraint is what makes this idempotent across restarts,
+/// same as [`bootstrap_admin`]'s `app_user.email` unique constraint).
+/// `scopes` should be the narrowest set the caller's route needs — never
+/// `*:*`; empty when the route checks no permission (see
+/// [`bootstrap_alerts_run_service`]'s doc comment for why that is the
+/// right choice there). `token` is `None` when the caller's own token env
+/// var is unset, in which case this seeds nothing at all (see
+/// [`bootstrap_agent_run_service`]'s doc comment, "What happens when ...
+/// is absent").
+///
+/// Idempotency and rotation behavior are identical for every caller: see
+/// [`bootstrap_agent_run_service`]'s doc comment section "Idempotent by
+/// construction, not by a pre-check".
+async fn bootstrap_service_run_identity(
+    state: &AppState,
+    token: Option<String>,
+    identity_name: &'static str,
+    scopes: Vec<String>,
+    missing_token_env_var: &str,
+) {
+    let Some(token) = token else {
         tracing::warn!(
-            "no agent-run service credential configured: set AGENT_RUN_TOKEN to let \
-             Dagster's digital-employee schedules authenticate against \
-             POST /api/agents/employees/{{id}}/run (schedules stay inert until then)"
+            "no {identity_name} service credential configured: set {missing_token_env_var} to \
+             let its Dagster schedule authenticate (the schedule stays inert until then)"
         );
         return;
     };
     let Some(pool) = state.pg.as_deref() else {
-        tracing::warn!("cannot seed agent-run service identity: no Postgres pool is configured");
+        tracing::warn!(
+            "cannot seed {identity_name} service identity: no Postgres pool is configured"
+        );
         return;
     };
 
@@ -251,10 +351,8 @@ async fn bootstrap_agent_run_service(state: &AppState) {
         "production"
     };
     let input = lakehouse_store::identity::CreateServiceIdentityInput {
-        name: AGENT_RUN_SERVICE_IDENTITY_NAME.to_owned(),
-        // ONLY `agent:manage` — never `*:*`. This identity must not be
-        // able to do anything beyond running a digital employee.
-        scopes: vec!["agent:manage".to_owned()],
+        name: identity_name.to_owned(),
+        scopes,
         environment: environment.to_owned(),
     };
     let service_identity_id =
@@ -262,26 +360,26 @@ async fn bootstrap_agent_run_service(state: &AppState) {
             Ok(identity) => {
                 let Ok(id) = identity.id.parse() else {
                     tracing::error!(
-                        "agent-run service identity was created but its id did not parse as a UUID"
+                        "{identity_name} service identity was created but its id did not parse \
+                         as a UUID"
                     );
                     return;
                 };
                 id
             }
             Err(lakehouse_store::StoreError::Conflict) => {
-                tracing::info!("agent-run service identity already exists; reusing it");
-                let Some(id) =
-                    find_service_identity_id_by_name(pool, AGENT_RUN_SERVICE_IDENTITY_NAME).await
-                else {
+                tracing::info!("{identity_name} service identity already exists; reusing it");
+                let Some(id) = find_service_identity_id_by_name(pool, identity_name).await else {
                     tracing::error!(
-                        "agent-run service identity name is taken but its id could not be resolved"
+                        "{identity_name} service identity name is taken but its id could not be \
+                         resolved"
                     );
                     return;
                 };
                 id
             }
             Err(err) => {
-                tracing::error!(%err, "failed to seed agent-run service identity");
+                tracing::error!(%err, "failed to seed {identity_name} service identity");
                 return;
             }
         };
@@ -291,17 +389,15 @@ async fn bootstrap_agent_run_service(state: &AppState) {
         lakehouse_auth::service_token::ensure_service_credential(pool, service_identity_id, &token)
             .await
     {
-        tracing::error!(%err, "agent-run service identity was seeded but its credential was not");
+        tracing::error!(%err, "{identity_name} service identity was seeded but its credential was not");
         return;
     }
-    tracing::info!(
-        "agent-run service credential seeded (scope: agent:manage); \
-         digital-employee schedules can now authenticate"
-    );
+    tracing::info!("{identity_name} service credential seeded");
 }
 
-/// Look up an existing `service_identity.id` by its unique `name`. Only
-/// ever called from [`bootstrap_agent_run_service`]'s Conflict branch,
+/// Look up an existing `service_identity.id` by its unique `name`. Called
+/// from the [`bootstrap_service_run_identity`] Conflict branch shared by
+/// both [`bootstrap_agent_run_service`] and [`bootstrap_alerts_run_service`],
 /// where a row with this name is already known to exist — `None` there
 /// means the row vanished between the failed insert and this lookup
 /// (logged by the caller as an error, not a panic).
@@ -807,6 +903,81 @@ mod tests {
             let pool = state.pg.as_deref().expect("pg pool configured");
             assert_eq!(identity_row_count(pool).await, 0);
             assert_eq!(credential_row_count(pool).await, 0);
+        }
+
+        async fn alerts_identity_row_count(pool: &sqlx::PgPool) -> i64 {
+            let (count,): (i64,) =
+                sqlx::query_as("SELECT count(*) FROM service_identity WHERE name = $1")
+                    .bind(ALERTS_RUN_SERVICE_IDENTITY_NAME)
+                    .fetch_one(pool)
+                    .await
+                    .expect("count service_identity rows");
+            count
+        }
+
+        async fn alerts_credential_row_count(pool: &sqlx::PgPool) -> i64 {
+            let (count,): (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM service_credential sc \
+                 JOIN service_identity si ON si.id = sc.service_identity_id \
+                 WHERE si.name = $1",
+            )
+            .bind(ALERTS_RUN_SERVICE_IDENTITY_NAME)
+            .fetch_one(pool)
+            .await
+            .expect("count service_credential rows");
+            count
+        }
+
+        /// With `ALERTS_RUN_TOKEN` set, boot seeds exactly one identity
+        /// (no scopes — see [`bootstrap_alerts_run_service`]'s doc comment
+        /// for why) and one matching credential; the token authenticates a
+        /// real principal that nonetheless does NOT hold `alert:write` —
+        /// proving [`bootstrap_service_run_identity`] behaves identically
+        /// for this caller while honoring B9's narrower scope decision.
+        #[tokio::test]
+        async fn bootstrap_alerts_run_service_seeds_identity_and_credential() {
+            let mut overrides = HashMap::new();
+            overrides.insert(
+                "ALERTS_RUN_TOKEN".to_owned(),
+                "unit-test-alerts-token".to_owned(),
+            );
+            let state = fresh_state(&overrides).await;
+
+            bootstrap_alerts_run_service(&state).await;
+
+            let pool = state.pg.as_deref().expect("pg pool configured");
+            assert_eq!(alerts_identity_row_count(pool).await, 1);
+            assert_eq!(alerts_credential_row_count(pool).await, 1);
+
+            let (scopes,): (Vec<String>,) =
+                sqlx::query_as("SELECT scopes FROM service_identity WHERE name = $1")
+                    .bind(ALERTS_RUN_SERVICE_IDENTITY_NAME)
+                    .fetch_one(pool)
+                    .await
+                    .expect("read the seeded identity's scopes");
+            assert_eq!(scopes, Vec::<String>::new());
+
+            let principal = lakehouse_auth::service_token::verify_service_token(
+                pool,
+                &lakehouse_auth::Secret::new("unit-test-alerts-token".to_owned()),
+            )
+            .await
+            .expect("the configured token must authenticate a real service principal");
+            assert!(!principal.permissions.has("alert:write"));
+        }
+
+        /// With `ALERTS_RUN_TOKEN` unset, bootstrap creates nothing at all —
+        /// no identity, no credential — same posture as
+        /// [`bootstrap_agent_run_service`] when its own token is unset.
+        #[tokio::test]
+        async fn bootstrap_alerts_run_service_creates_nothing_when_token_is_unset() {
+            let state = fresh_state(&HashMap::new()).await;
+
+            bootstrap_alerts_run_service(&state).await;
+
+            let pool = state.pg.as_deref().expect("pg pool configured");
+            assert_eq!(alerts_identity_row_count(pool).await, 0);
+            assert_eq!(alerts_credential_row_count(pool).await, 0);
         }
     }
 }

@@ -10,6 +10,7 @@ auto-names the one repository this code location exposes `__repository__`
 
 from dagster import Definitions
 from dispar_orchestrate.agent_runs import agent_run_job, agent_run_schedules
+from dispar_orchestrate.alerts_run import alerts_run_job, alerts_run_schedule
 from dispar_orchestrate.assets import bronze_ingest_job
 from dispar_orchestrate.gold_export import gold_export_job
 from dispar_orchestrate.maintenance import (
@@ -33,7 +34,11 @@ from dispar_orchestrate.replication_metrics import (
 # code location as P3's `bronze_ingest_job` — one code location, one
 # package, per ADR 0005 ("A future P4 [and P5] ... adds modules under the
 # same `dispar_orchestrate` package and the same image, not new top-level
-# directories").
+# directories"). WS0 item 11 adds `alerts_run_job` + `alerts_run_schedule`:
+# unlike `agent_run_schedules` (per-employee, zero entries when its token
+# is unset), `alerts_run_schedule` is a SINGLE, always-registered schedule
+# (alert rules are evaluated as one batch, not per-row) — see
+# `alerts_run.py`'s module doc for the full design.
 #
 # `gold_export_job` is STILL registered without a schedule (a separate,
 # larger change would be needed to give it the same service-credential
@@ -52,10 +57,12 @@ defs = Definitions(
         replication_slot_check_job,
         gold_export_job,
         agent_run_job,
+        alerts_run_job,
     ],
     schedules=[
         bronze_maintenance_schedule,
         replication_slot_check_schedule,
+        alerts_run_schedule,
         *agent_run_schedules,
     ],
 )
