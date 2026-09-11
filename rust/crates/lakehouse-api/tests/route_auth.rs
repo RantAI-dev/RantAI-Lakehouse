@@ -219,7 +219,7 @@ async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
 }
 
 /// A seeded Analyst (no `governance:write`) is denied
-/// `POST /api/lakehouse/tables/{ns}/{table}/maintenance` (WS2 §4 Task B2),
+/// `POST /api/lakehouse/tables/{ns}/{table}/maintenance` (WS2 §4),
 /// a fifth `Policy::RequiresPermission` route added after the four-family
 /// spot-check above — kept as its own test rather than folded into that
 /// one so its doc comment's "four" stays accurate.

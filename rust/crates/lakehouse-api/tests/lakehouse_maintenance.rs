@@ -61,9 +61,9 @@ fn valid_policy_body() -> Value {
     })
 }
 
-/// A Governance Admin's POST is stored, and both the per-table GET (read
-/// back as a `catalog:read`-holding principal — see the comment at that
-/// call below) and the cross-table list reflect exactly what was stored.
+/// A Governance Admin's POST is stored, and both the per-table GET and the
+/// cross-table list — read back by that same Governance Admin — reflect
+/// exactly what was stored.
 #[tokio::test]
 async fn governance_admin_sets_a_policy_and_reads_it_back() {
     let TestApp { router, pool } = spin_up().await;
@@ -87,20 +87,11 @@ async fn governance_admin_sets_a_policy_and_reads_it_back() {
     assert_eq!(post_body["compactSmallFiles"], json!(true));
     assert_eq!(post_body["schedule"], json!("daily"));
 
-    // `GET .../maintenance` (unlike the POST this test just proved) is
-    // gated on `catalog:read` (a pre-existing, out-of-scope-for-B2 policy
-    // row) — `dewi@meridian.example`'s Governance Admin role
-    // (`policy:*, residency:*, audit:read, governance:write`) does not
-    // hold it, so the round-trip read uses a session that does
-    // (`fajar@meridian.example`, Platform Admin, `*:*`) rather than
-    // asserting a 200 the auth gate would never actually return for the
-    // user who wrote the policy.
-    let reader_cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
     let get_resp = request(
         &router,
         "GET",
         "/api/lakehouse/tables/silver/orders/maintenance",
-        &reader_cookie,
+        &cookie,
         None,
     )
     .await;

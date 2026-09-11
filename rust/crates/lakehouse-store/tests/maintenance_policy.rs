@@ -134,6 +134,19 @@ async fn migration_0030_grants_governance_write_to_governance_admin_exactly_once
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn migration_0031_grants_catalog_read_to_governance_admin_exactly_once(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let permissions: String =
+        sqlx::query_scalar("SELECT permissions FROM role WHERE name = 'Governance Admin'")
+            .fetch_one(&pool)
+            .await
+            .expect("seeded Governance Admin role");
+    assert_eq!(permissions.matches("catalog:read").count(), 1);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn invalid_schedule_is_refused_by_the_check_constraint(pool: PgPool) -> sqlx::Result<()> {
     let mut input = valid_input();
     input.schedule = Some("hourly".to_owned());
