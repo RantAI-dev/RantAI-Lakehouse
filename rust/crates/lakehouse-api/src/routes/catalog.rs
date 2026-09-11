@@ -505,13 +505,18 @@ async fn enrich_bronze_assets(
 // renders as "Fresh" for every asset regardless of actual staleness.
 // `health` used to be derived from whether rows/columns came back, which
 // measures neither freshness, failed loads, nor data quality. WS2 fills
-// real sizes from `Iceberg` manifests and freshness from `Iceberg` snapshot
-// timestamps; nothing yet measures asset health.
+// `sizeBytes` from Iceberg snapshot summaries (`total-files-size`) and
+// `freshnessLagSeconds` from Iceberg snapshot timestamps — but only for
+// Bronze rows whose `table_name` is confirmed present in Lakekeeper's
+// `bronze` namespace listing, via `list`'s enrichment (see the module
+// comment above `iceberg_candidates`); nothing yet measures asset health.
 
 /// One Bronze/Iceberg asset row for the catalog list. `rows` and
 /// `last_updated` are real (from the `dataset_sync`/`dataset_catalog`
-/// registry); `size_bytes`, `freshness_lag_seconds`, and `health` are not
-/// measured — see the module comment above.
+/// registry); `size_bytes` and `freshness_lag_seconds` are `null` in this
+/// row builder and filled in afterward by `list`'s Iceberg enrichment when
+/// the row's `table_name` names a real Bronze Iceberg table; `health` is
+/// not measured at all — see the module comment above.
 fn bronze_catalog_row(
     slug: &str,
     title: &str,
@@ -849,6 +854,7 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
         str_col(sync, "frekuensi"),
         str_col(sync, "satuan"),
         str_col(sync, "klasifikasi"),
+        table,
     );
     Ok(Some(body))
 }
@@ -934,6 +940,7 @@ fn bronze_detail_body(
     frekuensi: &str,
     satuan: &str,
     klasifikasi: &str,
+    table_name: &str,
 ) -> Value {
     json!({
         "id": slug,
@@ -967,6 +974,12 @@ fn bronze_detail_body(
         "schemaVersions": [],
         "upstream": [],
         "downstream": downstream,
+        // The registry's own table_name — a true registry fact, not an
+        // Iceberg-verified one (see the WS2 A4 module comment above
+        // `iceberg_candidates` for why this string may or may not name a
+        // real Bronze Iceberg table). The frontend uses it to try loading
+        // Iceberg snapshots for this asset, and handles a 404 quietly.
+        "tableName": if table_name.is_empty() { Value::Null } else { json!(table_name) },
         "_meta": {
             "frekuensi": frekuensi,
             "satuan": satuan,
@@ -1091,6 +1104,9 @@ mod tests {
         assert_eq!(ch_detail["sizeBytes"], Value::Null);
         assert_eq!(ch_detail["freshnessLagSeconds"], Value::Null);
         assert_eq!(ch_detail["health"], json!("unknown"));
+        // Silver/Gold detail never emits tableName — only the Bronze
+        // registry carries a table_name to report.
+        assert!(ch_detail.get("tableName").is_none());
 
         let bronze_detail = bronze_detail_body(
             "slug-1",
@@ -1107,12 +1123,39 @@ mod tests {
             "harian",
             "orang",
             "primer",
+            "commerce_orders",
         );
         assert_eq!(bronze_detail["usage"], Value::Null);
         assert!(bronze_detail.get("lifecyclePolicy").is_none());
         assert_eq!(bronze_detail["sizeBytes"], Value::Null);
         assert_eq!(bronze_detail["freshnessLagSeconds"], Value::Null);
         assert_eq!(bronze_detail["health"], json!("unknown"));
+        assert_eq!(bronze_detail["tableName"], json!("commerce_orders"));
+    }
+
+    // WS2 §4 — the Bronze asset detail exposes the registry's table_name so
+    // the frontend can link an asset to its Iceberg table (Snapshots tab);
+    // an empty registry value must render as `null`, never an empty string.
+    #[test]
+    fn bronze_detail_body_reports_null_table_name_when_registry_value_is_empty() {
+        let bronze_detail = bronze_detail_body(
+            "slug-1",
+            "Title",
+            false,
+            "owner",
+            "desc",
+            1,
+            0,
+            "2026-01-01T00:00:00Z",
+            &[],
+            &[],
+            &[],
+            "harian",
+            "orang",
+            "primer",
+            "",
+        );
+        assert_eq!(bronze_detail["tableName"], Value::Null);
     }
 
     #[test]
