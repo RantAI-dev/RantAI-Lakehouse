@@ -13,6 +13,7 @@ import {
 } from "@/components/patterns/status-badge"
 import { useService } from "@/hooks/use-service"
 import { formatBytes, formatCompactNumber, formatRelativeTime } from "@/lib/format"
+import { fmtMeasured } from "@/lib/measured"
 import { DATA_LAYER_LABEL, ENGINE_CATEGORY_LABEL } from "@/lib/status"
 import { assetService } from "@/services"
 import { ASSET_TYPE_LABEL } from "@/services/contracts/assets"
@@ -55,16 +56,18 @@ export function AssetDetailPage() {
           { label: "Layer", value: DATA_LAYER_LABEL[a.layer] },
           { label: "Format", value: a.format },
           { label: "Engine", value: ENGINE_CATEGORY_LABEL[a.engine] },
-          { label: "Rows", value: formatCompactNumber(a.rows) },
-          { label: "Size", value: formatBytes(a.sizeBytes) },
+          { label: "Rows", value: fmtMeasured(a.rows, formatCompactNumber) },
+          { label: "Size", value: fmtMeasured(a.sizeBytes, formatBytes) },
           { label: "Owner", value: a.owner },
           { label: "Residency", value: a.residency },
-          { label: "Lifecycle", value: a.lifecyclePolicy },
           {
             label: "Freshness",
             value: <FreshnessIndicator lagSeconds={a.freshnessLagSeconds} />,
           },
-          { label: "Updated", value: formatRelativeTime(a.lastUpdated) },
+          {
+            label: "Updated",
+            value: a.lastUpdated === null ? "—" : formatRelativeTime(a.lastUpdated),
+          },
         ]}
       />
       <AssetDetailTabs asset={a} />

@@ -6,6 +6,7 @@ import type {
   Health,
   StorageTier,
 } from "@/lib/status"
+import type { Measured } from "@/lib/measured"
 
 export type AssetType =
   | "table"
@@ -37,11 +38,15 @@ export type Asset = {
   description: string
   format: string
   engine: EngineCategory
-  rows: number
-  sizeBytes: number
+  // Silver rows are not queried; WS1 task 1.9 — null rather than a literal 0.
+  rows: Measured
+  // WS1 task 1.9 — not measured until WS2 reads Iceberg manifests.
+  sizeBytes: Measured
   columnCount: number
-  freshnessLagSeconds: number
-  lastUpdated: string
+  // WS1 task 1.9 — not measured until WS2 reads Iceberg snapshot timestamps.
+  freshnessLagSeconds: Measured
+  // WS1 task 1.9 — null in place of the empty-string placeholder for "unknown".
+  lastUpdated: string | null
   health: Health
   residency: string
 }
@@ -65,7 +70,8 @@ export type AssetDetail = Asset & {
     lastRun: string
   }[]
   policySummary: { id: string; name: string; effect: string }[]
-  usage: { queries7d: number; users7d: number; avgLatencyMs: number }
+  // WS1 task 1.9 — nothing counts per-asset queries or users yet.
+  usage: { queries7d: number; users7d: number; avgLatencyMs: number } | null
   recentQueries: { id: string; sql: string; user: string; at: string }[]
   dependents: { id: string; name: string; kind: string }[]
   changeHistory: { id: string; at: string; actor: string; summary: string }[]
@@ -73,7 +79,12 @@ export type AssetDetail = Asset & {
   schemaVersions: { version: number; at: string; change: string }[]
   upstream: { id: string; name: string }[]
   downstream: { id: string; name: string }[]
-  lifecyclePolicy: string
+  /**
+   * WS1 task 1.9 — the API no longer emits this field (it named a policy
+   * that exists nowhere). Kept optional only because the dead in-browser
+   * fixture `src/services/mock/assets.ts` still sets it.
+   */
+  lifecyclePolicy?: string
 }
 
 export type AssetFilter = {

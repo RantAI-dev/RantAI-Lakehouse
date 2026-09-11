@@ -312,7 +312,7 @@ function buildDetail(asset: Asset): AssetDetail {
     qualityChecks: [
       { id: "q1", name: "Primary key uniqueness", dimension: "Uniqueness", status: "passed", lastRun: agoIso(45) },
       { id: "q2", name: "Amount not null", dimension: "Completeness", status: asset.health === "degraded" ? "warning" : "passed", lastRun: agoIso(45) },
-      { id: "q3", name: "Freshness within SLA", dimension: "Freshness", status: asset.freshnessLagSeconds > 3600 ? "failed" : "passed", lastRun: agoIso(15) },
+      { id: "q3", name: "Freshness within SLA", dimension: "Freshness", status: asset.freshnessLagSeconds !== null && asset.freshnessLagSeconds > 3600 ? "failed" : "passed", lastRun: agoIso(15) },
     ],
     policySummary: [
       { id: "pol-1", name: "Tenant row isolation", effect: "Row filter by tenant_id" },

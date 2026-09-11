@@ -323,10 +323,14 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
 
       <TabsContent value="usage" className="mt-2">
         <SectionCard size="sm" title="Usage (7d)">
-          <p className="text-sm">
-            {a.usage.queries7d} queries · {a.usage.users7d} users · avg{" "}
-            {a.usage.avgLatencyMs} ms
-          </p>
+          {a.usage === null ? (
+            <QuietEmpty title="Usage not measured" />
+          ) : (
+            <p className="text-sm">
+              {a.usage.queries7d} queries · {a.usage.users7d} users · avg{" "}
+              {a.usage.avgLatencyMs} ms
+            </p>
+          )}
           {a.recentQueries.length === 0 ? (
             <QuietEmpty title="No recent queries" />
           ) : (

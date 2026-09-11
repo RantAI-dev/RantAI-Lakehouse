@@ -14,6 +14,7 @@ import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { TierBadge } from "@/components/patterns/status-badge"
 import { useService } from "@/hooks/use-service"
 import { formatBytes } from "@/lib/format"
+import { fmtMeasured } from "@/lib/measured"
 import {
   DATA_LAYER_LABEL,
   STORAGE_TIER_LABEL,
@@ -74,7 +75,7 @@ const columns: ColumnDef<Asset>[] = [
     className: "w-24 text-right",
     render: (r) => (
       <span className="tabular-nums text-muted-foreground">
-        {formatBytes(r.sizeBytes)}
+        {fmtMeasured(r.sizeBytes, formatBytes)}
       </span>
     ),
   },

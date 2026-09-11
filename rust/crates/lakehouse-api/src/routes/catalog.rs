@@ -97,27 +97,16 @@ async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
             let owner = author_of(slug);
             let description = str_col(c, "description");
             let updated_at = str_col(c, "updated_at");
-            json!({
-                "id": slug,
-                "name": str_col(c, "title"),
-                "namespace": if sekunder { "sekunder" } else { "sdi-primer" },
-                "type": "iceberg-table",
-                "layer": if is_curated_bronze(slug) { "bronze" } else { "raw" },
-                "tier": "warm",
-                "classification": "internal",
-                "owner": if owner.is_empty() { TENANT_OWNER.as_str() } else { owner.as_str() },
-                "domain": TENANT_DOMAIN.as_str(),
-                "description": description,
-                "format": "Apache Iceberg (Parquet)",
-                "engine": "hot-store",
-                "rows": rows,
-                "sizeBytes": rows * 220,
-                "columnCount": col_of(slug),
-                "freshnessLagSeconds": 0,
-                "lastUpdated": updated_at,
-                "health": if rows > 0 { "healthy" } else { "degraded" },
-                "residency": TENANT_RESIDENCY.as_str(),
-            })
+            bronze_catalog_row(
+                slug,
+                str_col(c, "title"),
+                sekunder,
+                owner.as_str(),
+                description,
+                rows,
+                col_of(slug),
+                updated_at,
+            )
         })
         .collect();
 
@@ -163,58 +152,133 @@ async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
             if bronze_table_names.contains(name) {
                 continue;
             }
-            assets.push(json!({
-                "id": format!("silver.{name}"),
-                "name": prettify(name),
-                "namespace": "silver",
-                "type": if engine == "View" { "view" } else { "table" },
-                "layer": "silver",
-                "tier": "warm",
-                "classification": "internal",
-                "owner": TENANT_OWNER.as_str(),
-                "domain": TENANT_DOMAIN.as_str(),
-                "description": "Model Silver terkurasi (bersih & terkonform) di ClickHouse.",
-                "format": if engine == "View" { "ClickHouse View".to_owned() } else { format!("ClickHouse {engine}") },
-                "engine": "hot-store",
-                "rows": 0,
-                "sizeBytes": 0,
-                "columnCount": col_count_of("silver", name),
-                "freshnessLagSeconds": 0,
-                "lastUpdated": "",
-                "health": "healthy",
-                "residency": TENANT_RESIDENCY.as_str(),
-            }));
+            assets.push(silver_catalog_row(
+                name,
+                engine,
+                col_count_of("silver", name),
+            ));
         } else {
             if name.ends_with("_baru") {
                 continue;
             }
             let rows = gold_rows_of(name);
-            assets.push(json!({
-                "id": format!("serving.{name}"),
-                "name": prettify(name),
-                "namespace": "serving",
-                "type": "table",
-                "layer": "gold",
-                "tier": "hot",
-                "classification": "internal",
-                "owner": TENANT_OWNER.as_str(),
-                "domain": TENANT_DOMAIN.as_str(),
-                "description": "Mart Gold penyaji dashboard (agregat siap pakai).",
-                "format": format!("ClickHouse {engine}"),
-                "engine": "hot-store",
-                "rows": rows,
-                "sizeBytes": rows * 220,
-                "columnCount": col_count_of("serving", name),
-                "freshnessLagSeconds": 0,
-                "lastUpdated": "",
-                "health": if rows > 0 { "healthy" } else { "degraded" },
-                "residency": TENANT_RESIDENCY.as_str(),
-            }));
+            assets.push(gold_catalog_row(
+                name,
+                engine,
+                rows,
+                col_count_of("serving", name),
+            ));
         }
     }
 
     let namespaces = build_namespaces(&assets);
     Ok(json!({ "assets": assets, "namespaces": namespaces }))
+}
+
+// WS1 task 1.9 — `sizeBytes` and `freshnessLagSeconds` are `null` and
+// `health` is `"unknown"` on every row below. `sizeBytes` used to be
+// `rows * 220`, an invented per-row byte constant (the same one already
+// removed from `ops.rs`/`overview.rs`), which made "sort by size" the same
+// as "sort by row count" while presenting itself as a real measurement.
+// `freshnessLagSeconds` used to be a literal `0`, which `FreshnessIndicator`
+// renders as "Fresh" for every asset regardless of actual staleness.
+// `health` used to be derived from whether rows/columns came back, which
+// measures neither freshness, failed loads, nor data quality. WS2 fills
+// real sizes from `Iceberg` manifests and freshness from `Iceberg` snapshot
+// timestamps; nothing yet measures asset health.
+
+/// One Bronze/Iceberg asset row for the catalog list. `rows` and
+/// `last_updated` are real (from the `dataset_sync`/`dataset_catalog`
+/// registry); `size_bytes`, `freshness_lag_seconds`, and `health` are not
+/// measured — see the module comment above.
+fn bronze_catalog_row(
+    slug: &str,
+    title: &str,
+    sekunder: bool,
+    owner: &str,
+    description: &str,
+    rows: i64,
+    col_count: i64,
+    last_updated: &str,
+) -> Value {
+    json!({
+        "id": slug,
+        "name": title,
+        "namespace": if sekunder { "sekunder" } else { "sdi-primer" },
+        "type": "iceberg-table",
+        "layer": if is_curated_bronze(slug) { "bronze" } else { "raw" },
+        "tier": "warm",
+        "classification": "internal",
+        "owner": if owner.is_empty() { TENANT_OWNER.as_str() } else { owner },
+        "domain": TENANT_DOMAIN.as_str(),
+        "description": description,
+        "format": "Apache Iceberg (Parquet)",
+        "engine": "hot-store",
+        "rows": rows,
+        "sizeBytes": Value::Null,
+        "columnCount": col_count,
+        "freshnessLagSeconds": Value::Null,
+        "lastUpdated": last_updated,
+        "health": "unknown",
+        "residency": TENANT_RESIDENCY.as_str(),
+    })
+}
+
+/// One Silver/`ClickHouse` view/table row for the catalog list. Silver row
+/// counts are not queried (an unfilled gap, not a measured zero), so `rows`
+/// and `sizeBytes` are `null` rather than the literal zeros they used to be;
+/// `lastUpdated` is `null` in place of the empty-string placeholder for
+/// "unknown".
+fn silver_catalog_row(name: &str, engine: &str, col_count: i64) -> Value {
+    json!({
+        "id": format!("silver.{name}"),
+        "name": prettify(name),
+        "namespace": "silver",
+        "type": if engine == "View" { "view" } else { "table" },
+        "layer": "silver",
+        "tier": "warm",
+        "classification": "internal",
+        "owner": TENANT_OWNER.as_str(),
+        "domain": TENANT_DOMAIN.as_str(),
+        "description": "Model Silver terkurasi (bersih & terkonform) di ClickHouse.",
+        "format": if engine == "View" { "ClickHouse View".to_owned() } else { format!("ClickHouse {engine}") },
+        "engine": "hot-store",
+        "rows": Value::Null,
+        "sizeBytes": Value::Null,
+        "columnCount": col_count,
+        "freshnessLagSeconds": Value::Null,
+        "lastUpdated": Value::Null,
+        "health": "unknown",
+        "residency": TENANT_RESIDENCY.as_str(),
+    })
+}
+
+/// One Gold/`ClickHouse` mart row for the catalog list. `rows` is real (from
+/// `system.parts`); `sizeBytes`, `freshnessLagSeconds`, and `health` are
+/// not measured, and `lastUpdated` is `null` in place of the empty-string
+/// placeholder for "unknown".
+fn gold_catalog_row(name: &str, engine: &str, rows: i64, col_count: i64) -> Value {
+    json!({
+        "id": format!("serving.{name}"),
+        "name": prettify(name),
+        "namespace": "serving",
+        "type": "table",
+        "layer": "gold",
+        "tier": "hot",
+        "classification": "internal",
+        "owner": TENANT_OWNER.as_str(),
+        "domain": TENANT_DOMAIN.as_str(),
+        "description": "Mart Gold penyaji dashboard (agregat siap pakai).",
+        "format": format!("ClickHouse {engine}"),
+        "engine": "hot-store",
+        "rows": rows,
+        "sizeBytes": Value::Null,
+        "columnCount": col_count,
+        "freshnessLagSeconds": Value::Null,
+        "lastUpdated": Value::Null,
+        "health": "unknown",
+        "residency": TENANT_RESIDENCY.as_str(),
+    })
 }
 
 /// Namespace metadata: display name and description. Overridable per
@@ -334,44 +398,7 @@ async fn clickhouse_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response>
         Err(_) => 0, // "view: tak ada parts" — swallowed in the TypeScript too.
     };
 
-    let body = json!({
-        "id": id,
-        "name": prettify(&table),
-        "namespace": db,
-        "type": if is_gold { "table" } else { "view" },
-        "layer": if is_gold { "gold" } else { "silver" },
-        "tier": if is_gold { "hot" } else { "warm" },
-        "classification": "internal",
-        "owner": TENANT_OWNER.as_str(),
-        "domain": TENANT_DOMAIN.as_str(),
-        "description": if is_gold {
-            "Mart Gold penyaji dashboard (agregat siap pakai)."
-        } else {
-            "Model Silver terkurasi (bersih & terkonform) di ClickHouse."
-        },
-        "format": if is_gold { "ClickHouse MergeTree" } else { "ClickHouse View" },
-        "engine": "hot-store",
-        "rows": rows,
-        "sizeBytes": rows * 220,
-        "columnCount": schema.len(),
-        "freshnessLagSeconds": 0,
-        "lastUpdated": "",
-        "health": if schema.is_empty() { "degraded" } else { "healthy" },
-        "residency": TENANT_RESIDENCY.as_str(),
-        "schema": schema,
-        "sample": sample,
-        "qualityChecks": [],
-        "policySummary": [],
-        "usage": { "queries7d": 0, "users7d": 0, "avgLatencyMs": 0 },
-        "recentQueries": [],
-        "dependents": [],
-        "changeHistory": [],
-        "snapshots": [],
-        "schemaVersions": [],
-        "upstream": [],
-        "downstream": [],
-        "lifecyclePolicy": "default",
-    });
+    let body = clickhouse_detail_body(id, &table, &db, is_gold, rows, &schema, &sample);
     Ok((StatusCode::OK, ApiJson(body)).into_response())
 }
 
@@ -485,9 +512,111 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
         vec![json!({ "id": format!("silver.{table}"), "name": format!("silver.{table}") })]
     };
 
-    let body = json!({
+    let col_count = cols.len();
+    let body = bronze_detail_body(
+        slug,
+        str_col(sync, "title"),
+        sekunder,
+        owner,
+        description,
+        rows,
+        col_count,
+        updated_at,
+        &schema,
+        &sample,
+        &downstream,
+        str_col(sync, "frekuensi"),
+        str_col(sync, "satuan"),
+        str_col(sync, "klasifikasi"),
+    );
+    Ok(Some(body))
+}
+
+/// Detail body for a `silver.*`/`serving.*` asset. `rows` is real (from
+/// `system.parts`); `sizeBytes`, `freshnessLagSeconds`, `health`, and `usage`
+/// are not measured, `lastUpdated` is `null` in place of the empty-string
+/// placeholder for "unknown", and `lifecyclePolicy` is no longer emitted
+/// (it named a policy that exists nowhere) — see the WS1 task 1.9 comment
+/// above `bronze_catalog_row`.
+fn clickhouse_detail_body(
+    id: &str,
+    table: &str,
+    db: &str,
+    is_gold: bool,
+    rows: i64,
+    schema: &[Value],
+    sample: &[Value],
+) -> Value {
+    json!({
+        "id": id,
+        "name": prettify(table),
+        "namespace": db,
+        "type": if is_gold { "table" } else { "view" },
+        "layer": if is_gold { "gold" } else { "silver" },
+        "tier": if is_gold { "hot" } else { "warm" },
+        "classification": "internal",
+        "owner": TENANT_OWNER.as_str(),
+        "domain": TENANT_DOMAIN.as_str(),
+        "description": if is_gold {
+            "Mart Gold penyaji dashboard (agregat siap pakai)."
+        } else {
+            "Model Silver terkurasi (bersih & terkonform) di ClickHouse."
+        },
+        "format": if is_gold { "ClickHouse MergeTree" } else { "ClickHouse View" },
+        "engine": "hot-store",
+        "rows": rows,
+        "sizeBytes": Value::Null,
+        "columnCount": schema.len(),
+        "freshnessLagSeconds": Value::Null,
+        "lastUpdated": Value::Null,
+        "health": "unknown",
+        "residency": TENANT_RESIDENCY.as_str(),
+        "schema": schema,
+        "sample": sample,
+        "qualityChecks": [],
+        "policySummary": [],
+        "usage": Value::Null,
+        "recentQueries": [],
+        "dependents": [],
+        "changeHistory": [],
+        "snapshots": [],
+        "schemaVersions": [],
+        "upstream": [],
+        "downstream": [],
+    })
+}
+
+/// Detail body for a Bronze/Iceberg asset. `rows` and `last_updated` are
+/// real (from the `dataset_sync`/`dataset_catalog` registry); `sizeBytes`,
+/// `freshnessLagSeconds`, `health`, and `usage` are not measured, and
+/// `lifecyclePolicy` is no longer emitted — see the WS1 task 1.9 comment
+/// above `bronze_catalog_row`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one-to-one port of the original inline `json!` body; every \
+              argument is a distinct already-fetched value with no natural \
+              grouping, so a wrapper struct would just move the same fields \
+              one level up without reducing coupling"
+)]
+fn bronze_detail_body(
+    slug: &str,
+    title: &str,
+    sekunder: bool,
+    owner: &str,
+    description: &str,
+    rows: i64,
+    col_count: usize,
+    last_updated: &str,
+    schema: &[Value],
+    sample: &[Value],
+    downstream: &[Value],
+    frekuensi: &str,
+    satuan: &str,
+    klasifikasi: &str,
+) -> Value {
+    json!({
         "id": slug,
-        "name": str_col(sync, "title"),
+        "name": title,
         "namespace": if sekunder { "sekunder" } else { "sdi-primer" },
         "type": "iceberg-table",
         "layer": if is_curated_bronze(slug) { "bronze" } else { "raw" },
@@ -499,17 +628,17 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
         "format": "Apache Iceberg (Parquet)",
         "engine": "hot-store",
         "rows": rows,
-        "sizeBytes": rows * 220,
-        "columnCount": cols.len(),
-        "freshnessLagSeconds": 0,
-        "lastUpdated": updated_at,
-        "health": if rows > 0 { "healthy" } else { "degraded" },
+        "sizeBytes": Value::Null,
+        "columnCount": col_count,
+        "freshnessLagSeconds": Value::Null,
+        "lastUpdated": last_updated,
+        "health": "unknown",
         "residency": TENANT_RESIDENCY.as_str(),
         "schema": schema,
         "sample": sample,
         "qualityChecks": [],
         "policySummary": [],
-        "usage": { "queries7d": 0, "users7d": 0, "avgLatencyMs": 0 },
+        "usage": Value::Null,
         "recentQueries": [],
         "dependents": [],
         "changeHistory": [],
@@ -517,14 +646,12 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
         "schemaVersions": [],
         "upstream": [],
         "downstream": downstream,
-        "lifecyclePolicy": "default",
         "_meta": {
-            "frekuensi": str_col(sync, "frekuensi"),
-            "satuan": str_col(sync, "satuan"),
-            "klasifikasi": str_col(sync, "klasifikasi"),
+            "frekuensi": frekuensi,
+            "satuan": satuan,
+            "klasifikasi": klasifikasi,
         },
-    });
-    Ok(Some(body))
+    })
 }
 
 fn not_found() -> ApiRejection {
@@ -583,6 +710,88 @@ mod tests {
     #[test]
     fn ns_meta_known_namespace() {
         assert_eq!(ns_meta("silver").0, "Silver (kurasi)");
+    }
+
+    // WS1 task 1.9 — `sizeBytes` was `rows * 220` (an invented constant, the
+    // same one already removed from `ops.rs`/`overview.rs`), `freshnessLagSeconds`
+    // was a literal `0` (which `FreshnessIndicator` renders as "Fresh" for
+    // every asset), and `health` was derived from row/column presence, which
+    // measures neither freshness nor failed loads. WS2 owns real sizes
+    // (`Iceberg` manifests) and freshness (`Iceberg` snapshot timestamps).
+    #[test]
+    fn catalog_rows_never_invent_size_freshness_or_health() {
+        let bronze = bronze_catalog_row(
+            "slug-1",
+            "Title",
+            false,
+            "owner",
+            "desc",
+            42,
+            3,
+            "2026-01-01T00:00:00Z",
+        );
+        assert_eq!(bronze["rows"], json!(42));
+        assert_eq!(bronze["sizeBytes"], Value::Null);
+        assert_eq!(bronze["freshnessLagSeconds"], Value::Null);
+        assert_eq!(bronze["health"], json!("unknown"));
+        assert_eq!(bronze["lastUpdated"], json!("2026-01-01T00:00:00Z"));
+
+        let silver = silver_catalog_row("mart_wisman", "View", 5);
+        assert_eq!(silver["rows"], Value::Null);
+        assert_eq!(silver["sizeBytes"], Value::Null);
+        assert_eq!(silver["freshnessLagSeconds"], Value::Null);
+        assert_eq!(silver["health"], json!("unknown"));
+        assert_eq!(silver["lastUpdated"], Value::Null);
+
+        let gold = gold_catalog_row("mart_wisman", "MergeTree", 99, 5);
+        assert_eq!(gold["rows"], json!(99));
+        assert_eq!(gold["sizeBytes"], Value::Null);
+        assert_eq!(gold["freshnessLagSeconds"], Value::Null);
+        assert_eq!(gold["health"], json!("unknown"));
+        assert_eq!(gold["lastUpdated"], Value::Null);
+    }
+
+    // WS1 task 1.9 — usage was three hardcoded zeros (nothing counts
+    // per-asset queries or users) and `lifecyclePolicy` named a policy that
+    // exists nowhere. Both detail bodies must stop asserting them.
+    #[test]
+    fn catalog_detail_reports_usage_as_unmeasured_and_no_lifecycle_policy() {
+        let ch_detail = clickhouse_detail_body(
+            "silver.mart_wisman",
+            "mart_wisman",
+            "silver",
+            false,
+            10,
+            &[],
+            &[],
+        );
+        assert_eq!(ch_detail["usage"], Value::Null);
+        assert!(ch_detail.get("lifecyclePolicy").is_none());
+        assert_eq!(ch_detail["sizeBytes"], Value::Null);
+        assert_eq!(ch_detail["freshnessLagSeconds"], Value::Null);
+        assert_eq!(ch_detail["health"], json!("unknown"));
+
+        let bronze_detail = bronze_detail_body(
+            "slug-1",
+            "Title",
+            false,
+            "owner",
+            "desc",
+            42,
+            3,
+            "2026-01-01T00:00:00Z",
+            &[],
+            &[],
+            &[],
+            "harian",
+            "orang",
+            "primer",
+        );
+        assert_eq!(bronze_detail["usage"], Value::Null);
+        assert!(bronze_detail.get("lifecyclePolicy").is_none());
+        assert_eq!(bronze_detail["sizeBytes"], Value::Null);
+        assert_eq!(bronze_detail["freshnessLagSeconds"], Value::Null);
+        assert_eq!(bronze_detail["health"], json!("unknown"));
     }
 
     #[test]
