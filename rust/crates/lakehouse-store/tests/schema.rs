@@ -223,3 +223,39 @@ async fn tenant_delete_is_restricted_while_a_user_belongs_to_it(pool: PgPool) ->
         .await?;
     Ok(())
 }
+
+/// WS1 finding J17: `0008_seed_pipelines.sql` and
+/// `0012_seed_overview_alerts.sql` inserted fixture activity (invented
+/// pipeline statuses/run times/SLA/freshness, and alerts narrating
+/// incidents that never happened) on surfaces the console keeps — a viewer
+/// could not tell it apart from real activity. `0027_prune_seeded_activity`
+/// deletes exactly those nine rows, following the
+/// `0026_drop_seeded_agent_runs` precedent of pruning fixture activity
+/// while leaving seeded definitions alone. This test pins that the rows
+/// are gone after every migration has run, not just after 0027 in
+/// isolation.
+#[sqlx::test(migrations = "../../migrations")]
+async fn seeded_fixture_pipelines_and_alerts_are_pruned_after_all_migrations(pool: PgPool) {
+    let (pipelines,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM pipeline_definition WHERE id IN \
+         ('pl-orders-rollup','pl-erp-inventory','pl-policy-docs','pl-embed-faq')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pipelines, 0,
+        "seeded fixture pipelines must not survive migration 0027"
+    );
+
+    let (alerts,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM alert_instance WHERE id IN ('al-01','al-02','al-03','al-04','al-05')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        alerts, 0,
+        "seeded fixture alerts must not survive migration 0027"
+    );
+}
