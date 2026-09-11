@@ -97,8 +97,8 @@ async fn get_body(
         .or_else(|| board_obj.and_then(|b| b.filters.clone()))
         .unwrap_or_default();
 
-    // Tile bawaan hanya disajikan bila deployment ini memang punya mart-nya;
-    // lihat `BUILTIN_DASHBOARD_ENABLED`.
+    // Built-in tiles are only served when this deployment actually has
+    // the mart for them; see `BUILTIN_DASHBOARD_ENABLED`.
     let on_default = (board == "default" || board == "all") && *BUILTIN_DASHBOARD_ENABLED;
     let stored_for_board: Vec<&StoredChartSpec> = if board == "all" {
         stored.iter().collect()
@@ -225,7 +225,7 @@ fn render_stored_chart(c: &StoredChartSpec) -> Value {
 
 fn parse_chart_input(body: &Bytes) -> Result<ChartInput, ApiError> {
     serde_json::from_slice(body)
-        .map_err(|_err| ApiError::BadRequest("body JSON tidak valid".to_owned()))
+        .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))
 }
 
 /// `POST /api/dashboard/specs` — create a chart from high-level input.
@@ -255,8 +255,8 @@ pub async fn specs_create(State(state): State<AppState>, body: Bytes) -> ApiResu
 /// rather than failing). Deserializing straight into a `#[serde(flatten)]
 /// ChartInput` here would invert that order — a body missing `mart`/`kind`/
 /// etc. but ALSO missing `id` would fail on the strict `ChartInput` shape
-/// before ever reaching the `id` check, reporting "body JSON tidak valid"
-/// instead of "id wajib untuk edit" (caught by the parity corpus:
+/// before ever reaching the `id` check, reporting "body JSON is invalid"
+/// instead of "id is required for edit" (caught by the parity corpus:
 /// `dashboard-specs-edit-missing-id` sends `{"title":"x"}`). Parsing to a
 /// bare [`Value`] first and checking `id` before the strict decode restores
 /// the TS precedence.
@@ -267,17 +267,17 @@ pub async fn specs_create(State(state): State<AppState>, body: Bytes) -> ApiResu
 /// failure.
 pub async fn specs_update(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
     let raw: Value = serde_json::from_slice(&body)
-        .map_err(|_err| ApiError::BadRequest("body JSON tidak valid".to_owned()))?;
+        .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))?;
     let id = raw
         .get("id")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned);
     let Some(id) = id else {
-        return Err(ApiError::BadRequest("id wajib untuk edit".to_owned()).into());
+        return Err(ApiError::BadRequest("id is required for edit".to_owned()).into());
     };
     let input: ChartInput = serde_json::from_value(raw)
-        .map_err(|_err| ApiError::BadRequest("body JSON tidak valid".to_owned()))?;
+        .map_err(|_err| ApiError::BadRequest("body JSON is invalid".to_owned()))?;
     let spec = store::spec_from_input(&state.clickhouse, &input, ChartSource::Ui, "ui", Some(id))
         .await
         .map_err(|err| ApiError::BadRequest(err.to_string()))?;
@@ -308,7 +308,7 @@ pub async fn specs_delete(
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let Some(id) = q.id.filter(|s| !s.is_empty()) else {
-        return Err(ApiError::BadRequest("id wajib".to_owned()).into());
+        return Err(ApiError::BadRequest("id is required".to_owned()).into());
     };
     store::delete_chart(&state.clickhouse, &id)
         .await
@@ -360,7 +360,7 @@ pub async fn boards_create(
         BoardCreateBody::default()
     } else {
         serde_json::from_slice(&body)
-            .map_err(|err| ApiError::BadRequest(format!("JSON tidak valid: {err}")))?
+            .map_err(|err| ApiError::BadRequest(format!("JSON is invalid: {err}")))?
     };
     let board = if let Some(dup) = parsed.duplicate {
         store::duplicate_board(&state.clickhouse, &dup).await
@@ -403,11 +403,11 @@ pub async fn boards_update(
         BoardEditBody::default()
     } else {
         serde_json::from_slice(&body)
-            .map_err(|err| ApiError::BadRequest(format!("JSON tidak valid: {err}")))?
+            .map_err(|err| ApiError::BadRequest(format!("JSON is invalid: {err}")))?
     };
     let id = parsed.id.unwrap_or_default();
     if id.is_empty() || id == "default" {
-        return Err(ApiError::BadRequest("dashboard tidak valid".to_owned()).into());
+        return Err(ApiError::BadRequest("invalid dashboard".to_owned()).into());
     }
     let ch = &state.clickhouse;
     if let Some(name) = &parsed.name {
@@ -451,7 +451,7 @@ pub async fn boards_delete(
 ) -> ApiResult<ApiJson<Value>> {
     let id = q.id.unwrap_or_default();
     if id.is_empty() || id == "default" {
-        return Err(ApiError::BadRequest("dashboard tidak valid".to_owned()).into());
+        return Err(ApiError::BadRequest("invalid dashboard".to_owned()).into());
     }
     store::delete_board(&state.clickhouse, &id)
         .await
@@ -589,7 +589,7 @@ pub async fn records(
         .clamp(1, 200);
 
     if !is_strict_ident(&mart) || !is_strict_ident(&column) {
-        return Err(ApiError::BadRequest("mart/column tidak valid".to_owned()).into());
+        return Err(ApiError::BadRequest("invalid mart/column".to_owned()).into());
     }
 
     let ch = &state.clickhouse;
@@ -602,13 +602,13 @@ pub async fn records(
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))?;
     if cols.is_empty() {
-        return Err(ApiError::NotFound(format!("mart '{mart}' tidak ada")).into());
+        return Err(ApiError::NotFound(format!("mart '{mart}' does not exist")).into());
     }
     let has_column = cols
         .iter()
         .any(|c| c.get("name").and_then(Value::as_str) == Some(column.as_str()));
     if !has_column {
-        return Err(ApiError::BadRequest(format!("kolom '{column}' tidak ada")).into());
+        return Err(ApiError::BadRequest(format!("column '{column}' does not exist")).into());
     }
 
     let sql = format!(
@@ -646,7 +646,7 @@ pub async fn values(
 ) -> ApiResult<ApiJson<Value>> {
     let column = strip_non_ident(q.column.as_deref().unwrap_or(""));
     if column.is_empty() {
-        return Err(ApiError::BadRequest("column wajib".to_owned()).into());
+        return Err(ApiError::BadRequest("column is required".to_owned()).into());
     }
     let ch = &state.clickhouse;
     let marts_sql = format!(
@@ -921,7 +921,7 @@ pub async fn embed_info(
     if id.is_empty() || id == "default" {
         return (
             StatusCode::BAD_REQUEST,
-            ApiJson(json!({ "error": "dashboard tidak valid" })),
+            ApiJson(json!({ "error": "invalid dashboard" })),
         )
             .into_response();
     }

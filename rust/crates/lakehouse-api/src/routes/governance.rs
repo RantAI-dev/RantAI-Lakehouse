@@ -112,7 +112,7 @@ pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Res
     match Kind::parse(&kind) {
         Kind::Unknown => (
             StatusCode::BAD_REQUEST,
-            ApiJson(json!({ "error": format!("kind tak dikenal: {kind}") })),
+            ApiJson(json!({ "error": format!("unknown kind: {kind}") })),
         )
             .into_response(),
         parsed => match run(&state, parsed).await {
@@ -203,7 +203,7 @@ async fn quality(ch: &ChClient, pg: Option<&PgPool>) -> Result<Value, GovError> 
             let threshold = if cek.starts_with("null_rate") {
                 "null <5%"
             } else {
-                "row_count > 0 & tidak anjlok >50%"
+                "row_count > 0 & does not drop >50%"
             };
             json!({
                 "id": format!("q-{i}"),
@@ -571,9 +571,7 @@ pub async fn create_rule(
         },
         Kind::Audit | Kind::Maintenance | Kind::Replication | Kind::Unknown => (
             StatusCode::BAD_REQUEST,
-            ApiJson(
-                json!({ "error": format!("kind tak dikenal atau tidak bisa ditulis: {kind}") }),
-            ),
+            ApiJson(json!({ "error": format!("unknown kind or not writable: {kind}") })),
         )
             .into_response(),
     }

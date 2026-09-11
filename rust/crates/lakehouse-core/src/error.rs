@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn bad_request_maps_to_400() {
         assert_eq!(
-            ApiError::BadRequest("Body harus JSON {sql}".to_owned()).status(),
+            ApiError::BadRequest("Body must be JSON {sql}".to_owned()).status(),
             400
         );
     }

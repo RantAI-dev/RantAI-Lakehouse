@@ -41,7 +41,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     let Some(jwt) = jwt else {
         return (
             StatusCode::BAD_REQUEST,
-            ApiJson(json!({ "error": "jwt wajib" })),
+            ApiJson(json!({ "error": "jwt is required" })),
         )
             .into_response();
     };

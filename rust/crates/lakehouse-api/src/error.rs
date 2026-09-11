@@ -85,12 +85,12 @@ mod tests {
 
     #[tokio::test]
     async fn bad_request_renders_400_with_message() {
-        let resp =
-            ApiRejection(ApiError::BadRequest("Body harus JSON {sql}".to_owned())).into_response();
+        let resp = ApiRejection(ApiError::BadRequest("Body must be JSON {sql}".to_owned()))
+            .into_response();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             body_json(resp).await,
-            json!({"error": "Body harus JSON {sql}"})
+            json!({"error": "Body must be JSON {sql}"})
         );
     }
 

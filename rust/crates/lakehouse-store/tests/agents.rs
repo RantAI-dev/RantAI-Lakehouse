@@ -582,8 +582,8 @@ async fn record_run_outcome_sets_status_and_appends_step(pool: PgPool) -> sqlx::
         &pool,
         &run_id,
         "rejected",
-        "Ditolak",
-        "tidak sesuai kebijakan",
+        "Rejected",
+        "does not meet policy",
     )
     .await
     .unwrap();
@@ -593,7 +593,7 @@ async fn record_run_outcome_sets_status_and_appends_step(pool: PgPool) -> sqlx::
     assert!(run.ended_at.is_some());
     assert_eq!(run.steps.len(), 2);
     assert_eq!(run.steps[1].status, "rejected");
-    assert_eq!(run.steps[1].detail, "tidak sesuai kebijakan");
+    assert_eq!(run.steps[1].detail, "does not meet policy");
     // The original pending-call step must still be there, untouched.
     assert_eq!(run.steps[0].status, "pending");
     Ok(())

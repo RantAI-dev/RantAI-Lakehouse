@@ -66,7 +66,7 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiErro
 fn required(field: &str, value: &str) -> Result<String, ApiError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err(ApiError::BadRequest(format!("{field} wajib diisi")));
+        return Err(ApiError::BadRequest(format!("{field} is required")));
     }
     Ok(trimmed.to_owned())
 }
@@ -508,7 +508,7 @@ pub async fn decide_approval(
             pg,
             &run_id,
             "rejected",
-            "Ditolak",
+            "Rejected",
             body.comment.as_deref().unwrap_or(""),
         )
         .await
@@ -524,9 +524,9 @@ pub async fn decide_approval(
     // action (plan invariant 3 / the copilot-operations-handover plan's
     // permission rule).
     let Some(spec) = ai_registry::find(&approval.action) else {
-        let detail = format!("tool tidak dikenal: {}", approval.action);
+        let detail = format!("unknown tool: {}", approval.action);
         if let Err(err) =
-            agents::record_run_outcome(pg, &run_id, "failed", "Tidak dieksekusi", &detail).await
+            agents::record_run_outcome(pg, &run_id, "failed", "Not executed", &detail).await
         {
             tracing::warn!(%err, run_id, "failed to record not-executed outcome");
         }
@@ -535,12 +535,12 @@ pub async fn decide_approval(
 
     if !spec.permission.is_empty() && !principal.permissions.has(spec.permission) {
         let detail = format!(
-            "approval disetujui, TAPI tidak dieksekusi: approver tidak punya izin '{}' untuk \
-             menjalankan tool ini",
+            "approval approved, BUT not executed: approver lacks permission '{}' to run \
+             this tool",
             spec.permission
         );
         if let Err(err) =
-            agents::record_run_outcome(pg, &run_id, "failed", "Tidak dieksekusi", &detail).await
+            agents::record_run_outcome(pg, &run_id, "failed", "Not executed", &detail).await
         {
             tracing::warn!(%err, run_id, "failed to record permission-denied outcome");
         }
@@ -567,9 +567,9 @@ pub async fn decide_approval(
         .await?
         .ok_or_else(|| ApiError::Internal(format!("linked run {run_id} vanished")))?;
     let Some(pending) = agents::pending_tool_call(&run) else {
-        let detail = "run yang disetujui tidak menyimpan tool call".to_owned();
+        let detail = "the approved run has no stored tool call".to_owned();
         if let Err(err) =
-            agents::record_run_outcome(pg, &run_id, "failed", "Tidak dieksekusi", &detail).await
+            agents::record_run_outcome(pg, &run_id, "failed", "Not executed", &detail).await
         {
             tracing::warn!(%err, run_id, "failed to record missing-tool-call outcome");
         }
@@ -583,7 +583,7 @@ pub async fn decide_approval(
         pg,
         &run_id,
         status,
-        "Eksekusi setelah disetujui",
+        "Executed after approval",
         &serde_json::to_string(&result).unwrap_or_default(),
     )
     .await
@@ -673,7 +673,7 @@ fn check_employee_run_auth(
     match principal {
         Some(p) if p.permissions.has("agent:manage") => Ok(RunAuth::Principal(p.clone())),
         Some(_) => Err(ApiError::PermissionDenied(
-            "agent:manage wajib untuk menjalankan employee secara manual".to_owned(),
+            "agent:manage is required to run an employee manually".to_owned(),
         )),
         None => Err(ApiError::unauthorized()),
     }
@@ -855,7 +855,7 @@ async fn run_headless_loop(
             Ok(m) => m,
             Err(err) => {
                 step_no += 1;
-                let detail = format!("AI Copilot tak tersedia: {err}");
+                let detail = format!("AI Copilot unavailable: {err}");
                 append_step(
                     pg,
                     run_id,
@@ -928,7 +928,7 @@ async fn run_headless_loop(
             if !is_build && is_write {
                 step_no += 1;
                 let detail = format!(
-                    "ditolak: mode ask tidak boleh menjalankan tool tulis ({})",
+                    "refused: ask mode may not run a write tool ({})",
                     call.function.name
                 );
                 append_step(
@@ -974,7 +974,7 @@ async fn run_headless_loop(
             {
                 step_no += 1;
                 let detail = format!(
-                    "ditolak: employee ini tidak punya izin '{}' untuk tool {}",
+                    "refused: this employee lacks permission '{}' for tool {}",
                     spec.permission, call.function.name
                 );
                 append_step(
@@ -1018,8 +1018,8 @@ async fn run_headless_loop(
                 let (_, resource_id) =
                     ai_audit::resource_for(&call.function.name, &args, &json!({}));
                 let reason = format!(
-                    "Menjalankan tool berisiko tinggi {} yang butuh persetujuan manusia \
-                     (dipicu oleh run headless employee {employee_id}).",
+                    "Running high-risk tool {} which requires human approval \
+                     (triggered by headless employee run {employee_id}).",
                     call.function.name
                 );
                 let pending = json!({ "tool": spec.name, "args": redacted });
@@ -1041,8 +1041,8 @@ async fn run_headless_loop(
                         tool: spec.name,
                         resource: resource_id.as_deref(),
                         reason: &reason,
-                        risk: "Tindakan berisiko tinggi (WriteHigh): tidak dapat dibatalkan \
-                               setelah dijalankan.",
+                        risk: "High-risk action (WriteHigh): cannot be undone once \
+                               executed.",
                         redacted_args: &redacted,
                     },
                 )
@@ -1084,7 +1084,7 @@ async fn run_headless_loop(
                             resource_id.as_deref(),
                             &Value::Object(args.clone()),
                             "failed",
-                            Some("gagal membuat approval"),
+                            Some("failed to create approval"),
                             run_id,
                             None,
                         )
@@ -1142,7 +1142,7 @@ async fn run_headless_loop(
         &format!("step-{step_no}"),
         "budget",
         "failed",
-        "batas iterasi tool tercapai",
+        "tool iteration budget reached",
     )
     .await;
     HeadlessOutcome::Terminal("failed")
@@ -1249,8 +1249,7 @@ pub async fn run_employee(
 
     if id == agents::COPILOT_EMPLOYEE_ID {
         return Err(ApiError::BadRequest(
-            "emp-copilot adalah baris interaktif khusus dan tidak bisa dijalankan headless"
-                .to_owned(),
+            "emp-copilot is a special interactive-only row and cannot be run headlessly".to_owned(),
         )
         .into());
     }
@@ -1261,7 +1260,7 @@ pub async fn run_employee(
 
     if matches!(config.status.as_str(), "paused" | "cancelled") {
         return Err(ApiError::Conflict(format!(
-            "Employee {id} berstatus \"{}\" dan tidak dapat dijalankan",
+            "Employee {id} has status \"{}\" and cannot be run",
             config.status
         ))
         .into());
@@ -1276,7 +1275,7 @@ pub async fn run_employee(
     let employee_prompt = config.prompt.clone().filter(|p| !p.trim().is_empty());
     let Some(prompt) = override_prompt.or(employee_prompt) else {
         return Err(ApiError::BadRequest(format!(
-            "Employee {id} tidak punya prompt, dan tidak ada override yang diberikan"
+            "Employee {id} has no prompt, and none was supplied as an override"
         ))
         .into());
     };

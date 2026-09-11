@@ -89,7 +89,7 @@ pub async fn send_webhook(
     // `/^https?:\/\/i.test(url)` — case-insensitive prefix check.
     let lower = url.to_ascii_lowercase();
     if !(lower.starts_with("http://") || lower.starts_with("https://")) {
-        return DeliverResult::err("URL webhook tidak valid");
+        return DeliverResult::err("invalid webhook URL");
     }
     let body = json!({
         "text": format!("*{title}*\n{text}"),
@@ -156,10 +156,10 @@ impl EmailSender {
     /// Send an email, matching `sendEmail(to, subject, html)`.
     ///
     /// Validation order, matching the TypeScript exactly:
-    /// 1. `SMTP_HOST` unset → `{ ok: false, error: "SMTP belum
-    ///    dikonfigurasi ..." }`, without attempting anything else.
-    /// 2. `to` empty or missing `@` → `{ ok: false, error: "alamat email
-    ///    tidak valid" }`.
+    /// 1. `SMTP_HOST` unset → `{ ok: false, error: "SMTP is not
+    ///    configured ..." }`, without attempting anything else.
+    /// 2. `to` empty or missing `@` → `{ ok: false, error: "invalid
+    ///    email address" }`.
     /// 3. Otherwise, connect and send; a transport-level failure is
     ///    reported via its `Display` message.
     ///
@@ -171,11 +171,11 @@ impl EmailSender {
     pub async fn send(&self, to: &str, subject: &str, html: &str) -> DeliverResult {
         let Some(host) = &self.config.host else {
             return DeliverResult::err(
-                "SMTP belum dikonfigurasi (set SMTP_HOST/PORT/USER/PASS/FROM di env)",
+                "SMTP is not configured (set SMTP_HOST/PORT/USER/PASS/FROM in the environment)",
             );
         };
         if to.is_empty() || !to.contains('@') {
-            return DeliverResult::err("alamat email tidak valid");
+            return DeliverResult::err("invalid email address");
         }
 
         let message = match build_message(&self.config.from, to, subject, html) {
@@ -256,7 +256,7 @@ mod tests {
     async fn webhook_rejects_non_http_url() {
         let client = reqwest::Client::new();
         let result = send_webhook(&client, "ftp://example.com", "t", "x").await;
-        assert_eq!(result, DeliverResult::err("URL webhook tidak valid"));
+        assert_eq!(result, DeliverResult::err("invalid webhook URL"));
     }
 
     #[tokio::test]
@@ -309,7 +309,7 @@ mod tests {
         assert_eq!(
             result,
             DeliverResult::err(
-                "SMTP belum dikonfigurasi (set SMTP_HOST/PORT/USER/PASS/FROM di env)"
+                "SMTP is not configured (set SMTP_HOST/PORT/USER/PASS/FROM in the environment)"
             )
         );
     }
@@ -318,10 +318,10 @@ mod tests {
     async fn email_rejects_invalid_address() {
         let sender = EmailSender::new(cfg(Some("smtp.example.com")));
         let result = sender.send("not-an-email", "s", "<p>hi</p>").await;
-        assert_eq!(result, DeliverResult::err("alamat email tidak valid"));
+        assert_eq!(result, DeliverResult::err("invalid email address"));
 
         let result_empty = sender.send("", "s", "<p>hi</p>").await;
-        assert_eq!(result_empty, DeliverResult::err("alamat email tidak valid"));
+        assert_eq!(result_empty, DeliverResult::err("invalid email address"));
     }
 
     #[test]
@@ -374,7 +374,7 @@ mod tests {
         assert_eq!(
             result,
             DeliverResult::err(
-                "SMTP belum dikonfigurasi (set SMTP_HOST/PORT/USER/PASS/FROM di env)"
+                "SMTP is not configured (set SMTP_HOST/PORT/USER/PASS/FROM in the environment)"
             )
         );
     }

@@ -500,7 +500,9 @@ pub async fn create_board(ch: &ChClient, name: &str) -> Result<Board, BiError> {
     ensure_bi_table(ch).await?;
     let clean = name.trim();
     if clean.is_empty() {
-        return Err(BiError::Validation("nama dashboard wajib.".to_owned()));
+        return Err(BiError::Validation(
+            "dashboard name is required.".to_owned(),
+        ));
     }
     let id = new_board_id();
     let sql = format!(
@@ -603,7 +605,7 @@ pub async fn rename_board(ch: &ChClient, id: &str, name: &str) -> Result<(), BiE
     ensure_bi_table(ch).await?;
     let clean = name.trim();
     if clean.is_empty() {
-        return Err(BiError::Validation("nama wajib.".to_owned()));
+        return Err(BiError::Validation("name is required.".to_owned()));
     }
     if let Some(board) = get_board(ch, id).await? {
         save_board_patch(
@@ -696,7 +698,7 @@ pub async fn set_board_public(ch: &ChClient, id: &str, enable: bool) -> Result<S
     ensure_bi_table(ch).await?;
     let board = get_board(ch, id)
         .await?
-        .ok_or_else(|| BiError::Validation("dashboard tidak ditemukan.".to_owned()))?;
+        .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
     let token = if enable {
         let existing = board.public_token.clone().unwrap_or_default();
         if existing.is_empty() {
@@ -729,7 +731,7 @@ pub async fn set_board_embed(ch: &ChClient, id: &str, enable: bool) -> Result<bo
     ensure_bi_table(ch).await?;
     let board = get_board(ch, id)
         .await?
-        .ok_or_else(|| BiError::Validation("dashboard tidak ditemukan.".to_owned()))?;
+        .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
     save_board_patch(
         ch,
         &board,
@@ -794,7 +796,7 @@ pub async fn duplicate_board(ch: &ChClient, id: &str) -> Result<Board, BiError> 
     ensure_bi_table(ch).await?;
     let src = get_board(ch, id)
         .await?
-        .ok_or_else(|| BiError::Validation("dashboard tidak ditemukan.".to_owned()))?;
+        .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
     let charts = list_stored_charts(ch).await?;
     let charts: Vec<_> = charts.into_iter().filter(|c| c.board == id).collect();
     let new_board = create_board(ch, &format!("{} (salinan)", src.name)).await?;
@@ -982,7 +984,7 @@ async fn validated_mart_columns(
         .unwrap_or(0);
     if n == 0 {
         return Err(BiError::Validation(format!(
-            "mart Gold '{mart}' tidak ditemukan di serving."
+            "Gold mart '{mart}' not found in serving."
         )));
     }
     let cols_sql = format!(
@@ -1064,9 +1066,9 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         target,
     };
     let measure_ident = Ident::new(m.as_str())
-        .map_err(|_| BiError::Validation("kolom measure tidak valid / tak ada.".to_owned()))?;
+        .map_err(|_| BiError::Validation("invalid or missing measure column.".to_owned()))?;
     let mart_ident = Ident::new(mart.as_str())
-        .map_err(|_| BiError::Validation(format!("nama mart tidak valid: {mart}")))?;
+        .map_err(|_| BiError::Validation(format!("invalid mart name: {mart}")))?;
     // `agg` was already checked against `aggregate_allowed` above, so this
     // conversion is exact (never hits the `Sum` fallback).
     let sql = build_kpi_sql(
@@ -1131,7 +1133,7 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
     } = ctx;
     let text = input.text.as_deref().unwrap_or_default().trim().to_owned();
     if text.is_empty() {
-        return Err(BiError::Validation("konten teks wajib.".to_owned()));
+        return Err(BiError::Validation("text content is required.".to_owned()));
     }
     let def = ChartInput {
         title: title.clone(),
@@ -1209,12 +1211,12 @@ fn validate_chart_shape(
 ) -> Result<(), BiError> {
     if !IDENT_ALLOWED(dimension) || !cols.contains(dimension) {
         return Err(BiError::Validation(format!(
-            "kolom dimensi '{dimension}' tak valid / tak ada."
+            "invalid or missing dimension column '{dimension}'."
         )));
     }
     if kind == ChartKind::Stacked && measures.len() < 2 {
         return Err(BiError::Validation(
-            "chart 'stacked' butuh ≥2 measure.".to_owned(),
+            "a 'stacked' chart needs >=2 measures.".to_owned(),
         ));
     }
     if (kind == ChartKind::Scatter || kind == ChartKind::Combo) && measures.len() < 2 {
@@ -1223,39 +1225,39 @@ fn validate_chart_shape(
             .and_then(|v| v.as_str().map(str::to_owned))
             .unwrap_or_default();
         return Err(BiError::Validation(format!(
-            "chart '{label}' butuh 2 measure (X & Y)."
+            "a '{label}' chart needs 2 measures (X & Y)."
         )));
     }
     if kind == ChartKind::Bubble && measures.len() < 3 {
         return Err(BiError::Validation(
-            "chart 'bubble' butuh 3 measure (X, Y, ukuran).".to_owned(),
+            "a 'bubble' chart needs 3 measures (X, Y, size).".to_owned(),
         ));
     }
     if !breakdown.is_empty() {
         if !IDENT_ALLOWED(breakdown) || !cols.contains(breakdown) {
             return Err(BiError::Validation(format!(
-                "kolom breakdown '{breakdown}' tak valid / tak ada."
+                "invalid or missing breakdown column '{breakdown}'."
             )));
         }
         if breakdown == dimension {
             return Err(BiError::Validation(
-                "breakdown harus beda dari dimensi.".to_owned(),
+                "breakdown must differ from dimension.".to_owned(),
             ));
         }
         if !breakdown_allowed(kind) {
             return Err(BiError::Validation(
-                "breakdown hanya untuk bar/hbar/line/area/heatmap.".to_owned(),
+                "breakdown is only for bar/hbar/line/area/heatmap.".to_owned(),
             ));
         }
         if measures.len() > 1 {
             return Err(BiError::Validation(
-                "dengan breakdown, pakai tepat satu measure.".to_owned(),
+                "with a breakdown, use exactly one measure.".to_owned(),
             ));
         }
     }
     if kind == ChartKind::Heatmap && breakdown.is_empty() {
         return Err(BiError::Validation(
-            "heatmap butuh breakdown (dimensi ke-2).".to_owned(),
+            "heatmap needs a breakdown (2nd dimension).".to_owned(),
         ));
     }
     Ok(())
@@ -1275,22 +1277,24 @@ fn build_chart_sql(
     limit: u32,
     breakdown: Option<&str>,
 ) -> Result<String, BiError> {
-    let mart_ident = Ident::new(mart)
-        .map_err(|_| BiError::Validation(format!("nama mart tidak valid: {mart}")))?;
+    let mart_ident =
+        Ident::new(mart).map_err(|_| BiError::Validation(format!("invalid mart name: {mart}")))?;
     let dimension_ident = Ident::new(dimension).map_err(|_| {
-        BiError::Validation(format!("kolom dimensi '{dimension}' tak valid / tak ada."))
+        BiError::Validation(format!(
+            "invalid or missing dimension column '{dimension}'."
+        ))
     })?;
     let mut measure_idents = Vec::with_capacity(measures.len());
     for m in measures {
         measure_idents.push(
             Ident::new(m.as_str()).map_err(|_| {
-                BiError::Validation("kolom measure tidak valid / tak ada.".to_owned())
+                BiError::Validation("invalid or missing measure column.".to_owned())
             })?,
         );
     }
     let breakdown_ident = match breakdown {
         Some(b) => Some(Ident::new(b).map_err(|_| {
-            BiError::Validation(format!("kolom breakdown '{b}' tak valid / tak ada."))
+            BiError::Validation(format!("invalid or missing breakdown column '{b}'."))
         })?),
         None => None,
     };
@@ -1425,12 +1429,12 @@ struct CommonFields {
 fn derive_common_fields(input: &ChartInput, id: Option<String>) -> Result<CommonFields, BiError> {
     let title = input.title.trim().to_owned();
     if title.is_empty() {
-        return Err(BiError::Validation("title wajib diisi.".to_owned()));
+        return Err(BiError::Validation("title is required.".to_owned()));
     }
     let kind = input.kind;
     if !KINDS.contains(&kind) {
         return Err(BiError::Validation(format!(
-            "kind tidak valid: {}",
+            "invalid kind: {}",
             serde_json::to_value(kind)
                 .map_or_else(|_| "?".to_owned(), |v| v.as_str().unwrap_or("?").to_owned())
         )));
@@ -1511,7 +1515,7 @@ pub async fn spec_from_input(
         .to_owned();
     if !IDENT_ALLOWED(&mart) {
         return Err(BiError::Validation(format!(
-            "nama mart tidak valid: {}",
+            "invalid mart name: {}",
             input.mart
         )));
     }
@@ -1523,12 +1527,12 @@ pub async fn spec_from_input(
         .unwrap_or_else(|| "sum".to_owned())
         .to_lowercase();
     if !aggregate_allowed(&agg) {
-        return Err(BiError::Validation(format!("aggregate tidak valid: {agg}")));
+        return Err(BiError::Validation(format!("invalid aggregate: {agg}")));
     }
     let measures = input.measures.clone();
     if measures.is_empty() {
         return Err(BiError::Validation(
-            "minimal satu kolom measure.".to_owned(),
+            "at least one measure column is required.".to_owned(),
         ));
     }
     if measures
@@ -1536,7 +1540,7 @@ pub async fn spec_from_input(
         .any(|m| !IDENT_ALLOWED(m) || !cols.contains(m))
     {
         return Err(BiError::Validation(
-            "kolom measure tidak valid / tak ada.".to_owned(),
+            "invalid or missing measure column.".to_owned(),
         ));
     }
 

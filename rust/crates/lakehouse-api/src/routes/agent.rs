@@ -251,7 +251,7 @@ fn is_word_char(c: char) -> bool {
 
 fn parse_question_body(body: &Bytes) -> Result<QuestionBody, ApiError> {
     serde_json::from_slice(body)
-        .map_err(|_err| ApiError::BadRequest("Body harus JSON {question}".to_owned()))
+        .map_err(|_err| ApiError::BadRequest("Body must be JSON {question}".to_owned()))
 }
 
 // ── POST /api/agent/ask ─────────────────────────────────────────────────
@@ -354,12 +354,14 @@ pub async fn ask(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJso
     let parsed = parse_question_body(&body)?;
     let question = match parsed.question {
         Some(q) if !q.trim().is_empty() => q,
-        _ => return Err(ApiError::BadRequest("question wajib".to_owned()).into()),
+        _ => return Err(ApiError::BadRequest("question is required".to_owned()).into()),
     };
 
     let hits = search_catalog(&state.clickhouse, &question)
         .await
-        .map_err(|err| ApiError::Unprocessable(format!("Gagal cari katalog: Error: {err}")))?;
+        .map_err(|err| {
+            ApiError::Unprocessable(format!("Failed to search catalog: Error: {err}"))
+        })?;
 
     let context = if hits.is_empty() {
         "(tidak ada dataset yang cocok)".to_owned()
@@ -397,7 +399,7 @@ pub async fn ask(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJso
     {
         Ok(a) => a,
         // LLM down: return the retrieval result honestly, without a summary.
-        Err(err) => format!("Agent LLM tak tersedia ({err}). Dataset yang cocok:\n{context}"),
+        Err(err) => format!("Agent LLM unavailable ({err}). Matching datasets:\n{context}"),
     };
 
     Ok(ApiJson(json!({
@@ -440,17 +442,17 @@ pub async fn query(State(state): State<AppState>, body: Bytes) -> Response {
     };
     let question = match parsed.question {
         Some(q) if !q.trim().is_empty() => q,
-        _ => return err_response(ApiError::BadRequest("question wajib".to_owned())),
+        _ => return err_response(ApiError::BadRequest("question is required".to_owned())),
     };
 
     let mut steps = vec![
-        json!({ "step": "skema", "detail": "Membaca skema mart Gold + Silver dari lakehouse." }),
+        json!({ "step": "schema", "detail": "Reading the Gold + Silver mart schema from the lakehouse." }),
     ];
     let schema = match schema_context(&state.clickhouse).await {
         Ok(s) => s,
         Err(err) => {
             return err_response(ApiError::Unprocessable(format!(
-                "Gagal baca skema: Error: {err}"
+                "Failed to read schema: Error: {err}"
             )));
         }
     };
@@ -475,7 +477,7 @@ pub async fn query(State(state): State<AppState>, body: Bytes) -> Response {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 ApiJson(json!({
-                    "error": "Agent LLM tak tersedia",
+                    "error": "Agent LLM unavailable",
                     "detail": err.to_string(),
                     "hint": "Set LLM_KEY (MiniMax) di .env.local.",
                 })),
@@ -486,7 +488,7 @@ pub async fn query(State(state): State<AppState>, body: Bytes) -> Response {
     let Some(gen_res) = extract_sql_json(&gen_out) else {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            ApiJson(json!({ "error": "LLM tak menghasilkan SQL valid" })),
+            ApiJson(json!({ "error": "LLM did not produce valid SQL" })),
         )
             .into_response();
     };
@@ -498,17 +500,17 @@ pub async fn query(State(state): State<AppState>, body: Bytes) -> Response {
 
     for attempt in 0..=MAX_FIX {
         if !is_read_only_sql(&sql) {
-            "SQL ditolak (hanya SELECT diizinkan).".clone_into(&mut last_error);
+            "SQL rejected (only SELECT is allowed).".clone_into(&mut last_error);
             break;
         }
         match state.clickhouse.query(&sql, None).await {
             Ok(r) => {
                 let step = if attempt == 0 {
-                    "jalankan".to_owned()
+                    "run".to_owned()
                 } else {
-                    format!("koreksi-{attempt}")
+                    format!("correction-{attempt}")
                 };
-                steps.push(json!({ "step": step, "detail": format!("OK, {} baris", r.rows) }));
+                steps.push(json!({ "step": step, "detail": format!("OK, {} rows", r.rows) }));
                 result = Some(r);
                 break;
             }
@@ -542,7 +544,7 @@ pub async fn query(State(state): State<AppState>, body: Bytes) -> Response {
                     break;
                 };
                 sql = fixed.sql;
-                steps.push(json!({ "step": format!("perbaiki-{}", attempt + 1), "detail": sql }));
+                steps.push(json!({ "step": format!("fix-{}", attempt + 1), "detail": sql }));
             }
         }
     }
@@ -552,7 +554,7 @@ pub async fn query(State(state): State<AppState>, body: Bytes) -> Response {
             StatusCode::UNPROCESSABLE_ENTITY,
             ApiJson(json!({
                 "sql": sql,
-                "error": "Query gagal setelah koreksi",
+                "error": "Query failed after correction",
                 "detail": last_error,
                 "steps": steps,
                 "explanation": gen_res.explanation,
@@ -641,15 +643,15 @@ struct TextToSqlBody {
 /// `runError` at 200 instead — matching the `TypeScript`).
 pub async fn text_to_sql(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
     let parsed: TextToSqlBody = serde_json::from_slice(&body)
-        .map_err(|_err| ApiError::BadRequest("Body harus JSON {question, run?}".to_owned()))?;
+        .map_err(|_err| ApiError::BadRequest("Body must be JSON {question, run?}".to_owned()))?;
     let question = match parsed.question {
         Some(q) if !q.trim().is_empty() => q,
-        _ => return Err(ApiError::BadRequest("question wajib".to_owned()).into()),
+        _ => return Err(ApiError::BadRequest("question is required".to_owned()).into()),
     };
 
     let schema = schema_context(&state.clickhouse)
         .await
-        .map_err(|err| ApiError::Unprocessable(format!("Gagal baca skema: Error: {err}")))?;
+        .map_err(|err| ApiError::Unprocessable(format!("Failed to read schema: Error: {err}")))?;
 
     let messages = [
         system_msg(TEXT_TO_SQL_SYSTEM),
@@ -661,12 +663,12 @@ pub async fn text_to_sql(State(state): State<AppState>, body: Bytes) -> ApiResul
         .await
         .map_err(|err| {
             ApiError::Unprocessable(format!(
-                "Agent LLM tak tersedia: detail={err} hint=Set env LLM_URL/LLM_MODEL ke node yang aktif (llm-node)."
+                "Agent LLM unavailable: detail={err} hint=Set env LLM_URL/LLM_MODEL to point at an active node (llm-node)."
             ))
         })?;
     let Some(out) = extract_sql_json(&content) else {
         return Err(ApiError::Unprocessable(
-            "Agent LLM tak tersedia: LLM tak mengembalikan JSON SQL yang valid.".to_owned(),
+            "Agent LLM unavailable: LLM did not return valid SQL JSON.".to_owned(),
         )
         .into());
     };
@@ -676,7 +678,7 @@ pub async fn text_to_sql(State(state): State<AppState>, body: Bytes) -> ApiResul
             "sql": out.sql,
             "explanation": out.explanation,
             "assumptions": out.assumptions,
-            "error": "SQL ditolak (hanya SELECT diizinkan).",
+            "error": "SQL rejected (only SELECT is allowed).",
         })));
     }
 

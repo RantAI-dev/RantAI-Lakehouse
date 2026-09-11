@@ -292,7 +292,7 @@ struct NormalizedRule {
 fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError> {
     let name = input.name.as_deref().unwrap_or("").trim().to_owned();
     if name.is_empty() {
-        return Err(AlertError::Validation("nama wajib.".to_owned()));
+        return Err(AlertError::Validation("name is required.".to_owned()));
     }
     let kind = if input.kind.as_deref() == Some("digest") {
         AlertKind::Digest
@@ -307,19 +307,17 @@ fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError>
     let target = input.target.as_deref().unwrap_or("").trim().to_owned();
     if target.is_empty() {
         return Err(AlertError::Validation(
-            "target (webhook URL / email) wajib.".to_owned(),
+            "target (webhook URL / email) is required.".to_owned(),
         ));
     }
     if channel == AlertChannel::Webhook {
         let lower = target.to_ascii_lowercase();
         if !(lower.starts_with("http://") || lower.starts_with("https://")) {
-            return Err(AlertError::Validation(
-                "webhook URL tidak valid.".to_owned(),
-            ));
+            return Err(AlertError::Validation("invalid webhook URL.".to_owned()));
         }
     }
     if channel == AlertChannel::Email && !target.contains('@') {
-        return Err(AlertError::Validation("email tidak valid.".to_owned()));
+        return Err(AlertError::Validation("invalid email.".to_owned()));
     }
 
     if kind == AlertKind::Alert {
@@ -337,15 +335,13 @@ fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError>
             .unwrap_or(AlertOp::Gt);
         let threshold = input.threshold.unwrap_or(0.0);
         if Ident::new(&mart).is_err() || Ident::new(&measure).is_err() {
-            return Err(AlertError::Validation(
-                "mart/measure tidak valid.".to_owned(),
-            ));
+            return Err(AlertError::Validation("invalid mart/measure.".to_owned()));
         }
         if !aggregate_allowed(&agg) {
-            return Err(AlertError::Validation("aggregate tidak valid.".to_owned()));
+            return Err(AlertError::Validation("invalid aggregate.".to_owned()));
         }
         if !threshold.is_finite() {
-            return Err(AlertError::Validation("threshold tidak valid.".to_owned()));
+            return Err(AlertError::Validation("invalid threshold.".to_owned()));
         }
         Ok(NormalizedRule {
             name,
@@ -362,7 +358,9 @@ fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError>
     } else {
         let board = input.board.as_deref().unwrap_or("").to_owned();
         if board.is_empty() {
-            return Err(AlertError::Validation("digest butuh board.".to_owned()));
+            return Err(AlertError::Validation(
+                "digest requires a board.".to_owned(),
+            ));
         }
         Ok(NormalizedRule {
             name,
@@ -567,7 +565,7 @@ pub async fn save_rule(
         // typed error is the Rust-idiomatic equivalent of that same
         // "should never happen" branch.
         None => Err(AlertError::Validation(
-            "rule tersimpan tapi tidak ditemukan.".to_owned(),
+            "rule was saved but could not be found.".to_owned(),
         )),
     }
 }
@@ -652,17 +650,15 @@ async fn current_value(
     agg: &str,
 ) -> Result<f64, AlertError> {
     let mart_ident =
-        Ident::new(mart).map_err(|e| AlertError::Validation(format!("mart tidak valid: {e}")))?;
+        Ident::new(mart).map_err(|e| AlertError::Validation(format!("invalid mart: {e}")))?;
     if !aggregate_allowed(agg) {
-        return Err(AlertError::Validation(format!(
-            "aggregate tidak dikenal: {agg}"
-        )));
+        return Err(AlertError::Validation(format!("unknown aggregate: {agg}")));
     }
     let expr = if agg == "count" {
         "count()".to_owned()
     } else {
         let measure_ident = Ident::new(measure)
-            .map_err(|e| AlertError::Validation(format!("measure tidak valid: {e}")))?;
+            .map_err(|e| AlertError::Validation(format!("invalid measure: {e}")))?;
         format!("round({agg}({measure_ident}))")
     };
     let sql = format!("SELECT {expr} AS v FROM serving.{mart_ident}");
@@ -706,7 +702,7 @@ fn fmt_id_id(n: f64) -> String {
 /// Digest text for a board's `KPI`/gauge tiles. Ports `digestText`.
 async fn digest_text(ch: &ChClient, board_id: &str) -> Result<String, ChError> {
     let Some(board) = lakehouse_bi::store::get_board(ch, board_id).await? else {
-        return Ok("Dashboard tidak ditemukan.".to_owned());
+        return Ok("Dashboard not found.".to_owned());
     };
     let charts = lakehouse_bi::store::list_stored_charts(ch).await?;
     let on_board: Vec<_> = charts.iter().filter(|c| c.board == board_id).collect();
@@ -1020,7 +1016,7 @@ mod tests {
             ..valid_alert_input()
         };
         let err = normalize_input(&input).unwrap_err();
-        assert_eq!(err.to_string(), "nama wajib.");
+        assert_eq!(err.to_string(), "name is required.");
     }
 
     #[test]
@@ -1030,7 +1026,7 @@ mod tests {
             ..valid_alert_input()
         };
         let err = normalize_input(&input).unwrap_err();
-        assert_eq!(err.to_string(), "target (webhook URL / email) wajib.");
+        assert_eq!(err.to_string(), "target (webhook URL / email) is required.");
     }
 
     #[test]
@@ -1040,7 +1036,7 @@ mod tests {
             ..valid_alert_input()
         };
         let err = normalize_input(&input).unwrap_err();
-        assert_eq!(err.to_string(), "webhook URL tidak valid.");
+        assert_eq!(err.to_string(), "invalid webhook URL.");
     }
 
     #[test]
@@ -1051,7 +1047,7 @@ mod tests {
             ..valid_alert_input()
         };
         let err = normalize_input(&input).unwrap_err();
-        assert_eq!(err.to_string(), "email tidak valid.");
+        assert_eq!(err.to_string(), "invalid email.");
     }
 
     #[test]
@@ -1082,7 +1078,7 @@ mod tests {
             ..valid_alert_input()
         };
         let err = normalize_input(&input).unwrap_err();
-        assert_eq!(err.to_string(), "mart/measure tidak valid.");
+        assert_eq!(err.to_string(), "invalid mart/measure.");
     }
 
     #[test]
@@ -1092,7 +1088,7 @@ mod tests {
             ..valid_alert_input()
         };
         let err = normalize_input(&input).unwrap_err();
-        assert_eq!(err.to_string(), "mart/measure tidak valid.");
+        assert_eq!(err.to_string(), "invalid mart/measure.");
     }
 
     #[test]
@@ -1102,7 +1098,7 @@ mod tests {
             ..valid_alert_input()
         };
         let err = normalize_input(&input).unwrap_err();
-        assert_eq!(err.to_string(), "aggregate tidak valid.");
+        assert_eq!(err.to_string(), "invalid aggregate.");
     }
 
     #[test]
@@ -1112,7 +1108,7 @@ mod tests {
             ..valid_alert_input()
         };
         let err = normalize_input(&input).unwrap_err();
-        assert_eq!(err.to_string(), "threshold tidak valid.");
+        assert_eq!(err.to_string(), "invalid threshold.");
     }
 
     #[test]
@@ -1143,7 +1139,7 @@ mod tests {
             ..valid_alert_input()
         };
         let err = normalize_input(&input).unwrap_err();
-        assert_eq!(err.to_string(), "digest butuh board.");
+        assert_eq!(err.to_string(), "digest requires a board.");
     }
 
     #[test]

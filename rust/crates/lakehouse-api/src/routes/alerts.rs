@@ -53,7 +53,7 @@ pub async fn list(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
 /// than contorting the parser to chase Bun's exact wording.
 fn parse_body(body: &Bytes) -> Result<AlertRuleInput, ApiError> {
     serde_json::from_slice(body)
-        .map_err(|err| ApiError::BadRequest(format!("JSON tidak valid: {err}")))
+        .map_err(|err| ApiError::BadRequest(format!("JSON is invalid: {err}")))
 }
 
 /// `POST /api/alerts` — create a rule.
@@ -80,7 +80,7 @@ pub async fn create(State(state): State<AppState>, body: Bytes) -> ApiResult<Api
 pub async fn update(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
     let input = parse_body(&body)?;
     let Some(id) = input.id.clone() else {
-        return Err(ApiError::BadRequest("id wajib".to_owned()).into());
+        return Err(ApiError::BadRequest("id is required".to_owned()).into());
     };
     let rule = lakehouse_alerts::save_rule(&state.clickhouse, &input, Some(&id))
         .await
@@ -106,7 +106,7 @@ pub async fn delete(
     Query(query): Query<DeleteQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let Some(id) = query.id else {
-        return Err(ApiError::BadRequest("id wajib".to_owned()).into());
+        return Err(ApiError::BadRequest("id is required".to_owned()).into());
     };
     lakehouse_alerts::delete_rule(&state.clickhouse, &id)
         .await
@@ -162,8 +162,8 @@ fn check_run_token(
     match principal {
         Some(p) if matches!(p.id, PrincipalId::Service(_)) => Ok(()),
         _ => Err(ApiError::Unavailable(
-            "alerts run tidak dikonfigurasi: set ALERTS_RUN_TOKEN, atau panggil dengan \
-             kredensial service identity (bukan sesi pengguna manusia)"
+            "alerts run is not configured: set ALERTS_RUN_TOKEN, or call with \
+             service-identity credentials (not a human user session)"
                 .to_owned(),
         )),
     }

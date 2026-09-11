@@ -308,7 +308,7 @@ fn build_namespaces(assets: &[Value]) -> Vec<Value> {
         .into_iter()
         .map(|name| {
             let (meta_name, description) = ns_meta(&name);
-            // Dihitung sebelum `json!`, karena `"id": name` memindahkan `name`.
+            // Computed before `json!`, because `"id": name` moves `name`.
             let display = if meta_name.is_empty() {
                 name.clone()
             } else {
@@ -655,7 +655,7 @@ fn bronze_detail_body(
 }
 
 fn not_found() -> ApiRejection {
-    ApiError::NotFound("Aset tidak ditemukan".to_owned()).into()
+    ApiError::NotFound("Asset not found".to_owned()).into()
 }
 
 #[cfg(test)]

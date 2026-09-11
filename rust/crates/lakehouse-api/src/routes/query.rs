@@ -29,12 +29,12 @@ struct SqlBody {
 /// Parse the raw request body as `{"sql": "..."}`.
 ///
 /// Both routes share one `try { ({ sql } = await req.json()) } catch { ...
-/// "Body harus JSON {sql}" ... }` shape in the `TypeScript`: any body that
+/// "Body must be JSON {sql}" ... }` shape in the `TypeScript`: any body that
 /// doesn't parse as JSON at all — not merely a body missing `sql` — is a
 /// 400 with this exact message.
 fn parse_body(body: &Bytes) -> Result<SqlBody, ApiError> {
     serde_json::from_slice(body)
-        .map_err(|_err| ApiError::BadRequest("Body harus JSON {sql}".to_owned()))
+        .map_err(|_err| ApiError::BadRequest("Body must be JSON {sql}".to_owned()))
 }
 
 /// Whether `sql` is a read-only statement `ClickHouse` may run from Query
@@ -124,11 +124,11 @@ pub async fn run(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJso
     let parsed = parse_body(&body)?;
     let sql = match parsed.sql {
         Some(s) if !s.is_empty() => s,
-        _ => return Err(ApiError::BadRequest("sql wajib diisi".to_owned()).into()),
+        _ => return Err(ApiError::BadRequest("sql is required".to_owned()).into()),
     };
     if !is_read_only(&sql) {
         return Err(ApiError::Unprocessable(
-            "Hanya query baca (SELECT/SHOW/DESCRIBE/EXPLAIN) yang diizinkan di Query Studio."
+            "Only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) are allowed in Query Studio."
                 .to_owned(),
         )
         .into());
@@ -319,7 +319,7 @@ pub async fn estimate(State(state): State<AppState>, body: Bytes) -> ApiResult<A
     let parsed = parse_body(&body)?;
     let sql = match parsed.sql {
         Some(s) if !s.trim().is_empty() => s,
-        _ => return Err(ApiError::BadRequest("sql wajib diisi".to_owned()).into()),
+        _ => return Err(ApiError::BadRequest("sql is required".to_owned()).into()),
     };
 
     let (estimated_bytes, sources) = estimate_body(&state.clickhouse, &sql).await;

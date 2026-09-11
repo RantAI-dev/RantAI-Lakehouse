@@ -70,7 +70,7 @@ async fn run_saved_query_rejects_a_saved_drop_statement() {
         .as_str()
         .expect("run_saved_query must refuse a DROP statement");
     assert!(
-        error.contains("Hanya query baca"),
+        error.contains("Only read queries"),
         "must be refused by the same read-only guard `/api/query/run` uses: {error}"
     );
 }
@@ -97,7 +97,7 @@ async fn run_saved_query_rejects_a_saved_insert_statement() {
     let error = ran["result"]["error"]
         .as_str()
         .expect("run_saved_query must refuse an INSERT statement");
-    assert!(error.contains("Hanya query baca"), "{error}");
+    assert!(error.contains("Only read queries"), "{error}");
 }
 
 /// A saved SELECT is NOT refused by the guard (it may still fail later
@@ -123,7 +123,7 @@ async fn run_saved_query_does_not_refuse_a_saved_select() {
     let ran = call_tool(&router, &cookie, "run_saved_query", json!({ "id": id })).await;
     if let Some(error) = ran["result"]["error"].as_str() {
         assert!(
-            !error.contains("Hanya query baca"),
+            !error.contains("Only read queries"),
             "a plain SELECT must never be refused by the read-only guard: {error}"
         );
     }

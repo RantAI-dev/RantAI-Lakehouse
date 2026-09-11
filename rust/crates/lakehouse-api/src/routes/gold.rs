@@ -107,8 +107,8 @@ fn check_export_token(
     match principal {
         Some(p) if matches!(p.id, PrincipalId::Service(_)) => Ok(()),
         _ => Err(ApiError::Unavailable(
-            "gold export tidak dikonfigurasi: set GOLD_EXPORT_RUN_TOKEN, atau panggil dengan \
-             kredensial service identity (bukan sesi pengguna manusia)"
+            "gold export is not configured: set GOLD_EXPORT_RUN_TOKEN, or call with \
+             service-identity credentials (not a human user session)"
                 .to_owned(),
         )),
     }
@@ -132,8 +132,8 @@ fn check_export_token(
 pub(crate) async fn read_catalog_token(path: &str) -> Result<SecretValue, ApiError> {
     let raw = tokio::fs::read_to_string(path).await.map_err(|err| {
         ApiError::Unavailable(format!(
-            "Lakekeeper gold-export token tidak dapat dibaca dari {path:?}: {err} \
-             (Gold export belum diprovisikan pada deployment ini — lihat ADR 0011)"
+            "Lakekeeper gold-export token could not be read from {path:?}: {err} \
+             (Gold export has not been provisioned on this deployment — see ADR 0011)"
         ))
     })?;
     Ok(SecretValue::new(raw.trim().to_owned()))
@@ -176,7 +176,7 @@ pub async fn export(
     )?;
 
     let mart_ident =
-        Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("mart tidak valid: {e}")))?;
+        Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
 
     // Held for the rest of this handler (dropped at function return,
     // success or error alike) — see this function's "Single-flight" doc
@@ -188,7 +188,7 @@ pub async fn export(
         .await
         .map_err(|_| {
             ApiError::Conflict(format!(
-                "export mart {:?} sedang berjalan; tunggu sampai selesai sebelum mencoba lagi",
+                "export for mart {:?} is already running; wait for it to finish before retrying",
                 mart_ident.as_str()
             ))
         })?;
@@ -252,7 +252,7 @@ pub async fn read_back(
     )?;
 
     let mart_ident =
-        Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("mart tidak valid: {e}")))?;
+        Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
 
     let token = read_catalog_token(&state.config.lakekeeper_gold_export_token_file).await?;
     let iceberg_config = gold_export::iceberg_config(

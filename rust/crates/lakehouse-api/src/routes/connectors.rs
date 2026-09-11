@@ -51,7 +51,7 @@ fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiErro
 fn required(field: &str, value: &str) -> Result<String, ApiError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err(ApiError::BadRequest(format!("{field} wajib diisi")));
+        return Err(ApiError::BadRequest(format!("{field} is required")));
     }
     Ok(trimmed.to_owned())
 }
