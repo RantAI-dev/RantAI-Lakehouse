@@ -369,9 +369,18 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
-        psql -v ON_ERROR_STOP=1 -tc
-        "SELECT 1 FROM pg_database WHERE datname = '$${OPENFGA_PG_DB}'" |
-        grep -q 1 ||
+        set -eu;
+        for attempt in $$(seq 1 10); do
+          if psql -v ON_ERROR_STOP=1 -tc "SELECT 1 FROM pg_database WHERE datname = '$${OPENFGA_PG_DB}'" | grep -q 1; then
+            echo "database $${OPENFGA_PG_DB} already present"; exit 0;
+          fi
+          if psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$${OPENFGA_PG_DB}\"" 2>/dev/null; then
+            echo "created database $${OPENFGA_PG_DB}"; exit 0;
+          fi
+          echo "openfga-db-init: postgres not ready for CREATE DATABASE yet (attempt $${attempt}/10), retrying" >&2;
+          sleep 2;
+        done;
+        echo "openfga-db-init: postgres never became ready after 20s" >&2;
         psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$${OPENFGA_PG_DB}\""
     restart: "no"
 
