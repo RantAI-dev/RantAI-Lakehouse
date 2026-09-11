@@ -8,8 +8,10 @@ export type Connector = {
   health: Health
   environment: string
   tenant: string
-  lastTestAt: string
-  lastActivityAt: string
+  /** `null` until a supported probe has run — see `record_test_result`. */
+  lastTestAt: string | null
+  /** `null`: nothing measures connector activity yet. */
+  lastActivityAt: string | null
   capabilities: string[]
   owner: string
 }
@@ -46,7 +48,8 @@ export type ConnectorTestResult = {
   /** Real measured latency in milliseconds; `null` when `supported` is `false` (no attempt was made). */
   latencyMs: number | null
   message: string
-  testedAt: string
+  /** `null` when `supported` is `false`: an unsupported type was never actually dialed. */
+  testedAt: string | null
 }
 
 export type CreateConnectorInput = {

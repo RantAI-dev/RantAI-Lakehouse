@@ -61,7 +61,7 @@ const columns: ColumnDef<Connector>[] = [
     header: "Last test",
     render: (r) => (
       <span className="text-muted-foreground">
-        {formatRelativeTime(r.lastTestAt)}
+        {r.lastTestAt === null ? "Never tested" : formatRelativeTime(r.lastTestAt)}
       </span>
     ),
   },
@@ -70,7 +70,7 @@ const columns: ColumnDef<Connector>[] = [
     header: "Last activity",
     render: (r) => (
       <span className="text-muted-foreground">
-        {formatRelativeTime(r.lastActivityAt)}
+        {r.lastActivityAt === null ? "—" : formatRelativeTime(r.lastActivityAt)}
       </span>
     ),
   },
@@ -146,8 +146,14 @@ function ConnectorDetail({ id }: { id: string }) {
           { label: "Environment", value: c.environment },
           { label: "Tenant", value: c.tenant },
           { label: "Owner", value: c.owner },
-          { label: "Last test", value: formatRelativeTime(c.lastTestAt) },
-          { label: "Last activity", value: formatRelativeTime(c.lastActivityAt) },
+          {
+            label: "Last test",
+            value: c.lastTestAt === null ? "Never tested" : formatRelativeTime(c.lastTestAt),
+          },
+          {
+            label: "Last activity",
+            value: c.lastActivityAt === null ? "—" : formatRelativeTime(c.lastActivityAt),
+          },
           { label: "Discovered assets", value: c.discoveredAssets },
         ]}
       />

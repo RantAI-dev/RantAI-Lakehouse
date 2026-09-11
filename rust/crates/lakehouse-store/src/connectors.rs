@@ -62,6 +62,10 @@ fn iso_millis(at: OffsetDateTime) -> String {
     )
 }
 
+fn iso_opt(at: Option<OffsetDateTime>) -> Option<String> {
+    at.map(iso_millis)
+}
+
 /// A connector, as returned by every read endpoint. Mirrors `Connector` in
 /// `contracts/connectors.ts` — deliberately has no `host` or `secret_ref`
 /// field. See the module doc comment.
@@ -83,10 +87,15 @@ pub struct Connector {
     pub environment: String,
     /// Owning tenant's display name.
     pub tenant: String,
-    /// Last connection-test time, ISO 8601.
-    pub last_test_at: String,
-    /// Last observed activity time, ISO 8601.
-    pub last_activity_at: String,
+    /// Last connection-test time, ISO 8601. `None` until a real, supported
+    /// probe has run via [`record_test_result`] -- WS1 finding J19: a
+    /// freshly created connector must never claim a test that never
+    /// happened.
+    pub last_test_at: Option<String>,
+    /// Last observed activity time, ISO 8601. Always `None` on read today:
+    /// no writer anywhere sets `connector.last_activity_at` yet -- WS3's
+    /// planned ingest-run tracking is the intended source.
+    pub last_activity_at: Option<String>,
     /// Feature/capability labels this connector supports.
     pub capabilities: Vec<String>,
     /// Owning team or person.
@@ -194,8 +203,7 @@ struct ConnectorRow {
                   not a value this crate consumes or the Debug impl prints"
     )]
     secret_ref: String,
-    last_test_at: OffsetDateTime,
-    last_activity_at: OffsetDateTime,
+    last_test_at: Option<OffsetDateTime>,
     capabilities: Vec<String>,
     owner: String,
 }
@@ -218,7 +226,6 @@ impl std::fmt::Debug for ConnectorRow {
             .field("host", &REDACTED)
             .field("secret_ref", &REDACTED)
             .field("last_test_at", &self.last_test_at)
-            .field("last_activity_at", &self.last_activity_at)
             .field("capabilities", &self.capabilities)
             .field("owner", &self.owner)
             .finish()
@@ -235,16 +242,21 @@ impl From<ConnectorRow> for Connector {
             health: row.health,
             environment: row.environment,
             tenant: row.tenant,
-            last_test_at: iso_millis(row.last_test_at),
-            last_activity_at: iso_millis(row.last_activity_at),
+            last_test_at: iso_opt(row.last_test_at),
+            // No writer sets this column yet -- see the field's doc comment
+            // on `Connector` and the module doc comment.
+            last_activity_at: None,
             capabilities: row.capabilities,
             owner: row.owner,
         }
     }
 }
 
+// `last_activity_at` is deliberately NOT selected here: nothing writes it
+// (see `Connector::last_activity_at`'s doc comment), so every read maps it
+// to `None` rather than selecting a column this crate never populates.
 const CONNECTOR_COLUMNS: &str = "id, name, type, direction, health, environment, tenant, host, \
-     secret_ref, last_test_at, last_activity_at, capabilities, owner";
+     secret_ref, last_test_at, capabilities, owner";
 
 /// List every connector, newest first.
 ///
@@ -383,9 +395,11 @@ pub fn looks_like_raw_secret(value: &str) -> bool {
     false
 }
 
-/// Create a connector. `health` always starts `"healthy"`, `lastTestAt`/
-/// `lastActivityAt` start at "now" — same as `mock/connectors.ts`'s
-/// `createConnector`.
+/// Create a connector. `health` always starts `"unknown"` and `lastTestAt`/
+/// `lastActivityAt` start `null` — WS1 finding J19: no probe has run yet, so
+/// nothing about this connector's health or test history has been measured.
+/// `record_test_result` is the only function that ever moves `health` off
+/// `"unknown"` or sets `lastTestAt`.
 ///
 /// # Errors
 ///
@@ -402,10 +416,14 @@ pub async fn create_connector(
 ) -> Result<Connector, StoreError> {
     let id = slug_id(&input.name);
     let owner = input.owner.as_deref().unwrap_or(DEFAULT_OWNER);
+    // `last_test_at`/`last_activity_at` are omitted: neither column has a
+    // default any more (`0028_connector_health_unknown_until_tested.sql`),
+    // so both come back `NULL` -- no test has run and nothing measures
+    // activity, so nothing is claimed.
     let sql = format!(
         "INSERT INTO connector (id, name, type, direction, health, environment, tenant, host, \
          secret_ref, secret_ref_secondary, residency, capabilities, owner) \
-         VALUES ($1, $2, $3, $4, 'healthy', $5, $6, $7, $8, $9, $10, $11, $12) \
+         VALUES ($1, $2, $3, $4, 'unknown', $5, $6, $7, $8, $9, $10, $11, $12) \
          RETURNING {CONNECTOR_COLUMNS}"
     );
     let row: ConnectorRow = sqlx::query_as(&sql)
@@ -452,8 +470,10 @@ pub struct ConnectorTestResult {
     /// plainly that this build cannot test it — never a fabricated
     /// success/failure message.
     pub message: String,
-    /// When the test ran, ISO 8601.
-    pub tested_at: String,
+    /// When the test ran, ISO 8601, or `None` when `supported` is `false`:
+    /// an unsupported type was never actually dialed, so no test time was
+    /// stamped — see [`record_test_result`].
+    pub tested_at: Option<String>,
 }
 
 /// Fetch the connectivity-relevant fields (`type`, `host`, `secret_ref`,
@@ -516,16 +536,18 @@ pub struct ConnectorDialInfo {
     pub secret_ref_secondary: Option<String>,
 }
 
-/// Persist the outcome of a real connectivity probe and stamp
-/// `lastTestAt`. Called by `lakehouse-api`'s `connector_probe` module
-/// AFTER it has actually attempted (or declined to attempt, for an
-/// unsupported type) a dial — this function never decides `ok`/`supported`
-/// itself, only records what the caller measured.
+/// Persist the outcome of a real connectivity probe and, when the probe
+/// type is supported, stamp `lastTestAt`. Called by `lakehouse-api`'s
+/// `connector_probe` module AFTER it has actually attempted (or declined to
+/// attempt, for an unsupported type) a dial — this function never decides
+/// `ok`/`supported` itself, only records what the caller measured.
 ///
 /// `health` is updated to `"healthy"`/`"unhealthy"` only when `supported`
 /// is `true` — an unsupported type's last-known health is left untouched,
 /// since declining to test a connector is not evidence about whether it is
-/// healthy.
+/// healthy. `last_test_at` follows the same rule and for the same reason:
+/// an unsupported probe type was never actually dialed, so it must not
+/// claim a test time it does not have (WS1 finding J19).
 ///
 /// # Errors
 ///
@@ -539,10 +561,10 @@ pub async fn record_test_result(
     latency_ms: Option<i64>,
     message: &str,
 ) -> Result<ConnectorTestResult, StoreError> {
-    let sql = "UPDATE connector SET last_test_at = now(), health = CASE WHEN $2 THEN (CASE WHEN \
-               $3 THEN 'healthy' ELSE 'unhealthy' END) ELSE health END WHERE id = $1 RETURNING \
-               last_test_at";
-    let row: Option<(OffsetDateTime,)> = sqlx::query_as(sql)
+    let sql = "UPDATE connector SET last_test_at = CASE WHEN $2 THEN now() ELSE last_test_at END, \
+               health = CASE WHEN $2 THEN (CASE WHEN $3 THEN 'healthy' ELSE 'unhealthy' END) ELSE \
+               health END WHERE id = $1 RETURNING last_test_at";
+    let row: Option<(Option<OffsetDateTime>,)> = sqlx::query_as(sql)
         .bind(id)
         .bind(supported)
         .bind(ok)
@@ -556,7 +578,7 @@ pub async fn record_test_result(
         supported,
         latency_ms,
         message: message.to_owned(),
-        tested_at: iso_millis(tested_at),
+        tested_at: iso_opt(tested_at),
     })
 }
 
@@ -650,8 +672,10 @@ mod tests {
             health: "healthy".to_owned(),
             environment: "production".to_owned(),
             tenant: "Meridian Group".to_owned(),
-            last_test_at: "2026-01-01T00:00:00.000Z".to_owned(),
-            last_activity_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            // Exercises both states: a test that has run, and activity that
+            // (today) never gets measured -- see the field doc comments.
+            last_test_at: Some("2026-01-01T00:00:00.000Z".to_owned()),
+            last_activity_at: None,
             capabilities: vec!["CDC".to_owned()],
             owner: "o".to_owned(),
         };
@@ -671,6 +695,7 @@ mod tests {
         ] {
             assert!(value.get(key).is_some(), "Connector is missing `{key}`");
         }
+        assert_eq!(value.get("lastActivityAt"), Some(&serde_json::Value::Null));
         // The whole point of this domain: no credential-adjacent field
         // exists on the wire type at all.
         assert!(value.get("host").is_none());
@@ -689,8 +714,8 @@ mod tests {
                 health: "healthy".to_owned(),
                 environment: "production".to_owned(),
                 tenant: "Meridian Group".to_owned(),
-                last_test_at: "2026-01-01T00:00:00.000Z".to_owned(),
-                last_activity_at: "2026-01-01T00:00:00.000Z".to_owned(),
+                last_test_at: Some("2026-01-01T00:00:00.000Z".to_owned()),
+                last_activity_at: None,
                 capabilities: vec![],
                 owner: "o".to_owned(),
             },
@@ -722,8 +747,7 @@ mod tests {
             tenant: "Meridian Group".to_owned(),
             host: "super-secret-internal-host.example:5432".to_owned(),
             secret_ref: "env:VERY_SENSITIVE_LOOKING_NAME".to_owned(),
-            last_test_at: OffsetDateTime::now_utc(),
-            last_activity_at: OffsetDateTime::now_utc(),
+            last_test_at: Some(OffsetDateTime::now_utc()),
             capabilities: vec![],
             owner: "o".to_owned(),
         };

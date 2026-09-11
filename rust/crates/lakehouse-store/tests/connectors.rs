@@ -328,3 +328,206 @@ async fn delete_connector_unknown_id_is_false_not_an_error(pool: PgPool) -> sqlx
     assert!(!deleted);
     Ok(())
 }
+
+/// WS1 finding J19: a brand-new connector must never claim, at creation, a
+/// health status or a test time it does not have. `create_connector` starts
+/// `health = "unknown"` and both timestamps `None` -- `record_test_result`
+/// is the only thing that ever moves them.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_new_connector_starts_unknown_and_untested(pool: PgPool) -> sqlx::Result<()> {
+    let created = create_connector(
+        &pool,
+        &CreateConnectorInput {
+            name: "freshly created connector".to_owned(),
+            kind: "REST API".to_owned(),
+            direction: "source".to_owned(),
+            host: "h".to_owned(),
+            secret_ref: "env:X".to_owned(),
+            secret_ref_secondary: None,
+            environment: "staging".to_owned(),
+            tenant: "Meridian Group".to_owned(),
+            residency: String::new(),
+            capabilities: vec![],
+            owner: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(created.health, "unknown");
+    assert!(created.last_test_at.is_none());
+    assert!(created.last_activity_at.is_none());
+
+    // Also true of a fresh read, not just the create response.
+    let read_back = get_connector(&pool, &created.id).await.unwrap().unwrap();
+    assert_eq!(read_back.connector.health, "unknown");
+    assert!(read_back.connector.last_test_at.is_none());
+    assert!(read_back.connector.last_activity_at.is_none());
+    Ok(())
+}
+
+/// An unsupported probe type never actually dialed the connector, so it
+/// must not stamp a test time it does not have -- only `health` for a
+/// SUPPORTED probe is meaningful evidence.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unsupported_probe_does_not_stamp_a_test_time(pool: PgPool) -> sqlx::Result<()> {
+    let created = create_connector(
+        &pool,
+        &CreateConnectorInput {
+            name: "unsupported probe connector".to_owned(),
+            kind: "Kafka".to_owned(),
+            direction: "source".to_owned(),
+            host: "h".to_owned(),
+            secret_ref: "env:X".to_owned(),
+            secret_ref_secondary: None,
+            environment: "staging".to_owned(),
+            tenant: "Meridian Group".to_owned(),
+            residency: String::new(),
+            capabilities: vec![],
+            owner: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(created.health, "unknown");
+    assert!(created.last_test_at.is_none());
+
+    let result = record_test_result(&pool, &created.id, false, false, None, "unsupported")
+        .await
+        .unwrap();
+    assert!(!result.supported);
+    assert!(result.tested_at.is_none());
+
+    let after = get_connector(&pool, &created.id).await.unwrap().unwrap();
+    assert_eq!(
+        after.connector.health, "unknown",
+        "an unsupported probe must not change stored health"
+    );
+    assert!(
+        after.connector.last_test_at.is_none(),
+        "an unsupported probe never actually dialed the connector, so it must not claim a test \
+         time"
+    );
+    Ok(())
+}
+
+/// A SUPPORTED probe that fails is real evidence: it stamps both a test
+/// time and `health`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_supported_probe_stamps_time_and_health(pool: PgPool) -> sqlx::Result<()> {
+    let created = create_connector(
+        &pool,
+        &CreateConnectorInput {
+            name: "supported probe connector".to_owned(),
+            kind: "REST API".to_owned(),
+            direction: "source".to_owned(),
+            host: "h".to_owned(),
+            secret_ref: "env:X".to_owned(),
+            secret_ref_secondary: None,
+            environment: "staging".to_owned(),
+            tenant: "Meridian Group".to_owned(),
+            residency: String::new(),
+            capabilities: vec![],
+            owner: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let result = record_test_result(&pool, &created.id, false, true, Some(42), "refused")
+        .await
+        .unwrap();
+    assert!(result.supported);
+    assert!(!result.ok);
+    assert!(result.tested_at.is_some());
+
+    let after = get_connector(&pool, &created.id).await.unwrap().unwrap();
+    assert_eq!(after.connector.health, "unhealthy");
+    assert!(after.connector.last_test_at.is_some());
+    Ok(())
+}
+
+/// `0028_connector_health_unknown_until_tested.sql` resets the two seeded
+/// connectors' fabricated `health`/`last_test_at` -- after full migration
+/// (which every `#[sqlx::test]` here runs), both read as `"unknown"`/`None`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn seeded_connectors_read_unknown_and_untested_after_migration(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    for id in ["conn-pg-lakehouse", "conn-s3-warehouse"] {
+        let detail = get_connector(&pool, id).await.unwrap().unwrap();
+        assert_eq!(
+            detail.connector.health, "unknown",
+            "{id} should read unknown"
+        );
+        assert!(
+            detail.connector.last_test_at.is_none(),
+            "{id} should read untested"
+        );
+    }
+    Ok(())
+}
+
+/// `sqlx::test` always applies every migration, so `0028`'s targeted
+/// predicate (`last_test_at < created_at`) cannot be exercised by running
+/// migrations partially. Instead this test proves the predicate is
+/// targeted by executing the migration's own UPDATE statement text a
+/// SECOND time, directly, against a row crafted to represent a genuine
+/// post-creation test result (`last_test_at` AFTER `created_at`) — the
+/// shape `record_test_result` always produces, and the opposite of the
+/// fabricated seed shape the migration is meant to catch. If the predicate
+/// were a blanket `UPDATE ... WHERE id IN (...)` (not also gated on
+/// `last_test_at < created_at`), this row would incorrectly get reset too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn migration_predicate_never_resets_a_genuine_post_creation_test(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    // Replace the seeded row with one shaped like a real, already-tested
+    // connector: `last_test_at` AFTER `created_at`.
+    sqlx::query("DELETE FROM connector WHERE id = $1")
+        .bind("conn-pg-lakehouse")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO connector (id, name, type, direction, health, environment, tenant, host, \
+         secret_ref, created_at, last_test_at) VALUES ($1, $2, $3, $4, 'healthy', $5, $6, $7, \
+         $8, now() - interval '1 hour', now())",
+    )
+    .bind("conn-pg-lakehouse")
+    .bind("genuinely tested connector")
+    .bind("PostgreSQL")
+    .bind("source")
+    .bind("production")
+    .bind("Meridian Group")
+    .bind("h")
+    .bind("env:X")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Re-run 0028's own UPDATE statement text (not the whole migration
+    // file, which already applied once during provisioning).
+    sqlx::query(
+        "UPDATE connector SET health = 'unknown', last_test_at = NULL WHERE id IN \
+         ('conn-pg-lakehouse', 'conn-s3-warehouse') AND health = 'healthy' AND last_test_at < \
+         created_at",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let after = get_connector(&pool, "conn-pg-lakehouse")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.connector.health, "healthy",
+        "a genuine post-creation test result must survive the migration's predicate"
+    );
+    assert!(
+        after.connector.last_test_at.is_some(),
+        "a genuine post-creation test result must survive the migration's predicate"
+    );
+    Ok(())
+}
