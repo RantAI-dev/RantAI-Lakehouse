@@ -15,6 +15,7 @@ mod error;
 mod gold_export;
 mod gold_lock;
 mod json;
+mod lakekeeper_token;
 mod policy;
 mod routes;
 mod state;

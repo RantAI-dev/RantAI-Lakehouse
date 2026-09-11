@@ -31,6 +31,7 @@ pub mod error;
 pub mod gold_export;
 pub mod gold_lock;
 pub mod json;
+pub mod lakekeeper_token;
 pub mod policy;
 pub mod routes;
 pub mod state;

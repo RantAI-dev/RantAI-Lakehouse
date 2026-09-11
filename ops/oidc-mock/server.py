@@ -93,6 +93,16 @@ PRINCIPALS = [
     # `rust-iceberg`/`debezium`/`dlt` as three principals instead of one,
     # despite all three holding the same relation set today.
     "gold-export",
+    # WS2 amendment A0 — `lakehouse-api`'s upcoming `/api/lakehouse/*`
+    # routes (WS2's Iceberg-catalog surface) need read-only metadata access
+    # to Lakekeeper: listing namespaces/tables and loading table metadata,
+    # never a create/modify verb. Neither existing principal fits:
+    # `gold-export` can create/modify/select (too broad for a read-only
+    # surface), and `clickhouse-reader` holds `modify` and is another
+    # service's identity. A separate principal so this identity is
+    # independently auditable/revocable, same rationale as every other
+    # entry in this list.
+    "lakehouse-api-reader",
     "unauthorized-test",
 ]
 

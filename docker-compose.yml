@@ -208,6 +208,11 @@ services:
       LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE: /tokens/gold-export.jwt
+      # WS2 amendment A0 — the `lakehouse-api-reader` principal
+      # (`ops/oidc-mock/server.py`'s `PRINCIPALS`), read-only metadata
+      # access for the upcoming `/api/lakehouse/*` catalog routes. See
+      # ADR 0011 Decision 4 for the measured relation grant.
+      LAKEKEEPER_READ_TOKEN_FILE: /tokens/lakehouse-api-reader.jwt
       GOLD_SOURCE_SCHEMA: ${GOLD_SOURCE_SCHEMA:-serving}
       GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
       # ── Tenant identity (see `lakehouse-api/src/tenant.rs`) ──
@@ -238,6 +243,15 @@ services:
         target: /tokens/gold-export.jwt
         volume:
           subpath: gold-export.jwt
+        read_only: true
+      # WS2 amendment A0 — same single-file subpath shape, for the
+      # read-only `lakehouse-api-reader` principal (LAKEKEEPER_READ_TOKEN_FILE
+      # above). This service still cannot read any other principal's token.
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/lakehouse-api-reader.jwt
+        volume:
+          subpath: lakehouse-api-reader.jwt
         read_only: true
     restart: unless-stopped
 
@@ -722,6 +736,14 @@ services:
   #     rather than being slipped into this fix. Tracked as follow-up
   #     work, not done here; this comment is honest about the CURRENT
   #     scope in the meantime.
+  #   - `lakehouse-api-reader` (WS2 amendment A0: `lakehouse-api`'s
+  #     upcoming `/api/lakehouse/*` catalog routes): `describe` — measured
+  #     sufficient (WS2 task A0 proof, `ws2-a0` project) for listing
+  #     namespaces, listing tables in a namespace, and loading table
+  #     metadata against this Lakekeeper (v0.13.3). No `select`: nothing
+  #     WS2 reads is table DATA, only catalog metadata, and `describe` is
+  #     the narrower of the two relations that worked. No `create`/
+  #     `modify`: this principal never writes.
   #   - `unauthorized-test`: registered (Lakekeeper knows who it is) but
   #     NEVER granted anything — the negative-test principal.
   lakekeeper-authz-init:
@@ -782,6 +804,12 @@ services:
         read_only: true
       - type: volume
         source: lakehouse_oidc_tokens
+        target: /tokens/lakehouse-api-reader.jwt
+        volume:
+          subpath: lakehouse-api-reader.jwt
+        read_only: true
+      - type: volume
+        source: lakehouse_oidc_tokens
         target: /tokens/unauthorized-test.jwt
         volume:
           subpath: unauthorized-test.jwt
@@ -795,7 +823,7 @@ services:
         admin_token="$$(cat /tokens/admin.jwt)"
         admin_auth="Authorization: Bearer $$admin_token"
 
-        for principal in rust-iceberg debezium dlt clickhouse-reader trino gold-export unauthorized-test; do
+        for principal in rust-iceberg debezium dlt clickhouse-reader trino gold-export lakehouse-api-reader unauthorized-test; do
           ptoken="$$(cat /tokens/$$principal.jwt)"
           code=$$(curl -s -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $$ptoken" -H 'Content-Type: application/json' \
@@ -838,6 +866,12 @@ services:
         # doc comment): `gold-export`'s token is not restricted to the
         # `gold` namespace by this call.
         grant gold-export create modify select
+        # WS2 amendment A0 — `lakehouse-api-reader`: `describe`, measured
+        # sufficient (see the "Grants" list above this job's doc comment)
+        # for listing namespaces/tables and loading table metadata. No
+        # `select`/`create`/`modify`: this principal never reads table
+        # data or writes.
+        grant lakehouse-api-reader describe
         # unauthorized-test: deliberately no grant call.
     restart: "no"
 

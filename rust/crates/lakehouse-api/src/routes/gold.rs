@@ -35,9 +35,11 @@
 //! every route it can even when a dependency is down, degrading only the
 //! routes that need it. [`export`]/[`read_back`] report the missing
 //! precondition at REQUEST time instead: [`read_catalog_token`] returns
-//! `503 Unavailable` naming the unread token file (ADR 0011) when Gold
-//! export has not been provisioned on this deployment yet, rather than the
-//! whole process refusing to start over one route's dependency.
+//! `503 Unavailable` with fixed text naming the env var (ADR 0011, via the
+//! shared `crate::lakekeeper_token::read_token_file` helper — never the
+//! token path or the raw io error) when Gold export has not been
+//! provisioned on this deployment yet, rather than the whole process
+//! refusing to start over one route's dependency.
 //!
 //! # Single-flight: concurrent exports of the SAME mart
 //!
@@ -117,12 +119,22 @@ fn check_export_token(
 /// Reads the `gold-export` principal's Lakekeeper bearer token from
 /// [`crate::config::Config::lakekeeper_gold_export_token_file`].
 ///
+/// Thin, Gold-specific wrapper over the shared
+/// [`crate::lakekeeper_token::read_token_file`] helper (WS2 task A0
+/// generalized this function rather than copying it for the new
+/// `lakehouse-api-reader` principal — AGENTS.md rule 4). No token refresh:
+/// the file is re-read on every call, so a re-minted token is picked up on
+/// the next call, but nothing proactively re-mints one before its 30-day
+/// expiry (ADR 0011's known gap).
+///
 /// # Errors
 ///
-/// Returns [`ApiError::Unavailable`] if the file cannot be read (Gold
-/// export is not provisioned on this deployment — see ADR 0011: the
-/// `gold-export` principal's token is minted by `ops/oidc-mock` at compose
-/// bring-up onto a volume this service must have mounted).
+/// Returns [`ApiError::Unavailable`] with fixed text naming only the
+/// purpose and `LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE` if the file cannot be
+/// read (Gold export is not provisioned on this deployment — see ADR
+/// 0011: the `gold-export` principal's token is minted by `ops/oidc-mock`
+/// at compose bring-up onto a volume this service must have mounted). The
+/// path and the io error are logged, never returned to the caller.
 ///
 /// `pub(crate)` (not private) so `routes::ai::tools::gold` (T2.4 of the
 /// copilot-operations-handover plan) can read the SAME token this route
@@ -130,13 +142,12 @@ fn check_export_token(
 /// doc comment for why the copilot tool calls this directly instead of
 /// going through [`export`]/[`read_back`]'s [`check_export_token`] guard.
 pub(crate) async fn read_catalog_token(path: &str) -> Result<SecretValue, ApiError> {
-    let raw = tokio::fs::read_to_string(path).await.map_err(|err| {
-        ApiError::Unavailable(format!(
-            "Lakekeeper gold-export token could not be read from {path:?}: {err} \
-             (Gold export has not been provisioned on this deployment — see ADR 0011)"
-        ))
-    })?;
-    Ok(SecretValue::new(raw.trim().to_owned()))
+    crate::lakekeeper_token::read_token_file(
+        path,
+        "gold-export",
+        "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE",
+    )
+    .await
 }
 
 /// `POST /api/gold/export/{mart}` — run the export.

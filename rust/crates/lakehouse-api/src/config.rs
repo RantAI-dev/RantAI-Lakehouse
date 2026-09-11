@@ -298,6 +298,21 @@ pub struct Config {
     /// Gold export being unconfigured (503) at request time, when it
     /// actually tries to read the file.
     pub lakekeeper_gold_export_token_file: String,
+    /// WS2 amendment A0 (ADR 0011 Decision 4) — path to a file holding the
+    /// `lakehouse-api-reader` Lakekeeper principal's pre-minted static
+    /// bearer token, read by WS2's `/api/lakehouse/*` catalog routes
+    /// through the shared `crate::lakekeeper_token::read_token_file`
+    /// helper (the same one [`Self::lakekeeper_gold_export_token_file`]
+    /// uses). A separate, narrower-scoped principal from `gold-export`:
+    /// `gold-export` can create/modify/select, and these routes only ever
+    /// read catalog metadata.
+    ///
+    /// Same "always a default path, never `None`-when-unset" shape as
+    /// [`Self::lakekeeper_gold_export_token_file`], and the same no-refresh
+    /// caveat: the file is re-read on every (re)connect, so a re-minted
+    /// token is picked up without restarting this process, but nothing
+    /// re-mints one before its 30-day expiry (ADR 0011's known gap).
+    pub lakekeeper_read_token_file: String,
     /// `ClickHouse` schema Gold marts live in (ADR 0010: `serving.*`).
     /// `routes::gold`'s export route reads `{gold_source_schema}.{mart}`.
     /// Default `"serving"`.
@@ -428,6 +443,10 @@ impl std::fmt::Debug for Config {
                 "lakekeeper_gold_export_token_file",
                 &self.lakekeeper_gold_export_token_file,
             )
+            .field(
+                "lakekeeper_read_token_file",
+                &self.lakekeeper_read_token_file,
+            )
             .field("gold_source_schema", &self.gold_source_schema)
             .field(
                 "gold_export_run_token",
@@ -496,6 +515,14 @@ impl Config {
     /// Returns [`ConfigError`] if `PORT` is set to a value that does not
     /// parse as a `u16`. An unparseable `SMTP_PORT` does NOT error — see
     /// [`Config::smtp_port`].
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one flat env->field mapping, one line per Config field; \
+                  splitting it would just move the same lines behind an \
+                  extra layer of indirection with no independent unit to \
+                  test (WS2 task A0 added lakekeeper_read_token_file, \
+                  crossing the 100-line lint threshold)"
+    )]
     pub fn from_map(env: &HashMap<String, String>) -> Result<Self, ConfigError> {
         let smtp_port = match env.get("SMTP_PORT") {
             Some(raw) => raw.parse::<u16>().unwrap_or_else(|_| {
@@ -597,6 +624,11 @@ impl Config {
                 env,
                 "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE",
                 "/tokens/gold-export.jwt",
+            ),
+            lakekeeper_read_token_file: or_default(
+                env,
+                "LAKEKEEPER_READ_TOKEN_FILE",
+                "/tokens/lakehouse-api-reader.jwt",
             ),
             gold_source_schema: or_default(env, "GOLD_SOURCE_SCHEMA", "serving"),
             gold_export_run_token: truthy(env, "GOLD_EXPORT_RUN_TOKEN"),
@@ -711,6 +743,10 @@ mod tests {
         assert_eq!(
             cfg.lakekeeper_gold_export_token_file,
             "/tokens/gold-export.jwt"
+        );
+        assert_eq!(
+            cfg.lakekeeper_read_token_file,
+            "/tokens/lakehouse-api-reader.jwt"
         );
         assert_eq!(cfg.gold_source_schema, "serving");
         assert_eq!(cfg.gold_export_run_token, None);
