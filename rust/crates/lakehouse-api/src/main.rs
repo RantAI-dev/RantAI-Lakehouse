@@ -78,6 +78,12 @@ async fn main() -> anyhow::Result<()> {
     // comment for what happens when it's unset.
     bootstrap_alerts_run_service(&state).await;
 
+    // Same shape again, for Dagster's maintenance job's policy fetch, from
+    // `LAKEHOUSE_MAINTENANCE_TOKEN` — see
+    // `bootstrap_lakehouse_maintenance_service`'s doc comment for what
+    // happens when it's unset.
+    bootstrap_lakehouse_maintenance_service(&state).await;
+
     let app = routes::router(state);
 
     let addr = format!("0.0.0.0:{port}");
@@ -181,6 +187,13 @@ const AGENT_RUN_SERVICE_IDENTITY_NAME: &str = "agent-run-scheduler";
 /// provisions — same `<domain>-run-scheduler` shape as
 /// [`AGENT_RUN_SERVICE_IDENTITY_NAME`].
 const ALERTS_RUN_SERVICE_IDENTITY_NAME: &str = "alerts-run-scheduler";
+
+/// Fixed name of the service identity
+/// [`bootstrap_lakehouse_maintenance_service`] provisions — same
+/// `<domain>-<role>` naming as the other service identities above, though
+/// this one is not a `-run-scheduler`: it authenticates a read of the
+/// maintenance policy list, not a scheduled run trigger.
+const LAKEHOUSE_MAINTENANCE_SERVICE_IDENTITY_NAME: &str = "lakehouse-maintenance-policy-reader";
 
 /// Idempotently seed the ONE service identity + credential that lets
 /// Dagster's digital-employee schedule factory
@@ -305,14 +318,52 @@ async fn bootstrap_alerts_run_service(state: &AppState) {
     .await;
 }
 
+/// Lets `dagster/dispar_orchestrate/maintenance.py`'s maintenance job
+/// authenticate against `GET /api/lakehouse/maintenance-policies`'s
+/// `Policy::RequiresAuth` floor, from
+/// [`Config::lakehouse_maintenance_token`] — the exact same `auth_gate`-
+/// floor problem [`bootstrap_agent_run_service`]/
+/// [`bootstrap_alerts_run_service`] solve for their own callers, reusing
+/// the identical mechanism rather than a third, near-duplicate
+/// implementation.
+///
+/// # Why this identity gets NO scopes
+///
+/// `GET /api/lakehouse/maintenance-policies` is `Policy::RequiresAuth`
+/// (`policy::POLICY_TABLE`) — any authenticated principal clears that
+/// floor — and its handler, `routes::lakehouse::list_maintenance_policies`,
+/// checks no permission at all: it returns the maintenance policy list to
+/// any caller who authenticates. The policy list itself carries no secret.
+/// Granting this identity `catalog:read` would be strictly more privilege
+/// than the route it authenticates for ever inspects — a leaked
+/// `LAKEHOUSE_MAINTENANCE_TOKEN` would then also let its holder read the
+/// whole Iceberg catalog, not just the maintenance policy list. An empty
+/// [`lakehouse_auth::PermissionSet`] still authenticates
+/// (`verify_service_token` builds it from `service_identity.scopes`
+/// regardless of whether that array is empty) and satisfies
+/// `RequiresAuth`; it simply satisfies no `RequiresPermission` check,
+/// which this route never performs.
+async fn bootstrap_lakehouse_maintenance_service(state: &AppState) {
+    bootstrap_service_run_identity(
+        state,
+        state.config.lakehouse_maintenance_token.clone(),
+        LAKEHOUSE_MAINTENANCE_SERVICE_IDENTITY_NAME,
+        Vec::new(),
+        "LAKEHOUSE_MAINTENANCE_TOKEN",
+    )
+    .await;
+}
+
 /// Idempotently seed ONE service identity + credential that lets a
-/// Dagster schedule authenticate against a token-guarded, `RequiresAuth`
-/// route — the shared core [`bootstrap_agent_run_service`] and
-/// [`bootstrap_alerts_run_service`] both call. See
+/// Dagster job authenticate against a token-guarded, `RequiresAuth`
+/// route — the shared core [`bootstrap_agent_run_service`],
+/// [`bootstrap_alerts_run_service`], and
+/// [`bootstrap_lakehouse_maintenance_service`] all call. See
 /// [`bootstrap_agent_run_service`]'s doc comment for the full "why this
-/// exists at all" rationale — both callers hit the identical `auth_gate`
-/// floor problem, on `POST /api/agents/employees/{id}/run` and
-/// `POST /api/alerts/run` respectively.
+/// exists at all" rationale — every caller hits the identical `auth_gate`
+/// floor problem, on `POST /api/agents/employees/{id}/run`,
+/// `POST /api/alerts/run`, and
+/// `GET /api/lakehouse/maintenance-policies` respectively.
 ///
 /// `identity_name` must be a fixed, unique `service_identity.name` (its
 /// own `UNIQUE` constraint is what makes this idempotent across restarts,
@@ -401,10 +452,11 @@ async fn bootstrap_service_run_identity(
 
 /// Look up an existing `service_identity.id` by its unique `name`. Called
 /// from the [`bootstrap_service_run_identity`] Conflict branch shared by
-/// both [`bootstrap_agent_run_service`] and [`bootstrap_alerts_run_service`],
-/// where a row with this name is already known to exist — `None` there
-/// means the row vanished between the failed insert and this lookup
-/// (logged by the caller as an error, not a panic).
+/// [`bootstrap_agent_run_service`], [`bootstrap_alerts_run_service`], and
+/// [`bootstrap_lakehouse_maintenance_service`], where a row with this name
+/// is already known to exist — `None` there means the row vanished between
+/// the failed insert and this lookup (logged by the caller as an error,
+/// not a panic).
 async fn find_service_identity_id_by_name(pool: &sqlx::PgPool, name: &str) -> Option<uuid::Uuid> {
     let row: Option<(uuid::Uuid,)> =
         sqlx::query_as("SELECT id FROM service_identity WHERE name = $1")
@@ -982,6 +1034,80 @@ mod tests {
             let pool = state.pg.as_deref().expect("pg pool configured");
             assert_eq!(alerts_identity_row_count(pool).await, 0);
             assert_eq!(alerts_credential_row_count(pool).await, 0);
+        }
+
+        async fn lakehouse_maintenance_identity_row_count(pool: &sqlx::PgPool) -> i64 {
+            let (count,): (i64,) =
+                sqlx::query_as("SELECT count(*) FROM service_identity WHERE name = $1")
+                    .bind(LAKEHOUSE_MAINTENANCE_SERVICE_IDENTITY_NAME)
+                    .fetch_one(pool)
+                    .await
+                    .expect("count service_identity rows");
+            count
+        }
+
+        async fn lakehouse_maintenance_credential_row_count(pool: &sqlx::PgPool) -> i64 {
+            let (count,): (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM service_credential sc \
+                 JOIN service_identity si ON si.id = sc.service_identity_id \
+                 WHERE si.name = $1",
+            )
+            .bind(LAKEHOUSE_MAINTENANCE_SERVICE_IDENTITY_NAME)
+            .fetch_one(pool)
+            .await
+            .expect("count service_credential rows");
+            count
+        }
+
+        /// With `LAKEHOUSE_MAINTENANCE_TOKEN` set, boot seeds exactly one
+        /// identity (no scopes — see
+        /// [`bootstrap_lakehouse_maintenance_service`]'s doc comment for
+        /// why) and one matching credential; the token authenticates a
+        /// real principal that nonetheless does NOT hold `catalog:read`.
+        #[tokio::test]
+        async fn bootstrap_lakehouse_maintenance_service_seeds_identity_and_credential() {
+            let mut overrides = HashMap::new();
+            overrides.insert(
+                "LAKEHOUSE_MAINTENANCE_TOKEN".to_owned(),
+                "unit-test-lakehouse-maintenance-token".to_owned(),
+            );
+            let state = fresh_state(&overrides).await;
+
+            bootstrap_lakehouse_maintenance_service(&state).await;
+
+            let pool = state.pg.as_deref().expect("pg pool configured");
+            assert_eq!(lakehouse_maintenance_identity_row_count(pool).await, 1);
+            assert_eq!(lakehouse_maintenance_credential_row_count(pool).await, 1);
+
+            let (scopes,): (Vec<String>,) =
+                sqlx::query_as("SELECT scopes FROM service_identity WHERE name = $1")
+                    .bind(LAKEHOUSE_MAINTENANCE_SERVICE_IDENTITY_NAME)
+                    .fetch_one(pool)
+                    .await
+                    .expect("read the seeded identity's scopes");
+            assert_eq!(scopes, Vec::<String>::new());
+
+            let principal = lakehouse_auth::service_token::verify_service_token(
+                pool,
+                &lakehouse_auth::Secret::new("unit-test-lakehouse-maintenance-token".to_owned()),
+            )
+            .await
+            .expect("the configured token must authenticate a real service principal");
+            assert!(!principal.permissions.has("catalog:read"));
+        }
+
+        /// With `LAKEHOUSE_MAINTENANCE_TOKEN` unset, bootstrap creates
+        /// nothing at all — no identity, no credential — same posture as
+        /// [`bootstrap_alerts_run_service`] when its own token is unset.
+        #[tokio::test]
+        async fn bootstrap_lakehouse_maintenance_service_creates_nothing_when_token_is_unset() {
+            let state = fresh_state(&HashMap::new()).await;
+
+            bootstrap_lakehouse_maintenance_service(&state).await;
+
+            let pool = state.pg.as_deref().expect("pg pool configured");
+            assert_eq!(lakehouse_maintenance_identity_row_count(pool).await, 0);
+            assert_eq!(lakehouse_maintenance_credential_row_count(pool).await, 0);
         }
     }
 }

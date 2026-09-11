@@ -358,6 +358,12 @@ pub struct Config {
     /// holding `agent:manage` (a human clicking "Run now" in the console)
     /// is also accepted, with `trigger = "manual"`. `None` when unset.
     pub agent_run_token: Option<String>,
+    /// Shared token Dagster's maintenance job uses to authenticate against
+    /// `GET /api/lakehouse/maintenance-policies`. `None` when unset. When
+    /// set, `lakehouse-api` also seeds a scope-less service identity from
+    /// it — see `main::bootstrap_lakehouse_maintenance_service`'s doc
+    /// comment for why no scopes are granted.
+    pub lakehouse_maintenance_token: Option<String>,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -457,6 +463,10 @@ impl std::fmt::Debug for Config {
             .field(
                 "agent_run_token",
                 &self.agent_run_token.as_ref().map(|_| REDACTED),
+            )
+            .field(
+                "lakehouse_maintenance_token",
+                &self.lakehouse_maintenance_token.as_ref().map(|_| REDACTED),
             )
             .finish()
     }
@@ -635,6 +645,7 @@ impl Config {
             gold_export_max_rows: parse_u64_or_default(env, "GOLD_EXPORT_MAX_ROWS", 5_000_000),
             gold_export_batch_size: parse_u64_or_default(env, "GOLD_EXPORT_BATCH_SIZE", 20_000),
             agent_run_token: truthy(env, "AGENT_RUN_TOKEN"),
+            lakehouse_maintenance_token: truthy(env, "LAKEHOUSE_MAINTENANCE_TOKEN"),
         })
     }
 
@@ -673,6 +684,10 @@ mod tests {
             ("SMTP_PASS", "s3cret-smtp-pass"),
             ("AGENT_RUN_TOKEN", "s3cret-agent-run-token"),
             (
+                "LAKEHOUSE_MAINTENANCE_TOKEN",
+                "s3cret-lakehouse-maintenance-token",
+            ),
+            (
                 "DATABASE_URL",
                 "postgres://u:s3cret-pg-pass@db.internal:5432/lakehouse",
             ),
@@ -686,6 +701,7 @@ mod tests {
             "s3cret-alerts-token",
             "s3cret-smtp-pass",
             "s3cret-agent-run-token",
+            "s3cret-lakehouse-maintenance-token",
             "s3cret-pg-pass",
             "db.internal",
         ] {
@@ -753,6 +769,7 @@ mod tests {
         assert_eq!(cfg.gold_export_max_rows, 5_000_000);
         assert_eq!(cfg.gold_export_batch_size, 20_000);
         assert_eq!(cfg.agent_run_token, None);
+        assert_eq!(cfg.lakehouse_maintenance_token, None);
         // Safe-by-default: SSRF blocking is ON unless explicitly disabled.
         assert!(!cfg.connector_probe_allow_internal_hosts);
     }

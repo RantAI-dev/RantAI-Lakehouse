@@ -150,6 +150,16 @@ services:
       #    digital-employee schedule stays inert (see
       #    `dagster/dispar_orchestrate/agent_runs.py`'s module doc). ──
       AGENT_RUN_TOKEN: ${AGENT_RUN_TOKEN:-}
+      # Same shape again — `main::bootstrap_lakehouse_maintenance_service`
+      # seeds a scope-less "lakehouse-maintenance-policy-reader" service
+      # identity from this value, which is what lets Dagster's maintenance
+      # job's `Authorization: Bearer <LAKEHOUSE_MAINTENANCE_TOKEN>` clear
+      # `GET /api/lakehouse/maintenance-policies`'s `Policy::RequiresAuth`
+      # floor — must match `dagster-code-location`'s own
+      # `LAKEHOUSE_MAINTENANCE_TOKEN`. Left unset by default, in which case
+      # bootstrap seeds nothing and the maintenance job's policy fetch
+      # fails visibly (401) rather than silently.
+      LAKEHOUSE_MAINTENANCE_TOKEN: ${LAKEHOUSE_MAINTENANCE_TOKEN:-}
       EMBED_SECRET: ${EMBED_SECRET:-}
       OIDC_ISSUER: ${OIDC_ISSUER:-}
       OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
@@ -1451,6 +1461,17 @@ services:
       # above. With this unset, the schedule stays registered but every
       # run it triggers fails visibly (401/503), never silently.
       ALERTS_RUN_TOKEN: ${ALERTS_RUN_TOKEN:-}
+      # `maintenance.py`'s maintenance job: the shared token this job sends
+      # as `Authorization: Bearer` to `GET
+      # /api/lakehouse/maintenance-policies` (to authenticate as the
+      # `lakehouse-maintenance-policy-reader` service identity
+      # `lakehouse-api`'s `main::bootstrap_lakehouse_maintenance_service`
+      # seeds from this same value) — must match `lakehouse-api`'s own
+      # `LAKEHOUSE_MAINTENANCE_TOKEN`, same single-`.env`-value reasoning
+      # `AGENT_RUN_TOKEN` documents above. With this unset, the API seeds
+      # no identity and the maintenance job's policy fetch fails visibly
+      # (401), never silently.
+      LAKEHOUSE_MAINTENANCE_TOKEN: ${LAKEHOUSE_MAINTENANCE_TOKEN:-}
     command: ["dagster", "api", "grpc", "-h", "0.0.0.0", "-p", "4000", "-m", "dispar_orchestrate.definitions"]
     restart: unless-stopped
 
