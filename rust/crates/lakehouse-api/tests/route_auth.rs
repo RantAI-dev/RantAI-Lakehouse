@@ -218,6 +218,30 @@ async fn a_seeded_analyst_is_denied_the_four_hardened_permission_families() {
     }
 }
 
+/// A seeded Analyst (no `governance:write`) is denied
+/// `POST /api/lakehouse/tables/{ns}/{table}/maintenance` (WS2 §4 Task B2),
+/// a fifth `Policy::RequiresPermission` route added after the four-family
+/// spot-check above — kept as its own test rather than folded into that
+/// one so its doc comment's "four" stays accurate.
+#[tokio::test]
+async fn a_seeded_analyst_is_denied_the_maintenance_policy_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let resp = request_with_cookie(
+        &router,
+        "POST",
+        "/api/lakehouse/tables/x/x/maintenance",
+        &cookie,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Analyst must be denied governance:write"
+    );
+}
+
 /// # Input validation: malformed body -> 400 with the `{"error": "..."}`
 /// envelope
 ///

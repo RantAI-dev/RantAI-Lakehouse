@@ -164,7 +164,11 @@ fn lakehouse_router() -> Router<AppState> {
         )
         .route(
             "/api/lakehouse/tables/{ns}/{table}/maintenance",
-            get(lakehouse::maintenance),
+            get(lakehouse::maintenance).post(lakehouse::set_maintenance_policy),
+        )
+        .route(
+            "/api/lakehouse/maintenance-policies",
+            get(lakehouse::list_maintenance_policies),
         )
 }
 

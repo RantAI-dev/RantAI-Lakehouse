@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use iceberg::{NamespaceIdent, TableIdent};
 use lakehouse_core::ApiError;
@@ -491,6 +492,133 @@ pub async fn maintenance(
     )))
 }
 
+/// `POST /api/lakehouse/tables/{ns}/{table}/maintenance`'s body. CamelCase
+/// on the wire, matching [`maintenance_body`]'s GET shape.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MaintenancePolicyBody {
+    snapshots_to_keep: Option<i32>,
+    orphan_age_hours: Option<i32>,
+    compact_small_files: bool,
+    schedule: Option<String>,
+}
+
+/// Parses `body` as [`MaintenancePolicyBody`], or a 400 with a fixed
+/// English message — mirrors `routes::connectors::parse_body`'s
+/// `Bytes`-in, `ApiError::BadRequest`-out shape; the message itself is
+/// fixed rather than embedding `serde_json`'s own text (WS1 T17c: new
+/// response strings are English, and a fixed message is simpler to assert
+/// on than whatever wording a parser version happens to produce).
+fn parse_maintenance_policy_body(body: &Bytes) -> Result<MaintenancePolicyBody, ApiError> {
+    serde_json::from_slice(body).map_err(|_| ApiError::BadRequest("body must be JSON".to_owned()))
+}
+
+/// Bounds shared with `table_maintenance_policy`'s CHECK constraints
+/// (migration `0030`), checked here first so a bad request gets a 400
+/// naming the field rather than the generic `StoreError::Database` a CHECK
+/// violation would otherwise surface as.
+fn validate_maintenance_policy_body(body: &MaintenancePolicyBody) -> Result<(), ApiError> {
+    if body.snapshots_to_keep.is_some_and(|n| n < 1) {
+        return Err(ApiError::BadRequest(
+            "snapshotsToKeep must be at least 1: the current snapshot is always kept".to_owned(),
+        ));
+    }
+    if body.orphan_age_hours.is_some_and(|n| n < 1) {
+        return Err(ApiError::BadRequest(
+            "orphanAgeHours must be at least 1: an age of 0 could delete files an in-flight \
+             write still needs"
+                .to_owned(),
+        ));
+    }
+    if let Some(schedule) = &body.schedule
+        && schedule != "daily"
+        && schedule != "weekly"
+    {
+        return Err(ApiError::BadRequest(
+            "schedule must be \"daily\", \"weekly\", or null".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// `POST /api/lakehouse/tables/{ns}/{table}/maintenance` — create or
+/// replace this table's maintenance policy.
+///
+/// Deliberately does not check the table exists in the catalog: the
+/// policy store (`table_maintenance_policy`) is independent of the
+/// catalog, and `dagster/dispar_orchestrate/maintenance.py`'s job only
+/// ever acts on tables it discovers there, so a policy for a table that
+/// does not exist (yet, or ever) is simply inert. Requiring a catalog
+/// round trip here would make writing a policy depend on Lakekeeper being
+/// up, for no benefit — the maintenance GET route's own `configured: true`
+/// already shows a caller their policy was saved.
+///
+/// # Errors
+///
+/// 400 if `ns`/`table` are not `[a-z0-9_]+`-shaped, the body is not JSON,
+/// or a bound (`snapshotsToKeep`/`orphanAgeHours` below 1, an unrecognized
+/// `schedule`) is out of range; 401/403 from the auth gate
+/// (`governance:write`); 503 if no Postgres pool is configured.
+pub async fn set_maintenance_policy(
+    State(state): State<AppState>,
+    Path((ns, table)): Path<(String, String)>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    validate_ident(&ns, "ns")?;
+    validate_ident(&table, "table")?;
+    let parsed = parse_maintenance_policy_body(&body)?;
+    validate_maintenance_policy_body(&parsed)?;
+
+    let input = maintenance_policy::MaintenancePolicyInput {
+        namespace: ns.clone(),
+        table_name: table.clone(),
+        snapshots_to_keep: parsed.snapshots_to_keep,
+        orphan_age_hours: parsed.orphan_age_hours,
+        compact_small_files: parsed.compact_small_files,
+        schedule: parsed.schedule.clone(),
+    };
+    maintenance_policy::upsert_policy(pool(&state)?, &input).await?;
+
+    // The GET maintenance shape, minus `lastRun`: a form that just saved a
+    // policy shows what was stored without a `ClickHouse` round trip.
+    Ok(ApiJson(json!({
+        "namespace": ns,
+        "tableName": table,
+        "configured": true,
+        "snapshotsToKeep": parsed.snapshots_to_keep,
+        "orphanAgeHours": parsed.orphan_age_hours,
+        "compactSmallFiles": parsed.compact_small_files,
+        "schedule": parsed.schedule,
+    })))
+}
+
+/// `GET /api/lakehouse/maintenance-policies` — every configured table
+/// maintenance policy.
+///
+/// Read by `dagster/dispar_orchestrate/maintenance.py` using the
+/// scope-less `lakehouse-maintenance-policy-reader` service identity
+/// (`main.rs`'s `bootstrap_lakehouse_maintenance_service`). Mounted as
+/// `Policy::RequiresAuth`, not a specific permission: the list carries no
+/// secret, only per-table retention/compaction settings, and the
+/// maintenance service identity holds no scopes to check against.
+///
+/// # Errors
+///
+/// 503 if no Postgres pool is configured.
+pub async fn list_maintenance_policies(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+    let rows = maintenance_policy::list_all_policies(pool(&state)?).await?;
+    Ok(ApiJson(json!({
+        "policies": rows.iter().map(|r| json!({
+            "namespace": r.namespace,
+            "tableName": r.table_name,
+            "snapshotsToKeep": r.snapshots_to_keep,
+            "orphanAgeHours": r.orphan_age_hours,
+            "compactSmallFiles": r.compact_small_files,
+            "schedule": r.schedule,
+        })).collect::<Vec<_>>()
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -580,7 +708,7 @@ mod tests {
         assert_eq!(rows[1]["lastUpdatedAt"], Value::Null);
     }
 
-    /// A5-F1: Iceberg snapshot ids are `i64`, normally random and far above
+    /// Iceberg snapshot ids are `i64`, normally random and far above
     /// `Number.MAX_SAFE_INTEGER` (2^53−1 = `9_007_199_254_740_991`). Any id
     /// past that point must survive as a JSON *string* — a JSON number
     /// would be rounded by the browser's `JSON.parse`.
@@ -667,7 +795,7 @@ mod tests {
         assert_eq!(body["stats"]["metadataLogCount"], json!(1));
     }
 
-    /// A5-F1: `id` and `parentId` must both survive as strings past
+    /// `id` and `parentId` must both survive as strings past
     /// `Number.MAX_SAFE_INTEGER`, and a `None` `parentId` must still be
     /// `null` rather than the string `"null"`.
     #[test]
@@ -776,6 +904,85 @@ mod tests {
         assert!(last_run_applies("bronze"));
         assert!(!last_run_applies("silver"));
         assert!(!last_run_applies("gold"));
+    }
+
+    fn valid_maintenance_policy_body() -> MaintenancePolicyBody {
+        MaintenancePolicyBody {
+            snapshots_to_keep: Some(10),
+            orphan_age_hours: Some(48),
+            compact_small_files: true,
+            schedule: Some("daily".to_owned()),
+        }
+    }
+
+    #[test]
+    fn validate_maintenance_policy_body_accepts_the_minimum_bounds() {
+        let mut body = valid_maintenance_policy_body();
+        body.snapshots_to_keep = Some(1);
+        assert!(validate_maintenance_policy_body(&body).is_ok());
+    }
+
+    #[test]
+    fn validate_maintenance_policy_body_rejects_zero_snapshots_to_keep() {
+        let mut body = valid_maintenance_policy_body();
+        body.snapshots_to_keep = Some(0);
+        let err = validate_maintenance_policy_body(&body).expect_err("0 keeps nothing new");
+        assert_eq!(err.status(), 400);
+        assert!(err.to_string().contains("snapshotsToKeep"));
+    }
+
+    #[test]
+    fn validate_maintenance_policy_body_rejects_a_negative_snapshots_to_keep() {
+        let mut body = valid_maintenance_policy_body();
+        body.snapshots_to_keep = Some(-1);
+        assert!(validate_maintenance_policy_body(&body).is_err());
+    }
+
+    #[test]
+    fn validate_maintenance_policy_body_rejects_zero_orphan_age_hours() {
+        let mut body = valid_maintenance_policy_body();
+        body.orphan_age_hours = Some(0);
+        let err = validate_maintenance_policy_body(&body)
+            .expect_err("an orphan age of 0 could delete in-flight writes");
+        assert_eq!(err.status(), 400);
+        assert!(err.to_string().contains("orphanAgeHours"));
+    }
+
+    #[test]
+    fn validate_maintenance_policy_body_rejects_an_unknown_schedule() {
+        let mut body = valid_maintenance_policy_body();
+        body.schedule = Some("hourly".to_owned());
+        let err = validate_maintenance_policy_body(&body).expect_err("hourly is not a schedule");
+        assert_eq!(err.status(), 400);
+        assert!(err.to_string().contains("schedule"));
+    }
+
+    #[test]
+    fn validate_maintenance_policy_body_accepts_daily_weekly_and_null_schedule() {
+        for schedule in [Some("daily".to_owned()), Some("weekly".to_owned()), None] {
+            let mut body = valid_maintenance_policy_body();
+            body.schedule = schedule;
+            assert!(validate_maintenance_policy_body(&body).is_ok());
+        }
+    }
+
+    #[test]
+    fn validate_maintenance_policy_body_accepts_an_all_null_policy() {
+        let body = MaintenancePolicyBody {
+            snapshots_to_keep: None,
+            orphan_age_hours: None,
+            compact_small_files: false,
+            schedule: None,
+        };
+        assert!(validate_maintenance_policy_body(&body).is_ok());
+    }
+
+    #[test]
+    fn parse_maintenance_policy_body_rejects_malformed_json() {
+        let err = parse_maintenance_policy_body(&Bytes::from_static(b"not json at all"))
+            .expect_err("malformed body must be rejected");
+        assert_eq!(err.status(), 400);
+        assert_eq!(err.to_string(), "body must be JSON");
     }
 
     /// Exercises `namespaces` end to end against a real (local, throwaway)
