@@ -57,8 +57,8 @@ export function QueryStudioPage() {
     }
   }
 
-  // Agentic ask: NL → generate SQL → JALANKAN → koreksi diri bila error →
-  // jelaskan hasil. Satu tombol, loop penuh di server (/api/agent/query).
+  // Agentic ask: NL → generate SQL → RUN → self-correct on error →
+  // explain the result. One button, the whole loop runs server-side (/api/agent/query).
   const [agentBusy, setAgentBusy] = React.useState(false)
   const [agentResult, setAgentResult] = React.useState<AgentQueryResult | null>(null)
   const [agentError, setAgentError] = React.useState<string | null>(null)
@@ -69,7 +69,7 @@ export function QueryStudioPage() {
     try {
       const out = await askAgentSql(question)
       setAgentResult(out)
-      setSql(out.sql) // muat SQL final ke editor untuk ditinjau/di-tweak
+      setSql(out.sql) // load the final SQL into the editor for review/tweaking
     } catch (e) {
       setAgentError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -130,7 +130,7 @@ export function QueryStudioPage() {
                 ) : null}
               </div>
 
-              {/* Hasil agentic: jawaban NL + jejak langkah (plan→act→correct) + preview */}
+              {/* Agentic result: NL answer + step trace (plan→act→correct) + preview */}
               {agentResult ? (
                 <SectionCard title="Jawaban agent">
                   <p className="text-sm">{agentResult.answer}</p>

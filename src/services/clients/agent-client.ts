@@ -2,9 +2,9 @@ import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
- * Klien agent untuk UI (client-side). Memanggil route agentic self-correcting
- * `/api/agent/query`. Bukan bagian QueryService contract (kapabilitas tambahan),
- * jadi diimpor langsung oleh halaman Query Studio.
+ * Client-side agent client for the UI. Calls the self-correcting agentic
+ * route `/api/agent/query`. Not part of the QueryService contract (an extra
+ * capability), so it is imported directly by the Query Studio page.
  */
 
 export type AgentStep = { step: string; detail: string };

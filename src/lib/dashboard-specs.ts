@@ -1,43 +1,43 @@
 /**
- * Semantic layer tipis untuk dashboarding — "metrics as code" ala Rill, tapi
- * nyatu di konsol (tanpa app BI kedua, tanpa AGPL).
+ * A thin semantic layer for dashboarding — "metrics as code" in the Rill
+ * mould, but folded into the console itself (no second BI app, no AGPL).
  *
- * Tiap kartu didefinisikan di sini: SQL-nya (dijalankan SERVER-side oleh akun
- * ClickHouse read-only lewat /api/dashboard) + cara render-nya (kind + encoding).
- * Menambah chart = menambah satu entri di sini; tak perlu sentuh UI. Sumber
- * data = mart Gold di `serving.*` (satu-satunya layer yang boleh dipakai
- * dashboard — Raw/Bronze/Silver tidak).
+ * Each card is defined here: its SQL (run SERVER-side by a read-only
+ * ClickHouse account via /api/dashboard) plus how it renders (kind +
+ * encoding). Adding a chart means adding one entry here; the UI needs no
+ * changes. Data comes from the Gold marts in `serving.*` (the only layer a
+ * dashboard is allowed to use — not Raw/Bronze/Silver).
  */
 
 export type ChartKind =
-  // batang & garis
+  // bar & line
   | "bar" | "hbar" | "line" | "area" | "stacked" | "combo"
-  // komposisi
+  // composition
   | "pie" | "rose" | "funnel" | "treemap"
-  // korelasi & distribusi
+  // correlation & distribution
   | "scatter" | "bubble" | "heatmap" | "radar" | "waterfall"
-  // geografis
+  // geographic
   | "geomap"
-  // angka tunggal
+  // single number
   | "kpi" | "gauge"
-  // non-grafik
+  // non-chart
   | "table" | "text";
 export type NumFmt = "int" | "float";
-/** Asal spec: bawaan (seed), dibuat AI lewat chat, atau manual lewat UI. */
+/** Spec origin: builtin (seeded), AI-generated via chat, or manual via the UI. */
 export type ChartSource = "builtin" | "ai" | "ui";
 
-/** KPI angka tunggal. SQL harus mengembalikan kolom `v` (dan boleh kolom lain). */
+/** A single-number KPI. The SQL must return a `v` column (other columns are allowed). */
 export type KpiSpec = {
   id: string;
   title: string;
   sql: string;
   format: NumFmt;
   caption?: string;
-  /** Mart sumber — untuk lineage/label. */
+  /** Source mart — for lineage/labeling. */
   mart: string;
 };
 
-/** Chart. SQL mengembalikan baris; `x`/`y` menunjuk kolom untuk sumbu/seri. */
+/** A chart. The SQL returns rows; `x`/`y` name the columns for the axis/series. */
 export type ChartSpec = {
   id: string;
   title: string;
@@ -46,22 +46,23 @@ export type ChartSpec = {
   mart: string;
   sql: string;
   x: string;
-  /** satu kolom (bar/line/pie) atau beberapa kolom (stacked). */
+  /** One column (bar/line/pie) or several columns (stacked). */
   y: string | string[];
   /**
-   * Kolom breakdown opsional (dimensi ke-2): memecah y menjadi banyak seri per
-   * nilai kolom ini (mis. multi-line per kawasan, grouped bar per kategori).
-   * Bila diisi, `y` adalah satu measure & data long-format (x, series, nilai).
+   * Optional breakdown column (a second dimension): splits y into multiple
+   * series by this column's value (e.g. one line per region, grouped bars
+   * per category). When set, `y` is a single measure and the data is
+   * long-format (x, series, value).
    */
   series?: string;
   format?: NumFmt;
-  /** 2 = full width di grid. */
+  /** 2 = full width in the grid. */
   span?: 1 | 2;
-  /** Konten markdown untuk tile kind="text" (tanpa SQL). */
+  /** Markdown content for a kind="text" tile (no SQL). */
   text?: string;
-  /** Caption/unit untuk tile kind="kpi". */
+  /** Caption/unit for a kind="kpi" tile. */
   caption?: string;
-  /** Nilai target/max untuk kind="gauge" (bila kosong → auto dari nilai). */
+  /** Target/max value for kind="gauge" (auto-derived from the value when unset). */
   target?: number;
 };
 
@@ -224,20 +225,20 @@ export const CHARTS: ChartSpec[] = [
   },
 ];
 
-/** Peta id → SQL untuk dipakai route server. */
+/** Map of id → SQL, for use by the server route. */
 export const SPEC_SQL: Record<string, string> = Object.fromEntries(
   [...KPIS, ...CHARTS].map((s) => [s.id, s.sql]),
 );
 
-/** Metadata render (tanpa SQL) — inilah yang dikirim ke klien. */
+/** Render metadata (no SQL) — this is what gets sent to the client. */
 export type ChartRenderSpec = Omit<ChartSpec, "sql"> & {
   source: ChartSource;
   board?: string;
-  /** Definisi terstruktur (ChartInput) untuk prefill saat edit. */
+  /** Structured definition (ChartInput) to prefill on edit. */
   def?: unknown;
 };
 
-/** Buang SQL dari spec, tempel asalnya — untuk respons API ke browser. */
+/** Strip SQL from the spec and attach its source — for the API response to the browser. */
 export function toRenderSpec(spec: ChartSpec, source: ChartSource): ChartRenderSpec {
   const { sql: _sql, ...rest } = spec;
   return { ...rest, source };

@@ -6,7 +6,7 @@ export const metadata: Metadata = {
   robots: { index: false, follow: false },
 };
 
-/** Rute publik read-only: /public/dashboard/<token>. Tanpa chrome konsol (AppFrame melewatinya). */
+/** Public read-only route: /public/dashboard/<token>. No console chrome (AppFrame skips it). */
 export default async function PublicDashboardPage({ params }: { params: Promise<{ token: string }> }) {
   const { token } = await params;
   return <PublicDashboard token={token} />;

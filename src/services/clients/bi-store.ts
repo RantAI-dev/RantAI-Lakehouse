@@ -19,29 +19,29 @@ export type StoredChartSpec = ChartSpec & {
   createdAt?: string;
 };
 
-/** Input tingkat-tinggi (dari AI tool / UI builder) — server menyusun SQL-nya. */
+/** High-level input (from an AI tool / UI builder) — the server composes the SQL. */
 export type ChartInput = {
   title: string;
   subtitle?: string;
-  mart: string; // tanpa prefix "serving." — mis. "mart_wisman"
+  mart: string; // without the "serving." prefix — e.g. "mart_wisman"
   kind: ChartKind;
-  dimension: string; // kolom sumbu-X / kategori
-  measures: string[]; // kolom nilai; >1 untuk "stacked"
-  breakdown?: string; // dimensi ke-2 opsional → pecah jadi banyak seri
+  dimension: string; // x-axis / category column
+  measures: string[]; // value columns; >1 for "stacked"
+  breakdown?: string; // optional 2nd dimension → splits into multiple series
   aggregate?: "sum" | "avg" | "max" | "min" | "count";
   limit?: number;
   order?: "desc" | "asc" | "none";
   span?: 1 | 2;
-  board?: string; // board tujuan (default "default")
-  text?: string; // konten markdown (kind="text")
+  board?: string; // target board (default "default")
+  text?: string; // markdown content (kind="text")
   caption?: string; // unit/caption (kind="kpi")
   target?: number; // target/max (kind="gauge")
 };
 
-/** Posisi tile di kanvas grid (12 kolom). Key = chartId. */
+/** Tile position on the grid canvas (12 columns). Key = chartId. */
 export type TileBox = { x: number; y: number; w: number; h: number };
 export type LayoutMap = Record<string, TileBox>;
-/** Filter dashboard: nilai kolom yang menyaring semua tile yang punya kolom itu. */
+/** Dashboard filter: a column value that filters every tile that has that column. */
 export type FilterDef = { column: string; values: string[] };
 
 export type Board = {

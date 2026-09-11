@@ -3,10 +3,10 @@ import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
- * OpsService NYATA sepenuhnya: observability/workloads/services dari
- * ClickHouse system.* + Dagster. cancelWorkload adalah `KILL QUERY` nyata
- * lewat `/api/ops/workloads/{id}/cancel`. mock/ops.ts sudah dihapus. `usage`
- * dihapus di WS1 honesty pass — tidak ada yang mengukurnya.
+ * OpsService is now fully real: observability/workloads/services from
+ * ClickHouse system.* + Dagster. cancelWorkload is a real `KILL QUERY` via
+ * `/api/ops/workloads/{id}/cancel`. mock/ops.ts has been deleted. `usage`
+ * was removed in the WS1 honesty pass — nothing measures it.
  */
 async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
   const res = await apiFetch(url, { signal });

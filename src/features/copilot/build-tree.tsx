@@ -5,9 +5,10 @@ import { cn } from "@/lib/utils";
 import { apiFetch } from "@/services/http";
 
 /**
- * Pohon pipeline lakehouse LIVE untuk mode Build. Polling /api/ai/build-status
- * dgn runId sampai run selesai; tiap step (Bronze→Silver→Gold) menghijau saat
- * berjalan. Ini yang bikin "build data via chat" kelihatan nyata.
+ * A LIVE lakehouse pipeline tree for Build mode. Polls
+ * /api/ai/build-status with a runId until the run finishes; each step
+ * (Bronze→Silver→Gold) turns green as it runs. This is what makes
+ * "build data via chat" feel real.
  */
 
 type Step = { key: string; status: string };
@@ -69,7 +70,7 @@ export function BuildTree({ runId }: { runId: string }) {
   }, [runId]);
 
   const byKey = new Map(steps.map((s) => [s.key, s.status]));
-  // Urutkan step: yang dikenal ikut ORDER, sisanya di belakang.
+  // Order the steps: known ones follow ORDER, the rest come after.
   const known = ORDER.map((k) => ({ key: k, status: byKey.get(k) ?? "PENDING" }));
   const extra = steps.filter((s) => !STEP_LABEL[s.key]);
   const all = [...known, ...extra];

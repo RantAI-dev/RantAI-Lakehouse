@@ -9,8 +9,9 @@ import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
- * AssetService NYATA — katalog data dari lakehouse (bronze_meta + silver) lewat
- * route server `/api/catalog`. Filter di-terapkan di client (katalog kecil).
+ * AssetService is real — the data catalog from the lakehouse (bronze_meta +
+ * silver) via the server route `/api/catalog`. Filtering happens client-side
+ * (the catalog is small).
  */
 async function loadCatalog(signal?: AbortSignal): Promise<{ assets: Asset[]; namespaces: CatalogNamespace[] }> {
   const res = await apiFetch("/api/catalog", { signal });

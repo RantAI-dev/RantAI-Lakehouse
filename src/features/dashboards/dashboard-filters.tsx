@@ -7,9 +7,10 @@ import type { FilterDef } from "@/services/clients/bi-store";
 import { apiFetch } from "@/services/http";
 
 /**
- * Bar filter dashboard (lintas-tile) ala Tableau/Metabase. Pilih kolom dimensi
- * → nilai (multi-select) → menyaring SEMUA tile yang punya kolom itu. Filter
- * aktif tampil sebagai chip. Berlaku live & (di dashboard user) tersimpan.
+ * A cross-tile dashboard filter bar, Tableau/Metabase-style. Pick a
+ * dimension column → values (multi-select) → filters EVERY tile that has
+ * that column. Active filters show as chips. Applies live and (on a user
+ * dashboard) is saved.
  */
 export function DashboardFilters({
   columns, filters, onChange,
@@ -18,7 +19,7 @@ export function DashboardFilters({
   filters: FilterDef[];
   onChange: (next: FilterDef[]) => void;
 }) {
-  const [editing, setEditing] = React.useState<string | null>(null); // kolom yang lagi dibuka
+  const [editing, setEditing] = React.useState<string | null>(null); // the column currently open
   const [valuesList, setValuesList] = React.useState<string[]>([]);
   const [picked, setPicked] = React.useState<Set<string>>(new Set());
   const [loading, setLoading] = React.useState(false);
@@ -54,7 +55,7 @@ export function DashboardFilters({
     <div className="flex flex-wrap items-center gap-1.5" ref={ref}>
       <span className="flex items-center gap-1 text-xs text-muted-foreground"><Filter className="size-3.5" /> Filter:</span>
 
-      {/* Chip filter aktif */}
+      {/* Active filter chips */}
       {filters.map((f) => (
         <div key={f.column} className="relative">
           <button
@@ -72,7 +73,7 @@ export function DashboardFilters({
         </div>
       ))}
 
-      {/* Tambah filter */}
+      {/* Add filter */}
       {available.length ? (
         <div className="relative">
           <button

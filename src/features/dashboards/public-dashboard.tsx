@@ -17,10 +17,10 @@ type Payload = {
 };
 
 /**
- * Halaman PUBLIK read-only sebuah dashboard (dibuka lewat token share, tanpa
- * login, tanpa chrome konsol). Cocok dikirim ke atasan / pihak luar: mereka
- * cukup buka link, lihat KPI & chart, ganti tema terang/gelap. Tidak bisa
- * mengedit apa pun.
+ * The PUBLIC read-only page for a dashboard (opened via a share token, no
+ * login, no console chrome). Fit for sending to a manager / outside party:
+ * they just open the link, see the KPIs & charts, and toggle light/dark
+ * theme. They cannot edit anything.
  */
 export function PublicDashboard({ token }: { token: string }) {
   const { resolvedTheme, setTheme } = useTheme();
@@ -73,7 +73,7 @@ export function PublicDashboard({ token }: { token: string }) {
 
   return (
     <div className="min-h-screen bg-muted/25">
-      {/* Header ringkas — brand + judul + toggle tema */}
+      {/* Compact header — brand + title + theme toggle */}
       <header className="sticky top-0 z-10 flex items-center gap-3 border-b border-border bg-card/80 px-4 py-3 backdrop-blur-md sm:px-6">
         <span className="relative block h-6 w-[116px] shrink-0">
           <Image src="/logo-light.png" alt="Rantai Lake" fill sizes="116px" className="object-contain object-left dark:hidden" priority />

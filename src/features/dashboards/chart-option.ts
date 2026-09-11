@@ -2,10 +2,10 @@ import type { EChartsOption } from "echarts";
 import type { ChartSpec } from "@/lib/dashboard-specs";
 import { JAKARTA_MAP, normalizeJakartaArea } from "./echarts-maps";
 
-/** buildOption hanya butuh cara render (bukan SQL) — muat ChartSpec & ChartRenderSpec. */
+/** buildOption only needs how to render (not the SQL) — fits ChartSpec & ChartRenderSpec. */
 type Renderable = Pick<ChartSpec, "kind" | "x" | "y" | "series" | "target">;
 
-/** Palet kategorikal konsol (indigo-led). Dipakai konsisten lintas chart. */
+/** The console's categorical palette (indigo-led). Used consistently across charts. */
 const PALETTE = [
   "#6366f1", "#0ea5e9", "#10b981", "#f59e0b",
   "#ef4444", "#8b5cf6", "#14b8a6", "#ec4899",
@@ -73,7 +73,7 @@ export function buildOption(
     };
   }
 
-  // ── Kind non-sumbu-standar (Metabase/Tableau-parity) ─────────────────────
+  // ── Non-standard-axis kinds (Metabase/Tableau-parity) ─────────────────────
   const yArr = Array.isArray(spec.y) ? spec.y : [spec.y];
   const y0 = yArr[0];
   const niceMax = (v: number) => {
@@ -181,7 +181,7 @@ export function buildOption(
       legend: { top: 0, textStyle: { color: axis, fontSize: 11 }, icon: "circle" },
       grid: { ...base.grid, top: 34 },
       xAxis: catAxis(cat),
-      // alignTicks off — dua metrik beda skala (mis. jutaan vs ribuan).
+      // alignTicks off — the two metrics have different scales (e.g. millions vs thousands).
       yAxis: [{ ...valAxis(m1), alignTicks: false }, { ...valAxis(m2, true), alignTicks: false }],
       series: [
         { name: m1, type: "bar", data: rows.map((r) => num(r[m1])), barMaxWidth: 34, itemStyle: { borderRadius: [4, 4, 0, 0] } },
@@ -269,7 +269,7 @@ export function buildOption(
     axisTick: { show: false },
   };
 
-  // Breakdown (dimensi ke-2): data long-format (x, series, nilai) → banyak seri.
+  // Breakdown (2nd dimension): long-format data (x, series, value) → multiple series.
   if (spec.series) {
     const valueCol = Array.isArray(spec.y) ? spec.y[0] : spec.y;
     const seriesCol = spec.series;
@@ -310,7 +310,7 @@ export function buildOption(
     } as EChartsOption;
   }
 
-  // Stacked bar (mis. wisnus + wisman).
+  // Stacked bar (e.g. wisnus + wisman).
   if (spec.kind === "stacked" && Array.isArray(spec.y)) {
     return {
       ...base,
@@ -329,7 +329,7 @@ export function buildOption(
     };
   }
 
-  // Bar / hbar / line / area — satu seri.
+  // Bar / hbar / line / area — a single series.
   const yCol = Array.isArray(spec.y) ? spec.y[0] : spec.y;
   const values = (horizontal ? [...rows].reverse() : rows).map((r) => num(r[yCol]));
   const isLine = spec.kind === "line" || spec.kind === "area";

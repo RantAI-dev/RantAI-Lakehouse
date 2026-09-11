@@ -9,11 +9,12 @@ import { ChatComposer } from "./chat-composer";
 
 
 /**
- * Chat dock GLOBAL — bar di TENGAH-BAWAH setiap halaman (gaya Google Cloud
- * Assist). Bar input selalu tampak; saat ada percakapan / difokus, panel chat
- * NAIK ke atas bar (Ask/Build, menu Tools, render tool, pohon build). Berbagi
- * otak & riwayat dengan halaman /copilot lewat useCopilot. Disembunyikan di
- * /copilot (sudah full-page).
+ * The GLOBAL chat dock — a bar at the BOTTOM-CENTER of every page (Google
+ * Cloud Assist style). The input bar is always visible; when there's a
+ * conversation / it's focused, the chat panel RISES above the bar
+ * (Ask/Build, Tools menu, tool rendering, build tree). Shares the brain &
+ * history with the /copilot page via useCopilot. Hidden on /copilot
+ * (already a full page).
  */
 export function CopilotDock() {
   const pathname = usePathname();

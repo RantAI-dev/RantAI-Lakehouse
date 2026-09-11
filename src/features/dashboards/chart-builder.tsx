@@ -25,7 +25,7 @@ export type ChartDef = {
 };
 type BoardOpt = { id: string; name: string };
 
-/** Tipe chart dikelompokkan (ala pemilih visualisasi Metabase/Tableau). */
+/** Chart types grouped (Metabase/Tableau-style visualization picker). */
 const KIND_GROUPS: { group: string; items: { value: ChartKind; label: string }[] }[] = [
   { group: "Comparison", items: [
     { value: "bar", label: "Bar" },
@@ -63,7 +63,7 @@ const KIND_GROUPS: { group: string; items: { value: ChartKind; label: string }[]
   ] },
 ];
 const AGGS = ["sum", "avg", "max", "min", "count"];
-/** Label measure yang berubah menurut kind (X/Y/size, bar/line, dst). */
+/** Measure labels that vary by kind (X/Y/size, bar/line, etc.). */
 const MEASURE_LABELS: Partial<Record<ChartKind, string[]>> = {
   scatter: ["X metric", "Y metric"],
   bubble: ["X metric", "Y metric", "Size metric"],
@@ -72,10 +72,10 @@ const MEASURE_LABELS: Partial<Record<ChartKind, string[]>> = {
 };
 
 /**
- * Builder chart — jalur MANUAL (ala Tableau). Dipakai dua mode:
- *  - BUAT (punya trigger sendiri "New chart"),
- *  - EDIT (dikendalikan induk: `open`, `initial` berisi id+def).
- * Menulis ke artefak yang SAMA dengan jalur chat (console.bi_chart).
+ * Chart builder — the MANUAL path (Tableau-style). Used in two modes:
+ *  - CREATE (has its own "New chart" trigger),
+ *  - EDIT (controlled by the parent: `open`, `initial` carries id+def).
+ * Writes to the SAME artifact as the chat path (console.bi_chart).
  */
 export function ChartBuilder({
   onSaved, board = "default", boards = [], initial, editId,
@@ -119,7 +119,7 @@ export function ChartBuilder({
   const isText = kind === "text";
   const isKpi = kind === "kpi";
   const isGauge = kind === "gauge";
-  const isSingle = isKpi || isGauge;         // tanpa dimensi (angka tunggal)
+  const isSingle = isKpi || isGauge;         // no dimension (single number)
   const isHeatmap = kind === "heatmap";
   const needsM2 = kind === "stacked" || kind === "scatter" || kind === "combo" || kind === "bubble";
   const needsM3 = kind === "bubble";
@@ -134,7 +134,7 @@ export function ChartBuilder({
     return f;
   }
 
-  // Saat dibuka: muat mart, dan bila EDIT prefill dari initial.
+  // On open: load the marts, and if EDIT, prefill from initial.
   React.useEffect(() => {
     if (!open) return;
     void apiFetch("/api/dashboard/fields").then((r) => r.json()).then((j) => setMarts(j.marts ?? [])).catch(() => setMarts([]));
@@ -173,7 +173,7 @@ export function ChartBuilder({
     setTargetBoard(board); setFields(null); setError(null);
   }
 
-  // Ganti mart oleh USER → reset pilihan kolom & muat ulang.
+  // User changes the mart → reset the column selections and reload.
   function onMartChange(m: string) {
     setMart(m); setDimension(""); setMeasure(""); setMeasure2(""); setMeasure3(""); setBreakdown("");
     if (m) void loadFields(m); else setFields(null);
@@ -246,7 +246,7 @@ export function ChartBuilder({
             <Input id="ch-title" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Visitors by Region" />
           </div>
 
-          {/* Tipe + Board */}
+          {/* Type + Board */}
           <div className="grid grid-cols-2 gap-3">
             <div className="grid gap-1.5">
               <Label>Tipe</Label>

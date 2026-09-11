@@ -10,7 +10,7 @@ import { ToolStepCard } from "./tool-step";
 import { BuildTree } from "./build-tree";
 import type { Msg } from "./use-copilot";
 
-/** Avatar bulat untuk pesan — AI (gradasi violet) / user (netral). */
+/** A round message avatar — AI (violet gradient) / user (neutral). */
 function Avatar({ ai }: { ai?: boolean }) {
   return (
     <span
@@ -26,7 +26,7 @@ function Avatar({ ai }: { ai?: boolean }) {
   );
 }
 
-/** Titik-titik "mengetik" (dipinjam dari pola RantAI-Agents). */
+/** "Typing" dots (borrowed from the RantAI-Agents pattern). */
 export function TypingDots({ className }: { className?: string }) {
   return (
     <div className={cn("flex items-center gap-1", className)}>
@@ -38,7 +38,7 @@ export function TypingDots({ className }: { className?: string }) {
   );
 }
 
-/** Daftar pesan Copilot — render kaya (tool cards, pohon build, markdown). */
+/** The Copilot message list — rich rendering (tool cards, build tree, markdown). */
 export function ChatMessages({
   messages, busy, error, className, onConfirmTool, onCancelTool, confirmingKey,
 }: {

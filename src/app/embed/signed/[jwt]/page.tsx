@@ -7,9 +7,10 @@ export const metadata: Metadata = {
 };
 
 /**
- * SIGNED EMBED: /embed/signed/<jwt>[?chart=<id>]. JWT ditandatangani host dgn
- * EMBEDDING SECRET; server memverifikasi & mengunci filter (params). Untuk
- * <iframe>. AppFrame melewati chrome; latar transparan.
+ * SIGNED EMBED: /embed/signed/<jwt>[?chart=<id>]. The host signs the JWT
+ * with the EMBEDDING SECRET; the server verifies it and locks the filters
+ * (params). For an <iframe>. AppFrame skips the chrome; transparent
+ * background.
  */
 export default async function SignedEmbedPage({
   params, searchParams,

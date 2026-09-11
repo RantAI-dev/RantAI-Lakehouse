@@ -7,17 +7,18 @@ import { ChatMessages } from "./chat-messages";
 import { ChatComposer } from "./chat-composer";
 
 /**
- * Halaman AI Copilot — tampilan chat ala RantAI-Agents: avatar per pesan,
- * welcome ketengah dengan pill saran, composer lembut. RIWAYAT dipindah jadi
- * bar horizontal di bawah navbar (bukan sidebar kiri). Otak & riwayat dibagi
- * dengan chat dock global lewat useCopilot.
+ * The AI Copilot page — a RantAI-Agents-style chat view: a per-message
+ * avatar, a centered welcome with suggestion pills, a soft composer.
+ * HISTORY renders in the left sidebar's bottom slot (see app-sidebar.tsx),
+ * not on this page. The brain & history are shared with the global chat
+ * dock via useCopilot.
  */
 export function CopilotPage() {
   const c = useCopilot();
 
   return (
     <div className="flex flex-col gap-3">
-      {/* Chat (riwayat ada di sidebar) */}
+      {/* Chat (history lives in the sidebar) */}
       <div className="mx-auto flex w-full max-w-3xl flex-col">
         <div className="min-h-[56vh] overflow-y-auto pr-0.5">
           {c.messages.length === 0 ? (

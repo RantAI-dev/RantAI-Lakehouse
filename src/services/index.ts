@@ -14,39 +14,40 @@ import { postgresConnectorService } from "./clients/connectors"
 import { postgresAgentService } from "./clients/agents"
 import { clickhouseAlertRuleService } from "./clients/alerts"
 
-// Overview kini NYATA sepenuhnya — summary/activity dari ClickHouse+Dagster,
-// alerts (list/ack/resolve) dari Postgres (Task 2.6). mock/overview.ts
-// sudah dihapus.
+// Overview is now fully real — summary/activity from ClickHouse+Dagster,
+// alerts (list/ack/resolve) from Postgres (Task 2.6). mock/overview.ts
+// has been deleted.
 export const overviewService = clickhouseOverviewService
 export const assetService = clickhouseAssetService
 void mockAssetService
-// Pipelines kini NYATA sepenuhnya — list/get/runs/trigger dari Dagster,
-// create/generate dari Postgres + LLM, cancel/retry/pause/resume adalah
-// mutation Dagster nyata. mock/pipelines.ts sudah dihapus.
+// Pipelines is now fully real — list/get/runs/trigger from Dagster,
+// create/generate from Postgres + LLM, cancel/retry/pause/resume are
+// real Dagster mutations. mock/pipelines.ts has been deleted.
 export const pipelineService = dagsterPipelineService
-// Query Studio kini NYATA sepenuhnya — eksekusi SQL, saved/history, dan
-// generateSql semua lewat backend Rust (ClickHouse + Postgres + LLM).
-// mock/queries.ts sudah dihapus.
+// Query Studio is now fully real — SQL execution, saved/history, and
+// generateSql all go through the Rust backend (ClickHouse + Postgres + LLM).
+// mock/queries.ts has been deleted.
 export const queryService = clickhouseQueryService
-// Agents kini NYATA sepenuhnya — employees/tools/workflows/runs/approvals
-// di Postgres (Task 2.9). Tidak ada runtime eksekusi agent/tool (kontrak
-// memang tidak memintanya). mock/agents.ts sudah dihapus.
+// Agents is now fully real — employees/tools/workflows/runs/approvals
+// live in Postgres (Task 2.9). There is no agent/tool execution runtime
+// (the contract never asked for one). mock/agents.ts has been deleted.
 export const agentService = postgresAgentService
-// Governance kini NYATA sepenuhnya — reads dari ClickHouse/Dagster,
-// policies + create*Rule dari Postgres. mock/governance.ts sudah dihapus.
+// Governance is now fully real — reads from ClickHouse/Dagster,
+// policies + create*Rule from Postgres. mock/governance.ts has been deleted.
 export const governanceService = clickhouseGovernanceService
-// Ops kini NYATA sepenuhnya — observability/usage/workloads/services dari
-// ClickHouse+Dagster, cancelWorkload adalah KILL QUERY nyata. mock/ops.ts
-// sudah dihapus.
+// Ops is now fully real — observability/usage/workloads/services from
+// ClickHouse+Dagster, cancelWorkload is a real KILL QUERY. mock/ops.ts
+// has been deleted.
 export const opsService = clickhouseOpsService
-// Identity kini NYATA — pengguna/peran/tenant/service identity di Postgres.
-// Seluruh method kontrak terlayani, jadi mock/identity.ts sudah dihapus.
+// Identity is now real — users/roles/tenants/service identities live in
+// Postgres. Every contract method is served, so mock/identity.ts has been
+// deleted.
 export const identityService = postgresIdentityService
-// Connectors kini NYATA — definisi konektor (CRUD + testConnection) di
-// Postgres (Task 2.7). Kredensial TIDAK PERNAH disimpan/dikembalikan: hanya
-// `secretRef` (referensi, mis. "env:FOO"); lihat
-// `rust/crates/lakehouse-store/src/connectors.rs` untuk catatan keputusan.
-// mock/connectors.ts sudah dihapus.
+// Connectors is now real — connector definitions (CRUD + testConnection) live
+// in Postgres (Task 2.7). Credentials are NEVER stored or returned: only the
+// `secretRef` (a reference, e.g. "env:FOO"); see
+// `rust/crates/lakehouse-store/src/connectors.rs` for the design rationale.
+// mock/connectors.ts has been deleted.
 export const connectorService = postgresConnectorService
 // Alert rules (WS1 task 1.15) — CRUD + run over `console.alert_rule` in
 // ClickHouse, ported by `lakehouse_alerts`. No mock ever existed for this

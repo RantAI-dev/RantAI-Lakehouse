@@ -16,11 +16,11 @@ type Payload = {
 };
 
 /**
- * View EMBED — dirancang untuk di dalam <iframe> di situs/app lain (ala
- * embed publik Metabase). Tanpa header/footer/chrome. Dua mode:
- *  - seluruh dashboard (grid) — default
- *  - satu chart saja bila `chartId` diberikan (?chart=<id>) — mengisi iframe.
- * Read-only, data dari mart Gold. Latar transparan agar menyatu dgn host.
+ * The EMBED view — designed to sit inside an <iframe> on another site/app
+ * (Metabase-public-embed style). No header/footer/chrome. Two modes:
+ *  - the whole dashboard (grid) — default
+ *  - a single chart when `chartId` is given (?chart=<id>) — fills the iframe.
+ * Read-only, data from Gold marts. Transparent background so it blends into the host.
  */
 export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: string; chartId?: string }) {
   const { resolvedTheme } = useTheme();
@@ -28,8 +28,8 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
   const [data, setData] = React.useState<Payload | null>(null);
   const [state, setState] = React.useState<"loading" | "ok" | "notfound" | "error">("loading");
 
-  // Sumber data: token publik (GET, read-only) ATAU JWT signed embed (POST,
-  // filter terkunci server-side). Link publik: /embed/dashboard/<token>.
+  // Data source: a public token (GET, read-only) OR a signed JWT embed (POST,
+  // server-side locked filters). Public link: /embed/dashboard/<token>.
   const linkBase = token ? `/public/dashboard/${token}` : "";
 
   React.useEffect(() => {
@@ -58,7 +58,7 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
 
   const charts = data?.charts ?? [];
 
-  // ── Mode: satu chart mengisi iframe ────────────────────────────────────────
+  // ── Mode: a single chart fills the iframe ──────────────────────────────────
   if (chartId) {
     const spec = charts.find((c) => c.id === chartId);
     if (state === "ok" && !spec) {
@@ -84,7 +84,7 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
     );
   }
 
-  // ── Mode: seluruh dashboard ────────────────────────────────────────────────
+  // ── Mode: the whole dashboard ──────────────────────────────────────────────
   const items: GridItem[] = charts.map((spec) => ({
     id: spec.id,
     title: spec.title,

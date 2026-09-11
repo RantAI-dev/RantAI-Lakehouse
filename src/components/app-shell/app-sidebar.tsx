@@ -26,7 +26,7 @@ import { NAV_GROUPS, activeNavHref, type NavGroup, type NavItem } from "./nav-co
 import { apiFetch } from "@/services/http"
 
 function BrandLogo() {
-  // Logo ikut tema: navy untuk sidebar terang, putih untuk sidebar gelap.
+  // Logo follows the theme: navy for a light sidebar, white for a dark one.
   return (
     <div className="relative size-8 shrink-0" aria-hidden>
       <Image src="/logo-light.png" alt="Rantai Lake" fill sizes="32px" className="object-contain dark:hidden" priority />
@@ -38,12 +38,12 @@ function BrandLogo() {
 type FlyoutState = { label: string; top: number; left: number } | null
 
 /**
- * Primary sidebar — daftar SECTION. Perilaku beda per mode:
- *  · MELEBAR: klik section = buka halaman pertamanya; sub-halaman tampil sebagai
- *    BOTTOM NAV (lihat AppBottomNav).
- *  · DICIUTKAN (ikon): klik ikon section → FLYOUT sub-halaman ke kanan (klik),
- *    karena bottom nav tak muat.
- * Grup 1-item selalu link langsung.
+ * Primary sidebar — a list of SECTIONs. Behavior differs by mode:
+ *  · EXPANDED: clicking a section opens its first page; its sub-pages show
+ *    as a BOTTOM NAV (see AppBottomNav).
+ *  · COLLAPSED (icons): clicking a section icon opens a FLYOUT of sub-pages
+ *    to the right (on click), since there's no room for a bottom nav.
+ * A 1-item group always links directly.
  */
 export function AppSidebar() {
   const pathname = usePathname()
@@ -140,7 +140,7 @@ export function AppSidebar() {
     const label = single ? first.title : group.label
     const active = group.items.some((it) => it.href === activeHref)
 
-    // Grup 1-item, atau mode melebar → link navigasi biasa.
+    // A 1-item group, or expanded mode → a plain navigation link.
     if (single || !iconMode) {
       return (
         <SidebarMenuItem key={group.label} className="group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:justify-center">
@@ -159,7 +159,7 @@ export function AppSidebar() {
       )
     }
 
-    // Mode ikon + multi-item → tombol flyout.
+    // Icon mode + multi-item → a flyout button.
     const isOpen = flyout?.label === group.label
     return (
       <SidebarMenuItem key={group.label} className="flex justify-center">
@@ -202,7 +202,7 @@ export function AppSidebar() {
           </SidebarMenu>
         </SidebarGroup>
 
-        {/* Slot bawah — DAFTAR DASHBOARD, RIWAYAT chat, atau sub-menu section. */}
+        {/* Bottom slot — DASHBOARD LIST, chat HISTORY, or a section sub-menu. */}
         {!iconMode && onDashboards ? (
           <SidebarGroup className="mt-1 gap-0 border-t border-sidebar-border px-2 pb-1 pt-2">
             <div className="flex items-center justify-between pr-1">
@@ -289,7 +289,7 @@ export function AppSidebar() {
         ) : null}
       </SidebarContent>
 
-      {/* Flyout (hanya mode ikon) */}
+      {/* Flyout (icon mode only) */}
       {mounted && flyout && openGroup
         ? createPortal(
             <div

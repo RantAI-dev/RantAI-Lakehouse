@@ -29,7 +29,7 @@ function asObj(v: unknown): Record<string, unknown> {
   return v && typeof v === "object" ? (v as Record<string, unknown>) : {};
 }
 
-/** Bar-chart horizontal CSS bila hasil = 1 kolom label + 1 kolom angka. */
+/** CSS horizontal bar chart when the result is 1 label column + 1 number column. */
 function MiniBar({ columns, rows }: { columns: string[]; rows: Record<string, unknown>[] }) {
   if (columns.length < 2 || rows.length === 0 || rows.length > 12) return null;
   const [labelCol, valCol] = columns;
@@ -226,7 +226,7 @@ function StepBody({
     }
   }
 
-  // Default: JSON ringkas.
+  // Default: a compact JSON dump.
   return (
     <pre className="mt-1 overflow-x-auto rounded bg-muted/60 px-2 py-1.5 font-mono text-[10px] text-muted-foreground">
       {JSON.stringify(step.result, null, 2).slice(0, 600)}

@@ -45,9 +45,10 @@ const SOURCE_BADGE: Record<ChartSource, { label: string; cls: string } | null> =
 const YEARS = ["all", "2014", "2015", "2016", "2017", "2018", "2019", "2020", "2021", "2022", "2023", "2024", "2025", "2026"];
 
 /**
- * Dashboard ala Tableau/Metabase — kanvas tile drag/resize, multi-dashboard
- * (dipilih via ?board=, dikelola dari sidebar). Mode Edit menata tata letak
- * (disimpan ke lakehouse); mode Lihat presentasi bersih. Kartu manual & AI.
+ * A Tableau/Metabase-style dashboard — a drag/resize tile canvas, multiple
+ * dashboards (chosen via ?board=, managed from the sidebar). Edit mode
+ * arranges the layout (saved to the lakehouse); View mode is a clean
+ * presentation. Manual and AI-built cards.
  */
 export function DashboardPage() {
   const router = useRouter();
@@ -72,7 +73,7 @@ export function DashboardPage() {
   const [newName, setNewName] = React.useState("");
   const [fullscreen, setFullscreen] = React.useState(false);
   const [autoSec, setAutoSec] = React.useState("0");
-  // Drill / cross-filter: menu saat klik titik data + modal baris mentah.
+  // Drill / cross-filter: menu on data-point click + a modal of raw rows.
   const [drill, setDrill] = React.useState<{ name: string; column: string; mart: string; x: number; y: number } | null>(null);
   const [records, setRecords] = React.useState<{ columns: string[]; rows: Record<string, unknown>[]; value: string; loading: boolean } | null>(null);
   const [shareOpen, setShareOpen] = React.useState(false);
@@ -106,18 +107,18 @@ export function DashboardPage() {
     }
   }, [board, year]);
 
-  // Ganti dashboard → adopsi ulang filter tersimpan board itu.
+  // Switch dashboard → re-adopt that board's saved filters.
   React.useEffect(() => { adoptingRef.current = true; filtersRef.current = []; setFilters([]); }, [board]);
   React.useEffect(() => { void load(); }, [load]);
 
-  // Auto-refresh berkala (presentasi).
+  // Periodic auto-refresh (for presentation).
   React.useEffect(() => {
     const s = Number(autoSec);
     if (!s) return;
     const t = setInterval(() => void load(), s * 1000);
     return () => clearInterval(t);
   }, [autoSec, load]);
-  // Esc keluar fullscreen.
+  // Esc exits fullscreen.
   React.useEffect(() => {
     if (!fullscreen) return;
     const h = (e: KeyboardEvent) => { if (e.key === "Escape") setFullscreen(false); };
@@ -135,11 +136,11 @@ export function DashboardPage() {
     }
     void load();
   }, [board, isDefault, load]);
-  // Klik titik data pada chart (mode Lihat) → buka menu drill di posisi kursor.
+  // Click a chart data point (View mode) → open the drill menu at the cursor position.
   const onTileClick = React.useCallback((column: string, mart: string) =>
     (name: string, pos: { x: number; y: number }) => setDrill({ name, column, mart, x: pos.x, y: pos.y }), []);
 
-  // Cross-filter: toggle nilai di kolom → menyaring SEMUA tile yang punya kolom itu.
+  // Cross-filter: toggle a column value → filters EVERY tile that has that column.
   const crossFilter = React.useCallback((column: string, value: string) => {
     const cur = filtersRef.current;
     const ex = cur.find((f) => f.column === column);
@@ -156,7 +157,7 @@ export function DashboardPage() {
     setDrill(null);
   }, [applyFilters]);
 
-  // Drill-down: tampilkan baris mentah Gold di balik nilai yang diklik.
+  // Drill-down: show the raw Gold rows behind the clicked value.
   const openRecords = React.useCallback(async (mart: string, column: string, value: string) => {
     setDrill(null);
     setRecords({ columns: [], rows: [], value, loading: true });
@@ -171,8 +172,8 @@ export function DashboardPage() {
     }
   }, []);
 
-  // Export PDF — pakai dialog print browser (Save as PDF). Print CSS mengubah
-  // kanvas tile jadi tumpukan rapi & menyembunyikan chrome konsol. Tanpa dep.
+  // Export PDF — uses the browser's print dialog (Save as PDF). Print CSS turns
+  // the tile canvas into a tidy stack and hides the console chrome. No deps.
   function doExportPdf() {
     setMenuOpen(false);
     setEdit(false);
@@ -183,14 +184,14 @@ export function DashboardPage() {
 
   // Start in VIEW mode; user clicks "Edit layout" to arrange. Reset on board switch.
   React.useEffect(() => { setEdit(false); }, [board]);
-  // Buka /dashboards (demo) → langsung ke dashboard user terbaru bila ada.
+  // Open /dashboards (demo) → jump straight to the newest user dashboard if one exists.
   React.useEffect(() => {
     if (data && isDefault && data.boards.length > 1) {
       router.replace(`/dashboards?board=${data.boards[data.boards.length - 1].id}`);
     }
   }, [data, isDefault, router]);
 
-  // Simpan layout (debounced) untuk dashboard user.
+  // Save the layout (debounced) for a user dashboard.
   const saveTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const persistLayout = React.useCallback((next: LayoutMap) => {
     setLayout(next);
@@ -257,7 +258,7 @@ export function DashboardPage() {
         method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: board, embed: enable }),
       });
       setEmbedEnabled(enable);
-      // Refresh sample token (baru bermakna saat enabled).
+      // Refresh the sample token (only meaningful once enabled).
       const res = await apiFetch(`/api/dashboard/embed-info?board=${encodeURIComponent(board)}`, { cache: "no-store" });
       const json = await res.json();
       setSampleToken(json?.sampleToken ?? "");
@@ -334,12 +335,12 @@ export function DashboardPage() {
     return () => setPageContext(null);
   }, [board, isDefault, dashName, charts, setPageContext]);
 
-  // Bangun tile untuk grid.
+  // Build the tiles for the grid.
   const items: GridItem[] = charts.map((spec) => {
     const cell = data?.results[spec.id];
     const badge = SOURCE_BADGE[spec.source];
     const dim = (spec.def as ChartDef | undefined)?.dimension;
-    // Klik-drill hanya di mode Lihat, untuk chart yang punya dimensi kategori.
+    // Click-drill only in View mode, for charts that have a category dimension.
     const clickable = !edit && !!dim && spec.kind !== "geomap" && spec.kind !== "table" && spec.kind !== "kpi" && spec.kind !== "gauge" && spec.kind !== "text";
     return {
       id: spec.id,
@@ -429,7 +430,7 @@ export function DashboardPage() {
         </div>
       ) : null}
 
-      {/* KPI row (dashboard bawaan) */}
+      {/* KPI row (builtin dashboard) */}
       {kpis.length ? (
         <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
           {kpis.map((k) => {
@@ -446,7 +447,7 @@ export function DashboardPage() {
         </div>
       ) : null}
 
-      {/* Kanvas */}
+      {/* Canvas */}
       {!loading && charts.length === 0 ? (
         <div className="rounded-lg border border-dashed py-16 text-center text-sm text-muted-foreground">
           This dashboard is empty. Click <span className="font-medium text-foreground">New chart</span> or ask AI Copilot: <span className="font-medium text-foreground">“create a chart …”</span>.
@@ -469,7 +470,7 @@ export function DashboardPage() {
           onSaved={() => { setEditing(null); void load(); }} />
       ) : null}
 
-      {/* Drill menu — muncul saat klik titik data (mode Lihat). */}
+      {/* Drill menu — appears when a data point is clicked (View mode). */}
       {drill ? (
         <>
           <div className="fixed inset-0 z-40" onClick={() => setDrill(null)} />
@@ -484,7 +485,7 @@ export function DashboardPage() {
         </>
       ) : null}
 
-      {/* Drill-down: baris mentah Gold di balik nilai. */}
+      {/* Drill-down: raw Gold rows behind the value. */}
       <Dialog open={!!records} onOpenChange={(o) => { if (!o) setRecords(null); }}>
         <DialogContent className="max-h-[85vh] overflow-hidden sm:max-w-3xl">
           <DialogHeader><DialogTitle className="flex items-center gap-2"><Table2 className="size-4" /> Records · {records?.value}</DialogTitle></DialogHeader>
@@ -546,7 +547,7 @@ export function DashboardPage() {
                   <a href={shareUrl} target="_blank" rel="noopener noreferrer" className="inline-block text-xs font-medium text-primary hover:underline">Open preview ↗</a>
                 </div>
 
-                {/* Embed (iframe) — ala Metabase */}
+                {/* Embed (iframe) — Metabase-style */}
                 <div className="space-y-1.5">
                   <p className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground"><Code2 className="size-3.5" /> Embed in a website</p>
                   <div className="rounded-md border border-border bg-muted/30 p-2">

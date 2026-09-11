@@ -9,22 +9,22 @@ import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
- * ConnectorService NYATA — definisi konektor (source/sink) lewat route
- * `/api/connectors`, backed oleh Postgres (`lakehouse-store`, Task 2.7).
+ * ConnectorService is real — connector definitions (source/sink) go through
+ * the `/api/connectors` route, backed by Postgres (`lakehouse-store`, Task 2.7).
  *
- * CATATAN KREDENSIAL: `CreateConnectorInput.secretRef` adalah REFERENSI ke
- * tempat kredensial disimpan (nama env var, path secret manager) — bukan
- * nilai kredensial itu sendiri. Backend tidak pernah menyimpan, mengembalikan,
- * mencatat log, atau menampilkan nilai kredensial; `Connector`/`ConnectorDetail`
- * bahkan tidak punya field untuk itu.
+ * CREDENTIAL NOTE: `CreateConnectorInput.secretRef` is a REFERENCE to where a
+ * credential is stored (an env var name, a secret-manager path) — not the
+ * credential value itself. The backend never stores, returns, logs, or
+ * displays a credential value; `Connector`/`ConnectorDetail` do not even have
+ * a field for one.
  *
- * `testConnection` di sini SEKARANG melakukan probe jaringan nyata — tapi
- * hanya untuk PostgreSQL dan object storage S3-compatible, satu-satunya dua
- * tipe yang build ini tahu cara menghubunginya. Tipe lain (Kafka, MQTT,
- * MongoDB, dst.) mengembalikan `supported: false`, bukan hasil palsu. Lihat
- * `rust/crates/lakehouse-api/src/connector_probe.rs` untuk implementasinya
- * dan `rust/crates/lakehouse-store/src/connectors.rs` untuk catatan
- * keputusan kredensial lengkap.
+ * `testConnection` here NOW performs a real network probe — but only for
+ * PostgreSQL and S3-compatible object storage, the only two types this build
+ * knows how to reach. Other types (Kafka, MQTT, MongoDB, etc.) return
+ * `supported: false` rather than a fabricated result. See
+ * `rust/crates/lakehouse-api/src/connector_probe.rs` for the implementation
+ * and `rust/crates/lakehouse-store/src/connectors.rs` for the full
+ * credential design rationale.
  */
 
 async function getJson<T>(url: string, init?: RequestInit): Promise<T> {

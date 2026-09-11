@@ -38,7 +38,7 @@ export type NavItem = {
 
 export type NavGroup = {
   label: string
-  /** Ikon section — untuk tombol flyout di sidebar. */
+  /** Section icon — for the flyout button in the sidebar. */
   icon?: LucideIcon
   items: NavItem[]
 }
@@ -164,13 +164,13 @@ export const NAV_GROUPS: NavGroup[] = [
 /** Flat list of every sidebar nav item, used for active-state and command search. */
 export const ALL_NAV_ITEMS: NavItem[] = NAV_GROUPS.flatMap((g) => g.items)
 
-/** Grup (section) yang memuat halaman aktif — untuk bottom-nav & sub-navigasi. */
+/** The group (section) that contains the active page — for bottom-nav & sub-navigation. */
 export function activeNavGroup(pathname: string): NavGroup | undefined {
   const href = activeNavHref(pathname)
   return NAV_GROUPS.find((g) => g.items.some((it) => it.href === href))
 }
 
-/** Sub-halaman section aktif (kosong bila hanya 1 item). */
+/** Sub-pages of the active section (empty when there's only 1 item). */
 export function subNavItems(pathname: string): NavItem[] {
   const g = activeNavGroup(pathname)
   return g && g.items.length > 1 ? g.items : []

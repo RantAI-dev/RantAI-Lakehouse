@@ -13,14 +13,15 @@ import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
- * IdentityService NYATA — pengguna, peran, tenant, dan service identity
- * tersimpan di Postgres lewat route `/api/identity/*` (crate `lakehouse-store`).
- * Menggantikan seluruh `mock/identity.ts`; tidak ada method yang masih mock.
+ * IdentityService is real — users, roles, tenants, and service identities
+ * are stored in Postgres via the `/api/identity/*` route (crate
+ * `lakehouse-store`). Replaces all of `mock/identity.ts`; no method here is
+ * still mocked.
  *
- * Catatan: backend ini TIDAK punya lapisan autentikasi. Semua endpoint di
- * bawah — termasuk tiga POST yang membuat baris direktori sungguhan — terbuka
- * bagi siapa pun yang bisa menjangkau servisnya. Itu gap produk yang sedang
- * dieskalasi terpisah, bukan sesuatu yang ditambal di adapter ini.
+ * Note: this backend has NO authentication layer. Every endpoint below —
+ * including the three POSTs that create real directory rows — is open to
+ * anyone who can reach the service. That is a product gap being escalated
+ * separately, not something patched over in this adapter.
  */
 
 /** Map an error response body onto the ServiceError code its status implies. */

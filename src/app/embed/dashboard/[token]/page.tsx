@@ -7,8 +7,9 @@ export const metadata: Metadata = {
 };
 
 /**
- * Rute EMBED: /embed/dashboard/<token>[?chart=<chartId>]. Untuk <iframe> di
- * situs lain. AppFrame melewati chrome-nya; latar transparan.
+ * The EMBED route: /embed/dashboard/<token>[?chart=<chartId>]. For an
+ * <iframe> on another site. AppFrame skips its chrome; transparent
+ * background.
  */
 export default async function EmbedDashboardPage({
   params, searchParams,

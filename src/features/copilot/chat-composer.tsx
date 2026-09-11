@@ -7,7 +7,7 @@ import { cn } from "@/lib/utils";
 import type { Mode } from "./use-copilot";
 import { capsForMode } from "./capabilities";
 
-/** Menu "Tools" — pilih KAPABILITAS (sesuai menu) yang boleh dipakai agen. */
+/** The "Tools" menu — pick the (menu-facing) CAPABILITIES the agent may use. */
 function ToolsMenu({
   mode, enabledCaps, toggleCap,
 }: {
@@ -76,8 +76,9 @@ function ToolsMenu({
 }
 
 /**
- * Composer chat — input + toggle Ask/Build + menu Tools + kirim. Gaya "bar"
- * ala Google Cloud Assist / RantAI-Agents. Dipakai chat dock global & /copilot.
+ * The chat composer — input + Ask/Build toggle + Tools menu + send. A "bar"
+ * style like Google Cloud Assist / RantAI-Agents. Used by the global chat
+ * dock and /copilot.
  */
 export function ChatComposer({
   mode, setMode, onSend, busy, placeholder, autoFocus, rows = 2,
@@ -153,7 +154,7 @@ export function ChatComposer({
         className="resize-none border-0 bg-transparent px-2 py-1.5 shadow-none focus-visible:ring-0 dark:bg-transparent"
       />
       <div className="flex items-center gap-1.5 px-1 pb-0.5">
-        {/* Toggle Ask/Build */}
+        {/* Ask/Build toggle */}
         <div className="inline-flex rounded-lg bg-muted/60 p-0.5" role="tablist" aria-label="Copilot mode">
           {(["ask", "build"] as Mode[]).map((m) => (
             <button

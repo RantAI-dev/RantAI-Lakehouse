@@ -9,16 +9,16 @@ import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
- * QueryService NYATA — `run`/`estimate` mengeksekusi SQL di ClickHouse
- * (lakehouse kita) lewat route server `/api/query/*`; `generateSql` lewat
- * `/api/agent/text-to-sql` (LLM di-grounding ke skema lakehouse, Fase 1).
- * `listSaved`/`listHistory` kini NYATA juga, tersimpan di Postgres lewat
- * crate `lakehouse-store` (Fase 2, Task 2.4) — menggantikan seluruh
+ * QueryService is real — `run`/`estimate` execute SQL against ClickHouse
+ * (our lakehouse) via the server route `/api/query/*`; `generateSql` goes
+ * through `/api/agent/text-to-sql` (an LLM grounded on the lakehouse schema,
+ * Phase 1). `listSaved`/`listHistory` are now real too, stored in Postgres
+ * via the `lakehouse-store` crate (Phase 2, Task 2.4) — replacing all of
  * `mock/queries.ts`.
  *
- * `listHistory` bukan lagi fixture: setiap `run` yang sukses dicatat oleh
- * backend (`routes::query::run` -> `lakehouse_store::queries::record_history`),
- * jadi riwayat yang tampil adalah eksekusi sungguhan.
+ * `listHistory` is no longer a fixture: every successful `run` is recorded
+ * by the backend (`routes::query::run` -> `lakehouse_store::queries::record_history`),
+ * so the history shown is genuine execution history.
  */
 
 /** Map an error response body onto the ServiceError code its status implies. */
@@ -53,7 +53,7 @@ async function postJson<T>(url: string, sql: string, signal?: AbortSignal): Prom
 }
 
 export const clickhouseQueryService: QueryService = {
-  // ── NYATA (ClickHouse) ─────────────────────────────────────────────────
+  // ── real (ClickHouse) ──────────────────────────────────────────────────
   run(sql, signal) {
     return postJson<QueryResult>("/api/query/run", sql, signal);
   },
@@ -61,7 +61,7 @@ export const clickhouseQueryService: QueryService = {
     return postJson<QueryEstimate>("/api/query/estimate", sql, signal);
   },
 
-  // ── NYATA (agent text-to-SQL, LLM di-grounding ke skema lakehouse) ──────
+  // ── real (agent text-to-SQL, LLM grounded on the lakehouse schema) ─────
   async generateSql(question, signal) {
     const res = await apiFetch("/api/agent/text-to-sql", {
       method: "POST",
@@ -76,7 +76,7 @@ export const clickhouseQueryService: QueryService = {
     return { sql: json.sql, explanation: json.explanation ?? "", assumptions: json.assumptions ?? [] };
   },
 
-  // ── NYATA (Postgres) ─────────────────────────────────────────────────────
+  // ── real (Postgres) ────────────────────────────────────────────────────
   listSaved(signal) {
     return get<SavedQuery[]>("/api/query/saved", signal);
   },

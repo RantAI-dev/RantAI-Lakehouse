@@ -1,15 +1,15 @@
 import * as React from "react";
 
 /**
- * Renderer Markdown minimal & dependency-free untuk jawaban AI Copilot.
- * Dukungan: heading, tabel GFM, list (dash/bintang/angka), bold, italic,
- * inline code. Cukup untuk output ringkas model; bukan CommonMark penuh
- * (mis. tak ada blockquote / nested list).
+ * A minimal, dependency-free Markdown renderer for AI Copilot answers.
+ * Supports: headings, GFM tables, lists (dash/star/number), bold, italic,
+ * inline code. Enough for the model's concise output; not full CommonMark
+ * (e.g. no blockquotes / nested lists).
  */
 
 function renderInline(text: string, keyBase: string): React.ReactNode[] {
   const nodes: React.ReactNode[] = [];
-  // Tokenisasi: **bold**, `code`, *italic*.
+  // Tokenize: **bold**, `code`, *italic*.
   const re = /(\*\*[^*]+\*\*|`[^`]+`|\*[^*]+\*)/g;
   let last = 0;
   let m: RegExpExecArray | null;
@@ -51,7 +51,7 @@ export function MiniMarkdown({ text }: { text: string }) {
   while (i < lines.length) {
     const line = lines[i];
 
-    // Kosong → lewati.
+    // Empty → skip.
     if (!line.trim()) {
       i++;
       continue;
@@ -71,7 +71,7 @@ export function MiniMarkdown({ text }: { text: string }) {
       continue;
     }
 
-    // Tabel GFM: baris '|...|' diikuti baris pemisah '|---|'.
+    // GFM table: a '|...|' row followed by a '|---|' separator row.
     if (line.trim().startsWith("|") && i + 1 < lines.length && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1])) {
       const header = splitRow(line);
       const rows: string[][] = [];
@@ -109,7 +109,7 @@ export function MiniMarkdown({ text }: { text: string }) {
       continue;
     }
 
-    // List (-, *, atau '1.').
+    // List (-, *, or '1.').
     if (/^\s*([-*]|\d+\.)\s+/.test(line)) {
       const items: string[] = [];
       const ordered = /^\s*\d+\.\s+/.test(line);
@@ -128,7 +128,7 @@ export function MiniMarkdown({ text }: { text: string }) {
       continue;
     }
 
-    // Paragraf: gabung baris sampai baris kosong.
+    // Paragraph: join lines until a blank line.
     const para: string[] = [];
     while (i < lines.length && lines[i].trim() && !/^(#{1,3})\s/.test(lines[i]) && !lines[i].trim().startsWith("|") && !/^\s*([-*]|\d+\.)\s+/.test(lines[i])) {
       para.push(lines[i]);

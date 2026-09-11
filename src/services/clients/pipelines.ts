@@ -8,11 +8,11 @@ import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
- * PipelineService NYATA — job Dagster (orkestrasi lakehouse) lewat route
- * `/api/pipelines`, plus (Task 2.5) pipeline definitions yang diauthor lewat
- * Postgres (`createPipeline`) dan mutation
- * Dagster nyata untuk cancel/retry/pause/resume. Tidak ada lagi delegasi ke
- * mock — setiap method di sini memanggil backend Rust.
+ * PipelineService is real — Dagster jobs (lakehouse orchestration) via the
+ * `/api/pipelines` route, plus (Task 2.5) pipeline definitions authored via
+ * Postgres (`createPipeline`) and real Dagster mutations for
+ * cancel/retry/pause/resume. There is no more delegation to mock — every
+ * method here calls the Rust backend.
  */
 
 async function getJson<T>(url: string, init?: RequestInit): Promise<T> {

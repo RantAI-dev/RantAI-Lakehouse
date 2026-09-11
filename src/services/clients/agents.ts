@@ -12,19 +12,19 @@ import { apiFetch } from "../http"
 import { ServiceError } from "../errors"
 
 /**
- * AgentService NYATA — definisi digital employee, tools, workflows,
- * riwayat run, dan siklus approval semuanya tersimpan di Postgres lewat
- * route `/api/agents/*` (crate `lakehouse-store`, Task 2.9).
+ * AgentService is real — digital employee definitions, tools, workflows,
+ * run history, and the approval cycle are all stored in Postgres via the
+ * `/api/agents/*` route (crate `lakehouse-store`, Task 2.9).
  *
- * UPDATE (T3.2/T3.4, copilot-operations-handover plan): ada runtime
- * eksekusi headless sekarang — `runEmployee` memanggil `POST
- * /api/agents/employees/{id}/run`, yang benar-benar menjalankan loop
- * tool-calling copilot untuk satu digital employee tanpa pengawasan
- * interaktif, menulis `agent_run`/`steps`/`audit_event` yang nyata.
- * `listRuns`/`getRun` sekarang bisa menyajikan riwayat run yang benar-
- * benar terjadi, bukan cuma seed — lihat migrasi `0026_drop_seeded_
- * agent_runs.sql`, yang menghapus seed run/approval lama supaya halaman
- * ini tidak menyesatkan.
+ * UPDATE (T3.2/T3.4, copilot-operations-handover plan): there is now a
+ * headless execution runtime — `runEmployee` calls `POST
+ * /api/agents/employees/{id}/run`, which actually runs the copilot's
+ * tool-calling loop for one digital employee without interactive
+ * supervision, writing real `agent_run`/`steps`/`audit_event` rows.
+ * `listRuns`/`getRun` can now surface run history that actually happened,
+ * not just seed data — see migration `0026_drop_seeded_agent_runs.sql`,
+ * which removed the old seed runs/approvals so this page would not
+ * mislead.
  */
 
 function errorFor(status: number, message: string): ServiceError {

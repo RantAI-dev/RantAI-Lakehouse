@@ -12,7 +12,7 @@ function hasRows(c: Cell | undefined): c is { columns: string[]; rows: Record<st
   return !!c && "rows" in c;
 }
 
-/** Isi sebuah tile sesuai kind: text / kpi / table / chart. */
+/** Render a tile's body per its kind: text / kpi / table / chart. */
 export function TileBody({
   spec, cell, dark, loading, year, onDataClick,
 }: {
@@ -21,7 +21,7 @@ export function TileBody({
   dark: boolean;
   loading: boolean;
   year: string;
-  /** Klik titik data (bar/irisan/titik) → drill/cross-filter. */
+  /** Click a data point (bar/slice/point) → drill/cross-filter. */
   onDataClick?: (name: string, pos: { x: number; y: number }) => void;
 }) {
   if (spec.kind === "text") {
@@ -49,7 +49,7 @@ export function TileBody({
     return <TableView columns={cell.columns} rows={cell.rows} />;
   }
 
-  // geomap — perlu registrasi peta dulu (GeoJSON lokal).
+  // geomap — needs the map registered first (local GeoJSON).
   if (spec.kind === "geomap") {
     if (!hasRows(cell) || cell.rows.length === 0) {
       return <p className="grid h-full place-items-center text-xs text-muted-foreground">Tak ada data{year !== "all" ? ` (tahun ${year})` : ""}.</p>;
@@ -62,7 +62,7 @@ export function TileBody({
   return <p className="grid h-full place-items-center text-xs text-muted-foreground">Tak ada data{year !== "all" ? ` (tahun ${year})` : ""}.</p>;
 }
 
-/** Choropleth — pastikan peta terdaftar sebelum render; pesan ramah bila GeoJSON belum ada. */
+/** Choropleth — ensure the map is registered before rendering; a friendly message if the GeoJSON is missing. */
 function GeoChart({ spec, rows, dark }: { spec: ChartRenderSpec; rows: Record<string, unknown>[]; dark: boolean }) {
   const [state, setState] = React.useState<"loading" | "ready" | "missing">("loading");
   React.useEffect(() => {

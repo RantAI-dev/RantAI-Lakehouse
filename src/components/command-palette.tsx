@@ -11,7 +11,7 @@ import {
 import { NAV_GROUPS, pageTitleFor } from "@/components/app-shell/nav-config";
 
 const OPEN_EVENT = "rantai:open-command";
-/** Panggil dari mana saja (mis. box search navbar) untuk membuka palette. */
+/** Call from anywhere (e.g. the navbar search box) to open the palette. */
 export function openCommandPalette() {
   window.dispatchEvent(new Event(OPEN_EVENT));
 }
@@ -24,10 +24,11 @@ function readRecents(): Recent[] {
 }
 
 /**
- * Command Palette (⌘K) — navigasi & aksi cepat ala Linear/Vercel. Ketik untuk
- * loncat ke halaman manapun, jalankan aksi (buka Copilot, bikin chart, ekspor
- * YAML, ganti tema), atau buka halaman baru-baru ini. Pola konsol modern untuk
- * menu yang banyak: navigasi sebenarnya lewat sini, sidebar tetap ringkas.
+ * Command Palette (⌘K) — Linear/Vercel-style navigation & quick actions.
+ * Type to jump to any page, run an action (open Copilot, build a chart,
+ * export YAML, change theme), or open a recent page. A modern console
+ * pattern for a large menu: real navigation happens here, keeping the
+ * sidebar compact.
  */
 export function CommandPalette() {
   const [open, setOpen] = React.useState(false);
@@ -38,7 +39,7 @@ export function CommandPalette() {
 
   const groups = NAV_GROUPS;
 
-  // Buka via ⌘K / Ctrl+K, dan via event dari box search navbar.
+  // Open via ⌘K / Ctrl+K, and via an event from the navbar search box.
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
@@ -57,7 +58,7 @@ export function CommandPalette() {
 
   React.useEffect(() => { if (open) setRecents(readRecents()); }, [open]);
 
-  // Catat halaman yang dikunjungi (untuk daftar Recent).
+  // Record visited pages (for the Recent list).
   React.useEffect(() => {
     const title = pageTitleFor(pathname);
     const href = pathname;
@@ -94,7 +95,7 @@ export function CommandPalette() {
           No results.
         </Command.Empty>
 
-        {/* Aksi cepat */}
+        {/* Quick actions */}
         <Command.Group heading="Quick actions" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
           <PaletteItem icon={Sparkles} label="Ask / build via AI Copilot" value="ai copilot chat ask build" onSelect={() => go("/copilot")} />
           <PaletteItem icon={BarChart3} label="Open Dashboards" value="dashboards visualization chart" onSelect={() => go("/dashboards")} />
@@ -117,7 +118,7 @@ export function CommandPalette() {
           </Command.Group>
         ) : null}
 
-        {/* Semua halaman, per section */}
+        {/* All pages, per section */}
         {groups.map((g) => (
           <Command.Group
             key={g.label}

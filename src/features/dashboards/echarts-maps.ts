@@ -1,16 +1,16 @@
 import * as echarts from "echarts";
 
 /**
- * Registrasi peta ECharts dari GeoJSON LOKAL (di-bundle di public/), tanpa
- * panggilan ke server tile eksternal — konsisten dengan ethos self-host &
- * aman di embed/offline. Choropleth memakai nama peta ini.
+ * Registers ECharts maps from LOCAL GeoJSON (bundled under public/), with no
+ * call to an external tile server — consistent with the self-host ethos and
+ * safe for embed/offline use. Choropleths use this map name.
  */
 export const JAKARTA_MAP = "dki-jakarta";
 const JAKARTA_GEOJSON_URL = "/geo/dki-jakarta.geojson";
 
 const loading = new Map<string, Promise<boolean>>();
 
-/** Muat + daftarkan peta sekali (idempoten). Resolve false bila GeoJSON tak ada. */
+/** Load + register the map once (idempotent). Resolves false if the GeoJSON is missing. */
 export function ensureMap(name = JAKARTA_MAP, url = JAKARTA_GEOJSON_URL): Promise<boolean> {
   if (echarts.getMap(name)) return Promise.resolve(true);
   let p = loading.get(name);
@@ -25,8 +25,8 @@ export function ensureMap(name = JAKARTA_MAP, url = JAKARTA_GEOJSON_URL): Promis
 }
 
 /**
- * Normalisasi nama wilayah agar cocok dengan nama fitur di GeoJSON Jakarta
- * (mis. "KOTA JAKARTA PUSAT"/"Jakarta Pusat" → "Jakarta Pusat").
+ * Normalizes a region name so it matches the feature names in the Jakarta
+ * GeoJSON (e.g. "KOTA JAKARTA PUSAT"/"Jakarta Pusat" → "Jakarta Pusat").
  */
 export function normalizeJakartaArea(raw: string): string {
   let s = String(raw ?? "").trim().replace(/\s+/g, " ");

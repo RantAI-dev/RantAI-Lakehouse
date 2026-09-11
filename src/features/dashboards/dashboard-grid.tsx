@@ -20,7 +20,7 @@ const MARGIN = 12;
 const ROW_H = 44;
 const DEFAULT: TileBox = { x: 0, y: 0, w: 6, h: 6 };
 
-/** Pastikan tiap item punya kotak; yang belum → tempatkan 2-per-baris di bawah. */
+/** Ensure every item has a box; items without one get placed 2-per-row below. */
 function resolve(items: GridItem[], layout: LayoutMap): LayoutMap {
   const out: LayoutMap = {};
   const ids = new Set(items.map((i) => i.id));
@@ -40,9 +40,10 @@ function resolve(items: GridItem[], layout: LayoutMap): LayoutMap {
 type Drag = { id: string; mode: "move" | "resize"; px: number; py: number; box: TileBox };
 
 /**
- * Kanvas dashboard 12-kolom dengan DRAG (pindah) & RESIZE (handle sudut) ala
- * Tableau. Kustom (pointer events) — aman untuk React 19. Di mode `editable`,
- * tile bisa digeser & diubah ukurannya; perubahan dikirim via onLayoutChange.
+ * A 12-column dashboard canvas with DRAG (move) & RESIZE (corner handle),
+ * Tableau-style. Custom-built (pointer events) — safe for React 19. In
+ * `editable` mode, tiles can be moved and resized; changes are sent via
+ * onLayoutChange.
  */
 export function DashboardGrid({
   items, layout, editable, onLayoutChange,
@@ -57,8 +58,8 @@ export function DashboardGrid({
   const [drag, setDrag] = React.useState<Drag | null>(null);
   const [preview, setPreview] = React.useState<LayoutMap | null>(null);
 
-  // Ukur lebar SEKETIKA (useLayoutEffect) agar tile tak collapse di render awal,
-  // plus ResizeObserver untuk perubahan lebar.
+  // Measure width IMMEDIATELY (useLayoutEffect) so tiles don't collapse on the
+  // first render, plus a ResizeObserver for width changes.
   React.useLayoutEffect(() => {
     if (ref.current) setWidth(ref.current.getBoundingClientRect().width);
   }, []);
@@ -86,8 +87,8 @@ export function DashboardGrid({
   const maxY = Math.max(0, ...Object.values(view).map((b) => b.y + b.h));
   const canvasH = MARGIN + maxY * unitY + (editable ? unitY : 0);
 
-  // Pasang listener move/up LANGSUNG (imperatif) di startDrag agar tak bergantung
-  // pada re-render/effect — event pointermove pertama pun tertangkap.
+  // Attach move/up listeners DIRECTLY (imperatively) in startDrag so it does not
+  // depend on a re-render/effect — even the first pointermove event is caught.
   const startDrag = (e: React.PointerEvent, id: string, mode: "move" | "resize") => {
     if (!editable || !colW) return;
     e.preventDefault();
@@ -165,7 +166,7 @@ export function DashboardGrid({
               {/* Body */}
               <div className="min-h-0 flex-1 p-2">{it.body}</div>
             </div>
-            {/* Resize handle (pojok kanan-bawah, jelas) */}
+            {/* Resize handle (bottom-right corner, visible) */}
             {editable ? (
               <div
                 onPointerDown={(e) => startDrag(e, it.id, "resize")}

@@ -4,9 +4,9 @@ import * as React from "react";
 import * as echarts from "echarts";
 
 /**
- * Pembungkus tipis Apache ECharts untuk React 19 — tanpa echarts-for-react,
- * biar kendali penuh (React 19) & satu dependency saja. Menerima `option`
- * yang sudah jadi (dibangun theme-aware di chart-option.ts), lalu urus
+ * A thin Apache ECharts wrapper for React 19 — no echarts-for-react, for
+ * full control (React 19) and a single dependency. Takes a finished
+ * `option` (built theme-aware in chart-option.ts) and handles
  * init / setOption / resize / dispose.
  */
 export function EChart({
@@ -16,13 +16,13 @@ export function EChart({
 }: {
   option: echarts.EChartsOption;
   height?: number | string;
-  /** Klik titik data (bar/irisan/dll) → drill/cross-filter. `pos` = koordinat layar. */
+  /** Click a data point (bar/slice/etc.) → drill/cross-filter. `pos` = screen coordinates. */
   onDataClick?: (name: string, pos: { x: number; y: number }) => void;
 }) {
   const elRef = React.useRef<HTMLDivElement>(null);
   const chartRef = React.useRef<echarts.ECharts | null>(null);
-  // Simpan callback di ref supaya handler klik selalu pakai versi terbaru
-  // tanpa re-init chart.
+  // Keep the callback in a ref so the click handler always uses the latest
+  // version without re-initializing the chart.
   const clickRef = React.useRef(onDataClick);
   React.useEffect(() => { clickRef.current = onDataClick; }, [onDataClick]);
 
@@ -48,7 +48,7 @@ export function EChart({
   }, []);
 
   React.useEffect(() => {
-    // notMerge=true agar ganti tema/opsi bersih (tidak menumpuk seri lama).
+    // notMerge=true so theme/option changes are clean (no stacking of old series).
     chartRef.current?.setOption(option, true);
   }, [option]);
 

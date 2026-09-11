@@ -15,17 +15,17 @@ import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
- * GovernanceService: quality/lineage/audit/classification/residency NYATA dari
- * lakehouse (_silver_meta, Dagster, katalog) — dibaca lewat
- * `/api/governance/{kind}` / `/api/governance/lineage`, tidak berubah dari
- * Fase 1. Policies (list + create) dan tiga `create*Rule` sekarang NYATA
- * juga, tersimpan di Postgres lewat crate `lakehouse-store` (Fase 2, Task
- * 2.3) — menggantikan seluruh `mock/governance.ts`.
+ * GovernanceService: quality/lineage/audit/classification/residency are real,
+ * read from the lakehouse (_silver_meta, Dagster, catalog) via
+ * `/api/governance/{kind}` / `/api/governance/lineage`, unchanged since
+ * Phase 1. Policies (list + create) and the three `create*Rule` methods are
+ * now real too, stored in Postgres via the `lakehouse-store` crate (Phase 2,
+ * Task 2.3) — replacing all of `mock/governance.ts`.
  *
- * Catatan penting: rule yang dibuat lewat `create*Rule` TIDAK muncul di
- * `listQuality`/`listClassifications` — dua sisi itu sengaja punya sumber
- * data berbeda (config yang ditulis manusia vs. hasil observasi ClickHouse),
- * sesuai desain backend Rust-nya.
+ * Important note: a rule created via `create*Rule` does NOT appear in
+ * `listQuality`/`listClassifications` — the two sides deliberately have
+ * different data sources (human-authored config vs. ClickHouse observation
+ * results), per the Rust backend's design.
  */
 
 /** Map an error response body onto the ServiceError code its status implies. */

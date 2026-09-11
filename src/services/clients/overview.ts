@@ -8,10 +8,10 @@ import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
 /**
- * OverviewService NYATA sepenuhnya: getSummary + listActivity dari
- * ClickHouse/Dagster; alerts (list/ack/resolve) dari Postgres (Task 2.6) —
- * lihat `lakehouse_store::overview` untuk alasan instance alert disimpan di
- * Postgres, bukan ClickHouse. mock/overview.ts sudah dihapus.
+ * OverviewService is now fully real: getSummary + listActivity from
+ * ClickHouse/Dagster; alerts (list/ack/resolve) from Postgres (Task 2.6) —
+ * see `lakehouse_store::overview` for why alert instances are stored in
+ * Postgres, not ClickHouse. mock/overview.ts has been deleted.
  */
 async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
   const res = await apiFetch(url, {
