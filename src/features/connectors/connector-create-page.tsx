@@ -35,7 +35,7 @@ export function ConnectorCreatePage() {
   const [secretRef, setSecretRef] = React.useState("")
   const [capabilities, setCapabilities] = React.useState<string[]>(["schema discovery"])
   const [environment, setEnvironment] = React.useState("production")
-  const [tenant, setTenant] = React.useState("Nusantara Finance")
+  const [tenant, setTenant] = React.useState("")
   const [residency, setResidency] = React.useState("")
   const [createdId, setCreatedId] = React.useState<string | null>(null)
   const create = useServiceAction((signal, input: Parameters<typeof connectorService.createConnector>[0]) =>

@@ -71,7 +71,7 @@ export const clickhouseQueryService: QueryService = {
     });
     const json = await res.json();
     if (!res.ok) {
-      throw new ServiceError("unavailable", json?.detail ?? json?.error ?? "Agent tak tersedia");
+      throw new ServiceError("unavailable", json?.detail ?? json?.error ?? "Agent unavailable");
     }
     return { sql: json.sql, explanation: json.explanation ?? "", assumptions: json.assumptions ?? [] };
   },

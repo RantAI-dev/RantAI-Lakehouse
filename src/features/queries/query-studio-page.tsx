@@ -113,7 +113,7 @@ export function QueryStudioPage() {
                   onClick={handleAsk}
                   disabled={agentBusy || !question.trim()}
                 >
-                  {agentBusy ? "Agent bekerja…" : "✦ Ask (agentic)"}
+                  {agentBusy ? "Agent working…" : "✦ Ask (agentic)"}
                 </Button>
                 <Button
                   size="sm"
@@ -132,14 +132,14 @@ export function QueryStudioPage() {
 
               {/* Agentic result: NL answer + step trace (plan→act→correct) + preview */}
               {agentResult ? (
-                <SectionCard title="Jawaban agent">
+                <SectionCard title="Agent answer">
                   <p className="text-sm">{agentResult.answer}</p>
                   <p className="mt-2 text-xs text-muted-foreground">
                     {agentResult.rowCount} rows · final SQL loaded into the editor.
                   </p>
                   <details className="mt-3">
                     <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
-                      Jejak agent ({agentResult.steps.length} langkah)
+                      Agent trace ({agentResult.steps.length} steps)
                     </summary>
                     <ol className="mt-2 space-y-1 text-xs text-muted-foreground">
                       {agentResult.steps.map((s, i) => (

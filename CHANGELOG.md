@@ -30,9 +30,9 @@ once a first release is tagged.
   (cache hit, pushdowns, query plan), operations health/version/latency, and
   workload start times are all `null`/"unknown" until something real
   computes them, instead of hardcoded zeros or constants.
-- Audit-trail deep links (query runs, approvals, connectors, digital-employee
-  runs) now carry a real event id only when a real audit event exists,
-  instead of a synthesized id that named no event and 404ed on click.
+- Audit-trail deep links (query runs, approvals, connectors) now carry a real
+  event id only when a real audit event exists, instead of a synthesized id
+  that named no event and 404ed on click.
 - Governance lineage is reported as unsupported rather than rendering a
   fixed source→bronze→silver template for every dataset; data-quality rule
   results report as not evaluated rather than defaulting to "warning".
@@ -46,8 +46,9 @@ once a first release is tagged.
 - The app shell now shows every real page unconditionally instead of hiding
   them behind a "preview" flag, and drops the always-on notification and
   presence indicators that nothing measured.
-- All remaining user-facing messages, error text, and code comments in the
-  console and API were translated from Indonesian to English.
+- User-facing messages, error text, and code comments in the console and API
+  were translated from Indonesian to English; copilot prompt text sent to
+  the model is intentionally left unchanged.
 - The alerts table now distinguishes an API failure from having no alerts,
   instead of showing an empty state for both.
 

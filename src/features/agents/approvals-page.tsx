@@ -222,14 +222,14 @@ export function ApprovalsPage() {
                   ),
                 },
                 {
+                  // WS1 T11 removed the Agent Workflows page, so this
+                  // renders the workflow id as plain text instead of a
+                  // link that would land on a missing route.
                   label: "Workflow",
                   value: selected.workflowId ? (
-                    <Link
-                      href={`/agents/workflows?id=${selected.workflowId}`}
-                      className="font-mono text-xs text-primary hover:underline"
-                    >
+                    <span className="font-mono text-xs">
                       {selected.workflowId}
-                    </Link>
+                    </span>
                   ) : (
                     "—"
                   ),
