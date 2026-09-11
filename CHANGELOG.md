@@ -23,6 +23,50 @@ once a first release is tagged.
   `README.md` reflect the new license. A dependency re-audit
   (`cargo deny check licenses`) found no dependency license incompatible
   with distributing the combined work under AGPL-3.0.
+- **Console honesty pass.** Every value the API could not actually measure
+  now reports as not measured instead of a plausible-looking number: overview
+  KPI tiles, service health, catalog asset size/freshness/usage, pipeline run
+  counters and cost, digital-employee metrics, query transparency fields
+  (cache hit, pushdowns, query plan), operations health/version/latency, and
+  workload start times are all `null`/"unknown" until something real
+  computes them, instead of hardcoded zeros or constants.
+- Audit-trail deep links (query runs, approvals, connectors, digital-employee
+  runs) now carry a real event id only when a real audit event exists,
+  instead of a synthesized id that named no event and 404ed on click.
+- Governance lineage is reported as unsupported rather than rendering a
+  fixed source→bronze→silver template for every dataset; data-quality rule
+  results report as not evaluated rather than defaulting to "warning".
+- The connector creation wizard now runs the real connection test against
+  the newly created connector and shows the actual outcome, instead of a
+  local "Test passed" step that contacted nothing; connector health reports
+  unknown, with no last-test time, until a probe actually runs.
+- Identity records no longer serve activity timestamps that were never
+  written; rotation status now matches what authentication itself enforces
+  (expired once the credential's expiry has passed).
+- The app shell now shows every real page unconditionally instead of hiding
+  them behind a "preview" flag, and drops the always-on notification and
+  presence indicators that nothing measured.
+- All remaining user-facing messages, error text, and code comments in the
+  console and API were translated from Indonesian to English.
+- The alerts table now distinguishes an API failure from having no alerts,
+  instead of showing an empty state for both.
+
+### Removed
+
+- Pages and dialogs with no backend behind them: storage tiering (including
+  the "Restore to Hot" dialog, which hardcoded the asset it restored),
+  knowledge sources/vector jobs/semantic search, agent workflows/tools
+  registry/agentic builder, governance residency/workspace settings, the
+  policy-impact preview, and the query-collaboration surface. Their API
+  routes remain registered for later workstreams that will rebuild them on
+  real data.
+- The pipeline detail view no longer synthesizes an op graph, description,
+  or config summary on the client; it shows the pipeline's real run history
+  with an honestly empty graph tab.
+- The query-transparency estimate panel, which rendered plan stages as
+  "completed" before they had run.
+- Seeded pipeline and alert rows that were indistinguishable from real
+  activity are pruned by migration.
 
 ## [0.1.0] - 2026-08-30
 
