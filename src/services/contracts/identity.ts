@@ -5,7 +5,9 @@ export type User = {
   status: "active" | "inactive"
   roles: string[]
   tenants: string[]
-  lastActivity: string
+  // Nothing writes app_user.last_activity_at (no login, session, or token
+  // use records it), so the server never serves a fabricated value here.
+  lastActivity: string | null
 }
 
 export type Role = {
@@ -35,8 +37,12 @@ export type ServiceIdentity = {
   scopes: string[]
   environment: string
   expiresAt: string
+  // The server reports "expired" once the credential is past expiresAt,
+  // matching the check service-token authentication already applies.
   rotationStatus: "current" | "due" | "expired"
-  lastUsedAt: string
+  // Nothing writes service_identity.last_used_at, so the server never
+  // serves a fabricated value here.
+  lastUsedAt: string | null
 }
 
 export type InviteUserInput = {

@@ -74,7 +74,7 @@ const columns: ColumnDef<User>[] = [
   {
     key: "last",
     header: "Last activity",
-    render: (r) => formatRelativeTime(r.lastActivity),
+    render: (r) => (r.lastActivity === null ? "Not recorded" : formatRelativeTime(r.lastActivity)),
   },
 ]
 
@@ -211,7 +211,10 @@ export function UsersPage() {
               },
               {
                 label: "Last activity",
-                value: formatRelativeTime(selected.lastActivity),
+                value:
+                  selected.lastActivity === null
+                    ? "Not recorded"
+                    : formatRelativeTime(selected.lastActivity),
               },
             ]}
           />

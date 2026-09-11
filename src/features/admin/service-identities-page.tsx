@@ -71,7 +71,7 @@ const columns: ColumnDef<ServiceIdentity>[] = [
   {
     key: "used",
     header: "Last used",
-    render: (r) => formatRelativeTime(r.lastUsedAt),
+    render: (r) => (r.lastUsedAt === null ? "Not recorded" : formatRelativeTime(r.lastUsedAt)),
   },
 ]
 

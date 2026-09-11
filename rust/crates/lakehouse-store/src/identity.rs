@@ -108,12 +108,21 @@ pub struct User {
     /// contract's `tenants: string[]` and the mock fixtures, which use
     /// `"Meridian Group"` rather than `"meridian-group"`.
     pub tenants: Vec<String>,
-    /// `app_user.last_activity_at`, ISO 8601. Serializes as `lastActivity`.
-    pub last_activity: String,
+    /// `app_user.last_activity_at`. Always `None`: the column defaults to
+    /// `now()` at insert time (`0001_init.sql:68`) but nothing in this
+    /// workspace — no login, session, or token use — ever updates it (J18),
+    /// so serving the stored value would report a seeded user as "active"
+    /// forever and a brand-new user as active at the moment of creation.
+    /// Serializes as `lastActivity`.
+    pub last_activity: Option<String>,
 }
 
 /// The raw row shape [`list_users`]/[`get_user`] select, before
-/// timestamps and ids are rendered as strings.
+/// ids are rendered as strings.
+///
+/// `last_activity_at` is deliberately not selected (see
+/// [`User::last_activity`]'s doc comment), so there is no column here to
+/// decode it into.
 #[derive(Debug, FromRow)]
 struct UserRow {
     id: Uuid,
@@ -122,7 +131,6 @@ struct UserRow {
     status: String,
     roles: Vec<String>,
     tenants: Vec<String>,
-    last_activity_at: OffsetDateTime,
 }
 
 impl From<UserRow> for User {
@@ -134,7 +142,7 @@ impl From<UserRow> for User {
             status: row.status,
             roles: row.roles,
             tenants: row.tenants,
-            last_activity: iso_millis(row.last_activity_at),
+            last_activity: None,
         }
     }
 }
@@ -156,7 +164,7 @@ pub struct UserFilter {
 /// yields an empty array (not a `[null]` from `array_agg`), and the two
 /// independent many-to-many relationships cannot multiply each other's row
 /// counts the way two joins in one query would.
-const USER_SELECT: &str = "SELECT u.id, u.name, u.email, u.status, u.last_activity_at, \
+const USER_SELECT: &str = "SELECT u.id, u.name, u.email, u.status, \
      ARRAY(SELECT r.name FROM app_user_role ur JOIN role r ON r.id = ur.role_id \
            WHERE ur.user_id = u.id ORDER BY r.name) AS roles, \
      ARRAY(SELECT t.name FROM app_user_tenant ut JOIN tenant t ON t.id = ut.tenant_id \
@@ -612,13 +620,34 @@ pub struct ServiceIdentity {
     pub expires_at: String,
     /// `"current"`, `"due"`, or `"expired"` — the closed union the contract
     /// declares. Serializes as `rotationStatus`.
+    ///
+    /// Not simply the stored `service_identity.rotation_status` column: that
+    /// column is never updated as time passes (`0001_init.sql:107-121`),
+    /// while service-token authentication already refuses a credential once
+    /// `expires_at <= now()` (`lakehouse-auth::service_token`, line ~135).
+    /// Left alone, an identity created `"current"` would keep reporting
+    /// `"current"` after authentication had started rejecting it. So
+    /// [`SERVICE_IDENTITY_SELECT`] derives `"expired"` in SQL whenever
+    /// `expires_at <= now()`, matching authentication exactly, and only
+    /// falls back to the stored value otherwise. No `"due"` threshold is
+    /// derived because none is specified (`0001_init.sql`'s header comment
+    /// for this column says so explicitly) — inventing one here would be a
+    /// fabricated policy, not an honest read.
     pub rotation_status: String,
-    /// Last time the credential was seen in use, ISO 8601. Serializes as
-    /// `lastUsedAt`.
-    pub last_used_at: String,
+    /// `service_identity.last_used_at`. Always `None`: the column defaults
+    /// to `now()` at insert time (`0001_init.sql:125`) but nothing in this
+    /// workspace ever updates it on actual use (J18), so a freshly created
+    /// identity would otherwise read as "used" at the moment it was
+    /// created. Serializes as `lastUsedAt`.
+    pub last_used_at: Option<String>,
 }
 
 /// The raw row shape service-identity reads select.
+///
+/// `last_used_at` is deliberately not selected (see
+/// [`ServiceIdentity::last_used_at`]'s doc comment); `rotation_status` here
+/// holds the *derived* value [`SERVICE_IDENTITY_SELECT`] computes, not the
+/// bare column.
 #[derive(Debug, FromRow)]
 struct ServiceIdentityRow {
     id: Uuid,
@@ -627,7 +656,6 @@ struct ServiceIdentityRow {
     environment: String,
     expires_at: OffsetDateTime,
     rotation_status: String,
-    last_used_at: OffsetDateTime,
 }
 
 impl From<ServiceIdentityRow> for ServiceIdentity {
@@ -639,14 +667,21 @@ impl From<ServiceIdentityRow> for ServiceIdentity {
             environment: row.environment,
             expires_at: iso_millis(row.expires_at),
             rotation_status: row.rotation_status,
-            last_used_at: iso_millis(row.last_used_at),
+            last_used_at: None,
         }
     }
 }
 
 /// The columns every service-identity read shares.
-const SERVICE_IDENTITY_SELECT: &str = "SELECT s.id, s.name, s.scopes, s.environment, s.expires_at, s.rotation_status, \
-     s.last_used_at FROM service_identity s";
+///
+/// `rotation_status` is a `CASE` expression, not the bare column: it derives
+/// `"expired"` whenever `expires_at <= now()` — the exact condition
+/// `lakehouse-auth::service_token` uses to refuse a credential — so a filter
+/// and the list can never disagree with each other or with authentication.
+/// See [`ServiceIdentity::rotation_status`] for the full rationale.
+const SERVICE_IDENTITY_SELECT: &str = "SELECT s.id, s.name, s.scopes, s.environment, s.expires_at, \
+     CASE WHEN s.expires_at <= now() THEN 'expired' ELSE s.rotation_status END AS rotation_status \
+     FROM service_identity s";
 
 /// Optional narrowing for [`list_service_identities`].
 #[derive(Debug, Clone, Default)]
@@ -777,7 +812,7 @@ mod tests {
             status: "active".to_owned(),
             roles: vec!["Analyst".to_owned()],
             tenants: vec!["Meridian Group".to_owned()],
-            last_activity: "2026-01-01T00:00:00.000Z".to_owned(),
+            last_activity: None,
         };
         let value = serde_json::to_value(&user).unwrap();
         for key in [
@@ -827,7 +862,7 @@ mod tests {
             environment: "production".to_owned(),
             expires_at: "2026-01-01T00:00:00.000Z".to_owned(),
             rotation_status: "current".to_owned(),
-            last_used_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            last_used_at: None,
         };
         let value = serde_json::to_value(&identity).unwrap();
         for key in [

@@ -28,8 +28,8 @@ use lakehouse_store::StoreError;
 use lakehouse_store::identity::{
     CreateRoleInput, CreateServiceIdentityInput, CreateTenantInput, InviteUserInput,
     ServiceIdentityFilter, TenantFilter, UserFilter, create_role, create_service_identity,
-    create_tenant, create_user, delete_user, get_user, list_roles, list_service_identities,
-    list_tenants, list_users,
+    create_tenant, create_user, delete_user, get_service_identity, get_user, list_roles,
+    list_service_identities, list_tenants, list_users,
 };
 use sqlx::PgPool;
 
@@ -129,10 +129,11 @@ async fn create_user_links_roles_and_tenants_by_name(pool: PgPool) -> sqlx::Resu
     assert_eq!(user.status, "active", "column default");
     assert_eq!(user.roles, vec!["Analyst", "Approver"]);
     assert_eq!(user.tenants, vec!["Meridian Group", "Meridian Retail"]);
-    assert!(
-        user.last_activity.ends_with('Z'),
-        "timestamps render like Date.toISOString(), got {}",
-        user.last_activity
+    // J18: nothing writes `app_user.last_activity_at`, so a freshly created
+    // user must not be served its insert-time default as "active now".
+    assert_eq!(
+        user.last_activity, None,
+        "last_activity is never served: nothing writes the column"
     );
 
     let refetched = get_user(&pool, &user.id).await.unwrap();
@@ -275,9 +276,110 @@ async fn creates_use_the_mock_fixtures_defaults(pool: PgPool) -> sqlx::Result<()
     .unwrap();
     assert_eq!(identity.rotation_status, "current");
     assert_eq!(identity.scopes, vec!["query:read"]);
+    // J18: nothing writes `service_identity.last_used_at`, so a freshly
+    // created identity must not be served its insert-time default as "used
+    // just now".
+    assert_eq!(
+        identity.last_used_at, None,
+        "last_used_at is never served: nothing writes the column"
+    );
+    Ok(())
+}
+
+/// `rotation_status` is stored, but authentication
+/// (`lakehouse-auth::service_token`) already refuses a credential once
+/// `expires_at <= now()`. An identity that is still marked `'current'` in
+/// the table but has aged past its `expires_at` must read `"expired"` from
+/// both `list_service_identities` and `get_service_identity`, so a filter
+/// and the list can never disagree with each other or with what
+/// authentication actually does.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_identity_past_its_expiry_reads_expired_even_if_stored_current(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let (id,): (uuid::Uuid,) = sqlx::query_as(
+        "INSERT INTO service_identity (name, scopes, environment, rotation_status, expires_at) \
+         VALUES ($1, $2, $3, 'current', now() - interval '1 minute') RETURNING id",
+    )
+    .bind("stale-credential")
+    .bind(vec!["query:read".to_owned()])
+    .bind("staging")
+    .fetch_one(&pool)
+    .await?;
+
+    let fetched = get_service_identity(&pool, &id.to_string()).await.unwrap();
+    assert_eq!(fetched.rotation_status, "expired");
+
+    let listed = list_service_identities(&pool, &ServiceIdentityFilter::default())
+        .await
+        .unwrap();
+    let listed = listed
+        .iter()
+        .find(|s| s.id == id.to_string())
+        .expect("just-inserted identity");
+    assert_eq!(listed.rotation_status, "expired");
+    Ok(())
+}
+
+/// An identity that has not yet reached `expires_at` reports whatever
+/// `rotation_status` is stored, unchanged — no `"due"` threshold is derived,
+/// because none is specified (`0001_init.sql`'s header comment for the
+/// column says so explicitly).
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unexpired_identity_keeps_its_stored_status(pool: PgPool) -> sqlx::Result<()> {
+    let (id,): (uuid::Uuid,) = sqlx::query_as(
+        "INSERT INTO service_identity (name, scopes, environment, rotation_status, expires_at) \
+         VALUES ($1, $2, $3, 'due', now() + interval '1 day') RETURNING id",
+    )
+    .bind("aging-credential")
+    .bind(vec!["query:read".to_owned()])
+    .bind("staging")
+    .fetch_one(&pool)
+    .await?;
+
+    let fetched = get_service_identity(&pool, &id.to_string()).await.unwrap();
+    assert_eq!(fetched.rotation_status, "due");
+
+    let listed = list_service_identities(&pool, &ServiceIdentityFilter::default())
+        .await
+        .unwrap();
+    let listed = listed
+        .iter()
+        .find(|s| s.id == id.to_string())
+        .expect("just-inserted identity");
+    assert_eq!(listed.rotation_status, "due");
+    Ok(())
+}
+
+/// Both never-written activity timestamps come back `None`, and — because
+/// this is the wire-format-facing check — the *serialized* JSON keeps the
+/// key present with an explicit `null` rather than dropping it, matching
+/// what `src/services/contracts/identity.ts` declares (`string | null`, not
+/// an optional field).
+#[sqlx::test(migrations = "../../migrations")]
+async fn identity_activity_timestamps_are_not_served(pool: PgPool) -> sqlx::Result<()> {
+    let users = list_users(&pool, &UserFilter::default()).await.unwrap();
     assert!(
-        identity.expires_at > identity.last_used_at,
-        "a new credential expires in the future"
+        users.iter().all(|u| u.last_activity.is_none()),
+        "no seeded user's last_activity may be served"
+    );
+    let user_json = serde_json::to_value(&users[0]).unwrap();
+    assert_eq!(
+        user_json.get("lastActivity"),
+        Some(&serde_json::Value::Null)
+    );
+
+    let identities = list_service_identities(&pool, &ServiceIdentityFilter::default())
+        .await
+        .unwrap();
+    assert!(
+        identities.iter().all(|s| s.last_used_at.is_none()),
+        "no seeded identity's last_used_at may be served"
+    );
+    let identity_json = serde_json::to_value(&identities[0]).unwrap();
+    assert_eq!(
+        identity_json.get("lastUsedAt"),
+        Some(&serde_json::Value::Null)
     );
     Ok(())
 }
