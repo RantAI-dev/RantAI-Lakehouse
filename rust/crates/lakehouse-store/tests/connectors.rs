@@ -20,6 +20,7 @@
 use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
+use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::connectors::{
     CreateConnectorInput, create_connector, delete_connector, get_connector,
     get_connector_dial_info, list_connectors, record_test_result,
@@ -529,5 +530,39 @@ async fn migration_predicate_never_resets_a_genuine_post_creation_test(
         after.connector.last_test_at.is_some(),
         "a genuine post-creation test result must survive the migration's predicate"
     );
+    Ok(())
+}
+
+/// WS1 task 1.14 (judge finding J12): `get_connector` used to compute
+/// `aud-conn-<id>` on every read — a string that named no `audit_event`
+/// row, so "View audit" always 404ed. It now resolves the id only when a
+/// real event exists for `resource_kind = 'connector'` /
+/// `resource_id = <connector id>`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_connector_audit_event_id_resolves_a_real_event(pool: PgPool) -> sqlx::Result<()> {
+    let before = get_connector(&pool, "conn-pg-lakehouse")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.audit_event_id, None);
+
+    let event = insert_audit_event(
+        &pool,
+        NewAuditEvent {
+            action: "test_connection".to_owned(),
+            resource_kind: Some("connector".to_owned()),
+            resource_id: Some("conn-pg-lakehouse".to_owned()),
+            outcome: "executed".to_owned(),
+            ..NewAuditEvent::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let after = get_connector(&pool, "conn-pg-lakehouse")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.audit_event_id.as_deref(), Some(event.id.as_str()));
     Ok(())
 }

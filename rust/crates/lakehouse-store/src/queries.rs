@@ -163,8 +163,13 @@ pub struct QueryHistoryItem {
     /// Whether the result was served (partly) from cache. Serializes as
     /// `cacheAssisted`.
     pub cache_assisted: bool,
-    /// A synthesized audit-trail correlation id. Omitted from JSON when
-    /// absent. Serializes as `auditEventId`.
+    /// The newest real `audit_event` row recorded against this history row
+    /// (`resource_kind = 'query_history'`, `resource_id = id`), resolved on
+    /// read via a lateral join in [`list_history`] — never stored. `None`
+    /// until WS5 starts recording query-run audit events (see the module
+    /// doc comment and `list_history`'s doc comment for why no producer
+    /// writes this column anymore). Omitted from JSON when absent.
+    /// Serializes as `auditEventId`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_event_id: Option<String>,
 }
@@ -212,14 +217,35 @@ const HISTORY_LIST_LIMIT: i64 = 200;
 
 /// List recorded query executions, most recent first.
 ///
+/// # `auditEventId` resolution (WS1 task 1.14, judge finding J12)
+///
+/// `query_history.audit_event_id` is no longer written — `routes::query::run`
+/// used to mint a `aud-query-<id>` string that named no `audit_event` row,
+/// so every "View audit" link built from it 404ed. This query instead
+/// resolves the id through a `LEFT JOIN LATERAL` against `audit_event`,
+/// keyed on `resource_kind = 'query_history'` and `resource_id = id`, taking
+/// the newest matching event (several can exist for one query run). A bare
+/// `LEFT JOIN` would duplicate the history row once per matching event; the
+/// lateral subquery's `LIMIT 1` keeps the row count exact. The composite
+/// index `audit_event_resource_idx (resource_kind, resource_id)`
+/// (`0024_audit_event.sql`) covers this lookup. Nothing inserts a
+/// `query_history` audit event yet (WS5), so `auditEventId` is `None` for
+/// every row until then — that is honest, not a bug.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_history(pool: &PgPool) -> Result<Vec<QueryHistoryItem>, StoreError> {
     let rows: Vec<QueryHistoryRow> = sqlx::query_as(
-        "SELECT id, sql, user_name, at, status, duration_ms, scanned_bytes, cost_units, \
-         workload_class, engine, cache_assisted, audit_event_id \
-         FROM query_history ORDER BY at DESC LIMIT $1",
+        "SELECT q.id, q.sql, q.user_name, q.at, q.status, q.duration_ms, q.scanned_bytes, \
+         q.cost_units, q.workload_class, q.engine, q.cache_assisted, ae.id AS audit_event_id \
+         FROM query_history q \
+         LEFT JOIN LATERAL ( \
+             SELECT ae.id FROM audit_event ae \
+              WHERE ae.resource_kind = 'query_history' AND ae.resource_id = q.id \
+              ORDER BY ae.at DESC LIMIT 1 \
+         ) ae ON true \
+         ORDER BY q.at DESC LIMIT $1",
     )
     .bind(HISTORY_LIST_LIMIT)
     .fetch_all(pool)
@@ -252,8 +278,6 @@ pub struct RecordHistoryInput<'a> {
     pub engine: &'a str,
     /// Whether the result was served (partly) from cache.
     pub cache_assisted: bool,
-    /// A synthesized audit-trail correlation id, if any.
-    pub audit_event_id: Option<&'a str>,
 }
 
 /// Record one query execution.
@@ -281,8 +305,8 @@ pub async fn record_history(
     sqlx::query(
         "INSERT INTO query_history \
          (id, sql, user_name, status, duration_ms, scanned_bytes, cost_units, \
-          workload_class, engine, cache_assisted, audit_event_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+          workload_class, engine, cache_assisted) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(input.id)
@@ -295,7 +319,6 @@ pub async fn record_history(
     .bind(input.workload_class)
     .bind(input.engine)
     .bind(input.cache_assisted)
-    .bind(input.audit_event_id)
     .execute(pool)
     .await?;
     Ok(())

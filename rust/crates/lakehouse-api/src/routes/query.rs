@@ -166,7 +166,6 @@ pub async fn run(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJso
         .map_or_else(|| elapsed_ms(started), |s| seconds_to_ms(s.elapsed));
     let cost_units = std::cmp::max(1, bytes_to_cost_units(scanned_bytes));
     let id = format!("q-{started_epoch_ms}");
-    let audit_event_id = format!("aud-query-{id}");
 
     // Record this execution in query history — best-effort. A history-write
     // failure (no Postgres pool configured, Postgres down, ...) must never
@@ -191,7 +190,6 @@ pub async fn run(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJso
             workload_class: "hot-analytics",
             engine: "hot-store",
             cache_assisted: false,
-            audit_event_id: Some(&audit_event_id),
         };
         if let Err(err) = queries::record_history(pool, &input).await {
             tracing::warn!(%err, "failed to record query history (query itself succeeded)");

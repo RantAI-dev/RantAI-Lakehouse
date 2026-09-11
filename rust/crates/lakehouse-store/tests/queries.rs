@@ -19,8 +19,10 @@
 // by the linker before its ctor section is ever considered).
 use lakehouse_test_support as _;
 
+use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::queries::{RecordHistoryInput, list_history, list_saved, record_history};
 use sqlx::PgPool;
+use time::OffsetDateTime;
 
 /// The seed lands the two `mock/queries.ts` saved-query fixtures.
 #[sqlx::test(migrations = "../../migrations")]
@@ -50,7 +52,6 @@ async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<(
             workload_class: "hot-analytics",
             engine: "hot-store",
             cache_assisted: false,
-            audit_event_id: Some("aud-query-q-1"),
         },
     )
     .await
@@ -61,7 +62,6 @@ async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<(
     assert_eq!(history[0].id, "q-1");
     assert_eq!(history[0].sql, "SELECT 1");
     assert_eq!(history[0].status, "completed");
-    assert_eq!(history[0].audit_event_id.as_deref(), Some("aud-query-q-1"));
     assert!(history[0].at.ends_with('Z'));
     Ok(())
 }
@@ -83,12 +83,154 @@ async fn record_history_is_idempotent_per_id(pool: PgPool) -> sqlx::Result<()> {
         workload_class: "hot-analytics",
         engine: "hot-store",
         cache_assisted: false,
-        audit_event_id: None,
     };
     record_history(&pool, &input).await.unwrap();
     record_history(&pool, &input).await.unwrap();
 
     let history = list_history(&pool).await.unwrap();
     assert_eq!(history.len(), 1);
+    Ok(())
+}
+
+/// A `NewAuditEvent` fixture pinned to one query-history resource, mirroring
+/// the shape `routes::query::run` would eventually write once WS5 records
+/// real query-run audit events.
+fn query_history_audit_event(resource_id: &str, action: &str) -> NewAuditEvent {
+    NewAuditEvent {
+        action: action.to_owned(),
+        resource_kind: Some("query_history".to_owned()),
+        resource_id: Some(resource_id.to_owned()),
+        outcome: "executed".to_owned(),
+        ..NewAuditEvent::default()
+    }
+}
+
+/// WS1 task 1.14 (judge finding J12): no producer mints a synthetic
+/// `aud-query-<id>` string anymore — `auditEventId` must be absent until a
+/// real `audit_event` row exists for the query-history resource.
+#[sqlx::test(migrations = "../../migrations")]
+async fn history_item_has_no_audit_id_without_a_real_event(pool: PgPool) -> sqlx::Result<()> {
+    record_history(
+        &pool,
+        &RecordHistoryInput {
+            id: "q-no-audit",
+            sql: "SELECT 1",
+            user: "anonymous",
+            status: "completed",
+            duration_ms: 1,
+            scanned_bytes: 1,
+            cost_units: 0.1,
+            workload_class: "hot-analytics",
+            engine: "hot-store",
+            cache_assisted: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    let history = list_history(&pool).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].audit_event_id, None);
+    Ok(())
+}
+
+/// Once a real `audit_event` row names the history row's resource, the
+/// list resolves the id through the lateral join — the "View audit" link
+/// this task is fixing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn history_item_resolves_the_real_audit_event_id(pool: PgPool) -> sqlx::Result<()> {
+    record_history(
+        &pool,
+        &RecordHistoryInput {
+            id: "q-audit",
+            sql: "SELECT 1",
+            user: "anonymous",
+            status: "completed",
+            duration_ms: 1,
+            scanned_bytes: 1,
+            cost_units: 0.1,
+            workload_class: "hot-analytics",
+            engine: "hot-store",
+            cache_assisted: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    let event = insert_audit_event(&pool, query_history_audit_event("q-audit", "query_sql"))
+        .await
+        .unwrap();
+
+    let history = list_history(&pool).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].audit_event_id.as_deref(),
+        Some(event.id.as_str())
+    );
+    Ok(())
+}
+
+/// Insert an `audit_event` row directly, with an explicit `at`, bypassing
+/// `audit::insert`'s `now()` default. Test-only fixture helper: it exists
+/// so [`history_item_uses_the_newest_of_several_events_without_duplicating_the_row`]
+/// can assert "newest wins" deterministically instead of relying on two
+/// `now()`-stamped inserts landing in different microseconds (they are not
+/// guaranteed to — see `tests/audit.rs`'s `list_orders_newest_first`, which
+/// documents the same tie risk for `audit::insert`).
+async fn insert_audit_event_at(pool: &PgPool, id: &str, resource_id: &str, at: OffsetDateTime) {
+    sqlx::query(
+        "INSERT INTO audit_event (id, at, action, resource_kind, resource_id, outcome) \
+         VALUES ($1, $2, 'query_sql', 'query_history', $3, 'executed')",
+    )
+    .bind(id)
+    .bind(at)
+    .bind(resource_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Several `audit_event` rows can exist for one query-history resource
+/// (e.g. a re-run of the audit pipeline). The lateral join must pick the
+/// newest one and must never duplicate the history row — a bare `LEFT
+/// JOIN` would return one row per matching event.
+#[sqlx::test(migrations = "../../migrations")]
+async fn history_item_uses_the_newest_of_several_events_without_duplicating_the_row(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    record_history(
+        &pool,
+        &RecordHistoryInput {
+            id: "q-multi",
+            sql: "SELECT 1",
+            user: "anonymous",
+            status: "completed",
+            duration_ms: 1,
+            scanned_bytes: 1,
+            cost_units: 0.1,
+            workload_class: "hot-analytics",
+            engine: "hot-store",
+            cache_assisted: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    let now = OffsetDateTime::now_utc();
+    insert_audit_event_at(&pool, "audit-multi-older", "q-multi", now).await;
+    insert_audit_event_at(
+        &pool,
+        "audit-multi-newer",
+        "q-multi",
+        now + time::Duration::seconds(60),
+    )
+    .await;
+
+    let history = list_history(&pool).await.unwrap();
+    assert_eq!(history.len(), 1, "the lateral join must not duplicate rows");
+    assert_eq!(
+        history[0].audit_event_id.as_deref(),
+        Some("audit-multi-newer")
+    );
     Ok(())
 }

@@ -760,7 +760,14 @@ pub struct ApprovalItem {
     /// The deciding reviewer's comment, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
-    /// Audit log reference, if any.
+    /// The newest real `audit_event` row recorded against this approval
+    /// (`resource_kind = 'approval'`, `resource_id = id`), resolved on read
+    /// via a lateral join in [`list_approvals`]/[`decide_approval`] — never
+    /// stored. `routes::agents::decide_approval` writes the matching event
+    /// via `ai_audit::record` *after* the store call returns, so a
+    /// `decide_approval` return value never carries this id even on
+    /// success; a later `list_approvals` call does (see
+    /// [`decide_approval`]'s doc comment).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_event_id: Option<String>,
 }
@@ -814,9 +821,35 @@ impl From<ApprovalRow> for ApprovalItem {
     }
 }
 
-const APPROVAL_COLUMNS: &str = "id, employee_id, employee_name, run_id, workflow_id, action, \
-     resource, reason, impact, evidence, policy, cost_estimate, expires_at, requested_at, \
-     status, risk, decided_at, comment, audit_event_id";
+/// Columns qualified against the `a` alias `list_approvals`/`decide_approval`
+/// give `approval_item`, plus `ae.id AS audit_event_id` resolved from the
+/// [`APPROVAL_AUDIT_JOIN`] lateral join rather than read from
+/// `approval_item.audit_event_id` (that column stays in the table — see
+/// `0022_approvals.sql`/migration history — but nothing writes it anymore;
+/// see [`ApprovalItem::audit_event_id`]'s doc comment). Qualification is
+/// required, not stylistic: `id` and the other column names exist on both
+/// `approval_item` and (for `id`) `audit_event`, so an unqualified list
+/// would be ambiguous once the lateral join is in the `FROM` clause.
+const APPROVAL_COLUMNS_QUALIFIED: &str = "a.id, a.employee_id, a.employee_name, a.run_id, \
+     a.workflow_id, a.action, a.resource, a.reason, a.impact, a.evidence, a.policy, \
+     a.cost_estimate, a.expires_at, a.requested_at, a.status, a.risk, a.decided_at, a.comment, \
+     ae.id AS audit_event_id";
+
+/// The lateral join that resolves an approval's real audit-event id: the
+/// newest `audit_event` row with `resource_kind = 'approval'` and
+/// `resource_id` equal to the approval's id. A plain `LEFT JOIN` would
+/// duplicate the approval row once per matching event (several audit
+/// events can exist for one approval, e.g. `needs_approval` then
+/// `approved`); the lateral subquery's `ORDER BY ... LIMIT 1` keeps one row
+/// per approval. The composite index `audit_event_resource_idx
+/// (resource_kind, resource_id)` (`0024_audit_event.sql`) covers this
+/// lookup.
+const APPROVAL_AUDIT_JOIN: &str = "FROM approval_item a \
+     LEFT JOIN LATERAL ( \
+         SELECT ae.id FROM audit_event ae \
+          WHERE ae.resource_kind = 'approval' AND ae.resource_id = a.id \
+          ORDER BY ae.at DESC LIMIT 1 \
+     ) ae ON true";
 
 /// List approvals, newest-requested first, optionally filtered to one
 /// employee.
@@ -829,8 +862,8 @@ pub async fn list_approvals(
     employee_id: Option<&str>,
 ) -> Result<Vec<ApprovalItem>, StoreError> {
     let sql = format!(
-        "SELECT {APPROVAL_COLUMNS} FROM approval_item WHERE ($1::text IS NULL OR employee_id = \
-         $1) ORDER BY requested_at DESC"
+        "SELECT {APPROVAL_COLUMNS_QUALIFIED} {APPROVAL_AUDIT_JOIN} WHERE ($1::text IS NULL OR \
+         a.employee_id = $1) ORDER BY a.requested_at DESC"
     );
     let rows: Vec<ApprovalRow> = sqlx::query_as(&sql)
         .bind(employee_id)
@@ -860,6 +893,25 @@ impl Decision {
 /// Decide a pending approval. Mirrors `mock/agents.ts`'s `decideApproval`:
 /// only a `"pending"` approval can be decided.
 ///
+/// # `auditEventId` is always `None` on return (WS1 task 1.14, judge
+/// finding J12)
+///
+/// This used to stamp `aud-approval-<id>-<status>` into
+/// `approval_item.audit_event_id` on every decision — a string that named
+/// no `audit_event` row (the real event `routes::agents::decide_approval`
+/// writes via `ai_audit::record` gets its own generated id), so "View
+/// audit" always 404ed. It no longer writes that column at all: after the
+/// `UPDATE`, this re-reads the row inside the same transaction through
+/// [`APPROVAL_COLUMNS_QUALIFIED`]/[`APPROVAL_AUDIT_JOIN`], the same
+/// resolve-on-read lateral lookup `list_approvals` uses. Because
+/// `routes::agents::decide_approval` calls `ai_audit::record` *after* this
+/// function returns, the matching `audit_event` row does not exist yet at
+/// re-read time — so the `ApprovalItem` this returns always carries
+/// `audit_event_id: None`, even for a successful decision. That is honest:
+/// a later `list_approvals` call (after the audit write lands) resolves the
+/// real id. This task does not reorder the audit write into the store —
+/// that is WS5's to own.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::NotFound`] if `id` is unknown. Returns
@@ -888,16 +940,18 @@ pub async fn decide_approval(
     if status != "pending" {
         return Err(StoreError::Conflict);
     }
-    let sql = format!(
-        "UPDATE approval_item SET status = $2, decided_at = now(), comment = $3, \
-         audit_event_id = $4 WHERE id = $1 RETURNING {APPROVAL_COLUMNS}"
-    );
-    let audit_event_id = format!("aud-approval-{id}-{}", decision.as_status());
-    let row: ApprovalRow = sqlx::query_as(&sql)
+    sqlx::query(
+        "UPDATE approval_item SET status = $2, decided_at = now(), comment = $3 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(decision.as_status())
+    .bind(comment)
+    .execute(&mut *tx)
+    .await?;
+    let select_sql =
+        format!("SELECT {APPROVAL_COLUMNS_QUALIFIED} {APPROVAL_AUDIT_JOIN} WHERE a.id = $1");
+    let row: ApprovalRow = sqlx::query_as(&select_sql)
         .bind(id)
-        .bind(decision.as_status())
-        .bind(comment)
-        .bind(&audit_event_id)
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;

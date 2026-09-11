@@ -270,6 +270,12 @@ async fn deciding_a_pending_approval_stamps_decided_at_and_status(
     assert_eq!(decided.status, "approved");
     assert!(decided.decided_at.is_some());
     assert_eq!(decided.comment.as_deref(), Some("looks fine"));
+    // WS1 task 1.14 (judge finding J12): `decide_approval` no longer mints
+    // a synthetic `aud-approval-<id>-<status>` id, and it re-reads before
+    // `routes::agents::decide_approval` has written the real audit event —
+    // so a fresh decision always carries `None` here (see the doc comment
+    // on `lakehouse_store::agents::decide_approval`).
+    assert_eq!(decided.audit_event_id, None);
 
     // Reflected in the owning run's embedded approvals too.
     let run = get_run(&pool, "run-decide-01").await.unwrap().unwrap();
@@ -287,6 +293,53 @@ async fn decide_unknown_approval_is_not_found(pool: PgPool) -> sqlx::Result<()> 
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::NotFound));
+    Ok(())
+}
+
+/// WS1 task 1.14 (judge finding J12): once the real `audit_event` row
+/// `routes::agents::decide_approval` writes via `ai_audit::record` lands
+/// (`resource_kind = 'approval'`, `resource_id = <approval id>`),
+/// `list_approvals` resolves it through the lateral join — the "View
+/// audit" link this task is fixing. Before that write, the link stays
+/// absent rather than pointing at a synthetic id.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_approvals_resolves_the_real_audit_event_id_after_decision(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    insert_run(&pool, "run-audit-01", "emp-inventory").await;
+    insert_approval(
+        &pool,
+        "ap-audit-01",
+        "emp-inventory",
+        "inventory-copilot",
+        Some("run-audit-01"),
+        "pending",
+    )
+    .await;
+    decide_approval(&pool, "ap-audit-01", Decision::Approved, None)
+        .await
+        .unwrap();
+
+    let before = list_approvals(&pool, None).await.unwrap();
+    let item = before.iter().find(|a| a.id == "ap-audit-01").unwrap();
+    assert_eq!(item.audit_event_id, None);
+
+    let event = lakehouse_store::audit::insert(
+        &pool,
+        lakehouse_store::audit::NewAuditEvent {
+            action: "approve_action".to_owned(),
+            resource_kind: Some("approval".to_owned()),
+            resource_id: Some("ap-audit-01".to_owned()),
+            outcome: "approved".to_owned(),
+            ..lakehouse_store::audit::NewAuditEvent::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let after = list_approvals(&pool, None).await.unwrap();
+    let item = after.iter().find(|a| a.id == "ap-audit-01").unwrap();
+    assert_eq!(item.audit_event_id.as_deref(), Some(event.id.as_str()));
     Ok(())
 }
 

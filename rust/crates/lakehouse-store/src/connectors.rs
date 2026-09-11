@@ -141,9 +141,10 @@ pub struct ConnectorDetail {
     pub recent_errors: Vec<RecentError>,
     /// Pipelines whose `connector_id` names this connector.
     pub dependent_pipelines: Vec<ConnectorDependent>,
-    /// A deterministic, purely label-shaped audit-event reference (matches
-    /// `mock/connectors.ts`'s `aud-conn-<id>` convention) — not a real
-    /// audit-log lookup.
+    /// The newest real `audit_event` row recorded against this connector
+    /// (`resource_kind = 'connector'`, `resource_id = id`), resolved on
+    /// read by [`get_connector`] — never stored. `None` until WS5 starts
+    /// recording connector audit events; see `get_connector`'s doc comment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_event_id: Option<String>,
 }
@@ -272,6 +273,18 @@ pub async fn list_connectors(pool: &PgPool) -> Result<Vec<Connector>, StoreError
 /// Fetch one connector's detail: base fields plus dependent pipelines
 /// derived from `pipeline_definition.connector_id`.
 ///
+/// # `auditEventId` resolution (WS1 task 1.14, judge finding J12)
+///
+/// This used to compute `aud-conn-<id>` on every read — a label-shaped
+/// string that named no `audit_event` row, so "View audit" always 404ed.
+/// It now looks up the newest real `audit_event` row with
+/// `resource_kind = 'connector'` and `resource_id = id` and returns `None`
+/// when no such event exists. The composite index
+/// `audit_event_resource_idx (resource_kind, resource_id)`
+/// (`0024_audit_event.sql`) covers this lookup. Nothing inserts a
+/// `connector` audit event yet (WS5), so this is `None` today for every
+/// connector — that is honest, not a bug.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if a query fails.
@@ -298,8 +311,16 @@ pub async fn get_connector(pool: &PgPool, id: &str) -> Result<Option<ConnectorDe
         })
         .collect();
 
+    let audit_event_id: Option<String> = sqlx::query_scalar(
+        "SELECT id FROM audit_event WHERE resource_kind = 'connector' AND resource_id = $1 \
+         ORDER BY at DESC LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
     Ok(Some(ConnectorDetail {
-        audit_event_id: Some(format!("aud-conn-{}", connector.id)),
+        audit_event_id,
         connector,
         discovered_assets: 0,
         discovered_schemas: Vec::new(),
@@ -661,6 +682,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn connector_serializes_without_host_or_secret_ref() {
@@ -723,7 +745,12 @@ mod tests {
             discovered_schemas: vec![],
             recent_errors: vec![],
             dependent_pipelines: vec![],
-            audit_event_id: Some("aud-conn-conn-x".to_owned()),
+            // This is a serialization test, not a resolution test — the
+            // exact value doesn't matter, but it stands for a real
+            // `audit_event.id` (see `audit::insert`'s `audit-<uuid>`
+            // format), not the `aud-conn-<id>` label this crate used to
+            // fabricate.
+            audit_event_id: Some(format!("audit-{}", Uuid::new_v4())),
         };
         let value = serde_json::to_value(&detail).unwrap();
         assert!(value.get("host").is_none());
