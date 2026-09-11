@@ -16,8 +16,7 @@
 //!
 //! This module stays free of any HTTP response shape (`serde_json::json!`
 //! belongs to `lakehouse-api`'s `routes::lakehouse`, which maps these types
-//! into the `/api/lakehouse/*` contract — WS2 plan review; judge
-//! corrections A1-7).
+//! into the `/api/lakehouse/*` contract).
 //!
 //! # `NotFound` mapping
 //!
@@ -111,8 +110,8 @@ pub async fn list_namespaces(client: &IcebergClient) -> Result<Vec<NamespaceIden
 }
 
 /// Lists table identifiers in `namespace` — a single, cheap listing call,
-/// deliberately NOT a per-table `load_table` loop (see `list_table_idents`'s
-/// doc and A1-8, which replaces the plan's original `list_tables`).
+/// deliberately NOT a per-table `load_table` loop, so the caller can bound
+/// per-table loads.
 ///
 /// # Errors
 /// Returns [`RestError::NotFound`] if `namespace` does not exist,
@@ -145,8 +144,8 @@ pub struct TableStats {
 /// `iceberg-0.10.1/src/spec/snapshot_summary.rs`). A table committed by a
 /// DIFFERENT writer (Debezium's Iceberg sink, dlt) may not populate the
 /// same keys — this returns `None` per field rather than assuming every
-/// writer agrees. Resolved for real Bronze tables by Task G2's gate, not by
-/// this comment.
+/// writer agrees. Whether tables written by Debezium or dlt populate these
+/// keys is not yet verified.
 #[must_use]
 pub fn stats_from_summary(summary: &Summary) -> TableStats {
     TableStats {
@@ -269,7 +268,11 @@ pub struct TableDetail {
     pub partition_fields: Vec<PartitionFieldDetail>,
     /// The table's Iceberg properties.
     pub properties: HashMap<String, String>,
-    /// The table's full snapshot history, oldest first.
+    /// The table's full snapshot history, sorted oldest first by
+    /// `timestamp_ms` ascending (ties broken by `id` ascending). `iceberg`
+    /// 0.10.1's `TableMetadata::snapshots()` iterates a map keyed by
+    /// snapshot id, not commit order, so [`load_table_detail`] sorts the
+    /// collected vector explicitly rather than trusting iteration order.
     pub snapshots: Vec<SnapshotDetail>,
     /// `snapshots.len()` — kept as a separate field so a caller does not
     /// need to materialize the full snapshot list just to know its size.
@@ -320,20 +323,27 @@ pub async fn load_table_detail(
             })
             .collect(),
         properties: metadata.properties().clone(),
-        snapshots: metadata
-            .snapshots()
-            .map(|s| SnapshotDetail {
-                id: s.snapshot_id(),
-                parent_id: s.parent_snapshot_id(),
-                timestamp_ms: s.timestamp_ms(),
-                operation: s.summary().operation.as_str().to_owned(),
-                added_records: parse_u64(s.summary(), "added-records"),
-                deleted_records: parse_u64(s.summary(), "deleted-records"),
-                total_records: parse_u64(s.summary(), "total-records"),
-                total_data_files: parse_u64(s.summary(), "total-data-files"),
-                stats: stats_from_summary(s.summary()),
-            })
-            .collect(),
+        snapshots: {
+            let mut snapshots: Vec<SnapshotDetail> = metadata
+                .snapshots()
+                .map(|s| SnapshotDetail {
+                    id: s.snapshot_id(),
+                    parent_id: s.parent_snapshot_id(),
+                    timestamp_ms: s.timestamp_ms(),
+                    operation: s.summary().operation.as_str().to_owned(),
+                    added_records: parse_u64(s.summary(), "added-records"),
+                    deleted_records: parse_u64(s.summary(), "deleted-records"),
+                    total_records: parse_u64(s.summary(), "total-records"),
+                    total_data_files: parse_u64(s.summary(), "total-data-files"),
+                    stats: stats_from_summary(s.summary()),
+                })
+                .collect();
+            // `TableMetadata::snapshots()` iterates a map keyed by snapshot
+            // id, not commit order — sort explicitly so `snapshots` is
+            // actually oldest-first, as documented on the field.
+            snapshots.sort_by(|a, b| a.timestamp_ms.cmp(&b.timestamp_ms).then(a.id.cmp(&b.id)));
+            snapshots
+        },
         snapshot_count: metadata.snapshots().len(),
         metadata_log_count: metadata.metadata_log().len(),
         stats: metadata
@@ -420,11 +430,10 @@ mod tests {
         use crate::catalog::{IcebergClient, IcebergClientConfig};
 
         /// A minimal, spec-valid Iceberg REST `LoadTableResult` JSON
-        /// fixture, hand-written (not captured live — WS2 plan review;
-        /// judge correction A1-5): format version 2, one schema, a
-        /// default partition spec with one field, two snapshots with
-        /// `total-*`/`added-records` summary keys, and a one-entry
-        /// metadata log.
+        /// fixture, hand-written (not captured live): format version 2,
+        /// one schema, a default partition spec with one field, two
+        /// snapshots with `total-*`/`added-records` summary keys, and a
+        /// one-entry metadata log.
         const LOAD_TABLE_FIXTURE: &str = r#"{
             "metadata-location": "s3://bucket/warehouse/bronze/orders/metadata/00001.metadata.json",
             "metadata": {
@@ -477,6 +486,80 @@ mod tests {
                         "sequence-number": 2,
                         "timestamp-ms": 1700000000000,
                         "manifest-list": "s3://bucket/warehouse/bronze/orders/metadata/snap-2.avro",
+                        "summary": {
+                            "operation": "append",
+                            "added-records": "50",
+                            "deleted-records": "0",
+                            "total-records": "150",
+                            "total-data-files": "2",
+                            "total-files-size": "2048"
+                        }
+                    }
+                ],
+                "metadata-log": [
+                    {"timestamp-ms": 1699999000000, "metadata-file": "s3://bucket/warehouse/bronze/orders/metadata/00000.metadata.json"}
+                ],
+                "sort-orders": [{"order-id": 0, "fields": []}],
+                "default-sort-order-id": 0
+            }
+        }"#;
+
+        /// A second `LoadTableResult` fixture whose snapshot ids run
+        /// AGAINST commit order (the newer snapshot has the smaller id),
+        /// so a sort keyed on id alone would misorder it. Otherwise the
+        /// same shape as [`LOAD_TABLE_FIXTURE`].
+        const LOAD_TABLE_FIXTURE_UNORDERED_IDS: &str = r#"{
+            "metadata-location": "s3://bucket/warehouse/bronze/orders/metadata/00001.metadata.json",
+            "metadata": {
+                "format-version": 2,
+                "table-uuid": "9c12d441-03fe-4bb1-8e5c-b2e7c1a04a3d",
+                "location": "s3://bucket/warehouse/bronze/orders",
+                "last-sequence-number": 2,
+                "last-updated-ms": 1700000000000,
+                "last-column-id": 2,
+                "schemas": [
+                    {
+                        "schema-id": 0,
+                        "type": "struct",
+                        "fields": [
+                            {"id": 1, "name": "id", "required": true, "type": "long"},
+                            {"id": 2, "name": "created_at", "required": false, "type": "timestamp"}
+                        ]
+                    }
+                ],
+                "current-schema-id": 0,
+                "partition-specs": [
+                    {
+                        "spec-id": 0,
+                        "fields": [
+                            {"source-id": 2, "field-id": 1000, "name": "created_at_day", "transform": "day"}
+                        ]
+                    }
+                ],
+                "default-spec-id": 0,
+                "last-partition-id": 1000,
+                "properties": {"write.format.default": "parquet"},
+                "current-snapshot-id": 10,
+                "snapshots": [
+                    {
+                        "snapshot-id": 20,
+                        "sequence-number": 1,
+                        "timestamp-ms": 1699999000000,
+                        "manifest-list": "s3://bucket/warehouse/bronze/orders/metadata/snap-20.avro",
+                        "summary": {
+                            "operation": "append",
+                            "added-records": "100",
+                            "total-records": "100",
+                            "total-data-files": "1",
+                            "total-files-size": "1024"
+                        }
+                    },
+                    {
+                        "snapshot-id": 10,
+                        "parent-snapshot-id": 20,
+                        "sequence-number": 2,
+                        "timestamp-ms": 1700000000000,
+                        "manifest-list": "s3://bucket/warehouse/bronze/orders/metadata/snap-10.avro",
                         "summary": {
                             "operation": "append",
                             "added-records": "50",
@@ -603,6 +686,37 @@ mod tests {
             assert_eq!(snapshot_two.total_data_files, Some(2));
             assert_eq!(detail.stats.record_count, Some(150));
             assert_eq!(detail.stats.total_bytes, Some(2048));
+        }
+
+        #[tokio::test]
+        async fn load_table_detail_orders_snapshots_oldest_first_by_timestamp() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/namespaces/bronze/tables/orders"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(LOAD_TABLE_FIXTURE_UNORDERED_IDS),
+                )
+                .mount(&server)
+                .await;
+            let client = connect(&server).await;
+            let ident = TableIdent::new(
+                NamespaceIdent::from_strs(["bronze"]).expect("namespace"),
+                "orders".to_owned(),
+            );
+
+            let detail = load_table_detail(&client, &ident)
+                .await
+                .expect("load_table_detail");
+
+            // Snapshot 20 has the smaller timestamp but the LARGER id;
+            // snapshot 10 is the newer commit with the SMALLER id. Sorting
+            // by id alone would put 10 before 20 — wrong. Sorting by
+            // `timestamp_ms` puts 20 (older) first, matching the doc's
+            // "oldest first" claim.
+            assert_eq!(detail.snapshots.len(), 2);
+            assert_eq!(detail.snapshots[0].id, 20);
+            assert_eq!(detail.snapshots[1].id, 10);
+            assert!(detail.snapshots[0].timestamp_ms < detail.snapshots[1].timestamp_ms);
         }
 
         #[tokio::test]
