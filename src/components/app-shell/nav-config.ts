@@ -29,7 +29,6 @@ import {
   Sparkles,
   Tags,
   Users,
-  Wallet,
   Waypoints,
   Workflow,
   Wrench,
@@ -162,7 +161,6 @@ export const NAV_GROUPS: NavGroup[] = [
       { title: "Workloads", href: "/workloads", icon: CircleGauge },
       { title: "Observability", href: "/observability", icon: FileSearch },
       { title: "Services", href: "/services", icon: Server },
-      { title: "Usage & Budgets", href: "/usage", icon: Wallet },
     ],
   },
   {

@@ -14,6 +14,7 @@ import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { HealthBadge, Pill } from "@/components/patterns/status-badge"
 import { useService } from "@/hooks/use-service"
 import { formatPercent } from "@/lib/format"
+import { fmtMeasured } from "@/lib/measured"
 import { HEALTH_LABEL, type Health } from "@/lib/status"
 import { opsService } from "@/services"
 import type { PlatformService } from "@/services/contracts/ops"
@@ -44,7 +45,7 @@ const columns: ColumnDef<PlatformService>[] = [
       <div>
         <p className="font-medium">{r.name}</p>
         <p className="text-xs text-muted-foreground">
-          v{r.version} · {r.site}
+          {r.version === null ? "—" : `v${r.version}`} · {r.site}
         </p>
       </div>
     ),
@@ -52,18 +53,33 @@ const columns: ColumnDef<PlatformService>[] = [
   {
     key: "health",
     header: "Health",
-    render: (r) => <HealthBadge health={r.health} />,
+    render: (r) => (
+      <div className="flex items-center gap-1">
+        <HealthBadge health={r.health} />
+        {!r.checked ? (
+          <span className="text-xs text-muted-foreground">(not probed)</span>
+        ) : null}
+      </div>
+    ),
   },
-  { key: "replicas", header: "Replicas", render: (r) => r.replicas },
+  {
+    key: "replicas",
+    header: "Replicas",
+    render: (r) => fmtMeasured(r.replicas),
+  },
   {
     key: "err",
     header: "Error rate",
-    render: (r) => formatPercent(r.errorRate),
+    render: (r) => fmtMeasured(r.errorRate, formatPercent),
   },
   {
     key: "lat",
     header: "Latency",
-    render: (r) => <span className="font-mono text-xs">{r.latencyMs} ms</span>,
+    render: (r) => (
+      <span className="font-mono text-xs">
+        {fmtMeasured(r.latencyMs, (n) => `${n} ms`)}
+      </span>
+    ),
   },
   {
     key: "deps",
@@ -129,23 +145,33 @@ export function ServicesPage() {
       >
         {selected ? (
           <>
-            <HealthBadge health={selected.health} className="self-start" />
+            <div className="flex items-center gap-1 self-start">
+              <HealthBadge health={selected.health} />
+              {!selected.checked ? (
+                <span className="text-xs text-muted-foreground">Not probed</span>
+              ) : null}
+            </div>
             <MetadataList
               items={[
                 {
                   label: "Version",
                   value: (
-                    <span className="font-mono text-xs">v{selected.version}</span>
+                    <span className="font-mono text-xs">
+                      {selected.version === null ? "—" : `v${selected.version}`}
+                    </span>
                   ),
                 },
                 { label: "Site", value: selected.site },
-                { label: "Replicas", value: selected.replicas },
-                { label: "Error rate", value: formatPercent(selected.errorRate) },
+                { label: "Replicas", value: fmtMeasured(selected.replicas) },
+                {
+                  label: "Error rate",
+                  value: fmtMeasured(selected.errorRate, formatPercent),
+                },
                 {
                   label: "Latency",
                   value: (
                     <span className="font-mono text-xs">
-                      {selected.latencyMs} ms
+                      {fmtMeasured(selected.latencyMs, (n) => `${n} ms`)}
                     </span>
                   ),
                 },

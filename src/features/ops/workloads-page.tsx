@@ -13,6 +13,7 @@ import { WorkloadStatusBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatCost, formatDuration, formatRelativeTime } from "@/lib/format"
+import { fmtMeasured } from "@/lib/measured"
 import {
   ENGINE_CATEGORY_LABEL,
   WORKLOAD_CLASS_LABEL,
@@ -69,7 +70,9 @@ export function WorkloadsPage() {
       {
         key: "class",
         header: "Class",
-        render: (r) => WORKLOAD_CLASS_LABEL[r.class],
+        // No workload classifier exists yet (WS1 honesty pass); null
+        // renders as "—" instead of a guessed class.
+        render: (r) => (r.class === null ? "—" : WORKLOAD_CLASS_LABEL[r.class]),
       },
       {
         key: "engine",
@@ -93,7 +96,9 @@ export function WorkloadsPage() {
       {
         key: "started",
         header: "Started",
-        render: (r) => formatRelativeTime(r.startedAt),
+        // startedAt is derived server-side from `elapsed`; null when that
+        // derivation fails to parse — never the request's own clock.
+        render: (r) => (r.startedAt === null ? "—" : formatRelativeTime(r.startedAt)),
       },
       {
         key: "elapsed",
@@ -103,7 +108,8 @@ export function WorkloadsPage() {
       {
         key: "cost",
         header: "Est. cost",
-        render: (r) => formatCost(r.estimatedCost),
+        // No cost model exists yet; null renders as "—".
+        render: (r) => fmtMeasured(r.estimatedCost, formatCost),
       },
       {
         key: "actions",

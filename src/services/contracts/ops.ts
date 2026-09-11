@@ -1,32 +1,35 @@
-import type {
-  EngineCategory,
-  Health,
-  StorageTier,
-  WorkloadClass,
-  WorkloadStatus,
-} from "@/lib/status"
+import type { EngineCategory, Health, WorkloadClass, WorkloadStatus } from "@/lib/status"
+import type { Measured } from "@/lib/measured"
 
 export type WorkloadItem = {
   id: string
   principal: string
   tenant: string
-  class: WorkloadClass
+  // No workload classifier exists yet (WS1 honesty pass); null replaces
+  // the invented "hot-analytics" literal every row used to carry.
+  class: WorkloadClass | null
   engine: EngineCategory
   status: WorkloadStatus
   elapsedMs: number
-  estimatedCost: number
+  // No cost model exists yet; null replaces the literal `1`.
+  estimatedCost: Measured
   queueReason?: string
-  startedAt: string
+  // Derived server-side from `elapsed` in the same ClickHouse query, not
+  // this process's clock; null when that derivation fails to parse.
+  startedAt: string | null
 }
 
 export type ObservabilitySummary = {
   queryP95Ms: number
   queryErrorRate: number
-  ingestLagSeconds: number
-  cacheHitRate: number
-  policyDecisionP95Ms: number
-  agentSuccessRate: number
-  activeIncidents: number
+  // Nothing measures these yet (WS1 honesty pass); null replaces the
+  // literal zeros. `streamingLagSeconds` was removed outright — it had no
+  // consumer and nothing measures streaming either.
+  ingestLagSeconds: Measured
+  cacheHitRate: Measured
+  policyDecisionP95Ms: Measured
+  agentSuccessRate: Measured
+  activeIncidents: Measured
   slos: { name: string; target: string; current: string; ok: boolean }[]
 }
 
@@ -34,27 +37,18 @@ export type PlatformService = {
   id: string
   name: string
   health: Health
-  version: string
+  // `true` only for ClickHouse and Dagster, the two services actually
+  // probed this request; Iceberg/Lakekeeper and RustFS are never probed
+  // (WS5 is expected to add real probes for them).
+  checked: boolean
+  // Nothing measures version, replica count, error rate, or latency for
+  // any service today; null replaces the "-"/1/0/0 literals.
+  version: string | null
   site: string
-  replicas: number
-  errorRate: number
-  latencyMs: number
+  replicas: Measured
+  errorRate: Measured
+  latencyMs: Measured
   dependencies: string[]
-}
-
-export type UsageSummary = {
-  computeUnits7d: number
-  scannedBytes7d: number
-  storageByTier: Record<StorageTier, number>
-  pipelineRuns7d: number
-  agentBudgetUsedRate: number
-  tenants: {
-    id: string
-    name: string
-    computeUnits: number
-    budgetLimit: number
-    budgetSpent: number
-  }[]
 }
 
 export interface OpsService {
@@ -62,5 +56,4 @@ export interface OpsService {
   cancelWorkload(id: string, signal?: AbortSignal): Promise<WorkloadItem>
   getObservability(signal?: AbortSignal): Promise<ObservabilitySummary>
   listServices(signal?: AbortSignal): Promise<PlatformService[]>
-  getUsage(signal?: AbortSignal): Promise<UsageSummary>
 }

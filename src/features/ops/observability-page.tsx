@@ -7,6 +7,7 @@ import { SectionCard } from "@/components/patterns/section-card"
 import { CheckBadge } from "@/components/patterns/status-badge"
 import { useService } from "@/hooks/use-service"
 import { formatLagSeconds, formatPercent } from "@/lib/format"
+import { fmtMeasured } from "@/lib/measured"
 import { opsService } from "@/services"
 
 export function ObservabilityPage() {
@@ -21,13 +22,25 @@ export function ObservabilityPage() {
           <MetricGrid>
             <MetricCard label="Query p95" value={`${state.data.queryP95Ms} ms`} />
             <MetricCard label="Query errors" value={formatPercent(state.data.queryErrorRate)} />
-            <MetricCard label="Ingest lag" value={formatLagSeconds(state.data.ingestLagSeconds)} />
-            <MetricCard label="Cache hit" value={formatPercent(state.data.cacheHitRate)} />
+            <MetricCard
+              label="Ingest lag"
+              value={fmtMeasured(state.data.ingestLagSeconds, formatLagSeconds)}
+            />
+            <MetricCard
+              label="Cache hit"
+              value={fmtMeasured(state.data.cacheHitRate, formatPercent)}
+            />
           </MetricGrid>
           <MetricGrid className="lg:grid-cols-3">
-            <MetricCard label="Policy p95" value={`${state.data.policyDecisionP95Ms} ms`} />
-            <MetricCard label="Agent success" value={formatPercent(state.data.agentSuccessRate)} />
-            <MetricCard label="Incidents" value={state.data.activeIncidents} />
+            <MetricCard
+              label="Policy p95"
+              value={fmtMeasured(state.data.policyDecisionP95Ms, (n) => `${n} ms`)}
+            />
+            <MetricCard
+              label="Agent success"
+              value={fmtMeasured(state.data.agentSuccessRate, formatPercent)}
+            />
+            <MetricCard label="Incidents" value={fmtMeasured(state.data.activeIncidents)} />
           </MetricGrid>
           <SectionCard title="SLO board">
             <ul className="space-y-2 text-sm">

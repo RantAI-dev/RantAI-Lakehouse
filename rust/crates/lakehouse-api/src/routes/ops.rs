@@ -1,37 +1,42 @@
-//! `GET /api/ops/{kind}` — operational views: `observability`, `usage`,
-//! `workloads`, `services`.
+//! `GET /api/ops/{kind}` — operational views: `observability`, `workloads`,
+//! `services`.
 //!
 //! Ports `src/app/api/ops/[kind]/route.ts`. An unrecognized `kind` returns
 //! HTTP 400 with `{"error": "kind tak dikenal: <kind>"}`, verified against
 //! `ops-unknown-kind.json` in the parity corpus.
+//!
+//! `usage` was cut in WS1: storage-by-tier used an invented
+//! bytes-per-row constant and the tenant budget was a literal `100_000`
+//! with compute units relabelled as spend. Nothing but the now-removed
+//! Usage page called it, so `"usage"` now falls through to
+//! [`Kind::Unknown`] like any other unrecognized value.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ident::SqlLiteral;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 
 use crate::json::ApiJson;
 use crate::routes::support::{js_error, num_or_zero, str_col};
 use crate::state::AppState;
-use crate::tenant::{TENANT_ID, TENANT_OWNER, TENANT_SITE};
+use crate::tenant::{TENANT_ID, TENANT_SITE};
 use lakehouse_dagster::{DgClient, DgError};
 
-/// The four recognized `ops/{kind}` values. Ported from the `if (kind ===
+/// The three recognized `ops/{kind}` values. Ported from the `if (kind ===
 /// ...)` chain in `ops/[kind]/route.ts`; anything else is [`Kind::Unknown`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     /// `ops/observability` — query SLOs.
     Observability,
-    /// `ops/usage` — 7-day compute/storage usage.
-    Usage,
     /// `ops/workloads` — currently running `ClickHouse` processes.
     Workloads,
     /// `ops/services` — component health checks.
     Services,
-    /// Anything else, which the TypeScript rejects with HTTP 400.
+    /// Anything else, which the TypeScript rejects with HTTP 400. Also
+    /// where `"usage"` lands now that the Usage page is gone (WS1).
     Unknown,
 }
 
@@ -39,7 +44,6 @@ impl Kind {
     fn parse(kind: &str) -> Self {
         match kind {
             "observability" => Self::Observability,
-            "usage" => Self::Usage,
             "workloads" => Self::Workloads,
             "services" => Self::Services,
             _ => Self::Unknown,
@@ -79,11 +83,45 @@ pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Res
 async fn run(state: &AppState, kind: Kind) -> Result<Value, OpsError> {
     match kind {
         Kind::Observability => observability(&state.clickhouse).await,
-        Kind::Usage => usage(&state.clickhouse, &state.dagster).await,
         Kind::Workloads => workloads(&state.clickhouse).await,
         Kind::Services => services(&state.clickhouse, &state.dagster).await,
         Kind::Unknown => unreachable!("Kind::Unknown is handled before `run` is called"),
     }
+}
+
+/// Build the `ops/observability` JSON from measured `p95`/`err`, extracted
+/// so the five unmeasured fields it nulls (and the dropped
+/// `streamingLagSeconds` key) can be asserted without a `ClickHouse` call.
+fn observability_json(p95: i64, err: f64) -> Value {
+    json!({
+        "queryP95Ms": p95,
+        "queryErrorRate": err,
+        // Nothing measures ingest lag, cache hit rate, policy decision
+        // latency, agent success rate, or open incidents today; `null` is
+        // honest, the literal zeros this replaced were not (P5 review /
+        // WS1 honesty pass task 1.7). `streamingLagSeconds` is dropped
+        // outright: it has no consumer in the TypeScript contract and
+        // nothing measures streaming either.
+        "ingestLagSeconds": Value::Null,
+        "cacheHitRate": Value::Null,
+        "policyDecisionP95Ms": Value::Null,
+        "agentSuccessRate": Value::Null,
+        "activeIncidents": Value::Null,
+        "slos": [
+            {
+                "name": "Query p95 < 2s",
+                "target": "2000ms",
+                "current": format!("{p95}ms"),
+                "ok": p95 < 2000,
+            },
+            {
+                "name": "Query error rate < 1%",
+                "target": "1%",
+                "current": format!("{:.2}%", err * 100.0),
+                "ok": err < 0.01,
+            },
+        ],
+    })
 }
 
 async fn observability(ch: &ChClient) -> Result<Value, OpsError> {
@@ -102,157 +140,113 @@ async fn observability(ch: &ChClient) -> Result<Value, OpsError> {
     let err = q
         .and_then(|r| str_col(r, "err").parse::<f64>().ok())
         .unwrap_or(0.0);
-    Ok(json!({
-        "queryP95Ms": p95,
-        "queryErrorRate": err,
-        "ingestLagSeconds": 0,
-        "streamingLagSeconds": 0,
-        "cacheHitRate": 0,
-        "policyDecisionP95Ms": 0,
-        "agentSuccessRate": 0,
-        "activeIncidents": 0,
-        "slos": [
-            {
-                "name": "Query p95 < 2s",
-                "target": "2000ms",
-                "current": format!("{p95}ms"),
-                "ok": p95 < 2000,
-            },
-            {
-                "name": "Query error rate < 1%",
-                "target": "1%",
-                "current": format!("{:.2}%", err * 100.0),
-                "ok": err < 0.01,
-            },
-        ],
-    }))
+    Ok(observability_json(p95, err))
 }
 
-async fn usage(ch: &ChClient, dagster: &DgClient) -> Result<Value, OpsError> {
-    let u_rows = ch
-        .rows(
-            "SELECT toString(count()) units, toString(sum(read_bytes)) bytes
-           FROM system.query_log WHERE type='QueryFinish' AND event_time > now() - INTERVAL 7 DAY",
-            None,
-        )
-        .await?;
-    let u = u_rows.first();
-    let units = num_or_zero(u, "units");
-    let bytes = num_or_zero(u, "bytes");
-
-    let now_ms = now_unix_millis();
-    let runs7d = dagster
-        .list_runs(200)
-        .await?
-        .into_iter()
-        .filter(|r| r.start_time.unwrap_or(0.0) * 1000.0 > now_ms - 7.0 * 864e5)
-        .count();
-
-    let store_rows = ch
-        .rows(
-            "SELECT toString(sum(bytes_on_disk)) hot,
-                  (SELECT toString(sum(total)) FROM (SELECT total FROM lake.`bronze_meta.dataset_sync` UNION ALL SELECT total FROM lake.`bronze_meta_sec.dataset_sync`)) warmRows
-           FROM system.parts WHERE database='serving' AND active",
-            None,
-        )
-        .await?;
-    let store = store_rows.first();
-    let hot = num_or_zero(store, "hot");
-    let warm_rows = num_or_zero(store, "warmRows");
-
-    Ok(json!({
-        "computeUnits7d": units,
-        "scannedBytes7d": bytes,
-        "storageByTier": {
-            "hot": hot,
-            "warm": warm_rows * 220,
-            "cold": 0,
-            "ai": 0,
-        },
-        "pipelineRuns7d": runs7d,
-        "agentBudgetUsedRate": 0,
-        "tenants": [
-            {
-                "id": TENANT_ID.as_str(),
-                "name": TENANT_OWNER.as_str(),
-                "computeUnits": units,
-                "budgetLimit": 100_000,
-                "budgetSpent": units,
-            },
-        ],
-    }))
+/// Build one `ops/workloads` row from a `system.processes` fixture row.
+/// `started_ms` is computed by `ClickHouse` in the same query as `elapsed`
+/// (`now64() - elapsed`), not stamped by this process, so both numbers come
+/// from one clock at one instant. A row whose `started_ms` fails to parse
+/// (or is absent, e.g. in a test fixture) reports `startedAt: null` rather
+/// than falling back to the request's own clock — that fallback was the
+/// fabrication this replaces.
+fn workload_row(index: usize, p: &Map<String, Value>) -> Value {
+    let elapsed_secs = str_col(p, "elapsed").parse::<f64>().unwrap_or(0.0);
+    let started_at = str_col(p, "started_ms")
+        .parse::<f64>()
+        .ok()
+        .map(|ms| lakehouse_dagster::iso_from_unix_seconds(ms / 1000.0));
+    json!({
+        "id": format!("w-{index}"),
+        "principal": str_col(p, "user"),
+        "tenant": TENANT_ID.as_str(),
+        // No workload classifier exists; null instead of the invented
+        // "hot-analytics" literal every row used to carry.
+        "class": Value::Null,
+        // Every row here comes from `system.processes`, which *is*
+        // `ClickHouse` — this label is true regardless of workload shape
+        // (mirrors the same deliberate call on `/api/query/run`).
+        "engine": "hot-store",
+        "status": "running",
+        "elapsedMs": elapsed_ms(elapsed_secs),
+        // No cost model exists; null instead of the literal `1`.
+        "estimatedCost": Value::Null,
+        "startedAt": started_at,
+    })
 }
 
 async fn workloads(ch: &ChClient) -> Result<Value, OpsError> {
     let procs = ch
         .rows(
-            "SELECT user, toString(elapsed) elapsed, substring(query,1,80) query
+            "SELECT user, toString(elapsed) elapsed, substring(query,1,80) query,
+                  toString(toUnixTimestamp64Milli(now64(3)) - toInt64(elapsed * 1000)) started_ms
          FROM system.processes WHERE query NOT LIKE '%system.processes%' LIMIT 50",
             None,
         )
         .await?;
-    let started_at = now_iso();
     let workloads: Vec<Value> = procs
         .iter()
         .enumerate()
-        .map(|(i, p)| {
-            let elapsed_secs = str_col(p, "elapsed").parse::<f64>().unwrap_or(0.0);
-            json!({
-                "id": format!("w-{i}"),
-                "principal": str_col(p, "user"),
-                "tenant": TENANT_ID.as_str(),
-                "class": "hot-analytics",
-                "engine": "hot-store",
-                "status": "running",
-                "elapsedMs": elapsed_ms(elapsed_secs),
-                "estimatedCost": 1,
-                "startedAt": started_at,
-            })
-        })
+        .map(|(i, p)| workload_row(i, p))
         .collect();
     Ok(json!({ "workloads": workloads }))
+}
+
+/// Build one `ops/services` row. `probed` is `Some(ok)` when a live check
+/// actually ran this request (`ClickHouse`, `Dagster`); it is `None` when
+/// nothing probes the service at all (`Iceberg`/`Lakekeeper`, `RustFS`) —
+/// those used to silently reuse `ClickHouse`'s result or the literal
+/// `true`. An unprobed service reports `health: "unknown"` and
+/// `checked: false` rather than a guessed health, and none of `version`,
+/// `replicas`, `errorRate`, or `latencyMs` are measured for any service
+/// today (WS5 is expected to fill some of these in).
+fn service_row(id: &str, name: &str, probed: Option<bool>, deps: &[&str]) -> Value {
+    let health = match probed {
+        Some(true) => "healthy",
+        Some(false) => "unhealthy",
+        None => "unknown",
+    };
+    json!({
+        "id": id,
+        "name": name,
+        "health": health,
+        "checked": probed.is_some(),
+        "version": Value::Null,
+        "site": TENANT_SITE.as_str(),
+        "replicas": Value::Null,
+        "errorRate": Value::Null,
+        "latencyMs": Value::Null,
+        "dependencies": deps,
+    })
 }
 
 async fn services(ch: &ChClient, dagster: &DgClient) -> Result<Value, OpsError> {
     let ch_ok = ch.rows("SELECT 1", None).await.is_ok();
     let dag_ok = dagster.is_alive().await;
-    let entries = [
-        (
+    let services = vec![
+        service_row(
             "clickhouse",
             "ClickHouse (Hot analytical store)",
-            ch_ok,
-            vec![],
+            Some(ch_ok),
+            &[],
         ),
-        (
+        service_row(
             "dagster",
             "Dagster (Orchestration)",
-            dag_ok,
-            vec!["clickhouse"],
+            Some(dag_ok),
+            &["clickhouse"],
         ),
-        (
+        // Never probed — this used to reuse `ch_ok`, so a dead Lakekeeper
+        // read healthy whenever ClickHouse (a different service) answered.
+        service_row(
             "iceberg",
             "Iceberg + Lakekeeper (Open tables)",
-            ch_ok,
-            vec!["rustfs"],
+            None,
+            &["rustfs"],
         ),
-        ("rustfs", "RustFS (Object storage)", true, vec![]),
+        // Never probed — this used to be the literal `true`.
+        service_row("rustfs", "RustFS (Object storage)", None, &[]),
     ];
-    let services: Vec<Value> = entries
-        .into_iter()
-        .map(|(id, name, ok, deps)| {
-            json!({
-                "id": id,
-                "name": name,
-                "health": if ok { "healthy" } else { "unhealthy" },
-                "version": "-",
-                "site": TENANT_SITE.as_str(),
-                "replicas": 1,
-                "errorRate": 0,
-                "latencyMs": 0,
-                "dependencies": deps,
-            })
-        })
-        .collect();
     Ok(json!({ "services": services }))
 }
 
@@ -267,17 +261,10 @@ fn elapsed_ms(elapsed_secs: f64) -> i64 {
     (elapsed_secs * 1000.0).round() as i64
 }
 
-/// `Date.now()` in milliseconds.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "millisecond-precision comparison against a 7-day window; \
-              precision loss at this magnitude is inconsequential"
-)]
-fn now_unix_millis() -> f64 {
-    OffsetDateTime::now_utc().unix_timestamp_nanos() as f64 / 1_000_000.0
-}
-
-/// `new Date().toISOString()`.
+/// `new Date().toISOString()`. Still used by [`cancel_workload_body`] for
+/// the cancelled-workload response; `workloads` no longer uses it (its
+/// `startedAt` is now derived from the same `ClickHouse` query as
+/// `elapsed`, not this process's clock) — see `workload_row`.
 #[allow(
     clippy::cast_precision_loss,
     reason = "second-precision input to a millisecond-precision formatter"
@@ -378,7 +365,6 @@ mod tests {
     #[test]
     fn kind_parses_known_values() {
         assert_eq!(Kind::parse("observability"), Kind::Observability);
-        assert_eq!(Kind::parse("usage"), Kind::Usage);
         assert_eq!(Kind::parse("workloads"), Kind::Workloads);
         assert_eq!(Kind::parse("services"), Kind::Services);
     }
@@ -388,6 +374,96 @@ mod tests {
         assert_eq!(Kind::parse("bogus-kind"), Kind::Unknown);
         assert_eq!(Kind::parse(""), Kind::Unknown);
         assert_eq!(Kind::parse("lineage"), Kind::Unknown);
+    }
+
+    #[test]
+    fn kind_parse_usage_is_unknown_now_that_the_usage_page_is_cut() {
+        // WS1 honesty pass: the Usage page and its API kind had no measured
+        // backing (invented bytes-per-row constant, a literal budget), and
+        // nothing else called `/api/ops/usage`. This is a deliberate
+        // contract change, not a weakened test.
+        assert_eq!(Kind::parse("usage"), Kind::Unknown);
+    }
+
+    #[test]
+    fn unprobed_services_report_unknown_health_and_are_marked_unchecked() {
+        let iceberg = service_row("iceberg", "Iceberg", None, &["rustfs"]);
+        assert_eq!(iceberg["health"], "unknown");
+        assert_eq!(iceberg["checked"], false);
+        for field in ["version", "replicas", "errorRate", "latencyMs"] {
+            assert!(iceberg[field].is_null(), "{field} should be null");
+        }
+
+        let rustfs = service_row("rustfs", "RustFS", None, &[]);
+        assert_eq!(rustfs["health"], "unknown");
+        assert_eq!(rustfs["checked"], false);
+    }
+
+    #[test]
+    fn probed_services_keep_their_real_health() {
+        let down = service_row("clickhouse", "ClickHouse", Some(false), &[]);
+        assert_eq!(down["health"], "unhealthy");
+        assert_eq!(down["checked"], true);
+        // Even a probed service reports null for the metrics nothing
+        // measures — probing only tells us up/down, not version or
+        // latency.
+        assert!(down["version"].is_null());
+
+        let up = service_row("dagster", "Dagster", Some(true), &["clickhouse"]);
+        assert_eq!(up["health"], "healthy");
+        assert_eq!(up["checked"], true);
+    }
+
+    #[test]
+    fn observability_nulls_every_unmeasured_metric_and_drops_streaming_lag() {
+        let v = observability_json(120, 0.002);
+        assert_eq!(v["queryP95Ms"], 120);
+        assert!((v["queryErrorRate"].as_f64().unwrap() - 0.002).abs() < f64::EPSILON);
+        for field in [
+            "ingestLagSeconds",
+            "cacheHitRate",
+            "policyDecisionP95Ms",
+            "agentSuccessRate",
+            "activeIncidents",
+        ] {
+            assert!(v[field].is_null(), "{field} should be null");
+        }
+        assert!(
+            v.get("streamingLagSeconds").is_none(),
+            "streamingLagSeconds must be removed, not just nulled"
+        );
+        assert!(v["slos"].is_array());
+    }
+
+    #[test]
+    fn workload_started_at_is_derived_from_elapsed_not_the_request_time() {
+        let mut row = Map::new();
+        row.insert("user".to_owned(), Value::String("alice".to_owned()));
+        row.insert("elapsed".to_owned(), Value::String("1.5".to_owned()));
+        // `started_ms` is what `now64() - elapsed*1000` would produce on
+        // the server; the epoch millisecond for 2026-08-27T04:00:10.075Z.
+        row.insert(
+            "started_ms".to_owned(),
+            Value::String("1787803210075".to_owned()),
+        );
+        let v = workload_row(0, &row);
+        assert_eq!(v["startedAt"], "2026-08-27T04:00:10.075Z");
+        assert_eq!(v["engine"], "hot-store");
+        assert!(v["class"].is_null());
+        assert!(v["estimatedCost"].is_null());
+    }
+
+    #[test]
+    fn workload_started_at_is_null_when_started_ms_does_not_parse() {
+        let mut row = Map::new();
+        row.insert("user".to_owned(), Value::String("bob".to_owned()));
+        row.insert("elapsed".to_owned(), Value::String("0.2".to_owned()));
+        row.insert("started_ms".to_owned(), Value::String(String::new()));
+        let v = workload_row(1, &row);
+        assert!(
+            v["startedAt"].is_null(),
+            "an unparseable started_ms must never fall back to the request's own clock"
+        );
     }
 
     #[test]
