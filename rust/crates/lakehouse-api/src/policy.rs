@@ -141,6 +141,15 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET", "/api/catalog",       Policy::RequiresPermission("catalog:read")),
     ("GET", "/api/catalog/{id}",  Policy::RequiresPermission("catalog:read")),
 
+    // ── Lakehouse (WS2 §4): the read-only Iceberg warehouse/namespace/
+    //    table surface, gated by the same seeded `catalog:read` permission
+    //    as the dataset registry above. ────────────────────────────────────
+    ("GET", "/api/lakehouse/warehouses",                      Policy::RequiresPermission("catalog:read")),
+    ("GET", "/api/lakehouse/namespaces",                      Policy::RequiresPermission("catalog:read")),
+    ("GET", "/api/lakehouse/tables",                          Policy::RequiresPermission("catalog:read")),
+    ("GET", "/api/lakehouse/tables/{ns}/{table}",             Policy::RequiresPermission("catalog:read")),
+    ("GET", "/api/lakehouse/tables/{ns}/{table}/maintenance", Policy::RequiresPermission("catalog:read")),
+
     // ── Overview / alerts: no seeded resource maps to these — auth only. ─
     ("GET",  "/api/overview",                                Policy::RequiresAuth),
     ("POST", "/api/overview",                                Policy::RequiresAuth),

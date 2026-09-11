@@ -18,6 +18,7 @@ mod gold;
 mod governance;
 mod identity;
 mod knowledge;
+mod lakehouse;
 mod ops;
 mod overview;
 mod pipelines;
@@ -147,6 +148,23 @@ fn storage_router() -> Router<AppState> {
         .route(
             "/api/storage/restore",
             axum::routing::post(storage::restore_asset),
+        )
+}
+
+/// The `/api/lakehouse/*` sub-router (WS2 §4), split out for the same
+/// `clippy::too_many_lines` reason as [`pipelines_router`].
+fn lakehouse_router() -> Router<AppState> {
+    Router::new()
+        .route("/api/lakehouse/warehouses", get(lakehouse::warehouses))
+        .route("/api/lakehouse/namespaces", get(lakehouse::namespaces))
+        .route("/api/lakehouse/tables", get(lakehouse::tables))
+        .route(
+            "/api/lakehouse/tables/{ns}/{table}",
+            get(lakehouse::table_detail),
+        )
+        .route(
+            "/api/lakehouse/tables/{ns}/{table}/maintenance",
+            get(lakehouse::maintenance),
         )
 }
 
@@ -302,6 +320,7 @@ pub fn router(state: AppState) -> Router {
             get(governance::get).post(governance::create_rule),
         )
         .merge(storage_router())
+        .merge(lakehouse_router())
         .route(
             "/api/alerts",
             get(alerts::list)
