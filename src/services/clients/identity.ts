@@ -71,36 +71,36 @@ function post<T>(
 
 export const postgresIdentityService: IdentityService = {
   listUsers(signal) {
-    return get<User[]>("/api/identity/users", signal, "Daftar pengguna gagal dimuat");
+    return get<User[]>("/api/identity/users", signal, "Failed to load user list");
   },
   listRoles(signal) {
-    return get<Role[]>("/api/identity/roles", signal, "Daftar peran gagal dimuat");
+    return get<Role[]>("/api/identity/roles", signal, "Failed to load role list");
   },
   listTenants(signal) {
-    return get<Tenant[]>("/api/identity/tenants", signal, "Daftar tenant gagal dimuat");
+    return get<Tenant[]>("/api/identity/tenants", signal, "Failed to load tenant list");
   },
   listServiceIdentities(signal) {
     return get<ServiceIdentity[]>(
       "/api/identity/service-identities",
       signal,
-      "Daftar service identity gagal dimuat"
+      "Failed to load service identity list"
     );
   },
   inviteUser(input: InviteUserInput, signal) {
-    return post<User>("/api/identity/users", input, signal, "Undangan pengguna gagal");
+    return post<User>("/api/identity/users", input, signal, "Failed to invite user");
   },
   createRole(input: CreateRoleInput, signal) {
-    return post<Role>("/api/identity/roles", input, signal, "Pembuatan peran gagal");
+    return post<Role>("/api/identity/roles", input, signal, "Failed to create role");
   },
   createTenant(input: CreateTenantInput, signal) {
-    return post<Tenant>("/api/identity/tenants", input, signal, "Pembuatan tenant gagal");
+    return post<Tenant>("/api/identity/tenants", input, signal, "Failed to create tenant");
   },
   createServiceIdentity(input: CreateServiceIdentityInput, signal) {
     return post<ServiceIdentity>(
       "/api/identity/service-identities",
       input,
       signal,
-      "Pembuatan service identity gagal"
+      "Failed to create service identity"
     );
   },
 };

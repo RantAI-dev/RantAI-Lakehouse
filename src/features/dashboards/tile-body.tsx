@@ -44,7 +44,7 @@ export function TileBody({
 
   if (spec.kind === "table") {
     if (!hasRows(cell) || cell.rows.length === 0) {
-      return <p className="grid h-full place-items-center text-xs text-muted-foreground">Tak ada data{year !== "all" ? ` (tahun ${year})` : ""}.</p>;
+      return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data{year !== "all" ? ` (year ${year})` : ""}.</p>;
     }
     return <TableView columns={cell.columns} rows={cell.rows} />;
   }
@@ -52,14 +52,14 @@ export function TileBody({
   // geomap — needs the map registered first (local GeoJSON).
   if (spec.kind === "geomap") {
     if (!hasRows(cell) || cell.rows.length === 0) {
-      return <p className="grid h-full place-items-center text-xs text-muted-foreground">Tak ada data{year !== "all" ? ` (tahun ${year})` : ""}.</p>;
+      return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data{year !== "all" ? ` (year ${year})` : ""}.</p>;
     }
     return <GeoChart spec={spec} rows={cell.rows} dark={dark} />;
   }
 
   // chart
   if (hasRows(cell) && cell.rows.length) return <EChart option={buildOption(spec, cell.rows, dark)} height="100%" onDataClick={onDataClick} />;
-  return <p className="grid h-full place-items-center text-xs text-muted-foreground">Tak ada data{year !== "all" ? ` (tahun ${year})` : ""}.</p>;
+  return <p className="grid h-full place-items-center text-xs text-muted-foreground">No data{year !== "all" ? ` (year ${year})` : ""}.</p>;
 }
 
 /** Choropleth — ensure the map is registered before rendering; a friendly message if the GeoJSON is missing. */

@@ -16,7 +16,7 @@ import { ServiceError } from "../errors";
 async function loadCatalog(signal?: AbortSignal): Promise<{ assets: Asset[]; namespaces: CatalogNamespace[] }> {
   const res = await apiFetch("/api/catalog", { signal });
   const json = await res.json();
-  if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Katalog gagal dimuat");
+  if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Failed to load catalog");
   return json;
 }
 
@@ -41,7 +41,7 @@ export const clickhouseAssetService: AssetService = {
   async getAsset(id, signal) {
     const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}`, { signal });
     const json = await res.json();
-    if (!res.ok) throw new ServiceError("not_found", json?.error ?? "Aset tidak ditemukan");
+    if (!res.ok) throw new ServiceError("not_found", json?.error ?? "Asset not found");
     return json as AssetDetail;
   },
   async listNamespaces(signal) {

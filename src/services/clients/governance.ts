@@ -41,7 +41,7 @@ function errorFor(status: number, message: string): ServiceError {
 async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
   const res = await apiFetch(url, { signal });
   const json = await res.json().catch(() => null);
-  if (!res.ok) throw errorFor(res.status, json?.error ?? "Governance gagal dimuat");
+  if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to load governance");
   return json as T;
 }
 
@@ -53,7 +53,7 @@ async function post<T>(url: string, body: unknown, signal?: AbortSignal): Promis
     signal,
   });
   const json = await res.json().catch(() => null);
-  if (!res.ok) throw errorFor(res.status, json?.error ?? "Governance gagal disimpan");
+  if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to save governance");
   return json as T;
 }
 

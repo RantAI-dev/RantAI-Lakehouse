@@ -121,7 +121,7 @@ function StepBody({
         <p className="text-foreground">{String(res.summary ?? "Konfirmasi tindakan ini?")}</p>
         <div className="flex gap-2">
           <Button size="sm" onClick={onConfirm} disabled={confirming}>
-            {confirming ? "Menjalankan…" : "Confirm"}
+            {confirming ? "Running…" : "Confirm"}
           </Button>
           <Button size="sm" variant="outline" onClick={onCancel} disabled={confirming}>
             Cancel
@@ -139,12 +139,12 @@ function StepBody({
     const approvalId = String(res.approval_id ?? "");
     return (
       <div className="mt-1 space-y-2 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[11px]">
-        <p className="text-foreground">{String(res.summary ?? "Tindakan ini butuh persetujuan.")}</p>
+        <p className="text-foreground">{String(res.summary ?? "This action needs approval.")}</p>
         <Link
           href={approvalId ? `/agents/approvals?id=${encodeURIComponent(approvalId)}` : "/agents/approvals"}
           className="inline-flex items-center gap-1 font-medium text-amber-700 underline underline-offset-2 dark:text-amber-400"
         >
-          Lihat di Approvals →
+          View in Approvals →
         </Link>
       </div>
     );
@@ -182,7 +182,7 @@ function StepBody({
             <span className="text-muted-foreground">[{d.tier}]</span> {d.title}
           </li>
         ))}
-        {ds.length > 10 ? <li className="text-muted-foreground">+{ds.length - 10} lain…</li> : null}
+        {ds.length > 10 ? <li className="text-muted-foreground">+{ds.length - 10} more…</li> : null}
       </ul>
     );
   }

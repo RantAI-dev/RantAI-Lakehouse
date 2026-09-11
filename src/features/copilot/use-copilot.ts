@@ -88,7 +88,7 @@ function useCopilotState() {
         }),
       });
       const json = await res.json();
-      if (!res.ok) throw new Error(json?.hint ?? json?.detail ?? json?.error ?? "Copilot gagal");
+      if (!res.ok) throw new Error(json?.hint ?? json?.detail ?? json?.error ?? "Copilot failed");
       const full: Msg[] = [
         ...next,
         {

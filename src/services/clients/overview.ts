@@ -32,19 +32,19 @@ export const clickhouseOverviewService: OverviewService = {
   async getSummary(signal) {
     const res = await apiFetch("/api/overview", { signal });
     const json = await res.json();
-    if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Overview gagal dimuat");
+    if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Failed to load overview");
     return json as OverviewSummary;
   },
   async listActivity(signal) {
     const res = await apiFetch("/api/overview", { method: "POST", signal });
     const json = await res.json();
-    if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Activity gagal dimuat");
+    if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Failed to load activity");
     return json.activity as ActivityItem[];
   },
   async listAlerts(signal) {
     const res = await apiFetch("/api/overview/alerts", { signal });
     const json = await res.json();
-    if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Alerts gagal dimuat");
+    if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Failed to load alerts");
     return json as AlertItem[];
   },
   acknowledgeAlert(id, signal) {

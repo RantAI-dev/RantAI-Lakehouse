@@ -165,7 +165,7 @@ export function DashboardPage() {
       const q = new URLSearchParams({ mart, column, value, limit: "100" });
       const res = await apiFetch(`/api/dashboard/records?${q.toString()}`, { cache: "no-store" });
       const json = await res.json();
-      if (!res.ok) throw new Error(json?.error ?? "gagal");
+      if (!res.ok) throw new Error(json?.error ?? "failed");
       setRecords({ columns: json.columns ?? [], rows: json.rows ?? [], value, loading: false });
     } catch {
       setRecords({ columns: [], rows: [], value, loading: false });
@@ -627,7 +627,7 @@ export function DashboardPage() {
           <Input autoFocus value={newName} onChange={(e) => setNewName(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") void saveRename(); }} placeholder="Dashboard name" />
           <DialogFooter>
             <DialogClose render={<Button variant="ghost" size="sm" />}>Cancel</DialogClose>
-            <Button size="sm" onClick={() => void saveRename()}>Simpan</Button>
+            <Button size="sm" onClick={() => void saveRename()}>Save</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

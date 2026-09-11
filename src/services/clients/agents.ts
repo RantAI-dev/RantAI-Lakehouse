@@ -71,33 +71,33 @@ export const postgresAgentService: AgentService = {
     return get<DigitalEmployee[]>(
       "/api/agents/employees",
       signal,
-      "Daftar digital employee gagal dimuat"
+      "Failed to load digital employee list"
     )
   },
   getEmployee(id, signal) {
     return get<DigitalEmployee>(
       `/api/agents/employees/${encodeURIComponent(id)}`,
       signal,
-      "Detail digital employee gagal dimuat"
+      "Failed to load digital employee detail"
     )
   },
   listRuns(employeeId, signal) {
     const qs = employeeId ? `?employeeId=${encodeURIComponent(employeeId)}` : ""
-    return get<AgentRun[]>(`/api/agents/runs${qs}`, signal, "Daftar run gagal dimuat")
+    return get<AgentRun[]>(`/api/agents/runs${qs}`, signal, "Failed to load run list")
   },
   getRun(id, signal) {
-    return get<AgentRun>(`/api/agents/runs/${encodeURIComponent(id)}`, signal, "Detail run gagal dimuat")
+    return get<AgentRun>(`/api/agents/runs/${encodeURIComponent(id)}`, signal, "Failed to load run detail")
   },
   listApprovals(employeeId, signal) {
     const qs = employeeId ? `?employeeId=${encodeURIComponent(employeeId)}` : ""
-    return get<ApprovalItem[]>(`/api/agents/approvals${qs}`, signal, "Daftar approval gagal dimuat")
+    return get<ApprovalItem[]>(`/api/agents/approvals${qs}`, signal, "Failed to load approval list")
   },
   decideApproval(id, input: DecideApprovalInput, signal) {
     return post<DecideApprovalResult>(
       `/api/agents/approvals/${encodeURIComponent(id)}/decide`,
       input,
       signal,
-      "Memutuskan approval gagal"
+      "Failed to decide approval"
     )
   },
   createEmployee(input: CreateEmployeeInput, signal) {
@@ -105,7 +105,7 @@ export const postgresAgentService: AgentService = {
       "/api/agents/employees",
       input,
       signal,
-      "Membuat digital employee gagal"
+      "Failed to create digital employee"
     )
   },
   suspendEmployee(id, signal) {
@@ -113,7 +113,7 @@ export const postgresAgentService: AgentService = {
       `/api/agents/employees/${encodeURIComponent(id)}/suspend`,
       undefined,
       signal,
-      "Menangguhkan digital employee gagal"
+      "Failed to suspend digital employee"
     )
   },
   resumeEmployee(id, signal) {
@@ -121,7 +121,7 @@ export const postgresAgentService: AgentService = {
       `/api/agents/employees/${encodeURIComponent(id)}/resume`,
       undefined,
       signal,
-      "Melanjutkan digital employee gagal"
+      "Failed to resume digital employee"
     )
   },
   revokeEmployee(id, signal) {
@@ -129,7 +129,7 @@ export const postgresAgentService: AgentService = {
       `/api/agents/employees/${encodeURIComponent(id)}/revoke`,
       undefined,
       signal,
-      "Mencabut digital employee gagal"
+      "Failed to revoke digital employee"
     )
   },
   async runEmployee(id, input: RunEmployeeInput | undefined, signal) {
@@ -138,7 +138,7 @@ export const postgresAgentService: AgentService = {
       `/api/agents/employees/${encodeURIComponent(id)}/run`,
       body,
       signal,
-      "Menjalankan digital employee gagal"
+      "Failed to run digital employee"
     )
     return run
   },

@@ -11,7 +11,7 @@ import { ServiceError } from "../errors";
 async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
   const res = await apiFetch(url, { signal });
   const json = await res.json();
-  if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Ops gagal dimuat");
+  if (!res.ok) throw new ServiceError("unavailable", json?.error ?? "Failed to load ops");
   return json as T;
 }
 

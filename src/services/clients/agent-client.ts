@@ -29,7 +29,7 @@ export async function askAgentSql(question: string, signal?: AbortSignal): Promi
   });
   const json = await res.json();
   if (!res.ok) {
-    throw new ServiceError("unavailable", json?.detail ?? json?.hint ?? json?.error ?? "Agent gagal");
+    throw new ServiceError("unavailable", json?.detail ?? json?.hint ?? json?.error ?? "Agent failed");
   }
   return json as AgentQueryResult;
 }
