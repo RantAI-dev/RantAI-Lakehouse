@@ -22,8 +22,7 @@ use crate::json::ApiJson;
 use crate::routes::support::js_error;
 use crate::state::AppState;
 
-use crate::tenant::{TENANT_OWNER, TENANT_SOURCE};
-const TARGET: &str = "serving.mart_* (Gold)";
+use crate::tenant::TENANT_OWNER;
 
 /// `GET /api/pipelines` — every `Dagster` job, enriched with its most
 /// recent run and (first) schedule, unioned with every Postgres-authored
@@ -60,21 +59,7 @@ async fn list_body(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, Lis
         .iter()
         .map(|j| {
             let last = last_run_for(&runs, &j.name);
-            json!({
-                "id": j.name,
-                "name": j.name,
-                "kind": "batch",
-                "status": last.map_or("unknown", |r| map_run_status(&r.status)),
-                "owner": TENANT_OWNER.as_str(),
-                "source": TENANT_SOURCE.as_str(),
-                "target": TARGET,
-                "schedule": schedule_label(j),
-                "lastRunAt": last
-                    .and_then(|r| r.start_time)
-                    .map_or_else(String::new, iso_from_unix_seconds),
-                "slaOk": last.is_none_or(|r| r.status == "SUCCESS"),
-                "freshnessLagSeconds": 0,
-            })
+            dagster_pipeline_row(j, last)
         })
         .collect();
     if let Some(pg) = pg {
@@ -82,6 +67,32 @@ async fn list_body(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, Lis
         pipelines.extend(authored.iter().filter_map(|p| serde_json::to_value(p).ok()));
     }
     Ok(json!({ "pipelines": pipelines }))
+}
+
+/// Build one `Dagster`-job row for `GET /api/pipelines`. `Dagster`'s job/run
+/// API carries no per-job lineage, no `SLA` definition (`WS5` adds
+/// `dataset_sla`), and no freshness measurement (`WS2` derives that from
+/// Iceberg snapshot timestamps) — `source`, `target`, `slaOk`, and
+/// `freshnessLagSeconds` are therefore reported as `null` rather than a
+/// stamped-on default that every job would share (`WS1` finding J16).
+/// `lastRunAt` is `null` when the job has never run instead of an empty
+/// string standing in for "never ran".
+fn dagster_pipeline_row(j: &DgJob, last: Option<&DgRun>) -> Value {
+    json!({
+        "id": j.name,
+        "name": j.name,
+        "kind": "batch",
+        "status": last.map_or("unknown", |r| map_run_status(&r.status)),
+        "owner": TENANT_OWNER.as_str(),
+        "source": Value::Null,
+        "target": Value::Null,
+        "schedule": schedule_label(j),
+        "lastRunAt": last
+            .and_then(|r| r.start_time)
+            .map_or(Value::Null, |t| Value::String(iso_from_unix_seconds(t))),
+        "slaOk": Value::Null,
+        "freshnessLagSeconds": Value::Null,
+    })
 }
 
 /// The run with the largest `startTime` for `job_name`, matching the
@@ -490,20 +501,7 @@ async fn dagster_schedule_toggle(state: &AppState, job_name: &str, paused: bool)
     };
     match outcome {
         Ok(o) if o.ok => {
-            let body = json!({
-                "id": job_name,
-                "name": job_name,
-                "kind": "batch",
-                "status": if paused { "paused" } else { "ready" },
-                "owner": TENANT_OWNER.as_str(),
-                "source": TENANT_SOURCE.as_str(),
-                "target": TARGET,
-                "schedule": schedule_label(job),
-                "lastRunAt": "",
-                "slaOk": true,
-                "freshnessLagSeconds": 0,
-            });
-            (StatusCode::OK, ApiJson(body)).into_response()
+            (StatusCode::OK, ApiJson(schedule_mutation_body(job, paused))).into_response()
         }
         Ok(o) => (
             StatusCode::CONFLICT,
@@ -516,6 +514,26 @@ async fn dagster_schedule_toggle(state: &AppState, job_name: &str, paused: bool)
         )
             .into_response(),
     }
+}
+
+/// Build the pause/resume response body for a `Dagster`-backed pipeline.
+/// Same reasoning as [`dagster_pipeline_row`]: no lineage, `SLA`, freshness,
+/// or last-run time is known here, so all five are `null` rather than the
+/// literal `true`/`""`/`0` this endpoint used to return unconditionally.
+fn schedule_mutation_body(job: &DgJob, paused: bool) -> Value {
+    json!({
+        "id": job.name,
+        "name": job.name,
+        "kind": "batch",
+        "status": if paused { "paused" } else { "ready" },
+        "owner": TENANT_OWNER.as_str(),
+        "source": Value::Null,
+        "target": Value::Null,
+        "schedule": schedule_label(job),
+        "lastRunAt": Value::Null,
+        "slaOk": Value::Null,
+        "freshnessLagSeconds": Value::Null,
+    })
 }
 
 /// `POST /api/pipelines/runs/{runId}/cancel` — terminate a running
@@ -674,6 +692,55 @@ mod tests {
         ];
         let last = last_run_for(&runs, "a").unwrap();
         assert_eq!(last.status, "SUCCESS");
+    }
+
+    #[test]
+    fn dagster_pipeline_rows_never_invent_freshness_sla_or_lineage() {
+        let never_run = DgJob {
+            name: "bronze_maintenance_job".to_owned(),
+            schedules: vec![],
+        };
+        let ran_job = DgJob {
+            name: "silver_orders".to_owned(),
+            schedules: vec![],
+        };
+        let last = run("silver_orders", "SUCCESS", Some(100.0), Some(160.0));
+
+        let never_run_row = dagster_pipeline_row(&never_run, None);
+        let ran_row = dagster_pipeline_row(&ran_job, Some(&last));
+
+        for row in [&never_run_row, &ran_row] {
+            assert!(row["freshnessLagSeconds"].is_null());
+            assert!(row["slaOk"].is_null());
+            assert!(row["source"].is_null());
+            assert!(row["target"].is_null());
+        }
+        assert!(
+            never_run_row["lastRunAt"].is_null(),
+            "a job with no run must not report a lastRunAt"
+        );
+        assert!(
+            ran_row["lastRunAt"].is_string(),
+            "a job with a real run keeps its real start time"
+        );
+    }
+
+    #[test]
+    fn schedule_mutation_body_reports_unknowns_as_null() {
+        let job = DgJob {
+            name: "j".to_owned(),
+            schedules: vec![],
+        };
+        let body = schedule_mutation_body(&job, true);
+        for key in [
+            "source",
+            "target",
+            "slaOk",
+            "freshnessLagSeconds",
+            "lastRunAt",
+        ] {
+            assert!(body[key].is_null(), "{key} must be null, got {}", body[key]);
+        }
     }
 
     #[test]

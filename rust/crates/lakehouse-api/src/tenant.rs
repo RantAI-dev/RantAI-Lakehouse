@@ -39,10 +39,6 @@ pub static TENANT_RESIDENCY: LazyLock<String> =
 /// Physical site the services run on.
 pub static TENANT_SITE: LazyLock<String> = LazyLock::new(|| env_or("TENANT_SITE", "Depok (187)"));
 
-/// Upstream system that feeds the ingestion pipelines.
-pub static TENANT_SOURCE: LazyLock<String> =
-    LazyLock::new(|| env_or("TENANT_SOURCE", "Satu Data Jakarta + berkas"));
-
 /// Dataset slugs whose Bronze registry entry counts as curated rather than raw.
 ///
 /// Comma-separated in `BRONZE_CURATED_SLUGS`.

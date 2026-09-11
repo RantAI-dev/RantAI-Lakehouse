@@ -39,13 +39,13 @@ const columns: ColumnDef<Pipeline>[] = [
   )},
   { key: "status", header: "Status", render: (r) => <StatusBadge status={r.status} /> },
   { key: "owner", header: "Owner", render: (r) => r.owner },
-  { key: "source", header: "Source", render: (r) => r.source },
-  { key: "target", header: "Target", render: (r) => r.target },
+  { key: "source", header: "Source", render: (r) => r.source ?? "—" },
+  { key: "target", header: "Target", render: (r) => r.target ?? "—" },
   { key: "schedule", header: "Schedule", render: (r) => r.schedule },
-  { key: "last", header: "Last run", render: (r) => formatRelativeTime(r.lastRunAt) },
+  { key: "last", header: "Last run", render: (r) => (r.lastRunAt === null ? "—" : formatRelativeTime(r.lastRunAt)) },
   { key: "next", header: "Next run", render: (r) => (r.nextRunAt ? formatRelativeTime(r.nextRunAt) : "—") },
   { key: "fresh", header: "Freshness", render: (r) => <FreshnessIndicator lagSeconds={r.freshnessLagSeconds} /> },
-  { key: "sla", header: "SLA", render: (r) => (r.slaOk ? "OK" : "Breached") },
+  { key: "sla", header: "SLA", render: (r) => (r.slaOk === null ? "—" : r.slaOk ? "OK" : "Breached") },
 ]
 
 export function PipelinesPage() {
@@ -67,8 +67,8 @@ export function PipelinesPage() {
       if (kind !== "all" && p.kind !== kind) return false
       if (status !== "all" && p.status !== status) return false
       if (!q) return true
-      return [p.name, p.source, p.target, p.owner].some((v) =>
-        v.toLowerCase().includes(q)
+      return [p.name, p.source, p.target, p.owner].some(
+        (v) => v !== null && v.toLowerCase().includes(q)
       )
     })
   }, [state.data, search, kind, status])

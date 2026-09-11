@@ -9,18 +9,23 @@ export type Pipeline = {
   kind: PipelineKind
   status: EntityStatus
   owner: string
-  source: string
-  target: string
+  /** Null for a Dagster job: no per-job lineage exists until WS4 reads the op graph. Authored pipelines keep their real user-entered source. */
+  source: string | null
+  /** Null for a Dagster job: same as `source`. Authored pipelines keep their real user-entered target. */
+  target: string | null
   /** Optional link to the ingress connector that feeds this pipeline. */
   connectorId?: string
   /** Catalog asset IDs for cross-navigation (mock → future API). */
   sourceAssetId?: string
   targetAssetId?: string
   schedule: string
-  lastRunAt: string
+  /** Null when the pipeline has never run — an authored draft always, a Dagster job until its first run. */
+  lastRunAt: string | null
   nextRunAt?: string
-  slaOk: boolean
-  freshnessLagSeconds: number
+  /** Null: no SLA is defined anywhere yet — WS5 adds `dataset_sla`. */
+  slaOk: boolean | null
+  /** Null until WS2 derives freshness from Iceberg snapshot timestamps. */
+  freshnessLagSeconds: Measured
 }
 
 export type PipelineRun = {

@@ -314,11 +314,11 @@ export function PipelineDetailPage() {
                 { label: "Schedule", value: <span className="font-mono text-xs">{p.schedule}</span> },
                 {
                   label: "Source",
-                  value: <AssetLink id={p.sourceAssetId} label={p.source} />,
+                  value: <AssetLink id={p.sourceAssetId} label={p.source ?? "—"} />,
                 },
                 {
                   label: "Target",
-                  value: <AssetLink id={p.targetAssetId} label={p.target} />,
+                  value: <AssetLink id={p.targetAssetId} label={p.target ?? "—"} />,
                 },
                 {
                   label: "Connector",
@@ -333,9 +333,9 @@ export function PipelineDetailPage() {
                     "—"
                   ),
                 },
-                { label: "Last run", value: formatRelativeTime(p.lastRunAt) },
+                { label: "Last run", value: p.lastRunAt === null ? "—" : formatRelativeTime(p.lastRunAt) },
                 { label: "Next run", value: p.nextRunAt ? formatRelativeTime(p.nextRunAt) : "—" },
-                { label: "SLA", value: p.slaOk ? "OK" : "Breached" },
+                { label: "SLA", value: p.slaOk === null ? "—" : p.slaOk ? "OK" : "Breached" },
                 { label: "Freshness", value: <FreshnessIndicator lagSeconds={p.freshnessLagSeconds} /> },
                 ...(p.configSummary ?? []).map((c) => ({
                   label: c.key,
