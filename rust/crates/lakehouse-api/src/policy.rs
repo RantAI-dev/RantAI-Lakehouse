@@ -269,6 +269,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // `tests/route_auth.rs::every_registered_route_has_a_policy_entry`.
     ("DELETE", "/api/connectors/{id}",      Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/connectors/{id}/test",   Policy::RequiresPermission("connector:manage")),
+    ("GET",  "/api/connectors/{id}/debezium-properties", Policy::RequiresPermission("connector:manage")),
 
     // ── Knowledge: no seeded resource — auth only. ───────────────────────
     ("GET",  "/api/knowledge/sources",       Policy::RequiresAuth),

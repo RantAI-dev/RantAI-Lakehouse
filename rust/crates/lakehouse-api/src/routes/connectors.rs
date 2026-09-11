@@ -24,7 +24,7 @@ use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::cdc::ConnectorSlug;
 use lakehouse_store::connectors::{self, ConnectorDetail, ConnectorDialInfo, CreateConnectorInput};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::connector_deprovision::{self, DeprovisionError, Deprovisioned, PgTarget};
 use crate::connector_probe;
@@ -256,6 +256,137 @@ pub async fn test_connection(
     }
 }
 
+/// `?table=` query for `GET /api/connectors/{id}/debezium-properties`.
+#[derive(Debug, Deserialize)]
+pub struct DebeziumPropertiesQuery {
+    /// Schema-qualified source table to capture, e.g. `"public.orders"`.
+    /// Required: no registry column stores which table a CDC connector
+    /// captures yet — WS3's `connector_ingest_spec` migration
+    /// (`dial`/`sourceObjects` JSONB) adds one. Until then this is a
+    /// required query parameter, not an oversight.
+    table: String,
+}
+
+/// The response body for `GET /api/connectors/{id}/debezium-properties`.
+/// `properties` contains ONLY `${ENV_VAR_NAME}` references for every
+/// credential-shaped field — never a resolved secret — see
+/// [`lakehouse_store::cdc::render_debezium_properties_template`]'s doc
+/// comment. Consumed by a future `ops/debezium/render_compose.py`
+/// (WS3), which is what actually expands the references when it
+/// generates a real `debezium-server` compose service; nothing in this
+/// handler or its caller resolves them.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebeziumPropertiesResponse {
+    /// The `.properties` file body, with `${ENV_VAR_NAME}` references
+    /// in place of every credential value.
+    properties: String,
+    /// The `table` query parameter this response was rendered for,
+    /// echoed back so a caller does not have to track it separately.
+    table: String,
+    /// A human-readable reminder of what `properties` is and is not —
+    /// present so this is self-documenting even if read outside this
+    /// handler's own doc comment.
+    note: String,
+}
+
+/// `GET /api/connectors/{id}/debezium-properties` — render the
+/// `debezium-server` `application.properties` TEMPLATE a `PostgreSQL`
+/// CDC connector would run with, using `${ENV_VAR_NAME}` references for
+/// every credential-shaped field. See
+/// [`lakehouse_store::cdc::render_debezium_properties_template`]'s doc
+/// comment for why this is a template, never a resolved config, and
+/// why that is a correctness requirement (a resolved config would
+/// expose the deployment's database password, S3 keys, and catalog
+/// token to any `connector:manage` principal) rather than a shortcut.
+///
+/// # Errors
+///
+/// 404 if `id` is unknown; 400 if the connector is not `PostgreSQL`-kind,
+/// its `host` is not shaped `"<user>@<host>:<port>/<database>"`, its
+/// `secretRef` is not an `env:`-scheme reference (this template can only
+/// name an env var, so a `vault:`-scheme or other reference cannot be
+/// rendered as one — an honest 400, not a guess), `table` is missing or
+/// blank, or any field fails `DebeziumSourceSpec`/
+/// `render_debezium_properties_template`'s validation; 503/500 as every
+/// other connector route.
+pub async fn debezium_properties(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<DebeziumPropertiesQuery>,
+) -> ApiResult<ApiJson<DebeziumPropertiesResponse>> {
+    let dial_info = connectors::get_connector_dial_info(pool(&state)?, &id).await?;
+    let Some(dial_info) = dial_info else {
+        return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
+    };
+    if !dial_info.kind.to_lowercase().contains("postgres") {
+        return Err(ApiError::BadRequest(format!(
+            "connector {id} is type {kind:?}, not PostgreSQL — Debezium properties only \
+             apply to a PostgreSQL CDC connector",
+            kind = dial_info.kind
+        ))
+        .into());
+    }
+    let table = query.table.trim();
+    if table.is_empty() {
+        return Err(ApiError::BadRequest("table query parameter is required".to_owned()).into());
+    }
+    let Some(target) = connector_probe::parse_postgres_host(&dial_info.host) else {
+        return Err(ApiError::BadRequest(format!(
+            "connector {id} is registered as PostgreSQL but its host is not shaped \
+             \"<user>@<host>:<port>/<database>\""
+        ))
+        .into());
+    };
+    let Some(database_password_ref) = dial_info.secret_ref.strip_prefix("env:") else {
+        return Err(ApiError::BadRequest(format!(
+            "connector {id}'s secretRef {:?} is not an env: reference; this template can \
+             only name an environment variable, not a vault: or other reference scheme",
+            dial_info.secret_ref
+        ))
+        .into());
+    };
+    let slug = connector_slug_for_id(&id)?;
+    let source = lakehouse_store::cdc::DebeziumSourceSpec::new(
+        slug,
+        target.host,
+        target.port,
+        target.database,
+        target.user,
+        table,
+    )
+    .map_err(|err| ApiError::BadRequest(format!("connector {id}'s fields are invalid: {err}")))?;
+
+    let sink = lakehouse_store::cdc::IcebergSinkLocation {
+        catalog_uri: &state.config.lakekeeper_catalog_uri,
+        warehouse: &state.config.lakekeeper_warehouse,
+        s3_endpoint: &state.config.rustfs_s3_endpoint,
+    };
+    // RUSTFS_ACCESS_KEY/RUSTFS_SECRET_KEY/LAKEKEEPER_TOKEN name the SAME
+    // deployment-wide Iceberg-sink env vars `docker-compose.yml`'s
+    // `debezium-server` heredoc already references — every CDC connector in
+    // this deployment writes to the one shared warehouse, unlike the
+    // source database password, which is per-connector.
+    let refs = lakehouse_store::cdc::DebeziumEnvRefs {
+        database_password_ref,
+        s3_access_key_ref: "RUSTFS_ACCESS_KEY",
+        s3_secret_key_ref: "RUSTFS_SECRET_KEY",
+        catalog_token_ref: Some("LAKEKEEPER_TOKEN"),
+    };
+    let properties = lakehouse_store::cdc::render_debezium_properties_template(
+        &source, &sink, &refs,
+    )
+    .map_err(|err| ApiError::BadRequest(format!("connector {id}'s fields are invalid: {err}")))?;
+
+    Ok(ApiJson(DebeziumPropertiesResponse {
+        properties,
+        table: table.to_owned(),
+        note: "values are ${ENV_VAR_NAME} references the deployment's own shell expands at \
+               container start — never a resolved secret"
+            .to_owned(),
+    }))
+}
+
 /// `?force=true` on `DELETE /api/connectors/{id}` — see [`delete`]'s doc
 /// comment for what this overrides and why it exists at all.
 #[derive(Debug, Default, Deserialize)]
@@ -480,6 +611,25 @@ mod tests {
             let body: Value = serde_json::from_slice(&bytes).unwrap();
             assert!(body.get("error").is_some(), "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn debezium_properties_route_is_registered() {
+        let app = crate::routes::router(state_without_pool());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/connectors/conn-x/debezium-properties?table=public.orders")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no pool -> 503, not 404"
+        );
     }
 
     #[test]

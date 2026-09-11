@@ -138,6 +138,19 @@ pub enum CdcSpecError {
         /// Which field was rejected (never the value itself — see above).
         field: &'static str,
     },
+
+    /// A [`DebeziumEnvRefs`] field was not a valid environment-variable
+    /// identifier. See [`validate_env_var_ref`].
+    #[error("{field} is not a valid environment-variable reference name: {value:?}")]
+    InvalidEnvVarReference {
+        /// Which field of [`DebeziumEnvRefs`] was invalid.
+        field: &'static str,
+        /// The rejected value, as given — safe to include: an env var
+        /// reference NAME is never a credential (same reasoning
+        /// [`InvalidConnectorSlug`](CdcSpecError::InvalidConnectorSlug)
+        /// states for a rejected slug).
+        value: String,
+    },
 }
 
 /// A connector identifier constrained to `^[a-z0-9][a-z0-9_]{0,62}$` —
@@ -446,6 +459,179 @@ pub fn render_debezium_properties(
         port = source.database_port,
         user = source.database_user,
         password = database_password.expose_secret(),
+        dbname = source.database_name,
+        table = source.schema_qualified_table,
+    ))
+}
+
+/// Validate that `value` is a plain environment-variable identifier
+/// (`^[A-Za-z_][A-Za-z0-9_]*$`) before [`render_debezium_properties_template`]
+/// places it inside a `${...}` wrapper.
+///
+/// A bare "no control characters" check (as [`reject_control_characters`]
+/// does for [`render_debezium_properties`]'s resolved secret values) is not
+/// enough here: a literal `}` is not a control character, but it closes the
+/// `${...}` wrapper early; a `$` could start a second, attacker-chosen
+/// expansion; and a `=` makes the reference look like a resolved
+/// `key=value` line rather than a reference name. This stricter,
+/// identifier-only shape is what actually rules those out.
+fn validate_env_var_ref(field: &'static str, value: &str) -> Result<(), CdcSpecError> {
+    let valid = value
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if valid {
+        Ok(())
+    } else {
+        Err(CdcSpecError::InvalidEnvVarReference {
+            field,
+            value: value.to_owned(),
+        })
+    }
+}
+
+/// The Iceberg sink's non-secret location fields — everything
+/// [`render_debezium_properties_template`] needs about WHERE the sink
+/// is, as opposed to [`DebeziumEnvRefs`], which says WHICH env vars hold
+/// its credentials. Deliberately a separate, smaller type from
+/// [`IcebergSinkSpec`]: that type carries `catalog_token:
+/// Option<SecretValue>`, a resolved credential this renderer must never
+/// accept even as a type it could construct and ignore.
+#[derive(Debug, Clone, Copy)]
+pub struct IcebergSinkLocation<'a> {
+    /// `Lakekeeper`'s REST catalog URI, e.g. `http://lakekeeper:8181/catalog`.
+    pub catalog_uri: &'a str,
+    /// The `Lakekeeper` warehouse name.
+    pub warehouse: &'a str,
+    /// The S3-compatible endpoint backing that warehouse.
+    pub s3_endpoint: &'a str,
+}
+
+/// Environment-variable reference NAMES (never values) for the
+/// credentials [`render_debezium_properties_template`]'s output refers
+/// to — exactly the shape `docker-compose.yml`'s `debezium-server`
+/// heredoc already uses today
+/// (`debezium.source.database.password=$${POSTGRES_PASSWORD}`,
+/// `debezium.sink.iceberg.s3.access-key-id=$${RUSTFS_ACCESS_KEY}`,
+/// `debezium.sink.iceberg.s3.secret-access-key=$${RUSTFS_SECRET_KEY}`,
+/// `debezium.sink.iceberg.token=$${LAKEKEEPER_TOKEN}`) — the deployment's
+/// own shell expands `${NAME}` into the real value when the
+/// `debezium-server` container actually starts; nothing in this crate or
+/// its caller ever resolves it.
+#[derive(Debug, Clone, Copy)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the shared `_ref` postfix is deliberate, not accidental duplication: it is what \
+              distinguishes every field here from a resolved SecretValue field of the same base \
+              name elsewhere in this module (e.g. IcebergSinkSpec::catalog_token), which is the \
+              exact confusion this type exists to make impossible to introduce by accident"
+)]
+pub struct DebeziumEnvRefs<'a> {
+    /// Env var name holding the source database password, e.g.
+    /// `"CONNECTOR_PG_PASSWORD"` — derived by the caller from the
+    /// connector's own `secretRef` (see `routes::connectors::debezium_properties`),
+    /// not hardcoded, since a real connector's credential need not be
+    /// named the same as the checked-in demo's.
+    pub database_password_ref: &'a str,
+    /// Env var name holding the Iceberg sink's S3 access key, e.g.
+    /// `"RUSTFS_ACCESS_KEY"` — shared across every CDC connector in this
+    /// deployment (the sink is one warehouse), unlike
+    /// `database_password_ref`.
+    pub s3_access_key_ref: &'a str,
+    /// Env var name holding the Iceberg sink's S3 secret key.
+    pub s3_secret_key_ref: &'a str,
+    /// Env var name holding the `Lakekeeper` catalog token, or `None`
+    /// when this deployment's `Lakekeeper` enforces no authorization
+    /// (mirrors [`IcebergSinkSpec::catalog_token`]'s own `None` case).
+    pub catalog_token_ref: Option<&'a str>,
+}
+
+/// Render the `debezium-server` `application.properties` TEMPLATE a
+/// `PostgreSQL` CDC connector would run with — credential fields are
+/// `${ENV_VAR_NAME}` references the deployment's own shell expands at
+/// container start, never a resolved value. This is the function
+/// `routes::connectors::debezium_properties` calls; it is deliberately
+/// NOT [`render_debezium_properties`] (see this module's "Callers"
+/// section) — that function still exists, unchanged, for whatever
+/// eventually renders a REAL running config server-side, with real
+/// resolved [`SecretValue`]s, never over this HTTP route.
+///
+/// # Errors
+///
+/// Returns [`CdcSpecError::InvalidEnvVarReference`] if any of `refs`'s
+/// fields is not a valid environment-variable identifier
+/// (`^[A-Za-z_][A-Za-z0-9_]*$`) — see [`validate_env_var_ref`] for why
+/// this is checked here rather than left to
+/// [`reject_control_characters`]'s weaker guarantee.
+#[must_use = "this only builds a properties template; the caller must still return/deliver it"]
+pub fn render_debezium_properties_template(
+    source: &DebeziumSourceSpec,
+    sink: &IcebergSinkLocation<'_>,
+    refs: &DebeziumEnvRefs<'_>,
+) -> Result<String, CdcSpecError> {
+    validate_env_var_ref("database_password_ref", refs.database_password_ref)?;
+    validate_env_var_ref("s3_access_key_ref", refs.s3_access_key_ref)?;
+    validate_env_var_ref("s3_secret_key_ref", refs.s3_secret_key_ref)?;
+    if let Some(catalog_token_ref) = refs.catalog_token_ref {
+        validate_env_var_ref("catalog_token_ref", catalog_token_ref)?;
+    }
+
+    let slug = source.connector_slug.as_str();
+    let token_line = refs
+        .catalog_token_ref
+        .map(|name| format!("debezium.sink.iceberg.token=${{{name}}}\n"))
+        .unwrap_or_default();
+    let schema = source
+        .schema_qualified_table
+        .split_once('.')
+        .map_or(source.schema_qualified_table.as_str(), |(schema, _)| schema);
+
+    Ok(format!(
+        "debezium.sink.type=iceberg\n\
+         debezium.sink.iceberg.catalog-name=lakekeeper\n\
+         debezium.sink.iceberg.type=rest\n\
+         debezium.sink.iceberg.uri={catalog_uri}\n\
+         debezium.sink.iceberg.warehouse={warehouse}\n\
+         {token_line}\
+         debezium.sink.iceberg.io-impl=org.apache.iceberg.aws.s3.S3FileIO\n\
+         debezium.sink.iceberg.s3.endpoint={s3_endpoint}\n\
+         debezium.sink.iceberg.s3.path-style-access=true\n\
+         debezium.sink.iceberg.s3.access-key-id=${{{s3_access_key_ref}}}\n\
+         debezium.sink.iceberg.s3.secret-access-key=${{{s3_secret_key_ref}}}\n\
+         debezium.sink.iceberg.client.region=us-east-1\n\
+         debezium.sink.iceberg.upsert=true\n\
+         debezium.sink.iceberg.upsert-keep-deletes=true\n\
+         debezium.sink.iceberg.destination-uppercase-table-names=false\n\
+         debezium.sink.iceberg.write.format.default=parquet\n\
+         \n\
+         debezium.source.connector.class=io.debezium.connector.postgresql.PostgresConnector\n\
+         debezium.source.offset.storage=org.apache.kafka.connect.storage.FileOffsetBackingStore\n\
+         debezium.source.offset.storage.file.filename=/debezium/data/{slug}-offsets.dat\n\
+         debezium.source.offset.flush.interval.ms=0\n\
+         debezium.source.database.hostname={hostname}\n\
+         debezium.source.database.port={port}\n\
+         debezium.source.database.user={user}\n\
+         debezium.source.database.password=${{{database_password_ref}}}\n\
+         debezium.source.database.dbname={dbname}\n\
+         debezium.source.topic.prefix={slug}\n\
+         debezium.source.schema.include.list={schema}\n\
+         debezium.source.table.include.list={table}\n\
+         debezium.source.plugin.name=pgoutput\n\
+         debezium.source.slot.name={slug}_slot\n\
+         debezium.source.publication.name={slug}_pub\n\
+         debezium.source.publication.autocreate.mode=disabled\n\
+         debezium.source.schema.history.internal=io.debezium.storage.file.history.FileSchemaHistory\n\
+         debezium.source.schema.history.internal.file.filename=/debezium/data/{slug}-schema-history.dat\n",
+        catalog_uri = sink.catalog_uri,
+        warehouse = sink.warehouse,
+        s3_endpoint = sink.s3_endpoint,
+        s3_access_key_ref = refs.s3_access_key_ref,
+        s3_secret_key_ref = refs.s3_secret_key_ref,
+        hostname = source.database_hostname,
+        port = source.database_port,
+        user = source.database_user,
+        database_password_ref = refs.database_password_ref,
         dbname = source.database_name,
         table = source.schema_qualified_table,
     ))
@@ -850,5 +1036,103 @@ mod tests {
              docker-compose.yml demo connector config — update whichever \
              one is now wrong"
         );
+    }
+
+    // ---- render_debezium_properties_template ----
+
+    #[test]
+    fn template_renders_env_var_references_never_a_resolved_value() {
+        let source = DebeziumSourceSpec::new(
+            ConnectorSlug::new("orders_pg").unwrap(),
+            "pg.internal",
+            5432,
+            "oms",
+            "cdc_reader",
+            "public.orders",
+        )
+        .unwrap();
+        let sink = IcebergSinkLocation {
+            catalog_uri: "http://lakekeeper:8181/catalog",
+            warehouse: "default",
+            s3_endpoint: "http://rustfs:9000",
+        };
+        let refs = DebeziumEnvRefs {
+            database_password_ref: "CONNECTOR_PG_PASSWORD",
+            s3_access_key_ref: "RUSTFS_ACCESS_KEY",
+            s3_secret_key_ref: "RUSTFS_SECRET_KEY",
+            catalog_token_ref: Some("LAKEKEEPER_TOKEN"),
+        };
+        let rendered = render_debezium_properties_template(&source, &sink, &refs).unwrap();
+
+        assert!(rendered.contains("debezium.source.database.password=${CONNECTOR_PG_PASSWORD}"));
+        assert!(rendered.contains("debezium.sink.iceberg.s3.access-key-id=${RUSTFS_ACCESS_KEY}"));
+        assert!(
+            rendered.contains("debezium.sink.iceberg.s3.secret-access-key=${RUSTFS_SECRET_KEY}")
+        );
+        assert!(rendered.contains("debezium.sink.iceberg.token=${LAKEKEEPER_TOKEN}"));
+        assert!(rendered.contains("debezium.source.slot.name=orders_pg_slot"));
+        assert!(rendered.contains("debezium.source.publication.name=orders_pg_pub"));
+        // The whole point: no `${...}`-wrapped literal ever looks like a
+        // resolved secret, and this function's signature makes it
+        // impossible to pass one in — there is no SecretValue parameter to
+        // misuse.
+        assert!(!rendered.contains("hunter2"));
+    }
+
+    #[test]
+    fn template_rejects_a_reference_name_shaped_like_an_injection_attempt() {
+        let source = DebeziumSourceSpec::new(
+            ConnectorSlug::new("orders_pg").unwrap(),
+            "pg.internal",
+            5432,
+            "oms",
+            "cdc_reader",
+            "public.orders",
+        )
+        .unwrap();
+        let sink = IcebergSinkLocation {
+            catalog_uri: "http://lakekeeper:8181/catalog",
+            warehouse: "default",
+            s3_endpoint: "http://rustfs:9000",
+        };
+        let refs = DebeziumEnvRefs {
+            database_password_ref: "EVIL}\ndebezium.source.slot.name=evil_slot",
+            s3_access_key_ref: "RUSTFS_ACCESS_KEY",
+            s3_secret_key_ref: "RUSTFS_SECRET_KEY",
+            catalog_token_ref: None,
+        };
+        let err = render_debezium_properties_template(&source, &sink, &refs).unwrap_err();
+        assert!(matches!(err, CdcSpecError::InvalidEnvVarReference { .. }));
+    }
+
+    /// A direct, pure unit test of `validate_env_var_ref` itself — not
+    /// just the one composite case above — proving it rejects every
+    /// character that could either make a
+    /// value LOOK like a resolved secret rather than a reference name (`=`,
+    /// matching a `key=value` `.properties` line shape) or break out of the
+    /// `${...}` wrapper / inject an extra property line (newline, `$`,
+    /// `}`). This is a pure function test: no HTTP, no process environment,
+    /// nothing to mutate or race on — it proves the type-level guarantee
+    /// directly, which is what actually stops a secret VALUE from ever
+    /// reaching this renderer (there is no `SecretValue` parameter to
+    /// misuse in the first place; this test is about injection into the
+    /// template's own syntax, not about secret leakage, which the
+    /// function's signature already makes impossible).
+    #[test]
+    fn validate_env_var_ref_rejects_every_dangerous_character() {
+        for bad in [
+            "PASSWORD=hunter2", // '=' — looks like a resolved key=value line
+            "PASSWORD\nEVIL=1", // newline — property-injection shape
+            "PASSWORD$",        // '$' — could start a second ${...} expansion
+            "PASSWORD}",        // '}' — closes the wrapper early
+        ] {
+            let err = validate_env_var_ref("test_field", bad).unwrap_err();
+            assert!(
+                matches!(err, CdcSpecError::InvalidEnvVarReference { .. }),
+                "{bad:?} must be rejected"
+            );
+        }
+        // The positive case: a plain identifier is accepted.
+        assert!(validate_env_var_ref("test_field", "RUSTFS_ACCESS_KEY").is_ok());
     }
 }

@@ -181,6 +181,10 @@ fn connectors_router() -> Router<AppState> {
             "/api/connectors/{id}/test",
             axum::routing::post(connectors::test_connection),
         )
+        .route(
+            "/api/connectors/{id}/debezium-properties",
+            get(connectors::debezium_properties),
+        )
 }
 
 /// The `/api/identity/*` sub-router (Phase 2 identity domain), split out
