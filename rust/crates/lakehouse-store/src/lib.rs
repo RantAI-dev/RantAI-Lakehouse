@@ -36,6 +36,7 @@ pub mod error;
 pub mod governance;
 pub mod identity;
 pub mod knowledge;
+pub mod maintenance_policy;
 pub mod overview;
 pub mod pipelines;
 pub mod queries;
