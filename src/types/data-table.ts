@@ -9,6 +9,7 @@ declare module "@tanstack/react-table" {
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   interface TableMeta<TData extends RowData> {
     queryKeys?: QueryKeys;
+    persistKey?: string;
     /** Column order, pinning and visibility back to the page's defaults. */
     resetLayout?: () => void;
     /** Active server-side group column id, if any. */

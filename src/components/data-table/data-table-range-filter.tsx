@@ -17,6 +17,68 @@ interface DataTableRangeFilterProps<TData> extends React.ComponentProps<"div"> {
   ) => void;
 }
 
+function RangeNumberInput({
+  id,
+  ariaLabel,
+  ariaValuemin,
+  ariaValuemax,
+  dataSlot,
+  placeholder,
+  min,
+  max,
+  className,
+  value: externalValue,
+  onChange,
+}: {
+  id: string;
+  ariaLabel?: string;
+  ariaValuemin?: number;
+  ariaValuemax?: number;
+  dataSlot?: string;
+  placeholder?: string;
+  min?: number;
+  max?: number;
+  className?: string;
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  const [localValue, setLocalValue] = React.useState(externalValue);
+  const pushedRef = React.useRef(externalValue);
+
+  React.useEffect(() => {
+    if (externalValue !== pushedRef.current) {
+      pushedRef.current = externalValue;
+      setLocalValue(externalValue);
+    }
+  }, [externalValue]);
+
+  const handleChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const next = event.target.value;
+    setLocalValue(next);
+    pushedRef.current = next;
+    onChange(next);
+  };
+
+  return (
+    <Input
+      id={id}
+      type="number"
+      aria-label={ariaLabel}
+      aria-valuemin={ariaValuemin}
+      aria-valuemax={ariaValuemax}
+      data-slot={dataSlot}
+      data-filter-value=""
+      inputMode="numeric"
+      placeholder={placeholder}
+      min={min}
+      max={max}
+      className={className}
+      value={localValue}
+      onChange={handleChange}
+    />
+  );
+}
+
 export function DataTableRangeFilter<TData>({
   filter,
   column,
@@ -41,11 +103,7 @@ export function DataTableRangeFilter<TData>({
     (value: string | number | undefined) => {
       if (value === undefined || value === "") return "";
       const numValue = Number(value);
-      return Number.isNaN(numValue)
-        ? ""
-        : numValue.toLocaleString(undefined, {
-            maximumFractionDigits: 0,
-          });
+      return Number.isNaN(numValue) ? "" : String(numValue);
     },
     [],
   );
@@ -86,37 +144,32 @@ export function DataTableRangeFilter<TData>({
       className={cn("flex w-full items-center gap-2", className)}
       {...props}
     >
-      <Input
+      <RangeNumberInput
         id={`${inputId}-min`}
-        type="number"
-        aria-label={`${meta?.label} minimum value`}
-        aria-valuemin={min}
-        aria-valuemax={max}
-        data-slot="range-min"
-        data-filter-value=""
-        inputMode="numeric"
+        ariaLabel={`${meta?.label} minimum value`}
+        ariaValuemin={min}
+        ariaValuemax={max}
+        dataSlot="range-min"
         placeholder={min.toString()}
         min={min}
         max={max}
         className="h-8 w-full rounded"
-        defaultValue={value[0]}
-        onChange={(event) => onRangeValueChange(event.target.value, true)}
+        value={value[0] ?? ""}
+        onChange={(val) => onRangeValueChange(val, true)}
       />
       <span className="sr-only shrink-0 text-muted-foreground">to</span>
-      <Input
+      <RangeNumberInput
         id={`${inputId}-max`}
-        type="number"
-        aria-label={`${meta?.label} maximum value`}
-        aria-valuemin={min}
-        aria-valuemax={max}
-        data-slot="range-max"
-        inputMode="numeric"
+        ariaLabel={`${meta?.label} maximum value`}
+        ariaValuemin={min}
+        ariaValuemax={max}
+        dataSlot="range-max"
         placeholder={max.toString()}
         min={min}
         max={max}
         className="h-8 w-full rounded"
-        defaultValue={value[1]}
-        onChange={(event) => onRangeValueChange(event.target.value)}
+        value={value[1] ?? ""}
+        onChange={(val) => onRangeValueChange(val)}
       />
     </div>
   );

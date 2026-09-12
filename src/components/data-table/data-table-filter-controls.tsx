@@ -353,6 +353,71 @@ export function DataTableFilterItem<TData>({
   );
 }
 
+function DataTableTextFilterInput({
+  id,
+  type,
+  ariaLabel,
+  ariaDescribedby,
+  inputMode,
+  placeholder,
+  className,
+  value: externalValue,
+  onChange,
+}: {
+  id: string;
+  type: string;
+  ariaLabel?: string;
+  ariaDescribedby?: string;
+  inputMode?: React.HTMLAttributes<HTMLInputElement>["inputMode"];
+  placeholder?: string;
+  className?: string;
+  value: unknown;
+  onChange: (value: string) => void;
+}) {
+  const initialValue =
+    typeof externalValue === "string" || typeof externalValue === "number"
+      ? String(externalValue)
+      : "";
+  const [localValue, setLocalValue] = React.useState(initialValue);
+  const pushedRef = React.useRef(initialValue);
+
+  React.useEffect(() => {
+    const nextVal =
+      typeof externalValue === "string" || typeof externalValue === "number"
+        ? String(externalValue)
+        : "";
+    if (nextVal !== pushedRef.current) {
+      pushedRef.current = nextVal;
+      setLocalValue(nextVal);
+    }
+  }, [externalValue]);
+
+  const handleChange = React.useCallback(
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      const next = event.target.value;
+      setLocalValue(next);
+      pushedRef.current = next;
+      onChange(next);
+    },
+    [onChange]
+  );
+
+  return (
+    <Input
+      id={id}
+      type={type}
+      aria-label={ariaLabel}
+      aria-describedby={ariaDescribedby}
+      inputMode={inputMode}
+      placeholder={placeholder}
+      className={className}
+      data-filter-value=""
+      value={localValue}
+      onChange={handleChange}
+    />
+  );
+}
+
 export function DataTableFilterValueInput<TData>({
   filter,
   inputId,
@@ -409,21 +474,19 @@ export function DataTableFilterValueInput<TData>({
         filter.variant === "number" || filter.variant === "range";
 
       return (
-        <Input
+        <DataTableTextFilterInput
+          key={filter.filterId}
           id={inputId}
           type={isNumber ? "number" : filter.variant}
-          aria-label={`${columnMeta?.label} filter value`}
-          aria-describedby={`${inputId}-description`}
+          ariaLabel={`${columnMeta?.label} filter value`}
+          ariaDescribedby={`${inputId}-description`}
           inputMode={isNumber ? "numeric" : undefined}
           placeholder={columnMeta?.placeholder ?? "Enter a value..."}
           className="h-7 w-full rounded-md"
-          data-filter-value=""
-          defaultValue={
-            typeof filter.value === "string" ? filter.value : undefined
-          }
-          onChange={(event) =>
+          value={filter.value}
+          onChange={(value) =>
             onFilterUpdate(filter.filterId, {
-              value: event.target.value,
+              value,
             })
           }
         />

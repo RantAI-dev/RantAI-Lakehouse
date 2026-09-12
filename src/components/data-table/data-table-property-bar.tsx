@@ -119,6 +119,7 @@ export function DataTablePropertyBar<TData>({
           debounceMs={debounceMs}
           throttleMs={throttleMs}
           openFilterId={openFilterId}
+          onOpenFilterIdChange={setOpenFilterId}
           forceAdvanced={advancedFilterMode}
         />
       ) : null}

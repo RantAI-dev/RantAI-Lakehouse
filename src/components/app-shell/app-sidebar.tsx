@@ -4,9 +4,10 @@ import * as React from "react"
 import { createPortal } from "react-dom"
 import Image from "next/image"
 import Link from "next/link"
-import { usePathname } from "next/navigation"
+import { usePathname, useRouter } from "next/navigation"
 import { CircleUserRound, ChevronRight } from "lucide-react"
 import { useAuth } from "@/features/auth/auth-provider"
+import { rememberTableHref } from "@/hooks/use-table-memory"
 import {
   Sidebar,
   SidebarContent,
@@ -53,6 +54,7 @@ type FlyoutState = { label: string; top: number; left: number } | null
  * "Soon" (lihat `comingSoon` di nav-config), bukan disembunyikan.
  */
 export function AppSidebar() {
+  const router = useRouter()
   const pathname = usePathname()
   const activeHref = activeNavHref(pathname)
   const groups = visibleNavGroups()
@@ -72,6 +74,18 @@ export function AppSidebar() {
   const flyoutRef = React.useRef<HTMLDivElement>(null)
   const [mounted, setMounted] = React.useState(false)
   React.useEffect(() => setMounted(true), [])
+
+  const handleNavClick = React.useCallback(
+    (e: React.MouseEvent<HTMLAnchorElement>, href: string) => {
+      setFlyout(null)
+      const target = rememberTableHref(href)
+      if (target !== href) {
+        e.preventDefault()
+        router.push(target)
+      }
+    },
+    [router]
+  )
   React.useEffect(() => setFlyout(null), [pathname])
   React.useEffect(() => { if (!iconMode) setFlyout(null) }, [iconMode])
 
@@ -118,7 +132,7 @@ export function AppSidebar() {
     return (
       <Link
         href={item.href}
-        onClick={() => setFlyout(null)}
+        onClick={(e) => handleNavClick(e, item.href)}
         className={cn(
           "flex items-center gap-2 rounded-md px-2.5 py-1.5 text-sm text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
           active && "bg-sidebar-accent font-medium text-sidebar-primary shadow-sm ring-1 ring-sidebar-border",
@@ -178,7 +192,7 @@ export function AppSidebar() {
             tooltip={label}
             className={menuBtnClass(active)}
             render={
-              <Link href={first.href}>
+              <Link href={first.href} onClick={(e) => handleNavClick(e, first.href)}>
                 <Icon className="size-4 shrink-0" />
                 <span className="truncate leading-5">{label}</span>
               </Link>

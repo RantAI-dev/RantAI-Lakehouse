@@ -56,6 +56,9 @@ export function clearTableMemory(persistKey: string) {
   const storageKey = getTableMemoryStorageKey(persistKey);
   localStorage.removeItem(storageKey);
   clearListeners.get(storageKey)?.forEach((listener) => listener());
+  try {
+    localStorage.removeItem(`app:table-property-bar:${persistKey}`);
+  } catch {}
 }
 
 function subscribeTableMemoryClear(storageKey: string, listener: ClearListener) {

@@ -2,7 +2,7 @@
 
 import type { Column, Table } from "@tanstack/react-table";
 import { ListFilter, Plus } from "lucide-react";
-import { useSearchParams } from "next/navigation";
+import { usePathname, useSearchParams } from "next/navigation";
 import * as React from "react";
 
 import { DEFAULT_QUERY_KEYS } from "@/components/data-table/data-table-query-keys";
@@ -31,19 +31,19 @@ import { useDataTableFilters } from "@/hooks/use-data-table-filters";
 import { cn } from "@/lib/utils";
 
 interface DataTablePropertyBarToggleProps<TData> {
-  table: Table<TData>;
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  disabled?: boolean;
-  shallow?: boolean;
-  debounceMs?: number;
-  throttleMs?: number;
+  readonly table: Table<TData>;
+  readonly open: boolean;
+  readonly onOpenChange: (open: boolean) => void;
+  readonly disabled?: boolean;
+  readonly shallow?: boolean;
+  readonly debounceMs?: number;
+  readonly throttleMs?: number;
   /** Page-specific entries in the "Filter by..." picker. */
-  menuExtras?: React.ReactNode;
+  readonly menuExtras?: React.ReactNode;
   /** Called after a column filter is created from the empty-state picker. */
-  onFilterCreated?: (filterId: string) => void;
+  readonly onFilterCreated?: (filterId: string) => void;
   /** Called when the user chooses "Add advanced filter". */
-  onAdvancedFilterStart?: () => void;
+  readonly onAdvancedFilterStart?: () => void;
 }
 
 export function DataTablePropertyBarToggle<TData>({
@@ -57,7 +57,7 @@ export function DataTablePropertyBarToggle<TData>({
   menuExtras,
   onFilterCreated,
   onAdvancedFilterStart,
-}: DataTablePropertyBarToggleProps<TData>) {
+}: Readonly<DataTablePropertyBarToggleProps<TData>>) {
   const [pickerOpen, setPickerOpen] = React.useState(false);
   const openedBarForPickerRef = React.useRef(false);
 
@@ -108,17 +108,19 @@ export function DataTablePropertyBarToggle<TData>({
 
   const handleButtonClick = React.useCallback(() => {
     if (!hasActiveFilters) {
-      if (!open) {
-        openedBarForPickerRef.current = true;
-        onOpenChange(true);
-      } else {
+      if (open || pickerOpen) {
         openedBarForPickerRef.current = false;
+        setPickerOpen(false);
+        onOpenChange(false);
+        return;
       }
+      openedBarForPickerRef.current = true;
+      onOpenChange(true);
       setPickerOpen(true);
       return;
     }
     onOpenChange(!open);
-  }, [hasActiveFilters, onOpenChange, open]);
+  }, [hasActiveFilters, onOpenChange, open, pickerOpen]);
 
   const button = (
     <Button
@@ -211,13 +213,61 @@ export function DataTablePropertyBarToggle<TData>({
   );
 }
 
+const PROPERTY_BAR_STORAGE_PREFIX = "app:table-property-bar:";
+
+export function getPropertyBarStorageKey(persistKey: string) {
+  return `${PROPERTY_BAR_STORAGE_PREFIX}${persistKey}`;
+}
+
+const propertyBarListeners = new Map<string, Set<() => void>>();
+
+function emitPropertyBarChange(storageKey: string) {
+  propertyBarListeners.get(storageKey)?.forEach((listener) => listener());
+}
+
+function subscribePropertyBar(storageKey: string, listener: () => void) {
+  let set = propertyBarListeners.get(storageKey);
+  if (!set) {
+    set = new Set();
+    propertyBarListeners.set(storageKey, set);
+  }
+  set.add(listener);
+
+  const handleStorage = (event: StorageEvent) => {
+    if (event.key === storageKey) {
+      listener();
+    }
+  };
+  window.addEventListener("storage", handleStorage);
+
+  return () => {
+    set!.delete(listener);
+    if (set!.size === 0) {
+      propertyBarListeners.delete(storageKey);
+    }
+    window.removeEventListener("storage", handleStorage);
+  };
+}
+
+function readStoredDismissed(storageKey: string): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return localStorage.getItem(storageKey);
+  } catch {
+    return null;
+  }
+}
+
 export function usePropertyBarOpenState<TData>(
   table: Table<TData>,
   /** Extra URL keys that should open the bar on load (e.g. page-specific filters). */
   openWhenKeys: string[] = []
 ) {
+  const pathname = usePathname();
   const searchParams = useSearchParams();
   const keys = table.options.meta?.queryKeys ?? DEFAULT_QUERY_KEYS;
+  const persistKey = table.options.meta?.persistKey ?? pathname;
+  const storageKey = getPropertyBarStorageKey(persistKey);
 
   const ruleSignature = React.useMemo(
     () =>
@@ -231,12 +281,21 @@ export function usePropertyBarOpenState<TData>(
 
   const hasActiveRules = ruleSignature.replace(/\0/g, "").length > 0;
 
-  const [manualOpen, setManualOpen] = React.useState(false);
-  const [dismissedFor, setDismissedFor] = React.useState<string | null>(null);
+  const storedDismissed = React.useSyncExternalStore(
+    React.useCallback(
+      (onStoreChange) => subscribePropertyBar(storageKey, onStoreChange),
+      [storageKey]
+    ),
+    () => readStoredDismissed(storageKey),
+    () => null
+  );
 
-  // Opening the bar while filters/sort are active only flips `dismissedFor`, so
-  // `manualOpen` can stay true from an earlier empty-bar open. When rules clear,
-  // fall back to `manualOpen` — reset it so the bar collapses instead of sticking.
+  const [manualOpen, setManualOpen] = React.useState(false);
+
+  // When rules clear, reset manualOpen so the bar doesn't stick open if it was
+  // previously opened without active rules. We do NOT clear storedDismissed here
+  // because page navigation/mount momentarily has no active rules before URL
+  // params hydrate/restore, which would race and wipe the user's collapsed state.
   React.useEffect(() => {
     if (!hasActiveRules) {
       setManualOpen(false);
@@ -244,18 +303,25 @@ export function usePropertyBarOpenState<TData>(
   }, [hasActiveRules]);
 
   const open = hasActiveRules
-    ? dismissedFor !== ruleSignature
+    ? storedDismissed !== ruleSignature
     : manualOpen;
 
   const setOpen = React.useCallback(
     (next: boolean) => {
       if (hasActiveRules) {
-        setDismissedFor(next ? null : ruleSignature);
+        try {
+          if (next) {
+            localStorage.removeItem(storageKey);
+          } else {
+            localStorage.setItem(storageKey, ruleSignature);
+          }
+          emitPropertyBarChange(storageKey);
+        } catch {}
         return;
       }
       setManualOpen(next);
     },
-    [hasActiveRules, ruleSignature]
+    [hasActiveRules, ruleSignature, storageKey]
   );
 
   return [open, setOpen] as const;

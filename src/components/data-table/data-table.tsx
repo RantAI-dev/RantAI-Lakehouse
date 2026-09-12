@@ -357,7 +357,7 @@ function DataTableDataRow<TData>({
       <ContextMenuTrigger asChild className="select-text">
         {rowNode}
       </ContextMenuTrigger>
-      <ContextMenuContent>
+      <ContextMenuContent className="w-48">
         {renderRowContextMenu(row.original)}
       </ContextMenuContent>
     </ContextMenu>

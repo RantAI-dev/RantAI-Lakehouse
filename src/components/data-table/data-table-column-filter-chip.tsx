@@ -178,6 +178,7 @@ interface DataTableColumnFilterChipsProps<TData> {
   throttleMs?: number;
   /** filterId to open editor on first render (e.g. just added from picker). */
   openFilterId?: string | null;
+  onOpenFilterIdChange?: (filterId: string | null) => void;
   /**
    * Notion-style "N rules" summary chip — only when entered via
    * "Add advanced filter", not for ordinary multi-column chips.
@@ -196,8 +197,15 @@ export function DataTableColumnFilterChips<TData>({
   debounceMs,
   throttleMs,
   openFilterId,
+  onOpenFilterIdChange,
   forceAdvanced = false,
 }: DataTableColumnFilterChipsProps<TData>) {
+  React.useEffect(() => {
+    if (openFilterId) {
+      onOpenFilterIdChange?.(null);
+    }
+  }, [openFilterId, onOpenFilterIdChange]);
+
   if (forceAdvanced) {
     return (
       <DataTableAdvancedFilterRulesChip

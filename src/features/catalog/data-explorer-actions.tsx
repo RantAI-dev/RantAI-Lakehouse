@@ -108,6 +108,7 @@ export function AssetRowActions({
       </DropdownMenuTrigger>
       <DropdownMenuContent
         align="end"
+        className="w-48"
         // Same reason as the trigger: selecting an item must not bubble up
         // into the row's click handler.
         onClick={(event) => event.stopPropagation()}

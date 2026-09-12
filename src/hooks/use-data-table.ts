@@ -395,11 +395,14 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
     return Object.entries(filterValues).reduce<ColumnFiltersState>(
       (filters, [key, value]) => {
         if (value !== null) {
-          const processedValue = Array.isArray(value)
-            ? value
-            : typeof value === "string" && /[^a-zA-Z0-9]/.test(value)
-              ? value.split(/[^a-zA-Z0-9]+/).filter(Boolean)
-              : [value];
+          let processedValue: string[];
+          if (Array.isArray(value)) {
+            processedValue = value;
+          } else if (typeof value === "string" && /[^a-zA-Z0-9]/.test(value)) {
+            processedValue = value.split(/[^a-zA-Z0-9]+/).filter(Boolean);
+          } else {
+            processedValue = [value];
+          }
 
           filters.push({
             id: key,
@@ -428,7 +431,7 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
         const filterUpdates = next.reduce<
           Record<string, string | string[] | null>
         >((acc, filter) => {
-          if (filterableColumns.find((column) => column.id === filter.id)) {
+          if (filterableColumns.some((column) => column.id === filter.id)) {
             acc[filter.id] = filter.value as string | string[];
           }
           return acc;
@@ -488,6 +491,7 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
     manualFiltering: true,
     meta: {
       ...tableProps.meta,
+      persistKey,
       resetLayout,
       queryKeys: tableKeys,
       groupBy: groupBy ?? null,

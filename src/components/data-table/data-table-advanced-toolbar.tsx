@@ -66,6 +66,14 @@ export function DataTableAdvancedToolbar<TData>({
   const [openFilterId, setOpenFilterId] = React.useState<string | null>(null);
   const [advancedFilterMode, setAdvancedFilterMode] = React.useState(false);
 
+  const handlePropertyBarOpenChange = React.useCallback(
+    (next: boolean) => {
+      setPropertyBarOpen(next);
+      setOpenFilterId(null);
+    },
+    [setPropertyBarOpen]
+  );
+
   return (
     // The search box writes the table's params but never sees the table, so
     // its names reach it from here.
@@ -88,13 +96,13 @@ export function DataTableAdvancedToolbar<TData>({
               {children}
               <DataTableSortButton
                 propertyBarOpen={propertyBarOpen}
-                onPropertyBarOpenChange={setPropertyBarOpen}
+                onPropertyBarOpenChange={handlePropertyBarOpenChange}
               />
               {!hidePropertyBar ? (
                 <DataTablePropertyBarToggle
                   table={table}
                   open={propertyBarOpen}
-                  onOpenChange={setPropertyBarOpen}
+                  onOpenChange={handlePropertyBarOpenChange}
                   shallow={shallow}
                   debounceMs={debounceMs}
                   throttleMs={throttleMs}

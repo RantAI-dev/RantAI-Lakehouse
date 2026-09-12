@@ -356,17 +356,19 @@ export function DataTableSortButton<TData>({
 
   const handleButtonClick = React.useCallback(() => {
     if (!hasSorting) {
-      if (!propertyBarOpen) {
-        openedBarForPickerRef.current = true;
-        onPropertyBarOpenChange(true);
-      } else {
+      if (propertyBarOpen || pickerOpen) {
         openedBarForPickerRef.current = false;
+        setPickerOpen(false);
+        onPropertyBarOpenChange(false);
+        return;
       }
+      openedBarForPickerRef.current = true;
+      onPropertyBarOpenChange(true);
       setPickerOpen(true);
       return;
     }
     onPropertyBarOpenChange(!propertyBarOpen);
-  }, [hasSorting, onPropertyBarOpenChange, propertyBarOpen]);
+  }, [hasSorting, onPropertyBarOpenChange, propertyBarOpen, pickerOpen]);
 
   const button = (
     <Button
