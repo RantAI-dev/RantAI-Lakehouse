@@ -40,8 +40,14 @@ pub enum ConfigError {
 ///
 /// `Debug` is implemented by hand (not derived) so secret fields
 /// (`ch_password`, `llm_key`, `embed_secret`, `alerts_run_token`,
-/// `smtp_pass`, `database_url`) never appear in a `{:?}`-formatted log
-/// line. `database_url` is redacted in full (not field-by-field like
+/// `smtp_pass`, `database_url`, `lakekeeper_credential_secret_ref`,
+/// `rustfs_access_key_secret_ref`, `rustfs_secret_key_secret_ref`) never
+/// appear in a `{:?}`-formatted log line. The three `*_secret_ref` fields
+/// are references, not values (see `lakehouse_core::secret`'s module doc),
+/// but are redacted anyway as defense in depth against a caller pasting a
+/// raw secret into a reference field by mistake — the same stance
+/// `lakehouse_store::connectors::ConnectorRow` takes for its own
+/// `secret_ref` field. `database_url` is redacted in full (not field-by-field like
 /// `ch_url`/`ch_password`) because Postgres connection strings embed the
 /// username and password inline (`postgres://user:pass@host/db`) — there
 /// is no separate "password field" to redact around. `AppState`
@@ -50,7 +56,28 @@ pub enum ConfigError {
 /// able to leak these into JSON logs — this repo already runs
 /// `check-no-secrets.sh` in CI because a secret leaked once.
 #[derive(Clone, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool here is an independent, unrelated env-derived toggle \
+              (SMTP_SECURE, dev-mode cookie posture, OIDC JIT provisioning, \
+              the connector-probe SSRF opt-out) — a state machine or enum \
+              would have to model every combination of a set that is not \
+              actually a state machine"
+)]
 pub struct Config {
+    /// Whether [`crate::connector_probe`] may dial private/internal address
+    /// ranges (RFC1918, loopback, link-local including the cloud metadata
+    /// endpoint, IPv6 unique-local) named by a connector's `host`.
+    ///
+    /// Default `false` — SSRF-safe by default. `POST /api/connectors` lets
+    /// the caller choose that `host`, so without this a `connector:manage`
+    /// principal gets an internal port scanner with output. This
+    /// deployment's own seeded connectors (`postgres:5432`,
+    /// `http://rustfs:9000`) ARE internal names, so the compose stack opts
+    /// out explicitly — an opt-out rather than a default, so the safe
+    /// posture is what a deployment gets unless it says otherwise. `true`
+    /// only when the env var is exactly `"true"`.
+    pub connector_probe_allow_internal_hosts: bool,
     /// `ClickHouse` HTTP interface URL. Default
     /// `"http://localhost:18123"` (`clickhouse.ts:11`, `??`).
     pub ch_url: String,
@@ -197,6 +224,51 @@ pub struct Config {
     /// default (like [`Self::smtp_port`], not load-bearing enough to fail
     /// boot over).
     pub oidc_clock_skew_seconds: u64,
+    /// Lakekeeper Iceberg REST catalog base URI (P1,
+    /// `lakehouse-iceberg::IcebergClientConfig::catalog_uri`). Default
+    /// matches `docker-compose.yml`'s `lakekeeper` service port mapping.
+    /// Rust/Phase-1b-only: no TypeScript equivalent, since the original
+    /// backend never spoke to a catalog.
+    pub lakekeeper_catalog_uri: String,
+    /// Lakekeeper warehouse identifier this deployment writes Bronze
+    /// tables into. Already the fully-resolved warehouse name — see ADR
+    /// 0003 for the `TENANT_ID` → warehouse naming convention; this field
+    /// is NOT `TENANT_ID` itself, callers that need the mapping applied
+    /// combine `tenant::TENANT_ID` with the convention ADR 0003 defines.
+    /// Default `"default"`.
+    pub lakekeeper_warehouse: String,
+    /// `secretRef` (see `lakehouse_core::secret`) for Lakekeeper's own
+    /// `OAuth2` client-credential, when Lakekeeper authorization is enabled.
+    /// `None` when unset, meaning Lakekeeper is assumed to be running in
+    /// no-auth (open) mode — see the P1b report for R1's status in this
+    /// deployment. This field carries a REFERENCE (an `env:VAR_NAME`
+    /// string), never a credential value — same guarantee
+    /// `lakehouse_store::connectors`'s `secret_ref` field carries, and
+    /// resolved the same way, through a
+    /// `lakehouse_core::secret::SecretResolver`.
+    pub lakekeeper_credential_secret_ref: Option<String>,
+    /// S3-compatible object store endpoint backing the Lakekeeper
+    /// warehouse (`RustFS` by default; `SeaweedFS` in P2 — see
+    /// `docs/STORAGE-COMPATIBILITY.md`, once P2 lands). Default matches
+    /// `docker-compose.yml`'s `rustfs` service port mapping.
+    pub rustfs_s3_endpoint: String,
+    /// S3 region string sent to the object store client. `RustFS` does not
+    /// enforce AWS region semantics, but the S3 API requires *a* value.
+    /// Default `"us-east-1"`.
+    pub rustfs_s3_region: String,
+    /// Bucket the lakehouse warehouse's Iceberg tables live under. Default
+    /// matches `docker-compose.yml`'s `LAKEHOUSE_WAREHOUSE_BUCKET` default.
+    pub lakehouse_warehouse_bucket: String,
+    /// `secretRef` for the `RustFS`/S3 access key. Only used as a fallback
+    /// when Lakekeeper is not vending per-table credentials (e.g. a direct
+    /// `object_store` health check outside the catalog path) — the G1 test
+    /// itself must NOT use this field on the write path; see
+    /// `lakehouse-iceberg`'s crate doc comment on why vended credentials,
+    /// not static ones, are the point. `None` when unset.
+    pub rustfs_access_key_secret_ref: Option<String>,
+    /// `secretRef` for the `RustFS`/S3 secret key. Same caveat as
+    /// [`Self::rustfs_access_key_secret_ref`].
+    pub rustfs_secret_key_secret_ref: Option<String>,
     /// Postgres connection string for Phase 2 OLTP storage (`lakehouse-store`).
     /// Default `"postgres://lakehouse:lakehouse@localhost:5432/lakehouse"`
     /// (`??` semantics, like every other URL field here). Rust/Phase-2-only:
@@ -208,6 +280,69 @@ pub struct Config {
     /// is handed to `connect_lazy` as-is and any problem with it surfaces
     /// lazily, at first use, as an ordinary request-time error.
     pub database_url: String,
+    /// ADR 0010/0011 — path to a file holding the `gold-export` Lakekeeper
+    /// principal's pre-minted static bearer token (`iceberg-catalog-rest`'s
+    /// `token` property — see `lakehouse-iceberg::catalog`'s module doc on
+    /// why this build uses a static token, not an `OAuth2` exchange).
+    /// Deliberately a **file path**, not a `secretRef`: the token is
+    /// minted at compose bring-up by `ops/oidc-mock` onto a shared volume
+    /// (`lakehouse_oidc_tokens`) every writer in this stack already reads
+    /// directly from disk the same way (`docker-compose.yml`'s
+    /// `g1-test-runner`, `debezium-server`, `trino`, ...) — there is no
+    /// static value to put behind an `env:` `secretRef` ahead of time.
+    /// Always set to a default path — `/tokens/gold-export.jwt`, matching
+    /// where `docker-compose.yml`'s `lakehouse-api` service mounts the
+    /// shared token volume — rather than `None`-when-unset: unlike a real
+    /// secret, there is no meaningful "intentionally absent" state here,
+    /// only "the file isn't there (yet)", which `routes::gold` treats as
+    /// Gold export being unconfigured (503) at request time, when it
+    /// actually tries to read the file.
+    pub lakekeeper_gold_export_token_file: String,
+    /// `ClickHouse` schema Gold marts live in (ADR 0010: `serving.*`).
+    /// `routes::gold`'s export route reads `{gold_source_schema}.{mart}`.
+    /// Default `"serving"`.
+    pub gold_source_schema: String,
+    /// Shared token gating `POST /api/gold/export/{mart}`, same D4 shape
+    /// as [`Self::alerts_run_token`]: with this set, a matching
+    /// `x-run-token` header/`?token=` is required; with it unset, only a
+    /// service-identity principal is let through. `None` when unset.
+    pub gold_export_run_token: Option<String>,
+    /// Hard cap on how many source rows a single `POST
+    /// /api/gold/export/{mart}` call will export (code-review fix: the
+    /// prior implementation read an entire mart into memory with no limit
+    /// at all, and a large mart could OOM the whole API process — not
+    /// just the export request, every route it serves). Checked against
+    /// `ClickHouse`'s `count()` for the source table BEFORE any row data
+    /// is read (`gold_export::export_mart`); a mart over the cap fails
+    /// the export outright with an error naming both the mart and the cap,
+    /// rather than silently truncating — silent truncation would publish
+    /// a partial mart to Iceberg as if it were the complete one, which is
+    /// worse than refusing. Not parsed as a genuinely load-bearing value
+    /// (like [`Self::port`]): an unparsable override falls back to the
+    /// default rather than failing config resolution, same posture as
+    /// [`Self::oidc_clock_skew_seconds`]. Default `5_000_000`.
+    pub gold_export_max_rows: u64,
+    /// How many source rows `gold_export::export_mart` reads from
+    /// `ClickHouse` and appends to Iceberg per batch, instead of
+    /// materializing the whole mart at once (the same OOM defect
+    /// [`Self::gold_export_max_rows`] documents). Each batch is one
+    /// `SELECT ... LIMIT n OFFSET n FORMAT JSON` round trip and one
+    /// `GoldTable::append` (one new Parquet file/snapshot). Same
+    /// non-load-bearing parsing posture as
+    /// [`Self::gold_export_max_rows`]. Default `20_000`.
+    pub gold_export_batch_size: u64,
+    /// Shared token gating `POST /api/agents/employees/{id}/run`
+    /// (Tier 3, copilot-operations-handover plan), same D4 shape as
+    /// [`Self::gold_export_run_token`]/[`Self::alerts_run_token`]: with
+    /// this set, a matching `x-run-token` header/`?token=` runs the
+    /// employee headlessly with `trigger = "schedule"` (this is what
+    /// `dagster/dispar_orchestrate`'s digital-employee schedule factory
+    /// authenticates with, mirroring `gold_export_job`). Unlike gold/alerts,
+    /// the fallback when this is unset (or the token doesn't match) is NOT
+    /// "service-identity principal only" — an authenticated principal
+    /// holding `agent:manage` (a human clicking "Run now" in the console)
+    /// is also accepted, with `trigger = "manual"`. `None` when unset.
+    pub agent_run_token: Option<String>,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -242,6 +377,29 @@ impl std::fmt::Debug for Config {
             .field("smtp_user", &self.smtp_user)
             .field("smtp_pass", &REDACTED)
             .field("smtp_from", &self.smtp_from)
+            .field("lakekeeper_catalog_uri", &self.lakekeeper_catalog_uri)
+            .field("lakekeeper_warehouse", &self.lakekeeper_warehouse)
+            .field(
+                "lakekeeper_credential_secret_ref",
+                &self
+                    .lakekeeper_credential_secret_ref
+                    .as_ref()
+                    .map(|_| REDACTED),
+            )
+            .field("rustfs_s3_endpoint", &self.rustfs_s3_endpoint)
+            .field("rustfs_s3_region", &self.rustfs_s3_region)
+            .field(
+                "lakehouse_warehouse_bucket",
+                &self.lakehouse_warehouse_bucket,
+            )
+            .field(
+                "rustfs_access_key_secret_ref",
+                &self.rustfs_access_key_secret_ref.as_ref().map(|_| REDACTED),
+            )
+            .field(
+                "rustfs_secret_key_secret_ref",
+                &self.rustfs_secret_key_secret_ref.as_ref().map(|_| REDACTED),
+            )
             .field("port", &self.port)
             .field("is_dev", &self.is_dev)
             .field("auth_bootstrap_email", &self.auth_bootstrap_email)
@@ -260,8 +418,27 @@ impl std::fmt::Debug for Config {
             .field("oidc_jit_provisioning", &self.oidc_jit_provisioning)
             .field("oidc_role_map", &self.oidc_role_map)
             .field("oidc_groups_claim", &self.oidc_groups_claim)
+            .field(
+                "connector_probe_allow_internal_hosts",
+                &self.connector_probe_allow_internal_hosts,
+            )
             .field("oidc_clock_skew_seconds", &self.oidc_clock_skew_seconds)
             .field("database_url", &REDACTED)
+            .field(
+                "lakekeeper_gold_export_token_file",
+                &self.lakekeeper_gold_export_token_file,
+            )
+            .field("gold_source_schema", &self.gold_source_schema)
+            .field(
+                "gold_export_run_token",
+                &self.gold_export_run_token.as_ref().map(|_| REDACTED),
+            )
+            .field("gold_export_max_rows", &self.gold_export_max_rows)
+            .field("gold_export_batch_size", &self.gold_export_batch_size)
+            .field(
+                "agent_run_token",
+                &self.agent_run_token.as_ref().map(|_| REDACTED),
+            )
             .finish()
     }
 }
@@ -276,6 +453,17 @@ fn or_default(env: &HashMap<String, String>, key: &str, default: &str) -> String
 /// when `key` is absent *or* present-but-empty.
 fn truthy(env: &HashMap<String, String>, key: &str) -> Option<String> {
     env.get(key).filter(|v| !v.is_empty()).cloned()
+}
+
+/// Parses `key` as a `u64`, falling back to `default` when absent or
+/// unparseable. Same non-load-bearing posture as
+/// [`Config::oidc_clock_skew_seconds`]: a garbage override must not fail
+/// config resolution, only silently keep the documented default. Used by
+/// [`Config::gold_export_max_rows`]/[`Config::gold_export_batch_size`].
+fn parse_u64_or_default(env: &HashMap<String, String>, key: &str, default: u64) -> u64 {
+    env.get(key)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
 /// Parse `OIDC_ROLE_MAP`'s `"group1=Role One,group2=Role Two"` format into
@@ -377,15 +565,44 @@ impl Config {
                 .is_some_and(|v| v == "true"),
             oidc_role_map: parse_role_map(env.get("OIDC_ROLE_MAP").map_or("", String::as_str)),
             oidc_groups_claim: or_default(env, "OIDC_GROUPS_CLAIM", "groups"),
+            connector_probe_allow_internal_hosts: env
+                .get("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS")
+                .is_some_and(|v| v == "true"),
             oidc_clock_skew_seconds: env
                 .get("OIDC_CLOCK_SKEW_SECONDS")
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(60),
+            lakekeeper_catalog_uri: or_default(
+                env,
+                "LAKEKEEPER_CATALOG_URI",
+                "http://localhost:8181/catalog",
+            ),
+            lakekeeper_warehouse: or_default(env, "LAKEKEEPER_WAREHOUSE", "default"),
+            lakekeeper_credential_secret_ref: truthy(env, "LAKEKEEPER_CREDENTIAL_SECRET_REF"),
+            rustfs_s3_endpoint: or_default(env, "RUSTFS_S3_ENDPOINT", "http://localhost:9010"),
+            rustfs_s3_region: or_default(env, "RUSTFS_S3_REGION", "us-east-1"),
+            lakehouse_warehouse_bucket: or_default(
+                env,
+                "LAKEHOUSE_WAREHOUSE_BUCKET",
+                "lakehouse-warehouse",
+            ),
+            rustfs_access_key_secret_ref: truthy(env, "RUSTFS_ACCESS_KEY_SECRET_REF"),
+            rustfs_secret_key_secret_ref: truthy(env, "RUSTFS_SECRET_KEY_SECRET_REF"),
             database_url: or_default(
                 env,
                 "DATABASE_URL",
                 "postgres://lakehouse:lakehouse@localhost:5432/lakehouse",
             ),
+            lakekeeper_gold_export_token_file: or_default(
+                env,
+                "LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE",
+                "/tokens/gold-export.jwt",
+            ),
+            gold_source_schema: or_default(env, "GOLD_SOURCE_SCHEMA", "serving"),
+            gold_export_run_token: truthy(env, "GOLD_EXPORT_RUN_TOKEN"),
+            gold_export_max_rows: parse_u64_or_default(env, "GOLD_EXPORT_MAX_ROWS", 5_000_000),
+            gold_export_batch_size: parse_u64_or_default(env, "GOLD_EXPORT_BATCH_SIZE", 20_000),
+            agent_run_token: truthy(env, "AGENT_RUN_TOKEN"),
         })
     }
 
@@ -422,6 +639,7 @@ mod tests {
             ("EMBED_SECRET", "s3cret-embed"),
             ("ALERTS_RUN_TOKEN", "s3cret-alerts-token"),
             ("SMTP_PASS", "s3cret-smtp-pass"),
+            ("AGENT_RUN_TOKEN", "s3cret-agent-run-token"),
             (
                 "DATABASE_URL",
                 "postgres://u:s3cret-pg-pass@db.internal:5432/lakehouse",
@@ -435,6 +653,7 @@ mod tests {
             "s3cret-embed",
             "s3cret-alerts-token",
             "s3cret-smtp-pass",
+            "s3cret-agent-run-token",
             "s3cret-pg-pass",
             "db.internal",
         ] {
@@ -470,6 +689,14 @@ mod tests {
             cfg.database_url,
             "postgres://lakehouse:lakehouse@localhost:5432/lakehouse"
         );
+        assert_eq!(cfg.lakekeeper_catalog_uri, "http://localhost:8181/catalog");
+        assert_eq!(cfg.lakekeeper_warehouse, "default");
+        assert_eq!(cfg.lakekeeper_credential_secret_ref, None);
+        assert_eq!(cfg.rustfs_s3_endpoint, "http://localhost:9010");
+        assert_eq!(cfg.rustfs_s3_region, "us-east-1");
+        assert_eq!(cfg.lakehouse_warehouse_bucket, "lakehouse-warehouse");
+        assert_eq!(cfg.rustfs_access_key_secret_ref, None);
+        assert_eq!(cfg.rustfs_secret_key_secret_ref, None);
         // OIDC unconfigured by default — graceful degradation, see the
         // `oidc_issuer`/`oidc_client_id` field doc comments.
         assert_eq!(cfg.oidc_issuer, None);
@@ -481,6 +708,56 @@ mod tests {
         assert!(cfg.oidc_role_map.is_empty());
         assert_eq!(cfg.oidc_groups_claim, "groups");
         assert_eq!(cfg.oidc_clock_skew_seconds, 60);
+        assert_eq!(
+            cfg.lakekeeper_gold_export_token_file,
+            "/tokens/gold-export.jwt"
+        );
+        assert_eq!(cfg.gold_source_schema, "serving");
+        assert_eq!(cfg.gold_export_run_token, None);
+        assert_eq!(cfg.gold_export_max_rows, 5_000_000);
+        assert_eq!(cfg.gold_export_batch_size, 20_000);
+        assert_eq!(cfg.agent_run_token, None);
+        // Safe-by-default: SSRF blocking is ON unless explicitly disabled.
+        assert!(!cfg.connector_probe_allow_internal_hosts);
+    }
+
+    #[test]
+    fn gold_export_max_rows_and_batch_size_are_overridable() {
+        let env = map(&[
+            ("GOLD_EXPORT_MAX_ROWS", "123"),
+            ("GOLD_EXPORT_BATCH_SIZE", "7"),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.gold_export_max_rows, 123);
+        assert_eq!(cfg.gold_export_batch_size, 7);
+    }
+
+    /// Same non-load-bearing posture as `OIDC_CLOCK_SKEW_SECONDS`: a
+    /// garbage override must not fail config resolution — it falls back to
+    /// the documented default instead.
+    #[test]
+    fn invalid_gold_export_row_settings_fall_back_to_defaults_instead_of_erroring() {
+        let env = map(&[
+            ("GOLD_EXPORT_MAX_ROWS", "not-a-number"),
+            ("GOLD_EXPORT_BATCH_SIZE", "also-not-a-number"),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.gold_export_max_rows, 5_000_000);
+        assert_eq!(cfg.gold_export_batch_size, 20_000);
+    }
+
+    /// The compose stack's documented opt-out — only the literal string
+    /// `"true"` flips the default, matching every other boolean flag in
+    /// this config (`OIDC_JIT_PROVISIONING`, `SMTP_SECURE`).
+    #[test]
+    fn connector_probe_allow_internal_hosts_requires_the_literal_string_true() {
+        let cfg =
+            Config::from_map(&map(&[("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS", "yes")])).unwrap();
+        assert!(!cfg.connector_probe_allow_internal_hosts);
+
+        let cfg =
+            Config::from_map(&map(&[("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS", "true")])).unwrap();
+        assert!(cfg.connector_probe_allow_internal_hosts);
     }
 
     #[test]
@@ -535,6 +812,56 @@ mod tests {
         let cfg = Config::from_map(&env).unwrap();
         let rendered = format!("{cfg:?}");
         assert!(!rendered.contains("s3cret-oidc-client-secret"));
+    }
+
+    /// H1 for the new `secretRef`-shaped fields: `{:?}` must never leak the
+    /// reference string, even though it is not a value — see the type-level
+    /// doc comment for why these are redacted anyway.
+    #[test]
+    fn debug_redacts_secret_ref_fields() {
+        let env = map(&[
+            (
+                "LAKEKEEPER_CREDENTIAL_SECRET_REF",
+                "env:LAKEKEEPER_CREDENTIAL",
+            ),
+            ("RUSTFS_ACCESS_KEY_SECRET_REF", "env:RUSTFS_ACCESS_KEY"),
+            ("RUSTFS_SECRET_KEY_SECRET_REF", "env:RUSTFS_SECRET_KEY"),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        let rendered = format!("{cfg:?}");
+        for secret_ref in [
+            "env:LAKEKEEPER_CREDENTIAL",
+            "env:RUSTFS_ACCESS_KEY",
+            "env:RUSTFS_SECRET_KEY",
+        ] {
+            assert!(
+                !rendered.contains(secret_ref),
+                "Debug output leaked secretRef {secret_ref:?}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn lakekeeper_and_rustfs_fields_are_overridable() {
+        let env = map(&[
+            (
+                "LAKEKEEPER_CATALOG_URI",
+                "http://lakekeeper.internal:8181/catalog",
+            ),
+            ("LAKEKEEPER_WAREHOUSE", "tenant-acme"),
+            ("RUSTFS_S3_ENDPOINT", "http://rustfs.internal:9000"),
+            ("RUSTFS_S3_REGION", "eu-west-1"),
+            ("LAKEHOUSE_WAREHOUSE_BUCKET", "acme-warehouse"),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(
+            cfg.lakekeeper_catalog_uri,
+            "http://lakekeeper.internal:8181/catalog"
+        );
+        assert_eq!(cfg.lakekeeper_warehouse, "tenant-acme");
+        assert_eq!(cfg.rustfs_s3_endpoint, "http://rustfs.internal:9000");
+        assert_eq!(cfg.rustfs_s3_region, "eu-west-1");
+        assert_eq!(cfg.lakehouse_warehouse_bucket, "acme-warehouse");
     }
 
     #[test]

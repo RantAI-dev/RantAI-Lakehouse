@@ -1,0 +1,54 @@
+{
+  "_comment": "P2 (G2) SeaweedFS matrix config, TEMPLATE. Rendered at bring-up by the `seaweedfs-iam-init` compose service (docker-compose.yml) into a named volume the `seaweedfs` service mounts read-only — this file itself never carries working credentials or a working STS signing key (see docs/STORAGE-COMPATIBILITY.md's 'Credential hygiene' note: docker-compose.yml doubles as the deployment template, so a committed working key here would have shipped to every deployment, not just local/CI). __SEAWEEDFS_ACCESS_KEY__ / __SEAWEEDFS_SECRET_KEY__ / __SEAWEEDFS_STS_SIGNING_KEY__ are substituted by the init job from SEAWEEDFS_ACCESS_KEY / SEAWEEDFS_SECRET_KEY / SEAWEEDFS_STS_SIGNING_KEY (.env.example) — the signing key is GENERATED per deployment when that var is left unset, never defaulted to a constant. Otherwise mirrors the RustFS-side setup (allow-all role trust) so the storage boundary comparison stays apples-to-apples with RustFS's own well-known defaults plus its 'accept any sts-role-arn string' behavior — not a real IAM identity either way. See docker-compose.yml's `seaweedfs`/`seaweedfs-iam-init` services and docs/STORAGE-COMPATIBILITY.md.",
+  "identities": [
+    {
+      "name": "lakehouse-seaweedfs",
+      "credentials": [
+        { "accessKey": "__SEAWEEDFS_ACCESS_KEY__", "secretKey": "__SEAWEEDFS_SECRET_KEY__" }
+      ],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ],
+  "sts": {
+    "tokenDuration": "1h",
+    "maxSessionLength": "12h",
+    "issuer": "seaweedfs-sts",
+    "signingKey": "__SEAWEEDFS_STS_SIGNING_KEY__"
+  },
+  "policy": {
+    "defaultEffect": "Deny",
+    "storeType": "memory"
+  },
+  "policies": [
+    {
+      "name": "LakehouseWarehouseAccess",
+      "document": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": ["s3:*"],
+            "Resource": ["*"]
+          }
+        ]
+      }
+    }
+  ],
+  "roles": [
+    {
+      "roleName": "lakekeeper",
+      "roleArn": "arn:aws:iam::000000000000:role/lakekeeper",
+      "attachedPolicies": ["LakehouseWarehouseAccess"],
+      "trustPolicy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": { "AWS": "*" },
+            "Action": ["sts:AssumeRole"]
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -39,10 +39,17 @@ flowchart LR
         API["lakehouse-api (axum)"]
     end
 
-    Postgres[("Postgres\n(OLTP: identity, governance,\npipelines, connectors, ...)")]
-    ClickHouse[("ClickHouse\n(analytics: serving.* marts,\ncatalog, lineage, BI)")]
-    Dagster["Dagster\n(orchestration)"]
+    Postgres[("Postgres\n(OLTP: identity, governance,\npipelines, connectors, ...\nalso the CDC source, wal_level=logical)")]
+    ClickHouse[("ClickHouse 26.8\n(analytics: serving.* marts,\ncatalog, lineage, BI;\nalso reads Bronze via DataLakeCatalog)")]
+    Dagster["Dagster\n(orchestration, opt-in profile:\nbatch ingest + Bronze maintenance)"]
     LLM["LLM\n(OpenAI-compatible)"]
+
+    subgraph Lakehouse["Lakehouse layer (P1-P5)"]
+        Lakekeeper["Lakekeeper\n(Iceberg REST catalog)"]
+        RustFS[("RustFS / SeaweedFS\n(S3-compatible object store)")]
+        Debezium["Debezium Server\n(CDC, opt-in profile)"]
+        Trino["Trino-as-cron\n(Bronze compaction only,\nopt-in profile, ADR 0009)"]
+    end
 
     Browser --> UI
     UI --> Rewrite
@@ -51,12 +58,33 @@ flowchart LR
     API --> ClickHouse
     API --> Dagster
     API --> LLM
+    Dagster --> Lakekeeper
+    Debezium --> Lakekeeper
+    Debezium --> Postgres
+    Lakekeeper --> RustFS
+    ClickHouse -. reads Bronze via .-> Lakekeeper
+    Trino -. compacts Bronze via .-> Lakekeeper
 ```
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full module map (11
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full module map (13
 Rust crates), the request lifecycle (browser → rewrite → axum middleware →
 policy check → handler → store/client), and the Postgres-vs-ClickHouse data
 model.
+
+The lakehouse layer (Lakekeeper, RustFS/SeaweedFS, Debezium, Trino) is real
+infrastructure, verified end to end (see `docs/plans/G1-RESULT.md` through
+`docs/plans/P5-RESULT.md`), and is compose-profile opt-in for the
+Dagster/Trino pieces (`dagster`, `trino`). **`lakehouse-iceberg` now has a
+real caller**: `POST`/`GET /api/gold/export/{mart}`
+(`lakehouse-api::routes::gold`, ADR 0010) reads a Gold mart from
+ClickHouse `MergeTree` and appends it to its own `gold` Iceberg namespace
+through Lakekeeper, and reads it back through `iceberg-rust` — the console
+still reads *Bronze* through ClickHouse's `DataLakeCatalog`/the
+`bronze_meta.*` registry, not through `lakehouse-iceberg` directly, since
+that read path works on both 26.3 and 26.8 (see "Status / Known
+limitations" below for the write-path defects, and
+`docs/plans/CLICKHOUSE-26.8-REMEASUREMENT.md` for which of them 26.8
+fixes).
 
 ## Quickstart
 
@@ -158,12 +186,16 @@ cargo deny check licenses
 
 ### Rust toolchain / MSRV
 
-The workspace declares `rust-version = "1.85"` in `rust/Cargo.toml` — that's
-the minimum edition-2024-capable toolchain this code promises to compile
-on. `rust/rust-toolchain.toml` pins the toolchain actually used for local
-dev/CI (currently `1.96.1`, newer than the MSRV floor) so contributors and
-CI build with the same compiler; `rustup` will fetch it automatically the
-first time you run `cargo` inside `rust/`.
+The workspace declares `rust-version = "1.88"` in `rust/Cargo.toml` — that's
+the real floor this code has been verified to compile on (`Cargo.lock`
+pulls in `time@0.3.55`, which needs rustc >= 1.88, plus
+`testcontainers`/`etcetera`/`ferroid` transitively pushing past the raw
+edition-2024 minimum of `1.85`; see `rust/Cargo.toml`'s comment and
+`docs/CI.md` for how that was verified). `rust/rust-toolchain.toml` pins
+the toolchain actually used for local dev/CI (currently `1.96.1`, newer
+than the MSRV floor) so contributors and CI build with the same compiler;
+`rustup` will fetch it automatically the first time you run `cargo` inside
+`rust/`.
 
 ## Configuration
 
@@ -219,22 +251,185 @@ listed here because you need them to run the console at all:
 See `rust/crates/lakehouse-auth/README.md` for detailed, per-provider OIDC
 setup instructions (Okta, Entra, Google, Keycloak).
 
+A further set of variables live only in `docker-compose.yml` — they
+configure the P1 object store (RustFS) and Iceberg REST catalog
+(Lakekeeper) *services themselves* (ports, Lakekeeper's own Postgres
+database, its encryption key) and are not read by `config.rs`, because
+they configure the container, not the `lakehouse-iceberg` client that
+talks to it:
+
+| Variable | Purpose | Default | Required? |
+| --- | --- | --- | --- |
+| `RUSTFS_ACCESS_KEY` | RustFS S3 API access key — RustFS's own ROOT credential. No longer what the seeded `conn-s3-warehouse` connector dials with (see `CONNECTOR_S3_ACCESS_KEY` below); migration 0023 moved that off this var so the connector secret allowlist never has to name RustFS's root key | `rustfsadmin` (public, well-known) | No, but override before exposing RustFS beyond localhost |
+| `RUSTFS_SECRET_KEY` | RustFS S3 API secret key. Same note as `RUSTFS_ACCESS_KEY` above | `rustfsadmin` (public, well-known) | No, but override before exposing RustFS beyond localhost |
+| `CONNECTOR_S3_ACCESS_KEY` | Access key the seeded `conn-s3-warehouse` connector's `secretRef` (`env:CONNECTOR_S3_ACCESS_KEY`) resolves to for a real connectivity test, and what `dagster/dispar_orchestrate/dlt_pipeline.py` and `ops/g3/g3_loadgen.py` authenticate to RustFS with. Deliberately a name distinct from `RUSTFS_ACCESS_KEY` (RustFS's own root key) — the connector secret allowlist (`CONNECTOR_ALLOWED_SECRET_REFS`) never has to name a process secret to let the seeded connector dial. Defaults to the same value as `RUSTFS_ACCESS_KEY` for the local stack; set to a least-privilege identity in a real deployment | `rustfsadmin` (public, well-known) | No, but override before exposing RustFS beyond localhost |
+| `CONNECTOR_S3_SECRET_KEY` | Secret key half of the pair above (`env:CONNECTOR_S3_SECRET_KEY`) | `rustfsadmin` (public, well-known) | No, but override before exposing RustFS beyond localhost |
+| `RUSTFS_HOST_PORT` | Host port mapped to RustFS's S3 API (container port 9000) | `9010` | No |
+| `RUSTFS_CONSOLE_HOST_PORT` | Host port mapped to RustFS's web console (container port 9001) | `9011` | No |
+| `LAKEKEEPER_PG_DB` | Name of Lakekeeper's own Postgres database on the existing `postgres` service (separate from the `lakehouse` app database's `console` schema) | `lakekeeper` | No |
+| `LAKEKEEPER_ENCRYPTION_KEY` | Encrypts secrets in Lakekeeper's own schema | Lakekeeper's own placeholder — **change before any non-throwaway use** | No |
+| `LAKEKEEPER_BASE_URI` | Base URL Lakekeeper advertises in its own REST responses | `http://localhost:8181` | No |
+| `LAKEKEEPER_HOST_PORT` | Host port mapped to Lakekeeper's REST API (container port 8181) | `8181` | No |
+| `LAKEKEEPER_OPENFGA_STORE_NAME` | Name of the OpenFGA store Lakekeeper's authorization model lives in | `lakekeeper` | No |
+| `OPENFGA_PG_DB` | Name of OpenFGA's own Postgres database on the existing `postgres` service | `openfga` | No |
+| `OPENFGA_HTTP_HOST_PORT` | Host port mapped to OpenFGA's HTTP API (container port 8080) | `8082` | No |
+| `OPENFGA_GRPC_HOST_PORT` | Host port mapped to OpenFGA's gRPC API (container port 8081) — this is the port Lakekeeper's `LAKEKEEPER__OPENFGA__ENDPOINT` actually talks to | `8083` | No |
+| `OIDC_MOCK_HOST_PORT` | Host port mapped to `ops/oidc-mock`'s discovery/JWKS/token endpoints (container port 8090) | `8090` | No |
+
+P1b (`lakehouse-iceberg`) adds the client-side counterparts below, read by
+`config.rs` — these are what a Rust process (not the container) uses to
+*connect to* RustFS/Lakekeeper. `lakehouse-api`'s Gold export route
+(`routes::gold`, ADR 0010) is the first route to actually build an
+`IcebergClient` from these fields; the G1 test and any manual `cargo run`
+usage share the same documented source docker-compose already uses:
+
+| Variable | Purpose | Default | Required? |
+| --- | --- | --- | --- |
+| `LAKEKEEPER_CATALOG_URI` | Lakekeeper's Iceberg REST catalog base URI, as reached from the Rust process | `http://localhost:8181/catalog` | No |
+| `LAKEKEEPER_WAREHOUSE` | Lakekeeper warehouse this deployment writes Bronze tables into — see ADR 0003 for the `TENANT_ID` naming convention | `default` | No |
+| `LAKEKEEPER_CREDENTIAL_SECRET_REF` | `secretRef` (see `lakehouse_core::secret`, ADR 0002) for Lakekeeper's OAuth2 client-credential, when Lakekeeper authorization is enabled | unset (no-auth mode assumed) | No |
+| `LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE` | File path to the `gold-export` Lakekeeper principal's pre-minted static bearer token (ADR 0011), read at export-request time — not a `secretRef`, see the field's doc comment for why | `/tokens/gold-export.jwt` | No |
+| `GOLD_SOURCE_SCHEMA` | ClickHouse schema `routes::gold` reads Gold marts from | `serving` | No |
+| `GOLD_EXPORT_RUN_TOKEN` | Shared token gating `POST`/`GET /api/gold/export/{mart}` (same D4 shape as `ALERTS_RUN_TOKEN`); unset means only a service-identity principal may call it | unset | No |
+| `GOLD_EXPORT_MAX_ROWS` | Hard cap on rows a single Gold export will read/append; a mart over this fails outright (error names the mart and the cap) instead of silently truncating | `5000000` | No |
+| `GOLD_EXPORT_BATCH_SIZE` | Rows read from ClickHouse and appended to Iceberg per batch, instead of materializing the whole mart in memory at once | `20000` | No |
+| `RUSTFS_S3_ENDPOINT` | S3-compatible endpoint the `lakehouse-iceberg` `object_store` client targets | `http://localhost:9010` | No |
+| `RUSTFS_S3_REGION` | Region string sent to the S3 client (RustFS does not enforce AWS region semantics, but the S3 API requires a value) | `us-east-1` | No |
+| `LAKEHOUSE_WAREHOUSE_BUCKET` | Bucket the lakehouse warehouse's Iceberg tables live under — also read by the compose `rustfs-bucket-init` job | `lakehouse-warehouse` | No |
+| `RUSTFS_ACCESS_KEY_SECRET_REF` | `secretRef` for a static RustFS/S3 access key, used only as a fallback outside the vended-credentials write path (see `lakehouse-iceberg`'s crate doc) | unset | No |
+| `RUSTFS_SECRET_KEY_SECRET_REF` | `secretRef` for the matching static secret key | unset | No |
+
+A further batch of compose-only variables were added in P2–P5 for
+SeaweedFS (the P2 storage-compatibility target, matrix-profile only),
+Trino (the P4 small-file-compaction escape hatch, ADR 0009), and Debezium
+Server (P5 CDC). None of these are read by `config.rs` — they configure the
+containers themselves, and (for Trino/Debezium) are only relevant behind
+their opt-in compose profiles:
+
+| Variable | Purpose | Default | Required? |
+| --- | --- | --- | --- |
+| `SEAWEEDFS_ACCESS_KEY` | SeaweedFS S3 API access key | `seaweedfsadmin` (public, well-known) | No, but override before exposing SeaweedFS beyond localhost |
+| `SEAWEEDFS_SECRET_KEY` | SeaweedFS S3 API secret key | `seaweedfsadmin` (public, well-known) | No, but override before exposing SeaweedFS beyond localhost |
+| `TRINO_PUBLISH_HOST_PORT` | SECURITY: `trino` has no authentication of its own, so its host port is NOT published by default — `trino-maintenance-cron` (the only real consumer) reaches it in-network as `http://trino:8080`. Set to the literal string `trino` (matching the Compose profile, not `true`/`1`) to opt in to host access; any other value leaves it disabled. See the `trino-host-port` service comment in `docker-compose.yml` for why the value must be that exact profile name | unset (disabled) | No, and CHANGE ME only on a trusted host if you do |
+| `TRINO_HOST_PORT` | Host port mapped to Trino's coordinator UI/API (`trino` profile), only published when `TRINO_PUBLISH_HOST_PORT` is also set. Not `8090` — `oidc-mock` already publishes that, and the two collide when the `trino` profile runs alongside the base stack | `8091` | No |
+| `TRINO_CRON_INTERVAL_SECONDS` | How often `trino-maintenance-cron` runs `ALTER TABLE ... EXECUTE optimize` against every Bronze table (`trino` profile) | `21600` (6h) | No |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | Credentials and database for the compose `postgres` service. `POSTGRES_PASSWORD` is `lakehouse-api`'s OWN database password — no longer what the seeded `conn-pg-lakehouse` connector dials with (see `CONNECTOR_PG_PASSWORD` below) | `lakehouse` / `lakehouse` / `lakehouse` | No |
+| `CONNECTOR_PG_PASSWORD` | Password the seeded `conn-pg-lakehouse` connector's `secretRef` (`env:CONNECTOR_PG_PASSWORD`) resolves to for a real connectivity test. Deliberately a name distinct from `POSTGRES_PASSWORD` (the console's own database password) — the connector secret allowlist never has to name a process secret to let the seeded connector dial. Defaults to the same value as `POSTGRES_PASSWORD` for the local stack; set to a least-privilege credential in a real deployment | `lakehouse` | No |
+| `POSTGRES_HOST_PORT` | Host port for Postgres | `5432` | No |
+| `CH_HTTP_HOST_PORT` / `CH_NATIVE_HOST_PORT` | Host ports for ClickHouse's HTTP and native interfaces | `8123` / `9000` | No |
+| `CH_DB` | ClickHouse default database created at first boot | `default` | No |
+| `API_HOST_PORT` | Host port for `lakehouse-api` | `8080` | No |
+| `DAGSTER_WEBSERVER_HOST_PORT` | Host port for the Dagster webserver (`dagster` profile) | `3000` | No |
+| `SEAWEEDFS_S3_HOST_PORT` | Host port for SeaweedFS's S3 API (`seaweedfs` profile) | `8333` | No |
+| `DAGSTER_PG_DB` | Dagster's own Postgres database, created on the existing `postgres` service | `dagster` | No |
+| `OPENFGA_PG_DB` | OpenFGA's own Postgres database | `openfga` | No |
+| `LAKEKEEPER_OPENFGA_STORE_NAME` | Name of the OpenFGA store holding the catalog authorization model | `lakekeeper` | No |
+| `BRONZE_SOURCE_SCHEMA` / `BRONZE_SOURCE_TABLE` | Source schema and table the dlt batch-ingest job reads (`dagster` profile) | `ingest_demo` / `orders` | No |
+| `BRONZE_TABLE_NAME` | Bronze Iceberg table the ingest job writes | `g3a_orders` | No |
+| `LAKEHOUSE_API_URL` | In-network address Dagster jobs use to call the API back | `http://lakehouse-api:8080` | No |
+| `CH_RUSTFS_S3_ENDPOINT` | S3 endpoint Iceberg clients use for object I/O. Switching this to the SeaweedFS service is what makes the G2 storage matrix a config-only change | `http://rustfs:9000` | No |
+| `TENANT_OWNER` / `TENANT_ID` / `TENANT_DOMAIN` / `TENANT_RESIDENCY` / `TENANT_SITE` / `TENANT_SOURCE` | Tenant identity surfaced on catalog assets, audit and quota records (`lakehouse-api/src/tenant.rs`). Each falls back to its historical default when blank | unset (historical defaults apply) | No |
+| `BRONZE_CURATED_SLUGS` | Comma-separated dataset slugs presented as curated rather than raw Bronze | unset | No |
+| `CATALOG_NAMESPACE_META` | JSON object overriding catalog namespace display names/descriptions. Malformed JSON is ignored in favour of the defaults — a bad label is cosmetic, refusing to serve the catalog is an outage | unset | No |
+| `BUILTIN_DASHBOARD_ENABLED` | Set `0` on any tenant **without** a `serving.mart_wisman` mart: the built-in "Main" dashboard's tiles are hardcoded to it and paint red before the UI redirects | `1` | No, but effectively required off-tenant |
+| `GOLD_SOURCE_SCHEMA` | ClickHouse schema Gold export reads marts from | `serving` | No |
+| `GOLD_EXPORT_MARTS` | Comma-separated marts the scheduled Gold export job exports | `gold_export_smoke` | No |
+| `GOLD_EXPORT_RUN_TOKEN` | Shared token required by `POST /api/gold/export/{mart}`. Generate your own | unset | No |
+| `GOLD_MART_NAME` / `GOLD_EXPORT_ROW_COUNT` | Mart name and row count the Gold export acceptance test seeds | `gold_export_smoke` / `7` | No |
+
+Debezium Server's image (`ghcr.io/memiiso/debezium-server-iceberg`) is
+pinned by digest in `docker-compose.yml`, not by an env var — see the
+service definition's comment and R4 in the risk register for why (no
+versioned tag is published upstream). Its config
+(`ops/debezium/application.properties.tmpl`) is rendered from the
+connector-registry (ADR 0007), not from top-level env vars.
+
 ## Status / Known limitations
 
 This is a young, honestly-scoped project. Please read this before filing an
 issue about any of the following — they're known, not bugs:
 
-- **`rust/Dockerfile` does not currently build from a clean clone**
-  (wrong rustc pin + a `pub mod tenant;` in `lib.rs` whose source file
-  isn't committed yet). See the "KNOWN BLOCKER" section at the top of
-  [docs/OPERATIONS.md](docs/OPERATIONS.md) for the exact errors and status.
-- **`streaming` is mocked.** There is no Kafka/Redpanda/Pulsar/Flink
-  anywhere in this project. The streaming domain in the UI is backed by
-  `src/services/mock/streaming.ts`.
+- **There is no streaming surface.** There is no Kafka/Redpanda/Pulsar/Flink
+  anywhere in this project. The console previously had a mocked
+  `streaming` domain fabricating lag/throughput/checkpoint numbers; it has
+  been removed rather than kept as a mock. **CDC (Debezium, P5) is not a
+  streaming engine** and is not relabeled as one — it's a
+  change-data-capture pipe from Postgres into Bronze Iceberg, surfaced
+  instead under Governance → "Ingestion (CDC)".
 - **`knowledge.search` is mocked.** There is no vector store or embeddings
   API wired up. Knowledge *sources* and *vector jobs* ARE real, backed by
   Postgres (`lakehouse-store::knowledge`) — only the search-query path
   itself is mocked.
+- **Connector "Test connection" genuinely dials only PostgreSQL and
+  S3-compatible object storage.** `POST /api/connectors/{id}/test`
+  (`lakehouse-api`'s `connector_probe` module) opens a real, 5s-bounded
+  connection and measures real latency for those two types, resolving the
+  connector's `secretRef` via `EnvSecretResolver` (ADR 0002). Every other
+  connector `type` (Kafka, MQTT, MongoDB, Oracle, SAP/ERP, SFTP, a vendor
+  REST API, ...) has no dial implementation in this build and returns
+  `{ supported: false }` with a message saying so — never a fabricated
+  latency or success. The seed (`0022_prune_connector_seed.sql`) was
+  shrunk to match: two connectors, `conn-pg-lakehouse` and
+  `conn-s3-warehouse`, pointing at the compose stack's own Postgres and
+  RustFS.
+- **ClickHouse cannot `CREATE TABLE` through the catalog, on 26.3 or
+  26.8.** `CREATE TABLE` inside a `DataLakeCatalog` database never reaches
+  Lakekeeper — it falls back to `MergeTree` and fails with `Code: 79` on
+  both versions. `INSERT` is the part that changed: on 26.3 a partitioned
+  catalog-registered table **segfaulted the server** and an unpartitioned
+  one failed with `Code: 1000`; on the pinned 26.8 both now succeed. Gold
+  export still goes through Rust (ADR 0010), because `CREATE TABLE` —
+  the half that has to work for ClickHouse to own a table's lifecycle —
+  still does not. See `docs/plans/CLICKHOUSE-26.8-REMEASUREMENT.md` for the
+  re-measurement and `docs/plans/G1-RESULT.md` for the original 26.3 run.
+- **`OPTIMIZE` runs but does not bin-pack, and `expire_snapshots` is now
+  refused.** On the pinned 26.8, `remove_orphan_files` works (it did not
+  exist on 26.3) and `OPTIMIZE` returns OK but leaves the file count
+  unchanged — 7 files in, 7 files out — so it is not compaction. Moving
+  the other way, `expire_snapshots` worked on 26.3 and is **unsupported
+  for transactional catalogs** on 26.8. Small-file compaction on Bronze
+  therefore still runs out-of-band via a Trino-as-cron container (`trino`
+  compose profile, ADR 0009); a deployment that never enables that profile
+  accumulates small Bronze files unbounded.
+- **Bronze snapshot history is currently unbounded.** This follows from the
+  line above and is an operational gap now, not a future one: nothing
+  expires snapshots. ClickHouse 26.8 refuses `expire_snapshots` for
+  catalog-backed tables, the maintenance job probes it each run and logs
+  the live refusal rather than skipping silently, and Lakekeeper-side
+  expiry does not exist yet. ADR 0004 deferred retention to P4; with P5
+  CDC volume landing continuously, metadata grows without a bound until
+  that is built. See `docs/plans/CLICKHOUSE-26.8-REMEASUREMENT.md` and
+  `docs/plans/G3-RESULT.md`.
+- **A bare `count()` overcounts on CDC-fed Bronze tables — measured on
+  26.3, not re-verified on the pinned 26.8.** Reproducing it needs a
+  CDC-fed table carrying merge-on-read equality deletes, i.e. the full
+  Debezium path rather than a hand-built table, so the 26.8 re-measurement
+  did not cover it. Treat it as open, not fixed: the lint that guards it
+  (R11) is version-independent and stays either way. On ClickHouse
+  26.3, `SELECT count()` / `count(*)` / `count(<col>)` against a Bronze
+  Iceberg table with merge-on-read equality deletes (i.e. any
+  Debezium-fed table) takes a metadata-only fast path that does not
+  subtract deleted rows — measured returning 6 where 4 was correct. Any
+  `WHERE` or `GROUP BY` forces the correct row-scan path. This is a
+  silent wrong answer, not an error; no code added in this repository
+  emits a bare `count()` against a Bronze Iceberg table (R11). See
+  `docs/plans/P5-RESULT.md`.
+- **Lakekeeper authorization is enabled by default — `authz-backend:
+  "openfga"`, not `"allow-all"`.** `docker compose up` now brings up
+  OpenFGA and a mock OIDC issuer (`ops/oidc-mock`) alongside Lakekeeper,
+  and every writer this repo's own tests exercise (the Rust `g1-lakekeeper`
+  test path, `debezium-server`, the dlt pipeline) authenticates as a
+  granted principal — see `docs/adr/0011-lakekeeper-authorization.md` for
+  the model, the grants, and the default-posture decision. **What is still
+  open:** ClickHouse's `CREATE TABLE`/`INSERT` through the catalog do not
+  work on this ClickHouse version at all (a ClickHouse defect, independent
+  of authorization — see above and `docs/plans/G1-RESULT.md`), so R1's
+  original framing ("ClickHouse catalog-registered
+  writes fail against Lakekeeper's authz on metadata updates") is still
+  untestable. The `trino` compose profile (ADR 0009's small-file-
+  compaction escape hatch) is granted its own principal too — `EXECUTE
+  optimize` measured working under enforcement (3 data files -> 1 on a
+  live Bronze table; see ADR 0011 and `docs/plans/G3-RESULT.md`).
 - **`getWorkspaceSettings` returns a fixed response.** The contract has no
   setter; workspace settings are not actually persisted or configurable
   yet.

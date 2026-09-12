@@ -58,6 +58,16 @@ const DEAD_UPSTREAM: &str = "http://127.0.0.1:1";
 /// `AppState::new` — not a `PgPool` extractor — is what this crate's tests
 /// need.
 pub async fn spin_up() -> TestApp {
+    spin_up_with_env(&HashMap::new()).await
+}
+
+/// Same as [`spin_up`], but `overrides` is merged into the env map AFTER
+/// the usual dead-upstream defaults are set, so a caller can point one
+/// upstream at something real (e.g. `LLM_URL` at a `wiremock::MockServer`,
+/// for T3.2's headless-run tests that actually need the LLM to answer)
+/// without losing the others' fail-fast behaviour, and can set config-only
+/// keys (e.g. `AGENT_RUN_TOKEN`) that [`spin_up`] never sets at all.
+pub async fn spin_up_with_env(overrides: &HashMap<String, String>) -> TestApp {
     let base_url = lakehouse_test_support::database_url();
     let admin_pool = PgPoolOptions::new()
         .max_connections(1)
@@ -88,6 +98,9 @@ pub async fn spin_up() -> TestApp {
     env.insert("CH_URL".to_owned(), DEAD_UPSTREAM.to_owned());
     env.insert("DAGSTER_URL".to_owned(), DEAD_UPSTREAM.to_owned());
     env.insert("LLM_URL".to_owned(), DEAD_UPSTREAM.to_owned());
+    for (k, v) in overrides {
+        env.insert(k.clone(), v.clone());
+    }
     // Deliberately NOT `APP_ENV=development`: keeps the session cookie's
     // `Secure` attribute on, matching the fail-closed production default —
     // these tests never rely on the cookie flowing over plaintext HTTP,

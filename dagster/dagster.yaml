@@ -1,0 +1,18 @@
+# Dagster instance config: run/event-log/schedule storage on the EXISTING
+# `postgres` compose service, via a dedicated `dagster` database
+# (`dagster-db-init` mirrors `lakekeeper-db-init` exactly) — not Dagster's
+# default SQLite, which cannot be shared between the webserver and daemon
+# containers. See docs/adr/0005-dagster-code-location-ownership-and-packaging.md.
+storage:
+  postgres:
+    postgres_db:
+      hostname:
+        env: DAGSTER_PG_HOST
+      port:
+        env: DAGSTER_PG_PORT
+      username:
+        env: DAGSTER_PG_USER
+      password:
+        env: DAGSTER_PG_PASSWORD
+      db_name:
+        env: DAGSTER_PG_DB

@@ -94,10 +94,6 @@ const columns: ColumnDef<Connector>[] = [
   },
 ]
 
-function dependentHref(kind: "pipeline" | "streaming", id: string) {
-  return kind === "streaming" ? `/streaming/${id}` : `/pipelines/${id}`
-}
-
 /** Drawer body — fetches full connector detail for the selected row. */
 function ConnectorDetail({ id }: { id: string }) {
   const state = useService((s) => connectorService.getConnector(id, s), [id])
@@ -148,12 +144,21 @@ function ConnectorDetail({ id }: { id: string }) {
       {testAction.data ? (
         <p
           className={
-            testAction.data.ok
-              ? "text-sm text-emerald-600 dark:text-emerald-400"
-              : "text-sm text-destructive"
+            !testAction.data.supported
+              ? "text-sm text-muted-foreground"
+              : testAction.data.ok
+                ? "text-sm text-emerald-600 dark:text-emerald-400"
+                : "text-sm text-destructive"
           }
         >
-          {testAction.data.message} · {testAction.data.latencyMs} ms
+          {testAction.data.supported ? (
+            <>
+              {testAction.data.message}
+              {testAction.data.latencyMs !== null ? ` · ${testAction.data.latencyMs} ms` : ""}
+            </>
+          ) : (
+            <>Not testable · {testAction.data.message}</>
+          )}
         </p>
       ) : null}
       <MetadataList
@@ -223,14 +228,14 @@ function ConnectorDetail({ id }: { id: string }) {
         </p>
         {c.dependentPipelines.length === 0 ? (
           <p className="mt-1 text-sm text-muted-foreground">
-            No dependent pipelines or streaming jobs.
+            No dependent pipelines.
           </p>
         ) : (
           <ul className="mt-1 space-y-1">
             {c.dependentPipelines.map((p) => (
               <li key={p.id}>
                 <Link
-                  href={dependentHref(p.kind, p.id)}
+                  href={`/pipelines/${p.id}`}
                   className="font-mono text-sm text-primary hover:underline"
                 >
                   {p.name}

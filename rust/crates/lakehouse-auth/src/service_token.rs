@@ -24,6 +24,31 @@ use crate::repository::PgPool;
 use crate::secret::Secret;
 use crate::token::{generate_opaque_token, hash_token};
 
+/// Shared insert behind [`create_service_credential`]/
+/// [`ensure_service_credential`] — one place that actually writes a
+/// `service_credential` row, so both callers persist the exact same shape.
+///
+/// `ON CONFLICT (token_hash) DO NOTHING` makes this idempotent against the
+/// table's own `service_credential_token_hash_unique` constraint: inserting
+/// the same (already-hashed) token twice is a no-op, not an error — the
+/// property [`ensure_service_credential`] needs to be safely re-run on
+/// every process boot.
+async fn insert_service_credential(
+    pool: &PgPool,
+    service_identity_id: Uuid,
+    token_hash: &str,
+) -> Result<(), AuthError> {
+    sqlx::query(
+        "INSERT INTO service_credential (service_identity_id, token_hash) VALUES ($1, $2) \
+         ON CONFLICT (token_hash) DO NOTHING",
+    )
+    .bind(service_identity_id)
+    .bind(token_hash)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Issue a new token for `service_identity_id`.
 ///
 /// Returns the raw token — only its hash is persisted.
@@ -38,13 +63,33 @@ pub async fn create_service_credential(
     service_identity_id: Uuid,
 ) -> Result<Secret, AuthError> {
     let token = generate_opaque_token();
-    let token_hash = hash_token(&token);
-    sqlx::query("INSERT INTO service_credential (service_identity_id, token_hash) VALUES ($1, $2)")
-        .bind(service_identity_id)
-        .bind(token_hash)
-        .execute(pool)
-        .await?;
+    insert_service_credential(pool, service_identity_id, &hash_token(&token)).await?;
     Ok(token)
+}
+
+/// Idempotently persist a caller-supplied `token` as `service_identity_id`'s
+/// credential, hashing it the exact same way [`create_service_credential`]
+/// hashes its own generated token.
+///
+/// This is the shape a config-driven bootstrap needs and
+/// [`create_service_credential`] cannot provide: the caller (e.g.
+/// `lakehouse-api`'s `main::bootstrap_agent_run_service`) already knows the
+/// token's value — it came from an env var an operator set, not from this
+/// crate's CSPRNG — so it must be *this exact token's* hash that lands in
+/// `service_credential`, not a freshly generated one. Re-running this with
+/// the same `token` on every process restart is a no-op (see
+/// [`insert_service_credential`]'s doc comment): the credential is neither
+/// duplicated nor invalidated.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Database`] on any storage failure.
+pub async fn ensure_service_credential(
+    pool: &PgPool,
+    service_identity_id: Uuid,
+    token: &Secret,
+) -> Result<(), AuthError> {
+    insert_service_credential(pool, service_identity_id, &hash_token(token)).await
 }
 
 /// Revoke `token`. Idempotent, for the same reason

@@ -1,0 +1,331 @@
+"""P5 Dagster job: Postgres replication-slot lag / WAL-retention metrics —
+R5 in `docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md`'s risk register ("a stuck or
+lagging replication slot pins WAL and fills the customer's production
+database disk"), the most dangerous risk in the whole build. This job is
+the first-class metrics surface the task brief requires, and it deliberately
+reuses the EXACT mechanism `dispar_orchestrate.maintenance.record_maintenance_run`
+already established in P4: a plain `INSERT` into a `lake.bronze_meta.*`
+table, read back by `lakehouse-api::routes::governance` — not a parallel
+registry, per R10 (the `bronze_meta.*` schema already has enough owners).
+
+# What this measures, and why via SQL against the source, not Debezium
+
+`pg_replication_slots` (queryable on ANY Postgres server with a slot, no
+special privilege beyond `pg_monitor` or superuser) reports, per slot:
+`active` (is a consumer currently connected), `restart_lsn` (the oldest WAL
+Postgres must retain for this slot), and `confirmed_flush_lsn` (the newest
+WAL position the consumer has acknowledged). `pg_current_wal_lsn() -
+restart_lsn` (via `pg_wal_lsn_diff`) is exactly "how much WAL is being
+pinned by this slot" — the quantity that fills a disk if a slot goes stale.
+This is measured directly against the SOURCE Postgres server, not asked of
+Debezium Server itself, because a customer's production database is the
+actual thing at risk, and it already exposes this via a system view with no
+extra component required — asking Debezium instead would mean trusting a
+CDC connector's own self-report of a risk that manifests on a database it
+does not control.
+
+# Delivery — how a breached threshold actually reaches a human
+
+Measuring is only half of R5. Until this job also exposed
+`serving.replication_slot_health`, a breach produced a row and a log line
+and nothing else: `_status_for` computed "warning"/"critical" that no one
+was told about, so the operator's first notification that WAL was pinned
+would be the source disk filling. A metric nobody is paged on is not a
+mitigation.
+
+`lakehouse_alerts::run_rules` evaluates every rule as
+`SELECT {aggregate}({measure}) AS v FROM serving.{mart}` — it can only read
+`serving.*`, which is precisely why a `lake.bronze_meta.*` table was
+invisible to it. The view this job creates puts the same numbers in reach of
+that existing engine, so breaches deliver through the existing channels
+(email/webhook, `POST /api/alerts/run`) with no second delivery path to
+maintain — R10's "reuse the mechanism, do not invent a parallel one".
+
+The rule is NOT auto-created, deliberately: seeding a rule that emails
+people is not a decision a metrics job should make on an operator's behalf.
+Create it once, via `POST /api/alerts/rules` or the console:
+
+    mart      = replication_slot_health
+    aggregate = max
+    measure   = unhealthy
+    operator  = gt
+    threshold = 0
+
+which fires whenever any slot's latest check is `warning` or `critical`. To
+alert on an absolute size instead, use `measure = wal_retained_bytes` with
+`aggregate = max` and a byte threshold.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from typing import Any
+
+import psycopg2
+import requests
+from dagster import DefaultScheduleStatus, Definitions, ScheduleDefinition, job, op
+
+from dispar_orchestrate.bronze_catalog import ClickHouseTarget
+
+
+def _env(name: str, default: str) -> str:
+    value = os.environ.get(name, "").strip()
+    return value if value else default
+
+
+def _ch_exec(target: ClickHouseTarget, statement: str) -> None:
+    """Duplicated from `bronze_catalog._ch_exec` rather than imported: that
+    function (and `_sql_string_literal`/`_utc_now_iso`, also duplicated
+    below) are module-private by convention (leading underscore) — this
+    module gets its own copies rather than reaching across that boundary,
+    the same call `maintenance.py` already made for its own `_ch_query`."""
+    resp = requests.post(
+        target.url,
+        auth=(target.user, target.password),
+        data=statement.encode("utf-8"),
+        timeout=30,
+    )
+    resp.raise_for_status()
+
+
+def _sql_string_literal(value: str) -> str:
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _utc_now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+@dataclass(frozen=True)
+class ReplicationConfig:
+    ch: ClickHouseTarget
+    # CREDENTIAL HYGIENE (review finding): this used to read
+    # `BRONZE_SOURCE_DATABASE_URL` — a full `postgresql://user:password@
+    # host/db` DSN passed through docker-compose.yml as one plaintext env
+    # var (visible whole to `docker inspect`). That var is gone; these
+    # four components match `dlt_pipeline.py`'s `BronzeIngestConfig` (see
+    # its field comment) and `docker-compose.yml`'s `dagster-code-location`
+    # env block, which now sets `BRONZE_SOURCE_DB_HOST`/`_PORT`/`_USER`/
+    # `_PASSWORD`/`_NAME` instead of one DSN. The connection string is
+    # assembled in-process below (`psycopg2.connect` accepts discrete
+    # kwargs directly, so it is never even joined into one string here).
+    source_db_host: str
+    source_db_port: str
+    source_db_user: str
+    source_db_password: str
+    source_db_name: str
+
+    @classmethod
+    def from_env(cls) -> "ReplicationConfig":
+        return cls(
+            ch=ClickHouseTarget.from_env(),
+            source_db_host=_env("BRONZE_SOURCE_DB_HOST", "postgres"),
+            source_db_port=_env("BRONZE_SOURCE_DB_PORT", "5432"),
+            source_db_user=_env("BRONZE_SOURCE_DB_USER", "lakehouse"),
+            source_db_password=_env("BRONZE_SOURCE_DB_PASSWORD", "lakehouse"),
+            source_db_name=_env("BRONZE_SOURCE_DB_NAME", "lakehouse"),
+        )
+
+
+# `lake.bronze_meta.replication_slot` is a NEW table, introduced by this P5
+# job. Per R10, its DDL is defined in EXACTLY ONE place: here — mirroring
+# `maintenance.py`'s `_MAINTENANCE_RUN_DDL` precedent exactly, including the
+# same reason it is NOT mirrored into `demo/clickhouse/04_registry.sql`
+# (out of scope for this phase's change set).
+_REPLICATION_SLOT_DDL = (
+    "CREATE TABLE IF NOT EXISTS lake.`bronze_meta.replication_slot` ("
+    "connector_id String, "
+    "slot_name String, "
+    "checked_at String, "
+    "active UInt8, "
+    "wal_retained_bytes Int64, "
+    "confirmed_flush_lag_bytes Int64, "
+    "status String"
+    ") ENGINE = ReplacingMergeTree ORDER BY (connector_id, checked_at)"
+)
+
+# R5's delivery half. Before this, a breached WAL threshold produced a row in
+# the table above and a log line — and nothing else. `_status_for` computed
+# "warning"/"critical" that no one was ever told about, which is the failure
+# mode R5 exists to prevent wearing the costume of its own mitigation: the
+# operator learns their source disk is filling by the source disk filling.
+#
+# Rather than build a second delivery path, this exposes the metric where the
+# EXISTING alerts engine can already see it. `lakehouse_alerts::run_rules`
+# evaluates every rule as `SELECT {agg}({measure}) AS v FROM serving.{mart}`
+# — it can only read `serving.*`, which is why a `lake.bronze_meta.*` table
+# was unreachable to it. This view puts the same numbers in reach, so a
+# normal alert rule delivers them through the normal channels (email/webhook,
+# `POST /api/alerts/run`) with no new mechanism to maintain. Per R10: reuse
+# the mechanism, do not invent a parallel one.
+#
+# One row per slot, latest check only (`argMax` over `checked_at`), because
+# an alert should fire on the CURRENT state of a slot, not on a stale row
+# from before it recovered. `unhealthy` is 0/1 so `max(unhealthy) > 0` is the
+# natural rule for "any slot is unhealthy", and `wal_retained_bytes` is
+# exposed directly so an operator can alert on an absolute byte threshold
+# instead if they prefer.
+_REPLICATION_SLOT_HEALTH_VIEW_DDL = (
+    "CREATE OR REPLACE VIEW serving.replication_slot_health AS "
+    "SELECT connector_id, slot_name, "
+    "argMax(status, checked_at) AS status, "
+    "argMax(wal_retained_bytes, checked_at) AS wal_retained_bytes, "
+    "argMax(confirmed_flush_lag_bytes, checked_at) AS confirmed_flush_lag_bytes, "
+    "argMax(active, checked_at) AS active, "
+    "if(argMax(status, checked_at) IN ('warning', 'critical'), 1, 0) AS unhealthy "
+    "FROM lake.`bronze_meta.replication_slot` "
+    "GROUP BY connector_id, slot_name"
+)
+
+# Conservative, arbitrary thresholds — this is a first-class metric, not a
+# tuned alert; an operator with real WAL volume data should override these
+# via env vars rather than this job hardcoding a "correct" number nothing
+# has measured yet (the same "don't guess a number, measure it" posture
+# `docs/adr/0004-bronze-naming-partitioning-retention.md` took for
+# retention).
+_WARN_WAL_RETAINED_BYTES = int(_env("REPLICATION_SLOT_WARN_WAL_BYTES", str(500 * 1024 * 1024)))
+_CRITICAL_WAL_RETAINED_BYTES = int(
+    _env("REPLICATION_SLOT_CRITICAL_WAL_BYTES", str(2 * 1024 * 1024 * 1024))
+)
+
+
+def _status_for(wal_retained_bytes: int, active: bool) -> str:
+    """A slot that is not `active` (no consumer connected) but still
+    exists is ALREADY the dangerous state R5 describes — a disconnected
+    Debezium Server still pins WAL at its last `restart_lsn` indefinitely,
+    which is exactly why this checks `active` independently of the byte
+    thresholds, not only as a tiebreaker."""
+    if not active:
+        return "critical"
+    if wal_retained_bytes >= _CRITICAL_WAL_RETAINED_BYTES:
+        return "critical"
+    if wal_retained_bytes >= _WARN_WAL_RETAINED_BYTES:
+        return "warning"
+    return "ok"
+
+
+def check_replication_slots(cfg: ReplicationConfig) -> list[dict[str, Any]]:
+    """Query every logical replication slot on the source Postgres server.
+    `connector_id` is derived from the slot name (this build's own naming
+    convention, `<connector_slug>_slot` — see
+    `lakehouse_store::cdc::render_debezium_properties`), not looked up
+    against the `connector` table: this job runs against the SOURCE
+    database directly and has no reason to depend on the console's own
+    Postgres being reachable, matching `bronze_catalog.py`'s existing
+    posture of talking to exactly the systems a check needs and no more."""
+    results: list[dict[str, Any]] = []
+    conn = psycopg2.connect(
+        host=cfg.source_db_host,
+        port=cfg.source_db_port,
+        user=cfg.source_db_user,
+        password=cfg.source_db_password,
+        dbname=cfg.source_db_name,
+    )
+    try:
+        conn.set_session(readonly=True, autocommit=True)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT slot_name, active, "
+                "pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint AS wal_retained_bytes, "
+                "COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn), 0)::bigint "
+                "  AS confirmed_flush_lag_bytes "
+                "FROM pg_replication_slots WHERE slot_type = 'logical'"
+            )
+            for slot_name, active, wal_retained_bytes, confirmed_flush_lag_bytes in cur.fetchall():
+                connector_id = slot_name[: -len("_slot")] if slot_name.endswith("_slot") else slot_name
+                results.append(
+                    {
+                        "connector_id": connector_id,
+                        "slot_name": slot_name,
+                        "active": bool(active),
+                        "wal_retained_bytes": int(wal_retained_bytes),
+                        "confirmed_flush_lag_bytes": int(confirmed_flush_lag_bytes),
+                        "status": _status_for(int(wal_retained_bytes), bool(active)),
+                    }
+                )
+    finally:
+        conn.close()
+    return results
+
+
+def record_replication_slot_metrics(
+    slots: list[dict[str, Any]], *, target: "ClickHouseTarget | None" = None
+) -> None:
+    """Upsert every checked slot's metrics into
+    `lake.bronze_meta.replication_slot` — the SAME registry mechanism
+    `record_maintenance_run` already uses, read by
+    `lakehouse-api::routes::governance::replication`."""
+    ch = target or ClickHouseTarget.from_env()
+    _ch_exec(ch, "CREATE DATABASE IF NOT EXISTS lake")
+    _ch_exec(ch, _REPLICATION_SLOT_DDL)
+    # `serving` must exist before a view can be created in it. It does in
+    # every deployment that has run the demo schema, but this job must not
+    # depend on that having happened first.
+    _ch_exec(ch, "CREATE DATABASE IF NOT EXISTS serving")
+    _ch_exec(ch, _REPLICATION_SLOT_HEALTH_VIEW_DDL)
+
+    if not slots:
+        return
+
+    checked_at = _utc_now_iso()
+    values = ", ".join(
+        f"({_sql_string_literal(s['connector_id'])}, {_sql_string_literal(s['slot_name'])}, "
+        f"{_sql_string_literal(checked_at)}, {1 if s['active'] else 0}, "
+        f"{int(s['wal_retained_bytes'])}, {int(s['confirmed_flush_lag_bytes'])}, "
+        f"{_sql_string_literal(s['status'])})"
+        for s in slots
+    )
+    _ch_exec(
+        ch,
+        "INSERT INTO lake.`bronze_meta.replication_slot` "
+        "(connector_id, slot_name, checked_at, active, wal_retained_bytes, "
+        "confirmed_flush_lag_bytes, status) VALUES " + values,
+    )
+
+
+@op
+def run_replication_slot_check(context) -> list[dict[str, Any]]:
+    cfg = ReplicationConfig.from_env()
+    slots = check_replication_slots(cfg)
+    context.log.info(f"checked {len(slots)} replication slot(s): {slots}")
+    for slot in slots:
+        if slot["status"] != "ok":
+            context.log.warning(
+                f"replication slot {slot['slot_name']!r} is {slot['status']}: "
+                f"wal_retained_bytes={slot['wal_retained_bytes']}, active={slot['active']} "
+                "(R5: a stuck/lagging slot pins WAL and can fill the source database's disk)"
+            )
+    record_replication_slot_metrics(slots, target=cfg.ch)
+    context.add_output_metadata({"slots_checked": len(slots)})
+    return slots
+
+
+@job
+def replication_slot_check_job() -> None:
+    """`DAGSTER_LOCATION`-visible job name: `replication_slot_check_job`."""
+    run_replication_slot_check()
+
+
+# Every 15 minutes — WAL can accumulate fast under write-heavy load, so this
+# is deliberately much more frequent than the daily Bronze maintenance
+# schedule; a stuck slot is a same-day operational emergency, not a
+# maintenance-window concern.
+# RUNNING for the same reason as `bronze_maintenance_schedule`: created
+# STOPPED, this never fires, and R5 ("a stuck or lagging replication slot
+# pins WAL and fills the customer's production database disk") is a risk
+# whose whole mitigation is that this runs unattended. A slot-lag monitor
+# that is silently switched off is worse than none, because the empty
+# surface reads as "no problems".
+replication_slot_check_schedule = ScheduleDefinition(
+    job=replication_slot_check_job,
+    cron_schedule="*/15 * * * *",
+    default_status=DefaultScheduleStatus.RUNNING,
+)
+
+replication_defs = Definitions(
+    jobs=[replication_slot_check_job],
+    schedules=[replication_slot_check_schedule],
+)

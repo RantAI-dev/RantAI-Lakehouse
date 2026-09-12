@@ -15,6 +15,7 @@ mod catalog_query;
 mod connectors;
 mod dashboard;
 mod embed;
+mod gold;
 mod governance;
 mod identity;
 mod knowledge;
@@ -173,7 +174,10 @@ fn connectors_router() -> Router<AppState> {
             "/api/connectors",
             get(connectors::list).post(connectors::create),
         )
-        .route("/api/connectors/{id}", get(connectors::detail))
+        .route(
+            "/api/connectors/{id}",
+            get(connectors::detail).delete(connectors::delete),
+        )
         .route(
             "/api/connectors/{id}/test",
             axum::routing::post(connectors::test_connection),
@@ -255,6 +259,10 @@ fn agents_router() -> Router<AppState> {
             axum::routing::post(agents::revoke_employee),
         )
         .route(
+            "/api/agents/employees/{id}/run",
+            axum::routing::post(agents::run_employee),
+        )
+        .route(
             "/api/agents/tools",
             get(agents::list_tools).post(agents::register_tool),
         )
@@ -307,6 +315,10 @@ pub fn router(state: AppState) -> Router {
                 .delete(alerts::delete),
         )
         .route("/api/alerts/run", get(alerts::run).post(alerts::run))
+        .route(
+            "/api/gold/export/{mart}",
+            get(gold::read_back).post(gold::export),
+        )
         .route("/api/query/run", axum::routing::post(query::run))
         .route("/api/query/estimate", axum::routing::post(query::estimate))
         .route("/api/query/saved", get(query::list_saved))
@@ -352,6 +364,7 @@ pub fn router(state: AppState) -> Router {
             axum::routing::post(agent::text_to_sql),
         )
         .route("/api/ai/chat", axum::routing::post(ai::chat))
+        .route("/api/ai/tool", axum::routing::post(ai::tool_call))
         .route(
             "/api/ai/sessions",
             get(ai::sessions_get)

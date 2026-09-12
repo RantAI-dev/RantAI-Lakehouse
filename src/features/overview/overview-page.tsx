@@ -14,7 +14,6 @@ import { useService } from "@/hooks/use-service"
 import {
   formatBytes,
   formatCompactNumber,
-  formatLagSeconds,
   formatPercent,
   formatRelativeTime,
 } from "@/lib/format"
@@ -35,13 +34,13 @@ export function OverviewPage() {
         description="Platform health across storage tiers, pipelines, queries, agents, and governance."
       />
 
-      {summary.status === "loading" ? <MetricSkeleton cards={8} /> : null}
+      {summary.status === "loading" ? <MetricSkeleton cards={7} /> : null}
       {summary.status === "error" ? (
         <ErrorState error={summary.error} onRetry={summary.reload} />
       ) : null}
       {summary.status === "success" ? (
         <>
-          <MetricGrid className="lg:grid-cols-4">
+          <MetricGrid className="lg:grid-cols-3">
             <MetricCard
               label="Catalog assets"
               value={formatCompactNumber(summary.data.assetsTotal)}
@@ -53,12 +52,6 @@ export function OverviewPage() {
               label="Pipelines"
               value={summary.data.pipelines.active}
               hint={`${summary.data.pipelines.failed} failed · ${summary.data.pipelines.delayed} delayed`}
-            />
-            <MetricCard
-              label="Streaming jobs"
-              value={summary.data.streaming.jobs}
-              hint={`max lag ${formatLagSeconds(summary.data.streaming.maxLagSeconds)} · ${summary.data.streaming.unhealthy} unhealthy`}
-              trendTone={summary.data.streaming.unhealthy > 0 ? "negative" : "positive"}
             />
             <MetricCard
               label="Query volume (24h)"
@@ -123,7 +116,7 @@ export function OverviewPage() {
           <div className="grid gap-4 lg:grid-cols-2">
             <SectionCard
               title="Service health"
-              description="Access layer, stores, streaming, and retrieval planes."
+              description="Access layer, stores, and retrieval planes."
             >
               <div className="flex flex-wrap gap-3 text-sm">
                 <span className="text-emerald-600 dark:text-emerald-400">

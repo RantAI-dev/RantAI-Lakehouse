@@ -65,6 +65,10 @@ export function ApprovalsPage() {
     null
   )
   const [comment, setComment] = React.useState("")
+  const [executionResult, setExecutionResult] = React.useState<{
+    executed: boolean
+    result?: unknown
+  } | null>(null)
   const decide = useServiceAction(
     withNotify(
       { success: "Decision recorded", error: "Failed to record decision" },
@@ -88,14 +92,15 @@ export function ApprovalsPage() {
 
   async function confirmDecision() {
     if (!selected || !decision) return
-    const updated = await decide.run(selected.id, {
+    const outcome = await decide.run(selected.id, {
       decision,
       comment: comment.trim() || undefined,
     })
-    if (updated) {
+    if (outcome) {
       setDecision(null)
       setComment("")
-      setSelected(updated)
+      setSelected(outcome.approval)
+      setExecutionResult({ executed: outcome.executed, result: outcome.result })
       state.reload()
     }
   }
@@ -130,7 +135,12 @@ export function ApprovalsPage() {
       {state.status === "success" && rows.length === 0 ? (
         <EmptyState
           title="No approvals"
-          description="Pending and resolved approval requests appear here."
+          description="A request lands here whenever a run — from the copilot chat, Run now, or a schedule — hits a high-risk (WriteHigh) tool call. Nothing is waiting on you right now."
+          action={
+            <Button size="sm" variant="outline" render={<Link href="/agents/runs" />}>
+              View agent runs
+            </Button>
+          }
         />
       ) : null}
       {state.status === "success" && rows.length > 0 ? (
@@ -138,14 +148,20 @@ export function ApprovalsPage() {
           columns={columns}
           rows={rows}
           rowKey={(r) => r.id}
-          onRowClick={setSelected}
+          onRowClick={(r) => {
+            setExecutionResult(null)
+            setSelected(r)
+          }}
         />
       ) : null}
 
       <DetailDrawer
         open={selected !== null}
         onOpenChange={(open) => {
-          if (!open) setSelected(null)
+          if (!open) {
+            setSelected(null)
+            setExecutionResult(null)
+          }
         }}
         title="Approval request"
         description={selected?.action}
@@ -194,9 +210,17 @@ export function ApprovalsPage() {
                   ),
                 },
                 {
+                  // T3.4 of the copilot-operations-handover plan added
+                  // `/agents/runs/[id]`, so this links there now instead of
+                  // showing the run id as plain text.
                   label: "Run",
                   value: selected.runId ? (
-                    <span className="font-mono text-xs">{selected.runId}</span>
+                    <Link
+                      href={`/agents/runs/${encodeURIComponent(selected.runId)}`}
+                      className="font-mono text-xs text-primary hover:underline"
+                    >
+                      {selected.runId}
+                    </Link>
                   ) : (
                     "—"
                   ),
@@ -258,6 +282,20 @@ export function ApprovalsPage() {
                     <li key={e}>{e}</li>
                   ))}
                 </ul>
+              </div>
+            ) : null}
+            {executionResult ? (
+              <div>
+                <p className="text-xs font-medium text-muted-foreground">
+                  {executionResult.executed
+                    ? "Execution result"
+                    : "Decision recorded — not executed"}
+                </p>
+                <pre className="mt-1 max-h-64 overflow-auto rounded bg-muted/60 px-2 py-1.5 font-mono text-[11px] text-muted-foreground">
+                  {executionResult.executed
+                    ? JSON.stringify(executionResult.result, null, 2)
+                    : "The tool was never executed — either the action was rejected, or the approver lacked the underlying tool's own permission."}
+                </pre>
               </div>
             ) : null}
           </>

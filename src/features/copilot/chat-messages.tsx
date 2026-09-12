@@ -40,12 +40,18 @@ export function TypingDots({ className }: { className?: string }) {
 
 /** Daftar pesan Copilot — render kaya (tool cards, pohon build, markdown). */
 export function ChatMessages({
-  messages, busy, error, className,
+  messages, busy, error, className, onConfirmTool, onCancelTool, confirmingKey,
 }: {
   messages: Msg[];
   busy: boolean;
   error?: string | null;
   className?: string;
+  /** Confirm a `needs_confirmation` tool step (T0.4's Confirm button). */
+  onConfirmTool?: (messageIndex: number, stepIndex: number) => void;
+  /** Cancel a `needs_confirmation` tool step. */
+  onCancelTool?: (messageIndex: number, stepIndex: number) => void;
+  /** `"<messageIndex>:<stepIndex>"` of the step currently being confirmed. */
+  confirmingKey?: string | null;
 }) {
   const endRef = React.useRef<HTMLDivElement>(null);
   React.useEffect(() => {
@@ -68,7 +74,15 @@ export function ChatMessages({
             <div className="min-w-0 flex-1 space-y-2 pt-0.5">
               {m.tools && m.tools.length ? (
                 <div className="space-y-1.5">
-                  {m.tools.map((t, j) => <ToolStepCard key={j} step={t} />)}
+                  {m.tools.map((t, j) => (
+                    <ToolStepCard
+                      key={j}
+                      step={t}
+                      onConfirm={onConfirmTool ? () => onConfirmTool(i, j) : undefined}
+                      onCancel={onCancelTool ? () => onCancelTool(i, j) : undefined}
+                      confirming={confirmingKey === `${i}:${j}`}
+                    />
+                  ))}
                 </div>
               ) : null}
               {m.buildRunId ? <BuildTree runId={m.buildRunId} /> : null}

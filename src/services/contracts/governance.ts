@@ -118,6 +118,43 @@ export type CreateResidencyRuleInput = {
   allowedOutput: string
 }
 
+/**
+ * One row of `GET /api/governance/maintenance` — a single Dagster
+ * `bronze_maintenance_job` run against one Bronze Iceberg table. Only
+ * `expire_snapshots` is a real, working verb on ClickHouse 26.3
+ * (`remove_orphan_files` does not exist for Iceberg tables; `OPTIMIZE`
+ * parses but fails at runtime with an HTTP 403) — see
+ * `docs/plans/G3-RESULT.md` and ADR 0009. `skippedVerbs` names the verbs
+ * that were not attempted, so the UI never implies a compaction ran when it
+ * did not.
+ */
+export type MaintenanceRun = {
+  tableName: string
+  runAt: string
+  dryRun: { deletedDataFiles: string; deletedManifestFiles: string }
+  applied: { deletedDataFiles: string; deletedManifestFiles: string }
+  skippedVerbs: string
+}
+
+/**
+ * One row of `GET /api/governance/replication` — a point-in-time snapshot
+ * of one Postgres logical-replication slot backing a CDC connector
+ * (Debezium Server, P5). `status` is `"ok" | "warning" | "critical"`,
+ * computed in `dagster/dispar_orchestrate/replication_metrics.py` from WAL
+ * retention thresholds and whether the slot is still `active` — an
+ * inactive slot is flagged `critical` regardless of byte thresholds,
+ * because a disconnected consumer still pins WAL indefinitely (R5).
+ */
+export type ReplicationSlot = {
+  connectorId: string
+  slotName: string
+  checkedAt: string
+  active: boolean
+  walRetainedBytes: string
+  confirmedFlushLagBytes: string
+  status: "ok" | "warning" | "critical" | string
+}
+
 export interface GovernanceService {
   listPolicies(signal?: AbortSignal): Promise<Policy[]>
   listClassifications(signal?: AbortSignal): Promise<ClassificationRule[]>
@@ -125,6 +162,10 @@ export interface GovernanceService {
   getLineage(focusId: string, signal?: AbortSignal): Promise<LineageGraph>
   listAudit(signal?: AbortSignal): Promise<AuditEvent[]>
   listResidency(signal?: AbortSignal): Promise<ResidencyRule[]>
+  /** Bronze Iceberg maintenance runs (P4/P6) — `GET /api/governance/maintenance`. */
+  listMaintenanceRuns(signal?: AbortSignal): Promise<MaintenanceRun[]>
+  /** CDC replication slot health (P5/P6) — `GET /api/governance/replication`. */
+  listReplicationSlots(signal?: AbortSignal): Promise<ReplicationSlot[]>
   createPolicy(input: CreatePolicyInput, signal?: AbortSignal): Promise<Policy>
   createQualityRule(
     input: CreateQualityRuleInput,

@@ -190,6 +190,14 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",    "/api/alerts/run",  Policy::RequiresAuth),
     ("POST",   "/api/alerts/run",  Policy::RequiresAuth),
 
+    // ── Gold export (ADR 0010, Rust/Phase-P6-only — no TypeScript route to
+    //    port): same "floor" shape as `/api/alerts/run` — `RequiresAuth`
+    //    here, PLUS `routes::gold::check_export_token`'s own stricter D4
+    //    guard inside the handler (shared-token match, or a service-
+    //    identity principal when `GOLD_EXPORT_RUN_TOKEN` is unset). ──────
+    ("GET",  "/api/gold/export/{mart}",  Policy::RequiresAuth),
+    ("POST", "/api/gold/export/{mart}",  Policy::RequiresAuth),
+
     // ── Query: seeded Analyst permission `query:read`. `collaboration` has
     //    no seeded resource — auth only. ──────────────────────────────────
     ("POST", "/api/query/run",            Policy::RequiresPermission("query:read")),
@@ -235,6 +243,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/agent/query",         Policy::RequiresAuth),
     ("POST", "/api/agent/text-to-sql",   Policy::RequiresAuth),
     ("POST", "/api/ai/chat",             Policy::RequiresAuth),
+    ("POST", "/api/ai/tool",             Policy::RequiresAuth),
     ("GET",    "/api/ai/sessions",       Policy::RequiresAuth),
     ("POST",   "/api/ai/sessions",       Policy::RequiresAuth),
     ("DELETE", "/api/ai/sessions",       Policy::RequiresAuth),
@@ -259,6 +268,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/connectors",             Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/connectors",             Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}",        Policy::RequiresPermission("connector:manage")),
+    // Was missing entirely while `routes::mod` registered `.delete(...)` on
+    // this pattern, so `auth_gate` classified every DELETE as unclassified and
+    // returned a hard 500 — the deny-by-default branch doing exactly its job,
+    // on a route that was simply never added here. See
+    // `tests/route_auth.rs::every_registered_route_has_a_policy_entry`.
+    ("DELETE", "/api/connectors/{id}",      Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/connectors/{id}/test",   Policy::RequiresPermission("connector:manage")),
 
     // ── Knowledge: no seeded resource — auth only. ───────────────────────
@@ -280,6 +295,16 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/agents/employees/{id}/suspend",   Policy::RequiresPermission("agent:manage")),
     ("POST", "/api/agents/employees/{id}/resume",    Policy::RequiresPermission("agent:manage")),
     ("POST", "/api/agents/employees/{id}/revoke",    Policy::RequiresPermission("agent:manage")),
+    // `/employees/{id}/run` (T3.2, copilot-operations-handover plan): same
+    // "floor" shape as `/api/alerts/run`/`/api/gold/export/{mart}` —
+    // `RequiresAuth` here, PLUS `routes::agents::check_employee_run_auth`'s
+    // own stricter guard inside the handler (a matching `x-run-token`
+    // against `AGENT_RUN_TOKEN`, OR an authenticated principal holding
+    // `agent:manage` — unlike gold/alerts, the no-token fallback is a
+    // PERMISSION check, not a service-identity check, because a human
+    // clicking "Run now" is a legitimate caller here, not only a
+    // scheduler). ────────────────────────────────────────────────────────
+    ("POST", "/api/agents/employees/{id}/run",       Policy::RequiresAuth),
     ("GET",  "/api/agents/tools",                    Policy::RequiresAuth),
     ("POST", "/api/agents/tools",                    Policy::RequiresAuth),
     ("GET",  "/api/agents/runs",                     Policy::RequiresAuth),

@@ -1,0 +1,176 @@
+# Lakehouse Foundation Plan
+
+Takes RantAI Lakehouse from a console over Postgres + ClickHouse + Dagster to
+a working lakehouse: object storage, an Iceberg REST catalog, Bronze
+ingestion, ClickHouse serving, and in-engine maintenance.
+
+Locked decisions live in the task brief and are not restated here. Open
+questions are ADRs in [`docs/adr/`](../adr/). Phase gates are in §3.
+
+## 1. Current state
+
+Today the product is a **ClickHouse warehouse with medallion-shaped database
+names**, not a lakehouse. `bronze`, `silver`, and `gold` are ClickHouse
+databases (`demo/clickhouse/02_bronze.sql`, `05_silver.sql`); data lives in
+MergeTree, coupled to the only engine that can read it. There is no object
+storage, no open table format, and no catalog over open tables. This is why
+`routes/storage.rs` hardcodes the Cold and AI tiers to zero — there is
+nowhere cold to put anything.
+
+### Rust crates
+
+| Crate | State | Note |
+| --- | --- | --- |
+| `lakehouse-core` | Real | `ApiError`, `Ident`/`SqlLiteral` injection boundary |
+| `lakehouse-clickhouse` | Real | HTTP client, single `lib.rs` |
+| `lakehouse-store` | Real | 9 Postgres domains; `connect_lazy` is non-fatal |
+| `lakehouse-auth` | Real | 4 authenticators, `Principal` seam |
+| `lakehouse-bi` | Real | Chart specs + ClickHouse board store |
+| `lakehouse-dagster` | Real | GraphQL: launch, terminate, re-execute, schedules |
+| `lakehouse-llm` / `-embed` / `-notify` / `-alerts` | Real | External-system clients |
+| `lakehouse-api` | Real | 12.9k LOC, 19 route modules — largest crate, watch growth |
+| `lakehouse-test-support` | Real | Postgres integration harness |
+
+**No crate does object I/O, Iceberg, or catalog work.** `rust/Cargo.toml`
+declares exactly one database driver: `sqlx` with the `postgres` feature. No
+`object_store`, no `iceberg`, no S3 client of any kind.
+
+### Frontend service domains
+
+Ten of twelve are real (`src/services/index.ts`). Still mocked: `streaming`
+(no streaming engine exists anywhere) and `knowledge.search` (no vector
+store). Both are deliberate and documented.
+
+### Stubbed — looks real, is not
+
+- **Storage Cold/AI tiers** always report zero.
+
+**Resolved in P6:** `connectors::test_connection` used to open no socket —
+it bumped `last_test_at` and returned stored health with a hardcoded
+latency (84ms / 2400ms), and `0014_seed_connectors.sql` seeded 28
+connectors (Kafka, MQTT, MongoDB, Oracle, SAP, SFTP, Iceberg, S3) none of
+which could dial. As of P6: `POST /api/connectors/{id}/test` genuinely
+dials **PostgreSQL** and **S3-compatible object storage** (`lakehouse-api`'s
+new `connector_probe` module, resolving `secretRef` via ADR 0002's
+`SecretResolver`) and reports real measured latency; every other connector
+`type` returns `supported: false` with an honest message, never a
+fabricated result. `0022_prune_connector_seed.sql` shrank the seed to the
+two connectors this build can actually dial against the compose stack
+(`conn-pg-lakehouse`, `conn-s3-warehouse`) — see that migration and
+`connector_probe.rs`'s module doc comments for the full record.
+
+### Doc accuracy
+
+`docs/ARCHITECTURE.md` and `docs/OPERATIONS.md` are accurate and high
+quality. Stale and corrected as they are touched: root
+`FEATURE_COVERAGE.md` ("All product data paths are mock adapters" — false
+for 10 domains), `AI_PROJECT_INSIGHTS.md` ("frontend preview only"),
+README's MSRV note (says 1.85; `Cargo.toml` says 1.88).
+
+## 2. Compose service inventory
+
+| Service | Status | Phase |
+| --- | --- | --- |
+| `postgres` (16) | Exists | — |
+| `clickhouse` (24.8) | Exists | Needs ≥26.2 for Iceberg writes — bump in P1 |
+| `lakehouse-api` | Exists | Built from `Dockerfile.api`; converge in P0 |
+| `rustfs` | New | P1 — default S3 implementation |
+| `lakekeeper` | New | P1 — Iceberg REST catalog |
+| `lakekeeper-migrate` | New | P1 — one-shot schema init |
+| `seaweedfs` | New | P2 — matrix profile only |
+| `dagster` (webserver + daemon + code location) | New | P3 |
+| `debezium-server` | New | P5 |
+| `trino` | Conditional | P4 only if G3 fails |
+
+Every new service gets a healthcheck, an env var in `config.rs` and the
+README table, an `OPERATIONS.md` entry, and a failure-mode note.
+
+## 3. Phases, tasks, acceptance
+
+**P0 — Unblock.** `main.rs:17` declares `mod tenant;` but
+`src/tenant.rs` is uncommitted, so a clean clone does not build. The module
+is used by 5 route modules (`ops`, `dashboard`, `governance`, `catalog`,
+`pipelines`), so it is committed, not removed. Converge `rust/Dockerfile`
+and `rust/Dockerfile.api` per `OPERATIONS.md`, point compose at the survivor.
+*Accept:* clean clone + `docker compose up --build` green; CI green except
+the known gitleaks history job.
+
+**P1 — Floor (G1).** RustFS + Lakekeeper in compose. New crate
+`lakehouse-iceberg`: `object_store` client, Lakekeeper REST client, Bronze
+table create + append via `iceberg-rust`. ClickHouse `DataLakeCatalog`
+database over Lakekeeper (`allow_database_iceberg = 1`; backtick
+`` `db.table` `` naming). *Accept:* integration test under compose, using
+**vended credentials** against RustFS — (a) Rust appends, ClickHouse SELECTs
+the rows; (b) ClickHouse `CREATE TABLE` + `INSERT` through the catalog
+(`allow_insert_into_iceberg = 1`), read back via `iceberg-rust`.
+**Stop condition:** if (b) fails specifically against Lakekeeper, halt and
+report with logs and versions. This is the one finding that changes the
+design.
+
+**P2 — Storage boundary (G2).** Same suite against SeaweedFS by env/config
+change only — no code diff. Write `docs/STORAGE-COMPATIBILITY.md` (v4
+signing, ListObjectsV2, multipart, range GET, conditional writes,
+STS-or-remote-signing, lifecycle). *Accept:* matrix green on both stores.
+
+**P3 — Batch ingest (G3a).** Dagster code location; dlt `sql_database`
+reads a real Postgres table into Bronze through Lakekeeper. *Accept:*
+end-to-end test; table visible in console catalog; lineage recorded.
+
+**P4 — Maintenance (G3).** Dagster job, per Bronze table, in order:
+`expire_snapshots` → `remove_orphan_files` → `OPTIMIZE` →
+`OPTIMIZE … MANIFEST`, each behind its experimental setting. `dry_run`
+metrics surfaced in console. *Accept (G3):* synthetic small-file load
+equivalent to 14 days of CDC; measure file count and query planning time per
+partition before/after. **ClickHouse has no bin-pack rewrite of small data
+files** — if planning degrades beyond 2×, add Trino-as-cron for `optimize`
+on Bronze only, and record the ADR. Otherwise Trino stays out.
+
+**P5 — CDC (G4).** Debezium Server + debezium-server-iceberg from Postgres
+logical replication into Bronze; upsert mode; snapshot then stream; schema
+evolution constrained to the ClickHouse-readable set. Connector registry
+generates the config. Slot lag and WAL retention exposed as metrics/alerts.
+*Accept:* insert/update/delete on source visible in ClickHouse within the
+agreed latency; replication slot cleanup verified on connector delete.
+
+**P6 — Console.** Storage/Catalog/Ingestion/Maintenance surfaces in the
+existing UI domains; replace mocks the new layer makes real; shrink the
+fictional connector seed; update `FEATURE_COVERAGE.md`, `ARCHITECTURE.md`,
+`OPERATIONS.md`, README.
+
+## 4. ADRs
+
+| ADR | Subject | Due |
+| --- | --- | --- |
+| 0001 | Dockerfile convergence and the `tenant` module | P0 |
+| 0002 | `secretRef` resolution: env → file → provider trait | P1 |
+| 0003 | Tenant → Lakekeeper project/warehouse mapping | P1 |
+| 0004 | Bronze naming, partitioning (default: ingestion day), retention | P1 |
+| 0005 | Dagster code-location ownership and compose packaging | P3 |
+| 0006 | Schema-evolution propagation: source → Bronze → Silver | P4 |
+| 0007 | Connector registry → Debezium/dlt config generation | P5 |
+| 0008 | Initial snapshot/backfill for large tables | P5 |
+| 0009 | Small-file compaction (outcome of G3) | P4 |
+| 0010 | Gold export to Iceberg happens in Rust, not ClickHouse | **Done** (P1) |
+| 0011 | Lakekeeper authorization: OpenFGA, principals, default posture | **Done** (R1) |
+
+ADR 0002 is load-bearing: Lakekeeper storage secrets, Debezium source
+credentials, and dlt all block on it.
+
+## 5. Risk register
+
+| # | Risk | Severity | Mitigation |
+| --- | --- | --- | --- |
+| R1 | ClickHouse catalog-registered writes fail against Lakekeeper's authz on metadata updates | **Critical → Retired** (with a caveat) | **Retired for everything measurable; the original framing stays untestable.** Lakekeeper now runs `authz-backend: "openfga"` by default (`docker compose up`, no profile) — see [ADR 0011](../adr/0011-lakekeeper-authorization.md). Every writer this repo's own tests exercise (`rust-iceberg`, `debezium`, `dlt`) authenticates as a granted principal and G1/G2/G3/G3a/G4 all pass under enforcement; a negative test proves an ungranted principal is genuinely denied (`404 NoSuchWarehouseException`, not a silent pass). **What R1's original sentence asked for — ClickHouse's catalog *writes* failing against authz — is still moot as framed**: ClickHouse cannot write through the catalog at all on this ClickHouse version (unchanged since P1, see [G1-RESULT.md](G1-RESULT.md)), so that interaction never reaches Lakekeeper's authz layer to be measured. Gold export stays on Rust ([ADR 0010](../adr/0010-gold-export-to-iceberg-from-rust.md)). Not yet granted: the `trino` profile |
+| R2 | No bin-pack rewrite in ClickHouse; Bronze accumulates small files from CDC. **Raised in P1a:** `OPTIMIZE … MANIFEST` is also a syntax error on 26.3, so two assumed mitigations are unavailable — see [CLICKHOUSE-MAINTENANCE-FINDINGS.md](CLICKHOUSE-MAINTENANCE-FINDINGS.md) | **High** | G3 measures it; Trino-as-cron is the pre-authorized escape hatch, and is now more likely to be needed |
+| R3 | RustFS is young; storage is the durability layer | **High** | S3 API is the boundary; G2 proves the swap; customer S3 is first-class |
+| R4 | `debezium-server-iceberg` is community-maintained (Memiiso), not Debezium-official | Medium | Pin version; isolate behind the connector-registry config seam so it is replaceable |
+| R5 | Debezium replication slot pins WAL and fills a customer's primary disk | **High** | Slot lag + WAL retention as first-class alerts (P5); verified slot cleanup on delete |
+| R6 | `iceberg-rust` 0.10.x is pre-1.0; API churn expected | Medium | Pin exact minor; confine to `lakehouse-iceberg` so upgrades touch one crate |
+| R7 | Nested struct/array/map type changes are not readable by ClickHouse | Medium | Enforce in the connector contract; reject at registration, not at read time |
+| R8 | New services inherit "Postgres-down is quiet" — failures surface only as request-time 503s | Medium | Healthcheck per service; revisit `GET /health/ready` (proposed in `OPERATIONS.md`) |
+| R9 | Six new components for a stack with zero object storage today | Medium | Strict gate order; no phase starts before the prior gate passes |
+| R11 | **Added in P5. Silent wrong answers, not errors — the most dangerous class in this build. Now enforced, not just conventional.** On ClickHouse 26.3, a bare `count()` / `count(*)` / `count(<col>)` against an Iceberg table with merge-on-read equality deletes (i.e. any CDC-fed Bronze table) takes a metadata-only fast path and **overcounts**, returning every physical row Debezium ever wrote including superseded ones — measured 6 where the correct answer is 4 (8 vs. 6 in the P5 stack that first hit it — see [P5-RESULT.md](P5-RESULT.md)). Adding *any* `WHERE` or `GROUP BY` forces the row-scan path and is correct. | **High** | `ops/lint/check_bare_iceberg_count.py`, a CI job (`.github/workflows/ci.yml`, `r11-bare-iceberg-count`), scans Python/Rust/TypeScript sources for a bare `count()`/`count(*)`/`count(<col>)` against a `DataLakeCatalog`/`icecat*`/`` `bronze.*` `` target lacking a `WHERE`/`GROUP BY`, and fails the build. Verified firing: running it cold caught two real pre-existing violations (`ops/g3a/g3a_test.py`, `rust/crates/lakehouse-iceberg/tests/g1_lakekeeper.rs`, both fixed to `WHERE 1`), and it was separately demonstrated catching a deliberately injected violation and clearing after removal. It never flags `bronze_meta.*`/`silver.*`/`serving.*`/`system.*` (MergeTree, safe) — see the script's own docstring for the exact false-positive/false-negative boundary of this text-based heuristic (not a SQL parser). |
+| R10 | **Added in P3. Now enforced, not just conventional.** The `bronze_meta.*` registry schema was defined in two places — `demo/clickhouse/04_registry.sql` and `dagster/dispar_orchestrate/bronze_catalog.py`'s `CREATE TABLE IF NOT EXISTS`. Verified byte-identical at the time (same columns, types, `ReplacingMergeTree`, `ORDER BY`), but nothing enforced that. If one drifted, `IF NOT EXISTS` would silently keep the stale table and the console would read wrong data with no error. | Medium | `demo/clickhouse/04_registry.sql` is out of scope for this build to edit, so a shared migration file was not an option. Instead, `bronze_catalog.py` is now the schema's single owner: `EXPECTED_SCHEMAS`/`_MAINTENANCE_RUN_SCHEMA` are the canonical column/engine/`ORDER BY` definitions, and `_assert_or_create_schema` either creates a missing table (the bare-compose-stack bootstrap case) or, if the table already exists, reads its actual shape back from `system.columns`/`system.tables` and raises `SchemaDriftError` on any mismatch instead of silently trusting an `IF NOT EXISTS` no-op. Verified against a live ClickHouse 26.3: a correct table passes clean, a deliberately mismatched expected schema (extra column, and separately a wrong `ORDER BY`) raises loudly, and a from-scratch bootstrap still creates all four tables (including P4's `bronze_meta.maintenance_run`, folded into the same ownership model). `ops/g3/g3_test.py`'s `step_verify_r10_schema_drift_guard` runs this same drift-detection call against the real, already-ingested `bronze_meta.dataset_catalog` table in CI. |
+
+R1 and R2 are the two that can force a redesign. Both are measured before
+anything is built on top of them.

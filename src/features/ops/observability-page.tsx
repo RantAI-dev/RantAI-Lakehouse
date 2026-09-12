@@ -14,7 +14,7 @@ export function ObservabilityPage() {
   return (
     <div className="flex flex-col gap-4">
       <PageHeader title="Observability" description="Platform SLOs, lag, cache behavior, policy latency, and agent performance." />
-      {state.status === "loading" ? <MetricSkeleton cards={8} /> : null}
+      {state.status === "loading" ? <MetricSkeleton cards={7} /> : null}
       {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
       {state.status === "success" ? (
         <>
@@ -22,8 +22,9 @@ export function ObservabilityPage() {
             <MetricCard label="Query p95" value={`${state.data.queryP95Ms} ms`} />
             <MetricCard label="Query errors" value={formatPercent(state.data.queryErrorRate)} />
             <MetricCard label="Ingest lag" value={formatLagSeconds(state.data.ingestLagSeconds)} />
-            <MetricCard label="Streaming lag" value={formatLagSeconds(state.data.streamingLagSeconds)} trendTone="negative" />
             <MetricCard label="Cache hit" value={formatPercent(state.data.cacheHitRate)} />
+          </MetricGrid>
+          <MetricGrid className="lg:grid-cols-3">
             <MetricCard label="Policy p95" value={`${state.data.policyDecisionP95Ms} ms`} />
             <MetricCard label="Agent success" value={formatPercent(state.data.agentSuccessRate)} />
             <MetricCard label="Incidents" value={state.data.activeIncidents} />

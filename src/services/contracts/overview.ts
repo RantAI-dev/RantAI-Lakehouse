@@ -11,7 +11,6 @@ export type OverviewSummary = {
   staleAssets: number
   assetsByTier: Record<StorageTier, { count: number; bytes: number }>
   pipelines: { active: number; failed: number; delayed: number }
-  streaming: { jobs: number; maxLagSeconds: number; unhealthy: number }
   queries: {
     volume24h: number
     p95Ms: number

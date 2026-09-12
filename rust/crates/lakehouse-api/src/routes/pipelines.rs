@@ -22,8 +22,7 @@ use crate::json::ApiJson;
 use crate::routes::support::js_error;
 use crate::state::AppState;
 
-const OWNER: &str = "Dinas Pariwisata & Ekraf DKI Jakarta";
-const SOURCE: &str = "Satu Data Jakarta + berkas";
+use crate::tenant::{TENANT_OWNER, TENANT_SOURCE};
 const TARGET: &str = "serving.mart_* (Gold)";
 
 /// `GET /api/pipelines` — every `Dagster` job, enriched with its most
@@ -66,8 +65,8 @@ async fn list_body(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, Lis
                 "name": j.name,
                 "kind": "batch",
                 "status": last.map_or("unknown", |r| map_run_status(&r.status)),
-                "owner": OWNER,
-                "source": SOURCE,
+                "owner": TENANT_OWNER.as_str(),
+                "source": TENANT_SOURCE.as_str(),
                 "target": TARGET,
                 "schedule": schedule_label(j),
                 "lastRunAt": last
@@ -491,8 +490,8 @@ async fn dagster_schedule_toggle(state: &AppState, job_name: &str, paused: bool)
                 "name": job_name,
                 "kind": "batch",
                 "status": if paused { "paused" } else { "ready" },
-                "owner": OWNER,
-                "source": SOURCE,
+                "owner": TENANT_OWNER.as_str(),
+                "source": TENANT_SOURCE.as_str(),
                 "target": TARGET,
                 "schedule": schedule_label(job),
                 "lastRunAt": "",

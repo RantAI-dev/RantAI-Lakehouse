@@ -103,6 +103,35 @@ pub async fn list_saved(pool: &PgPool) -> Result<Vec<SavedQuery>, StoreError> {
     Ok(rows.into_iter().map(SavedQuery::from).collect())
 }
 
+/// Insert a new saved query. New for the AI Copilot's `save_query` tool
+/// (T1.4 of the copilot-operations-handover plan) — `SavedQuery` had no
+/// writer anywhere in the `QueryService` contract before this (see the
+/// module doc comment: only `listSaved()` existed), because the console
+/// itself never authored one; the copilot is the first caller that does.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the insert fails.
+pub async fn create_saved_query(
+    pool: &PgPool,
+    title: &str,
+    sql: &str,
+    owner: &str,
+    tags: &[String],
+) -> Result<SavedQuery, StoreError> {
+    let row: SavedQueryRow = sqlx::query_as(
+        "INSERT INTO saved_query (title, sql, owner, tags) VALUES ($1, $2, $3, $4) \
+         RETURNING id, title, sql, owner, updated_at, tags",
+    )
+    .bind(title)
+    .bind(sql)
+    .bind(owner)
+    .bind(tags)
+    .fetch_one(pool)
+    .await?;
+    Ok(SavedQuery::from(row))
+}
+
 // ── Query history (written by `routes::query::run`, read by listHistory) ─
 
 /// One recorded query execution. Mirrors `QueryHistoryItem` in

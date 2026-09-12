@@ -10,8 +10,10 @@ For environment variables and a running-system quickstart, see
 
 ## Module map
 
-The Rust backend (`rust/crates/`) is 11 crates. `lakehouse-api` is the only
-binary; everything else is a library crate it depends on.
+The Rust backend (`rust/crates/`) is 13 crates (`lakehouse-iceberg` was
+added in P1; the table below already listed it, but the prose above it had
+not been updated until P6). `lakehouse-api` is the only binary; everything
+else is a library crate it depends on.
 
 | Crate | Owns |
 | --- | --- |
@@ -25,6 +27,7 @@ binary; everything else is a library crate it depends on.
 | `lakehouse-embed` | Signed embedding (Metabase-style): HS256 JWT carrying a dashboard resource plus locked filter params, hand-rolled (no external JWT crate), matching the original TypeScript. |
 | `lakehouse-notify` | Delivery to webhook (Slack/Discord/generic incoming webhook) and email (SMTP via `lettre`), used by alerts and digests. |
 | `lakehouse-alerts` | Threshold alerts and scheduled digests over `serving.*` ClickHouse marts, persisted in `console.alert_rule`, delivered via `lakehouse-notify`. |
+| `lakehouse-iceberg` | P1: `object_store`-backed S3 client, Lakekeeper Iceberg REST catalog client, Bronze table create + append, and (ADR 0010) Gold export create/append/read-back. **`lakehouse-api` depends on it as of the Gold export work**: `routes::gold` (`POST`/`GET /api/gold/export/{mart}`, glued together by `gold_export.rs`) is its first real caller — Bronze itself is still surfaced in the console by reading `bronze_meta.*` (ClickHouse) directly, via `routes::catalog`/`routes::governance`/`routes::storage`, never through this crate. It is also exercised by the G1/G3a/G4/Gold-export gate test runners and (indirectly) by Debezium Server/dlt as REST-catalog clients. See its crate doc comment and `docs/adr/0002`–`0004`, `0010`. |
 | `lakehouse-api` | The axum HTTP service: config resolution, middleware, routing, policy, and every handler. The only crate with `main()`. |
 
 ## Request lifecycle
@@ -98,6 +101,55 @@ Two stores, deliberately not merged, because they solve different problems:
 `queries`, `overview`, `storage` — one module per Postgres-backed domain,
 plus shared `error` and `connectors`-adjacent plumbing.
 
+### A third store: Bronze Iceberg on object storage (P1–P5)
+
+P1–P5 added a third data path that is neither Postgres nor ClickHouse
+`MergeTree`: **Bronze**, stored as Apache Iceberg tables on an S3-compatible
+object store (RustFS by default; SeaweedFS is a verified drop-in swap, see
+`docs/STORAGE-COMPATIBILITY.md`), registered in Lakekeeper's Iceberg REST
+catalog. Two independent writers populate it — Dagster/dlt for batch
+ingest (P3) and Debezium Server for CDC (P5) — both writing through
+Lakekeeper, never through ClickHouse. ClickHouse reads Bronze back out via
+a `DataLakeCatalog` database (`allow_database_iceberg = 1`) pointed at the
+same Lakekeeper catalog; this read path works and is what
+`routes::catalog`, `routes::governance` (`maintenance`/`replication`
+kinds), and `routes::storage`'s Warm-tier estimate all rely on.
+
+**ClickHouse cannot reliably write to this catalog itself** on 26.3:
+`CREATE TABLE` inside a `DataLakeCatalog` database never reaches
+Lakekeeper, and `INSERT` into a partitioned catalog-registered table
+segfaults the server (see `docs/plans/G1-RESULT.md`). This is why Gold
+export was moved to Rust (`lakehouse-iceberg`, ADR 0010) instead of going
+through ClickHouse's Iceberg write path, and why in-engine Bronze
+maintenance is limited to `expire_snapshots` (`docs/plans/G3-RESULT.md`,
+ADR 0009's Trino-as-cron escape hatch for the small-file compaction
+`OPTIMIZE` cannot do).
+
+**Gold export is built** (ADR 0010): `routes::gold` reads a `serving.*`
+Gold mart from ClickHouse `MergeTree`, then appends it as a new Iceberg
+snapshot to its own `gold` namespace through Lakekeeper — the same
+vended-credentials write path G1(a) proved, exercised from
+`lakehouse-api` instead of a test runner for the first time. It is
+append-only, matching `iceberg-rust` 0.10.x's capabilities: a re-export
+does not replace the table's rows, it adds another snapshot, tagged by
+`_exported_at` — see `lakehouse-iceberg::gold`'s module doc for the
+consequence of running it on a schedule. Triggered by `dagster/dispar_orchestrate/gold_export.py` (daily schedule,
+calling the Rust route over HTTP — Dagster has no `iceberg-rust` binding
+of its own) or directly via the route. See ADR 0010 for the full record,
+including the principal/grant and the namespace-naming decision.
+
+A parallel Bronze *metadata registry* — `lake.bronze_meta.*` and
+`lake.bronze_meta_sec.*` (dataset catalog, column, sync, plus P4/P5's
+`maintenance_run`/`replication_slot` tables) — lives in ClickHouse
+`MergeTree`, not Iceberg. This is what every console route above actually
+queries; it is the reason the "never emit a bare `count()` against a Bronze
+Iceberg table" rule (R11, see `docs/plans/P5-RESULT.md`) has not bitten any
+existing product code — the registry is a `MergeTree` table, immune to the
+Iceberg-specific equality-delete counting bug. Two independent owners write
+this schema's DDL today — `demo/clickhouse/04_registry.sql` and
+`dagster/dispar_orchestrate/bronze_catalog.py` — verified byte-identical
+but not enforced as such (R10); this document does not add a third.
+
 ### Boot behavior: Postgres down is not fatal
 
 `lakehouse_store::connect_lazy` performs no network I/O and only fails if
@@ -164,7 +216,7 @@ checks that are easy to forget on a new route.
 shapes the frontend codebase was originally written against (one file per
 domain: `governance.ts`, `pipelines.ts`, `identity.ts`, `overview.ts`,
 `queries.ts`, `storage.ts`, `connectors.ts`, `agents.ts`, `knowledge.ts`,
-`assets.ts`, `streaming.ts`, ...). Frontend components call these
+`assets.ts`, ...). Frontend components call these
 contracts, not `fetch` directly.
 
 After the Rust cutover, `src/services/clients/*` implementations of these
@@ -184,5 +236,7 @@ historical) parity harness.
 
 `src/services/mock/*` remains the implementation for domains that are
 still mocked rather than backed by a real Rust route — see README's
-"Status / Known limitations" for exactly which ones (`streaming`,
-`knowledge.search`).
+"Status / Known limitations" for exactly which ones (`knowledge.search`).
+The `streaming` domain was removed outright rather than kept mocked —
+there is no streaming engine anywhere in this stack, so faking one in the
+UI was a locked-decision violation, not a limitation to document.

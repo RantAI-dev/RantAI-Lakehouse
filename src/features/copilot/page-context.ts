@@ -66,7 +66,7 @@ const MAP: { test: (p: string) => boolean; ctx: PageContext }[] = [
     },
   },
   {
-    test: (p) => p.startsWith("/pipelines") || p.startsWith("/streaming"),
+    test: (p) => p.startsWith("/pipelines"),
     ctx: {
       key: "pipelines",
       title: "Run or inspect pipelines",
@@ -75,7 +75,7 @@ const MAP: { test: (p: string) => boolean; ctx: PageContext }[] = [
         ask: ["Check the latest build status", "Summarize lakehouse data quality"],
         build: ["Rebuild the lakehouse (Bronze→Silver→Gold)", "Refresh the culinary mart"],
       },
-      system: "The user is on Pipelines / Streaming. They may want to run pipelines, check build status, or build/refresh data.",
+      system: "The user is on Pipelines. They may want to run pipelines, check build status, or build/refresh data.",
     },
   },
   {

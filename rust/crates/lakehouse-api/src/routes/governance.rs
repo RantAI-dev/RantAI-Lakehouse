@@ -26,6 +26,7 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::support::{js_error, str_col};
 use crate::state::AppState;
+use crate::tenant::{TENANT_ID, TENANT_SITE};
 use lakehouse_dagster::{DgClient, DgError, iso_from_unix_seconds, map_run_status};
 
 /// The four recognized `governance/{kind}` values. Ported from the `if
@@ -42,6 +43,28 @@ enum Kind {
     Classification,
     /// `governance/residency` — static tenant residency policy.
     Residency,
+    /// `governance/maintenance` — **P4 addition, not a TS-port kind** (like
+    /// the `quality`/`classification`/`residency` "Gap fix" unions above,
+    /// this extends beyond the original four-kind TS dispatch). Surfaces
+    /// `lake.bronze_meta.maintenance_run` — the dry-run/applied
+    /// `expire_snapshots` metrics `dagster/dispar_orchestrate/
+    /// maintenance.py` writes via the SAME `bronze_meta.*` registry
+    /// mechanism `register_bronze_table` already uses, per the task
+    /// brief's "reuse that mechanism; do not invent a parallel one."
+    Maintenance,
+    /// `governance/replication` — **P5 addition, not a TS-port kind**, same
+    /// shape as `maintenance`'s "Gap fix" precedent. Surfaces
+    /// `lake.bronze_meta.replication_slot` — the per-connector Postgres
+    /// replication-slot lag/WAL-retention snapshot
+    /// `dagster/dispar_orchestrate/replication_metrics.py` writes on a
+    /// schedule, via the SAME `bronze_meta.*` registry mechanism
+    /// `register_bronze_table`/`record_maintenance_run` already use. R5 in
+    /// the risk register ("a stuck or lagging replication slot pins WAL and
+    /// fills the customer's production database disk") is the reason this
+    /// exists: it is the first-class metrics surface for that risk, reusing
+    /// the P4 maintenance surface's mechanism rather than inventing a
+    /// parallel one, per R10.
+    Replication,
     /// Anything else, which the TypeScript rejects with HTTP 400.
     Unknown,
 }
@@ -53,6 +76,8 @@ impl Kind {
             "audit" => Self::Audit,
             "classification" => Self::Classification,
             "residency" => Self::Residency,
+            "maintenance" => Self::Maintenance,
+            "replication" => Self::Replication,
             _ => Self::Unknown,
         }
     }
@@ -97,9 +122,11 @@ pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Res
 async fn run(state: &AppState, kind: Kind) -> Result<Value, GovError> {
     match kind {
         Kind::Quality => quality(&state.clickhouse, state.pg.as_deref()).await,
-        Kind::Audit => audit(&state.dagster).await,
+        Kind::Audit => audit(&state.dagster, state.pg.as_deref()).await,
         Kind::Classification => classification(&state.clickhouse, state.pg.as_deref()).await,
         Kind::Residency => residency(state.pg.as_deref()).await,
+        Kind::Maintenance => maintenance(&state.clickhouse).await,
+        Kind::Replication => replication(&state.clickhouse).await,
         Kind::Unknown => unreachable!("Kind::Unknown is handled before `run` is called"),
     }
 }
@@ -188,9 +215,51 @@ async fn quality(ch: &ChClient, pg: Option<&PgPool>) -> Result<Value, GovError> 
     Ok(json!({ "quality": quality }))
 }
 
-async fn audit(dagster: &DgClient) -> Result<Value, GovError> {
+/// `principal_kind`/`outcome` on `audit_event` are a wider vocabulary than
+/// the TS `ActorKind` (`"user" | "service" | "agent"`) this response's
+/// `actorKind` field is typed as. Map the copilot's `"copilot"` and
+/// `"schedule"` principal kinds onto `"agent"` — the closest existing
+/// meaning — rather than emit a value the frontend type doesn't know,
+/// preserving the existing response shape for existing consumers.
+fn actor_kind_of(principal_kind: Option<&str>) -> &'static str {
+    match principal_kind {
+        Some("user") => "user",
+        Some("service") => "service",
+        // "copilot" and "schedule" are both non-human actors from the
+        // frontend's point of view.
+        _ => "agent",
+    }
+}
+
+/// Same narrowing for `outcome`: `audit_event.outcome` has eight values,
+/// the TS `AuditOutcome` union has three (`"success" | "denied" |
+/// "error"`). `needs_confirmation`/`needs_approval` are in-flight, not yet
+/// allowed, so they map to `"denied"` rather than `"success"` — a viewer
+/// scanning for problems should not read a still-pending gate as clean.
+fn outcome_of(outcome: &str) -> &'static str {
+    match outcome {
+        "allowed" | "executed" | "approved" => "success",
+        "failed" => "error",
+        // "refused" | "rejected" | "needs_confirmation" | "needs_approval"
+        _ => "denied",
+    }
+}
+
+/// `GET /api/governance/audit`. Unions `audit_event` rows (copilot/console
+/// actions) onto the `Dagster`-run-derived pipeline history, adding a
+/// `source: "copilot" | "pipeline"` field so a consumer can filter by
+/// origin. This is additive: every field the pre-existing response shape
+/// had is still present with the same meaning, so
+/// `src/services/clients/governance.ts` and the `/audit` page keep
+/// working unchanged (see `AuditEvent` in
+/// `src/services/contracts/governance.ts` — it declares no `source`
+/// field, so TypeScript simply ignores the extra JSON property; nothing
+/// currently narrows on it). When `pg` is `None` (no `DATABASE_URL`), this
+/// degrades to the pre-fix `Dagster`-only view, matching `quality`'s and
+/// `classification`'s same-shaped gap fixes.
+async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovError> {
     let runs = dagster.list_runs(50).await?;
-    let audit: Vec<Value> = runs
+    let mut audit: Vec<Value> = runs
         .iter()
         .map(|r| {
             json!({
@@ -198,16 +267,52 @@ async fn audit(dagster: &DgClient) -> Result<Value, GovError> {
                 "at": r.start_time.map_or_else(String::new, iso_from_unix_seconds),
                 "actor": "Dagster",
                 "actorKind": "service",
-                "tenant": "dispar-dki",
+                "tenant": TENANT_ID.as_str(),
                 "action": format!("pipeline {}: {}", map_run_status(&r.status), r.job_name),
                 "resource": r.job_name,
                 "outcome": if r.status == "FAILURE" { "error" } else { "success" },
                 "policyDecision": "allow",
                 "obligations": [],
                 "engineCategory": "hot-store",
+                "source": "pipeline",
             })
         })
         .collect();
+    if let Some(pg) = pg {
+        let events =
+            lakehouse_store::audit::list(pg, lakehouse_store::audit::AuditFilter::default())
+                .await?;
+        audit.extend(events.iter().map(|e| {
+            let resource = match (&e.resource_kind, &e.resource_id) {
+                (Some(kind), Some(id)) => format!("{kind}:{id}"),
+                (Some(kind), None) => kind.clone(),
+                (None, Some(id)) => id.clone(),
+                (None, None) => e.action.clone(),
+            };
+            json!({
+                "id": e.id,
+                "at": e.at,
+                "actor": e.actor_label.clone().or_else(|| e.principal_id.clone()).unwrap_or_else(|| "Copilot".to_owned()),
+                "actorKind": actor_kind_of(e.principal_kind.as_deref()),
+                "tenant": TENANT_ID.as_str(),
+                "action": e.action,
+                "resource": resource,
+                "outcome": outcome_of(&e.outcome),
+                "policyDecision": if outcome_of(&e.outcome) == "success" { "allow" } else { "deny" },
+                "obligations": [],
+                "approvalId": e.approval_id,
+                "source": "copilot",
+            })
+        }));
+    }
+    // Newest first across both sources: both `at` values are the same
+    // fixed-width `YYYY-MM-DDTHH:MM:SS.mmmZ` format, so lexicographic
+    // string order is chronological order.
+    audit.sort_by(|a, b| {
+        let a_at = a.get("at").and_then(Value::as_str).unwrap_or_default();
+        let b_at = b.get("at").and_then(Value::as_str).unwrap_or_default();
+        b_at.cmp(a_at)
+    });
     Ok(json!({ "audit": audit }))
 }
 
@@ -246,9 +351,9 @@ async fn classification(ch: &ChClient, pg: Option<&PgPool>) -> Result<Value, Gov
 async fn residency(pg: Option<&PgPool>) -> Result<Value, GovError> {
     let mut residency: Vec<Value> = vec![json!({
         "id": "res-dispar-dki",
-        "tenant": "dispar-dki",
+        "tenant": TENANT_ID.as_str(),
         "classification": "internal",
-        "approvedSites": ["Depok (187)"],
+        "approvedSites": [TENANT_SITE.as_str()],
         "crossSiteAllowed": false,
         "allowedOutput": "on-premise DKI",
         "violations7d": 0,
@@ -258,6 +363,104 @@ async fn residency(pg: Option<&PgPool>) -> Result<Value, GovError> {
         residency.extend(authored.iter().filter_map(|r| serde_json::to_value(r).ok()));
     }
     Ok(json!({ "residency": residency }))
+}
+
+/// `GET /api/governance/maintenance` — P4's `dry_run` metrics surface.
+/// Reads `lake.bronze_meta.maintenance_run` directly (that table has no
+/// authored/Postgres counterpart — it is Dagster-written only — so there
+/// is no `pg` union here, unlike `quality`/`classification`/`residency`).
+/// The table itself is created by `dagster/dispar_orchestrate/
+/// bronze_catalog.py::record_maintenance_run` (`CREATE TABLE IF NOT
+/// EXISTS`, single owner — see that module's doc comment on why it is not
+/// mirrored into `demo/clickhouse/04_registry.sql`), so on a deployment
+/// where the P4 maintenance job has never run, this table does not exist
+/// yet and the query below fails — surfaced as the standard 503 `run`
+/// already gives every other kind, not a special case.
+async fn maintenance(ch: &ChClient) -> Result<Value, GovError> {
+    let rows = ch
+        .rows(
+            "SELECT table_name, run_at, \
+                toString(dry_run_deleted_data_files) dry_data, \
+                toString(dry_run_deleted_manifest_files) dry_manifests, \
+                toString(applied_deleted_data_files) applied_data, \
+                toString(applied_deleted_manifest_files) applied_manifests, \
+                skipped_verbs \
+             FROM lake.`bronze_meta.maintenance_run` \
+             ORDER BY run_at DESC LIMIT 500",
+            None,
+        )
+        .await?;
+    let runs: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "tableName": str_col(r, "table_name"),
+                "runAt": str_col(r, "run_at"),
+                "dryRun": {
+                    "deletedDataFiles": str_col(r, "dry_data"),
+                    "deletedManifestFiles": str_col(r, "dry_manifests"),
+                },
+                "applied": {
+                    "deletedDataFiles": str_col(r, "applied_data"),
+                    "deletedManifestFiles": str_col(r, "applied_manifests"),
+                },
+                "skippedVerbs": str_col(r, "skipped_verbs"),
+            })
+        })
+        .collect();
+    Ok(json!({ "maintenance": runs }))
+}
+
+/// `GET /api/governance/replication` — R5's slot-lag/WAL-retention metrics
+/// surface. Reads `lake.bronze_meta.replication_slot` directly (Dagster-
+/// written only, same posture as `maintenance` — no `pg` union). On a
+/// deployment where no CDC connector has ever run, this table does not
+/// exist yet and the query fails, surfaced as the standard 503 every other
+/// `kind` already gives — not a special case.
+/// The `SELECT` behind [`replication`], pulled out so the
+/// `toString(active)` wrapping is assertable — the bug it fixes is invisible
+/// in the response shape (a slot just reads inactive) and only reproduces
+/// against a real `ClickHouse`, so a unit test on the query text is the
+/// cheapest thing that actually guards it.
+const REPLICATION_SLOTS_SQL: &str = "SELECT connector_id, slot_name, checked_at, \
+     toString(active) active, \
+     toString(wal_retained_bytes) wal_retained_bytes, \
+     toString(confirmed_flush_lag_bytes) confirmed_flush_lag_bytes, \
+     status \
+     FROM lake.`bronze_meta.replication_slot` \
+     ORDER BY checked_at DESC LIMIT 500";
+
+/// Read a `ClickHouse` boolean-ish column that has been stringified with
+/// `toString`.
+///
+/// `ClickHouse` has no `Bool` in this schema — `active` is `UInt8`, rendered
+/// in JSON as the NUMBER `1`/`0`. [`str_col`] is `Value::as_str`, which is
+/// `None` for a number, so reading such a column WITHOUT `toString` in the
+/// query silently yields `""` and therefore `false`. That is what made every
+/// replication slot show as disconnected. Wrapping in `toString` is the fix;
+/// this function is the other half of the contract, and accepts `"true"` as
+/// well so a future `Bool` column does not silently regress the same way.
+fn ch_bool(row: &serde_json::Map<String, Value>, key: &str) -> bool {
+    matches!(str_col(row, key), "1" | "true")
+}
+
+async fn replication(ch: &ChClient) -> Result<Value, GovError> {
+    let rows = ch.rows(REPLICATION_SLOTS_SQL, None).await?;
+    let slots: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "connectorId": str_col(r, "connector_id"),
+                "slotName": str_col(r, "slot_name"),
+                "checkedAt": str_col(r, "checked_at"),
+                "active": ch_bool(r, "active"),
+                "walRetainedBytes": str_col(r, "wal_retained_bytes"),
+                "confirmedFlushLagBytes": str_col(r, "confirmed_flush_lag_bytes"),
+                "status": str_col(r, "status"),
+            })
+        })
+        .collect();
+    Ok(json!({ "replicationSlots": slots }))
 }
 
 /// Query parameters accepted by `GET /api/governance/lineage`.
@@ -290,6 +493,23 @@ pub async fn lineage(State(state): State<AppState>, Query(q): Query<LineageQuery
     }
 }
 
+/// Does this `ClickHouse` server error mean the database or table simply is
+/// not there?
+///
+/// `ChError::Server` carries the raw `ClickHouse` error body verbatim with no
+/// structured code, so this matches on it. Both the numeric code and the
+/// symbolic name are required: the codes alone (60, 81) appear in unrelated
+/// text, and matching the name alone would fire on a query that merely
+/// mentioned it. `ClickHouse` formats these as, e.g.
+///
+/// ```text
+/// Code: 81. DB::Exception: Database _silver_meta does not exist. (UNKNOWN_DATABASE)
+/// ```
+fn missing_ch_object(msg: &str) -> bool {
+    (msg.contains("Code: 81") && msg.contains("UNKNOWN_DATABASE"))
+        || (msg.contains("Code: 60") && msg.contains("UNKNOWN_TABLE"))
+}
+
 async fn lineage_body(ch: &ChClient, focus: &str) -> Result<Value, ChError> {
     let escaped_focus = SqlLiteral::from(focus);
     let meta_sql = format!(
@@ -309,7 +529,23 @@ async fn lineage_body(ch: &ChClient, focus: &str) -> Result<Value, ChError> {
     let cols_sql = format!(
         "SELECT kolom, tipe FROM _silver_meta.kolom_tipe WHERE tabel={escaped_table} LIMIT 200"
     );
-    let cols = ch.rows(&cols_sql, None).await?;
+    // Column mappings are ENRICHMENT: `nodes` and `edges` below — the lineage
+    // graph itself, and the only thing the console needs to draw it — are
+    // built entirely from `bronze_meta.dataset_catalog` above. `_silver_meta`
+    // is a legacy Silver-layer database that the lakehouse compose stack does
+    // not create, so propagating this error meant `GET /api/governance/lineage`
+    // returned 503 with empty nodes/edges for EVERY dataset there — the whole
+    // lineage surface dark because an optional detail table was absent.
+    //
+    // Narrow on purpose: only a missing database/table degrades to "no column
+    // detail". A connection failure, a permission error, or a malformed query
+    // still propagates, because those mean the answer is unknown rather than
+    // legitimately empty.
+    let cols = match ch.rows(&cols_sql, None).await {
+        Ok(rows) => rows,
+        Err(ChError::Server(msg)) if missing_ch_object(&msg) => Vec::new(),
+        Err(err) => return Err(err),
+    };
 
     let src_label = if sekunder {
         "Sumber sekunder (olahan)"
@@ -405,7 +641,7 @@ pub async fn create_rule(
             Ok(resp) => resp.into_response(),
             Err(err) => err.into_response(),
         },
-        Kind::Audit | Kind::Unknown => (
+        Kind::Audit | Kind::Maintenance | Kind::Replication | Kind::Unknown => (
             StatusCode::BAD_REQUEST,
             ApiJson(
                 json!({ "error": format!("kind tak dikenal atau tidak bisa ditulis: {kind}") }),
@@ -585,6 +821,8 @@ mod tests {
         assert_eq!(Kind::parse("audit"), Kind::Audit);
         assert_eq!(Kind::parse("classification"), Kind::Classification);
         assert_eq!(Kind::parse("residency"), Kind::Residency);
+        assert_eq!(Kind::parse("maintenance"), Kind::Maintenance);
+        assert_eq!(Kind::parse("replication"), Kind::Replication);
     }
 
     #[test]
@@ -609,5 +847,141 @@ mod tests {
         assert_eq!(severity_of("fail"), "high");
         assert_eq!(severity_of("warn"), "medium");
         assert_eq!(severity_of("pass"), "info");
+    }
+
+    /// The bug this guards: `active` is `UInt8`, so `ClickHouse` renders it as
+    /// a JSON NUMBER. `str_col` is `Value::as_str` -> `None` for a number ->
+    /// `""` -> false, and every replication slot showed as disconnected on
+    /// the Ingestion page, healthy ones included. Only `toString(active)` in
+    /// the query makes the value a string this can read at all.
+    #[test]
+    fn replication_query_stringifies_every_numeric_column() {
+        for col in ["active", "wal_retained_bytes", "confirmed_flush_lag_bytes"] {
+            assert!(
+                REPLICATION_SLOTS_SQL.contains(&format!("toString({col})")),
+                "{col} is numeric in ClickHouse and must be wrapped in toString(), \
+                 or str_col reads it as an empty string"
+            );
+        }
+    }
+
+    #[test]
+    fn ch_bool_reads_a_stringified_uint8() {
+        let mut row = serde_json::Map::new();
+        row.insert("active".into(), Value::from("1"));
+        assert!(ch_bool(&row, "active"));
+        row.insert("active".into(), Value::from("0"));
+        assert!(!ch_bool(&row, "active"));
+        // A future Bool column stringifies as "true"/"false".
+        row.insert("active".into(), Value::from("true"));
+        assert!(ch_bool(&row, "active"));
+        row.insert("active".into(), Value::from("false"));
+        assert!(!ch_bool(&row, "active"));
+    }
+
+    /// The failure mode itself: an UNWRAPPED numeric column arrives as a JSON
+    /// number and reads false, whatever its real value. This asserts the
+    /// broken behaviour deliberately, so the reason the query must wrap the
+    /// column is documented in an executable form rather than only in a
+    /// comment.
+    #[test]
+    fn ch_bool_cannot_read_a_bare_numeric_column() {
+        let mut row = serde_json::Map::new();
+        row.insert("active".into(), Value::from(1));
+        assert!(
+            !ch_bool(&row, "active"),
+            "a bare UInt8 arrives as a JSON number and is unreadable as a string — \
+             this is why the query wraps it"
+        );
+    }
+
+    #[test]
+    fn ch_bool_is_false_for_a_missing_column() {
+        assert!(!ch_bool(&serde_json::Map::new(), "active"));
+    }
+
+    #[test]
+    fn missing_ch_object_recognizes_absent_database_and_table() {
+        // Verbatim from the G3a failure this was written for.
+        assert!(missing_ch_object(
+            "Code: 81. DB::Exception: Database _silver_meta does not exist. \
+             (UNKNOWN_DATABASE) (version 26.8.2.7 (official build))"
+        ));
+        assert!(missing_ch_object(
+            "Code: 60. DB::Exception: Table _silver_meta.kolom_tipe does not exist. \
+             (UNKNOWN_TABLE) (version 26.8.2.7 (official build))"
+        ));
+    }
+
+    #[test]
+    fn missing_ch_object_does_not_swallow_other_failures() {
+        // These mean "the answer is unknown", not "legitimately empty", so
+        // lineage must still fail loudly rather than report no columns.
+        assert!(!missing_ch_object(
+            "Code: 497. DB::Exception: user is not allowed to SELECT. (ACCESS_DENIED)"
+        ));
+        assert!(!missing_ch_object(
+            "Code: 62. DB::Exception: Syntax error: failed at position 8. (SYNTAX_ERROR)"
+        ));
+        assert!(!missing_ch_object("fetch failed"));
+        // Code without the symbolic name, and name without the code: neither
+        // is conclusive on its own, since both forms show up in unrelated
+        // message text.
+        assert!(!missing_ch_object(
+            "Code: 81. DB::Exception: something else entirely"
+        ));
+        assert!(!missing_ch_object(
+            "query mentioning UNKNOWN_DATABASE in passing"
+        ));
+    }
+
+    #[test]
+    fn actor_kind_of_narrows_copilot_principal_kinds_to_agent() {
+        assert_eq!(actor_kind_of(Some("user")), "user");
+        assert_eq!(actor_kind_of(Some("service")), "service");
+        // Neither "copilot" nor "schedule" is a value the frontend's
+        // `ActorKind` union knows; both must collapse to "agent" rather
+        // than leak an unrecognized string into a typed field.
+        assert_eq!(actor_kind_of(Some("copilot")), "agent");
+        assert_eq!(actor_kind_of(Some("schedule")), "agent");
+        assert_eq!(actor_kind_of(None), "agent");
+    }
+
+    #[test]
+    fn outcome_of_treats_pending_gates_as_denied_not_success() {
+        assert_eq!(outcome_of("allowed"), "success");
+        assert_eq!(outcome_of("executed"), "success");
+        assert_eq!(outcome_of("approved"), "success");
+        assert_eq!(outcome_of("failed"), "error");
+        assert_eq!(outcome_of("refused"), "denied");
+        assert_eq!(outcome_of("rejected"), "denied");
+        // The regression this test guards: a still-pending gate decision
+        // must never read as "success" just because it isn't a hard
+        // refusal yet.
+        assert_eq!(outcome_of("needs_confirmation"), "denied");
+        assert_eq!(outcome_of("needs_approval"), "denied");
+    }
+
+    /// The merge sort in [`audit`] compares `at` strings lexicographically;
+    /// this is the regression test for that assumption holding across rows
+    /// from both sources (`Dagster`-derived and `audit_event`-derived use
+    /// the same `YYYY-MM-DDTHH:MM:SS.mmmZ` format).
+    #[test]
+    fn audit_rows_sort_newest_first_by_at_string() {
+        let mut rows = [
+            json!({ "id": "a", "at": "2026-09-08T10:00:00.000Z" }),
+            json!({ "id": "b", "at": "2026-09-08T12:00:00.000Z" }),
+            json!({ "id": "c", "at": "2026-09-08T11:00:00.000Z" }),
+        ];
+        rows.sort_by(|a, b| {
+            let a_at = a.get("at").and_then(Value::as_str).unwrap_or_default();
+            let b_at = b.get("at").and_then(Value::as_str).unwrap_or_default();
+            b_at.cmp(a_at)
+        });
+        let ids: Vec<&str> = rows
+            .iter()
+            .map(|r| r.get("id").and_then(Value::as_str).unwrap())
+            .collect();
+        assert_eq!(ids, vec!["b", "c", "a"]);
     }
 }

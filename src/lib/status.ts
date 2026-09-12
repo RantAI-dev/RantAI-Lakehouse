@@ -151,14 +151,12 @@ export const WORKLOAD_CLASS_LABEL: Record<WorkloadClass, string> = {
 export type EngineCategory =
   | "hot-store"
   | "federated-compute"
-  | "streaming"
   | "ai-store"
   | "telemetry-store"
 
 export const ENGINE_CATEGORY_LABEL: Record<EngineCategory, string> = {
   "hot-store": "Hot analytical store",
   "federated-compute": "Federated compute",
-  streaming: "Real-time streaming",
   "ai-store": "AI retrieval store",
   "telemetry-store": "Telemetry store",
 }
@@ -190,6 +188,48 @@ export const APPROVAL_STATUS_LABEL: Record<ApprovalStatus, string> = {
   pending: "Pending",
   approved: "Approved",
   rejected: "Rejected",
+}
+
+/**
+ * Lifecycle of a digital-employee `agent_run` (see `POST
+ * /api/agents/employees/{id}/run`, copilot-operations-handover plan T3.2).
+ * Deliberately its own union rather than a reuse of `EntityStatus`: a run
+ * can be blocked on a human decision (`waiting_approval`) or explicitly
+ * `rejected` by one, neither of which fits the generic entity lifecycle.
+ */
+export type AgentRunStatus =
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "waiting_approval"
+  | "rejected"
+
+export const AGENT_RUN_STATUS_LABEL: Record<AgentRunStatus, string> = {
+  running: "Running",
+  succeeded: "Succeeded",
+  failed: "Failed",
+  waiting_approval: "Waiting for approval",
+  rejected: "Rejected",
+}
+
+export const AGENT_RUN_STATUS_DESCRIPTION: Record<AgentRunStatus, string> = {
+  running: "Currently executing.",
+  succeeded: "Finished successfully.",
+  failed: "Ended with an error.",
+  waiting_approval:
+    "Paused: a high-risk tool call inside this run needs a human decision before it can continue.",
+  rejected:
+    "A human rejected the tool call this run was waiting on; it ended without executing it.",
+}
+
+/** One tool-call step inside an `agent_run.steps` trace. */
+export type RunStepStatus = "pending" | "succeeded" | "failed" | "refused"
+
+export const RUN_STEP_STATUS_LABEL: Record<RunStepStatus, string> = {
+  pending: "Waiting for approval",
+  succeeded: "Succeeded",
+  failed: "Failed",
+  refused: "Refused",
 }
 
 /** Who performed an action: a person, a platform service, or a delegated agent. */

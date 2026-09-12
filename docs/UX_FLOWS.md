@@ -19,10 +19,10 @@ DetailDrawer (opsional, inspect cepat)
 
 | Pola | Kapan dipakai |
 |---|---|
-| **Step wizard** (`FormStepLayout`) | Entity kompleks — pipeline, connector, policy, streaming job, workflow |
+| **Step wizard** (`FormStepLayout`) | Entity kompleks — pipeline, connector, policy, workflow |
 | **CreateSheet** | Entity sederhana — project, knowledge source, admin invite, rules |
 | **ConfirmActionDialog** | Pause / Suspend / Revoke dan aksi berisiko |
-| **Detail route** | Entity durable (pipeline, streaming, employee, asset) |
+| **Detail route** | Entity durable (pipeline, employee, asset) |
 | **DetailDrawer** | Inspect cepat dari list (connector, policy, workflow, dll.) |
 
 ### 1.2 Persistensi mock
@@ -83,29 +83,7 @@ flowchart LR
 
 ---
 
-## 3. Build — Streaming Jobs
-
-### 3.1 Create
-
-```text
-/streaming → Create Streaming Job → /streaming/create
-  Basics → Sources → Definition SQL → Triggers → Review
-  → Create job → /streaming
-```
-
-### 3.2 Detail ops
-
-```text
-/streaming/{id}
-  → Pause (confirm + impact) → paused
-  → Resume → running
-```
-
-Ini pola pause/resume paling lengkap di produk.
-
----
-
-## 4. Data — Connectors
+## 3. Data — Connectors
 
 ```text
 /connectors → New Connector → /connectors/create
@@ -118,7 +96,7 @@ Secret hanya sebagai **reference path** (mis. `vault://…`), bukan nilai rahasi
 
 ---
 
-## 5. Governance — Policies
+## 4. Governance — Policies
 
 ```text
 /governance/policies → Create Policy → /governance/policies/create
@@ -137,7 +115,7 @@ Sheet creates terkait (bukan wizard penuh):
 
 ---
 
-## 6. Intelligence — Agent Workflows
+## 5. Intelligence — Agent Workflows
 
 ```text
 /agents/workflows → Create Workflow → /agents/workflows/create
@@ -149,7 +127,7 @@ Catatan: bukan visual node editor penuh; step kinds + preview.
 
 ---
 
-## 7. CreateSheet (pola sederhana)
+## 6. CreateSheet (pola sederhana)
 
 Contoh kanonik — **Collaboration → Create Project**:
 
@@ -175,7 +153,7 @@ Sheet creates lain (field berbeda, pola sama):
 
 ---
 
-## 8. Intelligence — Digital Employee ops
+## 7. Intelligence — Digital Employee ops
 
 ```text
 /agents/employees → Create Employee (sheet) → muncul di list
@@ -186,7 +164,7 @@ Sheet creates lain (field berbeda, pola sama):
 
 ---
 
-## 9. Operational pages (tanpa create entity)
+## 8. Operational pages (tanpa create entity)
 
 | Halaman | Actions |
 |---|---|
@@ -199,26 +177,25 @@ Overview, Activity, Audit, Lineage, Observability, Services, Usage, Catalog, Dat
 
 ---
 
-## 10. Checklist smoke test (manual)
+## 9. Checklist smoke test (manual)
 
 Gunakan dengan `npm run dev` (mock only):
 
 1. **Pipelines:** Create wizard → list → detail → Run now → open run drawer → cancel/retry when applicable → Pause → Resume → follow Target → asset.
 2. **Agentic Builder:** generate dari list → baris baru muncul.
 3. **Connectors:** wizard → list → drawer → Test connection → Create pipeline → dependent links.
-4. **Streaming:** create → detail Pause/Resume → Triggers link ke agent/workflow → sink asset.
-5. **Policies:** create draft → list status draft → asset Policies tab links back.
-6. **Workflows:** create dengan approval gate → list.
-7. **Approvals:** `/agents/approvals` → open pending → Approve/Reject + comment → Audit link.
-8. **Query Studio:** federated SQL → estimate plan → Run → Results plan + View in Audit → History Audit.
-9. **Knowledge:** source drawer → Vector Jobs / Semantic Search / Catalog asset.
-10. **Storage:** Restore to Hot → operation appears; tier vs layer copy clear.
-11. **Collaboration:** Create Project sheet → list tanpa pindah route.
-12. **Employee:** Suspend → Resume → Revoke; Approvals/Audit links on runs.
+4. **Policies:** create draft → list status draft → asset Policies tab links back.
+5. **Workflows:** create dengan approval gate → list.
+6. **Approvals:** `/agents/approvals` → open pending → Approve/Reject + comment → Audit link.
+7. **Query Studio:** federated SQL → estimate plan → Run → Results plan + View in Audit → History Audit.
+8. **Knowledge:** source drawer → Vector Jobs / Semantic Search / Catalog asset.
+9. **Storage:** Restore to Hot → operation appears; tier vs layer copy clear.
+10. **Collaboration:** Create Project sheet → list tanpa pindah route.
+11. **Employee:** Suspend → Resume → Revoke; Approvals/Audit links on runs.
 
 ---
 
-## 11. Batasan UX yang masih diketahui
+## 10. Batasan UX yang masih diketahui
 
 | Gap | Severity | Catatan |
 |---|---|---|
@@ -230,7 +207,7 @@ Gunakan dengan `npm run dev` (mock only):
 
 ---
 
-## 12. File referensi implementasi
+## 11. File referensi implementasi
 
 | Concern | Lokasi |
 |---|---|

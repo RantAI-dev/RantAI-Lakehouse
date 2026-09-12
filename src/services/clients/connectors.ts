@@ -16,11 +16,15 @@ import { ServiceError } from "../errors";
  * tempat kredensial disimpan (nama env var, path secret manager) — bukan
  * nilai kredensial itu sendiri. Backend tidak pernah menyimpan, mengembalikan,
  * mencatat log, atau menampilkan nilai kredensial; `Connector`/`ConnectorDetail`
- * bahkan tidak punya field untuk itu. Konsekuensinya: `testConnection` di sini
- * TIDAK melakukan probe jaringan nyata ke sistem eksternal — hasilnya
- * mencerminkan `health` konektor yang tersimpan terakhir. Lihat
- * `rust/crates/lakehouse-store/src/connectors.rs` untuk catatan keputusan
- * lengkap.
+ * bahkan tidak punya field untuk itu.
+ *
+ * `testConnection` di sini SEKARANG melakukan probe jaringan nyata — tapi
+ * hanya untuk PostgreSQL dan object storage S3-compatible, satu-satunya dua
+ * tipe yang build ini tahu cara menghubunginya. Tipe lain (Kafka, MQTT,
+ * MongoDB, dst.) mengembalikan `supported: false`, bukan hasil palsu. Lihat
+ * `rust/crates/lakehouse-api/src/connector_probe.rs` untuk implementasinya
+ * dan `rust/crates/lakehouse-store/src/connectors.rs` untuk catatan
+ * keputusan kredensial lengkap.
  */
 
 async function getJson<T>(url: string, init?: RequestInit): Promise<T> {

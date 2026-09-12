@@ -23,7 +23,6 @@ export type ObservabilitySummary = {
   queryP95Ms: number
   queryErrorRate: number
   ingestLagSeconds: number
-  streamingLagSeconds: number
   cacheHitRate: number
   policyDecisionP95Ms: number
   agentSuccessRate: number
