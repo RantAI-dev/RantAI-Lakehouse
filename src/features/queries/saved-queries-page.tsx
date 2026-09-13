@@ -38,6 +38,12 @@ const columns: ColumnDef<SavedQuery>[] = [
 
 export function SavedQueriesPage() {
   const state = useService((s) => queryService.listSaved(s), [])
+  // `GET /api/query/scheduling` is a static capability probe (WS2 §13, WS2
+  // plan review W10, round 2, item 1): no safe per-principal execution path
+  // exists before WS7's policy-obligations engine, so this always resolves
+  // `supported: false`. Rendered as plain text, not a schedule control —
+  // there is nothing for a control to submit to.
+  const scheduling = useService((s) => queryService.getSchedulingCapability(s), [])
   const [search, setSearch] = React.useState("")
   const [selected, setSelected] = React.useState<SavedQuery | null>(null)
 
@@ -59,6 +65,11 @@ export function SavedQueriesPage() {
         description="Reusable SQL assets with owners and tags."
       />
       <QueryStudioTabs />
+      {scheduling.status === "success" && scheduling.data.supported === false ? (
+        <p className="text-sm text-muted-foreground">
+          Scheduled queries: not supported yet — {scheduling.data.reason}.
+        </p>
+      ) : null}
       <FilterToolbar>
         <SearchField
           value={search}

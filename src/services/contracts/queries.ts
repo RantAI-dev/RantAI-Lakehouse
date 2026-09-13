@@ -104,10 +104,22 @@ export type QueryResult = {
   auditEventId?: string
 }
 
+/**
+ * `GET /api/query/scheduling` — a static capability probe. Scheduled
+ * execution of a saved query needs a safe per-principal authority model
+ * (a scheduled job has no live session to run "as," and a shared service
+ * identity would bypass the author's own permissions) that does not exist
+ * before WS7's policy-obligations engine, so this is always `supported:
+ * false` today — never a real schedule, never a stored `schedule_cron`
+ * (WS2 §13, WS2 plan review W10, round 2, item 1).
+ */
+export type QuerySchedulingCapability = { supported: false; reason: string }
+
 export interface QueryService {
   listSaved(signal?: AbortSignal): Promise<SavedQuery[]>
   listHistory(signal?: AbortSignal): Promise<QueryHistoryItem[]>
   estimate(sql: string, signal?: AbortSignal): Promise<QueryEstimate>
   run(sql: string, options: { engine: QueryEngine }, signal?: AbortSignal): Promise<QueryResult>
   generateSql(question: string, signal?: AbortSignal): Promise<{ sql: string; explanation: string; assumptions: string[] }>
+  getSchedulingCapability(signal?: AbortSignal): Promise<QuerySchedulingCapability>
 }

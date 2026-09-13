@@ -4,6 +4,7 @@ import type {
   QueryEstimate,
   SavedQuery,
   QueryHistoryItem,
+  QuerySchedulingCapability,
 } from "../contracts/queries";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
@@ -86,5 +87,8 @@ export const clickhouseQueryService: QueryService = {
   },
   listHistory(signal) {
     return get<QueryHistoryItem[]>("/api/query/history", signal);
+  },
+  getSchedulingCapability(signal) {
+    return get<QuerySchedulingCapability>("/api/query/scheduling", signal);
   },
 };

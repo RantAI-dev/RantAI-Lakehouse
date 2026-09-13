@@ -222,6 +222,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/query/saved",          Policy::RequiresPermission("query:read")),
     ("GET",  "/api/query/history",        Policy::RequiresPermission("query:read")),
     ("GET",  "/api/query/run/{id}/download", Policy::RequiresPermission("query:read")),
+    ("GET",  "/api/query/scheduling",     Policy::RequiresPermission("query:read")),
 
     // ── Pipelines: seeded Data Engineer permission `pipeline:*`. ─────────
     ("GET",  "/api/pipelines",                        Policy::RequiresPermission("pipeline:read")),

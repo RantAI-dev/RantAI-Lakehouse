@@ -691,8 +691,8 @@ fn is_valid_history_id(id: &str) -> bool {
 
 /// Only these `query_history.engine` values may be re-run through this
 /// route (WS2 plan review W9). `"hot-store"` is the legacy placeholder
-/// every row recorded before Task C2 threaded a real `engine` field
-/// carries — it named `ClickHouse`'s storage tier, not a different
+/// every row recorded before this workstream threaded a real `engine`
+/// field carries — it named `ClickHouse`'s storage tier, not a different
 /// engine, so it is downloadable exactly like `"clickhouse"`. `"trino"`
 /// is deliberately excluded: re-running it on the wrong engine is not an
 /// option this route offers.
@@ -772,10 +772,10 @@ fn map_download_ch_error(err: &ChError) -> ApiError {
 /// be re-run through this route at all.
 ///
 /// Ownership is exact-match on `query_history.user_name` against the
-/// caller's own principal id string. Every row recorded before Task C2
-/// threaded a real principal into `routes::query::run` carries the fixed
-/// placeholder `"anonymous"`, which — by construction — never equals any
-/// authenticated caller's real id string, so those legacy rows are
+/// caller's own principal id string. Every row recorded before this
+/// workstream threaded a real principal into `routes::query::run` carries
+/// the fixed placeholder `"anonymous"`, which — by construction — never
+/// equals any authenticated caller's real id string, so those legacy rows are
 /// permanently undownloadable through this route. That is a deliberate,
 /// fail-closed consequence of scoping by identity, not an oversight to be
 /// worked around.
@@ -858,6 +858,40 @@ pub async fn download(
         bytes,
     )
         .into_response())
+}
+
+// ── GET /api/query/scheduling (WS2 §13, WS2 plan review W10, round 2, item 1) ──
+
+/// `{ "supported": false, "reason": ... }` — scheduled execution of a saved
+/// query needs a safe per-principal authority model that does not exist
+/// yet: a scheduled job has no live session to run "as," and running the
+/// query under a shared service identity would execute with different
+/// authority than the query's author holds at trigger time. That model is
+/// planned for WS7's policy-obligations engine, not this workstream.
+///
+/// An earlier revision of this capability added a `saved_query.schedule_cron`
+/// column that the API accepted and stored while nothing ever ran it — dead
+/// schema advertising a capability that does not exist. This probe adds no
+/// column, no migration, and no field on [`SavedQuery`]: nothing is stored
+/// that nothing then reads (AGENTS.md principle 2).
+#[must_use]
+fn scheduling_capability_body() -> Value {
+    json!({
+        "supported": false,
+        "reason": "scheduled execution needs a safe per-principal authority model, planned for WS7",
+    })
+}
+
+/// `GET /api/query/scheduling` — a static capability probe the
+/// saved-queries UI calls once, so it can render an honest "not supported
+/// yet" instead of offering a schedule control that does nothing (WS2 §13,
+/// WS2 plan review W10, round 2, item 1).
+///
+/// # Errors
+///
+/// This handler never fails — it reports a fixed, static capability.
+pub async fn scheduling(State(_state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+    Ok(ApiJson(scheduling_capability_body()))
 }
 
 #[cfg(test)]
@@ -1366,6 +1400,19 @@ mod tests {
         fn ch_transport_error_maps_to_503() {
             let err = map_download_ch_error(&ChError::Cancelled);
             assert_eq!(err.status(), 503);
+        }
+    }
+
+    // ── GET /api/query/scheduling (WS2 §13, WS2 plan review W10, round 2, item 1) ──
+
+    mod scheduling_pure {
+        use super::*;
+
+        #[test]
+        fn scheduling_capability_reports_unsupported_with_a_reason() {
+            let body = scheduling_capability_body();
+            assert_eq!(body["supported"], serde_json::json!(false));
+            assert!(body["reason"].as_str().unwrap().contains("WS7"));
         }
     }
 }
