@@ -87,7 +87,14 @@ pub(super) async fn run_saved_query(state: &AppState, args: &Map<String, Value>)
         return json!({ "error": "saved query tidak ditemukan" });
     };
     let body = Bytes::from(json!({ "sql": saved.sql }).to_string());
-    api_result_to_value(crate::routes::query::run(State(state.clone()), body).await).await
+    // This internal call never goes through axum's auth middleware, so
+    // there is no `Principal` to pass — the copilot dispatcher
+    // (`routes::ai::run_tool`) threads no principal through to any tool
+    // today. `run_saved_query` never asks for `engine: "trino"`, so this
+    // has no effect while WS2 §4's Trino guard is the only principal-gated
+    // path in `run`; see that function's doc comment for what widening the
+    // 401 floor to every engine would mean here.
+    api_result_to_value(crate::routes::query::run(State(state.clone()), None, body).await).await
 }
 
 #[cfg(test)]

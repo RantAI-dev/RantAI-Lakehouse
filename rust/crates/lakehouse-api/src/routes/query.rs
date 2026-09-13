@@ -6,12 +6,15 @@
 
 use std::time::Instant;
 
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::State;
+use lakehouse_auth::Principal;
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::queries::{self, QueryHistoryItem, RecordHistoryInput, SavedQuery};
+use lakehouse_trino::{TrinoError, TrinoResult};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -24,6 +27,12 @@ use crate::state::AppState;
 struct SqlBody {
     #[serde(default)]
     sql: Option<String>,
+    /// Which engine should run this statement: `"clickhouse"` (the
+    /// default, when absent) or `"trino"` (WS2 §4). Only [`run`] reads
+    /// this — `estimate` always runs `EXPLAIN ESTIMATE` against
+    /// `ClickHouse`, unaffected.
+    #[serde(default)]
+    engine: Option<String>,
 }
 
 /// Parse the raw request body as `{"sql": "..."}`.
@@ -111,16 +120,102 @@ fn is_word_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
+/// Whether `sql` is additionally safe to send to `Trino`, on top of
+/// [`is_read_only`] (checked first, unconditionally, for every engine —
+/// this function is never the only gate). Applied only when the request
+/// names `engine: "trino"`.
+///
+/// [`is_read_only`]'s denylist was written for `ClickHouse` and is not
+/// sufficient here, for two reasons specific to `Trino`:
+///
+/// - `Trino`'s `EXPLAIN ANALYZE` *executes* the statement it explains,
+///   unlike `ClickHouse`'s `EXPLAIN`, which never runs anything. A
+///   statement starting `EXPLAIN ANALYZE <write>` passes
+///   [`is_read_only`]'s "starts with an allowed keyword" test and, unless
+///   `<write>` happens to use one of the 12 `ClickHouse`-oriented denied
+///   words, sails through it entirely — see [`contains_explain_analyze`].
+/// - `Trino` speaks `SQL` statements `ClickHouse` doesn't have, several of
+///   which write: `MERGE`, `REFRESH MATERIALIZED VIEW`, `COMMENT ON`,
+///   `CALL` (procedures, including maintenance ones), `EXECUTE`/`PREPARE`/
+///   `DEALLOCATE` (prepared statements, a smuggling vector for anything
+///   above), `SET`/`RESET` (session state), and `DENY` (access control
+///   itself). None of these are in [`is_read_only`]'s `ClickHouse`-shaped
+///   denylist, so they are refused here instead.
+///
+/// This guard is the console's OWN boundary, not `Trino`'s. `Trino`'s
+/// file-based access control (the compose `trino` service's
+/// `rules.json`) restricts the `iceberg` catalog to `SELECT` for every
+/// user except `trino-maintenance`, but it does NOT block `ALTER TABLE …
+/// EXECUTE optimize` for a plain reader — Trino's
+/// `checkCanExecuteTableProcedure` requires only table `SELECT`, with no
+/// separate privilege for maintenance procedures (see the compose file's
+/// block comment on `rules.json` for the measured proof). So this guard
+/// is what actually stops a `query:read` principal from running `ALTER
+/// TABLE … EXECUTE optimize` through the console, not `Trino` itself.
+#[must_use]
+fn is_trino_safe(sql: &str) -> bool {
+    !contains_explain_analyze(sql) && !contains_trino_denied_keyword(sql)
+}
+
+/// Whether `sql` contains `explain`, followed — modulo any amount of
+/// whitespace, and case-insensitively — by `analyze`, as adjacent words.
+/// `Trino` accepts arbitrary whitespace between the two keywords
+/// (`EXPLAIN   ANALYZE`, `explain\nanalyze`, ...), so the comparison
+/// normalizes every whitespace run to a single space before matching.
+fn contains_explain_analyze(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    let collapsed = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Sentinel spaces at both ends turn the substring check into a
+    // word-bounded match with no separate boundary logic needed.
+    format!(" {collapsed} ").contains(" explain analyze ")
+}
+
+/// The `Trino`-specific write/session/procedure vocabulary
+/// [`is_trino_safe`] refuses, checked as whole words with [`word_occurs`]
+/// — the same helper [`contains_denied_keyword`] uses, rather than a
+/// second matcher.
+fn contains_trino_denied_keyword(sql: &str) -> bool {
+    const TRINO_DENIED: [&str; 10] = [
+        "merge",
+        "refresh",
+        "comment",
+        "call",
+        "execute",
+        "deny",
+        "set",
+        "reset",
+        "prepare",
+        "deallocate",
+    ];
+    let lower = sql.to_ascii_lowercase();
+    let chars: Vec<char> = lower.chars().collect();
+    TRINO_DENIED.iter().any(|kw| word_occurs(&chars, kw))
+}
+
 /// `POST /api/query/run` — execute a read-only `SQL` statement against
-/// `ClickHouse` and return it in `QueryResult` shape.
+/// `ClickHouse` (`engine` absent or `"clickhouse"`) or `Trino`
+/// (`engine: "trino"`, WS2 §4) and return it in `QueryResult` shape.
 ///
 /// # Errors
 ///
 /// - 400 [`ApiError::BadRequest`] on an unparseable body or a missing/empty
 ///   `sql`.
-/// - 422 [`ApiError::Unprocessable`] when `sql` fails the read-only guard,
-///   or when `ClickHouse` itself rejects the query.
-pub async fn run(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
+/// - 401 [`ApiError::Unauthorized`] for `engine: "trino"` with no
+///   authenticated principal — the `X-Trino-User` this handler sends is
+///   derived from the principal's uuid (see [`trino_user_for`]'s doc
+///   comment for why never a display name), so there is nothing safe to
+///   send without one. The route is policy-gated
+///   (`Policy::RequiresPermission("query:read")`), so this exists only as
+///   defense in depth, the same shape `routes::gold::export` uses.
+/// - 422 [`ApiError::Unprocessable`] when `sql` fails [`is_read_only`] (any
+///   engine) or [`is_trino_safe`] (`engine: "trino"` only), or when the
+///   engine itself rejects the query.
+/// - 503 [`ApiError::Unavailable`] when `Trino` is unreachable or times out.
+pub async fn run(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
     let parsed = parse_body(&body)?;
     let sql = match parsed.sql {
         Some(s) if !s.is_empty() => s,
@@ -134,36 +229,53 @@ pub async fn run(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJso
         .into());
     }
 
+    let engine = parsed.engine.as_deref().unwrap_or("clickhouse").to_owned();
+    if engine == "trino" && !is_trino_safe(&sql) {
+        return Err(ApiError::Unprocessable(
+            "This statement is not permitted against Trino (write, session, or procedure \
+             keyword detected)."
+                .to_owned(),
+        )
+        .into());
+    }
+
     let started = Instant::now();
     let started_epoch_ms = epoch_ms();
-    let result = state.clickhouse.query(&sql, None).await?;
 
-    let columns: Vec<String> = result.meta.iter().map(|m| m.name.clone()).collect();
-    let rows: Vec<Value> = result
-        .data
-        .iter()
-        .map(|row| {
-            let mut out = Map::new();
-            for c in &columns {
-                let v = row.get(c);
-                let s = match v {
-                    None | Some(Value::Null) => String::new(),
-                    Some(Value::String(s)) => s.clone(),
-                    Some(Value::Bool(b)) => b.to_string(),
-                    Some(Value::Number(n)) => n.to_string(),
-                    Some(other) => other.to_string(),
-                };
-                out.insert(c.clone(), Value::String(s));
-            }
-            Value::Object(out)
-        })
-        .collect();
+    let (columns, rows, duration_ms, scanned_bytes) = if engine == "trino" {
+        let trino_user = trino_user_for(principal.as_ref())?;
+        let result = state
+            .trino
+            .run_statement(&sql, &trino_user)
+            .await
+            .map_err(map_trino_error)?;
+        let (columns, rows) = trino_result_to_rows(&result);
+        (columns, rows, elapsed_ms(started), 0)
+    } else {
+        let result = state.clickhouse.query(&sql, None).await?;
 
-    let scanned_bytes = result.statistics.as_ref().map_or(0, |s| s.bytes_read);
-    let duration_ms = result
-        .statistics
-        .as_ref()
-        .map_or_else(|| elapsed_ms(started), |s| seconds_to_ms(s.elapsed));
+        let columns: Vec<String> = result.meta.iter().map(|m| m.name.clone()).collect();
+        let rows: Vec<Value> = result
+            .data
+            .iter()
+            .map(|row| {
+                let mut out = Map::new();
+                for c in &columns {
+                    let v = row.get(c);
+                    out.insert(c.clone(), Value::String(stringify_cell(v)));
+                }
+                Value::Object(out)
+            })
+            .collect();
+
+        let scanned_bytes = result.statistics.as_ref().map_or(0, |s| s.bytes_read);
+        let duration_ms = result
+            .statistics
+            .as_ref()
+            .map_or_else(|| elapsed_ms(started), |s| seconds_to_ms(s.elapsed));
+        (columns, rows, duration_ms, scanned_bytes)
+    };
+
     let cost_units = std::cmp::max(1, bytes_to_cost_units(scanned_bytes));
     let id = format!("q-{started_epoch_ms}");
 
@@ -172,12 +284,16 @@ pub async fn run(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJso
     // turn an otherwise-successful query into an error response for the
     // caller, who already has their result: log a warning and keep going.
     // See `lakehouse_store::queries::record_history`'s doc comment.
+    //
+    // `user`/`engine` are still the pre-WS2-§4 placeholders here — real
+    // principal/engine threading lands in the next commit, which also
+    // corrects `QueryHistoryItem.user`'s doc comment to match.
     if let Some(pool) = state.pg.as_deref() {
         #[allow(
             clippy::cast_possible_wrap,
             clippy::cast_precision_loss,
-            reason = "scanned_bytes/duration_ms/cost_units are ClickHouse-reported sizes for \
-                      one query, well within i64/f64's exact-integer range"
+            reason = "scanned_bytes/duration_ms/cost_units are ClickHouse/Trino-reported sizes \
+                      for one query, well within i64/f64's exact-integer range"
         )]
         let input = RecordHistoryInput {
             id: &id,
@@ -203,7 +319,83 @@ pub async fn run(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJso
         duration_ms,
         scanned_bytes,
         cost_units,
+        &engine,
     )))
+}
+
+/// Coerce one cell to the string-everything shape both `run_result_json`
+/// row shapes use, matching the `TypeScript`'s implicit stringification.
+fn stringify_cell(v: Option<&Value>) -> String {
+    match v {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Bool(b)) => b.to_string(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// Convert a [`TrinoResult`] into the same `(columns, rows)` shape the
+/// `ClickHouse` branch of [`run`] produces, so both engines answer with an
+/// identical `QueryResult` row format.
+fn trino_result_to_rows(result: &TrinoResult) -> (Vec<String>, Vec<Value>) {
+    let columns: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
+    let rows: Vec<Value> = result
+        .rows
+        .iter()
+        .map(|row| {
+            let mut out = Map::new();
+            for (i, c) in columns.iter().enumerate() {
+                out.insert(c.clone(), Value::String(stringify_cell(row.get(i))));
+            }
+            Value::Object(out)
+        })
+        .collect();
+    (columns, rows)
+}
+
+/// The `X-Trino-User` `run` sends for `engine: "trino"`: `console-<uuid>`,
+/// derived from the authenticated principal's stable id — NEVER
+/// `principal.display_name`. A display name is neither unique nor stable,
+/// and the compose `trino` service's file-based access control (see its
+/// `rules.json` block comment) grants full `iceberg` catalog write access
+/// to exactly one user name, `trino-maintenance`. Sending a display name
+/// would let any principal who sets theirs to `trino-maintenance` claim
+/// that write identity — the `console-` prefix puts every console-derived
+/// user in a namespace that can never collide with a service user name.
+///
+/// # Errors
+///
+/// [`ApiError::Unauthorized`] when `principal` is `None`: there is no safe
+/// value to send in that case, so the request is refused before it reaches
+/// `Trino` at all.
+fn trino_user_for(principal: Option<&Extension<Principal>>) -> Result<String, ApiError> {
+    let Some(Extension(p)) = principal else {
+        return Err(ApiError::unauthorized());
+    };
+    Ok(format!("console-{}", p.id.uuid()))
+}
+
+/// Map a [`TrinoError`] to the [`ApiError`] `run` returns.
+///
+/// [`TrinoError::Query`]'s message is forwarded verbatim — the ONE place
+/// this crate lets `Trino`'s own text reach a response, because the caller
+/// reading it is the same principal whose own `SQL` produced it (the exact
+/// posture `lakehouse_trino`'s crate doc comment documents as safe).
+/// Every other variant is classified into a fixed message before it
+/// reaches the caller, per this repository's "upstream error text never
+/// reaches a response" rule.
+fn map_trino_error(err: TrinoError) -> ApiError {
+    match err {
+        TrinoError::Query(msg) => ApiError::Unprocessable(msg),
+        TrinoError::Timeout => ApiError::Unavailable("trino query timed out".to_owned()),
+        TrinoError::Transport(_) | TrinoError::HttpStatus(_) => {
+            ApiError::Unavailable("trino unavailable".to_owned())
+        }
+        TrinoError::TooManyRows { cap } => {
+            ApiError::Unprocessable(format!("trino result exceeded the {cap}-row cap"))
+        }
+    }
 }
 
 /// Build the `/api/query/run` response body from already-computed values.
@@ -211,6 +403,12 @@ pub async fn run(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJso
 /// Extracted from [`run`] so the transparency-panel contract — which fields
 /// are real measurements versus `null` — is unit-testable without a live
 /// `ClickHouse` connection.
+///
+/// `engine` is the top-level field naming which engine actually ran this
+/// statement (`"clickhouse"`/`"trino"`, WS2 §4) — a DIFFERENT thing from
+/// `metrics.engine`, which stays the fixed string `"hot-store"` describing
+/// `ClickHouse`'s storage tier regardless of which top-level engine ran.
+/// Neither renames nor removes the other.
 fn run_result_json(
     id: &str,
     columns: &Value,
@@ -218,9 +416,11 @@ fn run_result_json(
     duration_ms: u64,
     scanned_bytes: u64,
     cost_units: u64,
+    engine: &str,
 ) -> Value {
     json!({
         "id": id,
+        "engine": engine,
         "columns": columns,
         "rows": rows,
         "metrics": {
@@ -558,7 +758,7 @@ mod tests {
 
     #[test]
     fn run_result_emits_null_for_unmeasured_transparency_fields() {
-        let v = run_result_json("q-1", &json!([]), &json!([]), 12, 34, 1);
+        let v = run_result_json("q-1", &json!([]), &json!([]), 12, 34, 1, "clickhouse");
 
         // The transparency panel exists to tell the reader what actually
         // happened. ClickHouse's response carries no cache-hit flag and no
@@ -580,6 +780,12 @@ mod tests {
         assert_eq!(v["metrics"]["durationMs"], json!(12));
         assert_eq!(v["metrics"]["scannedBytes"], json!(34));
         assert_eq!(v["metrics"]["costUnits"], json!(1));
+
+        // The new top-level `engine` (which engine ran) and the untouched
+        // `metrics.engine` (ClickHouse's storage tier) are two different
+        // concepts and must not collapse into one value.
+        assert_eq!(v["engine"], json!("clickhouse"));
+        assert_eq!(v["metrics"]["engine"], json!("hot-store"));
     }
 
     #[test]
@@ -596,5 +802,238 @@ mod tests {
         }
         // The EXPLAIN ESTIMATE numbers are real.
         assert_eq!(v["estimatedBytes"], json!(100));
+    }
+
+    // ── `engine: "trino"` (WS2 §4) ──────────────────────────────────────
+
+    mod trino_engine {
+        use std::collections::HashMap;
+
+        use lakehouse_auth::{PermissionSet, PrincipalId};
+        use uuid::Uuid;
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+        use crate::config::Config;
+
+        /// Builds `AppState` the way `routes::connectors::state_without_pool`
+        /// does (`AppState::new(Config::from_map(..))`), overriding
+        /// `TRINO_URL` so `AppState::trino` points at the wiremock server
+        /// instead of the real compose service. No live Postgres either
+        /// (`DATABASE_URL` is deliberately unparseable): history recording
+        /// degrades to a logged warning, per `record_history`'s doc
+        /// comment, which is fine for these handler-level tests.
+        fn test_state_with_trino(trino_uri: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+            env.insert("TRINO_URL".to_owned(), trino_uri.to_owned());
+            AppState::new(Config::from_map(&env).expect("valid config from a plain map"))
+        }
+
+        /// An authenticated `query:read` principal for `run`'s tests.
+        /// `display_name` is deliberately a parameter — one test sets it to
+        /// `"trino-maintenance"` to prove [`trino_user_for`] never reads it.
+        fn principal_with_display_name(display_name: &str) -> Extension<Principal> {
+            Extension(Principal {
+                id: PrincipalId::User(Uuid::nil()),
+                tenant_ids: Vec::new(),
+                display_name: display_name.to_owned(),
+                permissions: PermissionSet::parse("query:read"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+            })
+        }
+
+        fn trino_body(sql: &str) -> Bytes {
+            Bytes::from(serde_json::to_vec(&json!({"sql": sql, "engine": "trino"})).unwrap())
+        }
+
+        async fn assert_refused_before_reaching_trino(sql: &str) {
+            let server = MockServer::start().await;
+            let state = test_state_with_trino(&server.uri());
+            let result = run(
+                State(state),
+                Some(principal_with_display_name("alice")),
+                trino_body(sql),
+            )
+            .await;
+            assert!(result.is_err(), "expected {sql:?} to be refused");
+            assert_eq!(
+                server
+                    .received_requests()
+                    .await
+                    .expect("mock server records requests")
+                    .len(),
+                0,
+                "{sql:?} must never reach Trino"
+            );
+        }
+
+        // Refusals `is_read_only` already catches, unchanged — the Trino
+        // guard is additive, never a relaxation of the existing gate.
+        #[tokio::test]
+        async fn refuses_call_without_reaching_trino() {
+            assert_refused_before_reaching_trino("CALL system.runtime.kill_query(query_id => 'x')")
+                .await;
+        }
+
+        #[tokio::test]
+        async fn refuses_alter_table_execute_optimize() {
+            assert_refused_before_reaching_trino("ALTER TABLE t EXECUTE optimize").await;
+        }
+
+        #[tokio::test]
+        async fn refuses_merge_into() {
+            assert_refused_before_reaching_trino(
+                "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn refuses_set_session() {
+            assert_refused_before_reaching_trino("SET SESSION query_max_run_time = '1h'").await;
+        }
+
+        #[tokio::test]
+        async fn refuses_explain_analyze_insert() {
+            assert_refused_before_reaching_trino("EXPLAIN ANALYZE INSERT INTO t SELECT 1").await;
+        }
+
+        // Refusals the new Trino-specific guard adds — each of these passes
+        // `is_read_only` today (verified against this branch's unmodified
+        // `is_read_only`/`contains_denied_keyword` before `is_trino_safe`
+        // existed): none of the 12 ClickHouse-shaped denied words appear,
+        // and each starts with the allowed `explain` keyword.
+        #[tokio::test]
+        async fn refuses_explain_analyze_merge_bypass() {
+            assert_refused_before_reaching_trino(
+                "EXPLAIN ANALYZE MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn refuses_explain_analyze_refresh_materialized_view_bypass() {
+            assert_refused_before_reaching_trino("EXPLAIN ANALYZE REFRESH MATERIALIZED VIEW v")
+                .await;
+        }
+
+        #[tokio::test]
+        async fn refuses_explain_analyze_comment_bypass() {
+            assert_refused_before_reaching_trino("EXPLAIN ANALYZE COMMENT ON TABLE t IS 'x'").await;
+        }
+
+        #[tokio::test]
+        async fn refuses_explain_analyze_with_extra_whitespace_and_mixed_case() {
+            assert_refused_before_reaching_trino("ExPlAiN     aNaLyZe SELECT 1").await;
+        }
+
+        #[tokio::test]
+        async fn runs_a_select_and_reports_engine_in_the_response() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/statement"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "q1",
+                    "columns": [{"name": "n", "type": "bigint"}],
+                    "data": [[1]],
+                })))
+                .mount(&server)
+                .await;
+
+            let state = test_state_with_trino(&server.uri());
+            let ApiJson(value) = run(
+                State(state),
+                Some(principal_with_display_name("alice")),
+                trino_body("SELECT 1"),
+            )
+            .await
+            .expect("ok");
+
+            assert_eq!(value["engine"], json!("trino"));
+            assert_eq!(value["rows"], json!([{"n": "1"}]));
+        }
+
+        #[tokio::test]
+        async fn x_trino_user_header_is_derived_from_the_uuid_never_the_display_name() {
+            let server = MockServer::start().await;
+            let expected_header = format!("console-{}", Uuid::nil());
+            Mock::given(method("POST"))
+                .and(path("/v1/statement"))
+                .and(header("X-Trino-User", expected_header.as_str()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "id": "q1",
+                    "columns": [{"name": "n", "type": "bigint"}],
+                    "data": [[1]],
+                })))
+                .mount(&server)
+                .await;
+
+            let state = test_state_with_trino(&server.uri());
+            // The display name is deliberately the exact string the
+            // maintenance user is named — proving `trino_user_for` never
+            // reads it is the point of this test.
+            let result = run(
+                State(state),
+                Some(principal_with_display_name("trino-maintenance")),
+                trino_body("SELECT 1"),
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "the wiremock header matcher would reject a wrong header"
+            );
+        }
+
+        #[tokio::test]
+        async fn missing_principal_is_refused_before_reaching_trino() {
+            let server = MockServer::start().await;
+            let state = test_state_with_trino(&server.uri());
+            let result = run(State(state), None, trino_body("SELECT 1")).await;
+            let err = result.expect_err("no principal must be refused");
+            assert_eq!(err.0.status(), 401);
+            assert_eq!(
+                server
+                    .received_requests()
+                    .await
+                    .expect("mock server records requests")
+                    .len(),
+                0
+            );
+        }
+
+        #[test]
+        fn maps_query_error_to_422_forwarding_the_message_verbatim() {
+            let err = map_trino_error(TrinoError::Query("line 1:1: mismatched input".to_owned()));
+            assert_eq!(err.status(), 422);
+            assert!(err.to_string().contains("mismatched input"));
+        }
+
+        #[test]
+        fn maps_timeout_to_503() {
+            let err = map_trino_error(TrinoError::Timeout);
+            assert_eq!(err.status(), 503);
+        }
+
+        #[test]
+        fn maps_http_status_to_503() {
+            let err = map_trino_error(TrinoError::HttpStatus(500));
+            assert_eq!(err.status(), 503);
+        }
+
+        #[test]
+        fn maps_too_many_rows_to_422_naming_the_cap() {
+            let err = map_trino_error(TrinoError::TooManyRows { cap: 10_000 });
+            assert_eq!(err.status(), 422);
+            assert!(err.to_string().contains("10000") || err.to_string().contains("10,000"));
+        }
+
+        #[test]
+        fn allows_a_plain_select_against_the_trino_guard() {
+            assert!(is_trino_safe("SELECT 1"));
+        }
     }
 }
