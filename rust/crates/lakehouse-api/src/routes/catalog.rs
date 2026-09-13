@@ -62,9 +62,9 @@ use crate::tenant::{
 };
 
 /// Query parameters accepted by `GET /api/catalog`. `q` is the free-text
-/// search term the command palette sends (WS2 §13, Task E2) — moved here
-/// from `src/services/clients/assets.ts`'s browser-side filter so there is
-/// one implementation of the term match, not two (`AGENTS.md` rule 4).
+/// search term the command palette sends (WS2 §13) — moved here from
+/// `src/services/clients/assets.ts`'s browser-side filter so there is one
+/// implementation of the term match, not two (`AGENTS.md` rule 4).
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
     #[serde(default)]
@@ -115,11 +115,14 @@ pub async fn list(State(state): State<AppState>, Query(params): Query<ListQuery>
 /// and `id` — the SAME fields and case rule
 /// `src/services/clients/assets.ts`'s `clickhouseAssetService.listAssets`
 /// used to apply in the browser, moved here so there is one implementation
-/// (WS2 §13, Task E2 pre-dispatch fix E2-2). Widened by `annotations`: an
-/// asset also matches when its own annotation row's `description` or any
-/// `tags` entry contains the term. An empty `q` matches everything.
+/// (WS2 §13). Case folding uses `to_lowercase()`, not `to_ascii_lowercase()`,
+/// because the browser's JavaScript `toLowerCase()` is Unicode-aware and a
+/// faithful port must match it for non-ASCII text in descriptions and
+/// annotations. Widened by `annotations`: an asset also matches when its own
+/// annotation row's `description` or any `tags` entry contains the term. An
+/// empty `q` matches everything.
 fn filter_assets_by_query(assets: &[Value], q: &str, annotations: &[AnnotationRow]) -> Vec<Value> {
-    let needle = q.trim().to_ascii_lowercase();
+    let needle = q.trim().to_lowercase();
     if needle.is_empty() {
         return assets.to_vec();
     }
@@ -131,28 +134,22 @@ fn filter_assets_by_query(assets: &[Value], q: &str, annotations: &[AnnotationRo
         .iter()
         .filter(|asset| {
             let id = asset["id"].as_str().unwrap_or_default();
-            let name = asset["name"]
-                .as_str()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
+            let name = asset["name"].as_str().unwrap_or_default().to_lowercase();
             let description = asset["description"]
                 .as_str()
                 .unwrap_or_default()
-                .to_ascii_lowercase();
+                .to_lowercase();
             if name.contains(&needle)
                 || description.contains(&needle)
-                || id.to_ascii_lowercase().contains(&needle)
+                || id.to_lowercase().contains(&needle)
             {
                 return true;
             }
             by_id.get(id).is_some_and(|row| {
                 row.description
                     .as_deref()
-                    .is_some_and(|d| d.to_ascii_lowercase().contains(&needle))
-                    || row
-                        .tags
-                        .iter()
-                        .any(|t| t.to_ascii_lowercase().contains(&needle))
+                    .is_some_and(|d| d.to_lowercase().contains(&needle))
+                    || row.tags.iter().any(|t| t.to_lowercase().contains(&needle))
             })
         })
         .cloned()
@@ -1363,6 +1360,22 @@ mod tests {
         ];
         assert_eq!(filter_assets_by_query(&assets, "", &[]).len(), 2);
         assert_eq!(filter_assets_by_query(&assets, "   ", &[]).len(), 2);
+    }
+
+    #[test]
+    fn filter_assets_by_query_matches_non_ascii_case_unicode_aware() {
+        // `Ö`/`ö` are distinct bytes under `to_ascii_lowercase` (ASCII
+        // lowercasing only touches `A`-`Z`, so a non-ASCII byte never
+        // changes and the two never compare equal) but fold to the same
+        // code point under `to_lowercase`, matching the browser's
+        // Unicode-aware JavaScript `toLowerCase()`.
+        let assets = vec![json!({
+            "id": "bronze.orders",
+            "name": "Orders",
+            "description": "Umsatz nach Übersee"
+        })];
+        let filtered = filter_assets_by_query(&assets, "übersee", &[]);
+        assert_eq!(filtered.len(), 1);
     }
 
     #[test]

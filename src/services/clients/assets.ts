@@ -13,9 +13,9 @@ import { ServiceError } from "../errors";
  * silver) via the server route `/api/catalog`. The free-text term (`q`) is
  * filtered server-side (`rust/crates/lakehouse-api/src/routes/catalog.rs`'s
  * `filter_assets_by_query`) rather than in the browser, so there is one
- * implementation of the term match, not two (WS2 §13, Task E2 pre-dispatch
- * fix E2-2). Facet filters (`tier`/`layer`/`type`/`classification`) stay
- * client-side, applied to the returned list below.
+ * implementation of the term match, not two (WS2 §13). Facet filters
+ * (`tier`/`layer`/`type`/`classification`) stay client-side, applied to the
+ * returned list below.
  */
 async function loadCatalog(
   q: string | undefined,
