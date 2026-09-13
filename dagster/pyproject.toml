@@ -21,6 +21,12 @@ dependencies = [
     "psycopg2-binary==2.9.10",
     "sqlalchemy==2.0.36",
     "requests==2.32.3",
+    # s3fs is already pulled in transitively by dlt[s3] (verified: s3fs
+    # 2026.7.0 is installed in this project's venv), but
+    # capacity_snapshot.py imports it directly by name — pinned here so
+    # a future dlt version bump cannot silently drop or change it
+    # without this file's own dependency list saying so.
+    "s3fs==2026.7.0",
 ]
 
 [build-system]

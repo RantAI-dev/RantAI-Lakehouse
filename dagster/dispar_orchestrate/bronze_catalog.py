@@ -441,6 +441,35 @@ def record_maintenance_verb_run(
     )
 
 
+# ── P6: bucket capacity snapshot ────────────────────────────────────────
+#
+# `_CAPACITY_SNAPSHOT_SCHEMA` is a NEW table (`capacity_snapshot.py`'s
+# daily bucket-size job), so — like `_MAINTENANCE_RUN_SCHEMA` and
+# `_MAINTENANCE_VERB_RUN_SCHEMA` above — it always takes
+# `_assert_or_create_schema`'s "table does not exist yet" branch (create
+# fresh) on every deployment, never the additive path that does not
+# exist. `TableSchema.create_ddl` always emits `lake.\`{table_name}\``,
+# so `table_name` is one identifier that may contain a dot, always
+# inside `lake` — `bronze_meta.capacity_snapshot`, following the same
+# convention as `bronze_meta.maintenance_run` above, not a separate
+# `console` database (which `_assert_or_create_all` never creates).
+# `clickhouse_bytes_on_disk` is deliberately not a column here:
+# `GET /api/lakehouse/capacity` reads ClickHouse's own `system.parts`
+# live, so this table stores only the numbers it is the sole source
+# for.
+_CAPACITY_SNAPSHOT_SCHEMA = TableSchema(
+    table_name="bronze_meta.capacity_snapshot",
+    columns=(
+        ("measured_at", "DateTime64(3, 'UTC')"),
+        ("bucket_name", "String"),
+        ("bytes", "UInt64"),
+        ("objects", "UInt64"),
+    ),
+    engine="ReplacingMergeTree",
+    order_by=("bucket_name", "measured_at"),
+)
+
+
 def _utc_now_iso() -> str:
     from datetime import datetime, timezone
 

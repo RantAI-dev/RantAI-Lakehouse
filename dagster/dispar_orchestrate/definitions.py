@@ -12,6 +12,10 @@ from dagster import Definitions
 from dispar_orchestrate.agent_runs import agent_run_job, agent_run_schedules
 from dispar_orchestrate.alerts_run import alerts_run_job, alerts_run_schedule
 from dispar_orchestrate.assets import bronze_ingest_job
+from dispar_orchestrate.capacity_snapshot import (
+    capacity_snapshot_job,
+    capacity_snapshot_schedule,
+)
 from dispar_orchestrate.gold_export import gold_export_job
 from dispar_orchestrate.maintenance import (
     bronze_maintenance_job,
@@ -40,6 +44,11 @@ from dispar_orchestrate.replication_metrics import (
 # (alert rules are evaluated as one batch, not per-row) — see
 # `alerts_run.py`'s module doc for the full design.
 #
+# `capacity_snapshot_job` (+ its daily schedule) adds P6's bucket-capacity
+# measurement, into the SAME code location for the same ADR 0005 reason —
+# see `capacity_snapshot.py`'s module doc for its own design and the
+# schema-ownership split with `bronze_catalog.py`.
+#
 # `gold_export_job` is STILL registered without a schedule (a separate,
 # larger change would be needed to give it the same service-credential
 # treatment `agent_run_job` got here — see `gold_export.py`'s module doc),
@@ -58,11 +67,13 @@ defs = Definitions(
         gold_export_job,
         agent_run_job,
         alerts_run_job,
+        capacity_snapshot_job,
     ],
     schedules=[
         bronze_maintenance_schedule,
         replication_slot_check_schedule,
         alerts_run_schedule,
         *agent_run_schedules,
+        capacity_snapshot_schedule,
     ],
 )
