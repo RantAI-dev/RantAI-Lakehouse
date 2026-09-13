@@ -576,7 +576,7 @@ pub async fn decide_approval(
         return Err(ApiError::Internal(detail).into());
     };
     let args: Map<String, Value> = pending.args.as_object().cloned().unwrap_or_default();
-    let result = ai_tools::run_tool(&state, &pending.tool, &args).await;
+    let result = ai_tools::run_tool(&state, Some(&principal), &pending.tool, &args).await;
     let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
     let status = if ok { "succeeded" } else { "failed" };
     if let Err(err) = agents::record_run_outcome(
@@ -1103,7 +1103,14 @@ async fn run_headless_loop(
             // itself is the authorization, mirroring how `gold_export_job`
             // already runs its own `WriteLow`-equivalent export unattended.
             step_no += 1;
-            let result = ai_tools::run_tool(state, &call.function.name, &args).await;
+            // A scheduled/headless run has no authenticated `Principal` to
+            // hand `run_tool` — only `principal_id`/`principal_kind`
+            // (a schedule or a service identity, not a session). Passing
+            // `None` here is honest about that gap rather than fabricating
+            // one; it means `run_saved_query` still 401s from a headless
+            // run, unchanged from before this fix, which only threads the
+            // principal that already exists at the interactive call sites.
+            let result = ai_tools::run_tool(state, None, &call.function.name, &args).await;
             let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
             let (resource_kind, resource_id) =
                 ai_audit::resource_for(&call.function.name, &args, &result);

@@ -27,6 +27,7 @@ mod pipelines;
 mod queries;
 
 use axum::response::{IntoResponse, Response};
+use lakehouse_auth::Principal;
 use serde_json::{Map, Value, json};
 
 use super::registry;
@@ -84,6 +85,7 @@ pub(super) async fn api_result_to_value<T: IntoResponse>(result: ApiResult<T>) -
 /// dikenal", which would be a bug worth crashing a test over, not masking.
 pub(in crate::routes) async fn run_tool(
     state: &AppState,
+    principal: Option<&Principal>,
     name: &str,
     args: &Map<String, Value>,
 ) -> Value {
@@ -125,7 +127,7 @@ pub(in crate::routes) async fn run_tool(
         "cancel_pipeline_run" => pipelines::cancel_pipeline_run(state, args).await,
         "save_query" => queries::save_query(state, args).await,
         "list_saved_queries" => queries::list_saved_queries(state).await,
-        "run_saved_query" => queries::run_saved_query(state, args).await,
+        "run_saved_query" => queries::run_saved_query(state, principal, args).await,
         "get_audit_history" => governance::get_audit_history(state).await,
         "list_classification_rules" => governance::list_classification_rules(state).await,
         "list_quality_rules" => governance::list_quality_rules(state).await,
@@ -184,7 +186,7 @@ mod tests {
     async fn run_tool_dispatches_every_registered_tool_and_refuses_unknown() {
         let state = dispatch_test_state();
         for spec in registry::TOOLS {
-            let result = run_tool(&state, spec.name, &Map::new()).await;
+            let result = run_tool(&state, None, spec.name, &Map::new()).await;
             if let Some(err) = result.get("error").and_then(Value::as_str) {
                 assert!(
                     !err.starts_with("tool tak dikenal"),
@@ -193,7 +195,7 @@ mod tests {
                 );
             }
         }
-        let unknown = run_tool(&state, "not_a_real_tool", &Map::new()).await;
+        let unknown = run_tool(&state, None, "not_a_real_tool", &Map::new()).await;
         assert_eq!(
             unknown,
             json!({ "error": "tool tak dikenal: not_a_real_tool" })

@@ -351,7 +351,13 @@ pub async fn chat(
                 }
             } else {
                 let clean_args = gate::strip_confirmed(&args);
-                let result = tools::run_tool(&state, &call.function.name, &clean_args).await;
+                let result = tools::run_tool(
+                    &state,
+                    principal.as_ref().map(|Extension(p)| p),
+                    &call.function.name,
+                    &clean_args,
+                )
+                .await;
                 let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
                 (result, if ok { "executed" } else { "failed" }, None, None)
             };
@@ -541,7 +547,13 @@ pub async fn tool_call(
         }
     } else {
         let clean_args = gate::strip_confirmed(&parsed.args);
-        let result = tools::run_tool(&state, &parsed.tool, &clean_args).await;
+        let result = tools::run_tool(
+            &state,
+            principal.as_ref().map(|Extension(p)| p),
+            &parsed.tool,
+            &clean_args,
+        )
+        .await;
         let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
         (result, if ok { "executed" } else { "failed" }, None, None)
     };
