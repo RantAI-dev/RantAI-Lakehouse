@@ -114,8 +114,10 @@ export function AppSidebar() {
 
   const menuBtnClass = (active: boolean) =>
     cn(
-      "h-8 rounded-md px-2.5 py-1.5 text-sm font-normal tracking-normal text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
-      active && "bg-sidebar-accent font-medium text-sidebar-primary shadow-sm ring-1 ring-sidebar-border",
+      "h-8 rounded-md px-2.5 py-1.5 text-sm tracking-normal transition-colors duration-150",
+      active
+        ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
+        : "font-normal text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
     )
 
   /**
@@ -134,8 +136,10 @@ export function AppSidebar() {
         href={item.href}
         onClick={(e) => handleNavClick(e, item.href)}
         className={cn(
-          "flex items-center gap-2 rounded-md px-2.5 py-1.5 text-sm text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
-          active && "bg-sidebar-accent font-medium text-sidebar-primary shadow-sm ring-1 ring-sidebar-border",
+          "flex items-center gap-2 rounded-md px-2.5 py-1.5 text-sm transition-colors duration-150",
+          active
+            ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
+            : "text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
         )}
       >
         {showIcon ? <Icon className="size-4 shrink-0" /> : null}
@@ -257,9 +261,10 @@ export function AppSidebar() {
           aria-expanded={isOpen}
           onClick={(e) => openFlyout(group.label, e.currentTarget)}
           className={cn(
-            "grid size-8 place-items-center rounded-md text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
-            (active || isOpen) && "bg-sidebar-accent text-sidebar-primary",
-            active && "shadow-sm ring-1 ring-sidebar-border",
+            "grid size-8 place-items-center rounded-md transition-colors duration-150",
+            (active || isOpen)
+              ? "bg-sidebar-accent text-sidebar-accent-foreground font-medium"
+              : "text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
           )}
         >
           <Icon className="size-4" />
