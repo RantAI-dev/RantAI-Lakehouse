@@ -93,12 +93,14 @@ pub(super) async fn run_saved_query(
         return json!({ "error": "saved query tidak ditemukan" });
     };
     // `None` here is not just the interactive copilot's own missing
-    // session — `run_headless_loop` (`routes::agents`) forwards `None` for
-    // every schedule- or service-triggered digital-employee run, which has
-    // no interactive user to run as. Returning a plain forwarded 401 from
-    // `query::run` in that case reads as a broken feature; naming the real
-    // reason here keeps the refusal fail-closed (the query still never
-    // runs) while being honest about why, per AGENTS.md principle 2.
+    // session — `run_headless_loop` (`routes::agents`) forwards the SAME
+    // principal `run_employee`'s auth guard resolved, and that is `None`
+    // precisely for `RunAuth::Token`: a schedule or service token, which
+    // has no interactive user to run as (C2-F3). Returning a plain
+    // forwarded 401 from `query::run` in that case reads as a broken
+    // feature; naming the real reason here keeps the refusal fail-closed
+    // (the query still never runs) while being honest about why, per
+    // AGENTS.md principle 2.
     let Some(principal) = principal else {
         return json!({
             "error": "running a saved query needs an authenticated user; this run was \
