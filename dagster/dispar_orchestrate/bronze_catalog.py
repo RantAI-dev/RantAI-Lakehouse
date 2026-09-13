@@ -349,6 +349,98 @@ def register_bronze_table(
         )
 
 
+# ── Per-verb maintenance outcomes (WS2 §4 rework) ───────────────────────
+#
+# `_MAINTENANCE_RUN_SCHEMA` above and `record_maintenance_run` are left
+# byte-identical by this rework, deliberately: `_assert_or_create_schema`'s
+# R10 guard has no additive path — for an EXISTING table it requires the
+# exact `(name, type)` column tuple to match, and raises `SchemaDriftError`
+# otherwise — so adding columns to that already-deployed table would raise
+# schema drift on every deployment's next scheduled run (the demo
+# included) and stop maintenance entirely. Per-verb outcomes
+# (`expire_snapshots`/`optimize`, whether they ran, were refused, skipped,
+# or failed) go into this NEW table instead, which no existing deployment
+# has yet, so `_assert_or_create_schema`'s "table does not exist yet"
+# branch (create fresh) is always the one that fires.
+_MAINTENANCE_VERB_RUN_SCHEMA = TableSchema(
+    table_name="bronze_meta.maintenance_verb_run",
+    columns=(
+        ("table_name", "String"),
+        ("run_at", "String"),
+        ("verb", "String"),
+        ("engine", "String"),
+        ("outcome", "String"),
+        ("detail", "String"),
+    ),
+    engine="ReplacingMergeTree",
+    order_by=("table_name", "run_at", "verb"),
+)
+
+
+def latest_maintenance_run_at(target: ClickHouseTarget, table_name: str) -> str | None:
+    """The most recent `run_at` `record_maintenance_run` wrote for
+    `table_name` (`bronze_meta.maintenance_run.run_at`'s own
+    `_utc_now_iso` string shape), or `None` if this table has never had a
+    maintenance run recorded — including `bronze_meta.maintenance_run`
+    not existing yet, the very first run on a fresh deployment.
+    `maintenance.py`'s per-table schedule cadence gate treats `None` as
+    "never run before", which always allows a run.
+    """
+    try:
+        rows = _ch_query_json(
+            target,
+            "SELECT max(run_at) AS run_at FROM lake.`bronze_meta.maintenance_run` "
+            f"WHERE table_name = {_sql_string_literal(table_name)}",
+        )
+    except requests.RequestException:
+        # Most commonly `bronze_meta.maintenance_run` not existing yet (no
+        # run has ever been recorded) or ClickHouse being unreachable —
+        # both mean "no known last run", which the cadence gate treats
+        # the same as "never run before" (always allowed), never a raise.
+        return None
+    if not rows:
+        return None
+    value = rows[0].get("run_at")
+    return value or None
+
+
+def record_maintenance_verb_run(
+    *,
+    table_name: str,
+    run_at: str,
+    verb_runs: list[dict[str, str]],
+    target: "ClickHouseTarget | None" = None,
+) -> None:
+    """Records this run's per-verb outcomes for `table_name` into the NEW
+    `lake.bronze_meta.maintenance_verb_run` table (see the section comment
+    above for why this is a new table rather than new columns on
+    `_MAINTENANCE_RUN_SCHEMA`), via the same `_assert_or_create_all` R10
+    path every other table in this module goes through.
+
+    `verb_runs` is a list of
+    `{"verb": ..., "engine": ..., "outcome": ..., "detail": ...}` dicts,
+    `outcome` one of `applied`, `refused`, `skipped` or `failed`. Does
+    nothing (no `INSERT`, no schema check) when `verb_runs` is empty — a
+    table with no configured policy has nothing to record here.
+    """
+    if not verb_runs:
+        return
+    ch = target or ClickHouseTarget.from_env()
+    _assert_or_create_all(ch, (_MAINTENANCE_VERB_RUN_SCHEMA,))
+
+    values = ", ".join(
+        f"({_sql_string_literal(table_name)}, {_sql_string_literal(run_at)}, "
+        f"{_sql_string_literal(v['verb'])}, {_sql_string_literal(v['engine'])}, "
+        f"{_sql_string_literal(v['outcome'])}, {_sql_string_literal(v['detail'])})"
+        for v in verb_runs
+    )
+    _ch_exec(
+        ch,
+        "INSERT INTO lake.`bronze_meta.maintenance_verb_run` "
+        "(table_name, run_at, verb, engine, outcome, detail) VALUES " + values,
+    )
+
+
 def _utc_now_iso() -> str:
     from datetime import datetime, timezone
 

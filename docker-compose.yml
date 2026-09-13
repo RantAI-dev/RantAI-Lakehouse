@@ -1478,6 +1478,15 @@ services:
       # no identity and the maintenance job's policy fetch fails visibly
       # (401), never silently.
       LAKEHOUSE_MAINTENANCE_TOKEN: ${LAKEHOUSE_MAINTENANCE_TOKEN:-}
+      # WS2 §4 (B3) — `maintenance.py`'s own `/v1/statement` client
+      # (`_trino_execute`, a deliberate duplicate of `lakehouse-trino`'s
+      # polling loop: this job runs outside the Rust binary) for the
+      # `expire_snapshots`/`optimize` verbs a table's policy requests. An
+      # internal service address, not a credential, so a default is
+      # allowed (AGENTS.md: `${X:-}` for dev defaults). Trino runs only
+      # under the `trino` profile; when it is unreachable the job records
+      # a degraded skip in `skipped_verbs` rather than raising.
+      TRINO_URL: ${TRINO_URL:-http://trino:8080}
     command: ["dagster", "api", "grpc", "-h", "0.0.0.0", "-p", "4000", "-m", "dispar_orchestrate.definitions"]
     restart: unless-stopped
 
