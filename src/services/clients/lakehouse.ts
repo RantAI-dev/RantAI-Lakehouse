@@ -5,6 +5,8 @@ import type {
   LakehouseTableDetail,
   LakehouseTableSummary,
   LakehouseWarehouse,
+  MaintenancePolicyInput,
+  MaintenancePolicyResult,
 } from "../contracts/lakehouse"
 import { apiFetch } from "../http"
 import { ServiceError } from "../errors"
@@ -80,6 +82,18 @@ export const icebergLakehouseService: LakehouseService = {
       lakehouseMaintenanceUrl(namespace, table),
       { cache: "no-store", signal },
       "Lakehouse maintenance policy could not be loaded"
+    )
+  },
+  async setMaintenancePolicy(namespace, table, input, signal) {
+    return request<MaintenancePolicyResult>(
+      lakehouseMaintenanceUrl(namespace, table),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(input satisfies MaintenancePolicyInput),
+        signal,
+      },
+      "Lakehouse maintenance policy could not be saved"
     )
   },
 }

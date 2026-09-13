@@ -118,6 +118,22 @@ export type LakehouseMaintenanceRun = {
   skippedVerbs: string
 }
 
+/**
+ * One `bronze_meta.maintenance_verb_run` row, mirroring
+ * `routes/lakehouse.rs::maintenance_verb_run_row_json` exactly. `outcome`
+ * is widened with `| string` since the job can record an outcome this
+ * contract doesn't yet list — e.g. `"refused"` when `expire_snapshots` hits
+ * the 7-day retention floor, which a caller must still be able to display
+ * rather than have swallowed by a type mismatch.
+ */
+export type LakehouseVerbRun = {
+  verb: string
+  engine: string
+  outcome: "applied" | "refused" | "skipped" | "failed" | string
+  detail: string
+  runAt: string
+}
+
 export type LakehouseMaintenance = {
   namespace: string
   tableName: string
@@ -131,7 +147,31 @@ export type LakehouseMaintenance = {
   compactSmallFiles: boolean
   schedule: string | null
   lastRun: LakehouseMaintenanceRun | null
+  /** Additive: newest recorded run of each verb, oldest-first is not implied. */
+  lastVerbRuns: LakehouseVerbRun[]
 }
+
+/**
+ * `POST /api/lakehouse/tables/{ns}/{table}/maintenance`'s body — camelCase
+ * on the wire, matching `MaintenancePolicyBody` in
+ * `routes/lakehouse.rs`. `snapshotsToKeep`/`orphanAgeHours` of `null` clear
+ * that field to the maintenance job's default; setting either below 1 is
+ * rejected both here (`validateMaintenancePolicyForm`) and by the route.
+ */
+export type MaintenancePolicyInput = {
+  snapshotsToKeep: number | null
+  orphanAgeHours: number | null
+  compactSmallFiles: boolean
+  schedule: string | null
+}
+
+/**
+ * The route's POST response — the GET `LakehouseMaintenance` shape minus
+ * `lastRun`/`lastVerbRuns`, which a save does not recompute (no
+ * `ClickHouse` round trip happens on write; see `set_maintenance_policy`'s
+ * doc comment).
+ */
+export type MaintenancePolicyResult = Omit<LakehouseMaintenance, "lastRun" | "lastVerbRuns">
 
 export interface LakehouseService {
   listWarehouses(signal?: AbortSignal): Promise<LakehouseWarehouse[]>
@@ -143,4 +183,10 @@ export interface LakehouseService {
   ): Promise<LakehouseTableSummary[]>
   getTableDetail(namespace: string, table: string, signal?: AbortSignal): Promise<LakehouseTableDetail>
   getMaintenance(namespace: string, table: string, signal?: AbortSignal): Promise<LakehouseMaintenance>
+  setMaintenancePolicy(
+    namespace: string,
+    table: string,
+    input: MaintenancePolicyInput,
+    signal?: AbortSignal
+  ): Promise<MaintenancePolicyResult>
 }

@@ -164,6 +164,7 @@ function maintenance(partial: Partial<LakehouseMaintenance>): LakehouseMaintenan
     compactSmallFiles: false,
     schedule: null,
     lastRun: null,
+    lastVerbRuns: [],
     ...partial,
   }
 }
