@@ -1,6 +1,14 @@
 import type { Measured } from "@/lib/measured"
 import type { EngineCategory, EntityStatus, WorkloadClass } from "@/lib/status"
 
+/**
+ * The query-execution engine, chosen by the user in Query Studio (WS2 §4).
+ * Not to be confused with `EngineCategory`, which describes a ClickHouse
+ * storage tier (hot/warm/cold) rather than which execution engine ran the
+ * query.
+ */
+export type QueryEngine = "clickhouse" | "trino"
+
 export type SavedQuery = {
   id: string
   title: string
@@ -20,7 +28,14 @@ export type QueryHistoryItem = {
   scannedBytes: number
   costUnits: number
   workloadClass: WorkloadClass
-  engine: EngineCategory
+  /**
+   * The API now records the real execution engine (`"clickhouse"` /
+   * `"trino"`) here; old rows written before that change still carry
+   * `"hot-store"`, an `EngineCategory` value, hence the union — and
+   * `| string` since either side is free to widen without breaking this
+   * contract.
+   */
+  engine: EngineCategory | QueryEngine | string
   cacheAssisted: boolean
   auditEventId?: string
 }
@@ -62,6 +77,12 @@ export type QueryResult = {
   id: string
   columns: string[]
   rows: Record<string, string>[]
+  /**
+   * The engine this specific run actually executed against — distinct from
+   * `metrics.engine` below, which is an `EngineCategory` describing the
+   * ClickHouse storage tier the query hit, not which engine ran it.
+   */
+  engine: QueryEngine | string
   metrics: {
     durationMs: number
     scannedBytes: number
@@ -87,6 +108,6 @@ export interface QueryService {
   listSaved(signal?: AbortSignal): Promise<SavedQuery[]>
   listHistory(signal?: AbortSignal): Promise<QueryHistoryItem[]>
   estimate(sql: string, signal?: AbortSignal): Promise<QueryEstimate>
-  run(sql: string, signal?: AbortSignal): Promise<QueryResult>
+  run(sql: string, options: { engine: QueryEngine }, signal?: AbortSignal): Promise<QueryResult>
   generateSql(question: string, signal?: AbortSignal): Promise<{ sql: string; explanation: string; assumptions: string[] }>
 }

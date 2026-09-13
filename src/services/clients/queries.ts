@@ -38,11 +38,15 @@ async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
   return json as T;
 }
 
-async function postJson<T>(url: string, sql: string, signal?: AbortSignal): Promise<T> {
+async function postJson<T>(
+  url: string,
+  body: Record<string, unknown>,
+  signal?: AbortSignal
+): Promise<T> {
   const res = await apiFetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sql }),
+    body: JSON.stringify(body),
     signal,
   });
   const json = await res.json().catch(() => null);
@@ -53,12 +57,12 @@ async function postJson<T>(url: string, sql: string, signal?: AbortSignal): Prom
 }
 
 export const clickhouseQueryService: QueryService = {
-  // ── real (ClickHouse) ──────────────────────────────────────────────────
-  run(sql, signal) {
-    return postJson<QueryResult>("/api/query/run", sql, signal);
+  // ── real (ClickHouse / Trino) ────────────────────────────────────────────
+  run(sql, options, signal) {
+    return postJson<QueryResult>("/api/query/run", { sql, engine: options.engine }, signal);
   },
   estimate(sql, signal) {
-    return postJson<QueryEstimate>("/api/query/estimate", sql, signal);
+    return postJson<QueryEstimate>("/api/query/estimate", { sql }, signal);
   },
 
   // ── real (agent text-to-SQL, LLM grounded on the lakehouse schema) ─────

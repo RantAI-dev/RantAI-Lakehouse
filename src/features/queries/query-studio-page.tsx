@@ -5,29 +5,134 @@ import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Button } from "@/components/ui/button"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { SqlEditor } from "@/components/sql-editor"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { queryService } from "@/services"
+import { insertAsOfClause } from "@/lib/snapshot-picker"
+import { lakehouseService, queryService } from "@/services"
 import { askAgentSql, type AgentQueryResult } from "@/services/clients/agent-client"
+import type { QueryEngine } from "@/services/contracts/queries"
 import { HistoryQuickList, SavedQuickList } from "./query-context-lists"
 import { QueryResultsSection } from "./query-results-section"
 import { QueryStudioTabs } from "./query-studio-tabs"
 
 const STARTER_SQL = "-- Write SQL here, or generate it from a question"
 
+/**
+ * Iceberg time-travel controls: the user picks a namespace, then a table
+ * (from `lakehouseService.listTables`), and that table's own snapshots
+ * (from `getTableDetail`) feed the picker — the table is never inferred
+ * from the SQL text itself. Only rendered when the engine is `trino`,
+ * since `FOR VERSION AS OF` is meaningless against ClickHouse.
+ */
+function IcebergTimeTravelControls({
+  sql,
+  onApply,
+}: {
+  sql: string
+  onApply: (nextSql: string) => void
+}) {
+  const [namespace, setNamespace] = React.useState<string | null>(null)
+  const [table, setTable] = React.useState<string | null>(null)
+  const [snapshotId, setSnapshotId] = React.useState<string | null>(null)
+
+  const namespacesState = useService((s) => lakehouseService.listNamespaces(undefined, s), [])
+  const tablesState = useService(
+    (s) => (namespace ? lakehouseService.listTables(namespace, undefined, s) : Promise.resolve([])),
+    [namespace]
+  )
+  const detailState = useService(
+    (s) =>
+      namespace && table
+        ? lakehouseService.getTableDetail(namespace, table, s)
+        : Promise.resolve(null),
+    [namespace, table]
+  )
+  const snapshots = detailState.status === "success" && detailState.data ? detailState.data.snapshots : []
+
+  function handleApply() {
+    if (!namespace || !table || !snapshotId) return
+    onApply(insertAsOfClause(sql, `${namespace}.${table}`, snapshotId))
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-2 rounded-md border border-dashed border-border p-2 text-xs">
+      <span className="font-medium text-muted-foreground">Time travel</span>
+      <Select
+        value={namespace ?? ""}
+        onValueChange={(v) => {
+          setNamespace(v || null)
+          setTable(null)
+          setSnapshotId(null)
+        }}
+      >
+        <SelectTrigger size="sm">
+          <SelectValue placeholder="Namespace" />
+        </SelectTrigger>
+        <SelectContent>
+          {namespacesState.status === "success"
+            ? namespacesState.data.map((n) => (
+                <SelectItem key={n.name} value={n.name}>
+                  {n.name}
+                </SelectItem>
+              ))
+            : null}
+        </SelectContent>
+      </Select>
+      <Select
+        value={table ?? ""}
+        onValueChange={(v) => {
+          setTable(v || null)
+          setSnapshotId(null)
+        }}
+        disabled={!namespace}
+      >
+        <SelectTrigger size="sm">
+          <SelectValue placeholder="Table" />
+        </SelectTrigger>
+        <SelectContent>
+          {tablesState.status === "success"
+            ? tablesState.data.map((t) => (
+                <SelectItem key={t.name} value={t.name}>
+                  {t.name}
+                </SelectItem>
+              ))
+            : null}
+        </SelectContent>
+      </Select>
+      <Select value={snapshotId ?? ""} onValueChange={(v) => setSnapshotId(v || null)} disabled={snapshots.length === 0}>
+        <SelectTrigger size="sm">
+          <SelectValue placeholder="Snapshot" />
+        </SelectTrigger>
+        <SelectContent>
+          {snapshots.map((snap) => (
+            <SelectItem key={snap.id} value={snap.id}>
+              {snap.id} · {snap.operation}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      <Button size="sm" variant="outline" onClick={handleApply} disabled={!namespace || !table || !snapshotId}>
+        Insert AS OF
+      </Button>
+    </div>
+  )
+}
+
 /** Query Studio: natural-language ↔ SQL workspace with execution transparency. */
 export function QueryStudioPage() {
   const [tab, setTab] = React.useState("nl")
   const [question, setQuestion] = React.useState("")
   const [sql, setSql] = React.useState(STARTER_SQL)
+  const [engine, setEngine] = React.useState<QueryEngine>("clickhouse")
 
   const generateAct = useServiceAction((signal, q: string) =>
     queryService.generateSql(q, signal)
   )
-  const runAct = useServiceAction((signal, s: string) =>
-    queryService.run(s, signal)
+  const runAct = useServiceAction((signal, s: string, eng: QueryEngine) =>
+    queryService.run(s, { engine: eng }, signal)
   )
   const savedState = useService((s) => queryService.listSaved(s), [])
 
@@ -191,21 +296,33 @@ export function QueryStudioPage() {
             </TabsContent>
             <TabsContent value="sql" className="mt-3 space-y-3">
               <SqlEditor value={sql} onChange={setSql} />
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <Button
                   size="sm"
-                  onClick={() => void runAct.run(sql)}
+                  onClick={() => void runAct.run(sql, engine)}
                   disabled={running || !sql.trim()}
                 >
                   {running ? "Running…" : "Run query"}
                 </Button>
+                <Select value={engine} onValueChange={(v) => setEngine((v as QueryEngine) || "clickhouse")}>
+                  <SelectTrigger size="sm">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="clickhouse">ClickHouse</SelectItem>
+                    <SelectItem value="trino">Trino</SelectItem>
+                  </SelectContent>
+                </Select>
               </div>
+              {engine === "trino" ? (
+                <IcebergTimeTravelControls sql={sql} onApply={setSql} />
+              ) : null}
             </TabsContent>
           </Tabs>
           {runAct.status === "error" ? (
             <ErrorState
               error={runAct.error}
-              onRetry={() => void runAct.run(sql)}
+              onRetry={() => void runAct.run(sql, engine)}
             />
           ) : null}
           {runAct.data ? <QueryResultsSection result={runAct.data} /> : null}
