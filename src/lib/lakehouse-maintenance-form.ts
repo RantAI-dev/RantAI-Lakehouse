@@ -1,6 +1,6 @@
 /**
  * Pure client-side validation for the maintenance-policy form on the
- * table-detail page (WS2 §4 Task B4). Mirrors
+ * table-detail page (WS2 §4). Mirrors
  * `validate_maintenance_policy_body` in
  * `rust/crates/lakehouse-api/src/routes/lakehouse.rs` field for field and
  * message for message, so a bad input fails here before the round trip the

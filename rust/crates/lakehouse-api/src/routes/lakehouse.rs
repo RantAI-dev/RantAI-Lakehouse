@@ -1039,7 +1039,7 @@ mod tests {
     fn is_unknown_table_error_accepts_a_real_clickhouse_unknown_table_body() {
         // Observed against ClickHouse 26.7.3.19 over the HTTP interface
         // (a read-only query against a table that does not exist), not
-        // invented — this stack pins that version (WS2 §4 B3-F3).
+        // invented — this stack pins that version (WS2 §4).
         let body = "Code: 60. DB::Exception: Unknown table expression identifier \
                      'lake.bronze_meta.maintenance_verb_run' in scope SELECT 1 FROM \
                      lake.`bronze_meta.maintenance_verb_run`. (UNKNOWN_TABLE) \
@@ -1294,8 +1294,15 @@ mod tests {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .respond_with(ResponseTemplate::new(404).set_body_string(
-                    "Code: 60. DB::Exception: Table lake.bronze_meta.maintenance_verb_run \
-                     doesn't exist. (UNKNOWN_TABLE)",
+                    // Observed against ClickHouse 26.7.3.19 over the HTTP
+                    // interface (a read-only query against a table that does
+                    // not exist), not invented — the same measured body
+                    // `is_unknown_table_error_accepts_a_real_clickhouse_unknown_table_body`
+                    // asserts against above.
+                    "Code: 60. DB::Exception: Unknown table expression identifier \
+                     'lake.bronze_meta.maintenance_verb_run' in scope SELECT 1 FROM \
+                     lake.`bronze_meta.maintenance_verb_run`. (UNKNOWN_TABLE) \
+                     (version 26.7.3.19 (official build))",
                 ))
                 .mount(&server)
                 .await;
