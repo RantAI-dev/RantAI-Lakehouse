@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use iceberg::{NamespaceIdent, TableIdent};
@@ -44,6 +44,7 @@ use lakehouse_core::ident::SqlLiteral;
 use lakehouse_iceberg::IcebergClient;
 use lakehouse_iceberg::rest;
 use lakehouse_store::PgPool;
+use lakehouse_store::annotation::AnnotationRow;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
@@ -60,11 +61,44 @@ use crate::tenant::{
     NAMESPACE_META, TENANT_DOMAIN, TENANT_OWNER, TENANT_RESIDENCY, is_curated_bronze,
 };
 
-/// `GET /api/catalog` — the full asset registry, grouped into namespaces.
-pub async fn list(State(state): State<AppState>) -> Response {
+/// Query parameters accepted by `GET /api/catalog`. `q` is the free-text
+/// search term the command palette sends (WS2 §13, Task E2) — moved here
+/// from `src/services/clients/assets.ts`'s browser-side filter so there is
+/// one implementation of the term match, not two (`AGENTS.md` rule 4).
+#[derive(Debug, Deserialize)]
+pub struct ListQuery {
+    #[serde(default)]
+    q: Option<String>,
+}
+
+/// `GET /api/catalog` — the full asset registry, grouped into namespaces,
+/// optionally narrowed by `?q=` to assets whose `name`/`description`/`id`
+/// (or, when Postgres is configured, whose annotation `description`/`tags`)
+/// contain the term.
+pub async fn list(State(state): State<AppState>, Query(params): Query<ListQuery>) -> Response {
     match list_body(&state.clickhouse).await {
         Ok((mut body, bronze_pairs)) => {
             enrich_bronze_assets(&state, &mut body, bronze_pairs).await;
+            if let Some(q) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+                let annotations = match state.pg.as_deref() {
+                    Some(pool) => match lakehouse_store::annotation::list_all(pool).await {
+                        Ok(rows) => rows,
+                        Err(err) => {
+                            // Annotations widen the search; they never gate
+                            // it. A store failure here degrades to
+                            // name/description/id matching only, not a
+                            // failed request.
+                            tracing::warn!(%err, "asset_annotation lookup failed during catalog search");
+                            Vec::new()
+                        }
+                    },
+                    None => Vec::new(),
+                };
+                if let Some(assets) = body.get("assets").and_then(Value::as_array) {
+                    let filtered = filter_assets_by_query(assets, q, &annotations);
+                    body["assets"] = Value::Array(filtered);
+                }
+            }
             (StatusCode::OK, ApiJson(body)).into_response()
         }
         // `catch (e) { return NextResponse.json({ error: String(e), assets:
@@ -75,6 +109,54 @@ pub async fn list(State(state): State<AppState>) -> Response {
         )
             .into_response(),
     }
+}
+
+/// Case-insensitive substring match over each asset's `name`, `description`,
+/// and `id` — the SAME fields and case rule
+/// `src/services/clients/assets.ts`'s `clickhouseAssetService.listAssets`
+/// used to apply in the browser, moved here so there is one implementation
+/// (WS2 §13, Task E2 pre-dispatch fix E2-2). Widened by `annotations`: an
+/// asset also matches when its own annotation row's `description` or any
+/// `tags` entry contains the term. An empty `q` matches everything.
+fn filter_assets_by_query(assets: &[Value], q: &str, annotations: &[AnnotationRow]) -> Vec<Value> {
+    let needle = q.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return assets.to_vec();
+    }
+    let by_id: HashMap<&str, &AnnotationRow> = annotations
+        .iter()
+        .map(|row| (row.asset_id.as_str(), row))
+        .collect();
+    assets
+        .iter()
+        .filter(|asset| {
+            let id = asset["id"].as_str().unwrap_or_default();
+            let name = asset["name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let description = asset["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if name.contains(&needle)
+                || description.contains(&needle)
+                || id.to_ascii_lowercase().contains(&needle)
+            {
+                return true;
+            }
+            by_id.get(id).is_some_and(|row| {
+                row.description
+                    .as_deref()
+                    .is_some_and(|d| d.to_ascii_lowercase().contains(&needle))
+                    || row
+                        .tags
+                        .iter()
+                        .any(|t| t.to_ascii_lowercase().contains(&needle))
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 #[allow(
@@ -1238,6 +1320,49 @@ mod tests {
     fn split_db_table_strips_sql_metacharacters() {
         let (_, table) = split_db_table("silver.mart'; DROP TABLE x --");
         assert_eq!(table, "martDROPTABLEx");
+    }
+
+    #[test]
+    fn filter_assets_by_query_matches_name_description_or_id_case_insensitively() {
+        let assets = vec![
+            json!({ "id": "bronze.orders", "name": "Orders", "description": "Order events" }),
+            json!({ "id": "bronze.users", "name": "Users", "description": "Signup ledger" }),
+        ];
+        let filtered = filter_assets_by_query(&assets, "ORDER", &[]);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["id"], json!("bronze.orders"));
+
+        let by_id = filter_assets_by_query(&assets, "bronze.users", &[]);
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0]["id"], json!("bronze.users"));
+    }
+
+    #[test]
+    fn filter_assets_by_query_matches_via_an_annotation_tag() {
+        let assets = vec![
+            json!({ "id": "bronze.orders", "name": "Orders", "description": "Order events" }),
+            json!({ "id": "bronze.users", "name": "Users", "description": "Signup ledger" }),
+        ];
+        let annotations = vec![AnnotationRow {
+            asset_id: "bronze.users".to_owned(),
+            owner: None,
+            steward: None,
+            tags: vec!["pii".to_owned()],
+            description: None,
+        }];
+        let filtered = filter_assets_by_query(&assets, "pii", &annotations);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["id"], json!("bronze.users"));
+    }
+
+    #[test]
+    fn filter_assets_by_query_empty_q_returns_everything() {
+        let assets = vec![
+            json!({ "id": "bronze.orders", "name": "Orders", "description": "Order events" }),
+            json!({ "id": "bronze.users", "name": "Users", "description": "Signup ledger" }),
+        ];
+        assert_eq!(filter_assets_by_query(&assets, "", &[]).len(), 2);
+        assert_eq!(filter_assets_by_query(&assets, "   ", &[]).len(), 2);
     }
 
     #[test]

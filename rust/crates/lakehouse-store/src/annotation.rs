@@ -102,3 +102,18 @@ pub async fn get_annotation(
     .await?;
     Ok(row)
 }
+
+/// Fetch every asset's annotation — used by `GET /api/catalog?q=` (WS2 §13)
+/// to widen the free-text search to annotation `description`/`tags`
+/// without one round trip per asset.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn list_all(pool: &PgPool) -> Result<Vec<AnnotationRow>, StoreError> {
+    let rows =
+        sqlx::query_as("SELECT asset_id, owner, steward, tags, description FROM asset_annotation")
+            .fetch_all(pool)
+            .await?;
+    Ok(rows)
+}

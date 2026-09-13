@@ -6,9 +6,16 @@ import { useRouter } from "next/navigation";
 import { usePathname } from "next/navigation";
 import { useTheme } from "next-themes";
 import {
-  Search, Sparkles, BarChart3, Plus, Download, Moon, Sun, Clock,
+  Search, Sparkles, BarChart3, Plus, Download, Moon, Sun, Clock, Database,
 } from "lucide-react";
 import { NAV_GROUPS, pageTitleFor } from "@/components/app-shell/nav-config";
+import { assetService } from "@/services";
+import type { Asset } from "@/services/contracts/assets";
+import { capPaletteAssetResults } from "@/lib/palette-search";
+
+/** Debounce, in ms, before a typed search term reaches `assetService`
+ * (WS2 §13, Task E2 pre-dispatch fix E2-3). */
+const CATALOG_SEARCH_DEBOUNCE_MS = 250;
 
 const OPEN_EVENT = "rantai:open-command";
 /** Call from anywhere (e.g. the navbar search box) to open the palette. */
@@ -33,11 +40,40 @@ function readRecents(): Recent[] {
 export function CommandPalette() {
   const [open, setOpen] = React.useState(false);
   const [recents, setRecents] = React.useState<Recent[]>([]);
+  const [search, setSearch] = React.useState("");
+  const [assetResults, setAssetResults] = React.useState<Asset[]>([]);
   const router = useRouter();
   const pathname = usePathname();
   const { resolvedTheme, setTheme } = useTheme();
 
   const groups = NAV_GROUPS;
+
+  // Server-side catalog search behind the "Catalog assets" group (WS2 §13,
+  // Task E2). Debounced 250ms and abortable on every keystroke so a slow
+  // response for an earlier term can never clobber a later one's result —
+  // `cancelled` guards state updates from a request whose signal already
+  // aborted or whose debounce timer never fired. A failed request shows no
+  // results rather than a spinner that never resolves.
+  React.useEffect(() => {
+    const term = search.trim();
+    if (!term) {
+      setAssetResults([]);
+      return;
+    }
+    let cancelled = false;
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      assetService
+        .listAssets({ search: term }, controller.signal)
+        .then((assets) => { if (!cancelled) setAssetResults(capPaletteAssetResults(assets)); })
+        .catch(() => { if (!cancelled) setAssetResults([]); });
+    }, CATALOG_SEARCH_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [search]);
 
   // Open via ⌘K / Ctrl+K, and via an event from the navbar search box.
   React.useEffect(() => {
@@ -56,7 +92,10 @@ export function CommandPalette() {
     };
   }, []);
 
-  React.useEffect(() => { if (open) setRecents(readRecents()); }, [open]);
+  React.useEffect(() => {
+    if (open) setRecents(readRecents());
+    else setSearch("");
+  }, [open]);
 
   // Record visited pages (for the Recent list).
   React.useEffect(() => {
@@ -84,8 +123,10 @@ export function CommandPalette() {
         <Search className="size-4 shrink-0 text-muted-foreground" />
         <Command.Input
           autoFocus
-          placeholder="Search pages or actions…"
+          placeholder="Search pages, actions, or catalog assets…"
           className="h-11 w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+          value={search}
+          onValueChange={setSearch}
         />
         <kbd className="hidden rounded border border-border px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground sm:block">esc</kbd>
       </div>
@@ -114,6 +155,21 @@ export function CommandPalette() {
           <Command.Group heading="Recent" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
             {recents.map((r) => (
               <PaletteItem key={r.href} icon={Clock} label={r.title} value={`recent ${r.title} ${r.href}`} onSelect={() => go(r.href)} />
+            ))}
+          </Command.Group>
+        ) : null}
+
+        {/* Catalog assets — server-side search, WS2 §13 Task E2 */}
+        {assetResults.length ? (
+          <Command.Group heading="Catalog assets" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
+            {assetResults.map((a) => (
+              <PaletteItem
+                key={a.id}
+                icon={Database}
+                label={a.name}
+                value={`asset ${a.id} ${a.name}`}
+                onSelect={() => go(`/data/assets/${a.id}`)}
+              />
             ))}
           </Command.Group>
         ) : null}
