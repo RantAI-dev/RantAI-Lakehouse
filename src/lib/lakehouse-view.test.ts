@@ -1,6 +1,8 @@
 import { describe, expect, it } from "bun:test"
 import {
+  formatSignedBytes,
   isIcebergCandidate,
+  lakehouseCapacityUrl,
   lakehouseMaintenanceUrl,
   lakehouseNamespacesUrl,
   lakehouseTableDetailUrl,
@@ -67,6 +69,26 @@ describe("lakehouseTableDetailUrl", () => {
     expect(lakehouseTableDetailUrl("bronze", "orders/2026 q1")).toBe(
       "/api/lakehouse/tables/bronze/orders%2F2026%20q1"
     )
+  })
+})
+
+describe("lakehouseCapacityUrl", () => {
+  it("has no query parameters", () => {
+    expect(lakehouseCapacityUrl()).toBe("/api/lakehouse/capacity")
+  })
+})
+
+describe("formatSignedBytes", () => {
+  it("prefixes a positive delta with +", () => {
+    expect(formatSignedBytes(1536)).toBe("+1.5 KB")
+  })
+
+  it("prefixes a negative delta with - and formats its magnitude", () => {
+    expect(formatSignedBytes(-1536)).toBe("-1.5 KB")
+  })
+
+  it("treats a zero delta as a genuine measured zero, not a dash", () => {
+    expect(formatSignedBytes(0)).toBe("+0 B")
   })
 })
 

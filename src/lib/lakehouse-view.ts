@@ -4,7 +4,7 @@
  * page components so it can be unit-tested with `bun test` — the
  * component-test harness (H0) does not exist on this branch.
  */
-import { formatRelativeTime } from "./format"
+import { formatBytes, formatRelativeTime } from "./format"
 import type {
   LakehouseMaintenance,
   LakehouseSnapshot,
@@ -32,6 +32,22 @@ export function lakehouseTableDetailUrl(namespace: string, table: string): strin
 
 export function lakehouseMaintenanceUrl(namespace: string, table: string): string {
   return `${lakehouseTableDetailUrl(namespace, table)}/maintenance`
+}
+
+export function lakehouseCapacityUrl(): string {
+  return "/api/lakehouse/capacity"
+}
+
+/**
+ * Renders `growth7d` (a signed byte delta — shrinkage is a real, negative
+ * measurement) with an explicit `+`/`-` sign, built on top of `formatBytes`
+ * rather than a second byte formatter: `formatBytes` itself only accepts
+ * non-negative magnitudes, so the sign is split off before it, not
+ * reimplemented inside it.
+ */
+export function formatSignedBytes(bytes: number): string {
+  const sign = bytes < 0 ? "-" : "+"
+  return `${sign}${formatBytes(Math.abs(bytes))}`
 }
 
 /** Link to the table-detail page for a given namespace/table pair. */

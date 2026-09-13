@@ -1,4 +1,5 @@
 import type {
+  LakehouseCapacity,
   LakehouseMaintenance,
   LakehouseNamespace,
   LakehouseService,
@@ -11,6 +12,7 @@ import type {
 import { apiFetch } from "../http"
 import { ServiceError } from "../errors"
 import {
+  lakehouseCapacityUrl,
   lakehouseMaintenanceUrl,
   lakehouseNamespacesUrl,
   lakehouseTableDetailUrl,
@@ -53,6 +55,13 @@ export const icebergLakehouseService: LakehouseService = {
       "Lakehouse warehouses could not be loaded"
     )
     return json.warehouses
+  },
+  async getCapacity(signal) {
+    return request<LakehouseCapacity>(
+      lakehouseCapacityUrl(),
+      { cache: "no-store", signal },
+      "Lakehouse capacity could not be loaded"
+    )
   },
   async listNamespaces(warehouse, signal) {
     const json = await request<{ namespaces: LakehouseNamespace[] }>(

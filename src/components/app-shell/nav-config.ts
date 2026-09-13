@@ -94,7 +94,10 @@ export const NAV_GROUPS: NavGroup[] = [
   {
     label: "Lakehouse",
     icon: Layers,
-    items: [{ title: "Tables", href: "/lakehouse/tables", icon: Layers }],
+    items: [
+      { title: "Tables", href: "/lakehouse/tables", icon: Layers },
+      { title: "Capacity", href: "/lakehouse/capacity", icon: BarChart3 },
+    ],
   },
   {
     label: "Build",

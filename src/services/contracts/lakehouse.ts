@@ -173,8 +173,38 @@ export type MaintenancePolicyInput = {
  */
 export type MaintenancePolicyResult = Omit<LakehouseMaintenance, "lastRun" | "lastVerbRuns">
 
+/**
+ * One `bucket_name`'s newest reading from `bronze_meta.capacity_snapshot`,
+ * mirroring `routes/lakehouse.rs::capacity_body`'s `buckets[]` entries.
+ * `bytes`/`objects` are plain numbers, not `Measured` — the backend's
+ * `num_or_zero` already defaults an unparseable or missing column to `0`
+ * before this ever reaches the wire, so there is no "not measured" state
+ * left to represent here.
+ */
+export type LakehouseCapacityBucket = {
+  name: string
+  bytes: number
+  objects: number
+  measuredAt: string
+}
+
+/**
+ * `GET /api/lakehouse/capacity`'s body, mirroring `capacity_body` exactly.
+ * `growth7d` is `Measured` (not a plain `number`) because it really can be
+ * absent by design: `null` whenever no reading falls within the ±12 hour
+ * window around `latest - 7 days` (fewer than ~8 days of history, or a
+ * missed daily run) — see `capacity_body`'s doc comment. Render it with
+ * `fmtMeasured`, never `?? 0`.
+ */
+export type LakehouseCapacity = {
+  buckets: LakehouseCapacityBucket[]
+  clickhouse: { bytesOnDisk: number }
+  growth7d: Measured
+}
+
 export interface LakehouseService {
   listWarehouses(signal?: AbortSignal): Promise<LakehouseWarehouse[]>
+  getCapacity(signal?: AbortSignal): Promise<LakehouseCapacity>
   listNamespaces(warehouse?: string, signal?: AbortSignal): Promise<LakehouseNamespace[]>
   listTables(
     namespace: string,
