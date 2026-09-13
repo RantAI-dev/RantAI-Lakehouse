@@ -188,8 +188,11 @@ class MeasureSnapshotGrowthTest(unittest.TestCase):
 class FetchPolicyIndexTest(unittest.TestCase):
     """`_fetch_policy_index` fetches every configured maintenance policy
     ONCE per run and indexes it by `(namespace, tableName)` — see the
-    module doc's "Per-table policy + Trino verbs" section and the WS2
-    Task B3 pre-dispatch fixes on policy-fetch failures."""
+    module doc's "Per-table policy + Trino verbs" section. A policy-fetch
+    failure (401/403, a server error, an unreachable API, or no token
+    configured) is fail-closed for auth (raises `Failure`) or recorded as
+    a skip for everything else, never silently treated as "no policy
+    configured"."""
 
     def test_indexes_policies_by_namespace_and_table_name(self) -> None:
         resp = mock.Mock(status_code=200)
@@ -262,7 +265,7 @@ class FetchPolicyIndexTest(unittest.TestCase):
 
 
 class ComputeRetentionThresholdTest(unittest.TestCase):
-    """B3-1: `_compute_retention_threshold` must never emit a `'0d'`-style
+    """`_compute_retention_threshold` must never emit a `'0d'`-style
     threshold that would expire every snapshot but the current one — the
     threshold is the AGE of the Nth-newest snapshot, so exactly N
     survive."""
@@ -303,7 +306,7 @@ class ComputeRetentionThresholdTest(unittest.TestCase):
 
 
 class CadenceAllowsTest(unittest.TestCase):
-    """B3-3: per-table `schedule` cadence for the Trino verbs only."""
+    """Per-table `schedule` cadence for the Trino verbs only."""
 
     def test_a_null_schedule_always_allows_a_run(self) -> None:
         now = datetime(2026, 1, 10, tzinfo=timezone.utc)

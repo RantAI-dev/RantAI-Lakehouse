@@ -1478,7 +1478,7 @@ services:
       # no identity and the maintenance job's policy fetch fails visibly
       # (401), never silently.
       LAKEHOUSE_MAINTENANCE_TOKEN: ${LAKEHOUSE_MAINTENANCE_TOKEN:-}
-      # WS2 §4 (B3) — `maintenance.py`'s own `/v1/statement` client
+      # WS2 §4 — `maintenance.py`'s own `/v1/statement` client
       # (`_trino_execute`, a deliberate duplicate of `lakehouse-trino`'s
       # polling loop: this job runs outside the Rust binary) for the
       # `expire_snapshots`/`optimize` verbs a table's policy requests. An

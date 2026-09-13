@@ -622,10 +622,10 @@ def _parse_trino_timestamp(value: str) -> datetime:
     `2026-01-01 00:00:00.000 UTC`) — into an aware UTC `datetime`. Falls
     back to `datetime.fromisoformat` for a plain ISO-8601 string with no
     trailing zone name, so a differently-configured Trino session still
-    parses. Not measured against a live Trino response (B3-5: the
-    procedure syntax is resolved from `ops/trino/optimize_bronze.sh`'s
-    existing proof and Trino's documented form, not a fresh live capture);
-    this job's own G2 gate exercises the real response shape."""
+    parses. Not measured against a live Trino response: the procedure
+    syntax is resolved from `ops/trino/optimize_bronze.sh`'s existing proof
+    and Trino's documented form, not a fresh live capture; this job's own
+    G2 gate exercises the real response shape."""
     text = value.strip()
     if text.endswith(" UTC"):
         text = text[: -len(" UTC")]
@@ -672,7 +672,7 @@ def _cadence_allows(
 def _compute_retention_threshold(
     committed_at: list[datetime], keep: int, now: datetime
 ) -> tuple[str | None, str | None]:
-    """B3-1: computes the `expire_snapshots(retention_threshold => ...)`
+    """Computes the `expire_snapshots(retention_threshold => ...)`
     argument that keeps exactly the `keep` newest snapshots, from
     `committed_at` (every snapshot's commit time, NEWEST FIRST — the
     order `SELECT committed_at FROM iceberg.<ns>."<t>$snapshots" ORDER BY

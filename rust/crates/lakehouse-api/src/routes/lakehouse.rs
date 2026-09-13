@@ -329,9 +329,8 @@ fn maintenance_verb_run_row_json(row: &Map<String, Value>) -> Value {
 /// # Errors
 /// Returns [`lakehouse_clickhouse::ChError`] if the query fails, including
 /// `bronze_meta.maintenance_verb_run` not existing yet — see
-/// [`maintenance_verb_runs_or_empty`], the only caller, for why that is
-/// NOT surfaced as a 503 the way [`latest_maintenance_run`]'s missing
-/// table is.
+/// [`maintenance_verb_runs_or_empty`], the only caller, for how that
+/// specific error is told apart from every other failure.
 async fn latest_maintenance_verb_runs(
     ch: &lakehouse_clickhouse::ChClient,
     table_name: &str,
@@ -342,30 +341,54 @@ async fn latest_maintenance_verb_runs(
     Ok(rows.iter().map(maintenance_verb_run_row_json).collect())
 }
 
-/// Unlike `bronze_meta.maintenance_run` (whose absence means "the P4
-/// maintenance job has never run on this deployment" — a real outage
-/// signal `classify_ch_error` turns into a fixed 503), a missing
-/// `bronze_meta.maintenance_verb_run` is the NORMAL steady state for any
-/// table that has never had a policy run a Trino verb, and for every
-/// deployment that predates this feature. Turning that into the same 503
-/// would make a brand-new, additive field regress an endpoint that was
-/// already serving successfully — so a lookup failure here degrades to an
-/// honest empty list (logged, never silently swallowed) instead of
-/// failing the whole `GET`.
+/// True when `body` is `ClickHouse`'s error text for "the table does not
+/// exist" — this stack pins `ClickHouse` 26.7.3.19, whose exception text
+/// for a missing table ends with the error's code name in parentheses,
+/// e.g. `"Code: 60. DB::Exception: Table lake.bronze_meta.\
+/// maintenance_verb_run doesn't exist. (UNKNOWN_TABLE)"`. Matched on the
+/// code name (`UNKNOWN_TABLE`) with the numeric code (`60`) checked too,
+/// belt and braces. A small named function so it is unit-testable on
+/// plain strings, without a live `ClickHouse`.
+///
+/// This inspects `ClickHouse`'s own error text only to CLASSIFY it into a
+/// `bool` — the text itself is never returned or logged verbatim from
+/// here, so AGENTS.md rule 4 (upstream error text never reaches a
+/// response) still holds; [`classify_ch_error`] is what actually redacts
+/// it for every case this function does not recognize.
+fn is_unknown_table_error(body: &str) -> bool {
+    body.contains("(UNKNOWN_TABLE)") || body.contains("Code: 60.")
+}
+
+/// `bronze_meta.maintenance_verb_run` is created lazily by
+/// `dagster/dispar_orchestrate/bronze_catalog.py::record_maintenance_verb_run`
+/// on the first verb run, so `ClickHouse` reporting it does not exist
+/// (`is_unknown_table_error`) truthfully means "nothing has ever been
+/// recorded for this table" — the one case where `[]` is honest rather
+/// than fabricated.
+///
+/// Every OTHER `ChError` — including `ClickHouse` being unreachable —
+/// takes the same fixed 503 [`classify_ch_error`] gives `lastRun`, so the
+/// two fields on this route share one posture. Turning every failure into
+/// `[]` (as this function used to) made a genuine outage indistinguishable
+/// from "nothing has run" — AGENTS.md rule 2.
+///
+/// # Errors
+/// The fixed 503 [`classify_ch_error`] produces, for any `ChError` other
+/// than a `ClickHouse` unknown-table error.
 async fn maintenance_verb_runs_or_empty(
     ch: &lakehouse_clickhouse::ChClient,
     table_name: &str,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, ApiError> {
     match latest_maintenance_verb_runs(ch, table_name).await {
-        Ok(rows) => rows,
-        Err(err) => {
-            tracing::warn!(
-                %err,
+        Ok(rows) => Ok(rows),
+        Err(lakehouse_clickhouse::ChError::Server(ref body)) if is_unknown_table_error(body) => {
+            tracing::debug!(
                 table_name,
-                "maintenance-verb-run lookup failed, reporting no verb runs"
+                "bronze_meta.maintenance_verb_run does not exist yet, reporting no verb runs"
             );
-            Vec::new()
+            Ok(Vec::new())
         }
+        Err(err) => Err(classify_ch_error(&err)),
     }
 }
 
@@ -533,12 +556,15 @@ fn last_run_applies(ns: &str) -> bool {
 ///
 /// # Errors
 /// 400 if `ns`/`table` are not `[a-z0-9_]+`-shaped, 503 if no Postgres pool
-/// is configured ([`lakehouse_store::StoreError::Unavailable`]) or the
-/// `ClickHouse` maintenance-run lookup fails — following
+/// is configured ([`lakehouse_store::StoreError::Unavailable`]) or either
+/// `ClickHouse` maintenance-history lookup fails — following
 /// `routes::governance::maintenance`'s own documented posture: a missing
 /// `bronze_meta.maintenance_run` table (the P4 job has never run on this
 /// deployment) looks the same as `ClickHouse` being down, and both get the
 /// same fixed 503 rather than a fabricated `lastRun: null` success.
+/// `lastVerbRuns` shares that posture too, except for the one case where
+/// `bronze_meta.maintenance_verb_run` itself does not exist yet — see
+/// [`maintenance_verb_runs_or_empty`].
 pub async fn maintenance(
     State(state): State<AppState>,
     Path((ns, table)): Path<(String, String)>,
@@ -563,11 +589,11 @@ pub async fn maintenance(
         None
     };
 
-    // `lastVerbRuns` — see `maintenance_verb_runs_or_empty`'s doc comment
-    // for why a lookup failure here degrades to an empty list instead of
-    // the 503 `last_run`'s own failure gives.
+    // `lastVerbRuns` — see `maintenance_verb_runs_or_empty`'s doc comment:
+    // it shares `last_run`'s fixed 503 for every failure except the table
+    // itself not existing yet, which is the honest `[]`.
     let last_verb_runs = if last_run_applies(&ns) {
-        maintenance_verb_runs_or_empty(&state.clickhouse, &table).await
+        maintenance_verb_runs_or_empty(&state.clickhouse, &table).await?
     } else {
         Vec::new()
     };
@@ -1006,6 +1032,19 @@ mod tests {
     }
 
     #[test]
+    fn is_unknown_table_error_accepts_a_real_clickhouse_unknown_table_body() {
+        let body = "Code: 60. DB::Exception: Table lake.bronze_meta.maintenance_verb_run \
+                     doesn't exist. (UNKNOWN_TABLE)";
+        assert!(is_unknown_table_error(body));
+    }
+
+    #[test]
+    fn is_unknown_table_error_rejects_an_unrelated_clickhouse_error() {
+        let body = "Code: 62. DB::Exception: Syntax error: failed at position 1 (SYNTAX_ERROR)";
+        assert!(!is_unknown_table_error(body));
+    }
+
+    #[test]
     fn classify_rest_error_maps_not_found_to_404_naming_the_table() {
         let err = classify_rest_error(&RestError::NotFound, "table");
         assert_eq!(err.status(), 404);
@@ -1232,6 +1271,50 @@ mod tests {
                 broken_hits, 1,
                 "a fan-out item must not be retried by lakehouse_catalog::call"
             );
+        }
+
+        /// `lakehouse_clickhouse::ChClient` posts every query to its
+        /// configured URL directly (no fixed path), matching this crate's
+        /// own wiremock tests for it.
+        fn ch_client(server: &MockServer) -> lakehouse_clickhouse::ChClient {
+            lakehouse_clickhouse::ChClient::new(server.uri(), "default".to_owned(), String::new())
+        }
+
+        #[tokio::test]
+        async fn maintenance_verb_runs_or_empty_reports_no_runs_for_an_unknown_table() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(404).set_body_string(
+                    "Code: 60. DB::Exception: Table lake.bronze_meta.maintenance_verb_run \
+                     doesn't exist. (UNKNOWN_TABLE)",
+                ))
+                .mount(&server)
+                .await;
+
+            let rows = maintenance_verb_runs_or_empty(&ch_client(&server), "orders")
+                .await
+                .expect("an unknown-table error is the one truthful empty list");
+
+            assert_eq!(rows, Vec::<Value>::new());
+        }
+
+        #[tokio::test]
+        async fn maintenance_verb_runs_or_empty_shares_last_runs_fixed_503_for_any_other_failure() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(500)
+                        .set_body_string("Code: 210. DB::NetException: Connection refused"),
+                )
+                .mount(&server)
+                .await;
+
+            let err = maintenance_verb_runs_or_empty(&ch_client(&server), "orders")
+                .await
+                .expect_err("a real ClickHouse failure must not be reported as no verb runs");
+
+            assert_eq!(err.status(), 503);
+            assert_eq!(err.to_string(), "maintenance history is unavailable");
         }
     }
 }
