@@ -170,6 +170,7 @@ fn lakehouse_router() -> Router<AppState> {
             "/api/lakehouse/maintenance-policies",
             get(lakehouse::list_maintenance_policies),
         )
+        .route("/api/lakehouse/capacity", get(lakehouse::capacity))
 }
 
 /// The `/api/overview/alerts/*` sub-router (Task 2.6), split out for the

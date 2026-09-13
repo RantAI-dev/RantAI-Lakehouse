@@ -150,6 +150,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET", "/api/lakehouse/tables/{ns}/{table}",             Policy::RequiresPermission("catalog:read")),
     ("GET", "/api/lakehouse/tables/{ns}/{table}/maintenance", Policy::RequiresPermission("catalog:read")),
     ("POST", "/api/lakehouse/tables/{ns}/{table}/maintenance", Policy::RequiresPermission("governance:write")),
+    ("GET", "/api/lakehouse/capacity",                        Policy::RequiresPermission("catalog:read")),
     ("GET", "/api/lakehouse/maintenance-policies",            Policy::RequiresAuth),
 
     // ── Overview / alerts: no seeded resource maps to these — auth only. ─

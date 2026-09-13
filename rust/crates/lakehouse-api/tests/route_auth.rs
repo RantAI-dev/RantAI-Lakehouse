@@ -242,6 +242,33 @@ async fn a_seeded_analyst_is_denied_the_maintenance_policy_write() {
     );
 }
 
+/// A seeded Analyst (`catalog:read`) is not denied
+/// `GET /api/lakehouse/capacity` (WS2 §4). This route is
+/// `Policy::RequiresPermission("catalog:read")`, the same seeded permission
+/// as the rest of `/api/lakehouse/*` — not `RequiresAuth`, which an earlier
+/// plan draft assumed by analogy to the now-cut `/api/storage*` routes.
+/// The zero-permission-principal loop above already proves the OTHER
+/// direction generically (any `RequiresPermission` entry, including this
+/// one, gets 403 with no permissions at all); this is the matching
+/// allowed-with-the-permission half.
+#[tokio::test]
+async fn a_seeded_analyst_is_not_denied_lakehouse_capacity() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let resp = request_with_cookie(&router, "GET", "/api/lakehouse/capacity", &cookie).await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Analyst holding catalog:read must not be denied"
+    );
+    assert_ne!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a valid session must never be treated as unauthenticated"
+    );
+}
+
 /// # Input validation: malformed body -> 400 with the `{"error": "..."}`
 /// envelope
 ///

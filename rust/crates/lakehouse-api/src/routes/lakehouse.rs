@@ -32,7 +32,7 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::lakehouse_catalog;
 use crate::routes::governance::latest_maintenance_run;
-use crate::routes::support::str_col;
+use crate::routes::support::{num_or_zero, str_col};
 use crate::state::AppState;
 
 /// Every `{ns}`/`{table}` path segment and `namespace` query value must
@@ -119,6 +119,25 @@ fn classify_catalog_access_error(
 fn classify_ch_error(err: &lakehouse_clickhouse::ChError) -> ApiError {
     tracing::warn!(%err, "maintenance-run lookup failed");
     ApiError::Unavailable("maintenance history is unavailable".to_owned())
+}
+
+/// Classifies a `ClickHouse` capacity lookup failure — same posture as
+/// [`classify_ch_error`], a fixed 503 rather than `ClickHouse`'s own error
+/// text (AGENTS.md rule 4).
+///
+/// `bronze_meta.capacity_snapshot` is written once a day by a single
+/// whole-deployment job (`dagster/dispar_orchestrate/
+/// capacity_snapshot.py::capacity_snapshot_job`), not lazily per table like
+/// `bronze_meta.maintenance_verb_run` (see `is_unknown_table_error`'s doc
+/// comment, where absence is the normal steady state for a table that has
+/// simply never had a verb run for ONE table). Here, the table not existing
+/// yet means the capacity job has never run on this deployment at all —
+/// indistinguishable, from a caller's point of view, from `ClickHouse`
+/// being down. Both cases take this same fixed 503, never a fabricated
+/// `buckets: []` success.
+fn classify_capacity_ch_error(err: &lakehouse_clickhouse::ChError) -> ApiError {
+    tracing::warn!(%err, "capacity snapshot lookup failed");
+    ApiError::Unavailable("capacity metrics are unavailable".to_owned())
 }
 
 /// RFC 3339 UTC timestamp from a snapshot's `last-updated-ms`, or `None`
@@ -738,6 +757,128 @@ pub async fn list_maintenance_policies(State(state): State<AppState>) -> ApiResu
     })))
 }
 
+/// `bucket_name`/`bytes`/`objects` come back through `toString(...)`, like
+/// every other numeric or 64-bit column read in this module, so a large
+/// value never round-trips through `serde_json`'s own number parsing.
+/// `measured_at` is `ClickHouse`'s own display string, passed straight to
+/// `buckets[].measuredAt`; `measured_at_ms` is a `toUnixTimestamp64Milli`
+/// epoch, used only internally by [`capacity_body`]'s growth-window
+/// comparison, never rendered.
+const CAPACITY_SNAPSHOT_QUERY: &str = "SELECT bucket_name, toString(bytes) bytes, \
+    toString(objects) objects, \
+    toString(toUnixTimestamp64Milli(measured_at)) measured_at_ms, \
+    toString(measured_at) measured_at \
+    FROM lake.`bronze_meta.capacity_snapshot` \
+    WHERE measured_at >= now() - INTERVAL 8 DAY \
+    ORDER BY measured_at DESC";
+
+/// Live disk usage, read fresh on every request rather than from the daily
+/// snapshot table — `system.parts` reflects merges/compaction that happen
+/// far more often than once a day.
+const BYTES_ON_DISK_QUERY: &str = "SELECT toString(sum(bytes_on_disk)) bytes_on_disk \
+    FROM system.parts WHERE active";
+
+/// A day, in milliseconds — the unit [`capacity_body`]'s growth window is
+/// expressed in.
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+/// The tolerance around `latest - 7 days` a candidate row's `measured_at`
+/// may fall within and still count as "the seven-day-old reading" — see
+/// [`capacity_body`]'s doc comment.
+const GROWTH_WINDOW_MS: i64 = 12 * 60 * 60 * 1000;
+
+/// `GET /api/lakehouse/capacity`'s body — pure over `rows`, already read
+/// from `lake.bronze_meta.capacity_snapshot` for the last 8 days (newest
+/// first), and `bytes_on_disk`, `ClickHouse`'s own live `system.parts`
+/// total.
+///
+/// `buckets` reports the newest row seen for each distinct `bucket_name`
+/// (this deployment's `capacity_snapshot_job` measures exactly one bucket,
+/// `LAKEHOUSE_WAREHOUSE_BUCKET`, but nothing here assumes that).
+///
+/// `growth7d` is the total bytes across every bucket at the latest
+/// timestamp, minus the total at the newest timestamp at or before
+/// `latest - 7 days` that falls within a ±12 hour window of it — never the
+/// row seven POSITIONS back, which a single missed daily run would
+/// silently misalign against the wrong day. When no such reading exists
+/// (fewer than ~8 days of history, or a gap wider than the window),
+/// `growth7d` is `null` rather than a synthesized number.
+fn capacity_body(rows: &[Map<String, Value>], bytes_on_disk: i64) -> Value {
+    // The newest row per bucket, for `buckets` — `rows` is already
+    // `ORDER BY measured_at DESC`, so the first row seen for a given name
+    // is its newest.
+    let mut buckets = Vec::new();
+    let mut seen_buckets = std::collections::HashSet::new();
+    for row in rows {
+        let name = str_col(row, "bucket_name");
+        if seen_buckets.insert(name.to_owned()) {
+            buckets.push(json!({
+                "name": name,
+                "bytes": num_or_zero(Some(row), "bytes"),
+                "objects": num_or_zero(Some(row), "objects"),
+                "measuredAt": str_col(row, "measured_at"),
+            }));
+        }
+    }
+
+    // Total bytes across every bucket sharing an exact timestamp — this
+    // deployment's single-bucket job writes one row per run, so this is
+    // simply that row's total, but a future multi-bucket batch written at
+    // the same instant is summed correctly rather than picked arbitrarily.
+    let mut totals: Vec<(i64, i64)> = Vec::new();
+    for row in rows {
+        let ms = num_or_zero(Some(row), "measured_at_ms");
+        let bytes = num_or_zero(Some(row), "bytes");
+        if let Some(entry) = totals.iter_mut().find(|(t, _)| *t == ms) {
+            entry.1 += bytes;
+        } else {
+            totals.push((ms, bytes));
+        }
+    }
+    totals.sort_by_key(|&(ms, _)| std::cmp::Reverse(ms));
+
+    let growth7d = totals.first().and_then(|&(latest_ms, latest_total)| {
+        let target = latest_ms - 7 * DAY_MS;
+        totals
+            .iter()
+            .filter(|&&(ms, _)| (ms - target).abs() <= GROWTH_WINDOW_MS)
+            .max_by_key(|&&(ms, _)| ms)
+            .map(|&(_, total)| latest_total - total)
+    });
+
+    json!({
+        "buckets": buckets,
+        "clickhouse": { "bytesOnDisk": bytes_on_disk },
+        "growth7d": growth7d,
+    })
+}
+
+/// `GET /api/lakehouse/capacity` — bucket capacity from the daily
+/// `capacity_snapshot_job` plus `ClickHouse`'s own live disk usage,
+/// replacing the cut `/api/storage*` surface (WS2 §4).
+///
+/// # Errors
+///
+/// 503 if either `ClickHouse` query fails — see
+/// [`classify_capacity_ch_error`]'s doc comment for why a missing
+/// `bronze_meta.capacity_snapshot` table takes the same fixed 503 as any
+/// other failure here, never an empty `buckets: []` success.
+pub async fn capacity(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+    let rows = state
+        .clickhouse
+        .rows(CAPACITY_SNAPSHOT_QUERY, None)
+        .await
+        .map_err(|err| classify_capacity_ch_error(&err))?;
+    let disk_rows = state
+        .clickhouse
+        .rows(BYTES_ON_DISK_QUERY, None)
+        .await
+        .map_err(|err| classify_capacity_ch_error(&err))?;
+    let bytes_on_disk = num_or_zero(disk_rows.first(), "bytes_on_disk");
+
+    Ok(ApiJson(capacity_body(&rows, bytes_on_disk)))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1001,6 +1142,96 @@ mod tests {
         assert_eq!(body["schedule"], json!("daily"));
         assert_eq!(body["lastRun"], last_run);
         assert_eq!(body["lastVerbRuns"], json!(last_verb_runs));
+    }
+
+    /// One `lake.bronze_meta.capacity_snapshot` row, in the exact shape
+    /// [`CAPACITY_SNAPSHOT_QUERY`] returns: every numeric column already
+    /// stringified. `measured_at_ms` is what [`capacity_body`]'s growth
+    /// window compares against; `measured_at` is only ever echoed into
+    /// `buckets[].measuredAt`, so tests that don't care about its exact
+    /// text reuse it as a readable label.
+    fn capacity_row(bucket_name: &str, bytes: i64, measured_at_ms: i64) -> Map<String, Value> {
+        let mut row = Map::new();
+        row.insert("bucket_name".to_owned(), json!(bucket_name));
+        row.insert("bytes".to_owned(), json!(bytes.to_string()));
+        row.insert("objects".to_owned(), json!("1"));
+        row.insert(
+            "measured_at_ms".to_owned(),
+            json!(measured_at_ms.to_string()),
+        );
+        row.insert(
+            "measured_at".to_owned(),
+            json!(format!("day-{measured_at_ms}")),
+        );
+        row
+    }
+
+    #[test]
+    fn capacity_body_reports_null_growth_with_a_single_row() {
+        let rows = vec![capacity_row("lakehouse-warehouse", 100, 0)];
+
+        let body = capacity_body(&rows, 500);
+
+        assert_eq!(body["growth7d"], Value::Null);
+        assert_eq!(body["buckets"][0]["bytes"], json!(100));
+        assert_eq!(body["clickhouse"]["bytesOnDisk"], json!(500));
+    }
+
+    #[test]
+    fn capacity_body_computes_growth7d_from_the_row_exactly_seven_days_back() {
+        // Nine consecutive daily rows, newest first (as `ORDER BY
+        // measured_at DESC` returns them) — day 0 is "today", day 8 is
+        // eight days ago. `bytes` grows by 100 per day, so the row exactly
+        // seven days back (day 7) holds 100 and today (day 0) holds 800.
+        let rows: Vec<_> = (0..=8)
+            .map(|days_ago: i64| {
+                capacity_row(
+                    "lakehouse-warehouse",
+                    100 * (9 - days_ago),
+                    -days_ago * DAY_MS,
+                )
+            })
+            .collect();
+
+        let body = capacity_body(&rows, 500);
+
+        assert_eq!(body["growth7d"], json!(700));
+    }
+
+    #[test]
+    fn capacity_body_is_null_when_the_seven_day_row_is_missing_and_outside_the_window() {
+        // Day 7 (exactly seven days back) is missing; the nearest
+        // surviving row, day 5, is two full days outside the ±12h window,
+        // so no candidate qualifies and growth7d must be null rather than
+        // silently comparing against the wrong day.
+        let rows = vec![
+            capacity_row("lakehouse-warehouse", 800, 0),
+            capacity_row("lakehouse-warehouse", 500, -5 * DAY_MS),
+            capacity_row("lakehouse-warehouse", 100, -8 * DAY_MS),
+        ];
+
+        let body = capacity_body(&rows, 500);
+
+        assert_eq!(body["growth7d"], Value::Null);
+    }
+
+    #[test]
+    fn capacity_body_accepts_a_run_that_landed_a_few_hours_off_the_seven_day_mark() {
+        // The row six days and sixteen hours back — within the ±12 hour
+        // window of "seven days back minus twelve hours" is NOT close
+        // enough; six days and thirteen hours back IS within twelve hours
+        // of the seven-day target's early edge (7d - 13h vs 7d), so it
+        // must still be picked rather than yielding null.
+        let seven_days_back = -7 * DAY_MS;
+        let within_window = seven_days_back + (11 * 60 * 60 * 1000);
+        let rows = vec![
+            capacity_row("lakehouse-warehouse", 800, 0),
+            capacity_row("lakehouse-warehouse", 300, within_window),
+        ];
+
+        let body = capacity_body(&rows, 500);
+
+        assert_eq!(body["growth7d"], json!(500));
     }
 
     #[test]
