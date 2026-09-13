@@ -308,6 +308,10 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/api/catalog", get(catalog::list))
         .route("/api/catalog/{id}", get(catalog::detail))
+        .route(
+            "/api/catalog/{id}/annotation",
+            get(catalog::get_annotation).put(catalog::put_annotation),
+        )
         .route("/api/overview", get(overview::get).post(overview::refresh))
         .merge(overview_alerts_router())
         .route("/api/ops/{kind}", get(ops::get))

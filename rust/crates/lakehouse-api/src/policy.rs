@@ -141,6 +141,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET", "/api/catalog",       Policy::RequiresPermission("catalog:read")),
     ("GET", "/api/catalog/{id}",  Policy::RequiresPermission("catalog:read")),
 
+    // ── Catalog annotations (WS2 §13): console-only owner/steward/tags/
+    //    description. PUT reuses the already-seeded `catalog:write`
+    //    permission (Data Engineer role, 0002_seed_identity.sql) — no new
+    //    permission string, no grant migration (WS2 plan review W8). ─────
+    ("GET", "/api/catalog/{id}/annotation", Policy::RequiresPermission("catalog:read")),
+    ("PUT", "/api/catalog/{id}/annotation", Policy::RequiresPermission("catalog:write")),
+
     // ── Lakehouse (WS2 §4): the read-only Iceberg warehouse/namespace/
     //    table surface, gated by the same seeded `catalog:read` permission
     //    as the dataset registry above. ────────────────────────────────────

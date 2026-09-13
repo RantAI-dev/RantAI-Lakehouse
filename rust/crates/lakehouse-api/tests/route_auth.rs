@@ -269,6 +269,84 @@ async fn a_seeded_analyst_is_not_denied_lakehouse_capacity() {
     );
 }
 
+/// A seeded Analyst (`catalog:read`, no `catalog:write`) is not denied
+/// `GET /api/catalog/{id}/annotation` (WS2 §13) — that route is gated by
+/// the same seeded `catalog:read` permission as the rest of the catalog
+/// surface.
+#[tokio::test]
+async fn a_seeded_analyst_is_not_denied_catalog_annotation_read() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let resp = request_with_cookie(
+        &router,
+        "GET",
+        "/api/catalog/commerce_orders/annotation",
+        &cookie,
+    )
+    .await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Analyst holding catalog:read must not be denied"
+    );
+    assert_ne!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a valid session must never be treated as unauthenticated"
+    );
+}
+
+/// A seeded Analyst (`catalog:read`, no `catalog:write`) IS denied
+/// `PUT /api/catalog/{id}/annotation` (WS2 §13, WS2 plan review W8):
+/// annotation writes reuse the already-seeded `catalog:write` permission,
+/// which the seeded Analyst role does not hold.
+#[tokio::test]
+async fn a_seeded_analyst_is_denied_catalog_annotation_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let resp = request_with_cookie(
+        &router,
+        "PUT",
+        "/api/catalog/commerce_orders/annotation",
+        &cookie,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Analyst must be denied catalog:write"
+    );
+}
+
+/// A seeded Data Engineer (`catalog:write`, among others) is not denied
+/// `PUT /api/catalog/{id}/annotation` (WS2 §13, WS2 plan review W8) — the
+/// matching allowed-with-the-permission half of the test above.
+#[tokio::test]
+async fn a_seeded_data_engineer_is_not_denied_catalog_annotation_write() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+
+    let resp = request_with_cookie(
+        &router,
+        "PUT",
+        "/api/catalog/commerce_orders/annotation",
+        &cookie,
+    )
+    .await;
+    assert_ne!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Data Engineer holding catalog:write must not be denied"
+    );
+    assert_ne!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a valid session must never be treated as unauthenticated"
+    );
+}
+
 /// # Input validation: malformed body -> 400 with the `{"error": "..."}`
 /// envelope
 ///

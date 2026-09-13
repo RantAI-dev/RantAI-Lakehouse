@@ -5,12 +5,35 @@
 //! `bronze_meta`/`bronze_meta_sec` registry tables in `lake`; Silver/Gold
 //! assets are read directly off `ClickHouse`'s `system.tables` /
 //! `system.columns` / `system.parts`.
+//!
+//! # `GET`/`PUT /api/catalog/{id}/annotation` — bounded console metadata
+//!
+//! `asset_annotation` (migration `0032`) holds console-only metadata a
+//! `catalog:write` holder can attach to any asset id: owner, steward, tags,
+//! description. `PUT` reuses the already-seeded `catalog:write` permission
+//! (WS2 plan review W8) — no new permission string. Because any
+//! `catalog:write` holder can call it, the body is bounded on both sides —
+//! validated here, returning `400` naming the offending field, and mirrored
+//! as `CHECK` constraints in `0032_asset_annotation.sql` as defense in
+//! depth:
+//! - `owner`/`steward`: at most 128 characters each;
+//! - `description`: at most 4,000 characters;
+//! - `tags`: at most 20 entries, each 1-64 characters matching
+//!   `^[a-z0-9][a-z0-9_-]*$`;
+//! - the `{id}` path segment itself: at most 200 characters.
+//!
+//! The stored key is `asset_id`, the full catalog id as this route's own
+//! `{id}` path parameter provides it — a bare slug for Bronze
+//! (`bronze_catalog_row`), `"silver.<name>"` for Silver
+//! (`silver_catalog_row`), `"serving.<name>"` for Gold (`gold_catalog_row`)
+//! — never a re-derived table name.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -20,6 +43,8 @@ use lakehouse_core::ApiError;
 use lakehouse_core::ident::SqlLiteral;
 use lakehouse_iceberg::IcebergClient;
 use lakehouse_iceberg::rest;
+use lakehouse_store::PgPool;
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio::time::Instant;
 
@@ -992,6 +1017,185 @@ fn not_found() -> ApiRejection {
     ApiError::NotFound("Asset not found".to_owned()).into()
 }
 
+// WS2 §13 — GET/PUT /api/catalog/{id}/annotation. See the module doc above
+// for the bounds this validates and why the key is `asset_id`, not a
+// table name.
+
+/// Body accepted by `PUT /api/catalog/{id}/annotation`. Every field is
+/// optional so a caller can send only what changed; a missing `tags` is
+/// treated as an empty list, not "leave tags unchanged" — this is an
+/// upsert-replace, matching `upsert_annotation`'s `ON CONFLICT DO UPDATE`.
+#[derive(Debug, Deserialize)]
+struct AnnotationBody {
+    #[serde(default)]
+    owner: Option<String>,
+    #[serde(default)]
+    steward: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+const ANNOTATION_ID_MAX_LEN: usize = 200;
+const ANNOTATION_OWNER_MAX_LEN: usize = 128;
+const ANNOTATION_STEWARD_MAX_LEN: usize = 128;
+const ANNOTATION_DESCRIPTION_MAX_LEN: usize = 4000;
+const ANNOTATION_TAGS_MAX_COUNT: usize = 20;
+const ANNOTATION_TAG_MAX_LEN: usize = 64;
+
+fn annotation_pool(state: &AppState) -> Result<&PgPool, ApiError> {
+    state.pg.as_deref().ok_or_else(|| {
+        ApiError::Unavailable(
+            "annotation store unavailable: no Postgres pool is configured".to_owned(),
+        )
+    })
+}
+
+/// `true` if `tag` is 1-64 characters matching `^[a-z0-9][a-z0-9_-]*$` —
+/// mirrored as `asset_annotation_tags_are_valid` in
+/// `0032_asset_annotation.sql`.
+fn tag_is_valid(tag: &str) -> bool {
+    if tag.is_empty() || tag.len() > ANNOTATION_TAG_MAX_LEN {
+        return false;
+    }
+    let mut chars = tag.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// Bounds the `{id}` path segment. Returns `400` naming the field.
+///
+/// # Errors
+/// [`ApiError::BadRequest`] if `id` exceeds [`ANNOTATION_ID_MAX_LEN`]
+/// characters.
+fn validate_annotation_id(id: &str) -> Result<(), ApiError> {
+    if id.chars().count() > ANNOTATION_ID_MAX_LEN {
+        return Err(ApiError::BadRequest(format!(
+            "id must be at most {ANNOTATION_ID_MAX_LEN} characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Bounds every field of `body`. Returns `400` naming the offending field
+/// — see the module doc above for the exact limits.
+///
+/// # Errors
+/// [`ApiError::BadRequest`] on the first bound violated.
+fn validate_annotation_body(body: &AnnotationBody) -> Result<(), ApiError> {
+    if let Some(owner) = &body.owner
+        && owner.chars().count() > ANNOTATION_OWNER_MAX_LEN
+    {
+        return Err(ApiError::BadRequest(format!(
+            "owner must be at most {ANNOTATION_OWNER_MAX_LEN} characters"
+        )));
+    }
+    if let Some(steward) = &body.steward
+        && steward.chars().count() > ANNOTATION_STEWARD_MAX_LEN
+    {
+        return Err(ApiError::BadRequest(format!(
+            "steward must be at most {ANNOTATION_STEWARD_MAX_LEN} characters"
+        )));
+    }
+    if let Some(description) = &body.description
+        && description.chars().count() > ANNOTATION_DESCRIPTION_MAX_LEN
+    {
+        return Err(ApiError::BadRequest(format!(
+            "description must be at most {ANNOTATION_DESCRIPTION_MAX_LEN} characters"
+        )));
+    }
+    if body.tags.len() > ANNOTATION_TAGS_MAX_COUNT {
+        return Err(ApiError::BadRequest(format!(
+            "tags must have at most {ANNOTATION_TAGS_MAX_COUNT} entries"
+        )));
+    }
+    for tag in &body.tags {
+        if !tag_is_valid(tag) {
+            return Err(ApiError::BadRequest(format!(
+                "tags: \"{tag}\" must be 1-{ANNOTATION_TAG_MAX_LEN} characters matching ^[a-z0-9][a-z0-9_-]*$"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `GET /api/catalog/{id}/annotation` — one asset's console-only metadata.
+/// An asset with no annotation row returns the empty shape rather than
+/// `404`, matching how the rest of this module nulls out unmeasured
+/// fields instead of failing.
+///
+/// # Errors
+/// [`ApiError::Unavailable`] if no Postgres pool is configured; a
+/// classified [`lakehouse_store::StoreError`] on any other database
+/// failure.
+pub async fn get_annotation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    let pool = annotation_pool(&state)?;
+    let row = lakehouse_store::annotation::get_annotation(pool, &id).await?;
+    Ok(ApiJson(row.map_or_else(
+        || {
+            json!({
+                "owner": Value::Null,
+                "steward": Value::Null,
+                "tags": Value::Array(vec![]),
+                "description": Value::Null,
+            })
+        },
+        |r| {
+            json!({
+                "owner": r.owner,
+                "steward": r.steward,
+                "tags": r.tags,
+                "description": r.description,
+            })
+        },
+    )))
+}
+
+/// `PUT /api/catalog/{id}/annotation` — create or replace one asset's
+/// console-only metadata. Reuses the already-seeded `catalog:write`
+/// permission (`0002_seed_identity.sql`'s Data Engineer role) — no new
+/// permission string, no grant migration (WS2 plan review W8).
+///
+/// # Errors
+/// `400` if the body is not JSON, or if `id`/`owner`/`steward`/
+/// `description`/any `tags` entry exceeds its bound — see the module doc
+/// above. [`ApiError::Unavailable`] if no Postgres pool is configured; a
+/// classified [`lakehouse_store::StoreError`] on any other database
+/// failure (including a `CHECK` constraint the validation above should
+/// have already caught).
+pub async fn put_annotation(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    validate_annotation_id(&id)?;
+    let parsed: AnnotationBody = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::BadRequest("body must be JSON".to_owned()))?;
+    validate_annotation_body(&parsed)?;
+    let pool = annotation_pool(&state)?;
+    lakehouse_store::annotation::upsert_annotation(
+        pool,
+        &lakehouse_store::annotation::AnnotationInput {
+            asset_id: id,
+            owner: parsed.owner,
+            steward: parsed.steward,
+            tags: parsed.tags,
+            description: parsed.description,
+        },
+    )
+    .await?;
+    Ok(ApiJson(json!({ "ok": true })))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1311,5 +1515,123 @@ mod tests {
             result.is_empty(),
             "a connect that never resolves must leave enrichment empty, not hang"
         );
+    }
+
+    // WS2 §13 — annotation bounds. Pure-function tests, matching this
+    // module's own idiom of unit-testing the extracted validation/JSON
+    // builders directly rather than a full `AppState`.
+
+    fn valid_body() -> AnnotationBody {
+        AnnotationBody {
+            owner: Some("data-eng".to_owned()),
+            steward: Some("bayu".to_owned()),
+            tags: vec!["pii".to_owned()],
+            description: Some("Order events".to_owned()),
+        }
+    }
+
+    #[test]
+    fn validate_annotation_id_accepts_a_bronze_slug_and_a_silver_prefixed_id() {
+        assert!(validate_annotation_id("commerce_orders").is_ok());
+        assert!(validate_annotation_id("silver.mart_orders").is_ok());
+    }
+
+    #[test]
+    fn validate_annotation_id_rejects_over_200_chars() {
+        let id = "a".repeat(201);
+        let err = validate_annotation_id(&id).expect_err("must reject");
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("id")));
+    }
+
+    #[test]
+    fn validate_annotation_body_accepts_a_fully_populated_body() {
+        assert!(validate_annotation_body(&valid_body()).is_ok());
+    }
+
+    #[test]
+    fn validate_annotation_body_accepts_every_field_absent() {
+        let body = AnnotationBody {
+            owner: None,
+            steward: None,
+            tags: vec![],
+            description: None,
+        };
+        assert!(validate_annotation_body(&body).is_ok());
+    }
+
+    #[test]
+    fn validate_annotation_body_rejects_owner_over_128_chars() {
+        let mut body = valid_body();
+        body.owner = Some("o".repeat(129));
+        let err = validate_annotation_body(&body).expect_err("must reject");
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("owner")));
+    }
+
+    #[test]
+    fn validate_annotation_body_rejects_steward_over_128_chars() {
+        let mut body = valid_body();
+        body.steward = Some("s".repeat(129));
+        let err = validate_annotation_body(&body).expect_err("must reject");
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("steward")));
+    }
+
+    #[test]
+    fn validate_annotation_body_rejects_description_over_4000_chars() {
+        let mut body = valid_body();
+        body.description = Some("d".repeat(4001));
+        let err = validate_annotation_body(&body).expect_err("must reject");
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("description")));
+    }
+
+    #[test]
+    fn validate_annotation_body_rejects_more_than_20_tags() {
+        let mut body = valid_body();
+        body.tags = (0..21).map(|i| format!("tag-{i}")).collect();
+        let err = validate_annotation_body(&body).expect_err("must reject");
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("tags")));
+    }
+
+    #[test]
+    fn validate_annotation_body_accepts_exactly_20_tags() {
+        let mut body = valid_body();
+        body.tags = (0..20).map(|i| format!("tag-{i}")).collect();
+        assert!(validate_annotation_body(&body).is_ok());
+    }
+
+    #[test]
+    fn validate_annotation_body_rejects_a_tag_over_64_chars() {
+        let mut body = valid_body();
+        body.tags = vec!["a".repeat(65)];
+        let err = validate_annotation_body(&body).expect_err("must reject");
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg.contains("tags")));
+    }
+
+    #[test]
+    fn validate_annotation_body_rejects_an_uppercase_tag() {
+        let mut body = valid_body();
+        body.tags = vec!["PII".to_owned()];
+        assert!(validate_annotation_body(&body).is_err());
+    }
+
+    #[test]
+    fn validate_annotation_body_rejects_a_tag_starting_with_a_hyphen() {
+        let mut body = valid_body();
+        body.tags = vec!["-pii".to_owned()];
+        assert!(validate_annotation_body(&body).is_err());
+    }
+
+    #[test]
+    fn validate_annotation_body_accepts_a_single_char_tag() {
+        let mut body = valid_body();
+        body.tags = vec!["a".to_owned()];
+        assert!(validate_annotation_body(&body).is_ok());
+    }
+
+    #[test]
+    fn put_annotation_rejects_a_non_json_body_in_english() {
+        let err = serde_json::from_slice::<AnnotationBody>(b"not json")
+            .map_err(|_| ApiError::BadRequest("body must be JSON".to_owned()))
+            .expect_err("must reject");
+        assert!(matches!(err, ApiError::BadRequest(msg) if msg == "body must be JSON"));
     }
 }
