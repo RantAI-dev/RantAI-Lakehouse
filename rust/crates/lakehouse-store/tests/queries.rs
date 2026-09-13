@@ -20,7 +20,9 @@
 use lakehouse_test_support as _;
 
 use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
-use lakehouse_store::queries::{RecordHistoryInput, list_history, list_saved, record_history};
+use lakehouse_store::queries::{
+    RecordHistoryInput, get_history_item, list_history, list_saved, record_history,
+};
 use sqlx::PgPool;
 use time::OffsetDateTime;
 
@@ -232,5 +234,84 @@ async fn history_item_uses_the_newest_of_several_events_without_duplicating_the_
         history[0].audit_event_id.as_deref(),
         Some("audit-multi-newer")
     );
+    Ok(())
+}
+
+/// WS2 §4 — `record_history` now carries the real principal uuid and the
+/// real engine, not the pre-WS2 `"anonymous"`/`"hot-store"` placeholders;
+/// `list_history` returns exactly what was written for both fields.
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_history_carries_the_real_principal_uuid_and_engine(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let principal_uuid = "8f14e45f-ceea-467e-bd0d-8fbcae0b0000";
+    record_history(
+        &pool,
+        &RecordHistoryInput {
+            id: "q-real-user",
+            sql: "SELECT 1",
+            user: principal_uuid,
+            status: "completed",
+            duration_ms: 1,
+            scanned_bytes: 1,
+            cost_units: 0.1,
+            workload_class: "hot-analytics",
+            engine: "trino",
+            cache_assisted: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    let history = list_history(&pool).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].user, principal_uuid);
+    assert_eq!(history[0].engine, "trino");
+    Ok(())
+}
+
+/// [`get_history_item`] fetches the same row [`list_history`] would, by
+/// id, including the lateral `audit_event` resolution.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_history_item_fetches_one_row_by_id(pool: PgPool) -> sqlx::Result<()> {
+    record_history(
+        &pool,
+        &RecordHistoryInput {
+            id: "q-get-one",
+            sql: "SELECT 1",
+            user: "8f14e45f-ceea-467e-bd0d-8fbcae0b0000",
+            status: "completed",
+            duration_ms: 1,
+            scanned_bytes: 1,
+            cost_units: 0.1,
+            workload_class: "hot-analytics",
+            engine: "clickhouse",
+            cache_assisted: false,
+        },
+    )
+    .await
+    .unwrap();
+    let event = insert_audit_event(&pool, query_history_audit_event("q-get-one", "query_sql"))
+        .await
+        .unwrap();
+
+    let item = get_history_item(&pool, "q-get-one")
+        .await
+        .unwrap()
+        .expect("row must exist");
+    assert_eq!(item.id, "q-get-one");
+    assert_eq!(item.user, "8f14e45f-ceea-467e-bd0d-8fbcae0b0000");
+    assert_eq!(item.engine, "clickhouse");
+    assert_eq!(item.audit_event_id.as_deref(), Some(event.id.as_str()));
+    Ok(())
+}
+
+/// A non-existent id is `Ok(None)`, not an error — the caller (a later
+/// task's ownership check) distinguishes "no such query" from a database
+/// failure.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_history_item_returns_none_for_an_unknown_id(pool: PgPool) -> sqlx::Result<()> {
+    let item = get_history_item(&pool, "q-does-not-exist").await.unwrap();
+    assert_eq!(item, None);
     Ok(())
 }

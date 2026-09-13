@@ -200,12 +200,18 @@ fn contains_trino_denied_keyword(sql: &str) -> bool {
 ///
 /// - 400 [`ApiError::BadRequest`] on an unparseable body or a missing/empty
 ///   `sql`.
-/// - 401 [`ApiError::Unauthorized`] for `engine: "trino"` with no
-///   authenticated principal — the `X-Trino-User` this handler sends is
-///   derived from the principal's uuid (see [`trino_user_for`]'s doc
-///   comment for why never a display name), so there is nothing safe to
-///   send without one. The route is policy-gated
-///   (`Policy::RequiresPermission("query:read")`), so this exists only as
+/// - 401 [`ApiError::Unauthorized`] with no authenticated principal, for
+///   ANY engine. `query_history.user_name` now records the principal's own
+///   uuid (previously the fixed placeholder `"anonymous"` — see
+///   `QueryHistoryItem::user`'s doc comment), and `engine: "trino"`'s
+///   `X-Trino-User` is derived from that same uuid, never
+///   `principal.display_name` (a display name is attacker-controlled, and
+///   the compose `trino` service's file-based access control grants full
+///   `iceberg` catalog write access to exactly the user name
+///   `trino-maintenance` — see that service's `rules.json` block comment).
+///   Neither has a safe/honest value to fall back to with no principal, so
+///   the request is refused before anything runs. The route is
+///   policy-gated (`Policy::RequiresPermission("query:read")`), so this is
 ///   defense in depth, the same shape `routes::gold::export` uses.
 /// - 422 [`ApiError::Unprocessable`] when `sql` fails [`is_read_only`] (any
 ///   engine) or [`is_trino_safe`] (`engine: "trino"` only), or when the
@@ -229,6 +235,15 @@ pub async fn run(
         .into());
     }
 
+    // See this function's doc comment: there is no honest value left to
+    // record (or, for Trino, to send as `X-Trino-User`) for an
+    // unauthenticated caller, so every engine requires a principal now —
+    // `"anonymous"` is never written to `query_history` again.
+    let Some(Extension(p)) = principal else {
+        return Err(ApiError::unauthorized().into());
+    };
+    let user_id = p.id.uuid().to_string();
+
     let engine = parsed.engine.as_deref().unwrap_or("clickhouse").to_owned();
     if engine == "trino" && !is_trino_safe(&sql) {
         return Err(ApiError::Unprocessable(
@@ -243,7 +258,7 @@ pub async fn run(
     let started_epoch_ms = epoch_ms();
 
     let (columns, rows, duration_ms, scanned_bytes) = if engine == "trino" {
-        let trino_user = trino_user_for(principal.as_ref())?;
+        let trino_user = format!("console-{user_id}");
         let result = state
             .trino
             .run_statement(&sql, &trino_user)
@@ -285,9 +300,9 @@ pub async fn run(
     // caller, who already has their result: log a warning and keep going.
     // See `lakehouse_store::queries::record_history`'s doc comment.
     //
-    // `user`/`engine` are still the pre-WS2-§4 placeholders here — real
-    // principal/engine threading lands in the next commit, which also
-    // corrects `QueryHistoryItem.user`'s doc comment to match.
+    // `user` is the principal's own uuid (guaranteed present above) and
+    // `engine` is the engine that actually ran — both genuine measurements
+    // now, not the pre-WS2-§4 `"anonymous"`/`"hot-store"` placeholders.
     if let Some(pool) = state.pg.as_deref() {
         #[allow(
             clippy::cast_possible_wrap,
@@ -298,13 +313,13 @@ pub async fn run(
         let input = RecordHistoryInput {
             id: &id,
             sql: &sql,
-            user: "anonymous",
+            user: &user_id,
             status: "completed",
             duration_ms: duration_ms as i64,
             scanned_bytes: scanned_bytes as i64,
             cost_units: cost_units as f64,
             workload_class: "hot-analytics",
-            engine: "hot-store",
+            engine: &engine,
             cache_assisted: false,
         };
         if let Err(err) = queries::record_history(pool, &input).await {
@@ -352,28 +367,6 @@ fn trino_result_to_rows(result: &TrinoResult) -> (Vec<String>, Vec<Value>) {
         })
         .collect();
     (columns, rows)
-}
-
-/// The `X-Trino-User` `run` sends for `engine: "trino"`: `console-<uuid>`,
-/// derived from the authenticated principal's stable id — NEVER
-/// `principal.display_name`. A display name is neither unique nor stable,
-/// and the compose `trino` service's file-based access control (see its
-/// `rules.json` block comment) grants full `iceberg` catalog write access
-/// to exactly one user name, `trino-maintenance`. Sending a display name
-/// would let any principal who sets theirs to `trino-maintenance` claim
-/// that write identity — the `console-` prefix puts every console-derived
-/// user in a namespace that can never collide with a service user name.
-///
-/// # Errors
-///
-/// [`ApiError::Unauthorized`] when `principal` is `None`: there is no safe
-/// value to send in that case, so the request is refused before it reaches
-/// `Trino` at all.
-fn trino_user_for(principal: Option<&Extension<Principal>>) -> Result<String, ApiError> {
-    let Some(Extension(p)) = principal else {
-        return Err(ApiError::unauthorized());
-    };
-    Ok(format!("console-{}", p.id.uuid()))
 }
 
 /// Map a [`TrinoError`] to the [`ApiError`] `run` returns.
@@ -833,7 +826,8 @@ mod tests {
 
         /// An authenticated `query:read` principal for `run`'s tests.
         /// `display_name` is deliberately a parameter — one test sets it to
-        /// `"trino-maintenance"` to prove [`trino_user_for`] never reads it.
+        /// `"trino-maintenance"` to prove [`run`] never derives
+        /// `X-Trino-User` from it.
         fn principal_with_display_name(display_name: &str) -> Extension<Principal> {
             Extension(Principal {
                 id: PrincipalId::User(Uuid::nil()),
@@ -973,8 +967,8 @@ mod tests {
 
             let state = test_state_with_trino(&server.uri());
             // The display name is deliberately the exact string the
-            // maintenance user is named — proving `trino_user_for` never
-            // reads it is the point of this test.
+            // maintenance user is named — proving `X-Trino-User` is never
+            // derived from it is the point of this test.
             let result = run(
                 State(state),
                 Some(principal_with_display_name("trino-maintenance")),
@@ -1034,6 +1028,43 @@ mod tests {
         #[test]
         fn allows_a_plain_select_against_the_trino_guard() {
             assert!(is_trino_safe("SELECT 1"));
+        }
+
+        // ── WS2 §4: the real principal now gates every engine ──────────
+
+        /// The default (`ClickHouse`) engine is refused with 401 too, not
+        /// just `engine: "trino"` — `run`'s doc comment documents there is
+        /// no honest `"anonymous"` fallback left for `query_history.user`.
+        /// This must fail before either engine's client is ever called, so
+        /// no `ClickHouse`/`Trino` reachability is needed for this test.
+        #[tokio::test]
+        async fn missing_principal_is_401_for_the_default_engine_too() {
+            let server = MockServer::start().await;
+            let state = test_state_with_trino(&server.uri());
+            let body = Bytes::from(r#"{"sql": "SELECT 1"}"#);
+            let err = run(State(state), None, body)
+                .await
+                .expect_err("no principal must be refused");
+            assert_eq!(err.0.status(), 401);
+        }
+
+        /// A run with an authenticated principal records that principal's
+        /// own uuid string as `query_history.user` — proven at the
+        /// `lakehouse_store` layer
+        /// (`record_history_carries_the_real_principal_uuid_and_engine` in
+        /// `lakehouse-store/tests/queries.rs`), since this crate's handler
+        /// tests run with no live Postgres pool (`record_history` degrades
+        /// to a logged warning per its own doc comment, so there is
+        /// nothing to assert against here). This test instead pins the
+        /// pure derivation `run` performs — `p.id.uuid().to_string()` — so
+        /// a future refactor of that one line is caught here even without
+        /// a database.
+        #[test]
+        fn the_recorded_user_is_the_principals_uuid_string_not_the_display_name() {
+            let Extension(p) = principal_with_display_name("trino-maintenance");
+            let recorded_user = p.id.uuid().to_string();
+            assert_eq!(recorded_user, Uuid::nil().to_string());
+            assert_ne!(recorded_user, p.display_name);
         }
     }
 }

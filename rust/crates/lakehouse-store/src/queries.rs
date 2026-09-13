@@ -143,8 +143,11 @@ pub struct QueryHistoryItem {
     pub id: String,
     /// The executed SQL text.
     pub sql: String,
-    /// Who ran the query. No auth exists yet (see the routes-crate module
-    /// doc comments), so this is currently always a placeholder.
+    /// Who ran the query, as the principal's own uuid string (WS2 §4,
+    /// `routes::query::run`). A row written before that change still
+    /// holds the earlier fixed placeholder, `"anonymous"` — this column
+    /// was never backfilled, so an old row and a new row are
+    /// distinguishable only by whether this value parses as a `Uuid`.
     pub user: String,
     /// When the query ran, ISO 8601.
     pub at: String,
@@ -251,6 +254,38 @@ pub async fn list_history(pool: &PgPool) -> Result<Vec<QueryHistoryItem>, StoreE
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(QueryHistoryItem::from).collect())
+}
+
+/// Fetch one query-history row by id — added for an owner-scoped lookup
+/// (a later task checks whether the caller downloading a result is the
+/// same principal `run` recorded as `user`, now that `user` is a real
+/// principal uuid rather than the fixed `"anonymous"` placeholder). Mirrors
+/// [`list_history`]'s lateral `audit_event` resolution (see that
+/// function's doc comment: `audit_event_id` is never stored, only resolved
+/// on read) so a single-row lookup and the list agree on the same value.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn get_history_item(
+    pool: &PgPool,
+    id: &str,
+) -> Result<Option<QueryHistoryItem>, StoreError> {
+    let row: Option<QueryHistoryRow> = sqlx::query_as(
+        "SELECT q.id, q.sql, q.user_name, q.at, q.status, q.duration_ms, q.scanned_bytes, \
+         q.cost_units, q.workload_class, q.engine, q.cache_assisted, ae.id AS audit_event_id \
+         FROM query_history q \
+         LEFT JOIN LATERAL ( \
+             SELECT ae.id FROM audit_event ae \
+              WHERE ae.resource_kind = 'query_history' AND ae.resource_id = q.id \
+              ORDER BY ae.at DESC LIMIT 1 \
+         ) ae ON true \
+         WHERE q.id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(QueryHistoryItem::from))
 }
 
 /// Everything [`record_history`] needs to write one row.
