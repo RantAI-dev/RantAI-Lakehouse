@@ -92,6 +92,19 @@ pub(super) async fn run_saved_query(
     let Some(saved) = saved else {
         return json!({ "error": "saved query tidak ditemukan" });
     };
+    // `None` here is not just the interactive copilot's own missing
+    // session — `run_headless_loop` (`routes::agents`) forwards `None` for
+    // every schedule- or service-triggered digital-employee run, which has
+    // no interactive user to run as. Returning a plain forwarded 401 from
+    // `query::run` in that case reads as a broken feature; naming the real
+    // reason here keeps the refusal fail-closed (the query still never
+    // runs) while being honest about why, per AGENTS.md principle 2.
+    let Some(principal) = principal else {
+        return json!({
+            "error": "running a saved query needs an authenticated user; this run was \
+                       triggered by a schedule, which has no user to run it as",
+        });
+    };
     let body = Bytes::from(json!({ "sql": saved.sql }).to_string());
     // This internal call never goes through axum's auth middleware, so it
     // must forward the caller's own `Principal` itself rather than relying
@@ -102,7 +115,7 @@ pub(super) async fn run_saved_query(
     // now — `query::run` 401s with none, for every engine — so a
     // copilot-run saved query is recorded under the real user in
     // `query_history`, exactly like a console-run query.
-    let extension = principal.cloned().map(Extension);
+    let extension = Some(Extension(principal.clone()));
     api_result_to_value(crate::routes::query::run(State(state.clone()), extension, body).await)
         .await
 }
@@ -261,12 +274,16 @@ mod tests {
         }
 
         #[sqlx::test(migrations = "../../migrations")]
-        async fn run_saved_query_without_a_principal_still_401s(pool: PgPool) -> sqlx::Result<()> {
-            // No `ClickHouse` mock is mounted: a correct 401 must never
-            // reach it. This is the pre-existing, still-required "fail
-            // closed with no principal" behaviour `query::run` enforces —
-            // C2-f only threads the principal that already exists at each
-            // call site, it must never invent one to dodge this.
+        async fn run_saved_query_without_a_principal_refuses_with_a_named_reason(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            // No `ClickHouse` mock is mounted, and `query::run` is never
+            // called: this is the fail-closed "no principal" case
+            // `run_saved_query` now short-circuits itself, before it would
+            // otherwise forward a bare 401 shape from `query::run` — see
+            // C2-F2. A schedule- or service-triggered digital-employee run
+            // (`routes::agents::run_headless_loop` with no user behind it)
+            // hits exactly this path.
             let mut env = HashMap::new();
             env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
             let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
@@ -281,9 +298,13 @@ mod tests {
             args.insert("id".to_owned(), json!(first.id));
 
             let result = run_saved_query(&state, None, &args).await;
-            assert!(
-                result.get("error").is_some(),
-                "expected the 401 shaped error, got {result}"
+            assert_eq!(
+                result,
+                json!({
+                    "error": "running a saved query needs an authenticated user; this run \
+                               was triggered by a schedule, which has no user to run it as",
+                }),
+                "expected the honest no-principal refusal, got {result}"
             );
             Ok(())
         }

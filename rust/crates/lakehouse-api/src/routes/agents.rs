@@ -29,6 +29,7 @@
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use lakehouse_auth::repository::load_principal_for_user;
 use lakehouse_auth::{PermissionSet, Principal};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
@@ -782,6 +783,68 @@ fn headless_system_prompt(is_build: bool) -> String {
     }
 }
 
+/// Resolves the [`Principal`] a headless run should act as, from the
+/// `principal_kind`/`principal_id` `run_employee` derives from `RunAuth`
+/// (`:1290-1299`): `"user"` names a real person — a Platform Admin's
+/// manual "Run now" click — and gets that user's principal loaded ONCE
+/// here, before the tool loop, so history records the real person instead
+/// of `"anonymous"` (C2-F2). Every other kind (`"schedule"` — Dagster's
+/// schedule factory, T3.3 — and anything unrecognised) has no interactive
+/// user behind it and gets `None`, which `run_saved_query` now refuses
+/// with a named reason instead of forwarding a bare 401.
+///
+/// Never fails the run over a bad lookup: a `principal_id` that does not
+/// parse as a UUID, or one that no longer names an `app_user` row (the
+/// user was deleted after the run was scheduled), logs a warning and
+/// degrades to `None` — the run still executes every tool that does not
+/// require a principal; only a principal-requiring call refuses inside
+/// the loop, exactly like the schedule case.
+///
+/// # Errors
+///
+/// Does not return a `Result`: every failure mode (missing id,
+/// unparsable id, lookup error) is handled by degrading to `None` rather
+/// than propagating, per this function's own doc above.
+async fn principal_for_headless_run(
+    pg: &PgPool,
+    principal_kind: &str,
+    principal_id: Option<&str>,
+) -> Option<Principal> {
+    if principal_kind != "user" {
+        return None;
+    }
+    let Some(id) = principal_id else {
+        tracing::warn!(
+            principal_kind,
+            "headless run: a \"user\" kind run carried no principal_id"
+        );
+        return None;
+    };
+    let Ok(user_id) = Uuid::parse_str(id) else {
+        tracing::warn!(
+            principal_kind,
+            principal_id = id,
+            "headless run: principal_id did not parse as a uuid"
+        );
+        return None;
+    };
+    // "session" mirrors `session::validate`'s own provider tag for this
+    // same lookup (`lakehouse-auth/src/session.rs:112`): this is a
+    // re-identification of an already-authenticated user, not a fresh
+    // password/OIDC verification.
+    match load_principal_for_user(pg, user_id, "session".to_owned(), false).await {
+        Ok(principal) => Some(principal),
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                %user_id,
+                "headless run: failed to load the principal for a user-triggered run"
+            );
+            None
+        }
+    }
+}
+
 /// The headless tool-calling loop shared by every `POST
 /// /api/agents/employees/{id}/run` call — see [`run_employee`]'s doc
 /// comment for the full picture. Never panics: an LLM failure, a refused
@@ -843,6 +906,13 @@ async fn run_headless_loop(
             is_build || !is_write
         })
         .collect();
+
+    // Loaded ONCE per run, before the loop, not per step: a user-triggered
+    // run acts as that one user for its entire duration, and re-querying
+    // Postgres for the same principal on every tool call would be pure
+    // waste. See [`principal_for_headless_run`] for what `principal_kind`
+    // values count as "a real user" and how a bad lookup degrades.
+    let principal = principal_for_headless_run(pg, principal_kind, principal_id.as_deref()).await;
 
     let mut step_no: u32 = 0;
 
@@ -1103,14 +1173,14 @@ async fn run_headless_loop(
             // itself is the authorization, mirroring how `gold_export_job`
             // already runs its own `WriteLow`-equivalent export unattended.
             step_no += 1;
-            // A scheduled/headless run has no authenticated `Principal` to
-            // hand `run_tool` — only `principal_id`/`principal_kind`
-            // (a schedule or a service identity, not a session). Passing
-            // `None` here is honest about that gap rather than fabricating
-            // one; it means `run_saved_query` still 401s from a headless
-            // run, unchanged from before this fix, which only threads the
-            // principal that already exists at the interactive call sites.
-            let result = ai_tools::run_tool(state, None, &call.function.name, &args).await;
+            // `principal` was resolved once above, before this loop
+            // started (C2-F2): a manually-triggered run acts as the
+            // triggering user for every tool call in this run, a
+            // schedule-triggered run passes `None`, and a principal-
+            // requiring tool (`run_saved_query`) is responsible for
+            // refusing `None` with a named reason rather than a bare 401.
+            let result =
+                ai_tools::run_tool(state, principal.as_ref(), &call.function.name, &args).await;
             let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
             let (resource_kind, resource_id) =
                 ai_audit::resource_for(&call.function.name, &args, &result);
@@ -1513,5 +1583,82 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ApiError::PermissionDenied(_)));
+    }
+
+    // ── C2-F2 regression coverage: a user-triggered headless run must act
+    // as that user, and a run with no user behind it must never error nor
+    // fabricate one ─────────────────────────────────────────────────────
+    //
+    // `run_headless_loop` itself is not directly testable (it drives a
+    // real `LlmClient` chat loop), so this exercises the extracted
+    // "resolve the principal for this run" step,
+    // [`principal_for_headless_run`], directly against the `sqlx::test`
+    // pool — the same seam `run_headless_loop` calls before its tool loop
+    // starts.
+    mod principal_for_headless_run_tests {
+        use lakehouse_test_support as _;
+
+        use super::*;
+
+        /// Seeded by `0002_seed_identity.sql`: Rina Wijaya, an `active`
+        /// `app_user` row holding the `Analyst` and `Approver` roles.
+        const SEEDED_USER_ID: &str = "33333333-3333-4333-8333-000000000001";
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_seeded_user_id_yields_a_principal_with_that_uuid(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            let principal = principal_for_headless_run(&pool, "user", Some(SEEDED_USER_ID)).await;
+            let principal = principal.expect("a seeded user id must resolve to a principal");
+            assert_eq!(
+                principal.id.uuid().to_string(),
+                SEEDED_USER_ID,
+                "the resolved principal must be the SAME user the run was triggered by"
+            );
+            Ok(())
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_schedule_kind_yields_none_even_with_a_valid_id_present(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            // `run_employee` never actually sets `principal_id` for a
+            // `"schedule"` kind (see `:1290-1299`), but this asserts the
+            // stronger property directly: `principal_kind` alone decides
+            // whether a lookup is even attempted, so a schedule-triggered
+            // run can never accidentally act as a user.
+            let principal =
+                principal_for_headless_run(&pool, "schedule", Some(SEEDED_USER_ID)).await;
+            assert!(principal.is_none());
+            Ok(())
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn an_unknown_uuid_yields_none_and_does_not_error(pool: PgPool) -> sqlx::Result<()> {
+            let principal = principal_for_headless_run(
+                &pool,
+                "user",
+                Some("99999999-9999-4999-8999-000000000099"),
+            )
+            .await;
+            assert!(principal.is_none());
+            Ok(())
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_malformed_id_yields_none_and_does_not_error(pool: PgPool) -> sqlx::Result<()> {
+            let principal = principal_for_headless_run(&pool, "user", Some("not-a-uuid")).await;
+            assert!(principal.is_none());
+            Ok(())
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_user_kind_with_no_id_yields_none_and_does_not_error(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            let principal = principal_for_headless_run(&pool, "user", None).await;
+            assert!(principal.is_none());
+            Ok(())
+        }
     }
 }
