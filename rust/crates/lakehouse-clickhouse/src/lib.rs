@@ -261,6 +261,45 @@ impl ChClient {
         };
         run_cancellable(fut, cancel).await
     }
+
+    /// Run `sql` verbatim (no `FORMAT JSON` wrapping — the caller supplies
+    /// its own `FORMAT` clause) and return the raw response body bytes,
+    /// unparsed.
+    ///
+    /// Added for `routes::query::download` (WS2 §13, WS2 plan review W9):
+    /// a `CSV`/`Parquet` export is not `ClickHouse`'s `FORMAT JSON` shape
+    /// [`ChClient::query`] parses, so this is a genuinely new small
+    /// addition to this crate's public surface rather than a hidden
+    /// dependency, called out in that task's commit body.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChError::Transport`] on a network-level failure, or
+    /// [`ChError::Server`] when `ClickHouse` responds with a non-2xx status.
+    pub async fn raw_bytes(
+        &self,
+        sql: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<u8>, ChError> {
+        let fut = async {
+            let response = self
+                .client
+                .post(&self.url)
+                .basic_auth(&self.user, Some(&self.password))
+                .header(CONTENT_TYPE, "text/plain; charset=utf-8")
+                .header(CACHE_CONTROL, "no-store")
+                .body(sql.to_owned())
+                .send()
+                .await?;
+            let status = response.status();
+            if !status.is_success() {
+                let text = response.text().await?;
+                return Err(ChError::Server(server_error_message(status, &text)));
+            }
+            Ok(response.bytes().await?.to_vec())
+        };
+        run_cancellable(fut, cancel).await
+    }
 }
 
 /// Race `fut` against `cancel` being cancelled, when a token is supplied.
@@ -642,5 +681,40 @@ mod tests {
     #[test]
     fn build_query_body_strips_semicolon_and_trailing_whitespace() {
         assert_eq!(build_query_body("SELECT 1;   "), "SELECT 1\nFORMAT JSON");
+    }
+
+    // -- raw_bytes (WS2 §13, WS2 plan review W9) --------------------------
+
+    #[tokio::test]
+    async fn raw_bytes_returns_the_response_body_unparsed() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("FORMAT CSV"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("n\n1\n2\n"))
+            .mount(&server)
+            .await;
+
+        let bytes = client(&server.uri())
+            .raw_bytes("SELECT n FROM t FORMAT CSV", None)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"n\n1\n2\n");
+    }
+
+    #[tokio::test]
+    async fn raw_bytes_maps_a_non_2xx_status_to_ch_error_server() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_string("Code: 47. Unknown identifier"),
+            )
+            .mount(&server)
+            .await;
+
+        let err = client(&server.uri())
+            .raw_bytes("SELECT bogus FORMAT CSV", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ChError::Server(msg) if msg.contains("Unknown identifier")));
     }
 }

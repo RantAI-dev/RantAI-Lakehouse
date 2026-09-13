@@ -8,9 +8,11 @@ use std::time::Instant;
 
 use axum::Extension;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
+use axum::http::header;
+use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
-use lakehouse_clickhouse::ChClient;
+use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::queries::{self, QueryHistoryItem, RecordHistoryInput, SavedQuery};
@@ -659,6 +661,205 @@ pub async fn list_history(
     Ok(ApiJson(queries::list_history(pool(&state)?).await?))
 }
 
+// ── GET /api/query/run/{id}/download (WS2 §13, WS2 plan review W9) ─────
+
+/// `?format=csv|parquet` on [`download`].
+#[derive(Debug, Deserialize)]
+pub(crate) struct DownloadQuery {
+    format: String,
+}
+
+/// The most rows a download re-run is allowed to return — this is a
+/// bounded RE-EXECUTION against current data, not a replay of the
+/// original result, so the cap protects both the response size and the
+/// re-run's own cost. Applied twice, belt and braces: as a `LIMIT` in the
+/// wrapped statement itself (see [`build_capped_statement`]) and as a
+/// `max_result_rows` `SETTINGS` override with `result_overflow_mode =
+/// 'break'`, so `ClickHouse` truncates rather than erroring if the outer
+/// `LIMIT` is somehow not honored.
+const DOWNLOAD_ROW_CAP: u32 = 10_000;
+
+/// `query_history.id` shape: `q-<epoch_ms>`, digits only after the
+/// prefix. Validated before `id` is ever interpolated into the
+/// `Content-Disposition` header (WS2 plan review W9) — this is a
+/// header-injection guard, not a lookup optimization; the database lookup
+/// itself already binds `id` as a parameter and needs no such check.
+fn is_valid_history_id(id: &str) -> bool {
+    id.strip_prefix("q-")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Only these `query_history.engine` values may be re-run through this
+/// route (WS2 plan review W9). `"hot-store"` is the legacy placeholder
+/// every row recorded before Task C2 threaded a real `engine` field
+/// carries — it named `ClickHouse`'s storage tier, not a different
+/// engine, so it is downloadable exactly like `"clickhouse"`. `"trino"`
+/// is deliberately excluded: re-running it on the wrong engine is not an
+/// option this route offers.
+fn is_downloadable_engine(engine: &str) -> bool {
+    engine == "clickhouse" || engine == "hot-store"
+}
+
+/// Wrap `sql` (a `query_history` row's stored statement) in an outer
+/// `SELECT * FROM (...)  LIMIT <cap> ...` rather than appending `LIMIT
+/// <cap>` to it directly.
+///
+/// Appending would be invalid `SQL` whenever the stored statement already
+/// ends in its own `LIMIT` clause, and worse: a trailing `-- comment` in
+/// the stored `SQL` would comment out an appended `LIMIT`, uncapping the
+/// download entirely. Wrapping keeps the stored statement — comment and
+/// all — fully enclosed in its own subquery, so nothing in it can reach
+/// outside the parentheses to interfere with the outer `LIMIT`/`SETTINGS`
+/// clause (WS2 §13, WS2 plan review W9).
+///
+/// Only a single trailing `;` (and any whitespace around it) is stripped
+/// first — the same `strip_trailing_semicolon` shape
+/// `lakehouse-clickhouse` already uses for its own `FORMAT` appending, so
+/// a genuinely empty statement or one with internal semicolons is left
+/// otherwise untouched.
+fn build_capped_statement(sql: &str, format_clause: &str) -> String {
+    let trimmed = sql.trim_end();
+    let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
+    format!(
+        "SELECT * FROM (\n{trimmed}\n) LIMIT {DOWNLOAD_ROW_CAP} SETTINGS \
+         max_result_rows = {DOWNLOAD_ROW_CAP}, result_overflow_mode = 'break' \
+         FORMAT {format_clause}"
+    )
+}
+
+/// Map a [`ChError`] from the re-run `ClickHouse` call performed by
+/// [`download`] to a fixed [`ApiError`] — never `?`, and never the
+/// upstream message.
+///
+/// `POST /api/query/run`'s `ChError -> ApiError` conversion
+/// (`lakehouse_clickhouse::ChError`'s own `From` impl, tested by
+/// `error.rs`'s `ch_error_converts_through_question_mark_to_422_rejection`)
+/// forwards `ClickHouse`'s message verbatim — a narrow, deliberate
+/// exception because the caller reading it is the same principal whose
+/// own `SQL` produced it, at the moment they submitted it. This route
+/// re-runs a PAST query, possibly minutes or days later, so the caller is
+/// no longer necessarily in a position to make sense of a raw `ClickHouse`
+/// diagnostic; more importantly, per this repository's "upstream error
+/// text never reaches a response" rule, this route does not reuse that
+/// narrow precedent (WS2 plan review W9). `ChError::Server` becomes a
+/// fixed 422; every other variant is treated as the service being
+/// unavailable and becomes 503. The real detail is logged server-side
+/// either way.
+fn map_download_ch_error(err: &ChError) -> ApiError {
+    match err {
+        ChError::Server(_) => {
+            tracing::warn!(%err, "stored query failed to re-run for download");
+            ApiError::Unprocessable("stored query failed to re-run".to_owned())
+        }
+        ChError::Transport(_) | ChError::Cancelled => {
+            tracing::warn!(%err, "clickhouse unreachable while re-running a query for download");
+            ApiError::Unavailable("clickhouse unavailable while re-running the query".to_owned())
+        }
+    }
+}
+
+/// `GET /api/query/run/{id}/download?format=csv|parquet` — re-run a past
+/// `query_history` row's `SQL` against current data and return the result
+/// as a file download (WS2 §13, WS2 plan review W9).
+///
+/// This is NOT the original result the caller once saw: it re-executes
+/// the stored statement against whatever `ClickHouse` holds right now,
+/// capped at [`DOWNLOAD_ROW_CAP`] rows. Data ingested or deleted since the
+/// original run changes what comes back.
+///
+/// Only rows whose `engine` is `"clickhouse"` or the legacy `"hot-store"`
+/// placeholder are eligible (WS2 plan review W9) — a `"trino"` row cannot
+/// be re-run through this route at all.
+///
+/// Ownership is exact-match on `query_history.user_name` against the
+/// caller's own principal id string. Every row recorded before Task C2
+/// threaded a real principal into `routes::query::run` carries the fixed
+/// placeholder `"anonymous"`, which — by construction — never equals any
+/// authenticated caller's real id string, so those legacy rows are
+/// permanently undownloadable through this route. That is a deliberate,
+/// fail-closed consequence of scoping by identity, not an oversight to be
+/// worked around.
+///
+/// # Errors
+///
+/// - 400 [`ApiError::BadRequest`] when `format` is neither `csv` nor
+///   `parquet`, or when `id` does not match the `query_history.id` shape
+///   (`q-<digits>`).
+/// - 404 [`ApiError::NotFound`] when no history row matches `id`, or when
+///   one does but its recorded owner is not the calling principal
+///   (including every legacy `"anonymous"` row — see this doc comment).
+/// - 422 [`ApiError::Unprocessable`] when the row's `engine` is not
+///   downloadable, when its stored `SQL` fails [`is_read_only`] (defense
+///   in depth: `routes::query::run` already gated this at insert time),
+///   or when `ClickHouse` rejects the re-run.
+/// - 503 [`ApiError::Unavailable`] when the query store or `ClickHouse`
+///   itself is unreachable.
+pub async fn download(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<DownloadQuery>,
+    principal: Option<Extension<Principal>>,
+) -> ApiResult<Response> {
+    let (format_clause, content_type, extension) = match query.format.as_str() {
+        "csv" => ("CSV", "text/csv", "csv"),
+        "parquet" => ("Parquet", "application/octet-stream", "parquet"),
+        _ => {
+            return Err(ApiError::BadRequest("format must be csv or parquet".to_owned()).into());
+        }
+    };
+    if !is_valid_history_id(&id) {
+        return Err(ApiError::BadRequest("id must look like a query run id".to_owned()).into());
+    }
+
+    let Some(item) = queries::get_history_item(pool(&state)?, &id).await? else {
+        return Err(ApiError::NotFound("query run not found".to_owned()).into());
+    };
+
+    // Fails closed identically for a stranger's row and a legacy
+    // "anonymous" row (see this function's doc comment) — a caller cannot
+    // distinguish "not yours" from "does not exist" either way.
+    let caller_id = principal
+        .as_ref()
+        .map(|Extension(p)| p.id.uuid().to_string());
+    if caller_id.as_deref() != Some(item.user.as_str()) {
+        return Err(ApiError::NotFound("query run not found".to_owned()).into());
+    }
+
+    if !is_downloadable_engine(&item.engine) {
+        return Err(
+            ApiError::Unprocessable("download supports ClickHouse runs only".to_owned()).into(),
+        );
+    }
+    // Defense in depth: `routes::query::run` already refused a non-read-only
+    // statement at insert time, so this should be unreachable in practice —
+    // re-checked here because this route is about to re-execute the stored
+    // SQL, not merely read it back.
+    if !is_read_only(&item.sql) {
+        return Err(ApiError::Unprocessable("stored query is not read-only".to_owned()).into());
+    }
+
+    let capped_sql = build_capped_statement(&item.sql, format_clause);
+    let bytes = state
+        .clickhouse
+        .raw_bytes(&capped_sql, None)
+        .await
+        .map_err(|err| map_download_ch_error(&err))?;
+
+    let content_disposition = format!("attachment; filename=\"{id}.{extension}\"");
+    // Bypasses the `ApiJson` choke point deliberately: the response body
+    // here is a raw file (CSV/Parquet bytes), not a JSON value — there is
+    // nothing for `ApiJson` to serialize (AGENTS.md requires a comment at
+    // any choke-point bypass explaining why).
+    Ok((
+        [
+            (header::CONTENT_TYPE, content_type.to_owned()),
+            (header::CONTENT_DISPOSITION, content_disposition),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1065,6 +1266,106 @@ mod tests {
             let recorded_user = p.id.uuid().to_string();
             assert_eq!(recorded_user, Uuid::nil().to_string());
             assert_ne!(recorded_user, p.display_name);
+        }
+    }
+
+    // ── GET /api/query/run/{id}/download (WS2 §13, WS2 plan review W9) ──
+
+    mod download_pure {
+        use super::*;
+
+        #[test]
+        fn wraps_sql_that_already_has_its_own_limit_clause() {
+            let capped = build_capped_statement("SELECT * FROM t LIMIT 5", "CSV");
+            assert_eq!(
+                capped,
+                "SELECT * FROM (\nSELECT * FROM t LIMIT 5\n) LIMIT 10000 SETTINGS \
+                 max_result_rows = 10000, result_overflow_mode = 'break' FORMAT CSV"
+            );
+        }
+
+        #[test]
+        fn wraps_sql_ending_in_a_trailing_comment_without_letting_it_uncap_the_limit() {
+            // A naive `format!("{sql} LIMIT {cap}")` would have this trailing
+            // `--` comment out the appended LIMIT, uncapping the download —
+            // wrapping the whole statement in its own subquery keeps the
+            // comment fully enclosed, unable to reach the outer LIMIT.
+            let capped = build_capped_statement("SELECT * FROM t -- trailing comment", "CSV");
+            assert_eq!(
+                capped,
+                "SELECT * FROM (\nSELECT * FROM t -- trailing comment\n) LIMIT 10000 \
+                 SETTINGS max_result_rows = 10000, result_overflow_mode = 'break' FORMAT CSV"
+            );
+        }
+
+        #[test]
+        fn wraps_a_with_query() {
+            let capped = build_capped_statement("WITH x AS (SELECT 1) SELECT * FROM x", "Parquet");
+            assert_eq!(
+                capped,
+                "SELECT * FROM (\nWITH x AS (SELECT 1) SELECT * FROM x\n) LIMIT 10000 \
+                 SETTINGS max_result_rows = 10000, result_overflow_mode = 'break' \
+                 FORMAT Parquet"
+            );
+        }
+
+        #[test]
+        fn strips_exactly_one_trailing_semicolon_and_its_surrounding_whitespace() {
+            let capped = build_capped_statement("SELECT 1;   ", "CSV");
+            assert_eq!(
+                capped,
+                "SELECT * FROM (\nSELECT 1\n) LIMIT 10000 SETTINGS max_result_rows = 10000, \
+                 result_overflow_mode = 'break' FORMAT CSV"
+            );
+        }
+
+        #[test]
+        fn clickhouse_and_legacy_hot_store_engines_are_downloadable() {
+            assert!(is_downloadable_engine("clickhouse"));
+            assert!(is_downloadable_engine("hot-store"));
+        }
+
+        #[test]
+        fn trino_and_unknown_engines_are_not_downloadable() {
+            assert!(!is_downloadable_engine("trino"));
+            assert!(!is_downloadable_engine("something-else"));
+        }
+
+        #[test]
+        fn valid_history_ids_are_the_q_dash_digits_shape() {
+            assert!(is_valid_history_id("q-1"));
+            assert!(is_valid_history_id("q-1736200000000"));
+        }
+
+        #[test]
+        fn ids_without_the_q_dash_digits_shape_are_rejected() {
+            for id in [
+                "",
+                "q-",
+                "q-abc",
+                "Q-1",
+                "q-1;DROP TABLE t",
+                "../q-1",
+                "q-1\r\nSet-Cookie: x=y",
+            ] {
+                assert!(!is_valid_history_id(id), "expected rejected: {id:?}");
+            }
+        }
+
+        #[test]
+        fn ch_server_error_maps_to_422_with_a_fixed_message_never_the_upstream_text() {
+            let err = map_download_ch_error(&ChError::Server(
+                "Code: 47. Unknown identifier: nope".to_owned(),
+            ));
+            assert_eq!(err.status(), 422);
+            assert_eq!(err.to_string(), "stored query failed to re-run");
+            assert!(!err.to_string().contains("Unknown identifier"));
+        }
+
+        #[test]
+        fn ch_transport_error_maps_to_503() {
+            let err = map_download_ch_error(&ChError::Cancelled);
+            assert_eq!(err.status(), 503);
         }
     }
 }

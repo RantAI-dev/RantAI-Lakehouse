@@ -346,6 +346,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/query/estimate", axum::routing::post(query::estimate))
         .route("/api/query/saved", get(query::list_saved))
         .route("/api/query/history", get(query::list_history))
+        .route("/api/query/run/{id}/download", get(query::download))
         .merge(pipelines_router())
         .route("/api/dashboard", get(dashboard::get))
         .route(
