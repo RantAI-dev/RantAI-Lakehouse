@@ -160,6 +160,12 @@ services:
       # bootstrap seeds nothing and the maintenance job's policy fetch
       # fails visibly (401) rather than silently.
       LAKEHOUSE_MAINTENANCE_TOKEN: ${LAKEHOUSE_MAINTENANCE_TOKEN:-}
+      # WS2 §4 — base URL for `routes::query::run`'s `engine: "trino"` path
+      # (`lakehouse-trino`'s `/v1/statement` client). An internal service
+      # address, not a credential, so a default is fine here — the `trino`
+      # profile is optional, and an unreachable Trino degrades to a
+      # per-request 503 rather than lakehouse-api refusing to boot.
+      TRINO_URL: ${TRINO_URL:-http://trino:8080}
       EMBED_SECRET: ${EMBED_SECRET:-}
       OIDC_ISSUER: ${OIDC_ISSUER:-}
       OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
@@ -1795,8 +1801,9 @@ services:
         security.config-file=/etc/trino/rules.json
         EOF
         # `trino` has no `http-server.authentication.type` (see the block
-        # comment above this service), so the `X-Trino-User` header C2 and
-        # `optimize_bronze.sh` send is an unauthenticated claim, not a
+        # comment above this service), so the `X-Trino-User` header the
+        # console query route and `optimize_bronze.sh` send is an
+        # unauthenticated claim, not a
         # verified identity — anyone reaching this coordinator inside the
         # compose network can name themselves `trino-maintenance`. This
         # file-based access control is therefore not network isolation; it

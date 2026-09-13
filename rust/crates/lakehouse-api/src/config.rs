@@ -364,6 +364,21 @@ pub struct Config {
     /// it — see `main::bootstrap_lakehouse_maintenance_service`'s doc
     /// comment for why no scopes are granted.
     pub lakehouse_maintenance_token: Option<String>,
+    /// Base URL of the `Trino` coordinator `routes::query::run` talks to
+    /// for `engine: "trino"` requests (WS2 §4). Not a secret — an internal
+    /// service address, like [`Self::ch_url`] — so it's printed verbatim
+    /// by [`std::fmt::Debug`]. Always has a default: the `trino` compose
+    /// profile is optional, so `AppState::trino` is always constructed and
+    /// an unreachable `Trino` becomes a per-request 503, never a missing
+    /// field. Default `"http://trino:8080"`.
+    pub trino_url: String,
+    /// Hard cap on rows a single `Trino` statement may accumulate across
+    /// `nextUri` pages before [`lakehouse_trino::TrinoClient::run_statement`]
+    /// cancels the query and returns `TrinoError::TooManyRows` — same
+    /// non-load-bearing parsing posture as [`Self::gold_export_max_rows`]:
+    /// an unparsable override falls back to the default rather than
+    /// failing config resolution. Default `10_000`.
+    pub trino_max_rows: usize,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -468,6 +483,8 @@ impl std::fmt::Debug for Config {
                 "lakehouse_maintenance_token",
                 &self.lakehouse_maintenance_token.as_ref().map(|_| REDACTED),
             )
+            .field("trino_url", &self.trino_url)
+            .field("trino_max_rows", &self.trino_max_rows)
             .finish()
     }
 }
@@ -646,6 +663,14 @@ impl Config {
             gold_export_batch_size: parse_u64_or_default(env, "GOLD_EXPORT_BATCH_SIZE", 20_000),
             agent_run_token: truthy(env, "AGENT_RUN_TOKEN"),
             lakehouse_maintenance_token: truthy(env, "LAKEHOUSE_MAINTENANCE_TOKEN"),
+            trino_url: or_default(env, "TRINO_URL", "http://trino:8080"),
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "trino_max_rows is a small row-count cap; usize is 64-bit on every \
+                          platform this service is built for, so parsing as u64 and narrowing \
+                          cannot truncate a realistic value"
+            )]
+            trino_max_rows: parse_u64_or_default(env, "TRINO_MAX_ROWS", 10_000) as usize,
         })
     }
 
@@ -770,8 +795,31 @@ mod tests {
         assert_eq!(cfg.gold_export_batch_size, 20_000);
         assert_eq!(cfg.agent_run_token, None);
         assert_eq!(cfg.lakehouse_maintenance_token, None);
+        assert_eq!(cfg.trino_url, "http://trino:8080");
+        assert_eq!(cfg.trino_max_rows, 10_000);
         // Safe-by-default: SSRF blocking is ON unless explicitly disabled.
         assert!(!cfg.connector_probe_allow_internal_hosts);
+    }
+
+    #[test]
+    fn trino_settings_are_overridable() {
+        let env = map(&[
+            ("TRINO_URL", "http://trino.internal:9999"),
+            ("TRINO_MAX_ROWS", "42"),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.trino_url, "http://trino.internal:9999");
+        assert_eq!(cfg.trino_max_rows, 42);
+    }
+
+    /// Same non-load-bearing posture as `GOLD_EXPORT_MAX_ROWS`: a garbage
+    /// override must not fail config resolution — it falls back to the
+    /// documented default instead.
+    #[test]
+    fn invalid_trino_max_rows_falls_back_to_default_instead_of_erroring() {
+        let env = map(&[("TRINO_MAX_ROWS", "not-a-number")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.trino_max_rows, 10_000);
     }
 
     #[test]

@@ -24,6 +24,9 @@ lakehouse-embed = { path = "../lakehouse-embed" }
 lakehouse-llm = { path = "../lakehouse-llm" }
 lakehouse-store = { path = "../lakehouse-store" }
 lakehouse-auth = { path = "../lakehouse-auth" }
+# WS2 §4 — `routes::query::run`'s `engine: "trino"` path talks to Trino's
+# `/v1/statement` protocol through this crate's thin client, never directly.
+lakehouse-trino = { path = "../lakehouse-trino" }
 # ADR 0010 — Gold export to Iceberg happens in Rust: `routes::gold` (and
 # `gold_export`, the ClickHouse-read -> Arrow -> Iceberg-append glue) is
 # the first real caller of this crate. See the crate's own doc comment,

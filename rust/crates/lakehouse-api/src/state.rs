@@ -14,6 +14,7 @@ use lakehouse_embed::EmbedSecretResolver;
 use lakehouse_iceberg::IcebergClient;
 use lakehouse_llm::LlmClient;
 use lakehouse_store::PgPool;
+use lakehouse_trino::{TrinoClient, TrinoConfig};
 use tokio::sync::RwLock;
 
 use crate::bronze_stats_cache::BronzeStatsCache;
@@ -128,6 +129,13 @@ pub struct AppState {
     /// populated (same pattern as [`Self::gold_export_locks`]): it needs
     /// no external dependency, just an in-process map.
     pub bronze_stats_cache: Arc<BronzeStatsCache>,
+    /// `Trino` `/v1/statement` client for `routes::query::run`'s
+    /// `engine: "trino"` path (WS2 §4). Always present, like
+    /// [`Self::clickhouse`], never `Option` — the `trino` compose profile
+    /// is optional, so an unreachable `Trino` is a per-request 503 (see
+    /// `lakehouse_trino::TrinoError`'s mapping in `routes::query`), not a
+    /// missing field this process has to branch on before every use.
+    pub trino: Arc<TrinoClient>,
 }
 
 /// The exact `secretRef`s [`AppState::connector_secret_resolver`] may
@@ -228,6 +236,13 @@ impl AppState {
             oidc: oidc_config(&config)
                 .map(|oidc_config| Arc::new(OidcAuthenticator::new(oidc_config, (**pool).clone()))),
         });
+        // `TrinoConfig::new` supplies the documented `max_rows`/`paging_cap`
+        // defaults; only `base_url` and `max_rows` are overridden from
+        // [`Config`] here — `paging_cap` has no env-derived override yet.
+        let trino = TrinoClient::new(TrinoConfig {
+            max_rows: config.trino_max_rows,
+            ..TrinoConfig::new(config.trino_url.clone())
+        });
         Self {
             config: Arc::new(config),
             clickhouse,
@@ -246,6 +261,7 @@ impl AppState {
             gold_export_locks: MartLocks::default(),
             iceberg: Arc::new(RwLock::new(None)),
             bronze_stats_cache: Arc::new(BronzeStatsCache::new()),
+            trino: Arc::new(trino),
         }
     }
 }

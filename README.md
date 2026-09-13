@@ -219,6 +219,8 @@ guessed.
 | `EMBED_SECRET` | HMAC signing secret for signed dashboard embeds | unset (embedding disabled) | No |
 | `ALERTS_RUN_TOKEN` | Shared bearer token required to call `POST /api/alerts/run`; when set, also seeds the scope-less `alerts-run-scheduler` service identity Dagster's `alerts_run_schedule` authenticates as | unset | No, but unset means the endpoint replies 503 to anyone except an authenticated service-identity principal (not 401) — see Security notes below |
 | `LAKEHOUSE_MAINTENANCE_TOKEN` | Shared bearer token Dagster's maintenance job uses to authenticate against `GET /api/lakehouse/maintenance-policies`; when set, also seeds the scope-less `lakehouse-maintenance-policy-reader` service identity from it | unset | No, but unset means the API seeds no service identity and the maintenance job's policy fetch fails visibly with 401 |
+| `TRINO_URL` | Base URL of the Trino coordinator `POST /api/query/run`'s `engine: "trino"` path talks to | `http://trino:8080` | No, but unreachable means that path replies 503 |
+| `TRINO_MAX_ROWS` | Hard cap on rows a single Trino statement may accumulate across pages before the query is cancelled and refused | `10000` | No |
 | `SMTP_HOST` | SMTP host for alert/digest email delivery | unset (email disabled) | No |
 | `SMTP_PORT` | SMTP port. Invalid values log a warning and fall back to the default rather than failing boot | `587` | No |
 | `SMTP_SECURE` | Force implicit TLS (`"true"`). Effective value is also `true` whenever `SMTP_PORT` is `465`, even if this is unset | `false` | No |
