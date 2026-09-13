@@ -343,12 +343,16 @@ async fn latest_maintenance_verb_runs(
 
 /// True when `body` is `ClickHouse`'s error text for "the table does not
 /// exist" — this stack pins `ClickHouse` 26.7.3.19, whose exception text
-/// for a missing table ends with the error's code name in parentheses,
-/// e.g. `"Code: 60. DB::Exception: Table lake.bronze_meta.\
-/// maintenance_verb_run doesn't exist. (UNKNOWN_TABLE)"`. Matched on the
-/// code name (`UNKNOWN_TABLE`) with the numeric code (`60`) checked too,
-/// belt and braces. A small named function so it is unit-testable on
-/// plain strings, without a live `ClickHouse`.
+/// for a missing table ends with the error's code name in parentheses.
+/// Observed directly against `ClickHouse` 26.7.3.19 over the HTTP
+/// interface (a read-only query against a table that does not exist),
+/// e.g. ``"Code: 60. DB::Exception: Unknown table expression identifier \
+/// 'lake.bronze_meta.maintenance_verb_run' in scope SELECT 1 FROM \
+/// lake.`bronze_meta.maintenance_verb_run`. (UNKNOWN_TABLE) (version \
+/// 26.7.3.19 (official build))"``. Matched on the code name
+/// (`UNKNOWN_TABLE`) with the numeric code (`60`) checked too, belt and
+/// braces. A small named function so it is unit-testable on plain
+/// strings, without a live `ClickHouse`.
 ///
 /// This inspects `ClickHouse`'s own error text only to CLASSIFY it into a
 /// `bool` — the text itself is never returned or logged verbatim from
@@ -1033,8 +1037,13 @@ mod tests {
 
     #[test]
     fn is_unknown_table_error_accepts_a_real_clickhouse_unknown_table_body() {
-        let body = "Code: 60. DB::Exception: Table lake.bronze_meta.maintenance_verb_run \
-                     doesn't exist. (UNKNOWN_TABLE)";
+        // Observed against ClickHouse 26.7.3.19 over the HTTP interface
+        // (a read-only query against a table that does not exist), not
+        // invented — this stack pins that version (WS2 §4 B3-F3).
+        let body = "Code: 60. DB::Exception: Unknown table expression identifier \
+                     'lake.bronze_meta.maintenance_verb_run' in scope SELECT 1 FROM \
+                     lake.`bronze_meta.maintenance_verb_run`. (UNKNOWN_TABLE) \
+                     (version 26.7.3.19 (official build))";
         assert!(is_unknown_table_error(body));
     }
 
