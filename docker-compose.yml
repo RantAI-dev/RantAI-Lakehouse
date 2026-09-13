@@ -1790,6 +1790,94 @@ services:
         s3.aws-access-key=$${RUSTFS_ACCESS_KEY}
         s3.aws-secret-key=$${RUSTFS_SECRET_KEY}
         EOF
+        mkdir -p /etc/trino && cat > /etc/trino/access-control.properties <<EOF
+        access-control.name=file
+        security.config-file=/etc/trino/rules.json
+        EOF
+        # `trino` has no `http-server.authentication.type` (see the block
+        # comment above this service), so the `X-Trino-User` header C2 and
+        # `optimize_bronze.sh` send is an unauthenticated claim, not a
+        # verified identity — anyone reaching this coordinator inside the
+        # compose network can name themselves `trino-maintenance`. This
+        # file-based access control is therefore not network isolation; it
+        # is what stops a console query (routed through `POST
+        # /api/query/run`'s SQL-keyword guard, which is not a sufficient
+        # boundary on its own) from committing an Iceberg write once it
+        # reaches Trino. The `catalogs` rules are first-match and deny any
+        # catalog that matches none: only `trino-maintenance` gets `all` on
+        # `iceberg` (the catalog whose principal holds Lakekeeper `modify`,
+        # above); every other user gets `read-only` there; `system` is
+        # read-only for everyone (`SHOW TABLES` and `system.runtime.queries`
+        # need it).
+        #
+        # `catalogs` alone is NOT enough — measured directly against this
+        # image (`trinodb/trino:483`): `catalogs` rules govern catalog
+        # visibility and schema/table CREATE-or-DROP only. With no `tables`
+        # section, table PRIVILEGES default to allow-all, so `ALTER TABLE
+        # ... EXECUTE optimize` — the exact write this task exists to
+        # block — succeeded for a plain `console-reader` user even with the
+        # `catalogs`-only rules above (`CREATE TABLE` was correctly denied
+        # by `catalogs`; `EXECUTE optimize` was not, because Trino's
+        # `checkCanExecuteTableProcedure` only requires table `SELECT`).
+        # The `tables` rules below give `trino-maintenance` every table
+        # privilege on `iceberg`; everyone else gets `SELECT` only — the
+        # console query path (a later task's `POST /api/query/run`) needs
+        # `SELECT` to actually read Bronze, so denying it here would ship a
+        # dead-on-arrival read feature.
+        #
+        # Measured against a seeded Bronze table with these final rules:
+        # a `console-reader`-shaped user CAN `SHOW TABLES`/`SELECT` (both
+        # required for reads to work) but is denied `CREATE TABLE`,
+        # `INSERT INTO` and `DROP TABLE` ("Access Denied: Cannot ...",
+        # from the `catalogs: read-only` + `tables` rules together).
+        # `ALTER TABLE ... EXECUTE optimize`, however, is NOT denied for
+        # `console-reader` under these rules — Trino's file-based access
+        # control gates the `optimize` table procedure on `SELECT` alone,
+        # with no separate privilege for table maintenance procedures, so
+        # granting the `SELECT` reads need reopens `optimize` for everyone.
+        # This is accepted, not a bug to chase further, for two reasons:
+        # (1) the console path never reaches Trino with an `EXECUTE`
+        # statement in the first place — `POST /api/query/run`'s
+        # Trino-specific SQL guard (a later task) refuses `ALTER ...
+        # EXECUTE`, `MERGE`, `EXPLAIN ANALYZE ...` and similar before any
+        # request leaves `lakehouse-api`; (2) `X-Trino-User` is an
+        # unauthenticated claim (see above) — anyone who can reach Trino
+        # directly, bypassing the console entirely, could already assert
+        # `trino-maintenance` and run `optimize` regardless of what these
+        # rules say. These Trino-side rules bound the console-mediated
+        # path; they are not, and cannot be, a network boundary.
+        #
+        # `system` keeps `SELECT` for everyone: `system.runtime.queries`
+        # has no table procedures to protect, and reading it is how an
+        # operator confirms which user ran a query. Rules are first-match,
+        # same as `catalogs`.
+        #
+        # NOT tested here: `trino-maintenance` `CREATE TABLE`. Lakekeeper's
+        # `trino` principal is granted only `select`+`modify`, never
+        # `create` (ADR 0011 — deliberate: Trino "never creates a
+        # namespace or table"), and this is the SAME shared principal for
+        # every Trino query regardless of `X-Trino-User`, so no Trino user
+        # can create a table here — confirmed by reproducing the identical
+        # Lakekeeper `ForbiddenException` for both `trino-maintenance` and
+        # `console-reader`. The write-success proof for `trino-maintenance`
+        # is `ALTER TABLE ... EXECUTE optimize` and `DROP TABLE` against a
+        # table seeded outside Trino (via a principal that DOES hold
+        # `create`) — that is what this rules file exists to gate, and
+        # what `trino-maintenance-cron` actually runs.
+        cat > /etc/trino/rules.json <<EOF
+        {
+          "catalogs": [
+            {"user": "trino-maintenance", "catalog": "iceberg", "allow": "all"},
+            {"catalog": "iceberg", "allow": "read-only"},
+            {"catalog": "system", "allow": "read-only"}
+          ],
+          "tables": [
+            {"user": "trino-maintenance", "catalog": "iceberg", "schema": ".*", "table": ".*", "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP"]},
+            {"catalog": "iceberg", "schema": ".*", "table": ".*", "privileges": ["SELECT"]},
+            {"catalog": "system", "schema": ".*", "table": ".*", "privileges": ["SELECT"]}
+          ]
+        }
+        EOF
         exec /usr/lib/trino/bin/run-trino
     # NO `ports:` HERE — this is the fix. `trino-maintenance-cron` (below)
     # is the only consumer of this coordinator, and it reaches it as

@@ -23,8 +23,22 @@ INTERVAL_SECONDS="${TRINO_CRON_INTERVAL_SECONDS:-21600}"  # 6h default
 log() { echo "[trino-maintenance-cron] $(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
 
 run_once() {
-  tables=$(trino --server http://trino:8080 --execute "SHOW TABLES FROM iceberg.bronze" \
-    --output-format TSV_HEADER 2>/dev/null | tail -n +2 || true)
+  # Trino's file-based access control (docker-compose.yml, `trino` service)
+  # grants `all` on the `iceberg` catalog to exactly this user; every other
+  # user gets `read-only` there. Without `--user trino-maintenance` the CLI
+  # sends no `X-Trino-User` at all, falls back to the CLI's default identity,
+  # and both calls below would be denied.
+  # Capture the CLI's own exit status (not the trailing `tail`'s) so a real
+  # Trino failure (coordinator not yet warm, network blip) is distinguished
+  # from a genuinely empty `bronze` namespace — piping straight into `tail`
+  # loses that distinction because a pipeline's status is its last command's.
+  if ! raw=$(trino --server http://trino:8080 --user trino-maintenance \
+      --execute "SHOW TABLES FROM iceberg.bronze" \
+      --output-format TSV_HEADER 2>&1); then
+    log "WARNING: could not list Bronze tables (trino unavailable?): $raw"
+    return 0
+  fi
+  tables=$(printf '%s\n' "$raw" | tail -n +2)
   if [ -z "$tables" ]; then
     log "no Bronze tables found via iceberg.bronze — nothing to optimize"
     return 0
@@ -32,7 +46,7 @@ run_once() {
   echo "$tables" | while IFS= read -r t; do
     [ -z "$t" ] && continue
     log "optimize iceberg.bronze.\"$t\""
-    if ! trino --server http://trino:8080 \
+    if ! trino --server http://trino:8080 --user trino-maintenance \
         --execute "ALTER TABLE iceberg.bronze.\"$t\" EXECUTE optimize" 2>&1; then
       log "WARNING: optimize failed for $t (continuing with remaining tables)"
     fi
