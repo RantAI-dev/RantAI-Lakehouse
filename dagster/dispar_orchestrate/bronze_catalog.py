@@ -470,6 +470,49 @@ _CAPACITY_SNAPSHOT_SCHEMA = TableSchema(
 )
 
 
+def _utc_now_ch_timestamp() -> str:
+    """A `DateTime64(3, 'UTC')`-parseable literal with millisecond
+    precision, e.g. `2026-09-13 12:34:56.789` — no explicit zone suffix,
+    because the column's own declared type already fixes it to UTC."""
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%d %H:%M:%S.") + f"{now.microsecond // 1000:03d}"
+
+
+def record_capacity_snapshot(
+    *,
+    bucket_name: str,
+    bytes_: int,
+    objects: int,
+    target: "ClickHouseTarget | None" = None,
+) -> None:
+    """Insert one row into `lake.bronze_meta.capacity_snapshot`
+    (`_CAPACITY_SNAPSHOT_SCHEMA` above), via the same `_assert_or_create_all`
+    R10 path every other table in this module goes through — the writer
+    lives beside its schema and its sibling recorders
+    (`record_maintenance_run`, `record_maintenance_verb_run`) so the
+    registry schema keeps exactly one owner for both its definition and
+    its write.
+
+    One row per run — `ReplacingMergeTree ORDER BY (bucket_name,
+    measured_at)` means two rows in the same millisecond for the same
+    bucket would collide, which cannot happen for a job invoked at most
+    once a day. Called from `capacity_snapshot.py`'s daily bucket-size job.
+    """
+    ch = target or ClickHouseTarget.from_env()
+    _assert_or_create_all(ch, (_CAPACITY_SNAPSHOT_SCHEMA,))
+    values = (
+        f"({_sql_string_literal(_utc_now_ch_timestamp())}, "
+        f"{_sql_string_literal(bucket_name)}, {int(bytes_)}, {int(objects)})"
+    )
+    _ch_exec(
+        ch,
+        "INSERT INTO lake.`bronze_meta.capacity_snapshot` "
+        "(measured_at, bucket_name, bytes, objects) VALUES " + values,
+    )
+
+
 def _utc_now_iso() -> str:
     from datetime import datetime, timezone
 

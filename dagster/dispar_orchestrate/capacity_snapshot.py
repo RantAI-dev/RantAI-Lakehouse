@@ -25,20 +25,23 @@ would silently authenticate anonymously and fail. A missing or empty
 value raises `dagster.Failure` (AGENTS.md: a config/auth problem is a
 `Failure`, never a silent empty-string default) — see `_required_env`.
 
-# Schema: `lake.bronze_meta.capacity_snapshot`, not `console.capacity_snapshot`
+# Schema and write: `lake.bronze_meta.capacity_snapshot`, not `console.capacity_snapshot`
 
 `bronze_catalog.TableSchema.create_ddl` always emits
 `CREATE TABLE IF NOT EXISTS lake.\\`{table_name}\\``, and
 `_assert_or_create_schema` only ever looks in database `lake`
 (`system.tables WHERE database = 'lake'`). A `table_name` is ONE
 identifier that may contain a dot, always inside `lake` — see the
-existing `bronze_meta.maintenance_run`. So this job's schema
-(`bronze_catalog._CAPACITY_SNAPSHOT_SCHEMA`) is
+existing `bronze_meta.maintenance_run`. So this job's schema is
 `table_name="bronze_meta.capacity_snapshot"`, giving
-``lake.`bronze_meta.capacity_snapshot` ``, defined in `bronze_catalog.py`
-so the registry schema keeps exactly one owner (R10) even though the
-`INSERT` itself is issued from this module (this module's own test needs
-to monkeypatch `_ch_exec` inside its own namespace, not `bronze_catalog`'s).
+``lake.`bronze_meta.capacity_snapshot` ``.
+
+Both the schema (`_CAPACITY_SNAPSHOT_SCHEMA`) and the writer
+(`record_capacity_snapshot`) live in `bronze_catalog.py`, beside its
+sibling recorders `record_maintenance_run`/`record_maintenance_verb_run` —
+the schema owner also owns the write, so this module imports only that
+one public name rather than reaching into `bronze_catalog`'s private
+`_assert_or_create_all`/`_ch_exec` to issue the `INSERT` itself.
 
 `clickhouse_bytes_on_disk` is NOT a column here: `GET /api/lakehouse/capacity`
 reads ClickHouse's own `system.parts` live, so this table stores the
@@ -50,25 +53,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
 
 from dagster import DefaultScheduleStatus, Failure, ScheduleDefinition, job, op
 from s3fs import S3FileSystem
 
-from dispar_orchestrate.bronze_catalog import (
-    _CAPACITY_SNAPSHOT_SCHEMA,
-    ClickHouseTarget,
-    _assert_or_create_all,
-    _ch_exec,
-    _sql_string_literal,
-)
-
-# `_CAPACITY_SNAPSHOT_SCHEMA` is defined in `bronze_catalog.py` (next to
-# `_MAINTENANCE_RUN_SCHEMA`/`_MAINTENANCE_VERB_RUN_SCHEMA`), not here, so
-# the registry schema keeps exactly one owner (R10) even though the
-# `INSERT` itself is issued from this module — this module's own test
-# needs to monkeypatch `_ch_exec` inside its own namespace, not
-# `bronze_catalog`'s.
+from dispar_orchestrate.bronze_catalog import ClickHouseTarget, record_capacity_snapshot
 
 
 def _env(name: str, default: str) -> str:
@@ -144,40 +133,6 @@ def measure_bucket(cfg: CapacityConfig) -> BucketMeasurement:
     return BucketMeasurement(
         bytes=sum(info["size"] for info in files),
         objects=len(files),
-    )
-
-
-def _utc_now_ch_timestamp() -> str:
-    """A `DateTime64(3, 'UTC')`-parseable literal with millisecond
-    precision, e.g. `2026-09-13 12:34:56.789` — no explicit zone suffix,
-    because the column's own declared type already fixes it to UTC."""
-    now = datetime.now(timezone.utc)
-    return now.strftime("%Y-%m-%d %H:%M:%S.") + f"{now.microsecond // 1000:03d}"
-
-
-def record_capacity_snapshot(
-    *,
-    bucket_name: str,
-    bytes_: int,
-    objects: int,
-    target: "ClickHouseTarget | None" = None,
-) -> None:
-    """Insert one row into `lake.bronze_meta.capacity_snapshot`
-    (`_CAPACITY_SNAPSHOT_SCHEMA`, owned by `bronze_catalog.py` per R10).
-    One row per run — `ReplacingMergeTree ORDER BY (bucket_name,
-    measured_at)` means two rows in the same millisecond for the same
-    bucket would collide, which cannot happen for a job invoked at most
-    once a day."""
-    ch = target or ClickHouseTarget.from_env()
-    _assert_or_create_all(ch, (_CAPACITY_SNAPSHOT_SCHEMA,))
-    values = (
-        f"({_sql_string_literal(_utc_now_ch_timestamp())}, "
-        f"{_sql_string_literal(bucket_name)}, {int(bytes_)}, {int(objects)})"
-    )
-    _ch_exec(
-        ch,
-        "INSERT INTO lake.`bronze_meta.capacity_snapshot` "
-        "(measured_at, bucket_name, bytes, objects) VALUES " + values,
     )
 
 

@@ -1,11 +1,20 @@
 """Unit tests for `dagster/dispar_orchestrate/capacity_snapshot.py`.
 
-No network: `S3FileSystem` and `_ch_exec` are monkeypatched with fakes,
-per this package's own no-network testing rule (`test_maintenance.py`
-does the same for its own HTTP-backed functions, via `mock.patch`
-instead — this file uses bare pytest functions with the `monkeypatch`
-fixture, since this is a brand-new file with no existing suite style to
-match and pytest is what actually runs this package's tests).
+No network: `S3FileSystem` is monkeypatched with a fake, per this
+package's own no-network testing rule (`test_maintenance.py` does the
+same for its own HTTP-backed functions, via `mock.patch` instead — this
+file uses bare pytest functions with the `monkeypatch` fixture, since
+this is a brand-new file with no existing suite style to match and
+pytest is what actually runs this package's tests).
+
+`record_capacity_snapshot` itself is defined in `bronze_catalog.py`
+(beside its sibling recorders), so its `_ch_exec`/`_assert_or_create_all`
+calls are patched on `bronze_catalog`, not on this module — a function
+looks up module-level names in the globals of the module it is DEFINED
+in, not the module through which it happens to be imported, so patching
+`bronze_catalog._ch_exec` intercepts the call made via
+`capacity_snapshot.record_capacity_snapshot` identically to a
+`bronze_catalog`-only caller.
 
 Run with:
 `~/.cache/rantai-dagster-venv/bin/python -m pytest dagster/dispar_orchestrate/test_capacity_snapshot.py -q`
@@ -16,7 +25,7 @@ from __future__ import annotations
 import pytest
 from dagster import Failure
 
-from dispar_orchestrate import capacity_snapshot
+from dispar_orchestrate import bronze_catalog, capacity_snapshot
 
 
 def _cfg(**overrides) -> capacity_snapshot.CapacityConfig:
@@ -64,14 +73,14 @@ def test_measure_bucket_lists_objects_via_s3fs(monkeypatch):
 
 def test_record_capacity_snapshot_writes_one_row(monkeypatch):
     inserted = []
-    monkeypatch.setattr(capacity_snapshot, "_ch_exec", lambda target, sql: inserted.append(sql))
+    monkeypatch.setattr(bronze_catalog, "_ch_exec", lambda target, sql: inserted.append(sql))
     # `_assert_or_create_all` (the R10 ensure-schema step, shared with
     # every other `bronze_catalog` table) issues its own real
     # `system.tables`/`system.columns` reads via `bronze_catalog`'s OWN
     # `_ch_query_json`, not the `_ch_exec` patched above — no-op it here
     # so this stays a pure unit test of the INSERT this function issues,
     # not a live-ClickHouse integration test of schema creation.
-    monkeypatch.setattr(capacity_snapshot, "_assert_or_create_all", lambda target, schemas: None)
+    monkeypatch.setattr(bronze_catalog, "_assert_or_create_all", lambda target, schemas: None)
     capacity_snapshot.record_capacity_snapshot(
         bucket_name="lakehouse-warehouse",
         bytes_=350,
