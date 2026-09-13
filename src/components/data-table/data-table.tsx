@@ -55,8 +55,8 @@ import { getColumnPinningStyle } from "@/lib/data-table";
 import type { GroupSummary } from "@/services/contracts/pagination";
 import { cn } from "@/lib/utils";
 
-/** Clears below the sticky dashboard header (`h-14` = 3.5rem). */
-const STICKY_HEADER_TOP_PX = 56;
+/** Header sticks to top of the table scroll container. */
+const STICKY_HEADER_TOP_PX = 0;
 
 const stickyHeadClass = "bg-background";
 
@@ -157,6 +157,8 @@ interface DataTableProps<TData> extends React.ComponentProps<"div"> {
   groupSummaries?: GroupSummary[] | null;
   /** Infinite scroll state — omit for page-button pagination. */
   infinite?: DataTableInfiniteState;
+  /** Whether to virtualize rows. Defaults to true. */
+  virtualize?: boolean;
   /**
    * Makes each row open its record. Interactive cells (action menus, buttons)
    * have to stop propagation themselves, or they fire this too.
@@ -369,6 +371,7 @@ export function DataTable<TData>({
   actionBar,
   groupSummaries,
   infinite,
+  virtualize: virtualizeProp,
   children,
   className,
   onRowClick,
@@ -503,9 +506,12 @@ export function DataTable<TData>({
 
   const visibleColumnCount = table.getVisibleLeafColumns().length;
   const tableRows = table.getRowModel().rows;
+  const isInfinite =
+    table.options.meta?.paginationMode === "infinite" || Boolean(infinite);
+  const virtualize = virtualizeProp ?? (isInfinite || true);
 
   const virtualItems = React.useMemo(() => {
-    if (!infinite) return [];
+    if (!virtualize) return [];
     return buildVirtualTableRows({
       tableRows,
       groupBy,
@@ -516,8 +522,8 @@ export function DataTable<TData>({
     collapsedGroups,
     groupBy,
     groupSummaries,
-    infinite,
     tableRows,
+    virtualize,
   ]);
 
   // `setScrollMargin` is listed even though `useState` setters are stable:
@@ -535,7 +541,7 @@ export function DataTable<TData>({
   const assignBodyRef = React.useCallback(
     (node: HTMLTableSectionElement | null) => {
       bodyRef.current = node;
-      if (!node || !infinite) return;
+      if (!node || !virtualize) return;
 
       const table = node.closest("table");
       const thead = headerRef.current ?? table?.querySelector("thead");
@@ -543,11 +549,11 @@ export function DataTable<TData>({
 
       setScrollMargin(getDocumentTop(table) + thead.offsetHeight);
     },
-    [infinite, setScrollMargin]
+    [setScrollMargin, virtualize]
   );
 
   React.useLayoutEffect(() => {
-    if (!infinite) {
+    if (!virtualize) {
       setScrollMargin(null);
       return;
     }
@@ -567,13 +573,13 @@ export function DataTable<TData>({
       window.removeEventListener("resize", updateScrollMargin);
       window.removeEventListener("scroll", updateScrollMargin);
     };
-  }, [infinite, updateScrollMargin, virtualItems.length]);
+  }, [updateScrollMargin, virtualItems.length, virtualize]);
 
   const scrollMarginReady = scrollMargin !== null;
   const resolvedScrollMargin = scrollMargin ?? 0;
 
   const rowVirtualizer = useWindowVirtualizer({
-    count: infinite && scrollMarginReady ? virtualItems.length : 0,
+    count: virtualize && scrollMarginReady ? virtualItems.length : 0,
     estimateSize: (index) =>
       estimateVirtualRowHeight(virtualItems[index]),
     scrollMargin: resolvedScrollMargin,
@@ -582,27 +588,27 @@ export function DataTable<TData>({
   });
 
   const virtualRows =
-    infinite && scrollMarginReady ? rowVirtualizer.getVirtualItems() : [];
+    virtualize && scrollMarginReady ? rowVirtualizer.getVirtualItems() : [];
   const virtualPaddingTop =
-    infinite && scrollMarginReady && virtualRows.length > 0
+    virtualize && scrollMarginReady && virtualRows.length > 0
       ? Math.max(
           0,
           virtualRows[0].start - rowVirtualizer.options.scrollMargin
         )
       : 0;
   const virtualPaddingBottom =
-    infinite && scrollMarginReady && virtualRows.length > 0
+    virtualize && scrollMarginReady && virtualRows.length > 0
       ? Math.max(
           0,
           rowVirtualizer.getTotalSize() -
-            virtualRows[virtualRows.length - 1].end
+            (virtualRows.at(-1)?.end ?? 0)
         )
       : 0;
 
   React.useEffect(() => {
     if (!infinite?.hasNextPage || infinite.isFetchingNextPage) return;
 
-    const lastItem = virtualRows[virtualRows.length - 1];
+    const lastItem = virtualRows.at(-1);
     if (lastItem && lastItem.index >= Math.max(0, virtualItems.length - 8)) {
       infinite.onLoadMore();
       return;
@@ -625,9 +631,9 @@ export function DataTable<TData>({
   }, [infinite, virtualItems.length, virtualRows]);
 
   const virtualBodyRows =
-    infinite &&
+    virtualize &&
     scrollMarginReady &&
-    (virtualItems.length > 0 || infinite.hasNextPage) ? (
+    (virtualItems.length > 0 || infinite?.hasNextPage) ? (
       <>
         {virtualPaddingTop > 0 ? (
           <VirtualSpacerRow
@@ -666,7 +672,7 @@ export function DataTable<TData>({
     ) : null;
 
   const bodyRows = React.useMemo(() => {
-    if (infinite) return null;
+    if (virtualize) return null;
     if (!tableRows.length) return null;
 
     const items = buildVirtualTableRows({
@@ -694,7 +700,6 @@ export function DataTable<TData>({
     collapsedGroups,
     groupBy,
     groupSummaries,
-    infinite,
     onRowClick,
     pinnedOffsets,
     renderRowContextMenu,
@@ -702,11 +707,12 @@ export function DataTable<TData>({
     tableRows,
     toggleGroup,
     visibleColumnCount,
+    virtualize,
   ]);
 
   const tableBodyContent =
     virtualBodyRows ??
-    (infinite && !scrollMarginReady ? (
+    (virtualize && !scrollMarginReady ? (
       <TableRow aria-hidden="true" className="border-0 hover:bg-transparent">
         <TableCell
           colSpan={visibleColumnCount}
@@ -738,27 +744,11 @@ export function DataTable<TData>({
         onDragEnd={onDragEnd}
       >
         {/*
-          Deliberately no `overflow-x` wrapper.
-
-          It is tempting — a wide table should scroll in its own box rather
-          than widening the page — but it cannot be done here. An overflow
-          ancestor becomes the containing block for `position: sticky`, so
-          the header's `top: 56px` would resolve against this div instead
-          of the viewport and scroll away with the rows. And
-          `overflow-y: visible` cannot rescue it: per spec the browser
-          forces it to `auto` as soon as `overflow-x` is not `visible`
-          (measured — computed `overflow-y` came back `auto`, header
-          dropped from 107px to 163px).
-
-          Making the header sticky against this box instead (`top: 0`,
-          capped height) does work, but it would move the table off the
-          window scroll that `useWindowVirtualizer` depends on.
-
-          So pages keep the table narrow enough to fit instead: hide the
-          columns that do not earn their width at small sizes. See
-          `columnVisibility` in `data-explorer-page.tsx`.
+          Container has `overflow-x: auto` so wide tables scroll horizontally
+          within their own container rather than blowing out the document scrollWidth
+          and pushing the page behind the fixed sidebar.
         */}
-        <div ref={tableContainerRef} className="min-w-0">
+        <div ref={tableContainerRef} className="w-full min-w-0 max-w-full overflow-x-auto">
           <table
             data-slot="table"
             className="w-full caption-bottom border-separate border-spacing-0 text-sm"
@@ -833,8 +823,22 @@ export function DataTable<TData>({
                 aria-hidden="true"
               />
             )}
-            <DataTableInfiniteFooter infinite={infinite} />
+            <DataTableInfiniteFooter
+              infinite={infinite}
+              selectedCount={table.getFilteredSelectedRowModel().rows.length}
+            />
           </>
+        ) : virtualize ? (
+          <DataTableInfiniteFooter
+            infinite={{
+              onLoadMore: () => {},
+              hasNextPage: false,
+              isFetchingNextPage: false,
+              loadedCount: tableRows.length,
+              totalItems: table.getCoreRowModel().rows.length,
+            }}
+            selectedCount={table.getFilteredSelectedRowModel().rows.length}
+          />
         ) : (
           <DataTablePagination table={table} />
         )}

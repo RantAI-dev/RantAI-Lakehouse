@@ -4,64 +4,27 @@ import * as React from "react"
 import { PlusIcon } from "lucide-react"
 import { CreateSheet } from "@/components/patterns/create-sheet"
 import { PageHeader } from "@/components/patterns/page-header"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
-import {
-  FilterSelect,
-  FilterToolbar,
-  SearchField,
-} from "@/components/patterns/filter-toolbar"
+import { DataTable } from "@/components/data-table/data-table"
+import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
+import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
-import {
-  ClassificationBadge,
-  Pill,
-} from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
+import { filterDataClientSide } from "@/lib/data-table"
 import { withNotify } from "@/lib/notify"
-import { CLASSIFICATION_LABEL, type Classification } from "@/lib/status"
+import { type Classification } from "@/lib/status"
 import { governanceService } from "@/services"
-import type { ResidencyRule } from "@/services/contracts/governance"
-
-const CLASSIFICATION_OPTIONS = (
-  Object.keys(CLASSIFICATION_LABEL) as Classification[]
-).map((c) => ({ value: c, label: CLASSIFICATION_LABEL[c] }))
+import { CLASSIFICATION_OPTIONS, getResidencyColumns } from "./residency-columns"
 
 const selectClassName =
   "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
-const columns: ColumnDef<ResidencyRule>[] = [
-  { key: "tenant", header: "Tenant", render: (r) => r.tenant },
-  { key: "class", header: "Classification", render: (r) => <ClassificationBadge classification={r.classification} /> },
-  { key: "sites", header: "Approved sites", render: (r) => (
-    <div className="flex flex-wrap gap-1">
-      {r.approvedSites.map((s) => (
-        <Pill key={s} tone="neutral">{s}</Pill>
-      ))}
-    </div>
-  )},
-  { key: "cross", header: "Cross-site", render: (r) =>
-    r.crossSiteAllowed ? (
-      <Pill tone="neutral">Cross-site allowed</Pill>
-    ) : (
-      <Pill tone="warning">Single site</Pill>
-    ),
-  },
-  { key: "out", header: "Allowed output", render: (r) => r.allowedOutput },
-  { key: "viol", header: "Violations 7d", render: (r) =>
-    r.violations7d > 0 ? (
-      <span className="font-medium text-destructive">{r.violations7d}</span>
-    ) : (
-      r.violations7d
-    ),
-  },
-]
-
 export function ResidencyPage() {
   const state = useService((s) => governanceService.listResidency(s), [])
-  const [search, setSearch] = React.useState("")
-  const [classification, setClassification] = React.useState("all")
   const [createOpen, setCreateOpen] = React.useState(false)
   const [tenant, setTenant] = React.useState("")
   const [formClassification, setFormClassification] =
@@ -69,6 +32,45 @@ export function ResidencyPage() {
   const [approvedSites, setApprovedSites] = React.useState("")
   const [crossSiteAllowed, setCrossSiteAllowed] = React.useState("no")
   const [allowedOutput, setAllowedOutput] = React.useState("")
+  const tableUrlState = useTableUrlState()
+
+  const columns = React.useMemo(() => getResidencyColumns(), [])
+
+  const filteredData = React.useMemo(() => {
+    if (state.status !== "success" || !state.data) return []
+    return filterDataClientSide(state.data, {
+      search: tableUrlState.search,
+      searchFields: [
+        (r) => r.tenant,
+        (r) => r.classification,
+        (r) => r.approvedSites.join(", "),
+        (r) => r.allowedOutput,
+      ],
+      filters: tableUrlState.filters,
+      joinOperator: tableUrlState.joinOperator,
+    })
+  }, [
+    state.status,
+    state.data,
+    tableUrlState.search,
+    tableUrlState.filters,
+    tableUrlState.joinOperator,
+  ])
+
+  const { table } = useDataTable({
+    data: filteredData,
+    columns,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/governance/residency",
+    initialState: {
+      columnPinning: { right: ["actions"] },
+    },
+  })
+
   const create = useServiceAction(
     withNotify(
       {
@@ -81,16 +83,6 @@ export function ResidencyPage() {
       ) => governanceService.createResidencyRule(input, signal)
     )
   )
-
-  const filtered = React.useMemo(() => {
-    const q = search.trim().toLowerCase()
-    return (state.data ?? []).filter((r) => {
-      if (classification !== "all" && r.classification !== classification)
-        return false
-      if (!q) return true
-      return r.tenant.toLowerCase().includes(q)
-    })
-  }, [state.data, search, classification])
 
   function resetForm() {
     setTenant("")
@@ -131,25 +123,20 @@ export function ResidencyPage() {
           </Button>
         }
       />
-      <FilterToolbar>
-        <SearchField
-          value={search}
-          onChange={setSearch}
-          placeholder="Search tenant..."
-        />
-        <FilterSelect
-          value={classification}
-          onChange={setClassification}
-          options={CLASSIFICATION_OPTIONS}
-          allLabel="All classifications"
-          ariaLabel="Filter by classification"
-        />
-      </FilterToolbar>
+
       {state.status === "loading" ? <LoadingSkeleton /> : null}
-      {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
-      {state.status === "success" ? (
-        <DataTable columns={columns} rows={filtered} rowKey={(r) => r.id} />
+      {state.status === "error" ? (
+        <ErrorState error={state.error} onRetry={state.reload} />
       ) : null}
+      {state.status === "success" ? (
+        <div className="flex flex-col gap-4">
+          <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
+            <DataTableSearch placeholder="Search tenant, sites, classification…" />
+          </DataTableAdvancedToolbar>
+          <DataTable table={table} />
+        </div>
+      ) : null}
+
       <CreateSheet
         open={createOpen}
         onOpenChange={(open) => {
@@ -183,7 +170,9 @@ export function ResidencyPage() {
             }
           >
             {CLASSIFICATION_OPTIONS.map((o) => (
-              <option key={o.value} value={o.value}>{o.label}</option>
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
             ))}
           </select>
         </div>
@@ -221,3 +210,4 @@ export function ResidencyPage() {
     </div>
   )
 }
+

@@ -3,15 +3,13 @@
 import * as React from "react"
 import Link from "next/link"
 import { PlusIcon } from "lucide-react"
+import { DataTable } from "@/components/data-table/data-table"
+import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
+import { DataTableFacetedFilter } from "@/components/data-table/data-table-faceted-filter"
+import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { PageHeader } from "@/components/patterns/page-header"
 import { Button } from "@/components/ui/button"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
-import {
-  FilterSelect,
-  FilterToolbar,
-  SearchField,
-} from "@/components/patterns/filter-toolbar"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import {
   EmptyState,
@@ -19,13 +17,15 @@ import {
   LoadingSkeleton,
 } from "@/components/patterns/page-states"
 import { Pill, StatusBadge } from "@/components/patterns/status-badge"
+import { useDataTable } from "@/hooks/use-data-table"
 import { useService } from "@/hooks/use-service"
 import { formatRelativeTime } from "@/lib/format"
 import { ENTITY_STATUS_LABEL } from "@/lib/status"
 import { agentService } from "@/services"
 import type { AgentWorkflow } from "@/services/contracts/agents"
+import { getWorkflowColumns } from "./workflow-columns"
 
-function ApprovalGatePill({ required }: { required: boolean }) {
+function ApprovalGatePill({ required }: { readonly required: boolean }) {
   return required ? (
     <Pill tone="warning">Approval gate</Pill>
   ) : (
@@ -33,35 +33,33 @@ function ApprovalGatePill({ required }: { required: boolean }) {
   )
 }
 
-const columns: ColumnDef<AgentWorkflow>[] = [
-  { key: "name", header: "Workflow", render: (r) => r.name },
-  { key: "status", header: "Status", render: (r) => <StatusBadge status={r.status} /> },
-  { key: "trigger", header: "Trigger", render: (r) => r.trigger },
-  { key: "steps", header: "Steps", render: (r) => r.steps },
-  { key: "approval", header: "Approval", render: (r) => <ApprovalGatePill required={r.approvalRequired} /> },
-  { key: "last", header: "Last run", render: (r) => formatRelativeTime(r.lastRunAt) },
-  { key: "owner", header: "Owner", render: (r) => r.owner },
-]
-
 export function WorkflowsPage() {
   const state = useService((s) => agentService.listWorkflows(s), [])
-  const [search, setSearch] = React.useState("")
-  const [status, setStatus] = React.useState("all")
   const [selected, setSelected] = React.useState<AgentWorkflow | null>(null)
+
+  const columns = React.useMemo(
+    () => getWorkflowColumns({ onSelect: setSelected }),
+    []
+  )
+
+  const data = state.data ?? []
+
+  const { table } = useDataTable({
+    data,
+    columns,
+    pageCount: 1,
+    initialState: {
+      columnPinning: { right: ["actions"] },
+    },
+    getRowId: (originalRow) => originalRow.id,
+    shallow: false,
+    clearOnDefault: true,
+  })
 
   const statusOptions = React.useMemo(() => {
     const present = new Set(state.data?.map((r) => r.status) ?? [])
     return [...present].map((s) => ({ value: s, label: ENTITY_STATUS_LABEL[s] }))
   }, [state.data])
-
-  const filtered = React.useMemo(() => {
-    const q = search.trim().toLowerCase()
-    return (state.data ?? []).filter((r) => {
-      if (status !== "all" && r.status !== status) return false
-      if (!q) return true
-      return [r.name, r.owner, r.trigger].some((v) => v.toLowerCase().includes(q))
-    })
-  }, [state.data, search, status])
 
   return (
     <div className="flex flex-col gap-4">
@@ -75,20 +73,6 @@ export function WorkflowsPage() {
           </Button>
         }
       />
-      <FilterToolbar>
-        <SearchField
-          value={search}
-          onChange={setSearch}
-          placeholder="Search name, owner, trigger..."
-        />
-        <FilterSelect
-          value={status}
-          onChange={setStatus}
-          options={statusOptions}
-          allLabel="All statuses"
-          ariaLabel="Filter by status"
-        />
-      </FilterToolbar>
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
       {state.status === "success" && (state.data?.length ?? 0) === 0 ? (
@@ -104,10 +88,23 @@ export function WorkflowsPage() {
       ) : null}
       {state.status === "success" && (state.data?.length ?? 0) > 0 ? (
         <DataTable
-          columns={columns}
-          rows={filtered}
-          rowKey={(r) => r.id}
-          onRowClick={setSelected}
+          table={table}
+          renderToolbar={() => (
+            <DataTableAdvancedToolbar table={table}>
+              <DataTableSearch
+                table={table}
+                placeholder="Search workflows..."
+                className="w-full sm:w-64"
+              />
+              {table.getColumn("status") && (
+                <DataTableFacetedFilter
+                  column={table.getColumn("status")}
+                  title="Status"
+                  options={statusOptions}
+                />
+              )}
+            </DataTableAdvancedToolbar>
+          )}
         />
       ) : null}
       <DetailDrawer

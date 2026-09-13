@@ -3,9 +3,7 @@
 import { useMemo, useState } from "react"
 import Link from "next/link"
 import { PageHeader } from "@/components/patterns/page-header"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
-import { FilterToolbar, SearchField } from "@/components/patterns/filter-toolbar"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
@@ -13,54 +11,60 @@ import { useService } from "@/hooks/use-service"
 import { assetService } from "@/services"
 import type { CatalogNamespace } from "@/services/contracts/assets"
 
-const columns: ColumnDef<CatalogNamespace>[] = [
-  {
-    key: "name",
-    header: "Namespace",
-    render: (r) => <span className="font-mono text-sm">{r.name}</span>,
-    sortValue: (r) => r.name,
-  },
-  { key: "desc", header: "Description", render: (r) => r.description },
-  {
-    key: "assets",
-    header: "Assets",
-    render: (r) => r.assetCount,
-    sortValue: (r) => r.assetCount,
-  },
-  {
-    key: "owner",
-    header: "Owner",
-    render: (r) => r.owner,
-    sortValue: (r) => r.owner,
-  },
-  {
-    key: "engine",
-    header: "Source engine",
-    render: (r) => r.sourceEngine,
-    sortValue: (r) => r.sourceEngine,
-  },
-  {
-    key: "res",
-    header: "Residency",
-    render: (r) => r.residency,
-    sortValue: (r) => r.residency,
-  },
-]
+import { DataTable } from "@/components/data-table/data-table"
+import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
+import { DataTableSearch } from "@/components/data-table/data-table-search"
+import { useDataTable } from "@/hooks/use-data-table"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
+import { filterDataClientSide } from "@/lib/data-table"
+import { getCatalogNamespaceColumns } from "./catalog-namespace-columns"
 
 /** Unified catalog namespaces with ownership and residency metadata. */
 export function CatalogPage() {
   const state = useService((s) => assetService.listNamespaces(s), [])
-  const [search, setSearch] = useState("")
   const [selected, setSelected] = useState<CatalogNamespace | null>(null)
+  const tableUrlState = useTableUrlState()
 
-  const rows = useMemo(() => {
-    if (state.status !== "success") return []
-    const q = search.trim().toLowerCase()
-    if (!q) return state.data
-    return state.data.filter((ns) =>
-      `${ns.name} ${ns.owner} ${ns.description}`.toLowerCase().includes(q)
-    )
-  }, [state.status, state.data, search])
+  const columns = useMemo(
+    () => getCatalogNamespaceColumns({ onSelect: setSelected }),
+    []
+  )
+
+  const filteredData = useMemo(() => {
+    if (state.status !== "success" || !state.data) return []
+    return filterDataClientSide(state.data, {
+      search: tableUrlState.search,
+      searchFields: [
+        (ns) => ns.name,
+        (ns) => ns.owner,
+        (ns) => ns.description,
+        (ns) => ns.sourceEngine,
+        (ns) => ns.residency,
+      ],
+      filters: tableUrlState.filters,
+      joinOperator: tableUrlState.joinOperator,
+    })
+  }, [
+    state.status,
+    state.data,
+    tableUrlState.search,
+    tableUrlState.filters,
+    tableUrlState.joinOperator,
+  ])
+
+  const { table } = useDataTable({
+    data: filteredData,
+    columns,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/catalog",
+    initialState: {
+      columnPinning: { right: ["actions"] },
+    },
+  })
 
   return (
     <div className="flex flex-col gap-4">
@@ -68,25 +72,18 @@ export function CatalogPage() {
         title="Catalog"
         description="Namespaces, ownership, residency, and source-engine metadata for governed discovery."
       />
-      <FilterToolbar>
-        <SearchField
-          value={search}
-          onChange={setSearch}
-          placeholder="Search namespaces..."
-        />
-      </FilterToolbar>
+
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? (
         <ErrorState error={state.error} onRetry={state.reload} />
       ) : null}
       {state.status === "success" ? (
-        <DataTable
-          columns={columns}
-          rows={rows}
-          rowKey={(r) => r.id}
-          onRowClick={setSelected}
-          pageSize={25}
-        />
+        <div className="flex flex-col gap-4">
+          <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
+            <DataTableSearch placeholder="Search namespaces…" />
+          </DataTableAdvancedToolbar>
+          <DataTable table={table} onRowClick={setSelected} />
+        </div>
       ) : null}
 
       <DetailDrawer

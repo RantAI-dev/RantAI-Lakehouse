@@ -3,99 +3,52 @@
 import { useMemo, useState } from "react"
 import Link from "next/link"
 import { PlusIcon } from "lucide-react"
-import { PageHeader } from "@/components/patterns/page-header"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
+import { DataTable } from "@/components/data-table/data-table"
+import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
+import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
-import {
-  FilterSelect,
-  FilterToolbar,
-  SearchField,
-} from "@/components/patterns/filter-toolbar"
 import { MetadataList } from "@/components/patterns/metadata-list"
+import { PageHeader } from "@/components/patterns/page-header"
 import {
   EmptyState,
   ErrorState,
   LoadingSkeleton,
 } from "@/components/patterns/page-states"
 import { HealthBadge, Pill } from "@/components/patterns/status-badge"
-import { withNotify } from "@/lib/notify"
 import { Button } from "@/components/ui/button"
+import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatRelativeTime } from "@/lib/format"
+import { withNotify } from "@/lib/notify"
 import { HEALTH_LABEL, type Health } from "@/lib/status"
 import { connectorService } from "@/services"
 import type { Connector } from "@/services/contracts/connectors"
+import type { DataTableFilterField } from "@/types/data-table"
+import { DIRECTION_LABEL, getConnectorColumns } from "./connectors-columns"
 
 type Direction = Connector["direction"]
 
-const DIRECTION_LABEL: Record<Direction, string> = {
-  source: "Source",
-  sink: "Sink",
-  bidirectional: "Bidirectional",
-}
-
-const columns: ColumnDef<Connector>[] = [
+const filterFields: DataTableFilterField<Connector>[] = [
   {
-    key: "name",
-    header: "Connector",
-    render: (r) => (
-      <div>
-        <p className="font-medium">{r.name}</p>
-        <p className="text-xs text-muted-foreground">{r.type}</p>
-      </div>
-    ),
-    sortValue: (r) => r.name,
+    id: "direction",
+    label: "Direction",
+    options: (Object.keys(DIRECTION_LABEL) as Direction[]).map((d) => ({
+      value: d,
+      label: DIRECTION_LABEL[d],
+    })),
   },
   {
-    key: "dir",
-    header: "Direction",
-    render: (r) => DIRECTION_LABEL[r.direction],
-    sortValue: (r) => DIRECTION_LABEL[r.direction],
-  },
-  {
-    key: "health",
-    header: "Health",
-    render: (r) => <HealthBadge health={r.health} />,
-    sortValue: (r) => r.health,
-  },
-  {
-    key: "env",
-    header: "Environment",
-    render: (r) => r.environment,
-    sortValue: (r) => r.environment,
-  },
-  {
-    key: "tenant",
-    header: "Tenant",
-    render: (r) => r.tenant,
-    sortValue: (r) => r.tenant,
-  },
-  {
-    key: "test",
-    header: "Last test",
-    render: (r) => (
-      <span className="text-muted-foreground">
-        {formatRelativeTime(r.lastTestAt)}
-      </span>
-    ),
-    // Urutkan pakai timestamp mentah, bukan teks "2 hours ago" yang
-    // diformat — teks relatif tidak terurut secara kronologis.
-    sortValue: (r) => r.lastTestAt,
-  },
-  {
-    key: "activity",
-    header: "Last activity",
-    render: (r) => (
-      <span className="text-muted-foreground">
-        {formatRelativeTime(r.lastActivityAt)}
-      </span>
-    ),
-    sortValue: (r) => r.lastActivityAt,
+    id: "health",
+    label: "Health",
+    options: (Object.keys(HEALTH_LABEL) as Health[]).map((h) => ({
+      value: h,
+      label: HEALTH_LABEL[h],
+    })),
   },
 ]
 
 /** Drawer body — fetches full connector detail for the selected row. */
-function ConnectorDetail({ id }: { id: string }) {
+function ConnectorDetail({ id }: { readonly id: string }) {
   const state = useService((s) => connectorService.getConnector(id, s), [id])
   const testAction = useServiceAction(
     withNotify(
@@ -252,24 +205,26 @@ function ConnectorDetail({ id }: { id: string }) {
 
 export function ConnectorsPage() {
   const state = useService((s) => connectorService.listConnectors(s), [])
-  const [search, setSearch] = useState("")
-  const [direction, setDirection] = useState<Direction | "all">("all")
-  const [health, setHealth] = useState<Health | "all">("all")
   const [selected, setSelected] = useState<Connector | null>(null)
 
-  const rows = useMemo(() => {
-    if (state.status !== "success") return []
-    const q = search.trim().toLowerCase()
-    return state.data.filter((c) => {
-      if (direction !== "all" && c.direction !== direction) return false
-      if (health !== "all" && c.health !== health) return false
-      if (q) {
-        const hay = `${c.name} ${c.type} ${c.tenant} ${c.owner}`.toLowerCase()
-        if (!hay.includes(q)) return false
-      }
-      return true
-    })
-  }, [state.status, state.data, search, direction, health])
+  const columns = useMemo(
+    () => getConnectorColumns({ onSelect: setSelected }),
+    []
+  )
+
+  const { table } = useDataTable({
+    data: state.data ?? [],
+    columns,
+    pageCount: 1,
+    filterFields,
+    enableRowSelection: false,
+    initialState: {
+      columnPinning: { right: ["actions"] },
+    },
+    getRowId: (row) => row.id,
+    shallow: false,
+    clearOnDefault: true,
+  })
 
   return (
     <div className="flex flex-col gap-4">
@@ -283,33 +238,6 @@ export function ConnectorsPage() {
           </Button>
         }
       />
-      <FilterToolbar>
-        <SearchField
-          value={search}
-          onChange={setSearch}
-          placeholder="Search connectors..."
-        />
-        <FilterSelect
-          ariaLabel="Filter by direction"
-          allLabel="All directions"
-          value={direction}
-          onChange={(v) => setDirection(v as Direction | "all")}
-          options={Object.entries(DIRECTION_LABEL).map(([value, label]) => ({
-            value,
-            label,
-          }))}
-        />
-        <FilterSelect
-          ariaLabel="Filter by health"
-          allLabel="All health"
-          value={health}
-          onChange={(v) => setHealth(v as Health | "all")}
-          options={Object.entries(HEALTH_LABEL).map(([value, label]) => ({
-            value,
-            label,
-          }))}
-        />
-      </FilterToolbar>
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? (
         <ErrorState error={state.error} onRetry={state.reload} />
@@ -326,18 +254,33 @@ export function ConnectorsPage() {
         />
       ) : null}
       {state.status === "success" && (state.data?.length ?? 0) > 0 ? (
-        <DataTable
-          columns={columns}
-          rows={rows}
-          rowKey={(r) => r.id}
-          onRowClick={setSelected}
-          pageSize={25}
-        />
+        <div className="space-y-4">
+          <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
+            <DataTableSearch
+              table={table}
+              placeholder="Search connectors..."
+              className="h-8 w-40 lg:w-64"
+            />
+          </DataTableAdvancedToolbar>
+          <div className="rounded-md border">
+            <DataTable table={table} />
+          </div>
+        </div>
       ) : null}
 
       <DetailDrawer
         open={selected !== null}
         onOpenChange={(open) => {
+          if (!open) setSelected(null)
+        }}
+        title={selected?.name ?? ""}
+        description={selected?.type}
+      >
+        {selected ? <ConnectorDetail id={selected.id} /> : null}
+      </DetailDrawer>
+    </div>
+  )
+}
           if (!open) setSelected(null)
         }}
         title={selected?.name ?? ""}

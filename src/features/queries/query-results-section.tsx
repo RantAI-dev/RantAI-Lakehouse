@@ -2,21 +2,27 @@
 
 import * as React from "react"
 import Link from "next/link"
+import type { ColumnDef } from "@tanstack/react-table"
 import { Download } from "lucide-react"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
+import { DataTable } from "@/components/data-table/data-table"
+import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { Pill } from "@/components/patterns/status-badge"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Button } from "@/components/ui/button"
+import { useDataTable } from "@/hooks/use-data-table"
 import { downloadCsv, toCsv } from "@/lib/csv"
 import { formatBytes, formatCost, formatDuration } from "@/lib/format"
 import { ENGINE_CATEGORY_LABEL, WORKLOAD_CLASS_LABEL } from "@/lib/status"
 import type { QueryResult } from "@/services/contracts/queries"
 import { QueryPlanPanel } from "./query-transparency-panel"
 
-type ResultRow = { key: string; cells: Record<string, string> }
+interface PillListProps {
+  readonly values: readonly string[]
+}
 
-function PillList({ values }: { values: string[] }) {
+function PillList(props: PillListProps) {
+  const { values } = props
   if (values.length === 0) return <span className="text-muted-foreground">None</span>
   return (
     <span className="flex flex-wrap gap-1">
@@ -29,23 +35,45 @@ function PillList({ values }: { values: string[] }) {
   )
 }
 
+function buildQueryResultColumns(
+  columnNames: readonly string[]
+): ColumnDef<Record<string, string>>[] {
+  return columnNames.map((colName) => ({
+    id: colName,
+    accessorFn: (row) => row[colName] ?? "",
+    header: ({ column }) => (
+      <DataTableColumnHeader column={column} label={colName} />
+    ),
+    cell: ({ getValue }) => {
+      const val = getValue()
+      return (
+        <span className="font-mono text-xs">
+          {typeof val === "string" ? val : JSON.stringify(val ?? "")}
+        </span>
+      )
+    },
+    enableSorting: true,
+  }))
+}
+
+interface QueryResultsSectionProps {
+  readonly result: QueryResult
+}
+
 /** Query result rows plus the actual execution metrics beneath them. */
-export function QueryResultsSection({ result }: { result: QueryResult }) {
-  const columns = React.useMemo<ColumnDef<ResultRow>[]>(
-    () =>
-      result.columns.map((c) => ({
-        key: c,
-        header: c,
-        render: (row) => (
-          <span className="font-mono text-xs">{row.cells[c]}</span>
-        ),
-      })),
+export function QueryResultsSection(props: QueryResultsSectionProps) {
+  const { result } = props
+  const columns = React.useMemo(
+    () => buildQueryResultColumns(result.columns),
     [result.columns]
   )
-  const rows = React.useMemo<ResultRow[]>(
-    () => result.rows.map((cells, i) => ({ key: String(i), cells })),
-    [result.rows]
-  )
+
+  const { table } = useDataTable({
+    data: result.rows,
+    columns,
+    pageCount: 1,
+    getRowId: (_row, index) => String(index),
+  })
 
   return (
     <SectionCard
@@ -56,7 +84,7 @@ export function QueryResultsSection({ result }: { result: QueryResult }) {
           <Button
             size="sm"
             variant="outline"
-            disabled={rows.length === 0}
+            disabled={result.rows.length === 0}
             onClick={() =>
               downloadCsv(
                 `query-results-${new Date().toISOString().slice(0, 10)}.csv`,
@@ -79,12 +107,24 @@ export function QueryResultsSection({ result }: { result: QueryResult }) {
         </div>
       }
     >
-      <DataTable
-        columns={columns}
-        rows={rows}
-        rowKey={(r) => r.key}
-        emptyMessage="The query returned no rows."
-      />
+      {result.rows.length === 0 ? (
+        <p className="py-4 text-center text-sm text-muted-foreground">
+          The query returned no rows.
+        </p>
+      ) : (
+        <div className="rounded-md border">
+          <DataTable
+            table={table}
+            infinite={{
+              onLoadMore: () => {},
+              hasNextPage: false,
+              isFetchingNextPage: false,
+              totalItems: result.rows.length,
+              loadedCount: result.rows.length,
+            }}
+          />
+        </div>
+      )}
       <MetadataList
         columns={3}
         items={[

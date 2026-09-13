@@ -13,11 +13,13 @@ export interface DataTableInfiniteState {
 
 interface DataTableInfiniteFooterProps extends React.ComponentProps<"div"> {
   infinite: DataTableInfiniteState;
+  selectedCount?: number;
 }
 
 /** Footer for infinite tables — row count, plus a spinner while the next chunk loads. */
 export function DataTableInfiniteFooter({
   infinite,
+  selectedCount = 0,
   className,
   ...props
 }: DataTableInfiniteFooterProps) {
@@ -41,11 +43,13 @@ export function DataTableInfiniteFooter({
         <span>
           Showing {loadedCount.toLocaleString()} of {totalItems.toLocaleString()}
           {!hasNextPage && loadedCount > 0 ? " · End of list" : null}
+          {selectedCount > 0 ? ` · ${selectedCount.toLocaleString()} selected` : null}
         </span>
       ) : null}
       {isFetchingNextPage && showCount ? (
         <span className="text-muted-foreground/80">
           · {loadedCount.toLocaleString()} of {totalItems.toLocaleString()}
+          {selectedCount > 0 ? ` · ${selectedCount.toLocaleString()} selected` : null}
         </span>
       ) : null}
     </div>

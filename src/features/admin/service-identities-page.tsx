@@ -2,77 +2,33 @@
 
 import * as React from "react"
 import { PlusIcon } from "lucide-react"
+import { DataTable } from "@/components/data-table/data-table"
+import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
+import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { CreateSheet } from "@/components/patterns/create-sheet"
 import { PageHeader } from "@/components/patterns/page-header"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
-import {
-  FilterSelect,
-  FilterToolbar,
-  SearchField,
-} from "@/components/patterns/filter-toolbar"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
-import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { useAuth } from "@/features/auth/auth-provider"
+import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
-import { formatRelativeTime } from "@/lib/format"
 import { identityService } from "@/services"
 import type { ServiceIdentity } from "@/services/contracts/identity"
-import { useAuth } from "@/features/auth/auth-provider"
+import type { DataTableFilterField } from "@/types/data-table"
+import { getServiceIdentityColumns } from "./service-identities-columns"
 
-const ROTATION_OPTIONS = [
-  { value: "current", label: "Current" },
-  { value: "due", label: "Rotation due" },
-  { value: "expired", label: "Expired" },
-]
-
-function RotationPill({
-  status,
-}: {
-  status: ServiceIdentity["rotationStatus"]
-}) {
-  switch (status) {
-    case "current":
-      return <Pill tone="success">Current</Pill>
-    case "due":
-      return <Pill tone="warning">Rotation due</Pill>
-    case "expired":
-      return <Pill tone="destructive">Expired</Pill>
-  }
-}
-
-const columns: ColumnDef<ServiceIdentity>[] = [
-  { key: "name", header: "Identity", render: (r) => r.name },
+const filterFields: DataTableFilterField<ServiceIdentity>[] = [
   {
-    key: "scopes",
-    header: "Scopes",
-    render: (r) => (
-      <div className="flex flex-wrap gap-1">
-        {r.scopes.map((scope) => (
-          <Pill key={scope} tone="neutral" className="font-mono">
-            {scope}
-          </Pill>
-        ))}
-      </div>
-    ),
-  },
-  { key: "env", header: "Environment", render: (r) => r.environment },
-  {
-    key: "rot",
-    header: "Rotation",
-    render: (r) => <RotationPill status={r.rotationStatus} />,
-  },
-  {
-    key: "exp",
-    header: "Expires",
-    render: (r) => formatRelativeTime(r.expiresAt),
-  },
-  {
-    key: "used",
-    header: "Last used",
-    render: (r) => formatRelativeTime(r.lastUsedAt),
+    id: "rotationStatus",
+    label: "Rotation",
+    options: [
+      { value: "current", label: "Current" },
+      { value: "due", label: "Rotation due" },
+      { value: "expired", label: "Expired" },
+    ],
   },
 ]
 
@@ -80,8 +36,6 @@ export function ServiceIdentitiesPage() {
   const { hasPermission } = useAuth()
   const canWrite = hasPermission("identity:write")
   const state = useService((s) => identityService.listServiceIdentities(s), [])
-  const [search, setSearch] = React.useState("")
-  const [rotation, setRotation] = React.useState("all")
   const [createOpen, setCreateOpen] = React.useState(false)
   const [name, setName] = React.useState("")
   const [scopes, setScopes] = React.useState("")
@@ -99,17 +53,21 @@ export function ServiceIdentitiesPage() {
     )
   )
 
-  const filtered = React.useMemo(() => {
-    const q = search.trim().toLowerCase()
-    return (state.data ?? []).filter((si) => {
-      if (rotation !== "all" && si.rotationStatus !== rotation) return false
-      if (!q) return true
-      return (
-        si.name.toLowerCase().includes(q) ||
-        si.scopes.some((scope) => scope.toLowerCase().includes(q))
-      )
-    })
-  }, [state.data, search, rotation])
+  const columns = React.useMemo(() => getServiceIdentityColumns(), [])
+
+  const { table } = useDataTable({
+    data: state.data ?? [],
+    columns,
+    pageCount: 1,
+    filterFields,
+    enableRowSelection: false,
+    initialState: {
+      columnPinning: { right: ["actions"] },
+    },
+    getRowId: (row) => row.id,
+    shallow: false,
+    clearOnDefault: true,
+  })
 
   function resetForm() {
     setName("")
@@ -118,6 +76,94 @@ export function ServiceIdentitiesPage() {
   }
 
   async function handleCreate() {
+    const result = await create.run({
+      name: name.trim(),
+      scopes: scopes
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+      environment: environment.trim(),
+    })
+    if (result) {
+      setCreateOpen(false)
+      resetForm()
+      state.reload()
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <PageHeader
+        title="Service Identities"
+        description="Non-human identity, mTLS certs, scoped tokens, and rotation posture."
+        actions={
+          <Button
+            size="sm"
+            onClick={() => setCreateOpen(true)}
+            disabled={!canWrite}
+            title={canWrite ? undefined : "You don't have permission to create service identities."}
+          >
+            <PlusIcon data-icon="inline-start" />
+            Create Service Identity
+          </Button>
+        }
+      />
+      {state.status === "loading" ? <LoadingSkeleton /> : null}
+      {state.status === "error" ? (
+        <ErrorState error={state.error} onRetry={state.reload} />
+      ) : null}
+      {state.status === "success" ? (
+        <div className="space-y-4">
+          <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
+            <DataTableSearch
+              table={table}
+              placeholder="Search identity, scopes..."
+              className="h-8 w-40 lg:w-64"
+            />
+          </DataTableAdvancedToolbar>
+          <div className="rounded-md border">
+            <DataTable table={table} />
+          </div>
+        </div>
+      ) : null}
+      <CreateSheet
+        open={createOpen}
+        onOpenChange={(open) => {
+          setCreateOpen(open)
+          if (!open) resetForm()
+        }}
+        title="Create Service Identity"
+        description="Issue a new non-human service identity."
+        canSubmit={Boolean(name.trim() && scopes.trim() && environment.trim())}
+        submitting={create.status === "pending"}
+        onSubmit={handleCreate}
+      >
+        <div className="space-y-1.5">
+          <Label htmlFor="si-name">Name</Label>
+          <Input id="si-name" value={name} onChange={(e) => setName(e.target.value)} />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="si-scopes">Scopes (comma-separated)</Label>
+          <Input
+            id="si-scopes"
+            value={scopes}
+            onChange={(e) => setScopes(e.target.value)}
+            placeholder="query:read, storage:write"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="si-env">Environment</Label>
+          <Input
+            id="si-env"
+            value={environment}
+            onChange={(e) => setEnvironment(e.target.value)}
+            placeholder="production"
+          />
+        </div>
+      </CreateSheet>
+    </div>
+  )
+}
     const result = await create.run({
       name: name.trim(),
       scopes: scopes

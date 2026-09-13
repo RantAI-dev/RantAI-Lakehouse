@@ -4,8 +4,8 @@ import * as React from "react"
 import Link from "next/link"
 import { useParams } from "next/navigation"
 import { PauseIcon, PlayIcon, RotateCcwIcon, SquareIcon } from "lucide-react"
+import { DataTable } from "@/components/data-table/data-table"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
 import { FlowCanvas } from "@/components/patterns/flow-canvas"
 import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
@@ -20,50 +20,20 @@ import { SectionCard } from "@/components/patterns/section-card"
 import { StatusBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import {
   formatCompactNumber,
   formatCost,
   formatDateTime,
-  formatDuration,
   formatRelativeTime,
 } from "@/lib/format"
 import { pipelineService } from "@/services"
 import type { PipelineRun } from "@/services/contracts/pipelines"
+import { getPipelineRunColumns, runDuration } from "./pipeline-run-columns"
 
-function runDuration(run: PipelineRun): string {
-  if (!run.endedAt) return "running"
-  return formatDuration(
-    new Date(run.endedAt).getTime() - new Date(run.startedAt).getTime()
-  )
-}
-
-const runColumns: ColumnDef<PipelineRun>[] = [
-  { key: "status", header: "Status", render: (r) => <StatusBadge status={r.status} /> },
-  { key: "started", header: "Started", render: (r) => formatRelativeTime(r.startedAt) },
-  { key: "duration", header: "Duration", render: (r) => runDuration(r) },
-  { key: "processed", header: "Processed", render: (r) => formatCompactNumber(r.processed) },
-  { key: "accepted", header: "Accepted", render: (r) => formatCompactNumber(r.accepted) },
-  { key: "rejected", header: "Rejected", render: (r) => (
-    <span className={r.rejected > 0 ? "text-destructive" : undefined}>
-      {formatCompactNumber(r.rejected)}
-    </span>
-  )},
-  { key: "retried", header: "Retried", render: (r) => formatCompactNumber(r.retried) },
-  { key: "cost", header: "Cost", render: (r) => formatCost(r.costUnits) },
-  { key: "error", header: "Error", render: (r) =>
-    r.error ? (
-      <span className="block max-w-52 truncate text-destructive" title={r.error}>
-        {r.error}
-      </span>
-    ) : (
-      "—"
-    ),
-  },
-]
-
-function AssetLink({ id, label }: { id?: string; label: string }) {
+function AssetLink({ id, label }: { readonly id?: string; readonly label: string }) {
   if (!id) return <span className="font-mono text-xs">{label}</span>
   return (
     <Link
@@ -75,14 +45,128 @@ function AssetLink({ id, label }: { id?: string; label: string }) {
   )
 }
 
+function RunDrawerActions({
+  run,
+  onCancel,
+  onRetry,
+  retrying,
+}: {
+  readonly run: PipelineRun
+  readonly onCancel: () => void
+  readonly onRetry: () => void
+  readonly retrying: boolean
+}) {
+  const isRunning = run.status === "running"
+  const canRetry = run.status === "failed" || run.status === "cancelled"
+
+  return (
+    <div className="flex flex-wrap gap-2">
+      {isRunning ? (
+        <Button size="sm" variant="outline" onClick={onCancel}>
+          <SquareIcon data-icon="inline-start" />
+          Cancel run
+        </Button>
+      ) : null}
+      {canRetry ? (
+        <Button size="sm" disabled={retrying} onClick={onRetry}>
+          <RotateCcwIcon data-icon="inline-start" />
+          {retrying ? "Retrying…" : "Retry run"}
+        </Button>
+      ) : null}
+      {run.outputAssetId ? (
+        <Button
+          size="sm"
+          variant="ghost"
+          render={<Link href={`/data/assets/${run.outputAssetId}`} />}
+        >
+          Output dataset
+        </Button>
+      ) : null}
+      <Button
+        size="sm"
+        variant="ghost"
+        render={<Link href={`/lineage?focus=${run.pipelineId}`} />}
+      >
+        Lineage
+      </Button>
+      {run.auditEventId ? (
+        <Button
+          size="sm"
+          variant="ghost"
+          render={<Link href={`/audit?event=${run.auditEventId}`} />}
+        >
+          Audit
+        </Button>
+      ) : null}
+    </div>
+  )
+}
+
+function RunDrawerContent({
+  run,
+  onCancel,
+  onRetry,
+  retrying,
+}: {
+  readonly run: PipelineRun
+  readonly onCancel: () => void
+  readonly onRetry: () => void
+  readonly retrying: boolean
+}) {
+  const metadataItems = [
+    { label: "Status", value: <StatusBadge status={run.status} /> },
+    { label: "Started", value: formatDateTime(run.startedAt) },
+    {
+      label: "Ended",
+      value: run.endedAt ? formatDateTime(run.endedAt) : "running",
+    },
+    { label: "Duration", value: runDuration(run) },
+    { label: "Processed", value: formatCompactNumber(run.processed) },
+    { label: "Accepted", value: formatCompactNumber(run.accepted) },
+    { label: "Rejected", value: formatCompactNumber(run.rejected) },
+    { label: "Retried", value: formatCompactNumber(run.retried) },
+    { label: "Cost", value: formatCost(run.costUnits) },
+    {
+      label: "Checkpoint",
+      value: run.checkpoint ? (
+        <span className="font-mono text-xs">{run.checkpoint}</span>
+      ) : (
+        "—"
+      ),
+    },
+    {
+      label: "Pipeline",
+      value: <span className="font-mono text-xs">{run.pipelineId}</span>,
+    },
+  ]
+
+  return (
+    <>
+      <RunDrawerActions
+        run={run}
+        onCancel={onCancel}
+        onRetry={onRetry}
+        retrying={retrying}
+      />
+      <MetadataList items={metadataItems} />
+      {run.error ? (
+        <div>
+          <p className="text-xs font-medium text-muted-foreground">Error</p>
+          <p className="mt-1 text-sm text-destructive">{run.error}</p>
+        </div>
+      ) : null}
+    </>
+  )
+}
+
 function RunDrawer({
   run,
   onClose,
   onChanged,
 }: {
-  run: PipelineRun | null
-  onClose: () => void
-  onChanged: () => void
+  readonly run: PipelineRun | null
+  readonly onClose: () => void
+  readonly onChanged: () => void
 }) {
   const cancelAction = useServiceAction(
     withNotify(
@@ -98,6 +182,25 @@ function RunDrawer({
   )
   const [cancelOpen, setCancelOpen] = React.useState(false)
 
+  const handleRetry = async () => {
+    if (!run) return
+    const next = await retryAction.run(run.id)
+    if (next) {
+      onChanged()
+      onClose()
+    }
+  }
+
+  const handleConfirmCancel = async () => {
+    if (!run) return
+    const updated = await cancelAction.run(run.id)
+    if (updated) {
+      setCancelOpen(false)
+      onChanged()
+      onClose()
+    }
+  }
+
   return (
     <>
       <DetailDrawer
@@ -109,91 +212,12 @@ function RunDrawer({
         description={run ? `Run ${run.id}` : undefined}
       >
         {run ? (
-          <>
-            <div className="flex flex-wrap gap-2">
-              {run.status === "running" ? (
-                <Button size="sm" variant="outline" onClick={() => setCancelOpen(true)}>
-                  <SquareIcon data-icon="inline-start" />
-                  Cancel run
-                </Button>
-              ) : null}
-              {run.status === "failed" || run.status === "cancelled" ? (
-                <Button
-                  size="sm"
-                  disabled={retryAction.status === "pending"}
-                  onClick={async () => {
-                    const next = await retryAction.run(run.id)
-                    if (next) {
-                      onChanged()
-                      onClose()
-                    }
-                  }}
-                >
-                  <RotateCcwIcon data-icon="inline-start" />
-                  {retryAction.status === "pending" ? "Retrying…" : "Retry run"}
-                </Button>
-              ) : null}
-              {run.outputAssetId ? (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  render={<Link href={`/data/assets/${run.outputAssetId}`} />}
-                >
-                  Output dataset
-                </Button>
-              ) : null}
-              <Button
-                size="sm"
-                variant="ghost"
-                render={<Link href={`/lineage?focus=${run.pipelineId}`} />}
-              >
-                Lineage
-              </Button>
-              {run.auditEventId ? (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  render={<Link href={`/audit?event=${run.auditEventId}`} />}
-                >
-                  Audit
-                </Button>
-              ) : null}
-            </div>
-            <MetadataList
-              items={[
-                { label: "Status", value: <StatusBadge status={run.status} /> },
-                { label: "Started", value: formatDateTime(run.startedAt) },
-                {
-                  label: "Ended",
-                  value: run.endedAt ? formatDateTime(run.endedAt) : "running",
-                },
-                { label: "Duration", value: runDuration(run) },
-                { label: "Processed", value: formatCompactNumber(run.processed) },
-                { label: "Accepted", value: formatCompactNumber(run.accepted) },
-                { label: "Rejected", value: formatCompactNumber(run.rejected) },
-                { label: "Retried", value: formatCompactNumber(run.retried) },
-                { label: "Cost", value: formatCost(run.costUnits) },
-                {
-                  label: "Checkpoint",
-                  value: run.checkpoint ? (
-                    <span className="font-mono text-xs">{run.checkpoint}</span>
-                  ) : (
-                    "—"
-                  ),
-                },
-                {
-                  label: "Pipeline",
-                  value: <span className="font-mono text-xs">{run.pipelineId}</span>,
-                },
-              ]}
-            />
-            {run.error ? (
-              <div>
-                <p className="text-xs font-medium text-muted-foreground">Error</p>
-                <p className="mt-1 text-sm text-destructive">{run.error}</p>
-              </div>
-            ) : null}
-          </>
+          <RunDrawerContent
+            run={run}
+            onCancel={() => setCancelOpen(true)}
+            onRetry={handleRetry}
+            retrying={retryAction.status === "pending"}
+          />
         ) : null}
       </DetailDrawer>
       <ConfirmActionDialog
@@ -204,15 +228,7 @@ function RunDrawer({
         impact="In-flight work stops at the last checkpoint. Partial output may remain."
         confirmLabel="Cancel run"
         confirming={cancelAction.status === "pending"}
-        onConfirm={async () => {
-          if (!run) return
-          const updated = await cancelAction.run(run.id)
-          if (updated) {
-            setCancelOpen(false)
-            onChanged()
-            onClose()
-          }
-        }}
+        onConfirm={handleConfirmCancel}
       />
     </>
   )
@@ -225,7 +241,9 @@ export function PipelineDetailPage() {
     [pipelineId]
   )
   const [selectedRun, setSelectedRun] = React.useState<PipelineRun | null>(null)
+  const [cancelRunTarget, setCancelRunTarget] = React.useState<PipelineRun | null>(null)
   const [pauseOpen, setPauseOpen] = React.useState(false)
+
   const runAction = useServiceAction(
     withNotify(
       { success: "Run triggered", error: "Failed to trigger run" },
@@ -244,6 +262,42 @@ export function PipelineDetailPage() {
       (signal, id: string) => pipelineService.resumePipeline(id, signal)
     )
   )
+  const cancelAction = useServiceAction(
+    withNotify(
+      { success: "Run cancelled", error: "Failed to cancel run" },
+      (signal, runId: string) => pipelineService.cancelRun(runId, signal)
+    )
+  )
+  const retryAction = useServiceAction(
+    withNotify(
+      { success: "Run retried", error: "Failed to retry run" },
+      (signal, runId: string) => pipelineService.retryRun(runId, signal)
+    )
+  )
+
+  const runs = React.useMemo(() => state.data?.runs ?? [], [state.data?.runs])
+
+  const columns = React.useMemo(
+    () =>
+      getPipelineRunColumns({
+        onSelect: setSelectedRun,
+        onCancel: (run) => setCancelRunTarget(run),
+        onRetry: async (run) => {
+          const next = await retryAction.run(run.id)
+          if (next) state.reload()
+        },
+      }),
+    [retryAction, state]
+  )
+
+  const { table } = useDataTable({
+    data: runs,
+    columns,
+    pageCount: 1,
+    initialState: {
+      columnPinning: { right: ["actions"] },
+    },
+  })
 
   if (state.status === "loading") return <LoadingSkeleton rows={8} />
   if (state.status === "error") return <ErrorState error={state.error} onRetry={state.reload} />
@@ -313,6 +367,25 @@ export function PipelineDetailPage() {
           }
         }}
       />
+      <ConfirmActionDialog
+        open={cancelRunTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setCancelRunTarget(null)
+        }}
+        title="Cancel pipeline run"
+        description={cancelRunTarget ? `Cancel run ${cancelRunTarget.id}?` : "Cancel this run?"}
+        impact="In-flight work stops at the last checkpoint. Partial output may remain."
+        confirmLabel="Cancel run"
+        confirming={cancelAction.status === "pending"}
+        onConfirm={async () => {
+          if (!cancelRunTarget) return
+          const updated = await cancelAction.run(cancelRunTarget.id)
+          if (updated) {
+            setCancelRunTarget(null)
+            state.reload()
+          }
+        }}
+      />
       <Tabs defaultValue="overview">
         <TabsList>
           <TabsTrigger value="overview">Overview</TabsTrigger>
@@ -378,10 +451,15 @@ export function PipelineDetailPage() {
             />
           ) : (
             <DataTable
-              columns={runColumns}
-              rows={p.runs}
-              rowKey={(r) => r.id}
+              table={table}
               onRowClick={setSelectedRun}
+              infinite={{
+                onLoadMore: () => {},
+                hasNextPage: false,
+                isFetchingNextPage: false,
+                totalItems: runs.length,
+                loadedCount: runs.length,
+              }}
             />
           )}
         </TabsContent>

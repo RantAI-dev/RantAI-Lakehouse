@@ -2,55 +2,69 @@
 
 import * as React from "react"
 import Link from "next/link"
+import { DataTable } from "@/components/data-table/data-table"
+import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
+import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { CodeBlock } from "@/components/patterns/code-block"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
-import { FilterToolbar, SearchField } from "@/components/patterns/filter-toolbar"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
-import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
+import { useDataTable } from "@/hooks/use-data-table"
 import { useService } from "@/hooks/use-service"
 import { formatRelativeTime } from "@/lib/format"
 import { queryService } from "@/services"
 import type { SavedQuery } from "@/services/contracts/queries"
 import { QueryStudioTabs } from "./query-studio-tabs"
+import { getSavedQueryColumns, TagPills } from "./saved-query-columns"
 
-function TagPills({ tags }: { tags: string[] }) {
+function SavedQueryDrawerContent({ query }: { readonly query: SavedQuery }) {
   return (
-    <span className="flex flex-wrap gap-1">
-      {tags.map((t) => (
-        <Pill key={t} tone="neutral">
-          {t}
-        </Pill>
-      ))}
-    </span>
+    <>
+      <CodeBlock>{query.sql}</CodeBlock>
+      <MetadataList
+        items={[
+          { label: "Owner", value: query.owner },
+          { label: "Updated", value: formatRelativeTime(query.updatedAt) },
+          { label: "Tags", value: <TagPills tags={query.tags} /> },
+        ]}
+      />
+      <Button
+        size="sm"
+        render={<Link href={`/query-studio?saved=${encodeURIComponent(query.id)}`} />}
+      >
+        Open in Studio
+      </Button>
+    </>
   )
 }
 
-const columns: ColumnDef<SavedQuery>[] = [
-  { key: "title", header: "Title", render: (r) => <span className="font-medium">{r.title}</span> },
-  { key: "owner", header: "Owner", render: (r) => r.owner },
-  { key: "tags", header: "Tags", render: (r) => <TagPills tags={r.tags} /> },
-  { key: "updated", header: "Updated", render: (r) => formatRelativeTime(r.updatedAt) },
-]
-
 export function SavedQueriesPage() {
   const state = useService((s) => queryService.listSaved(s), [])
-  const [search, setSearch] = React.useState("")
   const [selected, setSelected] = React.useState<SavedQuery | null>(null)
 
-  const filtered = React.useMemo(() => {
-    const q = search.trim().toLowerCase()
-    if (!q) return state.data ?? []
-    return (state.data ?? []).filter(
-      (r) =>
-        r.title.toLowerCase().includes(q) ||
-        r.owner.toLowerCase().includes(q) ||
-        r.tags.some((t) => t.toLowerCase().includes(q))
-    )
-  }, [state.data, search])
+  const columns = React.useMemo(
+    () =>
+      getSavedQueryColumns({
+        onInspect: (query) => setSelected(query),
+      }),
+    []
+  )
+
+  const rawData = React.useMemo(() => state.data ?? [], [state.data])
+
+  const { table } = useDataTable({
+    data: rawData,
+    columns,
+    pageCount: 1,
+    initialState: {
+      columnPinning: { right: ["actions"] },
+    },
+    getRowId: (row) => row.id,
+    shallow: false,
+    clearOnDefault: true,
+  })
 
   return (
     <div className="flex flex-col gap-4">
@@ -59,22 +73,19 @@ export function SavedQueriesPage() {
         description="Reusable SQL assets with owners and tags."
       />
       <QueryStudioTabs />
-      <FilterToolbar>
-        <SearchField
-          value={search}
-          onChange={setSearch}
-          placeholder="Search title, tags, owner..."
-        />
-      </FilterToolbar>
       {state.status === "loading" ? <LoadingSkeleton /> : null}
-      {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
+      {state.status === "error" ? (
+        <ErrorState error={state.error} onRetry={state.reload} />
+      ) : null}
       {state.status === "success" ? (
-        <DataTable
-          columns={columns}
-          rows={filtered}
-          rowKey={(r) => r.id}
-          onRowClick={setSelected}
-        />
+        <div className="space-y-4">
+          <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
+            <DataTableSearch placeholder="Search title, owner..." />
+          </DataTableAdvancedToolbar>
+          <div className="rounded-md border">
+            <DataTable table={table} />
+          </div>
+        </div>
       ) : null}
       <DetailDrawer
         open={selected !== null}
@@ -84,24 +95,7 @@ export function SavedQueriesPage() {
         title={selected?.title ?? "Saved query"}
         wide
       >
-        {selected ? (
-          <>
-            <CodeBlock>{selected.sql}</CodeBlock>
-            <MetadataList
-              items={[
-                { label: "Owner", value: selected.owner },
-                { label: "Updated", value: formatRelativeTime(selected.updatedAt) },
-                { label: "Tags", value: <TagPills tags={selected.tags} /> },
-              ]}
-            />
-            <Button
-              size="sm"
-              render={<Link href={`/query-studio?saved=${selected.id}`} />}
-            >
-              Open in Studio
-            </Button>
-          </>
-        ) : null}
+        {selected ? <SavedQueryDrawerContent query={selected} /> : null}
       </DetailDrawer>
     </div>
   )

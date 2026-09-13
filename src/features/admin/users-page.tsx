@@ -2,114 +2,84 @@
 
 import * as React from "react"
 import { PlusIcon } from "lucide-react"
+
+import { DataTable } from "@/components/data-table/data-table"
+import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
+import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { CreateSheet } from "@/components/patterns/create-sheet"
-import { PageHeader } from "@/components/patterns/page-header"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
-import {
-  FilterSelect,
-  FilterToolbar,
-  SearchField,
-} from "@/components/patterns/filter-toolbar"
 import { MetadataList } from "@/components/patterns/metadata-list"
+import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
-import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { useAuth } from "@/features/auth/auth-provider"
+import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
+import { filterDataClientSide } from "@/lib/data-table"
 import { formatRelativeTime } from "@/lib/format"
 import { identityService } from "@/services"
 import type { User } from "@/services/contracts/identity"
-import { useAuth } from "@/features/auth/auth-provider"
-
-const STATUS_OPTIONS = [
-  { value: "active", label: "Active" },
-  { value: "inactive", label: "Inactive" },
-]
-
-function UserStatusPill({ status }: { status: User["status"] }) {
-  return status === "active" ? (
-    <Pill tone="success">Active</Pill>
-  ) : (
-    <Pill tone="neutral">Inactive</Pill>
-  )
-}
-
-function PillList({ values }: { values: string[] }) {
-  if (values.length === 0) return <span>—</span>
-  return (
-    <div className="flex flex-wrap gap-1">
-      {values.map((v) => (
-        <Pill key={v} tone="neutral">
-          {v}
-        </Pill>
-      ))}
-    </div>
-  )
-}
-
-const columns: ColumnDef<User>[] = [
-  {
-    key: "name",
-    header: "User",
-    render: (r) => (
-      <div>
-        <p className="font-medium">{r.name}</p>
-        <p className="text-xs text-muted-foreground">{r.email}</p>
-      </div>
-    ),
-  },
-  {
-    key: "status",
-    header: "Status",
-    render: (r) => <UserStatusPill status={r.status} />,
-  },
-  { key: "roles", header: "Roles", render: (r) => <PillList values={r.roles} /> },
-  {
-    key: "tenants",
-    header: "Tenants",
-    render: (r) => <PillList values={r.tenants} />,
-  },
-  {
-    key: "last",
-    header: "Last activity",
-    render: (r) => formatRelativeTime(r.lastActivity),
-  },
-]
+import { getUserColumns, PillList, UserStatusPill } from "./user-columns"
 
 export function UsersPage() {
   const { hasPermission } = useAuth()
   const canWrite = hasPermission("identity:write")
   const state = useService((s) => identityService.listUsers(s), [])
-  const [search, setSearch] = React.useState("")
-  const [status, setStatus] = React.useState("all")
-  const [role, setRole] = React.useState("all")
   const [selected, setSelected] = React.useState<User | null>(null)
   const [createOpen, setCreateOpen] = React.useState(false)
   const [name, setName] = React.useState("")
   const [email, setEmail] = React.useState("")
   const [roles, setRoles] = React.useState("")
   const [tenants, setTenants] = React.useState("")
+  const tableUrlState = useTableUrlState()
+
   const create = useServiceAction(
     (signal, input: Parameters<typeof identityService.inviteUser>[0]) =>
       identityService.inviteUser(input, signal)
   )
 
-  const roleOptions = React.useMemo(() => {
-    const present = new Set((state.data ?? []).flatMap((u) => u.roles))
-    return [...present].sort().map((r) => ({ value: r, label: r }))
-  }, [state.data])
+  const columns = React.useMemo(
+    () => getUserColumns({ onSelect: setSelected }),
+    []
+  )
 
-  const filtered = React.useMemo(() => {
-    const q = search.trim().toLowerCase()
-    return (state.data ?? []).filter((u) => {
-      if (status !== "all" && u.status !== status) return false
-      if (role !== "all" && !u.roles.includes(role)) return false
-      if (!q) return true
-      return [u.name, u.email].some((v) => v.toLowerCase().includes(q))
+  const filteredData = React.useMemo(() => {
+    if (state.status !== "success" || !state.data) return []
+    return filterDataClientSide(state.data, {
+      search: tableUrlState.search,
+      searchFields: [
+        (u) => u.name,
+        (u) => u.email,
+        (u) => u.roles.join(" "),
+        (u) => u.tenants.join(" "),
+      ],
+      filters: tableUrlState.filters,
+      joinOperator: tableUrlState.joinOperator,
     })
-  }, [state.data, search, status, role])
+  }, [
+    state.status,
+    state.data,
+    tableUrlState.search,
+    tableUrlState.filters,
+    tableUrlState.joinOperator,
+  ])
+
+  const { table } = useDataTable({
+    data: filteredData,
+    columns,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/admin/users",
+    initialState: {
+      columnPinning: { right: ["actions"] },
+    },
+  })
 
   function resetForm() {
     setName("")
@@ -155,39 +125,19 @@ export function UsersPage() {
           </Button>
         }
       />
-      <FilterToolbar>
-        <SearchField
-          value={search}
-          onChange={setSearch}
-          placeholder="Search name, email..."
-        />
-        <FilterSelect
-          value={status}
-          onChange={setStatus}
-          options={STATUS_OPTIONS}
-          allLabel="All statuses"
-          ariaLabel="Filter by status"
-        />
-        <FilterSelect
-          value={role}
-          onChange={setRole}
-          options={roleOptions}
-          allLabel="All roles"
-          ariaLabel="Filter by role"
-        />
-      </FilterToolbar>
+
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? (
         <ErrorState error={state.error} onRetry={state.reload} />
       ) : null}
       {state.status === "success" ? (
-        <DataTable
-          columns={columns}
-          rows={filtered}
-          rowKey={(r) => r.id}
-          onRowClick={setSelected}
-        />
+        <DataTable table={table}>
+          <DataTableAdvancedToolbar table={table}>
+            <DataTableSearch placeholder="Search name, email, roles, tenants…" />
+          </DataTableAdvancedToolbar>
+        </DataTable>
       ) : null}
+
       <DetailDrawer
         open={selected !== null}
         onOpenChange={(open) => {

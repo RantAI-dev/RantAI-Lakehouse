@@ -1,70 +1,55 @@
 "use client"
 
-import { PageHeader } from "@/components/patterns/page-header"
+import * as React from "react"
+import { DataTable } from "@/components/data-table/data-table"
+import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
+import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { MetricCard, MetricGrid } from "@/components/patterns/metric-card"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
+import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, MetricSkeleton } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
-import { Pill, TierBadge } from "@/components/patterns/status-badge"
+import { TierBadge } from "@/components/patterns/status-badge"
+import { useDataTable } from "@/hooks/use-data-table"
 import { useService } from "@/hooks/use-service"
 import { formatBytes, formatCompactNumber, formatPercent } from "@/lib/format"
 import type { StorageTier } from "@/lib/status"
 import { opsService } from "@/services"
 import type { UsageSummary } from "@/services/contracts/ops"
+import { getUsageTenantColumns } from "./usage-columns"
 
 type TenantRow = UsageSummary["tenants"][number]
 
-function BudgetUtilization({ row }: { row: TenantRow }) {
-  const fraction = row.budgetLimit > 0 ? row.budgetSpent / row.budgetLimit : 0
-  if (fraction >= 0.9) {
-    return (
-      <div className="flex items-center gap-2">
-        <Pill tone="destructive">Critical</Pill>
-        <span className="text-xs font-medium text-destructive">
-          {formatPercent(fraction)}
-        </span>
-      </div>
-    )
-  }
-  if (fraction >= 0.75) {
-    return (
-      <div className="flex items-center gap-2">
-        <Pill tone="warning">High</Pill>
-        <span className="text-xs text-muted-foreground">
-          {formatPercent(fraction)}
-        </span>
-      </div>
-    )
-  }
+function TenantBudgetsTable({ tenants }: { readonly tenants: readonly TenantRow[] }) {
+  const columns = React.useMemo(() => getUsageTenantColumns(), [])
+
+  const { table } = useDataTable({
+    data: tenants as TenantRow[],
+    columns,
+    pageCount: 1,
+    enableRowSelection: false,
+    initialState: {
+      columnPinning: { right: ["actions"] },
+    },
+    getRowId: (row) => row.id,
+    shallow: false,
+    clearOnDefault: true,
+  })
+
   return (
-    <div className="flex items-center gap-2">
-      <Pill tone="success">Healthy</Pill>
-      <span className="text-xs text-muted-foreground">
-        {formatPercent(fraction)}
-      </span>
+    <div className="space-y-4">
+      <DataTableAdvancedToolbar table={table}>
+        <DataTableSearch
+          table={table}
+          placeholder="Search tenants..."
+          className="h-8 w-40 lg:w-64"
+        />
+      </DataTableAdvancedToolbar>
+      <div className="rounded-md border">
+        <DataTable table={table} />
+      </div>
     </div>
   )
 }
-
-const columns: ColumnDef<TenantRow>[] = [
-  { key: "name", header: "Tenant", render: (r) => r.name },
-  {
-    key: "compute",
-    header: "Compute",
-    render: (r) => formatCompactNumber(r.computeUnits),
-  },
-  {
-    key: "budget",
-    header: "Budget",
-    render: (r) =>
-      `${formatCompactNumber(r.budgetSpent)} / ${formatCompactNumber(r.budgetLimit)}`,
-  },
-  {
-    key: "utilization",
-    header: "Utilization",
-    render: (r) => <BudgetUtilization row={r} />,
-  },
-]
 
 export function UsagePage() {
   const state = useService((s) => opsService.getUsage(s), [])
@@ -116,11 +101,7 @@ export function UsagePage() {
             </div>
           </SectionCard>
           <SectionCard title="Tenant budgets">
-            <DataTable
-              columns={columns}
-              rows={state.data.tenants}
-              rowKey={(r) => r.id}
-            />
+            <TenantBudgetsTable tenants={state.data.tenants} />
           </SectionCard>
         </>
       ) : null}

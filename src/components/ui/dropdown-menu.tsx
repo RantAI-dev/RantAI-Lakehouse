@@ -9,8 +9,26 @@ function DropdownMenu({ ...props }: MenuPrimitive.Root.Props) {
   return <MenuPrimitive.Root data-slot="dropdown-menu" {...props} />
 }
 
-function DropdownMenuTrigger({ ...props }: MenuPrimitive.Trigger.Props) {
-  return <MenuPrimitive.Trigger data-slot="dropdown-menu-trigger" {...props} />
+function DropdownMenuTrigger({
+  asChild,
+  children,
+  ...props
+}: MenuPrimitive.Trigger.Props & { asChild?: boolean }) {
+  if (asChild && React.isValidElement(children)) {
+    return (
+      <MenuPrimitive.Trigger
+        data-slot="dropdown-menu-trigger"
+        render={children}
+        {...props}
+      />
+    )
+  }
+
+  return (
+    <MenuPrimitive.Trigger data-slot="dropdown-menu-trigger" {...props}>
+      {children}
+    </MenuPrimitive.Trigger>
+  )
 }
 
 function DropdownMenuPortal({ ...props }: MenuPrimitive.Portal.Props) {
@@ -70,19 +88,28 @@ function DropdownMenuGroupLabel({
 function DropdownMenuItem({
   className,
   variant = "default",
+  asChild,
+  children,
   ...props
-}: MenuPrimitive.Item.Props & { variant?: "default" | "destructive" }) {
-  return (
-    <MenuPrimitive.Item
-      data-slot="dropdown-menu-item"
-      data-variant={variant}
-      className={cn(
-        "flex cursor-default items-center gap-2 rounded-md px-2 py-1.5 text-sm outline-none select-none data-highlighted:bg-muted data-highlighted:text-foreground data-disabled:pointer-events-none data-disabled:opacity-50 data-[variant=destructive]:text-destructive data-[variant=destructive]:data-highlighted:bg-destructive/10 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
-        className
-      )}
-      {...props}
-    />
-  )
+}: MenuPrimitive.Item.Props & {
+  variant?: "default" | "destructive"
+  asChild?: boolean
+}) {
+  const itemProps = {
+    "data-slot": "dropdown-menu-item",
+    "data-variant": variant,
+    className: cn(
+      "flex cursor-default items-center gap-2 rounded-md px-2 py-1.5 text-sm outline-none select-none data-highlighted:bg-muted data-highlighted:text-foreground data-disabled:pointer-events-none data-disabled:opacity-50 data-[variant=destructive]:text-destructive data-[variant=destructive]:data-highlighted:bg-destructive/10 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
+      className
+    ),
+    ...props,
+  }
+
+  if (asChild && React.isValidElement(children)) {
+    return <MenuPrimitive.Item render={children} {...itemProps} />
+  }
+
+  return <MenuPrimitive.Item {...itemProps}>{children}</MenuPrimitive.Item>
 }
 
 function DropdownMenuLabel({ className, ...props }: React.ComponentProps<"div">) {

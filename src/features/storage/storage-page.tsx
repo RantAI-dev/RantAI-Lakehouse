@@ -1,26 +1,30 @@
 "use client"
 
 import * as React from "react"
-import Link from "next/link"
 import { PlusIcon, RotateCcwIcon } from "lucide-react"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { CreateSheet } from "@/components/patterns/create-sheet"
 import { PageHeader } from "@/components/patterns/page-header"
 import { MetricCard, MetricGrid } from "@/components/patterns/metric-card"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
+import { DataTable } from "@/components/data-table/data-table"
+import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
+import { DataTableSearch } from "@/components/data-table/data-table-search"
 import {
   ErrorState,
   LoadingSkeleton,
   MetricSkeleton,
 } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
-import { Pill, StatusBadge, TierBadge } from "@/components/patterns/status-badge"
+import { Pill, TierBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
+import { filterDataClientSide } from "@/lib/data-table"
 import { withNotify } from "@/lib/notify"
-import { formatBytes, formatPercent, formatRelativeTime } from "@/lib/format"
+import { formatBytes, formatPercent } from "@/lib/format"
 import {
   DATA_LAYER_LABEL,
   STORAGE_TIER_LABEL,
@@ -29,71 +33,135 @@ import {
 } from "@/lib/status"
 import { storageService } from "@/services"
 import type { LifecyclePolicy, TieringOp } from "@/services/contracts/storage"
+import type { QueryKeys } from "@/types/data-table"
+import {
+  getLifecyclePolicyColumns,
+  getTieringOpColumns,
+} from "./storage-columns"
 
 const TIERS: StorageTier[] = ["hot", "warm", "cold", "ai"]
 const DATA_LAYERS = Object.keys(DATA_LAYER_LABEL) as DataLayer[]
 
-const policyCols: ColumnDef<LifecyclePolicy>[] = [
-  { key: "name", header: "Policy", render: (r) => r.name },
-  { key: "scope", header: "Scope", render: (r) => r.scope },
-  {
-    key: "rules",
-    header: "Hot → Warm → Cold",
-    render: (r) => `${r.hotDays}d → ${r.warmDays}d → ${r.coldAfterDays}d+`,
-  },
-  {
-    key: "status",
-    header: "Status",
-    render: (r) => <StatusBadge status={r.status} />,
-  },
-  { key: "savings", header: "Savings", render: (r) => r.estimatedSavings },
-  {
-    key: "applied",
-    header: "Last applied",
-    render: (r) => (
-      <span className="text-muted-foreground">
-        {formatRelativeTime(r.lastAppliedAt)}
-      </span>
-    ),
-  },
-]
+const POLICY_QUERY_KEYS: Partial<QueryKeys> = {
+  page: "p_page",
+  perPage: "p_perPage",
+  sort: "p_sort",
+  filters: "p_filters",
+  joinOperator: "p_joinOperator",
+  search: "p_search",
+  view: "p_view",
+  groupBy: "p_groupBy",
+}
 
-function opCols(): ColumnDef<TieringOp>[] {
-  return [
-    {
-      key: "asset",
-      header: "Asset",
-      render: (r) =>
-        r.assetId ? (
-          <Link
-            href={`/data/assets/${r.assetId}`}
-            className="font-medium hover:underline"
-          >
-            {r.asset}
-          </Link>
-        ) : (
-          r.asset
-        ),
+function LifecyclePoliciesTable({
+  policies,
+}: {
+  readonly policies: LifecyclePolicy[]
+}) {
+  const tableUrlState = useTableUrlState(POLICY_QUERY_KEYS)
+  const columns = React.useMemo(() => getLifecyclePolicyColumns(), [])
+
+  const filteredData = React.useMemo(() => {
+    return filterDataClientSide(policies, {
+      search: tableUrlState.search,
+      searchFields: [(r) => r.name, (r) => r.scope, (r) => r.status],
+      filters: tableUrlState.filters,
+      joinOperator: tableUrlState.joinOperator,
+    })
+  }, [
+    policies,
+    tableUrlState.search,
+    tableUrlState.filters,
+    tableUrlState.joinOperator,
+  ])
+
+  const { table } = useDataTable({
+    data: filteredData,
+    columns,
+    queryKeys: POLICY_QUERY_KEYS,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/storage/policies",
+    initialState: {
+      columnPinning: { right: ["actions"] },
     },
-    {
-      key: "move",
-      header: "Move",
-      render: (r) => (
-        <span className="inline-flex items-center gap-1">
-          <TierBadge tier={r.from} />
-          <span className="text-muted-foreground">→</span>
-          <TierBadge tier={r.to} />
-        </span>
-      ),
+  })
+
+  return (
+    <div className="flex flex-col gap-4">
+      <DataTableAdvancedToolbar table={table}>
+        <DataTableSearch
+          table={table}
+          placeholder="Search policies by name, scope..."
+        />
+      </DataTableAdvancedToolbar>
+      <DataTable table={table} />
+    </div>
+  )
+}
+
+const OP_QUERY_KEYS: Partial<QueryKeys> = {
+  page: "op_page",
+  perPage: "op_perPage",
+  sort: "op_sort",
+  filters: "op_filters",
+  joinOperator: "op_joinOperator",
+  search: "op_search",
+  view: "op_view",
+  groupBy: "op_groupBy",
+}
+
+function TieringOperationsTable({
+  operations,
+}: {
+  readonly operations: TieringOp[]
+}) {
+  const tableUrlState = useTableUrlState(OP_QUERY_KEYS)
+  const columns = React.useMemo(() => getTieringOpColumns(), [])
+
+  const filteredData = React.useMemo(() => {
+    return filterDataClientSide(operations, {
+      search: tableUrlState.search,
+      searchFields: [(r) => r.asset, (r) => r.status, (r) => r.detail],
+      filters: tableUrlState.filters,
+      joinOperator: tableUrlState.joinOperator,
+    })
+  }, [
+    operations,
+    tableUrlState.search,
+    tableUrlState.filters,
+    tableUrlState.joinOperator,
+  ])
+
+  const { table } = useDataTable({
+    data: filteredData,
+    columns,
+    queryKeys: OP_QUERY_KEYS,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/storage/operations",
+    initialState: {
+      columnPinning: { right: ["actions"] },
     },
-    {
-      key: "status",
-      header: "Status",
-      render: (r) => <StatusBadge status={r.status} />,
-    },
-    { key: "at", header: "When", render: (r) => formatRelativeTime(r.at) },
-    { key: "detail", header: "Detail", render: (r) => r.detail },
-  ]
+  })
+
+  return (
+    <div className="flex flex-col gap-4">
+      <DataTableAdvancedToolbar table={table}>
+        <DataTableSearch
+          table={table}
+          placeholder="Search operations by asset, status, detail..."
+        />
+      </DataTableAdvancedToolbar>
+      <DataTable table={table} />
+    </div>
+  )
 }
 
 export function StoragePage() {
@@ -249,7 +317,7 @@ export function StoragePage() {
           <ErrorState error={policies.error} onRetry={policies.reload} />
         ) : null}
         {policies.status === "success" ? (
-          <DataTable columns={policyCols} rows={policies.data} rowKey={(r) => r.id} />
+          <LifecyclePoliciesTable policies={policies.data} />
         ) : null}
       </SectionCard>
 
@@ -259,7 +327,7 @@ export function StoragePage() {
           <ErrorState error={ops.error} onRetry={ops.reload} />
         ) : null}
         {ops.status === "success" ? (
-          <DataTable columns={opCols()} rows={ops.data} rowKey={(r) => r.id} />
+          <TieringOperationsTable operations={ops.data} />
         ) : null}
       </SectionCard>
 

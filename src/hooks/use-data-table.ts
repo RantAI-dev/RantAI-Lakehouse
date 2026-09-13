@@ -59,7 +59,10 @@ interface UseDataTableProps<TData>
       | "manualPagination"
       | "manualSorting"
     >,
-    Required<Pick<TableOptions<TData>, "pageCount">> {
+    Partial<Pick<TableOptions<TData>, "pageCount">> {
+  manualPagination?: boolean;
+  manualSorting?: boolean;
+  manualFiltering?: boolean;
   initialState?: Omit<Partial<TableState>, "sorting"> & {
     sorting?: ExtendedColumnSort<TData>[];
   };
@@ -91,13 +94,20 @@ interface UseDataTableProps<TData>
  * user pinned last.
  */
 function anchorPinning(
-  pinning: ColumnPinningState,
-  anchors: ColumnPinningState
+  pinning: ColumnPinningState = {},
+  anchors: ColumnPinningState = {},
+  validColumnIds?: Set<string>
 ): ColumnPinningState {
-  const split = (ids: string[] = [], anchored: string[] = []) => ({
-    anchored: ids.filter((id) => anchored.includes(id)),
-    rest: ids.filter((id) => !anchored.includes(id)),
-  });
+  const split = (ids: string[] = [], anchored: string[] = []) => {
+    const validAnchors = validColumnIds
+      ? anchored.filter((id) => validColumnIds.has(id))
+      : anchored;
+    const rest = ids.filter((id) => !validAnchors.includes(id));
+    return {
+      anchored: validAnchors,
+      rest,
+    };
+  };
 
   const left = split(pinning.left, anchors.left);
   const right = split(pinning.right, anchors.right);
@@ -126,7 +136,10 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
     scroll = false,
     shallow = true,
     startTransition,
-    paginationMode = "pages",
+    paginationMode = "infinite",
+    manualPagination = true,
+    manualSorting = true,
+    manualFiltering = true,
     ...tableProps
   } = props;
   const pageKey = queryKeys?.page ?? PAGE_KEY;
@@ -190,11 +203,28 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
 
   // Read once: pages build `initialState` inline, so re-reading it every render
   // would hand the table a new default object each time.
-  const [layoutDefaults] = React.useState<TableLayout>(() => ({
-    columnOrder: initialState?.columnOrder ?? [],
-    columnPinning: initialState?.columnPinning ?? {},
-    columnVisibility: initialState?.columnVisibility ?? {},
-  }));
+  const [layoutDefaults] = React.useState<TableLayout>(() => {
+    const initialPinning = initialState?.columnPinning ?? {};
+    const hasActions = columns.some((c) => c.id === "actions");
+    const right = initialPinning.right ? [...initialPinning.right] : [];
+    if (hasActions && !right.includes("actions")) {
+      right.push("actions");
+    }
+    const hasSelect = columns.some((c) => c.id === "select");
+    const left = initialPinning.left ? [...initialPinning.left] : [];
+    if (hasSelect && !left.includes("select")) {
+      left.push("select");
+    }
+
+    return {
+      columnOrder: initialState?.columnOrder ?? [],
+      columnPinning: {
+        left,
+        right,
+      },
+      columnVisibility: initialState?.columnVisibility ?? {},
+    };
+  });
 
   const {
     layout,
@@ -254,8 +284,13 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
   // Normalised before it reaches the table, so a layout stored before the
   // anchoring rule existed is corrected on load rather than on next change.
   const columnPinning = React.useMemo(
-    () => anchorPinning(layout.columnPinning, layoutDefaults.columnPinning),
-    [layout.columnPinning, layoutDefaults.columnPinning]
+    () =>
+      anchorPinning(
+        layout.columnPinning,
+        layoutDefaults.columnPinning,
+        columnIds
+      ),
+    [layout.columnPinning, layoutDefaults.columnPinning, columnIds]
   );
 
   const onColumnPinningChange = React.useCallback(
@@ -266,11 +301,12 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
           typeof updaterOrValue === "function"
             ? updaterOrValue(columnPinning)
             : updaterOrValue,
-          layoutDefaults.columnPinning
+          layoutDefaults.columnPinning,
+          columnIds
         ),
       });
     },
-    [layout, columnPinning, layoutDefaults.columnPinning, setLayout]
+    [layout, columnPinning, layoutDefaults.columnPinning, columnIds, setLayout]
   );
 
   const isInfinite = paginationMode === "infinite";
@@ -291,7 +327,9 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
       .withDefault(defaultPageSize)
   );
 
-  const pageSize = isInfinite ? infiniteChunkSize : perPage;
+  const pageSize = isInfinite
+    ? (manualPagination ? infiniteChunkSize : Math.max(infiniteChunkSize, props.data.length || 1000))
+    : perPage;
 
   const pagination: PaginationState = React.useMemo(() => {
     return {
@@ -450,12 +488,14 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
     [debouncedSetFilterValues, filterableColumns, enableAdvancedFilter]
   );
 
+  const resolvedPageCount = manualPagination ? pageCount : undefined;
+
   // eslint-disable-next-line react-hooks/incompatible-library
   const table = useReactTable({
     ...tableProps,
     columns,
     initialState,
-    pageCount,
+    pageCount: resolvedPageCount,
     state: {
       pagination,
       sorting,
@@ -486,9 +526,9 @@ export function useDataTable<TData>(props: UseDataTableProps<TData>) {
     getFacetedRowModel: getFacetedRowModel(),
     getFacetedUniqueValues: getFacetedUniqueValues(),
     getFacetedMinMaxValues: getFacetedMinMaxValues(),
-    manualPagination: true,
-    manualSorting: true,
-    manualFiltering: true,
+    manualPagination,
+    manualSorting,
+    manualFiltering,
     meta: {
       ...tableProps.meta,
       persistKey,
