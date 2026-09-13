@@ -25,13 +25,14 @@ use lakehouse_iceberg::rest::{
 use lakehouse_store::PgPool;
 use lakehouse_store::maintenance_policy::{self, MaintenancePolicyRow};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::bounded;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::lakehouse_catalog;
 use crate::routes::governance::latest_maintenance_run;
+use crate::routes::support::str_col;
 use crate::state::AppState;
 
 /// Every `{ns}`/`{table}` path segment and `namespace` query value must
@@ -262,6 +263,7 @@ fn maintenance_body(
     table_name: &str,
     policy: Option<&MaintenancePolicyRow>,
     last_run: Option<Value>,
+    last_verb_runs: &[Value],
 ) -> Value {
     let last_run = last_run.unwrap_or(Value::Null);
     match policy {
@@ -274,6 +276,7 @@ fn maintenance_body(
             "compactSmallFiles": p.compact_small_files,
             "schedule": p.schedule,
             "lastRun": last_run,
+            "lastVerbRuns": last_verb_runs,
         }),
         None => json!({
             "namespace": namespace,
@@ -286,7 +289,83 @@ fn maintenance_body(
             "compactSmallFiles": false,
             "schedule": Value::Null,
             "lastRun": last_run,
+            "lastVerbRuns": last_verb_runs,
         }),
+    }
+}
+
+/// Builds the `SELECT` behind [`latest_maintenance_verb_runs`]: every row
+/// `dagster/dispar_orchestrate/bronze_catalog.py::record_maintenance_verb_run`
+/// wrote for `table_name`'s NEWEST recorded run (`run_at = (SELECT
+/// max(run_at) ...)`), narrowed to that one table via a bound, escaped
+/// literal — never `format!` on an identifier here, `table_name` is a
+/// value, not a column/table name. `bronze_meta.maintenance_verb_run` is a
+/// brand-new table (WS2 §4): most tables, and every deployment before this
+/// feature existed, will never have a row in it — see
+/// [`maintenance_verb_runs_or_empty`] for how that absence is handled.
+fn maintenance_verb_run_query(table_name: &str) -> String {
+    let lit = lakehouse_core::ident::SqlLiteral::from(table_name);
+    format!(
+        "SELECT verb, engine, outcome, detail, run_at \
+         FROM lake.`bronze_meta.maintenance_verb_run` \
+         WHERE table_name = {lit} AND run_at = \
+         (SELECT max(run_at) FROM lake.`bronze_meta.maintenance_verb_run` WHERE table_name = {lit}) \
+         ORDER BY verb"
+    )
+}
+
+/// Maps one `bronze_meta.maintenance_verb_run` row to the JSON shape
+/// [`maintenance`]'s `lastVerbRuns` array returns per entry.
+fn maintenance_verb_run_row_json(row: &Map<String, Value>) -> Value {
+    json!({
+        "verb": str_col(row, "verb"),
+        "engine": str_col(row, "engine"),
+        "outcome": str_col(row, "outcome"),
+        "detail": str_col(row, "detail"),
+        "runAt": str_col(row, "run_at"),
+    })
+}
+
+/// # Errors
+/// Returns [`lakehouse_clickhouse::ChError`] if the query fails, including
+/// `bronze_meta.maintenance_verb_run` not existing yet — see
+/// [`maintenance_verb_runs_or_empty`], the only caller, for why that is
+/// NOT surfaced as a 503 the way [`latest_maintenance_run`]'s missing
+/// table is.
+async fn latest_maintenance_verb_runs(
+    ch: &lakehouse_clickhouse::ChClient,
+    table_name: &str,
+) -> Result<Vec<Value>, lakehouse_clickhouse::ChError> {
+    let rows = ch
+        .rows(&maintenance_verb_run_query(table_name), None)
+        .await?;
+    Ok(rows.iter().map(maintenance_verb_run_row_json).collect())
+}
+
+/// Unlike `bronze_meta.maintenance_run` (whose absence means "the P4
+/// maintenance job has never run on this deployment" — a real outage
+/// signal `classify_ch_error` turns into a fixed 503), a missing
+/// `bronze_meta.maintenance_verb_run` is the NORMAL steady state for any
+/// table that has never had a policy run a Trino verb, and for every
+/// deployment that predates this feature. Turning that into the same 503
+/// would make a brand-new, additive field regress an endpoint that was
+/// already serving successfully — so a lookup failure here degrades to an
+/// honest empty list (logged, never silently swallowed) instead of
+/// failing the whole `GET`.
+async fn maintenance_verb_runs_or_empty(
+    ch: &lakehouse_clickhouse::ChClient,
+    table_name: &str,
+) -> Vec<Value> {
+    match latest_maintenance_verb_runs(ch, table_name).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                table_name,
+                "maintenance-verb-run lookup failed, reporting no verb runs"
+            );
+            Vec::new()
+        }
     }
 }
 
@@ -484,11 +563,21 @@ pub async fn maintenance(
         None
     };
 
+    // `lastVerbRuns` — see `maintenance_verb_runs_or_empty`'s doc comment
+    // for why a lookup failure here degrades to an empty list instead of
+    // the 503 `last_run`'s own failure gives.
+    let last_verb_runs = if last_run_applies(&ns) {
+        maintenance_verb_runs_or_empty(&state.clickhouse, &table).await
+    } else {
+        Vec::new()
+    };
+
     Ok(ApiJson(maintenance_body(
         &ns,
         &table,
         policy.as_ref(),
         last_run,
+        &last_verb_runs,
     )))
 }
 
@@ -840,12 +929,13 @@ mod tests {
 
     #[test]
     fn maintenance_body_reports_unconfigured_with_the_jobs_real_default() {
-        let body = maintenance_body("bronze", "orders", None, None);
+        let body = maintenance_body("bronze", "orders", None, None, &[]);
 
         assert_eq!(body["configured"], json!(false));
         assert_eq!(body["snapshotsToKeep"], Value::Null);
         assert_eq!(body["compactSmallFiles"], json!(false));
         assert_eq!(body["lastRun"], Value::Null);
+        assert_eq!(body["lastVerbRuns"], json!([]));
     }
 
     #[test]
@@ -859,14 +949,60 @@ mod tests {
             schedule: Some("daily".to_owned()),
         };
         let last_run = json!({ "tableName": "orders", "runAt": "2026-01-01T00:00:00Z" });
+        let last_verb_runs = vec![json!({
+            "verb": "optimize",
+            "engine": "trino",
+            "outcome": "applied",
+            "detail": "",
+            "runAt": "2026-01-01T00:00:00Z",
+        })];
 
-        let body = maintenance_body("bronze", "orders", Some(&policy), Some(last_run.clone()));
+        let body = maintenance_body(
+            "bronze",
+            "orders",
+            Some(&policy),
+            Some(last_run.clone()),
+            &last_verb_runs,
+        );
 
         assert_eq!(body["configured"], json!(true));
         assert_eq!(body["snapshotsToKeep"], json!(10));
         assert_eq!(body["compactSmallFiles"], json!(true));
         assert_eq!(body["schedule"], json!("daily"));
         assert_eq!(body["lastRun"], last_run);
+        assert_eq!(body["lastVerbRuns"], json!(last_verb_runs));
+    }
+
+    #[test]
+    fn maintenance_verb_run_query_binds_the_table_name_as_a_literal_not_an_identifier() {
+        let sql = maintenance_verb_run_query("orders'; DROP TABLE x; --");
+
+        assert!(sql.contains("WHERE table_name = 'orders''; DROP TABLE x; --'"));
+        assert!(sql.contains("FROM lake.`bronze_meta.maintenance_verb_run`"));
+        assert!(sql.contains("ORDER BY verb"));
+    }
+
+    #[test]
+    fn maintenance_verb_run_row_json_uses_camel_case_field_names() {
+        let mut row = Map::new();
+        row.insert("verb".to_owned(), json!("expire_snapshots"));
+        row.insert("engine".to_owned(), json!("trino"));
+        row.insert("outcome".to_owned(), json!("refused"));
+        row.insert("detail".to_owned(), json!("min-retention floor"));
+        row.insert("run_at".to_owned(), json!("2026-01-01T00:00:00Z"));
+
+        let body = maintenance_verb_run_row_json(&row);
+
+        assert_eq!(
+            body,
+            json!({
+                "verb": "expire_snapshots",
+                "engine": "trino",
+                "outcome": "refused",
+                "detail": "min-retention floor",
+                "runAt": "2026-01-01T00:00:00Z",
+            })
+        );
     }
 
     #[test]
