@@ -588,3 +588,81 @@ def record_maintenance_run(
         "bronze_snapshot_count, bronze_metadata_log_count, "
         "snapshot_growth_measured) VALUES " + values,
     )
+
+
+# ── Ingest-run outcomes (WS3 plan review Z2, Z9) ────────────────────────
+#
+# `lake.bronze_meta.ingest_run` is a NEW table, introduced for
+# `ingest_factory.py`'s per-connector ingest jobs. Same story as
+# `_MAINTENANCE_RUN_SCHEMA` above: not
+# mirrored into `demo/clickhouse/04_registry.sql` (out of scope for this
+# build to edit), so this table has exactly one owner, `_INGEST_RUN_SCHEMA`
+# below -- deliberately its OWN one-element tuple passed to
+# `_assert_or_create_all`, the same pattern `record_maintenance_run` uses,
+# NOT folded into the top-level `EXPECTED_SCHEMAS` tuple (that tuple holds
+# only the three `dataset_catalog`/`dataset_sync`/`dataset_column`
+# registry tables `register_bronze_table` writes; the grand plan's "via
+# `EXPECTED_SCHEMAS`" names the single-canonical-schema-per-table
+# MECHANISM `_assert_or_create_schema` enforces, not a literal shared
+# tuple every writer must append to).
+_INGEST_RUN_SCHEMA = TableSchema(
+    table_name="bronze_meta.ingest_run",
+    columns=(
+        ("connector_id", "String"),
+        ("job", "String"),
+        ("object", "String"),
+        ("rows", "Nullable(UInt64)"),  # WS3 plan review Z9: NULL means "not measured", never a fabricated 0
+        ("started_at", "String"),
+        ("ended_at", "String"),
+        ("status", "String"),
+        ("error", "String"),
+    ),
+    engine="ReplacingMergeTree",
+    order_by=("connector_id", "job", "started_at"),
+)
+
+
+def record_ingest_run(
+    *,
+    connector_id: str,
+    job: str,
+    object_name: str,
+    rows: int | None,
+    started_at: str,
+    ended_at: str,
+    status: str,
+    error: str = "",
+    target: "ClickHouseTarget | None" = None,
+) -> None:
+    """Upsert one ingest run's outcome into `lake.bronze_meta.ingest_run`
+    -- the SAME `_assert_or_create_schema` R10 pattern
+    `record_maintenance_run` (`:377-425` at the time of this task's plan)
+    uses for `_MAINTENANCE_RUN_SCHEMA`, not the top-level
+    `EXPECTED_SCHEMAS` tuple (see this section's header comment).
+
+    `rows=None` (WS3 plan review Z9) writes SQL `NULL` -- the real row
+    count comes from `adapters/sink.py`'s
+    `pipeline.last_trace.last_normalize_info.row_counts` (dlt's own
+    normalize metrics), which is genuinely absent for an outcome where no
+    load was attempted at all (e.g. an SSRF-blocked or
+    unsupported-column-type rejection before `dlt` ever ran) -- recording
+    `0` there would claim "zero rows loaded," a specific, false,
+    measured-sounding number AGENTS.md's "never fabricate" rule (principle
+    2) forbids. `NULL` says "not measured," which is what actually
+    happened.
+    """
+    ch = target or ClickHouseTarget.from_env()
+    _assert_or_create_all(ch, (_INGEST_RUN_SCHEMA,))
+    rows_literal = "NULL" if rows is None else str(int(rows))
+    values = (
+        f"({_sql_string_literal(connector_id)}, {_sql_string_literal(job)}, "
+        f"{_sql_string_literal(object_name)}, {rows_literal}, "
+        f"{_sql_string_literal(started_at)}, {_sql_string_literal(ended_at)}, "
+        f"{_sql_string_literal(status)}, {_sql_string_literal(error)})"
+    )
+    _ch_exec(
+        ch,
+        "INSERT INTO lake.`bronze_meta.ingest_run` "
+        "(connector_id, job, object, rows, started_at, ended_at, status, error) "
+        "VALUES " + values,
+    )
