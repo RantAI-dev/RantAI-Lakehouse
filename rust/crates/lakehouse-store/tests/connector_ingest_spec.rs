@@ -19,6 +19,7 @@
 // by the linker before its ctor section is ever considered).
 use lakehouse_test_support as _;
 
+use lakehouse_store::connectors::{CreateConnectorInput, create_connector, get_ingest_spec};
 use sqlx::PgPool;
 
 /// `0033_connector_ingest_spec.sql` grants `ingest:read` to the seeded Data
@@ -59,41 +60,52 @@ async fn ingest_read_is_granted_exactly_once(pool: PgPool) -> sqlx::Result<()> {
 }
 
 /// The five additive columns from `0033` exist with the documented
-/// defaults, so an existing connector row keeps parsing with
-/// `adapter = NULL` ("not ingestible yet") rather than failing to migrate.
+/// defaults, so a connector row that has never had an ingest spec set
+/// keeps parsing with `adapter = NULL` ("not ingestible yet") rather than
+/// failing to migrate.
 ///
-/// This test originally asserted `adapter = NULL` for every seeded
-/// connector row, but `0034_seed_connector_ingest_spec.sql` now fills in
-/// `adapter`/`dial`/`source_objects` on the two rows
-/// `0022_prune_connector_seed.sql` seeded (`conn-pg-lakehouse`,
-/// `conn-s3-warehouse`) — the two connectors this compose stack can
-/// actually dial. Those two are excluded here and covered instead by
-/// `tests/connector_ingest_spec_seed.rs`; this test now checks the
-/// column-default claim against every OTHER connector row, so it stays
-/// meaningful if a future migration seeds a third dialable connector
-/// without touching this one.
+/// This test previously queried `WHERE id NOT IN ('conn-pg-lakehouse',
+/// 'conn-s3-warehouse')` over the seeded rows and looped over the result.
+/// After the migration chain that query returns zero rows:
+/// `0014_seed_connectors.sql` inserts 28 connector rows and
+/// `0022_prune_connector_seed.sql` deletes exactly those 28 and
+/// re-inserts only `conn-pg-lakehouse`/`conn-s3-warehouse` — the two IDs
+/// the `NOT IN` excludes. So the loop body never ran and the test asserted
+/// nothing (WS3 item 10). There is no third seeded row left to observe the
+/// defaults on, so this test now creates its own connector row (which
+/// `0034_seed_connector_ingest_spec.sql` never touches, since it only
+/// updates the two dialable rows by id) and reads the defaults off that
+/// via `get_ingest_spec`, the same store function
+/// `tests/connectors.rs`'s ingest-spec tests use.
 #[sqlx::test(migrations = "../../migrations")]
-async fn non_seeded_connectors_have_null_adapter_and_empty_dial(pool: PgPool) -> sqlx::Result<()> {
-    type ConnectorIngestRow = (
-        Option<String>,
-        Option<String>,
-        serde_json::Value,
-        serde_json::Value,
-        Option<String>,
-    );
-    let rows: Vec<ConnectorIngestRow> = sqlx::query_as(
-        "SELECT adapter, ingest_mode, dial, source_objects, schedule_cron FROM connector \
-             WHERE id NOT IN ('conn-pg-lakehouse', 'conn-s3-warehouse') ORDER BY id",
+async fn a_freshly_created_connector_has_null_adapter_and_empty_dial(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = create_connector(
+        &pool,
+        &CreateConnectorInput {
+            name: "ingest spec column defaults".to_owned(),
+            kind: "REST API".to_owned(),
+            direction: "source".to_owned(),
+            host: "api.example.internal".to_owned(),
+            secret_ref: "env:INGEST_SPEC_DEFAULTS_TEST_TOKEN".to_owned(),
+            secret_ref_secondary: None,
+            environment: "staging".to_owned(),
+            tenant: "Meridian Group".to_owned(),
+            residency: "in-region".to_owned(),
+            capabilities: vec![],
+            owner: None,
+        },
     )
-    .fetch_all(&pool)
-    .await?;
-    for (adapter, ingest_mode, dial, source_objects, schedule_cron) in rows {
-        assert_eq!(adapter, None);
-        assert_eq!(ingest_mode, None);
-        assert_eq!(dial, serde_json::json!({}));
-        assert_eq!(source_objects, serde_json::json!([]));
-        assert_eq!(schedule_cron, None);
-    }
+    .await
+    .unwrap();
+
+    let spec = get_ingest_spec(&pool, &created.id).await.unwrap().unwrap();
+    assert_eq!(spec.adapter, None);
+    assert_eq!(spec.ingest_mode, None);
+    assert_eq!(spec.dial, serde_json::json!({}));
+    assert_eq!(spec.source_objects, serde_json::json!([]));
+    assert_eq!(spec.schedule_cron, None);
     Ok(())
 }
 
