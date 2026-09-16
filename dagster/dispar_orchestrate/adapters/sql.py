@@ -39,14 +39,20 @@ mechanism its own connection API actually offers:
   `HostNameInCertificate=<host>` keeps TLS certificate verification
   targeting the real hostname even though the socket dials the IP.
 
-(A `postgresql` driver, if this module ever grows one, would need the
-SAME kind of per-driver pin: `psycopg2`/libpq accepts a separate
-`hostaddr` connect parameter alongside `host` -- `host` stays the name
-for TLS/SNI, `hostaddr` pins the checked IP, and libpq performs no DNS
-lookup of its own. `_DRIVERNAMES` below has no `"postgresql"` entry
-because that pin is applied at `dlt_pipeline.py`'s own, separate
-Postgres call site by a separate follow-up task, not in this module --
-see "Open question 2, resolved" below.)
+**`postgres`/`postgresql` is deliberately absent from `_DRIVERNAMES` and
+explicitly refused by `build_source` (WS3 item 20's routing decision,
+below) -- not a gap.** `psycopg2`/libpq gets the SAME kind of per-driver
+pin `mssql` gets above, but at a different call site: `host` stays the
+name for TLS/SNI, `hostaddr` (a separate `connect_args` kwarg) pins the
+checked IP, and libpq performs no DNS lookup of its own once it is set.
+That pin lives in `dlt_pipeline.py::run_bronze_ingest`
+(`BronzeIngestConfig.from_dial` builds the config a registry-supplied
+Postgres dial needs), not here -- see "Open question 2, resolved" below
+for why Postgres batch stays on that module's existing path in this
+workstream, and "WS3 item 20" for why this module refuses the driver
+outright (rather than silently mis-routing it) so a reader never has to
+guess which of the two modules a `driver: postgres` connector dials
+through.
 
 # ODBC injection (WS3 plan review Z13)
 
@@ -190,6 +196,23 @@ def build_source(
     `test_build_source_checks_the_host_before_building_any_credentials`).
     """
     driver = spec["driver"]
+
+    # WS3 item 20: Postgres routes to dlt_pipeline.py's own call site
+    # (BronzeIngestConfig.from_dial), never here -- see this module's
+    # docstring's "Open question 2, resolved" section for why. Refusing
+    # it explicitly, with a message naming the other module, is what lets
+    # a reader tell which path a driver='postgres' connector takes
+    # without guessing (a bare `_DRIVERNAMES.get` miss below would say
+    # only "does not know driver", true of both a real gap and a
+    # deliberate one). Checked before `resolve_checked` so a misrouted
+    # call fails immediately, not after a network round trip.
+    if driver in ("postgres", "postgresql"):
+        raise ValueError(
+            f"sql adapter does not route driver {driver!r} -- Postgres batch stays on "
+            "dlt_pipeline.py's existing path (WS3 item 20); route this connector through "
+            "dlt_pipeline.BronzeIngestConfig.from_dial instead"
+        )
+
     resolved = resolve_checked(spec["host"], spec["port"])
     table_names = [obj["name"].split(".")[-1] for obj in source_objects]
 

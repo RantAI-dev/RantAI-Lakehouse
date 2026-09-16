@@ -53,6 +53,7 @@ different table-creation code path producing the same partitioning
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -60,6 +61,7 @@ from typing import Any
 
 from dlt.sources.sql_database import sql_database
 
+from dispar_orchestrate import ssrf_guard
 from dispar_orchestrate.adapters.sink import SinkConfig, load_via_sink
 
 
@@ -154,6 +156,70 @@ class BronzeIngestConfig:
             lakekeeper_token=lakekeeper_token,
         )
 
+    @classmethod
+    def from_dial(
+        cls,
+        dial: dict[str, Any],
+        secrets: dict[str, str],
+        source_objects: list[dict[str, Any]],
+    ) -> "BronzeIngestConfig":
+        """Build a config for a registry-supplied Postgres dial (WS3 item
+        20's routing decision).
+
+        `rust/migrations/0034_seed_connector_ingest_spec.sql` seeds the
+        only real, dialable Postgres connector (`conn-pg-lakehouse`) as
+        `adapter='sql'`, `driver='postgres'` -- but `adapters/sql.py`'s
+        `_DRIVERNAMES` deliberately has no `postgres`/`postgresql` entry
+        and `build_source` refuses that driver outright (see its module
+        docstring). This classmethod is the other half of that decision:
+        a Postgres dial routes HERE, into `run_bronze_ingest`'s existing,
+        unchanged code path, not into `adapters/sql.py`. A future
+        a future ingest-job factory calls this for every `adapter='sql'`,
+        `driver='postgres'` connector row and everything else through
+        `adapters/sql.py::build_source` -- one dispatch, not a guess.
+
+        Infra fields (Lakekeeper/RustFS endpoints, warehouse bucket,
+        token) stay environment-sourced (`from_env`) -- those describe
+        THIS deployment, not the connector being dialed. Only the
+        per-connector fields (host/port/user/database/schema/table/bronze
+        table name) come from `dial`/`secrets`/`source_objects`, mirroring
+        `adapters/sql.py::build_source`'s own `(spec, secrets,
+        source_objects)` signature so the two routing halves read the
+        same shape.
+
+        # Errors
+
+        Raises `ValueError` if `dial['driver']` is not `postgres`/
+        `postgresql`, or if `source_objects` is empty.
+        """
+        driver = dial.get("driver")
+        if driver not in ("postgres", "postgresql"):
+            raise ValueError(f"from_dial only routes driver='postgres' connectors, got {driver!r}")
+        if not source_objects:
+            raise ValueError("from_dial requires at least one source object")
+
+        obj = source_objects[0]
+        schema, sep, table = obj["name"].partition(".")
+        if not sep:
+            # No "schema.table" separator -- treat the whole name as the
+            # table, falling back to this pipeline's own env-configured
+            # default schema rather than fabricating one.
+            schema, table = _env("BRONZE_SOURCE_SCHEMA", "ingest_demo"), schema
+        bronze_table_name = obj.get("target", table)
+
+        base = cls.from_env()
+        return dataclasses.replace(
+            base,
+            source_db_host=dial["host"],
+            source_db_port=str(dial["port"]),
+            source_db_user=dial["user"],
+            source_db_password=secrets["password"],
+            source_db_name=dial["database"],
+            source_schema=schema,
+            source_table=table,
+            bronze_table_name=bronze_table_name,
+        )
+
 
 def _stamp_ingested_at(record: dict[str, Any]) -> dict[str, Any]:
     """Bronze's system ingestion-time column (ADR 0004's
@@ -166,7 +232,8 @@ def _stamp_ingested_at(record: dict[str, Any]) -> dict[str, Any]:
 
 def run_bronze_ingest(config: BronzeIngestConfig | None = None) -> dict[str, Any]:
     """Run the dlt pipeline once: build the Postgres `sql_database` source
-    (unchanged from before this refactor), then write it through the
+    (SSRF-checked and `hostaddr`-pinned per WS3 item 20, the rest
+    unchanged from before that pin was added), then write it through the
     shared sink (`adapters/sink.py`, extracted per
     `docs/superpowers/plans/2026-09-11-ws3-ingestion-tier1.md`) every other ingest
     adapter (SQL/files/REST) writes through too. Returns a small summary
@@ -181,6 +248,18 @@ def run_bronze_ingest(config: BronzeIngestConfig | None = None) -> dict[str, Any
     """
     cfg = config or BronzeIngestConfig.from_env()
 
+    # WS3 item 20: the SAME `hostaddr` SSRF pin every other SQL
+    # driver gets from `adapters/sql.py` -- `BRONZE_SOURCE_DB_HOST` is an
+    # operator-set env var today, not a principal-chosen value, so this
+    # pin is defence in depth for THIS call site; it becomes load-bearing
+    # the moment a registry dial (`BronzeIngestConfig.from_dial`, above)
+    # reaches here with a principal-chosen host. `psycopg2`/libpq does not
+    # resolve through `socket.getaddrinfo` (see `ssrf_guard.py`'s module
+    # docstring), so `resolve_checked` alone would not protect a later
+    # connect -- `hostaddr` closes that by handing libpq the checked
+    # address directly and letting it skip its own DNS lookup entirely.
+    resolved = ssrf_guard.resolve_checked(cfg.source_db_host, int(cfg.source_db_port))
+
     # Assembled here, in-process, from discrete components (`from_env`,
     # above) — this dict is the ONE place a full Postgres DSN exists for
     # this pipeline; it is never passed through docker-compose.yml (or any
@@ -193,6 +272,9 @@ def run_bronze_ingest(config: BronzeIngestConfig | None = None) -> dict[str, Any
         "drivername": "postgresql",
         "username": cfg.source_db_user,
         "password": cfg.source_db_password,
+        # `host` stays the name (unchanged) -- TLS/SNI and certificate
+        # verification keep targeting it; only the dial itself is pinned,
+        # via `hostaddr` below.
         "host": cfg.source_db_host,
         "port": int(cfg.source_db_port),
         "database": cfg.source_db_name,
@@ -201,6 +283,12 @@ def run_bronze_ingest(config: BronzeIngestConfig | None = None) -> dict[str, Any
         credentials=source_credentials,
         schema=cfg.source_schema,
         table_names=[cfg.source_table],
+        # libpq's pinning mechanism (`ssrf_guard.py`'s module docstring):
+        # `hostaddr` carries the checked IP and makes libpq skip its own
+        # DNS lookup -- verified against dlt 1.30.0, `engine_kwargs`
+        # reaches `sqlalchemy.create_engine()` directly
+        # (`dlt/sources/sql_database/__init__.py:109,272`).
+        engine_kwargs={"connect_args": {"hostaddr": resolved.ip}},
     )
     resource = source.resources[cfg.source_table]
     resource.apply_hints(table_name=cfg.bronze_table_name)

@@ -173,6 +173,24 @@ def test_mssql_connection_string_refuses_a_control_character_in_database() -> No
         )
 
 
+# WS3 item 20 (the routing decision `adapters/sql.py`'s module docstring left
+# open): a Postgres dial routes to dlt_pipeline.py::BronzeIngestConfig.from_dial,
+# never here -- this module's own `_DRIVERNAMES` deliberately has no
+# "postgres"/"postgresql" entry. Refusing it with a message naming the
+# other module (rather than the generic "does not know driver" a plain
+# `_DRIVERNAMES.get` miss would give) is what lets a reader tell which
+# path a driver='postgres' connector takes without guessing.
+def test_build_source_refuses_postgres_explicitly(monkeypatch) -> None:
+    monkeypatch.setattr("dispar_orchestrate.adapters.sql.sql_database", lambda **_: pytest.fail("must not be called"))
+    with pytest.raises(ValueError, match="dlt_pipeline"):
+        build_source(
+            {"driver": "postgres", "host": "postgres", "port": 5432, "database": "lakehouse", "user": "lakehouse"},
+            secrets={"password": "x"},
+            source_objects=[],
+            resolve_checked=lambda host, port: ResolvedAddress(ip="10.0.0.9", port=port, family=2),
+        )
+
+
 def test_build_source_refuses_an_unknown_driver(monkeypatch) -> None:
     monkeypatch.setattr("dispar_orchestrate.adapters.sql.sql_database", lambda **_: pytest.fail("must not be called"))
     with pytest.raises(ValueError, match="does not know driver"):
