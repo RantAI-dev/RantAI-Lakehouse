@@ -108,6 +108,22 @@ export type IngestSecretRefs = {
 }
 
 /**
+ * The closed set the database enforces via `connector_adapter_check`
+ * (`rust/migrations/0033_connector_ingest_spec.sql`). Widened with
+ * `| string` because the Rust field is a plain `Option<String>`, not a
+ * closed enum — the client stays honest about a value the server might
+ * send that predates this list or that a future migration adds.
+ */
+export type IngestAdapter = "sql" | "cdc" | "files" | "rest" | "sheets" | string
+
+/**
+ * The closed set the database enforces via `connector_ingest_mode_check`
+ * (`rust/migrations/0033_connector_ingest_spec.sql`). See `IngestAdapter`
+ * for why this widens with `| string`.
+ */
+export type IngestMode = "batch" | "cdc" | string
+
+/**
  * A connector's ingest configuration, as returned by
  * `GET /api/connectors/{id}/ingest-spec`. Mirrors Rust `IngestSpec`
  * (`rust/crates/lakehouse-store/src/connectors.rs`) field-for-field,
@@ -116,8 +132,8 @@ export type IngestSecretRefs = {
  * that has never had an ingest spec set.
  */
 export type IngestSpec = {
-  adapter: string | null
-  ingestMode: string | null
+  adapter: IngestAdapter | null
+  ingestMode: IngestMode | null
   dial: Dial
   sourceObjects: SourceObject[]
   scheduleCron: string | null
@@ -133,8 +149,8 @@ export type IngestSpec = {
  * scheduled.
  */
 export type IngestSpecInput = {
-  adapter: string
-  ingestMode: string
+  adapter: IngestAdapter
+  ingestMode: IngestMode
   dial: Dial
   sourceObjects: SourceObject[]
   scheduleCron?: string
