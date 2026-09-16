@@ -1,5 +1,5 @@
 """Unit tests for `dagster/dispar_orchestrate/bronze_catalog.py`'s
-`record_ingest_run` (Task F7, WS3 plan review Z9).
+`record_ingest_run` (WS3 plan review Z9).
 
 Mirrors `test_capacity_snapshot.py::test_record_capacity_snapshot_writes_one_row`'s
 monkeypatch shape: `record_ingest_run` is defined IN `bronze_catalog`, so
