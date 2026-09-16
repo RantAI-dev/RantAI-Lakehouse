@@ -585,6 +585,50 @@ fn minimal_input(name: &str) -> CreateConnectorInput {
     }
 }
 
+/// A valid `cdc`-adapter `dial`, matching `ingest_spec::CdcDial`'s required
+/// fields (`driver`/`host`/`port`/`database`/`user`/`slotName`/
+/// `publicationName`).
+fn cdc_spec_fixture() -> IngestSpecInput {
+    IngestSpecInput {
+        adapter: "cdc".to_owned(),
+        ingest_mode: "cdc".to_owned(),
+        dial: serde_json::json!({
+            "driver": "postgres",
+            "host": "source.example.internal",
+            "port": 5432,
+            "database": "oms",
+            "user": "replicator",
+            "slotName": "oms_orders_slot",
+            "publicationName": "oms_orders_pub",
+        }),
+        source_objects: serde_json::json!([]),
+        schedule_cron: None,
+    }
+}
+
+/// [`ConnectorDialInfo`] must hand back `adapter`/`dial` alongside the
+/// connectivity fields it already returned — `routes::connectors`'s
+/// deprovision-on-delete dispatch (WS3 plan review X4) needs both to decide
+/// whether a connector's replication slot/publication should be attempted
+/// at all, and, for a `cdc` adapter, to read the names straight out of
+/// `dial` rather than guessing them from the connector's `id`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_connector_dial_info_includes_adapter_and_dial(pool: PgPool) -> sqlx::Result<()> {
+    let created = create_connector(&pool, &minimal_input("dial info adapter and dial"))
+        .await
+        .unwrap();
+    let spec = cdc_spec_fixture();
+    set_ingest_spec(&pool, &created.id, &spec).await.unwrap();
+
+    let info = get_connector_dial_info(&pool, &created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(info.adapter.as_deref(), Some("cdc"));
+    assert_eq!(info.dial, spec.dial);
+    Ok(())
+}
+
 /// `set_ingest_spec` writes a valid `dial`, and `get_ingest_spec` reads it
 /// back, including the connector's existing `secretRef` (never resolved,
 /// only named — see `IngestSecretRefs`'s doc comment).

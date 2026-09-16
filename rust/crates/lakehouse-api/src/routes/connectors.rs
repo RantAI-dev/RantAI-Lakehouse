@@ -426,23 +426,115 @@ fn connector_slug_for_id(id: &str) -> Result<ConnectorSlug, ApiError> {
     })
 }
 
-/// Attempt to drop `id`'s `PostgreSQL` CDC replication slot/publication —
-/// the real work behind [`delete`]'s pre-delete deprovision step. Resolves
-/// `dial_info`'s host/credential exactly the way
-/// [`crate::connector_probe::probe`] does for `POST
-/// /api/connectors/{id}/test` (same parser, same allowlisted resolver),
-/// because dropping a slot needs the same "safely resolve this
-/// connector's own secretRef and dial its own host" capability a
-/// connectivity test already has — see `connector_deprovision`'s module
-/// doc comment for why this makes
-/// `ops/debezium/deprovision_connector.sh`'s "the API has no such
-/// mechanism" comment obsolete.
+/// Decide WHETHER `id`'s connector should have a `Postgres` replication
+/// slot/publication dropped at all, and if so, do it. This is the single
+/// place that rule lives (WS3 plan review X4): [`delete`] calls this
+/// unconditionally and carries no
+/// `kind`-based condition of its own, so there is exactly one encoding of
+/// the rule to keep correct, rather than two that could drift apart.
+///
+/// - `adapter = "cdc"` — the slot/publication names come from
+///   `dial.slotName`/`dial.publicationName`, with **no fallback**:
+///   [`lakehouse_store::ingest_spec::CdcDial`] requires both fields, so a
+///   `cdc` connector always names its own slot/publication rather than one
+///   guessed from its registry `id`.
+/// - `adapter` is `sql` | `files` | `rest` | `sheets` — returns `Ok(None)`
+///   (nothing to deprovision) unconditionally. These adapters never had a
+///   replication slot to begin with, so deleting one of these connectors
+///   must not attempt to drop a slot/publication merely because its `kind`
+///   string happens to say "`PostgreSQL`" — the exact defect this task
+///   fixes.
+/// - `adapter IS NULL` (a connector row created before
+///   `0033_connector_ingest_spec.sql` added the column) **and** `kind`
+///   names Postgres — falls back to the pre-WS3 slug-derived names,
+///   unchanged from before this task. Bounded EXACTLY to
+///   `adapter IS NULL`: the `Some(_)` arm above always matches first once
+///   any connector has an `adapter` at all (`sql` included), so this arm
+///   is unreachable for any connector this build itself creates.
+/// - `adapter IS NULL` and `kind` does not name Postgres — `Ok(None)`.
+///
+/// `Ok(None)` means "there was nothing to deprovision"; [`delete`] treats
+/// that exactly like a successful deprovision and proceeds to delete the
+/// row.
 async fn deprovision_postgres_connector(
     state: &AppState,
     id: &str,
     dial_info: &ConnectorDialInfo,
+) -> Result<Option<Deprovisioned>, ApiError> {
+    match dial_info.adapter.as_deref() {
+        Some("cdc") => {
+            let dial = Dial::parse("cdc", &dial_info.dial).map_err(|err| {
+                // `AGENTS.md`'s known-gap note forbids adding another
+                // `ApiError::Internal` that
+                // carries upstream error text, so the parse failure is
+                // logged server-side and the response gets fixed text only.
+                // Failing closed here is still correct: a row marked
+                // `adapter = 'cdc'` whose `dial` will not parse is a
+                // data-integrity problem, not something to silently skip.
+                tracing::error!(
+                    connector_id = %id,
+                    error = %err,
+                    "adapter=cdc connector's dial column does not parse as a CDC dial; \
+                     deprovisioning cannot determine its slot/publication names"
+                );
+                ApiError::Internal(format!(
+                    "connector {id} is registered with adapter=cdc but its stored dial does not \
+                     parse as a CDC dial; see the server log for the parse error"
+                ))
+            })?;
+            let Some(cdc) = dial.as_cdc() else {
+                // Unreachable in practice (`Dial::parse("cdc", ..)` only
+                // ever returns `Dial::Cdc`), but matched honestly rather
+                // than with `unwrap`/`expect` — see the parse arm above for
+                // why the response carries fixed text.
+                tracing::error!(
+                    connector_id = %id,
+                    "Dial::parse(\"cdc\", ..) returned a non-Cdc variant"
+                );
+                return Err(ApiError::Internal(format!(
+                    "connector {id} is registered with adapter=cdc but its parsed dial is not a \
+                     CDC dial"
+                )));
+            };
+            deprovision_with_names(state, id, dial_info, &cdc.slot_name, &cdc.publication_name)
+                .await
+                .map(Some)
+        }
+        None if dial_info.kind.to_lowercase().contains("postgres") => {
+            let slug = connector_slug_for_id(id)?;
+            deprovision_with_names(
+                state,
+                id,
+                dial_info,
+                &format!("{slug}_slot"),
+                &format!("{slug}_pub"),
+            )
+            .await
+            .map(Some)
+        }
+        // `sql` | `files` | `rest` | `sheets` never had a replication slot
+        // (the `Some(_)` half of this arm), and `adapter IS NULL` with a
+        // non-Postgres `kind` never did either (the `None` half, falling
+        // through from the guarded arm above) — both are "nothing to
+        // deprovision" (WS3 plan review X4).
+        Some(_) | None => Ok(None),
+    }
+}
+
+/// The shared body behind every [`deprovision_postgres_connector`] arm that
+/// actually attempts a drop: resolve `dial_info`'s host/credential exactly
+/// the way [`crate::connector_probe::probe`] does for `POST
+/// /api/connectors/{id}/test` (same parser, same allowlisted resolver),
+/// then drop `slot_name`/`publication_name` on that target. Unchanged from
+/// [`deprovision_postgres_connector`]'s body before this task, just
+/// parameterized on the two names instead of a single `&ConnectorSlug`.
+async fn deprovision_with_names(
+    state: &AppState,
+    id: &str,
+    dial_info: &ConnectorDialInfo,
+    slot_name: &str,
+    publication_name: &str,
 ) -> Result<Deprovisioned, ApiError> {
-    let slug = connector_slug_for_id(id)?;
     let Some(target) = connector_probe::parse_postgres_host(&dial_info.host) else {
         return Err(ApiError::Internal(format!(
             "connector {id} is registered as PostgreSQL but its host is not shaped \
@@ -466,39 +558,54 @@ async fn deprovision_postgres_connector(
         password,
         database: target.database.to_owned(),
     };
-    connector_deprovision::drop_slot_and_publication(&pg_target, &slug)
+    connector_deprovision::drop_slot_and_publication(&pg_target, slot_name, publication_name)
         .await
-        .map_err(|err| ApiError::Internal(deprovision_error_message(id, &slug, &err)))
+        .map_err(|err| {
+            ApiError::Internal(deprovision_error_message(
+                id,
+                slot_name,
+                publication_name,
+                &err,
+            ))
+        })
 }
 
 /// Render a [`DeprovisionError`] into text safe to put in a 409/500 body or
-/// a log line — never the credential [`deprovision_postgres_connector`]
-/// resolved, only the slot/publication names and the error's own
-/// `Display` (which, per [`DeprovisionError`]'s doc comment, never
-/// includes connection credentials).
-fn deprovision_error_message(id: &str, slug: &ConnectorSlug, err: &DeprovisionError) -> String {
+/// a log line — never the credential [`deprovision_with_names`] resolved,
+/// only the slot/publication names and the error's own `Display` (which,
+/// per [`DeprovisionError`]'s doc comment, never includes connection
+/// credentials).
+fn deprovision_error_message(
+    id: &str,
+    slot_name: &str,
+    publication_name: &str,
+    err: &DeprovisionError,
+) -> String {
     format!(
-        "deprovisioning connector {id}'s CDC replication slot ({slug}_slot) and publication \
-         ({slug}_pub) failed: {err}"
+        "deprovisioning connector {id}'s CDC replication slot ({slot_name:?}) and publication \
+         ({publication_name:?}) failed: {err}"
     )
 }
 
 /// `DELETE /api/connectors/{id}` — remove a connector registration.
 ///
-/// # `PostgreSQL` CDC deprovisioning happens FIRST
+/// # CDC deprovisioning happens FIRST, decided by `adapter` not `kind`
 ///
-/// For a `PostgreSQL`-kind connector, this now attempts to drop its
-/// replication slot/publication on the source database (see
-/// [`deprovision_postgres_connector`]) BEFORE removing the registry row —
-/// the fix for the exact gap `lakehouse_store::connectors::delete_connector`
-/// used to describe: silently deleting the row while the slot survived
-/// left it pinning WAL on the customer's source database until disk filled,
-/// forever, with nothing in the registry to show it. Deprovisioning is
-/// idempotent (an already-absent slot/publication is success), so a
-/// connector that was never fully provisioned, or was already cleaned up
-/// by a previous attempt, still deletes cleanly.
+/// This calls [`deprovision_postgres_connector`] unconditionally, BEFORE
+/// removing the registry row — that function is the single place deciding
+/// whether there is anything to drop at all (WS3 plan review X4: an
+/// `adapter = "cdc"` connector, or the bounded `adapter IS NULL` legacy
+/// Postgres case; never a `sql`/`files`/`rest`/`sheets` connector, however
+/// its `kind` string reads). This fixes the exact gap
+/// `lakehouse_store::connectors::delete_connector` used to describe:
+/// silently deleting the row while the slot survived left it pinning WAL on
+/// the customer's source database until disk filled, forever, with nothing
+/// in the registry to show it. Deprovisioning is idempotent (an
+/// already-absent slot/publication is success), so a connector that was
+/// never fully provisioned, or was already cleaned up by a previous
+/// attempt, still deletes cleanly.
 ///
-/// - Deprovision succeeds (or the connector is not `PostgreSQL`) -> the row
+/// - Deprovision succeeds, or there was nothing to deprovision -> the row
 ///   is deleted -> 204, same as before.
 /// - Deprovision fails and `?force` is absent/false -> the row is KEPT and
 ///   this returns 409, naming the slot/publication in the message. This is
@@ -515,8 +622,8 @@ fn deprovision_error_message(id: &str, slug: &ConnectorSlug, err: &DeprovisionEr
 ///
 /// # Errors
 ///
-/// 404 if `id` is unknown; 409 if `PostgreSQL` CDC deprovisioning failed
-/// and `force` was not given; 503/500 as above.
+/// 404 if `id` is unknown; 409 if CDC deprovisioning failed and `force`
+/// was not given; 503/500 as above.
 pub async fn delete(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -527,9 +634,7 @@ pub async fn delete(
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
     };
 
-    if dial_info.kind.to_lowercase().contains("postgres")
-        && let Err(err) = deprovision_postgres_connector(&state, &id, &dial_info).await
-    {
+    if let Err(err) = deprovision_postgres_connector(&state, &id, &dial_info).await {
         if query.force {
             let slug = connector_slug_for_id(&id).ok();
             tracing::error!(
@@ -893,5 +998,144 @@ mod tests {
                  connector-resolvable"
             );
         }
+    }
+
+    /// A [`ConnectorDialInfo`] fixture for [`deprovision_postgres_connector`]
+    /// unit tests — `kind`/`adapter`/`dial` vary per test, everything else
+    /// is filler.
+    fn dial_info(kind: &str, adapter: Option<&str>, dial: serde_json::Value) -> ConnectorDialInfo {
+        ConnectorDialInfo {
+            kind: kind.to_owned(),
+            // Deliberately shaped so `parse_postgres_host` succeeds and the
+            // connect attempt fails fast and deterministically (nothing
+            // listens on 127.0.0.1:1 — same trick
+            // `connector_deprovision`'s own
+            // `unreachable_host_surfaces_as_connect_error_not_a_hang` test
+            // uses), rather than depending on DNS behavior for an
+            // unresolvable hostname.
+            host: "dialuser@127.0.0.1:1/db".to_owned(),
+            secret_ref: "env:TEST_CONNECTOR_PASSWORD".to_owned(),
+            secret_ref_secondary: None,
+            adapter: adapter.map(str::to_owned),
+            dial,
+        }
+    }
+
+    /// A state whose `connector_secret_resolver` always resolves
+    /// `env:TEST_CONNECTOR_PASSWORD`, without touching the real process
+    /// environment or the production allowlist — these tests only need
+    /// credential resolution to succeed deterministically so execution
+    /// reaches the real dial attempt (and its slot/publication names),
+    /// never a real database.
+    fn state_with_stub_secret_resolver() -> AppState {
+        let mut state = state_without_pool();
+        state.connector_secret_resolver = std::sync::Arc::new(
+            lakehouse_core::secret::EnvSecretResolver::with_map(HashMap::from([(
+                "TEST_CONNECTOR_PASSWORD".to_owned(),
+                "unused-in-this-test".to_owned(),
+            )])),
+        );
+        state
+    }
+
+    /// WS3 plan review X4: an `adapter = "cdc"`
+    /// connector's slot/publication come from `dial`, with no fallback to a
+    /// slug derived from its own `id` — even when `kind` does not say
+    /// "`PostgreSQL`" at all, proving the dispatch is driven by `adapter`, not
+    /// `kind`. The names embedded in the resulting error are exactly what
+    /// was actually attempted, since the unreachable `127.0.0.1:1` target
+    /// makes [`connector_deprovision::drop_slot_and_publication`] fail
+    /// deterministically at the connect step, past both the adapter
+    /// dispatch and the credential resolution.
+    #[tokio::test]
+    async fn deprovision_reads_slot_and_publication_from_dial_for_cdc_adapter() {
+        let state = state_with_stub_secret_resolver();
+        let info = dial_info(
+            "Custom CDC System",
+            Some("cdc"),
+            serde_json::json!({
+                "driver": "postgres",
+                "host": "source.example.internal",
+                "port": 5432,
+                "database": "oms",
+                "user": "replicator",
+                "slotName": "dial_supplied_slot",
+                "publicationName": "dial_supplied_pub",
+            }),
+        );
+        let err = deprovision_postgres_connector(&state, "conn-cdc-dial-wins", &info)
+            .await
+            .expect_err("127.0.0.1:1 refuses every connection");
+        let text = err.to_string();
+        assert!(
+            text.contains("dial_supplied_slot") && text.contains("dial_supplied_pub"),
+            "expected the error to name dial's own slot/publication: {text}"
+        );
+        // The slug this connector's `id` would derive to must never appear
+        // -- proves `dial` won with NO fallback, not merely that it was
+        // tried first.
+        assert!(
+            !text.contains("conn_cdc_dial_wins"),
+            "the slug-derived name must never appear once adapter=cdc: {text}"
+        );
+    }
+
+    /// The exact defect this rule fixes: a `sql`-adapter connector must never
+    /// have `drop_slot`/`drop_publication` attempted, however its `kind`
+    /// string reads. Proven here at the unit level (rather than needing an
+    /// unreachable host to prove absence indirectly): `Ok(None)` with NO
+    /// dial attempt means this returns immediately, before ever resolving a
+    /// credential or touching the network.
+    #[tokio::test]
+    async fn deprovision_never_attempted_for_a_sql_adapter_even_when_kind_says_postgresql() {
+        let state = state_with_stub_secret_resolver();
+        let info = dial_info(
+            "PostgreSQL",
+            Some("sql"),
+            serde_json::json!({
+                "driver": "postgres",
+                "host": "warehouse.example.internal",
+                "port": 5432,
+                "database": "oms",
+                "user": "reader",
+            }),
+        );
+        let result = deprovision_postgres_connector(&state, "conn-sql-never-deprovisioned", &info)
+            .await
+            .expect("a sql-adapter connector must never even attempt a dial");
+        assert!(result.is_none());
+    }
+
+    /// The bounded legacy fallback: `adapter IS NULL` (a pre-WS3 row) and
+    /// `kind` names Postgres still falls back to the slug-derived names,
+    /// unchanged from before this task — proven by the connector's own `id`
+    /// slug appearing in the resulting error, since no `dial` exists to
+    /// provide anything else.
+    #[tokio::test]
+    async fn deprovision_falls_back_to_slug_derivation_only_when_adapter_is_null_and_kind_is_postgres()
+     {
+        let state = state_with_stub_secret_resolver();
+        let info = dial_info("PostgreSQL", None, serde_json::json!({}));
+        let err = deprovision_postgres_connector(&state, "conn-legacy-null-adapter", &info)
+            .await
+            .expect_err("127.0.0.1:1 refuses every connection");
+        let text = err.to_string();
+        assert!(
+            text.contains("conn_legacy_null_adapter_slot")
+                && text.contains("conn_legacy_null_adapter_pub"),
+            "expected the legacy path to fall back to the id-derived slug: {text}"
+        );
+    }
+
+    /// `adapter IS NULL` and `kind` does NOT name Postgres — nothing to
+    /// deprovision, same as any other non-CDC case.
+    #[tokio::test]
+    async fn deprovision_is_a_no_op_for_a_null_adapter_non_postgres_connector() {
+        let state = state_with_stub_secret_resolver();
+        let info = dial_info("Object storage", None, serde_json::json!({}));
+        let result = deprovision_postgres_connector(&state, "conn-s3-warehouse", &info)
+            .await
+            .expect("a non-Postgres, null-adapter connector must never attempt a dial");
+        assert!(result.is_none());
     }
 }

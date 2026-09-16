@@ -165,21 +165,46 @@ pub enum DeprovisionError {
     /// One of the queries this function issues did not complete within
     /// [`QUERY_TIMEOUT`] — a hung/unreachable source database must fail
     /// fast, not hang the `DELETE` request indefinitely.
-    #[error("deprovisioning connector {slug:?} timed out after {timeout_secs}s")]
+    #[error("deprovisioning {label} timed out after {timeout_secs}s")]
     Timeout {
-        /// The connector slug being deprovisioned.
-        slug: String,
+        /// What was being deprovisioned when the timeout hit — the
+        /// slot/publication name(s) involved, not a connector slug: since
+        /// WS3 plan review X4, a `cdc`-adapter connector's names come from
+        /// its `dial`, not from `ConnectorSlug`-deriving its `id`.
+        label: String,
         /// The timeout that was exceeded, in seconds.
         timeout_secs: u64,
+    },
+    /// `slot_name`/`publication_name` failed [`ConnectorSlug`]'s
+    /// identifier-safety check before any DDL was attempted. This is a
+    /// data-integrity problem, not a database failure: a `dial.slotName`/
+    /// `publicationName` value (or a slug-derived legacy name) that isn't
+    /// shaped like a safe SQL identifier must never reach the
+    /// `DROP PUBLICATION`/`pg_drop_replication_slot` calls below, which
+    /// inline it directly (see [`drop_publication`]'s doc comment for why
+    /// that inlining is safe only when the value has already been checked
+    /// this way).
+    #[error("{field} {value:?} is not a valid identifier: {source}")]
+    InvalidName {
+        /// Which name was rejected (`"slot_name"` or `"publication_name"`).
+        field: &'static str,
+        /// The rejected value, as given — never a credential, safe to
+        /// include (same reasoning as
+        /// [`CdcSpecError::InvalidConnectorSlug`](lakehouse_store::cdc::CdcSpecError::InvalidConnectorSlug)).
+        value: String,
+        /// The underlying validation failure.
+        #[source]
+        source: lakehouse_store::cdc::CdcSpecError,
     },
 }
 
 /// Bound a query future by [`QUERY_TIMEOUT`], collapsing "timed out" and
 /// the query's own error into [`DeprovisionError`] via `on_timeout`/`on_err`
 /// so every call site stays a single `.await?`-shaped line rather than
-/// repeating the same `match` five times.
+/// repeating the same `match` five times. `label` names whatever is being
+/// deprovisioned, for [`DeprovisionError::Timeout`]'s message only.
 async fn with_timeout<T, E>(
-    slug: &ConnectorSlug,
+    label: &str,
     future: impl Future<Output = Result<T, E>>,
     on_err: impl FnOnce(E) -> DeprovisionError,
 ) -> Result<T, DeprovisionError> {
@@ -187,17 +212,28 @@ async fn with_timeout<T, E>(
         Ok(Ok(value)) => Ok(value),
         Ok(Err(err)) => Err(on_err(err)),
         Err(_) => Err(DeprovisionError::Timeout {
-            slug: slug.to_string(),
+            label: label.to_owned(),
             timeout_secs: QUERY_TIMEOUT.as_secs(),
         }),
     }
 }
 
-/// Drop the replication slot and publication a `Postgres` CDC connector
-/// named `slug` was using, on the source database dialed via `target`.
+/// Drop the replication slot named `slot_name` and the publication named
+/// `publication_name` on the source database dialed via `target`.
 /// Idempotent: dropping an already-absent slot/publication is success, not
 /// an error — see the module doc comment's ordering section for why each
 /// step happens in this order.
+///
+/// `slot_name`/`publication_name` are taken directly rather than derived
+/// from a [`ConnectorSlug`], because a `cdc`-adapter connector's names come
+/// from its own `dial.slotName`/`dial.publicationName` (WS3 plan review
+/// X4) — they no longer always equal `"{slug}_slot"`/`"{slug}_pub"`. The
+/// guarantee this module still gives is that whatever name reaches a
+/// `DROP`/`pg_drop_replication_slot` call is always shaped like a safe SQL
+/// identifier: [`drop_publication`] and [`drop_slot`] each validate their
+/// name via [`ConnectorSlug::new`] before using it, so the property that
+/// used to be "always `{slug}_pub`" is now "always validated-identifier-
+/// shaped" instead.
 ///
 /// # Errors
 ///
@@ -206,13 +242,9 @@ async fn with_timeout<T, E>(
 /// [`DeprovisionError::Timeout`] rather than hanging the caller.
 pub async fn drop_slot_and_publication(
     target: &PgTarget,
-    slug: &ConnectorSlug,
+    slot_name: &str,
+    publication_name: &str,
 ) -> Result<Deprovisioned, DeprovisionError> {
-    // The slot and publication names are derived inside `drop_publication`
-    // and `drop_slot` from the validated slug, not composed here and passed
-    // down — see those functions on why that placement is what makes the
-    // no-injection guarantee structural rather than a property of this one
-    // call site.
     let options = PgConnectOptions::new()
         .host(&target.host)
         .port(target.port)
@@ -225,13 +257,16 @@ pub async fn drop_slot_and_publication(
         // default rather than leaving it to sqlx's own default.
         .ssl_mode(PgSslMode::Prefer);
 
-    let mut conn = with_timeout(slug, PgConnection::connect_with(&options), |source| {
-        DeprovisionError::Connect { source }
-    })
+    let connect_label = format!("slot {slot_name:?} / publication {publication_name:?}");
+    let mut conn = with_timeout(
+        &connect_label,
+        PgConnection::connect_with(&options),
+        |source| DeprovisionError::Connect { source },
+    )
     .await?;
 
-    let publication = drop_publication(&mut conn, slug).await?;
-    let slot = drop_slot(&mut conn, slug).await?;
+    let publication = drop_publication(&mut conn, publication_name).await?;
+    let slot = drop_slot(&mut conn, slot_name).await?;
 
     Ok(Deprovisioned { publication, slot })
 }
@@ -241,28 +276,34 @@ pub async fn drop_slot_and_publication(
 /// parameter, because Postgres' DDL grammar does not accept a bind
 /// parameter in place of an identifier (`DROP PUBLICATION $1` is a syntax
 /// error, not a safer version of this statement). Inlining an identifier
-/// is safe here ONLY because `publication_name` is built from a
-/// [`ConnectorSlug`] (`^[a-z0-9][a-z0-9_]{0,62}$`) plus a fixed `_pub`
-/// suffix — this function takes `&ConnectorSlug`, never a `&str`, so the
-/// type system (not this call site's care) is what guarantees there is
-/// nothing here to inject.
+/// is safe ONLY because `publication_name` is validated against
+/// [`ConnectorSlug`]'s shape (`^[a-z0-9][a-z0-9_]{0,62}$`) at the top of
+/// this function, before anything below touches it — this is no longer
+/// "always `{slug}_pub`" (WS3 plan review X4: a `cdc`-adapter connector's
+/// publication name comes from its own `dial.publicationName`, which need
+/// not match its `id`-derived slug at all), so the safety property this
+/// function now guarantees is "always validated-identifier-shaped", not
+/// "always slug-derived".
 ///
 /// Reports [`DropOutcome::NotPresent`] when the publication did not exist
 /// before this call, distinguishing that from actually having dropped one.
+///
+/// # Errors
+///
+/// Returns [`DeprovisionError::InvalidName`] if `publication_name` is not
+/// shaped like a valid [`ConnectorSlug`]. See [`DeprovisionError`]'s other
+/// variants for the database-level failures.
 async fn drop_publication(
     conn: &mut PgConnection,
-    slug: &ConnectorSlug,
+    publication_name: &str,
 ) -> Result<DropOutcome, DeprovisionError> {
-    // Derived HERE, from the validated slug, rather than accepted as a
-    // `&str` parameter. That is the whole point: with a `&str` the caller
-    // could hand this function any string and the "the type system
-    // guarantees it" claim above would be decorative — true of the one
-    // existing call site, and silently false the moment a second one
-    // appears. Building it inside makes the guarantee structural.
-    let publication_name = format!("{}_pub", slug.as_str());
-    let publication_name = publication_name.as_str();
+    ConnectorSlug::new(publication_name).map_err(|source| DeprovisionError::InvalidName {
+        field: "publication_name",
+        value: publication_name.to_owned(),
+        source,
+    })?;
     let existed: Option<(i32,)> = with_timeout(
-        slug,
+        publication_name,
         sqlx::query_as("SELECT 1 FROM pg_publication WHERE pubname = $1")
             .bind(publication_name)
             .fetch_optional(&mut *conn),
@@ -274,12 +315,14 @@ async fn drop_publication(
     .await?;
 
     let drop_sql = format!("DROP PUBLICATION IF EXISTS \"{publication_name}\"");
-    with_timeout(slug, sqlx::query(&drop_sql).execute(&mut *conn), |source| {
-        DeprovisionError::DropPublication {
+    with_timeout(
+        publication_name,
+        sqlx::query(&drop_sql).execute(&mut *conn),
+        |source| DeprovisionError::DropPublication {
             publication: publication_name.to_owned(),
             source,
-        }
-    })
+        },
+    )
     .await?;
 
     Ok(if existed.is_some() {
@@ -294,23 +337,34 @@ async fn drop_publication(
 /// here is bound as a `$1` VALUE (`pg_replication_slots.slot_name`,
 /// `pg_terminate_backend`'s pid argument, `pg_drop_replication_slot`'s name
 /// argument all accept a bind parameter — none of these are DDL identifier
-/// positions), so no inlining/validation argument is needed for this half.
+/// positions), so injection is not the risk `slot_name` is validated
+/// against below. It is still validated via [`ConnectorSlug::new`] anyway
+/// (WS3 plan review X4): `slot_name` now comes straight from a `cdc`-
+/// adapter connector's `dial.slotName`, and rejecting anything not shaped
+/// like a safe identifier up front keeps that value held to the same bar
+/// everywhere this crate accepts a slot/publication name, rather than
+/// depending on this one query-parameter-binding fact never changing.
+///
+/// # Errors
+///
+/// Returns [`DeprovisionError::InvalidName`] if `slot_name` is not shaped
+/// like a valid [`ConnectorSlug`]. See [`DeprovisionError`]'s other
+/// variants for the database-level failures.
 async fn drop_slot(
     conn: &mut PgConnection,
-    slug: &ConnectorSlug,
+    slot_name: &str,
 ) -> Result<DropOutcome, DeprovisionError> {
-    // Derived here for the same reason as in `drop_publication`. Injection
-    // is not the risk in this function (every identifier below is bound as
-    // a `$1` VALUE), but taking a name the caller composed would still let
-    // the two functions disagree about which slot they are acting on.
-    let slot_name = format!("{}_slot", slug.as_str());
-    let slot_name = slot_name.as_str();
+    ConnectorSlug::new(slot_name).map_err(|source| DeprovisionError::InvalidName {
+        field: "slot_name",
+        value: slot_name.to_owned(),
+        source,
+    })?;
     // A slot must be inactive before it can be dropped — if some process
     // (most likely a live `debezium-server`) is still consuming it,
     // terminate that backend's replication connection first. Absent slot
     // means this simply affects zero rows, which is fine.
     with_timeout(
-        slug,
+        slot_name,
         sqlx::query(
             "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots \
              WHERE slot_name = $1 AND active_pid IS NOT NULL",
@@ -329,7 +383,7 @@ async fn drop_slot(
     // `ops/debezium/deprovision_connector.sh`.
     for _ in 0..SLOT_INACTIVE_POLL_ATTEMPTS {
         let active: Option<(bool,)> = with_timeout(
-            slug,
+            slot_name,
             sqlx::query_as("SELECT active FROM pg_replication_slots WHERE slot_name = $1")
                 .bind(slot_name)
                 .fetch_optional(&mut *conn),
@@ -346,7 +400,7 @@ async fn drop_slot(
     }
 
     let exists: Option<(bool,)> = with_timeout(
-        slug,
+        slot_name,
         sqlx::query_as("SELECT active FROM pg_replication_slots WHERE slot_name = $1")
             .bind(slot_name)
             .fetch_optional(&mut *conn),
@@ -362,7 +416,7 @@ async fn drop_slot(
     };
 
     with_timeout(
-        slug,
+        slot_name,
         sqlx::query("SELECT pg_drop_replication_slot($1)")
             .bind(slot_name)
             .execute(&mut *conn),
@@ -410,8 +464,13 @@ mod tests {
     #[sqlx::test(migrations = false)]
     async fn absent_slot_and_publication_is_success_not_an_error(pool: PgPool) -> sqlx::Result<()> {
         let target = target_for(&pool);
-        let slug = ConnectorSlug::new("nope_never_provisioned").unwrap();
-        let result = drop_slot_and_publication(&target, &slug).await.unwrap();
+        let result = drop_slot_and_publication(
+            &target,
+            "nope_never_provisioned_slot",
+            "nope_never_provisioned_pub",
+        )
+        .await
+        .unwrap();
         assert_eq!(result.publication, DropOutcome::NotPresent);
         assert_eq!(result.slot, DropOutcome::NotPresent);
         Ok(())
@@ -421,13 +480,14 @@ mod tests {
     async fn existing_publication_is_dropped_and_reported_as_dropped(
         pool: PgPool,
     ) -> sqlx::Result<()> {
-        let slug = ConnectorSlug::new("realpub_test").unwrap();
         sqlx::query("CREATE PUBLICATION \"realpub_test_pub\" FOR ALL TABLES")
             .execute(&pool)
             .await?;
 
         let target = target_for(&pool);
-        let result = drop_slot_and_publication(&target, &slug).await.unwrap();
+        let result = drop_slot_and_publication(&target, "realpub_test_slot", "realpub_test_pub")
+            .await
+            .unwrap();
         assert_eq!(result.publication, DropOutcome::Dropped);
         assert_eq!(result.slot, DropOutcome::NotPresent);
 
@@ -440,8 +500,30 @@ mod tests {
         // Idempotent: calling again on an already-clean connector must
         // still succeed and report NotPresent, not fail.
         let target = target_for(&pool);
-        let second = drop_slot_and_publication(&target, &slug).await.unwrap();
+        let second = drop_slot_and_publication(&target, "realpub_test_slot", "realpub_test_pub")
+            .await
+            .unwrap();
         assert_eq!(second.publication, DropOutcome::NotPresent);
+        Ok(())
+    }
+
+    /// A `slot_name`/`publication_name` that is not shaped like a valid
+    /// [`ConnectorSlug`] (e.g. carries a double quote, which would let it
+    /// escape the `DROP PUBLICATION IF EXISTS "<name>"` identifier
+    /// quoting) must be rejected before any query runs, not merely produce
+    /// a Postgres-side syntax error — the whole point of WS3 plan review
+    /// X4's "always validated-identifier-shaped" guarantee.
+    #[sqlx::test(migrations = false)]
+    async fn invalid_publication_name_is_rejected_before_any_query(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let target = target_for(&pool);
+        let err = drop_slot_and_publication(&target, "safe_slot", "not a valid slug\"; --")
+            .await
+            .expect_err("a non-slug-shaped publication name must be rejected");
+        assert!(
+            matches!(err, DeprovisionError::InvalidName { field, .. } if field == "publication_name")
+        );
         Ok(())
     }
 
@@ -454,11 +536,11 @@ mod tests {
             password: SecretValue::new("postgres"),
             database: "postgres".to_owned(),
         };
-        let slug = ConnectorSlug::new("unreachable_test").unwrap();
         let started = std::time::Instant::now();
-        let err = drop_slot_and_publication(&target, &slug)
-            .await
-            .expect_err("nothing listens on port 1");
+        let err =
+            drop_slot_and_publication(&target, "unreachable_test_slot", "unreachable_test_pub")
+                .await
+                .expect_err("nothing listens on port 1");
         assert!(started.elapsed() < QUERY_TIMEOUT + Duration::from_secs(2));
         assert!(matches!(
             err,

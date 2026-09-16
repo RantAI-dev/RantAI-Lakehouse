@@ -583,6 +583,11 @@ mod tests {
             host: host.to_owned(),
             secret_ref: secret_ref.to_owned(),
             secret_ref_secondary: secondary.map(str::to_owned),
+            // These tests exercise `probe`'s type-based dispatch, not the
+            // adapter-based deprovision dispatch WS3 added — every case
+            // here is a pre-WS3-shaped fixture (WS3 plan review X4).
+            adapter: None,
+            dial: serde_json::json!({}),
         }
     }
 

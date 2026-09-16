@@ -505,6 +505,18 @@ pub struct ConnectorTestResult {
 /// [`Connector`] or [`ConnectorRow`] — see that type's doc comment for why
 /// it has no `Debug` impl at all.
 ///
+/// The raw row shape [`get_connector_dial_info`]'s query returns, before
+/// it's reshaped into [`ConnectorDialInfo`] — named purely to satisfy
+/// `clippy::type_complexity`, not used anywhere else.
+type ConnectorDialInfoRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    serde_json::Value,
+);
+
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
@@ -512,18 +524,21 @@ pub async fn get_connector_dial_info(
     pool: &PgPool,
     id: &str,
 ) -> Result<Option<ConnectorDialInfo>, StoreError> {
-    let row: Option<(String, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT type, host, secret_ref, secret_ref_secondary FROM connector WHERE id = $1",
+    let row: Option<ConnectorDialInfoRow> = sqlx::query_as(
+        "SELECT type, host, secret_ref, secret_ref_secondary, adapter, dial FROM connector \
+             WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(
-        |(kind, host, secret_ref, secret_ref_secondary)| ConnectorDialInfo {
+        |(kind, host, secret_ref, secret_ref_secondary, adapter, dial)| ConnectorDialInfo {
             kind,
             host,
             secret_ref,
             secret_ref_secondary,
+            adapter,
+            dial,
         },
     ))
 }
@@ -555,6 +570,22 @@ pub struct ConnectorDialInfo {
     /// two (e.g. S3 access key id + secret access key). `None` for types
     /// that only ever need one.
     pub secret_ref_secondary: Option<String>,
+    /// One of `sql | cdc | files | rest | sheets` (`connector_adapter_check`,
+    /// `0033_connector_ingest_spec.sql`), or `None` for a connector row
+    /// created before that migration added the column ("not ingestible
+    /// yet"). This is what `lakehouse-api`'s connector-deletion deprovision
+    /// step dispatches on (WS3 plan review X4): only `adapter = "cdc"`, or
+    /// the bounded `adapter IS NULL` legacy-Postgres case, ever attempts to
+    /// drop a replication slot/publication — a `sql`/`files`/`rest`/
+    /// `sheets` connector never had one, regardless of what its `kind`
+    /// string says.
+    pub adapter: Option<String>,
+    /// The connector's raw ingest `dial` (`{}` until `set_ingest_spec` has
+    /// ever been called — `0033`'s column default). Handed back unparsed
+    /// rather than as a `crate::ingest_spec::Dial` because the one caller
+    /// that needs it (the deprovision step, for `adapter = "cdc"`) is the
+    /// only place that knows which shape to parse it against.
+    pub dial: serde_json::Value,
 }
 
 /// Caller-supplied fields for [`set_ingest_spec`]. Mirrors `IngestSpecInput`
