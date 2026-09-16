@@ -169,6 +169,21 @@ pub enum RestAuth {
     Basic,
 }
 
+impl RestAuth {
+    /// The `type` tag this variant serializes under — the same string
+    /// `secret_map.secret_field_names`/[`secret_field_names`] key on for a
+    /// `rest` adapter's `auth_type` (WS3 plan review Z6).
+    #[must_use]
+    pub fn type_tag(&self) -> &'static str {
+        match self {
+            RestAuth::ApiKey { .. } => "api_key",
+            RestAuth::Bearer => "bearer",
+            RestAuth::Oauth2ClientCredentials { .. } => "oauth2_client_credentials",
+            RestAuth::Basic => "basic",
+        }
+    }
+}
+
 /// A `rest` adapter's pagination shape, internally tagged on `type`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase", tag = "type")]
@@ -287,6 +302,19 @@ impl Dial {
     pub fn as_cdc(&self) -> Option<&CdcDial> {
         match self {
             Dial::Cdc(dial) => Some(dial),
+            _ => None,
+        }
+    }
+
+    /// The `rest` adapter's `dial.auth.type` tag, or `None` for any other
+    /// adapter — the `auth_type` [`secret_field_names`] keys on for
+    /// `rest` (WS3 plan review Z6). Used by
+    /// [`crate::connectors::set_ingest_spec`] to look up how many secret
+    /// refs this spec needs.
+    #[must_use]
+    pub fn rest_auth_type(&self) -> Option<&'static str> {
+        match self {
+            Dial::Rest(rest) => Some(rest.auth.type_tag()),
             _ => None,
         }
     }
@@ -445,6 +473,98 @@ pub fn validate_hostname(field: &'static str, host: &str) -> Result<(), InvalidH
             field,
             value: host.to_owned(),
         })
+    }
+}
+
+/// The ONE `(adapter, auth type) -> named secret fields` mapping (WS3
+/// plan review Z6), used by [`crate::connectors::set_ingest_spec`] to
+/// require the right NUMBER of secret refs for a given adapter/auth-type
+/// combination at SAVE time.
+///
+/// Mirrors `dagster/dispar_orchestrate/secret_map.py`'s
+/// `SECRET_FIELD_NAMES` dict EXACTLY -- see that module's doc comment for
+/// why this is a same-commit literal pin, not a cross-language import
+/// (this workspace has none), and the bug this pin replaces: an earlier
+/// Dagster-side revision derived an env-var name from a principal-chosen
+/// connector id instead of consulting a named mapping like this one. A
+/// Rust-side change to this `match` must land in the same commit as the
+/// matching Python-side change (the same discipline `column_gate.py` and
+/// `cdc.rs::NESTED_TYPE_MARKERS` already carry, X9).
+///
+/// `auth_type` is consulted only for `adapter == "rest"` — every other
+/// adapter's field count does not depend on it. Returns `None` for a
+/// combination this mapping does not recognize; the caller ([`crate::connectors::set_ingest_spec`])
+/// turns that into [`crate::StoreError::Validation`], never a silent
+/// default.
+#[must_use]
+pub fn secret_field_names(
+    adapter: &str,
+    auth_type: Option<&str>,
+) -> Option<&'static [&'static str]> {
+    match (adapter, auth_type) {
+        ("sql" | "cdc", _) => Some(&["password"]),
+        ("files", _) => Some(&["accessKey", "secretKey"]),
+        ("rest", Some("api_key")) => Some(&["apiKey"]),
+        ("rest", Some("bearer")) => Some(&["token"]),
+        ("rest", Some("basic")) => Some(&["username", "password"]),
+        ("rest", Some("oauth2_client_credentials")) => Some(&["clientId", "clientSecret"]),
+        ("sheets", _) => Some(&["serviceAccountJson"]),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod secret_field_tests {
+    use super::secret_field_names;
+
+    #[test]
+    fn secret_field_names_matches_the_ported_python_mapping() {
+        // The Python port (secret_map.py) hardcodes the SAME pairs in its
+        // own SECRET_FIELD_NAMES dict -- this test's only job is to be
+        // the thing that breaks if this match is ever edited without a
+        // matching Python edit in the same commit (X9's discipline).
+        assert_eq!(
+            secret_field_names("sql", None),
+            Some(["password"].as_slice())
+        );
+        assert_eq!(
+            secret_field_names("cdc", None),
+            Some(["password"].as_slice())
+        );
+        assert_eq!(
+            secret_field_names("files", None),
+            Some(["accessKey", "secretKey"].as_slice())
+        );
+        assert_eq!(
+            secret_field_names("rest", Some("api_key")),
+            Some(["apiKey"].as_slice())
+        );
+        assert_eq!(
+            secret_field_names("rest", Some("bearer")),
+            Some(["token"].as_slice())
+        );
+        assert_eq!(
+            secret_field_names("rest", Some("basic")),
+            Some(["username", "password"].as_slice())
+        );
+        assert_eq!(
+            secret_field_names("rest", Some("oauth2_client_credentials")),
+            Some(["clientId", "clientSecret"].as_slice())
+        );
+        assert_eq!(
+            secret_field_names("sheets", None),
+            Some(["serviceAccountJson"].as_slice())
+        );
+        assert_eq!(secret_field_names("rest", Some("not-a-real-type")), None);
+        assert_eq!(secret_field_names("smtp", None), None);
+    }
+
+    #[test]
+    fn secret_field_names_ignores_auth_type_for_non_rest_adapters() {
+        assert_eq!(
+            secret_field_names("sql", Some("bearer")),
+            Some(["password"].as_slice())
+        );
     }
 }
 

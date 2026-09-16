@@ -632,22 +632,37 @@ async fn get_connector_dial_info_includes_adapter_and_dial(pool: PgPool) -> sqlx
 /// `set_ingest_spec` writes a valid `dial`, and `get_ingest_spec` reads it
 /// back, including the connector's existing `secretRef` (never resolved,
 /// only named — see `IngestSecretRefs`'s doc comment).
+///
+/// Uses `sql`, not `files`: `secret_field_names("files", None)` needs
+/// TWO secret refs (`accessKey`+`secretKey`, WS3 plan review Z6), so a
+/// `files` spec would no longer round-trip against `minimal_input`'s
+/// single `secretRef` — this test is about the round trip itself, not
+/// that particular adapter's secret-count rule, so it picks the adapter
+/// (`sql`) whose single-field mapping matches `minimal_input` as-is,
+/// letting this test still assert `secret_refs.secondary == None`
+/// meaningfully.
 #[sqlx::test(migrations = "../../migrations")]
 async fn set_ingest_spec_then_get_round_trips(pool: PgPool) -> sqlx::Result<()> {
     let created = create_connector(&pool, &minimal_input("ingest spec round trip"))
         .await
         .unwrap();
     let spec = IngestSpecInput {
-        adapter: "files".to_owned(),
+        adapter: "sql".to_owned(),
         ingest_mode: "batch".to_owned(),
-        dial: serde_json::json!({"protocol": "s3", "bucket": "b", "format": "csv"}),
+        dial: serde_json::json!({
+            "driver": "postgres",
+            "host": "source.example.internal",
+            "port": 5432,
+            "database": "orders",
+            "user": "app_reader",
+        }),
         source_objects: serde_json::json!([]),
         schedule_cron: Some("0 * * * *".to_owned()),
     };
     set_ingest_spec(&pool, &created.id, &spec).await.unwrap();
 
     let read = get_ingest_spec(&pool, &created.id).await.unwrap().unwrap();
-    assert_eq!(read.adapter.as_deref(), Some("files"));
+    assert_eq!(read.adapter.as_deref(), Some("sql"));
     assert_eq!(read.ingest_mode.as_deref(), Some("batch"));
     assert_eq!(read.dial, spec.dial);
     assert_eq!(read.schedule_cron.as_deref(), Some("0 * * * *"));
@@ -689,6 +704,155 @@ async fn set_ingest_spec_rejects_a_dial_that_fails_adapter_validation(
         "an invalid dial must never be persisted"
     );
     assert_eq!(read.dial, serde_json::json!({}));
+    Ok(())
+}
+
+/// WS3 plan review Z6: a `rest` connector saved with `auth.type = "basic"`
+/// needs TWO secret refs (`secret_map.secret_field_names`/
+/// `ingest_spec::secret_field_names` both map `("rest", "basic")` to
+/// `("username", "password")`), but `minimal_input` only ever sets
+/// `secret_ref`, leaving `secret_ref_secondary` `None`. `set_ingest_spec`
+/// must reject this at SAVE time, not let it through to be discovered as
+/// a `KeyError` inside `secret_resolver.resolve_secrets` at run time.
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_ingest_spec_rejects_basic_auth_rest_with_only_one_secret_ref(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = create_connector(&pool, &minimal_input("rest basic auth one secret"))
+        .await
+        .unwrap();
+    let spec = IngestSpecInput {
+        adapter: "rest".to_owned(),
+        ingest_mode: "batch".to_owned(),
+        dial: serde_json::json!({
+            "baseUrl": "https://api.example.internal",
+            "auth": {"type": "basic"},
+            "pagination": {"type": "none"},
+            "endpoints": [],
+        }),
+        source_objects: serde_json::json!([]),
+        schedule_cron: None,
+    };
+    let err = set_ingest_spec(&pool, &created.id, &spec)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Validation(_)));
+
+    // The rejected spec must never have reached the row.
+    let read = get_ingest_spec(&pool, &created.id).await.unwrap().unwrap();
+    assert_eq!(
+        read.adapter, None,
+        "a spec whose secret-ref count doesn't match its adapter/auth combination must never be persisted"
+    );
+    Ok(())
+}
+
+/// The positive control for the test above: a `rest`/`basic` connector
+/// created WITH both secret refs set is accepted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_ingest_spec_accepts_basic_auth_rest_with_two_secret_refs(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = create_connector(
+        &pool,
+        &CreateConnectorInput {
+            secret_ref_secondary: Some("env:INGEST_SPEC_TEST_TOKEN_SECONDARY".to_owned()),
+            ..minimal_input("rest basic auth two secrets")
+        },
+    )
+    .await
+    .unwrap();
+    let spec = IngestSpecInput {
+        adapter: "rest".to_owned(),
+        ingest_mode: "batch".to_owned(),
+        dial: serde_json::json!({
+            "baseUrl": "https://api.example.internal",
+            "auth": {"type": "basic"},
+            "pagination": {"type": "none"},
+            "endpoints": [],
+        }),
+        source_objects: serde_json::json!([]),
+        schedule_cron: None,
+    };
+    set_ingest_spec(&pool, &created.id, &spec).await.unwrap();
+
+    let read = get_ingest_spec(&pool, &created.id).await.unwrap().unwrap();
+    assert_eq!(read.adapter.as_deref(), Some("rest"));
+    Ok(())
+}
+
+/// A `sheets` adapter only ever needs ONE secret ref
+/// (`secret_field_names("sheets", None) == ("serviceAccountJson",)`), so
+/// `minimal_input`'s single `secret_ref` (no secondary) is sufficient —
+/// this is the "the validation two tests above does not over-reject the
+/// common case" check.
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_ingest_spec_accepts_sheets_adapter_with_one_secret_ref(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = create_connector(&pool, &minimal_input("sheets adapter one secret"))
+        .await
+        .unwrap();
+    let spec = IngestSpecInput {
+        adapter: "sheets".to_owned(),
+        ingest_mode: "batch".to_owned(),
+        dial: serde_json::json!({"spreadsheetId": "abc123", "ranges": ["Sheet1!A1:B2"]}),
+        source_objects: serde_json::json!([]),
+        schedule_cron: None,
+    };
+    set_ingest_spec(&pool, &created.id, &spec).await.unwrap();
+    Ok(())
+}
+
+/// A `files` adapter needs TWO secret refs
+/// (`secret_field_names("files", None) == ("accessKey", "secretKey")`);
+/// `minimal_input` alone (one `secretRef`, no secondary) must be
+/// rejected, complementing the `rest`/`basic` case tested above with a
+/// second adapter that also needs two.
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_ingest_spec_rejects_files_adapter_with_only_one_secret_ref(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = create_connector(&pool, &minimal_input("files adapter one secret rejected"))
+        .await
+        .unwrap();
+    let spec = IngestSpecInput {
+        adapter: "files".to_owned(),
+        ingest_mode: "batch".to_owned(),
+        dial: serde_json::json!({"protocol": "s3", "bucket": "b", "format": "csv"}),
+        source_objects: serde_json::json!([]),
+        schedule_cron: None,
+    };
+    let err = set_ingest_spec(&pool, &created.id, &spec)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Validation(_)));
+    Ok(())
+}
+
+/// The positive control: a `files` connector created WITH both secret
+/// refs set is accepted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_ingest_spec_accepts_files_adapter_with_two_secret_refs(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = create_connector(
+        &pool,
+        &CreateConnectorInput {
+            secret_ref_secondary: Some("env:INGEST_SPEC_TEST_TOKEN_SECONDARY".to_owned()),
+            ..minimal_input("files adapter two secrets")
+        },
+    )
+    .await
+    .unwrap();
+    let spec = IngestSpecInput {
+        adapter: "files".to_owned(),
+        ingest_mode: "batch".to_owned(),
+        dial: serde_json::json!({"protocol": "s3", "bucket": "b", "format": "csv"}),
+        source_objects: serde_json::json!([]),
+        schedule_cron: None,
+    };
+    set_ingest_spec(&pool, &created.id, &spec).await.unwrap();
     Ok(())
 }
 

@@ -724,19 +724,65 @@ pub async fn get_ingest_spec(pool: &PgPool, id: &str) -> Result<Option<IngestSpe
 /// [`StoreError::Validation`] and never reaches the `UPDATE` below, so a
 /// half-written or malformed `dial` is never persisted.
 ///
+/// Second (WS3 plan review Z6): once the `dial` shape itself is valid,
+/// this checks that the connector's declared secret refs are ENOUGH for
+/// what `spec.adapter` (and, for `rest`, `dial.auth.type`) needs —
+/// [`crate::ingest_spec::secret_field_names`] names the ordered fields
+/// (mirrored by `dagster/dispar_orchestrate/secret_map.py`'s
+/// `SECRET_FIELD_NAMES`, same commit), and a two-field combination
+/// (e.g. `rest`/`basic` needs `username`+`password`) REQUIRES
+/// `secret_ref_secondary` to already be set on the connector row. A
+/// mismatch is rejected here, at SAVE time, rather than surfacing as a
+/// `KeyError` deep inside `secret_resolver.resolve_secrets`
+/// (`dagster/dispar_orchestrate/secret_resolver.py`) when a Dagster
+/// ingest job actually runs.
+///
 /// # Errors
 ///
 /// Returns [`StoreError::Validation`] if `spec.dial` fails
-/// [`crate::ingest_spec::Dial::parse`] for `spec.adapter`. Returns
-/// [`StoreError::NotFound`] if `id` does not name a connector. Returns
-/// [`StoreError::Database`] on any other failure.
+/// [`crate::ingest_spec::Dial::parse`] for `spec.adapter`, or if the
+/// connector's secret-ref count does not match
+/// [`crate::ingest_spec::secret_field_names`] for `spec.adapter`/the
+/// dial's auth type. Returns [`StoreError::NotFound`] if `id` does not
+/// name a connector. Returns [`StoreError::Database`] on any other
+/// failure.
 pub async fn set_ingest_spec(
     pool: &PgPool,
     id: &str,
     spec: &IngestSpecInput,
 ) -> Result<IngestSpec, StoreError> {
-    crate::ingest_spec::Dial::parse(&spec.adapter, &spec.dial)
+    let dial = crate::ingest_spec::Dial::parse(&spec.adapter, &spec.dial)
         .map_err(|err| StoreError::Validation(err.to_string()))?;
+
+    let auth_type = dial.rest_auth_type();
+    let fields =
+        crate::ingest_spec::secret_field_names(&spec.adapter, auth_type).ok_or_else(|| {
+            StoreError::Validation(format!(
+                "no secret field mapping for adapter {:?} auth_type {auth_type:?}",
+                spec.adapter
+            ))
+        })?;
+
+    // Read the connector's OWN declared secret-ref count before writing —
+    // never derived from `id` (the exact bug Z6 replaces on the Dagster
+    // side), only from the row this connector already carries.
+    let secret_ref_secondary = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT secret_ref_secondary FROM connector WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or(StoreError::NotFound)?;
+
+    if fields.len() == 2 && secret_ref_secondary.is_none() {
+        return Err(StoreError::Validation(format!(
+            "adapter {:?} auth_type {auth_type:?} needs {} secret refs (fields: {:?}), but this \
+             connector has only secretRef set, no secretRefSecondary",
+            spec.adapter,
+            fields.len(),
+            fields
+        )));
+    }
 
     let row: Option<IngestSpecRow> = sqlx::query_as(
         "UPDATE connector SET adapter = $2, ingest_mode = $3, dial = $4, source_objects = $5, \
