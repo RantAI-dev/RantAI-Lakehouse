@@ -480,6 +480,56 @@ async fn seeded_data_engineer_may_get_and_put_ingest_spec() {
     assert_ne!(put_resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// # SSRF: `PUT .../ingest-spec` refuses an obviously-internal dial host at
+/// save time
+///
+/// This is a SECOND, non-authoritative check, on top of the dial-time
+/// guard `connector_probe::resolve_checked`/Dagster's own `ssrf_guard`
+/// already run — see `routes::connectors::ingest_spec_put`'s doc comment
+/// for why a save-time check can never be the guarantee (DNS can change
+/// between this `PUT` and a later `POST .../ingest/run`) and exists only
+/// to fail fast on the common case (WS3 plan judge review Z1).
+#[tokio::test]
+async fn ingest_spec_put_rejects_a_dial_whose_host_resolves_internal() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id = create_principal_with_permissions(&pool, "connector:manage").await;
+    let cookie = session_cookie_for_user(&pool, user_id).await;
+
+    let body = serde_json::json!({
+        "adapter": "rest",
+        "ingestMode": "batch",
+        "dial": {
+            "baseUrl": "http://127.0.0.1:9999",
+            "auth": {"type": "bearer"},
+            "pagination": {"type": "none"},
+            "endpoints": [],
+        },
+        "sourceObjects": [],
+    });
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/connectors/conn-pg-lakehouse/ingest-spec")
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&body).expect("serialize body"),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "a rest dial whose baseUrl resolves to a loopback address must be refused at save \
+         time, not just discovered on the next scheduled ingest run"
+    );
+}
+
 /// # Input validation: malformed body -> 400 with the `{"error": "..."}`
 /// envelope
 ///

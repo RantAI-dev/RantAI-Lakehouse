@@ -236,7 +236,17 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
 /// pattern-matching the literal `host` string. Returns `Err` with a message
 /// safe to surface directly (never includes upstream response data — there
 /// is none at this stage, only DNS resolution).
-async fn resolve_checked(host: &str, port: u16, allow_internal_hosts: bool) -> Result<(), String> {
+///
+/// `pub(crate)`, not private: `routes::connectors::ingest_spec_put` calls
+/// this directly to run the SAME check as a second, non-authoritative
+/// SSRF guard at `PUT .../ingest-spec` save time (WS3 plan judge review
+/// Z1) — see that function's doc comment for why a save-time check can
+/// only ever be advisory, not a substitute for this dial-time one.
+pub(crate) async fn resolve_checked(
+    host: &str,
+    port: u16,
+    allow_internal_hosts: bool,
+) -> Result<(), String> {
     let addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host((host, port)).await {
         Ok(iter) => iter.collect(),
         Err(err) => return Err(format!("could not resolve host {host:?}: {err}")),
@@ -405,7 +415,13 @@ fn parse_s3_host(host: &str) -> Option<(&str, &str)> {
 /// without pulling in a full URL-parsing dependency — `object_store`'s
 /// `AmazonS3Builder::with_endpoint` only ever needs `host`/`port` from
 /// this to be handed to [`resolve_checked`], not the whole URL structure.
-fn parse_endpoint_host_port(endpoint: &str) -> Option<(&str, u16)> {
+///
+/// `pub(crate)`, not private: `routes::connectors::ingest_spec_put` reuses
+/// this to pull `host`/`port` out of a `files` adapter's `dial.endpoint`
+/// and a `rest` adapter's `dial.baseUrl` for the same save-time SSRF check
+/// [`resolve_checked`]'s doc comment describes — the two adapters whose
+/// dial shape names a URL rather than a bare `host`/`port` pair.
+pub(crate) fn parse_endpoint_host_port(endpoint: &str) -> Option<(&str, u16)> {
     let (authority, default_port) = if let Some(rest) = endpoint.strip_prefix("https://") {
         (rest, 443)
     } else if let Some(rest) = endpoint.strip_prefix("http://") {

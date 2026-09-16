@@ -24,6 +24,7 @@ use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::cdc::ConnectorSlug;
 use lakehouse_store::connectors::{self, ConnectorDetail, ConnectorDialInfo, CreateConnectorInput};
+use lakehouse_store::ingest_spec::Dial;
 use serde::{Deserialize, Serialize};
 
 use crate::connector_deprovision::{self, DeprovisionError, Deprovisioned, PgTarget};
@@ -601,6 +602,45 @@ pub struct IngestSpecBody {
     schedule_cron: Option<String>,
 }
 
+/// A second, non-authoritative SSRF check on `dial`'s host, run at
+/// `PUT .../ingest-spec` SAVE time — see [`ingest_spec_put`]'s doc comment
+/// for why this can only ever be advisory and what stays authoritative.
+///
+/// Checks `sql`/`cdc` (`dial.host`/`dial.port` directly), `files` (only
+/// when `dial.endpoint` is set — a `files` dial with no endpoint override
+/// has no caller-supplied host to check) and `rest` (`dial.baseUrl`,
+/// parsed the same way [`connector_probe::probe_s3`] parses an S3
+/// endpoint) against [`connector_probe::resolve_checked`], gated the SAME
+/// way [`connector_probe::probe`] already is by
+/// `state.config.connector_probe_allow_internal_hosts`. Never checks
+/// `sheets`: its dial names a spreadsheet id, not a caller-chosen host —
+/// every `sheets` connector targets Google's own fixed hosts.
+///
+/// # Errors
+///
+/// Returns `ApiError::BadRequest` naming the offending resolved address
+/// (the same message [`connector_probe::resolve_checked`] already produces
+/// for `POST .../test`) if a checked host resolves to a private/internal
+/// address and `allow_internal_hosts` is `false`.
+async fn check_dial_ssrf(dial: &Dial, allow_internal_hosts: bool) -> Result<(), ApiError> {
+    let host_port: Option<(&str, u16)> = match dial {
+        Dial::Sql(sql) => Some((sql.host.as_str(), sql.port)),
+        Dial::Cdc(cdc) => Some((cdc.host.as_str(), cdc.port)),
+        Dial::Files(files) => files
+            .endpoint
+            .as_deref()
+            .and_then(connector_probe::parse_endpoint_host_port),
+        Dial::Rest(rest) => connector_probe::parse_endpoint_host_port(&rest.base_url),
+        Dial::Sheets(_) => None,
+    };
+    let Some((host, port)) = host_port else {
+        return Ok(());
+    };
+    connector_probe::resolve_checked(host, port, allow_internal_hosts)
+        .await
+        .map_err(ApiError::BadRequest)
+}
+
 /// `PUT /api/connectors/{id}/ingest-spec` — set a connector's ingest
 /// configuration.
 ///
@@ -611,18 +651,40 @@ pub struct IngestSpecBody {
 /// invalid `dial` (unknown field, missing required field, unsafe hostname)
 /// never reaches the database.
 ///
+/// # A second, non-authoritative SSRF check runs here too
+///
+/// Once `dial` parses, this handler ALSO extracts its host (see
+/// [`check_dial_ssrf`]) and runs it through
+/// [`connector_probe::resolve_checked`] — the SAME check [`connector_probe`]
+/// runs before a real dial. This is deliberately NOT the authoritative
+/// guard: DNS can change between this save and a later
+/// `POST .../ingest/run`, so the check that actually matters stays at dial
+/// time, inside `connector_probe` for a Rust-side probe and inside
+/// Dagster's own `ssrf_guard.resolve_checked` for an ingestion job. This
+/// save-time copy exists only to fail fast on the common case — a caller
+/// pastes an obviously-internal host and finds out immediately, at save
+/// time, rather than on the next scheduled run (WS3 plan judge review Z1).
+///
 /// # Errors
 ///
 /// 404 if `id` is unknown; 400 if `dial` fails
-/// `ingest_spec::Dial::parse` for `adapter` (`StoreError::Validation` maps
-/// to `ApiError::BadRequest`, never `Internal` — the validator's own
-/// message is safe to surface); 503/500 as above.
+/// `ingest_spec::Dial::parse` for `adapter`, or if [`check_dial_ssrf`]
+/// refuses `dial`'s host (`StoreError::Validation` maps to
+/// `ApiError::BadRequest`, never `Internal` — both messages are safe to
+/// surface); 503/500 as above.
 pub async fn ingest_spec_put(
     State(state): State<AppState>,
     Path(id): Path<String>,
     body: Bytes,
 ) -> ApiResult<ApiJson<connectors::IngestSpec>> {
     let body: IngestSpecBody = parse_body(&body)?;
+    // Parsed here, in the route, ahead of `set_ingest_spec`'s own (later,
+    // authoritative-for-persistence) `Dial::parse` call: this handler
+    // needs the typed `Dial` itself to extract a host for
+    // `check_dial_ssrf`, which `set_ingest_spec` never returns.
+    let dial = Dial::parse(&body.adapter, &body.dial)
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    check_dial_ssrf(&dial, state.config.connector_probe_allow_internal_hosts).await?;
     let input = connectors::IngestSpecInput {
         adapter: body.adapter,
         ingest_mode: body.ingest_mode,
