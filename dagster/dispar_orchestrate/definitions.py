@@ -17,6 +17,7 @@ from dispar_orchestrate.capacity_snapshot import (
     capacity_snapshot_schedule,
 )
 from dispar_orchestrate.gold_export import gold_export_job
+from dispar_orchestrate.ingest_factory import ingest_job, ingest_schedules
 from dispar_orchestrate.maintenance import (
     bronze_maintenance_job,
     bronze_maintenance_schedule,
@@ -68,6 +69,7 @@ defs = Definitions(
         agent_run_job,
         alerts_run_job,
         capacity_snapshot_job,
+        ingest_job,
     ],
     schedules=[
         bronze_maintenance_schedule,
@@ -75,5 +77,6 @@ defs = Definitions(
         alerts_run_schedule,
         *agent_run_schedules,
         capacity_snapshot_schedule,
+        *ingest_schedules,
     ],
 )
