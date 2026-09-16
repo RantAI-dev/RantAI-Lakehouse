@@ -636,8 +636,11 @@ async fn probe_rest(
 /// `sheets` ships `supported: false` unconditionally in Tier 1 (WS3 plan
 /// review Z10, open question 4): a real Google service-account
 /// JWT-bearer token exchange requires SIGNING a claim set with the
-/// account's RSA private key, and this workspace has no verified
-/// crypto-signing dependency wired up to do that correctly — mirrors
+/// account's RSA private key, and no such signing path has been
+/// implemented or verified against a real service account. `jsonwebtoken =
+/// "9"` (`rust/Cargo.toml`) is already a workspace dependency, but
+/// `lakehouse-auth`'s `oidc` module uses it to VERIFY tokens this API
+/// receives, not to MINT a service-account assertion — mirrors
 /// `dagster/dispar_orchestrate`'s own `adapters/sheets.py`, which ships
 /// the SAME unconditional `supported: false` for the same reason on the
 /// Dagster side. This function therefore never resolves a `secretRef` and

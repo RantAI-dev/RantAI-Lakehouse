@@ -24,9 +24,9 @@
 //! nothing) — there is no `MySQL` or SQL Server live-database fixture
 //! inside `cargo test`. [`discover_sql_postgres`] therefore has a real, live
 //! `#[sqlx::test]` proof in this task; [`discover_sql_mysql`] and
-//! [`discover_sql_mssql`] do not, and are instead exercised by Task I2's
-//! G6 gate, which stands up real `mysql-g6`/`mssql-g6` compose services
-//! and calls this route over real HTTP against them. This is deliberate
+//! [`discover_sql_mssql`] do not, and are instead exercised by the
+//! `ops/g6` gate against real `mysql`/`mssql` compose services, calling
+//! this route over real HTTP against them. This is deliberate
 //! coverage placement (stated in the plan), not a gap left unmentioned.
 //!
 //! # Scope: `sql`/`cdc` only in this task
@@ -62,9 +62,9 @@ pub struct DiscoveredColumn {
 }
 
 /// One discovered table (or, for a future non-SQL adapter, an equivalent
-/// object) — `name` is `"<schema>.<table>"`, matching `SourceObject.name`'s
-/// shape (Task A3), so a caller can copy it directly into an ingest spec's
-/// `sourceObjects`.
+/// object) — `name` is `"<schema>.<table>"`, matching the `SourceObject.name`
+/// shape (`lakehouse_store::ingest_spec::SourceObject`), so a caller can copy
+/// it directly into an ingest spec's `sourceObjects`.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredObject {
@@ -256,8 +256,8 @@ pub async fn discover_sql_mysql(
 }
 
 // SQL Server's own `INFORMATION_SCHEMA.COLUMNS` (T-SQL is
-// case-insensitive for identifiers by default) — `tiberius` (not `sqlx`;
-// Task E1) uses `@P1`-numbered parameters, not `?`/`$1`.
+// case-insensitive for identifiers by default) — `tiberius` (not `sqlx`)
+// uses `@P1`-numbered parameters, not `?`/`$1`.
 pub(crate) const MSSQL_DISCOVER_QUERY: &str = "SELECT table_name, column_name, data_type FROM \
     information_schema.columns WHERE table_schema = @P1 ORDER BY table_name, ordinal_position";
 

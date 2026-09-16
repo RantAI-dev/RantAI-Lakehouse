@@ -14,7 +14,7 @@ import type { Asset } from "@/services/contracts/assets";
 import { capPaletteAssetResults } from "@/lib/palette-search";
 
 /** Debounce, in ms, before a typed search term reaches `assetService`
- * (WS2 §13, Task E2 pre-dispatch fix E2-3). */
+ * (WS2 §13). */
 const CATALOG_SEARCH_DEBOUNCE_MS = 250;
 
 const OPEN_EVENT = "rantai:open-command";
@@ -48,8 +48,8 @@ export function CommandPalette() {
 
   const groups = NAV_GROUPS;
 
-  // Server-side catalog search behind the "Catalog assets" group (WS2 §13,
-  // Task E2). Debounced 250ms and abortable on every keystroke so a slow
+  // Server-side catalog search behind the "Catalog assets" group (WS2 §13).
+  // Debounced 250ms and abortable on every keystroke so a slow
   // response for an earlier term can never clobber a later one's result —
   // `cancelled` guards state updates from a request whose signal already
   // aborted or whose debounce timer never fired. A failed request shows no
@@ -159,7 +159,7 @@ export function CommandPalette() {
           </Command.Group>
         ) : null}
 
-        {/* Catalog assets — server-side search, WS2 §13 Task E2 */}
+        {/* Catalog assets — server-side search, WS2 §13 */}
         {assetResults.length ? (
           <Command.Group heading="Catalog assets" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
             {assetResults.map((a) => (

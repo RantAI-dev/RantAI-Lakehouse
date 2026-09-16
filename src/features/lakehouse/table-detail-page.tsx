@@ -50,8 +50,8 @@ function formValuesFromPolicy(m: LakehouseMaintenance): MaintenancePolicyFormVal
 
 /**
  * Read-only Iceberg table detail (schema, partition spec, a newest-first
- * snapshot timeline, stats) plus a maintenance-policy write form (WS2 §4
- * Task B4). `orphanAgeHours` is stored by this form but not applied by
+ * snapshot timeline, stats) plus a maintenance-policy write form (WS2 §4).
+ * `orphanAgeHours` is stored by this form but not applied by
  * this build — `remove_orphan_files` runs without an age argument on this
  * `ClickHouse` — so the field is labelled honestly rather than implying it
  * takes effect.

@@ -1,6 +1,6 @@
 /**
- * Command-palette catalog search bounds (WS2 §13, Task E2 pre-dispatch fix
- * E2-3). The palette calls `assetService.listAssets` (through `@/services`,
+ * Command-palette catalog search bounds (WS2 §13). The palette calls
+ * `assetService.listAssets` (through `@/services`,
  * never a raw URL) after a debounce and abort wiring that lives in
  * `command-palette.tsx` itself — plain `setTimeout`/`AbortController`
  * plumbing, not logic worth hiding behind an interface. The one rule that
