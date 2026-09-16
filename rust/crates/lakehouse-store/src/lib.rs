@@ -40,6 +40,7 @@ pub mod connectors;
 pub mod error;
 pub mod governance;
 pub mod identity;
+pub mod ingest_spec;
 pub mod knowledge;
 pub mod maintenance_policy;
 pub mod overview;
