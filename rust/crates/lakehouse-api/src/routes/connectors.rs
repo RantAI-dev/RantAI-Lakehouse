@@ -24,7 +24,7 @@ use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::cdc::ConnectorSlug;
 use lakehouse_store::connectors::{self, ConnectorDetail, ConnectorDialInfo, CreateConnectorInput};
-use lakehouse_store::ingest_spec::Dial;
+use lakehouse_store::ingest_spec::{Dial, SqlDriver};
 use serde::{Deserialize, Serialize};
 
 use crate::connector_deprovision::{self, DeprovisionError, Deprovisioned, PgTarget};
@@ -358,22 +358,142 @@ pub struct DebeziumPropertiesResponse {
     note: String,
 }
 
+/// Map a [`SqlDriver`] to the real, documented `Debezium` connector class
+/// name that source driver runs under (WS3 item 15). Used only by
+/// [`debezium_properties`] to pick
+/// [`lakehouse_store::cdc::render_debezium_properties_template`]'s
+/// `connector_class` argument — before this task, that argument did not
+/// exist and the renderer always hardcoded the `PostgreSQL` class, which
+/// would have silently mislabeled a `mysql`/`mssql` connector's rendered
+/// template.
+fn debezium_connector_class(driver: SqlDriver) -> &'static str {
+    match driver {
+        SqlDriver::Postgres => "io.debezium.connector.postgresql.PostgresConnector",
+        SqlDriver::Mysql => "io.debezium.connector.mysql.MySqlConnector",
+        SqlDriver::Mssql => "io.debezium.connector.sqlserver.SqlServerConnector",
+    }
+}
+
+/// The source-connection fields [`debezium_properties`] needs, resolved
+/// from `dial_info` by [`resolve_debezium_source_target`] — pulled out of
+/// that handler into its own type/function so the handler itself stays
+/// under `clippy::too_many_lines`, not for any reuse beyond this module.
+struct DebeziumSourceTarget {
+    host: String,
+    port: u16,
+    database: String,
+    user: String,
+    connector_class: &'static str,
+}
+
+/// Resolve `id`/`dial_info` into a [`DebeziumSourceTarget`] — see
+/// [`debezium_properties`]'s "Adapter dispatch" doc section for the full
+/// `adapter`-first-then-legacy-`kind` rule this implements.
+///
+/// # Errors
+///
+/// A 400 [`ApiError`] for every case documented on [`debezium_properties`]
+/// as producing one.
+fn resolve_debezium_source_target(
+    id: &str,
+    dial_info: &ConnectorDialInfo,
+) -> Result<DebeziumSourceTarget, ApiError> {
+    match dial_info.adapter.as_deref() {
+        Some(adapter @ ("sql" | "cdc")) => {
+            let parsed = Dial::parse(adapter, &dial_info.dial).map_err(|err| {
+                ApiError::BadRequest(format!(
+                    "connector {id}'s dial does not parse as its own adapter {adapter:?}: {err}"
+                ))
+            })?;
+            let (driver, host, port, database, user) = match &parsed {
+                Dial::Sql(dial) => (
+                    dial.driver,
+                    dial.host.clone(),
+                    dial.port,
+                    dial.database.clone(),
+                    dial.user.clone(),
+                ),
+                Dial::Cdc(dial) => (
+                    dial.driver,
+                    dial.host.clone(),
+                    dial.port,
+                    dial.database.clone(),
+                    dial.user.clone(),
+                ),
+                Dial::Files(_) | Dial::Rest(_) | Dial::Sheets(_) => {
+                    return Err(ApiError::BadRequest(format!(
+                        "connector {id} is registered with adapter {adapter:?} but its parsed \
+                         dial is not a sql/cdc shape"
+                    )));
+                }
+            };
+            Ok(DebeziumSourceTarget {
+                host,
+                port,
+                database,
+                user,
+                connector_class: debezium_connector_class(driver),
+            })
+        }
+        None if dial_info.kind.to_lowercase().contains("postgres") => {
+            let Some(target) = connector_probe::parse_postgres_host(&dial_info.host) else {
+                return Err(ApiError::BadRequest(format!(
+                    "connector {id} is registered as PostgreSQL but its host is not shaped \
+                     \"<user>@<host>:<port>/<database>\""
+                )));
+            };
+            Ok(DebeziumSourceTarget {
+                host: target.host.to_owned(),
+                port: target.port,
+                database: target.database.to_owned(),
+                user: target.user.to_owned(),
+                connector_class: debezium_connector_class(SqlDriver::Postgres),
+            })
+        }
+        _ => Err(ApiError::BadRequest(format!(
+            "connector {id} is type {kind:?} with adapter {adapter:?} — Debezium properties \
+             only apply to a sql/cdc adapter connector, or a legacy null-adapter PostgreSQL \
+             connector",
+            kind = dial_info.kind,
+            adapter = dial_info.adapter,
+        ))),
+    }
+}
+
 /// `GET /api/connectors/{id}/debezium-properties` — render the
-/// `debezium-server` `application.properties` TEMPLATE a `PostgreSQL`
-/// CDC connector would run with, using `${ENV_VAR_NAME}` references for
-/// every credential-shaped field. See
+/// `debezium-server` `application.properties` TEMPLATE a CDC connector
+/// would run with, using `${ENV_VAR_NAME}` references for every
+/// credential-shaped field. See
 /// [`lakehouse_store::cdc::render_debezium_properties_template`]'s doc
 /// comment for why this is a template, never a resolved config, and
 /// why that is a correctness requirement (a resolved config would
 /// expose the deployment's database password, S3 keys, and catalog
 /// token to any `connector:manage` principal) rather than a shortcut.
 ///
+/// # Adapter dispatch (WS3 item 15)
+///
+/// A connector whose `adapter` column (`0033_connector_ingest_spec.sql`) is
+/// `sql` or `cdc` has its connection fields read from the structured
+/// `dial` column via [`Dial::parse`] — this covers `postgres`, `mysql`,
+/// and `mssql` drivers, each rendering its own real `Debezium` connector
+/// class via [`debezium_connector_class`]. A connector with `adapter IS
+/// NULL` (a pre-WS3 row) falls back to the ORIGINAL `kind`-string check
+/// plus [`connector_probe::parse_postgres_host`]'s `host`-string parsing —
+/// mirrors the same `adapter`-first-then-legacy-`kind` pattern
+/// `connector_probe::probe`'s own dispatch and the connector-deletion
+/// deprovision step already use (WS3 plan review X4, Z14). Every other
+/// adapter (`files`/`rest`/`sheets`), or a null-adapter connector whose
+/// `kind` does not name `PostgreSQL`, is not a CDC source and gets an
+/// honest 400.
+///
 /// # Errors
 ///
-/// 404 if `id` is unknown; 400 if the connector is not `PostgreSQL`-kind,
-/// its `host` is not shaped `"<user>@<host>:<port>/<database>"`, its
-/// `secretRef` is not an `env:`-scheme reference (this template can only
-/// name an env var, so a `vault:`-scheme or other reference cannot be
+/// 404 if `id` is unknown; 400 if the connector is not a `sql`/`cdc`
+/// adapter connector (nor a legacy null-adapter `PostgreSQL` connector),
+/// its dial does not parse or is not shaped `sql`/`cdc`, a legacy
+/// connector's `host` is not shaped `"<user>@<host>:<port>/<database>"`,
+/// its `secretRef` is not an `env:`-scheme reference (this template can
+/// only name an env var, so a `vault:`-scheme or other reference cannot be
 /// rendered as one — an honest 400, not a guess), `table` is missing or
 /// blank, or any field fails `DebeziumSourceSpec`/
 /// `render_debezium_properties_template`'s validation; 503/500 as every
@@ -387,25 +507,13 @@ pub async fn debezium_properties(
     let Some(dial_info) = dial_info else {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
     };
-    if !dial_info.kind.to_lowercase().contains("postgres") {
-        return Err(ApiError::BadRequest(format!(
-            "connector {id} is type {kind:?}, not PostgreSQL — Debezium properties only \
-             apply to a PostgreSQL CDC connector",
-            kind = dial_info.kind
-        ))
-        .into());
-    }
     let table = query.table.trim();
     if table.is_empty() {
         return Err(ApiError::BadRequest("table query parameter is required".to_owned()).into());
     }
-    let Some(target) = connector_probe::parse_postgres_host(&dial_info.host) else {
-        return Err(ApiError::BadRequest(format!(
-            "connector {id} is registered as PostgreSQL but its host is not shaped \
-             \"<user>@<host>:<port>/<database>\""
-        ))
-        .into());
-    };
+
+    let target = resolve_debezium_source_target(&id, &dial_info)?;
+
     let Some(database_password_ref) = dial_info.secret_ref.strip_prefix("env:") else {
         return Err(ApiError::BadRequest(format!(
             "connector {id}'s secretRef {:?} is not an env: reference; this template can \
@@ -442,7 +550,10 @@ pub async fn debezium_properties(
         catalog_token_ref: Some("LAKEKEEPER_TOKEN"),
     };
     let properties = lakehouse_store::cdc::render_debezium_properties_template(
-        &source, &sink, &refs,
+        &source,
+        &sink,
+        &refs,
+        target.connector_class,
     )
     .map_err(|err| ApiError::BadRequest(format!("connector {id}'s fields are invalid: {err}")))?;
 

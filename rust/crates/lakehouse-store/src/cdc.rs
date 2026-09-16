@@ -573,15 +573,27 @@ pub struct DebeziumEnvRefs<'a> {
     pub catalog_token_ref: Option<&'a str>,
 }
 
-/// Render the `debezium-server` `application.properties` TEMPLATE a
-/// `PostgreSQL` CDC connector would run with — credential fields are
-/// `${ENV_VAR_NAME}` references the deployment's own shell expands at
-/// container start, never a resolved value. This is the function
+/// Render the `debezium-server` `application.properties` TEMPLATE a CDC
+/// connector would run with — credential fields are `${ENV_VAR_NAME}`
+/// references the deployment's own shell expands at container start,
+/// never a resolved value. This is the function
 /// `routes::connectors::debezium_properties` calls; it is deliberately
 /// NOT [`render_debezium_properties`] (see this module's "Callers"
 /// section) — that function still exists, unchanged, for whatever
 /// eventually renders a REAL running config server-side, with real
 /// resolved [`SecretValue`]s, never over this HTTP route.
+///
+/// `connector_class` names the real, documented `Debezium` connector class
+/// for the source driver — `"io.debezium.connector.postgresql.PostgresConnector"`,
+/// `"io.debezium.connector.mysql.MySqlConnector"`, or
+/// `"io.debezium.connector.sqlserver.SqlServerConnector"` (WS3 item 15:
+/// `Debezium` also supports non-Postgres CDC sources, but the class name
+/// hardcoded here before this parameter existed was always the Postgres
+/// one, which would silently mislabel a `mysql`/`mssql` connector's
+/// rendered template). The caller picks the value; this function only
+/// interpolates it verbatim (it is a static, deployment-chosen string, not
+/// user input, so it gets no `reject_control_characters`/
+/// `validate_env_var_ref`-style validation of its own).
 ///
 /// # Errors
 ///
@@ -595,6 +607,7 @@ pub fn render_debezium_properties_template(
     source: &DebeziumSourceSpec,
     sink: &IcebergSinkLocation<'_>,
     refs: &DebeziumEnvRefs<'_>,
+    connector_class: &str,
 ) -> Result<String, CdcSpecError> {
     validate_env_var_ref("database_password_ref", refs.database_password_ref)?;
     validate_env_var_ref("s3_access_key_ref", refs.s3_access_key_ref)?;
@@ -631,7 +644,7 @@ pub fn render_debezium_properties_template(
          debezium.sink.iceberg.destination-uppercase-table-names=false\n\
          debezium.sink.iceberg.write.format.default=parquet\n\
          \n\
-         debezium.source.connector.class=io.debezium.connector.postgresql.PostgresConnector\n\
+         debezium.source.connector.class={connector_class}\n\
          debezium.source.offset.storage=org.apache.kafka.connect.storage.FileOffsetBackingStore\n\
          debezium.source.offset.storage.file.filename=/debezium/data/{slug}-offsets.dat\n\
          debezium.source.offset.flush.interval.ms=0\n\
@@ -654,6 +667,7 @@ pub fn render_debezium_properties_template(
         s3_endpoint = sink.s3_endpoint,
         s3_access_key_ref = refs.s3_access_key_ref,
         s3_secret_key_ref = refs.s3_secret_key_ref,
+        connector_class = connector_class,
         hostname = source.database_hostname,
         port = source.database_port,
         user = source.database_user,
@@ -1174,7 +1188,13 @@ mod tests {
             s3_secret_key_ref: "RUSTFS_SECRET_KEY",
             catalog_token_ref: Some("LAKEKEEPER_TOKEN"),
         };
-        let rendered = render_debezium_properties_template(&source, &sink, &refs).unwrap();
+        let rendered = render_debezium_properties_template(
+            &source,
+            &sink,
+            &refs,
+            "io.debezium.connector.postgresql.PostgresConnector",
+        )
+        .unwrap();
 
         assert!(rendered.contains("debezium.source.database.password=${CONNECTOR_PG_PASSWORD}"));
         assert!(rendered.contains("debezium.sink.iceberg.s3.access-key-id=${RUSTFS_ACCESS_KEY}"));
@@ -1213,8 +1233,60 @@ mod tests {
             s3_secret_key_ref: "RUSTFS_SECRET_KEY",
             catalog_token_ref: None,
         };
-        let err = render_debezium_properties_template(&source, &sink, &refs).unwrap_err();
+        let err = render_debezium_properties_template(
+            &source,
+            &sink,
+            &refs,
+            "io.debezium.connector.postgresql.PostgresConnector",
+        )
+        .unwrap_err();
         assert!(matches!(err, CdcSpecError::InvalidEnvVarReference { .. }));
+    }
+
+    /// WS3 item 15: `render_debezium_properties_template` must name the
+    /// REAL Debezium connector class for a non-Postgres driver rather than
+    /// always hardcoding the Postgres one — proven here for `mysql`, and
+    /// re-asserting the same no-secret-leak property WS0's own
+    /// `template_renders_env_var_references_never_a_resolved_value` test
+    /// already proves, for a non-Postgres class this time.
+    #[test]
+    fn template_renders_the_mysql_connector_class_for_a_mysql_source() {
+        let source = DebeziumSourceSpec::new(
+            ConnectorSlug::new("orders_mysql").unwrap(),
+            "mysql.internal",
+            3306,
+            "oms",
+            "cdc_reader",
+            "oms.orders",
+        )
+        .unwrap();
+        let sink = IcebergSinkLocation {
+            catalog_uri: "http://lakekeeper:8181/catalog",
+            warehouse: "default",
+            s3_endpoint: "http://rustfs:9000",
+        };
+        let refs = DebeziumEnvRefs {
+            database_password_ref: "CONNECTOR_MYSQL_PASSWORD",
+            s3_access_key_ref: "RUSTFS_ACCESS_KEY",
+            s3_secret_key_ref: "RUSTFS_SECRET_KEY",
+            catalog_token_ref: Some("LAKEKEEPER_TOKEN"),
+        };
+        let rendered = render_debezium_properties_template(
+            &source,
+            &sink,
+            &refs,
+            "io.debezium.connector.mysql.MySqlConnector",
+        )
+        .unwrap();
+
+        assert!(rendered.contains(
+            "debezium.source.connector.class=io.debezium.connector.mysql.MySqlConnector"
+        ));
+        // Same no-secret-leak property, re-asserted for a non-Postgres
+        // class: every credential-shaped field is still ONLY an
+        // `${ENV_VAR_NAME}` reference.
+        assert!(rendered.contains("debezium.source.database.password=${CONNECTOR_MYSQL_PASSWORD}"));
+        assert!(!rendered.contains("hunter2"));
     }
 
     /// A direct, pure unit test of `validate_env_var_ref` itself — not
