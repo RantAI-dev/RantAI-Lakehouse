@@ -15,18 +15,29 @@
 # against the demo CDC connector to prove slot cleanup actually works, per
 # G4's acceptance criterion.
 #
-# Usage: deprovision_connector.sh <connector_slug>
+# Usage: deprovision_connector.sh <slot_name> <publication_name>
 # Requires: psql on PATH, PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE (or a
 # full libpq connection string via PGSERVICE/PGURL-style env) already set
 # in the environment — this script does not itself resolve a secretRef.
+#
+# WS3 plan review X4: the slot and publication names used to be derived
+# here from one `<connector_slug>` (`${SLUG}_slot`/`${SLUG}_pub`) — but
+# `lakehouse_store::cdc::render_debezium_properties` (WS3 item 5) now takes
+# the slot/publication names as explicit, registry-owned values rather
+# than generating them from the connector id, so a slot's real name need
+# not resemble its connector's slug at all. Deriving them here again would
+# reintroduce exactly the guessed-attribution problem
+# `dispar_orchestrate.replication_metrics`'s module doc removed for the
+# metrics side of this same slot-naming change. The as-yet-unbuilt compose
+# renderer under `ops/debezium/` is the intended caller that will pass
+# `dial.slotName`/`dial.publicationName` verbatim once it exists.
 
 set -eu
 
-SLUG="${1:?usage: deprovision_connector.sh <connector_slug>}"
-SLOT="${SLUG}_slot"
-PUB="${SLUG}_pub"
+SLOT="${1:?usage: deprovision_connector.sh <slot_name> <publication_name>}"
+PUB="${2:?usage: deprovision_connector.sh <slot_name> <publication_name>}"
 
-echo "[deprovision] dropping publication '${PUB}' and replication slot '${SLOT}' for connector '${SLUG}'"
+echo "[deprovision] dropping publication '${PUB}' and replication slot '${SLOT}'"
 
 # The publication can be dropped regardless of slot state.
 psql -v ON_ERROR_STOP=1 -c "DROP PUBLICATION IF EXISTS \"${PUB}\";"

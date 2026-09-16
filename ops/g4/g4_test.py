@@ -218,7 +218,14 @@ def step_verify_slot_cleanup_on_connector_delete() -> None:
     print(f"[g4] slot 'p5cdc_slot' exists before deprovisioning, wal_retained_bytes={wal_retained_before}")
 
     script = os.environ.get("DEPROVISION_SCRIPT", "/opt/deprovision_connector.sh")
-    result = subprocess.run(["sh", script, "p5cdc"], capture_output=True, text=True, check=False)
+    # WS3 plan review X4: `deprovision_connector.sh` now takes the slot and
+    # publication names as two explicit arguments instead of deriving both
+    # from one `<connector_slug>` (a slot's real name is registry-owned and
+    # need not resemble its connector's slug — see
+    # `dispar_orchestrate.replication_metrics`'s module doc for why the
+    # same guess was removed there). The demo CDC connector's names are the
+    # `p5cdc_slot`/`p5cdc_pub` pair this file already asserts on above.
+    result = subprocess.run(["sh", script, "p5cdc_slot", "p5cdc_pub"], capture_output=True, text=True, check=False)
     print(result.stdout)
     if result.returncode != 0:
         raise G4Failure(f"deprovision_connector.sh failed: {result.stderr}")

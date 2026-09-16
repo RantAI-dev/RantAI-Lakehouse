@@ -117,6 +117,14 @@ class ReplicationConfig:
     source_db_user: str
     source_db_password: str
     source_db_name: str
+    # WS3 plan review X4/Z3: `lakehouse-api`'s connector registry, read to
+    # attribute a live `pg_replication_slots` row to the connector whose
+    # `dial.slotName` produced it. `INGEST_SERVICE_TOKEN` names an
+    # `ingest:read`-scoped service identity — this job only ever reads
+    # `GET /api/connectors/ingestible`, never `connector:manage`-gated
+    # `GET /api/connectors`.
+    api_url: str
+    ingest_service_token: str
 
     @classmethod
     def from_env(cls) -> "ReplicationConfig":
@@ -127,6 +135,8 @@ class ReplicationConfig:
             source_db_user=_env("BRONZE_SOURCE_DB_USER", "lakehouse"),
             source_db_password=_env("BRONZE_SOURCE_DB_PASSWORD", "lakehouse"),
             source_db_name=_env("BRONZE_SOURCE_DB_NAME", "lakehouse"),
+            api_url=_env("LAKEHOUSE_API_URL", "http://lakehouse-api:8080"),
+            ingest_service_token=_env("INGEST_SERVICE_TOKEN", ""),
         )
 
 
@@ -207,15 +217,119 @@ def _status_for(wal_retained_bytes: int, active: bool) -> str:
     return "ok"
 
 
+def _headers(cfg: ReplicationConfig) -> dict[str, str]:
+    return {} if not cfg.ingest_service_token else {"Authorization": f"Bearer {cfg.ingest_service_token}"}
+
+
+def _fetch_ingestible_connectors(cfg: ReplicationConfig) -> tuple[list[dict[str, Any]], bool]:
+    """`GET /api/connectors/ingestible` — NOT `GET /api/connectors`, which
+    stays `connector:manage`-gated, a permission the `ingest:read`-only
+    service identity this job authenticates as does not hold (WS3 plan
+    review X4). Mirrors `agent_runs.py::_fetch_schedulable_employees`'s
+    degrade-on-failure posture exactly: a `requests.RequestException`, a
+    non-2xx response, or a non-JSON/non-list body all degrade to an empty
+    connector list rather than raising — this run's own slot/WAL metrics
+    (R5) are still worth recording even when an id can't be attributed.
+
+    Returns `(connectors, reachable)`. `reachable` distinguishes "the
+    registry answered but no connector matched a given slot" from "the
+    registry could not be reached at all" so a per-slot warning below can
+    name the correct one of the two reasons WS3 plan review Z3 requires."""
+    if not cfg.ingest_service_token:
+        print(
+            "dispar_orchestrate.replication_metrics: INGEST_SERVICE_TOKEN is "
+            "unset; resolving every slot as unresolved"
+        )
+        return [], False
+
+    try:
+        resp = requests.get(
+            f"{cfg.api_url}/api/connectors/ingestible",
+            headers=_headers(cfg),
+            timeout=10,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        print(
+            f"WARNING: dispar_orchestrate.replication_metrics: could not "
+            f"reach lakehouse-api's connector registry ({exc}); resolving "
+            "every slot as unresolved"
+        )
+        return [], False
+
+    try:
+        connectors = resp.json()
+    except ValueError as exc:
+        print(
+            f"WARNING: dispar_orchestrate.replication_metrics: "
+            f"lakehouse-api returned a non-JSON /api/connectors/ingestible "
+            f"body ({exc}); resolving every slot as unresolved"
+        )
+        return [], False
+
+    if not isinstance(connectors, list):
+        print(
+            "WARNING: dispar_orchestrate.replication_metrics: "
+            f"/api/connectors/ingestible returned {type(connectors).__name__}, "
+            "expected a list; resolving every slot as unresolved"
+        )
+        return [], False
+
+    return connectors, True
+
+
+def _slot_to_connector_id(connectors: list[dict[str, Any]]) -> dict[str, str]:
+    """`{dial.slotName: id}` for every `adapter == "cdc"` connector — the
+    slot-name shape is registry-owned (`lakehouse_store::cdc::render_debezium_properties`
+    now takes the slot/publication names explicitly rather than deriving
+    them from the connector id), so this lookup is the only correct way to
+    attribute a live `pg_replication_slots` row; a slot name is no longer
+    guaranteed to resemble the id that created it."""
+    lookup: dict[str, str] = {}
+    for connector in connectors:
+        if not isinstance(connector, dict) or connector.get("adapter") != "cdc":
+            continue
+        dial = connector.get("dial")
+        connector_id = connector.get("id")
+        if not isinstance(dial, dict) or not connector_id:
+            continue
+        slot_name = dial.get("slotName")
+        if slot_name:
+            lookup[slot_name] = connector_id
+    return lookup
+
+
 def check_replication_slots(cfg: ReplicationConfig) -> list[dict[str, Any]]:
-    """Query every logical replication slot on the source Postgres server.
-    `connector_id` is derived from the slot name (this build's own naming
-    convention, `<connector_slug>_slot` — see
-    `lakehouse_store::cdc::render_debezium_properties`), not looked up
-    against the `connector` table: this job runs against the SOURCE
-    database directly and has no reason to depend on the console's own
-    Postgres being reachable, matching `bronze_catalog.py`'s existing
-    posture of talking to exactly the systems a check needs and no more."""
+    """Query every logical replication slot on the source Postgres server,
+    then attribute each to a connector via the registry's `GET
+    /api/connectors/ingestible` (WS3 plan review X4) — never by
+    string-stripping the slot name. That stripped-suffix guess
+    (`slot_name[: -len("_slot")]`) was a fabricated attribution (AGENTS.md
+    rule 2: "Never fabricate"): `lakehouse_store::cdc::render_debezium_properties`
+    now takes the slot/publication names explicitly (WS3 plan review X4),
+    so a CDC connector's slot name is registry-owned and need not resemble
+    its connector id at all.
+
+    A slot with no matching `adapter == "cdc"` connector — because the
+    registry is unreachable, or because it genuinely answered with no
+    match — is attributed to `f"unresolved:{slot_name}"`, NEVER a bare
+    `""` (WS3 plan review Z3): `lake.bronze_meta.replication_slot` is a
+    `ReplacingMergeTree ORDER BY (connector_id, checked_at)` and
+    `slot_name` is not in that key, so two unresolved slots checked in the
+    same run (sharing one `checked_at`) would collapse into a single row
+    under a shared `connector_id = ""`, silently discarding one slot's WAL
+    metrics — exactly the R5 signal this table exists to carry. The
+    `unresolved:` prefix is safely distinguishable from a real connector
+    id because `:` never appears in a `slug_id`-generated one.
+
+    This job still queries the SOURCE Postgres directly for the slot rows
+    themselves (matching `bronze_catalog.py`'s posture of talking to
+    exactly the systems a check needs); only the id ATTRIBUTION step is
+    now registry-driven, which is a new HTTP dependency this task
+    introduces, not a refactor of one that existed before."""
+    connectors, registry_reachable = _fetch_ingestible_connectors(cfg)
+    slot_to_connector_id = _slot_to_connector_id(connectors)
+
     results: list[dict[str, Any]] = []
     conn = psycopg2.connect(
         host=cfg.source_db_host,
@@ -235,7 +349,20 @@ def check_replication_slots(cfg: ReplicationConfig) -> list[dict[str, Any]]:
                 "FROM pg_replication_slots WHERE slot_type = 'logical'"
             )
             for slot_name, active, wal_retained_bytes, confirmed_flush_lag_bytes in cur.fetchall():
-                connector_id = slot_name[: -len("_slot")] if slot_name.endswith("_slot") else slot_name
+                connector_id = slot_to_connector_id.get(slot_name)
+                if connector_id is None:
+                    reason = (
+                        "registry unreachable"
+                        if not registry_reachable
+                        else "no adapter=cdc connector's dial.slotName matches this slot"
+                    )
+                    print(
+                        f"WARNING: dispar_orchestrate.replication_metrics: "
+                        f"slot {slot_name!r} could not be attributed to a "
+                        f"connector ({reason}); recording it as unresolved "
+                        "rather than guessing"
+                    )
+                    connector_id = f"unresolved:{slot_name}"
                 results.append(
                     {
                         "connector_id": connector_id,
