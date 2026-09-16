@@ -113,28 +113,50 @@ pub struct CreateConnectorBody {
 
 const VALID_DIRECTIONS: [&str; 3] = ["source", "sink", "bidirectional"];
 
-/// Refuse a caller-supplied `secretRef` that names one of the deployment's
-/// connector credentials ([`crate::state::CONNECTOR_ALLOWED_SECRET_REFS`]).
+/// Refuse a caller-supplied `secretRef` that matches one of the deployment's
+/// reserved connector-credential patterns
+/// ([`crate::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS`]).
 ///
-/// Those refs are the only ones `AppState::connector_secret_resolver` will
-/// resolve, and they exist for the connectors seeded by migration — the ones
-/// this deployment operates itself. A user-created connector naming one would
-/// have the API authenticate to a caller-chosen `host` with the deployment's
-/// own connector credentials. `connector_probe`'s SSRF guard does not prevent
-/// that: it blocks internal address ranges, and exfiltration wants an
-/// EXTERNAL host, which is exactly what it permits.
+/// Those patterns are the only shapes `AppState::connector_secret_resolver`
+/// will resolve, and they exist for the connectors seeded by migration — the
+/// ones this deployment operates itself. A user-created connector naming a
+/// ref that matches one would have the API authenticate to a caller-chosen
+/// `host` with the deployment's own connector credentials. `connector_probe`'s
+/// SSRF guard does not prevent that: it blocks internal address ranges, and
+/// exfiltration wants an EXTERNAL host, which is exactly what it permits.
 ///
 /// So the allowlist answers "which refs may resolve at all" and this answers
 /// "who may name them". Neither alone is sufficient: without the allowlist a
 /// connector could name `env:DATABASE_URL`; without this check it could name
-/// the connector credentials and point them anywhere.
+/// a reserved connector-credential ref and point it anywhere. Both checks
+/// call the SAME [`lakehouse_core::secret::pattern_matches`] against the
+/// SAME pattern constant, so the two cannot drift the way
+/// `0023_connector_dedicated_secret_refs.sql`'s header describes happening to
+/// the old exact-list version.
 ///
-/// Deliberately compared case-sensitively and after trimming, matching how
-/// the ref is stored and later handed to the resolver — a check that
-/// normalized more aggressively than the resolver would leave a gap between
-/// what this rejects and what that accepts.
+/// # What this does NOT refuse (WS3 plan review X4/Z4)
+///
+/// A name that is not itself one of the reserved patterns — e.g.
+/// `env:CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS`, a real [`crate::config::Config`]
+/// flag, not a credential — is accepted HERE, at creation time: this check's
+/// job is narrower than "reject anything unsafe", it only refuses a caller
+/// naming one of the deployment's OWN reserved refs. Such a name still fails
+/// later, at resolve time, when [`AllowlistedSecretResolver`](lakehouse_core::secret::AllowlistedSecretResolver)
+/// independently checks the same patterns and returns `NotAllowed` the first
+/// time `POST .../test`, `POST .../discover`, or `POST .../ingest/run` tries
+/// to actually resolve it — the two-stage design this module's doc comment
+/// describes.
+///
+/// Deliberately compared after trimming, matching how the ref is stored and
+/// later handed to the resolver — a check that normalized more aggressively
+/// than the resolver would leave a gap between what this rejects and what
+/// that accepts.
 fn reject_allowlisted_secret_ref(field: &str, value: &str) -> Result<(), ApiError> {
-    if crate::state::CONNECTOR_ALLOWED_SECRET_REFS.contains(&value.trim()) {
+    let trimmed = value.trim();
+    if crate::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS
+        .iter()
+        .any(|pattern| lakehouse_core::secret::pattern_matches(pattern, trimmed))
+    {
         return Err(ApiError::BadRequest(format!(
             "{field} must not name a deployment connector credential; those are reserved for \
              connectors this deployment seeds itself"
@@ -941,15 +963,23 @@ mod tests {
 
     /// The exfiltration path this check exists to close: a
     /// `connector:manage` principal naming a deployment connector credential
-    /// on a connector whose `host` they choose. Every allowlisted ref must be
-    /// refused, so adding one to the allowlist without widening this check
-    /// fails here rather than silently opening the hole again.
+    /// on a connector whose `host` they choose. A representative instance of
+    /// EVERY allowlisted pattern must be refused, so widening the pattern
+    /// list without widening this check fails here rather than silently
+    /// opening the hole again.
     #[test]
     fn user_created_connector_cannot_name_a_deployment_connector_credential() {
-        for r in crate::state::CONNECTOR_ALLOWED_SECRET_REFS {
+        for r in [
+            "env:CONNECTOR_MYSQL_PASSWORD",
+            "env:CONNECTOR_S3_SECRET_KEY",
+            "env:CONNECTOR_S3_ACCESS_KEY",
+            "env:CONNECTOR_REST_API_KEY",
+            "env:CONNECTOR_OAUTH_TOKEN",
+            "file:/run/secrets/connector_mysql_password",
+        ] {
             assert!(
                 reject_allowlisted_secret_ref("secretRef", r).is_err(),
-                "allowlisted ref {r:?} must be refused on a user-created connector"
+                "pattern-matching ref {r:?} must be refused on a user-created connector"
             );
             // Whitespace must not be a bypass: the value is trimmed before
             // storage, so a padded ref would reach the resolver identically.
@@ -960,31 +990,40 @@ mod tests {
         }
     }
 
-    /// The check must not over-reach: an ordinary `env:` ref is still
-    /// accepted here. It will fail later at resolution (it is not on the
-    /// allowlist), which is a different, honest error — "this deployment
-    /// will not resolve that", not "you may not say that".
+    /// The check must not over-reach: an ordinary `env:` ref that does not
+    /// match a reserved pattern is still accepted here. It will fail later
+    /// at resolution (it is not on the allowlist), which is a different,
+    /// honest error — "this deployment will not resolve that", not "you may
+    /// not say that". Includes `env:CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS`
+    /// (WS3 plan review X4/Z4): a real config flag, not a credential, so it
+    /// matches none of the credential-suffix patterns and must pass THIS
+    /// check even though `AllowlistedSecretResolver::resolve` refuses it
+    /// with `NotAllowed` at resolve time — see this function's doc comment
+    /// for the full two-stage explanation.
     #[test]
     fn ordinary_secret_refs_are_still_accepted_by_this_check() {
         for r in [
             "env:MY_SECRET",
             "vault:secret/data/x",
             "env:POSTGRES_PASSWORD_2",
+            "env:CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS",
         ] {
             assert!(
                 reject_allowlisted_secret_ref("secretRef", r).is_ok(),
-                "{r:?} is not a deployment connector credential and must pass this check"
+                "{r:?} does not match a reserved connector-credential pattern and must pass \
+                 this check"
             );
         }
     }
 
-    /// The allowlist must never name one of the API's own secrets again.
+    /// The allowlist must never admit one of the API's own secrets again.
     /// This is the regression guard for the finding itself: the previous
     /// list was `env:POSTGRES_PASSWORD` / `env:RUSTFS_ACCESS_KEY` /
-    /// `env:RUSTFS_SECRET_KEY`, and re-adding any of them would restore the
-    /// exfiltration path no matter what the route-level check does.
+    /// `env:RUSTFS_SECRET_KEY`, and a pattern wide enough to re-admit any of
+    /// them would restore the exfiltration path no matter what the
+    /// route-level check does.
     #[test]
-    fn allowlist_never_names_the_apis_own_secrets() {
+    fn allowlist_never_admits_the_apis_own_secrets() {
         for forbidden in [
             "env:POSTGRES_PASSWORD",
             "env:RUSTFS_ACCESS_KEY",
@@ -993,9 +1032,11 @@ mod tests {
             "env:CH_PASSWORD",
         ] {
             assert!(
-                !crate::state::CONNECTOR_ALLOWED_SECRET_REFS.contains(&forbidden),
-                "{forbidden:?} is one of the API's own secrets and must never be \
-                 connector-resolvable"
+                !crate::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS
+                    .iter()
+                    .any(|pattern| lakehouse_core::secret::pattern_matches(pattern, forbidden)),
+                "{forbidden:?} is one of the API's own secrets and must never match a \
+                 connector-resolvable pattern"
             );
         }
     }

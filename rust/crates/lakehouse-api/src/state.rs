@@ -8,7 +8,10 @@ use lakehouse_auth::{
     SessionAuthenticator,
 };
 use lakehouse_clickhouse::ChClient;
-use lakehouse_core::secret::{AllowlistedSecretResolver, DynSecretResolver, EnvSecretResolver};
+use lakehouse_core::secret::{
+    AllowlistedSecretResolver, DynSecretResolver, EnvSecretResolver, FileSecretResolver,
+    SecretError, SecretResolver, SecretValue,
+};
 use lakehouse_dagster::DgClient;
 use lakehouse_embed::EmbedSecretResolver;
 use lakehouse_iceberg::IcebergClient;
@@ -92,14 +95,14 @@ pub struct AppState {
     /// unrestricted resolver would let a `connector:manage` principal name
     /// any process secret (`env:DATABASE_URL`, `env:CH_PASSWORD`, ...) and
     /// exfiltrate it to infrastructure they own. Always an
-    /// [`AllowlistedSecretResolver`] wrapping [`EnvSecretResolver`],
-    /// scoped to exactly [`CONNECTOR_ALLOWED_SECRET_REFS`] — the
-    /// `secretRef`s this deployment's OWN seeded connectors use
+    /// [`AllowlistedSecretResolver`] wrapping a scheme-dispatching
+    /// `env:`/`file:` resolver, scoped to exactly
+    /// [`CONNECTOR_ALLOWED_SECRET_REF_PATTERNS`] — the credential-suffix
+    /// `secretRef` shapes this deployment's OWN seeded connectors use
     /// (`rust/migrations/0022_prune_connector_seed.sql`), nothing else.
     /// `Arc<dyn DynSecretResolver>`, not a concrete type, so a later
-    /// `FileSecretResolver`/external-provider implementation swaps in
-    /// (still allowlisted) without changing this field's type or any
-    /// reader of it.
+    /// external-provider implementation swaps in (still allowlisted)
+    /// without changing this field's type or any reader of it.
     pub connector_secret_resolver: Arc<dyn DynSecretResolver>,
     /// The configured authenticators, or `None` under the exact same
     /// condition as [`Self::pg`] being `None` (no Postgres pool). When
@@ -138,12 +141,24 @@ pub struct AppState {
     pub trino: Arc<TrinoClient>,
 }
 
-/// The exact `secretRef`s [`AppState::connector_secret_resolver`] may
-/// resolve — see that field's doc comment and ADR 0002's addendum. This is
-/// deliberately a fixed, hardcoded list, not derived from configuration:
-/// widening it is a code change to make and review, not something a request
-/// or an environment variable can do — a `connector:manage` principal must
-/// never be able to expand their own reach.
+/// The credential-suffix `secretRef` PATTERNS (see
+/// [`lakehouse_core::secret::pattern_matches`])
+/// [`AppState::connector_secret_resolver`] may resolve — see that field's
+/// doc comment and ADR 0002's addendum. This is deliberately a fixed,
+/// hardcoded list, not derived from configuration: widening it is a code
+/// change to make and review, not something a request or an environment
+/// variable can do — a `connector:manage` principal must never be able to
+/// expand their own reach.
+///
+/// PATTERNS, not exact strings (WS3 plan review X1): the prior list was
+/// three exact `env:CONNECTOR_*` names, and a bare `env:CONNECTOR_*` prefix
+/// check (considered and rejected — see [`lakehouse_core::secret::pattern_matches`]'s
+/// doc comment) would have admitted `env:CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS`,
+/// a real [`Config`] flag, not a credential. Every pattern here ends in a
+/// credential-shaped suffix (`_PASSWORD`, `_SECRET_KEY`, `_ACCESS_KEY`,
+/// `_API_KEY`, `_TOKEN`), or is the single `file:` pattern below, so a
+/// non-credential `CONNECTOR_*` config variable can never match no matter
+/// what gets added under that prefix later.
 ///
 /// These are CONNECTOR-DEDICATED variables, deliberately NOT the API's own
 /// secrets. The earlier list named `env:POSTGRES_PASSWORD` (the console's
@@ -159,14 +174,61 @@ pub struct AppState {
 /// A deployment MAY set these equal to the real credentials — that is its
 /// choice to make explicitly, in its own environment — but the API's own
 /// secrets are no longer reachable through a connector by name. Combined
-/// with [`crate::routes::connectors::rejects_allowlisted_secret_ref`], which
-/// refuses a USER-created connector that names one of these, the only
-/// connectors that can dial with them are the ones seeded by migration.
-pub(crate) const CONNECTOR_ALLOWED_SECRET_REFS: [&str; 3] = [
-    "env:CONNECTOR_PG_PASSWORD",
-    "env:CONNECTOR_S3_ACCESS_KEY",
-    "env:CONNECTOR_S3_SECRET_KEY",
+/// with [`crate::routes::connectors::reject_allowlisted_secret_ref`], which
+/// checks the SAME patterns to refuse a USER-created connector naming a
+/// reserved ref, the only connectors that can dial with them are the ones
+/// seeded by migration.
+pub(crate) const CONNECTOR_ALLOWED_SECRET_REF_PATTERNS: [&str; 6] = [
+    "env:CONNECTOR_*_PASSWORD",
+    "env:CONNECTOR_*_SECRET_KEY",
+    "env:CONNECTOR_*_ACCESS_KEY",
+    "env:CONNECTOR_*_API_KEY",
+    "env:CONNECTOR_*_TOKEN",
+    "file:/run/secrets/connector_*",
 ];
+
+/// Dispatches a `secretRef` to [`EnvSecretResolver`] (`env:` scheme) or
+/// [`FileSecretResolver`] (`file:` scheme) by its prefix, so
+/// [`AppState::connector_secret_resolver`] can be a single
+/// [`AllowlistedSecretResolver`] covering both schemes instead of the caller
+/// having to pick a resolver before the allowlist check ever runs.
+///
+/// An unrecognized scheme is [`SecretError::UnsupportedRef`] here, at the
+/// combining layer, rather than falling through silently — the same
+/// fail-closed shape [`EnvSecretResolver`] and [`FileSecretResolver`] each
+/// use for their own scheme mismatch.
+#[derive(Debug)]
+struct ConnectorSecretResolver {
+    env: EnvSecretResolver,
+    file: FileSecretResolver,
+}
+
+impl ConnectorSecretResolver {
+    fn new() -> Self {
+        Self {
+            env: EnvSecretResolver::new(),
+            // `/run/secrets` is the fixed Docker/Compose secrets mount this
+            // deployment uses — see `FileSecretResolver`'s doc comment for
+            // why a fixed base directory (not caller-supplied) matters.
+            file: FileSecretResolver::new("/run/secrets"),
+        }
+    }
+}
+
+impl SecretResolver for ConnectorSecretResolver {
+    async fn resolve(&self, secret_ref: &str) -> Result<SecretValue, SecretError> {
+        if secret_ref.starts_with(lakehouse_core::secret::ENV_SECRET_REF_PREFIX) {
+            self.env.resolve(secret_ref).await
+        } else if secret_ref.starts_with(lakehouse_core::secret::FILE_SECRET_REF_PREFIX) {
+            self.file.resolve(secret_ref).await
+        } else {
+            Err(SecretError::UnsupportedRef {
+                secret_ref: secret_ref.to_owned(),
+                resolver: "connector-scheme",
+            })
+        }
+    }
+}
 
 /// Translate [`Config`]'s flat `oidc_*` env-derived fields into
 /// [`lakehouse_auth::OidcConfig`], or `None` if `OIDC` is not configured.
@@ -251,8 +313,8 @@ impl AppState {
             llm: Arc::new(llm),
             pg,
             connector_secret_resolver: Arc::new(AllowlistedSecretResolver::new(
-                EnvSecretResolver::new(),
-                CONNECTOR_ALLOWED_SECRET_REFS
+                ConnectorSecretResolver::new(),
+                CONNECTOR_ALLOWED_SECRET_REF_PATTERNS
                     .iter()
                     .map(|s| (*s).to_owned()),
                 "connector-allowlist",
@@ -302,5 +364,59 @@ mod tests {
         let cfg = Config::from_map(&env).unwrap();
         let state = AppState::new(cfg);
         assert!(state.pg.is_none());
+    }
+
+    /// The regression guard for WS3 plan review X1: a credential-suffixed
+    /// `secretRef` — including one Phase E's new adapters need
+    /// (`env:CONNECTOR_MYSQL_PASSWORD`), not only the two dedicated refs
+    /// migrations 0022/0023 seed — must be ADMITTED by the allowlist, while
+    /// the API's own secrets and the `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS`
+    /// config flag (a real `Config` field, not a credential) must be
+    /// REFUSED. The assertion is on the ERROR VARIANT, not merely
+    /// `is_err()`: [`SecretError::NotFound`] means "allowed, but this test
+    /// process has no such env var set"; [`SecretError::NotAllowed`] means
+    /// "refused by the allowlist before ever looking". A test that only
+    /// checked `is_err()` would keep passing even if the allowlist were
+    /// deleted outright, since an unset env var is `NotFound` either way.
+    #[tokio::test]
+    async fn connector_secret_resolver_admits_credential_suffixed_refs_but_refuses_the_apis_own_secrets_and_the_probe_flag()
+     {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        let state = AppState::new(cfg);
+
+        for admitted in [
+            "env:CONNECTOR_PG_PASSWORD",
+            "env:CONNECTOR_S3_ACCESS_KEY",
+            "env:CONNECTOR_S3_SECRET_KEY",
+            "env:CONNECTOR_MYSQL_PASSWORD",
+        ] {
+            let err = state
+                .connector_secret_resolver
+                .resolve_dyn(admitted)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, lakehouse_core::secret::SecretError::NotFound { .. }),
+                "{admitted} must be allowed by the pattern allowlist (NotFound, not \
+                 NotAllowed, since the env var is unset in this test process); got {err:?}"
+            );
+        }
+
+        for forbidden in [
+            "env:POSTGRES_PASSWORD",
+            "env:DATABASE_URL",
+            "env:CH_PASSWORD",
+            "env:CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS",
+        ] {
+            let err = state
+                .connector_secret_resolver
+                .resolve_dyn(forbidden)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, lakehouse_core::secret::SecretError::NotAllowed { .. }),
+                "{forbidden} must be refused by the allowlist; got {err:?}"
+            );
+        }
     }
 }
