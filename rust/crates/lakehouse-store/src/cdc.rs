@@ -373,24 +373,50 @@ pub struct IcebergSinkSpec {
 /// same set of properties, so the renderer and the actually-deployed
 /// config cannot silently drift apart.
 ///
+/// `slot_name` and `publication_name` are supplied by the caller rather
+/// than derived from `source.connector_slug`: a connector's replication
+/// slot and publication are provisioned out of band (see this function's
+/// own doc comment on `publication.autocreate.mode=disabled`, and the
+/// registry's `dial.slotName`/`dial.publicationName` fields), so a name
+/// that does not match what was actually provisioned would silently make
+/// `Debezium` read the wrong (or no) replication stream instead of failing
+/// loudly. Both are still validated as identifiers via [`ConnectorSlug::new`]
+/// before being interpolated — this reuses `ConnectorSlug`'s identifier-
+/// safety check without re-typing either name as a `ConnectorSlug` itself,
+/// since neither is a connector slug.
+///
 /// # Errors
 ///
-/// Returns [`CdcSpecError::ControlCharacterInField`] if `database_password`,
-/// `s3_access_key`, `s3_secret_key`, or `sink.catalog_token` contains a
-/// newline or other control character. `source`'s and `sink`'s own string
-/// fields are already validated ([`DebeziumSourceSpec::new`]); the
-/// credential values handed to this call are the last unvalidated inputs,
-/// since they are resolved by the caller immediately before calling this
-/// function (see the module doc comment) rather than stored in either spec
-/// type.
+/// Returns [`CdcSpecError::InvalidConnectorSlug`] if `slot_name` or
+/// `publication_name` does not match [`ConnectorSlug`]'s allowed shape —
+/// this covers both a value derived elsewhere in this crate and one read
+/// back from this crate's own `ingest_spec::CdcDial::slot_name`/
+/// `publication_name` fields (`src/ingest_spec.rs`), which is where a
+/// `cdc`-adapter connector's registry-supplied names actually live.
+/// Returns [`CdcSpecError::ControlCharacterInField`] if
+/// `database_password`, `s3_access_key`, `s3_secret_key`, or
+/// `sink.catalog_token` contains a newline or other control character.
+/// `source`'s and `sink`'s own string fields are already validated
+/// ([`DebeziumSourceSpec::new`]); the credential values handed to this call
+/// are the last unvalidated inputs, since they are resolved by the caller
+/// immediately before calling this function (see the module doc comment)
+/// rather than stored in either spec type.
 #[must_use = "this only builds a properties string; the caller must still write/deliver it"]
 pub fn render_debezium_properties(
     source: &DebeziumSourceSpec,
     sink: &IcebergSinkSpec,
+    slot_name: &str,
+    publication_name: &str,
     database_password: &SecretValue,
     s3_access_key: &SecretValue,
     s3_secret_key: &SecretValue,
 ) -> Result<String, CdcSpecError> {
+    // Validated purely for the identifier-safety side effect: the
+    // resulting `ConnectorSlug` is discarded, since `slot_name` and
+    // `publication_name` are not connector slugs, just values that must be
+    // as safe to embed unescaped as one.
+    ConnectorSlug::new(slot_name)?;
+    ConnectorSlug::new(publication_name)?;
     reject_control_characters("database_password", database_password.expose_secret())?;
     reject_control_characters("s3_access_key", s3_access_key.expose_secret())?;
     reject_control_characters("s3_secret_key", s3_secret_key.expose_secret())?;
@@ -445,8 +471,8 @@ pub fn render_debezium_properties(
          debezium.source.schema.include.list={schema}\n\
          debezium.source.table.include.list={table}\n\
          debezium.source.plugin.name=pgoutput\n\
-         debezium.source.slot.name={slug}_slot\n\
-         debezium.source.publication.name={slug}_pub\n\
+         debezium.source.slot.name={slot_name}\n\
+         debezium.source.publication.name={publication_name}\n\
          debezium.source.publication.autocreate.mode=disabled\n\
          debezium.source.schema.history.internal=io.debezium.storage.file.history.FileSchemaHistory\n\
          debezium.source.schema.history.internal.file.filename=/debezium/data/{slug}-schema-history.dat\n",
@@ -890,6 +916,8 @@ mod tests {
         let err = render_debezium_properties(
             &source,
             &sink,
+            "orders_pg_slot",
+            "orders_pg_pub",
             &malicious_password,
             &SecretValue::new("akid"),
             &SecretValue::new("secretkey"),
@@ -925,8 +953,16 @@ mod tests {
         let db_password = SecretValue::new("hunter2");
         let s3_key = SecretValue::new("akid");
         let s3_secret = SecretValue::new("secretkey");
-        let rendered =
-            render_debezium_properties(&source, &sink, &db_password, &s3_key, &s3_secret).unwrap();
+        let rendered = render_debezium_properties(
+            &source,
+            &sink,
+            "orders_pg_slot",
+            "orders_pg_pub",
+            &db_password,
+            &s3_key,
+            &s3_secret,
+        )
+        .unwrap();
 
         assert!(rendered.contains("debezium.source.database.password=hunter2"));
         assert!(rendered.contains("debezium.sink.iceberg.s3.access-key-id=akid"));
@@ -939,6 +975,80 @@ mod tests {
         // measured trap — never the Iceberg-backed default.
         assert!(rendered.contains("org.apache.kafka.connect.storage.FileOffsetBackingStore"));
         assert!(rendered.contains("io.debezium.storage.file.history.FileSchemaHistory"));
+    }
+
+    /// `render_debezium_properties`'s slot and publication names come from
+    /// whatever the caller passes, not from re-deriving `{slug}_slot`/
+    /// `{slug}_pub` internally — proven by passing names that do NOT match
+    /// the slug-derived shape and asserting
+    /// the slug-derived form never appears in the output.
+    #[test]
+    fn render_uses_the_given_slot_and_publication_names_not_the_slug_derived_ones() {
+        let source = DebeziumSourceSpec::new(
+            ConnectorSlug::new("orders_pg").unwrap(),
+            "pg.internal",
+            5432,
+            "oms",
+            "cdc_reader",
+            "public.orders",
+        )
+        .unwrap();
+        let sink = IcebergSinkSpec {
+            catalog_uri: "http://lakekeeper:8181/catalog".to_owned(),
+            warehouse: "default".to_owned(),
+            s3_endpoint: "http://rustfs:9000".to_owned(),
+            catalog_token: None,
+        };
+        let out = render_debezium_properties(
+            &source,
+            &sink,
+            "custom_slot_v2",
+            "custom_pub_v2",
+            &SecretValue::new("hunter2"),
+            &SecretValue::new("akid"),
+            &SecretValue::new("secretkey"),
+        )
+        .unwrap();
+        assert!(out.contains("debezium.source.slot.name=custom_slot_v2"));
+        assert!(out.contains("debezium.source.publication.name=custom_pub_v2"));
+        assert!(!out.contains("orders_pg_slot"));
+        assert!(!out.contains("orders_pg_pub"));
+    }
+
+    /// Both `slot_name` and `publication_name` are still validated as
+    /// identifiers, via [`ConnectorSlug::new`], even though a valid name is
+    /// no longer required to equal `{slug}_slot`/`{slug}_pub` — a
+    /// registry-supplied name still has to be safe to embed unescaped in a
+    /// Debezium `.properties` file (see [`ConnectorSlug`]'s doc comment for
+    /// why: path traversal, newline injection).
+    #[test]
+    fn render_rejects_an_invalid_slot_name_even_though_it_is_not_a_slug() {
+        let source = DebeziumSourceSpec::new(
+            ConnectorSlug::new("orders_pg").unwrap(),
+            "pg.internal",
+            5432,
+            "oms",
+            "cdc_reader",
+            "public.orders",
+        )
+        .unwrap();
+        let sink = IcebergSinkSpec {
+            catalog_uri: "http://lakekeeper:8181/catalog".to_owned(),
+            warehouse: "default".to_owned(),
+            s3_endpoint: "http://rustfs:9000".to_owned(),
+            catalog_token: None,
+        };
+        let err = render_debezium_properties(
+            &source,
+            &sink,
+            "../escape\nslot",
+            "orders_pg_pub",
+            &SecretValue::new("hunter2"),
+            &SecretValue::new("akid"),
+            &SecretValue::new("secretkey"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CdcSpecError::InvalidConnectorSlug { .. }));
     }
 
     /// Parse a `.properties`-shaped body (`key=value` per line, blank lines
@@ -1014,6 +1124,8 @@ mod tests {
         let rendered = render_debezium_properties(
             &source,
             &sink,
+            "p5cdc_slot",
+            "p5cdc_pub",
             &SecretValue::new("lakehouse"),
             &SecretValue::new("rustfsadmin"),
             &SecretValue::new("rustfsadmin"),
