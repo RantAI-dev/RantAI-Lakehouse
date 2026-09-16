@@ -73,6 +73,7 @@ object_store = { version = "0.14", features = ["aws"] }
 # happen in one place at a time.
 arrow-array = "58"
 arrow-schema = "58"
+tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "rustls", "chrono"] }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
