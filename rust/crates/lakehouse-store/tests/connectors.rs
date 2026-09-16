@@ -23,7 +23,8 @@ use lakehouse_store::StoreError;
 use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::connectors::{
     CreateConnectorInput, IngestSpecInput, create_connector, delete_connector, get_connector,
-    get_connector_dial_info, get_ingest_spec, list_connectors, record_test_result, set_ingest_spec,
+    get_connector_dial_info, get_ingest_spec, list_connectors, list_ingestible_connectors,
+    record_test_result, set_ingest_spec,
 };
 use lakehouse_store::pipelines::{CreatePipelineInput, create_pipeline};
 use sqlx::PgPool;
@@ -668,6 +669,53 @@ async fn set_ingest_spec_then_get_round_trips(pool: PgPool) -> sqlx::Result<()> 
     assert_eq!(read.schedule_cron.as_deref(), Some("0 * * * *"));
     assert_eq!(read.secret_refs.primary, "env:INGEST_SPEC_TEST_TOKEN");
     assert_eq!(read.secret_refs.secondary, None);
+    Ok(())
+}
+
+/// `list_ingestible_connectors` carries the connector's
+/// `secretRef` NAME (never resolved), and only rows that have had an
+/// ingest spec set at all (`adapter IS NOT NULL`) — a connector created
+/// but never given an ingest spec must not show up as "ingestible".
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_ingestible_connectors_carries_the_secret_ref_name_never_resolved(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let never_configured = create_connector(&pool, &minimal_input("never given an ingest spec"))
+        .await
+        .unwrap();
+
+    let created = create_connector(&pool, &minimal_input("ingestible listing"))
+        .await
+        .unwrap();
+    let spec = IngestSpecInput {
+        adapter: "sql".to_owned(),
+        ingest_mode: "batch".to_owned(),
+        dial: serde_json::json!({
+            "driver": "mysql",
+            "host": "source.example.internal",
+            "port": 3306,
+            "database": "orders",
+            "user": "app_reader",
+        }),
+        source_objects: serde_json::json!([{"name": "orders", "target": "orders"}]),
+        schedule_cron: Some("0 * * * *".to_owned()),
+    };
+    set_ingest_spec(&pool, &created.id, &spec).await.unwrap();
+
+    let rows = list_ingestible_connectors(&pool).await.unwrap();
+    assert!(
+        !rows.iter().any(|r| r.id == never_configured.id),
+        "a connector with no ingest spec set must not be listed as ingestible"
+    );
+
+    let row = rows.iter().find(|r| r.id == created.id).unwrap();
+    assert_eq!(row.adapter, "sql");
+    assert_eq!(row.ingest_mode, "batch");
+    assert_eq!(row.dial, spec.dial);
+    assert_eq!(row.source_objects, spec.source_objects);
+    assert_eq!(row.schedule_cron.as_deref(), Some("0 * * * *"));
+    assert_eq!(row.secret_ref, "env:INGEST_SPEC_TEST_TOKEN");
+    assert_eq!(row.secret_ref_secondary, None);
     Ok(())
 }
 

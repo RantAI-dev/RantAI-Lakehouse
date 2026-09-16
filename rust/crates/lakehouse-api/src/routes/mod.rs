@@ -197,6 +197,17 @@ fn connectors_router() -> Router<AppState> {
             get(connectors::list).post(connectors::create),
         )
         .route(
+            // A dedicated route (not `?ingestible=true` on `/api/connectors`):
+            // `Policy::RequiresPermission` takes one string per route, so
+            // overloading the existing `connector:manage`-gated route would
+            // need an "either permission" `Policy` variant this workstream
+            // does not otherwise need (the ingest:read scope this route is gated on, below). matchit (axum's router)
+            // matches this static segment ahead of the `{id}` param route
+            // below for the literal path `/api/connectors/ingestible`.
+            "/api/connectors/ingestible",
+            get(connectors::list_ingestible),
+        )
+        .route(
             "/api/connectors/{id}",
             get(connectors::detail).delete(connectors::delete),
         )

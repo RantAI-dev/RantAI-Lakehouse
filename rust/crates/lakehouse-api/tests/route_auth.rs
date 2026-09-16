@@ -348,6 +348,46 @@ async fn a_seeded_data_engineer_is_not_denied_catalog_annotation_write() {
 }
 
 /// A principal holding ONLY `ingest:read` (not `connector:manage`) may
+/// `GET /api/connectors/ingestible` but is refused the base
+/// `GET /api/connectors` — the whole reason `/ingestible` exists as a
+/// separate route rather than a query param on the `connector:manage`-gated
+/// one: the Dagster ingest service identity (`dagster/dispar_orchestrate/ingest_factory.py`)
+/// only ever holds `ingest:read`, never `connector:manage`.
+#[tokio::test]
+async fn ingest_read_scope_can_call_ingestible_but_not_the_base_connectors_route() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id = create_principal_with_permissions(&pool, "ingest:read").await;
+
+    let ingestible_cookie = session_cookie_for_user(&pool, user_id).await;
+    let ingestible_resp = request_with_cookie(
+        &router,
+        "GET",
+        "/api/connectors/ingestible",
+        &ingestible_cookie,
+    )
+    .await;
+    assert_ne!(
+        ingestible_resp.status(),
+        StatusCode::FORBIDDEN,
+        "ingest:read alone must be enough to GET /api/connectors/ingestible"
+    );
+    assert_ne!(
+        ingestible_resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a valid session must never be treated as unauthenticated"
+    );
+
+    let base_cookie = session_cookie_for_user(&pool, user_id).await;
+    let base_resp = request_with_cookie(&router, "GET", "/api/connectors", &base_cookie).await;
+    assert_eq!(
+        base_resp.status(),
+        StatusCode::FORBIDDEN,
+        "ingest:read alone must NOT be enough to GET the base /api/connectors route -- that \
+         is a distinct, broader connector:manage-gated route"
+    );
+}
+
+/// A principal holding ONLY `ingest:read` (not `connector:manage`) may
 /// `GET /api/connectors/{id}/ingest-spec` and is refused `PUT` on the same
 /// route.
 ///

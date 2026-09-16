@@ -281,6 +281,14 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
 
     // ── Connectors: seeded Data Engineer permission `connector:manage`. ──
     ("GET",  "/api/connectors",             Policy::RequiresPermission("connector:manage")),
+    // `ingest:read` (`0033_connector_ingest_spec.sql`'s grant) is a
+    // STRICTLY NARROWER read-only permission than `connector:manage` --
+    // the whole reason this is a separate route rather than a query param
+    // on `/api/connectors` above (see `routes::mod::connectors_router`'s
+    // comment). An `ingest:read`-only caller (the Dagster ingest service
+    // identity, `dagster/dispar_orchestrate/ingest_factory.py`) must
+    // never be able to call the base `/api/connectors` route.
+    ("GET",  "/api/connectors/ingestible",  Policy::RequiresPermission("ingest:read")),
     ("POST", "/api/connectors",             Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}",        Policy::RequiresPermission("connector:manage")),
     // Was missing entirely while `routes::mod` registered `.delete(...)` on

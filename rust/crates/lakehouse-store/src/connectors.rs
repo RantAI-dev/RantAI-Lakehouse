@@ -849,6 +849,125 @@ pub async fn record_test_result(
     })
 }
 
+/// Everything `dagster/dispar_orchestrate/ingest_factory.py` needs to build
+/// and run one ingest job for a connector, and nothing else — narrower
+/// than [`ConnectorDialInfo`] (which also carries `host`/`kind` fields
+/// this route has no use for) and a STRICT SUPERSET of what [`Connector`]
+/// (the public, redacted read type) can express, since `Connector` has no
+/// `adapter`/`dial`/`secretRef` fields at all (see the module doc
+/// comment). Returned only by [`list_ingestible_connectors`], exposed
+/// ONLY to `ingest:read`-scoped callers
+/// (`GET /api/connectors/ingestible`, `0033_connector_ingest_spec.sql`'s
+/// grant) — a caller with ONLY `ingest:read` and no `connector:manage`
+/// still gets `secretRef` NAMES here (never resolved values), the same
+/// "name, never resolve" posture `GET .../ingest-spec` already
+/// established for `connector:manage` callers.
+///
+/// `host` still never appears as its own field — it lives inside `dial`,
+/// which this type DOES expose (unlike `Connector`), since the whole
+/// point of `/ingestible` is handing a trusted, `ingest:read`-scoped
+/// internal caller enough to actually dial.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestibleConnector {
+    /// `connector.id`.
+    pub id: String,
+    /// One of `sql | cdc | files | rest | sheets` — never `NULL` here,
+    /// since [`list_ingestible_connectors`] only selects rows where
+    /// `adapter IS NOT NULL`.
+    pub adapter: String,
+    /// `"batch" | "cdc"`. `set_ingest_spec` always writes this in the
+    /// same `UPDATE` as `adapter`, so a row this query selects (`adapter
+    /// IS NOT NULL`) has always had `ingest_mode` written too in
+    /// practice — but see this struct's `# Note` if that invariant is
+    /// ever weakened.
+    pub ingest_mode: String,
+    /// Validated at `set_ingest_spec` time against
+    /// [`crate::ingest_spec::Dial::parse`] for this row's `adapter`.
+    pub dial: serde_json::Value,
+    /// The objects (tables/endpoints/sheet ranges) this ingest job
+    /// targets.
+    pub source_objects: serde_json::Value,
+    /// `None` for a `cdc`-mode job, or a `batch`-mode job that has never
+    /// been scheduled.
+    pub schedule_cron: Option<String>,
+    /// Reference NAME to the primary credential — never resolved here.
+    pub secret_ref: String,
+    /// Reference NAME to a secondary credential, for an adapter/auth-type
+    /// combination that needs two (`secret_map.secret_field_names`,
+    /// Dagster-side; `ingest_spec::secret_field_names`, Rust-side).
+    pub secret_ref_secondary: Option<String>,
+}
+
+/// The raw tuple shape [`list_ingestible_connectors`] decodes from its
+/// `SELECT`, naming the same eight columns in the same order: `id,
+/// adapter, ingest_mode, dial, source_objects, schedule_cron, secret_ref,
+/// secret_ref_secondary`. A module-level alias rather than an inline type,
+/// same `clippy::type_complexity` reason [`IngestSpecRow`] exists for.
+type IngestibleConnectorRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    serde_json::Value,
+    serde_json::Value,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
+/// List every connector that has ever had an ingest spec set
+/// (`adapter IS NOT NULL`) — the source `ingest_factory.py`'s schedule
+/// factory and `run_ingest` op both read from, via
+/// `GET /api/connectors/ingestible`.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn list_ingestible_connectors(
+    pool: &PgPool,
+) -> Result<Vec<IngestibleConnector>, StoreError> {
+    let rows: Vec<IngestibleConnectorRow> = sqlx::query_as(
+        "SELECT id, adapter, ingest_mode, dial, source_objects, schedule_cron, secret_ref, \
+         secret_ref_secondary FROM connector WHERE adapter IS NOT NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(
+            |(
+                id,
+                adapter,
+                ingest_mode,
+                dial,
+                source_objects,
+                schedule_cron,
+                secret_ref,
+                secret_ref_secondary,
+            )| {
+                // `adapter IS NOT NULL` is the query's own WHERE clause, so
+                // this `?` never actually short-circuits in practice — it
+                // exists so a future change to the query can never turn a
+                // NULL adapter into a fabricated empty string here instead
+                // of silently dropping the row (AGENTS.md principle 2).
+                // Same reasoning for `ingest_mode`: `set_ingest_spec` always
+                // writes it alongside `adapter`, so this only guards
+                // against a hand-edited or future-migration-violated row.
+                Some(IngestibleConnector {
+                    id,
+                    adapter: adapter?,
+                    ingest_mode: ingest_mode?,
+                    dial,
+                    source_objects,
+                    schedule_cron,
+                    secret_ref,
+                    secret_ref_secondary,
+                })
+            },
+        )
+        .collect())
+}
+
 /// Delete a connector by id. Returns `Ok(false)` (not an error) if `id`
 /// does not name a connector — matching the idempotent-delete convention
 /// most of this codebase's `DELETE` handlers already use.

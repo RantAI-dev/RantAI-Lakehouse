@@ -66,6 +66,26 @@ pub async fn list(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<connec
     Ok(ApiJson(connectors::list_connectors(pool(&state)?).await?))
 }
 
+/// `GET /api/connectors/ingestible` — every connector that has an ingest
+/// spec set (`adapter IS NOT NULL`), as an
+/// [`connectors::IngestibleConnector`]. Gated on `ingest:read`
+/// (`POLICY_TABLE`), a strictly narrower grant than the base
+/// `/api/connectors` route's `connector:manage` — this is the route
+/// `dagster/dispar_orchestrate/ingest_factory.py`'s `ingest:read`-scoped
+/// service identity calls, both at code-load time (to build schedules)
+/// and at run time (`run_ingest`'s own re-fetch of its own connector).
+///
+/// # Errors
+///
+/// 503 if no pool is configured; 500 on a database failure.
+pub async fn list_ingestible(
+    State(state): State<AppState>,
+) -> ApiResult<ApiJson<Vec<connectors::IngestibleConnector>>> {
+    Ok(ApiJson(
+        connectors::list_ingestible_connectors(pool(&state)?).await?,
+    ))
+}
+
 /// `GET /api/connectors/{id}` — one connector's detail.
 ///
 /// # Errors
