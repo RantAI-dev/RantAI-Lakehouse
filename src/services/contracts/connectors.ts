@@ -72,9 +72,79 @@ export type CreateConnectorInput = {
   owner?: string
 }
 
+/**
+ * The `dial` payload for a connector's ingest spec. Mirrors the opaque
+ * `serde_json::Value` field on Rust's `IngestSpec`/`IngestSpecInput`
+ * (`rust/crates/lakehouse-store/src/connectors.rs`): its actual shape is
+ * one of five adapter-specific structs in
+ * `rust/crates/lakehouse-store/src/ingest_spec.rs`, dispatched on
+ * `adapter` and validated there by `Dial::parse` on every `PUT`. The
+ * browser never re-validates `dial`'s contents — it is deliberately
+ * loose JSON on this side.
+ */
+export type Dial = Record<string, unknown>
+
+/**
+ * One object (table, endpoint, sheet range) an ingest job targets.
+ * Mirrors `SourceObject` in
+ * `rust/crates/lakehouse-store/src/ingest_spec.rs` (`#[serde(deny_unknown_fields,
+ * rename_all = "camelCase")]`).
+ */
+export type SourceObject = {
+  name: string
+  incrementalKey?: string
+  target: string
+}
+
+/**
+ * Credential reference NAMES only (`env:FOO`, `file:/…`), never a
+ * resolved value — mirrors `IngestSecretRefs` in
+ * `rust/crates/lakehouse-store/src/connectors.rs` exactly, including its
+ * `Option<String>` nullability on `secondary`.
+ */
+export type IngestSecretRefs = {
+  primary: string
+  secondary: string | null
+}
+
+/**
+ * A connector's ingest configuration, as returned by
+ * `GET /api/connectors/{id}/ingest-spec`. Mirrors Rust `IngestSpec`
+ * (`rust/crates/lakehouse-store/src/connectors.rs`) field-for-field,
+ * including nullability: `adapter`/`ingestMode` are plain
+ * `Option<String>` there (not a closed enum), `null` for a connector
+ * that has never had an ingest spec set.
+ */
+export type IngestSpec = {
+  adapter: string | null
+  ingestMode: string | null
+  dial: Dial
+  sourceObjects: SourceObject[]
+  scheduleCron: string | null
+  secretRefs: IngestSecretRefs
+}
+
+/**
+ * The `PUT /api/connectors/{id}/ingest-spec` body. Mirrors Rust
+ * `IngestSpecInput` (`rust/crates/lakehouse-store/src/connectors.rs`):
+ * `adapter`/`ingestMode` are required plain strings there too (validated
+ * at runtime by `Dial::parse`, not by the type system), and
+ * `scheduleCron` is omittable for a `cdc`-mode job or one that is not
+ * scheduled.
+ */
+export type IngestSpecInput = {
+  adapter: string
+  ingestMode: string
+  dial: Dial
+  sourceObjects: SourceObject[]
+  scheduleCron?: string
+}
+
 export interface ConnectorService {
   listConnectors(signal?: AbortSignal): Promise<Connector[]>
   getConnector(id: string, signal?: AbortSignal): Promise<ConnectorDetail>
   createConnector(input: CreateConnectorInput, signal?: AbortSignal): Promise<Connector>
   testConnection(id: string, signal?: AbortSignal): Promise<ConnectorTestResult>
+  getIngestSpec(id: string, signal?: AbortSignal): Promise<IngestSpec>
+  setIngestSpec(id: string, input: IngestSpecInput, signal?: AbortSignal): Promise<IngestSpec>
 }

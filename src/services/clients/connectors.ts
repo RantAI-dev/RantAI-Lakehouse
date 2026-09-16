@@ -4,6 +4,8 @@ import type {
   ConnectorService,
   ConnectorTestResult,
   CreateConnectorInput,
+  IngestSpec,
+  IngestSpecInput,
 } from "../contracts/connectors";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
@@ -52,6 +54,21 @@ async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Pr
   return json as T;
 }
 
+async function putJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
+  const res = await apiFetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  const json = await res.json();
+  if (!res.ok) {
+    const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
+    throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`);
+  }
+  return json as T;
+}
+
 export const postgresConnectorService: ConnectorService = {
   listConnectors(signal) {
     return getJson<Connector[]>("/api/connectors", { signal });
@@ -64,5 +81,11 @@ export const postgresConnectorService: ConnectorService = {
   },
   testConnection(id, signal) {
     return postJson<ConnectorTestResult>(`/api/connectors/${encodeURIComponent(id)}/test`, undefined, signal);
+  },
+  getIngestSpec(id, signal) {
+    return getJson<IngestSpec>(`/api/connectors/${encodeURIComponent(id)}/ingest-spec`, { signal });
+  },
+  setIngestSpec(id, input: IngestSpecInput, signal) {
+    return putJson<IngestSpec>(`/api/connectors/${encodeURIComponent(id)}/ingest-spec`, input, signal);
   },
 };
