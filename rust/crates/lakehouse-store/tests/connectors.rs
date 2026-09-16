@@ -22,8 +22,8 @@ use lakehouse_test_support as _;
 use lakehouse_store::StoreError;
 use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::connectors::{
-    CreateConnectorInput, create_connector, delete_connector, get_connector,
-    get_connector_dial_info, list_connectors, record_test_result,
+    CreateConnectorInput, IngestSpecInput, create_connector, delete_connector, get_connector,
+    get_connector_dial_info, get_ingest_spec, list_connectors, record_test_result, set_ingest_spec,
 };
 use lakehouse_store::pipelines::{CreatePipelineInput, create_pipeline};
 use sqlx::PgPool;
@@ -564,5 +564,112 @@ async fn get_connector_audit_event_id_resolves_a_real_event(pool: PgPool) -> sql
         .unwrap()
         .unwrap();
     assert_eq!(after.audit_event_id.as_deref(), Some(event.id.as_str()));
+    Ok(())
+}
+
+/// A minimal, valid [`CreateConnectorInput`] for tests that only care about
+/// the resulting connector's id, not its other fields.
+fn minimal_input(name: &str) -> CreateConnectorInput {
+    CreateConnectorInput {
+        name: name.to_owned(),
+        kind: "REST API".to_owned(),
+        direction: "source".to_owned(),
+        host: "api.example.internal".to_owned(),
+        secret_ref: "env:INGEST_SPEC_TEST_TOKEN".to_owned(),
+        secret_ref_secondary: None,
+        environment: "staging".to_owned(),
+        tenant: "Meridian Group".to_owned(),
+        residency: "in-region".to_owned(),
+        capabilities: vec![],
+        owner: None,
+    }
+}
+
+/// `set_ingest_spec` writes a valid `dial`, and `get_ingest_spec` reads it
+/// back, including the connector's existing `secretRef` (never resolved,
+/// only named — see `IngestSecretRefs`'s doc comment).
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_ingest_spec_then_get_round_trips(pool: PgPool) -> sqlx::Result<()> {
+    let created = create_connector(&pool, &minimal_input("ingest spec round trip"))
+        .await
+        .unwrap();
+    let spec = IngestSpecInput {
+        adapter: "files".to_owned(),
+        ingest_mode: "batch".to_owned(),
+        dial: serde_json::json!({"protocol": "s3", "bucket": "b", "format": "csv"}),
+        source_objects: serde_json::json!([]),
+        schedule_cron: Some("0 * * * *".to_owned()),
+    };
+    set_ingest_spec(&pool, &created.id, &spec).await.unwrap();
+
+    let read = get_ingest_spec(&pool, &created.id).await.unwrap().unwrap();
+    assert_eq!(read.adapter.as_deref(), Some("files"));
+    assert_eq!(read.ingest_mode.as_deref(), Some("batch"));
+    assert_eq!(read.dial, spec.dial);
+    assert_eq!(read.schedule_cron.as_deref(), Some("0 * * * *"));
+    assert_eq!(read.secret_refs.primary, "env:INGEST_SPEC_TEST_TOKEN");
+    assert_eq!(read.secret_refs.secondary, None);
+    Ok(())
+}
+
+/// A `dial` that fails its adapter's own validation (`sql` requires
+/// `driver`/`host`/`port`/`database`/`user`, and rejects an unknown field
+/// like `password`) is rejected as [`StoreError::Validation`] and never
+/// written — the whole point of validating BEFORE the `UPDATE`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_ingest_spec_rejects_a_dial_that_fails_adapter_validation(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = create_connector(&pool, &minimal_input("ingest spec invalid dial"))
+        .await
+        .unwrap();
+    let spec = IngestSpecInput {
+        adapter: "sql".to_owned(),
+        ingest_mode: "batch".to_owned(),
+        // Missing required fields (host/port/database/user) AND carries a
+        // forbidden `password` field -- `SqlDial`'s `deny_unknown_fields`
+        // rejects it before any missing-field check even runs.
+        dial: serde_json::json!({"driver": "mysql", "password": "s3cret"}),
+        source_objects: serde_json::json!([]),
+        schedule_cron: None,
+    };
+    let err = set_ingest_spec(&pool, &created.id, &spec)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Validation(_)));
+
+    // The rejected dial must never have reached the row.
+    let read = get_ingest_spec(&pool, &created.id).await.unwrap().unwrap();
+    assert_eq!(
+        read.adapter, None,
+        "an invalid dial must never be persisted"
+    );
+    assert_eq!(read.dial, serde_json::json!({}));
+    Ok(())
+}
+
+/// `set_ingest_spec`/`get_ingest_spec` both return [`StoreError::NotFound`]
+/// / `Ok(None)` for an id that names no connector, rather than silently
+/// succeeding or panicking.
+#[sqlx::test(migrations = "../../migrations")]
+async fn ingest_spec_functions_treat_an_unknown_id_honestly(pool: PgPool) -> sqlx::Result<()> {
+    assert!(
+        get_ingest_spec(&pool, "conn-does-not-exist")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let spec = IngestSpecInput {
+        adapter: "files".to_owned(),
+        ingest_mode: "batch".to_owned(),
+        dial: serde_json::json!({"protocol": "s3", "bucket": "b", "format": "csv"}),
+        source_objects: serde_json::json!([]),
+        schedule_cron: None,
+    };
+    let err = set_ingest_spec(&pool, "conn-does-not-exist", &spec)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound));
     Ok(())
 }

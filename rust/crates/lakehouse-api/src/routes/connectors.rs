@@ -564,6 +564,81 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `GET /api/connectors/{id}/ingest-spec` — a connector's ingest
+/// configuration.
+///
+/// Gated on `ingest:read`, not `connector:manage` — see `policy.rs`'s
+/// `POLICY_TABLE` entry and `0033_connector_ingest_spec.sql`'s header
+/// comment for why: a read-only caller (e.g. Phase G's ingest service
+/// identity) must never be handed PUT-level `connector:manage` just to
+/// read a `dial`.
+///
+/// # Errors
+///
+/// 404 if `id` is unknown; 503/500 as above.
+pub async fn ingest_spec_get(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<connectors::IngestSpec>> {
+    let spec = connectors::get_ingest_spec(pool(&state)?, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Connector {id} not found")))?;
+    Ok(ApiJson(spec))
+}
+
+/// The `PUT /api/connectors/{id}/ingest-spec` body. Mirrors
+/// `IngestSpecInput` in `contracts/connectors.ts`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestSpecBody {
+    adapter: String,
+    ingest_mode: String,
+    #[serde(default)]
+    dial: serde_json::Value,
+    #[serde(default)]
+    source_objects: serde_json::Value,
+    #[serde(default)]
+    schedule_cron: Option<String>,
+}
+
+/// `PUT /api/connectors/{id}/ingest-spec` — set a connector's ingest
+/// configuration.
+///
+/// Gated on `connector:manage`, not `ingest:read` — the write half of the
+/// same split [`ingest_spec_get`]'s doc comment describes.
+/// [`lakehouse_store::connectors::set_ingest_spec`] runs
+/// `ingest_spec::Dial::parse` against `dial` BEFORE writing anything, so an
+/// invalid `dial` (unknown field, missing required field, unsafe hostname)
+/// never reaches the database.
+///
+/// # Errors
+///
+/// 404 if `id` is unknown; 400 if `dial` fails
+/// `ingest_spec::Dial::parse` for `adapter` (`StoreError::Validation` maps
+/// to `ApiError::BadRequest`, never `Internal` — the validator's own
+/// message is safe to surface); 503/500 as above.
+pub async fn ingest_spec_put(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<connectors::IngestSpec>> {
+    let body: IngestSpecBody = parse_body(&body)?;
+    let input = connectors::IngestSpecInput {
+        adapter: body.adapter,
+        ingest_mode: body.ingest_mode,
+        dial: body.dial,
+        source_objects: body.source_objects,
+        schedule_cron: body.schedule_cron,
+    };
+    match connectors::set_ingest_spec(pool(&state)?, &id, &input).await {
+        Ok(spec) => Ok(ApiJson(spec)),
+        Err(lakehouse_store::StoreError::NotFound) => {
+            Err(ApiError::NotFound(format!("Connector {id} not found")).into())
+        }
+        Err(err) => Err(ApiError::from(err).into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

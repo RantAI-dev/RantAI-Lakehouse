@@ -17,6 +17,7 @@
 //! | [`StoreError::ForeignKeyViolation`] | `BadRequest`  | 400    | caller referenced a row that doesn't exist                     |
 //! | [`StoreError::NotFound`]   | `NotFound`            | 404    | caller asked for a row that doesn't exist                      |
 //! | [`StoreError::Unavailable`]| `Unavailable`         | 503    | no pool configured at all (see [`crate::connect_lazy`])         |
+//! | [`StoreError::Validation`] | `BadRequest`          | 400    | this crate's own validator rejected caller input (never a raw `sqlx` error) |
 //! | [`StoreError::Database`]   | `Internal`            | 500    | anything else — connection refused, timeout, syntax error, ...  |
 //! | [`StoreError::Migration`]  | `Internal`            | 500    | `sqlx::migrate!` failed to apply                                |
 //!
@@ -61,6 +62,17 @@ pub enum StoreError {
     /// reached.
     #[error("database is not available")]
     Unavailable,
+    /// A caller-supplied value failed application-level validation this
+    /// crate performs itself (never a raw `sqlx`/Postgres error) -- e.g. a
+    /// `dial` that fails `ingest_spec::Dial::parse` (`set_ingest_spec`,
+    /// `connectors.rs`). Carries the validator's own message, which is
+    /// already safe to surface (it never echoes raw upstream driver/
+    /// database text, nor the raw `dial` JSON a smuggled credential could
+    /// hide in -- see `ingest_spec`'s module doc comment -- unlike
+    /// [`Self::Database`], whose message is deliberately generic; see the
+    /// module doc comment's rule for why).
+    #[error("{0}")]
+    Validation(String),
     /// Any other `sqlx` failure: connection refused, pool timeout, a SQL
     /// syntax error, a type-decode failure, and so on. Intentionally does
     /// NOT interpolate the source error into `Display` — see the module
@@ -104,7 +116,17 @@ impl From<StoreError> for ApiError {
         let message = err.to_string();
         match err {
             StoreError::Conflict => Self::Conflict(message),
-            StoreError::ForeignKeyViolation => Self::BadRequest(message),
+            // `ForeignKeyViolation` and `Validation` both map to `BadRequest`
+            // for different reasons (see the module doc comment's mapping
+            // table): the former because the caller referenced a row that
+            // doesn't exist, the latter because this crate's own validator
+            // (e.g. `ingest_spec::Dial::parse`'s field-path error) rejected
+            // caller input -- `Validation`'s message is safe to surface,
+            // never a raw `sqlx`/database error, so it never needs the
+            // generic `Internal` treatment `Database`/`Migration` get below.
+            StoreError::ForeignKeyViolation | StoreError::Validation(_) => {
+                Self::BadRequest(message)
+            }
             StoreError::NotFound => Self::NotFound(message),
             StoreError::Unavailable => Self::Unavailable(message),
             StoreError::Database(_) | StoreError::Migration(_) => Self::Internal(message),
@@ -122,6 +144,19 @@ mod tests {
     fn conflict_maps_to_409() {
         let api: ApiError = StoreError::Conflict.into();
         assert_eq!(api.status(), 409);
+    }
+
+    /// `Validation` must map to 400, never `Internal` (500) -- an invalid
+    /// `dial` is the caller's fault, and the exhaustive `match` in
+    /// `From<StoreError> for ApiError` above forces every future variant
+    /// to name its status explicitly rather than fall through to a `_`
+    /// arm.
+    #[test]
+    fn validation_maps_to_400_and_carries_the_validator_message() {
+        let api: ApiError =
+            StoreError::Validation("dial for adapter \"sql\" is invalid".to_owned()).into();
+        assert_eq!(api.status(), 400);
+        assert_eq!(api.to_string(), "dial for adapter \"sql\" is invalid");
     }
 
     #[test]

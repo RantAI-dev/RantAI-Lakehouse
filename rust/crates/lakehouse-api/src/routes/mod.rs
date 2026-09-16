@@ -208,6 +208,10 @@ fn connectors_router() -> Router<AppState> {
             "/api/connectors/{id}/debezium-properties",
             get(connectors::debezium_properties),
         )
+        .route(
+            "/api/connectors/{id}/ingest-spec",
+            get(connectors::ingest_spec_get).put(connectors::ingest_spec_put),
+        )
 }
 
 /// The `/api/identity/*` sub-router (Phase 2 identity domain), split out

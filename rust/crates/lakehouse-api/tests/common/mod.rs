@@ -192,3 +192,47 @@ pub async fn create_zero_permission_principal(pool: &PgPool) -> Uuid {
 
     user_id
 }
+
+/// Creates a fresh `app_user` holding a role that grants EXACTLY
+/// `permissions` (a `role.permissions`-shaped string, e.g. `"ingest:read"`
+/// or `"connector:manage"`) and returns its `app_user.id`.
+///
+/// Unlike [`create_zero_permission_principal`], this lets a test assert
+/// the negative half of a two-permission split: no seeded role holds
+/// `ingest:read` alone or `connector:manage` alone (the only seeded role
+/// with either, Data Engineer, holds BOTH after
+/// `0033_connector_ingest_spec.sql`'s grant), so a route whose GET and PUT
+/// require different permissions needs a principal minted with exactly
+/// one of the two to prove the split is real and not accidentally
+/// satisfied by the other permission.
+pub async fn create_principal_with_permissions(pool: &PgPool, permissions: &str) -> Uuid {
+    let role_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO role (id, name, permissions, description) VALUES ($1, $2, $3, 'test: single-permission principal')",
+    )
+    .bind(role_id)
+    .bind(format!("Single Perm {}", Uuid::new_v4()))
+    .bind(permissions)
+    .execute(pool)
+    .await
+    .expect("insert a single-permission role");
+
+    let user_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO app_user (id, name, email, status) VALUES ($1, 'Single Perm Test User', $2, 'active')",
+    )
+    .bind(user_id)
+    .bind(format!("single-perm-{user_id}@test.invalid"))
+    .execute(pool)
+    .await
+    .expect("insert a single-permission test user");
+
+    sqlx::query("INSERT INTO app_user_role (user_id, role_id) VALUES ($1, $2)")
+        .bind(user_id)
+        .bind(role_id)
+        .execute(pool)
+        .await
+        .expect("attach the single-permission role to the test user");
+
+    user_id
+}

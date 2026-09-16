@@ -46,8 +46,8 @@ use lakehouse_api::policy::{POLICY_TABLE, Policy};
 use tower::ServiceExt;
 
 use common::{
-    TestApp, create_zero_permission_principal, session_cookie_for_seeded_user,
-    session_cookie_for_user, spin_up,
+    TestApp, create_principal_with_permissions, create_zero_permission_principal,
+    session_cookie_for_seeded_user, session_cookie_for_user, spin_up,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -345,6 +345,139 @@ async fn a_seeded_data_engineer_is_not_denied_catalog_annotation_write() {
         StatusCode::UNAUTHORIZED,
         "a valid session must never be treated as unauthenticated"
     );
+}
+
+/// A principal holding ONLY `ingest:read` (not `connector:manage`) may
+/// `GET /api/connectors/{id}/ingest-spec` and is refused `PUT` on the same
+/// route.
+///
+/// This, together with the next two tests, replaces a wrong assertion this
+/// plan originally specified ("a principal with only `connector:manage`
+/// can do both") — `PermissionSet::has`
+/// (`lakehouse-auth/src/permissions.rs`) matches resource+action exactly,
+/// so `connector:manage` never satisfies `ingest:read`; a Data Engineer
+/// can do both only because `0033_connector_ingest_spec.sql` grants it
+/// BOTH permissions, not because one implies the other.
+#[tokio::test]
+async fn ingest_read_only_principal_may_get_but_not_put_ingest_spec() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id = create_principal_with_permissions(&pool, "ingest:read").await;
+
+    let get_cookie = session_cookie_for_user(&pool, user_id).await;
+    let get_resp = request_with_cookie(
+        &router,
+        "GET",
+        "/api/connectors/conn-pg-lakehouse/ingest-spec",
+        &get_cookie,
+    )
+    .await;
+    assert_ne!(
+        get_resp.status(),
+        StatusCode::FORBIDDEN,
+        "ingest:read alone must be enough to GET the ingest-spec"
+    );
+    assert_ne!(
+        get_resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a valid session must never be treated as unauthenticated"
+    );
+
+    let put_cookie = session_cookie_for_user(&pool, user_id).await;
+    let put_resp = request_with_cookie(
+        &router,
+        "PUT",
+        "/api/connectors/conn-pg-lakehouse/ingest-spec",
+        &put_cookie,
+    )
+    .await;
+    assert_eq!(
+        put_resp.status(),
+        StatusCode::FORBIDDEN,
+        "ingest:read alone must NOT be enough to PUT the ingest-spec -- that would hand a \
+         read-only caller PUT-level authority"
+    );
+}
+
+/// A principal holding ONLY `connector:manage` (not `ingest:read`) may
+/// `PUT /api/connectors/{id}/ingest-spec` and is refused `GET` on the same
+/// route -- the mirror image of the test above.
+#[tokio::test]
+async fn connector_manage_only_principal_may_put_but_not_get_ingest_spec() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id = create_principal_with_permissions(&pool, "connector:manage").await;
+
+    let get_cookie = session_cookie_for_user(&pool, user_id).await;
+    let get_resp = request_with_cookie(
+        &router,
+        "GET",
+        "/api/connectors/conn-pg-lakehouse/ingest-spec",
+        &get_cookie,
+    )
+    .await;
+    assert_eq!(
+        get_resp.status(),
+        StatusCode::FORBIDDEN,
+        "connector:manage alone must NOT be enough to GET the ingest-spec -- ingest:read is a \
+         distinct resource:action pair"
+    );
+
+    let put_cookie = session_cookie_for_user(&pool, user_id).await;
+    let put_resp = request_with_cookie(
+        &router,
+        "PUT",
+        "/api/connectors/conn-pg-lakehouse/ingest-spec",
+        &put_cookie,
+    )
+    .await;
+    assert_ne!(
+        put_resp.status(),
+        StatusCode::FORBIDDEN,
+        "connector:manage alone must be enough to PUT the ingest-spec"
+    );
+    assert_ne!(
+        put_resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a valid session must never be treated as unauthenticated"
+    );
+}
+
+/// A seeded Data Engineer holds BOTH `ingest:read` and `connector:manage`
+/// (`0033_connector_ingest_spec.sql`'s grant, on top of the seeded
+/// `pipeline:*, catalog:write, connector:manage`), so it may do EACH verb
+/// on `ingest-spec` -- unlike either single-permission principal above.
+#[tokio::test]
+async fn seeded_data_engineer_may_get_and_put_ingest_spec() {
+    let TestApp { router, pool } = spin_up().await;
+
+    let get_cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+    let get_resp = request_with_cookie(
+        &router,
+        "GET",
+        "/api/connectors/conn-pg-lakehouse/ingest-spec",
+        &get_cookie,
+    )
+    .await;
+    assert_ne!(
+        get_resp.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Data Engineer holding ingest:read must not be denied GET"
+    );
+    assert_ne!(get_resp.status(), StatusCode::UNAUTHORIZED);
+
+    let put_cookie = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+    let put_resp = request_with_cookie(
+        &router,
+        "PUT",
+        "/api/connectors/conn-pg-lakehouse/ingest-spec",
+        &put_cookie,
+    )
+    .await;
+    assert_ne!(
+        put_resp.status(),
+        StatusCode::FORBIDDEN,
+        "a seeded Data Engineer holding connector:manage must not be denied PUT"
+    );
+    assert_ne!(put_resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 /// # Input validation: malformed body -> 400 with the `{"error": "..."}`

@@ -557,6 +557,175 @@ pub struct ConnectorDialInfo {
     pub secret_ref_secondary: Option<String>,
 }
 
+/// Caller-supplied fields for [`set_ingest_spec`]. Mirrors `IngestSpecInput`
+/// in `contracts/connectors.ts`.
+///
+/// `dial` is opaque `serde_json::Value` here: [`set_ingest_spec`] is what
+/// actually validates its shape, via [`crate::ingest_spec::Dial::parse`],
+/// dispatched on `adapter` — see that function's doc comment for why the
+/// parse happens BEFORE any write.
+#[derive(Debug, Clone)]
+pub struct IngestSpecInput {
+    /// One of `sql | cdc | files | rest | sheets` — the value
+    /// [`crate::ingest_spec::Dial::parse`] dispatches on.
+    pub adapter: String,
+    /// `"batch" | "cdc"`, matching `connector_ingest_mode_check`
+    /// (`0033_connector_ingest_spec.sql`).
+    pub ingest_mode: String,
+    /// Validated by [`crate::ingest_spec::Dial::parse`] against the shape
+    /// `adapter` names. Never free-form at the application level, even
+    /// though the `dial` column itself is plain `JSONB`.
+    pub dial: serde_json::Value,
+    /// The objects (tables/endpoints/sheet ranges) this ingest job
+    /// targets. Not individually validated by this function — see
+    /// `crate::ingest_spec::SourceObject::validate` for the per-object
+    /// check, applied by the caller before this is invoked.
+    pub source_objects: serde_json::Value,
+    /// An optional cron schedule for a `batch`-mode ingest job.
+    pub schedule_cron: Option<String>,
+}
+
+/// Names ONLY (`"env:FOO"`, `"vault:secret/data/x"`) of the credentials a
+/// connector's ingest job resolves at run time — never a resolved value.
+/// Mirrors `IngestSecretRefs` in `contracts/connectors.ts`. Reuses the same
+/// `connector.secret_ref`/`secret_ref_secondary` columns
+/// [`ConnectorDialInfo`] already names; `set_ingest_spec` never writes
+/// either column, since a credential reference is set at connector-create
+/// time (`create_connector`), not at ingest-spec-configuration time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestSecretRefs {
+    /// The primary credential's reference name.
+    pub primary: String,
+    /// The secondary credential's reference name, or `None` for a
+    /// connector type that only ever needs one.
+    pub secondary: Option<String>,
+}
+
+/// A connector's ingest configuration, as returned by [`get_ingest_spec`].
+/// Mirrors `IngestSpec` in `contracts/connectors.ts`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestSpec {
+    /// `None` for a connector that has never had an ingest spec set — see
+    /// `0033_connector_ingest_spec.sql`'s "additive" header comment: every
+    /// pre-WS3 connector row parses with `adapter = NULL` until this is
+    /// called for it.
+    pub adapter: Option<String>,
+    /// `None` under the same condition as `adapter`.
+    pub ingest_mode: Option<String>,
+    /// `{}` until [`set_ingest_spec`] is ever called — the column default.
+    pub dial: serde_json::Value,
+    /// `[]` until [`set_ingest_spec`] is ever called — the column default.
+    pub source_objects: serde_json::Value,
+    /// `None` for a `cdc`-mode ingest job, or one that has never been
+    /// scheduled.
+    pub schedule_cron: Option<String>,
+    /// Credential reference NAMES only — see [`IngestSecretRefs`]'s doc
+    /// comment.
+    pub secret_refs: IngestSecretRefs,
+}
+
+/// The raw tuple shape [`get_ingest_spec`]/[`set_ingest_spec`] both decode
+/// from a `SELECT`/`RETURNING` naming the same seven columns, in the same
+/// order: `adapter, ingest_mode, dial, source_objects, schedule_cron,
+/// secret_ref, secret_ref_secondary`. A module-level alias rather than a
+/// local one in each function -- `clippy::items_after_statements` forbids
+/// a local `type` declared after `Dial::parse`'s validation statement in
+/// [`set_ingest_spec`].
+type IngestSpecRow = (
+    Option<String>,
+    Option<String>,
+    serde_json::Value,
+    serde_json::Value,
+    Option<String>,
+    String,
+    Option<String>,
+);
+
+/// Build an [`IngestSpec`] from an [`IngestSpecRow`], shared by
+/// [`get_ingest_spec`] and [`set_ingest_spec`].
+fn ingest_spec_from_row(row: IngestSpecRow) -> IngestSpec {
+    let (
+        adapter,
+        ingest_mode,
+        dial,
+        source_objects,
+        schedule_cron,
+        secret_ref,
+        secret_ref_secondary,
+    ) = row;
+    IngestSpec {
+        adapter,
+        ingest_mode,
+        dial,
+        source_objects,
+        schedule_cron,
+        secret_refs: IngestSecretRefs {
+            primary: secret_ref,
+            secondary: secret_ref_secondary,
+        },
+    }
+}
+
+/// Read a connector's ingest configuration. Returns `Ok(None)` if `id` does
+/// not name a connector.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn get_ingest_spec(pool: &PgPool, id: &str) -> Result<Option<IngestSpec>, StoreError> {
+    let row: Option<IngestSpecRow> = sqlx::query_as(
+        "SELECT adapter, ingest_mode, dial, source_objects, schedule_cron, secret_ref, \
+         secret_ref_secondary FROM connector WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(ingest_spec_from_row))
+}
+
+/// Set a connector's ingest configuration.
+///
+/// [`crate::ingest_spec::Dial::parse`] runs FIRST, against `spec.dial`
+/// dispatched on `spec.adapter` — an invalid `dial` (an unknown field, a
+/// missing required field, an unsafe hostname) fails here as
+/// [`StoreError::Validation`] and never reaches the `UPDATE` below, so a
+/// half-written or malformed `dial` is never persisted.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Validation`] if `spec.dial` fails
+/// [`crate::ingest_spec::Dial::parse`] for `spec.adapter`. Returns
+/// [`StoreError::NotFound`] if `id` does not name a connector. Returns
+/// [`StoreError::Database`] on any other failure.
+pub async fn set_ingest_spec(
+    pool: &PgPool,
+    id: &str,
+    spec: &IngestSpecInput,
+) -> Result<IngestSpec, StoreError> {
+    crate::ingest_spec::Dial::parse(&spec.adapter, &spec.dial)
+        .map_err(|err| StoreError::Validation(err.to_string()))?;
+
+    let row: Option<IngestSpecRow> = sqlx::query_as(
+        "UPDATE connector SET adapter = $2, ingest_mode = $3, dial = $4, source_objects = $5, \
+         schedule_cron = $6 WHERE id = $1 RETURNING adapter, ingest_mode, dial, source_objects, \
+         schedule_cron, secret_ref, secret_ref_secondary",
+    )
+    .bind(id)
+    .bind(&spec.adapter)
+    .bind(&spec.ingest_mode)
+    .bind(&spec.dial)
+    .bind(&spec.source_objects)
+    .bind(&spec.schedule_cron)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Err(StoreError::NotFound);
+    };
+    Ok(ingest_spec_from_row(row))
+}
+
 /// Persist the outcome of a real connectivity probe and, when the probe
 /// type is supported, stamp `lastTestAt`. Called by `lakehouse-api`'s
 /// `connector_probe` module AFTER it has actually attempted (or declined to

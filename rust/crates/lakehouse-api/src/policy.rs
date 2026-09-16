@@ -291,6 +291,19 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("DELETE", "/api/connectors/{id}",      Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/connectors/{id}/test",   Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}/debezium-properties", Policy::RequiresPermission("connector:manage")),
+    // `ingest-spec` GET/PUT deliberately carry DIFFERENT permissions, unlike
+    // every other connector route above: `connector:manage` is a broad
+    // write-capable grant, and a read-only caller (Phase G's ingest
+    // service identity, minted with only `ingest:read` — see
+    // `0033_connector_ingest_spec.sql`) must never be handed it just to
+    // read a `dial`. `PermissionSet::has` (`lakehouse-auth/src/
+    // permissions.rs`) matches resource+action exactly, so `ingest:read`
+    // and `connector:manage` are two independent grants — the seeded Data
+    // Engineer role holds both (`0033`'s `UPDATE`), an ingest-only caller
+    // holds only the first. See `tests/route_auth.rs` for the three-way
+    // assertion this split requires.
+    ("GET",  "/api/connectors/{id}/ingest-spec", Policy::RequiresPermission("ingest:read")),
+    ("PUT",  "/api/connectors/{id}/ingest-spec", Policy::RequiresPermission("connector:manage")),
 
     // ── Knowledge: no seeded resource — auth only. ───────────────────────
     ("GET",  "/api/knowledge/sources",       Policy::RequiresAuth),
