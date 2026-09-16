@@ -74,12 +74,22 @@ object_store = { version = "0.14", features = ["aws"] }
 arrow-array = "58"
 arrow-schema = "58"
 tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "rustls", "chrono"] }
+# `tiberius::Client::connect` takes a Tokio-`AsyncRead`/`AsyncWrite`
+# stream wrapped for the `futures`-crate traits tiberius itself uses
+# (tiberius's own doc comment, `src/lib.rs`'s "Connecting with Tokio"
+# example) -- `compat` is the feature gating that wrapper.
+tokio-util = { workspace = true, features = ["compat"] }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 wiremock = { workspace = true }
 uuid = { workspace = true }
 lakehouse-test-support = { path = "../lakehouse-test-support" }
+# connector_probe.rs's own tests (`PanicIfCalledResolver`) implement
+# `lakehouse_core::secret::DynSecretResolver` directly -- that trait is
+# `#[async_trait::async_trait]` at its definition site
+# (`lakehouse-core/src/secret.rs`), so any impl needs the same macro.
+async-trait = { workspace = true }
 # `#[tokio::test(start_paused = true)]` for `bounded::run_with_budget`'s
 # deterministic budget/timeout tests (WS2 §4) — a real `sleep` would make
 # those tests slow and, at the margins, flaky.

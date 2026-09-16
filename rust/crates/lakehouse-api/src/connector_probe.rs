@@ -3,9 +3,7 @@
 //!
 //! # What this module supports, and why only this much
 //!
-//! Two connector `type`s can be genuinely dialed today, both because the
-//! dependency to do so already sits in this workspace and both because
-//! this deployment's compose stack actually runs one:
+//! Five connector shapes can be genuinely dialed today:
 //!
 //! - **`PostgreSQL`** (`sqlx`, already a `lakehouse-api` dependency for
 //!   `lakehouse-store`) — opens a real connection and runs `SELECT 1`.
@@ -13,13 +11,31 @@
 //!   dependency via `lakehouse-iceberg`) — does an authenticated
 //!   `list_with_delimiter` (a cheap, bounded listing call; no data read or
 //!   written).
+//! - **`MySQL`**/**`MariaDB`** (`sqlx`'s `mysql` feature, WS3 item 12) —
+//!   same shape as `PostgreSQL`: connect, run `SELECT 1`.
+//! - **Microsoft SQL Server** (`tiberius`, a new dependency, WS3 item 12)
+//!   — connect, run `SELECT 1` via `simple_query`.
+//! - **A `rest` adapter's REST/vendor API** (`reqwest`, already a
+//!   `lakehouse-api` dependency) — one bounded `GET` against the dial's
+//!   `baseUrl`, classified on status code only.
+//!
+//! The last two of those six are dispatched by `adapter`
+//! (`sql`/`cdc`/`files`/`rest`/`sheets`, `0033_connector_ingest_spec.sql`),
+//! not by the free-form `kind` label the first two still use — see
+//! [`probe`]'s doc comment for the `adapter`-first-then-legacy-`kind`
+//! dispatch rule.
+//!
+//! A `sheets` adapter is registered (`connector_type`, `0035`) but ships
+//! **`supported: false` unconditionally** — see [`probe_sheets`]'s doc
+//! comment for why (no verified Google service-account token exchange
+//! exists in this workspace, WS3 plan review Z10 open question 4).
 //!
 //! Every other seeded/registered connector `type` (Kafka, MQTT, `MongoDB`,
-//! Oracle, SAP/ERP, SFTP, a REST/vendor API, ...) has **no dial
-//! implementation in this build** — see [`probe`]'s `_ =>` arm. Those
-//! report [`Outcome::unsupported`], never a fabricated latency or success.
-//! Adding a new supported type means adding both a real client dependency
-//! and a new arm here — never widening the `_` arm to claim more than this
+//! Oracle, SAP/ERP, SFTP, ...) has **no dial implementation in this
+//! build** — see [`probe_by_kind`]'s `_ =>` arm. Those report
+//! [`Outcome::unsupported`], never a fabricated latency or success. Adding
+//! a new supported type means adding both a real client dependency and a
+//! new arm here — never widening the `_` arm to claim more than this
 //! build can back up.
 //!
 //! # Credential handling
@@ -86,10 +102,13 @@ use std::time::{Duration, Instant};
 
 use lakehouse_core::secret::DynSecretResolver;
 use lakehouse_store::connectors::ConnectorDialInfo;
+use lakehouse_store::ingest_spec::{CdcDial, Dial, RestAuth, RestDial, SqlDial, SqlDriver};
 use object_store::ObjectStore;
 use object_store::aws::AmazonS3Builder;
 use sqlx::Connection;
+use sqlx::mysql::{MySqlConnectOptions, MySqlConnection, MySqlSslMode};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgSslMode};
+use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 /// Bound on a single dial attempt (connect + one cheap operation). Chosen
 /// to be a "few seconds" per the task brief — long enough that a healthy
@@ -176,8 +195,41 @@ fn elapsed_millis(elapsed: Duration) -> i64 {
 /// panics on a malformed `host` or an unresolvable `secret_ref` — both
 /// become [`Outcome::misconfigured`], never a crash.
 ///
+/// Dispatches primarily on `info.adapter` (`sql | cdc | files | rest |
+/// sheets`, `0033_connector_ingest_spec.sql`) rather than the free-form
+/// `kind` label, falling back to the original `kind`-based dispatch only
+/// for a pre-WS3 row with `adapter IS NULL` — mirrors the same
+/// `adapter`-first-then-legacy-`kind` pattern the connector-deletion
+/// deprovision step already uses (WS3 plan review X4).
+///
 /// [`Config::connector_probe_allow_internal_hosts`]: crate::config::Config::connector_probe_allow_internal_hosts
 pub async fn probe(
+    info: &ConnectorDialInfo,
+    resolver: &dyn DynSecretResolver,
+    allow_internal_hosts: bool,
+) -> Outcome {
+    match info.adapter.as_deref() {
+        Some(adapter @ ("sql" | "cdc")) => {
+            probe_dial(adapter, info, resolver, allow_internal_hosts).await
+        }
+        Some("rest") => probe_rest_info(info, resolver, allow_internal_hosts).await,
+        Some("sheets") => probe_sheets(),
+        // A `files` adapter's `dial` names an object-storage protocol (S3
+        // today, per `lakehouse_store::ingest_spec::FilesProtocol`) — the
+        // SAME thing the pre-WS3 `kind`-string dispatch below already
+        // dials via `probe_s3`, which still reads `info.host`'s legacy
+        // `<endpoint>|<bucket>` shape (`0022_prune_connector_seed.sql`'s
+        // `conn-s3-warehouse` row keeps that shape after
+        // `0034_seed_connector_ingest_spec.sql` sets `adapter = 'files'`
+        // on it) — no second S3 client is added here.
+        Some("files") => probe_s3(info, resolver, allow_internal_hosts).await,
+        _ => probe_by_kind(info, resolver, allow_internal_hosts).await,
+    }
+}
+
+/// The original `kind`-string dispatch (pre-WS3), kept as the fallback for
+/// a connector row with `adapter IS NULL` — see [`probe`]'s doc comment.
+async fn probe_by_kind(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
     allow_internal_hosts: bool,
@@ -189,6 +241,402 @@ pub async fn probe(
         probe_s3(info, resolver, allow_internal_hosts).await
     } else {
         Outcome::unsupported(&info.kind)
+    }
+}
+
+/// The common connection fields [`SqlDial`] and [`CdcDial`] share — both
+/// are "a [`SqlDriver`] plus `host`/`port`/`database`/`user`" — normalized
+/// into one shape so [`probe_dial`] can dispatch by driver without caring
+/// which of the two adapters (`sql` or `cdc`) produced it.
+struct DialTarget<'a> {
+    driver: SqlDriver,
+    host: &'a str,
+    port: u16,
+    database: &'a str,
+    user: &'a str,
+}
+
+impl<'a> From<&'a SqlDial> for DialTarget<'a> {
+    fn from(dial: &'a SqlDial) -> Self {
+        Self {
+            driver: dial.driver,
+            host: &dial.host,
+            port: dial.port,
+            database: &dial.database,
+            user: &dial.user,
+        }
+    }
+}
+
+impl<'a> From<&'a CdcDial> for DialTarget<'a> {
+    fn from(dial: &'a CdcDial) -> Self {
+        Self {
+            driver: dial.driver,
+            host: &dial.host,
+            port: dial.port,
+            database: &dial.database,
+            user: &dial.user,
+        }
+    }
+}
+
+/// Route a `sql`/`cdc` adapter's `dial` to the right driver-specific
+/// probe.
+///
+/// `conn-pg-lakehouse` (`0034_seed_connector_ingest_spec.sql`) seeds
+/// `adapter = 'sql'`, `dial.driver = "postgres"` on the SAME connector row
+/// [`probe_postgres`]'s legacy `host`-string parsing (`parse_postgres_host`)
+/// already dials successfully — after this task, that row's `adapter` is
+/// no longer `NULL`, so [`probe`]'s dispatch reaches this function for it,
+/// not [`probe_by_kind`]. Rather than add a second, untested
+/// Postgres-from-`dial` code path, `SqlDriver::Postgres` here simply
+/// re-enters [`probe_postgres`] via `info.host`, which is unchanged and
+/// still valid. Only `Mysql`/`Mssql` get a genuinely new probe (WS3 item
+/// 13).
+async fn probe_dial(
+    adapter: &str,
+    info: &ConnectorDialInfo,
+    resolver: &dyn DynSecretResolver,
+    allow_internal_hosts: bool,
+) -> Outcome {
+    let parsed = match Dial::parse(adapter, &info.dial) {
+        Ok(dial) => dial,
+        Err(err) => return Outcome::misconfigured(format!("connector's dial is invalid: {err}")),
+    };
+    let target = match &parsed {
+        Dial::Sql(dial) => DialTarget::from(dial),
+        Dial::Cdc(dial) => DialTarget::from(dial),
+        Dial::Files(_) | Dial::Rest(_) | Dial::Sheets(_) => {
+            return Outcome::misconfigured(format!(
+                "connector is misconfigured: its dial does not match its own adapter {adapter:?}"
+            ));
+        }
+    };
+    match target.driver {
+        SqlDriver::Postgres => probe_postgres(info, resolver, allow_internal_hosts).await,
+        SqlDriver::Mysql => {
+            probe_mysql(&target, &info.secret_ref, resolver, allow_internal_hosts).await
+        }
+        SqlDriver::Mssql => {
+            probe_mssql(&target, &info.secret_ref, resolver, allow_internal_hosts).await
+        }
+    }
+}
+
+/// Real connectivity probe for a `mysql`-driver `sql`/`cdc` dial (WS3 item
+/// 13). `resolve_checked` runs FIRST, before `secret_ref` is even
+/// resolved — see the module doc comment's "SSRF" section and this file's
+/// `probe_mysql_blocks_an_internal_host_before_dialing` test, which hands
+/// this function a resolver that panics if it is ever called, proving the
+/// blocked path never reaches secret resolution let alone a dial.
+async fn probe_mysql(
+    target: &DialTarget<'_>,
+    secret_ref: &str,
+    resolver: &dyn DynSecretResolver,
+    allow_internal_hosts: bool,
+) -> Outcome {
+    if let Err(message) = resolve_checked(target.host, target.port, allow_internal_hosts).await {
+        return Outcome::misconfigured(message);
+    }
+    let password = match resolver.resolve_dyn(secret_ref).await {
+        Ok(secret) => secret,
+        Err(err) => {
+            return Outcome::misconfigured(format!(
+                "could not resolve the connector's credential: {err}"
+            ));
+        }
+    };
+    let options = MySqlConnectOptions::new()
+        .host(target.host)
+        .port(target.port)
+        .username(target.user)
+        .password(password.expose_secret())
+        .database(target.database)
+        // Same explicit-not-implicit reasoning as probe_postgres's
+        // PgSslMode::Prefer: state the effective TLS posture rather than
+        // leaving it to sqlx's default.
+        .ssl_mode(MySqlSslMode::Preferred);
+
+    let started = Instant::now();
+    let attempt = tokio::time::timeout(DIAL_TIMEOUT, async {
+        let mut conn = MySqlConnection::connect_with(&options).await?;
+        sqlx::query("SELECT 1").execute(&mut conn).await?;
+        conn.close().await
+    })
+    .await;
+    let elapsed = started.elapsed();
+
+    match attempt {
+        Ok(Ok(())) => Outcome::success(elapsed, "Connected via MySQL and ran SELECT 1."),
+        Ok(Err(err)) => Outcome::failure(
+            elapsed,
+            format!("MySQL connection failed: {}", classify_sqlx_error(&err)),
+        ),
+        Err(_) => Outcome::failure(
+            elapsed,
+            format!(
+                "MySQL connection timed out after {}s",
+                DIAL_TIMEOUT.as_secs()
+            ),
+        ),
+    }
+}
+
+/// Classify a `tiberius` connection error into one of a small set of
+/// generic failure classes — same discipline as `classify_sqlx_error`, see
+/// the module doc comment's "Error messages never echo upstream data"
+/// section.
+fn classify_tiberius_error(err: &tiberius::error::Error) -> &'static str {
+    match err {
+        tiberius::error::Error::Io { kind, .. } => match kind {
+            std::io::ErrorKind::ConnectionRefused => "connection refused",
+            std::io::ErrorKind::TimedOut => "timed out",
+            std::io::ErrorKind::PermissionDenied => "permission denied",
+            _ => "connection failed",
+        },
+        tiberius::error::Error::Tls(_) => "TLS error",
+        // SQL Server error 18456: "Login failed for user" -- the
+        // documented code for an authentication rejection.
+        tiberius::error::Error::Server(_) if err.code() == Some(18_456) => "authentication failed",
+        tiberius::error::Error::Server(_) => "database rejected the connection",
+        _ => "connection failed",
+    }
+}
+
+/// Real connectivity probe for an `mssql`-driver `sql`/`cdc` dial (WS3
+/// item 13), via the `tiberius` driver (`rust/crates/lakehouse-api/Cargo.toml`,
+/// WS3 item 12). `resolve_checked` runs FIRST,
+/// before `secret_ref` is resolved or a `TcpStream` is even opened — see
+/// `probe_mssql_blocks_an_internal_host_before_dialing`, which mirrors
+/// `probe_mysql`'s own SSRF test with a panicking resolver.
+async fn probe_mssql(
+    target: &DialTarget<'_>,
+    secret_ref: &str,
+    resolver: &dyn DynSecretResolver,
+    allow_internal_hosts: bool,
+) -> Outcome {
+    if let Err(message) = resolve_checked(target.host, target.port, allow_internal_hosts).await {
+        return Outcome::misconfigured(message);
+    }
+    let password = match resolver.resolve_dyn(secret_ref).await {
+        Ok(secret) => secret,
+        Err(err) => {
+            return Outcome::misconfigured(format!(
+                "could not resolve the connector's credential: {err}"
+            ));
+        }
+    };
+
+    let mut config = tiberius::Config::new();
+    config.host(target.host);
+    config.port(target.port);
+    config.database(target.database);
+    config.authentication(tiberius::AuthMethod::sql_server(
+        target.user,
+        password.expose_secret(),
+    ));
+    // Tier 1 has no cert-pinning story for an arbitrary operator-supplied
+    // SQL Server host -- same "state the TLS posture explicitly" reasoning
+    // as probe_postgres's PgSslMode::Prefer, applied to tiberius's own
+    // "accept the presented certificate without verifying its chain"
+    // knob.
+    config.trust_cert();
+    let addr = config.get_addr();
+
+    let started = Instant::now();
+    let attempt = tokio::time::timeout(DIAL_TIMEOUT, async move {
+        let tcp = tokio::net::TcpStream::connect(&addr).await?;
+        tcp.set_nodelay(true)?;
+        let mut client = tiberius::Client::connect(config, tcp.compat_write()).await?;
+        // A literal, constant query string -- never built from caller
+        // input (tiberius's own `simple_query` doc comment: do not use
+        // this with user-specified input).
+        client
+            .simple_query("SELECT 1")
+            .await?
+            .into_first_result()
+            .await?;
+        Ok::<(), tiberius::error::Error>(())
+    })
+    .await;
+    let elapsed = started.elapsed();
+
+    match attempt {
+        Ok(Ok(())) => Outcome::success(elapsed, "Connected via SQL Server and ran SELECT 1."),
+        Ok(Err(err)) => Outcome::failure(
+            elapsed,
+            format!(
+                "SQL Server connection failed: {}",
+                classify_tiberius_error(&err)
+            ),
+        ),
+        Err(_) => Outcome::failure(
+            elapsed,
+            format!(
+                "SQL Server connection timed out after {}s",
+                DIAL_TIMEOUT.as_secs()
+            ),
+        ),
+    }
+}
+
+/// Classify a `reqwest` error into one of a small set of generic failure
+/// classes, using only its typed accessors (`is_connect`/`is_timeout`) —
+/// never `Display`, which can echo request/response detail. See the
+/// module doc comment's "Error messages never echo upstream data" section.
+fn classify_reqwest_error(err: &reqwest::Error) -> &'static str {
+    if err.is_connect() {
+        "connection refused"
+    } else if err.is_timeout() {
+        "timed out"
+    } else {
+        "connection failed"
+    }
+}
+
+fn probe_rest_misconfigured_dial(adapter: &str) -> Outcome {
+    Outcome::misconfigured(format!(
+        "connector is misconfigured: its dial does not match its own adapter {adapter:?}"
+    ))
+}
+
+/// Parses `info.dial` as a `rest` adapter's [`RestDial`] and hands it to
+/// [`probe_rest`] — the [`ConnectorDialInfo`]-facing entry point
+/// [`probe`]'s dispatcher calls.
+async fn probe_rest_info(
+    info: &ConnectorDialInfo,
+    resolver: &dyn DynSecretResolver,
+    allow_internal_hosts: bool,
+) -> Outcome {
+    match Dial::parse("rest", &info.dial) {
+        Ok(Dial::Rest(dial)) => {
+            probe_rest(&dial, &info.secret_ref, resolver, allow_internal_hosts).await
+        }
+        Ok(_) => probe_rest_misconfigured_dial("rest"),
+        Err(err) => Outcome::misconfigured(format!("connector's dial is invalid: {err}")),
+    }
+}
+
+/// Real connectivity probe for a `rest` adapter's dial (WS3 item 13).
+/// `resolve_checked` runs FIRST, against `dial.base_url`'s own
+/// host/port, before any credential is resolved or request sent — see
+/// `probe_rest_blocks_an_internal_host_before_dialing`.
+async fn probe_rest(
+    dial: &RestDial,
+    secret_ref: &str,
+    resolver: &dyn DynSecretResolver,
+    allow_internal_hosts: bool,
+) -> Outcome {
+    let Some((host, port)) = parse_endpoint_host_port(&dial.base_url) else {
+        return Outcome::misconfigured(
+            "connector is misconfigured: a rest adapter's baseUrl must be an http(s):// URL",
+        );
+    };
+    if let Err(message) = resolve_checked(host, port, allow_internal_hosts).await {
+        return Outcome::misconfigured(message);
+    }
+
+    let request = reqwest::Client::new().get(&dial.base_url);
+    let request = match &dial.auth {
+        RestAuth::ApiKey { header } => {
+            let key = match resolver.resolve_dyn(secret_ref).await {
+                Ok(secret) => secret,
+                Err(err) => {
+                    return Outcome::misconfigured(format!(
+                        "could not resolve the connector's credential: {err}"
+                    ));
+                }
+            };
+            request.header(header, key.expose_secret())
+        }
+        RestAuth::Bearer => {
+            let token = match resolver.resolve_dyn(secret_ref).await {
+                Ok(secret) => secret,
+                Err(err) => {
+                    return Outcome::misconfigured(format!(
+                        "could not resolve the connector's credential: {err}"
+                    ));
+                }
+            };
+            request.bearer_auth(token.expose_secret())
+        }
+        RestAuth::Basic => {
+            // The resolved secretRef is treated as the already-encoded
+            // "user:pass" credential material for this header -- a `rest`
+            // adapter's `ConnectorDialInfo` carries exactly one
+            // `secret_ref`, not a separate username field, so the operator
+            // creating the connector supplies the credential in the shape
+            // this probe sends verbatim in the Authorization header.
+            let basic = match resolver.resolve_dyn(secret_ref).await {
+                Ok(secret) => secret,
+                Err(err) => {
+                    return Outcome::misconfigured(format!(
+                        "could not resolve the connector's credential: {err}"
+                    ));
+                }
+            };
+            request.header(
+                reqwest::header::AUTHORIZATION,
+                format!("Basic {}", basic.expose_secret()),
+            )
+        }
+        RestAuth::Oauth2ClientCredentials { .. } => {
+            // Never fabricated: an OAuth2 client-credentials exchange is a
+            // second network call this build does not implement in Tier 1
+            // (mirrors probe_sheets's own "unsupported, honestly" posture
+            // for a credential exchange this workspace cannot verify).
+            return Outcome::misconfigured(
+                "connector is misconfigured: OAuth2 client-credentials REST auth is not \
+                 implemented by this build's connectivity probe -- configure apiKey or bearer \
+                 auth to test this connector",
+            );
+        }
+    };
+
+    let started = Instant::now();
+    let attempt = tokio::time::timeout(DIAL_TIMEOUT, request.send()).await;
+    let elapsed = started.elapsed();
+
+    match attempt {
+        Ok(Ok(response)) if response.status().is_success() => Outcome::success(
+            elapsed,
+            "Connected via REST and received a successful response.",
+        ),
+        Ok(Ok(response)) => Outcome::failure(
+            elapsed,
+            format!("REST request rejected: HTTP {}", response.status().as_u16()),
+        ),
+        Ok(Err(err)) => Outcome::failure(
+            elapsed,
+            format!("REST request failed: {}", classify_reqwest_error(&err)),
+        ),
+        Err(_) => Outcome::failure(
+            elapsed,
+            format!("REST request timed out after {}s", DIAL_TIMEOUT.as_secs()),
+        ),
+    }
+}
+
+/// `sheets` ships `supported: false` unconditionally in Tier 1 (WS3 plan
+/// review Z10, open question 4): a real Google service-account
+/// JWT-bearer token exchange requires SIGNING a claim set with the
+/// account's RSA private key, and this workspace has no verified
+/// crypto-signing dependency wired up to do that correctly — mirrors
+/// `dagster/dispar_orchestrate`'s own `adapters/sheets.py`, which ships
+/// the SAME unconditional `supported: false` for the same reason on the
+/// Dagster side. This function therefore never resolves a `secretRef` and
+/// never opens a connection to `oauth2.googleapis.com`/
+/// `sheets.googleapis.com` at all — "unsupported, honestly" (AGENTS.md
+/// rule 14) over a crypto code path nobody has run against a real service
+/// account, not a partial implementation that only sometimes dials.
+fn probe_sheets() -> Outcome {
+    Outcome {
+        ok: false,
+        supported: false,
+        latency_ms: None,
+        message: "This build cannot test a Google Sheets connector: no verified \
+                   service-account token exchange exists yet."
+            .to_owned(),
     }
 }
 
@@ -863,5 +1311,168 @@ mod tests {
         resolve_checked("localhost", 1, true)
             .await
             .expect("allow_internal_hosts=true must let a loopback-resolving host through");
+    }
+
+    // -- WS3 item 13: probe_mysql/probe_mssql/probe_rest/probe_sheets --
+
+    /// A resolver that panics if `resolve_dyn` is ever called — used to
+    /// prove a blocked SSRF outcome never even reaches secret resolution,
+    /// let alone a driver connection attempt.
+    #[derive(Debug)]
+    struct PanicIfCalledResolver;
+
+    #[async_trait::async_trait]
+    impl DynSecretResolver for PanicIfCalledResolver {
+        async fn resolve_dyn(
+            &self,
+            _secret_ref: &str,
+        ) -> Result<lakehouse_core::secret::SecretValue, lakehouse_core::secret::SecretError>
+        {
+            panic!(
+                "resolve_checked must block an internal host BEFORE any secret is resolved, \
+                 but resolve_dyn was called"
+            );
+        }
+    }
+
+    fn sql_dial(driver: SqlDriver, host: &str, port: u16) -> SqlDial {
+        SqlDial {
+            driver,
+            host: host.to_owned(),
+            port,
+            database: "x".to_owned(),
+            user: "u".to_owned(),
+            ssl_mode: None,
+        }
+    }
+
+    /// Mirrors `postgres_loopback_host_is_blocked_by_default`: a loopback
+    /// host must be refused before `probe_mysql` ever touches
+    /// `resolver`/a `MySqlConnection`.
+    #[tokio::test]
+    async fn probe_mysql_blocks_an_internal_host_before_dialing() {
+        let dial = sql_dial(SqlDriver::Mysql, "127.0.0.1", 3306);
+        let target = DialTarget::from(&dial);
+        let outcome = probe_mysql(&target, "env:UNUSED", &PanicIfCalledResolver, false).await;
+        assert!(!outcome.ok);
+        assert!(outcome.supported);
+        assert!(
+            outcome.latency_ms.is_none(),
+            "a blocked host must never be dialed, so no latency exists"
+        );
+        assert!(
+            outcome.message.contains("private/internal"),
+            "{}",
+            outcome.message
+        );
+    }
+
+    /// Same property as above, for `probe_mssql` — proves the guard sits
+    /// before `tiberius::Config`/`TcpStream::connect` too, not only before
+    /// `sqlx`.
+    #[tokio::test]
+    async fn probe_mssql_blocks_an_internal_host_before_dialing() {
+        let dial = sql_dial(SqlDriver::Mssql, "127.0.0.1", 1433);
+        let target = DialTarget::from(&dial);
+        let outcome = probe_mssql(&target, "env:UNUSED", &PanicIfCalledResolver, false).await;
+        assert!(!outcome.ok);
+        assert!(outcome.supported);
+        assert!(outcome.latency_ms.is_none());
+        assert!(
+            outcome.message.contains("private/internal"),
+            "{}",
+            outcome.message
+        );
+    }
+
+    /// Same property for `probe_rest` — the guard runs against
+    /// `dial.base_url`'s own host/port before any header is built or
+    /// request sent.
+    #[tokio::test]
+    async fn probe_rest_blocks_an_internal_host_before_dialing() {
+        let dial = RestDial {
+            base_url: "http://127.0.0.1:1".to_owned(),
+            auth: RestAuth::Bearer,
+            pagination: lakehouse_store::ingest_spec::RestPagination::None,
+            endpoints: vec![],
+        };
+        let outcome = probe_rest(&dial, "env:UNUSED", &PanicIfCalledResolver, false).await;
+        assert!(!outcome.ok);
+        assert!(outcome.supported);
+        assert!(outcome.latency_ms.is_none());
+        assert!(
+            outcome.message.contains("private/internal"),
+            "{}",
+            outcome.message
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_rest_reports_ok_on_a_2xx_response() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let dial = RestDial {
+            base_url: server.uri(),
+            // RestAuth has no "no auth" variant (ADR 0013) -- Bearer is
+            // the smallest variant that exercises the resolver, with the
+            // resolved token unused by wiremock's unconditional 200 mock.
+            auth: RestAuth::Bearer,
+            pagination: lakehouse_store::ingest_spec::RestPagination::None,
+            endpoints: vec![],
+        };
+        // allow_internal_hosts: true -- wiremock's ephemeral server binds
+        // loopback, and this test is about the 2xx-success path, not the
+        // SSRF blocklist (covered separately above).
+        let mut map = std::collections::HashMap::new();
+        map.insert("REST_TEST_TOKEN".to_owned(), "irrelevant".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let outcome = probe_rest(&dial, "env:REST_TEST_TOKEN", &resolver, true).await;
+        assert!(outcome.ok, "{}", outcome.message);
+        assert!(outcome.supported);
+        assert!(outcome.latency_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn probe_rest_reports_the_status_code_never_the_body_on_a_4xx_response() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_string("secret upstream detail"),
+            )
+            .mount(&server)
+            .await;
+        let dial = RestDial {
+            base_url: server.uri(),
+            auth: RestAuth::Bearer,
+            pagination: lakehouse_store::ingest_spec::RestPagination::None,
+            endpoints: vec![],
+        };
+        let mut map = std::collections::HashMap::new();
+        map.insert("REST_TEST_TOKEN".to_owned(), "irrelevant".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let outcome = probe_rest(&dial, "env:REST_TEST_TOKEN", &resolver, true).await;
+        assert!(!outcome.ok);
+        assert!(outcome.supported);
+        assert!(outcome.message.contains("403"));
+        assert!(
+            !outcome.message.contains("secret upstream detail"),
+            "the response body must never be echoed: {}",
+            outcome.message
+        );
+    }
+
+    /// `sheets` never dials anything, in any state -- proves it reports
+    /// `supported: false` even though this test never seeds a
+    /// `secret_ref` at all, matching Tier 1's unconditional posture (see
+    /// `probe_sheets`'s doc comment).
+    #[test]
+    fn probe_sheets_is_unconditionally_unsupported() {
+        let outcome = probe_sheets();
+        assert!(!outcome.ok);
+        assert!(!outcome.supported);
+        assert!(outcome.latency_ms.is_none());
     }
 }
