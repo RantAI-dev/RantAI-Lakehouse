@@ -28,6 +28,7 @@ pub mod bounded;
 pub mod bronze_stats_cache;
 pub mod config;
 pub mod connector_deprovision;
+pub mod connector_discover;
 pub mod connector_probe;
 pub mod error;
 pub mod gold_export;

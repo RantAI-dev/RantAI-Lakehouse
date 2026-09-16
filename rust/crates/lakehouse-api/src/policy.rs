@@ -290,6 +290,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // `tests/route_auth.rs::every_registered_route_has_a_policy_entry`.
     ("DELETE", "/api/connectors/{id}",      Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/connectors/{id}/test",   Policy::RequiresPermission("connector:manage")),
+    // Reads a connector's live schema (tables/columns), same sensitivity
+    // class as `/test` (opens a real, credentialed connection to the
+    // connector's own target) — not a new permission, matching every
+    // other read-shaped connector route above (WS3 item 14).
+    ("POST", "/api/connectors/{id}/discover", Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}/debezium-properties", Policy::RequiresPermission("connector:manage")),
     // `ingest-spec` GET/PUT deliberately carry DIFFERENT permissions, unlike
     // every other connector route above: `connector:manage` is a broad

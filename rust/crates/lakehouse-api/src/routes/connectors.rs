@@ -279,6 +279,51 @@ pub async fn test_connection(
     }
 }
 
+/// `?schema=` query for `POST /api/connectors/{id}/discover`. Required
+/// only for a `sql`/`cdc` adapter connector — see
+/// `crate::connector_discover::discover`'s doc comment.
+#[derive(Debug, Deserialize)]
+pub struct DiscoverQuery {
+    /// The schema to list tables/columns from. Bound as a query
+    /// parameter into each driver's discovery SQL, never interpolated —
+    /// see `crate::connector_discover`'s module doc comment for why that
+    /// is this task's central property.
+    schema: Option<String>,
+}
+
+/// `POST /api/connectors/{id}/discover` — list a connector's source
+/// tables and columns, for a `sql`/`cdc` adapter connector against the
+/// `?schema=` query parameter. Every other adapter (`files`/`rest`/
+/// `sheets`) or a connector with no ingest-spec adapter set yet answers
+/// with an honest `supported: false` — see
+/// `crate::connector_discover`'s module doc comment for exactly what is
+/// and is not implemented.
+///
+/// # Errors
+///
+/// 404 if `id` is unknown; 422 if the connector's dial is invalid, its
+/// resolved host is SSRF-blocked, its credential cannot be resolved, or
+/// the discovery connection/query itself fails; 503/500 as every other
+/// connector route.
+pub async fn discover(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<DiscoverQuery>,
+) -> ApiResult<ApiJson<crate::connector_discover::DiscoverResult>> {
+    let dial_info = connectors::get_connector_dial_info(pool(&state)?, &id).await?;
+    let Some(dial_info) = dial_info else {
+        return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
+    };
+    let result = crate::connector_discover::discover(
+        &dial_info,
+        query.schema.as_deref(),
+        state.connector_secret_resolver.as_ref(),
+        state.config.connector_probe_allow_internal_hosts,
+    )
+    .await?;
+    Ok(ApiJson(result))
+}
+
 /// `?table=` query for `GET /api/connectors/{id}/debezium-properties`.
 #[derive(Debug, Deserialize)]
 pub struct DebeziumPropertiesQuery {

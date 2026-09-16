@@ -205,6 +205,10 @@ fn connectors_router() -> Router<AppState> {
             axum::routing::post(connectors::test_connection),
         )
         .route(
+            "/api/connectors/{id}/discover",
+            axum::routing::post(connectors::discover),
+        )
+        .route(
             "/api/connectors/{id}/debezium-properties",
             get(connectors::debezium_properties),
         )

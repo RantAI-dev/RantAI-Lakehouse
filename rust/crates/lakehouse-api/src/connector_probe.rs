@@ -114,7 +114,12 @@ use tokio_util::compat::TokioAsyncWriteCompatExt;
 /// to be a "few seconds" per the task brief — long enough that a healthy
 /// LAN-local compose service never times out under normal load, short
 /// enough that a hung/firewalled host resolves the request quickly.
-const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// `pub(crate)`: `connector_discover` reuses the SAME bound for its own
+/// dial-then-list-schema attempt (WS3 item 14) rather than inventing a
+/// second timeout constant for what is, mechanically, the same kind of
+/// bounded network operation this module already disciplines.
+pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The result of attempting (or declining to attempt) a connectivity
 /// probe. Never carries a fabricated `latency_ms` — see the field doc
@@ -248,12 +253,19 @@ async fn probe_by_kind(
 /// are "a [`SqlDriver`] plus `host`/`port`/`database`/`user`" — normalized
 /// into one shape so [`probe_dial`] can dispatch by driver without caring
 /// which of the two adapters (`sql` or `cdc`) produced it.
-struct DialTarget<'a> {
-    driver: SqlDriver,
-    host: &'a str,
-    port: u16,
-    database: &'a str,
-    user: &'a str,
+///
+/// `pub(crate)` (fields included): `connector_discover` builds the SAME
+/// shape from the SAME `Dial::Sql`/`Dial::Cdc` variants to decide which
+/// driver-specific discovery connection to open (WS3 item 14) — reusing
+/// this rather than a second private copy of the `From<&SqlDial>`/
+/// `From<&CdcDial>` conversions below (AGENTS.md: grep for the existing
+/// helper before writing one).
+pub(crate) struct DialTarget<'a> {
+    pub(crate) driver: SqlDriver,
+    pub(crate) host: &'a str,
+    pub(crate) port: u16,
+    pub(crate) database: &'a str,
+    pub(crate) user: &'a str,
 }
 
 impl<'a> From<&'a SqlDial> for DialTarget<'a> {
@@ -386,7 +398,11 @@ async fn probe_mysql(
 /// generic failure classes — same discipline as `classify_sqlx_error`, see
 /// the module doc comment's "Error messages never echo upstream data"
 /// section.
-fn classify_tiberius_error(err: &tiberius::error::Error) -> &'static str {
+///
+/// `pub(crate)`: reused by `connector_discover` for its own SQL Server
+/// discovery-connection failures (WS3 item 14) — see
+/// `classify_sqlx_error`'s doc comment for the same reasoning.
+pub(crate) fn classify_tiberius_error(err: &tiberius::error::Error) -> &'static str {
     match err {
         tiberius::error::Error::Io { kind, .. } => match kind {
             std::io::ErrorKind::ConnectionRefused => "connection refused",
@@ -766,7 +782,12 @@ pub(crate) fn parse_postgres_host(host: &str) -> Option<PgDialTarget<'_>> {
 /// Classify a `sqlx` connection error into one of a small set of generic
 /// failure classes — see the module doc comment's "Error messages never
 /// echo upstream data" section for why this never formats `err` itself.
-fn classify_sqlx_error(err: &sqlx::Error) -> &'static str {
+///
+/// `pub(crate)`: `connector_discover` classifies its own Postgres/`MySQL`
+/// discovery-connection failures through this SAME function (WS3 item
+/// 14) rather than a second copy — the "never echo upstream data"
+/// property must hold identically for both callers.
+pub(crate) fn classify_sqlx_error(err: &sqlx::Error) -> &'static str {
     match err {
         sqlx::Error::Io(io_err) => match io_err.kind() {
             std::io::ErrorKind::ConnectionRefused => "connection refused",
