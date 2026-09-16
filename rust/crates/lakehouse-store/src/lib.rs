@@ -28,6 +28,10 @@
 //! [`error::StoreError::Unavailable`] rather than reach for an `Option`
 //! that was never `Some`.
 
+// `sqlx::test` embeds the migration set at compile time; touching this file
+// (adding `0033_connector_ingest_spec.sql`, WS3 item 1) forces the macro to
+// re-expand and pick up the new migration for every `#[sqlx::test]` in this
+// crate's `tests/` binaries.
 pub mod agents;
 pub mod annotation;
 pub mod audit;
