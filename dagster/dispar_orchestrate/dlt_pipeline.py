@@ -53,16 +53,14 @@ different table-creation code path producing the same partitioning
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-import dlt
-from dlt.destinations import filesystem
-from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
 from dlt.sources.sql_database import sql_database
+
+from dispar_orchestrate.adapters.sink import SinkConfig, load_via_sink
 
 
 def _env(name: str, default: str) -> str:
@@ -157,53 +155,6 @@ class BronzeIngestConfig:
         )
 
 
-def _install_catalog_env(config: BronzeIngestConfig) -> None:
-    """Point dlt's Iceberg `table_format` at Lakekeeper's REST catalog by
-    setting the two env vars `dlt.common.libs.pyiceberg.IcebergConfig`
-    resolves (`sections="iceberg_catalog"`).
-
-    `iceberg_catalog_config` is a `Dict[str, Any]`-typed field — dlt's env
-    provider does not do double-underscore key-splitting for a plain dict
-    field the way it does for nested dataclasses, so the whole dict must
-    be supplied as one JSON-encoded env var
-    (`ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG`). Verified empirically
-    against a live Lakekeeper: individual
-    `ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG__URI`-style keys are silently
-    ignored (dlt falls back to the ephemeral local catalog with no error),
-    while the single JSON-blob env var is picked up correctly and produces
-    a REST-catalog-registered table.
-
-    `s3.force-virtual-addressing = "false"` matters on RustFS/SeaweedFS:
-    without it, pyiceberg's PyArrow-backed `FileIO` tries virtual-hosted
-    addressing (`<bucket>.<endpoint-host>`), which fails DNS resolution
-    against a plain path-style S3-compatible endpoint like RustFS/SeaweedFS
-    — this is the same path-style requirement
-    `docker-compose.yml`'s `lakekeeper-warehouse-init` already sets for
-    Lakekeeper's own storage profile (`"path-style-access": true`), applied
-    here on dlt's side of the same S3 endpoint.
-    """
-    os.environ["ICEBERG_CATALOG__ICEBERG_CATALOG_NAME"] = "default"
-    os.environ["ICEBERG_CATALOG__ICEBERG_CATALOG_TYPE"] = "rest"
-    catalog_config: dict[str, str] = {
-        "type": "rest",
-        "uri": config.lakekeeper_catalog_uri,
-        "warehouse": config.lakekeeper_warehouse,
-        "s3.endpoint": config.rustfs_endpoint,
-        "s3.access-key-id": config.rustfs_access_key,
-        "s3.secret-access-key": config.rustfs_secret_key,
-        "s3.region": "us-east-1",
-        "s3.path-style-access": "true",
-        "s3.force-virtual-addressing": "false",
-    }
-    if config.lakekeeper_token:
-        # R1 (ADR 0011): pyiceberg's `RestCatalog` accepts a raw static
-        # bearer `token` the same way `iceberg-catalog-rest` (Rust) does —
-        # sent as-is on every request, no OAuth2 exchange. `None`/absent
-        # on a pre-R1 or authz-disabled stack.
-        catalog_config["token"] = config.lakekeeper_token
-    os.environ["ICEBERG_CATALOG__ICEBERG_CATALOG_CONFIG"] = json.dumps(catalog_config)
-
-
 def _stamp_ingested_at(record: dict[str, Any]) -> dict[str, Any]:
     """Bronze's system ingestion-time column (ADR 0004's
     `bronze::INGESTED_AT_COLUMN` equivalent for the dlt write path) —
@@ -214,27 +165,21 @@ def _stamp_ingested_at(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def run_bronze_ingest(config: BronzeIngestConfig | None = None) -> dict[str, Any]:
-    """Run the dlt pipeline once. Returns a small summary dict (row/table
-    names, load id) for the caller (the Dagster asset) to attach as
-    metadata and pass on to Bronze catalog registration.
+    """Run the dlt pipeline once: build the Postgres `sql_database` source
+    (unchanged from before this refactor), then write it through the
+    shared sink (`adapters/sink.py`, extracted per
+    `docs/superpowers/plans/2026-09-11-ws3-ingestion-tier1.md`) every other ingest
+    adapter (SQL/files/REST) writes through too. Returns a small summary
+    dict (row/table names, measured row count) for the caller (the
+    Dagster op in `assets.py`) to attach as metadata and pass on to Bronze
+    catalog registration.
 
     # Errors
 
-    Raises whatever `pipeline.run` raises (`PipelineStepFailed`, etc.) —
-    this is a thin, unit-testable wrapper around dlt's own run, not a
-    place that swallows load failures.
+    Raises `RuntimeError` if the dlt load had failed jobs — this stays a
+    thin, unit-testable wrapper, not a place that swallows load failures.
     """
     cfg = config or BronzeIngestConfig.from_env()
-    _install_catalog_env(cfg)
-
-    destination = filesystem(
-        bucket_url=f"s3://{cfg.warehouse_bucket}/bronze",
-        credentials={
-            "aws_access_key_id": cfg.rustfs_access_key,
-            "aws_secret_access_key": cfg.rustfs_secret_key,
-            "endpoint_url": cfg.rustfs_endpoint,
-        },
-    )
 
     # Assembled here, in-process, from discrete components (`from_env`,
     # above) — this dict is the ONE place a full Postgres DSN exists for
@@ -260,39 +205,23 @@ def run_bronze_ingest(config: BronzeIngestConfig | None = None) -> dict[str, Any
     resource = source.resources[cfg.source_table]
     resource.apply_hints(table_name=cfg.bronze_table_name)
     resource.add_map(_stamp_ingested_at)
-    iceberg_adapter(
-        resource,
-        partition=[iceberg_partition.day("_ingested_at")],
-        # PR #29 review: format-version 2 was claimed "confirmed" without
-        # ever being set or asserted. dlt's iceberg destination does not
-        # default this itself (pyiceberg's own table-creation default is
-        # already v2, but that is pyiceberg's default, not a guarantee this
-        # pipeline makes) — set it explicitly, at table-creation time, so
-        # the guarantee is this module's own rather than inherited
-        # incidentally from whatever pyiceberg happens to default to.
-        # `ops/g3a/g3a_test.py::step_verify_format_version_2` asserts this
-        # against the catalog's own REST metadata, not against what dlt
-        # reports back.
-        table_properties={"format-version": "2"},
-    )
 
-    pipeline = dlt.pipeline(
-        pipeline_name=f"bronze_ingest_{cfg.bronze_table_name}",
-        destination=destination,
-        # Flat `bronze` dataset (ADR 0004's flat `bronze` namespace) — every
-        # Bronze table this pipeline ever writes lands in the same
-        # Lakekeeper namespace `lakehouse-iceberg`'s Rust write path uses.
-        dataset_name="bronze",
-    )
-    load_info = pipeline.run(source, table_format="iceberg")
-    if load_info.has_failed_jobs:
-        raise RuntimeError(f"dlt load had failed jobs: {load_info.load_packages}")
+    result = load_via_sink(source, cfg.bronze_table_name, SinkConfig.from_bronze_ingest_config(cfg))
+    if result.has_failed_jobs:
+        # `load_info_str` (`str(load_info)`) can contain a file path --
+        # fine in a raised exception that stays server-side (this op is
+        # not a route handler), but see `adapters/sink.py`'s module doc
+        # for why it must never reach a caller/response elsewhere.
+        raise RuntimeError(f"dlt load had failed jobs: {result.load_info_str}")
 
     return {
         "bronze_table_name": cfg.bronze_table_name,
         "source_schema": cfg.source_schema,
         "source_table": cfg.source_table,
-        "load_id": load_info.loads_ids[-1] if load_info.loads_ids else None,
+        # WS3 plan review Z9: the real, measured row count from dlt's own
+        # normalize trace (`adapters/sink.py`'s module doc) -- `None`,
+        # never a fabricated `0`, when unmeasured.
+        "rows": result.rows,
     }
 
 
