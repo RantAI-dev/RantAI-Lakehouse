@@ -1,13 +1,15 @@
 """Unit tests for `dagster/dispar_orchestrate/replication_metrics.py`'s
-registry-driven connector-id attribution (WS3 Task B3, WS3 plan review X4).
+registry-driven connector-id attribution (WS3 plan review X4).
 
 Before this task, `check_replication_slots` attributed a live
 `pg_replication_slots` row to a connector by stripping a `_slot` suffix off
 the slot name (`slot_name[: -len("_slot")]`), unconditionally — a guessed
 attribution the module doc now calls a fabricated metric (AGENTS.md rule
-2). After WS3's Task G4, a CDC connector's slot name is registry-owned and
-need not resemble its connector id at all, so attribution must come from
-`GET /api/connectors/ingestible` instead.
+2). Once `ops/debezium/render_compose.py` assigns a CDC connector's slot
+and publication names from its registry-owned `dial` (rather than deriving
+them from the connector id), a slot name need not resemble its connector
+id at all, so attribution must come from `GET /api/connectors/ingestible`
+instead.
 
 No real network: `requests.get` and `psycopg2.connect` are both
 monkeypatched, the same style `test_agent_runs.py` uses for

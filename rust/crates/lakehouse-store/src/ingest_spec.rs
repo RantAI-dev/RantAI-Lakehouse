@@ -32,7 +32,8 @@ pub enum SqlDriver {
     Mysql,
     /// `PostgreSQL`.
     Postgres,
-    /// Microsoft SQL Server, dialed via ODBC by Task F2's Python adapter.
+    /// Microsoft SQL Server, dialed via ODBC by the Dagster `sql` adapter
+    /// this driver's `dial` values are validated for.
     Mssql,
 }
 
@@ -247,9 +248,9 @@ impl Dial {
     /// Dispatches on `adapter` — the connector's own stored column value —
     /// and parses `raw` against exactly one struct, never trying every
     /// shape in turn. `host` is additionally checked by
-    /// [`validate_hostname`] for `sql`/`cdc` adapters, since Task F2's
-    /// Python-side ODBC adapter later interpolates `host` into a
-    /// delimiter-separated connection string.
+    /// [`validate_hostname`] for `sql`/`cdc` adapters, since the Dagster
+    /// `sql` adapter's Python-side ODBC driver later interpolates `host`
+    /// into a delimiter-separated connection string.
     ///
     /// # Errors
     ///
