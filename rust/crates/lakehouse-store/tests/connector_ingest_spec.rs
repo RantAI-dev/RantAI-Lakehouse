@@ -59,11 +59,21 @@ async fn ingest_read_is_granted_exactly_once(pool: PgPool) -> sqlx::Result<()> {
 }
 
 /// The five additive columns from `0033` exist with the documented
-/// defaults, so an existing connector row (like the two
-/// `0022_prune_connector_seed.sql` seeds) keeps parsing with
+/// defaults, so an existing connector row keeps parsing with
 /// `adapter = NULL` ("not ingestible yet") rather than failing to migrate.
+///
+/// This test originally asserted `adapter = NULL` for every seeded
+/// connector row, but `0034_seed_connector_ingest_spec.sql` now fills in
+/// `adapter`/`dial`/`source_objects` on the two rows
+/// `0022_prune_connector_seed.sql` seeded (`conn-pg-lakehouse`,
+/// `conn-s3-warehouse`) — the two connectors this compose stack can
+/// actually dial. Those two are excluded here and covered instead by
+/// `tests/connector_ingest_spec_seed.rs`; this test now checks the
+/// column-default claim against every OTHER connector row, so it stays
+/// meaningful if a future migration seeds a third dialable connector
+/// without touching this one.
 #[sqlx::test(migrations = "../../migrations")]
-async fn seeded_connectors_have_null_adapter_and_empty_dial(pool: PgPool) -> sqlx::Result<()> {
+async fn non_seeded_connectors_have_null_adapter_and_empty_dial(pool: PgPool) -> sqlx::Result<()> {
     type ConnectorIngestRow = (
         Option<String>,
         Option<String>,
@@ -73,20 +83,37 @@ async fn seeded_connectors_have_null_adapter_and_empty_dial(pool: PgPool) -> sql
     );
     let rows: Vec<ConnectorIngestRow> = sqlx::query_as(
         "SELECT adapter, ingest_mode, dial, source_objects, schedule_cron FROM connector \
-             ORDER BY id",
+             WHERE id NOT IN ('conn-pg-lakehouse', 'conn-s3-warehouse') ORDER BY id",
     )
     .fetch_all(&pool)
     .await?;
-    assert!(
-        !rows.is_empty(),
-        "expected the seeded connector rows to exist"
-    );
     for (adapter, ingest_mode, dial, source_objects, schedule_cron) in rows {
         assert_eq!(adapter, None);
         assert_eq!(ingest_mode, None);
         assert_eq!(dial, serde_json::json!({}));
         assert_eq!(source_objects, serde_json::json!([]));
         assert_eq!(schedule_cron, None);
+    }
+    Ok(())
+}
+
+/// `0034_seed_connector_ingest_spec.sql` fills in `adapter`/`dial`/
+/// `source_objects` on the two connectors this compose stack can actually
+/// dial (`conn-pg-lakehouse`, `conn-s3-warehouse`); this pins that BOTH
+/// rows moved off the column defaults, complementing
+/// `tests/connector_ingest_spec_seed.rs`'s per-field assertions on each
+/// row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn seeded_connectors_no_longer_have_null_adapter(pool: PgPool) -> sqlx::Result<()> {
+    let rows: Vec<(Option<String>,)> = sqlx::query_as(
+        "SELECT adapter FROM connector WHERE id IN ('conn-pg-lakehouse', 'conn-s3-warehouse') \
+         ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(rows.len(), 2, "expected both seeded connectors to exist");
+    for (adapter,) in rows {
+        assert!(adapter.is_some(), "expected 0034 to have set adapter");
     }
     Ok(())
 }
