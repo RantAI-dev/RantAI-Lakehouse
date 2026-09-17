@@ -29,6 +29,7 @@ import {
   formatRelativeTime,
 } from "@/lib/format"
 import { fmtMeasured } from "@/lib/measured"
+import { isEmployeePaused } from "@/lib/status"
 import { agentService } from "@/services"
 import type { AgentRun, ApprovalItem } from "@/services/contracts/agents"
 
@@ -198,7 +199,7 @@ export function EmployeeDetailPage() {
   if (employee.status === "loading") return <LoadingSkeleton rows={8} />
   if (employee.status === "error") return <ErrorState error={employee.error} onRetry={employee.reload} />
   const e = employee.data
-  const isPaused = e.status === "paused"
+  const isPaused = isEmployeePaused(e.status)
   const isRevoked = e.status === "cancelled"
   const isCopilot = employeeId === "emp-copilot"
   const hasPrompt = Boolean(e.prompt?.trim())
@@ -272,6 +273,9 @@ export function EmployeeDetailPage() {
           </>
         }
       />
+      {resumeAction.status === "error" ? (
+        <p className="text-sm text-destructive">{resumeAction.error.message}</p>
+      ) : null}
       <ConfirmActionDialog
         open={confirm !== null}
         onOpenChange={(open) => {
@@ -303,7 +307,13 @@ export function EmployeeDetailPage() {
             employee.reload()
           }
         }}
-      />
+      >
+        {(confirm === "revoke" ? revokeAction : suspendAction).status === "error" ? (
+          <p className="text-sm text-destructive">
+            {(confirm === "revoke" ? revokeAction : suspendAction).error?.message}
+          </p>
+        ) : null}
+      </ConfirmActionDialog>
       <ConfirmActionDialog
         open={runDialogOpen}
         onOpenChange={(open) => {

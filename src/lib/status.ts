@@ -37,6 +37,20 @@ export const ENTITY_STATUS_LABEL: Record<EntityStatus, string> = {
   archived: "Archived",
 }
 
+/**
+ * Whether an `EntityStatus` reads as "suspended, resumable" for a digital
+ * employee. Kept as its own pure function (not an inline `=== "paused"`
+ * check) so the employee detail page's Pause/Resume control derives from
+ * one tested source instead of a guess at the string a plan snippet used —
+ * verified against `rust/crates/lakehouse-api/src/routes/agents.rs`, where
+ * `suspend_employee`/`resume_employee` set/read exactly `"paused"`
+ * (`resume_employee`'s 409 guard at `agents.rs:1368` matches on
+ * `"paused" | "cancelled"`, WS7 item G5).
+ */
+export function isEmployeePaused(status: EntityStatus): boolean {
+  return status === "paused"
+}
+
 export const ENTITY_STATUS_DESCRIPTION: Record<EntityStatus, string> = {
   draft: "Not yet validated or deployed.",
   validating: "Configuration checks are in progress.",
