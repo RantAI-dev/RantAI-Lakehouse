@@ -14,6 +14,7 @@ import { postgresConnectorService } from "./clients/connectors"
 import { postgresAgentService } from "./clients/agents"
 import { clickhouseAlertRuleService } from "./clients/alerts"
 import { icebergLakehouseService } from "./clients/lakehouse"
+import { goldService as goldClientService } from "./clients/gold"
 
 // Overview is now fully real — summary/activity from ClickHouse+Dagster,
 // alerts (list/ack/resolve) from Postgres (Task 2.6). mock/overview.ts
@@ -58,3 +59,7 @@ export const alertRuleService = clickhouseAlertRuleService
 // Lakehouse (WS2 §4) — the read-only Iceberg warehouse/namespace/table
 // surface over `/api/lakehouse/*`. No mock ever existed for this service.
 export const lakehouseService = icebergLakehouseService
+// Gold export page (WS6) — marts/exports/history/consumers all real, via
+// lakehouse-api's /api/gold/* routes. No mock ever existed for this
+// domain (ADR 0010 was Rust-only from the start).
+export const goldService = goldClientService
