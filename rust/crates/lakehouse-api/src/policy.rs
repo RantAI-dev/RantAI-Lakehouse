@@ -148,9 +148,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET", "/api/catalog/{id}/annotation", Policy::RequiresPermission("catalog:read")),
     ("PUT", "/api/catalog/{id}/annotation", Policy::RequiresPermission("catalog:write")),
 
-    // ── Access requests (WS7 item E2): anyone who can see a catalog entry
-    //    may request more access to it. ───────────────────────────────────
-    ("POST", "/api/catalog/{id}/access-request", Policy::RequiresPermission("catalog:read")),
+    // ── Access requests (WS7 item E2/E3): anyone who can see a catalog
+    //    entry may request more access to it; `access:approve` (minted by
+    //    migration 0040, held only by Governance Admin) is a distinct
+    //    governance authority from `agent:approve` that decides it. ───────
+    ("POST", "/api/catalog/{id}/access-request",         Policy::RequiresPermission("catalog:read")),
+    ("POST", "/api/catalog/access-requests/{id}/decide", Policy::RequiresPermission("access:approve")),
 
     // ── Lakehouse (WS2 §4): the read-only Iceberg warehouse/namespace/
     //    table surface, gated by the same seeded `catalog:read` permission

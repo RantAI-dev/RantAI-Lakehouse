@@ -1524,6 +1524,147 @@ pub async fn create_access_request(
     Ok(row.into())
 }
 
+/// Reads one `approval_item` by id, of EITHER `kind` — the read-before-
+/// decide both `routes::agents::decide_approval` and
+/// `routes::catalog::decide_access_request` (WS7 item E3) need, to check
+/// `kind`/`requested_by_user_id` before committing to a decision.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any query failure.
+pub async fn get_approval(pool: &PgPool, id: &str) -> Result<Option<ApprovalItem>, StoreError> {
+    let select_sql =
+        format!("SELECT {APPROVAL_COLUMNS_QUALIFIED} {APPROVAL_AUDIT_JOIN} WHERE a.id = $1");
+    let row: Option<ApprovalRow> = sqlx::query_as(&select_sql)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(ApprovalItem::from))
+}
+
+/// One `access_grant` row (WS7 item E1) — what an APPROVED access request
+/// actually grants: a single permission token, bounded by an expiry.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccessGrant {
+    /// `access_grant.id`.
+    pub id: String,
+    /// The `approval_item` this grant was created from.
+    pub approval_id: String,
+    /// The user this grant applies to.
+    pub user_id: Uuid,
+    /// The granted permission token (e.g. `"catalog:write"`).
+    pub permission: String,
+    /// When the grant was created, ISO 8601.
+    pub granted_at: String,
+    /// When the grant stops applying, ISO 8601 — `lakehouse-auth`'s
+    /// `load_principal_for_user` (WS7 item E4) only folds in a grant whose
+    /// `expires_at` is still in the future.
+    pub expires_at: String,
+}
+
+#[derive(FromRow)]
+struct AccessGrantRow {
+    id: String,
+    approval_id: String,
+    user_id: Uuid,
+    permission: String,
+    granted_at: OffsetDateTime,
+    expires_at: OffsetDateTime,
+}
+
+impl From<AccessGrantRow> for AccessGrant {
+    fn from(row: AccessGrantRow) -> Self {
+        Self {
+            id: row.id,
+            approval_id: row.approval_id,
+            user_id: row.user_id,
+            permission: row.permission,
+            granted_at: iso_millis(row.granted_at),
+            expires_at: iso_millis(row.expires_at),
+        }
+    }
+}
+
+/// Decide a pending access request (`kind = 'access'`). Same row-lock,
+/// pending-only status-transition shape [`decide_approval`] already uses
+/// (only ONE concurrent `decide` call can ever observe `Ok`, matching that
+/// function's own exactly-once guarantee) — on [`Decision::Approved`],
+/// additionally inserts one [`AccessGrant`] row, `expires_at = now() +
+/// grant_days days`, `permission` parsed from the approval's own `action`
+/// (`"access:<permission>"`, the exact shape [`create_access_request`]
+/// always writes). Returns `Ok(None)` for a rejection (nothing granted).
+///
+/// # Errors
+///
+/// [`StoreError::NotFound`] if `id` is unknown. [`StoreError::Conflict`]
+/// if the approval has already been decided (an already-approved/rejected
+/// item cannot be re-decided). [`StoreError::Validation`] if `id` names a
+/// row whose `action` is not `"access:<permission>"`-shaped or whose
+/// `requested_by_user_id` is `NULL` — both should be impossible for a real
+/// `kind = 'access'` row (WS7 item E1's own `CHECK` constraints), so this
+/// is a defensive refusal, never a silent grant to nobody.
+pub async fn decide_access_request(
+    pool: &PgPool,
+    id: &str,
+    decision: Decision,
+    comment: Option<&str>,
+    grant_days: i64,
+) -> Result<Option<AccessGrant>, StoreError> {
+    let mut tx = pool.begin().await?;
+    let current: Option<(String, String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT status, action, requested_by_user_id FROM approval_item WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((status, action, requested_by_user_id)) = current else {
+        return Err(StoreError::NotFound);
+    };
+    if status != "pending" {
+        return Err(StoreError::Conflict);
+    }
+    sqlx::query(
+        "UPDATE approval_item SET status = $2, decided_at = now(), comment = $3 WHERE id = $1",
+    )
+    .bind(id)
+    .bind(decision.as_status())
+    .bind(comment)
+    .execute(&mut *tx)
+    .await?;
+    let grant = if decision == Decision::Approved {
+        let permission = action.strip_prefix("access:").ok_or_else(|| {
+            StoreError::Validation(format!(
+                "approval {id} has kind 'access' but action {action:?} is not \
+                 \"access:<permission>\"-shaped"
+            ))
+        })?;
+        let user_id = requested_by_user_id.ok_or_else(|| {
+            StoreError::Validation(format!(
+                "approval {id} has kind 'access' but no requested_by_user_id"
+            ))
+        })?;
+        let grant_id = format!("grant-{}", Uuid::new_v4());
+        let row: AccessGrantRow = sqlx::query_as(
+            "INSERT INTO access_grant (id, approval_id, user_id, permission, expires_at) \
+             VALUES ($1, $2, $3, $4, now() + ($5 || ' days')::interval) \
+             RETURNING id, approval_id, user_id, permission, granted_at, expires_at",
+        )
+        .bind(&grant_id)
+        .bind(id)
+        .bind(user_id)
+        .bind(permission)
+        .bind(grant_days.to_string())
+        .fetch_one(&mut *tx)
+        .await?;
+        Some(row.into())
+    } else {
+        None
+    };
+    tx.commit().await?;
+    Ok(grant)
+}
+
 /// `overview.pendingApprovals` (WS5 item B2): the count of approval items
 /// still waiting on a human decision.
 ///
@@ -1682,6 +1823,51 @@ mod access_request_tests {
         assert_eq!(req.requested_by_user_id, Some(requester));
         assert_eq!(req.action, "access:catalog:write");
         assert_eq!(req.resource.as_deref(), Some("catalog-1"));
+        Ok(())
+    }
+
+    /// Failing-test-first for WS7 item E3: before this task,
+    /// `decide_access_request`/`AccessGrant` did not exist at all. Quoted
+    /// failure text (`cargo test -p lakehouse-store
+    /// agents::decide_access_request 2>&1 | tail -30` against the pre-E3
+    /// state): `error[E0425]: cannot find function \`decide_access_request\`
+    /// in this scope`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn decide_access_request_approved_creates_a_time_bounded_grant(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let requester = seed_test_user(&pool, "req2@tenant-a.invalid").await;
+        let req = create_access_request(
+            &pool,
+            &NewAccessRequest {
+                requested_by_user_id: requester,
+                catalog_id: "catalog-1",
+                permission: "catalog:write",
+                reason: "need to correct a mapping error",
+            },
+        )
+        .await
+        .expect("creating a well-formed access request must succeed");
+
+        let grant = super::decide_access_request(
+            &pool,
+            &req.id,
+            super::Decision::Approved,
+            Some("looks fine"),
+            30,
+        )
+        .await
+        .expect("deciding a pending access request must succeed")
+        .expect("an approval must create a grant");
+
+        assert_eq!(grant.permission, "catalog:write");
+        assert_eq!(grant.user_id, requester);
+        let expires_at = time::OffsetDateTime::parse(
+            &grant.expires_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("expires_at must be a real ISO 8601 timestamp");
+        assert!(expires_at > time::OffsetDateTime::now_utc());
         Ok(())
     }
 }

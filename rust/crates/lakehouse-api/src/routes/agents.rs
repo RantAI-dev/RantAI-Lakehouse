@@ -441,13 +441,16 @@ pub async fn list_approvals(
 }
 
 /// The `POST /api/agents/approvals/{id}/decide` body. Mirrors
-/// `DecideApprovalInput`.
+/// `DecideApprovalInput`. Fields are `pub(crate)` (WS7 item E3, N1) so
+/// `routes::catalog::decide_access_request` can parse the SAME shape for
+/// `POST /api/catalog/access-requests/{id}/decide` — one body type, two
+/// routes, never a second, redefined struct.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DecideApprovalBody {
-    decision: String,
+    pub(crate) decision: String,
     #[serde(default)]
-    comment: Option<String>,
+    pub(crate) comment: Option<String>,
 }
 
 /// `POST /api/agents/approvals/{id}/decide` — approve or reject a pending
@@ -562,6 +565,20 @@ pub async fn decide_approval(
         }
     };
     let pg = pool(&state)?;
+
+    // WS7 item E3 (N1, revision 2 judge review): `approval_item.id` is a
+    // single id space shared by both `kind`s (WS7 item E1's migration) —
+    // this route must refuse a `kind = "access"` row with 404, not decide
+    // it, even though `agents::decide_approval`'s own UPDATE would happily
+    // transition it too. A 404, not 403: from THIS route's point of view
+    // the resource simply does not exist as something it can decide.
+    match agents::get_approval(pg, &id).await {
+        Ok(Some(existing)) if existing.kind != "tool_call" => {
+            return Err(ApiError::NotFound(format!("Approval {id} not found")).into());
+        }
+        Ok(_) => {}
+        Err(err) => return Err(ApiError::from(err).into()),
+    }
 
     let approval = match agents::decide_approval(pg, &id, decision, body.comment.as_deref()).await {
         Ok(updated) => updated,

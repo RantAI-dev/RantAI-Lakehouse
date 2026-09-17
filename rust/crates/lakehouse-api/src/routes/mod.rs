@@ -220,6 +220,25 @@ fn governance_static_router() -> Router<AppState> {
         )
 }
 
+/// The `/api/catalog/{id}/access-request` +
+/// `/api/catalog/access-requests/{id}/decide` sub-router (WS7 items E2/E3),
+/// split out for the same `clippy::too_many_lines` reason as
+/// [`pipelines_router`]. Two distinct paths under `/api/catalog` — one has
+/// a literal `access-requests` segment where the other has a `{id}`
+/// capture at the same position, so axum's router never treats them as
+/// ambiguous.
+fn catalog_access_router() -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/catalog/{id}/access-request",
+            axum::routing::post(catalog::access_request),
+        )
+        .route(
+            "/api/catalog/access-requests/{id}/decide",
+            axum::routing::post(catalog::decide_access_request),
+        )
+}
+
 /// The `/api/overview/alerts/*` sub-router (Task 2.6), split out for the
 /// same `clippy::too_many_lines` reason as [`pipelines_router`].
 fn overview_alerts_router() -> Router<AppState> {
@@ -398,10 +417,7 @@ pub fn router(state: AppState) -> Router {
             "/api/catalog/{id}/annotation",
             get(catalog::get_annotation).put(catalog::put_annotation),
         )
-        .route(
-            "/api/catalog/{id}/access-request",
-            axum::routing::post(catalog::access_request),
-        )
+        .merge(catalog_access_router())
         .route("/api/overview", get(overview::get).post(overview::refresh))
         .merge(overview_alerts_router())
         // `/api/ops/logs` is a literal segment registered ahead of the

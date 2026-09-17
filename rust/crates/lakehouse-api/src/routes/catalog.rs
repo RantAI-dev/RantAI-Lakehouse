@@ -1361,6 +1361,133 @@ pub async fn access_request(
     })))
 }
 
+// ── POST /api/catalog/access-requests/{id}/decide (WS7 item E3) ────────
+
+/// `POST /api/catalog/access-requests/{id}/decide` — a dedicated,
+/// `access:approve`-gated route that decides an access request. **Never**
+/// reused for a `kind = "tool_call"` approval — see the module-level
+/// discussion in the WS7 plan (M4/N1): `access:approve` (minted by WS7
+/// item E1's migration, held only by Governance Admin) is a distinct
+/// governance authority from `agent:approve`, and the two decisions stay
+/// on two separate routes so `POLICY_TABLE`/`route_auth.rs`'s own
+/// table-driven loop proves the right permission for each, rather than a
+/// single fan-out handler whose in-handler `kind` branch a future edit
+/// could silently skip.
+///
+/// `GRANT_DAYS`: how long an approved access request's [`AccessGrant`]
+/// lasts. Fixed rather than caller-supplied (no field in the request or
+/// decide body names it) — a requester/approver cannot negotiate their
+/// own grant's lifetime through this route; the WS7 plan does not specify
+/// a value, so this uses the same 30-day window its own store-layer test
+/// (`lakehouse_store::agents::decide_access_request_approved_creates_a_time_bounded_grant`)
+/// exercises.
+const GRANT_DAYS: i64 = 30;
+
+/// See [`DecideAccessRequestBody`]'s doc comment — reuses
+/// `routes::agents::DecideApprovalBody`'s exact shape (WS7 item E3, N1),
+/// never a redefined struct.
+type DecideAccessRequestBody = crate::routes::agents::DecideApprovalBody;
+
+/// # Errors
+///
+/// - `400` [`ApiError::BadRequest`] on an unparseable body or a `decision`
+///   other than `"approved"`/`"rejected"`.
+/// - `404` [`ApiError::NotFound`] if `id` is unknown, OR names a
+///   `kind = "tool_call"` approval — this route can only decide `kind =
+///   "access"` rows (see this function's own doc comment).
+/// - `403` [`ApiError::PermissionDenied`] if the deciding principal is the SAME
+///   person who requested this access — self-approval is refused, proven
+///   by a real test (WS7 plan's own acceptance criterion for this task).
+/// - `409` [`ApiError::Conflict`] if the request has already been decided.
+/// - `503`/`500` as [`lakehouse_store::StoreError`] classifies.
+pub async fn decide_access_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Extension(principal): Extension<lakehouse_auth::Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    let body: DecideAccessRequestBody = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::BadRequest("body must be JSON".to_owned()))?;
+    let decision = match body.decision.as_str() {
+        "approved" => lakehouse_store::agents::Decision::Approved,
+        "rejected" => lakehouse_store::agents::Decision::Rejected,
+        other => {
+            return Err(ApiError::BadRequest(format!(
+                "decision must be \"approved\" or \"rejected\", got {other:?}"
+            ))
+            .into());
+        }
+    };
+    let pool = annotation_pool(&state)?;
+
+    // N1: 404, not 403 — see this function's own doc comment.
+    let existing = lakehouse_store::agents::get_approval(pool, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Access request {id} not found")))?;
+    if existing.kind != "access" {
+        return Err(ApiError::NotFound(format!("Access request {id} not found")).into());
+    }
+    // Self-approval refused: the deciding principal must not be the same
+    // human who requested this access — the SERVER-SIDE enforcement of
+    // Hard Requirement 3, not merely a client-side hint.
+    if existing.requested_by_user_id == Some(principal.id.uuid()) {
+        return Err(ApiError::PermissionDenied(
+            "tidak boleh menyetujui permintaan akses milik sendiri".to_owned(),
+        )
+        .into());
+    }
+
+    let grant = match lakehouse_store::agents::decide_access_request(
+        pool,
+        &id,
+        decision,
+        body.comment.as_deref(),
+        GRANT_DAYS,
+    )
+    .await
+    {
+        Ok(grant) => grant,
+        Err(lakehouse_store::StoreError::NotFound) => {
+            return Err(ApiError::NotFound(format!("Access request {id} not found")).into());
+        }
+        Err(lakehouse_store::StoreError::Conflict) => {
+            return Err(ApiError::Conflict(format!(
+                "Access request {id} has already been decided"
+            ))
+            .into());
+        }
+        Err(err) => return Err(ApiError::from(err).into()),
+    };
+
+    let decide_outcome = match decision {
+        lakehouse_store::agents::Decision::Approved => "approved",
+        lakehouse_store::agents::Decision::Rejected => "rejected",
+    };
+    // Best-effort, matching WS5 item D1's own posture.
+    let _ = lakehouse_store::audit::insert(
+        pool,
+        lakehouse_store::audit::NewAuditEvent {
+            principal_id: Some(principal.id.uuid().to_string()),
+            principal_kind: Some("user".to_owned()),
+            actor_label: Some(principal.display_name.clone()),
+            action: existing.action.clone(),
+            resource_kind: Some("approval".to_owned()),
+            resource_id: Some(id.clone()),
+            args: Some(json!({ "comment": body.comment })),
+            outcome: decide_outcome.to_owned(),
+            approval_id: Some(id.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    Ok(ApiJson(json!({
+        "ok": true,
+        "status": decide_outcome,
+        "grant": grant,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
