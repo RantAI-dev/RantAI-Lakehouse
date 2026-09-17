@@ -275,10 +275,14 @@ pub async fn chat(
         }
         if calls.is_empty() {
             let answer = strip_tool_xml(msg.content.as_deref().unwrap_or(""));
+            // WS7 item F2: every number/table the model just printed is
+            // checked against `tool_trace` — the actual record of what ran
+            // this turn — before it ever reaches the caller.
+            let annotated = citations::annotate_answer(&answer, &tool_trace);
             return (
                 StatusCode::OK,
                 ApiJson(chat_response_body(
-                    &answer,
+                    &annotated,
                     &tool_trace,
                     build_run_id.as_deref(),
                     chart_created,
@@ -434,17 +438,25 @@ pub async fn chat(
         .chat_with_tools(&messages, &[], ChatOptions::default())
         .await
     {
-        Ok(final_msg) => (
-            StatusCode::OK,
-            ApiJson(chat_response_body(
-                &final_msg.content.unwrap_or_default(),
-                &tool_trace,
-                build_run_id.as_deref(),
-                chart_created,
-                Some("batas iterasi tool tercapai"),
-            )),
-        )
-            .into_response(),
+        Ok(final_msg) => {
+            // WS7 item F2: the iteration-budget-exhausted final answer is
+            // checked the same way as the normal return path — a model
+            // that runs out of tool-calling turns is not exempt from
+            // citation checking.
+            let annotated =
+                citations::annotate_answer(&final_msg.content.unwrap_or_default(), &tool_trace);
+            (
+                StatusCode::OK,
+                ApiJson(chat_response_body(
+                    &annotated,
+                    &tool_trace,
+                    build_run_id.as_deref(),
+                    chart_created,
+                    Some("batas iterasi tool tercapai"),
+                )),
+            )
+                .into_response()
+        }
         Err(err) => llm_unavailable(&err),
     }
 }
