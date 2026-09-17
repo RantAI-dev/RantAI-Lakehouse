@@ -1,0 +1,12 @@
+# ops/g6/docker-compose.g6.override.yml -- WS3 plan review Z11: this
+# variable is GATE-ONLY. The default docker-compose.yml (no -f pointing
+# here) leaves INGEST_ALLOW_INTERNAL_HOSTS unset on dagster-code-location,
+# so a real deployment's Dagster ingestion jobs keep refusing internal
+# hosts by default -- only this gate's own compose invocation
+# (`docker compose -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
+# --profile g6 --profile dagster ...`) admits them, and only for the
+# mysql-g6/mssql-g6/rest-stub-g6 fixtures this gate itself stands up.
+services:
+  dagster-code-location:
+    environment:
+      INGEST_ALLOW_INTERNAL_HOSTS: "true"
