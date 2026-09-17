@@ -26,7 +26,7 @@
 //!
 //! `OpenFGA`/`Trino` are only dialed when their base URL is configured
 //! (`crate::config::Config::openfga_url`/`trino_health_url` — see that
-//! module's Task A0 doc comments for why `Trino` needs a second,
+//! module's config doc comments for why `Trino` needs a second,
 //! `None`-able field distinct from the always-defaulted query-engine
 //! `trino_url`). Unconfigured reports [`ServiceHealth::checked`] `false`
 //! and [`ServiceHealth::health_label`] `"unknown"`, never `"unhealthy"` —
@@ -627,7 +627,7 @@ pub async fn probe_all(state: &AppState) -> Vec<ServiceHealth> {
     vec![ch, dagster, lakekeeper, rustfs, openfga, trino]
 }
 
-/// 15 s cache for [`probe_all`] (WS5 Task A2) — see the module doc comment.
+/// 15 s cache for [`probe_all`] (WS5) — see the module doc comment.
 /// `None` until the first read.
 pub type HealthCache = Arc<tokio::sync::Mutex<Option<(Vec<ServiceHealth>, OffsetDateTime)>>>;
 

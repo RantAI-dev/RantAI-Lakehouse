@@ -396,7 +396,7 @@ pub struct Config {
     /// failing config resolution. Default `10_000`.
     pub trino_max_rows: usize,
     /// Same `TRINO_URL` env var as [`Self::trino_url`], read a second way
-    /// for `health::probe_trino` (WS5 Task A0, grand plan §7): `None` when
+    /// for `health::probe_trino` (WS5, grand plan §7): `None` when
     /// `TRINO_URL` is unset, never the baked-in `"http://trino:8080"`
     /// default `trino_url` always carries. The query-engine field
     /// (`trino_url`) is deliberately always-present so `routes::query::run`
@@ -1144,7 +1144,7 @@ mod tests {
         assert_eq!(err, ConfigError::InvalidPort("nope".to_owned()));
     }
 
-    /// WS5 Task A0 (plan review Y1) — `trino_health_url`/`openfga_url` are
+    /// WS5 (plan review Y1) — `trino_health_url`/`openfga_url` are
     /// both genuinely optional: an unset URL must resolve to `None`, not a
     /// baked-in host:port, so `health::probe_all` never dials a service
     /// this deployment never configured.
