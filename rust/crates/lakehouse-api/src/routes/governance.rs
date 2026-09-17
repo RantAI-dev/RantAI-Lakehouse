@@ -754,17 +754,36 @@ pub struct CreatePolicyBody {
     owner: Option<String>,
 }
 
-/// `POST /api/governance/policies` — author a new policy. Returns 201.
+/// Parse and validate a `POST /api/governance/policies` body into a
+/// [`CreatePolicyInput`], pure and DB-free so it can be unit tested without
+/// a pool (same extraction pattern as `routes::query::run_result_json`).
+///
+/// Refuses (400) a `conditions` value that parses as JSON but describes no
+/// real obligation — [`crate::policy_engine::PolicyCondition::parse`]
+/// returns `None` for it. A `conditions` value that is present but is NOT
+/// valid JSON at all (legacy free-text prose) passes through unchanged:
+/// only a JSON-shaped-but-empty condition is refused, so an admin who
+/// deliberately writes prose is never blocked, but one who almost-authors
+/// a structured clause is caught before saving something that silently
+/// does nothing.
 ///
 /// # Errors
 ///
-/// 400 on a malformed body; 409 if the name is taken; 503/500 as above.
-pub async fn create_policy(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> ApiResult<(StatusCode, ApiJson<Policy>)> {
-    let body: CreatePolicyBody = parse_body(&body)?;
-    let input = CreatePolicyInput {
+/// Returns [`ApiError::BadRequest`] if `body` isn't the expected shape, or
+/// if an authored `conditions` blob is JSON-shaped but enforces nothing.
+fn create_policy_body(body: Value) -> Result<CreatePolicyInput, ApiError> {
+    let body: CreatePolicyBody = serde_json::from_value(body)
+        .map_err(|err| ApiError::BadRequest(format!("invalid JSON: {err}")))?;
+    if let Some(conditions) = body.conditions.as_deref() {
+        let is_json = serde_json::from_str::<Value>(conditions).is_ok();
+        if is_json && crate::policy_engine::PolicyCondition::parse(conditions).is_none() {
+            return Err(ApiError::BadRequest(
+                "conditions authors an enforcement clause with no obligation (mask or rowFilter required)"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(CreatePolicyInput {
         name: body.name,
         kind: body.kind,
         subjects: body.subjects,
@@ -773,7 +792,22 @@ pub async fn create_policy(
         conditions: body.conditions,
         activate: body.activate,
         owner: body.owner,
-    };
+    })
+}
+
+/// `POST /api/governance/policies` — author a new policy. Returns 201.
+///
+/// # Errors
+///
+/// 400 on a malformed body or an authored `conditions` blob with no real
+/// obligation; 409 if the name is taken; 503/500 as above.
+pub async fn create_policy(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, ApiJson<Policy>)> {
+    let body: Value = serde_json::from_slice(&body)
+        .map_err(|err| ApiError::BadRequest(format!("invalid JSON: {err}")))?;
+    let input = create_policy_body(body)?;
     let created = governance::create_policy(pool(&state)?, &input).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
 }
@@ -980,6 +1014,46 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn create_policy_rejects_a_conditions_blob_with_no_real_obligation() {
+        let body = json!({
+            "name": "p1", "kind": "Row filter", "subjects": "s", "resources": "r",
+            "effect": "Permit with obligation",
+            "conditions": r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":[],"rowFilter":""}"#,
+        });
+        let err = create_policy_body(body).expect_err("empty obligation must be refused");
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn create_policy_accepts_a_well_formed_conditions_blob() {
+        let body = json!({
+            "name": "p2", "kind": "Row filter", "subjects": "s", "resources": "r",
+            "effect": "Permit with obligation",
+            "conditions": r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}"#,
+        });
+        assert!(create_policy_body(body).is_ok());
+    }
+
+    #[test]
+    fn create_policy_accepts_legacy_prose_conditions_unchanged() {
+        let body = json!({
+            "name": "p3", "kind": "Row filter", "subjects": "All analysts",
+            "resources": "tenant-scoped tables", "effect": "Permit with obligation",
+            "conditions": "Applies broadly, reviewed quarterly",
+        });
+        assert!(create_policy_body(body).is_ok());
+    }
+
+    #[test]
+    fn create_policy_accepts_absent_conditions() {
+        let body = json!({
+            "name": "p4", "kind": "Row filter", "subjects": "s", "resources": "r",
+            "effect": "Permit with obligation",
+        });
+        assert!(create_policy_body(body).is_ok());
+    }
 
     fn maintenance_fixture_row() -> Map<String, Value> {
         let mut row = Map::new();

@@ -64,6 +64,12 @@ impl PolicyCondition {
     /// [`Self::parse`] over an `Option<&str>`, for the common
     /// `policy.conditions: Option<String>` shape.
     #[must_use]
+    #[allow(
+        dead_code,
+        reason = "no read-time caller exists yet in Phase A; Phase B's sql_rewrite \
+                  enforcement path (and WS7 item A5's preview route) call this on every \
+                  policy.conditions it loads"
+    )]
     pub fn parse_opt(raw: Option<&str>) -> Option<Self> {
         raw.and_then(Self::parse)
     }

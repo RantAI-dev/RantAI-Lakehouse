@@ -24,6 +24,7 @@ mod lakehouse_catalog;
 mod lakekeeper_token;
 mod next_run;
 mod policy;
+mod policy_engine;
 mod routes;
 mod state;
 mod tenant;
