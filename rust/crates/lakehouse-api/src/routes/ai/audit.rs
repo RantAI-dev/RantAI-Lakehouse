@@ -131,15 +131,78 @@ pub fn resource_for(
     }
 }
 
+/// Builds the [`NewAuditEvent`] [`record`] writes — extracted as a pure,
+/// `PgPool`-free function so `principal_kind` is unit-tested directly
+/// instead of only indirectly through an async insert (WS5 item D2; mirrors
+/// `routes::query::query_run_audit_event`'s "extract pure logic, unit-test
+/// without a connection" pattern). `args` is [`redact`]-ed here, same as
+/// before the extraction.
+///
+/// `principal_kind` is a genuine parameter, not hardcoded, because not
+/// every caller of an `audit_event` write is the copilot: [`record`] passes
+/// the literal `"copilot"` (it is only ever called from the copilot's own
+/// dispatch paths, [`super::chat`]/[`super::tool_call`]), while
+/// `routes::agents::decide_approval` — a console route a human calls, not
+/// the copilot — passes [`Principal::kind_for_audit`] instead (WS5 item
+/// D2; see that method's doc comment for the `0024_audit_event.sql` CHECK
+/// it satisfies). Binding `"copilot"` unconditionally here, as this
+/// function's predecessor did, recorded every human approval decision as
+/// the copilot's — this extraction, plus that one non-copilot call site,
+/// is the fix.
+///
+/// `pub(crate)` (not private) so `routes::agents::decide_approval` (a
+/// sibling module, WS5 item D2) can call it directly, the same visibility
+/// treatment `MAX_STRING_LEN`/`truncate_string` already got for
+/// `routes::query` (WS5 item D1, AGENTS.md rule 4 — promoting beats
+/// duplicating the `NewAuditEvent` literal).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the pure half of record's flat argument list, extracted \
+    unchanged (WS5 item D2) — a builder would only hide that every field \
+    here is genuinely independent input, same justification as record's \
+    own allow below"
+)]
+pub(crate) fn build_event(
+    principal_kind: &str,
+    principal: Option<&Principal>,
+    session_id: Option<&str>,
+    action: &str,
+    resource_kind: Option<&str>,
+    resource_id: Option<&str>,
+    args: &Value,
+    outcome: &str,
+    detail: Option<&str>,
+    run_id: Option<&str>,
+    approval_id: Option<&str>,
+) -> NewAuditEvent {
+    NewAuditEvent {
+        principal_id: principal.map(|p| p.id.uuid().to_string()),
+        principal_kind: Some(principal_kind.to_owned()),
+        actor_label: principal.map(|p| p.display_name.clone()),
+        action: action.to_owned(),
+        resource_kind: resource_kind.map(str::to_owned),
+        resource_id: resource_id.map(str::to_owned),
+        args: Some(redact(args)),
+        outcome: outcome.to_owned(),
+        detail: detail.map(str::to_owned),
+        run_id: run_id.map(str::to_owned),
+        approval_id: approval_id.map(str::to_owned),
+        session_id: session_id.map(str::to_owned),
+    }
+}
+
 /// Writes one `audit_event` row for a copilot gate decision or tool
 /// execution. Every argument here maps directly onto
-/// [`NewAuditEvent`]'s fields except `args`, which is [`redact`]-ed first.
+/// [`NewAuditEvent`]'s fields except `args`, which is [`redact`]-ed first
+/// (inside [`build_event`]).
 ///
 /// `principal_kind` is always `"copilot"` — this module is only ever
 /// called from the copilot's own dispatch paths ([`super::chat`],
 /// [`super::tool_call`]); a headless "digital employee" run (T3.2, not
-/// this task) or a human's own action elsewhere in the console uses a
-/// different `principal_kind` through a different call site.
+/// this task) or a human's own action elsewhere in the console uses
+/// [`build_event`] directly with a real [`Principal::kind_for_audit`]
+/// instead of going through this copilot-flavored wrapper (WS5 item D2 —
+/// `routes::agents::decide_approval` is the first such caller).
 ///
 /// # Never fails visibly
 ///
@@ -175,20 +238,19 @@ pub async fn record(
         );
         return;
     };
-    let event = NewAuditEvent {
-        principal_id: principal.map(|p| p.id.uuid().to_string()),
-        principal_kind: Some("copilot".to_owned()),
-        actor_label: principal.map(|p| p.display_name.clone()),
-        action: action.to_owned(),
-        resource_kind: resource_kind.map(str::to_owned),
-        resource_id: resource_id.map(str::to_owned),
-        args: Some(redact(args)),
-        outcome: outcome.to_owned(),
-        detail: detail.map(str::to_owned),
-        run_id: run_id.map(str::to_owned),
-        approval_id: approval_id.map(str::to_owned),
-        session_id: session_id.map(str::to_owned),
-    };
+    let event = build_event(
+        "copilot",
+        principal,
+        session_id,
+        action,
+        resource_kind,
+        resource_id,
+        args,
+        outcome,
+        detail,
+        run_id,
+        approval_id,
+    );
     if let Err(err) = audit::insert(pool, event).await {
         tracing::warn!(
             %err,

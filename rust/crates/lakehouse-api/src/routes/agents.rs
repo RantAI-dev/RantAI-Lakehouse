@@ -436,6 +436,48 @@ pub struct DecideApprovalBody {
 /// 403 if the approval was approved but the approver lacks the underlying
 /// tool's own permission (the tool is never executed in that case);
 /// 503/500 as above.
+/// The `NewAuditEvent` [`decide_approval`]'s approval-decision audit write
+/// builds — extracted as a pure, unit-tested function (WS5 item D2),
+/// mirroring `routes::query::query_run_audit_event`'s pattern: this call
+/// site's own choice (`resource_kind: "approval"`, paired with the
+/// approval's own id — the pairing WS1 T16's `LEFT JOIN` depends on,
+/// confirmed by reading this handler in full) is hardcoded inside the
+/// helper, not passed by the caller, so a real assertion on the built
+/// event pins it — unlike the source-text-grepping test this replaces,
+/// which would still pass if this call site became dead code.
+///
+/// `principal_kind` comes from [`Principal::kind_for_audit`], never the
+/// `"copilot"` literal `routes::ai::audit::record` uses for its own
+/// (genuinely copilot-triggered) callers: `decide_approval` is a console
+/// route a human calls (`Policy::RequiresPermission("agent:approve")`),
+/// and recording their decision as the copilot's was the bug this task
+/// fixes. Delegates construction to `routes::ai::audit::build_event`
+/// (AGENTS.md rule 4 — reusing beats duplicating the `NewAuditEvent`
+/// literal) rather than calling `routes::ai::audit::record`, which would
+/// force `principal_kind` back to `"copilot"`.
+fn decide_approval_audit_event(
+    principal: &Principal,
+    action: &str,
+    approval_id: &str,
+    comment: Option<&str>,
+    outcome: &str,
+    run_id: Option<&str>,
+) -> NewAuditEvent {
+    ai_audit::build_event(
+        principal.kind_for_audit(),
+        Some(principal),
+        None,
+        action,
+        Some("approval"),
+        Some(approval_id),
+        &json!({ "comment": comment }),
+        outcome,
+        None,
+        run_id,
+        Some(approval_id),
+    )
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one straight-line sequence of terminal outcomes (reject / \
@@ -480,20 +522,27 @@ pub async fn decide_approval(
         Decision::Approved => "approved",
         Decision::Rejected => "rejected",
     };
-    ai_audit::record(
-        Some(pg),
-        Some(&principal),
-        None,
+    // WS5 item D2: built and inserted directly (not via
+    // `ai_audit::record`, which hardcodes `principal_kind: "copilot"` —
+    // wrong here, `decide_approval` is a human console route, not a
+    // copilot dispatch path) so this row's `principal_kind` reflects the
+    // deciding principal's own kind.
+    let decide_audit_event = decide_approval_audit_event(
+        &principal,
         &approval.action,
-        Some("approval"),
-        Some(&id),
-        &json!({ "comment": body.comment }),
+        &id,
+        body.comment.as_deref(),
         decide_outcome,
-        None,
         approval.run_id.as_deref(),
-        Some(&id),
-    )
-    .await;
+    );
+    if let Err(err) = store_audit::insert(pg, decide_audit_event).await {
+        tracing::warn!(
+            %err,
+            action = %approval.action,
+            outcome = decide_outcome,
+            "failed to record approval-decision audit event"
+        );
+    }
 
     // Approvals the copilot creates always carry a `run_id` (see
     // `create_pending_approval`); one that doesn't (a manually-inserted or
@@ -1359,6 +1408,7 @@ mod tests {
 
     use axum::body::to_bytes;
     use axum::http::Request;
+    use lakehouse_auth::PrincipalId;
     use serde_json::Value;
     use tower::ServiceExt;
 
@@ -1427,32 +1477,80 @@ mod tests {
         assert!(!matches!(body.decision.as_str(), "approved" | "rejected"));
     }
 
-    /// WS5 item D2: `decide_approval`'s existing `ai_audit::record` call
-    /// (`:483-494`) already writes `resource_kind: Some("approval")` paired
-    /// with the approval's own `id` — exactly the pairing WS1 T16's
-    /// `LEFT JOIN LATERAL` against `audit_event` needs to resolve a real
-    /// audit id on read. This is a confirmation test, not a red-then-green
-    /// one (stated honestly rather than inventing a failure this task
-    /// doesn't have): it pins the call site's literal arguments by
-    /// grepping the handler's own source, so a future edit to this call
-    /// that changes `resource_kind`/`resource_id` is caught here instead
-    /// of silently breaking the read-path join.
+    /// A logged-in human principal — `PrincipalId::User`. Mirrors
+    /// `routes::query`'s own test fixture of the same name.
+    fn fixture_user_principal() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(1)),
+            tenant_ids: Vec::new(),
+            display_name: "Rina Wijaya".to_owned(),
+            permissions: PermissionSet::parse("agent:approve"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+        }
+    }
+
+    /// A service-token principal — `PrincipalId::Service`.
+    fn fixture_service_principal() -> Principal {
+        Principal {
+            id: PrincipalId::Service(Uuid::from_u128(2)),
+            tenant_ids: Vec::new(),
+            display_name: "dagster-orchestrator".to_owned(),
+            permissions: PermissionSet::parse("agent:approve"),
+            provider: "service".to_owned(),
+            must_change_password: false,
+        }
+    }
+
+    /// WS5 item D2, failing-test-first: before this task's production fix,
+    /// `decide_approval` recorded every human approval decision through
+    /// `ai_audit::record`, which hardcoded `principal_kind: "copilot"` —
+    /// so a human's own decision was mis-attributed to the copilot. Before
+    /// this task added the `decide_approval_audit_event` helper below,
+    /// this test failed to compile at all (E0425, unresolved function),
+    /// since `decide_approval` still called `ai_audit::record` directly.
+    /// This test asserts the BUILT `NewAuditEvent`, replacing the
+    /// previous version's source-text grep (which would have passed even
+    /// if this call site became dead code).
     #[test]
-    fn decide_approval_audit_call_uses_the_pairing_t16s_join_expects() {
-        let source = include_str!("agents.rs");
-        let call_site = source
-            .split("ai_audit::record(")
-            .nth(1)
-            .and_then(|s| s.split(")\n    .await").next())
-            .expect("ai_audit::record call site not found");
-        assert!(
-            call_site.contains(r#"Some("approval")"#),
-            "resource_kind must stay \"approval\": {call_site}"
+    fn decide_approval_audit_event_uses_the_deciding_principals_real_kind() {
+        let principal = fixture_user_principal();
+        let event = decide_approval_audit_event(
+            &principal,
+            "run_saved_query",
+            "appr-1",
+            Some("looks fine"),
+            "approved",
+            Some("run-1"),
         );
-        assert!(
-            call_site.contains("Some(&id)"),
-            "resource_id must stay the approval's own id: {call_site}"
+        assert_eq!(event.principal_kind.as_deref(), Some("user"));
+        assert_eq!(
+            event.principal_id.as_deref(),
+            Some(principal.id.uuid().to_string().as_str())
         );
+        assert_eq!(event.resource_kind.as_deref(), Some("approval"));
+        assert_eq!(event.resource_id.as_deref(), Some("appr-1"));
+        assert_eq!(event.action, "run_saved_query");
+        assert_eq!(event.outcome, "approved");
+        assert_eq!(event.run_id.as_deref(), Some("run-1"));
+        assert_eq!(event.approval_id.as_deref(), Some("appr-1"));
+    }
+
+    /// A service identity's decision (e.g. an automated policy service
+    /// acting through a service token) must record `principal_kind:
+    /// "service"`, never `"user"` or the old hardcoded `"copilot"`.
+    #[test]
+    fn decide_approval_audit_event_records_a_service_identity_as_service_not_user() {
+        let principal = fixture_service_principal();
+        let event = decide_approval_audit_event(
+            &principal,
+            "run_saved_query",
+            "appr-2",
+            None,
+            "rejected",
+            None,
+        );
+        assert_eq!(event.principal_kind.as_deref(), Some("service"));
     }
 
     /// D (T3.2's fix): `create_employee` must validate `mode` the same way
