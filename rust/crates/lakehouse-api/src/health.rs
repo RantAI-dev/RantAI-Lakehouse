@@ -603,6 +603,30 @@ async fn probe_trino_if_configured(http: &reqwest::Client, url: Option<&str>) ->
     }
 }
 
+/// `Lakekeeper` is probed only when `LAKEKEEPER_CATALOG_URI` is set to a
+/// non-empty value. Unlike `trino_health_url`/`openfga_url` (both
+/// `Option<String>`), `lakekeeper_catalog_uri` is a plain `String` with a
+/// compose-shaped default, so before this a deployment that simply does not
+/// run a catalog had no way to say so: the probe always fired, always
+/// failed, and the console reported a permanent `unhealthy` for a service
+/// that was never meant to be there. "Not deployed" and "deployed and
+/// broken" are different facts (AGENTS.md principle 2) — an empty value is
+/// the opt-out, reported `unknown`/`checked: false` exactly like the other
+/// two optional services.
+async fn probe_lakekeeper_if_configured(
+    http: &reqwest::Client,
+    catalog_uri: &str,
+) -> ServiceHealth {
+    if catalog_uri.trim().is_empty() {
+        return unknown(
+            "lakekeeper",
+            "Iceberg + Lakekeeper (Open tables)",
+            OffsetDateTime::now_utc(),
+        );
+    }
+    probe_lakekeeper(http, &lakekeeper_probe_base(catalog_uri)).await
+}
+
 /// Probe all six services concurrently, in this fixed, documented order:
 /// `clickhouse, dagster, lakekeeper, rustfs, openfga, trino`. "No fixed
 /// list" in the grand plan means the ROUTE does not hardcode a subset for
@@ -615,11 +639,10 @@ pub async fn probe_all(state: &AppState) -> Vec<ServiceHealth> {
         "{}/server_info",
         state.config.dagster_url.replace("/graphql", "")
     );
-    let lakekeeper_base = lakekeeper_probe_base(&state.config.lakekeeper_catalog_uri);
     let (ch, dagster, lakekeeper, rustfs, openfga, trino) = tokio::join!(
         probe_clickhouse(&state.clickhouse),
         probe_dagster(&http, &dagster_server_info_url),
-        probe_lakekeeper(&http, &lakekeeper_base),
+        probe_lakekeeper_if_configured(&http, &state.config.lakekeeper_catalog_uri),
         probe_rustfs(&state.config),
         probe_openfga_if_configured(&http, state.config.openfga_url.as_deref()),
         probe_trino_if_configured(&http, state.config.trino_health_url.as_deref()),
@@ -776,6 +799,18 @@ mod tests {
         let health =
             probe_openfga_if_configured(&reqwest::Client::new(), cfg.openfga_url.as_deref()).await;
         assert!(!health.checked);
+        assert_eq!(health.health_label(), "unknown");
+    }
+
+    /// An empty `LAKEKEEPER_CATALOG_URI` means "this deployment does not run
+    /// a catalog" and must report `unknown` without probing — not the
+    /// permanent `unhealthy` a always-on probe produced for every
+    /// catalog-less deployment.
+    #[tokio::test]
+    async fn unconfigured_lakekeeper_reports_unknown_without_a_probe() {
+        let health = probe_lakekeeper_if_configured(&reqwest::Client::new(), "   ").await;
+        assert!(!health.checked);
+        assert!(!health.ok);
         assert_eq!(health.health_label(), "unknown");
     }
 
