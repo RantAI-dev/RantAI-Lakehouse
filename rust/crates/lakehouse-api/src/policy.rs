@@ -284,6 +284,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("DELETE", "/api/ai/sessions",       Policy::RequiresAuth),
     ("GET",  "/api/ai/build-status",     Policy::RequiresAuth),
 
+    // WS5 item F1: navbar bell — same `RequiresAuth` floor as every other
+    // authenticated-but-not-permission-scoped read in this table (e.g.
+    // `/api/overview`, `/api/ai/build-status` immediately above); every
+    // principal sees their own deployment's open alerts/pending approvals,
+    // not a permission-scoped subset.
+    ("GET",  "/api/notifications",       Policy::RequiresAuth),
+
     // ── Identity (Phase 2 directory): permission-gated (D1 fix). Reads
     //    require `identity:read`, mutations (create user/role/tenant/
     //    service-identity — the last of which can mint a `*:*` role and

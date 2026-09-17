@@ -19,6 +19,8 @@ import { cn } from "@/lib/utils"
 import { pageTitleFor } from "./nav-config"
 import { openCommandPalette } from "@/components/command-palette"
 import { useAuth } from "@/features/auth/auth-provider"
+import { useService } from "@/hooks/use-service"
+import { notificationsService } from "@/services"
 
 /**
  * Sticky top navbar rendered on every page.
@@ -29,6 +31,15 @@ export function AppNavbar() {
   const pathname = usePathname()
   const pageTitle = pageTitleFor(pathname)
   const { user, logout } = useAuth()
+  // WS5 item F1: the bell dot lights only for a real, currently
+  // open/pending item — never on `supported: false` (an unsupported
+  // deployment shows no dot, not a stuck-on or stuck-off guess) and never
+  // from an invented "unread" count (no per-principal read cursor exists).
+  const notifications = useService((signal) => notificationsService.list(signal), [])
+  const hasNotifications =
+    notifications.status === "success" &&
+    notifications.data.supported &&
+    (notifications.data.openAlerts.length > 0 || notifications.data.pendingApprovals.length > 0)
 
   return (
     <header
@@ -82,6 +93,9 @@ export function AppNavbar() {
             render={
               <Link href="/alerts">
                 <Bell className="size-4" />
+                {hasNotifications ? (
+                  <span className="absolute right-2 top-2 size-1.5 rounded-full bg-primary ring-2 ring-background" />
+                ) : null}
               </Link>
             }
           />

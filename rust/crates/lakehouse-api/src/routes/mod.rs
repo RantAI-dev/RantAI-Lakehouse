@@ -19,6 +19,7 @@ mod governance;
 mod identity;
 mod knowledge;
 mod lakehouse;
+mod notifications;
 mod ops;
 mod overview;
 mod pipelines;
@@ -455,6 +456,10 @@ pub fn router(state: AppState) -> Router {
                 .delete(ai::sessions_delete),
         )
         .route("/api/ai/build-status", get(ai::build_status))
+        // WS5 item F1: navbar bell — real, honest open-alert/pending-approval
+        // lists (never a fabricated `unreadCount`, never a zero that reads
+        // as "genuinely nothing" without Postgres — see `routes::notifications`).
+        .route("/api/notifications", get(notifications::list))
         // Phase 2 identity domain.
         .merge(identity_router())
         // Phase 2, Task 2.7: connector definitions.

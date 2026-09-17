@@ -1319,6 +1319,26 @@ pub async fn count_pending_approvals(pool: &PgPool) -> Result<i64, StoreError> {
     Ok(n)
 }
 
+/// `GET /api/notifications` (WS5 item F1): every approval still awaiting a
+/// human decision, in full — the list-shaped sibling of
+/// [`count_pending_approvals`], which stays as its own fn for
+/// `overview.pendingApprovals`'s count-only need. Both read `approval_item`
+/// in a different projection for a different caller, matching the existing
+/// pattern where `overview.rs` and this module already read the same table
+/// two different ways.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn list_pending_approvals(pool: &PgPool) -> Result<Vec<ApprovalItem>, StoreError> {
+    let sql = format!(
+        "SELECT {APPROVAL_COLUMNS_QUALIFIED} {APPROVAL_AUDIT_JOIN} WHERE a.status = 'pending' \
+         ORDER BY a.requested_at DESC"
+    );
+    let rows: Vec<ApprovalRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    Ok(rows.into_iter().map(ApprovalItem::from).collect())
+}
+
 /// `overview.agents.activeRuns` (WS5 item B2): the count of `agent_run`
 /// rows currently executing (`status = 'running'`) -- a run that has
 /// finished (`succeeded`/`failed`) or is paused on a human decision

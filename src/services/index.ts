@@ -15,6 +15,7 @@ import { postgresAgentService } from "./clients/agents"
 import { clickhouseAlertRuleService } from "./clients/alerts"
 import { icebergLakehouseService } from "./clients/lakehouse"
 import { goldService as goldClientService } from "./clients/gold"
+import { notificationsService as notificationsClientService } from "./clients/notifications"
 
 // Overview is now fully real — summary/activity from ClickHouse+Dagster,
 // alerts (list/ack/resolve) from Postgres (Task 2.6). mock/overview.ts
@@ -63,3 +64,7 @@ export const lakehouseService = icebergLakehouseService
 // lakehouse-api's /api/gold/* routes. No mock ever existed for this
 // domain (ADR 0010 was Rust-only from the start).
 export const goldService = goldClientService
+// Navbar bell (WS5 item F1) — real open alerts + pending approvals from
+// Postgres, honest `supported: false` when no pool is configured. No mock
+// ever existed for this domain.
+export const notificationsService = notificationsClientService

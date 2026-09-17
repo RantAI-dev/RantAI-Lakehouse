@@ -74,15 +74,21 @@ async fn list_body(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, Lis
 }
 
 /// Build one `Dagster`-job row for `GET /api/pipelines`. `Dagster`'s job/run
-/// API carries no per-job lineage, no `SLA` definition (`WS5` adds
-/// `dataset_sla`), and no freshness measurement (`WS2` derives that from
-/// Iceberg snapshot timestamps) — `source`, `target`, `slaOk`, and
+/// API carries no per-job lineage and no freshness measurement (`WS2`
+/// derives that from Iceberg snapshot timestamps) — `source`, `target`, and
 /// `freshnessLagSeconds` are therefore reported as `null` rather than a
 /// stamped-on default that every job would share (`WS1` finding J16).
-/// `lastRunAt` is `null` when the job has never run instead of an empty
-/// string standing in for "never ran". `nextRunAt` (WS4 item G2) is
-/// computed server-side from the job's first schedule's cron expression;
-/// `null` for a manual job or an uncomputable cron — never a guess.
+/// `slaOk` stays `null` permanently, not "until `WS5`": `dataset_sla`
+/// (`WS5` item E1) is keyed by warehouse *table*, `slaOk` by `Dagster`
+/// *job* — a pipeline can write many tables, and a table can be written by
+/// many jobs, so no single `dataset_sla` row could honestly summarize a
+/// `slaOk` boolean for one job. `WS5` deliberately does not wire the two
+/// together (`docs/superpowers/plans/2026-09-11-ws5-platform-signals.md`,
+/// WS5 item E2 Step 1). `lastRunAt` is `null` when the job has never run
+/// instead of an empty string standing in for "never ran". `nextRunAt`
+/// (WS4 item G2) is computed server-side from the job's first schedule's
+/// cron expression; `null` for a manual job or an uncomputable cron —
+/// never a guess.
 fn dagster_pipeline_row(j: &DgJob, last: Option<&DgRun>) -> Value {
     json!({
         "id": j.name,
