@@ -261,22 +261,10 @@ pub struct CreatePipelineBody {
     source_zone: String,
     source_table: String,
     #[serde(default)]
-    #[allow(
-        dead_code,
-        reason = "accepted for contract compatibility, not yet stored"
-    )]
     incremental_column: Option<String>,
     #[serde(default)]
-    #[allow(
-        dead_code,
-        reason = "accepted for contract compatibility, not yet stored"
-    )]
     transforms: Vec<String>,
     #[serde(default)]
-    #[allow(
-        dead_code,
-        reason = "accepted for contract compatibility, not yet stored"
-    )]
     fbic_enabled: bool,
     target_zone: String,
     target_table: String,
@@ -287,19 +275,36 @@ pub struct CreatePipelineBody {
 
 /// `POST /api/pipelines` — author a new pipeline definition. Returns 201.
 ///
+/// Every entry of `body.transforms` is validated through
+/// `transform_grammar::parse_transform` BEFORE `pipelines::create_pipeline`
+/// is ever called (WS4 item D3) — an invalid transform is refused with 400
+/// and writes nothing to `pipeline_definition`, rather than being stored
+/// and only rejected at execution time.
+///
 /// # Errors
 ///
-/// 400 on a malformed body; 409 if the name is taken; 503/500 as above.
+/// 400 on a malformed body, or if any `transforms` entry does not parse
+/// against the grammar (the 400 names which entry by index, never the
+/// entry's own text — the untrusted payload itself is not echoed back);
+/// 409 if the name is taken; 503/500 as above.
 pub async fn create(
     State(state): State<AppState>,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<pipelines::Pipeline>)> {
     let body: CreatePipelineBody = parse_body(&body)?;
+    for (index, transform) in body.transforms.iter().enumerate() {
+        crate::transform_grammar::parse_transform(transform).map_err(|err| {
+            ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
+        })?;
+    }
     let input = CreatePipelineInput {
         name: body.name,
         kind: body.kind,
         source_zone: body.source_zone,
         source_table: body.source_table,
+        incremental_column: body.incremental_column,
+        transforms: body.transforms,
+        fbic_enabled: body.fbic_enabled,
         target_zone: body.target_zone,
         target_table: body.target_table,
         schedule: body.schedule,
@@ -387,6 +392,9 @@ pub async fn generate(
         kind: "incremental".to_owned(),
         source_zone: body.database.clone(),
         source_table: "source_table".to_owned(),
+        incremental_column: None,
+        transforms: Vec::new(),
+        fbic_enabled: false,
         target_zone: body.database,
         target_table: "target_table".to_owned(),
         schedule: "On demand".to_owned(),
@@ -837,5 +845,86 @@ mod tests {
         // `r.startTime && r.endTime` is falsy for exactly 0.
         assert_eq!(cost_units(Some(0.0), Some(10.0)), 0);
         assert_eq!(cost_units(Some(10.0), Some(0.0)), 0);
+    }
+
+    /// WS4 item D3 — `POST /api/pipelines` validates every `transforms`
+    /// entry through `transform_grammar::parse_transform` before writing
+    /// anything, exercised against a real Postgres so the "writes nothing"
+    /// half of the assertion is real, not just an in-memory claim.
+    mod create_route {
+        use lakehouse_test_support as _;
+
+        use crate::config::Config;
+        use crate::state::AppState;
+
+        use super::super::*;
+
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database")
+            )
+        }
+
+        fn state_for(pool: &sqlx::PgPool) -> AppState {
+            let mut env = std::collections::HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        /// A `POST /api/pipelines` body with an unparseable `transforms`
+        /// entry (`"filter(1=1; DROP TABLE x)"` — not `<ident> <op>
+        /// '<literal>'`) returns 400 naming WHICH entry failed (by index,
+        /// never the entry's own text — see [`create`]'s doc comment), and
+        /// writes NOTHING to `pipeline_definition`: a direct query for a
+        /// row with this name finds none.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_pipeline_rejects_an_unparseable_transform_with_400(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let name = format!("create-route-test-{}", uuid::Uuid::new_v4());
+            let body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "name": name,
+                    "kind": "batch",
+                    "sourceZone": "bronze",
+                    "sourceTable": "t",
+                    "transforms": ["filter(1=1; DROP TABLE x)"],
+                    "targetZone": "silver",
+                    "targetTable": "t",
+                    "schedule": "manual",
+                }))
+                .expect("serialize"),
+            );
+
+            let err = create(State(state), body).await.unwrap_err();
+            assert_eq!(err.0.status(), 400);
+            let message = err.0.to_string();
+            assert!(
+                message.contains("transforms[0]"),
+                "error must name which transform failed by index: {message:?}"
+            );
+            assert!(
+                !message.contains("DROP TABLE"),
+                "error must not echo the untrusted payload text: {message:?}"
+            );
+
+            let row: Option<(String,)> =
+                sqlx::query_as("SELECT id FROM pipeline_definition WHERE name = $1")
+                    .bind(&name)
+                    .fetch_optional(&pool)
+                    .await
+                    .expect("query should succeed");
+            assert!(
+                row.is_none(),
+                "an invalid transform must write nothing to pipeline_definition"
+            );
+        }
     }
 }

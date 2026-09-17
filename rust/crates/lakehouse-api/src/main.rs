@@ -25,6 +25,7 @@ mod policy;
 mod routes;
 mod state;
 mod tenant;
+mod transform_grammar;
 
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;

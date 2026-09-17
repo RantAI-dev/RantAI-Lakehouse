@@ -74,6 +74,30 @@ pub struct Pipeline {
     pub freshness_lag_seconds: Option<i32>,
 }
 
+/// The full stored shape of an authored pipeline's definition, returned by
+/// `GET /api/pipelines/{id}` as `definition` (Correction 5 in this task's
+/// plan doc — the grand plan named this type without defining it).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthoredDefinition {
+    /// Source zone (e.g. `"bronze"`).
+    pub source_zone: String,
+    /// Source table.
+    pub source_table: String,
+    /// Column an incremental read watermarks on, if any.
+    pub incremental_column: Option<String>,
+    /// Grammar-validated transform steps, in the order they run.
+    pub transforms: Vec<String>,
+    /// Whether file-based incremental capture is enabled.
+    pub fbic_enabled: bool,
+    /// Target zone.
+    pub target_zone: String,
+    /// Target table.
+    pub target_table: String,
+    /// Ingress connector id, if any.
+    pub connector_id: Option<String>,
+}
+
 #[derive(Debug, FromRow)]
 struct PipelineRow {
     id: String,
@@ -88,6 +112,19 @@ struct PipelineRow {
     target_asset_id: Option<String>,
     schedule: String,
     next_run_at: Option<OffsetDateTime>,
+}
+
+/// A row shape for [`get_definition`], carrying the three columns migration
+/// `0036` added (`incremental_column`/`fbic_enabled`/`transforms`) plus the
+/// `source`/`target` this function splits back into zone/table pairs.
+#[derive(Debug, FromRow)]
+struct DefinitionRow {
+    source: String,
+    target: String,
+    incremental_column: Option<String>,
+    transforms: serde_json::Value,
+    fbic_enabled: bool,
+    connector_id: Option<String>,
 }
 
 impl From<PipelineRow> for Pipeline {
@@ -147,6 +184,55 @@ pub async fn get_pipeline(pool: &PgPool, id: &str) -> Result<Option<Pipeline>, S
     Ok(row.map(Pipeline::from))
 }
 
+/// Fetch one authored pipeline's full stored definition (migration `0036`'s
+/// `incremental_column`/`fbic_enabled`/`transforms`, plus `source`/`target`
+/// split back into zone/table pairs) — the `definition` field `GET
+/// /api/pipelines/{id}` reports for a `pl-` id.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn get_definition(
+    pool: &PgPool,
+    id: &str,
+) -> Result<Option<AuthoredDefinition>, StoreError> {
+    let row: Option<DefinitionRow> = sqlx::query_as(
+        "SELECT source, target, incremental_column, transforms, fbic_enabled, connector_id \
+         FROM pipeline_definition WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| {
+        // Mirrors `create_pipeline`'s own `format!("{}.{}", zone, table)`
+        // construction — split back into the two halves it came from.
+        let (source_zone, source_table) = split_zone_table(&row.source);
+        let (target_zone, target_table) = split_zone_table(&row.target);
+        let transforms: Vec<String> = serde_json::from_value(row.transforms).unwrap_or_default();
+        AuthoredDefinition {
+            source_zone,
+            source_table,
+            incremental_column: row.incremental_column,
+            transforms,
+            fbic_enabled: row.fbic_enabled,
+            target_zone,
+            target_table,
+            connector_id: row.connector_id,
+        }
+    }))
+}
+
+/// Split a `"<zone>.<table>"` location on its first `.`, matching
+/// `create_pipeline`'s own construction. A location with no `.` (should
+/// never happen for a row this store wrote) falls back to an empty zone
+/// rather than panicking.
+fn split_zone_table(location: &str) -> (String, String) {
+    location.split_once('.').map_or_else(
+        || (String::new(), location.to_owned()),
+        |(zone, table)| (zone.to_owned(), table.to_owned()),
+    )
+}
+
 /// A slug-based id in the same shape `mock/pipelines.ts`'s `slugId` used
 /// (`"pl-<slug>-<base36 millis>"`), so ids created by this store don't
 /// collide with a Dagster job name (which is never prefixed `pl-`) or with
@@ -200,6 +286,15 @@ pub struct CreatePipelineInput {
     pub source_zone: String,
     /// Source table.
     pub source_table: String,
+    /// Column an incremental read watermarks on, if any (migration 0036).
+    pub incremental_column: Option<String>,
+    /// Grammar-validated transform steps, already checked by
+    /// `transform_grammar::parse_transform` at the route layer before this
+    /// function is ever called — this store function does not re-validate
+    /// them, it only persists the strings.
+    pub transforms: Vec<String>,
+    /// Whether file-based incremental capture is enabled (migration 0036).
+    pub fbic_enabled: bool,
     /// Target zone.
     pub target_zone: String,
     /// Target table.
@@ -231,10 +326,11 @@ pub async fn create_pipeline(
     // meaning yet (no writer ever updates them, see `Pipeline::from`'s doc
     // comment) — `true`/`0` are legacy placeholders satisfying the schema,
     // never surfaced to a caller.
+    let transforms = serde_json::to_value(&input.transforms).unwrap_or(serde_json::Value::Null);
     let sql = format!(
         "INSERT INTO pipeline_definition (id, name, kind, status, owner, source, target, \
-         schedule, sla_ok, freshness_lag_seconds) \
-         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, true, 0) \
+         schedule, sla_ok, freshness_lag_seconds, incremental_column, fbic_enabled, transforms) \
+         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, true, 0, $8, $9, $10) \
          RETURNING {PIPELINE_COLUMNS}"
     );
     let row: PipelineRow = sqlx::query_as(&sql)
@@ -245,6 +341,9 @@ pub async fn create_pipeline(
         .bind(&source)
         .bind(&target)
         .bind(&input.schedule)
+        .bind(&input.incremental_column)
+        .bind(input.fbic_enabled)
+        .bind(&transforms)
         .fetch_one(pool)
         .await?;
     Ok(row.into())

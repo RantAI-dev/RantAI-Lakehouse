@@ -96,6 +96,24 @@ impl Transform {
     /// through [`Ident`]'s or [`SqlLiteral`]'s own `Display`
     /// (identifier-safety / literal-escaping), never raw interpolation of
     /// caller text.
+    ///
+    /// Not called from Rust at runtime yet — it is the reference twin of
+    /// `dagster/dispar_orchestrate/authored_transforms.py::render_clickhouse`
+    /// (Phase E2), which is what actually renders a `Transform` into the
+    /// `ClickHouse` SQL `authored_factory.py`'s generated jobs execute.
+    /// `WS4` item D3/D4/G2/G3 (this commit) is the first task to add a
+    /// second `mod transform_grammar;` declaration for this file (in
+    /// `main.rs`, alongside `lib.rs`'s existing `pub mod`) so
+    /// `routes::pipelines::create`'s new `parse_transform` call compiles
+    /// for the `lakehouse-api` BINARY target, not only its library target
+    /// — that surfaces `clippy::dead_code` here for the first time: a
+    /// binary crate has no public-API boundary keeping an unused `pub fn`
+    /// alive the way the library target's `pub mod` already did.
+    #[allow(
+        dead_code,
+        reason = "reference twin of authored_transforms.py::render_clickhouse (Phase E2); \
+                  exercised by this file's own tests, not yet called from Rust at runtime"
+    )]
     #[must_use]
     pub fn render_clickhouse(&self) -> String {
         match self {
