@@ -355,6 +355,43 @@ pub enum RewriteError {
         /// The specific problem found in the filter text.
         reason: String,
     },
+    /// A table-function call (`FROM name(...)`) is not on the (empty)
+    /// table-function allowlist — see [`ALLOWED_TABLE_FUNCTIONS`].
+    #[error("table function `{name}` is not permitted in a governed query")]
+    TableFunctionDenied {
+        /// The called function's own name, as written in the query.
+        name: String,
+    },
+    /// A sensitive `system.*` table was read without `audit:read` — see
+    /// [`SENSITIVE_SYSTEM_TABLES`].
+    #[error("reading `{table}` requires the audit:read permission")]
+    SensitiveSystemTable {
+        /// The sensitive table's canonical `"schema.table"` name.
+        table: String,
+    },
+    /// A `dictGet*`/`joinGet*` family call was found while the calling
+    /// principal has ANY authored obligation anywhere — see
+    /// [`is_dict_or_join_function`]'s own doc comment for why the whole
+    /// family is refused rather than traced to a specific dictionary.
+    #[error("`{name}` is not permitted for a principal with any authored obligation")]
+    DictOrJoinFunctionDenied {
+        /// The called function's own name, as written in the query.
+        name: String,
+    },
+    /// A view whose own defining query reads a governed table was
+    /// found — refused rather than inlined or itself substituted (WS7
+    /// plan, Hard Requirement 4).
+    #[error("view `{view}` reads a governed table and cannot be rewritten safely")]
+    #[allow(
+        dead_code,
+        reason = "only a #[cfg(test)] constructor exists in this commit \
+                  (Task B5's classify_views tests); Task B6's enforce() is \
+                  the first production caller"
+    )]
+    ViewOverGovernedTable {
+        /// The view's own canonical `"schema.table"` name.
+        view: String,
+    },
 }
 
 /// Real column list + obligations for one governed table.
@@ -1526,6 +1563,655 @@ mod refuses_unparseable_shapes {
                 "label={label} sql={sql}"
             );
         }
+    }
+}
+
+/// Real `ClickHouse` system table names that can leak information about
+/// OTHER principals' activity (queries they ran, sessions, in-flight
+/// processes) — reading these requires `audit:read`, unlike an
+/// ordinary `system.*` catalog table (`system.columns`, `system.tables`)
+/// which stays open to any authenticated caller.
+const SENSITIVE_SYSTEM_TABLES: &[&str] = &[
+    "system.query_log",
+    "system.query_thread_log",
+    "system.processes",
+    "system.session_log",
+    "system.text_log",
+];
+
+/// `ClickHouse` table functions this module allows in a governed
+/// query — empty, deliberately. A table-function call reads data by a
+/// mechanism table substitution cannot see or govern (`merge()` reads
+/// by regex, `view()` embeds an arbitrary query, `url()`/`s3()`/
+/// `remote()`/`input()`/... read data this module never resolves to a
+/// canonical table name at all), so this is an ALLOWLIST that allows
+/// none, not a denylist of the ones a reviewer happened to think of —
+/// closing the whole class at once, including every name a future
+/// `ClickHouse` release adds (a denylist needs updating for a new name;
+/// an empty allowlist does not, by construction). See this module's
+/// test `refuses_every_real_table_function_the_allowlist_does_not_name`
+/// for the full, live-confirmed 88-name list this covers.
+const ALLOWED_TABLE_FUNCTIONS: &[&str] = &[];
+
+/// The `dictGet*`/`dictHas`/`dictIsIn`/`joinGet*` family, lower-cased.
+/// A dictionary or `Join`-engine table's SOURCE can be a governed
+/// table, but that source is never visible from the query text (it
+/// lives in a separate `CREATE DICTIONARY`/`Join`-engine definition
+/// this module has no introspection path for) — so this module cannot
+/// prove any single call is safe, and refuses the WHOLE FAMILY whenever
+/// the calling principal has ANY authored obligation anywhere (never
+/// attempting to trace whether THIS PARTICULAR dictionary happens to be
+/// backed by a governed table). A principal with no obligation anywhere
+/// is unaffected — see [`is_dict_or_join_function`].
+const DICT_JOIN_FUNCTIONS: &[&str] = &[
+    "dictget",
+    "dictgetall",
+    "dictgetchildren",
+    "dictgetdate",
+    "dictgetdateordefault",
+    "dictgetdatetime",
+    "dictgetdatetimeordefault",
+    "dictgetdescendants",
+    "dictgetfloat32",
+    "dictgetfloat32ordefault",
+    "dictgetfloat64",
+    "dictgetfloat64ordefault",
+    "dictgethierarchy",
+    "dictgetipv4",
+    "dictgetipv4ordefault",
+    "dictgetipv6",
+    "dictgetipv6ordefault",
+    "dictgetint16",
+    "dictgetint16ordefault",
+    "dictgetint32",
+    "dictgetint32ordefault",
+    "dictgetint64",
+    "dictgetint64ordefault",
+    "dictgetint8",
+    "dictgetint8ordefault",
+    "dictgetkeys",
+    "dictgetordefault",
+    "dictgetornull",
+    "dictgetroot",
+    "dictgetstring",
+    "dictgetstringordefault",
+    "dictgetuint16",
+    "dictgetuint16ordefault",
+    "dictgetuint32",
+    "dictgetuint32ordefault",
+    "dictgetuint64",
+    "dictgetuint64ordefault",
+    "dictgetuint8",
+    "dictgetuint8ordefault",
+    "dictgetuuid",
+    "dictgetuuidordefault",
+    "dicthas",
+    "dictisin",
+    "joinget",
+    "joingetornull",
+];
+
+/// Whether `name` (any case) is in the `dictGet*`/`joinGet*` family —
+/// the enumerated [`DICT_JOIN_FUNCTIONS`] list PLUS a `dictget`/
+/// `joinget` prefix backstop, so a real variant this module's own
+/// enumeration missed, or a future `ClickHouse` release's new
+/// `dictGetX`, is still caught.
+fn is_dict_or_join_function(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    DICT_JOIN_FUNCTIONS.contains(&lower.as_str())
+        || lower.starts_with("dictget")
+        || lower.starts_with("joinget")
+}
+
+fn canonical_object_name(name: &ObjectName) -> String {
+    let parts: Vec<String> = name
+        .0
+        .iter()
+        .filter_map(ObjectNamePart::as_ident)
+        .map(|ident| ident.value.to_ascii_lowercase())
+        .collect();
+    canonicalize(&parts)
+}
+
+/// Read-only classification pass, run via `sqlparser`'s own derived
+/// `Visit` traversal so every `TableFactor` and `Expr::Function`
+/// anywhere in the statement is reached — including inside an
+/// `EXPLAIN`'s wrapped statement (`Statement::Explain`'s own `Visit`
+/// impl recurses into its boxed inner `Statement`, so no separate
+/// unwrap step is needed here), a CTE body, or a subquery — without a
+/// hand-written match over every nesting shape.
+struct Classifier<'a> {
+    permissions: &'a [String],
+    has_any_obligation: bool,
+}
+
+impl Visitor for Classifier<'_> {
+    type Break = RewriteError;
+
+    fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<RewriteError> {
+        let TableFactor::Table { name, args, .. } = table_factor else {
+            return ControlFlow::Continue(());
+        };
+        if args.is_some() {
+            let called = name.to_string();
+            let lower = called.to_ascii_lowercase();
+            if !ALLOWED_TABLE_FUNCTIONS.contains(&lower.as_str()) {
+                return ControlFlow::Break(RewriteError::TableFunctionDenied { name: called });
+            }
+            return ControlFlow::Continue(());
+        }
+        let canonical = canonical_object_name(name);
+        if SENSITIVE_SYSTEM_TABLES.contains(&canonical.as_str())
+            && !self.permissions.iter().any(|p| p == "audit:read")
+        {
+            return ControlFlow::Break(RewriteError::SensitiveSystemTable { table: canonical });
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<RewriteError> {
+        if let Expr::Function(f) = expr {
+            let called = f.name.to_string();
+            if self.has_any_obligation && is_dict_or_join_function(&called) {
+                return ControlFlow::Break(RewriteError::DictOrJoinFunctionDenied { name: called });
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Classifies `sql` for a principal carrying `permissions`, refusing:
+/// a table-function call not on the (empty) [`ALLOWED_TABLE_FUNCTIONS`]
+/// allowlist; a [`SENSITIVE_SYSTEM_TABLES`] read without `audit:read`;
+/// and, when `has_any_obligation` is `true`, any `dictGet*`/`joinGet*`
+/// family call anywhere in the statement (see [`is_dict_or_join_function`]
+/// and [`DICT_JOIN_FUNCTIONS`]'s own doc comment for why the whole
+/// family, not just the tables this query's `FROM` names).
+///
+/// # Errors
+/// [`RewriteError::Unparseable`] if `sql` does not parse;
+/// [`RewriteError::TableFunctionDenied`], [`RewriteError::SensitiveSystemTable`],
+/// or [`RewriteError::DictOrJoinFunctionDenied`] per the rules above.
+pub fn classify_statement_for_principal(
+    sql: &str,
+    dialect: &dyn Dialect,
+    permissions: &[String],
+    has_any_obligation: bool,
+) -> Result<(), RewriteError> {
+    let statements = Parser::parse_sql(dialect, sql).map_err(|_| RewriteError::Unparseable)?;
+    let mut classifier = Classifier {
+        permissions,
+        has_any_obligation,
+    };
+    for stmt in &statements {
+        if let ControlFlow::Break(err) = stmt.visit(&mut classifier) {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// [`classify_statement_for_principal`] with no principal context — the
+/// correct default for a caller with no `permissions`/obligation
+/// information at all (`has_any_obligation: false` matches "a principal
+/// with no obligation anywhere is unaffected").
+///
+/// # Errors
+/// Same as [`classify_statement_for_principal`].
+#[allow(
+    dead_code,
+    reason = "no non-test caller exists yet in this commit (Task B5); \
+              a future no-principal-context caller (or a test using it \
+              directly) is the first production caller"
+)]
+pub fn classify_statement(sql: &str, dialect: &dyn Dialect) -> Result<(), RewriteError> {
+    classify_statement_for_principal(sql, dialect, &[], false)
+}
+
+/// Resolves a table's engine and (for a view) its defining SQL, so
+/// [`classify_views`] can tell a view reading a governed table from an
+/// ordinary one. The real implementation (Phase C) queries `SELECT
+/// engine, create_table_query FROM system.tables WHERE (database,
+/// name) = (...)`; `NoViews` (Task B6) implements this as "nothing is
+/// ever a view", for a caller with no catalog access at all.
+#[allow(
+    dead_code,
+    reason = "only a #[cfg(test)] implementor exists in this commit \
+              (Task B5's FakeSystemTablesCatalog); Task B6's NoViews and \
+              Phase C's real implementation are the first production callers"
+)]
+pub trait SystemTablesCatalog {
+    /// `(engine, create_table_query)` for `table` (canonical
+    /// `"schema.table"`), or `None` if the table is unknown to the
+    /// catalog.
+    fn engine_and_definition(&self, table: &str) -> Option<(String, Option<String>)>;
+}
+
+/// Refuses `sql` if it reads a view (`engine` `"View"` or
+/// `"MaterializedView"`) whose OWN defining query touches any table in
+/// `obligated_tables` — the view is never inlined or itself
+/// substituted (WS7 plan, Hard Requirement 4): a view definition is
+/// authored independently of this module's own obligations map, so
+/// this module cannot prove the view's own `SELECT` doesn't re-expose
+/// a masked column or bypass a row filter by construction; refusing the
+/// whole query is the only fail-closed option.
+///
+/// # Errors
+/// [`RewriteError::Unparseable`] if `sql` does not parse;
+/// [`RewriteError::ViewOverGovernedTable`] if such a view is read.
+#[allow(
+    clippy::implicit_hasher,
+    reason = "this crate never builds a HashSet<String> with a non-default \
+              hasher; see the matching allow on substitute_governed_tables"
+)]
+#[allow(
+    dead_code,
+    reason = "no non-test caller exists yet in this commit (Task B5); \
+              Task B6's enforce() is the first production caller"
+)]
+pub fn classify_views(
+    sql: &str,
+    dialect: &dyn Dialect,
+    catalog: &dyn SystemTablesCatalog,
+    obligated_tables: &HashSet<String>,
+) -> Result<(), RewriteError> {
+    let tables = referenced_tables(sql, dialect).ok_or(RewriteError::Unparseable)?;
+    for table in &tables {
+        let Some((engine, definition)) = catalog.engine_and_definition(table) else {
+            continue;
+        };
+        if engine != "View" && engine != "MaterializedView" {
+            continue;
+        }
+        let Some(def_sql) = definition else { continue };
+        let Some(def_tables) = referenced_tables(&def_sql, dialect) else {
+            continue;
+        };
+        if def_tables.iter().any(|t| obligated_tables.contains(t)) {
+            return Err(RewriteError::ViewOverGovernedTable {
+                view: table.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod refusals {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use sqlparser::dialect::ClickHouseDialect;
+
+    use super::{
+        RewriteError, SystemTablesCatalog, classify_statement, classify_statement_for_principal,
+        classify_views,
+    };
+
+    /// The full, real `ClickHouse` table-function name list — confirmed
+    /// live (`SELECT name FROM system.table_functions ORDER BY name`)
+    /// against a `ClickHouse` 26.7.3.19 instance, per the WS7 plan's own
+    /// Task B5 header. Every one of these must be refused since
+    /// [`super::ALLOWED_TABLE_FUNCTIONS`] is empty.
+    const ALL_TABLE_FUNCTIONS_CONFIRMED_LIVE: &[&str] = &[
+        "SQLStandardValues",
+        "arrowFlight",
+        "arrowflight",
+        "azureBlobStorage",
+        "azureBlobStorageCluster",
+        "cluster",
+        "clusterAllReplicas",
+        "cosn",
+        "deltaLake",
+        "deltaLakeAzure",
+        "deltaLakeAzureCluster",
+        "deltaLakeCluster",
+        "deltaLakeLocal",
+        "deltaLakeS3",
+        "deltaLakeS3Cluster",
+        "dictionary",
+        "eval",
+        "executable",
+        "file",
+        "fileCluster",
+        "filesystem",
+        "format",
+        "fuzzJSON",
+        "fuzzQuery",
+        "gcs",
+        "generateRandom",
+        "generateSeries",
+        "generate_series",
+        "hdfs",
+        "hdfsCluster",
+        "hive",
+        "hudi",
+        "hudiCluster",
+        "iceberg",
+        "icebergAzure",
+        "icebergAzureCluster",
+        "icebergCluster",
+        "icebergHDFS",
+        "icebergHDFSCluster",
+        "icebergLocal",
+        "icebergLocalCluster",
+        "icebergS3",
+        "icebergS3Cluster",
+        "input",
+        "jdbc",
+        "loop",
+        "merge",
+        "mergeTreeAnalyzeIndexes",
+        "mergeTreeAnalyzeIndexesUUID",
+        "mergeTreeIndex",
+        "mergeTreeProjection",
+        "mergeTreeTextIndex",
+        "mongodb",
+        "mysql",
+        "null",
+        "numbers",
+        "numbers_mt",
+        "odbc",
+        "oss",
+        "paimon",
+        "paimonAzure",
+        "paimonAzureCluster",
+        "paimonCluster",
+        "paimonHDFS",
+        "paimonHDFSCluster",
+        "paimonLocal",
+        "paimonS3",
+        "paimonS3Cluster",
+        "postgresql",
+        "primes",
+        "prometheusQuery",
+        "prometheusQueryRange",
+        "redis",
+        "remote",
+        "remoteSecure",
+        "s3",
+        "s3Cluster",
+        "sqlite",
+        "timeSeriesData",
+        "timeSeriesMetrics",
+        "timeSeriesSamples",
+        "timeSeriesSelector",
+        "timeSeriesTags",
+        "url",
+        "urlCluster",
+        "values",
+        "view",
+        "viewExplain",
+        "viewIfPermitted",
+        "ytsaurus",
+        "zeros",
+        "zeros_mt",
+    ];
+
+    /// The full, real `dictGet*`/`dictHas`/`dictIsIn`/`joinGet*` family
+    /// — confirmed live against the same instance, per the WS7 plan's
+    /// Task B5 header.
+    const DICT_JOIN_FUNCTIONS_CONFIRMED_LIVE: &[&str] = &[
+        "dictGet",
+        "dictGetAll",
+        "dictGetChildren",
+        "dictGetDate",
+        "dictGetDateOrDefault",
+        "dictGetDateTime",
+        "dictGetDateTimeOrDefault",
+        "dictGetDescendants",
+        "dictGetFloat32",
+        "dictGetFloat32OrDefault",
+        "dictGetFloat64",
+        "dictGetFloat64OrDefault",
+        "dictGetHierarchy",
+        "dictGetIPv4",
+        "dictGetIPv4OrDefault",
+        "dictGetIPv6",
+        "dictGetIPv6OrDefault",
+        "dictGetInt16",
+        "dictGetInt16OrDefault",
+        "dictGetInt32",
+        "dictGetInt32OrDefault",
+        "dictGetInt64",
+        "dictGetInt64OrDefault",
+        "dictGetInt8",
+        "dictGetInt8OrDefault",
+        "dictGetKeys",
+        "dictGetOrDefault",
+        "dictGetOrNull",
+        "dictGetRoot",
+        "dictGetString",
+        "dictGetStringOrDefault",
+        "dictGetUInt16",
+        "dictGetUInt16OrDefault",
+        "dictGetUInt32",
+        "dictGetUInt32OrDefault",
+        "dictGetUInt64",
+        "dictGetUInt64OrDefault",
+        "dictGetUInt8",
+        "dictGetUInt8OrDefault",
+        "dictGetUUID",
+        "dictGetUUIDOrDefault",
+        "dictHas",
+        "dictIsIn",
+        "joinGet",
+        "joinGetOrNull",
+    ];
+
+    #[test]
+    fn refuses_every_real_table_function_the_allowlist_does_not_name() {
+        for name in ALL_TABLE_FUNCTIONS_CONFIRMED_LIVE {
+            let sql = format!("SELECT * FROM {name}('arg1', 'arg2')");
+            let err = classify_statement(&sql, &ClickHouseDialect {}).unwrap_err();
+            assert!(
+                matches!(err, RewriteError::TableFunctionDenied { .. }),
+                "name={name}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_merge_which_reads_tables_by_regex() {
+        let err = classify_statement(
+            "SELECT * FROM merge('silver', '^customers')",
+            &ClickHouseDialect {},
+        )
+        .unwrap_err();
+        assert!(matches!(err, RewriteError::TableFunctionDenied { .. }));
+    }
+
+    #[test]
+    fn refuses_view_which_embeds_an_arbitrary_query_as_a_table() {
+        // sqlparser 0.62.0 does not parse a bare (unparenthesized)
+        // SELECT as a table-function argument at all (verified: this
+        // exact string fails with "Expected: ), found: email") -- a
+        // plan-stale detail (the plan's own illustrative test expected
+        // TableFunctionDenied), but the outcome Hard Requirement 2
+        // actually cares about -- refused, never silently passed
+        // through -- holds regardless of which error variant it is.
+        let err = classify_statement(
+            "SELECT * FROM view(SELECT email FROM silver.customers)",
+            &ClickHouseDialect {},
+        )
+        .unwrap_err();
+        assert!(matches!(err, RewriteError::Unparseable));
+    }
+
+    #[test]
+    fn refuses_executable_which_runs_a_script() {
+        let err = classify_statement(
+            "SELECT * FROM executable('script.py', 'CSV', 'x Int32')",
+            &ClickHouseDialect {},
+        )
+        .unwrap_err();
+        assert!(matches!(err, RewriteError::TableFunctionDenied { .. }));
+    }
+
+    #[test]
+    fn refuses_input_which_was_on_neither_the_old_denylist_nor_commonly_discussed() {
+        let err = classify_statement("SELECT * FROM input('x Int32')", &ClickHouseDialect {})
+            .unwrap_err();
+        assert!(matches!(err, RewriteError::TableFunctionDenied { .. }));
+    }
+
+    #[test]
+    fn refuses_query_log_without_audit_read() {
+        let err = classify_statement_for_principal(
+            "SELECT query FROM system.query_log",
+            &ClickHouseDialect {},
+            &["catalog:read".to_owned()],
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RewriteError::SensitiveSystemTable { .. }));
+    }
+
+    #[test]
+    fn allows_query_log_with_audit_read() {
+        assert!(
+            classify_statement_for_principal(
+                "SELECT query FROM system.query_log",
+                &ClickHouseDialect {},
+                &["audit:read".to_owned()],
+                false,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn allows_ordinary_system_columns_without_audit_read() {
+        assert!(
+            classify_statement_for_principal(
+                "SELECT name FROM system.columns",
+                &ClickHouseDialect {},
+                &[],
+                false
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn explain_unwraps_to_the_inner_statement_for_classification() {
+        let err = classify_statement(
+            "EXPLAIN SELECT * FROM remote('h', 'db', 't')",
+            &ClickHouseDialect {},
+        )
+        .unwrap_err();
+        assert!(matches!(err, RewriteError::TableFunctionDenied { .. }));
+    }
+
+    #[test]
+    fn refuses_dict_get_in_a_projection_when_the_principal_has_any_obligation() {
+        let sql = "SELECT dictGet('db.users_dict', 'email', toUInt64(1)) AS e";
+        let err =
+            classify_statement_for_principal(sql, &ClickHouseDialect {}, &[], true).unwrap_err();
+        assert!(matches!(err, RewriteError::DictOrJoinFunctionDenied { .. }));
+    }
+
+    #[test]
+    fn allows_dict_get_when_the_principal_has_no_obligation_anywhere() {
+        let sql = "SELECT dictGet('db.public_dict', 'label', toUInt64(1)) AS e";
+        assert!(classify_statement_for_principal(sql, &ClickHouseDialect {}, &[], false).is_ok());
+    }
+
+    #[test]
+    fn refuses_every_dict_get_variant_and_dict_has_dict_is_in_when_the_principal_has_any_obligation()
+     {
+        for fname in DICT_JOIN_FUNCTIONS_CONFIRMED_LIVE {
+            let sql = format!("SELECT {fname}('db.d', 'k', toUInt64(1))");
+            let err = classify_statement_for_principal(&sql, &ClickHouseDialect {}, &[], true)
+                .unwrap_err();
+            assert!(
+                matches!(err, RewriteError::DictOrJoinFunctionDenied { .. }),
+                "fname={fname}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_a_dict_get_prefixed_name_not_individually_enumerated() {
+        let err = classify_statement_for_principal(
+            "SELECT dictGetSomeFutureVariant('db.d', 'k', 1)",
+            &ClickHouseDialect {},
+            &[],
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RewriteError::DictOrJoinFunctionDenied { .. }));
+    }
+
+    #[test]
+    fn refuses_join_get_when_the_principal_has_any_obligation() {
+        let err = classify_statement_for_principal(
+            "SELECT joinGet('db.join_table', 'email', 1)",
+            &ClickHouseDialect {},
+            &[],
+            true,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RewriteError::DictOrJoinFunctionDenied { .. }));
+    }
+
+    struct FakeSystemTablesCatalog {
+        views: HashMap<String, String>,
+    }
+
+    impl FakeSystemTablesCatalog {
+        fn new() -> Self {
+            Self {
+                views: HashMap::new(),
+            }
+        }
+
+        fn with_view(mut self, name: &str, definition: &str) -> Self {
+            self.views.insert(name.to_owned(), definition.to_owned());
+            self
+        }
+    }
+
+    impl SystemTablesCatalog for FakeSystemTablesCatalog {
+        fn engine_and_definition(&self, table: &str) -> Option<(String, Option<String>)> {
+            self.views
+                .get(table)
+                .map(|def| ("View".to_owned(), Some(def.clone())))
+        }
+    }
+
+    #[test]
+    fn refuses_a_view_whose_definition_reads_a_governed_table() {
+        let catalog = FakeSystemTablesCatalog::new().with_view(
+            "serving.v_customers",
+            "SELECT id, email FROM silver.customers",
+        );
+        let obligated = std::collections::HashSet::from(["silver.customers".to_owned()]);
+        let err = classify_views(
+            "SELECT * FROM serving.v_customers",
+            &ClickHouseDialect {},
+            &catalog,
+            &obligated,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RewriteError::ViewOverGovernedTable { .. }));
+    }
+
+    #[test]
+    fn allows_a_view_whose_definition_reads_no_governed_table() {
+        let catalog = FakeSystemTablesCatalog::new()
+            .with_view("serving.v_public", "SELECT id FROM silver.orders_enriched");
+        let obligated = std::collections::HashSet::from(["silver.customers".to_owned()]);
+        assert!(
+            classify_views(
+                "SELECT * FROM serving.v_public",
+                &ClickHouseDialect {},
+                &catalog,
+                &obligated,
+            )
+            .is_ok()
+        );
     }
 }
 
