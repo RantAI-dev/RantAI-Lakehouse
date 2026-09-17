@@ -218,6 +218,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    identity principal when `GOLD_EXPORT_RUN_TOKEN` is unset). ──────
     ("GET",  "/api/gold/export/{mart}",  Policy::RequiresAuth),
     ("POST", "/api/gold/export/{mart}",  Policy::RequiresAuth),
+    // History (WS6 item 3): same RequiresAuth floor as export/read-back —
+    // row counts and run timing, not public data.
+    ("GET",  "/api/gold/exports",        Policy::RequiresAuth),
 
     // ── Query: seeded Analyst permission `query:read`. ───────────────────
     ("POST", "/api/query/run",            Policy::RequiresPermission("query:read")),

@@ -16,6 +16,7 @@ mod connector_discover;
 mod connector_probe;
 mod error;
 mod gold_export;
+mod gold_export_history;
 mod gold_lock;
 mod json;
 mod lakehouse_catalog;

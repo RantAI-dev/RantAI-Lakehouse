@@ -61,6 +61,7 @@ use serde_json::{Value, json};
 
 use crate::error::ApiResult;
 use crate::gold_export::{self, GoldExportError};
+use crate::gold_export_history;
 use crate::json::ApiJson;
 use crate::state::AppState;
 
@@ -244,7 +245,8 @@ pub async fn export(
         Some(token),
     );
 
-    let result = gold_export::export_mart(
+    let started_at = time::OffsetDateTime::now_utc();
+    let export_result = gold_export::export_mart(
         &state.clickhouse,
         &iceberg_config,
         &source_table,
@@ -252,8 +254,46 @@ pub async fn export(
         state.config.gold_export_max_rows,
         state.config.gold_export_batch_size,
     )
-    .await
-    .map_err(ApiError::from)?;
+    .await;
+    let finished_at = time::OffsetDateTime::now_utc();
+
+    let triggered_by = principal.as_ref().map_or_else(
+        || "unknown".to_owned(),
+        |Extension(p)| match p.id {
+            PrincipalId::Service(_) => format!("service:{}", p.display_name),
+            PrincipalId::User(_) => format!("user:{}", p.display_name),
+        },
+    );
+    let error_message = export_result.as_ref().err().map(ToString::to_string);
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "rows_exported is a usize from an in-memory Vec of one ClickHouse batch, \
+                  never near u64::MAX"
+    )]
+    let history_row = gold_export_history::NewGoldExportRun {
+        mart: mart_ident.as_str(),
+        status: if export_result.is_ok() {
+            "success"
+        } else {
+            "failed"
+        },
+        rows_exported: export_result.as_ref().ok().map(|r| r.rows_exported as u64),
+        format_version: export_result.as_ref().ok().map(|r| r.format_version),
+        snapshot_id: export_result.as_ref().ok().and_then(|r| r.snapshot_id),
+        error: error_message.as_deref(),
+        triggered_by: &triggered_by,
+        started_at_ms: started_at.unix_timestamp() * 1000,
+        finished_at_ms: finished_at.unix_timestamp() * 1000,
+    };
+    // Best-effort: a history-write failure must never turn an otherwise
+    // successful (or already-failed-for-a-different-reason) export into a
+    // 500 — see gold_export_history::record_export_run's doc comment.
+    if let Err(err) = gold_export_history::record_export_run(&state.clickhouse, &history_row).await
+    {
+        tracing::error!(%err, mart = mart_ident.as_str(), "failed to record gold export history");
+    }
+
+    let result = export_result.map_err(ApiError::from)?;
 
     Ok(ApiJson(json!({
         "namespace": result.namespace,
@@ -327,6 +367,51 @@ pub async fn read_back(
         "snapshotId": readback.snapshot_id,
         "exportedAt": readback.exported_at_ms.and_then(millis_to_rfc3339),
     })))
+}
+
+/// Query parameters for `GET /api/gold/exports`.
+#[derive(Debug, Deserialize)]
+pub struct ExportsQuery {
+    mart: String,
+    /// Same shared-token/permission gate as `export`/`read_back` — see
+    /// [`check_export_token`].
+    token: Option<String>,
+}
+
+/// `GET /api/gold/exports?mart=` — the most recent export attempts for one
+/// mart, newest first, from `console.gold_export_run`
+/// (`gold_export_history`). Same auth posture as `read_back`: it reveals
+/// row counts and timing, not public data.
+///
+/// # Errors
+///
+/// Returns 400 if `mart` is missing/blank or not a valid identifier,
+/// 401/503 from [`check_export_token`], or 500 if the `ClickHouse` query
+/// fails.
+pub async fn exports(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ExportsQuery>,
+    principal: Option<Extension<Principal>>,
+) -> ApiResult<ApiJson<Value>> {
+    let header_token = headers.get("x-run-token").and_then(|v| v.to_str().ok());
+    check_export_token(
+        state.config.gold_export_run_token.as_deref(),
+        header_token,
+        query.token.as_deref(),
+        principal.as_ref().map(|Extension(p)| p),
+    )?;
+
+    let mart_ident = Ident::new(query.mart.trim())
+        .map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+
+    let runs = gold_export_history::list_export_runs(&state.clickhouse, mart_ident.as_str(), 50)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(ApiJson(
+        json!({ "mart": mart_ident.as_str(), "runs": runs }),
+    ))
 }
 
 #[cfg(test)]
