@@ -17,7 +17,6 @@ use axum::response::{IntoResponse, Response};
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ident::SqlLiteral;
 use serde_json::{Map, Value, json};
-use time::OffsetDateTime;
 
 use crate::health;
 use crate::json::ApiJson;
@@ -151,12 +150,21 @@ async fn observability(ch: &ChClient) -> Result<Value, OpsError> {
 /// (or is absent, e.g. in a test fixture) reports `startedAt: null` rather
 /// than falling back to the request's own clock — that fallback was the
 /// fabrication this replaces.
-fn workload_row(index: usize, p: &Map<String, Value>) -> Value {
-    let elapsed_secs = str_col(p, "elapsed").parse::<f64>().unwrap_or(0.0);
-    let started_at = str_col(p, "started_ms")
+/// Shared by [`workload_row`] and [`cancel_workload_body`] (WS5 item A5): a
+/// `started_ms` column from `system.processes` (see [`workload_row`]'s doc
+/// comment for why this comes from `ClickHouse`'s own clock, not this
+/// process's) is parsed into an ISO 8601 string, or `None` if it's
+/// absent/unparseable — never a fallback to this process's own clock.
+fn started_at_from_ms_column(p: &Map<String, Value>) -> Option<String> {
+    str_col(p, "started_ms")
         .parse::<f64>()
         .ok()
-        .map(|ms| lakehouse_dagster::iso_from_unix_seconds(ms / 1000.0));
+        .map(|ms| lakehouse_dagster::iso_from_unix_seconds(ms / 1000.0))
+}
+
+fn workload_row(index: usize, p: &Map<String, Value>) -> Value {
+    let elapsed_secs = str_col(p, "elapsed").parse::<f64>().unwrap_or(0.0);
+    let started_at = started_at_from_ms_column(p);
     json!({
         "id": format!("w-{index}"),
         "principal": str_col(p, "user"),
@@ -249,18 +257,6 @@ fn elapsed_ms(elapsed_secs: f64) -> i64 {
     (elapsed_secs * 1000.0).round() as i64
 }
 
-/// `new Date().toISOString()`. Still used by [`cancel_workload_body`] for
-/// the cancelled-workload response; `workloads` no longer uses it (its
-/// `startedAt` is now derived from the same `ClickHouse` query as
-/// `elapsed`, not this process's clock) — see `workload_row`.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "second-precision input to a millisecond-precision formatter"
-)]
-fn now_iso() -> String {
-    lakehouse_dagster::iso_from_unix_seconds(OffsetDateTime::now_utc().unix_timestamp() as f64)
-}
-
 // ── cancelWorkload (Task 2.6) ───────────────────────────────────────────
 //
 // `GET /api/ops/workloads` (above) mints purely positional ids ("w-0",
@@ -317,7 +313,8 @@ async fn cancel_workload_body(ch: &ChClient, id: &str) -> Result<Option<Value>, 
     };
     let procs = ch
         .rows(
-            "SELECT query_id, user, toString(elapsed) elapsed, substring(query,1,80) query
+            "SELECT query_id, user, toString(elapsed) elapsed, substring(query,1,80) query,
+                  toString(toUnixTimestamp64Milli(now64(3)) - toInt64(elapsed * 1000)) started_ms
              FROM system.processes WHERE query NOT LIKE '%system.processes%' LIMIT 50",
             None,
         )
@@ -340,7 +337,13 @@ async fn cancel_workload_body(ch: &ChClient, id: &str) -> Result<Option<Value>, 
         "status": "cancelled",
         "elapsedMs": elapsed_ms(elapsed_secs),
         "estimatedCost": 1,
-        "startedAt": now_iso(),
+        // J14 / WS5 plan review Y5: derived from the same
+        // `started_ms` column (ClickHouse's own clock, computed in the
+        // same query as `elapsed`) `workload_row` already uses — never
+        // this process's own clock (`now_iso()`, the fabrication this
+        // replaces). `None` (never a fallback to "now") when the row
+        // exists but `started_ms` didn't parse.
+        "startedAt": started_at_from_ms_column(row),
     })))
 }
 
@@ -514,11 +517,36 @@ mod tests {
         );
     }
 
+    /// WS5 item A5 (J14 / plan review Y5) — `cancel_workload_body`'s
+    /// `startedAt` is now derived from the same `started_ms` column
+    /// `workload_row` already uses, via the shared
+    /// `started_at_from_ms_column` helper. This test exercises the helper
+    /// directly on a fixture row (never a live/mocked `ClickHouse` call —
+    /// see the CRITICAL SAFETY note below).
     #[test]
-    fn now_iso_looks_like_an_iso_timestamp() {
-        let s = now_iso();
-        assert!(s.ends_with('Z'));
-        assert_eq!(s.len(), "2026-08-27T04:00:10.075Z".len());
+    fn started_at_from_ms_column_is_derived_from_the_shared_clock_column() {
+        let mut row = Map::new();
+        row.insert(
+            "started_ms".to_owned(),
+            Value::String("1787803210075".to_owned()),
+        );
+        assert_eq!(
+            started_at_from_ms_column(&row).as_deref(),
+            Some("2026-08-27T04:00:10.075Z")
+        );
+    }
+
+    #[test]
+    fn started_at_from_ms_column_is_none_when_absent_or_unparseable() {
+        // Never a fallback to the request's own clock — this is the exact
+        // fabrication J14 found in `cancel_workload_body`'s old
+        // `"startedAt": now_iso()`.
+        let empty = Map::new();
+        assert_eq!(started_at_from_ms_column(&empty), None);
+
+        let mut bad = Map::new();
+        bad.insert("started_ms".to_owned(), Value::String(String::new()));
+        assert_eq!(started_at_from_ms_column(&bad), None);
     }
 
     // ── cancelWorkload (Task 2.6) ────────────────────────────────────────
