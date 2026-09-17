@@ -52,6 +52,274 @@ pub(crate) const REFUSED_UNPARSEABLE: &[(&str, &str)] = &[(
     "WITH 2024 AS target_year SELECT * FROM silver.customers WHERE tahun = target_year",
 )];
 
+use std::collections::HashSet;
+use std::convert::Infallible;
+use std::ops::ControlFlow;
+
+use sqlparser::ast::{Query, TableFactor, Visit, Visitor};
+use sqlparser::dialect::Dialect;
+use sqlparser::parser::Parser;
+
+/// Collects every [`Query`] node anywhere in a visited AST — the
+/// top-level query itself, each CTE's own body, every subquery no
+/// matter how deeply nested (a `FROM`, a `WHERE`/`HAVING` predicate, a
+/// `SELECT`-list expression, a function argument, a `UNION` branch, a
+/// derived table) — via `sqlparser`'s own derived `Visit` traversal
+/// (the `visitor` Cargo feature enabled in this crate's `Cargo.toml`),
+/// never a hand-written recursive match over every `Expr` variant that
+/// could silently miss one. [`referenced_tables`] and
+/// [`substitute_governed_tables`] (Task B3) both start from this same
+/// flattening, so neither can miss a table hiding inside an expression
+/// position the other author did not think to hand-enumerate.
+struct QueryCollector {
+    found: Vec<Query>,
+}
+
+impl Visitor for QueryCollector {
+    type Break = Infallible;
+
+    fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Infallible> {
+        self.found.push(query.clone());
+        ControlFlow::Continue(())
+    }
+}
+
+/// Every [`Query`] node reachable from `stmt`, flattened — see
+/// [`QueryCollector`].
+fn all_queries(stmt: &sqlparser::ast::Statement) -> Vec<Query> {
+    let mut collector = QueryCollector { found: Vec::new() };
+    let _: ControlFlow<Infallible> = stmt.visit(&mut collector);
+    collector.found
+}
+
+/// Every real table (never a CTE alias) referenced anywhere in `sql`,
+/// canonicalized to `"schema.table"` — see [`canonicalize`]. `None`
+/// means `sql` did not parse under `dialect` at all; the caller treats
+/// that as "cannot prove this query touches no governed table" and
+/// refuses per the fail-closed rule (WS7 plan, Hard Requirement 2).
+/// Read-only: used to decide WHICH tables need substitution before
+/// [`substitute_governed_tables`]'s mutating pass runs (Task B3), and
+/// (unlike that pass) collapses a self-join's two occurrences of the
+/// same table into one name — a call site that needs every AST
+/// POSITION, not just every distinct name, uses Task B3's
+/// `substitute_governed_tables` directly.
+///
+/// A bare, unqualified table name is excluded here whenever it matches
+/// a CTE alias declared ANYWHERE in `sql` (not lexically scoped to the
+/// exact position) — safe because every table this module's caller
+/// ever governs is authored fully qualified (`policy_engine::
+/// PolicyCondition::table`, e.g. `"serving.mart_x"`), so a bare 1-part
+/// name can never collide with a governed table's canonical key
+/// regardless of CTE scoping precision; excluding it too eagerly only
+/// ever affects this function's own "is this a CTE" cosmetics, never
+/// which tables get substituted.
+#[allow(
+    dead_code,
+    reason = "no non-test caller exists yet in this commit (Task B2); \
+              Task B6's enforce() is the first production caller"
+)]
+pub fn referenced_tables(sql: &str, dialect: &dyn Dialect) -> Option<Vec<String>> {
+    let statements = Parser::parse_sql(dialect, sql).ok()?;
+    let mut queries = Vec::new();
+    for stmt in &statements {
+        queries.extend(all_queries(stmt));
+    }
+    let ctes: HashSet<String> = queries
+        .iter()
+        .flat_map(|q| q.with.iter())
+        .flat_map(|with| with.cte_tables.iter())
+        .map(|cte| cte.alias.name.value.to_ascii_lowercase())
+        .collect();
+    let mut out = HashSet::new();
+    for query in &queries {
+        for twj in top_level_table_with_joins(query) {
+            collect_table_factor_name(&twj.relation, &ctes, &mut out);
+            for join in &twj.joins {
+                collect_table_factor_name(&join.relation, &ctes, &mut out);
+            }
+        }
+    }
+    Some(out.into_iter().collect())
+}
+
+/// `query.body`'s own top-level `FROM` clause, unwrapping a
+/// parenthesized `SetExpr::Query` (`(SELECT ... )` around a whole
+/// query body, distinct from a derived-table subquery — both cases are
+/// already separately present in [`all_queries`]'s flat list) and a
+/// `SetExpr::SetOperation` (`UNION`/`EXCEPT`/`INTERSECT`)'s two sides,
+/// so a `UNION` branch's own `FROM` is reached even though it has no
+/// separate [`Query`] node of its own (a `SetExpr::SetOperation` side
+/// is a `SetExpr`, not a boxed `Query`).
+fn top_level_table_with_joins(query: &Query) -> Vec<&sqlparser::ast::TableWithJoins> {
+    fn from_set_expr(expr: &sqlparser::ast::SetExpr) -> Vec<&sqlparser::ast::TableWithJoins> {
+        match expr {
+            sqlparser::ast::SetExpr::Select(select) => select.from.iter().collect(),
+            sqlparser::ast::SetExpr::SetOperation { left, right, .. } => {
+                let mut out = from_set_expr(left);
+                out.extend(from_set_expr(right));
+                out
+            }
+            // SetExpr::Query is a parenthesized query body; its own
+            // Query node is separately present in `all_queries`'s flat
+            // list (pre_visit_query fires for it too), so it is not
+            // walked again here.
+            _ => Vec::new(),
+        }
+    }
+    from_set_expr(&query.body)
+}
+
+/// Records `factor`'s own canonical table name into `out`, when it is
+/// an ordinary `TableFactor::Table` naming a real table (not a
+/// table-function call — `args.is_some()` — which Task B5 classifies
+/// and refuses separately, and not a bare name matching a CTE alias).
+/// Does NOT recurse into `TableFactor::Derived`'s subquery or
+/// `TableFactor::NestedJoin`'s inner joins beyond one level of
+/// unwrapping — both are reachable through [`all_queries`]/this same
+/// function being called again for the nested/derived query's own
+/// top-level `FROM`, so a second, deeper recursion here would only
+/// duplicate (harmlessly, into the same `HashSet`) work already done.
+fn collect_table_factor_name(
+    factor: &TableFactor,
+    ctes: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    match factor {
+        TableFactor::Table { name, args, .. } => {
+            if args.is_some() {
+                return;
+            }
+            let parts: Vec<String> = name
+                .0
+                .iter()
+                .filter_map(sqlparser::ast::ObjectNamePart::as_ident)
+                .map(|ident| ident.value.to_ascii_lowercase())
+                .collect();
+            if parts.len() == 1 && ctes.contains(&parts[0]) {
+                return; // a CTE reference, not a real table
+            }
+            out.insert(canonicalize(&parts));
+        }
+        TableFactor::NestedJoin {
+            table_with_joins, ..
+        } => {
+            collect_table_factor_name(&table_with_joins.relation, ctes, out);
+            for join in &table_with_joins.joins {
+                collect_table_factor_name(&join.relation, ctes, out);
+            }
+        }
+        // TableFactor::Derived's own subquery is a Query node already
+        // present in `all_queries`'s flat list — its tables are found
+        // when `referenced_tables` processes THAT entry, not here.
+        _ => {}
+    }
+}
+
+/// `"schema.table"`, dropping a leading catalog part when three parts
+/// are given (`lake.serving.mart_x` / Trino's `iceberg.serving.mart_x`
+/// both canonicalize to `serving.mart_x`) and leaving a bare one-part
+/// name as-is.
+fn canonicalize(parts: &[String]) -> String {
+    match parts.len() {
+        0 => String::new(),
+        1 => parts[0].clone(),
+        2 => parts.join("."),
+        _ => parts[parts.len() - 2..].join("."),
+    }
+}
+
+#[cfg(test)]
+mod table_resolution {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use sqlparser::dialect::ClickHouseDialect;
+
+    use super::referenced_tables;
+
+    #[test]
+    fn finds_a_plain_table() {
+        let tables =
+            referenced_tables("SELECT * FROM serving.mart_x", &ClickHouseDialect {}).unwrap();
+        assert_eq!(tables, vec!["serving.mart_x".to_owned()]);
+    }
+
+    #[test]
+    fn normalizes_backtick_and_catalog_qualification_to_the_same_canonical_name() {
+        for sql in [
+            "SELECT * FROM serving.mart_x",
+            "SELECT * FROM `serving`.`mart_x`",
+            "SELECT * FROM lake.serving.mart_x", // 3-part ClickHouse-style
+            "SELECT * FROM iceberg.serving.mart_x", // Trino catalog-qualified
+        ] {
+            let tables = referenced_tables(sql, &ClickHouseDialect {}).unwrap();
+            assert!(
+                tables.contains(&"serving.mart_x".to_owned()),
+                "sql={sql} tables={tables:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn finds_tables_inside_a_cte_and_does_not_treat_the_cte_name_as_a_real_table() {
+        let sql = "WITH recent AS (SELECT id FROM silver.orders_enriched) SELECT * FROM recent";
+        let tables = referenced_tables(sql, &ClickHouseDialect {}).unwrap();
+        assert_eq!(tables, vec!["silver.orders_enriched".to_owned()]);
+    }
+
+    #[test]
+    fn finds_tables_inside_from_where_and_select_subqueries() {
+        let sql = "SELECT (SELECT max(id) FROM silver.a) AS m FROM silver.b \
+                   WHERE id IN (SELECT id FROM silver.c)";
+        let mut tables = referenced_tables(sql, &ClickHouseDialect {}).unwrap();
+        tables.sort();
+        assert_eq!(
+            tables,
+            vec![
+                "silver.a".to_owned(),
+                "silver.b".to_owned(),
+                "silver.c".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn finds_tables_on_both_sides_of_a_union() {
+        let sql = "SELECT id FROM silver.a UNION ALL SELECT id FROM silver.b";
+        let mut tables = referenced_tables(sql, &ClickHouseDialect {}).unwrap();
+        tables.sort();
+        assert_eq!(tables, vec!["silver.a".to_owned(), "silver.b".to_owned()]);
+    }
+
+    #[test]
+    fn finds_every_joined_table_including_a_self_join_twice() {
+        let sql =
+            "SELECT * FROM silver.a JOIN silver.b ON a.id = b.id LEFT JOIN silver.c ON a.id = c.id";
+        let mut tables = referenced_tables(sql, &ClickHouseDialect {}).unwrap();
+        tables.sort();
+        assert_eq!(
+            tables,
+            vec![
+                "silver.a".to_owned(),
+                "silver.b".to_owned(),
+                "silver.c".to_owned()
+            ]
+        );
+
+        // A self-join names the SAME canonical table twice, at two
+        // distinct AST positions — referenced_tables (a set) collapses
+        // that to one canonical name, but Task B3's MUTATING walk
+        // (unlike this read-only one) visits and substitutes both
+        // TableFactor nodes independently, proven by its own
+        // `self_join` test, not this one.
+        let self_join =
+            "SELECT a.id FROM silver.customers a JOIN silver.customers b ON a.email = b.email";
+        assert_eq!(
+            referenced_tables(self_join, &ClickHouseDialect {}).unwrap(),
+            vec!["silver.customers".to_owned()]
+        );
+    }
+}
+
 #[cfg(test)]
 mod parses_real_repository_query_shapes {
     use sqlparser::dialect::{ClickHouseDialect, GenericDialect};
