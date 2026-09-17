@@ -384,6 +384,98 @@ impl QueryBuilder<Ready> {
     }
 }
 
+/// Next-token values [`apply_builtin_year_filter`] considers safe to
+/// precede with a freshly inserted `WHERE` clause — every `ClickHouse`
+/// clause keyword that can legally follow a bare `FROM <table>` with no
+/// alias/`JOIN`/existing predicate in between, plus the closing `)` of a
+/// subquery. Anything else (an alias, `WHERE`, `PREWHERE`, `JOIN`, `FINAL`,
+/// ...) means inserting here would produce invalid or silently wrong SQL,
+/// so the caller degrades to unfiltered instead.
+const SAFE_NEXT_TOKENS: [&str; 8] = [
+    "GROUP", "ORDER", "LIMIT", "HAVING", "SETTINGS", "FORMAT", "UNION", ")",
+];
+
+/// Applies a `WHERE tahun IN (...)` predicate to a built-in `KpiSpec`/
+/// `ChartSpec`'s raw SQL, for the dashboard's year selector — [`sql_with_filters`]
+/// itself cannot be reused for a built-in spec, since it needs a
+/// `ChartInput`, which built-ins do not have.
+///
+/// Inserted as plain text, right after the literal substring `FROM
+/// serving.<mart>`, but only when three boundary conditions all hold — see
+/// [`SAFE_NEXT_TOKENS`] and the guards below — because built-in specs are
+/// loaded from a deployment-supplied `BUILTIN_DASHBOARD_SPEC` file (Task 6),
+/// not just this repo's own 13 shipped entries, so this function cannot
+/// assume the input is as simple as those 13 always were. Returns `sql`
+/// completely unchanged (an honest "unfiltered", never a corrupted
+/// insertion) when: `years` is empty; `mart` is not in `mart_cols` or has
+/// no `tahun` column (checked the same way [`sql_with_filters`] checks it
+/// for stored charts); the marker `FROM serving.<mart>` does not appear, or
+/// appears more than once (ambiguous — e.g. a `UNION` reading the same mart
+/// twice); the character immediately after the marker is neither
+/// whitespace nor end-of-string (a prefix collision, e.g. `mart_event`
+/// matching inside `mart_event_detail`); or the next real token after the
+/// marker is not in [`SAFE_NEXT_TOKENS`] (an alias, an existing
+/// `WHERE`/`PREWHERE`, a `JOIN`, `FINAL`, or anything else this function
+/// does not recognize as safe to precede).
+#[must_use]
+pub fn apply_builtin_year_filter<HMap, HSet>(
+    sql: &str,
+    mart: &str,
+    years: &[i64],
+    mart_cols: &std::collections::HashMap<String, HashSet<String, HSet>, HMap>,
+) -> String
+where
+    HMap: std::hash::BuildHasher,
+    HSet: std::hash::BuildHasher,
+{
+    if years.is_empty() {
+        return sql.to_owned();
+    }
+    let Some(cols) = mart_cols.get(mart) else {
+        return sql.to_owned();
+    };
+    if !cols.contains("tahun") {
+        return sql.to_owned();
+    }
+
+    let marker = format!("FROM serving.{mart}");
+    if sql.matches(&marker).count() != 1 {
+        return sql.to_owned();
+    }
+    let Some(pos) = sql.find(&marker) else {
+        return sql.to_owned();
+    };
+    let after = pos + marker.len();
+    let rest = &sql[after..];
+
+    // Guard 1: the character right after the marker must be end-of-string
+    // or whitespace, never an identifier-continuation character.
+    match rest.chars().next() {
+        None => {}
+        Some(c) if c.is_whitespace() => {}
+        _ => return sql.to_owned(),
+    }
+
+    // Guard 2: the next real token (if any) must be one of SAFE_NEXT_TOKENS.
+    let next_token_ok = match rest.split_whitespace().next() {
+        None => true,
+        Some(token) => {
+            let upper = token.to_ascii_uppercase();
+            SAFE_NEXT_TOKENS.contains(&upper.as_str())
+        }
+    };
+    if !next_token_ok {
+        return sql.to_owned();
+    }
+
+    let years_csv = years
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{} WHERE tahun IN ({years_csv}){rest}", &sql[..after])
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -512,5 +604,136 @@ mod tests {
         }];
         let sql = sql_with_filters(&spec, &[], &filters, &cols);
         assert_eq!(sql, spec.spec.sql);
+    }
+
+    #[test]
+    fn apply_builtin_year_filter_inserts_where_after_the_mart_clause() {
+        let cols = mart_cols(&[("mart_wisman", &["tahun", "jumlah"])]);
+        let sql = "SELECT sum(jumlah) AS v FROM serving.mart_wisman";
+        let filtered = apply_builtin_year_filter(sql, "mart_wisman", &[2023, 2024], &cols);
+        assert_eq!(
+            filtered,
+            "SELECT sum(jumlah) AS v FROM serving.mart_wisman WHERE tahun IN (2023,2024)"
+        );
+    }
+
+    #[test]
+    fn apply_builtin_year_filter_preserves_a_trailing_order_by() {
+        let cols = mart_cols(&[("mart_event", &["tahun", "jumlah_event"])]);
+        let sql =
+            "SELECT jumlah_event AS v, tahun FROM serving.mart_event ORDER BY tahun DESC LIMIT 1";
+        let filtered = apply_builtin_year_filter(sql, "mart_event", &[2024], &cols);
+        assert_eq!(
+            filtered,
+            "SELECT jumlah_event AS v, tahun FROM serving.mart_event WHERE tahun IN (2024) \
+             ORDER BY tahun DESC LIMIT 1"
+        );
+    }
+
+    #[test]
+    fn apply_builtin_year_filter_is_a_no_op_when_years_is_empty() {
+        let cols = mart_cols(&[("mart_wisman", &["tahun"])]);
+        let sql = "SELECT 1 FROM serving.mart_wisman";
+        assert_eq!(
+            apply_builtin_year_filter(sql, "mart_wisman", &[], &cols),
+            sql
+        );
+    }
+
+    #[test]
+    fn apply_builtin_year_filter_is_a_no_op_when_the_mart_has_no_tahun_column() {
+        let cols = mart_cols(&[("mart_kuliner", &["wilayah", "jumlah_usaha"])]);
+        let sql = "SELECT wilayah FROM serving.mart_kuliner";
+        assert_eq!(
+            apply_builtin_year_filter(sql, "mart_kuliner", &[2024], &cols),
+            sql
+        );
+    }
+
+    #[test]
+    fn apply_builtin_year_filter_is_a_no_op_when_the_from_clause_is_not_found() {
+        // Defensive: a spec whose SQL does not read `FROM serving.<mart>`
+        // directly (none of the shipped built-ins do this) degrades to
+        // unfiltered rather than corrupting the query.
+        let cols = mart_cols(&[("mart_x", &["tahun"])]);
+        let sql = "SELECT 1"; // no FROM clause at all
+        assert_eq!(
+            apply_builtin_year_filter(sql, "mart_x", &[2024], &cols),
+            sql
+        );
+    }
+
+    // -- boundary guards (judge review W6-2): specs are now loaded from a
+    // deployment-supplied JSON file (Task 6), so "none of the 13 shipped
+    // specs has a WHERE" no longer bounds the input this function sees. Each
+    // test below is one of the three failure modes the review named,
+    // asserting the safe degradation: SQL returned unchanged, never a
+    // corrupted insertion. ---------------------------------------------------
+
+    #[test]
+    fn apply_builtin_year_filter_rejects_a_prefix_collision_with_a_longer_mart_name() {
+        // `mart = "mart_event"`'s marker, "FROM serving.mart_event", is
+        // also a PREFIX of "FROM serving.mart_event_detail" — a naive
+        // substring match would insert the predicate mid-identifier.
+        let cols = mart_cols(&[("mart_event", &["tahun"])]);
+        let sql = "SELECT 1 FROM serving.mart_event_detail";
+        assert_eq!(
+            apply_builtin_year_filter(sql, "mart_event", &[2024], &cols),
+            sql
+        );
+    }
+
+    #[test]
+    fn apply_builtin_year_filter_rejects_an_aliased_from_clause() {
+        // `FROM serving.mart_wisman AS w` must not become `... WHERE tahun
+        // IN (2024) AS w` — `AS` is not one of the safe next tokens.
+        let cols = mart_cols(&[("mart_wisman", &["tahun"])]);
+        let sql = "SELECT 1 FROM serving.mart_wisman AS w";
+        assert_eq!(
+            apply_builtin_year_filter(sql, "mart_wisman", &[2024], &cols),
+            sql
+        );
+    }
+
+    #[test]
+    fn apply_builtin_year_filter_rejects_an_existing_where_clause() {
+        let cols = mart_cols(&[("mart_wisman", &["tahun"])]);
+        let sql = "SELECT 1 FROM serving.mart_wisman WHERE region = 'x'";
+        assert_eq!(
+            apply_builtin_year_filter(sql, "mart_wisman", &[2024], &cols),
+            sql
+        );
+    }
+
+    #[test]
+    fn apply_builtin_year_filter_rejects_a_join_after_the_mart_clause() {
+        let cols = mart_cols(&[("mart_wisman", &["tahun"])]);
+        let sql = "SELECT 1 FROM serving.mart_wisman JOIN serving.mart_event USING (tahun)";
+        assert_eq!(
+            apply_builtin_year_filter(sql, "mart_wisman", &[2024], &cols),
+            sql
+        );
+    }
+
+    #[test]
+    fn apply_builtin_year_filter_rejects_final_after_the_mart_clause() {
+        let cols = mart_cols(&[("mart_wisman", &["tahun"])]);
+        let sql = "SELECT 1 FROM serving.mart_wisman FINAL";
+        assert_eq!(
+            apply_builtin_year_filter(sql, "mart_wisman", &[2024], &cols),
+            sql
+        );
+    }
+
+    #[test]
+    fn apply_builtin_year_filter_rejects_when_the_marker_appears_more_than_once() {
+        // A UNION reading the same mart twice makes "the" insertion point
+        // ambiguous — refuse rather than guess which occurrence to filter.
+        let cols = mart_cols(&[("mart_wisman", &["tahun"])]);
+        let sql = "SELECT 1 FROM serving.mart_wisman UNION ALL SELECT 1 FROM serving.mart_wisman";
+        assert_eq!(
+            apply_builtin_year_filter(sql, "mart_wisman", &[2024], &cols),
+            sql
+        );
     }
 }

@@ -121,11 +121,15 @@ async fn get_body(
     let mut results = Map::new();
     if on_default {
         for k in KPIS.iter() {
-            let (id, val) = run_spec_sql(ch, &k.id, &k.sql).await;
+            let sql =
+                lakehouse_bi::builder::apply_builtin_year_filter(&k.sql, &k.mart, &years, &cols);
+            let (id, val) = run_spec_sql(ch, &k.id, &sql).await;
             results.insert(id, val);
         }
         for c in CHARTS.iter() {
-            let (id, val) = run_spec_sql(ch, &c.id, &c.sql).await;
+            let sql =
+                lakehouse_bi::builder::apply_builtin_year_filter(&c.sql, &c.mart, &years, &cols);
+            let (id, val) = run_spec_sql(ch, &c.id, &sql).await;
             results.insert(id, val);
         }
     }
