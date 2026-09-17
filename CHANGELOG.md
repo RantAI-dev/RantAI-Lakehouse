@@ -8,6 +8,31 @@ once a first release is tagged.
 
 ## [Unreleased]
 
+### Added
+
+- Gold Exports console page: per-mart last export (`snapshotId`/
+  `exportedAt`, read straight off the Iceberg table's own snapshot), an
+  "Export now" action, export history from a new `console.gold_export_run`
+  table, and a `GET /api/gold/export/{mart}/consumers` route that reports
+  an honest `supported: false` until Trino query-history correlation is
+  written (the `lakehouse-trino` client crate exists but this route does
+  not yet call it) (WS6).
+- `POST`/`GET /api/gold/export/{mart}`'s `check_export_token` now also
+  accepts a session holding the `gold:export` permission, in addition to
+  the pre-existing shared-token/service-identity paths — a deployment
+  that sets `GOLD_EXPORT_RUN_TOKEN` for the Dagster schedule no longer
+  locks the console's "Export now" button out for every human operator
+  (WS6).
+- The scheduled `gold_export_schedule` (daily 04:00) is restored. Known
+  gap: unlike `agent_run_schedule`/`alerts_run_schedule`, no service
+  identity is provisioned for it yet, so its nightly run currently gets
+  `401` at `Policy::RequiresAuth` before `check_export_token` ever runs —
+  shipped anyway per AGENTS.md rule 2 (a schedule that visibly fails is
+  more honest than one withheld to hide the gap) (WS6).
+- Per-tenant built-in "Main" dashboard tile catalog loaded from a JSON
+  file via `BUILTIN_DASHBOARD_SPEC`, replacing the removed
+  `BUILTIN_DASHBOARD_ENABLED` boolean flag (WS6).
+
 ### Changed
 
 - **Relicensed the project from Apache-2.0 to AGPL-3.0-or-later.**

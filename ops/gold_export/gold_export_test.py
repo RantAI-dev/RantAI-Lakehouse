@@ -245,6 +245,58 @@ def step_read_back_via_api() -> None:
     print(f"[gold-export] round trip confirmed: {ROW_COUNT} rows in, {ROW_COUNT} rows read back")
 
 
+def step_read_back_reports_snapshot_fields() -> None:
+    """WS6: `GET /api/gold/export/{mart}` now also reports
+    `snapshotId`/`exportedAt` (`routes::gold::read_back`), independent of
+    the row count `step_read_back_via_api` already checked."""
+    resp = API.get(f"{API_URL}/api/gold/export/{MART_NAME}", timeout=30)
+    if not resp.ok:
+        raise GoldExportFailure(f"GET /api/gold/export/{MART_NAME} failed: {resp.status_code} {resp.text}")
+    body = resp.json()
+    if body.get("snapshotId") is None:
+        raise GoldExportFailure(f"expected a non-null snapshotId after a real export, got {body}")
+    if not body.get("exportedAt"):
+        raise GoldExportFailure(f"expected a non-empty exportedAt after a real export, got {body}")
+    print(f"[gold-export] snapshotId={body.get('snapshotId')} exportedAt={body.get('exportedAt')}")
+
+
+def step_history_lists_this_run() -> None:
+    """WS6: `GET /api/gold/exports?mart=` (`routes::gold::exports`, backed
+    by `console.gold_export_run`) must list at least the run this test
+    itself just triggered, with a `rowsExported` matching what was
+    seeded."""
+    resp = API.get(f"{API_URL}/api/gold/exports", params={"mart": MART_NAME}, timeout=30)
+    if not resp.ok:
+        raise GoldExportFailure(f"GET /api/gold/exports failed: {resp.status_code} {resp.text}")
+    body = resp.json()
+    runs = body.get("runs", [])
+    if not runs:
+        raise GoldExportFailure(f"expected at least one export run recorded, got {body}")
+    latest = runs[0]
+    if latest.get("status") != "success":
+        raise GoldExportFailure(f"expected the latest run to be status=success, got {latest}")
+    if latest.get("rowsExported") != ROW_COUNT:
+        raise GoldExportFailure(
+            f"expected the latest run's rowsExported to be {ROW_COUNT}, got {latest.get('rowsExported')}"
+        )
+    print(f"[gold-export] history shows {len(runs)} run(s), latest: {latest}")
+
+
+def step_consumers_route_is_honest_about_being_unsupported() -> None:
+    """WS6: no code exists yet that correlates a Gold mart against
+    `Trino`'s query history (`routes::gold::consumers`'s own doc comment)
+    — this must be a clear `supported: false`, never a guessed count."""
+    resp = API.get(f"{API_URL}/api/gold/export/{MART_NAME}/consumers", timeout=30)
+    if not resp.ok:
+        raise GoldExportFailure(f"GET .../consumers failed: {resp.status_code} {resp.text}")
+    body = resp.json()
+    if body.get("supported") is not False:
+        raise GoldExportFailure(f"expected supported: false (no Trino client yet), got {body}")
+    if body.get("consumers") is not None:
+        raise GoldExportFailure(f"expected consumers: null when unsupported, got {body}")
+    print(f"[gold-export] consumers route honestly reports unsupported: {body.get('reason')}")
+
+
 def main() -> int:
     try:
         step_wait_for_services()
@@ -253,6 +305,9 @@ def main() -> int:
         step_trigger_export()
         step_verify_lakekeeper_metadata_directly()
         step_read_back_via_api()
+        step_read_back_reports_snapshot_fields()
+        step_history_lists_this_run()
+        step_consumers_route_is_honest_about_being_unsupported()
     except GoldExportFailure as exc:
         print(f"[gold-export] FAILED: {exc}", file=sys.stderr)
         return 1

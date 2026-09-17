@@ -159,3 +159,46 @@ Gold export is implemented, in `lakehouse-iceberg` + `lakehouse-api`:
   confirms format-version 2 straight from Lakekeeper's own REST metadata
   (independent of what the Rust route claims), and reads the table back
   through `iceberg-rust` to confirm the row count matches what was seeded.
+
+## Addendum (WS6)
+
+`POST`/`GET /api/gold/export/{mart}` now also report `snapshotId`/
+`exportedAt` (the exported Iceberg table's current snapshot id and commit
+time, read straight off `iceberg-rust`'s own `Snapshot`, not
+self-reported). A new `console.gold_export_run` table
+(`lakehouse-api::gold_export_history`, its own single owner — see that
+module's doc comment for why this is not `lakehouse-bi::store` or
+Dagster's `EXPECTED_SCHEMAS`) records every export attempt, success and
+failure alike, from either the console's "Export now" button or the
+scheduled Dagster job — both call the same `POST` handler, so one
+insertion point covers both triggers. `GET /api/gold/exports?mart=`
+serves that history back, newest first. `check_export_token` now also
+accepts a session holding the `gold:export` permission (e.g. Platform
+Admin's seeded `*:*` role) unconditionally, in addition to the pre-existing
+shared-token/service-identity paths — this is what lets the console button
+work even on a deployment that has `GOLD_EXPORT_RUN_TOKEN` set for the
+Dagster schedule; a wrong or missing token is still `401` for anyone
+without that permission. `GET /api/gold/export/{mart}/consumers` is an
+honest `supported: false` stub: the `lakehouse-trino` client crate already
+exists and is wired into this build for other routes, but no code here
+yet correlates `Trino`'s query history against a Gold mart's exported
+table — this route never guesses a count.
+
+The scheduled `gold_export_schedule` (daily 04:00) is restored, but —
+unlike `agent_run_job`/`alerts_run_job` — it has **no**
+`bootstrap_gold_export_service` counterpart in `lakehouse-api::main`. Its
+job (`dagster/dispar_orchestrate/gold_export.py:gold_export_job`) sends
+only `x-run-token`; `POLICY_TABLE`'s `Policy::RequiresAuth` floor still
+runs `auth_gate` before `routes::gold::check_export_token` even sees that
+header, so every nightly run currently reaches `401` at the router. This
+is a real, unfixed gap this change does not close (it needs a Rust-side
+change to provision a service identity the same way
+`bootstrap_agent_run_service`/`bootstrap_alerts_run_service` do) — see the
+`gold_export_schedule` definition's own comment in `gold_export.py` for
+the full reasoning on why the schedule ships anyway: a schedule that runs
+and visibly fails every night is the honest state (AGENTS.md rule 2),
+not one withheld to hide the gap. The acceptance test
+(`ops/gold_export/gold_export_test.py`) was extended to assert all three:
+`snapshotId`/`exportedAt` populated after a real export, the export
+history listing the run the test itself triggered with a matching
+`rowsExported`, and the consumers stub's `supported: false` shape.
