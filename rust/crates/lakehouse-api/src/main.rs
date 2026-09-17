@@ -21,6 +21,7 @@ mod gold_lock;
 mod json;
 mod lakehouse_catalog;
 mod lakekeeper_token;
+mod next_run;
 mod policy;
 mod routes;
 mod state;

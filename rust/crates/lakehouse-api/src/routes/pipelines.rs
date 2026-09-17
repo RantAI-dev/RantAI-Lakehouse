@@ -16,6 +16,7 @@ use lakehouse_store::PgPool;
 use lakehouse_store::pipelines::{self, CreatePipelineInput};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
@@ -76,7 +77,9 @@ async fn list_body(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, Lis
 /// `freshnessLagSeconds` are therefore reported as `null` rather than a
 /// stamped-on default that every job would share (`WS1` finding J16).
 /// `lastRunAt` is `null` when the job has never run instead of an empty
-/// string standing in for "never ran".
+/// string standing in for "never ran". `nextRunAt` (WS4 item G2) is
+/// computed server-side from the job's first schedule's cron expression;
+/// `null` for a manual job or an uncomputable cron — never a guess.
 fn dagster_pipeline_row(j: &DgJob, last: Option<&DgRun>) -> Value {
     json!({
         "id": j.name,
@@ -90,9 +93,31 @@ fn dagster_pipeline_row(j: &DgJob, last: Option<&DgRun>) -> Value {
         "lastRunAt": last
             .and_then(|r| r.start_time)
             .map_or(Value::Null, |t| Value::String(iso_from_unix_seconds(t))),
+        "nextRunAt": next_run_at_json(j),
         "slaOk": Value::Null,
         "freshnessLagSeconds": Value::Null,
     })
+}
+
+/// `nextRunAt` for a `Dagster` job (WS4 item G2): the next fire time of its
+/// FIRST schedule (same "only the first schedule" rule [`schedule_label`]
+/// already follows), computed server-side via
+/// `crate::next_run::next_run_at`. `null` for a job with no schedule, or
+/// whose cron expression `next_run_at` cannot compute a next occurrence
+/// from — never a fabricated guess.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "a cron next-occurrence Unix timestamp (seconds since epoch) fits exactly in f64 \
+              until year 285 million; iso_from_unix_seconds takes f64 for parity with Dagster's \
+              own run timestamps"
+)]
+fn next_run_at_json(job: &DgJob) -> Value {
+    job.schedules
+        .first()
+        .and_then(|s| crate::next_run::next_run_at(&s.cron_schedule, OffsetDateTime::now_utc()))
+        .map_or(Value::Null, |t| {
+            Value::String(iso_from_unix_seconds(t.unix_timestamp() as f64))
+        })
 }
 
 /// The run with the largest `startTime` for `job_name`, matching the
@@ -645,6 +670,7 @@ fn schedule_mutation_body(job: &DgJob, paused: bool) -> Value {
         "target": Value::Null,
         "schedule": schedule_label(job),
         "lastRunAt": Value::Null,
+        "nextRunAt": next_run_at_json(job),
         "slaOk": Value::Null,
         "freshnessLagSeconds": Value::Null,
     })
@@ -891,9 +917,54 @@ mod tests {
             "slaOk",
             "freshnessLagSeconds",
             "lastRunAt",
+            "nextRunAt",
         ] {
             assert!(body[key].is_null(), "{key} must be null, got {}", body[key]);
         }
+    }
+
+    /// WS4 item G2 — `nextRunAt` is a real, computed value for a job with a
+    /// real cron schedule, and `null` (never a guess) for a manual job or
+    /// one whose only schedule's cron `next_run::next_run_at` cannot parse.
+    #[test]
+    fn next_run_at_json_is_real_for_a_cron_schedule_and_null_otherwise() {
+        let scheduled = DgJob {
+            name: "j".to_owned(),
+            schedules: vec![DgSchedule {
+                name: "s1".to_owned(),
+                cron_schedule: "0 3 * * *".to_owned(),
+                schedule_state: DgScheduleState {
+                    status: "RUNNING".to_owned(),
+                },
+            }],
+        };
+        let manual = DgJob {
+            name: "m".to_owned(),
+            schedules: vec![],
+        };
+        let malformed = DgJob {
+            name: "b".to_owned(),
+            schedules: vec![DgSchedule {
+                name: "s2".to_owned(),
+                cron_schedule: "not a cron".to_owned(),
+                schedule_state: DgScheduleState {
+                    status: "RUNNING".to_owned(),
+                },
+            }],
+        };
+
+        assert!(
+            next_run_at_json(&scheduled).is_string(),
+            "a real cron schedule must produce a real nextRunAt"
+        );
+        assert!(
+            next_run_at_json(&manual).is_null(),
+            "a job with no schedule must report nextRunAt: null"
+        );
+        assert!(
+            next_run_at_json(&malformed).is_null(),
+            "an unparseable cron must report nextRunAt: null, never a guess"
+        );
     }
 
     #[test]

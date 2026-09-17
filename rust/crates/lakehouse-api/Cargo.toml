@@ -58,6 +58,15 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 time = { workspace = true, features = ["macros"] }
+croner.workspace = true
+# `croner` 2.x always pulls in `chrono` as its own non-optional datetime
+# backend (see `rust/Cargo.toml`'s comment on the `croner` entry); this
+# crate needs `chrono` itself as a direct dependency too, for
+# `crate::next_run::next_run_at`'s own `chrono::DateTime::from_timestamp`
+# round trip -- `chrono` was already in `rust/Cargo.lock` as a TRANSITIVE
+# dependency of something else in the tree, but this is the first direct
+# use of it in this crate (WS4 item G2).
+chrono = "0.4"
 uuid = { workspace = true }
 sqlx = { workspace = true }
 # `connector_probe`'s real S3-compatible connectivity test — same crate,

@@ -40,6 +40,17 @@ async-trait = "0.1"
 argon2 = "0.5"
 subtle = "2"
 jsonwebtoken = "9"
+# `lakehouse-api::next_run` (WS4 item G2) is the first workstream to land
+# this dependency -- WS5 also needs cron-next-occurrence computation and
+# reuses this same entry rather than adding a second one (programme rule:
+# whichever workstream lands first adds it). No feature flag: `croner`
+# 2.x's plan-doc-assumed `chrono` FEATURE does not exist -- confirmed by
+# reading the crate's own Cargo.toml after `cargo fetch` (a required
+# hedge from this task's own plan doc, which flagged the API as
+# independently unverified) -- `chrono` is croner 2.x's one, non-optional,
+# always-on datetime backend; `next_run.rs`'s own doc comment has the
+# full API-shape correction (`Cron::new(..).parse()`, not `FromStr`).
+croner = { version = "2" }
 
 [workspace.lints.rust]
 future-incompatible = "warn"

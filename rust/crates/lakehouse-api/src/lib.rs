@@ -37,6 +37,7 @@ pub mod gold_lock;
 pub mod json;
 pub mod lakehouse_catalog;
 pub mod lakekeeper_token;
+pub mod next_run;
 pub mod policy;
 pub mod routes;
 pub mod state;
