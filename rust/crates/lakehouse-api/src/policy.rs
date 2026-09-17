@@ -171,7 +171,16 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // ── Ops: `{kind}` fans out to several logical resources with no single
     //    seeded permission — auth only (see module doc comment). Cancelling
     //    a workload (kills a real ClickHouse query) requires the seeded
-    //    Data Engineer permission `workload:cancel` (0020). ───────────────
+    //    Data Engineer permission `workload:cancel` (0020). `/api/ops/logs`
+    //    (WS5 item G1) is registered ahead of the `{kind}` wildcard, same
+    //    literal-before-parameter precedent as `/api/governance/lineage`
+    //    below — router-level floor is `RequiresAuth`; the ClickHouse
+    //    branch's stricter `"ops:logs"` check (only Platform Admin's
+    //    `*:*` satisfies it — `system.text_log` carries every query's SQL
+    //    text verbatim) lives inside the handler, matching
+    //    `routes/alerts.rs::check_run_token`'s "auth-only router gate,
+    //    stricter handler guard" pattern for `/api/alerts/run`. ─────────
+    ("GET",  "/api/ops/logs",                      Policy::RequiresAuth),
     ("GET",  "/api/ops/{kind}",                    Policy::RequiresAuth),
     ("POST", "/api/ops/workloads/{id}/cancel",     Policy::RequiresPermission("workload:cancel")),
 

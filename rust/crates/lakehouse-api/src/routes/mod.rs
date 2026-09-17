@@ -383,6 +383,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/overview", get(overview::get).post(overview::refresh))
         .merge(overview_alerts_router())
+        // `/api/ops/logs` is a literal segment registered ahead of the
+        // `/api/ops/{kind}` wildcard below (WS5 item G1) -- axum matches a
+        // static segment over a path parameter when both are registered,
+        // same precedent as `/api/governance/lineage`-before-`{kind}`.
+        .route("/api/ops/logs", get(ops::logs))
         .route("/api/ops/{kind}", get(ops::get))
         .route(
             "/api/ops/workloads/{id}/cancel",

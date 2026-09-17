@@ -11,12 +11,14 @@
 //! Usage page called it, so `"usage"` now falls through to
 //! [`Kind::Unknown`] like any other unrecognized value.
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use lakehouse_auth::Principal;
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ident::SqlLiteral;
 use lakehouse_store::PgPool;
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::health;
@@ -469,6 +471,198 @@ async fn cancel_workload_body(ch: &ChClient, id: &str) -> Result<Option<Value>, 
     })))
 }
 
+// ── GET /api/ops/logs (WS5 item G1, grand plan §13) ─────────────────────
+//
+// Deviation from the original draft (WS5 plan review U4, blocker,
+// security): this route no longer serves Dagster run logs. WS4's own plan
+// (`docs/superpowers/plans/2026-09-11-ws4-pipelines-detail-source-logs.md`,
+// its own run-logs route item) reserves `GET
+// /api/pipelines/{id}/runs/{runId}/logs` for that -- gated `pipeline:read`,
+// not merely `RequiresAuth` -- since op-authored
+// log text can carry a connection string or other operational secret
+// verbatim, and every authenticated user should not be able to read every
+// pipeline's run logs. That route is NOT YET implemented on this branch
+// (confirmed: no `run_logs`/`logsForRun` call exists in
+// `lakehouse-dagster` or `routes/pipelines.rs` as of this commit) -- this
+// route defers to it by name/path regardless, rather than re-implementing
+// a second, less-scoped copy of the same data under a wider gate.
+
+/// The `system.text_log` message field is truncated to this many
+/// characters by the query itself (a `ClickHouse`-side `substring`, not a
+/// Rust-side re-truncation) -- even an `"ops:logs"`-scoped read must not
+/// let one log line pull an unbounded blob into the response.
+const MAX_LOG_MESSAGE_CHARS: usize = 2000;
+
+/// The default `tail` when the caller omits `?tail=`.
+const DEFAULT_LOG_TAIL: u32 = 200;
+
+/// The hard ceiling `tail` is clamped to regardless of what the caller
+/// asks for -- a caller must not be able to request an unbounded read.
+const MAX_LOG_TAIL: u32 = 1000;
+
+/// Query parameters for `GET /api/ops/logs`.
+#[derive(Debug, Deserialize, Default)]
+pub struct LogsQuery {
+    service: Option<String>,
+    tail: Option<u32>,
+}
+
+/// Clamp a caller-supplied `tail` to `[1, MAX_LOG_TAIL]`, defaulting to
+/// `DEFAULT_LOG_TAIL` when absent. A caller cannot request more than
+/// `MAX_LOG_TAIL` lines no matter what it passes.
+fn bound_tail(tail: Option<u32>) -> u32 {
+    tail.unwrap_or(DEFAULT_LOG_TAIL).clamp(1, MAX_LOG_TAIL)
+}
+
+/// The fixed allowlist `service` is matched against -- nothing
+/// caller-supplied is ever interpolated into a command, file path, or
+/// container name (AGENTS.md fail-closed principle). An unlisted or
+/// unrecognized value is [`Self::Unsupported`], never an attempt to guess
+/// how to read logs for a service this route does not know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogService {
+    /// `system.text_log` -- real, gated on `"ops:logs"` (Step below).
+    ClickHouse,
+    /// Dagster run logs live on WS4's own, more narrowly scoped route --
+    /// see the module note above. Reported honestly rather than served
+    /// here a second time.
+    Dagster,
+    /// Lakekeeper, `RustFS`, `OpenFGA`, `Trino`, and any unrecognized
+    /// value: no log-reading endpoint exists for these on the compose
+    /// stack (confirmed against `docker-compose.yml`'s service list) --
+    /// `supported: false` at 200, never `Docker` socket access (out of
+    /// scope per grand plan §13).
+    Unsupported,
+}
+
+impl LogService {
+    fn parse(service: &str) -> Self {
+        match service {
+            "clickhouse" => Self::ClickHouse,
+            "dagster" => Self::Dagster,
+            _ => Self::Unsupported,
+        }
+    }
+}
+
+/// Whether `principal` may read `service=clickhouse` logs. Only
+/// `"ops:logs"` -- an unseeded token only Platform Admin's `"*:*"` grant
+/// satisfies (`lakehouse-auth/src/permissions.rs`) -- passes here, not
+/// merely an authenticated principal: `system.text_log` carries every
+/// query's SQL text verbatim, which can include a table function's
+/// literal credentials (e.g. `s3(url, key, secret)`), so this is not an
+/// Analyst-level read even though `/api/ops/logs` itself is only
+/// `Policy::RequiresAuth` at the router level (`POLICY_TABLE`). This is
+/// the same "router-level auth-only, handler-level stricter guard"
+/// pattern `routes/alerts.rs::check_run_token` already establishes for
+/// `/api/alerts/run`.
+fn can_read_clickhouse_logs(principal: Option<&Principal>) -> bool {
+    principal.is_some_and(|p| p.has("ops:logs"))
+}
+
+/// Reads `system.text_log`, capped at `tail` rows and `MAX_LOG_MESSAGE_CHARS`
+/// per message (both server-side, via the query itself).
+///
+/// # Errors
+///
+/// Returns [`ChError`] on any `ClickHouse` failure; the caller ([`logs`])
+/// classifies it into a fixed `"database error"` message before it
+/// reaches a response -- upstream error text never reaches the caller
+/// (AGENTS.md principle 4).
+async fn clickhouse_logs(ch: &ChClient, tail: u32) -> Result<Vec<Value>, ChError> {
+    let rows = ch
+        .rows(
+            &format!(
+                "SELECT toString(event_time) event_time, level, \
+                 substring(message, 1, {MAX_LOG_MESSAGE_CHARS}) message \
+                 FROM system.text_log ORDER BY event_time DESC LIMIT {tail}"
+            ),
+            None,
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            json!({
+                "at": str_col(r, "event_time"),
+                "level": str_col(r, "level"),
+                "message": str_col(r, "message"),
+            })
+        })
+        .collect())
+}
+
+/// `GET /api/ops/logs?service=&tail=` (WS5 item G1) -- an allowlisted,
+/// bounded-tail read of one platform component's own logs.
+///
+/// `service` is matched against [`LogService::parse`]'s fixed allowlist;
+/// an unlisted or unrecognized value degrades to the honest
+/// `{"supported": false, "reason": "..."}` shape at 200, never an error
+/// that reads as "this might work with a different spelling." `tail`
+/// defaults to `DEFAULT_LOG_TAIL` and is clamped to `MAX_LOG_TAIL`
+/// regardless of what the caller asks for.
+///
+/// # Errors
+///
+/// This is a `Response`-returning handler (matching the rest of this
+/// file): 403 when `service=clickhouse` and the caller lacks
+/// `"ops:logs"`; 503 with a fixed `"database error"` message (never
+/// upstream `ClickHouse` text) on a query failure.
+pub async fn logs(
+    State(state): State<AppState>,
+    Query(query): Query<LogsQuery>,
+    principal: Option<Extension<Principal>>,
+) -> Response {
+    let tail = bound_tail(query.tail);
+    match LogService::parse(query.service.as_deref().unwrap_or("")) {
+        LogService::ClickHouse => {
+            if !can_read_clickhouse_logs(principal.as_ref().map(|Extension(p)| p)) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    ApiJson(json!({ "error": "forbidden" })),
+                )
+                    .into_response();
+            }
+            match clickhouse_logs(&state.clickhouse, tail).await {
+                Ok(lines) => (
+                    StatusCode::OK,
+                    ApiJson(
+                        json!({ "supported": true, "service": "clickhouse", "lines": lines }),
+                    ),
+                )
+                    .into_response(),
+                Err(err) => {
+                    // Upstream ClickHouse error text never reaches the
+                    // caller -- classify, don't forward (AGENTS.md
+                    // principle 4).
+                    tracing::warn!(error = %err, "clickhouse_logs failed");
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        ApiJson(json!({ "error": "database error" })),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        LogService::Dagster => (
+            StatusCode::OK,
+            ApiJson(json!({
+                "supported": false,
+                "reason": "use GET /api/pipelines/{id}/runs/{runId}/logs (WS4's own scoped run-logs route, gated pipeline:read)"
+            })),
+        )
+            .into_response(),
+        LogService::Unsupported => (
+            StatusCode::OK,
+            ApiJson(json!({
+                "supported": false,
+                "reason": "no log-reading endpoint exists for this service"
+            })),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -890,5 +1084,97 @@ mod tests {
     #[tokio::test]
     async fn agent_success_rate_is_none_without_a_configured_pool() {
         assert_eq!(agent_success_rate(None).await, None);
+    }
+
+    // ── GET /api/ops/logs (WS5 item G1) ─────────────────────────────────
+
+    use lakehouse_auth::{PermissionSet, PrincipalId};
+    use uuid::Uuid;
+
+    fn principal_with(permissions: &str) -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::nil()),
+            tenant_ids: Vec::new(),
+            display_name: "test".to_owned(),
+            permissions: PermissionSet::parse(permissions),
+            provider: "session".to_owned(),
+            must_change_password: false,
+        }
+    }
+
+    #[test]
+    fn log_service_parse_recognizes_clickhouse_and_dagster_specially() {
+        assert_eq!(LogService::parse("clickhouse"), LogService::ClickHouse);
+        assert_eq!(LogService::parse("dagster"), LogService::Dagster);
+    }
+
+    #[test]
+    fn log_service_parse_maps_every_other_known_and_unknown_value_to_unsupported() {
+        for id in ["lakekeeper", "rustfs", "openfga", "trino", "bogus", ""] {
+            assert_eq!(LogService::parse(id), LogService::Unsupported, "{id}");
+        }
+    }
+
+    #[test]
+    fn bound_tail_defaults_when_absent() {
+        assert_eq!(bound_tail(None), DEFAULT_LOG_TAIL);
+    }
+
+    #[test]
+    fn bound_tail_clamps_a_caller_supplied_value_above_the_ceiling() {
+        // A caller must not be able to request an unbounded read.
+        assert_eq!(bound_tail(Some(u32::MAX)), MAX_LOG_TAIL);
+        assert_eq!(bound_tail(Some(50)), 50);
+    }
+
+    /// A principal holding every seeded non-`*:*` permission (Analyst,
+    /// Data Engineer, Governance Admin's non-wildcard grants, ...) but not
+    /// `*:*` itself must NOT be able to read `system.text_log` -- it
+    /// carries every query's SQL text verbatim, which can include a table
+    /// function's literal credentials.
+    #[test]
+    fn clickhouse_logs_permission_denies_every_non_wildcard_seeded_permission() {
+        let principal = principal_with(
+            "query:read, catalog:read, lineage:read, agent:approve, policy:review, \
+             policy:*, residency:*, audit:read, pipeline:*, catalog:write, \
+             connector:manage, feature:write, notebook:run, dashboard:read, \
+             alert:write, workload:cancel, storage:restore, governance:write",
+        );
+        assert!(!can_read_clickhouse_logs(Some(&principal)));
+        assert!(!can_read_clickhouse_logs(None));
+    }
+
+    #[test]
+    fn clickhouse_logs_permission_allows_only_the_platform_admin_wildcard() {
+        let admin = principal_with("*:*");
+        assert!(can_read_clickhouse_logs(Some(&admin)));
+    }
+
+    #[tokio::test]
+    async fn clickhouse_logs_truncates_messages_via_a_clickhouse_side_substring_and_bounds_limit() {
+        let server = wiremock::MockServer::start().await;
+        let body = json!({
+            "meta": [],
+            "data": [{ "event_time": "2026-09-17 00:00:00", "level": "Error", "message": "boom" }],
+            "rows": 1,
+        });
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains(format!(
+                "substring(message, 1, {MAX_LOG_MESSAGE_CHARS})"
+            )))
+            .and(wiremock::matchers::body_string_contains("LIMIT 1000"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        // The query itself must clamp the LIMIT even when the caller
+        // passes an out-of-range tail -- the truncation is server-side,
+        // never a Rust-side re-truncation applied after an unbounded
+        // fetch.
+        let lines = clickhouse_logs(&ch_client(&server.uri()), MAX_LOG_TAIL)
+            .await
+            .expect("mocked ClickHouse call must succeed");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["message"], "boom");
     }
 }
