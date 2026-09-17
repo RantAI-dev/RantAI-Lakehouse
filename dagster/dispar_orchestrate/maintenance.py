@@ -198,6 +198,7 @@ from dispar_orchestrate.bronze_catalog import (
     record_maintenance_run,
     record_maintenance_verb_run,
 )
+from dispar_orchestrate.op_metadata import source_metadata
 
 CATALOG_DB = "icecat_maintenance"
 
@@ -834,7 +835,11 @@ def _optimize_result(
     return None, {"verb": "optimize", "engine": "trino", "outcome": "applied", "detail": ""}
 
 
-@op
+@op(
+    # sql=None: this op runs one REMOVE/EXPIRE statement per discovered
+    # table, not one fixed template.
+    tags=source_metadata("dispar_orchestrate/maintenance.py::run_bronze_maintenance", sql=None)
+)
 def run_bronze_maintenance(context) -> list[dict[str, Any]]:
     """The P4 maintenance chain, per Bronze table: `remove_orphan_files`
     dry-run (metrics only, matching the task brief's "dry_run metrics

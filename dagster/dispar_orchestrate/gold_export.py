@@ -32,6 +32,7 @@ import requests
 from dagster import DefaultScheduleStatus, Definitions, ScheduleDefinition, job, op
 
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, record_maintenance_run
+from dispar_orchestrate.op_metadata import source_metadata
 
 
 def _env(name: str, default: str) -> str:
@@ -81,7 +82,7 @@ def export_one_mart(cfg: GoldExportConfig, mart: str) -> dict[str, Any]:
     return resp.json()
 
 
-@op
+@op(tags=source_metadata("dispar_orchestrate/gold_export.py::run_gold_export"))
 def run_gold_export(context) -> list[dict[str, Any]]:
     """Runs `POST /api/gold/export/{mart}` for every mart in
     `GOLD_EXPORT_MARTS` (comma-separated, default `gold_export_smoke` — the

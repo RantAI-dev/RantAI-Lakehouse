@@ -75,6 +75,7 @@ import requests
 
 from dagster import Definitions, Field, ScheduleDefinition, job, op
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, record_maintenance_run
+from dispar_orchestrate.op_metadata import source_metadata
 
 
 def _env(name: str, default: str) -> str:
@@ -138,7 +139,8 @@ def post_run(cfg: AgentRunConfig, employee_id: str) -> requests.Response:
                 "(Dagster launchpad or a future schedule's `run_config_fn`)."
             ),
         )
-    }
+    },
+    tags=source_metadata("dispar_orchestrate/agent_runs.py::run_agent_employee"),
 )
 def run_agent_employee(context) -> dict[str, Any]:
     """Runs `POST /api/agents/employees/{employee_id}/run` for the employee

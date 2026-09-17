@@ -16,9 +16,10 @@ from dagster import job, op
 
 from dispar_orchestrate.bronze_catalog import register_bronze_table
 from dispar_orchestrate.dlt_pipeline import BronzeIngestConfig, run_bronze_ingest
+from dispar_orchestrate.op_metadata import source_metadata
 
 
-@op
+@op(tags=source_metadata("dispar_orchestrate/assets.py::ingest_bronze_table"))
 def ingest_bronze_table(context) -> dict:
     """Run the dlt pipeline: Postgres -> Bronze Iceberg through Lakekeeper."""
     summary = run_bronze_ingest()
@@ -32,7 +33,7 @@ def ingest_bronze_table(context) -> dict:
     return summary
 
 
-@op
+@op(tags=source_metadata("dispar_orchestrate/assets.py::register_in_catalog"))
 def register_in_catalog(context, summary: dict) -> None:
     """Make the ingested table show up on `GET /api/catalog` and the
     `governance/lineage`/`governance/classification` surfaces, by writing
