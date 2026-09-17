@@ -40,12 +40,14 @@
 /// `WITH` binding, distinct from a `WITH ... AS (<query>)` CTE) is
 /// rejected by `sqlparser` 0.62.0's `ClickHouseDialect` grammar; it is
 /// refused end-to-end (`RewriteError::Unparseable`), never silently
-/// treated as touching no governed table — see `refusals::
-/// refuses_unparseable_shapes` (Task B5).
+/// treated as touching no governed table — see
+/// `refuses_unparseable_shapes::every_recorded_unparseable_class_is_refused_end_to_end`
+/// (Task B4).
 #[allow(
     dead_code,
-    reason = "no reader exists yet in this commit (Task B1); Task B5's \
-              refusals::refuses_unparseable_shapes test is the first caller"
+    reason = "only a #[cfg(test)] reader exists (Task B4's \
+              refuses_unparseable_shapes module); never reachable from the \
+              lakehouse-api binary target until Phase C wires enforce() in"
 )]
 pub(crate) const REFUSED_UNPARSEABLE: &[(&str, &str)] = &[(
     "with_scalar_alias",
@@ -1365,6 +1367,165 @@ mod table_substitution {
         )
         .unwrap_err();
         assert!(matches!(err, RewriteError::UnprovableSubstitution { .. }));
+    }
+}
+
+/// Task B4's own executable specification for the row-filter grammar
+/// introduced (out of strict task order — see Task B3's commit
+/// message) alongside table substitution: every bare identifier is a
+/// real column or [`PRINCIPAL_ID_PLACEHOLDER`];
+/// [`PRINCIPAL_TENANT_IDS_PLACEHOLDER`] is valid only as the sole `IN
+/// (...)` element; a function call must be on
+/// [`ALLOWED_ROW_FILTER_FUNCTIONS`]; a subquery/`EXISTS`/garbage is
+/// refused; placeholder expansion re-serializes through `sqlparser`'s
+/// own `Value::SingleQuotedString`, never a find-and-replace on the raw
+/// authored string.
+#[cfg(test)]
+mod row_filter {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use sqlparser::ast::Expr;
+    use sqlparser::parser::Parser;
+
+    use super::{PlaceholderValues, RewriteError, expand_placeholders, validate_row_filter_expr};
+
+    fn parse_test_expr(raw: &str) -> Expr {
+        let dialect = sqlparser::dialect::GenericDialect {};
+        Parser::new(&dialect)
+            .try_with_sql(raw)
+            .unwrap()
+            .parse_expr()
+            .unwrap()
+    }
+
+    #[test]
+    fn validate_row_filter_expr_accepts_a_simple_comparison_against_real_columns() {
+        let cols = vec!["tenant_id".to_owned(), "tahun".to_owned()];
+        assert!(validate_row_filter_expr("tenant_id = 'tenant-a'", &cols).is_ok());
+    }
+
+    #[test]
+    fn validate_row_filter_expr_rejects_an_unknown_column() {
+        let cols = vec!["tenant_id".to_owned()];
+        let err = validate_row_filter_expr("secret_col = 1", &cols).unwrap_err();
+        assert!(matches!(err, RewriteError::InvalidRowFilter { .. }));
+    }
+
+    #[test]
+    fn validate_row_filter_expr_rejects_a_function_call_not_on_the_allowlist() {
+        let cols = vec!["tenant_id".to_owned()];
+        let err = validate_row_filter_expr("tenant_id = (SELECT 1)", &cols).unwrap_err();
+        assert!(matches!(err, RewriteError::InvalidRowFilter { .. }));
+    }
+
+    #[test]
+    fn validate_row_filter_expr_rejects_garbage_that_is_not_an_expression_at_all() {
+        let cols = vec!["tenant_id".to_owned()];
+        assert!(validate_row_filter_expr("; DROP TABLE t; --", &cols).is_err());
+    }
+
+    #[test]
+    fn validate_row_filter_expr_accepts_the_scalar_principal_placeholder_as_a_bare_identifier() {
+        let cols = vec!["owner_id".to_owned()];
+        assert!(validate_row_filter_expr("owner_id = __principal_id__", &cols).is_ok());
+    }
+
+    #[test]
+    fn validate_row_filter_expr_accepts_the_list_placeholder_only_as_the_sole_in_list_element() {
+        let cols = vec!["tenant_id".to_owned()];
+        assert!(validate_row_filter_expr("tenant_id IN (__principal_tenant_ids__)", &cols).is_ok());
+    }
+
+    #[test]
+    fn validate_row_filter_expr_rejects_the_list_placeholder_used_bare() {
+        // Not inside an IN-list — nothing else could give a LIST
+        // placeholder a well-defined scalar meaning, so this is
+        // refused, not silently coerced to one element.
+        let cols = vec!["tenant_id".to_owned()];
+        let err =
+            validate_row_filter_expr("tenant_id = __principal_tenant_ids__", &cols).unwrap_err();
+        assert!(matches!(err, RewriteError::InvalidRowFilter { .. }));
+    }
+
+    #[test]
+    fn validate_row_filter_expr_rejects_the_list_placeholder_alongside_other_in_list_elements() {
+        let cols = vec!["tenant_id".to_owned()];
+        let err = validate_row_filter_expr("tenant_id IN (__principal_tenant_ids__, 'x')", &cols)
+            .unwrap_err();
+        assert!(matches!(err, RewriteError::InvalidRowFilter { .. }));
+    }
+
+    #[test]
+    fn expand_placeholders_renders_the_scalar_placeholder_through_sql_literal() {
+        let expr = parse_test_expr("owner_id = __principal_id__");
+        let values = PlaceholderValues {
+            principal_id: Some("u-1".to_owned()),
+            principal_tenant_ids: vec![],
+        };
+        let out = expand_placeholders(&expr, &values).unwrap();
+        assert_eq!(out, "owner_id = 'u-1'");
+    }
+
+    #[test]
+    fn expand_placeholders_renders_the_list_placeholder_as_one_literal_per_tenant() {
+        let expr = parse_test_expr("tenant_id IN (__principal_tenant_ids__)");
+        let values = PlaceholderValues {
+            principal_id: None,
+            principal_tenant_ids: vec!["t-1".to_owned(), "t-2".to_owned()],
+        };
+        let out = expand_placeholders(&expr, &values).unwrap();
+        assert_eq!(out, "tenant_id IN ('t-1', 't-2')");
+    }
+
+    #[test]
+    fn expand_placeholders_with_an_empty_tenant_list_produces_a_never_matching_in_list() {
+        // `IN ()` is invalid SQL in most dialects — a principal with NO
+        // tenant memberships renders `IN (NULL)` instead, which is
+        // valid and matches nothing, rather than a broken statement or
+        // (worse) an empty-list special case some engine optimizes to
+        // "always true".
+        let expr = parse_test_expr("tenant_id IN (__principal_tenant_ids__)");
+        let values = PlaceholderValues {
+            principal_id: None,
+            principal_tenant_ids: vec![],
+        };
+        assert_eq!(
+            expand_placeholders(&expr, &values).unwrap(),
+            "tenant_id IN (NULL)"
+        );
+    }
+}
+
+/// Consumes Task B1's `REFUSED_UNPARSEABLE` (populated with the real,
+/// observed `record_m1_class_parse_results` output) to prove every
+/// class recorded there is refused end to end through the real entry
+/// point, never silently dropped from coverage or treated as touching
+/// no governed table.
+#[cfg(test)]
+mod refuses_unparseable_shapes {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use sqlparser::dialect::ClickHouseDialect;
+
+    use super::{PlaceholderValues, REFUSED_UNPARSEABLE, RewriteError, substitute_governed_tables};
+
+    #[test]
+    fn every_recorded_unparseable_class_is_refused_end_to_end() {
+        for (label, sql) in REFUSED_UNPARSEABLE {
+            let err = substitute_governed_tables(
+                sql,
+                &ClickHouseDialect {},
+                &HashMap::new(),
+                &PlaceholderValues::none(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, RewriteError::Unparseable),
+                "label={label} sql={sql}"
+            );
+        }
     }
 }
 
