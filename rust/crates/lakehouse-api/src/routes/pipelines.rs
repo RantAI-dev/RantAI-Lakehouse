@@ -403,6 +403,59 @@ pub struct SourceQuery {
     op: Option<String>,
 }
 
+/// `GET /api/pipelines/{id}/runs/{runId}/steps` — per-step status and row
+/// counts for one run (WS4 item C3, closes WS1 T3 for real
+/// materializations). `id` is accepted for URL symmetry with the other
+/// run-scoped routes but not used to filter — a `runId` already uniquely
+/// identifies a run in `Dagster`.
+///
+/// # Errors
+///
+/// 503 if the `Dagster` `run_steps` lookup fails. An unknown `runId`
+/// itself is not a distinct error case here —
+/// [`lakehouse_dagster::DgClient::run_steps`] reports it as an empty
+/// `Vec` (its own doc comment: "nothing to show", not "an error"), so this
+/// route responds `200 { "steps": [] }`, never a fabricated 404 for a run
+/// this client cannot actually tell apart from "no steps recorded yet".
+pub async fn run_steps(
+    State(state): State<AppState>,
+    Path((_id, run_id)): Path<(String, String)>,
+) -> Response {
+    match state.dagster.run_steps(&run_id).await {
+        Ok(steps) => (
+            StatusCode::OK,
+            ApiJson(json!({ "steps": steps.iter().map(step_to_json).collect::<Vec<_>>() })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ApiJson(json!({ "error": js_error(err) })),
+        )
+            .into_response(),
+    }
+}
+
+fn step_to_json(s: &lakehouse_dagster::RunStep) -> Value {
+    json!({
+        "stepKey": s.step_key,
+        // Reuses the existing `map_run_status` rather than sending
+        // Dagster's raw step-status vocabulary — the TS contract (Phase F)
+        // types this field EntityStatus, matching every other status the
+        // API already sends, so the frontend needs no second, Dagster-
+        // specific status mapper of its own. A step status
+        // `map_run_status` doesn't recognize (e.g. "SKIPPED", which it
+        // never returns since it was written for RUN-level statuses)
+        // falls through to its existing "unknown" catch-all -- honest,
+        // not a fabricated guess at which EntityStatus it should be.
+        "status": map_run_status(&s.status),
+        "startMs": s.start_ms,
+        "endMs": s.end_ms,
+        "materializations": s.materializations.iter().map(|m| json!({
+            "assetKey": m.asset_key, "rows": m.rows,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 fn run_to_json(r: &DgRun, pipeline_id: &str) -> Value {
     json!({
         "id": r.run_id,
@@ -1864,6 +1917,72 @@ mod tests {
             .await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
             let _ = std::fs::remove_file(parent.join("secret.py"));
+        }
+    }
+
+    /// WS4 item C3 — `GET /api/pipelines/{id}/runs/{runId}/steps`, against
+    /// Phase A's real captured `run_steps` fixture.
+    mod steps_route {
+        use std::collections::HashMap;
+
+        use crate::config::Config;
+        use crate::state::AppState;
+
+        use super::*;
+
+        fn state_with_dagster(server_uri: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DAGSTER_URL".to_owned(), format!("{server_uri}/graphql"));
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        #[tokio::test]
+        async fn steps_route_returns_steps_with_row_counts_from_a_real_captured_fixture() {
+            let server = wiremock::MockServer::start().await;
+            let body: Value = serde_json::from_str(include_str!(
+                "../../../lakehouse-dagster/tests/fixtures/run_steps_captured_fixture.json"
+            ))
+            .expect("fixture parses");
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = run_steps(
+                State(state),
+                Path(("bronze_maintenance_job".to_owned(), "r1".to_owned())),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&response_body).expect("valid JSON");
+            let steps = v["steps"].as_array().expect("steps array");
+            assert_eq!(steps.len(), 1);
+            assert_eq!(steps[0]["stepKey"], "run_bronze_maintenance");
+            // The real fixture's status is "FAILURE" -> map_run_status ->
+            // "failed", never the raw Dagster string.
+            assert_eq!(steps[0]["status"], "failed");
+            assert!(steps[0]["startMs"].is_number());
+            assert!(steps[0]["materializations"].as_array().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn steps_route_is_503_not_a_fabricated_empty_list_when_dagster_is_unreachable() {
+            // No mock mounted at all -- every request to this MockServer's
+            // address fails at the transport level once it is dropped, but
+            // building the client against an address nothing listens on is
+            // simpler and just as real.
+            let state = state_with_dagster("http://127.0.0.1:1");
+            let response = run_steps(
+                State(state),
+                Path(("bronze_maintenance_job".to_owned(), "r1".to_owned())),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
     }
 
