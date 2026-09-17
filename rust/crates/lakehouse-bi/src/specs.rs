@@ -431,7 +431,7 @@ mod tests {
 
     // `charts()`/`kpis()`/`spec_sql()` all read the process-wide
     // `KPIS`/`CHARTS` statics, which are empty unless `BUILTIN_DASHBOARD_SPEC`
-    // is set (Task 6) — setting that env var from within one test would race
+    // is set (WS6) — setting that env var from within one test would race
     // every other test in this binary that touches the same `LazyLock`, so
     // the tests below either build a `ChartSpec`/`KpiSpec` directly (now
     // straightforward: the fields are owned `String`) or parse the shipped

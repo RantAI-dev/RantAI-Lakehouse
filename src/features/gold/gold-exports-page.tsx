@@ -22,7 +22,7 @@ import type { GoldExportRun, GoldMart, GoldReadBack } from "@/services/contracts
  * One mart's row: last export (read straight back from Iceberg), export
  * history count, best-effort consumer count, and an "Export now" trigger.
  * Each sub-fetch is independent — `getLastExport` 404/500s for a mart that
- * has never been exported (Task 2's `read_back` has no table to read yet),
+ * has never been exported (`read_back` has no table to read yet),
  * and that is rendered as "Never exported" here, not as a page-level
  * error.
  */

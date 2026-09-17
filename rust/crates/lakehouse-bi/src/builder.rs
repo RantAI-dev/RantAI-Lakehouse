@@ -403,7 +403,7 @@ const SAFE_NEXT_TOKENS: [&str; 8] = [
 /// Inserted as plain text, right after the literal substring `FROM
 /// serving.<mart>`, but only when three boundary conditions all hold — see
 /// [`SAFE_NEXT_TOKENS`] and the guards below — because built-in specs are
-/// loaded from a deployment-supplied `BUILTIN_DASHBOARD_SPEC` file (Task 6),
+/// loaded from a deployment-supplied `BUILTIN_DASHBOARD_SPEC` file (WS6),
 /// not just this repo's own 13 shipped entries, so this function cannot
 /// assume the input is as simple as those 13 always were. Returns `sql`
 /// completely unchanged (an honest "unfiltered", never a corrupted
@@ -664,7 +664,7 @@ mod tests {
     }
 
     // -- boundary guards (judge review W6-2): specs are now loaded from a
-    // deployment-supplied JSON file (Task 6), so "none of the 13 shipped
+    // deployment-supplied JSON file (WS6), so "none of the 13 shipped
     // specs has a WHERE" no longer bounds the input this function sees. Each
     // test below is one of the three failure modes the review named,
     // asserting the safe degradation: SQL returned unchanged, never a
