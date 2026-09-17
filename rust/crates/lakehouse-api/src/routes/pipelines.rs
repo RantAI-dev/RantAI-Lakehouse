@@ -925,6 +925,7 @@ mod tests {
             permissions: PermissionSet::parse("pipeline:write"),
             provider: "session".to_owned(),
             must_change_password: false,
+            role_names: Vec::new(),
         }
     }
 
@@ -937,6 +938,7 @@ mod tests {
             permissions: PermissionSet::parse("pipeline:write"),
             provider: "service".to_owned(),
             must_change_password: false,
+            role_names: Vec::new(),
         }
     }
 

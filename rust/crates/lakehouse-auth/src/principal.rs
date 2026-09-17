@@ -75,6 +75,18 @@ pub struct Principal {
     /// an extra database round trip beyond what identifying the caller
     /// already costs.
     pub must_change_password: bool,
+    /// Names of every role this principal holds (`role.name`), e.g.
+    /// `["Analyst", "Approver"]`. Empty for a service identity (a
+    /// [`crate::service_token`]-derived principal has scopes, not roles).
+    ///
+    /// Distinct from `permissions`: two principals holding different role
+    /// SETS can still merge to an identical `PermissionSet` (e.g. one role
+    /// granting `pipeline:*` directly vs. two roles whose union happens to
+    /// cover the same tokens), so `permissions.has(...)` cannot answer "does
+    /// this principal hold role X" — the `lakehouse-api` policy engine
+    /// (WS7) needs the real names because authored policy
+    /// `conditions.roles` names roles, not permission strings.
+    pub role_names: Vec<String>,
 }
 
 impl Principal {
@@ -130,7 +142,14 @@ mod tests {
             permissions: PermissionSet::parse("query:read, catalog:read"),
             provider: "local".to_owned(),
             must_change_password: false,
+            role_names: vec!["Analyst".to_owned()],
         }
+    }
+
+    #[test]
+    fn role_names_are_carried_alongside_the_merged_permission_set() {
+        let principal = sample_principal();
+        assert_eq!(principal.role_names, vec!["Analyst".to_owned()]);
     }
 
     #[test]

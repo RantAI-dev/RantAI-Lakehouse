@@ -1510,6 +1510,7 @@ mod tests {
             permissions: PermissionSet::parse("agent:approve"),
             provider: "session".to_owned(),
             must_change_password: false,
+            role_names: Vec::new(),
         }
     }
 
@@ -1522,6 +1523,7 @@ mod tests {
             permissions: PermissionSet::parse("agent:approve"),
             provider: "service".to_owned(),
             must_change_password: false,
+            role_names: Vec::new(),
         }
     }
 
@@ -1659,6 +1661,7 @@ mod tests {
             permissions: admin_perms(),
             provider: "session".to_owned(),
             must_change_password: false,
+            role_names: Vec::new(),
         }
     }
 
@@ -1670,6 +1673,7 @@ mod tests {
             permissions: PermissionSet::default(),
             provider: "session".to_owned(),
             must_change_password: false,
+            role_names: Vec::new(),
         }
     }
 

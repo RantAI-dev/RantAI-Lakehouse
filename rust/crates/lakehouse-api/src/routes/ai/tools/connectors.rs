@@ -142,6 +142,7 @@ mod tests {
             permissions: PermissionSet::parse("connector:manage"),
             provider: "session".to_owned(),
             must_change_password: false,
+            role_names: Vec::new(),
         }
     }
 

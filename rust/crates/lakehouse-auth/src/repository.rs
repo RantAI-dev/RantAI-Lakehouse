@@ -69,18 +69,16 @@ pub async fn load_principal_for_user(
         return Err(AuthError::NotFound);
     };
 
-    let permission_strings: Vec<(String,)> = sqlx::query_as(
-        "SELECT r.permissions FROM app_user_role ur \
+    let role_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT r.name, r.permissions FROM app_user_role ur \
          JOIN role r ON r.id = ur.role_id WHERE ur.user_id = $1",
     )
     .bind(user_id)
     .fetch_all(pool)
     .await?;
-    let permissions = PermissionSet::merge(
-        permission_strings
-            .iter()
-            .map(|(raw,)| PermissionSet::parse(raw)),
-    );
+    let role_names: Vec<String> = role_rows.iter().map(|(name, _)| name.clone()).collect();
+    let permissions =
+        PermissionSet::merge(role_rows.iter().map(|(_, raw)| PermissionSet::parse(raw)));
 
     let tenant_ids: Vec<(Uuid,)> =
         sqlx::query_as("SELECT tenant_id FROM app_user_tenant WHERE user_id = $1")
@@ -95,6 +93,7 @@ pub async fn load_principal_for_user(
         permissions,
         provider,
         must_change_password,
+        role_names,
     })
 }
 

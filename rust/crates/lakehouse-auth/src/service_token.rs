@@ -151,6 +151,9 @@ pub async fn verify_service_token(pool: &PgPool, token: &Secret) -> Result<Princ
         // cannot itself change a password), so there is nothing for this
         // flag to mean here — always `false`.
         must_change_password: false,
+        // A service identity's scopes are not roles; no authored policy
+        // names a service principal by role today.
+        role_names: Vec::new(),
     })
 }
 

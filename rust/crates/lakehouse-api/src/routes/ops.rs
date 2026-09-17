@@ -1099,6 +1099,7 @@ mod tests {
             permissions: PermissionSet::parse(permissions),
             provider: "session".to_owned(),
             must_change_password: false,
+            role_names: Vec::new(),
         }
     }
 

@@ -50,6 +50,19 @@ async fn a_freshly_issued_token_verifies_with_the_identitys_scopes_as_permission
     Ok(())
 }
 
+/// A service identity's scopes are not roles (WS7 item A1): no authored
+/// policy names a service principal by role, so `Principal.role_names`
+/// must come back empty rather than derived from `scopes`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn role_names_empty_for_a_service_principal(pool: PgPool) -> sqlx::Result<()> {
+    let service_id = Uuid::parse_str(BI_DASHBOARD_READER).unwrap();
+    let token = create_service_credential(&pool, service_id).await.unwrap();
+
+    let principal = verify_service_token(&pool, &token).await.unwrap();
+    assert!(principal.role_names.is_empty());
+    Ok(())
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_revoked_service_token_is_rejected(pool: PgPool) -> sqlx::Result<()> {
     let service_id = Uuid::parse_str(BI_DASHBOARD_READER).unwrap();
