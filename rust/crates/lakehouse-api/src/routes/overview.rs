@@ -43,7 +43,8 @@ enum OverviewError {
 /// queries, and pipelines.
 pub async fn get(State(state): State<AppState>) -> Response {
     let probes = crate::health::cached_probe_all(&state).await;
-    match get_body(&state.clickhouse, &state.dagster, &probes).await {
+    let pg = state.pg.as_deref();
+    match get_body(&state.clickhouse, &state.dagster, pg, &probes).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         // `catch (e) { return NextResponse.json({ error: String(e) }, {
         // status: 503 }); }` in `overview/route.ts` GET.
@@ -58,6 +59,7 @@ pub async fn get(State(state): State<AppState>) -> Response {
 async fn get_body(
     ch: &ChClient,
     dagster: &DgClient,
+    pg: Option<&PgPool>,
     probes: &[crate::health::ServiceHealth],
 ) -> Result<Value, OverviewError> {
     let assets_row = ch
@@ -105,6 +107,26 @@ async fn get_body(
     let jobs = dagster.list_jobs_with_schedules().await?;
     let delayed = count_delayed_schedules(dagster, &jobs, OffsetDateTime::now_utc()).await;
 
+    // `overview.pendingApprovals`/`agents.activeRuns` (WS5 item B2): `null`
+    // both when no Postgres pool is configured and when a configured
+    // pool's query fails -- the rest of `/api/overview` is real without
+    // Postgres, so a Postgres hiccup degrades these two fields to
+    // "not measured," never a 503 for the whole page and never a
+    // fabricated `0`.
+    let (pending_approvals, active_agent_runs) = match pg {
+        Some(pool) => (
+            lakehouse_store::agents::count_pending_approvals(pool)
+                .await
+                .inspect_err(|err| tracing::warn!(%err, "count_pending_approvals failed"))
+                .ok(),
+            lakehouse_store::agents::count_active_agent_runs(pool)
+                .await
+                .inspect_err(|err| tracing::warn!(%err, "count_active_agent_runs failed"))
+                .ok(),
+        ),
+        None => (None, None),
+    };
+
     let now_ms = now_unix_millis();
     let recent: Vec<&lakehouse_dagster::DgRun> = runs
         .iter()
@@ -121,8 +143,15 @@ async fn get_body(
     let warm_row = warm_row.first();
     let q_row = q_row.first();
 
+    let counts = SummaryCounts {
+        active,
+        failed,
+        delayed,
+        pending_approvals,
+        active_agent_runs,
+    };
     Ok(summary_json(
-        assets_row, hot_row, warm_row, q_row, active, failed, delayed, probes,
+        assets_row, hot_row, warm_row, q_row, &counts, probes,
     ))
 }
 
@@ -132,26 +161,39 @@ async fn get_body(
 /// `ClickHouse`/`Dagster` connection.
 ///
 /// WS1 task 1.8: `queries.cacheAssistRate`, `policyViolations7d`,
-/// `pendingApprovals`, `agents.*`, and the `cold`/`ai` tiers are `null`
-/// because nothing in this route measures them today — no cache-hit
-/// signal, no policy engine, no Postgres pool for approvals, no agent-run
-/// accounting. `warm.bytes` is `null` because `rows * 220` was an invented
-/// per-row byte size, not a measurement. `pipelines.delayed` (WS5 item B1)
-/// and `services.healthy/degraded/unhealthy` (WS5 item A4) are real,
-/// measured counts. WS5 also wires up approvals and agent-run counts
-/// (item B2); WS7 owns the policy engine and agent budgets. The
-/// `streaming` and `incidents` structures are dropped entirely (not
-/// nulled): neither was ever measured, and — apart from the incidents
-/// card, removed alongside this — nothing in the `TypeScript` client reads
-/// either one.
+/// `agents.budgetUsedRate`, and the `cold`/`ai` tiers are `null` because
+/// nothing in this route measures them today — no cache-hit signal, no
+/// policy engine, no agent-run budget accounting. `warm.bytes` is `null`
+/// because `rows * 220` was an invented per-row byte size, not a
+/// measurement. `pipelines.delayed` (WS5 item B1) and
+/// `services.healthy/degraded/unhealthy` (WS5 item A4) are real, measured
+/// counts. `pendingApprovals`/`agents.activeRuns` (WS5 item B2) are real
+/// Postgres counts when a pool is configured and the query succeeds,
+/// `null` otherwise (no pool, or the query itself failed) — never a
+/// fabricated `0`, which would read as "definitely zero waiting" rather
+/// than "not measured right now." WS7 owns the policy engine and agent
+/// budgets. The `streaming` and `incidents` structures are dropped
+/// entirely (not nulled): neither was ever measured, and — apart from the
+/// incidents card, removed alongside this — nothing in the `TypeScript`
+/// client reads either one.
+/// The `pipelines`/`agents` counters `summary_json` needs, grouped into
+/// one struct purely to stay under `clippy::too_many_arguments` -- these
+/// have no shared invariant beyond "computed once in `get_body`, read
+/// once here".
+struct SummaryCounts {
+    active: usize,
+    failed: usize,
+    delayed: usize,
+    pending_approvals: Option<i64>,
+    active_agent_runs: Option<i64>,
+}
+
 fn summary_json(
     assets_row: Option<&serde_json::Map<String, Value>>,
     hot_row: Option<&serde_json::Map<String, Value>>,
     warm_row: Option<&serde_json::Map<String, Value>>,
     q_row: Option<&serde_json::Map<String, Value>>,
-    active: usize,
-    failed: usize,
-    delayed: usize,
+    counts: &SummaryCounts,
     probes: &[crate::health::ServiceHealth],
 ) -> Value {
     json!({
@@ -163,7 +205,7 @@ fn summary_json(
             "cold": { "count": Value::Null, "bytes": Value::Null },
             "ai": { "count": Value::Null, "bytes": Value::Null },
         },
-        "pipelines": { "active": active, "failed": failed, "delayed": delayed },
+        "pipelines": { "active": counts.active, "failed": counts.failed, "delayed": counts.delayed },
         "queries": {
             "volume24h": num_or_zero(q_row, "vol"),
             "p95Ms": num_or_zero(q_row, "p95"),
@@ -172,8 +214,12 @@ fn summary_json(
             "scannedBytes24h": num_or_zero(q_row, "scan"),
         },
         "policyViolations7d": Value::Null,
-        "pendingApprovals": Value::Null,
-        "agents": { "activeRuns": Value::Null, "budgetUsedRate": Value::Null },
+        "pendingApprovals": counts.pending_approvals,
+        // `budgetUsedRate` stays `Value::Null` -- WS7 owns budget
+        // accounting; no code updates `budget_consumed`/`budget_reserved`
+        // yet, and WS5 does not add a writer for it, only a reader would
+        // be dishonest without one.
+        "agents": { "activeRuns": counts.active_agent_runs, "budgetUsedRate": Value::Null },
         "services": {
             "healthy": probes.iter().filter(|h| h.checked && h.ok).count(),
             // Always 0 -- none of `health::probe_all`'s six probes ever
@@ -480,7 +526,14 @@ mod tests {
 
     #[test]
     fn overview_reports_every_unmeasured_tile_as_null_and_drops_fabricated_structures() {
-        let v = summary_json(None, None, None, None, 0, 0, 0, &[]);
+        let counts = SummaryCounts {
+            active: 0,
+            failed: 0,
+            delayed: 0,
+            pending_approvals: None,
+            active_agent_runs: None,
+        };
+        let v = summary_json(None, None, None, None, &counts, &[]);
 
         assert!(
             v["assetsByTier"]["warm"]["bytes"].is_null(),
@@ -547,12 +600,37 @@ mod tests {
             fixture("dagster", true, false),
             fixture("trino", false, false),
         ];
-        let v = summary_json(None, None, None, None, 0, 0, 0, &probes);
+        let counts = SummaryCounts {
+            active: 0,
+            failed: 0,
+            delayed: 0,
+            pending_approvals: None,
+            active_agent_runs: None,
+        };
+        let v = summary_json(None, None, None, None, &counts, &probes);
         assert_eq!(v["services"]["healthy"], 1);
         assert_eq!(v["services"]["unhealthy"], 1);
         assert_eq!(
             v["services"]["degraded"], 0,
             "no probe in this set ever reports degraded"
         );
+    }
+
+    /// WS5 item B2 -- when a Postgres pool is configured and its counts
+    /// succeed, `pendingApprovals`/`agents.activeRuns` are the real counts,
+    /// never left `null` (the `null` path is only for "no pool" or "the
+    /// query failed", asserted above via `None`).
+    #[test]
+    fn overview_reports_real_pending_approvals_and_active_agent_runs_when_measured() {
+        let counts = SummaryCounts {
+            active: 0,
+            failed: 0,
+            delayed: 0,
+            pending_approvals: Some(3),
+            active_agent_runs: Some(2),
+        };
+        let v = summary_json(None, None, None, None, &counts, &[]);
+        assert_eq!(v["pendingApprovals"], 3);
+        assert_eq!(v["agents"]["activeRuns"], 2);
     }
 }

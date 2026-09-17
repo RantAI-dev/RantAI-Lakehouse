@@ -1306,6 +1306,34 @@ pub async fn create_linked_approval(
     Ok(approval_id)
 }
 
+/// `overview.pendingApprovals` (WS5 item B2): the count of approval items
+/// still waiting on a human decision.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any query failure.
+pub async fn count_pending_approvals(pool: &PgPool) -> Result<i64, StoreError> {
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM approval_item WHERE status = 'pending'")
+        .fetch_one(pool)
+        .await?;
+    Ok(n)
+}
+
+/// `overview.agents.activeRuns` (WS5 item B2): the count of `agent_run`
+/// rows currently executing (`status = 'running'`) -- a run that has
+/// finished (`succeeded`/`failed`) or is paused on a human decision
+/// (`waiting_approval`) does not count.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any query failure.
+pub async fn count_active_agent_runs(pool: &PgPool) -> Result<i64, StoreError> {
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_run WHERE status = 'running'")
+        .fetch_one(pool)
+        .await?;
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

@@ -22,10 +22,10 @@ use lakehouse_test_support as _;
 use lakehouse_store::StoreError;
 use lakehouse_store::agents::{
     COPILOT_EMPLOYEE_ID, CreateEmployeeInput, CreatedApproval, Decision, LinkedApprovalRequest,
-    NewApprovalRequest, RunStep, append_run_step, create_employee, create_linked_approval,
-    create_pending_approval, create_run, decide_approval, finish_run, get_employee,
-    get_employee_run_config, get_run, list_approvals, list_employees, list_runs,
-    list_scheduled_employees, list_tools, list_workflows, mark_run_waiting_approval,
+    NewApprovalRequest, RunStep, append_run_step, count_active_agent_runs, count_pending_approvals,
+    create_employee, create_linked_approval, create_pending_approval, create_run, decide_approval,
+    finish_run, get_employee, get_employee_run_config, get_run, list_approvals, list_employees,
+    list_runs, list_scheduled_employees, list_tools, list_workflows, mark_run_waiting_approval,
     pending_tool_call, record_run_outcome, resume_employee, revoke_employee, suspend_employee,
 };
 use serde_json::json;
@@ -892,5 +892,75 @@ async fn unmeasured_run_budget_consumed_is_none_not_insert_time_default(
         .unwrap()
         .unwrap();
     assert_eq!(run.budget_consumed, None);
+    Ok(())
+}
+
+/// `overview.pendingApprovals` (WS5 item B2): only `status = 'pending'`
+/// rows count -- an `approved`/`rejected` approval is no longer waiting on
+/// anyone.
+#[sqlx::test(migrations = "../../migrations")]
+async fn count_pending_approvals_counts_only_pending_status(pool: PgPool) -> sqlx::Result<()> {
+    insert_approval(
+        &pool,
+        "appr-pending-1",
+        "emp-inventory",
+        "inventory-copilot",
+        None,
+        "pending",
+    )
+    .await;
+    insert_approval(
+        &pool,
+        "appr-pending-2",
+        "emp-inventory",
+        "inventory-copilot",
+        None,
+        "pending",
+    )
+    .await;
+    insert_approval(
+        &pool,
+        "appr-approved-1",
+        "emp-inventory",
+        "inventory-copilot",
+        None,
+        "approved",
+    )
+    .await;
+    insert_approval(
+        &pool,
+        "appr-rejected-1",
+        "emp-risk",
+        "ops-sentinel",
+        None,
+        "rejected",
+    )
+    .await;
+
+    assert_eq!(count_pending_approvals(&pool).await.unwrap(), 2);
+    Ok(())
+}
+
+/// `overview.agents.activeRuns` (WS5 item B2): only `status = 'running'`
+/// rows count -- a `succeeded`/`failed`/`waiting_approval` run has already
+/// finished (or paused), it is not an active run.
+#[sqlx::test(migrations = "../../migrations")]
+async fn count_active_agent_runs_counts_only_running_status(pool: PgPool) -> sqlx::Result<()> {
+    insert_run(&pool, "run-active-1", "emp-inventory").await;
+    insert_run(&pool, "run-active-2", "emp-risk").await;
+    sqlx::query("INSERT INTO agent_run (id, employee_id, status, trigger, actor, steps) VALUES ($1, $2, 'succeeded', 'test', 'test-actor', '[]'::jsonb)")
+        .bind("run-succeeded-1")
+        .bind("emp-inventory")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO agent_run (id, employee_id, status, trigger, actor, steps) VALUES ($1, $2, 'failed', 'test', 'test-actor', '[]'::jsonb)")
+        .bind("run-failed-1")
+        .bind("emp-risk")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(count_active_agent_runs(&pool).await.unwrap(), 2);
     Ok(())
 }
