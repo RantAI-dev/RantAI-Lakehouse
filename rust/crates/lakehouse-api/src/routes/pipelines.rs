@@ -550,10 +550,29 @@ fn schedule_mutation_body(job: &DgJob, paused: bool) -> Value {
 /// can't be terminated (already finished, ...); 503 on a transport
 /// failure.
 pub async fn cancel_run(State(state): State<AppState>, Path(run_id): Path<String>) -> Response {
+    // The run being cancelled is the SAME run whose real start time is
+    // already knowable via `pipeline_run_status` (cheaper than
+    // `run_steps`, since only the run's own `startTime` is needed here,
+    // not its per-step materializations). A lookup failure or a run
+    // Dagster reports as not-yet-started both fall through to `None` —
+    // reporting the terminate mutation's own outcome must not be blocked
+    // on an unrelated status query.
+    let started_at = state
+        .dagster
+        .pipeline_run_status(&run_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|info| info.start_time)
+        .map(iso_from_unix_seconds);
     match state.dagster.terminate_run(&run_id).await {
         Ok(outcome) if outcome.error.is_none() => (
             StatusCode::OK,
-            ApiJson(run_mutation_body(&run_id, "cancelled")),
+            ApiJson(run_mutation_body(
+                &run_id,
+                "cancelled",
+                started_at.as_deref(),
+            )),
         )
             .into_response(),
         Ok(outcome) => dagster_mutation_failure(outcome.error),
@@ -575,9 +594,13 @@ pub async fn retry_run(State(state): State<AppState>, Path(run_id): Path<String>
     match state.dagster.launch_reexecution(&run_id).await {
         Ok(outcome) if outcome.error.is_none() => {
             let new_id = outcome.run_id.unwrap_or(run_id);
+            // The NEW run's id, just launched: `Dagster` has not populated
+            // its `startTime` yet at the instant this handler returns, so
+            // `None` is the honest value here — looking up the PARENT
+            // run's start time would report the wrong run's timestamp.
             (
                 StatusCode::OK,
-                ApiJson(run_mutation_body(&new_id, "running")),
+                ApiJson(run_mutation_body(&new_id, "running", None)),
             )
                 .into_response()
         }
@@ -597,12 +620,16 @@ pub async fn retry_run(State(state): State<AppState>, Path(run_id): Path<String>
 /// already knows (it's the pipeline it just cancelled/retried a run of), so
 /// `pipelineId` is left empty here, same tradeoff the contract's `runId`
 /// signature already forces.
-fn run_mutation_body(run_id: &str, status: &str) -> Value {
+fn run_mutation_body(run_id: &str, status: &str, started_at: Option<&str>) -> Value {
     json!({
         "id": run_id,
         "pipelineId": "",
         "status": status,
-        "startedAt": now_iso(),
+        // A timestamp the backend did not observe is a fabricated
+        // measurement (WS4 item G1): `started_at` is `None` unless the
+        // caller actually looked up the run's real start time, and the
+        // field stays `null` rather than being defaulted to `now()`.
+        "startedAt": started_at,
         // Same as run_to_json: see the note there.
         "processed": Value::Null,
         "accepted": Value::Null,
@@ -663,11 +690,23 @@ mod tests {
 
     #[test]
     fn run_mutation_body_emits_null_for_unmeasured_fields() {
-        let v = run_mutation_body("r1", "cancelled");
+        let v = run_mutation_body("r1", "cancelled", None);
 
         for key in ["processed", "accepted", "rejected", "retried", "costUnits"] {
             assert!(v[key].is_null(), "{key} must be null, got {}", v[key]);
         }
+    }
+
+    #[test]
+    fn run_mutation_body_reports_a_real_started_at_when_known_and_null_otherwise() {
+        let v = run_mutation_body("r1", "cancelled", None);
+        assert!(
+            v["startedAt"].is_null(),
+            "no real start time was supplied; must not fabricate now()"
+        );
+
+        let v2 = run_mutation_body("r1", "running", Some("2026-01-01T00:00:00.000Z"));
+        assert_eq!(v2["startedAt"], "2026-01-01T00:00:00.000Z");
     }
 
     #[test]

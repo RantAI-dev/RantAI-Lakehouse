@@ -253,6 +253,10 @@ pub struct RunStatusInfo {
     pub status: String,
     /// Each step's key + status, in `Dagster`'s reported order.
     pub steps: Vec<RunStepStatus>,
+    /// Unix seconds the run started, or `None` if `Dagster` hasn't
+    /// recorded one yet (WS4 item G1 — the value the API layer reports as
+    /// `startedAt` when it can, rather than fabricating `now()`).
+    pub start_time: Option<f64>,
 }
 
 /// Outcome of [`DgClient::launch_run`], mirroring the TypeScript's
@@ -679,7 +683,7 @@ impl DgClient {
         run_id: &str,
     ) -> Result<Option<RunStatusInfo>, DgError> {
         let query = "query($rid:ID!){ pipelineRunOrError(runId:$rid){ __typename \
-                      ... on Run { status stepStats { stepKey status } } } }";
+                      ... on Run { status startTime stepStats { stepKey status } } } }";
         let body = json!({ "query": query, "variables": { "rid": run_id } });
         let resp = self.client.post(&self.url).json(&body).send().await?;
         let text = resp.text().await?;
@@ -697,6 +701,7 @@ impl DgClient {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .to_owned();
+        let start_time = run.get("startTime").and_then(Value::as_f64);
         let steps = run
             .get("stepStats")
             .and_then(Value::as_array)
@@ -717,7 +722,11 @@ impl DgClient {
                     .collect()
             })
             .unwrap_or_default();
-        Ok(Some(RunStatusInfo { status, steps }))
+        Ok(Some(RunStatusInfo {
+            status,
+            steps,
+            start_time,
+        }))
     }
 
     /// Whether the `Dagster` GraphQL endpoint is reachable, checked via its
@@ -1091,6 +1100,7 @@ mod tests {
             .and(path("/graphql"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": { "pipelineRunOrError": { "__typename": "Run", "status": "SUCCESS",
+                    "startTime": 1_756_267_200.0,
                     "stepStats": [ { "stepKey": "bronze_sdi", "status": "SUCCESS" } ] } }
             })))
             .mount(&server)
@@ -1105,6 +1115,28 @@ mod tests {
         assert_eq!(info.status, "SUCCESS");
         assert_eq!(info.steps.len(), 1);
         assert_eq!(info.steps[0].key, "bronze_sdi");
+        assert_eq!(info.start_time, Some(1_756_267_200.0));
+    }
+
+    #[tokio::test]
+    // WS4 item G1: a run `Dagster` hasn't started yet reports `startTime:
+    // null` over GraphQL — this must parse to `None`, never a fabricated
+    // 0.0/now() value the API layer would then render as a fake ISO
+    // timestamp.
+    async fn pipeline_run_status_start_time_is_none_when_dagster_has_not_started_the_run() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "pipelineRunOrError": { "__typename": "Run", "status": "STARTING",
+                    "startTime": null, "stepStats": [] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let info = client.pipeline_run_status("r1").await.unwrap().unwrap();
+        assert!(info.start_time.is_none());
     }
 
     #[tokio::test]
