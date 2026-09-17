@@ -300,6 +300,37 @@ pub struct RunStep {
     pub materializations: Vec<StepMaterialization>,
 }
 
+/// One log line, from a `MessageEvent`-implementing event in a run's log
+/// stream, returned by [`DgClient::run_logs`].
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogLine {
+    /// Unix milliseconds the event was recorded — `Dagster` reports
+    /// `timestamp` as a STRING of milliseconds (`"1789668190285"`, not
+    /// seconds like `startTime`/`endTime`), parsed here.
+    pub ts: f64,
+    /// The event's log level (e.g. `"INFO"`, `"DEBUG"`, `"ERROR"`).
+    pub level: String,
+    /// The step this event belongs to, or `None` for a run-level event
+    /// (e.g. `RunEnqueuedEvent`, `RunFailureEvent`).
+    pub step_key: Option<String>,
+    /// The event's message — may be an empty string for structural events
+    /// that still implement `MessageEvent` (e.g. `RunEnqueuedEvent`).
+    pub message: String,
+}
+
+/// One page of a run's log stream, returned by [`DgClient::run_logs`].
+#[derive(Debug, Clone)]
+pub struct RunLogsPage {
+    /// Parsed `MessageEvent` lines, in `Dagster`'s reported order.
+    pub lines: Vec<LogLine>,
+    /// Opaque pagination cursor — pass as `after_cursor` to fetch the next
+    /// page.
+    pub cursor: String,
+    /// Whether more events exist after this page.
+    pub has_more: bool,
+}
+
 /// Outcome of [`DgClient::launch_run`], mirroring the TypeScript's
 /// `{ runId?: string; error?: string }` return shape (never a thrown
 /// error for a well-formed GraphQL response — failures are reported in
@@ -865,6 +896,84 @@ impl DgClient {
         Ok(steps)
     }
 
+    /// Fetch up to `limit` log lines for `run_id`, matching `logsForRun(runId,
+    /// afterCursor, limit) { __typename ... on EventConnection { events {
+    /// __typename ... on MessageEvent { message timestamp level stepKey }
+    /// } cursor hasMore } }` (WS4 item A1 — verified live against this
+    /// repository's own Dagster `1.13.20` stack; see
+    /// `tests/fixtures/run_logs_captured_fixture.json`). `logsForRun` is a
+    /// TOP-LEVEL query field, not nested under `Run`. Events in the union
+    /// that are not `MessageEvent` (rendered as `{"__typename": ...}` with
+    /// no `message`/`level`/`timestamp` under the `... on MessageEvent`
+    /// fragment) are silently skipped: a log viewer shows messages, not
+    /// every internal `Dagster` event type.
+    ///
+    /// Unlike [`DgClient::run_steps`], a run that doesn't exist here IS an
+    /// [`Err`] — the route maps it to a `404` (Phase C), a different
+    /// condition than "this run exists but has no log lines yet".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DgError::Transport`] on a network-level failure, or
+    /// [`DgError::Server`] when the response body isn't valid `JSON` or
+    /// `logsForRun.__typename` isn't `EventConnection` (`RunNotFoundError`,
+    /// `PythonError`).
+    pub async fn run_logs(
+        &self,
+        run_id: &str,
+        after_cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<RunLogsPage, DgError> {
+        let query = "query($rid:ID!,$after:String,$limit:Int!){ logsForRun(runId:$rid, \
+                      afterCursor:$after, limit:$limit){ __typename ... on EventConnection { \
+                      events { __typename ... on MessageEvent { message timestamp level \
+                      stepKey } } cursor hasMore } ... on RunNotFoundError { message } \
+                      ... on PythonError { message } } }";
+        let variables = json!({ "rid": run_id, "after": after_cursor, "limit": limit });
+        let body = json!({ "query": query, "variables": variables });
+        let resp = self.client.post(&self.url).json(&body).send().await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(DgError::Server(format!("Dagster HTTP {}", status.as_u16())));
+        }
+        let parsed: Value =
+            serde_json::from_str(&text).map_err(|e| DgError::Server(e.to_string()))?;
+        if let Some(errors) = parsed.get("errors") {
+            return Err(DgError::Server(truncate_300(&errors.to_string())));
+        }
+        let conn = parsed
+            .pointer("/data/logsForRun")
+            .ok_or_else(|| DgError::Server("Dagster response missing logsForRun".to_owned()))?;
+        if conn.get("__typename").and_then(Value::as_str) != Some("EventConnection") {
+            let message = conn
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Dagster run not found")
+                .to_owned();
+            return Err(DgError::Server(message));
+        }
+        let lines = conn
+            .get("events")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().filter_map(log_line_from_value).collect())
+            .unwrap_or_default();
+        let cursor = conn
+            .get("cursor")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let has_more = conn
+            .get("hasMore")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Ok(RunLogsPage {
+            lines,
+            cursor,
+            has_more,
+        })
+    }
+
     /// Whether the `Dagster` GraphQL endpoint is reachable, checked via its
     /// `/server_info` REST endpoint with a 3-second timeout — matching the
     /// `check("dagster", dagUrl)` helper in
@@ -1079,6 +1188,31 @@ fn asset_key_from(mat: &Value) -> Option<String> {
 fn seconds_to_ms(v: Option<&Value>) -> Option<i64> {
     v.and_then(Value::as_f64)
         .map(|secs| (secs * 1000.0).round() as i64)
+}
+
+/// Convert one `logsForRun.events` array element into a [`LogLine`], or
+/// `None` when the event doesn't carry the `MessageEvent` fields at all —
+/// `Dagster`'s `metadataEntries`-style unions omit fragment fields
+/// entirely for a `__typename` that doesn't implement the fragment's
+/// interface, rather than nulling them, so a missing `message` is this
+/// function's signal to skip the event (WS4 item A4: "the messages it
+/// could read", never a hard parse failure over one unrecognized event).
+fn log_line_from_value(e: &Value) -> Option<LogLine> {
+    let message = e.get("message").and_then(Value::as_str)?.to_owned();
+    let level = e.get("level").and_then(Value::as_str)?.to_owned();
+    // `Dagster` reports `timestamp` as a STRING of milliseconds, unlike
+    // `startTime`/`endTime`'s numeric seconds elsewhere in this client.
+    let ts = e
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<f64>().ok())?;
+    let step_key = e.get("stepKey").and_then(Value::as_str).map(str::to_owned);
+    Some(LogLine {
+        ts,
+        level,
+        step_key,
+        message,
+    })
 }
 
 /// `Dagster` run status → console `EntityStatus`, porting `mapRunStatus` in
@@ -1595,6 +1729,101 @@ mod tests {
             .unwrap();
         assert!(outcome.ok);
         assert!(outcome.error.is_none());
+    }
+
+    // ── WS4 item A4: run_logs ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_logs_parses_real_captured_fixture() {
+        let server = MockServer::start().await;
+        let body: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/run_logs_captured_fixture.json"
+        ))
+        .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let page = client
+            .run_logs("f13d18ca-0553-410e-8ebf-4a1286bdbbe5", None, 20)
+            .await
+            .unwrap();
+        // The real captured stream has 15 events, every one of them a
+        // MessageEvent variant (WS4 item A1 — this run's log stream never
+        // exercised a non-MessageEvent skip; see the synthetic test below).
+        assert_eq!(page.lines.len(), 15);
+        assert_eq!(
+            page.cursor,
+            "eyJ0eXBlIjogIlNUT1JBR0VfSUQiLCAidmFsdWUiOiA0Nn0="
+        );
+        assert!(!page.has_more);
+        let failure = page
+            .lines
+            .iter()
+            .find(|l| l.step_key.as_deref() == Some("run_bronze_maintenance") && l.level == "ERROR")
+            .unwrap();
+        assert!(failure.message.contains("failed"));
+    }
+
+    /// The real captured fixture's stream never contains a non-`MessageEvent`
+    /// union member (every event `Dagster` emitted for that run implements
+    /// the interface). This synthetic body (this crate's established
+    /// pattern for branches a capture can't exercise) proves a
+    /// `StepMaterializationEvent`-shaped entry — present only as
+    /// `{"__typename": ...}` with no `message`/`level`/`timestamp`, exactly
+    /// how a non-`MessageEvent` renders under the `... on MessageEvent`
+    /// fragment — is skipped rather than causing a parse error.
+    #[tokio::test]
+    async fn run_logs_skips_non_message_events_and_keeps_the_rest() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "logsForRun": { "__typename": "EventConnection", "events": [
+                    { "__typename": "MessageEvent", "message": "hello", "timestamp": "1000",
+                      "level": "INFO", "stepKey": null },
+                    { "__typename": "StepMaterializationEvent" },
+                    { "__typename": "MessageEvent", "message": "world", "timestamp": "2000",
+                      "level": "DEBUG", "stepKey": "step_a" }
+                ], "cursor": "c1", "hasMore": true } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let page = client.run_logs("r1", None, 20).await.unwrap();
+        assert_eq!(page.lines.len(), 2);
+        assert_eq!(page.lines[0].message, "hello");
+        assert_eq!(page.lines[1].message, "world");
+        assert_eq!(page.lines[1].step_key.as_deref(), Some("step_a"));
+        assert!(page.has_more);
+        assert_eq!(page.cursor, "c1");
+    }
+
+    /// Unlike [`run_steps_run_not_found_returns_empty_not_err`], a missing
+    /// run here is a genuine caller error — the route maps it to 404
+    /// (Phase C) rather than an empty page, since a log viewer that can't
+    /// find the run at all is a different condition than a run with no log
+    /// lines yet. Real shape verified live (WS4 item A1) against a bogus
+    /// run id: `logsForRun.__typename` becomes `RunNotFoundError`.
+    #[tokio::test]
+    async fn run_logs_run_not_found_is_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "logsForRun": { "__typename": "RunNotFoundError",
+                    "message": "Pipeline run nope could not be found." } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let err = client.run_logs("nope", None, 20).await.unwrap_err();
+        assert!(matches!(err, DgError::Server(_)));
     }
 
     // ── WS4 item A3: run_steps ──────────────────────────────────────────
