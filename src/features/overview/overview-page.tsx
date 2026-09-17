@@ -11,6 +11,7 @@ import {
 import { SectionCard } from "@/components/patterns/section-card"
 import { TierBadge } from "@/components/patterns/status-badge"
 import { useService } from "@/hooks/use-service"
+import { FreshnessStrip } from "./freshness-strip"
 import {
   formatBytes,
   formatCompactNumber,
@@ -141,6 +142,8 @@ export function OverviewPage() {
           </SectionCard>
         </>
       ) : null}
+
+      <FreshnessStrip />
 
       <SectionCard
         title="Recent activity"
