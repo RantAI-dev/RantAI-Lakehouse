@@ -30,11 +30,11 @@
 /// Real, observed `(label, sql)` results — hand-transcribed, never
 /// guessed — from
 /// `parses_real_repository_query_shapes::record_m1_class_parse_results`
-/// (Task B1 Step 3), run with `cargo test -p lakehouse-api --lib
+/// (WS7 item B1 Step 3), run with `cargo test -p lakehouse-api --lib
 /// sql_rewrite:: -- --nocapture` against `sqlparser` 0.62.0 with
 /// `ClickHouseDialect`. Of the twelve M1-listed leak classes, eleven
 /// parse under `ClickHouseDialect` today (`ARRAY JOIN` included) and are
-/// proven safe by `table_substitution`'s own tests (Task B3) instead.
+/// proven safe by `table_substitution`'s own tests (WS7 item B3) instead.
 /// Only `with_scalar_alias` (`WITH 2024 AS target_year SELECT * FROM
 /// silver.customers WHERE tahun = target_year` — a bare numeric-literal
 /// `WITH` binding, distinct from a `WITH ... AS (<query>)` CTE) is
@@ -42,10 +42,10 @@
 /// refused end-to-end (`RewriteError::Unparseable`), never silently
 /// treated as touching no governed table — see
 /// `refuses_unparseable_shapes::every_recorded_unparseable_class_is_refused_end_to_end`
-/// (Task B4).
+/// (WS7 item B4).
 #[allow(
     dead_code,
-    reason = "only a #[cfg(test)] reader exists (Task B4's \
+    reason = "only a #[cfg(test)] reader exists (WS7 item B4's \
               refuses_unparseable_shapes module); never reachable from the \
               lakehouse-api binary target until Phase C wires enforce() in"
 )]
@@ -70,7 +70,7 @@ use sqlparser::parser::Parser;
 /// (the `visitor` Cargo feature enabled in this crate's `Cargo.toml`),
 /// never a hand-written recursive match over every `Expr` variant that
 /// could silently miss one. [`referenced_tables`] and
-/// [`substitute_governed_tables`] (Task B3) both start from this same
+/// [`substitute_governed_tables`] (WS7 item B3) both start from this same
 /// flattening, so neither can miss a table hiding inside an expression
 /// position the other author did not think to hand-enumerate.
 struct QueryCollector {
@@ -100,10 +100,10 @@ fn all_queries(stmt: &sqlparser::ast::Statement) -> Vec<Query> {
 /// that as "cannot prove this query touches no governed table" and
 /// refuses per the fail-closed rule (WS7 plan, Hard Requirement 2).
 /// Read-only: used to decide WHICH tables need substitution before
-/// [`substitute_governed_tables`]'s mutating pass runs (Task B3), and
+/// [`substitute_governed_tables`]'s mutating pass runs (WS7 item B3), and
 /// (unlike that pass) collapses a self-join's two occurrences of the
 /// same table into one name — a call site that needs every AST
-/// POSITION, not just every distinct name, uses Task B3's
+/// POSITION, not just every distinct name, uses WS7 item B3's
 /// `substitute_governed_tables` directly.
 ///
 /// A bare, unqualified table name is excluded here whenever it matches
@@ -168,7 +168,7 @@ fn top_level_table_with_joins(query: &Query) -> Vec<&sqlparser::ast::TableWithJo
 
 /// Records `factor`'s own canonical table name into `out`, when it is
 /// an ordinary `TableFactor::Table` naming a real table (not a
-/// table-function call — `args.is_some()` — which Task B5 classifies
+/// table-function call — `args.is_some()` — which WS7 item B5 classifies
 /// and refuses separately, and not a bare name matching a CTE alias).
 /// Does NOT recurse into `TableFactor::Derived`'s subquery or
 /// `TableFactor::NestedJoin`'s inner joins beyond one level of
@@ -304,7 +304,7 @@ mod table_resolution {
 
         // A self-join names the SAME canonical table twice, at two
         // distinct AST positions — referenced_tables (a set) collapses
-        // that to one canonical name, but Task B3's MUTATING walk
+        // that to one canonical name, but WS7 item B3's MUTATING walk
         // (unlike this read-only one) visits and substitutes both
         // TableFactor nodes independently, proven by its own
         // `self_join` test, not this one.
@@ -336,7 +336,7 @@ pub enum RewriteError {
     #[error("statement did not parse under the configured SQL dialect")]
     Unparseable,
     /// A governed table's obligations could not be turned into a safe
-    /// rewrite — most commonly `real_columns: None` (Task B3's own
+    /// rewrite — most commonly `real_columns: None` (WS7 item B3's own
     /// `refuses_when_the_real_column_list_is_unknown` test), but also
     /// the fail-closed backstop in [`substitute_governed_tables`]: a
     /// table this function proved (via [`referenced_tables`]) is
@@ -349,7 +349,7 @@ pub enum RewriteError {
         table: String,
     },
     /// An authored row filter is not a real, validated expression —
-    /// Task B4 formalizes the exact grammar this rejects.
+    /// WS7 item B4 formalizes the exact grammar this rejects.
     #[error("invalid row filter: {reason}")]
     InvalidRowFilter {
         /// The specific problem found in the filter text.
@@ -385,7 +385,7 @@ pub enum RewriteError {
     #[allow(
         dead_code,
         reason = "only a #[cfg(test)] constructor exists in this commit \
-                  (Task B5's classify_views tests); Task B6's enforce() is \
+                  (WS7 item B5's classify_views tests); WS7 item B6's enforce() is \
                   the first production caller"
     )]
     ViewOverGovernedTable {
@@ -413,7 +413,7 @@ pub struct TableObligations {
 }
 
 /// The calling principal's own id/tenant ids, expanded into a row
-/// filter's two closed placeholders (Task B4, M3) — threaded from the
+/// filter's two closed placeholders (WS7 item B4, M3) — threaded from the
 /// real `Principal` in Phase C, never read from anywhere else, so a
 /// placeholder can never expand to anyone but the actual caller.
 #[derive(Debug, Clone, Default)]
@@ -431,8 +431,8 @@ impl PlaceholderValues {
     #[must_use]
     #[allow(
         dead_code,
-        reason = "no non-test caller exists yet in this commit (Task B3); \
-                  Task B6's enforce() and Phase C's real principal wiring are \
+        reason = "no non-test caller exists yet in this commit (WS7 item B3); \
+                  WS7 item B6's enforce() and Phase C's real principal wiring are \
                   the first production callers"
     )]
     pub fn none() -> Self {
@@ -451,7 +451,7 @@ pub const PRINCIPAL_TENANT_IDS_PLACEHOLDER: &str = "__principal_tenant_ids__";
 /// Requirement 2).
 const ALLOWED_ROW_FILTER_FUNCTIONS: &[&str] = &["lower", "upper", "tostring", "todate"];
 
-/// The one entry point Task B6 calls. Parses `sql`, and for EVERY
+/// The one entry point WS7 item B6 calls. Parses `sql`, and for EVERY
 /// `TableFactor::Table` this module can reach — any `FROM`, any
 /// `JOIN`'s relation, inside a CTE's own body, inside each `UNION`
 /// branch, inside a derived-table subquery, inside a `WHERE`/`HAVING`/
@@ -464,7 +464,7 @@ const ALLOWED_ROW_FILTER_FUNCTIONS: &[&str] = &["lower", "upper", "tostring", "t
 ///
 /// After the mutating pass, this function re-checks: every table
 /// [`referenced_tables`] (an exhaustive, `Visit`-based read-only walk —
-/// Task B2) proves is touched SOMEWHERE in `sql` AND has an
+/// WS7 item B2) proves is touched SOMEWHERE in `sql` AND has an
 /// `obligations` entry must also appear in the set of tables the
 /// mutating pass actually substituted. The mutating pass's own
 /// recursion into expression positions (`WHERE`/`HAVING`/`SELECT`-list
@@ -483,8 +483,8 @@ const ALLOWED_ROW_FILTER_FUNCTIONS: &[&str] = &["lower", "upper", "tostring", "t
 /// the mutating pass never reached.
 #[allow(
     dead_code,
-    reason = "no non-test caller exists yet in this commit (Task B3); \
-              Task B6's enforce() is the first production caller"
+    reason = "no non-test caller exists yet in this commit (WS7 item B3); \
+              WS7 item B6's enforce() is the first production caller"
 )]
 #[allow(
     clippy::implicit_hasher,
@@ -532,7 +532,7 @@ fn substitute_in_statement(
         Statement::Explain { statement, .. } => {
             substitute_in_statement(statement, dialect, obligations, placeholders, substituted)
         }
-        // Every other statement kind is handled by Task B5's refusal
+        // Every other statement kind is handled by WS7 item B5's refusal
         // rules, which run before this function is reached — see Task
         // B6's `enforce`.
         _ => Ok(()),
@@ -852,7 +852,7 @@ fn substitute_table_factor(
         }
         // A table-function call (`args.is_some()`, matched by the
         // `TableFactor::Table { .. } if args.is_none()` guard above
-        // failing) is classified and refused by Task B5, not resolved
+        // failing) is classified and refused by WS7 item B5, not resolved
         // as a normal table reference here; any other `TableFactor`
         // variant has no table reference to substitute.
         _ => Ok(()),
@@ -1407,8 +1407,8 @@ mod table_substitution {
     }
 }
 
-/// Task B4's own executable specification for the row-filter grammar
-/// introduced (out of strict task order — see Task B3's commit
+/// WS7 item B4's own executable specification for the row-filter grammar
+/// introduced (out of strict task order — see WS7 item B3's commit
 /// message) alongside table substitution: every bare identifier is a
 /// real column or [`PRINCIPAL_ID_PLACEHOLDER`];
 /// [`PRINCIPAL_TENANT_IDS_PLACEHOLDER`] is valid only as the sole `IN
@@ -1533,7 +1533,7 @@ mod row_filter {
     }
 }
 
-/// Consumes Task B1's `REFUSED_UNPARSEABLE` (populated with the real,
+/// Consumes WS7 item B1's `REFUSED_UNPARSEABLE` (populated with the real,
 /// observed `record_m1_class_parse_results` output) to prove every
 /// class recorded there is refused end to end through the real entry
 /// point, never silently dropped from coverage or treated as touching
@@ -1760,7 +1760,7 @@ pub fn classify_statement_for_principal(
 /// Same as [`classify_statement_for_principal`].
 #[allow(
     dead_code,
-    reason = "no non-test caller exists yet in this commit (Task B5); \
+    reason = "no non-test caller exists yet in this commit (WS7 item B5); \
               a future no-principal-context caller (or a test using it \
               directly) is the first production caller"
 )]
@@ -1772,12 +1772,12 @@ pub fn classify_statement(sql: &str, dialect: &dyn Dialect) -> Result<(), Rewrit
 /// [`classify_views`] can tell a view reading a governed table from an
 /// ordinary one. The real implementation (Phase C) queries `SELECT
 /// engine, create_table_query FROM system.tables WHERE (database,
-/// name) = (...)`; `NoViews` (Task B6) implements this as "nothing is
+/// name) = (...)`; `NoViews` (WS7 item B6) implements this as "nothing is
 /// ever a view", for a caller with no catalog access at all.
 #[allow(
     dead_code,
     reason = "only a #[cfg(test)] implementor exists in this commit \
-              (Task B5's FakeSystemTablesCatalog); Task B6's NoViews and \
+              (WS7 item B5's FakeSystemTablesCatalog); WS7 item B6's NoViews and \
               Phase C's real implementation are the first production callers"
 )]
 pub trait SystemTablesCatalog {
@@ -1806,8 +1806,8 @@ pub trait SystemTablesCatalog {
 )]
 #[allow(
     dead_code,
-    reason = "no non-test caller exists yet in this commit (Task B5); \
-              Task B6's enforce() is the first production caller"
+    reason = "no non-test caller exists yet in this commit (WS7 item B5); \
+              WS7 item B6's enforce() is the first production caller"
 )]
 pub fn classify_views(
     sql: &str,
@@ -1852,7 +1852,7 @@ mod refusals {
     /// The full, real `ClickHouse` table-function name list — confirmed
     /// live (`SELECT name FROM system.table_functions ORDER BY name`)
     /// against a `ClickHouse` 26.7.3.19 instance, per the WS7 plan's own
-    /// Task B5 header. Every one of these must be refused since
+    /// WS7 item B5 header. Every one of these must be refused since
     /// [`super::ALLOWED_TABLE_FUNCTIONS`] is empty.
     const ALL_TABLE_FUNCTIONS_CONFIRMED_LIVE: &[&str] = &[
         "SQLStandardValues",
@@ -1951,7 +1951,7 @@ mod refusals {
 
     /// The full, real `dictGet*`/`dictHas`/`dictIsIn`/`joinGet*` family
     /// — confirmed live against the same instance, per the WS7 plan's
-    /// Task B5 header.
+    /// WS7 item B5 header.
     const DICT_JOIN_FUNCTIONS_CONFIRMED_LIVE: &[&str] = &[
         "dictGet",
         "dictGetAll",
@@ -2215,6 +2215,209 @@ mod refusals {
     }
 }
 
+/// Supplies obligations for `(table, principal_roles)`. Implemented by
+/// `policy_engine` in Phase C; kept as a trait so this module's own
+/// tests run with zero database/`ClickHouse` dependency.
+#[allow(
+    dead_code,
+    reason = "only a #[cfg(test)] implementor exists in this commit (WS7 \
+              item B6's FakeObligations); Phase C's policy_engine-backed \
+              implementation is the first production caller"
+)]
+pub trait ObligationsSource {
+    /// The mask/row-filter obligations `table` carries for a principal
+    /// holding `principal_roles`, or `None` if none apply.
+    fn obligations_for(&self, table: &str, principal_roles: &[String]) -> Option<TableObligations>;
+    /// N5: whether ANY authored policy names ANY role in
+    /// `principal_roles`, for ANY table — not only the tables the
+    /// CURRENT query references. Needed because a `dictGet`/`joinGet`
+    /// call names no table syntactically at all; [`enforce`] cannot
+    /// know whether the dictionary/join-table it reads is backed by a
+    /// governed table, so it refuses the whole family whenever this is
+    /// `true`, rather than attempting to trace an unreachable source.
+    fn has_any_obligation(&self, principal_roles: &[String]) -> bool;
+}
+
+/// A [`SystemTablesCatalog`] that reports every table as "not a view" —
+/// for a caller with no `system.tables` access at all (or a test that
+/// does not exercise the view-refusal path).
+pub struct NoViews;
+
+impl SystemTablesCatalog for NoViews {
+    fn engine_and_definition(&self, _table: &str) -> Option<(String, Option<String>)> {
+        None
+    }
+}
+
+/// The one entry point Phase C calls. Order: (1) classify (table
+/// functions — an ALLOWLIST, N5 — sensitive `system.*`, and
+/// `dictGet*`/`joinGet*` whenever `obligations_source.has_any_obligation`
+/// is true, N5 — refuses before touching per-table obligations at all);
+/// (2) resolve every referenced table via [`referenced_tables`], look
+/// each up in `obligations_source`, and build the obligations map
+/// [`substitute_governed_tables`] needs; (3) [`classify_views`] over the
+/// SAME table list, refusing a view reading a governed table; (4)
+/// [`substitute_governed_tables`], with `placeholders` expanded from the
+/// real calling principal. `sql` is never returned unmodified after a
+/// step that could not fully verify it — a query touching no governed
+/// table and no refused construct passes through byte-for-byte
+/// (`Statement::to_string()`'s own re-serialization), everything else
+/// is rewritten or refused.
+///
+/// # Errors
+/// See [`classify_statement_for_principal`], [`classify_views`], and
+/// [`substitute_governed_tables`] — every error any of those three can
+/// return, `enforce` can return.
+#[allow(
+    dead_code,
+    reason = "no non-test caller exists yet in this commit (WS7 item B6); \
+              Phase C wires this into Query Studio and the copilot's run_sql"
+)]
+pub fn enforce(
+    sql: &str,
+    dialect: &dyn Dialect,
+    principal_roles: &[String],
+    placeholders: &PlaceholderValues,
+    obligations_source: &dyn ObligationsSource,
+    views_catalog: &dyn SystemTablesCatalog,
+) -> Result<String, RewriteError> {
+    let has_any_obligation = obligations_source.has_any_obligation(principal_roles);
+    classify_statement_for_principal(sql, dialect, principal_roles, has_any_obligation)?;
+    let tables = referenced_tables(sql, dialect).ok_or(RewriteError::Unparseable)?;
+    let mut obligations = HashMap::new();
+    for table in &tables {
+        if let Some(obl) = obligations_source.obligations_for(table, principal_roles) {
+            obligations.insert(table.clone(), obl);
+        }
+    }
+    let obligated: HashSet<String> = obligations.keys().cloned().collect();
+    classify_views(sql, dialect, views_catalog, &obligated)?;
+    substitute_governed_tables(sql, dialect, &obligations, placeholders)
+}
+
+#[cfg(test)]
+mod enforce_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use sqlparser::dialect::ClickHouseDialect;
+
+    use super::{
+        NoViews, ObligationsSource, PlaceholderValues, RewriteError, TableObligations, enforce,
+    };
+
+    struct FakeObligations {
+        any: bool,
+    }
+
+    impl ObligationsSource for FakeObligations {
+        fn obligations_for(&self, table: &str, _roles: &[String]) -> Option<TableObligations> {
+            (table == "silver.customers").then(|| TableObligations {
+                mask: vec!["email".to_owned()],
+                row_filter: None,
+                real_columns: Some(vec!["id".to_owned(), "email".to_owned()]),
+            })
+        }
+
+        fn has_any_obligation(&self, _roles: &[String]) -> bool {
+            self.any
+        }
+    }
+
+    #[test]
+    fn a_query_touching_no_governed_table_passes_through_unchanged() {
+        let src = FakeObligations { any: true };
+        let out = enforce(
+            "SELECT 1",
+            &ClickHouseDialect {},
+            &[],
+            &PlaceholderValues::none(),
+            &src,
+            &NoViews,
+        )
+        .unwrap();
+        assert_eq!(out, "SELECT 1");
+    }
+
+    #[test]
+    fn a_query_touching_a_governed_table_is_substituted() {
+        let src = FakeObligations { any: true };
+        let out = enforce(
+            "SELECT * FROM silver.customers",
+            &ClickHouseDialect {},
+            &[],
+            &PlaceholderValues::none(),
+            &src,
+            &NoViews,
+        )
+        .unwrap();
+        assert!(out.contains("replaceRegexpAll(toString(`email`)"));
+    }
+
+    #[test]
+    fn a_table_function_is_refused_even_with_no_governed_table_involved() {
+        let src = FakeObligations { any: false };
+        assert!(
+            enforce(
+                "SELECT * FROM url('h', 'CSV')",
+                &ClickHouseDialect {},
+                &[],
+                &PlaceholderValues::none(),
+                &src,
+                &NoViews,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_unparseable_statement_is_refused() {
+        let src = FakeObligations { any: false };
+        assert!(
+            enforce(
+                "SELECT ??? garbage",
+                &ClickHouseDialect {},
+                &[],
+                &PlaceholderValues::none(),
+                &src,
+                &NoViews,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn n5_a_dict_get_call_is_refused_when_has_any_obligation_is_true_even_with_no_table_in_the_from_clause()
+     {
+        let src = FakeObligations { any: true };
+        let err = enforce(
+            "SELECT dictGet('db.d', 'email', toUInt64(1))",
+            &ClickHouseDialect {},
+            &[],
+            &PlaceholderValues::none(),
+            &src,
+            &NoViews,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RewriteError::DictOrJoinFunctionDenied { .. }));
+    }
+
+    #[test]
+    fn n5_a_dict_get_call_is_allowed_when_the_principal_has_no_obligation_anywhere() {
+        let src = FakeObligations { any: false };
+        assert!(
+            enforce(
+                "SELECT dictGet('db.d', 'label', toUInt64(1))",
+                &ClickHouseDialect {},
+                &[],
+                &PlaceholderValues::none(),
+                &src,
+                &NoViews,
+            )
+            .is_ok()
+        );
+    }
+}
+
 #[cfg(test)]
 mod parses_real_repository_query_shapes {
     use sqlparser::dialect::{ClickHouseDialect, GenericDialect};
@@ -2224,7 +2427,7 @@ mod parses_real_repository_query_shapes {
     /// site in this repository. If `sqlparser` cannot parse one, that
     /// shape becomes a permanently refused construct (documented on
     /// [`super::REFUSED_UNPARSEABLE`] and covered by a regression test
-    /// in the `refusals` module, Task B5), never a silent
+    /// in the `refusals` module, WS7 item B5), never a silent
     /// pass-through — table substitution never runs on a statement
     /// that failed to parse at all.
     const CLICKHOUSE_SHAPES: &[&str] = &[
@@ -2238,7 +2441,7 @@ mod parses_real_repository_query_shapes {
         // lakehouse-bi specs.rs's kpi_event (ORDER BY + LIMIT on an aggregate query).
         "SELECT tahun, count() AS n FROM serving.mart_event ORDER BY tahun DESC LIMIT 1",
         // gold_export.rs's select_projection DateTime cast; FORMAT JSON is
-        // handled by Task B5's pre-split, so the parser only ever sees this.
+        // handled by WS7 item B5's pre-split, so the parser only ever sees this.
         "SELECT toString(toTimeZone(`created_at`, 'UTC')) AS `created_at`, `id` FROM silver.orders_enriched \
          ORDER BY `id` LIMIT 500 OFFSET 0",
         // query.rs test fixture `with x as (select 1) select * from x`.
@@ -2251,10 +2454,10 @@ mod parses_real_repository_query_shapes {
 
     /// The exact classes the WS7 plan's Hard Requirement 1 (M1) requires
     /// a named test for. Each is checked for parse success here (once,
-    /// recorded) — the `table_substitution` module (Task B3) then
+    /// recorded) — the `table_substitution` module (WS7 item B3) then
     /// proves table substitution masks/filters correctly for every one
     /// that DOES parse; one that does NOT parse is covered instead by
-    /// the `refusals` module's `refuses_unparseable_shapes` (Task B5).
+    /// the `refusals` module's `refuses_unparseable_shapes` (WS7 item B5).
     const M1_CLASS_SHAPES: &[(&str, &str)] = &[
         (
             "where_oracle",
@@ -2310,7 +2513,7 @@ mod parses_real_repository_query_shapes {
 
     /// Not an assertion of pass/fail either way for the M1 classes —
     /// this test's OUTPUT is read by the implementer and used to fill
-    /// in `super::REFUSED_UNPARSEABLE`'s entries per Task B1 Step 3. It
+    /// in `super::REFUSED_UNPARSEABLE`'s entries per WS7 item B1 Step 3. It
     /// always passes; it exists to make the finding reproducible in CI
     /// forever, not just once during planning.
     #[test]
