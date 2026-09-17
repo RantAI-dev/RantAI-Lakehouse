@@ -567,9 +567,11 @@ pub struct DatasetSla {
     pub table_name: String,
     /// Minutes within which the table is expected to receive a fresh
     /// write. Always `> 0` — enforced by `0037_dataset_sla.sql`'s `CHECK`
-    /// and, in front of it, [`crate::routes::governance::put_sla`]'s own
-    /// validation (route-level check is this crate's caller's job, not
-    /// this module's — kept here only as a doc pointer).
+    /// and, in front of it, `lakehouse-api`'s own `routes::governance::
+    /// put_sla` validation (route-level check is this crate's caller's
+    /// job, not this module's — kept here only as a doc pointer;
+    /// `crate::routes` does not exist in `lakehouse-store`, so this
+    /// cannot be an intra-doc link).
     pub expected_interval_minutes: i32,
     /// Who owns this table's freshness SLA, if recorded.
     pub owner: Option<String>,

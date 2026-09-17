@@ -42,6 +42,13 @@ fn aggregate_allowed(agg: &str) -> bool {
     AGGS.contains(&agg)
 }
 
+/// The five severities Postgres's `alert_instance.severity` `CHECK`
+/// admits (`0038_alert_instance_rule_link.sql`, mirroring
+/// `0011_overview_alerts.sql`'s original five) — the single place both
+/// [`normalize_input`] and `0038`'s `CHECK` must agree, named so a future
+/// edit to either side is easy to find the other.
+const SEVERITIES: [&str; 5] = ["critical", "high", "medium", "low", "info"];
+
 /// Errors produced while validating input or talking to `ClickHouse`
 /// through this module. Ports the `Error` throws in `saveRule`.
 #[derive(Debug, Error)]
@@ -124,6 +131,14 @@ pub enum AlertKind {
     /// Sends a KPI/gauge tile summary of a board, on demand or on a
     /// schedule.
     Digest,
+    /// Evaluates a `dataset_sla` row's freshness, not a `serving.*`
+    /// `ClickHouse` mart — see `run_freshness` (a later commit; this kind
+    /// has no evaluator yet, see `run_one`'s `match` below). WAL-slot
+    /// health needs NO new kind: an ordinary `AlertKind::Alert` rule
+    /// already targets `serving.replication_slot_health`
+    /// (`dagster/dispar_orchestrate/replication_metrics.py`'s own header
+    /// names the exact rule to create). WS5 plan review Y4.
+    Freshness,
 }
 
 impl AlertKind {
@@ -133,6 +148,7 @@ impl AlertKind {
         match self {
             Self::Alert => "alert",
             Self::Digest => "digest",
+            Self::Freshness => "freshness",
         }
     }
 }
@@ -207,6 +223,13 @@ pub struct AlertRule {
     /// `ClickHouse`-formatted creation timestamp.
     #[serde(rename = "createdAt", skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
+    /// Severity this rule's fired instances carry (WS5 plan review Y3: a
+    /// rule's severity is copied verbatim from this field into a fired
+    /// `alert_instance` row, never invented from `kind`). `None` when the
+    /// rule was saved without one — an honest "no severity," not a
+    /// silently-defaulted one.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub severity: Option<String>,
 }
 
 fn default_agg() -> String {
@@ -262,6 +285,12 @@ pub struct AlertRuleInput {
     /// else (including `None`) enables it, matching `input.enabled ===
     /// false ? 0 : 1`.
     pub enabled: Option<bool>,
+    /// Raw severity string, validated against [`SEVERITIES`] by
+    /// [`normalize_input`] — unlike `kind`/`channel`/`op`, an unrecognized
+    /// value here is rejected outright rather than silently falling back
+    /// to a default (WS5 plan review U12): a rule that claims a severity
+    /// `alert_instance`'s `CHECK` will not actually admit must never save.
+    pub severity: Option<String>,
 }
 
 /// The validated, normalized shape [`save_rule`] persists — split out of
@@ -279,6 +308,7 @@ struct NormalizedRule {
     op: AlertOp,
     threshold: f64,
     board: String,
+    severity: Option<String>,
 }
 
 /// Validate and normalize `input`, exactly reproducing `saveRule`'s
@@ -294,10 +324,10 @@ fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError>
     if name.is_empty() {
         return Err(AlertError::Validation("name is required.".to_owned()));
     }
-    let kind = if input.kind.as_deref() == Some("digest") {
-        AlertKind::Digest
-    } else {
-        AlertKind::Alert
+    let kind = match input.kind.as_deref() {
+        Some("digest") => AlertKind::Digest,
+        Some("freshness") => AlertKind::Freshness,
+        _ => AlertKind::Alert,
     };
     let channel = if input.channel.as_deref() == Some("email") {
         AlertChannel::Email
@@ -320,61 +350,151 @@ fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError>
         return Err(AlertError::Validation("invalid email.".to_owned()));
     }
 
+    // WS5 plan review U12: validated once, at the source, against the same
+    // five values `0038`'s `alert_instance.severity` `CHECK` admits —
+    // applies uniformly to all three kinds (Alert/Digest/Freshness), not
+    // special-cased per kind. A rule saved with an out-of-range severity
+    // would insert cleanly into `ClickHouse` (no `CHECK` there) and then
+    // silently fail every firing's `alert_instance` insert later, with no
+    // way for the operator to learn their rule can never actually alert.
+    let severity = match input.severity.as_deref() {
+        None | Some("") => None,
+        Some(s) if SEVERITIES.contains(&s) => Some(s.to_owned()),
+        Some(_) => return Err(AlertError::Validation("invalid severity.".to_owned())),
+    };
+
+    let common = NormalizedCommon {
+        name,
+        kind,
+        channel,
+        target,
+        severity,
+    };
     if kind == AlertKind::Alert {
-        let raw_mart = input.mart.as_deref().unwrap_or("");
-        let mart = raw_mart
-            .strip_prefix("serving.")
-            .unwrap_or(raw_mart)
-            .to_owned();
-        let measure = input.measure.as_deref().unwrap_or("").to_owned();
-        let agg = input.agg.as_deref().unwrap_or("sum").to_ascii_lowercase();
-        let op = input
-            .op
-            .as_deref()
-            .and_then(AlertOp::parse_exact)
-            .unwrap_or(AlertOp::Gt);
-        let threshold = input.threshold.unwrap_or(0.0);
-        if Ident::new(&mart).is_err() || Ident::new(&measure).is_err() {
-            return Err(AlertError::Validation("invalid mart/measure.".to_owned()));
-        }
-        if !aggregate_allowed(&agg) {
-            return Err(AlertError::Validation("invalid aggregate.".to_owned()));
-        }
-        if !threshold.is_finite() {
-            return Err(AlertError::Validation("invalid threshold.".to_owned()));
-        }
-        Ok(NormalizedRule {
-            name,
-            kind,
-            channel,
-            target,
-            mart,
-            measure,
-            agg,
-            op,
-            threshold,
-            board: String::new(),
-        })
+        normalize_alert(input, common)
+    } else if kind == AlertKind::Freshness {
+        normalize_freshness(input, common)
     } else {
-        let board = input.board.as_deref().unwrap_or("").to_owned();
-        if board.is_empty() {
-            return Err(AlertError::Validation(
-                "digest requires a board.".to_owned(),
-            ));
-        }
-        Ok(NormalizedRule {
-            name,
-            kind,
-            channel,
-            target,
-            mart: String::new(),
-            measure: String::new(),
-            agg: "sum".to_owned(),
-            op: AlertOp::Gt,
-            threshold: 0.0,
-            board,
-        })
+        normalize_digest(input, common)
     }
+}
+
+/// The fields [`normalize_input`] validates uniformly, before branching on
+/// `kind` — split out (alongside [`normalize_alert`]/[`normalize_freshness`]/
+/// [`normalize_digest`]) purely to keep [`normalize_input`] itself under
+/// `clippy::too_many_lines`; no behavior change from having it all inline.
+struct NormalizedCommon {
+    name: String,
+    kind: AlertKind,
+    channel: AlertChannel,
+    target: String,
+    severity: Option<String>,
+}
+
+fn normalize_alert(
+    input: &AlertRuleInput,
+    common: NormalizedCommon,
+) -> Result<NormalizedRule, AlertError> {
+    let raw_mart = input.mart.as_deref().unwrap_or("");
+    let mart = raw_mart
+        .strip_prefix("serving.")
+        .unwrap_or(raw_mart)
+        .to_owned();
+    let measure = input.measure.as_deref().unwrap_or("").to_owned();
+    let agg = input.agg.as_deref().unwrap_or("sum").to_ascii_lowercase();
+    let op = input
+        .op
+        .as_deref()
+        .and_then(AlertOp::parse_exact)
+        .unwrap_or(AlertOp::Gt);
+    let threshold = input.threshold.unwrap_or(0.0);
+    if Ident::new(&mart).is_err() || Ident::new(&measure).is_err() {
+        return Err(AlertError::Validation("invalid mart/measure.".to_owned()));
+    }
+    if !aggregate_allowed(&agg) {
+        return Err(AlertError::Validation("invalid aggregate.".to_owned()));
+    }
+    if !threshold.is_finite() {
+        return Err(AlertError::Validation("invalid threshold.".to_owned()));
+    }
+    Ok(NormalizedRule {
+        name: common.name,
+        kind: common.kind,
+        channel: common.channel,
+        target: common.target,
+        mart,
+        measure,
+        agg,
+        op,
+        threshold,
+        board: String::new(),
+        severity: common.severity,
+    })
+}
+
+/// A Freshness rule's `mart` field is reinterpreted as the
+/// `dataset_sla.table_name` it targets — validated as
+/// `<namespace>.<table>`, each half a real `Ident` (the same
+/// lexical-safety guarantee `Alert`'s `mart`/`measure` already get), never
+/// passed through to a query unchecked. This branch used to not exist:
+/// before it, every Freshness rule fell into [`normalize_digest`]'s
+/// (Digest-only) path and was rejected with "digest requires a board." —
+/// or, if a caller supplied a `board` anyway to dodge that, had its `mart`
+/// (the actual freshness target) silently blanked to `String::new()`.
+fn normalize_freshness(
+    input: &AlertRuleInput,
+    common: NormalizedCommon,
+) -> Result<NormalizedRule, AlertError> {
+    let raw_target = input.mart.as_deref().unwrap_or("").trim().to_owned();
+    let Some((ns, table)) = raw_target.split_once('.') else {
+        return Err(AlertError::Validation(
+            "freshness target table must be <namespace>.<table>.".to_owned(),
+        ));
+    };
+    if Ident::new(ns).is_err() || Ident::new(table).is_err() {
+        return Err(AlertError::Validation(
+            "invalid freshness target table.".to_owned(),
+        ));
+    }
+    Ok(NormalizedRule {
+        name: common.name,
+        kind: common.kind,
+        channel: common.channel,
+        target: common.target,
+        mart: raw_target,
+        measure: String::new(),
+        agg: "sum".to_owned(),
+        op: AlertOp::Gt,
+        threshold: 0.0,
+        board: String::new(),
+        severity: common.severity,
+    })
+}
+
+/// Unchanged from today's behavior.
+fn normalize_digest(
+    input: &AlertRuleInput,
+    common: NormalizedCommon,
+) -> Result<NormalizedRule, AlertError> {
+    let board = input.board.as_deref().unwrap_or("").to_owned();
+    if board.is_empty() {
+        return Err(AlertError::Validation(
+            "digest requires a board.".to_owned(),
+        ));
+    }
+    Ok(NormalizedRule {
+        name: common.name,
+        kind: common.kind,
+        channel: common.channel,
+        target: common.target,
+        mart: String::new(),
+        measure: String::new(),
+        agg: "sum".to_owned(),
+        op: AlertOp::Gt,
+        threshold: 0.0,
+        board,
+        severity: common.severity,
+    })
 }
 
 // ── id generation ──────────────────────────────────────────────────────
@@ -422,10 +542,21 @@ pub async fn ensure(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
+    // WS5 item C1: additive, idempotent widening of a table that already
+    // holds real data in production — the same convention every other
+    // optional text column on this table follows (e.g. `mart String
+    // DEFAULT ''` above); `non_empty()` already turns an empty string
+    // back into `None` on read, so this needs no migration for existing
+    // rows.
+    ch.exec(
+        "ALTER TABLE console.alert_rule ADD COLUMN IF NOT EXISTS severity String DEFAULT ''",
+        None,
+    )
+    .await?;
     Ok(())
 }
 
-const COLS: &str = "id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,toString(created_at) AS created_at";
+const COLS: &str = "id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,toString(created_at) AS created_at,severity";
 
 fn row_str<'a>(row: &'a Map<String, Value>, key: &str) -> &'a str {
     row.get(key).and_then(Value::as_str).unwrap_or("")
@@ -462,10 +593,10 @@ fn row_enabled(row: &Map<String, Value>) -> bool {
 /// applying the same permissive fallbacks (`r.agg || "sum"`, `OPS.includes`
 /// on `op`, `r.channel === "email"`, `r.mart || undefined`, ...).
 fn row_to_rule(row: &Map<String, Value>) -> AlertRule {
-    let kind = if row_str(row, "type") == "digest" {
-        AlertKind::Digest
-    } else {
-        AlertKind::Alert
+    let kind = match row_str(row, "type") {
+        "digest" => AlertKind::Digest,
+        "freshness" => AlertKind::Freshness,
+        _ => AlertKind::Alert,
     };
     let channel = if row_str(row, "channel") == "email" {
         AlertChannel::Email
@@ -488,6 +619,7 @@ fn row_to_rule(row: &Map<String, Value>) -> AlertRule {
         target: row_str(row, "target").to_owned(),
         enabled: row_enabled(row),
         created_at: non_empty(row_str(row, "created_at")),
+        severity: non_empty(row_str(row, "severity")),
     }
 }
 
@@ -542,8 +674,14 @@ pub async fn save_rule(
     let rid = id.map_or_else(new_rule_id, str::to_owned);
     let enabled: u8 = u8::from(input.enabled != Some(false));
     let threshold = normalized.threshold;
+    // `SqlLiteral` has no `NULL` variant (it always quotes a string), so a
+    // `None` severity binds ClickHouse's own empty-string default rather
+    // than `NULL` — consistent with `mart`/`measure`/`board`'s existing
+    // "empty string means absent" convention on this table (`non_empty()`
+    // already turns `""` back into `None` on read, so the round-trip is
+    // lossless).
     let sql = format!(
-        "INSERT INTO console.alert_rule (id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled) VALUES ({},{},{},{},{},{},{},{threshold},{},{},{},{enabled})",
+        "INSERT INTO console.alert_rule (id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,severity) VALUES ({},{},{},{},{},{},{},{threshold},{},{},{},{enabled},{})",
         SqlLiteral::from(rid.as_str()),
         SqlLiteral::from(normalized.name.as_str()),
         SqlLiteral::from(normalized.kind.as_str()),
@@ -554,6 +692,7 @@ pub async fn save_rule(
         SqlLiteral::from(normalized.board.as_str()),
         SqlLiteral::from(normalized.channel.as_str()),
         SqlLiteral::from(normalized.target.as_str()),
+        SqlLiteral::from(normalized.severity.as_deref().unwrap_or("")),
     );
     ch.exec(&sql, None).await?;
     match get_rule(ch, &rid).await? {
@@ -797,6 +936,14 @@ async fn run_one(
     match rule.kind {
         AlertKind::Alert => run_alert(ch, http, email, rule).await,
         AlertKind::Digest => run_digest(ch, http, email, rule).await,
+        // WS5 item C1: `AlertKind::Freshness` exists (Step 5) but has no
+        // evaluator yet — `run_freshness` lands in a later commit. Until
+        // then this must never be treated as an `Alert` (which would read
+        // `rule.mart` as a `serving.*` ClickHouse mart it is not) or
+        // silently dropped; a `skipped` result, matching every other
+        // per-rule failure this function already reports this way, is the
+        // honest outcome.
+        AlertKind::Freshness => skipped(rule, "freshness rules have no evaluator yet".to_owned()),
     }
 }
 
@@ -1192,5 +1339,147 @@ mod tests {
         assert!(id.starts_with("al_"));
         assert_eq!(id.len(), "al_".len() + 8);
         assert!(id["al_".len()..].bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    // ── ensure (WS5 item C1, Step 2) ────────────────────────────────────
+
+    /// WS5 plan review U1: the real precedent for testing a `ChClient`-
+    /// calling function without a live instance is
+    /// `lakehouse-clickhouse/src/lib.rs`'s own test module — `wiremock`
+    /// `MockServer` + `ChClient::new(server.uri(), ..)`, asserting on the
+    /// request body wiremock received. No live `ClickHouse`, no
+    /// `#[ignore]`.
+    #[tokio::test]
+    async fn ensure_sends_an_additive_severity_column_statement() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("ADD COLUMN IF NOT EXISTS severity"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Every other `ensure()` statement (CREATE DATABASE, CREATE
+        // TABLE) also POSTs to the same mock — a second unconditional
+        // mock answers those so `ensure` doesn't fail on an unmatched
+        // request.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        ensure(&ch).await.unwrap();
+        // wiremock's `.expect(1)` on the specific severity-column mock is
+        // verified automatically when `server` drops at the end of scope
+        // — if `ensure` never sends that statement, the test panics
+        // there.
+    }
+
+    // ── severity validation (WS5 item C1, Step 3a) ──────────────────────
+
+    #[test]
+    fn normalize_rejects_unknown_severity() {
+        let input = AlertRuleInput {
+            severity: Some("urgent".to_owned()),
+            ..valid_alert_input()
+        };
+        let err = normalize_input(&input).unwrap_err();
+        assert_eq!(err.to_string(), "invalid severity.");
+    }
+
+    #[test]
+    fn normalize_accepts_a_real_severity() {
+        let input = AlertRuleInput {
+            severity: Some("critical".to_owned()),
+            ..valid_alert_input()
+        };
+        let normalized = normalize_input(&input).unwrap();
+        assert_eq!(normalized.severity, Some("critical".to_owned()));
+    }
+
+    #[test]
+    fn normalize_no_severity_stays_none() {
+        let normalized = normalize_input(&valid_alert_input()).unwrap();
+        assert_eq!(normalized.severity, None);
+    }
+
+    // ── AlertKind::Freshness round-trip (WS5 item C1, Step 4) ───────────
+
+    #[test]
+    fn freshness_kind_as_str_round_trips() {
+        assert_eq!(AlertKind::Freshness.as_str(), "freshness");
+    }
+
+    #[test]
+    fn row_to_rule_maps_freshness_type_column() {
+        let mut row = Map::new();
+        row.insert("id".to_owned(), Value::String("al_1".to_owned()));
+        row.insert("name".to_owned(), Value::String("x".to_owned()));
+        row.insert("type".to_owned(), Value::String("freshness".to_owned()));
+        row.insert("mart".to_owned(), Value::String("bronze.orders".to_owned()));
+        row.insert("measure".to_owned(), Value::String(String::new()));
+        row.insert("agg".to_owned(), Value::String(String::new()));
+        row.insert("op".to_owned(), Value::String(String::new()));
+        row.insert("threshold".to_owned(), Value::String("0".to_owned()));
+        row.insert("board".to_owned(), Value::String(String::new()));
+        row.insert("channel".to_owned(), Value::String("email".to_owned()));
+        row.insert("target".to_owned(), Value::String("t".to_owned()));
+        row.insert("enabled".to_owned(), Value::String("1".to_owned()));
+        row.insert("created_at".to_owned(), Value::String(String::new()));
+        row.insert("severity".to_owned(), Value::String("info".to_owned()));
+
+        let rule = row_to_rule(&row);
+        assert_eq!(rule.kind, AlertKind::Freshness);
+        assert_eq!(rule.severity, Some("info".to_owned()));
+    }
+
+    // ── normalize_input Freshness branch (WS5 item C1, Step 4a/5a) ──────
+
+    #[test]
+    fn normalize_input_accepts_a_valid_freshness_target() {
+        let input = AlertRuleInput {
+            name: Some("Orders freshness".to_owned()),
+            kind: Some("freshness".to_owned()),
+            target: Some("ops@example.invalid".to_owned()),
+            channel: Some("email".to_owned()),
+            mart: Some("bronze.orders".to_owned()),
+            ..AlertRuleInput::default()
+        };
+        let normalized = normalize_input(&input).unwrap();
+        assert_eq!(normalized.kind, AlertKind::Freshness);
+        assert_eq!(normalized.mart, "bronze.orders");
+        // measure/agg/threshold/board are cleared for this kind — a
+        // Freshness rule is target-only, nothing else on the row means
+        // anything for it.
+        assert!(normalized.measure.is_empty());
+        assert!(normalized.board.is_empty());
+    }
+
+    #[test]
+    fn normalize_input_rejects_a_freshness_rule_with_no_target_table() {
+        let input = AlertRuleInput {
+            name: Some("Orders freshness".to_owned()),
+            kind: Some("freshness".to_owned()),
+            target: Some("ops@example.invalid".to_owned()),
+            channel: Some("email".to_owned()),
+            mart: None,
+            ..AlertRuleInput::default()
+        };
+        assert!(normalize_input(&input).is_err());
+    }
+
+    #[test]
+    fn normalize_input_rejects_an_injection_shaped_freshness_target() {
+        let input = AlertRuleInput {
+            name: Some("Orders freshness".to_owned()),
+            kind: Some("freshness".to_owned()),
+            target: Some("ops@example.invalid".to_owned()),
+            channel: Some("email".to_owned()),
+            mart: Some("bronze.orders; DROP TABLE dataset_sla;--".to_owned()),
+            ..AlertRuleInput::default()
+        };
+        assert!(normalize_input(&input).is_err());
     }
 }

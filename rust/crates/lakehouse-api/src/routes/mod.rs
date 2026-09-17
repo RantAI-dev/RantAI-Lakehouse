@@ -185,7 +185,13 @@ fn lakehouse_router() -> Router<AppState> {
 fn governance_static_router() -> Router<AppState> {
     Router::new()
         .route("/api/governance/lineage", get(governance::lineage))
-        .route("/api/governance/ingest-runs", get(governance::ingest_runs))
+        .route(
+            // A dedicated route (WS3 item 17), mounted alongside `lineage`
+            // immediately above — never a seventh `{kind}` dispatch value
+            // (see `governance.rs`'s module doc comment).
+            "/api/governance/ingest-runs",
+            get(governance::ingest_runs),
+        )
         .route(
             "/api/governance/policies",
             get(governance::list_policies).post(governance::create_policy),
