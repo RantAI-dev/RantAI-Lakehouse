@@ -257,61 +257,36 @@ async fn rewrite_sql_for_principal_inner(
     let obligations_source =
         crate::policy_engine::PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
 
-    // Step 1 — sync only. A `sqlparser::dialect::Dialect` trait object is
-    // not `Send`, so a `&dyn Dialect` must never be held across an
-    // `.await` point (doing so makes this whole function's future — and
-    // therefore `run`'s, and therefore axum's `Handler` impl for it — not
-    // `Send`, a real compile error this file hit while wiring this in).
-    // This local `dialect` is constructed and used ONLY inside this
-    // synchronous block, producing an owned `Vec<String>` before any
-    // `.await` runs.
-    let tables = if is_trino_engine(engine) {
-        crate::sql_rewrite::referenced_tables(sql, &sqlparser::dialect::GenericDialect {})
-    } else {
-        crate::sql_rewrite::referenced_tables(sql, &sqlparser::dialect::ClickHouseDialect {})
-    }
-    .ok_or_else(|| {
-        ApiError::Unprocessable(
-            crate::policy_engine::engine_error_message(
-                &crate::policy_engine::PolicyEngineError::Unparseable,
-            )
-            .to_owned(),
-        )
-    })?;
-
-    // Step 2 — async, no dialect involved at all.
-    let (obligations, views) = obligations_source
-        .prefetch_for_tables(&tables, &principal.role_names)
-        .await
-        .map_err(|err| {
-            ApiError::Unprocessable(crate::policy_engine::engine_error_message(&err).to_owned())
-        })?;
-
-    // Step 3 — sync again. A FRESH `dialect` local, never the one from
-    // Step 1 — it is constructed here, after the `.await` above, so it is
-    // never live across a suspension point either.
+    // WS7 item D1/D2: the actual referenced-tables/prefetch/enforce
+    // sequence now lives in ONE place —
+    // `policy_engine::rewrite_sql_for_roles` — shared with
+    // `routes::support::run_spec_sql` (dashboards/embeds) and
+    // `gold_export::export_batch_sql` (Gold export), never a parallel
+    // copy of this logic. Only the per-engine dialect *selection*
+    // (`ClickHouseDialect` vs. `GenericDialect`) stays here, since the
+    // two are different concrete types.
     if is_trino_engine(engine) {
-        let dialect = sqlparser::dialect::GenericDialect {};
-        crate::sql_rewrite::enforce(
+        crate::policy_engine::rewrite_sql_for_roles(
             sql,
-            &dialect,
+            &sqlparser::dialect::GenericDialect {},
             &principal.role_names,
             &placeholders,
-            &obligations,
-            &views,
+            &obligations_source,
         )
+        .await
     } else {
-        let dialect = sqlparser::dialect::ClickHouseDialect {};
-        crate::sql_rewrite::enforce(
+        crate::policy_engine::rewrite_sql_for_roles(
             sql,
-            &dialect,
+            &sqlparser::dialect::ClickHouseDialect {},
             &principal.role_names,
             &placeholders,
-            &obligations,
-            &views,
+            &obligations_source,
         )
+        .await
     }
-    .map_err(|err| ApiError::Unprocessable(crate::policy_engine::refusal_message(&err).to_owned()))
+    .map_err(|err| {
+        ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
+    })
 }
 
 /// Runs the already-rewritten `sql` against whichever engine `engine`

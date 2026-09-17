@@ -19,8 +19,23 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::json::ApiJson;
+use crate::policy_engine::PolicyEngineObligations;
 use crate::routes::support::{mart_columns, render_stored_spec, run_spec_sql};
 use crate::state::AppState;
+
+/// WS7 item D1: neither `POST /api/embed/data` nor
+/// `GET /api/public/dashboard/{token}` carries a real principal —
+/// `Policy::Public`, checked in `route_auth.rs`'s own table-driven loop
+/// against `policy.rs`'s `POLICY_TABLE`. Both are governed as if the
+/// viewer held exactly this seeded, least-privileged, dashboard-only role
+/// (`0002_seed_identity.sql:46`), never as an unrestricted principal — a
+/// masking/row-filter policy authored against `"Dashboard Viewer"` (or
+/// against no role at all, which matches nobody) is the only way to
+/// restrict what an external embed/public-link viewer can see through
+/// these two routes. This is a deliberate mapping, documented here, not
+/// an accidental "no principal, so no obligations" fail-open path (WS7
+/// plan Hard Requirement 2).
+const EMBED_VIEWER_ROLE: &str = "Dashboard Viewer";
 
 /// `{ jwt }` — the `POST /api/embed/data` body shape.
 #[derive(Debug, Default, Deserialize)]
@@ -93,7 +108,7 @@ pub async fn data(State(state): State<AppState>, body: Bytes) -> Response {
     let mut filters = board.filters.clone().unwrap_or_default();
     filters.extend(params_to_filters(claims.params));
 
-    match render_board_payload(&state.clickhouse, &board, &board_id, &filters).await {
+    match render_board_payload(&state, &board, &board_id, &filters).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -155,7 +170,7 @@ pub async fn public_dashboard(
 
     let filters = board.filters.clone().unwrap_or_default();
     let board_id = board.id.clone();
-    match render_board_payload(&state.clickhouse, &board, &board_id, &filters).await {
+    match render_board_payload(&state, &board, &board_id, &filters).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -170,11 +185,15 @@ pub async fn public_dashboard(
 /// `board_id`, filtered by `filters` (never by caller-supplied years —
 /// neither route accepts a `year` parameter).
 async fn render_board_payload(
-    ch: &ChClient,
+    state: &AppState,
     board: &Board,
     board_id: &str,
     filters: &[FilterDef],
 ) -> Result<Value, lakehouse_clickhouse::ChError> {
+    let ch: &ChClient = &state.clickhouse;
+    let roles = [EMBED_VIEWER_ROLE.to_owned()];
+    let placeholders = crate::sql_rewrite::PlaceholderValues::none();
+    let obligations = PolicyEngineObligations::new(state.pg.as_deref(), ch);
     let stored = store::list_stored_charts(ch).await?;
     let stored_for_board: Vec<&StoredChartSpec> = stored
         .iter()
@@ -198,7 +217,8 @@ async fn render_board_payload(
     let mut charts_out = Vec::with_capacity(stored_for_board.len());
     for c in &stored_for_board {
         let sql = sql_with_filters(c, &[], filters, &cols);
-        let (id, val) = run_spec_sql(ch, &c.spec.id, &sql).await;
+        let (id, val) =
+            run_spec_sql(ch, &c.spec.id, &sql, &roles, &placeholders, &obligations).await;
         results.insert(id, val);
 
         let mut rendered = render_stored_spec(&c.spec, c.source);

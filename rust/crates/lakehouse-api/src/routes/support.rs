@@ -138,11 +138,47 @@ pub(crate) fn render_stored_spec(spec: &store::ChartSpec, source: ChartSource) -
 /// `runSpec` in `dashboard/route.ts` (and its `embed`/`public` siblings): an
 /// empty `sql` (text tiles) needs no query; any other failure is captured
 /// per-tile rather than failing the whole response.
-pub(crate) async fn run_spec_sql(ch: &ChClient, id: &str, sql: &str) -> (String, Value) {
+///
+/// WS7 item D1: `sql` is rewritten through
+/// `policy_engine::rewrite_sql_for_roles` — the SAME shared entry point
+/// `routes::query::run` (WS7 item C2) and `gold_export::export_batch_sql`
+/// (WS7 item D2) call — for `roles`/`placeholders` BEFORE it ever reaches
+/// `ch.query`. A refusal (a table function, a masking/row-filter policy
+/// this module cannot prove safe, an authored-but-unenforceable
+/// condition, ...) is captured into this tile's own `{"error": ...}`
+/// slot, exactly like a `ClickHouse` query failure already is — the
+/// dashboard still renders its other tiles — but `ch.query` is never
+/// called for a refused tile, so a masked/filtered chart can never
+/// silently execute the unrewritten `sql` instead.
+pub(crate) async fn run_spec_sql(
+    ch: &ChClient,
+    id: &str,
+    sql: &str,
+    roles: &[String],
+    placeholders: &crate::sql_rewrite::PlaceholderValues,
+    obligations: &crate::policy_engine::PolicyEngineObligations<'_>,
+) -> (String, Value) {
     if sql.is_empty() {
         return (id.to_owned(), json!({ "columns": [], "rows": [] }));
     }
-    match ch.query(sql, None).await {
+    let rewritten = match crate::policy_engine::rewrite_sql_for_roles(
+        sql,
+        &sqlparser::dialect::ClickHouseDialect {},
+        roles,
+        placeholders,
+        obligations,
+    )
+    .await
+    {
+        Ok(rewritten) => rewritten,
+        Err(err) => {
+            return (
+                id.to_owned(),
+                json!({ "error": crate::policy_engine::enforcement_error_message(&err) }),
+            );
+        }
+    };
+    match ch.query(&rewritten, None).await {
         Ok(r) => {
             let columns: Vec<String> = r.meta.iter().map(|m| m.name.clone()).collect();
             (id.to_owned(), json!({ "columns": columns, "rows": r.data }))
@@ -239,5 +275,168 @@ mod tests {
     #[test]
     fn js_error_formats_like_string_of_error() {
         assert_eq!(js_error("bad sql"), "Error: bad sql");
+    }
+}
+
+// ── WS7 item D1: `run_spec_sql` goes through the same
+//    `policy_engine::rewrite_sql_for_roles` Query Studio uses ──────────────
+#[cfg(test)]
+mod run_spec_sql_enforcement {
+    //! Real Postgres (`#[sqlx::test]`, a real authored `policy` row) plus a
+    //! wiremock `ClickHouse` — the exact same two-harness shape
+    //! `routes::query`'s `enforcement` test module already established for
+    //! WS7 item C2 (`run_rewrites_sql_for_a_governed_table_before_executing`).
+    //! The WS7 plan names `fake_clickhouse_returning_columns`/
+    //! `fake_policy_engine_obligations_masking` helpers that do not exist
+    //! anywhere in this codebase — `PolicyEngineObligations` is a concrete
+    //! struct over a real `PgPool`/`ChClient`, not a mockable trait, so a
+    //! "fake" obligations source can only mean a real (ephemeral)
+    //! Postgres seeded with a real policy row, which is what this module
+    //! builds instead.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_clickhouse::ChClient;
+    use lakehouse_store::PgPool;
+    use lakehouse_store::governance::{self, CreatePolicyInput};
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::run_spec_sql;
+    use crate::policy_engine::PolicyEngineObligations;
+    use crate::sql_rewrite::PlaceholderValues;
+
+    /// Mounts the `system.columns` response `PolicyEngineObligations`
+    /// needs to resolve `silver.customers`'s real column list, and the
+    /// masked-projection query's own response — the ONLY two `ClickHouse`
+    /// requests a masked `run_spec_sql` call makes.
+    async fn mount_masked_customers_responses(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(body_string_contains("system.columns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "name", "type": "String"},
+                    {"name": "default_kind", "type": "String"},
+                    {"name": "default_expression", "type": "String"},
+                ],
+                "data": [
+                    {"name": "id", "default_kind": "", "default_expression": ""},
+                    {"name": "email", "default_kind": "", "default_expression": ""},
+                ],
+                "rows": 2,
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("replaceRegexpAll"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "id", "type": "UInt64"},
+                    {"name": "email", "type": "String"},
+                ],
+                "data": [{"id": "1", "email": "***"}],
+                "rows": 1,
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// Failing-test-first for WS7 item D1: before `run_spec_sql` grew its
+    /// `roles`/`placeholders`/`obligations` parameters and its internal
+    /// `policy_engine::rewrite_sql_for_roles` call, it took only
+    /// `(ch, id, sql)` and sent `sql` to `ClickHouse` completely
+    /// unrewritten. Quoted failure text (captured against the pre-D1
+    /// signature, `cargo test -p lakehouse-api support::run_spec_sql
+    /// 2>&1 | tail -40`): `error[E0061]: this function takes 3 arguments
+    /// but 6 arguments were supplied` — the call this test makes does not
+    /// even compile against the old signature, let alone mask `email`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_spec_sql_is_rewritten_through_sql_rewrite_enforce_for_the_given_roles(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        governance::create_policy(
+            &pool,
+            &CreatePolicyInput {
+                name: "dashboard-tile-masking-test".to_owned(),
+                kind: "Row filter".to_owned(),
+                subjects: "Analyst".to_owned(),
+                resources: "silver.customers".to_owned(),
+                effect: "Permit with obligation".to_owned(),
+                conditions: Some(
+                    r#"{"roles":["Analyst"],"table":"silver.customers","mask":["email"]}"#
+                        .to_owned(),
+                ),
+                activate: true,
+                owner: None,
+            },
+        )
+        .await
+        .expect("seeding the governing policy must succeed");
+
+        let server = MockServer::start().await;
+        mount_masked_customers_responses(&server).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+
+        let (_id, _val) = run_spec_sql(
+            &ch,
+            "chart1",
+            "SELECT id, email FROM silver.customers",
+            &["Analyst".to_owned()],
+            &PlaceholderValues::none(),
+            &obligations,
+        )
+        .await;
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("mock server records requests");
+        assert!(
+            requests
+                .iter()
+                .any(|r| String::from_utf8_lossy(&r.body)
+                    .contains("replaceRegexpAll(toString(`email`)")),
+            "expected ClickHouse to receive the masked/rewritten query, never the raw one"
+        );
+        Ok(())
+    }
+
+    /// Failing-test-first for WS7 item D1's other half (Hard Requirement
+    /// 2): before this task, `run_spec_sql` had no rewrite/refusal step at
+    /// all, so a table-function chart SQL would have reached `ClickHouse`
+    /// unrefused. Quoted failure text (same pre-D1 signature): `error[E0061]:
+    /// this function takes 3 arguments but 6 arguments were supplied`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_spec_sql_refuses_and_never_executes_when_enforce_refuses(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        // No mocks mounted at all — any request that reaches ClickHouse
+        // fails loudly (connection/404), which would itself prove the
+        // refusal happened too late.
+        let server = MockServer::start().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+
+        let (_id, val) = run_spec_sql(
+            &ch,
+            "chart1",
+            "SELECT * FROM url('h', 'CSV')",
+            &[],
+            &PlaceholderValues::none(),
+            &obligations,
+        )
+        .await;
+
+        assert!(val.get("error").is_some(), "expected a refusal: {val:?}");
+        let requests = server
+            .received_requests()
+            .await
+            .expect("mock server records requests");
+        assert!(
+            requests.is_empty(),
+            "a refused chart SQL must never reach ClickHouse: {requests:?}"
+        );
+        Ok(())
     }
 }

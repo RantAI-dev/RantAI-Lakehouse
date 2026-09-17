@@ -11,10 +11,12 @@
 
 use std::collections::{HashMap, HashSet};
 
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use lakehouse_auth::Principal;
 use lakehouse_bi::builder::sql_with_filters;
 use lakehouse_bi::specs::{CHARTS, ChartKind, ChartSource, KPIS, to_render_spec};
 use lakehouse_bi::store::{self, ChartInput, FilterDef, LayoutMap, StoredChartSpec};
@@ -25,6 +27,7 @@ use serde_json::{Map, Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::policy_engine::PolicyEngineObligations;
 use crate::routes::support::{
     is_numeric_type, mart_columns, render_stored_spec, run_spec_sql, strip_non_ident,
 };
@@ -45,8 +48,36 @@ pub struct DashboardQuery {
 
 /// `GET /api/dashboard` — the combined tile data + metadata payload the
 /// main dashboard view renders.
-pub async fn get(State(state): State<AppState>, Query(q): Query<DashboardQuery>) -> Response {
-    match get_body(&state.clickhouse, &q).await {
+///
+/// WS7 item D1: `Policy::RequiresPermission("dashboard:read")` (see
+/// `policy.rs`) guarantees a real `Extension<Principal>` is always
+/// present here — its `role_names`/id/tenant ids are threaded into every
+/// tile's `run_spec_sql` call, so a masking/row-filter policy applies to
+/// the authenticated dashboard viewer, exactly as it would in Query
+/// Studio.
+pub async fn get(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Query(q): Query<DashboardQuery>,
+) -> Response {
+    let placeholders = crate::sql_rewrite::PlaceholderValues {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_tenant_ids: principal
+            .tenant_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    };
+    let obligations = PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
+    match get_body(
+        &state.clickhouse,
+        &q,
+        &principal.role_names,
+        &placeholders,
+        &obligations,
+    )
+    .await
+    {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -66,6 +97,9 @@ pub async fn get(State(state): State<AppState>, Query(q): Query<DashboardQuery>)
 async fn get_body(
     ch: &ChClient,
     q: &DashboardQuery,
+    roles: &[String],
+    placeholders: &crate::sql_rewrite::PlaceholderValues,
+    obligations: &PolicyEngineObligations<'_>,
 ) -> Result<Value, lakehouse_clickhouse::ChError> {
     let board = q.board.clone().unwrap_or_else(|| "default".to_owned());
     let years: Vec<i64> = q
@@ -123,19 +157,19 @@ async fn get_body(
         for k in KPIS.iter() {
             let sql =
                 lakehouse_bi::builder::apply_builtin_year_filter(&k.sql, &k.mart, &years, &cols);
-            let (id, val) = run_spec_sql(ch, &k.id, &sql).await;
+            let (id, val) = run_spec_sql(ch, &k.id, &sql, roles, placeholders, obligations).await;
             results.insert(id, val);
         }
         for c in CHARTS.iter() {
             let sql =
                 lakehouse_bi::builder::apply_builtin_year_filter(&c.sql, &c.mart, &years, &cols);
-            let (id, val) = run_spec_sql(ch, &c.id, &sql).await;
+            let (id, val) = run_spec_sql(ch, &c.id, &sql, roles, placeholders, obligations).await;
             results.insert(id, val);
         }
     }
     for c in &stored_for_board {
         let sql = sql_with_filters(c, &years, &filters, &cols);
-        let (id, val) = run_spec_sql(ch, &c.spec.id, &sql).await;
+        let (id, val) = run_spec_sql(ch, &c.spec.id, &sql, roles, placeholders, obligations).await;
         results.insert(id, val);
     }
 

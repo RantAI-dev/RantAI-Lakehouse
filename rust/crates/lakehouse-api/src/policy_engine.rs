@@ -31,6 +31,7 @@
 
 use serde::Deserialize;
 use serde_json::Value;
+use sqlparser::dialect::Dialect;
 
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ident::SqlLiteral;
@@ -178,6 +179,80 @@ pub fn refusal_message(err: &sql_rewrite::RewriteError) -> &'static str {
             "Query membaca view yang menyingkap tabel yang diatur kebijakan; tidak didukung."
         }
     }
+}
+
+/// Either failure source [`rewrite_sql_for_roles`] can hit: resolving
+/// obligations (a Store failure, or Hard Requirement 1's unenforceable
+/// authored condition) or rewriting `sql` once obligations are known (a
+/// table function, sensitive `system.*` read, `dictGet`/`joinGet` call, a
+/// view over a governed table, or an unparseable/unprovable statement).
+/// Never forwarded verbatim to an HTTP response — see
+/// [`enforcement_error_message`].
+#[derive(Debug, thiserror::Error)]
+pub enum EnforcementError {
+    /// See [`PolicyEngineError`].
+    #[error(transparent)]
+    Engine(#[from] PolicyEngineError),
+    /// See [`sql_rewrite::RewriteError`].
+    #[error(transparent)]
+    Rewrite(#[from] sql_rewrite::RewriteError),
+}
+
+/// [`engine_error_message`]/[`refusal_message`], dispatched over
+/// [`EnforcementError`]'s two variants — the one non-leaking message
+/// function every [`rewrite_sql_for_roles`] caller uses.
+#[must_use]
+pub fn enforcement_error_message(err: &EnforcementError) -> &'static str {
+    match err {
+        EnforcementError::Engine(e) => engine_error_message(e),
+        EnforcementError::Rewrite(e) => refusal_message(e),
+    }
+}
+
+/// The one shared rewrite path Query Studio (`routes::query::run`, WS7
+/// item C2), dashboards/embeds (WS7 item D1), and Gold export (WS7 item
+/// D2) all go through — never a parallel, simplified masking primitive
+/// (WS7 plan Hard Requirement 1's "apply the same engine", read
+/// literally). Resolves every table `sql` references under `dialect`,
+/// prefetches real obligations for `roles` from `obligations_source`,
+/// then rewrites through [`sql_rewrite::enforce`].
+///
+/// `dialect` is generic (`D: Dialect + Sync`, a concrete type like
+/// `ClickHouseDialect`/`GenericDialect`), never `&dyn Dialect`: this
+/// function's own local `dialect` binding is live both before AND after
+/// the `.await` below (used again by `sql_rewrite::enforce`), so for the
+/// generated future to be `Send` the held reference itself must be
+/// `Send`, which requires `D: Sync` — a `&dyn Dialect` trait object does
+/// not implement that automatically, but a concrete, stateless dialect
+/// struct does (see `routes::query::rewrite_sql_for_principal_inner`'s
+/// own doc comment, which hit this exact constraint and worked around it
+/// by constructing two separate `&dyn Dialect` locals, one on each side
+/// of the `.await`, before this shared function existed).
+///
+/// # Errors
+/// [`EnforcementError::Engine`] if obligations cannot be resolved;
+/// [`EnforcementError::Rewrite`] if `sql` fails classification or
+/// substitution once obligations are known.
+pub async fn rewrite_sql_for_roles<D: Dialect + Sync>(
+    sql: &str,
+    dialect: &D,
+    roles: &[String],
+    placeholders: &sql_rewrite::PlaceholderValues,
+    obligations_source: &PolicyEngineObligations<'_>,
+) -> Result<String, EnforcementError> {
+    let tables =
+        sql_rewrite::referenced_tables(sql, dialect).ok_or(PolicyEngineError::Unparseable)?;
+    let (obligations, views) = obligations_source
+        .prefetch_for_tables(&tables, roles)
+        .await?;
+    Ok(sql_rewrite::enforce(
+        sql,
+        dialect,
+        roles,
+        placeholders,
+        &obligations,
+        &views,
+    )?)
 }
 
 /// Loads every `status = 'ready'` policy's `conditions`, applying Hard
