@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
     // factory (`dagster/dispar_orchestrate/authored_factory.py`, Phase E),
     // from `PIPELINE_RUN_TOKEN` — see `bootstrap_pipeline_run_service`'s
     // doc comment for what happens when it's unset, and why this identity
-    // is scoped to `pipeline:write` only.
+    // is scoped to both `pipeline:read` and `pipeline:write`.
     bootstrap_pipeline_run_service(&state).await;
 
     // WS0 item 11: same shape, for Dagster's `alerts_run_schedule`
@@ -323,20 +323,32 @@ async fn bootstrap_agent_run_service(state: &AppState) {
 /// implementation (WS4 item G3; Baseline dependency 7 — the generalized
 /// [`bootstrap_service_run_identity`] core is reused, not redefined).
 ///
-/// # Why this identity is scoped to `pipeline:write` ONLY
+/// # Why this identity is scoped to `pipeline:read` AND `pipeline:write`
 ///
 /// `authored_factory.py`'s job is not read-only: it both lists authored
-/// pipeline definitions (`GET /api/pipelines?engine=authored`,
-/// `pipeline:read`) AND, once Phase E lands, triggers/updates the authored
-/// jobs it builds from them — the same `pipeline:write`-gated surface a
-/// human `pipeline:write` principal uses (`POST /api/pipelines/{id}/
-/// trigger`, `POST /api/pipelines/{id}/status`). `pipeline:write` is the
-/// SMALLEST single permission that covers both: `PermissionSet` grants are
-/// not composable into "read AND this one write", so this identity is
-/// scoped to exactly `pipeline:write` — nothing broader, never `*:*`,
-/// never `catalog:write`/`connector:manage`, which this caller never
-/// touches. A leaked `PIPELINE_RUN_TOKEN` lets its holder operate authored
-/// pipelines, and nothing else.
+/// pipeline definitions (`GET /api/pipelines?engine=authored`, gated by
+/// `Policy::RequiresPermission("pipeline:read")` — `policy.rs`) AND, once
+/// Phase E lands, triggers/updates the authored jobs it builds from them
+/// (`POST /api/pipelines/{id}/trigger`, `POST /api/pipelines/{id}/status`,
+/// gated by `pipeline:write`). A service identity's `scopes` column is an
+/// array, not a single value — `0002_seed_identity.sql` already seeds
+/// other identities with several tokens (e.g. `ARRAY['query:read',
+/// 'catalog:read']`) — so there is no need to pick one permission that
+/// covers both: this identity is scoped to exactly `pipeline:read` and
+/// `pipeline:write`, nothing broader, never `*:*`, never
+/// `catalog:write`/`connector:manage`, which this caller never touches. A
+/// leaked `PIPELINE_RUN_TOKEN` lets its holder operate authored pipelines,
+/// and nothing else.
+///
+/// A previous version of this comment claimed `pipeline:write` alone was
+/// "the smallest single permission covering both" reads and writes. That
+/// was false: `PermissionSet::has` (`lakehouse-auth/src/permissions.rs`)
+/// matches resource AND action exactly, so `pipeline:write` never
+/// satisfies a `pipeline:read` check. The scheduler got a 403 on the one
+/// route it exists to call (`GET /api/pipelines`), `_fetch_authored_
+/// pipelines` degraded honestly to an empty list, and no authored pipeline
+/// ever ran — silently, with no error surfaced anywhere (WS4 item G3
+/// follow-up fix).
 ///
 /// # What happens when `PIPELINE_RUN_TOKEN` is absent
 ///
@@ -350,10 +362,11 @@ async fn bootstrap_pipeline_run_service(state: &AppState) {
         state,
         state.config.pipeline_run_token.clone(),
         PIPELINE_RUN_SERVICE_IDENTITY_NAME,
-        // ONLY `pipeline:write` — never `*:*`. See this function's own
-        // doc comment for why this single permission, and not a narrower
-        // read-only one, is the correct scope for this caller.
-        vec!["pipeline:write".to_owned()],
+        // `pipeline:read` AND `pipeline:write` — never `*:*`. See this
+        // function's own doc comment for why both are needed (the
+        // scheduler both lists and triggers authored pipelines) and why
+        // an array of two scopes, not one permission, is the correct fix.
+        vec!["pipeline:read".to_owned(), "pipeline:write".to_owned()],
         "PIPELINE_RUN_TOKEN",
     )
     .await;
@@ -1326,12 +1339,16 @@ mod tests {
         }
 
         /// With `PIPELINE_RUN_TOKEN` set, boot seeds exactly one identity
-        /// scoped to `pipeline:write` ONLY (WS4 item G3) and one matching
-        /// credential; the token authenticates a real principal that holds
-        /// `pipeline:write` but NOT `catalog:write`/`connector:manage` —
-        /// proving [`bootstrap_service_run_identity`] behaves identically
-        /// for this caller while honoring this task's narrower scope
-        /// decision.
+        /// scoped to `pipeline:read` AND `pipeline:write` (WS4 item G3) and
+        /// one matching credential; the token authenticates a real
+        /// principal that holds both `pipeline:read` (the list route the
+        /// scheduler calls) and `pipeline:write` (the trigger route) but
+        /// NOT `catalog:write`/`connector:manage` — proving
+        /// [`bootstrap_service_run_identity`] behaves identically for this
+        /// caller while honoring this task's minimal-but-sufficient scope
+        /// decision. A test that only checked what the identity lacks
+        /// would not have caught the identity also lacking `pipeline:read`
+        /// (the bug this test guards against).
         #[tokio::test]
         async fn bootstrap_pipeline_run_service_seeds_identity_and_credential() {
             let mut overrides = HashMap::new();
@@ -1353,7 +1370,10 @@ mod tests {
                     .fetch_one(pool)
                     .await
                     .expect("read the seeded identity's scopes");
-            assert_eq!(scopes, vec!["pipeline:write".to_owned()]);
+            assert_eq!(
+                scopes,
+                vec!["pipeline:read".to_owned(), "pipeline:write".to_owned()]
+            );
 
             let principal = lakehouse_auth::service_token::verify_service_token(
                 pool,
@@ -1362,6 +1382,7 @@ mod tests {
             .await
             .expect("the configured token must authenticate a real service principal");
             assert!(principal.permissions.has("pipeline:write"));
+            assert!(principal.permissions.has("pipeline:read"));
             assert!(!principal.permissions.has("catalog:write"));
             assert!(!principal.permissions.has("connector:manage"));
         }
