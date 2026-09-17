@@ -29,6 +29,23 @@ const EMPTY_FORM: AlertRule = {
   id: "", name: "", type: "alert", agg: "sum", op: ">", threshold: 0, channel: "webhook", target: "", enabled: true,
 };
 
+/**
+ * Which rule-editor fields apply to a given `AlertRule.type`. A
+ * `freshness` rule reuses `mart` as its `<namespace>.<table>` target and
+ * sends no `board` — the backend clears `measure`/`agg`/`threshold`/`board`
+ * for that kind (`lakehouse-alerts::normalize_input`). Kept pure and
+ * DOM-free so it is unit-testable (WS5 item E3).
+ */
+export function alertRuleFormFields(type: string): {
+  martMeasure: boolean;
+  board: boolean;
+  freshnessTarget: boolean;
+} {
+  if (type === "freshness") return { martMeasure: false, board: false, freshnessTarget: true };
+  if (type === "alert") return { martMeasure: true, board: false, freshnessTarget: false };
+  return { martMeasure: false, board: true, freshnessTarget: false };
+}
+
 export function AlertsPage() {
   const state = useService((s) => alertRuleService.listRules(s), []);
 
@@ -125,6 +142,7 @@ export function AlertsPage() {
   const mutationError = removeAction.error ?? toggleAction.error ?? runAction.error;
   const rules = state.status === "success" ? state.data : [];
   const busy = saveAction.status === "pending";
+  const formFields = alertRuleFormFields(f.type);
   const runResults = runAction.status === "success" ? runAction.data.results : null;
 
   return (
@@ -224,7 +242,7 @@ export function AlertsPage() {
               <div className="grid gap-1.5"><Label>Type</Label>
                 <Select value={f.type} onValueChange={(v) => setF({ ...f, type: (v ?? "alert") })}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent><SelectItem value="alert">Threshold alert</SelectItem><SelectItem value="digest">Dashboard digest</SelectItem></SelectContent>
+                  <SelectContent><SelectItem value="alert">Threshold alert</SelectItem><SelectItem value="digest">Dashboard digest</SelectItem><SelectItem value="freshness">Dataset freshness</SelectItem></SelectContent>
                 </Select>
               </div>
               <div className="grid gap-1.5"><Label>Delivery</Label>
@@ -256,7 +274,16 @@ export function AlertsPage() {
               </Select>
             </div>
 
-            {f.type === "alert" ? (
+            {formFields.freshnessTarget ? (
+              <div className="grid gap-1.5">
+                <Label>Table (namespace.table)</Label>
+                <Input
+                  value={f.mart ?? ""}
+                  onChange={(e) => setF({ ...f, mart: e.target.value })}
+                  placeholder="bronze.orders"
+                />
+              </div>
+            ) : formFields.martMeasure ? (
               <>
                 <div className="grid grid-cols-2 gap-3">
                   <div className="grid gap-1.5"><Label>Mart (Gold)</Label>

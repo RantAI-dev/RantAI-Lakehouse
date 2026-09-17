@@ -5,8 +5,14 @@
  * `lakehouse_notify::DeliverResult` exactly.
  */
 
-/** Mirrors `AlertKind` (`#[serde(rename_all = "lowercase")]`). */
-export type AlertRuleKind = "alert" | "digest" | string
+/**
+ * Mirrors `AlertKind` (`#[serde(rename_all = "lowercase")]`,
+ * `rust/crates/lakehouse-alerts/src/lib.rs`), which accepts exactly
+ * `alert`, `digest`, `freshness`. A `freshness` rule reuses the `mart`
+ * field as its `<namespace>.<table>` target and the backend clears
+ * `measure`/`agg`/`threshold`/`board` for that kind (WS5 item E3).
+ */
+export type AlertRuleKind = "alert" | "digest" | "freshness" | string
 
 /** Mirrors `AlertChannel` (`#[serde(rename_all = "lowercase")]`). */
 export type AlertChannel = "webhook" | "email" | string
