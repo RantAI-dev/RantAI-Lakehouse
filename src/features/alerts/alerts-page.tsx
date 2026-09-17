@@ -235,6 +235,27 @@ export function AlertsPage() {
               </div>
             </div>
 
+            <div className="grid gap-1.5"><Label>Severity</Label>
+              {/* The backend's SEVERITIES accepts exactly these five strings
+                  and 400s on anything else; "(none)" must send no
+                  `severity` field at all, never an empty string or the
+                  literal "none" the backend would reject. */}
+              <Select
+                value={f.severity ?? "none"}
+                onValueChange={(v) => setF({ ...f, severity: !v || v === "none" ? undefined : v })}
+              >
+                <SelectTrigger><SelectValue placeholder="Severity" /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">(none)</SelectItem>
+                  <SelectItem value="critical">Critical</SelectItem>
+                  <SelectItem value="high">High</SelectItem>
+                  <SelectItem value="medium">Medium</SelectItem>
+                  <SelectItem value="low">Low</SelectItem>
+                  <SelectItem value="info">Info</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
             {f.type === "alert" ? (
               <>
                 <div className="grid grid-cols-2 gap-3">

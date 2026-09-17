@@ -34,6 +34,13 @@ export type AlertRule = {
   target: string
   enabled: boolean
   createdAt?: string
+  /**
+   * Copied verbatim onto a fired instance's `AlertItem.severity` (WS5 item
+   * C1). Omitted from the wire body (not `null`) when unset, mirroring
+   * `mart`/`measure`/`board` above — a rule with no severity fires
+   * instances with `severity: null`, never a fabricated default.
+   */
+  severity?: string
 }
 
 /**
@@ -55,6 +62,7 @@ export type SaveAlertRuleInput = {
   channel?: string
   target?: string
   enabled?: boolean
+  severity?: string
 }
 
 /** Mirrors `lakehouse_notify::DeliverResult`. */

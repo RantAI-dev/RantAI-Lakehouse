@@ -59,6 +59,26 @@ const columns: ColumnDef<AlertItem>[] = [
       r.assignee ?? <span className="text-muted-foreground">Unassigned</span>,
   },
   { key: "at", header: "When", render: (r) => formatRelativeTime(r.at) },
+  {
+    key: "firedAt",
+    header: "Fired",
+    render: (r) =>
+      r.firedAt ? (
+        formatRelativeTime(r.firedAt)
+      ) : (
+        <span className="text-muted-foreground">—</span>
+      ),
+  },
+  {
+    key: "silencedUntil",
+    header: "Silenced until",
+    render: (r) =>
+      r.silencedUntil ? (
+        formatDateTime(r.silencedUntil)
+      ) : (
+        <span className="text-muted-foreground">—</span>
+      ),
+  },
 ]
 
 /** Platform alerts with severity, acknowledgement, resolution, and deep links. */
@@ -75,6 +95,9 @@ export function AlertsPage() {
   )
   const resolve = useServiceAction((signal, id: string, resolutionNote: string) =>
     overviewService.resolveAlert(id, resolutionNote, signal)
+  )
+  const silence = useServiceAction((signal, id: string, untilMinutes: number) =>
+    overviewService.silenceAlert(id, untilMinutes, signal)
   )
 
   const rows = useMemo(() => {
@@ -100,6 +123,7 @@ export function AlertsPage() {
   function openAlert(alert: AlertItem) {
     ack.reset()
     resolve.reset()
+    silence.reset()
     setNote("")
     setSelected(alert)
   }
@@ -120,7 +144,15 @@ export function AlertsPage() {
     }
   }
 
-  const actionError = ack.error ?? resolve.error
+  async function onSilence(alert: AlertItem) {
+    const updated = await silence.run(alert.id, 60)
+    if (updated) {
+      setSelected(updated)
+      state.reload()
+    }
+  }
+
+  const actionError = ack.error ?? resolve.error ?? silence.error
 
   return (
     <div className="flex flex-col gap-4">
@@ -245,6 +277,18 @@ export function AlertsPage() {
                     onClick={() => onResolve(selected)}
                   >
                     {resolve.status === "pending" ? "Resolving..." : "Resolve"}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={
+                      ack.status === "pending" ||
+                      resolve.status === "pending" ||
+                      silence.status === "pending"
+                    }
+                    onClick={() => onSilence(selected)}
+                  >
+                    {silence.status === "pending" ? "Silencing..." : "Silence 60m"}
                   </Button>
                 </div>
                 {actionError ? (

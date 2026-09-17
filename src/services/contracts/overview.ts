@@ -90,4 +90,10 @@ export interface OverviewService {
   listAlerts(signal?: AbortSignal): Promise<AlertItem[]>
   acknowledgeAlert(id: string, signal?: AbortSignal): Promise<AlertItem>
   resolveAlert(id: string, note: string, signal?: AbortSignal): Promise<AlertItem>
+  /**
+   * `untilMinutes` must be within `1..=43_200` (30 days) — the backend's
+   * own range (`lakehouse_alerts`'s silence route) — a value outside it
+   * gets a 400, so callers must not surface a UI that can send one.
+   */
+  silenceAlert(id: string, untilMinutes: number, signal?: AbortSignal): Promise<AlertItem>
 }

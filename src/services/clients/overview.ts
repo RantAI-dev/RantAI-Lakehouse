@@ -53,4 +53,7 @@ export const clickhouseOverviewService: OverviewService = {
   resolveAlert(id, note, signal) {
     return postJson<AlertItem>(`/api/overview/alerts/${encodeURIComponent(id)}/resolve`, { note }, signal);
   },
+  silenceAlert(id, untilMinutes, signal) {
+    return postJson<AlertItem>(`/api/overview/alerts/${encodeURIComponent(id)}/silence`, { untilMinutes }, signal);
+  },
 };
