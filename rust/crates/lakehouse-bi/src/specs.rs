@@ -154,20 +154,20 @@ pub enum ChartSource {
 
 /// A single-number KPI. The `sql` must return a column named `v` (and may
 /// return other columns too).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct KpiSpec {
     /// Stable identifier.
-    pub id: &'static str,
+    pub id: String,
     /// Display title.
-    pub title: &'static str,
+    pub title: String,
     /// `ClickHouse` SQL that returns a `v` column.
-    pub sql: &'static str,
+    pub sql: String,
     /// Numeric display format.
     pub format: NumFmt,
     /// Optional caption/unit shown under the value.
-    pub caption: Option<&'static str>,
+    pub caption: Option<String>,
     /// Source mart — for lineage/labeling.
-    pub mart: &'static str,
+    pub mart: String,
 }
 
 /// A chart's `y` axis: a single measure column, or several for a stacked
@@ -183,241 +183,136 @@ pub enum ChartY {
 
 /// A chart. `sql` returns rows; `x`/`y` name the columns used for the
 /// axis/series.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ChartSpec {
     /// Stable identifier.
-    pub id: &'static str,
+    pub id: String,
     /// Display title.
-    pub title: &'static str,
+    pub title: String,
     /// Optional subtitle.
-    pub subtitle: Option<&'static str>,
+    pub subtitle: Option<String>,
     /// How to render the data.
     pub kind: ChartKind,
     /// Source mart — for lineage/labeling.
-    pub mart: &'static str,
+    pub mart: String,
     /// `ClickHouse` SQL that returns the chart's rows.
-    pub sql: &'static str,
+    pub sql: String,
     /// Column name for the X axis / category.
-    pub x: &'static str,
+    pub x: String,
     /// Column name(s) for the Y axis / measure(s).
     pub y: ChartY,
     /// Optional 2nd-dimension breakdown column: splits `y` into multiple
     /// series by this column's value. When set, `y` is a single measure and
     /// the data is long-format (x, series, value).
-    pub series: Option<&'static str>,
+    pub series: Option<String>,
     /// Numeric display format.
     pub format: Option<NumFmt>,
     /// Grid span; `2` = full width.
     pub span: Option<u8>,
     /// Markdown content for `kind: "text"` tiles (no SQL).
-    pub text: Option<&'static str>,
+    pub text: Option<String>,
     /// Caption/unit for `kind: "kpi"` tiles.
-    pub caption: Option<&'static str>,
+    pub caption: Option<String>,
     /// Target/max value for `kind: "gauge"` tiles (auto from data when
     /// unset).
     pub target: Option<f64>,
 }
 
-impl ChartY {
-    fn single(value: &'static str) -> Self {
-        Self::Single(value.to_owned())
+/// The JSON document `BUILTIN_DASHBOARD_SPEC` points at: the built-in
+/// "Main" dashboard's tile catalog, per tenant. An empty/missing file — or
+/// an unset `BUILTIN_DASHBOARD_SPEC` — means no built-in tiles at all
+/// (`routes::dashboard::get_body` treats an empty `KPIS`/`CHARTS` as
+/// "board disabled", replacing the retired `BUILTIN_DASHBOARD_ENABLED`
+/// flag).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BuiltinDashboardSpecFile {
+    #[serde(default)]
+    kpis: Vec<KpiSpec>,
+    #[serde(default)]
+    charts: Vec<ChartSpec>,
+}
+
+/// Parse a `BUILTIN_DASHBOARD_SPEC` document from its raw text. Exposed
+/// (`pub(crate)` would suffice for `dashboard.rs`, but this is `pub` so
+/// `tests/specs_match_typescript.rs` — an external integration test — can
+/// call it directly on the shipped default file rather than relying on the
+/// process-wide `KPIS`/`CHARTS` statics, which would require setting
+/// `BUILTIN_DASHBOARD_SPEC` via `std::env::set_var` in a test binary shared
+/// with other tests (AGENTS.md: never do that).
+///
+/// # Errors
+///
+/// Returns a [`serde_json::Error`] if `raw` is not valid JSON matching this
+/// shape. Malformed JSON is the caller's decision to treat as "disabled"
+/// ([`load_builtin_dashboard_spec`] does exactly that); this function
+/// itself reports the real error rather than swallowing it, so a test (like
+/// the ones below) can assert on the failure directly.
+pub fn parse_builtin_dashboard_spec(
+    raw: &str,
+) -> Result<BuiltinDashboardSpecFile, serde_json::Error> {
+    serde_json::from_str(raw)
+}
+
+impl BuiltinDashboardSpecFile {
+    /// Public accessors so external callers of
+    /// [`parse_builtin_dashboard_spec`] (the parity test) can read the
+    /// parsed fields without this struct's fields themselves needing to be
+    /// `pub`.
+    #[must_use]
+    pub fn kpis(&self) -> &[KpiSpec] {
+        &self.kpis
     }
 
-    fn multi(values: &[&'static str]) -> Self {
-        Self::Multi(values.iter().map(|v| (*v).to_owned()).collect())
+    /// The parsed `charts` array, mirroring [`Self::kpis`].
+    #[must_use]
+    pub fn charts(&self) -> &[ChartSpec] {
+        &self.charts
     }
 }
 
-/// Built-in KPI tiles, ported verbatim from `KPIS` in `dashboard-specs.ts`.
-pub static KPIS: LazyLock<Vec<KpiSpec>> = LazyLock::new(|| {
-    vec![
-        KpiSpec {
-            id: "kpi_wisman_total",
-            title: "Total Foreign Visitors",
-            mart: "mart_wisman",
-            sql: "SELECT sum(jumlah) AS v FROM serving.mart_wisman",
-            format: NumFmt::Int,
-            caption: Some("foreign visits (cumulative)"),
-        },
-        KpiSpec {
-            id: "kpi_dtw",
-            title: "Tracked Destinations",
-            mart: "mart_kunjungan_dtw",
-            sql: "SELECT count(DISTINCT destinasi) AS v FROM serving.mart_kunjungan_dtw",
-            format: NumFmt::Int,
-            caption: Some("tourist attractions (DTW)"),
-        },
-        KpiSpec {
-            id: "kpi_event",
-            title: "Events (Latest Year)",
-            mart: "mart_event",
-            sql: "SELECT jumlah_event AS v, tahun FROM serving.mart_event ORDER BY tahun DESC LIMIT 1",
-            format: NumFmt::Int,
-            caption: Some("number of events in the latest year"),
-        },
-        KpiSpec {
-            id: "kpi_gci",
-            title: "GCI Indicators Ready",
-            mart: "mart_gci_readiness",
-            sql: "SELECT sum(data_tersedia) AS v, count() AS total FROM serving.mart_gci_readiness",
-            format: NumFmt::Int,
-            caption: Some("indicators with data available"),
-        },
-    ]
-});
+fn load_builtin_dashboard_spec() -> BuiltinDashboardSpecFile {
+    let Ok(path) = std::env::var("BUILTIN_DASHBOARD_SPEC").map(|v| v.trim().to_owned()) else {
+        tracing::info!("BUILTIN_DASHBOARD_SPEC not set; built-in dashboard tiles disabled");
+        return BuiltinDashboardSpecFile::default();
+    };
+    if path.is_empty() {
+        tracing::info!("BUILTIN_DASHBOARD_SPEC is empty; built-in dashboard tiles disabled");
+        return BuiltinDashboardSpecFile::default();
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            tracing::error!(
+                %err,
+                path,
+                "BUILTIN_DASHBOARD_SPEC could not be read; built-in dashboard tiles disabled"
+            );
+            return BuiltinDashboardSpecFile::default();
+        }
+    };
+    match parse_builtin_dashboard_spec(&raw) {
+        Ok(spec) => spec,
+        Err(err) => {
+            tracing::error!(
+                %err,
+                path,
+                "BUILTIN_DASHBOARD_SPEC is not valid JSON; built-in dashboard tiles disabled"
+            );
+            BuiltinDashboardSpecFile::default()
+        }
+    }
+}
 
-/// Built-in chart tiles, ported verbatim from `CHARTS` in
-/// `dashboard-specs.ts`. The TS builds each `sql` from a `const S =
-/// "serving"` template; here the `serving.` prefix is inlined directly into
-/// each `&'static str` literal, byte-identical to the interpolated result.
-pub static CHARTS: LazyLock<Vec<ChartSpec>> = LazyLock::new(|| {
-    vec![
-        ChartSpec {
-            id: "wisman_tren",
-            title: "Foreign Visitor Trend",
-            subtitle: Some("Monthly total across years"),
-            kind: ChartKind::Area,
-            mart: "mart_wisman",
-            span: Some(2),
-            sql: "SELECT concat(toString(tahun),'-',leftPad(toString(bulan_no),2,'0')) AS periode,\n                 round(sum(jumlah)) AS jumlah\n          FROM serving.mart_wisman\n          GROUP BY tahun, bulan_no\n          ORDER BY tahun, bulan_no",
-            x: "periode",
-            y: ChartY::single("jumlah"),
-            series: None,
-            format: Some(NumFmt::Int),
-            text: None,
-            caption: None,
-            target: None,
-        },
-        ChartSpec {
-            id: "wisman_negara",
-            title: "Top Source Countries",
-            subtitle: Some("Top 10 nationalities"),
-            kind: ChartKind::Hbar,
-            mart: "mart_wisman",
-            span: None,
-            sql: "SELECT negara, round(sum(jumlah)) AS jumlah\n          FROM serving.mart_wisman\n          GROUP BY negara ORDER BY jumlah DESC LIMIT 10",
-            x: "negara",
-            y: ChartY::single("jumlah"),
-            series: None,
-            format: Some(NumFmt::Int),
-            text: None,
-            caption: None,
-            target: None,
-        },
-        ChartSpec {
-            id: "wisman_kawasan",
-            title: "Visitors by Region",
-            subtitle: Some("Distribution by continent/region"),
-            kind: ChartKind::Pie,
-            mart: "mart_wisman",
-            span: None,
-            sql: "SELECT kawasan, round(sum(jumlah)) AS jumlah\n          FROM serving.mart_wisman\n          GROUP BY kawasan ORDER BY jumlah DESC",
-            x: "kawasan",
-            y: ChartY::single("jumlah"),
-            series: None,
-            format: Some(NumFmt::Int),
-            text: None,
-            caption: None,
-            target: None,
-        },
-        ChartSpec {
-            id: "wisman_pintu",
-            title: "Visitors by Entry Point",
-            subtitle: Some("Arrival points"),
-            kind: ChartKind::Bar,
-            mart: "mart_wisman",
-            span: None,
-            sql: "SELECT pintu_masuk, round(sum(jumlah)) AS jumlah\n          FROM serving.mart_wisman\n          GROUP BY pintu_masuk ORDER BY jumlah DESC",
-            x: "pintu_masuk",
-            y: ChartY::single("jumlah"),
-            series: None,
-            format: Some(NumFmt::Int),
-            text: None,
-            caption: None,
-            target: None,
-        },
-        ChartSpec {
-            id: "dtw_top",
-            title: "Visits by Destination",
-            subtitle: Some("Domestic vs foreign, top 8 destinations"),
-            kind: ChartKind::Stacked,
-            mart: "mart_kunjungan_dtw",
-            span: Some(2),
-            sql: "SELECT destinasi, round(sum(wisnus)) AS wisnus, round(sum(wisman)) AS wisman\n          FROM serving.mart_kunjungan_dtw\n          GROUP BY destinasi ORDER BY sum(total) DESC LIMIT 8",
-            x: "destinasi",
-            y: ChartY::multi(&["wisnus", "wisman"]),
-            series: None,
-            format: Some(NumFmt::Int),
-            text: None,
-            caption: None,
-            target: None,
-        },
-        ChartSpec {
-            id: "event_tren",
-            title: "Event Count Trend",
-            subtitle: Some("Per year"),
-            kind: ChartKind::Line,
-            mart: "mart_event",
-            span: None,
-            sql: "SELECT toString(tahun) AS tahun, jumlah_event AS jumlah\n          FROM serving.mart_event ORDER BY tahun",
-            x: "tahun",
-            y: ChartY::single("jumlah"),
-            series: None,
-            format: Some(NumFmt::Int),
-            text: None,
-            caption: None,
-            target: None,
-        },
-        ChartSpec {
-            id: "gci_readiness",
-            title: "GCI Data Readiness",
-            subtitle: Some("Readiness status distribution"),
-            kind: ChartKind::Pie,
-            mart: "mart_gci_readiness",
-            span: None,
-            sql: "SELECT readiness, count() AS n\n          FROM serving.mart_gci_readiness\n          GROUP BY readiness ORDER BY n DESC",
-            x: "readiness",
-            y: ChartY::single("n"),
-            series: None,
-            format: Some(NumFmt::Int),
-            text: None,
-            caption: None,
-            target: None,
-        },
-        ChartSpec {
-            id: "kuliner_wilayah",
-            title: "Culinary Businesses by Area",
-            subtitle: Some("Registered businesses"),
-            kind: ChartKind::Bar,
-            mart: "mart_kuliner",
-            span: None,
-            sql: "SELECT wilayah, sum(jumlah_usaha) AS jumlah\n          FROM serving.mart_kuliner\n          GROUP BY wilayah ORDER BY jumlah DESC",
-            x: "wilayah",
-            y: ChartY::single("jumlah"),
-            series: None,
-            format: Some(NumFmt::Int),
-            text: None,
-            caption: None,
-            target: None,
-        },
-        ChartSpec {
-            id: "atlas_poi",
-            title: "Tourism POIs by Category",
-            subtitle: Some("Number of POIs"),
-            kind: ChartKind::Hbar,
-            mart: "mart_atlas",
-            span: None,
-            sql: "SELECT kategori, jumlah_poi AS jumlah\n          FROM serving.mart_atlas ORDER BY jumlah_poi DESC",
-            x: "kategori",
-            y: ChartY::single("jumlah"),
-            series: None,
-            format: Some(NumFmt::Int),
-            text: None,
-            caption: None,
-            target: None,
-        },
-    ]
-});
+static BUILTIN_SPEC: LazyLock<BuiltinDashboardSpecFile> =
+    LazyLock::new(load_builtin_dashboard_spec);
+
+/// Built-in KPI tiles for this tenant, from `BUILTIN_DASHBOARD_SPEC`. Empty
+/// when the env var is unset, unreadable, or invalid — this replaces the
+/// retired `BUILTIN_DASHBOARD_ENABLED` flag (empty = off).
+pub static KPIS: LazyLock<Vec<KpiSpec>> = LazyLock::new(|| BUILTIN_SPEC.kpis().to_vec());
+
+/// Built-in chart tiles for this tenant, mirroring [`KPIS`].
+pub static CHARTS: LazyLock<Vec<ChartSpec>> = LazyLock::new(|| BUILTIN_SPEC.charts().to_vec());
 
 /// The built-in charts, for cross-language drift guards (compare against the
 /// captured parity corpus).
@@ -432,16 +327,15 @@ pub fn kpis() -> &'static [KpiSpec] {
     &KPIS
 }
 
-/// Look up the SQL for a built-in id (KPI or chart), mirroring the TS
-/// `SPEC_SQL` map (`Object.fromEntries([...KPIS, ...CHARTS].map(...))`).
+/// Look up the SQL for a built-in id (KPI or chart).
 ///
 /// Returns `None` if `id` does not match a built-in KPI or chart.
 #[must_use]
-pub fn spec_sql(id: &str) -> Option<&'static str> {
+pub fn spec_sql(id: &str) -> Option<String> {
     KPIS.iter()
         .find(|k| k.id == id)
-        .map(|k| k.sql)
-        .or_else(|| CHARTS.iter().find(|c| c.id == id).map(|c| c.sql))
+        .map(|k| k.sql.clone())
+        .or_else(|| CHARTS.iter().find(|c| c.id == id).map(|c| c.sql.clone()))
 }
 
 /// Render-facing view of a [`ChartSpec`]: everything except `sql`, plus the
@@ -496,18 +390,18 @@ pub struct ChartRenderSpec {
 #[must_use]
 pub fn to_render_spec(spec: &ChartSpec, source: ChartSource) -> ChartRenderSpec {
     ChartRenderSpec {
-        id: spec.id.to_owned(),
-        title: spec.title.to_owned(),
-        subtitle: spec.subtitle.map(str::to_owned),
+        id: spec.id.clone(),
+        title: spec.title.clone(),
+        subtitle: spec.subtitle.clone(),
         kind: spec.kind,
-        mart: spec.mart.to_owned(),
-        x: spec.x.to_owned(),
+        mart: spec.mart.clone(),
+        x: spec.x.clone(),
         y: spec.y.clone(),
-        series: spec.series.map(str::to_owned),
+        series: spec.series.clone(),
         format: spec.format,
         span: spec.span,
-        text: spec.text.map(str::to_owned),
-        caption: spec.caption.map(str::to_owned),
+        text: spec.text.clone(),
+        caption: spec.caption.clone(),
         target: spec.target,
         source,
         board: None,
@@ -535,27 +429,53 @@ mod tests {
         );
     }
 
-    #[test]
-    fn charts_has_nine_entries() {
-        assert_eq!(charts().len(), 9);
+    // `charts()`/`kpis()`/`spec_sql()` all read the process-wide
+    // `KPIS`/`CHARTS` statics, which are empty unless `BUILTIN_DASHBOARD_SPEC`
+    // is set (Task 6) — setting that env var from within one test would race
+    // every other test in this binary that touches the same `LazyLock`, so
+    // the tests below either build a `ChartSpec`/`KpiSpec` directly (now
+    // straightforward: the fields are owned `String`) or parse the shipped
+    // fixture file through the pure [`parse_builtin_dashboard_spec`], never
+    // the statics.
+
+    impl ChartY {
+        fn single(value: &str) -> Self {
+            Self::Single(value.to_owned())
+        }
+
+        fn multi(values: &[&str]) -> Self {
+            Self::Multi(values.iter().map(|v| (*v).to_owned()).collect())
+        }
+    }
+
+    fn sample_chart(id: &str, y: ChartY) -> ChartSpec {
+        ChartSpec {
+            id: id.to_owned(),
+            title: "Title".to_owned(),
+            subtitle: None,
+            kind: ChartKind::Bar,
+            mart: "mart_wisman".to_owned(),
+            sql: "SELECT 1".to_owned(),
+            x: "x".to_owned(),
+            y,
+            series: None,
+            format: Some(NumFmt::Int),
+            span: None,
+            text: None,
+            caption: None,
+            target: None,
+        }
     }
 
     #[test]
-    fn kpis_has_four_entries() {
-        assert_eq!(kpis().len(), 4);
-    }
-
-    #[test]
-    fn spec_sql_finds_kpi_and_chart() {
-        assert!(spec_sql("kpi_wisman_total").is_some());
-        assert!(spec_sql("wisman_tren").is_some());
+    fn spec_sql_returns_none_for_an_unknown_id() {
         assert!(spec_sql("does_not_exist").is_none());
     }
 
     #[test]
     fn to_render_spec_strips_sql_and_sets_source() {
-        let spec = &charts()[0];
-        let render = to_render_spec(spec, ChartSource::Builtin);
+        let spec = sample_chart("wisman_tren", ChartY::single("jumlah"));
+        let render = to_render_spec(&spec, ChartSource::Builtin);
         assert_eq!(render.id, spec.id);
         assert_eq!(render.source, ChartSource::Builtin);
         let json = serde_json::to_value(&render).unwrap();
@@ -564,10 +484,55 @@ mod tests {
 
     #[test]
     fn stacked_chart_y_is_multi() {
-        let dtw = charts().iter().find(|c| c.id == "dtw_top").unwrap();
+        let dtw = sample_chart("dtw_top", ChartY::multi(&["wisnus", "wisman"]));
         assert_eq!(
             dtw.y,
             ChartY::Multi(vec!["wisnus".to_owned(), "wisman".to_owned()])
         );
+    }
+
+    #[test]
+    fn parse_builtin_dashboard_spec_reads_kpis_and_charts() {
+        let json = r#"{
+            "kpis": [
+                {"id": "k1", "title": "K1", "mart": "m1", "sql": "SELECT 1 AS v", "format": "int", "caption": null}
+            ],
+            "charts": [
+                {"id": "c1", "title": "C1", "subtitle": null, "kind": "bar", "mart": "m1",
+                 "sql": "SELECT 1", "x": "a", "y": "b", "series": null, "format": "int",
+                 "span": null, "text": null, "caption": null, "target": null}
+            ]
+        }"#;
+        let spec = parse_builtin_dashboard_spec(json).unwrap();
+        assert_eq!(spec.kpis.len(), 1);
+        assert_eq!(spec.kpis[0].id, "k1");
+        assert_eq!(spec.charts.len(), 1);
+        assert_eq!(spec.charts[0].kind, ChartKind::Bar);
+    }
+
+    #[test]
+    fn parse_builtin_dashboard_spec_defaults_both_arrays_when_absent() {
+        let spec = parse_builtin_dashboard_spec("{}").unwrap();
+        assert!(spec.kpis.is_empty());
+        assert!(spec.charts.is_empty());
+    }
+
+    #[test]
+    fn parse_builtin_dashboard_spec_rejects_malformed_json() {
+        assert!(parse_builtin_dashboard_spec("not json").is_err());
+    }
+
+    #[test]
+    fn shipped_default_spec_parses_and_matches_the_byte_count_of_the_former_static_catalog() {
+        // The shipped default is the exact 4 KPIs + 9 charts this module
+        // used to hardcode — this is the regression guard that the JSON
+        // migration didn't drop or duplicate an entry.
+        let raw = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("specs/builtin-default.json"),
+        )
+        .unwrap();
+        let spec = parse_builtin_dashboard_spec(&raw).unwrap();
+        assert_eq!(spec.kpis.len(), 4);
+        assert_eq!(spec.charts.len(), 9);
     }
 }

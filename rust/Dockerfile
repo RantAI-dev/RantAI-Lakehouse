@@ -39,6 +39,11 @@ WORKDIR /app
 COPY --from=builder /build/target/release/lakehouse-api /usr/local/bin/lakehouse-api
 COPY --from=builder /usr/local/cargo/bin/sqlx /usr/local/bin/sqlx
 COPY migrations ./migrations
+# The built-in "Main" dashboard's shipped tile catalog (Task 6,
+# lakehouse-bi::specs). Deployments opt in by setting
+# BUILTIN_DASHBOARD_SPEC=/app/specs/builtin-default.json; unset means no
+# built-in tiles at all.
+COPY --from=builder /build/crates/lakehouse-bi/specs ./specs
 COPY entrypoint.api.sh /usr/local/bin/entrypoint.api.sh
 RUN chmod +x /usr/local/bin/entrypoint.api.sh
 EXPOSE 8080

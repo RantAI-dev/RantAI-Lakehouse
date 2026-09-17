@@ -11,7 +11,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::tenant::BUILTIN_DASHBOARD_ENABLED;
 use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
@@ -97,9 +96,12 @@ async fn get_body(
         .or_else(|| board_obj.and_then(|b| b.filters.clone()))
         .unwrap_or_default();
 
-    // Built-in tiles are only served when this deployment actually has
-    // the mart for them; see `BUILTIN_DASHBOARD_ENABLED`.
-    let on_default = (board == "default" || board == "all") && *BUILTIN_DASHBOARD_ENABLED;
+    // The built-in tiles are served only when this tenant's
+    // BUILTIN_DASHBOARD_SPEC actually loaded a non-empty catalog — see
+    // lakehouse_bi::specs's module doc for why an empty/missing spec means
+    // "disabled" (this replaces the retired BUILTIN_DASHBOARD_ENABLED flag).
+    let on_default =
+        (board == "default" || board == "all") && (!KPIS.is_empty() || !CHARTS.is_empty());
     let stored_for_board: Vec<&StoredChartSpec> = if board == "all" {
         stored.iter().collect()
     } else {
@@ -119,11 +121,11 @@ async fn get_body(
     let mut results = Map::new();
     if on_default {
         for k in KPIS.iter() {
-            let (id, val) = run_spec_sql(ch, k.id, k.sql).await;
+            let (id, val) = run_spec_sql(ch, &k.id, &k.sql).await;
             results.insert(id, val);
         }
         for c in CHARTS.iter() {
-            let (id, val) = run_spec_sql(ch, c.id, c.sql).await;
+            let (id, val) = run_spec_sql(ch, &c.id, &c.sql).await;
             results.insert(id, val);
         }
     }

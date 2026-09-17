@@ -60,23 +60,6 @@ pub fn is_curated_bronze(slug: &str) -> bool {
     BRONZE_CURATED.iter().any(|curated| curated == slug)
 }
 
-/// Whether the built-in "Main" dashboard tiles are served.
-///
-/// The built-ins in `lakehouse-bi::specs` are hardcoded against the Dispar
-/// marts (`serving.mart_wisman`, `serving.mart_kunjungan_dtw`, …). On any
-/// deployment without those tables — the partner demo, for one — every tile on
-/// the default board fails with `Unknown table expression identifier`, painting
-/// the landing dashboard red before the UI redirects to a real board.
-///
-/// Set `BUILTIN_DASHBOARD_ENABLED=0` to serve an empty "Main" board instead.
-/// Defaults to enabled, so the Dispar console is unaffected.
-pub static BUILTIN_DASHBOARD_ENABLED: LazyLock<bool> = LazyLock::new(|| {
-    !matches!(
-        env_or("BUILTIN_DASHBOARD_ENABLED", "1").trim(),
-        "0" | "false" | "no" | "off"
-    )
-});
-
 /// Display name and description for a catalog namespace.
 pub struct NamespaceMeta {
     /// Human-readable namespace name.

@@ -336,7 +336,7 @@ their opt-in compose profiles:
 | `TENANT_OWNER` / `TENANT_ID` / `TENANT_DOMAIN` / `TENANT_RESIDENCY` / `TENANT_SITE` | Tenant identity surfaced on catalog assets, audit and quota records (`lakehouse-api/src/tenant.rs`). Each falls back to its historical default when blank | unset (historical defaults apply) | No |
 | `BRONZE_CURATED_SLUGS` | Comma-separated dataset slugs presented as curated rather than raw Bronze | unset | No |
 | `CATALOG_NAMESPACE_META` | JSON object overriding catalog namespace display names/descriptions. Malformed JSON is ignored in favour of the defaults — a bad label is cosmetic, refusing to serve the catalog is an outage | unset | No |
-| `BUILTIN_DASHBOARD_ENABLED` | Set `0` on any tenant **without** a `serving.mart_wisman` mart: the built-in "Main" dashboard's tiles are hardcoded to it and paint red before the UI redirects | `1` | No, but effectively required off-tenant |
+| `BUILTIN_DASHBOARD_SPEC` | Path to a JSON file of built-in "Main" dashboard KPI/chart tiles for this tenant (shape: `{kpis:[...], charts:[...]}`, see `rust/crates/lakehouse-bi/specs/builtin-default.json`); unset, unreadable, or invalid means no built-in tiles at all | unset | No |
 | `GOLD_SOURCE_SCHEMA` | ClickHouse schema Gold export reads marts from | `serving` | No |
 | `GOLD_EXPORT_MARTS` | Comma-separated marts the scheduled Gold export job exports | `gold_export_smoke` | No |
 | `GOLD_EXPORT_RUN_TOKEN` | Shared token required by `POST /api/gold/export/{mart}`. Generate your own | unset | No |

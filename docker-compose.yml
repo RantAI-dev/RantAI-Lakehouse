@@ -248,10 +248,6 @@ services:
       # cannot override them at all. Each resolves to its historical Dispar
       # literal when empty (`tenant.rs`'s `env_or` treats blank as unset), so
       # listing them here changes nothing for an existing deployment.
-      #
-      # `BUILTIN_DASHBOARD_ENABLED` must be `0` on any tenant without a
-      # `serving.mart_wisman` mart: the built-in "Main" board's tiles are
-      # hardcoded to the Dispar marts and paint red before redirecting.
       TENANT_OWNER: ${TENANT_OWNER:-}
       TENANT_ID: ${TENANT_ID:-}
       TENANT_DOMAIN: ${TENANT_DOMAIN:-}
@@ -259,7 +255,12 @@ services:
       TENANT_SITE: ${TENANT_SITE:-}
       BRONZE_CURATED_SLUGS: ${BRONZE_CURATED_SLUGS:-}
       CATALOG_NAMESPACE_META: ${CATALOG_NAMESPACE_META:-}
-      BUILTIN_DASHBOARD_ENABLED: ${BUILTIN_DASHBOARD_ENABLED:-1}
+      # Built-in "Main" dashboard tile catalog (Task 6, lakehouse-bi::specs):
+      # this compose file's default tenant has the Dispar marts, so it points
+      # at the shipped default the Dockerfile bakes into the image. Not a
+      # `${X:-default}` expansion on purpose — a literal, so a deployment
+      # without those marts can simply delete this line rather than override it.
+      BUILTIN_DASHBOARD_SPEC: /app/specs/builtin-default.json
     volumes:
       # PR #33 review, should-fix: a single-file subpath mount, not the
       # whole `lakehouse_oidc_tokens` volume — this service only ever

@@ -1,0 +1,92 @@
+{
+  "kpis": [
+    {
+      "id": "kpi_wisman_total",
+      "title": "Total Foreign Visitors",
+      "mart": "mart_wisman",
+      "sql": "SELECT sum(jumlah) AS v FROM serving.mart_wisman",
+      "format": "int",
+      "caption": "foreign visits (cumulative)"
+    },
+    {
+      "id": "kpi_dtw",
+      "title": "Tracked Destinations",
+      "mart": "mart_kunjungan_dtw",
+      "sql": "SELECT count(DISTINCT destinasi) AS v FROM serving.mart_kunjungan_dtw",
+      "format": "int",
+      "caption": "tourist attractions (DTW)"
+    },
+    {
+      "id": "kpi_event",
+      "title": "Events (Latest Year)",
+      "mart": "mart_event",
+      "sql": "SELECT jumlah_event AS v, tahun FROM serving.mart_event ORDER BY tahun DESC LIMIT 1",
+      "format": "int",
+      "caption": "number of events in the latest year"
+    },
+    {
+      "id": "kpi_gci",
+      "title": "GCI Indicators Ready",
+      "mart": "mart_gci_readiness",
+      "sql": "SELECT sum(data_tersedia) AS v, count() AS total FROM serving.mart_gci_readiness",
+      "format": "int",
+      "caption": "indicators with data available"
+    }
+  ],
+  "charts": [
+    {
+      "id": "wisman_tren", "title": "Foreign Visitor Trend", "subtitle": "Monthly total across years",
+      "kind": "area", "mart": "mart_wisman", "span": 2,
+      "sql": "SELECT concat(toString(tahun),'-',leftPad(toString(bulan_no),2,'0')) AS periode,\n                 round(sum(jumlah)) AS jumlah\n          FROM serving.mart_wisman\n          GROUP BY tahun, bulan_no\n          ORDER BY tahun, bulan_no",
+      "x": "periode", "y": "jumlah", "series": null, "format": "int", "text": null, "caption": null, "target": null
+    },
+    {
+      "id": "wisman_negara", "title": "Top Source Countries", "subtitle": "Top 10 nationalities",
+      "kind": "hbar", "mart": "mart_wisman", "span": null,
+      "sql": "SELECT negara, round(sum(jumlah)) AS jumlah\n          FROM serving.mart_wisman\n          GROUP BY negara ORDER BY jumlah DESC LIMIT 10",
+      "x": "negara", "y": "jumlah", "series": null, "format": "int", "text": null, "caption": null, "target": null
+    },
+    {
+      "id": "wisman_kawasan", "title": "Visitors by Region", "subtitle": "Distribution by continent/region",
+      "kind": "pie", "mart": "mart_wisman", "span": null,
+      "sql": "SELECT kawasan, round(sum(jumlah)) AS jumlah\n          FROM serving.mart_wisman\n          GROUP BY kawasan ORDER BY jumlah DESC",
+      "x": "kawasan", "y": "jumlah", "series": null, "format": "int", "text": null, "caption": null, "target": null
+    },
+    {
+      "id": "wisman_pintu", "title": "Visitors by Entry Point", "subtitle": "Arrival points",
+      "kind": "bar", "mart": "mart_wisman", "span": null,
+      "sql": "SELECT pintu_masuk, round(sum(jumlah)) AS jumlah\n          FROM serving.mart_wisman\n          GROUP BY pintu_masuk ORDER BY jumlah DESC",
+      "x": "pintu_masuk", "y": "jumlah", "series": null, "format": "int", "text": null, "caption": null, "target": null
+    },
+    {
+      "id": "dtw_top", "title": "Visits by Destination", "subtitle": "Domestic vs foreign, top 8 destinations",
+      "kind": "stacked", "mart": "mart_kunjungan_dtw", "span": 2,
+      "sql": "SELECT destinasi, round(sum(wisnus)) AS wisnus, round(sum(wisman)) AS wisman\n          FROM serving.mart_kunjungan_dtw\n          GROUP BY destinasi ORDER BY sum(total) DESC LIMIT 8",
+      "x": "destinasi", "y": ["wisnus", "wisman"], "series": null, "format": "int", "text": null, "caption": null, "target": null
+    },
+    {
+      "id": "event_tren", "title": "Event Count Trend", "subtitle": "Per year",
+      "kind": "line", "mart": "mart_event", "span": null,
+      "sql": "SELECT toString(tahun) AS tahun, jumlah_event AS jumlah\n          FROM serving.mart_event ORDER BY tahun",
+      "x": "tahun", "y": "jumlah", "series": null, "format": "int", "text": null, "caption": null, "target": null
+    },
+    {
+      "id": "gci_readiness", "title": "GCI Data Readiness", "subtitle": "Readiness status distribution",
+      "kind": "pie", "mart": "mart_gci_readiness", "span": null,
+      "sql": "SELECT readiness, count() AS n\n          FROM serving.mart_gci_readiness\n          GROUP BY readiness ORDER BY n DESC",
+      "x": "readiness", "y": "n", "series": null, "format": "int", "text": null, "caption": null, "target": null
+    },
+    {
+      "id": "kuliner_wilayah", "title": "Culinary Businesses by Area", "subtitle": "Registered businesses",
+      "kind": "bar", "mart": "mart_kuliner", "span": null,
+      "sql": "SELECT wilayah, sum(jumlah_usaha) AS jumlah\n          FROM serving.mart_kuliner\n          GROUP BY wilayah ORDER BY jumlah DESC",
+      "x": "wilayah", "y": "jumlah", "series": null, "format": "int", "text": null, "caption": null, "target": null
+    },
+    {
+      "id": "atlas_poi", "title": "Tourism POIs by Category", "subtitle": "Number of POIs",
+      "kind": "hbar", "mart": "mart_atlas", "span": null,
+      "sql": "SELECT kategori, jumlah_poi AS jumlah\n          FROM serving.mart_atlas ORDER BY jumlah_poi DESC",
+      "x": "kategori", "y": "jumlah", "series": null, "format": "int", "text": null, "caption": null, "target": null
+    }
+  ]
+}
