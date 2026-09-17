@@ -22,10 +22,11 @@ use lakehouse_test_support as _;
 use lakehouse_store::StoreError;
 use lakehouse_store::agents::{
     COPILOT_EMPLOYEE_ID, CreateEmployeeInput, CreatedApproval, Decision, LinkedApprovalRequest,
-    NewApprovalRequest, RunStep, append_run_step, count_active_agent_runs, count_pending_approvals,
-    create_employee, create_linked_approval, create_pending_approval, create_run, decide_approval,
-    finish_run, get_employee, get_employee_run_config, get_run, list_approvals, list_employees,
-    list_runs, list_scheduled_employees, list_tools, list_workflows, mark_run_waiting_approval,
+    NewApprovalRequest, RunStep, append_run_step, count_active_agent_runs,
+    count_agent_run_outcomes, count_pending_approvals, create_employee, create_linked_approval,
+    create_pending_approval, create_run, decide_approval, finish_run, get_employee,
+    get_employee_run_config, get_run, list_approvals, list_employees, list_runs,
+    list_scheduled_employees, list_tools, list_workflows, mark_run_waiting_approval,
     pending_tool_call, record_run_outcome, resume_employee, revoke_employee, suspend_employee,
 };
 use serde_json::json;
@@ -962,5 +963,50 @@ async fn count_active_agent_runs_counts_only_running_status(pool: PgPool) -> sql
         .unwrap();
 
     assert_eq!(count_active_agent_runs(&pool).await.unwrap(), 2);
+    Ok(())
+}
+
+/// `overview.agentSuccessRate`/`ops.observability.agentSuccessRate` (WS5
+/// item B5): `running` runs are excluded from both counts and from the
+/// denominator -- a run still in progress has no outcome yet.
+#[sqlx::test(migrations = "../../migrations")]
+async fn count_agent_run_outcomes_excludes_running_runs(pool: PgPool) -> sqlx::Result<()> {
+    // Two succeeded, one failed, all "completed" within the 24h window
+    // (ended_at defaults to now() via the fixture below); one still
+    // running, which must not count toward either bucket.
+    for (id, status) in [
+        ("run-outcome-succeeded-1", "succeeded"),
+        ("run-outcome-succeeded-2", "succeeded"),
+        ("run-outcome-failed-1", "failed"),
+    ] {
+        sqlx::query(
+            "INSERT INTO agent_run (id, employee_id, status, trigger, actor, steps, ended_at) \
+             VALUES ($1, $2, $3, 'test', 'test-actor', '[]'::jsonb, now())",
+        )
+        .bind(id)
+        .bind("emp-inventory")
+        .bind(status)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    insert_run(&pool, "run-outcome-running-1", "emp-risk").await;
+
+    let (succeeded, failed) = count_agent_run_outcomes(&pool).await.unwrap();
+    assert_eq!(succeeded, 2);
+    assert_eq!(failed, 1);
+    Ok(())
+}
+
+/// Zero completed runs in the window ⇒ `(0, 0)` -- the route-level
+/// wrapper turns that into `None` ("no data"), not `Some(0.0)` ("0%
+/// success"), but the store layer's own contract is just the raw counts.
+#[sqlx::test(migrations = "../../migrations")]
+async fn count_agent_run_outcomes_is_zero_zero_with_no_completed_runs(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    insert_run(&pool, "run-outcome-only-running", "emp-inventory").await;
+    let (succeeded, failed) = count_agent_run_outcomes(&pool).await.unwrap();
+    assert_eq!((succeeded, failed), (0, 0));
     Ok(())
 }

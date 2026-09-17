@@ -1334,6 +1334,26 @@ pub async fn count_active_agent_runs(pool: &PgPool) -> Result<i64, StoreError> {
     Ok(n)
 }
 
+/// `(succeeded, failed)` counts of `agent_run` rows completed in the last
+/// 24h -- `overview.agentSuccessRate`/`ops.observability.agentSuccessRate`
+/// (WS5 item B5). A `running` run is excluded from both counts and from
+/// the denominator: it has no outcome yet, so it is neither a success nor
+/// a failure.
+///
+/// # Errors
+///
+/// [`StoreError::Database`] on any query failure.
+pub async fn count_agent_run_outcomes(pool: &PgPool) -> Result<(i64, i64), StoreError> {
+    let row: (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE status = 'succeeded'), \
+                count(*) FILTER (WHERE status = 'failed') \
+         FROM agent_run WHERE ended_at > now() - INTERVAL '24 hours'",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

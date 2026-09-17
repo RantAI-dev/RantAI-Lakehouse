@@ -16,6 +16,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ident::SqlLiteral;
+use lakehouse_store::PgPool;
 use serde_json::{Map, Value, json};
 
 use crate::health;
@@ -82,7 +83,7 @@ pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Res
 
 async fn run(state: &AppState, kind: Kind) -> Result<Value, OpsError> {
     match kind {
-        Kind::Observability => observability(&state.clickhouse).await,
+        Kind::Observability => observability(&state.clickhouse, state.pg.as_deref()).await,
         Kind::Workloads => workloads(&state.clickhouse).await,
         Kind::Services => services(state).await,
         Kind::Unknown => unreachable!("Kind::Unknown is handled before `run` is called"),
@@ -93,29 +94,29 @@ async fn run(state: &AppState, kind: Kind) -> Result<Value, OpsError> {
 /// so the unmeasured fields it nulls (and the dropped
 /// `streamingLagSeconds` key) can be asserted without a `ClickHouse` call.
 ///
-/// `ingest_lag` (WS5 item B3) and `cache_hit_rate` (WS5 item B4) are real,
-/// computed `Option<f64>`s from the caller (`observability`) -- `None`
-/// serializes to `null` the same way the still-unmeasured fields below do,
-/// never a fabricated `0`.
+/// `ingest_lag` (WS5 item B3), `cache_hit_rate` (WS5 item B4), and
+/// `agent_success_rate` (WS5 item B5) are real, computed `Option<f64>`s
+/// from the caller (`observability`) -- `None` serializes to `null` the
+/// same way the still-unmeasured fields below do, never a fabricated `0`.
 fn observability_json(
     p95: i64,
     err: f64,
     ingest_lag: Option<f64>,
     cache_hit_rate: Option<f64>,
+    agent_success_rate: Option<f64>,
 ) -> Value {
     json!({
         "queryP95Ms": p95,
         "queryErrorRate": err,
         "ingestLagSeconds": ingest_lag,
         "cacheHitRate": cache_hit_rate,
-        // Nothing measures policy decision latency, agent success rate,
-        // or open incidents today; `null` is honest, the literal zeros
-        // this replaced were not (P5 review / WS1 honesty pass task 1.7).
-        // `streamingLagSeconds` is dropped outright: it has no consumer
-        // in the TypeScript contract and nothing measures streaming
-        // either.
+        // Nothing measures policy decision latency or open incidents
+        // today; `null` is honest, the literal zeros this replaced were
+        // not (P5 review / WS1 honesty pass task 1.7). `streamingLagSeconds`
+        // is dropped outright: it has no consumer in the TypeScript
+        // contract and nothing measures streaming either.
         "policyDecisionP95Ms": Value::Null,
-        "agentSuccessRate": Value::Null,
+        "agentSuccessRate": agent_success_rate,
         "activeIncidents": Value::Null,
         "slos": [
             {
@@ -134,7 +135,7 @@ fn observability_json(
     })
 }
 
-async fn observability(ch: &ChClient) -> Result<Value, OpsError> {
+async fn observability(ch: &ChClient, pg: Option<&PgPool>) -> Result<Value, OpsError> {
     let rows = ch
         .rows(
             "SELECT toString(round(quantile(0.95)(query_duration_ms))) p95,
@@ -152,7 +153,14 @@ async fn observability(ch: &ChClient) -> Result<Value, OpsError> {
         .unwrap_or(0.0);
     let ingest_lag = ingest_lag_seconds(ch).await;
     let cache_hit_rate = cache_hit_rate(ch).await;
-    Ok(observability_json(p95, err, ingest_lag, cache_hit_rate))
+    let agent_success_rate = agent_success_rate(pg).await;
+    Ok(observability_json(
+        p95,
+        err,
+        ingest_lag,
+        cache_hit_rate,
+        agent_success_rate,
+    ))
 }
 
 /// `observability.ingestLagSeconds` (WS5 item B3, corrected against WS3's
@@ -233,6 +241,28 @@ async fn cache_hit_rate(ch: &ChClient) -> Option<f64> {
     let misses = str_col(row, "misses").parse::<f64>().ok()?;
     let total = hits + misses;
     (total > 0.0).then_some(hits / total)
+}
+
+/// `overview.agentSuccessRate`/`ops.observability.agentSuccessRate` (WS5
+/// item B5) -- the fraction of `agent_run` rows completed in the last 24h
+/// that succeeded. `None` both when no Postgres pool is configured and
+/// when there are zero completed runs (no denominator) -- "no data" is
+/// not "0% success," which would read as a real, poor measurement rather
+/// than "not measured." Any query failure also degrades to `None`, never
+/// a 503 for the rest of `/api/ops/observability`.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "agent_run counts in this deployment are nowhere near f64's 52-bit mantissa \
+              limit; the precision this could lose is not reachable in practice"
+)]
+async fn agent_success_rate(pg: Option<&PgPool>) -> Option<f64> {
+    let pool = pg?;
+    let (succeeded, failed) = lakehouse_store::agents::count_agent_run_outcomes(pool)
+        .await
+        .inspect_err(|err| tracing::warn!(%err, "count_agent_run_outcomes failed"))
+        .ok()?;
+    let total = succeeded + failed;
+    (total > 0).then_some(succeeded as f64 / total as f64)
 }
 
 /// Build one `ops/workloads` row from a `system.processes` fixture row.
@@ -559,7 +589,7 @@ mod tests {
 
     #[test]
     fn observability_nulls_every_unmeasured_metric_and_drops_streaming_lag() {
-        let v = observability_json(120, 0.002, None, None);
+        let v = observability_json(120, 0.002, None, None, None);
         assert_eq!(v["queryP95Ms"], 120);
         assert!((v["queryErrorRate"].as_f64().unwrap() - 0.002).abs() < f64::EPSILON);
         for field in [
@@ -582,15 +612,22 @@ mod tests {
     /// number, never left null once it is actually measured.
     #[test]
     fn observability_reports_a_real_ingest_lag_when_measured() {
-        let v = observability_json(120, 0.002, Some(42.5), None);
+        let v = observability_json(120, 0.002, Some(42.5), None, None);
         assert_eq!(v["ingestLagSeconds"], 42.5);
     }
 
     /// WS5 item B4 -- likewise for a real, computed cache hit rate.
     #[test]
     fn observability_reports_a_real_cache_hit_rate_when_measured() {
-        let v = observability_json(120, 0.002, None, Some(0.8));
+        let v = observability_json(120, 0.002, None, Some(0.8), None);
         assert_eq!(v["cacheHitRate"], 0.8);
+    }
+
+    /// WS5 item B5 -- likewise for a real, computed agent success rate.
+    #[test]
+    fn observability_reports_a_real_agent_success_rate_when_measured() {
+        let v = observability_json(120, 0.002, None, None, Some(0.75));
+        assert_eq!(v["agentSuccessRate"], 0.75);
     }
 
     #[test]
@@ -838,5 +875,20 @@ mod tests {
             .await;
 
         assert_eq!(cache_hit_rate(&ch_client(&server.uri())).await, None);
+    }
+
+    // ── observability.agentSuccessRate (WS5 item B5) ────────────────────
+    //
+    // The store-level `count_agent_run_outcomes` fixtures (running-runs
+    // excluded, zero-denominator -> (0, 0)) live in
+    // `lakehouse-store/tests/agents.rs` against a real Postgres per this
+    // plan's own testing rule ("store tests
+    // `#[sqlx::test(migrations = "../../migrations")]`"). This route-level
+    // test only needs the "no pool configured" path, which never reaches
+    // a database at all.
+
+    #[tokio::test]
+    async fn agent_success_rate_is_none_without_a_configured_pool() {
+        assert_eq!(agent_success_rate(None).await, None);
     }
 }
