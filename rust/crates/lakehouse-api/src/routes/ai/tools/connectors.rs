@@ -22,9 +22,11 @@
 //!   all — see `lakehouse_store::connectors`'s module doc comment — so no
 //!   redaction step is needed here for the tool output to stay credential-free.
 
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
+use lakehouse_auth::Principal;
 use serde_json::{Map, Value, json};
 
 use super::{api_result_to_value, arg_str};
@@ -39,33 +41,58 @@ pub(super) async fn list_connectors(state: &AppState) -> Value {
 /// `camelCase` fields byte-for-byte: `secretRef`, `secretRefSecondary`, ...)
 /// and calls the route handler directly — this is what applies the
 /// raw-credential refusal without a second copy of that check.
-pub(super) async fn create_connector(state: &AppState, args: &Map<String, Value>) -> Value {
+///
+/// `principal` is forwarded as `Option<Extension<Principal>>`, the same
+/// re-wrapping `routes::ai::tools::queries::run_saved_query` already does
+/// for `routes::query::run` (WS5 item D3): this internal call bypasses
+/// axum's auth middleware, so `routes::connectors::create` (which now
+/// writes a real `connector.create` `audit_event` under the real principal)
+/// gets the SAME `Principal` the copilot dispatcher was handed for
+/// `POST /api/ai/chat` / `POST /api/ai/tool`, and 401s honestly (see that
+/// handler's doc comment) when there is none — e.g. a schedule-triggered
+/// headless run, which has no interactive user to attribute this to.
+pub(super) async fn create_connector(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let body = match serde_json::to_vec(&Value::Object(args.clone())) {
         Ok(bytes) => bytes,
         Err(err) => return json!({ "error": err.to_string() }),
     };
+    let extension = principal.cloned().map(Extension);
     api_result_to_value(
-        crate::routes::connectors::create(State(state.clone()), Bytes::from(body)).await,
+        crate::routes::connectors::create(State(state.clone()), extension, Bytes::from(body)).await,
     )
     .await
 }
 
-pub(super) async fn test_connector(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn test_connector(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id wajib diisi" });
     }
+    let extension = principal.cloned().map(Extension);
     api_result_to_value(
-        crate::routes::connectors::test_connection(State(state.clone()), Path(id)).await,
+        crate::routes::connectors::test_connection(State(state.clone()), extension, Path(id)).await,
     )
     .await
 }
 
-pub(super) async fn delete_connector(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn delete_connector(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id wajib diisi" });
     }
+    let extension = principal.cloned().map(Extension);
     // `DeleteQuery::default()` is `force: false`: if CDC deprovisioning
     // fails, the registry row stays and the copilot reports the failure
     // rather than orphaning a replication slot. Forcing past a failed
@@ -73,6 +100,7 @@ pub(super) async fn delete_connector(state: &AppState, args: &Map<String, Value>
     // console route), never something an agent decides on its own.
     match crate::routes::connectors::delete(
         State(state.clone()),
+        extension,
         Path(id),
         Query(crate::routes::connectors::DeleteQuery::default()),
     )
@@ -89,6 +117,9 @@ mod tests {
 
     use std::collections::HashMap;
 
+    use lakehouse_auth::{PermissionSet, PrincipalId};
+    use uuid::Uuid;
+
     use super::*;
     use crate::config::Config;
 
@@ -98,12 +129,29 @@ mod tests {
         AppState::new(Config::from_map(&env).unwrap())
     }
 
+    /// A logged-in human principal — used everywhere below a test needs
+    /// to reach PAST the WS5 item D3 auth check and into the handler
+    /// logic these tests actually exercise (raw-secret refusal, missing
+    /// `id`, redaction) — a bare `None` would now 401 before any of that
+    /// runs.
+    fn fixture_user_principal() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(1)),
+            tenant_ids: Vec::new(),
+            display_name: "Rina Wijaya".to_owned(),
+            permissions: PermissionSet::parse("connector:manage"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+        }
+    }
+
     /// A `create_connector` call carrying a raw-looking credential in
     /// `secretRef` is refused by the SAME check `POST /api/connectors`
     /// runs — this test proves the reuse, not just that some check exists.
     #[tokio::test]
     async fn create_connector_refuses_a_raw_looking_secret_ref() {
         let state = state_without_pool();
+        let principal = fixture_user_principal();
         let mut args = Map::new();
         args.insert("name".to_owned(), json!("n"));
         args.insert("type".to_owned(), json!("PostgreSQL"));
@@ -115,7 +163,7 @@ mod tests {
         );
         args.insert("environment".to_owned(), json!("production"));
         args.insert("tenant".to_owned(), json!("t"));
-        let result = create_connector(&state, &args).await;
+        let result = create_connector(&state, Some(&principal), &args).await;
         assert!(result.get("error").is_some(), "{result}");
     }
 
@@ -125,6 +173,7 @@ mod tests {
     #[tokio::test]
     async fn create_connector_accepts_a_secret_ref() {
         let state = state_without_pool();
+        let principal = fixture_user_principal();
         let mut args = Map::new();
         args.insert("name".to_owned(), json!("n"));
         args.insert("type".to_owned(), json!("PostgreSQL"));
@@ -133,7 +182,7 @@ mod tests {
         args.insert("secretRef".to_owned(), json!("env:DB_PASSWORD"));
         args.insert("environment".to_owned(), json!("production"));
         args.insert("tenant".to_owned(), json!("t"));
-        let result = create_connector(&state, &args).await;
+        let result = create_connector(&state, Some(&principal), &args).await;
         let err = result
             .get("error")
             .and_then(Value::as_str)
@@ -144,19 +193,30 @@ mod tests {
         );
     }
 
+    /// No principal at all (e.g. a schedule-triggered headless run, which
+    /// has no interactive user) is refused honestly rather than reaching
+    /// any validation logic.
+    #[tokio::test]
+    async fn create_connector_without_a_principal_is_refused() {
+        let state = state_without_pool();
+        let result = create_connector(&state, None, &Map::new()).await;
+        assert!(result.get("error").is_some(), "{result}");
+    }
+
     /// Tool output never contains `host` or `secretRef`, matching the
     /// underlying `Connector`/`ConnectorDetail`/`ConnectorTestResult`
     /// response types, which have no such fields to serialize at all.
     #[tokio::test]
     async fn list_and_test_never_return_host_or_secret_ref() {
         let state = state_without_pool();
+        let principal = fixture_user_principal();
         let list_result = list_connectors(&state).await;
         assert!(!list_result.to_string().contains("secretRef"));
         assert!(!list_result.to_string().contains("\"host\""));
 
         let mut args = Map::new();
         args.insert("id".to_owned(), json!("conn-x"));
-        let test_result = test_connector(&state, &args).await;
+        let test_result = test_connector(&state, Some(&principal), &args).await;
         assert!(!test_result.to_string().contains("secretRef"));
         assert!(!test_result.to_string().contains("\"host\""));
     }
@@ -164,12 +224,13 @@ mod tests {
     #[tokio::test]
     async fn test_connector_and_delete_connector_require_id() {
         let state = state_without_pool();
+        let principal = fixture_user_principal();
         assert_eq!(
-            test_connector(&state, &Map::new()).await,
+            test_connector(&state, Some(&principal), &Map::new()).await,
             json!({ "error": "id wajib diisi" })
         );
         assert_eq!(
-            delete_connector(&state, &Map::new()).await,
+            delete_connector(&state, Some(&principal), &Map::new()).await,
             json!({ "error": "id wajib diisi" })
         );
     }

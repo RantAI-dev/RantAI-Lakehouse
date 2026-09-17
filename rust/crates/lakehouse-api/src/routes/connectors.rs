@@ -17,11 +17,14 @@
 //! `host` or `secretRef` — [`lakehouse_store::connectors::Connector`] and
 //! `ConnectorDetail` have no such field to serialize.
 
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
+use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::cdc::ConnectorSlug;
 use lakehouse_store::connector_type::{self, ConnectorType};
 use lakehouse_store::connectors::{self, ConnectorDetail, ConnectorDialInfo, CreateConnectorInput};
@@ -216,26 +219,79 @@ fn reject_allowlisted_secret_ref(field: &str, value: &str) -> Result<(), ApiErro
     Ok(())
 }
 
+/// The `NewAuditEvent` [`create`]/[`test_connection`]/[`delete`] each
+/// write — a pure, unit-tested helper (WS5 item D3), mirroring
+/// `routes::query::query_run_audit_event`/`routes::agents::
+/// decide_approval_audit_event`'s pattern: `resource_kind: "connector"`
+/// paired with the connector's own id is this module's own choice, baked
+/// in here rather than passed by each call site, since it is the pairing
+/// `lakehouse_store::connectors::get_connector`'s own `LEFT JOIN`-free
+/// lookup (`resource_kind = 'connector' AND resource_id = id`, confirmed
+/// by reading that function before writing this) already expects.
+///
+/// `principal_kind` comes from [`Principal::kind_for_audit`], never
+/// `Principal::provider` — same CHECK this crate's other audit sites
+/// satisfy (see that method's doc comment).
+fn connector_audit_event(
+    principal: &Principal,
+    action: &str,
+    connector_id: &str,
+    args: Value,
+    outcome: &str,
+) -> NewAuditEvent {
+    NewAuditEvent {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        action: action.to_owned(),
+        resource_kind: Some("connector".to_owned()),
+        resource_id: Some(connector_id.to_owned()),
+        args: Some(args),
+        outcome: outcome.to_owned(),
+        detail: None,
+        run_id: None,
+        approval_id: None,
+        session_id: None,
+    }
+}
+
 /// `POST /api/connectors` — register a connector. Returns 201.
 ///
 /// # Security
 ///
-/// Unauthenticated, like every route in this service — see
-/// `routes::identity`'s module doc comment for why that is a known,
-/// escalated gap rather than an oversight.
+/// Requires an authenticated [`Principal`] holding `connector:manage`
+/// (`crate::policy::POLICY_TABLE`, confirmed by reading it before writing
+/// this) — this doc comment previously and incorrectly claimed the route
+/// was unauthenticated (WS5 item D3 correction; the policy table has
+/// required `connector:manage` for this route for some time, this
+/// comment just never caught up).
+///
+/// `principal` is `Option<Extension<Principal>>`, not a bare
+/// `Extension<Principal>`, even though the mounted route always supplies
+/// one (`crate::policy::auth_gate` guarantees it for `connector:manage`):
+/// `routes::ai::tools::connectors::create_connector` calls this handler
+/// directly, bypassing that middleware, for the copilot's own
+/// `create_connector` tool — matching `routes::query::run`'s own
+/// `Option<Extension<Principal>>` + explicit refusal shape (WS5 item D1)
+/// rather than mandating an extractor no internal caller can satisfy.
 ///
 /// # Errors
 ///
-/// 400 on a malformed body, a blank required field, an unrecognized
-/// `direction`, or a `secretRef` shaped like a raw credential (see
+/// 401 if no principal is present (see above); 400 on a malformed body, a
+/// blank required field, an unrecognized `direction`, or a `secretRef`
+/// shaped like a raw credential (see
 /// `lakehouse_store::connectors::looks_like_raw_secret`); 409 if the name
 /// is taken; 503/500 as above. Also 400 if `secretRef`/`secretRefSecondary`
 /// names a deployment connector credential — see
 /// [`reject_allowlisted_secret_ref`].
 pub async fn create(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<connectors::Connector>)> {
+    let Some(Extension(principal)) = principal else {
+        return Err(ApiError::unauthorized().into());
+    };
     let body: CreateConnectorBody = parse_body(&body)?;
     let direction = required("direction", &body.direction)?;
     if !VALID_DIRECTIONS.contains(&direction.as_str()) {
@@ -284,6 +340,20 @@ pub async fn create(
         owner: body.owner,
     };
     let created = connectors::create_connector(pool(&state)?, &input).await?;
+    // WS5 item D3: best-effort, never turns a successful create into an
+    // error — name/type/direction only, never `secretRef` (a reference
+    // name, not a credential, per this module's own guarantee, but still
+    // not this row's business to repeat).
+    let event = connector_audit_event(
+        &principal,
+        "connector.create",
+        &created.id,
+        json!({ "name": created.name, "type": created.kind, "direction": created.direction }),
+        "executed",
+    );
+    if let Err(err) = store_audit::insert(pool(&state)?, event).await {
+        tracing::warn!(%err, connector_id = %created.id, "failed to record connector.create audit event");
+    }
     Ok((StatusCode::CREATED, ApiJson(created)))
 }
 
@@ -297,11 +367,20 @@ pub async fn create(
 ///
 /// # Errors
 ///
-/// 404 if `id` is unknown; 503/500 as above.
+/// 401 if no principal is present (see [`create`]'s doc comment on why
+/// this is `Option`, not a bare `Extension`); 404 if `id` is unknown;
+/// 503/500 as above.
 pub async fn test_connection(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<connectors::ConnectorTestResult>> {
+    // See `create`'s doc comment: `Option`, not a bare `Extension`, because
+    // `routes::ai::tools::connectors::test_connector` calls this handler
+    // directly, bypassing `crate::policy::auth_gate`.
+    let Some(Extension(principal)) = principal else {
+        return Err(ApiError::unauthorized().into());
+    };
     let dial_info = connectors::get_connector_dial_info(pool(&state)?, &id).await?;
     let Some(dial_info) = dial_info else {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
@@ -322,7 +401,24 @@ pub async fn test_connection(
     )
     .await
     {
-        Ok(result) => Ok(ApiJson(result)),
+        Ok(result) => {
+            // WS5 item D3: `supported`/`ok` only — never `outcome.message`,
+            // which `connector_probe::probe`'s own result may carry a raw
+            // upstream probe error verbatim (host, credentials-adjacent
+            // detail). Best-effort: a failed audit write never turns a
+            // completed test into an error response.
+            let event = connector_audit_event(
+                &principal,
+                "connector.test",
+                &id,
+                json!({ "supported": result.supported, "ok": result.ok }),
+                "executed",
+            );
+            if let Err(err) = store_audit::insert(pool(&state)?, event).await {
+                tracing::warn!(%err, connector_id = %id, "failed to record connector.test audit event");
+            }
+            Ok(ApiJson(result))
+        }
         Err(lakehouse_store::StoreError::NotFound) => {
             Err(ApiError::NotFound(format!("Connector {id} not found")).into())
         }
@@ -851,13 +947,19 @@ fn deprovision_error_message(
 ///
 /// # Errors
 ///
-/// 404 if `id` is unknown; 409 if CDC deprovisioning failed and `force`
-/// was not given; 503/500 as above.
+/// 401 if no principal is present (see [`create`]'s doc comment on why
+/// this is `Option`, not a bare `Extension`); 404 if `id` is unknown; 409
+/// if CDC deprovisioning failed and `force` was not given; 503/500 as
+/// above.
 pub async fn delete(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
     Query(query): Query<DeleteQuery>,
 ) -> ApiResult<StatusCode> {
+    let Some(Extension(principal)) = principal else {
+        return Err(ApiError::unauthorized().into());
+    };
     let dial_info = connectors::get_connector_dial_info(pool(&state)?, &id).await?;
     let Some(dial_info) = dial_info else {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
@@ -895,6 +997,13 @@ pub async fn delete(
     let deleted = connectors::delete_connector(pool(&state)?, &id).await?;
     if !deleted {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
+    }
+    // WS5 item D3: best-effort, after the row is already gone — a failed
+    // audit write here must never resurrect the 404/409 branches above or
+    // undo a delete that already succeeded.
+    let event = connector_audit_event(&principal, "connector.delete", &id, json!({}), "executed");
+    if let Err(err) = store_audit::insert(pool(&state)?, event).await {
+        tracing::warn!(%err, connector_id = %id, "failed to record connector.delete audit event");
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1144,8 +1253,11 @@ mod tests {
 
     use axum::body::to_bytes;
     use axum::http::Request;
+    use lakehouse_auth::PermissionSet;
+    use lakehouse_auth::PrincipalId;
     use serde_json::Value;
     use tower::ServiceExt;
+    use uuid::Uuid;
 
     use super::*;
     use crate::config::Config;
@@ -1154,6 +1266,100 @@ mod tests {
         let mut env = HashMap::new();
         env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
         AppState::new(Config::from_map(&env).unwrap())
+    }
+
+    /// A logged-in human principal — `PrincipalId::User`. Mirrors
+    /// `routes::query`/`routes::agents`'s own test fixture of the same
+    /// name.
+    fn fixture_user_principal() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(1)),
+            tenant_ids: Vec::new(),
+            display_name: "Rina Wijaya".to_owned(),
+            permissions: PermissionSet::parse("connector:manage"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+        }
+    }
+
+    /// A service-token principal — `PrincipalId::Service`.
+    fn fixture_service_principal() -> Principal {
+        Principal {
+            id: PrincipalId::Service(Uuid::from_u128(2)),
+            tenant_ids: Vec::new(),
+            display_name: "dagster-orchestrator".to_owned(),
+            permissions: PermissionSet::parse("connector:manage"),
+            provider: "service".to_owned(),
+            must_change_password: false,
+        }
+    }
+
+    /// WS5 item D3, failing-test-first: `connector_audit_event` did not
+    /// exist before this task; referencing it below failed to compile
+    /// with `cannot find function connector_audit_event in this scope`
+    /// (confirmed by checking out the pre-fix file and running this test
+    /// before adding the helper).
+    #[test]
+    fn connector_create_audit_event_pairs_with_connector_resource_kind() {
+        let principal = fixture_user_principal();
+        let event = connector_audit_event(
+            &principal,
+            "connector.create",
+            "conn-1",
+            json!({ "name": "orders-cdc", "type": "postgres-cdc" }),
+            "executed",
+        );
+        assert_eq!(event.principal_kind.as_deref(), Some("user"));
+        assert_eq!(
+            event.principal_id.as_deref(),
+            Some(principal.id.uuid().to_string().as_str())
+        );
+        assert_eq!(event.resource_kind.as_deref(), Some("connector"));
+        assert_eq!(event.resource_id.as_deref(), Some("conn-1"));
+        assert_eq!(event.action, "connector.create");
+        assert_eq!(event.outcome, "executed");
+    }
+
+    /// A service identity's connector action must record `principal_kind:
+    /// "service"`, never `"user"`.
+    #[test]
+    fn connector_audit_event_records_a_service_identity_as_service_not_user() {
+        let principal = fixture_service_principal();
+        let event = connector_audit_event(
+            &principal,
+            "connector.test",
+            "conn-1",
+            json!({}),
+            "executed",
+        );
+        assert_eq!(event.principal_kind.as_deref(), Some("service"));
+    }
+
+    /// The connector.test call site must only ever pass `supported`/`ok`
+    /// into `args` — never the raw upstream probe error message
+    /// `connector_probe::probe`'s own result may carry (a host,
+    /// credentials-adjacent detail). This asserts the helper's own args
+    /// shape stays exactly `{ "supported": .., "ok": .. }`, so a future
+    /// edit that adds `result.message` to the call site is caught by
+    /// re-reading this test's fixed shape, not by trusting the call site.
+    #[test]
+    fn connector_test_audit_event_never_carries_the_raw_probe_error() {
+        let principal = fixture_user_principal();
+        let raw_probe_message =
+            "connection refused: password authentication failed for user \"root\" host=10.0.0.5";
+        let event = connector_audit_event(
+            &principal,
+            "connector.test",
+            "conn-1",
+            json!({ "supported": true, "ok": false }),
+            "executed",
+        );
+        let args_str = event.args.unwrap().to_string();
+        assert!(
+            !args_str.contains(raw_probe_message),
+            "must never embed the raw upstream probe error text"
+        );
+        assert_eq!(args_str, r#"{"supported":true,"ok":false}"#);
     }
 
     #[tokio::test]
