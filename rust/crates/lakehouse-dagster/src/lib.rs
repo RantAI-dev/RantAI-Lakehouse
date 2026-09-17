@@ -267,6 +267,40 @@ pub struct LaunchOutcome {
     pub error: Option<String>,
 }
 
+/// Shared decode/branch tail for [`DgClient::launch_run`],
+/// [`DgClient::launch_run_with_config`], and
+/// [`DgClient::launch_reexecution`] — all three mutations decode the same
+/// `LaunchRunResult` shape and apply the identical
+/// `LaunchRunSuccess`/`PythonError`/`RunConfigValidationInvalid` branching
+/// (WS3 plan review Z9 added the second call site, which is what pushed
+/// this from two duplicated call sites to three — generalized here rather
+/// than duplicated a third time).
+fn launch_outcome_from(r: LaunchRunResult) -> LaunchOutcome {
+    if r.typename == "LaunchRunSuccess"
+        && let Some(run) = r.run
+    {
+        return LaunchOutcome {
+            run_id: Some(run.run_id),
+            error: None,
+        };
+    }
+    let error = r
+        .message
+        .or_else(|| {
+            r.errors.map(|errs| {
+                errs.into_iter()
+                    .map(|e| e.message)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+        })
+        .unwrap_or(r.typename);
+    LaunchOutcome {
+        run_id: None,
+        error: Some(error),
+    }
+}
+
 /// HTTP client for `Dagster`'s GraphQL endpoint.
 pub struct DgClient {
     client: Client,
@@ -452,30 +486,49 @@ impl DgClient {
             }
         });
         let data: LaunchRunData = self.execute(query, Some(variables)).await?;
-        let r = data.launch_run;
-        if r.typename == "LaunchRunSuccess"
-            && let Some(run) = r.run
-        {
-            return Ok(LaunchOutcome {
-                run_id: Some(run.run_id),
-                error: None,
-            });
-        }
-        let error = r
-            .message
-            .or_else(|| {
-                r.errors.map(|errs| {
-                    errs.into_iter()
-                        .map(|e| e.message)
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                })
-            })
-            .unwrap_or(r.typename);
-        Ok(LaunchOutcome {
-            run_id: None,
-            error: Some(error),
-        })
+        Ok(launch_outcome_from(data.launch_run))
+    }
+
+    /// Like [`DgClient::launch_run`], but with `runConfigData` set —
+    /// `Dagster`'s GraphQL `ExecutionParams.runConfigData` field takes a
+    /// JSON STRING (not a nested object), so `run_config` is serialized to
+    /// a string once here. Added for WS3's `ingest_job` (one static job,
+    /// per-connector `connector_id` config, WS3 plan review Z9) —
+    /// [`DgClient::launch_run`] itself is UNCHANGED so every existing
+    /// caller (`routes::pipelines::trigger`) keeps its current,
+    /// config-free launch; this is a second, additive method, not a
+    /// signature change to the first.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`DgClient::launch_run`]: a GraphQL-level launch failure
+    /// (a bad job name, a `RunConfigValidationInvalid`) comes back as
+    /// `Ok(LaunchOutcome { run_id: None, error: Some(msg) })`, NOT `Err`
+    /// — only a transport failure or a malformed GraphQL response is
+    /// [`DgError::Transport`]/[`DgError::Server`].
+    pub async fn launch_run_with_config(
+        &self,
+        job_name: &str,
+        run_config: &Value,
+    ) -> Result<LaunchOutcome, DgError> {
+        let query = "mutation($sel: JobOrPipelineSelector!, $cfg: String!) { \
+                      launchRun(executionParams: { selector: $sel, mode: \"default\", \
+                      runConfigData: $cfg }) { \
+                      __typename \
+                      ... on LaunchRunSuccess { run { runId } } \
+                      ... on PythonError { message } \
+                      ... on RunConfigValidationInvalid { errors { message } } \
+                      } }";
+        let variables = json!({
+            "sel": {
+                "repositoryName": self.repo,
+                "repositoryLocationName": self.location,
+                "pipelineName": job_name,
+            },
+            "cfg": run_config.to_string(),
+        });
+        let data: LaunchRunData = self.execute(query, Some(variables)).await?;
+        Ok(launch_outcome_from(data.launch_run))
     }
 
     /// Terminate a running run, matching `mutation { terminateRun(runId:
@@ -541,30 +594,7 @@ impl DgClient {
         let data: LaunchReexecutionData = self
             .execute(query, Some(json!({ "parentRunId": parent_run_id })))
             .await?;
-        let r = data.launch_run_reexecution;
-        if r.typename == "LaunchRunSuccess"
-            && let Some(run) = r.run
-        {
-            return Ok(LaunchOutcome {
-                run_id: Some(run.run_id),
-                error: None,
-            });
-        }
-        let error = r
-            .message
-            .or_else(|| {
-                r.errors.map(|errs| {
-                    errs.into_iter()
-                        .map(|e| e.message)
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                })
-            })
-            .unwrap_or(r.typename);
-        Ok(LaunchOutcome {
-            run_id: None,
-            error: Some(error),
-        })
+        Ok(launch_outcome_from(data.launch_run_reexecution))
     }
 
     /// Start (unpause) a schedule, matching `mutation { startSchedule(...) }`.
@@ -911,6 +941,62 @@ mod tests {
         let outcome = client.launch_run("refresh_lakehouse").await.unwrap();
         assert_eq!(outcome.run_id.as_deref(), Some("run-123"));
         assert!(outcome.error.is_none());
+    }
+
+    /// WS3 item 29 (Z9): `launch_run_with_config` must send
+    /// `runConfigData` as a JSON STRING (`ExecutionParams.runConfigData`'s
+    /// wire type), not a nested GraphQL object — `body_partial_json`
+    /// asserts the exact `variables.cfg` value the mocked server receives.
+    #[tokio::test]
+    async fn launch_run_with_config_sends_run_config_data_as_a_json_string() {
+        use wiremock::matchers::body_partial_json;
+
+        let run_config = json!({"ops": {"run_ingest": {"config": {"connector_id": "conn-a"}}}});
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_partial_json(json!({
+                "variables": { "cfg": run_config.to_string() }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "launchRun": { "__typename": "LaunchRunSuccess", "run": { "runId": "run-456" } } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .launch_run_with_config("ingest_job", &run_config)
+            .await
+            .unwrap();
+        assert_eq!(outcome.run_id.as_deref(), Some("run-456"));
+        assert!(outcome.error.is_none());
+    }
+
+    /// A GraphQL-level failure (`RunConfigValidationInvalid`) must still
+    /// come back as `Ok(LaunchOutcome { error: Some(_) })`, the same
+    /// non-`Err` shape [`launch_run_python_error_returns_error_not_err`]
+    /// proves for the config-free `launch_run`.
+    #[tokio::test]
+    async fn launch_run_with_config_validation_invalid_is_ok_not_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "launchRun": { "__typename": "RunConfigValidationInvalid",
+                    "errors": [ { "message": "connector_id is required" } ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let run_config = json!({"ops": {"run_ingest": {"config": {}}}});
+        let outcome = client
+            .launch_run_with_config("ingest_job", &run_config)
+            .await
+            .unwrap();
+        assert!(outcome.run_id.is_none());
+        assert_eq!(outcome.error.as_deref(), Some("connector_id is required"));
     }
 
     #[tokio::test]

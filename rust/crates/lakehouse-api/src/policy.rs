@@ -317,6 +317,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // assertion this split requires.
     ("GET",  "/api/connectors/{id}/ingest-spec", Policy::RequiresPermission("ingest:read")),
     ("PUT",  "/api/connectors/{id}/ingest-spec", Policy::RequiresPermission("connector:manage")),
+    // Launches a real Dagster run (or, for a cdc connector, only reports
+    // why it can't) -- a MUTATING action, so `connector:manage`, not
+    // `ingest:read`. The ingest:read-scoped Dagster ingest-schedule-
+    // factory service identity (`main::bootstrap_ingest_run_service`) is
+    // a READER of `/ingestible`/`ingest-spec`, it never calls this route
+    // itself (WS3 item 29).
+    ("POST", "/api/connectors/{id}/ingest/run", Policy::RequiresPermission("connector:manage")),
 
     // ── Knowledge: no seeded resource — auth only. ───────────────────────
     ("GET",  "/api/knowledge/sources",       Policy::RequiresAuth),

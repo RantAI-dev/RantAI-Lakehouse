@@ -26,11 +26,13 @@ use lakehouse_store::cdc::ConnectorSlug;
 use lakehouse_store::connectors::{self, ConnectorDetail, ConnectorDialInfo, CreateConnectorInput};
 use lakehouse_store::ingest_spec::{Dial, SqlDriver};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 use crate::connector_deprovision::{self, DeprovisionError, Deprovisioned, PgTarget};
 use crate::connector_probe;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::support::js_error;
 use crate::state::AppState;
 
 /// Borrow the Postgres pool, or fail with a 503. Mirrors
@@ -1001,6 +1003,93 @@ pub async fn ingest_spec_put(
             Err(ApiError::NotFound(format!("Connector {id} not found")).into())
         }
         Err(err) => Err(ApiError::from(err).into()),
+    }
+}
+
+/// `POST /api/connectors/{id}/ingest/run`'s response for a `cdc`-adapter
+/// connector: `supported: false` with the REAL reason, never a fabricated
+/// "snapshot started" response, and never a launch (ADR 0008).
+///
+/// `ADR 0008` (`docs/adr/0008-initial-snapshot-backfill.md`) explicitly
+/// declines to build a signal-table/incremental-snapshot mechanism —
+/// there is no `debezium_signal` table anywhere in this codebase.
+/// `Debezium`'s own default `snapshot.mode=initial` already performs the
+/// initial-snapshot-then-stream sequence automatically, the moment a
+/// `debezium-server` process starts against a newly created replication
+/// slot/publication (`ops/debezium/render_compose.py` renders that
+/// service). So there is nothing a route can trigger: the trigger already
+/// happened, at `debezium-server` startup, not at a caller's request.
+const CDC_INGEST_RUN_UNSUPPORTED_REASON: &str = "CDC ingestion has no separate trigger: \
+    Debezium's own snapshot.mode=initial (ADR 0008) runs the initial snapshot automatically \
+    the moment the debezium-server compose service (ops/debezium/render_compose.py) starts \
+    against this connector's replication slot/publication. Bring that service up to start \
+    ingestion; there is nothing this route can trigger.";
+
+/// `POST /api/connectors/{id}/ingest/run` — launch this connector's
+/// static `ingest_job` now, or (for a `cdc`-adapter connector) report the
+/// honest reason there is nothing to launch.
+///
+/// Gated on `connector:manage` (`POLICY_TABLE`) — a MUTATING action, not
+/// `ingest:read`: the `ingest:read`-scoped Dagster ingest-schedule-factory
+/// identity (`main::bootstrap_ingest_run_service`) is a READER, it never
+/// calls this route itself.
+///
+/// # Distinguishing a `Dagster` launch failure from a transport failure
+/// (WS3 plan review Z9)
+///
+/// [`lakehouse_dagster::DgClient::launch_run_with_config`] returns
+/// `Ok(LaunchOutcome { run_id: None, error: Some(msg) })`, NOT `Err`, for
+/// a GraphQL-level launch failure (a bad job name, a
+/// `RunConfigValidationInvalid`) — exactly the branching
+/// `routes::pipelines::trigger` (`pipelines.rs:184-207`) already proves
+/// out: `Err` is reserved for transport failures and malformed GraphQL
+/// responses. This handler branches the identical way: `outcome.error`
+/// present becomes a 422 naming that error; `Err(err)` becomes a 503,
+/// classified through [`js_error`] the same way `trigger`'s own 503
+/// branch is (`DgError`'s `Display` is already sanitized — see that
+/// type's doc comment — so this is not a fourteenth Phase-1
+/// `ApiError::Internal(err.to_string())` leak).
+///
+/// # Errors
+///
+/// 404 if `id` is unknown or has no ingest spec set (`adapter IS NULL`);
+/// 422 if `Dagster` reports a launch-time failure; 503 on a `Dagster`
+/// transport failure; 503/500 as above for the database pool.
+pub async fn ingest_run(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    let spec = connectors::get_ingest_spec(pool(&state)?, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Connector {id} not found")))?;
+    let adapter = spec
+        .adapter
+        .ok_or_else(|| ApiError::NotFound(format!("Connector {id} has no ingest spec set")))?;
+
+    if adapter == "cdc" {
+        return Ok(ApiJson(json!({
+            "supported": false,
+            "reason": CDC_INGEST_RUN_UNSUPPORTED_REASON,
+        })));
+    }
+
+    // Mirrors `agent_runs.py`'s `_employee_run_config` shape: one static
+    // job (`ingest_job`), the launched run's only per-run input is this
+    // connector's id, which `run_ingest`'s Dagster op re-fetches the
+    // connector row by (`dagster/dispar_orchestrate/ingest_factory.py`).
+    let run_config = json!({"ops": {"run_ingest": {"config": {"connector_id": id}}}});
+    match state
+        .dagster
+        .launch_run_with_config("ingest_job", &run_config)
+        .await
+    {
+        Ok(outcome) => {
+            if let Some(error) = outcome.error {
+                return Err(ApiError::Unprocessable(error).into());
+            }
+            Ok(ApiJson(json!({ "runId": outcome.run_id })))
+        }
+        Err(err) => Err(ApiError::Unavailable(js_error(err)).into()),
     }
 }
 

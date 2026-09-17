@@ -227,6 +227,10 @@ fn connectors_router() -> Router<AppState> {
             "/api/connectors/{id}/ingest-spec",
             get(connectors::ingest_spec_get).put(connectors::ingest_spec_put),
         )
+        .route(
+            "/api/connectors/{id}/ingest/run",
+            axum::routing::post(connectors::ingest_run),
+        )
 }
 
 /// The `/api/identity/*` sub-router (Phase 2 identity domain), split out
