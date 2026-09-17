@@ -567,88 +567,36 @@ pub async fn revoke_employee(pool: &PgPool, id: &str) -> Result<DigitalEmployee,
 // ---------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------
+//
+// WS7 item G4: the `agent_tool` Postgres table (and its
+// `AgentTool`/`list_tools`/`RegisterToolInput`/`register_tool` Rust
+// surface, all removed here) was never the real tool registry — nothing
+// in `routes::ai`'s dispatch (`ai_tools::run_tool`,
+// `ai_registry::TOOLS`) ever read from it, so "registering" a tool here
+// never made it callable. `GET /api/agents/tools` now reflects
+// `ai_registry::TOOLS` directly (`routes::agents::list_tools_body`); this
+// function is what backs its real 30-day usage counts, from the SAME
+// `audit_event` rows `ai::audit::record` already writes unconditionally
+// on every tool dispatch. The `agent_tool` table and its `0017`/`0018`
+// seed rows stay in the schema (a migration is never edited or dropped
+// once applied) but nothing in this crate reads them anymore.
 
-/// Mirrors `AgentTool` in `contracts/agents.ts`.
-#[derive(Debug, Clone, PartialEq, Serialize, FromRow)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentTool {
-    /// `agent_tool.id`.
-    pub id: String,
-    /// Display name; the table's natural key.
-    pub name: String,
-    /// Semver-ish version label.
-    pub version: String,
-    /// Publishing team or vendor.
-    pub publisher: String,
-    /// Permission scope label (e.g. `"query:read"`).
-    pub permission: String,
-    /// `"healthy" | "degraded" | "unhealthy" | "unknown"`.
-    pub health: String,
-    /// `"pending" | "approved" | "rejected"` (`ApprovalStatus`).
-    pub approval_status: String,
-    /// Whether this tool version is deprecated.
-    pub deprecated: bool,
-    /// Rate limit label (e.g. `"60/min"`).
-    pub rate_limit: String,
-    /// Invocation count over the trailing 30 days.
-    pub usage_30d: i64,
-}
-
-const TOOL_COLUMNS: &str = "id, name, version, publisher, permission, health, approval_status, \
-     deprecated, rate_limit, usage_30d";
-
-/// List every registered tool, newest first.
+/// `(action, count)` for every distinct `audit_event.action` dispatched
+/// in the last 30 days — the real usage counts
+/// `routes::agents::list_tools_body` looks each registry tool's name up
+/// in.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
-pub async fn list_tools(pool: &PgPool) -> Result<Vec<AgentTool>, StoreError> {
-    let sql = format!("SELECT {TOOL_COLUMNS} FROM agent_tool ORDER BY created_at DESC");
-    Ok(sqlx::query_as(&sql).fetch_all(pool).await?)
-}
-
-/// Everything [`register_tool`] needs. Mirrors `RegisterToolInput`.
-#[derive(Debug, Clone)]
-pub struct RegisterToolInput {
-    /// Display name; must not collide with an existing tool.
-    pub name: String,
-    /// Semver-ish version label.
-    pub version: String,
-    /// Publishing team or vendor.
-    pub publisher: String,
-    /// Permission scope label (e.g. `"query:read"`).
-    pub permission: String,
-    /// Rate limit label (e.g. `"60/min"`).
-    pub rate_limit: String,
-}
-
-/// Register a tool. `health` starts `"healthy"`, `approvalStatus` starts
-/// `"pending"`, `usage30d` starts `0` — same as `mock/agents.ts`'s
-/// `registerTool`.
-///
-/// # Errors
-///
-/// Returns [`StoreError::Conflict`] (409) if the name is taken.
-pub async fn register_tool(
-    pool: &PgPool,
-    input: &RegisterToolInput,
-) -> Result<AgentTool, StoreError> {
-    let id = slug_id("tool", &input.name);
-    let sql = format!(
-        "INSERT INTO agent_tool (id, name, version, publisher, permission, health, \
-         approval_status, deprecated, rate_limit) \
-         VALUES ($1, $2, $3, $4, $5, 'healthy', 'pending', false, $6) \
-         RETURNING {TOOL_COLUMNS}"
-    );
-    Ok(sqlx::query_as(&sql)
-        .bind(&id)
-        .bind(&input.name)
-        .bind(&input.version)
-        .bind(&input.publisher)
-        .bind(&input.permission)
-        .bind(&input.rate_limit)
-        .fetch_one(pool)
-        .await?)
+pub async fn tool_usage_counts_30d(pool: &PgPool) -> Result<Vec<(String, i64)>, StoreError> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT action, COUNT(*) FROM audit_event WHERE at > now() - interval '30 days' \
+         GROUP BY action",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 // ---------------------------------------------------------------------

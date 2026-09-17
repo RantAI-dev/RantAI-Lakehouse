@@ -32,7 +32,7 @@ use lakehouse_store::agents::{
     count_agent_run_outcomes, count_pending_approvals, create_employee, create_linked_approval,
     create_pending_approval, create_run, decide_approval, finish_run, get_employee,
     get_employee_run_config, get_employee_with_metrics, get_run, list_approvals, list_employees,
-    list_runs, list_scheduled_employees, list_tools, list_workflows, mark_run_waiting_approval,
+    list_runs, list_scheduled_employees, list_workflows, mark_run_waiting_approval,
     pending_tool_call, recompute_employee_metrics, record_run_budget, record_run_outcome,
     resume_employee, revoke_employee, suspend_employee,
 };
@@ -84,7 +84,16 @@ async fn seed_populates_every_agents_list(pool: PgPool) -> sqlx::Result<()> {
     assert_eq!(list_workflows(&pool).await.unwrap().len(), 2);
     // emp-inventory, emp-risk, and the reserved emp-copilot (0024).
     assert_eq!(list_employees(&pool).await.unwrap().len(), 3);
-    assert_eq!(list_tools(&pool).await.unwrap().len(), 3);
+    // WS7 item G4 removed `agents::list_tools`/`AgentTool` -- nothing in
+    // this crate reads `agent_tool` anymore (the real tool registry is
+    // `ai_registry::TOOLS`, in `lakehouse-api`), but the table and its
+    // 0018 seed rows still exist (a migration is never edited/dropped
+    // once applied), so a raw count still proves seeding intact.
+    let (tool_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agent_tool")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(tool_count, 3);
     // 0025 drops the seeded run/approval fixture history; there is still
     // no live execution path in this migration set, so both are empty.
     assert_eq!(list_runs(&pool, None).await.unwrap().len(), 0);

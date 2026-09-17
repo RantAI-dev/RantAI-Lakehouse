@@ -22,9 +22,22 @@
 //!
 //! `WS1` task 1.11 removed the Agent Workflows and Tool Registry pages:
 //! nothing executes an authored workflow, and the agent runtime never
-//! reads the tool registry. `/api/agents/workflows` and `/api/agents/tools`
-//! still serve real `Postgres` CRUD, stay registered and
-//! `POLICY_TABLE`-classified, and are left for `WS7` to reuse or retire.
+//! reads the tool registry. `/api/agents/workflows` still serves real
+//! `Postgres` CRUD, stays registered and `POLICY_TABLE`-classified, and is
+//! left for a later workstream to reuse or retire.
+//!
+//! `GET /api/agents/tools` (WS7 item G4) no longer serves that unread
+//! `agent_tool` Postgres table — it now reflects
+//! `crate::routes::ai::registry::TOOLS`, the real copilot tool registry
+//! every headless run and interactive chat call actually dispatches
+//! through, with real 30-day usage counts from `audit_event`. `POST
+//! /api/agents/tools` is removed entirely: nothing ever consumed it (no
+//! frontend page calls it — confirmed empty `grep -rln "AgentTool\|
+//! registerTool\|/api/agents/tools" src/`), and "registering" a tool in
+//! `agent_tool` never made it callable — the registry above is the only
+//! thing that does. The `agent_tool` table and its `0017`/`0018` seed
+//! rows stay in the schema (a migration is never edited or dropped once
+//! applied) but nothing in this crate reads them anymore.
 
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, Query, State};
@@ -33,9 +46,8 @@ use lakehouse_auth::{PermissionSet, Principal};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::agents::{
-    self, AgentRun, AgentTool, AgentWorkflow, ApprovalItem, CreateEmployeeInput,
-    CreateWorkflowInput, Decision, DigitalEmployee, LinkedApprovalRequest, RegisterToolInput,
-    RunStep,
+    self, AgentRun, AgentWorkflow, ApprovalItem, CreateEmployeeInput, CreateWorkflowInput,
+    Decision, DigitalEmployee, LinkedApprovalRequest, RunStep,
 };
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use serde::Deserialize;
@@ -288,46 +300,89 @@ pub async fn revoke_employee(
 
 // ── Tools ──────────────────────────────────────────────────────────────
 
-/// `GET /api/agents/tools`.
+/// One entry in `GET /api/agents/tools`'s response — the real copilot
+/// tool registry (`ai_registry::TOOLS`), not the unread `agent_tool`
+/// Postgres table (WS7 item G4; see this module's own doc comment).
+/// Replaces the old `AgentTool` contract entirely — a deliberate breaking
+/// change with no known caller (see this task's report for the
+/// confirming grep).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegistryTool {
+    /// The name the copilot's LLM calls this tool by
+    /// ([`ai_registry::ToolSpec::name`]).
+    pub name: String,
+    /// This tool's `OpenAI`-compatible function schema's own
+    /// `function.description` — the same text the LLM itself is shown.
+    pub description: String,
+    /// `"Read" | "WriteLow" | "WriteHigh"` — [`ai_registry::Risk`], as the
+    /// gate in `ai::gate` enforces it.
+    pub risk: &'static str,
+    /// The `resource:action` permission this tool requires, or `""` for
+    /// authenticated-only (see [`ai_registry::ToolSpec::permission`]'s own
+    /// doc comment).
+    pub permission: &'static str,
+    /// Real dispatch count over the trailing 30 days, from
+    /// `audit_event` — 0 when the registry has never been asked to run
+    /// this tool in the window, never a fabrication when it's genuinely
+    /// unused.
+    pub usage_count_30d: i64,
+}
+
+/// [`ai_registry::Risk`] as the string this route's contract exposes —
+/// the registry itself carries no string form (its `Risk` enum is
+/// dispatch-internal), so this is the one, single place that names.
+fn risk_label(risk: ai_registry::Risk) -> &'static str {
+    match risk {
+        ai_registry::Risk::Read => "Read",
+        ai_registry::Risk::WriteLow => "WriteLow",
+        ai_registry::Risk::WriteHigh => "WriteHigh",
+    }
+}
+
+/// Maps every [`ai_registry::TOOLS`] entry to a [`RegistryTool`], looking
+/// up each one's real 30-day dispatch count from `usage_counts` (an
+/// `(action, count)` pair per distinct `audit_event.action` in the
+/// window, as the route handler's own `GROUP BY` query produces) — `0`
+/// when a tool's name has no matching row, not absent from the list: the
+/// registry is the source of truth for WHICH tools exist, `audit_event`
+/// only for how often each one ran.
+fn list_tools_body(usage_counts: &[(String, i64)]) -> Vec<RegistryTool> {
+    ai_registry::TOOLS
+        .iter()
+        .map(|spec| {
+            let schema = (spec.schema)();
+            let description = schema["function"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            let usage_count_30d = usage_counts
+                .iter()
+                .find(|(action, _)| action == spec.name)
+                .map_or(0, |(_, count)| *count);
+            RegistryTool {
+                name: spec.name.to_owned(),
+                description,
+                risk: risk_label(spec.risk),
+                permission: spec.permission,
+                usage_count_30d,
+            }
+        })
+        .collect()
+}
+
+/// `GET /api/agents/tools` — the real copilot tool registry
+/// (`ai_registry::TOOLS`) with real 30-day dispatch counts from
+/// `audit_event` (WS7 item G4). `POST /api/agents/tools` (the old
+/// `agent_tool`-table "register a tool" endpoint) is removed entirely —
+/// see this module's doc comment.
 ///
 /// # Errors
 ///
 /// 503 if no pool is configured; 500 on a database failure.
-pub async fn list_tools(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<AgentTool>>> {
-    Ok(ApiJson(agents::list_tools(pool(&state)?).await?))
-}
-
-/// The `POST /api/agents/tools` body. Mirrors `RegisterToolInput`.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RegisterToolBody {
-    name: String,
-    version: String,
-    publisher: String,
-    permission: String,
-    rate_limit: String,
-}
-
-/// `POST /api/agents/tools` — register a tool. Returns 201.
-///
-/// # Errors
-///
-/// 400 on a malformed body or a blank required field; 409 if the name is
-/// taken; 503/500 as above.
-pub async fn register_tool(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> ApiResult<(StatusCode, ApiJson<AgentTool>)> {
-    let body: RegisterToolBody = parse_body(&body)?;
-    let input = RegisterToolInput {
-        name: required("name", &body.name)?,
-        version: required("version", &body.version)?,
-        publisher: required("publisher", &body.publisher)?,
-        permission: required("permission", &body.permission)?,
-        rate_limit: required("rateLimit", &body.rate_limit)?,
-    };
-    let created = agents::register_tool(pool(&state)?, &input).await?;
-    Ok((StatusCode::CREATED, ApiJson(created)))
+pub async fn list_tools(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<RegistryTool>>> {
+    let usage_counts = agents::tool_usage_counts_30d(pool(&state)?).await?;
+    Ok(ApiJson(list_tools_body(&usage_counts)))
 }
 
 // ── Runs ───────────────────────────────────────────────────────────────
@@ -1006,7 +1061,15 @@ async fn run_headless_loop(
                 None,
                 None,
                 &json!({ "prompt": prompt }),
-                "budget_exhausted",
+                // `audit_event.outcome` has its own, narrower CHECK-
+                // constrained vocabulary (`0024_audit_event.sql`) that does
+                // NOT include `"budget_exhausted"` — that string is
+                // `agent_run.status`'s vocabulary (no CHECK constraint,
+                // widened for WS7 item G2), a DIFFERENT column with a
+                // DIFFERENT allowed-values set. `"failed"` is the correct,
+                // already-allowed audit outcome for this case; the real
+                // reason is still on record, in `detail` below.
+                "failed",
                 Some(&detail),
                 run_id,
                 None,
@@ -1554,6 +1617,51 @@ mod tests {
             let body: Value = serde_json::from_slice(&bytes).unwrap();
             assert!(body.get("error").is_some(), "{path}");
         }
+    }
+
+    /// WS7 item G4, failing-test-first: before this task, `GET
+    /// /api/agents/tools` read the unread `agent_tool` Postgres table via
+    /// `agents::list_tools`/`AgentTool` — completely disconnected from
+    /// `ai_registry::TOOLS`, the table every real tool dispatch actually
+    /// goes through (confirmed by reading `routes::ai::tools::run_tool`
+    /// before touching this). `list_tools_body` did not exist before this
+    /// task; `cargo test -p lakehouse-api list_tools_body --lib --no-run`
+    /// failed with E0425 (unresolved function).
+    #[test]
+    fn list_tools_body_reflects_the_real_registry_not_seeded_fantasy_data() {
+        let tools = list_tools_body(&[]);
+        assert!(
+            tools.iter().any(|t| t.name == "run_sql"),
+            "must reflect ai_registry::TOOLS, not agent_tool seed rows"
+        );
+        let run_sql = tools.iter().find(|t| t.name == "run_sql").unwrap();
+        assert_eq!(run_sql.usage_count_30d, 0);
+        assert_eq!(run_sql.risk, "Read");
+        assert_eq!(run_sql.permission, "query:read");
+        assert!(!run_sql.description.is_empty());
+    }
+
+    #[test]
+    fn list_tools_body_counts_real_audit_events() {
+        let events = vec![("run_sql".to_owned(), 3_i64)];
+        let tools = list_tools_body(&events);
+        assert_eq!(
+            tools
+                .iter()
+                .find(|t| t.name == "run_sql")
+                .unwrap()
+                .usage_count_30d,
+            3
+        );
+        // A tool with no matching audit_event row is 0, not absent.
+        assert_eq!(
+            tools
+                .iter()
+                .find(|t| t.name == "list_datasets")
+                .unwrap()
+                .usage_count_30d,
+            0
+        );
     }
 
     #[test]

@@ -395,8 +395,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // clicking "Run now" is a legitimate caller here, not only a
     // scheduler). ────────────────────────────────────────────────────────
     ("POST", "/api/agents/employees/{id}/run",       Policy::RequiresAuth),
+    // POST /api/agents/tools removed (WS7 item G4): the real tool
+    // registry (ai_registry::TOOLS) has no "register" concept.
     ("GET",  "/api/agents/tools",                    Policy::RequiresAuth),
-    ("POST", "/api/agents/tools",                    Policy::RequiresAuth),
     ("GET",  "/api/agents/runs",                     Policy::RequiresAuth),
     ("GET",  "/api/agents/runs/{id}",                Policy::RequiresAuth),
     ("GET",  "/api/agents/approvals",                Policy::RequiresPermission("agent:approve")),

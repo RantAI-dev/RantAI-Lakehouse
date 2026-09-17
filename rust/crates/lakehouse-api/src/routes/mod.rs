@@ -353,10 +353,11 @@ fn agents_router() -> Router<AppState> {
             "/api/agents/employees/{id}/run",
             axum::routing::post(agents::run_employee),
         )
-        .route(
-            "/api/agents/tools",
-            get(agents::list_tools).post(agents::register_tool),
-        )
+        // WS7 item G4: POST /api/agents/tools ("register a tool" against
+        // the unread agent_tool table) is removed — GET now reflects the
+        // real ai_registry::TOOLS registry, see routes::agents's module
+        // doc comment.
+        .route("/api/agents/tools", get(agents::list_tools))
         .route("/api/agents/runs", get(agents::list_runs))
         .route("/api/agents/runs/{id}", get(agents::get_run))
         .route("/api/agents/approvals", get(agents::list_approvals))
