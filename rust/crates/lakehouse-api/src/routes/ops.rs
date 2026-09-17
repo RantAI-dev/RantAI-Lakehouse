@@ -93,21 +93,27 @@ async fn run(state: &AppState, kind: Kind) -> Result<Value, OpsError> {
 /// so the unmeasured fields it nulls (and the dropped
 /// `streamingLagSeconds` key) can be asserted without a `ClickHouse` call.
 ///
-/// `ingest_lag` (WS5 item B3) is a real, computed `Option<f64>` from the
-/// caller (`observability`) -- `None` serializes to `null` the same way
-/// the still-unmeasured fields below do, never a fabricated `0`.
-fn observability_json(p95: i64, err: f64, ingest_lag: Option<f64>) -> Value {
+/// `ingest_lag` (WS5 item B3) and `cache_hit_rate` (WS5 item B4) are real,
+/// computed `Option<f64>`s from the caller (`observability`) -- `None`
+/// serializes to `null` the same way the still-unmeasured fields below do,
+/// never a fabricated `0`.
+fn observability_json(
+    p95: i64,
+    err: f64,
+    ingest_lag: Option<f64>,
+    cache_hit_rate: Option<f64>,
+) -> Value {
     json!({
         "queryP95Ms": p95,
         "queryErrorRate": err,
         "ingestLagSeconds": ingest_lag,
-        // Nothing measures cache hit rate, policy decision latency, agent
-        // success rate, or open incidents today; `null` is honest, the
-        // literal zeros this replaced were not (P5 review / WS1 honesty
-        // pass task 1.7). `streamingLagSeconds` is dropped outright: it
-        // has no consumer in the TypeScript contract and nothing measures
-        // streaming either.
-        "cacheHitRate": Value::Null,
+        "cacheHitRate": cache_hit_rate,
+        // Nothing measures policy decision latency, agent success rate,
+        // or open incidents today; `null` is honest, the literal zeros
+        // this replaced were not (P5 review / WS1 honesty pass task 1.7).
+        // `streamingLagSeconds` is dropped outright: it has no consumer
+        // in the TypeScript contract and nothing measures streaming
+        // either.
         "policyDecisionP95Ms": Value::Null,
         "agentSuccessRate": Value::Null,
         "activeIncidents": Value::Null,
@@ -145,7 +151,8 @@ async fn observability(ch: &ChClient) -> Result<Value, OpsError> {
         .and_then(|r| str_col(r, "err").parse::<f64>().ok())
         .unwrap_or(0.0);
     let ingest_lag = ingest_lag_seconds(ch).await;
-    Ok(observability_json(p95, err, ingest_lag))
+    let cache_hit_rate = cache_hit_rate(ch).await;
+    Ok(observability_json(p95, err, ingest_lag, cache_hit_rate))
 }
 
 /// `observability.ingestLagSeconds` (WS5 item B3, corrected against WS3's
@@ -201,6 +208,31 @@ async fn ingest_lag_seconds(ch: &ChClient) -> Option<f64> {
         .fold(None, |acc: Option<f64>, age| {
             Some(acc.map_or(age, |a| a.max(age)))
         })
+}
+
+/// `observability.cacheHitRate` (WS5 item B4) -- real, verified live on
+/// this instance (see the plan's "External signals verified" section).
+/// 24h window, matching `q_row`'s window in `overview.rs` for consistency
+/// across the two routes that both summarize the last day of
+/// `system.query_log`. `None` when no cache-eligible queries ran in the
+/// window (`hits + misses == 0`) -- "no data" is not "0% hit rate," which
+/// would read as a real, poor measurement rather than "not measured."
+async fn cache_hit_rate(ch: &ChClient) -> Option<f64> {
+    let rows = ch
+        .rows(
+            "SELECT toString(sum(ProfileEvents['QueryCacheHits'])) hits, \
+                    toString(sum(ProfileEvents['QueryCacheMisses'])) misses \
+             FROM system.query_log \
+             WHERE type = 'QueryFinish' AND event_time > now() - INTERVAL 24 HOUR",
+            None,
+        )
+        .await
+        .ok()?;
+    let row = rows.first()?;
+    let hits = str_col(row, "hits").parse::<f64>().ok()?;
+    let misses = str_col(row, "misses").parse::<f64>().ok()?;
+    let total = hits + misses;
+    (total > 0.0).then_some(hits / total)
 }
 
 /// Build one `ops/workloads` row from a `system.processes` fixture row.
@@ -527,7 +559,7 @@ mod tests {
 
     #[test]
     fn observability_nulls_every_unmeasured_metric_and_drops_streaming_lag() {
-        let v = observability_json(120, 0.002, None);
+        let v = observability_json(120, 0.002, None, None);
         assert_eq!(v["queryP95Ms"], 120);
         assert!((v["queryErrorRate"].as_f64().unwrap() - 0.002).abs() < f64::EPSILON);
         for field in [
@@ -550,8 +582,15 @@ mod tests {
     /// number, never left null once it is actually measured.
     #[test]
     fn observability_reports_a_real_ingest_lag_when_measured() {
-        let v = observability_json(120, 0.002, Some(42.5));
+        let v = observability_json(120, 0.002, Some(42.5), None);
         assert_eq!(v["ingestLagSeconds"], 42.5);
+    }
+
+    /// WS5 item B4 -- likewise for a real, computed cache hit rate.
+    #[test]
+    fn observability_reports_a_real_cache_hit_rate_when_measured() {
+        let v = observability_json(120, 0.002, None, Some(0.8));
+        assert_eq!(v["cacheHitRate"], 0.8);
     }
 
     #[test]
@@ -762,5 +801,42 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+
+    // ── observability.cacheHitRate (WS5 item B4) ────────────────────────
+
+    #[tokio::test]
+    async fn cache_hit_rate_divides_hits_by_hits_plus_misses() {
+        let server = wiremock::MockServer::start().await;
+        let body = json!({
+            "meta": [],
+            "data": [{ "hits": "8", "misses": "2" }],
+            "rows": 1,
+        });
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let rate = cache_hit_rate(&ch_client(&server.uri())).await;
+        assert_eq!(rate, Some(0.8));
+    }
+
+    /// No cache-eligible queries ran in the window: both counters are
+    /// zero, so this is "no data," not "0% hit rate" -- `None`, never `0`.
+    #[tokio::test]
+    async fn cache_hit_rate_is_none_when_there_is_no_denominator() {
+        let server = wiremock::MockServer::start().await;
+        let body = json!({
+            "meta": [],
+            "data": [{ "hits": "0", "misses": "0" }],
+            "rows": 1,
+        });
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        assert_eq!(cache_hit_rate(&ch_client(&server.uri())).await, None);
     }
 }
