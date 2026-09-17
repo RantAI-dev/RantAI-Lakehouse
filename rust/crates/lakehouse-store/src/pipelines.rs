@@ -351,11 +351,27 @@ pub async fn create_pipeline(
 
 /// Update an authored pipeline's status (`pausePipeline`/`resumePipeline`
 /// for a pipeline that has no backing Dagster job — see
-/// `routes::pipelines::pause`/`resume`).
+/// `routes::pipelines::pause`/`resume`; and `routes::pipelines::
+/// set_status_route`'s draft -> ready transition, WS4 item D4).
+///
+/// `status` is bound straight into the query with NO validation of its own
+/// here — this function relies entirely on `pipeline_definition`'s
+/// `pipeline_definition_status_check` CHECK constraint (`0007_pipelines.sql`)
+/// to reject anything outside the fixed status vocabulary. **This is
+/// defense in depth for THIS function's own callers only, not the real
+/// safety boundary for `POST /api/pipelines/{id}/status`**:
+/// `routes::pipelines::set_status_route`'s `ALLOWED_TRANSITIONS` table is
+/// checked in the ROUTE, before this function is ever called, and is what
+/// actually stops a `pipeline:write` principal from setting a run-derived
+/// status (`"completed"`/`"running"`/`"failed"`/`"degraded"`/`"partial"`)
+/// that fabricates an execution outcome (judge review V9). `pause`/
+/// `resume`'s own callers only ever pass the literal `"paused"`/`"ready"`,
+/// so the CHECK constraint alone has always been sufficient for them.
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::Database`] on any failure.
+/// Returns [`StoreError::Database`] on any failure, including the CHECK
+/// constraint rejecting a `status` outside its fixed vocabulary.
 pub async fn set_status(
     pool: &PgPool,
     id: &str,

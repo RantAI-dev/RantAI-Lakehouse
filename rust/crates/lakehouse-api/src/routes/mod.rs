@@ -118,6 +118,10 @@ fn pipelines_router() -> Router<AppState> {
             axum::routing::post(pipelines::trigger),
         )
         .route(
+            "/api/pipelines/{id}/status",
+            axum::routing::post(pipelines::set_status_route),
+        )
+        .route(
             "/api/pipelines/{id}/pause",
             axum::routing::post(pipelines::pause),
         )

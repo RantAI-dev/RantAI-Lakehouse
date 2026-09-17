@@ -112,3 +112,45 @@ async fn get_definition_none_for_unknown_id(pool: PgPool) -> sqlx::Result<()> {
     assert!(definition.is_none());
     Ok(())
 }
+
+// ── WS4 item D4: `set_status`, now explicitly defense-in-depth only ────
+
+/// `set_status`'s own validation is entirely the `pipeline_definition_
+/// status_check` CHECK constraint — a status outside the fixed vocabulary
+/// still fails here, exactly as before this task. `POST
+/// /api/pipelines/{id}/status`'s REAL validation is
+/// `routes::pipelines::ALLOWED_TRANSITIONS`, checked before this function
+/// is ever called (see `set_status`'s own doc comment).
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_status_rejects_a_status_outside_the_check_constraint(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input())
+        .await
+        .expect("create_pipeline should succeed");
+
+    let result = pipelines::set_status(&pool, &created.id, "not_a_real_status").await;
+    assert!(
+        matches!(result, Err(lakehouse_store::StoreError::Database(_))),
+        "expected StoreError::Database from the CHECK constraint, got {result:?}"
+    );
+    Ok(())
+}
+
+/// `set_status` itself still moves a `"draft"` pipeline to `"ready"` when
+/// asked — the function's own behavior is unchanged by this task, only its
+/// role (defense in depth, not the route's real gate) is.
+#[sqlx::test(migrations = "../../migrations")]
+async fn set_status_moves_a_draft_pipeline_to_ready(pool: PgPool) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input())
+        .await
+        .expect("create_pipeline should succeed");
+    assert_eq!(created.status, "draft");
+
+    let updated = pipelines::set_status(&pool, &created.id, "ready")
+        .await
+        .expect("set_status should succeed")
+        .expect("pipeline should exist");
+    assert_eq!(updated.status, "ready");
+    Ok(())
+}

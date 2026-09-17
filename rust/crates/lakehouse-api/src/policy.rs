@@ -241,6 +241,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/pipelines/generate",               Policy::RequiresPermission("pipeline:write")),
     ("GET",  "/api/pipelines/{id}/runs",              Policy::RequiresPermission("pipeline:read")),
     ("POST", "/api/pipelines/{id}/trigger",           Policy::RequiresPermission("pipeline:write")),
+    ("POST", "/api/pipelines/{id}/status",            Policy::RequiresPermission("pipeline:write")),
     ("POST", "/api/pipelines/{id}/pause",             Policy::RequiresPermission("pipeline:write")),
     ("POST", "/api/pipelines/{id}/resume",            Policy::RequiresPermission("pipeline:write")),
     ("POST", "/api/pipelines/runs/{runId}/cancel",    Policy::RequiresPermission("pipeline:write")),
