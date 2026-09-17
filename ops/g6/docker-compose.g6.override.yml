@@ -6,7 +6,34 @@
 # (`docker compose -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
 # --profile g6 --profile dagster ...`) admits them, and only for the
 # mysql-g6/mssql-g6/rest-stub-g6 fixtures this gate itself stands up.
+#
+# WS3 item 37: MYSQL_ROOT_PASSWORD, CONNECTOR_MYSQL_PASSWORD and
+# MSSQL_SA_PASSWORD (mysql-g6, mssql-g6, g6-test-runner below) live here
+# for the same reason as INGEST_ALLOW_INTERNAL_HOSTS above -- they are
+# gate-only, and `${VAR:?}` in the default docker-compose.yml is
+# interpolated for every service regardless of profile, so leaving them
+# there broke `docker compose --profile '*' config --quiet` (the
+# repo-wide check AGENTS.md prescribes) for every checkout, gate or not.
+# They stay `${VAR:?}` here: fail-closed, just relocated.
 services:
   dagster-code-location:
     environment:
       INGEST_ALLOW_INTERNAL_HOSTS: "true"
+
+  mysql-g6:
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?}
+      MYSQL_PASSWORD: ${CONNECTOR_MYSQL_PASSWORD:?}
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:?}"]
+
+  mssql-g6:
+    environment:
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?}
+    healthcheck:
+      test: ["CMD", "/opt/mssql-tools18/bin/sqlcmd", "-C", "-S", "localhost", "-U", "sa", "-P", "${MSSQL_SA_PASSWORD:?}", "-Q", "SELECT 1"]
+
+  g6-test-runner:
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?}
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?}

@@ -2218,17 +2218,27 @@ services:
   # admits them. `g6` profile: never started by `--profile dagster` or
   # `--profile test` alone, so a real deployment never pays for these
   # containers.
+  #
+  # WS3 item 37: MYSQL_ROOT_PASSWORD, CONNECTOR_MYSQL_PASSWORD and
+  # MSSQL_SA_PASSWORD are gate-only credentials, so they are NOT referenced
+  # here. Compose interpolates `${VAR:?}` in every service regardless of
+  # profile, so a gate-only credential referenced in this file broke
+  # `docker compose --profile '*' config --quiet` -- the repo-wide check
+  # AGENTS.md prescribes -- for everybody, on every checkout, whether or
+  # not they run the g6 gate. The credentials (and the healthcheck
+  # commands that embed them) live in
+  # `ops/g6/docker-compose.g6.override.yml`, which the gate's own
+  # invocation adds with `-f`; they stay `${VAR:?}` there too, so the gate
+  # still fails closed without real values.
   mysql-g6:
     image: mysql:8
     profiles: ["g6"]
     restart: "no"
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?}
       MYSQL_DATABASE: g6_ingest
       MYSQL_USER: g6_reader
-      MYSQL_PASSWORD: ${CONNECTOR_MYSQL_PASSWORD:?}
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:?}"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -2239,9 +2249,8 @@ services:
     restart: "no"
     environment:
       ACCEPT_EULA: "Y"
-      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?}
     healthcheck:
-      test: ["CMD", "/opt/mssql-tools18/bin/sqlcmd", "-C", "-S", "localhost", "-U", "sa", "-P", "${MSSQL_SA_PASSWORD:?}", "-Q", "SELECT 1"]
+      test: ["CMD", "/opt/mssql-tools18/bin/sqlcmd", "-C", "-S", "localhost", "-U", "sa", "-Q", "SELECT 1"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -2286,8 +2295,9 @@ services:
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
       AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?}
-      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?}
+      # MYSQL_ROOT_PASSWORD, MSSQL_SA_PASSWORD: gate-only, set in
+      # ops/g6/docker-compose.g6.override.yml -- see the comment above
+      # mysql-g6/mssql-g6 in this file (WS3 item 37).
     entrypoint: ["/bin/sh", "-c"]
     command: ["pip install -q requests pymysql pyodbc && python g6_ingest_matrix_test.py"]
     restart: "no"
