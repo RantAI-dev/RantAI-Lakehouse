@@ -382,12 +382,6 @@ pub enum RewriteError {
     /// found — refused rather than inlined or itself substituted (WS7
     /// plan, Hard Requirement 4).
     #[error("view `{view}` reads a governed table and cannot be rewritten safely")]
-    #[allow(
-        dead_code,
-        reason = "only a #[cfg(test)] constructor exists in this commit \
-                  (WS7 item B5's classify_views tests); WS7 item B6's enforce() is \
-                  the first production caller"
-    )]
     ViewOverGovernedTable {
         /// The view's own canonical `"schema.table"` name.
         view: String,
@@ -426,15 +420,10 @@ pub struct PlaceholderValues {
 
 impl PlaceholderValues {
     /// No placeholder values available — used by a caller with no
-    /// principal context (tests, and any row filter that uses neither
-    /// placeholder).
+    /// principal context (WS7 item A5's policy-preview route, which has no
+    /// real query-time principal to expand `__principal_id__`/
+    /// `__principal_tenant_ids__` from, and tests).
     #[must_use]
-    #[allow(
-        dead_code,
-        reason = "no non-test caller exists yet in this commit (WS7 item B3); \
-                  WS7 item B6's enforce() and Phase C's real principal wiring are \
-                  the first production callers"
-    )]
     pub fn none() -> Self {
         Self::default()
     }
@@ -481,11 +470,6 @@ const ALLOWED_ROW_FILTER_FUNCTIONS: &[&str] = &["lower", "upper", "tostring", "t
 /// `real_columns` is `None`, its masked/filtered projection fails to
 /// re-parse, or the post-substitution backstop finds a governed table
 /// the mutating pass never reached.
-#[allow(
-    dead_code,
-    reason = "no non-test caller exists yet in this commit (WS7 item B3); \
-              WS7 item B6's enforce() is the first production caller"
-)]
 #[allow(
     clippy::implicit_hasher,
     reason = "this crate never builds a HashMap<String, TableObligations> with a \
@@ -1663,6 +1647,197 @@ fn is_dict_or_join_function(name: &str) -> bool {
         || lower.starts_with("joinget")
 }
 
+/// Walks `expr`, collecting every bare `Expr::Identifier`/
+/// `Expr::CompoundIdentifier` name (the last segment of a compound one)
+/// into `idents` and setting `*has_dict_call` when any `Expr::Function`
+/// call anywhere inside it is in the `dictGet*`/`joinGet*` family
+/// ([`is_dict_or_join_function`]). Returns `false` the moment it reaches
+/// an `Expr` shape it does not specifically model (a subquery, a lambda,
+/// anything not one of the handful of composite shapes below) — the
+/// caller ([`referenced_identifiers`]/[`contains_dict_or_join_call`])
+/// then reports "cannot enumerate" rather than a partial, silently
+/// under-counted identifier set: WS7 item C1's N2 fix (Hard Requirement 1's
+/// fail-closed rule applies here too — a `default_expression` this walker
+/// cannot fully see through must never be treated as "provably references
+/// no masked column").
+fn collect_from_expr(expr: &Expr, idents: &mut HashSet<String>, has_dict_call: &mut bool) -> bool {
+    match expr {
+        Expr::Identifier(ident) => {
+            idents.insert(ident.value.clone());
+            true
+        }
+        Expr::CompoundIdentifier(parts) => {
+            if let Some(last) = parts.last() {
+                idents.insert(last.value.clone());
+            }
+            true
+        }
+        Expr::Value(_) => true,
+        Expr::Function(f) => {
+            if is_dict_or_join_function(&f.name.to_string()) {
+                *has_dict_call = true;
+            }
+            match &f.args {
+                FunctionArguments::None => true,
+                FunctionArguments::List(list) => list.args.iter().all(|arg| match arg {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                    | FunctionArg::Named {
+                        arg: FunctionArgExpr::Expr(e),
+                        ..
+                    } => collect_from_expr(e, idents, has_dict_call),
+                    _ => false,
+                }),
+                FunctionArguments::Subquery(_) => false,
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_from_expr(left, idents, has_dict_call)
+                && collect_from_expr(right, idents, has_dict_call)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::Cast { expr: inner, .. } => collect_from_expr(inner, idents, has_dict_call),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            collect_from_expr(inner, idents, has_dict_call)
+                && collect_from_expr(low, idents, has_dict_call)
+                && collect_from_expr(high, idents, has_dict_call)
+        }
+        Expr::Like {
+            expr: inner,
+            pattern,
+            ..
+        }
+        | Expr::ILike {
+            expr: inner,
+            pattern,
+            ..
+        } => {
+            collect_from_expr(inner, idents, has_dict_call)
+                && collect_from_expr(pattern, idents, has_dict_call)
+        }
+        Expr::InList {
+            expr: inner, list, ..
+        } => {
+            collect_from_expr(inner, idents, has_dict_call)
+                && list
+                    .iter()
+                    .all(|item| collect_from_expr(item, idents, has_dict_call))
+        }
+        _ => false,
+    }
+}
+
+/// Parses `expr_text` as a standalone `Expr` (same `GenericDialect`/
+/// `parse_expr` entry point [`validate_row_filter_expr`] uses, WS7 item
+/// C1) and collects every bare column identifier referenced anywhere
+/// inside it. `None` when `expr_text` fails to parse at all, OR when it
+/// parses but contains a shape [`collect_from_expr`] does not model —
+/// both are "cannot prove this expression's column references", so both
+/// fail closed identically (see [`collect_from_expr`]'s own doc comment).
+/// Used by [`crate::policy_engine`]'s transitive mask closure to decide
+/// whether a `ClickHouse` `ALIAS`/`MATERIALIZED`/`DEFAULT` column's
+/// `default_expression` derives from an already-masked column.
+#[must_use]
+pub fn referenced_identifiers(expr_text: &str) -> Option<Vec<String>> {
+    let dialect = sqlparser::dialect::GenericDialect {};
+    let mut parser = Parser::new(&dialect).try_with_sql(expr_text).ok()?;
+    let expr = parser.parse_expr().ok()?;
+    if !parser.consume_token(&sqlparser::tokenizer::Token::EOF) {
+        return None;
+    }
+    let mut idents = HashSet::new();
+    let mut has_dict_call = false;
+    if !collect_from_expr(&expr, &mut idents, &mut has_dict_call) {
+        return None;
+    }
+    Some(idents.into_iter().collect())
+}
+
+/// Whether `expr_text` (parsed the same way [`referenced_identifiers`]
+/// does) calls a `dictGet*`/`dictHas`/`dictIsIn`/`joinGet*` function
+/// anywhere inside it (WS7 item C1, N5). An `expr_text` that fails to
+/// parse, or parses but contains a shape [`collect_from_expr`] does not
+/// model, already returns `true` — [`crate::policy_engine`]'s own
+/// `derives_from_masked` branch already fails closed (masks the column)
+/// on `referenced_identifiers` returning `None` — so this function itself
+/// only has to decide the PARSES-and-fully-enumerable case.
+#[must_use]
+pub fn contains_dict_or_join_call(expr_text: &str) -> bool {
+    let dialect = sqlparser::dialect::GenericDialect {};
+    let Some(mut parser) = Parser::new(&dialect).try_with_sql(expr_text).ok() else {
+        return true;
+    };
+    let Ok(expr) = parser.parse_expr() else {
+        return true;
+    };
+    if !parser.consume_token(&sqlparser::tokenizer::Token::EOF) {
+        return true; // trailing input after the expression — fail closed
+    }
+    let mut idents = HashSet::new();
+    let mut has_dict_call = false;
+    if !collect_from_expr(&expr, &mut idents, &mut has_dict_call) {
+        return true;
+    }
+    has_dict_call
+}
+
+#[cfg(test)]
+mod default_expression_analysis {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::{contains_dict_or_join_call, referenced_identifiers};
+
+    #[test]
+    fn referenced_identifiers_finds_a_simple_function_call_argument() {
+        let mut refs = referenced_identifiers("lower(email)").unwrap();
+        refs.sort();
+        assert_eq!(refs, vec!["email".to_owned()]);
+    }
+
+    #[test]
+    fn referenced_identifiers_finds_every_identifier_in_a_binary_expression() {
+        let mut refs = referenced_identifiers("sipHash64(email_lc)").unwrap();
+        refs.sort();
+        assert_eq!(refs, vec!["email_lc".to_owned()]);
+    }
+
+    #[test]
+    fn referenced_identifiers_is_none_for_unparseable_text() {
+        assert!(referenced_identifiers("??? not valid sql").is_none());
+    }
+
+    #[test]
+    fn contains_dict_or_join_call_is_true_for_a_dict_get_call() {
+        assert!(contains_dict_or_join_call(
+            "dictGet('db.crm_dict', 'email', id)"
+        ));
+    }
+
+    #[test]
+    fn contains_dict_or_join_call_is_true_for_a_join_get_call() {
+        assert!(contains_dict_or_join_call(
+            "joinGet('db.join_table', 'email', id)"
+        ));
+    }
+
+    #[test]
+    fn contains_dict_or_join_call_is_false_for_an_ordinary_function_call() {
+        assert!(!contains_dict_or_join_call("lower(email)"));
+    }
+
+    #[test]
+    fn contains_dict_or_join_call_fails_closed_on_unparseable_text() {
+        assert!(contains_dict_or_join_call("??? not valid sql"));
+    }
+}
+
 fn canonical_object_name(name: &ObjectName) -> String {
     let parts: Vec<String> = name
         .0
@@ -1774,12 +1949,6 @@ pub fn classify_statement(sql: &str, dialect: &dyn Dialect) -> Result<(), Rewrit
 /// engine, create_table_query FROM system.tables WHERE (database,
 /// name) = (...)`; `NoViews` (WS7 item B6) implements this as "nothing is
 /// ever a view", for a caller with no catalog access at all.
-#[allow(
-    dead_code,
-    reason = "only a #[cfg(test)] implementor exists in this commit \
-              (WS7 item B5's FakeSystemTablesCatalog); WS7 item B6's NoViews and \
-              Phase C's real implementation are the first production callers"
-)]
 pub trait SystemTablesCatalog {
     /// `(engine, create_table_query)` for `table` (canonical
     /// `"schema.table"`), or `None` if the table is unknown to the
@@ -1803,11 +1972,6 @@ pub trait SystemTablesCatalog {
     clippy::implicit_hasher,
     reason = "this crate never builds a HashSet<String> with a non-default \
               hasher; see the matching allow on substitute_governed_tables"
-)]
-#[allow(
-    dead_code,
-    reason = "no non-test caller exists yet in this commit (WS7 item B5); \
-              WS7 item B6's enforce() is the first production caller"
 )]
 pub fn classify_views(
     sql: &str,
@@ -2218,12 +2382,6 @@ mod refusals {
 /// Supplies obligations for `(table, principal_roles)`. Implemented by
 /// `policy_engine` in Phase C; kept as a trait so this module's own
 /// tests run with zero database/`ClickHouse` dependency.
-#[allow(
-    dead_code,
-    reason = "only a #[cfg(test)] implementor exists in this commit (WS7 \
-              item B6's FakeObligations); Phase C's policy_engine-backed \
-              implementation is the first production caller"
-)]
 pub trait ObligationsSource {
     /// The mask/row-filter obligations `table` carries for a principal
     /// holding `principal_roles`, or `None` if none apply.
@@ -2240,7 +2398,16 @@ pub trait ObligationsSource {
 
 /// A [`SystemTablesCatalog`] that reports every table as "not a view" —
 /// for a caller with no `system.tables` access at all (or a test that
-/// does not exercise the view-refusal path).
+/// does not exercise the view-refusal path). `policy_engine::PrefetchedViews`
+/// (WS7 item C1) is the real production `SystemTablesCatalog`
+/// `routes::query::run` uses (it genuinely resolves `system.tables`), so
+/// this stays test-only in the current call graph.
+#[allow(
+    dead_code,
+    reason = "only a #[cfg(test)] caller exists in this commit (this module's own \
+              enforce_tests); policy_engine::PrefetchedViews is the real \
+              production SystemTablesCatalog every non-test caller uses"
+)]
 pub struct NoViews;
 
 impl SystemTablesCatalog for NoViews {
@@ -2268,11 +2435,6 @@ impl SystemTablesCatalog for NoViews {
 /// See [`classify_statement_for_principal`], [`classify_views`], and
 /// [`substitute_governed_tables`] — every error any of those three can
 /// return, `enforce` can return.
-#[allow(
-    dead_code,
-    reason = "no non-test caller exists yet in this commit (WS7 item B6); \
-              Phase C wires this into Query Studio and the copilot's run_sql"
-)]
 pub fn enforce(
     sql: &str,
     dialect: &dyn Dialect,
