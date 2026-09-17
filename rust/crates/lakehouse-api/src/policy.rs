@@ -221,6 +221,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // History (WS6 item 3): same RequiresAuth floor as export/read-back —
     // row counts and run timing, not public data.
     ("GET",  "/api/gold/exports",        Policy::RequiresAuth),
+    // Consumers (WS6 item 4): an honest supported:false stub — no
+    // ClickHouse/Iceberg/Trino data is ever returned, but the floor stays
+    // RequiresAuth (not a public route) to match every other route under
+    // /api/gold/export/{mart}.
+    ("GET",  "/api/gold/export/{mart}/consumers", Policy::RequiresAuth),
 
     // ── Query: seeded Analyst permission `query:read`. ───────────────────
     ("POST", "/api/query/run",            Policy::RequiresPermission("query:read")),

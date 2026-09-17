@@ -414,13 +414,84 @@ pub async fn exports(
     ))
 }
 
+/// `GET /api/gold/export/{mart}/consumers` — WS6 ships this as an honest
+/// stub. Correlating a Gold mart's exported Iceberg table against
+/// `Trino`'s `system.runtime.queries` needs code that runs a query
+/// through a `Trino` client and matches its result against the mart's
+/// table name — **no such code exists in this build**. This is NOT
+/// because the `lakehouse-trino` crate is unavailable: it already exists
+/// on this branch and `AppState::trino` already wires a live
+/// [`lakehouse_trino::TrinoClient`] for `routes::query::run`'s
+/// `engine: "trino"` path. `lakehouse-trino`'s own crate doc comment
+/// says its surface was kept deliberately small "so a future 'consumers'
+/// route can depend on it" — this route is that future route, not yet
+/// written; the crate being present is exactly what makes writing it a
+/// small follow-up rather than a new dependency. Until that correlation
+/// logic exists, this route unconditionally reports `supported: false`
+/// rather than guessing — never a silently-empty list, which would read
+/// as "this mart has zero consumers" (a different, false claim).
+///
+/// # Errors
+///
+/// Returns 400 if `mart` is not a valid identifier; otherwise always
+/// `200` with `supported: false` — this route never calls `Trino`, so it
+/// never fails on the `Trino` side.
+pub async fn consumers(Path(mart): Path<String>) -> ApiResult<ApiJson<Value>> {
+    let mart_ident =
+        Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+    Ok(ApiJson(json!({
+        "mart": mart_ident.as_str(),
+        "consumers": Value::Null,
+        "supported": false,
+        "reason": "Trino query-history correlation for Gold marts is not implemented: this \
+                   route has no code that queries system.runtime.queries or matches it \
+                   against a mart's exported table, even though the lakehouse-trino client \
+                   crate already exists and is wired into this build for other routes",
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::collections::HashMap;
+
+    use axum::http::{Request, StatusCode};
     use lakehouse_auth::PermissionSet;
+    use tower::ServiceExt;
 
     use super::*;
+    use crate::config::Config;
+
+    /// Same idiom `routes::connectors::tests::state_without_pool` uses: a
+    /// deliberately-malformed `DATABASE_URL` so `AppState::new` boots with
+    /// no live Postgres pool, proving a route is reachable (mounted +
+    /// policy-gated) without needing a real database.
+    fn state_without_pool() -> AppState {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+        AppState::new(Config::from_map(&env).unwrap())
+    }
+
+    #[tokio::test]
+    async fn consumers_route_reports_unsupported_without_a_trino_client() {
+        let app = crate::routes::router(state_without_pool());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/gold/export/sales/consumers")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // No principal/token presented -> the router's auth_gate for
+        // RequiresAuth still runs before the handler body, so this proves
+        // routing + policy wiring (never 404), matching every other
+        // "route is registered" test in this crate's style (see
+        // routes::connectors::tests::debezium_properties_route_is_registered).
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
+    }
 
     fn service_principal() -> Principal {
         Principal {

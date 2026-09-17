@@ -382,6 +382,7 @@ pub fn router(state: AppState) -> Router {
             get(gold::read_back).post(gold::export),
         )
         .route("/api/gold/exports", get(gold::exports))
+        .route("/api/gold/export/{mart}/consumers", get(gold::consumers))
         .route("/api/query/run", axum::routing::post(query::run))
         .route("/api/query/estimate", axum::routing::post(query::estimate))
         .route("/api/query/saved", get(query::list_saved))
