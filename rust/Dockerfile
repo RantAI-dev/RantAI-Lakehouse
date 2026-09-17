@@ -39,6 +39,30 @@ WORKDIR /app
 COPY --from=builder /build/target/release/lakehouse-api /usr/local/bin/lakehouse-api
 COPY --from=builder /usr/local/cargo/bin/sqlx /usr/local/bin/sqlx
 COPY migrations ./migrations
+# WS4 (grand plan §6): the API image carries a read-only copy of the
+# Dagster code location's own source, so GET /api/pipelines/{id}/source
+# can serve real op source text without a runtime call back into Dagster
+# (which has no "give me this file's text" GraphQL field) or a shared
+# volume between two independently-deployed images. Copied from the
+# `pipeline_src` ADDITIONAL build context (docker-compose.yml's
+# `additional_contexts: { pipeline_src: ./dagster/dispar_orchestrate }`),
+# never from the primary `./rust` context above — the primary context is
+# deliberately never widened to the repository root, since the untracked,
+# developer-owned `.dockerignore` excludes `rust`/`docs`/`*.md` and would
+# break every existing COPY the moment the context became `.`, and a
+# repo-root context with NO `.dockerignore` present at all (a clean
+# checkout) would instead pull in `.git`, `node_modules`, and everything
+# else unbounded.
+COPY --from=pipeline_src . /opt/pipeline-src/dispar_orchestrate
+# Same convention `dagster/Dockerfile` already uses (WS4 item B1): the
+# commit this image was built from, read by `crate::pipeline_source::
+# check_commit` via `AppState`/`Config::git_sha` to refuse serving source
+# text that cannot be verified against the running Dagster code location's
+# own declared commit. Default "unknown" so a bare `docker build .` (no
+# --build-arg) still succeeds; `check_commit` treats "unknown" on either
+# side as unverifiable, never a fabricated match.
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
 # The built-in "Main" dashboard's shipped tile catalog (WS6,
 # lakehouse-bi::specs). Deployments opt in by setting
 # BUILTIN_DASHBOARD_SPEC=/app/specs/builtin-default.json; unset means no

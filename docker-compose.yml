@@ -81,6 +81,20 @@ services:
     build:
       context: ./rust
       dockerfile: Dockerfile
+      # WS4 item C2 — the source tree `GET /api/pipelines/{id}/source`
+      # serves from, baked into the image via a SECOND, independent build
+      # context rather than widening `context` above to the repository
+      # root (judge review V8: the untracked, developer-owned
+      # `.dockerignore` excludes `rust`/`docs`/`*.md` and would break
+      # every `COPY rust/...` a `context: .` change would require; a
+      # clean checkout with NO `.dockerignore` at all would instead send
+      # the ENTIRE repository — `.git`, `node_modules`, every
+      # workstream's checkout — as build context, unbounded). Neither
+      # `context` nor `dockerfile` above changes at all.
+      additional_contexts:
+        pipeline_src: ./dagster/dispar_orchestrate
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     ports:
       - "${API_HOST_PORT:-8080}:8080"
     depends_on:

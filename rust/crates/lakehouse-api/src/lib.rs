@@ -39,6 +39,7 @@ pub mod json;
 pub mod lakehouse_catalog;
 pub mod lakekeeper_token;
 pub mod next_run;
+pub mod pipeline_source;
 pub mod policy;
 pub mod policy_engine;
 pub mod routes;

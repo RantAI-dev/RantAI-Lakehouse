@@ -1,6 +1,7 @@
 //! Shared application state, threaded into every axum handler via
 //! [`axum::extract::State`].
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use lakehouse_auth::{
@@ -144,6 +145,16 @@ pub struct AppState {
     /// `services` tile or `/api/ops/services` read past the window always
     /// re-probes. `None` until the first read.
     pub health_cache: crate::health::HealthCache,
+    /// The allowlist [`crate::pipeline_source::build_allowlist`] walked
+    /// ONCE at startup from `PIPELINE_SOURCE_DIR` (default
+    /// `/opt/pipeline-src/dispar_orchestrate` — `rust/Dockerfile`'s `COPY
+    /// --from=pipeline_src`, WS4 item C2) — empty (never a panic) when
+    /// that directory doesn't exist, e.g. a dev environment without the
+    /// baked tree, in which case every `GET /api/pipelines/{id}/source`
+    /// request 404s honestly rather than the process failing to boot.
+    /// `Arc`, not rebuilt per request: the code location tree this image
+    /// ships is fixed for the image's lifetime.
+    pub pipeline_source_allowlist: Arc<crate::pipeline_source::SourceAllowlist>,
 }
 
 /// The credential-suffix `secretRef` PATTERNS (see
@@ -310,6 +321,28 @@ impl AppState {
             max_rows: config.trino_max_rows,
             ..TrinoConfig::new(config.trino_url.clone())
         });
+        // `PIPELINE_SOURCE_DIR` — default `/opt/pipeline-src/dispar_orchestrate`,
+        // `rust/Dockerfile`'s `COPY --from=pipeline_src`, WS4 item C2. A
+        // dev environment without the baked tree degrades to an empty
+        // allowlist (every `/source` request then 404s, honestly, rather
+        // than the process failing to boot at all).
+        let pipeline_source_base = std::env::var("PIPELINE_SOURCE_DIR").map_or_else(
+            |_| PathBuf::from("/opt/pipeline-src/dispar_orchestrate"),
+            PathBuf::from,
+        );
+        let pipeline_source_allowlist = match crate::pipeline_source::build_allowlist(
+            &pipeline_source_base,
+        ) {
+            Ok(allowlist) => allowlist,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    path = %pipeline_source_base.display(),
+                    "pipeline source tree not found or unreadable; GET /api/pipelines/{{id}}/source will 404 for every op"
+                );
+                crate::pipeline_source::SourceAllowlist::new()
+            }
+        };
         Self {
             config: Arc::new(config),
             clickhouse,
@@ -330,6 +363,7 @@ impl AppState {
             bronze_stats_cache: Arc::new(BronzeStatsCache::new()),
             trino: Arc::new(trino),
             health_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            pipeline_source_allowlist: Arc::new(pipeline_source_allowlist),
         }
     }
 }

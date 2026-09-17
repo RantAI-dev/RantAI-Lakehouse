@@ -117,6 +117,12 @@ async-trait = { workspace = true }
 # deterministic budget/timeout tests (WS2 §4) — a real `sleep` would make
 # those tests slow and, at the margins, flaky.
 tokio = { workspace = true, features = ["test-util"] }
+# `pipeline_source.rs`'s tests (WS4 item C2) exercise the allowlist builder
+# against a real filesystem (a real `..`/absolute-path/symlink escape must
+# actually resolve to a file outside a real base directory to prove
+# anything, not a string containing those characters) — a real `TempDir`
+# per test, auto-removed on drop, never a fixed shared path.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

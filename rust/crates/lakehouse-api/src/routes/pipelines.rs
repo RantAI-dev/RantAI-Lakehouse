@@ -8,7 +8,7 @@
 
 use axum::Extension;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
@@ -312,6 +312,95 @@ async fn authored_detail(state: &AppState, id: &str) -> Response {
         );
     }
     (StatusCode::OK, ApiJson(body)).into_response()
+}
+
+/// `GET /api/pipelines/{id}/source?op=<sourceRef>` — read-only op source
+/// text (WS4 item C2, grand plan §6's path-traversal risk item). `id` is
+/// accepted but not otherwise used to scope the lookup — the allowlist is
+/// global to the one code location this API image ships alongside
+/// (`crate::state::AppState::pipeline_source_allowlist`); it is kept in
+/// the path for contract symmetry with the other three new routes and
+/// because a future multi-code-location deployment would need it.
+///
+/// # Security
+///
+/// `op` is CALLER-SUPPLIED, hostile input. It is never concatenated into a
+/// filesystem path: `crate::pipeline_source::read_source` resolves the
+/// file half through a pre-built [`crate::pipeline_source::SourceAllowlist`]
+/// (an exact-key `HashMap` lookup), so a `..`, absolute path, symlink
+/// escape, or encoded variant simply never matches a key and is refused
+/// before any `std::fs` call touches it. `commit` provenance is checked
+/// against a FRESH `job_graph` call's own `commit` metadata — NEVER from a
+/// `commit` query parameter (which would be exactly as caller-controllable
+/// as `op` itself, and so exactly as untrustworthy).
+///
+/// # Errors
+///
+/// 400 if `op` is missing; 409 if `op` does not name any real op in the
+/// job's current graph (its `commit` is then unknowable — see below — never
+/// silently 404'd, since "op unknown" and "commit unverifiable" would
+/// otherwise be indistinguishable to a caller) or if a real op's own
+/// `commit` metadata does not match this image's `GIT_SHA`
+/// (`crate::pipeline_source::check_commit`); 404 if the commit check
+/// passes but `sourceRef` is still not in the allowlist or its function is
+/// not found within it; 503 if the `Dagster` `job_graph` lookup itself
+/// fails.
+pub async fn source(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<SourceQuery>,
+) -> Response {
+    let Some(op_ref) = params.op else {
+        return (
+            StatusCode::BAD_REQUEST,
+            ApiJson(json!({ "error": "missing ?op=" })),
+        )
+            .into_response();
+    };
+    let graph = match state.dagster.job_graph(&id).await {
+        Ok(g) => g,
+        Err(err) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiJson(json!({ "error": js_error(err) })),
+            )
+                .into_response();
+        }
+    };
+    let op_commit = graph
+        .ops
+        .iter()
+        .find(|o| o.source_ref.as_deref() == Some(op_ref.as_str()))
+        .and_then(|o| o.commit.as_deref());
+    if let Err(err) = crate::pipeline_source::check_commit(op_commit, &state.config.git_sha) {
+        return (
+            StatusCode::CONFLICT,
+            ApiJson(json!({ "error": err.to_string() })),
+        )
+            .into_response();
+    }
+    match crate::pipeline_source::read_source(&state.pipeline_source_allowlist, &op_ref) {
+        Ok(text) => (
+            StatusCode::OK,
+            ApiJson(json!({
+                "sourceRef": op_ref,
+                "commit": state.config.git_sha,
+                "language": "python",
+                "text": text,
+            })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            ApiJson(json!({ "error": "source not available for this build" })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SourceQuery {
+    op: Option<String>,
 }
 
 fn run_to_json(r: &DgRun, pipeline_id: &str) -> Value {
@@ -1523,6 +1612,258 @@ mod tests {
             // row genuinely doesn't exist) -- both are honest, neither is
             // 200.
             assert_ne!(response.status(), StatusCode::OK);
+        }
+    }
+
+    /// WS4 item C2 — `GET /api/pipelines/{id}/source?op=`, exercised end to
+    /// end: a real `tempdir()`-backed allowlist (never a mocked path check)
+    /// plus `wiremock` standing in for the `job_graph` call `check_commit`
+    /// reads `commit` metadata from.
+    mod source_route {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use crate::config::Config;
+        use crate::pipeline_source;
+        use crate::state::AppState;
+
+        use super::*;
+
+        fn state_with_dagster_and_source(server_uri: &str, base: &std::path::Path) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DAGSTER_URL".to_owned(), format!("{server_uri}/graphql"));
+            let config = Config::from_map(&env).expect("a valid test Config");
+            let mut state = AppState::new(config);
+            let allowlist = pipeline_source::build_allowlist(base).expect("build_allowlist");
+            state.pipeline_source_allowlist = Arc::new(allowlist);
+            state
+        }
+
+        #[tokio::test]
+        async fn pipeline_source_route_400s_when_op_is_missing() {
+            let server = wiremock::MockServer::start().await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state = state_with_dagster_and_source(&server.uri(), dir.path());
+            let response = source(
+                State(state),
+                Path("bronze_maintenance_job".to_owned()),
+                Query(SourceQuery { op: None }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn pipeline_source_route_404s_on_unknown_op_after_commit_passes() {
+            let server = wiremock::MockServer::start().await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join("assets.py"), "def real_fn():\n    pass\n")
+                .expect("write");
+            let op_ref = "dispar_orchestrate/assets.py::not_a_real_fn";
+            wiremock::Mock::given(wiremock::matchers::body_string_contains("pipelineOrError"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineOrError": { "__typename": "Pipeline", "solidHandles": [
+                        { "solid": { "name": "an_op", "definition": { "description": null,
+                            "metadata": [
+                                { "key": "source_ref", "value": op_ref },
+                                { "key": "commit", "value": "real-sha" },
+                            ] }, "inputs": [] } }
+                    ] } }
+                })))
+                .mount(&server)
+                .await;
+            let state = state_with_dagster_and_source(&server.uri(), dir.path());
+            // This image's own GIT_SHA must match the op's declared commit
+            // for the request to reach the allowlist check at all.
+            let mut state = state;
+            state.config = Arc::new({
+                let mut env = HashMap::new();
+                env.insert("GIT_SHA".to_owned(), "real-sha".to_owned());
+                Config::from_map(&env).expect("a valid test Config")
+            });
+            let response = source(
+                State(state),
+                Path("bronze_maintenance_job".to_owned()),
+                Query(SourceQuery {
+                    op: Some(op_ref.to_owned()),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn pipeline_source_route_409s_on_commit_mismatch() {
+            let server = wiremock::MockServer::start().await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join("assets.py"), "def real_fn():\n    pass\n")
+                .expect("write");
+            let op_ref = "dispar_orchestrate/assets.py::real_fn";
+            wiremock::Mock::given(wiremock::matchers::body_string_contains("pipelineOrError"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineOrError": { "__typename": "Pipeline", "solidHandles": [
+                        { "solid": { "name": "an_op", "definition": { "description": null,
+                            "metadata": [
+                                { "key": "source_ref", "value": op_ref },
+                                { "key": "commit", "value": "op-built-from-this-sha" },
+                            ] }, "inputs": [] } }
+                    ] } }
+                })))
+                .mount(&server)
+                .await;
+            let mut state = state_with_dagster_and_source(&server.uri(), dir.path());
+            let mut env = HashMap::new();
+            env.insert(
+                "GIT_SHA".to_owned(),
+                "this-image-was-built-from-a-different-sha".to_owned(),
+            );
+            state.config = Arc::new(Config::from_map(&env).expect("a valid test Config"));
+            let response = source(
+                State(state),
+                Path("bronze_maintenance_job".to_owned()),
+                Query(SourceQuery {
+                    op: Some(op_ref.to_owned()),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+        }
+
+        /// **The exact V1 regression**: both `commit` and `GIT_SHA` at the
+        /// build-time placeholder `"unknown"` must still refuse — a naive
+        /// `==` comparison would treat this as "verified," when in truth
+        /// NEITHER image's real commit is known.
+        #[tokio::test]
+        async fn pipeline_source_route_409s_when_both_commits_are_the_unknown_placeholder() {
+            let server = wiremock::MockServer::start().await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join("assets.py"), "def real_fn():\n    pass\n")
+                .expect("write");
+            let op_ref = "dispar_orchestrate/assets.py::real_fn";
+            wiremock::Mock::given(wiremock::matchers::body_string_contains("pipelineOrError"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineOrError": { "__typename": "Pipeline", "solidHandles": [
+                        { "solid": { "name": "an_op", "definition": { "description": null,
+                            "metadata": [
+                                { "key": "source_ref", "value": op_ref },
+                                { "key": "commit", "value": "unknown" },
+                            ] }, "inputs": [] } }
+                    ] } }
+                })))
+                .mount(&server)
+                .await;
+            // GIT_SHA is left unset -> Config::from_map defaults it to
+            // "unknown" too (config.rs: `or_default(env, "GIT_SHA",
+            // "unknown")`).
+            let state = state_with_dagster_and_source(&server.uri(), dir.path());
+            assert_eq!(state.config.git_sha, "unknown");
+            let response = source(
+                State(state),
+                Path("bronze_maintenance_job".to_owned()),
+                Query(SourceQuery {
+                    op: Some(op_ref.to_owned()),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&body).expect("valid JSON");
+            assert_eq!(
+                v["error"], "source provenance is unavailable for this build",
+                "the UnverifiableProvenance message, never a fabricated match"
+            );
+        }
+
+        #[tokio::test]
+        async fn pipeline_source_route_200s_and_returns_text_for_a_real_allowlisted_op() {
+            let server = wiremock::MockServer::start().await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(
+                dir.path().join("assets.py"),
+                "def ingest_bronze_table():\n    return 1\n",
+            )
+            .expect("write");
+            let op_ref = "dispar_orchestrate/assets.py::ingest_bronze_table";
+            wiremock::Mock::given(wiremock::matchers::body_string_contains("pipelineOrError"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineOrError": { "__typename": "Pipeline", "solidHandles": [
+                        { "solid": { "name": "an_op", "definition": { "description": null,
+                            "metadata": [
+                                { "key": "source_ref", "value": op_ref },
+                                { "key": "commit", "value": "real-sha-abc123" },
+                            ] }, "inputs": [] } }
+                    ] } }
+                })))
+                .mount(&server)
+                .await;
+            let mut state = state_with_dagster_and_source(&server.uri(), dir.path());
+            let mut env = HashMap::new();
+            env.insert("GIT_SHA".to_owned(), "real-sha-abc123".to_owned());
+            state.config = Arc::new(Config::from_map(&env).expect("a valid test Config"));
+            let response = source(
+                State(state),
+                Path("bronze_maintenance_job".to_owned()),
+                Query(SourceQuery {
+                    op: Some(op_ref.to_owned()),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&body).expect("valid JSON");
+            assert!(
+                v["text"]
+                    .as_str()
+                    .expect("text field")
+                    .contains("def ingest_bronze_table")
+            );
+            assert_eq!(v["commit"], "real-sha-abc123");
+        }
+
+        /// A real, live traversal attempt through the actual HTTP handler
+        /// (not just `pipeline_source`'s own unit tests): a `sourceRef`
+        /// claiming `../secret.py::x`, even when `Dagster` itself reports
+        /// it as the op's `source_ref` (a compromised/malicious code
+        /// location) and the commit matches, must still 404 — the
+        /// allowlist has no such key.
+        #[tokio::test]
+        async fn pipeline_source_route_refuses_a_traversal_reported_by_dagster_itself() {
+            let server = wiremock::MockServer::start().await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(dir.path().join("assets.py"), "x = 1\n").expect("write");
+            let parent = dir.path().parent().expect("tempdir has a parent");
+            std::fs::write(parent.join("secret.py"), "SECRET = 1\n").expect("write");
+            let op_ref = "../secret.py::x";
+            wiremock::Mock::given(wiremock::matchers::body_string_contains("pipelineOrError"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineOrError": { "__typename": "Pipeline", "solidHandles": [
+                        { "solid": { "name": "an_op", "definition": { "description": null,
+                            "metadata": [
+                                { "key": "source_ref", "value": op_ref },
+                                { "key": "commit", "value": "real-sha-abc123" },
+                            ] }, "inputs": [] } }
+                    ] } }
+                })))
+                .mount(&server)
+                .await;
+            let mut state = state_with_dagster_and_source(&server.uri(), dir.path());
+            let mut env = HashMap::new();
+            env.insert("GIT_SHA".to_owned(), "real-sha-abc123".to_owned());
+            state.config = Arc::new(Config::from_map(&env).expect("a valid test Config"));
+            let response = source(
+                State(state),
+                Path("bronze_maintenance_job".to_owned()),
+                Query(SourceQuery {
+                    op: Some(op_ref.to_owned()),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let _ = std::fs::remove_file(parent.join("secret.py"));
         }
     }
 

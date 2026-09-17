@@ -416,6 +416,17 @@ pub struct Config {
     /// "unset means unprobed, not unhealthy" posture as
     /// [`Self::trino_health_url`].
     pub openfga_url: Option<String>,
+    /// The commit this image was built from — `rust/Dockerfile`'s `ARG
+    /// GIT_SHA=unknown` / `ENV GIT_SHA=${GIT_SHA}` pair (WS4 item C2), the
+    /// same convention `dagster/Dockerfile` already uses for the code
+    /// location image. Compared against an op's own `commit` metadata by
+    /// `crate::pipeline_source::check_commit` to decide whether
+    /// `GET /api/pipelines/{id}/source?op=` may honestly claim "this is
+    /// the code that ran" — default `"unknown"` (not an `Option`: an
+    /// unset `GIT_SHA` is a real, comparable value here, and
+    /// `check_commit` already treats the literal `"unknown"` as
+    /// unverifiable on either side).
+    pub git_sha: String,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -539,6 +550,7 @@ impl std::fmt::Debug for Config {
             .field("trino_max_rows", &self.trino_max_rows)
             .field("trino_health_url", &self.trino_health_url)
             .field("openfga_url", &self.openfga_url)
+            .field("git_sha", &self.git_sha)
             .finish()
     }
 }
@@ -729,6 +741,7 @@ impl Config {
             trino_max_rows: parse_u64_or_default(env, "TRINO_MAX_ROWS", 10_000) as usize,
             trino_health_url: truthy(env, "TRINO_URL"),
             openfga_url: truthy(env, "OPENFGA_URL"),
+            git_sha: or_default(env, "GIT_SHA", "unknown"),
         })
     }
 
