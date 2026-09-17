@@ -6,19 +6,22 @@
 //! `src/app/api/pipelines/[id]/runs/route.ts`, and
 //! `src/app/api/pipelines/[id]/trigger/route.ts`.
 
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_dagster::{DgClient, DgError, DgJob, DgRun, iso_from_unix_seconds, map_run_status};
 use lakehouse_store::PgPool;
+use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::pipelines::{self, CreatePipelineInput};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 
-use crate::error::ApiResult;
+use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::routes::support::js_error;
 use crate::state::AppState;
@@ -200,13 +203,78 @@ fn cost_units(start: Option<f64>, end: Option<f64>) -> i64 {
     }
 }
 
+/// The `NewAuditEvent` [`trigger`]/[`create`]/[`pause`]/[`resume`] each
+/// write on success — a pure, unit-tested helper (WS5 item D4), mirroring
+/// `routes::connectors::connector_audit_event`'s pattern:
+/// `resource_kind: "pipeline"` paired with the pipeline/job's own id is
+/// this task's own choice (T16's fixed scope covers query history,
+/// approvals, and connector detail only — not these two sites, per the
+/// Phase D preamble). `outcome` is always `"executed"`: every call site
+/// below only calls this on ITS OWN success path, so there is no failure
+/// outcome for this helper to encode.
+///
+/// `principal_kind` comes from [`Principal::kind_for_audit`], never
+/// [`Principal::provider`] — same CHECK this crate's other audit sites
+/// satisfy.
+fn pipeline_audit_event(principal: &Principal, action: &str, pipeline_id: &str) -> NewAuditEvent {
+    NewAuditEvent {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        action: action.to_owned(),
+        resource_kind: Some("pipeline".to_owned()),
+        resource_id: Some(pipeline_id.to_owned()),
+        args: None,
+        outcome: "executed".to_owned(),
+        detail: None,
+        run_id: None,
+        approval_id: None,
+        session_id: None,
+    }
+}
+
+/// Best-effort `pipeline_audit_event` insert — log and continue on `Err`,
+/// same non-fatal posture as `routes::connectors`'s call sites: a failed
+/// audit write must never turn an already-succeeded pipeline action into
+/// an error response.
+async fn record_pipeline_audit(state: &AppState, principal: &Principal, action: &str, id: &str) {
+    let Some(pool) = state.pg.as_deref() else {
+        return;
+    };
+    let event = pipeline_audit_event(principal, action, id);
+    if let Err(err) = store_audit::insert(pool, event).await {
+        tracing::warn!(%err, action, pipeline_id = id, "failed to record pipeline audit event");
+    }
+}
+
 /// `POST /api/pipelines/{id}/trigger` — launch a new run of job `id`.
 ///
 /// This mutates live infrastructure (starts a real `Dagster`/`ClickHouse`
 /// pipeline run) and is therefore exercised only via the
 /// `pipeline-trigger-bad-id` corpus entry, which targets a job name that
 /// does not exist so `Dagster` rejects the launch instead of starting one.
-pub async fn trigger(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+///
+/// `principal` is `Option<Extension<Principal>>`, not a bare
+/// `Extension<Principal>`, even though the mounted route always supplies
+/// one (`pipeline:write`, `crate::policy::POLICY_TABLE`):
+/// `routes::ai::tools::pipelines::trigger_pipeline` calls this handler
+/// directly, bypassing that middleware, for the copilot's own
+/// `trigger_pipeline` tool — same shape as `routes::connectors::create`
+/// (WS5 item D3).
+///
+/// # Errors
+///
+/// Returns a 401 [`Response`] (not a propagated [`ApiError`] — this
+/// handler predates `ApiResult` and stays bare-`Response`-returning, like
+/// [`pause`]/[`resume`]) if no principal is present.
+pub async fn trigger(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(Extension(principal)) = principal else {
+        return ApiRejection(ApiError::unauthorized()).into_response();
+    };
     match state.dagster.launch_run(&id).await {
         Ok(outcome) => {
             if let Some(error) = outcome.error {
@@ -216,6 +284,7 @@ pub async fn trigger(State(state): State<AppState>, Path(id): Path<String>) -> R
                 )
                     .into_response();
             }
+            record_pipeline_audit(&state, &principal, "pipeline.trigger", &id).await;
             let body = json!({
                 "id": outcome.run_id,
                 "pipelineId": id,
@@ -314,6 +383,7 @@ pub struct CreatePipelineBody {
 /// 409 if the name is taken; 503/500 as above.
 pub async fn create(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<pipelines::Pipeline>)> {
     let body: CreatePipelineBody = parse_body(&body)?;
@@ -336,6 +406,12 @@ pub async fn create(
         owner: body.owner,
     };
     let created = pipelines::create_pipeline(pool(&state)?, &input).await?;
+    // WS5 item D4: best-effort, never turns a successful create into an
+    // error. `create` has no internal (copilot tool) caller today
+    // (confirmed by grepping `routes::ai::tools::pipelines` before adding
+    // this parameter), so `Extension<Principal>`, not `Option`, matches
+    // `pipeline:write`'s own `RequiresPermission` guarantee exactly.
+    record_pipeline_audit(&state, &principal, "pipeline.create", &created.id).await;
     Ok((StatusCode::CREATED, ApiJson(created)))
 }
 
@@ -569,17 +645,48 @@ pub async fn set_status_route(
 /// backing job) or a real `Dagster` job (pauses its first schedule, if
 /// any).
 ///
+/// `principal` is `Option<Extension<Principal>>` — see [`trigger`]'s doc
+/// comment; `routes::ai::tools::pipelines::pause_pipeline` calls this
+/// handler directly, bypassing `crate::policy::auth_gate`.
+///
 /// # Errors
 ///
-/// 404 if `id` is unknown (or names a job with no schedule to pause); 503
-/// as above.
-pub async fn pause(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    set_pipeline_paused(&state, &id, true).await
+/// 401 if no principal is present; 404 if `id` is unknown (or names a job
+/// with no schedule to pause); 503 as above.
+pub async fn pause(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(Extension(principal)) = principal else {
+        return ApiRejection(ApiError::unauthorized()).into_response();
+    };
+    let response = set_pipeline_paused(&state, &id, true).await;
+    if response.status().is_success() {
+        record_pipeline_audit(&state, &principal, "pipeline.pause", &id).await;
+    }
+    response
 }
 
-/// `POST /api/pipelines/{id}/resume` — the inverse of [`pause`].
-pub async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    set_pipeline_paused(&state, &id, false).await
+/// `POST /api/pipelines/{id}/resume` — the inverse of [`pause`]. See its
+/// doc comment for the `Option<Extension<Principal>>` shape.
+///
+/// # Errors
+///
+/// 401 if no principal is present; 404/503 as [`pause`].
+pub async fn resume(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(Extension(principal)) = principal else {
+        return ApiRejection(ApiError::unauthorized()).into_response();
+    };
+    let response = set_pipeline_paused(&state, &id, false).await;
+    if response.status().is_success() {
+        record_pipeline_audit(&state, &principal, "pipeline.resume", &id).await;
+    }
+    response
 }
 
 async fn set_pipeline_paused(state: &AppState, id: &str, paused: bool) -> Response {
@@ -795,9 +902,66 @@ fn dagster_mutation_failure(error: Option<String>) -> Response {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use lakehouse_auth::{PermissionSet, PrincipalId};
     use lakehouse_dagster::{DgSchedule, DgScheduleState};
+    use uuid::Uuid;
 
     use super::*;
+
+    /// A logged-in human principal — mirrors `routes::query`/
+    /// `routes::agents`/`routes::connectors`'s own test fixture of the
+    /// same name.
+    pub(super) fn fixture_user_principal() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(1)),
+            tenant_ids: Vec::new(),
+            display_name: "Rina Wijaya".to_owned(),
+            permissions: PermissionSet::parse("pipeline:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+        }
+    }
+
+    /// A service-token principal — `PrincipalId::Service`.
+    fn fixture_service_principal() -> Principal {
+        Principal {
+            id: PrincipalId::Service(Uuid::from_u128(2)),
+            tenant_ids: Vec::new(),
+            display_name: "dagster-orchestrator".to_owned(),
+            permissions: PermissionSet::parse("pipeline:write"),
+            provider: "service".to_owned(),
+            must_change_password: false,
+        }
+    }
+
+    /// WS5 item D4, failing-test-first: `pipeline_audit_event` did not
+    /// exist before this task; referencing it below failed to compile
+    /// with `cannot find function pipeline_audit_event in this scope`
+    /// (confirmed by checking out the pre-fix file and running this test
+    /// before adding the helper).
+    #[test]
+    fn pipeline_audit_event_pairs_with_pipeline_resource_kind() {
+        let principal = fixture_user_principal();
+        let event = pipeline_audit_event(&principal, "pipeline.trigger", "job-1");
+        assert_eq!(event.principal_kind.as_deref(), Some("user"));
+        assert_eq!(
+            event.principal_id.as_deref(),
+            Some(principal.id.uuid().to_string().as_str())
+        );
+        assert_eq!(event.resource_kind.as_deref(), Some("pipeline"));
+        assert_eq!(event.resource_id.as_deref(), Some("job-1"));
+        assert_eq!(event.action, "pipeline.trigger");
+        assert_eq!(event.outcome, "executed");
+    }
+
+    /// A service identity's pipeline action must record `principal_kind:
+    /// "service"`, never `"user"`.
+    #[test]
+    fn pipeline_audit_event_records_a_service_identity_as_service_not_user() {
+        let principal = fixture_service_principal();
+        let event = pipeline_audit_event(&principal, "pipeline.pause", "job-1");
+        assert_eq!(event.principal_kind.as_deref(), Some("service"));
+    }
 
     fn run(job_name: &str, status: &str, start: Option<f64>, end: Option<f64>) -> DgRun {
         DgRun {
@@ -1030,6 +1194,7 @@ mod tests {
         use crate::state::AppState;
 
         use super::super::*;
+        use super::fixture_user_principal;
 
         fn database_url_for(pool: &sqlx::PgPool) -> String {
             let options = pool.connect_options();
@@ -1075,7 +1240,9 @@ mod tests {
                 .expect("serialize"),
             );
 
-            let err = create(State(state), body).await.unwrap_err();
+            let err = create(State(state), Extension(fixture_user_principal()), body)
+                .await
+                .unwrap_err();
             assert_eq!(err.0.status(), 400);
             let message = err.0.to_string();
             assert!(
@@ -1160,9 +1327,13 @@ mod tests {
                 }))
                 .expect("serialize"),
             );
-            let (_, ApiJson(pipeline)) = create(State(state.clone()), body)
-                .await
-                .expect("create should succeed");
+            let (_, ApiJson(pipeline)) = create(
+                State(state.clone()),
+                Extension(fixture_user_principal()),
+                body,
+            )
+            .await
+            .expect("create should succeed");
             pipeline
         }
 

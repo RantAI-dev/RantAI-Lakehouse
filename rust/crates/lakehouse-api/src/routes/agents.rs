@@ -708,6 +708,37 @@ fn principal_for_run_auth(auth: &RunAuth) -> Option<&Principal> {
     }
 }
 
+/// The `(trigger, principal_id, principal_kind, actor)` tuple
+/// [`run_employee`] passes to [`agents::create_run`] and every
+/// [`write_headless_audit`] call for this run — a pure, unit-tested
+/// function (WS5 item D4), extracted from what used to be an inline
+/// `match` in [`run_employee`] itself.
+///
+/// **Bug found and fixed while extracting this (confirmed by reading the
+/// inline `match` before touching it):** `RunAuth::Principal(p)` used to
+/// hardcode `principal_kind: "user"` unconditionally. `check_employee_run_auth`
+/// accepts ANY authenticated principal holding `agent:manage` — human or
+/// service identity alike, see that function's own doc comment — so a
+/// service identity manually triggering a run (not the `RunAuth::Token`
+/// schedule path, which already correctly used `"schedule"`) was
+/// mis-recorded as a human's. [`Principal::kind_for_audit`] is the fix,
+/// same as WS5 item D2's `decide_approval` bug: never a literal, always
+/// derived from `PrincipalId`'s variant.
+fn run_employee_audit_identity(
+    auth: &RunAuth,
+    employee_name: &str,
+) -> (&'static str, Option<String>, &'static str, String) {
+    match auth {
+        RunAuth::Token => ("schedule", None, "schedule", employee_name.to_owned()),
+        RunAuth::Principal(p) => (
+            "manual",
+            Some(p.id.uuid().to_string()),
+            p.kind_for_audit(),
+            p.display_name.clone(),
+        ),
+    }
+}
+
 /// The `POST /api/agents/employees/{id}/run` auth guard: EITHER a valid
 /// `x-run-token` matching [`crate::config::Config::agent_run_token`], OR an
 /// authenticated principal holding `agent:manage` — see the module-level
@@ -1356,16 +1387,8 @@ pub async fn run_employee(
         .into());
     };
 
-    let (trigger, principal_id, principal_kind, actor): (&str, Option<String>, &str, String) =
-        match &auth {
-            RunAuth::Token => ("schedule", None, "schedule", config.name.clone()),
-            RunAuth::Principal(p) => (
-                "manual",
-                Some(p.id.uuid().to_string()),
-                "user",
-                p.display_name.clone(),
-            ),
-        };
+    let (trigger, principal_id, principal_kind, actor) =
+        run_employee_audit_identity(&auth, &config.name);
     let principal = principal_for_run_auth(&auth);
 
     let run_id = format!("run-emp-{}", Uuid::new_v4());
@@ -1551,6 +1574,55 @@ mod tests {
             None,
         );
         assert_eq!(event.principal_kind.as_deref(), Some("service"));
+    }
+
+    /// WS5 item D4, failing-test-first: `run_employee_audit_identity`
+    /// (extracted from an inline `match` in `run_employee`) used to
+    /// hardcode `"user"` for EVERY `RunAuth::Principal`, human or
+    /// service identity alike — `check_employee_run_auth` accepts any
+    /// authenticated principal holding `agent:manage`, not only humans
+    /// (confirmed by reading that function before touching this). Quoted
+    /// failure, before the extraction: this exact assertion
+    /// (`principal_kind == "service"` for a service `RunAuth::Principal`)
+    /// could not even be written against the old inline `match`, since
+    /// there was no unit-testable function to call — the closest thing
+    /// to a red state this refactor-and-fix has.
+    #[test]
+    fn run_employee_audit_identity_records_a_service_identity_as_service_not_user() {
+        let principal = fixture_service_principal();
+        let (trigger, principal_id, principal_kind, actor) =
+            run_employee_audit_identity(&RunAuth::Principal(principal.clone()), "emp-name");
+        assert_eq!(trigger, "manual");
+        assert_eq!(
+            principal_id.as_deref(),
+            Some(principal.id.uuid().to_string().as_str())
+        );
+        assert_eq!(principal_kind, "service");
+        assert_eq!(actor, "dagster-orchestrator");
+    }
+
+    /// A human `RunAuth::Principal` still records `principal_kind: "user"`
+    /// — this fix changes the service case, not the (already correct)
+    /// human one.
+    #[test]
+    fn run_employee_audit_identity_records_a_human_principal_as_user() {
+        let principal = fixture_user_principal();
+        let (_, _, principal_kind, _) =
+            run_employee_audit_identity(&RunAuth::Principal(principal), "emp-name");
+        assert_eq!(principal_kind, "user");
+    }
+
+    /// A schedule-triggered run (no principal at all) still records
+    /// `principal_kind: "schedule"` and uses the employee's own name as
+    /// `actor` — unaffected by this fix.
+    #[test]
+    fn run_employee_audit_identity_records_a_token_trigger_as_schedule() {
+        let (trigger, principal_id, principal_kind, actor) =
+            run_employee_audit_identity(&RunAuth::Token, "Nightly Ingest Bot");
+        assert_eq!(trigger, "schedule");
+        assert_eq!(principal_id, None);
+        assert_eq!(principal_kind, "schedule");
+        assert_eq!(actor, "Nightly Ingest Bot");
     }
 
     /// D (T3.2's fix): `create_employee` must validate `mode` the same way

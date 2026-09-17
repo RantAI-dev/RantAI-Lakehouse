@@ -13,7 +13,9 @@
 
 use serde_json::{Map, Value, json};
 
+use axum::Extension;
 use axum::extract::{Path, State};
+use lakehouse_auth::Principal;
 
 use super::{arg_str, response_to_value};
 use crate::state::AppState;
@@ -94,12 +96,27 @@ pub(super) async fn list_pipeline_runs(state: &AppState, args: &Map<String, Valu
     response_to_value(crate::routes::pipelines::runs(State(state.clone()), Path(id)).await).await
 }
 
-pub(super) async fn trigger_pipeline(state: &AppState, args: &Map<String, Value>) -> Value {
+/// `principal` is forwarded as `Option<Extension<Principal>>` — the same
+/// re-wrapping `routes::ai::tools::connectors::create_connector` already
+/// does for `routes::connectors::create` (WS5 item D3/D4): this internal
+/// call bypasses axum's auth middleware, so `routes::pipelines::trigger`
+/// (which now writes a real `pipeline.trigger` `audit_event` under the real
+/// principal) gets the SAME `Principal` the copilot dispatcher was
+/// handed, and 401s honestly when there is none.
+pub(super) async fn trigger_pipeline(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id wajib diisi" });
     }
-    response_to_value(crate::routes::pipelines::trigger(State(state.clone()), Path(id)).await).await
+    let extension = principal.cloned().map(Extension);
+    response_to_value(
+        crate::routes::pipelines::trigger(State(state.clone()), extension, Path(id)).await,
+    )
+    .await
 }
 
 pub(super) async fn retry_pipeline_run(state: &AppState, args: &Map<String, Value>) -> Value {
@@ -111,20 +128,36 @@ pub(super) async fn retry_pipeline_run(state: &AppState, args: &Map<String, Valu
         .await
 }
 
-pub(super) async fn pause_pipeline(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn pause_pipeline(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id wajib diisi" });
     }
-    response_to_value(crate::routes::pipelines::pause(State(state.clone()), Path(id)).await).await
+    let extension = principal.cloned().map(Extension);
+    response_to_value(
+        crate::routes::pipelines::pause(State(state.clone()), extension, Path(id)).await,
+    )
+    .await
 }
 
-pub(super) async fn resume_pipeline(state: &AppState, args: &Map<String, Value>) -> Value {
+pub(super) async fn resume_pipeline(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id wajib diisi" });
     }
-    response_to_value(crate::routes::pipelines::resume(State(state.clone()), Path(id)).await).await
+    let extension = principal.cloned().map(Extension);
+    response_to_value(
+        crate::routes::pipelines::resume(State(state.clone()), extension, Path(id)).await,
+    )
+    .await
 }
 
 pub(super) async fn cancel_pipeline_run(state: &AppState, args: &Map<String, Value>) -> Value {
@@ -159,15 +192,15 @@ mod t1_3_tests {
             json!({ "error": "id wajib diisi" })
         );
         assert_eq!(
-            trigger_pipeline(&s, &Map::new()).await,
+            trigger_pipeline(&s, None, &Map::new()).await,
             json!({ "error": "id wajib diisi" })
         );
         assert_eq!(
-            pause_pipeline(&s, &Map::new()).await,
+            pause_pipeline(&s, None, &Map::new()).await,
             json!({ "error": "id wajib diisi" })
         );
         assert_eq!(
-            resume_pipeline(&s, &Map::new()).await,
+            resume_pipeline(&s, None, &Map::new()).await,
             json!({ "error": "id wajib diisi" })
         );
         assert_eq!(
