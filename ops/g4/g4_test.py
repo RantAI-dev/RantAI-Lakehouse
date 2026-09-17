@@ -57,6 +57,72 @@ LAKEKEEPER_WAREHOUSE = os.environ.get("LAKEKEEPER_WAREHOUSE", "default")
 CH_OAUTH_CLIENT_ID = os.environ.get("CH_OAUTH_CLIENT_ID", "")
 CH_OAUTH_SERVER_URI = os.environ.get("CH_OAUTH_SERVER_URI", "")
 
+# Duplicated from ops/g3a/g3a_test.py's step_login/API session — g4_test.py
+# has no shared package with g3a_test.py to import this from (each g*
+# gate script is a standalone entrypoint), matching this file's existing
+# precedent of duplicating ch_query/_wait_for from the same source.
+API_URL = os.environ.get("API_URL", "http://lakehouse-api:8089")
+DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://dagster-webserver:3000/graphql")
+AUTH_EMAIL = os.environ.get("AUTH_BOOTSTRAP_EMAIL", "admin@example.invalid")
+AUTH_PASSWORD = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "changeme")
+ALERTS_RUN_TOKEN = os.environ.get("ALERTS_RUN_TOKEN", "")
+
+API = requests.Session()
+
+
+def step_login() -> None:
+    """Every `/api/*` route this step calls (`/api/alerts`, `/api/overview/
+    alerts`, `/api/overview/alerts/{id}/silence`) is `Policy::RequiresAuth`
+    or stricter (`policy.rs`, confirmed) — log in as the bootstrap admin
+    and let `API` carry the session cookie, exactly as
+    `ops/g3a/g3a_test.py::step_login` already does for the identical
+    reason."""
+    login = API.post(f"{API_URL}/api/auth/login", json={"email": AUTH_EMAIL, "password": AUTH_PASSWORD}, timeout=10)
+    if not login.ok:
+        raise G4Failure(f"login failed: {login.status_code} {login.text}")
+    if login.json().get("mustChangePassword"):
+        rotated = API.post(f"{API_URL}/api/auth/change-password", json={"newPassword": AUTH_PASSWORD}, timeout=10)
+        if not rotated.ok:
+            raise G4Failure(f"forced password rotation failed: {rotated.status_code} {rotated.text}")
+        relogin = API.post(f"{API_URL}/api/auth/login", json={"email": AUTH_EMAIL, "password": AUTH_PASSWORD}, timeout=10)
+        if not relogin.ok:
+            raise G4Failure(f"re-login after rotation failed: {relogin.status_code} {relogin.text}")
+    print("[g4] logged in as bootstrap admin")
+
+
+WAL_ALERT_RULE_ID = "al_g4_p5cdc_wal"
+
+
+def step_seed_wal_alert_rule() -> None:
+    """An ordinary `AlertKind::Alert` rule against `serving.
+    replication_slot_health` — WAL-slot health needs no new alert kind
+    (WS5 plan review Y4); `replication_metrics.py`'s own module doc names
+    this exact rule shape (`mart = replication_slot_health`, `measure =
+    unhealthy`). `console.alert_rule` is a `ReplacingMergeTree` keyed on
+    `id` (`lakehouse-alerts::ensure`), so re-`POST`ing the same id every
+    run is a correct, idempotent upsert, not a conditional "if missing"
+    check."""
+    resp = API.post(
+        f"{API_URL}/api/alerts",
+        json={
+            "id": WAL_ALERT_RULE_ID,
+            "name": "g4 WAL slot health",
+            "type": "alert",
+            "mart": "replication_slot_health",
+            "measure": "unhealthy",
+            "agg": "max",
+            "op": ">",
+            "threshold": 0,
+            "channel": "webhook",
+            "target": "http://127.0.0.1:1/g4-webhook-sink",
+            "severity": "critical",
+        },
+        timeout=10,
+    )
+    if not resp.ok:
+        raise G4Failure(f"failed to seed the WAL alert rule: {resp.status_code} {resp.text}")
+    print("[g4] seeded WAL alert rule (idempotent upsert)")
+
 
 def ch_auth_settings() -> str:
     if not CH_OAUTH_CLIENT_ID:
@@ -241,15 +307,151 @@ def step_verify_slot_cleanup_on_connector_delete() -> None:
     print("[g4] slot 'p5cdc_slot' no longer exists after deprovisioning — WAL is no longer pinned")
 
 
+def step_wal_breach_produces_a_silenceable_alert_instance() -> None:
+    """WS5 acceptance (grand plan §7): a WAL breach on the CDC slot
+    produces a real alert_instance row via /api/alerts/run, and that row
+    can be silenced through the API.
+
+    Breach mechanism: pause consumption by stopping the debezium-server
+    container (ops/debezium/ has exactly one script,
+    deprovision_connector.sh — confirmed this revision — which removes
+    the slot outright, so it cannot be reused here). WAL is grown with
+    ordinary UPDATEs against the five rows the compose seed already
+    inserted (docker-compose.yml:2043-2049, ids 1..5) — REPLICA IDENTITY
+    FULL means each UPDATE writes a full-row WAL image, so no new rows
+    and no primary-key collision, unlike the prior revision's INSERT loop
+    (WS5 plan review U8).
+    """
+    project = os.environ.get("G4_COMPOSE_PROJECT", "g4ci")
+    subprocess.run(["docker", "compose", "-p", project, "stop", "debezium-server"], check=True)
+    try:
+        for i in range(2000):
+            pg_exec(f"UPDATE p5_cdc.orders SET amount = amount + 0.01 WHERE id = {(i % 5) + 1};")
+        # replication_metrics_job writes lake.bronze_meta.replication_slot
+        # on its own 15-minute schedule (replication_metrics.py:451,
+        # cron_schedule="*/15 * * * *") — run it once, out of band, via
+        # Dagster's launchRun mutation so this gate does not wait 15
+        # minutes for a fresh row.
+        launch = requests.post(
+            DAGSTER_URL,
+            json={
+                "query": "mutation($job:String!){ launchRun(executionParams:{selector:{repositoryLocationName:\"dispar_orchestrate\",repositoryName:\"__repository__\",jobName:$job}, runConfigData:\"{}\"}){ __typename ... on LaunchRunSuccess { run { id } } ... on PythonError { message } } }",
+                "variables": {"job": "replication_metrics_job"},
+            },
+            timeout=30,
+        )
+        launch.raise_for_status()
+        launched = launch.json().get("data", {}).get("launchRun", {})
+        if launched.get("__typename") != "LaunchRunSuccess":
+            raise G4Failure(f"failed to launch replication_metrics_job: {launch.text}")
+        time.sleep(10)  # let the job write its row before evaluating rules
+
+        run_resp = API.post(
+            f"{API_URL}/api/alerts/run",
+            headers={"x-run-token": ALERTS_RUN_TOKEN} if ALERTS_RUN_TOKEN else {},
+            timeout=30,
+        )
+        run_resp.raise_for_status()
+        results = run_resp.json()["results"]
+        fired = next((r for r in results if r.get("id") == WAL_ALERT_RULE_ID and r.get("fired")), None)
+        if fired is None:
+            raise G4Failure(f"expected a fired result for {WAL_ALERT_RULE_ID}, got: {results}")
+
+        alerts_resp = API.get(f"{API_URL}/api/overview/alerts", timeout=10)
+        alerts_resp.raise_for_status()
+        # Match the instance produced by THIS rule specifically — not
+        # "any open alert" (WS5 plan review U8), since other rules may
+        # also be open in a shared CI environment.
+        open_alert = next(
+            (a for a in alerts_resp.json() if a["status"] == "open" and a.get("ruleId") == WAL_ALERT_RULE_ID),
+            None,
+        )
+        if open_alert is None:
+            raise G4Failure(f"no open alert_instance row for {WAL_ALERT_RULE_ID} after a fired WAL breach")
+        if open_alert.get("severity") != "critical":
+            raise G4Failure(
+                f"expected the fired instance's severity to be copied verbatim from the seeded "
+                f"rule's severity ('critical'), got: {open_alert.get('severity')!r}"
+            )
+
+        # The 15-minute dedup holds (insert_from_fired_rule's `fired_at >
+        # now - 15min` check, independent of silence -- the rule is not
+        # yet silenced at this point): a second /api/alerts/run call while
+        # the breach is still ongoing must NOT insert a second
+        # alert_instance row for this rule, even though the rule still
+        # fires on every evaluation.
+        dedup_run_resp = API.post(
+            f"{API_URL}/api/alerts/run",
+            headers={"x-run-token": ALERTS_RUN_TOKEN} if ALERTS_RUN_TOKEN else {},
+            timeout=30,
+        )
+        dedup_run_resp.raise_for_status()
+        alerts_after_dedup_run = API.get(f"{API_URL}/api/overview/alerts", timeout=10)
+        alerts_after_dedup_run.raise_for_status()
+        instances_for_rule_after_dedup = [
+            a for a in alerts_after_dedup_run.json() if a.get("ruleId") == WAL_ALERT_RULE_ID
+        ]
+        if len(instances_for_rule_after_dedup) != 1:
+            raise G4Failure(
+                f"expected exactly one alert_instance row for {WAL_ALERT_RULE_ID} within the "
+                f"15-minute dedup window, got {len(instances_for_rule_after_dedup)}: "
+                f"{instances_for_rule_after_dedup}"
+            )
+
+        silence_resp = API.post(
+            f"{API_URL}/api/overview/alerts/{open_alert['id']}/silence",
+            json={"untilMinutes": 60},
+            timeout=10,
+        )
+        if silence_resp.status_code != 200 or not silence_resp.json().get("silencedUntil"):
+            raise G4Failure(f"silence did not return a populated silencedUntil: {silence_resp.text}")
+
+        # Silencing suppresses the next insert (and, per
+        # `deliver_unless_silenced`/`persist_fired_results`, the next
+        # delivery too -- both check the same `SilenceSource`): re-running
+        # /api/alerts/run now that the instance is silenced must not
+        # produce a new OPEN row for this rule (the existing row moved to
+        # "acknowledged" when it was silenced, and stays there). This gate
+        # has no webhook receiver to inspect delivery directly (no HTTP
+        # surface exists to prove a webhook was NOT sent), so delivery
+        # suppression is asserted by code reference here, not measured --
+        # what IS externally observable, and asserted below, is that no
+        # second open instance appears.
+        rerun_resp = API.post(
+            f"{API_URL}/api/alerts/run",
+            headers={"x-run-token": ALERTS_RUN_TOKEN} if ALERTS_RUN_TOKEN else {},
+            timeout=30,
+        )
+        rerun_resp.raise_for_status()
+        alerts_after_rerun = API.get(f"{API_URL}/api/overview/alerts", timeout=10)
+        alerts_after_rerun.raise_for_status()
+        instances_for_rule = [
+            a for a in alerts_after_rerun.json() if a.get("ruleId") == WAL_ALERT_RULE_ID
+        ]
+        open_after_rerun = [a for a in instances_for_rule if a["status"] == "open"]
+        if open_after_rerun:
+            raise G4Failure(
+                f"a re-run of /api/alerts/run after silencing produced a new open "
+                f"instance for {WAL_ALERT_RULE_ID} (dedup/silence-suppression did not "
+                f"hold): {open_after_rerun}"
+            )
+        print("[g4] WAL breach produced a fired, silenceable alert_instance row; re-run after silence stayed suppressed")
+    finally:
+        subprocess.run(["docker", "compose", "-p", project, "start", "debezium-server"], check=True)
+
+
 def main() -> int:
     try:
         step_wait_for_services()
+        step_login()
+        step_seed_wal_alert_rule()
         step_create_catalog_database()
         step_wait_for_table_registered()
         order_id, _ = step_insert_visible_within_budget()
         step_update_visible_within_budget(order_id)
         step_delete_visible_within_budget(order_id)
         step_row_counts_use_a_where_predicate()
+        step_wal_breach_produces_a_silenceable_alert_instance()
         step_verify_slot_cleanup_on_connector_delete()
     except G4Failure as exc:
         print(f"[g4] FAILED: {exc}", file=sys.stderr)
