@@ -85,6 +85,13 @@ async fn main() -> anyhow::Result<()> {
     // happens when it's unset.
     bootstrap_lakehouse_maintenance_service(&state).await;
 
+    // WS3 item 28 (plan review X7): same shape, for Dagster's ingest
+    // schedule factory (`dagster/dispar_orchestrate`'s ingest_job/
+    // ingest_schedules), from `INGEST_SERVICE_TOKEN` — see
+    // `bootstrap_ingest_run_service`'s doc comment for what happens when
+    // it's unset, and why this identity is scoped to `ingest:read` only.
+    bootstrap_ingest_run_service(&state).await;
+
     let app = routes::router(state);
 
     let addr = format!("0.0.0.0:{port}");
@@ -195,6 +202,15 @@ const ALERTS_RUN_SERVICE_IDENTITY_NAME: &str = "alerts-run-scheduler";
 /// this one is not a `-run-scheduler`: it authenticates a read of the
 /// maintenance policy list, not a scheduled run trigger.
 const LAKEHOUSE_MAINTENANCE_SERVICE_IDENTITY_NAME: &str = "lakehouse-maintenance-policy-reader";
+
+/// Fixed name of the service identity [`bootstrap_ingest_run_service`]
+/// provisions — same `<domain>-<role>` naming as
+/// [`LAKEHOUSE_MAINTENANCE_SERVICE_IDENTITY_NAME`]: this identity reads,
+/// it does not run a schedule trigger itself (the ingest job is triggered
+/// per-connector by `POST /api/connectors/{id}/ingest/run`, which a human
+/// or `agent:manage`/`connector:manage` principal calls — not this
+/// identity).
+const INGEST_SERVICE_IDENTITY_NAME: &str = "ingest-run-service";
 
 /// Idempotently seed the ONE service identity + credential that lets
 /// Dagster's digital-employee schedule factory
@@ -355,11 +371,46 @@ async fn bootstrap_lakehouse_maintenance_service(state: &AppState) {
     .await;
 }
 
+/// Lets `dagster/dispar_orchestrate`'s ingest schedule factory
+/// authenticate against `GET /api/connectors/ingestible`'s
+/// `Policy::RequiresPermission("ingest:read")` and a CDC connector's
+/// `dial` read (`ops/debezium/render_compose.py`'s caller), from
+/// [`Config::ingest_service_token`] — the exact same `auth_gate`-floor
+/// problem [`bootstrap_agent_run_service`]/[`bootstrap_alerts_run_service`]/
+/// [`bootstrap_lakehouse_maintenance_service`] solve for their own
+/// callers, reusing the identical mechanism rather than a fourth,
+/// near-duplicate implementation.
+///
+/// # Why this identity is scoped to `ingest:read` ONLY (WS3 plan review X7)
+///
+/// This caller reads connector rows (`GET /api/connectors/ingestible`,
+/// `routes::connectors::list_ingestible`) and a CDC connector's `dial`
+/// (`ops/debezium/render_compose.py`) — it never creates, updates, or
+/// deletes a connector.
+/// `connector:manage` would be a STRICTLY BROADER grant than this caller
+/// ever needs: a leaked `INGEST_SERVICE_TOKEN` would then also let its
+/// holder create, edit, or delete connectors, not just list and read the
+/// ones already there. `ingest:read` is exactly what
+/// `routes::connectors::list_ingestible` (and every other route this
+/// identity calls) checks — nothing broader, never `connector:manage`,
+/// never `*:*`.
+async fn bootstrap_ingest_run_service(state: &AppState) {
+    bootstrap_service_run_identity(
+        state,
+        state.config.ingest_service_token.clone(),
+        INGEST_SERVICE_IDENTITY_NAME,
+        vec!["ingest:read".to_owned()],
+        "INGEST_SERVICE_TOKEN",
+    )
+    .await;
+}
+
 /// Idempotently seed ONE service identity + credential that lets a
 /// Dagster job authenticate against a token-guarded, `RequiresAuth`
 /// route — the shared core [`bootstrap_agent_run_service`],
-/// [`bootstrap_alerts_run_service`], and
-/// [`bootstrap_lakehouse_maintenance_service`] all call. See
+/// [`bootstrap_alerts_run_service`],
+/// [`bootstrap_lakehouse_maintenance_service`], and
+/// [`bootstrap_ingest_run_service`] all call. See
 /// [`bootstrap_agent_run_service`]'s doc comment for the full "why this
 /// exists at all" rationale — every caller hits the identical `auth_gate`
 /// floor problem, on `POST /api/agents/employees/{id}/run`,
@@ -1109,6 +1160,83 @@ mod tests {
             let pool = state.pg.as_deref().expect("pg pool configured");
             assert_eq!(lakehouse_maintenance_identity_row_count(pool).await, 0);
             assert_eq!(lakehouse_maintenance_credential_row_count(pool).await, 0);
+        }
+
+        async fn ingest_identity_row_count(pool: &sqlx::PgPool) -> i64 {
+            let (count,): (i64,) =
+                sqlx::query_as("SELECT count(*) FROM service_identity WHERE name = $1")
+                    .bind(INGEST_SERVICE_IDENTITY_NAME)
+                    .fetch_one(pool)
+                    .await
+                    .expect("count service_identity rows");
+            count
+        }
+
+        async fn ingest_credential_row_count(pool: &sqlx::PgPool) -> i64 {
+            let (count,): (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM service_credential sc \
+                 JOIN service_identity si ON si.id = sc.service_identity_id \
+                 WHERE si.name = $1",
+            )
+            .bind(INGEST_SERVICE_IDENTITY_NAME)
+            .fetch_one(pool)
+            .await
+            .expect("count service_credential rows");
+            count
+        }
+
+        /// With `INGEST_SERVICE_TOKEN` set, boot seeds exactly one identity
+        /// scoped to `ingest:read` ONLY (WS3 plan review X7) and one
+        /// matching credential; the token authenticates a real principal
+        /// that holds `ingest:read` but NOT `connector:manage` — proving
+        /// [`bootstrap_service_run_identity`] behaves identically for this
+        /// caller while honoring X7's narrower scope decision.
+        #[tokio::test]
+        async fn bootstrap_ingest_run_service_seeds_identity_and_credential() {
+            let mut overrides = HashMap::new();
+            overrides.insert(
+                "INGEST_SERVICE_TOKEN".to_owned(),
+                "unit-test-ingest-token".to_owned(),
+            );
+            let state = fresh_state(&overrides).await;
+
+            bootstrap_ingest_run_service(&state).await;
+
+            let pool = state.pg.as_deref().expect("pg pool configured");
+            assert_eq!(ingest_identity_row_count(pool).await, 1);
+            assert_eq!(ingest_credential_row_count(pool).await, 1);
+
+            let (scopes,): (Vec<String>,) =
+                sqlx::query_as("SELECT scopes FROM service_identity WHERE name = $1")
+                    .bind(INGEST_SERVICE_IDENTITY_NAME)
+                    .fetch_one(pool)
+                    .await
+                    .expect("read the seeded identity's scopes");
+            assert_eq!(scopes, vec!["ingest:read".to_owned()]);
+
+            let principal = lakehouse_auth::service_token::verify_service_token(
+                pool,
+                &lakehouse_auth::Secret::new("unit-test-ingest-token".to_owned()),
+            )
+            .await
+            .expect("the configured token must authenticate a real service principal");
+            assert!(principal.permissions.has("ingest:read"));
+            assert!(!principal.permissions.has("connector:manage"));
+        }
+
+        /// With `INGEST_SERVICE_TOKEN` unset, bootstrap creates nothing at
+        /// all — no identity, no credential — same posture as
+        /// [`bootstrap_lakehouse_maintenance_service`] when its own token
+        /// is unset.
+        #[tokio::test]
+        async fn bootstrap_ingest_run_service_creates_nothing_when_token_is_unset() {
+            let state = fresh_state(&HashMap::new()).await;
+
+            bootstrap_ingest_run_service(&state).await;
+
+            let pool = state.pg.as_deref().expect("pg pool configured");
+            assert_eq!(ingest_identity_row_count(pool).await, 0);
+            assert_eq!(ingest_credential_row_count(pool).await, 0);
         }
     }
 }

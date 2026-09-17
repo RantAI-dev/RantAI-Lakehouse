@@ -364,6 +364,14 @@ pub struct Config {
     /// it — see `main::bootstrap_lakehouse_maintenance_service`'s doc
     /// comment for why no scopes are granted.
     pub lakehouse_maintenance_token: Option<String>,
+    /// Shared token Dagster's `ingest_job` (`dagster/dispar_orchestrate`'s
+    /// ingest schedule factory) uses to authenticate against
+    /// `GET /api/connectors/ingestible` and a CDC connector's `dial`.
+    /// `None` when unset. When set, `lakehouse-api` also seeds a service
+    /// identity scoped to `ingest:read` ONLY from it — see
+    /// `main::bootstrap_ingest_run_service`'s doc comment for why that
+    /// scope, and no broader one, is granted.
+    pub ingest_service_token: Option<String>,
     /// Base URL of the `Trino` coordinator `routes::query::run` talks to
     /// for `engine: "trino"` requests (WS2 §4). Not a secret — an internal
     /// service address, like [`Self::ch_url`] — so it's printed verbatim
@@ -388,6 +396,13 @@ impl std::fmt::Debug for Config {
     /// Renders every field verbatim except the secret ones, which are
     /// rendered as `"<redacted>"` regardless of whether they're set — see
     /// the type-level doc comment for why this can't be `#[derive(Debug)]`.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one flat field->render mapping, one line per Config \
+                  field, same shape (and same non-reason to split) as \
+                  Config::from_map above -- WS3 item 28 added \
+                  ingest_service_token, pushing this over the line count"
+    )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Config")
             .field("ch_url", &self.ch_url)
@@ -482,6 +497,10 @@ impl std::fmt::Debug for Config {
             .field(
                 "lakehouse_maintenance_token",
                 &self.lakehouse_maintenance_token.as_ref().map(|_| REDACTED),
+            )
+            .field(
+                "ingest_service_token",
+                &self.ingest_service_token.as_ref().map(|_| REDACTED),
             )
             .field("trino_url", &self.trino_url)
             .field("trino_max_rows", &self.trino_max_rows)
@@ -663,6 +682,7 @@ impl Config {
             gold_export_batch_size: parse_u64_or_default(env, "GOLD_EXPORT_BATCH_SIZE", 20_000),
             agent_run_token: truthy(env, "AGENT_RUN_TOKEN"),
             lakehouse_maintenance_token: truthy(env, "LAKEHOUSE_MAINTENANCE_TOKEN"),
+            ingest_service_token: truthy(env, "INGEST_SERVICE_TOKEN"),
             trino_url: or_default(env, "TRINO_URL", "http://trino:8080"),
             #[allow(
                 clippy::cast_possible_truncation,
@@ -795,6 +815,7 @@ mod tests {
         assert_eq!(cfg.gold_export_batch_size, 20_000);
         assert_eq!(cfg.agent_run_token, None);
         assert_eq!(cfg.lakehouse_maintenance_token, None);
+        assert_eq!(cfg.ingest_service_token, None);
         assert_eq!(cfg.trino_url, "http://trino:8080");
         assert_eq!(cfg.trino_max_rows, 10_000);
         // Safe-by-default: SSRF blocking is ON unless explicitly disabled.

@@ -160,6 +160,18 @@ services:
       # bootstrap seeds nothing and the maintenance job's policy fetch
       # fails visibly (401) rather than silently.
       LAKEHOUSE_MAINTENANCE_TOKEN: ${LAKEHOUSE_MAINTENANCE_TOKEN:-}
+      # WS3 item 28 (plan review X7) — same shape again —
+      # `main::bootstrap_ingest_run_service` seeds an "ingest-run-service"
+      # service identity scoped to `ingest:read` ONLY (never
+      # `connector:manage`) from this value, which is what lets Dagster's
+      # ingest schedule factory's `Authorization: Bearer
+      # <INGEST_SERVICE_TOKEN>` clear `GET /api/connectors/ingestible`'s
+      # `Policy::RequiresPermission("ingest:read")` floor — must match
+      # `dagster-code-location`'s own `INGEST_SERVICE_TOKEN`. Left unset by
+      # default, in which case bootstrap seeds nothing and the ingest
+      # schedule factory's connector fetch fails visibly (401) rather than
+      # silently.
+      INGEST_SERVICE_TOKEN: ${INGEST_SERVICE_TOKEN:-}
       # WS2 §4 — base URL for `routes::query::run`'s `engine: "trino"` path
       # (`lakehouse-trino`'s `/v1/statement` client). An internal service
       # address, not a credential, so a default is fine here — the `trino`
@@ -1478,6 +1490,17 @@ services:
       # no identity and the maintenance job's policy fetch fails visibly
       # (401), never silently.
       LAKEHOUSE_MAINTENANCE_TOKEN: ${LAKEHOUSE_MAINTENANCE_TOKEN:-}
+      # WS3 item 28 (plan review X7) — `ingest_factory.py`'s ingest
+      # schedule factory: the shared token it sends as `Authorization:
+      # Bearer` to `GET /api/connectors/ingestible` and a CDC connector's
+      # `dial` (to authenticate as the `ingest-run-service` service
+      # identity `lakehouse-api`'s `main::bootstrap_ingest_run_service`
+      # seeds from this same value, scoped to `ingest:read` ONLY) — must
+      # match `lakehouse-api`'s own `INGEST_SERVICE_TOKEN`, same
+      # single-`.env`-value reasoning `AGENT_RUN_TOKEN` documents above.
+      # With this unset, the API seeds no identity and the ingest schedule
+      # factory's connector fetch fails visibly (401), never silently.
+      INGEST_SERVICE_TOKEN: ${INGEST_SERVICE_TOKEN:-}
       # WS2 §4 — `maintenance.py`'s own `/v1/statement` client
       # (`_trino_execute`, a deliberate duplicate of `lakehouse-trino`'s
       # polling loop: this job runs outside the Rust binary) for the
