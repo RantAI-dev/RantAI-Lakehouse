@@ -10,6 +10,7 @@ import type {
   CreatePolicyInput,
   CreateQualityRuleInput,
   CreateClassificationRuleInput,
+  DatasetSla,
 } from "../contracts/governance";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
@@ -57,6 +58,23 @@ async function post<T>(url: string, body: unknown, signal?: AbortSignal): Promis
   return json as T;
 }
 
+// WS5 item E1 (judge amendment 2): the plan's `putDatasetSla` calls a
+// `put` helper this file never had — only `get`/`post` existed. Mirrors
+// `post` exactly (same `apiFetch` usage, same `errorFor` mapping) rather
+// than routing a real PUT through `post`'s method string, which would
+// ship a 405 against `PUT /api/governance/sla`.
+async function put<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
+  const res = await apiFetch(url, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  });
+  const json = await res.json().catch(() => null);
+  if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to save governance");
+  return json as T;
+}
+
 export const clickhouseGovernanceService: GovernanceService = {
   async listQuality(signal) {
     return (await get<{ quality: QualityRule[] }>("/api/governance/quality", signal)).quality;
@@ -92,5 +110,11 @@ export const clickhouseGovernanceService: GovernanceService = {
   },
   createClassificationRule(input: CreateClassificationRuleInput, signal) {
     return post<ClassificationRule>("/api/governance/classification", input, signal);
+  },
+  listDatasetSla(signal) {
+    return get<DatasetSla[]>("/api/governance/sla", signal);
+  },
+  putDatasetSla(input: DatasetSla, signal) {
+    return put<DatasetSla>("/api/governance/sla", input, signal);
   },
 };

@@ -143,6 +143,17 @@ export type ReplicationSlot = {
   status: "ok" | "warning" | "critical" | string
 }
 
+/**
+ * A per-table freshness expectation, authored by an operator and read by
+ * the Overview "Freshness" strip (WS5 item E2) and `lakehouse-alerts`'s
+ * `Freshness` rule kind (item C1). `GET`/`PUT /api/governance/sla`.
+ */
+export type DatasetSla = {
+  tableName: string
+  expectedIntervalMinutes: number
+  owner?: string
+}
+
 export interface GovernanceService {
   listPolicies(signal?: AbortSignal): Promise<Policy[]>
   listClassifications(signal?: AbortSignal): Promise<ClassificationRule[]>
@@ -162,4 +173,8 @@ export interface GovernanceService {
     input: CreateClassificationRuleInput,
     signal?: AbortSignal
   ): Promise<ClassificationRule>
+  /** Every authored dataset freshness SLA — `GET /api/governance/sla`. */
+  listDatasetSla(signal?: AbortSignal): Promise<DatasetSla[]>
+  /** Author or replace one table's freshness SLA — `PUT /api/governance/sla`. */
+  putDatasetSla(input: DatasetSla, signal?: AbortSignal): Promise<DatasetSla>
 }

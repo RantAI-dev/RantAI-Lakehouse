@@ -183,6 +183,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/governance/ingest-runs", Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/governance/policies",  Policy::RequiresPermission("policy:read")),
     ("POST", "/api/governance/policies",  Policy::RequiresPermission("policy:write")),
+    // WS5 item E1 (Y6): per-table freshness SLA. `governance:write` is the
+    // existing grant `0030_table_maintenance_policy.sql` already gives the
+    // `Governance Admin` role (not re-granted here) — same permission the
+    // Iceberg maintenance write above uses.
+    ("GET",  "/api/governance/sla",       Policy::RequiresPermission("policy:read")),
+    ("PUT",  "/api/governance/sla",       Policy::RequiresPermission("governance:write")),
     ("GET",  "/api/governance/{kind}",    Policy::RequiresAuth),
     ("POST", "/api/governance/{kind}",    Policy::RequiresAuth),
 

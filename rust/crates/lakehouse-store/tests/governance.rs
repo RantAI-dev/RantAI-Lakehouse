@@ -25,9 +25,10 @@ use lakehouse_test_support as _;
 use lakehouse_store::StoreError;
 use lakehouse_store::governance::{
     CreateClassificationRuleInput, CreatePolicyInput, CreateQualityRuleInput,
-    CreateResidencyRuleInput, create_classification_rule, create_policy, create_quality_rule,
-    create_residency_rule, list_classification_rules, list_policies, list_quality_rules,
-    list_residency_rules,
+    CreateResidencyRuleInput, DatasetSla, create_classification_rule, create_policy,
+    create_quality_rule, create_residency_rule, expected_interval_minutes_for,
+    list_classification_rules, list_dataset_sla, list_policies, list_quality_rules,
+    list_residency_rules, upsert_dataset_sla,
 };
 use sqlx::PgPool;
 
@@ -281,5 +282,90 @@ async fn seed_is_idempotent_when_applied_twice(pool: PgPool) -> sqlx::Result<()>
         .fetch_one(&pool)
         .await?;
     assert_eq!(count.0, 2);
+    Ok(())
+}
+
+// ── Dataset SLA (WS5 item E1, Y6) ────────────────────────────────────────
+
+/// No SLA authored for a table yet -> `None`, and the table starts empty
+/// (no seed for `dataset_sla`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn expected_interval_minutes_for_is_none_with_no_authored_row(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    assert!(list_dataset_sla(&pool).await.unwrap().is_empty());
+    let interval = expected_interval_minutes_for(&pool, "gold.orders")
+        .await
+        .unwrap();
+    assert_eq!(interval, None);
+    Ok(())
+}
+
+/// `upsert_dataset_sla` inserts on first call and updates in place on a
+/// second call for the same `table_name` (the `ON CONFLICT` upsert), and
+/// `list_dataset_sla`/`expected_interval_minutes_for` both see the result.
+#[sqlx::test(migrations = "../../migrations")]
+async fn upsert_dataset_sla_round_trips_insert_then_update(pool: PgPool) -> sqlx::Result<()> {
+    let created = upsert_dataset_sla(
+        &pool,
+        &DatasetSla {
+            table_name: "gold.orders".to_owned(),
+            expected_interval_minutes: 60,
+            owner: Some("Data Engineering".to_owned()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(created.expected_interval_minutes, 60);
+    assert_eq!(created.owner.as_deref(), Some("Data Engineering"));
+
+    let listed = list_dataset_sla(&pool).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].table_name, "gold.orders");
+
+    let interval = expected_interval_minutes_for(&pool, "gold.orders")
+        .await
+        .unwrap();
+    assert_eq!(interval, Some(60));
+
+    let updated = upsert_dataset_sla(
+        &pool,
+        &DatasetSla {
+            table_name: "gold.orders".to_owned(),
+            expected_interval_minutes: 30,
+            owner: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated.expected_interval_minutes, 30);
+    assert_eq!(updated.owner, None);
+    assert_eq!(
+        list_dataset_sla(&pool).await.unwrap().len(),
+        1,
+        "upsert must not duplicate the row"
+    );
+    Ok(())
+}
+
+/// The database `CHECK (expected_interval_minutes > 0)` rejects a
+/// zero-or-negative interval — this is the actual guarantee behind the
+/// route-level rejection in `routes::governance::put_sla` (WS5 plan review
+/// U12: both layers are tested, not just one).
+#[sqlx::test(migrations = "../../migrations")]
+async fn upsert_dataset_sla_rejects_a_non_positive_interval_at_the_database(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let err = upsert_dataset_sla(
+        &pool,
+        &DatasetSla {
+            table_name: "gold.orders".to_owned(),
+            expected_interval_minutes: 0,
+            owner: None,
+        },
+    )
+    .await
+    .expect_err("the CHECK constraint must reject a zero interval");
+    assert!(matches!(err, StoreError::Database(_)), "{err:?}");
     Ok(())
 }

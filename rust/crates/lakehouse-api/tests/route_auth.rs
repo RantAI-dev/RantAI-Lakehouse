@@ -570,6 +570,150 @@ async fn ingest_spec_put_rejects_a_dial_whose_host_resolves_internal() {
     );
 }
 
+// ── Dataset SLA (WS5 item E1, Y6) ────────────────────────────────────────
+
+/// A principal holding ONLY `policy:read` (not `governance:write`) may
+/// `GET /api/governance/sla` and is refused `PUT` on the same route —
+/// mirrors `ingest_read_only_principal_may_get_but_not_put_ingest_spec`'s
+/// shape: `GET`/`PUT` on one path are gated by two DIFFERENT seeded
+/// permissions, not by one permission implying the other.
+#[tokio::test]
+async fn policy_read_only_principal_may_get_but_not_put_sla() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id = create_principal_with_permissions(&pool, "policy:read").await;
+
+    let get_cookie = session_cookie_for_user(&pool, user_id).await;
+    let get_resp = request_with_cookie(&router, "GET", "/api/governance/sla", &get_cookie).await;
+    assert_ne!(
+        get_resp.status(),
+        StatusCode::FORBIDDEN,
+        "policy:read alone must be enough to GET /api/governance/sla"
+    );
+    assert_ne!(
+        get_resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a valid session must never be treated as unauthenticated"
+    );
+
+    let put_cookie = session_cookie_for_user(&pool, user_id).await;
+    let put_resp = request_with_cookie(&router, "PUT", "/api/governance/sla", &put_cookie).await;
+    assert_eq!(
+        put_resp.status(),
+        StatusCode::FORBIDDEN,
+        "policy:read alone must NOT be enough to PUT /api/governance/sla -- that would hand \
+         a read-only caller write authority"
+    );
+}
+
+/// A principal holding ONLY `governance:write` (not `policy:read`) may
+/// `PUT /api/governance/sla` and is refused `GET` on the same route — the
+/// mirror image of the test above.
+#[tokio::test]
+async fn governance_write_only_principal_may_put_but_not_get_sla() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id = create_principal_with_permissions(&pool, "governance:write").await;
+
+    let get_cookie = session_cookie_for_user(&pool, user_id).await;
+    let get_resp = request_with_cookie(&router, "GET", "/api/governance/sla", &get_cookie).await;
+    assert_eq!(
+        get_resp.status(),
+        StatusCode::FORBIDDEN,
+        "governance:write alone must NOT be enough to GET /api/governance/sla -- that is a \
+         distinct, policy:read-gated route"
+    );
+
+    let put_cookie = session_cookie_for_user(&pool, user_id).await;
+    let put_resp = request_with_cookie(&router, "PUT", "/api/governance/sla", &put_cookie).await;
+    assert_ne!(
+        put_resp.status(),
+        StatusCode::FORBIDDEN,
+        "governance:write alone must be enough to PUT /api/governance/sla"
+    );
+    assert_ne!(
+        put_resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a valid session must never be treated as unauthenticated"
+    );
+}
+
+/// # Input validation: `expectedIntervalMinutes: 0` is refused at the
+/// route, never reaching the database (WS5 plan review U12 — both layers
+/// tested, not just the store-level `CHECK` in
+/// `lakehouse-store/tests/governance.rs`).
+///
+/// `put_sla` validates the body (`validate_namespaced_table`, then the
+/// `expectedIntervalMinutes <= 0` check) BEFORE it ever calls `pool(&state)`
+/// to reach Postgres, so this is a real 400, not a database error
+/// reinterpreted as one — see `routes::governance::put_sla`'s doc comment.
+#[tokio::test]
+async fn put_sla_rejects_a_non_positive_interval_before_touching_the_database() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id = create_principal_with_permissions(&pool, "governance:write").await;
+    let cookie = session_cookie_for_user(&pool, user_id).await;
+
+    let body = serde_json::json!({
+        "tableName": "gold.orders",
+        "expectedIntervalMinutes": 0,
+    });
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/governance/sla")
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&body).expect("serialize body"),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "a zero expectedIntervalMinutes must be refused at the route, not surfaced as a \
+         500 from the database CHECK constraint"
+    );
+}
+
+/// A malformed `tableName` (no `.`, so it cannot split into
+/// `<namespace>.<table>`) is refused the same way, for the same reason.
+#[tokio::test]
+async fn put_sla_rejects_a_table_name_with_no_namespace() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id = create_principal_with_permissions(&pool, "governance:write").await;
+    let cookie = session_cookie_for_user(&pool, user_id).await;
+
+    let body = serde_json::json!({
+        "tableName": "orders",
+        "expectedIntervalMinutes": 60,
+    });
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/governance/sla")
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&body).expect("serialize body"),
+                ))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "a tableName with no <namespace>.<table> split must be refused at the route"
+    );
+}
+
 /// # Input validation: malformed body -> 400 with the `{"error": "..."}`
 /// envelope
 ///

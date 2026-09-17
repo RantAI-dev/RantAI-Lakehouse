@@ -177,6 +177,26 @@ fn lakehouse_router() -> Router<AppState> {
         .route("/api/lakehouse/capacity", get(lakehouse::capacity))
 }
 
+/// The static (non-`{kind}`) `/api/governance/*` routes, split out for the
+/// same `clippy::too_many_lines` reason as [`pipelines_router`]. Each is
+/// mounted ahead of the generic `/api/governance/{kind}` fallback in
+/// [`router`] — static segments match before captures, matching the
+/// `lineage`/`policies` precedent documented on [`router`] itself.
+fn governance_static_router() -> Router<AppState> {
+    Router::new()
+        .route("/api/governance/lineage", get(governance::lineage))
+        .route("/api/governance/ingest-runs", get(governance::ingest_runs))
+        .route(
+            "/api/governance/policies",
+            get(governance::list_policies).post(governance::create_policy),
+        )
+        // WS5 item E1 (Y6): dataset freshness SLA.
+        .route(
+            "/api/governance/sla",
+            get(governance::get_sla).put(governance::put_sla),
+        )
+}
+
 /// The `/api/overview/alerts/*` sub-router (Task 2.6), split out for the
 /// same `clippy::too_many_lines` reason as [`pipelines_router`].
 fn overview_alerts_router() -> Router<AppState> {
@@ -355,18 +375,7 @@ pub fn router(state: AppState) -> Router {
             "/api/ops/workloads/{id}/cancel",
             axum::routing::post(ops::cancel_workload),
         )
-        .route("/api/governance/lineage", get(governance::lineage))
-        .route(
-            // A dedicated route (WS3 item 17), mounted alongside `lineage`
-            // immediately above — never a seventh `{kind}` dispatch value
-            // (see `governance.rs`'s module doc comment).
-            "/api/governance/ingest-runs",
-            get(governance::ingest_runs),
-        )
-        .route(
-            "/api/governance/policies",
-            get(governance::list_policies).post(governance::create_policy),
-        )
+        .merge(governance_static_router())
         .route(
             "/api/governance/{kind}",
             get(governance::get).post(governance::create_rule),

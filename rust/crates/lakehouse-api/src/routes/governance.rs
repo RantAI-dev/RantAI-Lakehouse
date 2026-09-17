@@ -886,6 +886,91 @@ pub async fn create_residency_rule(
     Ok((StatusCode::CREATED, ApiJson(created)))
 }
 
+// ── Dataset SLA (WS5 item E1, Y6) ────────────────────────────────────────
+//
+// Mounted as literal routes ahead of the generic `/api/governance/{kind}`
+// fallback (`routes/mod.rs`, `policy.rs`), matching the existing
+// `/api/governance/lineage`/`/api/governance/policies` precedent — never a
+// seventh `{kind}` dispatch value (see this module's doc comment).
+
+/// Split `raw` on the first `.` and validate each half as a real
+/// [`lakehouse_core::ident::Ident`] — the identical validation item C1's
+/// `Freshness` rule target will apply, extracted here so both call one
+/// shared helper rather than duplicating the split-and-check logic
+/// (AGENTS.md rule 4). `Ident` only guarantees lexical safety (no SQL
+/// injection through the identifier position); `dataset_sla.table_name`
+/// is never interpolated into a query, so that guarantee is stronger than
+/// this call site strictly needs — but it is also the exact
+/// `<namespace>.<table>` shape check the route needs, and reusing it beats
+/// writing a second, weaker regex.
+fn validate_namespaced_table(raw: &str) -> Result<(), ApiError> {
+    let Some((ns, table)) = raw.split_once('.') else {
+        return Err(ApiError::BadRequest(
+            "tableName wajib berformat <namespace>.<table>.".to_owned(),
+        ));
+    };
+    if lakehouse_core::ident::Ident::new(ns).is_err()
+        || lakehouse_core::ident::Ident::new(table).is_err()
+    {
+        return Err(ApiError::BadRequest("tableName tidak valid.".to_owned()));
+    }
+    Ok(())
+}
+
+/// `GET /api/governance/sla` — every authored dataset freshness SLA.
+///
+/// # Errors
+///
+/// 503 if no pool is configured; 500 on a database failure.
+pub async fn get_sla(
+    State(state): State<AppState>,
+) -> ApiResult<ApiJson<Vec<governance::DatasetSla>>> {
+    Ok(ApiJson(governance::list_dataset_sla(pool(&state)?).await?))
+}
+
+/// The `PUT /api/governance/sla` body. Mirrors `DatasetSla`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PutDatasetSlaBody {
+    table_name: String,
+    expected_interval_minutes: i32,
+    #[serde(default)]
+    owner: Option<String>,
+}
+
+/// `PUT /api/governance/sla` — author or replace one table's freshness SLA.
+/// Gated by `governance:write` (`POLICY_TABLE`), granted to the
+/// `Governance Admin` role by `0030_table_maintenance_policy.sql` — not
+/// re-granted here.
+///
+/// # Errors
+///
+/// 400 if `tableName` is not `<namespace>.<table>` (each half a valid
+/// [`lakehouse_core::ident::Ident`]) or `expectedIntervalMinutes` is not
+/// `> 0` — the route-level half of WS5 plan review U12's defense in depth;
+/// `0037_dataset_sla.sql`'s `CHECK (expected_interval_minutes > 0)` is the
+/// guarantee this mirrors, not the other way around. 503/500 as above.
+pub async fn put_sla(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> ApiResult<ApiJson<governance::DatasetSla>> {
+    let body: PutDatasetSlaBody = parse_body(&body)?;
+    validate_namespaced_table(&body.table_name)?;
+    if body.expected_interval_minutes <= 0 {
+        return Err(ApiError::BadRequest(
+            "expectedIntervalMinutes wajib bernilai positif.".to_owned(),
+        )
+        .into());
+    }
+    let input = governance::DatasetSla {
+        table_name: body.table_name,
+        expected_interval_minutes: body.expected_interval_minutes,
+        owner: body.owner,
+    };
+    let saved = governance::upsert_dataset_sla(pool(&state)?, &input).await?;
+    Ok(ApiJson(saved))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

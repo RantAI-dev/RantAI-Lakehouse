@@ -548,6 +548,96 @@ pub async fn create_residency_rule(
     Ok(row.into())
 }
 
+// ── Dataset SLA (WS5 item E1, Y6) ────────────────────────────────────────
+
+/// A per-table freshness expectation, authored by an operator and read by
+/// the Overview "Freshness" strip and `lakehouse-alerts`'s `Freshness` rule
+/// kind (item C1). Mirrors `DatasetSla` in `contracts/governance.ts`.
+///
+/// WS5 plan review U12: `sqlx::FromRow` derived directly on the wire type
+/// (not a separate `*Row` + `From` pair, unlike [`Policy`]'s convention) —
+/// this struct's three fields already match their column names exactly
+/// with no `camelCase`/`snake_case` mismatch inside Rust
+/// (`#[serde(rename_all = "camelCase")]` only affects JSON serialization),
+/// so the extra indirection buys nothing here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct DatasetSla {
+    /// `<namespace>.<table>`, the row's natural key.
+    pub table_name: String,
+    /// Minutes within which the table is expected to receive a fresh
+    /// write. Always `> 0` — enforced by `0037_dataset_sla.sql`'s `CHECK`
+    /// and, in front of it, [`crate::routes::governance::put_sla`]'s own
+    /// validation (route-level check is this crate's caller's job, not
+    /// this module's — kept here only as a doc pointer).
+    pub expected_interval_minutes: i32,
+    /// Who owns this table's freshness SLA, if recorded.
+    pub owner: Option<String>,
+}
+
+/// List every authored dataset SLA, by table name.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn list_dataset_sla(pool: &PgPool) -> Result<Vec<DatasetSla>, StoreError> {
+    let rows: Vec<DatasetSla> = sqlx::query_as(
+        "SELECT table_name, expected_interval_minutes, owner FROM dataset_sla ORDER BY table_name",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Create or replace the SLA for `input.table_name`.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on any query failure — including the
+/// `dataset_sla_expected_interval_minutes_check` `CHECK` violation when
+/// `expected_interval_minutes <= 0` (route-level validation in
+/// `routes::governance::put_sla` rejects that input before it reaches this
+/// function in the normal request path; this is the actual guarantee, not
+/// a duplicate of it).
+pub async fn upsert_dataset_sla(
+    pool: &PgPool,
+    input: &DatasetSla,
+) -> Result<DatasetSla, StoreError> {
+    sqlx::query_as(
+        "INSERT INTO dataset_sla (table_name, expected_interval_minutes, owner) VALUES ($1, $2, $3) \
+         ON CONFLICT (table_name) DO UPDATE SET expected_interval_minutes = EXCLUDED.expected_interval_minutes, \
+         owner = EXCLUDED.owner \
+         RETURNING table_name, expected_interval_minutes, owner",
+    )
+    .bind(&input.table_name)
+    .bind(input.expected_interval_minutes)
+    .bind(&input.owner)
+    .fetch_one(pool)
+    .await
+    .map_err(StoreError::from)
+}
+
+/// The expected freshness interval for one table, or `None` if no SLA is
+/// authored for it. Used by `lakehouse-alerts`'s injected `FreshnessSource`
+/// (item C1); nothing on this branch calls it yet — that is expected for a
+/// `pub` fn establishing a library crate's API ahead of its first caller,
+/// not a reason to `#[allow(dead_code)]` it.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn expected_interval_minutes_for(
+    pool: &PgPool,
+    table_name: &str,
+) -> Result<Option<i32>, StoreError> {
+    let row: Option<(i32,)> =
+        sqlx::query_as("SELECT expected_interval_minutes FROM dataset_sla WHERE table_name = $1")
+            .bind(table_name)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(n,)| n))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
