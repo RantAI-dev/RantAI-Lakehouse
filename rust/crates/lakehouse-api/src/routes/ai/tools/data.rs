@@ -9,7 +9,11 @@ use serde_json::{Map, Value, json};
 use super::arg_str;
 use crate::routes::support::{is_numeric_type, strip_non_ident};
 
-const CATALOG_UNION: &str = "(SELECT slug,title,description,tier,table_name FROM lake.`bronze_meta.dataset_catalog` \
+// WS7 item F5: `pub(in crate::routes)` so `routes::agent::schema_context`
+// can run this SAME union query for its new Bronze catalog section,
+// rather than re-deriving an equivalent string that could drift from this
+// one.
+pub(in crate::routes) const CATALOG_UNION: &str = "(SELECT slug,title,description,tier,table_name FROM lake.`bronze_meta.dataset_catalog` \
      UNION ALL SELECT slug,title,description,tier,table_name FROM lake.`bronze_meta_sec.dataset_catalog`)";
 
 pub(super) async fn run_sql(ch: &ChClient, args: &Map<String, Value>) -> Value {

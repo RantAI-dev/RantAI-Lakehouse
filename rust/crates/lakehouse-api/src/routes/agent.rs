@@ -84,10 +84,37 @@ pub(crate) async fn schema_context(ch: &ChClient) -> Result<String, lakehouse_cl
         .map(ToOwned::to_owned)
         .collect();
 
+    // WS7 item F5: names the Bronze catalog too, not only Silver/Gold —
+    // the SAME `CATALOG_UNION` query `tools::data::list_datasets` already
+    // runs (reused, never re-derived), so the copilot can ground an
+    // answer in a raw Bronze dataset the model has otherwise never heard
+    // of (`schema_context`'s only other sections cover `serving.*` and
+    // `silver.*`).
+    let bronze_rows = ch
+        .rows(
+            &format!(
+                "SELECT slug, table_name, tier FROM {} LIMIT 40",
+                crate::routes::ai::tools::data::CATALOG_UNION
+            ),
+            None,
+        )
+        .await?;
+    let bronze: Vec<String> = bronze_rows
+        .iter()
+        .take(40)
+        .map(|r| {
+            let slug = r.get("slug").and_then(Value::as_str).unwrap_or("");
+            let table = r.get("table_name").and_then(Value::as_str).unwrap_or("");
+            let tier = r.get("tier").and_then(Value::as_str).unwrap_or("");
+            format!("{slug} (lake.`{table}`, tier={tier})")
+        })
+        .collect();
+
     Ok(format!(
-        "TABEL MART (Gold, utama untuk agregasi):\n{}\n\nTABEL SILVER (detail per dataset, akses: silver.`<nama>`):\n{}",
+        "TABEL MART (Gold, utama untuk agregasi):\n{}\n\nTABEL SILVER (detail per dataset, akses: silver.`<nama>`):\n{}\n\nTABEL BRONZE (mentah, akses: lake.`bronze_meta.dataset_catalog` untuk daftar):\n{}",
         mart_descs.join("\n"),
         silver.join(", "),
+        bronze.join(", "),
     ))
 }
 
@@ -783,5 +810,55 @@ mod tests {
         ] {
             assert!(!is_read_only_sql_text_to_sql(&format!("SELECT 1; {kw} x")));
         }
+    }
+
+    /// WS7 item F5: `schema_context` used to only ever read
+    /// `serving.mart_*`/`silver.*` — a Bronze-only dataset (never
+    /// promoted to Silver) was invisible to the model, so it could never
+    /// ground an answer about one. This proves the new third section
+    /// exists and names the Bronze tier, via the SAME `CATALOG_UNION`
+    /// query `tools::data::list_datasets` already runs.
+    #[tokio::test]
+    async fn schema_context_includes_bronze_meta_tables_not_only_marts() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains(
+                "SHOW TABLES FROM serving",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({"data": []})))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains(
+                "SHOW TABLES FROM silver",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"name": "some_silver_table"}],
+            })))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains(
+                "bronze_meta.dataset_catalog",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"slug": "dataset_x", "table_name": "dataset_x", "tier": "primer"}],
+            })))
+            .mount(&server)
+            .await;
+
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let ctx = schema_context(&ch)
+            .await
+            .expect("mocked ClickHouse responses parse");
+
+        assert!(
+            ctx.contains("BRONZE"),
+            "must name the bronze tier, not only serving.mart_*: {ctx}"
+        );
+        assert!(
+            ctx.contains("dataset_x"),
+            "must name the actual Bronze dataset: {ctx}"
+        );
     }
 }
