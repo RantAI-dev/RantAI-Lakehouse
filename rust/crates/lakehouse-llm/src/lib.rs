@@ -76,6 +76,31 @@ struct ChatResponse {
     choices: Vec<ChatChoice>,
 }
 
+/// Real token usage, when the endpoint reports it. `MiniMax`'s chat
+/// completions API is `OpenAI`-compatible and documents exactly these
+/// three fields plus a `MiniMax`-specific `total_characters` this client
+/// does not need (verified via web search against `MiniMax`'s own API
+/// documentation during WS7 planning — this repo's own `lakehouse-llm`
+/// client talks to `LLM_URL`/`LLM_KEY`, `MiniMax` by default per
+/// `docker-compose.yml`'s `LLM_URL` default and this module's own doc
+/// comment on [`LlmClient::new`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "field names mirror the provider's OpenAI-compatible usage wire \
+              format verbatim (prompt_tokens/completion_tokens/total_tokens) \
+              so #[derive(Deserialize)] needs no renames"
+)]
+pub struct Usage {
+    /// Tokens consumed by the prompt (input) side of the call.
+    pub prompt_tokens: u32,
+    /// Tokens generated in the completion (output) side of the call.
+    pub completion_tokens: u32,
+    /// `prompt_tokens + completion_tokens`, as reported by the endpoint
+    /// (not recomputed locally — the endpoint's own total is trusted).
+    pub total_tokens: u32,
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatChoice {
     message: ChatResponseMessage,
@@ -279,6 +304,25 @@ impl LlmClient {
         tools: &[Value],
         opts: ChatOptions,
     ) -> Result<LlmMessage, LlmError> {
+        Ok(self.chat_with_tools_metered(messages, tools, opts).await?.0)
+    }
+
+    /// Same as [`LlmClient::chat_with_tools`], but also returns the real
+    /// token usage the endpoint reported for this call — `None` when the
+    /// endpoint's response omits a `usage` block entirely (never a
+    /// fabricated zero; a caller that needs to accumulate budget
+    /// consumption reads this, not a guess derived from message length).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LlmError::Transport`] on a network-level failure, or
+    /// [`LlmError::Api`] when the endpoint responds with a non-2xx status.
+    pub async fn chat_with_tools_metered(
+        &self,
+        messages: &[LlmMessage],
+        tools: &[Value],
+        opts: ChatOptions,
+    ) -> Result<(LlmMessage, Option<Usage>), LlmError> {
         let body = ChatWithToolsRequest {
             model: &self.model,
             messages,
@@ -322,7 +366,10 @@ impl LlmClient {
             let stripped = strip_think_blocks(content).trim().to_owned();
             msg.content = Some(stripped);
         }
-        Ok(msg)
+        let usage = parsed
+            .get("usage")
+            .and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok());
+        Ok((msg, usage))
     }
 }
 
@@ -572,6 +619,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(msg.content.as_deref(), Some("final answer"));
+    }
+
+    #[tokio::test]
+    async fn chat_with_tools_returns_real_token_usage_when_the_endpoint_reports_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"content": "hi"}}],
+                "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
+            })))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), "m".to_owned(), "k".to_owned());
+        let (_, usage) = client
+            .chat_with_tools_metered(&[], &[], ChatOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            usage,
+            Some(Usage {
+                prompt_tokens: 120,
+                completion_tokens: 30,
+                total_tokens: 150,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_is_none_when_the_endpoint_omits_it() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"content": "hi"}}],
+            })))
+            .mount(&server)
+            .await;
+        let client = LlmClient::new(server.uri(), "m".to_owned(), "k".to_owned());
+        let (_, usage) = client
+            .chat_with_tools_metered(&[], &[], ChatOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(usage, None);
     }
 
     #[tokio::test]
