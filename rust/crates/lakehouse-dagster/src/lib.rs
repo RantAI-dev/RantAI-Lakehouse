@@ -259,6 +259,47 @@ pub struct RunStatusInfo {
     pub start_time: Option<f64>,
 }
 
+/// One asset materialization reported by a step, matching
+/// `stepStats.materializations`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StepMaterialization {
+    /// The materialized asset's key, joined with `/` (`assetKey.path` —
+    /// `Dagster` represents a key as a path segment list, e.g.
+    /// `["bronze", "orders"]`), or `None` when the event carries no key.
+    pub asset_key: Option<String>,
+    /// Row count, when the op emitted an `IntMetadataEntry` labeled
+    /// `"rows"` — `None` when it did not (most ops emit no row count at
+    /// all; inventing `0` would claim "measured zero rows" for "not
+    /// measured", WS4 item A3).
+    pub rows: Option<i64>,
+}
+
+/// One `Dagster` execution step's full detail within a run (status, timing,
+/// materializations), returned by [`DgClient::run_steps`]. Distinct from
+/// [`RunStepStatus`] (used by [`DgClient::pipeline_run_status`]), which
+/// carries only `key`/`status` — this type is for the pipeline detail
+/// view's step list, which additionally needs timing and per-step output
+/// row counts.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunStep {
+    /// The step's key (e.g. `"run_bronze_maintenance"`).
+    pub step_key: String,
+    /// The step's `Dagster` status string (e.g. `"SUCCESS"`, `"FAILURE"`),
+    /// reported verbatim like [`RunStatusInfo::status`].
+    pub status: String,
+    /// Unix milliseconds the step started, or `None` if it hasn't started
+    /// — `Dagster` reports `startTime` in seconds (possibly fractional);
+    /// this is that value times 1000, the millisecond convention the API
+    /// layer's timestamp rendering expects.
+    pub start_ms: Option<i64>,
+    /// Unix milliseconds the step ended, or `None` if it hasn't.
+    pub end_ms: Option<i64>,
+    /// Assets this step materialized, in `Dagster`'s reported order.
+    pub materializations: Vec<StepMaterialization>,
+}
+
 /// Outcome of [`DgClient::launch_run`], mirroring the TypeScript's
 /// `{ runId?: string; error?: string }` return shape (never a thrown
 /// error for a well-formed GraphQL response — failures are reported in
@@ -778,6 +819,52 @@ impl DgClient {
         }))
     }
 
+    /// Fetch `run_id`'s per-step status, timing, and materializations,
+    /// matching `runOrError { __typename ... on Run { stepStats { stepKey
+    /// status startTime endTime materializations { assetKey { path }
+    /// metadataEntries { __typename ... on IntMetadataEntry { label
+    /// intValue } } } } } }` (WS4 item A1 — verified live against this
+    /// repository's own Dagster `1.13.20` stack; see
+    /// `tests/fixtures/run_steps_captured_fixture.json`). Unlike
+    /// [`DgClient::pipeline_run_status`] (Phase 1, returns only
+    /// `status`/`key` per step), this also parses each materialization's
+    /// `rows` metadata entry when present.
+    ///
+    /// A run that doesn't exist (`__typename` other than `"Run"`, e.g. the
+    /// real `RunNotFoundError` shape this stack returns for a bogus run
+    /// id) is a normal "nothing to show" case here — `Ok(Vec::new())`, not
+    /// an `Err` — matching [`DgClient::pipeline_run_status`]'s posture for
+    /// the same condition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DgError::Transport`] on a network-level failure, or
+    /// [`DgError::Server`] when the response body isn't valid `JSON`.
+    pub async fn run_steps(&self, run_id: &str) -> Result<Vec<RunStep>, DgError> {
+        let query = "query($rid:ID!){ runOrError(runId:$rid){ __typename \
+                      ... on Run { stepStats { stepKey status startTime endTime \
+                      materializations { assetKey { path } metadataEntries { __typename \
+                      ... on IntMetadataEntry { label intValue } } } } } } }";
+        let body = json!({ "query": query, "variables": { "rid": run_id } });
+        let resp = self.client.post(&self.url).json(&body).send().await?;
+        let text = resp.text().await?;
+        let parsed: Value =
+            serde_json::from_str(&text).map_err(|e| DgError::Server(e.to_string()))?;
+        let run = parsed.pointer("/data/runOrError");
+        let Some(run) = run else {
+            return Ok(Vec::new());
+        };
+        if run.get("__typename").and_then(Value::as_str) != Some("Run") {
+            return Ok(Vec::new());
+        }
+        let steps = run
+            .get("stepStats")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().map(run_step_from_value).collect())
+            .unwrap_or_default();
+        Ok(steps)
+    }
+
     /// Whether the `Dagster` GraphQL endpoint is reachable, checked via its
     /// `/server_info` REST endpoint with a 3-second timeout — matching the
     /// `check("dagster", dagUrl)` helper in
@@ -905,6 +992,93 @@ struct DependsOnNode {
 #[derive(Debug, Deserialize)]
 struct DependsOnSolid {
     name: String,
+}
+
+/// Convert one `stepStats` array element into a [`RunStep`] — split out
+/// from [`DgClient::run_steps`] so the per-step parse (itself several
+/// nested `Option` chains) reads as one function rather than a closure
+/// buried in a `.map()`.
+fn run_step_from_value(s: &Value) -> RunStep {
+    let materializations = s
+        .get("materializations")
+        .and_then(Value::as_array)
+        .map(|mats| {
+            mats.iter()
+                .map(|m| StepMaterialization {
+                    asset_key: asset_key_from(m),
+                    rows: m
+                        .get("metadataEntries")
+                        .and_then(rows_from_metadata_entries),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    RunStep {
+        step_key: s
+            .get("stepKey")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        status: s
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        start_ms: seconds_to_ms(s.get("startTime")),
+        end_ms: seconds_to_ms(s.get("endTime")),
+        materializations,
+    }
+}
+
+/// The `"rows"`-labeled `IntMetadataEntry`'s value, when the
+/// materialization's `metadataEntries` union carries one — `Dagster`'s
+/// `metadataEntries` is a heterogeneous GraphQL union (`IntMetadataEntry`,
+/// `TextMetadataEntry`, ...) that `serde` cannot untag safely without a
+/// blanket `#[serde(other)]` swallowing real variants, so this is read via
+/// raw `Value` navigation, the same approach
+/// [`DgClient::pipeline_run_status`] already uses for `stepStats`.
+fn rows_from_metadata_entries(entries: &Value) -> Option<i64> {
+    entries.as_array()?.iter().find_map(|e| {
+        if e.get("__typename").and_then(Value::as_str) != Some("IntMetadataEntry") {
+            return None;
+        }
+        if e.get("label").and_then(Value::as_str) != Some("rows") {
+            return None;
+        }
+        e.get("intValue").and_then(Value::as_i64)
+    })
+}
+
+/// Join `assetKey.path` (`Dagster`'s asset key is a path segment list, e.g.
+/// `["bronze", "orders"]`) with `/`, or `None` when the materialization
+/// carries no asset key at all.
+fn asset_key_from(mat: &Value) -> Option<String> {
+    let segments = mat
+        .get("assetKey")?
+        .get("path")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        None
+    } else {
+        Some(segments.join("/"))
+    }
+}
+
+/// Convert a `Dagster` `startTime`/`endTime` value (Unix seconds, possibly
+/// fractional) into Unix milliseconds — `None` when `Dagster` hasn't
+/// recorded the timestamp yet (WS4 item G1's "never fabricate a timestamp"
+/// posture, reused here for step-level timing).
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "millisecond-precision display timestamp; Dagster's own \
+              timestamps never approach i64::MAX seconds"
+)]
+fn seconds_to_ms(v: Option<&Value>) -> Option<i64> {
+    v.and_then(Value::as_f64)
+        .map(|secs| (secs * 1000.0).round() as i64)
 }
 
 /// `Dagster` run status → console `EntityStatus`, porting `mapRunStatus` in
@@ -1421,6 +1595,95 @@ mod tests {
             .unwrap();
         assert!(outcome.ok);
         assert!(outcome.error.is_none());
+    }
+
+    // ── WS4 item A3: run_steps ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_steps_parses_real_captured_fixture() {
+        let server = MockServer::start().await;
+        let body: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/run_steps_captured_fixture.json"
+        ))
+        .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let steps = client
+            .run_steps("f13d18ca-0553-410e-8ebf-4a1286bdbbe5")
+            .await
+            .unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].step_key, "run_bronze_maintenance");
+        assert_eq!(steps[0].status, "FAILURE");
+        assert!(steps[0].start_ms.is_some());
+        assert!(steps[0].end_ms.is_some());
+        // Real fixture: this run's step failed before any asset
+        // materialized — must parse to an empty Vec, never fabricated rows.
+        assert!(steps[0].materializations.is_empty());
+    }
+
+    /// No registered job on the live capture stack (WS4 item A1) emits an
+    /// `IntMetadataEntry` labeled `"rows"`, so this synthetic body
+    /// (matching this crate's established pattern) proves the field is
+    /// parsed at all, and that a materialization with NO `"rows"`-labeled
+    /// entry parses to `None`, never a fabricated `0`.
+    #[tokio::test]
+    async fn run_steps_parses_rows_metadata_and_defaults_missing_to_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runOrError": { "__typename": "Run", "stepStats": [
+                    { "stepKey": "with_rows", "status": "SUCCESS", "startTime": 1.0, "endTime": 2.0,
+                      "materializations": [ { "assetKey": { "path": ["bronze", "orders"] },
+                        "metadataEntries": [ { "__typename": "IntMetadataEntry", "label": "rows", "intValue": 1234 } ] } ] },
+                    { "stepKey": "no_rows", "status": "SUCCESS", "startTime": 3.0, "endTime": 4.0,
+                      "materializations": [ { "assetKey": { "path": ["bronze", "customers"] },
+                        "metadataEntries": [ { "__typename": "TextMetadataEntry", "label": "note", "text": "ok" } ] } ] }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let steps = client.run_steps("r1").await.unwrap();
+        assert_eq!(steps.len(), 2);
+        let with_rows = &steps[0];
+        assert_eq!(with_rows.materializations.len(), 1);
+        assert_eq!(with_rows.materializations[0].rows, Some(1234));
+        assert_eq!(
+            with_rows.materializations[0].asset_key.as_deref(),
+            Some("bronze/orders")
+        );
+        let no_rows = &steps[1];
+        assert_eq!(no_rows.materializations.len(), 1);
+        assert_eq!(no_rows.materializations[0].rows, None);
+    }
+
+    /// A missing run is a normal "nothing to show" case here, matching the
+    /// posture [`pipeline_run_status_none_when_run_not_found`] proves for
+    /// the sibling call — real shape verified live (WS4 item A1) against a
+    /// bogus run id: `runOrError.__typename` becomes `RunNotFoundError`.
+    #[tokio::test]
+    async fn run_steps_run_not_found_returns_empty_not_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runOrError": { "__typename": "RunNotFoundError",
+                    "message": "Pipeline run nope could not be found." } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let steps = client.run_steps("nope").await.unwrap();
+        assert!(steps.is_empty());
     }
 
     // ── WS4 item A2: job_graph ──────────────────────────────────────────
