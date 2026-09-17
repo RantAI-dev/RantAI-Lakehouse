@@ -1514,6 +1514,56 @@ services:
     command: ["dagster", "api", "grpc", "-h", "0.0.0.0", "-p", "4000", "-m", "dispar_orchestrate.definitions"]
     restart: unless-stopped
 
+  # WS5 item G2 — one-shot: `pg_dump` every compose-created Postgres
+  # database (see `dagster/dispar_orchestrate/backup_job.py`'s DATABASES)
+  # to a DEDICATED backup bucket, never the shared warehouse bucket every
+  # ingestion connector/Iceberg reader can already read — one of the four
+  # databases is the identity database (`app_user`/`auth_identity` hashes),
+  # so sharing a failure domain with warehouse credentials would turn
+  # compromise of any one connector credential into compromise of every
+  # user's password hash. Own `backups` profile (not `dagster`): an
+  # operator opts in separately from bringing up the rest of the Dagster
+  # stack.
+  #
+  # The `BACKUP_S3_*` bucket/credential values themselves are NOT set
+  # here — they live in `ops/backups/docker-compose.backups.override.yml`
+  # instead, added with `-f` only when actually running a backup, same
+  # precedent `ops/g6/docker-compose.g6.override.yml` already establishes
+  # for gate-only credentials (see that file's own comment): `${VAR:?}`
+  # is interpolated for every service regardless of profile, so putting a
+  # must-set-only-under-one-profile credential directly in THIS file
+  # would break `docker compose --profile '*' config --quiet` (the
+  # repo-wide check AGENTS.md prescribes) for every checkout, backups
+  # configured or not. Trigger on a schedule via an external cron/systemd
+  # timer/CI job calling `docker compose -f docker-compose.yml -f
+  # ops/backups/docker-compose.backups.override.yml --profile backups run
+  # --rm backup-job` — see `docs/OPERATIONS.md`'s "Dedicated-bucket
+  # backup job" section for the exact command and the restore procedure,
+  # and `backup_job.py`'s module doc for why this is not (yet) wired as
+  # an automatic in-process Dagster schedule.
+  backup-job:
+    profiles: ["backups"]
+    build:
+      context: ./dagster
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Not a credential -- a retention window -- so a dev default is fine
+      # (AGENTS.md: `${X:-}` for dev defaults, `${X:?}` for must-set).
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      POSTGRES_DB: ${POSTGRES_DB:-lakehouse}
+      LAKEKEEPER_PG_DB: ${LAKEKEEPER_PG_DB:-lakekeeper}
+      OPENFGA_PG_DB: ${OPENFGA_PG_DB:-openfga}
+      DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
+    command: ["python", "-m", "dispar_orchestrate.backup_job"]
+    restart: "no"
+
   # P3 (G3a) — webserver (GraphQL API + UI). `DAGSTER_URL` (see
   # `lakehouse-api::config::Config`) points at
   # `http://dagster-webserver:3000/graphql` from inside the compose

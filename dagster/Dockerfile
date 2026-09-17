@@ -22,6 +22,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential libpq-dev curl \
     && rm -rf /var/lib/apt/lists/*
 
+# WS5 item G2: `backup_job.py`'s `pg_dump` client. `docker-compose.yml`'s
+# `postgres` service is pinned `image: postgres:16` (confirmed at every
+# occurrence of that pin) -- a client major must match the server major, a
+# newer `pg_dump`'s custom-format output is not guaranteed to `pg_restore`
+# into an older server -- but this base image's Debian release (verified
+# by running `cat /etc/debian_version` inside `python:3.12-slim`: `13.6`,
+# i.e. trixie) packages PostgreSQL 17 by default, not 16, so a bare
+# `apt-get install postgresql-client-16` fails with "Unable to locate
+# package" against trixie's default sources. The PostgreSQL project's own
+# apt repository carries every still-supported major for every supported
+# Debian release, so it is added first, specifically for the `-16`
+# package. Requires network access to apt.postgresql.org at BUILD TIME
+# (fetching the signing key and the repository index) -- a fully
+# air-gapped build must pre-stage these packages some other way; this
+# does not solve that case, only names it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+         -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt trixie-pgdg main" \
+         > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client-16 \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /opt/dagster/app
 COPY pyproject.toml ./
 COPY dispar_orchestrate ./dispar_orchestrate

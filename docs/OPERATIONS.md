@@ -532,3 +532,85 @@ This procedure was tested end-to-end as part of this phase: a backup was
 taken, a scratch database was restored from it, and the restore was
 verified by querying the restored data. See the phase report for the
 actual command transcript.
+
+## Dedicated-bucket backup job (WS5 item G2)
+
+The script-based procedure above covers only `${POSTGRES_DB:-lakehouse}`
+(the app database) and writes to local disk. `dagster/dispar_orchestrate/
+backup_job.py`, run via the `backups` compose profile, covers all four
+compose-created Postgres databases (the app database, plus Lakekeeper's,
+OpenFGA's, and Dagster's own) and uploads each dump to an **S3-compatible
+bucket that is dedicated to backups**, never the shared warehouse bucket.
+
+**Why a dedicated bucket, not the warehouse bucket — security, not
+preference.** One of the four databases is the identity database
+(`app_user`/`auth_identity`, holding password and service-token hashes).
+Writing that dump into the same bucket every warehouse-scoped credential
+(every ingestion connector, every Iceberg reader) can already read would
+turn compromise of ANY ONE of those credentials into compromise of every
+user's password hash — a privilege-escalation path the warehouse bucket's
+access domain was never meant to grant. `backup_job.py` therefore reads
+its own `BACKUP_S3_*` endpoint, bucket, and credentials, entirely
+separate from `RUSTFS_*`/`CONNECTOR_S3_*`.
+
+### Configure
+
+Set `BACKUP_S3_ENDPOINT`, `BACKUP_S3_BUCKET`, `BACKUP_S3_ACCESS_KEY`,
+`BACKUP_S3_SECRET_KEY` (and leave `BACKUP_S3_ACCESS_KEY_SECRET_REF=env:
+BACKUP_S3_ACCESS_KEY` / `BACKUP_S3_SECRET_KEY_SECRET_REF=env:
+BACKUP_S3_SECRET_KEY` at their `.env.example` values) in your `.env`.
+`BACKUP_RETENTION_DAYS` (default `30`) is the one optional field — it is
+a retention window, not a credential.
+
+These four bucket/credential values are **required** (`${VAR:?}`, no
+default) but deliberately do **not** live in the default
+`docker-compose.yml` — they live in
+`ops/backups/docker-compose.backups.override.yml`, added with `-f` only
+when a backup actually runs, same precedent
+`ops/g6/docker-compose.g6.override.yml` already establishes for its own
+gate-only credentials: a `${VAR:?}` in the default file is interpolated
+for every service regardless of profile, so a must-set-only-under-one-
+profile credential placed there would break `docker compose --profile
+'*' config --quiet` (the repo-wide check AGENTS.md prescribes) for every
+checkout, backups configured or not.
+
+### Run
+
+```bash
+docker compose -f docker-compose.yml \
+  -f ops/backups/docker-compose.backups.override.yml \
+  --profile backups run --rm backup-job
+```
+
+Without the `-f ops/backups/...` override (or with any of its four vars
+unset), this refuses to start — a `backups` profile enabled with no
+bucket configured is a clear startup failure, never a silent write into
+the wrong place, and never a silently-skipped backup reported as
+successful. A failed `pg_dump` for any one database raises immediately
+(`dagster.Failure`) and stops the run before uploading anything for the
+databases after it — a partial run is never reported as a complete one.
+
+**Scheduling:** this is not (yet) wired as an automatic in-process
+Dagster job/schedule — see `backup_job.py`'s module doc for why (in
+short: doing so safely would require threading these same bucket/DB
+credentials into the always-on `dagster-code-location` service, which
+would make every `dagster`-profile deployment require backup
+configuration too). Run the command above from an external trigger (host
+cron, a systemd timer, or a CI scheduled job) on whatever cadence your
+retention policy assumes (nightly, matching `BACKUP_RETENTION_DAYS`'s
+default 30-day window, is a reasonable starting point).
+
+### Restore
+
+Download the dump for the database/timestamp you want from
+`<BACKUP_S3_BUCKET>/<db-name>/<timestamp>.dump` (via any S3-compatible
+client pointed at `BACKUP_S3_ENDPOINT` with the same credentials), then:
+
+```bash
+pg_restore --dbname=<target-db> --clean --if-exists --no-owner <dump-file>
+```
+
+Same "restore into a scratch database first" caution as the script-based
+procedure above applies here — `--clean` drops existing objects before
+recreating them, so verify a dump against a throwaway database name
+before trusting it against the live one.

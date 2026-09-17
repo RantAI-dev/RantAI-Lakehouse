@@ -1,0 +1,33 @@
+# ops/backups/docker-compose.backups.override.yml -- WS5 item G2: the
+# dedicated backup bucket's endpoint/bucket/credentials are MUST-SET
+# (`${VAR:?}`, never a default -- a deployment that enables the `backups`
+# profile without configuring these gets a clear startup failure, not a
+# silent write into the wrong place). They live here, not in the default
+# `docker-compose.yml`, for the exact reason
+# `ops/g6/docker-compose.g6.override.yml` already documents for its own
+# gate-only credentials: `${VAR:?}` is interpolated for EVERY service
+# regardless of profile, so a must-set-only-under-one-profile credential
+# placed directly in the default file would break `docker compose
+# --profile '*' config --quiet` (the repo-wide check AGENTS.md
+# prescribes) for every checkout, whether or not that checkout ever runs
+# a backup.
+#
+# Usage: `docker compose -f docker-compose.yml -f
+# ops/backups/docker-compose.backups.override.yml --profile backups run
+# --rm backup-job` (see docs/OPERATIONS.md's "Dedicated-bucket backup
+# job" section).
+#
+# `BACKUP_S3_ACCESS_KEY`/`BACKUP_S3_SECRET_KEY` are the actual credential
+# values the two `_SECRET_REF` vars point at, by the `env:` scheme
+# convention `backup_job.py`'s `resolve_secret_ref` understands --
+# required here too, since `resolve_secret_ref` reads them out of THIS
+# container's own environment, not the ref string alone.
+services:
+  backup-job:
+    environment:
+      BACKUP_S3_ENDPOINT: ${BACKUP_S3_ENDPOINT:?}
+      BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:?}
+      BACKUP_S3_ACCESS_KEY_SECRET_REF: ${BACKUP_S3_ACCESS_KEY_SECRET_REF:?}
+      BACKUP_S3_SECRET_KEY_SECRET_REF: ${BACKUP_S3_SECRET_KEY_SECRET_REF:?}
+      BACKUP_S3_ACCESS_KEY: ${BACKUP_S3_ACCESS_KEY:?}
+      BACKUP_S3_SECRET_KEY: ${BACKUP_S3_SECRET_KEY:?}
