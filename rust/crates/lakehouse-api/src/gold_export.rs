@@ -498,6 +498,13 @@ pub struct GoldExportResult {
     /// the source query returned no rows — no snapshot is committed in
     /// that case (see [`export_mart`]'s doc comment).
     pub rows_exported: usize,
+    /// The id of the `Iceberg` snapshot this export just committed —
+    /// `None` only when `rows_exported == 0` (the documented no-op path:
+    /// no table is created, no snapshot exists).
+    pub snapshot_id: Option<i64>,
+    /// When that snapshot was committed (Unix ms) — `None` under the same
+    /// condition as `snapshot_id`.
+    pub exported_at_ms: Option<i64>,
 }
 
 /// Reads every row of `source_table` (a fully-qualified `ClickHouse`
@@ -566,6 +573,8 @@ pub async fn export_mart(
             table: sanitized_table,
             format_version: 2,
             rows_exported: 0,
+            snapshot_id: None,
+            exported_at_ms: None,
         });
     }
 
@@ -651,13 +660,32 @@ pub async fn export_mart(
         table: sanitized_table,
         format_version: 2,
         rows_exported,
+        snapshot_id: table.current_snapshot_id(),
+        exported_at_ms: table.current_snapshot_timestamp_ms(),
     })
 }
 
+/// The result of reading a Gold table back through `iceberg-rust`,
+/// independent of whatever the last export claimed.
+pub struct GoldReadBack {
+    /// The Iceberg format version of the table read.
+    pub format_version: u8,
+    /// The number of rows visible across every snapshot's data files.
+    pub rows: usize,
+    /// Mirrors `GoldExportResult::snapshot_id`'s "only `None` for an
+    /// export that committed nothing" caveat — here it can also be `None`
+    /// for a table that exists (created via
+    /// `IcebergClient::create_gold_table`) but has never been appended to,
+    /// which `export_mart` itself never leaves in that state, but a caller
+    /// of `IcebergClient::create_gold_table` directly could.
+    pub snapshot_id: Option<i64>,
+    /// Mirrors `GoldExportResult::exported_at_ms`.
+    pub exported_at_ms: Option<i64>,
+}
+
 /// Loads the Gold table named `mart_name` and reads back every row
-/// currently visible, returning just the row count — used by
-/// `routes::gold::read_back` to prove the export round trip without
-/// exposing the Gold data itself over the API.
+/// currently visible — used by `routes::gold::read_back` to prove the
+/// export round trip without exposing the Gold data itself over the API.
 ///
 /// # Errors
 ///
@@ -666,13 +694,20 @@ pub async fn export_mart(
 pub async fn read_back_row_count(
     iceberg_config: &IcebergClientConfig,
     mart_name: &str,
-) -> Result<(u8, usize), GoldExportError> {
+) -> Result<GoldReadBack, GoldExportError> {
     let client = IcebergClient::connect(iceberg_config).await?;
     let table: GoldTable = client.load_gold_table(mart_name).await?;
     let format_version = table.format_version() as u8;
+    let snapshot_id = table.current_snapshot_id();
+    let exported_at_ms = table.current_snapshot_timestamp_ms();
     let batches = table.read_all().await?;
     let rows = batches.iter().map(RecordBatch::num_rows).sum();
-    Ok((format_version, rows))
+    Ok(GoldReadBack {
+        format_version,
+        rows,
+        snapshot_id,
+        exported_at_ms,
+    })
 }
 
 /// Builds an [`IcebergClientConfig`] for the Gold export path from
@@ -696,6 +731,20 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn gold_export_result_carries_snapshot_fields() {
+        let result = GoldExportResult {
+            namespace: "gold".to_owned(),
+            table: "sales".to_owned(),
+            format_version: 2,
+            rows_exported: 7,
+            snapshot_id: Some(123),
+            exported_at_ms: Some(1_700_000_000_000),
+        };
+        assert_eq!(result.snapshot_id, Some(123));
+        assert_eq!(result.exported_at_ms, Some(1_700_000_000_000));
+    }
 
     fn row_with(name: &str, value: Value) -> Map<String, Value> {
         let mut row = Map::new();

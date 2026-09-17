@@ -557,6 +557,32 @@ impl GoldTable {
         self.table.metadata().current_schema()
     }
 
+    /// The id of the table's current snapshot — the one just committed by
+    /// the most recent [`Self::append`], or `None` for a table that was
+    /// created (via [`IcebergClient::create_gold_table`]) but never
+    /// appended to. `gold_export::export_mart` never creates a table
+    /// without immediately appending at least one batch to it (a zero-row
+    /// source mart is a documented no-op there, per its own doc comment),
+    /// so in practice this is only ever `None` for a table this crate has
+    /// not written to at all.
+    #[must_use]
+    pub fn current_snapshot_id(&self) -> Option<i64> {
+        self.table.metadata().current_snapshot_id()
+    }
+
+    /// The wall-clock time (Unix milliseconds) `Iceberg` recorded when the
+    /// table's current snapshot was committed to the catalog — distinct
+    /// from `_exported_at` (`gold_export::export_mart`'s own per-batch
+    /// column, written by this process at read time, before the commit).
+    /// `None` under the same condition as [`Self::current_snapshot_id`].
+    #[must_use]
+    pub fn current_snapshot_timestamp_ms(&self) -> Option<i64> {
+        self.table
+            .metadata()
+            .current_snapshot()
+            .map(|snapshot| snapshot.timestamp_ms())
+    }
+
     /// Appends `batch` as one new Parquet data file, in one fast-append
     /// snapshot, committed through `catalog`. Same mechanics as
     /// [`BronzeTable::append`], partitioned by `day(_exported_at)` instead
@@ -636,5 +662,119 @@ impl GoldTable {
         futures::TryStreamExt::try_collect(stream)
             .await
             .map_err(|e| IcebergError::Write(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    //! `GoldTable::current_snapshot_id`/`current_snapshot_timestamp_ms` are
+    //! thin delegations to `iceberg-rust`'s own (already-tested)
+    //! `TableMetadata` accessors — the behavior worth proving here is only
+    //! "before any snapshot exists, both are `None`; once one does, both
+    //! are `Some`". Neither this crate nor its `iceberg` dependency ships
+    //! an in-memory `Catalog` implementation (`iceberg-catalog-memory` is
+    //! not a dependency — confirmed by reading `Cargo.toml`), and the only
+    //! existing Gold-table test in this repository
+    //! (`tests/g1_lakekeeper.rs`) is `#[ignore]`d and needs a live
+    //! Lakekeeper/`RustFS` stack. So these tests build a `Table` directly
+    //! from an in-memory `TableMetadata` (via `TableMetadataBuilder`, the
+    //! same builder `iceberg-catalog-rest`'s own `Catalog` impl uses
+    //! internally) and `FileIO::new_with_memory()` — no network, no disk,
+    //! no new dependency — then construct `GoldTable` by hand since this
+    //! test module is nested inside `catalog.rs` and can see its private
+    //! `table` field directly.
+
+    use iceberg::Runtime;
+    use iceberg::io::FileIO;
+    use iceberg::spec::{Operation, Snapshot, SortOrder, Summary, TableMetadataBuilder};
+    use iceberg::table::Table;
+
+    use super::*;
+
+    fn gold_table_fixture() -> GoldTable {
+        let schema = gold::gold_schema(vec![NestedField::required(
+            gold::FIRST_DOMAIN_FIELD_ID,
+            "region",
+            iceberg::spec::Type::Primitive(iceberg::spec::PrimitiveType::String),
+        )])
+        .expect("gold schema builds");
+        let partition_spec =
+            gold::export_day_partition_spec(&schema).expect("partition spec builds");
+        let creation = TableCreation::builder()
+            .name("sales".to_owned())
+            .location("memory:///gold/sales".to_owned())
+            .schema(schema)
+            .partition_spec(partition_spec)
+            .sort_order(SortOrder::unsorted_order())
+            .format_version(FormatVersion::V2)
+            .build();
+        let metadata = TableMetadataBuilder::from_table_creation(creation)
+            .expect("metadata builder from creation")
+            .build()
+            .expect("metadata builds")
+            .metadata;
+        let identifier = TableIdent::from_strs(["gold", "sales"]).expect("table ident");
+        let table = Table::builder()
+            .identifier(identifier)
+            .metadata(metadata)
+            .file_io(FileIO::new_with_memory())
+            .runtime(Runtime::current())
+            .build()
+            .expect("table builds");
+        GoldTable { table }
+    }
+
+    fn with_one_snapshot(mut gold_table: GoldTable) -> GoldTable {
+        let schema_id = gold_table.table.metadata().current_schema().schema_id();
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(1)
+            .with_sequence_number(1)
+            .with_timestamp_ms(
+                i64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("system clock after unix epoch")
+                        .as_millis(),
+                )
+                .expect("current time fits in i64 milliseconds"),
+            )
+            .with_manifest_list("memory:///gold/sales/metadata/snap-1.avro")
+            .with_summary(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .with_schema_id(schema_id)
+            .build();
+        let metadata =
+            TableMetadataBuilder::new_from_metadata(gold_table.table.metadata().clone(), None)
+                .set_branch_snapshot(snapshot, iceberg::spec::MAIN_BRANCH)
+                .expect("add snapshot to main branch")
+                .build()
+                .expect("metadata builds")
+                .metadata;
+        gold_table.table = Table::builder()
+            .identifier(gold_table.table.identifier().clone())
+            .metadata(metadata)
+            .file_io(gold_table.table.file_io().clone())
+            .runtime(Runtime::current())
+            .build()
+            .expect("table rebuilds with new metadata");
+        gold_table
+    }
+
+    #[tokio::test]
+    async fn current_snapshot_id_and_timestamp_are_none_before_any_append() {
+        let table = gold_table_fixture();
+        assert_eq!(table.current_snapshot_id(), None);
+        assert_eq!(table.current_snapshot_timestamp_ms(), None);
+    }
+
+    #[tokio::test]
+    async fn current_snapshot_id_and_timestamp_are_some_after_one_append() {
+        let table = with_one_snapshot(gold_table_fixture());
+        assert_eq!(table.current_snapshot_id(), Some(1));
+        assert!(table.current_snapshot_timestamp_ms().is_some());
     }
 }
