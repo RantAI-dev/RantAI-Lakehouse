@@ -2253,6 +2253,67 @@ services:
     profiles: ["g6"]
     restart: "no"
 
+  # WS3 (G6) — the ingest matrix acceptance test (ops/g6/g6_ingest_matrix_test.py).
+  # Builds from the dagster-code-location image (not a bare python:3.12-slim,
+  # unlike g3a-test-runner/g4-test-runner above) because it needs pymysql/
+  # pyodbc, and the dagster-code-location image already carries the ODBC
+  # driver apt-install sequence dagster/dispar_orchestrate/adapters/sql.py
+  # needs -- avoiding a third, separate ODBC-driver install to maintain.
+  g6-test-runner:
+    profiles: ["g6"]
+    build:
+      context: ./dagster
+      dockerfile: Dockerfile
+    working_dir: /work
+    volumes:
+      - ./ops/g6:/work
+    depends_on:
+      dagster-code-location:
+        condition: service_started
+      mysql-g6:
+        condition: service_healthy
+      mssql-g6:
+        condition: service_healthy
+      rest-stub-g6:
+        condition: service_started
+    environment:
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      DAGSTER_URL: http://dagster-webserver:3000/graphql
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      CH_LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?}
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?}
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["pip install -q requests pymysql pyodbc && python g6_ingest_matrix_test.py"]
+    restart: "no"
+
+  # WS3 (G6) — the override-free link-local rejection proof
+  # (ops/g6/g6_linklocal_test.py). Deliberately "dagster", NOT "g6": this
+  # service must be runnable against the DEFAULT compose file alone (no
+  # -f ops/g6/docker-compose.g6.override.yml), so its own profile
+  # membership cannot accidentally pull in the override-only fixtures.
+  g6-test-runner-linklocal:
+    profiles: ["dagster"]
+    image: python:3.12-slim
+    working_dir: /work
+    volumes:
+      - ./ops/g6:/work
+    depends_on:
+      dagster-code-location:
+        condition: service_started
+    environment:
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["pip install -q requests && python g6_linklocal_test.py"]
+    restart: "no"
+
 volumes:
   lakehouse_postgres_data:
   lakehouse_clickhouse_data:

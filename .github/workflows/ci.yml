@@ -468,6 +468,64 @@ jobs:
         if: always()
         run: docker compose -p g4ci down -v
 
+  # ── WS3 (G6) acceptance — the Tier 1 ingestion matrix: one connector
+  # per adapter (sql×mysql, sql×mssql, sql×postgres, files×csv, rest) is
+  # registered, given an ingest-spec, run, and its rows verified in Bronze
+  # through ClickHouse; plus the column gate, CDC's honest supported:false,
+  # and Sheets' honest supported:false. Same g1-rustfs/g3a-dagster/g4-cdc
+  # shape. A second, SEPARATE, override-free compose project proves the
+  # DEFAULT stack (INGEST_ALLOW_INTERNAL_HOSTS unset) still refuses a
+  # link-local target -- ops/g6/docker-compose.g6.override.yml's own
+  # comment explains why that variable is gate-only and never belongs in
+  # docker-compose.yml itself. See ops/g6/g6_ingest_matrix_test.py and
+  # ops/g6/g6_linklocal_test.py. ──
+  g6-ingest:
+    name: Rust · G6 ingest matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write CI-only .env
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
+          MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
+          EOF
+
+      - name: Bring up the g6 matrix (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
+        run: >
+          docker compose -p g6ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
+          --profile g6 --profile dagster up -d --build
+
+      - name: Run the G6 ingest matrix test inside the compose network
+        run: docker compose -p g6ci --profile g6 run --rm g6-test-runner
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g6ci logs
+
+      - name: Tear down the g6 matrix project
+        if: always()
+        run: docker compose -p g6ci down -v
+
+      - name: Bring up a SEPARATE, override-free project for the link-local assertion
+        run: docker compose -p g6ci-linklocal --profile dagster up -d --build
+
+      - name: Run the link-local rejection test (default compose, flag unset)
+        run: docker compose -p g6ci-linklocal --profile dagster run --rm g6-test-runner-linklocal
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g6ci-linklocal logs
+
+      - name: Tear down the link-local project
+        if: always()
+        run: docker compose -p g6ci-linklocal down -v
+
   # ── ADR 0010 acceptance — Gold export to Iceberg, from Rust:
   # `lakehouse-api::routes::gold` reads a real `serving.*` Gold mart from
   # ClickHouse and appends it to the `gold` Iceberg namespace through
