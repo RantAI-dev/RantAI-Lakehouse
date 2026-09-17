@@ -165,9 +165,13 @@ async fn get_body(
 /// nothing in this route measures them today — no cache-hit signal, no
 /// policy engine, no agent-run budget accounting. `warm.bytes` is `null`
 /// because `rows * 220` was an invented per-row byte size, not a
-/// measurement. `pipelines.delayed` (WS5 item B1) and
-/// `services.healthy/degraded/unhealthy` (WS5 item A4) are real, measured
-/// counts. `pendingApprovals`/`agents.activeRuns` (WS5 item B2) are real
+/// measurement. `services.healthy/degraded/unhealthy` (WS5 item A4) are
+/// real, measured counts. `pipelines.delayed` (WS5 item B1) is a real count
+/// when every `RUNNING` schedule's run lookup succeeds, `null` when any one
+/// of them fails — a failed query and "never ran" are different answers,
+/// and folding the former into the latter used to make a `Dagster` outage
+/// report a confident `delayed: 0`. `pendingApprovals`/`agents.activeRuns`
+/// (WS5 item B2) are real
 /// Postgres counts when a pool is configured and the query succeeds,
 /// `null` otherwise (no pool, or the query itself failed) — never a
 /// fabricated `0`, which would read as "definitely zero waiting" rather
@@ -183,7 +187,10 @@ async fn get_body(
 struct SummaryCounts {
     active: usize,
     failed: usize,
-    delayed: usize,
+    /// `None` when the per-schedule `Dagster` run lookup failed for at
+    /// least one `RUNNING` schedule (see `count_delayed_schedules`) — never
+    /// a fabricated `0`.
+    delayed: Option<usize>,
     pending_approvals: Option<i64>,
     active_agent_runs: Option<i64>,
 }
@@ -291,24 +298,42 @@ fn is_schedule_delayed(
 /// NEVER the shared, capped `list_runs(100)` window — WS5 plan review U7:
 /// a schedule that stopped firing long ago falls out of that window and
 /// would otherwise score "no baseline" instead of "delayed").
-async fn count_delayed_schedules(dagster: &DgClient, jobs: &[DgJob], now: OffsetDateTime) -> usize {
+///
+/// `None` when any one `list_runs_for_job` call fails, matching the other
+/// WS5 observability metrics (`pendingApprovals`, `ingestLagSeconds`,
+/// `cacheHitRate`, `agentSuccessRate`): a failed lookup is "not measured,"
+/// never folded into the count as if that schedule had simply never run.
+/// Before this fix `.ok()` discarded the error and treated it exactly like
+/// "no run yet" — `is_schedule_delayed` correctly calls a schedule with no
+/// baseline "not delayed," so a `Dagster` outage silently produced a
+/// confident `delayed: 0` instead of "unknown." One failed lookup poisons
+/// the whole count: a partial count reported as a total is its own
+/// fabrication.
+async fn count_delayed_schedules(
+    dagster: &DgClient,
+    jobs: &[DgJob],
+    now: OffsetDateTime,
+) -> Option<usize> {
     let mut delayed = 0;
     for job in jobs {
         for schedule in &job.schedules {
             if schedule.schedule_state.status != "RUNNING" {
                 continue;
             }
-            let last_run = dagster
+            let runs = dagster
                 .list_runs_for_job(&job.name, 1)
                 .await
-                .ok()
-                .and_then(|runs| runs.into_iter().next());
+                .inspect_err(|err| {
+                    tracing::warn!(%err, job = %job.name, "list_runs_for_job failed");
+                })
+                .ok()?;
+            let last_run = runs.into_iter().next();
             if is_schedule_delayed(schedule, last_run.as_ref(), now) {
                 delayed += 1;
             }
         }
     }
-    delayed
+    Some(delayed)
 }
 
 /// `POST /api/overview` — recent activity, sourced entirely from `Dagster`
@@ -529,7 +554,7 @@ mod tests {
         let counts = SummaryCounts {
             active: 0,
             failed: 0,
-            delayed: 0,
+            delayed: Some(0),
             pending_approvals: None,
             active_agent_runs: None,
         };
@@ -545,7 +570,9 @@ mod tests {
         }
         assert_eq!(
             v["pipelines"]["delayed"], 0,
-            "delayed is a real, measured count (WS5 item B1), never null when computed"
+            "delayed is a real, measured count (WS5 item B1) when every \
+             lookup succeeds — this fixture's Some(0) must serialize as 0, \
+             never null"
         );
         assert!(v["queries"]["cacheAssistRate"].is_null());
         assert!(v["policyViolations7d"].is_null());
@@ -603,7 +630,7 @@ mod tests {
         let counts = SummaryCounts {
             active: 0,
             failed: 0,
-            delayed: 0,
+            delayed: Some(0),
             pending_approvals: None,
             active_agent_runs: None,
         };
@@ -625,12 +652,81 @@ mod tests {
         let counts = SummaryCounts {
             active: 0,
             failed: 0,
-            delayed: 0,
+            delayed: Some(0),
             pending_approvals: Some(3),
             active_agent_runs: Some(2),
         };
         let v = summary_json(None, None, None, None, &counts, &[]);
         assert_eq!(v["pendingApprovals"], 3);
         assert_eq!(v["agents"]["activeRuns"], 2);
+    }
+
+    // ── pipelines.delayed: a failed run lookup is "unknown," never "0" ──
+
+    fn fixture_job(name: &str, cron: &str, status: &str) -> DgJob {
+        DgJob {
+            name: name.to_owned(),
+            schedules: vec![fixture_schedule(cron, status)],
+        }
+    }
+
+    /// The defect this fixes: `.ok()` on a failed `list_runs_for_job`
+    /// turned a query failure into `None` ("no run"), which
+    /// `is_schedule_delayed` — correctly, for its own job — calls "not
+    /// delayed." So an unreachable `Dagster` used to produce a confident
+    /// `Some(0)` instead of "unknown." Asserted directly against a
+    /// wiremock server that always 500s.
+    #[tokio::test]
+    async fn count_delayed_schedules_is_none_when_the_run_lookup_fails() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(500).set_body_string("boom"))
+            .mount(&server)
+            .await;
+        let dagster = DgClient::new(server.uri());
+        let jobs = vec![fixture_job("maintenance_job", "0 3 * * *", "RUNNING")];
+        let now = datetime!(2026 - 09 - 11 03:20:00 UTC);
+
+        let result = count_delayed_schedules(&dagster, &jobs, now).await;
+
+        assert_eq!(
+            result, None,
+            "a failed run lookup must poison the whole count, not read as Some(0)"
+        );
+    }
+
+    /// The companion case this fix must not disturb: when every lookup
+    /// succeeds, `count_delayed_schedules` still returns a real `Some`
+    /// count.
+    #[tokio::test]
+    async fn count_delayed_schedules_is_some_when_every_lookup_succeeds() {
+        let server = wiremock::MockServer::start().await;
+        // last run started yesterday -- the 03:00 fire today never
+        // happened, so this schedule counts as delayed.
+        let body = json!({
+            "data": {
+                "runsOrError": {
+                    "__typename": "Runs",
+                    "results": [{
+                        "runId": "r1",
+                        "jobName": "maintenance_job",
+                        "status": "SUCCESS",
+                        "startTime": datetime!(2026 - 09 - 10 03:00:05 UTC).unix_timestamp(),
+                        "endTime": Value::Null,
+                    }],
+                }
+            }
+        });
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let dagster = DgClient::new(server.uri());
+        let jobs = vec![fixture_job("maintenance_job", "0 3 * * *", "RUNNING")];
+        let now = datetime!(2026 - 09 - 11 03:20:00 UTC);
+
+        let result = count_delayed_schedules(&dagster, &jobs, now).await;
+
+        assert_eq!(result, Some(1));
     }
 }
