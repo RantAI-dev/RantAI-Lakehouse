@@ -2,12 +2,14 @@
 //! `describe_dataset`, `get_lineage`, `get_quality`, `describe_mart`.
 //! Moved out of `ai.rs` unchanged (T0.1 registry refactor).
 
+use lakehouse_auth::Principal;
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ident::SqlLiteral;
 use serde_json::{Map, Value, json};
 
-use super::arg_str;
+use super::{api_result_to_value, arg_str};
 use crate::routes::support::{is_numeric_type, strip_non_ident};
+use crate::state::AppState;
 
 // WS7 item F5: `pub(in crate::routes)` so `routes::agent::schema_context`
 // can run this SAME union query for its new Bronze catalog section,
@@ -16,11 +18,45 @@ use crate::routes::support::{is_numeric_type, strip_non_ident};
 pub(in crate::routes) const CATALOG_UNION: &str = "(SELECT slug,title,description,tier,table_name FROM lake.`bronze_meta.dataset_catalog` \
      UNION ALL SELECT slug,title,description,tier,table_name FROM lake.`bronze_meta_sec.dataset_catalog`)";
 
-pub(super) async fn run_sql(ch: &ChClient, args: &Map<String, Value>) -> Value {
+/// WS7 item C3: delegates to the SAME `routes::query::run` Query Studio
+/// and saved queries already call — closing the divergent-guard gap this
+/// task's own name cites (`WS7 plan §0 item 7`): before this change,
+/// `run_sql` called `ch.query` directly, so `sql_rewrite::enforce`'s
+/// masking/row-filter/table-function/sensitive-table/view refusal (WS7
+/// items B3-B6, wired into `routes::query::run` by WS7 item C2) never ran
+/// for a copilot-issued query at all, even though the exact same
+/// `Extension(principal)` reached this function. See
+/// `tools::queries::run_saved_query`'s doc comment for why "call the real
+/// handler, read its JSON back" is the preferred reuse shape over
+/// re-implementing the guard a second time — this function now follows
+/// that exact same shape.
+///
+/// `is_read_only_sql`/`dry_run_sql` below stay in place as an ADDITIONAL,
+/// cheaper first filter (WS7 item F4) — never a substitute for
+/// `routes::query::run`'s own `is_read_only`/`sql_rewrite::enforce`,
+/// which still run on every call reaching this function, principal
+/// present or not.
+pub(super) async fn run_sql(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let sql = arg_str(args, "sql");
     if !crate::routes::agent::is_read_only_sql(&sql) {
         return json!({ "error": "Hanya SELECT diizinkan." });
     }
+    // Same fail-closed shape `tools::queries::run_saved_query` uses for a
+    // headless (schedule/service-token) caller with no interactive
+    // principal to run as — `routes::query::run` 401s with none, for
+    // every engine, so there is no honest value to forward here either.
+    // Checked BEFORE `dry_run_sql` below (a real `ClickHouse` round trip)
+    // so a headless caller is refused without spending that call at all.
+    let Some(principal) = principal else {
+        return json!({
+            "error": "menjalankan SQL memerlukan pengguna yang terautentikasi; panggilan ini \
+                       dipicu oleh jadwal, yang tidak memiliki pengguna untuk dijalankan",
+        });
+    };
     // WS7 item F4: `is_read_only_sql` above is a regex-shaped first
     // filter (unchanged, still checked first, defense-in-depth) — it can
     // disagree with what `ClickHouse` itself will actually execute for a
@@ -30,23 +66,16 @@ pub(super) async fn run_sql(ch: &ChClient, args: &Map<String, Value>) -> Value {
     // by `EXPLAIN AST` itself) and refuses whenever the engine's own
     // answer is not a `SELECT`, closing the gap where a model-composed
     // SQL string could smuggle a non-`SELECT` construct past the regex.
-    let dry_run = dry_run_sql(ch, args).await;
+    let dry_run = dry_run_sql(&state.clickhouse, args).await;
     if dry_run.get("error").is_some() {
         return dry_run;
     }
-    match ch.query(&sql, None).await {
-        Ok(r) => {
-            let columns: Vec<String> = r.meta.iter().map(|m| m.name.clone()).collect();
-            let rows: Vec<Value> = r
-                .data
-                .iter()
-                .take(50)
-                .map(|row| Value::Object(row.clone()))
-                .collect();
-            json!({ "columns": columns, "rows": rows, "rowCount": r.rows })
-        }
-        Err(err) => json!({ "error": err.to_string() }),
-    }
+    let body = axum::body::Bytes::from(json!({ "sql": sql }).to_string());
+    let extension = Some(axum::Extension(principal.clone()));
+    api_result_to_value(
+        crate::routes::query::run(axum::extract::State(state.clone()), extension, body).await,
+    )
+    .await
 }
 
 /// Dry-runs `args["sql"]` via `ClickHouse`'s own `EXPLAIN AST`, refusing
@@ -347,5 +376,206 @@ mod dry_run {
             json!("WITH x AS (SELECT 1) SELECT * FROM x UNION ALL SELECT 2"),
         );
         assert!(dry_run_sql(&ch, &args).await.get("error").is_none());
+    }
+}
+
+#[cfg(test)]
+mod run_sql_delegation {
+    //! WS7 item C3: `run_sql` now enforces policy through the SAME path
+    //! Query Studio uses (`routes::query::run`), closing the
+    //! divergent-guard gap the WS7 plan's §0 item 7 names — before this
+    //! change `run_sql` called `ch.query` directly, so a governed table's
+    //! `email` column was never masked for a copilot-issued query even
+    //! though the exact same principal reached it. Real Postgres
+    //! (`#[sqlx::test]`, a real authored policy row) plus a wiremock
+    //! `ClickHouse` (`ChClient` speaks plain HTTP; there is no
+    //! `last_query()`-style test double on it — every assertion below
+    //! reads the mock server's own recorded requests instead, the same
+    //! pattern `routes::query::tests::trino_engine` already uses), the
+    //! same two harnesses `tools::queries`'s `principal_forwarding` module
+    //! relies on for the equivalent `run_saved_query` proof.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use lakehouse_auth::{PermissionSet, PrincipalId};
+    use lakehouse_store::PgPool;
+    use lakehouse_store::governance::CreatePolicyInput;
+    use uuid::Uuid;
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::config::Config;
+
+    fn database_url_for(pool: &PgPool) -> String {
+        let options = pool.connect_options();
+        format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        )
+    }
+
+    fn analyst_principal() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::nil()),
+            tenant_ids: Vec::new(),
+            display_name: "alice".to_owned(),
+            permissions: PermissionSet::parse("query:read"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: vec!["Analyst".to_owned()],
+        }
+    }
+
+    /// Mounts every `ClickHouse` response `routes::query::run`'s
+    /// enforcement path needs for `SELECT * FROM serving.mart_x`: the
+    /// `EXPLAIN AST` dry run (WS7 item F4, still checked first by
+    /// `run_sql` itself), `system.columns` (`PolicyEngineObligations`'s
+    /// real-column resolution, WS7 item C1), `system.tables` (view
+    /// detection), and finally the real, masked `SELECT` the derived-table
+    /// substitution produces.
+    async fn mount_governed_table_responses(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(body_string_contains("EXPLAIN AST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"explain": "SelectWithUnionQuery (children 1)\n"}],
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("system.columns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [
+                    {"name": "name", "type": "String"},
+                    {"name": "default_kind", "type": "String"},
+                    {"name": "default_expression", "type": "String"},
+                ],
+                "data": [
+                    {"name": "id", "default_kind": "", "default_expression": ""},
+                    {"name": "email", "default_kind": "", "default_expression": ""},
+                ],
+                "rows": 2,
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("system.tables"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [
+                    {"name": "database", "type": "String"},
+                    {"name": "name", "type": "String"},
+                    {"name": "engine", "type": "String"},
+                    {"name": "create_table_query", "type": "String"},
+                ],
+                "data": [
+                    {"database": "serving", "name": "mart_x", "engine": "MergeTree", "create_table_query": ""},
+                ],
+                "rows": 1,
+            })))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("replaceRegexpAll"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "meta": [
+                    {"name": "id", "type": "UInt64"},
+                    {"name": "email", "type": "String"},
+                ],
+                "data": [{"id": "1", "email": "***"}],
+                "rows": 1,
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn run_sql_is_masked_the_same_way_query_studio_is(pool: PgPool) -> sqlx::Result<()> {
+        lakehouse_store::governance::create_policy(
+            &pool,
+            &CreatePolicyInput {
+                name: "run-sql-masking-test".to_owned(),
+                kind: "Row filter".to_owned(),
+                subjects: "Analyst".to_owned(),
+                resources: "serving.mart_x".to_owned(),
+                effect: "Permit with obligation".to_owned(),
+                conditions: Some(
+                    r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}"#.to_owned(),
+                ),
+                activate: true,
+                owner: None,
+            },
+        )
+        .await
+        .expect("seeding the governing policy must succeed");
+
+        let server = MockServer::start().await;
+        mount_governed_table_responses(&server).await;
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("CH_URL".to_owned(), server.uri());
+        let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+
+        let principal = analyst_principal();
+        let mut args = Map::new();
+        args.insert("sql".to_owned(), json!("SELECT * FROM serving.mart_x"));
+        let result = run_sql(&state, Some(&principal), &args).await;
+
+        assert!(
+            result.get("error").is_none(),
+            "expected a successful, masked run, got {result}"
+        );
+        assert!(
+            result["columns"]
+                .as_array()
+                .expect("columns array")
+                .contains(&json!("email")),
+            "expected the email column to still be present (masked, not dropped): {result}"
+        );
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("mock server records requests");
+        assert!(
+            requests
+                .iter()
+                .any(|r| String::from_utf8_lossy(&r.body).contains("replaceRegexpAll")),
+            "expected the ACTUAL query ClickHouse received to be the rewritten/masked form, \
+             never the original literal SQL — this is what closes the divergent-guard gap \
+             (WS7 plan §0 item 7)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_sql_without_a_principal_refuses_with_a_named_reason() {
+        // No `ClickHouse` mock is mounted, and `query::run` is never
+        // called: same fail-closed shape
+        // `tools::queries::run_saved_query_without_a_principal_refuses_with_a_named_reason`
+        // proves for the saved-query path — a headless (schedule/service-
+        // token) caller has no honest principal to forward.
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+        let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+        let mut args = Map::new();
+        args.insert("sql".to_owned(), json!("SELECT 1"));
+        let result = run_sql(&state, None, &args).await;
+        assert_eq!(
+            result,
+            json!({
+                "error": "menjalankan SQL memerlukan pengguna yang terautentikasi; panggilan \
+                           ini dipicu oleh jadwal, yang tidak memiliki pengguna untuk \
+                           dijalankan",
+            }),
+            "expected the honest no-principal refusal, got {result}"
+        );
     }
 }

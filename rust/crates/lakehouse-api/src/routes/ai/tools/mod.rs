@@ -98,7 +98,7 @@ pub(in crate::routes) async fn run_tool(
     }
     let ch = &state.clickhouse;
     match name {
-        "run_sql" => data::run_sql(ch, args).await,
+        "run_sql" => data::run_sql(state, principal, args).await,
         "list_datasets" => data::list_datasets(ch, args).await,
         "describe_dataset" => data::describe_dataset(ch, args).await,
         "get_lineage" => data::get_lineage(ch, args).await,
