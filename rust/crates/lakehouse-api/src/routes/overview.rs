@@ -18,9 +18,13 @@ use serde_json::{Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::next_run::next_run_at;
 use crate::routes::support::{js_error, num_or_zero, str_col};
 use crate::state::AppState;
-use lakehouse_dagster::{DgClient, DgError, iso_from_unix_seconds, map_run_status};
+use lakehouse_dagster::{
+    DgClient, DgError, DgJob, DgRun, DgSchedule, iso_from_unix_seconds, map_run_status,
+};
+use time::OffsetDateTime;
 
 /// Errors surfaced while building the overview: either `ClickHouse` or
 /// `Dagster` can fail, and — matching the TypeScript's single `try/catch`
@@ -92,10 +96,14 @@ async fn get_body(
         .await?;
 
     let runs = dagster.list_runs(100).await?;
-    // `jobs` is fetched but never read in the TypeScript response — kept
-    // here only so a `Dagster` outage on this call still 503s like the
-    // original, matching its (accidental) error-propagation behavior.
-    let _jobs = dagster.list_jobs().await?;
+    // `jobs` used to be fetched-but-unread, kept only so a `Dagster`
+    // outage on this call still 503s like the original TypeScript. Task
+    // B1 (WS5) now reads it for real: each `RUNNING` schedule's own
+    // latest run, via `list_jobs_with_schedules`/`list_runs_for_job` --
+    // never the shared, capped `runs` list above, which a long-stalled
+    // schedule can fall out of entirely (WS5 plan review U7).
+    let jobs = dagster.list_jobs_with_schedules().await?;
+    let delayed = count_delayed_schedules(dagster, &jobs, OffsetDateTime::now_utc()).await;
 
     let now_ms = now_unix_millis();
     let recent: Vec<&lakehouse_dagster::DgRun> = runs
@@ -114,7 +122,7 @@ async fn get_body(
     let q_row = q_row.first();
 
     Ok(summary_json(
-        assets_row, hot_row, warm_row, q_row, active, failed, probes,
+        assets_row, hot_row, warm_row, q_row, active, failed, delayed, probes,
     ))
 }
 
@@ -123,15 +131,15 @@ async fn get_body(
 /// fields are real measurements versus `null` — is assertable without a
 /// `ClickHouse`/`Dagster` connection.
 ///
-/// WS1 task 1.8: `pipelines.delayed`, `queries.cacheAssistRate`,
-/// `policyViolations7d`, `pendingApprovals`, `agents.*`,
-/// `services.healthy/degraded/unhealthy`, and the `cold`/`ai` tiers are
-/// `null` because nothing in this route measures them today — no lateness
-/// computation, no cache-hit signal, no policy engine, no Postgres pool for
-/// approvals, no agent-run accounting, and no service probes. `warm.bytes`
-/// is `null` because `rows * 220` was an invented per-row byte size, not a
-/// measurement. WS5 is expected to wire up schedule lateness, approvals, and
-/// service probes; WS7 owns the policy engine and agent budgets. The
+/// WS1 task 1.8: `queries.cacheAssistRate`, `policyViolations7d`,
+/// `pendingApprovals`, `agents.*`, and the `cold`/`ai` tiers are `null`
+/// because nothing in this route measures them today — no cache-hit
+/// signal, no policy engine, no Postgres pool for approvals, no agent-run
+/// accounting. `warm.bytes` is `null` because `rows * 220` was an invented
+/// per-row byte size, not a measurement. `pipelines.delayed` (WS5 item B1)
+/// and `services.healthy/degraded/unhealthy` (WS5 item A4) are real,
+/// measured counts. WS5 also wires up approvals and agent-run counts
+/// (item B2); WS7 owns the policy engine and agent budgets. The
 /// `streaming` and `incidents` structures are dropped entirely (not
 /// nulled): neither was ever measured, and — apart from the incidents
 /// card, removed alongside this — nothing in the `TypeScript` client reads
@@ -143,6 +151,7 @@ fn summary_json(
     q_row: Option<&serde_json::Map<String, Value>>,
     active: usize,
     failed: usize,
+    delayed: usize,
     probes: &[crate::health::ServiceHealth],
 ) -> Value {
     json!({
@@ -154,7 +163,7 @@ fn summary_json(
             "cold": { "count": Value::Null, "bytes": Value::Null },
             "ai": { "count": Value::Null, "bytes": Value::Null },
         },
-        "pipelines": { "active": active, "failed": failed, "delayed": Value::Null },
+        "pipelines": { "active": active, "failed": failed, "delayed": delayed },
         "queries": {
             "volume24h": num_or_zero(q_row, "vol"),
             "p95Ms": num_or_zero(q_row, "p95"),
@@ -176,6 +185,84 @@ fn summary_json(
             "unhealthy": probes.iter().filter(|h| h.checked && !h.ok).count(),
         },
     })
+}
+
+/// A `RUNNING`-state schedule is delayed when its most recent run started
+/// before the fire time immediately preceding `now` — i.e. it missed its
+/// last expected occurrence. Computed via [`next_run_at`] (WS4 item G2,
+/// `croner`-backed) run repeatedly: `croner` only exposes "next after," so
+/// "the expected fire time just before now" is derived by walking forward
+/// from a 48h-ago probe until the next occurrence is no longer before
+/// `now` — matching the grace-window idiom WS5 plan review U7 asks for
+/// ("late when the last run started before the previous expected fire
+/// time"). A schedule with no run yet (`last_run: None`) is never delayed
+/// — no baseline to be late against, and a freshly created schedule must
+/// not immediately show red. A cron expression [`next_run_at`] cannot
+/// parse (malformed, or a non-5-field shape) also never flags delayed —
+/// this build does not guess at an interval it cannot compute.
+fn is_schedule_delayed(
+    schedule: &DgSchedule,
+    last_run: Option<&DgRun>,
+    now: OffsetDateTime,
+) -> bool {
+    if schedule.schedule_state.status != "RUNNING" {
+        return false;
+    }
+    let Some(last_run) = last_run else {
+        return false;
+    };
+    let Some(last_start) = last_run.start_time else {
+        return false;
+    };
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "start_time is Unix seconds as f64; truncation to i64 seconds is inconsequential \
+                  at any real-world timestamp magnitude"
+    )]
+    let last_start_secs = last_start as i64;
+    let Ok(last_start) = OffsetDateTime::from_unix_timestamp(last_start_secs) else {
+        return false;
+    };
+    let probe_start = now - time::Duration::hours(48);
+    let Some(first_after_probe) = next_run_at(&schedule.cron_schedule, probe_start) else {
+        return false; // cron_schedule not parseable -- never guess
+    };
+    // Walk forward from the 48h-ago probe until the next occurrence is no
+    // longer before `now` -- that last "before now" occurrence is the
+    // most recent expected fire time.
+    let mut candidate = first_after_probe;
+    let previous_expected = loop {
+        match next_run_at(&schedule.cron_schedule, candidate) {
+            Some(next) if next < now => candidate = next,
+            _ => break candidate,
+        }
+    };
+    last_start < previous_expected
+}
+
+/// Counts every `RUNNING` schedule across `jobs` that [`is_schedule_delayed`]
+/// against its own latest run (fetched per-job via `list_runs_for_job`,
+/// NEVER the shared, capped `list_runs(100)` window — WS5 plan review U7:
+/// a schedule that stopped firing long ago falls out of that window and
+/// would otherwise score "no baseline" instead of "delayed").
+async fn count_delayed_schedules(dagster: &DgClient, jobs: &[DgJob], now: OffsetDateTime) -> usize {
+    let mut delayed = 0;
+    for job in jobs {
+        for schedule in &job.schedules {
+            if schedule.schedule_state.status != "RUNNING" {
+                continue;
+            }
+            let last_run = dagster
+                .list_runs_for_job(&job.name, 1)
+                .await
+                .ok()
+                .and_then(|runs| runs.into_iter().next());
+            if is_schedule_delayed(schedule, last_run.as_ref(), now) {
+                delayed += 1;
+            }
+        }
+    }
+    delayed
 }
 
 /// `POST /api/overview` — recent activity, sourced entirely from `Dagster`
@@ -321,8 +408,68 @@ pub async fn resolve_alert(
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(
+        clippy::cast_precision_loss,
+        reason = "test fixture timestamps are small, real-world Unix seconds; casting to f64 to \
+                  match DgRun::start_time's wire shape loses no meaningful precision"
+    )]
 
     use super::*;
+    use lakehouse_dagster::{DgRun, DgSchedule, DgScheduleState};
+    use time::macros::datetime;
+
+    fn fixture_schedule(cron: &str, status: &str) -> DgSchedule {
+        DgSchedule {
+            name: "s".to_owned(),
+            cron_schedule: cron.to_owned(),
+            schedule_state: DgScheduleState {
+                status: status.to_owned(),
+            },
+        }
+    }
+
+    fn fixture_run(job_name: &str, start: time::OffsetDateTime) -> DgRun {
+        DgRun {
+            run_id: "r1".to_owned(),
+            job_name: job_name.to_owned(),
+            status: "SUCCESS".to_owned(),
+            start_time: Some(start.unix_timestamp() as f64),
+            end_time: None,
+        }
+    }
+
+    #[test]
+    fn a_running_schedule_is_delayed_when_its_own_latest_run_missed_the_previous_expected_fire_time()
+     {
+        let now = datetime!(2026 - 09 - 11 03:20:00 UTC); // maintenance.py's "0 3 * * *" fired at 03:00 today
+        let schedule = fixture_schedule("0 3 * * *", "RUNNING");
+        // last run started yesterday -- the 03:00 fire today never happened.
+        let last_run = fixture_run("maintenance_job", datetime!(2026 - 09 - 10 03:00:05 UTC));
+        assert!(is_schedule_delayed(&schedule, Some(&last_run), now));
+    }
+
+    #[test]
+    fn a_running_schedule_that_fired_on_time_is_not_delayed() {
+        let now = datetime!(2026 - 09 - 11 03:20:00 UTC);
+        let schedule = fixture_schedule("0 3 * * *", "RUNNING");
+        let last_run = fixture_run("maintenance_job", datetime!(2026 - 09 - 11 03:00:05 UTC));
+        assert!(!is_schedule_delayed(&schedule, Some(&last_run), now));
+    }
+
+    #[test]
+    fn a_schedule_with_no_run_yet_is_never_delayed() {
+        let now = datetime!(2026 - 09 - 11 03:20:00 UTC);
+        let schedule = fixture_schedule("*/15 * * * *", "RUNNING");
+        assert!(!is_schedule_delayed(&schedule, None, now));
+    }
+
+    #[test]
+    fn a_stopped_schedule_is_never_counted_regardless_of_its_last_run() {
+        let now = datetime!(2026 - 09 - 11 03:20:00 UTC);
+        let schedule = fixture_schedule("0 3 * * *", "STOPPED");
+        let last_run = fixture_run("maintenance_job", datetime!(2026 - 09 - 01 03:00:00 UTC));
+        assert!(!is_schedule_delayed(&schedule, Some(&last_run), now));
+    }
 
     #[test]
     fn now_unix_millis_is_plausible() {
@@ -333,7 +480,7 @@ mod tests {
 
     #[test]
     fn overview_reports_every_unmeasured_tile_as_null_and_drops_fabricated_structures() {
-        let v = summary_json(None, None, None, None, 0, 0, &[]);
+        let v = summary_json(None, None, None, None, 0, 0, 0, &[]);
 
         assert!(
             v["assetsByTier"]["warm"]["bytes"].is_null(),
@@ -343,7 +490,10 @@ mod tests {
             assert!(v["assetsByTier"][tier]["count"].is_null());
             assert!(v["assetsByTier"][tier]["bytes"].is_null());
         }
-        assert!(v["pipelines"]["delayed"].is_null());
+        assert_eq!(
+            v["pipelines"]["delayed"], 0,
+            "delayed is a real, measured count (WS5 item B1), never null when computed"
+        );
         assert!(v["queries"]["cacheAssistRate"].is_null());
         assert!(v["policyViolations7d"].is_null());
         assert!(
@@ -397,7 +547,7 @@ mod tests {
             fixture("dagster", true, false),
             fixture("trino", false, false),
         ];
-        let v = summary_json(None, None, None, None, 0, 0, &probes);
+        let v = summary_json(None, None, None, None, 0, 0, 0, &probes);
         assert_eq!(v["services"]["healthy"], 1);
         assert_eq!(v["services"]["unhealthy"], 1);
         assert_eq!(
