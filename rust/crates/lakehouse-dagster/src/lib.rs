@@ -457,6 +457,55 @@ impl DgClient {
             .collect())
     }
 
+    /// Fetch `job_name`'s op graph (nodes + dependency edges), matching
+    /// `pipelineOrError { __typename ... on Pipeline { solidHandles { solid
+    /// { name definition { description } inputs { dependsOn { solid { name
+    /// } } } } } } }` (WS4 item A1 — verified live against this
+    /// repository's own Dagster `1.13.20` stack; see
+    /// `tests/fixtures/job_graph_bronze_maintenance.json`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DgError::Transport`] on a network-level failure, or
+    /// [`DgError::Server`] when `Dagster` responds with a non-2xx status,
+    /// a GraphQL `errors` array, or `pipelineOrError.__typename` is not
+    /// `Pipeline` (e.g. `PipelineNotFoundError` — the job doesn't exist in
+    /// this repository/location).
+    pub async fn job_graph(&self, job_name: &str) -> Result<JobGraph, DgError> {
+        let query = "query($sel: PipelineSelector!) { pipelineOrError(params: $sel) { \
+                      __typename ... on Pipeline { solidHandles { solid { name \
+                      definition { description } inputs { dependsOn { solid { name } } } } } } \
+                      } }";
+        let variables = json!({ "sel": {
+            "pipelineName": job_name,
+            "repositoryName": self.repo,
+            "repositoryLocationName": self.location,
+        }});
+        let data: PipelineOrErrorData = self.execute(query, Some(variables)).await?;
+        let PipelineOrError::Pipeline { solid_handles } = data.pipeline_or_error else {
+            return Err(DgError::Server(format!("job {job_name} not found")));
+        };
+        let ops = solid_handles
+            .iter()
+            .map(|h| GraphOp {
+                name: h.solid.name.clone(),
+                description: h.solid.definition.description.clone(),
+            })
+            .collect();
+        let edges = solid_handles
+            .iter()
+            .flat_map(|h| {
+                h.solid.inputs.iter().flat_map(move |input| {
+                    input.depends_on.iter().map(move |d| GraphEdge {
+                        from: d.solid.name.clone(),
+                        to: h.solid.name.clone(),
+                    })
+                })
+            })
+            .collect();
+        Ok(JobGraph { ops, edges })
+    }
+
     /// Launch a run of `job_name`, matching `launchRun(jobName)` in the
     /// TypeScript client.
     ///
@@ -771,6 +820,91 @@ impl DgClient {
             .data
             .ok_or_else(|| DgError::Server("Dagster response missing data".to_owned()))
     }
+}
+
+/// One op node in a job's dependency graph, as returned by
+/// `pipelineOrError { ... on Pipeline { solidHandles { solid { ... } } } }`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphOp {
+    /// The op's name (e.g. `"run_bronze_maintenance"`).
+    pub name: String,
+    /// The op's docstring, when it has one — `solid.definition.description`
+    /// is itself nullable on `Dagster`'s side.
+    pub description: Option<String>,
+}
+
+/// One dependency edge (`from` runs before `to`), derived from
+/// `Input.dependsOn.solid.name` — `Dagster`'s own graph representation is
+/// input-to-upstream-output, so this client inverts it once here rather
+/// than making every caller do so.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GraphEdge {
+    /// The upstream op's name.
+    pub from: String,
+    /// The downstream op's name.
+    pub to: String,
+}
+
+/// A job's op graph: nodes plus dependency edges, returned by
+/// [`DgClient::job_graph`].
+#[derive(Debug, Clone)]
+pub struct JobGraph {
+    /// Every op in the job, in the order `Dagster` reported them.
+    pub ops: Vec<GraphOp>,
+    /// Dependency edges derived from each op's inputs.
+    pub edges: Vec<GraphEdge>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PipelineOrErrorData {
+    #[serde(rename = "pipelineOrError")]
+    pipeline_or_error: PipelineOrError,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "__typename")]
+enum PipelineOrError {
+    Pipeline {
+        #[serde(rename = "solidHandles")]
+        solid_handles: Vec<SolidHandleNode>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, Deserialize)]
+struct SolidHandleNode {
+    solid: SolidNode,
+}
+
+#[derive(Debug, Deserialize)]
+struct SolidNode {
+    name: String,
+    definition: SolidDefinitionNode,
+    #[serde(default)]
+    inputs: Vec<InputNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SolidDefinitionNode {
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InputNode {
+    #[serde(rename = "dependsOn")]
+    depends_on: Vec<DependsOnNode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DependsOnNode {
+    solid: DependsOnSolid,
+}
+
+#[derive(Debug, Deserialize)]
+struct DependsOnSolid {
+    name: String,
 }
 
 /// `Dagster` run status → console `EntityStatus`, porting `mapRunStatus` in
@@ -1287,6 +1421,78 @@ mod tests {
             .unwrap();
         assert!(outcome.ok);
         assert!(outcome.error.is_none());
+    }
+
+    // ── WS4 item A2: job_graph ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn job_graph_parses_ops_and_edges_from_a_real_captured_fixture() {
+        let server = MockServer::start().await;
+        let body: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/job_graph_bronze_maintenance.json"
+        ))
+        .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let graph = client.job_graph("bronze_maintenance_job").await.unwrap();
+        assert!(!graph.ops.is_empty());
+        assert!(graph.ops.iter().any(|o| o.name == "run_bronze_maintenance"));
+    }
+
+    /// The real captured fixture (WS4 item A1) has a single op with no
+    /// dependencies, so it can't demonstrate edge extraction. This
+    /// synthetic body (consistent with every other mutation/branch test in
+    /// this module, which use hand-built `json!` bodies rather than
+    /// captures) proves `inputs.dependsOn` is inverted into `from`/`to`
+    /// edges correctly.
+    #[tokio::test]
+    async fn job_graph_derives_edges_from_input_depends_on() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "pipelineOrError": { "__typename": "Pipeline", "solidHandles": [
+                    { "solid": { "name": "extract", "definition": { "description": null }, "inputs": [] } },
+                    { "solid": { "name": "load", "definition": { "description": "loads rows" },
+                      "inputs": [ { "dependsOn": [ { "solid": { "name": "extract" } } ] } ] } }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let graph = client.job_graph("some_job").await.unwrap();
+        assert_eq!(graph.ops.len(), 2);
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].from, "extract");
+        assert_eq!(graph.edges[0].to, "load");
+        let load = graph.ops.iter().find(|o| o.name == "load").unwrap();
+        assert_eq!(load.description.as_deref(), Some("loads rows"));
+    }
+
+    /// Real, live-verified shape (WS4 item A1, queried against a bogus job
+    /// name on the same stack): a job unknown to this repository/location
+    /// resolves `pipelineOrError.__typename` to `PipelineNotFoundError`,
+    /// never a `Pipeline`. Must be a hard error, not a panic on `unwrap`.
+    #[tokio::test]
+    async fn job_graph_errors_when_job_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "pipelineOrError": { "__typename": "PipelineNotFoundError" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let err = client.job_graph("no_such_job").await.unwrap_err();
+        assert!(matches!(err, DgError::Server(_)));
     }
 
     #[tokio::test]
