@@ -3,7 +3,12 @@ import type {
   ConnectorDetail,
   ConnectorService,
   ConnectorTestResult,
+  ConnectorType,
   CreateConnectorInput,
+  DiscoverResult,
+  IngestibleConnector,
+  IngestRun,
+  IngestRunResult,
   IngestSpec,
   IngestSpecInput,
 } from "../contracts/connectors";
@@ -87,5 +92,23 @@ export const postgresConnectorService: ConnectorService = {
   },
   setIngestSpec(id, input: IngestSpecInput, signal) {
     return putJson<IngestSpec>(`/api/connectors/${encodeURIComponent(id)}/ingest-spec`, input, signal);
+  },
+  listTypes(signal) {
+    return getJson<ConnectorType[]>("/api/connectors/types", { signal });
+  },
+  listIngestible(signal) {
+    return getJson<IngestibleConnector[]>("/api/connectors/ingestible", { signal });
+  },
+  discoverConnector(id, signal) {
+    return postJson<DiscoverResult>(`/api/connectors/${encodeURIComponent(id)}/discover`, undefined, signal);
+  },
+  runIngest(id, signal) {
+    return postJson<IngestRunResult>(`/api/connectors/${encodeURIComponent(id)}/ingest/run`, undefined, signal);
+  },
+  listIngestRuns(connectorId, signal) {
+    return getJson<IngestRun[]>(
+      `/api/governance/ingest-runs?connectorId=${encodeURIComponent(connectorId)}`,
+      { signal }
+    );
   },
 };

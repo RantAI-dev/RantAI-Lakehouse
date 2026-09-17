@@ -156,6 +156,112 @@ export type IngestSpecInput = {
   scheduleCron?: string
 }
 
+/**
+ * One row of `connector_type` (`rust/migrations/0035_connector_type.sql`),
+ * as returned by the wizard's type listing. Mirrors Rust
+ * `ConnectorType` (`rust/crates/lakehouse-store/src/connector_type.rs`)
+ * field-for-field. `supported: false` is a real, listed roadmap entry
+ * (AGENTS.md rule 2 — never omitted, never faked as working).
+ */
+export type ConnectorType = {
+  name: string
+  adapter: IngestAdapter | null
+  supported: boolean
+  docsUrl: string | null
+}
+
+/**
+ * One discovered column. Mirrors Rust `DiscoveredColumn`
+ * (`rust/crates/lakehouse-api/src/connector_discover.rs`) exactly —
+ * note the field is `typeName`, not `type`, and this array is never
+ * `null` (only ever empty), matching that struct's plain `Vec`.
+ */
+export type DiscoveredColumn = {
+  name: string
+  typeName: string
+}
+
+/**
+ * One discovered table (or future non-SQL equivalent object). Mirrors
+ * Rust `DiscoveredObject` exactly — `columns` is a plain array, never
+ * nullable, and there is no `sample` field: this route reports schema
+ * only, never a data preview.
+ */
+export type DiscoveredObject = {
+  name: string
+  columns: DiscoveredColumn[]
+}
+
+/**
+ * The response body for `POST /api/connectors/{id}/discover`. Mirrors
+ * Rust `DiscoverResult` exactly (same module). `reason` is populated
+ * whenever `supported` is `false`, omitted (not `null`) otherwise — the
+ * Rust field is `Option<String>` with no `skip_serializing_if`, but every
+ * other `Option<String>` reason field on this route follows the same
+ * "absent means not applicable" convention as `AlertRule`'s optional
+ * fields (`contracts/alerts.ts`), so this widens with `?` rather than
+ * `| null` for consistency; either reads a missing key the same way.
+ */
+export type DiscoverResult = {
+  objects: DiscoveredObject[]
+  supported: boolean
+  reason?: string
+}
+
+/**
+ * `POST /api/connectors/{id}/ingest/run`'s response. The route returns
+ * a raw `serde_json::Value`, not a typed struct
+ * (`rust/crates/lakehouse-api/src/routes/connectors.rs`'s `ingest_run`),
+ * and its two branches send DIFFERENT keys — never both: a successful
+ * launch sends only `{ runId }` (no `supported` key at all); the
+ * honest `cdc`-adapter refusal sends only `{ supported: false, reason }`
+ * (no `runId`). Both fields are therefore optional here, not `supported:
+ * boolean` required — a required `supported` would claim every response
+ * carries it, which the real wire body does not.
+ */
+export type IngestRunResult = {
+  runId?: string
+  supported?: boolean
+  reason?: string
+}
+
+/**
+ * One row of `bronze_meta.ingest_run` (ClickHouse, WS3 item 25), as
+ * returned by `GET /api/governance/ingest-runs?connectorId=`.
+ */
+export type IngestRun = {
+  connectorId: string
+  job: string
+  object: string
+  /** `null` means "not measured" (dlt's normalize row count was
+   * unavailable), never a fabricated `0` (WS3 plan review Z9). */
+  rows: number | null
+  startedAt: string
+  endedAt: string
+  status: string
+  error: string
+}
+
+/**
+ * One connector `dagster/dispar_orchestrate/ingest_factory.py` can build
+ * and run a job for. Mirrors Rust `IngestibleConnector`
+ * (`rust/crates/lakehouse-store/src/connectors.rs`) — NOT `Connector`:
+ * this is a materially different, wider shape (exposes `adapter`/
+ * `dial`/`secretRef` names, which the redacted `Connector` type never
+ * does) returned by `GET /api/connectors/ingestible`, scoped to
+ * `ingest:read` callers.
+ */
+export type IngestibleConnector = {
+  id: string
+  adapter: IngestAdapter
+  ingestMode: IngestMode
+  dial: Dial
+  sourceObjects: unknown
+  scheduleCron: string | null
+  secretRef: string
+  secretRefSecondary: string | null
+}
+
 export interface ConnectorService {
   listConnectors(signal?: AbortSignal): Promise<Connector[]>
   getConnector(id: string, signal?: AbortSignal): Promise<ConnectorDetail>
@@ -163,4 +269,20 @@ export interface ConnectorService {
   testConnection(id: string, signal?: AbortSignal): Promise<ConnectorTestResult>
   getIngestSpec(id: string, signal?: AbortSignal): Promise<IngestSpec>
   setIngestSpec(id: string, input: IngestSpecInput, signal?: AbortSignal): Promise<IngestSpec>
+  /**
+   * `GET /api/connectors/types` — every row of `connector_type`, used by
+   * the create wizard to offer a type (or list it disabled, honestly,
+   * when `supported` is `false`). NOTE: verified against
+   * `rust/crates/lakehouse-api/src/policy.rs`/`routes/mod.rs` — no route
+   * currently mounts `connector_type::list_connector_types` anywhere in
+   * this snapshot, though the store function and migration both exist.
+   * This client method is wired to the URL the store function's own
+   * naming implies; it 404s until a future task adds the route. Not
+   * silently assumed to work — see this task's report.
+   */
+  listTypes(signal?: AbortSignal): Promise<ConnectorType[]>
+  listIngestible(signal?: AbortSignal): Promise<IngestibleConnector[]>
+  discoverConnector(id: string, signal?: AbortSignal): Promise<DiscoverResult>
+  runIngest(id: string, signal?: AbortSignal): Promise<IngestRunResult>
+  listIngestRuns(connectorId: string, signal?: AbortSignal): Promise<IngestRun[]>
 }
