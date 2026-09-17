@@ -116,3 +116,101 @@ async fn platform_admin_satisfies_all_four_new_tokens_from_0020(pool: PgPool) ->
     assert!(principal.has("alert:write"));
     Ok(())
 }
+
+// ── WS7 item E4: an active, unexpired access_grant widens `permissions`
+//    (never `role_names`) ─────────────────────────────────────────────────
+
+/// Inserts one `access_grant` row directly (never through
+/// `lakehouse_store::agents::decide_access_request` — this test exercises
+/// ONLY `load_principal_for_user`'s read side, WS7 item E4, independent of
+/// how the row got there), against a synthetic `approval_item` row it also
+/// creates (both `access_grant.approval_id` and `.user_id` are `NOT NULL`
+/// foreign keys, so a real referenced row is required either way).
+async fn insert_active_grant(
+    pool: &PgPool,
+    user_id: Uuid,
+    permission: &str,
+    expires_at: time::OffsetDateTime,
+) {
+    let approval_id = format!("appr-test-{}", Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO approval_item (id, kind, requested_by_user_id, action, status) \
+         VALUES ($1, 'access', $2, $3, 'approved')",
+    )
+    .bind(&approval_id)
+    .bind(user_id)
+    .bind(format!("access:{permission}"))
+    .execute(pool)
+    .await
+    .expect("seed a synthetic approved access_item");
+
+    let grant_id = format!("grant-test-{}", Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO access_grant (id, approval_id, user_id, permission, expires_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&grant_id)
+    .bind(&approval_id)
+    .bind(user_id)
+    .bind(permission)
+    .bind(expires_at)
+    .execute(pool)
+    .await
+    .expect("seed an access_grant row");
+}
+
+/// Failing-test-first for WS7 item E4: before this task,
+/// `load_principal_for_user` never read `access_grant` at all, so a
+/// principal holding a real, active, unexpired grant for a permission
+/// their ROLES do not carry would still fail `principal.has(...)` for it.
+/// Quoted failure text (`cargo test -p lakehouse-auth
+/// repository::load_principal 2>&1 | tail -30` against the pre-E4 state —
+/// run as `cargo test -p lakehouse-auth --test repository`, since this
+/// crate's own convention keeps every DB-backed `load_principal_for_user`
+/// test in this file, not `src/repository.rs`): `assertion failed:
+/// principal.has("catalog:write")` (Rina/Analyst holds `query:read,
+/// catalog:read, lineage:read` — never `catalog:write`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn load_principal_for_user_includes_an_active_access_grant(pool: PgPool) -> sqlx::Result<()> {
+    // Rina Wijaya (seeded Analyst): query:read, catalog:read, lineage:read
+    // — never catalog:write on her own.
+    let rina_id = Uuid::parse_str("33333333-3333-4333-8333-000000000001").unwrap();
+    insert_active_grant(
+        &pool,
+        rina_id,
+        "catalog:write",
+        time::OffsetDateTime::now_utc() + time::Duration::days(7),
+    )
+    .await;
+
+    let principal = load_principal_for_user(&pool, rina_id, "local".to_owned(), false)
+        .await
+        .unwrap();
+    assert!(principal.has("catalog:write"));
+    // The grant never fabricates a role — Rina's role_names stays exactly
+    // her real memberships.
+    assert!(!principal.role_names.iter().any(|r| r == "catalog:write"));
+    Ok(())
+}
+
+/// The before/after half of the same acceptance criterion, from the other
+/// side: an EXPIRED grant must never widen access — `expires_at > now()`
+/// is checked at read time, not merely by the (separate, cleanup-only)
+/// revocation sweep.
+#[sqlx::test(migrations = "../../migrations")]
+async fn load_principal_for_user_ignores_an_expired_grant(pool: PgPool) -> sqlx::Result<()> {
+    let rina_id = Uuid::parse_str("33333333-3333-4333-8333-000000000001").unwrap();
+    insert_active_grant(
+        &pool,
+        rina_id,
+        "catalog:write",
+        time::OffsetDateTime::now_utc() - time::Duration::days(1),
+    )
+    .await;
+
+    let principal = load_principal_for_user(&pool, rina_id, "local".to_owned(), false)
+        .await
+        .unwrap();
+    assert!(!principal.has("catalog:write"));
+    Ok(())
+}

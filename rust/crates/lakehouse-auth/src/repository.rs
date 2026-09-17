@@ -48,8 +48,33 @@ pub use lakehouse_store::PgPool;
 /// for a value the caller can supply for free.
 ///
 /// Merges `role.permissions` across every role the user holds (see
-/// [`crate::permissions`] for the parsing/merge semantics) and collects
-/// every tenant the user belongs to.
+/// [`crate::permissions`] for the parsing/merge semantics), folds in every
+/// still-active `access_grant` (WS7 item E4 — see this function's own
+/// "Access grants" section below), and collects every tenant the user
+/// belongs to.
+///
+/// # Access grants (WS7 item E4) widen `permissions`, never `role_names`
+///
+/// An approved [`lakehouse_store::agents::AccessGrant`] (WS7 item E3) adds
+/// ONE permission token to this call's returned [`Principal::permissions`]
+/// — through the exact same [`PermissionSet::merge`] the role permissions
+/// already go through, so a granted permission is indistinguishable from a
+/// role-held one at every `principal.has(...)` check site. This is
+/// deliberately the ONLY thing an access grant widens: [`Principal::role_names`]
+/// stays exactly the user's real role memberships — an access grant never
+/// fabricates a role the user was not actually assigned, matching
+/// [`Principal::role_names`]'s own doc comment (WS7 item A1). Only a grant
+/// with `revoked_at IS NULL AND expires_at > now()` is folded in — an
+/// EXPIRED-but-not-yet-swept grant already stops applying here immediately
+/// (the periodic revocation sweep, WS7 item E3 Step 4, is cleanup, not the
+/// enforcement point), and a REVOKED grant never applies again.
+///
+/// This is one extra query on the hottest auth path (session validation,
+/// run on every authenticated request) — justified the same way
+/// `tenant_ids`'s own extra query already is: this file's existing pattern
+/// of "one query per real-time-varying fact", rather than folding grants
+/// into the role-permissions query and losing the ability to reason about
+/// each source independently.
 ///
 /// # Errors
 ///
@@ -77,8 +102,27 @@ pub async fn load_principal_for_user(
     .fetch_all(pool)
     .await?;
     let role_names: Vec<String> = role_rows.iter().map(|(name, _)| name.clone()).collect();
-    let permissions =
-        PermissionSet::merge(role_rows.iter().map(|(_, raw)| PermissionSet::parse(raw)));
+
+    // WS7 item E4: every still-active access_grant permission, each
+    // treated as its own single-token PermissionSet (mirroring how a
+    // role's own free-text `permissions` column parses into one) so it
+    // merges through the SAME PermissionSet::merge call every role's
+    // permissions already go through — never a second, parallel grant
+    // mechanism (see this function's own doc comment).
+    let grant_rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT permission FROM access_grant \
+         WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now()",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    let permissions = PermissionSet::merge(
+        role_rows
+            .iter()
+            .map(|(_, raw)| PermissionSet::parse(raw))
+            .chain(grant_rows.iter().map(|(perm,)| PermissionSet::parse(perm))),
+    );
 
     let tenant_ids: Vec<(Uuid,)> =
         sqlx::query_as("SELECT tenant_id FROM app_user_tenant WHERE user_id = $1")
