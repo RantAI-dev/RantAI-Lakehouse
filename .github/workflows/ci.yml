@@ -430,10 +430,16 @@ jobs:
   # docs/plans/P5-RESULT.md) — Debezium Server + debezium-server-iceberg
   # captures a real Postgres table via logical replication; INSERT/UPDATE/
   # DELETE are all visible in ClickHouse within the agreed latency, and
-  # replication-slot cleanup on connector delete is verified. Does not
-  # need the Dagster webserver/daemon (debezium-server has no dependency
-  # on them), so this job is lighter than g3a-dagster/g3-maintenance
-  # above. See ops/g4/g4_test.py. ──
+  # replication-slot cleanup on connector delete is verified. WS5 item C3:
+  # this job ALSO now needs the Dagster webserver/daemon and
+  # lakehouse-api -- g4_test.py's step_wal_breach_produces_a_
+  # silenceable_alert_instance (WS5 acceptance) logs into lakehouse-api,
+  # launches replication_metrics_job through the Dagster webserver's
+  # GraphQL `launchRun` (the daemon's run queue actually executes it),
+  # and drives /api/alerts/run + /api/overview/alerts. Brought up with
+  # the same lakehouse-api/dagster-code-location/dagster-webserver/
+  # dagster-daemon set g3a-dagster/g3-maintenance already use, for the
+  # same reason. See ops/g4/g4_test.py. ──
   g4-cdc:
     name: Rust · G4 Debezium CDC into Bronze
     runs-on: ubuntu-latest
@@ -448,14 +454,24 @@ jobs:
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
+          # WS5 item C3: step_wal_breach_produces_a_silenceable_alert_instance
+          # calls POST /api/alerts/run with a bootstrap-admin (human)
+          # session, never a service-identity principal. With
+          # ALERTS_RUN_TOKEN unset, routes::alerts::check_run_token
+          # (D4, fail-closed) refuses anything but a service principal,
+          # so the gate needs a shared token here -- an obviously-fake
+          # CI value, same style as AUTH_BOOTSTRAP_PASSWORD above.
+          ALERTS_RUN_TOKEN=ci-alerts-run-token-not-real-123
           EOF
 
-      - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, the demo CDC source, and Debezium Server
+      - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, the demo CDC source, Debezium Server, and Dagster
         run: >
-          docker compose -p g4ci --profile dagster up -d
+          docker compose -p g4ci --profile dagster up -d --build
           postgres clickhouse rustfs rustfs-bucket-init
           lakekeeper-db-init lakekeeper-migrate lakekeeper lakekeeper-warehouse-init
           g4-source-init debezium-server
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon
 
       - name: Run the G4 acceptance test inside the compose network
         run: docker compose -p g4ci --profile dagster run --rm g4-test-runner

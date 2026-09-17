@@ -2237,6 +2237,15 @@ services:
         condition: service_started
       g4-source-init:
         condition: service_completed_successfully
+      # WS5 item C3 (C3-F1): step_wal_breach_produces_a_silenceable_
+      # alert_instance logs into lakehouse-api and launches
+      # replication_metrics_job through the Dagster webserver's GraphQL
+      # `launchRun` -- both must be up before g4_test.py runs, same
+      # g3a-test-runner precedent (`ops/g3a`'s own service block above).
+      lakehouse-api:
+        condition: service_started
+      dagster-webserver:
+        condition: service_healthy
     environment:
       DEPROVISION_SCRIPT: /opt/deprovision_connector.sh
       CH_URL: http://clickhouse:8123
@@ -2253,6 +2262,22 @@ services:
       PGUSER: ${POSTGRES_USER:-lakehouse}
       PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
       PGDATABASE: ${POSTGRES_DB:-lakehouse}
+      # WS5 item C3 -- g4_test.py's own env var names (duplicated from
+      # ops/g3a/g3a_test.py per its module comment, but NOT identically
+      # named: g4_test.py reads `API_URL`, not `LAKEHOUSE_API_URL`, and
+      # its built-in default port (8089) does not match lakehouse-api's
+      # actual listen port (8080, docker-compose.yml's own `ports:`) --
+      # set explicitly here rather than relying on that stale default.
+      API_URL: http://lakehouse-api:8080
+      DAGSTER_URL: http://dagster-webserver:3000/graphql
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      # Must match lakehouse-api's own ALERTS_RUN_TOKEN (both read the
+      # same `.env` value) -- routes::alerts::check_run_token (D4) fails
+      # closed to a service-identity principal when this is unset, and
+      # g4_test.py's step_login authenticates as a human bootstrap admin,
+      # not a service principal.
+      ALERTS_RUN_TOKEN: ${ALERTS_RUN_TOKEN:-}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null && pip install -q requests && python g4_test.py"
