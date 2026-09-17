@@ -18,6 +18,7 @@ import {
   Layers,
   Library,
   ListChecks,
+  PackageCheck,
   Plug,
   SearchCode,
   Server,
@@ -89,6 +90,7 @@ export const NAV_GROUPS: NavGroup[] = [
       { title: "Data Explorer", href: "/data", icon: Database },
       { title: "Catalog", href: "/catalog", icon: Library },
       { title: "Connectors", href: "/connectors", icon: Plug },
+      { title: "Gold Exports", href: "/gold-exports", icon: PackageCheck },
     ],
   },
   {
