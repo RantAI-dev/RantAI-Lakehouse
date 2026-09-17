@@ -1014,16 +1014,30 @@ pub async fn ingest_spec_put(
 /// declines to build a signal-table/incremental-snapshot mechanism —
 /// there is no `debezium_signal` table anywhere in this codebase.
 /// `Debezium`'s own default `snapshot.mode=initial` already performs the
-/// initial-snapshot-then-stream sequence automatically, the moment a
-/// `debezium-server` process starts against a newly created replication
-/// slot/publication (`ops/debezium/render_compose.py` renders that
-/// service). So there is nothing a route can trigger: the trigger already
-/// happened, at `debezium-server` startup, not at a caller's request.
-const CDC_INGEST_RUN_UNSUPPORTED_REASON: &str = "CDC ingestion has no separate trigger: \
-    Debezium's own snapshot.mode=initial (ADR 0008) runs the initial snapshot automatically \
-    the moment the debezium-server compose service (ops/debezium/render_compose.py) starts \
-    against this connector's replication slot/publication. Bring that service up to start \
-    ingestion; there is nothing this route can trigger.";
+/// initial-snapshot-then-stream sequence automatically, the moment this
+/// connector's own `debezium-<slug>` compose service
+/// (`ops/debezium/render_compose.py`'s `service_name = f"debezium-
+/// {sanitized_id}"`, the SAME [`connector_slug_for_id`] sanitize transform
+/// used here) starts against its replication slot/publication. So there
+/// is nothing a route can trigger: the trigger already happened, at that
+/// service's startup, not at a caller's request.
+///
+/// Falls back to the raw `connector_id` (rather than failing the whole
+/// "unsupported" response) on the practically-unreachable case
+/// [`connector_slug_for_id`] itself documents — an honest refusal should
+/// not itself 500 over a display-string detail.
+fn cdc_ingest_run_unsupported_reason(connector_id: &str) -> String {
+    let slug = connector_slug_for_id(connector_id)
+        .map_or_else(|_| connector_id.to_owned(), |slug| slug.to_string());
+    format!(
+        "CDC ingestion has no separate trigger: Debezium's own \
+         snapshot.mode=initial (ADR 0008) runs the initial snapshot \
+         automatically the moment the debezium-{slug} compose service \
+         (ops/debezium/render_compose.py) starts against this \
+         connector's replication slot/publication. Bring that service up \
+         to start ingestion; there is nothing this route can trigger."
+    )
+}
 
 /// `POST /api/connectors/{id}/ingest/run` — launch this connector's
 /// static `ingest_job` now, or (for a `cdc`-adapter connector) report the
@@ -1069,7 +1083,7 @@ pub async fn ingest_run(
     if adapter == "cdc" {
         return Ok(ApiJson(json!({
             "supported": false,
-            "reason": CDC_INGEST_RUN_UNSUPPORTED_REASON,
+            "reason": cdc_ingest_run_unsupported_reason(&id),
         })));
     }
 

@@ -129,6 +129,27 @@ additive and narrow (one column, `0033`'s migration) while pushing the
 actual shape enforcement to the one layer that has to enforce it either
 way.
 
+## Relationship to ADR 0008 (`cdc`'s `dial` has no trigger of its own)
+
+`ADR 0008` (`docs/adr/0008-initial-snapshot-backfill.md`) already settled
+that this build does not implement a signal-table/incremental-snapshot
+mechanism for `cdc` connectors: `Debezium`'s own default
+`snapshot.mode=initial` performs the initial-snapshot-then-stream sequence
+automatically, the moment the connector's `debezium-<slug>` compose
+service (`ops/debezium/render_compose.py`) starts against the
+`slotName`/`publicationName` this ADR's `cdc` `dial` shape carries. This
+matters for `POST /api/connectors/{id}/ingest/run` (WS3 item 29/30):
+unlike a `sql`/`files`/`rest`/`sheets` connector, launching a `cdc`
+connector's `ingest_job` would do nothing meaningful — there is no
+separate "start ingesting" step for `cdc` to trigger, because it already
+started, at `debezium-<slug>`'s own boot. The route reflects that
+honestly (`200 { supported: false, reason: "..." }`, naming ADR 0008 and
+the compose service to bring up), rather than either fabricating a
+"snapshot started" response or silently no-oping. A reader who only has
+this ADR in hand (this one describes the `cdc` `dial` shape, not why
+`ingest/run` treats it specially) should follow this pointer to ADR
+0008 rather than re-deriving the conclusion from scratch.
+
 ## Verification
 
 `cargo test -p lakehouse-store` for `0033`'s own regression coverage —
