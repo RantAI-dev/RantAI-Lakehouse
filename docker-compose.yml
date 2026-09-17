@@ -2297,6 +2297,47 @@ services:
       - "apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null && pip install -q requests && python g4_test.py"
     restart: "no"
 
+  # WS7 (Hard Requirement 10, item H2) — governance masking acceptance
+  # test: `ops/g8/g8_governance_test.py`. `test` profile, not `dagster` —
+  # this gate only needs `lakehouse-api` (which itself only depends on
+  # `postgres`/`clickhouse`, `docker-compose.yml:99-102`), matching
+  # `gold-export-test-runner`'s precedent above, not `g4-test-runner`'s
+  # (that one needs the full CDC/dagster chain for unrelated reasons).
+  #
+  # Usage (from a clean stack):
+  #   docker compose -p <project> up -d --build lakehouse-api
+  #   docker compose -p <project> --profile test run --rm g8-test-runner
+  g8-test-runner:
+    profiles: ["test"]
+    image: python:3.12-slim
+    working_dir: /work
+    volumes:
+      - ./ops/g8:/work
+    depends_on:
+      lakehouse-api:
+        condition: service_started
+    environment:
+      CH_URL: http://clickhouse:8123
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      # g8 needs direct Postgres access to the CONSOLE's own database
+      # (app_user/auth_identity/role) to seed a real Analyst login (WS7
+      # item H1's `step_seed_analyst_login`) — the SAME values
+      # g4-test-runner already sets for its own, unrelated CDC-source
+      # psql access above, not new ones.
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-lakehouse}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-lakehouse}
+      PGDATABASE: ${POSTGRES_DB:-lakehouse}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null && pip install -q requests argon2-cffi && python g8_governance_test.py"
+    restart: "no"
+
   # WS3 (G6) — Tier 1 ingestion matrix gate fixtures: one MySQL and one
   # SQL Server source the `sql` adapter (`dagster/dispar_orchestrate/
   # adapters/sql.py`) dials, plus a stdlib REST fixture server the `rest`

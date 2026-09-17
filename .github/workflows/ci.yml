@@ -582,3 +582,40 @@ jobs:
       - name: Tear down
         if: always()
         run: docker compose -p goldci down -v
+
+  # ── WS7 (Hard Requirement 10, item H2) — an authored masking policy
+  # masks a column for an Analyst and shows it in clear text for an
+  # admin; a bare SELECT */CTE-wrapped SELECT * bypass attempt is masked
+  # or refused identically. See ops/g8/g8_governance_test.py. Brings up
+  # only lakehouse-api (which pulls in postgres+clickhouse via its own
+  # depends_on, docker-compose.yml:99-102) — same shape as the
+  # `gold-export` job above, not `g4-cdc` below (that one needs the full
+  # CDC/dagster chain for unrelated reasons this gate has no part of). ──
+  g8-governance:
+    name: Rust · G8 governance masking
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Write CI-only .env
+        run: |
+          cat > .env <<'EOF'
+          AUTH_BOOTSTRAP_EMAIL=ci@example.com
+          AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
+          EOF
+
+      - name: Bring up lakehouse-api (and postgres/clickhouse via its own depends_on)
+        run: docker compose -p g8ci up -d --build lakehouse-api
+
+      - name: Run the G8 governance acceptance test inside the compose network
+        run: docker compose -p g8ci --profile test run --rm g8-test-runner
+
+      - name: Compose logs (on failure)
+        if: failure()
+        run: docker compose -p g8ci logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose -p g8ci down -v
