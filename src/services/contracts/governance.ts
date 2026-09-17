@@ -19,6 +19,11 @@ export type Policy = {
   version: number
   owner: string
   updatedAt: string
+  // Raw, still-unparsed `conditions` JSON string (WS7 item A2). Absent for
+  // a legacy policy authored before conditions were structured. A legacy
+  // value may be free-text prose rather than JSON — never assume it parses
+  // and never crash the policy list page on a `JSON.parse` failure.
+  conditions?: string
 }
 
 export type ClassificationRule = {

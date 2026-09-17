@@ -91,6 +91,15 @@ pub struct Policy {
     pub owner: String,
     /// When the policy was last written, ISO 8601. Serializes as `updatedAt`.
     pub updated_at: String,
+    /// The raw, still-authored `conditions` blob, if any. A legacy
+    /// pre-WS7 policy has free-text prose here (or nothing at all); a
+    /// WS7-authored one has the structured JSON `lakehouse-api`'s
+    /// `policy_engine::PolicyCondition::parse` understands. Omitted from
+    /// the wire entirely (not serialized as `null`) when absent, so a
+    /// legacy policy's response shape is unchanged from before this field
+    /// existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -105,6 +114,7 @@ struct PolicyRow {
     version: i32,
     owner: String,
     updated_at: OffsetDateTime,
+    conditions: Option<String>,
 }
 
 impl From<PolicyRow> for Policy {
@@ -120,6 +130,7 @@ impl From<PolicyRow> for Policy {
             version: row.version,
             owner: row.owner,
             updated_at: iso_millis(row.updated_at),
+            conditions: row.conditions,
         }
     }
 }
@@ -130,7 +141,7 @@ impl From<PolicyRow> for Policy {
 /// ([`create_policy`]), which need the same columns but never the same
 /// clause around them.
 const POLICY_COLUMNS: &str =
-    "id, name, status, kind, subjects, resources, effect, version, owner, updated_at";
+    "id, name, status, kind, subjects, resources, effect, version, owner, updated_at, conditions";
 
 /// List every authored quality rule, newest first. Used by
 /// `GET /api/governance/quality` to union authored rules on top of the
@@ -208,9 +219,10 @@ pub struct CreatePolicyInput {
     pub resources: String,
     /// The policy's effect.
     pub effect: String,
-    /// Free-text condition expression. Stored (an authored policy's
-    /// conditions are as much a fact about it as its effect), but not part
-    /// of the `Policy` wire type — the contract never reads it back.
+    /// Free-text or structured-JSON condition expression, stored verbatim
+    /// (an authored policy's conditions are as much a fact about it as its
+    /// effect). Read back on `Policy.conditions` (WS7 item A2) — see that
+    /// field's doc comment for the legacy-prose-vs-structured-JSON split.
     pub conditions: Option<String>,
     /// `true` -> status `"ready"`, `false`/absent -> `"draft"`, matching
     /// `mock/identity.ts`'s `createPolicy`.
@@ -646,6 +658,38 @@ mod tests {
 
     use super::*;
 
+    /// Enforcement structure lives INSIDE the string (parsed by
+    /// `lakehouse-api`'s `policy_engine`, WS7 item A3) — the store layer
+    /// stays a dumb TEXT column, exactly as `create_policy` already treats
+    /// it. This just proves `serde_json` accepts the authored shape;
+    /// [`policy_wire_type_exposes_conditions`] below is the real
+    /// assertion that the WIRE type now carries it back out.
+    #[test]
+    fn create_policy_input_conditions_round_trips_as_a_plain_string() {
+        let json_conditions =
+            r#"{"roles":["Analyst"],"table":"serving.mart_customer_segment","mask":["email"]}"#;
+        assert!(serde_json::from_str::<serde_json::Value>(json_conditions).is_ok());
+    }
+
+    #[test]
+    fn policy_wire_type_exposes_conditions() {
+        let row = PolicyRow {
+            id: Uuid::nil(),
+            name: "n".to_owned(),
+            status: "ready".to_owned(),
+            kind: "Row filter".to_owned(),
+            subjects: "s".to_owned(),
+            resources: "r".to_owned(),
+            effect: "Permit with obligation".to_owned(),
+            version: 1,
+            owner: "o".to_owned(),
+            updated_at: OffsetDateTime::now_utc(),
+            conditions: Some("{}".to_owned()),
+        };
+        let policy: Policy = row.into();
+        assert_eq!(policy.conditions.as_deref(), Some("{}"));
+    }
+
     /// The wire format is the contract: every key the browser reads must be
     /// the camelCase name `contracts/governance.ts` declares.
     #[test]
@@ -661,6 +705,7 @@ mod tests {
             version: 1,
             owner: "o".to_owned(),
             updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            conditions: None,
         };
         let value = serde_json::to_value(&policy).unwrap();
         for key in [
