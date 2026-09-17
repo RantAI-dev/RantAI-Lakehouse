@@ -2,7 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { useRouter } from "next/navigation"
+import { useRouter, useSearchParams } from "next/navigation"
 import { FormReviewSummary } from "@/components/patterns/form-review-summary"
 import { FormStepLayout, type FormStep } from "@/components/patterns/form-step-layout"
 import { PageHeader } from "@/components/patterns/page-header"
@@ -10,54 +10,99 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
-import { useServiceAction } from "@/hooks/use-service"
+import { useService, useServiceAction } from "@/hooks/use-service"
+import {
+  CAST_TYPES,
+  FILTER_OPERATORS,
+  renderTransformDraft,
+  transformErrorRowIndex,
+  type TransformDraft,
+} from "@/lib/transform-draft"
 import { cn } from "@/lib/utils"
-import { pipelineService } from "@/services"
+import { connectorService, pipelineService } from "@/services"
 import type { PipelineKind } from "@/services/contracts/pipelines"
 
 const STEPS: FormStep[] = [
   { id: "source", label: "Source", description: "Name and source table" },
-  { id: "transform", label: "Transform", description: "Chips or FBIC" },
+  { id: "transform", label: "Transform", description: "Grammar-checked transform steps" },
   { id: "target", label: "Target", description: "Destination table" },
   { id: "schedule", label: "Schedule", description: "Trigger and ownership" },
   { id: "review", label: "Review", description: "Confirm and create" },
 ]
 
-const TRANSFORM_CHIPS = [
-  "Select",
-  "Filter",
-  "Rename",
-  "Cast",
-  "Clean",
-  "Join",
-  "Aggregate",
-  "Deduplicate",
-]
-
 const KIND_OPTIONS: PipelineKind[] = ["batch", "incremental"]
+
+/** The five verbs `transform_grammar.rs::parse_transform` accepts — nothing else is offered. */
+const TRANSFORM_VERBS: TransformDraft["verb"][] = ["dedupe", "filter", "rename", "cast", "select"]
+
+function emptyDraftFor(verb: TransformDraft["verb"]): TransformDraft {
+  switch (verb) {
+    case "dedupe":
+      return { verb: "dedupe", key: "" }
+    case "filter":
+      return { verb: "filter", column: "", operator: FILTER_OPERATORS[0], value: "" }
+    case "rename":
+      return { verb: "rename", from: "", to: "" }
+    case "cast":
+      return { verb: "cast", column: "", type: CAST_TYPES[0] }
+    case "select":
+      return { verb: "select", columns: "" }
+  }
+}
+
+/** A draft is only addable once its own required fields are non-blank — never sent to the server half-filled. */
+function draftIsComplete(draft: TransformDraft): boolean {
+  switch (draft.verb) {
+    case "dedupe":
+      return draft.key.trim().length > 0
+    case "filter":
+      return draft.column.trim().length > 0 && draft.value.trim().length > 0
+    case "rename":
+      return draft.from.trim().length > 0 && draft.to.trim().length > 0
+    case "cast":
+      return draft.column.trim().length > 0
+    case "select":
+      return draft.columns.trim().length > 0
+  }
+}
 
 export function PipelineCreatePage() {
   const router = useRouter()
+  const searchParams = useSearchParams()
   const [step, setStep] = React.useState(0)
   const [name, setName] = React.useState("")
   const [kind, setKind] = React.useState<PipelineKind>("incremental")
   const [sourceZone, setSourceZone] = React.useState("bronze")
   const [sourceTable, setSourceTable] = React.useState("")
   const [incrementalColumn, setIncrementalColumn] = React.useState("updated_at")
-  const [transforms, setTransforms] = React.useState<string[]>([])
+  const [transformDrafts, setTransformDrafts] = React.useState<TransformDraft[]>([])
+  const [pendingVerb, setPendingVerb] = React.useState<TransformDraft["verb"]>("dedupe")
+  const [pendingDraft, setPendingDraft] = React.useState<TransformDraft>(emptyDraftFor("dedupe"))
   const [fbicEnabled, setFbicEnabled] = React.useState(false)
   const [targetZone, setTargetZone] = React.useState("silver")
   const [targetTable, setTargetTable] = React.useState("")
   const [schedule, setSchedule] = React.useState("Every hour")
+  const connectorIdFromUrl = searchParams.get("connectorId") ?? ""
+  const [connectorId, setConnectorId] = React.useState(connectorIdFromUrl)
+  const connectors = useService(
+    (signal) => connectorService.listConnectors(signal),
+    []
+  )
   const create = useServiceAction((signal, input: Parameters<typeof pipelineService.createPipeline>[0]) =>
     pipelineService.createPipeline(input, signal)
   )
+
+  // The 400 body names the failing row as `transforms[<index>]` (see
+  // routes/pipelines.rs::create) — surface it against that row instead of
+  // only the page-level generic message.
+  const failedTransformIndex =
+    create.status === "error" ? transformErrorRowIndex(create.error.message) : null
 
   const canProceed = React.useMemo(() => {
     if (step === 0) {
       return Boolean(name.trim() && sourceZone.trim() && sourceTable.trim() && incrementalColumn.trim())
     }
-    if (step === 1) return transforms.length > 0 || fbicEnabled
+    if (step === 1) return transformDrafts.length > 0 || fbicEnabled
     if (step === 2) return Boolean(targetZone.trim() && targetTable.trim())
     if (step === 3) return Boolean(schedule.trim())
     return true
@@ -67,17 +112,21 @@ export function PipelineCreatePage() {
     sourceZone,
     sourceTable,
     incrementalColumn,
-    transforms,
+    transformDrafts,
     fbicEnabled,
     targetZone,
     targetTable,
     schedule,
   ])
 
-  function toggleTransform(chip: string) {
-    setTransforms((prev) =>
-      prev.includes(chip) ? prev.filter((c) => c !== chip) : [...prev, chip]
-    )
+  function addTransformDraft() {
+    if (!draftIsComplete(pendingDraft)) return
+    setTransformDrafts((prev) => [...prev, pendingDraft])
+    setPendingDraft(emptyDraftFor(pendingVerb))
+  }
+
+  function removeTransformDraft(index: number) {
+    setTransformDrafts((prev) => prev.filter((_, i) => i !== index))
   }
 
   async function handleSubmit() {
@@ -87,11 +136,12 @@ export function PipelineCreatePage() {
       sourceZone: sourceZone.trim(),
       sourceTable: sourceTable.trim(),
       incrementalColumn: incrementalColumn.trim(),
-      transforms,
+      transforms: transformDrafts.map(renderTransformDraft),
       fbicEnabled,
       targetZone: targetZone.trim(),
       targetTable: targetTable.trim(),
       schedule: schedule.trim(),
+      connectorId: connectorId || undefined,
     })
     if (result) router.push("/pipelines")
   }
@@ -143,6 +193,29 @@ export function PipelineCreatePage() {
             <Field label="Source zone">
               <Input value={sourceZone} onChange={(e) => setSourceZone(e.target.value)} />
             </Field>
+            <Field label="Connector" className="sm:col-span-2">
+              {connectorIdFromUrl ? (
+                <div className="flex items-center justify-between rounded-lg border border-border px-3 py-1.5 text-sm">
+                  <span className="font-mono">{connectorIdFromUrl}</span>
+                  <Button variant="outline" size="sm" render={<Link href="/connectors" />}>
+                    Change
+                  </Button>
+                </div>
+              ) : (
+                <select
+                  className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+                  value={connectorId}
+                  onChange={(e) => setConnectorId(e.target.value)}
+                >
+                  <option value="">No connector (read a ClickHouse table directly)</option>
+                  {(connectors.data ?? []).map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </Field>
             <Field label="Source table">
               <Input
                 value={sourceTable}
@@ -157,25 +230,173 @@ export function PipelineCreatePage() {
           <div className="space-y-4">
             <div>
               <p className="mb-2 text-sm font-medium">Transforms</p>
-              <div className="flex flex-wrap gap-2">
-                {TRANSFORM_CHIPS.map((chip) => {
-                  const active = transforms.includes(chip)
-                  return (
-                    <button
-                      key={chip}
-                      type="button"
-                      onClick={() => toggleTransform(chip)}
+              <p className="mb-2 text-xs text-muted-foreground">
+                Only the verbs and operators the server&apos;s transform grammar accepts are offered
+                here — the request is still re-validated server-side on submit.
+              </p>
+              {transformDrafts.length > 0 ? (
+                <ul className="mb-3 space-y-1">
+                  {transformDrafts.map((draft, index) => (
+                    <li
+                      key={index}
                       className={cn(
-                        "rounded-full border px-3 py-1 text-xs font-medium transition-colors",
-                        active
-                          ? "border-primary bg-primary/15 text-primary"
-                          : "border-border text-muted-foreground hover:bg-muted"
+                        "flex items-center justify-between gap-2 rounded-lg border px-3 py-1.5 text-xs",
+                        failedTransformIndex === index
+                          ? "border-destructive bg-destructive/10"
+                          : "border-border"
                       )}
                     >
-                      {chip}
-                    </button>
-                  )
-                })}
+                      <span className="font-mono">{renderTransformDraft(draft)}</span>
+                      <div className="flex items-center gap-2">
+                        {failedTransformIndex === index ? (
+                          <span className="text-destructive">{create.status === "error" ? create.error.message : ""}</span>
+                        ) : null}
+                        <button
+                          type="button"
+                          onClick={() => removeTransformDraft(index)}
+                          className="text-muted-foreground hover:text-foreground"
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mb-3 text-xs text-muted-foreground">No transforms added yet.</p>
+              )}
+              <div className="flex flex-wrap items-end gap-2 rounded-lg border border-dashed border-border p-3">
+                <Field label="Verb">
+                  <select
+                    className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+                    value={pendingVerb}
+                    onChange={(e) => {
+                      const verb = e.target.value as TransformDraft["verb"]
+                      setPendingVerb(verb)
+                      setPendingDraft(emptyDraftFor(verb))
+                    }}
+                  >
+                    {TRANSFORM_VERBS.map((verb) => (
+                      <option key={verb} value={verb}>
+                        {verb}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                {pendingDraft.verb === "dedupe" ? (
+                  <Field label="Key column">
+                    <Input
+                      value={pendingDraft.key}
+                      onChange={(e) => setPendingDraft({ verb: "dedupe", key: e.target.value })}
+                      placeholder="order_id"
+                    />
+                  </Field>
+                ) : null}
+                {pendingDraft.verb === "filter" ? (
+                  <>
+                    <Field label="Column">
+                      <Input
+                        value={pendingDraft.column}
+                        onChange={(e) =>
+                          setPendingDraft({ ...pendingDraft, column: e.target.value })
+                        }
+                        placeholder="status"
+                      />
+                    </Field>
+                    <Field label="Operator">
+                      <select
+                        className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+                        value={pendingDraft.operator}
+                        onChange={(e) =>
+                          setPendingDraft({
+                            ...pendingDraft,
+                            operator: e.target.value as (typeof FILTER_OPERATORS)[number],
+                          })
+                        }
+                      >
+                        {FILTER_OPERATORS.map((op) => (
+                          <option key={op} value={op}>
+                            {op}
+                          </option>
+                        ))}
+                      </select>
+                    </Field>
+                    <Field label="Value">
+                      <Input
+                        value={pendingDraft.value}
+                        onChange={(e) => setPendingDraft({ ...pendingDraft, value: e.target.value })}
+                        placeholder="active"
+                      />
+                    </Field>
+                  </>
+                ) : null}
+                {pendingDraft.verb === "rename" ? (
+                  <>
+                    <Field label="From column">
+                      <Input
+                        value={pendingDraft.from}
+                        onChange={(e) => setPendingDraft({ ...pendingDraft, from: e.target.value })}
+                        placeholder="old_col"
+                      />
+                    </Field>
+                    <Field label="To column">
+                      <Input
+                        value={pendingDraft.to}
+                        onChange={(e) => setPendingDraft({ ...pendingDraft, to: e.target.value })}
+                        placeholder="new_col"
+                      />
+                    </Field>
+                  </>
+                ) : null}
+                {pendingDraft.verb === "cast" ? (
+                  <>
+                    <Field label="Column">
+                      <Input
+                        value={pendingDraft.column}
+                        onChange={(e) =>
+                          setPendingDraft({ ...pendingDraft, column: e.target.value })
+                        }
+                        placeholder="amount"
+                      />
+                    </Field>
+                    <Field label="Type">
+                      <select
+                        className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+                        value={pendingDraft.type}
+                        onChange={(e) =>
+                          setPendingDraft({
+                            ...pendingDraft,
+                            type: e.target.value as (typeof CAST_TYPES)[number],
+                          })
+                        }
+                      >
+                        {CAST_TYPES.map((t) => (
+                          <option key={t} value={t}>
+                            {t}
+                          </option>
+                        ))}
+                      </select>
+                    </Field>
+                  </>
+                ) : null}
+                {pendingDraft.verb === "select" ? (
+                  <Field label="Columns (comma-separated)">
+                    <Input
+                      value={pendingDraft.columns}
+                      onChange={(e) => setPendingDraft({ verb: "select", columns: e.target.value })}
+                      placeholder="id,name,amount"
+                    />
+                  </Field>
+                ) : null}
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={!draftIsComplete(pendingDraft)}
+                  onClick={addTransformDraft}
+                >
+                  Add transform
+                </Button>
               </div>
             </div>
             <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
@@ -227,6 +448,7 @@ export function PipelineCreatePage() {
                   { label: "Kind", value: kind },
                   { label: "Source", value: `${sourceZone}.${sourceTable}` },
                   { label: "Incremental column", value: incrementalColumn },
+                  { label: "Connector", value: connectorId || "None" },
                 ],
               },
               {
@@ -234,7 +456,9 @@ export function PipelineCreatePage() {
                 items: [
                   {
                     label: "Transforms",
-                    value: transforms.length ? transforms.join(", ") : "—",
+                    value: transformDrafts.length
+                      ? transformDrafts.map(renderTransformDraft).join(", ")
+                      : "—",
                   },
                   { label: "FBIC", value: fbicEnabled ? "Enabled" : "Off" },
                 ],

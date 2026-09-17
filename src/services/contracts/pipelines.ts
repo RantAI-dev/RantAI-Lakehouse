@@ -72,6 +72,8 @@ export type CreatePipelineInput = {
   targetTable: string
   schedule: string
   owner?: string
+  /** Optional ingress connector this pipeline reads through (WS4 item F5) — mirrors `Pipeline.connectorId`. */
+  connectorId?: string
 }
 
 export interface PipelineService {
