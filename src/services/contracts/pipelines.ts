@@ -50,14 +50,73 @@ export type PipelineRun = {
   outputAssetId?: string
 }
 
+/** One op node in a job's dependency graph (`GET /api/pipelines/{id}`'s `graph.ops`). */
+export type PipelineOpNode = {
+  name: string
+  description: string | null
+  sourceRef: string | null
+  commit: string | null
+  sql: string | null
+}
+
+/** One dependency edge: `from` runs before `to`. */
+export type PipelineOpEdge = { from: string; to: string }
+
+/**
+ * An authored pipeline's stored definition, exactly the fields
+ * `CreatePipelineInput` already sends and `rust/crates/lakehouse-api/src/routes/pipelines.rs`'s
+ * `authored_detail` now persists and returns (WS4 item D-series).
+ */
+export type AuthoredDefinition = {
+  sourceZone: string
+  sourceTable: string
+  incrementalColumn: string | null
+  transforms: string[]
+  fbicEnabled: boolean
+  targetZone: string
+  targetTable: string
+  connectorId: string | null
+}
+
 export type PipelineDetail = Pipeline & {
-  /** Populated by WS4 from the Dagster op graph. Absent until then. */
-  graph?: { id: string; label: string; kind: string; status: EntityStatus }[]
-  /** Populated by WS4 from the job definition. Absent until then. */
-  description?: string
-  /** Populated by WS4 from the run config. Absent until then. */
-  configSummary?: { key: string; value: string }[]
+  /** `"dagster"` for a Dagster-native job, `"authored"` for a Postgres-defined pipeline. */
+  engine: "dagster" | "authored"
+  /** No free-text description exists for a Dagster job today (WS4 item C1); null for both engines. */
+  description: string | null
+  /** Null: no graph is knowable — an authored pipeline with no run yet, or a
+   * Dagster job Dagster itself could not resolve. Real (populated from
+   * `job_graph`) for a Dagster job whose graph resolved. */
+  graph: { ops: PipelineOpNode[]; edges: PipelineOpEdge[] } | null
+  /** Real per-run config when recorded; `[]` (not null) is a genuine
+   * measurement of "no configuration recorded", distinct from `graph: null`'s
+   * "not knowable at all". */
+  config: { key: string; value: string }[]
+  /** Non-null only for an authored (`pl-`) pipeline. */
+  definition: AuthoredDefinition | null
   runs: PipelineRun[]
+}
+
+/** `GET /api/pipelines/{id}/source?op=` response — one op's read-only source text. */
+export type PipelineSource = {
+  sourceRef: string
+  commit: string
+  language: "python" | "sql"
+  text: string
+}
+
+/** One entry of `GET /api/pipelines/{id}/runs/{runId}/steps`. */
+export type PipelineRunStep = {
+  stepKey: string
+  status: EntityStatus
+  startMs: number | null
+  endMs: number | null
+  materializations: { assetKey: string | null; rows: Measured }[]
+}
+
+/** One bounded page of `GET /api/pipelines/{id}/runs/{runId}/logs`. */
+export type PipelineRunLogsPage = {
+  lines: { ts: number; level: string; stepKey: string | null; message: string }[]
+  cursor: string
 }
 
 export type CreatePipelineInput = {
@@ -86,4 +145,20 @@ export interface PipelineService {
   retryRun(runId: string, signal?: AbortSignal): Promise<PipelineRun>
   pausePipeline(id: string, signal?: AbortSignal): Promise<Pipeline>
   resumePipeline(id: string, signal?: AbortSignal): Promise<Pipeline>
+  /** `GET /api/pipelines/{id}/source?op=` — one op's read-only source text (WS4 item F1). */
+  getPipelineSource(id: string, op: string, signal?: AbortSignal): Promise<PipelineSource>
+  /** `GET /api/pipelines/{id}/runs/{runId}/steps` (WS4 item F1). */
+  getRunSteps(id: string, runId: string, signal?: AbortSignal): Promise<PipelineRunStep[]>
+  /** `GET /api/pipelines/{id}/runs/{runId}/logs?cursor=` — one bounded page,
+   * forward from `cursor` when given (WS4 item F1). */
+  getRunLogs(
+    id: string,
+    runId: string,
+    cursor?: string,
+    signal?: AbortSignal
+  ): Promise<PipelineRunLogsPage>
+  /** `POST /api/pipelines/{id}/status` — the only console caller is WS4 item
+   * F4's "Activate" action, moving a draft authored pipeline to `"ready"`
+   * (WS4 item F1, judge review V10). */
+  setPipelineStatus(id: string, status: string, signal?: AbortSignal): Promise<Pipeline>
 }

@@ -2,6 +2,10 @@ import type {
   PipelineService,
   Pipeline,
   PipelineRun,
+  PipelineDetail,
+  PipelineSource,
+  PipelineRunStep,
+  PipelineRunLogsPage,
   CreatePipelineInput,
 } from "../contracts/pipelines";
 import { apiFetch } from "../http";
@@ -50,14 +54,11 @@ export const dagsterPipelineService: PipelineService = {
     return getJson<PipelineRun>(`/api/pipelines/${encodeURIComponent(id)}/trigger`, { method: "POST", signal });
   },
   async getPipeline(id, signal) {
-    const [list, runs] = await Promise.all([this.listPipelines(signal), this.listRuns(id, signal)]);
-    const base = list.find((p) => p.id === id);
-    if (!base) throw new ServiceError("not_found", "Pipeline not found");
-    // WS1 task 1.1: the description, op graph and config summary used to be
-    // invented here. The API cannot yet report them (WS4 adds the Dagster
-    // graph query), so the detail is the list row plus its real runs and the
-    // graph tab renders an empty state.
-    return { ...base, runs };
+    // WS4 item F1: `GET /api/pipelines/{id}` now returns the real detail
+    // (engine, op graph, config, authored definition) directly — no more
+    // reconstructing a partial detail from the list + runs endpoints, the
+    // WS1 task 1.1 placeholder this replaces.
+    return getJson<PipelineDetail>(`/api/pipelines/${encodeURIComponent(id)}`, { signal });
   },
 
   createPipeline(input: CreatePipelineInput, signal) {
@@ -74,5 +75,29 @@ export const dagsterPipelineService: PipelineService = {
   },
   resumePipeline(id, signal) {
     return postJson<Pipeline>(`/api/pipelines/${encodeURIComponent(id)}/resume`, undefined, signal);
+  },
+  getPipelineSource(id, op, signal) {
+    return getJson<PipelineSource>(
+      `/api/pipelines/${encodeURIComponent(id)}/source?op=${encodeURIComponent(op)}`,
+      { signal }
+    );
+  },
+  async getRunSteps(id, runId, signal) {
+    return (
+      await getJson<{ steps: PipelineRunStep[] }>(
+        `/api/pipelines/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/steps`,
+        { signal }
+      )
+    ).steps;
+  },
+  getRunLogs(id, runId, cursor, signal) {
+    const query = cursor ? `?cursor=${encodeURIComponent(cursor)}` : "";
+    return getJson<PipelineRunLogsPage>(
+      `/api/pipelines/${encodeURIComponent(id)}/runs/${encodeURIComponent(runId)}/logs${query}`,
+      { signal }
+    );
+  },
+  setPipelineStatus(id, status, signal) {
+    return postJson<Pipeline>(`/api/pipelines/${encodeURIComponent(id)}/status`, { status }, signal);
   },
 };
