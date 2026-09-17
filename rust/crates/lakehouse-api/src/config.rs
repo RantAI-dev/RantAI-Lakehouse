@@ -372,6 +372,14 @@ pub struct Config {
     /// `main::bootstrap_ingest_run_service`'s doc comment for why that
     /// scope, and no broader one, is granted.
     pub ingest_service_token: Option<String>,
+    /// Shared token `dagster/dispar_orchestrate`'s authored-pipeline
+    /// schedule factory (`authored_factory.py`, Phase E) uses to
+    /// authenticate against `GET /api/pipelines?engine=authored`. `None`
+    /// when unset. When set, `lakehouse-api` also seeds a service identity
+    /// scoped to `pipeline:write` ONLY from it — see
+    /// `main::bootstrap_pipeline_run_service`'s doc comment for why that
+    /// scope, and no broader one, is granted (WS4 item G3).
+    pub pipeline_run_token: Option<String>,
     /// Base URL of the `Trino` coordinator `routes::query::run` talks to
     /// for `engine: "trino"` requests (WS2 §4). Not a secret — an internal
     /// service address, like [`Self::ch_url`] — so it's printed verbatim
@@ -501,6 +509,10 @@ impl std::fmt::Debug for Config {
             .field(
                 "ingest_service_token",
                 &self.ingest_service_token.as_ref().map(|_| REDACTED),
+            )
+            .field(
+                "pipeline_run_token",
+                &self.pipeline_run_token.as_ref().map(|_| REDACTED),
             )
             .field("trino_url", &self.trino_url)
             .field("trino_max_rows", &self.trino_max_rows)
@@ -683,6 +695,7 @@ impl Config {
             agent_run_token: truthy(env, "AGENT_RUN_TOKEN"),
             lakehouse_maintenance_token: truthy(env, "LAKEHOUSE_MAINTENANCE_TOKEN"),
             ingest_service_token: truthy(env, "INGEST_SERVICE_TOKEN"),
+            pipeline_run_token: truthy(env, "PIPELINE_RUN_TOKEN"),
             trino_url: or_default(env, "TRINO_URL", "http://trino:8080"),
             #[allow(
                 clippy::cast_possible_truncation,
@@ -816,6 +829,7 @@ mod tests {
         assert_eq!(cfg.agent_run_token, None);
         assert_eq!(cfg.lakehouse_maintenance_token, None);
         assert_eq!(cfg.ingest_service_token, None);
+        assert_eq!(cfg.pipeline_run_token, None);
         assert_eq!(cfg.trino_url, "http://trino:8080");
         assert_eq!(cfg.trino_max_rows, 10_000);
         // Safe-by-default: SSRF blocking is ON unless explicitly disabled.

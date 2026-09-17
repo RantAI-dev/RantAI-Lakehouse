@@ -76,6 +76,13 @@ async fn main() -> anyhow::Result<()> {
     // for what happens when it's unset.
     bootstrap_agent_run_service(&state).await;
 
+    // WS4 item G3: same shape, for Dagster's authored-pipeline schedule
+    // factory (`dagster/dispar_orchestrate/authored_factory.py`, Phase E),
+    // from `PIPELINE_RUN_TOKEN` — see `bootstrap_pipeline_run_service`'s
+    // doc comment for what happens when it's unset, and why this identity
+    // is scoped to `pipeline:write` only.
+    bootstrap_pipeline_run_service(&state).await;
+
     // WS0 item 11: same shape, for Dagster's `alerts_run_schedule`
     // (`dagster/dispar_orchestrate/alerts_run.py`), from
     // `ALERTS_RUN_TOKEN` — see `bootstrap_alerts_run_service`'s doc
@@ -194,6 +201,12 @@ async fn bootstrap_admin(state: &AppState) {
 /// for its own (`PARITY_SERVICE_IDENTITY_NAME`).
 const AGENT_RUN_SERVICE_IDENTITY_NAME: &str = "agent-run-scheduler";
 
+/// Fixed name of the service identity
+/// [`bootstrap_pipeline_run_service`] provisions — same
+/// `<domain>-run-scheduler` shape as [`AGENT_RUN_SERVICE_IDENTITY_NAME`]
+/// (WS4 item G3).
+const PIPELINE_RUN_SERVICE_IDENTITY_NAME: &str = "authored-pipeline-scheduler";
+
 /// Fixed name of the service identity [`bootstrap_alerts_run_service`]
 /// provisions — same `<domain>-run-scheduler` shape as
 /// [`AGENT_RUN_SERVICE_IDENTITY_NAME`].
@@ -295,6 +308,53 @@ async fn bootstrap_agent_run_service(state: &AppState) {
         // `routes::agents::run_employee` DOES check this permission.
         vec!["agent:manage".to_owned()],
         "AGENT_RUN_TOKEN",
+    )
+    .await;
+}
+
+/// Idempotently seed the ONE service identity + credential that lets
+/// Dagster's authored-pipeline schedule factory
+/// (`dagster/dispar_orchestrate/authored_factory.py`, Phase E) authenticate
+/// against `lakehouse-api`, from [`Config::pipeline_run_token`] — the exact
+/// same `auth_gate`-floor problem [`bootstrap_agent_run_service`]/
+/// [`bootstrap_alerts_run_service`]/[`bootstrap_lakehouse_maintenance_service`]/
+/// [`bootstrap_ingest_run_service`] solve for their own callers, reusing
+/// the identical mechanism rather than a fifth, near-duplicate
+/// implementation (WS4 item G3; Baseline dependency 7 — the generalized
+/// [`bootstrap_service_run_identity`] core is reused, not redefined).
+///
+/// # Why this identity is scoped to `pipeline:write` ONLY
+///
+/// `authored_factory.py`'s job is not read-only: it both lists authored
+/// pipeline definitions (`GET /api/pipelines?engine=authored`,
+/// `pipeline:read`) AND, once Phase E lands, triggers/updates the authored
+/// jobs it builds from them — the same `pipeline:write`-gated surface a
+/// human `pipeline:write` principal uses (`POST /api/pipelines/{id}/
+/// trigger`, `POST /api/pipelines/{id}/status`). `pipeline:write` is the
+/// SMALLEST single permission that covers both: `PermissionSet` grants are
+/// not composable into "read AND this one write", so this identity is
+/// scoped to exactly `pipeline:write` — nothing broader, never `*:*`,
+/// never `catalog:write`/`connector:manage`, which this caller never
+/// touches. A leaked `PIPELINE_RUN_TOKEN` lets its holder operate authored
+/// pipelines, and nothing else.
+///
+/// # What happens when `PIPELINE_RUN_TOKEN` is absent
+///
+/// Logs a `tracing::warn!` and returns, seeding NOTHING — no identity, no
+/// credential — same posture as every other `bootstrap_*_run_service`
+/// above when its own token is unset. Phase E's schedule factory simply
+/// cannot authenticate yet, which is the existing, safe, documented
+/// posture this task follows, not a new one.
+async fn bootstrap_pipeline_run_service(state: &AppState) {
+    bootstrap_service_run_identity(
+        state,
+        state.config.pipeline_run_token.clone(),
+        PIPELINE_RUN_SERVICE_IDENTITY_NAME,
+        // ONLY `pipeline:write` — never `*:*`. See this function's own
+        // doc comment for why this single permission, and not a narrower
+        // read-only one, is the correct scope for this caller.
+        vec!["pipeline:write".to_owned()],
+        "PIPELINE_RUN_TOKEN",
     )
     .await;
 }
@@ -1240,6 +1300,112 @@ mod tests {
             let pool = state.pg.as_deref().expect("pg pool configured");
             assert_eq!(ingest_identity_row_count(pool).await, 0);
             assert_eq!(ingest_credential_row_count(pool).await, 0);
+        }
+
+        async fn pipeline_run_identity_row_count(pool: &sqlx::PgPool) -> i64 {
+            let (count,): (i64,) =
+                sqlx::query_as("SELECT count(*) FROM service_identity WHERE name = $1")
+                    .bind(PIPELINE_RUN_SERVICE_IDENTITY_NAME)
+                    .fetch_one(pool)
+                    .await
+                    .expect("count service_identity rows");
+            count
+        }
+
+        async fn pipeline_run_credential_row_count(pool: &sqlx::PgPool) -> i64 {
+            let (count,): (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM service_credential sc \
+                 JOIN service_identity si ON si.id = sc.service_identity_id \
+                 WHERE si.name = $1",
+            )
+            .bind(PIPELINE_RUN_SERVICE_IDENTITY_NAME)
+            .fetch_one(pool)
+            .await
+            .expect("count service_credential rows");
+            count
+        }
+
+        /// With `PIPELINE_RUN_TOKEN` set, boot seeds exactly one identity
+        /// scoped to `pipeline:write` ONLY (WS4 item G3) and one matching
+        /// credential; the token authenticates a real principal that holds
+        /// `pipeline:write` but NOT `catalog:write`/`connector:manage` —
+        /// proving [`bootstrap_service_run_identity`] behaves identically
+        /// for this caller while honoring this task's narrower scope
+        /// decision.
+        #[tokio::test]
+        async fn bootstrap_pipeline_run_service_seeds_identity_and_credential() {
+            let mut overrides = HashMap::new();
+            overrides.insert(
+                "PIPELINE_RUN_TOKEN".to_owned(),
+                "unit-test-pipeline-run-token".to_owned(),
+            );
+            let state = fresh_state(&overrides).await;
+
+            bootstrap_pipeline_run_service(&state).await;
+
+            let pool = state.pg.as_deref().expect("pg pool configured");
+            assert_eq!(pipeline_run_identity_row_count(pool).await, 1);
+            assert_eq!(pipeline_run_credential_row_count(pool).await, 1);
+
+            let (scopes,): (Vec<String>,) =
+                sqlx::query_as("SELECT scopes FROM service_identity WHERE name = $1")
+                    .bind(PIPELINE_RUN_SERVICE_IDENTITY_NAME)
+                    .fetch_one(pool)
+                    .await
+                    .expect("read the seeded identity's scopes");
+            assert_eq!(scopes, vec!["pipeline:write".to_owned()]);
+
+            let principal = lakehouse_auth::service_token::verify_service_token(
+                pool,
+                &lakehouse_auth::Secret::new("unit-test-pipeline-run-token".to_owned()),
+            )
+            .await
+            .expect("the configured token must authenticate a real service principal");
+            assert!(principal.permissions.has("pipeline:write"));
+            assert!(!principal.permissions.has("catalog:write"));
+            assert!(!principal.permissions.has("connector:manage"));
+        }
+
+        /// Running the bootstrap twice (a process restart) does not
+        /// duplicate the identity or the credential — same idempotency
+        /// shape every other `bootstrap_*_run_service` proves for itself.
+        #[tokio::test]
+        async fn bootstrap_pipeline_run_service_is_idempotent_across_two_runs() {
+            let mut overrides = HashMap::new();
+            overrides.insert(
+                "PIPELINE_RUN_TOKEN".to_owned(),
+                "unit-test-pipeline-run-token".to_owned(),
+            );
+            let state = fresh_state(&overrides).await;
+
+            bootstrap_pipeline_run_service(&state).await;
+            bootstrap_pipeline_run_service(&state).await;
+
+            let pool = state.pg.as_deref().expect("pg pool configured");
+            assert_eq!(
+                pipeline_run_identity_row_count(pool).await,
+                1,
+                "a second boot must not duplicate the service identity"
+            );
+            assert_eq!(
+                pipeline_run_credential_row_count(pool).await,
+                1,
+                "a second boot with the same token must not duplicate the credential"
+            );
+        }
+
+        /// With `PIPELINE_RUN_TOKEN` unset, bootstrap creates nothing at
+        /// all — no identity, no credential — same posture as
+        /// [`bootstrap_ingest_run_service`] when its own token is unset.
+        #[tokio::test]
+        async fn bootstrap_pipeline_run_service_creates_nothing_when_token_is_unset() {
+            let state = fresh_state(&HashMap::new()).await;
+
+            bootstrap_pipeline_run_service(&state).await;
+
+            let pool = state.pg.as_deref().expect("pg pool configured");
+            assert_eq!(pipeline_run_identity_row_count(pool).await, 0);
+            assert_eq!(pipeline_run_credential_row_count(pool).await, 0);
         }
     }
 }
