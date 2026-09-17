@@ -76,7 +76,12 @@ impl From<GoldExportError> for ApiError {
             // not our outage" shape as the other `Unprocessable` variants,
             // not a 500: the fix is retrying with a smaller mart or a
             // deliberately raised cap, not anything server-side.
-            | GoldExportError::RowCapExceeded { .. } => Self::Unprocessable(err.to_string()),
+            | GoldExportError::RowCapExceeded { .. }
+            // WS7 item D2: `err.to_string()` is safe here — the inner
+            // string is already `policy_engine::enforcement_error_message`'s
+            // own fixed, non-leaking text (`export_batch_sql` never wraps
+            // the raw Postgres/sqlparser error), matching AGENTS.md rule 4.
+            | GoldExportError::PolicyRefused(_) => Self::Unprocessable(err.to_string()),
             GoldExportError::Iceberg(e) => Self::Internal(e.to_string()),
         }
     }
@@ -245,6 +250,32 @@ pub async fn export(
         Some(token),
     );
 
+    // WS7 item D2: `export_mart`'s per-batch query goes through the same
+    // `sql_rewrite::enforce` Query Studio/dashboards use. `principal`
+    // being `None` here means the call authenticated purely via the
+    // `x-run-token`/`?token=` shared secret (`check_export_token` above,
+    // matching `GOLD_EXPORT_RUN_TOKEN` with no principal at all) — a
+    // genuine service-identity trigger with no role membership, mapped to
+    // `roles: &[]`/`PlaceholderValues::none()` (a `PolicyCondition` can
+    // never target an empty-`roles` subject, WS7 item A3, so this never
+    // silently resolves to "no obligations" for a REAL principal — see
+    // this route's own doc comment on `check_export_token`'s three
+    // distinct authentication shapes). A `Some(principal)` (human session
+    // holding `gold:export`, or the scheduler's own `Service` principal)
+    // always uses that principal's real `role_names`/id/tenant ids.
+    let roles: Vec<String> = principal
+        .as_ref()
+        .map_or_else(Vec::new, |Extension(p)| p.role_names.clone());
+    let placeholders = principal.as_ref().map_or_else(
+        crate::sql_rewrite::PlaceholderValues::none,
+        |Extension(p)| crate::sql_rewrite::PlaceholderValues {
+            principal_id: Some(p.id.uuid().to_string()),
+            principal_tenant_ids: p.tenant_ids.iter().map(ToString::to_string).collect(),
+        },
+    );
+    let obligations =
+        crate::policy_engine::PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
+
     let started_at = time::OffsetDateTime::now_utc();
     let export_result = gold_export::export_mart(
         &state.clickhouse,
@@ -253,6 +284,9 @@ pub async fn export(
         mart_ident.as_str(),
         state.config.gold_export_max_rows,
         state.config.gold_export_batch_size,
+        &roles,
+        &placeholders,
+        &obligations,
     )
     .await;
     let finished_at = time::OffsetDateTime::now_utc();

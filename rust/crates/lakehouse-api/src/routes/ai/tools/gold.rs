@@ -28,6 +28,7 @@
 //! read/write logic.
 
 use axum::response::IntoResponse;
+use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_core::ident::Ident;
 use serde_json::{Map, Value, json};
@@ -57,11 +58,30 @@ async fn iceberg_config_for(
     Ok((mart_ident, iceberg_config))
 }
 
-pub(super) async fn export_gold_mart(state: &AppState, args: &Map<String, Value>) -> Value {
+/// WS7 item D2: `export_mart`'s per-batch query goes through the same
+/// `sql_rewrite::enforce` `POST /api/gold/export/{mart}` uses.
+/// `principal` is `Option` for the same reason `create_connector`'s is
+/// (a schedule-triggered headless run has no interactive user) — but,
+/// unlike `routes::gold::export`'s own run-token path, there is no
+/// legitimate "no principal at all" case for a copilot tool call (this
+/// module's own doc comment: it always comes from a logged-in human's
+/// chat session), so an absent principal is refused outright rather than
+/// defaulting to `roles: &[]`, which would mean "no obligations, full
+/// access" for a call that should never reach this function with no
+/// principal in the first place — the fail-closed choice Hard
+/// Requirement 2 requires.
+pub(super) async fn export_gold_mart(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
     let mart = arg_str(args, "mart");
     if mart.is_empty() {
         return json!({ "error": "mart wajib diisi" });
     }
+    let Some(principal) = principal else {
+        return json!({ "error": "export_gold_mart membutuhkan sesi pengguna yang sudah masuk" });
+    };
     let (mart_ident, iceberg_config) = match iceberg_config_for(state, &mart).await {
         Ok(pair) => pair,
         Err(err) => return err,
@@ -71,6 +91,16 @@ pub(super) async fn export_gold_mart(state: &AppState, args: &Map<String, Value>
         state.config.gold_source_schema,
         mart_ident.as_str()
     );
+    let placeholders = crate::sql_rewrite::PlaceholderValues {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_tenant_ids: principal
+            .tenant_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    };
+    let obligations =
+        crate::policy_engine::PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
     match crate::gold_export::export_mart(
         &state.clickhouse,
         &iceberg_config,
@@ -83,6 +113,9 @@ pub(super) async fn export_gold_mart(state: &AppState, args: &Map<String, Value>
         // copilot instead.
         state.config.gold_export_max_rows,
         state.config.gold_export_batch_size,
+        &principal.role_names,
+        &placeholders,
+        &obligations,
     )
     .await
     {
@@ -127,6 +160,9 @@ mod tests {
 
     use std::collections::HashMap;
 
+    use lakehouse_auth::{PermissionSet, PrincipalId};
+    use uuid::Uuid;
+
     use super::*;
     use crate::config::Config;
 
@@ -134,16 +170,51 @@ mod tests {
         AppState::new(Config::from_map(&HashMap::new()).unwrap())
     }
 
+    /// A logged-in human principal — used to reach PAST WS7 item D2's own
+    /// "no principal at all" refusal and into `export_gold_mart`'s real
+    /// body (the Lakekeeper-token-file failure these tests actually
+    /// exercise).
+    fn fixture_user_principal() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(1)),
+            tenant_ids: Vec::new(),
+            display_name: "Rina Wijaya".to_owned(),
+            permissions: PermissionSet::parse("catalog:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        }
+    }
+
     #[tokio::test]
     async fn both_tools_require_mart() {
         let s = state();
+        let principal = fixture_user_principal();
         assert_eq!(
-            export_gold_mart(&s, &Map::new()).await,
+            export_gold_mart(&s, Some(&principal), &Map::new()).await,
             json!({ "error": "mart wajib diisi" })
         );
         assert_eq!(
             get_gold_export(&s, &Map::new()).await,
             json!({ "error": "mart wajib diisi" })
+        );
+    }
+
+    /// WS7 item D2's own fail-closed refusal: a copilot tool call with no
+    /// principal at all (which this module's doc comment says should
+    /// never legitimately happen) is refused before ever reaching
+    /// `gold_export::export_mart` — never silently treated as "no
+    /// obligations, full access".
+    #[tokio::test]
+    async fn export_gold_mart_refuses_with_no_principal_at_all() {
+        let s = state();
+        let mut args = Map::new();
+        args.insert("mart".to_owned(), json!("mart_wisman"));
+        let result = export_gold_mart(&s, None, &args).await;
+        assert!(result.get("error").is_some(), "{result}");
+        assert!(
+            result["error"].as_str().unwrap().contains("sesi pengguna"),
+            "{result}"
         );
     }
 
@@ -154,9 +225,10 @@ mod tests {
     #[tokio::test]
     async fn both_tools_fail_cleanly_without_a_lakekeeper_token_file() {
         let s = state();
+        let principal = fixture_user_principal();
         let mut args = Map::new();
         args.insert("mart".to_owned(), json!("mart_wisman"));
-        let export_result = export_gold_mart(&s, &args).await;
+        let export_result = export_gold_mart(&s, Some(&principal), &args).await;
         assert!(export_result.get("error").is_some(), "{export_result}");
         let read_result = get_gold_export(&s, &args).await;
         assert!(read_result.get("error").is_some(), "{read_result}");

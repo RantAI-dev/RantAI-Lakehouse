@@ -140,7 +140,7 @@ pub(in crate::routes) async fn run_tool(
         "run_bronze_maintenance" => pipelines::run_bronze_maintenance(&state.dagster).await,
         "list_workloads" => ops::list_workloads(state).await,
         "kill_query" => ops::kill_query(state, args).await,
-        "export_gold_mart" => gold::export_gold_mart(state, args).await,
+        "export_gold_mart" => gold::export_gold_mart(state, principal, args).await,
         "get_gold_export" => gold::get_gold_export(state, args).await,
         "draft_policy" => governance::draft_policy(state, args).await,
         "draft_classification_rule" => governance::draft_classification_rule(state, args).await,

@@ -125,6 +125,15 @@ pub enum GoldExportError {
         /// The configured `GOLD_EXPORT_MAX_ROWS` value.
         cap: u64,
     },
+    /// WS7 item D2: [`export_batch_sql`] refused a batch query — a fixed,
+    /// non-leaking message from
+    /// `policy_engine::enforcement_error_message`, never the raw
+    /// Postgres/`sqlparser` text (`AGENTS.md` rule 4). A refusal on the
+    /// FIRST batch (the common case — a governed table's obligations
+    /// don't usually change mid-export) aborts the whole export before
+    /// any data is written to Iceberg at all.
+    #[error("Gold export refused by the policy engine: {0}")]
+    PolicyRefused(String),
 }
 
 /// One column's resolved Iceberg + Arrow shape, plus enough to parse a
@@ -432,6 +441,60 @@ fn order_by_clause(columns: &[ChColumn]) -> String {
         .join(", ")
 }
 
+/// WS7 item D2: builds the exact same `SELECT`/`ORDER BY`/`LIMIT`/
+/// `OFFSET` batch query [`export_mart`]'s loop always built inline
+/// (unmasked — [`select_projection`]'s `DateTime`-cast-only behavior is
+/// UNCHANGED; masking now happens structurally, not per-column), then
+/// rewrites it through `policy_engine::rewrite_sql_for_roles` — the SAME
+/// shared entry point `routes::query::run` (WS7 item C2) and
+/// `routes::support::run_spec_sql` (WS7 item D1) call, never a parallel,
+/// simplified masking primitive (WS7 plan Hard Requirement 1).
+///
+/// Deliberately never includes `FORMAT JSON` in the SQL text handed to
+/// `rewrite_sql_for_roles` — WS7 item B5 refuses an inline `FORMAT`
+/// clause outright (see `sql_rewrite`'s own
+/// `parses_real_repository_query_shapes` doc comment: "`FORMAT JSON` is
+/// handled by WS7 item B5's pre-split"). The rewritten SQL is returned
+/// with no `FORMAT` clause; `ChClient::query` appends `FORMAT JSON`
+/// itself when one is absent, so the caller does not need to re-append
+/// it either.
+///
+/// # Errors
+/// [`GoldExportError::PolicyRefused`] if obligations cannot be resolved
+/// or the rewrite is refused — a fixed, non-leaking message
+/// (`policy_engine::enforcement_error_message`), never the raw
+/// Postgres/`sqlparser` text.
+pub(crate) async fn export_batch_sql(
+    source_table: &str,
+    columns: &[ChColumn],
+    batch_size: u64,
+    offset: u64,
+    roles: &[String],
+    placeholders: &crate::sql_rewrite::PlaceholderValues,
+    obligations: &crate::policy_engine::PolicyEngineObligations<'_>,
+) -> Result<String, GoldExportError> {
+    let select_clause = select_clause(source_table, columns);
+    let order_by = order_by_clause(columns);
+    let batch_sql = if order_by.is_empty() {
+        format!("{select_clause} LIMIT {batch_size} OFFSET {offset}")
+    } else {
+        format!("{select_clause} ORDER BY {order_by} LIMIT {batch_size} OFFSET {offset}")
+    };
+    crate::policy_engine::rewrite_sql_for_roles(
+        &batch_sql,
+        &sqlparser::dialect::ClickHouseDialect {},
+        roles,
+        placeholders,
+        obligations,
+    )
+    .await
+    .map_err(|err| {
+        GoldExportError::PolicyRefused(
+            crate::policy_engine::enforcement_error_message(&err).to_owned(),
+        )
+    })
+}
+
 /// Builds one Arrow [`ArrayRef`] for `plan` from every row in `rows`.
 fn build_array(
     plan: &ColumnPlan,
@@ -529,7 +592,23 @@ pub struct GoldExportResult {
 ///
 /// See [`GoldExportError`]'s variants. In particular,
 /// [`GoldExportError::RowCapExceeded`] is returned (and no `ClickHouse` row
-/// data is read at all) when `source_table` has more than `max_rows` rows.
+/// data is read at all) when `source_table` has more than `max_rows` rows;
+/// [`GoldExportError::PolicyRefused`] (WS7 item D2) is returned when
+/// [`export_batch_sql`] cannot resolve obligations for `roles` or the
+/// rewrite is refused — checked on every batch, so a refusal aborts
+/// before that batch's rows are read, but a refusal on any batch after
+/// the first means earlier, already-masked/filtered batches were already
+/// appended to Iceberg (see [`export_batch_sql`]'s own doc comment on why
+/// this is re-checked per batch rather than assumed stable for the whole
+/// export).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "WS7 item D2 added roles/placeholders/obligations to the existing six \
+              ch/iceberg_config/source_table/mart_name/max_rows/batch_size parameters; \
+              grouping them into a struct would only move the same nine facts one \
+              level of indirection away from every call site, not reduce what a \
+              caller must supply"
+)]
 pub async fn export_mart(
     ch: &ChClient,
     iceberg_config: &IcebergClientConfig,
@@ -537,6 +616,9 @@ pub async fn export_mart(
     mart_name: &str,
     max_rows: u64,
     batch_size: u64,
+    roles: &[String],
+    placeholders: &crate::sql_rewrite::PlaceholderValues,
+    obligations: &crate::policy_engine::PolicyEngineObligations<'_>,
 ) -> Result<GoldExportResult, GoldExportError> {
     let namespace = gold::GOLD_NAMESPACE.to_owned();
     let sanitized_table =
@@ -598,23 +680,25 @@ pub async fn export_mart(
             .map_err(|e| GoldExportError::Batch(format!("schema_to_arrow_schema failed: {e}")))?,
     );
 
-    let select_clause = select_clause(source_table, &schema_probe.meta);
-    let order_by = order_by_clause(&schema_probe.meta);
-
     let mut offset = 0u64;
     let mut rows_exported = 0usize;
     loop {
-        // `ORDER BY` every column — see `order_by_clause`'s doc comment
-        // for why this, not just a mart-specific key, is needed for
-        // `LIMIT`/`OFFSET` pagination to be well-defined at all.
-        let batch_sql = if order_by.is_empty() {
-            format!("{select_clause} LIMIT {batch_size} OFFSET {offset} FORMAT JSON")
-        } else {
-            format!(
-                "{select_clause} ORDER BY {order_by} LIMIT {batch_size} OFFSET {offset} \
-                 FORMAT JSON"
-            )
-        };
+        // WS7 item D2: the batch query is built AND rewritten/refused
+        // through the same policy engine every other read site uses —
+        // see `export_batch_sql`'s own doc comment. `ORDER BY` every
+        // column — see `order_by_clause`'s doc comment for why this, not
+        // just a mart-specific key, is needed for `LIMIT`/`OFFSET`
+        // pagination to be well-defined at all.
+        let batch_sql = export_batch_sql(
+            source_table,
+            &schema_probe.meta,
+            batch_size,
+            offset,
+            roles,
+            placeholders,
+            obligations,
+        )
+        .await?;
         let batch_result = ch.query(&batch_sql, None).await?;
         if batch_result.data.is_empty() {
             break;
@@ -920,5 +1004,149 @@ mod tests {
         assert!(message.contains("sales_by_region"));
         assert!(message.contains("5000000") || message.contains("5_000_000"));
         assert!(message.contains("GOLD_EXPORT_MAX_ROWS"));
+    }
+}
+
+// ── WS7 item D2: `export_batch_sql` goes through the same
+//    `policy_engine::rewrite_sql_for_roles` Query Studio/dashboards use ────
+#[cfg(test)]
+mod export_batch_sql_enforcement {
+    //! Same real-Postgres-plus-wiremock harness as
+    //! `routes::query::tests::enforcement` (WS7 item C2) and
+    //! `routes::support::run_spec_sql_enforcement` (WS7 item D1) — the
+    //! WS7 plan's `fake_clickhouse_returning_columns`/
+    //! `fake_policy_engine_obligations_masking` helpers do not exist in
+    //! this codebase (see `run_spec_sql_enforcement`'s own doc comment
+    //! for why).
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_clickhouse::ChClient;
+    use lakehouse_store::PgPool;
+    use lakehouse_store::governance::{self, CreatePolicyInput};
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{ChColumn, export_batch_sql};
+    use crate::policy_engine::PolicyEngineObligations;
+    use crate::sql_rewrite::PlaceholderValues;
+
+    async fn mount_customers_system_columns(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(body_string_contains("system.columns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "name", "type": "String"},
+                    {"name": "default_kind", "type": "String"},
+                    {"name": "default_expression", "type": "String"},
+                ],
+                "data": [
+                    {"name": "id", "default_kind": "", "default_expression": ""},
+                    {"name": "email", "default_kind": "", "default_expression": ""},
+                ],
+                "rows": 2,
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// Failing-test-first for WS7 item D2: before this task,
+    /// `export_batch_sql`/`GoldExportError::PolicyRefused` did not exist at
+    /// all — the batch loop built `batch_sql` inline and executed it with
+    /// no obligations check of any kind (`gold_export.rs`'s pre-D2
+    /// `export_mart`, `LIMIT`/`OFFSET` loop). Quoted failure text
+    /// (`cargo test -p lakehouse-api gold_export::export_batch_sql 2>&1 |
+    /// tail -40` against the pre-D2 module): `error[E0425]: cannot find
+    /// function \`export_batch_sql\` in this scope`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn export_mart_rewrites_each_batch_query_for_the_triggering_principals_roles(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        governance::create_policy(
+            &pool,
+            &CreatePolicyInput {
+                name: "gold-export-masking-test".to_owned(),
+                kind: "Row filter".to_owned(),
+                subjects: "Analyst".to_owned(),
+                resources: "silver.customers".to_owned(),
+                effect: "Permit with obligation".to_owned(),
+                conditions: Some(
+                    r#"{"roles":["Analyst"],"table":"silver.customers","mask":["email"]}"#
+                        .to_owned(),
+                ),
+                activate: true,
+                owner: None,
+            },
+        )
+        .await
+        .expect("seeding the governing policy must succeed");
+
+        let server = MockServer::start().await;
+        mount_customers_system_columns(&server).await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+        let columns = vec![
+            ChColumn {
+                name: "id".to_owned(),
+                ty: "UInt64".to_owned(),
+            },
+            ChColumn {
+                name: "email".to_owned(),
+                ty: "String".to_owned(),
+            },
+        ];
+
+        let sql = export_batch_sql(
+            "silver.customers",
+            &columns,
+            500,
+            0,
+            &["Analyst".to_owned()],
+            &PlaceholderValues::none(),
+            &obligations,
+        )
+        .await
+        .expect("a masked batch query must be built, not refused");
+
+        assert!(
+            sql.contains("replaceRegexpAll(toString(`email`)"),
+            "expected the masking wrapper in the returned batch SQL: {sql}"
+        );
+        Ok(())
+    }
+
+    /// Failing-test-first for WS7 item D2's Hard Requirement 2 half: same
+    /// pre-D2 state as above — `export_batch_sql` did not exist, so no
+    /// batch query could ever be refused before reaching `ClickHouse`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn export_batch_sql_refuses_when_enforce_refuses(pool: PgPool) -> sqlx::Result<()> {
+        let server = MockServer::start().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+        let columns = vec![ChColumn {
+            name: "id".to_owned(),
+            ty: "UInt64".to_owned(),
+        }];
+
+        // A table-function source is refused unconditionally
+        // (`ALLOWED_TABLE_FUNCTIONS` is empty, WS7 item B5) — never
+        // reachable through a real Gold export's own mart-name validation
+        // in practice, but this exercises the SAME refusal path a
+        // governed real table would take if its obligations proved
+        // unprovable, without needing a second policy fixture.
+        let err = export_batch_sql(
+            "url('h', 'CSV')",
+            &columns,
+            500,
+            0,
+            &[],
+            &PlaceholderValues::none(),
+            &obligations,
+        )
+        .await
+        .expect_err("a table-function source must be refused");
+
+        assert!(matches!(err, super::GoldExportError::PolicyRefused(_)));
+        Ok(())
     }
 }
