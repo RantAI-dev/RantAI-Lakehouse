@@ -33,6 +33,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -1273,6 +1274,91 @@ pub async fn put_annotation(
     )
     .await?;
     Ok(ApiJson(json!({ "ok": true })))
+}
+
+// ── POST /api/catalog/{id}/access-request (WS7 item E2) ────────────────
+
+/// `{permission, reason}` — the `POST /api/catalog/{id}/access-request`
+/// body shape.
+#[derive(Debug, Deserialize)]
+struct AccessRequestBody {
+    permission: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// `POST /api/catalog/{id}/access-request` — a principal who can already
+/// SEE a catalog entry (`catalog:read`, held by the seeded Analyst role)
+/// asks for a permission they do not already hold on it. Creates a
+/// `pending`, `kind = "access"` `approval_item` (WS7 item E1's migration)
+/// — the request itself carries no expiry; only the eventual GRANT does
+/// (WS7 item E3).
+///
+/// # Errors
+///
+/// - `400` [`ApiError::BadRequest`] if the body is not JSON, `permission`
+///   is not a real `resource:action`-shaped token (validated the same way
+///   `identity::create_role`'s `PermissionSet::parse` already validates a
+///   permission string's shape), or the CALLING principal already holds
+///   `permission` — requesting a permission you already have is not a
+///   pending request.
+/// - `503` [`ApiError::Unavailable`] if no Postgres pool is configured; a
+///   classified [`lakehouse_store::StoreError`] on any other database
+///   failure.
+pub async fn access_request(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Extension(principal): Extension<lakehouse_auth::Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    let parsed: AccessRequestBody = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::BadRequest("body must be JSON".to_owned()))?;
+    let permission = parsed.permission.trim();
+    if lakehouse_auth::PermissionSet::parse(permission).is_empty() {
+        return Err(ApiError::BadRequest(
+            "permission must be a real \"resource:action\" token".to_owned(),
+        )
+        .into());
+    }
+    if principal.has(permission) {
+        return Err(ApiError::BadRequest(
+            "principal already holds the requested permission".to_owned(),
+        )
+        .into());
+    }
+    let pool = annotation_pool(&state)?;
+    let req = lakehouse_store::agents::create_access_request(
+        pool,
+        &lakehouse_store::agents::NewAccessRequest {
+            requested_by_user_id: principal.id.uuid(),
+            catalog_id: &id,
+            permission,
+            reason: parsed.reason.trim(),
+        },
+    )
+    .await?;
+    // Best-effort, matching WS5 item D1's own posture: an audit-write
+    // failure never fails the request that triggered it.
+    let _ = lakehouse_store::audit::insert(
+        pool,
+        lakehouse_store::audit::NewAuditEvent {
+            principal_id: Some(principal.id.uuid().to_string()),
+            principal_kind: Some("user".to_owned()),
+            actor_label: Some(principal.display_name.clone()),
+            action: "catalog.access_request".to_owned(),
+            resource_kind: Some("catalog".to_owned()),
+            resource_id: Some(id.clone()),
+            outcome: "needs_approval".to_owned(),
+            approval_id: Some(req.id.clone()),
+            ..Default::default()
+        },
+    )
+    .await;
+    Ok(ApiJson(json!({
+        "ok": true,
+        "approvalId": req.id,
+        "status": req.status,
+    })))
 }
 
 #[cfg(test)]

@@ -398,6 +398,10 @@ pub fn router(state: AppState) -> Router {
             "/api/catalog/{id}/annotation",
             get(catalog::get_annotation).put(catalog::put_annotation),
         )
+        .route(
+            "/api/catalog/{id}/access-request",
+            axum::routing::post(catalog::access_request),
+        )
         .route("/api/overview", get(overview::get).post(overview::refresh))
         .merge(overview_alerts_router())
         // `/api/ops/logs` is a literal segment registered ahead of the

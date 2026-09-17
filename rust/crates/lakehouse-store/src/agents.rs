@@ -849,13 +849,27 @@ pub struct ApprovalItem {
     /// [`decide_approval`]'s doc comment).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_event_id: Option<String>,
+    /// `"tool_call" | "access"` (WS7 item E1, `0040_access_requests.sql`).
+    /// Every approval inserted before that migration backfilled to
+    /// `"tool_call"`; an access request (WS7 item E2) is always
+    /// `"access"`. `routes::agents::decide_approval` and
+    /// `routes::catalog::decide_access_request` (WS7 item E3) each refuse
+    /// the OTHER kind with a 404 — see that pair's own doc comments.
+    pub kind: String,
+    /// The human who requested this approval — set for `kind = "access"`
+    /// (WS7 item E2's `create_access_request`), `None` for `kind =
+    /// "tool_call"` (a digital employee acted; no single human requester
+    /// exists). Used by `decide_access_request` (WS7 item E3) to refuse a
+    /// principal approving their own request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_by_user_id: Option<Uuid>,
 }
 
 #[derive(FromRow)]
 struct ApprovalRow {
     id: String,
-    employee_id: String,
-    employee_name: String,
+    employee_id: Option<String>,
+    employee_name: Option<String>,
     run_id: Option<String>,
     workflow_id: Option<String>,
     action: String,
@@ -872,14 +886,24 @@ struct ApprovalRow {
     decided_at: Option<OffsetDateTime>,
     comment: Option<String>,
     audit_event_id: Option<String>,
+    kind: String,
+    requested_by_user_id: Option<Uuid>,
 }
 
 impl From<ApprovalRow> for ApprovalItem {
     fn from(row: ApprovalRow) -> Self {
         Self {
             id: row.id,
-            employee_id: row.employee_id,
-            employee_name: row.employee_name,
+            // WS7 item E1 widened `employee_id`/`employee_name` to
+            // nullable (an access request names no digital employee at
+            // all) — `ApprovalItem`'s own fields stay non-`Option`
+            // (every EXISTING reader assumes a tool-call approval, which
+            // still always sets both) and default to `String::new()` for
+            // the `kind = "access"` shape this `From` impl also now
+            // handles, rather than widening every call site's field type
+            // for a case they never read.
+            employee_id: row.employee_id.unwrap_or_default(),
+            employee_name: row.employee_name.unwrap_or_default(),
             run_id: row.run_id,
             workflow_id: row.workflow_id,
             action: row.action,
@@ -896,6 +920,8 @@ impl From<ApprovalRow> for ApprovalItem {
             decided_at: iso_opt(row.decided_at),
             comment: row.comment,
             audit_event_id: row.audit_event_id,
+            kind: row.kind,
+            requested_by_user_id: row.requested_by_user_id,
         }
     }
 }
@@ -912,7 +938,7 @@ impl From<ApprovalRow> for ApprovalItem {
 const APPROVAL_COLUMNS_QUALIFIED: &str = "a.id, a.employee_id, a.employee_name, a.run_id, \
      a.workflow_id, a.action, a.resource, a.reason, a.impact, a.evidence, a.policy, \
      a.cost_estimate, a.expires_at, a.requested_at, a.status, a.risk, a.decided_at, a.comment, \
-     ae.id AS audit_event_id";
+     ae.id AS audit_event_id, a.kind, a.requested_by_user_id";
 
 /// The lateral join that resolves an approval's real audit-event id: the
 /// newest `audit_event` row with `resource_kind = 'approval'` and
@@ -1440,6 +1466,64 @@ pub async fn create_linked_approval(
     Ok(approval_id)
 }
 
+// ---------------------------------------------------------------------
+// Access requests (WS7 item E2/E3) — `kind = 'access'` approval_item rows
+// ---------------------------------------------------------------------
+
+/// Everything [`create_access_request`] needs. An access request is still
+/// an `ApprovalItem` (`kind = 'access'`) — see this module's own "Access
+/// requests" section doc — not a second, parallel table.
+#[derive(Debug, Clone)]
+pub struct NewAccessRequest<'a> {
+    /// The requesting human's `app_user.id`.
+    pub requested_by_user_id: Uuid,
+    /// The catalog entry the requester wants more access to —
+    /// `approval_item.resource`.
+    pub catalog_id: &'a str,
+    /// The permission token requested (e.g. `"catalog:write"`) —
+    /// `approval_item.action` is stored as `format!("access:{permission}")`
+    /// so it reads clearly alongside every `kind = 'tool_call'` action
+    /// (a tool name) in the same column.
+    pub permission: &'a str,
+    /// Why the requester wants it.
+    pub reason: &'a str,
+}
+
+/// Creates one `pending`, `kind = 'access'` `approval_item` row. The
+/// request itself never expires (`expires_at: None` — only the eventual
+/// GRANT does, see [`decide_access_request`]).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the insert fails (e.g.
+/// `requested_by_user_id` does not reference an existing `app_user` row).
+pub async fn create_access_request(
+    pool: &PgPool,
+    req: &NewAccessRequest<'_>,
+) -> Result<ApprovalItem, StoreError> {
+    let approval_id = format!("appr-{}", Uuid::new_v4());
+    let action = format!("access:{}", req.permission);
+    sqlx::query(
+        "INSERT INTO approval_item \
+         (id, kind, requested_by_user_id, action, resource, reason, status, risk) \
+         VALUES ($1, 'access', $2, $3, $4, $5, 'pending', '')",
+    )
+    .bind(&approval_id)
+    .bind(req.requested_by_user_id)
+    .bind(&action)
+    .bind(req.catalog_id)
+    .bind(req.reason)
+    .execute(pool)
+    .await?;
+    let select_sql =
+        format!("SELECT {APPROVAL_COLUMNS_QUALIFIED} {APPROVAL_AUDIT_JOIN} WHERE a.id = $1");
+    let row: ApprovalRow = sqlx::query_as(&select_sql)
+        .bind(&approval_id)
+        .fetch_one(pool)
+        .await?;
+    Ok(row.into())
+}
+
 /// `overview.pendingApprovals` (WS5 item B2): the count of approval items
 /// still waiting on a human decision.
 ///
@@ -1531,5 +1615,73 @@ mod tests {
     fn decision_maps_to_lowercase_status() {
         assert_eq!(Decision::Approved.as_status(), "approved");
         assert_eq!(Decision::Rejected.as_status(), "rejected");
+    }
+}
+
+// ── WS7 item E2: `create_access_request` inserts a `kind = 'access'`
+//    approval_item row ────────────────────────────────────────────────────
+#[cfg(test)]
+mod access_request_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use sqlx::PgPool;
+    use uuid::Uuid;
+
+    // Forces `lakehouse-test-support`'s `#[ctor]`-started Postgres
+    // testcontainer to link into THIS crate's `--lib` test binary — this
+    // crate's other `#[sqlx::test]`s live in `tests/` integration binaries
+    // (which reference it directly), so without this, the linker strips
+    // the ctor as dead code from the `--lib` binary and `#[sqlx::test]`
+    // fails with "DATABASE_URL must be set" instead of getting a live
+    // container. Same idiom `lakehouse-api`'s own `--lib` tests use
+    // (`routes::agents::tests::budget_end_to_end`).
+    use lakehouse_test_support as _;
+
+    use super::{NewAccessRequest, create_access_request};
+
+    /// Seeds a bare `app_user` row (no role/tenant membership needed —
+    /// `create_access_request` only needs `requested_by_user_id` to
+    /// reference a real `app_user`), returning its id.
+    async fn seed_test_user(pool: &PgPool, email: &str) -> Uuid {
+        let (id,): (Uuid,) =
+            sqlx::query_as("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
+                .bind(email)
+                .bind(email)
+                .fetch_one(pool)
+                .await
+                .expect("seeding a test app_user must succeed");
+        id
+    }
+
+    /// Failing-test-first for WS7 item E2: before this task,
+    /// `create_access_request`/`NewAccessRequest` did not exist, and
+    /// `approval_item` had no `kind`/`requested_by_user_id` columns at
+    /// all. Quoted failure text (`cargo test -p lakehouse-store
+    /// agents::create_access_request 2>&1 | tail -30` against the pre-E1/E2
+    /// state): `error[E0433]: failed to resolve: use of undeclared type
+    /// \`NewAccessRequest\`` / `error[E0425]: cannot find function
+    /// \`create_access_request\` in this scope`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn create_access_request_inserts_a_pending_approval_with_kind_access(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let requester = seed_test_user(&pool, "req@tenant-a.invalid").await;
+        let req = create_access_request(
+            &pool,
+            &NewAccessRequest {
+                requested_by_user_id: requester,
+                catalog_id: "catalog-1",
+                permission: "catalog:write",
+                reason: "need to correct a mapping error",
+            },
+        )
+        .await
+        .expect("creating a well-formed access request must succeed");
+        assert_eq!(req.kind, "access");
+        assert_eq!(req.status, "pending");
+        assert_eq!(req.requested_by_user_id, Some(requester));
+        assert_eq!(req.action, "access:catalog:write");
+        assert_eq!(req.resource.as_deref(), Some("catalog-1"));
+        Ok(())
     }
 }
