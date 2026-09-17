@@ -195,6 +195,172 @@ fn contains_trino_denied_keyword(sql: &str) -> bool {
     TRINO_DENIED.iter().any(|kw| word_occurs(&chars, kw))
 }
 
+/// WS7 item C2: prefetches obligations for every table `sql` references
+/// (WS7 item C1's `PolicyEngineObligations`) and rewrites `sql` through
+/// [`crate::sql_rewrite::enforce`] — masking/row-filtering every governed
+/// table, refusing a table function, a sensitive `system.*` read, a
+/// `dictGet`/`joinGet`-family call, or a view over a governed table
+/// outright. `sql` is never forwarded to `ClickHouse`/`Trino` unrewritten:
+/// every failure here is an `Err`, matching `sql_rewrite`'s own "never a
+/// silent pass-through" rule (Hard Requirement 2), and Hard Requirement 1
+/// (a `status = 'ready'` policy row with an authored-but-unparseable
+/// condition) surfaces the same way — a 422, never a silently-unenforced
+/// query — via [`crate::policy_engine::PolicyEngineError::UnenforceableAuthoredCondition`].
+///
+/// The elapsed wall time is recorded into `state.policy_decision_latencies`
+/// (WS7 item C2 Step 4's `policyDecisionP95Ms`) regardless of outcome — a
+/// refused query still cost real time deciding that.
+///
+/// # Errors
+/// 422 [`ApiError::Unprocessable`] with a fixed, non-leaking message
+/// (`policy_engine::engine_error_message`/`refusal_message` — the
+/// underlying Postgres/`sqlparser` error text never reaches the response,
+/// `AGENTS.md` rule 4) when obligations cannot be resolved or `sql` fails
+/// classification/substitution.
+async fn rewrite_sql_for_principal(
+    state: &AppState,
+    sql: &str,
+    engine: &str,
+    principal: &Principal,
+) -> Result<String, ApiError> {
+    let started_rewrite = Instant::now();
+    let result = rewrite_sql_for_principal_inner(state, sql, engine, principal).await;
+    state
+        .policy_decision_latencies
+        .record(started_rewrite.elapsed());
+    result
+}
+
+/// `Trino`'s catalog.schema.table qualification needs `GenericDialect` (no
+/// `PrestoDialect` exists in this `sqlparser` version — verified, see
+/// `sql_rewrite`'s own `generic_dialect_parses_a_representative_trino_shape`
+/// test); every other engine value (including the `"clickhouse"` default)
+/// uses `ClickHouseDialect`, matching `run`'s own engine dispatch.
+fn is_trino_engine(engine: &str) -> bool {
+    engine == "trino"
+}
+
+async fn rewrite_sql_for_principal_inner(
+    state: &AppState,
+    sql: &str,
+    engine: &str,
+    principal: &Principal,
+) -> Result<String, ApiError> {
+    let placeholders = crate::sql_rewrite::PlaceholderValues {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_tenant_ids: principal
+            .tenant_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    };
+    let obligations_source =
+        crate::policy_engine::PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
+
+    // Step 1 — sync only. A `sqlparser::dialect::Dialect` trait object is
+    // not `Send`, so a `&dyn Dialect` must never be held across an
+    // `.await` point (doing so makes this whole function's future — and
+    // therefore `run`'s, and therefore axum's `Handler` impl for it — not
+    // `Send`, a real compile error this file hit while wiring this in).
+    // This local `dialect` is constructed and used ONLY inside this
+    // synchronous block, producing an owned `Vec<String>` before any
+    // `.await` runs.
+    let tables = if is_trino_engine(engine) {
+        crate::sql_rewrite::referenced_tables(sql, &sqlparser::dialect::GenericDialect {})
+    } else {
+        crate::sql_rewrite::referenced_tables(sql, &sqlparser::dialect::ClickHouseDialect {})
+    }
+    .ok_or_else(|| {
+        ApiError::Unprocessable(
+            crate::policy_engine::engine_error_message(
+                &crate::policy_engine::PolicyEngineError::Unparseable,
+            )
+            .to_owned(),
+        )
+    })?;
+
+    // Step 2 — async, no dialect involved at all.
+    let (obligations, views) = obligations_source
+        .prefetch_for_tables(&tables, &principal.role_names)
+        .await
+        .map_err(|err| {
+            ApiError::Unprocessable(crate::policy_engine::engine_error_message(&err).to_owned())
+        })?;
+
+    // Step 3 — sync again. A FRESH `dialect` local, never the one from
+    // Step 1 — it is constructed here, after the `.await` above, so it is
+    // never live across a suspension point either.
+    if is_trino_engine(engine) {
+        let dialect = sqlparser::dialect::GenericDialect {};
+        crate::sql_rewrite::enforce(
+            sql,
+            &dialect,
+            &principal.role_names,
+            &placeholders,
+            &obligations,
+            &views,
+        )
+    } else {
+        let dialect = sqlparser::dialect::ClickHouseDialect {};
+        crate::sql_rewrite::enforce(
+            sql,
+            &dialect,
+            &principal.role_names,
+            &placeholders,
+            &obligations,
+            &views,
+        )
+    }
+    .map_err(|err| ApiError::Unprocessable(crate::policy_engine::refusal_message(&err).to_owned()))
+}
+
+/// Runs the already-rewritten `sql` against whichever engine `engine`
+/// names, returning `(columns, rows, duration_ms, scanned_bytes)`. Split
+/// out of [`run`] purely to keep that function under
+/// `clippy::too_many_lines` after WS7 item C2 added the rewrite step —
+/// no behavior change from the inline block it replaces.
+async fn execute_query_against_engine(
+    state: &AppState,
+    engine: &str,
+    sql: &str,
+    user_id: &str,
+    started: Instant,
+) -> Result<(Vec<String>, Vec<Value>, u64, u64), ApiError> {
+    if engine == "trino" {
+        let trino_user = format!("console-{user_id}");
+        let result = state
+            .trino
+            .run_statement(sql, &trino_user)
+            .await
+            .map_err(map_trino_error)?;
+        let (columns, rows) = trino_result_to_rows(&result);
+        Ok((columns, rows, elapsed_ms(started), 0))
+    } else {
+        let result = state.clickhouse.query(sql, None).await?;
+
+        let columns: Vec<String> = result.meta.iter().map(|m| m.name.clone()).collect();
+        let rows: Vec<Value> = result
+            .data
+            .iter()
+            .map(|row| {
+                let mut out = Map::new();
+                for c in &columns {
+                    let v = row.get(c);
+                    out.insert(c.clone(), Value::String(stringify_cell(v)));
+                }
+                Value::Object(out)
+            })
+            .collect();
+
+        let scanned_bytes = result.statistics.as_ref().map_or(0, |s| s.bytes_read);
+        let duration_ms = result
+            .statistics
+            .as_ref()
+            .map_or_else(|| elapsed_ms(started), |s| seconds_to_ms(s.elapsed));
+        Ok((columns, rows, duration_ms, scanned_bytes))
+    }
+}
+
 /// `POST /api/query/run` — execute a read-only `SQL` statement against
 /// `ClickHouse` (`engine` absent or `"clickhouse"`) or `Trino`
 /// (`engine: "trino"`, WS2 §4) and return it in `QueryResult` shape.
@@ -218,7 +384,11 @@ fn contains_trino_denied_keyword(sql: &str) -> bool {
 ///   defense in depth, the same shape `routes::gold::export` uses.
 /// - 422 [`ApiError::Unprocessable`] when `sql` fails [`is_read_only`] (any
 ///   engine) or [`is_trino_safe`] (`engine: "trino"` only), or when the
-///   engine itself rejects the query.
+///   engine itself rejects the query, or `sql_rewrite::enforce` refuses it
+///   (WS7 item C2 — a table function, a sensitive `system.*` read, a
+///   `dictGet`/`joinGet`-family call, a view over a governed table, or an
+///   authored-but-unenforceable policy condition, WS7 plan Hard
+///   Requirement 1).
 /// - 503 [`ApiError::Unavailable`] when `Trino` is unreachable or times out.
 pub async fn run(
     State(state): State<AppState>,
@@ -257,42 +427,19 @@ pub async fn run(
         .into());
     }
 
+    // WS7 item C2: every ad hoc SQL surface is rewritten through the same
+    // `sql_rewrite::enforce` (Phase B) before it reaches EITHER engine —
+    // still after `is_read_only`, per this route's existing ordering, and
+    // before `started`/`Instant::now()` below so the elapsed time recorded
+    // for `policyDecisionP95Ms` covers exactly the rewrite step, nothing
+    // else.
+    let sql = rewrite_sql_for_principal(&state, &sql, &engine, &p).await?;
+
     let started = Instant::now();
     let started_epoch_ms = epoch_ms();
 
-    let (columns, rows, duration_ms, scanned_bytes) = if engine == "trino" {
-        let trino_user = format!("console-{user_id}");
-        let result = state
-            .trino
-            .run_statement(&sql, &trino_user)
-            .await
-            .map_err(map_trino_error)?;
-        let (columns, rows) = trino_result_to_rows(&result);
-        (columns, rows, elapsed_ms(started), 0)
-    } else {
-        let result = state.clickhouse.query(&sql, None).await?;
-
-        let columns: Vec<String> = result.meta.iter().map(|m| m.name.clone()).collect();
-        let rows: Vec<Value> = result
-            .data
-            .iter()
-            .map(|row| {
-                let mut out = Map::new();
-                for c in &columns {
-                    let v = row.get(c);
-                    out.insert(c.clone(), Value::String(stringify_cell(v)));
-                }
-                Value::Object(out)
-            })
-            .collect();
-
-        let scanned_bytes = result.statistics.as_ref().map_or(0, |s| s.bytes_read);
-        let duration_ms = result
-            .statistics
-            .as_ref()
-            .map_or_else(|| elapsed_ms(started), |s| seconds_to_ms(s.elapsed));
-        (columns, rows, duration_ms, scanned_bytes)
-    };
+    let (columns, rows, duration_ms, scanned_bytes) =
+        execute_query_against_engine(&state, &engine, &sql, &user_id, started).await?;
 
     let cost_units = std::cmp::max(1, bytes_to_cost_units(scanned_bytes));
     let id = format!("q-{started_epoch_ms}");
@@ -1528,6 +1675,202 @@ mod tests {
             let body = scheduling_capability_body();
             assert_eq!(body["supported"], serde_json::json!(false));
             assert!(body["reason"].as_str().unwrap().contains("WS7"));
+        }
+    }
+
+    // ── WS7 item C2: `run` rewrites/refuses through `sql_rewrite::enforce`
+    //    before EITHER engine ────────────────────────────────────────────
+
+    mod enforcement {
+        //! Real Postgres (`#[sqlx::test]`, a real authored `policy` row)
+        //! plus a wiremock `ClickHouse` — the same two harnesses
+        //! `tools::data::run_sql_delegation` uses for the equivalent
+        //! proof one layer up (the copilot's `run_sql` tool). `ChClient`
+        //! has no `last_query()`-style test double, so every assertion
+        //! here reads the mock server's own recorded requests, matching
+        //! this file's existing `trino_engine::assert_refused_before_reaching_trino`.
+
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use std::collections::HashMap;
+
+        use lakehouse_auth::{PermissionSet, PrincipalId};
+        use lakehouse_store::governance::CreatePolicyInput;
+        use uuid::Uuid;
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+        use crate::config::Config;
+
+        fn database_url_for(pool: &PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database"),
+            )
+        }
+
+        fn analyst_principal() -> Extension<Principal> {
+            Extension(Principal {
+                id: PrincipalId::User(Uuid::nil()),
+                tenant_ids: Vec::new(),
+                display_name: "alice".to_owned(),
+                permissions: PermissionSet::parse("query:read"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: vec!["Analyst".to_owned()],
+            })
+        }
+
+        async fn mount_governed_table_responses(server: &MockServer) {
+            Mock::given(method("POST"))
+                .and(body_string_contains("system.columns"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [
+                        {"name": "name", "type": "String"},
+                        {"name": "default_kind", "type": "String"},
+                        {"name": "default_expression", "type": "String"},
+                    ],
+                    "data": [
+                        {"name": "id", "default_kind": "", "default_expression": ""},
+                        {"name": "email", "default_kind": "", "default_expression": ""},
+                    ],
+                    "rows": 2,
+                })))
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("system.tables"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [
+                        {"name": "database", "type": "String"},
+                        {"name": "name", "type": "String"},
+                        {"name": "engine", "type": "String"},
+                        {"name": "create_table_query", "type": "String"},
+                    ],
+                    "data": [
+                        {"database": "serving", "name": "mart_x", "engine": "MergeTree", "create_table_query": ""},
+                    ],
+                    "rows": 1,
+                })))
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("replaceRegexpAll"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [
+                        {"name": "id", "type": "UInt64"},
+                        {"name": "email", "type": "String"},
+                    ],
+                    "data": [{"id": "1", "email": "***"}],
+                    "rows": 1,
+                })))
+                .mount(server)
+                .await;
+        }
+
+        /// Failing-test-first for WS7 item C2: before this task wired
+        /// `sql_rewrite::enforce` into `run`, this assertion failed
+        /// because `run` sent the LITERAL, unmasked `SELECT * FROM
+        /// serving.mart_x` straight to `ClickHouse` — no request in
+        /// `server.received_requests()` ever contained
+        /// `"replaceRegexpAll"` at all. Quoted failure text (captured
+        /// before Step 2's implementation): `assertion failed:
+        /// requests.iter().any(|r| ...contains("replaceRegexpAll"))`.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn run_rewrites_sql_for_a_governed_table_before_executing(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            lakehouse_store::governance::create_policy(
+                &pool,
+                &CreatePolicyInput {
+                    name: "query-run-masking-test".to_owned(),
+                    kind: "Row filter".to_owned(),
+                    subjects: "Analyst".to_owned(),
+                    resources: "serving.mart_x".to_owned(),
+                    effect: "Permit with obligation".to_owned(),
+                    conditions: Some(
+                        r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}"#
+                            .to_owned(),
+                    ),
+                    activate: true,
+                    owner: None,
+                },
+            )
+            .await
+            .expect("seeding the governing policy must succeed");
+
+            let server = MockServer::start().await;
+            mount_governed_table_responses(&server).await;
+
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+            env.insert("CH_URL".to_owned(), server.uri());
+            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+
+            let body = Bytes::from(json!({ "sql": "SELECT * FROM serving.mart_x" }).to_string());
+            let result = run(State(state), Some(analyst_principal()), body).await;
+            assert!(
+                result.is_ok(),
+                "expected a successful, masked run: {result:?}"
+            );
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("mock server records requests");
+            assert!(
+                requests
+                    .iter()
+                    .any(|r| String::from_utf8_lossy(&r.body).contains("replaceRegexpAll")),
+                "expected the query ClickHouse actually received to be the rewritten/masked \
+                 form, never the original literal SQL"
+            );
+            Ok(())
+        }
+
+        /// Failing-test-first for WS7 item C2's Hard Requirement 2 (never
+        /// silently pass an unrewritten/unrefused query through): before
+        /// this task, `run` had no classification step at all, so a
+        /// table-function read reached `ClickHouse` unrefused —
+        /// `server.received_requests()` would have been non-empty.
+        /// Quoted failure text (captured before Step 2's implementation):
+        /// `assertion failed: requests.is_empty()`, `left: false, right:
+        /// true` (a request WAS recorded, the table function reached
+        /// `ClickHouse`).
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn run_refuses_a_table_function_before_touching_clickhouse_at_all(
+            pool: PgPool,
+        ) -> sqlx::Result<()> {
+            let server = MockServer::start().await;
+            // No mocks mounted at all — any request reaching `ClickHouse`
+            // fails with a connection/404 error, which would itself prove
+            // the refusal came too late.
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+            env.insert("CH_URL".to_owned(), server.uri());
+            let state = AppState::new(Config::from_map(&env).expect("valid config from a map"));
+
+            let body = Bytes::from(json!({ "sql": "SELECT * FROM url('h','CSV')" }).to_string());
+            let result = run(State(state), Some(analyst_principal()), body).await;
+            let err = result.expect_err("a table function must be refused");
+            assert_eq!(err.into_response().status(), 422);
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("mock server records requests");
+            assert!(
+                requests.is_empty(),
+                "a table function must never reach ClickHouse at all: {requests:?}"
+            );
+            Ok(())
         }
     }
 }

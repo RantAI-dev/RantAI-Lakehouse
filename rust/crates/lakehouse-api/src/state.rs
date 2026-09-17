@@ -155,6 +155,85 @@ pub struct AppState {
     /// `Arc`, not rebuilt per request: the code location tree this image
     /// ships is fixed for the image's lifetime.
     pub pipeline_source_allowlist: Arc<crate::pipeline_source::SourceAllowlist>,
+    /// Ring buffer of the last [`POLICY_DECISION_LATENCY_CAP`]
+    /// `sql_rewrite::enforce` prefetch+rewrite durations (WS7 item C2) —
+    /// `routes::query::run` records one sample per call, refused or not;
+    /// `GET /api/ops/observability`'s `policyDecisionP95Ms` computes a
+    /// real p95 from it instead of the literal `null` WS1's honesty pass
+    /// left in place. Always populated (same pattern as
+    /// [`Self::gold_export_locks`]/[`Self::bronze_stats_cache`]): needs no
+    /// external dependency, just an in-process buffer.
+    pub policy_decision_latencies: PolicyDecisionLatencies,
+}
+
+/// The cap [`PolicyDecisionLatencies`] keeps — old samples are evicted
+/// oldest-first once the buffer is full, so the reported p95 always
+/// reflects recent behavior rather than growing unbounded for the life of
+/// the process.
+const POLICY_DECISION_LATENCY_CAP: usize = 1000;
+
+/// Thread-safe ring buffer of policy-decision durations, shared (via
+/// [`Arc`]) across every clone of [`AppState`] so every request records
+/// into, and every `/api/ops/observability` read sees, the SAME buffer.
+///
+/// A plain `Mutex<VecDeque<Duration>>`, not a lock-free structure: this is
+/// written once per `routes::query::run` call and read at most once per
+/// `/api/ops/observability` request — nowhere near a contention hot path
+/// (WS7 item C2 Step 2's own "implementer's choice, documented").
+#[derive(Clone, Default)]
+pub struct PolicyDecisionLatencies(
+    Arc<std::sync::Mutex<std::collections::VecDeque<std::time::Duration>>>,
+);
+
+impl PolicyDecisionLatencies {
+    /// Records one duration, evicting the oldest sample once the buffer
+    /// holds [`POLICY_DECISION_LATENCY_CAP`] entries. A poisoned lock (a
+    /// prior panic while holding it, unreachable in practice — nothing in
+    /// this module panics) still recovers its inner guard rather than
+    /// panicking here too, since losing one latency sample is far less
+    /// harmful than crashing every future request that records one.
+    pub fn record(&self, elapsed: std::time::Duration) {
+        let mut buf = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if buf.len() >= POLICY_DECISION_LATENCY_CAP {
+            buf.pop_front();
+        }
+        buf.push_back(elapsed);
+    }
+
+    /// The real p95, in milliseconds, over every sample recorded so far.
+    /// `None` when no query has run yet — "no data" is not "0ms", which
+    /// would read as a real, excellent measurement rather than "not
+    /// measured" (the same honesty rule every other `None`-capable metric
+    /// in `routes::ops` already follows).
+    #[must_use]
+    pub fn p95_ms(&self) -> Option<f64> {
+        let buf = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if buf.is_empty() {
+            return None;
+        }
+        let mut millis: Vec<f64> = buf
+            .iter()
+            .map(std::time::Duration::as_secs_f64)
+            .map(|s| s * 1000.0)
+            .collect();
+        millis.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss,
+            reason = "millis.len() is bounded by POLICY_DECISION_LATENCY_CAP (1000), \
+                      nowhere near usize/f64 precision limits"
+        )]
+        let idx = ((millis.len() as f64) * 0.95).ceil() as usize;
+        let idx = idx.saturating_sub(1).min(millis.len() - 1);
+        Some(millis[idx])
+    }
 }
 
 /// The credential-suffix `secretRef` PATTERNS (see
@@ -364,6 +443,7 @@ impl AppState {
             trino: Arc::new(trino),
             health_cache: Arc::new(tokio::sync::Mutex::new(None)),
             pipeline_source_allowlist: Arc::new(pipeline_source_allowlist),
+            policy_decision_latencies: PolicyDecisionLatencies::default(),
         }
     }
 }
@@ -373,8 +453,41 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::collections::HashMap;
+    use std::time::Duration;
 
     use super::*;
+
+    // ── WS7 item C2: `policyDecisionP95Ms` is a real measurement ────────
+
+    #[test]
+    fn policy_decision_latencies_reports_none_when_empty() {
+        let latencies = PolicyDecisionLatencies::default();
+        assert_eq!(latencies.p95_ms(), None);
+    }
+
+    #[test]
+    fn policy_decision_latencies_computes_a_real_p95_from_recorded_samples() {
+        let latencies = PolicyDecisionLatencies::default();
+        for ms in [10, 20, 30, 40, 100] {
+            latencies.record(Duration::from_millis(ms));
+        }
+        // Sorted: [10, 20, 30, 40, 100]; p95 index = ceil(5 * 0.95) - 1 = 4
+        // -> the largest sample.
+        assert_eq!(latencies.p95_ms(), Some(100.0));
+    }
+
+    #[test]
+    fn policy_decision_latencies_evicts_the_oldest_sample_once_full() {
+        let latencies = PolicyDecisionLatencies::default();
+        // Fill past the cap with a huge outlier, then push it out with
+        // small samples — the outlier must be evicted, not retained
+        // forever.
+        latencies.record(Duration::from_secs(3600));
+        for _ in 0..POLICY_DECISION_LATENCY_CAP {
+            latencies.record(Duration::from_millis(1));
+        }
+        assert_eq!(latencies.p95_ms(), Some(1.0));
+    }
 
     /// The boot-behavior guarantee this module exists to provide: building
     /// `AppState` never blocks on, or fails because of, Postgres being

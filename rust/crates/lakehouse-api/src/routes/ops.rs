@@ -85,7 +85,7 @@ pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Res
 
 async fn run(state: &AppState, kind: Kind) -> Result<Value, OpsError> {
     match kind {
-        Kind::Observability => observability(&state.clickhouse, state.pg.as_deref()).await,
+        Kind::Observability => observability(state).await,
         Kind::Workloads => workloads(&state.clickhouse).await,
         Kind::Services => services(state).await,
         Kind::Unknown => unreachable!("Kind::Unknown is handled before `run` is called"),
@@ -96,28 +96,33 @@ async fn run(state: &AppState, kind: Kind) -> Result<Value, OpsError> {
 /// so the unmeasured fields it nulls (and the dropped
 /// `streamingLagSeconds` key) can be asserted without a `ClickHouse` call.
 ///
-/// `ingest_lag` (WS5 item B3), `cache_hit_rate` (WS5 item B4), and
-/// `agent_success_rate` (WS5 item B5) are real, computed `Option<f64>`s
-/// from the caller (`observability`) -- `None` serializes to `null` the
-/// same way the still-unmeasured fields below do, never a fabricated `0`.
+/// `ingest_lag` (WS5 item B3), `cache_hit_rate` (WS5 item B4),
+/// `agent_success_rate` (WS5 item B5), and `policy_decision_p95_ms` (WS7
+/// item C2) are real, computed `Option<f64>`s from the caller
+/// (`observability`) -- `None` serializes to `null` the same way the
+/// still-unmeasured fields below do, never a fabricated `0`.
 fn observability_json(
     p95: i64,
     err: f64,
     ingest_lag: Option<f64>,
     cache_hit_rate: Option<f64>,
     agent_success_rate: Option<f64>,
+    policy_decision_p95_ms: Option<f64>,
 ) -> Value {
     json!({
         "queryP95Ms": p95,
         "queryErrorRate": err,
         "ingestLagSeconds": ingest_lag,
         "cacheHitRate": cache_hit_rate,
-        // Nothing measures policy decision latency or open incidents
-        // today; `null` is honest, the literal zeros this replaced were
-        // not (P5 review / WS1 honesty pass task 1.7). `streamingLagSeconds`
-        // is dropped outright: it has no consumer in the TypeScript
-        // contract and nothing measures streaming either.
-        "policyDecisionP95Ms": Value::Null,
+        // WS7 item C2: a real p95 over `AppState::policy_decision_latencies`
+        // once at least one query has run `sql_rewrite::enforce`'s
+        // prefetch+rewrite step (`routes::query::run`); `null` — never a
+        // fabricated `0` — until then. Nothing measures open incidents
+        // yet, so that one stays `null` (P5 review / WS1 honesty pass
+        // task 1.7). `streamingLagSeconds` is dropped outright: it has no
+        // consumer in the TypeScript contract and nothing measures
+        // streaming either.
+        "policyDecisionP95Ms": policy_decision_p95_ms,
         "agentSuccessRate": agent_success_rate,
         "activeIncidents": Value::Null,
         "slos": [
@@ -137,7 +142,9 @@ fn observability_json(
     })
 }
 
-async fn observability(ch: &ChClient, pg: Option<&PgPool>) -> Result<Value, OpsError> {
+async fn observability(state: &AppState) -> Result<Value, OpsError> {
+    let ch = &state.clickhouse;
+    let pg = state.pg.as_deref();
     let rows = ch
         .rows(
             "SELECT toString(round(quantile(0.95)(query_duration_ms))) p95,
@@ -156,12 +163,14 @@ async fn observability(ch: &ChClient, pg: Option<&PgPool>) -> Result<Value, OpsE
     let ingest_lag = ingest_lag_seconds(ch).await;
     let cache_hit_rate = cache_hit_rate(ch).await;
     let agent_success_rate = agent_success_rate(pg).await;
+    let policy_decision_p95_ms = state.policy_decision_latencies.p95_ms();
     Ok(observability_json(
         p95,
         err,
         ingest_lag,
         cache_hit_rate,
         agent_success_rate,
+        policy_decision_p95_ms,
     ))
 }
 
@@ -783,7 +792,7 @@ mod tests {
 
     #[test]
     fn observability_nulls_every_unmeasured_metric_and_drops_streaming_lag() {
-        let v = observability_json(120, 0.002, None, None, None);
+        let v = observability_json(120, 0.002, None, None, None, None);
         assert_eq!(v["queryP95Ms"], 120);
         assert!((v["queryErrorRate"].as_f64().unwrap() - 0.002).abs() < f64::EPSILON);
         for field in [
@@ -806,22 +815,30 @@ mod tests {
     /// number, never left null once it is actually measured.
     #[test]
     fn observability_reports_a_real_ingest_lag_when_measured() {
-        let v = observability_json(120, 0.002, Some(42.5), None, None);
+        let v = observability_json(120, 0.002, Some(42.5), None, None, None);
         assert_eq!(v["ingestLagSeconds"], 42.5);
     }
 
     /// WS5 item B4 -- likewise for a real, computed cache hit rate.
     #[test]
     fn observability_reports_a_real_cache_hit_rate_when_measured() {
-        let v = observability_json(120, 0.002, None, Some(0.8), None);
+        let v = observability_json(120, 0.002, None, Some(0.8), None, None);
         assert_eq!(v["cacheHitRate"], 0.8);
     }
 
     /// WS5 item B5 -- likewise for a real, computed agent success rate.
     #[test]
     fn observability_reports_a_real_agent_success_rate_when_measured() {
-        let v = observability_json(120, 0.002, None, None, Some(0.75));
+        let v = observability_json(120, 0.002, None, None, Some(0.75), None);
         assert_eq!(v["agentSuccessRate"], 0.75);
+    }
+
+    /// WS7 item C2 -- likewise for a real, measured `policyDecisionP95Ms`,
+    /// closing the `null` WS1's honesty pass left in place.
+    #[test]
+    fn observability_reports_a_real_policy_decision_p95_when_measured() {
+        let v = observability_json(120, 0.002, None, None, None, Some(3.5));
+        assert_eq!(v["policyDecisionP95Ms"], 3.5);
     }
 
     #[test]
