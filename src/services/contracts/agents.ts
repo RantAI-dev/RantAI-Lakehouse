@@ -18,10 +18,17 @@ export type DigitalEmployee = {
   allowedTools: string[]
   dataScope: string
   /**
-   * `budgetSpent`, `budgetReserved`, `approvalRate`, `successRate` and
-   * `recentRuns` are null until `WS7` tracks spend per tool call: the
-   * backing Postgres columns exist but nothing ever updates them, so the
-   * API no longer serves their insert-time defaults as measurements.
+   * `budgetSpent`, `approvalRate`, `successRate` and `recentRuns` are
+   * recomputed from real `agent_run`/`approval_item` rows at every run's
+   * terminal transition (WS7 item G3) — real values on the DETAIL route
+   * (`GET /api/agents/employees/{id}`), `null` on the LIST route (a list
+   * of many employees does not pay for four extra aggregate columns
+   * each; see `lakehouse_store::agents::EMPLOYEE_COLUMNS`'s doc comment)
+   * and `null` for `successRate`/`approvalRate` specifically whenever an
+   * employee has no qualifying terminal run/decided approval in the
+   * 30-day window (an honest "no ratio to report", never a fabricated
+   * `0`). `budgetReserved` stays `null` permanently — no multi-step
+   * reservation/hold concept exists anywhere in this codebase.
    */
   budgetSpent: Measured
   budgetReserved: Measured

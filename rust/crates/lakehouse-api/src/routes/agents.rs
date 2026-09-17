@@ -139,7 +139,10 @@ pub async fn list_employees(
     Ok(ApiJson(agents::list_employees(pool(&state)?).await?))
 }
 
-/// `GET /api/agents/employees/{id}`.
+/// `GET /api/agents/employees/{id}`. Uses
+/// [`agents::get_employee_with_metrics`] (WS7 item G3), not the lighter
+/// [`agents::get_employee`] `list_employees` uses — a single-row DETAIL
+/// read can afford the four real metric columns `list_employees` skips.
 ///
 /// # Errors
 ///
@@ -148,7 +151,7 @@ pub async fn get_employee(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<ApiJson<DigitalEmployee>> {
-    let employee = agents::get_employee(pool(&state)?, &id)
+    let employee = agents::get_employee_with_metrics(pool(&state)?, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Employee {id} not found")))?;
     Ok(ApiJson(employee))
@@ -794,12 +797,19 @@ enum HeadlessOutcome {
 }
 
 /// Writes a headless run's real, accumulated token spend
-/// ([`agents::record_run_budget`]), logging (never panicking) if the run
-/// has vanished mid-loop — mirrors [`append_step`]'s own log-and-continue
-/// shape.
-async fn write_run_budget(pg: &PgPool, run_id: &str, budget_consumed: f64) {
+/// ([`agents::record_run_budget`]) and recomputes the owning employee's
+/// real metrics from its `agent_run`/`approval_item` rows
+/// ([`agents::recompute_employee_metrics`], WS7 item G3) — called once, at
+/// every terminal transition of [`run_headless_loop`], so an employee's
+/// `budgetSpent`/`successRate`/`approvalRate`/`recentRuns` are current the
+/// moment its run ends. Logs (never panics) on either failure, mirroring
+/// [`append_step`]'s own log-and-continue shape.
+async fn write_run_budget(pg: &PgPool, run_id: &str, employee_id: &str, budget_consumed: f64) {
     if let Err(err) = agents::record_run_budget(pg, run_id, budget_consumed).await {
         tracing::warn!(%err, run_id, "headless run: failed to record budget_consumed");
+    }
+    if let Err(err) = agents::recompute_employee_metrics(pg, employee_id).await {
+        tracing::warn!(%err, employee_id, "headless run: failed to recompute employee metrics");
     }
 }
 
@@ -1002,7 +1012,7 @@ async fn run_headless_loop(
                 None,
             )
             .await;
-            write_run_budget(pg, run_id, budget_consumed).await;
+            write_run_budget(pg, run_id, employee_id, budget_consumed).await;
             return HeadlessOutcome::Terminal("budget_exhausted");
         }
 
@@ -1049,7 +1059,7 @@ async fn run_headless_loop(
                     None,
                 )
                 .await;
-                write_run_budget(pg, run_id, budget_consumed).await;
+                write_run_budget(pg, run_id, employee_id, budget_consumed).await;
                 return HeadlessOutcome::Terminal("failed");
             }
         };
@@ -1082,7 +1092,7 @@ async fn run_headless_loop(
                 None,
             )
             .await;
-            write_run_budget(pg, run_id, budget_consumed).await;
+            write_run_budget(pg, run_id, employee_id, budget_consumed).await;
             return HeadlessOutcome::Terminal("succeeded");
         }
 
@@ -1322,7 +1332,7 @@ async fn run_headless_loop(
         "tool iteration budget reached",
     )
     .await;
-    write_run_budget(pg, run_id, budget_consumed).await;
+    write_run_budget(pg, run_id, employee_id, budget_consumed).await;
     HeadlessOutcome::Terminal("failed")
 }
 

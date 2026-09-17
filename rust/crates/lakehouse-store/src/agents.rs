@@ -195,36 +195,38 @@ pub struct DigitalEmployee {
     pub autonomy: String,
     /// Lifecycle status (`EntityStatus`).
     pub status: String,
-    /// Budget ceiling.
+    /// Budget ceiling, in tokens (WS7 item G2's unit decision).
     pub budget_limit: f64,
-    /// `None` until `WS7` tracks spend per tool call: the column exists but
-    /// nothing ever updates it, so its value would be an insert-time
-    /// default, not a measurement (WS1 task 1.11).
-    #[sqlx(skip)]
+    /// Real, recomputed `SUM(agent_run.budget_consumed)` over every run for
+    /// this employee (WS7 item G3) — `None` only for [`list_employees`]/
+    /// [`get_employee`]'s lighter projection, which does not fetch this
+    /// column at all (see [`get_employee_with_metrics`], which does).
     pub budget_spent: Option<f64>,
-    /// `None` until `WS7` tracks spend per tool call: the column exists but
-    /// nothing ever updates it, so its value would be an insert-time
-    /// default, not a measurement (WS1 task 1.11).
+    /// No multi-step reservation/hold concept exists anywhere in this
+    /// codebase (confirmed while writing `0039_agent_metrics_recompute.sql`
+    /// — nothing ever reserves a budget ahead of a run), so this stays
+    /// `#[sqlx(skip)]` `None` permanently, unlike its four siblings below
+    /// (WS1 task 1.11's original placeholder collapse, now narrowed to
+    /// just this one column).
     #[sqlx(skip)]
     pub budget_reserved: Option<f64>,
     /// Tool names this employee may invoke.
     pub allowed_tools: Vec<String>,
     /// Human-readable data-access scope.
     pub data_scope: String,
-    /// `None` until `WS7` tracks spend per tool call: the column exists but
-    /// nothing ever updates it, so its value would be an insert-time
-    /// default, not a measurement (WS1 task 1.11).
-    #[sqlx(skip)]
+    /// Real, recomputed approval rate over the employee's `approval_item`
+    /// rows in the last 30 days (WS7 item G3) — see
+    /// [`budget_spent`](Self::budget_spent)'s doc comment for the
+    /// list-vs-detail projection split.
     pub approval_rate: Option<f64>,
-    /// `None` until `WS7` tracks spend per tool call: the column exists but
-    /// nothing ever updates it, so its value would be an insert-time
-    /// default, not a measurement (WS1 task 1.11).
-    #[sqlx(skip)]
+    /// Real, recomputed success rate over the employee's `agent_run` rows
+    /// in the last 30 days (WS7 item G3) — see
+    /// [`budget_spent`](Self::budget_spent)'s doc comment for the
+    /// list-vs-detail projection split.
     pub success_rate: Option<f64>,
-    /// `None` until `WS7` tracks spend per tool call: the column exists but
-    /// nothing ever updates it, so its value would be an insert-time
-    /// default, not a measurement (WS1 task 1.11).
-    #[sqlx(skip)]
+    /// Real, recomputed count of `agent_run` rows in the last 30 days
+    /// (WS7 item G3) — see [`budget_spent`](Self::budget_spent)'s doc
+    /// comment for the list-vs-detail projection split.
     pub recent_runs: Option<i64>,
     /// The instruction a headless run sends to the copilot. `None` means
     /// this employee is not runnable.
@@ -240,38 +242,134 @@ pub struct DigitalEmployee {
     pub permissions: String,
 }
 
-// WS1 task 1.11: budget_spent, budget_reserved, approval_rate, success_rate
-// and recent_runs are dropped from this SELECT list — nothing ever writes
-// them, so selecting them would just re-serve the insert-time default as a
-// measurement. The columns themselves stay (WS7 may reuse them); see
-// `DigitalEmployee`'s field docs.
+// WS7 item G3: budget_spent/approval_rate/success_rate/recent_runs are
+// real, recomputed columns now (see `recompute_employee_metrics` in
+// `0039_agent_metrics_recompute.sql`, called at every run's terminal
+// transition) — but they stay OUT of this narrower SELECT list on
+// purpose: a list of many employees should not pay for four
+// already-materialized-but-still-extra column reads each, and the
+// LIST route (`list_employees`) has never rendered them (confirmed by
+// reading `src/features/agents/employees-page.tsx`'s list rendering).
+// `get_employee_with_metrics` (below) is the FULL projection, used by the
+// single-row DETAIL route where the cost is free.
 const EMPLOYEE_COLUMNS: &str = "id, name, purpose, owner, autonomy, status, budget_limit, \
      allowed_tools, data_scope, prompt, schedule_cron, mode, permissions";
 
-/// List every digital employee, newest first.
+/// The narrow [`EMPLOYEE_COLUMNS`] projection, row-for-row — kept as its
+/// own `FromRow` type (rather than reusing [`DigitalEmployee`] directly)
+/// because `DigitalEmployee` now has four real metric columns
+/// (`budget_spent`/`approval_rate`/`success_rate`/`recent_runs`, WS7 item
+/// G3) this narrower query never selects; mapping through this type makes
+/// that omission explicit at every call site via
+/// [`EmployeeListRow::without_metrics`] rather than a silent
+/// column-not-found panic at runtime.
+#[derive(FromRow)]
+struct EmployeeListRow {
+    id: String,
+    name: String,
+    purpose: String,
+    owner: String,
+    autonomy: String,
+    status: String,
+    budget_limit: f64,
+    allowed_tools: Vec<String>,
+    data_scope: String,
+    prompt: Option<String>,
+    schedule_cron: Option<String>,
+    mode: String,
+    permissions: String,
+}
+
+impl EmployeeListRow {
+    /// Lifts a narrow row into [`DigitalEmployee`], with every metric
+    /// field explicitly `None` — "not fetched for a list view", a real,
+    /// disclosed distinction from "no run has completed yet"
+    /// ([`get_employee_with_metrics`]'s own `None`), though both render
+    /// as `—` client-side (matching `Measured`'s existing collapse of
+    /// "unmeasured" and "not fetched" into one display state).
+    fn without_metrics(self) -> DigitalEmployee {
+        DigitalEmployee {
+            id: self.id,
+            name: self.name,
+            purpose: self.purpose,
+            owner: self.owner,
+            autonomy: self.autonomy,
+            status: self.status,
+            budget_limit: self.budget_limit,
+            budget_spent: None,
+            budget_reserved: None,
+            allowed_tools: self.allowed_tools,
+            data_scope: self.data_scope,
+            approval_rate: None,
+            success_rate: None,
+            recent_runs: None,
+            prompt: self.prompt,
+            schedule_cron: self.schedule_cron,
+            mode: self.mode,
+            permissions: self.permissions,
+        }
+    }
+}
+
+/// [`EMPLOYEE_COLUMNS`] plus the four real metric columns WS7 item G3
+/// recomputes — backs [`get_employee_with_metrics`] only.
+const FULL_EMPLOYEE_COLUMNS: &str = "id, name, purpose, owner, autonomy, status, budget_limit, allowed_tools, data_scope, \
+     prompt, schedule_cron, mode, permissions, budget_spent, approval_rate, success_rate, \
+     recent_runs";
+
+/// List every digital employee, newest first. Metric columns
+/// (`budgetSpent`/`successRate`/`approvalRate`/`recentRuns`) are `None` —
+/// see [`EMPLOYEE_COLUMNS`]'s doc comment; use [`get_employee_with_metrics`]
+/// for a single employee's real values.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn list_employees(pool: &PgPool) -> Result<Vec<DigitalEmployee>, StoreError> {
     let sql = format!("SELECT {EMPLOYEE_COLUMNS} FROM agent_employee ORDER BY created_at DESC");
-    Ok(sqlx::query_as(&sql).fetch_all(pool).await?)
+    let rows: Vec<EmployeeListRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    Ok(rows
+        .into_iter()
+        .map(EmployeeListRow::without_metrics)
+        .collect())
 }
 
-/// Fetch one employee by id.
+/// Fetch one employee by id. Metric columns are `None` — see
+/// [`EMPLOYEE_COLUMNS`]'s doc comment; use [`get_employee_with_metrics`]
+/// for the real values.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
 pub async fn get_employee(pool: &PgPool, id: &str) -> Result<Option<DigitalEmployee>, StoreError> {
     let sql = format!("SELECT {EMPLOYEE_COLUMNS} FROM agent_employee WHERE id = $1");
+    let row: Option<EmployeeListRow> = sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?;
+    Ok(row.map(EmployeeListRow::without_metrics))
+}
+
+/// Fetch one employee by id WITH its real, recomputed metrics
+/// (`budgetSpent`/`successRate`/`approvalRate`/`recentRuns`, WS7 item G3)
+/// — backs the `GET /api/agents/employees/{id}` DETAIL route, where
+/// paying for four already-materialized columns on one row is free
+/// (unlike [`list_employees`]'s narrower projection).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn get_employee_with_metrics(
+    pool: &PgPool,
+    id: &str,
+) -> Result<Option<DigitalEmployee>, StoreError> {
+    let sql = format!("SELECT {FULL_EMPLOYEE_COLUMNS} FROM agent_employee WHERE id = $1");
     Ok(sqlx::query_as(&sql).bind(id).fetch_optional(pool).await?)
 }
 
 /// List every digital employee that has a `schedule_cron` set, newest
 /// first. This is exactly the set T3.3's Dagster schedule factory needs
 /// to build one `ScheduleDefinition` per employee — a `NULL` cron means
-/// manual-only and is excluded.
+/// manual-only and is excluded. Metric columns are `None`, same as
+/// [`list_employees`]: this list is schedule-factory input, not a
+/// console view.
 ///
 /// # Errors
 ///
@@ -281,7 +379,11 @@ pub async fn list_scheduled_employees(pool: &PgPool) -> Result<Vec<DigitalEmploy
         "SELECT {EMPLOYEE_COLUMNS} FROM agent_employee WHERE schedule_cron IS NOT NULL \
          ORDER BY created_at DESC"
     );
-    Ok(sqlx::query_as(&sql).fetch_all(pool).await?)
+    let rows: Vec<EmployeeListRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+    Ok(rows
+        .into_iter()
+        .map(EmployeeListRow::without_metrics)
+        .collect())
 }
 
 /// The subset of an employee's columns a headless run needs: what to send
@@ -391,7 +493,7 @@ pub async fn create_employee(
          VALUES ($1, $2, $3, $4, $5, 'draft', $6, $7, $8, $9, $10, $11, $12) \
          RETURNING {EMPLOYEE_COLUMNS}"
     );
-    Ok(sqlx::query_as(&sql)
+    let row: EmployeeListRow = sqlx::query_as(&sql)
         .bind(&id)
         .bind(&input.name)
         .bind(&input.purpose)
@@ -405,10 +507,16 @@ pub async fn create_employee(
         .bind(mode)
         .bind(permissions)
         .fetch_one(pool)
-        .await?)
+        .await?;
+    Ok(row.without_metrics())
 }
 
-/// Set an employee's `status` and return the updated row.
+/// Set an employee's `status` and return the updated row. Metric columns
+/// on the returned [`DigitalEmployee`] are `None` — a status-only mutation
+/// has no reason to also pay for the four metric columns (matching
+/// [`get_employee`]'s own narrower projection); callers displaying an
+/// updated row alongside real metrics should re-fetch via
+/// [`get_employee_with_metrics`].
 ///
 /// # Errors
 ///
@@ -420,12 +528,13 @@ async fn set_employee_status(
 ) -> Result<DigitalEmployee, StoreError> {
     let sql =
         format!("UPDATE agent_employee SET status = $2 WHERE id = $1 RETURNING {EMPLOYEE_COLUMNS}");
-    let row: Option<DigitalEmployee> = sqlx::query_as(&sql)
+    let row: Option<EmployeeListRow> = sqlx::query_as(&sql)
         .bind(id)
         .bind(status)
         .fetch_optional(pool)
         .await?;
-    row.ok_or(StoreError::NotFound)
+    row.map(EmployeeListRow::without_metrics)
+        .ok_or(StoreError::NotFound)
 }
 
 /// `POST /api/agents/employees/{id}/suspend` — sets `status = "paused"`.
@@ -1268,6 +1377,35 @@ pub async fn record_run_budget(
     if result.rows_affected() == 0 {
         return Err(StoreError::NotFound);
     }
+    Ok(())
+}
+
+/// Recomputes `budget_spent`/`success_rate`/`approval_rate`/`recent_runs`
+/// for one employee from its real `agent_run`/`approval_item` rows (WS7
+/// item G3, `recompute_employee_metrics` SQL function,
+/// `0039_agent_metrics_recompute.sql`) and writes the result — called once
+/// at every terminal transition of a headless run
+/// (`routes::agents::run_headless_loop`), so an employee's own metrics are
+/// current the moment its run ends, not on the next unrelated read.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails. Never
+/// [`StoreError::NotFound`]: the underlying `UPDATE ... WHERE e.id = ...`
+/// inside the SQL function is a no-op (not an error) if `employee_id` does
+/// not exist, matching `PERFORM`-style void-function semantics — this
+/// mirrors `record_run_budget`'s caller (`write_run_budget`), which only
+/// ever calls this for an `employee_id` a run already references via a
+/// foreign key, so a missing employee here would mean a foreign key
+/// violation happened earlier, not something this function itself detects.
+pub async fn recompute_employee_metrics(
+    pool: &PgPool,
+    employee_id: &str,
+) -> Result<(), StoreError> {
+    sqlx::query("SELECT recompute_employee_metrics($1)")
+        .bind(employee_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

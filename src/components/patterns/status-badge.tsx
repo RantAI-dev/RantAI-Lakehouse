@@ -279,6 +279,7 @@ const AGENT_RUN_STATUS_TONE: Record<AgentRunStatus, Tone> = {
   failed: "destructive",
   waiting_approval: "warning",
   rejected: "destructive",
+  budget_exhausted: "destructive",
 }
 
 /** Lifecycle pill for a digital-employee `agent_run` — distinct from

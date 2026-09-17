@@ -31,10 +31,10 @@ use lakehouse_store::agents::{
     NewApprovalRequest, RunStep, append_run_step, count_active_agent_runs,
     count_agent_run_outcomes, count_pending_approvals, create_employee, create_linked_approval,
     create_pending_approval, create_run, decide_approval, finish_run, get_employee,
-    get_employee_run_config, get_run, list_approvals, list_employees, list_runs,
-    list_scheduled_employees, list_tools, list_workflows, mark_run_waiting_approval,
-    pending_tool_call, record_run_budget, record_run_outcome, resume_employee, revoke_employee,
-    suspend_employee,
+    get_employee_run_config, get_employee_with_metrics, get_run, list_approvals, list_employees,
+    list_runs, list_scheduled_employees, list_tools, list_workflows, mark_run_waiting_approval,
+    pending_tool_call, recompute_employee_metrics, record_run_budget, record_run_outcome,
+    resume_employee, revoke_employee, suspend_employee,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -1109,5 +1109,200 @@ async fn count_agent_run_outcomes_is_zero_zero_with_no_completed_runs(
     insert_run(&pool, "run-outcome-only-running", "emp-inventory").await;
     let (succeeded, failed) = count_agent_run_outcomes(&pool).await.unwrap();
     assert_eq!((succeeded, failed), (0, 0));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// WS7 item G3: real, recomputed employee metrics
+// ---------------------------------------------------------------------
+
+async fn seed_metrics_employee(pool: &PgPool, name: &str, budget_limit: f64) -> String {
+    let input = CreateEmployeeInput {
+        name: name.to_owned(),
+        purpose: "p".to_owned(),
+        autonomy: "L2".to_owned(),
+        allowed_tools: vec![],
+        data_scope: "d".to_owned(),
+        budget_limit,
+        owner: None,
+        prompt: None,
+        schedule_cron: None,
+        mode: None,
+        permissions: None,
+    };
+    create_employee(pool, &input).await.unwrap().id
+}
+
+/// `recompute_employee_metrics` computes `budgetSpent`/`successRate`/
+/// `recentRuns` from real `agent_run` rows -- a `succeeded` and a
+/// `failed` run both count toward `recentRuns` and the `successRate`
+/// denominator; only `succeeded` counts toward its numerator; a run
+/// still `running` counts toward `recentRuns` (a real run that started)
+/// but is excluded from `successRate` entirely (no outcome yet).
+#[sqlx::test(migrations = "../../migrations")]
+async fn recompute_employee_metrics_reflects_real_runs(pool: PgPool) -> sqlx::Result<()> {
+    let employee_id = seed_metrics_employee(&pool, "metrics-employee", 1000.0).await;
+
+    create_run(&pool, "run-metrics-1", &employee_id, "manual", "tester")
+        .await
+        .unwrap();
+    record_run_budget(&pool, "run-metrics-1", 60.0)
+        .await
+        .unwrap();
+    finish_run(&pool, "run-metrics-1", "succeeded")
+        .await
+        .unwrap();
+
+    create_run(&pool, "run-metrics-2", &employee_id, "manual", "tester")
+        .await
+        .unwrap();
+    record_run_budget(&pool, "run-metrics-2", 40.0)
+        .await
+        .unwrap();
+    finish_run(&pool, "run-metrics-2", "failed").await.unwrap();
+
+    // Still running: counts toward recent_runs, excluded from success_rate.
+    create_run(&pool, "run-metrics-3", &employee_id, "manual", "tester")
+        .await
+        .unwrap();
+
+    recompute_employee_metrics(&pool, &employee_id)
+        .await
+        .unwrap();
+
+    let employee = get_employee_with_metrics(&pool, &employee_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(employee.budget_spent, Some(100.0));
+    assert_eq!(employee.success_rate, Some(0.5));
+    assert_eq!(employee.recent_runs, Some(3));
+    Ok(())
+}
+
+/// Honest-null path (program requirement: "if no runs have completed, a
+/// success rate is null, not 100" -- and, symmetrically, not 0 either): an
+/// employee with zero terminal runs in the window has `successRate ==
+/// None`, never a fabricated `Some(0.0)`. `budgetSpent`/`recentRuns` DO
+/// report a real `Some(0.0)`/`Some(0)` here -- "zero rows summed" and
+/// "zero rows counted" are true answers, unlike an undefined ratio.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recompute_employee_metrics_leaves_success_rate_null_with_no_terminal_runs(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let employee_id = seed_metrics_employee(&pool, "no-runs-employee", 1000.0).await;
+    recompute_employee_metrics(&pool, &employee_id)
+        .await
+        .unwrap();
+    let employee = get_employee_with_metrics(&pool, &employee_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(employee.success_rate, None);
+    assert_eq!(employee.approval_rate, None);
+    assert_eq!(employee.budget_spent, Some(0.0));
+    assert_eq!(employee.recent_runs, Some(0));
+    Ok(())
+}
+
+/// `approval_rate` is computed from real `approval_item` rows linked to
+/// the employee's runs -- a still-`pending` approval is excluded from
+/// both the numerator and the denominator, same as a still-running run
+/// for `success_rate`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn recompute_employee_metrics_computes_approval_rate_from_real_approval_items(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let employee_id = seed_metrics_employee(&pool, "approval-metrics-employee", 1000.0).await;
+    create_run(
+        &pool,
+        "run-appr-metrics-1",
+        &employee_id,
+        "manual",
+        "tester",
+    )
+    .await
+    .unwrap();
+    insert_approval(
+        &pool,
+        "ap-metrics-1",
+        &employee_id,
+        "approval-metrics-employee",
+        Some("run-appr-metrics-1"),
+        "approved",
+    )
+    .await;
+    insert_approval(
+        &pool,
+        "ap-metrics-2",
+        &employee_id,
+        "approval-metrics-employee",
+        Some("run-appr-metrics-1"),
+        "rejected",
+    )
+    .await;
+    insert_approval(
+        &pool,
+        "ap-metrics-3",
+        &employee_id,
+        "approval-metrics-employee",
+        Some("run-appr-metrics-1"),
+        "pending",
+    )
+    .await;
+
+    recompute_employee_metrics(&pool, &employee_id)
+        .await
+        .unwrap();
+    let employee = get_employee_with_metrics(&pool, &employee_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(employee.approval_rate, Some(0.5));
+    Ok(())
+}
+
+/// `list_employees`/`get_employee` never fetch the four metric columns
+/// (a real, disclosed "not fetched for a list view" distinct from "no run
+/// has completed yet") -- `get_employee_with_metrics` is the only
+/// function that returns their real, recomputed values.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_and_get_employee_omit_metrics_that_get_employee_with_metrics_reports(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let employee_id = seed_metrics_employee(&pool, "list-vs-detail-employee", 1000.0).await;
+    create_run(
+        &pool,
+        "run-list-vs-detail",
+        &employee_id,
+        "manual",
+        "tester",
+    )
+    .await
+    .unwrap();
+    record_run_budget(&pool, "run-list-vs-detail", 25.0)
+        .await
+        .unwrap();
+    finish_run(&pool, "run-list-vs-detail", "succeeded")
+        .await
+        .unwrap();
+    recompute_employee_metrics(&pool, &employee_id)
+        .await
+        .unwrap();
+
+    let via_get = get_employee(&pool, &employee_id).await.unwrap().unwrap();
+    assert_eq!(via_get.budget_spent, None);
+    assert_eq!(via_get.recent_runs, None);
+
+    let via_list = list_employees(&pool).await.unwrap();
+    let listed = via_list.iter().find(|e| e.id == employee_id).unwrap();
+    assert_eq!(listed.budget_spent, None);
+
+    let via_detail = get_employee_with_metrics(&pool, &employee_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(via_detail.budget_spent, Some(25.0));
+    assert_eq!(via_detail.recent_runs, Some(1));
     Ok(())
 }
