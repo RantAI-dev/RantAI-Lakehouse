@@ -18,6 +18,16 @@ mod error;
 mod gold_export;
 mod gold_export_history;
 mod gold_lock;
+// `#[allow(dead_code)]`: `state.rs`'s `AppState::health_cache` field (WS5
+// Task A2) needs this module declared for `crate::health::HealthCache` to
+// resolve in the bin's own crate tree, but nothing in the bin calls into
+// it yet -- WS5 Task A3 (`routes::ops::services`) is the first real call
+// site, landing immediately after this commit in the same task series.
+#[allow(
+    dead_code,
+    reason = "WS5 Task A3 wires the first real caller in; see the comment above"
+)]
+mod health;
 mod json;
 mod lakehouse_catalog;
 mod lakekeeper_token;

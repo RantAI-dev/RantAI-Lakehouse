@@ -139,6 +139,11 @@ pub struct AppState {
     /// `lakehouse_trino::TrinoError`'s mapping in `routes::query`), not a
     /// missing field this process has to branch on before every use.
     pub trino: Arc<TrinoClient>,
+    /// 15 s cache for `health::probe_all` (WS5, grand plan §7) — never
+    /// serves a result older than its own `checked_at` plus the window; a
+    /// `services` tile or `/api/ops/services` read past the window always
+    /// re-probes. `None` until the first read.
+    pub health_cache: crate::health::HealthCache,
 }
 
 /// The credential-suffix `secretRef` PATTERNS (see
@@ -324,6 +329,7 @@ impl AppState {
             iceberg: Arc::new(RwLock::new(None)),
             bronze_stats_cache: Arc::new(BronzeStatsCache::new()),
             trino: Arc::new(trino),
+            health_cache: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 }

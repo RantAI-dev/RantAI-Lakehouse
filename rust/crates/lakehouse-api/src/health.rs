@@ -33,9 +33,15 @@
 //! see [`unknown`]'s doc comment. `RustFS`'s two credential refs are the
 //! same story: unset means "never dialed," not "dialed and failed."
 //!
-//! `probe_all` is uncached in this file — WS5 Task A2 adds a 15 s cache
-//! wrapper (`cached_probe_all`) around it in `AppState`.
+//! # The 15 s cache
+//!
+//! [`cached_probe_all`] never serves a result whose own `checked_at` is
+//! more than [`CACHE_WINDOW`] old — every read compares against the
+//! current time, there is no background refresh timer that could drift.
+//! The cache itself lives in `crate::state::AppState::health_cache`; this
+//! module only owns the type and the comparison logic.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lakehouse_clickhouse::{ChClient, ChError};
@@ -458,7 +464,13 @@ async fn probe_rustfs(config: &Config) -> ServiceHealth {
         .with_allow_http(true)
         .build();
     let Ok(client) = built else {
-        return unhealthy("rustfs", "RustFS (Object storage)", now, None, "misconfigured");
+        return unhealthy(
+            "rustfs",
+            "RustFS (Object storage)",
+            now,
+            None,
+            "misconfigured",
+        );
     };
     let started = Instant::now();
     let attempt = tokio::time::timeout(PROBE_TIMEOUT, client.list_with_delimiter(None)).await;
@@ -613,6 +625,46 @@ pub async fn probe_all(state: &AppState) -> Vec<ServiceHealth> {
         probe_trino_if_configured(&http, state.config.trino_health_url.as_deref()),
     );
     vec![ch, dagster, lakekeeper, rustfs, openfga, trino]
+}
+
+/// 15 s cache for [`probe_all`] (WS5 Task A2) — see the module doc comment.
+/// `None` until the first read.
+pub type HealthCache = Arc<tokio::sync::Mutex<Option<(Vec<ServiceHealth>, OffsetDateTime)>>>;
+
+/// How long a cached probe result may be served before a read re-probes.
+const CACHE_WINDOW: time::Duration = time::Duration::seconds(15);
+
+/// Core cache logic with an injected clock and probe fn, so the 15 s window
+/// is tested without ever sleeping or touching a real clock.
+async fn cached_probe_all_with<F, Fut>(
+    cache: &HealthCache,
+    now: impl Fn() -> OffsetDateTime,
+    probe: F,
+) -> Vec<ServiceHealth>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Vec<ServiceHealth>>,
+{
+    let mut guard = cache.lock().await;
+    let current = now();
+    if let Some((cached, checked_at)) = guard.as_ref()
+        && current - *checked_at < CACHE_WINDOW
+    {
+        return cached.clone();
+    }
+    let fresh = probe().await;
+    *guard = Some((fresh.clone(), current));
+    fresh
+}
+
+/// Production entry point `routes::ops`/`routes::overview` call — never
+/// serves a result whose own `checked_at` is more than [`CACHE_WINDOW`]
+/// old; a read past the window always re-probes.
+pub async fn cached_probe_all(state: &AppState) -> Vec<ServiceHealth> {
+    cached_probe_all_with(&state.health_cache, OffsetDateTime::now_utc, || {
+        probe_all(state)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -784,5 +836,56 @@ mod tests {
             "unhealthy"
         );
         assert_eq!(healthy("x", "X", now, None, None).health_label(), "healthy");
+    }
+
+    struct FixedClock(std::sync::atomic::AtomicI64);
+    impl FixedClock {
+        fn new(unix_seconds: i64) -> Self {
+            Self(std::sync::atomic::AtomicI64::new(unix_seconds))
+        }
+        fn advance(&self, secs: i64) {
+            self.0.fetch_add(secs, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn now(&self) -> OffsetDateTime {
+            OffsetDateTime::from_unix_timestamp(self.0.load(std::sync::atomic::Ordering::SeqCst))
+                .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_probe_is_not_reprobed_within_the_window() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let cache: HealthCache = Arc::new(tokio::sync::Mutex::new(None));
+        let clock = FixedClock::new(1_800_000_000);
+        let probe = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { vec![] }
+        };
+        let _ = cached_probe_all_with(&cache, || clock.now(), probe).await;
+        let _ = cached_probe_all_with(&cache, || clock.now(), probe).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "second call within the 15s window must not re-probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_probe_is_reprobed_once_the_window_elapses() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let cache: HealthCache = Arc::new(tokio::sync::Mutex::new(None));
+        let clock = FixedClock::new(1_800_000_000);
+        let probe = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { vec![] }
+        };
+        let _ = cached_probe_all_with(&cache, || clock.now(), probe).await;
+        clock.advance(16);
+        let _ = cached_probe_all_with(&cache, || clock.now(), probe).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a read past the 15s window must re-probe"
+        );
     }
 }
