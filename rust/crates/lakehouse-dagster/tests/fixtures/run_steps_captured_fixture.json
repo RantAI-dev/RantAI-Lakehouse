@@ -1,0 +1,1 @@
+{"data":{"runOrError":{"__typename":"Run","stepStats":[{"stepKey":"run_bronze_maintenance","status":"FAILURE","startTime":1789668195.5151439,"endTime":1789668198.7092135,"materializations":[]}]}}}
