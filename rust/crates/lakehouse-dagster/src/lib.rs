@@ -546,7 +546,8 @@ impl DgClient {
     pub async fn job_graph(&self, job_name: &str) -> Result<JobGraph, DgError> {
         let query = "query($sel: PipelineSelector!) { pipelineOrError(params: $sel) { \
                       __typename ... on Pipeline { solidHandles { solid { name \
-                      definition { description } inputs { dependsOn { solid { name } } } } } } \
+                      definition { description metadata { key value } } \
+                      inputs { dependsOn { solid { name } } } } } } \
                       } }";
         let variables = json!({ "sel": {
             "pipelineName": job_name,
@@ -562,6 +563,9 @@ impl DgClient {
             .map(|h| GraphOp {
                 name: h.solid.name.clone(),
                 description: h.solid.definition.description.clone(),
+                source_ref: metadata_value(&h.solid.definition.metadata, "source_ref"),
+                commit: metadata_value(&h.solid.definition.metadata, "commit"),
+                sql: metadata_value(&h.solid.definition.metadata, "sql"),
             })
             .collect();
         let edges = solid_handles
@@ -1028,6 +1032,36 @@ pub struct GraphOp {
     /// The op's docstring, when it has one — `solid.definition.description`
     /// is itself nullable on `Dagster`'s side.
     pub description: Option<String>,
+    /// The op's own source location, `"dispar_orchestrate/<file>.py::<fn>"`
+    /// — read from `definition.metadata`'s `"source_ref"`-keyed entry
+    /// (WS4 item C1). `None` when the op carries no such entry (a
+    /// foreign/future job this client must not panic on — this repository's
+    /// own ops always carry one post-Phase-B, verified by
+    /// `dagster/dispar_orchestrate/test_op_source_metadata.py`).
+    pub source_ref: Option<String>,
+    /// The commit `GIT_SHA` the op's own image was built from — read from
+    /// `definition.metadata`'s `"commit"`-keyed entry. `None` when absent;
+    /// see [`Self::source_ref`]'s note on untrusted/foreign jobs.
+    pub commit: Option<String>,
+    /// The literal SQL statement template the op executes, when it has a
+    /// single one to show — read from `definition.metadata`'s
+    /// `"sql"`-keyed entry. `None` (not empty string) when the op passes no
+    /// `sql=` to `source_metadata` (`dagster/dispar_orchestrate/op_metadata.py`),
+    /// which is every op in this code location today.
+    pub sql: Option<String>,
+}
+
+/// Look up `label` in `entries` (`definition.metadata`'s `{key, value}`
+/// list — `Dagster`'s GraphQL `metadata` field, sourced from the op's own
+/// `tags`, not a typed union; see `dagster/dispar_orchestrate/op_metadata.py`'s
+/// deviation note on why this client reads a flat key/value list instead of
+/// the plan sketch's `TextMetadataEntry` union). `None` when no entry with
+/// that key exists.
+fn metadata_value(entries: &[MetadataItem], label: &str) -> Option<String> {
+    entries
+        .iter()
+        .find(|e| e.key == label)
+        .map(|e| e.value.clone())
 }
 
 /// One dependency edge (`from` runs before `to`), derived from
@@ -1085,6 +1119,22 @@ struct SolidNode {
 #[derive(Debug, Deserialize)]
 struct SolidDefinitionNode {
     description: Option<String>,
+    /// `Dagster`'s `metadata` field is a `NON_NULL` list — real fixtures
+    /// always carry it, but hand-built `json!` test bodies elsewhere in
+    /// this module predate this field and omit it entirely, so `#[serde
+    /// (default)]` keeps them compiling as empty rather than a parse
+    /// failure.
+    #[serde(default)]
+    metadata: Vec<MetadataItem>,
+}
+
+/// One `{key, value}` pair from `SolidDefinition.metadata` — real,
+/// live-verified shape (WS4 item C1), NOT the plan sketch's
+/// `TextMetadataEntry` union.
+#[derive(Debug, Deserialize)]
+struct MetadataItem {
+    key: String,
+    value: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1934,6 +1984,72 @@ mod tests {
         let graph = client.job_graph("bronze_maintenance_job").await.unwrap();
         assert!(!graph.ops.is_empty());
         assert!(graph.ops.iter().any(|o| o.name == "run_bronze_maintenance"));
+    }
+
+    /// WS4 item C1: the fixture was recaptured (live, against this
+    /// repository's own Dagster 1.13.20 stack) with the query extended to
+    /// `definition { description metadata { key value } }` — live
+    /// introspection showed `SolidDefinition.metadata` returns a plain
+    /// `{key, value}` list sourced from the op's `tags`, NOT a
+    /// `TextMetadataEntry` union as the plan sketch assumed (see
+    /// `dagster/dispar_orchestrate/op_metadata.py`'s own deviation note).
+    /// This test is written against the REAL shape.
+    #[tokio::test]
+    async fn job_graph_captures_source_ref_commit_and_sql_metadata_entries() {
+        let server = MockServer::start().await;
+        let body: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/job_graph_bronze_maintenance.json"
+        ))
+        .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let graph = client.job_graph("bronze_maintenance_job").await.unwrap();
+        let op = graph
+            .ops
+            .iter()
+            .find(|o| o.name == "run_bronze_maintenance")
+            .unwrap();
+        assert_eq!(
+            op.source_ref.as_deref(),
+            Some("dispar_orchestrate/maintenance.py::run_bronze_maintenance")
+        );
+        assert_eq!(op.commit.as_deref(), Some("unknown"));
+        // This op passes no `sql=` to `source_metadata` (WS4 item B2 —
+        // `maintenance.py:841` calls `source_metadata(..., sql=None)`), so
+        // the real fixture carries no `sql` metadata key — `None`, not a
+        // fabricated empty string.
+        assert_eq!(op.sql, None);
+    }
+
+    /// An op reporting metadata with none of the three recognized labels
+    /// (should not happen post-Phase-B, but a foreign/future job's
+    /// `tags`-derived metadata list is untrusted input to this client) must
+    /// not panic, and reports all three fields `None`.
+    #[tokio::test]
+    async fn job_graph_op_with_no_recognized_metadata_labels_reports_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "pipelineOrError": { "__typename": "Pipeline", "solidHandles": [
+                    { "solid": { "name": "foreign_op", "definition": { "description": null,
+                        "metadata": [ { "key": "owner", "value": "someone" } ] }, "inputs": [] } }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let graph = client.job_graph("some_job").await.unwrap();
+        let op = &graph.ops[0];
+        assert_eq!(op.source_ref, None);
+        assert_eq!(op.commit, None);
+        assert_eq!(op.sql, None);
     }
 
     /// The real captured fixture (WS4 item A1) has a single op with no

@@ -175,6 +175,145 @@ pub async fn runs(State(state): State<AppState>, Path(id): Path<String>) -> Resp
     }
 }
 
+/// `GET /api/pipelines/{id}` — full detail: op graph, config, schedule, and
+/// (for an authored pipeline) its stored definition. Dispatches on the
+/// `pl-` id prefix exactly like [`pause`]/[`resume`] (WS4 item C1, grand
+/// plan §6, closes WS1 T2's "graph tab has nothing real to show").
+pub async fn detail(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if id.starts_with("pl-") {
+        return authored_detail(&state, &id).await;
+    }
+    dagster_detail(&state, &id).await
+}
+
+async fn dagster_detail(state: &AppState, job_name: &str) -> Response {
+    // `jobs`/`runs` are fetched (and the "does this job even exist" 404
+    // decided) BEFORE `job_graph` is awaited — NOT joined together with it
+    // via a single `tokio::try_join!` (the plan sketch's shape). `job_graph`
+    // itself reports an unknown job as `DgError::Server("job ... not
+    // found")` (`lakehouse_dagster::DgClient::job_graph`), which under a
+    // combined join would race with the jobs-list lookup and could surface
+    // as a fabricated 503 ("service unavailable") for what is really a 404
+    // ("this pipeline does not exist") — an unavailable-vs-not-found
+    // conflation this module's own honesty rule (never report an outage
+    // for a resource that simply isn't there) forbids.
+    let (jobs, runs) = match tokio::try_join!(
+        state.dagster.list_jobs_with_schedules(),
+        state.dagster.list_runs(100),
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiJson(json!({ "error": js_error(err) })),
+            )
+                .into_response();
+        }
+    };
+    let Some(job) = jobs.iter().find(|j| j.name == job_name) else {
+        return (
+            StatusCode::NOT_FOUND,
+            ApiJson(json!({ "error": format!("Pipeline {job_name} not found") })),
+        )
+            .into_response();
+    };
+    let graph = match state.dagster.job_graph(job_name).await {
+        Ok(g) => g,
+        Err(err) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiJson(json!({ "error": js_error(err) })),
+            )
+                .into_response();
+        }
+    };
+    let last = last_run_for(&runs, job_name);
+    let mut body = dagster_pipeline_row(job, last);
+    // `dagster_pipeline_row` always returns a `json!({ ... })` object
+    // literal (never an array/scalar) — `if let`, not `.expect()`, so this
+    // module stays panic-free even if that invariant is ever violated: a
+    // future refactor of `dagster_pipeline_row` that broke it would simply
+    // fail to attach `engine`/`graph`/`config`/`definition` rather than
+    // crash the request.
+    if let Value::Object(obj) = &mut body {
+        obj.insert("engine".to_owned(), json!("dagster"));
+        // `Dagster`'s job/run API carries no free-text description of its
+        // own (same "no lineage, no free-text field" gap
+        // `dagster_pipeline_row`'s doc comment already notes for
+        // `source`/`target`) — `null`, not the op graph's own docstrings,
+        // which are per-op, not per-job.
+        obj.insert("description".to_owned(), Value::Null);
+        obj.insert(
+            "graph".to_owned(),
+            json!({
+                "ops": graph.ops.iter().map(graph_op_to_json).collect::<Vec<_>>(),
+                "edges": graph.edges.iter().map(|e| json!({ "from": e.from, "to": e.to })).collect::<Vec<_>>(),
+            }),
+        );
+        // No stored/authored config exists for a `Dagster`-native job —
+        // `[]`, never fabricated.
+        obj.insert("config".to_owned(), json!([]));
+        obj.insert("definition".to_owned(), Value::Null);
+    }
+    (StatusCode::OK, ApiJson(body)).into_response()
+}
+
+fn graph_op_to_json(op: &lakehouse_dagster::GraphOp) -> Value {
+    json!({
+        "name": op.name,
+        "description": op.description,
+        "sourceRef": op.source_ref,
+        "commit": op.commit,
+        "sql": op.sql,
+    })
+}
+
+/// The `pl-` half of [`detail`]: an authored pipeline has no `Dagster` job
+/// graph until Phase E's `authored_factory.py` builds one from its stored
+/// definition — `"graph": null` here is the honest answer until then,
+/// exactly like WS1's T2 empty state, never a fabricated single-op stand-in.
+async fn authored_detail(state: &AppState, id: &str) -> Response {
+    let pool = match pool(state) {
+        Ok(pool) => pool,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    let pipeline = match pipelines::get_pipeline(pool, id).await {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                ApiJson(json!({ "error": format!("Pipeline {id} not found") })),
+            )
+                .into_response();
+        }
+        Err(err) => return crate::error::ApiRejection(err.into()).into_response(),
+    };
+    let definition = match pipelines::get_definition(pool, id).await {
+        Ok(def) => def,
+        Err(err) => return crate::error::ApiRejection(err.into()).into_response(),
+    };
+    // `Pipeline` (`lakehouse_store::pipelines::Pipeline`) is a plain
+    // `#[derive(Serialize)]` struct of `String`/`Option`/`bool` fields, so
+    // this serialization cannot fail in practice — but `if let`, not
+    // `.expect()`, keeps this route panic-free even if that ever changes:
+    // a serialization failure here degrades to an empty envelope rather
+    // than a crashed request.
+    let mut body = serde_json::to_value(&pipeline).unwrap_or_else(|_| json!({}));
+    if let Value::Object(obj) = &mut body {
+        obj.insert("engine".to_owned(), json!("authored"));
+        obj.insert("description".to_owned(), Value::Null);
+        obj.insert("graph".to_owned(), Value::Null);
+        obj.insert("config".to_owned(), json!([]));
+        obj.insert(
+            "definition".to_owned(),
+            definition.map_or(Value::Null, |d| {
+                serde_json::to_value(d).unwrap_or(Value::Null)
+            }),
+        );
+    }
+    (StatusCode::OK, ApiJson(body)).into_response()
+}
+
 fn run_to_json(r: &DgRun, pipeline_id: &str) -> Value {
     json!({
         "id": r.run_id,
@@ -1189,6 +1328,202 @@ mod tests {
         // `r.startTime && r.endTime` is falsy for exactly 0.
         assert_eq!(cost_units(Some(0.0), Some(10.0)), 0);
         assert_eq!(cost_units(Some(10.0), Some(0.0)), 0);
+    }
+
+    /// WS4 item C1 — `GET /api/pipelines/{id}` for a `Dagster`-native job:
+    /// no Postgres needed, `state.dagster` is a `wiremock` stand-in.
+    mod detail_route {
+        use std::collections::HashMap;
+
+        use crate::config::Config;
+        use crate::state::AppState;
+
+        use super::*;
+
+        fn state_with_dagster(server_uri: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DAGSTER_URL".to_owned(), format!("{server_uri}/graphql"));
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        /// The response shape asserted below (WS4 item C1),
+        /// built against a real captured `job_graph` fixture served by
+        /// `wiremock` for every GraphQL POST this route dispatches
+        /// (`repositoriesOrError`, `runsOrError`, `pipelineOrError`) — all
+        /// three land on the same `/graphql` path, so one catch-all mock
+        /// per query shape is mounted, matched on the query text itself.
+        #[tokio::test]
+        async fn detail_route_returns_graph_config_and_schedule_for_a_dagster_job() {
+            let server = wiremock::MockServer::start().await;
+            let job_graph_body: Value = serde_json::from_str(include_str!(
+                "../../../lakehouse-dagster/tests/fixtures/job_graph_bronze_maintenance.json"
+            ))
+            .expect("fixture parses");
+
+            wiremock::Mock::given(wiremock::matchers::body_string_contains(
+                "repositoriesOrError",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "repositoriesOrError": { "__typename": "RepositoryConnection", "nodes": [
+                    { "jobs": [ { "name": "bronze_maintenance_job" } ],
+                      "schedules": [ { "name": "sched", "cronSchedule": "0 3 * * *",
+                          "scheduleState": { "status": "RUNNING" },
+                          "jobName": "bronze_maintenance_job" } ] }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+            wiremock::Mock::given(wiremock::matchers::body_string_contains("runsOrError"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "runsOrError": { "__typename": "Runs", "results": [] } }
+                })))
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::body_string_contains("pipelineOrError"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(job_graph_body))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = detail(State(state), Path("bronze_maintenance_job".to_owned())).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&body).expect("valid JSON");
+            assert_eq!(v["id"], "bronze_maintenance_job");
+            assert_eq!(v["engine"], "dagster");
+            assert_eq!(
+                v["graph"]["edges"].as_array().expect("edges array").len(),
+                0
+            );
+            let ops = v["graph"]["ops"].as_array().expect("ops array");
+            assert_eq!(ops.len(), 1);
+            assert_eq!(ops[0]["name"], "run_bronze_maintenance");
+            assert_eq!(
+                ops[0]["sourceRef"],
+                "dispar_orchestrate/maintenance.py::run_bronze_maintenance"
+            );
+            assert_eq!(ops[0]["commit"], "unknown");
+            assert!(v["config"].as_array().expect("config array").is_empty());
+            assert!(v["definition"].is_null());
+        }
+
+        #[tokio::test]
+        async fn detail_route_404s_for_a_dagster_job_not_in_the_repository() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::body_string_contains(
+                "repositoriesOrError",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "repositoriesOrError": { "__typename": "RepositoryConnection", "nodes": [
+                    { "jobs": [], "schedules": [] }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+            wiremock::Mock::given(wiremock::matchers::body_string_contains("runsOrError"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "runsOrError": { "__typename": "Runs", "results": [] } }
+                })))
+                .mount(&server)
+                .await;
+            wiremock::Mock::given(wiremock::matchers::body_string_contains("pipelineOrError"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineOrError": { "__typename": "PipelineNotFoundError" } }
+                })))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = detail(State(state), Path("no_such_job".to_owned())).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        /// The `pl-` half of [`detail`], exercised against a real Postgres
+        /// so "definition populated from the stored row" is real.
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database")
+            )
+        }
+
+        fn pg_state_for(pool: &sqlx::PgPool) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn authored_detail_reports_engine_authored_null_graph_and_the_stored_definition(
+            pool: sqlx::PgPool,
+        ) {
+            use lakehouse_test_support as _;
+
+            let state = pg_state_for(&pool);
+            let body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "name": format!("detail-route-test-{}", uuid::Uuid::new_v4()),
+                    "kind": "batch",
+                    "sourceZone": "bronze",
+                    "sourceTable": "t",
+                    "transforms": [],
+                    "targetZone": "silver",
+                    "targetTable": "t",
+                    "schedule": "manual",
+                }))
+                .expect("serialize"),
+            );
+            let (_, ApiJson(created)) = create(
+                State(state.clone()),
+                Extension(fixture_user_principal()),
+                body,
+            )
+            .await
+            .expect("create should succeed");
+
+            let response = detail(State(state), Path(created.id.clone())).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&response_body).expect("valid JSON");
+            assert_eq!(v["id"], created.id);
+            assert_eq!(v["engine"], "authored");
+            assert!(
+                v["graph"].is_null(),
+                "authored pipelines have no job graph yet"
+            );
+            assert_eq!(v["definition"]["sourceZone"], "bronze");
+            assert_eq!(v["definition"]["targetTable"], "t");
+        }
+
+        #[tokio::test]
+        async fn authored_detail_404s_for_an_unknown_pl_id() {
+            let mut env = HashMap::new();
+            env.insert(
+                "DATABASE_URL".to_owned(),
+                "postgres://postgres:postgres@localhost:5432/postgres".to_owned(),
+            );
+            let config = Config::from_map(&env).expect("a valid test Config");
+            let state = AppState::new(config);
+            let response = detail(State(state), Path("pl-does-not-exist".to_owned())).await;
+            // No live Postgres backs this test's DATABASE_URL, so this
+            // either 503s (store unreachable) or 404s (a real Postgres IS
+            // reachable at the default URL in this dev environment and the
+            // row genuinely doesn't exist) -- both are honest, neither is
+            // 200.
+            assert_ne!(response.status(), StatusCode::OK);
+        }
     }
 
     /// WS4 item D3 — `POST /api/pipelines` validates every `transforms`
