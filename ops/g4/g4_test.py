@@ -307,23 +307,63 @@ def step_verify_slot_cleanup_on_connector_delete() -> None:
     print("[g4] slot 'p5cdc_slot' no longer exists after deprovisioning — WAL is no longer pinned")
 
 
+WAL_BREACH_SLOT_NAME = "g4_wal_breach_slot"
+
+
 def step_wal_breach_produces_a_silenceable_alert_instance() -> None:
     """WS5 acceptance (grand plan §7): a WAL breach on the CDC slot
     produces a real alert_instance row via /api/alerts/run, and that row
     can be silenced through the API.
 
-    Breach mechanism: pause consumption by stopping the debezium-server
-    container (ops/debezium/ has exactly one script,
-    deprovision_connector.sh — confirmed this revision — which removes
-    the slot outright, so it cannot be reused here). WAL is grown with
-    ordinary UPDATEs against the five rows the compose seed already
-    inserted (docker-compose.yml:2043-2049, ids 1..5) — REPLICA IDENTITY
-    FULL means each UPDATE writes a full-row WAL image, so no new rows
-    and no primary-key collision, unlike the prior revision's INSERT loop
-    (WS5 plan review U8).
+    C3-F2: the prior revision breached WAL by `docker compose stop
+    debezium-server`, run from inside `g4-test-runner` (`docker-compose.
+    yml`'s `g4-test-runner` block: `image: python:3.12-slim`, no Docker
+    CLI installed, no `/var/run/docker.sock` mount — confirmed this
+    revision). That call could never succeed; the step raised
+    `FileNotFoundError` before growing any WAL, so this half of the gate
+    never actually ran. Mounting the Docker socket into a test container
+    to fix this was considered and rejected deliberately, not overlooked:
+    it would hand this gate root-equivalent control of the host's Docker
+    daemon just to grow a number.
+
+    Breach mechanism instead: open a SECOND, deliberately unconsumed
+    logical replication slot with `pg_create_logical_replication_slot`,
+    using the same `pgoutput` output plugin the real CDC slot uses
+    (`docker-compose.yml`'s `debezium-server` command block:
+    `debezium.source.plugin.name=pgoutput`). A slot with no consumer
+    attached is `active = false` in `pg_replication_slots` from the
+    moment it is created, and `replication_metrics.py::_status_for`
+    treats `not active` as `critical` independently of WAL byte volume
+    ("a disconnected [consumer] still pins WAL ... exactly why this
+    checks `active` independently of the byte thresholds"). WAL is still
+    grown with the existing ordinary UPDATEs against the five rows the
+    compose seed already inserted (docker-compose.yml, ids 1..5) —
+    REPLICA IDENTITY FULL means each UPDATE writes a full-row WAL image,
+    so no new rows and no primary-key collision — so the slot's
+    `wal_retained_bytes` is also genuinely non-trivial, not just
+    `active = false` on an idle slot.
+
+    `replication_metrics_job` reads every logical slot on the source
+    (`SELECT ... FROM pg_replication_slots WHERE slot_type = 'logical'`,
+    no slot-name filter), and the seeded alert rule
+    (`step_seed_wal_alert_rule`) is `max(unhealthy) > 0` over ALL slots
+    in `serving.replication_slot_health` — it cannot distinguish which
+    slot is unhealthy, only that at least one is. That is fine for what
+    this step needs (a real, non-fabricated breach that fires the rule)
+    but it means the rule would fire identically if the REAL CDC slot
+    (`p5cdc_slot`) ever went unhealthy for an unrelated reason. This step
+    never touches `p5cdc_slot` or `debezium-server` — the CDC pipeline
+    the rest of this gate exercises keeps running, untouched, throughout.
+
+    The breach slot is dropped in a `finally`: an unconsumed logical
+    slot pins WAL indefinitely (the same R5 risk this whole job exists
+    to catch) and would fill the disk of any environment that left it
+    behind, CI runner included.
     """
-    project = os.environ.get("G4_COMPOSE_PROJECT", "g4ci")
-    subprocess.run(["docker", "compose", "-p", project, "stop", "debezium-server"], check=True)
+    pg_exec(
+        f"SELECT pg_create_logical_replication_slot('{WAL_BREACH_SLOT_NAME}', 'pgoutput');"
+    )
+    print(f"[g4] created deliberately unconsumed slot {WAL_BREACH_SLOT_NAME!r} (plugin=pgoutput)")
     try:
         for i in range(2000):
             pg_exec(f"UPDATE p5_cdc.orders SET amount = amount + 0.01 WHERE id = {(i % 5) + 1};")
@@ -437,7 +477,16 @@ def step_wal_breach_produces_a_silenceable_alert_instance() -> None:
             )
         print("[g4] WAL breach produced a fired, silenceable alert_instance row; re-run after silence stayed suppressed")
     finally:
-        subprocess.run(["docker", "compose", "-p", project, "start", "debezium-server"], check=True)
+        # Not optional: an unconsumed logical slot pins WAL on the source
+        # Postgres server indefinitely (R5) until it is dropped — leaving
+        # this slot behind after the gate exits would fill the disk of
+        # whatever environment ran it, same failure mode this job exists
+        # to catch. `ON_ERROR_STOP=1` (pg_exec) means a missing slot here
+        # (e.g. creation itself failed above) raises rather than silently
+        # no-op'ing, so a broken cleanup is visible in gate output instead
+        # of masked.
+        pg_exec(f"SELECT pg_drop_replication_slot('{WAL_BREACH_SLOT_NAME}');")
+        print(f"[g4] dropped slot {WAL_BREACH_SLOT_NAME!r} — WAL is no longer pinned")
 
 
 def main() -> int:
