@@ -39,7 +39,7 @@ WORKDIR /app
 COPY --from=builder /build/target/release/lakehouse-api /usr/local/bin/lakehouse-api
 COPY --from=builder /usr/local/cargo/bin/sqlx /usr/local/bin/sqlx
 COPY migrations ./migrations
-# The built-in "Main" dashboard's shipped tile catalog (Task 6,
+# The built-in "Main" dashboard's shipped tile catalog (WS6,
 # lakehouse-bi::specs). Deployments opt in by setting
 # BUILTIN_DASHBOARD_SPEC=/app/specs/builtin-default.json; unset means no
 # built-in tiles at all.

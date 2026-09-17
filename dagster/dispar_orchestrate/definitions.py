@@ -50,7 +50,7 @@ from dispar_orchestrate.replication_metrics import (
 # see `capacity_snapshot.py`'s module doc for its own design and the
 # schema-ownership split with `bronze_catalog.py`.
 #
-# WS6 Task 5 restores `gold_export_schedule` (daily 04:00,
+# WS6 restores `gold_export_schedule` (daily 04:00,
 # `default_status=RUNNING`, same convention as every schedule below — see
 # `gold_export.py`'s module-level comment for why RUNNING and for the
 # still-open `auth_gate` floor gap this change does not close). It remains

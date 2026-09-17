@@ -9,7 +9,7 @@
 //! no bundler/Next.js context is needed) and compares `id`/`sql` for every
 //! entry, in order, against the shipped JSON file parsed through
 //! [`lakehouse_bi::specs::parse_builtin_dashboard_spec`] — never the
-//! process-wide `KPIS`/`CHARTS` statics (Task 6 made those load lazily from
+//! process-wide `KPIS`/`CHARTS` statics (WS6 made those load lazily from
 //! a `BUILTIN_DASHBOARD_SPEC` env var; setting that from within a test
 //! would be `std::env::set_var` in a test binary shared with other tests,
 //! a data race on the process environment that AGENTS.md forbids).

@@ -1,4 +1,4 @@
-"""Unit tests for `gold_export.py`'s scheduled trigger — WS6 Task 5.
+"""Unit tests for `gold_export.py`'s scheduled trigger (WS6).
 
 `gold_export_job` has been registered without a schedule since ADR 0010
 (no route auth wiring existed for it, so a nightly 401 would have gone
