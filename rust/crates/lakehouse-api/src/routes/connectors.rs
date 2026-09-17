@@ -23,6 +23,7 @@ use axum::http::StatusCode;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::cdc::ConnectorSlug;
+use lakehouse_store::connector_type::{self, ConnectorType};
 use lakehouse_store::connectors::{self, ConnectorDetail, ConnectorDialInfo, CreateConnectorInput};
 use lakehouse_store::ingest_spec::{Dial, SqlDriver};
 use serde::{Deserialize, Serialize};
@@ -85,6 +86,34 @@ pub async fn list_ingestible(
 ) -> ApiResult<ApiJson<Vec<connectors::IngestibleConnector>>> {
     Ok(ApiJson(
         connectors::list_ingestible_connectors(pool(&state)?).await?,
+    ))
+}
+
+/// `GET /api/connectors/types` — every row of `connector_type`
+/// (migration `0035`), the reference table the creation wizard reads to
+/// offer a type — including `supported = false` roadmap rows, listed
+/// honestly rather than omitted (AGENTS.md rule 2).
+///
+/// # Gap fix
+///
+/// `lakehouse_store::connector_type::list_connector_types` and
+/// `src/services/clients/connectors.ts`'s `listTypes` both already
+/// existed with no HTTP surface between them (verified against
+/// `policy.rs`/`routes/mod.rs` before this route existed — the
+/// wizard's connector-type list 404d). Gated on `connector:manage`,
+/// matching every other read-shaped `/api/connectors*` route
+/// (`list`, `detail`) the creation wizard's caller already needs —
+/// this is a small reference table feeding directly into
+/// `POST /api/connectors`, which is `connector:manage`-gated, not the
+/// narrower `ingest:read` scope minted only for the Dagster ingest
+/// service identity.
+///
+/// # Errors
+///
+/// 503 if no pool is configured; 500 on a database failure.
+pub async fn list_types(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<ConnectorType>>> {
+    Ok(ApiJson(
+        connector_type::list_connector_types(pool(&state)?).await?,
     ))
 }
 

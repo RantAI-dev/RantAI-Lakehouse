@@ -208,6 +208,15 @@ fn connectors_router() -> Router<AppState> {
             get(connectors::list_ingestible),
         )
         .route(
+            // Gap fix (WS3 item 33): `list_connector_types`/`listTypes` both
+            // already existed with no route between them — the wizard's
+            // connector-type list 404d. A dedicated static route, matching
+            // `/ingestible`'s shape immediately above, matched ahead of
+            // `/api/connectors/{id}` for the same reason.
+            "/api/connectors/types",
+            get(connectors::list_types),
+        )
+        .route(
             "/api/connectors/{id}",
             get(connectors::detail).delete(connectors::delete),
         )

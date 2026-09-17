@@ -289,6 +289,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // identity, `dagster/dispar_orchestrate/ingest_factory.py`) must
     // never be able to call the base `/api/connectors` route.
     ("GET",  "/api/connectors/ingestible",  Policy::RequiresPermission("ingest:read")),
+    // Gap fix (WS3 item 33): the creation wizard's connector-type list --
+    // a small reference table feeding directly into `POST
+    // /api/connectors` immediately below, which is `connector:manage`-
+    // gated, not the narrower `ingest:read` scope minted only for the
+    // Dagster ingest service identity.
+    ("GET",  "/api/connectors/types",       Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/connectors",             Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/connectors/{id}",        Policy::RequiresPermission("connector:manage")),
     // Was missing entirely while `routes::mod` registered `.delete(...)` on

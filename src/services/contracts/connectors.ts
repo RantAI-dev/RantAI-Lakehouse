@@ -353,13 +353,12 @@ export interface ConnectorService {
   /**
    * `GET /api/connectors/types` — every row of `connector_type`, used by
    * the create wizard to offer a type (or list it disabled, honestly,
-   * when `supported` is `false`). NOTE: verified against
-   * `rust/crates/lakehouse-api/src/policy.rs`/`routes/mod.rs` — no route
-   * currently mounts `connector_type::list_connector_types` anywhere in
-   * this snapshot, though the store function and migration both exist.
-   * This client method is wired to the URL the store function's own
-   * naming implies; it 404s until a future task adds the route. Not
-   * silently assumed to work — see this task's report.
+   * when `supported` is `false`). WS3 item 33 mounted this route
+   * (`rust/crates/lakehouse-api/src/routes/connectors.rs::list_types`,
+   * gated `connector:manage`, matching this wizard's other connector
+   * reads) — the store function and migration already existed with no
+   * HTTP surface between them; this client method 404d until that gap
+   * fix closed it.
    */
   listTypes(signal?: AbortSignal): Promise<ConnectorType[]>
   listIngestible(signal?: AbortSignal): Promise<IngestibleConnector[]>
