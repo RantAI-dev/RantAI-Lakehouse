@@ -51,6 +51,12 @@ jsonwebtoken = "9"
 # always-on datetime backend; `next_run.rs`'s own doc comment has the
 # full API-shape correction (`Cron::new(..).parse()`, not `FromStr`).
 croner = { version = "2" }
+# WS7 Phase B (`lakehouse-api::sql_rewrite`) — the enforcement-side SQL
+# rewriter needs a real parser, not a regex/string scan, to apply masking
+# and row-filter obligations without ever misreading a construct as safe.
+# 0.62 verified latest via docs.rs/sqlparser/latest as of 2026-09-11;
+# `resolver = "3"` locks the exact patch in `Cargo.lock` on first build.
+sqlparser = "0.62"
 
 [workspace.lints.rust]
 future-incompatible = "warn"

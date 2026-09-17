@@ -65,6 +65,14 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 time = { workspace = true, features = ["macros"] }
 croner.workspace = true
+# WS7 Phase B — `sql_rewrite`'s table-substitution rewriter parses every
+# statement with a real grammar instead of scanning text, so it can
+# refuse anything it does not fully understand (Hard Requirement 1/2).
+# `visitor` derives `Visit`/`VisitMut` on every AST node, which Task B5
+# uses to find a dictGet*/joinGet* call anywhere in a statement (SELECT
+# list, WHERE, nested subquery) without hand-rolling an exhaustive
+# `Expr` match that a future sqlparser variant could silently bypass.
+sqlparser = { workspace = true, features = ["visitor"] }
 # `croner` 2.x always pulls in `chrono` as its own non-optional datetime
 # backend (see `rust/Cargo.toml`'s comment on the `croner` entry); this
 # crate needs `chrono` itself as a direct dependency too, for

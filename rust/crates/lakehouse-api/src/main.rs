@@ -26,6 +26,7 @@ mod next_run;
 mod policy;
 mod policy_engine;
 mod routes;
+mod sql_rewrite;
 mod state;
 mod tenant;
 mod transform_grammar;

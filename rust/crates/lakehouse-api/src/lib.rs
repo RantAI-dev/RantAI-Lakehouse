@@ -42,6 +42,7 @@ pub mod next_run;
 pub mod policy;
 pub mod policy_engine;
 pub mod routes;
+pub mod sql_rewrite;
 pub mod state;
 pub mod tenant;
 pub mod transform_grammar;
