@@ -90,6 +90,29 @@ impl Principal {
     pub fn in_tenant(&self, tenant_id: Uuid) -> bool {
         self.tenant_ids.contains(&tenant_id)
     }
+
+    /// Maps [`PrincipalId`]'s variant onto the vocabulary
+    /// `lakehouse_store::audit::NewAuditEvent.principal_kind` accepts —
+    /// `"user" | "service" | "copilot" | "schedule"`, CHECK-enforced by
+    /// `0024_audit_event.sql` (`audit_event_principal_kind_check`). Callers
+    /// writing an audit row for an authenticated [`Principal`] must use
+    /// this, never [`Principal::provider`] — `provider` is a DIFFERENT
+    /// vocabulary (`"local"`, `"session"`, `"service"`, `"oidc:<issuer>"`,
+    /// the authenticator that produced the principal, not the kind of
+    /// principal it is). Binding `provider` into `principal_kind` verbatim
+    /// would insert `"local"`/`"session"`/`"oidc:..."` for every
+    /// human-authenticated caller and violate the CHECK on every audit
+    /// write from a logged-in user (WS5 Phase D preamble finding). One
+    /// copy shared by every producer site (`routes::query::run`,
+    /// `routes::agents::decide_approval`, and later `routes::connectors`)
+    /// rather than a helper duplicated per call site (AGENTS.md rule 4).
+    #[must_use]
+    pub const fn kind_for_audit(&self) -> &'static str {
+        match self.id {
+            PrincipalId::User(_) => "user",
+            PrincipalId::Service(_) => "service",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -129,6 +152,18 @@ mod tests {
         let id = Uuid::from_u128(42);
         assert_eq!(PrincipalId::User(id).uuid(), id);
         assert_eq!(PrincipalId::Service(id).uuid(), id);
+    }
+
+    #[test]
+    fn kind_for_audit_maps_user_and_service_and_ignores_provider() {
+        let mut user = sample_principal();
+        user.provider = "oidc:example".to_owned(); // deliberately NOT "user"/"service"
+        assert_eq!(user.kind_for_audit(), "user");
+
+        let mut service = sample_principal();
+        service.id = PrincipalId::Service(Uuid::nil());
+        service.provider = "local".to_owned(); // deliberately the wrong-vocabulary value
+        assert_eq!(service.kind_for_audit(), "service");
     }
 
     #[test]

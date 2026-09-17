@@ -15,6 +15,7 @@ use lakehouse_auth::Principal;
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
+use lakehouse_store::audit::NewAuditEvent;
 use lakehouse_store::queries::{self, QueryHistoryItem, RecordHistoryInput, SavedQuery};
 use lakehouse_trino::{TrinoError, TrinoResult};
 use serde::Deserialize;
@@ -296,6 +297,23 @@ pub async fn run(
     let cost_units = std::cmp::max(1, bytes_to_cost_units(scanned_bytes));
     let id = format!("q-{started_epoch_ms}");
 
+    // Record a real audit_event for this run — best-effort, the same
+    // non-fatal posture as the history write just below: the query already
+    // ran and the caller already has their result, so a failure here is
+    // logged and swallowed, never turned into an error response. Written
+    // via `lakehouse_store::audit::insert` directly (not
+    // `routes::ai::audit::record`, which hardcodes `principal_kind:
+    // "copilot"` — wrong here, a query run is human- or service-triggered,
+    // never copilot-triggered). `resource_kind: "query_history"` paired
+    // with this run's own `id` is the pairing WS1 T16's `LEFT JOIN`
+    // resolves on read (WS5 Phase D preamble).
+    if let Some(pool) = state.pg.as_deref() {
+        let event = query_run_audit_event(&p, &id, &sql);
+        if let Err(err) = lakehouse_store::audit::insert(pool, event).await {
+            tracing::warn!(%err, "failed to record query.run audit event (query itself succeeded)");
+        }
+    }
+
     // Record this execution in query history — best-effort. A history-write
     // failure (no Postgres pool configured, Postgres down, ...) must never
     // turn an otherwise-successful query into an error response for the
@@ -338,6 +356,31 @@ pub async fn run(
         cost_units,
         &engine,
     )))
+}
+
+/// Built once per query run, unit-tested without a `ClickHouse`/Postgres
+/// connection — the pure half of the audit write, matching this file's
+/// existing pattern for pure helpers (`is_read_only`, `bytes_to_cost_units`,
+/// ...). `principal_kind` comes from [`Principal::kind_for_audit`]
+/// (`Principal.id`'s variant), never from `principal.provider` — see that
+/// method's doc comment for the `0024_audit_event.sql` CHECK it satisfies.
+/// `args.sql` reuses `routes::ai::audit`'s own truncation so an
+/// unbounded-length `SQL` string can't bloat `audit_event.args`.
+fn query_run_audit_event(principal: &Principal, query_id: &str, sql: &str) -> NewAuditEvent {
+    NewAuditEvent {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        action: "query.run".to_owned(),
+        resource_kind: Some("query_history".to_owned()),
+        resource_id: Some(query_id.to_owned()),
+        args: Some(json!({ "sql": crate::routes::ai::audit::truncate_string(sql) })),
+        outcome: "executed".to_owned(),
+        detail: None,
+        run_id: None,
+        approval_id: None,
+        session_id: None,
+    }
 }
 
 /// Coerce one cell to the string-everything shape both `run_result_json`
@@ -898,7 +941,76 @@ pub async fn scheduling(State(_state): State<AppState>) -> ApiResult<ApiJson<Val
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use lakehouse_auth::{PermissionSet, PrincipalId};
+    use uuid::Uuid;
+
     use super::*;
+
+    /// A logged-in human principal — `PrincipalId::User`.
+    fn fixture_user_principal() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::from_u128(1)),
+            tenant_ids: Vec::new(),
+            display_name: "Rina Wijaya".to_owned(),
+            permissions: PermissionSet::parse("query:read"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+        }
+    }
+
+    /// A service-token principal — `PrincipalId::Service`, e.g. the Dagster
+    /// orchestrator running a scheduled query.
+    fn fixture_service_principal() -> Principal {
+        Principal {
+            id: PrincipalId::Service(Uuid::from_u128(2)),
+            tenant_ids: Vec::new(),
+            display_name: "dagster-orchestrator".to_owned(),
+            permissions: PermissionSet::parse("query:read"),
+            provider: "service".to_owned(),
+            must_change_password: false,
+        }
+    }
+
+    #[test]
+    fn query_run_audit_event_uses_the_real_principal_and_a_truncated_sql() {
+        let principal = fixture_user_principal();
+        let event = query_run_audit_event(&principal, "q-123", "SELECT * FROM orders");
+        assert_eq!(event.principal_kind.as_deref(), Some("user"));
+        assert_eq!(
+            event.principal_id.as_deref(),
+            Some(principal.id.uuid().to_string().as_str())
+        );
+        assert_eq!(event.resource_kind.as_deref(), Some("query_history"));
+        assert_eq!(event.resource_id.as_deref(), Some("q-123"));
+        assert_eq!(event.action, "query.run");
+        assert_eq!(event.outcome, "executed");
+    }
+
+    #[test]
+    fn query_run_audit_event_records_a_service_identity_as_service_not_user() {
+        let principal = fixture_service_principal();
+        let event = query_run_audit_event(&principal, "q-124", "SELECT 1");
+        assert_eq!(event.principal_kind.as_deref(), Some("service"));
+    }
+
+    #[test]
+    fn query_run_audit_event_truncates_long_sql() {
+        // Mirrors `routes::ai::audit`'s own `redact_truncates_long_strings`
+        // assertion shape (`…[truncated]` suffix, strictly shorter than the
+        // input) rather than a fixed length bound — `truncate_string`
+        // keeps the first `MAX_STRING_LEN` characters AND appends the
+        // marker, so the output is `MAX_STRING_LEN` plus the marker's own
+        // length, not `MAX_STRING_LEN` or fewer.
+        let principal = fixture_user_principal();
+        let long_sql = "x".repeat(600);
+        let event = query_run_audit_event(&principal, "q-125", &long_sql);
+        let recorded_sql = event.args.unwrap()["sql"].as_str().unwrap().to_owned();
+        assert!(
+            recorded_sql.ends_with("…[truncated]"),
+            "must reuse ai::audit's MAX_STRING_LEN truncation, not the raw SQL: {recorded_sql:?}"
+        );
+        assert!(recorded_sql.chars().count() < long_sql.chars().count());
+    }
 
     #[test]
     fn allows_each_permitted_keyword() {

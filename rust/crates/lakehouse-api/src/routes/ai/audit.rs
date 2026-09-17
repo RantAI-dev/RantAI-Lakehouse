@@ -39,7 +39,7 @@ const SECRET_KEY_NEEDLES: [&str; 4] = ["secret", "password", "token", "key"];
 /// SQL-result-shaped (or just a very long free-text argument) from
 /// bloating `audit_event.args` — it has no idea what a "SQL result row"
 /// looks like, so it treats every over-long string the same way.
-const MAX_STRING_LEN: usize = 500;
+pub(crate) const MAX_STRING_LEN: usize = 500;
 
 fn is_secret_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
@@ -48,7 +48,7 @@ fn is_secret_key(key: &str) -> bool {
         .any(|needle| lower.contains(needle))
 }
 
-fn truncate_string(s: &str) -> Value {
+pub(crate) fn truncate_string(s: &str) -> Value {
     if s.chars().count() > MAX_STRING_LEN {
         let truncated: String = s.chars().take(MAX_STRING_LEN).collect();
         Value::String(format!("{truncated}…[truncated]"))

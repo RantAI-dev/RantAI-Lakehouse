@@ -20,13 +20,24 @@
 //! `conn-s3-warehouse` rows. `non_postgres_connector_deletes_without_any_
 //! deprovision_attempt` and `deleting_an_unknown_connector_is_still_404`
 //! are unaffected by 0034 (neither depends on a deprovision failure).
+//!
+//! WS5 item D1 (a judge finding against the previous commit): the test
+//! that used to be named
 //! `postgres_connector_delete_with_force_deletes_despite_deprovision_failure`
-//! is affected the same way the fixed test was: `conn-pg-lakehouse` no
-//! longer fails to deprovision, it has nothing to deprovision — but the
-//! assertions it makes (`?force=true` still deletes the row) hold either
-//! way, so it stays green and is left as is; its own doc comment below
-//! says so honestly rather than restating the old "despite a failure"
-//! premise.
+//! is affected the same way the 409 test was — `conn-pg-lakehouse` no
+//! longer fails to deprovision, it has nothing to deprovision (0034 gave it
+//! `adapter = 'sql'`) — but its own doc comment claimed the genuine
+//! "`force` bypasses a real deprovision failure" case was "now covered by
+//! `postgres_connector_delete_without_force_keeps_the_row_and_returns_409`'s
+//! own connector". That was false: that 409 test never passes
+//! `?force=true`, so nothing asserted the escape hatch's actual reason for
+//! existing. Renamed to
+//! `postgres_connector_delete_with_force_on_seeded_row_with_nothing_to_
+//! deprovision` (it deletes despite no failure, not despite one), and
+//! `postgres_connector_delete_with_force_bypasses_a_real_deprovision_failure`
+//! below adds the missing coverage: a self-created null-adapter
+//! `PostgreSQL` connector (the same shape the 409 test builds), deleted
+//! with `?force=true`, row gone.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -74,6 +85,31 @@ async fn delete(app: &axum::Router, path: &str, cookie: &str) -> axum::http::Res
         .expect("router never fails to produce a response")
 }
 
+/// Creates a null-adapter `PostgreSQL` connector pointed at the
+/// compose-network `postgres` host — `set_ingest_spec` is deliberately
+/// never called, so `adapter` stays `NULL` and
+/// `deprovision_postgres_connector` takes the legacy
+/// `None if kind.to_lowercase().contains("postgres")` arm, which
+/// deterministically fails to deprovision (the host is unreachable from
+/// this test's network). Shared by the 409-without-`force` test and the
+/// `force`-bypasses-a-real-failure test below (AGENTS.md rule 4 — a
+/// duplicated guard/fixture is a finding) so both exercise the identical
+/// genuine-failure shape.
+async fn create_connector_with_undeprovisionable_slot(pool: &PgPool, name: &str) -> String {
+    let created = create_connector(
+        pool,
+        &minimal_input(
+            name,
+            "PostgreSQL",
+            "lakehouse@postgres:5432/lakehouse",
+            "env:CONNECTOR_PG_PASSWORD",
+        ),
+    )
+    .await
+    .expect("create connector");
+    created.id
+}
+
 async fn connector_row_exists(pool: &PgPool, id: &str) -> bool {
     let row: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM connector WHERE id = $1")
         .bind(id)
@@ -101,22 +137,8 @@ async fn postgres_connector_delete_without_force_keeps_the_row_and_returns_409()
     let app = spin_up().await;
     let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
 
-    let created = create_connector(
-        &app.pool,
-        &minimal_input(
-            "still has a slot postgres",
-            "PostgreSQL",
-            "lakehouse@postgres:5432/lakehouse",
-            "env:CONNECTOR_PG_PASSWORD",
-        ),
-    )
-    .await
-    .expect("create connector");
-    // Deliberately never calls `set_ingest_spec`: `adapter` stays `NULL`,
-    // so `deprovision_postgres_connector` takes the legacy
-    // `None if kind.to_lowercase().contains("postgres")` arm rather than
-    // the `sql`-adapter no-op arm.
-    let id = created.id;
+    let id =
+        create_connector_with_undeprovisionable_slot(&app.pool, "still has a slot postgres").await;
     let slug = id.replace('-', "_");
     let expected_slot = format!("{slug}_slot");
     let expected_pub = format!("{slug}_pub");
@@ -150,16 +172,17 @@ async fn postgres_connector_delete_without_force_keeps_the_row_and_returns_409()
 
 /// `?force=true` deletes `conn-pg-lakehouse` regardless.
 ///
-/// WS3 item 6: this no longer proves `force` bypasses a deprovision
-/// *failure* — since 0034 gave the seeded row `adapter = 'sql'`,
-/// `deprovision_postgres_connector` treats it as nothing to deprovision
-/// (WS3 plan review X4) and the unforced route would 204 too. The
-/// assertion below (row gone, 204) still holds and is still worth
-/// keeping, but the genuine "force bypasses a real failure" case is now
-/// covered by `postgres_connector_delete_without_force_keeps_the_row_and_
-/// returns_409`'s own connector, not this one.
+/// WS3 item 6 / WS5 item D1: since 0034 gave the seeded row
+/// `adapter = 'sql'`, `deprovision_postgres_connector` treats it as
+/// nothing to deprovision (WS3 plan review X4) — deleting it is
+/// unremarkable, the unforced route would 204 too. Named for what this
+/// test actually proves (the seeded row deletes with `force`, deprovision
+/// never even attempted) rather than the old name's now-false claim of a
+/// deprovision failure. The genuine "`force` bypasses a REAL failure"
+/// case is `postgres_connector_delete_with_force_bypasses_a_real_
+/// deprovision_failure` below.
 #[tokio::test]
-async fn postgres_connector_delete_with_force_deletes_despite_deprovision_failure() {
+async fn postgres_connector_delete_with_force_on_seeded_row_with_nothing_to_deprovision() {
     let app = spin_up().await;
     let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
 
@@ -172,6 +195,47 @@ async fn postgres_connector_delete_with_force_deletes_despite_deprovision_failur
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert!(
         !connector_row_exists(&app.pool, "conn-pg-lakehouse").await,
+        "?force=true must delete the row"
+    );
+}
+
+/// The genuine case the `?force` escape hatch exists for: a connector
+/// whose deprovision attempt actually fails (the same self-created
+/// null-adapter `PostgreSQL` connector the 409-without-`force` test above
+/// builds, pointed at the same unreachable-in-this-network host) still
+/// deletes when `?force=true` is passed.
+///
+/// WS5 item D1 (a judge finding against the previous commit): the
+/// `postgres_connector_delete_with_force_deletes_despite_deprovision_
+/// failure` test this replaces was renamed above because it no longer
+/// exercised a real failure at all (0034 changed the seeded row's
+/// adapter); this test is the missing coverage, not a rename of the old
+/// one — nothing on this branch previously asserted `?force=true`
+/// overrides a genuine deprovision failure.
+#[tokio::test]
+async fn postgres_connector_delete_with_force_bypasses_a_real_deprovision_failure() {
+    let app = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+
+    let id = create_connector_with_undeprovisionable_slot(
+        &app.pool,
+        "force bypasses a real deprovision failure",
+    )
+    .await;
+    assert!(
+        connector_row_exists(&app.pool, &id).await,
+        "create_connector must have inserted the row"
+    );
+
+    let path = format!("/api/connectors/{id}?force=true");
+    let response = delete(&app.router, &path, &cookie).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "?force=true must override a genuine deprovision failure"
+    );
+    assert!(
+        !connector_row_exists(&app.pool, &id).await,
         "?force=true must delete the row even though deprovisioning failed"
     );
 }
