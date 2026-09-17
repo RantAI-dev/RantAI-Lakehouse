@@ -19,11 +19,12 @@ use lakehouse_core::ident::SqlLiteral;
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 
+use crate::health;
 use crate::json::ApiJson;
 use crate::routes::support::{js_error, num_or_zero, str_col};
 use crate::state::AppState;
 use crate::tenant::{TENANT_ID, TENANT_SITE};
-use lakehouse_dagster::{DgClient, DgError};
+use lakehouse_dagster::DgError;
 
 /// The three recognized `ops/{kind}` values. Ported from the `if (kind ===
 /// ...)` chain in `ops/[kind]/route.ts`; anything else is [`Kind::Unknown`].
@@ -84,7 +85,7 @@ async fn run(state: &AppState, kind: Kind) -> Result<Value, OpsError> {
     match kind {
         Kind::Observability => observability(&state.clickhouse).await,
         Kind::Workloads => workloads(&state.clickhouse).await,
-        Kind::Services => services(&state.clickhouse, &state.dagster).await,
+        Kind::Services => services(state).await,
         Kind::Unknown => unreachable!("Kind::Unknown is handled before `run` is called"),
     }
 }
@@ -192,61 +193,48 @@ async fn workloads(ch: &ChClient) -> Result<Value, OpsError> {
     Ok(json!({ "workloads": workloads }))
 }
 
-/// Build one `ops/services` row. `probed` is `Some(ok)` when a live check
-/// actually ran this request (`ClickHouse`, `Dagster`); it is `None` when
-/// nothing probes the service at all (`Iceberg`/`Lakekeeper`, `RustFS`) —
-/// those used to silently reuse `ClickHouse`'s result or the literal
-/// `true`. An unprobed service reports `health: "unknown"` and
-/// `checked: false` rather than a guessed health, and none of `version`,
-/// `replicas`, `errorRate`, or `latencyMs` are measured for any service
-/// today (WS5 is expected to fill some of these in).
-fn service_row(id: &str, name: &str, probed: Option<bool>, deps: &[&str]) -> Value {
-    let health = match probed {
-        Some(true) => "healthy",
-        Some(false) => "unhealthy",
-        None => "unknown",
-    };
+/// Build one `ops/services` row from a real [`health::ServiceHealth`]
+/// probe result (WS5 item A3) — replaces the old `service_row`, which took
+/// a bare `Option<bool>` and could only ever cover `ClickHouse`/`Dagster`;
+/// Lakekeeper/`RustFS`/`OpenFGA`/`Trino` are now genuinely probed too (or,
+/// for the two optional services, honestly reported `"unknown"` when
+/// unconfigured — see [`health::ServiceHealth::health_label`]).
+fn platform_service_row(h: &health::ServiceHealth, deps: &[&str]) -> Value {
     json!({
-        "id": id,
-        "name": name,
-        "health": health,
-        "checked": probed.is_some(),
-        "version": Value::Null,
+        "id": h.id,
+        "name": h.name,
+        "health": h.health_label(),
+        "checked": h.checked,
+        "version": h.version,
         "site": TENANT_SITE.as_str(),
         "replicas": Value::Null,
         "errorRate": Value::Null,
-        "latencyMs": Value::Null,
+        "latencyMs": h.latency_ms,
+        "checkedAt": h.checked_at,
         "dependencies": deps,
     })
 }
 
-async fn services(ch: &ChClient, dagster: &DgClient) -> Result<Value, OpsError> {
-    let ch_ok = ch.rows("SELECT 1", None).await.is_ok();
-    let dag_ok = dagster.is_alive().await;
-    let services = vec![
-        service_row(
-            "clickhouse",
-            "ClickHouse (Hot analytical store)",
-            Some(ch_ok),
-            &[],
-        ),
-        service_row(
-            "dagster",
-            "Dagster (Orchestration)",
-            Some(dag_ok),
-            &["clickhouse"],
-        ),
-        // Never probed — this used to reuse `ch_ok`, so a dead Lakekeeper
-        // read healthy whenever ClickHouse (a different service) answered.
-        service_row(
-            "iceberg",
-            "Iceberg + Lakekeeper (Open tables)",
-            None,
-            &["rustfs"],
-        ),
-        // Never probed — this used to be the literal `true`.
-        service_row("rustfs", "RustFS (Object storage)", None, &[]),
-    ];
+/// Declared dependency edges for the console's services graph. A fixed,
+/// hardcoded map (not derived from the probe set) — matches this file's
+/// pre-WS5 `dependencies` literals for `dagster`/`iceberg`(now
+/// `lakekeeper`)/`rustfs`, plus two new edges for the two newly-probed
+/// services this task adds.
+fn deps_for(id: &str) -> &'static [&'static str] {
+    match id {
+        "dagster" => &["clickhouse"],
+        "lakekeeper" => &["rustfs", "openfga"],
+        "trino" => &["lakekeeper", "rustfs"],
+        _ => &[],
+    }
+}
+
+async fn services(state: &AppState) -> Result<Value, OpsError> {
+    let probes = health::cached_probe_all(state).await;
+    let services: Vec<Value> = probes
+        .iter()
+        .map(|h| platform_service_row(h, deps_for(h.id)))
+        .collect();
     Ok(json!({ "services": services }))
 }
 
@@ -387,31 +375,91 @@ mod tests {
 
     #[test]
     fn unprobed_services_report_unknown_health_and_are_marked_unchecked() {
-        let iceberg = service_row("iceberg", "Iceberg", None, &["rustfs"]);
-        assert_eq!(iceberg["health"], "unknown");
-        assert_eq!(iceberg["checked"], false);
+        let trino = health::ServiceHealth {
+            id: "trino",
+            name: "Trino",
+            ok: false,
+            checked: false,
+            latency_ms: None,
+            version: None,
+            checked_at: "2026-08-27T04:00:10.075Z".to_owned(),
+            error: None,
+        };
+        let row = platform_service_row(&trino, &["rustfs"]);
+        assert_eq!(row["health"], "unknown");
+        assert_eq!(row["checked"], false);
         for field in ["version", "replicas", "errorRate", "latencyMs"] {
-            assert!(iceberg[field].is_null(), "{field} should be null");
+            assert!(row[field].is_null(), "{field} should be null");
         }
-
-        let rustfs = service_row("rustfs", "RustFS", None, &[]);
-        assert_eq!(rustfs["health"], "unknown");
-        assert_eq!(rustfs["checked"], false);
     }
 
     #[test]
     fn probed_services_keep_their_real_health() {
-        let down = service_row("clickhouse", "ClickHouse", Some(false), &[]);
-        assert_eq!(down["health"], "unhealthy");
-        assert_eq!(down["checked"], true);
+        let down = health::ServiceHealth {
+            id: "clickhouse",
+            name: "ClickHouse",
+            ok: false,
+            checked: true,
+            latency_ms: Some(12),
+            version: None,
+            checked_at: "2026-08-27T04:00:10.075Z".to_owned(),
+            error: Some("unreachable".to_owned()),
+        };
+        let row = platform_service_row(&down, &[]);
+        assert_eq!(row["health"], "unhealthy");
+        assert_eq!(row["checked"], true);
         // Even a probed service reports null for the metrics nothing
-        // measures — probing only tells us up/down, not version or
-        // latency.
-        assert!(down["version"].is_null());
+        // measures — probing only tells us up/down, not version.
+        assert!(row["version"].is_null());
+        assert_eq!(row["latencyMs"], 12);
+        assert_eq!(row["checkedAt"], "2026-08-27T04:00:10.075Z");
 
-        let up = service_row("dagster", "Dagster", Some(true), &["clickhouse"]);
-        assert_eq!(up["health"], "healthy");
-        assert_eq!(up["checked"], true);
+        let up = health::ServiceHealth {
+            id: "dagster",
+            name: "Dagster",
+            ok: true,
+            checked: true,
+            latency_ms: Some(5),
+            version: Some("1.13.17".to_owned()),
+            checked_at: "2026-08-27T04:00:10.075Z".to_owned(),
+            error: None,
+        };
+        let row = platform_service_row(&up, &["clickhouse"]);
+        assert_eq!(row["health"], "healthy");
+        assert_eq!(row["checked"], true);
+        assert_eq!(row["version"], "1.13.17");
+    }
+
+    /// WS5 item A3 — `services(&state)` returns all six probes, including
+    /// `"lakekeeper"`/`"openfga"`/`"trino"`, and an unconfigured
+    /// Trino/OpenFGA report `health: "unknown"`, `checked: false` even
+    /// though nothing was network-reachable in this test process.
+    #[tokio::test]
+    async fn services_returns_all_six_probes_with_unconfigured_ones_unknown() {
+        let cfg = crate::config::Config::from_map(&std::collections::HashMap::new()).unwrap();
+        let state = AppState::new(cfg);
+        let body = services(&state).await.unwrap();
+        let rows = body["services"].as_array().unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "clickhouse",
+                "dagster",
+                "lakekeeper",
+                "rustfs",
+                "openfga",
+                "trino"
+            ]
+        );
+        for id in ["trino", "openfga"] {
+            let row = rows.iter().find(|r| r["id"] == id).unwrap();
+            assert_eq!(
+                row["health"], "unknown",
+                "{id} must be unknown, not unhealthy"
+            );
+            assert_eq!(row["checked"], false);
+        }
     }
 
     #[test]
