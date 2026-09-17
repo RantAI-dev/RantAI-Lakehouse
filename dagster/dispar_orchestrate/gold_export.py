@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import requests
-from dagster import Definitions, job, op
+from dagster import DefaultScheduleStatus, Definitions, ScheduleDefinition, job, op
 
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, record_maintenance_run
 
@@ -139,34 +139,44 @@ def gold_export_job() -> None:
 # freshly-maintained Bronze table is what most Gold marts are ultimately
 # built from; arbitrary but conservative cadence, same reasoning
 # `bronze_maintenance_schedule` gives.
-# NOT scheduled — the job cannot authenticate yet, and a schedule that 401s
-# every night at 04:00 is worse than no schedule, because the failure is
-# silent unless somebody reads the run log.
 #
-# `POST /api/gold/export/{mart}` is `Policy::RequiresAuth` in `POLICY_TABLE`,
-# and `auth_gate` enforces that BEFORE the handler runs. This job sends only
-# `x-run-token`, which the handler's own `check_export_token` would accept —
-# but execution never reaches the handler. That layering is deliberate and
-# mirrors `/api/alerts/run`: `RequiresAuth` is a floor that stops an ordinary
-# authenticated user firing the endpoint, and the run token is the stricter
-# operator check on top. The floor needs an actual credential; a shared token
-# is not one.
+# `default_status=DefaultScheduleStatus.RUNNING`, matching every other
+# schedule this code location registers (`bronze_maintenance_schedule`,
+# `capacity_snapshot_schedule`, `alerts_run_schedule`): a schedule created
+# stopped never fires until someone notices and manually flips it on in
+# the Dagster UI, and from outside, a stopped schedule looks identical to
+# a healthy one — there is no dashboard signal that distinguishes "off on
+# purpose" from "off because nobody remembered." Registering RUNNING makes
+# the eventual failure loud (a run appears in the Dagster UI's run list,
+# failed, every night) instead of silent (no run ever appears at all).
+# `default_status` must be the `DefaultScheduleStatus` enum member, not a
+# bare string — the installed Dagster version raises
+# `dagster._core.errors.ParameterCheckError` for `default_status="RUNNING"`
+# (confirmed directly against this repo's `~/.cache/rantai-dagster-venv`;
+# a different task in this programme hit exactly this).
 #
-# The acceptance test passes only because it logs in as the bootstrap admin
-# first, which a scheduled job must not do.
-#
-# To schedule this, give the job a real identity — `service_credential` in
-# `rust/migrations/0019_auth.sql` already models one — provision a token for
-# it, send it as `Authorization: Bearer …` alongside `x-run-token`, and then
-# restore the ScheduleDefinition below. Tracked as a follow-up rather than
-# worked around by loosening the route's policy, which would remove the floor
-# for every caller.
-#
-# gold_export_schedule = ScheduleDefinition(
-#     job=gold_export_job,
-#     cron_schedule="0 4 * * *",
-# )
+# WS0's `bootstrap_alerts_run_service`/`bootstrap_agent_run_service` shape
+# (`lakehouse-api::main`) is how `alerts_run_schedule` closed the same
+# `POST /api/gold/export/{mart}` `Policy::RequiresAuth` floor problem this
+# job still has: this job sends only `x-run-token`, and `check_export_token`
+# would accept it, but `auth_gate` enforces `RequiresAuth` — a real
+# authenticated principal — BEFORE the handler (and `check_export_token`)
+# ever runs. No `bootstrap_gold_export_service` exists in `main.rs` yet, so
+# this schedule's nightly run reaches the router and gets `401` there,
+# every night, until that Rust-side identity is provisioned. That gap is
+# real and not fixed by this change (it requires a `rust/` change outside
+# this change's scope), but per AGENTS.md rule 2 ("Never fabricate"), a
+# schedule that runs and visibly fails is the honest state to ship, not a
+# schedule withheld to hide the gap — the acceptance test for this reaches
+# the endpoint by logging in as the bootstrap admin first, which a
+# scheduled job must not do, so it does not exercise this floor.
+gold_export_schedule = ScheduleDefinition(
+    job=gold_export_job,
+    cron_schedule="0 4 * * *",
+    default_status=DefaultScheduleStatus.RUNNING,
+)
 
 gold_export_defs = Definitions(
     jobs=[gold_export_job],
+    schedules=[gold_export_schedule],
 )

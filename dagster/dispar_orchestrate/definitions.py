@@ -16,7 +16,7 @@ from dispar_orchestrate.capacity_snapshot import (
     capacity_snapshot_job,
     capacity_snapshot_schedule,
 )
-from dispar_orchestrate.gold_export import gold_export_job
+from dispar_orchestrate.gold_export import gold_export_job, gold_export_schedule
 from dispar_orchestrate.ingest_factory import ingest_job, ingest_schedules
 from dispar_orchestrate.maintenance import (
     bronze_maintenance_job,
@@ -50,10 +50,11 @@ from dispar_orchestrate.replication_metrics import (
 # see `capacity_snapshot.py`'s module doc for its own design and the
 # schema-ownership split with `bronze_catalog.py`.
 #
-# `gold_export_job` is STILL registered without a schedule (a separate,
-# larger change would be needed to give it the same service-credential
-# treatment `agent_run_job` got here — see `gold_export.py`'s module doc),
-# so it remains launchable on demand from the Dagster UI, same as before.
+# WS6 Task 5 restores `gold_export_schedule` (daily 04:00,
+# `default_status=RUNNING`, same convention as every schedule below — see
+# `gold_export.py`'s module-level comment for why RUNNING and for the
+# still-open `auth_gate` floor gap this change does not close). It remains
+# also launchable on demand from the Dagster UI, same as before.
 # `agent_run_job`'s own schedules are no longer permanently empty: with
 # `AGENT_RUN_TOKEN` set (see `lakehouse-api::main::bootstrap_agent_run_service`
 # and this repo's `.env.example`), `agent_run_schedules` holds one entry
@@ -77,6 +78,7 @@ defs = Definitions(
         alerts_run_schedule,
         *agent_run_schedules,
         capacity_snapshot_schedule,
+        gold_export_schedule,
         *ingest_schedules,
     ],
 )
