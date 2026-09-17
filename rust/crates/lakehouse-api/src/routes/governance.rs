@@ -812,6 +812,150 @@ pub async fn create_policy(
     Ok((StatusCode::CREATED, ApiJson(created)))
 }
 
+/// The `POST /api/governance/policies/preview` body — a `table`/`mask`/
+/// `rowFilter` triple an admin is drafting, not-yet-saved.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewPolicyBody {
+    table: String,
+    #[serde(default)]
+    mask: Vec<String>,
+    #[serde(default)]
+    row_filter: Option<String>,
+}
+
+/// Builds the `POST /api/governance/policies/preview` response body.
+/// `affected_rows`/`masked_columns` are the caller's own real
+/// measurements — `None` for either means "could not measure", never a
+/// fabricated `0`/`[]` claimed as real — and `supported` is `true` only
+/// when BOTH measurements actually happened, matching WS7 item A5's Step 1
+/// tests: `(None, None)` for an unmeasurable preview (an unparsed row
+/// filter, or a table `system.columns` doesn't know), `(Some(n),
+/// Some(cols))` for a real one.
+///
+/// # Errors
+/// This function itself never errors — it is a pure `Value` builder, kept
+/// separate from the route handler so it is unit-testable without a
+/// `ClickHouse` connection (the same extraction pattern
+/// `routes::query::run_result_json` already uses).
+#[must_use]
+fn preview_result_json(affected_rows: Option<i64>, masked_columns: Option<Vec<String>>) -> Value {
+    let supported = affected_rows.is_some() && masked_columns.is_some();
+    json!({
+        "affectedRows": affected_rows,
+        "maskedColumns": masked_columns.unwrap_or_default(),
+        "supported": supported,
+    })
+}
+
+/// `POST /api/governance/policies/preview` — real policy impact preview
+/// (WS7 item A5, closing WS1 task 12's deferred half:
+/// `docs/superpowers/plans/2026-09-10-ws1-honesty-pass.md:912`, "Delete
+/// that block. Do not replace it — WS7's policy engine can compute a real
+/// one."). Re-validates `rowFilter` through the SAME
+/// `sql_rewrite::validate_row_filter_expr` Phase B built — never a second,
+/// divergent grammar (this is exactly why A5 was deferred until Phase B
+/// existed) — runs `SELECT count() FROM <table> WHERE <rewritten filter>`
+/// against `ClickHouse` (bounded 5s timeout) for `affectedRows`, and
+/// cross-checks each `mask` entry against `system.columns` for that
+/// table, reporting only the ones that are real columns (a typo'd column
+/// name is silently dropped from the PREVIEW only — `create_policy`
+/// (WS7 item A4) does not cross-check column existence at all, since a table
+/// can gain a masked column later, so this asymmetry is disclosed, not a
+/// bug).
+///
+/// Gated by `policy:write` (`POLICY_TABLE`) — only someone who could
+/// actually save the policy may preview its effect.
+///
+/// # Errors
+///
+/// 400 on a malformed body; 503 if no pool is configured (kept consistent
+/// with every other `/api/governance/*` route, even though this route
+/// itself never touches Postgres — `pool(&state)?` is the same
+/// availability gate the rest of this file uses).
+pub async fn preview_policy(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    pool(&state)?;
+    let body: PreviewPolicyBody = parse_body(&body)?;
+    Ok(ApiJson(preview_policy_impl(&state, &body).await))
+}
+
+async fn preview_policy_impl(state: &AppState, body: &PreviewPolicyBody) -> Value {
+    let Ok((schema, table)) = lakehouse_core::ident::split_namespaced_table(&body.table) else {
+        return preview_result_json(None, None);
+    };
+    let cols_sql = format!(
+        "SELECT name FROM system.columns WHERE database={} AND table={}",
+        SqlLiteral::from(schema),
+        SqlLiteral::from(table),
+    );
+    let real_columns: Vec<String> = match state.clickhouse.rows(&cols_sql, None).await {
+        Ok(rows) => rows
+            .iter()
+            .filter_map(|r| r.get("name").and_then(Value::as_str).map(str::to_owned))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    if real_columns.is_empty() {
+        // Either the table genuinely has no columns `ClickHouse` reports
+        // (does not exist yet, or the read itself failed) — either way
+        // this module cannot measure anything real for it.
+        return preview_result_json(None, None);
+    }
+    let masked_columns: Vec<String> = body
+        .mask
+        .iter()
+        .filter(|m| real_columns.iter().any(|c| c.eq_ignore_ascii_case(m)))
+        .cloned()
+        .collect();
+
+    let where_clause = match body
+        .row_filter
+        .as_deref()
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+    {
+        Some(filter) => {
+            let expanded = crate::sql_rewrite::validate_row_filter_expr(filter, &real_columns)
+                .and_then(|expr| {
+                    crate::sql_rewrite::expand_placeholders(
+                        &expr,
+                        &crate::sql_rewrite::PlaceholderValues::none(),
+                    )
+                });
+            match expanded {
+                Ok(expanded) => format!(" WHERE {expanded}"),
+                // Same "conditions do not parse" shape Step 1's own test
+                // exercises — `affectedRows` stays unmeasured, but the
+                // masked-column cross-check already ran, so it is still
+                // reported (never re-nulled just because the OTHER half
+                // of the preview failed).
+                Err(_) => return preview_result_json(None, Some(masked_columns)),
+            }
+        }
+        None => String::new(),
+    };
+    let count_sql =
+        format!("SELECT toString(count()) AS n FROM `{schema}`.`{table}`{where_clause}");
+    let affected_rows = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.clickhouse.rows(&count_sql, None),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .and_then(|rows| rows.into_iter().next())
+    .and_then(|row| {
+        row.get("n")
+            .and_then(Value::as_str)
+            .and_then(|s| s.parse::<i64>().ok())
+    });
+
+    preview_result_json(affected_rows, Some(masked_columns))
+}
+
 /// The `POST /api/governance/quality` body. Mirrors `CreateQualityRuleInput`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1053,6 +1197,35 @@ mod tests {
             "effect": "Permit with obligation",
         });
         assert!(create_policy_body(body).is_ok());
+    }
+
+    // ── WS7 item A5: real policy impact preview ─────────────────────────
+
+    #[test]
+    fn preview_body_reports_unmeasured_when_conditions_do_not_parse() {
+        let v = preview_result_json(None, None);
+        assert!(v["affectedRows"].is_null());
+        assert!(v["maskedColumns"].as_array().unwrap().is_empty());
+        assert_eq!(v["supported"], json!(false));
+    }
+
+    #[test]
+    fn preview_body_reports_real_values_when_measured() {
+        let v = preview_result_json(Some(42), Some(vec!["email".to_owned()]));
+        assert_eq!(v["affectedRows"], json!(42));
+        assert_eq!(v["maskedColumns"], json!(["email"]));
+        assert_eq!(v["supported"], json!(true));
+    }
+
+    #[test]
+    fn preview_body_is_unsupported_when_only_the_row_count_is_missing() {
+        // The masked-column cross-check succeeded but the row-count
+        // measurement did not (a bad row filter, or ClickHouse timed
+        // out) — `supported` must still be false: a HALF-real preview is
+        // not a real one.
+        let v = preview_result_json(None, Some(vec!["email".to_owned()]));
+        assert_eq!(v["maskedColumns"], json!(["email"]));
+        assert_eq!(v["supported"], json!(false));
     }
 
     fn maintenance_fixture_row() -> Map<String, Value> {

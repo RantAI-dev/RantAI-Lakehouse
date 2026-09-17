@@ -207,6 +207,12 @@ fn governance_static_router() -> Router<AppState> {
             "/api/governance/policies",
             get(governance::list_policies).post(governance::create_policy),
         )
+        // WS7 item A5: real policy impact preview (closes WS1 task 12's
+        // deferred half).
+        .route(
+            "/api/governance/policies/preview",
+            axum::routing::post(governance::preview_policy),
+        )
         // WS5 item E1 (Y6): dataset freshness SLA.
         .route(
             "/api/governance/sla",

@@ -193,6 +193,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/governance/ingest-runs", Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/governance/policies",  Policy::RequiresPermission("policy:read")),
     ("POST", "/api/governance/policies",  Policy::RequiresPermission("policy:write")),
+    // WS7 item A5: only someone who could actually save the policy may
+    // preview its effect.
+    ("POST", "/api/governance/policies/preview", Policy::RequiresPermission("policy:write")),
     // WS5 item E1 (Y6): per-table freshness SLA. `governance:write` is the
     // existing grant `0030_table_maintenance_policy.sql` already gives the
     // `Governance Admin` role (not re-granted here) — same permission the
