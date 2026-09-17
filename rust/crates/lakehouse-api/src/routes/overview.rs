@@ -484,6 +484,48 @@ pub struct SilenceAlertBody {
     until_minutes: i64,
 }
 
+/// Upper bound for `untilMinutes`: 30 days.
+const MAX_SILENCE_MINUTES: i64 = 43_200;
+
+/// Turns a caller-supplied `untilMinutes` into a validated, checked offset
+/// from `now`. WS5 item C1 (blocker): `untilMinutes` used to go straight
+/// from the request body into `OffsetDateTime::now_utc() +
+/// time::Duration::minutes(until_minutes)` with two caller-reachable
+/// defects — a non-positive value produced a `silenced_until` in the past,
+/// so `is_rule_silenced`'s `silenced_until > now` check was always false
+/// (the alert never silenced), yet the route still answered `200` with the
+/// alert marked `acknowledged`; and an out-of-range value (`i64::MAX`, for
+/// instance) panicked, since `time` 0.3.55's `SignedDuration::minutes`
+/// (`time::Duration` is a type alias for it) does `minutes.checked_mul(60)
+/// .expect(...)`, which aborts the process rather than returning an error.
+/// This rejects anything outside `1..=MAX_SILENCE_MINUTES` before
+/// constructing a `Duration` at all, and then uses `OffsetDateTime`'s own
+/// `checked_add` rather than `+` so that even a value inside the accepted
+/// range can never panic on the addition.
+///
+/// # Errors
+///
+/// 400 if `until_minutes` is not in `1..=MAX_SILENCE_MINUTES`, or if the
+/// resulting instant is not representable (defensive: unreachable within
+/// the accepted 30-day range on any realistic clock, but checked rather
+/// than assumed).
+fn until_at_from_minutes(
+    now: OffsetDateTime,
+    until_minutes: i64,
+) -> Result<OffsetDateTime, ApiError> {
+    if !(1..=MAX_SILENCE_MINUTES).contains(&until_minutes) {
+        return Err(ApiError::BadRequest(format!(
+            "untilMinutes must be between 1 and {MAX_SILENCE_MINUTES} (30 days)"
+        )));
+    }
+    now.checked_add(time::Duration::minutes(until_minutes))
+        .ok_or_else(|| {
+            ApiError::BadRequest(
+                "untilMinutes produces a time outside the representable range".to_owned(),
+            )
+        })
+}
+
 /// `POST /api/overview/alerts/{id}/silence` — silence an alert instance
 /// (and, if it carries a `rule_id`, that rule's future firings) for
 /// `untilMinutes`. WS5 item C1. A silence marks the row `acknowledged`
@@ -495,7 +537,8 @@ pub struct SilenceAlertBody {
 ///
 /// # Errors
 ///
-/// 400 on a malformed body; 404 if `id` is unknown; 503/500 as above.
+/// 400 on a malformed body or an `untilMinutes` outside `1..=43_200` (see
+/// [`until_at_from_minutes`]); 404 if `id` is unknown; 503/500 as above.
 pub async fn silence_alert(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -510,11 +553,14 @@ pub async fn silence_alert(
             .into_response();
         }
     };
+    let until_at = match until_at_from_minutes(OffsetDateTime::now_utc(), until.until_minutes) {
+        Ok(t) => t,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
     let pg = match pool(&state) {
         Ok(p) => p,
         Err(err) => return crate::error::ApiRejection(err).into_response(),
     };
-    let until_at = OffsetDateTime::now_utc() + time::Duration::minutes(until.until_minutes);
     match overview::silence_alert(pg, &id, until_at).await {
         Ok(Some(alert)) => (StatusCode::OK, ApiJson(alert)).into_response(),
         Ok(None) => (
@@ -597,6 +643,63 @@ mod tests {
         // Sanity bound: some time after this file was written, well before
         // any realistic clock error.
         assert!(now_unix_millis() > 1_700_000_000_000.0);
+    }
+
+    // WS5 item C1: both failing before the fix -- a negative `untilMinutes`
+    // used to return 200 while silencing nothing (`silenced_until` landed
+    // in the past), and `i64::MAX` used to panic inside
+    // `time::Duration::minutes`'s overflow check.
+
+    #[test]
+    fn a_negative_until_minutes_is_rejected_rather_than_silencing_nothing() {
+        let now = datetime!(2026 - 09 - 11 03:20:00 UTC);
+
+        let result = until_at_from_minutes(now, -5);
+
+        assert!(
+            matches!(result, Err(ApiError::BadRequest(_))),
+            "a negative untilMinutes must be a 400, not a 200 whose \
+             silenced_until is already in the past"
+        );
+    }
+
+    #[test]
+    fn a_zero_until_minutes_is_rejected() {
+        let now = datetime!(2026 - 09 - 11 03:20:00 UTC);
+
+        let result = until_at_from_minutes(now, 0);
+
+        assert!(matches!(result, Err(ApiError::BadRequest(_))));
+    }
+
+    #[test]
+    fn an_i64_max_until_minutes_is_rejected_rather_than_panicking() {
+        let now = datetime!(2026 - 09 - 11 03:20:00 UTC);
+
+        let result = until_at_from_minutes(now, i64::MAX);
+
+        assert!(
+            matches!(result, Err(ApiError::BadRequest(_))),
+            "an out-of-range untilMinutes must be a 400, not a panic inside \
+             time::Duration::minutes"
+        );
+    }
+
+    #[test]
+    fn an_in_range_until_minutes_advances_the_clock_by_that_many_minutes() {
+        let now = datetime!(2026 - 09 - 11 03:20:00 UTC);
+
+        let until_at = until_at_from_minutes(now, 60).expect("60 is within range");
+
+        assert_eq!(until_at, datetime!(2026 - 09 - 11 04:20:00 UTC));
+    }
+
+    #[test]
+    fn the_maximum_accepted_until_minutes_is_still_accepted() {
+        let now = datetime!(2026 - 09 - 11 03:20:00 UTC);
+
+        assert!(until_at_from_minutes(now, MAX_SILENCE_MINUTES).is_ok());
+        assert!(until_at_from_minutes(now, MAX_SILENCE_MINUTES + 1).is_err());
     }
 
     #[test]
