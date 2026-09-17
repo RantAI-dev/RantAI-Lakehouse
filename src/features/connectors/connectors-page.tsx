@@ -23,7 +23,7 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatRelativeTime } from "@/lib/format"
 import { HEALTH_LABEL, type Health } from "@/lib/status"
 import { connectorService } from "@/services"
-import type { Connector } from "@/services/contracts/connectors"
+import type { Connector, IngestRun } from "@/services/contracts/connectors"
 
 type Direction = Connector["direction"]
 
@@ -75,6 +75,99 @@ const columns: ColumnDef<Connector>[] = [
     ),
   },
 ]
+
+/**
+ * Read-only `Debezium` `.properties` rendering for a `cdc` adapter's
+ * captured table. `properties` holds ONLY `${ENV_VAR_NAME}` references —
+ * labeled explicitly as such, never resolved here or anywhere in the
+ * console.
+ */
+function DebeziumPanel({ connectorId, table }: { connectorId: string; table: string }) {
+  const props = useService(
+    (signal) => connectorService.getDebeziumProperties(connectorId, table, signal),
+    [connectorId, table]
+  )
+
+  if (props.status === "loading") return <LoadingSkeleton rows={2} />
+  if (props.status === "error")
+    return <ErrorState error={props.error} onRetry={props.reload} />
+
+  return (
+    <div>
+      <p className="text-xs font-medium text-muted-foreground">
+        Debezium properties · {props.data.table}
+      </p>
+      <p className="mt-0.5 text-xs text-muted-foreground">{props.data.note}</p>
+      <pre className="mt-1.5 overflow-x-auto rounded-md border bg-muted p-2 font-mono text-xs">
+        {props.data.properties}
+      </pre>
+    </div>
+  )
+}
+
+/**
+ * Ingest run history + a manual "Run now" trigger (WS3 item 17/36),
+ * `bronze_meta.ingest_run` surfaced through
+ * `GET /api/governance/ingest-runs?connectorId=`. For a `cdc` adapter,
+ * additionally renders the read-only Debezium properties panel for its
+ * first captured table (CDC has no separate batch trigger — see
+ * `runNow.data.reason` when `supported` is `false`).
+ */
+function IngestRunsPanel({ connectorId }: { connectorId: string }) {
+  const spec = useService((s) => connectorService.getIngestSpec(connectorId, s), [connectorId])
+  const runs = useService(
+    (s) => connectorService.listIngestRuns(connectorId, s),
+    [connectorId]
+  )
+  const runNow = useServiceAction((signal, id: string) => connectorService.runIngest(id, signal))
+
+  if (spec.status === "loading" || runs.status === "loading") return <LoadingSkeleton rows={3} />
+  if (spec.status === "error")
+    return <ErrorState error={spec.error} onRetry={spec.reload} />
+  if (runs.status === "error")
+    return <ErrorState error={runs.error} onRetry={runs.reload} />
+
+  const table: string | undefined = spec.data.sourceObjects[0]?.name
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <p className="text-xs font-medium text-muted-foreground">Ingest runs</p>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={runNow.status === "pending"}
+          onClick={async () => {
+            await runNow.run(connectorId)
+            runs.reload()
+          }}
+        >
+          {runNow.status === "pending" ? "Running…" : "Run now"}
+        </Button>
+      </div>
+      {runNow.data && runNow.data.supported === false ? (
+        <p className="text-sm text-muted-foreground">Not runnable · {runNow.data.reason}</p>
+      ) : null}
+      {runs.data.length === 0 ? (
+        <p className="text-sm text-muted-foreground">No ingest runs yet.</p>
+      ) : (
+        <ul className="space-y-1 text-sm">
+          {runs.data.map((r: IngestRun) => (
+            <li key={`${r.job}-${r.startedAt}`}>
+              {r.object}: {r.status} ({r.rows === null ? "—" : r.rows} rows)
+              <span className="ml-2 text-xs text-muted-foreground">
+                {formatRelativeTime(r.startedAt)}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {spec.data.adapter === "cdc" && table ? (
+        <DebeziumPanel connectorId={connectorId} table={table} />
+      ) : null}
+    </div>
+  )
+}
 
 /** Drawer body — fetches full connector detail for the selected row. */
 function ConnectorDetail({ id }: { id: string }) {
@@ -230,6 +323,7 @@ function ConnectorDetail({ id }: { id: string }) {
           </ul>
         )}
       </div>
+      <IngestRunsPanel connectorId={id} />
     </>
   )
 }

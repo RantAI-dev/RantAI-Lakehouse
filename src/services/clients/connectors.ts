@@ -5,6 +5,7 @@ import type {
   ConnectorTestResult,
   ConnectorType,
   CreateConnectorInput,
+  DebeziumProperties,
   DiscoverResult,
   IngestibleConnector,
   IngestRun,
@@ -108,6 +109,12 @@ export const postgresConnectorService: ConnectorService = {
   listIngestRuns(connectorId, signal) {
     return getJson<IngestRun[]>(
       `/api/governance/ingest-runs?connectorId=${encodeURIComponent(connectorId)}`,
+      { signal }
+    );
+  },
+  getDebeziumProperties(id, table, signal) {
+    return getJson<DebeziumProperties>(
+      `/api/connectors/${encodeURIComponent(id)}/debezium-properties?table=${encodeURIComponent(table)}`,
       { signal }
     );
   },

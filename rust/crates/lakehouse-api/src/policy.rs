@@ -178,6 +178,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    classification, audit, residency) has the same fan-out problem as
     //    ops — auth only for that one. ────────────────────────────────────
     ("GET",  "/api/governance/lineage",   Policy::RequiresPermission("lineage:read")),
+    // WS3 item 17: surfaces per-connector ingest history, the same
+    // audience as the base `/api/connectors` routes above.
+    ("GET",  "/api/governance/ingest-runs", Policy::RequiresPermission("connector:manage")),
     ("GET",  "/api/governance/policies",  Policy::RequiresPermission("policy:read")),
     ("POST", "/api/governance/policies",  Policy::RequiresPermission("policy:write")),
     ("GET",  "/api/governance/{kind}",    Policy::RequiresAuth),

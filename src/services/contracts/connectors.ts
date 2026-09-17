@@ -324,6 +324,20 @@ export type IngestRun = {
 }
 
 /**
+ * `GET /api/connectors/{id}/debezium-properties?table=`'s response.
+ * Mirrors Rust `DebeziumPropertiesResponse`
+ * (`rust/crates/lakehouse-api/src/routes/connectors.rs`). `properties`
+ * contains ONLY `${ENV_VAR_NAME}` references for every credential-shaped
+ * field, never a resolved secret — rendered as literal text, labeled with
+ * `note`, and never resolved client-side.
+ */
+export type DebeziumProperties = {
+  properties: string
+  table: string
+  note: string
+}
+
+/**
  * One connector `dagster/dispar_orchestrate/ingest_factory.py` can build
  * and run a job for. Mirrors Rust `IngestibleConnector`
  * (`rust/crates/lakehouse-store/src/connectors.rs`) — NOT `Connector`:
@@ -365,4 +379,16 @@ export interface ConnectorService {
   discoverConnector(id: string, signal?: AbortSignal): Promise<DiscoverResult>
   runIngest(id: string, signal?: AbortSignal): Promise<IngestRunResult>
   listIngestRuns(connectorId: string, signal?: AbortSignal): Promise<IngestRun[]>
+  /**
+   * `GET /api/connectors/{id}/debezium-properties?table=` — a read-only
+   * rendering of the `Debezium` `.properties` file body for a `cdc`
+   * adapter's captured table, `${ENV_VAR_NAME}` references only, never a
+   * resolved secret. `table` is required: no registry column stores which
+   * table alone until an ingest spec names one via `sourceObjects`.
+   */
+  getDebeziumProperties(
+    id: string,
+    table: string,
+    signal?: AbortSignal
+  ): Promise<DebeziumProperties>
 }

@@ -13,6 +13,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use lakehouse_clickhouse::{ChClient, ChError};
 use lakehouse_core::ApiError;
+use lakehouse_core::ident::SqlLiteral;
 use lakehouse_store::PgPool;
 use lakehouse_store::governance::{
     self, ClassificationRule, CreateClassificationRuleInput, CreatePolicyInput,
@@ -550,6 +551,121 @@ pub async fn lineage(State(_state): State<AppState>, Query(q): Query<LineageQuer
     (StatusCode::OK, ApiJson(lineage_unsupported(&q.focus))).into_response()
 }
 
+// ── `GET /api/governance/ingest-runs?connectorId=` (WS3 item 17) ───────
+//
+// Same shape as `lineage` immediately above: a dedicated route (mounted
+// next to `lineage` in `routes/mod.rs`), never a seventh `Kind`. Surfaces
+// `lake.bronze_meta.ingest_run`, written by
+// `dagster/dispar_orchestrate/bronze_catalog.py::record_ingest_run`, to
+// the connector detail page's ingest-runs panel.
+
+/// Query parameters accepted by `GET /api/governance/ingest-runs`.
+#[derive(Debug, Deserialize)]
+pub struct IngestRunsQuery {
+    /// Required: axum's `Query` extractor rejects the request with its own
+    /// 400 when this is absent, matching this module's `{kind}` dispatch's
+    /// own "malformed input -> 4xx before any `ClickHouse` call" posture —
+    /// unlike [`LineageQuery::focus`], which is `#[serde(default)]` and
+    /// genuinely optional, listing runs for no connector at all is not a
+    /// meaningful request.
+    #[serde(rename = "connectorId")]
+    connector_id: String,
+}
+
+/// One row of `lake.bronze_meta.ingest_run`. Mirrors `IngestRun` in
+/// `contracts/connectors.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestRunRow {
+    pub connector_id: String,
+    pub job: String,
+    pub object: String,
+    /// `None` means "not measured" (`dlt`'s normalize row count was
+    /// genuinely unavailable) — never a fabricated `0` (WS3 plan review
+    /// Z9, `bronze_catalog.py`'s `_INGEST_RUN_SCHEMA`: `rows` is
+    /// `Nullable(UInt64)`, and `record_ingest_run`'s `rows` parameter is
+    /// `int | None`, for exactly this reason). Read via
+    /// [`nullable_u64_col`], never [`str_col`] plus a client-side parse
+    /// that would silently coerce a genuine `NULL` into `0`.
+    pub rows: Option<u64>,
+    pub started_at: String,
+    pub ended_at: String,
+    pub status: String,
+    pub error: String,
+}
+
+/// A `ClickHouse` `Nullable(UInt64)` column, read as `Option<u64>` and
+/// NEVER defaulted to `0` — the counterpart to `support::num_or_zero` for a
+/// column where "absent" and "zero" are two different, both-real facts
+/// (WS3 plan review Z9; see [`IngestRunRow::rows`]'s doc comment).
+///
+/// `ClickHouse`'s `FORMAT JSON` renders `UInt64`/`Nullable(UInt64)` as a
+/// quoted string by default (`output_format_json_quote_64bit_integers`,
+/// to avoid a JS `Number` precision loss on 64-bit values) but a bare
+/// JSON number when a server has that setting off — this accepts both.
+/// Only a JSON `null` or a missing column becomes `None`; a value that
+/// fails to parse also becomes `None` rather than crashing the whole
+/// response over one bad row, matching this module's other `ClickHouse`
+/// readers' "never let one row's odd shape sink the list" posture.
+#[must_use]
+fn nullable_u64_col(row: &Map<String, Value>, key: &str) -> Option<u64> {
+    match row.get(key) {
+        Some(Value::Number(n)) => n.as_u64(),
+        Some(Value::String(s)) => s.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+/// Build every `bronze_meta.ingest_run` row for `connector_id`.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` transport or server failure.
+async fn ingest_runs_for_connector(
+    ch: &ChClient,
+    connector_id: &str,
+) -> Result<Vec<IngestRunRow>, ChError> {
+    let sql = format!(
+        "SELECT connector_id, job, object, rows, started_at, ended_at, status, error \
+         FROM lake.`bronze_meta.ingest_run` WHERE connector_id = {}",
+        // WS3 plan review Z10: the workspace-wide literal-escaping helper,
+        // used identically to `routes::ops::kill_query_sql`/`routes::catalog`
+        // for a caller-supplied value in a hand-`format!`ed `ClickHouse`
+        // WHERE clause — `governance.rs` had no ClickHouse-literal helper
+        // of its own to grep for before this task.
+        SqlLiteral::from(connector_id),
+    );
+    let rows = ch.rows(&sql, None).await?;
+    Ok(rows
+        .iter()
+        .map(|r| IngestRunRow {
+            connector_id: str_col(r, "connector_id").to_owned(),
+            job: str_col(r, "job").to_owned(),
+            object: str_col(r, "object").to_owned(),
+            rows: nullable_u64_col(r, "rows"),
+            started_at: str_col(r, "started_at").to_owned(),
+            ended_at: str_col(r, "ended_at").to_owned(),
+            status: str_col(r, "status").to_owned(),
+            error: str_col(r, "error").to_owned(),
+        })
+        .collect())
+}
+
+/// `GET /api/governance/ingest-runs?connectorId=<id>`.
+pub async fn ingest_runs(
+    State(state): State<AppState>,
+    Query(q): Query<IngestRunsQuery>,
+) -> Response {
+    match ingest_runs_for_connector(&state.clickhouse, &q.connector_id).await {
+        Ok(rows) => (StatusCode::OK, ApiJson(rows)).into_response(),
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ApiJson(json!({ "error": js_error(err) })),
+        )
+            .into_response(),
+    }
+}
+
 // ── Postgres-backed writes (Task 2.3) ───────────────────────────────────
 //
 // Policies (list + create) and the three `create*Rule` handlers below back
@@ -851,6 +967,109 @@ mod tests {
         assert_eq!(v["edges"].as_array().map(Vec::len), Some(0));
         assert_eq!(v["columnMappings"].as_array().map(Vec::len), Some(0));
         assert_eq!(v["focus"], json!("serving.mart_revenue"));
+    }
+
+    /// Real precedent, cited in this task's plan: `lakehouse-clickhouse/
+    /// src/lib.rs:401+`'s `wiremock`-backed `ChClient` tests — this
+    /// module has no live-`ClickHouse` integration test of its own, so
+    /// `ingest_runs_for_connector` is proven against a mocked HTTP
+    /// response, not a real cluster.
+    #[tokio::test]
+    async fn ingest_runs_returns_only_the_requested_connectors_rows() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "connector_id": "conn-x", "job": "ingest_job", "object": "orders",
+                    "rows": 42, "started_at": "2026-09-11T00:00:00Z",
+                    "ended_at": "2026-09-11T00:00:05Z", "status": "succeeded", "error": "",
+                }],
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        let rows = ingest_runs_for_connector(&ch, "conn-x").await.unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].connector_id, "conn-x");
+        assert_eq!(rows[0].job, "ingest_job");
+        assert_eq!(rows[0].object, "orders");
+        assert_eq!(rows[0].rows, Some(42));
+        assert_eq!(rows[0].status, "succeeded");
+    }
+
+    /// WS3 plan review Z9: a `NULL` `rows` column (dlt's row count was
+    /// genuinely unmeasured) must deserialize to `None`, never a
+    /// fabricated `0` — [`nullable_u64_col`] is the guard, this is its
+    /// integration-shaped proof against the same mocked envelope above.
+    #[tokio::test]
+    async fn ingest_runs_reports_a_null_row_count_as_none_not_zero() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{
+                    "connector_id": "conn-x", "job": "ingest_job", "object": "orders",
+                    "rows": null, "started_at": "2026-09-11T00:00:00Z",
+                    "ended_at": "2026-09-11T00:00:05Z", "status": "rejected", "error": "ssrf blocked",
+                }],
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        let rows = ingest_runs_for_connector(&ch, "conn-x").await.unwrap();
+
+        assert_eq!(
+            rows[0].rows, None,
+            "a NULL rows column must never become a fabricated 0"
+        );
+    }
+
+    #[test]
+    fn nullable_u64_col_accepts_a_quoted_string_a_bare_number_and_null() {
+        let mut row = Map::new();
+        row.insert("as_string".to_owned(), json!("42"));
+        row.insert("as_number".to_owned(), json!(42));
+        row.insert("as_null".to_owned(), Value::Null);
+
+        assert_eq!(nullable_u64_col(&row, "as_string"), Some(42));
+        assert_eq!(nullable_u64_col(&row, "as_number"), Some(42));
+        assert_eq!(nullable_u64_col(&row, "as_null"), None);
+        assert_eq!(nullable_u64_col(&row, "missing"), None);
+    }
+
+    /// `Query<IngestRunsQuery>` extraction fails (axum's own 400) when
+    /// `connectorId` is absent — asserted the same way this module's
+    /// other dedicated route (`lineage`) is unit-tested: against the
+    /// route's own logic with a minimal router, not the full
+    /// Postgres-backed `TestApp` `tests/route_auth.rs` uses (no
+    /// `ClickHouse`/Postgres call happens before extraction fails).
+    #[tokio::test]
+    async fn ingest_runs_route_requires_connector_id() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let cfg = crate::config::Config::from_map(&std::collections::HashMap::new()).unwrap();
+        let router = axum::Router::new()
+            .route(
+                "/api/governance/ingest-runs",
+                axum::routing::get(ingest_runs),
+            )
+            .with_state(AppState::new(cfg));
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/governance/ingest-runs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
