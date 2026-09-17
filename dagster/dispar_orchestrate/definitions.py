@@ -12,6 +12,7 @@ from dagster import Definitions
 from dispar_orchestrate.agent_runs import agent_run_job, agent_run_schedules
 from dispar_orchestrate.alerts_run import alerts_run_job, alerts_run_schedule
 from dispar_orchestrate.assets import bronze_ingest_job
+from dispar_orchestrate.authored_factory import authored_jobs
 from dispar_orchestrate.capacity_snapshot import (
     capacity_snapshot_job,
     capacity_snapshot_schedule,
@@ -50,6 +51,17 @@ from dispar_orchestrate.replication_metrics import (
 # see `capacity_snapshot.py`'s module doc for its own design and the
 # schema-ownership split with `bronze_catalog.py`.
 #
+# WS4 items E1/E3/E4 add `authored_jobs`: one real `authored__<id>` job per
+# Postgres-authored, `ready`-status `pipeline_definition` row, built from
+# `GET /api/pipelines` at code-load time — see `authored_factory.py`'s
+# module doc for the full design, its degrade-honestly fetch, and two
+# verified gaps (no `definition` field on this branch's list response yet;
+# the pipeline-run service identity's `pipeline:write`-only scope) that
+# currently keep this list empty against a real running stack. Spread into
+# `jobs=`, not `schedules=`: an authored pipeline has no cron schedule of
+# its own in this plan's scope — it is triggered on demand via
+# `POST /api/pipelines/{id}/trigger`, same as `gold_export_job`.
+#
 # WS6 restores `gold_export_schedule` (daily 04:00,
 # `default_status=RUNNING`, same convention as every schedule below — see
 # `gold_export.py`'s module-level comment for why RUNNING and for the
@@ -71,6 +83,7 @@ defs = Definitions(
         alerts_run_job,
         capacity_snapshot_job,
         ingest_job,
+        *authored_jobs,
     ],
     schedules=[
         bronze_maintenance_schedule,
