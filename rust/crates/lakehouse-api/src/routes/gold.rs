@@ -89,16 +89,40 @@ pub struct ExportQuery {
     token: Option<String>,
 }
 
-/// See the module doc comment's "Auth" section; behaviorally identical to
-/// `routes::alerts::check_run_token`, duplicated rather than shared
-/// because the two guards protect different config fields and the
-/// duplication is a handful of lines, not a maintained abstraction.
+/// See the module doc comment's "Auth" section. Two independent ways to
+/// pass, checked in this order:
+///
+/// 1. **`gold:export` permission, unconditionally.** A principal (human or
+///    service) holding this permission — e.g. Platform Admin's seeded
+///    `*:*` role, or a narrower role an operator has explicitly granted it
+///    — passes regardless of whether `GOLD_EXPORT_RUN_TOKEN` is
+///    configured. This is what lets the console's "Export now" button
+///    (WS6) work in every deployment, including ones that configure a
+///    shared token for the Dagster schedule — D4 (`CHANGELOG.md`:
+///    "`/api/alerts/run` now fails closed (401) when `ALERTS_RUN_TOKEN` is
+///    unset, instead of allowing unauthenticated calls") forbids
+///    fail-open when a token is unset; it does not require that a
+///    configured token become the only accepted credential once one
+///    exists — an explicitly permissioned session is exactly the kind of
+///    caller this floor exists to let through, not turn away.
+/// 2. **The configured shared token, if `GOLD_EXPORT_RUN_TOKEN` is set.**
+///    Unchanged from before this permission fallback existed: a wrong or
+///    missing token here is always `401`, whether or not the caller holds
+///    any permission at all.
+///
+/// With neither set, only a `PrincipalId::Service` principal is let
+/// through (`503` otherwise) — unchanged from before this task.
 fn check_export_token(
     configured: Option<&str>,
     header_token: Option<&str>,
     query_token: Option<&str>,
     principal: Option<&Principal>,
 ) -> Result<(), ApiError> {
+    if let Some(p) = principal
+        && p.has("gold:export")
+    {
+        return Ok(());
+    }
     if let Some(need) = configured {
         return if header_token.or(query_token) == Some(need) {
             Ok(())
@@ -107,10 +131,13 @@ fn check_export_token(
         };
     }
     match principal {
+        // Unchanged: the scheduled Dagster trigger's own service identity
+        // always passes even with no explicit scope, same posture as
+        // before this task.
         Some(p) if matches!(p.id, PrincipalId::Service(_)) => Ok(()),
         _ => Err(ApiError::Unavailable(
-            "gold export is not configured: set GOLD_EXPORT_RUN_TOKEN, or call with \
-             service-identity credentials (not a human user session)"
+            "gold export is not configured: set GOLD_EXPORT_RUN_TOKEN, call with a service \
+             identity credential, or use a session with the gold:export permission"
                 .to_owned(),
         )),
     }
@@ -233,7 +260,23 @@ pub async fn export(
         "table": result.table,
         "formatVersion": result.format_version,
         "rowsExported": result.rows_exported,
+        "snapshotId": result.snapshot_id,
+        "exportedAt": result.exported_at_ms.and_then(millis_to_rfc3339),
     })))
+}
+
+/// Renders an `Iceberg` snapshot's Unix-millisecond commit time as an RFC
+/// 3339 UTC string, or `None` if `ms` doesn't fall on a valid instant
+/// (defensive only — every value this is ever called with comes from
+/// `Snapshot::timestamp_ms`, which `iceberg-rust` derives from the
+/// table's own committed metadata).
+fn millis_to_rfc3339(ms: i64) -> Option<String> {
+    time::OffsetDateTime::from_unix_timestamp(ms / 1000)
+        .ok()
+        .and_then(|dt| {
+            dt.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
 }
 
 /// `GET /api/gold/export/{mart}` — read the Gold Iceberg table back
@@ -272,15 +315,121 @@ pub async fn read_back(
         Some(token),
     );
 
-    let (format_version, rows) =
-        gold_export::read_back_row_count(&iceberg_config, mart_ident.as_str())
-            .await
-            .map_err(ApiError::from)?;
+    let readback = gold_export::read_back_row_count(&iceberg_config, mart_ident.as_str())
+        .await
+        .map_err(ApiError::from)?;
 
     Ok(ApiJson(json!({
         "namespace": lakehouse_iceberg::gold::GOLD_NAMESPACE,
         "table": mart_ident.as_str(),
-        "formatVersion": format_version,
-        "rowsInIceberg": rows,
+        "formatVersion": readback.format_version,
+        "rowsInIceberg": readback.rows,
+        "snapshotId": readback.snapshot_id,
+        "exportedAt": readback.exported_at_ms.and_then(millis_to_rfc3339),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_auth::PermissionSet;
+
+    use super::*;
+
+    fn service_principal() -> Principal {
+        Principal {
+            id: PrincipalId::Service(uuid::Uuid::new_v4()),
+            tenant_ids: vec![],
+            display_name: "gold-export-scheduler".to_owned(),
+            permissions: PermissionSet::parse("gold:export"),
+            provider: "service".to_owned(),
+            must_change_password: false,
+        }
+    }
+
+    fn human_principal_with(permissions: &str) -> Principal {
+        Principal {
+            id: PrincipalId::User(uuid::Uuid::new_v4()),
+            tenant_ids: vec![],
+            display_name: "operator".to_owned(),
+            permissions: PermissionSet::parse(permissions),
+            provider: "session".to_owned(),
+            must_change_password: false,
+        }
+    }
+
+    #[test]
+    fn gold_export_permission_passes_even_with_no_token_configured() {
+        assert!(
+            check_export_token(None, None, None, Some(&human_principal_with("gold:export")))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn gold_export_permission_passes_even_when_a_token_is_configured_and_not_presented() {
+        // D4 (CHANGELOG.md) forbids FAIL-OPEN — letting an unauthenticated
+        // or under-permissioned caller through when a token is unset. It
+        // does not require that a token, once configured, become the
+        // ONLY accepted credential: a principal explicitly granted
+        // gold:export (e.g. via a console session) is exactly the kind
+        // of caller D4's floor already exists to distinguish from "any
+        // signed-up user" — see check_export_token's doc comment. Without
+        // this, a deployment that sets GOLD_EXPORT_RUN_TOKEN (for the
+        // Dagster schedule) would make the console's "Export now" button
+        // permanently unusable for every human operator.
+        assert!(
+            check_export_token(
+                Some("secret"),
+                None,
+                None,
+                Some(&human_principal_with("gold:export")),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn no_configured_token_still_accepts_a_service_principal_with_no_explicit_scope() {
+        // Unchanged behavior from before this task: a service principal
+        // was always sufficient, regardless of its own permission set.
+        let mut service = service_principal();
+        service.permissions = PermissionSet::parse("");
+        assert!(check_export_token(None, None, None, Some(&service)).is_ok());
+    }
+
+    #[test]
+    fn no_configured_token_rejects_a_human_principal_without_the_permission() {
+        let err = check_export_token(
+            None,
+            None,
+            None,
+            Some(&human_principal_with("catalog:read")),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ApiError::Unavailable(_)));
+    }
+
+    #[test]
+    fn no_configured_token_rejects_no_principal_at_all() {
+        assert!(check_export_token(None, None, None, None).is_err());
+    }
+
+    #[test]
+    fn configured_token_rejects_an_unpermissioned_session_presenting_the_wrong_token() {
+        // The token path's refusal is unchanged for anyone NOT holding
+        // gold:export: a wrong/missing token still 401s exactly as
+        // before this task.
+        let err = check_export_token(
+            Some("secret"),
+            None,
+            Some("wrong"),
+            Some(&human_principal_with("catalog:read")),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Unauthorized(_)) || err.to_string().contains("unauthorized")
+        );
+    }
 }

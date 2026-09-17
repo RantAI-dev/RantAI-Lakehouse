@@ -109,11 +109,11 @@ pub(super) async fn get_gold_export(state: &AppState, args: &Map<String, Value>)
         Err(err) => return err,
     };
     match crate::gold_export::read_back_row_count(&iceberg_config, mart_ident.as_str()).await {
-        Ok((format_version, rows)) => json!({
+        Ok(readback) => json!({
             "namespace": lakehouse_iceberg::gold::GOLD_NAMESPACE,
             "table": mart_ident.as_str(),
-            "formatVersion": format_version,
-            "rowsInIceberg": rows,
+            "formatVersion": readback.format_version,
+            "rowsInIceberg": readback.rows,
         }),
         Err(err) => {
             response_to_value(crate::error::ApiRejection(ApiError::from(err)).into_response()).await
