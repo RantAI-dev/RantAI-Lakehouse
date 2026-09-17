@@ -793,6 +793,16 @@ enum HeadlessOutcome {
     WaitingApproval,
 }
 
+/// Writes a headless run's real, accumulated token spend
+/// ([`agents::record_run_budget`]), logging (never panicking) if the run
+/// has vanished mid-loop — mirrors [`append_step`]'s own log-and-continue
+/// shape.
+async fn write_run_budget(pg: &PgPool, run_id: &str, budget_consumed: f64) {
+    if let Err(err) = agents::record_run_budget(pg, run_id, budget_consumed).await {
+        tracing::warn!(%err, run_id, "headless run: failed to record budget_consumed");
+    }
+}
+
 /// Appends one step to a headless run's trace, logging (never panicking)
 /// if the run has vanished mid-loop.
 async fn append_step(pg: &PgPool, run_id: &str, id: &str, label: &str, status: &str, detail: &str) {
@@ -903,6 +913,15 @@ async fn run_headless_loop(
     principal_id: Option<String>,
     principal_kind: &str,
     actor_label: &str,
+    // WS7 item G2: `budget_limit`/`budget_consumed` are measured in
+    // TOKENS, not currency — `lakehouse-llm` has no price table (`grep
+    // -rn "price\|cost_per_token" rust/crates/lakehouse-llm/` returns
+    // nothing) and this loop does not invent one. `DigitalEmployee.
+    // budget_limit`'s existing column and "Budget ceiling" label are
+    // reinterpreted as a token ceiling going forward — a disclosed,
+    // breaking semantic change for any already-authored employee whose
+    // `budget_limit` was set assuming a currency unit.
+    budget_limit: f64,
 ) -> HeadlessOutcome {
     use lakehouse_llm::{ChatOptions, LlmMessage, LlmMessageRole};
 
@@ -945,14 +964,64 @@ async fn run_headless_loop(
     // user-triggered run acts as that one user for every tool call below.
 
     let mut step_no: u32 = 0;
+    let mut budget_consumed: f64 = 0.0;
 
     for _ in 0..MAX_HEADLESS_ITER {
+        // Checked BEFORE each LLM call, not after — checking after would
+        // let one more call through unconditionally. This means one call
+        // can still push total usage past `budget_limit` before the loop
+        // notices (the loop cannot know a call's token cost before making
+        // it) — the run still stops at the next iteration boundary, never
+        // silently continuing past the detected overage.
+        if budget_consumed >= budget_limit {
+            step_no += 1;
+            let detail = format!(
+                "budget exhausted: consumed {budget_consumed} tokens against a limit of {budget_limit}"
+            );
+            append_step(
+                pg,
+                run_id,
+                &format!("step-{step_no}"),
+                "budget",
+                "failed",
+                &detail,
+            )
+            .await;
+            write_headless_audit(
+                pg,
+                principal_id.clone(),
+                principal_kind,
+                actor_label,
+                "run_employee",
+                None,
+                None,
+                &json!({ "prompt": prompt }),
+                "budget_exhausted",
+                Some(&detail),
+                run_id,
+                None,
+            )
+            .await;
+            write_run_budget(pg, run_id, budget_consumed).await;
+            return HeadlessOutcome::Terminal("budget_exhausted");
+        }
+
         let msg = match state
             .llm
-            .chat_with_tools(&messages, &tools, ChatOptions::default())
+            .chat_with_tools_metered(&messages, &tools, ChatOptions::default())
             .await
         {
-            Ok(m) => m,
+            Ok((m, usage)) => {
+                // A real, disclosed measurement gap: `usage` is `None`
+                // when the endpoint's response omits the `usage` block
+                // entirely — that call contributes nothing to
+                // `budget_consumed`, which is honest under-measurement,
+                // never a fabricated zero standing in for "unmeasured".
+                if let Some(usage) = usage {
+                    budget_consumed += f64::from(usage.total_tokens);
+                }
+                m
+            }
             Err(err) => {
                 step_no += 1;
                 let detail = format!("AI Copilot unavailable: {err}");
@@ -980,6 +1049,7 @@ async fn run_headless_loop(
                     None,
                 )
                 .await;
+                write_run_budget(pg, run_id, budget_consumed).await;
                 return HeadlessOutcome::Terminal("failed");
             }
         };
@@ -1012,6 +1082,7 @@ async fn run_headless_loop(
                 None,
             )
             .await;
+            write_run_budget(pg, run_id, budget_consumed).await;
             return HeadlessOutcome::Terminal("succeeded");
         }
 
@@ -1251,6 +1322,7 @@ async fn run_headless_loop(
         "tool iteration budget reached",
     )
     .await;
+    write_run_budget(pg, run_id, budget_consumed).await;
     HeadlessOutcome::Terminal("failed")
 }
 
@@ -1408,6 +1480,7 @@ pub async fn run_employee(
         principal_id,
         principal_kind,
         &actor,
+        config.budget_limit,
     )
     .await;
 
@@ -1758,5 +1831,225 @@ mod tests {
     #[test]
     fn a_run_auth_token_yields_no_principal() {
         assert!(principal_for_run_auth(&RunAuth::Token).is_none());
+    }
+
+    /// WS7 item G2: `run_headless_loop`'s real, DB-backed budget-exhaustion
+    /// behavior — the loop must stop with `HeadlessOutcome::Terminal
+    /// ("budget_exhausted")` once accumulated real token usage crosses
+    /// `budget_limit`, and `agent_run.budget_consumed` must hold the real
+    /// accumulated sum, not an estimate. Before this task, `run_headless_
+    /// loop` called `state.llm.chat_with_tools` (not the metered variant
+    /// WS7 item G1 added) and never read or wrote `budget_consumed`/
+    /// `budget_limit` anywhere in its body — confirmed by reading the
+    /// whole function before touching it. Quoted failing-test-first
+    /// state: before this task's implementation, `cargo test -p
+    /// lakehouse-api --lib --no-run` failed to compile this module with
+    /// `E0599: no method named 'chat_with_tools_metered' found for
+    /// struct 'LlmClient'` and `E0061: this function takes 10 arguments
+    /// but 11 arguments were supplied` (the new `budget_limit` parameter
+    /// below).
+    mod budget_end_to_end {
+        use std::collections::HashMap;
+
+        use lakehouse_store::agents as store_agents;
+        use lakehouse_test_support as _;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::super::*;
+        use crate::config::Config;
+
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database")
+            )
+        }
+
+        fn state_for(pool: &sqlx::PgPool, llm_url: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert("LLM_URL".to_owned(), llm_url.to_owned());
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        /// A `chat/completions` reply carrying a tool call (so the loop
+        /// keeps iterating instead of finishing on an empty-`tool_calls`
+        /// answer) plus a real `usage.total_tokens` of `total_tokens` —
+        /// the tool name (`no_such_tool`) deliberately matches nothing in
+        /// `ai_registry`, so `ai_tools::run_tool` reports a harmless
+        /// "unknown tool" error and the loop simply continues to its next
+        /// iteration, exactly like a genuine unresolvable tool call would.
+        fn tool_call_response(total_tokens: u32) -> Value {
+            json!({
+                "choices": [{"message": {
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "no_such_tool", "arguments": "{}" },
+                    }],
+                }}],
+                "usage": {
+                    "prompt_tokens": total_tokens.saturating_sub(10),
+                    "completion_tokens": 10,
+                    "total_tokens": total_tokens,
+                },
+            })
+        }
+
+        /// `employee.budget_limit` = 100; every LLM call in this stub
+        /// reports `usage.total_tokens` = 60. The loop must stop AFTER the
+        /// second call (60+60=120 > 100, checked before what would be a
+        /// third call), not before the first (60 < 100) and not after an
+        /// arbitrary third call — the mock has no call-count limit, so a
+        /// third call remains available for the loop to make if the
+        /// budget check failed to stop it.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn run_headless_loop_stops_with_budget_exhausted_once_the_limit_is_crossed(
+            pool: sqlx::PgPool,
+        ) {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(tool_call_response(60)))
+                .mount(&server)
+                .await;
+
+            let state = state_for(&pool, &server.uri());
+
+            let input = CreateEmployeeInput {
+                name: "budget-test-employee".to_owned(),
+                purpose: "p".to_owned(),
+                autonomy: "L2".to_owned(),
+                allowed_tools: vec![],
+                data_scope: "d".to_owned(),
+                budget_limit: 100.0,
+                owner: None,
+                prompt: Some("do the thing".to_owned()),
+                schedule_cron: None,
+                mode: Some("build".to_owned()),
+                permissions: Some("*:*".to_owned()),
+            };
+            let employee = store_agents::create_employee(&pool, &input).await.unwrap();
+            store_agents::create_run(&pool, "run-budget-1", &employee.id, "manual", "tester")
+                .await
+                .unwrap();
+
+            let perms = PermissionSet::parse("*:*");
+            let outcome = run_headless_loop(
+                &state,
+                "run-budget-1",
+                &employee.id,
+                "do the thing",
+                true,
+                &perms,
+                None,
+                None,
+                "schedule",
+                "tester",
+                100.0,
+            )
+            .await;
+
+            assert!(
+                matches!(outcome, HeadlessOutcome::Terminal("budget_exhausted")),
+                "must stop with budget_exhausted, not run a third LLM call"
+            );
+            // Mirrors `run_employee`'s own orchestration: `run_headless_loop`
+            // itself never sets the run's final `status`/`ended_at` for a
+            // `Terminal` outcome — its caller does, via `finish_run`, right
+            // after the loop returns.
+            if let HeadlessOutcome::Terminal(status) = outcome {
+                store_agents::finish_run(&pool, "run-budget-1", status)
+                    .await
+                    .unwrap();
+            }
+            let run = store_agents::get_run(&pool, "run-budget-1")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(run.status, "budget_exhausted");
+            assert_eq!(run.budget_consumed, Some(120.0));
+        }
+
+        /// A run whose consumption never reaches `budget_limit` finishes
+        /// normally — the budget check must never trip early on a run
+        /// that stays under its ceiling.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn run_headless_loop_finishes_normally_under_budget(pool: sqlx::PgPool) {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "choices": [{"message": {
+                        "role": "assistant",
+                        "content": "done",
+                    }}],
+                    "usage": {
+                        "prompt_tokens": 20,
+                        "completion_tokens": 10,
+                        "total_tokens": 30,
+                    },
+                })))
+                .mount(&server)
+                .await;
+
+            let state = state_for(&pool, &server.uri());
+
+            let input = CreateEmployeeInput {
+                name: "under-budget-employee".to_owned(),
+                purpose: "p".to_owned(),
+                autonomy: "L2".to_owned(),
+                allowed_tools: vec![],
+                data_scope: "d".to_owned(),
+                budget_limit: 100.0,
+                owner: None,
+                prompt: Some("do the thing".to_owned()),
+                schedule_cron: None,
+                mode: Some("build".to_owned()),
+                permissions: Some("*:*".to_owned()),
+            };
+            let employee = store_agents::create_employee(&pool, &input).await.unwrap();
+            store_agents::create_run(&pool, "run-budget-2", &employee.id, "manual", "tester")
+                .await
+                .unwrap();
+
+            let perms = PermissionSet::parse("*:*");
+            let outcome = run_headless_loop(
+                &state,
+                "run-budget-2",
+                &employee.id,
+                "do the thing",
+                true,
+                &perms,
+                None,
+                None,
+                "schedule",
+                "tester",
+                100.0,
+            )
+            .await;
+
+            assert!(matches!(outcome, HeadlessOutcome::Terminal("succeeded")));
+            if let HeadlessOutcome::Terminal(status) = outcome {
+                store_agents::finish_run(&pool, "run-budget-2", status)
+                    .await
+                    .unwrap();
+            }
+            let run = store_agents::get_run(&pool, "run-budget-2")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(run.budget_consumed, Some(30.0));
+        }
     }
 }

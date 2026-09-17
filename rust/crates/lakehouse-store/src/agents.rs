@@ -289,7 +289,10 @@ pub async fn list_scheduled_employees(pool: &PgPool) -> Result<Vec<DigitalEmploy
 /// its synthetic principal to, and whether the employee is even eligible
 /// to run right now (`status`; T3.2 must refuse a run for a suspended
 /// (`"paused"`) or revoked (`"cancelled"`) employee).
-#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+// `Eq` dropped (not `PartialEq, Eq`): `budget_limit: f64` cannot implement
+// `Eq` (no `Copy`+total-order guarantee for floats — NaN != NaN), so this
+// struct is `PartialEq`-only now that WS7 item G2 adds that field.
+#[derive(Debug, Clone, PartialEq, FromRow)]
 pub struct EmployeeRunConfig {
     /// `agent_employee.id`.
     pub id: String,
@@ -308,10 +311,16 @@ pub struct EmployeeRunConfig {
     /// Ceiling on what this employee's runs may do, in `role.permissions`
     /// format.
     pub permissions: String,
+    /// Token ceiling for a headless run of this employee (WS7 item G2:
+    /// `budget_limit`/`budget_consumed` are measured in tokens, not
+    /// currency — `lakehouse-llm` has no price table, see
+    /// `run_headless_loop`'s own doc comment on the unit decision).
+    pub budget_limit: f64,
 }
 
 /// Fetch just the run-configuration columns for one employee — `prompt`,
-/// `mode`, `permissions`, `status` — without the rest of [`DigitalEmployee`].
+/// `mode`, `permissions`, `status`, `budget_limit` — without the rest of
+/// [`DigitalEmployee`].
 ///
 /// # Errors
 ///
@@ -321,7 +330,8 @@ pub async fn get_employee_run_config(
     id: &str,
 ) -> Result<Option<EmployeeRunConfig>, StoreError> {
     let row: Option<EmployeeRunConfig> = sqlx::query_as(
-        "SELECT id, name, status, prompt, mode, permissions FROM agent_employee WHERE id = $1",
+        "SELECT id, name, status, prompt, mode, permissions, budget_limit \
+         FROM agent_employee WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -592,9 +602,17 @@ pub struct AgentRun {
     /// When the run ended, ISO 8601, if it has.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at: Option<String>,
-    /// `None` until `WS7` tracks spend per tool call: the column exists but
-    /// nothing ever updates it, so its value would be an insert-time
-    /// default, not a measurement (WS1 task 1.11).
+    /// Real token spend for this run, accumulated from every
+    /// [`lakehouse_llm::Usage::total_tokens`] the LLM endpoint reported
+    /// during the run (WS7 item G2), written once at every terminal
+    /// transition ([`record_run_budget`]). `agent_run.budget_consumed` is
+    /// `NOT NULL DEFAULT 0` at the schema level — a run that has not yet
+    /// reached a terminal status (`status` is `"running"` or
+    /// `"waiting_approval"`) has never had that default overwritten, so
+    /// its DB value of `0` would be an unstarted placeholder, not a
+    /// measurement; `hydrate_run` collapses that specific case to `None`
+    /// rather than re-serving a fabricated zero (WS1 task 1.11's same
+    /// concern, now applied only to the still-in-progress window).
     pub budget_consumed: Option<f64>,
     /// The recorded step trace.
     pub steps: Vec<RunStep>,
@@ -616,16 +634,18 @@ struct RunRow {
     delegated_user: Option<String>,
     started_at: OffsetDateTime,
     ended_at: Option<OffsetDateTime>,
+    budget_consumed: f64,
     steps: Json<Vec<RunStep>>,
     audit_event_id: Option<String>,
 }
 
-// WS1 task 1.11: budget_consumed is dropped from this SELECT list — nothing
-// ever writes it, so selecting it would just re-serve the insert-time
-// default as a measurement. `hydrate_run` sets `AgentRun::budget_consumed`
-// to `None` directly. The column itself stays (WS7 may reuse it).
+// WS7 item G2: budget_consumed is back in this SELECT list —
+// `record_run_budget` now writes a real accumulated-token-usage value at
+// every terminal transition of `run_headless_loop`, so selecting it once
+// more serves a real measurement, not the insert-time default WS1 task
+// 1.11 stopped serving.
 const RUN_COLUMNS: &str = "id, employee_id, workflow_id, status, trigger, actor, delegated_user, \
-     started_at, ended_at, steps, audit_event_id";
+     started_at, ended_at, budget_consumed, steps, audit_event_id";
 
 /// Fetch the `{id, status, at}` approval refs for one or more runs.
 async fn approvals_for_run(pool: &PgPool, run_id: &str) -> Result<Vec<RunApprovalRef>, StoreError> {
@@ -647,6 +667,7 @@ async fn approvals_for_run(pool: &PgPool, run_id: &str) -> Result<Vec<RunApprova
 
 async fn hydrate_run(pool: &PgPool, row: RunRow) -> Result<AgentRun, StoreError> {
     let approvals = approvals_for_run(pool, &row.id).await?;
+    let still_in_progress = matches!(row.status.as_str(), "running" | "waiting_approval");
     Ok(AgentRun {
         id: row.id,
         employee_id: row.employee_id,
@@ -657,10 +678,11 @@ async fn hydrate_run(pool: &PgPool, row: RunRow) -> Result<AgentRun, StoreError>
         delegated_user: row.delegated_user,
         started_at: iso_millis(row.started_at),
         ended_at: iso_opt(row.ended_at),
-        // WS1 task 1.11: nothing ever updates agent_run.budget_consumed, so
-        // it is no longer selected — this is `None`, not a re-served
-        // insert-time default.
-        budget_consumed: None,
+        budget_consumed: if still_in_progress {
+            None
+        } else {
+            Some(row.budget_consumed)
+        },
         steps: row.steps.0,
         approvals,
         audit_event_id: row.audit_event_id,
@@ -1215,6 +1237,32 @@ pub async fn finish_run(pool: &PgPool, run_id: &str, status: &str) -> Result<(),
     let result = sqlx::query("UPDATE agent_run SET status = $2, ended_at = now() WHERE id = $1")
         .bind(run_id)
         .bind(status)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
+/// Writes a run's real, accumulated token spend (WS7 item G2) — called
+/// once, at every terminal outcome of [`crate`]'s headless loop (success,
+/// failure, refusal-exhausted-iterations, and budget-exhausted alike), not
+/// per LLM call, so this is a single write per run rather than a
+/// write-per-call.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `run_id` does not exist, or
+/// [`StoreError::Database`] on any other failure.
+pub async fn record_run_budget(
+    pool: &PgPool,
+    run_id: &str,
+    budget_consumed: f64,
+) -> Result<(), StoreError> {
+    let result = sqlx::query("UPDATE agent_run SET budget_consumed = $2 WHERE id = $1")
+        .bind(run_id)
+        .bind(budget_consumed)
         .execute(pool)
         .await?;
     if result.rows_affected() == 0 {

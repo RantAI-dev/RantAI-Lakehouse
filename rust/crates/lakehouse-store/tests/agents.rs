@@ -11,7 +11,13 @@
 //! `docker compose up`, no external database required. Docker must be
 //! reachable from the environment running `cargo test`.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+// WS7 item G2: `budget_limit`/`budget_consumed` assertions below compare
+// f64s produced by an exact-literal insert against an exact-literal
+// expectation (no accumulated floating-point arithmetic in between), so a
+// strict `==` is exactly what's being tested (matching
+// `lakehouse-alerts`'s own identical `#![allow(clippy::float_cmp)]` for
+// the same reason).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
 
 // Force-links `lakehouse-test-support` so its `#[ctor]` Postgres
 // testcontainer bootstrap actually runs for this test binary (an
@@ -27,7 +33,8 @@ use lakehouse_store::agents::{
     create_pending_approval, create_run, decide_approval, finish_run, get_employee,
     get_employee_run_config, get_run, list_approvals, list_employees, list_runs,
     list_scheduled_employees, list_tools, list_workflows, mark_run_waiting_approval,
-    pending_tool_call, record_run_outcome, resume_employee, revoke_employee, suspend_employee,
+    pending_tool_call, record_run_budget, record_run_outcome, resume_employee, revoke_employee,
+    suspend_employee,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -769,6 +776,100 @@ async fn mark_run_waiting_approval_does_not_end_the_run(pool: PgPool) -> sqlx::R
     let run = get_run(&pool, "run-headless-04").await.unwrap().unwrap();
     assert_eq!(run.status, "waiting_approval");
     assert!(run.ended_at.is_none());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// WS7 item G2: real, accumulated token-based budget consumption
+// ---------------------------------------------------------------------
+
+/// A run still in progress (`status = "running"`) has never had
+/// `agent_run.budget_consumed`'s `NOT NULL DEFAULT 0` overwritten by
+/// `record_run_budget` — `get_run` must report `None`, not the DB
+/// default `0`, for this window: a fabricated zero would claim "zero
+/// tokens consumed" when the true answer is "not measured yet". Named
+/// per the program's "each honest-null field needs a named test"
+/// requirement.
+#[sqlx::test(migrations = "../../migrations")]
+async fn budget_consumed_is_none_not_a_fabricated_zero_while_a_run_is_still_running(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    create_run(
+        &pool,
+        "run-budget-06",
+        "emp-risk",
+        "manual",
+        "Fajar Nugroho",
+    )
+    .await
+    .unwrap();
+    let run = get_run(&pool, "run-budget-06").await.unwrap().unwrap();
+    assert_eq!(run.status, "running");
+    assert_eq!(run.budget_consumed, None);
+    Ok(())
+}
+
+/// `record_run_budget` writes the real, caller-accumulated value, and
+/// `get_run` reports it as `Some` once the run has reached a terminal
+/// status.
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_run_budget_writes_the_real_accumulated_value(pool: PgPool) -> sqlx::Result<()> {
+    create_run(
+        &pool,
+        "run-budget-07",
+        "emp-risk",
+        "manual",
+        "Fajar Nugroji",
+    )
+    .await
+    .unwrap();
+    record_run_budget(&pool, "run-budget-07", 120.0)
+        .await
+        .unwrap();
+    finish_run(&pool, "run-budget-07", "succeeded")
+        .await
+        .unwrap();
+    let run = get_run(&pool, "run-budget-07").await.unwrap().unwrap();
+    assert_eq!(run.budget_consumed, Some(120.0));
+    Ok(())
+}
+
+/// `record_run_budget` against a run id that does not exist is
+/// [`StoreError::NotFound`], matching every other single-row `agent_run`
+/// mutator in this module (`finish_run`, `mark_run_waiting_approval`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_run_budget_unknown_run_is_not_found(pool: PgPool) -> sqlx::Result<()> {
+    let err = record_run_budget(&pool, "run-nope", 10.0)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound));
+    Ok(())
+}
+
+/// `get_employee_run_config` now also carries `budget_limit` — the
+/// headless loop's own enforcement ceiling (WS7 item G2), previously
+/// absent from this narrower projection entirely.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_employee_run_config_includes_budget_limit(pool: PgPool) -> sqlx::Result<()> {
+    let input = CreateEmployeeInput {
+        name: "budget-limit-employee".to_owned(),
+        purpose: "p".to_owned(),
+        autonomy: "L2".to_owned(),
+        allowed_tools: vec![],
+        data_scope: "d".to_owned(),
+        budget_limit: 250.0,
+        owner: None,
+        prompt: Some("do the thing".to_owned()),
+        schedule_cron: None,
+        mode: Some("build".to_owned()),
+        permissions: None,
+    };
+    let created = create_employee(&pool, &input).await.unwrap();
+    let config = get_employee_run_config(&pool, &created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(config.budget_limit, 250.0);
     Ok(())
 }
 

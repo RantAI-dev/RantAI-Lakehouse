@@ -217,6 +217,7 @@ export type AgentRunStatus =
   | "failed"
   | "waiting_approval"
   | "rejected"
+  | "budget_exhausted"
 
 export const AGENT_RUN_STATUS_LABEL: Record<AgentRunStatus, string> = {
   running: "Running",
@@ -224,6 +225,7 @@ export const AGENT_RUN_STATUS_LABEL: Record<AgentRunStatus, string> = {
   failed: "Failed",
   waiting_approval: "Waiting for approval",
   rejected: "Rejected",
+  budget_exhausted: "Budget exhausted",
 }
 
 export const AGENT_RUN_STATUS_DESCRIPTION: Record<AgentRunStatus, string> = {
@@ -234,6 +236,8 @@ export const AGENT_RUN_STATUS_DESCRIPTION: Record<AgentRunStatus, string> = {
     "Paused: a high-risk tool call inside this run needs a human decision before it can continue.",
   rejected:
     "A human rejected the tool call this run was waiting on; it ended without executing it.",
+  budget_exhausted:
+    "Stopped because the employee's token budget ceiling was reached mid-run.",
 }
 
 /** One tool-call step inside an `agent_run.steps` trace. */
