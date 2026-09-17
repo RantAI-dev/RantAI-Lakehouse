@@ -893,28 +893,32 @@ pub async fn create_residency_rule(
 // `/api/governance/lineage`/`/api/governance/policies` precedent — never a
 // seventh `{kind}` dispatch value (see this module's doc comment).
 
-/// Split `raw` on the first `.` and validate each half as a real
-/// [`lakehouse_core::ident::Ident`] — the identical validation item C1's
-/// `Freshness` rule target will apply, extracted here so both call one
-/// shared helper rather than duplicating the split-and-check logic
-/// (AGENTS.md rule 4). `Ident` only guarantees lexical safety (no SQL
+/// Validate `raw` as `<namespace>.<table>`, each half a real
+/// [`lakehouse_core::ident::Ident`].
+///
+/// Wraps [`lakehouse_core::ident::split_namespaced_table`] — the single
+/// shared guard both this route and `lakehouse-alerts`'s
+/// `normalize_freshness` call (WS5 item C1a review finding: this was
+/// written twice, two commits apart, because `lakehouse-alerts` cannot
+/// depend on `lakehouse-api` to reuse a copy living here; `lakehouse-core`
+/// sits below both). `Ident` only guarantees lexical safety (no SQL
 /// injection through the identifier position); `dataset_sla.table_name`
 /// is never interpolated into a query, so that guarantee is stronger than
 /// this call site strictly needs — but it is also the exact
-/// `<namespace>.<table>` shape check the route needs, and reusing it beats
-/// writing a second, weaker regex.
+/// `<namespace>.<table>` shape check the route needs.
 fn validate_namespaced_table(raw: &str) -> Result<(), ApiError> {
-    let Some((ns, table)) = raw.split_once('.') else {
-        return Err(ApiError::BadRequest(
-            "tableName wajib berformat <namespace>.<table>.".to_owned(),
-        ));
-    };
-    if lakehouse_core::ident::Ident::new(ns).is_err()
-        || lakehouse_core::ident::Ident::new(table).is_err()
-    {
-        return Err(ApiError::BadRequest("tableName tidak valid.".to_owned()));
-    }
-    Ok(())
+    lakehouse_core::ident::split_namespaced_table(raw)
+        .map(|_| ())
+        .map_err(|err| {
+            ApiError::BadRequest(match err {
+                lakehouse_core::ident::NamespacedTableError::MissingSeparator => {
+                    "tableName wajib berformat <namespace>.<table>.".to_owned()
+                }
+                lakehouse_core::ident::NamespacedTableError::Invalid(_) => {
+                    "tableName tidak valid.".to_owned()
+                }
+            })
+        })
 }
 
 /// `GET /api/governance/sla` — every authored dataset freshness SLA.

@@ -82,7 +82,10 @@ pub(super) async fn run_alert_rule(state: &AppState, args: &Map<String, Value>) 
     }
     let http = reqwest::Client::new();
     let email = EmailSender::new(crate::routes::alerts::smtp_config(&state.config));
-    match lakehouse_alerts::run_rules(&state.clickhouse, &http, &email, Some(&id)).await {
+    // See `routes::alerts::run`'s identical comment: real `FreshnessSource`/
+    // `SilenceSource` implementations land in the next commit.
+    match lakehouse_alerts::run_rules(&state.clickhouse, &http, &email, Some(&id), None, None).await
+    {
         Ok(results) => json!({ "ran": results.len(), "results": results }),
         Err(err) => json!({ "error": err.to_string() }),
     }

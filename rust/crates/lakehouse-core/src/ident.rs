@@ -88,6 +88,46 @@ impl fmt::Display for Ident {
     }
 }
 
+/// Reasons [`split_namespaced_table`] rejected its input.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum NamespacedTableError {
+    /// No `.` separator was found.
+    #[error("expected <namespace>.<table>, no separator found")]
+    MissingSeparator,
+    /// One or both halves failed [`Ident`] validation.
+    #[error(transparent)]
+    Invalid(#[from] IdentError),
+}
+
+/// Split `raw` on the first `.` and validate each half as a real [`Ident`],
+/// returning the two validated substrings on success.
+///
+/// This guard used to be written twice, two commits apart: once in
+/// `lakehouse-api::routes::governance::validate_namespaced_table` (for
+/// `PUT /api/governance/sla`'s `tableName`) and once inline in
+/// `lakehouse-alerts::normalize_freshness` (for a `Freshness` rule's
+/// `mart`-as-target-table). Neither crate could reuse the other's copy —
+/// `lakehouse-alerts` cannot depend on `lakehouse-api` (that dependency
+/// runs the other way: `lakehouse-api` depends on `lakehouse-alerts`) — so
+/// putting the helper in either of them made it unreachable from the
+/// other. `lakehouse-core` sits below both, so this is the only place a
+/// single copy can live. See AGENTS.md rule 4: a duplicated guard is a
+/// finding.
+///
+/// # Errors
+///
+/// [`NamespacedTableError::MissingSeparator`] if `raw` has no `.`;
+/// [`NamespacedTableError::Invalid`] if either half is not a valid
+/// [`Ident`].
+pub fn split_namespaced_table(raw: &str) -> Result<(&str, &str), NamespacedTableError> {
+    let (namespace, table) = raw
+        .split_once('.')
+        .ok_or(NamespacedTableError::MissingSeparator)?;
+    Ident::new(namespace)?;
+    Ident::new(table)?;
+    Ok((namespace, table))
+}
+
 /// A SQL string literal that escapes itself safely on [`Display`].
 ///
 /// Escaping matches the TypeScript `esc()` function in
@@ -143,5 +183,29 @@ mod tests {
     #[test]
     fn literal_escapes_backslash_before_quote() {
         assert_eq!(SqlLiteral::from(r"a\b'c").to_string(), r"'a\\b''c'");
+    }
+
+    #[test]
+    fn split_namespaced_table_accepts_a_valid_pair() {
+        assert_eq!(
+            split_namespaced_table("bronze.orders").unwrap(),
+            ("bronze", "orders")
+        );
+    }
+
+    #[test]
+    fn split_namespaced_table_rejects_missing_separator() {
+        assert_eq!(
+            split_namespaced_table("bronze"),
+            Err(NamespacedTableError::MissingSeparator)
+        );
+    }
+
+    #[test]
+    fn split_namespaced_table_rejects_an_injection_shaped_half() {
+        assert!(matches!(
+            split_namespaced_table("bronze.orders; DROP TABLE dataset_sla;--"),
+            Err(NamespacedTableError::Invalid(_))
+        ));
     }
 }

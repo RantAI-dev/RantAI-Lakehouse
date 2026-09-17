@@ -2310,6 +2310,7 @@ dependencies = [
 name = "lakehouse-alerts"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "lakehouse-bi",
  "lakehouse-clickhouse",
  "lakehouse-core",

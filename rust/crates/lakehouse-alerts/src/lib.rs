@@ -441,20 +441,27 @@ fn normalize_alert(
 /// (Digest-only) path and was rejected with "digest requires a board." —
 /// or, if a caller supplied a `board` anyway to dodge that, had its `mart`
 /// (the actual freshness target) silently blanked to `String::new()`.
+///
+/// The split-and-check itself lives in
+/// [`lakehouse_core::ident::split_namespaced_table`], shared with
+/// `lakehouse-api`'s `routes::governance::validate_namespaced_table`
+/// (WS5 item C1a review finding: this used to be a second, independent
+/// copy — see that helper's doc comment for why the shared copy had to
+/// move down to `lakehouse-core`).
 fn normalize_freshness(
     input: &AlertRuleInput,
     common: NormalizedCommon,
 ) -> Result<NormalizedRule, AlertError> {
     let raw_target = input.mart.as_deref().unwrap_or("").trim().to_owned();
-    let Some((ns, table)) = raw_target.split_once('.') else {
-        return Err(AlertError::Validation(
-            "freshness target table must be <namespace>.<table>.".to_owned(),
-        ));
-    };
-    if Ident::new(ns).is_err() || Ident::new(table).is_err() {
-        return Err(AlertError::Validation(
-            "invalid freshness target table.".to_owned(),
-        ));
+    if let Err(err) = lakehouse_core::ident::split_namespaced_table(&raw_target) {
+        return Err(AlertError::Validation(match err {
+            lakehouse_core::ident::NamespacedTableError::MissingSeparator => {
+                "freshness target table must be <namespace>.<table>.".to_owned()
+            }
+            lakehouse_core::ident::NamespacedTableError::Invalid(_) => {
+                "invalid freshness target table.".to_owned()
+            }
+        }));
     }
     Ok(NormalizedRule {
         name: common.name,
@@ -891,8 +898,49 @@ pub struct RunResult {
     pub skipped: Option<String>,
 }
 
+/// Source of dataset-freshness data for `AlertKind::Freshness` rules,
+/// injected by the caller (`routes::alerts::run`) so this crate gains no
+/// dependency on `lakehouse-store` (Postgres `dataset_sla`) or
+/// `lakehouse-iceberg` (WS2's Lakekeeper REST `lastUpdatedMs`) — the same
+/// low-level-crate-stays-low-level pattern `connector_probe::DynSecretResolver`
+/// already uses. The real, Postgres/Iceberg-backed implementation
+/// (`ApiFreshnessSource`) is a later commit; every call site here passes
+/// `None` until then, which [`run_freshness`] reports as an honest
+/// `skipped`, never a silent pass.
+#[async_trait::async_trait]
+pub trait FreshnessSource: Send + Sync {
+    /// `dataset_sla.expected_interval_minutes` for `table_name`, or
+    /// `Ok(None)` when no `dataset_sla` row exists for it — a config gap
+    /// (nobody set an SLA for this table), not a data gap.
+    ///
+    /// # Errors
+    ///
+    /// A caller-defined error message (e.g. a database failure) — never an
+    /// upstream detail; implementations must classify before returning.
+    async fn expected_interval_minutes(&self, table_name: &str) -> Result<Option<i64>, String>;
+
+    /// Milliseconds since epoch of `table_name`'s current Iceberg
+    /// snapshot, or `None` when it cannot be determined right now
+    /// (catalog unreachable, table not found, no snapshot yet) — a data
+    /// gap, handled identically to a missing `dataset_sla` row: skip,
+    /// never fire or clear.
+    async fn last_snapshot_ms(&self, table_name: &str) -> Option<i64>;
+}
+
+/// Whether a rule is currently silenced — injected by the caller
+/// (`routes::alerts::run`) exactly like [`FreshnessSource`], so this crate
+/// still has no Postgres dependency. `true` suppresses delivery for a
+/// fired rule; the rule is still evaluated (`RunResult::fired`/`value`
+/// stay honest — a silence hides the noise, not the fact), only the
+/// [`deliver`] call is skipped. WS5 plan review U6.
+#[async_trait::async_trait]
+pub trait SilenceSource: Send + Sync {
+    /// Whether `rule_id` is currently silenced.
+    async fn is_silenced(&self, rule_id: &str) -> bool;
+}
+
 /// Evaluate every enabled rule (or just `only`, if given), delivering
-/// alerts/digests that fire. Ports `runRules`.
+/// alerts/digests/freshness breaches that fire. Ports `runRules`.
 ///
 /// # Warning
 ///
@@ -913,6 +961,8 @@ pub async fn run_rules(
     http: &reqwest::Client,
     email: &EmailSender,
     only: Option<&str>,
+    freshness: Option<&dyn FreshnessSource>,
+    silence: Option<&dyn SilenceSource>,
 ) -> Result<Vec<RunResult>, ChError> {
     let rules: Vec<AlertRule> = list_rules(ch)
         .await?
@@ -922,7 +972,7 @@ pub async fn run_rules(
 
     let mut out = Vec::with_capacity(rules.len());
     for rule in &rules {
-        out.push(run_one(ch, http, email, rule).await);
+        out.push(run_one(ch, http, email, freshness, silence, rule).await);
     }
     Ok(out)
 }
@@ -931,26 +981,71 @@ async fn run_one(
     ch: &ChClient,
     http: &reqwest::Client,
     email: &EmailSender,
+    freshness: Option<&dyn FreshnessSource>,
+    silence: Option<&dyn SilenceSource>,
     rule: &AlertRule,
 ) -> RunResult {
     match rule.kind {
-        AlertKind::Alert => run_alert(ch, http, email, rule).await,
-        AlertKind::Digest => run_digest(ch, http, email, rule).await,
-        // WS5 item C1: `AlertKind::Freshness` exists (Step 5) but has no
-        // evaluator yet — `run_freshness` lands in a later commit. Until
-        // then this must never be treated as an `Alert` (which would read
-        // `rule.mart` as a `serving.*` ClickHouse mart it is not) or
-        // silently dropped; a `skipped` result, matching every other
-        // per-rule failure this function already reports this way, is the
-        // honest outcome.
-        AlertKind::Freshness => skipped(rule, "freshness rules have no evaluator yet".to_owned()),
+        AlertKind::Alert => run_alert(ch, http, email, silence, rule).await,
+        AlertKind::Digest => run_digest(ch, http, email, silence, rule).await,
+        AlertKind::Freshness => {
+            run_freshness(freshness, http, email, silence, rule, now_millis()).await
+        }
     }
+}
+
+/// Current wall-clock time in milliseconds since the Unix epoch, used only
+/// as [`run_freshness`]'s `now_ms` argument from `run_one`. Kept to this
+/// single call site — never inside `run_freshness` itself — so
+/// `run_freshness` stays a pure function of its `now_ms` parameter and
+/// testable with a fixed clock (this plan's own testing rule: never read
+/// the real clock inside the function under test).
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
+
+/// Deliver a fired rule's webhook/email, unless a [`SilenceSource`] reports
+/// this rule is currently silenced. Shared by `run_alert`/`run_digest`/
+/// `run_freshness`'s otherwise-identical "check silence, then maybe
+/// deliver" sequence, written once here rather than pasted three times
+/// (AGENTS.md rule 4). A silence hides the noise, not the fact: each
+/// caller still records `RunResult::fired`/`value` honestly — only this
+/// delivery attempt is skipped. WS5 plan review U6.
+async fn deliver_unless_silenced(
+    http: &reqwest::Client,
+    email: &EmailSender,
+    silence: Option<&dyn SilenceSource>,
+    rule: &AlertRule,
+    title: &str,
+    text: &str,
+) -> Option<DeliverResult> {
+    let silenced = match silence {
+        Some(source) => source.is_silenced(&rule.id).await,
+        None => false,
+    };
+    if silenced {
+        return None;
+    }
+    Some(
+        deliver(
+            http,
+            email,
+            rule.channel.as_str(),
+            &rule.target,
+            title,
+            text,
+        )
+        .await,
+    )
 }
 
 async fn run_alert(
     ch: &ChClient,
     http: &reqwest::Client,
     email: &EmailSender,
+    silence: Option<&dyn SilenceSource>,
     rule: &AlertRule,
 ) -> RunResult {
     let mart = rule.mart.as_deref().unwrap_or("");
@@ -979,22 +1074,14 @@ async fn run_alert(
         fmt_id_id(rule.threshold),
     );
     let title = format!("⚠️ Alert: {}", rule.name);
-    let delivered = deliver(
-        http,
-        email,
-        rule.channel.as_str(),
-        &rule.target,
-        &title,
-        &text,
-    )
-    .await;
+    let delivered = deliver_unless_silenced(http, email, silence, rule, &title, &text).await;
     RunResult {
         id: rule.id.clone(),
         name: rule.name.clone(),
         kind: rule.kind,
         fired: true,
         value: Some(value),
-        delivered: Some(delivered),
+        delivered,
         skipped: None,
     }
 }
@@ -1003,32 +1090,102 @@ async fn run_digest(
     ch: &ChClient,
     http: &reqwest::Client,
     email: &EmailSender,
+    silence: Option<&dyn SilenceSource>,
     rule: &AlertRule,
 ) -> RunResult {
     let board = rule.board.as_deref().unwrap_or("");
     match digest_text(ch, board).await {
         Ok(text) => {
             let title = format!("📊 Digest: {}", rule.name);
-            let delivered = deliver(
-                http,
-                email,
-                rule.channel.as_str(),
-                &rule.target,
-                &title,
-                &text,
-            )
-            .await;
+            let delivered =
+                deliver_unless_silenced(http, email, silence, rule, &title, &text).await;
             RunResult {
                 id: rule.id.clone(),
                 name: rule.name.clone(),
                 kind: rule.kind,
                 fired: true,
                 value: None,
-                delivered: Some(delivered),
+                delivered,
                 skipped: None,
             }
         }
         Err(err) => skipped(rule, err.to_string()),
+    }
+}
+
+/// Evaluate one `Freshness` rule: how many minutes has it been since
+/// `rule.mart` (reinterpreted as the `dataset_sla.table_name` target, per
+/// [`normalize_freshness`]) last got a new Iceberg snapshot, compared
+/// against its `dataset_sla.expected_interval_minutes`. Three distinct
+/// outcomes, never conflated:
+///
+/// - **late** (`fired: true`) — the snapshot is older than the expected
+///   interval; a breach, delivered like any other fired rule (subject to
+///   [`SilenceSource`] suppression).
+/// - **on-time** (`fired: false`) — within the expected interval.
+/// - **unmeasurable** (`skipped: Some(reason)`) — no `freshness` source
+///   configured, no `dataset_sla` row for this table, or no snapshot time
+///   available. This case must never fire and must never clear: an
+///   inability to measure freshness is not evidence either way.
+async fn run_freshness(
+    freshness: Option<&dyn FreshnessSource>,
+    http: &reqwest::Client,
+    email: &EmailSender,
+    silence: Option<&dyn SilenceSource>,
+    rule: &AlertRule,
+    now_ms: i64,
+) -> RunResult {
+    let table_name = rule.mart.as_deref().unwrap_or("");
+    let Some(freshness) = freshness else {
+        return skipped(
+            rule,
+            "freshness source not configured for this call".to_owned(),
+        );
+    };
+    let expected = match freshness.expected_interval_minutes(table_name).await {
+        Ok(Some(minutes)) => minutes,
+        Ok(None) => return skipped(rule, format!("no dataset_sla row for table {table_name:?}")),
+        Err(err) => return skipped(rule, err),
+    };
+    let Some(last_snapshot_ms) = freshness.last_snapshot_ms(table_name).await else {
+        return skipped(
+            rule,
+            format!("last snapshot time unavailable for table {table_name:?}"),
+        );
+    };
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "millisecond ages and expected-interval minutes fit well within f64's exact-integer range for any realistic freshness window"
+    )]
+    let (age_minutes, expected_f64) = (
+        (now_ms - last_snapshot_ms) as f64 / 60_000.0,
+        expected as f64,
+    );
+    let late = age_minutes > expected_f64;
+    if !late {
+        return RunResult {
+            id: rule.id.clone(),
+            name: rule.name.clone(),
+            kind: rule.kind,
+            fired: false,
+            value: Some(age_minutes),
+            delivered: None,
+            skipped: None,
+        };
+    }
+    let text = format!(
+        "{table_name} last updated {age_minutes:.1} min ago (expected within {expected} min, per dataset_sla)"
+    );
+    let title = format!("⏰ Freshness: {}", rule.name);
+    let delivered = deliver_unless_silenced(http, email, silence, rule, &title, &text).await;
+    RunResult {
+        id: rule.id.clone(),
+        name: rule.name.clone(),
+        kind: rule.kind,
+        fired: true,
+        value: Some(age_minutes),
+        delivered,
+        skipped: None,
     }
 }
 
@@ -1481,5 +1638,224 @@ mod tests {
             ..AlertRuleInput::default()
         };
         assert!(normalize_input(&input).is_err());
+    }
+
+    // ── run_freshness (WS5 item C1, Step 6) ─────────────────────────────
+
+    fn freshness_rule(table_name: &str) -> AlertRule {
+        AlertRule {
+            id: "al_1".to_owned(),
+            name: "Orders freshness".to_owned(),
+            kind: AlertKind::Freshness,
+            mart: Some(table_name.to_owned()),
+            measure: None,
+            agg: default_agg(),
+            op: AlertOp::default(),
+            threshold: 0.0,
+            board: None,
+            channel: AlertChannel::Email,
+            target: "ops@example.invalid".to_owned(),
+            enabled: true,
+            created_at: None,
+            severity: None,
+        }
+    }
+
+    /// SMTP unconfigured (`host: None`) — `deliver` returns a fast,
+    /// network-free `DeliverResult::err` without an actual `SMTP` attempt,
+    /// matching `EmailSender::send`'s own documented validation order.
+    fn no_smtp_email_sender() -> EmailSender {
+        EmailSender::new(lakehouse_notify::SmtpConfig {
+            host: None,
+            port: 587,
+            secure: false,
+            user: None,
+            pass: String::new(),
+            from: String::new(),
+        })
+    }
+
+    struct FixedFreshness {
+        expected: Option<i64>,
+        last_snapshot_ms: Option<i64>,
+    }
+
+    #[async_trait::async_trait]
+    impl FreshnessSource for FixedFreshness {
+        async fn expected_interval_minutes(
+            &self,
+            _table_name: &str,
+        ) -> Result<Option<i64>, String> {
+            Ok(self.expected)
+        }
+        async fn last_snapshot_ms(&self, _table_name: &str) -> Option<i64> {
+            self.last_snapshot_ms
+        }
+    }
+
+    #[tokio::test]
+    async fn freshness_fires_when_last_snapshot_exceeds_the_expected_interval() {
+        let rule = freshness_rule("bronze.orders");
+        let src = FixedFreshness {
+            expected: Some(30),
+            last_snapshot_ms: Some(0),
+        };
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        // 60 min old, 30 min budget.
+        let result = run_freshness(Some(&src), &http, &email, None, &rule, 60 * 60_000).await;
+        assert!(result.fired);
+        assert!(result.skipped.is_none());
+    }
+
+    #[tokio::test]
+    async fn freshness_does_not_fire_within_the_expected_interval() {
+        let rule = freshness_rule("bronze.orders");
+        let src = FixedFreshness {
+            expected: Some(30),
+            last_snapshot_ms: Some(60 * 60_000 - 5 * 60_000),
+        };
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        // 5 min old, 30 min budget.
+        let result = run_freshness(Some(&src), &http, &email, None, &rule, 60 * 60_000).await;
+        assert!(!result.fired);
+        assert!(result.skipped.is_none());
+        assert!(
+            result.delivered.is_none(),
+            "an on-time result never attempts delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn freshness_skips_rather_than_firing_or_clearing_on_a_missing_snapshot() {
+        let rule = freshness_rule("bronze.orders");
+        let src = FixedFreshness {
+            expected: Some(30),
+            last_snapshot_ms: None,
+        };
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let result = run_freshness(Some(&src), &http, &email, None, &rule, 60 * 60_000).await;
+        assert!(!result.fired, "an unmeasurable freshness must never fire");
+        assert!(result.skipped.is_some());
+    }
+
+    #[tokio::test]
+    async fn freshness_skips_rather_than_firing_or_clearing_on_a_missing_sla_row() {
+        let rule = freshness_rule("bronze.orders");
+        let src = FixedFreshness {
+            expected: None,
+            last_snapshot_ms: Some(0),
+        };
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let result = run_freshness(Some(&src), &http, &email, None, &rule, 60 * 60_000).await;
+        assert!(!result.fired, "a missing dataset_sla row must never fire");
+        assert!(result.skipped.is_some());
+    }
+
+    #[tokio::test]
+    async fn freshness_skips_when_no_source_is_configured() {
+        let rule = freshness_rule("bronze.orders");
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let result = run_freshness(None, &http, &email, None, &rule, 60 * 60_000).await;
+        assert!(!result.fired);
+        assert_eq!(
+            result.skipped.as_deref(),
+            Some("freshness source not configured for this call")
+        );
+    }
+
+    // ── SilenceSource suppresses delivery, not evaluation (WS5 plan review U6) ──
+
+    struct AlwaysSilenced;
+
+    #[async_trait::async_trait]
+    impl SilenceSource for AlwaysSilenced {
+        async fn is_silenced(&self, _rule_id: &str) -> bool {
+            true
+        }
+    }
+
+    struct NeverSilenced;
+
+    #[async_trait::async_trait]
+    impl SilenceSource for NeverSilenced {
+        async fn is_silenced(&self, _rule_id: &str) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn a_silenced_freshness_breach_still_fires_but_is_not_delivered() {
+        let rule = freshness_rule("bronze.orders");
+        let src = FixedFreshness {
+            expected: Some(30),
+            last_snapshot_ms: Some(0),
+        };
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let result = run_freshness(
+            Some(&src),
+            &http,
+            &email,
+            Some(&AlwaysSilenced),
+            &rule,
+            60 * 60_000,
+        )
+        .await;
+        assert!(result.fired, "the rule is still genuinely over threshold");
+        assert!(result.value.is_some(), "value stays honest under a silence");
+        assert!(
+            result.delivered.is_none(),
+            "delivery must be suppressed during the silence"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unsilenced_freshness_breach_still_attempts_delivery() {
+        let rule = freshness_rule("bronze.orders");
+        let src = FixedFreshness {
+            expected: Some(30),
+            last_snapshot_ms: Some(0),
+        };
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let result = run_freshness(
+            Some(&src),
+            &http,
+            &email,
+            Some(&NeverSilenced),
+            &rule,
+            60 * 60_000,
+        )
+        .await;
+        assert!(result.fired);
+        assert!(
+            result.delivered.is_some(),
+            "an unsilenced fired rule still attempts delivery (SMTP being unconfigured makes it fail fast, not skip)"
+        );
+    }
+
+    #[tokio::test]
+    async fn deliver_unless_silenced_skips_the_deliver_call_entirely_when_silenced() {
+        let rule = freshness_rule("bronze.orders");
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let delivered =
+            deliver_unless_silenced(&http, &email, Some(&AlwaysSilenced), &rule, "title", "text")
+                .await;
+        assert!(delivered.is_none());
+    }
+
+    #[tokio::test]
+    async fn deliver_unless_silenced_with_no_source_configured_behaves_as_unsilenced() {
+        let rule = freshness_rule("bronze.orders");
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let delivered = deliver_unless_silenced(&http, &email, None, &rule, "title", "text").await;
+        assert!(delivered.is_some());
     }
 }

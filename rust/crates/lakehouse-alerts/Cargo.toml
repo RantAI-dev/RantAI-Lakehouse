@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 lakehouse-core = { path = "../lakehouse-core" }
 lakehouse-clickhouse = { path = "../lakehouse-clickhouse" }
 lakehouse-bi = { path = "../lakehouse-bi" }

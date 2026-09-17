@@ -241,10 +241,22 @@ pub async fn run(
 
     let http = reqwest::Client::new();
     let email = EmailSender::new(smtp_config(&state.config));
-    let results =
-        lakehouse_alerts::run_rules(&state.clickhouse, &http, &email, query.id.as_deref())
-            .await
-            .map_err(|err| ApiError::Internal(err.to_string()))?;
+    // `freshness`/`silence` are `None` here: `ApiFreshnessSource` and
+    // `ApiSilenceSource` (real Postgres/Iceberg-backed implementations of
+    // `lakehouse_alerts::FreshnessSource`/`SilenceSource`) land in a later
+    // commit (WS5 item C1, next). Until then every `Freshness` rule
+    // reports `skipped` and no rule's delivery is ever silence-suppressed
+    // from this route — an honest degrade, not a placeholder failure.
+    let results = lakehouse_alerts::run_rules(
+        &state.clickhouse,
+        &http,
+        &email,
+        query.id.as_deref(),
+        None,
+        None,
+    )
+    .await
+    .map_err(|err| ApiError::Internal(err.to_string()))?;
     Ok(ApiJson(json!({ "ran": results.len(), "results": results })))
 }
 
