@@ -34,6 +34,7 @@ pub mod error;
 pub mod gold_export;
 pub mod gold_export_history;
 pub mod gold_lock;
+pub mod health;
 pub mod json;
 pub mod lakehouse_catalog;
 pub mod lakekeeper_token;

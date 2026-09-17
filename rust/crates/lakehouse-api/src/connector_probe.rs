@@ -921,7 +921,7 @@ pub(crate) fn parse_endpoint_host_port(endpoint: &str) -> Option<(&str, u16)> {
 /// upstream HTTP response body verbatim, and this probe's `host` is
 /// caller-controlled (see the module doc comment), so doing so would leak
 /// arbitrary response bodies from wherever the caller pointed this probe.
-fn classify_object_store_error(err: &object_store::Error) -> &'static str {
+pub(crate) fn classify_object_store_error(err: &object_store::Error) -> &'static str {
     match err {
         object_store::Error::NotFound { .. } => "not found",
         object_store::Error::PermissionDenied { .. } => "permission denied",
