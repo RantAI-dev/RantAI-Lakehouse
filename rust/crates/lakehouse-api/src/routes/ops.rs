@@ -90,19 +90,23 @@ async fn run(state: &AppState, kind: Kind) -> Result<Value, OpsError> {
 }
 
 /// Build the `ops/observability` JSON from measured `p95`/`err`, extracted
-/// so the five unmeasured fields it nulls (and the dropped
+/// so the unmeasured fields it nulls (and the dropped
 /// `streamingLagSeconds` key) can be asserted without a `ClickHouse` call.
-fn observability_json(p95: i64, err: f64) -> Value {
+///
+/// `ingest_lag` (WS5 item B3) is a real, computed `Option<f64>` from the
+/// caller (`observability`) -- `None` serializes to `null` the same way
+/// the still-unmeasured fields below do, never a fabricated `0`.
+fn observability_json(p95: i64, err: f64, ingest_lag: Option<f64>) -> Value {
     json!({
         "queryP95Ms": p95,
         "queryErrorRate": err,
-        // Nothing measures ingest lag, cache hit rate, policy decision
-        // latency, agent success rate, or open incidents today; `null` is
-        // honest, the literal zeros this replaced were not (P5 review /
-        // WS1 honesty pass task 1.7). `streamingLagSeconds` is dropped
-        // outright: it has no consumer in the TypeScript contract and
-        // nothing measures streaming either.
-        "ingestLagSeconds": Value::Null,
+        "ingestLagSeconds": ingest_lag,
+        // Nothing measures cache hit rate, policy decision latency, agent
+        // success rate, or open incidents today; `null` is honest, the
+        // literal zeros this replaced were not (P5 review / WS1 honesty
+        // pass task 1.7). `streamingLagSeconds` is dropped outright: it
+        // has no consumer in the TypeScript contract and nothing measures
+        // streaming either.
         "cacheHitRate": Value::Null,
         "policyDecisionP95Ms": Value::Null,
         "agentSuccessRate": Value::Null,
@@ -140,7 +144,63 @@ async fn observability(ch: &ChClient) -> Result<Value, OpsError> {
     let err = q
         .and_then(|r| str_col(r, "err").parse::<f64>().ok())
         .unwrap_or(0.0);
-    Ok(observability_json(p95, err))
+    let ingest_lag = ingest_lag_seconds(ch).await;
+    Ok(observability_json(p95, err, ingest_lag))
+}
+
+/// `observability.ingestLagSeconds` (WS5 item B3, corrected against WS3's
+/// real, approved `bronze_meta.ingest_run` schema against a prior draft
+/// that assumed a `finished_at` temporal column this table does not have
+/// -- WS5 plan review U3). Per connector, the age of its own latest
+/// **successful** run; across connectors, the max of those ages -- the
+/// worst currently-stale connector, not the age of the single oldest row
+/// ever recorded (which only ever grows and never reflects current
+/// staleness). A connector with no successful run in the table
+/// contributes nothing to this aggregate: a connector that has never once
+/// ingested successfully is a real, separate gap this metric does not
+/// encode -- it is visible elsewhere (connector health status), not
+/// fabricated into a lag number here as "infinitely stale" (which would
+/// hide every other connector's real staleness behind one always-failing
+/// connector). If the table doesn't exist yet (WS3 not landed on this
+/// branch) or the query otherwise fails, this returns `None` and logs at
+/// `warn`, never a 500/503 for the rest of `/api/ops/observability`.
+async fn ingest_lag_seconds(ch: &ChClient) -> Option<f64> {
+    let rows = ch
+        .rows(
+            "SELECT connector_id, max(ended_at) AS latest_success \
+             FROM lake.`bronze_meta.ingest_run` \
+             WHERE status = 'succeeded' \
+             GROUP BY connector_id",
+            None,
+        )
+        .await;
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(error = %err, "ingest_lag_seconds: bronze_meta.ingest_run unavailable");
+            return None;
+        }
+    };
+    let now = time::OffsetDateTime::now_utc();
+    rows.iter()
+        .filter_map(|r| {
+            let ended_at_str = str_col(r, "latest_success");
+            // `ended_at` is a `ClickHouse` `String` (WS3's own schema --
+            // not a temporal type), so parse it the same way this file
+            // already parses ISO-shaped `String` timestamps elsewhere
+            // (`started_at_from_ms_column`'s siblings), never a
+            // `dateDiff` push-down that assumes a temporal column type
+            // this table does not have.
+            time::OffsetDateTime::parse(
+                ended_at_str,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .ok()
+        })
+        .map(|ended_at| (now - ended_at).as_seconds_f64())
+        .fold(None, |acc: Option<f64>, age| {
+            Some(acc.map_or(age, |a| a.max(age)))
+        })
 }
 
 /// Build one `ops/workloads` row from a `system.processes` fixture row.
@@ -467,7 +527,7 @@ mod tests {
 
     #[test]
     fn observability_nulls_every_unmeasured_metric_and_drops_streaming_lag() {
-        let v = observability_json(120, 0.002);
+        let v = observability_json(120, 0.002, None);
         assert_eq!(v["queryP95Ms"], 120);
         assert!((v["queryErrorRate"].as_f64().unwrap() - 0.002).abs() < f64::EPSILON);
         for field in [
@@ -484,6 +544,14 @@ mod tests {
             "streamingLagSeconds must be removed, not just nulled"
         );
         assert!(v["slos"].is_array());
+    }
+
+    /// WS5 item B3 -- a real, computed ingest lag passes through as a real
+    /// number, never left null once it is actually measured.
+    #[test]
+    fn observability_reports_a_real_ingest_lag_when_measured() {
+        let v = observability_json(120, 0.002, Some(42.5));
+        assert_eq!(v["ingestLagSeconds"], 42.5);
     }
 
     #[test]
@@ -595,5 +663,104 @@ mod tests {
         let id = "w-abc";
         let index = id.strip_prefix("w-").and_then(|s| s.parse::<usize>().ok());
         assert_eq!(index, None);
+    }
+
+    // ── observability.ingestLagSeconds (WS5 item B3) ────────────────────
+
+    fn ch_client(url: &str) -> ChClient {
+        ChClient::new(url.to_owned(), "default".to_owned(), String::new())
+    }
+
+    /// The worst currently-stale connector: per connector, the age of its
+    /// own latest *successful* run -- across connectors, the max of those
+    /// ages. Never the age of the single oldest row ever recorded (which
+    /// only ever grows and would misreport every connector as equally
+    /// stale forever).
+    #[tokio::test]
+    async fn ingest_lag_seconds_is_the_max_per_connector_latest_success_age() {
+        let server = wiremock::MockServer::start().await;
+        // connector-a's latest success is 10 minutes old; connector-b's is
+        // 2 hours old -- connector-b is the worse (staler) of the two, so
+        // the aggregate must be ~2h, not connector-a's 10 minutes and not
+        // some other, older row from either connector's history.
+        let now = time::OffsetDateTime::now_utc();
+        let a_latest = now - time::Duration::minutes(10);
+        let b_latest = now - time::Duration::hours(2);
+        let body = json!({
+            "meta": [],
+            "data": [
+                { "connector_id": "connector-a", "latest_success": a_latest
+                    .format(&time::format_description::well_known::Rfc3339).unwrap() },
+                { "connector_id": "connector-b", "latest_success": b_latest
+                    .format(&time::format_description::well_known::Rfc3339).unwrap() },
+            ],
+            "rows": 2,
+        });
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let lag = ingest_lag_seconds(&ch_client(&server.uri())).await;
+        let lag = lag.expect("a successful row must produce a lag");
+        // ~2 hours = 7200s, with generous slack for test wall-clock drift.
+        assert!(
+            (7100.0..7300.0).contains(&lag),
+            "expected ~2h staleness from connector-b, got {lag}s"
+        );
+    }
+
+    /// A connector whose only rows are non-`succeeded` contributes nothing
+    /// -- it must not be treated as "infinitely stale" (which would hide
+    /// every other connector's real staleness) and must not crash the
+    /// query (there is simply no `latest_success` row for it, since the
+    /// query already filters `WHERE status = 'succeeded'`).
+    #[tokio::test]
+    async fn ingest_lag_seconds_ignores_a_connector_with_no_successful_run() {
+        let server = wiremock::MockServer::start().await;
+        let now = time::OffsetDateTime::now_utc();
+        let only_success = now - time::Duration::minutes(5);
+        // The query's own `WHERE status = 'succeeded'` means an
+        // always-failing connector never appears in this result set at
+        // all -- simulated here by simply not including one.
+        let body = json!({
+            "meta": [],
+            "data": [
+                { "connector_id": "connector-ok", "latest_success": only_success
+                    .format(&time::format_description::well_known::Rfc3339).unwrap() },
+            ],
+            "rows": 1,
+        });
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let lag = ingest_lag_seconds(&ch_client(&server.uri())).await;
+        let lag = lag.expect("the one successful connector must still produce a lag");
+        assert!(
+            (280.0..320.0).contains(&lag),
+            "expected ~5m staleness, got {lag}s"
+        );
+    }
+
+    /// A simulated "unknown table" failure (WS3's `bronze_meta.ingest_run`
+    /// not landed on this branch yet) is `None`, never propagated as a
+    /// 500/503 for the rest of `/api/ops/observability`.
+    #[tokio::test]
+    async fn ingest_lag_seconds_is_none_when_the_table_is_unavailable() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string(
+                "Code: 60. DB::Exception: Table lake.bronze_meta.ingest_run doesn't exist",
+            ))
+            .mount(&server)
+            .await;
+
+        assert!(
+            ingest_lag_seconds(&ch_client(&server.uri()))
+                .await
+                .is_none()
+        );
     }
 }
