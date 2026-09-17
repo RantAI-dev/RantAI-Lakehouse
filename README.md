@@ -304,6 +304,8 @@ usage share the same documented source docker-compose already uses:
 | `LAKEHOUSE_WAREHOUSE_BUCKET` | Bucket the lakehouse warehouse's Iceberg tables live under — also read by the compose `rustfs-bucket-init` job | `lakehouse-warehouse` | No |
 | `RUSTFS_ACCESS_KEY_SECRET_REF` | `secretRef` for a static RustFS/S3 access key, used only as a fallback outside the vended-credentials write path (see `lakehouse-iceberg`'s crate doc) | unset | No |
 | `RUSTFS_SECRET_KEY_SECRET_REF` | `secretRef` for the matching static secret key | unset | No |
+| `TRINO_URL` | Trino coordinator base URL used only by the WS5 health probe (`GET /api/ops/services`); unset means "never probed," reported as `health: "unknown"`, never a fabricated outage for a deployment that never enables the `trino` compose profile. (Separate from the always-present, always-defaulted `trino_url` the `query.rs` Trino engine route dials — that one keeps its own `http://trino:8080` default so an unreachable Trino there stays a per-request 503, not a boot-time assumption.) | unset | No |
+| `OPENFGA_URL` | `OpenFGA` base URL used only by the WS5 health probe; unset means "never probed," reported as `health: "unknown"` — `OpenFGA` has no host port in this compose file by default, so a bare-metal or single-service deployment may have no route to it at all | unset | No |
 
 A further batch of compose-only variables were added in P2–P5 for
 SeaweedFS (the P2 storage-compatibility target, matrix-profile only),

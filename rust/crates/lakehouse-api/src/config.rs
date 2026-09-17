@@ -395,6 +395,27 @@ pub struct Config {
     /// an unparsable override falls back to the default rather than
     /// failing config resolution. Default `10_000`.
     pub trino_max_rows: usize,
+    /// Same `TRINO_URL` env var as [`Self::trino_url`], read a second way
+    /// for `health::probe_trino` (WS5 Task A0, grand plan §7): `None` when
+    /// `TRINO_URL` is unset, never the baked-in `"http://trino:8080"`
+    /// default `trino_url` always carries. The query-engine field
+    /// (`trino_url`) is deliberately always-present so `routes::query::run`
+    /// can turn an unreachable `Trino` into a per-request 503; the health
+    /// probe needs the opposite posture — "was this deployment ever told a
+    /// Trino URL at all" — since `trino` is a `profiles: ["trino"]`-gated
+    /// compose service and a deployment that never enables that profile
+    /// must never see a fabricated Trino outage on `/api/ops/services`. Two
+    /// fields, one env var, two honest fallback rules for two different
+    /// callers.
+    pub trino_health_url: Option<String>,
+    /// `OpenFGA` base URL (e.g. `http://openfga:8080`), used only by
+    /// [`crate::health::probe_openfga`]. `None` when unset — `OpenFGA` has
+    /// no host port in this compose file (`docker-compose.yml:406-425`, PR
+    /// #33 review blocker 2, deliberate), so a bare-metal or single-service
+    /// deployment of `lakehouse-api` may have no route to it at all; same
+    /// "unset means unprobed, not unhealthy" posture as
+    /// [`Self::trino_health_url`].
+    pub openfga_url: Option<String>,
 }
 
 /// Placeholder shown for secret fields instead of their real value.
@@ -516,6 +537,8 @@ impl std::fmt::Debug for Config {
             )
             .field("trino_url", &self.trino_url)
             .field("trino_max_rows", &self.trino_max_rows)
+            .field("trino_health_url", &self.trino_health_url)
+            .field("openfga_url", &self.openfga_url)
             .finish()
     }
 }
@@ -704,6 +727,8 @@ impl Config {
                           cannot truncate a realistic value"
             )]
             trino_max_rows: parse_u64_or_default(env, "TRINO_MAX_ROWS", 10_000) as usize,
+            trino_health_url: truthy(env, "TRINO_URL"),
+            openfga_url: truthy(env, "OPENFGA_URL"),
         })
     }
 
@@ -1117,5 +1142,45 @@ mod tests {
         let env = map(&[("PORT", "nope")]);
         let err = Config::from_map(&env).unwrap_err();
         assert_eq!(err, ConfigError::InvalidPort("nope".to_owned()));
+    }
+
+    /// WS5 Task A0 (plan review Y1) — `trino_health_url`/`openfga_url` are
+    /// both genuinely optional: an unset URL must resolve to `None`, not a
+    /// baked-in host:port, so `health::probe_all` never dials a service
+    /// this deployment never configured.
+    #[test]
+    fn trino_health_and_openfga_urls_are_none_by_default() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.trino_health_url, None);
+        assert_eq!(cfg.openfga_url, None);
+    }
+
+    #[test]
+    fn trino_health_and_openfga_urls_are_overridable() {
+        let env = map(&[
+            ("TRINO_URL", "http://trino.internal:8080"),
+            ("OPENFGA_URL", "http://openfga:8080"),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(
+            cfg.trino_health_url.as_deref(),
+            Some("http://trino.internal:8080")
+        );
+        assert_eq!(cfg.openfga_url.as_deref(), Some("http://openfga:8080"));
+    }
+
+    #[test]
+    fn empty_trino_url_is_treated_as_unset_for_the_health_probe() {
+        // `truthy()` semantics, matching every other optional field here —
+        // an operator setting `TRINO_URL=` in an env file must not probe an
+        // empty-string endpoint, even though the query-engine `trino_url`
+        // field falls back to its own baked-in default for that same case.
+        let env = map(&[("TRINO_URL", "")]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(cfg.trino_health_url, None);
+        // `trino_url` (query-engine field) uses `??` semantics like every
+        // other `or_default` field here — an explicit empty value is
+        // preserved, not re-defaulted (`or_default`'s own doc comment).
+        assert_eq!(cfg.trino_url, "");
     }
 }
