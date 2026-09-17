@@ -17,7 +17,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { formatCost, formatPercent } from "@/lib/format"
+import { formatPercent, formatTokens } from "@/lib/format"
 import { fmtMeasured } from "@/lib/measured"
 import {
   AUTONOMY_LABEL,
@@ -46,14 +46,14 @@ const columns: ColumnDef<DigitalEmployee>[] = [
     if (r.budgetSpent === null || r.budgetReserved === null) {
       return (
         <span className="tabular-nums">
-          — / {formatCost(r.budgetLimit)}
+          — / {formatTokens(r.budgetLimit)}
         </span>
       )
     }
     const used = r.budgetSpent + r.budgetReserved
     return (
       <span className="tabular-nums">
-        {formatCost(used)} / {formatCost(r.budgetLimit)}{" "}
+        {formatTokens(used)} / {formatTokens(r.budgetLimit)}{" "}
         <span className="text-xs text-muted-foreground">
           ({formatPercent(r.budgetLimit > 0 ? used / r.budgetLimit : 0)})
         </span>

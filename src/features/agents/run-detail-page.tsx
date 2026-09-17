@@ -13,7 +13,7 @@ import { SectionCard } from "@/components/patterns/section-card"
 import { AgentRunStatusBadge, ApprovalBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { useService } from "@/hooks/use-service"
-import { formatCost, formatDateTime, formatRelativeTime } from "@/lib/format"
+import { formatDateTime, formatRelativeTime, formatTokens } from "@/lib/format"
 import { fmtMeasured } from "@/lib/measured"
 import { agentService } from "@/services"
 
@@ -111,8 +111,8 @@ export function RunDetailPage() {
                 : "Still running / awaiting a decision",
             },
             {
-              label: "Budget consumed",
-              value: fmtMeasured(r.budgetConsumed, formatCost),
+              label: "Tokens consumed",
+              value: fmtMeasured(r.budgetConsumed, formatTokens),
             },
             {
               label: "Audit event",

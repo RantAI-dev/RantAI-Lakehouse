@@ -24,7 +24,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import {
-  formatCost,
+  formatTokens,
   formatPercent,
   formatRelativeTime,
 } from "@/lib/format"
@@ -132,7 +132,7 @@ function RunsSection({ runs }: { runs: AgentRun[] }) {
             <span
               className={`text-xs text-muted-foreground ${r.auditEventId ? "" : "ml-auto"}`}
             >
-              {fmtMeasured(r.budgetConsumed, formatCost)} · started{" "}
+              {fmtMeasured(r.budgetConsumed, formatTokens)} · started{" "}
               {formatRelativeTime(r.startedAt)}
               {r.endedAt ? ` · ended ${formatRelativeTime(r.endedAt)}` : ""}
             </span>
@@ -436,14 +436,14 @@ export function EmployeeDetailPage() {
           <p className="text-2xl font-semibold tabular-nums">
             {e.budgetSpent === null || e.budgetReserved === null
               ? "—"
-              : formatCost(e.budgetSpent + e.budgetReserved)}
+              : formatTokens(e.budgetSpent + e.budgetReserved)}
             <span className="text-base text-muted-foreground">
-              {" "}/ {formatCost(e.budgetLimit)}
+              {" "}/ {formatTokens(e.budgetLimit)}
             </span>
           </p>
           <p className="mt-1 text-xs text-muted-foreground">
-            Spent {fmtMeasured(e.budgetSpent, formatCost)} · Reserved{" "}
-            {fmtMeasured(e.budgetReserved, formatCost)}
+            Spent {fmtMeasured(e.budgetSpent, formatTokens)} · Reserved{" "}
+            {fmtMeasured(e.budgetReserved, formatTokens)}
           </p>
         </SectionCard>
         <SectionCard title="Scope">

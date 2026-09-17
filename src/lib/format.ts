@@ -42,6 +42,18 @@ export function formatDuration(ms: number): string {
   return `${h}h ${String(m % 60).padStart(2, "0")}m`
 }
 
+/**
+ * Agent token budget, e.g. 128000 → "128K tokens". WS7 item G2: WS7
+ * redefined an agent's budget unit as tokens, not a currency/cost-unit
+ * figure — `formatCost`'s "cu" suffix (below) is for pipeline run cost
+ * units only; a `budgetSpent`/`budgetLimit` figure must use this
+ * formatter instead, never `formatCost`.
+ */
+export function formatTokens(count: number): string {
+  if (!Number.isFinite(count)) return "—"
+  return `${formatCompactNumber(count)} tokens`
+}
+
 /** Internal cost units, e.g. 0.0421 → "0.0421 cu". */
 export function formatCost(units: number): string {
   if (!Number.isFinite(units)) return "—"
