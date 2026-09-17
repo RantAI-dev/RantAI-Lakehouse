@@ -456,6 +456,108 @@ fn step_to_json(s: &lakehouse_dagster::RunStep) -> Value {
     })
 }
 
+/// Hard cap on log lines a single `GET .../logs` request may return,
+/// REGARDLESS of what the caller's `?limit=` asks for (WS4 item C4, grand
+/// plan §6's "log streaming must not leak" risk item). `Dagster` op logs
+/// can echo arbitrarily large payloads (a misbehaving op printing a full
+/// row), and an unbounded page size would let one request pull an entire
+/// run's log history into a single response.
+const MAX_LOG_LINES_PER_PAGE: u32 = 500;
+
+/// `GET /api/pipelines/{id}/runs/{runId}/logs?cursor=&limit=` — a bounded,
+/// monotonic page of log lines (WS4 item C4). `limit` is clamped to
+/// [`MAX_LOG_LINES_PER_PAGE`] regardless of what the caller requests. The
+/// cursor itself is `Dagster`'s own opaque `logsForRun` cursor, passed
+/// straight through as `afterCursor` on the next call — never
+/// re-interpreted or re-encoded here — so paging strictly forward through
+/// it can neither skip an event (each page starts exactly where the last
+/// one's `cursor` left off) nor duplicate one (an already-returned event
+/// is never re-included by `Dagster`'s own cursor semantics) under
+/// repeated polling.
+///
+/// # Who can read these logs
+///
+/// Op log MESSAGE TEXT is passed through verbatim — an op that logs a
+/// value it shouldn't (a connection string on error, a row's contents)
+/// makes that value visible to anyone this route's
+/// `Policy::RequiresPermission("pipeline:read")` gate admits. Verified
+/// against `rust/migrations/0002_seed_identity.sql`, `pipeline:read` is
+/// granted only to the seeded Data Engineer role (`pipeline:*`) and
+/// Platform Admin (`*:*`) — never to a viewer/analyst-shaped role, and the
+/// `dagster-orchestrator` service identity itself holds `pipeline:run`
+/// (used to trigger/list), not `pipeline:read`, so a `Dagster`-side
+/// credential cannot read its own run logs back through this route. This
+/// is an operator-scoped surface today, not a general one — **if a future
+/// role grant widens `pipeline:read`, it widens run-log visibility by the
+/// same amount**, which is not automatically revisited by this route.
+///
+/// # Errors
+///
+/// 404 if `run_id` names a run `Dagster` reports as not found
+/// (`RunNotFoundError`); 503 if the `Dagster` `run_logs` call fails for
+/// any other reason, via [`js_error`], same as every other `Dagster`-
+/// backed route in this module — `js_error` wraps `DgError`'s own
+/// `Display` (a client-generated summary already truncated/shaped by
+/// `lakehouse_dagster`, never a raw HTTP response body or stack trace),
+/// not a fresh classification step of its own; a transport-level failure
+/// is the fixed string `"fetch failed"` (`DgError::Transport`'s own doc
+/// comment), while a typed `Dagster` GraphQL failure's `message` field
+/// passes through — the same posture every other route here already
+/// takes for a `Dagster` failure.
+pub async fn run_logs(
+    State(state): State<AppState>,
+    Path((_id, run_id)): Path<(String, String)>,
+    Query(params): Query<LogsQuery>,
+) -> Response {
+    let limit = params.limit.unwrap_or(200).min(MAX_LOG_LINES_PER_PAGE);
+    match state
+        .dagster
+        .run_logs(&run_id, params.cursor.as_deref(), limit)
+        .await
+    {
+        Ok(page) => (
+            StatusCode::OK,
+            ApiJson(json!({
+                "lines": page.lines.iter().map(|l| json!({
+                    "ts": l.ts, "level": l.level, "stepKey": l.step_key, "message": l.message,
+                })).collect::<Vec<_>>(),
+                "cursor": page.cursor,
+            })),
+        )
+            .into_response(),
+        // `DgError::Server` here carries `Dagster`'s own `message` field,
+        // not its `__typename` -- `lakehouse_dagster::DgClient::run_logs`
+        // returns the message text verbatim for any non-`EventConnection`
+        // response (`RunNotFoundError`, `PythonError`), so this route
+        // cannot switch on the typename directly. Live-verified against
+        // this repository's own Dagster 1.13.20 stack (a `logsForRun`
+        // query against a bogus `runId`): `RunNotFoundError.message` is
+        // literally `"Pipeline run <id> could not be found."` -- matched
+        // on that real, observed substring, NOT the plan sketch's
+        // `.contains("NotFound")` (which never appears in the message
+        // text itself, only in the typename `DgError::Server` discards).
+        Err(DgError::Server(msg)) if msg.contains("could not be found") => (
+            StatusCode::NOT_FOUND,
+            ApiJson(json!({ "error": format!("run {run_id} not found") })),
+        )
+            .into_response(),
+        // Never forward the raw Dagster error body -- `js_error` classifies
+        // it the same way every other Dagster-backed route in this file
+        // does.
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ApiJson(json!({ "error": js_error(err) })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LogsQuery {
+    cursor: Option<String>,
+    limit: Option<u32>,
+}
+
 fn run_to_json(r: &DgRun, pipeline_id: &str) -> Value {
     json!({
         "id": r.run_id,
@@ -1980,6 +2082,175 @@ mod tests {
             let response = run_steps(
                 State(state),
                 Path(("bronze_maintenance_job".to_owned(), "r1".to_owned())),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
+    /// WS4 item C4 — `GET /api/pipelines/{id}/runs/{runId}/logs?cursor=`,
+    /// against Phase A's real captured `run_logs` fixture, and the bounded-
+    /// page-size guarantee the brief's "log streaming must not leak" risk
+    /// item requires.
+    mod logs_route {
+        use std::collections::HashMap;
+
+        use crate::config::Config;
+        use crate::state::AppState;
+
+        use super::*;
+
+        fn state_with_dagster(server_uri: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DAGSTER_URL".to_owned(), format!("{server_uri}/graphql"));
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        #[tokio::test]
+        async fn logs_route_returns_lines_and_cursor_from_a_real_captured_fixture() {
+            let server = wiremock::MockServer::start().await;
+            let body: Value = serde_json::from_str(include_str!(
+                "../../../lakehouse-dagster/tests/fixtures/run_logs_captured_fixture.json"
+            ))
+            .expect("fixture parses");
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = run_logs(
+                State(state),
+                Path(("bronze_maintenance_job".to_owned(), "r1".to_owned())),
+                Query(LogsQuery {
+                    cursor: None,
+                    limit: None,
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&response_body).expect("valid JSON");
+            let lines = v["lines"].as_array().expect("lines array");
+            assert_eq!(lines.len(), 15);
+            assert_eq!(
+                v["cursor"],
+                "eyJ0eXBlIjogIlNUT1JBR0VfSUQiLCAidmFsdWUiOiA0Nn0="
+            );
+            // Real fixture's first event is a RunEnqueuedEvent with an
+            // empty message -- confirms the ts is parsed from the STRING
+            // timestamp, not left as a string or dropped.
+            assert!(lines[0]["ts"].is_number());
+        }
+
+        /// The size-bounding decision the brief's "log streaming must not
+        /// leak" risk item requires: a caller-supplied `?limit=` far above
+        /// the fixed ceiling is CLAMPED before it ever reaches
+        /// `state.dagster.run_logs`, not passed through.
+        #[tokio::test]
+        async fn logs_route_paginates_via_cursor_and_bounds_page_size() {
+            let server = wiremock::MockServer::start().await;
+            // Responder inspects the request body itself and asserts the
+            // `limit` variable Dagster actually received is clamped -- a
+            // real assertion on the outbound GraphQL request, not just on
+            // the response.
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(move |req: &wiremock::Request| {
+                    let parsed: Value = serde_json::from_slice(&req.body).expect("valid JSON body");
+                    let limit = parsed["variables"]["limit"]
+                        .as_u64()
+                        .expect("limit variable present");
+                    assert!(
+                        limit <= u64::from(MAX_LOG_LINES_PER_PAGE),
+                        "requested limit {limit} was not clamped to {MAX_LOG_LINES_PER_PAGE}"
+                    );
+                    let cursor = parsed["variables"]["after"].as_str();
+                    assert_eq!(
+                        cursor,
+                        Some("prior-page-cursor"),
+                        "the caller's cursor must be forwarded verbatim, not re-encoded"
+                    );
+                    wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                        "data": { "logsForRun": { "__typename": "EventConnection",
+                            "events": [], "cursor": "next-page-cursor", "hasMore": false } }
+                    }))
+                })
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = run_logs(
+                State(state),
+                Path(("bronze_maintenance_job".to_owned(), "r1".to_owned())),
+                Query(LogsQuery {
+                    cursor: Some("prior-page-cursor".to_owned()),
+                    limit: Some(100_000), // far above MAX_LOG_LINES_PER_PAGE
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&response_body).expect("valid JSON");
+            assert_eq!(v["cursor"], "next-page-cursor");
+        }
+
+        #[tokio::test]
+        async fn logs_route_404s_for_a_real_not_found_run_message() {
+            let server = wiremock::MockServer::start().await;
+            // The real, live-verified `RunNotFoundError` message text
+            // (queried against this repository's own Dagster 1.13.20
+            // stack with a bogus runId): `DgError::Server` carries the
+            // `message` field, NOT the `__typename`, so this route's own
+            // not-found match must key on this real substring.
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "logsForRun": { "__typename": "RunNotFoundError",
+                        "message": "Pipeline run bogus-run-id could not be found." } }
+                })))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = run_logs(
+                State(state),
+                Path((
+                    "bronze_maintenance_job".to_owned(),
+                    "bogus-run-id".to_owned(),
+                )),
+                Query(LogsQuery {
+                    cursor: None,
+                    limit: None,
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn logs_route_is_503_not_a_fabricated_empty_list_when_dagster_returns_a_python_error()
+        {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "logsForRun": { "__typename": "PythonError",
+                        "message": "boom: unrelated internal Dagster failure" } }
+                })))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = run_logs(
+                State(state),
+                Path(("bronze_maintenance_job".to_owned(), "r1".to_owned())),
+                Query(LogsQuery {
+                    cursor: None,
+                    limit: None,
+                }),
             )
             .await;
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);

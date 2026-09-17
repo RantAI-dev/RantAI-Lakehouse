@@ -121,6 +121,10 @@ fn pipelines_router() -> Router<AppState> {
             get(pipelines::run_steps),
         )
         .route(
+            "/api/pipelines/{id}/runs/{runId}/logs",
+            get(pipelines::run_logs),
+        )
+        .route(
             "/api/pipelines/{id}/trigger",
             axum::routing::post(pipelines::trigger),
         )
