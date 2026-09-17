@@ -5,9 +5,13 @@
 //! Every function here calls straight into the `lakehouse-alerts` crate —
 //! the SAME `list_rules`/`save_rule`/`delete_rule`/`run_rules` functions
 //! `routes::alerts` calls — rather than re-implementing rule storage or
-//! evaluation. `run_alert_rule` also reuses
-//! `routes::alerts::smtp_config` so a fired alert is delivered through the
-//! exact same `SmtpConfig` the console's `/api/alerts/run` builds.
+//! evaluation. `run_alert_rule` also reuses `routes::alerts::smtp_config`
+//! so a fired alert is delivered through the exact same `SmtpConfig` the
+//! console's `/api/alerts/run` builds, and `routes::alerts::ApiFreshnessSource`/
+//! `ApiSilenceSource` (WS5 item C1) so a copilot-triggered run evaluates
+//! `Freshness` rules and suppresses delivery for a silenced rule exactly
+//! like the HTTP route does — a rule silenced from the console must not
+//! page someone again just because the copilot ran it instead.
 //!
 //! `run_alert_rule` deliberately does NOT go through
 //! `routes::alerts::run`/`check_run_token`: that guard's whole point (see
@@ -82,9 +86,36 @@ pub(super) async fn run_alert_rule(state: &AppState, args: &Map<String, Value>) 
     }
     let http = reqwest::Client::new();
     let email = EmailSender::new(crate::routes::alerts::smtp_config(&state.config));
-    // See `routes::alerts::run`'s identical comment: real `FreshnessSource`/
-    // `SilenceSource` implementations land in the next commit.
-    match lakehouse_alerts::run_rules(&state.clickhouse, &http, &email, Some(&id), None, None).await
+    // Same real `FreshnessSource`/`SilenceSource` wiring as
+    // `routes::alerts::run` (WS5 item C1) — reused here, not
+    // reimplemented, so a copilot-triggered run also evaluates `Freshness`
+    // rules and never pages someone about an incident they already
+    // silenced. `AppState::iceberg` is read once, through the lock, guard
+    // dropped immediately.
+    let cached_iceberg = state.iceberg.read().await.clone();
+    let freshness_source = match (state.pg.as_deref(), cached_iceberg) {
+        (Some(pg), Some(iceberg)) => {
+            Some(crate::routes::alerts::ApiFreshnessSource { pg, iceberg })
+        }
+        _ => None,
+    };
+    let silence_source = state
+        .pg
+        .as_deref()
+        .map(|pg| crate::routes::alerts::ApiSilenceSource { pg });
+    match lakehouse_alerts::run_rules(
+        &state.clickhouse,
+        &http,
+        &email,
+        Some(&id),
+        freshness_source
+            .as_ref()
+            .map(|s| s as &dyn lakehouse_alerts::FreshnessSource),
+        silence_source
+            .as_ref()
+            .map(|s| s as &dyn lakehouse_alerts::SilenceSource),
+    )
+    .await
     {
         Ok(results) => json!({ "ran": results.len(), "results": results }),
         Err(err) => json!({ "error": err.to_string() }),

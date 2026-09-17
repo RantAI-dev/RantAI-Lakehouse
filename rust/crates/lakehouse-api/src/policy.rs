@@ -166,6 +166,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/overview/alerts",                          Policy::RequiresAuth),
     ("POST", "/api/overview/alerts/{id}/acknowledge",         Policy::RequiresAuth),
     ("POST", "/api/overview/alerts/{id}/resolve",             Policy::RequiresAuth),
+    ("POST", "/api/overview/alerts/{id}/silence",             Policy::RequiresAuth),
 
     // ── Ops: `{kind}` fans out to several logical resources with no single
     //    seeded permission — auth only (see module doc comment). Cancelling

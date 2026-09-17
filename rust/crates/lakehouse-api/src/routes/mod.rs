@@ -216,6 +216,12 @@ fn overview_alerts_router() -> Router<AppState> {
             "/api/overview/alerts/{id}/resolve",
             axum::routing::post(overview::resolve_alert),
         )
+        // WS5 item C1: silence a fired alert (and its rule's future
+        // firings) for a caller-chosen number of minutes.
+        .route(
+            "/api/overview/alerts/{id}/silence",
+            axum::routing::post(overview::silence_alert),
+        )
 }
 
 /// The `/api/connectors/*` sub-router (Task 2.7), split out for the same

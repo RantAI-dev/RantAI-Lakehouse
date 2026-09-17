@@ -60,7 +60,14 @@ export type ActivityItem = {
 export type AlertItem = {
   id: string
   title: string
-  severity: Severity
+  /**
+   * `null` when the firing rule was saved with no severity (WS5 item C1:
+   * a fired instance copies the rule's own severity verbatim, never
+   * invented from the rule's kind) — the backend always sends this key,
+   * so `null` here means "genuinely unset," distinct from a field the
+   * frontend hasn't loaded yet.
+   */
+  severity: Severity | null
   source: string
   affected: string
   status: AlertStatus
@@ -69,6 +76,12 @@ export type AlertItem = {
   detail: string
   resolutionNote?: string
   href?: string
+  /** The `console.alert_rule` id that fired this instance, if any. */
+  ruleId?: string
+  /** When the rule actually fired, ISO 8601 (WS5 item C1). */
+  firedAt?: string
+  /** Set once this alert (and its rule) is silenced, ISO 8601. */
+  silencedUntil?: string
 }
 
 export interface OverviewService {

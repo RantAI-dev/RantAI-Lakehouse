@@ -476,6 +476,56 @@ pub async fn resolve_alert(
     }
 }
 
+/// The `POST /api/overview/alerts/{id}/silence` body: how many minutes
+/// from now to silence this alert (and its `rule_id`, if any) for.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SilenceAlertBody {
+    until_minutes: i64,
+}
+
+/// `POST /api/overview/alerts/{id}/silence` — silence an alert instance
+/// (and, if it carries a `rule_id`, that rule's future firings) for
+/// `untilMinutes`. WS5 item C1. A silence marks the row `acknowledged`
+/// (like [`acknowledge_alert`]) and sets `silenced_until`, which
+/// `lakehouse_alerts::SilenceSource`'s real implementation
+/// (`routes::alerts::ApiSilenceSource`) consults to suppress both the next
+/// `alert_instance` insert and the next webhook/email delivery while the
+/// silence is active.
+///
+/// # Errors
+///
+/// 400 on a malformed body; 404 if `id` is unknown; 503/500 as above.
+pub async fn silence_alert(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let until: SilenceAlertBody = match serde_json::from_slice(&body) {
+        Ok(b) => b,
+        Err(err) => {
+            return crate::error::ApiRejection(ApiError::BadRequest(format!(
+                "invalid JSON: {err}"
+            )))
+            .into_response();
+        }
+    };
+    let pg = match pool(&state) {
+        Ok(p) => p,
+        Err(err) => return crate::error::ApiRejection(err).into_response(),
+    };
+    let until_at = OffsetDateTime::now_utc() + time::Duration::minutes(until.until_minutes);
+    match overview::silence_alert(pg, &id, until_at).await {
+        Ok(Some(alert)) => (StatusCode::OK, ApiJson(alert)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            ApiJson(json!({ "error": format!("Alert {id} not found") })),
+        )
+            .into_response(),
+        Err(err) => crate::error::ApiRejection(err.into()).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

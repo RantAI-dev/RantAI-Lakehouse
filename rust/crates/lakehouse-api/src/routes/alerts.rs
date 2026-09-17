@@ -4,15 +4,22 @@
 //! Ports `src/app/api/alerts/route.ts` and
 //! `src/app/api/alerts/run/route.ts`.
 
+use std::sync::Arc;
+
 use axum::body::Bytes;
 use axum::extract::{Extension, Query, State};
 use axum::http::HeaderMap;
-use lakehouse_alerts::AlertRuleInput;
+use iceberg::{NamespaceIdent, TableIdent};
+use lakehouse_alerts::{AlertKind, AlertRule, AlertRuleInput, FreshnessSource, SilenceSource};
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
+use lakehouse_iceberg::IcebergClient;
 use lakehouse_notify::{EmailSender, SmtpConfig};
+use lakehouse_store::PgPool;
+use lakehouse_store::overview::{self, FiredRule};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 
 use crate::config::Config;
 use crate::error::ApiResult;
@@ -185,6 +192,152 @@ pub(in crate::routes) fn smtp_config(config: &Config) -> SmtpConfig {
     }
 }
 
+/// [`FreshnessSource`] backed by real Postgres `dataset_sla` rows and
+/// WS2's Iceberg REST surface — the in-process path, not an HTTP call to
+/// this crate's own `/api/lakehouse/tables/{ns}/{table}` route (which
+/// returns `TableDetail`, a struct with no top-level `last_updated_ms`
+/// field at all). `lakehouse_iceberg::rest::load_table_summary` returns
+/// `TableSummary`, which does carry `last_updated_ms`, so this calls that
+/// function directly, in the same process, rather than looping back
+/// through HTTP. WS5 item C1.
+pub(in crate::routes) struct ApiFreshnessSource<'a> {
+    pub(in crate::routes) pg: &'a PgPool,
+    pub(in crate::routes) iceberg: Arc<IcebergClient>,
+}
+
+#[async_trait::async_trait]
+impl FreshnessSource for ApiFreshnessSource<'_> {
+    async fn expected_interval_minutes(&self, table_name: &str) -> Result<Option<i64>, String> {
+        // `StoreError`'s own `Display` renders the fixed string "database
+        // error" (`lakehouse-store/src/error.rs`), never an upstream
+        // detail, so `.to_string()` here is not a leak — unlike
+        // `ChError`/`DgError`'s `Server` variant elsewhere in this crate.
+        lakehouse_store::governance::expected_interval_minutes_for(self.pg, table_name)
+            .await
+            .map(|opt| opt.map(i64::from))
+            .map_err(|err| err.to_string())
+    }
+
+    async fn last_snapshot_ms(&self, table_name: &str) -> Option<i64> {
+        let (ns, table) = table_name.split_once('.')?;
+        let ident = TableIdent::new(NamespaceIdent::new(ns.to_owned()), table.to_owned());
+        lakehouse_iceberg::rest::load_table_summary(&self.iceberg, &ident)
+            .await
+            .ok()
+            .and_then(|summary| summary.last_updated_ms)
+    }
+}
+
+/// [`SilenceSource`] backed by real Postgres `alert_instance.silenced_until`
+/// (`lakehouse_store::overview::is_rule_silenced`). WS5 item C1, WS5 plan
+/// review U6.
+pub(in crate::routes) struct ApiSilenceSource<'a> {
+    pub(in crate::routes) pg: &'a PgPool,
+}
+
+#[async_trait::async_trait]
+impl SilenceSource for ApiSilenceSource<'_> {
+    async fn is_silenced(&self, rule_id: &str) -> bool {
+        overview::is_rule_silenced(self.pg, rule_id, OffsetDateTime::now_utc())
+            .await
+            // A Postgres error here must not turn a legitimate alert into
+            // a silent no-op that also fails to fire — degrade to "not
+            // silenced," never fail the whole run.
+            .unwrap_or(false)
+    }
+}
+
+/// A fixed, kind-derived `AlertItem.source` label for a fired rule's
+/// persisted instance — never invented per-rule text, just which engine
+/// produced it.
+fn fired_source(kind: AlertKind) -> &'static str {
+    match kind {
+        AlertKind::Alert => "Alert rules",
+        AlertKind::Freshness => "Freshness monitoring",
+        AlertKind::Digest => "Digest", // never reached: callers filter Digest out before this
+    }
+}
+
+/// A human-readable description of a fired rule's breach, built from
+/// [`lakehouse_alerts::RunResult::value`] and the rule's own config —
+/// never fabricated beyond what both already carry.
+fn fired_detail(rule: &AlertRule, value: Option<f64>) -> String {
+    let value = value.map_or_else(|| "n/a".to_owned(), |v| format!("{v:.2}"));
+    match rule.kind {
+        AlertKind::Freshness => format!(
+            "{} is stale: observed age {value} min",
+            rule.mart.as_deref().unwrap_or("")
+        ),
+        AlertKind::Alert | AlertKind::Digest => format!(
+            "{}({}) on {} {} {} — observed {value}",
+            rule.agg,
+            rule.measure.as_deref().unwrap_or(""),
+            rule.mart.as_deref().unwrap_or(""),
+            rule.op.as_str(),
+            rule.threshold
+        ),
+    }
+}
+
+/// Persist every fired, non-`Digest` result from `results` as an
+/// `alert_instance` row, best-effort — mirrors `routes::query.rs:171-198`'s
+/// history write: a Postgres outage (or a `ClickHouse` re-fetch failure)
+/// must never turn an otherwise-successful `/api/alerts/run` into an error
+/// response, since the webhook/email already went out. Skips (never
+/// inserts) a rule the caller's own [`ApiSilenceSource`] reports as
+/// currently silenced — the route layer's decision, not
+/// `insert_from_fired_rule`'s (that primitive has no silence awareness by
+/// design; see `lakehouse_store::overview`'s module doc comment). WS5 item
+/// C1, WS5 plan review U6.
+async fn persist_fired_results(
+    pg: &PgPool,
+    ch: &lakehouse_clickhouse::ChClient,
+    results: &[lakehouse_alerts::RunResult],
+) {
+    if !results
+        .iter()
+        .any(|r| r.fired && r.kind != AlertKind::Digest)
+    {
+        return;
+    }
+    // A second `list_rules` round trip, deliberately: `RunResult` carries
+    // only id/name/kind/fired/value, never the rule's own `severity`/
+    // `mart` this insert needs, and `run_rules` does not return its
+    // internal rule list.
+    let rules = match lakehouse_alerts::list_rules(ch).await {
+        Ok(rules) => rules,
+        Err(err) => {
+            tracing::warn!(%err, "failed to re-fetch alert rules for alert_instance persistence (results were still delivered)");
+            return;
+        }
+    };
+    let now = OffsetDateTime::now_utc();
+    for result in results {
+        if !result.fired || result.kind == AlertKind::Digest {
+            continue;
+        }
+        let Some(rule) = rules.iter().find(|r| r.id == result.id) else {
+            continue;
+        };
+        let silenced = ApiSilenceSource { pg }.is_silenced(&rule.id).await;
+        if silenced {
+            continue;
+        }
+        let detail = fired_detail(rule, result.value);
+        let fired = FiredRule {
+            rule_id: &rule.id,
+            title: &rule.name,
+            severity: rule.severity.as_deref(),
+            source: fired_source(rule.kind),
+            affected: rule.mart.as_deref().unwrap_or(""),
+            detail: &detail,
+        };
+        if let Err(err) = overview::insert_from_fired_rule(pg, &fired, now).await {
+            tracing::warn!(%err, rule_id = %rule.id, "failed to persist fired alert instance (delivery already happened)");
+        }
+    }
+}
+
 /// `GET`/`POST /api/alerts/run` — evaluate rules and deliver alerts/
 /// digests that fire.
 ///
@@ -241,22 +394,39 @@ pub async fn run(
 
     let http = reqwest::Client::new();
     let email = EmailSender::new(smtp_config(&state.config));
-    // `freshness`/`silence` are `None` here: `ApiFreshnessSource` and
-    // `ApiSilenceSource` (real Postgres/Iceberg-backed implementations of
-    // `lakehouse_alerts::FreshnessSource`/`SilenceSource`) land in a later
-    // commit (WS5 item C1, next). Until then every `Freshness` rule
-    // reports `skipped` and no rule's delivery is ever silence-suppressed
-    // from this route — an honest degrade, not a placeholder failure.
+    // `freshness`/`silence` sources are real, Postgres/Iceberg-backed
+    // implementations when both dependencies are configured for this
+    // request; otherwise `None` — every `Freshness` rule then reports
+    // `skipped` and no rule's delivery is ever silence-suppressed, an
+    // honest degrade rather than a placeholder failure. `AppState::iceberg`
+    // is read once, through the lock, with the guard dropped immediately
+    // (never held across an `.await`) — this route only uses whatever
+    // client is already cached; it does not itself trigger a connect.
+    let cached_iceberg = state.iceberg.read().await.clone();
+    let freshness_source = match (state.pg.as_deref(), cached_iceberg) {
+        (Some(pg), Some(iceberg)) => Some(ApiFreshnessSource { pg, iceberg }),
+        _ => None,
+    };
+    let silence_source = state.pg.as_deref().map(|pg| ApiSilenceSource { pg });
+
     let results = lakehouse_alerts::run_rules(
         &state.clickhouse,
         &http,
         &email,
         query.id.as_deref(),
-        None,
-        None,
+        freshness_source.as_ref().map(|s| s as &dyn FreshnessSource),
+        silence_source.as_ref().map(|s| s as &dyn SilenceSource),
     )
     .await
     .map_err(|err| ApiError::Internal(err.to_string()))?;
+
+    // Persist every fired, non-Digest result as an `alert_instance` row,
+    // best-effort (WS5 item C1) — see `persist_fired_results`'s doc
+    // comment.
+    if let Some(pg) = state.pg.as_deref() {
+        persist_fired_results(pg, &state.clickhouse, &results).await;
+    }
+
     Ok(ApiJson(json!({ "ran": results.len(), "results": results })))
 }
 
@@ -363,5 +533,164 @@ mod tests {
     fn run_endpoint_allows_a_service_identity_principal_when_token_unset() {
         let service = service_principal();
         assert!(check_run_token(None, None, None, Some(&service)).is_ok());
+    }
+
+    /// WS5 item C1, WS5 plan review U6: an end-to-end assertion that a
+    /// silence suppresses both delivery AND a fresh `alert_instance` row —
+    /// not just `lakehouse_store::overview`'s primitive-level boundary
+    /// (`overview::tests::a_silenced_rule_produces_no_new_instance_after_its_dedup_window_lapses`
+    /// documents that `insert_from_fired_rule` alone has no silence
+    /// awareness; this test proves the route layer's decision not to call
+    /// it while silenced).
+    mod silence_end_to_end {
+        use std::collections::HashMap;
+
+        use axum::extract::{Query, State};
+        use lakehouse_store::overview::{self, FiredRule};
+        use lakehouse_test_support as _;
+        use time::OffsetDateTime;
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::super::*;
+        use super::service_principal;
+        use crate::config::Config;
+
+        /// One enabled `Alert` rule, `ClickHouse`-row shaped exactly like
+        /// `row_to_rule` (`lakehouse-alerts/src/lib.rs`) expects — string
+        /// values throughout, matching `FORMAT JSON`'s stringified-integer
+        /// convention the rest of this codebase's `ClickHouse` fixtures
+        /// already use (see `row_to_rule_maps_freshness_type_column`).
+        fn rule_row_json() -> Value {
+            json!({
+                "id": "al-route-test-1",
+                "name": "Route test rule",
+                "type": "alert",
+                "mart": "route_test_mart",
+                "measure": "v",
+                "agg": "sum",
+                "op": ">",
+                "threshold": "10",
+                "board": "",
+                "channel": "webhook",
+                "target": "http://127.0.0.1:1/never-called",
+                "enabled": "1",
+                "created_at": "",
+                "severity": "high",
+            })
+        }
+
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database")
+            )
+        }
+
+        fn state_for(pool: &sqlx::PgPool, ch_url: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_silenced_rule_is_not_re_delivered_and_produces_no_new_row(pool: sqlx::PgPool) {
+            let server = MockServer::start().await;
+            // `list_rules`' `SELECT ... FROM console.alert_rule` — one
+            // enabled Alert rule.
+            Mock::given(method("POST"))
+                .and(body_string_contains("FROM console.alert_rule"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [], "data": [rule_row_json()], "rows": 1
+                })))
+                .mount(&server)
+                .await;
+            // `current_value`'s `SELECT round(sum(v)) FROM serving.<mart>`
+            // — a value far over the rule's threshold of 10, so it fires.
+            Mock::given(method("POST"))
+                .and(body_string_contains("FROM serving."))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [], "data": [{ "v": "999" }], "rows": 1
+                })))
+                .mount(&server)
+                .await;
+            // `ensure()`'s DDL statements (CREATE DATABASE/TABLE, ADD
+            // COLUMN) — a blank 200 for anything else.
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            let state = state_for(&pool, &server.uri());
+            let pg = state.pg.as_deref().expect("DATABASE_URL was set above");
+
+            // Fixture: the rule already fired once, 20 minutes ago (past
+            // the 15-minute dedup window), and is silenced 60 minutes out
+            // from now.
+            let first = overview::insert_from_fired_rule(
+                pg,
+                &FiredRule {
+                    rule_id: "al-route-test-1",
+                    title: "Route test rule",
+                    severity: Some("high"),
+                    source: "Alert rules",
+                    affected: "route_test_mart",
+                    detail: "seed",
+                },
+                OffsetDateTime::now_utc() - time::Duration::minutes(20),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            overview::silence_alert(
+                pg,
+                &first.id,
+                OffsetDateTime::now_utc() + time::Duration::minutes(60),
+            )
+            .await
+            .unwrap();
+
+            let response = run(
+                State(state),
+                HeaderMap::new(),
+                Query(RunQuery {
+                    id: Some("al-route-test-1".to_owned()),
+                    token: None,
+                }),
+                Some(Extension(service_principal())),
+            )
+            .await
+            .expect("a service-identity principal must pass the run-token guard");
+
+            let body = response.0;
+            let result = &body["results"][0];
+            assert_eq!(
+                result["fired"], true,
+                "the rule is still genuinely over threshold"
+            );
+            assert!(
+                result.get("delivered").is_none(),
+                "delivery must be suppressed during the silence"
+            );
+
+            let row_count: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM alert_instance WHERE rule_id = $1")
+                    .bind("al-route-test-1")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                row_count, 1,
+                "still only the original silenced row — no fresh instance while silenced"
+            );
+        }
     }
 }

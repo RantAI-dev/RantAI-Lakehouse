@@ -24,6 +24,12 @@ lakehouse-embed = { path = "../lakehouse-embed" }
 lakehouse-llm = { path = "../lakehouse-llm" }
 lakehouse-store = { path = "../lakehouse-store" }
 lakehouse-auth = { path = "../lakehouse-auth" }
+# `routes::alerts::ApiFreshnessSource`/`ApiSilenceSource` (WS5 item C1)
+# implement `lakehouse_alerts::FreshnessSource`/`SilenceSource`, both
+# `#[async_trait::async_trait]` at their definition site -- any impl
+# needs the same macro, in non-test code this time (not just
+# `connector_probe.rs`'s dev-dependency-only use below).
+async-trait = { workspace = true }
 # WS2 §4 — `routes::query::run`'s `engine: "trino"` path talks to Trino's
 # `/v1/statement` protocol through this crate's thin client, never directly.
 lakehouse-trino = { path = "../lakehouse-trino" }

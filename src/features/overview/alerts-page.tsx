@@ -33,7 +33,12 @@ const columns: ColumnDef<AlertItem>[] = [
   {
     key: "severity",
     header: "Severity",
-    render: (r) => <SeverityBadge severity={r.severity} />,
+    render: (r) =>
+      r.severity !== null ? (
+        <SeverityBadge severity={r.severity} />
+      ) : (
+        <span className="text-muted-foreground">—</span>
+      ),
   },
   { key: "title", header: "Alert", render: (r) => r.title },
   { key: "source", header: "Source", render: (r) => r.source },
@@ -178,7 +183,11 @@ export function AlertsPage() {
         {selected ? (
           <>
             <div className="flex flex-wrap items-center gap-2">
-              <SeverityBadge severity={selected.severity} />
+              {selected.severity !== null ? (
+                <SeverityBadge severity={selected.severity} />
+              ) : (
+                <span className="text-muted-foreground">No severity</span>
+              )}
               <AlertStatusBadge status={selected.status} />
             </div>
             <p className="text-sm text-foreground">{selected.detail}</p>
