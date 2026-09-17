@@ -20,6 +20,7 @@
 // rather than a second, divergent one. `gate` stays private: approval
 // CREATION only ever happens from inside this module's own dispatch.
 pub(in crate::routes) mod audit;
+mod citations;
 mod gate;
 pub(in crate::routes) mod registry;
 pub(in crate::routes) mod tools;
