@@ -1055,7 +1055,15 @@ async fn run_headless_loop(
         // notices (the loop cannot know a call's token cost before making
         // it) — the run still stops at the next iteration boundary, never
         // silently continuing past the detected overage.
-        if budget_consumed >= budget_limit {
+        //
+        // `budget_limit <= 0.0` means "no budget configured", not "a limit
+        // of zero": `0017_agents.sql`'s `budget_limit DOUBLE PRECISION NOT
+        // NULL DEFAULT 0` gives every employee created without an explicit
+        // budget that same default, and this loop must not read the
+        // column's absence as a real, already-exhausted ceiling. Such a
+        // run proceeds unmetered; a genuinely configured limit (> 0) still
+        // enforces exactly as below, including a limit reached mid-run.
+        if budget_limit > 0.0 && budget_consumed >= budget_limit {
             step_no += 1;
             let detail = format!(
                 "budget exhausted: consumed {budget_consumed} tokens against a limit of {budget_limit}"
@@ -2185,6 +2193,89 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(run.budget_consumed, Some(30.0));
+        }
+
+        /// `employee.budget_limit` = 0.0 — `0017_agents.sql`'s `DEFAULT 0`,
+        /// what every employee created without an explicit budget takes.
+        /// Before the fix, the pre-call check (`budget_consumed >=
+        /// budget_limit`, i.e. `0.0 >= 0.0`) tripped on the very FIRST
+        /// iteration: an unconfigured employee could never run at all,
+        /// and reported `"budget_exhausted"` for a budget that was never
+        /// configured in the first place. This test's mock always returns
+        /// a tool call reporting 1000 tokens of usage — under the OLD,
+        /// wrong reading, that is wildly "over" a limit of 0; under the
+        /// fixed reading, `budget_limit <= 0.0` means "no budget
+        /// configured" and the loop must run unmetered, all the way to
+        /// `MAX_HEADLESS_ITER`, accumulating far more than 0 tokens along
+        /// the way with no `budget_exhausted` stop.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn run_headless_loop_runs_unmetered_when_budget_limit_is_unconfigured_zero(
+            pool: sqlx::PgPool,
+        ) {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(tool_call_response(1000)))
+                .mount(&server)
+                .await;
+
+            let state = state_for(&pool, &server.uri());
+
+            let input = CreateEmployeeInput {
+                name: "unconfigured-budget-employee".to_owned(),
+                purpose: "p".to_owned(),
+                autonomy: "L2".to_owned(),
+                allowed_tools: vec![],
+                data_scope: "d".to_owned(),
+                budget_limit: 0.0,
+                owner: None,
+                prompt: Some("do the thing".to_owned()),
+                schedule_cron: None,
+                mode: Some("build".to_owned()),
+                permissions: Some("*:*".to_owned()),
+            };
+            let employee = store_agents::create_employee(&pool, &input).await.unwrap();
+            store_agents::create_run(&pool, "run-budget-3", &employee.id, "manual", "tester")
+                .await
+                .unwrap();
+
+            let perms = PermissionSet::parse("*:*");
+            let outcome = run_headless_loop(
+                &state,
+                "run-budget-3",
+                &employee.id,
+                "do the thing",
+                true,
+                &perms,
+                None,
+                None,
+                "schedule",
+                "tester",
+                0.0,
+            )
+            .await;
+
+            assert!(
+                !matches!(outcome, HeadlessOutcome::Terminal("budget_exhausted")),
+                "an unconfigured (0) budget must never stop a run with budget_exhausted"
+            );
+            // Ran to the iteration ceiling instead of stopping on the very
+            // first budget check — proof the check was skipped, not just
+            // delayed.
+            assert!(matches!(outcome, HeadlessOutcome::Terminal("failed")));
+            if let HeadlessOutcome::Terminal(status) = outcome {
+                store_agents::finish_run(&pool, "run-budget-3", status)
+                    .await
+                    .unwrap();
+            }
+            let run = store_agents::get_run(&pool, "run-budget-3")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                run.budget_consumed,
+                Some(f64::from(MAX_HEADLESS_ITER) * 1000.0)
+            );
         }
     }
 }
