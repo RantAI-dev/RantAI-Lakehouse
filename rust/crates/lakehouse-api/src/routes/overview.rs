@@ -38,7 +38,8 @@ enum OverviewError {
 /// `GET /api/overview` — aggregate counts across catalog, storage,
 /// queries, and pipelines.
 pub async fn get(State(state): State<AppState>) -> Response {
-    match get_body(&state.clickhouse, &state.dagster).await {
+    let probes = crate::health::cached_probe_all(&state).await;
+    match get_body(&state.clickhouse, &state.dagster, &probes).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         // `catch (e) { return NextResponse.json({ error: String(e) }, {
         // status: 503 }); }` in `overview/route.ts` GET.
@@ -50,7 +51,11 @@ pub async fn get(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn get_body(ch: &ChClient, dagster: &DgClient) -> Result<Value, OverviewError> {
+async fn get_body(
+    ch: &ChClient,
+    dagster: &DgClient,
+    probes: &[crate::health::ServiceHealth],
+) -> Result<Value, OverviewError> {
     let assets_row = ch
         .rows(
             "SELECT toString(count()) n, toString(countIf(coalesce(s.total,0)=0)) stale FROM (
@@ -109,7 +114,7 @@ async fn get_body(ch: &ChClient, dagster: &DgClient) -> Result<Value, OverviewEr
     let q_row = q_row.first();
 
     Ok(summary_json(
-        assets_row, hot_row, warm_row, q_row, active, failed,
+        assets_row, hot_row, warm_row, q_row, active, failed, probes,
     ))
 }
 
@@ -138,6 +143,7 @@ fn summary_json(
     q_row: Option<&serde_json::Map<String, Value>>,
     active: usize,
     failed: usize,
+    probes: &[crate::health::ServiceHealth],
 ) -> Value {
     json!({
         "assetsTotal": num_or_zero(assets_row, "n"),
@@ -159,7 +165,16 @@ fn summary_json(
         "policyViolations7d": Value::Null,
         "pendingApprovals": Value::Null,
         "agents": { "activeRuns": Value::Null, "budgetUsedRate": Value::Null },
-        "services": { "healthy": Value::Null, "degraded": Value::Null, "unhealthy": Value::Null },
+        "services": {
+            "healthy": probes.iter().filter(|h| h.checked && h.ok).count(),
+            // Always 0 -- none of `health::probe_all`'s six probes ever
+            // reports a "degraded" state, only ok/not-ok (WS5 item A4,
+            // matching `health::ServiceHealth::health_label`'s own
+            // three-way map). Documented here rather than fabricating a
+            // third state no probe produces.
+            "degraded": 0,
+            "unhealthy": probes.iter().filter(|h| h.checked && !h.ok).count(),
+        },
     })
 }
 
@@ -318,7 +333,7 @@ mod tests {
 
     #[test]
     fn overview_reports_every_unmeasured_tile_as_null_and_drops_fabricated_structures() {
-        let v = summary_json(None, None, None, None, 0, 0);
+        let v = summary_json(None, None, None, None, 0, 0, &[]);
 
         assert!(
             v["assetsByTier"]["warm"]["bytes"].is_null(),
@@ -337,12 +352,13 @@ mod tests {
         );
         assert!(v["agents"]["activeRuns"].is_null());
         assert!(v["agents"]["budgetUsedRate"].is_null());
-        for k in ["healthy", "degraded", "unhealthy"] {
-            assert!(
-                v["services"][k].is_null(),
-                "services.{k} was a guessed literal"
-            );
-        }
+        // No probes at all -> zero of each, not null: `services.healthy`/
+        // `unhealthy` are real counts over an (empty) probe set, not an
+        // unmeasured metric — see the dedicated test below for the
+        // unconfigured-exclusion behavior with a non-empty probe set.
+        assert_eq!(v["services"]["healthy"], 0);
+        assert_eq!(v["services"]["degraded"], 0);
+        assert_eq!(v["services"]["unhealthy"], 0);
         assert!(
             v.get("streaming").is_none(),
             "streaming is removed, not nulled"
@@ -356,5 +372,37 @@ mod tests {
         assert!(!v["assetsByTier"]["hot"]["bytes"].is_null());
         assert!(!v["assetsByTier"]["warm"]["count"].is_null());
         assert!(!v["pipelines"]["failed"].is_null());
+    }
+
+    /// WS5 item A4 -- `services.healthy`/`unhealthy` come from the same
+    /// probes `/api/ops/services` reads, and an unconfigured (unchecked)
+    /// service counts toward NEITHER bucket -- never miscounted as
+    /// unhealthy.
+    #[test]
+    fn overview_services_counts_exclude_unconfigured_probes() {
+        fn fixture(id: &'static str, checked: bool, ok: bool) -> crate::health::ServiceHealth {
+            crate::health::ServiceHealth {
+                id,
+                name: id,
+                ok,
+                checked,
+                latency_ms: None,
+                version: None,
+                checked_at: "2026-08-27T04:00:10.075Z".to_owned(),
+                error: None,
+            }
+        }
+        let probes = vec![
+            fixture("clickhouse", true, true),
+            fixture("dagster", true, false),
+            fixture("trino", false, false),
+        ];
+        let v = summary_json(None, None, None, None, 0, 0, &probes);
+        assert_eq!(v["services"]["healthy"], 1);
+        assert_eq!(v["services"]["unhealthy"], 1);
+        assert_eq!(
+            v["services"]["degraded"], 0,
+            "no probe in this set ever reports degraded"
+        );
     }
 }
