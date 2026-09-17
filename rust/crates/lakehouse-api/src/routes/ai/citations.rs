@@ -327,7 +327,7 @@ fn find_triple_backtick(chars: &[char]) -> Option<usize> {
 /// `unit_from_suffix`) `extract_numbers` calls — so the matching GRAMMAR
 /// is not duplicated, only the code-span/whitespace scanning shell around
 /// it is. `extract_numbers` itself stays as the batch-oriented, directly
-/// testable reference implementation of that grammar (Task F1/F2's own
+/// testable reference implementation of that grammar (WS7 items F1/F2's own
 /// acceptance tests, `extraction_and_annotation` below, call it
 /// directly) — real production-reachable code, just not from
 /// `chat()`'s own call path today.
