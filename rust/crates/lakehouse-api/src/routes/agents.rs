@@ -1427,6 +1427,34 @@ mod tests {
         assert!(!matches!(body.decision.as_str(), "approved" | "rejected"));
     }
 
+    /// WS5 item D2: `decide_approval`'s existing `ai_audit::record` call
+    /// (`:483-494`) already writes `resource_kind: Some("approval")` paired
+    /// with the approval's own `id` — exactly the pairing WS1 T16's
+    /// `LEFT JOIN LATERAL` against `audit_event` needs to resolve a real
+    /// audit id on read. This is a confirmation test, not a red-then-green
+    /// one (stated honestly rather than inventing a failure this task
+    /// doesn't have): it pins the call site's literal arguments by
+    /// grepping the handler's own source, so a future edit to this call
+    /// that changes `resource_kind`/`resource_id` is caught here instead
+    /// of silently breaking the read-path join.
+    #[test]
+    fn decide_approval_audit_call_uses_the_pairing_t16s_join_expects() {
+        let source = include_str!("agents.rs");
+        let call_site = source
+            .split("ai_audit::record(")
+            .nth(1)
+            .and_then(|s| s.split(")\n    .await").next())
+            .expect("ai_audit::record call site not found");
+        assert!(
+            call_site.contains(r#"Some("approval")"#),
+            "resource_kind must stay \"approval\": {call_site}"
+        );
+        assert!(
+            call_site.contains("Some(&id)"),
+            "resource_id must stay the approval's own id: {call_site}"
+        );
+    }
+
     /// D (T3.2's fix): `create_employee` must validate `mode` the same way
     /// it already validates `autonomy` — an unrecognized value never
     /// reaches `agents::create_employee` to surface as a raw DB `CHECK`
