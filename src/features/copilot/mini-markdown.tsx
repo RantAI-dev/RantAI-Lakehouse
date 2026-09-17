@@ -1,38 +1,68 @@
 import * as React from "react";
+import { OMITTED_TABLE_TEXT, UNVERIFIED_NUMBER_LABEL, tokenizeInline } from "@/lib/citation-markers";
 
 /**
  * A minimal, dependency-free Markdown renderer for AI Copilot answers.
  * Supports: headings, GFM tables, lists (dash/star/number), bold, italic,
  * inline code. Enough for the model's concise output; not full CommonMark
  * (e.g. no blockquotes / nested lists).
+ *
+ * Also renders the two citation states the copilot backend's
+ * `annotate_answer` (WS7 item F6; `rust/crates/lakehouse-api/src/routes/ai/
+ * citations.rs`) can write into the answer text before it ever reaches
+ * this component: an unverified number wrapped in
+ * `<span data-unverified="true">…</span>`, and a whole table with zero
+ * verified cells replaced by the literal `[table omitted: not backed by a
+ * tool result]`. Both are matched as plain text by `tokenizeInline`
+ * (`src/lib/citation-markers.ts`) — this component never runs the answer
+ * through an HTML parser, so there is no sanitizer step that could strip
+ * either marker.
  */
 
 function renderInline(text: string, keyBase: string): React.ReactNode[] {
-  const nodes: React.ReactNode[] = [];
-  // Tokenize: **bold**, `code`, *italic*.
-  const re = /(\*\*[^*]+\*\*|`[^`]+`|\*[^*]+\*)/g;
-  let last = 0;
-  let m: RegExpExecArray | null;
-  let i = 0;
-  while ((m = re.exec(text))) {
-    if (m.index > last) nodes.push(text.slice(last, m.index));
-    const tok = m[0];
-    const key = `${keyBase}-${i++}`;
-    if (tok.startsWith("**")) {
-      nodes.push(<strong key={key}>{tok.slice(2, -2)}</strong>);
-    } else if (tok.startsWith("`")) {
-      nodes.push(
-        <code key={key} className="rounded bg-muted px-1 py-0.5 font-mono text-[0.85em]">
-          {tok.slice(1, -1)}
-        </code>,
-      );
-    } else {
-      nodes.push(<em key={key}>{tok.slice(1, -1)}</em>);
+  return tokenizeInline(text).map((tok, i) => {
+    const key = `${keyBase}-${i}`;
+    switch (tok.kind) {
+      case "text":
+        return tok.content;
+      case "bold":
+        return <strong key={key}>{tok.content}</strong>;
+      case "code":
+        return (
+          <code key={key} className="rounded bg-muted px-1 py-0.5 font-mono text-[0.85em]">
+            {tok.content}
+          </code>
+        );
+      case "italic":
+        return <em key={key}>{tok.content}</em>;
+      case "unverified":
+        // Legible, not decorative: the dashed underline alone would teach
+        // a reader to ignore it, so the title spells out WHY this number
+        // is marked (WS7 item F1's own wording — a fact about the check,
+        // never a claim the number is wrong).
+        return (
+          <span
+            key={key}
+            data-unverified="true"
+            className="underline decoration-dashed decoration-2 decoration-amber-500 underline-offset-2"
+            title={UNVERIFIED_NUMBER_LABEL}
+          >
+            {tok.content}
+          </span>
+        );
+      case "omitted-table":
+        // Reads as a deliberate product behaviour, not a crash: same
+        // inline styling as the rest of the answer's prose, no error
+        // chrome, and the exact literal the backend emits.
+        return (
+          <span key={key} className="italic text-muted-foreground">
+            {OMITTED_TABLE_TEXT}
+          </span>
+        );
+      default:
+        return null;
     }
-    last = m.index + tok.length;
-  }
-  if (last < text.length) nodes.push(text.slice(last));
-  return nodes;
+  });
 }
 
 function splitRow(line: string): string[] {
