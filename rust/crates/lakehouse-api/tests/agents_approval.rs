@@ -374,11 +374,15 @@ async fn access_decide_route_refuses_a_tool_call_kind_approval_with_404() {
 #[tokio::test]
 async fn agent_decide_route_refuses_an_access_kind_approval_with_404() {
     let TestApp { router, pool } = spin_up().await;
-    // andi@meridian.example: Analyst, holds catalog:read.
+    // sari@meridian.example: Analyst ONLY (0002_seed_identity.sql:84), so it
+    // holds catalog:read but NOT catalog:write. andi@meridian.example cannot be
+    // used here: the seed grants andi BOTH Data Engineer and Analyst (:82-83),
+    // and Data Engineer already holds catalog:write (:43), so the route
+    // correctly refuses the request as one the principal already satisfies.
     let approval_id = create_pending_access_request(
         &router,
         &pool,
-        "andi@meridian.example",
+        "sari@meridian.example",
         "cat-1",
         "catalog:write",
     )
@@ -406,14 +410,14 @@ async fn access_decide_route_401s_or_403s_a_principal_lacking_access_approve() {
     let approval_id = create_pending_access_request(
         &router,
         &pool,
-        "andi@meridian.example",
+        "sari@meridian.example",
         "cat-1",
         "catalog:write",
     )
     .await;
 
-    // andi@meridian.example: Analyst only, no access:approve.
-    let cookie = session_cookie_for_seeded_user(&pool, "andi@meridian.example").await;
+    // sari@meridian.example: Analyst only, no access:approve.
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
     let resp = post(
         &router,
         &format!("/api/catalog/access-requests/{approval_id}/decide"),
@@ -433,18 +437,23 @@ async fn access_decide_route_401s_or_403s_a_principal_lacking_access_approve() {
 #[tokio::test]
 async fn access_decide_route_refuses_a_principal_approving_their_own_access_request() {
     let TestApp { router, pool } = spin_up().await;
-    // fajar@meridian.example: Platform Admin (*:*) — holds BOTH
-    // catalog:read (to request) and access:approve (to decide).
+    // dewi@meridian.example: Governance Admin, which `0040` grants
+    // `access:approve` (so she could otherwise decide) and which does NOT
+    // hold `catalog:write` (so she can legitimately request it).
+    // fajar@meridian.example cannot be used here: Platform Admin is `*:*`,
+    // which matches every permission, so `access_request` correctly refuses
+    // the request itself as one the principal already satisfies — a
+    // wildcard holder can never file an access request at all.
     let approval_id = create_pending_access_request(
         &router,
         &pool,
-        "fajar@meridian.example",
+        "dewi@meridian.example",
         "cat-1",
-        "storage:restore",
+        "catalog:write",
     )
     .await;
 
-    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+    let cookie = session_cookie_for_seeded_user(&pool, "dewi@meridian.example").await;
     let resp = post(
         &router,
         &format!("/api/catalog/access-requests/{approval_id}/decide"),
@@ -465,7 +474,7 @@ async fn access_decide_route_allows_a_different_access_approve_holder_and_the_gr
     let approval_id = create_pending_access_request(
         &router,
         &pool,
-        "andi@meridian.example",
+        "sari@meridian.example",
         "cat-1",
         "catalog:write",
     )
@@ -473,10 +482,10 @@ async fn access_decide_route_allows_a_different_access_approve_holder_and_the_gr
 
     // BEFORE: andi does not hold catalog:write.
     let (requester_id,): (uuid::Uuid,) = sqlx::query_as("SELECT id FROM app_user WHERE email = $1")
-        .bind("andi@meridian.example")
+        .bind("sari@meridian.example")
         .fetch_one(&pool)
         .await
-        .expect("seeded user andi@meridian.example must exist");
+        .expect("seeded user sari@meridian.example must exist");
     let before = lakehouse_auth::repository::load_principal_for_user(
         &pool,
         requester_id,
