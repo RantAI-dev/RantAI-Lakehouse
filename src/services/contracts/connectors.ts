@@ -85,6 +85,87 @@ export type CreateConnectorInput = {
 export type Dial = Record<string, unknown>
 
 /**
+ * Per-adapter `dial` shapes, mirroring
+ * `rust/crates/lakehouse-store/src/ingest_spec.rs`'s five
+ * `#[serde(deny_unknown_fields, rename_all = "camelCase")]` structs
+ * field-for-field. Added alongside `src/features/connectors/dial-forms/`,
+ * whose components narrow the wire-level `Dial` blob above to exactly one
+ * of these before handing it back to their `onChange` — a form typed
+ * against `Dial` alone could not otherwise be checked against its own
+ * adapter's real fields.
+ */
+export type SqlDriver = "mysql" | "postgres" | "mssql"
+
+export type SqlDial = {
+  driver: SqlDriver
+  host: string
+  port: number
+  database: string
+  /** A literal username, never a `secretRef` — see `ingest_spec.rs`'s
+   * `SqlDial::user` doc comment. */
+  user: string
+  sslMode: string | null
+}
+
+/** `CdcDial` = `SqlDial`'s fields plus `slotName`/`publicationName`,
+ * both required with no fallback (`ingest_spec.rs`'s `CdcDial`). */
+export type CdcDial = {
+  driver: SqlDriver
+  host: string
+  port: number
+  database: string
+  user: string
+  slotName: string
+  publicationName: string
+  serverId: number | null
+}
+
+export type FilesProtocol = "s3" | "sftp"
+export type FilesFormat = "csv" | "json" | "parquet"
+
+export type FilesDial = {
+  protocol: FilesProtocol
+  endpoint: string | null
+  bucket: string
+  prefix: string | null
+  format: FilesFormat
+  region: string | null
+}
+
+/**
+ * Internally tagged on `type`, mirroring `RestAuth`
+ * (`#[serde(tag = "type")]`) exactly — the same four `type` values
+ * `RestAuth::type_tag` names.
+ */
+export type RestAuth =
+  | { type: "api_key"; header: string }
+  | { type: "bearer" }
+  | { type: "oauth2_client_credentials"; tokenUrl: string }
+  | { type: "basic" }
+
+export type RestPagination =
+  | { type: "none" }
+  | { type: "page"; param: string }
+  | { type: "cursor"; cursorField: string }
+
+export type RestEndpoint = {
+  path: string
+  recordsPath: string | null
+}
+
+export type RestDial = {
+  baseUrl: string
+  auth: RestAuth
+  pagination: RestPagination
+  endpoints: RestEndpoint[]
+}
+
+export type SheetsDial = {
+  spreadsheetId: string
+  ranges: string[]
+}
+
+/**
  * One object (table, endpoint, sheet range) an ingest job targets.
  * Mirrors `SourceObject` in
  * `rust/crates/lakehouse-store/src/ingest_spec.rs` (`#[serde(deny_unknown_fields,
