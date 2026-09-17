@@ -648,7 +648,7 @@ pub async fn logs(
             StatusCode::OK,
             ApiJson(json!({
                 "supported": false,
-                "reason": "use GET /api/pipelines/{id}/runs/{runId}/logs (WS4's own scoped run-logs route, gated pipeline:read)"
+                "reason": "the scoped run-logs route (GET /api/pipelines/{id}/runs/{runId}/logs, gated pipeline:read) is planned but not yet implemented on this branch"
             })),
         )
             .into_response(),
@@ -1176,5 +1176,38 @@ mod tests {
             .expect("mocked ClickHouse call must succeed");
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0]["message"], "boom");
+    }
+
+    /// WS5 item G1 (P5 review fix) -- `service=dagster` must tell the
+    /// caller the scoped run-logs route is planned, never point them at
+    /// `GET /api/pipelines/{id}/runs/{runId}/logs` as if it already
+    /// existed: that route has no `run_logs` handler and no
+    /// `POLICY_TABLE` entry on this branch (confirmed against
+    /// `routes/pipelines.rs` and `policy.rs`), so the earlier wording
+    /// sent a caller straight at a 404.
+    #[tokio::test]
+    async fn logs_dagster_reports_the_scoped_route_as_planned_not_available() {
+        let cfg = crate::config::Config::from_map(&std::collections::HashMap::new()).unwrap();
+        let state = AppState::new(cfg);
+        let response = logs(
+            State(state),
+            Query(LogsQuery {
+                service: Some("dagster".to_owned()),
+                tail: None,
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["supported"], false);
+        assert_eq!(
+            body["reason"],
+            "the scoped run-logs route (GET /api/pipelines/{id}/runs/{runId}/logs, gated \
+             pipeline:read) is planned but not yet implemented on this branch"
+        );
     }
 }
