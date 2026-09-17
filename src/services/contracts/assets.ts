@@ -114,8 +114,77 @@ export type CatalogNamespace = {
   sourceEngine: string
 }
 
+/** `POST /api/catalog/{id}/access-request`'s body (WS7 item E2). */
+export type RequestAccessInput = {
+  permission: string
+  reason: string
+}
+
+/**
+ * Mirrors `lakehouse_store::agents::AccessGrant` — what an APPROVED
+ * access request actually grants: one permission token, bounded by an
+ * expiry.
+ */
+export type AccessGrant = {
+  id: string
+  approvalId: string
+  userId: string
+  permission: string
+  grantedAt: string
+  expiresAt: string
+}
+
+/**
+ * `POST /api/catalog/access-requests/{id}/decide`'s response (WS7 item
+ * E3). `grant` is present only for `status === "approved"` — a rejection
+ * grants nothing (`lakehouse_store::agents::decide_access_request`
+ * returns `Ok(None)` for `Decision::Rejected`).
+ */
+export type DecideAccessRequestResult = {
+  status: "approved" | "rejected"
+  grant?: AccessGrant
+}
+
 export interface AssetService {
   listAssets(filter: AssetFilter, signal?: AbortSignal): Promise<Asset[]>
   getAsset(id: string, signal?: AbortSignal): Promise<AssetDetail>
   listNamespaces(signal?: AbortSignal): Promise<CatalogNamespace[]>
+  /**
+   * `POST /api/catalog/{id}/access-request` — ask for a permission not
+   * already held on this catalog entry. `400`s server-side
+   * (`routes::catalog::access_request`) if the caller already holds
+   * `input.permission`, so the caller must only ever offer permissions
+   * `hasPermission` has already excluded (see `requestableAccessPermissions`
+   * in `@/lib/access-requests`).
+   *
+   * Optional (unlike this interface's other three methods) because
+   * `src/services/mock/assets.ts` — a dead in-browser fixture this task
+   * must not touch (see that file's own "dead fixture" comment
+   * elsewhere in this module) — implements only the original three;
+   * making this required would break that file's `: AssetService`
+   * annotation for a fixture nothing wires up (`services/index.ts` never
+   * assigns `assetService = mockAssetService`, only `clickhouseAssetService`
+   * does). The real (ClickHouse-backed) client always implements it.
+   */
+  requestAccess?(
+    catalogId: string,
+    input: RequestAccessInput,
+    signal?: AbortSignal
+  ): Promise<void>
+  /**
+   * `POST /api/catalog/access-requests/{id}/decide` — a DEDICATED route
+   * (N1 of the WS7 plan review): never reuses `agentService.decideApproval`,
+   * which only ever decides a `kind = "tool_call"` approval. Refuses with
+   * `403` (surfaced as a `ServiceError` with code `"permission_denied"`)
+   * when the deciding principal is the same person who requested this
+   * access (`routes::catalog::decide_access_request`, WS7 item E3).
+   *
+   * Optional for the same reason as `requestAccess` above.
+   */
+  decideAccessRequest?(
+    approvalId: string,
+    decision: "approved" | "rejected",
+    comment: string | undefined,
+    signal?: AbortSignal
+  ): Promise<DecideAccessRequestResult>
 }

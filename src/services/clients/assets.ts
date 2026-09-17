@@ -4,9 +4,26 @@ import type {
   AssetDetail,
   AssetFilter,
   CatalogNamespace,
+  DecideAccessRequestResult,
+  RequestAccessInput,
 } from "../contracts/assets";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
+
+/**
+ * Maps an HTTP status to the `ServiceError` code pages branch on. Mirrors
+ * `postgresAgentService`'s own `errorFor` (`clients/agents.ts`) — `403`
+ * becomes `"permission_denied"` so a self-approval refusal
+ * (`routes::catalog::decide_access_request`, WS7 item E3) surfaces the
+ * backend's own message rather than the generic `"unavailable"` this
+ * file's other methods fell back to before this task.
+ */
+function errorFor(status: number, message: string): ServiceError {
+  if (status === 404) return new ServiceError("not_found", message);
+  if (status === 400 || status === 409) return new ServiceError("invalid_request", message);
+  if (status === 401 || status === 403) return new ServiceError("permission_denied", message);
+  return new ServiceError("unavailable", message);
+}
 
 /**
  * AssetService is real — the data catalog from the lakehouse (bronze_meta +
@@ -49,5 +66,29 @@ export const clickhouseAssetService: AssetService = {
   },
   async listNamespaces(signal) {
     return (await loadCatalog(undefined, signal)).namespaces;
+  },
+  async requestAccess(catalogId, input: RequestAccessInput, signal) {
+    const res = await apiFetch(`/api/catalog/${encodeURIComponent(catalogId)}/access-request`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+      signal,
+    });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to request access");
+  },
+  async decideAccessRequest(approvalId, decision, comment, signal) {
+    const res = await apiFetch(
+      `/api/catalog/access-requests/${encodeURIComponent(approvalId)}/decide`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ decision, comment }),
+        signal,
+      }
+    );
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to decide access request");
+    return json as DecideAccessRequestResult;
   },
 };

@@ -108,6 +108,25 @@ export type ApprovalItem = {
   decidedAt?: string
   comment?: string
   auditEventId?: string
+  /**
+   * `"tool_call" | "access"` (WS7 item E1, `0040_access_requests.sql`).
+   * An access request (WS7 item E2) reads `permission` out of `action`
+   * itself — the backend always writes `action = "access:<permission>"`
+   * for a `kind = "access"` row (`lakehouse_store::agents::
+   * create_access_request`) — never a separate field.
+   */
+  kind: "tool_call" | "access"
+  /**
+   * The human who requested this approval — set only for `kind =
+   * "access"`, `undefined` for `kind = "tool_call"` (a digital employee
+   * acted; no single human requester exists). Used to disable the decide
+   * button for the requester's own pending request — see
+   * `isOwnAccessRequest` in `@/lib/access-requests`. The server-side
+   * refusal (`routes::catalog::decide_access_request`, WS7 item E3) is
+   * what actually enforces self-approval refusal; this is belt-and-
+   * suspenders only.
+   */
+  requestedByUserId?: string
 }
 
 export type DecideApprovalInput = {
