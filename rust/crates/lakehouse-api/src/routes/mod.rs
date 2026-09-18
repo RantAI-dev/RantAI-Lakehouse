@@ -62,10 +62,15 @@ fn auth_router() -> Router<AppState> {
         // comment and its `crate::policy::POLICY_TABLE` entry).
         .route("/api/auth/oidc/callback", get(auth::oidc_callback))
         // WS8 plan Task A6: unauthenticated by necessity — the login page
-        // calls this before any session exists to decide whether to render
-        // an SSO button. See `auth::providers`'s own doc comment and its
+        // calls this before any session exists to decide whether to render an
+        // SSO button. See `auth::providers`'s own doc comment and its
         // `crate::policy::POLICY_TABLE` entry.
         .route("/api/auth/providers", get(auth::providers))
+        // WS8 plan §Phase D: list the caller's own browser sessions (or
+        // every live session, for an `identity:sessions:manage` holder).
+        // `Policy::RequiresAuth` floor; the own-vs-all split lives inside
+        // the handler — see `auth::sessions` and `auth::SessionsDecision`.
+        .route("/api/auth/sessions", get(auth::sessions))
 }
 
 /// Default per-request timeout, used for every route whose TypeScript

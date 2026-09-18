@@ -157,6 +157,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/auth/logout",                  Policy::RequiresAuth),
     ("GET",  "/api/auth/me",                      Policy::RequiresAuth),
     ("POST", "/api/auth/change-password",         Policy::RequiresAuth),
+    // WS8 plan §Phase D: route-level `Policy::RequiresAuth` is coarse —
+    // every authenticated caller may list their own sessions. The
+    // `identity:sessions:manage` split (own vs. every live session in
+    // the deployment) lives in `routes::auth::sessions` itself, per the
+    // plan's "Hard Requirement 4" phrasing ("lists only the caller's own
+    // sessions unless..."); see `routes::auth::SessionsDecision`.
+    ("GET",  "/api/auth/sessions",                Policy::RequiresAuth),
 
     // ── Catalog: seeded Analyst permission `catalog:read`. ───────────────
     ("GET", "/api/catalog",       Policy::RequiresPermission("catalog:read")),

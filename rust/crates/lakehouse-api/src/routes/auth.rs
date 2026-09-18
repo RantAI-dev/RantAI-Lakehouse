@@ -30,13 +30,17 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
-use lakehouse_auth::{Authenticator, Credential, PrincipalId, Secret, password, session};
+use lakehouse_auth::{
+    Authenticator, Credential, Principal, PrincipalId, Secret, password, session,
+};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::identity;
+use lakehouse_store::sessions::SessionRow;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use time::Duration;
+use uuid::Uuid;
 
 use crate::auth::{AuthenticatedPrincipal, SESSION_COOKIE_NAME, session_cookie_from_headers};
 use crate::error::{ApiRejection, ApiResult};
@@ -257,6 +261,83 @@ pub async fn me(
             .collect(),
     };
     Ok((StatusCode::OK, ApiJson(body)).into_response())
+}
+
+/// What `GET /api/auth/sessions` should return for `principal`. The
+/// handler dispatches on this rather than threading two booleans through
+/// the SQL, so the service-principal branch ("a service identity has no
+/// `app_user_id` of its own to filter by") is a single match arm and a
+/// single unit-test target — rather than a second conditional in the
+/// query path that an integration test would only catch by accident.
+///
+/// Admin-vs-own is decided by `principal.has("identity:sessions:manage")`,
+/// per WS8 plan §Phase D Hard Requirement 4's own phrasing ("lists only
+/// the caller's own sessions unless..."): the route-level policy is
+/// `Policy::RequiresAuth` (every authenticated caller can hit it), and
+/// the fine-grained check lives in the handler so the same permission
+/// string covers any future endpoint that needs the same split without
+/// re-adding a row to `POLICY_TABLE`.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionsDecision {
+    /// A service principal has no `app_user.id` of its own to enumerate —
+    /// including when it holds `identity:sessions:manage`; the admin pass
+    /// is "every `app_user.id`", and a service identity has nothing of
+    /// that kind. Returning `Empty` here is the same "service principals
+    /// never enumerate" posture every other handler in this file keeps.
+    Empty,
+    /// Caller's own sessions only — the default.
+    Own(Uuid),
+    /// Every live session — the `identity:sessions:manage` permission
+    /// flips the `is_admin` argument on
+    /// [`lakehouse_store::sessions::list_sessions_for_caller`].
+    All(Uuid),
+}
+
+fn sessions_decision_for(principal: &Principal) -> SessionsDecision {
+    match principal.id {
+        PrincipalId::Service(_) => SessionsDecision::Empty,
+        PrincipalId::User(user_id) if principal.has("identity:sessions:manage") => {
+            SessionsDecision::All(user_id)
+        }
+        PrincipalId::User(user_id) => SessionsDecision::Own(user_id),
+    }
+}
+
+/// `GET /api/auth/sessions` — list the caller's own live browser sessions,
+/// or every live session in the deployment if the caller holds
+/// `identity:sessions:manage`. Route-level policy is `Policy::RequiresAuth`
+/// (every authenticated caller may hit this — the admin-vs-own split lives
+/// here in the handler, see [`SessionsDecision`]).
+///
+/// # A documented gap
+///
+/// `created_ip` and `user_agent` are returned as `null` for every session
+/// minted today: both [`login`] and [`oidc_callback`] call
+/// `session::create_session(..., None, None)`. The columns themselves are
+/// `TEXT NULL` (`0019_auth.sql`), so the listing reflects that honestly
+/// rather than inventing an IP or UA — see
+/// `lakehouse_store::sessions::SessionRow`'s own doc comment.
+///
+/// # Errors
+///
+/// Returns 503 [`ApiError::Unavailable`] when no Postgres pool is
+/// configured (mirroring [`pool`]'s idiom), or a classified
+/// [`lakehouse_store::StoreError`] on any storage failure.
+pub async fn sessions(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+) -> ApiResult<ApiJson<Vec<SessionRow>>> {
+    let pool = pool(&state)?;
+    let rows = match sessions_decision_for(&principal) {
+        SessionsDecision::Empty => Vec::new(),
+        SessionsDecision::Own(user_id) => {
+            lakehouse_store::sessions::list_sessions_for_caller(pool, user_id, false).await?
+        }
+        SessionsDecision::All(user_id) => {
+            lakehouse_store::sessions::list_sessions_for_caller(pool, user_id, true).await?
+        }
+    };
+    Ok(ApiJson(rows))
 }
 
 /// `{ oldPassword?, newPassword }` — `POST /api/auth/change-password` body.
@@ -1309,5 +1390,85 @@ mod tests {
         let without_oidc = AppState::new(Config::from_map(&HashMap::new()).unwrap());
         let body = get_json(&without_oidc, "/api/auth/providers").await;
         assert_eq!(body["oidc"], serde_json::json!(false));
+    }
+
+    // ── WS8 plan §Phase D, the `GET /api/auth/sessions` routing shape ──────
+
+    /// A service principal — even one that nominally holds
+    /// `identity:sessions:manage` — must yield [`SessionsDecision::Empty`]
+    /// from [`sessions_decision_for`]. A service identity has no
+    /// `app_user_id` of its own to filter by, and the admin path is
+    /// "every `app_user_id`", so flipping `is_admin = true` for a service
+    /// principal would hand it every session in the deployment — exactly
+    /// the enumeration a service caller has no business performing. This
+    /// pins down that the service-principal short-circuit happens BEFORE
+    /// the permission check, not after.
+    #[test]
+    fn sessions_decision_is_empty_for_every_service_principal() {
+        use lakehouse_auth::PermissionSet;
+
+        let admin_service = Principal {
+            id: PrincipalId::Service(Uuid::new_v4()),
+            tenant_ids: Vec::new(),
+            display_name: "service-with-admin".to_owned(),
+            permissions: PermissionSet::parse("identity:sessions:manage"),
+            provider: "service".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
+        assert_eq!(
+            sessions_decision_for(&admin_service),
+            SessionsDecision::Empty,
+            "a service principal must not enumerate, even with admin permission"
+        );
+
+        let plain_service = Principal {
+            id: PrincipalId::Service(Uuid::new_v4()),
+            tenant_ids: Vec::new(),
+            display_name: "service-without-admin".to_owned(),
+            permissions: PermissionSet::default(),
+            provider: "service".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
+        assert_eq!(
+            sessions_decision_for(&plain_service),
+            SessionsDecision::Empty,
+            "a service principal without the admin permission must also yield empty"
+        );
+    }
+
+    /// The two human branches of [`sessions_decision_for`]: a user without
+    /// `identity:sessions:manage` sees only their own sessions, and a user
+    /// with it sees every session. The `Uuid` is preserved across the
+    /// match so the SQL can keep using a stable, caller-bound id rather
+    /// than re-deriving one.
+    #[test]
+    fn sessions_decision_for_a_user_principal_flips_on_identity_sessions_manage() {
+        use lakehouse_auth::PermissionSet;
+
+        let user_id = Uuid::new_v4();
+        let plain_user = Principal {
+            id: PrincipalId::User(user_id),
+            tenant_ids: Vec::new(),
+            display_name: "plain-user".to_owned(),
+            permissions: PermissionSet::default(),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
+        assert_eq!(
+            sessions_decision_for(&plain_user),
+            SessionsDecision::Own(user_id),
+        );
+
+        let admin_user = Principal {
+            permissions: PermissionSet::parse("identity:sessions:manage"),
+            ..plain_user
+        };
+        assert_eq!(
+            sessions_decision_for(&admin_user),
+            SessionsDecision::All(user_id),
+        );
     }
 }
