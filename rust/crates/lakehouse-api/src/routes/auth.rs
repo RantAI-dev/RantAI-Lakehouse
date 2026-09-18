@@ -39,7 +39,7 @@ use sha2::Digest as _;
 use time::Duration;
 
 use crate::auth::{AuthenticatedPrincipal, SESSION_COOKIE_NAME, session_cookie_from_headers};
-use crate::error::ApiResult;
+use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::state::AppState;
 
@@ -521,6 +521,278 @@ pub async fn oidc_start(
     Ok(response)
 }
 
+/// `GET /api/auth/oidc/callback?code=&state=` query parameters. Both
+/// `Option` — a missing one is a 401 (see [`oidc_callback`]), not a 400:
+/// an `IdP` calling back with neither is indistinguishable from a bare
+/// probe/replay of this URL, and the existing flow-cookie-driven 401 path
+/// already covers it without a second error shape.
+#[derive(Debug, Deserialize)]
+pub struct OidcCallbackQuery {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+}
+
+/// The one field this handler reads from the token endpoint's response.
+/// Deliberately not `#[serde(deny_unknown_fields)]`: an `IdP` is free to
+/// also return `access_token`/`refresh_token`/`expires_in`/etc, none of
+/// which this authorization-code + PKCE *login* flow (as opposed to a
+/// resource-server bearer-token flow) has any use for — only the id token
+/// is verified and turned into a session.
+#[derive(Debug, Deserialize)]
+struct TokenResponse {
+    id_token: String,
+}
+
+/// `GET /api/auth/oidc/callback?code=&state=` — the second half of the
+/// login flow [`oidc_start`] began: exchange the authorization code for an
+/// id token, verify it (signature, `iss`, `aud`, `exp`/`nbf`, algorithm
+/// allowlist, and the `nonce` bound to this flow — all via
+/// [`lakehouse_auth::OidcAuthenticator::authenticate_with_nonce`], Task
+/// A3; none of that is reimplemented here), mint a brand-new session
+/// (never reusing or upgrading any session the caller's browser might
+/// already be carrying — that would be session fixation), and redirect to
+/// the flow cookie's `next`.
+///
+/// The flow cookie is read exactly once, at the top of this function, and
+/// cleared (`Max-Age=0`) in EVERY response this handler returns, success
+/// or failure — a second request replaying the same query string always
+/// then fails at the missing-cookie check below, which is what makes the
+/// whole exchange single-use regardless of how the first attempt turned
+/// out.
+///
+/// # Errors
+///
+/// Returns 401 on a missing/undecodable/unparseable flow cookie, a
+/// missing `code`/`state`, a `state` mismatch (compared in constant time
+/// via [`lakehouse_auth::Secret::constant_time_eq`] — never `==`, which
+/// would leak how many leading bytes matched through response timing), a
+/// token-exchange HTTP failure, or a verification failure from
+/// [`lakehouse_auth::OidcAuthenticator::authenticate_with_nonce`]. Every
+/// one of those renders the same generic 401 body: per AGENTS.md
+/// principle 4 ("upstream error text never reaches a response"), this
+/// handler never puts the `IdP`'s own error body, or which specific check
+/// failed, into anything sent back to the browser — only a `tracing::warn!`
+/// line records which branch fired, and even that carries no token/secret
+/// value. Returns 503 if OIDC or its token endpoint is not configured, or
+/// no Postgres pool is configured.
+pub async fn oidc_callback(
+    State(state): State<AppState>,
+    Query(query): Query<OidcCallbackQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Response> {
+    // Built once and reused by every branch below (see the doc comment
+    // above on why the cookie must be cleared unconditionally) rather than
+    // being repeated at each return site, which could drift.
+    let clear_cookie = || oidc_flow_cookie_header(state.config.is_dev, None);
+    let unauthorized_and_clear = |mut resp: Response| {
+        resp.headers_mut()
+            .append(header::SET_COOKIE, clear_cookie());
+        resp
+    };
+    let unauthorized =
+        || unauthorized_and_clear(ApiRejection(ApiError::unauthorized()).into_response());
+    let unavailable =
+        |msg: &str| ApiRejection(ApiError::Unavailable(msg.to_owned())).into_response();
+    let unavailable_and_clear = |msg: &str| unauthorized_and_clear(unavailable(msg));
+
+    // Deployment-configuration presence is checked BEFORE the flow cookie
+    // is ever read — same order [`oidc_start`] already uses for the same
+    // three settings (`auth.oidc`/token URL/redirect URI/client ID) plus
+    // this handler's own `OIDC_TOKEN_URL`. This is a "is OIDC configured
+    // on this deployment at all" question, independent of any particular
+    // caller's cookie, so it fails closed to 503 (not 401) exactly like
+    // [`oidc_start`] does when asked the same question — a 503 here is not
+    // a "no credentials presented" 401/403 for [`crate::policy::POLICY_TABLE`]'s
+    // `Policy::Public` purposes, and nothing has been read from `headers`
+    // yet, so there is no cookie to clear on this path.
+    let Some(auth) = state.auth.as_ref().and_then(|a| a.oidc.as_ref()) else {
+        return Ok(unavailable("OIDC is not configured on this deployment"));
+    };
+    let (Some(token_url), Some(redirect_uri)) = (
+        state.config.oidc_token_url.as_deref(),
+        state.config.oidc_redirect_uri.as_deref(),
+    ) else {
+        return Ok(unavailable(
+            "OIDC_TOKEN_URL/OIDC_REDIRECT_URI are not configured",
+        ));
+    };
+    // `AuthState::oidc` is `Some` only when `OIDC_ISSUER`/`OIDC_CLIENT_ID`
+    // are both set (`state::oidc_config`), the same invariant `oidc_start`
+    // relies on for `client_id` (see its P3 fix comment) — reading it the
+    // same fail-closed way here, rather than sending an empty
+    // `client_id` to the token endpoint.
+    let Some(client_id) = state.config.oidc_client_id.as_deref() else {
+        return Ok(unavailable("OIDC_CLIENT_ID is not configured"));
+    };
+
+    // From here on, every failure is a caller-supplied-value problem (bad
+    // cookie, bad state, failed exchange, failed verification), so it
+    // fails closed to 401 with the flow cookie cleared — see this
+    // function's doc comment.
+    let Some(flow) = decode_flow_cookie(&headers) else {
+        return Ok(unauthorized());
+    };
+
+    let (Some(code), Some(returned_state)) = (query.code, query.state) else {
+        tracing::warn!("oidc callback: missing code or state");
+        return Ok(unauthorized());
+    };
+    // Constant-time: `state` is the CSRF token binding this response to
+    // the request `oidc_start` issued, and a variable-time `==` would leak
+    // how many leading characters matched through response timing — the
+    // exact defect this task exists to close.
+    let state_matches =
+        Secret::new(returned_state).constant_time_eq(&Secret::new(flow.state.clone()));
+    if !state_matches {
+        tracing::warn!("oidc callback: state mismatch");
+        return Ok(unauthorized());
+    }
+
+    let Some(id_token) = exchange_code_for_id_token(
+        &state,
+        token_url,
+        redirect_uri,
+        client_id,
+        &code,
+        &flow.code_verifier,
+    )
+    .await
+    else {
+        return Ok(unauthorized());
+    };
+
+    let Ok(principal) = auth
+        .authenticate_with_nonce(&Secret::new(id_token), &flow.nonce)
+        .await
+    else {
+        tracing::warn!("oidc callback: id token verification failed");
+        return Ok(unauthorized());
+    };
+    let PrincipalId::User(user_id) = principal.id else {
+        // `authenticate_with_nonce` only ever resolves a
+        // `PrincipalId::User` (`resolve_principal` loads through
+        // `app_user`) — this branch exists so the match stays exhaustive,
+        // not because it is reachable in practice (same shape as
+        // [`login`]'s identical branch).
+        tracing::warn!("oidc callback: resolved principal was not a user");
+        return Ok(unauthorized());
+    };
+    let Some(pool) = state.pg.as_deref() else {
+        return Ok(unavailable_and_clear(
+            "authentication unavailable: no Postgres pool is configured (set DATABASE_URL)",
+        ));
+    };
+
+    // A fresh session — never an upgrade of any session the caller's
+    // browser might already be carrying — closes the session-fixation gap
+    // this task exists to close (see this function's doc comment). The
+    // same `session::create_session` call [`login`] already uses, not a
+    // parallel implementation.
+    let token =
+        session::create_session(pool, user_id, session::DEFAULT_SESSION_TTL, None, None).await?;
+
+    let mut response = (StatusCode::FOUND, ()).into_response();
+    response.headers_mut().insert(
+        header::LOCATION,
+        // `flow.next` was already validated by `is_safe_relative_path`
+        // inside `oidc_start` before it was ever written to the cookie
+        // (see `OidcFlow`'s doc comment) — never re-derived from this
+        // request, so there is nothing left to re-validate here. The
+        // fallback exists only for the type-level possibility that a
+        // valid relative path is somehow not a valid header value, not
+        // because a value that already passed `is_safe_relative_path` is
+        // expected to fail this.
+        HeaderValue::from_str(&flow.next).unwrap_or_else(|_| HeaderValue::from_static("/")),
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        session_cookie_header(
+            state.config.is_dev,
+            token.expose(),
+            session::DEFAULT_SESSION_TTL,
+        ),
+    );
+    response
+        .headers_mut()
+        .append(header::SET_COOKIE, clear_cookie());
+    Ok(response)
+}
+
+/// Read, base64url-decode, and JSON-parse the `lh_oidc_flow` cookie out of
+/// `headers`, folding all three failure modes (no cookie, bad base64, bad
+/// JSON) into one `None` — every caller treats them identically (401, per
+/// [`oidc_callback`]'s doc comment), so there is no reason to distinguish
+/// them past a `tracing::warn!` line naming which one fired.
+fn decode_flow_cookie(headers: &HeaderMap) -> Option<OidcFlow> {
+    let raw_cookie = oidc_flow_cookie(headers)?;
+    let Ok(flow_json) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&raw_cookie) else {
+        tracing::warn!("oidc callback: flow cookie was not valid base64url");
+        return None;
+    };
+    let Ok(flow) = serde_json::from_slice::<OidcFlow>(&flow_json) else {
+        tracing::warn!("oidc callback: flow cookie did not decode to a valid flow");
+        return None;
+    };
+    Some(flow)
+}
+
+/// POST the authorization code (and PKCE `code_verifier`) to `token_url`
+/// and return the `id_token` from a successful response, or `None` on any
+/// failure — a non-2xx status, a network error, or a response body that
+/// isn't `{"id_token": "..."}`. Never surfaces the `IdP`'s own status/body
+/// to the caller or into anything but a `tracing::warn!` line (AGENTS.md
+/// principle 4; see [`oidc_callback`]'s `# Errors` doc comment).
+async fn exchange_code_for_id_token(
+    state: &AppState,
+    token_url: &str,
+    redirect_uri: &str,
+    client_id: &str,
+    code: &str,
+    code_verifier: &str,
+) -> Option<String> {
+    let http = reqwest::Client::new();
+    let mut form = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", code_verifier),
+        ("client_id", client_id),
+    ];
+    if let Some(secret) = state.config.oidc_client_secret.as_deref() {
+        form.push(("client_secret", secret));
+    }
+    let token_response = http
+        .post(token_url)
+        .form(&form)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status);
+    let Ok(token_response) = token_response else {
+        tracing::warn!("oidc callback: token exchange request failed");
+        return None;
+    };
+    let Ok(TokenResponse { id_token }) = token_response.json::<TokenResponse>().await else {
+        tracing::warn!("oidc callback: token endpoint response was not the expected shape");
+        return None;
+    };
+    Some(id_token)
+}
+
+/// Read the `lh_oidc_flow` cookie's raw (still base64url-encoded) value
+/// out of the request's `Cookie` header, or `None` if it is absent —
+/// mirrors `crate::auth::session_cookie_from_headers`'s parsing shape for
+/// the session cookie, but is local to this module since `OIDC_FLOW_COOKIE_NAME`
+/// is private to it.
+fn oidc_flow_cookie(headers: &HeaderMap) -> Option<String> {
+    let header = headers.get(header::COOKIE)?.to_str().ok()?;
+    header.split(';').find_map(|pair| {
+        let (name, value) = pair.trim().split_once('=')?;
+        (name == OIDC_FLOW_COOKIE_NAME).then(|| value.to_owned())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -703,5 +975,269 @@ mod tests {
         for good in ["/", "/dashboards", "/dashboards/main?tab=history"] {
             assert!(is_safe_relative_path(good), "{good:?} must be accepted");
         }
+    }
+
+    // ── Task A5: `GET /api/auth/oidc/callback` — Step 1 (failing tests,
+    // written before `oidc_callback` exists at all). ──────────────────────
+
+    #[tokio::test]
+    async fn oidc_callback_rejects_a_state_mismatch_and_clears_the_flow_cookie() {
+        let state = state_with_oidc_flow_config();
+        let app = crate::routes::router(state);
+        let cookie = oidc_flow_cookie_header(
+            true,
+            Some(&OidcFlow {
+                state: "state-from-start".to_owned(),
+                nonce: "nonce-1".to_owned(),
+                code_verifier: "verifier-1".to_owned(),
+                next: "/dashboards".to_owned(),
+            }),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/oidc/callback?code=abc&state=state-does-not-match")
+                    .header(header::COOKIE, cookie.to_str().unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let cleared = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cleared.contains("Max-Age=0"));
+    }
+
+    #[tokio::test]
+    async fn oidc_callback_rejects_a_missing_flow_cookie() {
+        let state = state_with_oidc_flow_config();
+        let app = crate::routes::router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/auth/oidc/callback?code=abc&state=whatever")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ── The one wiremock-backed round trip: matching state/nonce all the
+    // way through a real (mock) token exchange and id-token verification.
+    // This is the one test in this repository, short of a live compose
+    // stack, that exercises `oidc_callback`'s token-exchange HTTP call end
+    // to end — Phase F's `g2`/Phase A's `g4` extension cover the real
+    // thing against `ops/oidc-mock`. ──────────────────────────────────────
+
+    fn b64url(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// A freshly generated RSA keypair plus the JWK describing its public
+    /// half — local to this module rather than reused from
+    /// `lakehouse-auth/tests/oidc.rs`, since that harness lives in a
+    /// different crate's integration-test binary and isn't a library this
+    /// crate can depend on.
+    struct TestKey {
+        kid: String,
+        encoding_key: jsonwebtoken::EncodingKey,
+        jwk: jsonwebtoken::jwk::Jwk,
+    }
+
+    impl TestKey {
+        fn generate(kid: &str) -> Self {
+            use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding};
+            use rsa::traits::PublicKeyParts;
+
+            let mut rng = rand::thread_rng();
+            let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("keygen");
+            let public_key = private_key.to_public_key();
+            let pem = private_key.to_pkcs1_pem(LineEnding::LF).expect("pkcs1 pem");
+            let encoding_key =
+                jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).expect("encoding key");
+
+            let jwk = jsonwebtoken::jwk::Jwk {
+                common: jsonwebtoken::jwk::CommonParameters {
+                    key_id: Some(kid.to_owned()),
+                    ..Default::default()
+                },
+                algorithm: jsonwebtoken::jwk::AlgorithmParameters::RSA(
+                    jsonwebtoken::jwk::RSAKeyParameters {
+                        key_type: jsonwebtoken::jwk::RSAKeyType::RSA,
+                        n: b64url(&public_key.n().to_bytes_be()),
+                        e: b64url(&public_key.e().to_bytes_be()),
+                    },
+                ),
+            };
+
+            Self {
+                kid: kid.to_owned(),
+                encoding_key,
+                jwk,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct IdTokenClaims<'a> {
+        sub: &'a str,
+        iss: &'a str,
+        aud: &'a str,
+        exp: i64,
+        nonce: &'a str,
+    }
+
+    fn sign_id_token(claims: &IdTokenClaims<'_>, key: &TestKey) -> String {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some(key.kid.clone());
+        jsonwebtoken::encode(&header, claims, &key.encoding_key).expect("sign")
+    }
+
+    async fn mount_jwks(server: &wiremock::MockServer, key: &TestKey) {
+        let set = jsonwebtoken::jwk::JwkSet {
+            keys: vec![key.jwk.clone()],
+        };
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/.well-known/jwks.json"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&set))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_token_endpoint(server: &wiremock::MockServer, id_token: &str) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/token"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "id_token": id_token })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// Same idiom `routes::pipelines::tests::database_url_for` uses: read
+    /// the real connection info `#[sqlx::test]` set up for `pool` back out
+    /// as a `DATABASE_URL` string, since `Config`/`AppState::new` only
+    /// know how to take a URL, not an already-open pool.
+    fn database_url_for(pool: &sqlx::PgPool) -> String {
+        let options = pool.connect_options();
+        format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database")
+        )
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn oidc_callback_with_a_matching_state_and_nonce_creates_a_session_and_redirects(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let server = wiremock::MockServer::start().await;
+        let key = TestKey::generate("kid-1");
+        mount_jwks(&server, &key).await;
+
+        let issuer = server.uri();
+        let client_id = "lakehouse-console";
+        let flow = OidcFlow {
+            state: "state-from-start".to_owned(),
+            nonce: "nonce-from-start".to_owned(),
+            code_verifier: "verifier-1".to_owned(),
+            next: "/dashboards".to_owned(),
+        };
+
+        let id_token = sign_id_token(
+            &IdTokenClaims {
+                sub: "user-a5-round-trip",
+                iss: &issuer,
+                aud: client_id,
+                // 32-bit-safe: this repository's test process clock is
+                // always well under `i32::MAX` seconds past the epoch.
+                exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                nonce: &flow.nonce,
+            },
+            &key,
+        );
+        mount_token_endpoint(&server, &id_token).await;
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("OIDC_ISSUER".to_owned(), issuer.clone());
+        env.insert("OIDC_CLIENT_ID".to_owned(), client_id.to_owned());
+        env.insert(
+            "OIDC_AUTHORIZE_URL".to_owned(),
+            format!("{issuer}/authorize"),
+        );
+        env.insert("OIDC_TOKEN_URL".to_owned(), format!("{issuer}/token"));
+        env.insert(
+            "OIDC_REDIRECT_URI".to_owned(),
+            "https://lake.invalid/api/auth/oidc/callback".to_owned(),
+        );
+        // Off by default (see `oidc_callback`'s doc comment on the plan's
+        // "JIT provisioning stays off by default" note) — turned on here
+        // because this test's whole point is a *successful* round trip for
+        // a `sub` this deployment has never seen before, which is exactly
+        // what JIT provisioning exists for.
+        env.insert("OIDC_JIT_PROVISIONING".to_owned(), "true".to_owned());
+        let config = Config::from_map(&env).expect("a valid test Config");
+        let state = AppState::new(config);
+        let app = crate::routes::router(state);
+
+        let cookie = oidc_flow_cookie_header(true, Some(&flow));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/auth/oidc/callback?code=auth-code-1&state={}",
+                        flow.state
+                    ))
+                    .header(header::COOKIE, cookie.to_str().unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/dashboards"
+        );
+        let set_cookies: Vec<&str> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        // Both the new session cookie AND the flow cookie's clear must be
+        // present — the flow cookie is single-use even on success (see
+        // `oidc_callback`'s doc comment).
+        assert!(
+            set_cookies
+                .iter()
+                .any(|c| c.starts_with(&format!("{SESSION_COOKIE_NAME}="))
+                    && !c.contains("Max-Age=0")),
+            "expected a fresh, non-empty session cookie: {set_cookies:?}"
+        );
+        assert!(
+            set_cookies
+                .iter()
+                .any(|c| c.starts_with(&format!("{OIDC_FLOW_COOKIE_NAME}="))
+                    && c.contains("Max-Age=0")),
+            "expected the flow cookie to be cleared even on success: {set_cookies:?}"
+        );
+        Ok(())
     }
 }

@@ -56,6 +56,11 @@ fn auth_router() -> Router<AppState> {
         // `auth::oidc_start`'s own doc comment and its
         // `crate::policy::POLICY_TABLE` entry.
         .route("/api/auth/oidc/start", get(auth::oidc_start))
+        // WS8 plan Task A5: unauthenticated by necessity — the caller has
+        // no session yet at this point in the flow. Fails closed to 401 on
+        // every verification gap (see `auth::oidc_callback`'s own doc
+        // comment and its `crate::policy::POLICY_TABLE` entry).
+        .route("/api/auth/oidc/callback", get(auth::oidc_callback))
 }
 
 /// Default per-request timeout, used for every route whose TypeScript

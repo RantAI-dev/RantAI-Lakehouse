@@ -135,6 +135,17 @@ tokio = { workspace = true, features = ["test-util"] }
 # actually resolve to a file outside a real base directory to prove
 # anything, not a string containing those characters) — a real `TempDir`
 # per test, auto-removed on drop, never a fixed shared path.
+# `routes::auth`'s Task A5 round-trip test signs a real id token to prove
+# `oidc_callback` calls `OidcAuthenticator::authenticate_with_nonce` (WS8
+# plan Task A3) against a `wiremock` `/jwks` + `/token` pair, the same
+# harness shape `lakehouse-auth/tests/oidc.rs` already uses for that
+# authenticator directly — `jsonwebtoken` is already a workspace
+# dependency (root `Cargo.toml`); `rsa` is not (it is a direct dependency
+# of `lakehouse-auth` only), so it is added here directly too, pinned to
+# the same "0.9" `lakehouse-auth/Cargo.toml` already uses.
+jsonwebtoken = { workspace = true }
+rsa = "0.9"
+
 tempfile = { workspace = true }
 
 [lints]

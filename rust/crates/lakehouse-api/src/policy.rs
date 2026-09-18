@@ -126,7 +126,9 @@ pub enum Policy {
 /// this table never needs to know about path-parameter values.
 #[rustfmt::skip]
 pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
-    // ── Public: the ONLY four routes in the whole service. ──────────────
+    // ── Public: the ONLY six routes in the whole service. (Was "four" —
+    // corrected here, in the same commit that adds the sixth, since Task
+    // A4's `/api/auth/oidc/start` had already made the old count stale.) ──
     ("GET",  "/health",                          Policy::Public),
     ("POST", "/api/embed/data",                   Policy::Public),
     ("GET",  "/api/public/dashboard/{token}",     Policy::Public),
@@ -135,6 +137,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // 302s to a fixed, config-sourced IdP URL and sets a single-use flow
     // cookie. Mirrors `/api/auth/login`'s existing `Policy::Public`.
     ("GET",  "/api/auth/oidc/start",              Policy::Public),
+    // WS8 plan Task A5: unauthenticated by necessity — the caller has no
+    // session at this point in the login flow. Every verification gap
+    // (missing/expired flow cookie, `state` mismatch, failed token
+    // exchange, failed id-token verification) fails closed to 401 inside
+    // the handler itself; this route grants nothing on its own, same as
+    // `/api/auth/oidc/start` above.
+    ("GET",  "/api/auth/oidc/callback",           Policy::Public),
 
     // ── Auth domain (this task) ──────────────────────────────────────────
     ("POST", "/api/auth/logout",                  Policy::RequiresAuth),
