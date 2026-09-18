@@ -426,6 +426,61 @@ pub async fn delete_role(pool: &PgPool, id: &str) -> Result<(), StoreError> {
 
 // ── Tenant ──────────────────────────────────────────────────────────────
 
+/// Slim subset of [`Tenant`] (just `id`, `name`, `slug`) used only by
+/// `GET /api/auth/me` to render a caller's own tenant memberships, never a
+/// general tenant-listing endpoint (that is [`Tenant`], unchanged). Lives
+/// here rather than in `routes/auth.rs` because [`list_tenants_by_ids`]
+/// returns it: a tuple of three bare columns would force every caller to
+/// re-shape the rows into the same `{id, name, slug}` triple, and the only
+/// such caller (`routes::auth::me`) is the one place that wants this exact
+/// shape — so the store gives back the typed value directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenantSummary {
+    /// `tenant.id`, rendered as a string.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// URL-safe identifier.
+    pub slug: String,
+}
+
+/// Load `{id, name, slug}` for exactly `tenant_ids`, in no particular
+/// order. Short-circuits to `Ok(Vec::new())` on an empty input, so a caller
+/// that already knows it has nothing to look up never pays a round trip —
+/// `routes::auth::me` relies on this to keep its service-principal /
+/// `tenant_ids.is_empty()` paths at zero queries.
+///
+/// Used only by `GET /api/auth/me` to render the caller's own tenant
+/// memberships; the general tenant-listing endpoint is [`list_tenants`],
+/// unchanged.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails (including Postgres
+/// being unreachable).
+pub async fn list_tenants_by_ids(
+    pool: &PgPool,
+    tenant_ids: &[Uuid],
+) -> Result<Vec<TenantSummary>, StoreError> {
+    if tenant_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(Uuid, String, String)> =
+        sqlx::query_as("SELECT id, name, slug FROM tenant WHERE id = ANY($1)")
+            .bind(tenant_ids)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, name, slug)| TenantSummary {
+            id: id.to_string(),
+            name,
+            slug,
+        })
+        .collect())
+}
+
 /// A customer workspace. Mirrors `Tenant` in `contracts/identity.ts`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -923,3 +923,52 @@ fn every_registered_route_has_a_policy_entry() {
          will 500 on every call to them: {missing:?}"
     );
 }
+
+/// `GET /api/auth/me` returns each membership as `{id, name, slug}` — not
+/// the bare `Vec<String>` of UUID strings the previous shape used, so a
+/// tenant-switcher has something to render. `sari@meridian.example` is
+/// seeded into exactly one tenant (`meridian-retail`,
+/// `0002_seed_identity.sql`), so the assertion is exact: one structured
+/// entry, every field a string.
+#[tokio::test]
+async fn me_response_returns_structured_tenants_not_bare_uuid_strings() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let resp = request_with_cookie(&router, "GET", "/api/auth/me", &cookie).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON body");
+    let tenants = body["tenants"]
+        .as_array()
+        .expect("`tenants` is an array (not the legacy bare-uuid array)");
+    assert_eq!(
+        tenants.len(),
+        1,
+        "sari@meridian.example is seeded into exactly one tenant (0002_seed_identity.sql)"
+    );
+    let entry = &tenants[0];
+    assert!(
+        entry["id"].is_string(),
+        "tenant[0].id must be a string (not a bare-UUID string), got {:?}",
+        entry["id"]
+    );
+    assert!(
+        entry["name"].is_string(),
+        "tenant[0].name must be a string, got {:?}",
+        entry["name"]
+    );
+    assert!(
+        entry["slug"].is_string(),
+        "tenant[0].slug must be a string, got {:?}",
+        entry["slug"]
+    );
+    assert_eq!(
+        entry["slug"].as_str(),
+        Some("meridian-retail"),
+        "sari's only seeded tenant is meridian-retail (0002_seed_identity.sql)"
+    );
+}

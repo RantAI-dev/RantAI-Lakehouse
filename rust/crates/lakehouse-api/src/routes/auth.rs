@@ -210,7 +210,13 @@ struct MeResponse {
     /// Every granted `"resource:action"` permission token (see
     /// [`lakehouse_auth::PermissionSet::as_strings`]).
     permissions: Vec<String>,
-    tenants: Vec<String>,
+    /// Structured `{id, name, slug}` view of every tenant the caller
+    /// belongs to — slim subset of `lakehouse_store::identity::Tenant`,
+    /// just enough for a tenant-switcher to render a label without
+    /// re-fetching the row (WS8 §Phase F). Empty for a service principal
+    /// (no `tenant_ids`) or when the follow-up read fails — same
+    /// fail-soft posture as `email`/`roles` above.
+    tenants: Vec<identity::TenantSummary>,
 }
 
 /// `GET /api/auth/me` — the authenticated caller's own identity, shaped
@@ -249,17 +255,28 @@ pub async fn me(
         PrincipalId::Service(_) => (None, Vec::new()),
     };
 
+    // Follow-up read so a caller of `GET /api/auth/me` gets each tenant's
+    // `name` and `slug` alongside its id — a tenant-switcher renders the
+    // label, so a bare-UUID-string array would not be enough. Same
+    // fail-soft posture as `email`/`roles` above (degrade to empty on
+    // failure), and `list_tenants_by_ids` short-circuits internally when
+    // `principal.tenant_ids` is empty — so a service principal, which has
+    // no `tenant_ids` at all (`lakehouse_auth::service_token` initializes
+    // it to `Vec::new()`), costs zero queries on this branch.
+    let tenants = match state.pg.as_deref() {
+        Some(pool) => identity::list_tenants_by_ids(pool, &principal.tenant_ids)
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+
     let body = MeResponse {
         id: principal.id.uuid().to_string(),
         name: principal.display_name,
         email,
         roles,
         permissions: principal.permissions.as_strings(),
-        tenants: principal
-            .tenant_ids
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
+        tenants,
     };
     Ok((StatusCode::OK, ApiJson(body)).into_response())
 }

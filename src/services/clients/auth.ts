@@ -15,7 +15,12 @@ export type AuthUser = {
   email: string | null;
   roles: string[];
   permissions: string[];
-  tenants: string[];
+  // Slim {id, name, slug} view of every tenant the caller belongs to —
+  // matches `lakehouse_store::identity::TenantSummary` exactly, so a
+  // tenant-switcher can render a label without a second round trip.
+  // Empty for a service principal or when the follow-up read fails (WS8
+  // §Phase F).
+  tenants: { id: string; name: string; slug: string }[];
 };
 
 /** Mirrors `LoginResponse`. */
