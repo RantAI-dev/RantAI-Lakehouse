@@ -88,22 +88,50 @@ function AssetLink({ id, label }: { id?: string; label: string }) {
  * `check_commit`) both surface through `source.status === "error"` with
  * the SERVER's own message — never a client-fabricated string that would
  * hide which of the two real reasons applies.
+ *
+ * Ops with no `sourceRef` are left out of the picker entirely, and a
+ * pipeline where NO op declares one says so instead of offering a choice
+ * that cannot resolve: `GET /api/pipelines/{id}/source` matches its `op=`
+ * against the op's `sourceRef`, so an op whose code location publishes no
+ * provenance metadata has nothing to look up.
  */
 function SourceTab({ pipelineId, ops }: { pipelineId: string; ops: PipelineOpNode[] }) {
-  const [selectedOp, setSelectedOp] = React.useState(ops[0]?.name ?? "")
+  const withSource = ops.filter((op) => op.sourceRef !== null)
+  if (withSource.length === 0) {
+    return (
+      <EmptyState
+        title="No source provenance"
+        description="No op in this pipeline declares where its code lives, so there is nothing to show. A code location publishes this as op metadata (source_ref/commit)."
+      />
+    )
+  }
+  return <SourceViewer pipelineId={pipelineId} ops={withSource} />
+}
+
+/**
+ * The picker itself, split out so [`SourceTab`]'s "nothing declares
+ * provenance" branch can return before any hook runs — and so the
+ * selected value is the op's `sourceRef` (what the route matches on),
+ * while the label stays the op NAME the reader recognises from the graph.
+ * Sending the name instead was why every op answered "source provenance
+ * is unavailable for this build": no op's `sourceRef` equals its name, so
+ * the lookup found no op at all and `check_commit` saw `None`.
+ */
+function SourceViewer({ pipelineId, ops }: { pipelineId: string; ops: PipelineOpNode[] }) {
+  const [selectedRef, setSelectedRef] = React.useState(ops[0]?.sourceRef ?? "")
   const source = useService(
-    (s) => pipelineService.getPipelineSource(pipelineId, selectedOp, s),
-    [pipelineId, selectedOp]
+    (s) => pipelineService.getPipelineSource(pipelineId, selectedRef, s),
+    [pipelineId, selectedRef]
   )
   return (
     <div className="flex flex-col gap-3">
       <select
         className="h-8 w-64 rounded-lg border border-input bg-transparent px-2.5 text-sm"
-        value={selectedOp}
-        onChange={(e) => setSelectedOp(e.target.value)}
+        value={selectedRef}
+        onChange={(e) => setSelectedRef(e.target.value)}
       >
         {ops.map((op) => (
-          <option key={op.name} value={op.name}>
+          <option key={op.name} value={op.sourceRef ?? ""}>
             {op.name}
           </option>
         ))}
@@ -112,7 +140,14 @@ function SourceTab({ pipelineId, ops }: { pipelineId: string; ops: PipelineOpNod
       {source.status === "error" ? (
         <ErrorState error={source.error} onRetry={source.reload} />
       ) : null}
-      {source.status === "success" ? <CodeView text={source.data.text} /> : null}
+      {source.status === "success" ? (
+        <div className="flex flex-col gap-2">
+          <p className="text-xs text-muted-foreground">
+            {source.data.sourceRef} · commit {source.data.commit.slice(0, 12)}
+          </p>
+          <CodeView text={source.data.text} />
+        </div>
+      ) : null}
     </div>
   )
 }
