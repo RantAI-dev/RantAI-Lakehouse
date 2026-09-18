@@ -24,6 +24,19 @@ lakehouse-embed = { path = "../lakehouse-embed" }
 lakehouse-llm = { path = "../lakehouse-llm" }
 lakehouse-store = { path = "../lakehouse-store" }
 lakehouse-auth = { path = "../lakehouse-auth" }
+# `routes::auth::oidc_start` (WS8 plan Task A4): PKCE's `code_challenge`
+# is `BASE64URL(SHA256(code_verifier))` (RFC 7636 §4.2) and the `lh_oidc_flow`
+# cookie's payload is base64url-encoded JSON — both need these directly,
+# not routed through `lakehouse-auth::token` (whose hashing is SHA-256 of a
+# bearer token for storage, a different job).
+sha2 = { workspace = true }
+base64 = { workspace = true }
+# Builds the IdP authorize-endpoint redirect URL with `Url::query_pairs_mut`
+# rather than hand-formatting a query string — see the workspace `Cargo.toml`
+# entry's comment on why this needed adding (the plan's claim that `url`
+# was already a direct dependency here did not hold against this branch's
+# actual `Cargo.toml`).
+url = { workspace = true }
 # `routes::alerts::ApiFreshnessSource`/`ApiSilenceSource` (WS5 item C1)
 # implement `lakehouse_alerts::FreshnessSource`/`SilenceSource`, both
 # `#[async_trait::async_trait]` at their definition site -- any impl

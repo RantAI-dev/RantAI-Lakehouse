@@ -2342,6 +2342,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "croner",
  "iceberg",
@@ -2363,6 +2364,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "sqlparser",
  "sqlx",
  "tempfile",
@@ -2375,6 +2377,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "wiremock",
 ]

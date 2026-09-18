@@ -131,6 +131,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/embed/data",                   Policy::Public),
     ("GET",  "/api/public/dashboard/{token}",     Policy::Public),
     ("POST", "/api/auth/login",                   Policy::Public),
+    // WS8 plan Task A4: redirect-only, grants nothing — it only ever
+    // 302s to a fixed, config-sourced IdP URL and sets a single-use flow
+    // cookie. Mirrors `/api/auth/login`'s existing `Policy::Public`.
+    ("GET",  "/api/auth/oidc/start",              Policy::Public),
 
     // ── Auth domain (this task) ──────────────────────────────────────────
     ("POST", "/api/auth/logout",                  Policy::RequiresAuth),

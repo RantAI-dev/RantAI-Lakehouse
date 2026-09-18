@@ -52,6 +52,10 @@ fn auth_router() -> Router<AppState> {
             "/api/auth/change-password",
             axum::routing::post(auth::change_password),
         )
+        // WS8 plan Task A4: unauthenticated by design — see
+        // `auth::oidc_start`'s own doc comment and its
+        // `crate::policy::POLICY_TABLE` entry.
+        .route("/api/auth/oidc/start", get(auth::oidc_start))
 }
 
 /// Default per-request timeout, used for every route whose TypeScript

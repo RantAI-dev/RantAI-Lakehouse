@@ -60,3 +60,13 @@ pub use repository::PgPool;
 pub use secret::Secret;
 pub use service_token::ServiceTokenAuthenticator;
 pub use session::SessionAuthenticator;
+// `token` itself stays private (`hash_token` is an internal storage detail
+// of `session`/`service_token`, not something a caller outside this crate
+// should ever need) — but `generate_opaque_token` is this crate's ONE
+// CSPRNG primitive, and WS8 plan Task A4 needs it in `lakehouse-api` for
+// the OIDC `state`/`nonce`/PKCE `code_verifier` triple, specifically so
+// that route never reaches for an ad-hoc `rand` call of its own (grep for
+// the existing helper before writing one — AGENTS.md rule 4). Re-exporting
+// just this one function, rather than making `token` `pub mod`, keeps
+// `hash_token` out of the public surface.
+pub use token::generate_opaque_token;
