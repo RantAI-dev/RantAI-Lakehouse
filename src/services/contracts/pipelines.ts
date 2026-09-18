@@ -93,7 +93,13 @@ export type PipelineDetail = Pipeline & {
   config: { key: string; value: string }[]
   /** Non-null only for an authored (`pl-`) pipeline. */
   definition: AuthoredDefinition | null
-  runs: PipelineRun[]
+  /**
+   * NOT part of `GET /api/pipelines/{id}`. `routes::pipelines::detail`
+   * (WS4 item C1) returns no `runs` field -- runs have their own route,
+   * `GET /api/pipelines/{id}/runs`, reached through `listRuns`. Declaring
+   * it here made every detail page crash on `state.data.runs[0]`.
+   */
+  runs?: PipelineRun[]
 }
 
 /** `GET /api/pipelines/{id}/source?op=` response — one op's read-only source text. */

@@ -357,6 +357,18 @@ export function PipelineDetailPage() {
     (s) => pipelineService.getPipeline(pipelineId, s),
     [pipelineId]
   )
+  // Runs come from `GET /api/pipelines/{id}/runs`, NOT from the detail
+  // payload: `routes::pipelines::detail` (WS4 item C1) returns id/name/
+  // graph/config/definition and no `runs` field at all. Reading
+  // `state.data.runs[0]` crashed every detail page with "Cannot read
+  // properties of undefined (reading '0')" -- the contract declared a field
+  // the route never sends, and a hand-written contract type cannot catch
+  // that at compile time.
+  const runsState = useService(
+    (s) => pipelineService.listRuns(pipelineId, s),
+    [pipelineId]
+  )
+  const runs = runsState.status === "success" ? runsState.data : []
   const [selectedRun, setSelectedRun] = React.useState<PipelineRun | null>(null)
   const [pauseOpen, setPauseOpen] = React.useState(false)
   const runAction = useServiceAction((signal, id: string) =>
@@ -375,7 +387,7 @@ export function PipelineDetailPage() {
   // Latest run's real step statuses color the graph tab's nodes — `runs`
   // is returned most-recent-first (`list_runs_for_job`/`run_to_json`
   // ordering, unchanged by WS4).
-  const latestRun = state.status === "success" ? state.data.runs[0] : undefined
+  const latestRun = runs[0]
   const stepsState = useService(
     (s) => (latestRun ? pipelineService.getRunSteps(pipelineId, latestRun.id, s) : Promise.resolve([])),
     [pipelineId, latestRun?.id]
@@ -541,7 +553,7 @@ export function PipelineDetailPage() {
           )}
         </TabsContent>
         <TabsContent value="runs" className="mt-3">
-          {p.runs.length === 0 ? (
+          {runs.length === 0 ? (
             <EmptyState
               title="No runs yet"
               description="Runs appear here once the pipeline executes."
@@ -549,7 +561,7 @@ export function PipelineDetailPage() {
           ) : (
             <DataTable
               columns={runColumns}
-              rows={p.runs}
+              rows={runs}
               rowKey={(r) => r.id}
               onRowClick={setSelectedRun}
             />
