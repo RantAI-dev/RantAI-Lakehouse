@@ -254,7 +254,7 @@ listed here because you need them to run the console at all:
 | Variable | Purpose | Default | Required? |
 | --- | --- | --- | --- |
 | `RUST_API_URL` | Target the Next.js `/api/*` rewrite proxies to (`next.config.ts`) | unset (rewrite disabled — no backend reachable) | Yes, to reach the Rust backend at all |
-| `NEXT_PUBLIC_SSO_ENABLED` | **Deprecated, superseded by `GET /api/auth/providers`.** Was: build-time flag that shows/hides SSO login UI. Left documented because a running deployment's compose env may still set it harmlessly; Next.js stops reading it once that route lands | unset (SSO UI hidden) | No — see "SSO configuration is split across two processes" below |
+| `NEXT_PUBLIC_SSO_ENABLED` | Build-time flag that shows/hides the SSO login UI | unset (SSO UI hidden) | No — see "SSO configuration is split across two processes" below |
 
 See `rust/crates/lakehouse-auth/README.md` for detailed, per-provider OIDC
 setup instructions (Okta, Entra, Google, Keycloak).

@@ -1,8 +1,12 @@
 """Unit tests for oidc-mock's authorization-code + PKCE addition (WS8 plan
-Phase A). No network: imports server.py's functions directly and drives
-them with an in-process http.client-shaped fake, matching this repo's
-existing convention of testing stdlib http.server handlers by calling
-their do_GET/do_POST directly (see ops/gold_export's test style)."""
+Phase A).
+
+No network, per AGENTS.md's Python rules: these import `server.py` and call
+`mint_authorization_code`/`exchange_authorization_code` directly, which is
+where the flow's real decisions live (PKCE comparison, redirect_uri binding,
+single use, expiry). The HTTP handlers around them are thin parameter
+plumbing, and the round trip over real sockets is covered by the g4 gate
+against the running container, not here."""
 from __future__ import annotations
 
 import base64
