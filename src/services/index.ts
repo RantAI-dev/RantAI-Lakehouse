@@ -16,6 +16,7 @@ import { clickhouseAlertRuleService } from "./clients/alerts"
 import { icebergLakehouseService } from "./clients/lakehouse"
 import { goldService as goldClientService } from "./clients/gold"
 import { notificationsService as notificationsClientService } from "./clients/notifications"
+import * as authClient from "./clients/auth"
 
 // Overview is now fully real — summary/activity from ClickHouse+Dagster,
 // alerts (list/ack/resolve) from Postgres (Task 2.6). mock/overview.ts
@@ -68,3 +69,11 @@ export const goldService = goldClientService
 // Postgres, honest `supported: false` when no pool is configured. No mock
 // ever existed for this domain.
 export const notificationsService = notificationsClientService
+// SSO admin page (WS8 §Phase F) reads the live OIDC configuration
+// off the API process. Only `providers` is registered — the other auth
+// methods (login/logout/me/change-password) stay imported directly by
+// `AuthProvider` and the login/change-password pages; see
+// `services/clients/auth.ts`'s module doc comment for why the split.
+export const authService = {
+  providers: authClient.providers,
+}

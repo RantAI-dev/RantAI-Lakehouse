@@ -3,9 +3,16 @@ import { ServiceError } from "../errors";
 
 /**
  * Auth client — wraps `/api/auth/*` (Task 3.2 backend, Task 3.3 frontend).
- * Not a `services/index.ts` domain (no mock counterpart makes sense for
- * authentication), so it is imported directly by `AuthProvider` and the
- * login/change-password pages rather than registered in the swap table.
+ * The login/logout/me/change-password methods are NOT a `services/index.ts`
+ * domain (no mock counterpart makes sense for authentication), so they are
+ * imported directly by `AuthProvider` and the login/change-password pages
+ * rather than registered in the swap table.
+ *
+ * `providers` IS registered — the SSO admin page reads it via
+ * `authService.providers`, and the page has no other way to ask "is OIDC
+ * configured on this deployment" (`routes/auth.rs:731`). It is the only
+ * auth method that fits the read-only, page-shaped pattern the rest of the
+ * service registry follows. See WS8 §Phase F.
  */
 
 /** Mirrors `MeResponse` from `rust/crates/lakehouse-api/src/routes/auth.rs`. */
@@ -77,4 +84,29 @@ export async function changePassword(input: {
     body: JSON.stringify(input),
   });
   await parse<unknown>(res, "Failed to change password.");
+}
+
+/**
+ * Mirrors `ProvidersResponse` from `routes/auth.rs:706-711` — the
+ * `camelCase` rename is enforced by the Rust struct's
+ * `#[serde(rename_all = "camelCase")]`, so the wire shape is
+ * `{ oidc: boolean; providerName: string | null }`. `providerName` is
+ * `null` when `oidc` is `false` (the route never sets one without the
+ * other), so consumers can treat `oidc === false` as the not-configured
+ * signal and ignore `providerName` in that branch.
+ */
+export type ProvidersResponse = {
+  oidc: boolean;
+  providerName: string | null;
+};
+
+/**
+ * `GET /api/auth/providers` (WS8 §Phase A). The OIDC runtime flag
+ * is read off the API process's in-memory `AuthState`/`Config`, so the
+ * SSO admin page (WS8 §Phase F) can never drift from the
+ * backend's real state the way a build-time flag could.
+ */
+export async function providers(signal?: AbortSignal): Promise<ProvidersResponse> {
+  const res = await apiFetch("/api/auth/providers", { signal });
+  return parse<ProvidersResponse>(res, "Failed to load SSO providers.");
 }
