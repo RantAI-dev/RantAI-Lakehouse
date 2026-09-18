@@ -243,6 +243,9 @@ guessed.
 | `OIDC_ROLE_MAP` | `"group1=Role One,group2=Role Two"` — maps an IdP group/role claim to a local role name | empty | No |
 | `OIDC_GROUPS_CLAIM` | Which token claim carries the caller's groups/roles | `groups` | No |
 | `OIDC_CLOCK_SKEW_SECONDS` | Clock-skew tolerance for `exp`/`nbf` validation. Invalid values fall back to the default | `60` | No |
+| `OIDC_AUTHORIZE_URL` | Authorization endpoint of the OIDC provider, for the browser-redirect login flow. Read ONLY from this var, never from a request | unset (browser SSO login stays off) | No |
+| `OIDC_TOKEN_URL` | Token endpoint of the OIDC provider, used to exchange an authorization code for tokens. Read ONLY from this var, never from a request | unset (browser SSO login stays off) | No |
+| `OIDC_REDIRECT_URI` | This deployment's fixed callback URL, registered with the OIDC provider ahead of time. Read ONLY from this var, never from a request, so a caller can never redirect a login or override the callback URL | unset (browser SSO login stays off) | No |
 | `DATABASE_URL` | Postgres connection string for Phase 2 OLTP storage | `postgres://lakehouse:lakehouse@localhost:5432/lakehouse` | No (but a wrong/unreachable value means every Phase 2 route returns 503 — see below) |
 
 Two additional variables live outside `config.rs`, on the frontend side —
@@ -251,7 +254,7 @@ listed here because you need them to run the console at all:
 | Variable | Purpose | Default | Required? |
 | --- | --- | --- | --- |
 | `RUST_API_URL` | Target the Next.js `/api/*` rewrite proxies to (`next.config.ts`) | unset (rewrite disabled — no backend reachable) | Yes, to reach the Rust backend at all |
-| `NEXT_PUBLIC_SSO_ENABLED` | Build-time flag that shows/hides SSO login UI | unset (SSO UI hidden) | No — see "SSO configuration is split across two processes" below |
+| `NEXT_PUBLIC_SSO_ENABLED` | **Deprecated, superseded by `GET /api/auth/providers`.** Was: build-time flag that shows/hides SSO login UI. Left documented because a running deployment's compose env may still set it harmlessly; Next.js stops reading it once that route lands | unset (SSO UI hidden) | No — see "SSO configuration is split across two processes" below |
 
 See `rust/crates/lakehouse-auth/README.md` for detailed, per-provider OIDC
 setup instructions (Okta, Entra, Google, Keycloak).
