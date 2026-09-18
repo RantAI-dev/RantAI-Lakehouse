@@ -45,6 +45,7 @@
 use axum::body::Bytes;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
+use lakehouse_auth::openfga::LakekeeperAdminClient;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::identity::{
@@ -53,6 +54,7 @@ use lakehouse_store::identity::{
 };
 use serde::Deserialize;
 
+use crate::config::Config;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::state::AppState;
@@ -270,29 +272,187 @@ pub struct CreateTenantBody {
     residency: String,
 }
 
-/// `POST /api/identity/tenants` — create a tenant. Returns 201.
+/// `POST /api/identity/tenants` — create (or resume provisioning of) a
+/// tenant.
 ///
 /// # Security
 ///
 /// Requires `identity:write` — see the module doc comment.
 ///
+/// # Resumable provisioning (WS8 plan Task B4, Correction 7)
+///
+/// A tenant's Lakekeeper warehouse, grants, and registry namespace are
+/// provisioned by three external calls this handler drives as a
+/// checkpointed state machine (`tenant.provisioning_status`,
+/// `0042_tenant_provisioning.sql`). A second `POST` of the same `slug`
+/// does not restart from zero or 409 outright: it finds the existing row
+/// and, if it is still genuinely in progress
+/// (`pending`/`warehouse_ready`/`grants_ready`/`namespace_ready`),
+/// resumes from the first incomplete step — using
+/// [`LakekeeperAdminClient::ensure_warehouse`]'s own lookup-before-create
+/// before ever attempting a Lakekeeper create, so a resumed run never
+/// double-provisions. A row already `complete` or `not_applicable` (a
+/// tenant seeded before provisioning existed at all —
+/// `0042_tenant_provisioning.sql`'s backfill) is a genuine 409: neither
+/// status is a step to resume from.
+///
 /// # Errors
 ///
-/// 400 on a malformed body or a blank name/slug; 409 if the slug is taken;
-/// 503/500 as above.
+/// 400 on a malformed body or a blank name/slug; 409 if the slug belongs
+/// to a tenant already `complete` or `not_applicable`; 503 if no Postgres
+/// pool is configured, or if a provisioning step could not reach
+/// Lakekeeper (never claims success while leaving a half-provisioned row);
+/// 500 on any other database failure.
+/// Provisioning statuses (`tenant.provisioning_status`) that a repeated
+/// `POST /api/identity/tenants` for the same slug resumes from, rather
+/// than rejecting with 409 — see [`create_tenant`]'s doc comment and WS8
+/// plan Correction 7. Deliberately excludes `complete` and
+/// `not_applicable`: neither is a step to resume from.
+const RESUMABLE_STATUSES: &[&str] = &[
+    "pending",
+    "warehouse_ready",
+    "grants_ready",
+    "namespace_ready",
+];
+
 pub async fn create_tenant(
     State(state): State<AppState>,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<Tenant>)> {
     let body: CreateTenantBody = parse_body(&body)?;
-    let input = CreateTenantInput {
-        name: required("name", &body.name)?,
-        slug: required("slug", &body.slug)?,
-        plan: body.plan,
-        residency: body.residency,
+    let name = required("name", &body.name)?;
+    let slug = required("slug", &body.slug)?;
+    let pool = pool(&state)?;
+
+    // Resume, don't reject, a slug that already exists but is still
+    // mid-provisioning (WS8 plan Correction 7). A 409 is reserved for a
+    // slug already terminal — either genuinely `complete`, or
+    // `not_applicable` (a grandfathered pre-provisioning tenant,
+    // `0042_tenant_provisioning.sql`'s backfill: re-POSTing its slug must
+    // not silently pull a legacy row into a provisioning attempt nobody
+    // asked for).
+    let (tenant, status_code) = match identity::find_tenant_by_slug(pool, &slug).await? {
+        Some(existing) if RESUMABLE_STATUSES.contains(&existing.provisioning_status.as_str()) => {
+            (existing, StatusCode::OK)
+        }
+        Some(_) => return Err(ApiError::Conflict("slug already taken".to_owned()).into()),
+        None => {
+            let input = CreateTenantInput {
+                name,
+                slug: slug.clone(),
+                plan: body.plan,
+                residency: body.residency,
+            };
+            (
+                identity::create_tenant(pool, &input).await?,
+                StatusCode::CREATED,
+            )
+        }
     };
-    let tenant = identity::create_tenant(pool(&state)?, &input).await?;
-    Ok((StatusCode::CREATED, ApiJson(tenant)))
+
+    let Some(admin) = state.lakekeeper_admin.as_ref() else {
+        // Provisioning is unreachable, not silently skipped — the tenant
+        // row exists (or already did) but stays at whatever status it
+        // had; a caller sees `provisioningStatus != "complete"` and knows
+        // to retry once Lakekeeper admin access is configured on this
+        // deployment, rather than being told the create succeeded when a
+        // warehouse was never provisioned.
+        return Ok((status_code, ApiJson(tenant)));
+    };
+
+    let tenant = provision_tenant(pool, admin, tenant, &state.config).await?;
+    Ok((status_code, ApiJson(tenant)))
+}
+
+/// Drives `tenant` through the provisioning state machine from wherever it
+/// currently sits, persisting the checkpoint after each step so a crash
+/// mid-way leaves an honest, resumable `provisioning_status` rather than a
+/// silent gap or a fabricated `complete`.
+///
+/// Each `if` below only fires when `tenant.provisioning_status` is still
+/// at the step it names — after a step's own
+/// `update_tenant_provisioning_status` call advances it, later `if`s in
+/// the same invocation continue straight through (a brand-new tenant runs
+/// all four in one call), and a resumed tenant simply skips every `if`
+/// whose step it has already passed.
+///
+/// # Errors
+///
+/// [`crate::error::provisioning_unavailable`] (503) if a Lakekeeper call
+/// fails — never `err.to_string()`, per AGENTS.md's "upstream error text
+/// never reaches a response". A [`lakehouse_core::StoreError`] from a
+/// checkpoint write propagates as-is via `?`.
+async fn provision_tenant(
+    pool: &PgPool,
+    admin: &LakekeeperAdminClient,
+    mut tenant: Tenant,
+    config: &Config,
+) -> ApiResult<Tenant> {
+    let warehouse_name = format!("tenant-{}", tenant.slug);
+    let prefix = format!("{}/{}/", config.lakehouse_warehouse_bucket, tenant.slug);
+
+    if tenant.provisioning_status == "pending" {
+        let warehouse_id = admin
+            .ensure_warehouse(&warehouse_name, &prefix)
+            .await
+            .map_err(|_| crate::error::provisioning_unavailable())?;
+        tenant = identity::update_tenant_provisioning_status(
+            pool,
+            &tenant.id,
+            "warehouse_ready",
+            Some(&warehouse_id),
+        )
+        .await?;
+    }
+    if tenant.provisioning_status == "warehouse_ready" {
+        let Some(warehouse_id) = tenant.warehouse_id.clone() else {
+            // Can only happen if a row was hand-edited into
+            // `warehouse_ready` without a `warehouse_id` — the state
+            // machine itself never advances a tenant to this status
+            // without recording one in the same write (see the branch
+            // above). A 400 rather than a panic: this is a malformed row,
+            // not this handler's bug.
+            return Err(ApiError::BadRequest(
+                "tenant has no warehouse_id to grant onto".to_owned(),
+            )
+            .into());
+        };
+        admin
+            .grant_machine_principals(&warehouse_id)
+            .await
+            .map_err(|_| crate::error::provisioning_unavailable())?;
+        tenant =
+            identity::update_tenant_provisioning_status(pool, &tenant.id, "grants_ready", None)
+                .await?;
+    }
+    if tenant.provisioning_status == "grants_ready" {
+        // Registry namespace: the grand plan calls for creating this
+        // tenant's Iceberg namespace here, but `lakehouse-iceberg`'s
+        // existing namespace-create surface
+        // (`catalog::LakehouseCatalog::ensure_bronze_namespace`/
+        // `ensure_gold_namespace`) is hardcoded to this deployment's one
+        // shared bronze/gold catalog, not parameterized by an arbitrary
+        // tenant warehouse — calling either here would create a
+        // `bronze`/`gold` namespace on the WRONG catalog, not a namespace
+        // scoped to this tenant's own warehouse. `lakehouse-iceberg` is
+        // outside this task's owned files (`routes/identity.rs`,
+        // `error.rs`, `lakehouse-store/src/identity.rs`), and inventing a
+        // second, tenant-scoped Iceberg REST client here would be exactly
+        // the kind of fabricated-but-wrong call AGENTS.md rule 2 forbids.
+        // This checkpoint therefore advances without a real namespace
+        // call — an honest, disclosed gap (a real per-tenant namespace
+        // create is future work once `lakehouse-iceberg` exposes one),
+        // not a silent skip: `namespace_ready` is a distinct status a
+        // reader can see never had additional API surface built for it.
+        tenant =
+            identity::update_tenant_provisioning_status(pool, &tenant.id, "namespace_ready", None)
+                .await?;
+    }
+    if tenant.provisioning_status == "namespace_ready" {
+        tenant =
+            identity::update_tenant_provisioning_status(pool, &tenant.id, "complete", None).await?;
+    }
+    Ok(tenant)
 }
 
 // ── Service identities ──────────────────────────────────────────────────

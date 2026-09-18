@@ -178,13 +178,11 @@ pub struct AppState {
     /// panicking at boot or silently dialing Lakekeeper with an
     /// empty-string token that would only surface as a confusing 401
     /// later, deep inside a provisioning call.
-    #[allow(
-        dead_code,
-        reason = "no reader yet — WS8 plan Task B4 (POST /api/identity/tenants) \
-                  is the first consumer and is out of this task's file scope \
-                  (config.rs/state.rs only); this allow is expected to be \
-                  removed the moment that task lands"
-    )]
+    ///
+    /// First (and, as of WS8 plan Task B4, only) read by
+    /// `routes::identity::create_tenant` — the `#[allow(dead_code)]` this
+    /// field carried since Task B3 is removed now that reader exists, per
+    /// that allow's own reason.
     pub lakekeeper_admin: Option<Arc<LakekeeperAdminClient>>,
 }
 

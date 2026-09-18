@@ -600,6 +600,64 @@ pub async fn create_tenant(pool: &PgPool, input: &CreateTenantInput) -> Result<T
     get_tenant(pool, &id.to_string()).await
 }
 
+/// Find a tenant by its slug, or `None` if no such tenant exists.
+///
+/// Unlike [`get_tenant`], a missing row is not an error: `POST
+/// /api/identity/tenants` (WS8 plan Task B4, Correction 7) uses this to
+/// decide whether to resume an existing, still-in-progress row or create a
+/// brand-new one — `None` is exactly the "create a new tenant" case, not a
+/// failure.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn find_tenant_by_slug(pool: &PgPool, slug: &str) -> Result<Option<Tenant>, StoreError> {
+    let sql = format!("{TENANT_SELECT} WHERE t.slug = $1");
+    let row: Option<TenantRow> = sqlx::query_as(&sql).bind(slug).fetch_optional(pool).await?;
+    Ok(row.map(Tenant::from))
+}
+
+/// Advance a tenant's provisioning checkpoint, optionally recording the
+/// Lakekeeper warehouse id.
+///
+/// Called once per step of the provisioning state machine
+/// (`routes::identity::provision_tenant`, WS8 plan Correction 7), and only
+/// after that step has genuinely succeeded — the caller is responsible for
+/// never calling this to advance past a step that failed, so a crash or
+/// error mid-way leaves the last truthful `provisioning_status` rather
+/// than a fabricated one. `warehouse_id: None` leaves the column
+/// untouched (`COALESCE`) instead of clearing it, so a later step that
+/// does not itself know the warehouse id (grants/namespace) cannot
+/// accidentally erase the id an earlier step recorded.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if no such tenant exists (or
+/// `tenant_id` is not a UUID), or [`StoreError::Database`] on any other
+/// failure.
+pub async fn update_tenant_provisioning_status(
+    pool: &PgPool,
+    tenant_id: &str,
+    status: &str,
+    warehouse_id: Option<&str>,
+) -> Result<Tenant, StoreError> {
+    let id = parse_id(tenant_id)?;
+    let affected = sqlx::query(
+        "UPDATE tenant SET provisioning_status = $2, \
+         warehouse_id = COALESCE($3, warehouse_id) WHERE id = $1",
+    )
+    .bind(id)
+    .bind(status)
+    .bind(warehouse_id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if affected == 0 {
+        return Err(StoreError::NotFound);
+    }
+    get_tenant(pool, tenant_id).await
+}
+
 /// Delete a tenant.
 ///
 /// # Errors

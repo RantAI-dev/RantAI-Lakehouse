@@ -54,6 +54,24 @@ impl IntoResponse for ApiRejection {
 /// The result type every route handler returns.
 pub type ApiResult<T> = Result<T, ApiRejection>;
 
+/// A fixed 503 for `POST /api/identity/tenants` (WS8 plan Task B4) when a
+/// call into Lakekeeper's management API fails.
+///
+/// Matches this crate's existing `ApiError::unauthorized()`/
+/// `invalid_or_expired()` constructor-function convention
+/// (`lakehouse-core/src/error.rs:100-108`): a small named `fn` rather than
+/// building the string at each `routes::identity::provision_tenant` call
+/// site, so every provisioning failure renders identically. Deliberately
+/// never carries `lakehouse_auth::openfga::OpenfgaError`'s own message or
+/// any upstream Lakekeeper response text (AGENTS.md: "upstream error text
+/// never reaches a response") — `OpenfgaError` itself already strips that
+/// (see its doc comment), but this constructor keeps the guarantee
+/// visible at the call site rather than relying on the callee alone.
+#[must_use]
+pub fn provisioning_unavailable() -> ApiError {
+    ApiError::Unavailable("tenant provisioning could not reach Lakekeeper".to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
