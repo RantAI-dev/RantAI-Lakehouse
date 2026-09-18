@@ -188,6 +188,40 @@ pub struct AppState {
     pub lakekeeper_admin: Option<Arc<LakekeeperAdminClient>>,
 }
 
+/// Build the admin-scoped [`LakekeeperAdminClient`] from the token file at
+/// `token_path`, or `None` when this deployment has no usable admin token.
+///
+/// An EMPTY (or whitespace-only) file counts as "no token", not as a token
+/// that happens to be the empty string: `read_to_string` succeeds on an
+/// empty file, so without this check the process would build a client that
+/// sends `Authorization: Bearer ` on every provisioning call and fail at
+/// Lakekeeper with a 401 that names nothing — the exact confusing failure
+/// the degrade-to-`None` path exists to avoid. A missing or unreadable file
+/// degrades the same way.
+fn lakekeeper_admin_client(token_path: &str, base_url: &str) -> Option<LakekeeperAdminClient> {
+    match std::fs::read_to_string(token_path) {
+        Ok(raw) if !raw.trim().is_empty() => Some(LakekeeperAdminClient::new(
+            base_url.to_owned(),
+            Secret::new(raw.trim().to_owned()),
+        )),
+        Ok(_) => {
+            tracing::warn!(
+                path = %token_path,
+                "Lakekeeper admin token file is present but empty; tenant provisioning (POST /api/identity/tenants) will report itself unavailable"
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                path = %token_path,
+                "Lakekeeper admin token file is unreadable; tenant provisioning (POST /api/identity/tenants) will report itself unavailable"
+            );
+            None
+        }
+    }
+}
+
 /// The cap [`PolicyDecisionLatencies`] keeps — old samples are evicted
 /// oldest-first once the buffer is full, so the reported p95 always
 /// reflects recent behavior rather than growing unbounded for the life of
@@ -459,20 +493,11 @@ impl AppState {
         // A missing/unreadable file degrades to `None`, never a panic or
         // an empty-string token — same posture `bootstrap_agent_run_service`
         // (`main.rs`) uses when its own token is unset.
-        let lakekeeper_admin = match std::fs::read_to_string(&config.lakekeeper_admin_token_file) {
-            Ok(raw) => Some(Arc::new(LakekeeperAdminClient::new(
-                config.lakekeeper_base_url.clone(),
-                Secret::new(raw.trim().to_owned()),
-            ))),
-            Err(err) => {
-                tracing::warn!(
-                    %err,
-                    path = %config.lakekeeper_admin_token_file,
-                    "Lakekeeper admin token file is unreadable; tenant provisioning (POST /api/identity/tenants) will report itself unavailable"
-                );
-                None
-            }
-        };
+        let lakekeeper_admin = lakekeeper_admin_client(
+            &config.lakekeeper_admin_token_file,
+            &config.lakekeeper_base_url,
+        )
+        .map(Arc::new);
         Self {
             config: Arc::new(config),
             clickhouse,
@@ -623,5 +648,53 @@ mod tests {
                 "{forbidden} must be refused by the allowlist; got {err:?}"
             );
         }
+    }
+
+    /// WS8 plan Task B3, judge fix: `read_to_string` SUCCEEDS on an empty
+    /// file, so "unreadable file degrades to `None`" did not cover the
+    /// case an operator actually hits — a token file created by a mount
+    /// or an init container that wrote nothing. Without this, the process
+    /// would dial `Lakekeeper` with `Authorization: Bearer ` and the
+    /// failure would surface as an unexplained 401 inside a provisioning
+    /// call instead of "provisioning is unavailable here".
+    #[test]
+    fn an_empty_lakekeeper_admin_token_file_is_treated_as_no_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin.jwt");
+        std::fs::write(&path, "   \n").unwrap();
+        assert!(
+            super::lakekeeper_admin_client(
+                path.to_str().expect("a UTF-8 temp path"),
+                "http://lakekeeper.invalid:8181"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_missing_lakekeeper_admin_token_file_is_treated_as_no_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-written.jwt");
+        assert!(
+            super::lakekeeper_admin_client(
+                path.to_str().expect("a UTF-8 temp path"),
+                "http://lakekeeper.invalid:8181"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_real_lakekeeper_admin_token_file_builds_a_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin.jwt");
+        std::fs::write(&path, "  header.payload.signature\n").unwrap();
+        assert!(
+            super::lakekeeper_admin_client(
+                path.to_str().expect("a UTF-8 temp path"),
+                "http://lakekeeper.invalid:8181"
+            )
+            .is_some()
+        );
     }
 }
