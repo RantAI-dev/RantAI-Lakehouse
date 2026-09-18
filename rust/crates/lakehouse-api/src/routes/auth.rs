@@ -462,6 +462,11 @@ pub async fn oidc_start(
         state.config.oidc_redirect_uri.as_deref().ok_or_else(|| {
             ApiError::Unavailable("OIDC_REDIRECT_URI is not configured".to_owned())
         })?;
+    let client_id = state
+        .config
+        .oidc_client_id
+        .as_deref()
+        .ok_or_else(|| ApiError::Unavailable("OIDC_CLIENT_ID is not configured".to_owned()))?;
 
     // `state`/`nonce`/PKCE `code_verifier` all come from the same CSPRNG
     // helper every other bearer-equivalent secret in this codebase uses
@@ -486,10 +491,15 @@ pub async fn oidc_start(
     redirect
         .query_pairs_mut()
         .append_pair("response_type", "code")
-        .append_pair(
-            "client_id",
-            state.config.oidc_client_id.as_deref().unwrap_or_default(),
-        )
+        // Not `unwrap_or_default()`: an empty `client_id` would still be
+        // sent, and the flow would fail at the `IdP` with an error this
+        // service never sees. `AuthState::oidc` is `Some` only when
+        // `OIDC_ISSUER` *and* `OIDC_CLIENT_ID` are both set
+        // (`state::oidc_config`, which `?`s on each), so the presence
+        // check above already guarantees this value — reading it the same
+        // fail-closed way as the other three keeps that guarantee true if
+        // `oidc_config`'s requirements ever change.
+        .append_pair("client_id", client_id)
         .append_pair("redirect_uri", redirect_uri)
         .append_pair("scope", "openid email profile")
         .append_pair("state", &flow.state)
