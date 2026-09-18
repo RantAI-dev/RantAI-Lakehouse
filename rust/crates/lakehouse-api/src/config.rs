@@ -224,6 +224,23 @@ pub struct Config {
     /// default (like [`Self::smtp_port`], not load-bearing enough to fail
     /// boot over).
     pub oidc_clock_skew_seconds: u64,
+    /// Authorization endpoint of the `OIDC` provider, for the
+    /// browser-redirect login flow (WS8 plan Task A2, Hard Requirement 1).
+    /// `None` when unset. Read ONLY from `OIDC_AUTHORIZE_URL` — never taken
+    /// from a request, so a caller cannot redirect a login to an arbitrary
+    /// host.
+    pub oidc_authorize_url: Option<String>,
+    /// Token endpoint of the `OIDC` provider, used to exchange an
+    /// authorization code for tokens (WS8 plan Task A2). `None` when
+    /// unset. Read ONLY from `OIDC_TOKEN_URL` — never taken from a
+    /// request.
+    pub oidc_token_url: Option<String>,
+    /// This deployment's fixed callback URL, registered with the `OIDC`
+    /// provider ahead of time (WS8 plan Task A2, Hard Requirement 1: "redirect
+    /// URI fixed from configuration"). `None` when unset. Read ONLY from
+    /// `OIDC_REDIRECT_URI` — never taken from a request, closing the open-
+    /// redirect class a request-supplied `redirect_uri` would allow.
+    pub oidc_redirect_uri: Option<String>,
     /// Lakekeeper Iceberg REST catalog base URI (P1,
     /// `lakehouse-iceberg::IcebergClientConfig::catalog_uri`). Default
     /// matches `docker-compose.yml`'s `lakekeeper` service port mapping.
@@ -514,6 +531,9 @@ impl std::fmt::Debug for Config {
                 &self.connector_probe_allow_internal_hosts,
             )
             .field("oidc_clock_skew_seconds", &self.oidc_clock_skew_seconds)
+            .field("oidc_authorize_url", &self.oidc_authorize_url)
+            .field("oidc_token_url", &self.oidc_token_url)
+            .field("oidc_redirect_uri", &self.oidc_redirect_uri)
             .field("database_url", &REDACTED)
             .field(
                 "lakekeeper_gold_export_token_file",
@@ -692,6 +712,9 @@ impl Config {
                 .get("OIDC_CLOCK_SKEW_SECONDS")
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(60),
+            oidc_authorize_url: truthy(env, "OIDC_AUTHORIZE_URL"),
+            oidc_token_url: truthy(env, "OIDC_TOKEN_URL"),
+            oidc_redirect_uri: truthy(env, "OIDC_REDIRECT_URI"),
             lakekeeper_catalog_uri: or_default(
                 env,
                 "LAKEKEEPER_CATALOG_URI",
@@ -852,6 +875,9 @@ mod tests {
         assert!(cfg.oidc_role_map.is_empty());
         assert_eq!(cfg.oidc_groups_claim, "groups");
         assert_eq!(cfg.oidc_clock_skew_seconds, 60);
+        assert_eq!(cfg.oidc_authorize_url, None);
+        assert_eq!(cfg.oidc_token_url, None);
+        assert_eq!(cfg.oidc_redirect_uri, None);
         assert_eq!(
             cfg.lakekeeper_gold_export_token_file,
             "/tokens/gold-export.jwt"
@@ -1195,5 +1221,43 @@ mod tests {
         // other `or_default` field here — an explicit empty value is
         // preserved, not re-defaulted (`or_default`'s own doc comment).
         assert_eq!(cfg.trino_url, "");
+    }
+
+    // WS8 plan Task A2: the browser login flow's authorize/token/redirect
+    // URLs are fixed from configuration only (Hard Requirement 1) — a
+    // request can never supply or override them.
+    #[test]
+    fn oidc_flow_urls_default_to_none_and_are_read_when_set() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.oidc_authorize_url, None);
+        assert_eq!(cfg.oidc_token_url, None);
+        assert_eq!(cfg.oidc_redirect_uri, None);
+
+        let mut env = HashMap::new();
+        env.insert(
+            "OIDC_AUTHORIZE_URL".to_owned(),
+            "http://idp.invalid/authorize".to_owned(),
+        );
+        env.insert(
+            "OIDC_TOKEN_URL".to_owned(),
+            "http://idp.invalid/token".to_owned(),
+        );
+        env.insert(
+            "OIDC_REDIRECT_URI".to_owned(),
+            "https://lake.invalid/api/auth/oidc/callback".to_owned(),
+        );
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(
+            cfg.oidc_authorize_url.as_deref(),
+            Some("http://idp.invalid/authorize")
+        );
+        assert_eq!(
+            cfg.oidc_token_url.as_deref(),
+            Some("http://idp.invalid/token")
+        );
+        assert_eq!(
+            cfg.oidc_redirect_uri.as_deref(),
+            Some("https://lake.invalid/api/auth/oidc/callback")
+        );
     }
 }
