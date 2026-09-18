@@ -71,6 +71,22 @@ export type CreateServiceIdentityInput = {
   environment: string
 }
 
+/**
+ * What `POST /api/identity/service-identities/{id}/rotate` returns
+ * (WS8 §Phase E, Hard Requirement 5).
+ *
+ * `secret` is the freshly minted raw token, returned exactly once on this
+ * response — `ServiceIdentity` itself has no secret/token_hash field, so
+ * every subsequent list/get route on the same identity continues to return
+ * credential *metadata* only. The backend that produces this shape is
+ * `lakehouse-store::identity::rotate_service_identity` plus its route
+ * (`routes::identity::rotate`), both wired up in commit `840cfd6`.
+ */
+export type RotateServiceIdentityResponse = {
+  secret: string
+  identity: ServiceIdentity
+}
+
 export interface IdentityService {
   listUsers(signal?: AbortSignal): Promise<User[]>
   listRoles(signal?: AbortSignal): Promise<Role[]>
@@ -83,4 +99,8 @@ export interface IdentityService {
     input: CreateServiceIdentityInput,
     signal?: AbortSignal
   ): Promise<ServiceIdentity>
+  rotateServiceIdentity(
+    id: string,
+    signal?: AbortSignal
+  ): Promise<RotateServiceIdentityResponse>
 }

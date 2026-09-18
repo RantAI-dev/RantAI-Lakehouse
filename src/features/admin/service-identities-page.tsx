@@ -13,6 +13,13 @@ import {
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useService, useServiceAction } from "@/hooks/use-service"
@@ -42,39 +49,6 @@ function RotationPill({
   }
 }
 
-const columns: ColumnDef<ServiceIdentity>[] = [
-  { key: "name", header: "Identity", render: (r) => r.name },
-  {
-    key: "scopes",
-    header: "Scopes",
-    render: (r) => (
-      <div className="flex flex-wrap gap-1">
-        {r.scopes.map((scope) => (
-          <Pill key={scope} tone="neutral" className="font-mono">
-            {scope}
-          </Pill>
-        ))}
-      </div>
-    ),
-  },
-  { key: "env", header: "Environment", render: (r) => r.environment },
-  {
-    key: "rot",
-    header: "Rotation",
-    render: (r) => <RotationPill status={r.rotationStatus} />,
-  },
-  {
-    key: "exp",
-    header: "Expires",
-    render: (r) => formatRelativeTime(r.expiresAt),
-  },
-  {
-    key: "used",
-    header: "Last used",
-    render: (r) => (r.lastUsedAt === null ? "Not recorded" : formatRelativeTime(r.lastUsedAt)),
-  },
-]
-
 export function ServiceIdentitiesPage() {
   const { hasPermission } = useAuth()
   const canWrite = hasPermission("identity:write")
@@ -85,11 +59,21 @@ export function ServiceIdentitiesPage() {
   const [name, setName] = React.useState("")
   const [scopes, setScopes] = React.useState("")
   const [environment, setEnvironment] = React.useState("")
+  // WS8 §Phase F, Hard Requirement 5: the rotated secret is shown in the
+  // dialog below exactly once and is NEVER persisted to localStorage,
+  // sessionStorage, or any service-layer cache entry. Kept as local
+  // component state, cleared when the dialog closes, so re-renders of the
+  // table (filter/search input, a refetch landing) cannot leak it via any
+  // hook that stores its argument.
+  const [revealedSecret, setRevealedSecret] = React.useState<string | null>(null)
   const create = useServiceAction(
     (
       signal,
       input: Parameters<typeof identityService.createServiceIdentity>[0]
     ) => identityService.createServiceIdentity(input, signal)
+  )
+  const rotate = useServiceAction(
+    (signal, id: string) => identityService.rotateServiceIdentity(id, signal),
   )
 
   const filtered = React.useMemo(() => {
@@ -125,6 +109,80 @@ export function ServiceIdentitiesPage() {
       state.reload()
     }
   }
+
+  async function handleRotate(id: string) {
+    // `useServiceAction.run` resolves to `null` on any thrown error (the
+    // service layer classifies upstream failures into ServiceError; see
+    // use-service.ts:99-105). A failed rotate MUST NOT open the dialog
+    // and MUST NOT refetch the list — a stale-row-refetch here would make
+    // a 5xx look like a success, so the `if (result)` guard is the
+    // single source of truth for "the rotation actually returned a
+    // secret".
+    const result = await rotate.run(id)
+    if (!result) return
+    setRevealedSecret(result.secret)
+    // Pull the freshly-rotated row (new expiresAt + rotationStatus reset
+    // back to "current") into view immediately, so the table reflects the
+    // backend's three writes without a manual page reload.
+    state.reload()
+  }
+
+  // The Rotate action column is appended to the table's existing
+  // identity/scopes/env/rotation/expires/used columns. Gated by the same
+  // `identity:write` permission the Create button uses (POLICY_TABLE
+  // already enforces this server-side; the disable here is just UX).
+  const columns: ColumnDef<ServiceIdentity>[] = [
+    { key: "name", header: "Identity", render: (r) => r.name },
+    {
+      key: "scopes",
+      header: "Scopes",
+      render: (r) => (
+        <div className="flex flex-wrap gap-1">
+          {r.scopes.map((scope) => (
+            <Pill key={scope} tone="neutral" className="font-mono">
+              {scope}
+            </Pill>
+          ))}
+        </div>
+      ),
+    },
+    { key: "env", header: "Environment", render: (r) => r.environment },
+    {
+      key: "rot",
+      header: "Rotation",
+      render: (r) => <RotationPill status={r.rotationStatus} />,
+    },
+    {
+      key: "exp",
+      header: "Expires",
+      render: (r) => formatRelativeTime(r.expiresAt),
+    },
+    {
+      key: "used",
+      header: "Last used",
+      render: (r) => (r.lastUsedAt === null ? "Not recorded" : formatRelativeTime(r.lastUsedAt)),
+    },
+    {
+      key: "rotate",
+      header: "",
+      className: "text-right",
+      render: (r) => (
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={!canWrite || rotate.status === "pending"}
+          onClick={() => void handleRotate(r.id)}
+          title={
+            canWrite
+              ? "Mint a new credential; the old one will be revoked immediately."
+              : "You don't have permission to rotate service identities."
+          }
+        >
+          Rotate
+        </Button>
+      ),
+    },
+  ]
 
   return (
     <div className="flex flex-col gap-4">
@@ -199,6 +257,40 @@ export function ServiceIdentitiesPage() {
           />
         </div>
       </CreateSheet>
+      <Dialog
+        open={revealedSecret !== null}
+        onOpenChange={(open) => {
+          if (!open) setRevealedSecret(null)
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>New credential</DialogTitle>
+            <DialogDescription>
+              This secret will not be shown again. Copy it now and store it in your secret
+              manager.
+            </DialogDescription>
+          </DialogHeader>
+          <code
+            data-testid="revealed-secret"
+            className="block break-all rounded bg-muted p-2 text-xs"
+          >
+            {revealedSecret}
+          </code>
+          <div className="flex justify-end">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                if (revealedSecret === null) return
+                void navigator.clipboard.writeText(revealedSecret)
+              }}
+            >
+              Copy
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

@@ -5,6 +5,7 @@ import type {
   IdentityService,
   InviteUserInput,
   Role,
+  RotateServiceIdentityResponse,
   ServiceIdentity,
   Tenant,
   User,
@@ -57,12 +58,15 @@ function post<T>(
   signal: AbortSignal | undefined,
   fallback: string
 ): Promise<T> {
+  // Empty-body POSTs (`rotateServiceIdentity` is the only caller today)
+  // pass `null`; we still set `content-type: application/json` so the
+  // request looks like every other POST in this adapter.
   return request<T>(
     url,
     {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
+      body: body === null || body === undefined ? undefined : JSON.stringify(body),
       signal,
     },
     fallback
@@ -101,6 +105,19 @@ export const postgresIdentityService: IdentityService = {
       input,
       signal,
       "Failed to create service identity"
+    );
+  },
+  // WS8 §Phase E: route was added in commit `840cfd6`. Returns the freshly
+  // minted token in `secret` exactly once — see the contract type's
+  // doc comment for why this shape is the only honest read-back. A 404
+  // maps to `not_found`, anything else falls through to `errorFor`'s
+  // generic mapping.
+  rotateServiceIdentity(id: string, signal) {
+    return post<RotateServiceIdentityResponse>(
+      `/api/identity/service-identities/${id}/rotate`,
+      null,
+      signal,
+      "Failed to rotate service identity"
     );
   },
 };
