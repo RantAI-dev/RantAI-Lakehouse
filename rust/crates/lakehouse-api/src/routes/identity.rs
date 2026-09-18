@@ -43,17 +43,22 @@
 //! the concrete proof, exercised end to end through the real router.
 
 use axum::body::Bytes;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use lakehouse_auth::Principal;
 use lakehouse_auth::openfga::LakekeeperAdminClient;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
+use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::identity::{
     self, CreateRoleInput, CreateServiceIdentityInput, CreateTenantInput, InviteUserInput, Role,
-    ServiceIdentity, ServiceIdentityFilter, Tenant, TenantFilter, User, UserFilter,
+    RotateServiceIdentityResponse, ServiceIdentity, ServiceIdentityFilter, Tenant, TenantFilter,
+    User, UserFilter,
 };
 use serde::Deserialize;
+use uuid::Uuid;
 
+use crate::auth::AuthenticatedPrincipal;
 use crate::config::Config;
 use crate::error::ApiResult;
 use crate::json::ApiJson;
@@ -522,6 +527,149 @@ pub async fn create_service_identity(
     Ok((StatusCode::CREATED, ApiJson(created)))
 }
 
+/// `POST /api/identity/service-identities/{id}/rotate` — revoke every
+/// currently-unrevoked credential for `identity_id`, mint a fresh
+/// credential, reset `expires_at`/`rotation_status`, audit, and return the
+/// new raw token exactly once.
+///
+/// # Security
+///
+/// Requires `identity:write` — see the module doc comment. A leaked old
+/// token is dead the moment this route returns 200, because every
+/// previously-unrevoked `service_credential` row is set `revoked_at = now()`
+/// inside the same transaction that inserts the new one
+/// (`lakehouse_store::identity::rotate_service_identity`); a token replayed
+/// after rotation therefore cannot match `service_credential.token_hash`
+/// with `revoked_at IS NULL`, and `lakehouse_auth::service_token::
+/// verify_service_token` filters on exactly that predicate.
+///
+/// # The secret is returned EXACTLY ONCE on this response
+///
+/// The raw token in `response.secret` is the value whose SHA-256 hex digest
+/// was just persisted to `service_credential.token_hash`. It is never
+/// persisted in plaintext (only the hash is, by design — see
+/// `lakehouse-auth::token`'s doc comment), and it is never re-served by
+/// any other route: `GET /api/identity/service-identities` and
+/// `GET /api/identity/service-identities/{id}` return credential
+/// *metadata* (`name`, `scopes`, `expires_at`, `rotation_status`) only,
+/// because `ServiceIdentity` itself has no `secret`/`token`/`token_hash`
+/// field. The console's caller is responsible for recording the secret at
+/// this moment — the server never sees it again.
+///
+/// # Audit is best-effort
+///
+/// The `audit_event` write is wrapped in `if let Err ... tracing::warn!`,
+/// mirroring `routes::agents::decide_approval`'s own pattern: a successful
+/// rotation is still 200 with the secret if the audit insert fails — the
+/// audit failure is operator-visible through the log line and never
+/// propagated into the response, per AGENTS.md principle 4 (no
+/// `ApiError::Internal` interpolating an upstream error).
+///
+/// # Errors
+///
+/// 400 on a non-UUID `{id}` (a malformed path can't match any row, so
+/// 404'ing it would conflate "doesn't exist" with "caller error" — the
+/// same posture as `routes::auth::revoke_session`'s 400 for a non-UUID
+/// session id); 404 via [`StoreError::NotFound`] when `{id}` is well-formed
+/// but no row matches (the final `get_service_identity` re-read is what
+/// surfaces that — see `rotate_service_identity`'s doc comment); 503 if no
+/// Postgres pool is configured; 500 (classified) on any other storage
+/// failure, with the upstream error text never reaching the response.
+pub async fn rotate_service_identity(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<RotateServiceIdentityResponse>> {
+    let identity_id = Uuid::parse_str(&id)
+        .map_err(|_| ApiError::BadRequest("service identity id must be a UUID".to_owned()))?;
+
+    let pool = pool(&state)?;
+    let response = identity::rotate_service_identity(pool, identity_id, || {
+        // Reuses `lakehouse_auth::generate_opaque_token` for the CSPRNG
+        // (the only public token-generation primitive `lakehouse-auth`
+        // re-exports — `lakehouse_auth::token::hash_token` is deliberately
+        // private per `lakehouse-auth/src/lib.rs`'s own note, and the
+        // `rotate_service_identity` store function cannot import
+        // `lakehouse-auth` at all because `lakehouse-auth` already depends
+        // on `lakehouse-store`, which would be a Cargo cycle Cargo refuses
+        // to build; so the SHA-256 hex digest is the small piece inlined
+        // here — see [`sha256_hex`] for the rationale). The closure runs
+        // inside the transaction, between the two `UPDATE`s and the
+        // `INSERT`, so a panic or SQL failure anywhere else in the function
+        // rolls the whole rotation back rather than leaving the new
+        // credential orphaned.
+        let token = lakehouse_auth::generate_opaque_token();
+        let token_hash = sha256_hex(token.expose());
+        (token.expose().to_owned(), token_hash)
+    })
+    .await?;
+
+    let audit_event = rotate_service_identity_audit_event(&principal, identity_id);
+    if let Err(err) = store_audit::insert(pool, audit_event).await {
+        tracing::warn!(
+            %err,
+            action = "identity.service_identity.rotate",
+            identity_id = %identity_id,
+            "failed to record service-identity rotation audit event"
+        );
+    }
+
+    Ok(ApiJson(response))
+}
+
+/// SHA-256 (`lakehouse_auth::token::hash_token`) of a string. Duplicates
+/// `lakehouse_auth::token::hash_token` here because that helper is
+/// deliberately private (`lakehouse-auth/src/lib.rs`'s note: "`hash_token`
+/// is an internal storage detail of `session`/`service_token`, not
+/// something a caller outside this crate should ever need"). The only
+/// public CSPRNG primitive `lakehouse-auth` re-exports is
+/// `generate_opaque_token` — and `lakehouse-store` cannot import
+/// `lakehouse-auth` at all (Cargo would reject the cycle), so the rotate
+/// store function takes a `(String, String)` mint callback instead of
+/// minting inline. The hex-digest logic itself is the small, well-isolated
+/// piece that has to live outside `lakehouse-auth` for this caller to
+/// compose correctly — any drift here would be caught by
+/// `lakehouse-auth`'s own `verify_service_token` round-trip tests, which
+/// insist on `hash_token`'s output format.
+fn sha256_hex(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(input.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Build the `NewAuditEvent` for a successful rotate — extracted as a pure,
+/// unit-tested function so the field-shape assertion lives next to the call
+/// site (rather than a brittle source-text grep), exactly the pattern
+/// `routes::agents::decide_approval_audit_event` and
+/// `routes::query::query_run_audit_event` use. The audit row is
+/// `outcome = "executed"` because rotation is a successful write (not a
+/// gate decision) — the schema's `audit_event_outcome_check` allows it.
+/// `principal_kind` comes from `Principal::kind_for_audit`, not from
+/// `principal.provider` — the two are different vocabularies (the audit
+/// CHECK accepts `"user" | "service" | "copilot" | "schedule"`; the
+/// authenticator's `provider` field is `"local" | "session" | "service" |
+/// "oidc:<issuer>"`), and binding `provider` here would write an
+/// audit-invalid `principal_kind` for every human caller.
+fn rotate_service_identity_audit_event(principal: &Principal, identity_id: Uuid) -> NewAuditEvent {
+    NewAuditEvent {
+        action: "identity.service_identity.rotate".to_owned(),
+        resource_kind: Some("service_identity".to_owned()),
+        resource_id: Some(identity_id.to_string()),
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        outcome: "executed".to_owned(),
+        args: None,
+        detail: None,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -561,20 +709,30 @@ mod tests {
     #[tokio::test]
     async fn every_database_backed_route_returns_503_without_a_pool() {
         use axum::body::to_bytes;
-        use axum::http::Request;
+        use axum::http::{Method, Request};
         use tower::ServiceExt;
 
+        // (path, method) — the rotate route is POST-only, so the GET-by-
+        // default request shape the other paths use would hit axum's
+        // method-mismatch path and never reach `auth_gate`. POST keeps the
+        // path reaching the auth gate, which is what this test is actually
+        // asserting against.
         let paths = [
-            "/api/identity/users",
-            "/api/identity/roles",
-            "/api/identity/tenants",
-            "/api/identity/service-identities",
+            ("/api/identity/users", Method::GET),
+            ("/api/identity/roles", Method::GET),
+            ("/api/identity/tenants", Method::GET),
+            ("/api/identity/service-identities", Method::GET),
+            (
+                "/api/identity/service-identities/c4f7a7b2-0000-4000-8000-000000000001/rotate",
+                Method::POST,
+            ),
         ];
-        for path in paths {
+        for (path, method) in paths {
             let app = crate::routes::router(state_without_pool());
             let response = app
                 .oneshot(
                     Request::builder()
+                        .method(method)
                         .uri(path)
                         .body(axum::body::Body::empty())
                         .unwrap(),
@@ -611,5 +769,52 @@ mod tests {
         let err = parse_body::<CreateRoleBody>(&Bytes::from_static(b"{not json"))
             .expect_err("malformed JSON must be rejected");
         assert_eq!(err.status(), 400);
+    }
+
+    /// The rotate route's audit row is built with a literal `NewAuditEvent`
+    /// shape (`action` / `resource_kind` / `resource_id` / `principal_kind` /
+    /// `outcome`) that the schema's `audit_event_*_check` constraints accept.
+    /// Asserting the literal here is what pins down Hard Requirement 5's
+    /// "rotate is audited" property at the field level — the `INSERT`
+    /// itself is exercised by the integration tests in
+    /// `lakehouse-store/tests/audit.rs`, which use the same `insert` helper
+    /// `rotate_service_identity` calls.
+    #[test]
+    fn rotate_service_identity_audit_event_has_the_expected_fields() {
+        use lakehouse_auth::{PermissionSet, PrincipalId};
+
+        let identity_id = uuid::Uuid::from_u128(0xDEAD_BEEF);
+        let principal = lakehouse_auth::Principal {
+            id: PrincipalId::User(uuid::Uuid::from_u128(0xCAFE_BABE)),
+            tenant_ids: Vec::new(),
+            display_name: "Rina Wijaya".to_owned(),
+            permissions: PermissionSet::parse("identity:write"),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        };
+
+        let event = rotate_service_identity_audit_event(&principal, identity_id);
+        assert_eq!(event.action, "identity.service_identity.rotate");
+        assert_eq!(event.resource_kind.as_deref(), Some("service_identity"));
+        // `Uuid::to_string` renders the canonical hyphenated form, which is
+        // what `audit_event.resource_id` should carry — same encoding the
+        // server-side `Principal::id.uuid().to_string()` produces for
+        // `principal_id`.
+        assert_eq!(
+            event.resource_id.as_deref(),
+            Some(identity_id.to_string().as_str())
+        );
+        assert_eq!(
+            event.principal_id.as_deref(),
+            Some(principal.id.uuid().to_string().as_str())
+        );
+        // `provider = "session"` is the authenticator's vocabulary — the
+        // audit row must NOT carry it (the audit CHECK only allows
+        // `"user" | "service" | "copilot" | "schedule"`). `kind_for_audit`
+        // is what maps the principal's variant onto the audit vocabulary.
+        assert_eq!(event.principal_kind.as_deref(), Some("user"));
+        assert_eq!(event.actor_label.as_deref(), Some("Rina Wijaya"));
+        assert_eq!(event.outcome, "executed");
     }
 }

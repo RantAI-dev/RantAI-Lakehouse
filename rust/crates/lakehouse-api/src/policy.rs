@@ -368,6 +368,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/identity/tenants",                Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/service-identities",     Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/service-identities",     Policy::RequiresPermission("identity:write")),
+    // WS8 plan §Phase E (Hard Requirement 5): rotation is a write-side
+    // identity-domain operation — reuses `identity:write` exactly the same
+    // way every other service-identity write does above, per AGENTS.md rule
+    // 4 (no new permission token minted for a route that already has a
+    // well-grounded one).
+    ("POST", "/api/identity/service-identities/{id}/rotate", Policy::RequiresPermission("identity:write")),
 
     // ── Connectors: seeded Data Engineer permission `connector:manage`. ──
     ("GET",  "/api/connectors",             Policy::RequiresPermission("connector:manage")),

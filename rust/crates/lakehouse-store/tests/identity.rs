@@ -29,7 +29,7 @@ use lakehouse_store::identity::{
     CreateRoleInput, CreateServiceIdentityInput, CreateTenantInput, InviteUserInput,
     ServiceIdentityFilter, TenantFilter, UserFilter, create_role, create_service_identity,
     create_tenant, create_user, delete_user, get_service_identity, get_tenant, get_user,
-    list_roles, list_service_identities, list_tenants, list_users,
+    list_roles, list_service_identities, list_tenants, list_users, rotate_service_identity,
 };
 use sqlx::PgPool;
 
@@ -584,5 +584,259 @@ async fn no_pipeline_definition_row_is_backfilled_because_none_are_seeded(
         count, 0,
         "0027 already deleted every seeded pipeline_definition row — 0042 must not invent a backfill target here"
     );
+    Ok(())
+}
+
+// ── WS8 plan §Phase E (Hard Requirement 5): rotate_service_identity ─────
+
+/// Seed a `service_identity` row exactly the shape the plan's `seed_*`
+/// helpers produce (name + scopes + environment + future expiry +
+/// `rotation_status = 'current'`), so the rotate tests' input matches what
+/// production seeding would create. The `name` is suffixed with a fresh
+/// `Uuid` because `#[sqlx::test]` runs every test in the same binary in
+/// the SAME database — only the test function gets a fresh connection per
+/// run, not a fresh schema (the `service_identity_name_unique` constraint
+/// would otherwise block a second test reusing a literal name).
+///
+/// Returned `id` is the freshly-inserted `service_identity.id`. The
+/// identity is created without a `service_credential.token_hash` row — the
+/// production `create_service_identity` doesn't insert one either (it
+/// only registers metadata, per its own doc comment), and the rotate
+/// tests that need a pre-existing credential insert one explicitly.
+async fn seed_service_identity(pool: &PgPool, name: &str) -> sqlx::Result<uuid::Uuid> {
+    let unique_name = format!("{name}-{}", uuid::Uuid::new_v4().simple());
+    let (id,): (uuid::Uuid,) = sqlx::query_as(
+        "INSERT INTO service_identity (name, scopes, environment, rotation_status, expires_at) \
+         VALUES ($1, $2, $3, 'current', now() + interval '90 days') RETURNING id",
+    )
+    .bind(&unique_name)
+    .bind(vec!["query:read".to_owned()])
+    .bind("production")
+    .fetch_one(pool)
+    .await?;
+    Ok(id)
+}
+
+/// `rotate_service_identity` writes the new credential with whatever hash
+/// the mint callback returns, and the response's `secret` is whatever
+/// string the mint callback puts in the first tuple slot. This test
+/// exercises that wiring end to end through the store, without depending
+/// on `lakehouse-auth` (which `lakehouse-store`'s tests cannot import —
+/// `lakehouse-auth` depends on `lakehouse-store`, and Cargo rejects the
+/// resulting cycle as either a regular or dev-dep; see the rotation
+/// function's doc comment for the full reasoning). The "hash produced by
+/// the store equals the hash `lakehouse_auth::token::hash_token` would
+/// compute for the same secret" property is asserted in
+/// `lakehouse-auth`'s test suite (end-to-end, via
+/// `verify_service_token`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn rotate_returns_the_new_secret_and_persists_its_hash(pool: PgPool) -> sqlx::Result<()> {
+    let identity_id = seed_service_identity(&pool, "ingestion-worker").await?;
+
+    let response = rotate_service_identity(&pool, identity_id, || {
+        (
+            "a-freshly-minted-raw-token".to_owned(),
+            "stored-hash-for-it".to_owned(),
+        )
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(response.secret, "a-freshly-minted-raw-token");
+    let (stored_hash,): (String,) = sqlx::query_as(
+        "SELECT token_hash FROM service_credential WHERE service_identity_id = $1 \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(identity_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        stored_hash, "stored-hash-for-it",
+        "the hash persisted in service_credential.token_hash is the one the mint callback provided"
+    );
+    Ok(())
+}
+
+/// Hard Requirement 5 — "old credential's fate": every previously-unrevoked
+/// credential for the identity must be `revoked_at` non-NULL once rotation
+/// succeeds, and the freshly inserted credential must be the only
+/// `revoked_at IS NULL` row for this identity.
+///
+/// We can't import `lakehouse_auth::service_token::verify_service_token`
+/// here (same cycle), so we exercise the property structurally: the SQL
+/// `service_token.rs::verify_service_token` filters on (`token_hash` matches,
+/// `revoked_at` IS NULL, identity not expired), and the only row that
+/// satisfies that after a rotation is the one the mint callback just
+/// inserted. The "leaked token can no longer authenticate" assertion is
+/// made end-to-end in `lakehouse-auth`'s own test suite, where both
+/// `lakehouse-auth` and the rest of the stack are reachable.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rotate_revokes_old_credentials_and_leaves_only_the_new_one_active(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let identity_id = seed_service_identity(&pool, "ingestion-worker").await?;
+
+    // Seed two pre-existing credentials — one already revoked, one still
+    // active. After rotation, the active one must be revoked, the previously
+    // revoked one stays revoked, and the new one is active.
+    let (old_active_id,): (uuid::Uuid,) = sqlx::query_as(
+        "INSERT INTO service_credential (service_identity_id, token_hash) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(identity_id)
+    .bind("old-active-hash")
+    .fetch_one(&pool)
+    .await?;
+    let (already_revoked_id,): (uuid::Uuid,) = sqlx::query_as(
+        "INSERT INTO service_credential (service_identity_id, token_hash, revoked_at) \
+         VALUES ($1, $2, now() - interval '1 hour') RETURNING id",
+    )
+    .bind(identity_id)
+    .bind("already-revoked-hash")
+    .fetch_one(&pool)
+    .await?;
+
+    rotate_service_identity(&pool, identity_id, || {
+        ("new-raw-token".to_owned(), "new-stored-hash".to_owned())
+    })
+    .await
+    .unwrap();
+
+    let rows: Vec<(String, Option<time::OffsetDateTime>)> = sqlx::query_as(
+        "SELECT token_hash, revoked_at FROM service_credential WHERE service_identity_id = $1 \
+         ORDER BY created_at ASC",
+    )
+    .bind(identity_id)
+    .fetch_all(&pool)
+    .await?;
+    let by_hash: std::collections::HashMap<&str, Option<time::OffsetDateTime>> =
+        rows.iter().map(|(h, r)| (h.as_str(), *r)).collect();
+
+    assert!(
+        by_hash
+            .get("already-revoked-hash")
+            .and_then(|r| r.as_ref())
+            .is_some(),
+        "a previously-revoked credential must stay revoked"
+    );
+    assert!(
+        by_hash
+            .get("old-active-hash")
+            .and_then(|r| r.as_ref())
+            .is_some(),
+        "the previously-active credential must be revoked by rotation"
+    );
+    assert!(
+        by_hash
+            .get("new-stored-hash")
+            .and_then(|r| r.as_ref())
+            .is_none(),
+        "the freshly inserted credential must be the only unrevoked one"
+    );
+
+    // And there is exactly one unrevoked credential for this identity.
+    let (active_count,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM service_credential WHERE service_identity_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(identity_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        active_count, 1,
+        "exactly one active credential after rotation"
+    );
+
+    // The two pre-existing ids are still around (revoke is not delete) —
+    // a future "log every credential ever issued" report still needs them.
+    assert!(
+        (by_hash.len() == 3) || (by_hash.len() == 2 && old_active_id != already_revoked_id),
+        "rotate must not delete old credential rows"
+    );
+    Ok(())
+}
+
+/// Reset `expires_at` to a fresh `NEW_IDENTITY_VALIDITY_DAYS` window and
+/// `rotation_status` to `'current'` — matches the shape of a freshly
+/// created identity (`create_service_identity`'s doc comment), so a
+/// rotation looks exactly like a brand-new identity for downstream
+/// filtering and authentication purposes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rotate_resets_expires_at_to_a_fresh_window_and_status_to_current(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let identity_id = seed_service_identity(&pool, "ingestion-worker").await?;
+
+    // Drive the seeded identity into the "about to expire" shape the plan's
+    // `seed_service_identity_expiring_soon` would — already past its
+    // expiry. The post-rotation row must come back with `expires_at > now()
+    // + 29 days` regardless of where it was.
+    sqlx::query(
+        "UPDATE service_identity SET expires_at = now() + interval '1 day', \
+         rotation_status = 'due' WHERE id = $1",
+    )
+    .bind(identity_id)
+    .execute(&pool)
+    .await?;
+
+    rotate_service_identity(&pool, identity_id, || {
+        ("new-raw-token".to_owned(), "new-stored-hash".to_owned())
+    })
+    .await
+    .unwrap();
+
+    let (expires_at, rotation_status): (time::OffsetDateTime, String) =
+        sqlx::query_as("SELECT expires_at, rotation_status FROM service_identity WHERE id = $1")
+            .bind(identity_id)
+            .fetch_one(&pool)
+            .await?;
+    assert!(
+        expires_at > time::OffsetDateTime::now_utc() + time::Duration::days(29),
+        "fresh expires_at must be > now + 29 days, got {expires_at}"
+    );
+    assert_eq!(
+        rotation_status, "current",
+        "rotation must reset rotation_status to 'current'"
+    );
+    Ok(())
+}
+
+/// Rotating an identity that does not exist is `StoreError::NotFound` —
+/// the route surfaces this as 404. The function does not try to first
+/// read and then write (a check-then-act that would race a concurrent
+/// delete); the final `get_service_identity` re-read is what raises the
+/// `NotFound` if the `UPDATE`s touched zero rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rotate_an_unknown_identity_is_not_found(pool: PgPool) -> sqlx::Result<()> {
+    let bogus = uuid::Uuid::from_u128(0xDEAD_BEEF);
+    let err = rotate_service_identity(&pool, bogus, || ("unused".to_owned(), "unused".to_owned()))
+        .await
+        .expect_err("rotating an unknown identity must surface NotFound");
+    assert!(matches!(err, StoreError::NotFound), "got {err:?}");
+    Ok(())
+}
+
+/// The mint callback's exception short-circuits the whole transaction —
+/// if it returns a (token, hash) pair that the SQL layer can use, every
+/// other invariant (revocation, expiry reset, row insert) holds. This
+/// test pins down the response field carrying the exact secret the
+/// callback returned, which is the load-bearing property: the caller must
+/// see the same string that was hashed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn rotate_response_secret_matches_the_mint_callback_output(pool: PgPool) -> sqlx::Result<()> {
+    let identity_id = seed_service_identity(&pool, "ingestion-worker").await?;
+
+    let expected_secret = "callers-raw-secret-string";
+    let response = rotate_service_identity(&pool, identity_id, || {
+        (expected_secret.to_owned(), "expected-hash".to_owned())
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(response.secret, expected_secret);
+    assert_eq!(
+        response.identity.id,
+        identity_id.to_string(),
+        "the response must carry the freshly re-read identity, including the post-rotation expires_at/rotation_status"
+    );
+    assert_eq!(response.identity.rotation_status, "current");
     Ok(())
 }

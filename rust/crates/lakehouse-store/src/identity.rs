@@ -872,6 +872,125 @@ pub async fn create_service_identity(
     get_service_identity(pool, &id.to_string()).await
 }
 
+/// What [`rotate_service_identity`] returns: the fresh raw token, returned
+/// to the caller exactly once, alongside the re-read identity.
+///
+/// The `secret` is the raw opaque token whose SHA-256 hex digest was just
+/// persisted to `service_credential.token_hash`. It is the only place in
+/// the codebase this raw value is ever returned — every list/get route on
+/// `service_identity` returns credential *metadata*, never a hash's input.
+/// Mirrors how a session's raw token is returned only at login/rotate time
+/// and never again from any subsequent `/api/auth/sessions`/`/me`/etc.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RotateServiceIdentityResponse {
+    /// The newly minted raw token, returned exactly once on this response.
+    /// Invariant: never persisted in plaintext, never re-served by any list
+    /// or get route (see [`rotate_service_identity`]'s doc comment for why
+    /// the only honest read-back is the freshly-issued one). Serializes as
+    /// `secret` to match the contract's `secret: string` field.
+    pub secret: String,
+    /// The service identity after the rotation's three writes have landed:
+    /// `expires_at` reset to a fresh `NEW_IDENTITY_VALIDITY_DAYS` window and
+    /// `rotation_status` reset to `"current"`. Serializes as `identity`.
+    pub identity: ServiceIdentity,
+}
+
+/// Revoke every currently-unrevoked credential for `identity_id`, mint a
+/// fresh credential, and reset `expires_at` to a fresh
+/// `NEW_IDENTITY_VALIDITY_DAYS` window and `rotation_status` to
+/// `"current"`, all in one transaction.
+///
+/// # Why the `mint_credential` callback rather than minting inline
+///
+/// `lakehouse-auth` already owns the CSPRNG (`generate_opaque_token`) +
+/// SHA-256 (`hash_token`) pair that turns a credential into a row in
+/// `service_credential`. Inlining those two functions here would be a
+/// second copy of the same guard — the very thing AGENTS.md rule 4 calls a
+/// "finding". But `lakehouse-auth` already depends on `lakehouse-store`
+/// (`lakehouse_auth::repository`'s re-export of `lakehouse_store::PgPool`),
+/// so importing `lakehouse-auth::token::*` from `lakehouse-store` would be a
+/// Cargo cycle Cargo refuses to build. A callback makes the contract
+/// explicit: this function owns the SQL transaction shape (revoke, reset,
+/// insert, commit), and a caller-owned closure owns "where the (raw token,
+/// hash) pair comes from". The route handler at
+/// `lakehouse-api/src/routes/identity::rotate_service_identity` provides
+/// the closure, using `lakehouse_auth::token::generate_opaque_token` +
+/// `lakehouse_auth::token::hash_token` — no duplication of either.
+///
+/// # Hard Requirement 5 — old credential's fate
+///
+/// Every currently-unrevoked `service_credential` row for `identity_id` is
+/// marked `revoked_at = now()` BEFORE the new row is inserted, and the
+/// transaction holds both writes — so a leak window between the two is
+/// closed: the moment rotation succeeds, every previously-valid token for
+/// this identity is rejected by `lakehouse_auth::service_token::
+/// verify_service_token` (it filters on `revoked_at IS NULL` and the
+/// never-reissued token's hash no longer matches any unrevoked row).
+/// `rotate_revokes_the_old_credential_immediately` is the load-bearing
+/// test for this property; it lives in `lakehouse-auth`'s test suite (it
+/// needs `verify_service_token`, which `lakehouse-store`'s tests cannot
+/// import — same cycle).
+///
+/// # Errors
+///
+/// * [`StoreError::NotFound`] if `identity_id` does not exist (the final
+///   `get_service_identity` re-read sees zero rows after the `UPDATE`
+///   touched zero rows, so the same `NotFound` covers both "no such id"
+///   and a non-UUID `id` — the parser rejects the latter before this
+///   function runs).
+/// * [`StoreError::Database`] on any storage failure, including a FK
+///   violation if `identity_id` was deleted between the UPDATE and the
+///   subsequent INSERT — surface as a classified `ApiError::Internal`,
+///   never an upstream-text interpolation.
+pub async fn rotate_service_identity(
+    pool: &PgPool,
+    identity_id: Uuid,
+    mint_credential: impl FnOnce() -> (String, String),
+) -> Result<RotateServiceIdentityResponse, StoreError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "UPDATE service_credential SET revoked_at = now() \
+         WHERE service_identity_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(identity_id)
+    .execute(&mut *tx)
+    .await?;
+    let new_expires_at =
+        OffsetDateTime::now_utc() + time::Duration::days(NEW_IDENTITY_VALIDITY_DAYS);
+    let rotated = sqlx::query(
+        "UPDATE service_identity SET rotation_status = 'current', expires_at = $2, updated_at = now() \
+         WHERE id = $1",
+    )
+    .bind(identity_id)
+    .bind(new_expires_at)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    // Detect "no such identity" before the INSERT below — otherwise the
+    // missing FK raises `ForeignKeyViolation` (a 400-mapped class), which
+    // would be the wrong response shape for "this id does not exist"
+    // (404-mapped `NotFound`). Raising here drops the transaction so the
+    // revocation write is also rolled back, leaving every previously-valid
+    // credential unchanged.
+    if rotated == 0 {
+        return Err(StoreError::NotFound);
+    }
+    let (raw_token, token_hash) = mint_credential();
+    sqlx::query("INSERT INTO service_credential (service_identity_id, token_hash) VALUES ($1, $2)")
+        .bind(identity_id)
+        .bind(&token_hash)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    let identity = get_service_identity(pool, &identity_id.to_string()).await?;
+    Ok(RotateServiceIdentityResponse {
+        secret: raw_token,
+        identity,
+    })
+}
+
 /// Delete a service identity.
 ///
 /// # Errors

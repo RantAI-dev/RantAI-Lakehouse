@@ -385,6 +385,14 @@ fn identity_router() -> Router<AppState> {
             "/api/identity/service-identities",
             get(identity::list_service_identities).post(identity::create_service_identity),
         )
+        // WS8 plan §Phase E (Hard Requirement 5): rotate a service
+        // identity's credential. `{id}` is validated as a UUID inside the
+        // handler (400 on a malformed id, 404 via `StoreError::NotFound`
+        // on a well-formed id with no row).
+        .route(
+            "/api/identity/service-identities/{id}/rotate",
+            axum::routing::post(identity::rotate_service_identity),
+        )
 }
 
 /// The `/api/knowledge/*` sub-router (Task 2.8), split out for the same
