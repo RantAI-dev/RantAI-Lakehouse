@@ -605,6 +605,43 @@ fn resolve_debezium_source_target(
                 connector_class: debezium_connector_class(driver),
             })
         }
+        Some("mongodb") => {
+            // WS9 §Phase E / E1: the `mongodb` adapter is NOT a
+            // `SqlDriver` variant (`MongoDB` is a document store, not a
+            // SQL/CDC source for `SqlDriver`'s purposes), so the
+            // dispatch here is on the adapter string itself. The mongo
+            // source block in `render_debezium_properties_template` only
+            // reads `source.connector_slug` (for the offset/schema-
+            // history filenames and topic prefix) and
+            // `source.schema_qualified_table` (currently a no-op for
+            // mongo, kept for parity with the postgres/mysql/mssql
+            // branches); the host/port/database/user fields of
+            // `DebeziumSourceSpec` are validated but never interpolated
+            // into the mongo branch — so we hand the resolver safe,
+            // non-empty placeholder values here rather than inventing a
+            // real host/port from `MongoDial.hosts` (the operator's
+            // real MongoDB host:port are env-var references in the
+            // rendered template, resolved by the container's shell,
+            // never by us).
+            let parsed = Dial::parse("mongodb", &dial_info.dial).map_err(|err| {
+                ApiError::BadRequest(format!(
+                    "connector {id}'s dial does not parse as a mongodb dial: {err}"
+                ))
+            })?;
+            if !matches!(parsed, Dial::Mongo(_)) {
+                return Err(ApiError::BadRequest(format!(
+                    "connector {id} is registered with adapter \"mongodb\" but its parsed \
+                     dial is not a Mongo dial"
+                )));
+            }
+            Ok(DebeziumSourceTarget {
+                host: "mongo.placeholder".to_owned(),
+                port: 27017,
+                database: "placeholder".to_owned(),
+                user: "placeholder".to_owned(),
+                connector_class: lakehouse_store::cdc::MONGO_CONNECTOR_CLASS,
+            })
+        }
         None if dial_info.kind.to_lowercase().contains("postgres") => {
             let Some(target) = connector_probe::parse_postgres_host(&dial_info.host) else {
                 return Err(ApiError::BadRequest(format!(
@@ -622,8 +659,8 @@ fn resolve_debezium_source_target(
         }
         _ => Err(ApiError::BadRequest(format!(
             "connector {id} is type {kind:?} with adapter {adapter:?} — Debezium properties \
-             only apply to a sql/cdc adapter connector, or a legacy null-adapter PostgreSQL \
-             connector",
+             only apply to a sql/cdc/mongodb adapter connector, or a legacy null-adapter \
+             PostgreSQL connector",
             kind = dial_info.kind,
             adapter = dial_info.adapter,
         ))),
@@ -640,15 +677,20 @@ fn resolve_debezium_source_target(
 /// expose the deployment's database password, S3 keys, and catalog
 /// token to any `connector:manage` principal) rather than a shortcut.
 ///
-/// # Adapter dispatch (WS3 item 15)
+/// # Adapter dispatch (WS3 item 15, WS9 §Phase E / E1)
 ///
 /// A connector whose `adapter` column (`0033_connector_ingest_spec.sql`) is
 /// `sql` or `cdc` has its connection fields read from the structured
 /// `dial` column via [`Dial::parse`] — this covers `postgres`, `mysql`,
 /// and `mssql` drivers, each rendering its own real `Debezium` connector
-/// class via [`debezium_connector_class`]. A connector with `adapter IS
-/// NULL` (a pre-WS3 row) falls back to the ORIGINAL `kind`-string check
-/// plus [`connector_probe::parse_postgres_host`]'s `host`-string parsing —
+/// class via [`debezium_connector_class`]. A connector whose `adapter` is
+/// `mongodb` (WS9 §Phase E) is dispatched on the adapter string itself,
+/// since `MongoDB` is not a `SqlDriver` variant; its rendered template
+/// carries a single `mongodb.connection.string` env-var-reference
+/// instead of the SQL source's per-field host/port/user/password/dbname.
+/// A connector with `adapter IS NULL` (a pre-WS3 row) falls back to the
+/// ORIGINAL `kind`-string check plus
+/// [`connector_probe::parse_postgres_host`]'s `host`-string parsing —
 /// mirrors the same `adapter`-first-then-legacy-`kind` pattern
 /// `connector_probe::probe`'s own dispatch and the connector-deletion
 /// deprovision step already use (WS3 plan review X4, Z14). Every other
@@ -658,16 +700,18 @@ fn resolve_debezium_source_target(
 ///
 /// # Errors
 ///
-/// 404 if `id` is unknown; 400 if the connector is not a `sql`/`cdc`
-/// adapter connector (nor a legacy null-adapter `PostgreSQL` connector),
-/// its dial does not parse or is not shaped `sql`/`cdc`, a legacy
-/// connector's `host` is not shaped `"<user>@<host>:<port>/<database>"`,
-/// its `secretRef` is not an `env:`-scheme reference (this template can
-/// only name an env var, so a `vault:`-scheme or other reference cannot be
-/// rendered as one — an honest 400, not a guess), `table` is missing or
-/// blank, or any field fails `DebeziumSourceSpec`/
-/// `render_debezium_properties_template`'s validation; 503/500 as every
-/// other connector route.
+/// 404 if `id` is unknown; 400 if the connector is not a
+/// `sql`/`cdc`/`mongodb` adapter connector (nor a legacy null-adapter
+/// `PostgreSQL` connector), its dial does not parse or is not shaped
+/// `sql`/`cdc`/`mongodb`, a legacy connector's `host` is not shaped
+/// `"<user>@<host>:<port>/<database>"`, its `secretRef` is not an
+/// `env:`-scheme reference (this template can only name an env var, so
+/// a `vault:`-scheme or other reference cannot be rendered as one — an
+/// honest 400, not a guess), `table` is missing or blank, or any field
+/// fails `DebeziumSourceSpec`/`render_debezium_properties_template`'s
+/// validation; 409 for an Oracle-driver CDC connector arriving with
+/// `ORACLE_CDC_LOGMINER_ENABLED=false`; 503/500 as every other
+/// connector route.
 pub async fn debezium_properties(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1729,5 +1773,43 @@ mod tests {
             .await
             .expect("a non-Postgres, null-adapter connector must never attempt a dial");
         assert!(result.is_none());
+    }
+
+    // ---- WS9 §Phase E / E1 dispatch tests ----
+
+    /// WS9 §Phase E / E1: the `mongodb` adapter's dispatch lives in
+    /// [`resolve_debezium_source_target`] (not on [`SqlDriver`], since
+    /// `MongoDB` is not a SQL/CDC source) and returns a target carrying
+    /// the real `Debezium` `MongoDB` connector class — `Some("mongodb")`
+    /// is the second dispatch the plan calls out, alongside the existing
+    /// `sql`/`cdc` arms. The test passes through
+    /// `resolve_debezium_source_target` directly (no router, no DB) so it
+    /// stays inside `cargo test -p lakehouse-api --lib`, never the
+    /// `tests/` directory's `#[sqlx::test]`-backed harness.
+    #[test]
+    fn mongodb_adapter_dispatch_returns_the_mongo_connector_class() {
+        let info = ConnectorDialInfo {
+            kind: "MongoDB CDC".to_owned(),
+            host: "mongo.internal:27017".to_owned(),
+            secret_ref: "env:CONNECTOR_MONGO_PASSWORD".to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some("mongodb".to_owned()),
+            dial: serde_json::json!({
+                "hosts": ["mongo-a.internal:27017"],
+                "database": "oms",
+                "username": "cdc_reader",
+                "directConnection": true,
+            }),
+        };
+        let target = resolve_debezium_source_target("conn-mongo-1", &info)
+            .expect("a mongodb adapter with a Mongo-shaped dial must dispatch");
+        assert_eq!(
+            target.connector_class,
+            lakehouse_store::cdc::MONGO_CONNECTOR_CLASS
+        );
+        assert_eq!(
+            target.connector_class,
+            "io.debezium.connector.mongodb.MongoDbConnector"
+        );
     }
 }

@@ -590,7 +590,13 @@ pub struct DebeziumEnvRefs<'a> {
 /// `Debezium` also supports non-Postgres CDC sources, but the class name
 /// hardcoded here before this parameter existed was always the Postgres
 /// one, which would silently mislabel a `mysql`/`mssql` connector's
-/// rendered template). The caller picks the value; this function only
+/// rendered template). WS9 §Phase E adds the `MongoDB` connector class
+/// `"io.debezium.connector.mongodb.MongoDbConnector"` to this set; the
+/// `MongoDB` connector's properties are materially different from the SQL
+/// source's (no replication slot, no publication, no `plugin.name=
+/// pgoutput`, no per-field hostname/port/user/password/dbname — a single
+/// `mongodb.connection.string` instead), so the source-side block below
+/// branches on the value. The caller picks the value; this function only
 /// interpolates it verbatim (it is a static, deployment-chosen string, not
 /// user input, so it gets no `reject_control_characters`/
 /// `validate_env_var_ref`-style validation of its own).
@@ -621,10 +627,62 @@ pub fn render_debezium_properties_template(
         .catalog_token_ref
         .map(|name| format!("debezium.sink.iceberg.token=${{{name}}}\n"))
         .unwrap_or_default();
-    let schema = source
-        .schema_qualified_table
-        .split_once('.')
-        .map_or(source.schema_qualified_table.as_str(), |(schema, _)| schema);
+
+    // MongoDB has no replication slot, no publication, no `plugin.name=
+    // pgoutput`, and no numeric server id — see the WS9 plan's
+    // `render_debezium_properties_template` step 2. It IS addressed by a
+    // single connection string the Debezium MongoDB connector parses
+    // itself, with the operator's host and port carried as `${...}`
+    // references the deployment's shell expands at container start —
+    // matching every other credential-shaped field this template already
+    // renders as a reference rather than a resolved value. The two
+    // `CONNECTOR_MONGO_HOST` / `CONNECTOR_MONGO_PORT` literal names are
+    // deployment-chosen env var names (not user input), so they get no
+    // `validate_env_var_ref`-style check of their own.
+    let source_block = if connector_class == MONGO_CONNECTOR_CLASS {
+        format!(
+            "debezium.source.connector.class={connector_class}\n\
+             debezium.source.offset.storage=org.apache.kafka.connect.storage.FileOffsetBackingStore\n\
+             debezium.source.offset.storage.file.filename=/debezium/data/{slug}-offsets.dat\n\
+             debezium.source.offset.flush.interval.ms=0\n\
+             debezium.source.mongodb.connection.string=mongodb://${{CONNECTOR_MONGO_HOST}}:${{CONNECTOR_MONGO_PORT}}/?directConnection=true\n\
+             debezium.source.topic.prefix={slug}\n\
+             debezium.source.schema.history.internal=io.debezium.storage.file.history.FileSchemaHistory\n\
+             debezium.source.schema.history.internal.file.filename=/debezium/data/{slug}-schema-history.dat\n",
+        )
+    } else {
+        let schema = source
+            .schema_qualified_table
+            .split_once('.')
+            .map_or(source.schema_qualified_table.as_str(), |(schema, _)| schema);
+        format!(
+            "debezium.source.connector.class={connector_class}\n\
+             debezium.source.offset.storage=org.apache.kafka.connect.storage.FileOffsetBackingStore\n\
+             debezium.source.offset.storage.file.filename=/debezium/data/{slug}-offsets.dat\n\
+             debezium.source.offset.flush.interval.ms=0\n\
+             debezium.source.database.hostname={hostname}\n\
+             debezium.source.database.port={port}\n\
+             debezium.source.database.user={user}\n\
+             debezium.source.database.password=${{{database_password_ref}}}\n\
+             debezium.source.database.dbname={dbname}\n\
+             debezium.source.topic.prefix={slug}\n\
+             debezium.source.schema.include.list={schema}\n\
+             debezium.source.table.include.list={table}\n\
+             debezium.source.plugin.name=pgoutput\n\
+             debezium.source.slot.name={slug}_slot\n\
+             debezium.source.publication.name={slug}_pub\n\
+             debezium.source.publication.autocreate.mode=disabled\n\
+             debezium.source.schema.history.internal=io.debezium.storage.file.history.FileSchemaHistory\n\
+             debezium.source.schema.history.internal.file.filename=/debezium/data/{slug}-schema-history.dat\n",
+            hostname = source.database_hostname,
+            port = source.database_port,
+            user = source.database_user,
+            database_password_ref = refs.database_password_ref,
+            dbname = source.database_name,
+            schema = schema,
+            table = source.schema_qualified_table,
+        )
+    };
 
     Ok(format!(
         "debezium.sink.type=iceberg\n\
@@ -644,38 +702,24 @@ pub fn render_debezium_properties_template(
          debezium.sink.iceberg.destination-uppercase-table-names=false\n\
          debezium.sink.iceberg.write.format.default=parquet\n\
          \n\
-         debezium.source.connector.class={connector_class}\n\
-         debezium.source.offset.storage=org.apache.kafka.connect.storage.FileOffsetBackingStore\n\
-         debezium.source.offset.storage.file.filename=/debezium/data/{slug}-offsets.dat\n\
-         debezium.source.offset.flush.interval.ms=0\n\
-         debezium.source.database.hostname={hostname}\n\
-         debezium.source.database.port={port}\n\
-         debezium.source.database.user={user}\n\
-         debezium.source.database.password=${{{database_password_ref}}}\n\
-         debezium.source.database.dbname={dbname}\n\
-         debezium.source.topic.prefix={slug}\n\
-         debezium.source.schema.include.list={schema}\n\
-         debezium.source.table.include.list={table}\n\
-         debezium.source.plugin.name=pgoutput\n\
-         debezium.source.slot.name={slug}_slot\n\
-         debezium.source.publication.name={slug}_pub\n\
-         debezium.source.publication.autocreate.mode=disabled\n\
-         debezium.source.schema.history.internal=io.debezium.storage.file.history.FileSchemaHistory\n\
-         debezium.source.schema.history.internal.file.filename=/debezium/data/{slug}-schema-history.dat\n",
+         {source_block}",
         catalog_uri = sink.catalog_uri,
         warehouse = sink.warehouse,
         s3_endpoint = sink.s3_endpoint,
         s3_access_key_ref = refs.s3_access_key_ref,
         s3_secret_key_ref = refs.s3_secret_key_ref,
-        connector_class = connector_class,
-        hostname = source.database_hostname,
-        port = source.database_port,
-        user = source.database_user,
-        database_password_ref = refs.database_password_ref,
-        dbname = source.database_name,
-        table = source.schema_qualified_table,
     ))
 }
+
+/// The Debezium `MongoDB` connector's class name — a single constant
+/// referenced from both [`render_debezium_properties_template`]'s
+/// source-block branch (which renders the mongo-specific properties when
+/// this is the `connector_class`) and from `routes::connectors`'s
+/// adapter-dispatch (`Some("mongodb") => MONGO_CONNECTOR_CLASS`). Two
+/// callers, one literal — matches the WS3 item 15 / WS9 §Phase E shape of
+/// the other `connector_class` values in
+/// `routes::connectors::debezium_connector_class`.
+pub const MONGO_CONNECTOR_CLASS: &str = "io.debezium.connector.mongodb.MongoDbConnector";
 
 #[cfg(test)]
 mod tests {
@@ -1287,6 +1331,85 @@ mod tests {
         // `${ENV_VAR_NAME}` reference.
         assert!(rendered.contains("debezium.source.database.password=${CONNECTOR_MYSQL_PASSWORD}"));
         assert!(!rendered.contains("hunter2"));
+    }
+
+    /// WS9 §Phase E / E1: the `MongoDB` connector class lands the same
+    /// property-template treatment WS3 item 15 added for `mysql`/`mssql`,
+    /// but with materially different source-side fields — the Debezium
+    /// `MongoDB` connector has no replication slot, no publication, no
+    /// `plugin.name=pgoutput`, and no per-field hostname/port/user/
+    /// password/dbname, addressing the source via a single
+    /// `mongodb.connection.string` whose host/port portions are
+    /// `${ENV_VAR_NAME}` references the deployment's shell expands at
+    /// container start (the same no-resolved-secret property the postgres/
+    /// mysql tests above prove, re-asserted here for a non-SQL source).
+    #[test]
+    fn template_renders_the_mongodb_connector_class_and_connection_string_env_ref() {
+        let source = DebeziumSourceSpec::new(
+            ConnectorSlug::new("orders_mongo").unwrap(),
+            "mongo.internal",
+            27017,
+            "oms",
+            "cdc_reader",
+            "oms.orders",
+        )
+        .unwrap();
+        let sink = IcebergSinkLocation {
+            catalog_uri: "http://lakekeeper:8181/catalog",
+            warehouse: "default",
+            s3_endpoint: "http://rustfs:9000",
+        };
+        let refs = DebeziumEnvRefs {
+            database_password_ref: "CONNECTOR_MONGO_PASSWORD",
+            s3_access_key_ref: "RUSTFS_ACCESS_KEY",
+            s3_secret_key_ref: "RUSTFS_SECRET_KEY",
+            catalog_token_ref: Some("LAKEKEEPER_TOKEN"),
+        };
+        let rendered =
+            render_debezium_properties_template(&source, &sink, &refs, MONGO_CONNECTOR_CLASS)
+                .unwrap();
+
+        assert!(rendered.contains(
+            "debezium.source.connector.class=io.debezium.connector.mongodb.MongoDbConnector"
+        ));
+        // The mongo branch's defining property: a single connection
+        // string with the operator's host/port carried as env-var
+        // references — same `${...}` shape every other credential-bearing
+        // field in this template uses.
+        assert!(
+            rendered.contains(
+                "debezium.source.mongodb.connection.string=mongodb://${CONNECTOR_MONGO_HOST}:${CONNECTOR_MONGO_PORT}/?directConnection=true"
+            ),
+            "mongo branch must render the env-var-reference connection string, got: {rendered}"
+        );
+        // The properties a Postgres / MySQL / MSSQL connector needs but
+        // MongoDB has no analog of: a replication slot, a publication, a
+        // numeric server id. Their absence here is what makes the
+        // mongo branch honest — a MongoDB source addressing itself by
+        // these would be a category error, not a misconfiguration.
+        assert!(
+            !rendered.contains("debezium.source.slot.name"),
+            "mongo branch must NOT carry slot.name -- mongo has no replication slot"
+        );
+        assert!(
+            !rendered.contains("debezium.source.database.server.id"),
+            "mongo branch must NOT carry database.server.id -- mongo has no numeric server id"
+        );
+        assert!(
+            !rendered.contains("debezium.source.plugin.name=pgoutput"),
+            "mongo branch must NOT carry plugin.name=pgoutput -- that is postgres-only"
+        );
+        // Same no-secret-leak property, re-asserted for the mongo branch:
+        // the host/port inside the connection string are
+        // `${ENV_VAR_NAME}` references, NEVER a resolved value.
+        assert!(
+            !rendered.contains("mongo.internal"),
+            "mongo branch must not leak the resolved source hostname"
+        );
+        assert!(
+            !rendered.contains("hunter2"),
+            "mongo branch must not leak a resolved password"
+        );
     }
 
     /// A direct, pure unit test of `validate_env_var_ref` itself — not
