@@ -143,3 +143,27 @@ def test_checking_resolver_propagates_the_batchs_own_exception_instead_of_swallo
     with pytest.raises(RuntimeError):
         with checking_resolver(getaddrinfo=_fake_getaddrinfo("93.184.216.34")):
             raise RuntimeError("the batch itself failed for an unrelated reason")
+
+def test_checking_resolver_refuses_a_link_local_ipv6_address_that_carries_a_zone_id():
+    """`fe80::1%eth0` is link-local — the range this guard exists to stop —
+    but `ipaddress.ip_address` cannot parse it until the zone id is
+    stripped. Before that strip it raised `ValueError` instead of a
+    refusal naming the reason."""
+    def fake(host, port, *args, **kwargs):
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("fe80::1%eth0", port, 0, 2))]
+
+    with checking_resolver(allow_internal_hosts=False, getaddrinfo=fake):
+        with pytest.raises(SsrfBlocked, match="private/internal/multicast"):
+            socket.getaddrinfo("broker.invalid", 9092)
+
+
+def test_checking_resolver_refuses_an_address_it_cannot_evaluate_at_all():
+    """An address this guard cannot parse has not been shown to be safe,
+    so it is refused — fail closed, with a message that says why, rather
+    than letting a bare `ValueError` abort the dial namelessly."""
+    def fake(host, port, *args, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("not-an-ip", port))]
+
+    with checking_resolver(allow_internal_hosts=False, getaddrinfo=fake):
+        with pytest.raises(SsrfBlocked, match="not an address this guard can evaluate"):
+            socket.getaddrinfo("broker.invalid", 9092)

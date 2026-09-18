@@ -200,6 +200,15 @@ def checking_resolver(*, allow_internal_hosts: bool | None = None, getaddrinfo: 
     (`INGEST_ALLOW_INTERNAL_HOSTS`) `resolve_checked` already reads --
     one operator-facing switch for both primitives, not two.
 
+    PROCESS-GLOBAL monkeypatch, like `pinned_resolution` above and safe
+    for the same stated reason: each `ingest_job` RUN processes exactly
+    one connector, so two batches never hold this context concurrently in
+    one process. Said here rather than assumed, because the restore in
+    `finally` puts back whatever `socket.getaddrinfo` was at ENTRY -- two
+    overlapping users would leave the later exit restoring an already
+    unwrapped resolver, silently ending the check for the one still
+    running.
+
     Restores the real `socket.getaddrinfo` on exit unconditionally
     (the `finally` block), including when the wrapped code itself
     raises -- this context manager never swallows or replaces the
@@ -213,7 +222,25 @@ def checking_resolver(*, allow_internal_hosts: bool | None = None, getaddrinfo: 
         infos = getaddrinfo(host, port, *args, **kwargs)
         if not allow_internal_hosts:
             for _family, _socktype, _proto, _canon, sockaddr in infos:
-                ip = ipaddress.ip_address(sockaddr[0])
+                raw = sockaddr[0]
+                # An IPv6 result can carry a zone id (`fe80::1%eth0`), and a
+                # resolver is free to return a form `ipaddress` will not
+                # parse at all. Refusing outright is the only fail-closed
+                # answer: an address this guard cannot evaluate has not been
+                # shown to be safe, and letting `ValueError` escape instead
+                # would abort the dial with an error that names no reason.
+                # The zone id is stripped first because `fe80::1%eth0` IS
+                # parseable once it is gone, and link-local is exactly the
+                # range this guard most needs to recognise rather than
+                # discard as unparseable.
+                try:
+                    ip = ipaddress.ip_address(raw.split("%", 1)[0])
+                except ValueError as exc:
+                    raise SsrfBlocked(
+                        f"refusing to dial {host!r}: connect-time resolution returned "
+                        f"{raw!r}, which is not an address this guard can evaluate "
+                        "(checking_resolver)"
+                    ) from exc
                 if _is_blocked_ip(ip):
                     raise SsrfBlocked(
                         f"refusing to dial {host!r}: connect-time resolution returned {ip}, "
