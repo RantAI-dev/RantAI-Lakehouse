@@ -119,13 +119,13 @@ async fn seed_tenant_at_status(
 }
 
 /// Step 1 (WS8 plan Task B4): a brand-new slug drives the full state
-/// machine — warehouse create, grants, namespace, complete — and the
+/// machine — warehouse create, then grants — and the
 /// response carries the real Lakekeeper warehouse id and a terminal
 /// `provisioningStatus`. Before this task's implementation, `create_tenant`
 /// was a bare Postgres insert with no `warehouseId`/`provisioningStatus`
 /// fields on the response and no Lakekeeper call at all.
 #[tokio::test]
-async fn create_tenant_provisions_a_warehouse_and_records_complete_status() {
+async fn create_tenant_provisions_a_warehouse_and_stops_honestly_at_grants_ready() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/management/v1/warehouse"))
@@ -157,7 +157,15 @@ async fn create_tenant_provisions_a_warehouse_and_records_complete_status() {
     .await;
     assert_eq!(response.status(), StatusCode::CREATED);
     let body = json_body(response).await;
-    assert_eq!(body["provisioningStatus"], "complete");
+    // `grants_ready`, NOT `complete`: the namespace step has no
+    // implementation yet (see `provision_tenant`'s comment — the only
+    // namespace-create surface is bound to the shared catalog, not a
+    // tenant warehouse). Writing `complete` here would put a completion
+    // that never happened into the database, which is exactly what
+    // migration 0042's `not_applicable` status exists to avoid for
+    // grandfathered tenants. The status an operator reads is the truth
+    // about how far provisioning actually got.
+    assert_eq!(body["provisioningStatus"], "grants_ready");
     assert!(
         body["warehouseId"].as_str().is_some(),
         "expected a warehouseId, got {body}"
@@ -200,7 +208,15 @@ async fn create_tenant_is_idempotent_on_a_repeated_slug_when_not_yet_complete() 
         "a resumed provisioning attempt must be 200, not 201 (nothing was created) or 409"
     );
     let body = json_body(response).await;
-    assert_eq!(body["provisioningStatus"], "complete");
+    // `grants_ready`, NOT `complete`: the namespace step has no
+    // implementation yet (see `provision_tenant`'s comment — the only
+    // namespace-create surface is bound to the shared catalog, not a
+    // tenant warehouse). Writing `complete` here would put a completion
+    // that never happened into the database, which is exactly what
+    // migration 0042's `not_applicable` status exists to avoid for
+    // grandfathered tenants. The status an operator reads is the truth
+    // about how far provisioning actually got.
+    assert_eq!(body["provisioningStatus"], "grants_ready");
     assert_eq!(body["warehouseId"], "wh-existing");
 }
 

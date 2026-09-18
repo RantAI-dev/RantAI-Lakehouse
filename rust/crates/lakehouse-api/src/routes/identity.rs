@@ -425,33 +425,27 @@ async fn provision_tenant(
             identity::update_tenant_provisioning_status(pool, &tenant.id, "grants_ready", None)
                 .await?;
     }
-    if tenant.provisioning_status == "grants_ready" {
-        // Registry namespace: the grand plan calls for creating this
-        // tenant's Iceberg namespace here, but `lakehouse-iceberg`'s
-        // existing namespace-create surface
-        // (`catalog::LakehouseCatalog::ensure_bronze_namespace`/
-        // `ensure_gold_namespace`) is hardcoded to this deployment's one
-        // shared bronze/gold catalog, not parameterized by an arbitrary
-        // tenant warehouse — calling either here would create a
-        // `bronze`/`gold` namespace on the WRONG catalog, not a namespace
-        // scoped to this tenant's own warehouse. `lakehouse-iceberg` is
-        // outside this task's owned files (`routes/identity.rs`,
-        // `error.rs`, `lakehouse-store/src/identity.rs`), and inventing a
-        // second, tenant-scoped Iceberg REST client here would be exactly
-        // the kind of fabricated-but-wrong call AGENTS.md rule 2 forbids.
-        // This checkpoint therefore advances without a real namespace
-        // call — an honest, disclosed gap (a real per-tenant namespace
-        // create is future work once `lakehouse-iceberg` exposes one),
-        // not a silent skip: `namespace_ready` is a distinct status a
-        // reader can see never had additional API surface built for it.
-        tenant =
-            identity::update_tenant_provisioning_status(pool, &tenant.id, "namespace_ready", None)
-                .await?;
-    }
-    if tenant.provisioning_status == "namespace_ready" {
-        tenant =
-            identity::update_tenant_provisioning_status(pool, &tenant.id, "complete", None).await?;
-    }
+    // Registry namespace: the grand plan calls for creating this tenant's
+    // Iceberg namespace here, and this state machine reserves
+    // `namespace_ready`/`complete` for it — but neither status is written
+    // yet, because no namespace is created yet. `lakehouse-iceberg`'s only
+    // namespace-create surface (`ensure_bronze_namespace`/
+    // `ensure_gold_namespace`) is hardcoded to this deployment's one shared
+    // catalog, not parameterized by a tenant warehouse, so calling it would
+    // create a namespace on the WRONG catalog; inventing a second,
+    // tenant-scoped Iceberg client here is out of this task's scope.
+    //
+    // So provisioning STOPS at `grants_ready`, and the caller is told that
+    // by the status it reads back. Advancing to `namespace_ready` and then
+    // `complete` without a namespace call would put a fabricated completion
+    // in the database — the same untruth the `not_applicable` status exists
+    // to avoid for grandfathered tenants (migration 0042's own header), and
+    // the one a code comment cannot fix, because the operator reading
+    // `provisioningStatus` never sees the comment.
+    //
+    // A warehouse exists and this stack's machine principals can write into
+    // it, which is what the two completed steps claim. Finishing the last
+    // step needs a per-tenant namespace API in `lakehouse-iceberg` first.
     Ok(tenant)
 }
 
