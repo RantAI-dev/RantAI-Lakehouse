@@ -27,6 +27,36 @@ dependencies = [
     # a future dlt version bump cannot silently drop or change it
     # without this file's own dependency list saying so.
     "s3fs==2026.7.0",
+    # WS9 plan Task B1 -- Tier 2 ingestion adapters (mongodb, oracle, kafka
+    # stream micro-batch, sftp). Verified installable for this image's
+    # interpreter (python:3.12-slim, dagster/Dockerfile) via
+    # `curl -s https://pypi.org/pypi/<pkg>/<ver>/json` on 2026-09-18: all
+    # four releases exist and each publishes a cp312 (or pure-Python
+    # py3-none-any) wheel, so none needs a source build. Newer releases
+    # exist upstream today (pymongo 4.18.1, oracledb 26.0.0, paramiko
+    # 5.0.0) but this plan's exact pins are still real, installable
+    # releases for this interpreter, so they are kept as specified rather
+    # than bumped without a reason recorded here.
+    "pymongo==4.9.2",
+    "oracledb==2.5.1",
+    # kafka-python, NOT confluent-kafka (WS9 plan Task B1, judge review
+    # K1): confluent-kafka's transport is librdkafka, a C library that
+    # resolves broker hostnames through its own internal resolver, never
+    # through Python's socket.getaddrinfo -- no check this codebase can
+    # install in Python (ssrf_guard.pinned_resolution / checking_resolver)
+    # can see or affect those lookups, and confluent-kafka's bindings
+    # expose no resolver callback to hook one into. kafka-python is a pure
+    # Python client whose connections (bootstrap, advertised, every
+    # mid-batch reconnect) all resolve through socket.getaddrinfo, which
+    # ssrf_guard.checking_resolver wraps for the whole consume batch.
+    # 3.0.11, not 2.0.2 (judge review K5): 2.0.2 is the last release of an
+    # unmaintained 2020-09-30 line; the project's maintained line resumed
+    # in 2025 (2.0.3..3.0.11). Verified 2026-09-18: 3.0.11 is still the
+    # current release on PyPI (requires_python >=3.8, ships only a
+    # py3-none-any wheel and an sdist -- pure Python, no native transport
+    # to link against, so no system package is needed for Kafka at all).
+    "kafka-python==3.0.11",
+    "paramiko==3.5.0",
 ]
 
 [build-system]
