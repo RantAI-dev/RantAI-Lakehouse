@@ -305,6 +305,39 @@ pub async fn list_connectors(
     Ok(rows.into_iter().map(Connector::from).collect())
 }
 
+/// Assign (or reassign) a connector to a tenant — the write behind `PUT
+/// /api/connectors/{id}/tenant` (WS8 plan Task C6, P2 fix). Closes the gap
+/// `0042_tenant_provisioning.sql` deliberately leaves open: that migration
+/// backfills `tenant_id` on only the two seeded connector rows, so every
+/// connector a real deployment creates afterward starts `tenant_id = NULL`
+/// and is invisible to [`list_connectors`]'s tenant-scoped reads until
+/// assigned here.
+///
+/// The `tenant_id` value is bound, never interpolated into the SQL text
+/// (AGENTS.md: "SQL values bound, `format!` only for constant
+/// identifiers").
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if no connector with `id` exists.
+/// `routes::connectors::assign_connector_tenant` checks
+/// `identity::tenant_exists` before calling this, so a foreign-key
+/// violation on `tenant_id` should not occur in practice; a
+/// [`StoreError::ForeignKeyViolation`] surfaces if it somehow does (a
+/// caller who raced a tenant deletion between the check and this write).
+/// Returns [`StoreError::Database`] on any other failure.
+pub async fn assign_tenant(pool: &PgPool, id: &str, tenant_id: Uuid) -> Result<(), StoreError> {
+    let result = sqlx::query("UPDATE connector SET tenant_id = $1 WHERE id = $2")
+        .bind(tenant_id)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
 /// Fetch one connector's detail: base fields plus dependent pipelines
 /// derived from `pipeline_definition.connector_id`.
 ///

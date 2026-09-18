@@ -31,6 +31,7 @@ use lakehouse_store::connectors::{self, ConnectorDetail, ConnectorDialInfo, Crea
 use lakehouse_store::ingest_spec::{Dial, SqlDriver};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::connector_deprovision::{self, DeprovisionError, Deprovisioned, PgTarget};
 use crate::connector_probe;
@@ -1040,6 +1041,62 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Body for `PUT /api/connectors/{id}/tenant`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignTenantBody {
+    tenant_id: Uuid,
+}
+
+/// `PUT /api/connectors/{id}/tenant` — assign (or reassign) a connector to
+/// a tenant.
+///
+/// # Why a distinct route, not a field on `POST`/an update body
+///
+/// A connector's tenant is a governance decision (who is allowed to see
+/// and manage this row), made independently of whoever defined its dial
+/// config, and worth its own explicit audit trail entry rather than being
+/// folded into an unrelated create/update diff (WS8 plan Task C6, P2 fix
+/// — see the module the plan's Task C6 section names).
+///
+/// # Why this exists at all
+///
+/// `0042_tenant_provisioning.sql` backfills `tenant_id` on only the two
+/// connector rows `0022_prune_connector_seed.sql` seeds — every connector a
+/// real deployment creates afterward starts `tenant_id = NULL` and is
+/// invisible to `GET /api/connectors`'s tenant-scoped read (Task C2) until
+/// assigned. This route is how an operator closes that gap, rather than
+/// leaving it disclosed only in a migration comment nobody reading the API
+/// ever sees.
+///
+/// # Errors
+///
+/// 404 if either the connector id or the tenant id does not exist — the
+/// same status for both, deliberately: this route must not become a
+/// discovery oracle for which tenant ids exist (mirrors `tenant_scope::
+/// resolve`'s own 404-not-403 rule). 400 for a malformed body. 503 if no
+/// pool is configured; 500 on any other database failure.
+pub async fn assign_connector_tenant(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<StatusCode> {
+    let AssignTenantBody { tenant_id } = parse_body(&body)?;
+    let pool = pool(&state)?;
+    if !lakehouse_store::identity::tenant_exists(pool, tenant_id).await? {
+        return Err(ApiError::NotFound("tenant not found".to_owned()).into());
+    }
+    connectors::assign_tenant(pool, &id, tenant_id)
+        .await
+        .map_err(|err| match err {
+            lakehouse_store::StoreError::NotFound => {
+                ApiError::NotFound(format!("Connector {id} not found"))
+            }
+            other => other.into(),
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// `GET /api/connectors/{id}/ingest-spec` — a connector's ingest
 /// configuration.
 ///
@@ -1796,5 +1853,144 @@ mod tests {
             .await
             .expect_err("a foreign X-Tenant must be refused");
         assert_eq!(err.0.status(), 404);
+    }
+
+    /// `PUT /api/connectors/{id}/tenant` — WS8 plan Task C6, P2 fix.
+    mod assign_tenant_route {
+        use lakehouse_store::identity::{self, CreateTenantInput};
+
+        use super::super::*;
+        use crate::config::Config;
+
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database"),
+            )
+        }
+
+        fn state_for(pool: &sqlx::PgPool) -> AppState {
+            let mut env = std::collections::HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        async fn seed_tenant(pool: &sqlx::PgPool, slug: &str) -> uuid::Uuid {
+            let tenant = identity::create_tenant(
+                pool,
+                &CreateTenantInput {
+                    name: "Acme Co".to_owned(),
+                    slug: slug.to_owned(),
+                    plan: "Standard".to_owned(),
+                    residency: "US".to_owned(),
+                },
+            )
+            .await
+            .expect("create a test tenant");
+            tenant
+                .id
+                .parse()
+                .expect("create_tenant returns a UUID-shaped id")
+        }
+
+        /// A connector with `tenant_id = NULL` — `create_connector` never
+        /// sets it, matching every connector a real deployment creates
+        /// after `0042_tenant_provisioning.sql` (whose own backfill only
+        /// touches the two seeded rows).
+        async fn seed_connector_with_null_tenant(pool: &sqlx::PgPool, name: &str) -> String {
+            let created = connectors::create_connector(
+                pool,
+                &connectors::CreateConnectorInput {
+                    name: name.to_owned(),
+                    kind: "PostgreSQL CDC".to_owned(),
+                    direction: "source".to_owned(),
+                    host: "db.internal:5432".to_owned(),
+                    secret_ref: "env:TEST_SECRET".to_owned(),
+                    secret_ref_secondary: None,
+                    environment: "staging".to_owned(),
+                    tenant: "Acme Co".to_owned(),
+                    residency: "US".to_owned(),
+                    capabilities: Vec::new(),
+                    owner: None,
+                },
+            )
+            .await
+            .expect("create a test connector");
+            created.id
+        }
+
+        fn assign_body(tenant_id: uuid::Uuid) -> Bytes {
+            Bytes::from(
+                serde_json::to_vec(&json!({ "tenantId": tenant_id.to_string() }))
+                    .expect("serialize"),
+            )
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn assigns_and_is_then_visible_in_the_scoped_list(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let tenant_id = seed_tenant(&pool, "c6-assign").await;
+            let connector_id = seed_connector_with_null_tenant(&pool, "c6-connector").await;
+
+            let status = assign_connector_tenant(
+                State(state),
+                Path(connector_id.clone()),
+                assign_body(tenant_id),
+            )
+            .await
+            .expect("assignment should succeed");
+            assert_eq!(status, StatusCode::NO_CONTENT);
+
+            let rows = connectors::list_connectors(
+                &pool,
+                &connectors::ConnectorFilter {
+                    tenant_id: Some(tenant_id),
+                },
+            )
+            .await
+            .expect("list_connectors should succeed");
+            assert!(
+                rows.iter().any(|r| r.id == connector_id),
+                "the assigned connector must now be visible in its tenant's scoped list"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn refuses_an_unknown_tenant_id_with_404(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let connector_id = seed_connector_with_null_tenant(&pool, "c6-orphan").await;
+            let unknown_tenant = uuid::Uuid::new_v4();
+
+            let err = assign_connector_tenant(
+                State(state),
+                Path(connector_id),
+                assign_body(unknown_tenant),
+            )
+            .await
+            .expect_err("an unknown tenant id must be refused");
+            assert_eq!(err.0.status(), 404);
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn refuses_an_unknown_connector_id_with_404(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let tenant_id = seed_tenant(&pool, "c6-no-connector").await;
+
+            let err = assign_connector_tenant(
+                State(state),
+                Path("does-not-exist".to_owned()),
+                assign_body(tenant_id),
+            )
+            .await
+            .expect_err("an unknown connector id must be refused");
+            assert_eq!(err.0.status(), 404);
+        }
     }
 }

@@ -15,9 +15,12 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use iceberg::{NamespaceIdent, TableIdent};
+use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_iceberg::rest::{
     self, RestError, SnapshotDetail, TableDetail, TableSummary, WarehouseSummary,
@@ -68,12 +71,16 @@ fn validate_warehouse(state: &AppState, warehouse: Option<&str>) -> Result<(), A
     }
 }
 
+/// Borrow the Postgres pool, or fail with a 503. Shared by every Postgres-
+/// backed read in this module — the maintenance-policy store (WS2 §4) and,
+/// as of WS8 plan Task C4, the tenant lookup [`warehouses`] needs to scope
+/// its response — hence the generic message, not a maintenance-policy-
+/// specific one that would misdescribe a tenant-lookup failure.
 fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
-    state.pg.as_deref().ok_or_else(|| {
-        ApiError::Unavailable(
-            "maintenance policy store unavailable: no Postgres pool is configured".to_owned(),
-        )
-    })
+    state
+        .pg
+        .as_deref()
+        .ok_or_else(|| ApiError::Unavailable("no Postgres pool is configured".to_owned()))
 }
 
 /// Classifies a [`RestError`] into a fixed [`ApiError`], logging the real
@@ -415,11 +422,66 @@ async fn maintenance_verb_runs_or_empty(
     }
 }
 
-/// `GET /api/lakehouse/warehouses`.
+/// `GET /api/lakehouse/warehouses` — the caller's tenant's own warehouse,
+/// never every warehouse this deployment happens to know about.
+///
+/// # Tenant scoping (WS8 plan Task C4, Hard Requirement 2)
+///
+/// `tenant_scope::resolve` runs first, fail closed: a principal belonging
+/// to zero tenants (`Ok(None)`) gets an EMPTY list, returned before the
+/// Lakekeeper catalog is ever contacted — never "unscoped, show the
+/// deployment's warehouse to everyone."
+///
+/// # Deviation from the plan's Task C4 pseudocode
+///
+/// The plan's Step 1/Step 2 assume `list_warehouses()` is a real,
+/// multi-warehouse Lakekeeper `Management API` call this route filters by
+/// id. That is not how this route (or `lakehouse_iceberg::rest::
+/// list_warehouses`, see its own module doc comment) actually works: the
+/// Management API's warehouse listing is admin-scoped and no long-running
+/// service in this stack holds an admin token, so [`rest::list_warehouses`]
+/// always reports exactly ONE warehouse — the single one this deployment
+/// is configured against (`Config::lakekeeper_warehouse`) — verified
+/// reachable, never filtered from a longer list. Scoping this route by
+/// `tenant.warehouse_id` therefore means: resolve the tenant, read its
+/// `warehouse_id`, and only call Lakekeeper (returning that one
+/// configured warehouse) when the tenant's own `warehouse_id` names the
+/// SAME warehouse this deployment serves. A tenant with no `warehouse_id`
+/// (not provisioned, or a grandfathered `not_applicable` tenant —
+/// `0042_tenant_provisioning.sql`) or one whose `warehouse_id` names a
+/// DIFFERENT warehouse gets an empty list — never a fallback to the
+/// shared/demo warehouse it does not itself own — and, in both cases,
+/// without ever calling Lakekeeper (cheap AND fail-closed, matching the
+/// no-tenant branch above).
 ///
 /// # Errors
-/// 503 if the catalog cannot be reached.
-pub async fn warehouses(State(state): State<AppState>) -> ApiResult<ApiJson<Value>> {
+///
+/// 404 if `X-Tenant` names a tenant the caller does not belong to
+/// (`tenant_scope::resolve`). 503 if no pool is configured or the
+/// Lakekeeper catalog cannot be reached; 500 on a database failure reading
+/// the tenant row.
+pub async fn warehouses(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Value>> {
+    let Some(tenant_id) = crate::tenant_scope::resolve(&principal, &headers)? else {
+        return Ok(ApiJson(warehouses_body(&[])));
+    };
+    let tenant =
+        lakehouse_store::identity::get_tenant(pool(&state)?, &tenant_id.to_string()).await?;
+    let Some(tenant_warehouse_id) = tenant.warehouse_id else {
+        // Not provisioned (or `not_applicable`) -- nothing of its own to
+        // show. Never falls back to the deployment's shared warehouse.
+        return Ok(ApiJson(warehouses_body(&[])));
+    };
+    if tenant_warehouse_id != state.config.lakekeeper_warehouse {
+        // The tenant's own warehouse isn't the one this deployment
+        // actually serves -- same "nothing of its own to show" outcome,
+        // and no Lakekeeper call for a warehouse that would never be
+        // returned anyway.
+        return Ok(ApiJson(warehouses_body(&[])));
+    }
     let client = lakehouse_catalog::client(&state)
         .await
         .map_err(|err| classify_catalog_access_error(err, "warehouse"))?;
@@ -1562,6 +1624,248 @@ mod tests {
 
             assert_eq!(err.status(), 503);
             assert_eq!(err.to_string(), "maintenance history is unavailable");
+        }
+    }
+
+    /// `GET /api/lakehouse/warehouses` tenant scoping — WS8 plan Task C4.
+    ///
+    /// # Deviation from the plan's Task C4 pseudocode
+    ///
+    /// The plan's own Step 1 assumes a `mock_lakekeeper_warehouse_list`
+    /// wiremock helper standing in for a real, multi-warehouse Lakekeeper
+    /// `Management API` listing this route filters by id. No such helper
+    /// exists anywhere in this codebase, and could not: `[warehouses]`'s
+    /// doc comment (this file, above) and `lakehouse_iceberg::rest::
+    /// list_warehouses`'s own module doc comment both establish that this
+    /// service never lists warehouses from Lakekeeper's Management API at
+    /// all (admin-scoped, no long-running service holds that token) — it
+    /// always reports exactly the ONE configured warehouse, verified
+    /// reachable via a real Iceberg REST catalog handshake
+    /// (`IcebergClient::connect`, `GET /v1/config`). The only existing
+    /// harness for that handshake in this repository
+    /// (`lakehouse-iceberg/tests/g1_lakekeeper.rs`) is `#[ignore]`d and
+    /// requires a live `docker compose` stack — building a wiremock stand-
+    /// in for the full Iceberg REST protocol is out of scope for this
+    /// task's own file list (`routes/lakehouse.rs` only).
+    ///
+    /// These tests instead prove the actual scoping contract the real code
+    /// implements: the store-only branches (no tenant, no `warehouse_id`,
+    /// a `warehouse_id` naming a DIFFERENT warehouse) return an empty list
+    /// WITHOUT reaching the catalog at all, and the one branch that SHOULD
+    /// reach it (`warehouse_id` matches `Config::lakekeeper_warehouse`)
+    /// demonstrably does — proven by `LAKEKEEPER_READ_TOKEN_FILE` being
+    /// left at its default, unprovisioned path
+    /// (`/tokens/lakehouse-api-reader.jwt`, `config.rs`), so a genuine
+    /// attempt to reach Lakekeeper fails fast with a 503 the moment it is
+    /// attempted, distinguishing "reached the call" from "never tried."
+    mod warehouses_route {
+        use std::collections::HashMap;
+
+        use lakehouse_auth::{PermissionSet, PrincipalId};
+        use lakehouse_store::identity::{self, CreateTenantInput, TenantFilter};
+        use uuid::Uuid;
+
+        use super::super::*;
+        use crate::config::Config;
+
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database"),
+            )
+        }
+
+        fn state_for(pool: &sqlx::PgPool) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        fn state_without_pool() -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        fn principal_with_tenants(tenant_ids: &[Uuid]) -> Principal {
+            Principal {
+                id: PrincipalId::User(Uuid::from_u128(1)),
+                tenant_ids: tenant_ids.to_vec(),
+                display_name: "Rina Wijaya".to_owned(),
+                permissions: PermissionSet::parse("catalog:read"),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: Vec::new(),
+            }
+        }
+
+        fn headers_with_x_tenant(tenant_id: Uuid) -> HeaderMap {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-tenant",
+                tenant_id
+                    .to_string()
+                    .parse()
+                    .expect("uuid renders as a valid header value"),
+            );
+            headers
+        }
+
+        async fn warehouses_array(state: &AppState, principal: &Principal) -> Vec<Value> {
+            let ApiJson(body) = warehouses(
+                State(state.clone()),
+                Extension(principal.clone()),
+                HeaderMap::new(),
+            )
+            .await
+            .expect("this branch must not error");
+            body["warehouses"]
+                .as_array()
+                .expect("warehouses array")
+                .clone()
+        }
+
+        async fn seed_tenant(pool: &sqlx::PgPool, slug: &str) -> Uuid {
+            let tenant = identity::create_tenant(
+                pool,
+                &CreateTenantInput {
+                    name: "Acme Co".to_owned(),
+                    slug: slug.to_owned(),
+                    plan: "Standard".to_owned(),
+                    residency: "US".to_owned(),
+                },
+            )
+            .await
+            .expect("create a test tenant");
+            tenant
+                .id
+                .parse()
+                .expect("create_tenant returns a UUID-shaped id")
+        }
+
+        /// Hard Requirement 2: a principal belonging to zero tenants gets
+        /// an EMPTY list, before the store is ever touched —
+        /// `state_without_pool()` proves this: reaching `pool(&state)?`
+        /// here would 503, not `Ok` with an empty body.
+        #[tokio::test]
+        async fn a_tenantless_principal_gets_an_empty_list_before_touching_the_store() {
+            let state = state_without_pool();
+            let principal = principal_with_tenants(&[]);
+
+            let warehouses = warehouses_array(&state, &principal).await;
+
+            assert!(
+                warehouses.is_empty(),
+                "Ok(None) from tenant_scope::resolve must render as an empty list"
+            );
+        }
+
+        /// `X-Tenant` naming a tenant the principal does not belong to is a
+        /// 404 (via `tenant_scope::resolve`'s own contract) — never
+        /// silently treated as "no tenant."
+        #[tokio::test]
+        async fn a_foreign_x_tenant_header_is_not_found() {
+            let state = state_without_pool();
+            let principal = principal_with_tenants(&[Uuid::from_u128(1)]);
+            let headers = headers_with_x_tenant(Uuid::from_u128(2)); // not a member
+
+            let err = warehouses(State(state), Extension(principal), headers)
+                .await
+                .expect_err("a foreign X-Tenant must be refused");
+
+            assert_eq!(err.0.status(), 404);
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_tenant_with_no_warehouse_id_gets_an_empty_list(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let tenant_id = seed_tenant(&pool, "c4-no-warehouse").await;
+            // Sanity: freshly created, never provisioned -- warehouse_id
+            // really is NULL, not a test-setup accident.
+            let stored = identity::list_tenants(&pool, &TenantFilter::default())
+                .await
+                .expect("list tenants")
+                .into_iter()
+                .find(|t| t.id == tenant_id.to_string())
+                .expect("seeded tenant");
+            assert_eq!(stored.warehouse_id, None);
+            let principal = principal_with_tenants(&[tenant_id]);
+
+            let warehouses = warehouses_array(&state, &principal).await;
+
+            assert!(
+                warehouses.is_empty(),
+                "an unprovisioned tenant must never fall back to the shared warehouse"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_tenant_whose_warehouse_id_names_a_different_warehouse_gets_an_empty_list(
+            pool: sqlx::PgPool,
+        ) {
+            let state = state_for(&pool);
+            let tenant_id = seed_tenant(&pool, "c4-other-warehouse").await;
+            identity::update_tenant_provisioning_status(
+                &pool,
+                &tenant_id.to_string(),
+                "warehouse_ready",
+                Some("not-this-deployments-warehouse"),
+            )
+            .await
+            .expect("record a warehouse id");
+            let principal = principal_with_tenants(&[tenant_id]);
+
+            let warehouses = warehouses_array(&state, &principal).await;
+
+            assert!(
+                warehouses.is_empty(),
+                "a tenant's own warehouse that this deployment does not serve must never \
+                 fall back to the shared warehouse"
+            );
+        }
+
+        /// The one branch that SHOULD reach Lakekeeper: proven by a real
+        /// attempt failing fast (503, `LAKEKEEPER_READ_TOKEN_FILE` at its
+        /// unprovisioned default) rather than short-circuiting to an empty
+        /// list the way every other branch above does.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_tenant_whose_warehouse_id_matches_the_configured_warehouse_reaches_the_catalog(
+            pool: sqlx::PgPool,
+        ) {
+            let state = state_for(&pool);
+            let tenant_id = seed_tenant(&pool, "c4-matching-warehouse").await;
+            identity::update_tenant_provisioning_status(
+                &pool,
+                &tenant_id.to_string(),
+                "warehouse_ready",
+                // `state_for` does not override `LAKEKEEPER_WAREHOUSE`, so
+                // `Config::lakekeeper_warehouse` is its default, "default"
+                // (`config.rs`).
+                Some(&state.config.lakekeeper_warehouse),
+            )
+            .await
+            .expect("record a warehouse id");
+            let principal = principal_with_tenants(&[tenant_id]);
+
+            let err = warehouses(State(state), Extension(principal), HeaderMap::new())
+                .await
+                .expect_err(
+                    "a matching warehouse_id must reach the catalog client, which fails fast \
+                 (no reader token provisioned in this test) rather than returning early",
+                );
+
+            assert_eq!(
+                err.0.status(),
+                503,
+                "must be the catalog-access failure, not a validation/auth error"
+            );
         }
     }
 }

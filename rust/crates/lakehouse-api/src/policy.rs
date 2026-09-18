@@ -297,6 +297,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/pipelines/{id}/resume",            Policy::RequiresPermission("pipeline:write")),
     ("POST", "/api/pipelines/runs/{runId}/cancel",    Policy::RequiresPermission("pipeline:write")),
     ("POST", "/api/pipelines/runs/{runId}/retry",     Policy::RequiresPermission("pipeline:write")),
+    // WS8 plan Task C7 (P2 fix): same posture as the connector assignment
+    // route above — `identity:write`, not `pipeline:write`.
+    ("PUT",  "/api/pipelines/{id}/tenant",            Policy::RequiresPermission("identity:write")),
 
     // ── Dashboard: seeded Dashboard Viewer permission `dashboard:read`.
     //    `dashboard:write` is the natural write counterpart — see module
@@ -400,6 +403,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // a READER of `/ingestible`/`ingest-spec`, it never calls this route
     // itself (WS3 item 29).
     ("POST", "/api/connectors/{id}/ingest/run", Policy::RequiresPermission("connector:manage")),
+    // WS8 plan Task C6 (P2 fix): the tenant-assignment route. `identity:
+    // write`, not `connector:manage` — this is a governance decision about
+    // WHO may see the row, the same permission every other tenant-
+    // membership write already requires (`POST /api/identity/tenants`
+    // above), not the broader "operate this connector" grant. Held today
+    // only by Platform Admin's `*:*` (`0002_seed_identity.sql`).
+    ("PUT", "/api/connectors/{id}/tenant", Policy::RequiresPermission("identity:write")),
 
     // ── Knowledge: no seeded resource — auth only. ───────────────────────
     ("GET",  "/api/knowledge/sources",       Policy::RequiresAuth),

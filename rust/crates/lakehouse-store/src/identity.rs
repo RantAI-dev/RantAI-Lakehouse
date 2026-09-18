@@ -557,6 +557,27 @@ pub async fn get_tenant(pool: &PgPool, id: &str) -> Result<Tenant, StoreError> {
     Ok(row.into())
 }
 
+/// Whether a tenant with `id` exists — the existence check
+/// `routes::connectors::assign_connector_tenant`/
+/// `routes::pipelines::assign_pipeline_tenant` (WS8 plan Tasks C6/C7) each
+/// run before writing a `connector`/`pipeline_definition` row's
+/// `tenant_id`, so an unknown tenant id 404s instead of silently creating a
+/// foreign-key violation the caller would see as a generic 500. Extracted
+/// here (rather than duplicated as an inline `EXISTS(...)` query in both
+/// route files) per AGENTS.md rule 4 — one query, one place, shared by both
+/// assignment routes.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn tenant_exists(pool: &PgPool, id: Uuid) -> Result<bool, StoreError> {
+    let (exists,): (bool,) = sqlx::query_as("SELECT EXISTS(SELECT 1 FROM tenant WHERE id = $1)")
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
+    Ok(exists)
+}
+
 /// Everything [`create_tenant`] needs. Mirrors `CreateTenantInput`.
 #[derive(Debug, Clone)]
 pub struct CreateTenantInput {

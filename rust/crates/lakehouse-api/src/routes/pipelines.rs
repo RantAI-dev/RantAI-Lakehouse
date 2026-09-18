@@ -1365,6 +1365,55 @@ fn dagster_mutation_failure(error: Option<String>) -> Response {
     (status, ApiJson(json!({ "error": message }))).into_response()
 }
 
+/// Body for `PUT /api/pipelines/{id}/tenant`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssignTenantBody {
+    tenant_id: Uuid,
+}
+
+/// `PUT /api/pipelines/{id}/tenant` — assign (or reassign) an authored
+/// pipeline to a tenant. Same shape and rationale as `routes::connectors::
+/// assign_connector_tenant` (WS8 plan Task C7, P2 fix): `0042_tenant_
+/// provisioning.sql` adds `tenant_id` to `pipeline_definition` with no
+/// backfill at all, so every authored pipeline starts invisible to `GET
+/// /api/pipelines`'s tenant-scoped read (Task C3) until assigned here.
+///
+/// Only ever targets a `pipeline_definition` row (a `pl-`-prefixed,
+/// Postgres-authored id) — a `Dagster`-backed pipeline id has no
+/// `tenant_id` column anywhere in this schema (see `routes::pipelines::
+/// list`'s own doc comment on the un-tenanted `Dagster`-job half), so it
+/// 404s here the same as any other unknown id, via `assign_tenant`'s
+/// `rows_affected() == 0` check — never a fabricated success for a job
+/// this route cannot actually scope.
+///
+/// # Errors
+///
+/// 404 if either the pipeline id or the tenant id does not exist — the
+/// same status for both, matching `tenant_scope::resolve`'s no-existence-
+/// leak rule. 400 for a malformed body. 503 if no pool is configured; 500
+/// on any other database failure.
+pub async fn assign_pipeline_tenant(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<StatusCode> {
+    let AssignTenantBody { tenant_id } = parse_body(&body)?;
+    let db_pool = pool(&state)?;
+    if !lakehouse_store::identity::tenant_exists(db_pool, tenant_id).await? {
+        return Err(ApiError::NotFound("tenant not found".to_owned()).into());
+    }
+    pipelines::assign_tenant(db_pool, &id, tenant_id)
+        .await
+        .map_err(|err| match err {
+            lakehouse_store::StoreError::NotFound => {
+                ApiError::NotFound(format!("Pipeline {id} not found"))
+            }
+            other => other.into(),
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod dagster_half_tenant_gate {
     //! The judge amendment to WS8 Task C0: the `Dagster`-job half of
@@ -2770,6 +2819,147 @@ mod tests {
                 404,
                 "a non-pl- id has no from-state to look up"
             );
+        }
+    }
+
+    /// `PUT /api/pipelines/{id}/tenant` — WS8 plan Task C7, P2 fix. Same
+    /// shape as `routes::connectors::tests::assign_tenant_route`.
+    mod assign_tenant_route {
+        use lakehouse_store::identity::{self, CreateTenantInput};
+
+        use super::*;
+        use crate::config::Config;
+
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database"),
+            )
+        }
+
+        fn state_for(pool: &sqlx::PgPool) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        async fn seed_tenant(pool: &sqlx::PgPool, slug: &str) -> Uuid {
+            let tenant = identity::create_tenant(
+                pool,
+                &CreateTenantInput {
+                    name: "Acme Co".to_owned(),
+                    slug: slug.to_owned(),
+                    plan: "Standard".to_owned(),
+                    residency: "US".to_owned(),
+                },
+            )
+            .await
+            .expect("create a test tenant");
+            tenant
+                .id
+                .parse()
+                .expect("create_tenant returns a UUID-shaped id")
+        }
+
+        /// A `pipeline_definition` row with `tenant_id = NULL` — `create`
+        /// never sets it, matching every authored pipeline created after
+        /// `0042_tenant_provisioning.sql` (whose own comment records that
+        /// it backfills nothing for this table at all).
+        async fn seed_pipeline_with_null_tenant(state: &AppState, name: &str) -> String {
+            let body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "name": name,
+                    "kind": "batch",
+                    "sourceZone": "bronze",
+                    "sourceTable": "t",
+                    "targetZone": "silver",
+                    "targetTable": "t",
+                    "schedule": "manual",
+                }))
+                .expect("serialize"),
+            );
+            let (_, ApiJson(pipeline)) = create(
+                State(state.clone()),
+                Extension(fixture_user_principal()),
+                body,
+            )
+            .await
+            .expect("create should succeed");
+            pipeline.id
+        }
+
+        fn assign_body(tenant_id: Uuid) -> Bytes {
+            Bytes::from(
+                serde_json::to_vec(&json!({ "tenantId": tenant_id.to_string() }))
+                    .expect("serialize"),
+            )
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn assigns_and_is_then_visible_in_the_scoped_list(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let tenant_id = seed_tenant(&pool, "c7-assign").await;
+            let pipeline_id = seed_pipeline_with_null_tenant(&state, "c7-assign-pipeline").await;
+
+            let status = assign_pipeline_tenant(
+                State(state),
+                Path(pipeline_id.clone()),
+                assign_body(tenant_id),
+            )
+            .await
+            .expect("assignment should succeed");
+            assert_eq!(status, StatusCode::NO_CONTENT);
+
+            let rows = pipelines::list_pipelines(
+                &pool,
+                &pipelines::PipelineFilter {
+                    tenant_id: Some(tenant_id),
+                },
+            )
+            .await
+            .expect("list_pipelines should succeed");
+            assert!(
+                rows.iter().any(|r| r.id == pipeline_id),
+                "the assigned pipeline must now be visible in its tenant's scoped list"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn refuses_an_unknown_tenant_id_with_404(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let pipeline_id = seed_pipeline_with_null_tenant(&state, "c7-orphan-pipeline").await;
+            let unknown_tenant = Uuid::new_v4();
+
+            let err = assign_pipeline_tenant(
+                State(state),
+                Path(pipeline_id),
+                assign_body(unknown_tenant),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0.status(), 404);
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn refuses_an_unknown_pipeline_id_with_404(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let tenant_id = seed_tenant(&pool, "c7-no-pipeline").await;
+
+            let err = assign_pipeline_tenant(
+                State(state),
+                Path("does-not-exist".to_owned()),
+                assign_body(tenant_id),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0.status(), 404);
         }
     }
 }

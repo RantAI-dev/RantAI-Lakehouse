@@ -212,6 +212,38 @@ pub async fn list_pipelines(
     Ok(rows.into_iter().map(Pipeline::from).collect())
 }
 
+/// Assign (or reassign) an authored pipeline to a tenant — the write
+/// behind `PUT /api/pipelines/{id}/tenant` (WS8 plan Task C7, P2 fix). Same
+/// posture as [`crate::connectors::assign_tenant`]: `0042_tenant_
+/// provisioning.sql` adds `tenant_id` to `pipeline_definition` with no
+/// backfill at all (see that migration's own comment — every seeded
+/// pipeline row was already deleted by `0027_prune_seeded_activity.sql` by
+/// the time it applies), so every authored pipeline starts `tenant_id =
+/// NULL` and needs this route to become visible to [`list_pipelines`]'s
+/// tenant-scoped reads.
+///
+/// The `tenant_id` value is bound, never interpolated into the SQL text.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if no pipeline with `id` exists.
+/// `routes::pipelines::assign_pipeline_tenant` checks `identity::
+/// tenant_exists` before calling this, so a foreign-key violation on
+/// `tenant_id` should not occur in practice; [`StoreError::
+/// ForeignKeyViolation`] surfaces if it somehow does. Returns
+/// [`StoreError::Database`] on any other failure.
+pub async fn assign_tenant(pool: &PgPool, id: &str, tenant_id: Uuid) -> Result<(), StoreError> {
+    let result = sqlx::query("UPDATE pipeline_definition SET tenant_id = $1 WHERE id = $2")
+        .bind(tenant_id)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(StoreError::NotFound);
+    }
+    Ok(())
+}
+
 /// Fetch one authored pipeline by id.
 ///
 /// # Errors

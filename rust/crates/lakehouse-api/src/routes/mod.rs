@@ -162,6 +162,12 @@ fn pipelines_router() -> Router<AppState> {
             "/api/pipelines/runs/{runId}/retry",
             axum::routing::post(pipelines::retry_run),
         )
+        // WS8 plan Task C7 (P2 fix): the assignment route for pipeline
+        // rows `0042_tenant_provisioning.sql` leaves `tenant_id = NULL`.
+        .route(
+            "/api/pipelines/{id}/tenant",
+            axum::routing::put(pipelines::assign_pipeline_tenant),
+        )
 }
 
 /// The `/api/storage/*` sub-router (Task 2.6), split out for the same
@@ -325,6 +331,12 @@ fn connectors_router() -> Router<AppState> {
         .route(
             "/api/connectors/{id}/ingest/run",
             axum::routing::post(connectors::ingest_run),
+        )
+        // WS8 plan Task C6 (P2 fix): the assignment route for connector
+        // rows `0042_tenant_provisioning.sql` leaves `tenant_id = NULL`.
+        .route(
+            "/api/connectors/{id}/tenant",
+            axum::routing::put(connectors::assign_connector_tenant),
         )
 }
 
