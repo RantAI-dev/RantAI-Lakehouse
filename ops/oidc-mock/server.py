@@ -36,6 +36,8 @@ container restart.
 from __future__ import annotations
 
 import base64
+import hashlib
+import html
 import http.server
 import json
 import os
@@ -116,6 +118,64 @@ PRINCIPALS = [
 # `mint_tokens` below writes to disk at container start; they never call
 # `/token`. PR #33 review, blocker 2.
 TOKEN_ENDPOINT_PRINCIPALS = [p for p in PRINCIPALS if p != "admin"]
+
+# ── Human test principals + authorization-code/PKCE flow (WS8 plan) ──────
+# Distinct from PRINCIPALS above (every entry there is a machine identity
+# a compose service authenticates as via client-credentials). These two
+# are the only identities /authorize will ever mint a code for — g2/g4's
+# OIDC round trip selects one via ?login_hint=, never a free-text sub, so
+# this mock can never be tricked into impersonating an arbitrary subject.
+HUMAN_TEST_PRINCIPALS = {
+    "test-admin": {"groups": ["lakehouse-admins"], "email": "test-admin@oidc-mock.invalid"},
+    "test-analyst": {"groups": ["lakehouse-analysts"], "email": "test-analyst@oidc-mock.invalid"},
+}
+
+AUTH_CODE_TTL_SECONDS = 120
+AUTH_CODES: dict[str, dict] = {}
+
+
+class PkceMismatch(Exception):
+    pass
+
+
+class RedirectUriMismatch(Exception):
+    pass
+
+
+class CodeAlreadyUsed(Exception):
+    pass
+
+
+class UnknownAuthorizationCode(Exception):
+    pass
+
+
+def mint_authorization_code(*, sub: str, redirect_uri: str, nonce: str, code_challenge: str) -> str:
+    code = base64.urlsafe_b64encode(os.urandom(24)).rstrip(b"=").decode()
+    AUTH_CODES[code] = {
+        "sub": sub,
+        "redirect_uri": redirect_uri,
+        "nonce": nonce,
+        "code_challenge": code_challenge,
+        "expires_at": time.time() + AUTH_CODE_TTL_SECONDS,
+        "used": False,
+    }
+    return code
+
+
+def exchange_authorization_code(*, code: str, redirect_uri: str, code_verifier: str) -> dict:
+    record = AUTH_CODES.get(code)
+    if record is None or record["used"] or time.time() > record["expires_at"]:
+        raise CodeAlreadyUsed() if record and record["used"] else UnknownAuthorizationCode()
+    if record["redirect_uri"] != redirect_uri:
+        raise RedirectUriMismatch()
+    computed = base64.urlsafe_b64encode(
+        hashlib.sha256(code_verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+    if computed != record["code_challenge"]:
+        raise PkceMismatch()
+    record["used"] = True
+    return record
 
 
 def b64url_uint(value: int) -> str:
@@ -215,7 +275,48 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quieter than the stdlib default
         pass
 
+    def do_GET(self):  # noqa: N802 (stdlib method name)
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/authorize":
+            self._handle_authorize_get(parsed)
+            return
+        # Every other GET (jwks.json, .well-known/openid-configuration) is
+        # a static file served from PUBLIC_DIR — unchanged stdlib behavior.
+        super().do_GET()
+
+    def _handle_authorize_get(self, parsed: urllib.parse.ParseResult) -> None:
+        # A stand-in for a real IdP's login screen: not a credential
+        # prompt (this is a mock with no passwords), just a choice of
+        # which HUMAN_TEST_PRINCIPALS identity the pretend-human is. The
+        # OIDC request params (redirect_uri, nonce, code_challenge, state)
+        # ride through as hidden fields so the POST below can bind the
+        # minted code to them, exactly as `/authorize?...` gave them.
+        query = urllib.parse.parse_qs(parsed.query)
+        redirect_uri = (query.get("redirect_uri") or [""])[0]
+        nonce = (query.get("nonce") or [""])[0]
+        code_challenge = (query.get("code_challenge") or [""])[0]
+        state = (query.get("state") or [""])[0]
+        buttons = "".join(
+            f'<button name="login_hint" value="{html.escape(sub)}">{html.escape(sub)}</button>'
+            for sub in HUMAN_TEST_PRINCIPALS
+        )
+        body = f"""<!doctype html><html><body>
+<form method="post" action="/authorize">
+<input type="hidden" name="redirect_uri" value="{html.escape(redirect_uri)}">
+<input type="hidden" name="nonce" value="{html.escape(nonce)}">
+<input type="hidden" name="code_challenge" value="{html.escape(code_challenge)}">
+<input type="hidden" name="state" value="{html.escape(state)}">
+{buttons}
+</form></body></html>"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(body.encode("utf-8"))
+
     def do_POST(self):  # noqa: N802 (stdlib method name)
+        if self.path == "/authorize":
+            self._handle_authorize_post()
+            return
         if self.path != "/token":
             self.send_response(404)
             self.end_headers()
@@ -224,6 +325,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8")
         form = urllib.parse.parse_qs(body)
+        # Authorization-code + PKCE branch (WS8 plan): the browser login
+        # round trip started by GET/POST /authorize above lands here.
+        # Checked before the client-credentials branch below since the two
+        # grants share this one endpoint but nothing else.
+        if form.get("grant_type") == ["authorization_code"]:
+            self._handle_token_authorization_code(form)
+            return
         client_id = (form.get("client_id") or [None])[0]
         # Client-credentials grant in name only — see module doc: this
         # exists purely so ClickHouse's `oauth_server_uri` has something to
@@ -246,6 +354,87 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             json.dumps(
                 {
                     "access_token": access_token,
+                    "token_type": "bearer",
+                    "expires_in": TOKEN_LIFETIME_SECONDS,
+                }
+            ).encode("utf-8")
+        )
+
+    def _handle_authorize_post(self) -> None:
+        # The login-screen stand-in's form submit: binds a fresh code to
+        # the chosen HUMAN_TEST_PRINCIPALS identity and the PKCE/nonce
+        # params carried through as hidden fields, then 302s back to the
+        # caller's redirect_uri exactly like a real authorization server.
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length).decode("utf-8")
+        form = urllib.parse.parse_qs(body)
+        sub = (form.get("login_hint") or [None])[0]
+        redirect_uri = (form.get("redirect_uri") or [""])[0]
+        nonce = (form.get("nonce") or [""])[0]
+        code_challenge = (form.get("code_challenge") or [""])[0]
+        state = (form.get("state") or [""])[0]
+        # Fail closed: only the two named test identities can ever receive
+        # a code — never a free-text sub off the form (see the
+        # HUMAN_TEST_PRINCIPALS comment above).
+        if sub not in HUMAN_TEST_PRINCIPALS:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "invalid_request"}).encode("utf-8"))
+            return
+        code = mint_authorization_code(
+            sub=sub,
+            redirect_uri=redirect_uri,
+            nonce=nonce,
+            code_challenge=code_challenge,
+        )
+        location = f"{redirect_uri}?{urllib.parse.urlencode({'code': code, 'state': state})}"
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.end_headers()
+
+    def _handle_token_authorization_code(self, form: dict) -> None:
+        code = (form.get("code") or [None])[0]
+        redirect_uri = (form.get("redirect_uri") or [""])[0]
+        code_verifier = (form.get("code_verifier") or [""])[0]
+        try:
+            record = exchange_authorization_code(
+                code=code, redirect_uri=redirect_uri, code_verifier=code_verifier
+            )
+        except (PkceMismatch, RedirectUriMismatch, CodeAlreadyUsed, UnknownAuthorizationCode):
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "invalid_grant"}).encode("utf-8"))
+            return
+        sub = record["sub"]
+        principal = HUMAN_TEST_PRINCIPALS[sub]
+        now = int(time.time())
+        private_pem = self._private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        id_token = jwt.encode(
+            {
+                "iss": ISSUER,
+                "aud": AUDIENCE,
+                "sub": sub,
+                "iat": now,
+                "exp": now + TOKEN_LIFETIME_SECONDS,
+                "nonce": record["nonce"],
+                "groups": principal["groups"],
+                "email": principal["email"],
+            },
+            private_pem,
+            algorithm="RS256",
+            headers={"kid": KEY_ID},
+        )
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(
+            json.dumps(
+                {
+                    "access_token": id_token,
+                    "id_token": id_token,
                     "token_type": "bearer",
                     "expires_in": TOKEN_LIFETIME_SECONDS,
                 }
