@@ -322,6 +322,7 @@ const RESUMABLE_STATUSES: &[&str] = &[
 
 pub async fn create_tenant(
     State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<Tenant>)> {
     let body: CreateTenantBody = parse_body(&body)?;
@@ -354,6 +355,25 @@ pub async fn create_tenant(
             )
         }
     };
+
+    // audit_event row mirrors WS5's audit schema — `outcome = "executed"`
+    // per `audit_event_outcome_check` (0024_audit_event.sql). Written
+    // BEFORE the `lakekeeper_admin` check so the audit fires whether or
+    // not provisioning is reachable on this deployment — the tenant row
+    // already exists in either branch (resume or fresh create), so an
+    // operator's history is honest about what happened. Best-effort: a
+    // failed audit write is logged and swallowed, never propagated, so
+    // the response code on the wire is always the underlying operation's,
+    // not the audit's (WS8 §Phase G).
+    let audit_event = tenant_create_audit_event(&principal, &tenant);
+    if let Err(err) = store_audit::insert(pool, audit_event).await {
+        tracing::warn!(
+            %err,
+            action = "identity.tenant.create",
+            tenant_id = %tenant.id,
+            "failed to record tenant-create audit event"
+        );
+    }
 
     let Some(admin) = state.lakekeeper_admin.as_ref() else {
         // Provisioning is unreachable, not silently skipped — the tenant
@@ -666,6 +686,32 @@ fn rotate_service_identity_audit_event(principal: &Principal, identity_id: Uuid)
         outcome: "executed".to_owned(),
         args: None,
         detail: None,
+        ..Default::default()
+    }
+}
+
+/// Build the `NewAuditEvent` for a successful tenant create — same
+/// pattern as [`rotate_service_identity_audit_event`]: pure,
+/// unit-testable, field-shape lives next to the call site. The audit
+/// row is `outcome = "executed"` because create is a successful write —
+/// the schema's `audit_event_outcome_check` allows it. `principal_kind`
+/// comes from `Principal::kind_for_audit`, not from `principal.provider`
+/// (the two are different vocabularies — see `Principal::kind_for_audit`'s
+/// own doc comment). `args` carries the slug and provisioning status
+/// the operator would otherwise have to re-query the row to recover.
+fn tenant_create_audit_event(principal: &Principal, tenant: &Tenant) -> NewAuditEvent {
+    NewAuditEvent {
+        action: "identity.tenant.create".to_owned(),
+        resource_kind: Some("tenant".to_owned()),
+        resource_id: Some(tenant.id.clone()),
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        outcome: "executed".to_owned(),
+        args: Some(serde_json::json!({
+            "slug": tenant.slug,
+            "provisioningStatus": tenant.provisioning_status,
+        })),
         ..Default::default()
     }
 }

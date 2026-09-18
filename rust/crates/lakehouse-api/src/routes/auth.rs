@@ -36,6 +36,7 @@ use lakehouse_auth::{
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::StoreError;
+use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::identity;
 use lakehouse_store::sessions::SessionRow;
 use serde::{Deserialize, Serialize};
@@ -415,6 +416,24 @@ pub async fn revoke_session(
     lakehouse_store::sessions::revoke_session_as_caller(pool, session_id, caller_id, is_admin)
         .await
         .map_err(StoreError::from)?;
+
+    // audit_event row mirrors WS5's audit schema — `outcome = "executed"`
+    // per `audit_event_outcome_check` (0024_audit_event.sql). `resource_id`
+    // is the request path's `{id}` (the session row's UUID, never the
+    // caller's bearer token — the token is not yet validated at this
+    // point and the route never sees it). Best-effort: a failed audit
+    // write is logged and swallowed, never propagated, so the response
+    // code on the wire is always the underlying revoke's, not the
+    // audit's (WS8 §Phase G).
+    let audit_event = session_revoke_audit_event(&principal, session_id);
+    if let Err(err) = store_audit::insert(pool, audit_event).await {
+        tracing::warn!(
+            %err,
+            action = "auth.session.revoke",
+            session_id = %session_id,
+            "failed to record session revoke audit event"
+        );
+    }
 
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -889,6 +908,25 @@ pub async fn oidc_callback(
     let token =
         session::create_session(pool, user_id, session::DEFAULT_SESSION_TTL, None, None).await?;
 
+    // audit_event row mirrors WS5's audit schema — `outcome = "executed"`
+    // per `audit_event_outcome_check` (0024_audit_event.sql).
+    // `resource_id` is intentionally `None` here: the session row's own
+    // id is not yet known without a second `SELECT` keyed on the hash,
+    // which this task does not add for a login-audit line that already
+    // carries `principal_id`. Best-effort: a failed audit write is
+    // logged and swallowed, never propagated, so the response on the
+    // wire is always the underlying login's, not the audit's (WS8
+    // §Phase G).
+    let audit_event = oidc_login_audit_event(&principal, user_id);
+    if let Err(err) = store_audit::insert(pool, audit_event).await {
+        tracing::warn!(
+            %err,
+            action = "auth.oidc.login",
+            user_id = %user_id,
+            "failed to record oidc login audit event"
+        );
+    }
+
     let mut response = (StatusCode::FOUND, ()).into_response();
     response.headers_mut().insert(
         header::LOCATION,
@@ -987,6 +1025,47 @@ fn oidc_flow_cookie(headers: &HeaderMap) -> Option<String> {
         let (name, value) = pair.trim().split_once('=')?;
         (name == OIDC_FLOW_COOKIE_NAME).then(|| value.to_owned())
     })
+}
+
+/// Build the `NewAuditEvent` for a successful OIDC login — extracted as
+/// a pure, unit-testable helper so the field-shape lives next to the
+/// call site (rather than a brittle source-text grep), mirroring
+/// `routes::identity::rotate_service_identity_audit_event`. The audit
+/// row is `outcome = "executed"` because login is a successful write —
+/// the schema's `audit_event_outcome_check` allows it. `principal_kind`
+/// comes from `Principal::kind_for_audit`, not from `principal.provider`
+/// (the two are different vocabularies — see `Principal::kind_for_audit`'s
+/// own doc comment).
+fn oidc_login_audit_event(principal: &Principal, user_id: Uuid) -> NewAuditEvent {
+    NewAuditEvent {
+        action: "auth.oidc.login".to_owned(),
+        resource_kind: Some("session".to_owned()),
+        resource_id: None,
+        principal_id: Some(user_id.to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        outcome: "executed".to_owned(),
+        detail: Some(format!("provider={}", principal.provider)),
+        ..Default::default()
+    }
+}
+
+/// Build the `NewAuditEvent` for a successful session revoke — same
+/// pattern as [`oidc_login_audit_event`]: pure, unit-testable, mirrors
+/// `routes::identity::rotate_service_identity_audit_event`. `resource_id`
+/// is the request path's `{id}` (the session row's UUID), never the
+/// caller's bearer token.
+fn session_revoke_audit_event(principal: &Principal, session_id: Uuid) -> NewAuditEvent {
+    NewAuditEvent {
+        action: "auth.session.revoke".to_owned(),
+        resource_kind: Some("session".to_owned()),
+        resource_id: Some(session_id.to_string()),
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_kind: Some(principal.kind_for_audit().to_owned()),
+        actor_label: Some(principal.display_name.clone()),
+        outcome: "executed".to_owned(),
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
@@ -1434,6 +1513,106 @@ mod tests {
                     && c.contains("Max-Age=0")),
             "expected the flow cookie to be cleared even on success: {set_cookies:?}"
         );
+        Ok(())
+    }
+
+    // ── WS8 §Phase G: `oidc_callback` writes a real `audit_event` row on
+    // success. Reuses the wiremock round-trip harness above verbatim —
+    // the only addition is the post-response SELECT against
+    // `audit_event`. ───────────────────────────────────────────────────────
+
+    /// A successful OIDC round trip writes a `audit_event` row with
+    /// `action = 'auth.oidc.login'`, `principal_kind = 'user'`, and
+    /// `outcome = 'executed'`. `resource_id` is intentionally `None`
+    /// (no second `SELECT` for the session row's id — see `oidc_callback`'s
+    /// own audit-write comment).
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn oidc_callback_writes_an_audit_event_with_principal_kind_user_on_success(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        // Same wiremock round-trip shape as
+        // `oidc_callback_with_a_matching_state_and_nonce_creates_a_session_and_redirects`:
+        // mock JWKS + token endpoint, sign an id token with the matching
+        // nonce, drive the round trip end to end. The only difference is
+        // the post-response SELECT against `audit_event`.
+        let server = wiremock::MockServer::start().await;
+        let key = TestKey::generate("kid-1");
+        mount_jwks(&server, &key).await;
+
+        let issuer = server.uri();
+        let client_id = "lakehouse-console";
+        let flow = OidcFlow {
+            state: "state-from-start".to_owned(),
+            nonce: "nonce-from-start".to_owned(),
+            code_verifier: "verifier-1".to_owned(),
+            next: "/dashboards".to_owned(),
+        };
+
+        let id_token = sign_id_token(
+            &IdTokenClaims {
+                sub: "user-g1-audit-round-trip",
+                iss: &issuer,
+                aud: client_id,
+                exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                nonce: &flow.nonce,
+            },
+            &key,
+        );
+        mount_token_endpoint(&server, &id_token).await;
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        env.insert("OIDC_ISSUER".to_owned(), issuer.clone());
+        env.insert("OIDC_CLIENT_ID".to_owned(), client_id.to_owned());
+        env.insert(
+            "OIDC_AUTHORIZE_URL".to_owned(),
+            format!("{issuer}/authorize"),
+        );
+        env.insert("OIDC_TOKEN_URL".to_owned(), format!("{issuer}/token"));
+        env.insert(
+            "OIDC_REDIRECT_URI".to_owned(),
+            "https://lake.invalid/api/auth/oidc/callback".to_owned(),
+        );
+        env.insert("OIDC_JIT_PROVISIONING".to_owned(), "true".to_owned());
+        let config = Config::from_map(&env).expect("a valid test Config");
+        let state = AppState::new(config);
+        let app = crate::routes::router(state);
+
+        let cookie = oidc_flow_cookie_header(true, Some(&flow));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/auth/oidc/callback?code=auth-code-1&state={}",
+                        flow.state
+                    ))
+                    .header(header::COOKIE, cookie.to_str().unwrap())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+
+        let row: (String, Option<String>, String) = sqlx::query_as(
+            "SELECT action, principal_kind, outcome FROM audit_event \
+             WHERE action = 'auth.oidc.login' ORDER BY at DESC LIMIT 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("an audit_event row for auth.oidc.login must exist");
+
+        assert_eq!(row.0, "auth.oidc.login");
+        assert_eq!(
+            row.1.as_deref(),
+            Some("user"),
+            "principal_kind must reflect the resolved PrincipalId::User — \
+             see Principal::kind_for_audit's mapping"
+        );
+        assert_eq!(row.2, "executed");
         Ok(())
     }
 

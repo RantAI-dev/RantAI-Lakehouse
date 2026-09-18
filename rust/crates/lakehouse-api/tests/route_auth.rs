@@ -972,3 +972,147 @@ async fn me_response_returns_structured_tenants_not_bare_uuid_strings() {
         "sari's only seeded tenant is meridian-retail (0002_seed_identity.sql)"
     );
 }
+
+// ── WS8 §Phase G: the two non-OIDC admin actions under audit
+// (`create_tenant`, `revoke_session`) each write a real `audit_event`
+// row on success. The OIDC-callback audit test lives in
+// `routes/auth.rs::tests` because its wiremock round-trip harness is
+// local to that module. These two live here because they only need the
+// shared `spin_up`/`session_cookie_for_user`/`request_with_cookie` triple
+// and a `#[tokio::test]` over the real router, exactly the shape the
+// rest of this file already follows. ──────────────────────────────────────
+
+/// `POST /api/identity/tenants` writes a `audit_event` row on success
+/// with `action = 'identity.tenant.create'`,
+/// `resource_kind = 'tenant'`, `resource_id = <new tenant's id>`, and
+/// `outcome = 'executed'` (WS8 §Phase G).
+///
+/// `spin_up()` does not override `LAKEKEEPER_ADMIN_TOKEN_FILE`, so
+/// `AppState::lakekeeper_admin` is `None` and the route's
+/// no-admin early return fires AFTER the audit write — exactly the
+/// "audit fires whether or not provisioning is reachable" property the
+/// audit-write comment in `routes::identity::create_tenant` calls out.
+#[tokio::test]
+async fn create_tenant_writes_an_audit_event_on_success() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "fajar@meridian.example").await;
+
+    let body_bytes = serde_json::to_vec(&serde_json::json!({
+        "name": "Acme Co",
+        "slug": "acme-co",
+        "plan": "Standard",
+        "residency": "US",
+    }))
+    .expect("serialize body");
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/identity/tenants")
+                .header("cookie", cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(body_bytes))
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "create_tenant must succeed (the tenant row is created and the \
+         audit row is written even when no Lakekeeper admin is configured \
+         on this deployment)"
+    );
+
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read response body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON body");
+    let tenant_id = body["id"]
+        .as_str()
+        .expect("the response body carries the new tenant's id");
+
+    let row: (String, Option<String>, Option<String>, String) = sqlx::query_as(
+        "SELECT action, resource_kind, resource_id, outcome FROM audit_event \
+         WHERE action = 'identity.tenant.create' ORDER BY at DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("an audit_event row for identity.tenant.create must exist");
+
+    assert_eq!(row.0, "identity.tenant.create");
+    assert_eq!(row.1.as_deref(), Some("tenant"));
+    assert_eq!(
+        row.2.as_deref(),
+        Some(tenant_id),
+        "resource_id must point at the new tenant's id"
+    );
+    assert_eq!(row.3, "executed");
+}
+
+/// `DELETE /api/auth/sessions/{id}` writes a `audit_event` row on
+/// success with `action = 'auth.session.revoke'`, `resource_id` =
+/// the session's UUID, and `outcome = 'executed'` (WS8 §Phase G).
+///
+/// Two live sessions are minted for the same `app_user.id`: one
+/// carries the cookie that drives the DELETE (so the auth gate
+/// resolves the caller as that user), and the other is the target of
+/// the DELETE. `revoke_session_as_caller`'s SQL predicate
+/// (`WHERE id = $1 AND revoked_at IS NULL AND ($3 OR app_user_id = $2)`)
+/// accepts the second because both sessions belong to the same user.
+#[tokio::test]
+async fn delete_session_writes_an_audit_event() {
+    let TestApp { router, pool } = spin_up().await;
+    let user_id: Uuid =
+        sqlx::query_scalar("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
+            .bind("caller")
+            .bind("caller-audit-revoke@x.invalid")
+            .fetch_one(&pool)
+            .await
+            .expect("insert a caller");
+
+    // Two sessions: one carries the cookie doing the DELETE, one is
+    // the target. `revoke_session` checks ownership via the SQL
+    // predicate, so both have to belong to the same `app_user.id`.
+    let caller_cookie = session_cookie_for_user(&pool, user_id).await;
+    let _target_cookie = session_cookie_for_user(&pool, user_id).await;
+    let target_session_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM session \
+         WHERE app_user_id = $1 AND revoked_at IS NULL \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("look up the target session id");
+
+    let response = request_with_cookie(
+        &router,
+        "DELETE",
+        &format!("/api/auth/sessions/{target_session_id}"),
+        &caller_cookie,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let row: (String, Option<String>, String) = sqlx::query_as(
+        "SELECT action, resource_id, outcome FROM audit_event \
+         WHERE action = 'auth.session.revoke' ORDER BY at DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("an audit_event row for auth.session.revoke must exist");
+
+    assert_eq!(row.0, "auth.session.revoke");
+    assert_eq!(row.2, "executed");
+    assert_eq!(
+        row.1.as_deref(),
+        Some(target_session_id.to_string().as_str()),
+        "resource_id must be the UUID string of the session that was \
+         revoked (the request path's {{id}}, never the caller's bearer \
+         token)"
+    );
+}
