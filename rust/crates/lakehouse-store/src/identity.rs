@@ -732,20 +732,27 @@ pub struct ServiceIdentity {
     /// for this column says so explicitly) — inventing one here would be a
     /// fabricated policy, not an honest read.
     pub rotation_status: String,
-    /// `service_identity.last_used_at`. Always `None`: the column defaults
-    /// to `now()` at insert time (`0001_init.sql:125`) but nothing in this
-    /// workspace ever updates it on actual use (J18), so a freshly created
-    /// identity would otherwise read as "used" at the moment it was
-    /// created. Serializes as `lastUsedAt`.
+    /// `service_identity.last_used_at`. Populated from the column on every
+    /// read since WS8 §Phase E — before that, the field always serialized
+    /// `None` even though the column was `NOT NULL DEFAULT now()`
+    /// (`0001_init.sql:125`), which was a fabrication (J18), not an honest
+    /// read. The column is now actually written by
+    /// `lakehouse-auth::service_token::verify_service_token`, throttled to
+    /// at most once per `LAST_USED_AT_THROTTLE_SECONDS` (300s, chosen to
+    /// match `oidc::DEFAULT_JWKS_TTL`'s already-reviewed cadence) per
+    /// identity — so the value reported here is at most five minutes stale
+    /// even for a heavily-used identity. Stays `Option<String>` (not
+    /// `String`) because the contract at
+    /// `src/services/contracts/identity.ts` types it as `string | null`
+    /// and that nullability is part of the wire shape the console parses.
+    /// Serializes as `lastUsedAt`.
     pub last_used_at: Option<String>,
 }
 
 /// The raw row shape service-identity reads select.
 ///
-/// `last_used_at` is deliberately not selected (see
-/// [`ServiceIdentity::last_used_at`]'s doc comment); `rotation_status` here
-/// holds the *derived* value [`SERVICE_IDENTITY_SELECT`] computes, not the
-/// bare column.
+/// `rotation_status` here holds the *derived* value
+/// [`SERVICE_IDENTITY_SELECT`] computes, not the bare column.
 #[derive(Debug, FromRow)]
 struct ServiceIdentityRow {
     id: Uuid,
@@ -754,6 +761,7 @@ struct ServiceIdentityRow {
     environment: String,
     expires_at: OffsetDateTime,
     rotation_status: String,
+    last_used_at: OffsetDateTime,
 }
 
 impl From<ServiceIdentityRow> for ServiceIdentity {
@@ -765,7 +773,7 @@ impl From<ServiceIdentityRow> for ServiceIdentity {
             environment: row.environment,
             expires_at: iso_millis(row.expires_at),
             rotation_status: row.rotation_status,
-            last_used_at: None,
+            last_used_at: Some(iso_millis(row.last_used_at)),
         }
     }
 }
@@ -777,8 +785,13 @@ impl From<ServiceIdentityRow> for ServiceIdentity {
 /// `lakehouse-auth::service_token` uses to refuse a credential — so a filter
 /// and the list can never disagree with each other or with authentication.
 /// See [`ServiceIdentity::rotation_status`] for the full rationale.
+/// `last_used_at` is the bare column — the schema default (`0001_init.sql:125`,
+/// `NOT NULL DEFAULT now()`) ensures every row carries a real timestamp, and
+/// `verify_service_token` keeps it current via a throttled UPDATE; see
+/// [`ServiceIdentity::last_used_at`] for the rationale.
 const SERVICE_IDENTITY_SELECT: &str = "SELECT s.id, s.name, s.scopes, s.environment, s.expires_at, \
-     CASE WHEN s.expires_at <= now() THEN 'expired' ELSE s.rotation_status END AS rotation_status \
+     CASE WHEN s.expires_at <= now() THEN 'expired' ELSE s.rotation_status END AS rotation_status, \
+     s.last_used_at \
      FROM service_identity s";
 
 /// Optional narrowing for [`list_service_identities`].
@@ -1081,7 +1094,7 @@ mod tests {
             environment: "production".to_owned(),
             expires_at: "2026-01-01T00:00:00.000Z".to_owned(),
             rotation_status: "current".to_owned(),
-            last_used_at: None,
+            last_used_at: Some("2026-01-01T00:00:00.000Z".to_owned()),
         };
         let value = serde_json::to_value(&identity).unwrap();
         for key in [

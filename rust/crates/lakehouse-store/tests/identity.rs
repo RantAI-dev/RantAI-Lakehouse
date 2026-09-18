@@ -276,12 +276,21 @@ async fn creates_use_the_mock_fixtures_defaults(pool: PgPool) -> sqlx::Result<()
     .unwrap();
     assert_eq!(identity.rotation_status, "current");
     assert_eq!(identity.scopes, vec!["query:read"]);
-    // J18: nothing writes `service_identity.last_used_at`, so a freshly
-    // created identity must not be served its insert-time default as "used
-    // just now".
-    assert_eq!(
-        identity.last_used_at, None,
-        "last_used_at is never served: nothing writes the column"
+    // WS8 §Phase E closes J18/T13a: `service_identity.last_used_at` is now
+    // actually written by `verify_service_token` (throttled to 300s/identity),
+    // and the schema default (`0001_init.sql:125`, `NOT NULL DEFAULT now()`)
+    // guarantees every row has a real timestamp at INSERT time — so a freshly
+    // created identity must serve a real ISO string, not `None`. The exact
+    // value is irrelevant; the only honest assertion is that the field is
+    // populated and parses as a timestamp.
+    let last_used = identity
+        .last_used_at
+        .as_deref()
+        .expect("last_used_at must be served now that verify_service_token writes it");
+    assert!(
+        time::OffsetDateTime::parse(last_used, &time::format_description::well_known::Rfc3339)
+            .is_ok(),
+        "last_used_at must parse as RFC 3339, got {last_used:?}"
     );
     Ok(())
 }
@@ -351,13 +360,14 @@ async fn an_unexpired_identity_keeps_its_stored_status(pool: PgPool) -> sqlx::Re
     Ok(())
 }
 
-/// Both never-written activity timestamps come back `None`, and — because
-/// this is the wire-format-facing check — the *serialized* JSON keeps the
-/// key present with an explicit `null` rather than dropping it, matching
-/// what `src/services/contracts/identity.ts` declares (`string | null`, not
-/// an optional field).
+/// `User.last_activity` is still served as `None` (nothing writes the column
+/// yet — the analogue for users remains J18-honest until its own task), and
+/// — because this is the wire-format-facing check — the *serialized* JSON
+/// keeps the key present with an explicit `null` rather than dropping it,
+/// matching what `src/services/contracts/identity.ts` declares (`string |
+/// null`, not an optional field).
 #[sqlx::test(migrations = "../../migrations")]
-async fn identity_activity_timestamps_are_not_served(pool: PgPool) -> sqlx::Result<()> {
+async fn user_activity_timestamps_are_not_served(pool: PgPool) -> sqlx::Result<()> {
     let users = list_users(&pool, &UserFilter::default()).await.unwrap();
     assert!(
         users.iter().all(|u| u.last_activity.is_none()),
@@ -368,18 +378,34 @@ async fn identity_activity_timestamps_are_not_served(pool: PgPool) -> sqlx::Resu
         user_json.get("lastActivity"),
         Some(&serde_json::Value::Null)
     );
+    Ok(())
+}
 
+/// WS8 §Phase E closes J18/T13a for `service_identity.last_used_at`: the
+/// column is now actually written by `verify_service_token` (throttled to
+/// 300s/identity) and the schema default (`0001_init.sql:125`, `NOT NULL
+/// DEFAULT now()`) guarantees a real timestamp at INSERT time, so every
+/// seeded identity must come back with a populated, parseable ISO string.
+/// This is the wire-format-facing assertion that the `null`-vs-`string`
+/// distinction now matches what the contract declares.
+#[sqlx::test(migrations = "../../migrations")]
+async fn service_identity_last_used_at_is_served(pool: PgPool) -> sqlx::Result<()> {
     let identities = list_service_identities(&pool, &ServiceIdentityFilter::default())
         .await
         .unwrap();
     assert!(
-        identities.iter().all(|s| s.last_used_at.is_none()),
-        "no seeded identity's last_used_at may be served"
+        identities.iter().all(|s| s.last_used_at.is_some()),
+        "every seeded identity's last_used_at must be served now that verify_service_token writes it"
     );
     let identity_json = serde_json::to_value(&identities[0]).unwrap();
-    assert_eq!(
-        identity_json.get("lastUsedAt"),
-        Some(&serde_json::Value::Null)
+    let last_used = identity_json
+        .get("lastUsedAt")
+        .and_then(|v| v.as_str())
+        .expect("lastUsedAt must serialize as a JSON string, not null");
+    assert!(
+        time::OffsetDateTime::parse(last_used, &time::format_description::well_known::Rfc3339)
+            .is_ok(),
+        "lastUsedAt must parse as RFC 3339, got {last_used:?}"
     );
     Ok(())
 }

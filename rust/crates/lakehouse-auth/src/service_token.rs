@@ -110,6 +110,23 @@ pub async fn revoke_service_credential(pool: &PgPool, token: &Secret) -> Result<
     Ok(())
 }
 
+/// How long a `last_used_at` write is skipped after the previous one,
+/// per service identity. `verify_service_token` runs on the authentication
+/// hot path — every authenticated service request, unconditionally, not
+/// just an occasional admin action — so writing `last_used_at` on every
+/// call would turn "read telemetry" into "every request also does a
+/// write". 300 is chosen to match `crate::oidc::DEFAULT_JWKS_TTL`
+/// (`oidc.rs`, also 300s) — not because the two are functionally related,
+/// but because it is an already-reviewed, already-familiar cadence in this
+/// same crate for "a value that is fine to be up to a few minutes stale",
+/// and picking a second, unrelated number would need its own separate
+/// justification this crate has no new evidence to give. A service
+/// identity queried thousands of times a minute costs at most one write
+/// per five minutes, not one per request; a rarely-used identity's
+/// `last_used_at` still updates the first time it is used after a long
+/// gap. Closes the J18/T13a "always-null" gap honestly.
+const LAST_USED_AT_THROTTLE_SECONDS: i64 = 300;
+
 /// Verify `token`, returning the [`Principal`] for the `service_identity`
 /// it belongs to if the credential is unrevoked and the identity itself
 /// hasn't expired.
@@ -121,6 +138,14 @@ pub async fn revoke_service_credential(pool: &PgPool, token: &Secret) -> Result<
 /// data. [`Principal::tenant_ids`] is always empty: nothing in the schema
 /// ties a `service_identity` to a tenant today, so reporting an empty list
 /// is honest rather than guessed.
+///
+/// On every successful verification this also issues a best-effort,
+/// throttled `UPDATE service_identity SET last_used_at = now()` (see
+/// [`LAST_USED_AT_THROTTLE_SECONDS`]). The throttle predicate is the
+/// entire throttle: a row within the window simply matches zero rows and
+/// the `UPDATE` is a silent no-op. An `Err` from the `UPDATE` is logged
+/// with `tracing::warn!` and swallowed — authentication is never blocked
+/// by telemetry.
 ///
 /// # Errors
 ///
@@ -140,6 +165,29 @@ pub async fn verify_service_token(pool: &PgPool, token: &Secret) -> Result<Princ
     let Some((service_identity_id, name, scopes)) = row else {
         return Err(AuthError::ServiceCredentialInvalid);
     };
+
+    // Best-effort, throttled telemetry — never a reason to fail an
+    // otherwise-valid credential. `last_used_at` is `NOT NULL DEFAULT
+    // now()` since `0001_init.sql:125`, so the `WHERE` clause needs no
+    // `OR last_used_at IS NULL` branch; a row within the window simply
+    // matches zero rows and this is a silent no-op. See this fn's
+    // doc comment for the swallow-and-log rule on errors.
+    if let Err(err) = sqlx::query(
+        "UPDATE service_identity SET last_used_at = now() \
+         WHERE id = $1 AND last_used_at < now() - ($2 * INTERVAL '1 second')",
+    )
+    .bind(service_identity_id)
+    .bind(LAST_USED_AT_THROTTLE_SECONDS)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(
+            %err,
+            service_identity_id = %service_identity_id,
+            "failed to update service_identity.last_used_at; authentication continues"
+        );
+    }
+
     let permissions = PermissionSet::parse(&scopes.join(","));
     Ok(Principal {
         id: PrincipalId::Service(service_identity_id),
