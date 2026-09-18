@@ -30,6 +30,7 @@ mod routes;
 mod sql_rewrite;
 mod state;
 mod tenant;
+mod tenant_scope;
 mod transform_grammar;
 
 use anyhow::Context;
