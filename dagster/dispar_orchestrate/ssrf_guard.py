@@ -183,3 +183,46 @@ def pinned_resolution(host: str, resolved: ResolvedAddress):
         yield
     finally:
         socket.getaddrinfo = real_getaddrinfo
+
+
+@contextlib.contextmanager
+def checking_resolver(*, allow_internal_hosts: bool | None = None, getaddrinfo: Callable = socket.getaddrinfo):
+    """WS9 judge review K1: wraps `socket.getaddrinfo` for the WHOLE
+    context, validating every result any caller receives -- not one
+    host pinned in advance (see `pinned_resolution` above for that
+    narrower case). Use this whenever a client may resolve and connect
+    to a SET of hosts it discovers over the life of a long-running
+    call, and the set cannot be enumerated up front (Kafka's
+    mid-batch metadata refresh; a resolver-mechanism this plan cannot
+    fully characterise ahead of time, e.g. Oracle thin mode, Task D2).
+
+    `allow_internal_hosts` follows the SAME env-var default
+    (`INGEST_ALLOW_INTERNAL_HOSTS`) `resolve_checked` already reads --
+    one operator-facing switch for both primitives, not two.
+
+    Restores the real `socket.getaddrinfo` on exit unconditionally
+    (the `finally` block), including when the wrapped code itself
+    raises -- this context manager never swallows or replaces the
+    caller's own exception; `SsrfBlocked` is raised INSTEAD of a
+    result only when THIS check itself finds a blocked address."""
+    if allow_internal_hosts is None:
+        allow_internal_hosts = os.environ.get("INGEST_ALLOW_INTERNAL_HOSTS", "").strip() == "true"
+    real_getaddrinfo = socket.getaddrinfo
+
+    def _checking(host, port, *args, **kwargs):
+        infos = getaddrinfo(host, port, *args, **kwargs)
+        if not allow_internal_hosts:
+            for _family, _socktype, _proto, _canon, sockaddr in infos:
+                ip = ipaddress.ip_address(sockaddr[0])
+                if _is_blocked_ip(ip):
+                    raise SsrfBlocked(
+                        f"refusing to dial {host!r}: connect-time resolution returned {ip}, "
+                        "a private/internal/multicast address (checking_resolver)"
+                    )
+        return infos
+
+    socket.getaddrinfo = _checking
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = real_getaddrinfo
