@@ -46,20 +46,20 @@ use crate::tenant::TENANT_OWNER;
 /// of this union (`pipelines::list_pipelines`) is filtered to that tenant
 /// via a bound `WHERE tenant_id = $1`.
 ///
-/// **Deviation from a literal reading of the WS8 plan's Task C3 spec,
-/// named here because it changes real behaviour:** the `Dagster`-job half
-/// of this union is NOT tenant-filtered. `0042_tenant_provisioning.sql`
-/// (Task B1, this task's own dependency) adds `tenant_id` only to
-/// `connector` and `pipeline_definition` — a `Dagster` job has no tenant
-/// column anywhere in this schema, and nothing maps a job name to a tenant
-/// id. Filtering it would mean inventing that mapping, which is exactly
-/// the "never fabricate" rule this program is built on; leaving it
-/// unscoped is an honest, pre-existing limitation (every `Dagster` job was
-/// already visible to every caller with `pipeline:read` before this task)
-/// rather than a claim of isolation this route cannot back up. The
-/// isolation guarantee this task's tests assert is scoped to
-/// `pipeline_definition` rows, matching what migration `0042` actually
-/// added a column for.
+/// # The `Dagster`-job half is a shared surface, gated like the catalog
+///
+/// A `Dagster` code location is one per deployment and nothing in this
+/// schema maps a job to a tenant — migration `0042` adds `tenant_id` to
+/// `connector` and `pipeline_definition` only. Task C3 filtered the
+/// authored half and left the jobs visible to every tenant with a comment
+/// saying so; that is the same shape the judge review's P1 rejected for
+/// the shared catalog, so it now runs through the same gate
+/// (`routes::catalog::catalog_tenant_refusal`, Task C0): a `"*:*"`
+/// principal and a single-tenant deployment are never refused, a member of
+/// `CATALOG_TENANT_ID` is never refused once that is set, and everyone else
+/// gets the authored half plus an explicit
+/// `"dagsterJobs": {"supported": false, "reason": …}` rather than a shorter
+/// list that looks complete.
 pub async fn list(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
@@ -75,7 +75,19 @@ pub async fn list(
         }
         Err(err) => return ApiRejection(err).into_response(),
     };
-    match list_body(&state.dagster, state.pg.as_deref(), tenant_id).await {
+    let dagster_jobs_refused =
+        match crate::routes::catalog::catalog_tenant_refusal(&state, &principal, &headers).await {
+            Ok(refusal) => refusal,
+            Err(err) => return ApiRejection(err).into_response(),
+        };
+    match list_body(
+        &state.dagster,
+        state.pg.as_deref(),
+        tenant_id,
+        dagster_jobs_refused,
+    )
+    .await
+    {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         // `catch (e) { return NextResponse.json({ pipelines: [], error:
         // String(e) }, { status: 503 }); }` in `pipelines/route.ts`.
@@ -99,17 +111,30 @@ async fn list_body(
     dagster: &DgClient,
     pg: Option<&PgPool>,
     tenant_id: Uuid,
+    dagster_jobs_refused: Option<&'static str>,
 ) -> Result<Value, ListError> {
-    let (jobs, runs) =
-        tokio::try_join!(dagster.list_jobs_with_schedules(), dagster.list_runs(100))?;
-
-    let mut pipelines: Vec<Value> = jobs
-        .iter()
-        .map(|j| {
-            let last = last_run_for(&runs, &j.name);
-            dagster_pipeline_row(j, last)
-        })
-        .collect();
+    // The `Dagster` half is a SHARED, un-tenanted resource — a code
+    // location is one per deployment and no table maps a job to a tenant
+    // (migration 0042 adds `tenant_id` to `connector` and
+    // `pipeline_definition` only). So it is gated by exactly the rule the
+    // shared catalog is gated by (`routes::catalog::catalog_tenant_refusal`,
+    // Task C0 plus its judge amendment): refused for a tenant-scoped
+    // caller unless an operator has named the owning tenant. When refused,
+    // the jobs are not fetched at all — not fetched and filtered out, so a
+    // refusal costs no `Dagster` round trip — and the response says so
+    // instead of silently returning a shorter list that looks complete.
+    let mut pipelines: Vec<Value> = Vec::new();
+    if dagster_jobs_refused.is_none() {
+        let (jobs, runs) =
+            tokio::try_join!(dagster.list_jobs_with_schedules(), dagster.list_runs(100))?;
+        pipelines = jobs
+            .iter()
+            .map(|j| {
+                let last = last_run_for(&runs, &j.name);
+                dagster_pipeline_row(j, last)
+            })
+            .collect();
+    }
     if let Some(pg) = pg {
         let filter = pipelines::PipelineFilter {
             tenant_id: Some(tenant_id),
@@ -117,7 +142,13 @@ async fn list_body(
         let authored = pipelines::list_pipelines(pg, &filter).await?;
         pipelines.extend(authored.iter().filter_map(|p| serde_json::to_value(p).ok()));
     }
-    Ok(json!({ "pipelines": pipelines }))
+    match dagster_jobs_refused {
+        None => Ok(json!({ "pipelines": pipelines })),
+        Some(reason) => Ok(json!({
+            "pipelines": pipelines,
+            "dagsterJobs": { "supported": false, "reason": reason },
+        })),
+    }
 }
 
 /// Build one `Dagster`-job row for `GET /api/pipelines`. `Dagster`'s job/run
@@ -1332,6 +1363,105 @@ fn dagster_mutation_failure(error: Option<String>) -> Response {
         StatusCode::CONFLICT
     };
     (status, ApiJson(json!({ "error": message }))).into_response()
+}
+
+#[cfg(test)]
+mod dagster_half_tenant_gate {
+    //! The judge amendment to WS8 Task C0: the `Dagster`-job half of
+    //! `GET /api/pipelines` is a shared, un-tenanted surface and is gated by
+    //! the same rule as the shared catalog.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::HashMap;
+
+    use axum::Extension;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use lakehouse_auth::{PermissionSet, Principal, PrincipalId};
+    use serde_json::Value;
+    use uuid::Uuid;
+
+    use super::list;
+    use crate::config::Config;
+    use crate::state::AppState;
+
+    fn database_url_for(pool: &lakehouse_store::PgPool) -> String {
+        let options = pool.connect_options();
+        format!(
+            "postgres://{}:postgres@{}:{}/{}",
+            options.get_username(),
+            options.get_host(),
+            options.get_port(),
+            options
+                .get_database()
+                .expect("#[sqlx::test] always targets a named database"),
+        )
+    }
+
+    /// `DAGSTER_URL` deliberately points at a port nothing listens on: if the
+    /// refusal ever stopped short-circuiting, the route would try to reach
+    /// `Dagster` and this test would fail on the attempt rather than pass by
+    /// accident.
+    fn state_for(pool: &lakehouse_store::PgPool) -> AppState {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+        env.insert(
+            "DAGSTER_URL".to_owned(),
+            "http://127.0.0.1:1/graphql".to_owned(),
+        );
+        let config = Config::from_map(&env).expect("a valid test Config");
+        AppState::new(config)
+    }
+
+    fn analyst() -> Principal {
+        Principal {
+            id: PrincipalId::User(Uuid::nil()),
+            tenant_ids: vec![Uuid::from_u128(1)],
+            display_name: "Analyst".to_owned(),
+            permissions: PermissionSet::parse("pipeline:read"),
+            provider: "local".to_owned(),
+            must_change_password: false,
+            role_names: vec!["Analyst".to_owned()],
+        }
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn the_dagster_half_is_refused_and_says_so_when_no_owning_tenant_is_named(
+        pool: lakehouse_store::PgPool,
+    ) {
+        // `0002_seed_identity.sql` seeds four tenants and `CATALOG_TENANT_ID`
+        // is unset, so the shared surfaces are refused for a principal
+        // without the unrestricted grant.
+        let response = list(
+            State(state_for(&pool)),
+            Some(Extension(analyst())),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("collect body");
+        let v: Value = serde_json::from_slice(&body).expect("valid JSON");
+        assert_eq!(
+            v["dagsterJobs"]["supported"], false,
+            "a refused shared surface must say so, not return a shorter list that looks complete"
+        );
+        assert!(
+            v["dagsterJobs"]["reason"]
+                .as_str()
+                .expect("a reason string")
+                .contains("CATALOG_TENANT_ID"),
+            "the reason must name the setting an operator sets to open it back up"
+        );
+        assert!(
+            v["pipelines"]
+                .as_array()
+                .expect("pipelines array")
+                .is_empty(),
+            "no Dagster job may appear, and this database has no authored pipeline rows"
+        );
+    }
 }
 
 #[cfg(test)]

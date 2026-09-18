@@ -614,3 +614,40 @@ Same "restore into a scratch database first" caution as the script-based
 procedure above applies here — `--clean` drops existing objects before
 recreating them, so verify a dump against a throwaway database name
 before trusting it against the live one.
+
+## Upgrade note: set `CATALOG_TENANT_ID` before deploying WS8
+
+WS8 makes every tenant-scoped list fail closed. Two surfaces cannot be
+filtered per tenant, because nothing in the schema associates them with one:
+
+- **the catalog** — `bronze_meta.dataset_catalog` has six columns (`slug`,
+  `title`, `description`, `tier`, `updated_at`, `table_name`) and no tenant or
+  connector reference;
+- **the `Dagster`-job half of `GET /api/pipelines`** — a code location is one
+  per deployment, and migration `0042` adds `tenant_id` to `connector` and
+  `pipeline_definition` only.
+
+Rather than show every tenant the same shared list and call it scoped, both
+are **refused** for any principal without the unrestricted (`*:*`) grant once
+the deployment has more than one tenant.
+
+**What this means for an existing deployment.** `0002_seed_identity.sql` seeds
+four tenants, and its users belong to several of them — so on upgrade,
+Analysts, Data Engineers and Governance Admins lose the catalog and the job
+list until you say who owns them:
+
+```
+CATALOG_TENANT_ID=<the id of the tenant that owns this deployment's shared catalog>
+```
+
+For a stack that still runs the seeded identities, that is the group tenant in
+`0002_seed_identity.sql`. Members of that tenant then see both surfaces exactly
+as before; everyone else keeps getting `{"supported": false, "reason": …}`,
+which names this setting.
+
+A **single-tenant** deployment is unaffected — there is no other tenant's data
+to leak into a shared list, so nothing is refused whether or not the setting is
+present.
+
+A malformed value fails startup rather than quietly disabling the check. With
+the setting unset, the API logs one warning at boot naming it.

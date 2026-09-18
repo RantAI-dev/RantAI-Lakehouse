@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env().context("failed to resolve configuration from environment")?;
+    warn_if_catalog_tenant_unconfigured(&config);
     let port = config.port;
     let state = AppState::new(config);
 
@@ -609,6 +610,29 @@ async fn shutdown_signal() {
     if let Err(err) = tokio::signal::ctrl_c().await {
         tracing::error!(%err, "failed to install ctrl-c handler");
         std::future::pending::<()>().await;
+    }
+}
+
+/// Log ONCE at boot when this deployment refuses the shared catalog and
+/// `Dagster`-job list to tenant-scoped callers because nobody has said who
+/// owns them (WS8 plan Task C0, judge review Q1).
+///
+/// At boot, not per request: the condition cannot change between requests
+/// without a restart (it reads `Config`), and a per-request warning on a
+/// read-heavy route would bury the one line an operator needs to see. The
+/// tenant COUNT is deliberately not consulted here — that needs the pool,
+/// which may not be reachable yet at this point in startup, and the route
+/// itself already treats a single-tenant deployment as never refused. So
+/// this says what is configured, never what will happen to a given request.
+fn warn_if_catalog_tenant_unconfigured(config: &config::Config) {
+    if config.catalog_tenant_id.is_none() {
+        tracing::warn!(
+            "CATALOG_TENANT_ID is not set: on a deployment with more than one tenant, \
+             the shared catalog and the Dagster-job half of GET /api/pipelines are \
+             refused for every principal without the unrestricted grant. Set it to the \
+             id of the tenant that owns this deployment's shared catalog to restore \
+             access for that tenant's members (docs/OPERATIONS.md)."
+        );
     }
 }
 

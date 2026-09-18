@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 
 use thiserror::Error;
+use uuid::Uuid;
 
 /// Errors that can occur while resolving [`Config`] from environment
 /// variables.
@@ -34,6 +35,17 @@ pub enum ConfigError {
     /// `PORT` was set but is not a valid `u16`.
     #[error("PORT must be a valid u16, got {0:?}")]
     InvalidPort(String),
+    /// `CATALOG_TENANT_ID` was set but is not a valid UUID.
+    ///
+    /// Fails config resolution rather than silently falling back to
+    /// `None` (WS8 plan Task C0): unlike `SMTP_PORT`, a mistyped
+    /// `CATALOG_TENANT_ID` would silently flip a deployment from "the
+    /// shared catalog/Dagster-job list work for the group tenant's
+    /// members" to "refused for everyone" — exactly the kind of quiet
+    /// behavior change a startup failure should catch instead of a
+    /// request-time surprise.
+    #[error("CATALOG_TENANT_ID must be a valid UUID, got {0:?}")]
+    InvalidCatalogTenantId(String),
 }
 
 /// Resolved application configuration.
@@ -469,6 +481,22 @@ pub struct Config {
     /// "unset means unprobed, not unhealthy" posture as
     /// [`Self::trino_health_url`].
     pub openfga_url: Option<String>,
+    /// UUID of the tenant that owns this deployment's single shared
+    /// catalog and Dagster-job list (WS8 plan Task C0, judge review
+    /// revision 2 Q1; extended to the `Dagster`-job half of
+    /// `GET /api/pipelines` by this task's judge amendment).
+    /// `bronze_meta.dataset_catalog` (six columns: slug, title,
+    /// description, tier, `updated_at`, `table_name`) and a `Dagster` code
+    /// location are both one-per-deployment resources with no tenant
+    /// column at all — nothing in this schema associates either with any
+    /// ONE tenant. `None` when unset: with more than one tenant in the
+    /// deployment, `routes::catalog::catalog_tenant_refusal` then refuses
+    /// both surfaces to every non-`"*:*"` principal rather than leaking
+    /// every tenant's data into a shared list. Set this to restore access
+    /// for the tenant that actually owns the shared deployment (e.g. the
+    /// seeded `0002_seed_identity.sql` group tenant) — see the
+    /// `docs/OPERATIONS.md` upgrade note.
+    pub catalog_tenant_id: Option<Uuid>,
     /// The commit this image was built from — `rust/Dockerfile`'s `ARG
     /// GIT_SHA=unknown` / `ENV GIT_SHA=${GIT_SHA}` pair (WS4 item C2), the
     /// same convention `dagster/Dockerfile` already uses for the code
@@ -611,6 +639,7 @@ impl std::fmt::Debug for Config {
             .field("trino_max_rows", &self.trino_max_rows)
             .field("trino_health_url", &self.trino_health_url)
             .field("openfga_url", &self.openfga_url)
+            .field("catalog_tenant_id", &self.catalog_tenant_id)
             .field("git_sha", &self.git_sha)
             .finish()
     }
@@ -811,6 +840,16 @@ impl Config {
             trino_max_rows: parse_u64_or_default(env, "TRINO_MAX_ROWS", 10_000) as usize,
             trino_health_url: truthy(env, "TRINO_URL"),
             openfga_url: truthy(env, "OPENFGA_URL"),
+            // WS8 plan Task C0 (judge review revision 2 Q1): a malformed
+            // value fails config resolution rather than silently
+            // disabling the tenant-ownership check — see
+            // ConfigError::InvalidCatalogTenantId's doc comment.
+            catalog_tenant_id: truthy(env, "CATALOG_TENANT_ID")
+                .map(|raw| {
+                    raw.parse::<Uuid>()
+                        .map_err(|_err| ConfigError::InvalidCatalogTenantId(raw))
+                })
+                .transpose()?,
             git_sha: or_default(env, "GIT_SHA", "unknown"),
         })
     }
@@ -1334,6 +1373,37 @@ mod tests {
         assert_eq!(
             cfg.oidc_redirect_uri.as_deref(),
             Some("https://lake.invalid/api/auth/oidc/callback")
+        );
+    }
+
+    // WS8 plan Task C0 (judge review revision 2 Q1) — an operator-stated
+    // owning tenant for the shared catalog/Dagster-job surfaces.
+    #[test]
+    fn catalog_tenant_id_defaults_to_none_and_parses_when_set() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.catalog_tenant_id, None);
+
+        let mut env = HashMap::new();
+        env.insert(
+            "CATALOG_TENANT_ID".to_owned(),
+            "11111111-1111-4111-8111-000000000001".to_owned(),
+        );
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(
+            cfg.catalog_tenant_id,
+            Some("11111111-1111-4111-8111-000000000001".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn catalog_tenant_id_fails_config_resolution_when_set_but_not_a_uuid() {
+        let mut env = HashMap::new();
+        env.insert("CATALOG_TENANT_ID".to_owned(), "not-a-uuid".to_owned());
+        let err = Config::from_map(&env)
+            .expect_err("a malformed CATALOG_TENANT_ID must fail config resolution, not silently disable itself");
+        assert_eq!(
+            err,
+            ConfigError::InvalidCatalogTenantId("not-a-uuid".to_owned())
         );
     }
 }
