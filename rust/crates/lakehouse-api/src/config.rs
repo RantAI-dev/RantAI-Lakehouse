@@ -254,6 +254,23 @@ pub struct Config {
     /// combine `tenant::TENANT_ID` with the convention ADR 0003 defines.
     /// Default `"default"`.
     pub lakekeeper_warehouse: String,
+    /// Base URL of Lakekeeper's own `management/v1/*` REST API (e.g.
+    /// `http://lakekeeper:8181`), used ONLY by
+    /// `lakehouse_auth::openfga::LakekeeperAdminClient` (WS8 plan Task B2)
+    /// to look up/create a tenant's warehouse and grant this stack's
+    /// machine principals onto it (WS8 plan Task B4). Deliberately a
+    /// separate field from [`Self::lakekeeper_catalog_uri`], not the same
+    /// value with a suffix stripped at the call site: the catalog URI
+    /// always carries Lakekeeper's Iceberg REST catalog path
+    /// (`.../catalog`, ADR 0010/0011), while the management API lives at
+    /// the bare host — grepped for an existing `LAKEKEEPER_URL`/
+    /// `lakekeeper_url`-shaped field first (AGENTS rule 4) and found none;
+    /// `docker-compose.yml`'s `LAKEKEEPER_BASE_URI` (used by the
+    /// `gold-export`/`g1`-style test runners) is the same shape and this
+    /// field reads the SAME env var name for consistency. Default
+    /// `"http://localhost:8181"`, matching
+    /// [`Self::lakekeeper_catalog_uri`]'s dev-default host/port.
+    pub lakekeeper_base_url: String,
     /// `secretRef` (see `lakehouse_core::secret`) for Lakekeeper's own
     /// `OAuth2` client-credential, when Lakekeeper authorization is enabled.
     /// `None` when unset, meaning Lakekeeper is assumed to be running in
@@ -330,6 +347,25 @@ pub struct Config {
     /// token is picked up without restarting this process, but nothing
     /// re-mints one before its 30-day expiry (ADR 0011's known gap).
     pub lakekeeper_read_token_file: String,
+    /// WS8 plan Task B3 — path to a file holding an ADMIN-scoped Lakekeeper
+    /// bearer token, read by `AppState::lakekeeper_admin` through the same
+    /// shared `crate::lakekeeper_token::read_token_file` helper
+    /// [`Self::lakekeeper_gold_export_token_file`]/
+    /// [`Self::lakekeeper_read_token_file`] already use (AGENTS rule 4: no
+    /// second reader). Unlike those two narrower-scoped principals, this
+    /// token must be able to call Lakekeeper's `management/v1/*` API
+    /// (create warehouses, grant permissions) — `POST
+    /// /api/identity/tenants`'s provisioning path (WS8 plan Task B4) is the
+    /// only caller. Same "always a default path, never `None`-when-unset"
+    /// shape as those two fields: default `/tokens/admin.jwt`, matching the
+    /// compose mount path `lakekeeper-authz-init` already uses for its own
+    /// admin token (`docker-compose.yml`) — Task B5 mounts the same volume
+    /// subpath into `lakehouse-api`. A missing or unreadable file leaves
+    /// `AppState::lakekeeper_admin` at `None` (provisioning degrades to
+    /// unavailable) rather than panicking at boot or constructing a client
+    /// with an empty-string token that would only surface as a confusing
+    /// 401 from Lakekeeper later.
+    pub lakekeeper_admin_token_file: String,
     /// `ClickHouse` schema Gold marts live in (ADR 0010: `serving.*`).
     /// `routes::gold`'s export route reads `{gold_source_schema}.{mart}`.
     /// Default `"serving"`.
@@ -487,6 +523,7 @@ impl std::fmt::Debug for Config {
             .field("smtp_from", &self.smtp_from)
             .field("lakekeeper_catalog_uri", &self.lakekeeper_catalog_uri)
             .field("lakekeeper_warehouse", &self.lakekeeper_warehouse)
+            .field("lakekeeper_base_url", &self.lakekeeper_base_url)
             .field(
                 "lakekeeper_credential_secret_ref",
                 &self
@@ -542,6 +579,10 @@ impl std::fmt::Debug for Config {
             .field(
                 "lakekeeper_read_token_file",
                 &self.lakekeeper_read_token_file,
+            )
+            .field(
+                "lakekeeper_admin_token_file",
+                &self.lakekeeper_admin_token_file,
             )
             .field("gold_source_schema", &self.gold_source_schema)
             .field(
@@ -721,6 +762,7 @@ impl Config {
                 "http://localhost:8181/catalog",
             ),
             lakekeeper_warehouse: or_default(env, "LAKEKEEPER_WAREHOUSE", "default"),
+            lakekeeper_base_url: or_default(env, "LAKEKEEPER_BASE_URI", "http://localhost:8181"),
             lakekeeper_credential_secret_ref: truthy(env, "LAKEKEEPER_CREDENTIAL_SECRET_REF"),
             rustfs_s3_endpoint: or_default(env, "RUSTFS_S3_ENDPOINT", "http://localhost:9010"),
             rustfs_s3_region: or_default(env, "RUSTFS_S3_REGION", "us-east-1"),
@@ -745,6 +787,11 @@ impl Config {
                 env,
                 "LAKEKEEPER_READ_TOKEN_FILE",
                 "/tokens/lakehouse-api-reader.jwt",
+            ),
+            lakekeeper_admin_token_file: or_default(
+                env,
+                "LAKEKEEPER_ADMIN_TOKEN_FILE",
+                "/tokens/admin.jwt",
             ),
             gold_source_schema: or_default(env, "GOLD_SOURCE_SCHEMA", "serving"),
             gold_export_run_token: truthy(env, "GOLD_EXPORT_RUN_TOKEN"),
@@ -858,6 +905,7 @@ mod tests {
         );
         assert_eq!(cfg.lakekeeper_catalog_uri, "http://localhost:8181/catalog");
         assert_eq!(cfg.lakekeeper_warehouse, "default");
+        assert_eq!(cfg.lakekeeper_base_url, "http://localhost:8181");
         assert_eq!(cfg.lakekeeper_credential_secret_ref, None);
         assert_eq!(cfg.rustfs_s3_endpoint, "http://localhost:9010");
         assert_eq!(cfg.rustfs_s3_region, "us-east-1");
@@ -886,6 +934,7 @@ mod tests {
             cfg.lakekeeper_read_token_file,
             "/tokens/lakehouse-api-reader.jwt"
         );
+        assert_eq!(cfg.lakekeeper_admin_token_file, "/tokens/admin.jwt");
         assert_eq!(cfg.gold_source_schema, "serving");
         assert_eq!(cfg.gold_export_run_token, None);
         assert_eq!(cfg.gold_export_max_rows, 5_000_000);
@@ -898,6 +947,33 @@ mod tests {
         assert_eq!(cfg.trino_max_rows, 10_000);
         // Safe-by-default: SSRF blocking is ON unless explicitly disabled.
         assert!(!cfg.connector_probe_allow_internal_hosts);
+    }
+
+    /// WS8 plan Task B3 Step 1 — the exact test the plan specifies,
+    /// isolated from `defaults_match_typescript_fallbacks` so `cargo test
+    /// -p lakehouse-api lakekeeper_admin_token_file` (this task's own
+    /// verify command) actually selects a test.
+    #[test]
+    fn lakekeeper_admin_token_file_defaults_to_the_tokens_admin_jwt_path() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.lakekeeper_admin_token_file, "/tokens/admin.jwt");
+    }
+
+    #[test]
+    fn lakekeeper_admin_token_file_and_base_url_are_overridable() {
+        let env = map(&[
+            (
+                "LAKEKEEPER_ADMIN_TOKEN_FILE",
+                "/secrets/lakekeeper-admin.jwt",
+            ),
+            ("LAKEKEEPER_BASE_URI", "http://lakekeeper.internal:8181"),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(
+            cfg.lakekeeper_admin_token_file,
+            "/secrets/lakekeeper-admin.jwt"
+        );
+        assert_eq!(cfg.lakekeeper_base_url, "http://lakekeeper.internal:8181");
     }
 
     #[test]

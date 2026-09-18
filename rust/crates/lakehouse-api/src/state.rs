@@ -4,8 +4,9 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use lakehouse_auth::openfga::LakekeeperAdminClient;
 use lakehouse_auth::{
-    LocalPasswordAuthenticator, OidcAuthenticator, OidcConfig, ServiceTokenAuthenticator,
+    LocalPasswordAuthenticator, OidcAuthenticator, OidcConfig, Secret, ServiceTokenAuthenticator,
     SessionAuthenticator,
 };
 use lakehouse_clickhouse::ChClient;
@@ -164,6 +165,27 @@ pub struct AppState {
     /// [`Self::gold_export_locks`]/[`Self::bronze_stats_cache`]): needs no
     /// external dependency, just an in-process buffer.
     pub policy_decision_latencies: PolicyDecisionLatencies,
+    /// Client for Lakekeeper's `management/v1/*` API, used by `POST
+    /// /api/identity/tenants` (WS8 plan Task B4) to provision a tenant's
+    /// warehouse and grant this stack's machine principals onto it — see
+    /// `lakehouse_auth::openfga::LakekeeperAdminClient`'s module doc
+    /// comment (WS8 plan Task B2). `None` when
+    /// `Config::lakekeeper_admin_token_file` is unreadable at startup
+    /// (not provisioned on this deployment, wrong path, permissions):
+    /// same degrade-honestly posture `bootstrap_agent_run_service`
+    /// (`main.rs`) uses for its own missing-token case — a caller sees
+    /// tenant provisioning as unavailable rather than the whole process
+    /// panicking at boot or silently dialing Lakekeeper with an
+    /// empty-string token that would only surface as a confusing 401
+    /// later, deep inside a provisioning call.
+    #[allow(
+        dead_code,
+        reason = "no reader yet — WS8 plan Task B4 (POST /api/identity/tenants) \
+                  is the first consumer and is out of this task's file scope \
+                  (config.rs/state.rs only); this allow is expected to be \
+                  removed the moment that task lands"
+    )]
+    pub lakekeeper_admin: Option<Arc<LakekeeperAdminClient>>,
 }
 
 /// The cap [`PolicyDecisionLatencies`] keeps — old samples are evicted
@@ -426,6 +448,31 @@ impl AppState {
                 crate::pipeline_source::SourceAllowlist::new()
             }
         };
+        // WS8 plan Task B3 — read the admin-scoped Lakekeeper bearer token
+        // synchronously (`std::fs::read_to_string`, not
+        // `crate::lakekeeper_token::read_token_file`): that helper is
+        // `async` (it targets per-request reads, e.g. `routes::gold`'s
+        // token read), while `AppState::new` is a plain sync fn called
+        // from `main.rs` without an executor available yet — making it
+        // `async` would ripple `.await` into every `AppState::new` call
+        // site in `main.rs`/`tests/*.rs`, files this task does not own.
+        // A missing/unreadable file degrades to `None`, never a panic or
+        // an empty-string token — same posture `bootstrap_agent_run_service`
+        // (`main.rs`) uses when its own token is unset.
+        let lakekeeper_admin = match std::fs::read_to_string(&config.lakekeeper_admin_token_file) {
+            Ok(raw) => Some(Arc::new(LakekeeperAdminClient::new(
+                config.lakekeeper_base_url.clone(),
+                Secret::new(raw.trim().to_owned()),
+            ))),
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    path = %config.lakekeeper_admin_token_file,
+                    "Lakekeeper admin token file is unreadable; tenant provisioning (POST /api/identity/tenants) will report itself unavailable"
+                );
+                None
+            }
+        };
         Self {
             config: Arc::new(config),
             clickhouse,
@@ -448,6 +495,7 @@ impl AppState {
             health_cache: Arc::new(tokio::sync::Mutex::new(None)),
             pipeline_source_allowlist: Arc::new(pipeline_source_allowlist),
             policy_decision_latencies: PolicyDecisionLatencies::default(),
+            lakekeeper_admin,
         }
     }
 }
