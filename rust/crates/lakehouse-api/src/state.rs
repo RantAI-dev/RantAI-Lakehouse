@@ -401,8 +401,12 @@ impl AppState {
             ..TrinoConfig::new(config.trino_url.clone())
         });
         // `PIPELINE_SOURCE_DIR` — default `/opt/pipeline-src/dispar_orchestrate`,
-        // `rust/Dockerfile`'s `COPY --from=pipeline_src`, WS4 item C2. A
-        // dev environment without the baked tree degrades to an empty
+        // `rust/Dockerfile`'s `COPY --from=pipeline_src`, WS4 item C2. Its
+        // FINAL COMPONENT is the code location's Python package name, and
+        // `build_allowlist` keys every file under it (a deployment baking
+        // a differently-named code location points this at that package's
+        // directory; see `pipeline_source::build_allowlist`). A dev
+        // environment without the baked tree degrades to an empty
         // allowlist (every `/source` request then 404s, honestly, rather
         // than the process failing to boot at all).
         let pipeline_source_base = std::env::var("PIPELINE_SOURCE_DIR").map_or_else(

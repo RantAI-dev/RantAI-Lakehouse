@@ -1794,11 +1794,24 @@ mod tests {
             state
         }
 
+        /// The code-location package directory the fixtures use as the
+        /// allowlist base. `build_allowlist` keys every file by the base's
+        /// OWN final component (the Python package name), so the base has
+        /// to be a directory named like a code location -- a raw temp root
+        /// would key files under a random directory name no `source_ref`
+        /// could match.
+        fn source_package(dir: &tempfile::TempDir) -> std::path::PathBuf {
+            let package = dir.path().join("dispar_orchestrate");
+            std::fs::create_dir(&package).expect("create the package dir");
+            package
+        }
+
         #[tokio::test]
         async fn pipeline_source_route_400s_when_op_is_missing() {
             let server = wiremock::MockServer::start().await;
             let dir = tempfile::tempdir().expect("tempdir");
-            let state = state_with_dagster_and_source(&server.uri(), dir.path());
+            let package = source_package(&dir);
+            let state = state_with_dagster_and_source(&server.uri(), &package);
             let response = source(
                 State(state),
                 Path("bronze_maintenance_job".to_owned()),
@@ -1812,8 +1825,8 @@ mod tests {
         async fn pipeline_source_route_404s_on_unknown_op_after_commit_passes() {
             let server = wiremock::MockServer::start().await;
             let dir = tempfile::tempdir().expect("tempdir");
-            std::fs::write(dir.path().join("assets.py"), "def real_fn():\n    pass\n")
-                .expect("write");
+            let package = source_package(&dir);
+            std::fs::write(package.join("assets.py"), "def real_fn():\n    pass\n").expect("write");
             let op_ref = "dispar_orchestrate/assets.py::not_a_real_fn";
             wiremock::Mock::given(wiremock::matchers::body_string_contains("pipelineOrError"))
                 .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
@@ -1827,7 +1840,7 @@ mod tests {
                 })))
                 .mount(&server)
                 .await;
-            let state = state_with_dagster_and_source(&server.uri(), dir.path());
+            let state = state_with_dagster_and_source(&server.uri(), &package);
             // This image's own GIT_SHA must match the op's declared commit
             // for the request to reach the allowlist check at all.
             let mut state = state;
@@ -1851,8 +1864,8 @@ mod tests {
         async fn pipeline_source_route_409s_on_commit_mismatch() {
             let server = wiremock::MockServer::start().await;
             let dir = tempfile::tempdir().expect("tempdir");
-            std::fs::write(dir.path().join("assets.py"), "def real_fn():\n    pass\n")
-                .expect("write");
+            let package = source_package(&dir);
+            std::fs::write(package.join("assets.py"), "def real_fn():\n    pass\n").expect("write");
             let op_ref = "dispar_orchestrate/assets.py::real_fn";
             wiremock::Mock::given(wiremock::matchers::body_string_contains("pipelineOrError"))
                 .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
@@ -1866,7 +1879,7 @@ mod tests {
                 })))
                 .mount(&server)
                 .await;
-            let mut state = state_with_dagster_and_source(&server.uri(), dir.path());
+            let mut state = state_with_dagster_and_source(&server.uri(), &package);
             let mut env = HashMap::new();
             env.insert(
                 "GIT_SHA".to_owned(),
@@ -1892,8 +1905,8 @@ mod tests {
         async fn pipeline_source_route_409s_when_both_commits_are_the_unknown_placeholder() {
             let server = wiremock::MockServer::start().await;
             let dir = tempfile::tempdir().expect("tempdir");
-            std::fs::write(dir.path().join("assets.py"), "def real_fn():\n    pass\n")
-                .expect("write");
+            let package = source_package(&dir);
+            std::fs::write(package.join("assets.py"), "def real_fn():\n    pass\n").expect("write");
             let op_ref = "dispar_orchestrate/assets.py::real_fn";
             wiremock::Mock::given(wiremock::matchers::body_string_contains("pipelineOrError"))
                 .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
@@ -1910,7 +1923,7 @@ mod tests {
             // GIT_SHA is left unset -> Config::from_map defaults it to
             // "unknown" too (config.rs: `or_default(env, "GIT_SHA",
             // "unknown")`).
-            let state = state_with_dagster_and_source(&server.uri(), dir.path());
+            let state = state_with_dagster_and_source(&server.uri(), &package);
             assert_eq!(state.config.git_sha, "unknown");
             let response = source(
                 State(state),
@@ -1935,8 +1948,9 @@ mod tests {
         async fn pipeline_source_route_200s_and_returns_text_for_a_real_allowlisted_op() {
             let server = wiremock::MockServer::start().await;
             let dir = tempfile::tempdir().expect("tempdir");
+            let package = source_package(&dir);
             std::fs::write(
-                dir.path().join("assets.py"),
+                package.join("assets.py"),
                 "def ingest_bronze_table():\n    return 1\n",
             )
             .expect("write");
@@ -1953,7 +1967,7 @@ mod tests {
                 })))
                 .mount(&server)
                 .await;
-            let mut state = state_with_dagster_and_source(&server.uri(), dir.path());
+            let mut state = state_with_dagster_and_source(&server.uri(), &package);
             let mut env = HashMap::new();
             env.insert("GIT_SHA".to_owned(), "real-sha-abc123".to_owned());
             state.config = Arc::new(Config::from_map(&env).expect("a valid test Config"));
@@ -1989,9 +2003,12 @@ mod tests {
         async fn pipeline_source_route_refuses_a_traversal_reported_by_dagster_itself() {
             let server = wiremock::MockServer::start().await;
             let dir = tempfile::tempdir().expect("tempdir");
-            std::fs::write(dir.path().join("assets.py"), "x = 1\n").expect("write");
-            let parent = dir.path().parent().expect("tempdir has a parent");
-            std::fs::write(parent.join("secret.py"), "SECRET = 1\n").expect("write");
+            let package = source_package(&dir);
+            std::fs::write(package.join("assets.py"), "x = 1\n").expect("write");
+            // The temp ROOT, one level above the package directory that
+            // is the allowlist base -- inside the `TempDir`'s own managed
+            // lifetime, and genuinely outside the base.
+            std::fs::write(dir.path().join("secret.py"), "SECRET = 1\n").expect("write");
             let op_ref = "../secret.py::x";
             wiremock::Mock::given(wiremock::matchers::body_string_contains("pipelineOrError"))
                 .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
@@ -2005,7 +2022,7 @@ mod tests {
                 })))
                 .mount(&server)
                 .await;
-            let mut state = state_with_dagster_and_source(&server.uri(), dir.path());
+            let mut state = state_with_dagster_and_source(&server.uri(), &package);
             let mut env = HashMap::new();
             env.insert("GIT_SHA".to_owned(), "real-sha-abc123".to_owned());
             state.config = Arc::new(Config::from_map(&env).expect("a valid test Config"));
@@ -2018,7 +2035,8 @@ mod tests {
             )
             .await;
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
-            let _ = std::fs::remove_file(parent.join("secret.py"));
+            // No manual cleanup: `secret.py` now lives inside `dir`, so
+            // dropping the `TempDir` removes it.
         }
     }
 

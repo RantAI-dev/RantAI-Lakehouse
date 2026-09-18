@@ -85,8 +85,9 @@ pub enum SourceError {
     Io,
 }
 
-/// `"dispar_orchestrate/<relative path>.py"` → the file's already-
-/// canonicalized, on-disk path. Built once by [`build_allowlist`].
+/// `"<package>/<relative path>.py"` → the file's already-canonicalized,
+/// on-disk path, where `<package>` is the baked code location's own
+/// directory name. Built once by [`build_allowlist`].
 pub type SourceAllowlist = HashMap<String, PathBuf>;
 
 /// Walk `base` once, admitting only regular `.py` files whose
@@ -100,6 +101,20 @@ pub type SourceAllowlist = HashMap<String, PathBuf>;
 /// Returns [`SourceError::Io`] if `base` itself cannot be canonicalized.
 pub fn build_allowlist(base: &Path) -> Result<SourceAllowlist, SourceError> {
     let base_real = base.canonicalize().map_err(|_| SourceError::Io)?;
+    // The key prefix is `base`'s OWN final component — the Python package
+    // name of the code location this image baked in
+    // (`/opt/pipeline-src/<package>`, `PIPELINE_SOURCE_DIR`). A `source_ref`
+    // is emitted by the code location itself and is always relative to its
+    // package root, so a deployment shipping a code location that is not
+    // named `dispar_orchestrate` (a demo's own package, a customer's own)
+    // used to produce keys no `source_ref` could ever match, and every
+    // `/source` request 404d no matter how correct the metadata was. A base
+    // with no final component (`/`) keeps the historical prefix rather than
+    // minting keys that start with `/`.
+    let package = base_real
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("dispar_orchestrate");
     let mut map = HashMap::new();
     for entry in walkdir_py_files(&base_real) {
         let Ok(real) = entry.canonicalize() else {
@@ -115,7 +130,7 @@ pub fn build_allowlist(base: &Path) -> Result<SourceAllowlist, SourceError> {
             continue;
         };
         let key = format!(
-            "dispar_orchestrate/{}",
+            "{package}/{}",
             relative_path.to_string_lossy().replace('\\', "/")
         );
         map.insert(key, real);
@@ -148,7 +163,7 @@ fn walkdir_py_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Resolve `source_ref` (`"dispar_orchestrate/<file>.py::<fn>"`) against
+/// Resolve `source_ref` (`"<package>/<file>.py::<fn>"`) against
 /// `allowlist` and return the function's source text.
 ///
 /// # Errors
@@ -255,18 +270,32 @@ mod tests {
 
     use super::*;
 
+    /// A temp directory holding a code-location package directory named
+    /// `dispar_orchestrate`, with `files` inside it. The package directory
+    /// — not the temp root — is what `build_allowlist` is given, because
+    /// the key prefix is now the base's own final component; keeping the
+    /// name `dispar_orchestrate` here preserves every existing assertion's
+    /// key strings, and `admits_a_code_location_named_something_else`
+    /// covers the other name.
     fn base_with(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempdir().unwrap();
+        let package = dir.path().join("dispar_orchestrate");
+        fs::create_dir(&package).unwrap();
         for (name, contents) in files {
-            fs::write(dir.path().join(name), contents).unwrap();
+            fs::write(package.join(name), contents).unwrap();
         }
         dir
+    }
+
+    /// The path handed to [`build_allowlist`] for a [`base_with`] fixture.
+    fn base_path(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("dispar_orchestrate")
     }
 
     #[test]
     fn resolves_a_real_allowlisted_file() {
         let dir = base_with(&[("assets.py", "def ingest_bronze_table():\n    pass\n")]);
-        let allowlist = build_allowlist(dir.path()).unwrap();
+        let allowlist = build_allowlist(&base_path(&dir)).unwrap();
         let text = read_source(
             &allowlist,
             "dispar_orchestrate/assets.py::ingest_bronze_table",
@@ -275,15 +304,43 @@ mod tests {
         assert!(text.contains("def ingest_bronze_table"));
     }
 
+    /// The key prefix follows the baked code location's own directory
+    /// name, so an image shipping a package that is not
+    /// `dispar_orchestrate` (`PIPELINE_SOURCE_DIR` pointed at it) serves
+    /// the `source_ref` values THAT code location emits. Before this, the
+    /// prefix was the hardcoded string `dispar_orchestrate/` and every
+    /// such deployment 404d on every op regardless of its metadata.
+    #[test]
+    fn admits_a_code_location_named_something_else() {
+        let dir = tempdir().unwrap();
+        let package = dir.path().join("meridian_orchestrate");
+        fs::create_dir(&package).unwrap();
+        fs::write(
+            package.join("definitions.py"),
+            "def bronze_commerce():\n    pass\n",
+        )
+        .unwrap();
+        let allowlist = build_allowlist(&package).unwrap();
+        let text = read_source(
+            &allowlist,
+            "meridian_orchestrate/definitions.py::bronze_commerce",
+        )
+        .unwrap();
+        assert!(text.contains("def bronze_commerce"));
+        assert!(!allowlist.contains_key("dispar_orchestrate/definitions.py"));
+    }
+
     #[test]
     fn rejects_a_real_dot_dot_escape() {
         let dir = base_with(&[("assets.py", "x = 1\n")]);
         // A sibling file OUTSIDE the base, to prove `..` would actually
         // reach something if not rejected — not just a string that
         // contains the characters `..` with nothing behind it.
-        let parent = dir.path().parent().unwrap();
-        fs::write(parent.join("secret.py"), "SECRET = 1\n").unwrap();
-        let allowlist = build_allowlist(dir.path()).unwrap();
+        // The temp ROOT, one level above the package directory that is
+        // the allowlist base -- inside the `TempDir`'s own managed
+        // lifetime, and genuinely outside the base.
+        fs::write(dir.path().join("secret.py"), "SECRET = 1\n").unwrap();
+        let allowlist = build_allowlist(&base_path(&dir)).unwrap();
         let err = read_source(&allowlist, "../secret.py::x").unwrap_err();
         assert!(matches!(err, SourceError::NotAllowlisted(_)));
     }
@@ -300,7 +357,7 @@ mod tests {
         let outside_dir = tempdir().unwrap();
         let outside_file = outside_dir.path().join("absolute_escape.py");
         fs::write(&outside_file, "SECRET = 1\n").unwrap();
-        let allowlist = build_allowlist(dir.path()).unwrap();
+        let allowlist = build_allowlist(&base_path(&dir)).unwrap();
         let op_ref = format!("{}::x", outside_file.display());
         let err = read_source(&allowlist, &op_ref).unwrap_err();
         assert!(matches!(err, SourceError::NotAllowlisted(_)));
@@ -313,31 +370,29 @@ mod tests {
     #[cfg(unix)]
     fn rejects_a_real_symlink_pointing_outside_the_base() {
         let dir = base_with(&[]);
-        let parent = dir.path().parent().unwrap();
-        let outside = parent.join("pipeline_source_test_outside.py");
+        let outside = dir.path().join("pipeline_source_test_outside.py");
         fs::write(&outside, "SECRET = 1\n").unwrap();
-        std::os::unix::fs::symlink(&outside, dir.path().join("linked.py")).unwrap();
-        let allowlist = build_allowlist(dir.path()).unwrap();
+        std::os::unix::fs::symlink(&outside, base_path(&dir).join("linked.py")).unwrap();
+        let allowlist = build_allowlist(&base_path(&dir)).unwrap();
         // Even if "linked.py" were (wrongly) added to the allowlist by
         // name, canonicalizing it must resolve outside `dir` and be
         // rejected -- this test asserts the allowlist builder itself
         // never admits a symlink whose target canonicalizes outside the
         // base, not just that a caller-supplied path is checked.
         assert!(!allowlist.contains_key("dispar_orchestrate/linked.py"));
-        let _ = fs::remove_file(&outside);
     }
 
     #[test]
     fn rejects_a_non_py_extension() {
         let dir = base_with(&[("notes.txt", "not python")]);
-        let allowlist = build_allowlist(dir.path()).unwrap();
+        let allowlist = build_allowlist(&base_path(&dir)).unwrap();
         assert!(!allowlist.contains_key("dispar_orchestrate/notes.txt"));
     }
 
     #[test]
     fn rejects_an_unknown_function_within_an_allowlisted_file() {
         let dir = base_with(&[("assets.py", "def real_fn():\n    pass\n")]);
-        let allowlist = build_allowlist(dir.path()).unwrap();
+        let allowlist = build_allowlist(&base_path(&dir)).unwrap();
         let err =
             read_source(&allowlist, "dispar_orchestrate/assets.py::not_a_real_fn").unwrap_err();
         assert!(matches!(err, SourceError::FunctionNotFound(_)));
@@ -415,7 +470,7 @@ mod tests {
     #[test]
     fn rejects_an_encoded_dot_dot_escape() {
         let dir = base_with(&[("assets.py", "x = 1\n")]);
-        let allowlist = build_allowlist(dir.path()).unwrap();
+        let allowlist = build_allowlist(&base_path(&dir)).unwrap();
         let err = read_source(&allowlist, "%2e%2e%2fsecret.py::x").unwrap_err();
         assert!(matches!(err, SourceError::NotAllowlisted(_)));
     }
@@ -426,7 +481,7 @@ mod tests {
     #[test]
     fn rejects_a_source_ref_with_no_separator() {
         let dir = base_with(&[("assets.py", "x = 1\n")]);
-        let allowlist = build_allowlist(dir.path()).unwrap();
+        let allowlist = build_allowlist(&base_path(&dir)).unwrap();
         let err = read_source(&allowlist, "dispar_orchestrate/assets.py").unwrap_err();
         assert!(matches!(err, SourceError::NotAllowlisted(_)));
     }
