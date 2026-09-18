@@ -1,3 +1,4 @@
+import type { Session } from "../contracts/auth";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
 
@@ -109,4 +110,39 @@ export type ProvidersResponse = {
 export async function providers(signal?: AbortSignal): Promise<ProvidersResponse> {
   const res = await apiFetch("/api/auth/providers", { signal });
   return parse<ProvidersResponse>(res, "Failed to load SSO providers.");
+}
+
+/**
+ * `GET /api/auth/sessions` (WS8 §Phase D, D1). The route is the
+ * ownership-aware listing: a caller without `identity:sessions:manage`
+ * gets only their own live browser sessions; an admin gets all of them
+ * (see `routes/auth.rs::sessions` and `lakehouse_store::sessions::list_
+ * sessions_for_caller`). Wire shape is `SessionRow`'s
+ * `camelCase` serialization — see `services/contracts/auth.ts`.
+ */
+export async function listSessions(signal?: AbortSignal): Promise<Session[]> {
+  const res = await apiFetch("/api/auth/sessions", { signal });
+  return parse<Session[]>(res, "Failed to load sessions.");
+}
+
+/**
+ * `DELETE /api/auth/sessions/{id}` (WS8 §Phase D, D2). The route is
+ * 404-uniform for foreign ids, missing ids, and already-revoked ids
+ * (Hard Requirement 4 — non-enumeration); from the client's point of view
+ * a 404 on revoke means "nothing to refresh, the row is gone or was
+ * never yours," which we surface by letting `apiFetch`'s 404 drive the
+ * `errorFor` mapping below.
+ */
+export async function deleteSession(id: string, signal?: AbortSignal): Promise<void> {
+  const res = await apiFetch(`/api/auth/sessions/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    signal,
+  });
+  if (!res.ok) {
+    const json = await res.json().catch(() => null);
+    if (res.status === 404) {
+      throw new ServiceError("not_found", json?.error ?? "Session not found.");
+    }
+    throw new ServiceError("unavailable", json?.error ?? "Failed to revoke session.");
+  }
 }

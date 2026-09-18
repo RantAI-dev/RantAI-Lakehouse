@@ -19,6 +19,7 @@ import {
   Library,
   ListChecks,
   LogIn,
+  MonitorSmartphone,
   PackageCheck,
   Plug,
   SearchCode,
@@ -170,6 +171,7 @@ export const NAV_GROUPS: NavGroup[] = [
         icon: KeyRound,
       },
       { title: "SSO", href: "/admin/sso", icon: LogIn },
+      { title: "Sessions", href: "/admin/sessions", icon: MonitorSmartphone },
     ],
   },
 ]

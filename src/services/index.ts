@@ -70,10 +70,15 @@ export const goldService = goldClientService
 // ever existed for this domain.
 export const notificationsService = notificationsClientService
 // SSO admin page (WS8 §Phase F) reads the live OIDC configuration
-// off the API process. Only `providers` is registered — the other auth
+// off the API process. Sessions page (WS8 §Phase F) lists and revokes
+// live browser sessions via `GET /api/auth/sessions` and
+// `DELETE /api/auth/sessions/{id}` (WS8 §Phase D, D1/D2). Only `providers`,
+// `listSessions`, and `deleteSession` are registered — the other auth
 // methods (login/logout/me/change-password) stay imported directly by
 // `AuthProvider` and the login/change-password pages; see
 // `services/clients/auth.ts`'s module doc comment for why the split.
 export const authService = {
   providers: authClient.providers,
+  listSessions: authClient.listSessions,
+  deleteSession: authClient.deleteSession,
 }
