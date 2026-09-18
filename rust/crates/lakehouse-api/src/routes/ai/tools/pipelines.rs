@@ -15,6 +15,7 @@ use serde_json::{Map, Value, json};
 
 use axum::Extension;
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use lakehouse_auth::Principal;
 
 use super::{arg_str, response_to_value};
@@ -84,8 +85,17 @@ pub(super) async fn run_bronze_maintenance(dagster: &lakehouse_dagster::DgClient
 
 // ── T1.3 pipeline-operations tools ──────────────────────────────────────
 
-pub(super) async fn list_pipelines(state: &AppState) -> Value {
-    response_to_value(crate::routes::pipelines::list(State(state.clone())).await).await
+/// `headers: HeaderMap::new()` — no `X-Tenant` selection from the copilot
+/// dispatcher today, so `tenant_scope::resolve` falls back to the
+/// principal's own first tenant (or `None`/empty list if it belongs to
+/// none), the same default an interactive caller gets by omitting the
+/// header.
+pub(super) async fn list_pipelines(state: &AppState, principal: Option<&Principal>) -> Value {
+    let extension = principal.cloned().map(Extension);
+    response_to_value(
+        crate::routes::pipelines::list(State(state.clone()), extension, HeaderMap::new()).await,
+    )
+    .await
 }
 
 pub(super) async fn list_pipeline_runs(state: &AppState, args: &Map<String, Value>) -> Value {

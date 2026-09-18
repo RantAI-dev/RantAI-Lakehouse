@@ -9,7 +9,7 @@
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
@@ -20,6 +20,7 @@ use lakehouse_store::pipelines::{self, CreatePipelineInput};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
@@ -34,8 +35,47 @@ use crate::tenant::TENANT_OWNER;
 /// Task 2.5) so an authored pipeline is visible immediately rather than
 /// vanishing the way an authored governance rule did before the Task 2.3
 /// gap fix — see `0007_pipelines.sql`'s header comment.
-pub async fn list(State(state): State<AppState>) -> Response {
-    match list_body(&state.dagster, state.pg.as_deref()).await {
+///
+/// # Tenant scoping (WS8 plan Task C3, Hard Requirement 2) — authored
+/// pipelines only
+///
+/// `tenant_scope::resolve` runs first: `Ok(None)` (the caller belongs to
+/// zero tenants) short-circuits to `{"pipelines": []}` before the `Dagster`
+/// client or the store are ever queried — fail closed, never "unscoped,
+/// show everything." When it resolves `Some(tenant_id)`, the authored half
+/// of this union (`pipelines::list_pipelines`) is filtered to that tenant
+/// via a bound `WHERE tenant_id = $1`.
+///
+/// **Deviation from a literal reading of the WS8 plan's Task C3 spec,
+/// named here because it changes real behaviour:** the `Dagster`-job half
+/// of this union is NOT tenant-filtered. `0042_tenant_provisioning.sql`
+/// (Task B1, this task's own dependency) adds `tenant_id` only to
+/// `connector` and `pipeline_definition` — a `Dagster` job has no tenant
+/// column anywhere in this schema, and nothing maps a job name to a tenant
+/// id. Filtering it would mean inventing that mapping, which is exactly
+/// the "never fabricate" rule this program is built on; leaving it
+/// unscoped is an honest, pre-existing limitation (every `Dagster` job was
+/// already visible to every caller with `pipeline:read` before this task)
+/// rather than a claim of isolation this route cannot back up. The
+/// isolation guarantee this task's tests assert is scoped to
+/// `pipeline_definition` rows, matching what migration `0042` actually
+/// added a column for.
+pub async fn list(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(Extension(principal)) = principal else {
+        return ApiRejection(ApiError::unauthorized()).into_response();
+    };
+    let tenant_id = match crate::tenant_scope::resolve(&principal, &headers) {
+        Ok(Some(tenant_id)) => tenant_id,
+        Ok(None) => {
+            return (StatusCode::OK, ApiJson(json!({ "pipelines": [] }))).into_response();
+        }
+        Err(err) => return ApiRejection(err).into_response(),
+    };
+    match list_body(&state.dagster, state.pg.as_deref(), tenant_id).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         // `catch (e) { return NextResponse.json({ pipelines: [], error:
         // String(e) }, { status: 503 }); }` in `pipelines/route.ts`.
@@ -55,7 +95,11 @@ enum ListError {
     Store(#[from] lakehouse_store::StoreError),
 }
 
-async fn list_body(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, ListError> {
+async fn list_body(
+    dagster: &DgClient,
+    pg: Option<&PgPool>,
+    tenant_id: Uuid,
+) -> Result<Value, ListError> {
     let (jobs, runs) =
         tokio::try_join!(dagster.list_jobs_with_schedules(), dagster.list_runs(100))?;
 
@@ -67,7 +111,10 @@ async fn list_body(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, Lis
         })
         .collect();
     if let Some(pg) = pg {
-        let authored = pipelines::list_pipelines(pg).await?;
+        let filter = pipelines::PipelineFilter {
+            tenant_id: Some(tenant_id),
+        };
+        let authored = pipelines::list_pipelines(pg, &filter).await?;
         pipelines.extend(authored.iter().filter_map(|p| serde_json::to_value(p).ok()));
     }
     Ok(json!({ "pipelines": pipelines }))
@@ -1291,11 +1338,14 @@ fn dagster_mutation_failure(error: Option<String>) -> Response {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::collections::HashMap;
+
     use lakehouse_auth::{PermissionSet, PrincipalId};
     use lakehouse_dagster::{DgSchedule, DgScheduleState};
     use uuid::Uuid;
 
     use super::*;
+    use crate::config::Config;
 
     /// A logged-in human principal — mirrors `routes::query`/
     /// `routes::agents`/`routes::connectors`'s own test fixture of the
@@ -1323,6 +1373,87 @@ mod tests {
             must_change_password: false,
             role_names: Vec::new(),
         }
+    }
+
+    fn state_without_pool() -> AppState {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+        let config = Config::from_map(&env).expect("a valid test Config");
+        AppState::new(config)
+    }
+
+    fn principal_with_tenants(tenant_ids: &[Uuid]) -> Principal {
+        Principal {
+            tenant_ids: tenant_ids.to_vec(),
+            ..fixture_user_principal()
+        }
+    }
+
+    fn headers_with_x_tenant(tenant_id: Uuid) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-tenant",
+            tenant_id
+                .to_string()
+                .parse()
+                .expect("uuid renders as a valid header value"),
+        );
+        headers
+    }
+
+    async fn response_json(resp: Response) -> (StatusCode, Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    // ── WS8 plan Task C3: `GET /api/pipelines` tenant scoping ──────────
+
+    /// Hard Requirement 2: a principal that belongs to zero tenants gets
+    /// `{"pipelines": []}` — never `403`/`404`, and never every tenant's
+    /// rows. `state_without_pool()` (no `Dagster` client reachable either)
+    /// proves this is returned BEFORE `list_body` (hence before the
+    /// `Dagster` client or the store) is ever queried: reaching
+    /// `list_body` here would fail with a 503 `Dagster` connection error,
+    /// not 200 with an empty body.
+    #[tokio::test]
+    async fn list_with_a_tenantless_principal_returns_an_empty_list_before_touching_dagster_or_the_store()
+     {
+        let state = state_without_pool();
+        let principal = principal_with_tenants(&[]);
+        let resp = list(
+            State(state),
+            Some(Extension(principal)),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        let (status, body) = response_json(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({ "pipelines": [] }));
+    }
+
+    /// No `Extension<Principal>` at all (the internal, non-HTTP call path
+    /// `routes::ai::tools::pipelines` used to take before this task) is
+    /// refused with 401, not a panic or an unscoped read.
+    #[tokio::test]
+    async fn list_with_no_principal_extension_is_unauthorized() {
+        let state = state_without_pool();
+        let resp = list(State(state), None, axum::http::HeaderMap::new()).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `X-Tenant` naming a tenant the principal does not belong to is a
+    /// 404 (via `tenant_scope::resolve`'s own contract), propagated
+    /// through this route rather than swallowed or defaulted to unscoped.
+    #[tokio::test]
+    async fn list_with_a_foreign_x_tenant_header_is_not_found() {
+        let state = state_without_pool();
+        let principal = principal_with_tenants(&[Uuid::from_u128(1)]);
+        let headers = headers_with_x_tenant(Uuid::from_u128(2)); // not a member
+        let resp = list(State(state), Some(Extension(principal)), headers).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     /// WS5 item D4, failing-test-first: `pipeline_audit_event` did not

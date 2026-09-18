@@ -20,7 +20,7 @@
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
@@ -63,13 +63,45 @@ fn required(field: &str, value: &str) -> Result<String, ApiError> {
     Ok(trimmed.to_owned())
 }
 
-/// `GET /api/connectors` — every connector.
+/// `GET /api/connectors` — every connector visible to the caller's active
+/// tenant.
+///
+/// # Tenant scoping (WS8 plan Task C2, Hard Requirement 2)
+///
+/// `tenant_scope::resolve` runs first, fail closed: a principal belonging
+/// to zero tenants (`Ok(None)`) gets an EMPTY list, returned before the
+/// store is ever queried — never "unscoped, show every tenant's
+/// connectors." A connector whose own `tenant_id` column is `NULL`
+/// (unassigned — `0042_tenant_provisioning.sql`) never matches a real
+/// tenant filter (SQL `NULL = $1` is never `true`), so it is invisible to
+/// every tenant-scoped caller, not merely the ones who happen not to ask
+/// for it.
 ///
 /// # Errors
 ///
-/// 503 if no pool is configured; 500 on a database failure.
-pub async fn list(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<connectors::Connector>>> {
-    Ok(ApiJson(connectors::list_connectors(pool(&state)?).await?))
+/// 401 if unauthenticated (should not happen — this route requires
+/// `connector:manage` in `POLICY_TABLE`, which already extracts a
+/// principal before this handler runs; the check here only covers the
+/// internal, non-HTTP call path `routes::ai::tools::connectors` uses).
+/// 404 if `X-Tenant` names a tenant the caller does not belong to. 503 if
+/// no pool is configured; 500 on a database failure.
+pub async fn list(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    headers: HeaderMap,
+) -> ApiResult<ApiJson<Vec<connectors::Connector>>> {
+    let Some(Extension(principal)) = principal else {
+        return Err(ApiError::unauthorized().into());
+    };
+    let Some(tenant_id) = crate::tenant_scope::resolve(&principal, &headers)? else {
+        return Ok(ApiJson(Vec::new()));
+    };
+    let filter = connectors::ConnectorFilter {
+        tenant_id: Some(tenant_id),
+    };
+    Ok(ApiJson(
+        connectors::list_connectors(pool(&state)?, &filter).await?,
+    ))
 }
 
 /// `GET /api/connectors/ingestible` — every connector that has an ingest
@@ -1694,5 +1726,75 @@ mod tests {
             .await
             .expect("a non-Postgres, null-adapter connector must never attempt a dial");
         assert!(result.is_none());
+    }
+
+    // ── WS8 plan Task C2: `GET /api/connectors` tenant scoping ─────────
+
+    fn principal_with_tenants(tenant_ids: &[Uuid]) -> Principal {
+        Principal {
+            tenant_ids: tenant_ids.to_vec(),
+            ..fixture_user_principal()
+        }
+    }
+
+    fn headers_with_x_tenant(tenant_id: Uuid) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-tenant",
+            tenant_id
+                .to_string()
+                .parse()
+                .expect("uuid renders as a valid header value"),
+        );
+        headers
+    }
+
+    /// Hard Requirement 2: a principal that belongs to zero tenants gets
+    /// an EMPTY list — never `403`/`404`, and never every tenant's rows.
+    /// `state_without_pool()` proves this is returned BEFORE the store is
+    /// ever queried: reaching `pool(&state)?` here would 503, not 200 with
+    /// an empty body.
+    #[tokio::test]
+    async fn list_with_a_tenantless_principal_returns_an_empty_list_before_touching_the_store() {
+        let state = state_without_pool();
+        let principal = principal_with_tenants(&[]);
+        let result = list(
+            State(state),
+            Some(Extension(principal)),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .expect("a tenantless principal must get Ok(empty list), not an error");
+        assert!(
+            result.0.is_empty(),
+            "Ok(None) from tenant_scope::resolve must render as an empty list, never every \
+             tenant's connectors"
+        );
+    }
+
+    /// No `Extension<Principal>` at all (the internal, non-HTTP call path
+    /// `routes::ai::tools::connectors` used to take before this task) is
+    /// refused with 401, not a panic or an unscoped read.
+    #[tokio::test]
+    async fn list_with_no_principal_extension_is_unauthorized() {
+        let state = state_without_pool();
+        let err = list(State(state), None, axum::http::HeaderMap::new())
+            .await
+            .expect_err("no principal must be refused");
+        assert_eq!(err.0.status(), 401);
+    }
+
+    /// `X-Tenant` naming a tenant the principal does not belong to is a
+    /// 404 (via `tenant_scope::resolve`'s own contract), propagated
+    /// through this route's own `?` rather than swallowed.
+    #[tokio::test]
+    async fn list_with_a_foreign_x_tenant_header_is_not_found() {
+        let state = state_without_pool();
+        let principal = principal_with_tenants(&[Uuid::from_u128(1)]);
+        let headers = headers_with_x_tenant(Uuid::from_u128(2)); // not a member
+        let err = list(State(state), Some(Extension(principal)), headers)
+            .await
+            .expect_err("a foreign X-Tenant must be refused");
+        assert_eq!(err.0.status(), 404);
     }
 }

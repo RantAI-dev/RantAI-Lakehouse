@@ -25,6 +25,7 @@
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use lakehouse_auth::Principal;
 use serde_json::{Map, Value, json};
@@ -32,8 +33,17 @@ use serde_json::{Map, Value, json};
 use super::{api_result_to_value, arg_str};
 use crate::state::AppState;
 
-pub(super) async fn list_connectors(state: &AppState) -> Value {
-    api_result_to_value(crate::routes::connectors::list(State(state.clone())).await).await
+/// `headers: HeaderMap::new()` — no `X-Tenant` selection from the copilot
+/// dispatcher today, so `tenant_scope::resolve` falls back to the
+/// principal's own first tenant (or `None`/empty list if it belongs to
+/// none), the same default an interactive caller gets by omitting the
+/// header.
+pub(super) async fn list_connectors(state: &AppState, principal: Option<&Principal>) -> Value {
+    let extension = principal.cloned().map(Extension);
+    api_result_to_value(
+        crate::routes::connectors::list(State(state.clone()), extension, HeaderMap::new()).await,
+    )
+    .await
 }
 
 /// Builds the exact `POST /api/connectors` JSON body from the tool's args
@@ -211,7 +221,7 @@ mod tests {
     async fn list_and_test_never_return_host_or_secret_ref() {
         let state = state_without_pool();
         let principal = fixture_user_principal();
-        let list_result = list_connectors(&state).await;
+        let list_result = list_connectors(&state, Some(&principal)).await;
         assert!(!list_result.to_string().contains("secretRef"));
         assert!(!list_result.to_string().contains("\"host\""));
 

@@ -45,6 +45,7 @@
 use serde::Serialize;
 use sqlx::FromRow;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::{PgPool, StoreError};
 
@@ -259,14 +260,48 @@ impl From<ConnectorRow> for Connector {
 const CONNECTOR_COLUMNS: &str = "id, name, type, direction, health, environment, tenant, host, \
      secret_ref, last_test_at, capabilities, owner";
 
-/// List every connector, newest first.
+/// Optional narrowing for [`list_connectors`] — WS8 plan Task C2, Hard
+/// Requirement 2 (tenant isolation).
+///
+/// `tenant_id: None` means "unscoped": every connector, including one
+/// whose own `tenant_id` column is `NULL` (unassigned). That branch exists
+/// only so callers with no tenant concept at all (the AI copilot's
+/// internal tool dispatch when its principal belongs to zero tenants would
+/// otherwise 401 before reaching here, and this crate's own non-route
+/// integration tests) keep today's behaviour. Every HTTP-reachable caller
+/// of [`list_connectors`] (`routes::connectors::list`) resolves a required
+/// tenant via `tenant_scope::resolve` FIRST and returns an empty list
+/// itself when that resolves to `None` — `list_connectors` is never
+/// invoked with `tenant_id: None` on a real tenant-scoped request. When
+/// `tenant_id` is `Some`, a connector with `tenant_id IS NULL` never
+/// matches (SQL `NULL = $1` is never `true`), which is exactly the "an
+/// unassigned row is invisible to a tenant-scoped read" contract migration
+/// `0042_tenant_provisioning.sql` documents.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectorFilter {
+    /// Restrict to this tenant, if given.
+    pub tenant_id: Option<Uuid>,
+}
+
+/// List every connector, newest first, optionally narrowed by
+/// [`ConnectorFilter`].
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
-pub async fn list_connectors(pool: &PgPool) -> Result<Vec<Connector>, StoreError> {
-    let sql = format!("SELECT {CONNECTOR_COLUMNS} FROM connector ORDER BY created_at DESC");
-    let rows: Vec<ConnectorRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+pub async fn list_connectors(
+    pool: &PgPool,
+    filter: &ConnectorFilter,
+) -> Result<Vec<Connector>, StoreError> {
+    let sql = format!(
+        "SELECT {CONNECTOR_COLUMNS} FROM connector \
+         WHERE ($1::uuid IS NULL OR tenant_id = $1) \
+         ORDER BY created_at DESC"
+    );
+    let rows: Vec<ConnectorRow> = sqlx::query_as(&sql)
+        .bind(filter.tenant_id)
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(Connector::from).collect())
 }
 

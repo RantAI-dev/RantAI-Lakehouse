@@ -12,6 +12,7 @@
 use serde::Serialize;
 use sqlx::FromRow;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::{PgPool, StoreError};
 
@@ -161,15 +162,53 @@ impl From<PipelineRow> for Pipeline {
 const PIPELINE_COLUMNS: &str = "id, name, kind, status, owner, source, target, connector_id, \
      source_asset_id, target_asset_id, schedule, next_run_at";
 
-/// List every authored pipeline definition, newest first.
+/// Optional narrowing for [`list_pipelines`] — WS8 plan Task C3, Hard
+/// Requirement 2 (tenant isolation).
+///
+/// Deliberately NOT the `tenant_id IS NULL OR ...` shape
+/// [`crate::connectors::ConnectorFilter`] uses: `routes::pipelines::list`
+/// (the one HTTP-reachable caller) always resolves a real tenant via
+/// `tenant_scope::resolve` before this function is ever called and returns
+/// early itself when that resolves to `None`, so `tenant_id` here is never
+/// itself `None` on a real request. Keeping the `IS NOT NULL AND` guard
+/// (rather than the `IS NULL OR` shape) means a filter-level unit test
+/// that constructs `PipelineFilter { tenant_id: None, .. }` directly
+/// proves "matches nothing" without depending on that route-level
+/// short-circuit ever having run — the store function is fail-closed on
+/// its own terms, not merely because of how its one caller happens to use
+/// it today.
+#[derive(Debug, Clone, Default)]
+pub struct PipelineFilter {
+    /// Restrict to this tenant, if given. `None` matches no rows at all —
+    /// see the struct doc comment.
+    pub tenant_id: Option<Uuid>,
+}
+
+/// List every authored pipeline definition, newest first, optionally
+/// narrowed by [`PipelineFilter`].
+///
+/// A pipeline whose own `tenant_id` column is `NULL` (unassigned —
+/// `0042_tenant_provisioning.sql`) never matches any `Some(tenant_id)`
+/// filter (SQL `NULL = $1` is never `true`) — fail closed: an unassigned
+/// row is invisible to every tenant-scoped read, never visible to every
+/// one of them.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
-pub async fn list_pipelines(pool: &PgPool) -> Result<Vec<Pipeline>, StoreError> {
-    let sql =
-        format!("SELECT {PIPELINE_COLUMNS} FROM pipeline_definition ORDER BY created_at DESC");
-    let rows: Vec<PipelineRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
+pub async fn list_pipelines(
+    pool: &PgPool,
+    filter: &PipelineFilter,
+) -> Result<Vec<Pipeline>, StoreError> {
+    let sql = format!(
+        "SELECT {PIPELINE_COLUMNS} FROM pipeline_definition \
+         WHERE ($1::uuid IS NOT NULL AND tenant_id = $1) \
+         ORDER BY created_at DESC"
+    );
+    let rows: Vec<PipelineRow> = sqlx::query_as(&sql)
+        .bind(filter.tenant_id)
+        .fetch_all(pool)
+        .await?;
     Ok(rows.into_iter().map(Pipeline::from).collect())
 }
 

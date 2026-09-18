@@ -22,19 +22,23 @@ use lakehouse_test_support as _;
 use lakehouse_store::StoreError;
 use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::connectors::{
-    CreateConnectorInput, IngestSpecInput, create_connector, delete_connector, get_connector,
-    get_connector_dial_info, get_ingest_spec, list_connectors, list_ingestible_connectors,
-    record_test_result, set_ingest_spec,
+    ConnectorFilter, CreateConnectorInput, IngestSpecInput, create_connector, delete_connector,
+    get_connector, get_connector_dial_info, get_ingest_spec, list_connectors,
+    list_ingestible_connectors, record_test_result, set_ingest_spec,
 };
+use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::pipelines::{CreatePipelineInput, create_pipeline};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 /// P6 shrank the seed to the two connector types this build can actually
 /// dial (`0022_prune_connector_seed.sql`) — see that migration's header
 /// comment for why the 28-row `mock/connectors.ts` fixture was removed.
 #[sqlx::test(migrations = "../../migrations")]
 async fn seed_populates_connector_list(pool: PgPool) -> sqlx::Result<()> {
-    let connectors = list_connectors(&pool).await.unwrap();
+    let connectors = list_connectors(&pool, &ConnectorFilter::default())
+        .await
+        .unwrap();
     assert_eq!(connectors.len(), 2);
     assert!(connectors.iter().any(|c| c.id == "conn-pg-lakehouse"));
     assert!(connectors.iter().any(|c| c.id == "conn-s3-warehouse"));
@@ -70,7 +74,9 @@ async fn created_connector_never_carries_host_or_secret_ref_on_the_wire(
     assert!(!raw.contains("LEAK_TEST_TOKEN"));
 
     // Also true of the list/detail reads, not just the create response.
-    let list = list_connectors(&pool).await.unwrap();
+    let list = list_connectors(&pool, &ConnectorFilter::default())
+        .await
+        .unwrap();
     let list_json = serde_json::to_string(&list).unwrap();
     assert!(!list_json.contains("super-secret-internal-host"));
     assert!(!list_json.contains("LEAK_TEST_TOKEN"));
@@ -930,5 +936,116 @@ async fn ingest_spec_functions_treat_an_unknown_id_honestly(pool: PgPool) -> sql
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::NotFound));
+    Ok(())
+}
+
+/// Minimal valid input for [`create_tenant`], varying only `slug` (unique)
+/// — matches `lakehouse_store::identity::CreateTenantInput`'s shape.
+fn tenant_input(slug: &str) -> CreateTenantInput {
+    CreateTenantInput {
+        name: slug.to_owned(),
+        slug: slug.to_owned(),
+        plan: "starter".to_owned(),
+        residency: "in-region".to_owned(),
+    }
+}
+
+/// Assign a connector to a tenant. No store function does this yet
+/// (`assign_connector_tenant` is WS8 plan Task C6, not this task) — a
+/// direct, bound `UPDATE` is the only way this test can set up a
+/// tenant-scoped fixture today, matching `0042_tenant_provisioning.sql`'s
+/// own column exactly (nullable `connector.tenant_id`).
+async fn set_connector_tenant(pool: &PgPool, connector_id: &str, tenant_id: Uuid) {
+    sqlx::query("UPDATE connector SET tenant_id = $1 WHERE id = $2")
+        .bind(tenant_id)
+        .bind(connector_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// WS8 plan Task C2, Step 1 (TDD): written and run BEFORE `ConnectorFilter`
+/// existed. The real Step 1 failure this produced (`ConnectorFilter`
+/// stripped, `list_connectors` reverted to its pre-Task-C2 one-arg
+/// signature):
+///
+/// ```text
+/// error[E0433]: failed to resolve: could not find `ConnectorFilter` in `connectors`
+/// error[E0061]: this function takes 1 argument but 2 arguments were supplied
+/// ```
+///
+/// Hard Requirement 2's own wording: a specific second tenant's row must
+/// be asserted ABSENT, never merely "the list is shorter" or "non-empty."
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_connectors_filtered_by_tenant_excludes_another_tenants_row(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = create_tenant(&pool, &tenant_input("tenant-a-connectors"))
+        .await
+        .unwrap();
+    let tenant_b = create_tenant(&pool, &tenant_input("tenant-b-connectors"))
+        .await
+        .unwrap();
+    let tenant_a_id: Uuid = tenant_a.id.parse().unwrap();
+    let tenant_b_id: Uuid = tenant_b.id.parse().unwrap();
+
+    let conn_a = create_connector(&pool, &minimal_input("conn-a isolation"))
+        .await
+        .unwrap();
+    let conn_b = create_connector(&pool, &minimal_input("conn-b isolation"))
+        .await
+        .unwrap();
+    set_connector_tenant(&pool, &conn_a.id, tenant_a_id).await;
+    set_connector_tenant(&pool, &conn_b.id, tenant_b_id).await;
+
+    let rows = list_connectors(
+        &pool,
+        &ConnectorFilter {
+            tenant_id: Some(tenant_a_id),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        rows.iter().any(|r| r.id == conn_a.id),
+        "tenant-a's own connector must be present"
+    );
+    assert!(
+        !rows.iter().any(|r| r.id == conn_b.id),
+        "tenant-b's connector must be absent, not merely unlisted-first"
+    );
+    Ok(())
+}
+
+/// Fail closed: a connector whose `tenant_id` column is `NULL`
+/// (unassigned) must never appear in ANY tenant-scoped list —
+/// `0042_tenant_provisioning.sql`'s own stated contract.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_connectors_with_a_null_tenant_id_is_invisible_once_scoped(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = create_tenant(&pool, &tenant_input("tenant-a-null-connector"))
+        .await
+        .unwrap();
+    let tenant_a_id: Uuid = tenant_a.id.parse().unwrap();
+
+    // Freshly created via `create_connector`, never assigned a tenant —
+    // `tenant_id` stays the column's default, `NULL`.
+    create_connector(&pool, &minimal_input("unassigned connector"))
+        .await
+        .unwrap();
+
+    let rows = list_connectors(
+        &pool,
+        &ConnectorFilter {
+            tenant_id: Some(tenant_a_id),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        rows.is_empty(),
+        "a connector with tenant_id NULL must not leak into any tenant's scoped list"
+    );
     Ok(())
 }

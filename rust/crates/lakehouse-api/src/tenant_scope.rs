@@ -21,17 +21,6 @@
 //! access by sending a different header value, only ask to see a tenant it
 //! is already a member of, or be refused.
 
-// Unused in the `lakehouse-api` BINARY target until Tasks C2/C3/C4 mount
-// their scoped list routes — the library target, and this module's own
-// tests, exercise it today. Same pattern (and same removal trigger) as
-// `AppState::lakekeeper_admin` carried between Tasks B3 and B4: the allow
-// names the task that deletes it, so it cannot quietly outlive its reason.
-#![allow(
-    dead_code,
-    reason = "no route caller yet — WS8 plan Tasks C2/C3/C4 are the first, \
-              and this allow is removed when the first of them lands"
-)]
-
 use axum::http::HeaderMap;
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
