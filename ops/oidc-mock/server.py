@@ -314,10 +314,16 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(body.encode("utf-8"))
 
     def do_POST(self):  # noqa: N802 (stdlib method name)
-        if self.path == "/authorize":
-            self._handle_authorize_post()
+        # Route on the PATH, not the raw request target: a client that
+        # posts back to the URL it was redirected to carries the query
+        # string along (`/authorize?response_type=...`), and comparing the
+        # raw target would 404 it — `do_GET` above already parses for the
+        # same reason.
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/authorize":
+            self._handle_authorize_post(parsed)
             return
-        if self.path != "/token":
+        if parsed.path != "/token":
             self.send_response(404)
             self.end_headers()
             self.wfile.write(b'{"error":"not_found"}')
@@ -360,7 +366,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             ).encode("utf-8")
         )
 
-    def _handle_authorize_post(self) -> None:
+    def _handle_authorize_post(self, parsed: urllib.parse.ParseResult) -> None:
         # The login-screen stand-in's form submit: binds a fresh code to
         # the chosen HUMAN_TEST_PRINCIPALS identity and the PKCE/nonce
         # params carried through as hidden fields, then 302s back to the
@@ -368,11 +374,23 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8")
         form = urllib.parse.parse_qs(body)
-        sub = (form.get("login_hint") or [None])[0]
-        redirect_uri = (form.get("redirect_uri") or [""])[0]
-        nonce = (form.get("nonce") or [""])[0]
-        code_challenge = (form.get("code_challenge") or [""])[0]
-        state = (form.get("state") or [""])[0]
+        # The login screen above renders these as hidden fields, so a
+        # browser sends them in the body. A client that instead posts back
+        # to the authorize URL it was given still has them in the query
+        # string — read the body first, then fall back to the query, so
+        # neither shape silently mints a code bound to empty values (which
+        # would then fail the PKCE/redirect_uri check at /token for a
+        # reason that has nothing to do with the caller).
+        query = urllib.parse.parse_qs(parsed.query)
+
+        def field(name: str) -> str:
+            return (form.get(name) or query.get(name) or [""])[0]
+
+        sub = (form.get("login_hint") or query.get("login_hint") or [None])[0]
+        redirect_uri = field("redirect_uri")
+        nonce = field("nonce")
+        code_challenge = field("code_challenge")
+        state = field("state")
         # Fail closed: only the two named test identities can ever receive
         # a code — never a free-text sub off the form (see the
         # HUMAN_TEST_PRINCIPALS comment above).

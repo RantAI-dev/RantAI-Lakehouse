@@ -41,6 +41,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.parse
 
 import requests
 
@@ -526,13 +527,34 @@ def step_oidc_authorization_code_round_trip() -> None:
     if not flow_cookie:
         raise G4Failure("lh_oidc_flow cookie was not set by /start")
 
-    # Hop 2: oidc-mock's Task A1 /authorize accepts a login_hint naming one
-    # of its HUMAN_TEST_PRINCIPALS and redirects back to the fixed
-    # redirect_uri (never a caller-supplied one — oidc-mock echoes only the
-    # redirect_uri /start itself sent) with ?code=&state=.
+    # Hop 2: oidc-mock's Task A1 /authorize. A browser would GET it, be
+    # served a login-screen stand-in whose hidden fields carry the OIDC
+    # request parameters, and POST those back with the chosen identity —
+    # so this test does the same. Posting `login_hint` alone would submit
+    # empty redirect_uri/nonce/code_challenge fields (the mock's POST
+    # handler reads its form body, not the URL's query string), and the
+    # code it minted would then be bound to nothing, failing at hop 3 for
+    # a reason that has nothing to do with lakehouse-api.
+    authorize_params = {
+        key: values[0]
+        for key, values in urllib.parse.parse_qs(
+            urllib.parse.urlparse(authorize_url).query
+        ).items()
+    }
+    login_form = session.get(authorize_url, allow_redirects=False, timeout=10)
+    if login_form.status_code != 200:
+        raise G4Failure(
+            f"oidc-mock /authorize did not serve its login screen: HTTP {login_form.status_code}"
+        )
     authorize = session.post(
         authorize_url,
-        data={"login_hint": "test-analyst"},
+        data={
+            "login_hint": "test-analyst",
+            "redirect_uri": authorize_params.get("redirect_uri", ""),
+            "nonce": authorize_params.get("nonce", ""),
+            "code_challenge": authorize_params.get("code_challenge", ""),
+            "state": authorize_params.get("state", ""),
+        },
         allow_redirects=False,
         timeout=10,
     )
