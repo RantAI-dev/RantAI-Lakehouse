@@ -19,7 +19,26 @@
  * shape of "not logged in yet" that `AuthProvider` itself probes for and
  * reacts to. Excluding that prefix is also what prevents a redirect loop
  * out of the login page itself.
+ *
+ * It also attaches `X-Tenant` when an active tenant is selected (WS8 plan
+ * Task F2): the tenant picker (`TenantSwitcher`, Task F3) persists the
+ * chosen tenant id to `localStorage` as a per-browser convenience — nothing
+ * server-trusted hangs off it, the server still derives the authoritative
+ * tenant scope from the session — so a request made before any tenant is
+ * chosen, or in an environment where `localStorage` throws (private
+ * browsing, SSR), goes out with no `X-Tenant` header at all rather than an
+ * empty one.
  */
+
+const ACTIVE_TENANT_STORAGE_KEY = "lh_active_tenant";
+
+function readActiveTenantId(): string | null {
+  try {
+    return localStorage.getItem(ACTIVE_TENANT_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
 
 let redirecting = false;
 
@@ -48,7 +67,12 @@ export function __resetApiFetchRedirectStateForTests(): void {
 }
 
 export async function apiFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-  const res = await fetch(input, init);
+  const headers = new Headers(init?.headers);
+  const activeTenantId = readActiveTenantId();
+  if (activeTenantId) {
+    headers.set("X-Tenant", activeTenantId);
+  }
+  const res = await fetch(input, { ...init, headers });
   if (res.status === 401 && !resolveUrl(input).startsWith("/api/auth/")) {
     redirectToLogin();
   }
