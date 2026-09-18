@@ -60,6 +60,22 @@ pub fn is_curated_bronze(slug: &str) -> bool {
     BRONZE_CURATED.iter().any(|curated| curated == slug)
 }
 
+/// Catalog namespace id for Bronze datasets taken from a PRIMARY source
+/// (the tenant's own operational systems / registries).
+///
+/// Was the literal `"sdi-primer"` — "SDI" is Satu Data Indonesia, one
+/// deployment's national-programme vocabulary, which every OTHER
+/// deployment then showed on all of its assets (AGENTS.md rule 12: no
+/// client names in product code). The id is generic now; a deployment that
+/// wants its own wording sets `CATALOG_NAMESPACE_META` — note that an
+/// existing override keyed `"sdi-primer"` no longer matches and falls back
+/// to the default label below, a cosmetic change only.
+pub const NAMESPACE_PRIMER: &str = "primer";
+
+/// Catalog namespace id for Bronze datasets derived from SECONDARY
+/// sources (third-party feeds, processed extracts).
+pub const NAMESPACE_SEKUNDER: &str = "sekunder";
+
 /// Display name and description for a catalog namespace.
 pub struct NamespaceMeta {
     /// Human-readable namespace name.
@@ -76,24 +92,24 @@ pub struct NamespaceMeta {
 pub static NAMESPACE_META: LazyLock<HashMap<String, NamespaceMeta>> = LazyLock::new(|| {
     let mut meta: HashMap<String, NamespaceMeta> = [
         (
-            "sdi-primer",
-            "SDI Primer (Satu Data Jakarta)",
-            "Dataset primer ditarik dari Satu Data Jakarta ke Bronze/Iceberg.",
+            NAMESPACE_PRIMER,
+            "Sumber Primer",
+            "Dataset primer dari sistem sumber tenant, mendarat di Bronze/Iceberg.",
         ),
         (
-            "sekunder",
-            "Data Sekunder (olahan)",
-            "Dataset sekunder olahan (wisman bersih, TripAdvisor, halal, dll).",
+            NAMESPACE_SEKUNDER,
+            "Sumber Sekunder (olahan)",
+            "Dataset sekunder: umpan pihak ketiga dan ekstrak olahan.",
         ),
         (
             "silver",
             "Silver (kurasi)",
-            "Model bersih & terkonform di ClickHouse — dimensi, wisman, restoran, event, dst.",
+            "Model bersih & terkonform di ClickHouse — dimensi dan fakta.",
         ),
         (
             "serving",
             "Gold (mart penyaji)",
-            "Mart agregat penyaji dashboard — mart_wisman, mart_kuliner, mart_event, dll.",
+            "Mart agregat penyaji dashboard dan embed.",
         ),
     ]
     .into_iter()

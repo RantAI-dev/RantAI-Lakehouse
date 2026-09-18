@@ -59,7 +59,8 @@ use crate::routes::support::{js_error, js_string, num_or_zero, prettify, str_col
 use crate::state::AppState;
 
 use crate::tenant::{
-    NAMESPACE_META, TENANT_DOMAIN, TENANT_OWNER, TENANT_RESIDENCY, is_curated_bronze,
+    NAMESPACE_META, NAMESPACE_PRIMER, NAMESPACE_SEKUNDER, TENANT_DOMAIN, TENANT_OWNER,
+    TENANT_RESIDENCY, is_curated_bronze,
 };
 
 /// Query parameters accepted by `GET /api/catalog`. `q` is the free-text
@@ -635,7 +636,7 @@ fn bronze_catalog_row(
     json!({
         "id": slug,
         "name": title,
-        "namespace": if sekunder { "sekunder" } else { "sdi-primer" },
+        "namespace": if sekunder { NAMESPACE_SEKUNDER } else { NAMESPACE_PRIMER },
         "type": "iceberg-table",
         "layer": if is_curated_bronze(slug) { "bronze" } else { "raw" },
         "tier": "warm",
@@ -1050,7 +1051,7 @@ fn bronze_detail_body(
     json!({
         "id": slug,
         "name": title,
-        "namespace": if sekunder { "sekunder" } else { "sdi-primer" },
+        "namespace": if sekunder { NAMESPACE_SEKUNDER } else { NAMESPACE_PRIMER },
         "type": "iceberg-table",
         "layer": if is_curated_bronze(slug) { "bronze" } else { "raw" },
         "tier": "warm",
@@ -1716,13 +1717,13 @@ mod tests {
     #[test]
     fn build_namespaces_counts_and_preserves_first_seen_order() {
         let assets = vec![
-            json!({"namespace": "sdi-primer"}),
+            json!({"namespace": NAMESPACE_PRIMER}),
             json!({"namespace": "silver"}),
-            json!({"namespace": "sdi-primer"}),
+            json!({"namespace": NAMESPACE_PRIMER}),
         ];
         let namespaces = build_namespaces(&assets);
         assert_eq!(namespaces.len(), 2);
-        assert_eq!(namespaces[0]["id"], "sdi-primer");
+        assert_eq!(namespaces[0]["id"], NAMESPACE_PRIMER);
         assert_eq!(namespaces[0]["assetCount"], 2);
         assert_eq!(namespaces[1]["id"], "silver");
         assert_eq!(namespaces[1]["assetCount"], 1);
