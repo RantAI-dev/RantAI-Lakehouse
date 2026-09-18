@@ -97,17 +97,23 @@ pub(super) async fn run_sql(
 /// or `{}` when the statement is confirmed a `SELECT`.
 pub(super) async fn dry_run_sql(ch: &ChClient, args: &Map<String, Value>) -> Value {
     let sql = arg_str(args, "sql");
-    let rows = match ch.rows(&format!("EXPLAIN AST {sql}"), None).await {
-        Ok(r) => r,
+    // `raw_bytes`, not `rows`: `ChClient::rows` appends `\nFORMAT JSON`,
+    // and `EXPLAIN AST … FORMAT JSON` does NOT answer in JSON —
+    // `ClickHouse` parses the FORMAT clause as part of the statement being
+    // explained (it appears in the dumped AST as `Identifier JSON`) and
+    // still replies in the default text format. The JSON envelope
+    // `rows` expects was therefore never there: the row set came back
+    // EMPTY, `first_line` was "", and EVERY statement — `SELECT` included
+    // — was refused as "melaporkan unknown", so the `run_sql` tool could
+    // not succeed at all. Verified live against `ClickHouse` 26.7.
+    // `raw_bytes` sends the statement verbatim and hands back the text
+    // body `EXPLAIN` actually produces.
+    let body = match ch.raw_bytes(&format!("EXPLAIN AST {sql}"), None).await {
+        Ok(b) => b,
         Err(err) => return json!({ "error": format!("dry run gagal: {err}") }),
     };
-    let first_line = rows
-        .first()
-        .and_then(|row| row.values().next())
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_owned();
+    let text = String::from_utf8_lossy(&body);
+    let first_line = text.lines().next().unwrap_or("").trim().to_owned();
     if first_line.starts_with("SelectWithUnionQuery") {
         return json!({});
     }
@@ -334,20 +340,35 @@ mod dry_run {
     use super::*;
 
     /// A mocked `ClickHouse` that answers every request (this test only
-    /// ever issues the one `EXPLAIN AST` query) with a single `explain`
-    /// row holding `explain_text` verbatim. Returns the [`MockServer`]
-    /// too — it must outlive the [`ChClient`] built from its URI, or the
-    /// mock stops answering before the test runs.
+    /// ever issues the one `EXPLAIN AST` query) with `explain_text` as a
+    /// PLAIN TEXT body — the shape `EXPLAIN` really returns. These tests
+    /// used to mock a `{"data": [{"explain": …}]}` JSON envelope, which
+    /// `EXPLAIN AST` never produces (see [`dry_run_sql`]'s comment): they
+    /// passed while the real tool refused every statement. Returns the
+    /// [`MockServer`] too — it must outlive the [`ChClient`] built from
+    /// its URI, or the mock stops answering before the test runs.
     async fn fake_clickhouse_explain_ast_response(explain_text: &str) -> (MockServer, ChClient) {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [{"explain": explain_text}],
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_string(explain_text))
             .mount(&server)
             .await;
         let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
         (server, ch)
+    }
+
+    /// The regression this pair of tests missed: an EMPTY body (what the
+    /// old `FORMAT JSON` path effectively produced) must not be read as a
+    /// `SELECT`, and a real `SELECT`'s text dump must be accepted.
+    #[tokio::test]
+    async fn run_sql_dry_run_refuses_an_empty_explain_body() {
+        let (_server, ch) = fake_clickhouse_explain_ast_response("").await;
+        let mut args = Map::new();
+        args.insert("sql".to_owned(), json!("SELECT 1"));
+        assert_eq!(
+            dry_run_sql(&ch, &args).await,
+            json!({"error": "hanya SELECT yang diizinkan (EXPLAIN AST melaporkan unknown)"})
+        );
     }
 
     #[tokio::test]
@@ -442,11 +463,15 @@ mod run_sql_delegation {
     /// detection), and finally the real, masked `SELECT` the derived-table
     /// substitution produces.
     async fn mount_governed_table_responses(server: &MockServer) {
+        // Plain text, not a JSON envelope: `EXPLAIN AST` answers in
+        // `ClickHouse`'s default text format even when a `FORMAT JSON`
+        // clause is appended (see `dry_run_sql`), and this mock has to
+        // answer the way the real engine does or the test proves nothing.
         Mock::given(method("POST"))
             .and(body_string_contains("EXPLAIN AST"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "data": [{"explain": "SelectWithUnionQuery (children 1)\n"}],
-            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("SelectWithUnionQuery (children 1)\n"),
+            )
             .mount(server)
             .await;
         Mock::given(method("POST"))
