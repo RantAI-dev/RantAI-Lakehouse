@@ -82,6 +82,36 @@ class BatchResult:
     offsets_to_commit: dict[int, int] = field(default_factory=dict)
 
 
+class BrokerListUnavailable(Exception):
+    """The consumer's advertised-broker list could not be read, so the
+    pre-check cannot run. Raised instead of proceeding: see
+    [`_advertised_brokers`]."""
+
+
+def _advertised_brokers(consumer) -> BrokerMetadata:
+    """Read the brokers the cluster has advertised to this consumer.
+
+    This reaches through `consumer._client.cluster` — kafka-python's own
+    internal accessor, cited with file:line in this module's docstring,
+    and the only way to see the advertised list. The pin in
+    `dagster/pyproject.toml` is exact, so that path changing is a
+    deliberate upgrade rather than a surprise; what must not happen is
+    that upgrade turning into a bare `AttributeError` deep inside a batch.
+    A list we cannot read is a list we cannot check, and an unchecked
+    broker set is exactly what the guard exists to prevent — so this
+    refuses by name, and the batch never starts.
+    """
+    try:
+        brokers = consumer._client.cluster.brokers()  # noqa: SLF001 - see docstring
+    except AttributeError as exc:
+        raise BrokerListUnavailable(
+            "cannot read the consumer's advertised broker list "
+            "(kafka-python's internal cluster accessor changed shape); "
+            "refusing to consume rather than dial unchecked brokers"
+        ) from exc
+    return BrokerMetadata(brokers=[(b.host, b.port) for b in brokers])
+
+
 def consume_one_batch(
     consumer: KafkaConsumer,
     *,
@@ -105,8 +135,9 @@ def consume_one_batch(
     why that is the caller's job, done only after a successful sink
     write.
     """
-    broker_metadata = BrokerMetadata(brokers=[(b.host, b.port) for b in consumer._client.cluster.brokers()])
-    check_all_advertised_brokers(broker_metadata, resolve_checked=resolve_checked)
+    check_all_advertised_brokers(
+        _advertised_brokers(consumer), resolve_checked=resolve_checked
+    )
 
     rows: list[dict] = []
     offsets: dict[int, int] = {}

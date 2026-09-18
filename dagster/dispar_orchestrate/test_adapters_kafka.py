@@ -142,3 +142,21 @@ def test_offset_and_metadata_is_built_with_one_positional_arg_not_a_none_metadat
     assert built.offset == 6
     assert built.metadata == ""  # the real default (kafka/structs.py), never None
     assert built.leader_epoch == -1
+
+
+def test_consume_refuses_when_the_advertised_broker_list_cannot_be_read():
+    """An upgrade that moves kafka-python's internal cluster accessor must
+    stop the batch with a named refusal, not a bare AttributeError from
+    inside the poll loop: a broker list we cannot read is a broker set we
+    cannot check, which is the whole point of the pre-check."""
+    from dispar_orchestrate.adapters import kafka as kafka_adapter
+
+    class _ConsumerWithoutClient:
+        def poll(self, **_kwargs):  # pragma: no cover - never reached
+            raise AssertionError("the batch must not start")
+
+    with pytest.raises(kafka_adapter.BrokerListUnavailable):
+        kafka_adapter.consume_one_batch(
+            _ConsumerWithoutClient(), topic="orders", max_seconds=1
+        )
+
