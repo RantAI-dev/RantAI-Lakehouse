@@ -513,11 +513,21 @@ pub struct DebeziumPropertiesResponse {
 /// exist and the renderer always hardcoded the `PostgreSQL` class, which
 /// would have silently mislabeled a `mysql`/`mssql` connector's rendered
 /// template.
+///
+/// `SqlDriver::Oracle` is intentionally absent — `Debezium` does not ship
+/// an Oracle CDC connector in this build. A `sql` adapter with
+/// `driver = "oracle"` is rejected at the call site
+/// ([`resolve_debezium_source_target`]) before this function is reached,
+/// so the missing arm never materialises at runtime.
 fn debezium_connector_class(driver: SqlDriver) -> &'static str {
     match driver {
         SqlDriver::Postgres => "io.debezium.connector.postgresql.PostgresConnector",
         SqlDriver::Mysql => "io.debezium.connector.mysql.MySqlConnector",
         SqlDriver::Mssql => "io.debezium.connector.sqlserver.SqlServerConnector",
+        SqlDriver::Oracle => unreachable!(
+            "Debezium CDC for Oracle is not supported in this build; \
+             resolve_debezium_source_target rejects Oracle before this is reached"
+        ),
     }
 }
 
@@ -567,13 +577,26 @@ fn resolve_debezium_source_target(
                     dial.database.clone(),
                     dial.user.clone(),
                 ),
-                Dial::Files(_) | Dial::Rest(_) | Dial::Sheets(_) => {
+                Dial::Files(_)
+                | Dial::Rest(_)
+                | Dial::Sheets(_)
+                | Dial::Mongo(_)
+                | Dial::Kafka(_)
+                | Dial::Sftp(_) => {
                     return Err(ApiError::BadRequest(format!(
                         "connector {id} is registered with adapter {adapter:?} but its parsed \
                          dial is not a sql/cdc shape"
                     )));
                 }
             };
+            if driver == SqlDriver::Oracle {
+                return Err(ApiError::BadRequest(format!(
+                    "connector {id}'s dial driver is Oracle; Debezium CDC has no Oracle \
+                     connector in this build, so a Debezium properties template cannot be \
+                     rendered. Oracle ingestion runs through the Dagster sql adapter, not \
+                     through Debezium."
+                )));
+            }
             Ok(DebeziumSourceTarget {
                 host,
                 port,
@@ -1074,7 +1097,19 @@ async fn check_dial_ssrf(dial: &Dial, allow_internal_hosts: bool) -> Result<(), 
             .as_deref()
             .and_then(connector_probe::parse_endpoint_host_port),
         Dial::Rest(rest) => connector_probe::parse_endpoint_host_port(&rest.base_url),
-        Dial::Sheets(_) => None,
+        // Tier 2 adapters (`mongodb`/`kafka`/`sftp`, WS9 §Phase A): the
+        // authoritative SSRF check runs in Dagster (`ssrf_guard_mongo.py`
+        // / `ssrf_guard_kafka.py` / `ssrf_guard_sftp.py`) at dial time,
+        // not in this save-time pre-check; this function only fails
+        // fast on the common case (a caller pastes an obviously-internal
+        // host for a `sql`/`cdc`/`files`/`rest` connector and finds out
+        // immediately, at save time). The Rust-side
+        // `routes/connectors::check_dial_ssrf` match returns `None` for
+        // these variants by construction -- the same shape `sheets`
+        // already has (its dial names a spreadsheet id, not a
+        // caller-chosen host). See the WS9 plan's hard requirement 1 for
+        // the authoritative Dagster-side check.
+        Dial::Sheets(_) | Dial::Mongo(_) | Dial::Kafka(_) | Dial::Sftp(_) => None,
     };
     let Some((host, port)) = host_port else {
         return Ok(());

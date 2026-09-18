@@ -318,7 +318,12 @@ async fn probe_dial(
     let target = match &parsed {
         Dial::Sql(dial) => DialTarget::from(dial),
         Dial::Cdc(dial) => DialTarget::from(dial),
-        Dial::Files(_) | Dial::Rest(_) | Dial::Sheets(_) => {
+        Dial::Files(_)
+        | Dial::Rest(_)
+        | Dial::Sheets(_)
+        | Dial::Mongo(_)
+        | Dial::Kafka(_)
+        | Dial::Sftp(_) => {
             return Outcome::misconfigured(format!(
                 "connector is misconfigured: its dial does not match its own adapter {adapter:?}"
             ));
@@ -332,6 +337,12 @@ async fn probe_dial(
         SqlDriver::Mssql => {
             probe_mssql(&target, &info.secret_ref, resolver, allow_internal_hosts).await
         }
+        SqlDriver::Oracle => Outcome::misconfigured(
+            "Oracle probes run through the Dagster sql adapter, not through this Rust-side \
+             probe; the connector's own health remains at whatever record_test_result has \
+             last stamped against it"
+                .to_owned(),
+        ),
     }
 }
 
@@ -1367,6 +1378,7 @@ mod tests {
             database: "x".to_owned(),
             user: "u".to_owned(),
             ssl_mode: None,
+            ssl_server_cert_dn: None,
         }
     }
 

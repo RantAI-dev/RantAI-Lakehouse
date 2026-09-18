@@ -3,10 +3,10 @@
 //!
 //! `connector.dial` (`0033_connector_ingest_spec.sql`) is free-form
 //! `JSONB` at the column level, but never free-form at the application
-//! level: [`Dial::parse`] parses it into exactly one of five
+//! level: [`Dial::parse`] parses it into exactly one of eight
 //! `#[serde(deny_unknown_fields, rename_all = "camelCase")]` structs,
 //! dispatched on the connector's own `adapter` column value. Every one of
-//! the five structs rejects an unknown field, which is the property that
+//! the eight structs rejects an unknown field, which is the property that
 //! stops a credential (a `password`, an `apiSecret`) being smuggled into
 //! `dial` — a column the allowlisted `secretRef` resolver
 //! (`lakehouse_core::secret`, ADR 0002) never inspects.
@@ -35,6 +35,11 @@ pub enum SqlDriver {
     /// Microsoft SQL Server, dialed via ODBC by the Dagster `sql` adapter
     /// this driver's `dial` values are validated for.
     Mssql,
+    /// Oracle, thin-mode `oracledb` (`dagster/dispar_orchestrate/adapters/
+    /// oracle.py`). Reuses the existing `sql` `dial`/`Dial::parse` shape
+    /// — Oracle is the fourth `SqlDriver` variant, not a fourth string
+    /// `adapter` value, so `connector_type.adapter = 'sql'` covers it.
+    Oracle,
 }
 
 /// The connection shape shared by a batch `sql` adapter's `dial`.
@@ -67,6 +72,15 @@ pub struct SqlDial {
     /// An optional TLS mode string, passed through verbatim to the
     /// generated ingestion job.
     pub ssl_mode: Option<String>,
+    /// An optional, operator-supplied Distinguished Name the Oracle
+    /// adapter's thin-mode `oracledb` driver uses for TLS certificate
+    /// verification. Required whenever `ssl_mode` implies TLS for an
+    /// Oracle connection — [`Dial::parse`] enforces this for the
+    /// `sql`/Oracle case; `mysql`/`postgresql`/`mssql` ignore the field.
+    /// Never synthesized from `host` (a bare `CN=<hostname>` would not
+    /// match a real certificate's full DN).
+    #[serde(default)]
+    pub ssl_server_cert_dn: Option<String>,
 }
 
 /// The connection shape for a change-data-capture `cdc` adapter's `dial`.
@@ -237,6 +251,180 @@ pub struct SheetsDial {
     pub ranges: Vec<String>,
 }
 
+/// The connection shape for a `mongodb` adapter's `dial`.
+///
+/// Refuses `mongodb+srv` discovery and replica-set discovery outright
+/// (`directConnection` MUST be `true`), per the WS9 plan's hard
+/// requirement 1. `MongoDial` has no `srvUri` field by construction —
+/// `deny_unknown_fields` enforces this, so a JSON shape carrying an
+/// `srvUri` is rejected at deserialize time as an unknown field. The
+/// `hosts` list is always explicit, one seed per entry, never discovered
+/// at runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MongoDial {
+    /// The explicit seed hosts, `host:port`-shaped, that the driver
+    /// dials directly (no `mongodb+srv`, no replica-set discovery). Every
+    /// entry is checked by [`validate_hostname`] before this `dial` is
+    /// accepted; the bare-host portion of each is what is checked.
+    pub hosts: Vec<String>,
+    /// The database name; pymongo also takes this as the auth source.
+    pub database: String,
+    /// The literal username — a bare username is not credential-shaped
+    /// (same reasoning as [`SqlDial::user`]); the password is the
+    /// connector's `secretRef` value, never named here.
+    pub username: String,
+    /// MUST be `true`. Replica-set discovery is refused outright (not
+    /// partially checked) — see the WS9 plan's hard requirement 1.
+    #[serde(rename = "directConnection")]
+    pub direct_connection: bool,
+}
+
+/// The `mongodb` adapter's authentication shape. Carries no fields today
+/// because `MongoDial.username` is the literal username and the password
+/// is the connector's `secretRef`. Modeled as an internally-tagged enum
+/// (rather than `bool`) so future `MongoDB` auth mechanisms (`SCRAM-SHA-256`
+/// etc.) have an obvious extension point.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "type")]
+pub enum MongoAuth {
+    /// No auth-specific fields today; carries the username via
+    /// [`MongoDial::username`] and the password via `secretRef`.
+    #[serde(rename = "password")]
+    Password,
+}
+
+/// The connection shape for a `kafka` adapter's `dial`.
+///
+/// `bootstrap_servers` are the brokers the operator initially dials; the
+/// cluster's metadata response then names the real "advertised listener"
+/// addresses the driver will actually connect to per partition. That
+/// post-bootstrap check is `ssrf_guard_kafka.check_all_advertised_brokers`,
+/// not this struct (the broker list is server-supplied, not
+/// operator-supplied). This struct validates the OPERATOR-supplied
+/// `bootstrap_servers` shape only.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct KafkaDial {
+    /// The bootstrap brokers the operator initially dials, `host:port`-
+    /// shaped. Each entry's bare-host portion is checked by
+    /// [`validate_hostname`].
+    pub bootstrap_servers: Vec<String>,
+    /// The topic to consume from.
+    pub topic: String,
+    /// The authentication shape — `kafka-python` accepts the structured
+    /// `sasl_plain_username` / `sasl_plain_password` keyword args; only
+    /// the username is named here, the password is the connector's
+    /// `secretRef`.
+    pub auth: KafkaAuth,
+    /// The consumer group id used to commit per-partition offsets. The
+    /// Kafka adapter commits to BOTH Kafka's own consumer-group offset
+    /// and `bronze_meta.ingest_offset` (Dagster side).
+    pub group_id: String,
+    /// The wall-clock cap on a single micro-batch read.
+    pub micro_batch_seconds: u32,
+}
+
+/// The `kafka` adapter's authentication shape. Mirrors
+/// [`RestAuth`]'s `tag = "type"` shape so a future `sasl_scram_sha256`
+/// variant lands the same way.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "type")]
+pub enum KafkaAuth {
+    /// `SASL/PLAIN` over a TLS connection: the username is named here,
+    /// the password is the connector's `secretRef`.
+    #[serde(rename = "sasl_plain")]
+    SaslPlain {
+        /// The SASL/PLAIN username.
+        username: String,
+    },
+    /// No SASL — a broker whose `security.protocol` is `PLAINTEXT`. The
+    /// connector has no `secretRef` for the password in this case (the
+    /// `secret_field_names` mapping for `("kafka", "none")` is empty);
+    /// a deployment must keep `secretRef` unset or use a non-credential
+    /// reference.
+    #[serde(rename = "none")]
+    None,
+}
+
+impl KafkaAuth {
+    /// The `type` tag this variant serializes under — the same string
+    /// [`RestAuth::type_tag`] returns for `rest`; reused as the
+    /// `auth_type` key the `(adapter, auth type) -> secret fields`
+    /// mapping ([`secret_field_names`]) keys on.
+    #[must_use]
+    pub fn type_tag(&self) -> &'static str {
+        match self {
+            KafkaAuth::SaslPlain { .. } => "sasl_plain",
+            KafkaAuth::None => "none",
+        }
+    }
+}
+
+/// The connection shape for an `sftp` adapter's `dial`.
+///
+/// `sftp` is its own `adapter` value, not a `FilesProtocol::Sftp`
+/// protocol — `dagster/dispar_orchestrate/adapters/files.py` is
+/// s3fs/S3-only, and a `files`/`sftp` round-trip would never have a
+/// working sink (`adapters/sftp.py` is its own module, WS9 §Phase D).
+/// `host_key_fingerprint` is **required** with no
+/// fallback — `paramiko.AutoAddPolicy` is NEVER acceptable (WS9 §Phase A
+/// hard requirement 1); `deny_unknown_fields` plus the missing-field error
+/// handle the rejection.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SftpDial {
+    /// The hostname to connect to, validated by [`validate_hostname`]
+    /// before this `dial` is accepted.
+    pub host: String,
+    /// The TCP port to connect to (typically `22`).
+    pub port: u16,
+    /// A literal username; may be empty for an anonymous-style flow but
+    /// is REQUIRED by the auth path either way (the empty default is for
+    /// compatibility with SFTP servers that accept an unauthenticated
+    /// listing, never for a real transfer).
+    pub user: String,
+    /// The pinned SSH host-key fingerprint the operator expects to see
+    /// when `paramiko.SSHClient.connect` runs (WS9 plan hard requirement
+    /// 1: never `AutoAddPolicy`). Required, no fallback; a missing field
+    /// fails to deserialize.
+    pub host_key_fingerprint: String,
+    /// The remote path the adapter reads from; the `source_objects` rows
+    /// are file names within this directory.
+    pub path: String,
+    /// The file format to parse (currently `csv` only on the Dagster
+    /// side).
+    pub file_format: String,
+    /// The authentication shape — `password` or `public_key`. The
+    /// credential itself is the connector's `secretRef`.
+    pub auth: SftpAuth,
+}
+
+/// The `sftp` adapter's authentication shape.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", tag = "type")]
+pub enum SftpAuth {
+    /// Username + password (carried as the connector's `secretRef`,
+    /// resolved to a `password` field name by [`secret_field_names`]).
+    #[serde(rename = "password")]
+    Password,
+    /// Public-key authentication (the private key PEM is the
+    /// connector's `secretRef`, resolved to a `privateKey` field name).
+    #[serde(rename = "public_key")]
+    PublicKey,
+}
+
+impl SftpAuth {
+    /// The `type` tag this variant serializes under.
+    #[must_use]
+    pub fn type_tag(&self) -> &'static str {
+        match self {
+            SftpAuth::Password => "password",
+            SftpAuth::PublicKey => "public_key",
+        }
+    }
+}
+
 /// A parsed `dial`, one variant per adapter.
 ///
 /// Never `#[serde(untagged)]` — see this module's doc comment. Constructed
@@ -249,6 +437,12 @@ pub enum Dial {
     Sql(SqlDial),
     /// A change-data-capture `cdc` adapter's dial.
     Cdc(CdcDial),
+    /// A `mongodb` adapter's dial.
+    Mongo(MongoDial),
+    /// A `kafka` adapter's dial.
+    Kafka(KafkaDial),
+    /// An `sftp` adapter's dial.
+    Sftp(SftpDial),
     /// A `files` adapter's dial.
     Files(FilesDial),
     /// A `rest` adapter's dial.
@@ -262,29 +456,54 @@ impl Dial {
     ///
     /// Dispatches on `adapter` — the connector's own stored column value —
     /// and parses `raw` against exactly one struct, never trying every
-    /// shape in turn. `host` is additionally checked by
-    /// [`validate_hostname`] for `sql`/`cdc` adapters, since the Dagster
-    /// `sql` adapter's Python-side ODBC driver later interpolates `host`
-    /// into a delimiter-separated connection string.
+    /// shape in turn. `host` (or its multi-entry equivalent
+    /// `hosts`/`bootstrap_servers`) is additionally checked by
+    /// [`validate_hostname`] for `sql`/`cdc`/`mongodb`/`kafka`/`sftp`
+    /// adapters, since the Dagster adapter later interpolates the host
+    /// into a delimiter-separated text format.
     ///
     /// # Errors
     ///
     /// Returns [`IngestSpecError::UnknownAdapter`] if `adapter` is not one
-    /// of `sql`/`cdc`/`files`/`rest`/`sheets`, or
-    /// [`IngestSpecError::InvalidDial`] if `raw` does not match the named
-    /// adapter's shape (an unknown field, a missing required field, or a
-    /// hostname [`validate_hostname`] rejects).
+    /// of `sql`/`cdc`/`mongodb`/`kafka`/`sftp`/`files`/`rest`/`sheets`,
+    /// or [`IngestSpecError::InvalidDial`] if `raw` does not match the
+    /// named adapter's shape (an unknown field, a missing required field,
+    /// a hostname [`validate_hostname`] rejects, an Oracle TLS
+    /// configuration without an `ssl_server_cert_dn`, or a control
+    /// character in `ssl_server_cert_dn`).
     pub fn parse(adapter: &str, raw: &serde_json::Value) -> Result<Dial, IngestSpecError> {
         match adapter {
             "sql" => {
                 let dial: SqlDial = parse_dial(adapter, raw)?;
                 check_hostname(adapter, "host", &dial.host)?;
+                validate_sql_dial_post_parse(adapter, &dial)?;
                 Ok(Dial::Sql(dial))
             }
             "cdc" => {
                 let dial: CdcDial = parse_dial(adapter, raw)?;
                 check_hostname(adapter, "host", &dial.host)?;
                 Ok(Dial::Cdc(dial))
+            }
+            "mongodb" => {
+                let dial: MongoDial = parse_dial(adapter, raw)?;
+                for host_port in &dial.hosts {
+                    let (host, _port) = split_host_port(adapter, "hosts", host_port)?;
+                    check_hostname(adapter, "hosts", host)?;
+                }
+                Ok(Dial::Mongo(dial))
+            }
+            "kafka" => {
+                let dial: KafkaDial = parse_dial(adapter, raw)?;
+                for server in &dial.bootstrap_servers {
+                    let (host, _port) = split_host_port(adapter, "bootstrapServers", server)?;
+                    check_hostname(adapter, "bootstrapServers", host)?;
+                }
+                Ok(Dial::Kafka(dial))
+            }
+            "sftp" => {
+                let dial: SftpDial = parse_dial(adapter, raw)?;
+                check_hostname(adapter, "host", &dial.host)?;
+                Ok(Dial::Sftp(dial))
             }
             "files" => Ok(Dial::Files(parse_dial(adapter, raw)?)),
             "rest" => Ok(Dial::Rest(parse_dial(adapter, raw)?)),
@@ -315,6 +534,31 @@ impl Dial {
     pub fn rest_auth_type(&self) -> Option<&'static str> {
         match self {
             Dial::Rest(rest) => Some(rest.auth.type_tag()),
+            _ => None,
+        }
+    }
+
+    /// The `kafka` adapter's `dial.auth.type` tag, or `None` for any
+    /// other adapter — the `auth_type` [`secret_field_names`] keys on
+    /// for `kafka`. Same role as [`Self::rest_auth_type`] but for the
+    /// Kafka dialect (the `(adapter, auth type) -> secret fields` mapping
+    /// is the ONE mapping, but its lookup key for `kafka` is the auth
+    /// type, not `None`).
+    #[must_use]
+    pub fn kafka_auth_type(&self) -> Option<&'static str> {
+        match self {
+            Dial::Kafka(kafka) => Some(kafka.auth.type_tag()),
+            _ => None,
+        }
+    }
+
+    /// The `sftp` adapter's `dial.auth.type` tag, or `None` for any
+    /// other adapter — the `auth_type` [`secret_field_names`] keys on
+    /// for `sftp`. Same role as [`Self::kafka_auth_type`].
+    #[must_use]
+    pub fn sftp_auth_type(&self) -> Option<&'static str> {
+        match self {
+            Dial::Sftp(sftp) => Some(sftp.auth.type_tag()),
             _ => None,
         }
     }
@@ -353,6 +597,87 @@ fn check_hostname(adapter: &str, field: &'static str, host: &str) -> Result<(), 
     })
 }
 
+/// Split a `host:port`-shaped string into its two halves, refusing an
+/// entry that does not contain a colon. Mirrors the `rsplit_once(':')`
+/// pattern `dagster/dispar_orchestrate/ssrf_guard_mongo.py`'s
+/// `resolve_all_seed_hosts` uses — a host with NO colon is rejected at
+/// parse time rather than silently defaulting to `27017`, since
+/// `rsplit_once`'s no-match result is a `None` we want to surface, not
+/// paper over.
+///
+/// # Errors
+///
+/// Returns [`IngestSpecError::InvalidDial`] if `value` does not contain a
+/// `:` (no embedded port).
+fn split_host_port<'a>(
+    adapter: &str,
+    field: &'static str,
+    value: &'a str,
+) -> Result<(&'a str, &'a str), IngestSpecError> {
+    match value.rsplit_once(':') {
+        Some((host, port)) => Ok((host, port)),
+        None => Err(IngestSpecError::InvalidDial {
+            adapter: adapter.to_owned(),
+            source: serde::de::Error::custom(format!(
+                "{field} entry {value:?} must be host:port-shaped"
+            )),
+        }),
+    }
+}
+
+/// Post-deserialize application-level validation for an [`SqlDial`]:
+/// the rules serde cannot express declaratively.
+///
+/// 1. Oracle TLS without `ssl_server_cert_dn`: thin-mode `oracledb`
+///    performs the TLS handshake against the connection's `host` field,
+///    which the Oracle build's `adapters/oracle.py` deliberately sets to
+///    an IP literal (the `resolve_checked` address). A `ssl_server_cert_dn`
+///    that names the certificate is therefore REQUIRED whenever
+///    `ssl_mode` implies TLS — without it, the driver silently degrades
+///    to matching a certificate against an IP, which never matches a
+///    real cert's full DN. Refused at save time, never a connection with
+///    the server's identity unverified.
+/// 2. Control characters in `ssl_server_cert_dn`: the operator-supplied
+///    DN is passed to `oracledb` UNCHANGED. A DN with control characters
+///    could be an injection attempt; refuse at save time.
+///
+/// # Errors
+///
+/// Returns [`IngestSpecError::InvalidDial`] if either rule fails.
+fn validate_sql_dial_post_parse(adapter: &str, dial: &SqlDial) -> Result<(), IngestSpecError> {
+    if let Some(dn) = dial.ssl_server_cert_dn.as_deref() {
+        for byte in dn.bytes() {
+            if byte < 0x20 || byte == 0x7f {
+                return Err(IngestSpecError::InvalidDial {
+                    adapter: adapter.to_owned(),
+                    source: serde::de::Error::custom(format!(
+                        "sslServerCertDn contains a control character (byte 0x{byte:02x})"
+                    )),
+                });
+            }
+        }
+    }
+
+    if dial.driver == SqlDriver::Oracle {
+        let tls_required = dial
+            .ssl_mode
+            .as_deref()
+            .is_some_and(|mode| mode != "disable");
+        if tls_required && dial.ssl_server_cert_dn.as_deref().is_none_or(str::is_empty) {
+            return Err(IngestSpecError::InvalidDial {
+                adapter: adapter.to_owned(),
+                source: serde::de::Error::custom(
+                    "sslServerCertDn is required when sslMode requires TLS: the server's \
+                     identity cannot be verified when connecting by IP; set sslServerCertDn to \
+                     the certificate's expected Distinguished Name, or set sslMode to disable",
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// A `dial` failed to parse or validate.
 ///
 /// [`IngestSpecError::InvalidDial`] never echoes the raw `dial` JSON —
@@ -363,7 +688,7 @@ fn check_hostname(adapter: &str, field: &'static str, host: &str) -> Result<(), 
 #[derive(Debug, thiserror::Error)]
 pub enum IngestSpecError {
     /// The connector's `adapter` column names a value not in the closed
-    /// `sql | cdc | files | rest | sheets` set.
+    /// `sql | cdc | mongodb | kafka | sftp | files | rest | sheets` set.
     #[error("unknown adapter {adapter:?}")]
     UnknownAdapter {
         /// The offending adapter value.
@@ -737,5 +1062,324 @@ mod tests {
     #[test]
     fn validate_hostname_rejects_an_empty_host() {
         assert!(validate_hostname("host", "").is_err());
+    }
+
+    // ── A2 — Tier 2 adapter shapes (WS9 §Phase A) ──────────────────────
+
+    #[test]
+    fn mongo_dial_parses_a_plain_uri_and_rejects_srv() {
+        let json = serde_json::json!({
+            "hosts": ["mongo-a.internal:27017", "mongo-b.internal:27017"],
+            "database": "catalog",
+            "username": "reader",
+            "directConnection": true
+        });
+        let dial: MongoDial =
+            serde_json::from_value(json).expect("valid mongo dial without srvUri parses");
+        assert_eq!(dial.hosts.len(), 2);
+        assert!(dial.direct_connection);
+
+        let with_srv = serde_json::json!({
+            "srvUri": "mongodb+srv://cluster.example.net/",
+            "hosts": ["mongo-a.internal:27017"],
+            "database": "catalog",
+            "username": "reader",
+            "directConnection": true
+        });
+        let err = serde_json::from_value::<MongoDial>(with_srv).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "srvUri must be refused by deny_unknown_fields, got: {err}"
+        );
+    }
+
+    #[test]
+    fn mongo_dial_has_no_srv_uri_field_at_all() {
+        // Hard Requirement 1 ("refuse mongodb+srv and replica-set discovery
+        // outright"): `deny_unknown_fields` is the structural guard, not
+        // a runtime check. Any MongoDial JSON carrying `srvUri` (or any
+        // other field not on the closed struct) fails to deserialize.
+        let extra = serde_json::json!({
+            "hosts": ["m.internal:27017"],
+            "database": "d",
+            "username": "u",
+            "directConnection": true,
+            "srvUri": "mongodb+srv://x/"
+        });
+        let err = serde_json::from_value::<MongoDial>(extra).unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn mongo_dial_requires_direct_connection_true() {
+        let json = serde_json::json!({
+            "hosts": ["m.internal:27017"],
+            "database": "d",
+            "username": "u",
+            "directConnection": false
+        });
+        // `directConnection` is a `bool` field — `false` parses. The
+        // Dagster side (`ssrf_guard_mongo.validate_mongo_dial`) refuses
+        // `false` at dial time; this test pins the Rust schema accepts
+        // both values (the refusal is NOT a structural property of the
+        // schema, by design — see the module doc comment on MongoDial).
+        let dial: MongoDial = serde_json::from_value(json).expect("false is parseable");
+        assert!(!dial.direct_connection);
+    }
+
+    #[test]
+    fn kafka_dial_parses_bootstrap_servers_and_auth() {
+        let json = serde_json::json!({
+            "bootstrapServers": ["broker-a.internal:9092", "broker-b.internal:9092"],
+            "topic": "orders",
+            "auth": {"type": "sasl_plain", "username": "orders-reader"},
+            "groupId": "lakehouse-orders-consumer",
+            "microBatchSeconds": 30
+        });
+        let dial: KafkaDial = serde_json::from_value(json).expect("valid kafka dial");
+        assert_eq!(dial.bootstrap_servers.len(), 2);
+        assert_eq!(dial.topic, "orders");
+        assert_eq!(dial.group_id, "lakehouse-orders-consumer");
+        assert_eq!(dial.micro_batch_seconds, 30);
+        assert_eq!(dial.auth.type_tag(), "sasl_plain");
+        assert_eq!(
+            dial.auth,
+            KafkaAuth::SaslPlain {
+                username: "orders-reader".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn sftp_dial_requires_a_host_key_fingerprint() {
+        let without_fingerprint = serde_json::json!({
+            "host": "sftp.bank.example",
+            "port": 22,
+            "user": "lakehouse",
+            "path": "/outbox",
+            "fileFormat": "csv",
+            "auth": {"type": "password"}
+        });
+        let err = serde_json::from_value::<SftpDial>(without_fingerprint).unwrap_err();
+        assert!(
+            err.to_string().contains("missing field"),
+            "hostKeyFingerprint must be required, got: {err}"
+        );
+
+        let with_fingerprint_json = serde_json::json!({
+            "host": "sftp.bank.example",
+            "port": 22,
+            "user": "lakehouse",
+            "hostKeyFingerprint": "SHA256:base64==",
+            "path": "/outbox",
+            "fileFormat": "csv",
+            "auth": {"type": "password"}
+        });
+        let with_fingerprint: SftpDial =
+            serde_json::from_value(with_fingerprint_json).expect("with fingerprint parses");
+        assert_eq!(with_fingerprint.host_key_fingerprint, "SHA256:base64==");
+        assert_eq!(with_fingerprint.auth, SftpAuth::Password);
+    }
+
+    #[test]
+    fn sql_driver_gains_an_oracle_variant() {
+        let json = serde_json::json!({
+            "driver": "oracle",
+            "host": "oracle-gl.internal",
+            "port": 1521,
+            "database": "GL",
+            "user": "reader"
+        });
+        let dial: SqlDial =
+            serde_json::from_value(json).expect("oracle driver parses as SqlDriver::Oracle");
+        assert_eq!(dial.driver, SqlDriver::Oracle);
+    }
+
+    #[test]
+    fn sql_dial_accepts_an_explicit_ssl_server_cert_dn() {
+        let json = serde_json::json!({
+            "driver": "oracle",
+            "host": "oracle-gl.internal",
+            "port": 1521,
+            "database": "GL",
+            "user": "reader",
+            "sslMode": "required",
+            "sslServerCertDn": "CN=oracle-gl.internal,OU=Finance,O=Acme,C=US"
+        });
+        let dial: SqlDial = serde_json::from_value(json).expect("oracle dial with DN parses");
+        assert_eq!(
+            dial.ssl_server_cert_dn.as_deref(),
+            Some("CN=oracle-gl.internal,OU=Finance,O=Acme,C=US")
+        );
+    }
+
+    #[test]
+    fn sql_dial_rejects_a_control_character_in_ssl_server_cert_dn() {
+        // Control character in the DN: the operator-supplied DN is
+        // passed to oracledb unchanged, so a control char is an
+        // injection vector and refused at save time.
+        let json = serde_json::json!({
+            "driver": "oracle",
+            "host": "oracle.internal",
+            "port": 1521,
+            "database": "GL",
+            "user": "reader",
+            "sslMode": "required",
+            "sslServerCertDn": "CN=oracle.internal\x00,OU=Finance"
+        });
+        let err = Dial::parse("sql", &json).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("control character"),
+            "control character must be refused at Dial::parse, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn dial_parse_refuses_oracle_tls_with_no_ssl_server_cert_dn() {
+        let json = serde_json::json!({
+            "driver": "oracle",
+            "host": "oracle.internal",
+            "port": 1521,
+            "database": "GL",
+            "user": "reader",
+            "sslMode": "required"
+        });
+        let err = Dial::parse("sql", &json).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot be verified when connecting by IP"),
+            "Oracle TLS without DN must mention the IP-vs-DN mismatch, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn dial_parse_accepts_oracle_tls_with_an_explicit_ssl_server_cert_dn() {
+        let json = serde_json::json!({
+            "driver": "oracle",
+            "host": "oracle.internal",
+            "port": 1521,
+            "database": "GL",
+            "user": "reader",
+            "sslMode": "required",
+            "sslServerCertDn": "CN=oracle.internal,OU=Finance,O=Acme,C=US"
+        });
+        let dial = Dial::parse("sql", &json).expect("Oracle TLS with explicit DN is accepted");
+        assert!(matches!(dial, Dial::Sql(_)));
+    }
+
+    #[test]
+    fn dial_parse_allows_oracle_plaintext_with_no_ssl_server_cert_dn() {
+        // Plaintext (no sslMode): no DN required, parses cleanly.
+        let json = serde_json::json!({
+            "driver": "oracle",
+            "host": "oracle.internal",
+            "port": 1521,
+            "database": "GL",
+            "user": "reader"
+        });
+        let dial = Dial::parse("sql", &json).expect("Oracle plaintext without sslMode is accepted");
+        assert!(matches!(dial, Dial::Sql(_)));
+
+        // sslMode = "disable" is also plaintext-shaped.
+        let json = serde_json::json!({
+            "driver": "oracle",
+            "host": "oracle.internal",
+            "port": 1521,
+            "database": "GL",
+            "user": "reader",
+            "sslMode": "disable"
+        });
+        let dial = Dial::parse("sql", &json).expect("Oracle with sslMode=disable is accepted");
+        assert!(matches!(dial, Dial::Sql(_)));
+    }
+
+    #[test]
+    fn dial_parse_rejects_a_kafka_bootstrap_server_shaped_for_injection() {
+        let json = serde_json::json!({
+            "bootstrapServers": ["broker;evil=1:9092"],
+            "topic": "orders",
+            "auth": {"type": "sasl_plain", "username": "u"},
+            "groupId": "g",
+            "microBatchSeconds": 30
+        });
+        let err = Dial::parse("kafka", &json).unwrap_err();
+        assert!(
+            matches!(&err, IngestSpecError::InvalidDial { adapter, .. } if adapter == "kafka"),
+            "validate_hostname must reject injection-shaped bootstrap, got: {err}"
+        );
+    }
+
+    #[test]
+    fn dial_parse_rejects_a_mongo_host_with_braces() {
+        let json = serde_json::json!({
+            "hosts": ["mongo{a}.internal:27017"],
+            "database": "catalog",
+            "username": "reader",
+            "directConnection": true
+        });
+        let err = Dial::parse("mongodb", &json).unwrap_err();
+        assert!(
+            matches!(&err, IngestSpecError::InvalidDial { adapter, .. } if adapter == "mongodb"),
+            "validate_hostname must reject brace-shaped host, got: {err}"
+        );
+    }
+
+    #[test]
+    fn dial_parse_dispatches_the_three_new_adapters() {
+        // Pinpoint the dispatch shape on `adapter` for the three new
+        // adapters (Mongo/Kafka/Sftp): each lands on its own variant,
+        // distinct from the existing five.
+        let mongo = serde_json::json!({
+            "hosts": ["m.internal:27017"],
+            "database": "d",
+            "username": "u",
+            "directConnection": true
+        });
+        let parsed = Dial::parse("mongodb", &mongo).expect("mongodb parses");
+        assert!(matches!(parsed, Dial::Mongo(_)));
+
+        let kafka = serde_json::json!({
+            "bootstrapServers": ["b.internal:9092"],
+            "topic": "t",
+            "auth": {"type": "none"},
+            "groupId": "g",
+            "microBatchSeconds": 60
+        });
+        let parsed = Dial::parse("kafka", &kafka).expect("kafka parses");
+        assert!(matches!(parsed, Dial::Kafka(_)));
+
+        let sftp = serde_json::json!({
+            "host": "sftp.internal",
+            "port": 22,
+            "user": "u",
+            "hostKeyFingerprint": "SHA256:x",
+            "path": "/inbox",
+            "fileFormat": "csv",
+            "auth": {"type": "public_key"}
+        });
+        let parsed = Dial::parse("sftp", &sftp).expect("sftp parses");
+        assert!(matches!(parsed, Dial::Sftp(_)));
+    }
+
+    #[test]
+    fn mysql_dial_round_trips_without_ssl_server_cert_dn() {
+        // The new field is `#[serde(default)]` so existing `mysql`/`mssql`
+        // dials without it continue to deserialize (round-tripping
+        // through `serde_json::to_value` would require `Serialize`,
+        // which is intentionally NOT derived on these dial structs --
+        // see the `Dial::parse` doc comment's "never echo the raw
+        // `dial` JSON" rationale).
+        let json = serde_json::json!({
+            "driver": "mysql",
+            "host": "db.internal",
+            "port": 3306,
+            "database": "orders",
+            "user": "app_reader",
+            "sslMode": "required"
+        });
+        let dial: SqlDial = serde_json::from_value(json).expect("mysql parses");
+        assert!(dial.ssl_server_cert_dn.is_none());
+        assert_eq!(dial.driver, SqlDriver::Mysql);
     }
 }

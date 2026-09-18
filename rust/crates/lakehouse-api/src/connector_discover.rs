@@ -373,6 +373,21 @@ async fn discover_dial(
                 let mut client = tiberius::Client::connect(config, tcp.compat_write()).await?;
                 discover_sql_mssql(&mut client, schema).await
             }
+            SqlDriver::Oracle => {
+                // Oracle schema discovery runs through the Dagster sql
+                // adapter (`dagster/dispar_orchestrate/adapters/oracle.py`
+                // over `oracledb` thin mode), not through this Rust-side
+                // probe. The match arm exists solely to keep
+                // `SqlDriver` exhaustive for the `sql`/`cdc` route shape;
+                // an Oracle connector never reaches this code because
+                // the dialect (`oracledb`) is not supported by sqlx,
+                // tiberius, or any other driver this module imports.
+                Err(DiscoverError::Blocked(
+                    "Oracle schema discovery runs through the Dagster sql adapter, not \
+                     through the Rust-side probe; this endpoint is unsupported for Oracle"
+                        .to_owned(),
+                ))
+            }
         }
     })
     .await;
@@ -410,7 +425,12 @@ pub async fn discover(
             let target = match &parsed {
                 Dial::Sql(dial) => DialTarget::from(dial),
                 Dial::Cdc(dial) => DialTarget::from(dial),
-                Dial::Files(_) | Dial::Rest(_) | Dial::Sheets(_) => {
+                Dial::Files(_)
+                | Dial::Rest(_)
+                | Dial::Sheets(_)
+                | Dial::Mongo(_)
+                | Dial::Kafka(_)
+                | Dial::Sftp(_) => {
                     return Err(DiscoverError::Blocked(format!(
                         "connector is misconfigured: its dial does not match its own adapter \
                          {adapter:?}"
