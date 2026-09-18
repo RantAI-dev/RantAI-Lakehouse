@@ -95,6 +95,12 @@ services:
         pipeline_src: ./dagster/dispar_orchestrate
       args:
         GIT_SHA: ${GIT_SHA:-unknown}
+        # Must name the SAME Python package as `pipeline_src` above: the
+        # API keys op source files by the baked directory's own name,
+        # because that is what a `source_ref` is relative to. Stated here
+        # rather than left to `rust/Dockerfile`'s default so the two halves
+        # are visibly one decision (see that file's ARG comment).
+        PIPELINE_PACKAGE: dispar_orchestrate
     ports:
       - "${API_HOST_PORT:-8080}:8080"
     depends_on:

@@ -53,7 +53,18 @@ COPY migrations ./migrations
 # repo-root context with NO `.dockerignore` present at all (a clean
 # checkout) would instead pull in `.git`, `node_modules`, and everything
 # else unbounded.
-COPY --from=pipeline_src . /opt/pipeline-src/dispar_orchestrate
+#
+# The destination's LAST COMPONENT is the code location's Python package
+# name, and `pipeline_source::build_allowlist` keys every file it finds
+# under exactly that name — a `source_ref` is emitted by the code location
+# itself and is always relative to its own package root. So a deployment
+# that bakes a different code location must change BOTH halves together:
+# the `pipeline_src` context it copies from, and this package name. Hence
+# one ARG driving the copy destination and `PIPELINE_SOURCE_DIR`, instead
+# of a literal repeated in two places that could silently disagree.
+ARG PIPELINE_PACKAGE=dispar_orchestrate
+COPY --from=pipeline_src . /opt/pipeline-src/${PIPELINE_PACKAGE}
+ENV PIPELINE_SOURCE_DIR=/opt/pipeline-src/${PIPELINE_PACKAGE}
 # Same convention `dagster/Dockerfile` already uses (WS4 item B1): the
 # commit this image was built from, read by `crate::pipeline_source::
 # check_commit` via `AppState`/`Config::git_sha` to refuse serving source
