@@ -3,6 +3,14 @@
  * from the current route so the dock/page can tailor its greeting, suggestions,
  * and the system prompt sent to the model. Specific pages (e.g. a dashboard)
  * can override this with richer entity context via setPageContext().
+ *
+ * The suggestions name no tenant's subject matter: they used to read
+ * "Total foreign visitors by region" / "Which datasets are about halal?" /
+ * "Describe the wisman dataset" — one deployment's tourism vocabulary,
+ * shown as the product's own starter prompts to every other tenant
+ * (AGENTS.md rule 12, same finding as the `sdi-primer` namespace id).
+ * Anything named here must exist in every deployment: catalog, pipelines,
+ * quality, lineage, and the generic shape of a mart.
  */
 
 export type PageSuggest = { ask: string[]; build: string[] };
@@ -19,8 +27,8 @@ const GENERIC: PageContext = {
   title: "How can I help?",
   hint: "Ask about your data, or switch to Build to create charts, dashboards, or refresh data.",
   suggest: {
-    ask: ["Total foreign visitors by region", "Which datasets are about halal?", "Summarize lakehouse data quality"],
-    build: ["Create a visitors-by-region chart", "Build a visitors dashboard", "Check the latest build status"],
+    ask: ["Which datasets are in the catalog?", "List the pipelines and their status", "Summarize lakehouse data quality"],
+    build: ["Create a revenue-by-channel chart", "Build a revenue dashboard", "Check the latest build status"],
   },
   system: "The user is in the RantAI Lakehouse console.",
 };
@@ -33,8 +41,8 @@ const MAP: { test: (p: string) => boolean; ctx: PageContext }[] = [
       title: "What would you like to explore?",
       hint: "Ask about platform health, key metrics, or where to look next.",
       suggest: {
-        ask: ["Summarize platform health", "Which datasets are stale?", "Total foreign visitors by region"],
-        build: ["Build a visitors dashboard", "Refresh the lakehouse (Bronze→Silver→Gold)"],
+        ask: ["Summarize platform health", "Which datasets are stale?", "Which pipeline ran last?"],
+        build: ["Build a revenue dashboard", "Refresh the lakehouse (Bronze→Silver→Gold)"],
       },
       system: "The user is on the Overview page (platform health across storage, pipelines, queries, governance). Help them find insights or navigate.",
     },
@@ -46,8 +54,8 @@ const MAP: { test: (p: string) => boolean; ctx: PageContext }[] = [
       title: "Build or explore a dashboard",
       hint: "Create a chart, start a new dashboard, or ask about what's shown.",
       suggest: {
-        ask: ["Explain the charts on this dashboard", "Total foreign visitors by region"],
-        build: ["Create a chart of visitors by region", "Add a KPI of total visitors", "Build a new visitors dashboard"],
+        ask: ["Explain the charts on this dashboard", "Which mart backs this dashboard?"],
+        build: ["Create a chart of revenue by channel", "Add a KPI of total revenue", "Build a new revenue dashboard"],
       },
       system: "The user is on the Dashboards page. They most likely want to create charts, create/edit a dashboard, or understand what's shown. Prefer create_chart / create_board / update_chart.",
     },
@@ -59,7 +67,7 @@ const MAP: { test: (p: string) => boolean; ctx: PageContext }[] = [
       title: "Explore or build data",
       hint: "Ask about datasets, schemas, lineage — or refresh/build data.",
       suggest: {
-        ask: ["What datasets are about halal?", "Describe the wisman dataset", "Show data lineage of visitors by country"],
+        ask: ["Which datasets hold customer data?", "Describe this dataset's columns", "Show this dataset's lineage"],
         build: ["Refresh the lakehouse (Bronze→Silver→Gold)", "Check the latest build status"],
       },
       system: "The user is exploring Data / Catalog. Help them query, describe datasets, inspect lineage/quality, or build/refresh data.",
@@ -73,7 +81,7 @@ const MAP: { test: (p: string) => boolean; ctx: PageContext }[] = [
       hint: "Ask about pipeline runs, or build/refresh the lakehouse.",
       suggest: {
         ask: ["Check the latest build status", "Summarize lakehouse data quality"],
-        build: ["Rebuild the lakehouse (Bronze→Silver→Gold)", "Refresh the culinary mart"],
+        build: ["Rebuild the lakehouse (Bronze→Silver→Gold)", "Rebuild the Gold marts"],
       },
       system: "The user is on Pipelines. They may want to run pipelines, check build status, or build/refresh data.",
     },
@@ -85,7 +93,7 @@ const MAP: { test: (p: string) => boolean; ctx: PageContext }[] = [
       title: "Write and run SQL",
       hint: "Ask a data question — Copilot writes and runs the SQL.",
       suggest: {
-        ask: ["Total foreign visitors by region", "Top 10 source countries", "Monthly visitor trend"],
+        ask: ["Total revenue by channel", "Top 10 products by revenue", "Monthly revenue trend"],
         build: ["Turn this into a chart on a dashboard"],
       },
       system: "The user is in Query Studio. Prefer run_sql; offer to turn results into a chart.",
@@ -98,7 +106,7 @@ const MAP: { test: (p: string) => boolean; ctx: PageContext }[] = [
       title: "Governance & quality",
       hint: "Ask about data quality, lineage, or classification.",
       suggest: {
-        ask: ["Summarize lakehouse data quality", "Show data lineage of visitors by country", "Which datasets have quality issues?"],
+        ask: ["Summarize lakehouse data quality", "Show the lineage of a Gold mart", "Which datasets have quality issues?"],
         build: ["Refresh the lakehouse (Bronze→Silver→Gold)"],
       },
       system: "The user is in Governance (quality, lineage, audit). Prefer get_quality / get_lineage.",
