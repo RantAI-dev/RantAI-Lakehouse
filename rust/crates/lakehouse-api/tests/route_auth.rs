@@ -242,6 +242,37 @@ async fn a_seeded_analyst_is_denied_the_maintenance_policy_write() {
     );
 }
 
+/// A seeded Analyst (`sari@meridian.example` — `query:read, catalog:read,
+/// lineage:read`, no `identity:write`) is denied
+/// `POST /api/identity/service-identities/{id}/rotate` (WS8 §Phase E) —
+/// the service-identity rotation endpoint, gated by
+/// `Policy::RequiresPermission("identity:write")`. The two table-driven
+/// loops above cover the zero-permission and Platform-Admin directions
+/// for this route by construction; this test pins the under-permissioned
+/// direction against a real, independently-seeded role (a regression
+/// that widened the gate to `Policy::RequiresAuth` would flip this 403 to
+/// a non-403, and the message names the missing permission so that
+/// failure cannot pass silently).
+#[tokio::test]
+async fn a_seeded_analyst_is_denied_service_identity_rotate() {
+    let TestApp { router, pool } = spin_up().await;
+    let cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+
+    let resp = request_with_cookie(
+        &router,
+        "POST",
+        "/api/identity/service-identities/00000000-0000-0000-0000-000000000000/rotate",
+        &cookie,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "POST /api/identity/service-identities/{{id}}/rotate must refuse an Analyst \
+         (missing identity:write) with 403"
+    );
+}
+
 /// A seeded Analyst (`catalog:read`) is not denied
 /// `GET /api/lakehouse/capacity` (WS2 §4). This route is
 /// `Policy::RequiresPermission("catalog:read")`, the same seeded permission
