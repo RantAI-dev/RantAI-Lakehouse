@@ -164,6 +164,16 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // plan's "Hard Requirement 4" phrasing ("lists only the caller's own
     // sessions unless..."); see `routes::auth::SessionsDecision`.
     ("GET",  "/api/auth/sessions",                Policy::RequiresAuth),
+    // WS8 plan §Phase D: revoke a single live session by id. Same floor
+    // as the list route — every authenticated caller may hit this, and
+    // the admin-vs-own split (`identity:sessions:manage` holders revoke
+    // any session; everyone else revokes only their own) lives inside
+    // `routes::auth::revoke_session`, mirroring `SessionsDecision` on
+    // the list side. The 404 body for "this session id belongs to
+    // someone else" and "this session id does not exist" is identical —
+    // see the route's doc comment for why the route is not an
+    // enumeration oracle.
+    ("DELETE", "/api/auth/sessions/{id}",          Policy::RequiresAuth),
 
     // ── Catalog: seeded Analyst permission `catalog:read`. ───────────────
     ("GET", "/api/catalog",       Policy::RequiresPermission("catalog:read")),

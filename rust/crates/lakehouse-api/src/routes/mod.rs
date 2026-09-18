@@ -71,6 +71,17 @@ fn auth_router() -> Router<AppState> {
         // `Policy::RequiresAuth` floor; the own-vs-all split lives inside
         // the handler — see `auth::sessions` and `auth::SessionsDecision`.
         .route("/api/auth/sessions", get(auth::sessions))
+        // WS8 plan §Phase D: revoke a single live session by id. Same
+        // floor as the list route; the admin-vs-own split lives inside
+        // the handler — see `auth::revoke_session`. The path-segment id
+        // is validated as a UUID by the handler itself (400 on a
+        // malformed id, rather than a 404 — see that route's doc
+        // comment for why a non-UUID path must not look like
+        // "doesn't exist").
+        .route(
+            "/api/auth/sessions/{id}",
+            axum::routing::delete(auth::revoke_session),
+        )
 }
 
 /// Default per-request timeout, used for every route whose TypeScript

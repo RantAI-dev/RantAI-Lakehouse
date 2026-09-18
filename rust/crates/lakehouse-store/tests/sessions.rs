@@ -41,7 +41,9 @@
 // by the linker before its ctor section is ever considered).
 use lakehouse_test_support as _;
 
-use lakehouse_store::sessions::{SessionRow, list_sessions_for_caller};
+use lakehouse_store::sessions::{
+    SessionOwnershipError, SessionRow, list_sessions_for_caller, revoke_session_as_caller,
+};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -82,6 +84,34 @@ async fn insert_live_session(pool: &PgPool, app_user_id: Uuid, hash: &str) {
     .execute(pool)
     .await
     .expect("insert live session");
+}
+
+/// Insert a live session and return its id. Mirrors [`insert_live_session`]
+/// but threads the generated `session.id` back to the caller — every
+/// `revoke_session_as_caller` test needs the id, not just the
+/// `app_user_id` / `token_hash`.
+async fn insert_live_session_returning_id(pool: &PgPool, app_user_id: Uuid, hash: &str) -> Uuid {
+    sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO session (app_user_id, token_hash, expires_at) \
+         VALUES ($1, $2, now() + interval '1 hour') \
+         RETURNING id",
+    )
+    .bind(app_user_id)
+    .bind(hash)
+    .fetch_one(pool)
+    .await
+    .expect("insert live session")
+}
+
+/// `session.revoked_at` for `session_id`, rendered as the text Postgres
+/// returns for `TIMESTAMPTZ NULL`. `None` here means the row is live (the
+/// listing's own live predicate), not a missing row.
+async fn revoked_at(pool: &PgPool, session_id: Uuid) -> Option<String> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT revoked_at::text FROM session WHERE id = $1")
+        .bind(session_id)
+        .fetch_one(pool)
+        .await
+        .expect("read session row")
 }
 
 /// The default branch: a caller authenticated as `caller_a` sees their
@@ -314,5 +344,107 @@ async fn an_already_expired_session_is_not_returned(pool: PgPool) -> sqlx::Resul
         .await
         .unwrap();
     assert_eq!(rows.len(), 1, "the expired row must not be returned");
+    Ok(())
+}
+
+// ── WS8 plan §Phase D: `revoke_session_as_caller` ────────────────────────
+//
+// Hard Requirement 4 ("never reveals whether another user's session id
+// exists") lives in two layers here:
+//   1. The SQL `WHERE id = $1 AND revoked_at IS NULL AND ($3 OR app_user_id = $2)`
+//      predicate, which matches zero rows for a foreign id, a missing id,
+//      and an already-revoked id identically.
+//   2. The single `SessionOwnershipError::NotFound` variant all three of
+//      those cases collapse into — see `SessionOwnershipError`'s own doc
+//      comment in `lakehouse_store::sessions`.
+// The store-level tests below pin down (1) for each of those three shapes;
+// the route-level tests in `lakehouse-api/src/routes/auth.rs` pin down (2)
+// end-to-end.
+
+/// Hard Requirement 4's first half: a caller revoking a session they do
+/// not own must see `SessionOwnershipError::NotFound` — the exact same
+/// error variant a missing id would produce. The session row's
+/// `revoked_at` is asserted to still be `NULL` so the test is a true
+/// "the row was not modified" check, not just "the function returned the
+/// right error."
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoke_session_as_caller_revokes_only_the_callers_own_without_admin(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let caller_a = seed_user(&pool, "a@x.invalid").await;
+    let caller_b = seed_user(&pool, "b@x.invalid").await;
+
+    let session_id_b = insert_live_session_returning_id(&pool, caller_b, &"b".repeat(64)).await;
+    insert_live_session_returning_id(&pool, caller_a, &"a".repeat(64)).await;
+
+    let result = revoke_session_as_caller(&pool, session_id_b, caller_a, false).await;
+    assert!(
+        matches!(result, Err(SessionOwnershipError::NotFound)),
+        "a non-admin caller revoking a foreign session id must see NotFound, \
+         got {result:?}"
+    );
+
+    // The actual database invariant: caller_b's session row's `revoked_at`
+    // is still `NULL`. The assertion is here (and not just on the error
+    // variant) so a regression that quietly started updating foreign rows
+    // would fail this test even if it kept returning the right variant.
+    assert!(
+        revoked_at(&pool, session_id_b).await.is_none(),
+        "caller_b's session row must remain live after caller_a's failed revoke"
+    );
+    Ok(())
+}
+
+/// Hard Requirement 4's second half: an `identity:sessions:manage` holder
+/// revoking someone else's session id succeeds. Mirrors the list route's
+/// admin branch (the same `identity:sessions:manage` token flips the
+/// `is_admin` flag, which the SQL collapses to "always match").
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoke_session_as_caller_admin_revokes_any_session(pool: PgPool) -> sqlx::Result<()> {
+    let caller_a = seed_user(&pool, "a@x.invalid").await;
+    let caller_b = seed_user(&pool, "b@x.invalid").await;
+
+    let session_id_b = insert_live_session_returning_id(&pool, caller_b, &"b".repeat(64)).await;
+    insert_live_session_returning_id(&pool, caller_a, &"a".repeat(64)).await;
+
+    revoke_session_as_caller(&pool, session_id_b, caller_a, true)
+        .await
+        .expect("admin caller must be able to revoke any session");
+
+    assert!(
+        revoked_at(&pool, session_id_b).await.is_some(),
+        "caller_b's session row must be revoked after caller_a's admin revoke"
+    );
+    Ok(())
+}
+
+/// A second revoke of the same id is `Err(NotFound)`, the same variant a
+/// foreign id would return. This is what closes the "the cookie has been
+/// cleared by the UI but the server still accepts the request" gap: a
+/// stale `DELETE` from a UI that already revoked its own copy (or, in
+/// general, any second revoke of a row whose `revoked_at` is already
+/// non-`NULL`) sees the exact same response as a brand-new revoke of
+/// someone else's id, so the route cannot be used to confirm "yes, that
+/// session id was real."
+///
+/// The SQL's `WHERE ... AND revoked_at IS NULL` is what guarantees this:
+/// after the first revoke, the predicate matches zero rows and
+/// `rows_affected() == 0` falls into the `NotFound` arm.
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoke_session_as_caller_already_revoked_returns_not_found(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let caller = seed_user(&pool, "a@x.invalid").await;
+    let session_id = insert_live_session_returning_id(&pool, caller, &"a".repeat(64)).await;
+
+    revoke_session_as_caller(&pool, session_id, caller, false)
+        .await
+        .expect("first revoke succeeds");
+
+    let second = revoke_session_as_caller(&pool, session_id, caller, false).await;
+    assert!(
+        matches!(second, Err(SessionOwnershipError::NotFound)),
+        "a second revoke of the same id must be NotFound, got {second:?}"
+    );
     Ok(())
 }

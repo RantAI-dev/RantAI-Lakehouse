@@ -29,6 +29,7 @@
 
 use serde::Serialize;
 use sqlx::FromRow;
+use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{PgPool, StoreError};
@@ -108,6 +109,96 @@ pub async fn list_sessions_for_caller(
     Ok(rows)
 }
 
+/// What can go wrong revoking a session by id — distinct from
+/// [`StoreError`] because the non-enumeration rule on this route is
+/// load-bearing: a session that exists but belongs to someone else, and a
+/// session that does not exist at all, must return the **exact same**
+/// variant, not just the same status code ([`Self::NotFound`] in both
+/// cases). Mapping them onto `StoreError::NotFound` directly would not
+/// express that intent — they're deliberately *one* error path, not two
+/// that happen to render identically, so they share a single variant.
+///
+/// `Database` carries the underlying `sqlx::Error` as a `#[source]` for
+/// server-side `tracing`; its `Display` is the fixed `"database error"`,
+/// never the upstream driver's text (AGENTS.md: "upstream error text
+/// never reaches a response"). The route's `?` turns both variants into
+/// `ApiError` via the existing `From<StoreError> for ApiError` impl —
+/// `NotFound` → `ApiError::NotFound("record not found")` (404),
+/// `Database` → `ApiError::Internal("database error")` (500) — so the
+/// route never has to know about this enum's variants directly.
+#[derive(Debug, Error)]
+pub enum SessionOwnershipError {
+    /// The session id does not exist, OR it exists but belongs to a
+    /// different caller (and `is_admin` is `false`). Same variant on
+    /// purpose — see the type doc comment.
+    #[error("session not found")]
+    NotFound,
+    /// Any storage failure. Never renders the upstream error text — see
+    /// the type doc comment.
+    #[error("database error")]
+    Database(#[source] sqlx::Error),
+}
+
+impl From<sqlx::Error> for SessionOwnershipError {
+    fn from(err: sqlx::Error) -> Self {
+        // No `RowNotFound`-to-`NotFound` mapping here: this is an UPDATE,
+        // which never produces `RowNotFound`. Every sqlx error here is a
+        // real storage failure, so they all collapse to `Database`.
+        Self::Database(err)
+    }
+}
+
+impl From<SessionOwnershipError> for StoreError {
+    fn from(err: SessionOwnershipError) -> Self {
+        match err {
+            SessionOwnershipError::NotFound => Self::NotFound,
+            SessionOwnershipError::Database(e) => Self::Database(e),
+        }
+    }
+}
+
+/// Revoke `session_id` if it belongs to `caller_id`, or unconditionally
+/// if `is_admin`. A session that exists but belongs to someone else, and
+/// a session that does not exist at all, return the exact same
+/// [`SessionOwnershipError::NotFound`] — Hard Requirement 4 ("never
+/// reveals whether another user's session id exists"). The route's
+/// single error-mapping path then renders both as the same 404 body.
+///
+/// The `WHERE ... AND revoked_at IS NULL` predicate is what makes a
+/// second revoke of the same id a [`SessionOwnershipError::NotFound`]:
+/// the row's `revoked_at` is now non-`NULL`, so the predicate matches
+/// zero rows and `rows_affected() == 0` — the same "no matching row"
+/// signal as a foreign id, by construction. This is also what makes a
+/// stale `DELETE` from a UI that already cleared its own cookie an
+/// `NotFound` rather than a silent no-op success, so the route cannot
+/// be used to confirm "yes, the row I knew about is still gone."
+///
+/// # Errors
+///
+/// Returns [`SessionOwnershipError::NotFound`] for both a missing id and
+/// a foreign id (Hard Requirement 4, see the type doc comment), or
+/// [`SessionOwnershipError::Database`] on any storage failure.
+pub async fn revoke_session_as_caller(
+    pool: &PgPool,
+    session_id: Uuid,
+    caller_id: Uuid,
+    is_admin: bool,
+) -> Result<(), SessionOwnershipError> {
+    let result = sqlx::query(
+        "UPDATE session SET revoked_at = now() \
+         WHERE id = $1 AND revoked_at IS NULL AND ($3 OR app_user_id = $2)",
+    )
+    .bind(session_id)
+    .bind(caller_id)
+    .bind(is_admin)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(SessionOwnershipError::NotFound);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -173,5 +264,38 @@ mod tests {
         );
         assert_eq!(json.get("createdIp"), Some(&serde_json::Value::Null));
         assert_eq!(json.get("userAgent"), Some(&serde_json::Value::Null));
+    }
+
+    /// Hard Requirement 4 lives in two layers at once: the SQL
+    /// (`UPDATE ... AND revoked_at IS NULL AND ($3 OR app_user_id = $2)`)
+    /// and the error mapping. The latter is a `Display` test, not a DB
+    /// test — `SessionOwnershipError::NotFound`'s message is what
+    /// `From<SessionOwnershipError> for StoreError` → `From<StoreError>
+    /// for ApiError` chains together to render the route's 404 body,
+    /// and any future reader touching that string has to consciously
+    /// re-confirm this test (which deliberately pins the message,
+    /// because the integration test's byte-equal assertion depends on
+    /// both the foreign-UUID arm and the missing-UUID arm rendering the
+    /// exact same `Display`).
+    #[test]
+    fn session_ownership_error_not_found_display_is_a_fixed_string() {
+        assert_eq!(
+            SessionOwnershipError::NotFound.to_string(),
+            "session not found"
+        );
+    }
+
+    /// The database-error variant must never embed upstream `sqlx` text
+    /// in its `Display` — same leak concern
+    /// `lakehouse_core::error::ApiError::Internal` and
+    /// `lakehouse_auth::AuthError::Database` carry. A raw `sqlx::Error`
+    /// can name the connection string / host, which must never reach an
+    /// HTTP response body.
+    #[test]
+    fn session_ownership_error_database_display_never_contains_source_text() {
+        let io_err = std::io::Error::other("connect to db.internal:5432 failed");
+        let err = SessionOwnershipError::Database(sqlx::Error::Io(io_err));
+        assert_eq!(err.to_string(), "database error");
+        assert!(!err.to_string().contains("db.internal"));
     }
 }

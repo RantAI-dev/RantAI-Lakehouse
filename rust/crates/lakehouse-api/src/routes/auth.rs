@@ -26,7 +26,7 @@
 //! scope does not call for.
 
 use axum::body::Bytes;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
@@ -35,6 +35,7 @@ use lakehouse_auth::{
 };
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
+use lakehouse_store::StoreError;
 use lakehouse_store::identity;
 use lakehouse_store::sessions::SessionRow;
 use serde::{Deserialize, Serialize};
@@ -306,7 +307,7 @@ fn sessions_decision_for(principal: &Principal) -> SessionsDecision {
 /// `GET /api/auth/sessions` — list the caller's own live browser sessions,
 /// or every live session in the deployment if the caller holds
 /// `identity:sessions:manage`. Route-level policy is `Policy::RequiresAuth`
-/// (every authenticated caller may hit this — the admin-vs-own split lives
+/// (every authenticated caller may hit it — the admin-vs-own split lives
 /// here in the handler, see [`SessionsDecision`]).
 ///
 /// # A documented gap
@@ -338,6 +339,67 @@ pub async fn sessions(
         }
     };
     Ok(ApiJson(rows))
+}
+
+/// `DELETE /api/auth/sessions/{id}` — revoke one live browser session. An
+/// `identity:sessions:manage` holder may revoke any session; everyone else
+/// may revoke only their own.
+///
+/// The route never tells a caller which of "your session",
+/// "another user's session", and "no such session" they hit — Hard
+/// Requirement 4 ("never reveals whether another user's session id
+/// exists"). All three collapse to the same 404 with the same body, so
+/// the route is not an enumeration oracle (WS8 §Phase D):
+///
+/// * A foreign id (someone else's session, caller is not admin) and a
+///   missing id both arrive at [`lakehouse_store::sessions::revoke_session_as_caller`]
+///   as `SessionOwnershipError::NotFound` (the SQL's
+///   `WHERE id = $1 AND revoked_at IS NULL AND ($3 OR app_user_id = $2)`
+///   predicate matches zero rows either way).
+/// * A service principal has no `app_user.id` of its own to enumerate —
+///   same posture as `SessionsDecision::Empty` on the list endpoint — so
+///   it short-circuits to the same 404 body before touching the DB. The
+///   service-principal branch carries the same `ApiError::NotFound`
+///   message as `StoreError::NotFound` would render, so the bytes match
+///   (verified by [`tests::delete_session_route_404_body_for_foreign_id_matches_missing_id`]).
+///
+/// A non-UUID path segment is a 400, not a 404: a malformed id can't
+/// match any row, so 404'ing it would be a "doesn't exist" response that
+/// also can't be a "foreign-id" check — exactly the wrong shape for a
+/// caller that's misusing the API. The 400 makes the malformed-path
+/// case its own shape.
+///
+/// `Policy::RequiresAuth` is the floor (every authenticated caller may
+/// hit this), and the admin-vs-own split lives here in the handler, the
+/// same way [`sessions`] splits it for the list endpoint.
+///
+/// # Errors
+///
+/// Returns 400 [`ApiError::BadRequest`] on a non-UUID `{id}`; 404
+/// [`ApiError::NotFound`] uniformly for foreign / missing / already-
+/// revoked ids and for service principals; 503
+/// [`ApiError::Unavailable`] when no Postgres pool is configured; or a
+/// classified [`StoreError`] (via [`SessionOwnershipError`]'s own
+/// `From<...> for StoreError` mapping) on any storage failure.
+pub async fn revoke_session(
+    State(state): State<AppState>,
+    AuthenticatedPrincipal(principal): AuthenticatedPrincipal,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    let session_id = Uuid::parse_str(&id)
+        .map_err(|_| ApiError::BadRequest("session id must be a UUID".to_owned()))?;
+
+    let PrincipalId::User(caller_id) = principal.id else {
+        return Err(ApiError::NotFound("record not found".to_owned()).into());
+    };
+    let is_admin = principal.has("identity:sessions:manage");
+
+    let pool = pool(&state)?;
+    lakehouse_store::sessions::revoke_session_as_caller(pool, session_id, caller_id, is_admin)
+        .await
+        .map_err(StoreError::from)?;
+
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// `{ oldPassword?, newPassword }` — `POST /api/auth/change-password` body.
@@ -1381,6 +1443,28 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    /// `AppState` with no Postgres pool — same shape every other `tests`
+    /// module in this crate uses for the "no pool → 503" branch
+    /// (`routes::identity::tests::state_without_pool`,
+    /// `routes::knowledge::tests`, ...). The D2-route tests that don't
+    /// reach [`pool`] (the 400 non-UUID path, the 404 service-principal
+    /// path) use this so they don't depend on a testcontainer Postgres.
+    fn state_without_pool() -> AppState {
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+        AppState::new(Config::from_map(&env).unwrap())
+    }
+
+    /// Read the bytes out of an axum `Response` body. Used by the
+    /// 404-body byte-equality test, which compares two responses'
+    /// bodies exactly.
+    async fn body_bytes(response: Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
     #[tokio::test]
     async fn providers_reports_oidc_configured_true_only_when_auth_state_has_it() {
         let with_oidc = state_with_oidc_flow_config();
@@ -1470,5 +1554,206 @@ mod tests {
             sessions_decision_for(&admin_user),
             SessionsDecision::All(user_id),
         );
+    }
+
+    // ── WS8 plan §Phase D, the `DELETE /api/auth/sessions/{id}` routing shape ──
+
+    /// A non-UUID path segment is a 400, not a 404. A malformed id can't
+    /// match any row, so 404'ing it would render the same "doesn't
+    /// exist" body as a foreign / missing id — which a caller could
+    /// otherwise use to tell "your path is malformed" apart from "the
+    /// session id is foreign/nonexistent." The 400 makes the
+    /// malformed-path case its own shape, so the route's 404 stays a
+    /// pure "is this id yours / does it exist" signal.
+    ///
+    /// Reachable without a pool: the UUID parse happens before
+    /// [`pool`], so `state_without_pool` exercises this branch in
+    /// isolation (and would 503 on `pool` if the path were valid).
+    #[tokio::test]
+    async fn delete_session_route_rejects_a_non_uuid_path_segment_with_400() {
+        let state = state_without_pool();
+        let principal = AuthenticatedPrincipal(Principal {
+            id: PrincipalId::User(Uuid::new_v4()),
+            tenant_ids: Vec::new(),
+            display_name: "alice".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::default(),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        });
+        let rejection = revoke_session(State(state), principal, Path("not-a-uuid".to_owned()))
+            .await
+            .expect_err("a non-UUID path segment must be a rejection");
+        let response = rejection.into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a non-UUID path must be 400, not 404 — Hard Requirement 4"
+        );
+    }
+
+    /// Hard Requirement 4's two 404 arms (foreign id, missing id) must
+    /// produce byte-equal responses. A future reader who changes the
+    /// foreign-id message has to consciously change the missing-id
+    /// message too — the route is not an enumeration oracle (WS8
+    /// §Phase D).
+    ///
+    /// The test does NOT hit the route end-to-end (that needs a real
+    /// DB); it constructs both response paths directly. The two paths
+    /// are:
+    ///
+    /// * Foreign / missing id: `revoke_session_as_caller` returns
+    ///   `SessionOwnershipError::NotFound`, which `?`-converts through
+    ///   `From<SessionOwnershipError> for StoreError` to
+    ///   `StoreError::NotFound`, then `From<StoreError> for ApiError`
+    ///   to `ApiError::NotFound("record not found")`.
+    /// * Service principal: the handler returns
+    ///   `ApiError::NotFound("record not found".to_owned())` directly,
+    ///   bypassing the DB.
+    ///
+    /// Both must render the same `{"error": "record not found"}` body.
+    #[tokio::test]
+    async fn delete_session_route_404_body_for_foreign_id_matches_missing_id() {
+        use crate::error::ApiRejection;
+
+        // Foreign / missing id path: SessionOwnershipError::NotFound ->
+        // StoreError::NotFound -> ApiError::NotFound("record not found").
+        let via_store: Response = ApiRejection(StoreError::NotFound.into()).into_response();
+
+        // Service-principal path: the handler short-circuits with the
+        // same ApiError::NotFound body before touching the DB.
+        let via_short_circuit: Response =
+            ApiRejection(ApiError::NotFound("record not found".to_owned())).into_response();
+
+        assert_eq!(via_store.status(), StatusCode::NOT_FOUND);
+        assert_eq!(via_short_circuit.status(), StatusCode::NOT_FOUND);
+
+        let via_store_body = body_bytes(via_store).await;
+        let via_short_circuit_body = body_bytes(via_short_circuit).await;
+        assert_eq!(
+            via_store_body, via_short_circuit_body,
+            "the foreign-id 404 body must byte-equal the missing-id 404 body"
+        );
+    }
+
+    /// A service principal must always get 404 on this route, never 401
+    /// or 403. A service identity has no `app_user.id` of its own to
+    /// enumerate, so the route cannot tell apart "your session",
+    /// "another user's session", and "no such session" — exactly the
+    /// same posture as [`SessionsDecision::Empty`] on the list endpoint.
+    /// Returning 401/403 here would let a service caller probe the
+    /// difference between "this id exists" and "this id doesn't",
+    /// which is the gap Hard Requirement 4 exists to close.
+    ///
+    /// Reachable without a pool: the service-principal short-circuit
+    /// runs before [`pool`], so `state_without_pool` is the right
+    /// harness (the 503-on-no-pool check is covered by
+    /// `every_database_backed_route_returns_503_without_a_pool` in
+    /// `routes/identity.rs`'s tests, and this route is now under that
+    /// same coverage umbrella).
+    #[tokio::test]
+    async fn delete_session_route_returns_404_for_a_service_principal() {
+        let state = state_without_pool();
+        let principal = AuthenticatedPrincipal(Principal {
+            id: PrincipalId::Service(Uuid::new_v4()),
+            tenant_ids: Vec::new(),
+            display_name: "service-caller".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::default(),
+            provider: "service".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        });
+        let rejection = revoke_session(
+            State(state),
+            principal,
+            Path("00000000-0000-0000-0000-000000000000".to_owned()),
+        )
+        .await
+        .expect_err("a service principal must be a rejection, not a 2xx");
+        let response = rejection.into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "a service principal must get 404, never 401/403"
+        );
+    }
+
+    /// The read-after-write property of the route: after
+    /// [`revoke_session`] returns Ok, the cookie for that session must
+    /// be rejected by [`lakehouse_auth::session::validate_session`].
+    /// If the DB write succeeded but the session still validated, the
+    /// cookie has been cleared by the UI but the server still accepts
+    /// the request — exactly the gap this task exists to close.
+    ///
+    /// This is the test that ties `lakehouse_auth::session::validate_session`'s
+    /// own live predicate (`revoked_at IS NULL AND expires_at > now()`)
+    /// to [`lakehouse_store::sessions::revoke_session_as_caller`]'s
+    /// UPDATE — both predicate on the same column, so a write that
+    /// passes our test passes theirs by construction. Asserting via
+    /// `validate_session` (rather than reading `revoked_at` directly)
+    /// is the property the route exists to provide end-to-end, and
+    /// is what would fail if our UPDATE didn't actually flip
+    /// `revoked_at` to non-`NULL`.
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn delete_session_route_makes_validate_session_reject_the_same_token(
+        pool: sqlx::PgPool,
+    ) -> sqlx::Result<()> {
+        use lakehouse_test_support as _;
+
+        let user_id: Uuid =
+            sqlx::query_scalar("INSERT INTO app_user (name, email) VALUES ($1, $2) RETURNING id")
+                .bind("caller")
+                .bind("caller@x.invalid")
+                .fetch_one(&pool)
+                .await?;
+
+        let token = lakehouse_auth::session::create_session(
+            &pool,
+            user_id,
+            lakehouse_auth::session::DEFAULT_SESSION_TTL,
+            None,
+            None,
+        )
+        .await
+        .expect("mint a session");
+
+        let session_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM session \
+             WHERE app_user_id = $1 AND revoked_at IS NULL \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .fetch_one(&pool)
+        .await?;
+
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url_for(&pool));
+        let state = AppState::new(Config::from_map(&env).unwrap());
+
+        let principal = AuthenticatedPrincipal(Principal {
+            id: PrincipalId::User(user_id),
+            tenant_ids: Vec::new(),
+            display_name: "caller".to_owned(),
+            permissions: lakehouse_auth::PermissionSet::default(),
+            provider: "session".to_owned(),
+            must_change_password: false,
+            role_names: Vec::new(),
+        });
+
+        let response = revoke_session(State(state), principal, Path(session_id.to_string()))
+            .await
+            .expect("revoke must succeed for the session's owner");
+        assert_eq!(
+            response.status(),
+            StatusCode::NO_CONTENT,
+            "a successful revoke returns 204"
+        );
+
+        let validation = lakehouse_auth::session::validate_session(&pool, &token).await;
+        assert!(
+            matches!(validation, Err(lakehouse_auth::AuthError::SessionInvalid)),
+            "validate_session must reject the revoked token, got {validation:?}"
+        );
+        Ok(())
     }
 }
