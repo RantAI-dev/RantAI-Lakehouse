@@ -128,3 +128,34 @@ def test_reading_documents_runs_inside_checking_resolver_so_a_rebound_host_is_re
     )
     with pytest.raises(SsrfBlocked, match="private/internal/multicast"):
         list(rows)
+
+
+def test_reading_refuses_a_document_whose_first_row_carries_a_nested_value():
+    """R7: Mongo has no declared column types, so the first document of the
+    read is the sample the gate inspects. A nested list/dict must be refused
+    at read time — silently flattening it in the sink would lose structure
+    the catalog would then describe wrongly."""
+    from dispar_orchestrate import column_gate
+    from dispar_orchestrate.adapters import mongodb
+
+    class _NestedCollection:
+        def find(self, _query):
+            yield {"id": 1, "tags": ["a", "b"]}
+
+    rows = mongodb._collection_rows(_NestedCollection())
+    with pytest.raises(column_gate.UnsupportedColumnType, match="tags"):
+        list(rows)
+
+
+def test_reading_accepts_a_flat_document():
+    """The gate must not refuse the ordinary case — a flat document streams
+    through untouched."""
+    from dispar_orchestrate.adapters import mongodb
+
+    class _FlatCollection:
+        def find(self, _query):
+            yield {"id": 1, "name": "widget"}
+            yield {"id": 2, "name": "gadget"}
+
+    assert [r["id"] for r in mongodb._collection_rows(_FlatCollection())] == [1, 2]
+

@@ -73,6 +73,7 @@ from dataclasses import dataclass, field
 from kafka import KafkaConsumer, TopicPartition
 
 from dispar_orchestrate import ssrf_guard
+from dispar_orchestrate.column_gate import reject_unsupported_column_types_from_sample
 from dispar_orchestrate.ssrf_guard_kafka import BrokerMetadata, check_all_advertised_brokers
 
 
@@ -148,7 +149,18 @@ def consume_one_batch(
             records_by_partition = consumer.poll(timeout_ms=min(1000, remaining_ms), max_records=500)
             for tp, records in records_by_partition.items():
                 for record in records:
-                    rows.append(json.loads(record.value))
+                    row = json.loads(record.value)
+                    # R7 (WS9 Task I1): a Kafka message carries no declared
+                    # column types either, so the batch's FIRST decoded
+                    # record is the sample this gate inspects — a nested
+                    # JSON array/object is refused before the batch is
+                    # written, not flattened by the sink. Refusing here
+                    # also means no offset is committed for a batch whose
+                    # shape this pipeline cannot represent, because the
+                    # commit only happens after a successful sink write.
+                    if not rows:
+                        reject_unsupported_column_types_from_sample(row)
+                    rows.append(row)
                     offsets[tp.partition] = max(offsets.get(tp.partition, -1), record.offset)
     return BatchResult(rows=rows, offsets_to_commit=offsets)
 

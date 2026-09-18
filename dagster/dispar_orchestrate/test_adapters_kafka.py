@@ -160,3 +160,28 @@ def test_consume_refuses_when_the_advertised_broker_list_cannot_be_read():
             _ConsumerWithoutClient(), topic="orders", max_seconds=1
         )
 
+
+def test_consume_refuses_a_batch_whose_first_message_carries_a_nested_value():
+    """R7: a Kafka message carries no declared column types, so the batch's
+    first decoded record is the sample the gate inspects. A nested JSON
+    array/object is refused BEFORE the batch is written — and because the
+    offset is only committed after a successful sink write, refusing here
+    also means the batch is re-delivered rather than skipped."""
+    from kafka import TopicPartition
+
+    from dispar_orchestrate import column_gate
+
+    tp = TopicPartition("orders", 0)
+    consumer = _FakeConsumer(
+        brokers=[_FakeBroker("broker-a.invalid", 9092)],
+        batches=[{tp: [_FakeRecord(b'{"id":1,"lines":[{"sku":"x"}]}', 0, 10)]}],
+    )
+    with pytest.raises(column_gate.UnsupportedColumnType, match="lines"):
+        consume_one_batch(
+            consumer,
+            topic="orders",
+            max_seconds=1,
+            resolve_checked=lambda h, p: ResolvedAddress(ip="93.184.216.34", port=p, family=2),
+            checking_resolver=lambda **_: contextlib.nullcontext(),
+        )
+

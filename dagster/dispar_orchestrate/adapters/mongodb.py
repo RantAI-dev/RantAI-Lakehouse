@@ -20,6 +20,7 @@ from typing import Any, Iterator
 from pymongo import MongoClient
 
 from dispar_orchestrate import ssrf_guard
+from dispar_orchestrate.column_gate import reject_unsupported_column_types_from_sample
 from dispar_orchestrate.ssrf_guard_mongo import resolve_all_seed_hosts, validate_mongo_dial
 
 
@@ -45,7 +46,20 @@ def _collection_rows(collection, *, checking_resolver=ssrf_guard.checking_resolv
     read.
     """
     with checking_resolver():
-        yield from collection.find({})
+        cursor = collection.find({})
+        for index, document in enumerate(cursor):
+            # R7 (WS9 Task I1): Mongo has no relational type catalogue to
+            # gate at registration, so the first document of the read is
+            # the sample this gate inspects — a nested list/dict value is
+            # refused here rather than silently flattened or dropped by
+            # the sink. Only the first: this is a per-run spot check (see
+            # `reject_unsupported_column_types_from_sample`'s own note on
+            # what it does and does not guarantee), and running it per
+            # document would put a dict walk on every row of every batch
+            # for a guarantee it still could not make.
+            if index == 0:
+                reject_unsupported_column_types_from_sample(document)
+            yield document
 
 
 def build_source(

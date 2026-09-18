@@ -50,13 +50,16 @@ this docstring states, per adapter, exactly what is and is not gated:
   a `reject_unsupported_column_types_from_sample` call at the same time,
   or it would reintroduce exactly the gap this note currently rules out.
 
-**Wiring status (disclosed, not assumed):** as of this commit,
-`adapters/mongodb.py` and `adapters/kafka.py` do NOT yet call
-`reject_unsupported_column_types_from_sample` -- this task's file
-ownership is `column_gate.py`/`test_column_gate.py` only, so the gate
-function exists and is tested here, but wiring it into those two
-adapters' read paths is separate, follow-on work. Do not read this
-module's existence as proof those adapters are gated today.
+**Wiring status:** `adapters/mongodb.py` gates the FIRST document of a
+read (`_collection_rows`) and `adapters/kafka.py` gates the first decoded
+record of a batch (`consume_one_batch`), each with its own test proving a
+nested value is refused at read time. The first row only: this is a
+per-run spot check, for the reason
+`reject_unsupported_column_types_from_sample` states, and walking every
+row of every batch would cost that on the hot path without buying the
+guarantee. In Kafka's case the refusal also means the batch's offset is
+never committed -- the commit happens only after a successful sink write
+-- so a refused batch is re-delivered, not skipped.
 """
 
 from __future__ import annotations
