@@ -59,6 +59,7 @@ use crate::error::AuthError;
 use crate::permissions::PermissionSet;
 use crate::principal::Principal;
 use crate::repository::{self, PgPool};
+use crate::secret::Secret;
 
 /// Algorithms this authenticator will ever verify a signature with —
 /// every one asymmetric.
@@ -478,6 +479,51 @@ impl OidcAuthenticator {
         let mapped = self.mapped_permissions(claims).await?;
         principal.permissions = PermissionSet::merge([principal.permissions, mapped]);
         Ok(principal)
+    }
+
+    /// Verify `token` exactly as [`Self::authenticate`] would (signature,
+    /// algorithm, `iss`/`aud`/`exp`/`nbf`, principal resolution — see
+    /// [`Self::validate_token`]/[`Self::resolve_principal`], neither of which
+    /// this method re-implements), and additionally require its `nonce`
+    /// claim to equal `expected_nonce`.
+    ///
+    /// # Why this exists instead of using [`Authenticator::authenticate`]
+    ///
+    /// The bearer-token *resource-server* path (`crate::authenticator`'s doc
+    /// comment; [`Authenticator::authenticate`]) never carries a
+    /// caller-supplied nonce to compare against — a service or an already-
+    /// established API caller has no login ceremony to bind. The browser
+    /// *login* flow (`routes::auth::oidc_callback`, a separate crate) does:
+    /// it minted a `nonce`, put it in a short-lived cookie alongside `state`,
+    /// and must prove the id token it receives back is the answer to
+    /// *that* authorization request, not a token replayed from a different
+    /// one — exactly what OIDC's `nonce` parameter exists to prove. This
+    /// method is that one additional check, layered on top of the same
+    /// verification [`Self::authenticate`] already does, not a parallel
+    /// implementation of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError::InvalidCredentials`] for every reason
+    /// [`Self::validate_token`] already would, or if the token's `nonce`
+    /// claim is missing or does not equal `expected_nonce` — deliberately the
+    /// same variant as every other validation failure in this module (see
+    /// [`Self::validate_token`]'s doc comment on non-enumeration).
+    pub async fn authenticate_with_nonce(
+        &self,
+        token: &Secret,
+        expected_nonce: &str,
+    ) -> Result<Principal, AuthError> {
+        let claims = self.validate_token(token.expose()).await?;
+        let actual_nonce = claims
+            .extra
+            .get("nonce")
+            .and_then(Value::as_str)
+            .ok_or(AuthError::InvalidCredentials)?;
+        if actual_nonce != expected_nonce {
+            return Err(AuthError::InvalidCredentials);
+        }
+        self.resolve_principal(&claims).await
     }
 
     /// Create (or link to an existing, same-email) `app_user` for `claims`,

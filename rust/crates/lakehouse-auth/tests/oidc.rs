@@ -115,6 +115,8 @@ struct Claims<'a> {
     name: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     groups: Option<Vec<&'a str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nonce: Option<&'a str>,
 }
 
 impl<'a> Claims<'a> {
@@ -128,6 +130,7 @@ impl<'a> Claims<'a> {
             email: None,
             name: None,
             groups: None,
+            nonce: None,
         }
     }
 }
@@ -595,5 +598,61 @@ async fn an_unmapped_group_grants_nothing_extra(pool: PgPool) -> sqlx::Result<()
 
     assert!(!principal.has("identity:write"));
     assert!(principal.has("query:read"));
+    Ok(())
+}
+
+// ── `authenticate_with_nonce` (WS8 plan Task A3) ───────────────────────────
+//
+// Builds on this file's existing `authenticator`/`sign`/`mount_jwks`
+// harness rather than a second JWT-minting approach. The mismatched-nonce
+// case is decided inside `validate_token`'s caller before `resolve_principal`
+// ever runs (same reasoning as the token-validation-failure tests above), so
+// it needs no Postgres and stays a plain `#[tokio::test]` with `lazy_pool`;
+// the matching-nonce case reaches `resolve_principal` and therefore needs
+// the real schema, like every other successful-`authenticate` test in this
+// file.
+
+/// Shared setup for both `authenticate_with_nonce` tests: an authenticator
+/// plus the key it trusts, wired the same way every other test in this file
+/// wires them.
+async fn test_authenticator(pool: PgPool) -> (MockServer, OidcAuthenticator, TestKey) {
+    let server = MockServer::start().await;
+    let key = TestKey::generate("kid-1");
+    mount_jwks(&server, &[&key]).await;
+    let auth = authenticator(&server, pool, Duration::from_secs(300), true);
+    (server, auth, key)
+}
+
+/// Sign a valid id token for `sub` carrying `nonce` as its `nonce` claim.
+fn mint_test_id_token(key: &TestKey, sub: &str, nonce: &str) -> String {
+    let mut claims = Claims::valid(sub);
+    claims.nonce = Some(nonce);
+    sign(&claims, key, Algorithm::RS256)
+}
+
+#[tokio::test]
+async fn authenticate_with_nonce_rejects_a_token_whose_nonce_claim_does_not_match() {
+    let (_server, auth, key) = test_authenticator(lazy_pool()).await;
+    let token = mint_test_id_token(&key, "sub-1", "nonce-in-token");
+    let err = auth
+        .authenticate_with_nonce(&Secret::new(token), "nonce-expected-by-caller")
+        .await
+        .expect_err("a mismatched nonce must be rejected");
+    assert!(matches!(err, AuthError::InvalidCredentials));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn authenticate_with_nonce_accepts_a_token_whose_nonce_claim_matches(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let (_server, auth, key) = test_authenticator(pool).await;
+    let token = mint_test_id_token(&key, "user-1", "nonce-xyz");
+    let principal = auth
+        .authenticate_with_nonce(&Secret::new(token), "nonce-xyz")
+        .await
+        .expect("a matching nonce must be accepted");
+    // `oidc:test` — this file's existing config fixture (`authenticator`'s
+    // `OidcConfig::new(ISSUER, CLIENT_ID, "test", ..)`), not `oidc:okta`.
+    assert_eq!(principal.provider, "oidc:test");
     Ok(())
 }
