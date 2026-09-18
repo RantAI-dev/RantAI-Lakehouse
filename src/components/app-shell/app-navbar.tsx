@@ -2,7 +2,7 @@
 
 import Link from "next/link"
 import { Search, Bell, LogOut, KeyRound, CircleUserRound } from "lucide-react"
-import { usePathname } from "next/navigation"
+import { usePathname, useRouter } from "next/navigation"
 import { SidebarTrigger } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -21,6 +21,7 @@ import { openCommandPalette } from "@/components/command-palette"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService } from "@/hooks/use-service"
 import { notificationsService } from "@/services"
+import { TenantSwitcher } from "./tenant-switcher"
 
 /**
  * Sticky top navbar rendered on every page.
@@ -30,7 +31,8 @@ import { notificationsService } from "@/services"
 export function AppNavbar() {
   const pathname = usePathname()
   const pageTitle = pageTitleFor(pathname)
-  const { user, logout } = useAuth()
+  const router = useRouter()
+  const { user, logout, activeTenantId, setActiveTenant } = useAuth()
   // WS5 item F1: the bell dot lights only for a real, currently
   // open/pending item — never on `supported: false` (an unsupported
   // deployment shows no dot, not a stuck-on or stuck-off guess) and never
@@ -85,6 +87,21 @@ export function AppNavbar() {
 
         <div className="flex shrink-0 items-center gap-1">
           <ThemeToggle />
+          <TenantSwitcher
+            tenants={user?.tenants ?? []}
+            activeTenantId={activeTenantId}
+            onSwitch={(id) => {
+              // Persist the new choice (`apiFetch` reads it on the next
+              // request, Tasks C1–C4 enforce it server-side), then force
+              // a server refetch — every tenant-scoped list route reads
+              // `X-Tenant` at request time, so a client-side re-filter
+              // would be dishonest (it would still show data fetched
+              // under the OLD tenant's scope until the next real
+              // request).
+              setActiveTenant(id)
+              router.refresh()
+            }}
+          />
           <Button
             variant="ghost"
             size="icon"
