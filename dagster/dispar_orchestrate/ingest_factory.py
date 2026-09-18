@@ -75,13 +75,18 @@ from urllib.parse import urlparse
 import requests
 from dagster import DefaultScheduleStatus, Field, ScheduleDefinition, job, op
 
+from kafka import KafkaConsumer, TopicPartition
+from kafka.structs import OffsetAndMetadata
+
 from dispar_orchestrate import dlt_pipeline, secret_resolver, ssrf_guard
 from dispar_orchestrate.adapters import files as files_adapter
 from dispar_orchestrate.adapters import rest as rest_adapter
 from dispar_orchestrate.adapters import sheets as sheets_adapter
 from dispar_orchestrate.adapters import sink as sink_adapter
 from dispar_orchestrate.adapters import sql as sql_adapter
-from dispar_orchestrate.bronze_catalog import record_ingest_run
+from dispar_orchestrate.adapters.kafka import consume_one_batch
+from dispar_orchestrate.adapters.sink import load_via_sink
+from dispar_orchestrate.bronze_catalog import record_ingest_offset, record_ingest_run
 from dispar_orchestrate.column_gate import UnsupportedColumnType, reject_unsupported_column_types
 from dispar_orchestrate.secret_map import secret_field_names
 from dispar_orchestrate.secret_resolver import SecretRefRejected
@@ -292,6 +297,75 @@ def _run_one_object(connector: dict, obj: dict) -> None:
     except Exception as exc:  # noqa: BLE001 -- every OTHER failure still gets a row (never silently invisible)
         _record(rows=None, status="failed", error=_classify_exception(exc))
         raise
+
+
+def run_kafka_stream_batch(
+    *,
+    connector_id: str,
+    spec: dict,
+    secrets: dict,
+    source_objects: list[dict],
+    consumer: "KafkaConsumer | None" = None,
+) -> None:
+    """One scheduled micro-batch for a `kafka`-adapter, `ingest_mode='stream'`
+    connector (WS9 plan Task D4). At-least-once, stated explicitly (hard
+    requirement 3): `consume_one_batch` returns rows plus the last offset
+    seen per partition, WITHOUT committing anything. This function calls
+    `load_via_sink` on those rows FIRST -- and only once that write
+    succeeds does it commit the batch's offsets, both to Kafka's own
+    broker-side consumer-group offset (`consumer.commit`, `enable_auto_commit
+    =False` so nothing commits on its own) AND to `bronze_meta.ingest_offset`
+    (`record_ingest_offset`, this build's own durable record, since a
+    fresh `KafkaConsumer` is constructed per scheduled run rather than kept
+    alive between runs). A crash between the sink write and either commit
+    call re-delivers the same batch on the next scheduled run -- a
+    deliberate, documented at-least-once gap (`adapters/sink.py`'s Iceberg
+    append path is not deduplicated), never a silent skip.
+
+    An empty batch (`not batch.rows`) returns without writing or
+    committing anything -- there is nothing to commit an offset FOR.
+
+    `consumer` is injectable (DEFAULT `None` builds a real
+    `KafkaConsumer` from `spec`) so a test can drive this function with a
+    fake driver and touch no network at all -- the same "inject the thing
+    that would otherwise touch the network" discipline
+    `adapters/mongodb.py::_collection_rows`'s `checking_resolver` param
+    and `adapters/kafka.py::consume_one_batch`'s `resolve_checked`/
+    `checking_resolver` params already establish in this workstream. When
+    this function owns the consumer (constructed it itself), it also
+    closes it in `finally`; a caller-supplied consumer is the caller's to
+    close.
+    """
+    owns_consumer = consumer is None
+    if owns_consumer:
+        consumer = KafkaConsumer(
+            bootstrap_servers=spec["bootstrapServers"],
+            group_id=spec["groupId"],
+            enable_auto_commit=False,
+            value_deserializer=lambda v: v,  # raw bytes -- consume_one_batch does its own json.loads
+        )
+        consumer.subscribe([spec["topic"]])
+    topic = spec.get("topic", "")
+    try:
+        batch = consume_one_batch(consumer, topic=topic, max_seconds=spec.get("microBatchSeconds", 60))
+        if not batch.rows:
+            return
+        sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env())
+        load_via_sink(batch.rows, source_objects[0]["target"], sink_config)
+        # Committed ONLY after the sink write above returned successfully
+        # (an exception there propagates out of this function before this
+        # point is ever reached -- see this function's own docstring).
+        consumer.commit(
+            {
+                TopicPartition(topic, partition): OffsetAndMetadata(offset + 1)
+                for partition, offset in batch.offsets_to_commit.items()
+            }
+        )
+        for partition, offset in batch.offsets_to_commit.items():
+            record_ingest_offset(connector_id, topic, partition, offset)
+    finally:
+        if owns_consumer:
+            consumer.close()
 
 
 @op(config_schema={"connector_id": Field(str, description="The connector.id (adapter IS NOT NULL) to ingest.")})

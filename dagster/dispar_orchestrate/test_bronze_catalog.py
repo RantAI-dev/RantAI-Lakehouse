@@ -13,7 +13,12 @@ Run with:
 from __future__ import annotations
 
 from dispar_orchestrate import bronze_catalog
-from dispar_orchestrate.bronze_catalog import ClickHouseTarget, record_ingest_run
+from dispar_orchestrate.bronze_catalog import (
+    ClickHouseTarget,
+    last_committed_offset,
+    record_ingest_offset,
+    record_ingest_run,
+)
 
 
 def test_record_ingest_run_creates_the_table_and_inserts_a_row(monkeypatch):
@@ -71,3 +76,55 @@ def test_record_ingest_run_defaults_error_to_empty_string(monkeypatch):
     )
     insert = next(s for s in executed if "INSERT INTO" in s)
     assert insert.rstrip().endswith("'')")
+
+
+# ── record_ingest_offset / last_committed_offset (WS9 plan Task A1/D4) ──
+
+
+def test_record_ingest_offset_creates_the_table_and_inserts_a_row(monkeypatch):
+    executed = []
+    monkeypatch.setattr(bronze_catalog, "_ch_query_json", lambda target, stmt: [])
+    monkeypatch.setattr(bronze_catalog, "_ch_exec", lambda target, stmt: executed.append(stmt))
+    record_ingest_offset(
+        "conn-kafka",
+        "orders",
+        0,
+        11,
+        target=ClickHouseTarget(url="http://ch", user="default", password=""),
+    )
+    assert any("CREATE TABLE IF NOT EXISTS lake.`bronze_meta.ingest_offset`" in s for s in executed)
+    insert = next(s for s in executed if "INSERT INTO lake.`bronze_meta.ingest_offset`" in s)
+    assert "'conn-kafka'" in insert
+    assert "'orders'" in insert
+    assert ", 0, 11, " in insert  # partition_id, committed_offset -- integers, not quoted
+
+
+def test_last_committed_offset_returns_none_when_nothing_was_ever_committed(monkeypatch):
+    monkeypatch.setattr(bronze_catalog, "_ch_query_json", lambda target, stmt: [])
+    result = last_committed_offset(
+        ClickHouseTarget(url="http://ch", user="default", password=""), "conn-kafka", "orders", 0
+    )
+    assert result is None
+
+
+def test_last_committed_offset_returns_none_when_the_query_fails(monkeypatch):
+    # Mirrors latest_maintenance_run_at's own "table not created yet, or
+    # ClickHouse unreachable -> treat as never committed" contract.
+    import requests
+
+    def _raise(target, stmt):
+        raise requests.ConnectionError("unreachable")
+
+    monkeypatch.setattr(bronze_catalog, "_ch_query_json", _raise)
+    result = last_committed_offset(
+        ClickHouseTarget(url="http://ch", user="default", password=""), "conn-kafka", "orders", 0
+    )
+    assert result is None
+
+
+def test_last_committed_offset_returns_the_real_committed_value(monkeypatch):
+    monkeypatch.setattr(bronze_catalog, "_ch_query_json", lambda target, stmt: [{"committed_offset": "11"}])
+    result = last_committed_offset(
+        ClickHouseTarget(url="http://ch", user="default", password=""), "conn-kafka", "orders", 0
+    )
+    assert result == 11

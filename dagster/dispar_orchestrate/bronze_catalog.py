@@ -666,3 +666,102 @@ def record_ingest_run(
         "(connector_id, job, object, rows, started_at, ended_at, status, error) "
         "VALUES " + values,
     )
+
+
+# ── Kafka micro-batch offset tracking (WS9 plan Task A1/D4) ─────────────
+#
+# `lake.bronze_meta.ingest_offset` is a NEW table, introduced for
+# `adapters/kafka.py`'s scheduled micro-batch job. It is CURRENT POSITION
+# ONLY -- one row per (connector_id, topic, partition_id), overwritten on
+# every commit -- never a history log (`connector_probe_result`, WS9 Phase
+# F, is where history is kept; conflating the two would let an
+# ever-growing offset table masquerade as an audit log it was never
+# designed to be). Not mirrored into `demo/clickhouse/04_registry.sql`
+# (out of scope for this build to edit), so this table has exactly one
+# owner: `_INGEST_OFFSET_SCHEMA` below -- its own one-element tuple passed
+# to `_assert_or_create_all`, the same pattern `_INGEST_RUN_SCHEMA` and
+# `_MAINTENANCE_RUN_SCHEMA` use.
+#
+# `ReplacingMergeTree ORDER BY (connector_id, topic, partition_id)` gives
+# the "current position" read (`last_committed_offset`, `FINAL`) an
+# upsert's semantics the same way `dataset_catalog`/`dataset_sync` already
+# rely on elsewhere in this module -- a plain `INSERT` per commit, not a
+# literal `ON CONFLICT ... DO UPDATE` (ClickHouse has no such clause);
+# the row for a given (connector_id, topic, partition_id) that survives a
+# background merge is the one `FINAL` returns.
+_INGEST_OFFSET_SCHEMA = TableSchema(
+    table_name="bronze_meta.ingest_offset",
+    columns=(
+        ("connector_id", "String"),
+        ("topic", "String"),
+        ("partition_id", "Int32"),
+        ("committed_offset", "Int64"),
+        ("committed_at", "String"),
+    ),
+    engine="ReplacingMergeTree",
+    order_by=("connector_id", "topic", "partition_id"),
+)
+
+
+def record_ingest_offset(
+    connector_id: str,
+    topic: str,
+    partition_id: int,
+    committed_offset: int,
+    *,
+    target: "ClickHouseTarget | None" = None,
+) -> None:
+    """Upsert the CURRENT committed offset for one (connector, topic,
+    partition) into `lake.bronze_meta.ingest_offset` -- called by
+    `ingest_factory.py::run_kafka_stream_batch` ONLY after
+    `adapters.sink.load_via_sink` has already succeeded for the batch this
+    offset belongs to (WS9 plan hard requirement 3: never before the sink
+    write, so a crash between consume and write is retried from the last
+    COMMITTED offset, at-least-once, on the next scheduled run).
+
+    A fresh `KafkaConsumer` is constructed per scheduled run (this
+    deployment runs no long-lived consumer process), so this table -- not
+    Kafka's own broker-side consumer-group offset alone -- is this build's
+    durable record of "where the last successful run left off".
+    """
+    ch = target or ClickHouseTarget.from_env()
+    _assert_or_create_all(ch, (_INGEST_OFFSET_SCHEMA,))
+    values = (
+        f"({_sql_string_literal(connector_id)}, {_sql_string_literal(topic)}, "
+        f"{int(partition_id)}, {int(committed_offset)}, {_sql_string_literal(_utc_now_iso())})"
+    )
+    _ch_exec(
+        ch,
+        "INSERT INTO lake.`bronze_meta.ingest_offset` "
+        "(connector_id, topic, partition_id, committed_offset, committed_at) VALUES " + values,
+    )
+
+
+def last_committed_offset(
+    target: ClickHouseTarget, connector_id: str, topic: str, partition_id: int
+) -> int | None:
+    """The last offset `record_ingest_offset` committed for this
+    (connector, topic, partition), or `None` if none has ever been
+    committed -- including `bronze_meta.ingest_offset` not existing yet
+    (a connector's very first scheduled run). `FINAL` reads the
+    post-merge current row for this key, matching the table's own
+    "current position only" contract (see the section header above).
+    """
+    try:
+        rows = _ch_query_json(
+            target,
+            "SELECT committed_offset FROM lake.`bronze_meta.ingest_offset` FINAL "
+            f"WHERE connector_id = {_sql_string_literal(connector_id)} "
+            f"AND topic = {_sql_string_literal(topic)} "
+            f"AND partition_id = {int(partition_id)}",
+        )
+    except requests.RequestException:
+        # Most commonly the table not existing yet (no commit has ever
+        # been recorded for this connector) or ClickHouse being
+        # unreachable -- both mean "no known committed offset", which the
+        # caller should treat the same as "never committed before".
+        return None
+    if not rows:
+        return None
+    value = rows[0].get("committed_offset")
+    return int(value) if value is not None else None

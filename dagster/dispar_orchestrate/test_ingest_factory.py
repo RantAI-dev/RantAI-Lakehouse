@@ -23,7 +23,9 @@ from __future__ import annotations
 import pytest
 import requests
 
-from dispar_orchestrate.ingest_factory import IngestFactoryConfig, build_ingest_schedules
+from dispar_orchestrate.adapters.kafka import BatchResult
+from dispar_orchestrate.adapters.sink import SinkResult
+from dispar_orchestrate.ingest_factory import IngestFactoryConfig, build_ingest_schedules, run_kafka_stream_batch
 
 
 def test_build_ingest_schedules_returns_empty_when_api_is_unreachable(monkeypatch) -> None:
@@ -258,3 +260,111 @@ def test_run_one_object_routes_a_postgres_driver_sql_connector_through_dlt_pipel
     assert from_dial_calls == [(connector["dial"], {"password": "s3cret"}, [obj])]
     assert recorded[0]["status"] == "succeeded"
     assert recorded[0]["rows"] == 42
+
+
+# ── run_kafka_stream_batch (WS9 plan Task D4) ────────────────────────────
+#
+# `consumer` is passed explicitly as a fake -- the plan's own hard
+# requirement ("fake the consumer/driver", WS9 plan Task D4 instructions)
+# -- so no real `KafkaConsumer` is ever constructed and no network is
+# touched. `consume_one_batch`/`load_via_sink`/`record_ingest_offset` are
+# monkeypatched by their bare (imported) names in `ingest_factory`'s own
+# module namespace, the same style `test_run_one_object_*` above already
+# uses for `_ADAPTERS`/`secret_resolver`/`sink_adapter`.
+
+
+class _FakeStreamConsumer:
+    """The minimal surface `run_kafka_stream_batch` calls on a
+    caller-supplied consumer: `.commit(...)`. `close()` is intentionally
+    NOT exercised here -- a caller-supplied consumer is the CALLER's to
+    close (see `run_kafka_stream_batch`'s own docstring), so this fake
+    records a commit call is enough to prove the code path."""
+
+    def __init__(self):
+        self.commits = []
+
+    def commit(self, offsets):
+        self.commits.append(offsets)
+
+
+def test_stream_dispatch_commits_offset_only_after_a_successful_sink_write(monkeypatch) -> None:
+    committed = []
+    written = []
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.consume_one_batch",
+        lambda *a, **k: BatchResult(rows=[{"id": 1}], offsets_to_commit={0: 5}),
+    )
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.load_via_sink",
+        lambda *a, **k: written.append(True) or SinkResult(rows=1, has_failed_jobs=False, load_info_str="ok"),
+    )
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.record_ingest_offset",
+        lambda *a, **k: committed.append(a),
+    )
+    fake_consumer = _FakeStreamConsumer()
+    run_kafka_stream_batch(
+        connector_id="conn-x",
+        spec={"topic": "orders"},
+        secrets={},
+        source_objects=[{"target": "orders"}],
+        consumer=fake_consumer,
+    )
+    assert written == [True]
+    assert len(committed) == 1  # committed AFTER the write, never before
+    assert len(fake_consumer.commits) == 1  # the broker-side consumer-group commit also happened
+
+
+def test_stream_dispatch_does_not_commit_the_offset_if_the_sink_write_fails(monkeypatch) -> None:
+    committed = []
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.consume_one_batch",
+        lambda *a, **k: BatchResult(rows=[{"id": 1}], offsets_to_commit={0: 5}),
+    )
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.load_via_sink",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("sink unavailable")),
+    )
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.record_ingest_offset",
+        lambda *a, **k: committed.append(a),
+    )
+    fake_consumer = _FakeStreamConsumer()
+    with pytest.raises(RuntimeError):
+        run_kafka_stream_batch(
+            connector_id="conn-x",
+            spec={"topic": "orders"},
+            secrets={},
+            source_objects=[{"target": "orders"}],
+            consumer=fake_consumer,
+        )
+    assert committed == []  # never committed -- the batch is retried whole next run
+    assert fake_consumer.commits == []  # the broker-side commit never happened either
+
+
+def test_stream_dispatch_returns_without_writing_or_committing_on_an_empty_batch(monkeypatch) -> None:
+    written = []
+    committed = []
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.consume_one_batch",
+        lambda *a, **k: BatchResult(rows=[], offsets_to_commit={}),
+    )
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.load_via_sink",
+        lambda *a, **k: written.append(True),
+    )
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.record_ingest_offset",
+        lambda *a, **k: committed.append(a),
+    )
+    fake_consumer = _FakeStreamConsumer()
+    run_kafka_stream_batch(
+        connector_id="conn-x",
+        spec={"topic": "orders"},
+        secrets={},
+        source_objects=[{"target": "orders"}],
+        consumer=fake_consumer,
+    )
+    assert written == []
+    assert committed == []
+    assert fake_consumer.commits == []
