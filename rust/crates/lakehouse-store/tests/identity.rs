@@ -28,8 +28,8 @@ use lakehouse_store::StoreError;
 use lakehouse_store::identity::{
     CreateRoleInput, CreateServiceIdentityInput, CreateTenantInput, InviteUserInput,
     ServiceIdentityFilter, TenantFilter, UserFilter, create_role, create_service_identity,
-    create_tenant, create_user, delete_user, get_service_identity, get_user, list_roles,
-    list_service_identities, list_tenants, list_users,
+    create_tenant, create_user, delete_user, get_service_identity, get_tenant, get_user,
+    list_roles, list_service_identities, list_tenants, list_users,
 };
 use sqlx::PgPool;
 
@@ -525,6 +525,64 @@ async fn seed_is_idempotent_when_applied_twice(pool: PgPool) -> sqlx::Result<()>
             .users,
         7,
         "membership rows must not double up either"
+    );
+    Ok(())
+}
+
+/// WS8 plan Phase B, Task B1 (migration `0042_tenant_provisioning.sql`,
+/// renumbered from the plan's `0040` — see that file's why-header): a
+/// tenant seeded by `0002_seed_identity.sql` predates provisioning
+/// entirely, so it must land on `not_applicable`, never `complete` — the
+/// P2 fix's whole point is that nothing was actually provisioned for it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn seeded_tenant_is_grandfathered_not_applicable_not_complete(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant = get_tenant(&pool, "11111111-1111-4111-8111-000000000001")
+        .await
+        .unwrap();
+    assert_eq!(tenant.warehouse_id, None);
+    assert_eq!(tenant.provisioning_status, "not_applicable");
+    Ok(())
+}
+
+/// The P2 fix backfills exactly the two connector rows
+/// `0022_prune_connector_seed.sql` seeds, and no others, to the seed
+/// tenant id.
+#[sqlx::test(migrations = "../../migrations")]
+async fn seeded_connectors_are_backfilled_to_the_seed_tenant(pool: PgPool) -> sqlx::Result<()> {
+    let rows: Vec<(String, Option<sqlx::types::Uuid>)> = sqlx::query_as(
+        "SELECT id, tenant_id FROM connector WHERE id IN ('conn-pg-lakehouse', 'conn-s3-warehouse') ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2);
+    for (_, tenant_id) in &rows {
+        assert_eq!(
+            tenant_id.map(|u| u.to_string()),
+            Some("11111111-1111-4111-8111-000000000001".to_owned())
+        );
+    }
+    Ok(())
+}
+
+/// `0027_prune_seeded_activity.sql` already deletes every
+/// `pipeline_definition` row `0008_seed_pipelines.sql` seeded, so
+/// `0042_tenant_provisioning.sql` has nothing to backfill in that table —
+/// asserting that stays zero guards against a future migration silently
+/// reintroducing a backfill target this one deliberately does not claim.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_pipeline_definition_row_is_backfilled_because_none_are_seeded(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM pipeline_definition")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "0027 already deleted every seeded pipeline_definition row — 0042 must not invent a backfill target here"
     );
     Ok(())
 }

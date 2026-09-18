@@ -459,6 +459,20 @@ pub struct Tenant {
     pub quota_compute: i64,
     /// Compute consumed. Serializes as `usedCompute`.
     pub used_compute: i64,
+    /// Lakekeeper's opaque warehouse id backing this tenant's Iceberg data,
+    /// or `None` if provisioning has not created one (WS8 plan Phase B,
+    /// migration `0042_tenant_provisioning.sql`). Serializes as
+    /// `warehouseId`. Text, not a UUID: it stores exactly what
+    /// Lakekeeper's `management/v1/warehouse` response returns.
+    pub warehouse_id: Option<String>,
+    /// Resumable checkpoint for tenant provisioning
+    /// (`pending`/`warehouse_ready`/`grants_ready`/`namespace_ready`/
+    /// `complete`/`not_applicable`/`failed`), enforced by a `CHECK`
+    /// constraint at the database. `not_applicable` marks a tenant seeded
+    /// before provisioning existed (`0002_seed_identity.sql`) — never
+    /// `complete`, since nothing was actually provisioned for it.
+    /// Serializes as `provisioningStatus`.
+    pub provisioning_status: String,
 }
 
 /// The raw row shape tenant reads select.
@@ -473,6 +487,8 @@ struct TenantRow {
     storage_bytes: i64,
     quota_compute: i64,
     used_compute: i64,
+    warehouse_id: Option<String>,
+    provisioning_status: String,
 }
 
 impl From<TenantRow> for Tenant {
@@ -488,6 +504,8 @@ impl From<TenantRow> for Tenant {
             storage_bytes: row.storage_bytes,
             quota_compute: row.quota_compute,
             used_compute: row.used_compute,
+            warehouse_id: row.warehouse_id,
+            provisioning_status: row.provisioning_status,
         }
     }
 }
@@ -496,6 +514,7 @@ impl From<TenantRow> for Tenant {
 /// count.
 const TENANT_SELECT: &str = "SELECT t.id, t.name, t.slug, t.plan, t.residency, \
      t.storage_bytes, t.quota_compute, t.used_compute, \
+     t.warehouse_id, t.provisioning_status, \
      (SELECT COUNT(*) FROM app_user_tenant ut WHERE ut.tenant_id = t.id) AS users \
      FROM tenant t";
 
@@ -838,6 +857,8 @@ mod tests {
             storage_bytes: 1,
             quota_compute: 2,
             used_compute: 3,
+            warehouse_id: None,
+            provisioning_status: "not_applicable".to_owned(),
         };
         let value = serde_json::to_value(&tenant).unwrap();
         for key in [
