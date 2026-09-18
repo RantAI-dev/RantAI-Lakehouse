@@ -521,6 +521,42 @@ pub async fn oidc_start(
     Ok(response)
 }
 
+/// `GET /api/auth/providers` response body: just enough for a login page
+/// to decide whether to render an SSO button and what to label it, never
+/// the configuration values themselves (no issuer URL, no client id).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProvidersResponse {
+    oidc: bool,
+    provider_name: Option<String>,
+}
+
+/// `GET /api/auth/providers` — replaces the build-time
+/// `NEXT_PUBLIC_SSO_ENABLED` flag with a runtime read of whether OIDC is
+/// actually configured on THIS API process, so a login page's SSO button
+/// can never drift from the backend's real state (a build-time flag could
+/// say "enabled" on a deployment where `OIDC_ISSUER`/`OIDC_CLIENT_ID` were
+/// never set, or vice versa). `Policy::Public` (see
+/// `crate::policy::POLICY_TABLE`'s entry for this route): this reveals
+/// only a boolean and a label an operator already chose to be
+/// public-facing (`OIDC_PROVIDER_NAME`), never a secret or the issuer/
+/// client id `AuthState::oidc`/`Config` also carry — and the login page
+/// needs this before any session exists, same as `/api/auth/login` and
+/// the `oidc_start`/`oidc_callback` routes above.
+///
+/// # Errors
+///
+/// Cannot fail on its own — every field is read from already-resolved,
+/// in-memory state (`AppState::auth`, `Config::oidc_provider_name`), never
+/// a database or network call.
+pub async fn providers(State(state): State<AppState>) -> ApiResult<ApiJson<ProvidersResponse>> {
+    let oidc = state.auth.as_ref().and_then(|a| a.oidc.as_ref());
+    Ok(ApiJson(ProvidersResponse {
+        oidc: oidc.is_some(),
+        provider_name: oidc.map(|_| state.config.oidc_provider_name.clone()),
+    }))
+}
+
 /// `GET /api/auth/oidc/callback?code=&state=` query parameters. Both
 /// `Option` — a missing one is a 401 (see [`oidc_callback`]), not a 400:
 /// an `IdP` calling back with neither is indistinguishable from a bare
@@ -1239,5 +1275,39 @@ mod tests {
             "expected the flow cookie to be cleared even on success: {set_cookies:?}"
         );
         Ok(())
+    }
+
+    // ── Task A6: `GET /api/auth/providers` — Step 1 (failing test, written
+    // before `providers` exists at all). ────────────────────────────────────
+
+    /// `GET path` against a fresh router built from `state`, decoded as a
+    /// JSON body. The plan's Step 1 snippet names a `get_json` helper that
+    /// does not exist anywhere in this tree (grepped: no hit) — this is a
+    /// local equivalent built from the exact `to_bytes` +
+    /// `serde_json::from_slice::<Value>` idiom
+    /// `routes::knowledge::tests::every_database_backed_route_returns_503_without_a_pool`
+    /// already uses, rather than inventing a second body-reading pattern.
+    async fn get_json(state: &AppState, path: &str) -> serde_json::Value {
+        let app = crate::routes::router(state.clone());
+        let response = app
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn providers_reports_oidc_configured_true_only_when_auth_state_has_it() {
+        let with_oidc = state_with_oidc_flow_config();
+        let body = get_json(&with_oidc, "/api/auth/providers").await;
+        assert_eq!(body["oidc"], serde_json::json!(true));
+
+        let without_oidc = AppState::new(Config::from_map(&HashMap::new()).unwrap());
+        let body = get_json(&without_oidc, "/api/auth/providers").await;
+        assert_eq!(body["oidc"], serde_json::json!(false));
     }
 }

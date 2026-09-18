@@ -126,9 +126,10 @@ pub enum Policy {
 /// this table never needs to know about path-parameter values.
 #[rustfmt::skip]
 pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
-    // ── Public: the ONLY six routes in the whole service. (Was "four" —
-    // corrected here, in the same commit that adds the sixth, since Task
-    // A4's `/api/auth/oidc/start` had already made the old count stale.) ──
+    // ── Public: the ONLY seven routes in the whole service. (Was "six" —
+    // corrected here, in the same commit that adds the seventh, since Task
+    // A5's `/api/auth/oidc/callback` had already made the old count
+    // stale.) ────────────────────────────────────────────────────────────
     ("GET",  "/health",                          Policy::Public),
     ("POST", "/api/embed/data",                   Policy::Public),
     ("GET",  "/api/public/dashboard/{token}",     Policy::Public),
@@ -144,6 +145,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // the handler itself; this route grants nothing on its own, same as
     // `/api/auth/oidc/start` above.
     ("GET",  "/api/auth/oidc/callback",           Policy::Public),
+    // WS8 plan Task A6: unauthenticated by necessity — the login page
+    // calls this before any session exists to decide whether to render an
+    // SSO button. It exposes only a boolean and an operator-chosen label
+    // (`OIDC_PROVIDER_NAME`), never a secret or the issuer/client id
+    // `AuthState::oidc`/`Config` also carry — see `auth::providers`'s own
+    // doc comment.
+    ("GET",  "/api/auth/providers",               Policy::Public),
 
     // ── Auth domain (this task) ──────────────────────────────────────────
     ("POST", "/api/auth/logout",                  Policy::RequiresAuth),
@@ -565,12 +573,19 @@ mod tests {
     }
 
     #[test]
-    fn exactly_four_public_entries_exist() {
+    fn exactly_seven_public_entries_exist() {
+        // Pre-existing drift found while landing Task A6: this assertion
+        // was still pinned at 4 even though Tasks A4/A5 had already grown
+        // POLICY_TABLE's `Policy::Public` block to 6 entries (this test was
+        // failing — `left: 6, right: 4` — before this commit's `/api/auth/
+        // providers` addition made it `left: 7`). Fixed here rather than
+        // left broken, per AGENTS.md rule 2 ("never weaken a test... if a
+        // test is wrong, fix it and say why").
         let public_count = POLICY_TABLE
             .iter()
             .filter(|(_, _, policy)| *policy == Policy::Public)
             .count();
-        assert_eq!(public_count, 4);
+        assert_eq!(public_count, 7);
     }
 
     #[test]
