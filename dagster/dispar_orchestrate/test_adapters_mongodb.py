@@ -98,3 +98,33 @@ def test_build_source_never_interpolates_the_username_or_password_into_a_uri_str
     # Passed through UNCHANGED as a keyword argument -- proof there was
     # no string-building step for it to be mangled or escape out of.
     assert captured["password"] == "p@ss/word:with?special&chars"
+
+def test_reading_documents_runs_inside_checking_resolver_so_a_rebound_host_is_refused():
+    """The seed-host check happens before `MongoClient` exists; pymongo then
+    resolves those names ITSELF, lazily, when the first document is pulled.
+    An answer that is safe during the pre-check and internal during the read
+    must still be refused -- that second lookup is the rebinding window, and
+    only `checking_resolver`, installed for the whole iteration, closes it."""
+    import functools
+    import socket
+
+    from dispar_orchestrate import ssrf_guard
+    from dispar_orchestrate.adapters import mongodb
+
+    def _internal(host, port, *args, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", port))]
+
+    class _ResolvingCollection:
+        """Stands in for pymongo's own lazy connect: the driver resolves the
+        host when the first document is pulled, not when the client is made."""
+
+        def find(self, _query):
+            socket.getaddrinfo("mongo.invalid", 27017)
+            yield {"never": "reached"}
+
+    rows = mongodb._collection_rows(
+        _ResolvingCollection(),
+        checking_resolver=functools.partial(ssrf_guard.checking_resolver, getaddrinfo=_internal),
+    )
+    with pytest.raises(SsrfBlocked, match="private/internal/multicast"):
+        list(rows)

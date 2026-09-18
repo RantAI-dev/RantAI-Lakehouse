@@ -5,6 +5,12 @@ directly, since dlt ships no mongodb source in the installed package
 EVERY explicit seed host is resolve_checked before MongoClient is
 constructed -- see ssrf_guard_mongo.py's module doc comment for why
 replica-set discovery is refused outright rather than checked live.
+
+The up-front check is not the whole guard: `MongoClient` resolves the
+host names itself, lazily, when documents are first pulled. The read
+therefore runs inside `ssrf_guard.checking_resolver` (see
+`_collection_rows`), so every address the driver actually dials is
+validated at connect time, not merely the names checked beforehand.
 """
 from __future__ import annotations
 
@@ -23,8 +29,23 @@ class AdapterBuildResult:
     resolved: list[ssrf_guard.ResolvedAddress]
 
 
-def _collection_rows(collection) -> Iterator[dict]:
-    yield from collection.find({})
+def _collection_rows(collection, *, checking_resolver=ssrf_guard.checking_resolver) -> Iterator[dict]:
+    """Yield a collection's documents with `checking_resolver` installed for
+    the WHOLE iteration.
+
+    `resolve_all_seed_hosts` checks the seed hosts, but `MongoClient` is
+    then handed those hosts BY NAME and does its own resolution — and, being
+    lazy, it does it here, when the first document is pulled, not when the
+    client was constructed. Checking a name and then letting the driver
+    resolve it again is precisely the check-then-connect gap
+    `ssrf_guard`'s module doc calls out: the second lookup can answer
+    differently (DNS rebinding), and every reconnect during a long read does
+    it again. Wrapping the iteration means every address `pymongo` actually
+    dials is validated at connect time, for as long as this source is being
+    read.
+    """
+    with checking_resolver():
+        yield from collection.find({})
 
 
 def build_source(
