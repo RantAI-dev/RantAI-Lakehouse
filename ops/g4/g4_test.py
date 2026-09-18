@@ -62,6 +62,11 @@ CH_OAUTH_SERVER_URI = os.environ.get("CH_OAUTH_SERVER_URI", "")
 # gate script is a standalone entrypoint), matching this file's existing
 # precedent of duplicating ch_query/_wait_for from the same source.
 API_URL = os.environ.get("API_URL", "http://lakehouse-api:8089")
+# WS8 plan Task H2: oidc-mock's /authorize + /token endpoints that
+# step_oidc_authorization_code_round_trip drives lakehouse-api's
+# /api/auth/oidc/{start,callback} against. Mirrors this file's existing
+# `API_URL` env-var-with-default pattern, not a new style.
+OIDC_MOCK_URL = os.environ.get("OIDC_MOCK_URL", "http://oidc-mock:8090")
 DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://dagster-webserver:3000/graphql")
 AUTH_EMAIL = os.environ.get("AUTH_BOOTSTRAP_EMAIL", "admin@example.invalid")
 AUTH_PASSWORD = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "changeme")
@@ -489,6 +494,80 @@ def step_wal_breach_produces_a_silenceable_alert_instance() -> None:
         print(f"[g4] dropped slot {WAL_BREACH_SLOT_NAME!r} — WAL is no longer pinned")
 
 
+def step_oidc_authorization_code_round_trip() -> None:
+    """WS8 plan Task H2 (grand plan §10 acceptance): drive a full
+    authorization-code + PKCE login through lakehouse-api's real
+    /api/auth/oidc/{start,callback} routes against oidc-mock's Task A1
+    /authorize + authorization_code /token addition — not a mocked HTTP
+    layer, a real three-hop redirect chain over `requests.Session` so
+    cookies persist exactly as a browser's would. A separate `Session`
+    from this file's module-level `API` (used by step_login and every
+    alerts step above): that one already carries a bootstrap-admin
+    `lh_session` cookie, and reusing it here would make it impossible to
+    tell whether `/api/auth/me` below is reporting the OIDC-minted
+    session's permissions or the pre-existing admin one's.
+    """
+    session = requests.Session()
+
+    # Hop 1: lakehouse-api issues the PKCE challenge/state/nonce and
+    # redirects to oidc-mock's /authorize. `allow_redirects=False` at
+    # every hop so this test controls and asserts on each redirect
+    # individually, rather than following the whole chain blind and only
+    # checking the final response.
+    start = session.get(f"{API_URL}/api/auth/oidc/start", allow_redirects=False, timeout=10)
+    if start.status_code != 302:
+        raise G4Failure(f"/api/auth/oidc/start did not redirect: HTTP {start.status_code}")
+    authorize_url = start.headers.get("Location", "")
+    if not authorize_url.startswith(f"{OIDC_MOCK_URL}/authorize"):
+        raise G4Failure(f"/start redirected somewhere other than oidc-mock's /authorize: {authorize_url}")
+    if "code_challenge_method=S256" not in authorize_url:
+        raise G4Failure("authorize URL is missing code_challenge_method=S256")
+    flow_cookie = session.cookies.get("lh_oidc_flow")
+    if not flow_cookie:
+        raise G4Failure("lh_oidc_flow cookie was not set by /start")
+
+    # Hop 2: oidc-mock's Task A1 /authorize accepts a login_hint naming one
+    # of its HUMAN_TEST_PRINCIPALS and redirects back to the fixed
+    # redirect_uri (never a caller-supplied one — oidc-mock echoes only the
+    # redirect_uri /start itself sent) with ?code=&state=.
+    authorize = session.post(
+        authorize_url,
+        data={"login_hint": "test-analyst"},
+        allow_redirects=False,
+        timeout=10,
+    )
+    if authorize.status_code != 302:
+        raise G4Failure(f"oidc-mock /authorize did not redirect: HTTP {authorize.status_code}")
+    callback_url = authorize.headers.get("Location", "")
+    if "/api/auth/oidc/callback" not in callback_url:
+        raise G4Failure(f"oidc-mock redirected somewhere other than the callback: {callback_url}")
+
+    # Hop 3: lakehouse-api's callback exchanges the code (PKCE verifier
+    # from the flow cookie, never re-sent by the client), verifies the id
+    # token (signature/iss/aud/exp/nbf/nonce via
+    # OidcAuthenticator::authenticate_with_nonce, Task A3), and mints a
+    # real session.
+    callback = session.get(callback_url, allow_redirects=False, timeout=10)
+    if callback.status_code != 302:
+        raise G4Failure(f"/api/auth/oidc/callback did not redirect: HTTP {callback.status_code}")
+    if "lh_session" not in session.cookies:
+        raise G4Failure("no lh_session cookie was set after the OIDC callback")
+    if "lh_oidc_flow" in session.cookies:
+        raise G4Failure("lh_oidc_flow cookie was not cleared after the callback consumed it")
+
+    # Prove the session is real and carries the role OIDC_ROLE_MAP mapped
+    # test-analyst's "lakehouse-analysts" group to (g4-test-runner sets
+    # OIDC_ROLE_MAP=lakehouse-analysts=Analyst — see the compose change
+    # below), not merely that a cookie exists.
+    me = session.get(f"{API_URL}/api/auth/me", timeout=10)
+    if me.status_code != 200:
+        raise G4Failure(f"GET /api/auth/me failed after OIDC login: HTTP {me.status_code}")
+    permissions = me.json().get("permissions", [])
+    if "query:read" not in permissions:
+        raise G4Failure(f"OIDC-mapped Analyst role did not grant query:read: permissions={permissions}")
+    print("[g4] OIDC authorization-code + PKCE round trip: session minted, Analyst role's query:read confirmed")
+
+
 def main() -> int:
     try:
         step_wait_for_services()
@@ -502,6 +581,7 @@ def main() -> int:
         step_row_counts_use_a_where_predicate()
         step_wal_breach_produces_a_silenceable_alert_instance()
         step_verify_slot_cleanup_on_connector_delete()
+        step_oidc_authorization_code_round_trip()
     except G4Failure as exc:
         print(f"[g4] FAILED: {exc}", file=sys.stderr)
         return 1

@@ -2266,6 +2266,15 @@ services:
         condition: service_started
       dagster-webserver:
         condition: service_healthy
+      # WS8 plan Task H2: step_oidc_authorization_code_round_trip drives
+      # oidc-mock's /authorize + /token directly. Unlike the plan text's
+      # claim, oidc-mock DOES have its own healthcheck (this file's
+      # `oidc-mock` service block, `.well-known/openid-configuration`
+      # polled every 5s) — `lakekeeper`'s own `depends_on: oidc-mock:
+      # condition: service_healthy` above is the precedent this follows,
+      # in preference to the plan's `service_started`.
+      oidc-mock:
+        condition: service_healthy
     environment:
       DEPROVISION_SCRIPT: /opt/deprovision_connector.sh
       CH_URL: http://clickhouse:8123
@@ -2298,6 +2307,31 @@ services:
       # g4_test.py's step_login authenticates as a human bootstrap admin,
       # not a service principal.
       ALERTS_RUN_TOKEN: ${ALERTS_RUN_TOKEN:-}
+      # WS8 plan Task H2 -- step_oidc_authorization_code_round_trip talks
+      # to oidc-mock directly to assert lakehouse-api's /start redirected
+      # it there. Matches g4_test.py's own default, set explicitly per
+      # this file's existing convention (every other constant above is
+      # spelled out here too, not left to its Python default).
+      OIDC_MOCK_URL: http://oidc-mock:8090
+      # NOT set here, and deliberately not fabricated as if they were:
+      # `OIDC_AUTHORIZE_URL`/`OIDC_TOKEN_URL`/`OIDC_REDIRECT_URI` (needed
+      # by `lakehouse-api`'s own `Config` for `/api/auth/oidc/start` and
+      # `/callback` to do anything but 503) and `OIDC_ROLE_MAP` (needed
+      # for test-analyst's `lakehouse-analysts` group to map to `Analyst`)
+      # are `lakehouse-api`'s OWN service config, read by that container's
+      # process env only -- setting a key in THIS service's `environment:`
+      # block has no effect on a sibling container's env, Compose has no
+      # cross-service environment inheritance. This task's file-ownership
+      # boundary (WS8 Phase H, Task H2) covers only this service block,
+      # not `lakehouse-api`'s (`docker-compose.yml:80-`); of the four,
+      # only `OIDC_ROLE_MAP` already has a matching `${OIDC_ROLE_MAP:-}`
+      # reference on that block (`:208`), so setting it in the shell/.env
+      # already reaches `lakehouse-api` without editing this file further
+      # -- `OIDC_AUTHORIZE_URL`/`OIDC_TOKEN_URL`/`OIDC_REDIRECT_URI` have
+      # NO reference there at all yet and must be added to
+      # `lakehouse-api`'s `environment:` block before this gate's new step
+      # can pass against a real stack. Disclosed here rather than papered
+      # over with a same-named var on the wrong service.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null && pip install -q requests && python g4_test.py"
