@@ -9,6 +9,7 @@ import { CopilotConfirmWriteDialog } from "./confirm-write-dialog";
 import { apiFetch } from "@/services/http";
 
 export type Mode = "ask" | "build";
+export type DockPosition = "bottom" | "right";
 export type Msg = {
   role: "user" | "assistant";
   content: string;
@@ -24,9 +25,31 @@ export type SessionMeta = { id: string; title: string; mode: string; updatedAt?:
  * Ask/Build, kirim, tool loop) DAN riwayat (simpan/muat sesi dari
  * console.chat_session). Satu instance → semua tampilan konsisten.
  */
+/** A copy of `messages` with one tool step swapped out; `null` if it no longer exists. */
+function replaceToolStep(
+  messages: Msg[],
+  messageIndex: number,
+  stepIndex: number,
+  change: (msg: Msg, step: ToolStep) => { step: ToolStep; chartCreated: boolean },
+): Msg[] | null {
+  const msg = messages[messageIndex];
+  const step = msg?.tools?.[stepIndex];
+  if (!msg?.tools || !step) return null;
+  const next = change(msg, step);
+  const tools = msg.tools.slice();
+  tools[stepIndex] = next.step;
+  const copy = messages.slice();
+  copy[messageIndex] = { ...msg, tools, chartCreated: next.chartCreated };
+  return copy;
+}
+
 function useCopilotState() {
   const [mode, setMode] = React.useState<Mode>("ask");
   const [messages, setMessages] = React.useState<Msg[]>([]);
+  // Confirm/Cancel resolve after an `await`; they read the latest list from
+  // here so the copy they persist is the same one they render.
+  const messagesRef = React.useRef(messages);
+  messagesRef.current = messages;
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
   const [sessionId, setSessionId] = React.useState<string | null>(null);
@@ -39,6 +62,49 @@ function useCopilotState() {
   const pageContextRef = React.useRef(pageContext);
   pageContextRef.current = pageContext;
   const setPageContext = React.useCallback((ctx: PageContext | null) => setPageOverride(ctx), []);
+
+  const [dockPosition, setDockPositionState] = React.useState<DockPosition>("bottom");
+  const [expanded, setExpandedState] = React.useState(false);
+  const [sidebarWidth, setSidebarWidthState] = React.useState(420);
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const savedPos = window.localStorage.getItem("copilot-dock-pos");
+      if (savedPos === "right" || savedPos === "bottom") setDockPositionState(savedPos);
+
+      const savedExp = window.localStorage.getItem("copilot-dock-exp");
+      if (savedExp === "1") setExpandedState(true);
+      else if (savedExp === "0") setExpandedState(false);
+
+      const savedWidth = Number.parseInt(window.localStorage.getItem("copilot-sidebar-width") || "420", 10);
+      if (!Number.isNaN(savedWidth) && savedWidth >= 300 && savedWidth <= 900) {
+        setSidebarWidthState(savedWidth);
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  const setDockPosition = React.useCallback((pos: DockPosition) => {
+    setDockPositionState(pos);
+    try { window.localStorage.setItem("copilot-dock-pos", pos); } catch { /* ignore */ }
+  }, []);
+
+  const setExpanded = React.useCallback((exp: boolean | ((prev: boolean) => boolean)) => {
+    setExpandedState((prev) => {
+      const next = typeof exp === "function" ? exp(prev) : exp;
+      try { window.localStorage.setItem("copilot-dock-exp", next ? "1" : "0"); } catch { /* ignore */ }
+      return next;
+    });
+  }, []);
+
+  const setSidebarWidth = React.useCallback((width: number | ((prev: number) => number)) => {
+    setSidebarWidthState((prev) => {
+      const next = typeof width === "function" ? width(prev) : width;
+      const clamped = Math.max(300, Math.min(850, next));
+      try { window.localStorage.setItem("copilot-sidebar-width", String(clamped)); } catch { /* ignore */ }
+      return clamped;
+    });
+  }, []);
 
   const toggleCap = React.useCallback((key: string) => {
     setEnabledCaps((prev) => {
@@ -108,14 +174,31 @@ function useCopilotState() {
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json?.hint ?? json?.detail ?? json?.error ?? "Copilot gagal");
+      const isChartActuallyCreated = Boolean(
+        json.chartCreated &&
+          json.toolTrace?.some(
+            (t: { tool: string; ok: boolean; result?: { created?: boolean } }) =>
+              t.tool === "create_chart" && t.ok && Boolean(t.result?.created),
+          ),
+      );
       const full: Msg[] = [
         ...next,
         {
-          role: "assistant", content: json.answer || "(no answer)",
-          tools: json.toolTrace ?? [], buildRunId: json.buildRunId, chartCreated: json.chartCreated,
+          role: "assistant",
+          content: json.answer || "(no answer)",
+          tools: json.toolTrace ?? [],
+          buildRunId: json.buildRunId,
+          chartCreated: isChartActuallyCreated,
         },
       ];
       setMessages(full);
+      if (isChartActuallyCreated) {
+        try {
+          window.dispatchEvent(new Event("dashboards:changed"));
+        } catch {
+          /* ignore */
+        }
+      }
       void persist(full, mode, sessionId);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -156,52 +239,77 @@ function useCopilotState() {
   const confirmTool = React.useCallback(async (messageIndex: number, stepIndex: number) => {
     const step = messages[messageIndex]?.tools?.[stepIndex];
     if (!step) return;
-    const pending = (step.result ?? {}) as { tool?: string; args?: Record<string, unknown> };
-    const toolName = pending.tool ?? step.tool;
+    const pending = step.result as { tool?: string; args?: Record<string, unknown> } | undefined;
+    const toolName = pending?.tool ?? step.tool;
     const key = `${messageIndex}:${stepIndex}`;
     setConfirmingKey(key);
     try {
+      const rawArgs = { ...((pending?.args ?? step.args) as Record<string, unknown>) };
+      if (!rawArgs.title && (rawArgs.caption || rawArgs.name || rawArgs.text)) {
+        rawArgs.title = String(rawArgs.caption || rawArgs.name || rawArgs.text);
+      }
       const res = await apiFetch("/api/ai/tool", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           tool: toolName,
-          args: { ...(pending.args ?? {}), confirmed: true },
+          args: { ...rawArgs, confirmed: true },
           mode,
           sessionId: sessionId ?? undefined,
         }),
       });
       const json = await res.json();
-      setMessages((prev) => {
-        const copy = prev.slice();
-        const msg = copy[messageIndex];
-        if (!msg?.tools?.[stepIndex]) return prev;
-        const tools = msg.tools.slice();
-        tools[stepIndex] = {
-          ...tools[stepIndex],
-          ok: res.ok && json.outcome !== "failed" && json.outcome !== "refused",
-          result: json.result ?? json,
-        };
-        copy[messageIndex] = { ...msg, tools };
-        return copy;
-      });
+      const toolOk = res.ok && json.outcome !== "failed" && json.outcome !== "refused";
+      const created = Boolean(toolOk && (json.result?.created || json.created || toolName === "create_chart"));
+      if (!toolOk || json.result?.error || json.error) {
+        setError(String(json.result?.error || json.error || "Failed to execute tool"));
+      }
+      const updated = replaceToolStep(messagesRef.current, messageIndex, stepIndex, (msg, step) => ({
+        step: { ...step, ok: toolOk, result: json.result ?? json },
+        chartCreated: Boolean(msg.chartCreated || created),
+      }));
+      if (updated) {
+        setMessages(updated);
+        void persist(updated, mode, sessionId);
+      }
+      if (created) {
+        try { window.dispatchEvent(new Event("dashboards:changed")); } catch { /* ignore */ }
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setConfirmingKey((k) => (k === key ? null : k));
     }
-  }, [messages, mode, sessionId]);
+  }, [messages, mode, sessionId, persist]);
 
   const cancelTool = React.useCallback((messageIndex: number, stepIndex: number) => {
-    setMessages((prev) => {
-      const copy = prev.slice();
-      const msg = copy[messageIndex];
-      if (!msg?.tools?.[stepIndex]) return prev;
-      const tools = msg.tools.slice();
-      tools[stepIndex] = { ...tools[stepIndex], ok: false, result: { cancelled: true } };
-      copy[messageIndex] = { ...msg, tools };
-      return copy;
-    });
-  }, []);
+    const updated = replaceToolStep(messagesRef.current, messageIndex, stepIndex, (_msg, step) => ({
+      step: { ...step, ok: false, result: { cancelled: true } },
+      chartCreated: false,
+    }));
+    if (updated) {
+      setMessages(updated);
+      void persist(updated, mode, sessionId);
+    }
+  }, [mode, sessionId, persist]);
+
+  /**
+   * Marks a pending tool step done without re-running it — the draft was
+   * saved another way (the chart builder). Persisted like Confirm/Cancel.
+   */
+  const completeToolStep = React.useCallback(
+    (messageIndex: number, stepIndex: number, result: Record<string, unknown>) => {
+      const updated = replaceToolStep(messagesRef.current, messageIndex, stepIndex, (_msg, step) => ({
+        step: { ...step, ok: true, result },
+        chartCreated: true,
+      }));
+      if (updated) {
+        setMessages(updated);
+        void persist(updated, mode, sessionId);
+      }
+      try { window.dispatchEvent(new Event("dashboards:changed")); } catch { /* ignore */ }
+    },
+    [mode, sessionId, persist],
+  );
 
   const newChat = React.useCallback(() => {
     setMessages([]); setSessionId(null); setError(null);
@@ -232,7 +340,9 @@ function useCopilotState() {
     enabledCaps, toggleCap, pageContext, setPageContext,
     send, newChat, loadSession, removeSession, refreshSessions,
     writeCaps, pendingSend, requestSend, confirmSend, cancelSend,
-    confirmTool, cancelTool, confirmingKey,
+    confirmTool, cancelTool, completeToolStep, confirmingKey,
+    dockPosition, setDockPosition, expanded, setExpanded,
+    sidebarWidth, setSidebarWidth,
   };
 }
 

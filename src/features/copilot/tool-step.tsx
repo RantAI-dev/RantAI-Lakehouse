@@ -3,7 +3,6 @@
 import * as React from "react";
 import Link from "next/link";
 import { cn } from "@/lib/utils";
-import { Button } from "@/components/ui/button";
 
 export type ToolStep = { tool: string; args: unknown; ok: boolean; result: unknown };
 
@@ -25,7 +24,7 @@ const TOOL_LABEL: Record<string, string> = {
   suggest_dashboard: "Design dashboard",
 };
 
-function asObj(v: unknown): Record<string, unknown> {
+export function asObj(v: unknown): Record<string, unknown> {
   return v && typeof v === "object" ? (v as Record<string, unknown>) : {};
 }
 
@@ -105,46 +104,34 @@ function QualityChips({ summary }: { summary: { verdict: string; n: string }[] }
   );
 }
 
-function StepBody({
-  step, onConfirm, onCancel, confirming,
-}: {
-  step: ToolStep;
-  onConfirm?: () => void;
-  onCancel?: () => void;
-  confirming?: boolean;
-}) {
+function StepBody({ step }: { step: ToolStep }) {
   const res = asObj(step.result);
 
+  // Confirm/Cancel live on the message's confirmation card (`chat-messages`),
+  // which also recovers a title the model left empty; a second pair of
+  // buttons here only asked the same question twice.
   if (res.needs_confirmation) {
     return (
-      <div className="mt-1 space-y-2 text-[11px]">
-        <p className="text-foreground">{String(res.summary ?? "Konfirmasi tindakan ini?")}</p>
-        <div className="flex gap-2">
-          <Button size="sm" onClick={onConfirm} disabled={confirming}>
-            {confirming ? "Menjalankan…" : "Confirm"}
-          </Button>
-          <Button size="sm" variant="outline" onClick={onCancel} disabled={confirming}>
-            Cancel
-          </Button>
-        </div>
-      </div>
+      <p className="mt-1 text-[11px] text-muted-foreground">
+        Waiting for your confirmation below.
+      </p>
     );
   }
 
   if (res.cancelled) {
-    return <p className="mt-1 text-[11px] text-muted-foreground">Dibatalkan.</p>;
+    return <p className="mt-1 text-[11px] text-muted-foreground">Cancelled.</p>;
   }
 
   if (res.needs_approval) {
     const approvalId = String(res.approval_id ?? "");
     return (
       <div className="mt-1 space-y-2 rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-[11px]">
-        <p className="text-foreground">{String(res.summary ?? "Tindakan ini butuh persetujuan.")}</p>
+        <p className="text-foreground">{String(res.summary ?? "This action requires approval.")}</p>
         <Link
           href={approvalId ? `/agents/approvals?id=${encodeURIComponent(approvalId)}` : "/agents/approvals"}
           className="inline-flex items-center gap-1 font-medium text-amber-700 underline underline-offset-2 dark:text-amber-400"
         >
-          Lihat di Approvals →
+          View in Approvals →
         </Link>
       </div>
     );
@@ -234,21 +221,12 @@ function StepBody({
   );
 }
 
-export function ToolStepCard({
-  step, onConfirm, onCancel, confirming,
-}: {
-  step: ToolStep;
-  /** Called when the user hits Confirm on a `needs_confirmation` result. */
-  onConfirm?: () => void;
-  /** Called when the user hits Cancel on a `needs_confirmation` result. */
-  onCancel?: () => void;
-  /** True while a Confirm re-send to `/api/ai/tool` is in flight. */
-  confirming?: boolean;
-}) {
+export function ToolStepCard({ step }: { step: ToolStep }) {
   const res = asObj(step.result);
   const needsApproval = Boolean(res.needs_approval);
+  const hasError = !step.ok || "error" in res;
   const [open, setOpen] = React.useState(
-    step.tool === "run_sql" || Boolean(res.needs_confirmation) || needsApproval,
+    step.tool === "run_sql" || needsApproval || hasError,
   );
   const label = TOOL_LABEL[step.tool] ?? step.tool;
   const pending = Boolean(res.needs_confirmation) || needsApproval;
@@ -268,18 +246,18 @@ export function ToolStepCard({
         <span className="font-medium">{label}</span>
         {needsApproval ? (
           <span className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
-            menunggu approval
+            pending approval
           </span>
         ) : res.needs_confirmation ? (
           <span className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400">
-            perlu konfirmasi
+            needs confirmation
           </span>
         ) : null}
         <span className="ml-auto font-mono text-[10px] text-muted-foreground">{open ? "−" : "+"}</span>
       </button>
       {open ? (
         <div className="border-t border-border px-2.5 pb-2 pt-1">
-          <StepBody step={step} onConfirm={onConfirm} onCancel={onCancel} confirming={confirming} />
+          <StepBody step={step} />
         </div>
       ) : null}
     </div>

@@ -1,11 +1,26 @@
 "use client";
 
 import * as React from "react";
+import { useSearchParams } from "next/navigation";
 import { Sparkles } from "lucide-react";
 import { useCopilot } from "./use-copilot";
 import { ChatMessages } from "./chat-messages";
 import { ChatComposer } from "./chat-composer";
 import { CopilotHistoryMenu } from "./history-menu";
+
+function SessionUrlSync() {
+  const searchParams = useSearchParams();
+  const { sessionId: activeId, loadSession } = useCopilot();
+  const sessionId = searchParams.get("id") ?? searchParams.get("session");
+
+  React.useEffect(() => {
+    if (sessionId && sessionId !== activeId) {
+      void loadSession(sessionId);
+    }
+  }, [sessionId, activeId, loadSession]);
+
+  return null;
+}
 
 /**
  * Halaman AI Copilot — tampilan chat ala RantAI-Agents: avatar per pesan,
@@ -20,9 +35,15 @@ import { CopilotHistoryMenu } from "./history-menu";
 export function CopilotPage() {
   const c = useCopilot();
 
+  // Viewport minus the 4rem navbar and `AppFrame`'s vertical padding, so the
+  // message list scrolls on its own and the composer stays on the bottom edge.
   return (
-    <div className="flex flex-col gap-3">
-      {/* Riwayat percakapan — hanya tampil bila sudah ada sesi tersimpan. */}
+    <div className="flex h-[calc(100svh-6rem)] flex-col gap-3 sm:h-[calc(100svh-6.5rem)] lg:h-[calc(100svh-7rem)]">
+      <React.Suspense fallback={null}>
+        <SessionUrlSync />
+      </React.Suspense>
+
+      {/* Riwayat percakapan — menampilkan percakapan aktif, last update, dan link ke halaman riwayat */}
       <CopilotHistoryMenu
         sessions={c.sessions}
         activeId={c.sessionId}
@@ -30,8 +51,8 @@ export function CopilotPage() {
         onNew={() => c.newChat()}
         onDelete={(id) => void c.removeSession(id)}
       />
-      <div className="mx-auto flex w-full max-w-3xl flex-col">
-        <div className="min-h-[56vh] overflow-y-auto pr-0.5">
+      <div className="mx-auto flex min-h-0 w-full max-w-3xl flex-1 flex-col">
+        <div className="min-h-0 flex-1 overflow-y-auto pr-0.5">
           {c.messages.length === 0 ? (
             <div className="flex flex-col items-center justify-center px-4 py-16 text-center">
               <div className="mb-4 grid size-12 place-items-center rounded-2xl border border-violet-500/20 bg-gradient-to-br from-violet-500/15 to-purple-600/15 text-violet-600 dark:text-violet-400">
@@ -55,12 +76,12 @@ export function CopilotPage() {
           ) : (
             <ChatMessages
               messages={c.messages} busy={c.busy} error={c.error}
-              onConfirmTool={c.confirmTool} onCancelTool={c.cancelTool} confirmingKey={c.confirmingKey}
+              onConfirmTool={c.confirmTool} onCancelTool={c.cancelTool} onCompleteTool={c.completeToolStep} confirmingKey={c.confirmingKey}
             />
           )}
         </div>
 
-        <div className="pt-3">
+        <div className="shrink-0 pt-3">
           <ChatComposer
             mode={c.mode} setMode={c.setMode} onSend={c.requestSend} busy={c.busy}
             enabledCaps={c.enabledCaps} toggleCap={c.toggleCap}

@@ -1,8 +1,10 @@
 "use client"
 
+import * as React from "react"
 import Link from "next/link"
-import { Search, Bell, LogOut, KeyRound, CircleUserRound } from "lucide-react"
+import { Search, Bell, LogOut, KeyRound, CircleUserRound, Sparkles, Sun, Moon, Monitor } from "lucide-react"
 import { usePathname } from "next/navigation"
+import { useTheme } from "next-themes"
 import { SidebarTrigger } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -13,12 +15,17 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
+  DropdownMenuSub,
+  DropdownMenuSubTrigger,
+  DropdownMenuSubContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
 } from "@/components/ui/dropdown-menu"
-import { ThemeToggle } from "@/components/theme-toggle"
 import { cn } from "@/lib/utils"
 import { pageTitleFor } from "./nav-config"
 import { openCommandPalette } from "@/components/command-palette"
 import { useAuth } from "@/features/auth/auth-provider"
+import { useCopilot } from "@/features/copilot/use-copilot"
 
 /**
  * Sticky top navbar rendered on every page.
@@ -29,6 +36,8 @@ export function AppNavbar() {
   const pathname = usePathname()
   const pageTitle = pageTitleFor(pathname)
   const { user, logout } = useAuth()
+  const copilot = useCopilot()
+  const isCopilotPage = pathname?.startsWith("/copilot")
 
   return (
     <header
@@ -57,7 +66,7 @@ export function AppNavbar() {
               {pageTitle}
             </p>
           </div>
-          <div className="relative ml-auto hidden w-full max-w-[360px] md:block">
+          <div className="relative ml-auto hidden w-full max-w-90 md:block">
             <Search
               className="pointer-events-none absolute left-3 top-1/2 size-4 shrink-0 -translate-y-1/2 text-muted-foreground"
               aria-hidden
@@ -78,7 +87,23 @@ export function AppNavbar() {
         </div>
 
         <div className="flex shrink-0 items-center gap-1">
-          <ThemeToggle />
+          {!isCopilotPage && (
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => copilot.setExpanded((prev) => !prev)}
+              className={cn(
+                "relative size-9 rounded-lg transition-colors",
+                copilot.expanded
+                  ? "bg-primary/10 text-primary hover:bg-primary/20 hover:text-primary"
+                  : "text-muted-foreground hover:bg-muted hover:text-foreground"
+              )}
+              aria-label={copilot.expanded ? "Collapse AI Copilot" : "Open AI Copilot"}
+              title={copilot.expanded ? "Collapse AI Copilot" : "Open AI Copilot"}
+            >
+              <Sparkles className="size-4" />
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="icon"
@@ -98,16 +123,49 @@ export function AppNavbar() {
   )
 }
 
-/** Who's signed in, with a logout affordance. Renders once `AuthProvider` has resolved a user (see `AppFrame`). */
+/** Sun until mounted, so the server render and the first client render agree. */
+function ThemeIcon({
+  mounted,
+  theme,
+  resolvedTheme,
+}: Readonly<{
+  mounted: boolean
+  theme: string | undefined
+  resolvedTheme: string | undefined
+}>) {
+  if (mounted && theme === "system") return <Monitor className="size-4" />
+  if (mounted && resolvedTheme === "dark") return <Moon className="size-4" />
+  return <Sun className="size-4" />
+}
+
+/** Who's signed in, with a logout affordance and theme selection. Renders once `AuthProvider` has resolved a user (see `AppFrame`). */
 function UserMenu({
   userName,
   userEmail,
   onLogout,
-}: {
+}: Readonly<{
   userName: string | undefined
   userEmail: string | null | undefined
   onLogout: () => void | Promise<void>
-}) {
+}>) {
+  const { theme, setTheme, resolvedTheme } = useTheme()
+  const [mounted, setMounted] = React.useState(false)
+
+  React.useEffect(() => {
+    setMounted(true)
+  }, [])
+
+  React.useEffect(() => {
+    if (!mounted) return
+    const meta = document.querySelector('meta[name="theme-color"]')
+    if (meta) {
+      meta.setAttribute(
+        "content",
+        resolvedTheme === "dark" ? "#050A30" : "#ffffff"
+      )
+    }
+  }, [mounted, resolvedTheme])
+
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
@@ -132,6 +190,28 @@ function UserMenu({
           <KeyRound />
           Change password
         </DropdownMenuItem>
+        <DropdownMenuSub>
+          <DropdownMenuSubTrigger>
+            <ThemeIcon mounted={mounted} theme={theme} resolvedTheme={resolvedTheme} />
+            <span>Theme</span>
+          </DropdownMenuSubTrigger>
+          <DropdownMenuSubContent>
+            <DropdownMenuRadioGroup value={mounted ? theme : undefined} onValueChange={(val) => setTheme(val)}>
+              <DropdownMenuRadioItem value="light">
+                <Sun className="size-4" />
+                <span>Light</span>
+              </DropdownMenuRadioItem>
+              <DropdownMenuRadioItem value="dark">
+                <Moon className="size-4" />
+                <span>Dark</span>
+              </DropdownMenuRadioItem>
+              <DropdownMenuRadioItem value="system">
+                <Monitor className="size-4" />
+                <span>System</span>
+              </DropdownMenuRadioItem>
+            </DropdownMenuRadioGroup>
+          </DropdownMenuSubContent>
+        </DropdownMenuSub>
         <DropdownMenuSeparator />
         <DropdownMenuItem variant="destructive" onClick={() => void onLogout()}>
           <LogOut />
