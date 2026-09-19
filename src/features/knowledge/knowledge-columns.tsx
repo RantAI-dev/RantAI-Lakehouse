@@ -31,6 +31,7 @@ import type {
   IndexStatus,
   KnowledgeSource,
 } from "@/services/contracts/knowledge"
+import { CLASSIFICATION_LABEL, ENTITY_STATUS_LABEL } from "@/lib/status"
 
 const INDEX_STATUS_TONE: Record<IndexStatus, "success" | "info" | "warning"> = {
   ready: "success",
@@ -43,6 +44,21 @@ const INDEX_STATUS_LABEL: Record<IndexStatus, string> = {
   indexing: "Indexing",
   degraded: "Degraded",
 }
+
+const CLASSIFICATION_OPTIONS = Object.entries(CLASSIFICATION_LABEL).map(([value, label]) => ({
+  value,
+  label,
+}))
+
+const ENTITY_STATUS_OPTIONS = Object.entries(ENTITY_STATUS_LABEL).map(([value, label]) => ({
+  value,
+  label,
+}))
+
+const INDEX_STATUS_OPTIONS = Object.entries(INDEX_STATUS_LABEL).map(([value, label]) => ({
+  value,
+  label,
+}))
 
 export function IndexStatusPill({ status }: { readonly status: IndexStatus }) {
   return (
@@ -97,6 +113,11 @@ export function getKnowledgeColumns(options: {
           </div>
         )
       },
+      enableColumnFilter: true,
+      meta: {
+        label: "Source",
+        variant: "text",
+      },
     },
     {
       accessorKey: "status",
@@ -104,6 +125,12 @@ export function getKnowledgeColumns(options: {
         <DataTableColumnHeader column={column} label="Status" />
       ),
       cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      enableColumnFilter: true,
+      meta: {
+        label: "Status",
+        variant: "select",
+        options: ENTITY_STATUS_OPTIONS,
+      },
     },
     {
       accessorKey: "indexStatus",
@@ -111,12 +138,23 @@ export function getKnowledgeColumns(options: {
         <DataTableColumnHeader column={column} label="Index" />
       ),
       cell: ({ row }) => <IndexStatusPill status={row.original.indexStatus} />,
+      enableColumnFilter: true,
+      meta: {
+        label: "Index",
+        variant: "select",
+        options: INDEX_STATUS_OPTIONS,
+      },
     },
     {
       accessorKey: "owner",
       header: ({ column }) => (
         <DataTableColumnHeader column={column} label="Owner" />
       ),
+      enableColumnFilter: true,
+      meta: {
+        label: "Owner",
+        variant: "text",
+      },
     },
     {
       accessorKey: "classification",
@@ -126,6 +164,12 @@ export function getKnowledgeColumns(options: {
       cell: ({ row }) => (
         <ClassificationBadge classification={row.original.classification} />
       ),
+      enableColumnFilter: true,
+      meta: {
+        label: "Class",
+        variant: "select",
+        options: CLASSIFICATION_OPTIONS,
+      },
     },
     {
       accessorKey: "chunkCount",
@@ -137,6 +181,11 @@ export function getKnowledgeColumns(options: {
           {formatCompactNumber(row.original.chunkCount)}
         </span>
       ),
+      enableColumnFilter: true,
+      meta: {
+        label: "Chunks",
+        variant: "number",
+      },
     },
     {
       accessorKey: "embeddingModel",
@@ -146,6 +195,11 @@ export function getKnowledgeColumns(options: {
       cell: ({ row }) => (
         <span className="font-mono text-xs">{row.original.embeddingModel}</span>
       ),
+      enableColumnFilter: true,
+      meta: {
+        label: "Embedding",
+        variant: "text",
+      },
     },
     {
       accessorKey: "freshnessLagSeconds",
@@ -155,6 +209,11 @@ export function getKnowledgeColumns(options: {
       cell: ({ row }) => (
         <FreshnessIndicator lagSeconds={row.original.freshnessLagSeconds} />
       ),
+      enableColumnFilter: true,
+      meta: {
+        label: "Freshness",
+        variant: "number",
+      },
     },
     {
       accessorKey: "dependentAgents",
@@ -164,6 +223,11 @@ export function getKnowledgeColumns(options: {
       cell: ({ row }) => (
         <span className="tabular-nums">{row.original.dependentAgents}</span>
       ),
+      enableColumnFilter: true,
+      meta: {
+        label: "Agents",
+        variant: "number",
+      },
     },
     {
       accessorKey: "lastRefresh",
@@ -171,6 +235,11 @@ export function getKnowledgeColumns(options: {
         <DataTableColumnHeader column={column} label="Last refresh" />
       ),
       cell: ({ row }) => formatRelativeTime(row.original.lastRefresh),
+      enableColumnFilter: true,
+      meta: {
+        label: "Last refresh",
+        variant: "date",
+      },
     },
     {
       id: "actions",

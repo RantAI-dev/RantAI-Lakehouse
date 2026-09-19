@@ -211,7 +211,7 @@ export function getAuditColumns({
       enableSorting: true,
       meta: {
         label: "Outcome",
-        variant: "multi-select",
+        variant: "multiSelect",
         options: OUTCOME_OPTIONS,
         icon: Shield,
       },

@@ -17,6 +17,17 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { formatCost, formatPercent } from "@/lib/format"
 import type { DigitalEmployee } from "@/services/contracts/agents"
+import { AUTONOMY_LABEL, ENTITY_STATUS_LABEL } from "@/lib/status"
+
+const AUTONOMY_OPTIONS = Object.entries(AUTONOMY_LABEL).map(([value, label]) => ({
+  value,
+  label,
+}))
+
+const ENTITY_STATUS_OPTIONS = Object.entries(ENTITY_STATUS_LABEL).map(([value, label]) => ({
+  value,
+  label,
+}))
 
 export function getEmployeeColumns(): ColumnDef<DigitalEmployee>[] {
   return [
@@ -39,6 +50,7 @@ export function getEmployeeColumns(): ColumnDef<DigitalEmployee>[] {
           </div>
         )
       },
+      enableColumnFilter: true,
       meta: {
         label: "Employee",
         variant: "text",
@@ -50,9 +62,11 @@ export function getEmployeeColumns(): ColumnDef<DigitalEmployee>[] {
         <DataTableColumnHeader column={column} label="Autonomy" />
       ),
       cell: ({ row }) => <AutonomyBadge level={row.original.autonomy} />,
+      enableColumnFilter: true,
       meta: {
         label: "Autonomy",
         variant: "select",
+        options: AUTONOMY_OPTIONS,
       },
     },
     {
@@ -61,9 +75,11 @@ export function getEmployeeColumns(): ColumnDef<DigitalEmployee>[] {
         <DataTableColumnHeader column={column} label="Status" />
       ),
       cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      enableColumnFilter: true,
       meta: {
         label: "Status",
         variant: "select",
+        options: ENTITY_STATUS_OPTIONS,
       },
     },
     {
@@ -98,6 +114,7 @@ export function getEmployeeColumns(): ColumnDef<DigitalEmployee>[] {
           {formatPercent(row.original.successRate)}
         </span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Success",
         variant: "number",
@@ -113,6 +130,7 @@ export function getEmployeeColumns(): ColumnDef<DigitalEmployee>[] {
           {formatPercent(row.original.approvalRate)}
         </span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Approval rate",
         variant: "number",
@@ -124,6 +142,7 @@ export function getEmployeeColumns(): ColumnDef<DigitalEmployee>[] {
         <DataTableColumnHeader column={column} label="Owner" />
       ),
       cell: ({ row }) => <span>{row.original.owner}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Owner",
         variant: "text",

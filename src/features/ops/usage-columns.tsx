@@ -55,9 +55,10 @@ export function getUsageTenantColumns(): ColumnDef<TenantRow>[] {
     {
       accessorKey: "name",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Tenant" />
+        <DataTableColumnHeader column={column} label="Tenant" />
       ),
       cell: ({ row }) => <span className="font-medium">{row.original.name}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Tenant",
         variant: "text",
@@ -66,11 +67,12 @@ export function getUsageTenantColumns(): ColumnDef<TenantRow>[] {
     {
       accessorKey: "computeUnits",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Compute" />
+        <DataTableColumnHeader column={column} label="Compute" />
       ),
       cell: ({ row }) => (
         <span>{formatCompactNumber(row.original.computeUnits)}</span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Compute",
         variant: "number",
@@ -79,7 +81,7 @@ export function getUsageTenantColumns(): ColumnDef<TenantRow>[] {
     {
       accessorKey: "budgetSpent",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Budget" />
+        <DataTableColumnHeader column={column} label="Budget" />
       ),
       cell: ({ row }) => {
         const r = row.original
@@ -89,6 +91,7 @@ export function getUsageTenantColumns(): ColumnDef<TenantRow>[] {
           </span>
         )
       },
+      enableColumnFilter: true,
       meta: {
         label: "Budget",
         variant: "number",
@@ -97,7 +100,7 @@ export function getUsageTenantColumns(): ColumnDef<TenantRow>[] {
     {
       id: "utilization",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Utilization" />
+        <DataTableColumnHeader column={column} label="Utilization" />
       ),
       cell: ({ row }) => <BudgetUtilization row={row.original} />,
       meta: {

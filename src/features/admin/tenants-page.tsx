@@ -15,6 +15,8 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useDataTable } from "@/hooks/use-data-table"
+import { filterDataClientSide } from "@/lib/data-table"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import {
   formatBytes,
@@ -50,17 +52,35 @@ export function TenantsPage() {
     []
   )
 
+  const tableUrlState = useTableUrlState()
+  const filteredData = React.useMemo(
+    () =>
+      filterDataClientSide(state.data ?? [], {
+        search: tableUrlState.search,
+        searchFields: [
+          (r) => r.name,
+          (r) => r.slug,
+          (r) => r.plan,
+        ],
+        filters: tableUrlState.filters,
+        joinOperator: tableUrlState.joinOperator,
+      }),
+    [state.data, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
+  )
+
   const { table } = useDataTable({
-    data: state.data ?? [],
+    data: filteredData,
     columns,
-    pageCount: 1,
-    enableRowSelection: false,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/admin/tenants",
     initialState: {
       columnPinning: { right: ["actions"] },
     },
     getRowId: (row) => row.id,
-    shallow: false,
-    clearOnDefault: true,
   })
 
   function resetForm() {
@@ -109,9 +129,7 @@ export function TenantsPage() {
         <div className="space-y-4">
           <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
             <DataTableSearch
-              table={table}
               placeholder="Search name, slug, plan..."
-              className="h-8 w-40 lg:w-64"
             />
           </DataTableAdvancedToolbar>
           <div className="rounded-md border">
@@ -204,109 +222,6 @@ export function TenantsPage() {
           />
         ) : null}
       </DetailDrawer>
-    </div>
-  )
-}
-            Create Tenant
-          </Button>
-        }
-      />
-      <FilterToolbar>
-        <SearchField
-          value={search}
-          onChange={setSearch}
-          placeholder="Search name, slug, plan..."
-        />
-      </FilterToolbar>
-      {state.status === "loading" ? <LoadingSkeleton /> : null}
-      {state.status === "error" ? (
-        <ErrorState error={state.error} onRetry={state.reload} />
-      ) : null}
-      {state.status === "success" ? (
-        <DataTable
-          columns={columns}
-          rows={filtered}
-          rowKey={(r) => r.id}
-          onRowClick={setSelected}
-        />
-      ) : null}
-      <DetailDrawer
-        open={selected !== null}
-        onOpenChange={(open) => {
-          if (!open) setSelected(null)
-        }}
-        title={selected?.name ?? ""}
-        description={selected ? `${selected.plan} plan` : undefined}
-      >
-        {selected ? (
-          <MetadataList
-            items={[
-              {
-                label: "Slug",
-                value: (
-                  <span className="font-mono text-xs">{selected.slug}</span>
-                ),
-              },
-              { label: "Plan", value: selected.plan },
-              { label: "Residency", value: selected.residency },
-              { label: "Users", value: formatNumber(selected.users) },
-              { label: "Agents", value: formatNumber(selected.agents) },
-              { label: "Storage", value: formatBytes(selected.storageBytes) },
-              { label: "Compute used vs quota", value: computeQuota(selected) },
-            ]}
-          />
-        ) : null}
-      </DetailDrawer>
-      <CreateSheet
-        open={createOpen}
-        onOpenChange={(open) => {
-          setCreateOpen(open)
-          if (!open) resetForm()
-        }}
-        title="Create Tenant"
-        description="Provision a tenant with plan and residency."
-        canSubmit={Boolean(
-          name.trim() && slug.trim() && plan.trim() && residency.trim()
-        )}
-        submitting={create.status === "pending"}
-        onSubmit={handleCreate}
-      >
-        <div className="space-y-1.5">
-          <Label htmlFor="tenant-name">Name</Label>
-          <Input
-            id="tenant-name"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="tenant-slug">Slug</Label>
-          <Input
-            id="tenant-slug"
-            value={slug}
-            onChange={(e) => setSlug(e.target.value)}
-            placeholder="acme"
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="tenant-plan">Plan</Label>
-          <Input
-            id="tenant-plan"
-            value={plan}
-            onChange={(e) => setPlan(e.target.value)}
-            placeholder="Enterprise"
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="tenant-residency">Residency</Label>
-          <Input
-            id="tenant-residency"
-            value={residency}
-            onChange={(e) => setResidency(e.target.value)}
-            placeholder="ID"
-          />
-        </div>
-      </CreateSheet>
     </div>
   )
 }

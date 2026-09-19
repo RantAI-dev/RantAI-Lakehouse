@@ -152,7 +152,7 @@ export function getPolicyColumns({
         const effect = row.original.effect?.toLowerCase()
         const isAllow = effect === "allow"
         return (
-          <Pill tone={isAllow ? "success" : "danger"}>
+          <Pill tone={isAllow ? "success" : "destructive"}>
             {row.original.effect}
           </Pill>
         )

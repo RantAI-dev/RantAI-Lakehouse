@@ -15,7 +15,13 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { formatRelativeTime } from "@/lib/format"
+import { ENTITY_STATUS_LABEL } from "@/lib/status"
 import type { AgentWorkflow } from "@/services/contracts/agents"
+
+const STATUS_OPTIONS = Object.entries(ENTITY_STATUS_LABEL).map(([value, label]) => ({
+  value,
+  label,
+}))
 
 interface WorkflowColumnsProps {
   readonly onSelect: (workflow: AgentWorkflow) => void
@@ -50,6 +56,7 @@ export function getWorkflowColumns({
           </button>
         )
       },
+      enableColumnFilter: true,
       meta: {
         label: "Workflow",
         variant: "text",
@@ -61,9 +68,11 @@ export function getWorkflowColumns({
         <DataTableColumnHeader column={column} label="Status" />
       ),
       cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      enableColumnFilter: true,
       meta: {
         label: "Status",
         variant: "select",
+        options: STATUS_OPTIONS,
       },
     },
     {
@@ -72,6 +81,7 @@ export function getWorkflowColumns({
         <DataTableColumnHeader column={column} label="Trigger" />
       ),
       cell: ({ row }) => <span>{row.original.trigger}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Trigger",
         variant: "text",
@@ -85,6 +95,7 @@ export function getWorkflowColumns({
       cell: ({ row }) => (
         <span className="tabular-nums">{row.original.steps}</span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Steps",
         variant: "number",
@@ -113,9 +124,10 @@ export function getWorkflowColumns({
           {formatRelativeTime(row.original.lastRunAt)}
         </span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Last run",
-        variant: "text",
+        variant: "date",
       },
     },
     {
@@ -124,6 +136,7 @@ export function getWorkflowColumns({
         <DataTableColumnHeader column={column} label="Owner" />
       ),
       cell: ({ row }) => <span>{row.original.owner}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Owner",
         variant: "text",

@@ -20,9 +20,10 @@ export function getRoleColumns(): ColumnDef<Role>[] {
     {
       accessorKey: "name",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Role" />
+        <DataTableColumnHeader column={column} label="Role" />
       ),
       cell: ({ row }) => <span className="font-medium">{row.original.name}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Role",
         variant: "text",
@@ -31,9 +32,10 @@ export function getRoleColumns(): ColumnDef<Role>[] {
     {
       accessorKey: "members",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Members" />
+        <DataTableColumnHeader column={column} label="Members" />
       ),
       cell: ({ row }) => <span>{formatNumber(row.original.members)}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Members",
         variant: "number",
@@ -42,11 +44,12 @@ export function getRoleColumns(): ColumnDef<Role>[] {
     {
       accessorKey: "permissions",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Permissions" />
+        <DataTableColumnHeader column={column} label="Permissions" />
       ),
       cell: ({ row }) => (
         <span className="font-mono text-xs">{row.original.permissions}</span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Permissions",
         variant: "text",
@@ -55,11 +58,12 @@ export function getRoleColumns(): ColumnDef<Role>[] {
     {
       accessorKey: "description",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Description" />
+        <DataTableColumnHeader column={column} label="Description" />
       ),
       cell: ({ row }) => (
         <span className="text-muted-foreground">{row.original.description}</span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Description",
         variant: "text",

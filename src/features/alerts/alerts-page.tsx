@@ -25,7 +25,9 @@ import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { useDataTable } from "@/hooks/use-data-table"
-import type { DataTableFilterField } from "@/types/data-table"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
+import { filterDataClientSide } from "@/lib/data-table"
+import type { QueryKeys } from "@/types/data-table"
 import { apiFetch } from "@/services/http"
 import {
   getRuleColumns,
@@ -43,18 +45,15 @@ type RunResult = {
 }
 
 const OPS = [">", ">=", "<", "<=", "=="]
-const AGGS = ["sum", "avg", "max", "min", "count"]
 
-const ruleFilterFields: DataTableFilterField<Rule>[] = [
-  {
-    id: "type",
-    label: "Type",
-    options: [
-      { label: "Threshold alert", value: "alert" },
-      { label: "Dashboard digest", value: "digest" },
-    ],
-  },
-]
+const RULE_QUERY_KEYS: Partial<QueryKeys> = {
+  search: "rule_search",
+  page: "rule_page",
+  perPage: "rule_limit",
+  sort: "rule_sort",
+  filters: "rule_filter",
+}
+const AGGS = ["sum", "avg", "max", "min", "count"]
 
 function formatRunResult(r: RunResult): string {
   if (r.skipped) {
@@ -115,9 +114,10 @@ function AlertConditionFields({
           <Label>Mart (Gold)</Label>
           <Select
             value={f.mart ?? ""}
-            onValueChange={(v = "") => {
-              setF((prev) => ({ ...prev, mart: v, measure: "" }))
-              void loadFields(v)
+            onValueChange={(v) => {
+              const mart = v ?? ""
+              setF((prev) => ({ ...prev, mart, measure: "" }))
+              void loadFields(mart)
             }}
           >
             <SelectTrigger>
@@ -136,7 +136,7 @@ function AlertConditionFields({
           <Label>Measure</Label>
           <Select
             value={f.measure ?? ""}
-            onValueChange={(v = "") => setF((prev) => ({ ...prev, measure: v }))}
+            onValueChange={(v) => setF((prev) => ({ ...prev, measure: v ?? "" }))}
             disabled={fields.length === 0}
           >
             <SelectTrigger>
@@ -157,7 +157,7 @@ function AlertConditionFields({
           <Label>Aggregate</Label>
           <Select
             value={f.agg ?? "sum"}
-            onValueChange={(v = "sum") => setF((prev) => ({ ...prev, agg: v }))}
+            onValueChange={(v) => setF((prev) => ({ ...prev, agg: v ?? "sum" }))}
           >
             <SelectTrigger>
               <SelectValue />
@@ -175,7 +175,7 @@ function AlertConditionFields({
           <Label>Operator</Label>
           <Select
             value={f.op ?? ">"}
-            onValueChange={(v = ">") => setF((prev) => ({ ...prev, op: v }))}
+            onValueChange={(v) => setF((prev) => ({ ...prev, op: v ?? ">" }))}
           >
             <SelectTrigger>
               <SelectValue />
@@ -216,7 +216,7 @@ function DigestConditionFields({ f, setF, boards }: DigestConditionProps) {
       <Label>Dashboard</Label>
       <Select
         value={f.board ?? ""}
-        onValueChange={(v = "") => setF((prev) => ({ ...prev, board: v }))}
+        onValueChange={(v) => setF((prev) => ({ ...prev, board: v ?? "" }))}
       >
         <SelectTrigger>
           <SelectValue placeholder="pick a dashboard" />
@@ -519,22 +519,32 @@ export function AlertRulesPage() {
     [busy, boards]
   )
 
+  const tableUrlState = useTableUrlState(RULE_QUERY_KEYS)
+  const filteredRules = React.useMemo(
+    () =>
+      filterDataClientSide(rules, {
+        search: tableUrlState.search,
+        searchFields: [(r) => r.name, (r) => r.mart, (r) => r.measure, (r) => r.target],
+        filters: tableUrlState.filters,
+        joinOperator: tableUrlState.joinOperator,
+      }),
+    [rules, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
+  )
+
   const { table } = useDataTable({
-    data: rules,
+    data: filteredRules,
     columns,
-    pageCount: 1,
-    filterFields: ruleFilterFields,
-    enableRowSelection: false,
-    queryKeys: {
-      search: "rule_search",
-      page: "rule_page",
-      perPage: "rule_limit",
-      sort: "rule_sort",
-      filters: "rule_filter",
-    },
+    queryKeys: RULE_QUERY_KEYS,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/alerts/rules",
     initialState: {
       columnPinning: { right: ["actions"] },
     },
+    getRowId: (row) => row.id,
   })
 
   return (
@@ -585,9 +595,7 @@ export function AlertRulesPage() {
       <div className="space-y-4">
         <DataTableAdvancedToolbar table={table}>
           <DataTableSearch
-            table={table}
             placeholder="Search rules..."
-            className="h-8 w-40 lg:w-64"
           />
         </DataTableAdvancedToolbar>
         <div className="rounded-md border">

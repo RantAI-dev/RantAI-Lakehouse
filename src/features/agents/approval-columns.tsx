@@ -16,6 +16,12 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { formatRelativeTime } from "@/lib/format"
 import type { ApprovalItem } from "@/services/contracts/agents"
+import { APPROVAL_STATUS_LABEL } from "@/lib/status"
+
+const APPROVAL_STATUS_OPTIONS = Object.entries(APPROVAL_STATUS_LABEL).map(([value, label]) => ({
+  value,
+  label,
+}))
 
 interface ApprovalColumnsProps {
   readonly onSelect: (approval: ApprovalItem) => void
@@ -47,6 +53,7 @@ export function getApprovalColumns({
           </div>
         )
       },
+      enableColumnFilter: true,
       meta: {
         label: "Requested action",
         variant: "text",
@@ -58,9 +65,11 @@ export function getApprovalColumns({
         <DataTableColumnHeader column={column} label="Status" />
       ),
       cell: ({ row }) => <ApprovalBadge status={row.original.status} />,
+      enableColumnFilter: true,
       meta: {
         label: "Status",
         variant: "select",
+        options: APPROVAL_STATUS_OPTIONS,
       },
     },
     {
@@ -69,6 +78,7 @@ export function getApprovalColumns({
         <DataTableColumnHeader column={column} label="Risk" />
       ),
       cell: ({ row }) => <span>{row.original.risk}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Risk",
         variant: "text",
@@ -84,9 +94,10 @@ export function getApprovalColumns({
           {formatRelativeTime(row.original.requestedAt)}
         </span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Requested",
-        variant: "text",
+        variant: "date",
       },
     },
     {

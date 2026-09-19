@@ -24,6 +24,12 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { formatRelativeTime } from "@/lib/format"
 import type { VectorJob } from "@/services/contracts/knowledge"
+import { ENTITY_STATUS_LABEL } from "@/lib/status"
+
+const ENTITY_STATUS_OPTIONS = Object.entries(ENTITY_STATUS_LABEL).map(([value, label]) => ({
+  value,
+  label,
+}))
 
 export function getVectorJobColumns(options: {
   readonly onInspect: (job: VectorJob) => void
@@ -62,6 +68,11 @@ export function getVectorJobColumns(options: {
         <DataTableColumnHeader column={column} label="Job" />
       ),
       cell: ({ row }) => <span className="font-medium">{row.original.name}</span>,
+      enableColumnFilter: true,
+      meta: {
+        label: "Job",
+        variant: "text",
+      },
     },
     {
       accessorKey: "status",
@@ -69,6 +80,12 @@ export function getVectorJobColumns(options: {
         <DataTableColumnHeader column={column} label="Status" />
       ),
       cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      enableColumnFilter: true,
+      meta: {
+        label: "Status",
+        variant: "select",
+        options: ENTITY_STATUS_OPTIONS,
+      },
     },
     {
       accessorKey: "source",
@@ -80,6 +97,11 @@ export function getVectorJobColumns(options: {
           {row.original.source}
         </span>
       ),
+      enableColumnFilter: true,
+      meta: {
+        label: "Source",
+        variant: "text",
+      },
     },
     {
       accessorKey: "embeddingModel",
@@ -89,6 +111,11 @@ export function getVectorJobColumns(options: {
       cell: ({ row }) => (
         <span className="font-mono text-xs">{row.original.embeddingModel}</span>
       ),
+      enableColumnFilter: true,
+      meta: {
+        label: "Model",
+        variant: "text",
+      },
     },
     {
       accessorKey: "indexType",
@@ -98,6 +125,11 @@ export function getVectorJobColumns(options: {
       cell: ({ row }) => (
         <span className="font-mono text-xs">{row.original.indexType}</span>
       ),
+      enableColumnFilter: true,
+      meta: {
+        label: "Index",
+        variant: "text",
+      },
     },
     {
       accessorKey: "lastRunAt",
@@ -105,12 +137,22 @@ export function getVectorJobColumns(options: {
         <DataTableColumnHeader column={column} label="Last run" />
       ),
       cell: ({ row }) => formatRelativeTime(row.original.lastRunAt),
+      enableColumnFilter: true,
+      meta: {
+        label: "Last run",
+        variant: "date",
+      },
     },
     {
       accessorKey: "owner",
       header: ({ column }) => (
         <DataTableColumnHeader column={column} label="Owner" />
       ),
+      enableColumnFilter: true,
+      meta: {
+        label: "Owner",
+        variant: "text",
+      },
     },
     {
       id: "actions",

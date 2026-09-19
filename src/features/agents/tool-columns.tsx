@@ -19,6 +19,17 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { formatCompactNumber } from "@/lib/format"
 import type { AgentTool } from "@/services/contracts/agents"
+import { APPROVAL_STATUS_LABEL, HEALTH_LABEL } from "@/lib/status"
+
+const APPROVAL_STATUS_OPTIONS = Object.entries(APPROVAL_STATUS_LABEL).map(([value, label]) => ({
+  value,
+  label,
+}))
+
+const HEALTH_OPTIONS = Object.entries(HEALTH_LABEL).map(([value, label]) => ({
+  value,
+  label,
+}))
 
 type ToolColumnOptions = {
   readonly onInspect: (tool: AgentTool) => void
@@ -72,6 +83,11 @@ export function getToolColumns({
           </div>
         )
       },
+      enableColumnFilter: true,
+      meta: {
+        label: "Tool",
+        variant: "text",
+      },
     },
     {
       accessorKey: "permission",
@@ -83,6 +99,11 @@ export function getToolColumns({
           {row.original.permission}
         </span>
       ),
+      enableColumnFilter: true,
+      meta: {
+        label: "Permission",
+        variant: "text",
+      },
     },
     {
       accessorKey: "health",
@@ -93,6 +114,12 @@ export function getToolColumns({
       filterFn: (row, id, value) => {
         return Array.isArray(value) && value.includes(row.getValue(id))
       },
+      enableColumnFilter: true,
+      meta: {
+        label: "Health",
+        variant: "select",
+        options: HEALTH_OPTIONS,
+      },
     },
     {
       accessorKey: "approvalStatus",
@@ -102,6 +129,12 @@ export function getToolColumns({
       cell: ({ row }) => <ApprovalBadge status={row.original.approvalStatus} />,
       filterFn: (row, id, value) => {
         return Array.isArray(value) && value.includes(row.getValue(id))
+      },
+      enableColumnFilter: true,
+      meta: {
+        label: "Approval",
+        variant: "select",
+        options: APPROVAL_STATUS_OPTIONS,
       },
     },
     {
@@ -114,6 +147,11 @@ export function getToolColumns({
           {row.original.rateLimit}
         </span>
       ),
+      enableColumnFilter: true,
+      meta: {
+        label: "Rate Limit",
+        variant: "text",
+      },
     },
     {
       accessorKey: "usage30d",
@@ -125,6 +163,11 @@ export function getToolColumns({
           {formatCompactNumber(row.original.usage30d)}
         </span>
       ),
+      enableColumnFilter: true,
+      meta: {
+        label: "Usage 30d",
+        variant: "number",
+      },
     },
     {
       id: "actions",

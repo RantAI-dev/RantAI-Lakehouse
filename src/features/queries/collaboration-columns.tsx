@@ -53,6 +53,11 @@ export function getCollaborationColumns(options: {
         <DataTableColumnHeader column={column} label="Project" />
       ),
       cell: ({ row }) => <span className="font-medium">{row.original.name}</span>,
+      enableColumnFilter: true,
+      meta: {
+        label: "Project",
+        variant: "text",
+      },
     },
     {
       accessorKey: "description",
@@ -64,6 +69,11 @@ export function getCollaborationColumns(options: {
           {row.original.description}
         </span>
       ),
+      enableColumnFilter: true,
+      meta: {
+        label: "Description",
+        variant: "text",
+      },
     },
     {
       accessorKey: "members",
@@ -75,6 +85,11 @@ export function getCollaborationColumns(options: {
           {formatNumber(row.original.members)}
         </span>
       ),
+      enableColumnFilter: true,
+      meta: {
+        label: "Members",
+        variant: "number",
+      },
     },
     {
       accessorKey: "updatedAt",
@@ -82,6 +97,11 @@ export function getCollaborationColumns(options: {
         <DataTableColumnHeader column={column} label="Updated" />
       ),
       cell: ({ row }) => formatRelativeTime(row.original.updatedAt),
+      enableColumnFilter: true,
+      meta: {
+        label: "Updated",
+        variant: "date",
+      },
     },
     {
       id: "actions",

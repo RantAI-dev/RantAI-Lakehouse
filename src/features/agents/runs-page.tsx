@@ -5,7 +5,6 @@ import Link from "next/link"
 import { PlayCircleIcon } from "lucide-react"
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
-import { DataTableFacetedFilter } from "@/components/data-table/data-table-faceted-filter"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { PageHeader } from "@/components/patterns/page-header"
 import {
@@ -15,17 +14,11 @@ import {
 } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import { useDataTable } from "@/hooks/use-data-table"
+import { filterDataClientSide } from "@/lib/data-table"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService } from "@/hooks/use-service"
-import { AGENT_RUN_STATUS_LABEL } from "@/lib/status"
 import { agentService } from "@/services"
 import { getRunColumns } from "./run-columns"
-
-const STATUS_OPTIONS = Object.entries(AGENT_RUN_STATUS_LABEL).map(
-  ([value, label]) => ({
-    value,
-    label,
-  })
-)
 
 /**
  * `/agents/runs` — every digital-employee run, real ones only: seeded
@@ -41,16 +34,36 @@ export function RunsPage() {
 
   const data = state.data ?? []
 
+  const tableUrlState = useTableUrlState()
+  const filteredData = React.useMemo(
+    () =>
+      filterDataClientSide(state.data ?? [], {
+        search: tableUrlState.search,
+        searchFields: [
+          (r) => r.id,
+          (r) => r.employeeId,
+          (r) => r.trigger,
+          (r) => r.actor,
+        ],
+        filters: tableUrlState.filters,
+        joinOperator: tableUrlState.joinOperator,
+      }),
+    [state.data, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
+  )
+
   const { table } = useDataTable({
-    data,
+    data: filteredData,
     columns,
-    pageCount: 1,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/agents/runs",
     initialState: {
       columnPinning: { right: ["actions"] },
     },
-    getRowId: (originalRow) => originalRow.id,
-    shallow: false,
-    clearOnDefault: true,
+    getRowId: (row) => row.id,
   })
 
   return (
@@ -79,25 +92,11 @@ export function RunsPage() {
         />
       ) : null}
       {state.status === "success" && data.length > 0 ? (
-        <DataTable
-          table={table}
-          renderToolbar={() => (
-            <DataTableAdvancedToolbar table={table}>
-              <DataTableSearch
-                table={table}
-                placeholder="Search runs..."
-                className="w-full sm:w-64"
-              />
-              {table.getColumn("status") && (
-                <DataTableFacetedFilter
-                  column={table.getColumn("status")}
-                  title="Status"
-                  options={STATUS_OPTIONS}
-                />
-              )}
-            </DataTableAdvancedToolbar>
-          )}
-        />
+        <DataTable table={table}>
+          <DataTableAdvancedToolbar table={table}>
+            <DataTableSearch placeholder="Search runs..." />
+          </DataTableAdvancedToolbar>
+        </DataTable>
       ) : null}
     </div>
   )

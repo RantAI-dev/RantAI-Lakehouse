@@ -13,10 +13,11 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useDataTable } from "@/hooks/use-data-table"
+import { filterDataClientSide } from "@/lib/data-table"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import { identityService } from "@/services"
-import type { Role } from "@/services/contracts/identity"
 import { getRoleColumns } from "./roles-columns"
 
 export function RolesPage() {
@@ -37,17 +38,35 @@ export function RolesPage() {
 
   const columns = React.useMemo(() => getRoleColumns(), [])
 
+  const tableUrlState = useTableUrlState()
+  const filteredData = React.useMemo(
+    () =>
+      filterDataClientSide(state.data ?? [], {
+        search: tableUrlState.search,
+        searchFields: [
+          (r) => r.name,
+          (r) => r.description,
+          (r) => r.permissions,
+        ],
+        filters: tableUrlState.filters,
+        joinOperator: tableUrlState.joinOperator,
+      }),
+    [state.data, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
+  )
+
   const { table } = useDataTable({
-    data: state.data ?? [],
+    data: filteredData,
     columns,
-    pageCount: 1,
-    enableRowSelection: false,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/admin/roles",
     initialState: {
       columnPinning: { right: ["actions"] },
     },
     getRowId: (row) => row.id,
-    shallow: false,
-    clearOnDefault: true,
   })
 
   function resetForm() {
@@ -94,9 +113,7 @@ export function RolesPage() {
         <div className="space-y-4">
           <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
             <DataTableSearch
-              table={table}
               placeholder="Search name, description, permissions..."
-              className="h-8 w-40 lg:w-64"
             />
           </DataTableAdvancedToolbar>
           <div className="rounded-md border">
@@ -140,5 +157,4 @@ export function RolesPage() {
       </CreateSheet>
     </div>
   )
-}
 }

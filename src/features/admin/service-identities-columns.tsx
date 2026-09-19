@@ -16,6 +16,12 @@ import {
 import { formatRelativeTime } from "@/lib/format"
 import type { ServiceIdentity } from "@/services/contracts/identity"
 
+const ROTATION_STATUS_OPTIONS = [
+  { value: "current", label: "Current" },
+  { value: "due", label: "Rotation due" },
+  { value: "expired", label: "Expired" },
+]
+
 function RotationPill({
   status,
 }: {
@@ -36,9 +42,10 @@ export function getServiceIdentityColumns(): ColumnDef<ServiceIdentity>[] {
     {
       accessorKey: "name",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Identity" />
+        <DataTableColumnHeader column={column} label="Identity" />
       ),
       cell: ({ row }) => <span className="font-medium">{row.original.name}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Identity",
         variant: "text",
@@ -47,7 +54,7 @@ export function getServiceIdentityColumns(): ColumnDef<ServiceIdentity>[] {
     {
       id: "scopes",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Scopes" />
+        <DataTableColumnHeader column={column} label="Scopes" />
       ),
       cell: ({ row }) => (
         <div className="flex flex-wrap gap-1">
@@ -67,53 +74,58 @@ export function getServiceIdentityColumns(): ColumnDef<ServiceIdentity>[] {
     {
       accessorKey: "environment",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Environment" />
+        <DataTableColumnHeader column={column} label="Environment" />
       ),
       cell: ({ row }) => <span>{row.original.environment}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Environment",
-        variant: "select",
+        variant: "text",
       },
     },
     {
       accessorKey: "rotationStatus",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Rotation" />
+        <DataTableColumnHeader column={column} label="Rotation" />
       ),
       cell: ({ row }) => <RotationPill status={row.original.rotationStatus} />,
+      enableColumnFilter: true,
       meta: {
         label: "Rotation",
         variant: "select",
+        options: ROTATION_STATUS_OPTIONS,
       },
     },
     {
       accessorKey: "expiresAt",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Expires" />
+        <DataTableColumnHeader column={column} label="Expires" />
       ),
       cell: ({ row }) => (
         <span className="text-muted-foreground">
           {formatRelativeTime(row.original.expiresAt)}
         </span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Expires",
-        variant: "text",
+        variant: "date",
       },
     },
     {
       accessorKey: "lastUsedAt",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Last used" />
+        <DataTableColumnHeader column={column} label="Last used" />
       ),
       cell: ({ row }) => (
         <span className="text-muted-foreground">
           {formatRelativeTime(row.original.lastUsedAt)}
         </span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Last used",
-        variant: "text",
+        variant: "date",
       },
     },
     {

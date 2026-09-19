@@ -16,6 +16,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { formatRelativeTime } from "@/lib/format"
+import { HEALTH_LABEL, type Health } from "@/lib/status"
 import type { Connector } from "@/services/contracts/connectors"
 
 type Direction = Connector["direction"]
@@ -26,6 +27,16 @@ export const DIRECTION_LABEL: Record<Direction, string> = {
   bidirectional: "Bidirectional",
 }
 
+const DIRECTION_OPTIONS = (Object.keys(DIRECTION_LABEL) as Direction[]).map((d) => ({
+  value: d,
+  label: DIRECTION_LABEL[d],
+}))
+
+const HEALTH_OPTIONS = (Object.keys(HEALTH_LABEL) as Health[]).map((h) => ({
+  value: h,
+  label: HEALTH_LABEL[h],
+}))
+
 export function getConnectorColumns({
   onSelect,
 }: {
@@ -35,7 +46,7 @@ export function getConnectorColumns({
     {
       accessorKey: "name",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Connector" />
+        <DataTableColumnHeader column={column} label="Connector" />
       ),
       cell: ({ row }) => {
         const r = row.original
@@ -52,6 +63,7 @@ export function getConnectorColumns({
           </div>
         )
       },
+      enableColumnFilter: true,
       meta: {
         label: "Connector",
         variant: "text",
@@ -60,42 +72,48 @@ export function getConnectorColumns({
     {
       accessorKey: "direction",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Direction" />
+        <DataTableColumnHeader column={column} label="Direction" />
       ),
       cell: ({ row }) => <span>{DIRECTION_LABEL[row.original.direction]}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Direction",
         variant: "select",
+        options: DIRECTION_OPTIONS,
       },
     },
     {
       accessorKey: "health",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Health" />
+        <DataTableColumnHeader column={column} label="Health" />
       ),
       cell: ({ row }) => <HealthBadge health={row.original.health} />,
+      enableColumnFilter: true,
       meta: {
         label: "Health",
         variant: "select",
+        options: HEALTH_OPTIONS,
       },
     },
     {
       accessorKey: "environment",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Environment" />
+        <DataTableColumnHeader column={column} label="Environment" />
       ),
       cell: ({ row }) => <span>{row.original.environment}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Environment",
-        variant: "select",
+        variant: "text",
       },
     },
     {
       accessorKey: "tenant",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Tenant" />
+        <DataTableColumnHeader column={column} label="Tenant" />
       ),
       cell: ({ row }) => <span>{row.original.tenant}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Tenant",
         variant: "text",
@@ -104,31 +122,33 @@ export function getConnectorColumns({
     {
       accessorKey: "lastTestAt",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Last test" />
+        <DataTableColumnHeader column={column} label="Last test" />
       ),
       cell: ({ row }) => (
         <span className="text-muted-foreground">
           {formatRelativeTime(row.original.lastTestAt)}
         </span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Last test",
-        variant: "text",
+        variant: "date",
       },
     },
     {
       accessorKey: "lastActivityAt",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Last activity" />
+        <DataTableColumnHeader column={column} label="Last activity" />
       ),
       cell: ({ row }) => (
         <span className="text-muted-foreground">
           {formatRelativeTime(row.original.lastActivityAt)}
         </span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Last activity",
-        variant: "text",
+        variant: "date",
       },
     },
     {

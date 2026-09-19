@@ -63,11 +63,25 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
           {row.original.name}
         </button>
       ),
+      enableColumnFilter: true,
+      meta: {
+        label: "Rule Name",
+        variant: "text",
+      },
     },
     {
       id: "type",
       accessorKey: "type",
       header: "Type",
+      enableColumnFilter: true,
+      meta: {
+        label: "Type",
+        variant: "select",
+        options: [
+          { label: "Threshold alert", value: "alert" },
+          { label: "Dashboard digest", value: "digest" },
+        ],
+      },
       cell: ({ row }) => {
         const isAlert = row.original.type === "alert"
         return (
@@ -135,6 +149,11 @@ export function getRuleColumns(options: RuleColumnsOptions): ColumnDef<Rule>[] {
             </span>
           </div>
         )
+      },
+      enableColumnFilter: true,
+      meta: {
+        label: "Status",
+        variant: "boolean",
       },
     },
     {

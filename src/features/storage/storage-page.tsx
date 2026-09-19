@@ -94,7 +94,6 @@ function LifecyclePoliciesTable({
     <div className="flex flex-col gap-4">
       <DataTableAdvancedToolbar table={table}>
         <DataTableSearch
-          table={table}
           placeholder="Search policies by name, scope..."
         />
       </DataTableAdvancedToolbar>
@@ -155,7 +154,6 @@ function TieringOperationsTable({
     <div className="flex flex-col gap-4">
       <DataTableAdvancedToolbar table={table}>
         <DataTableSearch
-          table={table}
           placeholder="Search operations by asset, status, detail..."
         />
       </DataTableAdvancedToolbar>

@@ -5,7 +5,6 @@ import Link from "next/link"
 import { PlusIcon } from "lucide-react"
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
-import { DataTableFacetedFilter } from "@/components/data-table/data-table-faceted-filter"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { PageHeader } from "@/components/patterns/page-header"
 import { Button } from "@/components/ui/button"
@@ -18,9 +17,10 @@ import {
 } from "@/components/patterns/page-states"
 import { Pill, StatusBadge } from "@/components/patterns/status-badge"
 import { useDataTable } from "@/hooks/use-data-table"
+import { filterDataClientSide } from "@/lib/data-table"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService } from "@/hooks/use-service"
 import { formatRelativeTime } from "@/lib/format"
-import { ENTITY_STATUS_LABEL } from "@/lib/status"
 import { agentService } from "@/services"
 import type { AgentWorkflow } from "@/services/contracts/agents"
 import { getWorkflowColumns } from "./workflow-columns"
@@ -42,24 +42,36 @@ export function WorkflowsPage() {
     []
   )
 
-  const data = state.data ?? []
+  const tableUrlState = useTableUrlState()
+  const filteredData = React.useMemo(
+    () =>
+      filterDataClientSide(state.data ?? [], {
+        search: tableUrlState.search,
+        searchFields: [
+          (r) => r.name,
+          (r) => r.owner,
+          (r) => r.trigger,
+        ],
+        filters: tableUrlState.filters,
+        joinOperator: tableUrlState.joinOperator,
+      }),
+    [state.data, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
+  )
 
   const { table } = useDataTable({
-    data,
+    data: filteredData,
     columns,
-    pageCount: 1,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/agents/workflows",
     initialState: {
       columnPinning: { right: ["actions"] },
     },
-    getRowId: (originalRow) => originalRow.id,
-    shallow: false,
-    clearOnDefault: true,
+    getRowId: (row) => row.id,
   })
-
-  const statusOptions = React.useMemo(() => {
-    const present = new Set(state.data?.map((r) => r.status) ?? [])
-    return [...present].map((s) => ({ value: s, label: ENTITY_STATUS_LABEL[s] }))
-  }, [state.data])
 
   return (
     <div className="flex flex-col gap-4">
@@ -87,25 +99,11 @@ export function WorkflowsPage() {
         />
       ) : null}
       {state.status === "success" && (state.data?.length ?? 0) > 0 ? (
-        <DataTable
-          table={table}
-          renderToolbar={() => (
-            <DataTableAdvancedToolbar table={table}>
-              <DataTableSearch
-                table={table}
-                placeholder="Search workflows..."
-                className="w-full sm:w-64"
-              />
-              {table.getColumn("status") && (
-                <DataTableFacetedFilter
-                  column={table.getColumn("status")}
-                  title="Status"
-                  options={statusOptions}
-                />
-              )}
-            </DataTableAdvancedToolbar>
-          )}
-        />
+        <DataTable table={table}>
+          <DataTableAdvancedToolbar table={table}>
+            <DataTableSearch placeholder="Search workflows..." />
+          </DataTableAdvancedToolbar>
+        </DataTable>
       ) : null}
       <DetailDrawer
         open={selected != null}

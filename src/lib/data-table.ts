@@ -150,6 +150,44 @@ function evaluateNumericFilter(
   return true;
 }
 
+/** Local midnight of a row timestamp (ISO, or ClickHouse's space-separated form). */
+function rowDay(rawValue: unknown): number {
+  const str = toSafeString(rawValue);
+  const t = new Date(str.includes(" ") && !str.includes("T") ? str.replace(" ", "T") : str);
+  return t.setHours(0, 0, 0, 0);
+}
+
+/** Local midnight of a filter value — the date picker stores epoch milliseconds. */
+function filterDay(value: unknown): number {
+  return new Date(Number(value)).setHours(0, 0, 0, 0);
+}
+
+/**
+ * Dates compare by calendar day: the picker selects days, so "is 12 Jun"
+ * has to match every row stamped any time on 12 Jun.
+ */
+function evaluateDateFilter(
+  rawValue: unknown,
+  value: unknown,
+  operator: string
+): boolean {
+  const day = rowDay(rawValue);
+  if (Number.isNaN(day)) return false;
+  if (operator === "isBetween") {
+    if (!Array.isArray(value) || value.length !== 2) return true;
+    return day >= filterDay(value[0]) && day <= filterDay(value[1]);
+  }
+  const target = filterDay(Array.isArray(value) ? value[0] : value);
+  if (Number.isNaN(target)) return true;
+  if (operator === "eq") return day === target;
+  if (operator === "ne") return day !== target;
+  if (operator === "lt") return day < target;
+  if (operator === "lte") return day <= target;
+  if (operator === "gt") return day > target;
+  if (operator === "gte") return day >= target;
+  return true;
+}
+
 function evaluateTextFilter(
   strRaw: string,
   strVal: string,
@@ -195,6 +233,10 @@ function evaluateFilter<TData>(
     return true;
   }
 
+  if (filter.variant === "date" || filter.variant === "dateRange") {
+    return evaluateDateFilter(rawValue, value, operator);
+  }
+
   if (operator === "inArray" || operator === "notInArray") {
     const targetArray = Array.isArray(value)
       ? value.map((v) => toSafeString(v).toLowerCase())
@@ -213,7 +255,7 @@ function evaluateFilter<TData>(
   }
 
   if (typeof rawValue === "boolean") {
-    const boolTarget = value === "true" || value === true;
+    const boolTarget = value === "true";
     return operator === "eq" ? rawValue === boolTarget : rawValue !== boolTarget;
   }
 

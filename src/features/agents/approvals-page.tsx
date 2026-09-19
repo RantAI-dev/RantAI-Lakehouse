@@ -19,20 +19,14 @@ import { ApprovalBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { useDataTable } from "@/hooks/use-data-table"
+import { filterDataClientSide } from "@/lib/data-table"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import { formatCost, formatRelativeTime } from "@/lib/format"
-import { APPROVAL_STATUS_LABEL } from "@/lib/status"
 import { agentService } from "@/services"
 import type { ApprovalItem } from "@/services/contracts/agents"
 import { getApprovalColumns } from "./approval-columns"
-
-const STATUS_OPTIONS = Object.entries(APPROVAL_STATUS_LABEL).map(
-  ([value, label]) => ({
-    value,
-    label,
-  })
-)
 
 interface DrawerContentProps {
   readonly selected: ApprovalItem
@@ -223,16 +217,36 @@ export function ApprovalsPage() {
 
   const data = state.data ?? []
 
+  const tableUrlState = useTableUrlState()
+  const filteredData = React.useMemo(
+    () =>
+      filterDataClientSide(state.data ?? [], {
+        search: tableUrlState.search,
+        searchFields: [
+          (r) => r.action,
+          (r) => r.employeeName,
+          (r) => r.resource,
+          (r) => r.risk,
+        ],
+        filters: tableUrlState.filters,
+        joinOperator: tableUrlState.joinOperator,
+      }),
+    [state.data, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
+  )
+
   const { table } = useDataTable({
-    data,
+    data: filteredData,
     columns,
-    pageCount: 1,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/agents/approvals",
     initialState: {
       columnPinning: { right: ["actions"] },
     },
-    getRowId: (originalRow) => originalRow.id,
-    shallow: false,
-    clearOnDefault: true,
+    getRowId: (row) => row.id,
   })
 
   async function confirmDecision() {

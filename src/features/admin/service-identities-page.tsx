@@ -13,24 +13,12 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useDataTable } from "@/hooks/use-data-table"
+import { filterDataClientSide } from "@/lib/data-table"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import { identityService } from "@/services"
-import type { ServiceIdentity } from "@/services/contracts/identity"
-import type { DataTableFilterField } from "@/types/data-table"
 import { getServiceIdentityColumns } from "./service-identities-columns"
-
-const filterFields: DataTableFilterField<ServiceIdentity>[] = [
-  {
-    id: "rotationStatus",
-    label: "Rotation",
-    options: [
-      { value: "current", label: "Current" },
-      { value: "due", label: "Rotation due" },
-      { value: "expired", label: "Expired" },
-    ],
-  },
-]
 
 export function ServiceIdentitiesPage() {
   const { hasPermission } = useAuth()
@@ -55,18 +43,35 @@ export function ServiceIdentitiesPage() {
 
   const columns = React.useMemo(() => getServiceIdentityColumns(), [])
 
+  const tableUrlState = useTableUrlState()
+  const filteredData = React.useMemo(
+    () =>
+      filterDataClientSide(state.data ?? [], {
+        search: tableUrlState.search,
+        searchFields: [
+          (r) => r.name,
+          (r) => r.scopes.join(" "),
+          (r) => r.environment,
+        ],
+        filters: tableUrlState.filters,
+        joinOperator: tableUrlState.joinOperator,
+      }),
+    [state.data, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
+  )
+
   const { table } = useDataTable({
-    data: state.data ?? [],
+    data: filteredData,
     columns,
-    pageCount: 1,
-    filterFields,
-    enableRowSelection: false,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/admin/service-identities",
     initialState: {
       columnPinning: { right: ["actions"] },
     },
     getRowId: (row) => row.id,
-    shallow: false,
-    clearOnDefault: true,
   })
 
   function resetForm() {
@@ -116,9 +121,7 @@ export function ServiceIdentitiesPage() {
         <div className="space-y-4">
           <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
             <DataTableSearch
-              table={table}
               placeholder="Search identity, scopes..."
-              className="h-8 w-40 lg:w-64"
             />
           </DataTableAdvancedToolbar>
           <div className="rounded-md border">
@@ -149,97 +152,6 @@ export function ServiceIdentitiesPage() {
             value={scopes}
             onChange={(e) => setScopes(e.target.value)}
             placeholder="query:read, storage:write"
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="si-env">Environment</Label>
-          <Input
-            id="si-env"
-            value={environment}
-            onChange={(e) => setEnvironment(e.target.value)}
-            placeholder="production"
-          />
-        </div>
-      </CreateSheet>
-    </div>
-  )
-}
-    const result = await create.run({
-      name: name.trim(),
-      scopes: scopes
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean),
-      environment: environment.trim(),
-    })
-    if (result) {
-      setCreateOpen(false)
-      resetForm()
-      state.reload()
-    }
-  }
-
-  return (
-    <div className="flex flex-col gap-4">
-      <PageHeader
-        title="Service Identities"
-        description="Machine clients, scopes, rotation, and recent use."
-        actions={
-          <Button
-            size="sm"
-            onClick={() => setCreateOpen(true)}
-            disabled={!canWrite}
-            title={canWrite ? undefined : "You don't have permission to create service identities."}
-          >
-            <PlusIcon data-icon="inline-start" />
-            Create Service Identity
-          </Button>
-        }
-      />
-      <FilterToolbar>
-        <SearchField
-          value={search}
-          onChange={setSearch}
-          placeholder="Search name, scopes..."
-        />
-        <FilterSelect
-          value={rotation}
-          onChange={setRotation}
-          options={ROTATION_OPTIONS}
-          allLabel="All rotation states"
-          ariaLabel="Filter by rotation status"
-        />
-      </FilterToolbar>
-      {state.status === "loading" ? <LoadingSkeleton /> : null}
-      {state.status === "error" ? (
-        <ErrorState error={state.error} onRetry={state.reload} />
-      ) : null}
-      {state.status === "success" ? (
-        <DataTable columns={columns} rows={filtered} rowKey={(r) => r.id} />
-      ) : null}
-      <CreateSheet
-        open={createOpen}
-        onOpenChange={(open) => {
-          setCreateOpen(open)
-          if (!open) resetForm()
-        }}
-        title="Create Service Identity"
-        description="Register a machine client with scopes and environment."
-        canSubmit={Boolean(name.trim() && scopes.trim() && environment.trim())}
-        submitting={create.status === "pending"}
-        onSubmit={handleCreate}
-      >
-        <div className="space-y-1.5">
-          <Label htmlFor="si-name">Name</Label>
-          <Input id="si-name" value={name} onChange={(e) => setName(e.target.value)} />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor="si-scopes">Scopes (comma-separated)</Label>
-          <Input
-            id="si-scopes"
-            value={scopes}
-            onChange={(e) => setScopes(e.target.value)}
-            placeholder="pipelines:write, catalog:read"
           />
         </div>
         <div className="space-y-1.5">

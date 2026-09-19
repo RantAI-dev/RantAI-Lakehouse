@@ -74,12 +74,22 @@ export function getSavedQueryColumns(options: {
         <DataTableColumnHeader column={column} label="Title" />
       ),
       cell: ({ row }) => <span className="font-medium">{row.original.title}</span>,
+      enableColumnFilter: true,
+      meta: {
+        label: "Title",
+        variant: "text",
+      },
     },
     {
       accessorKey: "owner",
       header: ({ column }) => (
         <DataTableColumnHeader column={column} label="Owner" />
       ),
+      enableColumnFilter: true,
+      meta: {
+        label: "Owner",
+        variant: "text",
+      },
     },
     {
       accessorKey: "tags",
@@ -95,6 +105,11 @@ export function getSavedQueryColumns(options: {
         <DataTableColumnHeader column={column} label="Updated" />
       ),
       cell: ({ row }) => formatRelativeTime(row.original.updatedAt),
+      enableColumnFilter: true,
+      meta: {
+        label: "Updated",
+        variant: "date",
+      },
     },
     {
       id: "actions",

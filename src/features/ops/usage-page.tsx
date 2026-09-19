@@ -10,6 +10,8 @@ import { ErrorState, MetricSkeleton } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { TierBadge } from "@/components/patterns/status-badge"
 import { useDataTable } from "@/hooks/use-data-table"
+import { filterDataClientSide } from "@/lib/data-table"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService } from "@/hooks/use-service"
 import { formatBytes, formatCompactNumber, formatPercent } from "@/lib/format"
 import type { StorageTier } from "@/lib/status"
@@ -22,26 +24,40 @@ type TenantRow = UsageSummary["tenants"][number]
 function TenantBudgetsTable({ tenants }: { readonly tenants: readonly TenantRow[] }) {
   const columns = React.useMemo(() => getUsageTenantColumns(), [])
 
+  const tableUrlState = useTableUrlState()
+  const filteredData = React.useMemo(
+    () =>
+      filterDataClientSide(tenants as TenantRow[], {
+        search: tableUrlState.search,
+        searchFields: [
+          (r) => r.name,
+        ],
+        filters: tableUrlState.filters,
+        joinOperator: tableUrlState.joinOperator,
+      }),
+    [tenants, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
+  )
+
   const { table } = useDataTable({
-    data: tenants as TenantRow[],
+    data: filteredData,
     columns,
-    pageCount: 1,
-    enableRowSelection: false,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/usage",
     initialState: {
       columnPinning: { right: ["actions"] },
     },
     getRowId: (row) => row.id,
-    shallow: false,
-    clearOnDefault: true,
   })
 
   return (
     <div className="space-y-4">
       <DataTableAdvancedToolbar table={table}>
         <DataTableSearch
-          table={table}
           placeholder="Search tenants..."
-          className="h-8 w-40 lg:w-64"
         />
       </DataTableAdvancedToolbar>
       <div className="rounded-md border">

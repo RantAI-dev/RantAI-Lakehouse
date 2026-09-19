@@ -18,34 +18,13 @@ import { HealthBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
+import { filterDataClientSide } from "@/lib/data-table"
 import { formatRelativeTime } from "@/lib/format"
 import { withNotify } from "@/lib/notify"
-import { HEALTH_LABEL, type Health } from "@/lib/status"
 import { connectorService } from "@/services"
 import type { Connector } from "@/services/contracts/connectors"
-import type { DataTableFilterField } from "@/types/data-table"
 import { DIRECTION_LABEL, getConnectorColumns } from "./connectors-columns"
-
-type Direction = Connector["direction"]
-
-const filterFields: DataTableFilterField<Connector>[] = [
-  {
-    id: "direction",
-    label: "Direction",
-    options: (Object.keys(DIRECTION_LABEL) as Direction[]).map((d) => ({
-      value: d,
-      label: DIRECTION_LABEL[d],
-    })),
-  },
-  {
-    id: "health",
-    label: "Health",
-    options: (Object.keys(HEALTH_LABEL) as Health[]).map((h) => ({
-      value: h,
-      label: HEALTH_LABEL[h],
-    })),
-  },
-]
 
 /** Drawer body — fetches full connector detail for the selected row. */
 function ConnectorDetail({ id }: { readonly id: string }) {
@@ -212,18 +191,36 @@ export function ConnectorsPage() {
     []
   )
 
+  const tableUrlState = useTableUrlState()
+  const filteredData = useMemo(
+    () =>
+      filterDataClientSide(state.data ?? [], {
+        search: tableUrlState.search,
+        searchFields: [
+          (c) => c.name,
+          (c) => c.type,
+          (c) => c.tenant,
+          (c) => c.environment,
+        ],
+        filters: tableUrlState.filters,
+        joinOperator: tableUrlState.joinOperator,
+      }),
+    [state.data, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
+  )
+
   const { table } = useDataTable({
-    data: state.data ?? [],
+    data: filteredData,
     columns,
-    pageCount: 1,
-    filterFields,
-    enableRowSelection: false,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/connectors",
     initialState: {
       columnPinning: { right: ["actions"] },
     },
     getRowId: (row) => row.id,
-    shallow: false,
-    clearOnDefault: true,
   })
 
   return (
@@ -257,9 +254,7 @@ export function ConnectorsPage() {
         <div className="space-y-4">
           <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
             <DataTableSearch
-              table={table}
               placeholder="Search connectors..."
-              className="h-8 w-40 lg:w-64"
             />
           </DataTableAdvancedToolbar>
           <div className="rounded-md border">
@@ -271,16 +266,6 @@ export function ConnectorsPage() {
       <DetailDrawer
         open={selected !== null}
         onOpenChange={(open) => {
-          if (!open) setSelected(null)
-        }}
-        title={selected?.name ?? ""}
-        description={selected?.type}
-      >
-        {selected ? <ConnectorDetail id={selected.id} /> : null}
-      </DetailDrawer>
-    </div>
-  )
-}
           if (!open) setSelected(null)
         }}
         title={selected?.name ?? ""}

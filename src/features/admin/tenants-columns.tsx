@@ -37,7 +37,7 @@ export function getTenantColumns({
     {
       accessorKey: "name",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Tenant" />
+        <DataTableColumnHeader column={column} label="Tenant" />
       ),
       cell: ({ row }) => {
         const r = row.original
@@ -54,6 +54,7 @@ export function getTenantColumns({
           </div>
         )
       },
+      enableColumnFilter: true,
       meta: {
         label: "Tenant",
         variant: "text",
@@ -62,31 +63,34 @@ export function getTenantColumns({
     {
       accessorKey: "plan",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Plan" />
+        <DataTableColumnHeader column={column} label="Plan" />
       ),
       cell: ({ row }) => <span>{row.original.plan}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Plan",
-        variant: "select",
+        variant: "text",
       },
     },
     {
       accessorKey: "residency",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Residency" />
+        <DataTableColumnHeader column={column} label="Residency" />
       ),
       cell: ({ row }) => <span>{row.original.residency}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Residency",
-        variant: "select",
+        variant: "text",
       },
     },
     {
       accessorKey: "users",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Users" />
+        <DataTableColumnHeader column={column} label="Users" />
       ),
       cell: ({ row }) => <span>{formatNumber(row.original.users)}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Users",
         variant: "number",
@@ -95,9 +99,10 @@ export function getTenantColumns({
     {
       accessorKey: "agents",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Agents" />
+        <DataTableColumnHeader column={column} label="Agents" />
       ),
       cell: ({ row }) => <span>{formatNumber(row.original.agents)}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Agents",
         variant: "number",
@@ -106,9 +111,10 @@ export function getTenantColumns({
     {
       accessorKey: "storageBytes",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Storage" />
+        <DataTableColumnHeader column={column} label="Storage" />
       ),
       cell: ({ row }) => <span>{formatBytes(row.original.storageBytes)}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Storage",
         variant: "number",
@@ -117,7 +123,7 @@ export function getTenantColumns({
     {
       id: "compute",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Compute quota" />
+        <DataTableColumnHeader column={column} label="Compute quota" />
       ),
       cell: ({ row }) => <span>{computeQuota(row.original)}</span>,
       meta: {

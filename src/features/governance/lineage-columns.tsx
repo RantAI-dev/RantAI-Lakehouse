@@ -18,12 +18,12 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
-import type { LineageEdge, LineageNode } from "@/services/contracts/governance"
+import type { LineageEdge, LineageGraph } from "@/services/contracts/governance"
 
 export function getLineageColumns({
   nodes,
 }: {
-  nodes: LineageNode[]
+  nodes: LineageGraph["nodes"]
 }): ColumnDef<LineageEdge>[] {
   const nodeMap = new Map(nodes.map((n) => [n.id, n.label]))
   const getLabel = (id: string) => nodeMap.get(id) ?? id

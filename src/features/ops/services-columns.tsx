@@ -14,7 +14,13 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { formatPercent } from "@/lib/format"
+import { HEALTH_LABEL, type Health } from "@/lib/status"
 import type { PlatformService } from "@/services/contracts/ops"
+
+const HEALTH_OPTIONS = (Object.keys(HEALTH_LABEL) as Health[]).map((h) => ({
+  value: h,
+  label: HEALTH_LABEL[h],
+}))
 
 function DependencyPills({ dependencies }: { readonly dependencies: readonly string[] }) {
   if (dependencies.length === 0) return <span>—</span>
@@ -38,7 +44,7 @@ export function getServiceColumns({
     {
       accessorKey: "name",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Service" />
+        <DataTableColumnHeader column={column} label="Service" />
       ),
       cell: ({ row }) => {
         const r = row.original
@@ -57,6 +63,7 @@ export function getServiceColumns({
           </div>
         )
       },
+      enableColumnFilter: true,
       meta: {
         label: "Service",
         variant: "text",
@@ -65,20 +72,23 @@ export function getServiceColumns({
     {
       accessorKey: "health",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Health" />
+        <DataTableColumnHeader column={column} label="Health" />
       ),
       cell: ({ row }) => <HealthBadge health={row.original.health} />,
+      enableColumnFilter: true,
       meta: {
         label: "Health",
         variant: "select",
+        options: HEALTH_OPTIONS,
       },
     },
     {
       accessorKey: "replicas",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Replicas" />
+        <DataTableColumnHeader column={column} label="Replicas" />
       ),
       cell: ({ row }) => <span>{row.original.replicas}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Replicas",
         variant: "number",
@@ -87,13 +97,14 @@ export function getServiceColumns({
     {
       accessorKey: "errorRate",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Error rate" />
+        <DataTableColumnHeader column={column} label="Error rate" />
       ),
       cell: ({ row }) => (
         <span className="font-mono text-xs">
           {formatPercent(row.original.errorRate)}
         </span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Error rate",
         variant: "number",
@@ -102,11 +113,12 @@ export function getServiceColumns({
     {
       accessorKey: "latencyMs",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Latency" />
+        <DataTableColumnHeader column={column} label="Latency" />
       ),
       cell: ({ row }) => (
         <span className="font-mono text-xs">{row.original.latencyMs} ms</span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Latency",
         variant: "number",
@@ -115,7 +127,7 @@ export function getServiceColumns({
     {
       id: "dependencies",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Dependencies" />
+        <DataTableColumnHeader column={column} label="Dependencies" />
       ),
       cell: ({ row }) => (
         <DependencyPills dependencies={row.original.dependencies} />

@@ -10,24 +10,13 @@ import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { HealthBadge, Pill } from "@/components/patterns/status-badge"
 import { useDataTable } from "@/hooks/use-data-table"
+import { filterDataClientSide } from "@/lib/data-table"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService } from "@/hooks/use-service"
 import { formatPercent } from "@/lib/format"
-import { HEALTH_LABEL, type Health } from "@/lib/status"
 import { opsService } from "@/services"
 import type { PlatformService } from "@/services/contracts/ops"
-import type { DataTableFilterField } from "@/types/data-table"
 import { getServiceColumns } from "./services-columns"
-
-const filterFields: DataTableFilterField<PlatformService>[] = [
-  {
-    id: "health",
-    label: "Health",
-    options: (Object.keys(HEALTH_LABEL) as Health[]).map((h) => ({
-      value: h,
-      label: HEALTH_LABEL[h],
-    })),
-  },
-]
 
 function DependencyPills({ dependencies }: { readonly dependencies: readonly string[] }) {
   if (dependencies.length === 0) return <span>—</span>
@@ -51,18 +40,35 @@ export function ServicesPage() {
     []
   )
 
+  const tableUrlState = useTableUrlState()
+  const filteredData = React.useMemo(
+    () =>
+      filterDataClientSide(state.data ?? [], {
+        search: tableUrlState.search,
+        searchFields: [
+          (r) => r.name,
+          (r) => r.site,
+          (r) => r.version,
+        ],
+        filters: tableUrlState.filters,
+        joinOperator: tableUrlState.joinOperator,
+      }),
+    [state.data, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
+  )
+
   const { table } = useDataTable({
-    data: state.data ?? [],
+    data: filteredData,
     columns,
-    pageCount: 1,
-    filterFields,
-    enableRowSelection: false,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/services",
     initialState: {
       columnPinning: { right: ["actions"] },
     },
     getRowId: (row) => row.id,
-    shallow: false,
-    clearOnDefault: true,
   })
 
   return (
@@ -79,9 +85,7 @@ export function ServicesPage() {
         <div className="space-y-4">
           <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
             <DataTableSearch
-              table={table}
               placeholder="Search name, site..."
-              className="h-8 w-40 lg:w-64"
             />
           </DataTableAdvancedToolbar>
           <div className="rounded-md border">

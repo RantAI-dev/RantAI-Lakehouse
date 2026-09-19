@@ -16,7 +16,13 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { formatCost, formatRelativeTime } from "@/lib/format"
+import { AGENT_RUN_STATUS_LABEL } from "@/lib/status"
 import type { AgentRun } from "@/services/contracts/agents"
+
+const STATUS_OPTIONS = Object.entries(AGENT_RUN_STATUS_LABEL).map(([value, label]) => ({
+  value,
+  label,
+}))
 
 export function getRunColumns(): ColumnDef<AgentRun>[] {
   return [
@@ -39,6 +45,7 @@ export function getRunColumns(): ColumnDef<AgentRun>[] {
           </div>
         )
       },
+      enableColumnFilter: true,
       meta: {
         label: "Run",
         variant: "text",
@@ -50,9 +57,11 @@ export function getRunColumns(): ColumnDef<AgentRun>[] {
         <DataTableColumnHeader column={column} label="Status" />
       ),
       cell: ({ row }) => <AgentRunStatusBadge status={row.original.status} />,
+      enableColumnFilter: true,
       meta: {
         label: "Status",
         variant: "select",
+        options: STATUS_OPTIONS,
       },
     },
     {
@@ -61,6 +70,7 @@ export function getRunColumns(): ColumnDef<AgentRun>[] {
         <DataTableColumnHeader column={column} label="Trigger" />
       ),
       cell: ({ row }) => <span>{row.original.trigger}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Trigger",
         variant: "text",
@@ -72,6 +82,7 @@ export function getRunColumns(): ColumnDef<AgentRun>[] {
         <DataTableColumnHeader column={column} label="Actor" />
       ),
       cell: ({ row }) => <span>{row.original.actor}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Actor",
         variant: "text",
@@ -87,9 +98,10 @@ export function getRunColumns(): ColumnDef<AgentRun>[] {
           {formatRelativeTime(row.original.startedAt)}
         </span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Started",
-        variant: "text",
+        variant: "date",
       },
     },
     {
@@ -104,9 +116,10 @@ export function getRunColumns(): ColumnDef<AgentRun>[] {
             : "—"}
         </span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Ended",
-        variant: "text",
+        variant: "date",
       },
     },
     {
@@ -119,6 +132,7 @@ export function getRunColumns(): ColumnDef<AgentRun>[] {
           {formatCost(row.original.budgetConsumed)}
         </span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Cost",
         variant: "number",

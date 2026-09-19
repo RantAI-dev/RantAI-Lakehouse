@@ -12,6 +12,8 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { useDataTable } from "@/hooks/use-data-table"
+import { filterDataClientSide } from "@/lib/data-table"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import {
@@ -40,18 +42,35 @@ export function EmployeesPage() {
 
   const columns = React.useMemo(() => getEmployeeColumns(), [])
 
-  const data = state.data ?? []
+  const tableUrlState = useTableUrlState()
+  const filteredData = React.useMemo(
+    () =>
+      filterDataClientSide(state.data ?? [], {
+        search: tableUrlState.search,
+        searchFields: [
+          (r) => r.name,
+          (r) => r.purpose,
+          (r) => r.owner,
+        ],
+        filters: tableUrlState.filters,
+        joinOperator: tableUrlState.joinOperator,
+      }),
+    [state.data, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
+  )
 
   const { table } = useDataTable({
-    data,
+    data: filteredData,
     columns,
-    pageCount: 1,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/agents/employees",
     initialState: {
       columnPinning: { right: ["actions"] },
     },
-    getRowId: (originalRow) => originalRow.id,
-    shallow: false,
-    clearOnDefault: true,
+    getRowId: (row) => row.id,
   })
 
   const create = useServiceAction(

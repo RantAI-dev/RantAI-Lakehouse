@@ -9,8 +9,27 @@ import { formatCost, formatDuration, formatRelativeTime } from "@/lib/format"
 import {
   ENGINE_CATEGORY_LABEL,
   WORKLOAD_CLASS_LABEL,
+  WORKLOAD_STATUS_LABEL,
+  type EngineCategory,
+  type WorkloadClass,
+  type WorkloadStatus,
 } from "@/lib/status"
 import type { WorkloadItem } from "@/services/contracts/ops"
+
+const STATUS_OPTIONS = (Object.keys(WORKLOAD_STATUS_LABEL) as WorkloadStatus[]).map((s) => ({
+  value: s,
+  label: WORKLOAD_STATUS_LABEL[s],
+}))
+
+const CLASS_OPTIONS = (Object.keys(WORKLOAD_CLASS_LABEL) as WorkloadClass[]).map((c) => ({
+  value: c,
+  label: WORKLOAD_CLASS_LABEL[c],
+}))
+
+const ENGINE_OPTIONS = (Object.keys(ENGINE_CATEGORY_LABEL) as EngineCategory[]).map((e) => ({
+  value: e,
+  label: ENGINE_CATEGORY_LABEL[e],
+}))
 
 export function getWorkloadColumns({
   onCancel,
@@ -25,11 +44,12 @@ export function getWorkloadColumns({
     {
       accessorKey: "principal",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Principal" />
+        <DataTableColumnHeader column={column} label="Principal" />
       ),
       cell: ({ row }) => (
         <span className="font-medium">{row.original.principal}</span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Principal",
         variant: "text",
@@ -38,9 +58,10 @@ export function getWorkloadColumns({
     {
       accessorKey: "tenant",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Tenant" />
+        <DataTableColumnHeader column={column} label="Tenant" />
       ),
       cell: ({ row }) => <span>{row.original.tenant}</span>,
+      enableColumnFilter: true,
       meta: {
         label: "Tenant",
         variant: "text",
@@ -49,33 +70,37 @@ export function getWorkloadColumns({
     {
       accessorKey: "class",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Class" />
+        <DataTableColumnHeader column={column} label="Class" />
       ),
       cell: ({ row }) => (
         <span>{WORKLOAD_CLASS_LABEL[row.original.class]}</span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Class",
         variant: "select",
+        options: CLASS_OPTIONS,
       },
     },
     {
       accessorKey: "engine",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Engine" />
+        <DataTableColumnHeader column={column} label="Engine" />
       ),
       cell: ({ row }) => (
         <span>{ENGINE_CATEGORY_LABEL[row.original.engine]}</span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Engine",
         variant: "select",
+        options: ENGINE_OPTIONS,
       },
     },
     {
       accessorKey: "status",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Status" />
+        <DataTableColumnHeader column={column} label="Status" />
       ),
       cell: ({ row }) => {
         const r = row.original
@@ -90,36 +115,40 @@ export function getWorkloadColumns({
           </div>
         )
       },
+      enableColumnFilter: true,
       meta: {
         label: "Status",
         variant: "select",
+        options: STATUS_OPTIONS,
       },
     },
     {
       accessorKey: "startedAt",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Started" />
+        <DataTableColumnHeader column={column} label="Started" />
       ),
       cell: ({ row }) => (
         <span className="text-muted-foreground">
           {formatRelativeTime(row.original.startedAt)}
         </span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Started",
-        variant: "text",
+        variant: "date",
       },
     },
     {
       accessorKey: "elapsedMs",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Elapsed" />
+        <DataTableColumnHeader column={column} label="Elapsed" />
       ),
       cell: ({ row }) => (
         <span className="font-mono text-xs">
           {formatDuration(row.original.elapsedMs)}
         </span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Elapsed",
         variant: "number",
@@ -128,13 +157,14 @@ export function getWorkloadColumns({
     {
       accessorKey: "estimatedCost",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="Est. cost" />
+        <DataTableColumnHeader column={column} label="Est. cost" />
       ),
       cell: ({ row }) => (
         <span className="font-mono text-xs">
           {formatCost(row.original.estimatedCost)}
         </span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Est. cost",
         variant: "number",

@@ -59,6 +59,7 @@ export function getAlertColumns(options: AlertColumnOptions): ColumnDef<AlertIte
         </Button>
       ),
       cell: ({ row }) => <SeverityBadge severity={row.original.severity} />,
+      enableColumnFilter: true,
       meta: {
         label: "Severity",
         variant: "select",
@@ -97,6 +98,7 @@ export function getAlertColumns(options: AlertColumnOptions): ColumnDef<AlertIte
           </button>
         )
       },
+      enableColumnFilter: true,
       meta: {
         label: "Alert Title",
         variant: "text",
@@ -119,6 +121,7 @@ export function getAlertColumns(options: AlertColumnOptions): ColumnDef<AlertIte
       cell: ({ row }) => (
         <span className="text-muted-foreground">{row.original.source}</span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Source",
         variant: "text",
@@ -141,6 +144,7 @@ export function getAlertColumns(options: AlertColumnOptions): ColumnDef<AlertIte
       cell: ({ row }) => (
         <span className="font-mono text-xs">{row.original.affected}</span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "Affected Target",
         variant: "text",
@@ -161,6 +165,7 @@ export function getAlertColumns(options: AlertColumnOptions): ColumnDef<AlertIte
         </Button>
       ),
       cell: ({ row }) => <AlertStatusBadge status={row.original.status} />,
+      enableColumnFilter: true,
       meta: {
         label: "Status",
         variant: "select",
@@ -196,6 +201,7 @@ export function getAlertColumns(options: AlertColumnOptions): ColumnDef<AlertIte
         ) : (
           <span className="text-xs text-muted-foreground">Unassigned</span>
         ),
+      enableColumnFilter: true,
       meta: {
         label: "Assignee",
         variant: "text",
@@ -220,9 +226,10 @@ export function getAlertColumns(options: AlertColumnOptions): ColumnDef<AlertIte
           {formatRelativeTime(row.original.at)}
         </span>
       ),
+      enableColumnFilter: true,
       meta: {
         label: "When",
-        variant: "text",
+        variant: "date",
       },
     },
     {
