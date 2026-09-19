@@ -1,5 +1,6 @@
 import type { Column } from "@tanstack/react-table";
 import { dataTableConfig } from "@/config/data-table";
+import { parseTimestamp } from "@/lib/format";
 import type {
   ExtendedColumnFilter,
   FilterOperator,
@@ -150,11 +151,9 @@ function evaluateNumericFilter(
   return true;
 }
 
-/** Local midnight of a row timestamp (ISO, or ClickHouse's space-separated form). */
+/** Local midnight of a row timestamp (ISO, or ClickHouse's zoneless UTC form). */
 function rowDay(rawValue: unknown): number {
-  const str = toSafeString(rawValue);
-  const t = new Date(str.includes(" ") && !str.includes("T") ? str.replace(" ", "T") : str);
-  return t.setHours(0, 0, 0, 0);
+  return parseTimestamp(toSafeString(rawValue)).setHours(0, 0, 0, 0);
 }
 
 /** Local midnight of a filter value — the date picker stores epoch milliseconds. */

@@ -55,9 +55,24 @@ export function formatPercent(fraction: number): string {
   return `${(fraction * 100).toFixed(1)}%`
 }
 
+/**
+ * Timestamp string → `Date`.
+ *
+ * ClickHouse's `toString(DateTime)` gives `"2026-09-13 07:09:40"`: no `T`, no
+ * zone. The server runs in UTC, but a zoneless string parses as local time, so
+ * in WIB every such stamp read 7 hours old. Treat that exact shape as UTC;
+ * anything carrying its own `T` or offset parses as written.
+ */
+export function parseTimestamp(value: string): Date {
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(value)) {
+    return new Date(`${value.replace(" ", "T")}Z`)
+  }
+  return new Date(value)
+}
+
 /** ISO timestamp → "12 Jun 2026, 09:41". */
 export function formatDateTime(iso: string): string {
-  const d = new Date(iso)
+  const d = parseTimestamp(iso)
   if (Number.isNaN(d.getTime())) return "—"
   return Intl.DateTimeFormat("en", {
     day: "2-digit",
@@ -97,7 +112,7 @@ export function formatDate(
 
 /** ISO timestamp → relative age, e.g. "4m ago", "3h ago", "2d ago". */
 export function formatRelativeTime(iso: string, now = Date.now()): string {
-  const t = new Date(iso).getTime()
+  const t = parseTimestamp(iso).getTime()
   if (Number.isNaN(t)) return "—"
   const diffMs = now - t
   if (diffMs < 0) return "just now"

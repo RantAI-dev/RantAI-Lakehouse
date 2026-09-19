@@ -7,8 +7,9 @@ type Row = { id: string; at: string; active: boolean }
 const rows: Row[] = [
   { id: "a", at: "2026-06-11T23:30:00", active: true },
   { id: "b", at: "2026-06-12T08:00:00", active: false },
-  // Format ClickHouse (spasi, bukan `T`) harus terbaca sama.
-  { id: "c", at: "2026-06-12 21:15:00", active: true },
+  // Format ClickHouse (spasi, tanpa zona) dibaca sebagai UTC; tengah hari
+  // UTC tetap jatuh di tanggal 12 untuk zona waktu UTC-11 s.d. UTC+11.
+  { id: "c", at: "2026-06-12 12:00:00", active: true },
   { id: "d", at: "2026-06-13T00:05:00", active: true },
 ]
 
