@@ -82,7 +82,7 @@ export function CopilotDock() {
                   {c.pageContext.suggest[c.mode].map((s) => (
                     <button
                       key={s}
-                      onClick={() => c.requestSend(s)}
+                      onClick={() => c.send(s)}
                       disabled={c.busy}
                       className="rounded-lg border border-border/70 bg-muted/20 px-3 py-2 text-left text-xs text-foreground transition-colors hover:bg-muted hover:border-primary/40 disabled:opacity-50"
                     >
@@ -95,7 +95,7 @@ export function CopilotDock() {
               <ChatMessages
                 messages={c.messages}
                 busy={c.busy}
-                error={c.error}
+                error={c.error} progress={c.progress} onRetry={c.retry}
                 onConfirmTool={c.confirmTool}
                 onCancelTool={c.cancelTool}
                 onCompleteTool={c.completeToolStep}
@@ -107,14 +107,14 @@ export function CopilotDock() {
       ) : null}
 
       {/* Bar input — glass; compact pill when collapsed, full when expanded */}
-      <ChatComposer
+      <ChatComposer onStop={c.stop}
         glass
         compact={!showPanel}
         mode={c.mode}
         setMode={c.setMode}
         onSend={(t) => {
           c.setExpanded(true);
-          c.requestSend(t);
+          c.send(t);
         }}
         busy={c.busy}
         rows={1}

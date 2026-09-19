@@ -89,7 +89,7 @@ export function CopilotPage() {
                 {c.pageContext.suggest[c.mode].map((s) => (
                   <button
                     key={s}
-                    onClick={() => c.requestSend(s)}
+                    onClick={() => c.send(s)}
                     disabled={c.busy}
                     className="inline-flex items-center gap-2 rounded-full border border-border bg-background px-4 py-2 text-sm font-medium text-foreground/80 transition-all hover:border-primary/40 hover:bg-muted/50 hover:text-foreground disabled:opacity-50"
                   >
@@ -100,15 +100,15 @@ export function CopilotPage() {
             </div>
           ) : (
             <ChatMessages
-              messages={c.messages} busy={c.busy} error={c.error}
+              messages={c.messages} busy={c.busy} error={c.error} progress={c.progress} onRetry={c.retry}
               onConfirmTool={c.confirmTool} onCancelTool={c.cancelTool} onCompleteTool={c.completeToolStep} confirmingKey={c.confirmingKey}
             />
           )}
         </div>
 
         <div className="shrink-0 pt-3">
-          <ChatComposer
-            mode={c.mode} setMode={c.setMode} onSend={c.requestSend} busy={c.busy}
+          <ChatComposer onStop={c.stop}
+            mode={c.mode} setMode={c.setMode} onSend={c.send} busy={c.busy}
             enabledCaps={c.enabledCaps} toggleCap={c.toggleCap}
             placeholder="Ask anything about your lakehouse data…"
           />

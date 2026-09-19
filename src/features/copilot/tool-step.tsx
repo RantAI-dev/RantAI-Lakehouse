@@ -2,11 +2,12 @@
 
 import * as React from "react";
 import Link from "next/link";
+import { ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 export type ToolStep = { tool: string; args: unknown; ok: boolean; result: unknown };
 
-const TOOL_LABEL: Record<string, string> = {
+export const TOOL_LABEL: Record<string, string> = {
   run_sql: "SQL query",
   list_datasets: "Search datasets",
   describe_dataset: "Dataset schema",
@@ -235,6 +236,7 @@ export function ToolStepCard({ step }: { step: ToolStep }) {
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
         className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-xs"
       >
         <span
@@ -253,7 +255,10 @@ export function ToolStepCard({ step }: { step: ToolStep }) {
             needs confirmation
           </span>
         ) : null}
-        <span className="ml-auto font-mono text-[10px] text-muted-foreground">{open ? "−" : "+"}</span>
+        <ChevronRight
+          className={cn("ml-auto size-3.5 shrink-0 text-muted-foreground transition-transform", open && "rotate-90")}
+          aria-hidden
+        />
       </button>
       {open ? (
         <div className="border-t border-border px-2.5 pb-2 pt-1">

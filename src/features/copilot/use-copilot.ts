@@ -3,17 +3,21 @@
 import * as React from "react";
 import { usePathname } from "next/navigation";
 import type { ToolStep } from "./tool-step";
-import { ALL_CAP_KEYS, capsForMode, toolsFromCaps } from "./capabilities";
+import { ALL_CAP_KEYS, toolsFromCaps } from "./capabilities";
 import { derivePageContext, type PageContext } from "./page-context";
-import { CopilotConfirmWriteDialog } from "./confirm-write-dialog";
+import { readNdjson } from "@/lib/ndjson";
 import { notifyError, notifySuccess } from "@/lib/notify";
 import { apiFetch } from "@/services/http";
 
 export type Mode = "ask" | "build";
 export type DockPosition = "bottom" | "right";
 export type Msg = {
+  /** Stable React key; older saved sessions get one when loaded. */
+  id?: string;
   role: "user" | "assistant";
   content: string;
+  /** The user stopped this answer before it arrived. */
+  stopped?: boolean;
   tools?: ToolStep[];
   buildRunId?: string;
   chartCreated?: boolean;
@@ -26,6 +30,28 @@ export type SessionMeta = {
   chartCreated?: boolean;
   /** Last message's content, truncated server-side; still markdown. */
   preview?: string;
+};
+
+/** What Copilot is doing while an answer is on its way. */
+export type ChatProgress = { phase: "thinking" | "tool"; tool?: string; startedAt: number };
+
+function newMsgId(): string {
+  return typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `m_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** The message a failed chat request should show, from its JSON error body. */
+function chatErrorText(body: unknown): string {
+  const b = (body ?? {}) as { error?: string; detail?: string; hint?: string };
+  return b.detail ?? b.error ?? "Copilot couldn't answer. Try again.";
+}
+
+type ChatResult = {
+  answer?: string;
+  toolTrace?: ToolStep[];
+  buildRunId?: string;
+  chartCreated?: boolean;
 };
 
 /** How many recent sessions the header history menus list. */
@@ -148,104 +174,112 @@ function useCopilotState() {
     } catch { /* abaikan */ }
   }, [refreshSessions]);
 
+  // Every tool that changes something is gated per call on the server
+  // (`needs_confirmation` / approval), so messages are sent as typed; the
+  // old ask-before-every-Build-message dialog only added a second prompt.
+  const abortRef = React.useRef<AbortController | null>(null);
+  // A request abandoned by New chat / switching conversation: its late
+  // result must not land in whatever is open now.
+  const discardedRef = React.useRef<AbortController | null>(null);
+  const discardInFlight = React.useCallback(() => {
+    discardedRef.current = abortRef.current;
+    abortRef.current?.abort();
+  }, []);
+  const [progress, setProgress] = React.useState<ChatProgress | null>(null);
+
   /**
-   * Kapabilitas bertanda `write: true` yang sedang aktif.
-   *
-   * Tool loop dijalankan DI BACKEND (`POST /api/ai/chat` mengembalikan
-   * `toolTrace` setelah semuanya selesai), jadi tidak ada titik di frontend
-   * untuk menyela satu per satu tool sebelum dieksekusi. Gerbang konfirmasi
-   * karena itu dipasang sebelum request dikirim: begitu ada kapabilitas
-   * penulis yang aktif di mode Build, pengguna dimintai persetujuan lebih
-   * dulu — sesuai rubrik "konfirmasi sebelum aksi yang mengubah atau
-   * menghapus data".
+   * Sends `text` after `history` (default: the current conversation) and
+   * streams Copilot's progress until the answer arrives.
    */
-  const writeCaps = React.useMemo(
-    () => capsForMode(mode).filter((c) => c.write && enabledCaps.has(c.key)),
-    [mode, enabledCaps]
-  );
-
-  /** Pesan yang menunggu persetujuan; `null` berarti tidak ada. */
-  const [pendingSend, setPendingSend] = React.useState<string | null>(null);
-
-  const send = React.useCallback(async (text: string) => {
+  const send = React.useCallback(async (text: string, history?: Msg[]) => {
     const q = text.trim();
     if (!q || busy) return;
     setError(null);
-    const next: Msg[] = [...messages, { role: "user", content: q }];
+    const next: Msg[] = [...(history ?? messagesRef.current), { id: newMsgId(), role: "user", content: q }];
     setMessages(next);
     setBusy(true);
+    setProgress({ phase: "thinking", startedAt: Date.now() });
+    const controller = new AbortController();
+    abortRef.current = controller;
     try {
       const res = await apiFetch("/api/ai/chat", {
         method: "POST", headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
           mode,
+          stream: true,
           tools: toolsFromCaps(enabledCaps, mode),
           context: pageContextRef.current?.system,
-          messages: next.map((m) => ({ role: m.role, content: m.content })),
+          messages: next.filter((m) => m.content).map((m) => ({ role: m.role, content: m.content })),
         }),
       });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json?.hint ?? json?.detail ?? json?.error ?? "Copilot gagal");
-      const isChartActuallyCreated = Boolean(
-        json.chartCreated &&
-          json.toolTrace?.some(
-            (t: { tool: string; ok: boolean; result?: { created?: boolean } }) =>
-              t.tool === "create_chart" && t.ok && Boolean(t.result?.created),
+      if (!res.ok) throw new Error(chatErrorText(await res.json().catch(() => null)));
+
+      let result: ChatResult | null = null;
+      for await (const raw of readNdjson(res)) {
+        const event = raw as { type?: string; tool?: string; body?: unknown };
+        if (event.type === "status") {
+          setProgress((p) => ({ phase: "thinking", startedAt: p?.startedAt ?? Date.now() }));
+        } else if (event.type === "tool") {
+          setProgress((p) => ({ phase: "tool", tool: event.tool, startedAt: p?.startedAt ?? Date.now() }));
+        } else if (event.type === "done") {
+          result = event.body as ChatResult;
+        } else if (event.type === "error") {
+          throw new Error(chatErrorText(event.body));
+        }
+      }
+      if (!result) throw new Error("Copilot's answer was cut off. Try again.");
+
+      const chartCreated = Boolean(
+        result.chartCreated &&
+          result.toolTrace?.some(
+            (t) => t.tool === "create_chart" && t.ok && Boolean((t.result as { created?: boolean } | undefined)?.created),
           ),
       );
+      const tools = result.toolTrace ?? [];
       const full: Msg[] = [
         ...next,
         {
+          id: newMsgId(),
           role: "assistant",
-          content: json.answer || "(no answer)",
-          tools: json.toolTrace ?? [],
-          buildRunId: json.buildRunId,
-          chartCreated: isChartActuallyCreated,
+          content: result.answer || (tools.length ? "" : "Copilot didn't return an answer."),
+          tools,
+          buildRunId: result.buildRunId,
+          chartCreated,
         },
       ];
       setMessages(full);
-      if (isChartActuallyCreated) {
-        try {
-          window.dispatchEvent(new Event("dashboards:changed"));
-        } catch {
-          /* ignore */
-        }
+      if (chartCreated) {
+        try { window.dispatchEvent(new Event("dashboards:changed")); } catch { /* ignore */ }
       }
       void persist(full, mode, sessionId);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }, [busy, messages, mode, sessionId, persist, enabledCaps]);
-
-  /**
-   * Pintu masuk dari UI. Menahan pesan lebih dulu bila ada kapabilitas
-   * penulis yang aktif, dan meneruskannya langsung bila tidak ada — jadi
-   * mode Ask (yang tidak pernah punya kapabilitas `write`) tidak terganggu.
-   */
-  const requestSend = React.useCallback(
-    (text: string) => {
-      const q = text.trim();
-      if (!q || busy) return;
-      if (writeCaps.length > 0) {
-        setPendingSend(q);
-        return;
+      if (discardedRef.current === controller) return;
+      if (controller.signal.aborted) {
+        const stopped: Msg[] = [...next, { id: newMsgId(), role: "assistant", content: "", stopped: true }];
+        setMessages(stopped);
+        void persist(stopped, mode, sessionId);
+      } else {
+        setError(e instanceof Error ? e.message : String(e));
       }
-      void send(q);
-    },
-    [busy, writeCaps, send]
-  );
+    } finally {
+      abortRef.current = null;
+      setBusy(false);
+      setProgress(null);
+    }
+  }, [busy, mode, sessionId, persist, enabledCaps]);
 
-  /** Pengguna menyetujui; kirim pesan yang tertahan. */
-  const confirmSend = React.useCallback(() => {
-    const q = pendingSend;
-    setPendingSend(null);
-    if (q) void send(q);
-  }, [pendingSend, send]);
+  /** Stop waiting for the answer in flight; the server stops before its next step. */
+  const stop = React.useCallback(() => abortRef.current?.abort(), []);
 
-  /** Pengguna membatalkan; buang pesan yang tertahan. */
-  const cancelSend = React.useCallback(() => setPendingSend(null), []);
+  /** Send the last question again, dropping the failed or stopped attempt. */
+  const retry = React.useCallback(() => {
+    const msgs = messagesRef.current;
+    let last = msgs.length - 1;
+    while (last >= 0 && msgs[last].role !== "user") last--;
+    if (last < 0) return;
+    void send(msgs[last].content, msgs.slice(0, last));
+  }, [send]);
 
   /** Confirm/Cancel a `needs_confirmation` tool step (T0.4). */
   const confirmTool = React.useCallback(async (messageIndex: number, stepIndex: number) => {
@@ -324,22 +358,24 @@ function useCopilotState() {
   );
 
   const newChat = React.useCallback(() => {
+    discardInFlight();
     setMessages([]); setSessionId(null); setError(null);
-  }, []);
+  }, [discardInFlight]);
 
   const loadSession = React.useCallback(async (id: string) => {
+    discardInFlight();
     setError(null);
     try {
       const res = await apiFetch(`/api/ai/sessions?id=${encodeURIComponent(id)}`, { cache: "no-store" });
       const json = await res.json();
       if (!res.ok) throw new Error(json?.error ?? "Failed to load session");
-      setMessages((json.session.messages ?? []) as Msg[]);
+      setMessages(((json.session.messages ?? []) as Msg[]).map((m) => (m.id ? m : { ...m, id: newMsgId() })));
       if (json.session.mode === "build" || json.session.mode === "ask") setMode(json.session.mode);
       setSessionId(json.session.id);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
-  }, []);
+  }, [discardInFlight]);
 
   const removeSession = React.useCallback(async (id: string): Promise<boolean> => {
     try {
@@ -375,7 +411,7 @@ function useCopilotState() {
     mode, setMode, messages, busy, error, sessionId, sessions,
     enabledCaps, toggleCap, pageContext, setPageContext,
     send, newChat, loadSession, removeSession, renameSession, refreshSessions,
-    writeCaps, pendingSend, requestSend, confirmSend, cancelSend,
+    progress, stop, retry,
     confirmTool, cancelTool, completeToolStep, confirmingKey,
     dockPosition, setDockPosition, expanded, setExpanded,
     sidebarWidth, setSidebarWidth,
@@ -385,19 +421,10 @@ function useCopilotState() {
 type CopilotValue = ReturnType<typeof useCopilotState>;
 const CopilotContext = React.createContext<CopilotValue | null>(null);
 
-/**
- * Provider tunggal — bungkus app agar dock/halaman/sidebar berbagi 1
- * percakapan. Dialog persetujuan aksi tulis ikut dipasang di sini supaya
- * berlaku untuk semua pintu masuk percakapan sekaligus.
- */
+/** Provider tunggal — bungkus app agar dock/halaman/sidebar berbagi 1 percakapan. */
 export function CopilotProvider({ children }: { children: React.ReactNode }) {
   const value = useCopilotState();
-  return React.createElement(
-    CopilotContext.Provider,
-    { value },
-    children,
-    React.createElement(CopilotConfirmWriteDialog)
-  );
+  return React.createElement(CopilotContext.Provider, { value }, children);
 }
 
 /** Akses otak Copilot bersama. */

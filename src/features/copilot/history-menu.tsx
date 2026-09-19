@@ -39,6 +39,7 @@ export function CopilotHistoryMenu({
             <button
               type="button"
               aria-label="Switch conversation"
+              title={label}
               className="group flex min-w-0 items-center gap-1.5 rounded-md px-2 py-1 text-left transition-colors hover:bg-muted/60"
             />
           }

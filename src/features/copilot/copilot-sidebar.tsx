@@ -147,7 +147,7 @@ export function CopilotSidebar() {
                   <button
                     key={s}
                     type="button"
-                    onClick={() => c.requestSend(s)}
+                    onClick={() => c.send(s)}
                     disabled={c.busy}
                     className="rounded-xl border border-border/70 bg-muted/20 p-2.5 text-left text-xs text-foreground transition-all hover:border-primary/40 hover:bg-muted/60 disabled:opacity-50"
                   >
@@ -161,7 +161,7 @@ export function CopilotSidebar() {
           <ChatMessages
             messages={c.messages}
             busy={c.busy}
-            error={c.error}
+            error={c.error} progress={c.progress} onRetry={c.retry}
             onConfirmTool={c.confirmTool}
             onCancelTool={c.cancelTool}
             onCompleteTool={c.completeToolStep}
@@ -172,10 +172,10 @@ export function CopilotSidebar() {
 
       {/* Composer footer */}
       <div className="shrink-0 border-t border-border bg-card/60 p-3">
-        <ChatComposer
+        <ChatComposer onStop={c.stop}
           mode={c.mode}
           setMode={c.setMode}
-          onSend={c.requestSend}
+          onSend={c.send}
           busy={c.busy}
           rows={2}
           placeholder="Ask anything about your lakehouse data…"

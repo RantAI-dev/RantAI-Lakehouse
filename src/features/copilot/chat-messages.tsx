@@ -2,65 +2,49 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { AlertCircle, BarChart3, Sparkles, User } from "lucide-react";
+import { AlertCircle, BarChart3, RotateCcw, Sparkles } from "lucide-react";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { MiniMarkdown } from "./mini-markdown";
-import { ToolStepCard, asObj } from "./tool-step";
 import { BuildTree } from "./build-tree";
-import { ChartDraftCard } from "./chart-draft-card";
-import type { Msg } from "./use-copilot";
+import { CopyButton } from "./copy-button";
+import { MiniMarkdown } from "./mini-markdown";
+import { PendingActionCard } from "./pending-action-card";
+import { TOOL_LABEL, ToolStepCard, asObj } from "./tool-step";
+import type { ChatProgress, Msg } from "./use-copilot";
 
-/** Avatar bulat untuk pesan — AI (gradasi violet) / user (netral). */
-function Avatar({ ai }: { ai?: boolean }) {
+/** What Copilot is doing right now, with the time it has taken so far. */
+function ProgressLine({ progress }: { progress: ChatProgress | null }) {
+  const [now, setNow] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, []);
+  const label =
+    progress?.phase === "tool" && progress.tool
+      ? `Running ${TOOL_LABEL[progress.tool] ?? progress.tool}…`
+      : "Thinking…";
+  const seconds = progress ? Math.max(0, Math.floor((now - progress.startedAt) / 1000)) : 0;
   return (
-    <span
-      className={cn(
-        "grid size-8 shrink-0 place-items-center rounded-lg border",
-        ai
-          ? "border-violet-500/20 bg-gradient-to-br from-violet-500/15 to-purple-600/15 text-violet-600 dark:text-violet-400"
-          : "border-border bg-muted text-muted-foreground",
-      )}
-    >
-      {ai ? <Sparkles className="size-4" /> : <User className="size-4" />}
-    </span>
-  );
-}
-
-/** Titik-titik "mengetik" (dipinjam dari pola RantAI-Agents). */
-export function TypingDots({ className }: { className?: string }) {
-  return (
-    <div className={cn("flex items-center gap-1", className)}>
-      <span className="sr-only">Copilot is typing…</span>
-      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/50 [animation-delay:-0.3s]" />
-      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/50 [animation-delay:-0.15s]" />
-      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/50" />
+    <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status">
+      <Sparkles className="size-4 animate-pulse text-violet-600 dark:text-violet-400" aria-hidden />
+      <span>{label}</span>
+      {seconds >= 2 ? <span className="text-xs tabular-nums">{seconds}s</span> : null}
     </div>
   );
 }
 
-function getConfirmationSummary(res: Record<string, unknown>, rawArgs: Record<string, unknown>): string {
-  if (typeof res.summary === "string" && !res.summary.includes('""')) {
-    return res.summary;
-  }
-  const rawTitle = rawArgs.title ?? rawArgs.caption ?? rawArgs.name ?? rawArgs.text;
-  const title = typeof rawTitle === "string" ? rawTitle : "";
-  if (title) {
-    const kind = typeof rawArgs.kind === "string" ? rawArgs.kind : "chart";
-    const mart = typeof rawArgs.mart === "string" ? rawArgs.mart : "data";
-    return `Create new ${kind} chart "${title}" from mart ${mart}.`;
-  }
-  return "Do you want to confirm this action?";
-}
-
 /** Daftar pesan Copilot — render kaya (tool cards, pohon build, markdown). */
 export function ChatMessages({
-  messages, busy, error, className, onConfirmTool, onCancelTool, onCompleteTool, confirmingKey,
+  messages, busy, progress, error, className, onRetry,
+  onConfirmTool, onCancelTool, onCompleteTool, confirmingKey,
 }: {
   messages: Msg[];
   busy: boolean;
+  progress?: ChatProgress | null;
   error?: string | null;
   className?: string;
+  /** Ask the last question again (after an error or a stop). */
+  onRetry?: () => void;
   /** Confirm a `needs_confirmation` tool step (T0.4's Confirm button). */
   onConfirmTool?: (messageIndex: number, stepIndex: number) => void;
   /** Cancel a `needs_confirmation` tool step. */
@@ -73,119 +57,83 @@ export function ChatMessages({
   const endRef = React.useRef<HTMLDivElement>(null);
   React.useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, busy]);
+  }, [messages, busy, error]);
+
+  const lastIndex = messages.length - 1;
 
   return (
     <div className={cn("space-y-4", className)}>
-      {messages.map((m, i) =>
-        m.role === "user" ? (
-          <div key={i} className="flex flex-row-reverse gap-3">
-            <Avatar />
-            <div className="max-w-[80%] whitespace-pre-wrap rounded-2xl rounded-tr-sm bg-primary px-3.5 py-2 text-sm text-primary-foreground">
-              {m.content}
+      {messages.map((m, i) => {
+        const key = m.id ?? `m${i}`;
+        if (m.role === "user") {
+          return (
+            <div key={key} className="flex justify-end">
+              <div className="max-w-[80%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-muted px-3.5 py-2 text-sm text-foreground">
+                {m.content}
+              </div>
             </div>
+          );
+        }
+        const pendingIndex = m.tools?.findIndex((t) => Boolean(asObj(t.result).needs_confirmation)) ?? -1;
+        const pendingStep = pendingIndex >= 0 ? m.tools?.[pendingIndex] : undefined;
+        return (
+          <div key={key} className="min-w-0 space-y-2">
+            {m.tools?.length ? (
+              <div className="space-y-1.5">
+                {m.tools.map((t, j) => (
+                  <ToolStepCard key={j} step={t} />
+                ))}
+              </div>
+            ) : null}
+            {m.buildRunId ? <BuildTree runId={m.buildRunId} /> : null}
+            {m.content ? <MiniMarkdown text={m.content} /> : null}
+            {m.stopped ? (
+              <p className="flex items-center gap-2 text-sm text-muted-foreground">
+                Response stopped.
+                {i === lastIndex && onRetry && !busy ? (
+                  <Button variant="link" size="sm" className="h-auto p-0" onClick={onRetry}>
+                    Ask again
+                  </Button>
+                ) : null}
+              </p>
+            ) : null}
+            {pendingStep ? (
+              <PendingActionCard
+                step={pendingStep}
+                confirming={confirmingKey === `${i}:${pendingIndex}`}
+                onConfirm={() => onConfirmTool?.(i, pendingIndex)}
+                onCancel={() => onCancelTool?.(i, pendingIndex)}
+                onSavedInBuilder={(result) => onCompleteTool?.(i, pendingIndex, result)}
+              />
+            ) : null}
+            {m.chartCreated ? (
+              <Link
+                href="/dashboards"
+                className={cn(buttonVariants({ variant: "outline", size: "sm" }), "gap-1.5")}
+              >
+                <BarChart3 className="size-4" /> Open Dashboards
+              </Link>
+            ) : null}
+            {m.content ? (
+              <div className="flex items-center gap-1">
+                <CopyButton text={m.content} label="Copy answer" />
+              </div>
+            ) : null}
           </div>
-        ) : (
-          <div key={i} className="flex gap-3">
-            <Avatar ai />
-            <div className="min-w-0 flex-1 space-y-2 pt-0.5">
-              {m.tools && m.tools.length ? (
-                <div className="space-y-1.5">
-                  {m.tools.map((t, j) => (
-                    <ToolStepCard key={j} step={t} />
-                  ))}
-                </div>
-              ) : null}
-              {m.buildRunId ? <BuildTree runId={m.buildRunId} /> : null}
-              <MiniMarkdown text={m.content} />
-              {(() => {
-                const pendingToolIndex = m.tools?.findIndex((t) => Boolean(asObj(t.result).needs_confirmation));
-                if (pendingToolIndex === undefined || pendingToolIndex === -1 || !m.tools?.[pendingToolIndex]) return null;
-                const pendingStep = m.tools[pendingToolIndex];
-                const res = asObj(pendingStep.result);
-                const rawArgs = asObj(res.args ?? pendingStep.args);
-                const summaryText = getConfirmationSummary(res, rawArgs);
-                const key = `${i}:${pendingToolIndex}`;
-                const isConfirming = confirmingKey === key;
-                const toolName = typeof res.tool === "string" ? res.tool : pendingStep.tool;
-                if (toolName === "create_chart") {
-                  return (
-                    <ChartDraftCard
-                      args={rawArgs}
-                      confirming={isConfirming}
-                      onConfirm={() => onConfirmTool?.(i, pendingToolIndex)}
-                      onCancel={() => onCancelTool?.(i, pendingToolIndex)}
-                      onSavedInBuilder={(saved) =>
-                        onCompleteTool?.(i, pendingToolIndex, {
-                          created: true,
-                          title: saved.title,
-                          kind: saved.kind,
-                          mart: saved.mart,
-                          board: saved.board,
-                          via: "builder",
-                        })
-                      }
-                    />
-                  );
-                }
-                return (
-                  <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 space-y-2 text-xs">
-                    <div className="flex items-center gap-1.5 font-medium text-amber-800 dark:text-amber-300">
-                      <AlertCircle className="size-4 shrink-0" />
-                      <span>Action requires confirmation</span>
-                    </div>
-                    <p className="text-foreground leading-relaxed">
-                      {summaryText}
-                    </p>
-                    <div className="flex items-center gap-2 pt-1">
-                      <Button
-                        size="sm"
-                        onClick={() => onConfirmTool?.(i, pendingToolIndex)}
-                        disabled={isConfirming}
-                      >
-                        {isConfirming ? "Executing…" : "Confirm"}
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => onCancelTool?.(i, pendingToolIndex)}
-                        disabled={isConfirming}
-                      >
-                        Cancel
-                      </Button>
-                    </div>
-                  </div>
-                );
-              })()}
-              {m.chartCreated ? (
-                <div className="pt-1">
-                  <Link
-                    href="/dashboards"
-                    onClick={() => {
-                      try {
-                        window.dispatchEvent(new Event("dashboards:changed"));
-                        window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
-                      } catch { /* ignore */ }
-                    }}
-                    className={cn(buttonVariants({ variant: "outline", size: "sm" }), "inline-flex items-center gap-1.5")}
-                  >
-                    <BarChart3 className="size-4" /> Open Dashboards
-                  </Link>
-                </div>
-              ) : null}
-            </div>
-          </div>
-        ),
-      )}
-      {busy ? (
-        <div className="flex items-center gap-3">
-          <Avatar ai />
-          <div className="flex items-center gap-2 pt-2 text-sm text-muted-foreground">
-            <TypingDots />
-          </div>
+        );
+      })}
+      {busy ? <ProgressLine progress={progress ?? null} /> : null}
+      {error ? (
+        <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm" role="alert">
+          <AlertCircle className="mt-0.5 size-4 shrink-0 text-destructive" />
+          <p className="min-w-0 flex-1 text-foreground">{error}</p>
+          {onRetry ? (
+            <Button size="sm" variant="outline" onClick={onRetry} className="h-7 gap-1 text-xs">
+              <RotateCcw className="size-3.5" /> Retry
+            </Button>
+          ) : null}
         </div>
       ) : null}
-      {error ? <p className="text-sm text-destructive">{error}</p> : null}
       <div ref={endRef} />
     </div>
   );
