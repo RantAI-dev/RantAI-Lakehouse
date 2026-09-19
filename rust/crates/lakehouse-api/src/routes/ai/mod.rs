@@ -718,21 +718,35 @@ fn strip_ci(s: &str, needle: &str) -> String {
 
 const CREATE_CHAT_SESSION_TABLE: &str = "CREATE TABLE IF NOT EXISTS console.chat_session (\
      id String, title String, mode String DEFAULT 'ask', \
-     messages_json String, updated_at DateTime DEFAULT now(), is_deleted UInt8 DEFAULT 0 \
+     messages_json String, updated_at DateTime DEFAULT now(), is_deleted UInt8 DEFAULT 0, \
+     owner_id String DEFAULT '', title_locked UInt8 DEFAULT 0 \
      ) ENGINE = ReplacingMergeTree(updated_at) ORDER BY id";
+
+/// Columns added after the table first shipped; `IF NOT EXISTS` makes them
+/// safe on both fresh and existing tables.
+const CHAT_SESSION_MIGRATIONS: [&str; 2] = [
+    "ALTER TABLE console.chat_session ADD COLUMN IF NOT EXISTS owner_id String DEFAULT ''",
+    "ALTER TABLE console.chat_session ADD COLUMN IF NOT EXISTS title_locked UInt8 DEFAULT 0",
+];
+
+/// Longest title derived from a conversation's first message.
+const TITLE_MAX_CHARS: usize = 80;
 
 static CHAT_SESSION_TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
 /// Create the `console` database and `chat_session` table if they don't
-/// already exist (idempotent, once per process — mirroring `chat-store.ts`'s
-/// module-level `ensured` flag, and [`lakehouse_bi::store::ensure_bi_table`]'s
-/// identical pattern).
+/// already exist, and add later columns (idempotent, once per process —
+/// mirroring [`lakehouse_bi::store::ensure_bi_table`]'s pattern).
 async fn ensure_chat_session_table(ch: &ChClient) -> Result<(), lakehouse_clickhouse::ChError> {
     CHAT_SESSION_TABLE_ENSURED
         .get_or_try_init(|| async {
             ch.exec("CREATE DATABASE IF NOT EXISTS console", None)
                 .await?;
-            ch.exec(CREATE_CHAT_SESSION_TABLE, None).await
+            ch.exec(CREATE_CHAT_SESSION_TABLE, None).await?;
+            for sql in CHAT_SESSION_MIGRATIONS {
+                ch.exec(sql, None).await?;
+            }
+            Ok(())
         })
         .await
         .map(drop)
@@ -743,29 +757,88 @@ fn esc(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "''")
 }
 
-/// Query parameters for `GET /api/ai/sessions` (`?id=`) and
-/// `DELETE /api/ai/sessions` (`?id=`).
+/// The signed-in user every session operation is scoped to.
+///
+/// Sessions hold whatever was asked and answered, so they are private to
+/// their owner: before `owner_id` existed, every user listed, opened and
+/// deleted everyone else's. Rows written before then have an empty owner
+/// and belong to nobody — they are hidden rather than guessed at.
+fn session_owner(principal: Option<&Extension<Principal>>) -> Result<String, ApiError> {
+    principal
+        .map(|Extension(p)| p.id.uuid().to_string())
+        .ok_or_else(|| ApiError::Unauthorized("sign in required".to_owned()))
+}
+
+fn internal(err: &impl std::fmt::Display) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ApiJson(json!({ "error": err.to_string() })),
+    )
+        .into_response()
+}
+
+/// Query parameters for `GET /api/ai/sessions`: `?id=` for one session,
+/// otherwise a page of the list.
+#[derive(Debug, Default, Deserialize)]
+pub struct SessionsQuery {
+    #[serde(default)]
+    id: Option<String>,
+    /// Matched against the title and the conversation text.
+    #[serde(default)]
+    q: Option<String>,
+    /// `ask` or `build`; anything else lists both.
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    offset: Option<u32>,
+}
+
+/// Query parameters for `DELETE /api/ai/sessions?id=`.
 #[derive(Debug, Deserialize)]
 pub struct SessionIdQuery {
     #[serde(default)]
     id: Option<String>,
 }
 
-/// `GET /api/ai/sessions` (list) or `?id=` (one full session).
+/// The list filters as a `WHERE` clause — owner always, then mode and search.
+fn session_filter(owner: &str, mode: Option<&str>, q: Option<&str>) -> String {
+    let mut conditions = vec![
+        "is_deleted = 0".to_owned(),
+        format!("owner_id = '{}'", esc(owner)),
+    ];
+    if let Some(m) = mode.filter(|m| matches!(*m, "ask" | "build")) {
+        conditions.push(format!("mode = '{m}'"));
+    }
+    if let Some(q) = q.map(str::trim).filter(|q| !q.is_empty()) {
+        let q = esc(q);
+        conditions.push(format!(
+            "(positionCaseInsensitiveUTF8(title, '{q}') > 0 \
+             OR positionCaseInsensitiveUTF8(messages_json, '{q}') > 0)"
+        ));
+    }
+    conditions.join(" AND ")
+}
+
+/// `GET /api/ai/sessions` — a page of the caller's sessions, or `?id=` for
+/// one of them in full. Another user's session answers 404, not 403, so ids
+/// can't be probed.
 pub async fn sessions_get(
     State(state): State<AppState>,
-    Query(q): Query<SessionIdQuery>,
+    principal: Option<Extension<Principal>>,
+    Query(q): Query<SessionsQuery>,
 ) -> Response {
+    let owner = match session_owner(principal.as_ref()) {
+        Ok(owner) => owner,
+        Err(err) => return crate::error::ApiRejection::from(err).into_response(),
+    };
     let ch = &state.clickhouse;
     if let Err(err) = ensure_chat_session_table(ch).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ApiJson(json!({ "error": err.to_string() })),
-        )
-            .into_response();
+        return internal(&err);
     }
-    if let Some(id) = q.id.filter(|s| !s.is_empty()) {
-        return match session_detail(ch, &id).await {
+    if let Some(id) = q.id.as_deref().filter(|s| !s.is_empty()) {
+        return match session_detail(ch, &owner, id).await {
             Ok(Some(session)) => {
                 (StatusCode::OK, ApiJson(json!({ "session": session }))).into_response()
             }
@@ -774,63 +847,112 @@ pub async fn sessions_get(
                 ApiJson(json!({ "error": "sesi tidak ditemukan" })),
             )
                 .into_response(),
-            Err(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiJson(json!({ "error": err.to_string() })),
-            )
-                .into_response(),
+            Err(err) => internal(&err),
         };
     }
-    match session_list(ch, 50).await {
-        Ok(sessions) => (StatusCode::OK, ApiJson(json!({ "sessions": sessions }))).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ApiJson(json!({ "error": err.to_string() })),
-        )
-            .into_response(),
+    match session_list(ch, &owner, &q).await {
+        Ok(page) => (StatusCode::OK, ApiJson(page)).into_response(),
+        Err(err) => internal(&err),
     }
 }
 
+/// One page of sessions, newest first, plus per-mode counts for the same
+/// search so a filter can show how many each choice holds.
 async fn session_list(
     ch: &ChClient,
-    limit: u32,
-) -> Result<Vec<Value>, lakehouse_clickhouse::ChError> {
-    let limit = limit.clamp(1, 200);
+    owner: &str,
+    q: &SessionsQuery,
+) -> Result<Value, lakehouse_clickhouse::ChError> {
+    let limit = q.limit.unwrap_or(30).clamp(1, 100);
+    let offset = q.offset.unwrap_or(0).min(100_000);
+    let filter = session_filter(owner, q.mode.as_deref(), q.q.as_deref());
+    // One row past the page says whether another page exists.
     let rows = ch
         .rows(
             &format!(
-                "SELECT id, title, mode, toString(updated_at) AS updated_at FROM console.chat_session FINAL \
-                 WHERE is_deleted = 0 ORDER BY updated_at DESC LIMIT {limit}"
+                "SELECT id, title, mode, toString(updated_at) AS updated_at, \
+                 positionCaseInsensitive(messages_json, '\"chartCreated\":true') > 0 AS chart_created, \
+                 substringUTF8(JSONExtractString(messages_json, -1, 'content'), 1, 240) AS preview \
+                 FROM console.chat_session FINAL WHERE {filter} \
+                 ORDER BY updated_at DESC LIMIT {} OFFSET {offset}",
+                limit + 1
             ),
             None,
         )
         .await?;
-    Ok(rows
+    let has_more = rows.len() > limit as usize;
+    let sessions: Vec<Value> = rows
         .iter()
+        .take(limit as usize)
         .map(|r| {
             json!({
                 "id": r.get("id"), "title": r.get("title"), "mode": r.get("mode"),
                 "updatedAt": r.get("updated_at"),
+                "chartCreated": r.get("chart_created").and_then(json_u64).unwrap_or(0) > 0,
+                "preview": r.get("preview"),
             })
         })
-        .collect())
-}
+        .collect();
 
-async fn session_detail(
-    ch: &ChClient,
-    id: &str,
-) -> Result<Option<Value>, lakehouse_clickhouse::ChError> {
-    let rows = ch
+    let count_filter = session_filter(owner, None, q.q.as_deref());
+    let count_rows = ch
         .rows(
             &format!(
-                "SELECT id, title, mode, messages_json, toString(updated_at) AS updated_at \
-                 FROM console.chat_session FINAL WHERE is_deleted = 0 AND id='{}' LIMIT 1",
-                esc(id)
+                "SELECT mode, count() AS n FROM console.chat_session FINAL \
+                 WHERE {count_filter} GROUP BY mode"
             ),
             None,
         )
         .await?;
-    let Some(row) = rows.first() else {
+    let mut counts = Map::new();
+    for r in &count_rows {
+        if let Some(mode) = r.get("mode").and_then(Value::as_str) {
+            counts.insert(
+                mode.to_owned(),
+                json!(r.get("n").and_then(json_u64).unwrap_or(0)),
+            );
+        }
+    }
+    Ok(json!({
+        "sessions": sessions,
+        "hasMore": has_more,
+        "nextOffset": has_more.then(|| offset + limit),
+        "counts": counts,
+    }))
+}
+
+/// `ClickHouse` returns `UInt64` as a JSON string and smaller ints as numbers.
+fn json_u64(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+async fn session_row(
+    ch: &ChClient,
+    owner: &str,
+    id: &str,
+) -> Result<Option<Map<String, Value>>, lakehouse_clickhouse::ChError> {
+    let rows = ch
+        .rows(
+            &format!(
+                "SELECT id, title, mode, messages_json, title_locked, toString(updated_at) AS updated_at \
+                 FROM console.chat_session FINAL \
+                 WHERE is_deleted = 0 AND id = '{}' AND owner_id = '{}' LIMIT 1",
+                esc(id),
+                esc(owner)
+            ),
+            None,
+        )
+        .await?;
+    Ok(rows.into_iter().next())
+}
+
+async fn session_detail(
+    ch: &ChClient,
+    owner: &str,
+    id: &str,
+) -> Result<Option<Value>, lakehouse_clickhouse::ChError> {
+    let Some(row) = session_row(ch, owner, id).await? else {
         return Ok(None);
     };
     let messages_json = row
@@ -855,16 +977,71 @@ struct SaveSessionBody {
     messages: Option<Vec<Value>>,
 }
 
-/// `POST /api/ai/sessions` — save/replace a session (id optional → new).
+/// A title from the first user message: whitespace collapsed, cut at
+/// [`TITLE_MAX_CHARS`] with an ellipsis so a cut title reads as one.
+fn derive_title(messages: &[Value]) -> String {
+    let raw = messages
+        .iter()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let collapsed = collapse_whitespace(raw);
+    if collapsed.is_empty() {
+        return "Percakapan".to_owned();
+    }
+    if collapsed.chars().count() <= TITLE_MAX_CHARS {
+        return collapsed;
+    }
+    let cut: String = collapsed.chars().take(TITLE_MAX_CHARS - 1).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// Insert one full version of a session row (`ReplacingMergeTree` keeps the
+/// newest by `updated_at`).
+async fn write_session(
+    ch: &ChClient,
+    row: &SessionWrite<'_>,
+) -> Result<(), lakehouse_clickhouse::ChError> {
+    let sql = format!(
+        "INSERT INTO console.chat_session \
+         (id, title, mode, messages_json, owner_id, title_locked, is_deleted) \
+         VALUES ('{}', '{}', '{}', '{}', '{}', {}, {})",
+        esc(row.id),
+        esc(row.title),
+        esc(row.mode),
+        esc(row.messages_json),
+        esc(row.owner),
+        u8::from(row.title_locked),
+        u8::from(row.deleted),
+    );
+    ch.exec(&sql, None).await
+}
+
+struct SessionWrite<'a> {
+    id: &'a str,
+    owner: &'a str,
+    title: &'a str,
+    title_locked: bool,
+    mode: &'a str,
+    messages_json: &'a str,
+    deleted: bool,
+}
+
+/// `POST /api/ai/sessions` — save/replace one of the caller's sessions (id
+/// optional → new). A renamed session keeps its title.
 ///
 /// # Errors
 ///
-/// 400 [`ApiError::BadRequest`] when `messages` is missing/empty; 500
-/// [`ApiError::Internal`] on a `ClickHouse` failure.
+/// 400 when `messages` is missing/empty; 401 without a signed-in user; 404
+/// when `id` names a session the caller doesn't own; 500 on a `ClickHouse`
+/// failure.
 pub async fn sessions_save(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    let owner = session_owner(principal.as_ref())?;
     let parsed: SaveSessionBody = serde_json::from_slice(&body).unwrap_or_default();
     let Some(messages) = parsed.messages.filter(|m| !m.is_empty()) else {
         return Err(ApiError::BadRequest("messages kosong".to_owned()).into());
@@ -874,22 +1051,33 @@ pub async fn sessions_save(
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))?;
 
-    let id = parsed
+    let requested = parsed
         .id
-        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-        .unwrap_or_else(new_session_id);
-    let first_user = messages
-        .iter()
-        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"));
-    let title_raw = first_user
-        .and_then(|m| m.get("content"))
-        .and_then(Value::as_str)
-        .unwrap_or("Percakapan");
-    let title = collapse_whitespace(&title_raw.chars().take(80).collect::<String>());
-    let title = if title.is_empty() {
-        "Percakapan".to_owned()
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    let existing = match &requested {
+        Some(id) => {
+            let row = session_row(ch, &owner, id)
+                .await
+                .map_err(|err| ApiError::Internal(err.to_string()))?;
+            // Never overwrite someone else's session under its id.
+            Some(row.ok_or_else(|| ApiError::NotFound("sesi tidak ditemukan".to_owned()))?)
+        }
+        None => None,
+    };
+    let id = requested.unwrap_or_else(new_session_id);
+    let locked = existing
+        .as_ref()
+        .and_then(|r| r.get("title_locked"))
+        .and_then(json_u64)
+        .is_some_and(|v| v > 0);
+    let title = if locked {
+        existing
+            .as_ref()
+            .and_then(|r| r.get("title"))
+            .and_then(Value::as_str)
+            .map_or_else(|| derive_title(&messages), ToOwned::to_owned)
     } else {
-        title
+        derive_title(&messages)
     };
 
     let mut json_body = serde_json::to_string(&messages).unwrap_or_else(|_| "[]".to_owned());
@@ -907,16 +1095,84 @@ pub async fn sessions_save(
     }
 
     let mode = parsed.mode.unwrap_or_else(|| "ask".to_owned());
-    let sql = format!(
-        "INSERT INTO console.chat_session (id, title, mode, messages_json) VALUES ('{}', '{}', '{}', '{}')",
-        esc(&id),
-        esc(&title),
-        esc(&mode),
-        esc(&json_body),
-    );
-    ch.exec(&sql, None)
+    write_session(
+        ch,
+        &SessionWrite {
+            id: &id,
+            owner: &owner,
+            title: &title,
+            title_locked: locked,
+            mode: &mode,
+            messages_json: &json_body,
+            deleted: false,
+        },
+    )
+    .await
+    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    Ok(ApiJson(json!({ "ok": true, "id": id, "title": title })))
+}
+
+/// `PATCH /api/ai/sessions` request body.
+#[derive(Debug, Default, Deserialize)]
+struct RenameSessionBody {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+/// `PATCH /api/ai/sessions` — rename one of the caller's sessions. The new
+/// title is locked, so later saves no longer re-derive it.
+///
+/// # Errors
+///
+/// 400 when `id` or `title` is missing; 401 without a signed-in user; 404
+/// when the caller doesn't own the session; 500 on a `ClickHouse` failure.
+pub async fn sessions_rename(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    let owner = session_owner(principal.as_ref())?;
+    let parsed: RenameSessionBody = serde_json::from_slice(&body).unwrap_or_default();
+    let id = parsed
+        .id
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("id wajib".to_owned()))?;
+    let title = parsed
+        .title
+        .map(|t| collapse_whitespace(&t))
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("judul wajib".to_owned()))?;
+    let title: String = title.chars().take(120).collect();
+    let ch = &state.clickhouse;
+    ensure_chat_session_table(ch)
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))?;
+    let row = session_row(ch, &owner, &id)
+        .await
+        .map_err(|err| ApiError::Internal(err.to_string()))?
+        .ok_or_else(|| ApiError::NotFound("sesi tidak ditemukan".to_owned()))?;
+    let field = |k: &str| {
+        row.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    write_session(
+        ch,
+        &SessionWrite {
+            id: &id,
+            owner: &owner,
+            title: &title,
+            title_locked: true,
+            mode: &field("mode"),
+            messages_json: &field("messages_json"),
+            deleted: false,
+        },
+    )
+    .await
+    .map_err(|err| ApiError::Internal(err.to_string()))?;
     Ok(ApiJson(json!({ "ok": true, "id": id, "title": title })))
 }
 
@@ -934,21 +1190,23 @@ fn new_session_id() -> String {
     format!("c_{hex}")
 }
 
-/// `s.slice(0,80).replace(/\s+/g, " ").trim()`.
+/// `s.replace(/\s+/g, " ").trim()`.
 fn collapse_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// `DELETE /api/ai/sessions?id=` — soft-delete a session.
+/// `DELETE /api/ai/sessions?id=` — soft-delete one of the caller's sessions.
 ///
 /// # Errors
 ///
-/// 400 [`ApiError::BadRequest`] when `id` is missing; 500
-/// [`ApiError::Internal`] on a `ClickHouse` failure.
+/// 400 when `id` is missing; 401 without a signed-in user; 404 when the
+/// caller doesn't own the session; 500 on a `ClickHouse` failure.
 pub async fn sessions_delete(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Query(q): Query<SessionIdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    let owner = session_owner(principal.as_ref())?;
     let Some(id) = q.id.filter(|s| !s.is_empty()) else {
         return Err(ApiError::BadRequest("id wajib".to_owned()).into());
     };
@@ -956,13 +1214,27 @@ pub async fn sessions_delete(
     ensure_chat_session_table(ch)
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))?;
-    let sql = format!(
-        "INSERT INTO console.chat_session (id, title, mode, messages_json, is_deleted) VALUES ('{}', '', 'ask', '[]', 1)",
-        esc(&id)
-    );
-    ch.exec(&sql, None)
+    if session_row(ch, &owner, &id)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| ApiError::Internal(err.to_string()))?
+        .is_none()
+    {
+        return Err(ApiError::NotFound("sesi tidak ditemukan".to_owned()).into());
+    }
+    write_session(
+        ch,
+        &SessionWrite {
+            id: &id,
+            owner: &owner,
+            title: "",
+            title_locked: false,
+            mode: "ask",
+            messages_json: "[]",
+            deleted: true,
+        },
+    )
+    .await
+    .map_err(|err| ApiError::Internal(err.to_string()))?;
     Ok(ApiJson(json!({ "ok": true })))
 }
 
@@ -971,6 +1243,38 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn session_filter_always_scopes_to_the_owner() {
+        let f = session_filter("u-1", None, None);
+        assert_eq!(f, "is_deleted = 0 AND owner_id = 'u-1'");
+    }
+
+    #[test]
+    fn session_filter_whitelists_mode_and_escapes_search() {
+        let f = session_filter("u-1", Some("build"), Some(" it's "));
+        assert!(f.contains("mode = 'build'"));
+        assert!(f.contains("positionCaseInsensitiveUTF8(title, 'it''s')"));
+        let f = session_filter("u-1", Some("x' OR 1=1 --"), None);
+        assert!(
+            !f.contains("mode"),
+            "unknown modes are dropped, not quoted in"
+        );
+    }
+
+    #[test]
+    fn derive_title_marks_a_cut_with_an_ellipsis() {
+        let long = "kata ".repeat(40);
+        let t = derive_title(&[json!({ "role": "user", "content": long })]);
+        assert_eq!(t.chars().count(), TITLE_MAX_CHARS);
+        assert!(t.ends_with('…'));
+        let short = derive_title(&[json!({ "role": "user", "content": "  halo   dunia " })]);
+        assert_eq!(short, "halo dunia");
+        assert_eq!(
+            derive_title(&[json!({ "role": "assistant", "content": "x" })]),
+            "Percakapan"
+        );
+    }
 
     #[test]
     fn parse_minimax_tool_calls_extracts_name_and_args() {

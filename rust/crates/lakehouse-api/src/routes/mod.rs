@@ -369,6 +369,7 @@ pub fn router(state: AppState) -> Router {
             "/api/ai/sessions",
             get(ai::sessions_get)
                 .post(ai::sessions_save)
+                .patch(ai::sessions_rename)
                 .delete(ai::sessions_delete),
         )
         .route("/api/ai/build-status", get(ai::build_status))
