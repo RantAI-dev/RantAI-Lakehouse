@@ -41,7 +41,10 @@ axum = { workspace = true }
 # (`tokio::sync::Mutex`/`OwnedMutexGuard`) and its tests
 # (`tokio::sync::Barrier`) need it directly, and this crate should compile
 # correctly on its own, not only as part of the whole-workspace build.
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync", "io-util"] }
+# `io::ReaderStream` turns the `POST /api/ai/chat` progress pipe into a
+# streaming response body (`stream: true`), without a separate stream crate.
+tokio-util = { workspace = true, features = ["io"] }
 tower = { workspace = true }
 tower-http = { workspace = true }
 reqwest = { workspace = true }

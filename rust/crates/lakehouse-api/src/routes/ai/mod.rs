@@ -94,7 +94,7 @@ const SYSTEM_BASE: &str = "Kamu AI Copilot untuk lakehouse pariwisata DKI Jakart
 
 const SYSTEM_ASK_SUFFIX: &str = "\n\nMODE: ASK (read-only). Kamu HANYA menjawab & menganalisis data — tidak\nmengubah/membangun apa pun (termasuk TIDAK membuat/menghapus chart). Kamu boleh\nmelihat dashboard (describe_mart/list_charts). Kalau user minta membangun data\natau membuat chart, sarankan pindah ke mode Build.";
 
-const SYSTEM_BUILD_SUFFIX: &str = "\n\nMODE: BUILD. Selain menjawab, kamu bisa MENGOPERASIKAN lakehouse:\n- Untuk \"bangun/segarkan Bronze/Silver/Gold\" atau \"refresh data\":\n  JELASKAN dulu rencananya singkat, lalu panggil trigger_lakehouse_build.\n- Setelah trigger, beri tahu user pipeline berjalan (statusnya tampil live).\n- Untuk \"bikin/tambah chart/dashboard soal X\" (BI lewat chat):\n  panggil describe_mart dulu, lalu create_chart dengan kolom yang benar-benar ada.\n- Untuk \"buatkan/sarankan dashboard soal X\" tanpa detail: panggil suggest_dashboard.\n- Untuk mengelompokkan: create_board dulu, lalu create_chart dengan board=<id>.\n- Untuk mengubah kartu: update_chart (kirim semua field dengan nilai baru).\n- Untuk alert/digest: list_alert_rules untuk lihat yang ada, create_alert_rule/\n  update_alert_rule untuk membuat/mengubah (tentukan mart, measure, agg, op,\n  threshold untuk alert; board untuk digest), run_alert_rule untuk menjalankan\n  satu rule sekarang (webhook/email BENERAN terkirim). delete_alert_rule\n  BUTUH PERSETUJUAN MANUSIA dulu sebelum benar-benar terhapus.\n- Untuk connector: list_connectors untuk lihat yang ada, create_connector untuk\n  mendaftarkan baru (secretRef WAJIB berupa referensi seperti \"env:NAMA\" atau\n  \"vault://...\", JANGAN PERNAH kredensial asli), test_connector untuk menguji\n  koneksi nyata. delete_connector BUTUH PERSETUJUAN MANUSIA dulu.\n- Untuk pipeline individual (bukan build utama): list_pipelines/\n  list_pipeline_runs untuk lihat status, trigger_pipeline/retry_pipeline_run\n  untuk menjalankan, resume_pipeline untuk mengaktifkan jadwal lagi.\n  pause_pipeline dan cancel_pipeline_run BUTUH PERSETUJUAN MANUSIA dulu.\n- Untuk saved query: save_query untuk menyimpan SQL bernama, list_saved_queries\n  untuk lihat daftar, run_saved_query untuk menjalankan ulang (hanya query baca\n  yang diizinkan, sama seperti Query Studio).\n- Untuk governance: get_audit_history (riwayat audit), list_classification_rules\n  dan list_quality_rules untuk lihat aturan yang ada, get_cdc_health untuk\n  kesehatan replication slot CDC, get_maintenance_metrics untuk riwayat\n  maintenance Bronze. draft_policy/draft_classification_rule/draft_quality_rule\n  untuk MENULIS aturan/kebijakan baru — SELALU tersimpan sebagai draft/belum\n  dievaluasi, mengaktifkan tetap aksi manusia di console.\n- Untuk maintenance Bronze: run_bronze_maintenance MENERAPKAN perubahan\n  (menghapus file data/manifest Iceberg yatim) — ini BUKAN dry run, dan BUTUH\n  PERSETUJUAN MANUSIA dulu sebelum benar-benar jalan.\n- Untuk workload ClickHouse: list_workloads untuk lihat query yang sedang\n  berjalan, kill_query untuk menghentikan paksa satu query (BUTUH PERSETUJUAN\n  MANUSIA dulu — ini KILL QUERY sungguhan).\n- Untuk Gold export: export_gold_mart untuk mengekspor satu mart ke Iceberg\n  (APPEND-ONLY — menjalankan ulang menambah baris, bukan menggantikan),\n  get_gold_export untuk membaca balik jumlah baris & format version-nya.\n- Tindakan yang butuh persetujuan manusia (delete_alert_rule, delete_connector,\n  pause_pipeline, cancel_pipeline_run, delete_chart, run_bronze_maintenance,\n  kill_query) TIDAK langsung jalan — beri tahu user bahwa permintaan sudah\n  masuk antrean persetujuan di /agents/approvals.";
+const SYSTEM_BUILD_SUFFIX: &str = "\n\nMODE: BUILD. Selain menjawab, kamu bisa MENGOPERASIKAN lakehouse:\n- Untuk \"bangun/segarkan Bronze/Silver/Gold\" atau \"refresh data\":\n  JELASKAN dulu rencananya singkat, lalu panggil trigger_lakehouse_build.\n- Setelah trigger, beri tahu user pipeline berjalan (statusnya tampil live).\n- Untuk \"bikin/tambah chart/dashboard soal X\" (BI lewat chat):\n  panggil describe_mart dulu, lalu create_chart dengan kolom yang benar-benar ada.\n- Untuk \"buatkan/sarankan dashboard soal X\" tanpa detail: panggil suggest_dashboard.\n- Untuk mengelompokkan: create_board dulu, lalu create_chart dengan board=<id>.\n- Untuk mengubah kartu: update_chart (kirim semua field dengan nilai baru).\n- Untuk alert/digest: list_alert_rules untuk lihat yang ada, create_alert_rule/\n  update_alert_rule untuk membuat/mengubah (tentukan mart, measure, agg, op,\n  threshold untuk alert; board untuk digest), run_alert_rule untuk menjalankan\n  satu rule sekarang (webhook/email BENERAN terkirim). delete_alert_rule\n  BUTUH PERSETUJUAN MANUSIA dulu sebelum benar-benar terhapus.\n- Untuk connector: list_connectors untuk lihat yang ada, create_connector untuk\n  mendaftarkan baru (secretRef WAJIB berupa referensi seperti \"env:NAMA\" atau\n  \"vault://...\", JANGAN PERNAH kredensial asli), test_connector untuk menguji\n  koneksi nyata. delete_connector BUTUH PERSETUJUAN MANUSIA dulu.\n- Untuk pipeline individual (bukan build utama): list_pipelines/\n  list_pipeline_runs untuk lihat status, trigger_pipeline/retry_pipeline_run\n  untuk menjalankan, resume_pipeline untuk mengaktifkan jadwal lagi.\n  pause_pipeline dan cancel_pipeline_run BUTUH PERSETUJUAN MANUSIA dulu.\n- Untuk saved query: save_query untuk menyimpan SQL bernama, list_saved_queries\n  untuk lihat daftar, run_saved_query untuk menjalankan ulang (hanya query baca\n  yang diizinkan, sama seperti Query Studio).\n- Untuk governance: get_audit_history (riwayat audit), list_classification_rules\n  dan list_quality_rules untuk lihat aturan yang ada, get_cdc_health untuk\n  kesehatan replication slot CDC, get_maintenance_metrics untuk riwayat\n  maintenance Bronze. draft_policy/draft_classification_rule/draft_quality_rule\n  untuk MENULIS aturan/kebijakan baru — SELALU tersimpan sebagai draft/belum\n  dievaluasi, mengaktifkan tetap aksi manusia di console.\n- Untuk maintenance Bronze: run_bronze_maintenance MENERAPKAN perubahan\n  (menghapus file data/manifest Iceberg yatim) — ini BUKAN dry run, dan BUTUH\n  PERSETUJUAN MANUSIA dulu sebelum benar-benar jalan.\n- Untuk workload ClickHouse: list_workloads untuk lihat query yang sedang\n  berjalan, kill_query untuk menghentikan paksa satu query (BUTUH PERSETUJUAN\n  MANUSIA dulu — ini KILL QUERY sungguhan).\n- Untuk Gold export: export_gold_mart untuk mengekspor satu mart ke Iceberg\n  (APPEND-ONLY — menjalankan ulang menambah baris, bukan menggantikan),\n  get_gold_export untuk membaca balik jumlah baris & format version-nya.\n- Tindakan yang butuh persetujuan manusia (delete_alert_rule, delete_connector,\n  pause_pipeline, cancel_pipeline_run, delete_chart, run_bronze_maintenance,\n  kill_query) TIDAK langsung jalan — beri tahu user bahwa permintaan sudah\n  masuk antrean persetujuan di /agents/approvals.\n- Kalau hasil tool berisi needs_confirmation: jawab SATU kalimat singkat saja,\n  mis. \"The chart draft is ready — review the preview below and confirm.\"\n  JANGAN mengulang konfigurasi/argumen (tipe chart, mart, kolom, judul, span,\n  limit) dan jangan minta user mengetik konfirmasi: UI sudah menampilkan\n  pratinjau lengkap beserta tombol konfirmasinya.";
 
 const MAX_ITER: u32 = 8;
 
@@ -118,6 +118,10 @@ struct ChatBody {
     context: Option<String>,
     #[serde(default)]
     messages: Vec<IncomingMessage>,
+    /// Answer as an NDJSON progress stream instead of one JSON body; see
+    /// [`stream_chat`].
+    #[serde(default)]
+    stream: bool,
 }
 
 /// `POST /api/ai/chat` — the agentic tool-calling loop: the LLM decides
@@ -150,28 +154,48 @@ struct ChatBody {
 /// rest of the API treats a policy layer bug or a middleware gap: never
 /// silently grant, always require the narrower of "no principal" and "no
 /// permissions".
-#[allow(
-    clippy::too_many_lines,
-    reason = "one straight-line port of a single TS handler's iterative \
-              tool-calling loop; splitting it up would scatter one \
-              sequential loop across helpers with no independent reuse"
-)]
 pub async fn chat(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> Response {
-    let perms = principal.as_ref().map(|Extension(p)| &p.permissions);
-    let parsed: ChatBody = match serde_json::from_slice(&body) {
-        Ok(p) => p,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                ApiJson(json!({ "error": "Body harus JSON {messages}" })),
-            )
-                .into_response();
-        }
+    let Ok(parsed) = serde_json::from_slice::<ChatBody>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            ApiJson(json!({ "error": "Body harus JSON {messages}" })),
+        )
+            .into_response();
     };
+    let principal = principal.map(|Extension(p)| p);
+    let stream = parsed.stream;
+    let run = match prepare_chat(&state, principal.as_ref(), parsed).await {
+        Ok(run) => run,
+        Err(response) => return response,
+    };
+    if stream {
+        return stream_chat(state, principal, run);
+    }
+    match run_chat(&state, principal.as_ref(), run, None).await {
+        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Err(err) => llm_unavailable(&err),
+    }
+}
+
+/// What [`run_chat`] needs: the full prompt and the tools the model may call.
+struct PreparedChat {
+    messages: Vec<LlmMessage>,
+    tools: Vec<Value>,
+    is_build: bool,
+}
+
+/// Validates the body and assembles the system prompt, history and the tool
+/// list for this principal and mode. A bad body is a ready 400 response.
+async fn prepare_chat(
+    state: &AppState,
+    principal: Option<&Principal>,
+    parsed: ChatBody,
+) -> Result<PreparedChat, Response> {
+    let perms = principal.map(|p| &p.permissions);
     let history: Vec<LlmMessage> = parsed
         .messages
         .iter()
@@ -189,11 +213,11 @@ pub async fn chat(
         })
         .collect();
     if history.is_empty() {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
             ApiJson(json!({ "error": "messages kosong" })),
         )
-            .into_response();
+            .into_response());
     }
 
     let is_build = parsed.mode.as_deref() == Some("build");
@@ -252,20 +276,63 @@ pub async fn chat(
         name: None,
     }];
     messages.extend(history);
+    Ok(PreparedChat {
+        messages,
+        tools,
+        is_build,
+    })
+}
 
+/// Progress events for `stream: true`. `None` for a plain JSON request.
+type Progress<'a> = Option<&'a tokio::sync::mpsc::UnboundedSender<Value>>;
+
+/// Sends one progress event; `false` once the client has gone (Stop, or a
+/// closed tab), so the loop can end instead of running more rounds for
+/// nobody.
+fn report(progress: Progress<'_>, event: Value) -> bool {
+    progress.is_none_or(|tx| tx.send(event).is_ok())
+}
+
+/// The agentic loop: ask the model, run the tools it calls (through
+/// [`gate::decide_by_name`]), feed the results back, until it answers
+/// without a tool call or [`MAX_ITER`] rounds pass. Returns the response
+/// body `{ answer, toolTrace, buildRunId?, chartCreated, note? }`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one straight-line port of a single TS handler's iterative \
+              tool-calling loop; splitting it up would scatter one \
+              sequential loop across helpers with no independent reuse"
+)]
+async fn run_chat(
+    state: &AppState,
+    principal: Option<&Principal>,
+    run: PreparedChat,
+    progress: Progress<'_>,
+) -> Result<Value, lakehouse_llm::LlmError> {
+    let perms = principal.map(|p| &p.permissions);
+    let PreparedChat {
+        mut messages,
+        tools,
+        is_build,
+    } = run;
     let mut tool_trace: Vec<Value> = Vec::new();
     let mut build_run_id: Option<String> = None;
     let mut chart_created = false;
 
     for _ in 0..MAX_ITER {
-        let msg = match state
+        if !report(progress, json!({ "type": "status", "phase": "thinking" })) {
+            return Ok(chat_response_body(
+                "",
+                &tool_trace,
+                build_run_id.as_deref(),
+                chart_created,
+                Some("stopped"),
+            ));
+        }
+        let msg = state
             .llm
             .chat_with_tools(&messages, &tools, ChatOptions::default())
-            .await
-        {
-            Ok(m) => m,
-            Err(err) => return llm_unavailable(&err),
-        };
+            .await?;
         messages.push(msg.clone());
 
         let mut calls: Vec<ToolCall> = msg.tool_calls.clone().unwrap_or_default();
@@ -274,21 +341,29 @@ pub async fn chat(
         }
         if calls.is_empty() {
             let answer = strip_tool_xml(msg.content.as_deref().unwrap_or(""));
-            return (
-                StatusCode::OK,
-                ApiJson(chat_response_body(
-                    &answer,
-                    &tool_trace,
-                    build_run_id.as_deref(),
-                    chart_created,
-                    None,
-                )),
-            )
-                .into_response();
+            return Ok(chat_response_body(
+                &answer,
+                &tool_trace,
+                build_run_id.as_deref(),
+                chart_created,
+                None,
+            ));
         }
 
         let mut xml_feedback: Vec<String> = Vec::new();
         for call in &calls {
+            if !report(
+                progress,
+                json!({ "type": "tool", "tool": call.function.name }),
+            ) {
+                return Ok(chat_response_body(
+                    "",
+                    &tool_trace,
+                    build_run_id.as_deref(),
+                    chart_created,
+                    Some("stopped"),
+                ));
+            }
             let args: Map<String, Value> =
                 serde_json::from_str(&call.function.arguments).unwrap_or_default();
             // D3: `ask` mode filters non-Read tools, and permission
@@ -314,10 +389,8 @@ pub async fn chat(
                     let (_, resource_id) =
                         audit::resource_for(&call.function.name, &args, &json!({}));
                     let redacted = audit::redact(&Value::Object(args.clone()));
-                    let actor = principal.as_ref().map_or_else(
-                        || "unknown".to_owned(),
-                        |Extension(p)| p.display_name.clone(),
-                    );
+                    let actor =
+                        principal.map_or_else(|| "unknown".to_owned(), |p| p.display_name.clone());
                     let approval_result = gate::create_write_high_approval(
                         state.pg.as_deref(),
                         &actor,
@@ -351,7 +424,7 @@ pub async fn chat(
                 }
             } else {
                 let clean_args = gate::strip_confirmed(&args);
-                let result = tools::run_tool(&state, &call.function.name, &clean_args).await;
+                let result = tools::run_tool(state, &call.function.name, &clean_args).await;
                 let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
                 (result, if ok { "executed" } else { "failed" }, None, None)
             };
@@ -359,7 +432,7 @@ pub async fn chat(
                 audit::resource_for(&call.function.name, &args, &result);
             audit::record(
                 state.pg.as_deref(),
-                principal.as_ref().map(|Extension(p)| p),
+                principal,
                 None,
                 &call.function.name,
                 resource_kind,
@@ -415,6 +488,7 @@ pub async fn chat(
     }
 
     // Iteration budget exhausted — ask once more for a final answer, tool-free.
+    report(progress, json!({ "type": "status", "phase": "thinking" }));
     messages.push(LlmMessage {
         role: LlmMessageRole::User,
         content: Some("Beri jawaban final ringkas dari hasil di atas.".to_owned()),
@@ -422,24 +496,64 @@ pub async fn chat(
         tool_call_id: None,
         name: None,
     });
-    match state
+    let final_msg = state
         .llm
         .chat_with_tools(&messages, &[], ChatOptions::default())
-        .await
-    {
-        Ok(final_msg) => (
-            StatusCode::OK,
-            ApiJson(chat_response_body(
-                &final_msg.content.unwrap_or_default(),
-                &tool_trace,
-                build_run_id.as_deref(),
-                chart_created,
-                Some("batas iterasi tool tercapai"),
-            )),
-        )
-            .into_response(),
-        Err(err) => llm_unavailable(&err),
-    }
+        .await?;
+    Ok(chat_response_body(
+        &final_msg.content.unwrap_or_default(),
+        &tool_trace,
+        build_run_id.as_deref(),
+        chart_created,
+        Some("batas iterasi tool tercapai"),
+    ))
+}
+
+/// `stream: true`: the same loop, answered as NDJSON — one JSON object per
+/// line. `{"type":"status","phase":"thinking"}` before each model round and
+/// `{"type":"tool","tool":…}` before each tool call let the client say what
+/// is happening; the last line is `{"type":"done","body":…}` (the plain
+/// response body) or `{"type":"error","status":…,"body":…}`. When the
+/// client disconnects, the loop stops before its next round or tool.
+fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat) -> Response {
+    use tokio::io::AsyncWriteExt as _;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let (mut writer, reader) = tokio::io::duplex(16 * 1024);
+
+    tokio::spawn(async move {
+        let last = match run_chat(&state, principal.as_ref(), run, Some(&tx)).await {
+            Ok(body) => json!({ "type": "done", "body": body }),
+            Err(err) => json!({
+                "type": "error",
+                "status": StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                "body": llm_unavailable_body(&err),
+            }),
+        };
+        let _ = tx.send(last);
+    });
+    // Dropping `rx` when a write fails (client gone) makes the loop's next
+    // `report` return false.
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            let line = format!("{event}\n");
+            if writer.write_all(line.as_bytes()).await.is_err() || writer.flush().await.is_err() {
+                break;
+            }
+            if event["type"] == "done" || event["type"] == "error" {
+                break;
+            }
+        }
+    });
+
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "application/x-ndjson"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(reader)),
+    )
+        .into_response()
 }
 
 // ── POST /api/ai/tool ───────────────────────────────────────────────────
@@ -597,13 +711,17 @@ fn chat_response_body(
 fn llm_unavailable(err: &lakehouse_llm::LlmError) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        ApiJson(json!({
-            "error": "AI Copilot tak tersedia",
-            "detail": err.to_string(),
-            "hint": "Set LLM_KEY (MiniMax) di .env.local.",
-        })),
+        ApiJson(llm_unavailable_body(err)),
     )
         .into_response()
+}
+
+fn llm_unavailable_body(err: &lakehouse_llm::LlmError) -> Value {
+    json!({
+        "error": "AI Copilot tak tersedia",
+        "detail": err.to_string(),
+        "hint": "Set LLM_KEY (MiniMax) di .env.local.",
+    })
 }
 
 /// `MiniMax-M2` sometimes emits a tool call as XML in `content` rather than
