@@ -26,6 +26,10 @@ export function CopilotDock() {
   const showPanel = c.expanded;
 
   return (
+    <>
+    {/* The bar floats over the page; this keeps the last row of content
+        scrollable out from under it. */}
+    <div aria-hidden className="h-20 shrink-0 print:hidden" />
     <div className={`fixed bottom-4 left-1/2 z-50 -translate-x-1/2 print:hidden transition-all duration-200 ${showPanel ? "w-[min(92vw,560px)]" : "w-[min(88vw,460px)]"}`}>
       {showPanel ? (
         <div className="mb-2 flex max-h-[58vh] flex-col overflow-hidden rounded-2xl border border-border/70 bg-card/90 shadow-[0_8px_40px_rgba(0,0,0,0.18)] backdrop-blur-xl supports-backdrop-filter:bg-card/80">
@@ -124,5 +128,6 @@ export function CopilotDock() {
         onFocus={() => c.setExpanded(true)}
       />
     </div>
+    </>
   );
 }

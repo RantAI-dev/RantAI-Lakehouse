@@ -1,4 +1,5 @@
 import type { EChartsOption } from "echarts";
+import { formatCompactNumber, monthlyAxisLabel } from "@/lib/chart-axis";
 import type { ChartSpec } from "@/lib/dashboard-specs";
 import { JAKARTA_MAP, normalizeJakartaArea } from "./echarts-maps";
 
@@ -12,13 +13,9 @@ const PALETTE = [
   "#84cc16", "#f97316",
 ];
 
-const fmtInt = (v: number) => Math.round(v).toLocaleString("id-ID");
-const fmtCompact = (v: number) => {
-  const a = Math.abs(v);
-  if (a >= 1_000_000) return `${(v / 1_000_000).toLocaleString("id-ID", { maximumFractionDigits: 1 })} jt`;
-  if (a >= 1_000) return `${(v / 1_000).toLocaleString("id-ID", { maximumFractionDigits: 1 })} rb`;
-  return fmtInt(v);
-};
+// English number format, matching the English UI (data values stay as-is).
+const fmtInt = (v: number) => Math.round(v).toLocaleString("en-US");
+const fmtCompact = formatCompactNumber;
 
 type Row = Record<string, unknown>;
 const num = (v: unknown) => Number(v ?? 0);
@@ -91,7 +88,7 @@ export function buildOption(
   });
   const catAxis = (data: string[]) => ({
     type: "category" as const, data,
-    axisLabel: { color: axis, fontSize: 11, interval: 0, hideOverlap: true, rotate: data.length > 6 ? 28 : 0 },
+    axisLabel: { color: axis, fontSize: 11, interval: 0, hideOverlap: true, rotate: data.length > 6 ? 28 : 0, ...monthlyAxisLabel(data) },
     axisLine: { lineStyle: { color: split } }, axisTick: { show: false },
   });
   type PieP = { name: string; value: number; percent: number };
@@ -263,7 +260,7 @@ export function buildOption(
       fontSize: 11,
       interval: 0,
       hideOverlap: true,
-      ...(horizontal ? {} : { rotate: cat.length > 6 ? 28 : 0 }),
+      ...(horizontal ? {} : { rotate: cat.length > 6 ? 28 : 0, ...monthlyAxisLabel(cat) }),
     },
     axisLine: { lineStyle: { color: split } },
     axisTick: { show: false },

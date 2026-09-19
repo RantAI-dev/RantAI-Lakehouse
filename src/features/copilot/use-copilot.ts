@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import type { ToolStep } from "./tool-step";
 import { ALL_CAP_KEYS, toolsFromCaps } from "./capabilities";
 import { derivePageContext, type PageContext } from "./page-context";
+import { notifyDashboardsChanged } from "@/features/dashboards/dashboard-events";
 import { readNdjson } from "@/lib/ndjson";
 import { notifyError, notifySuccess } from "@/lib/notify";
 import { apiFetch } from "@/services/http";
@@ -250,7 +251,7 @@ function useCopilotState() {
       ];
       setMessages(full);
       if (chartCreated) {
-        try { window.dispatchEvent(new Event("dashboards:changed")); } catch { /* ignore */ }
+        notifyDashboardsChanged();
       }
       void persist(full, mode, sessionId);
     } catch (e) {
@@ -318,7 +319,7 @@ function useCopilotState() {
         void persist(updated, mode, sessionId);
       }
       if (created) {
-        try { window.dispatchEvent(new Event("dashboards:changed")); } catch { /* ignore */ }
+        notifyDashboardsChanged();
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -352,7 +353,7 @@ function useCopilotState() {
         setMessages(updated);
         void persist(updated, mode, sessionId);
       }
-      try { window.dispatchEvent(new Event("dashboards:changed")); } catch { /* ignore */ }
+      notifyDashboardsChanged();
     },
     [mode, sessionId, persist],
   );

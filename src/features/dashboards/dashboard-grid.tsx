@@ -1,11 +1,13 @@
 "use client";
 
 import * as React from "react";
-import { GripVertical, MoreHorizontal, Pencil, Trash2 } from "lucide-react";
+import { GripVertical, MoreHorizontal } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuGroupLabel,
   DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
@@ -14,14 +16,26 @@ import { settleLayout } from "@/lib/grid-layout";
 import { cn } from "@/lib/utils";
 import type { LayoutMap, TileBox } from "@/services/clients/bi-store";
 
+export type TileMenuItem = {
+  label: string;
+  icon: React.ReactNode;
+  onSelect: () => void;
+  destructive?: boolean;
+  /** Start a new group: a separator is drawn above this item. */
+  separatorBefore?: boolean;
+};
+
 export type GridItem = {
   id: string;
   title: string;
   subtitle?: string;
   badge?: React.ReactNode;
+  /** Small affordance beside the title, e.g. that the chart is clickable. */
+  hint?: React.ReactNode;
   body: React.ReactNode;
-  onEdit?: () => void;
-  onRemove?: () => void;
+  /** Heading of the ⋯ menu (e.g. where the data comes from). */
+  menuLabel?: string;
+  menu?: TileMenuItem[];
 };
 
 const COLS = 12;
@@ -160,11 +174,14 @@ export function DashboardGrid({
                    onPointerDown={editable ? (e) => startDrag(e, it.id, "move") : undefined}>
                 {editable ? <GripVertical className="size-4 shrink-0 text-muted-foreground" /> : null}
                 <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-semibold leading-tight">{it.title}</p>
+                  <p className="flex items-center gap-1.5 truncate text-sm font-semibold leading-tight">
+                    <span className="truncate">{it.title}</span>
+                    {it.hint}
+                  </p>
                   {it.subtitle ? <p className="truncate text-[11px] text-muted-foreground">{it.subtitle}</p> : null}
                 </div>
                 {it.badge}
-                {it.onEdit || it.onRemove ? (
+                {it.menu?.length ? (
                   <div className="print:hidden" onPointerDown={(e) => e.stopPropagation()}>
                     <DropdownMenu>
                       <DropdownMenuTrigger
@@ -179,20 +196,23 @@ export function DashboardGrid({
                       >
                         <MoreHorizontal className="size-4" />
                       </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end" className="w-40">
-                        {it.onEdit ? (
-                          <DropdownMenuItem onClick={it.onEdit}>
-                            <Pencil />
-                            Edit chart
-                          </DropdownMenuItem>
+                      <DropdownMenuContent align="end" className="w-48">
+                        {it.menuLabel ? (
+                          <DropdownMenuGroup>
+                            <DropdownMenuGroupLabel className="truncate font-mono text-[11px] font-normal">
+                              {it.menuLabel}
+                            </DropdownMenuGroupLabel>
+                          </DropdownMenuGroup>
                         ) : null}
-                        {it.onEdit && it.onRemove ? <DropdownMenuSeparator /> : null}
-                        {it.onRemove ? (
-                          <DropdownMenuItem variant="destructive" onClick={it.onRemove}>
-                            <Trash2 />
-                            Delete chart
-                          </DropdownMenuItem>
-                        ) : null}
+                        {it.menu.map((m, i) => (
+                          <React.Fragment key={m.label}>
+                            {m.separatorBefore && i > 0 ? <DropdownMenuSeparator /> : null}
+                            <DropdownMenuItem variant={m.destructive ? "destructive" : "default"} onClick={m.onSelect}>
+                              {m.icon}
+                              {m.label}
+                            </DropdownMenuItem>
+                          </React.Fragment>
+                        ))}
                       </DropdownMenuContent>
                     </DropdownMenu>
                   </div>
