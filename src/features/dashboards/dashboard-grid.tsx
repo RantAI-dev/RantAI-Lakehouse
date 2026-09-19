@@ -1,7 +1,16 @@
 "use client";
 
 import * as React from "react";
-import { GripVertical, Pencil, Trash2 } from "lucide-react";
+import { GripVertical, MoreHorizontal, Pencil, Trash2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { settleLayout } from "@/lib/grid-layout";
 import { cn } from "@/lib/utils";
 import type { LayoutMap, TileBox } from "@/services/clients/bi-store";
 
@@ -20,7 +29,10 @@ const MARGIN = 12;
 const ROW_H = 44;
 const DEFAULT: TileBox = { x: 0, y: 0, w: 6, h: 6 };
 
-/** Pastikan tiap item punya kotak; yang belum → tempatkan 2-per-baris di bawah. */
+/**
+ * Pastikan tiap item punya kotak; yang belum → tempatkan 2-per-baris di bawah.
+ * Layout tersimpan yang terlanjur bertumpuk ikut dirapikan.
+ */
 function resolve(items: GridItem[], layout: LayoutMap): LayoutMap {
   const out: LayoutMap = {};
   const ids = new Set(items.map((i) => i.id));
@@ -34,7 +46,7 @@ function resolve(items: GridItem[], layout: LayoutMap): LayoutMap {
     col += DEFAULT.w;
     if (col >= COLS) { col = 0; maxY += DEFAULT.h; }
   }
-  return out;
+  return settleLayout(out);
 }
 
 type Drag = { id: string; mode: "move" | "resize"; px: number; py: number; box: TileBox };
@@ -107,7 +119,8 @@ export function DashboardGrid({
       const nb: TileBox = mode === "move"
         ? { x: Math.min(Math.max(0, b.x + dCols), COLS - b.w), y: Math.max(0, b.y + dRows), w: b.w, h: b.h }
         : { x: b.x, y: b.y, w: Math.min(Math.max(2, b.w + dCols), COLS - b.x), h: Math.max(3, b.h + dRows) };
-      last = { ...base, [id]: nb };
+      // Tile yang ditabrak turun ke bawah, jadi tidak ada yang tertimpa.
+      last = settleLayout({ ...base, [id]: nb }, id);
       setPreview(last);
     };
     const up = () => {
@@ -151,18 +164,37 @@ export function DashboardGrid({
                   {it.subtitle ? <p className="truncate text-[11px] text-muted-foreground">{it.subtitle}</p> : null}
                 </div>
                 {it.badge}
-                {editable ? (
-                  <div className="flex items-center gap-0.5" onPointerDown={(e) => e.stopPropagation()}>
-                    {it.onEdit ? (
-                      <button type="button" onClick={it.onEdit} aria-label="Edit" className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground">
-                        <Pencil className="size-3.5" />
-                      </button>
-                    ) : null}
-                    {it.onRemove ? (
-                      <button type="button" onClick={it.onRemove} aria-label="Delete" className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive">
-                        <Trash2 className="size-3.5" />
-                      </button>
-                    ) : null}
+                {it.onEdit || it.onRemove ? (
+                  <div className="print:hidden" onPointerDown={(e) => e.stopPropagation()}>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger
+                        render={
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="size-7 text-muted-foreground hover:text-foreground"
+                            aria-label={`Actions for ${it.title}`}
+                          />
+                        }
+                      >
+                        <MoreHorizontal className="size-4" />
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="w-40">
+                        {it.onEdit ? (
+                          <DropdownMenuItem onClick={it.onEdit}>
+                            <Pencil />
+                            Edit chart
+                          </DropdownMenuItem>
+                        ) : null}
+                        {it.onEdit && it.onRemove ? <DropdownMenuSeparator /> : null}
+                        {it.onRemove ? (
+                          <DropdownMenuItem variant="destructive" onClick={it.onRemove}>
+                            <Trash2 />
+                            Delete chart
+                          </DropdownMenuItem>
+                        ) : null}
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                   </div>
                 ) : null}
               </div>

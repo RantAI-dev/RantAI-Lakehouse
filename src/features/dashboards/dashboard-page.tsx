@@ -4,6 +4,7 @@ import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
 import { RefreshCw, Sparkles, Download, Pencil, Eye, Copy, Trash2, MoreHorizontal, Maximize2, Minimize2, Move, Share2, Link2, Check, Globe, Code2, KeyRound, Filter, Table2, FileDown, ChartColumn } from "lucide-react";
+import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
 import { PageHeader } from "@/components/patterns/page-header";
 import { BoardSwitcher } from "./board-switcher";
 import { Button } from "@/components/ui/button";
@@ -75,6 +76,9 @@ export function DashboardPage() {
   const filtersRef = React.useRef<FilterDef[]>([]);
   const adoptingRef = React.useRef(true);
   const [editing, setEditing] = React.useState<{ id: string; def: ChartDef } | null>(null);
+  // Tile delete is one click away in view mode too, so it asks first.
+  const [removing, setRemoving] = React.useState<{ id: string; title: string } | null>(null);
+  const [removeBusy, setRemoveBusy] = React.useState(false);
   const [renameOpen, setRenameOpen] = React.useState(false);
   const [newName, setNewName] = React.useState("");
   const [fullscreen, setFullscreen] = React.useState(false);
@@ -117,6 +121,13 @@ export function DashboardPage() {
   // Ganti dashboard → adopsi ulang filter tersimpan board itu.
   React.useEffect(() => { adoptingRef.current = true; filtersRef.current = []; setFilters([]); }, [board]);
   React.useEffect(() => { void load(); }, [load]);
+
+  // Muat ulang otomatis bila ada chart baru yang ditambahkan/dihapus (oleh Copilot atau modal).
+  React.useEffect(() => {
+    const handler = () => { void load(); };
+    window.addEventListener("dashboards:changed", handler);
+    return () => window.removeEventListener("dashboards:changed", handler);
+  }, [load]);
 
   // Auto-refresh berkala (presentasi). Hook-nya menjeda diri saat tab
   // tersembunyi — lihat `auto-refresh.ts`.
@@ -193,11 +204,11 @@ export function DashboardPage() {
     }
   }, [data, isDefault, router]);
 
-  // Simpan layout (debounced) untuk dashboard user.
+  // Simpan layout (debounced). Board bawaan ikut disimpan: backend menerima
+  // layout — dan hanya layout — untuk id "default".
   const saveTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const persistLayout = React.useCallback((next: LayoutMap) => {
     setLayout(next);
-    if (isDefault) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       void apiFetch("/api/dashboard/boards", {
@@ -205,11 +216,17 @@ export function DashboardPage() {
         body: JSON.stringify({ id: board, layout: next }),
       });
     }, 600);
-  }, [board, isDefault]);
+  }, [board]);
 
   async function remove(id: string) {
-    await apiFetch(`/api/dashboard/specs?id=${encodeURIComponent(id)}`, { method: "DELETE" });
-    void load();
+    setRemoveBusy(true);
+    try {
+      await apiFetch(`/api/dashboard/specs?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+      setRemoving(null);
+      void load();
+    } finally {
+      setRemoveBusy(false);
+    }
   }
   async function duplicateDashboard() {
     const res = await apiFetch("/api/dashboard/boards", {
@@ -361,7 +378,7 @@ export function DashboardPage() {
         </div>
       ),
       onEdit: spec.source !== "builtin" && spec.def ? () => setEditing({ id: spec.id, def: spec.def as ChartDef }) : undefined,
-      onRemove: spec.source !== "builtin" ? () => void remove(spec.id) : undefined,
+      onRemove: spec.source !== "builtin" ? () => setRemoving({ id: spec.id, title: spec.title }) : undefined,
       body: <TileBody spec={spec} cell={cell} dark={dark} loading={loading} year={year}
         onDataClick={clickable && dim ? onTileClick(dim, spec.mart) : undefined} />,
     };
@@ -380,7 +397,7 @@ export function DashboardPage() {
           />
         }
         description={isDefault
-          ? "Built-in dashboard (demo) — its layout is fixed. Pick “New dashboard” from the title menu to create your own, then arrange it freely."
+          ? "Built-in dashboard (demo) — rearrange tiles in Edit layout. Pick “New dashboard” from the title menu for your own, with filters and sharing."
           : "Dashboard canvas — drag & resize tiles in Edit mode. Saved automatically."}
         actions={
           <span data-print-hide className="contents">
@@ -389,11 +406,9 @@ export function DashboardPage() {
                 tingkat koleksi dan sudah tersedia di sidebar, jadi tidak
                 diduplikasi di sini. Yang tersisa sebagai aksi utama adalah
                 "New chart" — isi dari dashboard ini sendiri. */}
-            {!isDefault ? (
-              <Button variant={edit ? "default" : "outline"} size="sm" onClick={() => setEdit((e) => !e)}>
-                {edit ? <Eye className="size-4" /> : <Pencil className="size-4" />}{edit ? "Done" : "Edit layout"}
-              </Button>
-            ) : null}
+            <Button variant={edit ? "default" : "outline"} size="sm" onClick={() => setEdit((e) => !e)}>
+              {edit ? <Eye className="size-4" /> : <Pencil className="size-4" />}{edit ? "Done" : "Edit layout"}
+            </Button>
             <Select value={year} onValueChange={(v) => setYear(v ?? "all")}>
               <SelectTrigger className="h-8 w-[130px] text-xs" aria-label="Filter by year"><SelectValue /></SelectTrigger>
               <SelectContent>{YEARS.map((y) => <SelectItem key={y} value={y}>{y === "all" ? "All years" : `Year ${y}`}</SelectItem>)}</SelectContent>
@@ -511,15 +526,26 @@ export function DashboardPage() {
         </div>
       ) : (
         <>
-          {edit && !isDefault ? (
+          {edit ? (
             <div className="flex items-center gap-2 rounded-lg border border-dashed border-primary/30 bg-primary/5 px-3 py-1.5 text-xs text-muted-foreground">
               <Move className="size-3.5 text-primary" />
-              Edit mode: <span className="font-medium text-foreground">drag the header</span> to move, <span className="font-medium text-foreground">drag the bottom-right corner</span> to resize. Use ✏️/🗑️ per tile to edit/delete. Saved automatically.
+              Edit mode: <span className="font-medium text-foreground">drag the header</span> to move, <span className="font-medium text-foreground">drag the bottom-right corner</span> to resize. Use a tile’s ⋯ menu to edit or delete it. Saved automatically.
             </div>
           ) : null}
-          <DashboardGrid items={items} layout={layout} editable={edit && !isDefault} onLayoutChange={persistLayout} />
+          <DashboardGrid items={items} layout={layout} editable={edit} onLayoutChange={persistLayout} />
         </>
       )}
+
+      <ConfirmActionDialog
+        open={removing !== null}
+        onOpenChange={(o) => { if (!o) setRemoving(null); }}
+        title="Delete chart?"
+        description={`"${removing?.title ?? ""}" will be removed from this dashboard.`}
+        confirmLabel="Delete chart"
+        destructive
+        confirming={removeBusy}
+        onConfirm={() => { if (removing) void remove(removing.id); }}
+      />
 
       {editing ? (
         <ChartBuilder hideTrigger open={!!editing} onOpenChange={(o) => { if (!o) setEditing(null); }}

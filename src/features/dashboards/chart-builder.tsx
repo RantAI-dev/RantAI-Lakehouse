@@ -116,7 +116,8 @@ export function ChartBuilder({
   onSaved, board = "default", boards = [], initial, editId,
   open: openProp, onOpenChange, hideTrigger,
 }: {
-  onSaved: () => void;
+  /** Receives the definition that was saved. */
+  onSaved: (saved: ChartDef) => void;
   board?: string;
   boards?: BoardOpt[];
   initial?: ChartDef;
@@ -174,10 +175,11 @@ export function ChartBuilder({
     return f;
   }
 
-  // Saat dibuka: muat mart, dan bila EDIT prefill dari initial.
+  // Saat dibuka: muat mart, dan prefill dari initial — EDIT, atau draft
+  // (mis. dari Copilot) yang tipenya sudah dipilih, jadi galeri dilewati.
   React.useEffect(() => {
     if (!open) return;
-    setStep(isEdit ? "configure" : "gallery");
+    setStep(isEdit || initial?.kind ? "configure" : "gallery");
     void apiFetch("/api/dashboard/fields").then((r) => r.json()).then((j) => setMarts(j.marts ?? [])).catch(() => setMarts([]));
     if (initial) {
       setTitle(initial.title ?? "");
@@ -297,7 +299,7 @@ export function ChartBuilder({
       if (!res.ok) throw new Error(json?.error ?? "Failed to save chart");
       setOpen(false);
       if (!isEdit) reset();
-      onSaved();
+      onSaved(payload as ChartDef);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
