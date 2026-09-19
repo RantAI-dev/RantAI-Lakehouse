@@ -1,23 +1,49 @@
 "use client";
 
 import * as React from "react";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { Sparkles } from "lucide-react";
 import { useCopilot } from "./use-copilot";
 import { ChatMessages } from "./chat-messages";
 import { ChatComposer } from "./chat-composer";
 import { CopilotHistoryMenu } from "./history-menu";
 
+/**
+ * Keeps `/copilot?id=` and the open conversation in step, both ways, so a
+ * conversation has a link and Back returns to it.
+ *
+ * - The URL changed (a history link, Back/Forward): open that conversation.
+ * - The open conversation changed (picked from the menu, New chat, or a new
+ *   chat saved for the first time): rewrite the URL to match.
+ *
+ * The refs record what each side last looked like, so the side that just
+ * moved is followed and the other never bounces it back — while a load is
+ * in flight the old conversation is still open, and must not rewrite the
+ * URL that asked for the new one.
+ */
 function SessionUrlSync() {
+  const router = useRouter();
   const searchParams = useSearchParams();
   const { sessionId: activeId, loadSession } = useCopilot();
-  const sessionId = searchParams.get("id") ?? searchParams.get("session");
+  const urlId = searchParams.get("id") ?? searchParams.get("session");
+  const lastUrl = React.useRef<string | null | undefined>(undefined);
+  const lastActive = React.useRef<string | null>(activeId);
 
   React.useEffect(() => {
-    if (sessionId && sessionId !== activeId) {
-      void loadSession(sessionId);
+    if (urlId !== lastUrl.current) {
+      lastUrl.current = urlId;
+      lastActive.current = activeId;
+      if (urlId && urlId !== activeId) void loadSession(urlId);
+      else if (!urlId && activeId) router.replace(`/copilot?id=${encodeURIComponent(activeId)}`);
+      return;
     }
-  }, [sessionId, activeId, loadSession]);
+    if (activeId !== lastActive.current) {
+      lastActive.current = activeId;
+      if (activeId !== urlId) {
+        router.replace(activeId ? `/copilot?id=${encodeURIComponent(activeId)}` : "/copilot");
+      }
+    }
+  }, [urlId, activeId, loadSession, router]);
 
   return null;
 }
@@ -49,7 +75,6 @@ export function CopilotPage() {
         activeId={c.sessionId}
         onSelect={(id) => void c.loadSession(id)}
         onNew={() => c.newChat()}
-        onDelete={(id) => void c.removeSession(id)}
       />
       <div className="mx-auto flex min-h-0 w-full max-w-3xl flex-1 flex-col">
         <div className="min-h-0 flex-1 overflow-y-auto pr-0.5">

@@ -6,6 +6,7 @@ import type { ToolStep } from "./tool-step";
 import { ALL_CAP_KEYS, capsForMode, toolsFromCaps } from "./capabilities";
 import { derivePageContext, type PageContext } from "./page-context";
 import { CopilotConfirmWriteDialog } from "./confirm-write-dialog";
+import { notifyError, notifySuccess } from "@/lib/notify";
 import { apiFetch } from "@/services/http";
 
 export type Mode = "ask" | "build";
@@ -17,7 +18,18 @@ export type Msg = {
   buildRunId?: string;
   chartCreated?: boolean;
 };
-export type SessionMeta = { id: string; title: string; mode: string; updatedAt?: string };
+export type SessionMeta = {
+  id: string;
+  title: string;
+  mode: string;
+  updatedAt?: string;
+  chartCreated?: boolean;
+  /** Last message's content, truncated server-side; still markdown. */
+  preview?: string;
+};
+
+/** How many recent sessions the header history menus list. */
+const RECENT_SESSIONS = 20;
 
 /**
  * Otak AI Copilot yang DIPAKAI BERSAMA (lewat context) oleh chat dock global,
@@ -116,7 +128,7 @@ function useCopilotState() {
 
   const refreshSessions = React.useCallback(async () => {
     try {
-      const res = await apiFetch("/api/ai/sessions", { cache: "no-store" });
+      const res = await apiFetch(`/api/ai/sessions?limit=${RECENT_SESSIONS}`, { cache: "no-store" });
       const json = await res.json();
       if (Array.isArray(json.sessions)) setSessions(json.sessions);
     } catch { /* abaikan */ }
@@ -329,16 +341,40 @@ function useCopilotState() {
     }
   }, []);
 
-  const removeSession = React.useCallback(async (id: string) => {
-    await apiFetch(`/api/ai/sessions?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+  const removeSession = React.useCallback(async (id: string): Promise<boolean> => {
+    try {
+      const res = await apiFetch(`/api/ai/sessions?id=${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!res.ok) throw new Error((await res.json().catch(() => null))?.error ?? "Failed to delete");
+    } catch (e) {
+      notifyError("Couldn't delete conversation", e);
+      return false;
+    }
     if (id === sessionId) newChat();
+    notifySuccess("Conversation deleted");
     void refreshSessions();
+    return true;
   }, [sessionId, newChat, refreshSessions]);
+
+  const renameSession = React.useCallback(async (id: string, title: string): Promise<boolean> => {
+    try {
+      const res = await apiFetch("/api/ai/sessions", {
+        method: "PATCH", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, title }),
+      });
+      if (!res.ok) throw new Error((await res.json().catch(() => null))?.error ?? "Failed to rename");
+    } catch (e) {
+      notifyError("Couldn't rename conversation", e);
+      return false;
+    }
+    notifySuccess("Conversation renamed");
+    void refreshSessions();
+    return true;
+  }, [refreshSessions]);
 
   return {
     mode, setMode, messages, busy, error, sessionId, sessions,
     enabledCaps, toggleCap, pageContext, setPageContext,
-    send, newChat, loadSession, removeSession, refreshSessions,
+    send, newChat, loadSession, removeSession, renameSession, refreshSessions,
     writeCaps, pendingSend, requestSend, confirmSend, cancelSend,
     confirmTool, cancelTool, completeToolStep, confirmingKey,
     dockPosition, setDockPosition, expanded, setExpanded,
