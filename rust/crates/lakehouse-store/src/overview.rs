@@ -175,3 +175,165 @@ mod tests {
         assert!(value.get("href").is_none());
     }
 }
+
+// ── Overview summary sources ────────────────────────────────────────────
+//
+// The overview page used to read its pipeline numbers from Dagster and fill
+// the rest with zeros written into the handler. These read what the console
+// actually stores, so an unreachable orchestrator costs only the pipeline
+// numbers, and "0 pending approvals" means there are none rather than
+// "nobody wired this up".
+
+/// One entry of the recent-activity feed, from the audit trail.
+/// Mirrors `ActivityItem` in `contracts/overview.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityItem {
+    pub id: String,
+    pub at: String,
+    pub actor: String,
+    pub actor_kind: String,
+    pub action: String,
+    pub target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_href: Option<String>,
+    pub category: String,
+    pub audit_event_id: String,
+}
+
+#[derive(Debug, FromRow)]
+struct ActivityRow {
+    id: String,
+    at: OffsetDateTime,
+    // Nullable in `audit_event`: an action with no principal or no resource
+    // (most of them) writes NULL, not an empty string.
+    principal_kind: Option<String>,
+    actor_label: Option<String>,
+    action: String,
+    resource_kind: Option<String>,
+    resource_id: Option<String>,
+    outcome: String,
+}
+
+/// An audited action as a sentence: what happened to what, in plain words.
+fn activity_action(action: &str, outcome: &str) -> String {
+    let verb = match outcome {
+        "executed" => "ran",
+        "failed" => "failed to run",
+        "refused" => "was refused",
+        "needs_confirmation" => "asked to run",
+        "needs_approval" => "requested approval for",
+        _ => "ran",
+    };
+    format!("{verb} {}", action.replace('_', " "))
+}
+
+/// Which section of the console an audited action belongs to.
+fn activity_category(principal_kind: &str, resource_kind: &str) -> &'static str {
+    if principal_kind == "copilot" || principal_kind == "agent" {
+        return "agent";
+    }
+    match resource_kind {
+        "pipeline" | "pipeline_run" => "pipeline",
+        "connector" => "connector",
+        "policy" | "classification_rule" | "quality_rule" => "policy",
+        "approval" => "approval",
+        "alert" | "alert_rule" => "incident",
+        "chart" | "board" | "saved_query" | "query" => "query",
+        "dataset" | "table" => "schema",
+        _ => "query",
+    }
+}
+
+fn activity_href(resource_kind: &str) -> Option<String> {
+    let href = match resource_kind {
+        "chart" | "board" => "/dashboards",
+        "pipeline" | "pipeline_run" => "/pipelines",
+        "connector" => "/connectors",
+        "policy" => "/governance/policies",
+        "approval" => "/agents/approvals",
+        "saved_query" | "query" => "/query-studio/saved",
+        _ => return None,
+    };
+    Some(href.to_owned())
+}
+
+impl From<ActivityRow> for ActivityItem {
+    fn from(r: ActivityRow) -> Self {
+        let resource_kind = r.resource_kind.unwrap_or_default();
+        let principal_kind = r.principal_kind.unwrap_or_default();
+        let target = r
+            .resource_id
+            .filter(|s| !s.is_empty())
+            .or_else(|| (!resource_kind.is_empty()).then(|| resource_kind.clone()))
+            .unwrap_or_else(|| "—".to_owned());
+        let actor_kind = match principal_kind.as_str() {
+            "user" => "user",
+            "service" => "service",
+            _ => "agent",
+        };
+        Self {
+            at: iso_millis(r.at),
+            actor: r.actor_label.unwrap_or_else(|| "Unknown".to_owned()),
+            actor_kind: actor_kind.to_owned(),
+            action: activity_action(&r.action, &r.outcome),
+            target,
+            target_href: activity_href(&resource_kind),
+            category: activity_category(&principal_kind, &resource_kind).to_owned(),
+            audit_event_id: r.id.clone(),
+            id: r.id,
+        }
+    }
+}
+
+/// The most recent audited actions, newest first.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn recent_activity(pool: &PgPool, limit: i64) -> Result<Vec<ActivityItem>, StoreError> {
+    let rows: Vec<ActivityRow> = sqlx::query_as(
+        "SELECT id, at, principal_kind, actor_label, action, resource_kind, resource_id, outcome \
+         FROM audit_event ORDER BY at DESC LIMIT $1",
+    )
+    .bind(limit.clamp(1, 200))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(ActivityItem::from).collect())
+}
+
+/// Counts the overview's cards need, in one round trip.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct OverviewCounts {
+    /// Approvals waiting for a human decision.
+    pub pending_approvals: i64,
+    /// Audited actions the policy gate refused, last 7 days.
+    pub policy_violations_7d: i64,
+    /// Agent runs currently executing.
+    pub active_agent_runs: i64,
+    /// Pipelines currently running.
+    pub pipelines_running: i64,
+    /// Pipelines whose last run failed.
+    pub pipelines_failed: i64,
+    /// Pipelines that missed their freshness SLA.
+    pub pipelines_delayed: i64,
+}
+
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn counts(pool: &PgPool) -> Result<OverviewCounts, StoreError> {
+    let counts: OverviewCounts = sqlx::query_as(
+        "SELECT \
+           (SELECT count(*) FROM approval_item WHERE status = 'pending') AS pending_approvals, \
+           (SELECT count(*) FROM audit_event WHERE outcome = 'refused' AND at > now() - interval '7 days') AS policy_violations_7d, \
+           (SELECT count(*) FROM agent_run WHERE status IN ('running', 'queued')) AS active_agent_runs, \
+           (SELECT count(*) FROM pipeline_definition WHERE status = 'running') AS pipelines_running, \
+           (SELECT count(*) FROM pipeline_definition WHERE status = 'failed') AS pipelines_failed, \
+           (SELECT count(*) FROM pipeline_definition WHERE sla_ok = false) AS pipelines_delayed",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(counts)
+}

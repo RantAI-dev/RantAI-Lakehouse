@@ -9,7 +9,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use lakehouse_clickhouse::{ChClient, ChError};
+use lakehouse_clickhouse::ChError;
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::overview::{self, AlertItem};
@@ -20,28 +20,24 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::routes::support::{js_error, num_or_zero, str_col};
 use crate::state::AppState;
-use lakehouse_dagster::{DgClient, DgError, iso_from_unix_seconds, map_run_status};
+use lakehouse_dagster::{iso_from_unix_seconds, map_run_status};
 
-/// Errors surfaced while building the overview: either `ClickHouse` or
-/// `Dagster` can fail, and — matching the TypeScript's single `try/catch`
-/// around both — either failure produces the same 503 body.
+/// The overview is built from `ClickHouse`; only that failing makes the
+/// page unavailable. Postgres and `Dagster` contribute parts of it and are
+/// allowed to be down — their sections then report what is known instead of
+/// taking the whole page with them.
 #[derive(Debug, thiserror::Error)]
 enum OverviewError {
     /// A `ClickHouse` query failed.
     #[error("{0}")]
     ClickHouse(#[from] ChError),
-    /// A `Dagster` call failed.
-    #[error("{0}")]
-    Dagster(#[from] DgError),
 }
 
 /// `GET /api/overview` — aggregate counts across catalog, storage,
-/// queries, and pipelines.
+/// queries, pipelines, governance and service health.
 pub async fn get(State(state): State<AppState>) -> Response {
-    match get_body(&state.clickhouse, &state.dagster).await {
+    match get_body(&state).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
-        // `catch (e) { return NextResponse.json({ error: String(e) }, {
-        // status: 503 }); }` in `overview/route.ts` GET.
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
             ApiJson(json!({ "error": js_error(err) })),
@@ -50,7 +46,86 @@ pub async fn get(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn get_body(ch: &ChClient, dagster: &DgClient) -> Result<Value, OverviewError> {
+/// Pipeline run counts: from `Dagster` when it answers (it knows about runs
+/// in flight), otherwise from the pipeline definitions the console stores.
+async fn pipeline_counts(state: &AppState) -> (Value, bool) {
+    if let Ok(runs) = state.dagster.list_runs(100).await {
+        let now_ms = now_unix_millis();
+        let recent: Vec<&lakehouse_dagster::DgRun> = runs
+            .iter()
+            .filter(|r| r.start_time.unwrap_or(0.0) * 1000.0 > now_ms - 864e5)
+            .collect();
+        let failed = recent.iter().filter(|r| r.status == "FAILURE").count();
+        let active = recent
+            .iter()
+            .filter(|r| matches!(r.status.as_str(), "STARTED" | "STARTING" | "QUEUED"))
+            .count();
+        return (
+            json!({ "active": active, "failed": failed, "delayed": 0 }),
+            true,
+        );
+    }
+    let counts = match state.pg.as_deref() {
+        Some(pool) => overview::counts(pool).await.unwrap_or_default(),
+        None => overview::OverviewCounts::default(),
+    };
+    (
+        json!({
+            "active": counts.pipelines_running,
+            "failed": counts.pipelines_failed,
+            "delayed": counts.pipelines_delayed,
+        }),
+        false,
+    )
+}
+
+/// Health of the pieces this page depends on, as the console can observe
+/// them right now. `ClickHouse` answered (this body exists), so the only
+/// open questions are Postgres and the orchestrator.
+async fn service_health(state: &AppState, orchestrator_ok: bool) -> Value {
+    let postgres_ok = match state.pg.as_deref() {
+        Some(pool) => sqlx::query("SELECT 1").fetch_one(pool).await.is_ok(),
+        None => false,
+    };
+    let postgres_status = if postgres_ok { "healthy" } else { "unhealthy" };
+    let orchestrator_status = if orchestrator_ok { "healthy" } else { "unavailable" };
+    let items = json!([
+        { "name": "ClickHouse", "status": "healthy" },
+        { "name": "Postgres", "status": postgres_status },
+        { "name": "Orchestrator", "status": orchestrator_status },
+    ]);
+    let healthy = 1 + i32::from(postgres_ok) + i32::from(orchestrator_ok);
+    json!({
+        "healthy": healthy,
+        "degraded": 0,
+        "unhealthy": i32::from(!postgres_ok),
+        "unavailable": i32::from(!orchestrator_ok),
+        "items": items,
+    })
+}
+
+/// The open alerts, newest first, as the page's incident list.
+async fn incidents(state: &AppState) -> Vec<Value> {
+    let Some(pool) = state.pg.as_deref() else {
+        return Vec::new();
+    };
+    overview::list_alerts(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| a.status != "resolved")
+        .take(5)
+        .map(|a| {
+            json!({
+                "id": a.id, "title": a.title, "severity": a.severity,
+                "source": a.source, "at": a.at,
+            })
+        })
+        .collect()
+}
+
+async fn get_body(state: &AppState) -> Result<Value, OverviewError> {
+    let ch = &state.clickhouse;
     let assets_row = ch
         .rows(
             "SELECT toString(count()) n, toString(countIf(coalesce(s.total,0)=0)) stale FROM (
@@ -82,22 +157,11 @@ async fn get_body(ch: &ChClient, dagster: &DgClient) -> Result<Value, OverviewEr
         )
         .await?;
 
-    let runs = dagster.list_runs(100).await?;
-    // `jobs` is fetched but never read in the TypeScript response — kept
-    // here only so a `Dagster` outage on this call still 503s like the
-    // original, matching its (accidental) error-propagation behavior.
-    let _jobs = dagster.list_jobs().await?;
-
-    let now_ms = now_unix_millis();
-    let recent: Vec<&lakehouse_dagster::DgRun> = runs
-        .iter()
-        .filter(|r| r.start_time.unwrap_or(0.0) * 1000.0 > now_ms - 864e5)
-        .collect();
-    let failed = recent.iter().filter(|r| r.status == "FAILURE").count();
-    let active = recent
-        .iter()
-        .filter(|r| matches!(r.status.as_str(), "STARTED" | "STARTING" | "QUEUED"))
-        .count();
+    let (pipelines, orchestrator_ok) = pipeline_counts(state).await;
+    let counts = match state.pg.as_deref() {
+        Some(pool) => overview::counts(pool).await.unwrap_or_default(),
+        None => overview::OverviewCounts::default(),
+    };
 
     let assets_row = assets_row.first();
     let hot_row = hot_row.first();
@@ -114,7 +178,7 @@ async fn get_body(ch: &ChClient, dagster: &DgClient) -> Result<Value, OverviewEr
             "cold": { "count": 0, "bytes": 0 },
             "ai": { "count": 0, "bytes": 0 },
         },
-        "pipelines": { "active": active, "failed": failed, "delayed": 0 },
+        "pipelines": pipelines,
         "streaming": { "jobs": 0, "maxLagSeconds": 0, "unhealthy": 0 },
         "queries": {
             "volume24h": num_or_zero(q_row, "vol"),
@@ -123,18 +187,31 @@ async fn get_body(ch: &ChClient, dagster: &DgClient) -> Result<Value, OverviewEr
             "cacheAssistRate": 0,
             "scannedBytes24h": num_or_zero(q_row, "scan"),
         },
-        "policyViolations7d": 0,
-        "pendingApprovals": 0,
-        "agents": { "activeRuns": 0, "budgetUsedRate": 0 },
-        "services": { "healthy": 4, "degraded": 0, "unhealthy": 0 },
-        "incidents": [],
+        "policyViolations7d": counts.policy_violations_7d,
+        "pendingApprovals": counts.pending_approvals,
+        "agents": { "activeRuns": counts.active_agent_runs, "budgetUsedRate": 0 },
+        "services": service_health(state, orchestrator_ok).await,
+        "incidents": incidents(state).await,
+        "generatedAt": iso_now(),
     }))
 }
 
-/// `POST /api/overview` — recent activity, sourced entirely from `Dagster`
-/// run history. Despite the verb this reads only; there is no request
-/// body and nothing is mutated.
+/// `POST /api/overview` — the recent-activity feed, from the audit trail
+/// (every console and Copilot action lands there). Despite the verb this
+/// reads only; there is no request body and nothing is mutated.
+///
+/// `Dagster` run history is the fallback for deployments whose console
+/// Postgres is not configured.
 pub async fn refresh(State(state): State<AppState>) -> Response {
+    if let Some(pool) = state.pg.as_deref() {
+        match overview::recent_activity(pool, 20).await {
+            Ok(activity) => {
+                return (StatusCode::OK, ApiJson(json!({ "activity": activity }))).into_response();
+            }
+            // Say so rather than silently falling back to the orchestrator.
+            Err(err) => tracing::warn!(error = %err, "audit activity read failed; trying Dagster"),
+        }
+    }
     match state.dagster.list_runs(20).await {
         Ok(runs) => {
             let activity: Vec<Value> = runs
@@ -153,14 +230,27 @@ pub async fn refresh(State(state): State<AppState>) -> Response {
                 .collect();
             (StatusCode::OK, ApiJson(json!({ "activity": activity }))).into_response()
         }
-        // `catch (e) { return NextResponse.json({ activity: [], error:
-        // String(e) }, { status: 503 }); }` in `overview/route.ts` POST.
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
             ApiJson(json!({ "activity": [], "error": js_error(err) })),
         )
             .into_response(),
     }
+}
+
+/// Now, as an ISO-8601 instant — when the numbers above were read. Written
+/// by hand so this does not depend on `time`'s `formatting` feature.
+fn iso_now() -> String {
+    let at = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second()
+    )
 }
 
 /// `Date.now()` — current Unix time in milliseconds, as an `f64` so it can

@@ -21,9 +21,21 @@ export type OverviewSummary = {
   policyViolations7d: number
   pendingApprovals: number
   agents: { activeRuns: number; budgetUsedRate: number }
-  services: { healthy: number; degraded: number; unhealthy: number }
+  services: {
+    healthy: number
+    degraded: number
+    unhealthy: number
+    /** Dependencies that are simply not reachable (e.g. no orchestrator). */
+    unavailable?: number
+    /** Per-dependency status, for the health list. */
+    items?: { name: string; status: ServiceStatus }[]
+  }
   incidents: OverviewIncident[]
+  /** When the server read these numbers (ISO-8601). */
+  generatedAt?: string
 }
+
+export type ServiceStatus = "healthy" | "degraded" | "unhealthy" | "unavailable"
 
 export type OverviewIncident = {
   id: string

@@ -1,6 +1,7 @@
 "use client"
 
 import Link from "next/link"
+import { RefreshCw } from "lucide-react"
 import { PageHeader } from "@/components/patterns/page-header"
 import { MetricCard, MetricGrid } from "@/components/patterns/metric-card"
 import {
@@ -10,28 +11,66 @@ import {
 } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { SeverityBadge, TierBadge } from "@/components/patterns/status-badge"
+import { Button } from "@/components/ui/button"
 import { useService } from "@/hooks/use-service"
 import {
   formatBytes,
   formatCompactNumber,
+  formatDateTime,
   formatPercent,
   formatRelativeTime,
 } from "@/lib/format"
 import { STORAGE_TIER_LABEL, type StorageTier } from "@/lib/status"
+import type { ServiceStatus } from "@/services/contracts/overview"
 import { overviewService } from "@/services"
+import { cn } from "@/lib/utils"
 
 const TIERS: StorageTier[] = ["hot", "warm", "cold", "ai"]
+
+const STATUS_DOT: Record<ServiceStatus, string> = {
+  healthy: "bg-emerald-500",
+  degraded: "bg-amber-500",
+  unhealthy: "bg-destructive",
+  unavailable: "bg-muted-foreground/40",
+}
+
+const STATUS_LABEL: Record<ServiceStatus, string> = {
+  healthy: "Healthy",
+  degraded: "Degraded",
+  unhealthy: "Unhealthy",
+  unavailable: "Not connected",
+}
 
 /** Overview dashboard — executive-operational KPIs for the lakehouse console. */
 export function OverviewPage() {
   const summary = useService((s) => overviewService.getSummary(s), [])
   const activity = useService((s) => overviewService.listActivity(s), [])
 
+  const reloadAll = () => {
+    summary.reload()
+    activity.reload()
+  }
+  const generatedAt = summary.status === "success" ? summary.data.generatedAt : undefined
+  const busy = summary.status === "loading" || activity.status === "loading"
+
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Overview"
         description="Platform health across storage tiers, pipelines, queries, agents, and governance."
+        actions={
+          <div className="flex items-center gap-2">
+            {generatedAt ? (
+              <span className="hidden text-xs text-muted-foreground sm:inline" title={formatDateTime(generatedAt)}>
+                Updated {formatRelativeTime(generatedAt)}
+              </span>
+            ) : null}
+            <Button variant="outline" size="sm" onClick={reloadAll} disabled={busy}>
+              <RefreshCw className={cn("size-4", busy && "animate-spin")} />
+              Refresh
+            </Button>
+          </div>
+        }
       />
 
       {summary.status === "loading" ? <MetricSkeleton cards={7} /> : null}
@@ -40,45 +79,55 @@ export function OverviewPage() {
       ) : null}
       {summary.status === "success" ? (
         <>
-          <MetricGrid className="lg:grid-cols-3">
+          {/* What the platform holds and how hard it is working. */}
+          <MetricGrid className="lg:grid-cols-4">
             <MetricCard
               label="Catalog assets"
               value={formatCompactNumber(summary.data.assetsTotal)}
               hint={`${summary.data.staleAssets} stale by watermark`}
               trendTone={summary.data.staleAssets > 0 ? "negative" : "positive"}
-              trend={`${summary.data.staleAssets} stale`}
+              href="/catalog"
             />
             <MetricCard
-              label="Pipelines"
+              label="Pipelines running"
               value={summary.data.pipelines.active}
-              hint={`${summary.data.pipelines.failed} failed · ${summary.data.pipelines.delayed} delayed`}
+              hint={`${summary.data.pipelines.failed} failed · ${summary.data.pipelines.delayed} behind schedule`}
+              trendTone={summary.data.pipelines.failed > 0 ? "negative" : "neutral"}
+              href="/pipelines"
             />
             <MetricCard
               label="Query volume (24h)"
               value={formatCompactNumber(summary.data.queries.volume24h)}
-              hint={`p95 ${summary.data.queries.p95Ms} ms · cache ${formatPercent(summary.data.queries.cacheAssistRate)}`}
+              hint={`p95 ${summary.data.queries.p95Ms} ms · ${formatBytes(summary.data.queries.scannedBytes24h)} scanned`}
+              href="/workloads"
+            />
+            <MetricCard
+              label="Query failure rate (24h)"
+              value={formatPercent(summary.data.queries.failureRate)}
+              trendTone={summary.data.queries.failureRate > 0 ? "negative" : "positive"}
+              href="/workloads"
             />
           </MetricGrid>
-          <MetricGrid className="lg:grid-cols-4">
-            <MetricCard
-              label="Query failure rate"
-              value={formatPercent(summary.data.queries.failureRate)}
-              hint={`${formatBytes(summary.data.queries.scannedBytes24h)} scanned (24h)`}
-              trendTone={summary.data.queries.failureRate > 0 ? "negative" : "positive"}
-            />
+
+          {/* What is waiting for a human. */}
+          <MetricGrid className="lg:grid-cols-3">
             <MetricCard
               label="Policy violations (7d)"
               value={summary.data.policyViolations7d}
+              hint="Actions the policy gate refused"
               trendTone={summary.data.policyViolations7d > 0 ? "negative" : "positive"}
+              href="/audit"
             />
             <MetricCard
               label="Pending approvals"
               value={summary.data.pendingApprovals}
+              hint="Agent actions waiting for a decision"
+              href="/agents/approvals"
             />
             <MetricCard
-              label="Agent runs"
+              label="Agent runs in flight"
               value={summary.data.agents.activeRuns}
-              hint={`${formatPercent(summary.data.agents.budgetUsedRate)} budget used`}
+              href="/agents/runs"
             />
           </MetricGrid>
 
@@ -116,25 +165,33 @@ export function OverviewPage() {
           <div className="grid gap-4 lg:grid-cols-2">
             <SectionCard
               title="Service health"
-              description="Access layer, stores, and retrieval planes."
-            >
-              <div className="flex flex-wrap gap-3 text-sm">
-                <span className="text-emerald-600 dark:text-emerald-400">
-                  {summary.data.services.healthy} healthy
-                </span>
-                <span className="text-amber-600 dark:text-amber-400">
-                  {summary.data.services.degraded} degraded
-                </span>
-                <span className="text-destructive">
-                  {summary.data.services.unhealthy} unhealthy
-                </span>
-                <Link href="/services" className="ml-auto text-primary hover:underline">
+              description="What this page could reach just now."
+              action={
+                <Link href="/services" className="text-sm text-primary hover:underline">
                   View services
                 </Link>
-              </div>
+              }
+            >
+              {summary.data.services.items?.length ? (
+                <ul className="space-y-1.5">
+                  {summary.data.services.items.map((svc) => (
+                    <li key={svc.name} className="flex items-center gap-2 text-sm">
+                      <span className={cn("size-2 shrink-0 rounded-full", STATUS_DOT[svc.status])} aria-hidden />
+                      <span className="font-medium">{svc.name}</span>
+                      <span className="ml-auto text-xs text-muted-foreground">{STATUS_LABEL[svc.status]}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="text-sm text-muted-foreground">
+                  {summary.data.services.healthy} healthy · {summary.data.services.degraded} degraded ·{" "}
+                  {summary.data.services.unhealthy} unhealthy
+                </p>
+              )}
             </SectionCard>
+
             <SectionCard
-              title="Recent incidents"
+              title="Open incidents"
               action={
                 <Link href="/alerts" className="text-sm text-primary hover:underline">
                   View alerts
@@ -151,15 +208,15 @@ export function OverviewPage() {
                     <li key={inc.id}>
                       <Link
                         href="/alerts"
-                        className="-mx-2 flex items-start gap-2 rounded-md px-2 py-1.5 text-sm transition-colors hover:bg-muted/40"
+                        className="-mx-2 flex items-center gap-3 rounded-md px-2 py-1.5 text-sm transition-colors hover:bg-muted/40"
                       >
-                        <SeverityBadge severity={inc.severity} />
-                        <span className="min-w-0">
-                          <span className="block font-medium">{inc.title}</span>
-                          <span className="block text-xs text-muted-foreground">
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate font-medium">{inc.title}</span>
+                          <span className="block truncate text-xs text-muted-foreground">
                             {inc.source} · {formatRelativeTime(inc.at)}
                           </span>
                         </span>
+                        <SeverityBadge severity={inc.severity} />
                       </Link>
                     </li>
                   ))}
@@ -172,6 +229,7 @@ export function OverviewPage() {
 
       <SectionCard
         title="Recent activity"
+        description="Every console and Copilot action, from the audit trail."
         action={
           <Link href="/activity" className="text-sm text-primary hover:underline">
             View all
@@ -192,7 +250,10 @@ export function OverviewPage() {
                   key={item.id}
                   className="flex flex-wrap items-baseline gap-x-2 gap-y-1 py-2.5 text-sm"
                 >
-                  <span className="text-xs text-muted-foreground tabular-nums">
+                  <span
+                    className="text-xs tabular-nums text-muted-foreground"
+                    title={formatDateTime(item.at)}
+                  >
                     {formatRelativeTime(item.at)}
                   </span>
                   <span className="font-medium">{item.actor}</span>
