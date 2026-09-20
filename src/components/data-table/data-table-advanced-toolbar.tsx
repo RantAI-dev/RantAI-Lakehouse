@@ -40,6 +40,8 @@ interface DataTableAdvancedToolbarProps<
   propertyBarOpenKeys?: string[];
   /** Controls rendered on the right of row 1, after Settings. */
   trailing?: React.ReactNode;
+  /** Names the CSV download under Settings; omit to leave the table unexportable. */
+  exportName?: string;
 }
 
 export function DataTableAdvancedToolbar<TData>({
@@ -55,6 +57,7 @@ export function DataTableAdvancedToolbar<TData>({
   filterMenuExtras,
   propertyBarOpenKeys,
   trailing,
+  exportName,
   children,
   className,
   ...props
@@ -126,6 +129,7 @@ export function DataTableAdvancedToolbar<TData>({
                 onRefresh={onRefresh}
                 isRefreshing={isRefreshing}
                 columnControls={columnControls}
+                exportName={exportName}
               />
               {trailing}
             </div>

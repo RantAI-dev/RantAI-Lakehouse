@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronUp,
   Columns3,
+  Download,
   GripVertical,
   Layers2,
   RefreshCw,
@@ -40,6 +41,8 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { downloadCsv } from "@/lib/csv";
+import { csvFileName, tableCsv } from "@/lib/table-csv";
 
 interface DataTableSettingsMenuProps<TData> {
   table: Table<TData>;
@@ -53,6 +56,12 @@ interface DataTableSettingsMenuProps<TData> {
    */
   columnControls?: boolean;
   disabled?: boolean;
+  /**
+   * Name of what the table holds, used for the CSV file name ("Data
+   * Explorer" → `data-explorer-2026-09-20.csv`). Without it there is
+   * nothing sensible to call the file, so the export item stays hidden.
+   */
+  exportName?: string;
 }
 
 export function DataTableSettingsMenu<TData>({
@@ -61,6 +70,7 @@ export function DataTableSettingsMenu<TData>({
   isRefreshing,
   columnControls = true,
   disabled,
+  exportName,
 }: DataTableSettingsMenuProps<TData>) {
   const resetLayout = table.options.meta?.resetLayout;
   const groupBy = table.options.meta?.groupBy ?? null;
@@ -104,6 +114,29 @@ export function DataTableSettingsMenu<TData>({
       table
         .getAllLeafColumns()
         .map((column) => (movable.has(column.id) ? ids[cursor++] : column.id))
+    );
+  }
+
+  // What a download would contain: the rows the table holds right now —
+  // filtered and sorted as on screen, and on an infinite table only as far
+  // as the user has scrolled. The count is shown next to the menu item so
+  // that scope is visible before clicking, not a surprise in the file.
+  const exportableRows = table.getRowModel().rows;
+
+  function exportCsv() {
+    const columns = table
+      .getVisibleLeafColumns()
+      .filter((column) => column.accessorFn != null)
+      .map((column) => ({
+        id: column.id,
+        label: column.columnDef.meta?.label ?? column.id,
+      }));
+    const rows = exportableRows.map((row) =>
+      Object.fromEntries(columns.map((c) => [c.id, row.getValue(c.id)]))
+    );
+    downloadCsv(
+      csvFileName(exportName ?? "table"),
+      tableCsv(columns, rows)
     );
   }
 
@@ -318,6 +351,19 @@ export function DataTableSettingsMenu<TData>({
               </DropdownMenuSubContent>
             </DropdownMenuPortal>
           </DropdownMenuSub>
+        )}
+
+        {exportName && columnControls && (
+          <DropdownMenuItem
+            onSelect={exportCsv}
+            disabled={exportableRows.length === 0}
+          >
+            <Download className="text-muted-foreground" />
+            Export CSV
+            <span className="text-muted-foreground ml-auto text-xs tabular-nums">
+              {exportableRows.length}
+            </span>
+          </DropdownMenuItem>
         )}
 
         {onRefresh && (
