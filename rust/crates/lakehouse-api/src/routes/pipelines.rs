@@ -142,26 +142,25 @@ async fn detail_body(state: &AppState, id: &str) -> Result<Option<Value>, ApiErr
     // An authored pipeline is answered from Postgres alone: it has no job
     // in the orchestrator, so asking for its runs would only produce a
     // failure to explain away.
-    if let Some(pg) = state.pg.as_deref() {
-        if let Some(p) = pipelines::get_pipeline(pg, id)
+    if let Some(pg) = state.pg.as_deref()
+        && let Some(p) = pipelines::get_pipeline(pg, id)
             .await
             .map_err(|err| ApiError::Internal(err.to_string()))?
-        {
-            let mut value =
-                serde_json::to_value(&p).map_err(|err| ApiError::Internal(err.to_string()))?;
-            let object = value
-                .as_object_mut()
-                .ok_or_else(|| ApiError::Internal("pipeline is not an object".to_owned()))?;
-            object.insert("origin".to_owned(), json!(ORIGIN_AUTHORED));
-            object.insert("graph".to_owned(), authored_graph(&p));
-            object.insert("configSummary".to_owned(), authored_config(&p));
-            object.insert("runs".to_owned(), json!([]));
-            object.insert(
+    {
+        let mut value =
+            serde_json::to_value(&p).map_err(|err| ApiError::Internal(err.to_string()))?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| ApiError::Internal("pipeline is not an object".to_owned()))?;
+        object.insert("origin".to_owned(), json!(ORIGIN_AUTHORED));
+        object.insert("graph".to_owned(), authored_graph(&p));
+        object.insert("configSummary".to_owned(), authored_config(&p));
+        object.insert("runs".to_owned(), json!([]));
+        object.insert(
                 "runsUnavailable".to_owned(),
                 json!("This pipeline is authored in the console and has no orchestrator job yet, so it has never run."),
             );
-            return Ok(Some(value));
-        }
+        return Ok(Some(value));
     }
 
     // Otherwise it should be an orchestrator job. Its identity comes from

@@ -820,10 +820,7 @@ pub async fn create_saved(
         .into());
     }
     let owner_id = caller_id(principal.as_ref())?;
-    let owner = principal.map_or_else(
-        || "anonymous".to_owned(),
-        |Extension(p)| p.display_name.clone(),
-    );
+    let owner = principal.map_or_else(|| "anonymous".to_owned(), |Extension(p)| p.display_name);
     let saved = queries::create_saved_query(
         pool(&state)?,
         &title,
