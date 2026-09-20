@@ -5,15 +5,12 @@ import { PlusIcon } from "lucide-react"
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
+import { DataTableSkeleton } from "@/components/data-table/data-table-skeleton"
 import { CreateSheet } from "@/components/patterns/create-sheet"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { PageHeader } from "@/components/patterns/page-header"
-import {
-  EmptyState,
-  ErrorState,
-  LoadingSkeleton,
-} from "@/components/patterns/page-states"
+import { EmptyState, ErrorState } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -42,6 +39,13 @@ function CollaborationDrawerContent({
           { label: "Updated", value: formatRelativeTime(project.updatedAt) },
         ]}
       />
+      {/* Honest about the shape of the data: `members` is a count set once
+          at creation, and nothing links queries to a project yet. Saying
+          so beats a drawer that looks like it lost its content. */}
+      <p className="text-xs text-muted-foreground">
+        Member names and project queries are not stored yet — a project is
+        currently a shared label, not a workspace.
+      </p>
     </>
   )
 }
@@ -134,7 +138,7 @@ export function CollaborationPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Collaboration"
-        description="Shared query projects, members, and activity."
+        description="Shared query projects. A project records its name, member count and description today — queries are not attached to one yet."
         actions={
           <Button size="sm" onClick={() => setCreateOpen(true)}>
             <PlusIcon data-icon="inline-start" />
@@ -143,7 +147,9 @@ export function CollaborationPage() {
         }
       />
       <QueryStudioTabs />
-      {state.status === "loading" ? <LoadingSkeleton /> : null}
+      {state.status === "loading" ? (
+        <DataTableSkeleton columnCount={5} rowCount={6} filterCount={1} />
+      ) : null}
       {state.status === "error" ? (
         <ErrorState error={state.error} onRetry={state.reload} />
       ) : null}
@@ -160,7 +166,11 @@ export function CollaborationPage() {
       ) : null}
       {state.status === "success" && (state.data?.length ?? 0) > 0 ? (
         <div className="space-y-4">
-          <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
+          <DataTableAdvancedToolbar
+            table={table}
+            onRefresh={state.reload}
+            exportName="Collaboration projects"
+          >
             <DataTableSearch placeholder="Search projects..." />
           </DataTableAdvancedToolbar>
           <div className="rounded-md border">

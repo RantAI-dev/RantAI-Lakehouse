@@ -5,11 +5,12 @@ import Link from "next/link"
 import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
+import { DataTableSkeleton } from "@/components/data-table/data-table-skeleton"
 import { CodeBlock } from "@/components/patterns/code-block"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { PageHeader } from "@/components/patterns/page-header"
-import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { EmptyState, ErrorState } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import { useDataTable } from "@/hooks/use-data-table"
 import { filterDataClientSide } from "@/lib/data-table"
@@ -91,16 +92,38 @@ export function SavedQueriesPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Saved Queries"
-        description="Reusable SQL assets with owners and tags."
+        description="Reusable SQL shared with the team, with owners and tags."
+        actions={
+          <Button size="sm" render={<Link href="/query-studio" />}>
+            New query
+          </Button>
+        }
       />
       <QueryStudioTabs />
-      {state.status === "loading" ? <LoadingSkeleton /> : null}
+      {state.status === "loading" ? (
+        <DataTableSkeleton columnCount={5} rowCount={6} filterCount={1} />
+      ) : null}
       {state.status === "error" ? (
         <ErrorState error={state.error} onRetry={state.reload} />
       ) : null}
-      {state.status === "success" ? (
+      {state.status === "success" && rawData.length === 0 ? (
+        <EmptyState
+          title="No saved queries"
+          description="Write a query in the Studio and save it to reuse it here."
+          action={
+            <Button size="sm" render={<Link href="/query-studio" />}>
+              Open Studio
+            </Button>
+          }
+        />
+      ) : null}
+      {state.status === "success" && rawData.length > 0 ? (
         <div className="space-y-4">
-          <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
+          <DataTableAdvancedToolbar
+            table={table}
+            onRefresh={state.reload}
+            exportName="Saved queries"
+          >
             <DataTableSearch placeholder="Search title, owner..." />
           </DataTableAdvancedToolbar>
           <div className="rounded-md border">

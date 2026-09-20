@@ -11,18 +11,23 @@ import { Pill } from "@/components/patterns/status-badge"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Button } from "@/components/ui/button"
 import { useDataTable } from "@/hooks/use-data-table"
-import { downloadCsv, toCsv } from "@/lib/csv"
-import { formatBytes, formatCost, formatDuration } from "@/lib/format"
+import { downloadCsv } from "@/lib/csv"
+import { csvFileName, tableCsv } from "@/lib/table-csv"
+import { formatBytes, formatCost, formatDuration, formatNumber } from "@/lib/format"
 import { ENGINE_CATEGORY_LABEL, WORKLOAD_CLASS_LABEL } from "@/lib/status"
-import type { QueryResult } from "@/services/contracts/queries"
+import type { QueryCell, QueryResult } from "@/services/contracts/queries"
 import { QueryPlanPanel } from "./query-transparency-panel"
 
 interface PillListProps {
-  readonly values: readonly string[]
+  readonly values: readonly string[] | null
 }
 
 function PillList(props: PillListProps) {
   const { values } = props
+  // `null` and `[]` are different answers: nothing looked, versus looked
+  // and found nothing.
+  if (values === null)
+    return <span className="text-muted-foreground">Not evaluated</span>
   if (values.length === 0) return <span className="text-muted-foreground">None</span>
   return (
     <span className="flex flex-wrap gap-1">
@@ -35,25 +40,52 @@ function PillList(props: PillListProps) {
   )
 }
 
+/** How a cell reads. Numbers keep their type so they sort and align as numbers. */
+function renderCell(value: QueryCell): React.ReactNode {
+  if (value === null) return <span className="text-muted-foreground">NULL</span>
+  if (typeof value === "number") return formatNumber(value)
+  if (typeof value === "boolean") return String(value)
+  return value
+}
+
 function buildQueryResultColumns(
-  columnNames: readonly string[]
-): ColumnDef<Record<string, string>>[] {
-  return columnNames.map((colName) => ({
-    id: colName,
-    accessorFn: (row) => row[colName] ?? "",
-    header: ({ column }) => (
-      <DataTableColumnHeader column={column} label={colName} />
-    ),
-    cell: ({ getValue }) => {
-      const val = getValue()
-      return (
-        <span className="font-mono text-xs">
-          {typeof val === "string" ? val : JSON.stringify(val ?? "")}
+  columnNames: readonly string[],
+  rows: readonly Record<string, QueryCell>[]
+): ColumnDef<Record<string, QueryCell>>[] {
+  return columnNames.map((colName) => {
+    // Decided from the data, not from a guess about the column name: the
+    // server sends whatever type ClickHouse reported, so a numeric column
+    // is one whose values arrive as numbers. Numeric columns sort
+    // numerically and sit right-aligned, the way they do everywhere else
+    // in the console — before this every value was a string, so "10" came
+    // before "9".
+    const numeric = rows.some((row) => typeof row[colName] === "number")
+    return {
+      id: colName,
+      accessorFn: (row) => row[colName] ?? null,
+      header: ({ column }) => (
+        <DataTableColumnHeader
+          column={column}
+          label={colName}
+          align={numeric ? "right" : undefined}
+        />
+      ),
+      cell: ({ getValue }) => (
+        <span
+          className={
+            numeric
+              ? "block text-right font-mono text-xs tabular-nums"
+              : "font-mono text-xs"
+          }
+        >
+          {renderCell(getValue() as QueryCell)}
         </span>
-      )
-    },
-    enableSorting: true,
-  }))
+      ),
+      enableSorting: true,
+      sortingFn: numeric ? "basic" : "alphanumeric",
+      meta: { label: colName },
+    }
+  })
 }
 
 interface QueryResultsSectionProps {
@@ -64,8 +96,8 @@ interface QueryResultsSectionProps {
 export function QueryResultsSection(props: QueryResultsSectionProps) {
   const { result } = props
   const columns = React.useMemo(
-    () => buildQueryResultColumns(result.columns),
-    [result.columns]
+    () => buildQueryResultColumns(result.columns, result.rows),
+    [result.columns, result.rows]
   )
 
   const { table } = useDataTable({
@@ -87,8 +119,11 @@ export function QueryResultsSection(props: QueryResultsSectionProps) {
             disabled={result.rows.length === 0}
             onClick={() =>
               downloadCsv(
-                `query-results-${new Date().toISOString().slice(0, 10)}.csv`,
-                toCsv(result.columns, result.rows)
+                csvFileName("query results"),
+                tableCsv(
+                  result.columns.map((c) => ({ id: c, label: c })),
+                  result.rows
+                )
               )
             }
           >
@@ -107,6 +142,15 @@ export function QueryResultsSection(props: QueryResultsSectionProps) {
         </div>
       }
     >
+      {result.truncated ? (
+        // Said plainly: a partial answer read as a whole one is worse than
+        // no answer.
+        <p className="rounded-md bg-amber-500/5 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+          Showing the first {formatNumber(result.rowLimit)} of{" "}
+          {formatNumber(result.rowCount)} rows. Add a LIMIT or an aggregate
+          to see the whole result.
+        </p>
+      ) : null}
       {result.rows.length === 0 ? (
         <p className="py-4 text-center text-sm text-muted-foreground">
           The query returned no rows.
@@ -128,12 +172,22 @@ export function QueryResultsSection(props: QueryResultsSectionProps) {
       <MetadataList
         columns={3}
         items={[
+          { label: "Rows", value: formatNumber(result.rowCount) },
           { label: "Duration", value: formatDuration(result.metrics.durationMs) },
           { label: "Scanned", value: formatBytes(result.metrics.scannedBytes) },
           { label: "Cost", value: formatCost(result.metrics.costUnits) },
           { label: "Engine", value: ENGINE_CATEGORY_LABEL[result.metrics.engine] },
           { label: "Workload", value: WORKLOAD_CLASS_LABEL[result.metrics.workloadClass] },
-          { label: "Cache", value: result.metrics.cacheHit ? "Hit" : "Miss" },
+          {
+            label: "Cache",
+            // Nothing reads ClickHouse's query cache, so "Miss" would be
+            // a claim rather than a measurement.
+            value: result.metrics.cacheHit == null
+              ? "—"
+              : result.metrics.cacheHit
+                ? "Hit"
+                : "Miss",
+          },
           { label: "Pushdowns", value: <PillList values={result.metrics.pushdowns} /> },
           {
             label: "Policy obligations",
