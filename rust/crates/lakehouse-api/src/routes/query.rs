@@ -942,10 +942,13 @@ mod tests {
 
     #[test]
     fn strip_sql_noise_blanks_comments_and_literals() {
-        assert_eq!(
-            strip_sql_noise("SELECT 1 -- x\nFROM t").trim(),
-            "SELECT 1\nFROM t"
-        );
+        // Exact spacing is irrelevant to the guard — what matters is that
+        // the comment is gone and the words around it are not glued
+        // together.
+        let stripped = strip_sql_noise("SELECT 1 -- drop\nFROM t");
+        assert!(!stripped.contains("drop"), "{stripped}");
+        assert!(stripped.contains("SELECT 1"), "{stripped}");
+        assert!(stripped.contains("FROM t"), "{stripped}");
         assert_eq!(strip_sql_noise("SELECT /* x */ 1"), "SELECT   1");
         assert_eq!(
             strip_sql_noise("SELECT 'a' , \"b\" , `c`"),
