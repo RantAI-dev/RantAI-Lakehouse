@@ -24,6 +24,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
+import { namespaceAssetsHref } from "@/lib/table-filter-link"
 import type { CatalogNamespace } from "@/services/contracts/assets"
 
 export function getCatalogNamespaceColumns({
@@ -182,7 +183,7 @@ export function getCatalogNamespaceColumns({
                 </DropdownMenuItem>
                 <DropdownMenuItem asChild>
                   <Link
-                    href={`/data?q=${encodeURIComponent(item.name)}`}
+                    href={namespaceAssetsHref(item.name)}
                     onClick={(e) => e.stopPropagation()}
                   >
                     <Search className="size-4" />

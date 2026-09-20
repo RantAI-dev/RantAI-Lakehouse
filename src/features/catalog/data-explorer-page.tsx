@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import { useCallback, useEffect, useMemo } from "react"
+import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
 
 import { PageHeader } from "@/components/patterns/page-header"
@@ -14,6 +15,7 @@ import {
   ContextMenuSeparator,
 } from "@/components/ui/context-menu"
 import { ErrorState } from "@/components/patterns/page-states"
+import { Button } from "@/components/ui/button"
 import { useDataTable } from "@/hooks/use-data-table"
 import { useInfiniteTableQuery } from "@/hooks/use-infinite-table-query"
 import {
@@ -24,6 +26,14 @@ import { useWindowWidth } from "@/hooks/use-window-width"
 import { assetService } from "@/services"
 import type { Asset } from "@/services/contracts/assets"
 import { toServiceError } from "@/services/errors"
+import {
+  activeFilterValues,
+  filterParam,
+  removeFilter,
+  toggleFilterValue,
+} from "@/lib/table-filter-link"
+import { DATA_LAYER_LABEL, type DataLayer } from "@/lib/status"
+import { cn } from "@/lib/utils"
 import { getAssetActions } from "./data-explorer-actions"
 import { getDataExplorerColumns } from "./data-explorer-columns"
 
@@ -44,12 +54,8 @@ function legacyParamsToTableState(
           {
             id,
             value: [value],
-            variant: "multiSelect",
-            operator: "inArray",
-            // Required by the filter schema: without it the toolbar drops
-            // the filter it cannot parse, and the chips never appear even
-            // though the rows are filtered.
-            filterId: crypto.randomUUID().slice(0, 8),
+            variant: "multiSelect" as const,
+            operator: "inArray" as const,
           },
         ]
       : []
@@ -61,8 +67,25 @@ function legacyParamsToTableState(
     next.delete(key)
   }
   if (search) next.set("search", search)
-  if (facets.length > 0) next.set("filters", JSON.stringify(facets))
+  // `filterParam`, not raw JSON: it fills in the `filterId` the filter
+  // schema requires, without which the chips never appear.
+  if (facets.length > 0) next.set("filters", filterParam(facets))
   return next
+}
+
+/**
+ * The layers worth a one-click filter. `semantic` is left out on purpose:
+ * it is rare, and every layer remains available through the toolbar's own
+ * Layer filter — these are shortcuts, not the whole set.
+ */
+const QUICK_LAYERS: DataLayer[] = ["raw", "bronze", "silver", "gold"]
+
+/** Column labels, for telling the user which ones the window is too narrow for. */
+const WIDTH_HIDDEN_LABEL: Record<string, string> = {
+  sizeBytes: "Size",
+  freshnessLagSeconds: "Freshness",
+  type: "Type",
+  layer: "Layer",
 }
 
 /** Data Explorer — browse governed assets by layer, tier, type, and freshness. */
@@ -153,6 +176,26 @@ export function DataExplorerPage() {
     if (width < 860) hidden.push("layer")
     return hidden
   }, [width])
+
+  const hiddenLabels = hiddenByWidth.map((id) => WIDTH_HIDDEN_LABEL[id] ?? id)
+
+  // The quick filters own the `layer` filter and nothing else: they rewrite
+  // just that entry and carry the rest of the URL — search, sort, other
+  // filters, column layout — through untouched.
+  const activeLayers = useMemo(
+    () => activeFilterValues(tableUrlState.filters, "layer"),
+    [tableUrlState.filters]
+  )
+  const layerHref = useCallback(
+    (filters: string) => {
+      const next = new URLSearchParams(searchParams.toString())
+      if (filters) next.set("filters", filters)
+      else next.delete("filters")
+      const query = next.toString()
+      return query ? `/data?${query}` : "/data"
+    },
+    [searchParams]
+  )
 
   // Memoised: a new array each render would make TanStack Table rebuild
   // its column model, losing in-flight state like a column being dragged.
@@ -245,9 +288,61 @@ export function DataExplorerPage() {
             </>
           )}
         >
-          <DataTableAdvancedToolbar table={table}>
+          <DataTableAdvancedToolbar
+            table={table}
+            onRefresh={() => void refetch()}
+            exportName="Data Explorer"
+          >
             <DataTableSearch placeholder="Search assets by name, namespace, or owner…" />
           </DataTableAdvancedToolbar>
+          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+            <div className="flex flex-wrap items-center gap-1">
+              <span className="mr-1 text-xs text-muted-foreground">Layer</span>
+              <Button
+                size="sm"
+                variant={activeLayers.length === 0 ? "secondary" : "ghost"}
+                render={
+                  <Link
+                    href={layerHref(removeFilter(tableUrlState.filters, "layer"))}
+                  />
+                }
+              >
+                All
+              </Button>
+              {QUICK_LAYERS.map((layer) => {
+                const active = activeLayers.includes(layer)
+                return (
+                  <Button
+                    key={layer}
+                    size="sm"
+                    variant={active ? "secondary" : "ghost"}
+                    aria-pressed={active}
+                    className={cn(active && "font-semibold")}
+                    render={
+                      <Link
+                        href={layerHref(
+                          toggleFilterValue(tableUrlState.filters, "layer", layer)
+                        )}
+                      />
+                    }
+                  >
+                    {DATA_LAYER_LABEL[layer]}
+                  </Button>
+                )
+              })}
+            </div>
+            {hiddenLabels.length > 0 ? (
+              // Said out loud rather than left as a mystery: columns vanish
+              // as the window narrows, and without this the table simply
+              // looks like it lost data.
+              <p className="text-xs text-muted-foreground">
+                {hiddenLabels.join(", ")}{" "}
+                {hiddenLabels.length === 1 ? "is" : "are"} hidden at this
+                window width — widen the window, or open an asset to see
+                everything.
+              </p>
+            ) : null}
+          </div>
         </DataTable>
       )}
     </div>

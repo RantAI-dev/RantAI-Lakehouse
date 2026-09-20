@@ -15,10 +15,34 @@ import {
 } from "@/components/ui/table"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { formatCompactNumber, formatRelativeTime } from "@/lib/format"
+import { cn } from "@/lib/utils"
 import type { AssetDetail } from "@/services/contracts/assets"
 
 function QuietEmpty({ title }: { title: string }) {
   return <EmptyState title={title} className="py-4" />
+}
+
+/**
+ * A tab label carrying how much is behind it.
+ *
+ * Nine tabs with nothing to distinguish them means opening each one to find
+ * out which are empty; the count says so before the click, and a zero is
+ * dimmed so the eye skips it.
+ */
+function TabLabel({ label, count }: { label: string; count: number }) {
+  return (
+    <span className="flex items-center gap-1.5">
+      {label}
+      <span
+        className={cn(
+          "text-[11px] tabular-nums",
+          count === 0 ? "text-muted-foreground/50" : "text-muted-foreground"
+        )}
+      >
+        {count}
+      </span>
+    </span>
+  )
 }
 
 function dependentHref(id: string, kind: string) {
@@ -37,14 +61,37 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
   return (
     <Tabs defaultValue="schema" className="gap-1.5">
       <TabsList>
-        <TabsTrigger value="schema">Schema</TabsTrigger>
-        <TabsTrigger value="sample">Sample</TabsTrigger>
-        <TabsTrigger value="quality">Quality</TabsTrigger>
-        <TabsTrigger value="policies">Policies</TabsTrigger>
-        <TabsTrigger value="lineage">Lineage</TabsTrigger>
-        <TabsTrigger value="dependents">Dependents</TabsTrigger>
-        <TabsTrigger value="history">History</TabsTrigger>
-        <TabsTrigger value="snapshots">Snapshots</TabsTrigger>
+        <TabsTrigger value="schema">
+          <TabLabel label="Schema" count={a.schema.length} />
+        </TabsTrigger>
+        <TabsTrigger value="sample">
+          <TabLabel label="Sample" count={a.sample.length} />
+        </TabsTrigger>
+        <TabsTrigger value="quality">
+          <TabLabel label="Quality" count={a.qualityChecks.length} />
+        </TabsTrigger>
+        <TabsTrigger value="policies">
+          <TabLabel label="Policies" count={a.policySummary.length} />
+        </TabsTrigger>
+        <TabsTrigger value="lineage">
+          {/* Both directions in one number: the tab shows upstream and
+              downstream together. */}
+          <TabLabel
+            label="Lineage"
+            count={a.upstream.length + a.downstream.length}
+          />
+        </TabsTrigger>
+        <TabsTrigger value="dependents">
+          <TabLabel label="Dependents" count={a.dependents.length} />
+        </TabsTrigger>
+        <TabsTrigger value="history">
+          <TabLabel label="History" count={a.changeHistory.length} />
+        </TabsTrigger>
+        <TabsTrigger value="snapshots">
+          <TabLabel label="Snapshots" count={a.snapshots.length} />
+        </TabsTrigger>
+        {/* Usage has no list to count — it is one summary line plus recent
+            queries, which are shown inside. */}
         <TabsTrigger value="usage">Usage</TabsTrigger>
       </TabsList>
 
