@@ -38,9 +38,11 @@ export type Asset = {
   format: string
   engine: EngineCategory
   rows: number
-  sizeBytes: number
+  /** Null when the size is not measurable from the console (Iceberg data). */
+  sizeBytes: number | null
   columnCount: number
-  freshnessLagSeconds: number
+  /** Seconds since the asset was last written; null when unknown. */
+  freshnessLagSeconds: number | null
   lastUpdated: string
   health: Health
   residency: string

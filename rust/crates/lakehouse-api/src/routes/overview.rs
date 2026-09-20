@@ -126,9 +126,24 @@ async fn incidents(state: &AppState) -> Vec<Value> {
 
 async fn get_body(state: &AppState) -> Result<Value, OverviewError> {
     let ch = &state.clickhouse;
-    let assets_row = ch
+    // Same set of assets the catalog lists (Bronze datasets, Silver tables
+    // that are not just a Bronze table's landing spot, and Gold marts), so
+    // this card and Data Explorer answer with the same number.
+    let total_row = ch
         .rows(
-            "SELECT toString(count()) n, toString(countIf(coalesce(s.total,0)=0)) stale FROM (
+            "SELECT toString(
+         (SELECT count() FROM (SELECT slug FROM lake.`bronze_meta.dataset_catalog`
+            UNION ALL SELECT slug FROM lake.`bronze_meta_sec.dataset_catalog`))
+       + (SELECT count() FROM system.tables WHERE database='silver' AND name NOT IN (
+            SELECT table_name FROM lake.`bronze_meta.dataset_catalog`
+            UNION ALL SELECT table_name FROM lake.`bronze_meta_sec.dataset_catalog`))
+       + (SELECT count() FROM system.tables WHERE database='serving' AND name NOT LIKE '%\\_baru')) n",
+            None,
+        )
+        .await?;
+    let stale_row = ch
+        .rows(
+            "SELECT toString(countIf(coalesce(s.total,0)=0)) stale FROM (
          SELECT slug FROM lake.`bronze_meta.dataset_catalog`
          UNION ALL SELECT slug FROM lake.`bronze_meta_sec.dataset_catalog`) c
        LEFT JOIN (SELECT slug,total FROM lake.`bronze_meta.dataset_sync`
@@ -163,20 +178,24 @@ async fn get_body(state: &AppState) -> Result<Value, OverviewError> {
         None => overview::OverviewCounts::default(),
     };
 
-    let assets_row = assets_row.first();
+    let total_row = total_row.first();
+    let stale_row = stale_row.first();
     let hot_row = hot_row.first();
     let warm_row = warm_row.first();
     let q_row = q_row.first();
-    let warm_rows = num_or_zero(warm_row, "rows");
 
     Ok(json!({
-        "assetsTotal": num_or_zero(assets_row, "n"),
-        "staleAssets": num_or_zero(assets_row, "stale"),
+        "assetsTotal": num_or_zero(total_row, "n"),
+        // Bronze datasets only: a watermark is the thing that can go stale.
+        "staleAssets": num_or_zero(stale_row, "stale"),
+        // Only Hot is measurable from here: it is ClickHouse's own parts.
+        // Warm lives in Iceberg and Cold/AI are not tracked yet, so they
+        // report an unknown size instead of an invented one.
         "assetsByTier": {
             "hot": { "count": num_or_zero(hot_row, "assets"), "bytes": num_or_zero(hot_row, "bytes") },
-            "warm": { "count": num_or_zero(warm_row, "assets"), "bytes": warm_rows * 220 },
-            "cold": { "count": 0, "bytes": 0 },
-            "ai": { "count": 0, "bytes": 0 },
+            "warm": { "count": num_or_zero(warm_row, "assets"), "bytes": Value::Null },
+            "cold": { "count": 0, "bytes": Value::Null },
+            "ai": { "count": 0, "bytes": Value::Null },
         },
         "pipelines": pipelines,
         "streaming": { "jobs": 0, "maxLagSeconds": 0, "unhealthy": 0 },

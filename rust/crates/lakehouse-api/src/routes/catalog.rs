@@ -179,9 +179,13 @@ pub async fn list(State(state): State<AppState>) -> Response {
 async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
     let cat = ch
         .rows(
-            "SELECT slug, title, description, tier, updated_at, table_name FROM lake.`bronze_meta.dataset_catalog`
+            "SELECT slug, title, description, tier, updated_at, table_name,
+              toString(dateDiff('second', parseDateTimeBestEffortOrNull(updated_at), now())) lag
+       FROM lake.`bronze_meta.dataset_catalog`
        UNION ALL
-       SELECT slug, title, description, tier, updated_at, table_name FROM lake.`bronze_meta_sec.dataset_catalog`",
+       SELECT slug, title, description, tier, updated_at, table_name,
+              toString(dateDiff('second', parseDateTimeBestEffortOrNull(updated_at), now())) lag
+       FROM lake.`bronze_meta_sec.dataset_catalog`",
             None,
         )
         .await?;
@@ -243,9 +247,11 @@ async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
                 "format": "Apache Iceberg (Parquet)",
                 "engine": "hot-store",
                 "rows": rows,
-                "sizeBytes": rows * 220,
+                // Iceberg data, not ClickHouse parts: the console cannot see
+                // its size from here, and a guess reads like a measurement.
+                "sizeBytes": Value::Null,
                 "columnCount": col_of(slug),
-                "freshnessLagSeconds": 0,
+                "freshnessLagSeconds": str_col(c, "lag").parse::<i64>().ok(),
                 "lastUpdated": updated_at,
                 "health": if rows > 0 { "healthy" } else { "degraded" },
                 "residency": TENANT_RESIDENCY.as_str(),
@@ -268,8 +274,10 @@ async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
             None,
         ),
         ch.rows(
-            "SELECT table, toString(sum(rows)) r FROM system.parts
-         WHERE database='serving' AND active GROUP BY table",
+            "SELECT database db, table, toString(sum(rows)) r, toString(sum(bytes_on_disk)) b,
+              toString(dateDiff('second', max(modification_time), now())) lag
+         FROM system.parts WHERE database IN ('silver','serving') AND active
+         GROUP BY database, table",
             None,
         ),
     )?;
@@ -280,12 +288,15 @@ async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
             .find(|c| str_col(c, "db") == db && str_col(c, "table") == table)
             .map_or(0, |c| num_or_zero(Some(c), "n"))
     };
-    let gold_rows_of = |table: &str| -> i64 {
+    // Real size and last-write time, straight from the parts the table is
+    // made of. Before this, size was `rows * 220` and freshness was always
+    // 0 — a guess and a fiction, shown with two decimals of confidence.
+    let part_of = |db: &str, table: &str| {
         part_rows
             .iter()
-            .find(|p| str_col(p, "table") == table)
-            .map_or(0, |p| num_or_zero(Some(p), "r"))
+            .find(|p| str_col(p, "db") == db && str_col(p, "table") == table)
     };
+    let gold_rows_of = |table: &str| -> i64 { part_of("serving", table).map_or(0, |p| num_or_zero(Some(p), "r")) };
 
     for t in &tbl_rows {
         let db = str_col(t, "db");
@@ -308,10 +319,10 @@ async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
                 "description": "Model Silver terkurasi (bersih & terkonform) di ClickHouse.",
                 "format": if engine == "View" { "ClickHouse View".to_owned() } else { format!("ClickHouse {engine}") },
                 "engine": "hot-store",
-                "rows": 0,
-                "sizeBytes": 0,
+                "rows": part_of("silver", name).map_or(0, |p| num_or_zero(Some(p), "r")),
+                "sizeBytes": part_of("silver", name).map(|p| num_or_zero(Some(p), "b")),
                 "columnCount": col_count_of("silver", name),
-                "freshnessLagSeconds": 0,
+                "freshnessLagSeconds": part_of("silver", name).map(|p| num_or_zero(Some(p), "lag")),
                 "lastUpdated": "",
                 "health": "healthy",
                 "residency": TENANT_RESIDENCY.as_str(),
@@ -321,6 +332,7 @@ async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
                 continue;
             }
             let rows = gold_rows_of(name);
+            let part = part_of("serving", name);
             assets.push(json!({
                 "id": format!("serving.{name}"),
                 "name": prettify(name),
@@ -335,9 +347,9 @@ async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
                 "format": format!("ClickHouse {engine}"),
                 "engine": "hot-store",
                 "rows": rows,
-                "sizeBytes": rows * 220,
+                "sizeBytes": part.map(|p| num_or_zero(Some(p), "b")),
                 "columnCount": col_count_of("serving", name),
-                "freshnessLagSeconds": 0,
+                "freshnessLagSeconds": part.map(|p| num_or_zero(Some(p), "lag")),
                 "lastUpdated": "",
                 "health": if rows > 0 { "healthy" } else { "degraded" },
                 "residency": TENANT_RESIDENCY.as_str(),
@@ -459,12 +471,16 @@ async fn clickhouse_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response>
     // above, so this is safe despite the raw interpolation, matching the
     // TypeScript exactly.
     let rows_sql = format!(
-        "SELECT toString(sum(rows)) r FROM system.parts WHERE database='{db}' AND table='{table}' AND active"
+        "SELECT toString(sum(rows)) r, toString(sum(bytes_on_disk)) b,
+           toString(dateDiff('second', max(modification_time), now())) lag
+         FROM system.parts WHERE database='{db}' AND table='{table}' AND active"
     );
-    let rows = match ch.rows(&rows_sql, None).await {
-        Ok(rr) => num_or_zero(rr.first(), "r"),
-        Err(_) => 0, // "view: tak ada parts" — swallowed in the TypeScript too.
-    };
+    // A view has no parts; the query then answers with nulls, and the size
+    // and freshness stay unknown rather than being invented.
+    let part = ch.rows(&rows_sql, None).await.ok().and_then(|rr| rr.first().cloned());
+    let rows = num_or_zero(part.as_ref(), "r");
+    let size_bytes = part.as_ref().map(|p| num_or_zero(Some(p), "b")).filter(|_| rows > 0);
+    let lag_seconds = part.as_ref().map(|p| num_or_zero(Some(p), "lag")).filter(|_| rows > 0);
 
     let body = json!({
         "id": id,
@@ -484,9 +500,9 @@ async fn clickhouse_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response>
         "format": if is_gold { "ClickHouse MergeTree" } else { "ClickHouse View" },
         "engine": "hot-store",
         "rows": rows,
-        "sizeBytes": rows * 220,
+        "sizeBytes": size_bytes,
         "columnCount": schema.len(),
-        "freshnessLagSeconds": 0,
+        "freshnessLagSeconds": lag_seconds,
         "lastUpdated": "",
         "health": if schema.is_empty() { "degraded" } else { "healthy" },
         "residency": TENANT_RESIDENCY.as_str(),
@@ -532,10 +548,18 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
     let escaped_id = SqlLiteral::from(id);
     let sync_sql = format!(
         "SELECT slug, title, description, tier, table_name, toString(total) total,
-                author, frekuensi, satuan, klasifikasi, updated_at FROM (
-           SELECT slug,title,description,'primer' tier,table_name,total,author,frekuensi,satuan,klasifikasi,'' updated_at FROM lake.`bronze_meta.dataset_sync` s
+                author, frekuensi, satuan, klasifikasi, updated_at,
+                toString(dateDiff('second', parseDateTimeBestEffortOrNull(updated_at), now())) lag FROM (
+           SELECT s.slug slug, s.title title, s.description description, 'primer' tier, s.table_name table_name,
+                  s.total total, s.author author, s.frekuensi frekuensi, s.satuan satuan, s.klasifikasi klasifikasi,
+                  c.updated_at updated_at
+             FROM lake.`bronze_meta.dataset_sync` s
+             LEFT JOIN lake.`bronze_meta.dataset_catalog` c ON c.slug = s.slug
            UNION ALL
-           SELECT slug,title,description,'sekunder' tier,table_name,total,author,frekuensi,satuan,klasifikasi,'' updated_at FROM lake.`bronze_meta_sec.dataset_sync`
+           SELECT s.slug, s.title, s.description, 'sekunder', s.table_name,
+                  s.total, s.author, s.frekuensi, s.satuan, s.klasifikasi, c.updated_at
+             FROM lake.`bronze_meta_sec.dataset_sync` s
+             LEFT JOIN lake.`bronze_meta_sec.dataset_catalog` c ON c.slug = s.slug
          ) WHERE slug = {escaped_id} LIMIT 1"
     );
     let sync_rows = ch.rows(&sync_sql, None).await?;
@@ -631,9 +655,9 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
         "format": "Apache Iceberg (Parquet)",
         "engine": "hot-store",
         "rows": rows,
-        "sizeBytes": rows * 220,
+        "sizeBytes": Value::Null,
         "columnCount": cols.len(),
-        "freshnessLagSeconds": 0,
+        "freshnessLagSeconds": str_col(sync, "lag").parse::<i64>().ok(),
         "lastUpdated": updated_at,
         "health": if rows > 0 { "healthy" } else { "degraded" },
         "residency": TENANT_RESIDENCY.as_str(),

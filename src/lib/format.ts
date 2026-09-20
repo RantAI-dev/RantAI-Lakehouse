@@ -16,9 +16,12 @@ export function formatNumber(value: number): string {
   return Intl.NumberFormat("en").format(value)
 }
 
-/** Bytes → short human string, e.g. 1536 → "1.5 KB", 2.4e12 → "2.4 TB". */
-export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes < 0) return "—"
+/**
+ * Bytes → short human string, e.g. 1536 → "1.5 KB", 2.4e12 → "2.4 TB".
+ * `null` means the size is not measurable from here, and reads as "—".
+ */
+export function formatBytes(bytes: number | null | undefined): string {
+  if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return "—"
   const units = ["B", "KB", "MB", "GB", "TB", "PB"]
   let v = bytes
   let i = 0

@@ -189,15 +189,24 @@ mod tests {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActivityItem {
+    /// Stable row id for the feed; the audit event id, prefixed.
     pub id: String,
+    /// When it happened, RFC 3339.
     pub at: String,
+    /// Who did it, as the console should name them.
     pub actor: String,
+    /// `user`, `agent` or `service` — whichever principal acted.
     pub actor_kind: String,
+    /// What they did, in the console's words ("ran a query").
     pub action: String,
+    /// What they did it to, e.g. a table or a pipeline.
     pub target: String,
+    /// Where the console can show that target, when it has a page for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_href: Option<String>,
+    /// Grouping used for filtering the feed (`query`, `pipeline`, ...).
     pub category: String,
+    /// The audit event this entry was derived from.
     pub audit_event_id: String,
 }
 

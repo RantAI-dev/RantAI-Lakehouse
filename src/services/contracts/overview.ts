@@ -9,7 +9,8 @@ import type {
 export type OverviewSummary = {
   assetsTotal: number
   staleAssets: number
-  assetsByTier: Record<StorageTier, { count: number; bytes: number }>
+  /** `bytes` is null where the size is not measurable (Iceberg, untracked tiers). */
+  assetsByTier: Record<StorageTier, { count: number; bytes: number | null }>
   pipelines: { active: number; failed: number; delayed: number }
   queries: {
     volume24h: number
