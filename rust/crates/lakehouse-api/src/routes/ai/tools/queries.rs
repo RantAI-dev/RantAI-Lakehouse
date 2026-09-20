@@ -53,7 +53,9 @@ pub(super) async fn save_query(state: &AppState, args: &Map<String, Value>) -> V
         Ok(p) => p,
         Err(err) => return err,
     };
-    match queries::create_saved_query(pool, &title, &sql, &owner, &tags).await {
+    // The copilot saves under the name it was given; it has no principal
+    // id of its own to record as the author.
+    match queries::create_saved_query(pool, &title, &sql, &owner, &tags, None).await {
         Ok(saved) => json!({ "ok": true, "query": saved }),
         Err(err) => json!({ "error": err.to_string() }),
     }
@@ -87,7 +89,9 @@ pub(super) async fn run_saved_query(state: &AppState, args: &Map<String, Value>)
         return json!({ "error": "saved query tidak ditemukan" });
     };
     let body = Bytes::from(json!({ "sql": saved.sql }).to_string());
-    api_result_to_value(crate::routes::query::run(State(state.clone()), body).await).await
+    // No principal: the copilot runs this on its own behalf, so the run is
+    // audited as an unattributed one rather than borrowing a user's name.
+    api_result_to_value(crate::routes::query::run(State(state.clone()), None, body).await).await
 }
 
 #[cfg(test)]

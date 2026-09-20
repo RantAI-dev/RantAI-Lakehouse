@@ -118,15 +118,18 @@ pub async fn create_saved_query(
     sql: &str,
     owner: &str,
     tags: &[String],
+    owner_id: Option<Uuid>,
 ) -> Result<SavedQuery, StoreError> {
     let row: SavedQueryRow = sqlx::query_as(
-        "INSERT INTO saved_query (title, sql, owner, tags) VALUES ($1, $2, $3, $4) \
+        "INSERT INTO saved_query (title, sql, owner, tags, owner_id) \
+         VALUES ($1, $2, $3, $4, $5) \
          RETURNING id, title, sql, owner, updated_at, tags",
     )
     .bind(title)
     .bind(sql)
     .bind(owner)
     .bind(tags)
+    .bind(owner_id)
     .fetch_one(pool)
     .await?;
     Ok(SavedQuery::from(row))
@@ -144,8 +147,7 @@ pub struct QueryHistoryItem {
     pub id: String,
     /// The executed SQL text.
     pub sql: String,
-    /// Who ran the query. No auth exists yet (see the routes-crate module
-    /// doc comments), so this is currently always a placeholder.
+    /// Who ran the query, as a display name.
     pub user: String,
     /// When the query ran, ISO 8601.
     pub at: String,
@@ -211,17 +213,26 @@ impl From<QueryHistoryRow> for QueryHistoryItem {
 /// inserting.
 const HISTORY_LIST_LIMIT: i64 = 200;
 
-/// List recorded query executions, most recent first.
+/// List one user's recorded query executions, most recent first.
+///
+/// History holds the SQL people typed, which is as private as the chat
+/// sessions in `console.chat_session`: before `owner_id` existed this
+/// listed the whole table, so everyone read everyone else's queries. Rows
+/// recorded before then have no owner and are returned to nobody.
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
-pub async fn list_history(pool: &PgPool) -> Result<Vec<QueryHistoryItem>, StoreError> {
+pub async fn list_history(
+    pool: &PgPool,
+    owner_id: Uuid,
+) -> Result<Vec<QueryHistoryItem>, StoreError> {
     let rows: Vec<QueryHistoryRow> = sqlx::query_as(
         "SELECT id, sql, user_name, at, status, duration_ms, scanned_bytes, cost_units, \
          workload_class, engine, cache_assisted, audit_event_id \
-         FROM query_history ORDER BY at DESC LIMIT $1",
+         FROM query_history WHERE owner_id = $1 ORDER BY at DESC LIMIT $2",
     )
+    .bind(owner_id)
     .bind(HISTORY_LIST_LIMIT)
     .fetch_all(pool)
     .await?;
@@ -237,8 +248,11 @@ pub struct RecordHistoryInput<'a> {
     pub id: &'a str,
     /// The executed SQL text.
     pub sql: &'a str,
-    /// Who ran the query.
+    /// Who ran the query, as a display name.
     pub user: &'a str,
+    /// The user the row belongs to. `None` for a run with no authenticated
+    /// caller, which [`list_history`] then shows to nobody.
+    pub owner_id: Option<Uuid>,
     /// `"completed" | "failed" | "cancelled" | "blocked"`.
     pub status: &'a str,
     /// Wall-clock execution time, in milliseconds.
@@ -282,8 +296,8 @@ pub async fn record_history(
     sqlx::query(
         "INSERT INTO query_history \
          (id, sql, user_name, status, duration_ms, scanned_bytes, cost_units, \
-          workload_class, engine, cache_assisted, audit_event_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+          workload_class, engine, cache_assisted, audit_event_id, owner_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(input.id)
@@ -297,6 +311,7 @@ pub async fn record_history(
     .bind(input.engine)
     .bind(input.cache_assisted)
     .bind(input.audit_event_id)
+    .bind(input.owner_id)
     .execute(pool)
     .await?;
     Ok(())

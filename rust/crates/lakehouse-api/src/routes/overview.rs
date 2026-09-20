@@ -88,7 +88,11 @@ async fn service_health(state: &AppState, orchestrator_ok: bool) -> Value {
         None => false,
     };
     let postgres_status = if postgres_ok { "healthy" } else { "unhealthy" };
-    let orchestrator_status = if orchestrator_ok { "healthy" } else { "unavailable" };
+    let orchestrator_status = if orchestrator_ok {
+        "healthy"
+    } else {
+        "unavailable"
+    };
     let items = json!([
         { "name": "ClickHouse", "status": "healthy" },
         { "name": "Postgres", "status": postgres_status },

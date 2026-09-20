@@ -24,13 +24,22 @@ use lakehouse_store::queries::{
     list_collaboration, list_history, list_saved, record_history,
 };
 use sqlx::PgPool;
+use uuid::Uuid;
 
-/// The seed lands the two `mock/queries.ts` saved-query fixtures.
+/// The seed lands two saved queries, pointed at marts this lakehouse
+/// actually serves (`0027_query_ownership.sql` repointed them — the
+/// original fixtures named tables that do not exist here, so the only two
+/// examples a new user could open both failed on Run).
 #[sqlx::test(migrations = "../../migrations")]
 async fn seed_populates_saved_queries(pool: PgPool) -> sqlx::Result<()> {
     let saved = list_saved(&pool).await.unwrap();
     assert_eq!(saved.len(), 2);
-    assert!(saved.iter().any(|q| q.title == "Revenue by region"));
+    assert!(
+        saved
+            .iter()
+            .any(|q| q.title == "Top destinations by visitors")
+    );
+    assert!(saved.iter().all(|q| q.sql.contains("serving.mart_")));
     Ok(())
 }
 
@@ -64,14 +73,16 @@ async fn seed_and_create_collaboration_projects(pool: PgPool) -> sqlx::Result<()
 /// first — the round trip `routes::query::run` depends on.
 #[sqlx::test(migrations = "../../migrations")]
 async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<()> {
-    assert!(list_history(&pool).await.unwrap().is_empty());
+    let owner = Uuid::new_v4();
+    assert!(list_history(&pool, owner).await.unwrap().is_empty());
 
     record_history(
         &pool,
         &RecordHistoryInput {
             id: "q-1",
             sql: "SELECT 1",
-            user: "anonymous",
+            user: "Bootstrap Admin",
+            owner_id: Some(owner),
             status: "completed",
             duration_ms: 42,
             scanned_bytes: 1024,
@@ -85,13 +96,22 @@ async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<(
     .await
     .unwrap();
 
-    let history = list_history(&pool).await.unwrap();
+    let history = list_history(&pool, owner).await.unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].id, "q-1");
     assert_eq!(history[0].sql, "SELECT 1");
     assert_eq!(history[0].status, "completed");
     assert_eq!(history[0].audit_event_id.as_deref(), Some("aud-query-q-1"));
     assert!(history[0].at.ends_with('Z'));
+
+    // Another user's history is not this user's: the rows are private to
+    // whoever ran them.
+    assert!(
+        list_history(&pool, Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -101,10 +121,12 @@ async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<(
 /// surface to the caller, but would spam logs unnecessarily.
 #[sqlx::test(migrations = "../../migrations")]
 async fn record_history_is_idempotent_per_id(pool: PgPool) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
     let input = RecordHistoryInput {
         id: "q-dup",
         sql: "SELECT 1",
-        user: "anonymous",
+        user: "Bootstrap Admin",
+        owner_id: Some(owner),
         status: "completed",
         duration_ms: 1,
         scanned_bytes: 1,
@@ -117,7 +139,7 @@ async fn record_history_is_idempotent_per_id(pool: PgPool) -> sqlx::Result<()> {
     record_history(&pool, &input).await.unwrap();
     record_history(&pool, &input).await.unwrap();
 
-    let history = list_history(&pool).await.unwrap();
+    let history = list_history(&pool, owner).await.unwrap();
     assert_eq!(history.len(), 1);
     Ok(())
 }

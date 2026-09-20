@@ -321,7 +321,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/query/run", axum::routing::post(query::run))
         .route("/api/query/estimate", axum::routing::post(query::estimate))
-        .route("/api/query/saved", get(query::list_saved))
+        .route(
+            "/api/query/saved",
+            get(query::list_saved).post(query::create_saved),
+        )
         .route("/api/query/history", get(query::list_history))
         .route(
             "/api/query/collaboration",

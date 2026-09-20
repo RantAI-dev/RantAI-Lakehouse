@@ -296,7 +296,8 @@ async fn list_body(ch: &ChClient) -> Result<Value, ChError> {
             .iter()
             .find(|p| str_col(p, "db") == db && str_col(p, "table") == table)
     };
-    let gold_rows_of = |table: &str| -> i64 { part_of("serving", table).map_or(0, |p| num_or_zero(Some(p), "r")) };
+    let gold_rows_of =
+        |table: &str| -> i64 { part_of("serving", table).map_or(0, |p| num_or_zero(Some(p), "r")) };
 
     for t in &tbl_rows {
         let db = str_col(t, "db");
@@ -477,10 +478,20 @@ async fn clickhouse_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response>
     );
     // A view has no parts; the query then answers with nulls, and the size
     // and freshness stay unknown rather than being invented.
-    let part = ch.rows(&rows_sql, None).await.ok().and_then(|rr| rr.first().cloned());
+    let part = ch
+        .rows(&rows_sql, None)
+        .await
+        .ok()
+        .and_then(|rr| rr.first().cloned());
     let rows = num_or_zero(part.as_ref(), "r");
-    let size_bytes = part.as_ref().map(|p| num_or_zero(Some(p), "b")).filter(|_| rows > 0);
-    let lag_seconds = part.as_ref().map(|p| num_or_zero(Some(p), "lag")).filter(|_| rows > 0);
+    let size_bytes = part
+        .as_ref()
+        .map(|p| num_or_zero(Some(p), "b"))
+        .filter(|_| rows > 0);
+    let lag_seconds = part
+        .as_ref()
+        .map(|p| num_or_zero(Some(p), "lag"))
+        .filter(|_| rows > 0);
 
     let body = json!({
         "id": id,
