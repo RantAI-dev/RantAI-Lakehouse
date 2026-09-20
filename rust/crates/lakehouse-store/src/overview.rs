@@ -226,8 +226,10 @@ struct ActivityRow {
 
 /// An audited action as a sentence: what happened to what, in plain words.
 fn activity_action(action: &str, outcome: &str) -> String {
+    // "executed" falls through to the wildcard on purpose: it is the
+    // common case, and "ran" is also the sensible reading of any outcome
+    // this list has not learned yet.
     let verb = match outcome {
-        "executed" => "ran",
         "failed" => "failed to run",
         "refused" => "was refused",
         "needs_confirmation" => "asked to run",
@@ -248,8 +250,10 @@ fn activity_category(principal_kind: &str, resource_kind: &str) -> &'static str 
         "policy" | "classification_rule" | "quality_rule" => "policy",
         "approval" => "approval",
         "alert" | "alert_rule" => "incident",
-        "chart" | "board" | "saved_query" | "query" => "query",
         "dataset" | "table" => "schema",
+        // Charts, boards and saved queries fall through to the wildcard:
+        // they belong to "query", and so does anything this list has not
+        // learned yet.
         _ => "query",
     }
 }
