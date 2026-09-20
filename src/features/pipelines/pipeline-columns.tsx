@@ -32,6 +32,7 @@ import {
   DropdownMenuTrigger,
 } from "@rantai/design-system/ui/dropdown-menu"
 import { formatRelativeTime } from "@/lib/format"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { ENTITY_STATUS_LABEL, type EntityStatus } from "@/lib/status"
 import type { Pipeline, PipelineKind } from "@/services/contracts/pipelines"
 
@@ -113,6 +114,42 @@ export function getPipelineColumns({
         label: "Kind",
         variant: "select",
         options: PIPELINE_KIND_OPTIONS,
+        icon: Layers,
+      },
+    },
+    {
+      id: "origin",
+      accessorKey: "origin",
+      header: ({ column }) => (
+        <DataTableColumnHeader column={column} label="Origin" />
+      ),
+      // What a row can actually do follows from where it came from: only
+      // an orchestrator job can be triggered, cancelled or retried.
+      cell: ({ row }) => (
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <Badge variant="outline" className="text-xs font-normal">
+                {row.original.origin === "orchestrator" ? "Orchestrator" : "Authored"}
+              </Badge>
+            }
+          />
+          <TooltipContent>
+            {row.original.origin === "orchestrator"
+              ? "A job in the orchestrator: it runs, and its history is here."
+              : "Authored in the console. No engine is attached yet, so it cannot run."}
+          </TooltipContent>
+        </Tooltip>
+      ),
+      enableColumnFilter: true,
+      enableSorting: true,
+      meta: {
+        label: "Origin",
+        variant: "multiSelect",
+        options: [
+          { value: "orchestrator", label: "Orchestrator" },
+          { value: "authored", label: "Authored" },
+        ],
         icon: Layers,
       },
     },
@@ -226,7 +263,7 @@ export function getPipelineColumns({
       ),
       cell: ({ row }) => (
         <span className="text-xs text-muted-foreground whitespace-nowrap">
-          {formatRelativeTime(row.original.lastRunAt)}
+          {row.original.lastRunAt ? formatRelativeTime(row.original.lastRunAt) : "Never"}
         </span>
       ),
       enableColumnFilter: true,
@@ -305,7 +342,7 @@ export function getPipelineColumns({
                     <span>View details</span>
                   </Link>
                 </DropdownMenuItem>
-                {onTrigger ? (
+                {onTrigger && pipeline.origin === "orchestrator" ? (
                   <DropdownMenuItem
                     onClick={() => {
                       onTrigger(pipeline)
@@ -313,6 +350,14 @@ export function getPipelineColumns({
                   >
                     <Play className="size-4" />
                     <span>Trigger run</span>
+                  </DropdownMenuItem>
+                ) : null}
+                {onTrigger && pipeline.origin === "authored" ? (
+                  // Shown but disabled, with the reason: hiding it makes
+                  // the menu look inconsistent between rows.
+                  <DropdownMenuItem disabled>
+                    <Play className="size-4" />
+                    <span>Trigger run — no engine attached</span>
                   </DropdownMenuItem>
                 ) : null}
                 <DropdownMenuSeparator />

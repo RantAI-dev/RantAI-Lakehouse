@@ -26,14 +26,20 @@ import {
 } from "@/components/ui/dropdown-menu"
 import {
   formatCompactNumber,
-  formatCost,
   formatDuration,
   formatRelativeTime,
 } from "@/lib/format"
 import type { PipelineRun } from "@/services/contracts/pipelines"
 
+/**
+ * How long a run took, reading "running" while it is still going.
+ *
+ * Prefers the duration the orchestrator reported; falls back to the gap
+ * between the two timestamps when it did not give one.
+ */
 export function runDuration(run: PipelineRun): string {
   if (!run.endedAt) return "running"
+  if (run.durationSeconds != null) return formatDuration(run.durationSeconds * 1000)
   return formatDuration(
     new Date(run.endedAt).getTime() - new Date(run.startedAt).getTime()
   )
@@ -121,7 +127,7 @@ export function getPipelineRunColumns({
       cell: ({ row }) => (
         <span
           className={
-            row.original.rejected > 0
+            (row.original.rejected ?? 0) > 0
               ? "font-mono text-xs text-destructive font-medium"
               : "font-mono text-xs text-muted-foreground"
           }
@@ -140,19 +146,6 @@ export function getPipelineRunColumns({
       cell: ({ row }) => (
         <span className="font-mono text-xs text-muted-foreground">
           {formatCompactNumber(row.original.retried)}
-        </span>
-      ),
-      enableSorting: true,
-    },
-    {
-      id: "costUnits",
-      accessorKey: "costUnits",
-      header: ({ column }) => (
-        <DataTableColumnHeader column={column} label="Cost" />
-      ),
-      cell: ({ row }) => (
-        <span className="font-mono text-xs text-muted-foreground">
-          {formatCost(row.original.costUnits)}
         </span>
       ),
       enableSorting: true,

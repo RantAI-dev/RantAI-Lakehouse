@@ -25,9 +25,9 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import {
   formatCompactNumber,
-  formatCost,
   formatDateTime,
   formatRelativeTime,
+  isPast,
 } from "@/lib/format"
 import { pipelineService } from "@/services"
 import type { PipelineRun } from "@/services/contracts/pipelines"
@@ -121,11 +121,12 @@ function RunDrawerContent({
       value: run.endedAt ? formatDateTime(run.endedAt) : "running",
     },
     { label: "Duration", value: runDuration(run) },
+    // These read "—" unless the orchestrator reported them. They used to
+    // be zeros, which looked like a pipeline that had processed nothing.
     { label: "Processed", value: formatCompactNumber(run.processed) },
     { label: "Accepted", value: formatCompactNumber(run.accepted) },
     { label: "Rejected", value: formatCompactNumber(run.rejected) },
     { label: "Retried", value: formatCompactNumber(run.retried) },
-    { label: "Cost", value: formatCost(run.costUnits) },
     {
       label: "Checkpoint",
       value: run.checkpoint ? (
@@ -303,6 +304,9 @@ export function PipelineDetailPage() {
   if (state.status === "error") return <ErrorState error={state.error} onRetry={state.reload} />
   const p = state.data
   const isPaused = p.status === "paused"
+  // Pause/Resume act on a schedule in the orchestrator; an authored
+  // pipeline has neither.
+  const canRun = p.origin === "orchestrator"
 
   return (
     <div className="flex flex-col gap-4">
@@ -310,8 +314,16 @@ export function PipelineDetailPage() {
         eyebrow={<Link href="/pipelines" className="hover:underline">Pipelines</Link>}
         title={p.name}
         titleAccessory={<StatusBadge status={p.status} />}
-        description={p.description}
+        description={p.description ?? undefined}
         actions={
+          // An authored pipeline has no job in the orchestrator, so Run /
+          // Pause / Resume have nothing to act on. They used to be shown
+          // anyway and answered 503, which reads as "try again later".
+          !canRun ? (
+            <span className="text-xs text-muted-foreground">
+              No engine attached — this pipeline cannot run yet.
+            </span>
+          ) : (
           <>
             {isPaused ? (
               <Button
@@ -349,6 +361,7 @@ export function PipelineDetailPage() {
               {runAction.status === "pending" ? "Starting…" : "Run now"}
             </Button>
           </>
+          )
         }
       />
       <ConfirmActionDialog
@@ -421,8 +434,27 @@ export function PipelineDetailPage() {
                     "—"
                   ),
                 },
-                { label: "Last run", value: formatRelativeTime(p.lastRunAt) },
-                { label: "Next run", value: p.nextRunAt ? formatRelativeTime(p.nextRunAt) : "—" },
+                {
+                  label: "Last run",
+                  value: p.lastRunAt ? formatRelativeTime(p.lastRunAt) : "Never",
+                },
+                {
+                  label: "Next run",
+                  // A scheduled time that has already passed is not a
+                  // future event: "14d ago" under "Next run" reads as a
+                  // rendering bug when it is really an overdue schedule.
+                  value: p.nextRunAt ? (
+                    isPast(p.nextRunAt) ? (
+                      <span className="text-amber-600 dark:text-amber-400">
+                        Overdue · due {formatRelativeTime(p.nextRunAt)}
+                      </span>
+                    ) : (
+                      formatRelativeTime(p.nextRunAt)
+                    )
+                  ) : (
+                    "—"
+                  ),
+                },
                 { label: "SLA", value: p.slaOk ? "OK" : "Breached" },
                 { label: "Freshness", value: <FreshnessIndicator lagSeconds={p.freshnessLagSeconds} /> },
                 ...p.configSummary.map((c) => ({
@@ -434,20 +466,30 @@ export function PipelineDetailPage() {
           </SectionCard>
         </TabsContent>
         <TabsContent value="graph" className="mt-3">
-          <FlowCanvas
-            nodes={p.graph.map((n) => ({
-              id: n.id,
-              label: n.label,
-              kind: n.kind,
-              status: n.status,
-            }))}
-          />
+          {p.graph.length === 0 ? (
+            <EmptyState
+              title="No graph for this pipeline"
+              description="The orchestrator's job list does not describe the steps, so there is nothing here to draw."
+            />
+          ) : (
+            <FlowCanvas
+              nodes={p.graph.map((n) => ({
+                id: n.id,
+                label: n.label,
+                kind: n.kind,
+                status: n.status,
+              }))}
+            />
+          )}
         </TabsContent>
         <TabsContent value="runs" className="mt-3">
           {p.runs.length === 0 ? (
             <EmptyState
-              title="No runs yet"
-              description="Runs appear here once the pipeline executes."
+              title="No runs"
+              description={
+                p.runsUnavailable ??
+                "Runs appear here once the pipeline executes."
+              }
             />
           ) : (
             <DataTable

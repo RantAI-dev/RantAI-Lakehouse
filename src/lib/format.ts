@@ -3,16 +3,21 @@
  * helpers so dates, durations, bytes, rates, and costs read identically.
  */
 
-/** 1234567 → "1.2M"; 950 → "950". */
-export function formatCompactNumber(value: number): string {
+/**
+ * 1234567 → "1.2M"; 950 → "950".
+ * `null` means the number is not known, and reads as "—".
+ */
+export function formatCompactNumber(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "—"
   return Intl.NumberFormat("en", {
     notation: "compact",
     maximumFractionDigits: 1,
   }).format(value)
 }
 
-/** 1234567 → "1,234,567". */
-export function formatNumber(value: number): string {
+/** 1234567 → "1,234,567"; `null` → "—". */
+export function formatNumber(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "—"
   return Intl.NumberFormat("en").format(value)
 }
 
@@ -46,8 +51,8 @@ export function formatDuration(ms: number): string {
 }
 
 /** Internal cost units, e.g. 0.0421 → "0.0421 cu". */
-export function formatCost(units: number): string {
-  if (!Number.isFinite(units)) return "—"
+export function formatCost(units: number | null | undefined): string {
+  if (units == null || !Number.isFinite(units)) return "—"
   const digits = units >= 10 ? 1 : units >= 1 ? 2 : 4
   return `${units.toFixed(digits)} cu`
 }
@@ -114,7 +119,27 @@ export function formatDate(
 }
 
 /** ISO timestamp → relative age, e.g. "4m ago", "3h ago", "2d ago". */
-export function formatRelativeTime(iso: string, now = Date.now()): string {
+/**
+ * Whether a timestamp has already passed.
+ *
+ * Kept here beside the formatters so components never reach for
+ * `Date.now()` in render — the same reason `formatRelativeTime` takes
+ * `now` as a defaulted parameter.
+ */
+export function isPast(
+  iso: string | null | undefined,
+  now = Date.now()
+): boolean {
+  if (!iso) return false
+  const t = parseTimestamp(iso).getTime()
+  return !Number.isNaN(t) && t < now
+}
+
+export function formatRelativeTime(
+  iso: string | null | undefined,
+  now = Date.now()
+): string {
+  if (!iso) return "—"
   const t = parseTimestamp(iso).getTime()
   if (Number.isNaN(t)) return "—"
   const diffMs = now - t
