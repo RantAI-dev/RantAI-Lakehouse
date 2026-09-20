@@ -40,7 +40,18 @@ function legacyParamsToTableState(
   const facets = (["layer", "tier", "type"] as const).flatMap((id) => {
     const value = params.get(id)
     return value && value !== "all"
-      ? [{ id, value: [value], variant: "multiSelect", operator: "inArray" }]
+      ? [
+          {
+            id,
+            value: [value],
+            variant: "multiSelect",
+            operator: "inArray",
+            // Required by the filter schema: without it the toolbar drops
+            // the filter it cannot parse, and the chips never appear even
+            // though the rows are filtered.
+            filterId: crypto.randomUUID().slice(0, 8),
+          },
+        ]
       : []
   })
   if (!search && facets.length === 0) return null
