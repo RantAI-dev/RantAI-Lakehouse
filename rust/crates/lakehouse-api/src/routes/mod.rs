@@ -112,6 +112,7 @@ fn pipelines_router() -> Router<AppState> {
             "/api/pipelines/generate",
             axum::routing::post(pipelines::generate),
         )
+        .route("/api/pipelines/{id}", get(pipelines::get_one))
         .route("/api/pipelines/{id}/runs", get(pipelines::runs))
         .route(
             "/api/pipelines/{id}/trigger",

@@ -58,15 +58,25 @@ pub struct Pipeline {
     pub target_asset_id: Option<String>,
     /// Schedule label.
     pub schedule: String,
-    /// Last run time, ISO 8601.
-    pub last_run_at: String,
+    /// Last run time, ISO 8601; `None` when it has never run.
+    pub last_run_at: Option<String>,
     /// Next scheduled run time, ISO 8601, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_run_at: Option<String>,
     /// Whether the pipeline is currently meeting its SLA.
     pub sla_ok: bool,
-    /// Current freshness lag in seconds.
-    pub freshness_lag_seconds: i32,
+    /// Current freshness lag in seconds; `None` when nothing has measured it.
+    pub freshness_lag_seconds: Option<i32>,
+    /// What this pipeline is for, as its author described it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Column an incremental pipeline advances on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incremental_column: Option<String>,
+    /// Transform steps chosen when the pipeline was authored.
+    pub transforms: Vec<String>,
+    /// Whether format-based incremental capture is enabled.
+    pub fbic_enabled: bool,
 }
 
 #[derive(Debug, FromRow)]
@@ -82,10 +92,14 @@ struct PipelineRow {
     source_asset_id: Option<String>,
     target_asset_id: Option<String>,
     schedule: String,
-    last_run_at: OffsetDateTime,
+    last_run_at: Option<OffsetDateTime>,
     next_run_at: Option<OffsetDateTime>,
     sla_ok: bool,
-    freshness_lag_seconds: i32,
+    freshness_lag_seconds: Option<i32>,
+    description: Option<String>,
+    incremental_column: Option<String>,
+    transforms: Vec<String>,
+    fbic_enabled: bool,
 }
 
 impl From<PipelineRow> for Pipeline {
@@ -102,17 +116,21 @@ impl From<PipelineRow> for Pipeline {
             source_asset_id: row.source_asset_id,
             target_asset_id: row.target_asset_id,
             schedule: row.schedule,
-            last_run_at: iso_millis(row.last_run_at),
+            last_run_at: row.last_run_at.map(iso_millis),
             next_run_at: row.next_run_at.map(iso_millis),
             sla_ok: row.sla_ok,
             freshness_lag_seconds: row.freshness_lag_seconds,
+            description: row.description,
+            incremental_column: row.incremental_column,
+            transforms: row.transforms,
+            fbic_enabled: row.fbic_enabled,
         }
     }
 }
 
 const PIPELINE_COLUMNS: &str = "id, name, kind, status, owner, source, target, connector_id, \
      source_asset_id, target_asset_id, schedule, last_run_at, next_run_at, sla_ok, \
-     freshness_lag_seconds";
+     freshness_lag_seconds, description, incremental_column, transforms, fbic_enabled";
 
 /// List every authored pipeline definition, newest first.
 ///
@@ -198,6 +216,14 @@ pub struct CreatePipelineInput {
     pub schedule: String,
     /// Owner; defaults to [`DEFAULT_OWNER`] when absent.
     pub owner: Option<String>,
+    /// What the pipeline is for, in the author's words.
+    pub description: Option<String>,
+    /// Column an incremental pipeline advances on.
+    pub incremental_column: Option<String>,
+    /// Transform steps chosen in the wizard.
+    pub transforms: Vec<String>,
+    /// Whether format-based incremental capture was switched on.
+    pub fbic_enabled: bool,
 }
 
 const DEFAULT_OWNER: &str = "Current user";
@@ -220,8 +246,9 @@ pub async fn create_pipeline(
     let owner = input.owner.as_deref().unwrap_or(DEFAULT_OWNER);
     let sql = format!(
         "INSERT INTO pipeline_definition (id, name, kind, status, owner, source, target, \
-         schedule, sla_ok, freshness_lag_seconds) \
-         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, true, 0) \
+         schedule, sla_ok, description, incremental_column, \
+         transforms, fbic_enabled) \
+         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, true, $8, $9, $10, $11) \
          RETURNING {PIPELINE_COLUMNS}"
     );
     let row: PipelineRow = sqlx::query_as(&sql)
@@ -232,6 +259,10 @@ pub async fn create_pipeline(
         .bind(&source)
         .bind(&target)
         .bind(&input.schedule)
+        .bind(&input.description)
+        .bind(&input.incremental_column)
+        .bind(&input.transforms)
+        .bind(input.fbic_enabled)
         .fetch_one(pool)
         .await?;
     Ok(row.into())
@@ -280,10 +311,14 @@ mod tests {
             source_asset_id: None,
             target_asset_id: None,
             schedule: "manual".to_owned(),
-            last_run_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            last_run_at: Some("2026-01-01T00:00:00.000Z".to_owned()),
             next_run_at: None,
             sla_ok: true,
-            freshness_lag_seconds: 0,
+            freshness_lag_seconds: Some(0),
+            description: None,
+            incremental_column: None,
+            transforms: Vec::new(),
+            fbic_enabled: false,
         };
         let value = serde_json::to_value(&pipeline).unwrap();
         for key in [

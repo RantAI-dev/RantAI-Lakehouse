@@ -2,6 +2,7 @@ import type {
   PipelineService,
   Pipeline,
   PipelineDetail,
+  PipelineList,
   PipelineRun,
   CreatePipelineInput,
   GeneratePipelineInput,
@@ -20,7 +21,7 @@ import { ServiceError } from "../errors";
 async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await apiFetch(url, init);
   const json = await res.json();
-  if (!res.ok) throw new ServiceError("unavailable", json?.error ?? `Gagal (${res.status})`);
+  if (!res.ok) throw new ServiceError("unavailable", json?.error ?? `Request failed (${res.status})`);
   return json as T;
 }
 
@@ -34,14 +35,17 @@ async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Pr
   const json = await res.json();
   if (!res.ok) {
     const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
-    throw new ServiceError(kind, json?.error ?? `Gagal (${res.status})`);
+    throw new ServiceError(kind, json?.error ?? `Request failed (${res.status})`);
   }
   return json as T;
 }
 
 export const dagsterPipelineService: PipelineService = {
   async listPipelines(signal) {
-    return (await getJson<{ pipelines: Pipeline[] }>("/api/pipelines", { signal })).pipelines;
+    const body = await getJson<PipelineList>("/api/pipelines", { signal });
+    // The orchestrator half may be missing; the page says so rather than
+    // presenting a short list as the whole one.
+    return { pipelines: body.pipelines ?? [], orchestratorError: body.orchestratorError ?? null };
   },
   async listRuns(pipelineId, signal) {
     return (
@@ -51,25 +55,12 @@ export const dagsterPipelineService: PipelineService = {
   async triggerRun(id, signal) {
     return getJson<PipelineRun>(`/api/pipelines/${encodeURIComponent(id)}/trigger`, { method: "POST", signal });
   },
-  async getPipeline(id, signal) {
-    const [list, runs] = await Promise.all([this.listPipelines(signal), this.listRuns(id, signal)]);
-    const base = list.find((p) => p.id === id);
-    if (!base) throw new ServiceError("not_found", "Pipeline tidak ditemukan");
-    const detail: PipelineDetail = {
-      ...base,
-      description: "Job Dagster: refresh lakehouse Bronze→Silver→Gold (dlt + SQLMesh).",
-      graph: [
-        { id: "bronze", label: "Bronze (dlt)", kind: "ingest", status: "completed" },
-        { id: "silver", label: "Silver (typed)", kind: "transform", status: "completed" },
-        { id: "gold", label: "Gold (mart)", kind: "publish", status: "completed" },
-      ],
-      runs,
-      configSummary: [
-        { key: "engine", value: "Dagster" },
-        { key: "schedule", value: base.schedule },
-      ],
-    };
-    return detail;
+  // One request to one endpoint. This used to fetch the whole list, find
+  // the row, fetch the runs, and then make up the description, the graph
+  // and the config summary in the browser — the same three-node
+  // Bronze/Silver/Gold diagram for every pipeline that exists.
+  getPipeline(id, signal) {
+    return getJson<PipelineDetail>(`/api/pipelines/${encodeURIComponent(id)}`, { signal });
   },
 
   createPipeline(input: CreatePipelineInput, signal) {
