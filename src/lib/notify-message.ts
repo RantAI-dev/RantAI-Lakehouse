@@ -15,10 +15,11 @@ import { toServiceError, type ServiceErrorCode } from "@/services/errors"
  * "menjelaskan langkah berikutnya, bukan sekadar kode".
  */
 const HINTS: Record<ServiceErrorCode, string> = {
-  not_found: "Item mungkin sudah dihapus. Muat ulang daftar.",
-  permission_denied: "Akun ini tidak punya izin. Hubungi admin workspace.",
-  unavailable: "Layanan sedang tidak tersedia. Coba lagi sebentar lagi.",
-  invalid_request: "Periksa kembali isian sebelum mengirim ulang.",
+  not_found: "It may already have been deleted. Reload the list.",
+  permission_denied:
+    "This account does not have permission. Ask a workspace admin.",
+  unavailable: "The service is unavailable right now. Try again shortly.",
+  invalid_request: "Check the input before sending it again.",
   aborted: "",
 }
 

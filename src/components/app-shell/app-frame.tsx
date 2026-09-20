@@ -59,7 +59,12 @@ function AuthenticatedFrame({ children }: Readonly<{ children: React.ReactNode }
       <SidebarInset className="min-w-0 bg-muted/25">
         <AppNavbar />
         <div className="flex flex-1 min-h-0 min-w-0">
-          <main className="flex-1 min-w-0 p-4 sm:p-5 lg:p-6">{children}</main>
+          {/* The Copilot dock is `fixed bottom-4`, so without this the
+              last thing on every page sits underneath it. Pages used to
+              add their own bottom spacing (or forget to). */}
+          <main className="flex-1 min-w-0 p-4 pb-24 sm:p-5 sm:pb-24 lg:p-6 lg:pb-28">
+            {children}
+          </main>
           <CopilotSidebar />
         </div>
         <CopilotDock />

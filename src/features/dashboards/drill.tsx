@@ -4,7 +4,8 @@ import * as React from "react";
 import { Filter, Table2 } from "lucide-react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { apiFetch } from "@/services/http";
-import { RowsTable, type Rows } from "./tile-dialogs";
+import { RowsTable } from "@/components/patterns/rows-table";
+import { type Rows } from "./tile-dialogs";
 
 export type DrillTarget = { name: string; column: string; mart: string; x: number; y: number };
 export type RecordsState = Rows & { value: string; loading: boolean };
@@ -80,7 +81,7 @@ export function RecordsDialog({
           <div className="h-40 animate-pulse rounded bg-muted/40" />
         ) : records && records.rows.length ? (
           <>
-            <RowsTable data={records} />
+            <RowsTable columns={records.columns} rows={records.rows} />
             <p className="text-[11px] text-muted-foreground">Showing up to 100 rows.</p>
           </>
         ) : (

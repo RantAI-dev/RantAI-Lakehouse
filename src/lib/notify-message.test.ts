@@ -17,23 +17,23 @@ test("buildErrorDescription menggabungkan pesan asli dengan saran langkah lanjut
   // Detail dari server tetap ditampilkan, tapi ditambah langkah yang bisa
   // ditindaklanjuti — bukan sekadar kode error.
   assert.ok(description?.includes("Forbidden."))
-  assert.ok(description?.includes("Hubungi admin workspace."))
+  assert.ok(description?.includes("Ask a workspace admin."))
 })
 
 test("buildErrorDescription memberi saran berbeda per kode error", () => {
   assert.ok(
     buildErrorDescription(new ServiceError("not_found", "Missing."))?.includes(
-      "Muat ulang daftar."
+      "Reload the list."
     )
   )
   assert.ok(
     buildErrorDescription(
       new ServiceError("invalid_request", "Bad input.")
-    )?.includes("Periksa kembali isian")
+    )?.includes("Check the input")
   )
   assert.ok(
     buildErrorDescription(new ServiceError("unavailable", "Down."))?.includes(
-      "Coba lagi sebentar lagi."
+      "Try again shortly."
     )
   )
 })
@@ -62,12 +62,12 @@ test("buildErrorDescription menangani nilai lempar non-Error", () => {
   const description = buildErrorDescription("boom")
 
   assert.ok(description)
-  assert.ok(description.includes("Coba lagi sebentar lagi."))
+  assert.ok(description.includes("Try again shortly."))
 })
 
 test("buildErrorDescription tetap memberi teks saat pesan error kosong", () => {
   const description = buildErrorDescription(new ServiceError("not_found", "  "))
 
   // Pesan kosong tidak boleh menghasilkan toast tanpa keterangan sama sekali.
-  assert.equal(description, "Item mungkin sudah dihapus. Muat ulang daftar.")
+  assert.equal(description, "It may already have been deleted. Reload the list.")
 })
