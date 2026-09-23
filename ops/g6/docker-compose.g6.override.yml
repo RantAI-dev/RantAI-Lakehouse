@@ -15,10 +15,62 @@
 # there broke `docker compose --profile '*' config --quiet` (the
 # repo-wide check AGENTS.md prescribes) for every checkout, gate or not.
 # They stay `${VAR:?}` here: fail-closed, just relocated.
+#
+# `g6_secrets`: a GATE-ONLY named volume backing
+# `file:`-scheme connector credentials (ADR 0002 Addendum 3,
+# docs/adr/0002-secretref-resolution.md). `POST /api/connectors` no
+# longer accepts a client-chosen `secretRef`; the server derives one from
+# the connector's own generated id and returns it once
+# (`CreateConnectorResponse.credential`). A `file:` derived name is
+# always shaped `file:/run/secrets/connector_<id>_<suffix>`
+# (`lakehouse_store::connectors::derive_secret_ref`) -- `/run/secrets` is
+# `FileSecretResolver`'s hardcoded base dir on BOTH the Rust side
+# (`lakehouse-api/src/state.rs`) and the Python side
+# (`dagster/dispar_orchestrate/secret_resolver.py`'s `_SECRETS_BASE_DIR`),
+# so the SAME volume is mounted read-only at that exact path in both
+# `lakehouse-api` and `dagster-code-location` (the service that actually
+# EXECUTES a launched ingest run, per the run-launcher comment above
+# `dagster-code-location` in docker-compose.yml) -- and read-write in
+# `g6-test-runner`, which writes each connector's real credential value
+# there (basename-only, validated against the `file:/run/secrets/
+# connector_*` prefix before use -- see g6_ingest_matrix_test.py) right
+# after `POST /api/connectors` hands back the derived name. A real
+# deployment mounts this same way once it provisions real credentials as
+# files (`secret_resolver.py`'s own doc comment already names this exact
+# gap); it is "gate-only" here only in the sense that no OTHER compose
+# profile references `g6_secrets`, not because the mechanism itself is a
+# test-only shortcut.
+volumes:
+  g6_secrets:
+
 services:
   dagster-code-location:
     environment:
       INGEST_ALLOW_INTERNAL_HOSTS: "true"
+      # OpenSSL (Microsoft ODBC Driver 18's TLS implementation on Linux)
+      # honours SSL_CERT_FILE for the default trust store -- pointed at
+      # mssql-g6-cert-init's self-signed cert (mounted below) so the
+      # `mssql` adapter's real `TrustServerCertificate=no` verification
+      # has a CA it can actually verify `mssql-g6`'s certificate against.
+      # Gate-only: a real deployment dials real, CA-issued SQL Server
+      # certificates and needs no override of the system trust store.
+      SSL_CERT_FILE: /etc/mssql-tls/mssql-g6.pem
+    volumes:
+      - type: volume
+        source: g6_secrets
+        target: /run/secrets
+        read_only: true
+      - type: volume
+        source: mssql_g6_tls
+        target: /etc/mssql-tls
+        read_only: true
+
+  lakehouse-api:
+    volumes:
+      - type: volume
+        source: g6_secrets
+        target: /run/secrets
+        read_only: true
 
   mysql-g6:
     environment:
@@ -33,7 +85,30 @@ services:
     healthcheck:
       test: ["CMD", "/opt/mssql-tools18/bin/sqlcmd", "-C", "-S", "localhost", "-U", "sa", "-P", "${MSSQL_SA_PASSWORD:?}", "-Q", "SELECT 1"]
 
+  # Root credentials for mongo-g6, relocated here for the
+  # same "breaks `--profile '*' config --quiet`" reason as
+  # MYSQL_ROOT_PASSWORD above. Without this override mongo-g6 starts with
+  # NO authentication at all (see docker-compose.yml's comment on that
+  # service) -- fine for an override-free run, since nothing in this gate
+  # dials it without the override anyway.
+  mongo-g6:
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_G6_ROOT_USER:?}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_G6_ROOT_PASSWORD:?}
+
   g6-test-runner:
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?}
+      # The mysql-g6/mssql-g6 dial CONNECTOR credentials (not root/sa) --
+      # g6-test-runner needs the real values to write into each
+      # connector's derived `file:` credential (ADR 0002 Addendum 3), the
+      # SAME values mysql-g6's own override above provisions its
+      # `g6_reader` user with.
+      CONNECTOR_MYSQL_PASSWORD: ${CONNECTOR_MYSQL_PASSWORD:?}
       MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?}
+      MONGO_G6_ROOT_USER: ${MONGO_G6_ROOT_USER:?}
+      MONGO_G6_ROOT_PASSWORD: ${MONGO_G6_ROOT_PASSWORD:?}
+    volumes:
+      - type: volume
+        source: g6_secrets
+        target: /gate-secrets
