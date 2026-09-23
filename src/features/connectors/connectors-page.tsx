@@ -20,6 +20,7 @@ import {
 import { HealthBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { backfillTriggerMessage } from "@/lib/connectors/backfill-message"
 import { formatRelativeTime } from "@/lib/format"
 import { HEALTH_LABEL, type Health } from "@/lib/status"
 import { connectorService } from "@/services"
@@ -128,9 +129,21 @@ function IngestRunsPanel({ connectorId }: { connectorId: string }) {
     return <ErrorState error={runs.error} onRetry={runs.reload} />
 
   const table: string | undefined = spec.data.sourceObjects[0]?.name
+  // `driver` names the CDC source for the honest, generic message below
+  // only — the dial's actual shape is validated server-side
+  // (`Dial::parse`, `rust/crates/lakehouse-store/src/ingest_spec.rs`),
+  // never re-validated here (see `Dial`'s doc comment in
+  // `@/services/contracts/connectors`).
+  const driver =
+    spec.data.adapter === "cdc" && typeof spec.data.dial.driver === "string"
+      ? spec.data.dial.driver
+      : "cdc"
 
   return (
     <div className="space-y-3">
+      {spec.data.adapter === "cdc" ? (
+        <p className="text-sm text-muted-foreground">{backfillTriggerMessage(driver)}</p>
+      ) : null}
       <div className="flex items-center justify-between">
         <p className="text-xs font-medium text-muted-foreground">Ingest runs</p>
         <Button
