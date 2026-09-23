@@ -1611,29 +1611,46 @@ mod tests {
         }
     }
 
-    /// Two distinct ids never derive the same name — a handful of
-    /// adversarial pairs, including the exact shape the addendum's "why
-    /// this cannot reach someone else's credential" section calls out
-    /// (`conn-a-password` vs `conn-a` + suffix `PASSWORD`, which would
-    /// collide if `-`→`_` mapping were not one-to-one with a fixed set of
-    /// suffixes).
+    /// Two distinct ids never derive the same name, for ANY pair of kinds
+    /// and either source. The collision that would matter is across kinds:
+    /// `conn-a` + `SECRET_KEY` and `conn-a-secret` + a `KEY` suffix would
+    /// both spell `..._CONN_A_SECRET_KEY`. It cannot happen because no
+    /// allowed suffix is an `_`-separated tail of another; the cross-kind
+    /// pairs below are the ids that would exploit it if one ever were.
     #[test]
     fn distinct_ids_never_derive_the_same_name() {
+        const KINDS: [CredentialKind; 5] = [
+            CredentialKind::Password,
+            CredentialKind::SecretKey,
+            CredentialKind::AccessKey,
+            CredentialKind::ApiKey,
+            CredentialKind::Token,
+        ];
         let pairs = [
             ("conn-a-password", "conn-a"),
             ("conn-a-b", "conn-a-b-"),
             ("conn-ab", "conn-a-b"),
             ("conn-x-y-z", "conn-x-y-z-"),
+            ("conn-a", "conn-a-secret"),
+            ("conn-a", "conn-a-access"),
+            ("conn-a", "conn-a-api"),
+            ("conn-a-secret-key", "conn-a"),
         ];
         for (left, right) in pairs {
             assert_ne!(left, right, "test fixture bug: ids must differ");
-            let left_ref = derive_secret_ref(left, CredentialSource::Env, CredentialKind::Password);
-            let right_ref =
-                derive_secret_ref(right, CredentialSource::Env, CredentialKind::Password);
-            assert_ne!(
-                left_ref, right_ref,
-                "distinct ids {left:?} and {right:?} derived the same name"
-            );
+            for source in [CredentialSource::Env, CredentialSource::File] {
+                for left_kind in KINDS {
+                    for right_kind in KINDS {
+                        let left_ref = derive_secret_ref(left, source, left_kind);
+                        let right_ref = derive_secret_ref(right, source, right_kind);
+                        assert_ne!(
+                            left_ref, right_ref,
+                            "distinct ids {left:?} ({left_kind:?}) and {right:?} ({right_kind:?}) \
+                             derived the same name"
+                        );
+                    }
+                }
+            }
         }
     }
 }
