@@ -12,6 +12,7 @@ import type {
   IngestRunResult,
   IngestSpec,
   IngestSpecInput,
+  ProbeHistoryResponse,
 } from "../contracts/connectors";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
@@ -115,6 +116,13 @@ export const postgresConnectorService: ConnectorService = {
   getDebeziumProperties(id, table, signal) {
     return getJson<DebeziumProperties>(
       `/api/connectors/${encodeURIComponent(id)}/debezium-properties?table=${encodeURIComponent(table)}`,
+      { signal }
+    );
+  },
+  listProbeHistory(id, limit, signal) {
+    const query = limit === undefined ? "" : `?limit=${encodeURIComponent(limit)}`;
+    return getJson<ProbeHistoryResponse>(
+      `/api/connectors/${encodeURIComponent(id)}/probe-history${query}`,
       { signal }
     );
   },

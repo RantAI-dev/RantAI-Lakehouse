@@ -21,6 +21,7 @@ use lakehouse_test_support as _;
 
 use lakehouse_store::StoreError;
 use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
+use lakehouse_store::connector_probe_result::list_probe_results;
 use lakehouse_store::connectors::{
     CreateConnectorInput, IngestSpecInput, create_connector, delete_connector, get_connector,
     get_connector_dial_info, get_ingest_spec, list_connectors, list_ingestible_connectors,
@@ -930,5 +931,187 @@ async fn ingest_spec_functions_treat_an_unknown_id_honestly(pool: PgPool) -> sql
         .await
         .unwrap_err();
     assert!(matches!(err, StoreError::NotFound));
+    Ok(())
+}
+
+// ── connector_probe_result: per-connector probe history ────────────────
+
+fn probe_history_test_input(name: &str) -> CreateConnectorInput {
+    CreateConnectorInput {
+        name: name.to_owned(),
+        kind: "REST API".to_owned(),
+        direction: "source".to_owned(),
+        host: "h".to_owned(),
+        secret_ref: "env:X".to_owned(),
+        secret_ref_secondary: None,
+        environment: "staging".to_owned(),
+        tenant: "Meridian Group".to_owned(),
+        residency: String::new(),
+        capabilities: vec![],
+        owner: None,
+    }
+}
+
+/// A supported probe writes exactly one history row whose `ok`/
+/// `latency_ms`/`message` match what was measured, and whose `tested_at`
+/// equals the `tested_at` `record_test_result` itself returns -- proving
+/// the current-state `UPDATE` and the history insert share the exact same
+/// timestamp rather than each calling `now()` independently.
+#[sqlx::test(migrations = "../../migrations")]
+async fn supported_probe_writes_exactly_one_history_row(pool: PgPool) -> sqlx::Result<()> {
+    let created = create_connector(&pool, &probe_history_test_input("history: supported"))
+        .await
+        .unwrap();
+
+    let result = record_test_result(&pool, &created.id, true, true, Some(37), "ok, real dial")
+        .await
+        .unwrap();
+
+    let history = list_probe_results(&pool, &created.id, 50).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert!(history[0].ok);
+    assert_eq!(history[0].latency_ms, Some(37));
+    assert_eq!(history[0].message, "ok, real dial");
+    assert_eq!(
+        Some(history[0].tested_at.clone()),
+        result.tested_at,
+        "the history row's tested_at must equal the value record_test_result returned"
+    );
+    Ok(())
+}
+
+/// An unsupported probe writes NO history row -- an unsupported probe
+/// never actually dialed the connector, so it has no outcome to record
+/// (same rule `connector.health`/`lastTestAt` already follow).
+#[sqlx::test(migrations = "../../migrations")]
+async fn unsupported_probe_writes_no_history_row(pool: PgPool) -> sqlx::Result<()> {
+    let created = create_connector(&pool, &probe_history_test_input("history: unsupported"))
+        .await
+        .unwrap();
+
+    record_test_result(&pool, &created.id, false, false, None, "unsupported")
+        .await
+        .unwrap();
+
+    let history = list_probe_results(&pool, &created.id, 50).await.unwrap();
+    assert!(
+        history.is_empty(),
+        "an unsupported probe must never write a history row"
+    );
+    Ok(())
+}
+
+/// Testing an unknown connector id writes nothing and returns `NotFound` --
+/// exactly `record_test_result`'s existing contract for the current-state
+/// `UPDATE`, now also true for the history insert.
+#[sqlx::test(migrations = "../../migrations")]
+async fn unknown_connector_probe_writes_nothing(pool: PgPool) -> sqlx::Result<()> {
+    let err = record_test_result(&pool, "conn-does-not-exist", true, true, Some(1), "x")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound));
+
+    let history = list_probe_results(&pool, "conn-does-not-exist", 50)
+        .await
+        .unwrap();
+    assert!(history.is_empty());
+    Ok(())
+}
+
+/// 205 supported probes leave exactly 200 rows, and the survivors are the
+/// newest 200 -- `insert_and_trim`'s per-connector cap.
+#[sqlx::test(migrations = "../../migrations")]
+async fn probe_history_is_trimmed_to_the_newest_two_hundred(pool: PgPool) -> sqlx::Result<()> {
+    let created = create_connector(&pool, &probe_history_test_input("history: trim"))
+        .await
+        .unwrap();
+
+    for i in 0..205 {
+        record_test_result(
+            &pool,
+            &created.id,
+            true,
+            true,
+            Some(i),
+            &format!("probe {i}"),
+        )
+        .await
+        .unwrap();
+    }
+
+    let history = list_probe_results(&pool, &created.id, 500).await.unwrap();
+    assert_eq!(history.len(), 200);
+    // Newest first: the very first probe recorded ("probe 0".."probe 4")
+    // must have been trimmed away, and the last one recorded ("probe 204")
+    // must be the newest (first) entry.
+    assert_eq!(history[0].message, "probe 204");
+    assert_eq!(history[199].message, "probe 5");
+    for row in &history {
+        assert_ne!(row.message, "probe 0");
+        assert_ne!(row.message, "probe 4");
+    }
+    Ok(())
+}
+
+/// `list_probe_results` returns newest first and honours `limit`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_probe_results_returns_newest_first_and_honours_limit(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = create_connector(&pool, &probe_history_test_input("history: ordering"))
+        .await
+        .unwrap();
+
+    for i in 0..5 {
+        record_test_result(
+            &pool,
+            &created.id,
+            true,
+            true,
+            Some(i),
+            &format!("probe {i}"),
+        )
+        .await
+        .unwrap();
+    }
+
+    let all = list_probe_results(&pool, &created.id, 50).await.unwrap();
+    assert_eq!(all.len(), 5);
+    assert_eq!(all[0].message, "probe 4");
+    assert_eq!(all[4].message, "probe 0");
+
+    let limited = list_probe_results(&pool, &created.id, 2).await.unwrap();
+    assert_eq!(limited.len(), 2);
+    assert_eq!(limited[0].message, "probe 4");
+    assert_eq!(limited[1].message, "probe 3");
+    Ok(())
+}
+
+/// Deleting a connector cascades its probe history away
+/// (`connector_id ... REFERENCES connector(id) ON DELETE CASCADE`,
+/// `0044_connector_probe_result.sql`).
+#[sqlx::test(migrations = "../../migrations")]
+async fn deleting_a_connector_cascades_its_probe_history(pool: PgPool) -> sqlx::Result<()> {
+    let created = create_connector(&pool, &probe_history_test_input("history: cascade"))
+        .await
+        .unwrap();
+    record_test_result(&pool, &created.id, true, true, Some(1), "ok")
+        .await
+        .unwrap();
+    assert_eq!(
+        list_probe_results(&pool, &created.id, 50)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    assert!(delete_connector(&pool, &created.id).await.unwrap());
+
+    let history = list_probe_results(&pool, &created.id, 50).await.unwrap();
+    assert!(
+        history.is_empty(),
+        "deleting the connector must cascade-delete its probe history"
+    );
     Ok(())
 }

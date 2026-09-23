@@ -26,6 +26,7 @@ use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::cdc::ConnectorSlug;
+use lakehouse_store::connector_probe_result::{self, ConnectorProbeResult};
 use lakehouse_store::connector_type::{self, ConnectorType};
 use lakehouse_store::connectors::{self, ConnectorDetail, ConnectorDialInfo, CreateConnectorInput};
 use lakehouse_store::ingest_spec::{Dial, SqlDriver};
@@ -424,6 +425,69 @@ pub async fn test_connection(
         }
         Err(err) => Err(ApiError::from(err).into()),
     }
+}
+
+/// `?limit=` query for `GET /api/connectors/{id}/probe-history`.
+#[derive(Debug, Deserialize)]
+pub struct ProbeHistoryQuery {
+    limit: Option<i64>,
+}
+
+/// The default number of history rows returned when `?limit=` is absent.
+const DEFAULT_PROBE_HISTORY_LIMIT: i64 = 50;
+
+/// The accepted range for `?limit=` -- matches
+/// [`lakehouse_store::connector_probe_result`]'s own per-connector cap of
+/// 200 rows: asking for more than this table could ever hold for one
+/// connector is refused rather than silently clamped, so a caller relying
+/// on an out-of-range `limit` learns that immediately instead of quietly
+/// getting fewer rows than it asked for.
+const PROBE_HISTORY_LIMIT_RANGE: std::ops::RangeInclusive<i64> = 1..=200;
+
+/// `GET /api/connectors/{id}/probe-history` — the connector's most recent
+/// connectivity-probe results, newest first. See
+/// `lakehouse_store::connector_probe_result`'s module doc comment: this is
+/// history distinct from `connector.health`/`lastTestAt` (current state,
+/// unchanged by this route), and only ever contains SUPPORTED probes.
+///
+/// # Errors
+///
+/// 400 if `limit` is present and outside `1..=200` (never silently
+/// clamped — a caller relying on an out-of-range value should learn that,
+/// not get a quietly-truncated result); 404 if `id` is unknown; 503/500 as
+/// every other connector route.
+pub async fn probe_history(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ProbeHistoryQuery>,
+) -> ApiResult<ApiJson<ProbeHistoryResponse>> {
+    let limit = query.limit.unwrap_or(DEFAULT_PROBE_HISTORY_LIMIT);
+    if !PROBE_HISTORY_LIMIT_RANGE.contains(&limit) {
+        return Err(ApiError::BadRequest(format!(
+            "limit must be between {} and {}, got {limit}",
+            PROBE_HISTORY_LIMIT_RANGE.start(),
+            PROBE_HISTORY_LIMIT_RANGE.end()
+        ))
+        .into());
+    }
+    let pool = pool(&state)?;
+    // `get_connector` (rather than a bare existence check) so a 404 for an
+    // unknown id matches every other `/api/connectors/{id}/*` route's
+    // wording exactly -- see `detail`'s handler, above.
+    connectors::get_connector(pool, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Connector {id} not found")))?;
+    let results = connector_probe_result::list_probe_results(pool, &id, limit).await?;
+    Ok(ApiJson(ProbeHistoryResponse { results }))
+}
+
+/// The `GET /api/connectors/{id}/probe-history` response body. Mirrors
+/// `ProbeHistoryResponse` in `contracts/connectors.ts`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeHistoryResponse {
+    /// Newest first — see [`connector_probe_result::list_probe_results`].
+    results: Vec<ConnectorProbeResult>,
 }
 
 /// `?schema=` query for `POST /api/connectors/{id}/discover`. Required

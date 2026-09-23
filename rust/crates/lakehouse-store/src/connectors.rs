@@ -808,22 +808,43 @@ pub async fn set_ingest_spec(
 }
 
 /// Persist the outcome of a real connectivity probe and, when the probe
-/// type is supported, stamp `lastTestAt`. Called by `lakehouse-api`'s
-/// `connector_probe` module AFTER it has actually attempted (or declined to
-/// attempt, for an unsupported type) a dial — this function never decides
-/// `ok`/`supported` itself, only records what the caller measured.
+/// type is supported, stamp `lastTestAt` and append a
+/// [`crate::connector_probe_result::ConnectorProbeResult`] history row.
+/// Called by `lakehouse-api`'s `connector_probe` module AFTER it has
+/// actually attempted (or declined to attempt, for an unsupported type) a
+/// dial — this function never decides `ok`/`supported` itself, only
+/// records what the caller measured.
 ///
 /// `health` is updated to `"healthy"`/`"unhealthy"` only when `supported`
 /// is `true` — an unsupported type's last-known health is left untouched,
 /// since declining to test a connector is not evidence about whether it is
 /// healthy. `last_test_at` follows the same rule and for the same reason:
 /// an unsupported probe type was never actually dialed, so it must not
-/// claim a test time it does not have (WS1 finding J19).
+/// claim a test time it does not have (WS1 finding J19). The history row
+/// follows the exact same rule: an unsupported probe has no outcome to
+/// record, so no row is written for one.
+///
+/// The current-state `connector` UPDATE and the history insert-and-trim
+/// both run inside ONE transaction, committed together: the history row's
+/// `tested_at` is bound to the SAME value the `UPDATE ... RETURNING`
+/// produced (never a second `now()` call), so `connector.last_test_at` and
+/// the newest `connector_probe_result` row can never disagree about when
+/// the last supported probe ran.
+///
+/// `message` is stored exactly as given. `connector_probe`'s module doc
+/// comment ("Error messages never echo upstream data") guarantees every
+/// value this function is ever called with is one of a small set of fixed
+/// failure classes, the resolver's own refusal text, or a caller-supplied
+/// config-shape complaint — never raw upstream `Display` text — and
+/// `POST .../test` already returns this same string to the same
+/// `connector:manage` caller this history is later read back by, so
+/// recording it adds no new exposure.
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::NotFound`] if `id` does not name a connector, or
-/// [`StoreError::Database`] on any other failure.
+/// Returns [`StoreError::NotFound`] if `id` does not name a connector (in
+/// which case nothing is written), or [`StoreError::Database`] on any
+/// other failure.
 pub async fn record_test_result(
     pool: &PgPool,
     id: &str,
@@ -832,6 +853,7 @@ pub async fn record_test_result(
     latency_ms: Option<i64>,
     message: &str,
 ) -> Result<ConnectorTestResult, StoreError> {
+    let mut tx = pool.begin().await?;
     let sql = "UPDATE connector SET last_test_at = CASE WHEN $2 THEN now() ELSE last_test_at END, \
                health = CASE WHEN $2 THEN (CASE WHEN $3 THEN 'healthy' ELSE 'unhealthy' END) ELSE \
                health END WHERE id = $1 RETURNING last_test_at";
@@ -839,11 +861,26 @@ pub async fn record_test_result(
         .bind(id)
         .bind(supported)
         .bind(ok)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
     let Some((tested_at,)) = row else {
         return Err(StoreError::NotFound);
     };
+
+    if supported {
+        // `tested_at` is `Some` whenever `supported` is `true` -- the
+        // `UPDATE`'s own `CASE WHEN $2 THEN now() ...` guarantees it, so
+        // this `if let` never silently skips a history row for a
+        // supported probe.
+        if let Some(tested_at) = tested_at {
+            crate::connector_probe_result::insert_and_trim(
+                &mut tx, id, tested_at, ok, latency_ms, message,
+            )
+            .await?;
+        }
+    }
+
+    tx.commit().await?;
     Ok(ConnectorTestResult {
         ok,
         supported,

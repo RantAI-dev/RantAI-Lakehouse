@@ -52,6 +52,29 @@ export type ConnectorTestResult = {
   testedAt: string | null
 }
 
+/**
+ * One row of `GET /api/connectors/{id}/probe-history` — a past connectivity
+ * probe's outcome. Distinct from `Connector.lastTestAt`/`health` (current
+ * state, unchanged by reading this): this is HISTORY, per-connector,
+ * newest first, bounded to the most recent 200 rows — see
+ * `rust/migrations/0044_connector_probe_result.sql`. Only ever contains
+ * SUPPORTED probes (an unsupported probe never dialed anything, so it has
+ * no outcome to record).
+ */
+export type ConnectorProbeResult = {
+  /** ISO 8601. */
+  testedAt: string
+  ok: boolean
+  /** Real measured latency in milliseconds, or `null` if the dial attempt never completed. */
+  latencyMs: number | null
+  message: string
+}
+
+export type ProbeHistoryResponse = {
+  /** Newest first. */
+  results: ConnectorProbeResult[]
+}
+
 export type CreateConnectorInput = {
   name: string
   type: string
@@ -391,4 +414,11 @@ export interface ConnectorService {
     table: string,
     signal?: AbortSignal
   ): Promise<DebeziumProperties>
+  /**
+   * `GET /api/connectors/{id}/probe-history?limit=` — the connector's most
+   * recent connectivity-probe results, newest first. `limit` defaults to
+   * 50 server-side when omitted; the server rejects (never silently
+   * clamps) a `limit` outside `1..=200`.
+   */
+  listProbeHistory(id: string, limit?: number, signal?: AbortSignal): Promise<ProbeHistoryResponse>
 }
