@@ -10,8 +10,9 @@
 //!
 //! Each test asserts the exact request shape (method, path, and — where
 //! it matters to the behavior under test — body) `Lakekeeper` actually
-//! receives, not merely that the call returned `Ok`, per WS8 plan Task
-//! B2's requirement. The "no POST mock registered" tests additionally
+//! receives, not merely that the call returned `Ok` — a mock that only
+//! checks the return value would not catch a wrong grant payload reaching
+//! `Lakekeeper`. The "no POST mock registered" tests additionally
 //! rely on `wiremock`'s own unmatched-request panic on `MockServer` drop
 //! to prove the client never attempts a call it should have skipped.
 

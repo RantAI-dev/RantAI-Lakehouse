@@ -157,7 +157,7 @@ async fn set_status_moves_a_draft_pipeline_to_ready(pool: PgPool) -> sqlx::Resul
     Ok(())
 }
 
-// ── WS8 plan Task C3: tenant-scoped list, Hard Requirement 2 ───────────
+// ── Tenant-scoped list: tenant isolation ────────────────────────────────
 
 /// Minimal valid input for [`create_tenant`], varying only `slug` (unique).
 fn tenant_input(slug: &str) -> CreateTenantInput {
@@ -179,8 +179,9 @@ fn named_input(name: &str) -> CreatePipelineInput {
     }
 }
 
-/// Assign a pipeline to a tenant. No store function does this yet
-/// (`assign_pipeline_tenant` is WS8 plan Task C7, not this task) — a
+/// Assign a pipeline to a tenant. Written before
+/// `assign_tenant` (this module's own store function for that write)
+/// existed — a
 /// direct, bound `UPDATE` is the only way this test can set up a
 /// tenant-scoped fixture today, matching `0042_tenant_provisioning.sql`'s
 /// own column exactly (nullable `pipeline_definition.tenant_id`).
@@ -193,18 +194,18 @@ async fn set_pipeline_tenant(pool: &PgPool, pipeline_id: &str, tenant_id: Uuid) 
         .unwrap();
 }
 
-/// WS8 plan Task C3, Step 1 (TDD): written and run BEFORE `PipelineFilter`
-/// existed. The real Step 1 failure this produced (`PipelineFilter`
-/// stripped, `list_pipelines` reverted to its pre-Task-C3 one-arg
-/// signature):
+/// Written and run BEFORE `PipelineFilter`
+/// existed, as a failing test first. The real failure this produced
+/// (`PipelineFilter` stripped, `list_pipelines` reverted to its
+/// one-arg signature):
 ///
 /// ```text
 /// error[E0433]: failed to resolve: could not find `PipelineFilter` in `pipelines`
 /// error[E0061]: this function takes 1 argument but 2 arguments were supplied
 /// ```
 ///
-/// Hard Requirement 2's own wording: a specific second tenant's row must
-/// be asserted ABSENT, never merely "the list is shorter" or "non-empty."
+/// Tenant isolation requires asserting a specific second tenant's row
+/// ABSENT, never merely "the list is shorter" or "non-empty."
 #[sqlx::test(migrations = "../../migrations")]
 async fn list_pipelines_filtered_by_tenant_excludes_another_tenants_row(
     pool: PgPool,
@@ -247,7 +248,7 @@ async fn list_pipelines_filtered_by_tenant_excludes_another_tenants_row(
 }
 
 /// Fail closed: a pipeline whose `tenant_id` column is `NULL` (unassigned
-/// — every pipeline created before Task C7 lands, per
+/// — every pipeline created before it is assigned a tenant, per
 /// `0042_tenant_provisioning.sql`'s own header comment) must never appear
 /// in ANY tenant-scoped list.
 #[sqlx::test(migrations = "../../migrations")]

@@ -67,7 +67,7 @@ fn required(field: &str, value: &str) -> Result<String, ApiError> {
 /// `GET /api/connectors` — every connector visible to the caller's active
 /// tenant.
 ///
-/// # Tenant scoping (WS8 plan Task C2, Hard Requirement 2)
+/// # Tenant scoping
 ///
 /// `tenant_scope::resolve` runs first, fail closed: a principal belonging
 /// to zero tenants (`Ok(None)`) gets an EMPTY list, returned before the
@@ -1056,15 +1056,14 @@ pub struct AssignTenantBody {
 /// A connector's tenant is a governance decision (who is allowed to see
 /// and manage this row), made independently of whoever defined its dial
 /// config, and worth its own explicit audit trail entry rather than being
-/// folded into an unrelated create/update diff (WS8 plan Task C6, P2 fix
-/// — see the module the plan's Task C6 section names).
+/// folded into an unrelated create/update diff.
 ///
 /// # Why this exists at all
 ///
 /// `0042_tenant_provisioning.sql` backfills `tenant_id` on only the two
 /// connector rows `0022_prune_connector_seed.sql` seeds — every connector a
 /// real deployment creates afterward starts `tenant_id = NULL` and is
-/// invisible to `GET /api/connectors`'s tenant-scoped read (Task C2) until
+/// invisible to `GET /api/connectors`'s tenant-scoped read until
 /// assigned. This route is how an operator closes that gap, rather than
 /// leaving it disclosed only in a migration comment nobody reading the API
 /// ever sees.
@@ -1785,7 +1784,7 @@ mod tests {
         assert!(result.is_none());
     }
 
-    // ── WS8 plan Task C2: `GET /api/connectors` tenant scoping ─────────
+    // ── `GET /api/connectors` tenant scoping ────────────────────────────
 
     fn principal_with_tenants(tenant_ids: &[Uuid]) -> Principal {
         Principal {
@@ -1806,7 +1805,7 @@ mod tests {
         headers
     }
 
-    /// Hard Requirement 2: a principal that belongs to zero tenants gets
+    /// A principal that belongs to zero tenants gets
     /// an EMPTY list — never `403`/`404`, and never every tenant's rows.
     /// `state_without_pool()` proves this is returned BEFORE the store is
     /// ever queried: reaching `pool(&state)?` here would 503, not 200 with
@@ -1855,7 +1854,7 @@ mod tests {
         assert_eq!(err.0.status(), 404);
     }
 
-    /// `PUT /api/connectors/{id}/tenant` — WS8 plan Task C6, P2 fix.
+    /// `PUT /api/connectors/{id}/tenant` route tests.
     mod assign_tenant_route {
         use lakehouse_store::identity::{self, CreateTenantInput};
 

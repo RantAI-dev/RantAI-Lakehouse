@@ -950,8 +950,9 @@ fn tenant_input(slug: &str) -> CreateTenantInput {
     }
 }
 
-/// Assign a connector to a tenant. No store function does this yet
-/// (`assign_connector_tenant` is WS8 plan Task C6, not this task) — a
+/// Assign a connector to a tenant. Written before
+/// `assign_tenant` (this module's own store function for that write)
+/// existed — a
 /// direct, bound `UPDATE` is the only way this test can set up a
 /// tenant-scoped fixture today, matching `0042_tenant_provisioning.sql`'s
 /// own column exactly (nullable `connector.tenant_id`).
@@ -964,18 +965,18 @@ async fn set_connector_tenant(pool: &PgPool, connector_id: &str, tenant_id: Uuid
         .unwrap();
 }
 
-/// WS8 plan Task C2, Step 1 (TDD): written and run BEFORE `ConnectorFilter`
-/// existed. The real Step 1 failure this produced (`ConnectorFilter`
-/// stripped, `list_connectors` reverted to its pre-Task-C2 one-arg
-/// signature):
+/// Written and run BEFORE `ConnectorFilter`
+/// existed, as a failing test first. The real failure this produced
+/// (`ConnectorFilter` stripped, `list_connectors` reverted to its
+/// one-arg signature):
 ///
 /// ```text
 /// error[E0433]: failed to resolve: could not find `ConnectorFilter` in `connectors`
 /// error[E0061]: this function takes 1 argument but 2 arguments were supplied
 /// ```
 ///
-/// Hard Requirement 2's own wording: a specific second tenant's row must
-/// be asserted ABSENT, never merely "the list is shorter" or "non-empty."
+/// Tenant isolation requires asserting a specific second tenant's row
+/// ABSENT, never merely "the list is shorter" or "non-empty."
 #[sqlx::test(migrations = "../../migrations")]
 async fn list_connectors_filtered_by_tenant_excludes_another_tenants_row(
     pool: PgPool,

@@ -74,7 +74,8 @@ pub struct ListQuery {
     q: Option<String>,
 }
 
-// ── WS8 plan Task C0 (judge review revision 2 Q1) — CATALOG_TENANT_ID ──
+// ── CATALOG_TENANT_ID: this deployment's single shared, no-tenant-column
+//    catalog and Dagster-job list ──────────────────────────────────────
 //
 // `bronze_meta.dataset_catalog` (six columns: slug, title, description,
 // tier, updated_at, table_name — verified in `demo/clickhouse/04_registry.sql`
@@ -82,29 +83,28 @@ pub struct ListQuery {
 // tenant/connector reference at all — a Postgres migration cannot add a
 // column to this ClickHouse table, and deriving ownership from a
 // connector's `source_objects[].target` would tie this route's isolation
-// guarantee to a still-in-review WS3 schema this plan has no authority to
-// pin down. An optional `CATALOG_TENANT_ID` setting lets the operator
+// guarantee to a connector schema not owned by this table. An optional
+// `CATALOG_TENANT_ID` setting lets the operator
 // state which tenant owns this deployment's single shared catalog; a
 // principal in that tenant sees it, everyone else gets an honest refusal
 // instead of either every tenant's datasets (a leak) or a blank catalog
-// for every seeded role (the first plan draft's over-broad fix — judge
-// review revision 2 Q1).
+// for every seeded role (which would silently hide the catalog from
+// its own owning tenant too).
 //
-// **Judge amendment (this task, not the original plan text):** the same
-// rule also gates the `Dagster`-job half of `GET /api/pipelines`
+// The same rule also gates the `Dagster`-job half of `GET /api/pipelines`
 // (`routes::pipelines::list`, via [`catalog_tenant_refusal`] below).
 // `0042_tenant_provisioning.sql` gives `tenant_id` to `connector` and
 // `pipeline_definition` only — a `Dagster` code location is, like this
-// catalog, one per deployment with no tenant column anywhere, so C3's
-// prior "leave the Dagster half unscoped, with a disclosure comment"
-// posture is the exact shape this review's P1 rejected for the catalog: a
+// catalog, one per deployment with no tenant column anywhere, so leaving
+// the Dagster half unscoped with only a disclosure comment would repeat
+// the same leak this route exists to close: a
 // shared, un-tenanted resource visible to every tenant "with a
 // disclosure." One setting, one rule, applied to both surfaces.
 
 /// Refusal reason when `CATALOG_TENANT_ID` is configured but the caller
 /// does not belong to it.
 const CATALOG_TENANT_REFUSAL_NOT_OWNER: &str = "this deployment's shared catalog is owned by the tenant named in \
-     CATALOG_TENANT_ID; the caller does not belong to it (WS8 plan Task C0)";
+     CATALOG_TENANT_ID; the caller does not belong to it";
 
 /// Refusal reason when `CATALOG_TENANT_ID` is unset and more than one
 /// tenant exists — the same honest gap the first draft of this task
@@ -114,7 +114,7 @@ const CATALOG_TENANT_REFUSAL_UNCONFIGURED: &str = "per-dataset tenant ownership 
      (six columns: slug, title, description, tier, updated_at, table_name — \
      no tenant/connector reference), and CATALOG_TENANT_ID is not set; catalog \
      and Dagster-job reads are refused for a non-platform-admin principal \
-     while more than one tenant exists (WS8 plan Task C0) — set \
+     while more than one tenant exists — set \
      CATALOG_TENANT_ID to the id of the tenant that owns this deployment's \
      shared catalog to restore access for its members";
 
@@ -176,9 +176,9 @@ pub(crate) async fn catalog_tenant_refusal(
     let Some(catalog_tenant_id) = state.config.catalog_tenant_id else {
         return Ok(Some(CATALOG_TENANT_REFUSAL_UNCONFIGURED));
     };
-    // Reuses Task C1's resolver so "which tenant is this caller acting
+    // Reuses `tenant_scope::resolve` so "which tenant is this caller acting
     // as" is answered exactly once, the same way, everywhere in this
-    // plan — never a second, catalog-specific notion of "active tenant."
+    // service — never a second, catalog-specific notion of "active tenant."
     let active = crate::tenant_scope::resolve(principal, headers)?;
     Ok((active != Some(catalog_tenant_id)).then_some(CATALOG_TENANT_REFUSAL_NOT_OWNER))
 }
@@ -188,7 +188,7 @@ pub(crate) async fn catalog_tenant_refusal(
 /// (or, when Postgres is configured, whose annotation `description`/`tags`)
 /// contain the term.
 ///
-/// # Tenant scoping (WS8 plan Task C0)
+/// # Tenant scoping
 ///
 /// [`catalog_tenant_refusal`] runs first — see its doc comment and the
 /// module comment above it. A refusal returns `200` with `supported:
@@ -902,7 +902,7 @@ fn build_namespaces(assets: &[Value]) -> Vec<Value> {
 /// `GET /api/catalog/{id}` — one asset's metadata, schema, and a data
 /// sample.
 ///
-/// # Tenant scoping (WS8 plan Task C0)
+/// # Tenant scoping
 ///
 /// Applies the exact same [`catalog_tenant_refusal`] gate as [`list`] —
 /// see its doc comment.
@@ -2143,9 +2143,10 @@ mod tests {
         assert!(matches!(err, ApiError::BadRequest(msg) if msg == "body must be JSON"));
     }
 
-    // ── WS8 plan Task C0 (judge review revision 2 Q1): CATALOG_TENANT_ID
+    // ── CATALOG_TENANT_ID
     // gates GET /api/catalog and GET /api/catalog/{id} to the shared
-    // catalog's owning tenant. Six cases, one per judge-review bullet.
+    // catalog's owning tenant. Six cases covering each branch of
+    // catalog_tenant_refusal above.
     mod tenant_scoping {
         #![allow(clippy::unwrap_used, clippy::expect_used)]
 

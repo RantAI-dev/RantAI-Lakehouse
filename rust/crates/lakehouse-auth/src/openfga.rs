@@ -5,8 +5,7 @@
 //!
 //! # Why this file is named `openfga.rs` but contains no `OpenFGA` client
 //!
-//! The grand plan and this plan's own brief both name this path. Verified
-//! before writing a line of it (WS8 plan Correction 3): `grep -rn
+//! Verified before writing a line of it: `grep -rn
 //! "openfga" rust/crates/*/src/**/*.rs` across this whole workspace
 //! returns zero hits, and every grant this build has ever made —
 //! `docker-compose.yml`'s `lakekeeper-authz-init` job — goes through
@@ -15,11 +14,9 @@
 //! or HTTP API. `LAKEKEEPER__AUTHZ_BACKEND: openfga`
 //! (`docker-compose.yml:348,539`) makes `OpenFGA` `Lakekeeper`'s *internal*
 //! store, invisible to every caller outside `Lakekeeper` itself. This
-//! module is that `Lakekeeper`-facing client — the file path stays as
-//! directed so a reader following the grand plan's own cross-references
-//! finds it where promised; its actual contents match what this
-//! codebase's one proven grant mechanism (the `lakekeeper-authz-init`
-//! shell script in `docker-compose.yml`) does.
+//! module is that `Lakekeeper`-facing client; its actual contents match
+//! what this codebase's one proven grant mechanism (the
+//! `lakekeeper-authz-init` shell script in `docker-compose.yml`) does.
 //!
 //! # Credential handling
 //!
@@ -53,9 +50,10 @@ use crate::secret::Secret;
 
 /// The five machine principals every provisioned warehouse needs granted
 /// onto it so the stack's existing services can actually read/write a
-/// new tenant's data — see the module doc comment and WS8 plan
-/// Correction 4 for why this is a fixed list, not the calling user's own
-/// identity. Matches `docker-compose.yml`'s `lakekeeper-authz-init`
+/// new tenant's data — see the module doc comment for why this is a
+/// fixed list, not the calling user's own identity: these are the
+/// service accounts every warehouse needs regardless of who provisioned
+/// it. Matches `docker-compose.yml`'s `lakekeeper-authz-init`
 /// `grant()` calls exactly (verb sets included).
 const MACHINE_GRANTS: &[(&str, &[&str])] = &[
     ("rust-iceberg", &["create", "modify", "select"]),

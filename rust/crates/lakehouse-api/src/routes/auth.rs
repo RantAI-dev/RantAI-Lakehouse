@@ -214,7 +214,7 @@ struct MeResponse {
     /// Structured `{id, name, slug}` view of every tenant the caller
     /// belongs to — slim subset of `lakehouse_store::identity::Tenant`,
     /// just enough for a tenant-switcher to render a label without
-    /// re-fetching the row (WS8 §Phase F). Empty for a service principal
+    /// re-fetching the row. Empty for a service principal
     /// (no `tenant_ids`) or when the follow-up read fails — same
     /// fail-soft posture as `email`/`roles` above.
     tenants: Vec<identity::TenantSummary>,
@@ -289,9 +289,10 @@ pub async fn me(
 /// single unit-test target — rather than a second conditional in the
 /// query path that an integration test would only catch by accident.
 ///
-/// Admin-vs-own is decided by `principal.has("identity:sessions:manage")`,
-/// per WS8 plan §Phase D Hard Requirement 4's own phrasing ("lists only
-/// the caller's own sessions unless..."): the route-level policy is
+/// Admin-vs-own is decided by `principal.has("identity:sessions:manage")`:
+/// this route lists only the caller's own sessions unless the caller holds
+/// that permission, in which case it lists every live session in the
+/// deployment. The route-level policy is
 /// `Policy::RequiresAuth` (every authenticated caller can hit it), and
 /// the fine-grained check lives in the handler so the same permission
 /// string covers any future endpoint that needs the same split without
@@ -364,10 +365,10 @@ pub async fn sessions(
 /// may revoke only their own.
 ///
 /// The route never tells a caller which of "your session",
-/// "another user's session", and "no such session" they hit — Hard
-/// Requirement 4 ("never reveals whether another user's session id
-/// exists"). All three collapse to the same 404 with the same body, so
-/// the route is not an enumeration oracle (WS8 §Phase D):
+/// "another user's session", and "no such session" they hit — it never
+/// reveals whether another user's session id exists. All three collapse
+/// to the same 404 with the same body, so
+/// the route is not an enumeration oracle:
 ///
 /// * A foreign id (someone else's session, caller is not admin) and a
 ///   missing id both arrive at [`lakehouse_store::sessions::revoke_session_as_caller`]
@@ -417,14 +418,14 @@ pub async fn revoke_session(
         .await
         .map_err(StoreError::from)?;
 
-    // audit_event row mirrors WS5's audit schema — `outcome = "executed"`
+    // audit_event row mirrors 0024_audit_event.sql's schema — `outcome = "executed"`
     // per `audit_event_outcome_check` (0024_audit_event.sql). `resource_id`
     // is the request path's `{id}` (the session row's UUID, never the
     // caller's bearer token — the token is not yet validated at this
     // point and the route never sees it). Best-effort: a failed audit
     // write is logged and swallowed, never propagated, so the response
     // code on the wire is always the underlying revoke's, not the
-    // audit's (WS8 §Phase G).
+    // audit's.
     let audit_event = session_revoke_audit_event(&principal, session_id);
     if let Err(err) = store_audit::insert(pool, audit_event).await {
         tracing::warn!(
@@ -513,7 +514,7 @@ pub async fn change_password(
 /// check but is the check that actually matters: this server issues the
 /// redirect, the client-side one is only UX.
 ///
-/// # Why a leading-`/` check alone is not enough (P3 fix)
+/// # Why a leading-`/` check alone is not enough
 ///
 /// `path.starts_with('/') && !path.starts_with("//")` alone still admits
 /// `/\evil.invalid` — several browsers normalize a backslash toward a
@@ -835,7 +836,7 @@ pub async fn oidc_callback(
     };
     // `AuthState::oidc` is `Some` only when `OIDC_ISSUER`/`OIDC_CLIENT_ID`
     // are both set (`state::oidc_config`), the same invariant `oidc_start`
-    // relies on for `client_id` (see its P3 fix comment) — reading it the
+    // relies on for `client_id` — reading it the
     // same fail-closed way here, rather than sending an empty
     // `client_id` to the token endpoint.
     let Some(client_id) = state.config.oidc_client_id.as_deref() else {
@@ -908,15 +909,14 @@ pub async fn oidc_callback(
     let token =
         session::create_session(pool, user_id, session::DEFAULT_SESSION_TTL, None, None).await?;
 
-    // audit_event row mirrors WS5's audit schema — `outcome = "executed"`
+    // audit_event row mirrors 0024_audit_event.sql's schema — `outcome = "executed"`
     // per `audit_event_outcome_check` (0024_audit_event.sql).
     // `resource_id` is intentionally `None` here: the session row's own
     // id is not yet known without a second `SELECT` keyed on the hash,
     // which this task does not add for a login-audit line that already
     // carries `principal_id`. Best-effort: a failed audit write is
     // logged and swallowed, never propagated, so the response on the
-    // wire is always the underlying login's, not the audit's (WS8
-    // §Phase G).
+    // wire is always the underlying login's, not the audit's.
     let audit_event = oidc_login_audit_event(&principal, user_id);
     if let Err(err) = store_audit::insert(pool, audit_event).await {
         tracing::warn!(
@@ -1085,8 +1085,8 @@ mod tests {
     /// Same idiom `routes::gold::tests::state_without_pool` uses: an
     /// unreachable-but-well-formed `DATABASE_URL` (never actually
     /// dialled — `lakehouse_store::connect_lazy` performs no I/O, see
-    /// its own doc comment) plus every `OIDC_*` flow-config var Task A4
-    /// needs, so `AppState::new` boots with `auth.oidc` populated
+    /// its own doc comment) plus every `OIDC_*` flow-config var
+    /// `oidc_start` needs, so `AppState::new` boots with `auth.oidc` populated
     /// without a real Postgres instance or network call.
     fn state_with_oidc_flow_config() -> AppState {
         let mut env = HashMap::new();
@@ -1164,10 +1164,11 @@ mod tests {
 
     #[tokio::test]
     async fn oidc_start_rejects_every_off_origin_or_ambiguous_next_shape() {
-        // P3 fix: the judge review named these four shapes explicitly plus
-        // their percent-encoded forms; each is asserted individually rather
-        // than folded into one loop, so a future regression's failure names
-        // exactly which shape stopped being refused.
+        // These four off-origin/ambiguous `next` shapes, plus their
+        // percent-encoded forms, must all be refused; each is asserted
+        // individually rather than folded into one loop, so a future
+        // regression's failure names exactly which shape stopped being
+        // refused.
         let cases = [
             "https://attacker.invalid/steal", // absolute URL, wrong origin
             "//evil.invalid/steal",           // scheme-relative absolute URL
@@ -1233,9 +1234,9 @@ mod tests {
     #[test]
     fn is_safe_relative_path_rejects_every_p3_named_shape() {
         // Unit-level pin, independent of the full HTTP round trip above —
-        // this is the function the judge review's four named cases (plus
-        // percent-encoded forms, which axum has already decoded by the
-        // time this function runs) must refuse.
+        // this is the function the four named off-origin/ambiguous shapes
+        // above (plus percent-encoded forms, which axum has already
+        // decoded by the time this function runs) must refuse.
         for bad in [
             "https://evil.invalid",
             "//evil.invalid",
@@ -1252,8 +1253,8 @@ mod tests {
         }
     }
 
-    // ── Task A5: `GET /api/auth/oidc/callback` — Step 1 (failing tests,
-    // written before `oidc_callback` exists at all). ──────────────────────
+    // ── `GET /api/auth/oidc/callback` tests, written test-first
+    // (before `oidc_callback` exists at all). ──────────────────────
 
     #[tokio::test]
     async fn oidc_callback_rejects_a_state_mismatch_and_clears_the_flow_cookie() {
@@ -1460,8 +1461,8 @@ mod tests {
             "OIDC_REDIRECT_URI".to_owned(),
             "https://lake.invalid/api/auth/oidc/callback".to_owned(),
         );
-        // Off by default (see `oidc_callback`'s doc comment on the plan's
-        // "JIT provisioning stays off by default" note) — turned on here
+        // Off by default (see `oidc_callback`'s doc comment: JIT
+        // provisioning stays off unless an operator opts in) — turned on here
         // because this test's whole point is a *successful* round trip for
         // a `sub` this deployment has never seen before, which is exactly
         // what JIT provisioning exists for.
@@ -1516,7 +1517,7 @@ mod tests {
         Ok(())
     }
 
-    // ── WS8 §Phase G: `oidc_callback` writes a real `audit_event` row on
+    // ── `oidc_callback` writes a real `audit_event` row on
     // success. Reuses the wiremock round-trip harness above verbatim —
     // the only addition is the post-response SELECT against
     // `audit_event`. ───────────────────────────────────────────────────────
@@ -1616,12 +1617,11 @@ mod tests {
         Ok(())
     }
 
-    // ── Task A6: `GET /api/auth/providers` — Step 1 (failing test, written
-    // before `providers` exists at all). ────────────────────────────────────
+    // ── `GET /api/auth/providers` tests, written test-first
+    // (before `providers` exists at all). ────────────────────────────────────
 
     /// `GET path` against a fresh router built from `state`, decoded as a
-    /// JSON body. The plan's Step 1 snippet names a `get_json` helper that
-    /// does not exist anywhere in this tree (grepped: no hit) — this is a
+    /// JSON body. This is a
     /// local equivalent built from the exact `to_bytes` +
     /// `serde_json::from_slice::<Value>` idiom
     /// `routes::knowledge::tests::every_database_backed_route_returns_503_without_a_pool`
@@ -1672,7 +1672,7 @@ mod tests {
         assert_eq!(body["oidc"], serde_json::json!(false));
     }
 
-    // ── WS8 plan §Phase D, the `GET /api/auth/sessions` routing shape ──────
+    // ── `GET /api/auth/sessions` routing shape ──────
 
     /// A service principal — even one that nominally holds
     /// `identity:sessions:manage` — must yield [`SessionsDecision::Empty`]
@@ -1752,7 +1752,7 @@ mod tests {
         );
     }
 
-    // ── WS8 plan §Phase D, the `DELETE /api/auth/sessions/{id}` routing shape ──
+    // ── `DELETE /api/auth/sessions/{id}` routing shape ──
 
     /// A non-UUID path segment is a 400, not a 404. A malformed id can't
     /// match any row, so 404'ing it would render the same "doesn't
@@ -1784,15 +1784,15 @@ mod tests {
         assert_eq!(
             response.status(),
             StatusCode::BAD_REQUEST,
-            "a non-UUID path must be 400, not 404 — Hard Requirement 4"
+            "a non-UUID path must be 400, not 404 — it must not render the same body as a foreign/missing id"
         );
     }
 
-    /// Hard Requirement 4's two 404 arms (foreign id, missing id) must
-    /// produce byte-equal responses. A future reader who changes the
+    /// The two 404 arms (foreign id, missing id) must
+    /// produce byte-equal responses, so the route never reveals whether
+    /// another user's session id exists. A future reader who changes the
     /// foreign-id message has to consciously change the missing-id
-    /// message too — the route is not an enumeration oracle (WS8
-    /// §Phase D).
+    /// message too — the route is not an enumeration oracle.
     ///
     /// The test does NOT hit the route end-to-end (that needs a real
     /// DB); it constructs both response paths directly. The two paths
@@ -1838,8 +1838,9 @@ mod tests {
     /// "another user's session", and "no such session" — exactly the
     /// same posture as [`SessionsDecision::Empty`] on the list endpoint.
     /// Returning 401/403 here would let a service caller probe the
-    /// difference between "this id exists" and "this id doesn't",
-    /// which is the gap Hard Requirement 4 exists to close.
+    /// difference between "this id exists" and "this id doesn't" — the
+    /// non-enumeration guarantee this route makes exists to close that
+    /// gap.
     ///
     /// Reachable without a pool: the service-principal short-circuit
     /// runs before [`pool`], so `state_without_pool` is the right

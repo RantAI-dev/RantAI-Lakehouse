@@ -72,10 +72,10 @@ fn validate_warehouse(state: &AppState, warehouse: Option<&str>) -> Result<(), A
 }
 
 /// Borrow the Postgres pool, or fail with a 503. Shared by every Postgres-
-/// backed read in this module — the maintenance-policy store (WS2 §4) and,
-/// as of WS8 plan Task C4, the tenant lookup [`warehouses`] needs to scope
-/// its response — hence the generic message, not a maintenance-policy-
-/// specific one that would misdescribe a tenant-lookup failure.
+/// backed read in this module — the maintenance-policy store and the
+/// tenant lookup [`warehouses`] needs to scope its response — hence the
+/// generic message, not a maintenance-policy-specific one that would
+/// misdescribe a tenant-lookup failure.
 fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
     state
         .pg
@@ -425,16 +425,16 @@ async fn maintenance_verb_runs_or_empty(
 /// `GET /api/lakehouse/warehouses` — the caller's tenant's own warehouse,
 /// never every warehouse this deployment happens to know about.
 ///
-/// # Tenant scoping (WS8 plan Task C4, Hard Requirement 2)
+/// # Tenant scoping
 ///
 /// `tenant_scope::resolve` runs first, fail closed: a principal belonging
 /// to zero tenants (`Ok(None)`) gets an EMPTY list, returned before the
 /// Lakekeeper catalog is ever contacted — never "unscoped, show the
 /// deployment's warehouse to everyone."
 ///
-/// # Deviation from the plan's Task C4 pseudocode
+/// # Why this filters a one-warehouse list rather than querying by id
 ///
-/// The plan's Step 1/Step 2 assume `list_warehouses()` is a real,
+/// A naive implementation would assume `list_warehouses()` is a real,
 /// multi-warehouse Lakekeeper `Management API` call this route filters by
 /// id. That is not how this route (or `lakehouse_iceberg::rest::
 /// list_warehouses`, see its own module doc comment) actually works: the
@@ -1627,13 +1627,13 @@ mod tests {
         }
     }
 
-    /// `GET /api/lakehouse/warehouses` tenant scoping — WS8 plan Task C4.
+    /// `GET /api/lakehouse/warehouses` tenant scoping.
     ///
-    /// # Deviation from the plan's Task C4 pseudocode
+    /// # Why these tests don't mock a multi-warehouse Lakekeeper listing
     ///
-    /// The plan's own Step 1 assumes a `mock_lakekeeper_warehouse_list`
-    /// wiremock helper standing in for a real, multi-warehouse Lakekeeper
-    /// `Management API` listing this route filters by id. No such helper
+    /// A `mock_lakekeeper_warehouse_list` wiremock helper standing in for a
+    /// real, multi-warehouse Lakekeeper `Management API` listing this route
+    /// filters by id would be the obvious test shape. No such helper
     /// exists anywhere in this codebase, and could not: `[warehouses]`'s
     /// doc comment (this file, above) and `lakehouse_iceberg::rest::
     /// list_warehouses`'s own module doc comment both establish that this
@@ -1646,7 +1646,7 @@ mod tests {
     /// (`lakehouse-iceberg/tests/g1_lakekeeper.rs`) is `#[ignore]`d and
     /// requires a live `docker compose` stack — building a wiremock stand-
     /// in for the full Iceberg REST protocol is out of scope for this
-    /// task's own file list (`routes/lakehouse.rs` only).
+    /// file (`routes/lakehouse.rs` only).
     ///
     /// These tests instead prove the actual scoping contract the real code
     /// implements: the store-only branches (no tenant, no `warehouse_id`,
@@ -1750,7 +1750,7 @@ mod tests {
                 .expect("create_tenant returns a UUID-shaped id")
         }
 
-        /// Hard Requirement 2: a principal belonging to zero tenants gets
+        /// A principal belonging to zero tenants gets
         /// an EMPTY list, before the store is ever touched —
         /// `state_without_pool()` proves this: reaching `pool(&state)?`
         /// here would 503, not `Ok` with an empty body.

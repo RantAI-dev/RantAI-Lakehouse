@@ -244,7 +244,7 @@ async fn a_seeded_analyst_is_denied_the_maintenance_policy_write() {
 
 /// A seeded Analyst (`sari@meridian.example` — `query:read, catalog:read,
 /// lineage:read`, no `identity:write`) is denied
-/// `POST /api/identity/service-identities/{id}/rotate` (WS8 §Phase E) —
+/// `POST /api/identity/service-identities/{id}/rotate` —
 /// the service-identity rotation endpoint, gated by
 /// `Policy::RequiresPermission("identity:write")`. The two table-driven
 /// loops above cover the zero-permission and Platform-Admin directions
@@ -973,7 +973,7 @@ async fn me_response_returns_structured_tenants_not_bare_uuid_strings() {
     );
 }
 
-// ── WS8 §Phase G: the two non-OIDC admin actions under audit
+// ── The two non-OIDC admin actions under audit
 // (`create_tenant`, `revoke_session`) each write a real `audit_event`
 // row on success. The OIDC-callback audit test lives in
 // `routes/auth.rs::tests` because its wiremock round-trip harness is
@@ -985,7 +985,7 @@ async fn me_response_returns_structured_tenants_not_bare_uuid_strings() {
 /// `POST /api/identity/tenants` writes a `audit_event` row on success
 /// with `action = 'identity.tenant.create'`,
 /// `resource_kind = 'tenant'`, `resource_id = <new tenant's id>`, and
-/// `outcome = 'executed'` (WS8 §Phase G).
+/// `outcome = 'executed'`.
 ///
 /// `spin_up()` does not override `LAKEKEEPER_ADMIN_TOKEN_FILE`, so
 /// `AppState::lakekeeper_admin` is `None` and the route's
@@ -1055,7 +1055,7 @@ async fn create_tenant_writes_an_audit_event_on_success() {
 
 /// `DELETE /api/auth/sessions/{id}` writes a `audit_event` row on
 /// success with `action = 'auth.session.revoke'`, `resource_id` =
-/// the session's UUID, and `outcome = 'executed'` (WS8 §Phase G).
+/// the session's UUID, and `outcome = 'executed'`.
 ///
 /// Two live sessions are minted for the same `app_user.id`: one
 /// carries the cookie that drives the DELETE (so the auth gate

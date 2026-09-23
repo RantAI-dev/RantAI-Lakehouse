@@ -24,7 +24,7 @@ lakehouse-embed = { path = "../lakehouse-embed" }
 lakehouse-llm = { path = "../lakehouse-llm" }
 lakehouse-store = { path = "../lakehouse-store" }
 lakehouse-auth = { path = "../lakehouse-auth" }
-# `routes::auth::oidc_start` (WS8 plan Task A4): PKCE's `code_challenge`
+# `routes::auth::oidc_start`: PKCE's `code_challenge`
 # is `BASE64URL(SHA256(code_verifier))` (RFC 7636 §4.2) and the `lh_oidc_flow`
 # cookie's payload is base64url-encoded JSON — both need these directly,
 # not routed through `lakehouse-auth::token` (whose hashing is SHA-256 of a
@@ -33,9 +33,8 @@ sha2 = { workspace = true }
 base64 = { workspace = true }
 # Builds the IdP authorize-endpoint redirect URL with `Url::query_pairs_mut`
 # rather than hand-formatting a query string — see the workspace `Cargo.toml`
-# entry's comment on why this needed adding (the plan's claim that `url`
-# was already a direct dependency here did not hold against this branch's
-# actual `Cargo.toml`).
+# entry's comment on why this needed adding: it was not already a direct
+# dependency of this crate, only a transitive one via `reqwest`.
 url = { workspace = true }
 # `routes::alerts::ApiFreshnessSource`/`ApiSilenceSource` (WS5 item C1)
 # implement `lakehouse_alerts::FreshnessSource`/`SilenceSource`, both
@@ -135,9 +134,9 @@ tokio = { workspace = true, features = ["test-util"] }
 # actually resolve to a file outside a real base directory to prove
 # anything, not a string containing those characters) — a real `TempDir`
 # per test, auto-removed on drop, never a fixed shared path.
-# `routes::auth`'s Task A5 round-trip test signs a real id token to prove
-# `oidc_callback` calls `OidcAuthenticator::authenticate_with_nonce` (WS8
-# plan Task A3) against a `wiremock` `/jwks` + `/token` pair, the same
+# `routes::auth`'s OIDC callback round-trip test signs a real id token to prove
+# `oidc_callback` calls `OidcAuthenticator::authenticate_with_nonce`
+# against a `wiremock` `/jwks` + `/token` pair, the same
 # harness shape `lakehouse-auth/tests/oidc.rs` already uses for that
 # authenticator directly — `jsonwebtoken` is already a workspace
 # dependency (root `Cargo.toml`); `rsa` is not (it is a direct dependency

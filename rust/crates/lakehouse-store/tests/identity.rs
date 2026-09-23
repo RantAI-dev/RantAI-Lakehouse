@@ -572,11 +572,11 @@ async fn seed_is_idempotent_when_applied_twice(pool: PgPool) -> sqlx::Result<()>
     Ok(())
 }
 
-/// WS8 plan Phase B, Task B1 (migration `0042_tenant_provisioning.sql`,
-/// renumbered from the plan's `0040` — see that file's why-header): a
+/// Migration `0042_tenant_provisioning.sql` (see that file's why-header): a
 /// tenant seeded by `0002_seed_identity.sql` predates provisioning
-/// entirely, so it must land on `not_applicable`, never `complete` — the
-/// P2 fix's whole point is that nothing was actually provisioned for it.
+/// entirely, so it must land on `not_applicable`, never `complete` —
+/// `complete` would claim a completion that never happened, since nothing
+/// was actually provisioned for it.
 #[sqlx::test(migrations = "../../migrations")]
 async fn seeded_tenant_is_grandfathered_not_applicable_not_complete(
     pool: PgPool,
@@ -589,7 +589,7 @@ async fn seeded_tenant_is_grandfathered_not_applicable_not_complete(
     Ok(())
 }
 
-/// The P2 fix backfills exactly the two connector rows
+/// `0042_tenant_provisioning.sql` backfills exactly the two connector rows
 /// `0022_prune_connector_seed.sql` seeds, and no others, to the seed
 /// tenant id.
 #[sqlx::test(migrations = "../../migrations")]
@@ -630,10 +630,10 @@ async fn no_pipeline_definition_row_is_backfilled_because_none_are_seeded(
     Ok(())
 }
 
-// ── WS8 plan §Phase E (Hard Requirement 5): rotate_service_identity ─────
+// ── rotate_service_identity: old credential revocation ──────────────────
 
-/// Seed a `service_identity` row exactly the shape the plan's `seed_*`
-/// helpers produce (name + scopes + environment + future expiry +
+/// Seed a `service_identity` row exactly the shape a freshly created one
+/// takes (name + scopes + environment + future expiry +
 /// `rotation_status = 'current'`), so the rotate tests' input matches what
 /// production seeding would create. The `name` is suffixed with a fresh
 /// `Uuid` because `#[sqlx::test]` runs every test in the same binary in
@@ -700,7 +700,7 @@ async fn rotate_returns_the_new_secret_and_persists_its_hash(pool: PgPool) -> sq
     Ok(())
 }
 
-/// Hard Requirement 5 — "old credential's fate": every previously-unrevoked
+/// The old credential's fate: every previously-unrevoked
 /// credential for the identity must be `revoked_at` non-NULL once rotation
 /// succeeds, and the freshly inserted credential must be the only
 /// `revoked_at IS NULL` row for this identity.
@@ -808,8 +808,8 @@ async fn rotate_resets_expires_at_to_a_fresh_window_and_status_to_current(
 ) -> sqlx::Result<()> {
     let identity_id = seed_service_identity(&pool, "ingestion-worker").await?;
 
-    // Drive the seeded identity into the "about to expire" shape the plan's
-    // `seed_service_identity_expiring_soon` would — already past its
+    // Drive the seeded identity into an "already expired" shape by hand —
+    // already past its
     // expiry. The post-rotation row must come back with `expires_at > now()
     // + 29 days` regardless of where it was.
     sqlx::query(

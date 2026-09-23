@@ -54,7 +54,7 @@ impl IntoResponse for ApiRejection {
 /// The result type every route handler returns.
 pub type ApiResult<T> = Result<T, ApiRejection>;
 
-/// A fixed 503 for `POST /api/identity/tenants` (WS8 plan Task B4) when a
+/// A fixed 503 for `POST /api/identity/tenants` when a
 /// call into Lakekeeper's management API fails.
 ///
 /// Matches this crate's existing `ApiError::unauthorized()`/

@@ -134,18 +134,18 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/embed/data",                   Policy::Public),
     ("GET",  "/api/public/dashboard/{token}",     Policy::Public),
     ("POST", "/api/auth/login",                   Policy::Public),
-    // WS8 plan Task A4: redirect-only, grants nothing — it only ever
+    // Redirect-only, grants nothing — it only ever
     // 302s to a fixed, config-sourced IdP URL and sets a single-use flow
     // cookie. Mirrors `/api/auth/login`'s existing `Policy::Public`.
     ("GET",  "/api/auth/oidc/start",              Policy::Public),
-    // WS8 plan Task A5: unauthenticated by necessity — the caller has no
+    // Unauthenticated by necessity — the caller has no
     // session at this point in the login flow. Every verification gap
     // (missing/expired flow cookie, `state` mismatch, failed token
     // exchange, failed id-token verification) fails closed to 401 inside
     // the handler itself; this route grants nothing on its own, same as
     // `/api/auth/oidc/start` above.
     ("GET",  "/api/auth/oidc/callback",           Policy::Public),
-    // WS8 plan Task A6: unauthenticated by necessity — the login page
+    // Unauthenticated by necessity — the login page
     // calls this before any session exists to decide whether to render an
     // SSO button. It exposes only a boolean and an operator-chosen label
     // (`OIDC_PROVIDER_NAME`), never a secret or the issuer/client id
@@ -157,14 +157,14 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/auth/logout",                  Policy::RequiresAuth),
     ("GET",  "/api/auth/me",                      Policy::RequiresAuth),
     ("POST", "/api/auth/change-password",         Policy::RequiresAuth),
-    // WS8 plan §Phase D: route-level `Policy::RequiresAuth` is coarse —
+    // Route-level `Policy::RequiresAuth` is coarse —
     // every authenticated caller may list their own sessions. The
     // `identity:sessions:manage` split (own vs. every live session in
-    // the deployment) lives in `routes::auth::sessions` itself, per the
-    // plan's "Hard Requirement 4" phrasing ("lists only the caller's own
-    // sessions unless..."); see `routes::auth::SessionsDecision`.
+    // the deployment) lives in `routes::auth::sessions` itself: it lists
+    // only the caller's own sessions unless the caller holds
+    // `identity:sessions:manage`; see `routes::auth::SessionsDecision`.
     ("GET",  "/api/auth/sessions",                Policy::RequiresAuth),
-    // WS8 plan §Phase D: revoke a single live session by id. Same floor
+    // Revoke a single live session by id. Same floor
     // as the list route — every authenticated caller may hit this, and
     // the admin-vs-own split (`identity:sessions:manage` holders revoke
     // any session; everyone else revokes only their own) lives inside
@@ -314,8 +314,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/pipelines/{id}/resume",            Policy::RequiresPermission("pipeline:write")),
     ("POST", "/api/pipelines/runs/{runId}/cancel",    Policy::RequiresPermission("pipeline:write")),
     ("POST", "/api/pipelines/runs/{runId}/retry",     Policy::RequiresPermission("pipeline:write")),
-    // WS8 plan Task C7 (P2 fix): same posture as the connector assignment
-    // route above — `identity:write`, not `pipeline:write`.
+    // Same posture as the connector tenant-assignment route below —
+    // `identity:write`, not `pipeline:write`: this is a governance
+    // decision about who may see the row, not a pipeline-operation grant.
     ("PUT",  "/api/pipelines/{id}/tenant",            Policy::RequiresPermission("identity:write")),
 
     // ── Dashboard: seeded Dashboard Viewer permission `dashboard:read`.
@@ -368,7 +369,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/identity/tenants",                Policy::RequiresPermission("identity:write")),
     ("GET",  "/api/identity/service-identities",     Policy::RequiresPermission("identity:read")),
     ("POST", "/api/identity/service-identities",     Policy::RequiresPermission("identity:write")),
-    // WS8 plan §Phase E (Hard Requirement 5): rotation is a write-side
+    // Rotation is a write-side
     // identity-domain operation — reuses `identity:write` exactly the same
     // way every other service-identity write does above, per AGENTS.md rule
     // 4 (no new permission token minted for a route that already has a
@@ -426,7 +427,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // a READER of `/ingestible`/`ingest-spec`, it never calls this route
     // itself (WS3 item 29).
     ("POST", "/api/connectors/{id}/ingest/run", Policy::RequiresPermission("connector:manage")),
-    // WS8 plan Task C6 (P2 fix): the tenant-assignment route. `identity:
+    // The tenant-assignment route. `identity:
     // write`, not `connector:manage` — this is a governance decision about
     // WHO may see the row, the same permission every other tenant-
     // membership write already requires (`POST /api/identity/tenants`
@@ -607,13 +608,15 @@ mod tests {
 
     #[test]
     fn exactly_seven_public_entries_exist() {
-        // Pre-existing drift found while landing Task A6: this assertion
-        // was still pinned at 4 even though Tasks A4/A5 had already grown
-        // POLICY_TABLE's `Policy::Public` block to 6 entries (this test was
-        // failing — `left: 6, right: 4` — before this commit's `/api/auth/
-        // providers` addition made it `left: 7`). Fixed here rather than
-        // left broken, per AGENTS.md rule 2 ("never weaken a test... if a
-        // test is wrong, fix it and say why").
+        // Pre-existing drift found while landing the `/api/auth/providers`
+        // route: this assertion was still pinned at 4 even though the two
+        // earlier OIDC public routes (`/api/auth/oidc/start`,
+        // `/api/auth/oidc/callback`) had already grown POLICY_TABLE's
+        // `Policy::Public` block to 6 entries (this test was failing —
+        // `left: 6, right: 4` — before this commit's `/api/auth/providers`
+        // addition made it `left: 7`). Fixed here rather than left broken,
+        // per AGENTS.md rule 2 ("never weaken a test... if a test is
+        // wrong, fix it and say why").
         let public_count = POLICY_TABLE
             .iter()
             .filter(|(_, _, policy)| *policy == Policy::Public)

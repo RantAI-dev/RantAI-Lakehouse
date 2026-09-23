@@ -1,6 +1,7 @@
-//! `X-Tenant`-scoping, fail closed. See the module's callers in Phase C
-//! (`routes::connectors`, `routes::pipelines`, `routes::lakehouse` — Tasks
-//! C2/C3/C4) and WS8 plan Hard Requirement 2.
+//! `X-Tenant`-scoping, fail closed. See the module's callers
+//! (`routes::connectors`, `routes::pipelines`, `routes::lakehouse`): a
+//! principal belonging to zero tenants must get an empty list, never a
+//! 403 that would confirm a tenant exists.
 //!
 //! # The rule, in one sentence
 //!
@@ -103,7 +104,7 @@ mod tests {
         let principal = principal_with_tenants(&[TENANT_A]);
         let headers = headers_with_x_tenant(TENANT_B); // not in principal.tenant_ids
         let err = resolve(&principal, &headers).unwrap_err();
-        assert_eq!(err.status(), 404); // never 403 — Hard Requirement 2
+        assert_eq!(err.status(), 404); // never 403 — a 403 would confirm the tenant exists
     }
 
     #[test]

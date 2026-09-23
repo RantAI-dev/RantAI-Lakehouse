@@ -265,7 +265,7 @@ async fn created_ip_and_user_agent_round_trip_as_null_on_the_wire(
 /// first.
 ///
 /// `ORDER BY s.created_at DESC, s.id` (rather than the bare
-/// `created_at DESC` the plan sketch shows) gives a deterministic order
+/// `created_at DESC`) gives a deterministic order
 /// even when the timestamps collide — two sessions in the same
 /// microsecond-second window sort by `id` rather than by Postgres's
 /// unspecified tie-break. A regression that lost the `DESC` would put
@@ -347,10 +347,10 @@ async fn an_already_expired_session_is_not_returned(pool: PgPool) -> sqlx::Resul
     Ok(())
 }
 
-// ── WS8 plan §Phase D: `revoke_session_as_caller` ────────────────────────
+// ── `revoke_session_as_caller`: non-enumeration ──────────────────────────
 //
-// Hard Requirement 4 ("never reveals whether another user's session id
-// exists") lives in two layers here:
+// Never revealing whether another user's session id exists lives in two
+// layers here:
 //   1. The SQL `WHERE id = $1 AND revoked_at IS NULL AND ($3 OR app_user_id = $2)`
 //      predicate, which matches zero rows for a foreign id, a missing id,
 //      and an already-revoked id identically.
@@ -361,7 +361,7 @@ async fn an_already_expired_session_is_not_returned(pool: PgPool) -> sqlx::Resul
 // the route-level tests in `lakehouse-api/src/routes/auth.rs` pin down (2)
 // end-to-end.
 
-/// Hard Requirement 4's first half: a caller revoking a session they do
+/// Non-enumeration, first half: a caller revoking a session they do
 /// not own must see `SessionOwnershipError::NotFound` — the exact same
 /// error variant a missing id would produce. The session row's
 /// `revoked_at` is asserted to still be `NULL` so the test is a true
@@ -395,7 +395,7 @@ async fn revoke_session_as_caller_revokes_only_the_callers_own_without_admin(
     Ok(())
 }
 
-/// Hard Requirement 4's second half: an `identity:sessions:manage` holder
+/// Non-enumeration, second half: an `identity:sessions:manage` holder
 /// revoking someone else's session id succeeds. Mirrors the list route's
 /// admin branch (the same `identity:sessions:manage` token flips the
 /// `is_admin` flag, which the SQL collapses to "always match").

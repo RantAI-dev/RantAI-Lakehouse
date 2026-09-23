@@ -35,8 +35,8 @@ use uuid::Uuid;
 use crate::{PgPool, StoreError};
 
 /// One row of `GET /api/auth/sessions`. Deliberately carries no token or
-/// token hash — Hard Requirement 4 ("session tokens are never returned;
-/// only ids and metadata") — `id`/`user_id`/`user_name`/`created_at`/
+/// token hash — session tokens are never returned to a caller; only ids
+/// and metadata are — `id`/`user_id`/`user_name`/`created_at`/
 /// `expires_at`/`created_ip`/`user_agent` only, every field already
 /// non-secret in `session` (`0019_auth.sql`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, FromRow)]
@@ -160,8 +160,8 @@ impl From<SessionOwnershipError> for StoreError {
 /// Revoke `session_id` if it belongs to `caller_id`, or unconditionally
 /// if `is_admin`. A session that exists but belongs to someone else, and
 /// a session that does not exist at all, return the exact same
-/// [`SessionOwnershipError::NotFound`] — Hard Requirement 4 ("never
-/// reveals whether another user's session id exists"). The route's
+/// [`SessionOwnershipError::NotFound`] — this route must never reveal
+/// whether another user's session id exists. The route's
 /// single error-mapping path then renders both as the same 404 body.
 ///
 /// The `WHERE ... AND revoked_at IS NULL` predicate is what makes a
@@ -176,7 +176,7 @@ impl From<SessionOwnershipError> for StoreError {
 /// # Errors
 ///
 /// Returns [`SessionOwnershipError::NotFound`] for both a missing id and
-/// a foreign id (Hard Requirement 4, see the type doc comment), or
+/// a foreign id (non-enumeration, see the type doc comment), or
 /// [`SessionOwnershipError::Database`] on any storage failure.
 pub async fn revoke_session_as_caller(
     pool: &PgPool,
@@ -205,7 +205,7 @@ mod tests {
 
     use super::*;
 
-    /// Hard Requirement 4 — the wire shape of [`SessionRow`] never carries
+    /// The wire shape of [`SessionRow`] never carries
     /// a token or token hash. This is a structural test (no DB), pinning
     /// down what `#[derive(Serialize)]` actually emits rather than what the
     /// struct declaration says: a future field added by name "token" or
@@ -266,7 +266,7 @@ mod tests {
         assert_eq!(json.get("userAgent"), Some(&serde_json::Value::Null));
     }
 
-    /// Hard Requirement 4 lives in two layers at once: the SQL
+    /// The non-enumeration guarantee lives in two layers at once: the SQL
     /// (`UPDATE ... AND revoked_at IS NULL AND ($3 OR app_user_id = $2)`)
     /// and the error mapping. The latter is a `Display` test, not a DB
     /// test — `SessionOwnershipError::NotFound`'s message is what

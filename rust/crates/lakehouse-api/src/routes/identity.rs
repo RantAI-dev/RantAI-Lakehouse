@@ -284,7 +284,7 @@ pub struct CreateTenantBody {
 ///
 /// Requires `identity:write` — see the module doc comment.
 ///
-/// # Resumable provisioning (WS8 plan Task B4, Correction 7)
+/// # Resumable provisioning
 ///
 /// A tenant's Lakekeeper warehouse, grants, and registry namespace are
 /// provisioned by three external calls this handler drives as a
@@ -310,9 +310,10 @@ pub struct CreateTenantBody {
 /// 500 on any other database failure.
 /// Provisioning statuses (`tenant.provisioning_status`) that a repeated
 /// `POST /api/identity/tenants` for the same slug resumes from, rather
-/// than rejecting with 409 — see [`create_tenant`]'s doc comment and WS8
-/// plan Correction 7. Deliberately excludes `complete` and
-/// `not_applicable`: neither is a step to resume from.
+/// than rejecting with 409 — see [`create_tenant`]'s doc comment.
+/// Deliberately excludes `complete` and `not_applicable`: neither is a
+/// step to resume from, and treating either as resumable would silently
+/// re-run provisioning against a tenant that is already done.
 const RESUMABLE_STATUSES: &[&str] = &[
     "pending",
     "warehouse_ready",
@@ -331,7 +332,7 @@ pub async fn create_tenant(
     let pool = pool(&state)?;
 
     // Resume, don't reject, a slug that already exists but is still
-    // mid-provisioning (WS8 plan Correction 7). A 409 is reserved for a
+    // mid-provisioning. A 409 is reserved for a
     // slug already terminal — either genuinely `complete`, or
     // `not_applicable` (a grandfathered pre-provisioning tenant,
     // `0042_tenant_provisioning.sql`'s backfill: re-POSTing its slug must
@@ -356,7 +357,7 @@ pub async fn create_tenant(
         }
     };
 
-    // audit_event row mirrors WS5's audit schema — `outcome = "executed"`
+    // audit_event row mirrors 0024_audit_event.sql's schema — `outcome = "executed"`
     // per `audit_event_outcome_check` (0024_audit_event.sql). Written
     // BEFORE the `lakekeeper_admin` check so the audit fires whether or
     // not provisioning is reachable on this deployment — the tenant row
@@ -364,7 +365,7 @@ pub async fn create_tenant(
     // operator's history is honest about what happened. Best-effort: a
     // failed audit write is logged and swallowed, never propagated, so
     // the response code on the wire is always the underlying operation's,
-    // not the audit's (WS8 §Phase G).
+    // not the audit's.
     let audit_event = tenant_create_audit_event(&principal, &tenant);
     if let Err(err) = store_audit::insert(pool, audit_event).await {
         tracing::warn!(
@@ -450,15 +451,15 @@ async fn provision_tenant(
             identity::update_tenant_provisioning_status(pool, &tenant.id, "grants_ready", None)
                 .await?;
     }
-    // Registry namespace: the grand plan calls for creating this tenant's
-    // Iceberg namespace here, and this state machine reserves
-    // `namespace_ready`/`complete` for it — but neither status is written
+    // Registry namespace: this state machine reserves
+    // `namespace_ready`/`complete` for creating this tenant's Iceberg
+    // namespace — but neither status is written
     // yet, because no namespace is created yet. `lakehouse-iceberg`'s only
     // namespace-create surface (`ensure_bronze_namespace`/
     // `ensure_gold_namespace`) is hardcoded to this deployment's one shared
     // catalog, not parameterized by a tenant warehouse, so calling it would
     // create a namespace on the WRONG catalog; inventing a second,
-    // tenant-scoped Iceberg client here is out of this task's scope.
+    // tenant-scoped Iceberg client here is out of scope for this route.
     //
     // So provisioning STOPS at `grants_ready`, and the caller is told that
     // by the status it reads back. Advancing to `namespace_ready` and then
@@ -831,8 +832,8 @@ mod tests {
     /// The rotate route's audit row is built with a literal `NewAuditEvent`
     /// shape (`action` / `resource_kind` / `resource_id` / `principal_kind` /
     /// `outcome`) that the schema's `audit_event_*_check` constraints accept.
-    /// Asserting the literal here is what pins down Hard Requirement 5's
-    /// "rotate is audited" property at the field level — the `INSERT`
+    /// Asserting the literal here is what pins down the "credential
+    /// rotation is audited" property at the field level — the `INSERT`
     /// itself is exercised by the integration tests in
     /// `lakehouse-store/tests/audit.rs`, which use the same `insert` helper
     /// `rotate_service_identity` calls.

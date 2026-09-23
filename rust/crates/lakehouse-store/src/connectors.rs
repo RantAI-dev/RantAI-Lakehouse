@@ -260,8 +260,8 @@ impl From<ConnectorRow> for Connector {
 const CONNECTOR_COLUMNS: &str = "id, name, type, direction, health, environment, tenant, host, \
      secret_ref, last_test_at, capabilities, owner";
 
-/// Optional narrowing for [`list_connectors`] — WS8 plan Task C2, Hard
-/// Requirement 2 (tenant isolation).
+/// Optional narrowing for [`list_connectors`] for tenant isolation: a
+/// caller must never see a connector outside its own tenant.
 ///
 /// `tenant_id: None` means "unscoped": every connector, including one
 /// whose own `tenant_id` column is `NULL` (unassigned). That branch exists
@@ -306,7 +306,7 @@ pub async fn list_connectors(
 }
 
 /// Assign (or reassign) a connector to a tenant — the write behind `PUT
-/// /api/connectors/{id}/tenant` (WS8 plan Task C6, P2 fix). Closes the gap
+/// /api/connectors/{id}/tenant`. Closes the gap
 /// `0042_tenant_provisioning.sql` deliberately leaves open: that migration
 /// backfills `tenant_id` on only the two seeded connector rows, so every
 /// connector a real deployment creates afterward starts `tenant_id = NULL`

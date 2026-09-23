@@ -1,6 +1,8 @@
 //! HTTP-level integration tests for `POST /api/identity/tenants`'
-//! provisioning behaviour (WS8 plan Phase B, Task B4; resumable state
-//! machine per Correction 7).
+//! provisioning behaviour: a resumable state machine over `tenant.
+//! provisioning_status` (see `0042_tenant_provisioning.sql`) so a crash or
+//! restart partway through provisioning a tenant's Lakekeeper warehouse can
+//! be resumed rather than silently re-run or left stuck.
 //!
 //! Runs against the real, isolated Postgres `common::spin_up_with_env`
 //! provisions, with `LAKEKEEPER_BASE_URI` pointed at a `wiremock`
@@ -10,11 +12,9 @@
 //! `LakekeeperAdminClient`, one layer up (through the real route, not
 //! the client directly).
 //!
-//! Deviation from the plan's Step 1 listing: the plan's pseudocode names
-//! helpers `mock_lakekeeper_admin_server`/`state_with_pool_and_lakekeeper_
-//! admin`/`post_json`/`body_json`/`seed_tenant_at_status` that assume an
-//! in-file `#[cfg(test)]` module. This task instead follows this crate's
-//! existing Postgres-backed-test convention (`tests/tier1_writehigh_
+//! This file uses a standalone integration test file (rather than an
+//! in-file `#[cfg(test)]` module) to follow this crate's existing
+//! Postgres-backed-test convention (`tests/tier1_writehigh_
 //! approval.rs`, `tests/connector_delete_deprovision.rs`): a standalone
 //! integration test file using `tests/common/mod.rs`'s `spin_up_with_env`
 //! (env overrides substitute for patching `AppState` fields directly,
@@ -95,9 +95,9 @@ async fn app_with_lakekeeper_admin(server: &MockServer) -> TestApp {
 
 /// Inserts a `tenant` row directly at `status` (and `warehouse_id`,
 /// where the status implies one already exists), simulating a crash
-/// partway through a previous provisioning attempt — the row Task B4's
-/// resume path must pick up rather than reject with 409 or restart from
-/// `ensure_warehouse`.
+/// partway through a previous provisioning attempt — the row the resume
+/// path in `create_tenant` must pick up rather than reject with 409 or
+/// restart from `ensure_warehouse`.
 async fn seed_tenant_at_status(
     pool: &PgPool,
     slug: &str,
@@ -118,12 +118,12 @@ async fn seed_tenant_at_status(
     .expect("seed a tenant row directly");
 }
 
-/// Step 1 (WS8 plan Task B4): a brand-new slug drives the full state
-/// machine — warehouse create, then grants — and the
-/// response carries the real Lakekeeper warehouse id and a terminal
-/// `provisioningStatus`. Before this task's implementation, `create_tenant`
-/// was a bare Postgres insert with no `warehouseId`/`provisioningStatus`
-/// fields on the response and no Lakekeeper call at all.
+/// A brand-new slug drives the full state machine — warehouse create,
+/// then grants — and the response carries the real Lakekeeper warehouse
+/// id and a terminal `provisioningStatus`. Before this state machine
+/// existed, `create_tenant` was a bare Postgres insert with no
+/// `warehouseId`/`provisioningStatus` fields on the response and no
+/// Lakekeeper call at all.
 #[tokio::test]
 async fn create_tenant_provisions_a_warehouse_and_stops_honestly_at_grants_ready() {
     let server = MockServer::start().await;
@@ -172,9 +172,9 @@ async fn create_tenant_provisions_a_warehouse_and_stops_honestly_at_grants_ready
     );
 }
 
-/// Step 1 (WS8 plan Task B4, Correction 7): a slug already seeded at a
-/// genuinely in-progress status (simulating a crash after the warehouse
-/// step) is RESUMED on a repeated POST — grants + terminal steps only,
+/// A slug already seeded at a genuinely in-progress status (simulating a
+/// crash after the warehouse step) is RESUMED on a repeated POST —
+/// grants + terminal steps only,
 /// never a second `ensure_warehouse` call — rather than rejected with 409
 /// or restarted from scratch. Proven by never mounting the warehouse
 /// create/list mocks at all: if the handler incorrectly redid step 1, the
@@ -221,8 +221,9 @@ async fn create_tenant_is_idempotent_on_a_repeated_slug_when_not_yet_complete() 
 }
 
 /// A slug already at a terminal status (`complete`) is a genuine 409, not
-/// a resume — Correction 7's "409 for a row already `'complete'` or
-/// `'not_applicable'`" half of the rule.
+/// a resume: a row already `'complete'` or `'not_applicable'` has nothing
+/// left to provision, so a repeated POST of its slug is rejected rather
+/// than silently treated as a no-op success.
 #[tokio::test]
 async fn create_tenant_on_an_already_complete_slug_is_409_not_a_resume() {
     let server = MockServer::start().await;
@@ -245,7 +246,8 @@ async fn create_tenant_on_an_already_complete_slug_is_409_not_a_resume() {
 
 /// A `not_applicable` slug (a grandfathered pre-provisioning tenant,
 /// migration `0042`'s backfill) must never be pulled into a provisioning
-/// attempt by a later POST of its slug — also a 409, per Correction 7.
+/// attempt by a later POST of its slug — also a 409, for the same reason
+/// a `complete` row is: there is nothing left to provision.
 #[tokio::test]
 async fn create_tenant_on_a_not_applicable_slug_is_409_not_a_resume() {
     let server = MockServer::start().await;

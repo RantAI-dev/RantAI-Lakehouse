@@ -36,8 +36,7 @@ use crate::tenant::TENANT_OWNER;
 /// vanishing the way an authored governance rule did before the Task 2.3
 /// gap fix — see `0007_pipelines.sql`'s header comment.
 ///
-/// # Tenant scoping (WS8 plan Task C3, Hard Requirement 2) — authored
-/// pipelines only
+/// # Tenant scoping — authored pipelines only
 ///
 /// `tenant_scope::resolve` runs first: `Ok(None)` (the caller belongs to
 /// zero tenants) short-circuits to `{"pipelines": []}` before the `Dagster`
@@ -50,11 +49,11 @@ use crate::tenant::TENANT_OWNER;
 ///
 /// A `Dagster` code location is one per deployment and nothing in this
 /// schema maps a job to a tenant — migration `0042` adds `tenant_id` to
-/// `connector` and `pipeline_definition` only. Task C3 filtered the
-/// authored half and left the jobs visible to every tenant with a comment
-/// saying so; that is the same shape the judge review's P1 rejected for
-/// the shared catalog, so it now runs through the same gate
-/// (`routes::catalog::catalog_tenant_refusal`, Task C0): a `"*:*"`
+/// `connector` and `pipeline_definition` only. Filtering the authored
+/// half and leaving the jobs visible to every tenant with only a
+/// disclosure comment would repeat the same leak the shared catalog's
+/// gate exists to close, so this route runs through that same gate
+/// (`routes::catalog::catalog_tenant_refusal`): a `"*:*"`
 /// principal and a single-tenant deployment are never refused, a member of
 /// `CATALOG_TENANT_ID` is never refused once that is set, and everyone else
 /// gets the authored half plus an explicit
@@ -117,8 +116,8 @@ async fn list_body(
     // location is one per deployment and no table maps a job to a tenant
     // (migration 0042 adds `tenant_id` to `connector` and
     // `pipeline_definition` only). So it is gated by exactly the rule the
-    // shared catalog is gated by (`routes::catalog::catalog_tenant_refusal`,
-    // Task C0 plus its judge amendment): refused for a tenant-scoped
+    // shared catalog is gated by (`routes::catalog::catalog_tenant_refusal`):
+    // refused for a tenant-scoped
     // caller unless an operator has named the owning tenant. When refused,
     // the jobs are not fetched at all — not fetched and filtered out, so a
     // refusal costs no `Dagster` round trip — and the response says so
@@ -1374,10 +1373,10 @@ pub struct AssignTenantBody {
 
 /// `PUT /api/pipelines/{id}/tenant` — assign (or reassign) an authored
 /// pipeline to a tenant. Same shape and rationale as `routes::connectors::
-/// assign_connector_tenant` (WS8 plan Task C7, P2 fix): `0042_tenant_
+/// assign_connector_tenant`: `0042_tenant_
 /// provisioning.sql` adds `tenant_id` to `pipeline_definition` with no
 /// backfill at all, so every authored pipeline starts invisible to `GET
-/// /api/pipelines`'s tenant-scoped read (Task C3) until assigned here.
+/// /api/pipelines`'s tenant-scoped read until assigned here.
 ///
 /// Only ever targets a `pipeline_definition` row (a `pl-`-prefixed,
 /// Postgres-authored id) — a `Dagster`-backed pipeline id has no
@@ -1416,7 +1415,7 @@ pub async fn assign_pipeline_tenant(
 
 #[cfg(test)]
 mod dagster_half_tenant_gate {
-    //! The judge amendment to WS8 Task C0: the `Dagster`-job half of
+    //! The `Dagster`-job half of
     //! `GET /api/pipelines` is a shared, un-tenanted surface and is gated by
     //! the same rule as the shared catalog.
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1588,9 +1587,9 @@ mod tests {
         (status, serde_json::from_slice(&bytes).unwrap_or_default())
     }
 
-    // ── WS8 plan Task C3: `GET /api/pipelines` tenant scoping ──────────
+    // ── `GET /api/pipelines` tenant scoping ─────────────────────────────
 
-    /// Hard Requirement 2: a principal that belongs to zero tenants gets
+    /// A principal that belongs to zero tenants gets
     /// `{"pipelines": []}` — never `403`/`404`, and never every tenant's
     /// rows. `state_without_pool()` (no `Dagster` client reachable either)
     /// proves this is returned BEFORE `list_body` (hence before the
@@ -2822,7 +2821,7 @@ mod tests {
         }
     }
 
-    /// `PUT /api/pipelines/{id}/tenant` — WS8 plan Task C7, P2 fix. Same
+    /// `PUT /api/pipelines/{id}/tenant` route tests. Same
     /// shape as `routes::connectors::tests::assign_tenant_route`.
     mod assign_tenant_route {
         use lakehouse_store::identity::{self, CreateTenantInput};

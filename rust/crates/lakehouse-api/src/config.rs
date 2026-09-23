@@ -38,7 +38,7 @@ pub enum ConfigError {
     /// `CATALOG_TENANT_ID` was set but is not a valid UUID.
     ///
     /// Fails config resolution rather than silently falling back to
-    /// `None` (WS8 plan Task C0): unlike `SMTP_PORT`, a mistyped
+    /// `None`: unlike `SMTP_PORT`, a mistyped
     /// `CATALOG_TENANT_ID` would silently flip a deployment from "the
     /// shared catalog/Dagster-job list work for the group tenant's
     /// members" to "refused for everyone" — exactly the kind of quiet
@@ -237,19 +237,19 @@ pub struct Config {
     /// boot over).
     pub oidc_clock_skew_seconds: u64,
     /// Authorization endpoint of the `OIDC` provider, for the
-    /// browser-redirect login flow (WS8 plan Task A2, Hard Requirement 1).
-    /// `None` when unset. Read ONLY from `OIDC_AUTHORIZE_URL` — never taken
-    /// from a request, so a caller cannot redirect a login to an arbitrary
-    /// host.
+    /// browser-redirect login flow. `None` when unset. Read ONLY from
+    /// `OIDC_AUTHORIZE_URL` — never taken from a request, so a caller
+    /// cannot redirect a login to an arbitrary host.
     pub oidc_authorize_url: Option<String>,
     /// Token endpoint of the `OIDC` provider, used to exchange an
-    /// authorization code for tokens (WS8 plan Task A2). `None` when
+    /// authorization code for tokens. `None` when
     /// unset. Read ONLY from `OIDC_TOKEN_URL` — never taken from a
     /// request.
     pub oidc_token_url: Option<String>,
     /// This deployment's fixed callback URL, registered with the `OIDC`
-    /// provider ahead of time (WS8 plan Task A2, Hard Requirement 1: "redirect
-    /// URI fixed from configuration"). `None` when unset. Read ONLY from
+    /// provider ahead of time — the redirect URI is fixed from
+    /// configuration, never a request parameter, so it cannot be steered
+    /// to an attacker-controlled host. `None` when unset. Read ONLY from
     /// `OIDC_REDIRECT_URI` — never taken from a request, closing the open-
     /// redirect class a request-supplied `redirect_uri` would allow.
     pub oidc_redirect_uri: Option<String>,
@@ -268,9 +268,9 @@ pub struct Config {
     pub lakekeeper_warehouse: String,
     /// Base URL of Lakekeeper's own `management/v1/*` REST API (e.g.
     /// `http://lakekeeper:8181`), used ONLY by
-    /// `lakehouse_auth::openfga::LakekeeperAdminClient` (WS8 plan Task B2)
+    /// `lakehouse_auth::openfga::LakekeeperAdminClient`
     /// to look up/create a tenant's warehouse and grant this stack's
-    /// machine principals onto it (WS8 plan Task B4). Deliberately a
+    /// machine principals onto it. Deliberately a
     /// separate field from [`Self::lakekeeper_catalog_uri`], not the same
     /// value with a suffix stripped at the call site: the catalog URI
     /// always carries Lakekeeper's Iceberg REST catalog path
@@ -359,7 +359,7 @@ pub struct Config {
     /// token is picked up without restarting this process, but nothing
     /// re-mints one before its 30-day expiry (ADR 0011's known gap).
     pub lakekeeper_read_token_file: String,
-    /// WS8 plan Task B3 — path to a file holding an ADMIN-scoped Lakekeeper
+    /// Path to a file holding an ADMIN-scoped Lakekeeper
     /// bearer token, read by `AppState::lakekeeper_admin` through the same
     /// shared `crate::lakekeeper_token::read_token_file` helper
     /// [`Self::lakekeeper_gold_export_token_file`]/
@@ -367,11 +367,11 @@ pub struct Config {
     /// second reader). Unlike those two narrower-scoped principals, this
     /// token must be able to call Lakekeeper's `management/v1/*` API
     /// (create warehouses, grant permissions) — `POST
-    /// /api/identity/tenants`'s provisioning path (WS8 plan Task B4) is the
+    /// /api/identity/tenants`'s provisioning path is the
     /// only caller. Same "always a default path, never `None`-when-unset"
     /// shape as those two fields: default `/tokens/admin.jwt`, matching the
     /// compose mount path `lakekeeper-authz-init` already uses for its own
-    /// admin token (`docker-compose.yml`) — Task B5 mounts the same volume
+    /// admin token (`docker-compose.yml`), which mounts the same volume
     /// subpath into `lakehouse-api`. A missing or unreadable file leaves
     /// `AppState::lakekeeper_admin` at `None` (provisioning degrades to
     /// unavailable) rather than panicking at boot or constructing a client
@@ -482,9 +482,8 @@ pub struct Config {
     /// [`Self::trino_health_url`].
     pub openfga_url: Option<String>,
     /// UUID of the tenant that owns this deployment's single shared
-    /// catalog and Dagster-job list (WS8 plan Task C0, judge review
-    /// revision 2 Q1; extended to the `Dagster`-job half of
-    /// `GET /api/pipelines` by this task's judge amendment).
+    /// catalog and Dagster-job list (also governs the `Dagster`-job half
+    /// of `GET /api/pipelines`).
     /// `bronze_meta.dataset_catalog` (six columns: slug, title,
     /// description, tier, `updated_at`, `table_name`) and a `Dagster` code
     /// location are both one-per-deployment resources with no tenant
@@ -840,9 +839,8 @@ impl Config {
             trino_max_rows: parse_u64_or_default(env, "TRINO_MAX_ROWS", 10_000) as usize,
             trino_health_url: truthy(env, "TRINO_URL"),
             openfga_url: truthy(env, "OPENFGA_URL"),
-            // WS8 plan Task C0 (judge review revision 2 Q1): a malformed
-            // value fails config resolution rather than silently
-            // disabling the tenant-ownership check — see
+            // A malformed value fails config resolution rather than
+            // silently disabling the tenant-ownership check — see
             // ConfigError::InvalidCatalogTenantId's doc comment.
             catalog_tenant_id: truthy(env, "CATALOG_TENANT_ID")
                 .map(|raw| {
@@ -988,10 +986,9 @@ mod tests {
         assert!(!cfg.connector_probe_allow_internal_hosts);
     }
 
-    /// WS8 plan Task B3 Step 1 — the exact test the plan specifies,
-    /// isolated from `defaults_match_typescript_fallbacks` so `cargo test
-    /// -p lakehouse-api lakekeeper_admin_token_file` (this task's own
-    /// verify command) actually selects a test.
+    /// Isolated from `defaults_match_typescript_fallbacks` so `cargo test
+    /// -p lakehouse-api lakekeeper_admin_token_file` actually selects a
+    /// test.
     #[test]
     fn lakekeeper_admin_token_file_defaults_to_the_tokens_admin_jwt_path() {
         let cfg = Config::from_map(&HashMap::new()).unwrap();
@@ -1338,8 +1335,8 @@ mod tests {
         assert_eq!(cfg.trino_url, "");
     }
 
-    // WS8 plan Task A2: the browser login flow's authorize/token/redirect
-    // URLs are fixed from configuration only (Hard Requirement 1) — a
+    // The browser login flow's authorize/token/redirect
+    // URLs are fixed from configuration only — a
     // request can never supply or override them.
     #[test]
     fn oidc_flow_urls_default_to_none_and_are_read_when_set() {
@@ -1376,8 +1373,8 @@ mod tests {
         );
     }
 
-    // WS8 plan Task C0 (judge review revision 2 Q1) — an operator-stated
-    // owning tenant for the shared catalog/Dagster-job surfaces.
+    // An operator-stated owning tenant for the shared catalog/Dagster-job
+    // surfaces.
     #[test]
     fn catalog_tenant_id_defaults_to_none_and_parses_when_set() {
         let cfg = Config::from_map(&HashMap::new()).unwrap();

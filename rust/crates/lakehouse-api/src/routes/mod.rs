@@ -52,26 +52,26 @@ fn auth_router() -> Router<AppState> {
             "/api/auth/change-password",
             axum::routing::post(auth::change_password),
         )
-        // WS8 plan Task A4: unauthenticated by design — see
+        // Unauthenticated by design — see
         // `auth::oidc_start`'s own doc comment and its
         // `crate::policy::POLICY_TABLE` entry.
         .route("/api/auth/oidc/start", get(auth::oidc_start))
-        // WS8 plan Task A5: unauthenticated by necessity — the caller has
+        // Unauthenticated by necessity — the caller has
         // no session yet at this point in the flow. Fails closed to 401 on
         // every verification gap (see `auth::oidc_callback`'s own doc
         // comment and its `crate::policy::POLICY_TABLE` entry).
         .route("/api/auth/oidc/callback", get(auth::oidc_callback))
-        // WS8 plan Task A6: unauthenticated by necessity — the login page
+        // Unauthenticated by necessity — the login page
         // calls this before any session exists to decide whether to render an
         // SSO button. See `auth::providers`'s own doc comment and its
         // `crate::policy::POLICY_TABLE` entry.
         .route("/api/auth/providers", get(auth::providers))
-        // WS8 plan §Phase D: list the caller's own browser sessions (or
+        // List the caller's own browser sessions (or
         // every live session, for an `identity:sessions:manage` holder).
         // `Policy::RequiresAuth` floor; the own-vs-all split lives inside
         // the handler — see `auth::sessions` and `auth::SessionsDecision`.
         .route("/api/auth/sessions", get(auth::sessions))
-        // WS8 plan §Phase D: revoke a single live session by id. Same
+        // Revoke a single live session by id. Same
         // floor as the list route; the admin-vs-own split lives inside
         // the handler — see `auth::revoke_session`. The path-segment id
         // is validated as a UUID by the handler itself (400 on a
@@ -178,7 +178,7 @@ fn pipelines_router() -> Router<AppState> {
             "/api/pipelines/runs/{runId}/retry",
             axum::routing::post(pipelines::retry_run),
         )
-        // WS8 plan Task C7 (P2 fix): the assignment route for pipeline
+        // The assignment route for pipeline
         // rows `0042_tenant_provisioning.sql` leaves `tenant_id = NULL`.
         .route(
             "/api/pipelines/{id}/tenant",
@@ -348,7 +348,7 @@ fn connectors_router() -> Router<AppState> {
             "/api/connectors/{id}/ingest/run",
             axum::routing::post(connectors::ingest_run),
         )
-        // WS8 plan Task C6 (P2 fix): the assignment route for connector
+        // The assignment route for connector
         // rows `0042_tenant_provisioning.sql` leaves `tenant_id = NULL`.
         .route(
             "/api/connectors/{id}/tenant",
@@ -385,7 +385,7 @@ fn identity_router() -> Router<AppState> {
             "/api/identity/service-identities",
             get(identity::list_service_identities).post(identity::create_service_identity),
         )
-        // WS8 plan §Phase E (Hard Requirement 5): rotate a service
+        // Rotate a service
         // identity's credential. `{id}` is validated as a UUID inside the
         // handler (400 on a malformed id, 404 via `StoreError::NotFound`
         // on a well-formed id with no row).

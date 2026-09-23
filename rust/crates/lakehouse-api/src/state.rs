@@ -166,10 +166,10 @@ pub struct AppState {
     /// external dependency, just an in-process buffer.
     pub policy_decision_latencies: PolicyDecisionLatencies,
     /// Client for Lakekeeper's `management/v1/*` API, used by `POST
-    /// /api/identity/tenants` (WS8 plan Task B4) to provision a tenant's
+    /// /api/identity/tenants` to provision a tenant's
     /// warehouse and grant this stack's machine principals onto it — see
     /// `lakehouse_auth::openfga::LakekeeperAdminClient`'s module doc
-    /// comment (WS8 plan Task B2). `None` when
+    /// comment. `None` when
     /// `Config::lakekeeper_admin_token_file` is unreadable at startup
     /// (not provisioned on this deployment, wrong path, permissions):
     /// same degrade-honestly posture `bootstrap_agent_run_service`
@@ -179,10 +179,10 @@ pub struct AppState {
     /// empty-string token that would only surface as a confusing 401
     /// later, deep inside a provisioning call.
     ///
-    /// First (and, as of WS8 plan Task B4, only) read by
+    /// First (and, so far, only) read by
     /// `routes::identity::create_tenant` — the `#[allow(dead_code)]` this
-    /// field carried since Task B3 is removed now that reader exists, per
-    /// that allow's own reason.
+    /// field carried while nothing read it yet is removed now that a
+    /// reader exists.
     pub lakekeeper_admin: Option<Arc<LakekeeperAdminClient>>,
 }
 
@@ -480,7 +480,7 @@ impl AppState {
                 crate::pipeline_source::SourceAllowlist::new()
             }
         };
-        // WS8 plan Task B3 — read the admin-scoped Lakekeeper bearer token
+        // Read the admin-scoped Lakekeeper bearer token
         // synchronously (`std::fs::read_to_string`, not
         // `crate::lakekeeper_token::read_token_file`): that helper is
         // `async` (it targets per-request reads, e.g. `routes::gold`'s
@@ -648,9 +648,9 @@ mod tests {
         }
     }
 
-    /// WS8 plan Task B3, judge fix: `read_to_string` SUCCEEDS on an empty
-    /// file, so "unreadable file degrades to `None`" did not cover the
-    /// case an operator actually hits — a token file created by a mount
+    /// `read_to_string` SUCCEEDS on an empty
+    /// file, so "unreadable file degrades to `None`" alone does not cover
+    /// the case an operator actually hits — a token file created by a mount
     /// or an init container that wrote nothing. Without this, the process
     /// would dial `Lakekeeper` with `Authorization: Bearer ` and the
     /// failure would surface as an unexplained 401 inside a provisioning

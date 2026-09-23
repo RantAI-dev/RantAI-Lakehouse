@@ -515,8 +515,8 @@ pub struct Tenant {
     /// Compute consumed. Serializes as `usedCompute`.
     pub used_compute: i64,
     /// Lakekeeper's opaque warehouse id backing this tenant's Iceberg data,
-    /// or `None` if provisioning has not created one (WS8 plan Phase B,
-    /// migration `0042_tenant_provisioning.sql`). Serializes as
+    /// or `None` if provisioning has not created one (see migration
+    /// `0042_tenant_provisioning.sql`). Serializes as
     /// `warehouseId`. Text, not a UUID: it stores exactly what
     /// Lakekeeper's `management/v1/warehouse` response returns.
     pub warehouse_id: Option<String>,
@@ -614,7 +614,7 @@ pub async fn get_tenant(pool: &PgPool, id: &str) -> Result<Tenant, StoreError> {
 
 /// Whether a tenant with `id` exists — the existence check
 /// `routes::connectors::assign_connector_tenant`/
-/// `routes::pipelines::assign_pipeline_tenant` (WS8 plan Tasks C6/C7) each
+/// `routes::pipelines::assign_pipeline_tenant` each
 /// run before writing a `connector`/`pipeline_definition` row's
 /// `tenant_id`, so an unknown tenant id 404s instead of silently creating a
 /// foreign-key violation the caller would see as a generic 500. Extracted
@@ -679,7 +679,7 @@ pub async fn create_tenant(pool: &PgPool, input: &CreateTenantInput) -> Result<T
 /// Find a tenant by its slug, or `None` if no such tenant exists.
 ///
 /// Unlike [`get_tenant`], a missing row is not an error: `POST
-/// /api/identity/tenants` (WS8 plan Task B4, Correction 7) uses this to
+/// /api/identity/tenants` uses this to
 /// decide whether to resume an existing, still-in-progress row or create a
 /// brand-new one — `None` is exactly the "create a new tenant" case, not a
 /// failure.
@@ -697,7 +697,7 @@ pub async fn find_tenant_by_slug(pool: &PgPool, slug: &str) -> Result<Option<Ten
 /// Lakekeeper warehouse id.
 ///
 /// Called once per step of the provisioning state machine
-/// (`routes::identity::provision_tenant`, WS8 plan Correction 7), and only
+/// (`routes::identity::provision_tenant`), and only
 /// after that step has genuinely succeeded — the caller is responsible for
 /// never calling this to advance past a step that failed, so a crash or
 /// error mid-way leaves the last truthful `provisioning_status` rather
@@ -984,7 +984,7 @@ pub struct RotateServiceIdentityResponse {
 /// the closure, using `lakehouse_auth::token::generate_opaque_token` +
 /// `lakehouse_auth::token::hash_token` — no duplication of either.
 ///
-/// # Hard Requirement 5 — old credential's fate
+/// # The old credential's fate
 ///
 /// Every currently-unrevoked `service_credential` row for `identity_id` is
 /// marked `revoked_at = now()` BEFORE the new row is inserted, and the

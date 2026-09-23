@@ -36,7 +36,7 @@ const EXPIRED_IDENTITY: &str = "44444444-4444-4444-8444-000000000006";
 
 /// Seed a `service_identity` row exactly the shape a freshly created one
 /// takes (name + scopes + environment + future expiry + `rotation_status =
-/// 'current'`), so the WS8 §Phase E last-used-at tests' input matches what
+/// 'current'`), so the last-used-at tests below exercise input matching what
 /// production seeding would create. The `name` is suffixed with a fresh
 /// `Uuid` because `#[sqlx::test]` runs every test in the same binary in
 /// the SAME database — only the test function gets a fresh connection per
@@ -112,7 +112,8 @@ async fn a_token_for_an_expired_service_identity_is_rejected(pool: PgPool) -> sq
     Ok(())
 }
 
-/// WS8 §Phase E, P4 fix, behaviour 1 — `verify_service_token` writes
+/// Behaviour 1 of `verify_service_token`'s last-used-at throttle:
+/// `verify_service_token` writes
 /// `last_used_at` on first use past the throttle window. `0001_init.sql`
 /// defaults `last_used_at` to `now()` at INSERT time, so "first use" here
 /// means the value the seed already set moves forward past that original
@@ -157,8 +158,8 @@ async fn verify_service_token_writes_last_used_at_on_first_use(pool: PgPool) -> 
     Ok(())
 }
 
-/// WS8 §Phase E, P4 fix, behaviour 2 — within the 300s throttle window,
-/// a successful verification must NOT move `last_used_at` at all. This is
+/// Behaviour 2 of the last-used-at throttle: within the 300s throttle
+/// window, a successful verification must NOT move `last_used_at` at all. This is
 /// the throttle's load-bearing assertion: a naive "always write"
 /// implementation would fail here. The throttle's
 /// `WHERE last_used_at < now() - ($N * INTERVAL '1 second')` predicate
@@ -208,8 +209,8 @@ async fn verify_service_token_does_not_rewrite_last_used_at_within_the_throttle_
     Ok(())
 }
 
-/// WS8 §Phase E, P4 fix, behaviour 3 — past the 300s throttle window, a
-/// successful verification MUST move `last_used_at` forward again. The
+/// Behaviour 3 of the last-used-at throttle: past the 300s throttle
+/// window, a successful verification MUST move `last_used_at` forward again. The
 /// 301s back-date is one second past the window so a slow CI clock can't
 /// slip this into the "no-op" case.
 #[sqlx::test(migrations = "../../migrations")]

@@ -615,7 +615,7 @@ async fn shutdown_signal() {
 
 /// Log ONCE at boot when this deployment refuses the shared catalog and
 /// `Dagster`-job list to tenant-scoped callers because nobody has said who
-/// owns them (WS8 plan Task C0, judge review Q1).
+/// owns them.
 ///
 /// At boot, not per request: the condition cannot change between requests
 /// without a restart (it reads `Config`), and a per-request warning on a

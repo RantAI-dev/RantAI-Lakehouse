@@ -601,7 +601,7 @@ async fn an_unmapped_group_grants_nothing_extra(pool: PgPool) -> sqlx::Result<()
     Ok(())
 }
 
-// ── `authenticate_with_nonce` (WS8 plan Task A3) ───────────────────────────
+// ── `authenticate_with_nonce` ───────────────────────────────────────────────
 //
 // Builds on this file's existing `authenticator`/`sign`/`mount_jwks`
 // harness rather than a second JWT-minting approach. The mismatched-nonce

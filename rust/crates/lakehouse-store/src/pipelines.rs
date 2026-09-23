@@ -162,8 +162,8 @@ impl From<PipelineRow> for Pipeline {
 const PIPELINE_COLUMNS: &str = "id, name, kind, status, owner, source, target, connector_id, \
      source_asset_id, target_asset_id, schedule, next_run_at";
 
-/// Optional narrowing for [`list_pipelines`] — WS8 plan Task C3, Hard
-/// Requirement 2 (tenant isolation).
+/// Optional narrowing for [`list_pipelines`] for tenant isolation: a caller
+/// must never see a pipeline outside its own tenant.
 ///
 /// Deliberately NOT the `tenant_id IS NULL OR ...` shape
 /// [`crate::connectors::ConnectorFilter`] uses: `routes::pipelines::list`
@@ -213,7 +213,7 @@ pub async fn list_pipelines(
 }
 
 /// Assign (or reassign) an authored pipeline to a tenant — the write
-/// behind `PUT /api/pipelines/{id}/tenant` (WS8 plan Task C7, P2 fix). Same
+/// behind `PUT /api/pipelines/{id}/tenant`. Same
 /// posture as [`crate::connectors::assign_tenant`]: `0042_tenant_
 /// provisioning.sql` adds `tenant_id` to `pipeline_definition` with no
 /// backfill at all (see that migration's own comment — every seeded
