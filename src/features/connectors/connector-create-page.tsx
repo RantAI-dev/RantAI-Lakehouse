@@ -244,6 +244,12 @@ export function ConnectorCreatePage() {
 
   const selectedType = types.data?.find((t) => t.name === selectedTypeName) ?? null
   const adapter = selectedType?.adapter ?? null
+  // An unauthenticated Kafka connector still carries a derived primary
+  // name (the create body requires one), but nothing resolves it; telling
+  // the operator to provision it would be a false instruction.
+  const usesNoCredential =
+    adapter === "kafka" &&
+    (dial?.auth as { type?: unknown } | undefined)?.type === "none"
 
   // Default the selection to the first SUPPORTED type once the list
   // loads, so the wizard never opens sitting on a disabled option a user
@@ -352,7 +358,16 @@ export function ConnectorCreatePage() {
             </Button>
           }
         />
-        {createdCredential ? (
+        {createdCredential && usesNoCredential ? (
+          <SectionCard
+            title="No credential to provision"
+            description="This Kafka connector authenticates with no credential, so nothing reads its reserved name. Leave it unset."
+          >
+            <p className="text-sm text-muted-foreground">
+              Reserved, unused: <code className="rounded bg-muted px-1.5 py-0.5">{createdCredential.primary}</code>
+            </p>
+          </SectionCard>
+        ) : createdCredential ? (
           <SectionCard
             title="Provision these credentials"
             description="Shown once, now — the server derived these names from this connector's own id (ADR 0002 Addendum 3). They are not stored or shown again; write them down before leaving this page."
