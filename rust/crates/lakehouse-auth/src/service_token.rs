@@ -67,6 +67,24 @@ pub async fn create_service_credential(
     Ok(token)
 }
 
+/// A fresh service credential and the exact hash [`verify_service_token`]
+/// will look it up by, for a caller that must persist the hash itself.
+///
+/// [`create_service_credential`] mints and stores in one call through a
+/// pool; service-identity rotation cannot use it, because revoking the old
+/// credentials and inserting the new one have to happen in ONE transaction
+/// that the caller owns (and `lakehouse-store`, which runs it, cannot depend
+/// on this crate). This returns the pair instead of letting that caller hash
+/// the token itself: a second hashing implementation elsewhere would only
+/// have to drift once — a pepper, a different encoding — for every rotated
+/// credential to stop authenticating, silently.
+#[must_use]
+pub fn mint_credential() -> (Secret, String) {
+    let token = generate_opaque_token();
+    let token_hash = hash_token(&token);
+    (token, token_hash)
+}
+
 /// Idempotently persist a caller-supplied `token` as `service_identity_id`'s
 /// credential, hashing it the exact same way [`create_service_credential`]
 /// hashes its own generated token.

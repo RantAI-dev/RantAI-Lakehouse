@@ -605,21 +605,13 @@ pub async fn rotate_service_identity(
 
     let pool = pool(&state)?;
     let response = identity::rotate_service_identity(pool, identity_id, || {
-        // Reuses `lakehouse_auth::generate_opaque_token` for the CSPRNG
-        // (the only public token-generation primitive `lakehouse-auth`
-        // re-exports — `lakehouse_auth::token::hash_token` is deliberately
-        // private per `lakehouse-auth/src/lib.rs`'s own note, and the
-        // `rotate_service_identity` store function cannot import
-        // `lakehouse-auth` at all because `lakehouse-auth` already depends
-        // on `lakehouse-store`, which would be a Cargo cycle Cargo refuses
-        // to build; so the SHA-256 hex digest is the small piece inlined
-        // here — see [`sha256_hex`] for the rationale). The closure runs
-        // inside the transaction, between the two `UPDATE`s and the
-        // `INSERT`, so a panic or SQL failure anywhere else in the function
-        // rolls the whole rotation back rather than leaving the new
-        // credential orphaned.
-        let token = lakehouse_auth::generate_opaque_token();
-        let token_hash = sha256_hex(token.expose());
+        // `mint_credential` returns the token together with the hash
+        // `verify_service_token` will look it up by — the store function
+        // takes a mint callback because it runs the revoke-and-insert in its
+        // own transaction and cannot depend on `lakehouse-auth`. The closure
+        // runs inside that transaction, so a failure anywhere rolls the
+        // whole rotation back rather than orphaning the new credential.
+        let (token, token_hash) = lakehouse_auth::service_token::mint_credential();
         (token.expose().to_owned(), token_hash)
     })
     .await?;
@@ -635,31 +627,6 @@ pub async fn rotate_service_identity(
     }
 
     Ok(ApiJson(response))
-}
-
-/// SHA-256 (`lakehouse_auth::token::hash_token`) of a string. Duplicates
-/// `lakehouse_auth::token::hash_token` here because that helper is
-/// deliberately private (`lakehouse-auth/src/lib.rs`'s note: "`hash_token`
-/// is an internal storage detail of `session`/`service_token`, not
-/// something a caller outside this crate should ever need"). The only
-/// public CSPRNG primitive `lakehouse-auth` re-exports is
-/// `generate_opaque_token` — and `lakehouse-store` cannot import
-/// `lakehouse-auth` at all (Cargo would reject the cycle), so the rotate
-/// store function takes a `(String, String)` mint callback instead of
-/// minting inline. The hex-digest logic itself is the small, well-isolated
-/// piece that has to live outside `lakehouse-auth` for this caller to
-/// compose correctly — any drift here would be caught by
-/// `lakehouse-auth`'s own `verify_service_token` round-trip tests, which
-/// insist on `hash_token`'s output format.
-fn sha256_hex(input: &str) -> String {
-    use sha2::{Digest, Sha256};
-    use std::fmt::Write as _;
-    let digest = Sha256::digest(input.as_bytes());
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
 
 /// Build the `NewAuditEvent` for a successful rotate — extracted as a pure,
@@ -713,6 +680,50 @@ fn tenant_create_audit_event(principal: &Principal, tenant: &Tenant) -> NewAudit
             "provisioningStatus": tenant.provisioning_status,
         })),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod rotated_credential_authenticates {
+    //! The one property rotation exists for: the secret it returns must
+    //! actually authenticate, and the credentials it replaced must not.
+    //! Lives here because this crate depends on both `lakehouse-store`
+    //! (which runs the rotation) and `lakehouse-auth` (which verifies) —
+    //! neither of those can test the round trip on its own.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_auth::Secret;
+    use lakehouse_auth::service_token::{create_service_credential, verify_service_token};
+    use lakehouse_store::identity;
+    use uuid::Uuid;
+
+    /// `bi-dashboard-reader` in `0002_seed_identity.sql`: current, unexpired.
+    const SEEDED_IDENTITY: Uuid = Uuid::from_u128(0x4444_4444_4444_4444_8444_0000_0000_0001);
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_rotated_secret_authenticates_and_the_old_one_no_longer_does(
+        pool: lakehouse_store::PgPool,
+    ) {
+        let old = create_service_credential(&pool, SEEDED_IDENTITY)
+            .await
+            .unwrap();
+        assert!(verify_service_token(&pool, &old).await.is_ok());
+
+        let rotated = identity::rotate_service_identity(&pool, SEEDED_IDENTITY, || {
+            let (token, token_hash) = lakehouse_auth::service_token::mint_credential();
+            (token.expose().to_owned(), token_hash)
+        })
+        .await
+        .unwrap();
+
+        let principal = verify_service_token(&pool, &Secret::new(rotated.secret))
+            .await
+            .expect("the secret rotation returns must authenticate");
+        assert_eq!(principal.display_name, "bi-dashboard-reader");
+        assert!(
+            verify_service_token(&pool, &old).await.is_err(),
+            "the credential rotation replaced must stop authenticating"
+        );
     }
 }
 
