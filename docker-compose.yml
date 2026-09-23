@@ -318,6 +318,27 @@ services:
       # name, which is exactly what leaving this unset (rather than typo'd)
       # avoids.
       LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
+      # `routes::identity::provision_tenant`'s Lakekeeper warehouse-create
+      # call needs the same S3 storage settings `lakekeeper-warehouse-init`
+      # below already hardcodes into its own request body — endpoint/
+      # region/path-style/STS mirror that body's literals as this service's
+      # default (non-secret, so a literal default here is safe), but the
+      # credential pair is DEDICATED (`TENANT_WAREHOUSE_S3_ACCESS_KEY`/
+      # `_SECRET_KEY`), never `RUSTFS_ACCESS_KEY`/`RUSTFS_SECRET_KEY`
+      # themselves — ADR 0002 Addendum 2's "the allowlist must never name a
+      # secret the API's own process depends on" rule, applied to config,
+      # not only to `secretRef` allowlisting. Left unset here (`:-`, no
+      # default), so a deployment that never sets them gets
+      # `routes::identity::create_tenant`'s honest "tenant warehouse
+      # storage is not configured" 503 rather than a request built from
+      # empty-string credentials.
+      TENANT_WAREHOUSE_S3_ENDPOINT: ${TENANT_WAREHOUSE_S3_ENDPOINT:-http://rustfs:9000}
+      TENANT_WAREHOUSE_S3_REGION: ${TENANT_WAREHOUSE_S3_REGION:-us-east-1}
+      TENANT_WAREHOUSE_S3_PATH_STYLE_ACCESS: ${TENANT_WAREHOUSE_S3_PATH_STYLE_ACCESS:-true}
+      TENANT_WAREHOUSE_STS_ENABLED: ${TENANT_WAREHOUSE_STS_ENABLED:-true}
+      TENANT_WAREHOUSE_STS_ROLE_ARN: ${TENANT_WAREHOUSE_STS_ROLE_ARN:-arn:aws:iam::000000000000:role/lakekeeper}
+      TENANT_WAREHOUSE_S3_ACCESS_KEY: ${TENANT_WAREHOUSE_S3_ACCESS_KEY:-}
+      TENANT_WAREHOUSE_S3_SECRET_KEY: ${TENANT_WAREHOUSE_S3_SECRET_KEY:-}
       # ── Tenant identity (see `lakehouse-api/src/tenant.rs`) ──
       # Passed through explicitly because otherwise a non-Dispar deployment
       # cannot override them at all. Each resolves to its historical Dispar

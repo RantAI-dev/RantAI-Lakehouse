@@ -46,7 +46,8 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use lakehouse_auth::Principal;
-use lakehouse_auth::openfga::LakekeeperAdminClient;
+use lakehouse_auth::Secret;
+use lakehouse_auth::openfga::{LakekeeperAdminClient, TenantWarehouseStorage};
 use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
@@ -404,10 +405,15 @@ pub async fn create_tenant(
 ///
 /// # Errors
 ///
-/// [`crate::error::provisioning_unavailable`] (503) if a Lakekeeper call
-/// fails — never `err.to_string()`, per AGENTS.md's "upstream error text
-/// never reaches a response". A [`lakehouse_core::StoreError`] from a
-/// checkpoint write propagates as-is via `?`.
+/// [`crate::error::tenant_warehouse_storage_not_configured`] (503) if this
+/// deployment has not set the dedicated `TENANT_WAREHOUSE_S3_*` settings
+/// [`tenant_warehouse_storage`] requires — checked before ever attempting
+/// the Lakekeeper call, an honest refusal rather than a request Lakekeeper
+/// would reject anyway. [`crate::error::provisioning_unavailable`] (503) if
+/// a Lakekeeper call itself fails — never `err.to_string()`, per
+/// AGENTS.md's "upstream error text never reaches a response". A
+/// [`lakehouse_core::StoreError`] from a checkpoint write propagates as-is
+/// via `?`.
 async fn provision_tenant(
     pool: &PgPool,
     admin: &LakekeeperAdminClient,
@@ -418,10 +424,11 @@ async fn provision_tenant(
     let prefix = format!("{}/{}/", config.lakehouse_warehouse_bucket, tenant.slug);
 
     if tenant.provisioning_status == "pending" {
+        let storage = tenant_warehouse_storage(config)?;
         let warehouse_id = admin
-            .ensure_warehouse(&warehouse_name, &prefix)
+            .ensure_warehouse(&warehouse_name, &prefix, &storage)
             .await
-            .map_err(|_| crate::error::provisioning_unavailable())?;
+            .map_err(|err| crate::error::provisioning_unavailable(&err))?;
         tenant = identity::update_tenant_provisioning_status(
             pool,
             &tenant.id,
@@ -446,7 +453,7 @@ async fn provision_tenant(
         admin
             .grant_machine_principals(&warehouse_id)
             .await
-            .map_err(|_| crate::error::provisioning_unavailable())?;
+            .map_err(|err| crate::error::provisioning_unavailable(&err))?;
         tenant =
             identity::update_tenant_provisioning_status(pool, &tenant.id, "grants_ready", None)
                 .await?;
@@ -473,6 +480,47 @@ async fn provision_tenant(
     // it, which is what the two completed steps claim. Finishing the last
     // step needs a per-tenant namespace API in `lakehouse-iceberg` first.
     Ok(tenant)
+}
+
+/// Build the [`TenantWarehouseStorage`] `LakekeeperAdminClient::ensure_warehouse`
+/// needs from this deployment's dedicated `TENANT_WAREHOUSE_S3_*` config
+/// (see [`Config::tenant_warehouse_s3_endpoint`]'s doc comment for why
+/// these are dedicated settings, never `Config::rustfs_s3_endpoint`/
+/// `Config::rustfs_access_key_secret_ref`).
+///
+/// Checked once, right before `provision_tenant`'s "pending" step would
+/// otherwise attempt the Lakekeeper call — never partway through building
+/// the request, so a deployment missing these settings gets one honest 503
+/// naming exactly what to set, instead of a request built from empty
+/// strings that `Lakekeeper` would reject with a confusing validation
+/// error.
+///
+/// # Errors
+///
+/// [`crate::error::tenant_warehouse_storage_not_configured`] if
+/// [`Config::tenant_warehouse_s3_endpoint`],
+/// [`Config::tenant_warehouse_s3_access_key`], or
+/// [`Config::tenant_warehouse_s3_secret_key`] is unset. The remaining
+/// fields (region, path-style, STS) always have a value — see their own
+/// doc comments — so they never gate this check.
+fn tenant_warehouse_storage(config: &Config) -> ApiResult<TenantWarehouseStorage> {
+    let (Some(endpoint), Some(access_key), Some(secret_key)) = (
+        config.tenant_warehouse_s3_endpoint.as_ref(),
+        config.tenant_warehouse_s3_access_key.as_ref(),
+        config.tenant_warehouse_s3_secret_key.as_ref(),
+    ) else {
+        return Err(crate::error::tenant_warehouse_storage_not_configured().into());
+    };
+    Ok(TenantWarehouseStorage {
+        endpoint: endpoint.clone(),
+        region: config.tenant_warehouse_s3_region.clone(),
+        bucket: config.lakehouse_warehouse_bucket.clone(),
+        path_style_access: config.tenant_warehouse_s3_path_style_access,
+        sts_enabled: config.tenant_warehouse_sts_enabled,
+        sts_role_arn: config.tenant_warehouse_sts_role_arn.clone(),
+        access_key: access_key.clone(),
+        secret_key: Secret::new(secret_key.clone()),
+    })
 }
 
 // ── Service identities ──────────────────────────────────────────────────
@@ -818,6 +866,53 @@ mod tests {
         assert_eq!(required("name", "  Rina  ").unwrap(), "Rina");
         let err = required("name", "   ").expect_err("whitespace-only must be rejected");
         assert_eq!(err.status(), 400);
+    }
+
+    /// With every `TENANT_WAREHOUSE_S3_*` setting unset (`Config`'s
+    /// default), `tenant_warehouse_storage` must refuse rather than build a
+    /// request from empty strings.
+    #[test]
+    fn tenant_warehouse_storage_refuses_when_unconfigured() {
+        let config = Config::from_map(&HashMap::new()).unwrap();
+        let err = tenant_warehouse_storage(&config)
+            .expect_err("unset TENANT_WAREHOUSE_S3_* must refuse, not fabricate a request");
+        assert_eq!(err.0.status(), 503);
+        assert!(
+            err.0.to_string().contains("TENANT_WAREHOUSE_S3_ENDPOINT"),
+            "the refusal should name the missing settings, got: {}",
+            err.0
+        );
+    }
+
+    /// With every setting present, `tenant_warehouse_storage` builds a
+    /// [`TenantWarehouseStorage`] carrying exactly those values (the
+    /// `bucket` field reuses `LAKEHOUSE_WAREHOUSE_BUCKET`, per this
+    /// function's doc comment).
+    #[test]
+    fn tenant_warehouse_storage_builds_from_config_when_set() {
+        let mut env = HashMap::new();
+        env.insert(
+            "TENANT_WAREHOUSE_S3_ENDPOINT".to_owned(),
+            "http://rustfs.internal:9000".to_owned(),
+        );
+        env.insert(
+            "TENANT_WAREHOUSE_S3_ACCESS_KEY".to_owned(),
+            "tenant-access-key".to_owned(),
+        );
+        env.insert(
+            "TENANT_WAREHOUSE_S3_SECRET_KEY".to_owned(),
+            "tenant-secret-key".to_owned(),
+        );
+        env.insert(
+            "LAKEHOUSE_WAREHOUSE_BUCKET".to_owned(),
+            "acme-warehouse".to_owned(),
+        );
+        let config = Config::from_map(&env).unwrap();
+        let storage = tenant_warehouse_storage(&config).expect("every setting is present");
+        assert_eq!(storage.endpoint, "http://rustfs.internal:9000");
+        assert_eq!(storage.bucket, "acme-warehouse");
+        assert_eq!(storage.access_key, "tenant-access-key");
+        assert_eq!(storage.secret_key.expose(), "tenant-secret-key");
     }
 
     /// A malformed body is a 400 with the parser's message, not a 500 and

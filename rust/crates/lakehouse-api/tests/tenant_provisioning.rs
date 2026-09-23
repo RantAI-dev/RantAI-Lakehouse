@@ -90,6 +90,24 @@ async fn app_with_lakekeeper_admin(server: &MockServer) -> TestApp {
         "LAKEHOUSE_WAREHOUSE_BUCKET".to_owned(),
         "s3://test-warehouse".to_owned(),
     );
+    // The dedicated tenant-warehouse storage settings
+    // `tenant_warehouse_storage` requires before `ensure_warehouse` is
+    // ever called (`crate::error::tenant_warehouse_storage_not_configured`'s
+    // refusal otherwise) — every test in this file that expects a real
+    // `POST /management/v1/warehouse` call to reach the mock server needs
+    // these set, exactly like a real deployment would.
+    overrides.insert(
+        "TENANT_WAREHOUSE_S3_ENDPOINT".to_owned(),
+        "http://rustfs.test:9000".to_owned(),
+    );
+    overrides.insert(
+        "TENANT_WAREHOUSE_S3_ACCESS_KEY".to_owned(),
+        "test-tenant-access-key".to_owned(),
+    );
+    overrides.insert(
+        "TENANT_WAREHOUSE_S3_SECRET_KEY".to_owned(),
+        "test-tenant-secret-key".to_owned(),
+    );
     spin_up_with_env(&overrides).await
 }
 
@@ -290,4 +308,61 @@ async fn create_tenant_without_lakekeeper_admin_configured_leaves_status_pending
          created but left at its honest starting status, never fabricated \
          as complete"
     );
+}
+
+/// A Lakekeeper admin token IS configured (so `AppState::lakekeeper_admin`
+/// is `Some`), but this deployment never set the dedicated
+/// `TENANT_WAREHOUSE_S3_*` settings — the route must refuse with a
+/// specific, honest 503 naming those settings, never a misleading "could
+/// not reach Lakekeeper" (there was nothing wrong with reaching it; the
+/// request was never even built) and never a fabricated success. No mock
+/// is mounted on `server` at all: if the handler tried to call
+/// Lakekeeper anyway, the unmocked call would panic on `MockServer` drop
+/// rather than produce this clean 503.
+#[tokio::test]
+async fn create_tenant_without_tenant_warehouse_storage_configured_refuses_honestly() {
+    let server = MockServer::start().await;
+    let token_dir = tempfile::tempdir().expect("create a temp dir for the admin token file");
+    let token_path = token_dir.path().join("admin.jwt");
+    std::fs::write(&token_path, "test-admin-token").expect("write a fake admin token");
+    std::mem::forget(token_dir);
+
+    let mut overrides = HashMap::new();
+    overrides.insert("LAKEKEEPER_BASE_URI".to_owned(), server.uri());
+    overrides.insert(
+        "LAKEKEEPER_ADMIN_TOKEN_FILE".to_owned(),
+        token_path.to_str().expect("a UTF-8 temp path").to_owned(),
+    );
+    overrides.insert(
+        "LAKEHOUSE_WAREHOUSE_BUCKET".to_owned(),
+        "s3://test-warehouse".to_owned(),
+    );
+    // Deliberately no TENANT_WAREHOUSE_S3_* overrides.
+    let app = spin_up_with_env(&overrides).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "fajar@meridian.example").await;
+
+    let response = post(
+        &app.router,
+        "/api/identity/tenants",
+        &cookie,
+        json!({"name": "Acme Co", "slug": "acme-co", "plan": "Standard", "residency": "US"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(response).await;
+    let message = body["error"].as_str().expect("an error message");
+    assert!(
+        message.contains("TENANT_WAREHOUSE_S3_ENDPOINT"),
+        "expected the refusal to name the missing settings, got {message:?}"
+    );
+
+    // The tenant row was still created (the audit trail/resumability
+    // contract this whole state machine exists for) and stays honestly at
+    // `pending` — never advanced, never fabricated.
+    let (status,): (String,) =
+        sqlx::query_as("SELECT provisioning_status FROM tenant WHERE slug = 'acme-co'")
+            .fetch_one(&app.pool)
+            .await
+            .expect("the tenant row exists");
+    assert_eq!(status, "pending");
 }

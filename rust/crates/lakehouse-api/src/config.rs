@@ -53,8 +53,9 @@ pub enum ConfigError {
 /// `Debug` is implemented by hand (not derived) so secret fields
 /// (`ch_password`, `llm_key`, `embed_secret`, `alerts_run_token`,
 /// `smtp_pass`, `database_url`, `lakekeeper_credential_secret_ref`,
-/// `rustfs_access_key_secret_ref`, `rustfs_secret_key_secret_ref`) never
-/// appear in a `{:?}`-formatted log line. The three `*_secret_ref` fields
+/// `rustfs_access_key_secret_ref`, `rustfs_secret_key_secret_ref`,
+/// `tenant_warehouse_s3_access_key`, `tenant_warehouse_s3_secret_key`)
+/// never appear in a `{:?}`-formatted log line. The three `*_secret_ref` fields
 /// are references, not values (see `lakehouse_core::secret`'s module doc),
 /// but are redacted anyway as defense in depth against a caller pasting a
 /// raw secret into a reference field by mistake — the same stance
@@ -378,6 +379,70 @@ pub struct Config {
     /// with an empty-string token that would only surface as a confusing
     /// 401 from Lakekeeper later.
     pub lakekeeper_admin_token_file: String,
+    /// S3-compatible endpoint `POST /api/identity/tenants` creates tenant
+    /// Lakekeeper warehouses against. `None` when unset.
+    ///
+    /// A DEDICATED setting, not [`Self::rustfs_s3_endpoint`] (the process's
+    /// own object-store client config, used for the shared warehouse's
+    /// health check) — ADR 0002 Addendum 2's rule ("the allowlist must
+    /// never name a secret the API's own process depends on") applies here
+    /// by the same reasoning even though this is a plain endpoint URL, not
+    /// a `secretRef`: keeping tenant-warehouse provisioning's storage
+    /// config namespaced separately from this process's own means a future
+    /// change to one (e.g. rotating `RUSTFS_S3_ENDPOINT` for the shared
+    /// warehouse) cannot silently also repoint where every NEW tenant's
+    /// data lands. A deployment MAY set this to the same value as
+    /// `RUSTFS_S3_ENDPOINT` — the local compose stack does — but the two
+    /// settings are never read from each other.
+    ///
+    /// Together with [`Self::tenant_warehouse_s3_access_key`]/
+    /// [`Self::tenant_warehouse_s3_secret_key`], this being unset is what
+    /// makes tenant-warehouse provisioning REFUSE honestly
+    /// (`lakehouse_api::error::tenant_warehouse_storage_not_configured`)
+    /// rather than attempt a call `Lakekeeper` would reject — see
+    /// `routes::identity::create_tenant`'s module doc comment.
+    pub tenant_warehouse_s3_endpoint: Option<String>,
+    /// S3 region string sent to `Lakekeeper` for a tenant warehouse's
+    /// `storage-profile.region`. Non-secret, so — unlike the endpoint/
+    /// access-key/secret-key trio above — this has a sane default rather
+    /// than gating the "is tenant warehouse storage configured" check:
+    /// `RustFS`/most on-prem S3 gateways do not enforce AWS region
+    /// semantics but the S3 API requires *a* value, same rationale as
+    /// [`Self::rustfs_s3_region`]. Default `"us-east-1"`.
+    pub tenant_warehouse_s3_region: String,
+    /// `true` sends `storage-profile.path-style-access: true` — required
+    /// for `RustFS` and most on-prem S3 gateways, matching
+    /// `docker-compose.yml`'s `lakekeeper-warehouse-init` body. Default
+    /// `true`; a deployment fronting a virtual-hosted-style store (most of
+    /// AWS S3 today) sets this to `false`.
+    pub tenant_warehouse_s3_path_style_access: bool,
+    /// `true` sends `storage-profile.sts-enabled: true`, matching
+    /// `docker-compose.yml`'s `lakekeeper-warehouse-init` body — whether
+    /// `Lakekeeper` should vend STS-scoped credentials for tables under a
+    /// tenant's warehouse. Default `true`.
+    pub tenant_warehouse_sts_enabled: bool,
+    /// The role `Lakekeeper` assumes to vend a tenant warehouse's STS
+    /// credentials (`storage-profile.sts-role-arn`). Default matches
+    /// `docker-compose.yml`'s `lakekeeper-warehouse-init` literal — a
+    /// fixed dev/test ARN (`000000000000` is the well-known "no real AWS
+    /// account" id), not a real deployment's credential. Meaningless when
+    /// [`Self::tenant_warehouse_sts_enabled`] is `false`; still always
+    /// sent, mirroring the init body.
+    pub tenant_warehouse_sts_role_arn: String,
+    /// AWS-shaped access key id for the storage credential every tenant
+    /// warehouse is created with (`storage-credential.aws-access-key-id`).
+    /// `None` when unset — see [`Self::tenant_warehouse_s3_endpoint`]'s doc
+    /// comment for the "dedicated, not the process's own `RUSTFS_ACCESS_KEY`"
+    /// rationale and the honest-refusal behavior this being unset triggers.
+    pub tenant_warehouse_s3_access_key: Option<String>,
+    /// AWS-shaped secret access key for that same storage credential
+    /// (`storage-credential.aws-secret-access-key`). `None` when unset.
+    /// Redacted in [`Config`]'s `Debug` impl like every other secret field
+    /// here, and wrapped in [`lakehouse_auth::Secret`] the moment it
+    /// crosses into `lakehouse_auth::openfga` (see
+    /// `routes::identity::tenant_warehouse_storage`) — never logged, never
+    /// placed in an error.
+    pub tenant_warehouse_s3_secret_key: Option<String>,
     /// `ClickHouse` schema Gold marts live in (ADR 0010: `serving.*`).
     /// `routes::gold`'s export route reads `{gold_source_schema}.{mart}`.
     /// Default `"serving"`.
@@ -611,6 +676,40 @@ impl std::fmt::Debug for Config {
                 "lakekeeper_admin_token_file",
                 &self.lakekeeper_admin_token_file,
             )
+            .field(
+                "tenant_warehouse_s3_endpoint",
+                &self.tenant_warehouse_s3_endpoint,
+            )
+            .field(
+                "tenant_warehouse_s3_region",
+                &self.tenant_warehouse_s3_region,
+            )
+            .field(
+                "tenant_warehouse_s3_path_style_access",
+                &self.tenant_warehouse_s3_path_style_access,
+            )
+            .field(
+                "tenant_warehouse_sts_enabled",
+                &self.tenant_warehouse_sts_enabled,
+            )
+            .field(
+                "tenant_warehouse_sts_role_arn",
+                &self.tenant_warehouse_sts_role_arn,
+            )
+            .field(
+                "tenant_warehouse_s3_access_key",
+                &self
+                    .tenant_warehouse_s3_access_key
+                    .as_ref()
+                    .map(|_| REDACTED),
+            )
+            .field(
+                "tenant_warehouse_s3_secret_key",
+                &self
+                    .tenant_warehouse_s3_secret_key
+                    .as_ref()
+                    .map(|_| REDACTED),
+            )
             .field("gold_source_schema", &self.gold_source_schema)
             .field(
                 "gold_export_run_token",
@@ -821,6 +920,21 @@ impl Config {
                 "LAKEKEEPER_ADMIN_TOKEN_FILE",
                 "/tokens/admin.jwt",
             ),
+            tenant_warehouse_s3_endpoint: truthy(env, "TENANT_WAREHOUSE_S3_ENDPOINT"),
+            tenant_warehouse_s3_region: or_default(env, "TENANT_WAREHOUSE_S3_REGION", "us-east-1"),
+            tenant_warehouse_s3_path_style_access: env
+                .get("TENANT_WAREHOUSE_S3_PATH_STYLE_ACCESS")
+                .is_none_or(|v| v == "true"),
+            tenant_warehouse_sts_enabled: env
+                .get("TENANT_WAREHOUSE_STS_ENABLED")
+                .is_none_or(|v| v == "true"),
+            tenant_warehouse_sts_role_arn: or_default(
+                env,
+                "TENANT_WAREHOUSE_STS_ROLE_ARN",
+                "arn:aws:iam::000000000000:role/lakekeeper",
+            ),
+            tenant_warehouse_s3_access_key: truthy(env, "TENANT_WAREHOUSE_S3_ACCESS_KEY"),
+            tenant_warehouse_s3_secret_key: truthy(env, "TENANT_WAREHOUSE_S3_SECRET_KEY"),
             gold_source_schema: or_default(env, "GOLD_SOURCE_SCHEMA", "serving"),
             gold_export_run_token: truthy(env, "GOLD_EXPORT_RUN_TOKEN"),
             gold_export_max_rows: parse_u64_or_default(env, "GOLD_EXPORT_MAX_ROWS", 5_000_000),
@@ -1010,6 +1124,81 @@ mod tests {
             "/secrets/lakekeeper-admin.jwt"
         );
         assert_eq!(cfg.lakekeeper_base_url, "http://lakekeeper.internal:8181");
+    }
+
+    /// Unset by default — this being `None` is exactly what
+    /// `routes::identity::create_tenant` checks to refuse tenant
+    /// provisioning honestly instead of sending Lakekeeper a request built
+    /// from empty-string credentials.
+    #[test]
+    fn tenant_warehouse_storage_settings_default_to_unset_access_credentials() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert_eq!(cfg.tenant_warehouse_s3_endpoint, None);
+        assert_eq!(cfg.tenant_warehouse_s3_access_key, None);
+        assert_eq!(cfg.tenant_warehouse_s3_secret_key, None);
+        // Non-secret fields still get sane defaults, matching
+        // `docker-compose.yml`'s `lakekeeper-warehouse-init` body.
+        assert_eq!(cfg.tenant_warehouse_s3_region, "us-east-1");
+        assert!(cfg.tenant_warehouse_s3_path_style_access);
+        assert!(cfg.tenant_warehouse_sts_enabled);
+        assert_eq!(
+            cfg.tenant_warehouse_sts_role_arn,
+            "arn:aws:iam::000000000000:role/lakekeeper"
+        );
+    }
+
+    #[test]
+    fn tenant_warehouse_storage_settings_are_overridable() {
+        let env = map(&[
+            (
+                "TENANT_WAREHOUSE_S3_ENDPOINT",
+                "http://rustfs.internal:9000",
+            ),
+            ("TENANT_WAREHOUSE_S3_REGION", "eu-central-1"),
+            ("TENANT_WAREHOUSE_S3_PATH_STYLE_ACCESS", "false"),
+            ("TENANT_WAREHOUSE_STS_ENABLED", "false"),
+            (
+                "TENANT_WAREHOUSE_STS_ROLE_ARN",
+                "arn:aws:iam::123456789012:role/tenant-warehouse",
+            ),
+            ("TENANT_WAREHOUSE_S3_ACCESS_KEY", "tenant-access-key"),
+            ("TENANT_WAREHOUSE_S3_SECRET_KEY", "tenant-secret-key"),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        assert_eq!(
+            cfg.tenant_warehouse_s3_endpoint.as_deref(),
+            Some("http://rustfs.internal:9000")
+        );
+        assert_eq!(cfg.tenant_warehouse_s3_region, "eu-central-1");
+        assert!(!cfg.tenant_warehouse_s3_path_style_access);
+        assert!(!cfg.tenant_warehouse_sts_enabled);
+        assert_eq!(
+            cfg.tenant_warehouse_sts_role_arn,
+            "arn:aws:iam::123456789012:role/tenant-warehouse"
+        );
+        assert_eq!(
+            cfg.tenant_warehouse_s3_access_key.as_deref(),
+            Some("tenant-access-key")
+        );
+        assert_eq!(
+            cfg.tenant_warehouse_s3_secret_key.as_deref(),
+            Some("tenant-secret-key")
+        );
+    }
+
+    /// `Config`'s hand-written `Debug` never leaks the tenant-warehouse
+    /// secret pair, same guarantee every other secret field on this struct
+    /// already has (`ch_password`, `llm_key`, ...).
+    #[test]
+    fn tenant_warehouse_s3_credentials_are_redacted_in_debug_output() {
+        let env = map(&[
+            ("TENANT_WAREHOUSE_S3_ACCESS_KEY", "tenant-access-key"),
+            ("TENANT_WAREHOUSE_S3_SECRET_KEY", "tenant-secret-key"),
+        ]);
+        let cfg = Config::from_map(&env).unwrap();
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("tenant-access-key"));
+        assert!(!rendered.contains("tenant-secret-key"));
     }
 
     #[test]

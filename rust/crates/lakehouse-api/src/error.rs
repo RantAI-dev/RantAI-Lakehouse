@@ -9,6 +9,7 @@
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use lakehouse_auth::openfga::OpenfgaError;
 use lakehouse_core::ApiError;
 use serde::Serialize;
 
@@ -61,15 +62,48 @@ pub type ApiResult<T> = Result<T, ApiRejection>;
 /// `invalid_or_expired()` constructor-function convention
 /// (`lakehouse-core/src/error.rs:100-108`): a small named `fn` rather than
 /// building the string at each `routes::identity::provision_tenant` call
-/// site, so every provisioning failure renders identically. Deliberately
-/// never carries `lakehouse_auth::openfga::OpenfgaError`'s own message or
+/// site, so every provisioning failure of the same category renders
+/// identically. Deliberately never carries `OpenfgaError`'s own message or
 /// any upstream Lakekeeper response text (AGENTS.md: "upstream error text
 /// never reaches a response") — `OpenfgaError` itself already strips that
 /// (see its doc comment), but this constructor keeps the guarantee
 /// visible at the call site rather than relying on the callee alone.
+///
+/// Takes `cause` to pick one of two fixed messages — `OpenfgaError::Rejected`
+/// (Lakekeeper reached, our request refused — a `4xx`) reads differently
+/// from `Transport`/`Server` (Lakekeeper unreachable, or a `5xx`/unparseable
+/// response) — without ever repeating what Lakekeeper actually said.
 #[must_use]
-pub fn provisioning_unavailable() -> ApiError {
-    ApiError::Unavailable("tenant provisioning could not reach Lakekeeper".to_owned())
+pub fn provisioning_unavailable(cause: &OpenfgaError) -> ApiError {
+    let message = match cause {
+        OpenfgaError::Rejected => {
+            "tenant provisioning was rejected by Lakekeeper (a Lakekeeper request was reachable \
+             but refused)"
+        }
+        OpenfgaError::Transport | OpenfgaError::Server => {
+            "tenant provisioning could not reach Lakekeeper"
+        }
+    };
+    ApiError::Unavailable(message.to_owned())
+}
+
+/// A fixed 503 for `POST /api/identity/tenants` when this deployment has
+/// not set the dedicated `TENANT_WAREHOUSE_S3_*` settings tenant-warehouse
+/// provisioning requires — see `lakehouse_api::config::TenantWarehouseStorageConfig`'s
+/// doc comment for the exact fields. Named after the settings themselves
+/// (not just "unavailable") so an operator reading this response knows
+/// what to set, the same honest-and-specific posture the "no
+/// `lakekeeper_admin` client" branch in `routes::identity::create_tenant`
+/// already takes — this is that same branch's sibling for a Lakekeeper
+/// admin token that IS configured but whose tenant-warehouse storage
+/// settings are not.
+#[must_use]
+pub fn tenant_warehouse_storage_not_configured() -> ApiError {
+    ApiError::Unavailable(
+        "tenant warehouse storage is not configured: set TENANT_WAREHOUSE_S3_ENDPOINT, \
+         TENANT_WAREHOUSE_S3_ACCESS_KEY, and TENANT_WAREHOUSE_S3_SECRET_KEY"
+            .to_owned(),
+    )
 }
 
 #[cfg(test)]
@@ -179,5 +213,38 @@ mod tests {
             body_json(resp).await,
             json!({"error": "Code: 47. Unknown identifier: nope"})
         );
+    }
+
+    /// `OpenfgaError::Rejected` (Lakekeeper reached, our request refused)
+    /// must not render the same message `Transport`/`Server` do — the
+    /// whole point of splitting the cause categories.
+    #[test]
+    fn provisioning_unavailable_names_a_rejected_request_distinctly() {
+        let err = provisioning_unavailable(&OpenfgaError::Rejected);
+        assert_eq!(err.status(), 503);
+        assert!(err.to_string().contains("rejected"));
+        assert!(!err.to_string().contains("could not reach"));
+    }
+
+    /// `Transport`/`Server` share the "could not reach Lakekeeper" message
+    /// category — both mean the deployment cannot get a usable response
+    /// out of Lakekeeper at all, unlike a `Rejected` 4xx.
+    #[test]
+    fn provisioning_unavailable_groups_transport_and_server_together() {
+        let transport = provisioning_unavailable(&OpenfgaError::Transport);
+        let server = provisioning_unavailable(&OpenfgaError::Server);
+        assert_eq!(transport.to_string(), server.to_string());
+        assert!(transport.to_string().contains("could not reach"));
+    }
+
+    /// The honest refusal for unset tenant-warehouse storage settings
+    /// names the settings themselves, not a generic "unavailable".
+    #[test]
+    fn tenant_warehouse_storage_not_configured_names_the_settings() {
+        let err = tenant_warehouse_storage_not_configured();
+        assert_eq!(err.status(), 503);
+        assert!(err.to_string().contains("TENANT_WAREHOUSE_S3_ENDPOINT"));
+        assert!(err.to_string().contains("TENANT_WAREHOUSE_S3_ACCESS_KEY"));
+        assert!(err.to_string().contains("TENANT_WAREHOUSE_S3_SECRET_KEY"));
     }
 }
