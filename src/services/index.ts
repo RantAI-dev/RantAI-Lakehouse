@@ -69,10 +69,10 @@ export const goldService = goldClientService
 // Postgres, honest `supported: false` when no pool is configured. No mock
 // ever existed for this domain.
 export const notificationsService = notificationsClientService
-// SSO admin page (WS8 §Phase F) reads the live OIDC configuration
-// off the API process. Sessions page (WS8 §Phase F) lists and revokes
+// SSO admin page reads the live OIDC configuration
+// off the API process. Sessions page lists and revokes
 // live browser sessions via `GET /api/auth/sessions` and
-// `DELETE /api/auth/sessions/{id}` (WS8 §Phase D, D1/D2). Only `providers`,
+// `DELETE /api/auth/sessions/{id}`. Only `providers`,
 // `listSessions`, and `deleteSession` are registered — the other auth
 // methods (login/logout/me/change-password) stay imported directly by
 // `AuthProvider` and the login/change-password pages; see

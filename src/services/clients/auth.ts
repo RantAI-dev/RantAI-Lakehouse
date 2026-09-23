@@ -13,7 +13,7 @@ import { ServiceError } from "../errors";
  * `authService.providers`, and the page has no other way to ask "is OIDC
  * configured on this deployment" (`routes/auth.rs:731`). It is the only
  * auth method that fits the read-only, page-shaped pattern the rest of the
- * service registry follows. See WS8 §Phase F.
+ * service registry follows.
  */
 
 /** Mirrors `MeResponse` from `rust/crates/lakehouse-api/src/routes/auth.rs`. */
@@ -26,8 +26,7 @@ export type AuthUser = {
   // Slim {id, name, slug} view of every tenant the caller belongs to —
   // matches `lakehouse_store::identity::TenantSummary` exactly, so a
   // tenant-switcher can render a label without a second round trip.
-  // Empty for a service principal or when the follow-up read fails (WS8
-  // §Phase F).
+  // Empty for a service principal or when the follow-up read fails.
   tenants: { id: string; name: string; slug: string }[];
 };
 
@@ -102,9 +101,9 @@ export type ProvidersResponse = {
 };
 
 /**
- * `GET /api/auth/providers` (WS8 §Phase A). The OIDC runtime flag
+ * `GET /api/auth/providers`. The OIDC runtime flag
  * is read off the API process's in-memory `AuthState`/`Config`, so the
- * SSO admin page (WS8 §Phase F) can never drift from the
+ * SSO admin page can never drift from the
  * backend's real state the way a build-time flag could.
  */
 export async function providers(signal?: AbortSignal): Promise<ProvidersResponse> {
@@ -113,7 +112,7 @@ export async function providers(signal?: AbortSignal): Promise<ProvidersResponse
 }
 
 /**
- * `GET /api/auth/sessions` (WS8 §Phase D, D1). The route is the
+ * `GET /api/auth/sessions`. The route is the
  * ownership-aware listing: a caller without `identity:sessions:manage`
  * gets only their own live browser sessions; an admin gets all of them
  * (see `routes/auth.rs::sessions` and `lakehouse_store::sessions::list_
@@ -126,9 +125,9 @@ export async function listSessions(signal?: AbortSignal): Promise<Session[]> {
 }
 
 /**
- * `DELETE /api/auth/sessions/{id}` (WS8 §Phase D, D2). The route is
+ * `DELETE /api/auth/sessions/{id}`. The route is
  * 404-uniform for foreign ids, missing ids, and already-revoked ids
- * (Hard Requirement 4 — non-enumeration); from the client's point of view
+ * (non-enumeration); from the client's point of view
  * a 404 on revoke means "nothing to refresh, the row is gone or was
  * never yours," which we surface by letting `apiFetch`'s 404 drive the
  * `errorFor` mapping below.

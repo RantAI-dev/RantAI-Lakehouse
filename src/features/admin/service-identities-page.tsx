@@ -59,7 +59,7 @@ export function ServiceIdentitiesPage() {
   const [name, setName] = React.useState("")
   const [scopes, setScopes] = React.useState("")
   const [environment, setEnvironment] = React.useState("")
-  // WS8 §Phase F, Hard Requirement 5: the rotated secret is shown in the
+  // The rotated secret is shown in the
   // dialog below exactly once and is NEVER persisted to localStorage,
   // sessionStorage, or any service-layer cache entry. Kept as local
   // component state, cleared when the dialog closes, so re-renders of the

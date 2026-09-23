@@ -72,8 +72,8 @@ export type CreateServiceIdentityInput = {
 }
 
 /**
- * What `POST /api/identity/service-identities/{id}/rotate` returns
- * (WS8 §Phase E, Hard Requirement 5).
+ * What `POST /api/identity/service-identities/{id}/rotate` returns.
+ * The secret must never be persisted client-side beyond this one-shot read.
  *
  * `secret` is the freshly minted raw token, returned exactly once on this
  * response — `ServiceIdentity` itself has no secret/token_hash field, so

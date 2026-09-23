@@ -13,7 +13,7 @@
  * and `userAgent` round-trip as honest `null` for every session minted
  * today (both `routes/auth.rs::login` and `routes/auth.rs::oidc_callback`
  * pass `None` for them), so the shape keeps the null rather than a
- * fabricated placeholder (WS8 §Phase D).
+ * fabricated placeholder.
  */
 export type Session = {
   id: string;

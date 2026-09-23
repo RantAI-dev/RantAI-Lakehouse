@@ -43,7 +43,7 @@ type AuthContextValue = {
   /**
    * The tenant the caller is currently acting as — either the one they
    * last picked through the navbar's `TenantSwitcher` (persisted in
-   * `localStorage` as `lh_active_tenant`, WS8 §Phase F), or, when
+   * `localStorage` as `lh_active_tenant`), or, when
    * nothing is persisted yet, the first tenant they belong to. `null`
    * when the principal is loaded but belongs to zero tenants.
    */
@@ -53,7 +53,7 @@ type AuthContextValue = {
    * the next render of every `useAuth()` consumer reflects the choice.
    * The navbar's `TenantSwitcher` wires `onSwitch` to this AND to a
    * `router.refresh()` (see `app-navbar.tsx`) — every tenant-scoped
-   * list route reads `X-Tenant` at request time (WS8 §Phase C), so a
+   * list route reads `X-Tenant` at request time, so a
    * client-side re-filter would be dishonest (it would still be showing
    * data fetched under the OLD tenant's scope until the next real
    * request), which is why we force a server refetch instead.

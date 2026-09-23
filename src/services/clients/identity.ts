@@ -107,7 +107,7 @@ export const postgresIdentityService: IdentityService = {
       "Failed to create service identity"
     );
   },
-  // WS8 §Phase E: route was added in commit `840cfd6`. Returns the freshly
+  // Route was added in commit `840cfd6`. Returns the freshly
   // minted token in `secret` exactly once — see the contract type's
   // doc comment for why this shape is the only honest read-back. A 404
   // maps to `not_found`, anything else falls through to `errorFor`'s

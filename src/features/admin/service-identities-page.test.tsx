@@ -1,4 +1,4 @@
-// WS8 §Phase F, Hard Requirement 5. The Rotate button on the service
+// The Rotate button on the service
 // identities page MUST show the freshly-minted secret in a Dialog exactly
 // once, MUST trigger a list refetch so the row's new expiresAt /
 // rotationStatus land without a manual reload, MUST never persist the
@@ -157,7 +157,7 @@ function renderPage() {
   )
 }
 
-describe("ServiceIdentitiesPage rotate (WS8 §Phase F, Hard Requirement 5)", () => {
+describe("ServiceIdentitiesPage rotate (new secret shown once, never persisted)", () => {
   it("clicking Rotate calls POST /api/identity/service-identities/{id}/rotate with the row id", async () => {
     setupFetch({})
     renderPage()
@@ -196,7 +196,7 @@ describe("ServiceIdentitiesPage rotate (WS8 §Phase F, Hard Requirement 5)", () 
     expect(screen.getByText(/will not be shown again/i)).toBeDefined()
   })
 
-  it("the secret is never written to localStorage (Hard Requirement 5)", async () => {
+  it("the secret is never written to localStorage", async () => {
     setupFetch({
       rotateBody: {
         secret: "b".repeat(64),
@@ -207,8 +207,8 @@ describe("ServiceIdentitiesPage rotate (WS8 §Phase F, Hard Requirement 5)", () 
     await waitFor(() => expect(screen.getByText("ingestion-worker")).toBeDefined())
     fireEvent.click(screen.getByRole("button", { name: /rotate/i }))
     await screen.findByTestId("revealed-secret")
-    // Hard Requirement 5: "never persisted client-side beyond a
-    // one-shot dialog prop". `JSON.stringify(localStorage)` collapses
+    // The secret must never be persisted client-side beyond the
+    // one-shot dialog prop. `JSON.stringify(localStorage)` collapses
     // every key+value into one string; if the secret (or any fragment
     // long enough to be a fingerprint of it) leaked into storage, it
     // would surface here.

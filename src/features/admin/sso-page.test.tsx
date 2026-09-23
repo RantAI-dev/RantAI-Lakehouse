@@ -38,7 +38,7 @@ function mockProviders(body: unknown): void {
   ) as unknown as typeof fetch
 }
 
-describe("SsoPage (WS8 §Phase F)", () => {
+describe("SsoPage (reads live OIDC configuration)", () => {
   it("states OIDC is not configured when providers() reports oidc:false", async () => {
     mockProviders({ oidc: false, providerName: null })
     render(<SsoPage />)

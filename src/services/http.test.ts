@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test"
 import { apiFetch, __resetApiFetchRedirectStateForTests } from "./http"
 
-// WS8 plan Task F2: apiFetch attaches X-Tenant from the locally-persisted
+// apiFetch attaches X-Tenant from the locally-persisted
 // active tenant, and degrades silently (no header, never a throw) when the
 // tenant is unset or localStorage itself is unavailable.
 describe("apiFetch X-Tenant header", () => {

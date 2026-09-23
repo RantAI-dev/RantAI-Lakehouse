@@ -20,8 +20,8 @@
  * reacts to. Excluding that prefix is also what prevents a redirect loop
  * out of the login page itself.
  *
- * It also attaches `X-Tenant` when an active tenant is selected (WS8 plan
- * Task F2): the tenant picker (`TenantSwitcher`, Task F3) persists the
+ * It also attaches `X-Tenant` when an active tenant is selected: the
+ * tenant picker (`TenantSwitcher`) persists the
  * chosen tenant id to `localStorage` as a per-browser convenience — nothing
  * server-trusted hangs off it, the server still derives the authoritative
  * tenant scope from the session — so a request made before any tenant is

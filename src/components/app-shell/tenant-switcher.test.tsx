@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
 
-// WS8 §Phase F: `AuthProvider` calls `usePathname()` and `useRouter()`
+// `AuthProvider` calls `usePathname()` and `useRouter()`
 // at the top of the component (auth-provider.tsx:140-141). Both hooks
 // throw (or expect a Next.js AppRouter context) in a bare happy-dom
 // environment, so stub `next/navigation` at the module boundary before
@@ -36,7 +36,7 @@ const TENANTS = [
   { id: "b", name: "Beta", slug: "beta" },
 ]
 
-describe("TenantSwitcher (WS8 §Phase F)", () => {
+describe("TenantSwitcher (tenant picker)", () => {
   it("renders every tenant the user belongs to and marks the active one", () => {
     render(
       <TenantSwitcher tenants={TENANTS} activeTenantId="a" onSwitch={() => {}} />,
@@ -79,7 +79,7 @@ describe("TenantSwitcher (WS8 §Phase F)", () => {
 // the honest place to assert both the write side and the read-on-mount
 // contract — a pure `writeActiveTenantId` test alone would miss the
 // "exposed via useAuth" wiring the picker depends on.
-describe("AuthProvider tenant-state (WS8 §Phase F)", () => {
+describe("AuthProvider tenant-state (activeTenantId + setActiveTenant)", () => {
   const originalFetch = globalThis.fetch
 
   beforeEach(() => {

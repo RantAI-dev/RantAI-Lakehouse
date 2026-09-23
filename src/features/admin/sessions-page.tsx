@@ -11,14 +11,14 @@ import { authService } from "@/services"
 import type { Session } from "@/services/contracts/auth"
 
 /**
- * Sessions admin page (WS8 §Phase F). Reads `GET /api/auth/sessions`
- * (WS8 §Phase D, D1) and revokes with `DELETE /api/auth/sessions/{id}`
- * (WS8 §Phase D, D2). The page deliberately does not gate on
+ * Sessions admin page. Reads `GET /api/auth/sessions` and revokes with
+ * `DELETE /api/auth/sessions/{id}`. The page deliberately does not gate on
  * `identity:sessions:manage`: the ownership split lives server-side, so
  * any authenticated caller can render their own sessions — the revoke
  * button only succeeds for the caller's own sessions (or for any
- * session, with admin), and the route's 404-uniform behavior (Hard
- * Requirement 4) prevents the UI from being an enumeration oracle.
+ * session, with admin), and the route's uniform 404 behavior for both a
+ * missing id and a foreign id prevents the UI from being an enumeration
+ * oracle.
  */
 export function SessionsPage() {
   const state = useService((signal) => authService.listSessions(signal), [])

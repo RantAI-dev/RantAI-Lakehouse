@@ -7,7 +7,7 @@ import { useService } from "@/hooks/use-service"
 import { authService } from "@/services"
 
 /**
- * SSO admin page (WS8 §Phase F). Reads `GET /api/auth/providers`
+ * SSO admin page. Reads `GET /api/auth/providers`
  * to honestly report whether OIDC is configured on this deployment — the
  * flag is a runtime read of the API process's `AuthState`/`Config` (see
  * `routes/auth.rs:731`), so this page can never drift from the backend's
@@ -17,7 +17,7 @@ import { authService } from "@/services"
  * Deliberately does NOT read `OIDC_ROLE_MAP` over HTTP. Role mapping is
  * an env var on the API process, not a backend resource; the page text
  * surfaces the literal below so a future reader searching for it lands
- * here instead of inventing a role-map endpoint (plan Deviation D4). The
+ * here instead of inventing a role-map endpoint. The
  * same posture applies to `OIDC_CLIENT_SECRET` — neither secret ever
  * crosses the `/api/auth/*` wire.
  */

@@ -64,7 +64,7 @@ function mockSessions(sessionsBody: unknown): void {
   ) as unknown as typeof fetch
 }
 
-describe("SessionsPage (WS8 §Phase F)", () => {
+describe("SessionsPage (list + revoke)", () => {
   it("lists sessions and revokes one on click", async () => {
     mockSessions([
       {
