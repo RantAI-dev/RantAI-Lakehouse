@@ -597,11 +597,13 @@ pub struct ConnectorDialInfo {
 /// parse happens BEFORE any write.
 #[derive(Debug, Clone)]
 pub struct IngestSpecInput {
-    /// One of `sql | cdc | files | rest | sheets` — the value
-    /// [`crate::ingest_spec::Dial::parse`] dispatches on.
+    /// One of `sql | cdc | files | rest | sheets | mongodb | kafka | sftp`
+    /// — the value [`crate::ingest_spec::Dial::parse`] dispatches on.
     pub adapter: String,
-    /// `"batch" | "cdc"`, matching `connector_ingest_mode_check`
-    /// (`0033_connector_ingest_spec.sql`).
+    /// `"batch" | "cdc" | "stream"`, matching `connector_ingest_mode_check`
+    /// (`0033_connector_ingest_spec.sql`, widened by
+    /// `0043_ingest_tier2_adapters.sql` to admit `"stream"` for the
+    /// `kafka` adapter).
     pub ingest_mode: String,
     /// Validated by [`crate::ingest_spec::Dial::parse`] against the shape
     /// `adapter` names. Never free-form at the application level, even
@@ -874,15 +876,16 @@ pub async fn record_test_result(
 pub struct IngestibleConnector {
     /// `connector.id`.
     pub id: String,
-    /// One of `sql | cdc | files | rest | sheets` — never `NULL` here,
-    /// since [`list_ingestible_connectors`] only selects rows where
-    /// `adapter IS NOT NULL`.
+    /// One of `sql | cdc | files | rest | sheets | mongodb | kafka | sftp`
+    /// — never `NULL` here, since [`list_ingestible_connectors`] only
+    /// selects rows where `adapter IS NOT NULL`.
     pub adapter: String,
-    /// `"batch" | "cdc"`. `set_ingest_spec` always writes this in the
-    /// same `UPDATE` as `adapter`, so a row this query selects (`adapter
-    /// IS NOT NULL`) has always had `ingest_mode` written too in
-    /// practice — but see this struct's `# Note` if that invariant is
-    /// ever weakened.
+    /// `"batch" | "cdc" | "stream"` (the last one only for a `kafka`
+    /// adapter — see [`IngestSpecInput::ingest_mode`]). `set_ingest_spec`
+    /// always writes this in the same `UPDATE` as `adapter`, so a row
+    /// this query selects (`adapter IS NOT NULL`) has always had
+    /// `ingest_mode` written too in practice — but see this struct's
+    /// `# Note` if that invariant is ever weakened.
     pub ingest_mode: String,
     /// Validated at `set_ingest_spec` time against
     /// [`crate::ingest_spec::Dial::parse`] for this row's `adapter`.

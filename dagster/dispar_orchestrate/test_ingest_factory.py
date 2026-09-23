@@ -25,7 +25,12 @@ import requests
 
 from dispar_orchestrate.adapters.kafka import BatchResult
 from dispar_orchestrate.adapters.sink import SinkResult
-from dispar_orchestrate.ingest_factory import IngestFactoryConfig, build_ingest_schedules, run_kafka_stream_batch
+from dispar_orchestrate.ingest_factory import (
+    IngestFactoryConfig,
+    UnknownAdapter,
+    build_ingest_schedules,
+    run_kafka_stream_batch,
+)
 
 
 def test_build_ingest_schedules_returns_empty_when_api_is_unreachable(monkeypatch) -> None:
@@ -260,6 +265,278 @@ def test_run_one_object_routes_a_postgres_driver_sql_connector_through_dlt_pipel
     assert from_dial_calls == [(connector["dial"], {"password": "s3cret"}, [obj])]
     assert recorded[0]["status"] == "succeeded"
     assert recorded[0]["rows"] == 42
+
+
+def test_run_one_object_routes_an_oracle_driver_sql_connector_through_the_oracle_adapter(monkeypatch) -> None:
+    """`adapters/sql.py::build_source` has no `oracle` branch at all
+    (`_DRIVERNAMES` only names `mysql`/`mariadb`) -- Oracle is dispatched
+    to `adapters/oracle.py::build_source` instead, and the load is NEVER
+    wrapped in `ssrf_guard.pinned_resolution`: oracle's own `build_source`
+    already dialed the resolved IP literal inside its own
+    `checking_resolver()` scope before returning."""
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+
+    oracle_calls = []
+    pinned_calls = []
+
+    def fake_oracle_build_source(dial, secrets, source_objects):
+        oracle_calls.append((dial, secrets, source_objects))
+        return type("R", (), {"source": iter(()), "resolved": f.ssrf_guard.ResolvedAddress("10.0.0.9", 1521, 2)})()
+
+    monkeypatch.setattr(f.oracle_adapter, "build_source", fake_oracle_build_source)
+    monkeypatch.setattr(f.sink_adapter, "load_via_sink", lambda *a, **k: f.sink_adapter.SinkResult(
+        rows=7, has_failed_jobs=False, load_info_str=""
+    ))
+
+    def poisoned_pinned_resolution(host, resolved):
+        pinned_calls.append((host, resolved))
+        raise AssertionError("oracle's own build_source already guarded the dial -- must not be wrapped again")
+
+    monkeypatch.setattr(f.ssrf_guard, "pinned_resolution", poisoned_pinned_resolution)
+    # `_ADAPTERS["sql"]` (adapters/sql.py) must never be reached for
+    # driver="oracle" -- poison it so this test fails loudly if the
+    # routing branch is missed.
+    monkeypatch.setattr(
+        f,
+        "_ADAPTERS",
+        {
+            "sql": type(
+                "A",
+                (),
+                {"build_source": staticmethod(lambda dial, secrets, objs: (_ for _ in ()).throw(AssertionError(
+                    "adapters/sql.py must never be called for an oracle-driver connector"
+                )))},
+            )()
+        },
+    )
+
+    connector = {
+        "id": "conn-oracle",
+        "adapter": "sql",
+        "dial": {"driver": "oracle", "host": "ora.internal", "port": 1521, "database": "ORCLPDB1", "user": "reader"},
+        "secretRef": "env:CONNECTOR_ORACLE_PASSWORD",
+        "secretRefSecondary": None,
+    }
+    obj = {"name": "SCHEMA.ORDERS", "target": "orders"}
+    f._run_one_object(connector, obj)
+
+    assert oracle_calls == [(connector["dial"], {"password": "s3cret"}, [obj])]
+    assert pinned_calls == []  # never wrapped -- oracle guards its own dial
+    assert recorded[0]["status"] == "succeeded"
+    assert recorded[0]["rows"] == 7
+
+
+def test_run_one_object_routes_a_mongodb_connector_through_the_mongodb_adapter_without_wrapping_in_pinned_resolution(
+    monkeypatch,
+) -> None:
+    """`mongodb` was entirely absent from `_ADAPTERS` -- a mongodb
+    connector had no dispatch arm at all. Once added, its load must never
+    go through `ssrf_guard.pinned_resolution`: `build_source.resolved` is
+    a LIST of every seed host's `ResolvedAddress`, not the single address
+    `pinned_resolution` takes, and the adapter's own `_collection_rows`
+    already guards the whole read with `checking_resolver()`."""
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+
+    mongo_calls = []
+    pinned_calls = []
+
+    def fake_mongo_build_source(dial, secrets, source_objects):
+        mongo_calls.append((dial, secrets, source_objects))
+        return type(
+            "R",
+            (),
+            {
+                "sources": {source_objects[0]["target"]: iter([{"_id": 1}])},
+                "resolved": [f.ssrf_guard.ResolvedAddress("10.0.0.5", 27017, 2)],
+            },
+        )()
+
+    monkeypatch.setattr(f.mongodb_adapter, "build_source", fake_mongo_build_source)
+    monkeypatch.setattr(f.sink_adapter, "load_via_sink", lambda *a, **k: f.sink_adapter.SinkResult(
+        rows=1, has_failed_jobs=False, load_info_str=""
+    ))
+
+    def poisoned_pinned_resolution(host, resolved):
+        pinned_calls.append((host, resolved))
+        raise AssertionError("mongodb's own checking_resolver already guards the read -- must not be wrapped again")
+
+    monkeypatch.setattr(f.ssrf_guard, "pinned_resolution", poisoned_pinned_resolution)
+
+    connector = {
+        "id": "conn-mongo",
+        "adapter": "mongodb",
+        "dial": {"hosts": ["mongo.internal:27017"], "database": "app", "username": "reader"},
+        "secretRef": "env:CONNECTOR_MONGO_PASSWORD",
+        "secretRefSecondary": None,
+    }
+    obj = {"name": "orders", "target": "orders"}
+    f._run_one_object(connector, obj)
+
+    assert mongo_calls == [(connector["dial"], {"password": "s3cret"}, [obj])]
+    assert pinned_calls == []
+    assert recorded[0]["status"] == "succeeded"
+    assert recorded[0]["rows"] == 1
+
+
+def test_run_one_object_routes_an_sftp_connector_through_the_sftp_adapter_without_wrapping_in_pinned_resolution(
+    monkeypatch,
+) -> None:
+    """`sftp` was entirely absent from `_ADAPTERS`. Once added, its load
+    must never go through `ssrf_guard.pinned_resolution` a second time:
+    `adapters/sftp.py::build_source` already wraps its own
+    `client.connect()` in that same context manager, and reads the file
+    fully into memory, before this function ever sees a source."""
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+
+    sftp_calls = []
+    pinned_calls = []
+
+    def fake_sftp_build_source(dial, secrets, source_objects):
+        sftp_calls.append((dial, secrets, source_objects))
+        return type(
+            "R",
+            (),
+            {
+                "sources": {source_objects[0]["target"]: iter([{"a": "1"}])},
+                "resolved": f.ssrf_guard.ResolvedAddress("10.0.0.7", 22, 2),
+            },
+        )()
+
+    monkeypatch.setattr(f.sftp_adapter, "build_source", fake_sftp_build_source)
+    monkeypatch.setattr(f.sink_adapter, "load_via_sink", lambda *a, **k: f.sink_adapter.SinkResult(
+        rows=1, has_failed_jobs=False, load_info_str=""
+    ))
+
+    def poisoned_pinned_resolution(host, resolved):
+        pinned_calls.append((host, resolved))
+        raise AssertionError("sftp's own build_source already pinned the connect -- must not be wrapped again")
+
+    monkeypatch.setattr(f.ssrf_guard, "pinned_resolution", poisoned_pinned_resolution)
+
+    connector = {
+        "id": "conn-sftp",
+        "adapter": "sftp",
+        "dial": {
+            "host": "sftp.internal",
+            "port": 22,
+            "user": "lakehouse",
+            "hostKeyFingerprint": "SHA256:deadbeef",
+            "path": "/outbox",
+            "fileFormat": "csv",
+            "auth": {"type": "password"},
+        },
+        "secretRef": "env:CONNECTOR_SFTP_PASSWORD",
+        "secretRefSecondary": None,
+    }
+    obj = {"name": "orders.csv", "target": "orders"}
+    f._run_one_object(connector, obj)
+
+    assert sftp_calls == [(connector["dial"], {"password": "s3cret"}, [obj])]
+    assert pinned_calls == []
+    assert recorded[0]["status"] == "succeeded"
+    assert recorded[0]["rows"] == 1
+
+
+def test_run_one_object_raises_unknown_adapter_by_name_for_an_unrecognized_adapter(monkeypatch) -> None:
+    # A future adapter value that reaches this factory with no dispatch
+    # arm must fail loudly and NAME the adapter -- never a silent skip
+    # (AGENTS.md principle 3, fail closed) and never a bare KeyError.
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+    monkeypatch.setattr(f, "secret_field_names", lambda adapter, auth_type: ("password",))
+    connector = {
+        "id": "conn-future",
+        "adapter": "smtp",
+        "dial": {},
+        "secretRef": "env:CONNECTOR_SMTP_PASSWORD",
+        "secretRefSecondary": None,
+    }
+    with pytest.raises(UnknownAdapter, match="smtp"):
+        f._run_one_object(connector, {"name": "x", "target": "x"})
+    assert recorded[0]["status"] == "failed"
+
+
+def test_run_ingest_dispatches_a_stream_mode_kafka_connector_to_run_kafka_stream_batch(monkeypatch) -> None:
+    """`run_ingest` had no arm for `ingest_mode == "stream"` at all -- a
+    kafka connector's op body fell straight into the per-object
+    `_run_one_object` loop, which has no `kafka` dispatch of its own
+    either. `_run_stream_connector` is the arm `run_ingest` now calls
+    BEFORE that loop for any `ingestMode == "stream"` connector."""
+    import dispar_orchestrate.ingest_factory as f
+
+    calls = []
+    monkeypatch.setattr(f, "run_kafka_stream_batch", lambda **kw: calls.append(kw))
+    monkeypatch.setattr(
+        f.secret_resolver,
+        "resolve_secret_ref",
+        lambda ref: {"env:CONNECTOR_KAFKA_USERNAME": "svc-reader", "env:CONNECTOR_KAFKA_PASSWORD": "s3cret"}[ref],
+    )
+
+    connector = {
+        "id": "conn-kafka",
+        "adapter": "kafka",
+        "ingestMode": "stream",
+        "dial": {
+            "bootstrapServers": ["broker.internal:9092"],
+            "topic": "orders",
+            "auth": {"type": "sasl_plain", "username": "orders-reader"},
+            "groupId": "lakehouse-orders-consumer",
+            "microBatchSeconds": 30,
+        },
+        "sourceObjects": [{"name": "orders", "target": "orders"}],
+        "secretRef": "env:CONNECTOR_KAFKA_USERNAME",
+        "secretRefSecondary": "env:CONNECTOR_KAFKA_PASSWORD",
+    }
+    f._run_stream_connector(connector)
+
+    assert len(calls) == 1
+    assert calls[0]["connector_id"] == "conn-kafka"
+    assert calls[0]["spec"] == connector["dial"]
+    assert calls[0]["secrets"] == {"username": "svc-reader", "password": "s3cret"}
+    assert calls[0]["source_objects"] == connector["sourceObjects"]
+
+
+def test_run_ingest_never_calls_run_one_object_for_a_stream_mode_connector(monkeypatch) -> None:
+    # Proves the dispatch order inside run_ingest itself: a stream-mode
+    # connector must never fall into the per-object batch loop, even if
+    # it happens to carry a non-empty sourceObjects list.
+    import dispar_orchestrate.ingest_factory as f
+    from dagster import build_op_context
+
+    monkeypatch.setattr(f, "_run_stream_connector", lambda connector: None)
+    monkeypatch.setattr(
+        f, "_run_one_object", lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("a stream-mode connector must never reach the batch per-object loop")
+        )
+    )
+    connector = {
+        "id": "conn-kafka",
+        "adapter": "kafka",
+        "ingestMode": "stream",
+        "dial": {},
+        "sourceObjects": [{"name": "orders", "target": "orders"}],
+        "secretRef": None,
+        "secretRefSecondary": None,
+    }
+    monkeypatch.setattr(f, "_fetch_one_connector", lambda cfg, connector_id: connector)
+    monkeypatch.setattr(f.IngestFactoryConfig, "from_env", staticmethod(lambda: f.IngestFactoryConfig(api_url="http://x", service_token="t")))
+    context = build_op_context(op_config={"connector_id": "conn-kafka"})
+    f.run_ingest(context)
 
 
 # ── run_kafka_stream_batch ────────────────────────────────────────────────

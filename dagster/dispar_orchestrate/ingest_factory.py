@@ -40,6 +40,34 @@ gives them full protection; `mssql` pins via a raw ODBC connection string
 (`adapters/sql.py::_mssql_connection_string`) with no resolver call of its
 own to intercept.
 
+`mongodb`, `oracle` (a `sql`-adapter `driver`) and `sftp` do NOT go
+through that same `pinned_resolution` wrap -- each guards its own dial
+already, inside its own `build_source`, before `_run_one_object` ever
+sees a result: `mongodb.build_source` wraps the whole document read in
+`ssrf_guard.checking_resolver()` (its `resolved` is a LIST of every seed
+host, not the single address `pinned_resolution` takes); `oracle.build_source`
+dials a resolved IP LITERAL inside its own `checking_resolver()` scope,
+so there is no hostname left for a second wrap to protect; `sftp.build_source`
+wraps its own `client.connect()` in `pinned_resolution` and reads the
+file into memory before returning. `_run_one_object` dispatches all
+three to their own arms specifically so it can skip the generic wrap
+deliberately for each, rather than double-wrapping or passing a list
+where `pinned_resolution` expects one address. `kafka` never reaches
+`_run_one_object` at all -- see "Streaming" below.
+
+# Streaming
+
+A `kafka`-adapter connector's `ingest_mode` is `"stream"`, never
+`"batch"` (`connector_ingest_mode_check`, widened by
+`0043_ingest_tier2_adapters.sql`) -- `run_ingest` dispatches it to
+`_run_stream_connector`/`run_kafka_stream_batch` BEFORE the per-object
+loop below runs, since a streaming connector has no `sourceObjects` loop
+of its own: one micro-batch, from one bounded `consumer.poll()` window,
+covers the whole connector. `run_kafka_stream_batch`'s own docstring
+covers its SSRF posture (`ssrf_guard_kafka.check_all_advertised_brokers`
+plus a `checking_resolver()` scope around the whole poll loop) and its
+at-least-once commit ordering.
+
 # Postgres routing
 
 `adapters/sql.py::build_source` deliberately REFUSES `driver in
@@ -80,7 +108,10 @@ from kafka.structs import OffsetAndMetadata
 
 from dispar_orchestrate import dlt_pipeline, secret_resolver, ssrf_guard
 from dispar_orchestrate.adapters import files as files_adapter
+from dispar_orchestrate.adapters import mongodb as mongodb_adapter
+from dispar_orchestrate.adapters import oracle as oracle_adapter
 from dispar_orchestrate.adapters import rest as rest_adapter
+from dispar_orchestrate.adapters import sftp as sftp_adapter
 from dispar_orchestrate.adapters import sheets as sheets_adapter
 from dispar_orchestrate.adapters import sink as sink_adapter
 from dispar_orchestrate.adapters import sql as sql_adapter
@@ -92,6 +123,15 @@ from dispar_orchestrate.secret_map import secret_field_names
 from dispar_orchestrate.secret_resolver import SecretRefRejected
 
 _POSTGRES_DRIVERS = ("postgres", "postgresql")
+
+
+class UnknownAdapter(Exception):
+    """`connector["adapter"]` names no dispatch arm this factory knows how
+    to run -- raised BY NAME rather than left to surface as a bare
+    `KeyError` from a dict lookup, so a future adapter added to the
+    `connector_type`/`connector` CHECK constraints (`0033_connector_ingest_spec.sql`,
+    `0043_ingest_tier2_adapters.sql`) without a matching dispatch arm here
+    fails loudly and legibly at run time, never a silent no-op."""
 
 
 def _env(name: str, default: str) -> str:
@@ -180,7 +220,14 @@ def _sanitize_name(connector_id: str) -> str:
     return "".join(c if c.isalnum() or c == "_" else "_" for c in connector_id)
 
 
-_ADAPTERS = {"sql": sql_adapter, "files": files_adapter, "rest": rest_adapter, "sheets": sheets_adapter}
+_ADAPTERS = {
+    "sql": sql_adapter,
+    "files": files_adapter,
+    "rest": rest_adapter,
+    "sheets": sheets_adapter,
+    "mongodb": mongodb_adapter,
+    "sftp": sftp_adapter,
+}
 
 
 def _host_of(dial: dict) -> str | None:
@@ -210,8 +257,18 @@ def _resolve_object_secrets(connector: dict, adapter_name: str, dial: dict) -> d
     Raises `SecretRefRejected` if either required ref is missing, not
     allowlisted, or (for `env:` refs) unset in this environment.
     """
-    auth_type = dial.get("auth", {}).get("type") if adapter_name == "rest" else None
+    # secret_map.py's `_AUTH_TYPE_KEYED_ADAPTERS` -- rest/kafka/sftp are
+    # the three adapters whose secret-field count depends on
+    # `dial.auth.type`; every other adapter's mapping key always pairs
+    # with `None`, even for a connector whose dial happens to carry an
+    # "auth" object for some other reason.
+    auth_type = dial.get("auth", {}).get("type") if adapter_name in ("rest", "kafka", "sftp") else None
     fields = secret_field_names(adapter_name, auth_type)
+    if not fields:
+        # ("kafka", "none"): a PLAINTEXT broker needs no secret at all --
+        # never call resolve_secret_ref on a primary slot the connector
+        # was never required to set (mirrors secret_resolver.resolve_secrets).
+        return {}
     values = [secret_resolver.resolve_secret_ref(connector.get("secretRef"))]
     if len(fields) == 2:
         values.append(secret_resolver.resolve_secret_ref(connector.get("secretRefSecondary")))
@@ -269,13 +326,64 @@ def _run_one_object(connector: dict, obj: dict) -> None:
             _record(rows=outcome["rows"], status="succeeded")
             return
 
-        adapter = _ADAPTERS[adapter_name]
+        if adapter_name == "sql" and dial.get("driver") == "oracle":
+            # adapters/oracle.py's own build_source ALREADY dials the
+            # resolved IP literal inside its own `ssrf_guard.checking_resolver()`
+            # scope (see that module's docstring) before this function
+            # ever sees the result -- `resolved` here is real, but wrapping
+            # the load below in `ssrf_guard.pinned_resolution` too would
+            # be a second, redundant guard around a connection that (a)
+            # already happened at schema-reflection time and (b) dials an
+            # IP literal, never `dial["host"]` by name again. `oracle` is
+            # therefore dispatched here, never through the generic
+            # `_ADAPTERS` path below, precisely so this arm can skip that
+            # wrap deliberately instead of it silently never firing (the
+            # generic path's `_host_of` would find `dial["host"]` and
+            # apply it "by accident" otherwise).
+            result = oracle_adapter.build_source(dial, secrets, [obj])
+            outcome = sink_adapter.load_via_sink(
+                result.source,
+                obj["target"],
+                sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env()),
+            )
+            _record(rows=outcome.rows, status="succeeded")
+            return
+
+        adapter = _ADAPTERS.get(adapter_name)
+        if adapter is None:
+            raise UnknownAdapter(f"ingest_factory: no adapter dispatch for adapter={adapter_name!r}")
+
         if adapter_name == "sheets":
             result = adapter.build_source(dial, secrets)
             if not result.supported:
                 _record(rows=None, status="unsupported", error=result.reason or "")
                 return
             source, resolved = result.source, None
+        elif adapter_name == "mongodb":
+            # mongodb.build_source guards its OWN read: `_collection_rows`
+            # wraps the whole document iteration in
+            # `ssrf_guard.checking_resolver()` (see that module's
+            # docstring). `result.resolved` is a LIST of every seed
+            # host's `ResolvedAddress` -- NOT the single address
+            # `ssrf_guard.pinned_resolution` takes -- so `resolved` is set
+            # to `None` here deliberately, the same way the `sheets` arm
+            # above sets it, to keep this connector on the "already
+            # guarded, do not wrap again" path below rather than passing
+            # a list where one address is expected.
+            result = adapter.build_source(dial, secrets, [obj])
+            source, resolved = result.sources[obj["target"]], None
+        elif adapter_name == "sftp":
+            # sftp.build_source already wraps its OWN `client.connect(...)`
+            # in `ssrf_guard.pinned_resolution(spec["host"], resolved)`
+            # before it returns, AND reads the file into memory eagerly
+            # inside that same call (see that module's docstring) -- by
+            # the time this function has a source, the guarded dial has
+            # already happened and there is no further network access
+            # left for a second wrap to protect. `resolved` is set to
+            # `None` here for the same "do not double-wrap" reason the
+            # `mongodb` arm above states.
+            result = adapter.build_source(dial, secrets, [obj])
+            source, resolved = result.sources[obj["target"]], None
         else:
             result = adapter.build_source(dial, secrets, [obj])
             source, resolved = result.source, result.resolved
@@ -368,6 +476,36 @@ def run_kafka_stream_batch(
             consumer.close()
 
 
+def _run_stream_connector(connector: dict) -> None:
+    """Dispatch a `kafka`-adapter, `ingest_mode="stream"` connector
+    (`connector_ingest_mode_check`, widened to admit `"stream"` by
+    `0043_ingest_tier2_adapters.sql`) to `run_kafka_stream_batch` -- the
+    ONLY connector shape that function is built for (see its own
+    docstring: "one scheduled micro-batch for a kafka-adapter,
+    ingest_mode='stream' connector"). It is never reached through
+    `_run_one_object`/`_ADAPTERS`: a streaming connector has no per-object
+    loop, one micro-batch covers every `sourceObjects` entry via a single
+    `KafkaConsumer` subscription.
+
+    Secrets resolve through the SAME `secret_resolver.resolve_secrets`
+    helper (never `_resolve_object_secrets`, which is `_run_one_object`'s
+    own private helper) -- `("kafka", "none")`'s empty fields tuple means
+    a PLAINTEXT broker resolves zero secrets, never a `SecretRefRejected`
+    for a `secretRef` the connector was never required to set.
+    """
+    dial = connector["dial"]
+    auth_type = dial.get("auth", {}).get("type")
+    secrets = secret_resolver.resolve_secrets(
+        "kafka", auth_type, connector.get("secretRef"), connector.get("secretRefSecondary")
+    )
+    run_kafka_stream_batch(
+        connector_id=connector["id"],
+        spec=dial,
+        secrets=secrets,
+        source_objects=connector.get("sourceObjects", []),
+    )
+
+
 @op(config_schema={"connector_id": Field(str, description="The connector.id (adapter IS NOT NULL) to ingest.")})
 def run_ingest(context) -> None:
     connector_id: str = context.op_config["connector_id"]
@@ -379,6 +517,13 @@ def run_ingest(context) -> None:
             "snapshot.mode=initial (ADR 0008) runs ingestion automatically once its compose "
             "service starts, outside this job entirely"
         )
+        return
+    if connector.get("ingestMode") == "stream":
+        # The only ingest_mode a batch-shaped per-object loop below
+        # cannot run: a kafka connector's rows arrive from one bounded
+        # consumer.poll() loop over the whole topic, not from a
+        # build_source() call per sourceObjects entry.
+        _run_stream_connector(connector)
         return
     for obj in connector.get("sourceObjects", []):
         _run_one_object(connector, obj)
