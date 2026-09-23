@@ -7,9 +7,13 @@ each test asserts run BEFORE any connection attempt.
 """
 from __future__ import annotations
 
-import pytest
+import datetime
+import decimal
 
-from dispar_orchestrate.adapters.mongodb import build_source
+import pytest
+from bson import Binary, Decimal128, ObjectId
+
+from dispar_orchestrate.adapters.mongodb import _bson_safe, build_source
 from dispar_orchestrate.ssrf_guard import ResolvedAddress, SsrfBlocked
 from dispar_orchestrate.ssrf_guard_mongo import MongoConfigRejected
 
@@ -145,6 +149,68 @@ def test_reading_refuses_a_document_whose_first_row_carries_a_nested_value():
     rows = mongodb._collection_rows(_NestedCollection())
     with pytest.raises(column_gate.UnsupportedColumnType, match="tags"):
         list(rows)
+
+
+# ── _bson_safe ──────────────────────────────────────────────────────────
+
+
+def test_bson_safe_converts_an_objectid_to_its_hex_string():
+    oid = ObjectId("64b7f9e2c2a4f1a2b3c4d5e6")
+    assert _bson_safe(oid) == "64b7f9e2c2a4f1a2b3c4d5e6"
+    assert isinstance(_bson_safe(oid), str)
+
+
+def test_bson_safe_converts_a_decimal128_to_a_python_decimal_not_a_lossy_float():
+    result = _bson_safe(Decimal128("19.99"))
+    assert result == decimal.Decimal("19.99")
+    assert isinstance(result, decimal.Decimal)
+
+
+def test_bson_safe_strips_the_binary_subclass_down_to_plain_bytes():
+    result = _bson_safe(Binary(b"\x00\x01\xff"))
+    assert result == b"\x00\x01\xff"
+    assert type(result) is bytes  # not the Binary subclass -- see this module's docstring
+
+
+def test_bson_safe_passes_a_datetime_through_unchanged():
+    now = datetime.datetime(2026, 9, 18, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    assert _bson_safe(now) is now
+
+
+def test_bson_safe_passes_ordinary_scalars_through_unchanged():
+    assert _bson_safe("plain") == "plain"
+    assert _bson_safe(42) == 42
+    assert _bson_safe(None) is None
+    assert _bson_safe(True) is True
+
+
+def test_bson_safe_recurses_into_a_nested_document_and_array():
+    oid = ObjectId("64b7f9e2c2a4f1a2b3c4d5e6")
+    doc = {
+        "owner": {"ref": oid, "balance": Decimal128("5.00")},
+        "tags": [oid, {"blob": Binary(b"x")}],
+    }
+    result = _bson_safe(doc)
+    assert result["owner"]["ref"] == "64b7f9e2c2a4f1a2b3c4d5e6"
+    assert result["owner"]["balance"] == decimal.Decimal("5.00")
+    assert result["tags"][0] == "64b7f9e2c2a4f1a2b3c4d5e6"
+    assert result["tags"][1]["blob"] == b"x"
+
+
+def test_reading_documents_converts_the_default_objectid_id_to_a_string():
+    """Every real collection's default `_id` is an `ObjectId` -- this is
+    the case that broke ingestion of ANY real collection before
+    `_bson_safe` was wired into `_collection_rows`."""
+    from dispar_orchestrate.adapters import mongodb
+
+    oid = ObjectId("64b7f9e2c2a4f1a2b3c4d5e6")
+
+    class _RealIdCollection:
+        def find(self, _query):
+            yield {"_id": oid, "name": "widget"}
+
+    rows = list(mongodb._collection_rows(_RealIdCollection()))
+    assert rows == [{"_id": "64b7f9e2c2a4f1a2b3c4d5e6", "name": "widget"}]
 
 
 def test_reading_accepts_a_flat_document():

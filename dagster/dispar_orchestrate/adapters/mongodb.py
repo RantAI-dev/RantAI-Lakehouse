@@ -12,17 +12,61 @@ host names itself, lazily, when documents are first pulled. The read
 therefore runs inside `ssrf_guard.checking_resolver` (see
 `_collection_rows`), so every address the driver actually dials is
 validated at connect time, not merely the names checked beforehand.
+
+BSON TYPES ARE NOT JSON-SAFE (the bug this module's `_bson_safe` closes):
+`pymongo` decodes every document through `bson`, whose scalar types go
+beyond what `json`/dlt's normalizer accepts. Every REAL collection has an
+`_id` -- an `ObjectId` by default -- so this broke ingestion of any
+collection, not an edge case. `_bson_safe` converts, recursively (a
+matched value can be nested inside a `dict`/`list` the column gate above
+did not reject, since that gate only inspects the sample's TOP-LEVEL
+values -- see `column_gate.py`'s own docstring):
+- `ObjectId` -> its hex string (`str(value)`): the conventional, lossless
+  text form every Mongo tool already uses to display or round-trip one.
+- `Decimal128` -> `value.to_decimal()`, a Python `decimal.Decimal` -- dlt
+  has a real, native `decimal` column type (unlike `float`, which would
+  silently lose precision on the exact values `Decimal128` exists to
+  carry).
+- `bytes`/`bson.Binary` (a `bytes` subclass) -> plain `bytes(value)`: dlt
+  infers a column's type from the Python value's OWN type, and stripping
+  the `Binary` subclass wrapper is what makes that inference land on
+  dlt's normal `bytes` handling rather than an unrecognized subclass.
+- `datetime.datetime` -> passed through unchanged: dlt's normalizer
+  already accepts `datetime` natively (the same type `sql`/`files`
+  already hand it via SQLAlchemy/`csv` rows), so no conversion is needed
+  or performed.
+- Every other scalar (`str`, `int`, `float`, `bool`, `None`) -> unchanged.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Iterator
 
+from bson import Binary, Decimal128, ObjectId
 from pymongo import MongoClient
 
 from dispar_orchestrate import ssrf_guard
 from dispar_orchestrate.column_gate import reject_unsupported_column_types_from_sample
 from dispar_orchestrate.ssrf_guard_mongo import resolve_all_seed_hosts, validate_mongo_dial
+
+
+def _bson_safe(value: Any) -> Any:
+    """Recursively convert BSON-specific values (see this module's
+    docstring) to the JSON-safe/dlt-native Python types the sink expects.
+    `dict`/`list` recurse so a BSON value nested inside an otherwise
+    ordinary embedded document or array is still converted, even though
+    the column gate does not reject that nesting outright."""
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, Decimal128):
+        return value.to_decimal()
+    if isinstance(value, Binary):
+        return bytes(value)
+    if isinstance(value, dict):
+        return {key: _bson_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_bson_safe(item) for item in value]
+    return value
 
 
 @dataclass(frozen=True)
@@ -60,7 +104,14 @@ def _collection_rows(collection, *, checking_resolver=ssrf_guard.checking_resolv
             # for a guarantee it still could not make.
             if index == 0:
                 reject_unsupported_column_types_from_sample(document)
-            yield document
+            # _bson_safe AFTER the gate: converting `ObjectId`/`Decimal128`/
+            # `Binary` to plain str/Decimal/bytes never changes whether a
+            # top-level value is a `list`/`dict` (the ONLY thing the gate
+            # above inspects), so running the gate on the original document
+            # or the converted one rejects the exact same documents either
+            # way — converting first would just do the recursive walk on
+            # documents the gate is about to reject anyway.
+            yield _bson_safe(document)
 
 
 def build_source(
