@@ -5,6 +5,7 @@ import type {
   ConnectorTestResult,
   ConnectorType,
   CreateConnectorInput,
+  CreateConnectorResponse,
   DebeziumProperties,
   DiscoverResult,
   IngestibleConnector,
@@ -86,7 +87,7 @@ export const postgresConnectorService: ConnectorService = {
     return getJson<ConnectorDetail>(`/api/connectors/${encodeURIComponent(id)}`, { signal });
   },
   createConnector(input: CreateConnectorInput, signal) {
-    return postJson<Connector>("/api/connectors", input, signal);
+    return postJson<CreateConnectorResponse>("/api/connectors", input, signal);
   },
   testConnection(id, signal) {
     return postJson<ConnectorTestResult>(`/api/connectors/${encodeURIComponent(id)}/test`, undefined, signal);

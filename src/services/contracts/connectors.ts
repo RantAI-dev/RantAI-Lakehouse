@@ -85,19 +85,56 @@ export type ProbeHistoryResponse = {
 export type SecretSlot = "primary" | "secondary"
 
 /**
- * The `PUT /api/connectors/{id}/secret` body. `newSecretRef` NAMES an
- * already-provisioned credential reference (e.g. `"env:MY_SECRET"`) --
- * it never carries a secret value itself, same rule as
- * `CreateConnectorInput.secretRef`. The server runs a real connectivity
- * probe against a candidate built with this ref BEFORE writing anything
- * -- see `rust/crates/lakehouse-api/src/routes/connectors.rs::rotate_secret`'s
+ * Which resolver scheme a derived connector-credential name uses. Mirrors
+ * Rust `CredentialSource` (`rust/crates/lakehouse-store/src/connectors.rs`)
+ * field-for-field, including its `snake_case` wire form.
+ */
+export type CredentialSource = "env" | "file"
+
+/**
+ * The fixed suffix a derived connector-credential name ends in. Mirrors
+ * Rust `CredentialKind` — ADR 0002 Addendum 3's five allowed suffixes,
+ * `snake_case` wire form.
+ */
+export type CredentialKind = "password" | "secret_key" | "access_key" | "api_key" | "token"
+
+/**
+ * What the client chooses for a connector's credential(s): a source scheme
+ * and a kind per slot. Never a reference NAME -- the client does not know
+ * the connector's id yet (the server generates it), so it cannot name a
+ * ref itself. The server derives the actual name(s) from the id it
+ * generates and returns them once, in `CreateConnectorResponse.credential`
+ * (see `docs/adr/0002-secretref-resolution.md`'s Addendum 3).
+ */
+export type CredentialSpec = {
+  source: CredentialSource
+  primary: CredentialKind
+  /**
+   * Optional secondary slot, e.g. the secret-access-key half of an S3
+   * connector's access-key/secret-key pair. Without this, an API-created S3
+   * connector can never be tested — `connector_probe::probe_s3` requires
+   * both slots to be set.
+   */
+  secondary?: CredentialKind
+}
+
+/**
+ * The `PUT /api/connectors/{id}/secret` body. No free-text ref any more
+ * (ADR 0002 Addendum 3): the caller chooses a source/kind for the slot
+ * being rotated, and the server derives the new ref from the CONNECTOR'S
+ * OWN id (a derived `env:` name always begins `CONNECTOR_CONN_`, so a
+ * rotation can never target one of the deployment's reserved, seeded
+ * patterns). The server runs a real connectivity probe against a
+ * candidate built with the derived ref BEFORE writing anything -- see
+ * `rust/crates/lakehouse-api/src/routes/connectors.rs::rotate_secret`'s
  * doc comment for the full probe-first contract, including why an
  * unverifiable rotation is refused (422) rather than applied
  * unverified.
  */
 export type RotateConnectorSecretRequest = {
   slot: SecretSlot
-  newSecretRef: string
+  source: CredentialSource
+  kind: CredentialKind
 }
 
 /**
@@ -116,19 +153,34 @@ export type CreateConnectorInput = {
   type: string
   direction: Connector["direction"]
   host: string
-  secretRef: string
-  /**
-   * Optional secondary reference, e.g. the secret-access-key half of an S3
-   * connector's access-key/secret-key pair. Without this, an API-created S3
-   * connector can never be tested — `connector_probe::probe_s3` requires
-   * both `secretRef` and `secretRefSecondary` to be set.
-   */
-  secretRefSecondary?: string
+  /** No `secretRef`/`secretRefSecondary` field any more (ADR 0002
+   * Addendum 3) -- see `CredentialSpec`'s doc comment. */
+  credential: CredentialSpec
   environment: string
   tenant: string
   residency: string
   capabilities: string[]
   owner?: string
+}
+
+/**
+ * The credential reference NAMES a newly created connector's operator
+ * must provision -- returned ONCE, by `POST /api/connectors`, and never
+ * again (no GET response for this connector repeats them). Mirrors Rust
+ * `ConnectorCredentialNames`.
+ */
+export type ConnectorCredentialNames = {
+  primary: string
+  secondary: string | null
+}
+
+/**
+ * The `POST /api/connectors` response body: the created `Connector` plus
+ * the names the operator must provision. Mirrors Rust
+ * `CreateConnectorResponse`.
+ */
+export type CreateConnectorResponse = Connector & {
+  credential: ConnectorCredentialNames
 }
 
 /**
@@ -419,7 +471,7 @@ export type IngestibleConnector = {
 export interface ConnectorService {
   listConnectors(signal?: AbortSignal): Promise<Connector[]>
   getConnector(id: string, signal?: AbortSignal): Promise<ConnectorDetail>
-  createConnector(input: CreateConnectorInput, signal?: AbortSignal): Promise<Connector>
+  createConnector(input: CreateConnectorInput, signal?: AbortSignal): Promise<CreateConnectorResponse>
   testConnection(id: string, signal?: AbortSignal): Promise<ConnectorTestResult>
   getIngestSpec(id: string, signal?: AbortSignal): Promise<IngestSpec>
   setIngestSpec(id: string, input: IngestSpecInput, signal?: AbortSignal): Promise<IngestSpec>
