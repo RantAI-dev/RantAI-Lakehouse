@@ -23,12 +23,36 @@ use lakehouse_store::StoreError;
 use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::connector_probe_result::list_probe_results;
 use lakehouse_store::connectors::{
-    CreateConnectorInput, IngestSpecInput, SecretSlot, create_connector, delete_connector,
-    get_connector, get_connector_dial_info, get_ingest_spec, list_connectors,
-    list_ingestible_connectors, record_test_result, set_ingest_spec, swap_secret_ref,
+    CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec, IngestSpecInput,
+    SecretSlot, create_connector, delete_connector, get_connector, get_connector_dial_info,
+    get_ingest_spec, list_connectors, list_ingestible_connectors, record_test_result,
+    set_ingest_spec, swap_secret_ref,
 };
 use lakehouse_store::pipelines::{CreatePipelineInput, create_pipeline};
 use sqlx::PgPool;
+
+/// A single-slot `env:`-sourced credential spec -- the shape every test in
+/// this file that does not care about the specific derived name uses.
+fn single_credential() -> CredentialSpec {
+    CredentialSpec {
+        source: CredentialSource::Env,
+        primary: CredentialKind::Token,
+        secondary: None,
+    }
+}
+
+/// A two-slot `env:`-sourced credential spec -- `primary`/`secondary` use
+/// DIFFERENT kinds (`Token`/`SecretKey`), not the same one twice: the same
+/// id + source + kind always derives the SAME name
+/// ([`derive_secret_ref`]'s whole contract), so two slots that need to be
+/// distinct names must pick distinct kinds.
+fn two_slot_credential() -> CredentialSpec {
+    CredentialSpec {
+        source: CredentialSource::Env,
+        primary: CredentialKind::Token,
+        secondary: Some(CredentialKind::SecretKey),
+    }
+}
 
 /// P6 shrank the seed to the two connector types this build can actually
 /// dial (`0022_prune_connector_seed.sql`) — see that migration's header
@@ -53,33 +77,32 @@ async fn created_connector_never_carries_host_or_secret_ref_on_the_wire(
         kind: "REST API".to_owned(),
         direction: "source".to_owned(),
         host: "super-secret-internal-host.example".to_owned(),
-        secret_ref: "env:LEAK_TEST_TOKEN".to_owned(),
-        secret_ref_secondary: None,
+        credential: single_credential(),
         environment: "staging".to_owned(),
         tenant: "Meridian Group".to_owned(),
         residency: "in-region".to_owned(),
         capabilities: vec![],
         owner: None,
     };
-    let created = create_connector(&pool, &input).await.unwrap();
+    let (created, credential_names) = create_connector(&pool, &input).await.unwrap();
 
     let as_json = serde_json::to_value(&created).unwrap();
     assert!(as_json.get("host").is_none());
     assert!(as_json.get("secretRef").is_none());
     let raw = serde_json::to_string(&as_json).unwrap();
     assert!(!raw.contains("super-secret-internal-host"));
-    assert!(!raw.contains("LEAK_TEST_TOKEN"));
+    assert!(!raw.contains(&credential_names.primary));
 
     // Also true of the list/detail reads, not just the create response.
     let list = list_connectors(&pool).await.unwrap();
     let list_json = serde_json::to_string(&list).unwrap();
     assert!(!list_json.contains("super-secret-internal-host"));
-    assert!(!list_json.contains("LEAK_TEST_TOKEN"));
+    assert!(!list_json.contains(&credential_names.primary));
 
     let detail = get_connector(&pool, &created.id).await.unwrap().unwrap();
     let detail_json = serde_json::to_string(&detail).unwrap();
     assert!(!detail_json.contains("super-secret-internal-host"));
-    assert!(!detail_json.contains("LEAK_TEST_TOKEN"));
+    assert!(!detail_json.contains(&credential_names.primary));
 
     Ok(())
 }
@@ -93,8 +116,7 @@ async fn create_connector_rejects_duplicate_name(pool: PgPool) -> sqlx::Result<(
         kind: "REST API".to_owned(),
         direction: "source".to_owned(),
         host: "h".to_owned(),
-        secret_ref: "env:X".to_owned(),
-        secret_ref_secondary: None,
+        credential: single_credential(),
         environment: "staging".to_owned(),
         tenant: "Meridian Group".to_owned(),
         residency: String::new(),
@@ -113,15 +135,14 @@ async fn create_connector_rejects_duplicate_name(pool: PgPool) -> sqlx::Result<(
 async fn dependent_pipelines_are_derived_from_pipeline_definition(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let connector = create_connector(
+    let (connector, _credential_names) = create_connector(
         &pool,
         &CreateConnectorInput {
             name: "dependents test connector".to_owned(),
             kind: "REST API".to_owned(),
             direction: "source".to_owned(),
             host: "h".to_owned(),
-            secret_ref: "env:X".to_owned(),
-            secret_ref_secondary: None,
+            credential: single_credential(),
             environment: "staging".to_owned(),
             tenant: "Meridian Group".to_owned(),
             residency: String::new(),
@@ -308,15 +329,14 @@ async fn delete_connector_removes_the_row(pool: PgPool) -> sqlx::Result<()> {
         kind: "REST API".to_owned(),
         direction: "source".to_owned(),
         host: "h".to_owned(),
-        secret_ref: "env:DELETE_ME".to_owned(),
-        secret_ref_secondary: None,
+        credential: single_credential(),
         environment: "staging".to_owned(),
         tenant: "Meridian Group".to_owned(),
         residency: String::new(),
         capabilities: vec![],
         owner: None,
     };
-    let created = create_connector(&pool, &input).await.unwrap();
+    let (created, _credential_names) = create_connector(&pool, &input).await.unwrap();
 
     let deleted = delete_connector(&pool, &created.id).await.unwrap();
     assert!(deleted);
@@ -341,15 +361,14 @@ async fn delete_connector_unknown_id_is_false_not_an_error(pool: PgPool) -> sqlx
 /// is the only thing that ever moves them.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_new_connector_starts_unknown_and_untested(pool: PgPool) -> sqlx::Result<()> {
-    let created = create_connector(
+    let (created, _credential_names) = create_connector(
         &pool,
         &CreateConnectorInput {
             name: "freshly created connector".to_owned(),
             kind: "REST API".to_owned(),
             direction: "source".to_owned(),
             host: "h".to_owned(),
-            secret_ref: "env:X".to_owned(),
-            secret_ref_secondary: None,
+            credential: single_credential(),
             environment: "staging".to_owned(),
             tenant: "Meridian Group".to_owned(),
             residency: String::new(),
@@ -377,15 +396,14 @@ async fn a_new_connector_starts_unknown_and_untested(pool: PgPool) -> sqlx::Resu
 /// SUPPORTED probe is meaningful evidence.
 #[sqlx::test(migrations = "../../migrations")]
 async fn an_unsupported_probe_does_not_stamp_a_test_time(pool: PgPool) -> sqlx::Result<()> {
-    let created = create_connector(
+    let (created, _credential_names) = create_connector(
         &pool,
         &CreateConnectorInput {
             name: "unsupported probe connector".to_owned(),
             kind: "Kafka".to_owned(),
             direction: "source".to_owned(),
             host: "h".to_owned(),
-            secret_ref: "env:X".to_owned(),
-            secret_ref_secondary: None,
+            credential: single_credential(),
             environment: "staging".to_owned(),
             tenant: "Meridian Group".to_owned(),
             residency: String::new(),
@@ -421,15 +439,14 @@ async fn an_unsupported_probe_does_not_stamp_a_test_time(pool: PgPool) -> sqlx::
 /// time and `health`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_supported_probe_stamps_time_and_health(pool: PgPool) -> sqlx::Result<()> {
-    let created = create_connector(
+    let (created, _credential_names) = create_connector(
         &pool,
         &CreateConnectorInput {
             name: "supported probe connector".to_owned(),
             kind: "REST API".to_owned(),
             direction: "source".to_owned(),
             host: "h".to_owned(),
-            secret_ref: "env:X".to_owned(),
-            secret_ref_secondary: None,
+            credential: single_credential(),
             environment: "staging".to_owned(),
             tenant: "Meridian Group".to_owned(),
             residency: String::new(),
@@ -580,8 +597,7 @@ fn minimal_input(name: &str) -> CreateConnectorInput {
         kind: "REST API".to_owned(),
         direction: "source".to_owned(),
         host: "api.example.internal".to_owned(),
-        secret_ref: "env:INGEST_SPEC_TEST_TOKEN".to_owned(),
-        secret_ref_secondary: None,
+        credential: single_credential(),
         environment: "staging".to_owned(),
         tenant: "Meridian Group".to_owned(),
         residency: "in-region".to_owned(),
@@ -619,9 +635,10 @@ fn cdc_spec_fixture() -> IngestSpecInput {
 /// `dial` rather than guessing them from the connector's `id`.
 #[sqlx::test(migrations = "../../migrations")]
 async fn get_connector_dial_info_includes_adapter_and_dial(pool: PgPool) -> sqlx::Result<()> {
-    let created = create_connector(&pool, &minimal_input("dial info adapter and dial"))
-        .await
-        .unwrap();
+    let (created, _credential_names) =
+        create_connector(&pool, &minimal_input("dial info adapter and dial"))
+            .await
+            .unwrap();
     let spec = cdc_spec_fixture();
     set_ingest_spec(&pool, &created.id, &spec).await.unwrap();
 
@@ -648,9 +665,10 @@ async fn get_connector_dial_info_includes_adapter_and_dial(pool: PgPool) -> sqlx
 /// meaningfully.
 #[sqlx::test(migrations = "../../migrations")]
 async fn set_ingest_spec_then_get_round_trips(pool: PgPool) -> sqlx::Result<()> {
-    let created = create_connector(&pool, &minimal_input("ingest spec round trip"))
-        .await
-        .unwrap();
+    let (created, credential_names) =
+        create_connector(&pool, &minimal_input("ingest spec round trip"))
+            .await
+            .unwrap();
     let spec = IngestSpecInput {
         adapter: "sql".to_owned(),
         ingest_mode: "batch".to_owned(),
@@ -671,7 +689,7 @@ async fn set_ingest_spec_then_get_round_trips(pool: PgPool) -> sqlx::Result<()> 
     assert_eq!(read.ingest_mode.as_deref(), Some("batch"));
     assert_eq!(read.dial, spec.dial);
     assert_eq!(read.schedule_cron.as_deref(), Some("0 * * * *"));
-    assert_eq!(read.secret_refs.primary, "env:INGEST_SPEC_TEST_TOKEN");
+    assert_eq!(read.secret_refs.primary, credential_names.primary);
     assert_eq!(read.secret_refs.secondary, None);
     Ok(())
 }
@@ -684,11 +702,12 @@ async fn set_ingest_spec_then_get_round_trips(pool: PgPool) -> sqlx::Result<()> 
 async fn list_ingestible_connectors_carries_the_secret_ref_name_never_resolved(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let never_configured = create_connector(&pool, &minimal_input("never given an ingest spec"))
-        .await
-        .unwrap();
+    let (never_configured, _credential_names) =
+        create_connector(&pool, &minimal_input("never given an ingest spec"))
+            .await
+            .unwrap();
 
-    let created = create_connector(&pool, &minimal_input("ingestible listing"))
+    let (created, credential_names) = create_connector(&pool, &minimal_input("ingestible listing"))
         .await
         .unwrap();
     let spec = IngestSpecInput {
@@ -718,7 +737,7 @@ async fn list_ingestible_connectors_carries_the_secret_ref_name_never_resolved(
     assert_eq!(row.dial, spec.dial);
     assert_eq!(row.source_objects, spec.source_objects);
     assert_eq!(row.schedule_cron.as_deref(), Some("0 * * * *"));
-    assert_eq!(row.secret_ref, "env:INGEST_SPEC_TEST_TOKEN");
+    assert_eq!(row.secret_ref, credential_names.primary);
     assert_eq!(row.secret_ref_secondary, None);
     Ok(())
 }
@@ -731,9 +750,10 @@ async fn list_ingestible_connectors_carries_the_secret_ref_name_never_resolved(
 async fn set_ingest_spec_rejects_a_dial_that_fails_adapter_validation(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let created = create_connector(&pool, &minimal_input("ingest spec invalid dial"))
-        .await
-        .unwrap();
+    let (created, _credential_names) =
+        create_connector(&pool, &minimal_input("ingest spec invalid dial"))
+            .await
+            .unwrap();
     let spec = IngestSpecInput {
         adapter: "sql".to_owned(),
         ingest_mode: "batch".to_owned(),
@@ -770,9 +790,10 @@ async fn set_ingest_spec_rejects_a_dial_that_fails_adapter_validation(
 async fn set_ingest_spec_rejects_basic_auth_rest_with_only_one_secret_ref(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let created = create_connector(&pool, &minimal_input("rest basic auth one secret"))
-        .await
-        .unwrap();
+    let (created, _credential_names) =
+        create_connector(&pool, &minimal_input("rest basic auth one secret"))
+            .await
+            .unwrap();
     let spec = IngestSpecInput {
         adapter: "rest".to_owned(),
         ingest_mode: "batch".to_owned(),
@@ -805,10 +826,10 @@ async fn set_ingest_spec_rejects_basic_auth_rest_with_only_one_secret_ref(
 async fn set_ingest_spec_accepts_basic_auth_rest_with_two_secret_refs(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let created = create_connector(
+    let (created, _credential_names) = create_connector(
         &pool,
         &CreateConnectorInput {
-            secret_ref_secondary: Some("env:INGEST_SPEC_TEST_TOKEN_SECONDARY".to_owned()),
+            credential: two_slot_credential(),
             ..minimal_input("rest basic auth two secrets")
         },
     )
@@ -842,9 +863,10 @@ async fn set_ingest_spec_accepts_basic_auth_rest_with_two_secret_refs(
 async fn set_ingest_spec_accepts_sheets_adapter_with_one_secret_ref(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let created = create_connector(&pool, &minimal_input("sheets adapter one secret"))
-        .await
-        .unwrap();
+    let (created, _credential_names) =
+        create_connector(&pool, &minimal_input("sheets adapter one secret"))
+            .await
+            .unwrap();
     let spec = IngestSpecInput {
         adapter: "sheets".to_owned(),
         ingest_mode: "batch".to_owned(),
@@ -865,9 +887,10 @@ async fn set_ingest_spec_accepts_sheets_adapter_with_one_secret_ref(
 async fn set_ingest_spec_rejects_files_adapter_with_only_one_secret_ref(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let created = create_connector(&pool, &minimal_input("files adapter one secret rejected"))
-        .await
-        .unwrap();
+    let (created, _credential_names) =
+        create_connector(&pool, &minimal_input("files adapter one secret rejected"))
+            .await
+            .unwrap();
     let spec = IngestSpecInput {
         adapter: "files".to_owned(),
         ingest_mode: "batch".to_owned(),
@@ -888,10 +911,10 @@ async fn set_ingest_spec_rejects_files_adapter_with_only_one_secret_ref(
 async fn set_ingest_spec_accepts_files_adapter_with_two_secret_refs(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let created = create_connector(
+    let (created, _credential_names) = create_connector(
         &pool,
         &CreateConnectorInput {
-            secret_ref_secondary: Some("env:INGEST_SPEC_TEST_TOKEN_SECONDARY".to_owned()),
+            credential: two_slot_credential(),
             ..minimal_input("files adapter two secrets")
         },
     )
@@ -942,8 +965,7 @@ fn probe_history_test_input(name: &str) -> CreateConnectorInput {
         kind: "REST API".to_owned(),
         direction: "source".to_owned(),
         host: "h".to_owned(),
-        secret_ref: "env:X".to_owned(),
-        secret_ref_secondary: None,
+        credential: single_credential(),
         environment: "staging".to_owned(),
         tenant: "Meridian Group".to_owned(),
         residency: String::new(),
@@ -959,9 +981,10 @@ fn probe_history_test_input(name: &str) -> CreateConnectorInput {
 /// timestamp rather than each calling `now()` independently.
 #[sqlx::test(migrations = "../../migrations")]
 async fn supported_probe_writes_exactly_one_history_row(pool: PgPool) -> sqlx::Result<()> {
-    let created = create_connector(&pool, &probe_history_test_input("history: supported"))
-        .await
-        .unwrap();
+    let (created, _credential_names) =
+        create_connector(&pool, &probe_history_test_input("history: supported"))
+            .await
+            .unwrap();
 
     let result = record_test_result(&pool, &created.id, true, true, Some(37), "ok, real dial")
         .await
@@ -985,9 +1008,10 @@ async fn supported_probe_writes_exactly_one_history_row(pool: PgPool) -> sqlx::R
 /// (same rule `connector.health`/`lastTestAt` already follow).
 #[sqlx::test(migrations = "../../migrations")]
 async fn unsupported_probe_writes_no_history_row(pool: PgPool) -> sqlx::Result<()> {
-    let created = create_connector(&pool, &probe_history_test_input("history: unsupported"))
-        .await
-        .unwrap();
+    let (created, _credential_names) =
+        create_connector(&pool, &probe_history_test_input("history: unsupported"))
+            .await
+            .unwrap();
 
     record_test_result(&pool, &created.id, false, false, None, "unsupported")
         .await
@@ -1022,9 +1046,10 @@ async fn unknown_connector_probe_writes_nothing(pool: PgPool) -> sqlx::Result<()
 /// newest 200 -- `insert_and_trim`'s per-connector cap.
 #[sqlx::test(migrations = "../../migrations")]
 async fn probe_history_is_trimmed_to_the_newest_two_hundred(pool: PgPool) -> sqlx::Result<()> {
-    let created = create_connector(&pool, &probe_history_test_input("history: trim"))
-        .await
-        .unwrap();
+    let (created, _credential_names) =
+        create_connector(&pool, &probe_history_test_input("history: trim"))
+            .await
+            .unwrap();
 
     for i in 0..205 {
         record_test_result(
@@ -1058,9 +1083,10 @@ async fn probe_history_is_trimmed_to_the_newest_two_hundred(pool: PgPool) -> sql
 async fn list_probe_results_returns_newest_first_and_honours_limit(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let created = create_connector(&pool, &probe_history_test_input("history: ordering"))
-        .await
-        .unwrap();
+    let (created, _credential_names) =
+        create_connector(&pool, &probe_history_test_input("history: ordering"))
+            .await
+            .unwrap();
 
     for i in 0..5 {
         record_test_result(
@@ -1092,9 +1118,10 @@ async fn list_probe_results_returns_newest_first_and_honours_limit(
 /// `0044_connector_probe_result.sql`).
 #[sqlx::test(migrations = "../../migrations")]
 async fn deleting_a_connector_cascades_its_probe_history(pool: PgPool) -> sqlx::Result<()> {
-    let created = create_connector(&pool, &probe_history_test_input("history: cascade"))
-        .await
-        .unwrap();
+    let (created, _credential_names) =
+        create_connector(&pool, &probe_history_test_input("history: cascade"))
+            .await
+            .unwrap();
     record_test_result(&pool, &created.id, true, true, Some(1), "ok")
         .await
         .unwrap();
@@ -1125,9 +1152,10 @@ async fn deleting_a_connector_cascades_its_probe_history(pool: PgPool) -> sqlx::
 async fn swap_secret_ref_rotates_the_primary_slot_when_expected_old_matches(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let created = create_connector(&pool, &minimal_input("rotate primary target"))
-        .await
-        .unwrap();
+    let (created, _credential_names) =
+        create_connector(&pool, &minimal_input("rotate primary target"))
+            .await
+            .unwrap();
     let before = get_connector_dial_info(&pool, &created.id)
         .await
         .unwrap()
@@ -1159,9 +1187,10 @@ async fn swap_secret_ref_rotates_the_primary_slot_when_expected_old_matches(
 async fn swap_secret_ref_with_a_stale_expected_old_is_a_conflict_and_leaves_the_value_unchanged(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let created = create_connector(&pool, &minimal_input("rotate stale target"))
-        .await
-        .unwrap();
+    let (created, credential_names) =
+        create_connector(&pool, &minimal_input("rotate stale target"))
+            .await
+            .unwrap();
 
     let err = swap_secret_ref(
         &pool,
@@ -1182,7 +1211,7 @@ async fn swap_secret_ref_with_a_stale_expected_old_is_a_conflict_and_leaves_the_
         .unwrap()
         .unwrap();
     assert_eq!(
-        after.secret_ref, "env:INGEST_SPEC_TEST_TOKEN",
+        after.secret_ref, credential_names.primary,
         "a failed swap must never touch the stored value"
     );
     Ok(())
@@ -1213,9 +1242,10 @@ async fn swap_secret_ref_on_an_unknown_id_is_not_found(pool: PgPool) -> sqlx::Re
 async fn swap_secret_ref_sets_a_null_secondary_slot_when_expected_old_is_none(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let created = create_connector(&pool, &minimal_input("rotate secondary target"))
-        .await
-        .unwrap();
+    let (created, _credential_names) =
+        create_connector(&pool, &minimal_input("rotate secondary target"))
+            .await
+            .unwrap();
     let before = get_connector_dial_info(&pool, &created.id)
         .await
         .unwrap()

@@ -68,6 +68,42 @@ pub async fn spin_up() -> TestApp {
 /// without losing the others' fail-fast behaviour, and can set config-only
 /// keys (e.g. `AGENT_RUN_TOKEN`) that [`spin_up`] never sets at all.
 pub async fn spin_up_with_env(overrides: &HashMap<String, String>) -> TestApp {
+    let (state, pool) = build_state_and_pool(overrides).await;
+    let router = lakehouse_api::routes::router(state);
+    TestApp { router, pool }
+}
+
+/// Same as [`spin_up_with_env`], but replaces
+/// [`AppState::connector_secret_resolver`] with `resolver` before the
+/// router is built.
+///
+/// Exists for the ONE test that needs to prove a derived connector-credential
+/// name (ADR 0002 Addendum 3) actually resolves and a `PUT
+/// /api/connectors/{id}/secret` rotation lands
+/// (`connector_secret_rotate.rs`'s `a_derived_secret_ref_resolves_and_the_rotation_lands`)
+/// — without calling `std::env::set_var` (which would mutate process-wide
+/// state shared with every other test in this binary, running
+/// concurrently) and without provisioning a real `/run/secrets` file. The
+/// resolver is swapped on the already-built [`AppState`], the same way
+/// `routes::connectors`'s own unit tests
+/// (`state_with_stub_secret_resolver`) do it — that field is `pub` for
+/// exactly this reason.
+pub async fn spin_up_with_connector_secret_resolver(
+    overrides: &HashMap<String, String>,
+    resolver: std::sync::Arc<dyn lakehouse_core::secret::DynSecretResolver>,
+) -> TestApp {
+    let (mut state, pool) = build_state_and_pool(overrides).await;
+    state.connector_secret_resolver = resolver;
+    let router = lakehouse_api::routes::router(state);
+    TestApp { router, pool }
+}
+
+/// Shared by [`spin_up_with_env`] and
+/// [`spin_up_with_connector_secret_resolver`]: provisions a fresh,
+/// migrated, isolated database and builds the [`AppState`] over it, but
+/// stops short of building the router — the one step a caller needs to
+/// intercept in order to mutate `AppState` before routes are wired to it.
+async fn build_state_and_pool(overrides: &HashMap<String, String>) -> (AppState, PgPool) {
     let base_url = lakehouse_test_support::database_url();
     let admin_pool = PgPoolOptions::new()
         .max_connections(1)
@@ -107,9 +143,8 @@ pub async fn spin_up_with_env(overrides: &HashMap<String, String>) -> TestApp {
     // since `tower::ServiceExt::oneshot` never touches a real socket.
     let config = Config::from_map(&env).expect("a valid test Config");
     let state = AppState::new(config);
-    let router = lakehouse_api::routes::router(state);
 
-    TestApp { router, pool }
+    (state, pool)
 }
 
 /// Swaps the database name in `postgres://user:pass@host:port/dbname` for

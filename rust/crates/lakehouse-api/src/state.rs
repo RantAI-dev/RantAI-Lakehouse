@@ -268,11 +268,16 @@ impl PolicyDecisionLatencies {
 ///
 /// A deployment MAY set these equal to the real credentials — that is its
 /// choice to make explicitly, in its own environment — but the API's own
-/// secrets are no longer reachable through a connector by name. Combined
-/// with [`crate::routes::connectors::reject_allowlisted_secret_ref`], which
-/// checks the SAME patterns to refuse a USER-created connector naming a
-/// reserved ref, the only connectors that can dial with them are the ones
-/// seeded by migration.
+/// secrets are no longer reachable through a connector by name. As of ADR
+/// 0002 Addendum 3, a USER-created connector cannot name a ref at all — it
+/// only chooses a source/kind, and the server derives the actual name from
+/// the connector's own generated id
+/// (`lakehouse_store::connectors::derive_secret_ref`), which always begins
+/// `CONNECTOR_CONN_`/`connector_conn_` and so can never match one of these
+/// reserved, seeded patterns. That makes this narrower than the runtime
+/// check it replaced: naming a reserved ref is now structurally
+/// impossible for a user-created connector, not merely refused at write
+/// time.
 pub(crate) const CONNECTOR_ALLOWED_SECRET_REF_PATTERNS: [&str; 6] = [
     "env:CONNECTOR_*_PASSWORD",
     "env:CONNECTOR_*_SECRET_KEY",

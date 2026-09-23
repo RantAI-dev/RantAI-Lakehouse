@@ -19,7 +19,10 @@
 // by the linker before its ctor section is ever considered).
 use lakehouse_test_support as _;
 
-use lakehouse_store::connectors::{CreateConnectorInput, create_connector, get_ingest_spec};
+use lakehouse_store::connectors::{
+    CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec, create_connector,
+    get_ingest_spec,
+};
 use sqlx::PgPool;
 
 /// `0033_connector_ingest_spec.sql` grants `ingest:read` to the seeded Data
@@ -81,15 +84,18 @@ async fn ingest_read_is_granted_exactly_once(pool: PgPool) -> sqlx::Result<()> {
 async fn a_freshly_created_connector_has_null_adapter_and_empty_dial(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let created = create_connector(
+    let (created, _credential_names) = create_connector(
         &pool,
         &CreateConnectorInput {
             name: "ingest spec column defaults".to_owned(),
             kind: "REST API".to_owned(),
             direction: "source".to_owned(),
             host: "api.example.internal".to_owned(),
-            secret_ref: "env:INGEST_SPEC_DEFAULTS_TEST_TOKEN".to_owned(),
-            secret_ref_secondary: None,
+            credential: CredentialSpec {
+                source: CredentialSource::Env,
+                primary: CredentialKind::Token,
+                secondary: None,
+            },
             environment: "staging".to_owned(),
             tenant: "Meridian Group".to_owned(),
             residency: "in-region".to_owned(),

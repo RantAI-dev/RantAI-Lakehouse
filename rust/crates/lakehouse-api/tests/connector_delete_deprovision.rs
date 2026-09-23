@@ -46,23 +46,32 @@ mod common;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use lakehouse_store::connectors::{
-    CreateConnectorInput, IngestSpecInput, create_connector, set_ingest_spec,
+    CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec, IngestSpecInput,
+    create_connector, set_ingest_spec,
 };
 use sqlx::PgPool;
 use tower::ServiceExt;
 
 use common::{session_cookie_for_seeded_user, spin_up};
 
-/// A minimal, valid [`CreateConnectorInput`] — `kind`/`host`/`secret_ref`
-/// are overridden per test, everything else is filler.
-fn minimal_input(name: &str, kind: &str, host: &str, secret_ref: &str) -> CreateConnectorInput {
+/// A minimal, valid [`CreateConnectorInput`] — `kind`/`host` are
+/// overridden per test, everything else is filler. The credential is
+/// always a single `env:`-sourced password slot: every test in this file
+/// exercises deprovision dispatch (adapter/host shape), never credential
+/// resolution, so the derived name's exact value does not matter here —
+/// see `lakehouse-store/tests/connectors.rs` for tests that DO assert on
+/// the derived name.
+fn minimal_input(name: &str, kind: &str, host: &str) -> CreateConnectorInput {
     CreateConnectorInput {
         name: name.to_owned(),
         kind: kind.to_owned(),
         direction: "source".to_owned(),
         host: host.to_owned(),
-        secret_ref: secret_ref.to_owned(),
-        secret_ref_secondary: None,
+        credential: CredentialSpec {
+            source: CredentialSource::Env,
+            primary: CredentialKind::Password,
+            secondary: None,
+        },
         environment: "staging".to_owned(),
         tenant: "Meridian Group".to_owned(),
         residency: "in-region".to_owned(),
@@ -96,14 +105,9 @@ async fn delete(app: &axum::Router, path: &str, cookie: &str) -> axum::http::Res
 /// duplicated guard/fixture is a finding) so both exercise the identical
 /// genuine-failure shape.
 async fn create_connector_with_undeprovisionable_slot(pool: &PgPool, name: &str) -> String {
-    let created = create_connector(
+    let (created, _credential_names) = create_connector(
         pool,
-        &minimal_input(
-            name,
-            "PostgreSQL",
-            "lakehouse@postgres:5432/lakehouse",
-            "env:CONNECTOR_PG_PASSWORD",
-        ),
+        &minimal_input(name, "PostgreSQL", "lakehouse@postgres:5432/lakehouse"),
     )
     .await
     .expect("create connector");
@@ -275,7 +279,7 @@ async fn deprovision_never_attempted_for_a_batch_sql_connector() {
     let app = spin_up().await;
     let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
 
-    let created = create_connector(
+    let (created, _credential_names) = create_connector(
         &app.pool,
         &minimal_input(
             "batch sql postgres never deprovisioned",
@@ -285,7 +289,6 @@ async fn deprovision_never_attempted_for_a_batch_sql_connector() {
             // immediately, so if deprovisioning were attempted at all
             // (today's bug: gated on `kind` alone), this DELETE would 409.
             "this-is-not-a-dsn-shaped-host",
-            "env:CONNECTOR_PG_PASSWORD",
         ),
     )
     .await

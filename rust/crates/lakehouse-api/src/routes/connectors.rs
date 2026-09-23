@@ -7,15 +7,20 @@
 //! (`src/services/mock/connectors.ts`) that never had a server side —
 //! there is no TypeScript route handler this is bug-compatible with.
 //! Status codes are chosen to be correct: 201 on create, 404 on a missing
-//! id, 409 on a duplicate name, 400 on a malformed body or a `secretRef`
-//! that looks like a raw credential, 503 with no database pool.
+//! id, 409 on a duplicate name, 400 on a malformed body or a body that
+//! still names the removed `secretRef`/`secretRefSecondary` fields, 503
+//! with no database pool.
 //!
 //! # Credentials
 //!
 //! See `lakehouse_store::connectors`'s module doc comment for the full
 //! decision record. The short version: no endpoint here ever returns a
-//! `host` or `secretRef` — [`lakehouse_store::connectors::Connector`] and
-//! `ConnectorDetail` have no such field to serialize.
+//! `host` — [`lakehouse_store::connectors::Connector`] and
+//! `ConnectorDetail` have no such field to serialize, and no `secretRef`
+//! EXCEPT [`create`]'s response, once, at creation (ADR 0002 Addendum 3
+//! — a user-created connector no longer chooses a ref at all, only a
+//! source/kind; the server derives the name from the id it generates and
+//! returns it so the operator knows what to provision).
 
 use axum::Extension;
 use axum::body::Bytes;
@@ -136,10 +141,29 @@ pub async fn detail(
     Ok(ApiJson(detail))
 }
 
-/// The `POST /api/connectors` body. Mirrors `CreateConnectorInput`.
+/// The `POST /api/connectors` body's `credential` field. Mirrors
+/// `CreateConnectorInput["credential"]` in `contracts/connectors.ts`.
 ///
-/// `secret_ref` is a REFERENCE NAME (`"env:FOO"`, `"vault:path"`), never a
-/// credential value — see the module doc comment.
+/// There is no `secretRef`/`secretRefSecondary` field anywhere on this
+/// body (ADR 0002 Addendum 3): the client does not know the connector's
+/// id yet (the server generates it in [`connectors::create_connector`]),
+/// so it cannot name a reference itself. It chooses a source scheme and a
+/// kind per slot instead, and the server derives the actual names —
+/// returned once, in [`CreateConnectorResponse`].
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialSpecBody {
+    source: connectors::CredentialSource,
+    primary: connectors::CredentialKind,
+    /// `None` for a connector type that needs only one credential (e.g.
+    /// `PostgreSQL`). `Some` for e.g. an S3 connector's access-key/
+    /// secret-key pair — without this, an API-created S3 connector's
+    /// `/test` can never succeed, since `probe_s3` requires both.
+    #[serde(default)]
+    secondary: Option<connectors::CredentialKind>,
+}
+
+/// The `POST /api/connectors` body. Mirrors `CreateConnectorInput`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateConnectorBody {
@@ -148,14 +172,7 @@ pub struct CreateConnectorBody {
     kind: String,
     direction: String,
     host: String,
-    secret_ref: String,
-    /// Optional secondary reference, e.g. the secret-access-key half of an
-    /// S3 connector's access-key/secret-key pair (see
-    /// `lakehouse_store::connectors::ConnectorDialInfo::secret_ref_secondary`'s
-    /// doc comment). Without this, an API-created S3 connector's `/test`
-    /// can never succeed — `probe_s3` requires both.
-    #[serde(default)]
-    secret_ref_secondary: Option<String>,
+    credential: CredentialSpecBody,
     environment: String,
     tenant: String,
     #[serde(default)]
@@ -166,56 +183,60 @@ pub struct CreateConnectorBody {
     owner: Option<String>,
 }
 
+/// The `POST /api/connectors` response: the created
+/// [`connectors::Connector`] plus the credential reference NAMES the
+/// operator must provision. Mirrors `CreateConnectorResponse` in
+/// `contracts/connectors.ts`.
+///
+/// # Returned ONCE (ADR 0002 Addendum 3)
+///
+/// This is the only place these names are ever handed back. No GET
+/// response for this connector repeats them — `Connector`/`ConnectorDetail`
+/// gain no field (the module doc comment's guarantees 1/2 still hold
+/// exactly as written); this is a distinct, create-only response shape.
+/// An operator who loses these names can still recover them: they are a
+/// PURE function of the connector's own id
+/// (`lakehouse_store::connectors::derive_secret_ref`), so re-deriving them
+/// from `id` (visible on every GET) reproduces the identical string. Only
+/// the VALUE behind the name is secret; the name itself is not sensitive,
+/// which is why re-deriving it is safe even though this route does not
+/// offer a "show me again" endpoint.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateConnectorResponse {
+    #[serde(flatten)]
+    connector: connectors::Connector,
+    credential: connectors::ConnectorCredentialNames,
+}
+
 const VALID_DIRECTIONS: [&str; 3] = ["source", "sink", "bidirectional"];
 
-/// Refuse a caller-supplied `secretRef` that matches one of the deployment's
-/// reserved connector-credential patterns
-/// ([`crate::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS`]).
+/// Refuse a body that still names `secretRef`/`secretRefSecondary` — the
+/// pre-ADR-0002-Addendum-3 shape — instead of silently ignoring those
+/// fields (AGENTS.md principle 2: never silently drop what a caller sent).
+/// [`CreateConnectorBody`] has no field to deserialize either name into,
+/// so a caller sending them would otherwise get no error and no
+/// indication their `secretRef` was never used.
 ///
-/// Those patterns are the only shapes `AppState::connector_secret_resolver`
-/// will resolve, and they exist for the connectors seeded by migration — the
-/// ones this deployment operates itself. A user-created connector naming a
-/// ref that matches one would have the API authenticate to a caller-chosen
-/// `host` with the deployment's own connector credentials. `connector_probe`'s
-/// SSRF guard does not prevent that: it blocks internal address ranges, and
-/// exfiltration wants an EXTERNAL host, which is exactly what it permits.
-///
-/// So the allowlist answers "which refs may resolve at all" and this answers
-/// "who may name them". Neither alone is sufficient: without the allowlist a
-/// connector could name `env:DATABASE_URL`; without this check it could name
-/// a reserved connector-credential ref and point it anywhere. Both checks
-/// call the SAME [`lakehouse_core::secret::pattern_matches`] against the
-/// SAME pattern constant, so the two cannot drift the way
-/// `0023_connector_dedicated_secret_refs.sql`'s header describes happening to
-/// the old exact-list version.
-///
-/// # What this does NOT refuse (WS3 plan review X4/Z4)
-///
-/// A name that is not itself one of the reserved patterns — e.g.
-/// `env:CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS`, a real [`crate::config::Config`]
-/// flag, not a credential — is accepted HERE, at creation time: this check's
-/// job is narrower than "reject anything unsafe", it only refuses a caller
-/// naming one of the deployment's OWN reserved refs. Such a name still fails
-/// later, at resolve time, when [`AllowlistedSecretResolver`](lakehouse_core::secret::AllowlistedSecretResolver)
-/// independently checks the same patterns and returns `NotAllowed` the first
-/// time `POST .../test`, `POST .../discover`, or `POST .../ingest/run` tries
-/// to actually resolve it — the two-stage design this module's doc comment
-/// describes.
-///
-/// Deliberately compared after trimming, matching how the ref is stored and
-/// later handed to the resolver — a check that normalized more aggressively
-/// than the resolver would leave a gap between what this rejects and what
-/// that accepts.
-fn reject_allowlisted_secret_ref(field: &str, value: &str) -> Result<(), ApiError> {
-    let trimmed = value.trim();
-    if crate::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS
-        .iter()
-        .any(|pattern| lakehouse_core::secret::pattern_matches(pattern, trimmed))
-    {
-        return Err(ApiError::BadRequest(format!(
-            "{field} must not name a deployment connector credential; those are reserved for \
-             connectors this deployment seeds itself"
-        )));
+/// Runs on the raw JSON, before [`CreateConnectorBody`] deserialization,
+/// so the message can name the ADR and the new shape explicitly, rather
+/// than a generic "unknown field" a `#[serde(deny_unknown_fields)]` would
+/// produce (which also cannot single out these two names for a
+/// specialized message without a second copy of the field list already
+/// implied by the struct definition).
+fn reject_legacy_secret_ref_fields(body: &Bytes) -> Result<(), ApiError> {
+    let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(body) else {
+        return Ok(()); // Malformed JSON is `parse_body`'s job to report.
+    };
+    if map.contains_key("secretRef") || map.contains_key("secretRefSecondary") {
+        return Err(ApiError::BadRequest(
+            "secretRef/secretRefSecondary are no longer accepted here: a connector's credential \
+             reference name is now assigned by the server, derived from its own id (ADR 0002 \
+             Addendum 3, docs/adr/0002-secretref-resolution.md). Send `credential: { source, \
+             primary, secondary? }` instead, and read the derived names off this route's \
+             response"
+                .to_owned(),
+        ));
     }
     Ok(())
 }
@@ -279,20 +300,19 @@ fn connector_audit_event(
 /// # Errors
 ///
 /// 401 if no principal is present (see above); 400 on a malformed body, a
-/// blank required field, an unrecognized `direction`, or a `secretRef`
-/// shaped like a raw credential (see
-/// `lakehouse_store::connectors::looks_like_raw_secret`); 409 if the name
-/// is taken; 503/500 as above. Also 400 if `secretRef`/`secretRefSecondary`
-/// names a deployment connector credential — see
-/// [`reject_allowlisted_secret_ref`].
+/// blank required field, an unrecognized `direction`, or a body that still
+/// names `secretRef`/`secretRefSecondary` (see
+/// [`reject_legacy_secret_ref_fields`] — ADR 0002 Addendum 3 removed both
+/// fields); 409 if the name is taken; 503/500 as above.
 pub async fn create(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
     body: Bytes,
-) -> ApiResult<(StatusCode, ApiJson<connectors::Connector>)> {
+) -> ApiResult<(StatusCode, ApiJson<CreateConnectorResponse>)> {
     let Some(Extension(principal)) = principal else {
         return Err(ApiError::unauthorized().into());
     };
+    reject_legacy_secret_ref_fields(&body)?;
     let body: CreateConnectorBody = parse_body(&body)?;
     let direction = required("direction", &body.direction)?;
     if !VALID_DIRECTIONS.contains(&direction.as_str()) {
@@ -301,50 +321,27 @@ pub async fn create(
         ))
         .into());
     }
-    let secret_ref = required("secretRef", &body.secret_ref)?;
-    if connectors::looks_like_raw_secret(&secret_ref) {
-        return Err(ApiError::BadRequest(
-            "secretRef must be a reference to a credential (e.g. \"env:MY_SECRET\" or \
-             \"vault:secret/data/...\"), not the credential itself"
-                .to_owned(),
-        )
-        .into());
-    }
-    reject_allowlisted_secret_ref("secretRef", &secret_ref)?;
-    let secret_ref_secondary = match body.secret_ref_secondary {
-        Some(raw) if !raw.trim().is_empty() => {
-            let trimmed = raw.trim().to_owned();
-            if connectors::looks_like_raw_secret(&trimmed) {
-                return Err(ApiError::BadRequest(
-                    "secretRefSecondary must be a reference to a credential, not the credential \
-                     itself"
-                        .to_owned(),
-                )
-                .into());
-            }
-            reject_allowlisted_secret_ref("secretRefSecondary", &trimmed)?;
-            Some(trimmed)
-        }
-        _ => None,
-    };
     let input = CreateConnectorInput {
         name: required("name", &body.name)?,
         kind: required("type", &body.kind)?,
         direction,
         host: required("host", &body.host)?,
-        secret_ref,
-        secret_ref_secondary,
+        credential: connectors::CredentialSpec {
+            source: body.credential.source,
+            primary: body.credential.primary,
+            secondary: body.credential.secondary,
+        },
         environment: required("environment", &body.environment)?,
         tenant: required("tenant", &body.tenant)?,
         residency: body.residency,
         capabilities: body.capabilities,
         owner: body.owner,
     };
-    let created = connectors::create_connector(pool(&state)?, &input).await?;
+    let (created, credential) = connectors::create_connector(pool(&state)?, &input).await?;
     // WS5 item D3: best-effort, never turns a successful create into an
-    // error — name/type/direction only, never `secretRef` (a reference
-    // name, not a credential, per this module's own guarantee, but still
-    // not this row's business to repeat).
+    // error — name/type/direction only, never a credential reference name
+    // (not this row's business to repeat, even though a name alone is not
+    // a secret value).
     let event = connector_audit_event(
         &principal,
         "connector.create",
@@ -355,7 +352,13 @@ pub async fn create(
     if let Err(err) = store_audit::insert(pool(&state)?, event).await {
         tracing::warn!(%err, connector_id = %created.id, "failed to record connector.create audit event");
     }
-    Ok((StatusCode::CREATED, ApiJson(created)))
+    Ok((
+        StatusCode::CREATED,
+        ApiJson(CreateConnectorResponse {
+            connector: created,
+            credential,
+        }),
+    ))
 }
 
 /// `POST /api/connectors/{id}/test` — test a connector's connection.
@@ -493,24 +496,32 @@ pub struct ProbeHistoryResponse {
 /// The `PUT /api/connectors/{id}/secret` body. Mirrors
 /// `RotateConnectorSecretRequest` in `contracts/connectors.ts`.
 ///
+/// No `newSecretRef` free-text field any more (ADR 0002 Addendum 3): the
+/// caller cannot name a ref, only a source scheme and a kind for the slot
+/// being rotated — the server derives the new ref from the CONNECTOR'S
+/// OWN id (`id` is a path parameter here, already fixed by the time this
+/// body is read), the same way [`connectors::create_connector`] does.
+/// Since a derived name always begins `CONNECTOR_CONN_`/`connector_conn_`
+/// (every id begins `conn-`), a rotation can never target a reserved,
+/// deployment-owned pattern (`CONNECTOR_PG_*`, `CONNECTOR_S3_*`) —
+/// structurally, not by a runtime check — closing the same exfiltration
+/// path a free-text `newSecretRef` would have reopened after `create`'s
+/// own equivalent fix.
+///
 /// `deny_unknown_fields`: a caller-supplied field this shape does not
-/// name (e.g. a typo, or a stray `secretValue` a caller confused this
-/// with the actual credential) fails the request rather than being
-/// silently ignored — this route's whole point is precise control over
-/// which slot gets rewritten, so a misspelled field should never
-/// silently no-op.
+/// name (e.g. a lingering `newSecretRef`, or a typo) fails the request
+/// rather than being silently ignored — this route's whole point is
+/// precise control over which slot gets rewritten, so a misspelled or
+/// stale field should never silently no-op.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RotateSecretBody {
     /// Which of the connector's two credential slots to rotate.
     slot: connectors::SecretSlot,
-    /// The NAME of an already-provisioned credential reference (e.g.
-    /// `"env:CONNECTOR_PG_PASSWORD_V2"`) — never a credential value. Must
-    /// already resolve through [`AppState::connector_secret_resolver`]
-    /// (the same allowlisted resolver `POST .../test` uses): this route
-    /// does not provision a new secret, it only points the connector at
-    /// one that already exists.
-    new_secret_ref: String,
+    /// `env:` or `file:` — see [`connectors::derive_secret_ref`].
+    source: connectors::CredentialSource,
+    /// The suffix the derived name ends in.
+    kind: connectors::CredentialKind,
 }
 
 /// The `PUT /api/connectors/{id}/secret` response body.
@@ -529,29 +540,29 @@ pub struct RotateSecretResponse {
 ///
 /// # Why probe before swap
 ///
-/// The request names a credential reference that must already be
+/// The candidate credential reference (derived from this connector's own
+/// id, per [`RotateSecretBody`]'s doc comment) must already be
 /// provisioned (an env var, a secret-manager path) — this route never
-/// carries or accepts a secret value itself. Accepting that name and
-/// writing it straight onto the connector row would let a typo, a
-/// not-yet-provisioned ref, or a ref for the wrong host silently break
-/// every future dial of this connector, discovered only the next time
-/// something tries to use it. So this handler builds an in-memory COPY
-/// of the connector's dial info with `newSecretRef` swapped into the
-/// requested slot, runs a REAL connectivity probe against that copy
-/// using the SAME [`crate::connector_probe::probe`], the same
+/// carries or accepts a secret value itself. Writing a derived name
+/// straight onto the connector row without checking it first would let a
+/// not-yet-provisioned ref silently break every future dial of this
+/// connector, discovered only the next time something tries to use it. So
+/// this handler builds an in-memory COPY of the connector's dial info
+/// with the derived ref swapped into the requested slot, runs a REAL
+/// connectivity probe against that copy using the SAME
+/// [`crate::connector_probe::probe`], the same
 /// [`AppState::connector_secret_resolver`], and the same
 /// `connector_probe_allow_internal_hosts` flag [`test_connection`]
 /// uses — nothing is written to the database until that probe reports
 /// `supported: true, ok: true`.
 ///
 /// Using the SAME allowlisted resolver as `POST .../test` is deliberate,
-/// not incidental: [`AppState::connector_secret_resolver`] refuses to
-/// resolve any ref outside [`crate::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS`]
-/// (`NotAllowed`), so a `newSecretRef` naming, say, the deployment's own
-/// `env:DATABASE_URL` fails the probe as a misconfiguration, not as a
-/// resolved-and-dialed credential — the exact SSRF/exfiltration
-/// boundary [`create`]'s `reject_allowlisted_secret_ref` check already
-/// enforces at write time, held here too.
+/// not incidental: every derived name already matches
+/// [`crate::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS`] (ADR 0002
+/// Addendum 3), so this only ever fails as an honest "not provisioned
+/// yet" — never a resolver refusal, since a derived name can never be one
+/// of the reserved, deployment-owned patterns (`RotateSecretBody`'s doc
+/// comment explains why that is structural, not a runtime check).
 ///
 /// # Why the probe result is never persisted as history
 ///
@@ -569,16 +580,13 @@ pub struct RotateSecretResponse {
 ///
 /// # Errors
 ///
-/// 400 on a malformed body, a blank `newSecretRef`, a `newSecretRef`
-/// shaped like a raw credential (see
-/// [`connectors::looks_like_raw_secret`]), or a `newSecretRef` naming
-/// one of the deployment's own reserved connector-credential patterns
-/// (see [`reject_allowlisted_secret_ref`]); 404 if `id` is unknown; 422
-/// if the connector's type is either unsupported by this build's probe
-/// (a rotation can never be verified, so it is never applied) or the
-/// probe genuinely fails against the candidate credential; 409 if the
-/// connector's current ref in that slot changed between this handler's
-/// read and its write (someone else rotated it first — reload and
+/// 400 on a malformed body, or one that still names a field this shape
+/// does not have (`deny_unknown_fields`, e.g. a lingering `newSecretRef`);
+/// 404 if `id` is unknown; 422 if the connector's type is either unsupported by
+/// this build's probe (a rotation can never be verified, so it is never
+/// applied) or the probe genuinely fails against the candidate credential;
+/// 409 if the connector's current ref in that slot changed between this
+/// handler's read and its write (someone else rotated it first — reload and
 /// retry); 503/500 as every other connector route.
 pub async fn rotate_secret(
     State(state): State<AppState>,
@@ -587,16 +595,10 @@ pub async fn rotate_secret(
     body: Bytes,
 ) -> ApiResult<ApiJson<RotateSecretResponse>> {
     let body: RotateSecretBody = parse_body(&body)?;
-    let new_secret_ref = required("newSecretRef", &body.new_secret_ref)?;
-    if connectors::looks_like_raw_secret(&new_secret_ref) {
-        return Err(ApiError::BadRequest(
-            "newSecretRef must be a reference to a credential (e.g. \"env:MY_SECRET\" or \
-             \"vault:secret/data/...\"), not the credential itself"
-                .to_owned(),
-        )
-        .into());
-    }
-    reject_allowlisted_secret_ref("newSecretRef", &new_secret_ref)?;
+    // Derived from THIS connector's own id -- see `RotateSecretBody`'s doc
+    // comment for why this can never target a reserved, deployment-owned
+    // pattern.
+    let new_secret_ref = connectors::derive_secret_ref(&id, body.source, body.kind);
 
     let dial_info = connectors::get_connector_dial_info(pool(&state)?, &id).await?;
     let Some(dial_info) = dial_info else {
@@ -1851,8 +1853,11 @@ mod tests {
             kind: "REST API".to_owned(),
             direction: "sideways".to_owned(),
             host: "h".to_owned(),
-            secret_ref: "env:X".to_owned(),
-            secret_ref_secondary: None,
+            credential: CredentialSpecBody {
+                source: connectors::CredentialSource::Env,
+                primary: connectors::CredentialKind::Token,
+                secondary: None,
+            },
             environment: "production".to_owned(),
             tenant: "t".to_owned(),
             residency: String::new(),
@@ -1862,106 +1867,103 @@ mod tests {
         assert!(!VALID_DIRECTIONS.contains(&body.direction.as_str()));
     }
 
-    /// D5/Should-fix: `secretRefSecondary` must parse through the request
-    /// body (camelCase, per the struct's `rename_all`) and reach
+    /// `credential.secondary` must parse through the request body
+    /// (camelCase, per the struct's `rename_all`) and reach
     /// `CreateConnectorInput` — otherwise an API-created S3 connector can
     /// never be tested, since `probe_s3` requires both refs.
     #[test]
-    fn secret_ref_secondary_round_trips_through_the_request_body() {
+    fn credential_secondary_round_trips_through_the_request_body() {
         let json = serde_json::json!({
             "name": "n",
             "type": "Object storage",
             "direction": "sink",
             "host": "http://rustfs:9000|bucket",
-            "secretRef": "env:AK",
-            "secretRefSecondary": "env:SK",
+            "credential": { "source": "env", "primary": "access_key", "secondary": "secret_key" },
             "environment": "production",
             "tenant": "t",
         });
         let body: CreateConnectorBody = serde_json::from_value(json).unwrap();
-        assert_eq!(body.secret_ref_secondary.as_deref(), Some("env:SK"));
+        assert_eq!(
+            body.credential.secondary,
+            Some(connectors::CredentialKind::SecretKey)
+        );
     }
 
-    /// Absent `secretRefSecondary` (e.g. a `PostgreSQL` connector, which
+    /// Absent `credential.secondary` (e.g. a `PostgreSQL` connector, which
     /// only ever needs one credential) must still parse.
     #[test]
-    fn secret_ref_secondary_is_optional() {
+    fn credential_secondary_is_optional() {
         let json = serde_json::json!({
             "name": "n",
             "type": "PostgreSQL",
             "direction": "bidirectional",
             "host": "u@host:5432/db",
-            "secretRef": "env:PW",
+            "credential": { "source": "env", "primary": "password" },
             "environment": "production",
             "tenant": "t",
         });
         let body: CreateConnectorBody = serde_json::from_value(json).unwrap();
-        assert_eq!(body.secret_ref_secondary, None);
+        assert_eq!(body.credential.secondary, None);
     }
 
-    /// The defense-in-depth check from `looks_like_raw_secret` is wired
-    /// into this handler, not just unit-tested in isolation.
+    /// The regression guard this check exists for (ADR 0002 Addendum 3):
+    /// a body still naming the pre-addendum `secretRef`/`secretRefSecondary`
+    /// fields is refused, citing the ADR, rather than silently ignored
+    /// (`CreateConnectorBody` has no field to deserialize either name
+    /// into, so without this check they would simply vanish).
     #[test]
-    fn secret_looking_secret_ref_is_rejected_by_the_shared_check() {
-        assert!(connectors::looks_like_raw_secret(
-            "postgres://admin:hunter2@db.internal:5432/oms"
-        ));
-        assert!(!connectors::looks_like_raw_secret("env:MY_SECRET"));
+    fn create_refuses_a_body_still_naming_legacy_secret_ref_fields() {
+        let body = Bytes::from(
+            serde_json::json!({
+                "name": "n",
+                "type": "PostgreSQL",
+                "direction": "source",
+                "host": "h",
+                "secretRef": "env:MY_SECRET",
+                "environment": "production",
+                "tenant": "t",
+            })
+            .to_string(),
+        );
+        let err = reject_legacy_secret_ref_fields(&body).unwrap_err();
+        assert!(err.to_string().contains("ADR 0002 Addendum 3"), "{err}");
     }
 
-    /// The exfiltration path this check exists to close: a
-    /// `connector:manage` principal naming a deployment connector credential
-    /// on a connector whose `host` they choose. A representative instance of
-    /// EVERY allowlisted pattern must be refused, so widening the pattern
-    /// list without widening this check fails here rather than silently
-    /// opening the hole again.
+    /// Same refusal for the secondary field alone.
     #[test]
-    fn user_created_connector_cannot_name_a_deployment_connector_credential() {
-        for r in [
-            "env:CONNECTOR_MYSQL_PASSWORD",
-            "env:CONNECTOR_S3_SECRET_KEY",
-            "env:CONNECTOR_S3_ACCESS_KEY",
-            "env:CONNECTOR_REST_API_KEY",
-            "env:CONNECTOR_OAUTH_TOKEN",
-            "file:/run/secrets/connector_mysql_password",
-        ] {
-            assert!(
-                reject_allowlisted_secret_ref("secretRef", r).is_err(),
-                "pattern-matching ref {r:?} must be refused on a user-created connector"
-            );
-            // Whitespace must not be a bypass: the value is trimmed before
-            // storage, so a padded ref would reach the resolver identically.
-            assert!(
-                reject_allowlisted_secret_ref("secretRef", &format!("  {r}  ")).is_err(),
-                "padded {r:?} must be refused too"
-            );
-        }
+    fn create_refuses_a_body_still_naming_legacy_secret_ref_secondary_field() {
+        let body = Bytes::from(
+            serde_json::json!({
+                "name": "n",
+                "type": "Object storage",
+                "direction": "sink",
+                "host": "h",
+                "credential": { "source": "env", "primary": "access_key" },
+                "secretRefSecondary": "env:MY_SECRET_2",
+                "environment": "production",
+                "tenant": "t",
+            })
+            .to_string(),
+        );
+        assert!(reject_legacy_secret_ref_fields(&body).is_err());
     }
 
-    /// The check must not over-reach: an ordinary `env:` ref that does not
-    /// match a reserved pattern is still accepted here. It will fail later
-    /// at resolution (it is not on the allowlist), which is a different,
-    /// honest error — "this deployment will not resolve that", not "you may
-    /// not say that". Includes `env:CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS`
-    /// (WS3 plan review X4/Z4): a real config flag, not a credential, so it
-    /// matches none of the credential-suffix patterns and must pass THIS
-    /// check even though `AllowlistedSecretResolver::resolve` refuses it
-    /// with `NotAllowed` at resolve time — see this function's doc comment
-    /// for the full two-stage explanation.
+    /// An ordinary body with no legacy field passes this check.
     #[test]
-    fn ordinary_secret_refs_are_still_accepted_by_this_check() {
-        for r in [
-            "env:MY_SECRET",
-            "vault:secret/data/x",
-            "env:POSTGRES_PASSWORD_2",
-            "env:CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS",
-        ] {
-            assert!(
-                reject_allowlisted_secret_ref("secretRef", r).is_ok(),
-                "{r:?} does not match a reserved connector-credential pattern and must pass \
-                 this check"
-            );
-        }
+    fn create_accepts_a_body_with_no_legacy_secret_ref_fields() {
+        let body = Bytes::from(
+            serde_json::json!({
+                "name": "n",
+                "type": "PostgreSQL",
+                "direction": "source",
+                "host": "h",
+                "credential": { "source": "env", "primary": "password" },
+                "environment": "production",
+                "tenant": "t",
+            })
+            .to_string(),
+        );
+        assert!(reject_legacy_secret_ref_fields(&body).is_ok());
     }
 
     /// The allowlist must never admit one of the API's own secrets again.

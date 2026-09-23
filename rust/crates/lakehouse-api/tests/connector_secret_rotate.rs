@@ -1,49 +1,57 @@
 //! `PUT /api/connectors/{id}/secret` — probe-first credential-reference
 //! rotation (`routes::connectors::rotate_secret`).
 //!
-//! # Why every test here ends in a refusal, never a landed swap
+//! # The body no longer carries a free-text ref (ADR 0002 Addendum 3)
 //!
-//! `rotate_secret` refuses `newSecretRef` with
-//! `reject_allowlisted_secret_ref` — the SAME check `create` applies to a
-//! caller-supplied `secretRef` — before ever probing. That check refuses
-//! exactly the ref SHAPES [`crate::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS`]
-//! names; [`crate::state::AppState::connector_secret_resolver`]
-//! (`AllowlistedSecretResolver`) resolves ONLY those same shapes. The two
-//! checks are deliberately the mirror image of each other (see
-//! `reject_allowlisted_secret_ref`'s doc comment) — which means a
-//! `newSecretRef` that passes the refusal check can never resolve, and a
-//! `newSecretRef` that would resolve never passes the refusal check. So a
-//! real, HTTP-level "rotation lands" test is not possible against the
-//! public API surface with an honest `newSecretRef` — this is the SAME
-//! property `POST .../test` already has for every connector this build's
-//! `create` route can itself produce (`0023_connector_dedicated_secret_refs.sql`'s
-//! header: "the only connectors that can dial with [an allowlisted ref]
-//! are the ones seeded by migration"), not a new gap this route
-//! introduces. `swap_secret_ref`'s own success path is proven at the
-//! store layer instead (`lakehouse-store/tests/connectors.rs`) — see the
-//! task's report for the full reasoning.
+//! Before this ADR addendum, `newSecretRef` was a free-text field and
+//! `reject_allowlisted_secret_ref` refused it if it matched one of the
+//! deployment's reserved, seeded patterns
+//! (`crate::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS`) — the same
+//! check `create` applied to a caller-supplied `secretRef`. Since neither
+//! route accepts a free-text ref any more, that check (and its tests) are
+//! gone: the request now names a `{ slot, source, kind }`, and the server
+//! derives the actual ref from THIS CONNECTOR'S OWN id
+//! (`lakehouse_store::connectors::derive_secret_ref`). A derived `env:`
+//! name always begins `CONNECTOR_CONN_` (every generated id begins
+//! `conn-`), so a rotation can never target a reserved, deployment-owned
+//! pattern (`CONNECTOR_PG_*`, `CONNECTOR_S3_*`, neither of which begins
+//! `CONNECTOR_CONN_`) — structurally impossible now, rather than refused
+//! by a runtime check. `lakehouse-store`'s
+//! `no_seeded_ref_can_be_derived_from_any_connector_id` test is the
+//! regression guard for that property; this file's
+//! `a_derived_secret_ref_resolves_and_the_rotation_lands` test below
+//! proves the OTHER half — that the derived name for `conn-pg-lakehouse`
+//! really is `env:CONNECTOR_CONN_PG_LAKEHOUSE_PASSWORD`, distinct from the
+//! seeded `env:CONNECTOR_PG_PASSWORD` it already dials with.
 //!
-//! Keeping `reject_allowlisted_secret_ref` here (rather than skipping it,
-//! which the brief's literal wording for this route did not call out) is
-//! deliberate: without it, a `connector:manage` principal could create an
-//! ordinary connector pointed at a host they control (passing `create`'s
-//! own check with an innocuous ref), then use THIS route to rotate that
-//! connector's ref to a reserved, deployment-owned pattern -- reopening
-//! the exact exfiltration path `0023_connector_dedicated_secret_refs.sql`
-//! closed for `create`, just via a second write path instead of the
-//! first.
+//! # Why most tests here still end in a refusal, not a landed swap
+//!
+//! The default [`common::spin_up`] harness's `connector_secret_resolver`
+//! wraps a real `EnvSecretResolver` reading the actual process
+//! environment, which never has a derived, test-specific env var set. So
+//! against that harness, a derived candidate ref is allowlisted (it
+//! matches the pattern) but unresolvable (`NotFound`) — an honest
+//! "not provisioned yet" 422, not a security refusal. Only the one test
+//! that calls [`common::spin_up_with_connector_secret_resolver`] to inject
+//! a resolver whose map actually contains the derived name proves the
+//! success path.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use lakehouse_core::secret::EnvSecretResolver;
+use lakehouse_store::connectors::{CredentialKind, CredentialSource, derive_secret_ref};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tower::ServiceExt;
 
-use common::{session_cookie_for_seeded_user, spin_up};
+use common::{session_cookie_for_seeded_user, spin_up, spin_up_with_connector_secret_resolver};
 
 async fn put(
     app: &axum::Router,
@@ -65,6 +73,12 @@ async fn put(
         .expect("router never fails a request outright")
 }
 
+/// The fixed connector id `a_derived_secret_ref_resolves_and_the_rotation_lands`
+/// inserts its own row under, chosen here rather than generated by
+/// `POST /api/connectors` (which would produce an unpredictable id) so the
+/// derived name can be computed before the row exists at all.
+const ROTATE_SUCCESS_CONNECTOR_ID: &str = "conn-rotate-success-test";
+
 async fn secret_ref_columns(pool: &PgPool, id: &str) -> (String, Option<String>) {
     sqlx::query_as("SELECT secret_ref, secret_ref_secondary FROM connector WHERE id = $1")
         .bind(id)
@@ -73,15 +87,14 @@ async fn secret_ref_columns(pool: &PgPool, id: &str) -> (String, Option<String>)
         .expect("connector row must exist")
 }
 
-/// The candidate credential reference does not resolve
-/// (`AllowlistedSecretResolver` returns `NotAllowed` -- `newSecretRef`
-/// deliberately names no reserved pattern, see the module doc comment) --
-/// `supported: true` (this build CAN dial a `sql`-adapter Postgres
-/// connector), but the probe cannot even attempt a dial, so it must
-/// refuse the rotation with 422, and the stored `secret_ref` must be
+/// Against the default harness, the derived candidate ref is allowlisted
+/// but not provisioned (no such env var is actually set in this test
+/// process) — `supported: true` (this build CAN dial a `sql`-adapter
+/// Postgres connector), but the probe cannot even attempt a dial, so it
+/// must refuse the rotation with 422, and the stored `secret_ref` must be
 /// left exactly as seeded.
 #[tokio::test]
-async fn a_probe_that_cannot_resolve_the_candidate_ref_refuses_the_rotation_and_leaves_the_ref_unchanged()
+async fn a_probe_that_cannot_resolve_the_derived_ref_refuses_the_rotation_and_leaves_the_ref_unchanged()
  {
     let app = spin_up().await;
     let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
@@ -92,7 +105,7 @@ async fn a_probe_that_cannot_resolve_the_candidate_ref_refuses_the_rotation_and_
         &app.router,
         "/api/connectors/conn-pg-lakehouse/secret",
         &cookie,
-        json!({ "slot": "primary", "newSecretRef": "env:CUSTOM_ROTATION_TEST_REF" }),
+        json!({ "slot": "primary", "source": "env", "kind": "token" }),
     )
     .await;
 
@@ -101,8 +114,8 @@ async fn a_probe_that_cannot_resolve_the_candidate_ref_refuses_the_rotation_and_
     let body: Value = serde_json::from_slice(&bytes).unwrap();
     let message = body["error"].as_str().unwrap_or_default();
     assert!(
-        message.to_lowercase().contains("not") || message.to_lowercase().contains("allow"),
-        "expected a resolver-refusal-shaped message, got {message:?}"
+        message.to_lowercase().contains("resolve"),
+        "expected a credential-resolution-shaped refusal, got {message:?}"
     );
 
     let after = secret_ref_columns(&app.pool, "conn-pg-lakehouse").await;
@@ -134,7 +147,7 @@ async fn an_unsupported_connector_type_refuses_the_rotation_and_leaves_the_ref_u
         &app.router,
         "/api/connectors/conn-kafka-unsupported-test/secret",
         &cookie,
-        json!({ "slot": "primary", "newSecretRef": "env:CUSTOM_ROTATION_TEST_REF" }),
+        json!({ "slot": "primary", "source": "env", "kind": "token" }),
     )
     .await;
 
@@ -152,6 +165,9 @@ async fn an_unsupported_connector_type_refuses_the_rotation_and_leaves_the_ref_u
 }
 
 /// An unknown connector id is a 404 — before any probe is attempted.
+/// (The candidate ref is still derived from the path id first, since
+/// derivation is pure and needs no database lookup, but the dial-info
+/// fetch that follows finds nothing and 404s before any probe.)
 #[tokio::test]
 async fn rotating_an_unknown_connector_is_a_404() {
     let app = spin_up().await;
@@ -161,7 +177,7 @@ async fn rotating_an_unknown_connector_is_a_404() {
         &app.router,
         "/api/connectors/conn-does-not-exist/secret",
         &cookie,
-        json!({ "slot": "primary", "newSecretRef": "env:CUSTOM_ROTATION_TEST_REF" }),
+        json!({ "slot": "primary", "source": "env", "kind": "token" }),
     )
     .await;
 
@@ -179,19 +195,17 @@ async fn an_unrecognized_slot_is_a_400() {
         &app.router,
         "/api/connectors/conn-pg-lakehouse/secret",
         &cookie,
-        json!({ "slot": "tertiary", "newSecretRef": "env:CUSTOM_ROTATION_TEST_REF" }),
+        json!({ "slot": "tertiary", "source": "env", "kind": "token" }),
     )
     .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
-/// `newSecretRef` shaped like a raw credential value (not a reference
-/// name) must be refused with 400 — the same
-/// `connectors::looks_like_raw_secret` shape check `create` applies to a
-/// caller-supplied `secretRef`, reused here rather than re-implemented.
+/// A `source` outside `"env" | "file"` fails to deserialize -- a 400, not
+/// a panic or a silent default.
 #[tokio::test]
-async fn a_raw_credential_shaped_new_secret_ref_is_a_400() {
+async fn an_unrecognized_source_is_a_400() {
     let app = spin_up().await;
     let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
 
@@ -199,23 +213,18 @@ async fn a_raw_credential_shaped_new_secret_ref_is_a_400() {
         &app.router,
         "/api/connectors/conn-pg-lakehouse/secret",
         &cookie,
-        json!({
-            "slot": "primary",
-            "newSecretRef": "postgres://admin:hunter2@db.internal:5432/oms",
-        }),
+        json!({ "slot": "primary", "source": "ftp", "kind": "password" }),
     )
     .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
-/// A `newSecretRef` naming one of the deployment's own reserved
-/// connector-credential patterns is refused with 400 before any probe --
-/// the regression guard for the exfiltration path the module doc comment
-/// describes (rotating an attacker-hosted connector onto a real
-/// deployment credential).
+/// A body still naming the removed `newSecretRef` field is refused --
+/// `RotateSecretBody`'s `deny_unknown_fields` -- rather than silently
+/// ignored.
 #[tokio::test]
-async fn a_new_secret_ref_naming_a_reserved_connector_credential_pattern_is_refused() {
+async fn a_body_naming_the_legacy_new_secret_ref_field_is_a_400() {
     let app = spin_up().await;
     let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
 
@@ -223,22 +232,129 @@ async fn a_new_secret_ref_naming_a_reserved_connector_credential_pattern_is_refu
         &app.router,
         "/api/connectors/conn-pg-lakehouse/secret",
         &cookie,
-        json!({ "slot": "primary", "newSecretRef": "env:CONNECTOR_S3_SECRET_KEY" }),
+        json!({ "slot": "primary", "newSecretRef": "env:CONNECTOR_PG_PASSWORD_V2" }),
     )
     .await;
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let body: Value = serde_json::from_slice(&bytes).unwrap();
-    let message = body["error"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("reserved"),
-        "expected reject_allowlisted_secret_ref's own wording, got {message:?}"
-    );
-
     let after = secret_ref_columns(&app.pool, "conn-pg-lakehouse").await;
     assert_eq!(
         after.0, "env:CONNECTOR_PG_PASSWORD",
         "refused before any write"
     );
+}
+
+/// The real success path (item 4 of the ADR 0002 Addendum 3 work): a
+/// derived candidate ref that IS actually provisioned resolves, the probe
+/// succeeds against this test's own Postgres server (dialed in-network,
+/// with `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true` — the same SSRF-guard
+/// override `connector_probe`'s own loopback tests use), and the rotation
+/// lands: the stored `secret_ref` becomes the derived name.
+///
+/// Uses [`spin_up_with_connector_secret_resolver`] to inject a resolver
+/// whose map contains the derived name, rather than `std::env::set_var`
+/// (which would mutate process-wide state shared with every other test
+/// running concurrently in this binary) or a real `/run/secrets` mount.
+/// The dial target is this test's OWN per-test Postgres database (the
+/// same server `common::spin_up` already connects `app.pool` to) — a
+/// connector row is inserted directly (bypassing `POST /api/connectors`,
+/// which would generate a different, unpredictable id) with a fixed id
+/// and a `host` shaped `<user>@<host>:<port>/<database>`, so
+/// `connector_probe::probe_postgres` can actually complete a real dial.
+#[tokio::test]
+async fn a_derived_secret_ref_resolves_and_the_rotation_lands() {
+    let (user, password, host, port) = parse_postgres_url(&lakehouse_test_support::database_url());
+
+    let mut overrides = HashMap::new();
+    overrides.insert(
+        "CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS".to_owned(),
+        "true".to_owned(),
+    );
+
+    let derived_ref = derive_secret_ref(
+        ROTATE_SUCCESS_CONNECTOR_ID,
+        CredentialSource::Env,
+        CredentialKind::Password,
+    );
+    let env_var_name = derived_ref
+        .strip_prefix("env:")
+        .expect("derive_secret_ref with CredentialSource::Env always returns an env: ref");
+    let resolver = Arc::new(EnvSecretResolver::with_map(HashMap::from([(
+        env_var_name.to_owned(),
+        password,
+    )])));
+
+    let app = spin_up_with_connector_secret_resolver(&overrides, resolver).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+
+    // `current_database()` -- the per-test database `common::spin_up`
+    // already created and migrated `app.pool` against -- is the dial
+    // target: reachable, real, and isolated from every other test.
+    let (database,): (String,) = sqlx::query_as("SELECT current_database()")
+        .fetch_one(&app.pool)
+        .await
+        .expect("read the test database's own name");
+    let dial_host = format!("{user}@{host}:{port}/{database}");
+
+    // `adapter` is deliberately left `NULL` (the column's own default,
+    // never set here): `connector_probe::probe` dispatches an
+    // `adapter`-set row through `probe_dial`, which reads `SqlDial` out
+    // of `dial` (left `{}` here) rather than `host` -- this test wants
+    // the LEGACY `kind`-string dispatch (`probe_by_kind` -> `probe_postgres`),
+    // which parses the `<user>@<host>:<port>/<database>` shape straight out
+    // of `host`, matching how `conn-pg-lakehouse` itself is still probed.
+    sqlx::query(
+        "INSERT INTO connector (id, name, type, direction, host, secret_ref, environment, \
+         tenant) VALUES ($1, 'rotate success test', 'PostgreSQL', 'source', $2, \
+         'env:PLACEHOLDER_INITIAL_REF_NEVER_RESOLVED', 'production', 'meridian')",
+    )
+    .bind(ROTATE_SUCCESS_CONNECTOR_ID)
+    .bind(&dial_host)
+    .execute(&app.pool)
+    .await
+    .expect("seed the dialable connector row");
+
+    let response = put(
+        &app.router,
+        &format!("/api/connectors/{ROTATE_SUCCESS_CONNECTOR_ID}/secret"),
+        &cookie,
+        json!({ "slot": "primary", "source": "env", "kind": "password" }),
+    )
+    .await;
+
+    let status = response.status();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(status, StatusCode::OK, "expected a landed rotation: {body}");
+    assert_eq!(body["rotated"], json!(true));
+    assert_eq!(body["slot"], json!("primary"));
+
+    let after = secret_ref_columns(&app.pool, ROTATE_SUCCESS_CONNECTOR_ID).await;
+    assert_eq!(after.0, derived_ref);
+    assert_eq!(
+        derived_ref, "env:CONNECTOR_CONN_ROTATE_SUCCESS_TEST_PASSWORD",
+        "pin the exact derived shape (ADR 0002 Addendum 3's documented example, applied to \
+         this id)"
+    );
+}
+
+/// Parses `postgres://user:pass@host:port/db` into its pieces -- this
+/// file needs the TEST Postgres server's own address/credentials (never a
+/// production one; `lakehouse_test_support::database_url()` always points
+/// at the disposable `testcontainers` server) to build an in-network dial
+/// target for the success-path test above.
+fn parse_postgres_url(url: &str) -> (String, String, String, u16) {
+    let rest = url
+        .strip_prefix("postgres://")
+        .expect("lakehouse_test_support::database_url is a postgres:// URL");
+    let (auth, host_port_db) = rest.split_once('@').expect("user:pass@host:port/db");
+    let (user, password) = auth.split_once(':').unwrap_or((auth, ""));
+    let (host_port, _db) = host_port_db.split_once('/').unwrap_or((host_port_db, ""));
+    let (host, port) = host_port.rsplit_once(':').expect("host:port");
+    (
+        user.to_owned(),
+        password.to_owned(),
+        host.to_owned(),
+        port.parse().expect("numeric port"),
+    )
 }

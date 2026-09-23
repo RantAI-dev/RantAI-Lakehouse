@@ -331,8 +331,12 @@ pub async fn get_connector(pool: &PgPool, id: &str) -> Result<Option<ConnectorDe
 
 /// Everything [`create_connector`] needs. Mirrors `CreateConnectorInput`.
 ///
-/// `secret_ref` is a REFERENCE NAME, never a credential value — see the
-/// module doc comment.
+/// There is no `secret_ref`/`secret_ref_secondary` field here any more
+/// (ADR 0002 Addendum 3): a client does not choose a credential reference
+/// NAME, only a [`CredentialSpec`] (source + kind per slot). The server
+/// generates the connector's id (`slug_id`, below) and derives the actual
+/// reference names from it, in [`create_connector`], after the id is
+/// known.
 #[derive(Debug, Clone)]
 pub struct CreateConnectorInput {
     /// Display name; must not collide with an existing connector.
@@ -344,17 +348,9 @@ pub struct CreateConnectorInput {
     /// Connection target (hostname/endpoint label). Never returned by any
     /// GET response — see the module doc comment.
     pub host: String,
-    /// A REFERENCE NAME to where a credential lives, never the credential
-    /// itself. See the module doc comment.
-    pub secret_ref: String,
-    /// An optional second REFERENCE NAME (e.g. the secret-access-key half
-    /// of an S3 connector's access-key/secret-key pair — see
-    /// [`ConnectorDialInfo::secret_ref_secondary`]). `None` for connector
-    /// types that need only one credential (e.g. `PostgreSQL`). Without
-    /// this, an S3 connector created through the API could never be
-    /// tested: [`get_connector_dial_info`] always reads this column, and
-    /// `lakehouse-api::connector_probe::probe_s3` requires it.
-    pub secret_ref_secondary: Option<String>,
+    /// What to derive this connector's credential reference name(s) from —
+    /// see [`derive_secret_ref`] and ADR 0002 Addendum 3.
+    pub credential: CredentialSpec,
     /// Deployment environment.
     pub environment: String,
     /// Owning tenant's display name.
@@ -372,6 +368,122 @@ pub struct CreateConnectorInput {
 }
 
 const DEFAULT_OWNER: &str = "Current user";
+
+/// Where a derived connector-credential reference name should be looked up
+/// at resolve time. Mirrors `CredentialSource` in `contracts/connectors.ts`
+/// — ADR 0002 Addendum 3's two schemes, `env:` and `file:`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialSource {
+    /// `env:CONNECTOR_<ID>_<SUFFIX>`, resolved by `EnvSecretResolver`.
+    Env,
+    /// `file:/run/secrets/connector_<id>_<suffix>`, resolved by
+    /// `FileSecretResolver`.
+    File,
+}
+
+/// Which fixed credential-name suffix a slot derives. Mirrors
+/// `CredentialKind` in `contracts/connectors.ts` — exactly the five
+/// suffixes ADR 0002 Addendum 3 and
+/// `lakehouse_api::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS` both
+/// name; adding a sixth here without adding it there would derive a name
+/// the resolver never admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialKind {
+    /// `_PASSWORD` suffix.
+    Password,
+    /// `_SECRET_KEY` suffix.
+    SecretKey,
+    /// `_ACCESS_KEY` suffix.
+    AccessKey,
+    /// `_API_KEY` suffix.
+    ApiKey,
+    /// `_TOKEN` suffix.
+    Token,
+}
+
+impl CredentialKind {
+    /// The upper-case suffix ADR 0002 Addendum 3 names, e.g. `"PASSWORD"`.
+    /// [`derive_secret_ref`]'s `file:` form lower-cases this itself, rather
+    /// than this method offering a second casing — one source of truth for
+    /// the suffix text.
+    #[must_use]
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Self::Password => "PASSWORD",
+            Self::SecretKey => "SECRET_KEY",
+            Self::AccessKey => "ACCESS_KEY",
+            Self::ApiKey => "API_KEY",
+            Self::Token => "TOKEN",
+        }
+    }
+}
+
+/// What a client chooses for a connector's credential(s): a source scheme
+/// and a kind per slot. Never a reference NAME — the client does not know
+/// the connector's id yet (the server generates it), so it cannot name a
+/// ref itself. See [`derive_secret_ref`] and ADR 0002 Addendum 3.
+#[derive(Debug, Clone)]
+pub struct CredentialSpec {
+    /// `env:` or `file:` — which resolver scheme the derived name(s) use.
+    pub source: CredentialSource,
+    /// The primary slot's kind (`connector.secret_ref`).
+    pub primary: CredentialKind,
+    /// `None` for a connector type that needs only one credential (e.g.
+    /// `PostgreSQL`). `Some` for e.g. an S3 connector's access-key/
+    /// secret-key pair — see
+    /// [`ConnectorDialInfo::secret_ref_secondary`].
+    pub secondary: Option<CredentialKind>,
+}
+
+/// The credential reference NAMES a newly created connector's operator
+/// must provision — returned ONCE, by [`create_connector`], and never
+/// again: no GET response for this connector repeats them (this does not
+/// weaken the module doc comment's guarantees 1/2 — [`Connector`] and
+/// [`ConnectorDetail`] gain no field; this is a distinct, create-only
+/// return value). Mirrors the `credential` field of `CreateConnectorResponse`
+/// in `contracts/connectors.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectorCredentialNames {
+    /// The primary slot's derived reference name.
+    pub primary: String,
+    /// The secondary slot's derived reference name, or `None` when
+    /// [`CredentialSpec::secondary`] was `None`.
+    pub secondary: Option<String>,
+}
+
+/// Derive a user-created connector's credential reference name from ITS
+/// OWN id — ADR 0002 Addendum 3 (`docs/adr/0002-secretref-resolution.md`).
+/// For `id = "conn-orders-k3x9"`, `source = Env`, `kind = Password`:
+/// `"env:CONNECTOR_CONN_ORDERS_K3X9_PASSWORD"`.
+///
+/// `id` is always [`slug_id`]'s output, `[a-z0-9-]` only, so upper-casing
+/// (for `env:`) or lower-casing (for `file:`) and mapping `-` to `_` is a
+/// lossless, one-to-one transform: two different ids can never derive the
+/// same name, and every derived name already matches
+/// `lakehouse_api::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS` — both
+/// resolvers (the API's `AllowlistedSecretResolver` and Dagster's
+/// `secret_resolver.resolve_secret_ref`) are unchanged by this ADR; this
+/// function is the only place the invariant "every derived name matches
+/// the allowlist" has to be kept true.
+#[must_use]
+pub fn derive_secret_ref(id: &str, source: CredentialSource, kind: CredentialKind) -> String {
+    match source {
+        CredentialSource::Env => {
+            let key = id.to_ascii_uppercase().replace('-', "_");
+            format!("env:CONNECTOR_{key}_{}", kind.suffix())
+        }
+        CredentialSource::File => {
+            let key = id.replace('-', "_");
+            format!(
+                "file:/run/secrets/connector_{key}_{}",
+                kind.suffix().to_ascii_lowercase()
+            )
+        }
+    }
+}
 
 /// A caller-supplied `secret_ref` is a REFERENCE NAME (`"env:FOO"`,
 /// `"vault:secret/data/x"`), never a credential value. This heuristically
@@ -422,21 +534,41 @@ pub fn looks_like_raw_secret(value: &str) -> bool {
 /// `record_test_result` is the only function that ever moves `health` off
 /// `"unknown"` or sets `lastTestAt`.
 ///
+/// # Credential names are derived here, after the id is known (ADR 0002 Addendum 3)
+///
+/// The id is generated FIRST ([`slug_id`]), then [`derive_secret_ref`]
+/// builds `secret_ref`/`secret_ref_secondary` from it and `input.credential`
+/// — never the other way around, and never from a caller-supplied name.
+/// This is the one place that ordering has to hold, so it lives here
+/// rather than at the API layer: a route that generated the id itself and
+/// passed refs in would duplicate `slug_id`'s definition, the exact
+/// "grep for the existing helper" this module already asks of a caller
+/// (AGENTS.md rule 4).
+///
+/// The returned [`ConnectorCredentialNames`] is the ONLY time these names
+/// are ever produced — `routes::connectors::create` returns them straight
+/// through in its response, once; no other function in this crate
+/// recomputes or re-reveals them (a GET can recompute the SAME names from
+/// the connector's own `id`, since the derivation is pure, but nothing
+/// does — see [`ConnectorCredentialNames`]'s doc comment).
+///
 /// # Errors
 ///
-/// Returns [`StoreError::Conflict`] (409) if the name is taken. Returns
-/// `Err` wrapping a validation failure (via [`StoreError::Database`]'s
-/// sibling — see `routes::connectors::create` for how this is actually
-/// surfaced as a 400) is NOT done here: shape validation belongs to the API
-/// layer, which calls [`looks_like_raw_secret`] itself before invoking
-/// this function, matching the `identity`/`pipelines` modules' split
-/// (repository does persistence, route does request validation).
+/// Returns [`StoreError::Conflict`] (409) if the name is taken. Shape
+/// validation of `name`/`type`/`direction`/etc. is NOT done here — that
+/// belongs to the API layer, matching the `identity`/`pipelines` modules'
+/// split (repository does persistence, route does request validation).
 pub async fn create_connector(
     pool: &PgPool,
     input: &CreateConnectorInput,
-) -> Result<Connector, StoreError> {
+) -> Result<(Connector, ConnectorCredentialNames), StoreError> {
     let id = slug_id(&input.name);
     let owner = input.owner.as_deref().unwrap_or(DEFAULT_OWNER);
+    let secret_ref = derive_secret_ref(&id, input.credential.source, input.credential.primary);
+    let secret_ref_secondary = input
+        .credential
+        .secondary
+        .map(|kind| derive_secret_ref(&id, input.credential.source, kind));
     // `last_test_at`/`last_activity_at` are omitted: neither column has a
     // default any more (`0028_connector_health_unknown_until_tested.sql`),
     // so both come back `NULL` -- no test has run and nothing measures
@@ -455,14 +587,18 @@ pub async fn create_connector(
         .bind(&input.environment)
         .bind(&input.tenant)
         .bind(&input.host)
-        .bind(&input.secret_ref)
-        .bind(&input.secret_ref_secondary)
+        .bind(&secret_ref)
+        .bind(&secret_ref_secondary)
         .bind(&input.residency)
         .bind(&input.capabilities)
         .bind(owner)
         .fetch_one(pool)
         .await?;
-    Ok(row.into())
+    let names = ConnectorCredentialNames {
+        primary: secret_ref,
+        secondary: secret_ref_secondary,
+    };
+    Ok((row.into(), names))
 }
 
 /// The outcome of a connectivity test. Mirrors `ConnectorTestResult`.
@@ -1361,5 +1497,143 @@ mod tests {
         assert_eq!(radix36(0), "0");
         assert_eq!(radix36(35), "z");
         assert_eq!(radix36(36), "10");
+    }
+
+    // ── ADR 0002 Addendum 3: derived connector-credential names ─────────
+
+    /// The exact example the addendum documents.
+    #[test]
+    fn derive_secret_ref_matches_the_documented_example() {
+        assert_eq!(
+            derive_secret_ref(
+                "conn-orders-k3x9",
+                CredentialSource::Env,
+                CredentialKind::Password
+            ),
+            "env:CONNECTOR_CONN_ORDERS_K3X9_PASSWORD"
+        );
+        assert_eq!(
+            derive_secret_ref(
+                "conn-orders-k3x9",
+                CredentialSource::File,
+                CredentialKind::Password
+            ),
+            "file:/run/secrets/connector_conn_orders_k3x9_password"
+        );
+    }
+
+    /// A pattern-match check, ported the same way
+    /// `dagster/dispar_orchestrate/secret_resolver.py`'s `_pattern_matches`
+    /// is: exactly one `*` splitting a fixed prefix and a fixed suffix.
+    /// Test-only mirror of `lakehouse_core::secret::pattern_matches` --
+    /// this crate does not depend on `lakehouse-core`'s `secret` module,
+    /// so the test reimplements the one predicate it needs rather than add
+    /// a dependency just for an assertion helper.
+    fn test_pattern_matches(pattern: &str, value: &str) -> bool {
+        let (prefix, suffix) = pattern.split_once('*').expect("every pattern has one '*'");
+        value.len() >= prefix.len() + suffix.len()
+            && value.starts_with(prefix)
+            && value.ends_with(suffix)
+    }
+
+    /// Every derived name, for every source/kind combination, matches
+    /// `lakehouse_api::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS`
+    /// (mirrored here as a literal, since `lakehouse-api` depends on
+    /// `lakehouse-store` and not the reverse — a dependency this test
+    /// cannot invert just to import the constant). If either list ever
+    /// changes, this and that crate's own
+    /// `connector_secret_resolver_admits_credential_suffixed_refs_...`
+    /// test must be updated together.
+    #[test]
+    fn every_derived_name_matches_the_connector_allowlist_patterns() {
+        let patterns = [
+            "env:CONNECTOR_*_PASSWORD",
+            "env:CONNECTOR_*_SECRET_KEY",
+            "env:CONNECTOR_*_ACCESS_KEY",
+            "env:CONNECTOR_*_API_KEY",
+            "env:CONNECTOR_*_TOKEN",
+            "file:/run/secrets/connector_*",
+        ];
+        for id in ["conn-orders-k3x9", "conn-a", "conn-pg-lakehouse-2"] {
+            for source in [CredentialSource::Env, CredentialSource::File] {
+                for kind in [
+                    CredentialKind::Password,
+                    CredentialKind::SecretKey,
+                    CredentialKind::AccessKey,
+                    CredentialKind::ApiKey,
+                    CredentialKind::Token,
+                ] {
+                    let derived = derive_secret_ref(id, source, kind);
+                    assert!(
+                        patterns.iter().any(|p| test_pattern_matches(p, &derived)),
+                        "{derived:?} (id={id}, source={source:?}, kind={kind:?}) matches no \
+                         allowlist pattern"
+                    );
+                }
+            }
+        }
+    }
+
+    /// No seeded ref (`0014_seed_connectors.sql`, `0022_prune_connector_seed.sql`,
+    /// `0023_connector_dedicated_secret_refs.sql`) can ever be derived from
+    /// any id beginning `conn-` — every derived `env:` name begins
+    /// `CONNECTOR_CONN_`, and every seeded ref does not.
+    #[test]
+    fn no_seeded_ref_can_be_derived_from_any_connector_id() {
+        let seeded_refs = [
+            // 0014 (deleted by 0022, kept here since the assertion is
+            // about the SHAPE, not which rows are currently live).
+            "env:CLICKHOUSE_SERVING_PASSWORD",
+            "env:ERP_FINANCE_PASSWORD",
+            "env:FX_RATES_API_KEY",
+            "env:GSHEETS_OAUTH_REFRESH_TOKEN",
+            "env:ICEBERG_CATALOG_TOKEN",
+            "env:KAFKA_CLICKSTREAM_SASL",
+            "env:KAFKA_FLEET_SASL",
+            "env:KAFKA_ORDERS_SASL",
+            "env:MONGO_CATALOG_URI",
+            "env:MQTT_WAREHOUSE_PASSWORD",
+            "env:MYSQL_POS_PASSWORD",
+            "env:ORACLE_GL_PASSWORD",
+            "env:PG_OMS_CDC_PASSWORD",
+            "env:PRICE_CRAWLER_PROXY_TOKEN",
+            "env:WEATHER_API_KEY",
+            // 0022/0023 (live today).
+            "env:CONNECTOR_PG_PASSWORD",
+            "env:CONNECTOR_S3_ACCESS_KEY",
+            "env:CONNECTOR_S3_SECRET_KEY",
+        ];
+        for r in seeded_refs {
+            assert!(
+                !r.starts_with("env:CONNECTOR_CONN_"),
+                "{r:?} would collide with a derived name's fixed prefix"
+            );
+        }
+    }
+
+    /// Two distinct ids never derive the same name — a handful of
+    /// adversarial pairs, including the exact shape the addendum's "why
+    /// this cannot reach someone else's credential" section calls out
+    /// (`conn-a-password` vs `conn-a` + suffix `PASSWORD`, which would
+    /// collide if `-`→`_` mapping were not one-to-one with a fixed set of
+    /// suffixes).
+    #[test]
+    fn distinct_ids_never_derive_the_same_name() {
+        let pairs = [
+            ("conn-a-password", "conn-a"),
+            ("conn-a-b", "conn-a-b-"),
+            ("conn-ab", "conn-a-b"),
+            ("conn-x-y-z", "conn-x-y-z-"),
+        ];
+        for (left, right) in pairs {
+            assert_ne!(left, right, "test fixture bug: ids must differ");
+            let left_ref = derive_secret_ref(left, CredentialSource::Env, CredentialKind::Password);
+            let right_ref =
+                derive_secret_ref(right, CredentialSource::Env, CredentialKind::Password);
+            assert_ne!(
+                left_ref, right_ref,
+                "distinct ids {left:?} and {right:?} derived the same name"
+            );
+        }
     }
 }
