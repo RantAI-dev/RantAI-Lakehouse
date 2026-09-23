@@ -39,6 +39,21 @@ dependencies = [
     # without a reason recorded here.
     "pymongo==4.9.2",
     "oracledb==2.5.1",
+    # adapters/sql.py builds mysql+pymysql / mssql+pyodbc connection
+    # strings for the mysql/mariadb/mssql drivers, but neither driver
+    # package was ever added here -- every Tier 2 mysql/mariadb/mssql
+    # ingest failed with ModuleNotFoundError in the built image. Verified
+    # installable for this image's interpreter (python:3.12-slim,
+    # dagster/Dockerfile) via `pip install --dry-run "pymysql==1.2.3"
+    # "pyodbc==5.3.0"` and PyPI's file listing on 2026-09-23: PyMySQL
+    # ships one pure-Python wheel (no C extension, no system package
+    # needed), and pyodbc 5.3.0 ships a cp312 manylinux wheel -- but
+    # pyodbc also needs the Microsoft ODBC Driver 18 + unixodbc SHARED
+    # LIBRARY installed in the image at runtime (dagster/Dockerfile), not
+    # just this Python package; a Python-only fix here is not sufficient
+    # on its own.
+    "pymysql==1.2.3",
+    "pyodbc==5.3.0",
     # kafka-python, NOT confluent-kafka: confluent-kafka's transport is
     # librdkafka, a C library that resolves broker hostnames through its
     # own internal resolver, never through Python's socket.getaddrinfo --

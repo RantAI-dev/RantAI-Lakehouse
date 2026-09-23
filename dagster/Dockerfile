@@ -48,6 +48,53 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends postgresql-client-16 \
     && rm -rf /var/lib/apt/lists/*
 
+# adapters/sql.py's mssql driver (Microsoft ODBC Driver 18, pyodbc) needs
+# BOTH the pyodbc Python package (pyproject.toml) AND this system driver
+# -- pyodbc's manylinux wheel dynamically links libodbc.so.2 at runtime
+# (verified: `ldd` on the wheel's .so shows `libodbc.so.2 => not found`
+# until unixodbc is installed), and msodbcsql18 is the ODBC driver
+# `adapters/sql.py::_mssql_connection_string`'s connection string names
+# via `DRIVER={ODBC Driver 18 for SQL Server}` -- that literal string
+# must match a driver `pyodbc.drivers()` actually reports, which is what
+# installing msodbcsql18 under its own package-provided odbcinst.ini
+# entry guarantees.
+#
+# Same apt-repo pattern as the PGDG block above, for the same reason:
+# this base image's Debian release (trixie, `/etc/debian_version` ==
+# 13.6) has no msodbcsql18 in its own default sources, but Microsoft's
+# own apt repository publishes a trixie ("13") line
+# (https://packages.microsoft.com/config/debian/13/prod.list, verified
+# 2026-09-23) carrying it. ACCEPT_EULA=Y is required non-interactively by
+# msodbcsql18's postinst script -- the package refuses to configure
+# without it, by design (Microsoft's own EULA acceptance gate), not a
+# workaround. Requires network access to packages.microsoft.com at BUILD
+# TIME, same air-gapped-build caveat as the PGDG block above.
+# Two things verified by actually running this block, not assumed from
+# Microsoft's docs:
+# 1. The key must be DEARMORED (gpg --dearmor) into a binary keyring, not
+#    stored as the ASCII-armored .asc curl downloads directly --
+#    `https://packages.microsoft.com/config/debian/13/prod.list` itself
+#    names `signed-by=/usr/share/keyrings/microsoft-prod.gpg` (a binary
+#    keyring path, by extension).
+# 2. `https://packages.microsoft.com/keys/microsoft.asc` is NOT the key
+#    that signs this repo's `InRelease` today -- apt/sqv refused it with
+#    "Missing key EE4D7792F748182B, which is needed to verify signature"
+#    even dearmored correctly. `EE4D7792F748182B` is
+#    `https://packages.microsoft.com/keys/microsoft-2025.asc`'s own key id
+#    (verified with `gpg --show-keys`), listed alongside `microsoft.asc`
+#    at `https://packages.microsoft.com/keys/` -- Microsoft rotated the
+#    signing key this repository uses without rotating the name every
+#    published install guide still points at.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends unixodbc \
+    && curl -fsSL https://packages.microsoft.com/keys/microsoft-2025.asc \
+         | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg \
+    && echo "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/13/prod trixie main" \
+         > /etc/apt/sources.list.d/mssql-release.list \
+    && apt-get update \
+    && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /opt/dagster/app
 COPY pyproject.toml ./
 COPY dispar_orchestrate ./dispar_orchestrate
