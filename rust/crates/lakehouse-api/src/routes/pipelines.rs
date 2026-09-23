@@ -38,12 +38,15 @@ use crate::tenant::TENANT_OWNER;
 ///
 /// # Tenant scoping — authored pipelines only
 ///
-/// `tenant_scope::resolve` runs first: `Ok(None)` (the caller belongs to
-/// zero tenants) short-circuits to `{"pipelines": []}` before the `Dagster`
-/// client or the store are ever queried — fail closed, never "unscoped,
-/// show everything." When it resolves `Some(tenant_id)`, the authored half
-/// of this union (`pipelines::list_pipelines`) is filtered to that tenant
-/// via a bound `WHERE tenant_id = $1`.
+/// `tenant_scope::resolve` decides the authored half only. `Ok(None)` (the
+/// caller belongs to zero tenants) means no authored pipeline is listed at
+/// all — the store is never queried, fail closed, never "unscoped, show
+/// everything." `Some(tenant_id)` filters the authored half
+/// (`pipelines::list_pipelines`) to that tenant via a bound
+/// `WHERE tenant_id = $1`. A zero-tenant caller still goes through the
+/// `Dagster`-job gate below: an earlier version returned `{"pipelines": []}`
+/// before that gate ran, so a `"*:*"` operator with no tenant membership
+/// lost the whole job list the gate says it may always see.
 ///
 /// # The `Dagster`-job half is a shared surface, gated like the catalog
 ///
@@ -68,10 +71,7 @@ pub async fn list(
         return ApiRejection(ApiError::unauthorized()).into_response();
     };
     let tenant_id = match crate::tenant_scope::resolve(&principal, &headers) {
-        Ok(Some(tenant_id)) => tenant_id,
-        Ok(None) => {
-            return (StatusCode::OK, ApiJson(json!({ "pipelines": [] }))).into_response();
-        }
+        Ok(tenant_id) => tenant_id,
         Err(err) => return ApiRejection(err).into_response(),
     };
     let dagster_jobs_refused =
@@ -109,7 +109,7 @@ enum ListError {
 async fn list_body(
     dagster: &DgClient,
     pg: Option<&PgPool>,
-    tenant_id: Uuid,
+    tenant_id: Option<Uuid>,
     dagster_jobs_refused: Option<&'static str>,
 ) -> Result<Value, ListError> {
     // The `Dagster` half is a SHARED, un-tenanted resource — a code
@@ -134,7 +134,9 @@ async fn list_body(
             })
             .collect();
     }
-    if let Some(pg) = pg {
+    // No tenant means no authored pipeline, not every tenant's: the store
+    // is not queried at all.
+    if let (Some(pg), Some(tenant_id)) = (pg, tenant_id) {
         let filter = pipelines::PipelineFilter {
             tenant_id: Some(tenant_id),
         };
@@ -1589,15 +1591,17 @@ mod tests {
 
     // ── `GET /api/pipelines` tenant scoping ─────────────────────────────
 
-    /// A principal that belongs to zero tenants gets
-    /// `{"pipelines": []}` — never `403`/`404`, and never every tenant's
-    /// rows. `state_without_pool()` (no `Dagster` client reachable either)
-    /// proves this is returned BEFORE `list_body` (hence before the
-    /// `Dagster` client or the store) is ever queried: reaching
-    /// `list_body` here would fail with a 503 `Dagster` connection error,
-    /// not 200 with an empty body.
+    /// A restricted principal that belongs to zero tenants gets no
+    /// authored pipeline and an explicit `dagsterJobs` refusal — never
+    /// `403`/`404`, never every tenant's rows, and never a bare empty list
+    /// that reads as complete. `state_without_pool()` (no store, no
+    /// reachable `Dagster`) proves neither is queried: reaching either
+    /// would fail with a 503, not 200. This test previously asserted a bare
+    /// `{"pipelines": []}` returned before the `Dagster`-job gate ran,
+    /// which is the short-circuit that also hid the job list from a
+    /// `"*:*"` operator (see the next test).
     #[tokio::test]
-    async fn list_with_a_tenantless_principal_returns_an_empty_list_before_touching_dagster_or_the_store()
+    async fn list_with_a_tenantless_restricted_principal_refuses_dagster_jobs_without_querying_anything()
      {
         let state = state_without_pool();
         let principal = principal_with_tenants(&[]);
@@ -1609,7 +1613,38 @@ mod tests {
         .await;
         let (status, body) = response_json(resp).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, json!({ "pipelines": [] }));
+        assert_eq!(body["pipelines"], json!([]));
+        assert_eq!(body["dagsterJobs"]["supported"], json!(false));
+    }
+
+    /// A `"*:*"` principal with no tenant membership is never refused the
+    /// `Dagster`-job half (`catalog_tenant_refusal`), so the route must go
+    /// on to query `Dagster`. With no reachable `Dagster` that surfaces as
+    /// the route's 503, which is the proof it was queried: the old
+    /// short-circuit answered 200 with an empty list instead.
+    #[tokio::test]
+    async fn list_with_a_tenantless_unrestricted_principal_still_queries_dagster() {
+        // A `Dagster` URL on a closed local port, never the config default:
+        // the default names a real host port, and a unit test must not dial
+        // whatever happens to listen there.
+        let mut env = HashMap::new();
+        env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+        env.insert(
+            "DAGSTER_URL".to_owned(),
+            "http://127.0.0.1:1/graphql".to_owned(),
+        );
+        let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+        let principal = Principal {
+            permissions: PermissionSet::parse("*:*"),
+            ..principal_with_tenants(&[])
+        };
+        let resp = list(
+            State(state),
+            Some(Extension(principal)),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// No `Extension<Principal>` at all (the internal, non-HTTP call path
