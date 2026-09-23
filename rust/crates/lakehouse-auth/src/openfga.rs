@@ -158,7 +158,14 @@ pub struct TenantWarehouseStorage {
     pub region: String,
     /// Bucket every tenant warehouse is created under (tenants are
     /// separated by `storage_prefix`/`key-prefix` within it, not by
-    /// bucket).
+    /// bucket). The caller (`lakehouse_api::routes::identity::
+    /// tenant_warehouse_storage`) is responsible for this NEVER being the
+    /// same bucket a deployment's `default` warehouse's storage profile
+    /// claims — a storage profile with no `key-prefix` (as
+    /// `docker-compose.yml`'s `lakekeeper-warehouse-init` creates) owns the
+    /// WHOLE bucket, and Lakekeeper refuses to create any other warehouse
+    /// anywhere inside it (`CreateWarehouseStorageProfileOverlap`,
+    /// regardless of THIS warehouse's own `key-prefix`).
     pub bucket: String,
     /// `true` for a path-style-addressed store (`RustFS`, most on-prem S3
     /// gateways); `false` for virtual-hosted-style (most of AWS S3 today).

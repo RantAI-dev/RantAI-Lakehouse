@@ -402,6 +402,27 @@ pub struct Config {
     /// rather than attempt a call `Lakekeeper` would reject — see
     /// `routes::identity::create_tenant`'s module doc comment.
     pub tenant_warehouse_s3_endpoint: Option<String>,
+    /// Bucket every tenant warehouse is created under
+    /// (`storage-profile.bucket`; tenants are separated within it by
+    /// `key-prefix`, not by bucket).
+    ///
+    /// MUST NOT equal [`Self::lakehouse_warehouse_bucket`] — every
+    /// deployment's `lakekeeper-warehouse-init` (`docker-compose.yml`)
+    /// creates the shared `default` warehouse at THAT bucket's storage
+    /// profile ROOT, with no `key-prefix` at all. `Lakekeeper` refuses to
+    /// create a second warehouse anywhere inside a bucket a root-level
+    /// profile already claims (`CreateWarehouseStorageProfileOverlap`), so
+    /// pointing tenant warehouses at the same bucket makes EVERY tenant
+    /// provisioning attempt fail this way, regardless of `key-prefix` —
+    /// this was `routes::identity::tenant_warehouse_storage`'s bug before
+    /// this field existed (it read `lakehouse_warehouse_bucket` directly).
+    /// `tenant_warehouse_storage` refuses honestly when the two are equal,
+    /// at the same point it refuses when unset — see that function's doc
+    /// comment. Default `"lakehouse-tenant-warehouses"`, a name that is
+    /// never `lakehouse_warehouse_bucket`'s own default
+    /// (`"lakehouse-warehouse"`) so a deployment that sets neither still
+    /// gets two distinct buckets, not a same-named collision.
+    pub tenant_warehouse_s3_bucket: String,
     /// S3 region string sent to `Lakekeeper` for a tenant warehouse's
     /// `storage-profile.region`. Non-secret, so — unlike the endpoint/
     /// access-key/secret-key trio above — this has a sane default rather
@@ -681,6 +702,10 @@ impl std::fmt::Debug for Config {
                 &self.tenant_warehouse_s3_endpoint,
             )
             .field(
+                "tenant_warehouse_s3_bucket",
+                &self.tenant_warehouse_s3_bucket,
+            )
+            .field(
                 "tenant_warehouse_s3_region",
                 &self.tenant_warehouse_s3_region,
             )
@@ -921,6 +946,11 @@ impl Config {
                 "/tokens/admin.jwt",
             ),
             tenant_warehouse_s3_endpoint: truthy(env, "TENANT_WAREHOUSE_S3_ENDPOINT"),
+            tenant_warehouse_s3_bucket: or_default(
+                env,
+                "TENANT_WAREHOUSE_S3_BUCKET",
+                "lakehouse-tenant-warehouses",
+            ),
             tenant_warehouse_s3_region: or_default(env, "TENANT_WAREHOUSE_S3_REGION", "us-east-1"),
             tenant_warehouse_s3_path_style_access: env
                 .get("TENANT_WAREHOUSE_S3_PATH_STYLE_ACCESS")
@@ -1138,6 +1168,17 @@ mod tests {
         assert_eq!(cfg.tenant_warehouse_s3_secret_key, None);
         // Non-secret fields still get sane defaults, matching
         // `docker-compose.yml`'s `lakekeeper-warehouse-init` body.
+        // Distinct from `lakehouse_warehouse_bucket`'s own default
+        // (`"lakehouse-warehouse"`) — see `tenant_warehouse_s3_bucket`'s
+        // doc comment for why the two must never collide.
+        assert_eq!(
+            cfg.tenant_warehouse_s3_bucket,
+            "lakehouse-tenant-warehouses"
+        );
+        assert_ne!(
+            cfg.tenant_warehouse_s3_bucket,
+            cfg.lakehouse_warehouse_bucket
+        );
         assert_eq!(cfg.tenant_warehouse_s3_region, "us-east-1");
         assert!(cfg.tenant_warehouse_s3_path_style_access);
         assert!(cfg.tenant_warehouse_sts_enabled);
@@ -1154,6 +1195,7 @@ mod tests {
                 "TENANT_WAREHOUSE_S3_ENDPOINT",
                 "http://rustfs.internal:9000",
             ),
+            ("TENANT_WAREHOUSE_S3_BUCKET", "acme-tenant-warehouses"),
             ("TENANT_WAREHOUSE_S3_REGION", "eu-central-1"),
             ("TENANT_WAREHOUSE_S3_PATH_STYLE_ACCESS", "false"),
             ("TENANT_WAREHOUSE_STS_ENABLED", "false"),
@@ -1169,6 +1211,7 @@ mod tests {
             cfg.tenant_warehouse_s3_endpoint.as_deref(),
             Some("http://rustfs.internal:9000")
         );
+        assert_eq!(cfg.tenant_warehouse_s3_bucket, "acme-tenant-warehouses");
         assert_eq!(cfg.tenant_warehouse_s3_region, "eu-central-1");
         assert!(!cfg.tenant_warehouse_s3_path_style_access);
         assert!(!cfg.tenant_warehouse_sts_enabled);

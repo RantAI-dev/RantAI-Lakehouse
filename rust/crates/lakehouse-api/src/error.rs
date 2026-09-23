@@ -106,6 +106,29 @@ pub fn tenant_warehouse_storage_not_configured() -> ApiError {
     )
 }
 
+/// A fixed 503 for `POST /api/identity/tenants` when
+/// `TENANT_WAREHOUSE_S3_BUCKET` is set to the SAME bucket as
+/// `LAKEHOUSE_WAREHOUSE_BUCKET` — the sibling of
+/// [`tenant_warehouse_storage_not_configured`] for the case the settings
+/// ARE all set, but to a shape Lakekeeper can never accept. Every
+/// deployment's `lakekeeper-warehouse-init` (`docker-compose.yml`) creates
+/// the shared `default` warehouse at `LAKEHOUSE_WAREHOUSE_BUCKET`'s
+/// storage-profile ROOT (no `key-prefix`) — a warehouse whose profile
+/// claims a bucket's root makes `Lakekeeper` refuse EVERY other warehouse
+/// in that same bucket with `CreateWarehouseStorageProfileOverlap`,
+/// regardless of `key-prefix`. Caught here, before ever attempting the
+/// Lakekeeper call, rather than surfacing as a confusing `Rejected`
+/// (`provisioning_unavailable`) on the very first tenant provisioned.
+#[must_use]
+pub fn tenant_warehouse_bucket_overlaps_default() -> ApiError {
+    ApiError::Unavailable(
+        "tenant warehouses need their own bucket: TENANT_WAREHOUSE_S3_BUCKET must not equal \
+         LAKEHOUSE_WAREHOUSE_BUCKET, because the default warehouse (lakekeeper-warehouse-init) \
+         owns the root of that bucket"
+            .to_owned(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -246,5 +269,16 @@ mod tests {
         assert!(err.to_string().contains("TENANT_WAREHOUSE_S3_ENDPOINT"));
         assert!(err.to_string().contains("TENANT_WAREHOUSE_S3_ACCESS_KEY"));
         assert!(err.to_string().contains("TENANT_WAREHOUSE_S3_SECRET_KEY"));
+    }
+
+    /// The overlap refusal names both settings and says why, not just
+    /// "unavailable" — an operator reading it must be able to fix it
+    /// without reading this file's source.
+    #[test]
+    fn tenant_warehouse_bucket_overlaps_default_names_both_settings() {
+        let err = tenant_warehouse_bucket_overlaps_default();
+        assert_eq!(err.status(), 503);
+        assert!(err.to_string().contains("TENANT_WAREHOUSE_S3_BUCKET"));
+        assert!(err.to_string().contains("LAKEHOUSE_WAREHOUSE_BUCKET"));
     }
 }

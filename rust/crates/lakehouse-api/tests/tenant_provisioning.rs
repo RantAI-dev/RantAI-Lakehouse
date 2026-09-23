@@ -366,3 +366,73 @@ async fn create_tenant_without_tenant_warehouse_storage_configured_refuses_hones
             .expect("the tenant row exists");
     assert_eq!(status, "pending");
 }
+
+/// `TENANT_WAREHOUSE_S3_BUCKET` set equal to `LAKEHOUSE_WAREHOUSE_BUCKET`
+/// must refuse, not attempt a Lakekeeper call — the exact bug the G2
+/// gate's re-run against a real `lakekeeper-warehouse-init` (which claims
+/// that bucket's storage-profile root for the `default` warehouse)
+/// exposed: every tenant warehouse in the same bucket 400s with
+/// `CreateWarehouseStorageProfileOverlap`. No mock is mounted on `server`
+/// at all: if the handler tried to call Lakekeeper anyway, the unmocked
+/// call would panic on `MockServer` drop rather than produce this clean
+/// 503.
+#[tokio::test]
+async fn create_tenant_with_overlapping_tenant_and_default_buckets_refuses_honestly() {
+    let server = MockServer::start().await;
+    let token_dir = tempfile::tempdir().expect("create a temp dir for the admin token file");
+    let token_path = token_dir.path().join("admin.jwt");
+    std::fs::write(&token_path, "test-admin-token").expect("write a fake admin token");
+    std::mem::forget(token_dir);
+
+    let mut overrides = HashMap::new();
+    overrides.insert("LAKEKEEPER_BASE_URI".to_owned(), server.uri());
+    overrides.insert(
+        "LAKEKEEPER_ADMIN_TOKEN_FILE".to_owned(),
+        token_path.to_str().expect("a UTF-8 temp path").to_owned(),
+    );
+    overrides.insert(
+        "LAKEHOUSE_WAREHOUSE_BUCKET".to_owned(),
+        "shared-warehouse".to_owned(),
+    );
+    // Same bucket on both settings — this is the collision.
+    overrides.insert(
+        "TENANT_WAREHOUSE_S3_BUCKET".to_owned(),
+        "shared-warehouse".to_owned(),
+    );
+    overrides.insert(
+        "TENANT_WAREHOUSE_S3_ENDPOINT".to_owned(),
+        "http://rustfs.test:9000".to_owned(),
+    );
+    overrides.insert(
+        "TENANT_WAREHOUSE_S3_ACCESS_KEY".to_owned(),
+        "test-tenant-access-key".to_owned(),
+    );
+    overrides.insert(
+        "TENANT_WAREHOUSE_S3_SECRET_KEY".to_owned(),
+        "test-tenant-secret-key".to_owned(),
+    );
+    let app = spin_up_with_env(&overrides).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "fajar@meridian.example").await;
+
+    let response = post(
+        &app.router,
+        "/api/identity/tenants",
+        &cookie,
+        json!({"name": "Acme Co", "slug": "acme-co", "plan": "Standard", "residency": "US"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = json_body(response).await;
+    let message = body["error"].as_str().expect("an error message");
+    assert!(
+        message.contains("TENANT_WAREHOUSE_S3_BUCKET"),
+        "expected the refusal to name the colliding setting, got {message:?}"
+    );
+
+    let (status,): (String,) =
+        sqlx::query_as("SELECT provisioning_status FROM tenant WHERE slug = 'acme-co'")
+            .fetch_one(&app.pool)
+            .await
+            .expect("the tenant row exists");
+    assert_eq!(status, "pending");
+}

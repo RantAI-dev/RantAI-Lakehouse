@@ -407,9 +407,12 @@ pub async fn create_tenant(
 ///
 /// [`crate::error::tenant_warehouse_storage_not_configured`] (503) if this
 /// deployment has not set the dedicated `TENANT_WAREHOUSE_S3_*` settings
-/// [`tenant_warehouse_storage`] requires — checked before ever attempting
-/// the Lakekeeper call, an honest refusal rather than a request Lakekeeper
-/// would reject anyway. [`crate::error::provisioning_unavailable`] (503) if
+/// [`tenant_warehouse_storage`] requires, or
+/// [`crate::error::tenant_warehouse_bucket_overlaps_default`] (503) if
+/// `TENANT_WAREHOUSE_S3_BUCKET` equals `LAKEHOUSE_WAREHOUSE_BUCKET` —
+/// both checked before ever attempting the Lakekeeper call, an honest
+/// refusal rather than a request Lakekeeper would reject anyway.
+/// [`crate::error::provisioning_unavailable`] (503) if
 /// a Lakekeeper call itself fails — never `err.to_string()`, per
 /// AGENTS.md's "upstream error text never reaches a response". A
 /// [`lakehouse_core::StoreError`] from a checkpoint write propagates as-is
@@ -490,19 +493,26 @@ async fn provision_tenant(
 ///
 /// Checked once, right before `provision_tenant`'s "pending" step would
 /// otherwise attempt the Lakekeeper call — never partway through building
-/// the request, so a deployment missing these settings gets one honest 503
-/// naming exactly what to set, instead of a request built from empty
-/// strings that `Lakekeeper` would reject with a confusing validation
-/// error.
+/// the request, so a deployment missing these settings, or pointing them
+/// at a bucket that can never work, gets one honest 503 instead of a
+/// request `Lakekeeper` would reject with a confusing validation error.
 ///
 /// # Errors
 ///
 /// [`crate::error::tenant_warehouse_storage_not_configured`] if
 /// [`Config::tenant_warehouse_s3_endpoint`],
 /// [`Config::tenant_warehouse_s3_access_key`], or
-/// [`Config::tenant_warehouse_s3_secret_key`] is unset. The remaining
-/// fields (region, path-style, STS) always have a value — see their own
-/// doc comments — so they never gate this check.
+/// [`Config::tenant_warehouse_s3_secret_key`] is unset.
+/// [`crate::error::tenant_warehouse_bucket_overlaps_default`] if
+/// [`Config::tenant_warehouse_s3_bucket`] equals
+/// [`Config::lakehouse_warehouse_bucket`] — every deployment's
+/// `lakekeeper-warehouse-init` (`docker-compose.yml`) creates the shared
+/// `default` warehouse at THAT bucket's storage-profile ROOT (no
+/// `key-prefix`), so a tenant warehouse in the same bucket always 400s
+/// with Lakekeeper's `CreateWarehouseStorageProfileOverlap`, regardless of
+/// `key-prefix`. The remaining fields (region, path-style, STS) always
+/// have a value — see their own doc comments — so they never gate this
+/// check.
 fn tenant_warehouse_storage(config: &Config) -> ApiResult<TenantWarehouseStorage> {
     let (Some(endpoint), Some(access_key), Some(secret_key)) = (
         config.tenant_warehouse_s3_endpoint.as_ref(),
@@ -511,10 +521,13 @@ fn tenant_warehouse_storage(config: &Config) -> ApiResult<TenantWarehouseStorage
     ) else {
         return Err(crate::error::tenant_warehouse_storage_not_configured().into());
     };
+    if config.tenant_warehouse_s3_bucket == config.lakehouse_warehouse_bucket {
+        return Err(crate::error::tenant_warehouse_bucket_overlaps_default().into());
+    }
     Ok(TenantWarehouseStorage {
         endpoint: endpoint.clone(),
         region: config.tenant_warehouse_s3_region.clone(),
-        bucket: config.lakehouse_warehouse_bucket.clone(),
+        bucket: config.tenant_warehouse_s3_bucket.clone(),
         path_style_access: config.tenant_warehouse_s3_path_style_access,
         sts_enabled: config.tenant_warehouse_sts_enabled,
         sts_role_arn: config.tenant_warehouse_sts_role_arn.clone(),
@@ -884,16 +897,22 @@ mod tests {
         );
     }
 
-    /// With every setting present, `tenant_warehouse_storage` builds a
-    /// [`TenantWarehouseStorage`] carrying exactly those values (the
-    /// `bucket` field reuses `LAKEHOUSE_WAREHOUSE_BUCKET`, per this
-    /// function's doc comment).
+    /// With every setting present, and `TENANT_WAREHOUSE_S3_BUCKET`
+    /// distinct from `LAKEHOUSE_WAREHOUSE_BUCKET`, `tenant_warehouse_storage`
+    /// builds a [`TenantWarehouseStorage`] carrying exactly those values —
+    /// the `bucket` field is the DEDICATED `TENANT_WAREHOUSE_S3_BUCKET`,
+    /// never `LAKEHOUSE_WAREHOUSE_BUCKET` (see this function's doc comment
+    /// for why the two must never be equal).
     #[test]
     fn tenant_warehouse_storage_builds_from_config_when_set() {
         let mut env = HashMap::new();
         env.insert(
             "TENANT_WAREHOUSE_S3_ENDPOINT".to_owned(),
             "http://rustfs.internal:9000".to_owned(),
+        );
+        env.insert(
+            "TENANT_WAREHOUSE_S3_BUCKET".to_owned(),
+            "acme-tenant-warehouses".to_owned(),
         );
         env.insert(
             "TENANT_WAREHOUSE_S3_ACCESS_KEY".to_owned(),
@@ -910,9 +929,51 @@ mod tests {
         let config = Config::from_map(&env).unwrap();
         let storage = tenant_warehouse_storage(&config).expect("every setting is present");
         assert_eq!(storage.endpoint, "http://rustfs.internal:9000");
-        assert_eq!(storage.bucket, "acme-warehouse");
+        assert_eq!(storage.bucket, "acme-tenant-warehouses");
         assert_eq!(storage.access_key, "tenant-access-key");
         assert_eq!(storage.secret_key.expose(), "tenant-secret-key");
+    }
+
+    /// `TENANT_WAREHOUSE_S3_BUCKET` equal to `LAKEHOUSE_WAREHOUSE_BUCKET`
+    /// (the bug the G2 gate's re-run exposed: this function used to read
+    /// `lakehouse_warehouse_bucket` directly, always colliding with the
+    /// `default` warehouse `lakekeeper-warehouse-init` creates at that
+    /// bucket's root) must refuse, not build a request Lakekeeper would
+    /// 400 on with `CreateWarehouseStorageProfileOverlap`.
+    #[test]
+    fn tenant_warehouse_storage_refuses_when_bucket_overlaps_the_default_warehouse() {
+        let mut env = HashMap::new();
+        env.insert(
+            "TENANT_WAREHOUSE_S3_ENDPOINT".to_owned(),
+            "http://rustfs.internal:9000".to_owned(),
+        );
+        env.insert(
+            "TENANT_WAREHOUSE_S3_ACCESS_KEY".to_owned(),
+            "tenant-access-key".to_owned(),
+        );
+        env.insert(
+            "TENANT_WAREHOUSE_S3_SECRET_KEY".to_owned(),
+            "tenant-secret-key".to_owned(),
+        );
+        // Same bucket on both settings — this is the collision, whatever
+        // the actual name is.
+        env.insert(
+            "TENANT_WAREHOUSE_S3_BUCKET".to_owned(),
+            "shared-warehouse".to_owned(),
+        );
+        env.insert(
+            "LAKEHOUSE_WAREHOUSE_BUCKET".to_owned(),
+            "shared-warehouse".to_owned(),
+        );
+        let config = Config::from_map(&env).unwrap();
+        let err = tenant_warehouse_storage(&config)
+            .expect_err("an overlapping bucket must refuse, not build a request");
+        assert_eq!(err.0.status(), 503);
+        assert!(
+            err.0.to_string().contains("TENANT_WAREHOUSE_S3_BUCKET"),
+            "the refusal should name the colliding setting, got: {}",
+            err.0
+        );
     }
 
     /// A malformed body is a 400 with the parser's message, not a 500 and

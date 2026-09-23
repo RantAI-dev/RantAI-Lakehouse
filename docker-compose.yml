@@ -333,6 +333,16 @@ services:
       # storage is not configured" 503 rather than a request built from
       # empty-string credentials.
       TENANT_WAREHOUSE_S3_ENDPOINT: ${TENANT_WAREHOUSE_S3_ENDPOINT:-http://rustfs:9000}
+      # MUST NOT equal LAKEHOUSE_WAREHOUSE_BUCKET above — that bucket's
+      # storage-profile root belongs to the `default` warehouse
+      # `lakekeeper-warehouse-init` below creates, and Lakekeeper refuses
+      # to create any other warehouse anywhere inside a bucket a root-level
+      # profile already claims (`CreateWarehouseStorageProfileOverlap`,
+      # regardless of `key-prefix`). A default distinct from
+      # `LAKEHOUSE_WAREHOUSE_BUCKET`'s own default is what keeps a
+      # deployment that sets neither safe by construction — see
+      # `Config::tenant_warehouse_s3_bucket`'s doc comment.
+      TENANT_WAREHOUSE_S3_BUCKET: ${TENANT_WAREHOUSE_S3_BUCKET:-lakehouse-tenant-warehouses}
       TENANT_WAREHOUSE_S3_REGION: ${TENANT_WAREHOUSE_S3_REGION:-us-east-1}
       TENANT_WAREHOUSE_S3_PATH_STYLE_ACCESS: ${TENANT_WAREHOUSE_S3_PATH_STYLE_ACCESS:-true}
       TENANT_WAREHOUSE_STS_ENABLED: ${TENANT_WAREHOUSE_STS_ENABLED:-true}
@@ -442,11 +452,32 @@ services:
       AWS_EC2_METADATA_DISABLED: "true"
     entrypoint: ["/bin/sh", "-c"]
     command:
-      - >
-        aws --endpoint-url http://rustfs:9000 s3api head-bucket
-        --bucket ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse} 2>/dev/null ||
-        aws --endpoint-url http://rustfs:9000 s3api create-bucket
-        --bucket ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
+      # `set -eu`: a genuine `create-bucket` failure (not "already
+      # exists," which `head-bucket` already caught) must fail this job,
+      # not be silently swallowed by a later `||`. Two independent
+      # head-bucket-then-create-bucket statements, not one `&&`/`||`
+      # chain across both buckets — chaining them would make a real
+      # failure on the FIRST bucket skip checking/creating the SECOND
+      # entirely (left-to-right `&&`/`||` share precedence in POSIX
+      # shell), silently leaving the tenant bucket missing.
+      #
+      # The tenant bucket (`TENANT_WAREHOUSE_S3_BUCKET`) is created here
+      # too, distinct from the warehouse bucket above: `Config::
+      # tenant_warehouse_s3_bucket`'s doc comment explains why it must
+      # never be the same bucket `lakekeeper-warehouse-init` below points
+      # the shared `default` warehouse's storage profile at (a warehouse
+      # whose profile claims a bucket's root makes Lakekeeper refuse every
+      # OTHER warehouse in that bucket).
+      - |
+        set -eu
+        aws --endpoint-url http://rustfs:9000 s3api head-bucket \
+          --bucket "${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}" 2>/dev/null || \
+          aws --endpoint-url http://rustfs:9000 s3api create-bucket \
+            --bucket "${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}"
+        aws --endpoint-url http://rustfs:9000 s3api head-bucket \
+          --bucket "${TENANT_WAREHOUSE_S3_BUCKET:-lakehouse-tenant-warehouses}" 2>/dev/null || \
+          aws --endpoint-url http://rustfs:9000 s3api create-bucket \
+            --bucket "${TENANT_WAREHOUSE_S3_BUCKET:-lakehouse-tenant-warehouses}"
     restart: "no"
 
   # P1 — one-shot: create Lakekeeper's own Postgres database on the
@@ -1285,24 +1316,34 @@ services:
     # code). Widening the healthcheck cannot close that window from inside;
     # retrying from the client side does.
     command:
+      # Both buckets in one job, same retry loop reused per bucket — the
+      # tenant bucket (`TENANT_WAREHOUSE_S3_BUCKET`) needs the identical
+      # "S3 not usable yet" retry `rustfs-bucket-init`'s SeaweedFS sibling
+      # already needed for the warehouse bucket, and must be DISTINCT from
+      # it for the same `CreateWarehouseStorageProfileOverlap` reason
+      # `Config::tenant_warehouse_s3_bucket`'s doc comment gives.
       - |
         set -eu
-        bucket="${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}"
         endpoint="http://seaweedfs:8333"
-        for attempt in $$(seq 1 30); do
-          if aws --endpoint-url "$$endpoint" s3api head-bucket --bucket "$$bucket" 2>/dev/null; then
-            echo "bucket $$bucket already present"; exit 0
-          fi
-          if aws --endpoint-url "$$endpoint" s3api create-bucket --bucket "$$bucket" 2>/dev/null; then
-            echo "created bucket $$bucket"; exit 0
-          fi
-          echo "seaweedfs S3 not usable yet (attempt $$attempt/30), retrying" >&2
-          sleep 2
-        done
-        echo "seaweedfs S3 endpoint never became usable after 60s" >&2
-        # One last unsuppressed attempt so the actual AWS CLI error is in
-        # the logs rather than swallowed by 2>/dev/null.
-        aws --endpoint-url "$$endpoint" s3api create-bucket --bucket "$$bucket"
+        ensure_bucket() {
+          bucket="$$1"
+          for attempt in $$(seq 1 30); do
+            if aws --endpoint-url "$$endpoint" s3api head-bucket --bucket "$$bucket" 2>/dev/null; then
+              echo "bucket $$bucket already present"; return 0
+            fi
+            if aws --endpoint-url "$$endpoint" s3api create-bucket --bucket "$$bucket" 2>/dev/null; then
+              echo "created bucket $$bucket"; return 0
+            fi
+            echo "seaweedfs S3 not usable yet for bucket $$bucket (attempt $$attempt/30), retrying" >&2
+            sleep 2
+          done
+          echo "seaweedfs S3 endpoint never became usable for bucket $$bucket after 60s" >&2
+          # One last unsuppressed attempt so the actual AWS CLI error is in
+          # the logs rather than swallowed by 2>/dev/null.
+          aws --endpoint-url "$$endpoint" s3api create-bucket --bucket "$$bucket"
+        }
+        ensure_bucket "${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}"
+        ensure_bucket "${TENANT_WAREHOUSE_S3_BUCKET:-lakehouse-tenant-warehouses}"
     restart: "no"
 
   # P2 (G2) — mirrors `lakekeeper-warehouse-init` exactly (same bootstrap +
@@ -2432,27 +2473,13 @@ services:
   # as every other `g*-test-runner` in this file.
   #
   # Usage (from a clean stack — `lakehouse-api` must be (re)started after
-  # `AUTH_BOOTSTRAP_EMAIL`/`AUTH_BOOTSTRAP_PASSWORD`/`TENANT_WAREHOUSE_S3_*`
-  # are set, the same already-running-container caveat
-  # `gold-export-test-runner`'s own comment gives). Deliberately does NOT
-  # bring up `lakekeeper-warehouse-init`/`lakekeeper-authz-init` — see this
-  # service's own `depends_on` comment on why the `default` warehouse those
-  # jobs create would overlap every tenant warehouse this gate provisions.
-  # Lakekeeper still needs its one-time instance bootstrap
-  # (`management/v1/bootstrap`, `accept-terms-of-use`) before it will
-  # create ANY warehouse — `lakekeeper`'s image carries no shell utility to
-  # call this from inside the container, so do it from a throwaway image on
-  # the project's own network, e.g.:
+  # `AUTH_BOOTSTRAP_EMAIL`/`AUTH_BOOTSTRAP_PASSWORD` are set, the same
+  # already-running-container caveat `gold-export-test-runner`'s own
+  # comment gives):
   #   docker compose -p <project> --profile test up -d
   #     postgres clickhouse rustfs rustfs-bucket-init lakekeeper-db-init
-  #     lakekeeper-migrate lakekeeper lakehouse-api
-  #   admin_token="$(docker compose -p <project> exec -T lakehouse-api \
-  #     cat /tokens/admin.jwt)"
-  #   docker run --rm --network <project>_default curlimages/curl:8.10.1 \
-  #     -fsS -X POST -H "Authorization: Bearer $admin_token" \
-  #     -H 'Content-Type: application/json' \
-  #     -d '{"accept-terms-of-use": true}' \
-  #     http://lakekeeper:8181/management/v1/bootstrap
+  #     lakekeeper-migrate lakekeeper lakekeeper-warehouse-init
+  #     lakekeeper-authz-init lakehouse-api
   #   docker compose -p <project> --profile test run --rm g2-test-runner
   g2-test-runner:
     profiles: ["test"]
@@ -2473,25 +2500,8 @@ services:
     depends_on:
       lakehouse-api:
         condition: service_started
-      # Deliberately NOT `lakekeeper-authz-init` (this gate's first commit
-      # depended on it, copying `gold-export-test-runner`'s precedent
-      # without checking whether this gate actually needs what that job
-      # does): `lakekeeper-authz-init` grants machine principals onto the
-      # SHARED `default` warehouse `lakekeeper-warehouse-init` creates at
-      # its storage profile's bucket ROOT (no `key-prefix` at all) — and
-      # `POST /api/identity/tenants` provisions a warehouse in the SAME
-      # bucket (`LAKEHOUSE_WAREHOUSE_BUCKET`/`TENANT_WAREHOUSE_S3_*` share
-      # one bucket name, `routes::identity::tenant_warehouse_storage`),
-      # which Lakekeeper correctly refuses with
-      # `CreateWarehouseStorageProfileOverlap` — a `default` warehouse
-      # claiming the whole bucket makes every OTHER warehouse in that
-      # bucket, tenant or not, an overlap. This gate never needs `default`
-      # to exist, so it depends on Lakekeeper being bootstrapped
-      # (instance-level, one-time, independent of which warehouses exist
-      # afterward) and healthy instead — see the "Usage" comment above for
-      # how to bootstrap without also creating `default`.
-      lakekeeper:
-        condition: service_healthy
+      lakekeeper-authz-init:
+        condition: service_completed_successfully
     environment:
       API_URL: http://lakehouse-api:8080
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
