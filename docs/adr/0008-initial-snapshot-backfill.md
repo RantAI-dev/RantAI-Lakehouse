@@ -106,3 +106,22 @@ exercise the default `snapshot.mode=initial` path end to end: a source
 table with pre-existing rows, captured once at connector start, followed
 immediately by streamed `UPDATE`/`DELETE`/`INSERT` — the same sequencing
 this ADR's decision depends on.
+
+## Addendum — Oracle: a named extension point, not a feature
+
+Oracle CDC through `Debezium`'s LogMiner connector is **not implemented**. No
+LogMiner property template exists in this repository: the template
+`cdc.rs::render_debezium_properties_template` renders is shaped for the
+Postgres, MySQL and SQL Server connectors (and MongoDB, through its own arm),
+and handing it back with Oracle's connector class on it would produce a config
+that looks ready and that Oracle's connector rejects. LogMiner capture also
+needs the source database in `ARCHIVELOG` mode with supplemental logging —
+neither of which the batch sql adapter (`adapters/oracle.py`, a read-only
+`SELECT`) assumes or can configure remotely.
+
+`ORACLE_CDC_LOGMINER_ENABLED` (default `false`) names where that support will
+attach. `GET /api/connectors/{id}/debezium-properties` refuses every
+Oracle-driver connector with `409 { supported: false, reason }` in **both**
+flag states; the flag changes only what the reason explains. Oracle ingestion
+runs through the batch sql adapter until LogMiner support is built — the same
+posture this ADR took for Postgres's incremental-snapshot mode.

@@ -483,26 +483,56 @@ pub struct DebeziumPropertiesQuery {
 }
 
 /// The response body for `GET /api/connectors/{id}/debezium-properties`.
-/// `properties` contains ONLY `${ENV_VAR_NAME}` references for every
-/// credential-shaped field — never a resolved secret — see
+///
+/// An `untagged` enum so the same route can return either:
+/// - the rendered `${ENV_VAR_NAME}`-reference template (the
+///   [`DebeziumPropertiesResponse::Rendered`] variant — every supported
+///   driver), or
+/// - the honest `{ supported: false, reason: ... }` body for an
+///   Oracle-driver CDC connector arriving with
+///   `ORACLE_CDC_LOGMINER_ENABLED=false` (the
+///   [`DebeziumPropertiesResponse::Unsupported`] variant — WS9 §Phase E
+///   / E2).
+///
+/// `Rendered.properties` contains ONLY `${ENV_VAR_NAME}` references for
+/// every credential-shaped field — never a resolved secret — see
 /// [`lakehouse_store::cdc::render_debezium_properties_template`]'s doc
 /// comment. Consumed by a future `ops/debezium/render_compose.py`
 /// (WS3), which is what actually expands the references when it
 /// generates a real `debezium-server` compose service; nothing in this
 /// handler or its caller resolves them.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DebeziumPropertiesResponse {
-    /// The `.properties` file body, with `${ENV_VAR_NAME}` references
-    /// in place of every credential value.
-    properties: String,
-    /// The `table` query parameter this response was rendered for,
-    /// echoed back so a caller does not have to track it separately.
-    table: String,
-    /// A human-readable reminder of what `properties` is and is not —
-    /// present so this is self-documenting even if read outside this
-    /// handler's own doc comment.
-    note: String,
+#[serde(untagged)]
+pub enum DebeziumPropertiesResponse {
+    /// The rendered template body.
+    Rendered {
+        /// The `.properties` file body, with `${ENV_VAR_NAME}` references
+        /// in place of every credential value.
+        properties: String,
+        /// The `table` query parameter this response was rendered for,
+        /// echoed back so a caller does not have to track it separately.
+        table: String,
+        /// A human-readable reminder of what `properties` is and is not —
+        /// present so this is self-documenting even if read outside this
+        /// handler's own doc comment.
+        note: String,
+    },
+    /// The honest `supported: false` response, carrying the REAL reason
+    /// an Oracle-driver CDC connector's `Debezium` properties template
+    /// cannot be rendered. The shape mirrors `POST .../ingest/run`'s own
+    /// `supported: false` body (`ingest_run` below), so the connector
+    /// detail page can show one canonical message for both routes.
+    Unsupported {
+        /// Always `false`; this variant exists so the field's name is
+        /// visible at the call site and in the wire shape, not to
+        /// permit a `true` future — `Debezium` CDC is either supported
+        /// (rendered) or it isn't.
+        supported: bool,
+        /// Why this connector's `Debezium` properties template is not
+        /// being rendered. Self-contained text, never carries an
+        /// upstream error (AGENTS.md rule 4).
+        reason: String,
+    },
 }
 
 /// Map a [`SqlDriver`] to the real, documented `Debezium` connector class
@@ -514,20 +544,16 @@ pub struct DebeziumPropertiesResponse {
 /// would have silently mislabeled a `mysql`/`mssql` connector's rendered
 /// template.
 ///
-/// `SqlDriver::Oracle` is intentionally absent — `Debezium` does not ship
-/// an Oracle CDC connector in this build. A `sql` adapter with
-/// `driver = "oracle"` is rejected at the call site
-/// ([`resolve_debezium_source_target`]) before this function is reached,
-/// so the missing arm never materialises at runtime.
+/// The `SqlDriver::Oracle` arm names `Debezium`'s real Oracle class, but no
+/// rendered template ever carries it: [`debezium_properties`] refuses every
+/// Oracle-driver connector before rendering, whatever
+/// `ORACLE_CDC_LOGMINER_ENABLED` says (see `oracle_cdc_refusal`).
 fn debezium_connector_class(driver: SqlDriver) -> &'static str {
     match driver {
         SqlDriver::Postgres => "io.debezium.connector.postgresql.PostgresConnector",
         SqlDriver::Mysql => "io.debezium.connector.mysql.MySqlConnector",
         SqlDriver::Mssql => "io.debezium.connector.sqlserver.SqlServerConnector",
-        SqlDriver::Oracle => unreachable!(
-            "Debezium CDC for Oracle is not supported in this build; \
-             resolve_debezium_source_target rejects Oracle before this is reached"
-        ),
+        SqlDriver::Oracle => "io.debezium.connector.oracle.OracleConnector",
     }
 }
 
@@ -541,6 +567,12 @@ struct DebeziumSourceTarget {
     database: String,
     user: String,
     connector_class: &'static str,
+    /// The original [`SqlDriver`] value the parsed `dial` carried — kept
+    /// on the target so [`debezium_properties`] can decide whether the
+    /// Oracle refusal applies, without
+    /// the route handler having to re-parse the dial just to inspect the
+    /// driver.
+    driver: SqlDriver,
 }
 
 /// Resolve `id`/`dial_info` into a [`DebeziumSourceTarget`] — see
@@ -589,20 +621,17 @@ fn resolve_debezium_source_target(
                     )));
                 }
             };
-            if driver == SqlDriver::Oracle {
-                return Err(ApiError::BadRequest(format!(
-                    "connector {id}'s dial driver is Oracle; Debezium CDC has no Oracle \
-                     connector in this build, so a Debezium properties template cannot be \
-                     rendered. Oracle ingestion runs through the Dagster sql adapter, not \
-                     through Debezium."
-                )));
-            }
+            // Oracle still resolves here; it is refused one step later, at
+            // the `debezium_properties` call site (`oracle_cdc_refusal`),
+            // which is why the driver is kept on the target — the route can
+            // branch on it without re-parsing the dial.
             Ok(DebeziumSourceTarget {
                 host,
                 port,
                 database,
                 user,
                 connector_class: debezium_connector_class(driver),
+                driver,
             })
         }
         Some("mongodb") => {
@@ -640,6 +669,7 @@ fn resolve_debezium_source_target(
                 database: "placeholder".to_owned(),
                 user: "placeholder".to_owned(),
                 connector_class: lakehouse_store::cdc::MONGO_CONNECTOR_CLASS,
+                driver: SqlDriver::Postgres,
             })
         }
         None if dial_info.kind.to_lowercase().contains("postgres") => {
@@ -655,6 +685,7 @@ fn resolve_debezium_source_target(
                 database: target.database.to_owned(),
                 user: target.user.to_owned(),
                 connector_class: debezium_connector_class(SqlDriver::Postgres),
+                driver: SqlDriver::Postgres,
             })
         }
         _ => Err(ApiError::BadRequest(format!(
@@ -716,7 +747,7 @@ pub async fn debezium_properties(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(query): Query<DebeziumPropertiesQuery>,
-) -> ApiResult<ApiJson<DebeziumPropertiesResponse>> {
+) -> ApiResult<(StatusCode, ApiJson<DebeziumPropertiesResponse>)> {
     let dial_info = connectors::get_connector_dial_info(pool(&state)?, &id).await?;
     let Some(dial_info) = dial_info else {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
@@ -727,6 +758,14 @@ pub async fn debezium_properties(
     }
 
     let target = resolve_debezium_source_target(&id, &dial_info)?;
+
+    // Oracle CDC refusal. Fires BEFORE the secretRef `env:` check on
+    // purpose: an Oracle CDC connector with a `vault:`-schemed credential
+    // should report "this build does not do LogMiner", not a
+    // downstream-shaped error about an unrenderable ref scheme.
+    if let Some(response) = oracle_cdc_refusal(&target, state.config.oracle_cdc_logminer_enabled) {
+        return Ok((StatusCode::CONFLICT, ApiJson(response)));
+    }
 
     let Some(database_password_ref) = dial_info.secret_ref.strip_prefix("env:") else {
         return Err(ApiError::BadRequest(format!(
@@ -771,13 +810,52 @@ pub async fn debezium_properties(
     )
     .map_err(|err| ApiError::BadRequest(format!("connector {id}'s fields are invalid: {err}")))?;
 
-    Ok(ApiJson(DebeziumPropertiesResponse {
-        properties,
-        table: table.to_owned(),
-        note: "values are ${ENV_VAR_NAME} references the deployment's own shell expands at \
-               container start — never a resolved secret"
-            .to_owned(),
-    }))
+    Ok((
+        StatusCode::OK,
+        ApiJson(DebeziumPropertiesResponse::Rendered {
+            properties,
+            table: table.to_owned(),
+            note: "values are ${ENV_VAR_NAME} references the deployment's own shell expands at \
+                   container start — never a resolved secret"
+                .to_owned(),
+        }),
+    ))
+}
+
+/// The only gate between an Oracle-driver CDC connector and
+/// [`render_debezium_properties_template`] — and it always refuses.
+///
+/// This build ships no `Debezium` Oracle `LogMiner` property template. The
+/// template it can render is shaped for the Postgres/MySQL/SQL Server
+/// connectors, so rendering it for Oracle would put Oracle's connector class
+/// on properties an Oracle connector would reject — a config that looks
+/// ready and is not. `ORACLE_CDC_LOGMINER_ENABLED` names where that support
+/// will attach; it does not provide it. The two flag states therefore differ
+/// only in what the refusal tells the operator.
+fn oracle_cdc_refusal(
+    target: &DebeziumSourceTarget,
+    oracle_cdc_logminer_enabled: bool,
+) -> Option<DebeziumPropertiesResponse> {
+    if target.driver != SqlDriver::Oracle {
+        return None;
+    }
+    let reason = if oracle_cdc_logminer_enabled {
+        "ORACLE_CDC_LOGMINER_ENABLED is set, but this build ships no Debezium Oracle \
+         LogMiner property template: the template it can render is shaped for the \
+         Postgres, MySQL and SQL Server connectors, and Oracle's connector would reject \
+         it. Oracle ingestion runs through the batch sql adapter until LogMiner support \
+         is built (docs/adr/0008-initial-snapshot-backfill.md)."
+    } else {
+        "Oracle CDC via Debezium LogMiner is not enabled on this deployment \
+         (ORACLE_CDC_LOGMINER_ENABLED is unset or not \"true\"), and this build ships no \
+         LogMiner property template in any case. LogMiner capture needs ARCHIVELOG mode \
+         and supplemental logging on the source database, which the batch sql adapter \
+         neither assumes nor configures (docs/adr/0008-initial-snapshot-backfill.md)."
+    };
+    Some(DebeziumPropertiesResponse::Unsupported {
+        supported: false,
+        reason: reason.to_owned(),
+    })
 }
 
 /// `?force=true` on `DELETE /api/connectors/{id}` — see [`delete`]'s doc
@@ -1810,6 +1888,104 @@ mod tests {
         assert_eq!(
             target.connector_class,
             "io.debezium.connector.mongodb.MongoDbConnector"
+        );
+    }
+
+    // ---- the Oracle CDC gate ----
+
+    fn target_with_driver(driver: SqlDriver) -> DebeziumSourceTarget {
+        DebeziumSourceTarget {
+            host: "unused".to_owned(),
+            port: 0,
+            database: "unused".to_owned(),
+            user: "unused".to_owned(),
+            connector_class: "unused",
+            driver,
+        }
+    }
+
+    fn refusal_reason(response: Option<DebeziumPropertiesResponse>) -> String {
+        match response.expect("an Oracle-driver connector must be refused") {
+            DebeziumPropertiesResponse::Unsupported { supported, reason } => {
+                assert!(!supported);
+                reason
+            }
+            DebeziumPropertiesResponse::Rendered { .. } => {
+                panic!("an Oracle-driver connector must never get a rendered template")
+            }
+        }
+    }
+
+    /// Flag off (the default): refused, and the reason names the setting and
+    /// what `LogMiner` capture would need from the source database.
+    #[test]
+    fn an_oracle_connector_is_refused_when_the_logminer_flag_is_off() {
+        let reason = refusal_reason(oracle_cdc_refusal(
+            &target_with_driver(SqlDriver::Oracle),
+            false,
+        ));
+        assert!(reason.contains("ORACLE_CDC_LOGMINER_ENABLED"), "{reason}");
+        assert!(reason.contains("ARCHIVELOG"), "{reason}");
+    }
+
+    /// Flag ON: still refused. The only template this build can render is
+    /// shaped for the Postgres/MySQL/SQL Server connectors; handing it back
+    /// with Oracle's connector class on it would be a config that looks ready
+    /// and that Oracle's connector rejects. The reason says the flag is set
+    /// and why that is not enough, rather than repeating "not enabled".
+    #[test]
+    fn an_oracle_connector_is_refused_even_when_the_logminer_flag_is_on() {
+        let reason = refusal_reason(oracle_cdc_refusal(
+            &target_with_driver(SqlDriver::Oracle),
+            true,
+        ));
+        assert!(reason.contains("is set"), "{reason}");
+        assert!(reason.contains("no Debezium Oracle"), "{reason}");
+    }
+
+    /// The gate touches Oracle only: the drivers that have a real template
+    /// render it whatever the flag says.
+    #[test]
+    fn the_oracle_gate_never_touches_the_drivers_that_have_a_template() {
+        for driver in [SqlDriver::Postgres, SqlDriver::Mysql, SqlDriver::Mssql] {
+            for flag in [false, true] {
+                assert!(
+                    oracle_cdc_refusal(&target_with_driver(driver), flag).is_none(),
+                    "{driver:?} with flag={flag} must render"
+                );
+            }
+        }
+    }
+
+    /// An Oracle-driver CDC connector still
+    /// resolves cleanly through [`resolve_debezium_source_target`]
+    /// regardless of the gate — the gate is a separate call in the
+    /// handler. This regression-tests that the resolver does not
+    /// silently start rejecting Oracle just because the gate was added.
+    #[test]
+    fn oracle_driver_still_resolves_through_resolve_debezium_source_target() {
+        let info = ConnectorDialInfo {
+            kind: "Oracle".to_owned(),
+            host: "oracle.internal:1521".to_owned(),
+            secret_ref: "env:CONNECTOR_ORACLE_PASSWORD".to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some("cdc".to_owned()),
+            dial: serde_json::json!({
+                "driver": "oracle",
+                "host": "oracle.internal",
+                "port": 1521,
+                "database": "ORCL",
+                "user": "cdc_reader",
+                "slotName": "oracle_slot",
+                "publicationName": "oracle_pub",
+            }),
+        };
+        let target = resolve_debezium_source_target("conn-oracle-1", &info)
+            .expect("Oracle driver must still resolve, the gate fires later");
+        assert_eq!(target.driver, SqlDriver::Oracle);
+        assert_eq!(
+            target.connector_class,
+            "io.debezium.connector.oracle.OracleConnector"
         );
     }
 }

@@ -78,6 +78,19 @@ pub struct Config {
     /// posture is what a deployment gets unless it says otherwise. `true`
     /// only when the env var is exactly `"true"`.
     pub connector_probe_allow_internal_hosts: bool,
+    /// Whether this deployment says Oracle CDC via `Debezium`'s `LogMiner`
+    /// connector is wanted. Default `false`; `true` only for the exact string
+    /// `"true"`.
+    ///
+    /// It names an extension point, not a working feature: this build ships
+    /// no Oracle `LogMiner` property template, so `GET
+    /// /api/connectors/{id}/debezium-properties` refuses every Oracle-driver
+    /// connector in both states and only its explanation changes. `LogMiner`
+    /// capture also needs `ARCHIVELOG` mode and supplemental logging on the
+    /// source database, which the batch sql adapter (`adapters/oracle.py`,
+    /// read-only `SELECT`) neither assumes nor configures. See
+    /// `docs/adr/0008-initial-snapshot-backfill.md`.
+    pub oracle_cdc_logminer_enabled: bool,
     /// `ClickHouse` HTTP interface URL. Default
     /// `"http://localhost:18123"` (`clickhouse.ts:11`, `??`).
     pub ch_url: String,
@@ -513,6 +526,10 @@ impl std::fmt::Debug for Config {
                 "connector_probe_allow_internal_hosts",
                 &self.connector_probe_allow_internal_hosts,
             )
+            .field(
+                "oracle_cdc_logminer_enabled",
+                &self.oracle_cdc_logminer_enabled,
+            )
             .field("oidc_clock_skew_seconds", &self.oidc_clock_skew_seconds)
             .field("database_url", &REDACTED)
             .field(
@@ -687,6 +704,9 @@ impl Config {
             oidc_groups_claim: or_default(env, "OIDC_GROUPS_CLAIM", "groups"),
             connector_probe_allow_internal_hosts: env
                 .get("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS")
+                .is_some_and(|v| v == "true"),
+            oracle_cdc_logminer_enabled: env
+                .get("ORACLE_CDC_LOGMINER_ENABLED")
                 .is_some_and(|v| v == "true"),
             oidc_clock_skew_seconds: env
                 .get("OIDC_CLOCK_SKEW_SECONDS")
@@ -872,6 +892,8 @@ mod tests {
         assert_eq!(cfg.trino_max_rows, 10_000);
         // Safe-by-default: SSRF blocking is ON unless explicitly disabled.
         assert!(!cfg.connector_probe_allow_internal_hosts);
+        // Oracle CDC via Debezium LogMiner is off by default.
+        assert!(!cfg.oracle_cdc_logminer_enabled);
     }
 
     #[test]
@@ -932,6 +954,43 @@ mod tests {
         let cfg =
             Config::from_map(&map(&[("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS", "true")])).unwrap();
         assert!(cfg.connector_probe_allow_internal_hosts);
+    }
+
+    /// The `ORACLE_CDC_LOGMINER_ENABLED` flag defaults to `false`: an unset
+    /// variable must never read as a request for a capability this build
+    /// has not validated.
+    #[test]
+    fn oracle_cdc_logminer_enabled_defaults_to_false() {
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert!(!cfg.oracle_cdc_logminer_enabled);
+    }
+
+    /// The codebase's boolean-parsing rule is exact
+    /// `== "true"`, mirroring `connector_probe_allow_internal_hosts` and
+    /// `oidc_jit_provisioning` — `TRUE`, `1`, `yes`, `on`, and any other
+    /// non-`"true"` string MUST NOT flip the flag on. This is the rule
+    /// AGENTS.md mandates, re-asserted here for the new field so a future
+    /// widening (e.g. `is_some_and` accepting truthy strings) fails this
+    /// test rather than silently extending the gate.
+    #[test]
+    fn oracle_cdc_logminer_enabled_reads_the_true_string_only() {
+        let cfg = Config::from_map(&map(&[("ORACLE_CDC_LOGMINER_ENABLED", "true")])).unwrap();
+        assert!(cfg.oracle_cdc_logminer_enabled);
+
+        for bad in ["TRUE", "True", "1", "yes", "on", "enabled", " "] {
+            let cfg = Config::from_map(&map(&[("ORACLE_CDC_LOGMINER_ENABLED", bad)])).unwrap();
+            assert!(
+                !cfg.oracle_cdc_logminer_enabled,
+                "ORACLE_CDC_LOGMINER_ENABLED={bad:?} must not enable the flag"
+            );
+        }
+
+        // And the unset case (omitted entirely from the env map) also
+        // does not enable the flag — redundant with the `defaults_...`
+        // test, but cheap and reads as a self-contained "the gate stays
+        // closed for every non-`true` value" assertion.
+        let cfg = Config::from_map(&HashMap::new()).unwrap();
+        assert!(!cfg.oracle_cdc_logminer_enabled);
     }
 
     #[test]
