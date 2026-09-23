@@ -30,13 +30,42 @@
  * empty one.
  */
 
-const ACTIVE_TENANT_STORAGE_KEY = "lh_active_tenant";
+/**
+ * The one place the active-tenant key lives. The tenant switcher WRITES it
+ * (through `writeActiveTenantId`) and `apiFetch` READS it; if those two
+ * sides ever named different keys, `X-Tenant` would silently stop being
+ * sent and every request would fall back to the principal's first tenant.
+ * Exported from here, next to its reader, rather than re-declared by the
+ * writer.
+ */
+export const ACTIVE_TENANT_STORAGE_KEY = "lh_active_tenant";
 
-function readActiveTenantId(): string | null {
+/**
+ * The locally-persisted active tenant id, or `null` when unset, on the
+ * server (SSR), or when storage itself throws (private browsing) — in every
+ * one of those cases the request simply goes out without `X-Tenant`.
+ */
+export function readActiveTenantId(): string | null {
+  if (typeof window === "undefined") return null;
   try {
-    return localStorage.getItem(ACTIVE_TENANT_STORAGE_KEY);
+    return window.localStorage.getItem(ACTIVE_TENANT_STORAGE_KEY);
   } catch {
     return null;
+  }
+}
+
+/**
+ * Persist the active tenant id. Best-effort: when storage is unavailable
+ * the switch still takes effect in the current tab through React state;
+ * only persistence across reloads is lost. Never an authorization input —
+ * membership is resolved server-side from the session.
+ */
+export function writeActiveTenantId(id: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(ACTIVE_TENANT_STORAGE_KEY, id);
+  } catch {
+    // See the doc comment: a lost write only costs persistence.
   }
 }
 

@@ -4,6 +4,7 @@ import * as React from "react";
 import { usePathname, useRouter } from "next/navigation";
 import * as authClient from "@/services/clients/auth";
 import type { AuthUser } from "@/services/clients/auth";
+import { readActiveTenantId, writeActiveTenantId } from "@/services/http";
 
 /**
  * Route prefixes reachable without a session. Kept in sync with
@@ -25,56 +26,11 @@ export function isPublicPath(pathname: string): boolean {
 
 export type AuthStatus = "loading" | "authenticated" | "unauthenticated";
 
-/**
- * localStorage key the `TenantSwitcher` writes to when an authenticated
- * user picks which tenant they want to act as, and that `apiFetch` reads
- * to attach `X-Tenant` to every outbound request (WS8 §Phase F read
- * side, `src/services/http.ts:33`). This constant MUST stay in sync with
- * the one in `http.ts` — the picker and the header attachment are two
- * ends of the same wire, and a divergence would silently send a header
- * the picker never set or read a header the picker never wrote.
- *
- * Re-declared here rather than reaching into `http.ts` (whose exports
- * are intentionally minimal — only `apiFetch` and a test-only reset
- * latch are public) so this module owns its own tenant-state without
- * growing the choke point's surface.
- */
-export const ACTIVE_TENANT_STORAGE_KEY = "lh_active_tenant";
-
-/**
- * Read the locally-persisted active tenant id. Returns `null` on the
- * server (SSR), when the storage is unset, and when the storage itself
- * throws — `localStorage` is unavailable in private-browsing on some
- * platforms and the only correct behaviour on that failure is to act as
- * if no tenant was chosen (the server still derives the authoritative
- * scope from the session, so this is a UX degradation, never a security
- * gap).
- */
-export function readActiveTenantId(): string | null {
-  if (typeof window === "undefined") return null;
-  try {
-    return window.localStorage.getItem(ACTIVE_TENANT_STORAGE_KEY);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Write the locally-persisted active tenant id. Best-effort: storage
- * unavailable (private-browsing quota, SSR) is swallowed because the
- * in-memory `activeTenantId` already updates through React state, so the
- * tenant switch still takes effect for the current tab. Only the
- * cross-reload persistence is lost, and the server still enforces scope
- * from the session — see the comment in `src/services/http.ts:23-30`.
- */
-export function writeActiveTenantId(id: string): void {
-  if (typeof window === "undefined") return;
-  try {
-    window.localStorage.setItem(ACTIVE_TENANT_STORAGE_KEY, id);
-  } catch {
-    // Intentionally empty — see the doc comment above.
-  }
-}
+// The active-tenant key and its read/write helpers live in `@/services/http`,
+// next to `apiFetch`, which reads them to set `X-Tenant`. Re-exported here so
+// existing importers of this module keep working without a second
+// definition that could drift from the reader.
+export { ACTIVE_TENANT_STORAGE_KEY, readActiveTenantId, writeActiveTenantId } from "@/services/http";
 
 type AuthContextValue = {
   user: AuthUser | null;
