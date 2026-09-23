@@ -502,6 +502,18 @@ impl OidcAuthenticator {
     /// verification [`Self::authenticate`] already does, not a parallel
     /// implementation of it.
     ///
+    /// # Return value
+    ///
+    /// Also returns the mapped role NAMES [`Self::mapped_role_names`]
+    /// computed for this login (empty when [`OidcConfig::role_map`] is
+    /// unset or none of `claims`' groups matched it) — the caller
+    /// (`routes::auth::oidc_callback`) persists these on the new session
+    /// row so [`crate::session::validate_session`] can keep resolving them
+    /// on every later request, per `mapped_permissions`' own doc comment
+    /// ("for the lifetime of that login"). The returned [`Principal`]'s
+    /// permissions already include them for this one response, same as
+    /// before — the session-row copy is for every request after this one.
+    ///
     /// # Errors
     ///
     /// Returns [`AuthError::InvalidCredentials`] for every reason
@@ -513,7 +525,7 @@ impl OidcAuthenticator {
         &self,
         token: &Secret,
         expected_nonce: &str,
-    ) -> Result<Principal, AuthError> {
+    ) -> Result<(Principal, Vec<String>), AuthError> {
         let claims = self.validate_token(token.expose()).await?;
         let actual_nonce = claims
             .extra
@@ -523,7 +535,9 @@ impl OidcAuthenticator {
         if actual_nonce != expected_nonce {
             return Err(AuthError::InvalidCredentials);
         }
-        self.resolve_principal(&claims).await
+        let principal = self.resolve_principal(&claims).await?;
+        let mapped_role_names = self.mapped_role_names(&claims);
+        Ok((principal, mapped_role_names))
     }
 
     /// Create (or link to an existing, same-email) `app_user` for `claims`,
@@ -627,26 +641,27 @@ impl OidcAuthenticator {
     /// because a group in `claims` has no entry in
     /// [`OidcConfig::role_map`] — unmapped groups are silently ignored.
     async fn mapped_permissions(&self, claims: &OidcClaims) -> Result<PermissionSet, AuthError> {
+        let role_names = self.mapped_role_names(claims);
+        repository::permissions_for_role_names(&self.pool, &role_names).await
+    }
+
+    /// The role NAMES `claims`' groups map to via [`OidcConfig::role_map`]/
+    /// [`OidcConfig::groups_claim`] — the pure, no-database half of
+    /// [`Self::mapped_permissions`], split out so
+    /// [`Self::authenticate_with_nonce`] can hand these names to its caller
+    /// (`routes::auth::oidc_callback`, which persists them on the session
+    /// row — see `0045_session_oidc_mapped_roles.sql`) without a second,
+    /// parallel implementation of the group-to-role lookup.
+    fn mapped_role_names(&self, claims: &OidcClaims) -> Vec<String> {
         if self.config.role_map.is_empty() {
-            return Ok(PermissionSet::default());
+            return Vec::new();
         }
         let groups = claims.groups(&self.config.groups_claim);
-        let role_names: Vec<&str> = groups
+        groups
             .iter()
             .filter_map(|group| self.config.role_map.get(group))
-            .map(String::as_str)
-            .collect();
-        if role_names.is_empty() {
-            return Ok(PermissionSet::default());
-        }
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT permissions FROM role WHERE name = ANY($1)")
-                .bind(&role_names)
-                .fetch_all(&self.pool)
-                .await?;
-        Ok(PermissionSet::merge(
-            rows.iter().map(|(raw,)| PermissionSet::parse(raw)),
-        ))
+            .cloned()
+            .collect()
     }
 }
 

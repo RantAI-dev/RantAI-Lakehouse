@@ -1,0 +1,41 @@
+-- Persist an OIDC login's role-map-derived role NAMES on the session row.
+--
+-- WHY: `OidcAuthenticator::mapped_permissions` (lakehouse-auth/src/oidc.rs)
+-- resolves `OIDC_ROLE_MAP`-mapped groups to roles and folds their
+-- permissions into the `Principal` returned at login, and its own doc
+-- comment promises those permissions last "for the lifetime of that
+-- login" — deliberately never writing `app_user_role` (see that doc
+-- comment's "Precedence: union, not IdP-authoritative" section). Before
+-- this migration, `routes::auth::oidc_callback` computed that mapped
+-- `Principal` once at login and then called `session::create_session`,
+-- which stores only `app_user_id` — nothing about the mapped roles
+-- survives the request. Every later request resolves the session back
+-- through `session::validate_session` -> `repository::load_principal_for_user`,
+-- which only ever reads `app_user_role`, so the mapped permissions
+-- silently vanish after the redirect that set the session cookie.
+--
+-- The fix keeps the "never write `app_user_role`" design (a mapped role
+-- must stay revocable by removing the user from the IdP group, not a
+-- durable grant) by recording the mapped ROLE NAMES — not a frozen
+-- permission snapshot — on the session row itself. `session::validate_session`
+-- re-resolves those names against the live `role` table on every request
+-- (the same `role.name = ANY(...)` lookup `mapped_permissions` already
+-- does, shared via `repository::permissions_for_role_names` — one mapping
+-- implementation, not two), so a later change to a mapped role's
+-- `permissions` column takes effect immediately, exactly like a locally
+-- assigned role already does.
+--
+-- `TEXT[]`, not a join table: this is a same-crate concept identical in
+-- shape to `OidcConfig::role_map`'s own values (role display names, not
+-- ids — `role.name` has no stable surrogate key this session row could
+-- reference more cheaply), and it only ever needs to be read back as a
+-- whole list at session-resolve time, never queried by individual role
+-- name across sessions. `NOT NULL DEFAULT '{}'`: every session predating
+-- this column (and every non-OIDC session created after it — password,
+-- service) is `{}`, which `validate_session`'s merge treats as "no mapped
+-- roles", correctly leaving that principal's permissions exactly as
+-- `app_user_role` alone would produce.
+--
+-- Additive only; nothing here alters a previously-applied statement.
+ALTER TABLE session
+    ADD COLUMN oidc_mapped_roles TEXT[] NOT NULL DEFAULT '{}';

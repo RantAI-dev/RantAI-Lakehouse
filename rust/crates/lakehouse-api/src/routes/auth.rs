@@ -150,7 +150,8 @@ pub async fn login(State(state): State<AppState>, body: Bytes) -> ApiResult<Resp
         .await
         .unwrap_or(false);
     let token =
-        session::create_session(pool, user_id, session::DEFAULT_SESSION_TTL, None, None).await?;
+        session::create_session(pool, user_id, session::DEFAULT_SESSION_TTL, None, None, &[])
+            .await?;
 
     let body = LoginResponse {
         id: user_id.to_string(),
@@ -793,6 +794,14 @@ struct TokenResponse {
 /// line records which branch fired, and even that carries no token/secret
 /// value. Returns 503 if OIDC or its token endpoint is not configured, or
 /// no Postgres pool is configured.
+#[allow(
+    clippy::too_many_lines,
+    reason = "0045_session_oidc_mapped_roles.sql's fix threads mapped_role_names \
+              from authenticate_with_nonce through to create_session, which pushed \
+              this already-long, already-documented handler a few lines over the \
+              limit -- splitting it would scatter one linear login flow across \
+              functions for a threshold, not a real seam"
+)]
 pub async fn oidc_callback(
     State(state): State<AppState>,
     Query(query): Query<OidcCallbackQuery>,
@@ -879,7 +888,7 @@ pub async fn oidc_callback(
         return Ok(unauthorized());
     };
 
-    let Ok(principal) = auth
+    let Ok((principal, mapped_role_names)) = auth
         .authenticate_with_nonce(&Secret::new(id_token), &flow.nonce)
         .await
     else {
@@ -905,9 +914,20 @@ pub async fn oidc_callback(
     // browser might already be carrying — closes the session-fixation gap
     // this task exists to close (see this function's doc comment). The
     // same `session::create_session` call [`login`] already uses, not a
-    // parallel implementation.
-    let token =
-        session::create_session(pool, user_id, session::DEFAULT_SESSION_TTL, None, None).await?;
+    // parallel implementation, except this one also carries
+    // `mapped_role_names` (`0045_session_oidc_mapped_roles.sql`) so the
+    // OIDC-mapped permissions `authenticate_with_nonce` resolved for this
+    // login keep applying on every request this session makes, not just
+    // this one redirect.
+    let token = session::create_session(
+        pool,
+        user_id,
+        session::DEFAULT_SESSION_TTL,
+        None,
+        None,
+        &mapped_role_names,
+    )
+    .await?;
 
     // audit_event row mirrors 0024_audit_event.sql's schema — `outcome = "executed"`
     // per `audit_event_outcome_check` (0024_audit_event.sql).
@@ -1910,6 +1930,7 @@ mod tests {
             lakehouse_auth::session::DEFAULT_SESSION_TTL,
             None,
             None,
+            &[],
         )
         .await
         .expect("mint a session");

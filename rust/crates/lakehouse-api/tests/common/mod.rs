@@ -140,6 +140,7 @@ pub async fn session_cookie_for_user(pool: &PgPool, user_id: Uuid) -> String {
         lakehouse_auth::session::DEFAULT_SESSION_TTL,
         None,
         None,
+        &[],
     )
     .await
     .expect("mint a session for a test principal");

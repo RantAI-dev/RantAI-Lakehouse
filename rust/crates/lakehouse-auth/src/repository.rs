@@ -141,6 +141,40 @@ pub async fn load_principal_for_user(
     })
 }
 
+/// Merge the permissions of the roles named in `role_names`, exactly the
+/// `role.name = ANY($1)` lookup [`crate::oidc::OidcAuthenticator`]'s own
+/// mapped-permissions resolution used to run inline — extracted here so
+/// [`crate::session::validate_session`] can re-run the SAME lookup against
+/// a session's persisted `oidc_mapped_roles`, per that column's migration
+/// header ("one mapping implementation, not two").
+///
+/// A name in `role_names` that matches no `role` row (the role was deleted
+/// or renamed since it was recorded — on a session row, or transiently
+/// between an OIDC group-to-role mapping and its target role existing) is
+/// silently skipped, not an error: the whole point of resolving this on
+/// every read, rather than freezing a permission snapshot at login/session-
+/// creation time, is that it tolerates the mapping drifting underneath a
+/// still-live session without ever panicking or invalidating it.
+///
+/// # Errors
+///
+/// Returns [`AuthError::Database`] on a storage failure.
+pub async fn permissions_for_role_names(
+    pool: &PgPool,
+    role_names: &[String],
+) -> Result<PermissionSet, AuthError> {
+    if role_names.is_empty() {
+        return Ok(PermissionSet::default());
+    }
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT permissions FROM role WHERE name = ANY($1)")
+        .bind(role_names)
+        .fetch_all(pool)
+        .await?;
+    Ok(PermissionSet::merge(
+        rows.iter().map(|(raw,)| PermissionSet::parse(raw)),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

@@ -188,6 +188,7 @@ async fn expired_session_is_refused() {
         time::Duration::seconds(-60),
         None,
         None,
+        &[],
     )
     .await
     .expect("mint an already-expired session");

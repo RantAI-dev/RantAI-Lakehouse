@@ -647,12 +647,61 @@ async fn authenticate_with_nonce_accepts_a_token_whose_nonce_claim_matches(
 ) -> sqlx::Result<()> {
     let (_server, auth, key) = test_authenticator(pool).await;
     let token = mint_test_id_token(&key, "user-1", "nonce-xyz");
-    let principal = auth
+    let (principal, mapped_role_names) = auth
         .authenticate_with_nonce(&Secret::new(token), "nonce-xyz")
         .await
         .expect("a matching nonce must be accepted");
     // `oidc:test` — this file's existing config fixture (`authenticator`'s
     // `OidcConfig::new(ISSUER, CLIENT_ID, "test", ..)`), not `oidc:okta`.
     assert_eq!(principal.provider, "oidc:test");
+    // This fixture's `OidcConfig` carries no `role_map`
+    // (`authenticator`'s own construction), so there is nothing to map —
+    // `mapped_role_names` must be empty, not fabricated.
+    assert!(mapped_role_names.is_empty());
+    Ok(())
+}
+
+/// `authenticate_with_nonce` must return the SAME mapped role names
+/// `mapped_permissions` resolves internally (`0045_session_oidc_mapped_
+/// roles.sql`'s whole reason for existing: `routes::auth::oidc_callback`
+/// persists exactly this return value onto the new session row so the
+/// mapped permissions survive past the login response). Mirrors `a_mapped_
+/// group_grants_its_roles_permissions`'s fixture, but through the nonce
+/// path and asserting on the role-name list rather than only the merged
+/// principal's permissions.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authenticate_with_nonce_returns_the_mapped_role_names(pool: PgPool) -> sqlx::Result<()> {
+    let server = MockServer::start().await;
+    let key = TestKey::generate("kid-1");
+    mount_jwks(&server, &[&key]).await;
+
+    let jwks_url = format!("{}/jwks", server.uri());
+    let mut config = OidcConfig::new(ISSUER, CLIENT_ID, "test", jwks_url.clone());
+    config.jit_provisioning = false;
+    config
+        .role_map
+        .insert("lakehouse-admins".to_owned(), "Platform Admin".to_owned());
+    sqlx::query(
+        "INSERT INTO auth_identity (provider, external_subject, app_user_id, password_hash) \
+         VALUES ('oidc:test', 'rina-oidc-subject-4', $1, NULL)",
+    )
+    .bind(uuid::Uuid::parse_str(RINA).unwrap())
+    .execute(&pool)
+    .await?;
+
+    let jwks = JwksClient::with_ttl(jwks_url, Duration::from_secs(300));
+    let auth = OidcAuthenticator::with_jwks_client(config, jwks, pool);
+
+    let mut claims = Claims::valid("rina-oidc-subject-4");
+    claims.groups = Some(vec!["lakehouse-admins"]);
+    claims.nonce = Some("nonce-role-names");
+    let token = sign(&claims, &key, Algorithm::RS256);
+
+    let (principal, mapped_role_names) = auth
+        .authenticate_with_nonce(&Secret::new(token), "nonce-role-names")
+        .await
+        .expect("a matching nonce must be accepted");
+    assert_eq!(mapped_role_names, vec!["Platform Admin".to_owned()]);
+    assert!(principal.has("identity:write"));
     Ok(())
 }

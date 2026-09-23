@@ -34,6 +34,7 @@ use uuid::Uuid;
 use crate::authenticator::Authenticator;
 use crate::credential::Credential;
 use crate::error::AuthError;
+use crate::permissions::PermissionSet;
 use crate::principal::Principal;
 use crate::repository::{self, PgPool};
 use crate::secret::Secret;
@@ -44,6 +45,16 @@ use crate::token::{generate_opaque_token, hash_token};
 pub const DEFAULT_SESSION_TTL: Duration = Duration::hours(24);
 
 /// Create a session for `app_user_id`, valid for `ttl`.
+///
+/// `oidc_mapped_roles` is the list of role NAMES an OIDC login's
+/// `OIDC_ROLE_MAP` mapped this user's groups onto
+/// (`OidcAuthenticator::authenticate_with_nonce`'s second return value) —
+/// empty for every non-OIDC login (password, service). Persisted on the
+/// session row (`0045_session_oidc_mapped_roles.sql`) so
+/// [`validate_session`] can keep re-resolving those names' permissions on
+/// every later request this session makes, not just the one response that
+/// created it — see that migration's header for why this is the role
+/// NAMES, not a frozen permission snapshot.
 ///
 /// Returns the raw token — this is the ONLY point in its lifetime the raw
 /// value exists outside the caller's hands; only its hash is persisted.
@@ -59,19 +70,21 @@ pub async fn create_session(
     ttl: Duration,
     created_ip: Option<&str>,
     user_agent: Option<&str>,
+    oidc_mapped_roles: &[String],
 ) -> Result<Secret, AuthError> {
     let token = generate_opaque_token();
     let token_hash = hash_token(&token);
     let expires_at = OffsetDateTime::now_utc() + ttl;
     sqlx::query(
-        "INSERT INTO session (app_user_id, token_hash, expires_at, created_ip, user_agent) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO session (app_user_id, token_hash, expires_at, created_ip, user_agent, oidc_mapped_roles) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(app_user_id)
     .bind(token_hash)
     .bind(expires_at)
     .bind(created_ip)
     .bind(user_agent)
+    .bind(oidc_mapped_roles)
     .execute(pool)
     .await?;
     Ok(token)
@@ -79,6 +92,20 @@ pub async fn create_session(
 
 /// Validate `token`, returning the [`Principal`] for its owner if the
 /// session is live (not revoked, not expired).
+///
+/// If this session was created from an OIDC login whose group-to-role
+/// mapping matched at least one role (`oidc_mapped_roles`, see
+/// [`create_session`]'s doc comment), those roles' permissions are
+/// re-resolved against the live `role` table — through
+/// [`repository::permissions_for_role_names`], the SAME lookup
+/// `OidcAuthenticator::mapped_permissions` runs at login — and merged into
+/// the returned `Principal`'s permissions, exactly as they were merged
+/// into the one-off `Principal` `oidc_callback` got back from
+/// `authenticate_with_nonce`. This is what keeps a mapped role's grant
+/// alive for the rest of that login's session, not just its first
+/// response; `Principal::role_names` is left untouched (still exactly the
+/// user's real `app_user_role` memberships), matching how an access grant
+/// widens permissions without ever fabricating a role.
 ///
 /// # Errors
 ///
@@ -94,8 +121,8 @@ pub async fn validate_session(pool: &PgPool, token: &Secret) -> Result<Principal
     // crate — see `Principal::must_change_password`'s doc comment. Most
     // sessions have no matching `local` row's flag set, hence the
     // `COALESCE` to `false` rather than requiring one.
-    let row: Option<(Uuid, bool)> = sqlx::query_as(
-        "SELECT s.app_user_id, COALESCE(ai.must_change_password, false) \
+    let row: Option<(Uuid, bool, Vec<String>)> = sqlx::query_as(
+        "SELECT s.app_user_id, COALESCE(ai.must_change_password, false), s.oidc_mapped_roles \
          FROM session s \
          LEFT JOIN auth_identity ai \
              ON ai.app_user_id = s.app_user_id AND ai.provider = 'local' \
@@ -104,17 +131,22 @@ pub async fn validate_session(pool: &PgPool, token: &Secret) -> Result<Principal
     .bind(token_hash)
     .fetch_optional(pool)
     .await?;
-    let Some((app_user_id, must_change_password)) = row else {
+    let Some((app_user_id, must_change_password, oidc_mapped_roles)) = row else {
         return Err(AuthError::SessionInvalid);
     };
-    repository::load_principal_for_user(
+    let mut principal = repository::load_principal_for_user(
         pool,
         app_user_id,
         "session".to_owned(),
         must_change_password,
     )
     .await
-    .map_err(|_| AuthError::SessionInvalid)
+    .map_err(|_| AuthError::SessionInvalid)?;
+    if !oidc_mapped_roles.is_empty() {
+        let mapped = repository::permissions_for_role_names(pool, &oidc_mapped_roles).await?;
+        principal.permissions = PermissionSet::merge([principal.permissions, mapped]);
+    }
+    Ok(principal)
 }
 
 /// Revoke `token` (sign-out). Idempotent: revoking an already-revoked,
