@@ -93,10 +93,18 @@ export type CredentialSource = "env" | "file"
 
 /**
  * The fixed suffix a derived connector-credential name ends in. Mirrors
- * Rust `CredentialKind` — ADR 0002 Addendum 3's five allowed suffixes,
- * `snake_case` wire form.
+ * Rust `CredentialKind` — ADR 0002 Addendum 3's six allowed suffixes,
+ * `snake_case` wire form. `private_key` is for the `sftp` adapter's
+ * `SftpAuth`'s `public_key` auth kind (a private-key PEM, not any of the
+ * other five shapes).
  */
-export type CredentialKind = "password" | "secret_key" | "access_key" | "api_key" | "token"
+export type CredentialKind =
+  | "password"
+  | "secret_key"
+  | "access_key"
+  | "api_key"
+  | "token"
+  | "private_key"
 
 /**
  * What the client chooses for a connector's credential(s): a source scheme
@@ -205,7 +213,7 @@ export type Dial = Record<string, unknown>
  * against `Dial` alone could not otherwise be checked against its own
  * adapter's real fields.
  */
-export type SqlDriver = "mysql" | "postgres" | "mssql"
+export type SqlDriver = "mysql" | "postgres" | "mssql" | "oracle"
 
 export type SqlDial = {
   driver: SqlDriver
@@ -216,6 +224,13 @@ export type SqlDial = {
    * `SqlDial::user` doc comment. */
   user: string
   sslMode: string | null
+  /**
+   * An operator-typed Distinguished Name, required whenever `sslMode`
+   * implies TLS for `driver: "oracle"` — never derived from `host` (a
+   * bare `CN=<hostname>` would not match a real certificate's full DN).
+   * Ignored for every other driver. Mirrors `SqlDial::ssl_server_cert_dn`.
+   */
+  sslServerCertDn?: string | null
 }
 
 /** `CdcDial` = `SqlDial`'s fields plus `slotName`/`publicationName`,
@@ -277,6 +292,64 @@ export type SheetsDial = {
 }
 
 /**
+ * `dial` for the `mongodb` adapter. Mirrors `MongoDial`
+ * (`ingest_spec.rs`, `#[serde(deny_unknown_fields, rename_all =
+ * "camelCase")]`) exactly. `directConnection` MUST be `true` — this build
+ * refuses `mongodb+srv` and replica-set discovery outright; there is no
+ * `srvUri` field at all (never a toggle for something the server
+ * refuses). `username` is a literal, never a `secretRef` picker, same
+ * reasoning as `SqlDial.user`.
+ */
+export type MongoDial = {
+  hosts: string[]
+  database: string
+  username: string
+  directConnection: true
+}
+
+/**
+ * `dial` for the `kafka` adapter. Mirrors `KafkaDial` (`ingest_spec.rs`)
+ * exactly.
+ */
+export type KafkaDial = {
+  bootstrapServers: string[]
+  topic: string
+  auth: KafkaAuth
+  groupId: string
+  microBatchSeconds: number
+}
+
+/**
+ * Internally tagged on `type`, mirroring `KafkaAuth`
+ * (`#[serde(tag = "type")]`) exactly — the two variants
+ * `KafkaAuth::type_tag` names. `sasl_plain`'s `username` is dial
+ * configuration, not a secret (only the password is, via the connector's
+ * `secretRef`) — see `KafkaAuth::SaslPlain`'s doc comment.
+ */
+export type KafkaAuth = { type: "sasl_plain"; username: string } | { type: "none" }
+
+/**
+ * `dial` for the `sftp` adapter. Mirrors `SftpDial` (`ingest_spec.rs`)
+ * exactly. `hostKeyFingerprint` is REQUIRED with no fallback — host-key
+ * verification, never `paramiko.AutoAddPolicy`.
+ */
+export type SftpDial = {
+  host: string
+  port: number
+  user: string
+  hostKeyFingerprint: string
+  path: string
+  fileFormat: string
+  auth: SftpAuth
+}
+
+/**
+ * Internally tagged on `type`, mirroring `SftpAuth`
+ * (`#[serde(tag = "type")]`) exactly.
+ */
+export type SftpAuth = { type: "password" } | { type: "public_key" }
+
+/**
  * One object (table, endpoint, sheet range) an ingest job targets.
  * Mirrors `SourceObject` in
  * `rust/crates/lakehouse-store/src/ingest_spec.rs` (`#[serde(deny_unknown_fields,
@@ -301,19 +374,31 @@ export type IngestSecretRefs = {
 
 /**
  * The closed set the database enforces via `connector_adapter_check`
- * (`rust/migrations/0033_connector_ingest_spec.sql`). Widened with
- * `| string` because the Rust field is a plain `Option<String>`, not a
- * closed enum — the client stays honest about a value the server might
- * send that predates this list or that a future migration adds.
+ * (`rust/migrations/0033_connector_ingest_spec.sql`, widened by
+ * `0043_ingest_tier2_adapters.sql` to add the three Tier 2 values below).
+ * Widened with `| string` because the Rust field is a plain
+ * `Option<String>`, not a closed enum — the client stays honest about a
+ * value the server might send that predates this list or that a future
+ * migration adds.
  */
-export type IngestAdapter = "sql" | "cdc" | "files" | "rest" | "sheets" | string
+export type IngestAdapter =
+  | "sql"
+  | "cdc"
+  | "files"
+  | "rest"
+  | "sheets"
+  | "mongodb"
+  | "kafka"
+  | "sftp"
+  | string
 
 /**
  * The closed set the database enforces via `connector_ingest_mode_check`
- * (`rust/migrations/0033_connector_ingest_spec.sql`). See `IngestAdapter`
- * for why this widens with `| string`.
+ * (`rust/migrations/0033_connector_ingest_spec.sql`, widened by
+ * `0043_ingest_tier2_adapters.sql` to add `"stream"` for `kafka`). See
+ * `IngestAdapter` for why this widens with `| string`.
  */
-export type IngestMode = "batch" | "cdc" | string
+export type IngestMode = "batch" | "cdc" | "stream" | string
 
 /**
  * A connector's ingest configuration, as returned by

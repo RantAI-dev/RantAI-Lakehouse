@@ -12,7 +12,11 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { CdcDialForm } from "@/features/connectors/dial-forms/cdc-dial-form"
 import { FilesDialForm } from "@/features/connectors/dial-forms/files-dial-form"
+import { KafkaDialForm } from "@/features/connectors/dial-forms/kafka-dial-form"
+import { MongoDialForm } from "@/features/connectors/dial-forms/mongo-dial-form"
+import { OracleDialForm } from "@/features/connectors/dial-forms/oracle-dial-form"
 import { RestDialForm } from "@/features/connectors/dial-forms/rest-dial-form"
+import { SftpDialForm } from "@/features/connectors/dial-forms/sftp-dial-form"
 import { SheetsDialForm } from "@/features/connectors/dial-forms/sheets-dial-form"
 import { SqlDialForm } from "@/features/connectors/dial-forms/sql-dial-form"
 import { useService, useServiceAction } from "@/hooks/use-service"
@@ -25,7 +29,10 @@ import type {
   CredentialSource,
   CredentialSpec,
   FilesDial,
+  KafkaDial,
+  MongoDial,
   RestDial,
+  SftpDial,
   SheetsDial,
   SourceObject,
   SqlDial,
@@ -58,6 +65,7 @@ function hostFromDial(adapter: string | null, dial: Record<string, unknown> | nu
   switch (adapter) {
     case "sql":
     case "cdc":
+    case "sftp":
       return typeof dial.host === "string" ? dial.host : ""
     case "files":
       return typeof dial.bucket === "string" ? dial.bucket : ""
@@ -65,6 +73,12 @@ function hostFromDial(adapter: string | null, dial: Record<string, unknown> | nu
       return typeof dial.baseUrl === "string" ? dial.baseUrl : ""
     case "sheets":
       return typeof dial.spreadsheetId === "string" ? dial.spreadsheetId : ""
+    case "mongodb":
+      return Array.isArray(dial.hosts) && typeof dial.hosts[0] === "string" ? (dial.hosts[0] as string) : ""
+    case "kafka":
+      return Array.isArray(dial.bootstrapServers) && typeof dial.bootstrapServers[0] === "string"
+        ? (dial.bootstrapServers[0] as string)
+        : ""
     default:
       return ""
   }
@@ -76,6 +90,7 @@ const CREDENTIAL_KIND_OPTIONS: { value: CredentialKind; label: string }[] = [
   { value: "access_key", label: "Access key" },
   { value: "api_key", label: "API key" },
   { value: "token", label: "Token" },
+  { value: "private_key", label: "Private key" },
 ]
 
 /**
@@ -88,6 +103,20 @@ const CREDENTIAL_KIND_OPTIONS: { value: CredentialKind; label: string }[] = [
  * API key or bearer token. The user can still change either select --
  * this only seeds the initial value.
  */
+// mongodb/oracle(sql)/kafka(sasl_plain)/sftp(password) all fall into the
+// `default` "password" case below, same as the pre-Tier-2 sql/cdc
+// adapters -- no adapter-specific branch needed for them. `sftp`'s
+// `public_key` auth kind needs `private_key` instead; the user switches
+// the primary select themselves after picking that auth type in the dial
+// form (this seed only picks a starting value, per this function's own
+// doc comment above). `kafka`'s `none` auth needs no credential at all
+// (`secret_field_names` maps `("kafka", "none")` to no fields) but
+// `CreateConnectorInput.credential.primary`/`CredentialSpec::primary` is
+// a REQUIRED field server-side -- there is no honest "no credential" kind
+// to send. Rather than invent one, this seeds `password` like every other
+// adapter; the derived name is simply never provisioned for a `none`
+// Kafka connector, and "Test"/ingest never reads it (the adapter's own
+// `secret_field_names` lookup returns no fields, so nothing is resolved).
 function defaultCredentialForAdapter(adapter: string | null): { primary: CredentialKind; secondary: CredentialKind | null } {
   switch (adapter) {
     case "files":
@@ -101,13 +130,30 @@ function defaultCredentialForAdapter(adapter: string | null): { primary: Credent
 
 function DialFormFor({
   adapter,
+  typeName,
   dial,
   onChange,
 }: {
   adapter: string | null
+  /** `selectedType.name` — needed alongside `adapter` because Oracle
+   * dials with the same `sql` adapter/`SqlDial` shape every other SQL
+   * driver does (`SqlDriver::Oracle`, `ingest_spec.rs`), not a distinct
+   * `adapter` value; `adapter` alone cannot tell Oracle apart from
+   * PostgreSQL/MySQL/SQL Server. */
+  typeName: string | null
   dial: Record<string, unknown> | null
   onChange: (next: Record<string, unknown>) => void
 }) {
+  // Oracle is the one type whose dial form is picked by NAME, not by
+  // `adapter` alone -- see this function's `typeName` doc comment above.
+  if (adapter === "sql" && typeName === "Oracle") {
+    return (
+      <OracleDialForm
+        value={dial as unknown as SqlDial | null}
+        onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+      />
+    )
+  }
   switch (adapter) {
     case "sql":
       return (
@@ -141,6 +187,27 @@ function DialFormFor({
       return (
         <SheetsDialForm
           value={dial as unknown as SheetsDial | null}
+          onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+        />
+      )
+    case "mongodb":
+      return (
+        <MongoDialForm
+          value={dial as unknown as MongoDial | null}
+          onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+        />
+      )
+    case "kafka":
+      return (
+        <KafkaDialForm
+          value={dial as unknown as KafkaDial | null}
+          onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+        />
+      )
+    case "sftp":
+      return (
+        <SftpDialForm
+          value={dial as unknown as SftpDial | null}
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
         />
       )
@@ -192,13 +259,19 @@ export function ConnectorCreatePage() {
   // A new adapter means a new dial shape -- never carry the previous
   // adapter's fields into a struct that will reject them as unknown. Also
   // reseed the credential kind defaults for the new adapter (the user can
-  // still override either select afterward).
+  // still override either select afterward). Keyed on `selectedTypeName`
+  // too, not just `adapter`: switching PostgreSQL <-> Oracle keeps the
+  // same `sql` adapter (`DialFormFor`'s `typeName` doc comment) but
+  // renders a DIFFERENT form (`OracleDialForm`'s driver-locked shape vs.
+  // `SqlDialForm`'s driver select) -- carrying a postgres dial's `driver:
+  // "postgres"` into the Oracle form (or vice versa) would be exactly the
+  // stale-shape bug this effect exists to prevent.
   React.useEffect(() => {
     setDial(null)
     const defaults = defaultCredentialForAdapter(adapter)
     setCredentialPrimary(defaults.primary)
     setCredentialSecondary(defaults.secondary)
-  }, [adapter])
+  }, [adapter, selectedTypeName])
 
   const create = useServiceAction((signal, input: Parameters<typeof connectorService.createConnector>[0]) =>
     connectorService.createConnector(input, signal)
@@ -530,7 +603,7 @@ export function ConnectorCreatePage() {
         ) : null}
         {step === 1 ? (
           <div className="grid gap-3">
-            <DialFormFor adapter={adapter} dial={dial} onChange={setDial} />
+            <DialFormFor adapter={adapter} typeName={selectedType?.name ?? null} dial={dial} onChange={setDial} />
             <div className="grid gap-3 sm:grid-cols-2">
               <Field label="Credential source">
                 <select
