@@ -266,7 +266,7 @@ def load_via_sink(source, bronze_table_name: str, config: SinkConfig) -> SinkRes
     # does not rename that key, so this sink cannot look the resource up
     # by `bronze_table_name` the way the pre-extraction code -- which
     # built the source itself -- could).
-    iceberg_adapter(
+    adapted = iceberg_adapter(
         source,
         partition=[iceberg_partition.day("_ingested_at")],
         # PR #29 review: format-version 2 was claimed "confirmed" without
@@ -281,6 +281,13 @@ def load_via_sink(source, bronze_table_name: str, config: SinkConfig) -> SinkRes
         # reports back.
         table_properties={"format-version": "2"},
     )
+    # For a `DltSource`/`DltResource`, `iceberg_adapter` applies the hints
+    # in place to the resource `source` already carries. For plain rows
+    # (the Kafka micro-batch) it wraps them in a NEW resource and applies
+    # the hints only to that, so running the raw rows would drop the
+    # partition spec and `format-version` above. Run what it returned.
+    if not isinstance(source, (DltSource, DltResource)):
+        source = adapted
 
     pipeline = dlt.pipeline(
         pipeline_name=f"bronze_ingest_{bronze_table_name}",

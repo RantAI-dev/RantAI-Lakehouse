@@ -32,6 +32,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import dlt
+from dlt.extract.resource import DltResource
 
 from dispar_orchestrate.adapters.sink import (
     SinkConfig,
@@ -185,8 +186,10 @@ class _FakePipeline:
         self.init_kwargs = kwargs
         self.materialized_rows: list[dict] = []
         self.last_trace = None
+        self.run_source = None
 
     def run(self, source, table_name, table_format):
+        self.run_source = source
         self.materialized_rows = list(source)
         return _FakeLoadInfo()
 
@@ -224,6 +227,25 @@ def test_load_via_sink_stamps_a_kafka_shaped_batch_of_plain_dicts(monkeypatch) -
     # The list the Kafka caller still holds is untouched -- see the
     # `_stamp_for_load` test above for why that matters.
     assert batch_rows == [{"id": 1}, {"id": 2}]
+
+
+def test_load_via_sink_runs_plain_rows_as_a_resource_carrying_the_bronze_partition_spec(monkeypatch) -> None:
+    fake_pipelines: list[_FakePipeline] = []
+
+    def fake_pipeline_factory(**kwargs):
+        pipeline = _FakePipeline(**kwargs)
+        fake_pipelines.append(pipeline)
+        return pipeline
+
+    monkeypatch.setattr("dispar_orchestrate.adapters.sink.dlt.pipeline", fake_pipeline_factory)
+
+    load_via_sink([{"id": 1}], "orders", _sink_config())
+
+    run_source = fake_pipelines[0].run_source
+    assert isinstance(run_source, DltResource)
+    hints = run_source._hints["additional_table_hints"]
+    assert hints["x-iceberg-partition"] == [{"transform": "day", "source_column": "_ingested_at"}]
+    assert hints["x-iceberg-table-properties"] == {"format-version": "2"}
 
 
 def test_load_via_sink_stamps_a_single_dlt_resource(monkeypatch) -> None:
