@@ -278,12 +278,17 @@ impl PolicyDecisionLatencies {
 /// check it replaced: naming a reserved ref is now structurally
 /// impossible for a user-created connector, not merely refused at write
 /// time.
-pub(crate) const CONNECTOR_ALLOWED_SECRET_REF_PATTERNS: [&str; 6] = [
+pub(crate) const CONNECTOR_ALLOWED_SECRET_REF_PATTERNS: [&str; 7] = [
     "env:CONNECTOR_*_PASSWORD",
     "env:CONNECTOR_*_SECRET_KEY",
     "env:CONNECTOR_*_ACCESS_KEY",
     "env:CONNECTOR_*_API_KEY",
     "env:CONNECTOR_*_TOKEN",
+    // `sftp`'s `SftpAuth::PublicKey` auth kind derives this suffix
+    // (`CredentialKind::PrivateKey`, `lakehouse_store::connectors`) — keep
+    // this list and `dagster/dispar_orchestrate/secret_resolver.py`'s
+    // identical, same discipline as that module's own header comment.
+    "env:CONNECTOR_*_PRIVATE_KEY",
     "file:/run/secrets/connector_*",
 ];
 

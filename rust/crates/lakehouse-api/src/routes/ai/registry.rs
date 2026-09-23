@@ -314,8 +314,8 @@ fn create_connector_schema() -> Value {
             "host": { "type": "string", "description": "target koneksi (host:port atau endpoint)" },
             "credential": { "type": "object", "description": "spesifikasi kredensial; server yang menurunkan nama referensinya dari id connector", "properties": {
                 "source": { "type": "string", "enum": ["env", "file"] },
-                "primary": { "type": "string", "enum": ["password", "secret_key", "access_key", "api_key", "token"] },
-                "secondary": { "type": "string", "enum": ["password", "secret_key", "access_key", "api_key", "token"], "description": "slot kedua, mis. secret key S3, opsional" } },
+                "primary": { "type": "string", "enum": ["password", "secret_key", "access_key", "api_key", "token", "private_key"] },
+                "secondary": { "type": "string", "enum": ["password", "secret_key", "access_key", "api_key", "token", "private_key"], "description": "slot kedua, mis. secret key S3, opsional" } },
                 "required": ["source", "primary"] },
             "environment": { "type": "string" },
             "tenant": { "type": "string" },

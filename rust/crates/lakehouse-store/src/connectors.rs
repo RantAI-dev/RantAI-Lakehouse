@@ -383,10 +383,10 @@ pub enum CredentialSource {
 }
 
 /// Which fixed credential-name suffix a slot derives. Mirrors
-/// `CredentialKind` in `contracts/connectors.ts` — exactly the five
+/// `CredentialKind` in `contracts/connectors.ts` — exactly the six
 /// suffixes ADR 0002 Addendum 3 and
 /// `lakehouse_api::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS` both
-/// name; adding a sixth here without adding it there would derive a name
+/// name; adding a seventh here without adding it there would derive a name
 /// the resolver never admits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -401,6 +401,12 @@ pub enum CredentialKind {
     ApiKey,
     /// `_TOKEN` suffix.
     Token,
+    /// `_PRIVATE_KEY` suffix — the `sftp` adapter's `SftpAuth::PublicKey`
+    /// auth kind needs this (a private-key PEM is not honestly any of the
+    /// five kinds above); added for that case rather than overloading
+    /// `SecretKey`, whose suffix an S3 connector's secondary slot already
+    /// uses for an unrelated shape.
+    PrivateKey,
 }
 
 impl CredentialKind {
@@ -416,6 +422,7 @@ impl CredentialKind {
             Self::AccessKey => "ACCESS_KEY",
             Self::ApiKey => "API_KEY",
             Self::Token => "TOKEN",
+            Self::PrivateKey => "PRIVATE_KEY",
         }
     }
 }
@@ -1552,6 +1559,7 @@ mod tests {
             "env:CONNECTOR_*_ACCESS_KEY",
             "env:CONNECTOR_*_API_KEY",
             "env:CONNECTOR_*_TOKEN",
+            "env:CONNECTOR_*_PRIVATE_KEY",
             "file:/run/secrets/connector_*",
         ];
         for id in ["conn-orders-k3x9", "conn-a", "conn-pg-lakehouse-2"] {
@@ -1562,6 +1570,7 @@ mod tests {
                     CredentialKind::AccessKey,
                     CredentialKind::ApiKey,
                     CredentialKind::Token,
+                    CredentialKind::PrivateKey,
                 ] {
                     let derived = derive_secret_ref(id, source, kind);
                     assert!(
@@ -1619,12 +1628,13 @@ mod tests {
     /// pairs below are the ids that would exploit it if one ever were.
     #[test]
     fn distinct_ids_never_derive_the_same_name() {
-        const KINDS: [CredentialKind; 5] = [
+        const KINDS: [CredentialKind; 6] = [
             CredentialKind::Password,
             CredentialKind::SecretKey,
             CredentialKind::AccessKey,
             CredentialKind::ApiKey,
             CredentialKind::Token,
+            CredentialKind::PrivateKey,
         ];
         let pairs = [
             ("conn-a-password", "conn-a"),

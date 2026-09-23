@@ -50,6 +50,9 @@ CONNECTOR_ALLOWED_SECRET_REF_PATTERNS: tuple[str, ...] = (
     "env:CONNECTOR_*_ACCESS_KEY",
     "env:CONNECTOR_*_API_KEY",
     "env:CONNECTOR_*_TOKEN",
+    # sftp's public-key auth kind (CredentialKind::PrivateKey) — keep in
+    # sync with state.rs's CONNECTOR_ALLOWED_SECRET_REF_PATTERNS.
+    "env:CONNECTOR_*_PRIVATE_KEY",
     "file:/run/secrets/connector_*",
 )
 

@@ -636,7 +636,8 @@
                   "secret_key",
                   "access_key",
                   "api_key",
-                  "token"
+                  "token",
+                  "private_key"
                 ]
               },
               "secondary": {
@@ -646,7 +647,8 @@
                   "secret_key",
                   "access_key",
                   "api_key",
-                  "token"
+                  "token",
+                  "private_key"
                 ],
                 "description": "slot kedua, mis. secret key S3, opsional"
               }

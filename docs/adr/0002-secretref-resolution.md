@@ -343,7 +343,7 @@ them send another connector's credential to a host they control.
 id.** For a connector id `conn-orders-k3x9` the names are:
 
 - `env:CONNECTOR_CONN_ORDERS_K3X9_<SUFFIX>`, `<SUFFIX>` one of `PASSWORD`,
-  `SECRET_KEY`, `ACCESS_KEY`, `API_KEY`, `TOKEN`;
+  `SECRET_KEY`, `ACCESS_KEY`, `API_KEY`, `TOKEN`, `PRIVATE_KEY`;
 - `file:/run/secrets/connector_conn_orders_k3x9_<suffix>`, same suffixes in
   lower case.
 
