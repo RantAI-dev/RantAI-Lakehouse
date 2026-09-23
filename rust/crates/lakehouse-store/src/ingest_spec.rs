@@ -563,6 +563,19 @@ impl Dial {
             _ => None,
         }
     }
+
+    /// The `auth_type` key [`secret_field_names`] needs for THIS dial's
+    /// adapter, whichever of [`Self::rest_auth_type`],
+    /// [`Self::kafka_auth_type`] or [`Self::sftp_auth_type`] applies (at
+    /// most one ever returns `Some`, since each matches a disjoint set of
+    /// `Dial` variants) — the single call [`crate::connectors::set_ingest_spec`]
+    /// makes instead of trying each accessor itself.
+    #[must_use]
+    pub fn secret_map_auth_type(&self) -> Option<&'static str> {
+        self.rest_auth_type()
+            .or_else(|| self.kafka_auth_type())
+            .or_else(|| self.sftp_auth_type())
+    }
 }
 
 /// Deserialize `raw` into `T`, wrapping a failure as
@@ -817,23 +830,37 @@ pub fn validate_hostname(field: &'static str, host: &str) -> Result<(), InvalidH
 /// matching Python-side change (the same discipline `column_gate.py` and
 /// `cdc.rs::NESTED_TYPE_MARKERS` already carry, X9).
 ///
-/// `auth_type` is consulted only for `adapter == "rest"` — every other
-/// adapter's field count does not depend on it. Returns `None` for a
-/// combination this mapping does not recognize; the caller ([`crate::connectors::set_ingest_spec`])
-/// turns that into [`crate::StoreError::Validation`], never a silent
-/// default.
+/// `auth_type` is consulted for `adapter == "rest"` (the `dial.auth.type`
+/// tag), `adapter == "kafka"` (`"none"` needs zero secret refs — a
+/// `PLAINTEXT` broker has no credential at all — while `"sasl_plain"`
+/// needs two) and `adapter == "sftp"` (`"password"` vs. `"public_key"`
+/// select a different single field name, never a field COUNT, so both
+/// stay one-`secretRef`). Every other adapter's field count does not
+/// depend on it. Returns `None` for a combination this mapping does not
+/// recognize; the caller ([`crate::connectors::set_ingest_spec`]) turns
+/// that into [`crate::StoreError::Validation`], never a silent default.
 #[must_use]
 pub fn secret_field_names(
     adapter: &str,
     auth_type: Option<&str>,
 ) -> Option<&'static [&'static str]> {
     match (adapter, auth_type) {
-        ("sql" | "cdc", _) => Some(&["password"]),
+        // Every one of these needs exactly the single field `password`,
+        // for a different reason each time: sql/cdc/mongodb carry no
+        // auth-type distinction at all, sftp's "password" auth type is
+        // its one single-field case (its OTHER auth type, public_key,
+        // needs a differently-named field below, which is why sftp is
+        // not folded into the `_`-wildcard adapters on this arm).
+        ("sql" | "cdc" | "mongodb", _) | ("sftp", Some("password")) => Some(&["password"]),
         ("files", _) => Some(&["accessKey", "secretKey"]),
         ("rest", Some("api_key")) => Some(&["apiKey"]),
         ("rest", Some("bearer")) => Some(&["token"]),
-        ("rest", Some("basic")) => Some(&["username", "password"]),
+        // Both need `username` + `password`, coincidentally the same two
+        // names for two unrelated protocols (HTTP Basic and SASL/PLAIN).
+        ("rest", Some("basic")) | ("kafka", Some("sasl_plain")) => Some(&["username", "password"]),
         ("rest", Some("oauth2_client_credentials")) => Some(&["clientId", "clientSecret"]),
+        ("kafka", Some("none")) => Some(&[]),
+        ("sftp", Some("public_key")) => Some(&["privateKey"]),
         ("sheets", _) => Some(&["serviceAccountJson"]),
         _ => None,
     }
@@ -891,6 +918,67 @@ mod secret_field_tests {
             secret_field_names("sql", Some("bearer")),
             Some(["password"].as_slice())
         );
+    }
+
+    #[test]
+    fn secret_field_names_mongodb_needs_only_a_password() {
+        assert_eq!(
+            secret_field_names("mongodb", None),
+            Some(["password"].as_slice())
+        );
+    }
+
+    #[test]
+    fn secret_field_names_oracle_needs_only_a_password_like_every_other_sql_driver() {
+        // Oracle is `adapter = "sql"`, `dial.driver = "oracle"` (see
+        // `SqlDriver::Oracle`'s own doc comment) — the mapping key is
+        // `("sql", None)` regardless of which `SqlDriver` the dial names.
+        assert_eq!(
+            secret_field_names("sql", None),
+            Some(["password"].as_slice())
+        );
+    }
+
+    #[test]
+    fn secret_field_names_kafka_none_auth_needs_no_secret_at_all() {
+        assert_eq!(
+            secret_field_names("kafka", Some("none")),
+            Some([].as_slice())
+        );
+    }
+
+    #[test]
+    fn secret_field_names_kafka_sasl_plain_needs_username_and_password() {
+        assert_eq!(
+            secret_field_names("kafka", Some("sasl_plain")),
+            Some(["username", "password"].as_slice())
+        );
+    }
+
+    #[test]
+    fn secret_field_names_sftp_password_auth_needs_a_password() {
+        assert_eq!(
+            secret_field_names("sftp", Some("password")),
+            Some(["password"].as_slice())
+        );
+    }
+
+    #[test]
+    fn secret_field_names_sftp_public_key_auth_needs_a_private_key() {
+        assert_eq!(
+            secret_field_names("sftp", Some("public_key")),
+            Some(["privateKey"].as_slice())
+        );
+    }
+
+    #[test]
+    fn secret_field_names_kafka_with_no_auth_type_is_an_unrecognized_combination() {
+        // Unlike `rest`/`sftp`, whose adapter-level entries used to fall
+        // back to `_` (ignoring `auth_type`), `kafka` has no such
+        // fallback — every `KafkaAuth` variant is tagged, so `None` here
+        // means the caller never consulted `Dial::secret_map_auth_type`,
+        // which is itself a bug worth failing loudly on.
+        assert_eq!(secret_field_names("kafka", None), None);
     }
 }
 
@@ -1149,6 +1237,45 @@ mod tests {
                 username: "orders-reader".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn secret_map_auth_type_reads_the_kafka_auth_tag_through_the_dial_enum() {
+        let dial = Dial::Kafka(KafkaDial {
+            bootstrap_servers: vec!["broker.internal:9092".to_owned()],
+            topic: "orders".to_owned(),
+            auth: KafkaAuth::SaslPlain {
+                username: "orders-reader".to_owned(),
+            },
+            group_id: "lakehouse-orders-consumer".to_owned(),
+            micro_batch_seconds: 30,
+        });
+        assert_eq!(dial.secret_map_auth_type(), Some("sasl_plain"));
+    }
+
+    #[test]
+    fn secret_map_auth_type_reads_the_sftp_auth_tag_through_the_dial_enum() {
+        let dial = Dial::Sftp(SftpDial {
+            host: "sftp.internal".to_owned(),
+            port: 22,
+            user: "lakehouse".to_owned(),
+            host_key_fingerprint: "SHA256:deadbeef".to_owned(),
+            path: "/outbox".to_owned(),
+            file_format: "csv".to_owned(),
+            auth: SftpAuth::PublicKey,
+        });
+        assert_eq!(dial.secret_map_auth_type(), Some("public_key"));
+    }
+
+    #[test]
+    fn secret_map_auth_type_is_none_for_a_dial_with_no_auth_type_at_all() {
+        let dial = Dial::Mongo(MongoDial {
+            hosts: vec!["mongo.internal:27017".to_owned()],
+            database: "app".to_owned(),
+            username: "reader".to_owned(),
+            direct_connection: true,
+        });
+        assert_eq!(dial.secret_map_auth_type(), None);
     }
 
     #[test]

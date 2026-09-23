@@ -115,8 +115,17 @@ def resolve_secrets(
     Raises `ValueError` if `(adapter, auth_type)` names no mapping
     (`secret_field_names`), or `SecretRefRejected` (never a partial dict)
     if either required slot fails to resolve.
+
+    A zero-length `fields` tuple (`("kafka", "none")` -- a `PLAINTEXT`
+    broker with nothing to resolve) returns `{}` immediately, without
+    calling `resolve_secret_ref` at all: no secretRef is REQUIRED when no
+    secret field is needed, so a connector saved with `secretRef` unset
+    for this combination must not be rejected as if a credential were
+    missing.
     """
     fields = secret_field_names(adapter, auth_type)
+    if not fields:
+        return {}
     values = [resolve_secret_ref(primary)]
     if len(fields) == 2:
         values.append(resolve_secret_ref(secondary))

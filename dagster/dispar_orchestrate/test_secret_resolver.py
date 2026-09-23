@@ -83,3 +83,10 @@ def test_resolve_secrets_raises_when_the_secondary_slot_is_needed_but_missing() 
 def test_resolve_secrets_propagates_the_unknown_combination_error() -> None:
     with pytest.raises(ValueError):
         resolve_secrets("rest", "not-a-real-auth-type", "env:CONNECTOR_X_TOKEN", None)
+
+
+def test_resolve_secrets_returns_empty_for_kafka_none_auth_with_no_secret_ref_at_all() -> None:
+    # ("kafka", "none") maps to an empty fields tuple -- no secretRef is
+    # required for a PLAINTEXT broker, so this must not raise
+    # SecretRefRejected for a missing primary ref.
+    assert resolve_secrets("kafka", "none", None, None) == {}

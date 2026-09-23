@@ -726,7 +726,8 @@ pub async fn get_ingest_spec(pool: &PgPool, id: &str) -> Result<Option<IngestSpe
 ///
 /// Second (WS3 plan review Z6): once the `dial` shape itself is valid,
 /// this checks that the connector's declared secret refs are ENOUGH for
-/// what `spec.adapter` (and, for `rest`, `dial.auth.type`) needs —
+/// what `spec.adapter` (and, for `rest`/`kafka`/`sftp`, `dial.auth.type`)
+/// needs —
 /// [`crate::ingest_spec::secret_field_names`] names the ordered fields
 /// (mirrored by `dagster/dispar_orchestrate/secret_map.py`'s
 /// `SECRET_FIELD_NAMES`, same commit), and a two-field combination
@@ -743,7 +744,8 @@ pub async fn get_ingest_spec(pool: &PgPool, id: &str) -> Result<Option<IngestSpe
 /// [`crate::ingest_spec::Dial::parse`] for `spec.adapter`, or if the
 /// connector's secret-ref count does not match
 /// [`crate::ingest_spec::secret_field_names`] for `spec.adapter`/the
-/// dial's auth type. Returns [`StoreError::NotFound`] if `id` does not
+/// dial's auth type (`rest`, `kafka` or `sftp` — [`crate::ingest_spec::Dial::secret_map_auth_type`]).
+/// Returns [`StoreError::NotFound`] if `id` does not
 /// name a connector. Returns [`StoreError::Database`] on any other
 /// failure.
 pub async fn set_ingest_spec(
@@ -754,7 +756,7 @@ pub async fn set_ingest_spec(
     let dial = crate::ingest_spec::Dial::parse(&spec.adapter, &spec.dial)
         .map_err(|err| StoreError::Validation(err.to_string()))?;
 
-    let auth_type = dial.rest_auth_type();
+    let auth_type = dial.secret_map_auth_type();
     let fields =
         crate::ingest_spec::secret_field_names(&spec.adapter, auth_type).ok_or_else(|| {
             StoreError::Validation(format!(

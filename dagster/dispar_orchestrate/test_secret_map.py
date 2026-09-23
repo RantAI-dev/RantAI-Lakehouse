@@ -45,3 +45,34 @@ def test_a_non_rest_adapter_ignores_the_auth_type_argument() -> None:
     # -- a caller passing a stray auth_type for "sql" still gets the
     # single-password mapping rather than a spurious lookup miss.
     assert secret_field_names("sql", "bearer") == ("password",)
+
+
+def test_mongo_needs_only_a_password() -> None:
+    assert secret_field_names("mongodb", None) == ("password",)
+
+
+def test_oracle_needs_only_a_password_like_every_other_sql_driver() -> None:
+    # Oracle is `adapter="sql"`, `dial.driver="oracle"` -- the mapping key
+    # is unchanged, it is still ("sql", None).
+    assert secret_field_names("sql", None) == ("password",)
+
+
+def test_kafka_none_auth_needs_no_secret_at_all() -> None:
+    assert secret_field_names("kafka", "none") == ()
+
+
+def test_kafka_sasl_plain_needs_username_and_password() -> None:
+    assert secret_field_names("kafka", "sasl_plain") == ("username", "password")
+
+
+def test_sftp_password_auth_needs_a_password() -> None:
+    assert secret_field_names("sftp", "password") == ("password",)
+
+
+def test_sftp_public_key_auth_needs_a_private_key() -> None:
+    assert secret_field_names("sftp", "public_key") == ("privateKey",)
+
+
+def test_kafka_with_an_unrecognized_auth_type_is_a_hard_error() -> None:
+    with pytest.raises(ValueError):
+        secret_field_names("kafka", "sasl_scram_sha256")
