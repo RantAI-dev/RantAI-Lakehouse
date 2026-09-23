@@ -471,7 +471,25 @@ def run_kafka_stream_batch(
     append path is not deduplicated), never a silent skip.
 
     An empty batch (`not batch.rows`) returns without writing or
-    committing anything -- there is nothing to commit an offset FOR.
+    committing anything -- there is nothing to commit an offset FOR, and
+    (mirroring `_run_one_object`'s own per-object-only recording) nothing
+    is recorded to governance for an empty poll: an empty micro-batch is
+    not an outcome, it is nothing having happened this run.
+
+    GOVERNANCE (the bug this function used to have): unlike every batch
+    adapter path (`_run_one_object`'s own `_record` calls, via
+    `record_ingest_run`), this function used to record NOTHING --
+    `/api/governance/ingest-runs` showed no row for a Kafka connector's
+    micro-batch, success or failure, including an SSRF refusal of an
+    advertised broker (`consume_one_batch` raising `ssrf_guard.SsrfBlocked`
+    from inside `check_all_advertised_brokers`/`checking_resolver`). Now
+    records exactly one run per non-empty micro-batch, matching
+    `_run_one_object`'s three statuses: `"succeeded"` (the real row count
+    `load_via_sink`'s own `SinkResult.rows` measured -- never a fabricated
+    number), `"rejected"` (an `ssrf_guard.SsrfBlocked` from the poll
+    itself), or `"failed"` (any other exception, classified by TYPE NAME
+    only via `_classify_exception`, never the raw message -- same
+    discipline as `_run_one_object`'s own catch-all).
 
     `consumer` is injectable (DEFAULT `None` builds a real
     `KafkaConsumer` from `spec`) so a test can drive this function with a
@@ -495,23 +513,48 @@ def run_kafka_stream_batch(
         )
         consumer.subscribe([spec["topic"]])
     topic = spec.get("topic", "")
-    try:
-        batch = consume_one_batch(consumer, topic=topic, max_seconds=spec.get("microBatchSeconds", 60))
-        if not batch.rows:
-            return
-        sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env())
-        load_via_sink(batch.rows, source_objects[0]["target"], sink_config)
-        # Committed ONLY after the sink write above returned successfully
-        # (an exception there propagates out of this function before this
-        # point is ever reached -- see this function's own docstring).
-        consumer.commit(
-            {
-                TopicPartition(topic, partition): OffsetAndMetadata(offset + 1)
-                for partition, offset in batch.offsets_to_commit.items()
-            }
+    job_name = "ingest_job"
+    object_name = source_objects[0]["target"] if source_objects else topic
+    started_at = datetime.now(timezone.utc).isoformat()
+
+    def _record(*, rows, status, error=""):
+        record_ingest_run(
+            connector_id=connector_id,
+            job=job_name,
+            object_name=object_name,
+            rows=rows,
+            started_at=started_at,
+            ended_at=datetime.now(timezone.utc).isoformat(),
+            status=status,
+            error=error,
         )
-        for partition, offset in batch.offsets_to_commit.items():
-            record_ingest_offset(connector_id, topic, partition, offset)
+
+    try:
+        try:
+            batch = consume_one_batch(consumer, topic=topic, max_seconds=spec.get("microBatchSeconds", 60))
+            if not batch.rows:
+                return
+            sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env())
+            outcome = load_via_sink(batch.rows, source_objects[0]["target"], sink_config)
+            # Committed ONLY after the sink write above returned
+            # successfully (an exception there propagates out of this
+            # try block before this point is ever reached -- see this
+            # function's own docstring).
+            consumer.commit(
+                {
+                    TopicPartition(topic, partition): OffsetAndMetadata(offset + 1)
+                    for partition, offset in batch.offsets_to_commit.items()
+                }
+            )
+            for partition, offset in batch.offsets_to_commit.items():
+                record_ingest_offset(connector_id, topic, partition, offset)
+            _record(rows=outcome.rows, status="succeeded")
+        except ssrf_guard.SsrfBlocked as exc:
+            _record(rows=None, status="rejected", error=str(exc))
+            raise
+        except Exception as exc:  # noqa: BLE001 -- every OTHER failure still gets a row (never silently invisible)
+            _record(rows=None, status="failed", error=_classify_exception(exc))
+            raise
     finally:
         if owns_consumer:
             consumer.close()

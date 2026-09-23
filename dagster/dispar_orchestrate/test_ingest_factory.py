@@ -568,6 +568,7 @@ class _FakeStreamConsumer:
 def test_stream_dispatch_commits_offset_only_after_a_successful_sink_write(monkeypatch) -> None:
     committed = []
     written = []
+    recorded = []
     monkeypatch.setattr(
         "dispar_orchestrate.ingest_factory.consume_one_batch",
         lambda *a, **k: BatchResult(rows=[{"id": 1}], offsets_to_commit={0: 5}),
@@ -580,6 +581,10 @@ def test_stream_dispatch_commits_offset_only_after_a_successful_sink_write(monke
         "dispar_orchestrate.ingest_factory.record_ingest_offset",
         lambda *a, **k: committed.append(a),
     )
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.record_ingest_run",
+        lambda **kw: recorded.append(kw),
+    )
     fake_consumer = _FakeStreamConsumer()
     run_kafka_stream_batch(
         connector_id="conn-x",
@@ -591,10 +596,13 @@ def test_stream_dispatch_commits_offset_only_after_a_successful_sink_write(monke
     assert written == [True]
     assert len(committed) == 1  # committed AFTER the write, never before
     assert len(fake_consumer.commits) == 1  # the broker-side consumer-group commit also happened
+    assert recorded[0]["status"] == "succeeded"
+    assert recorded[0]["rows"] == 1  # the real SinkResult.rows count, never fabricated
 
 
 def test_stream_dispatch_does_not_commit_the_offset_if_the_sink_write_fails(monkeypatch) -> None:
     committed = []
+    recorded = []
     monkeypatch.setattr(
         "dispar_orchestrate.ingest_factory.consume_one_batch",
         lambda *a, **k: BatchResult(rows=[{"id": 1}], offsets_to_commit={0: 5}),
@@ -607,6 +615,10 @@ def test_stream_dispatch_does_not_commit_the_offset_if_the_sink_write_fails(monk
         "dispar_orchestrate.ingest_factory.record_ingest_offset",
         lambda *a, **k: committed.append(a),
     )
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.record_ingest_run",
+        lambda **kw: recorded.append(kw),
+    )
     fake_consumer = _FakeStreamConsumer()
     with pytest.raises(RuntimeError):
         run_kafka_stream_batch(
@@ -618,6 +630,71 @@ def test_stream_dispatch_does_not_commit_the_offset_if_the_sink_write_fails(monk
         )
     assert committed == []  # never committed -- the batch is retried whole next run
     assert fake_consumer.commits == []  # the broker-side commit never happened either
+    assert recorded[0]["status"] == "failed"
+    assert recorded[0]["rows"] is None
+    assert "sink unavailable" not in recorded[0]["error"]  # never the raw message
+    assert "RuntimeError" in recorded[0]["error"]  # the classified type name IS safe to record
+
+
+def test_stream_dispatch_records_nothing_on_an_empty_batch(monkeypatch) -> None:
+    """An empty poll is not an outcome -- nothing happened this run, so
+    nothing is recorded, mirroring `_run_one_object`'s own
+    per-object-only recording (never a fabricated zero-row success)."""
+    recorded = []
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.consume_one_batch",
+        lambda *a, **k: BatchResult(rows=[], offsets_to_commit={}),
+    )
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.record_ingest_run",
+        lambda **kw: recorded.append(kw),
+    )
+    fake_consumer = _FakeStreamConsumer()
+    run_kafka_stream_batch(
+        connector_id="conn-x",
+        spec={"topic": "orders"},
+        secrets={},
+        source_objects=[{"target": "orders"}],
+        consumer=fake_consumer,
+    )
+    assert recorded == []
+
+
+def test_stream_dispatch_records_a_rejected_ingest_run_when_consume_one_batch_is_ssrf_blocked(monkeypatch) -> None:
+    """The G6 gate's own reason for this fix: an SSRF refusal of an
+    advertised broker (`consume_one_batch` raising `ssrf_guard.SsrfBlocked`
+    from inside `check_all_advertised_brokers`/`checking_resolver`) used
+    to leave `/api/governance/ingest-runs` with no row at all for the
+    connector. Poison `load_via_sink` the same way the existing dispatch
+    tests poison a branch that must never be reached."""
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded = []
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.consume_one_batch",
+        lambda *a, **k: (_ for _ in ()).throw(f.ssrf_guard.SsrfBlocked("advertised broker 169.254.169.254:9092 refused")),
+    )
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.load_via_sink",
+        lambda *a, **k: pytest.fail("must not be called -- the poll itself was blocked"),
+    )
+    monkeypatch.setattr(
+        "dispar_orchestrate.ingest_factory.record_ingest_run",
+        lambda **kw: recorded.append(kw),
+    )
+    fake_consumer = _FakeStreamConsumer()
+    with pytest.raises(f.ssrf_guard.SsrfBlocked):
+        run_kafka_stream_batch(
+            connector_id="conn-x",
+            spec={"topic": "orders"},
+            secrets={},
+            source_objects=[{"target": "orders"}],
+            consumer=fake_consumer,
+        )
+    assert len(recorded) == 1
+    assert recorded[0]["status"] == "rejected"
+    assert recorded[0]["rows"] is None
+    assert "169.254.169.254" in recorded[0]["error"]  # SsrfBlocked's message IS safe to record verbatim
 
 
 def test_stream_dispatch_returns_without_writing_or_committing_on_an_empty_batch(monkeypatch) -> None:
