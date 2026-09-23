@@ -25,6 +25,7 @@ import { formatRelativeTime } from "@/lib/format"
 import { HEALTH_LABEL, type Health } from "@/lib/status"
 import { connectorService } from "@/services"
 import type { Connector, IngestRun } from "@/services/contracts/connectors"
+import { ConnectorCredentialRotation } from "./connector-credential-rotation"
 import { ConnectorProbeHistoryPanel } from "./connector-probe-history-panel"
 
 type Direction = Connector["direction"]
@@ -267,6 +268,7 @@ function ConnectorDetail({ id }: { id: string }) {
         ]}
       />
       <ConnectorProbeHistoryPanel connectorId={id} refreshKey={historyKey} />
+      <ConnectorCredentialRotation connectorId={id} onRotated={state.reload} />
       <div>
         <p className="text-xs font-medium text-muted-foreground">Capabilities</p>
         <div className="mt-1.5 flex flex-wrap gap-1.5">

@@ -22,6 +22,7 @@ import { SqlDialForm } from "@/features/connectors/dial-forms/sql-dial-form"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { cn } from "@/lib/utils"
 import { connectorService } from "@/services"
+import { CREDENTIAL_KIND_OPTIONS } from "./credential-options"
 import type {
   CdcDial,
   Connector,
@@ -83,15 +84,6 @@ function hostFromDial(adapter: string | null, dial: Record<string, unknown> | nu
       return ""
   }
 }
-
-const CREDENTIAL_KIND_OPTIONS: { value: CredentialKind; label: string }[] = [
-  { value: "password", label: "Password" },
-  { value: "secret_key", label: "Secret key" },
-  { value: "access_key", label: "Access key" },
-  { value: "api_key", label: "API key" },
-  { value: "token", label: "Token" },
-  { value: "private_key", label: "Private key" },
-]
 
 /**
  * A sensible default primary/secondary kind per adapter -- the server
