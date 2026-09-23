@@ -92,7 +92,7 @@ def test_consume_one_batch_returns_messages_and_max_offset_per_partition():
 
 
 def test_consume_one_batch_wraps_the_whole_poll_loop_in_checking_resolver():
-    # K1: not just a pre-check -- the WHOLE batch (pre-check and every
+    # Not just a pre-check -- the WHOLE batch (pre-check and every
     # poll iteration) runs inside checking_resolver, so a broker
     # re-advertised and reconnected to MID-BATCH is still checked.
     entered = []
@@ -132,7 +132,7 @@ def test_consume_one_batch_never_advances_the_offset_before_the_caller_confirms_
 
 
 def test_offset_and_metadata_is_built_with_one_positional_arg_not_a_none_metadata():
-    # K5's own warning, verified executably rather than only in a doc
+    # Verified executably rather than only in a doc
     # comment: kafka-python 3.0.11's OffsetAndMetadata field list/defaults
     # changed after 2.0 -- a `leader_epoch` field was added and `metadata`
     # defaults to `''`, not `None`.

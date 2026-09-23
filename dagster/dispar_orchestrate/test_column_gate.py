@@ -1,5 +1,5 @@
 """Tests for `column_gate.py`, the Python port of `cdc.rs`'s
-`reject_unsupported_column_types` (WS3, X9), plus WS9 Task I1's
+`reject_unsupported_column_types` (WS3, X9), plus
 `reject_unsupported_column_types_from_sample` for the document-shaped
 `mongodb`/`kafka` adapters. The `reject_unsupported_column_types` cases
 here each mirror a case in `rust/crates/lakehouse-store/src/cdc.rs`'s own
@@ -9,7 +9,7 @@ isn't mirrored in the other shows up as a failing test here, not as
 silent drift. `reject_unsupported_column_types_from_sample` has no Rust
 counterpart (Mongo/Kafka carry no relational type catalogue for `cdc.rs`
 to gate in the first place -- see `column_gate.py`'s module docstring),
-so its cases are pinned only against WS9 plan Task I1's own fixtures.
+so its cases are pinned only against this module's own fixtures below.
 """
 
 from __future__ import annotations
@@ -99,8 +99,7 @@ def test_reject_unsupported_column_types_covers_a_mongo_document_with_a_nested_a
     # Mongo has no fixed schema -- the gate runs over a SAMPLED document's
     # inferred field types (BSON type names decoded by pymongo as native
     # Python list/dict), the same NESTED_TYPE_MARKERS rule cdc.rs:79
-    # already enforces for a relational nested/array column (WS9 plan
-    # Task I1, Step 1).
+    # already enforces for a relational nested/array column.
     sample_doc = {"id": 1, "tags": ["a", "b"]}  # array -- unsupported, same rule as a Postgres ARRAY column
     with pytest.raises(UnsupportedColumnType) as exc_info:
         reject_unsupported_column_types_from_sample(sample_doc)

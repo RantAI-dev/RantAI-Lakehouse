@@ -121,10 +121,10 @@ def test_checking_resolver_allows_a_public_reconnect_mid_context():
 
 
 def test_checking_resolver_refuses_a_reconnect_to_an_internal_address_advertised_mid_batch():
-    # WS9 judge review K1's exact scenario: a broker advertised AFTER the
-    # batch started, resolving to an internal address -- this is the
-    # window a one-shot pre-check (check_all_advertised_brokers) cannot
-    # close, and checking_resolver exists specifically to close it: EVERY
+    # A broker advertised AFTER the batch started, resolving to an
+    # internal address -- this is the window a one-shot pre-check
+    # (check_all_advertised_brokers) cannot close, and checking_resolver
+    # exists specifically to close it: EVERY
     # getaddrinfo call made anywhere during the context is checked, not
     # just the ones made before entering it.
     with pytest.raises(SsrfBlocked):

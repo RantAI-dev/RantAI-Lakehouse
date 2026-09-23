@@ -1,14 +1,14 @@
 """dagster/dispar_orchestrate/adapters/oracle.py -- wraps dlt's
 `sql_database` with the `oracle+oracledb` SQLAlchemy dialect (thin mode,
-no Oracle Instant Client). SSRF (WS9 judge review K2, one design, not a
-branch): `resolve_checked` runs first; the connection's own `host`
+no Oracle Instant Client). SSRF: one design, not a
+branch: `resolve_checked` runs first; the connection's own `host`
 field is the CHECKED IP LITERAL (never the original hostname), so
 nothing downstream can re-resolve or DNS-rebind it; the whole call is
 additionally wrapped in `ssrf_guard.checking_resolver` as a
 belt-and-suspenders check that costs nothing if thin mode's internal
 transport never calls `socket.getaddrinfo` and catches it if it does.
 
-**Proved, not assumed (Task B2 rule 1): what `oracledb==2.5.1` thin
+**Proved, not assumed: what `oracledb==2.5.1` thin
 mode actually does.** The installed wheel ships no `.pyx` source (it is
 a compiled `thin_impl.cpython-314-x86_64-linux-gnu.so`), so the sdist
 (`pip download oracledb==2.5.1 --no-binary :all:`) was unpacked and its
@@ -36,10 +36,9 @@ through `socket.create_connection`/`getaddrinfo` at all -- irrelevant to
 this module because `host` is already the checked IP literal below, so
 neither path ever has a hostname left to resolve.)
 
-TLS certificate verification (WS9 judge review K6, correcting this
-module's own first draft): `spec.get("sslServerCertDn")` is an
-OPERATOR-SUPPLIED Distinguished Name (`SqlDial.ssl_server_cert_dn`,
-Task A2), passed to oracledb UNCHANGED -- never synthesized from
+TLS certificate verification: `spec.get("sslServerCertDn")`
+is an OPERATOR-SUPPLIED Distinguished Name (`SqlDial.ssl_server_cert_dn`,
+`rust/crates/lakehouse-store/src/ingest_spec.rs`), passed to oracledb UNCHANGED -- never synthesized from
 `spec['host']` (a bare `CN=<hostname>` would not match a real
 certificate's full DN, which ordinarily carries `OU=`/`O=`/`C=`
 components too). `ssl_server_cert_dn` is a real, documented
@@ -69,7 +68,7 @@ from dispar_orchestrate import ssrf_guard
 class OracleTlsConfigError(Exception):
     """`sslMode` requires TLS but no `sslServerCertDn` was supplied --
     refused, never a silent connection with the server's identity
-    unverified (WS9 judge review K6)."""
+    unverified."""
 
 
 @dataclass(frozen=True)
@@ -99,16 +98,15 @@ def build_source(
                 "certificate's expected Distinguished Name, or set sslMode to disable"
             )
         # The operator-supplied DN, passed through EXACTLY as configured
-        # -- never derived from spec["host"] (K6's correction).
+        # -- never derived from spec["host"].
         engine_kwargs["connect_args"] = {"ssl_server_cert_dn": cert_dn}
 
-    # WS3 Task F2 (Z13)'s precedent, reused: `credentials` is a plain
-    # Python dict of STRUCTURED fields handed to SQLAlchemy's
+    # `credentials` is a plain Python dict of STRUCTURED fields handed to SQLAlchemy's
     # `create_engine`, never an interpolated DSN string -- a
     # `user`/`password`/`database` value containing `@`/`/`/`:` cannot
     # break out of its own field. No `_odbc_quote` equivalent is
     # needed, for the same reason `mongodb.py` needs none: only
-    # `mssql`'s raw ODBC connection string (Task F2) lacks a
+    # `mssql`'s raw ODBC connection string (`adapters/sql.py`) lacks a
     # structured-parameter escape hatch.
     credentials = {
         "drivername": "oracle+oracledb",

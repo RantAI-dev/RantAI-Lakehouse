@@ -1,4 +1,4 @@
-"""Tests for `adapters.sftp.build_source` (WS9 plan Task D3).
+"""Tests for `adapters.sftp.build_source`.
 
 No network, no real SSH server: `paramiko.SSHClient` is faked at the
 class level (`monkeypatch.setattr(".../paramiko.SSHClient", ...)`) so

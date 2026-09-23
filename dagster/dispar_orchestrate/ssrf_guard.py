@@ -187,14 +187,14 @@ def pinned_resolution(host: str, resolved: ResolvedAddress):
 
 @contextlib.contextmanager
 def checking_resolver(*, allow_internal_hosts: bool | None = None, getaddrinfo: Callable = socket.getaddrinfo):
-    """WS9 judge review K1: wraps `socket.getaddrinfo` for the WHOLE
-    context, validating every result any caller receives -- not one
-    host pinned in advance (see `pinned_resolution` above for that
-    narrower case). Use this whenever a client may resolve and connect
-    to a SET of hosts it discovers over the life of a long-running
-    call, and the set cannot be enumerated up front (Kafka's
-    mid-batch metadata refresh; a resolver-mechanism this plan cannot
-    fully characterise ahead of time, e.g. Oracle thin mode, Task D2).
+    """Wraps `socket.getaddrinfo` for the WHOLE context, validating every
+    result any caller receives -- not one host pinned in advance (see
+    `pinned_resolution` above for that narrower case). Use this whenever
+    a client may resolve and connect to a SET of hosts it discovers over
+    the life of a long-running call, and the set cannot be enumerated up
+    front (Kafka's mid-batch metadata refresh; a resolver mechanism this
+    module does not control directly, such as the one `oracledb`'s thin
+    mode uses internally -- see `adapters/oracle.py`).
 
     `allow_internal_hosts` follows the SAME env-var default
     (`INGEST_ALLOW_INTERNAL_HOSTS`) `resolve_checked` already reads --

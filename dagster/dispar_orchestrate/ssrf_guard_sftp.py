@@ -1,5 +1,5 @@
-"""dagster/dispar_orchestrate/ssrf_guard_sftp.py -- WS9 plan hard
-requirement 1: paramiko's `SSHClient.connect()` needs a
+"""dagster/dispar_orchestrate/ssrf_guard_sftp.py -- paramiko's
+`SSHClient.connect()` needs a
 `MissingHostKeyPolicy` to decide what happens when it has no cached
 entry for a host. `paramiko.AutoAddPolicy` accepts and silently trusts
 WHATEVER key the server presents on first connect -- exactly the
@@ -8,7 +8,7 @@ module comment calls out for other protocols (never trust
 response-supplied data). `PinnedHostKeyPolicy` instead requires the
 operator to have captured the real host's key fingerprint out of band
 (e.g. `ssh-keyscan sftp.example.com | ssh-keygen -lf - -E sha256`) and
-stored it in `dial.hostKeyFingerprint` (SftpDial, Task A2, a REQUIRED
+stored it in `dial.hostKeyFingerprint` (`SftpDial`, a REQUIRED
 field -- there is no code path that connects without one). Every
 connection attempt computes the presented key's SHA256 fingerprint and
 refuses outright on any mismatch -- never falls back to trusting it."""

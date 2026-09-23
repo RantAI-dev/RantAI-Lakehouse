@@ -1,6 +1,7 @@
 """dagster/dispar_orchestrate/adapters/mongodb.py -- wraps `pymongo`
-directly, since dlt ships no mongodb source in the installed package
-(WS9 plan Correction 2). `directConnection=True` is enforced
+directly, since dlt ships no mongodb source in the installed package, so
+this adapter is hand-written rather than routed through
+`dlt_pipeline.py`. `directConnection=True` is enforced
 (ssrf_guard_mongo.validate_mongo_dial) before any network call, then
 EVERY explicit seed host is resolve_checked before MongoClient is
 constructed -- see ssrf_guard_mongo.py's module doc comment for why
@@ -48,7 +49,7 @@ def _collection_rows(collection, *, checking_resolver=ssrf_guard.checking_resolv
     with checking_resolver():
         cursor = collection.find({})
         for index, document in enumerate(cursor):
-            # R7 (WS9 Task I1): Mongo has no relational type catalogue to
+            # R7: Mongo has no relational type catalogue to
             # gate at registration, so the first document of the read is
             # the sample this gate inspects — a nested list/dict value is
             # refused here rather than silently flattened or dropped by
@@ -78,14 +79,13 @@ def build_source(
     """
     validate_mongo_dial(spec)
     resolved = resolve_all_seed_hosts(spec["hosts"], resolve_checked=resolve_checked)
-    # WS3 Task F2 (Z13) teaches the general lesson this call applies:
     # `username`/`password`/`authSource` are handed to MongoClient as
     # STRUCTURED keyword parameters, never concatenated into a
     # "mongodb://user:pass@host/db"-shaped URI string -- pymongo builds
     # its own internal MongoCredential object from these fields directly,
     # so there is no delimiter-separated text for a `;`/`@`/`/` in a
     # username or password to break out of. This is the SAME choice
-    # Task F2's `sql.py` makes for `mysql`/`postgresql` (a Python dict of
+    # `adapters/sql.py` makes for `mysql`/`postgresql` (a Python dict of
     # credentials, not an interpolated DSN) -- `_odbc_quote`
     # (`sql.py`'s `mssql` arm) exists ONLY because ODBC's raw connection
     # string has no structured-parameter escape hatch; Mongo's driver

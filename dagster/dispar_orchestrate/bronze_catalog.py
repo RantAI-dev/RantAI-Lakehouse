@@ -668,15 +668,15 @@ def record_ingest_run(
     )
 
 
-# ── Kafka micro-batch offset tracking (WS9 plan Task A1/D4) ─────────────
+# ── Kafka micro-batch offset tracking ────────────────────────────────────
 #
 # `lake.bronze_meta.ingest_offset` is a NEW table, introduced for
 # `adapters/kafka.py`'s scheduled micro-batch job. It is CURRENT POSITION
 # ONLY -- one row per (connector_id, topic, partition_id), overwritten on
-# every commit -- never a history log (`connector_probe_result`, WS9 Phase
-# F, is where history is kept; conflating the two would let an
-# ever-growing offset table masquerade as an audit log it was never
-# designed to be). Not mirrored into `demo/clickhouse/04_registry.sql`
+# every commit -- never a history log (`connector_probe_result` is where
+# history is kept; conflating the two would let an ever-growing offset
+# table masquerade as an audit log it was never designed to be). Not
+# mirrored into `demo/clickhouse/04_registry.sql`
 # (out of scope for this build to edit), so this table has exactly one
 # owner: `_INGEST_OFFSET_SCHEMA` below -- its own one-element tuple passed
 # to `_assert_or_create_all`, the same pattern `_INGEST_RUN_SCHEMA` and
@@ -715,9 +715,9 @@ def record_ingest_offset(
     partition) into `lake.bronze_meta.ingest_offset` -- called by
     `ingest_factory.py::run_kafka_stream_batch` ONLY after
     `adapters.sink.load_via_sink` has already succeeded for the batch this
-    offset belongs to (WS9 plan hard requirement 3: never before the sink
-    write, so a crash between consume and write is retried from the last
-    COMMITTED offset, at-least-once, on the next scheduled run).
+    offset belongs to -- never before the sink write, so a crash between
+    consume and write is retried from the last COMMITTED offset,
+    at-least-once, on the next scheduled run.
 
     A fresh `KafkaConsumer` is constructed per scheduled run (this
     deployment runs no long-lived consumer process), so this table -- not

@@ -1,6 +1,6 @@
-"""dagster/dispar_orchestrate/ssrf_guard_kafka.py -- WS9 plan hard
-requirement 1: Kafka's bootstrap host is not the only host the client
-ever dials. After connecting to ANY bootstrap broker, `kafka-python`
+"""dagster/dispar_orchestrate/ssrf_guard_kafka.py -- Kafka's bootstrap
+host is not the only host the client ever dials. After connecting to ANY
+bootstrap broker, `kafka-python`
 (like every Kafka client) asks for cluster metadata and then dials
 whatever "advertised listener" addresses that metadata names for each
 partition's leader/replicas -- addresses the BROKER chooses, not the
@@ -11,8 +11,8 @@ alone never inspects those. This module checks EVERY broker address a
 metadata response names, via the SAME resolve_checked rule, before
 `adapters/kafka.py` is allowed to call `.poll()` even once -- an early,
 readable pre-check, NOT the only defence: `ssrf_guard.checking_resolver`
-(WS9 plan Task C1, `ssrf_guard.py`) covers the mid-batch reconnect window
-this one-shot check alone cannot (WS9 judge review K1).
+(`ssrf_guard.py`) covers the mid-batch reconnect window this one-shot
+check alone cannot.
 
 Fail-closed: ANY single advertised broker failing the check aborts the
 WHOLE batch (no partial consumption from "the brokers that happened to
@@ -53,13 +53,14 @@ def check_all_advertised_brokers(
     cached across runs, since a cluster's advertised addresses can
     change between runs -- DNS/config drift, not just DNS TTL).
 
-    `_validate_hostname` (WS3 Task F2/A3, Z13's Python port, imported
-    from `adapters.sql` rather than re-implemented here -- ONE canonical
-    hostname-shape rule for this whole workstream, per Task A3's own
-    stated reason) runs BEFORE `resolve_checked` for every advertised
-    host: an advertised address is server-supplied text, and this
-    module's own `dial.bootstrapServers` entries already pass the SAME
-    check at `Dial::parse` time (Task A2) -- an advertised host that is
+    `_validate_hostname` (the Python port of
+    `rust/crates/lakehouse-store/src/ingest_spec.rs`'s hostname-shape
+    rule, imported from `adapters.sql` rather than re-implemented here --
+    ONE canonical hostname-shape rule for this whole workstream) runs
+    BEFORE `resolve_checked` for every advertised host: an advertised
+    address is server-supplied text, and this module's own
+    `dial.bootstrapServers` entries already pass the SAME check at
+    `Dial::parse` time (`ingest_spec.rs`) -- an advertised host that is
     not even hostname-shaped (e.g. carries `;`) is refused here for the
     identical reason, before a DNS lookup is even attempted."""
     for host, _port in metadata.brokers:

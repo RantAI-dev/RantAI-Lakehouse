@@ -3,7 +3,7 @@ every test fakes `MongoClient` (monkeypatched on the adapter module, not
 the real driver) and injects `resolve_checked` -- see
 `adapters/mongodb.py`'s module doc comment and `ssrf_guard_mongo.py`'s
 for the two checks (SRV-shape/directConnection, then every seed host)
-each test asserts run BEFORE any connection attempt (WS9 plan Task D1).
+each test asserts run BEFORE any connection attempt.
 """
 from __future__ import annotations
 

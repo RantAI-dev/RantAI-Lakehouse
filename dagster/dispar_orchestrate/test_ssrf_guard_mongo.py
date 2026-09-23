@@ -1,6 +1,6 @@
-"""Tests for `ssrf_guard_mongo.validate_mongo_dial`/`resolve_all_seed_hosts`
-(WS9 plan Task C2). Covers the two MongoDB host-selection mechanisms
-hard requirement 1 refuses outright: an SRV-shaped host string, and
+"""Tests for `ssrf_guard_mongo.validate_mongo_dial`/`resolve_all_seed_hosts`.
+Covers the two MongoDB host-selection mechanisms this module refuses
+outright: an SRV-shaped host string, and
 `directConnection=False` (replica-set member discovery).
 
 No network: `resolve_checked` is faked per-test rather than resolving
@@ -20,7 +20,8 @@ from dispar_orchestrate.ssrf_guard_mongo import (
 
 
 def test_validate_mongo_dial_refuses_a_srv_style_host():
-    # There is no `srvUri` field on MongoDial (ingest_spec.rs, Task A2)
+    # There is no `srvUri` field on MongoDial
+    # (`rust/crates/lakehouse-store/src/ingest_spec.rs`)
     # at the SCHEMA level -- this test proves the ADAPTER-level check
     # also refuses a host string that is itself SRV-shaped (defence in
     # depth against a caller who bypasses schema validation, e.g. a
@@ -30,7 +31,7 @@ def test_validate_mongo_dial_refuses_a_srv_style_host():
 
 
 def test_validate_mongo_dial_requires_direct_connection_true():
-    # Hard requirement 1: replica-set discovery is REFUSED, not
+    # Replica-set discovery is REFUSED, not
     # partially checked -- directConnection=False would let pymongo
     # dial members the operator never listed. Refusing this at
     # validate time (before any network call) is stricter and cheaper
@@ -80,7 +81,7 @@ def test_resolve_all_seed_hosts_defaults_to_port_27017_when_no_port_is_given():
 
 
 def test_resolve_all_seed_hosts_refuses_a_seed_host_shaped_for_injection():
-    # WS3 Task A3/F2 (Z13)'s _validate_hostname rule, reused here: an
+    # `_validate_hostname`'s rule (from `adapters/sql.py`), reused here: an
     # explicit seed host re-read at dial time (rather than trusted from
     # a prior Dial::parse save-time check) must still be hostname-shaped
     # before it is even resolved.

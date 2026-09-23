@@ -12,9 +12,10 @@ both `test_column_gate.py` (this module's test) and `cdc.rs`'s own `mod
 tests` pin the same fixture inputs so a one-sided change fails a test
 immediately.
 
-WS9 (Task I1) extends this module's COVERAGE, not its rule, to the four
-Tier 2 adapters -- each introspects source types in its own shape, and
-this docstring states, per adapter, exactly what is and is not gated:
+The Tier 2 adapters (`adapters/mongodb.py`, `adapters/oracle.py`,
+`adapters/kafka.py`, `adapters/sftp.py`) extend this module's COVERAGE,
+not its rule -- each introspects source types in its own shape, and this
+docstring states, per adapter, exactly what is and is not gated:
 
 - **`sql`/`files` (sheets/rest are non-relational and carry no column
   gate today)/`oracle`** -- a real, declared relational type catalogue
@@ -115,8 +116,7 @@ def reject_unsupported_column_types_from_sample(doc: dict) -> None:
     `reject_unsupported_column_types`/`NESTED_TYPE_MARKERS` encodes for a
     relational column, expressed over Python's own runtime type system
     instead of a declared type-name string -- neither Mongo nor Kafka
-    hands this gate a relational type catalogue to inspect (WS9 plan
-    Task I1, Step 2).
+    hands this gate a relational type catalogue to inspect.
 
     BSON's array/embedded-document types decode through `pymongo` as
     `list`/`dict`; a Kafka message's JSON `array`/`object` decode the

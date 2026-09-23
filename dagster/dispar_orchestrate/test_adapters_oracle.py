@@ -1,7 +1,7 @@
-"""Tests for `dispar_orchestrate.adapters.oracle` (WS9 plan Task D2).
+"""Tests for `dispar_orchestrate.adapters.oracle`.
 No network: `sql_database` and `resolve_checked` are both injected/
 monkeypatched, so nothing here dials a real socket. Each test asserts
-one specific behaviour of Task B2's single design (connect by resolved
+one specific behaviour of `build_source`'s design (connect by resolved
 IP, TLS verified against an operator-supplied DN, checking_resolver-
 wrapped) -- never merely "it did not crash"."""
 from __future__ import annotations
@@ -31,7 +31,7 @@ def test_build_source_checks_the_host_before_building_any_credentials(monkeypatc
 
 
 def test_build_source_connects_by_the_resolved_ip_literal_not_the_hostname(monkeypatch):
-    # K2: the connection's own `host` field is the CHECKED IP -- never
+    # The connection's own `host` field is the CHECKED IP -- never
     # the original hostname -- so nothing downstream can re-resolve it.
     captured = {}
     monkeypatch.setattr("dispar_orchestrate.adapters.oracle.sql_database", lambda **kwargs: captured.update(kwargs) or "src")
@@ -44,11 +44,11 @@ def test_build_source_connects_by_the_resolved_ip_literal_not_the_hostname(monke
     assert captured["credentials"]["drivername"] == "oracle+oracledb"
     assert captured["credentials"]["host"] == "10.0.0.9"  # the resolved IP, not "ora.invalid"
     assert captured["table_names"] == ["orders"]
-    assert "connect_args" not in captured.get("engine_kwargs", {})  # sslMode unset -- plaintext, no DN check (Step 5 of Task B2)
+    assert "connect_args" not in captured.get("engine_kwargs", {})  # sslMode unset -- plaintext, no DN check
 
 
 def test_build_source_passes_through_the_operator_supplied_ssl_server_cert_dn_unchanged(monkeypatch):
-    # WS9 judge review K6: the DN is OPERATOR-SUPPLIED, never synthesized
+    # The DN is OPERATOR-SUPPLIED, never synthesized
     # from spec["host"] -- python-oracledb matches the FULL certificate
     # DN, so a real multi-component subject (OU=/O=/C=, not just CN=)
     # must pass through exactly as the operator wrote it.
@@ -72,7 +72,7 @@ def test_build_source_passes_through_the_operator_supplied_ssl_server_cert_dn_un
 
 
 def test_build_source_refuses_tls_with_no_ssl_server_cert_dn_stating_why(monkeypatch):
-    # WS9 judge review K6: refuse, never silently connect with TLS
+    # Refuse, never silently connect with TLS
     # negotiated but the server's identity unverified.
     monkeypatch.setattr("dispar_orchestrate.adapters.oracle.sql_database", lambda **_: pytest.fail("must not be called"))
     with pytest.raises(OracleTlsConfigError, match="cannot be verified when connecting by IP"):
@@ -92,7 +92,7 @@ def test_build_source_refuses_tls_with_no_ssl_server_cert_dn_stating_why(monkeyp
 
 
 def test_build_source_wraps_the_call_in_checking_resolver(monkeypatch):
-    # K2: belt-and-suspenders regardless of which resolver mechanism
+    # Belt-and-suspenders regardless of which resolver mechanism
     # thin mode uses internally -- proven by asserting the module's
     # build_source body actually enters ssrf_guard.checking_resolver.
     entered = []
@@ -116,7 +116,7 @@ def test_build_source_wraps_the_call_in_checking_resolver(monkeypatch):
 
 
 def test_build_source_never_interpolates_the_password_into_a_dsn_string(monkeypatch):
-    # WS3 Task F2 (Z13)'s precedent: structured credentials dict, never
+    # Structured credentials dict, never
     # an interpolated "oracle+oracledb://user:pass@host/db" DSN string.
     captured = {}
     monkeypatch.setattr("dispar_orchestrate.adapters.oracle.sql_database", lambda **kwargs: captured.update(kwargs) or "src")

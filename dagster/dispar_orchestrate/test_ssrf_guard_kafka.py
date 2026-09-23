@@ -1,6 +1,5 @@
-"""Tests for `ssrf_guard_kafka.check_all_advertised_brokers` (WS9 plan
-Task C1). Covers the exact scenario the task brief names: a fake
-metadata response advertising an internal address for one of the
+"""Tests for `ssrf_guard_kafka.check_all_advertised_brokers`. Covers a
+fake metadata response advertising an internal address for one of the
 cluster's brokers, distinct from the (public) bootstrap host.
 
 No network: `resolve_checked` is faked per-test rather than resolving
@@ -72,7 +71,7 @@ def test_check_all_advertised_brokers_refuses_before_any_fetch_is_attempted():
 
 
 def test_check_all_advertised_brokers_refuses_an_advertised_host_shaped_for_injection():
-    # WS3 Task A3/F2 (Z13)'s _validate_hostname rule, reused here: an
+    # `_validate_hostname`'s rule (from `adapters/sql.py`), reused here: an
     # advertised address is server-supplied text and must be
     # hostname-shaped before it is even resolved.
     metadata = BrokerMetadata(brokers=[("broker;evil=1", 9092)])

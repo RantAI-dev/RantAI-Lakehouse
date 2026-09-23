@@ -1,6 +1,6 @@
-"""Tests for `ssrf_guard_sftp.PinnedHostKeyPolicy` (WS9 plan Task C3).
+"""Tests for `ssrf_guard_sftp.PinnedHostKeyPolicy`.
 
-Covers the exact refusal this task exists for: a `paramiko.MissingHostKeyPolicy`
+Covers the exact refusal this module exists for: a `paramiko.MissingHostKeyPolicy`
 that verifies against an operator-pinned fingerprint and never falls back to
 `AutoAddPolicy`'s trust-on-first-use behaviour.
 
@@ -51,7 +51,7 @@ def test_pinned_host_key_policy_refuses_a_mismatched_fingerprint():
 
 def test_pinned_host_key_policy_refuses_when_no_fingerprint_was_pinned():
     # A blank/empty expected fingerprint must never be treated as "accept
-    # anything" -- SftpDial.hostKeyFingerprint is a REQUIRED field (Task A2)
+    # anything" -- SftpDial.hostKeyFingerprint is a REQUIRED field
     # precisely so there is no code path that connects without one; this
     # guard must fail closed even if that invariant were ever violated
     # upstream, not warn-and-continue.

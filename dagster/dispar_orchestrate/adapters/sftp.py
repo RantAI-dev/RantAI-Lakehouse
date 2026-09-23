@@ -1,12 +1,11 @@
 """dagster/dispar_orchestrate/adapters/sftp.py -- hand-written over
-`paramiko` (no dlt filesystem source speaks SFTP; WS3's `files.py` is
-s3fs/S3-only -- WS9 plan Correction 5). Host-key verification uses
+`paramiko` (no dlt filesystem source speaks SFTP; `adapters/files.py` is
+s3fs/S3-only). Host-key verification uses
 `ssrf_guard_sftp.PinnedHostKeyPolicy` -- never `paramiko.AutoAddPolicy`.
-Auth is `password` or `public_key` (secret_map.py's ("sftp","*") rows,
-Task C4); a passphrase-protected private key is out of scope this
-workstream (Open Questions).
+Auth is `password` or `public_key` (secret_map.py's ("sftp","*") rows);
+a passphrase-protected private key is out of scope for this adapter.
 
-SSRF (WS9 plan hard requirement 1): `resolve_checked` validates
+SSRF: `resolve_checked` validates
 `dial.host` before anything connects, but that alone is only a
 name-shaped pre-check -- it proves nothing about the address the
 driver actually dials, because `paramiko.SSHClient.connect` resolves
@@ -23,8 +22,9 @@ would connect the checked name to a different, unchecked address).
 resolution is forced to return the SAME address `resolve_checked`
 already validated -- see `pinned_resolution`'s own doc comment for why
 this is safe under this build's one-connector-per-run concurrency
-model. Unlike Kafka/MongoDB (Tasks C1/C2), SFTP makes exactly one
-connection per run, so a single `pinned_resolution` scope around
+model. Unlike Kafka/MongoDB (`ssrf_guard_kafka.py`/`ssrf_guard_mongo.py`),
+SFTP makes exactly one connection per run, so a single
+`pinned_resolution` scope around
 `connect()` covers the whole guarded surface; there is no reconnect-to-
 a-different-host case here for `checking_resolver`'s wider net to
 close.
@@ -102,8 +102,9 @@ def build_source(
     SFTP directory.
 
     `_validate_hostname` and `resolve_checked` both run BEFORE any
-    connection attempt (WS3 Task F2/A3 (Z13)'s canonical hostname-shape
-    check, imported rather than re-implemented -- see kafka.py/mongodb.py
+    connection attempt (the canonical hostname-shape
+    check from `adapters/sql.py`, imported rather than re-implemented --
+    see `ssrf_guard_kafka.py`/`ssrf_guard_mongo.py`
     for the same pattern) -- a rejected or blocked dial never constructs
     a `paramiko.SSHClient` at all (see this module's
     `test_build_source_checks_the_host_before_connecting`). The actual

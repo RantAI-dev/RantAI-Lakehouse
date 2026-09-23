@@ -262,12 +262,11 @@ def test_run_one_object_routes_a_postgres_driver_sql_connector_through_dlt_pipel
     assert recorded[0]["rows"] == 42
 
 
-# ── run_kafka_stream_batch (WS9 plan Task D4) ────────────────────────────
+# ── run_kafka_stream_batch ────────────────────────────────────────────────
 #
-# `consumer` is passed explicitly as a fake -- the plan's own hard
-# requirement ("fake the consumer/driver", WS9 plan Task D4 instructions)
-# -- so no real `KafkaConsumer` is ever constructed and no network is
-# touched. `consume_one_batch`/`load_via_sink`/`record_ingest_offset` are
+# `consumer` is passed explicitly as a fake -- these are unit tests, so no
+# real `KafkaConsumer` is ever constructed and no network is touched.
+# `consume_one_batch`/`load_via_sink`/`record_ingest_offset` are
 # monkeypatched by their bare (imported) names in `ingest_factory`'s own
 # module namespace, the same style `test_run_one_object_*` above already
 # uses for `_ADAPTERS`/`secret_resolver`/`sink_adapter`.

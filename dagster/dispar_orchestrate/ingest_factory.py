@@ -308,8 +308,8 @@ def run_kafka_stream_batch(
     consumer: "KafkaConsumer | None" = None,
 ) -> None:
     """One scheduled micro-batch for a `kafka`-adapter, `ingest_mode='stream'`
-    connector (WS9 plan Task D4). At-least-once, stated explicitly (hard
-    requirement 3): `consume_one_batch` returns rows plus the last offset
+    connector. At-least-once, stated explicitly:
+    `consume_one_batch` returns rows plus the last offset
     seen per partition, WITHOUT committing anything. This function calls
     `load_via_sink` on those rows FIRST -- and only once that write
     succeeds does it commit the batch's offsets, both to Kafka's own

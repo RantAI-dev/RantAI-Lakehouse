@@ -78,7 +78,7 @@ def test_record_ingest_run_defaults_error_to_empty_string(monkeypatch):
     assert insert.rstrip().endswith("'')")
 
 
-# ── record_ingest_offset / last_committed_offset (WS9 plan Task A1/D4) ──
+# ── record_ingest_offset / last_committed_offset ─────────────────────────
 
 
 def test_record_ingest_offset_creates_the_table_and_inserts_a_row(monkeypatch):
