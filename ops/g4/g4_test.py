@@ -63,7 +63,7 @@ CH_OAUTH_SERVER_URI = os.environ.get("CH_OAUTH_SERVER_URI", "")
 # gate script is a standalone entrypoint), matching this file's existing
 # precedent of duplicating ch_query/_wait_for from the same source.
 API_URL = os.environ.get("API_URL", "http://lakehouse-api:8089")
-# WS8 plan Task H2: oidc-mock's /authorize + /token endpoints that
+# oidc-mock's /authorize + /token endpoints that
 # step_oidc_authorization_code_round_trip drives lakehouse-api's
 # /api/auth/oidc/{start,callback} against. Mirrors this file's existing
 # `API_URL` env-var-with-default pattern, not a new style.
@@ -496,10 +496,10 @@ def step_wal_breach_produces_a_silenceable_alert_instance() -> None:
 
 
 def step_oidc_authorization_code_round_trip() -> None:
-    """WS8 plan Task H2 (grand plan §10 acceptance): drive a full
-    authorization-code + PKCE login through lakehouse-api's real
-    /api/auth/oidc/{start,callback} routes against oidc-mock's Task A1
-    /authorize + authorization_code /token addition — not a mocked HTTP
+    """Drive a full authorization-code + PKCE login through lakehouse-api's
+    real /api/auth/oidc/{start,callback} routes against oidc-mock's
+    /authorize + authorization_code /token support (ops/oidc-mock/server.py)
+    — not a mocked HTTP
     layer, a real three-hop redirect chain over `requests.Session` so
     cookies persist exactly as a browser's would. A separate `Session`
     from this file's module-level `API` (used by step_login and every
@@ -527,7 +527,7 @@ def step_oidc_authorization_code_round_trip() -> None:
     if not flow_cookie:
         raise G4Failure("lh_oidc_flow cookie was not set by /start")
 
-    # Hop 2: oidc-mock's Task A1 /authorize. A browser would GET it, be
+    # Hop 2: oidc-mock's /authorize. A browser would GET it, be
     # served a login-screen stand-in whose hidden fields carry the OIDC
     # request parameters, and POST those back with the chosen identity —
     # so this test does the same. Posting `login_hint` alone would submit
@@ -567,7 +567,7 @@ def step_oidc_authorization_code_round_trip() -> None:
     # Hop 3: lakehouse-api's callback exchanges the code (PKCE verifier
     # from the flow cookie, never re-sent by the client), verifies the id
     # token (signature/iss/aud/exp/nbf/nonce via
-    # OidcAuthenticator::authenticate_with_nonce, Task A3), and mints a
+    # OidcAuthenticator::authenticate_with_nonce), and mints a
     # real session.
     callback = session.get(callback_url, allow_redirects=False, timeout=10)
     if callback.status_code != 302:

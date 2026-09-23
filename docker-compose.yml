@@ -2266,13 +2266,13 @@ services:
         condition: service_started
       dagster-webserver:
         condition: service_healthy
-      # WS8 plan Task H2: step_oidc_authorization_code_round_trip drives
-      # oidc-mock's /authorize + /token directly. Unlike the plan text's
-      # claim, oidc-mock DOES have its own healthcheck (this file's
-      # `oidc-mock` service block, `.well-known/openid-configuration`
-      # polled every 5s) — `lakekeeper`'s own `depends_on: oidc-mock:
-      # condition: service_healthy` above is the precedent this follows,
-      # in preference to the plan's `service_started`.
+      # g4_test.py's step_oidc_authorization_code_round_trip drives
+      # oidc-mock's /authorize + /token directly, so it must be up and
+      # actually ready, not merely started. oidc-mock DOES have its own
+      # healthcheck (this file's `oidc-mock` service block,
+      # `.well-known/openid-configuration` polled every 5s) —
+      # `lakekeeper`'s own `depends_on: oidc-mock: condition:
+      # service_healthy` above is the precedent this follows.
       oidc-mock:
         condition: service_healthy
     environment:
@@ -2307,7 +2307,7 @@ services:
       # g4_test.py's step_login authenticates as a human bootstrap admin,
       # not a service principal.
       ALERTS_RUN_TOKEN: ${ALERTS_RUN_TOKEN:-}
-      # WS8 plan Task H2 -- step_oidc_authorization_code_round_trip talks
+      # g4_test.py's step_oidc_authorization_code_round_trip talks
       # to oidc-mock directly to assert lakehouse-api's /start redirected
       # it there. Matches g4_test.py's own default, set explicitly per
       # this file's existing convention (every other constant above is
@@ -2321,9 +2321,9 @@ services:
       # are `lakehouse-api`'s OWN service config, read by that container's
       # process env only -- setting a key in THIS service's `environment:`
       # block has no effect on a sibling container's env, Compose has no
-      # cross-service environment inheritance. This task's file-ownership
-      # boundary (WS8 Phase H, Task H2) covers only this service block,
-      # not `lakehouse-api`'s (`docker-compose.yml:80-`); of the four,
+      # cross-service environment inheritance. This g4-test-runner service
+      # block's `environment:` covers only itself, not `lakehouse-api`'s
+      # (`docker-compose.yml:80-`); of the four,
       # only `OIDC_ROLE_MAP` already has a matching `${OIDC_ROLE_MAP:-}`
       # reference on that block (`:208`), so setting it in the shell/.env
       # already reaches `lakehouse-api` without editing this file further

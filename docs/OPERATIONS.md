@@ -615,9 +615,10 @@ procedure above applies here — `--clean` drops existing objects before
 recreating them, so verify a dump against a throwaway database name
 before trusting it against the live one.
 
-## Upgrade note: set `CATALOG_TENANT_ID` before deploying WS8
+## Upgrade note: set `CATALOG_TENANT_ID` before deploying multi-tenant admin support
 
-WS8 makes every tenant-scoped list fail closed. Two surfaces cannot be
+Migration `0042_tenant_provisioning.sql` and its route-level tenant scoping
+make every tenant-scoped list fail closed. Two surfaces cannot be
 filtered per tenant, because nothing in the schema associates them with one:
 
 - **the catalog** — `bronze_meta.dataset_catalog` has six columns (`slug`,

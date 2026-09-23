@@ -1,5 +1,4 @@
-"""Unit tests for oidc-mock's authorization-code + PKCE addition (WS8 plan
-Phase A).
+"""Unit tests for oidc-mock's authorization-code + PKCE support.
 
 No network, per AGENTS.md's Python rules: these import `server.py` and call
 `mint_authorization_code`/`exchange_authorization_code` directly, which is

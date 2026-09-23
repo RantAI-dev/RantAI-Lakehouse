@@ -119,7 +119,7 @@ PRINCIPALS = [
 # `/token`. PR #33 review, blocker 2.
 TOKEN_ENDPOINT_PRINCIPALS = [p for p in PRINCIPALS if p != "admin"]
 
-# ── Human test principals + authorization-code/PKCE flow (WS8 plan) ──────
+# ── Human test principals + authorization-code/PKCE flow ─────────────────
 # Distinct from PRINCIPALS above (every entry there is a machine identity
 # a compose service authenticates as via client-credentials). These two
 # are the only identities /authorize will ever mint a code for — g2/g4's
@@ -331,7 +331,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8")
         form = urllib.parse.parse_qs(body)
-        # Authorization-code + PKCE branch (WS8 plan): the browser login
+        # Authorization-code + PKCE branch: the browser login
         # round trip started by GET/POST /authorize above lands here.
         # Checked before the client-credentials branch below since the two
         # grants share this one endpoint but nothing else.
