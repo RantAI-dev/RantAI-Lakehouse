@@ -24,11 +24,13 @@ import { ServiceError } from "../errors";
  * ConnectorService is real — connector definitions (source/sink) go through
  * the `/api/connectors` route, backed by Postgres (`lakehouse-store`, Task 2.7).
  *
- * CREDENTIAL NOTE: `CreateConnectorInput.secretRef` is a REFERENCE to where a
- * credential is stored (an env var name, a secret-manager path) — not the
- * credential value itself. The backend never stores, returns, logs, or
- * displays a credential value; `Connector`/`ConnectorDetail` do not even have
- * a field for one.
+ * CREDENTIAL NOTE: `CreateConnectorInput.credential` (ADR 0002 Addendum 3)
+ * chooses a source/kind, never a reference NAME — the server derives the
+ * actual reference (where a credential is stored: an env var name, a
+ * secret-manager path) from the id it generates, and returns it once in
+ * `CreateConnectorResponse.credential`. The backend never stores, returns,
+ * logs, or displays a credential VALUE; `Connector`/`ConnectorDetail` do not
+ * even have a field for one.
  *
  * `testConnection` here NOW performs a real network probe — but only for
  * PostgreSQL and S3-compatible object storage, the only two types this build

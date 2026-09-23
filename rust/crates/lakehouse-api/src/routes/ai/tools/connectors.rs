@@ -43,9 +43,9 @@ pub(super) async fn list_connectors(state: &AppState) -> Value {
 
 /// Builds the exact `POST /api/connectors` JSON body from the tool's args
 /// (the schema's property names already match `CreateConnectorBody`'s
-/// `camelCase` fields byte-for-byte: `secretRef`, `secretRefSecondary`, ...)
-/// and calls the route handler directly — this is what applies the
-/// raw-credential refusal without a second copy of that check.
+/// `camelCase` fields byte-for-byte: `name`, `type`, `direction`, `host`,
+/// `credential`, ...) and calls the route handler directly — this is what
+/// applies the legacy-field refusal without a second copy of that check.
 ///
 /// `principal` is forwarded as `Option<Extension<Principal>>`, the same
 /// re-wrapping `routes::ai::tools::queries::run_saved_query` already does

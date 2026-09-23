@@ -274,14 +274,18 @@ impl SecretResolver for EnvSecretResolver {
 /// list is a fixed Rust constant, not caller input, so a malformed pattern
 /// is a programmer error caught by `debug_assert!`, not a runtime `Result`.
 ///
-/// `pub`, not `pub(crate)`: `lakehouse_api::routes::connectors`'s
-/// `reject_allowlisted_secret_ref` ("who may NAME a reserved ref") and
-/// `lakehouse_api::state`'s `AllowlistedSecretResolver` ("which refs may
-/// RESOLVE") must check the exact same patterns the exact same way, or the
-/// two checks drift apart the way `0023_connector_dedicated_secret_refs.sql`'s
-/// header describes happening to the old exact-list version (WS3 plan review
-/// X1). Exporting this function is what makes "same matcher" checkable
-/// across the crate boundary rather than merely asserted in a comment.
+/// `pub`, not `pub(crate)`: `lakehouse_api::state`'s
+/// `AllowlistedSecretResolver` ("which refs may RESOLVE") checks these
+/// patterns directly, and `lakehouse_store::connectors::derive_secret_ref`
+/// ("which refs a user-created connector's own id can ever produce", ADR
+/// 0002 Addendum 3) is unit-tested against the identical pattern shapes
+/// (mirrored as a literal there, since `lakehouse-store` cannot depend on
+/// `lakehouse-api`) — both must stay the exact same patterns the exact
+/// same way, or the two drift apart the way
+/// `0023_connector_dedicated_secret_refs.sql`'s header describes happening
+/// to the old exact-list version (WS3 plan review X1). Exporting this
+/// function is what makes "same matcher" checkable across the crate
+/// boundary rather than merely asserted in a comment.
 #[must_use]
 pub fn pattern_matches(pattern: &str, value: &str) -> bool {
     let mut parts = pattern.splitn(3, '*');
