@@ -301,6 +301,10 @@ fn connectors_router() -> Router<AppState> {
             get(connectors::probe_history),
         )
         .route(
+            "/api/connectors/{id}/secret",
+            axum::routing::put(connectors::rotate_secret),
+        )
+        .route(
             "/api/connectors/{id}/discover",
             axum::routing::post(connectors::discover),
         )

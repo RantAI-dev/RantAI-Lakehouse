@@ -42,7 +42,7 @@
 //! resolved value; it only ever reports whether the dial succeeded, how
 //! long it took, and a human-readable message.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use time::OffsetDateTime;
 
@@ -888,6 +888,128 @@ pub async fn record_test_result(
         message: message.to_owned(),
         tested_at: iso_opt(tested_at),
     })
+}
+
+/// Which of a connector's two credential slots [`swap_secret_ref`]
+/// targets. Mirrors `RotateConnectorSecretRequest["slot"]` in
+/// `contracts/connectors.ts`.
+///
+/// `secret_ref` (primary) is `NOT NULL` (`0013_connectors.sql`);
+/// `secret_ref_secondary` is nullable (`0021_connector_dial_columns.sql`
+/// — see [`ConnectorDialInfo::secret_ref_secondary`]'s doc comment), so
+/// only [`Self::Secondary`] can ever legitimately have `None` as the
+/// "current" value [`swap_secret_ref`]'s `expected_old` compares against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretSlot {
+    /// `connector.secret_ref`.
+    Primary,
+    /// `connector.secret_ref_secondary`.
+    Secondary,
+}
+
+impl SecretSlot {
+    /// The lowercase label this slot is recorded under -- e.g. in an
+    /// audit event's `args` (`lakehouse-api`'s `connector_audit_event`,
+    /// action `connector.secret_rotate`). Matches this enum's own
+    /// `#[serde(rename_all = "lowercase")]` wire form; kept as an
+    /// explicit method rather than round-tripping the value through
+    /// `serde_json::to_value` at every call site that only wants the
+    /// label.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Secondary => "secondary",
+        }
+    }
+}
+
+/// Conditionally rotate one of a connector's two credential REFERENCE
+/// NAMES (never a credential value -- see the module doc comment) from
+/// `expected_old` to `new_ref`.
+///
+/// This is an optimistic-concurrency compare-and-swap: the `UPDATE` only
+/// takes effect `WHERE id = $2 AND <col> IS NOT DISTINCT FROM
+/// expected_old`, so a caller who read the connector's current ref, then
+/// lost a race with a second rotation of the same slot before this call
+/// lands, gets [`StoreError::Conflict`] instead of silently clobbering a
+/// rotation it never observed.
+///
+/// This function does NOT verify that `new_ref` resolves to a working
+/// credential -- that is the caller's job, BEFORE calling this at all.
+/// `lakehouse-api`'s `routes::connectors::rotate_secret` runs a real
+/// connectivity probe (the same one `POST .../test` uses, via the same
+/// allowlisted resolver) against a candidate built with `new_ref` in
+/// place, and only calls this function once that probe reports
+/// `supported: true, ok: true` -- see that handler's doc comment for why
+/// the probe result itself is never persisted as
+/// `connector_probe_result` history here (it tested a credential the
+/// connector was not yet using when the probe ran).
+///
+/// `<col>` is picked by matching [`SecretSlot`] between two constant SQL
+/// string literals below -- `format!` is not used at all in this
+/// function, so there is no identifier interpolation to audit against
+/// AGENTS.md's "format! only for constant identifiers" rule in the first
+/// place.
+///
+/// # Zero rows: connector gone vs. ref changed since read
+///
+/// A single conditional `UPDATE` cannot itself distinguish "no such
+/// connector" from "the connector exists but its current ref no longer
+/// equals `expected_old`" -- both leave `rows_affected() == 0`. Rather
+/// than wrapping the whole call in a `SELECT ... FOR UPDATE` transaction
+/// (which would need to hold a row lock across the caller's earlier
+/// probe too, to actually close the race, at the cost of serializing
+/// every rotation attempt against that connector behind a lock held for
+/// the probe's `DIAL_TIMEOUT`), this runs a second, cheap query ONLY on
+/// the zero-rows path: if the row is now absent, [`StoreError::NotFound`];
+/// if it is still present (so the `IS NOT DISTINCT FROM` comparison is
+/// what failed the `WHERE` clause), [`StoreError::Conflict`]. Two
+/// round-trips only on the rare zero-rows path -- the common (one-row)
+/// success path is a single statement.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `id` does not name a connector.
+/// Returns [`StoreError::Conflict`] if `id` names a connector but its
+/// current value in slot `slot` no longer equals `expected_old`. Returns
+/// [`StoreError::Database`] on any other failure.
+pub async fn swap_secret_ref(
+    pool: &PgPool,
+    id: &str,
+    slot: SecretSlot,
+    expected_old: Option<&str>,
+    new_ref: &str,
+) -> Result<(), StoreError> {
+    let sql = match slot {
+        SecretSlot::Primary => {
+            "UPDATE connector SET secret_ref = $1 WHERE id = $2 AND secret_ref IS NOT DISTINCT FROM $3"
+        }
+        SecretSlot::Secondary => {
+            "UPDATE connector SET secret_ref_secondary = $1 WHERE id = $2 AND secret_ref_secondary \
+             IS NOT DISTINCT FROM $3"
+        }
+    };
+    let result = sqlx::query(sql)
+        .bind(new_ref)
+        .bind(id)
+        .bind(expected_old)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() > 0 {
+        return Ok(());
+    }
+    // Zero rows: figure out which of the two honest reasons applies --
+    // see the doc comment above.
+    let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM connector WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    match exists {
+        Some(_) => Err(StoreError::Conflict),
+        None => Err(StoreError::NotFound),
+    }
 }
 
 /// Everything `dagster/dispar_orchestrate/ingest_factory.py` needs to build

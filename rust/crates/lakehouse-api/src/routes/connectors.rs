@@ -490,6 +490,218 @@ pub struct ProbeHistoryResponse {
     results: Vec<ConnectorProbeResult>,
 }
 
+/// The `PUT /api/connectors/{id}/secret` body. Mirrors
+/// `RotateConnectorSecretRequest` in `contracts/connectors.ts`.
+///
+/// `deny_unknown_fields`: a caller-supplied field this shape does not
+/// name (e.g. a typo, or a stray `secretValue` a caller confused this
+/// with the actual credential) fails the request rather than being
+/// silently ignored — this route's whole point is precise control over
+/// which slot gets rewritten, so a misspelled field should never
+/// silently no-op.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RotateSecretBody {
+    /// Which of the connector's two credential slots to rotate.
+    slot: connectors::SecretSlot,
+    /// The NAME of an already-provisioned credential reference (e.g.
+    /// `"env:CONNECTOR_PG_PASSWORD_V2"`) — never a credential value. Must
+    /// already resolve through [`AppState::connector_secret_resolver`]
+    /// (the same allowlisted resolver `POST .../test` uses): this route
+    /// does not provision a new secret, it only points the connector at
+    /// one that already exists.
+    new_secret_ref: String,
+}
+
+/// The `PUT /api/connectors/{id}/secret` response body.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RotateSecretResponse {
+    /// Always `true` — this route either rotates the slot or returns an
+    /// error; there is no partial/pending state to report.
+    rotated: bool,
+    /// Echoes back which slot was rotated.
+    slot: connectors::SecretSlot,
+}
+
+/// `PUT /api/connectors/{id}/secret` — rotate one of a connector's two
+/// credential REFERENCE NAMES (never a credential value), PROBE-FIRST.
+///
+/// # Why probe before swap
+///
+/// The request names a credential reference that must already be
+/// provisioned (an env var, a secret-manager path) — this route never
+/// carries or accepts a secret value itself. Accepting that name and
+/// writing it straight onto the connector row would let a typo, a
+/// not-yet-provisioned ref, or a ref for the wrong host silently break
+/// every future dial of this connector, discovered only the next time
+/// something tries to use it. So this handler builds an in-memory COPY
+/// of the connector's dial info with `newSecretRef` swapped into the
+/// requested slot, runs a REAL connectivity probe against that copy
+/// using the SAME [`crate::connector_probe::probe`], the same
+/// [`AppState::connector_secret_resolver`], and the same
+/// `connector_probe_allow_internal_hosts` flag [`test_connection`]
+/// uses — nothing is written to the database until that probe reports
+/// `supported: true, ok: true`.
+///
+/// Using the SAME allowlisted resolver as `POST .../test` is deliberate,
+/// not incidental: [`AppState::connector_secret_resolver`] refuses to
+/// resolve any ref outside [`crate::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS`]
+/// (`NotAllowed`), so a `newSecretRef` naming, say, the deployment's own
+/// `env:DATABASE_URL` fails the probe as a misconfiguration, not as a
+/// resolved-and-dialed credential — the exact SSRF/exfiltration
+/// boundary [`create`]'s `reject_allowlisted_secret_ref` check already
+/// enforces at write time, held here too.
+///
+/// # Why the probe result is never persisted as history
+///
+/// [`connectors::record_test_result`] (and the
+/// [`connector_probe_result`] history row it writes) exist to record
+/// what happened when the connector's CURRENT, in-use credential was
+/// dialed. The probe this handler runs dials a credential the connector
+/// is NOT using yet — recording that as connector history would make
+/// `GET .../probe-history` show a "successful test" against a ref the
+/// connector had never actually been configured with at the time,
+/// which is not what that endpoint promises its readers. So this
+/// handler calls [`crate::connector_probe::probe`] directly and never
+/// [`connectors::record_test_result`]; `connector.health`/`lastTestAt`
+/// and the probe-history table are both left exactly as they were.
+///
+/// # Errors
+///
+/// 400 on a malformed body, a blank `newSecretRef`, a `newSecretRef`
+/// shaped like a raw credential (see
+/// [`connectors::looks_like_raw_secret`]), or a `newSecretRef` naming
+/// one of the deployment's own reserved connector-credential patterns
+/// (see [`reject_allowlisted_secret_ref`]); 404 if `id` is unknown; 422
+/// if the connector's type is either unsupported by this build's probe
+/// (a rotation can never be verified, so it is never applied) or the
+/// probe genuinely fails against the candidate credential; 409 if the
+/// connector's current ref in that slot changed between this handler's
+/// read and its write (someone else rotated it first — reload and
+/// retry); 503/500 as every other connector route.
+pub async fn rotate_secret(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<RotateSecretResponse>> {
+    let body: RotateSecretBody = parse_body(&body)?;
+    let new_secret_ref = required("newSecretRef", &body.new_secret_ref)?;
+    if connectors::looks_like_raw_secret(&new_secret_ref) {
+        return Err(ApiError::BadRequest(
+            "newSecretRef must be a reference to a credential (e.g. \"env:MY_SECRET\" or \
+             \"vault:secret/data/...\"), not the credential itself"
+                .to_owned(),
+        )
+        .into());
+    }
+    reject_allowlisted_secret_ref("newSecretRef", &new_secret_ref)?;
+
+    let dial_info = connectors::get_connector_dial_info(pool(&state)?, &id).await?;
+    let Some(dial_info) = dial_info else {
+        return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
+    };
+
+    // The value read here, BEFORE the probe, is what `swap_secret_ref`
+    // compares against at write time — closing the race between this
+    // read and that write, not just between two callers of this route.
+    let expected_old = match body.slot {
+        connectors::SecretSlot::Primary => Some(dial_info.secret_ref.clone()),
+        connectors::SecretSlot::Secondary => dial_info.secret_ref_secondary.clone(),
+    };
+
+    let mut candidate = dial_info.clone();
+    match body.slot {
+        connectors::SecretSlot::Primary => candidate.secret_ref = new_secret_ref.clone(),
+        connectors::SecretSlot::Secondary => {
+            candidate.secret_ref_secondary = Some(new_secret_ref.clone());
+        }
+    }
+
+    let outcome = crate::connector_probe::probe(
+        &candidate,
+        state.connector_secret_resolver.as_ref(),
+        state.config.connector_probe_allow_internal_hosts,
+    )
+    .await;
+
+    if !outcome.supported {
+        // 422, not 409: nothing about this connector's STATE conflicts
+        // with the request — this build simply cannot verify ANY
+        // rotation for this connector type, so one is never applied
+        // unverified. `test_connection` reports the identical
+        // `supported: false` case as 200 (it is that route's whole
+        // successful, honest response shape); here it must fail the
+        // request instead, since the caller asked for a WRITE this
+        // handler cannot safely perform.
+        return Err(ApiError::Unprocessable(format!(
+            "connector {id}'s type cannot be probed by this build, so a secret rotation \
+             cannot be verified and was NOT applied: {}",
+            outcome.message
+        ))
+        .into());
+    }
+    if !outcome.ok {
+        // 422: the candidate credential itself does not work — the
+        // probe's own classified message is already safe to surface
+        // (see `connector_probe`'s module doc comment: never raw
+        // upstream `Display` text).
+        return Err(ApiError::Unprocessable(outcome.message).into());
+    }
+
+    match connectors::swap_secret_ref(
+        pool(&state)?,
+        &id,
+        body.slot,
+        expected_old.as_deref(),
+        &new_secret_ref,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(lakehouse_store::StoreError::NotFound) => {
+            return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
+        }
+        Err(lakehouse_store::StoreError::Conflict) => {
+            return Err(ApiError::Conflict(
+                "the secret ref changed since it was read; reload and retry".to_owned(),
+            )
+            .into());
+        }
+        Err(err) => return Err(ApiError::from(err).into()),
+    }
+
+    // Matches this file's established audit convention (`create`,
+    // `test_connection`, `delete`): only a SUCCESSFUL mutation is
+    // audited here, best-effort, never turning a completed rotation into
+    // an error response. A refused attempt (bad body, unsupported type,
+    // failed probe, stale expected_old) is reported to the caller via
+    // its error response alone, exactly as every other refusal on this
+    // file's routes is -- none of `create`/`test_connection`/`delete`
+    // record a refusal either.
+    //
+    // `args` names the slot and that the probe succeeded — NEVER the old
+    // or new ref name (WS5 item D3's rule for this whole file: a
+    // reference name is not this row's business to repeat, even though
+    // it is not itself a credential value).
+    let event = connector_audit_event(
+        &principal,
+        "connector.secret_rotate",
+        &id,
+        json!({ "slot": body.slot.as_str(), "probeOk": true }),
+        "executed",
+    );
+    if let Err(err) = store_audit::insert(pool(&state)?, event).await {
+        tracing::warn!(%err, connector_id = %id, "failed to record connector.secret_rotate audit event");
+    }
+
+    Ok(ApiJson(RotateSecretResponse {
+        rotated: true,
+        slot: body.slot,
+    }))
+}
+
 /// `?schema=` query for `POST /api/connectors/{id}/discover`. Required
 /// only for a `sql`/`cdc` adapter connector — see
 /// `crate::connector_discover::discover`'s doc comment.

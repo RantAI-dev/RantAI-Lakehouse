@@ -23,9 +23,9 @@ use lakehouse_store::StoreError;
 use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::connector_probe_result::list_probe_results;
 use lakehouse_store::connectors::{
-    CreateConnectorInput, IngestSpecInput, create_connector, delete_connector, get_connector,
-    get_connector_dial_info, get_ingest_spec, list_connectors, list_ingestible_connectors,
-    record_test_result, set_ingest_spec,
+    CreateConnectorInput, IngestSpecInput, SecretSlot, create_connector, delete_connector,
+    get_connector, get_connector_dial_info, get_ingest_spec, list_connectors,
+    list_ingestible_connectors, record_test_result, set_ingest_spec, swap_secret_ref,
 };
 use lakehouse_store::pipelines::{CreatePipelineInput, create_pipeline};
 use sqlx::PgPool;
@@ -1112,6 +1112,136 @@ async fn deleting_a_connector_cascades_its_probe_history(pool: PgPool) -> sqlx::
     assert!(
         history.is_empty(),
         "deleting the connector must cascade-delete its probe history"
+    );
+    Ok(())
+}
+
+// ---- `swap_secret_ref` ----
+
+/// The success path: `expected_old` matches the connector's current
+/// primary `secret_ref`, so the swap lands and the new value round-trips
+/// back out through `get_connector_dial_info`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn swap_secret_ref_rotates_the_primary_slot_when_expected_old_matches(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = create_connector(&pool, &minimal_input("rotate primary target"))
+        .await
+        .unwrap();
+    let before = get_connector_dial_info(&pool, &created.id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    swap_secret_ref(
+        &pool,
+        &created.id,
+        SecretSlot::Primary,
+        Some(&before.secret_ref),
+        "env:ROTATED_PRIMARY_REF",
+    )
+    .await
+    .unwrap();
+
+    let after = get_connector_dial_info(&pool, &created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.secret_ref, "env:ROTATED_PRIMARY_REF");
+    Ok(())
+}
+
+/// A stale `expected_old` (not the connector's actual current ref) must
+/// be refused as a [`StoreError::Conflict`], and the value on the row
+/// must be left exactly as it was -- the compare-and-swap's whole
+/// purpose.
+#[sqlx::test(migrations = "../../migrations")]
+async fn swap_secret_ref_with_a_stale_expected_old_is_a_conflict_and_leaves_the_value_unchanged(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = create_connector(&pool, &minimal_input("rotate stale target"))
+        .await
+        .unwrap();
+
+    let err = swap_secret_ref(
+        &pool,
+        &created.id,
+        SecretSlot::Primary,
+        Some("env:THIS_IS_NOT_THE_CURRENT_REF"),
+        "env:WOULD_BE_NEW_REF",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Conflict),
+        "expected Conflict, got {err:?}"
+    );
+
+    let after = get_connector_dial_info(&pool, &created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.secret_ref, "env:INGEST_SPEC_TEST_TOKEN",
+        "a failed swap must never touch the stored value"
+    );
+    Ok(())
+}
+
+/// An unknown connector id is [`StoreError::NotFound`], not
+/// [`StoreError::Conflict`] -- the zero-rows disambiguation this function's
+/// doc comment describes.
+#[sqlx::test(migrations = "../../migrations")]
+async fn swap_secret_ref_on_an_unknown_id_is_not_found(pool: PgPool) -> sqlx::Result<()> {
+    let err = swap_secret_ref(
+        &pool,
+        "conn-does-not-exist-at-all",
+        SecretSlot::Primary,
+        Some("env:ANYTHING"),
+        "env:NEW_REF",
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::NotFound), "got {err:?}");
+    Ok(())
+}
+
+/// A connector whose secondary slot has never been set (`NULL`) can still
+/// be rotated by passing `expected_old: None` -- `IS NOT DISTINCT FROM`
+/// (rather than `=`) is what makes a `NULL`-to-`NULL` comparison match.
+#[sqlx::test(migrations = "../../migrations")]
+async fn swap_secret_ref_sets_a_null_secondary_slot_when_expected_old_is_none(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = create_connector(&pool, &minimal_input("rotate secondary target"))
+        .await
+        .unwrap();
+    let before = get_connector_dial_info(&pool, &created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        before.secret_ref_secondary, None,
+        "minimal_input leaves secret_ref_secondary unset"
+    );
+
+    swap_secret_ref(
+        &pool,
+        &created.id,
+        SecretSlot::Secondary,
+        None,
+        "env:NEW_SECONDARY_REF",
+    )
+    .await
+    .unwrap();
+
+    let after = get_connector_dial_info(&pool, &created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.secret_ref_secondary.as_deref(),
+        Some("env:NEW_SECONDARY_REF")
     );
     Ok(())
 }

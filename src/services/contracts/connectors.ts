@@ -75,6 +75,42 @@ export type ProbeHistoryResponse = {
   results: ConnectorProbeResult[]
 }
 
+/**
+ * Which of a connector's two credential slots a
+ * `PUT /api/connectors/{id}/secret` request targets. Mirrors Rust
+ * `SecretSlot` (`rust/crates/lakehouse-store/src/connectors.rs`)
+ * field-for-field, including its lowercase wire form
+ * (`#[serde(rename_all = "lowercase")]`).
+ */
+export type SecretSlot = "primary" | "secondary"
+
+/**
+ * The `PUT /api/connectors/{id}/secret` body. `newSecretRef` NAMES an
+ * already-provisioned credential reference (e.g. `"env:MY_SECRET"`) --
+ * it never carries a secret value itself, same rule as
+ * `CreateConnectorInput.secretRef`. The server runs a real connectivity
+ * probe against a candidate built with this ref BEFORE writing anything
+ * -- see `rust/crates/lakehouse-api/src/routes/connectors.rs::rotate_secret`'s
+ * doc comment for the full probe-first contract, including why an
+ * unverifiable rotation is refused (422) rather than applied
+ * unverified.
+ */
+export type RotateConnectorSecretRequest = {
+  slot: SecretSlot
+  newSecretRef: string
+}
+
+/**
+ * The `PUT /api/connectors/{id}/secret` response body. Mirrors Rust
+ * `RotateSecretResponse` exactly.
+ */
+export type RotateConnectorSecretResponse = {
+  /** Always `true` on a successful (2xx) response -- a refused rotation
+   * is a non-2xx `ServiceError`, never this shape with `rotated: false`. */
+  rotated: boolean
+  slot: SecretSlot
+}
+
 export type CreateConnectorInput = {
   name: string
   type: string
@@ -421,4 +457,14 @@ export interface ConnectorService {
    * clamps) a `limit` outside `1..=200`.
    */
   listProbeHistory(id: string, limit?: number, signal?: AbortSignal): Promise<ProbeHistoryResponse>
+  /**
+   * `PUT /api/connectors/{id}/secret` — probe-first credential-reference
+   * rotation. Rejects (never applies) a rotation this build cannot verify
+   * -- see `RotateConnectorSecretRequest`'s doc comment.
+   */
+  rotateSecret(
+    id: string,
+    body: RotateConnectorSecretRequest,
+    signal?: AbortSignal
+  ): Promise<RotateConnectorSecretResponse>
 }

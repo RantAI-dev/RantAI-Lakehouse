@@ -13,6 +13,8 @@ import type {
   IngestSpec,
   IngestSpecInput,
   ProbeHistoryResponse,
+  RotateConnectorSecretRequest,
+  RotateConnectorSecretResponse,
 } from "../contracts/connectors";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
@@ -124,6 +126,13 @@ export const postgresConnectorService: ConnectorService = {
     return getJson<ProbeHistoryResponse>(
       `/api/connectors/${encodeURIComponent(id)}/probe-history${query}`,
       { signal }
+    );
+  },
+  rotateSecret(id, body: RotateConnectorSecretRequest, signal) {
+    return putJson<RotateConnectorSecretResponse>(
+      `/api/connectors/${encodeURIComponent(id)}/secret`,
+      body,
+      signal
     );
   },
 };
