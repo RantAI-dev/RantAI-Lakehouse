@@ -484,7 +484,7 @@ def test_run_ingest_dispatches_a_stream_mode_kafka_connector_to_run_kafka_stream
     monkeypatch.setattr(
         f.secret_resolver,
         "resolve_secret_ref",
-        lambda ref: {"env:CONNECTOR_KAFKA_USERNAME": "svc-reader", "env:CONNECTOR_KAFKA_PASSWORD": "s3cret"}[ref],
+        lambda ref: {"env:CONNECTOR_KAFKA_PASSWORD": "s3cret"}[ref],
     )
 
     connector = {
@@ -499,15 +499,17 @@ def test_run_ingest_dispatches_a_stream_mode_kafka_connector_to_run_kafka_stream
             "microBatchSeconds": 30,
         },
         "sourceObjects": [{"name": "orders", "target": "orders"}],
-        "secretRef": "env:CONNECTOR_KAFKA_USERNAME",
-        "secretRefSecondary": "env:CONNECTOR_KAFKA_PASSWORD",
+        # The username is the dial's (`auth.username`); only the password is
+        # a secret. This fixture used to carry a second, different username
+        # as a secret ref -- two sources for one value, which disagreed.
+        "secretRef": "env:CONNECTOR_KAFKA_PASSWORD",
     }
     f._run_stream_connector(connector)
 
     assert len(calls) == 1
     assert calls[0]["connector_id"] == "conn-kafka"
     assert calls[0]["spec"] == connector["dial"]
-    assert calls[0]["secrets"] == {"username": "svc-reader", "password": "s3cret"}
+    assert calls[0]["secrets"] == {"password": "s3cret"}
     assert calls[0]["source_objects"] == connector["sourceObjects"]
 
 
@@ -644,3 +646,31 @@ def test_stream_dispatch_returns_without_writing_or_committing_on_an_empty_batch
     assert written == []
     assert committed == []
     assert fake_consumer.commits == []
+
+
+def test_a_sasl_plain_kafka_dial_connects_with_sasl_over_tls_and_its_resolved_password():
+    from dispar_orchestrate.ingest_factory import kafka_security_kwargs
+
+    kwargs = kafka_security_kwargs(
+        {"auth": {"type": "sasl_plain", "username": "ingest"}}, {"password": "not-a-real-secret"}
+    )
+    assert kwargs["security_protocol"] == "SASL_SSL"
+    assert kwargs["sasl_mechanism"] == "PLAIN"
+    assert kwargs["sasl_plain_username"] == "ingest"
+    assert kwargs["sasl_plain_password"] == "not-a-real-secret"
+    assert kwargs["ssl_check_hostname"] is True
+
+
+def test_a_kafka_dial_with_no_auth_connects_in_plaintext():
+    from dispar_orchestrate.ingest_factory import kafka_security_kwargs
+
+    assert kafka_security_kwargs({"auth": {"type": "none"}}, {}) == {"security_protocol": "PLAINTEXT"}
+
+
+def test_an_unknown_kafka_auth_type_is_refused_by_name_without_echoing_secrets():
+    from dispar_orchestrate.ingest_factory import UnsupportedKafkaAuth, kafka_security_kwargs
+
+    with pytest.raises(UnsupportedKafkaAuth) as exc:
+        kafka_security_kwargs({"auth": {"type": "sasl_scram_sha256"}}, {"password": "not-a-real-secret"})
+    assert "not-a-real-secret" not in str(exc.value)
+

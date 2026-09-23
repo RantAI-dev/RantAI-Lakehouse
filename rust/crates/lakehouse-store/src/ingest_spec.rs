@@ -851,13 +851,16 @@ pub fn secret_field_names(
         // its one single-field case (its OTHER auth type, public_key,
         // needs a differently-named field below, which is why sftp is
         // not folded into the `_`-wildcard adapters on this arm).
-        ("sql" | "cdc" | "mongodb", _) | ("sftp", Some("password")) => Some(&["password"]),
+        // Kafka SASL/PLAIN is here too: its username is configuration the
+        // dial carries (`KafkaAuth::SaslPlain { username }`, checked by
+        // `Dial::parse`), so only the password is a secret.
+        ("sql" | "cdc" | "mongodb", _)
+        | ("sftp", Some("password"))
+        | ("kafka", Some("sasl_plain")) => Some(&["password"]),
         ("files", _) => Some(&["accessKey", "secretKey"]),
         ("rest", Some("api_key")) => Some(&["apiKey"]),
         ("rest", Some("bearer")) => Some(&["token"]),
-        // Both need `username` + `password`, coincidentally the same two
-        // names for two unrelated protocols (HTTP Basic and SASL/PLAIN).
-        ("rest", Some("basic")) | ("kafka", Some("sasl_plain")) => Some(&["username", "password"]),
+        ("rest", Some("basic")) => Some(&["username", "password"]),
         ("rest", Some("oauth2_client_credentials")) => Some(&["clientId", "clientSecret"]),
         ("kafka", Some("none")) => Some(&[]),
         ("sftp", Some("public_key")) => Some(&["privateKey"]),
@@ -948,10 +951,10 @@ mod secret_field_tests {
     }
 
     #[test]
-    fn secret_field_names_kafka_sasl_plain_needs_username_and_password() {
+    fn secret_field_names_kafka_sasl_plain_needs_only_the_password() {
         assert_eq!(
             secret_field_names("kafka", Some("sasl_plain")),
-            Some(["username", "password"].as_slice())
+            Some(["password"].as_slice())
         );
     }
 

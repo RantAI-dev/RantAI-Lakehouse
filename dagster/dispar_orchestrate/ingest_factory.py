@@ -407,6 +407,46 @@ def _run_one_object(connector: dict, obj: dict) -> None:
         raise
 
 
+class UnsupportedKafkaAuth(Exception):
+    """The dial names a Kafka auth type this consumer cannot honour. Raised
+    before any connection is attempted."""
+
+
+def kafka_security_kwargs(spec: dict, secrets: dict) -> dict:
+    """The `KafkaConsumer` security settings the dial's `auth` declares.
+
+    A connector declared `sasl_plain` must connect with SASL/PLAIN over TLS;
+    one declared `none` connects in plaintext. Building the consumer without
+    these made every connector plaintext and unauthenticated whatever it
+    declared -- against a permissive broker it would connect without the
+    credentials it had just resolved, and without TLS. TLS here verifies
+    the broker's certificate against its hostname (`ssl_check_hostname`),
+    which still holds under `checking_resolver`: that guard checks each
+    resolved address, it does not replace the name the client connects by.
+
+    Never puts a secret into an error message.
+
+    # Errors
+
+    Raises `UnsupportedKafkaAuth` for any auth type other than `none` and
+    `sasl_plain`, and `KeyError` naming only the missing FIELD if a
+    `sasl_plain` dial lacks its username or the password was not resolved.
+    """
+    auth = spec.get("auth") or {}
+    auth_type = auth.get("type")
+    if auth_type == "none":
+        return {"security_protocol": "PLAINTEXT"}
+    if auth_type == "sasl_plain":
+        return {
+            "security_protocol": "SASL_SSL",
+            "sasl_mechanism": "PLAIN",
+            "sasl_plain_username": auth["username"],
+            "sasl_plain_password": secrets["password"],
+            "ssl_check_hostname": True,
+        }
+    raise UnsupportedKafkaAuth(f"kafka auth type {auth_type!r} is not supported by this consumer")
+
+
 def run_kafka_stream_batch(
     *,
     connector_id: str,
@@ -451,6 +491,7 @@ def run_kafka_stream_batch(
             group_id=spec["groupId"],
             enable_auto_commit=False,
             value_deserializer=lambda v: v,  # raw bytes -- consume_one_batch does its own json.loads
+            **kafka_security_kwargs(spec, secrets),
         )
         consumer.subscribe([spec["topic"]])
     topic = spec.get("topic", "")

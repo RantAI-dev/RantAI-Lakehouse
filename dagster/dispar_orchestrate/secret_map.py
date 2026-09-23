@@ -50,7 +50,10 @@ SECRET_FIELD_NAMES: dict[tuple[str, str | None], tuple[str, ...]] = {
     ("sheets", None): ("serviceAccountJson",),
     ("mongodb", None): ("password",),
     ("kafka", "none"): (),
-    ("kafka", "sasl_plain"): ("username", "password"),
+    # The SASL username is configuration, not a secret: it lives in the dial
+    # (`KafkaAuth::SaslPlain { username }`, rust/crates/lakehouse-store/src/ingest_spec.rs),
+    # which `Dial::parse` already validates at save time. Only the password is a secret.
+    ("kafka", "sasl_plain"): ("password",),
     ("sftp", "password"): ("password",),
     ("sftp", "public_key"): ("privateKey",),
 }

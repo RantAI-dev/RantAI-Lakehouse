@@ -61,8 +61,10 @@ def test_kafka_none_auth_needs_no_secret_at_all() -> None:
     assert secret_field_names("kafka", "none") == ()
 
 
-def test_kafka_sasl_plain_needs_username_and_password() -> None:
-    assert secret_field_names("kafka", "sasl_plain") == ("username", "password")
+def test_kafka_sasl_plain_needs_only_the_password_as_a_secret() -> None:
+    # The username is part of the dial, validated by Dial::parse; asking for
+    # it again as a secret would mean two sources for one value.
+    assert secret_field_names("kafka", "sasl_plain") == ("password",)
 
 
 def test_sftp_password_auth_needs_a_password() -> None:
