@@ -180,6 +180,28 @@ services:
       # bootstrap seeds nothing and the maintenance job's policy fetch
       # fails visibly (401) rather than silently.
       LAKEHOUSE_MAINTENANCE_TOKEN: ${LAKEHOUSE_MAINTENANCE_TOKEN:-}
+      # KNOWN GAP, deliberately not silently patched here: this service's
+      # `Config::lakekeeper_base_url` reads the SAME `LAKEKEEPER_BASE_URI`
+      # var the `lakekeeper` service block below uses for its own
+      # externally-advertised base URI (`.env.example`'s documented
+      # default, `http://localhost:8181` — the host-facing mapping for
+      # local dev). `docs/plans/P5-RESULT.md` §4 measured that same
+      # default as wrong for an in-network REST client:
+      # `AppState::lakekeeper_admin` (this service's `management/v1/*`
+      # client, now that `LAKEKEEPER_ADMIN_TOKEN_FILE` above gives it a
+      # reader) needs `http://lakekeeper:8181`, not `localhost`. Adding a
+      # different default here would collide with `lakekeeper`'s own use
+      # of the identical var name one block below — out of this change's
+      # scope to redesign. Every runner in this file that calls
+      # Lakekeeper's admin API sets `LAKEKEEPER_BASE_URI` to the in-network
+      # name explicitly in its OWN `environment:` block instead of relying
+      # on this shared default (see `g2-test-runner`, `gold-export-test-
+      # runner`); this key only forwards whatever `LAKEKEEPER_BASE_URI`
+      # the shell/.env already sets (previously this service's block did
+      # not reference the var at all, so it was unreachable here even
+      # when set) — empty by default, matching `Config::lakekeeper_base_url`'s
+      # own documented fallback.
+      LAKEKEEPER_BASE_URI: ${LAKEKEEPER_BASE_URI:-}
       # WS3 item 28 (plan review X7) — same shape again —
       # `main::bootstrap_ingest_run_service` seeds an "ingest-run-service"
       # service identity scoped to `ingest:read` ONLY (never
@@ -208,6 +230,20 @@ services:
       OIDC_ROLE_MAP: ${OIDC_ROLE_MAP:-}
       OIDC_GROUPS_CLAIM: ${OIDC_GROUPS_CLAIM:-groups}
       OIDC_CLOCK_SKEW_SECONDS: ${OIDC_CLOCK_SKEW_SECONDS:-60}
+      # `routes::auth::oidc_start`/`oidc_callback` (`/api/auth/oidc/start`
+      # and `/callback`) read these directly from `Config`
+      # (`oidc_authorize_url`/`oidc_token_url`/`oidc_redirect_uri`), not
+      # from `OIDC_ISSUER` above — unset (the default) makes both routes
+      # return 503 ("... is not configured"), confirmed at
+      # `routes/auth.rs`'s `oidc_start`, rather than misbehaving against an
+      # empty string. No default IdP URL belongs here: a real deployment's
+      # authorize/token endpoints are deployment-specific, and this stack's
+      # own `g4-test-runner` points them at `ops/oidc-mock` via its own
+      # env/override (docker-compose.yml's g4-test-runner block), not as a
+      # default on this service.
+      OIDC_AUTHORIZE_URL: ${OIDC_AUTHORIZE_URL:-}
+      OIDC_TOKEN_URL: ${OIDC_TOKEN_URL:-}
+      OIDC_REDIRECT_URI: ${OIDC_REDIRECT_URI:-}
       # ── Bootstrap admin: REQUIRED to be able to log in at all. There is
       #    deliberately no default credential — see docs/OPERATIONS.md. ──
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
@@ -261,8 +297,27 @@ services:
       # access for the upcoming `/api/lakehouse/*` catalog routes. See
       # ADR 0011 Decision 4 for the measured relation grant.
       LAKEKEEPER_READ_TOKEN_FILE: /tokens/lakehouse-api-reader.jwt
+      # `routes::identity::create_tenant`'s provisioning path (`AppState::
+      # lakekeeper_admin`) needs an ADMIN-scoped token, not `gold-export`'s
+      # or `lakehouse-api-reader`'s narrower ones — same mount path
+      # `lakekeeper-authz-init` already uses for its own admin token below,
+      # matching `Config::lakekeeper_admin_token_file`'s default
+      # (`config.rs`). A missing/unreadable file leaves
+      # `AppState::lakekeeper_admin` at `None`, so provisioning degrades to
+      # unavailable rather than this service refusing to boot.
+      LAKEKEEPER_ADMIN_TOKEN_FILE: /tokens/admin.jwt
       GOLD_SOURCE_SCHEMA: ${GOLD_SOURCE_SCHEMA:-serving}
       GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
+      # Same default every `*-init` service in this file uses to compute a
+      # tenant's warehouse prefix/bucket (grep `LAKEHOUSE_WAREHOUSE_BUCKET`
+      # in this file) — read by `routes::identity::provision_tenant` to
+      # build `{bucket}/{slug}/`. Not `:?`: a bucket name is not a
+      # credential, so an unset value degrading to the same literal every
+      # init container already defaults to is safe; what would NOT be safe
+      # is this service and an init container disagreeing on the bucket
+      # name, which is exactly what leaving this unset (rather than typo'd)
+      # avoids.
+      LAKEHOUSE_WAREHOUSE_BUCKET: ${LAKEHOUSE_WAREHOUSE_BUCKET:-lakehouse-warehouse}
       # ── Tenant identity (see `lakehouse-api/src/tenant.rs`) ──
       # Passed through explicitly because otherwise a non-Dispar deployment
       # cannot override them at all. Each resolves to its historical Dispar
@@ -282,11 +337,13 @@ services:
       # without those marts can simply delete this line rather than override it.
       BUILTIN_DASHBOARD_SPEC: /app/specs/builtin-default.json
     volumes:
-      # PR #33 review, should-fix: a single-file subpath mount, not the
-      # whole `lakehouse_oidc_tokens` volume — this service only ever
-      # reads `gold-export.jwt` (LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE above),
-      # so it should not also be able to read `admin.jwt` or any other
-      # principal's token off the shared volume.
+      # PR #33 review, should-fix: single-file subpath mounts, not the
+      # whole `lakehouse_oidc_tokens` volume — this service reads exactly
+      # three principals' tokens (`gold-export.jwt`,
+      # `lakehouse-api-reader.jwt`, and now `admin.jwt` for
+      # `LAKEKEEPER_ADMIN_TOKEN_FILE`/`routes::identity::create_tenant`
+      # above), each its own read-only subpath mount, so it cannot read any
+      # OTHER principal's token off the shared volume.
       - type: volume
         source: lakehouse_oidc_tokens
         target: /tokens/gold-export.jwt
@@ -301,6 +358,16 @@ services:
         target: /tokens/lakehouse-api-reader.jwt
         volume:
           subpath: lakehouse-api-reader.jwt
+        read_only: true
+      # Same single-file subpath shape, for the ADMIN-scoped principal
+      # `LAKEKEEPER_ADMIN_TOKEN_FILE` above names — the same volume subpath
+      # `lakekeeper-authz-init` mints and every other `admin.jwt` reader in
+      # this file already mounts read-only.
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/admin.jwt
+        volume:
+          subpath: admin.jwt
         read_only: true
     restart: unless-stopped
 
@@ -2323,18 +2390,65 @@ services:
       # block has no effect on a sibling container's env, Compose has no
       # cross-service environment inheritance. This g4-test-runner service
       # block's `environment:` covers only itself, not `lakehouse-api`'s
-      # (`docker-compose.yml:80-`); of the four,
-      # only `OIDC_ROLE_MAP` already has a matching `${OIDC_ROLE_MAP:-}`
-      # reference on that block (`:208`), so setting it in the shell/.env
-      # already reaches `lakehouse-api` without editing this file further
-      # -- `OIDC_AUTHORIZE_URL`/`OIDC_TOKEN_URL`/`OIDC_REDIRECT_URI` have
-      # NO reference there at all yet and must be added to
-      # `lakehouse-api`'s `environment:` block before this gate's new step
-      # can pass against a real stack. Disclosed here rather than papered
-      # over with a same-named var on the wrong service.
+      # (`docker-compose.yml:80-`). All four now DO have a matching
+      # `${X:-}` reference on that block (`OIDC_ROLE_MAP` already did;
+      # `OIDC_AUTHORIZE_URL`/`OIDC_TOKEN_URL`/`OIDC_REDIRECT_URI` were added
+      # there deliberately unset-by-default — see that block's own
+      # comment), so this gate must set all four in the shell/.env before
+      # bringing `lakehouse-api` up for a run that exercises
+      # `step_oidc_authorization_code_round_trip`; a base-file default
+      # would point every deployment's real OIDC login at this test mock.
     entrypoint: ["/bin/sh", "-c"]
     command:
       - "apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null && pip install -q requests && python g4_test.py"
+    restart: "no"
+
+  # G2 — tenant provisioning + `X-Tenant` scoping acceptance test:
+  # `ops/g2/g2_tenant_test.py`. `test` profile, not `dagster` — this gate
+  # only needs `lakehouse-api` and Lakekeeper's admin API, matching
+  # `gold-export-test-runner`'s precedent (same profile, same reason: no
+  # Dagster dependency). Same bind-mounted-script, stock-base-image shape
+  # as every other `g*-test-runner` in this file.
+  #
+  # Usage (from a clean stack — `lakehouse-api` must be (re)started after
+  # `AUTH_BOOTSTRAP_EMAIL`/`AUTH_BOOTSTRAP_PASSWORD` are set, the same
+  # already-running-container caveat `gold-export-test-runner`'s own
+  # comment gives):
+  #   docker compose -p <project> --profile test up -d
+  #     postgres clickhouse rustfs rustfs-bucket-init lakekeeper-db-init
+  #     lakekeeper-migrate lakekeeper lakekeeper-warehouse-init
+  #     lakekeeper-authz-init lakehouse-api
+  #   docker compose -p <project> --profile test run --rm g2-test-runner
+  g2-test-runner:
+    profiles: ["test"]
+    image: python:3.12-slim
+    working_dir: /work
+    volumes:
+      - ./ops/g2:/work
+      # Same single-file subpath mount `gold-export-test-runner` uses for
+      # the same principal — this runner only ever reads `admin.jwt`
+      # (`g2_tenant_test.py`'s `step_verify_warehouse_listed`), never
+      # printed.
+      - type: volume
+        source: lakehouse_oidc_tokens
+        target: /tokens/admin.jwt
+        volume:
+          subpath: admin.jwt
+        read_only: true
+    depends_on:
+      lakehouse-api:
+        condition: service_started
+      lakekeeper-authz-init:
+        condition: service_completed_successfully
+    environment:
+      API_URL: http://lakehouse-api:8080
+      AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
+      AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
+      LAKEKEEPER_BASE_URI: http://lakekeeper:8181
+      LAKEKEEPER_ADMIN_TOKEN_FILE: /tokens/admin.jwt
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "pip install -q requests && python g2_tenant_test.py"
     restart: "no"
 
   # WS7 (Hard Requirement 10, item H2) — governance masking acceptance
