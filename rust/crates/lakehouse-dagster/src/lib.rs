@@ -618,11 +618,15 @@ impl DgClient {
         Ok(launch_outcome_from(data.launch_run))
     }
 
-    /// Like [`DgClient::launch_run`], but with `runConfigData` set —
-    /// `Dagster`'s GraphQL `ExecutionParams.runConfigData` field takes a
-    /// JSON STRING (not a nested object), so `run_config` is serialized to
-    /// a string once here. Added for WS3's `ingest_job` (one static job,
-    /// per-connector `connector_id` config, WS3 plan review Z9) —
+    /// Like [`DgClient::launch_run`], but with `runConfigData` set.
+    /// `Dagster`'s GraphQL `ExecutionParams.runConfigData` is typed
+    /// `RunConfigData`, a generic scalar that takes the config OBJECT
+    /// itself. An earlier version declared the variable `String!` and sent
+    /// the config serialized to a string; `Dagster` rejects that at
+    /// validation (`Variable '$cfg' of type 'String!' used in position
+    /// expecting type 'RunConfigData'`, HTTP 400), so no connector ingest
+    /// run could launch. Used by `ingest_job` (one static job, per-connector
+    /// `connector_id` config) —
     /// [`DgClient::launch_run`] itself is UNCHANGED so every existing
     /// caller (`routes::pipelines::trigger`) keeps its current,
     /// config-free launch; this is a second, additive method, not a
@@ -640,7 +644,7 @@ impl DgClient {
         job_name: &str,
         run_config: &Value,
     ) -> Result<LaunchOutcome, DgError> {
-        let query = "mutation($sel: JobOrPipelineSelector!, $cfg: String!) { \
+        let query = "mutation($sel: JobOrPipelineSelector!, $cfg: RunConfigData!) { \
                       launchRun(executionParams: { selector: $sel, mode: \"default\", \
                       runConfigData: $cfg }) { \
                       __typename \
@@ -654,7 +658,7 @@ impl DgClient {
                 "repositoryLocationName": self.location,
                 "pipelineName": job_name,
             },
-            "cfg": run_config.to_string(),
+            "cfg": run_config,
         });
         let data: LaunchRunData = self.execute(query, Some(variables)).await?;
         Ok(launch_outcome_from(data.launch_run))
@@ -1444,20 +1448,24 @@ mod tests {
         assert!(outcome.error.is_none());
     }
 
-    /// WS3 item 29 (Z9): `launch_run_with_config` must send
-    /// `runConfigData` as a JSON STRING (`ExecutionParams.runConfigData`'s
-    /// wire type), not a nested GraphQL object — `body_partial_json`
-    /// asserts the exact `variables.cfg` value the mocked server receives.
+    /// `launch_run_with_config` must declare `$cfg` as `RunConfigData!`
+    /// and send the config OBJECT, matching `Dagster`'s schema for
+    /// `ExecutionParams.runConfigData`. This test previously asserted a
+    /// JSON string, which a mock accepts but real `Dagster` rejects with
+    /// HTTP 400 at query validation. A mock cannot validate the schema, so
+    /// both the declared type and the variable's shape are asserted here;
+    /// the end-to-end proof is the G6 gate's real `ingest/run`.
     #[tokio::test]
-    async fn launch_run_with_config_sends_run_config_data_as_a_json_string() {
-        use wiremock::matchers::body_partial_json;
+    async fn launch_run_with_config_sends_run_config_data_as_an_object() {
+        use wiremock::matchers::{body_partial_json, body_string_contains};
 
         let run_config = json!({"ops": {"run_ingest": {"config": {"connector_id": "conn-a"}}}});
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/graphql"))
+            .and(body_string_contains("$cfg: RunConfigData!"))
             .and(body_partial_json(json!({
-                "variables": { "cfg": run_config.to_string() }
+                "variables": { "cfg": run_config }
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": { "launchRun": { "__typename": "LaunchRunSuccess", "run": { "runId": "run-456" } } }
