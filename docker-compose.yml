@@ -2432,13 +2432,27 @@ services:
   # as every other `g*-test-runner` in this file.
   #
   # Usage (from a clean stack — `lakehouse-api` must be (re)started after
-  # `AUTH_BOOTSTRAP_EMAIL`/`AUTH_BOOTSTRAP_PASSWORD` are set, the same
-  # already-running-container caveat `gold-export-test-runner`'s own
-  # comment gives):
+  # `AUTH_BOOTSTRAP_EMAIL`/`AUTH_BOOTSTRAP_PASSWORD`/`TENANT_WAREHOUSE_S3_*`
+  # are set, the same already-running-container caveat
+  # `gold-export-test-runner`'s own comment gives). Deliberately does NOT
+  # bring up `lakekeeper-warehouse-init`/`lakekeeper-authz-init` — see this
+  # service's own `depends_on` comment on why the `default` warehouse those
+  # jobs create would overlap every tenant warehouse this gate provisions.
+  # Lakekeeper still needs its one-time instance bootstrap
+  # (`management/v1/bootstrap`, `accept-terms-of-use`) before it will
+  # create ANY warehouse — `lakekeeper`'s image carries no shell utility to
+  # call this from inside the container, so do it from a throwaway image on
+  # the project's own network, e.g.:
   #   docker compose -p <project> --profile test up -d
   #     postgres clickhouse rustfs rustfs-bucket-init lakekeeper-db-init
-  #     lakekeeper-migrate lakekeeper lakekeeper-warehouse-init
-  #     lakekeeper-authz-init lakehouse-api
+  #     lakekeeper-migrate lakekeeper lakehouse-api
+  #   admin_token="$(docker compose -p <project> exec -T lakehouse-api \
+  #     cat /tokens/admin.jwt)"
+  #   docker run --rm --network <project>_default curlimages/curl:8.10.1 \
+  #     -fsS -X POST -H "Authorization: Bearer $admin_token" \
+  #     -H 'Content-Type: application/json' \
+  #     -d '{"accept-terms-of-use": true}' \
+  #     http://lakekeeper:8181/management/v1/bootstrap
   #   docker compose -p <project> --profile test run --rm g2-test-runner
   g2-test-runner:
     profiles: ["test"]
@@ -2459,8 +2473,25 @@ services:
     depends_on:
       lakehouse-api:
         condition: service_started
-      lakekeeper-authz-init:
-        condition: service_completed_successfully
+      # Deliberately NOT `lakekeeper-authz-init` (this gate's first commit
+      # depended on it, copying `gold-export-test-runner`'s precedent
+      # without checking whether this gate actually needs what that job
+      # does): `lakekeeper-authz-init` grants machine principals onto the
+      # SHARED `default` warehouse `lakekeeper-warehouse-init` creates at
+      # its storage profile's bucket ROOT (no `key-prefix` at all) — and
+      # `POST /api/identity/tenants` provisions a warehouse in the SAME
+      # bucket (`LAKEHOUSE_WAREHOUSE_BUCKET`/`TENANT_WAREHOUSE_S3_*` share
+      # one bucket name, `routes::identity::tenant_warehouse_storage`),
+      # which Lakekeeper correctly refuses with
+      # `CreateWarehouseStorageProfileOverlap` — a `default` warehouse
+      # claiming the whole bucket makes every OTHER warehouse in that
+      # bucket, tenant or not, an overlap. This gate never needs `default`
+      # to exist, so it depends on Lakekeeper being bootstrapped
+      # (instance-level, one-time, independent of which warehouses exist
+      # afterward) and healthy instead — see the "Usage" comment above for
+      # how to bootstrap without also creating `default`.
+      lakekeeper:
+        condition: service_healthy
     environment:
       API_URL: http://lakehouse-api:8080
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
