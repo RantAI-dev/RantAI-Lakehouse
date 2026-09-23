@@ -40,8 +40,10 @@ reason).
 
 # Partitioning (ADR 0004 parity, not byte-identical)
 
-Every row gets a `_ingested_at` timestamp stamped by this pipeline (not a
-source column), and the created table is partitioned `day(_ingested_at)`
+Every row gets a `_ingested_at` timestamp stamped by the shared sink
+(`adapters/sink.py::load_via_sink`, the ONE owner of this column for
+every ingest adapter this build has -- see that module's docstring), not
+a source column, and the created table is partitioned `day(_ingested_at)`
 via dlt's `iceberg_adapter`/`iceberg_partition.day` — the same default
 ADR 0004 established for `lakehouse-iceberg`'s Rust-side
 `create_bronze_table`. The Iceberg field-id numbering dlt assigns differs
@@ -56,7 +58,6 @@ from __future__ import annotations
 import dataclasses
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any
 
 from dlt.sources.sql_database import sql_database
@@ -221,15 +222,6 @@ class BronzeIngestConfig:
         )
 
 
-def _stamp_ingested_at(record: dict[str, Any]) -> dict[str, Any]:
-    """Bronze's system ingestion-time column (ADR 0004's
-    `bronze::INGESTED_AT_COLUMN` equivalent for the dlt write path) —
-    stamped here, not read from the source, so partitioning never depends
-    on a source-provided timestamp existing/being non-null."""
-    record["_ingested_at"] = datetime.now(timezone.utc)
-    return record
-
-
 def run_bronze_ingest(config: BronzeIngestConfig | None = None) -> dict[str, Any]:
     """Run the dlt pipeline once: build the Postgres `sql_database` source
     (SSRF-checked and `hostaddr`-pinned per WS3 item 20, the rest
@@ -292,8 +284,13 @@ def run_bronze_ingest(config: BronzeIngestConfig | None = None) -> dict[str, Any
     )
     resource = source.resources[cfg.source_table]
     resource.apply_hints(table_name=cfg.bronze_table_name)
-    resource.add_map(_stamp_ingested_at)
 
+    # `_ingested_at` is stamped by `load_via_sink` itself now (ADR 0004's
+    # ONE owner of the column, for every adapter this build has -- see
+    # `adapters/sink.py`'s module doc) -- this used to call
+    # `resource.add_map(_stamp_ingested_at)` here, which meant the column
+    # only existed on the ONE code path (this one) that remembered to add
+    # it.
     result = load_via_sink(source, cfg.bronze_table_name, SinkConfig.from_bronze_ingest_config(cfg))
     if result.has_failed_jobs:
         # `load_info_str` (`str(load_info)`) can contain a file path --

@@ -29,7 +29,17 @@ Run with:
 
 from __future__ import annotations
 
-from dispar_orchestrate.adapters.sink import SinkConfig, _extract_rows
+from datetime import datetime, timezone
+
+import dlt
+
+from dispar_orchestrate.adapters.sink import (
+    SinkConfig,
+    _extract_rows,
+    _stamp_for_load,
+    _stamp_ingested_at,
+    load_via_sink,
+)
 from dispar_orchestrate.dlt_pipeline import BronzeIngestConfig
 
 
@@ -76,3 +86,165 @@ def test_extract_rows_returns_none_when_the_table_wrote_no_rows_this_run() -> No
 
 def test_extract_rows_returns_none_when_there_is_no_trace_at_all() -> None:
     assert _extract_rows(None, "orders") is None
+
+
+# ADR 0004: `_ingested_at` is stamped by this module, the ONE owner of the
+# column, for every shape `load_via_sink` is called with. The bug this
+# closes (found by the G6 gate against MySQL/MSSQL): only
+# `dlt_pipeline.py::run_bronze_ingest` used to stamp it (via its own
+# `add_map`, before reaching this shared sink), so every other adapter
+# (SQL/REST/mongodb/files/sftp/sheets/oracle, and the Kafka micro-batch)
+# wrote Bronze rows with no `_ingested_at` at all -- `iceberg_adapter`'s
+# `day("_ingested_at")` partition spec then failed outright for a
+# `sql_database` source with `ValueError: Could not find field with name
+# _ingested_at`, and silently produced an under-partitioned/columnless
+# table for every adapter that "succeeded" anyway.
+
+
+def test_stamp_ingested_at_overwrites_a_value_already_on_the_record() -> None:
+    # ADR 0004: the column is stamped, never read from the source -- a
+    # record that already has its own `_ingested_at` (e.g. a Kafka payload
+    # that happens to carry a same-named field) must not keep it.
+    stale = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    record = {"id": 1, "_ingested_at": stale}
+
+    stamped = _stamp_ingested_at(record)
+
+    assert stamped["_ingested_at"] != stale
+    assert stamped["_ingested_at"].tzinfo is not None
+
+
+def test_stamp_for_load_on_a_dlt_source_stamps_every_row_of_every_resource() -> None:
+    @dlt.resource(name="orders")
+    def orders():
+        yield {"id": 1}
+        yield {"id": 2}
+
+    @dlt.resource(name="customers")
+    def customers():
+        yield {"id": 9}
+
+    @dlt.source(name="two_table_source")
+    def two_table_source():
+        return [orders(), customers()]
+
+    source = two_table_source()
+
+    stamped_source = _stamp_for_load(source)
+    rows = list(stamped_source)
+
+    assert len(rows) == 3
+    for row in rows:
+        assert "_ingested_at" in row
+        assert row["_ingested_at"].tzinfo is not None
+        assert row["_ingested_at"].tzinfo == timezone.utc
+
+
+def test_stamp_for_load_on_a_bare_dlt_resource_stamps_its_rows() -> None:
+    @dlt.resource(name="orders")
+    def orders():
+        yield {"id": 1}
+
+    resource = orders()
+
+    stamped_resource = _stamp_for_load(resource)
+    rows = list(stamped_resource)
+
+    assert len(rows) == 1
+    assert rows[0]["_ingested_at"].tzinfo == timezone.utc
+
+
+def test_stamp_for_load_on_a_plain_list_of_dicts_stamps_without_mutating_the_callers_list() -> None:
+    # The Kafka micro-batch shape (`ingest_factory.py::run_kafka_stream_batch`'s
+    # `batch.rows`) -- a plain list of dicts, not a dlt source/resource.
+    original_rows = [{"id": 1}, {"id": 2}]
+
+    stamped_rows = list(_stamp_for_load(original_rows))
+
+    assert len(stamped_rows) == 2
+    for row in stamped_rows:
+        assert row["_ingested_at"].tzinfo == timezone.utc
+    # The caller's own dicts are never touched -- `batch.rows` is read
+    # again by `run_kafka_stream_batch` after this call (its own
+    # `_record(rows=...)` and the offset-commit bookkeeping), so mutating
+    # them in place would be a hidden side effect on that later read.
+    assert original_rows == [{"id": 1}, {"id": 2}]
+
+
+class _FakeLoadInfo:
+    has_failed_jobs = False
+
+
+class _FakePipeline:
+    """Stand-in for `dlt.pipeline(...)` that materializes whatever
+    `load_via_sink` hands its `run` method, without touching a network or
+    a real Lakekeeper -- the same "capture what reaches it" approach this
+    module's own row-count tests use for `_extract_rows`."""
+
+    def __init__(self, **kwargs) -> None:
+        self.init_kwargs = kwargs
+        self.materialized_rows: list[dict] = []
+        self.last_trace = None
+
+    def run(self, source, table_name, table_format):
+        self.materialized_rows = list(source)
+        return _FakeLoadInfo()
+
+
+def _sink_config() -> SinkConfig:
+    return SinkConfig(
+        lakekeeper_catalog_uri="http://lakekeeper:8181/catalog",
+        lakekeeper_warehouse="default",
+        rustfs_endpoint="http://rustfs:9000",
+        rustfs_access_key="k",
+        rustfs_secret_key="s",
+        warehouse_bucket="lakehouse-warehouse",
+        lakekeeper_token="",
+    )
+
+
+def test_load_via_sink_stamps_a_kafka_shaped_batch_of_plain_dicts(monkeypatch) -> None:
+    fake_pipelines: list[_FakePipeline] = []
+
+    def fake_pipeline_factory(**kwargs):
+        pipeline = _FakePipeline(**kwargs)
+        fake_pipelines.append(pipeline)
+        return pipeline
+
+    monkeypatch.setattr("dispar_orchestrate.adapters.sink.dlt.pipeline", fake_pipeline_factory)
+
+    batch_rows = [{"id": 1}, {"id": 2}]
+    result = load_via_sink(batch_rows, "orders", _sink_config())
+
+    assert result.has_failed_jobs is False
+    materialized = fake_pipelines[0].materialized_rows
+    assert len(materialized) == 2
+    for row in materialized:
+        assert row["_ingested_at"].tzinfo == timezone.utc
+    # The list the Kafka caller still holds is untouched -- see the
+    # `_stamp_for_load` test above for why that matters.
+    assert batch_rows == [{"id": 1}, {"id": 2}]
+
+
+def test_load_via_sink_stamps_a_single_dlt_resource(monkeypatch) -> None:
+    fake_pipelines: list[_FakePipeline] = []
+
+    def fake_pipeline_factory(**kwargs):
+        pipeline = _FakePipeline(**kwargs)
+        fake_pipelines.append(pipeline)
+        return pipeline
+
+    monkeypatch.setattr("dispar_orchestrate.adapters.sink.dlt.pipeline", fake_pipeline_factory)
+
+    @dlt.resource(name="orders")
+    def orders():
+        yield {"id": 1}
+        yield {"id": 2}
+
+    result = load_via_sink(orders(), "orders", _sink_config())
+
+    assert result.has_failed_jobs is False
+    materialized = fake_pipelines[0].materialized_rows
+    assert len(materialized) == 2
+    for row in materialized:
+        assert row["_ingested_at"].tzinfo == timezone.utc
