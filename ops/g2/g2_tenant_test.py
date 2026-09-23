@@ -26,6 +26,24 @@ identity.rs` and `rust/crates/lakehouse-api/src/tenant_scope.rs`):
    belong to is `404`, never `403` — a `403` would confirm to the caller
    that the tenant id exists at all, which `tenant_scope.rs`'s doc comment
    calls out by name as the leak this route must not have.
+4. A SECOND tenant, provisioned into the SAME shared `TENANT_WAREHOUSE_S3_
+   BUCKET` as the first (`routes::identity::provision_tenant`: `let prefix
+   = format!("{}/{}/", config.lakehouse_warehouse_bucket, tenant.slug)`),
+   also reaches `grants_ready` — even when its slug is the first tenant's
+   slug PLUS a suffix (`<first>-eu`), a string-prefix relationship chosen
+   deliberately: two Lakekeeper `key-prefix`es only avoid `Create
+   WarehouseStorageProfileOverlap` if neither is an actual PATH prefix of
+   the other, and `format!("{prefix}/")`'s trailing `/` is what turns
+   "`g2-x`" (a string prefix of "`g2-x-eu`") into "`g2-x/`" (NOT a path
+   prefix of "`g2-x-eu/`") — this step proves that trailing slash is
+   doing its job, not merely that two unrelated slugs coexist. Both
+   warehouses, AND the shared `default` warehouse (created at its storage
+   profile's bucket root by `lakekeeper-warehouse-init`, in a DIFFERENT
+   bucket from the tenant warehouses per `TENANT_WAREHOUSE_S3_BUCKET` —
+   see `Config::tenant_warehouse_s3_bucket`'s doc comment), must all list
+   from Lakekeeper's own `management/v1/warehouse` in the same call — this
+   gate runs against the real `lakekeeper-warehouse-init`/`lakekeeper-
+   authz-init` init chain, never a stack with `default` skipped.
 
 Run inside the compose network (the `g2-test-runner` service in
 `docker-compose.yml`, copying `g4-test-runner`'s shape) — Lakekeeper's
@@ -100,13 +118,12 @@ def step_login() -> None:
     print("[g2] logged in as bootstrap admin")
 
 
-def step_provision_tenant() -> dict:
-    """`POST /api/identity/tenants` for a fresh slug and assert the
-    response reports the state `provision_tenant` actually reaches."""
-    slug = f"g2-{uuid.uuid4().hex[:12]}"
+def step_provision_tenant(slug: str, name: str) -> dict:
+    """`POST /api/identity/tenants` for `slug` and assert the response
+    reports the state `provision_tenant` actually reaches."""
     resp = API.post(
         f"{API_URL}/api/identity/tenants",
-        json={"name": "G2 gate tenant", "slug": slug, "plan": "Enterprise", "residency": "g2-gate"},
+        json={"name": name, "slug": slug, "plan": "Enterprise", "residency": "g2-gate"},
         timeout=30,
     )
     if resp.status_code != 201:
@@ -127,11 +144,10 @@ def step_provision_tenant() -> dict:
     return tenant
 
 
-def step_verify_warehouse_listed(tenant: dict) -> None:
-    """Lakekeeper's own `management/v1/warehouse` listing must show the
-    warehouse `ensure_warehouse` (`lakehouse-auth::openfga`) actually
-    created for this tenant — proving the provisioning call reached
-    Lakekeeper for real, not only that Postgres's checkpoint was written."""
+def _list_lakekeeper_warehouses() -> list[dict]:
+    """`GET management/v1/warehouse`, bearer-authenticated with the
+    `admin` principal's pre-minted token — shared by every step below that
+    needs to see what Lakekeeper itself thinks exists, never printed."""
     try:
         with open(ADMIN_TOKEN_FILE, encoding="utf-8") as handle:
             admin_token = handle.read().strip()
@@ -147,7 +163,15 @@ def step_verify_warehouse_listed(tenant: dict) -> None:
     )
     if not resp.ok:
         raise G2Failure(f"Lakekeeper warehouse listing failed: {resp.status_code} {resp.text}")
-    warehouses = resp.json().get("warehouses", [])
+    return resp.json().get("warehouses", [])
+
+
+def step_verify_warehouse_listed(tenant: dict) -> None:
+    """Lakekeeper's own `management/v1/warehouse` listing must show the
+    warehouse `ensure_warehouse` (`lakehouse-auth::openfga`) actually
+    created for this tenant — proving the provisioning call reached
+    Lakekeeper for real, not only that Postgres's checkpoint was written."""
+    warehouses = _list_lakekeeper_warehouses()
     warehouse_id = tenant["warehouseId"]
     match = next((w for w in warehouses if w.get("id") == warehouse_id), None)
     if match is None:
@@ -157,6 +181,46 @@ def step_verify_warehouse_listed(tenant: dict) -> None:
             f"management/v1/warehouse listing: {listed_ids}"
         )
     print(f"[g2] Lakekeeper management API confirms warehouse {warehouse_id!r} exists")
+
+
+def step_sibling_tenant_prefix_does_not_overlap(first_tenant: dict, first_slug: str) -> None:
+    """Provision a SECOND tenant whose slug is `first_slug` plus a suffix
+    (so `first_slug` is a literal string prefix of the second tenant's
+    slug) and assert it also reaches `grants_ready` — proving
+    `provision_tenant`'s per-tenant `key-prefix` (`{bucket}/{slug}/`, note
+    the trailing slash) does not collide with a sibling tenant whose slug
+    merely starts with the same characters. Then re-list Lakekeeper's
+    warehouses once more and assert BOTH tenant warehouses AND the shared
+    `default` warehouse (created by the real `lakekeeper-warehouse-init`/
+    `lakekeeper-authz-init` chain this gate runs against) are all present
+    — the `default` check is what proves this run did not silently skip
+    that chain the way an earlier, reverted version of this gate did."""
+    second_slug = f"{first_slug}-eu"
+    second_tenant = step_provision_tenant(second_slug, "G2 gate tenant (sibling prefix)")
+
+    warehouses = _list_lakekeeper_warehouses()
+    listed_by_id = {w.get("id"): w for w in warehouses}
+    listed_names = {w.get("name") for w in warehouses}
+
+    for label, tenant in (("first", first_tenant), ("second", second_tenant)):
+        warehouse_id = tenant["warehouseId"]
+        if warehouse_id not in listed_by_id:
+            raise G2Failure(
+                f"{label} tenant's warehouse {warehouse_id!r} is missing from Lakekeeper's "
+                f"management/v1/warehouse listing after provisioning the sibling: "
+                f"{sorted(listed_by_id)}"
+            )
+    if "default" not in listed_names:
+        raise G2Failure(
+            "the shared 'default' warehouse is missing from Lakekeeper's management/v1/warehouse "
+            f"listing — this gate must run against the real lakekeeper-warehouse-init/"
+            f"lakekeeper-authz-init chain, not one that skips it: {sorted(listed_names)}"
+        )
+    print(
+        f"[g2] sibling tenant {second_slug!r} (prefix of first slug {first_slug!r}) also reached "
+        f"{EXPECTED_TERMINAL_STATUS!r}; Lakekeeper lists both tenant warehouses and 'default' "
+        "with no overlap"
+    )
 
 
 def step_x_tenant_for_a_foreign_tenant_is_404_not_403() -> None:
@@ -183,9 +247,11 @@ def step_x_tenant_for_a_foreign_tenant_is_404_not_403() -> None:
 def main() -> int:
     try:
         step_login()
-        tenant = step_provision_tenant()
+        first_slug = f"g2-{uuid.uuid4().hex[:12]}"
+        tenant = step_provision_tenant(first_slug, "G2 gate tenant")
         step_verify_warehouse_listed(tenant)
         step_x_tenant_for_a_foreign_tenant_is_404_not_403()
+        step_sibling_tenant_prefix_does_not_overlap(tenant, first_slug)
     except G2Failure as exc:
         print(f"[g2] FAILED: {exc}", file=sys.stderr)
         return 1
