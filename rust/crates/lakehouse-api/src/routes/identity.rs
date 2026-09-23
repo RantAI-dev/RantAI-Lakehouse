@@ -391,6 +391,16 @@ pub async fn create_tenant(
     Ok((status_code, ApiJson(tenant)))
 }
 
+/// A tenant warehouse's `key-prefix` inside the dedicated tenant bucket
+/// (`TENANT_WAREHOUSE_S3_BUCKET`, see [`tenant_warehouse_storage`]). It
+/// is the slug alone: the bucket already belongs to tenant warehouses, so
+/// a bucket name inside the prefix would only name a different bucket in
+/// the object path. The trailing `/` keeps a slug that is a string prefix
+/// of another (`acme` / `acme-eu`) from overlapping it in Lakekeeper.
+fn tenant_key_prefix(slug: &str) -> String {
+    format!("{slug}/")
+}
+
 /// Drives `tenant` through the provisioning state machine from wherever it
 /// currently sits, persisting the checkpoint after each step so a crash
 /// mid-way leaves an honest, resumable `provisioning_status` rather than a
@@ -424,7 +434,7 @@ async fn provision_tenant(
     config: &Config,
 ) -> ApiResult<Tenant> {
     let warehouse_name = format!("tenant-{}", tenant.slug);
-    let prefix = format!("{}/{}/", config.lakehouse_warehouse_bucket, tenant.slug);
+    let prefix = tenant_key_prefix(&tenant.slug);
 
     if tenant.provisioning_status == "pending" {
         let storage = tenant_warehouse_storage(config)?;
@@ -1030,5 +1040,11 @@ mod tests {
         assert_eq!(event.principal_kind.as_deref(), Some("user"));
         assert_eq!(event.actor_label.as_deref(), Some("Rina Wijaya"));
         assert_eq!(event.outcome, "executed");
+    }
+
+    #[test]
+    fn tenant_key_prefix_is_the_slug_alone_with_a_trailing_slash() {
+        assert_eq!(tenant_key_prefix("acme"), "acme/");
+        assert!(!tenant_key_prefix("acme-eu").starts_with(&tenant_key_prefix("acme")));
     }
 }
