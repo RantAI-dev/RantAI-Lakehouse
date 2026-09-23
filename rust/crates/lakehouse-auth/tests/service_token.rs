@@ -174,8 +174,16 @@ async fn verify_service_token_does_not_rewrite_last_used_at_within_the_throttle_
 ) -> sqlx::Result<()> {
     let identity_id = seed_service_identity(&pool, "ingestion-worker").await?;
     let token = create_service_credential(&pool, identity_id).await.unwrap();
+    // A real "used ten seconds ago" row: created an hour ago, last used
+    // ten seconds ago. The earlier fixture moved only `last_used_at`, to a
+    // moment BEFORE the row's own `created_at` — a last use that predates
+    // the identity, which no real row can have, and which the throttle now
+    // (correctly) reads as "never used" and lets through.
     sqlx::query(
-        "UPDATE service_identity SET last_used_at = now() - interval '10 seconds' WHERE id = $1",
+        "UPDATE service_identity \
+         SET created_at = now() - interval '1 hour', \
+             last_used_at = now() - interval '10 seconds' \
+         WHERE id = $1",
     )
     .bind(identity_id)
     .execute(&pool)
@@ -227,6 +235,37 @@ async fn verify_service_token_rewrites_last_used_at_after_the_throttle_window(
     assert!(
         after > stale,
         "a verification past the 300s window must move last_used_at forward (got {after}, stale was {stale})"
+    );
+    Ok(())
+}
+
+/// A first use that lands inside the throttle window of the identity's own
+/// CREATION must still be recorded. The column defaults to the insert time,
+/// so without the `last_used_at <= created_at` branch the plain throttle
+/// would skip it, and the store — which serves `lastUsedAt` only once the
+/// column has moved past `created_at` — would report a used identity as
+/// never used until some second call happened to land after the window.
+#[sqlx::test(migrations = "../../migrations")]
+async fn verify_service_token_records_a_first_use_made_right_after_creation(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let identity_id = seed_service_identity(&pool, "ingestion-worker").await?;
+    sqlx::query("UPDATE service_identity SET last_used_at = created_at WHERE id = $1")
+        .bind(identity_id)
+        .execute(&pool)
+        .await?;
+    let token = create_service_credential(&pool, identity_id).await.unwrap();
+
+    verify_service_token(&pool, &token).await.unwrap();
+
+    let (created_at, last_used_at): (OffsetDateTime, OffsetDateTime) =
+        sqlx::query_as("SELECT created_at, last_used_at FROM service_identity WHERE id = $1")
+            .bind(identity_id)
+            .fetch_one(&pool)
+            .await?;
+    assert!(
+        last_used_at > created_at,
+        "a first use must move last_used_at past created_at, got created {created_at} / used {last_used_at}"
     );
     Ok(())
 }

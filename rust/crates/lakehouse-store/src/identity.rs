@@ -787,20 +787,19 @@ pub struct ServiceIdentity {
     /// for this column says so explicitly) — inventing one here would be a
     /// fabricated policy, not an honest read.
     pub rotation_status: String,
-    /// `service_identity.last_used_at`. Populated from the column on every
-    /// read since WS8 §Phase E — before that, the field always serialized
-    /// `None` even though the column was `NOT NULL DEFAULT now()`
-    /// (`0001_init.sql:125`), which was a fabrication (J18), not an honest
-    /// read. The column is now actually written by
-    /// `lakehouse-auth::service_token::verify_service_token`, throttled to
-    /// at most once per `LAST_USED_AT_THROTTLE_SECONDS` (300s, chosen to
-    /// match `oidc::DEFAULT_JWKS_TTL`'s already-reviewed cadence) per
-    /// identity — so the value reported here is at most five minutes stale
-    /// even for a heavily-used identity. Stays `Option<String>` (not
-    /// `String`) because the contract at
-    /// `src/services/contracts/identity.ts` types it as `string | null`
-    /// and that nullability is part of the wire shape the console parses.
-    /// Serializes as `lastUsedAt`.
+    /// When this identity's credential was last actually used, or `None` if
+    /// it has never been used. Serializes as `lastUsedAt`.
+    ///
+    /// `None` is the honest answer for a never-used identity, and the
+    /// column alone cannot give it: `last_used_at` is `NOT NULL DEFAULT
+    /// now()` (`0001_init.sql`), so a freshly created identity's column
+    /// holds its creation time. Serving that would report a use that never
+    /// happened. [`SERVICE_IDENTITY_SELECT`] therefore returns the column
+    /// only when it has moved past `created_at` — which only
+    /// `lakehouse-auth::service_token::verify_service_token`'s write can do
+    /// — and NULL otherwise. That write is throttled to once per 300 s per
+    /// identity but always lets the FIRST use through, so a used identity
+    /// is never reported as unused for want of a second call.
     pub last_used_at: Option<String>,
 }
 
@@ -816,7 +815,7 @@ struct ServiceIdentityRow {
     environment: String,
     expires_at: OffsetDateTime,
     rotation_status: String,
-    last_used_at: OffsetDateTime,
+    last_used_at: Option<OffsetDateTime>,
 }
 
 impl From<ServiceIdentityRow> for ServiceIdentity {
@@ -828,7 +827,7 @@ impl From<ServiceIdentityRow> for ServiceIdentity {
             environment: row.environment,
             expires_at: iso_millis(row.expires_at),
             rotation_status: row.rotation_status,
-            last_used_at: Some(iso_millis(row.last_used_at)),
+            last_used_at: row.last_used_at.map(iso_millis),
         }
     }
 }
@@ -840,13 +839,12 @@ impl From<ServiceIdentityRow> for ServiceIdentity {
 /// `lakehouse-auth::service_token` uses to refuse a credential — so a filter
 /// and the list can never disagree with each other or with authentication.
 /// See [`ServiceIdentity::rotation_status`] for the full rationale.
-/// `last_used_at` is the bare column — the schema default (`0001_init.sql:125`,
-/// `NOT NULL DEFAULT now()`) ensures every row carries a real timestamp, and
-/// `verify_service_token` keeps it current via a throttled UPDATE; see
-/// [`ServiceIdentity::last_used_at`] for the rationale.
+/// `last_used_at` is NULL unless the column has moved past `created_at`:
+/// the column defaults to the insert time, so equal-to-creation means "never
+/// used", not "used at creation" — see [`ServiceIdentity::last_used_at`].
 const SERVICE_IDENTITY_SELECT: &str = "SELECT s.id, s.name, s.scopes, s.environment, s.expires_at, \
      CASE WHEN s.expires_at <= now() THEN 'expired' ELSE s.rotation_status END AS rotation_status, \
-     s.last_used_at \
+     CASE WHEN s.last_used_at > s.created_at THEN s.last_used_at END AS last_used_at \
      FROM service_identity s";
 
 /// Optional narrowing for [`list_service_identities`].

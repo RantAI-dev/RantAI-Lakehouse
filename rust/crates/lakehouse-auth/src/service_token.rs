@@ -168,13 +168,19 @@ pub async fn verify_service_token(pool: &PgPool, token: &Secret) -> Result<Princ
 
     // Best-effort, throttled telemetry — never a reason to fail an
     // otherwise-valid credential. `last_used_at` is `NOT NULL DEFAULT
-    // now()` since `0001_init.sql:125`, so the `WHERE` clause needs no
-    // `OR last_used_at IS NULL` branch; a row within the window simply
-    // matches zero rows and this is a silent no-op. See this fn's
-    // doc comment for the swallow-and-log rule on errors.
+    // now()` (`0001_init.sql`), so an identity that has never been used
+    // holds its CREATION time there, and the plain throttle predicate
+    // would skip a first use that lands within 300 s of creation — leaving
+    // the identity reported as never used (the store serves NULL until the
+    // column moves past `created_at`). `last_used_at <= created_at` lets
+    // that first use through unconditionally; every later use is throttled
+    // as before, and a row within the window matches zero rows, a silent
+    // no-op. See this fn's doc comment for the swallow-and-log rule.
     if let Err(err) = sqlx::query(
         "UPDATE service_identity SET last_used_at = now() \
-         WHERE id = $1 AND last_used_at < now() - ($2 * INTERVAL '1 second')",
+         WHERE id = $1 \
+           AND (last_used_at <= created_at \
+                OR last_used_at < now() - ($2 * INTERVAL '1 second'))",
     )
     .bind(service_identity_id)
     .bind(LAST_USED_AT_THROTTLE_SECONDS)

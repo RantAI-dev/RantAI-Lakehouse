@@ -276,21 +276,14 @@ async fn creates_use_the_mock_fixtures_defaults(pool: PgPool) -> sqlx::Result<()
     .unwrap();
     assert_eq!(identity.rotation_status, "current");
     assert_eq!(identity.scopes, vec!["query:read"]);
-    // WS8 §Phase E closes J18/T13a: `service_identity.last_used_at` is now
-    // actually written by `verify_service_token` (throttled to 300s/identity),
-    // and the schema default (`0001_init.sql:125`, `NOT NULL DEFAULT now()`)
-    // guarantees every row has a real timestamp at INSERT time — so a freshly
-    // created identity must serve a real ISO string, not `None`. The exact
-    // value is irrelevant; the only honest assertion is that the field is
-    // populated and parses as a timestamp.
-    let last_used = identity
-        .last_used_at
-        .as_deref()
-        .expect("last_used_at must be served now that verify_service_token writes it");
-    assert!(
-        time::OffsetDateTime::parse(last_used, &time::format_description::well_known::Rfc3339)
-            .is_ok(),
-        "last_used_at must parse as RFC 3339, got {last_used:?}"
+    // A freshly created identity has never been used, so it must say so:
+    // `null`, not its creation time. The column defaults to the insert time
+    // (`0001_init.sql`), which is why the store derives the value instead of
+    // serving the column — this assertion is what stops that from quietly
+    // regressing into a fabricated "used just now".
+    assert_eq!(
+        identity.last_used_at, None,
+        "a never-used identity must report no last use, not its creation time"
     );
     Ok(())
 }
@@ -381,27 +374,51 @@ async fn user_activity_timestamps_are_not_served(pool: PgPool) -> sqlx::Result<(
     Ok(())
 }
 
-/// WS8 §Phase E closes J18/T13a for `service_identity.last_used_at`: the
-/// column is now actually written by `verify_service_token` (throttled to
-/// 300s/identity) and the schema default (`0001_init.sql:125`, `NOT NULL
-/// DEFAULT now()`) guarantees a real timestamp at INSERT time, so every
-/// seeded identity must come back with a populated, parseable ISO string.
-/// This is the wire-format-facing assertion that the `null`-vs-`string`
-/// distinction now matches what the contract declares.
+/// `lastUsedAt` is `null` for an identity whose column still holds its
+/// creation time, and a real timestamp once the column has moved past it —
+/// the only thing that moves it is `verify_service_token`'s write. Drives
+/// the column directly rather than through `lakehouse-auth` so this crate's
+/// test does not depend on another crate's code.
 #[sqlx::test(migrations = "../../migrations")]
-async fn service_identity_last_used_at_is_served(pool: PgPool) -> sqlx::Result<()> {
-    let identities = list_service_identities(&pool, &ServiceIdentityFilter::default())
+async fn service_identity_last_used_at_is_null_until_it_is_actually_used(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = create_service_identity(
+        &pool,
+        &CreateServiceIdentityInput {
+            name: "never-used".to_owned(),
+            scopes: vec!["query:read".to_owned()],
+            environment: "staging".to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    let as_json = serde_json::to_value(&created).unwrap();
+    assert!(
+        as_json
+            .get("lastUsedAt")
+            .is_some_and(serde_json::Value::is_null),
+        "a never-used identity must serialize lastUsedAt as null, got {as_json}"
+    );
+
+    let id = uuid::Uuid::parse_str(&created.id).unwrap();
+    sqlx::query(
+        "UPDATE service_identity SET last_used_at = created_at + interval '1 minute' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await?;
+    let listed = list_service_identities(&pool, &ServiceIdentityFilter::default())
         .await
         .unwrap();
-    assert!(
-        identities.iter().all(|s| s.last_used_at.is_some()),
-        "every seeded identity's last_used_at must be served now that verify_service_token writes it"
-    );
-    let identity_json = serde_json::to_value(&identities[0]).unwrap();
-    let last_used = identity_json
-        .get("lastUsedAt")
-        .and_then(|v| v.as_str())
-        .expect("lastUsedAt must serialize as a JSON string, not null");
+    let used = listed
+        .iter()
+        .find(|s| s.id == created.id)
+        .expect("the identity just created is listed");
+    let last_used = used
+        .last_used_at
+        .as_deref()
+        .expect("once the column has moved past created_at, the use is reported");
     assert!(
         time::OffsetDateTime::parse(last_used, &time::format_description::well_known::Rfc3339)
             .is_ok(),
