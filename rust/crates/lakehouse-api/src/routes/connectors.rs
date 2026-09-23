@@ -491,8 +491,7 @@ pub struct DebeziumPropertiesQuery {
 /// - the honest `{ supported: false, reason: ... }` body for an
 ///   Oracle-driver CDC connector arriving with
 ///   `ORACLE_CDC_LOGMINER_ENABLED=false` (the
-///   [`DebeziumPropertiesResponse::Unsupported`] variant — WS9 §Phase E
-///   / E2).
+///   [`DebeziumPropertiesResponse::Unsupported`] variant).
 ///
 /// `Rendered.properties` contains ONLY `${ENV_VAR_NAME}` references for
 /// every credential-shaped field — never a resolved secret — see
@@ -635,10 +634,10 @@ fn resolve_debezium_source_target(
             })
         }
         Some("mongodb") => {
-            // WS9 §Phase E / E1: the `mongodb` adapter is NOT a
-            // `SqlDriver` variant (`MongoDB` is a document store, not a
-            // SQL/CDC source for `SqlDriver`'s purposes), so the
-            // dispatch here is on the adapter string itself. The mongo
+            // The `mongodb` adapter is NOT a `SqlDriver` variant (`MongoDB`
+            // is a document store, not a SQL/CDC source for `SqlDriver`'s
+            // purposes), so the dispatch here is on the adapter string
+            // itself. The mongo
             // source block in `render_debezium_properties_template` only
             // reads `source.connector_slug` (for the offset/schema-
             // history filenames and topic prefix) and
@@ -708,14 +707,14 @@ fn resolve_debezium_source_target(
 /// expose the deployment's database password, S3 keys, and catalog
 /// token to any `connector:manage` principal) rather than a shortcut.
 ///
-/// # Adapter dispatch (WS3 item 15, WS9 §Phase E / E1)
+/// # Adapter dispatch
 ///
 /// A connector whose `adapter` column (`0033_connector_ingest_spec.sql`) is
 /// `sql` or `cdc` has its connection fields read from the structured
 /// `dial` column via [`Dial::parse`] — this covers `postgres`, `mysql`,
 /// and `mssql` drivers, each rendering its own real `Debezium` connector
 /// class via [`debezium_connector_class`]. A connector whose `adapter` is
-/// `mongodb` (WS9 §Phase E) is dispatched on the adapter string itself,
+/// `mongodb` is dispatched on the adapter string itself,
 /// since `MongoDB` is not a `SqlDriver` variant; its rendered template
 /// carries a single `mongodb.connection.string` env-var-reference
 /// instead of the SQL source's per-field host/port/user/password/dbname.
@@ -1219,9 +1218,9 @@ async fn check_dial_ssrf(dial: &Dial, allow_internal_hosts: bool) -> Result<(), 
             .as_deref()
             .and_then(connector_probe::parse_endpoint_host_port),
         Dial::Rest(rest) => connector_probe::parse_endpoint_host_port(&rest.base_url),
-        // Tier 2 adapters (`mongodb`/`kafka`/`sftp`, WS9 §Phase A): the
-        // authoritative SSRF check runs in Dagster (`ssrf_guard_mongo.py`
-        // / `ssrf_guard_kafka.py` / `ssrf_guard_sftp.py`) at dial time,
+        // Tier 2 adapters (`mongodb`/`kafka`/`sftp`): the authoritative
+        // SSRF check runs in Dagster (`ssrf_guard_mongo.py` /
+        // `ssrf_guard_kafka.py` / `ssrf_guard_sftp.py`) at dial time,
         // not in this save-time pre-check; this function only fails
         // fast on the common case (a caller pastes an obviously-internal
         // host for a `sql`/`cdc`/`files`/`rest` connector and finds out
@@ -1229,8 +1228,8 @@ async fn check_dial_ssrf(dial: &Dial, allow_internal_hosts: bool) -> Result<(), 
         // `routes/connectors::check_dial_ssrf` match returns `None` for
         // these variants by construction -- the same shape `sheets`
         // already has (its dial names a spreadsheet id, not a
-        // caller-chosen host). See the WS9 plan's hard requirement 1 for
-        // the authoritative Dagster-side check.
+        // caller-chosen host). The authoritative check for these
+        // adapters stays in Dagster, not here.
         Dial::Sheets(_) | Dial::Mongo(_) | Dial::Kafka(_) | Dial::Sftp(_) => None,
     };
     let Some((host, port)) = host_port else {
@@ -1853,14 +1852,14 @@ mod tests {
         assert!(result.is_none());
     }
 
-    // ---- WS9 §Phase E / E1 dispatch tests ----
+    // ---- mongodb adapter dispatch tests ----
 
-    /// WS9 §Phase E / E1: the `mongodb` adapter's dispatch lives in
+    /// The `mongodb` adapter's dispatch lives in
     /// [`resolve_debezium_source_target`] (not on [`SqlDriver`], since
     /// `MongoDB` is not a SQL/CDC source) and returns a target carrying
     /// the real `Debezium` `MongoDB` connector class — `Some("mongodb")`
-    /// is the second dispatch the plan calls out, alongside the existing
-    /// `sql`/`cdc` arms. The test passes through
+    /// is a dispatch arm alongside the existing `sql`/`cdc` arms. The
+    /// test passes through
     /// `resolve_debezium_source_target` directly (no router, no DB) so it
     /// stays inside `cargo test -p lakehouse-api --lib`, never the
     /// `tests/` directory's `#[sqlx::test]`-backed harness.

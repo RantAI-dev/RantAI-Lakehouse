@@ -590,8 +590,8 @@ pub struct DebeziumEnvRefs<'a> {
 /// `Debezium` also supports non-Postgres CDC sources, but the class name
 /// hardcoded here before this parameter existed was always the Postgres
 /// one, which would silently mislabel a `mysql`/`mssql` connector's
-/// rendered template). WS9 §Phase E adds the `MongoDB` connector class
-/// `"io.debezium.connector.mongodb.MongoDbConnector"` to this set; the
+/// rendered template). This function also accepts the `MongoDB` connector
+/// class `"io.debezium.connector.mongodb.MongoDbConnector"`; the
 /// `MongoDB` connector's properties are materially different from the SQL
 /// source's (no replication slot, no publication, no `plugin.name=
 /// pgoutput`, no per-field hostname/port/user/password/dbname — a single
@@ -629,8 +629,7 @@ pub fn render_debezium_properties_template(
         .unwrap_or_default();
 
     // MongoDB has no replication slot, no publication, no `plugin.name=
-    // pgoutput`, and no numeric server id — see the WS9 plan's
-    // `render_debezium_properties_template` step 2. It IS addressed by a
+    // pgoutput`, and no numeric server id. It IS addressed by a
     // single connection string the Debezium MongoDB connector parses
     // itself, with the operator's host and port carried as `${...}`
     // references the deployment's shell expands at container start —
@@ -716,9 +715,8 @@ pub fn render_debezium_properties_template(
 /// source-block branch (which renders the mongo-specific properties when
 /// this is the `connector_class`) and from `routes::connectors`'s
 /// adapter-dispatch (`Some("mongodb") => MONGO_CONNECTOR_CLASS`). Two
-/// callers, one literal — matches the WS3 item 15 / WS9 §Phase E shape of
-/// the other `connector_class` values in
-/// `routes::connectors::debezium_connector_class`.
+/// callers, one literal — matches the shape of the other `connector_class`
+/// values in `routes::connectors::debezium_connector_class`.
 pub const MONGO_CONNECTOR_CLASS: &str = "io.debezium.connector.mongodb.MongoDbConnector";
 
 #[cfg(test)]
@@ -1333,9 +1331,9 @@ mod tests {
         assert!(!rendered.contains("hunter2"));
     }
 
-    /// WS9 §Phase E / E1: the `MongoDB` connector class lands the same
-    /// property-template treatment WS3 item 15 added for `mysql`/`mssql`,
-    /// but with materially different source-side fields — the Debezium
+    /// The `MongoDB` connector class lands the same property-template
+    /// treatment as `mysql`/`mssql`, but with materially different
+    /// source-side fields — the Debezium
     /// `MongoDB` connector has no replication slot, no publication, no
     /// `plugin.name=pgoutput`, and no per-field hostname/port/user/
     /// password/dbname, addressing the source via a single

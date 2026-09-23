@@ -254,8 +254,9 @@ pub struct SheetsDial {
 /// The connection shape for a `mongodb` adapter's `dial`.
 ///
 /// Refuses `mongodb+srv` discovery and replica-set discovery outright
-/// (`directConnection` MUST be `true`), per the WS9 plan's hard
-/// requirement 1. `MongoDial` has no `srvUri` field by construction —
+/// (`directConnection` MUST be `true`): both let the driver reach hosts
+/// this connector's SSRF check never validated. `MongoDial` has no
+/// `srvUri` field by construction —
 /// `deny_unknown_fields` enforces this, so a JSON shape carrying an
 /// `srvUri` is rejected at deserialize time as an unknown field. The
 /// `hosts` list is always explicit, one seed per entry, never discovered
@@ -275,7 +276,8 @@ pub struct MongoDial {
     /// connector's `secretRef` value, never named here.
     pub username: String,
     /// MUST be `true`. Replica-set discovery is refused outright (not
-    /// partially checked) — see the WS9 plan's hard requirement 1.
+    /// partially checked): it would let the driver reach hosts this
+    /// connector's SSRF check never validated.
     #[serde(rename = "directConnection")]
     pub direct_connection: bool,
 }
@@ -366,11 +368,11 @@ impl KafkaAuth {
 /// `sftp` is its own `adapter` value, not a `FilesProtocol::Sftp`
 /// protocol — `dagster/dispar_orchestrate/adapters/files.py` is
 /// s3fs/S3-only, and a `files`/`sftp` round-trip would never have a
-/// working sink (`adapters/sftp.py` is its own module, WS9 §Phase D).
-/// `host_key_fingerprint` is **required** with no
-/// fallback — `paramiko.AutoAddPolicy` is NEVER acceptable (WS9 §Phase A
-/// hard requirement 1); `deny_unknown_fields` plus the missing-field error
-/// handle the rejection.
+/// working sink (`adapters/sftp.py` is its own module). `host_key_fingerprint`
+/// is **required** with no fallback — `paramiko.AutoAddPolicy` is NEVER
+/// acceptable, since it would accept any host key on first connect and
+/// defeat host verification entirely; `deny_unknown_fields` plus the
+/// missing-field error handle the rejection.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SftpDial {
@@ -385,9 +387,8 @@ pub struct SftpDial {
     /// listing, never for a real transfer).
     pub user: String,
     /// The pinned SSH host-key fingerprint the operator expects to see
-    /// when `paramiko.SSHClient.connect` runs (WS9 plan hard requirement
-    /// 1: never `AutoAddPolicy`). Required, no fallback; a missing field
-    /// fails to deserialize.
+    /// when `paramiko.SSHClient.connect` runs (never `AutoAddPolicy`).
+    /// Required, no fallback; a missing field fails to deserialize.
     pub host_key_fingerprint: String,
     /// The remote path the adapter reads from; the `source_objects` rows
     /// are file names within this directory.
@@ -1064,7 +1065,7 @@ mod tests {
         assert!(validate_hostname("host", "").is_err());
     }
 
-    // ── A2 — Tier 2 adapter shapes (WS9 §Phase A) ──────────────────────
+    // ── Tier 2 adapter shapes ───────────────────────────────────────────
 
     #[test]
     fn mongo_dial_parses_a_plain_uri_and_rejects_srv() {
@@ -1095,10 +1096,10 @@ mod tests {
 
     #[test]
     fn mongo_dial_has_no_srv_uri_field_at_all() {
-        // Hard Requirement 1 ("refuse mongodb+srv and replica-set discovery
-        // outright"): `deny_unknown_fields` is the structural guard, not
-        // a runtime check. Any MongoDial JSON carrying `srvUri` (or any
-        // other field not on the closed struct) fails to deserialize.
+        // "Refuse mongodb+srv and replica-set discovery outright":
+        // `deny_unknown_fields` is the structural guard, not a runtime
+        // check. Any MongoDial JSON carrying `srvUri` (or any other
+        // field not on the closed struct) fails to deserialize.
         let extra = serde_json::json!({
             "hosts": ["m.internal:27017"],
             "database": "d",
