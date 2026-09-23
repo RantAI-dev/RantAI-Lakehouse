@@ -25,6 +25,7 @@ import { formatRelativeTime } from "@/lib/format"
 import { HEALTH_LABEL, type Health } from "@/lib/status"
 import { connectorService } from "@/services"
 import type { Connector, IngestRun } from "@/services/contracts/connectors"
+import { ConnectorProbeHistoryPanel } from "./connector-probe-history-panel"
 
 type Direction = Connector["direction"]
 
@@ -188,6 +189,7 @@ function ConnectorDetail({ id }: { id: string }) {
   const testAction = useServiceAction((signal, connectorId: string) =>
     connectorService.testConnection(connectorId, signal)
   )
+  const [historyKey, setHistoryKey] = useState(0)
 
   if (state.status === "loading") return <LoadingSkeleton rows={4} />
   if (state.status === "error")
@@ -208,6 +210,7 @@ function ConnectorDetail({ id }: { id: string }) {
           onClick={async () => {
             await testAction.run(id)
             state.reload()
+            setHistoryKey((k) => k + 1)
           }}
         >
           {testAction.status === "pending" ? "Testing…" : "Test connection"}
@@ -263,6 +266,7 @@ function ConnectorDetail({ id }: { id: string }) {
           { label: "Discovered assets", value: c.discoveredAssets },
         ]}
       />
+      <ConnectorProbeHistoryPanel connectorId={id} refreshKey={historyKey} />
       <div>
         <p className="text-xs font-medium text-muted-foreground">Capabilities</p>
         <div className="mt-1.5 flex flex-wrap gap-1.5">
