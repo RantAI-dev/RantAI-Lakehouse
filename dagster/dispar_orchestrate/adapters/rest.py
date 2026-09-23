@@ -20,11 +20,41 @@ follow -- a public `baseUrl`/`tokenUrl` answering
 an unchecked host `pinned_resolution` never sees, since the redirect
 target is a different hostname than the one that was resolved and pinned.
 
-Implements all four pagination shapes (page/cursor/offset/none) and all
-four auth types (api_key/bearer/oauth2_client_credentials/basic) as a
-hand-rolled generator, not dlt.sources.rest_api -- this plan has not
-verified that library's constructor matches these four shapes exactly,
-and a hand-rolled generator is fully specified and testable without it.
+Implements exactly the three pagination shapes
+`rust/crates/lakehouse-store/src/ingest_spec.rs`'s `RestPagination`
+admits -- `none`/`page`/`cursor` -- and all four auth types
+(api_key/bearer/oauth2_client_credentials/basic) as a hand-rolled
+generator, not dlt.sources.rest_api -- this plan has not verified that
+library's constructor matches these shapes exactly, and a hand-rolled
+generator is fully specified and testable without it.
+
+FIELD NAMES MATCH THE CONTRACT, NOT THIS MODULE'S OWN EARLIER GUESS
+(the fix for the bug the G6 gate's `rest_stub.py` reports): `RestDial`
+is `deny_unknown_fields`, so the console/API validate and store exactly
+these keys, and this adapter must read the SAME ones:
+- `RestEndpoint.records_path` (JSON `recordsPath`) -- the JSON path in a
+  response body naming the record array; absent means the response body
+  IS the array. This module used to read a `dataPath` key the contract
+  has never had, so any endpoint that set `recordsPath` (the only name
+  `PUT .../ingest-spec` accepts) silently extracted nothing here.
+- `RestPagination::Page { param }` (JSON `{"type": "page", "param": ...}`)
+  -- the query parameter name carrying the page number.
+- `RestPagination::Cursor { cursor_field }` (JSON
+  `{"type": "cursor", "cursorField": ...}`) -- the JSON path in a
+  response body naming the next cursor. The contract gives cursor
+  pagination no SEPARATE outgoing query-parameter name the way `page`
+  has `param`, so this adapter re-sends the cursor value under that same
+  `cursorField` name -- the one name the contract carries for this
+  variant, not a second, invented one.
+- There is no `offset` variant: `RestPagination` has exactly three
+  variants (`none`/`page`/`cursor`; `#[serde(tag = "type")]`, so a
+  `pagination.type` naming anything else, including `"offset"`, is
+  rejected 400 by `Dial::parse` before an ingest-spec is ever stored).
+  This module used to implement a fourth, `offset`-typed branch nothing
+  on the contract side could ever select -- dead code presented as a
+  supported shape. Removed rather than kept "for completeness": AGENTS.md
+  principle 2 prefers "unsupported, honestly" over dead code that claims
+  a capability the contract does not admit.
 """
 
 from __future__ import annotations
@@ -98,53 +128,58 @@ def _auth_headers_and_params(
     raise ValueError(f"rest adapter does not know auth type {auth_type!r}")
 
 
-def _extract(body: dict, data_path: str | None) -> list:
+def _extract(body: dict | list, json_path: str | None):
+    """Walk a dotted JSON path (`RestEndpoint.records_path` or
+    `RestPagination::Cursor.cursor_field`) from a response body. No path
+    means the body itself IS the value (a bare record array at the root,
+    or -- for a cursor -- a top-level cursor field with no path)."""
     node = body
-    if data_path:
-        for part in data_path.split("."):
+    if json_path:
+        for part in json_path.split("."):
             node = node[part]
     return node
 
 
 def _paginate(base_url: str, endpoint: dict, pagination: dict, headers: dict, http_get: Callable):
     path = endpoint["path"]
-    data_path = endpoint.get("dataPath")
+    records_path = endpoint.get("recordsPath")
     ptype = pagination.get("type", "none")
-    param = pagination.get("param")
 
     if ptype == "none":
-        yield from _extract(http_get(base_url + path, headers=headers, params={}), data_path)
-        return
-    if ptype == "offset":
-        offset = 0
-        page_size = pagination.get("pageSize", 100)
-        while True:
-            rows = _extract(http_get(base_url + path, headers=headers, params={param: offset}), data_path)
-            if not rows:
-                return
-            yield from rows
-            offset += page_size
+        yield from _extract(http_get(base_url + path, headers=headers, params={}), records_path)
         return
     if ptype == "page":
+        param = pagination["param"]
         page = 1
         while True:
-            rows = _extract(http_get(base_url + path, headers=headers, params={param: page}), data_path)
+            rows = _extract(http_get(base_url + path, headers=headers, params={param: page}), records_path)
             if not rows:
                 return
             yield from rows
             page += 1
         return
     if ptype == "cursor":
-        cursor_path = pagination.get("cursorPath", "nextCursor")
+        # The contract's Cursor variant carries only cursor_field (the
+        # response-body path naming the next cursor) -- no separate
+        # outgoing-parameter name the way Page carries `param` -- so the
+        # cursor is re-sent under that SAME name (see this module's
+        # docstring, "FIELD NAMES MATCH THE CONTRACT").
+        cursor_field = pagination["cursorField"]
         params: dict = {}
         while True:
             body = http_get(base_url + path, headers=headers, params=params)
-            rows = _extract(body, data_path)
+            rows = _extract(body, records_path)
             yield from rows
-            cursor = body.get(cursor_path)
+            try:
+                cursor = _extract(body, cursor_field)
+            except (KeyError, TypeError):
+                # The next-cursor field is absent from this response --
+                # the conventional "no more pages" signal, same as an
+                # explicit null value, not a malformed response.
+                cursor = None
             if not cursor:
                 return
-            params = {param: cursor}
+            params = {cursor_field: cursor}
         return
     raise ValueError(f"rest adapter does not know pagination type {ptype!r}")
 

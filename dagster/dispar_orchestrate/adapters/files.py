@@ -11,10 +11,28 @@ the WS2 review's own finding) wraps `aiobotocore`, which runs over
 `aiohttp`; with `aiodns` absent (verified) aiohttp's threaded resolver
 calls `socket.getaddrinfo` -- FULL pinning applies (unlike sql.py's
 postgresql/mssql drivers), proven with no real network by
-`test_pinned_resolution_is_consulted_on_the_s3fs_path`. When
-`dial.endpoint` is absent, this connector dials the deployment's own
-fixed RustFS warehouse (not a distinct connector-chosen host), so no
-check is made -- `resolved` is `None` in that case.
+`test_pinned_resolution_is_consulted_on_the_s3fs_path`.
+
+Docstring correction (this module previously claimed an absent
+`dial.endpoint` dials "the deployment's own fixed RustFS warehouse" --
+false, and never implemented): `_default_get_object` passes
+`client_kwargs={}` when `endpoint` is falsy, and `s3fs.S3FileSystem`'s
+own default, with no `endpoint_url` override, is `boto3`'s standard
+region-based AWS S3 endpoint -- there is no RustFS fallback anywhere in
+this module or its caller. `rust/crates/lakehouse-store/src/ingest_spec.rs`'s
+`FilesDial::endpoint` doc agrees: it names the field "an optional
+endpoint override (e.g. a RustFS/MinIO endpoint URL rather than public
+AWS S3)" -- an OVERRIDE of a public-AWS default, not a switch between two
+already-implemented targets. So: an absent `endpoint` means this
+connector dials the provider's own fixed, well-known public S3 endpoint
+-- not a caller-chosen host -- which is exactly why `resolved` is `None`
+and no SSRF check runs in that branch: the check exists for a
+CALLER-CHOSEN host (Z1's threat model), and a fixed public provider
+endpoint the caller cannot redirect is not one. That SSRF reasoning still
+holds under the corrected meaning; only the "RustFS" claim was false. A
+deployment that wants this connector to reach its own RustFS warehouse
+must set `dial.endpoint` explicitly, going through the same SSRF check as
+any other caller-chosen host.
 
 Tier 1 reads `format: "csv"` only. `parquet`/`jsonl`/`xlsx` are shapes
 this adapter does not yet read: `build_source` raises `ValueError` naming
