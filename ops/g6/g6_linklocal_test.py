@@ -43,6 +43,7 @@ import requests
 API_URL = os.environ.get("LAKEHOUSE_API_URL", "http://lakehouse-api:8080")
 AUTH_EMAIL = os.environ.get("AUTH_BOOTSTRAP_EMAIL", "ci@example.com")
 AUTH_PASSWORD = os.environ.get("AUTH_BOOTSTRAP_PASSWORD", "ci-password-not-real-123")
+DAGSTER_URL = os.environ.get("DAGSTER_URL", "http://dagster-webserver:3000/graphql")
 API = requests.Session()
 
 GATE_SECRETS_DIR = "/gate-secrets"
@@ -200,8 +201,36 @@ def step_kafka_spoofed_advertised_broker() -> None:
     _assert_rejected(connector_id=connector_id, label="kafka advertised-broker spoof")
 
 
+def _wait_for_ingest_job(timeout_s: int = 120) -> None:
+    """Wait until Dagster's code location lists `ingest_job`. The webserver
+    answering is not enough: compose can recreate `dagster-code-location`
+    when this runner starts, and an `ingest/run` in that window fails with
+    PipelineNotFoundError (seen in CI) instead of reaching the SSRF
+    assertion this file exists for."""
+    query = "{ repositoriesOrError { ... on RepositoryConnection { nodes { jobs { name } } } } }"
+    deadline = time.time() + timeout_s
+    last_err: Exception | None = None
+    while time.time() < deadline:
+        try:
+            resp = requests.post(DAGSTER_URL, json={"query": query}, timeout=5)
+            resp.raise_for_status()
+            nodes = (resp.json().get("data") or {}).get("repositoriesOrError", {}).get("nodes") or []
+            if any(j.get("name") == "ingest_job" for n in nodes for j in n.get("jobs", [])):
+                print("[g6-linklocal] ready: Dagster code location (ingest_job loaded)")
+                return
+        except Exception as exc:  # noqa: BLE001
+            last_err = exc
+        time.sleep(2)
+    raise SystemExit(f"[g6-linklocal] timed out waiting for ingest_job to load: {last_err}")
+
+
 def main() -> int:
     _login()
+    try:
+        _wait_for_ingest_job()
+    except SystemExit as exc:
+        print(exc, file=sys.stderr)
+        return 1
     try:
         step_rest_link_local()
         step_kafka_spoofed_advertised_broker()

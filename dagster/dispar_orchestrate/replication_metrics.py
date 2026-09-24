@@ -185,7 +185,11 @@ _REPLICATION_SLOT_HEALTH_VIEW_DDL = (
     "argMax(wal_retained_bytes, checked_at) AS wal_retained_bytes, "
     "argMax(confirmed_flush_lag_bytes, checked_at) AS confirmed_flush_lag_bytes, "
     "argMax(active, checked_at) AS active, "
-    "if(argMax(status, checked_at) IN ('warning', 'critical'), 1, 0) AS unhealthy "
+    # `status` below is the alias above, not the raw column: in ClickHouse
+    # an alias shadows the column of the same name, so writing
+    # `argMax(status, checked_at)` again here nests an aggregate inside an
+    # aggregate and the whole CREATE VIEW fails (ILLEGAL_AGGREGATION).
+    "if(status IN ('warning', 'critical'), 1, 0) AS unhealthy "
     "FROM lake.`bronze_meta.replication_slot` "
     "GROUP BY connector_id, slot_name"
 )
