@@ -367,6 +367,17 @@ jobs:
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
+          # dagster-code-location's `dlt` SSRF guard fail-closed refuses
+          # to dial `BRONZE_SOURCE_DB_HOST` (hardcoded to this compose
+          # network's own `postgres`, docker-compose.yml) unless this is
+          # set -- the guard's default posture, unchanged for every OTHER
+          # deployment (docker-compose.yml's own comment on this var).
+          # This gate's `bronze_ingest_job` run IS that co-located,
+          # operator-configured source, so it opts in for itself here,
+          # the same "gate sets it in its own .env" shape
+          # `ops/g6/docker-compose.g6.override.yml`'s header comment
+          # documents for its own fixtures.
+          INGEST_ALLOW_INTERNAL_HOSTS=true
           EOF
 
       - name: Bring up lakehouse-api + Dagster + the G3a source table
@@ -407,6 +418,11 @@ jobs:
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
           LAKEKEEPER_BASE_URI=http://lakekeeper:8181
           DAGSTER_URL=http://dagster-webserver:3000/graphql
+          # Same as g3a-dagster's own .env above: `ops/g3/g3_test.py`
+          # triggers `bronze_ingest_job` too (its own module doc, "if no
+          # Bronze table is registered yet"), which hits the same `dlt`
+          # SSRF guard against this compose network's own `postgres`.
+          INGEST_ALLOW_INTERNAL_HOSTS=true
           EOF
 
       - name: Bring up lakehouse-api + Dagster + the G3a source table
@@ -509,7 +525,13 @@ jobs:
           AUTH_BOOTSTRAP_EMAIL=ci@example.com
           AUTH_BOOTSTRAP_PASSWORD=ci-password-not-real-123
           MYSQL_ROOT_PASSWORD=ci-mysql-not-real-123
+          CONNECTOR_MYSQL_PASSWORD=ci-mysql-connector-not-real-123
           MSSQL_SA_PASSWORD=Ci-Mssql-Not-Real-123!
+          MONGO_G6_ROOT_USER=ci-mongo-root-not-real
+          MONGO_G6_ROOT_PASSWORD=ci-mongo-not-real-123
+          INGEST_SERVICE_TOKEN=ci-ingest-service-token-not-real-123
+          LAKEKEEPER_BASE_URI=http://lakekeeper:8181
+          DAGSTER_URL=http://dagster-webserver:3000/graphql
           EOF
 
       - name: Bring up the g6 matrix (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)

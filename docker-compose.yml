@@ -1539,6 +1539,19 @@ services:
           subpath: dlt.jwt
         read_only: true
     environment:
+      # WS3 item 20 (`dlt_pipeline.py::run_bronze_ingest`) — the `dlt`
+      # SSRF guard fail-closed refuses to dial an RFC1918/private
+      # address unless this is set; `BRONZE_SOURCE_DB_HOST` below is
+      # hardcoded to this SAME compose network's own `postgres` service,
+      # which is exactly such an address, so the demo bronze-ingest
+      # pipeline cannot run at all against the unmodified compose file
+      # without an explicit opt-in. Left unset by default (`:-`, empty —
+      # the guard's own fail-closed posture, unchanged): a deployment
+      # that wants this demo pipeline to reach a co-located,
+      # operator-configured source sets it in its own `.env`, the same
+      # way `ops/g6/docker-compose.g6.override.yml`'s gate-only override
+      # already does for its own fixtures — never a default here.
+      INGEST_ALLOW_INTERNAL_HOSTS: ${INGEST_ALLOW_INTERNAL_HOSTS:-}
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
       DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
@@ -2764,7 +2777,22 @@ services:
   # every compose-network container already is one.
   kafka-g6-spoofed:
     image: apache/kafka:3.8.0
-    profiles: ["g6"]
+    # Also "dagster", not only "g6": `g6-test-runner-linklocal` below is
+    # deliberately profile "dagster" (its own comment explains why — it
+    # must run against the default compose file with no override), and
+    # its `depends_on: kafka-g6-spoofed` makes this fixture part of that
+    # service's dependency graph. Compose validates every depends_on
+    # target against the ACTIVE profile set at model-build time, before
+    # deciding what to actually start — `docker compose --profile
+    # dagster config` refused the whole project with "depends on
+    # undefined service kafka-g6-spoofed" until this fixture carried the
+    # same profile, breaking every job that activates "dagster" alone
+    # (g3a-dagster, g3-maintenance, g4-cdc), not only g6-ingest's own
+    # link-local step. Widening the profile does not start this
+    # container in those other jobs: none of them names it or
+    # `g6-test-runner-linklocal` explicitly, and `up` with explicit
+    # service names starts only those services' own dependency chains.
+    profiles: ["g6", "dagster"]
     restart: "no"
     networks:
       default:
