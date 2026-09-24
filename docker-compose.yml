@@ -2898,6 +2898,7 @@ services:
         condition: service_healthy
     environment:
       LAKEHOUSE_API_URL: http://lakehouse-api:8080
+      DAGSTER_URL: http://dagster-webserver:3000/graphql
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
       AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
     entrypoint: ["/bin/sh", "-c"]
