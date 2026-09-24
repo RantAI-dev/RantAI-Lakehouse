@@ -108,6 +108,19 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
+      # A single-file `subpath` volume mount (the `gold-export.jwt`/
+      # `lakehouse-api-reader.jwt`/`admin.jwt` mounts below) fails at
+      # container CREATE time if that path does not already exist inside
+      # the named volume — unlike an unset env var or an unreachable
+      # host, this is not something a route can degrade past at request
+      # time, so it is not the same category as the `lakekeeper-authz-init`
+      # decoupling explained below. `oidc-mock` mints all three files
+      # (`mint_tokens` in `ops/oidc-mock/server.py`) before its own HTTP
+      # server starts answering the healthcheck below, so depending on it
+      # here only waits for the mock IdP itself, never for Lakekeeper
+      # provisioning.
+      oidc-mock:
+        condition: service_healthy
       # Code-review fix: this used to ALSO depend on
       # `lakekeeper-authz-init: condition: service_completed_successfully`
       # (ADR 0010/0011 — Gold export needs the `gold-export` principal
