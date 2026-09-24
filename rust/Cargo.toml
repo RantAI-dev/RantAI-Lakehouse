@@ -45,7 +45,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
 argon2 = "0.5"
 subtle = "2"
-jsonwebtoken = "9"
+jsonwebtoken = "11"
 # `lakehouse-api::next_run` (WS4 item G2) is the first workstream to land
 # this dependency -- WS5 also needs cron-next-occurrence computation and
 # reuses this same entry rather than adding a second one (programme rule:
