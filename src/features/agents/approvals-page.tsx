@@ -4,13 +4,10 @@ import * as React from "react"
 import Link from "next/link"
 import { CheckIcon, XIcon } from "lucide-react"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
+import { DataTable } from "@/components/data-table/data-table"
+import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
+import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
-import {
-  FilterSelect,
-  FilterToolbar,
-  SearchField,
-} from "@/components/patterns/filter-toolbar"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { PageHeader } from "@/components/patterns/page-header"
 import {
@@ -18,140 +15,296 @@ import {
   ErrorState,
   LoadingSkeleton,
 } from "@/components/patterns/page-states"
-import { ApprovalBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { useAuth } from "@/features/auth/auth-provider"
+import { useDataTable } from "@/hooks/use-data-table"
+import { filterDataClientSide } from "@/lib/data-table"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { accessGrantState, isOwnAccessRequest } from "@/lib/access-requests"
+import { isOwnAccessRequest } from "@/lib/access-requests"
+import { withNotify } from "@/lib/notify"
 import { formatCost, formatRelativeTime } from "@/lib/format"
-import { APPROVAL_STATUS_LABEL, type ApprovalStatus } from "@/lib/status"
 import { agentService, assetService } from "@/services"
 import type { ApprovalItem } from "@/services/contracts/agents"
+import { accessPermission, getApprovalColumns, statusCell } from "./approval-columns"
 
-/** `"access:catalog:write"` → `"catalog:write"` — the permission a `kind = "access"` row's `action` names. */
-function accessPermission(action: string): string {
-  return action.startsWith("access:") ? action.slice("access:".length) : action
+interface DrawerContentProps {
+  readonly selected: ApprovalItem
+  readonly executionResult: { readonly executed: boolean; readonly result?: unknown } | null
+  readonly decidedGrants: Record<string, string>
+  readonly selfApproval: boolean
+  readonly onDecide: (decision: "approved" | "rejected") => void
 }
 
-/**
- * The row's own known grant expiry — only ever available for a request
- * THIS session just decided (`decidedGrants`, keyed by approval id). A
- * row read back from `GET /api/agents/approvals` never carries it (that
- * route lists `approval_item` rows only; the grant's `expires_at` lives
- * in a separate `access_grant` row nothing joins in — see
- * `@/lib/access-requests`'s `accessGrantState` doc comment). Showing
- * nothing here for an older approved request is the honest choice, never
- * a fabricated date.
- */
-function statusCell(r: ApprovalItem, decidedGrants: Record<string, string>) {
-  if (r.kind !== "access") return <ApprovalBadge status={r.status} />
-  const expiresAt = decidedGrants[r.id]
-  const grantState = accessGrantState(r.status, expiresAt, Date.now())
-  if (grantState === "approved-expired") {
-    // Deliberately NOT the "Approved" tone — an expired grant must never
-    // read as still active.
-    return <Pill tone="neutral">Expired</Pill>
-  }
+function ApprovalDrawerContent({
+  selected,
+  executionResult,
+  decidedGrants,
+  selfApproval,
+  onDecide,
+}: DrawerContentProps) {
+  const costText = selected.costEstimate != null ? formatCost(selected.costEstimate) : "—"
+  const decisionText = selected.decidedAt
+    ? `${selected.status} · ${formatRelativeTime(selected.decidedAt)}`
+    : "Pending"
+  // A grant's real expiry is only ever known for a row THIS session just
+  // decided (see `statusCell`'s doc comment); an older `expiresAt` on a
+  // tool-call approval is a real backend field either way.
+  const expiresValue =
+    selected.kind === "access"
+      ? decidedGrants[selected.id]
+      : selected.expiresAt
+
   return (
-    <span className="flex flex-wrap items-center gap-1.5">
-      <ApprovalBadge status={r.status} />
-      {grantState === "approved-active" && expiresAt ? (
-        <span className="text-xs text-muted-foreground">
-          until {formatRelativeTime(expiresAt)}
-        </span>
+    <>
+      <div className="flex flex-wrap items-center gap-2">
+        {statusCell(selected, decidedGrants)}
+        {selected.status === "pending" && selfApproval ? (
+          <span title="You requested this access; a different Governance Admin must decide it">
+            <Button size="sm" disabled>
+              <CheckIcon data-icon="inline-start" />
+              Approve
+            </Button>
+          </span>
+        ) : null}
+        {selected.status === "pending" && !selfApproval ? (
+          <>
+            <Button size="sm" onClick={() => onDecide("approved")}>
+              <CheckIcon data-icon="inline-start" />
+              Approve
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => onDecide("rejected")}
+            >
+              <XIcon data-icon="inline-start" />
+              Reject
+            </Button>
+          </>
+        ) : null}
+        {selected.auditEventId ? (
+          <Button
+            size="sm"
+            variant="ghost"
+            render={<Link href={`/audit?event=${selected.auditEventId}`} />}
+          >
+            Audit
+          </Button>
+        ) : null}
+      </div>
+      <MetadataList
+        items={[
+          ...(selected.kind === "access"
+            ? []
+            : [
+                {
+                  label: "Agent",
+                  value: (
+                    <Link
+                      href={`/agents/employees/${selected.employeeId}`}
+                      className="text-primary hover:underline"
+                    >
+                      {selected.employeeName}
+                    </Link>
+                  ),
+                },
+              ]),
+          {
+            label: "Run",
+            value: selected.runId ? (
+              <Link
+                href={`/agents/runs/${encodeURIComponent(selected.runId)}`}
+                className="font-mono text-xs text-primary hover:underline"
+              >
+                {selected.runId}
+              </Link>
+            ) : (
+              "—"
+            ),
+          },
+          {
+            // The Agent Workflows page was removed (no mock consumer left
+            // for it), so this renders the workflow id as plain text
+            // instead of a link that would land on a missing route.
+            label: "Workflow",
+            value: selected.workflowId ? (
+              <span className="font-mono text-xs">{selected.workflowId}</span>
+            ) : (
+              "—"
+            ),
+          },
+          {
+            label: selected.kind === "access" ? "Catalog entry" : "Resource",
+            value: selected.resource ?? "—",
+          },
+          { label: "Reason", value: selected.reason ?? "—" },
+          { label: "Impact", value: selected.impact ?? "—" },
+          { label: "Risk", value: selected.risk || "—" },
+          { label: "Policy", value: selected.policy ?? "—" },
+          { label: "Cost estimate", value: costText },
+          {
+            label: "Requested",
+            value: formatRelativeTime(selected.requestedAt),
+          },
+          {
+            label: "Expires",
+            value: expiresValue ? formatRelativeTime(expiresValue) : "—",
+          },
+          {
+            label: "Decision",
+            value: decisionText,
+          },
+          {
+            label: "Comment",
+            value: selected.comment ?? "—",
+          },
+        ]}
+      />
+      {selected.evidence && selected.evidence.length > 0 ? (
+        <div>
+          <p className="text-xs font-medium text-muted-foreground">
+            Supporting evidence
+          </p>
+          <ul className="mt-1 list-disc space-y-1 pl-4 text-sm">
+            {selected.evidence.map((e) => (
+              <li key={e}>{e}</li>
+            ))}
+          </ul>
+        </div>
       ) : null}
-    </span>
+      {executionResult ? (
+        <div>
+          <p className="text-xs font-medium text-muted-foreground">
+            {executionResult.executed
+              ? "Execution result"
+              : "Decision recorded — not executed"}
+          </p>
+          <pre className="mt-1 max-h-64 overflow-auto rounded bg-muted/60 px-2 py-1.5 font-mono text-[11px] text-muted-foreground">
+            {executionResult.executed
+              ? JSON.stringify(executionResult.result, null, 2)
+              : "The tool was never executed — either the action was rejected, or the approver lacked the underlying tool's own permission."}
+          </pre>
+        </div>
+      ) : null}
+    </>
   )
+}
+
+function getDecisionDescription(
+  selected: ApprovalItem | null,
+  decision: "approved" | "rejected" | null
+): string {
+  if (!selected) {
+    return "Confirm this approval decision."
+  }
+  const verb = decision === "approved" ? "Approve" : "Reject"
+  const label = selected.kind === "access" ? `Access: ${accessPermission(selected.action)}` : selected.action
+  return `${verb} "${label}"?`
 }
 
 export function ApprovalsPage() {
   const state = useService((s) => agentService.listApprovals(undefined, s), [])
   const { user } = useAuth()
-  const [search, setSearch] = React.useState("")
-  const [status, setStatus] = React.useState<ApprovalStatus | "all">("pending")
   const [selected, setSelected] = React.useState<ApprovalItem | null>(null)
   const [decision, setDecision] = React.useState<"approved" | "rejected" | null>(
     null
   )
   const [comment, setComment] = React.useState("")
   const [executionResult, setExecutionResult] = React.useState<{
-    executed: boolean
-    result?: unknown
+    readonly executed: boolean
+    readonly result?: unknown
   } | null>(null)
   // Grants this session decided, keyed by approval id — see `statusCell`'s
   // doc comment on why an already-decided access request otherwise has no
   // expiry to show.
   const [decidedGrants, setDecidedGrants] = React.useState<Record<string, string>>({})
 
-  // N1 (WS7 plan): a `kind = "tool_call"` decision and a `kind = "access"`
-  // decision are two different routes with two different server-side
-  // authorities (`agent:approve` vs `access:approve`) — never one call
-  // that guesses which endpoint to hit.
+  // A `kind = "tool_call"` decision and a `kind = "access"` decision are
+  // two different routes with two different server-side authorities
+  // (`agent:approve` vs `access:approve`) — never one call that guesses
+  // which endpoint to hit.
   const decideToolCall = useServiceAction(
-    (signal, id: string, input: { decision: "approved" | "rejected"; comment?: string }) =>
-      agentService.decideApproval(id, input, signal)
+    withNotify(
+      { success: "Decision recorded", error: "Failed to record decision" },
+      (signal, id: string, input: { decision: "approved" | "rejected"; comment?: string }) =>
+        agentService.decideApproval(id, input, signal)
+    )
   )
   const decideAccess = useServiceAction(
-    (signal, id: string, dec: "approved" | "rejected", cmt: string | undefined) => {
-      // `decideAccessRequest` is optional on `AssetService` only so the
-      // dead `mock/assets.ts` fixture still satisfies the interface — see
-      // that contract's own doc comment. Fail closed rather than
-      // silently no-op if that assumption is ever wrong.
-      if (!assetService.decideAccessRequest) {
-        return Promise.reject(new Error("This deployment cannot decide access requests."))
+    withNotify(
+      { success: "Decision recorded", error: "Failed to record decision" },
+      (signal, id: string, dec: "approved" | "rejected", cmt: string | undefined) => {
+        // `decideAccessRequest` is optional on `AssetService` only so the
+        // dead `mock/assets.ts` fixture still satisfies the interface —
+        // see that contract's own doc comment. Fail closed rather than
+        // silently no-op if that assumption is ever wrong.
+        if (!assetService.decideAccessRequest) {
+          return Promise.reject(new Error("This deployment cannot decide access requests."))
+        }
+        return assetService.decideAccessRequest(id, dec, cmt, signal)
       }
-      return assetService.decideAccessRequest(id, dec, cmt, signal)
-    }
+    )
   )
   const deciding = decideToolCall.status === "pending" || decideAccess.status === "pending"
   const decideError = decideToolCall.error ?? decideAccess.error
 
-  const columns: ColumnDef<ApprovalItem>[] = [
-    {
-      key: "action",
-      header: "Requested action",
-      render: (r) => (
-        <div>
-          <p className="font-medium">
-            {r.kind === "access" ? `Access: ${accessPermission(r.action)}` : r.action}
-          </p>
-          <p className="text-xs text-muted-foreground">
-            {r.kind === "access" ? (r.reason || "—") : r.employeeName}
-          </p>
-        </div>
-      ),
-    },
-    {
-      key: "status",
-      header: "Status",
-      render: (r) => statusCell(r, decidedGrants),
-    },
-    { key: "risk", header: "Risk", render: (r) => r.risk || "—" },
-    {
-      key: "requested",
-      header: "Requested",
-      render: (r) => (
-        <span className="text-muted-foreground">
-          {formatRelativeTime(r.requestedAt)}
-        </span>
-      ),
-    },
-  ]
+  const selfApprovalOf = React.useCallback(
+    (item: ApprovalItem) => user !== null && isOwnAccessRequest(item, user.id),
+    [user]
+  )
 
-  const rows = React.useMemo(() => {
-    if (state.status !== "success") return []
-    const q = search.trim().toLowerCase()
-    return state.data.filter((a) => {
-      if (status !== "all" && a.status !== status) return false
-      if (!q) return true
-      return [a.action, a.employeeName, a.risk, a.resource ?? "", a.reason ?? ""]
-        .join(" ")
-        .toLowerCase()
-        .includes(q)
-    })
-  }, [state.status, state.data, search, status])
+  const columns = React.useMemo(
+    () =>
+      getApprovalColumns({
+        onSelect: (item) => {
+          setExecutionResult(null)
+          setSelected(item)
+        },
+        onDecide: (item, d) => {
+          setSelected(item)
+          setDecision(d)
+        },
+        decidedGrants,
+        isSelfApproval: selfApprovalOf,
+      }),
+    [decidedGrants, selfApprovalOf]
+  )
+
+  const data = state.data ?? []
+
+  const tableUrlState = useTableUrlState()
+  const filteredData = React.useMemo(
+    () =>
+      filterDataClientSide(state.data ?? [], {
+        search: tableUrlState.search,
+        searchFields: [
+          (r) => r.action,
+          (r) => r.employeeName,
+          (r) => r.resource,
+          (r) => r.risk,
+        ],
+        filters: tableUrlState.filters,
+        joinOperator: tableUrlState.joinOperator,
+      }),
+    [state.data, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
+  )
+
+  const { table } = useDataTable({
+    data: filteredData,
+    columns,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/agents/approvals",
+    initialState: {
+      columnPinning: { right: ["actions"] },
+    },
+    getRowId: (row) => row.id,
+  })
 
   async function confirmDecision() {
     if (!selected || !decision) return
@@ -189,8 +342,8 @@ export function ApprovalsPage() {
     }
   }
 
-  const selfApproval =
-    selected !== null && user !== null && isOwnAccessRequest(selected, user.id)
+  const selfApproval = selected !== null && selfApprovalOf(selected)
+  const dialogDescription = getDecisionDescription(selected, decision)
 
   return (
     <div className="flex flex-col gap-4">
@@ -198,28 +351,11 @@ export function ApprovalsPage() {
         title="Approvals"
         description="Human review gate for higher-risk agent actions and catalog access requests. Approve or reject with impact context before anything takes effect."
       />
-      <FilterToolbar>
-        <SearchField
-          value={search}
-          onChange={setSearch}
-          placeholder="Search approvals..."
-        />
-        <FilterSelect
-          ariaLabel="Filter by status"
-          allLabel="All statuses"
-          value={status}
-          onChange={(v) => setStatus(v as ApprovalStatus | "all")}
-          options={Object.entries(APPROVAL_STATUS_LABEL).map(([value, label]) => ({
-            value,
-            label,
-          }))}
-        />
-      </FilterToolbar>
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? (
         <ErrorState error={state.error} onRetry={state.reload} />
       ) : null}
-      {state.status === "success" && rows.length === 0 ? (
+      {state.status === "success" && data.length === 0 ? (
         <EmptyState
           title="No approvals"
           description="A request lands here whenever a run — from the copilot chat, Run now, or a schedule — hits a high-risk (WriteHigh) tool call, or a catalog viewer requests a permission they don't hold. Nothing is waiting on you right now."
@@ -230,16 +366,15 @@ export function ApprovalsPage() {
           }
         />
       ) : null}
-      {state.status === "success" && rows.length > 0 ? (
-        <DataTable
-          columns={columns}
-          rows={rows}
-          rowKey={(r) => r.id}
-          onRowClick={(r) => {
-            setExecutionResult(null)
-            setSelected(r)
-          }}
-        />
+      {state.status === "success" && data.length > 0 ? (
+        <div className="space-y-4">
+          <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
+            <DataTableSearch placeholder="Search approvals..." />
+          </DataTableAdvancedToolbar>
+          <div className="rounded-md border">
+            <DataTable table={table} />
+          </div>
+        </div>
       ) : null}
 
       <DetailDrawer
@@ -258,167 +393,13 @@ export function ApprovalsPage() {
         }
       >
         {selected ? (
-          <>
-            <div className="flex flex-wrap items-center gap-2">
-              {statusCell(selected, decidedGrants)}
-              {selected.status === "pending" && selfApproval ? (
-                <Tooltip>
-                  <TooltipTrigger
-                    render={
-                      <span>
-                        <Button size="sm" disabled>
-                          <CheckIcon data-icon="inline-start" />
-                          Approve
-                        </Button>
-                      </span>
-                    }
-                  />
-                  <TooltipContent>
-                    You requested this access; a different Governance Admin must
-                    decide it
-                  </TooltipContent>
-                </Tooltip>
-              ) : null}
-              {selected.status === "pending" && !selfApproval ? (
-                <>
-                  <Button size="sm" onClick={() => setDecision("approved")}>
-                    <CheckIcon data-icon="inline-start" />
-                    Approve
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => setDecision("rejected")}
-                  >
-                    <XIcon data-icon="inline-start" />
-                    Reject
-                  </Button>
-                </>
-              ) : null}
-              {selected.auditEventId ? (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  render={<Link href={`/audit?event=${selected.auditEventId}`} />}
-                >
-                  Audit
-                </Button>
-              ) : null}
-            </div>
-            <MetadataList
-              items={[
-                ...(selected.kind === "access"
-                  ? []
-                  : [
-                      {
-                        label: "Agent",
-                        value: (
-                          <Link
-                            href={`/agents/employees/${selected.employeeId}`}
-                            className="text-primary hover:underline"
-                          >
-                            {selected.employeeName}
-                          </Link>
-                        ),
-                      },
-                    ]),
-                {
-                  // T3.4 of the copilot-operations-handover plan added
-                  // `/agents/runs/[id]`, so this links there now instead of
-                  // showing the run id as plain text.
-                  label: "Run",
-                  value: selected.runId ? (
-                    <Link
-                      href={`/agents/runs/${encodeURIComponent(selected.runId)}`}
-                      className="font-mono text-xs text-primary hover:underline"
-                    >
-                      {selected.runId}
-                    </Link>
-                  ) : (
-                    "—"
-                  ),
-                },
-                {
-                  // WS1 T11 removed the Agent Workflows page, so this
-                  // renders the workflow id as plain text instead of a
-                  // link that would land on a missing route.
-                  label: "Workflow",
-                  value: selected.workflowId ? (
-                    <span className="font-mono text-xs">
-                      {selected.workflowId}
-                    </span>
-                  ) : (
-                    "—"
-                  ),
-                },
-                {
-                  label: selected.kind === "access" ? "Catalog entry" : "Resource",
-                  value: selected.resource ?? "—",
-                },
-                { label: "Reason", value: selected.reason ?? "—" },
-                { label: "Impact", value: selected.impact ?? "—" },
-                { label: "Risk", value: selected.risk || "—" },
-                { label: "Policy", value: selected.policy ?? "—" },
-                {
-                  label: "Cost estimate",
-                  value:
-                    selected.costEstimate != null
-                      ? formatCost(selected.costEstimate)
-                      : "—",
-                },
-                {
-                  label: "Requested",
-                  value: formatRelativeTime(selected.requestedAt),
-                },
-                {
-                  label: "Expires",
-                  value: (() => {
-                    const grantExpiry =
-                      selected.kind === "access"
-                        ? decidedGrants[selected.id]
-                        : selected.expiresAt
-                    return grantExpiry ? formatRelativeTime(grantExpiry) : "—"
-                  })(),
-                },
-                {
-                  label: "Decision",
-                  value: selected.decidedAt
-                    ? `${selected.status} · ${formatRelativeTime(selected.decidedAt)}`
-                    : "Pending",
-                },
-                {
-                  label: "Comment",
-                  value: selected.comment ?? "—",
-                },
-              ]}
-            />
-            {selected.evidence && selected.evidence.length > 0 ? (
-              <div>
-                <p className="text-xs font-medium text-muted-foreground">
-                  Supporting evidence
-                </p>
-                <ul className="mt-1 list-disc space-y-1 pl-4 text-sm">
-                  {selected.evidence.map((e) => (
-                    <li key={e}>{e}</li>
-                  ))}
-                </ul>
-              </div>
-            ) : null}
-            {executionResult ? (
-              <div>
-                <p className="text-xs font-medium text-muted-foreground">
-                  {executionResult.executed
-                    ? "Execution result"
-                    : "Decision recorded — not executed"}
-                </p>
-                <pre className="mt-1 max-h-64 overflow-auto rounded bg-muted/60 px-2 py-1.5 font-mono text-[11px] text-muted-foreground">
-                  {executionResult.executed
-                    ? JSON.stringify(executionResult.result, null, 2)
-                    : "The tool was never executed — either the action was rejected, or the approver lacked the underlying tool's own permission."}
-                </pre>
-              </div>
-            ) : null}
-          </>
+          <ApprovalDrawerContent
+            selected={selected}
+            executionResult={executionResult}
+            decidedGrants={decidedGrants}
+            selfApproval={selfApproval}
+            onDecide={setDecision}
+          />
         ) : null}
       </DetailDrawer>
 
@@ -431,15 +412,7 @@ export function ApprovalsPage() {
           }
         }}
         title={decision === "approved" ? "Approve action" : "Reject action"}
-        description={
-          selected
-            ? `${decision === "approved" ? "Approve" : "Reject"} “${
-                selected.kind === "access"
-                  ? `Access: ${accessPermission(selected.action)}`
-                  : selected.action
-              }”?`
-            : "Confirm this approval decision."
-        }
+        description={dialogDescription}
         impact={
           selected?.impact ??
           (selected?.kind === "access"
@@ -471,3 +444,4 @@ export function ApprovalsPage() {
     </div>
   )
 }
+

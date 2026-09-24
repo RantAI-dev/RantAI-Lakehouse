@@ -11,8 +11,14 @@
 // before any import resolves. `mock.module` is hoisted to the top of the
 // file by bun's test runner, so the stub is in place before the `import`
 // statements below pull in `AuthProvider`.
+//
+// `useSearchParams` is stubbed too: the Advanced Data Table's
+// `useTableUrlState` reads it for page/sort/filter state, and the real
+// hook returns `null` outside a Router context, which crashed every test
+// in this file at `searchParams.get`.
 mock.module("next/navigation", () => ({
   usePathname: () => "/admin/service-identities",
+  useSearchParams: () => new URLSearchParams(),
   useRouter: () => ({
     push: () => {},
     replace: () => {},
@@ -26,6 +32,7 @@ mock.module("next/navigation", () => ({
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test"
 import { AuthProvider } from "@/features/auth/auth-provider"
+import { TableProviders } from "@/components/app-shell/table-providers"
 import { ServiceIdentitiesPage } from "./service-identities-page"
 
 const originalFetch = global.fetch
@@ -52,7 +59,7 @@ afterEach(() => {
   // auto-cleaning between tests, so the previous `it`'s
   // `<ServiceIdentitiesPage />` (and its `<Dialog>` portal) would
   // otherwise still be in the DOM when the next `it` rendered —
-  // `getByRole("button", { name: /rotate/i })` would then find two
+  // `getByRole("button", { name: /service identity actions/i })` would then find two
   // matching buttons and throw "Found multiple elements".
   cleanup()
   global.fetch = originalFetch
@@ -150,11 +157,26 @@ function setupFetch(opts: {
 }
 
 function renderPage() {
+  // `TableProviders` (normally mounted once in the root layout) supplies
+  // the `NuqsAdapter` the Advanced Data Table's URL-backed state needs —
+  // without it, `useTableMemory`'s `useQueryStates` throws "nuqs requires
+  // an adapter" outside a real Next.js app tree.
   return render(
-    <AuthProvider>
-      <ServiceIdentitiesPage />
-    </AuthProvider>,
+    <TableProviders>
+      <AuthProvider>
+        <ServiceIdentitiesPage />
+      </AuthProvider>
+    </TableProviders>,
   )
+}
+
+// "Rotate credential" lives inside the row actions dropdown, not a bare
+// button on the row — open the trigger first, then click the menu item
+// the trigger's popover renders.
+async function clickRotate() {
+  fireEvent.click(screen.getByRole("button", { name: /service identity actions/i }))
+  const item = await screen.findByText(/rotate credential/i)
+  fireEvent.click(item)
 }
 
 describe("ServiceIdentitiesPage rotate (new secret shown once, never persisted)", () => {
@@ -162,7 +184,7 @@ describe("ServiceIdentitiesPage rotate (new secret shown once, never persisted)"
     setupFetch({})
     renderPage()
     await waitFor(() => expect(screen.getByText("ingestion-worker")).toBeDefined())
-    fireEvent.click(screen.getByRole("button", { name: /rotate/i }))
+    await clickRotate()
     await waitFor(() => {
       const call = fetchCalls.find(
         (c) =>
@@ -186,7 +208,7 @@ describe("ServiceIdentitiesPage rotate (new secret shown once, never persisted)"
     })
     renderPage()
     await waitFor(() => expect(screen.getByText("ingestion-worker")).toBeDefined())
-    fireEvent.click(screen.getByRole("button", { name: /rotate/i }))
+    await clickRotate()
     // The secret lands in a `<code data-testid="revealed-secret">` so the
     // assertion reads like "the dialog displays the secret verbatim",
     // not "the dialog has a copyable button" — the design is immediate
@@ -205,7 +227,7 @@ describe("ServiceIdentitiesPage rotate (new secret shown once, never persisted)"
     })
     renderPage()
     await waitFor(() => expect(screen.getByText("ingestion-worker")).toBeDefined())
-    fireEvent.click(screen.getByRole("button", { name: /rotate/i }))
+    await clickRotate()
     await screen.findByTestId("revealed-secret")
     // The secret must never be persisted client-side beyond the
     // one-shot dialog prop. `JSON.stringify(localStorage)` collapses
@@ -225,7 +247,7 @@ describe("ServiceIdentitiesPage rotate (new secret shown once, never persisted)"
         c.method === "GET" &&
         c.url.includes("/api/identity/service-identities"),
     ).length
-    fireEvent.click(screen.getByRole("button", { name: /rotate/i }))
+    await clickRotate()
     await screen.findByTestId("revealed-secret")
     await waitFor(() => {
       const getCallsAfter = fetchCalls.filter(
@@ -246,7 +268,7 @@ describe("ServiceIdentitiesPage rotate (new secret shown once, never persisted)"
         c.method === "GET" &&
         c.url.includes("/api/identity/service-identities"),
     ).length
-    fireEvent.click(screen.getByRole("button", { name: /rotate/i }))
+    await clickRotate()
     // Let any in-flight POST + getState() resolve; the dialog should
     // never have mounted, the list should not have been refetched.
     await waitFor(() => {

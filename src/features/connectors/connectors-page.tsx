@@ -3,15 +3,12 @@
 import { useMemo, useState } from "react"
 import Link from "next/link"
 import { PlusIcon } from "lucide-react"
-import { PageHeader } from "@/components/patterns/page-header"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
+import { DataTable } from "@/components/data-table/data-table"
+import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
+import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
-import {
-  FilterSelect,
-  FilterToolbar,
-  SearchField,
-} from "@/components/patterns/filter-toolbar"
 import { MetadataList } from "@/components/patterns/metadata-list"
+import { PageHeader } from "@/components/patterns/page-header"
 import {
   EmptyState,
   ErrorState,
@@ -19,65 +16,18 @@ import {
 } from "@/components/patterns/page-states"
 import { HealthBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
+import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { backfillTriggerMessage } from "@/lib/connectors/backfill-message"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
+import { filterDataClientSide } from "@/lib/data-table"
 import { formatRelativeTime } from "@/lib/format"
-import { HEALTH_LABEL, type Health } from "@/lib/status"
+import { withNotify } from "@/lib/notify"
 import { connectorService } from "@/services"
 import type { Connector, IngestRun } from "@/services/contracts/connectors"
 import { ConnectorCredentialRotation } from "./connector-credential-rotation"
 import { ConnectorProbeHistoryPanel } from "./connector-probe-history-panel"
-
-type Direction = Connector["direction"]
-
-const DIRECTION_LABEL: Record<Direction, string> = {
-  source: "Source",
-  sink: "Sink",
-  bidirectional: "Bidirectional",
-}
-
-const columns: ColumnDef<Connector>[] = [
-  {
-    key: "name",
-    header: "Connector",
-    render: (r) => (
-      <div>
-        <p className="font-medium">{r.name}</p>
-        <p className="text-xs text-muted-foreground">{r.type}</p>
-      </div>
-    ),
-  },
-  {
-    key: "dir",
-    header: "Direction",
-    render: (r) => DIRECTION_LABEL[r.direction],
-  },
-  {
-    key: "health",
-    header: "Health",
-    render: (r) => <HealthBadge health={r.health} />,
-  },
-  { key: "env", header: "Environment", render: (r) => r.environment },
-  { key: "tenant", header: "Tenant", render: (r) => r.tenant },
-  {
-    key: "test",
-    header: "Last test",
-    render: (r) => (
-      <span className="text-muted-foreground">
-        {r.lastTestAt === null ? "Never tested" : formatRelativeTime(r.lastTestAt)}
-      </span>
-    ),
-  },
-  {
-    key: "activity",
-    header: "Last activity",
-    render: (r) => (
-      <span className="text-muted-foreground">
-        {r.lastActivityAt === null ? "—" : formatRelativeTime(r.lastActivityAt)}
-      </span>
-    ),
-  },
-]
+import { DIRECTION_LABEL, getConnectorColumns } from "./connectors-columns"
 
 /**
  * Read-only `Debezium` `.properties` rendering for a `cdc` adapter's
@@ -185,10 +135,14 @@ function IngestRunsPanel({ connectorId }: { connectorId: string }) {
 }
 
 /** Drawer body — fetches full connector detail for the selected row. */
-function ConnectorDetail({ id }: { id: string }) {
+function ConnectorDetail({ id }: { readonly id: string }) {
   const state = useService((s) => connectorService.getConnector(id, s), [id])
-  const testAction = useServiceAction((signal, connectorId: string) =>
-    connectorService.testConnection(connectorId, signal)
+  const testAction = useServiceAction(
+    withNotify(
+      { success: "Connection test passed", error: "Connection test failed" },
+      (signal, connectorId: string) =>
+        connectorService.testConnection(connectorId, signal)
+    )
   )
   const [historyKey, setHistoryKey] = useState(0)
 
@@ -349,24 +303,44 @@ function ConnectorDetail({ id }: { id: string }) {
 
 export function ConnectorsPage() {
   const state = useService((s) => connectorService.listConnectors(s), [])
-  const [search, setSearch] = useState("")
-  const [direction, setDirection] = useState<Direction | "all">("all")
-  const [health, setHealth] = useState<Health | "all">("all")
   const [selected, setSelected] = useState<Connector | null>(null)
 
-  const rows = useMemo(() => {
-    if (state.status !== "success") return []
-    const q = search.trim().toLowerCase()
-    return state.data.filter((c) => {
-      if (direction !== "all" && c.direction !== direction) return false
-      if (health !== "all" && c.health !== health) return false
-      if (q) {
-        const hay = `${c.name} ${c.type} ${c.tenant} ${c.owner}`.toLowerCase()
-        if (!hay.includes(q)) return false
-      }
-      return true
-    })
-  }, [state.status, state.data, search, direction, health])
+  const columns = useMemo(
+    () => getConnectorColumns({ onSelect: setSelected }),
+    []
+  )
+
+  const tableUrlState = useTableUrlState()
+  const filteredData = useMemo(
+    () =>
+      filterDataClientSide(state.data ?? [], {
+        search: tableUrlState.search,
+        searchFields: [
+          (c) => c.name,
+          (c) => c.type,
+          (c) => c.tenant,
+          (c) => c.environment,
+        ],
+        filters: tableUrlState.filters,
+        joinOperator: tableUrlState.joinOperator,
+      }),
+    [state.data, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
+  )
+
+  const { table } = useDataTable({
+    data: filteredData,
+    columns,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/connectors",
+    initialState: {
+      columnPinning: { right: ["actions"] },
+    },
+    getRowId: (row) => row.id,
+  })
 
   return (
     <div className="flex flex-col gap-4">
@@ -380,33 +354,6 @@ export function ConnectorsPage() {
           </Button>
         }
       />
-      <FilterToolbar>
-        <SearchField
-          value={search}
-          onChange={setSearch}
-          placeholder="Search connectors..."
-        />
-        <FilterSelect
-          ariaLabel="Filter by direction"
-          allLabel="All directions"
-          value={direction}
-          onChange={(v) => setDirection(v as Direction | "all")}
-          options={Object.entries(DIRECTION_LABEL).map(([value, label]) => ({
-            value,
-            label,
-          }))}
-        />
-        <FilterSelect
-          ariaLabel="Filter by health"
-          allLabel="All health"
-          value={health}
-          onChange={(v) => setHealth(v as Health | "all")}
-          options={Object.entries(HEALTH_LABEL).map(([value, label]) => ({
-            value,
-            label,
-          }))}
-        />
-      </FilterToolbar>
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? (
         <ErrorState error={state.error} onRetry={state.reload} />
@@ -423,12 +370,16 @@ export function ConnectorsPage() {
         />
       ) : null}
       {state.status === "success" && (state.data?.length ?? 0) > 0 ? (
-        <DataTable
-          columns={columns}
-          rows={rows}
-          rowKey={(r) => r.id}
-          onRowClick={setSelected}
-        />
+        <div className="space-y-4">
+          <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
+            <DataTableSearch
+              placeholder="Search connectors..."
+            />
+          </DataTableAdvancedToolbar>
+          <div className="rounded-md border">
+            <DataTable table={table} />
+          </div>
+        </div>
       ) : null}
 
       <DetailDrawer

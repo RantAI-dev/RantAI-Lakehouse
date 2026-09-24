@@ -176,6 +176,7 @@ async fn dependent_pipelines_are_derived_from_pipeline_definition(
             target_table: "t".to_owned(),
             schedule: "manual".to_owned(),
             owner: None,
+            description: None,
         },
     )
     .await

@@ -2,109 +2,138 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { BarChart3, Sparkles, User } from "lucide-react";
-import { Button } from "@/components/ui/button";
+import { AlertCircle, BarChart3, RotateCcw, Sparkles } from "lucide-react";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { MiniMarkdown } from "./mini-markdown";
-import { ToolStepCard } from "./tool-step";
 import { BuildTree } from "./build-tree";
-import type { Msg } from "./use-copilot";
+import { CopyButton } from "./copy-button";
+import { MiniMarkdown } from "./mini-markdown";
+import { PendingActionCard } from "./pending-action-card";
+import { TOOL_LABEL, ToolStepCard, asObj } from "./tool-step";
+import type { ChatProgress, Msg } from "./use-copilot";
 
-/** A round message avatar — AI (violet gradient) / user (neutral). */
-function Avatar({ ai }: { ai?: boolean }) {
+/** What Copilot is doing right now, with the time it has taken so far. */
+function ProgressLine({ progress }: { progress: ChatProgress | null }) {
+  const [now, setNow] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, []);
+  const label =
+    progress?.phase === "tool" && progress.tool
+      ? `Running ${TOOL_LABEL[progress.tool] ?? progress.tool}…`
+      : "Thinking…";
+  const seconds = progress ? Math.max(0, Math.floor((now - progress.startedAt) / 1000)) : 0;
   return (
-    <span
-      className={cn(
-        "grid size-8 shrink-0 place-items-center rounded-lg border",
-        ai
-          ? "border-violet-500/20 bg-gradient-to-br from-violet-500/15 to-purple-600/15 text-violet-600 dark:text-violet-400"
-          : "border-border bg-muted text-muted-foreground",
-      )}
-    >
-      {ai ? <Sparkles className="size-4" /> : <User className="size-4" />}
-    </span>
-  );
-}
-
-/** "Typing" dots (borrowed from the RantAI-Agents pattern). */
-export function TypingDots({ className }: { className?: string }) {
-  return (
-    <div className={cn("flex items-center gap-1", className)}>
-      <span className="sr-only">Copilot is typing…</span>
-      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/50 [animation-delay:-0.3s]" />
-      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/50 [animation-delay:-0.15s]" />
-      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/50" />
+    <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status">
+      <Sparkles className="size-4 animate-pulse text-violet-600 dark:text-violet-400" aria-hidden />
+      <span>{label}</span>
+      {seconds >= 2 ? <span className="text-xs tabular-nums">{seconds}s</span> : null}
     </div>
   );
 }
 
 /** The Copilot message list — rich rendering (tool cards, build tree, markdown). */
 export function ChatMessages({
-  messages, busy, error, className, onConfirmTool, onCancelTool, confirmingKey,
+  messages, busy, progress, error, className, onRetry,
+  onConfirmTool, onCancelTool, onCompleteTool, confirmingKey,
 }: {
   messages: Msg[];
   busy: boolean;
+  progress?: ChatProgress | null;
   error?: string | null;
   className?: string;
+  /** Ask the last question again (after an error or a stop). */
+  onRetry?: () => void;
   /** Confirm a `needs_confirmation` tool step (T0.4's Confirm button). */
   onConfirmTool?: (messageIndex: number, stepIndex: number) => void;
   /** Cancel a `needs_confirmation` tool step. */
   onCancelTool?: (messageIndex: number, stepIndex: number) => void;
+  /** Mark a pending step done with this result, without re-running the tool. */
+  onCompleteTool?: (messageIndex: number, stepIndex: number, result: Record<string, unknown>) => void;
   /** `"<messageIndex>:<stepIndex>"` of the step currently being confirmed. */
   confirmingKey?: string | null;
 }) {
   const endRef = React.useRef<HTMLDivElement>(null);
   React.useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, busy]);
+  }, [messages, busy, error]);
+
+  const lastIndex = messages.length - 1;
 
   return (
     <div className={cn("space-y-4", className)}>
-      {messages.map((m, i) =>
-        m.role === "user" ? (
-          <div key={i} className="flex flex-row-reverse gap-3">
-            <Avatar />
-            <div className="max-w-[80%] whitespace-pre-wrap rounded-2xl rounded-tr-sm bg-primary px-3.5 py-2 text-sm text-primary-foreground">
-              {m.content}
+      {messages.map((m, i) => {
+        const key = m.id ?? `m${i}`;
+        if (m.role === "user") {
+          return (
+            <div key={key} className="flex justify-end">
+              <div className="max-w-[80%] whitespace-pre-wrap rounded-2xl rounded-br-sm bg-muted px-3.5 py-2 text-sm text-foreground">
+                {m.content}
+              </div>
             </div>
+          );
+        }
+        const pendingIndex = m.tools?.findIndex((t) => Boolean(asObj(t.result).needs_confirmation)) ?? -1;
+        const pendingStep = pendingIndex >= 0 ? m.tools?.[pendingIndex] : undefined;
+        return (
+          <div key={key} className="min-w-0 space-y-2">
+            {m.tools?.length ? (
+              <div className="space-y-1.5">
+                {m.tools.map((t, j) => (
+                  <ToolStepCard key={j} step={t} />
+                ))}
+              </div>
+            ) : null}
+            {m.buildRunId ? <BuildTree runId={m.buildRunId} /> : null}
+            {m.content ? <MiniMarkdown text={m.content} /> : null}
+            {m.stopped ? (
+              <p className="flex items-center gap-2 text-sm text-muted-foreground">
+                Response stopped.
+                {i === lastIndex && onRetry && !busy ? (
+                  <Button variant="link" size="sm" className="h-auto p-0" onClick={onRetry}>
+                    Ask again
+                  </Button>
+                ) : null}
+              </p>
+            ) : null}
+            {pendingStep ? (
+              <PendingActionCard
+                step={pendingStep}
+                confirming={confirmingKey === `${i}:${pendingIndex}`}
+                onConfirm={() => onConfirmTool?.(i, pendingIndex)}
+                onCancel={() => onCancelTool?.(i, pendingIndex)}
+                onSavedInBuilder={(result) => onCompleteTool?.(i, pendingIndex, result)}
+              />
+            ) : null}
+            {m.chartCreated ? (
+              <Link
+                href="/dashboards"
+                className={cn(buttonVariants({ variant: "outline", size: "sm" }), "gap-1.5")}
+              >
+                <BarChart3 className="size-4" /> Open Dashboards
+              </Link>
+            ) : null}
+            {m.content ? (
+              <div className="flex items-center gap-1">
+                <CopyButton text={m.content} label="Copy answer" />
+              </div>
+            ) : null}
           </div>
-        ) : (
-          <div key={i} className="flex gap-3">
-            <Avatar ai />
-            <div className="min-w-0 flex-1 space-y-2 pt-0.5">
-              {m.tools && m.tools.length ? (
-                <div className="space-y-1.5">
-                  {m.tools.map((t, j) => (
-                    <ToolStepCard
-                      key={j}
-                      step={t}
-                      onConfirm={onConfirmTool ? () => onConfirmTool(i, j) : undefined}
-                      onCancel={onCancelTool ? () => onCancelTool(i, j) : undefined}
-                      confirming={confirmingKey === `${i}:${j}`}
-                    />
-                  ))}
-                </div>
-              ) : null}
-              {m.buildRunId ? <BuildTree runId={m.buildRunId} /> : null}
-              <MiniMarkdown text={m.content} />
-              {m.chartCreated ? (
-                <Button size="sm" variant="outline" render={<Link href="/dashboards" />}>
-                  <BarChart3 className="size-4" /> Buka Dashboards
-                </Button>
-              ) : null}
-            </div>
-          </div>
-        ),
-      )}
-      {busy ? (
-        <div className="flex items-center gap-3">
-          <Avatar ai />
-          <div className="flex items-center gap-2 pt-2 text-sm text-muted-foreground">
-            <TypingDots />
-          </div>
+        );
+      })}
+      {busy ? <ProgressLine progress={progress ?? null} /> : null}
+      {error ? (
+        <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm" role="alert">
+          <AlertCircle className="mt-0.5 size-4 shrink-0 text-destructive" />
+          <p className="min-w-0 flex-1 text-foreground">{error}</p>
+          {onRetry ? (
+            <Button size="sm" variant="outline" onClick={onRetry} className="h-7 gap-1 text-xs">
+              <RotateCcw className="size-3.5" /> Retry
+            </Button>
+          ) : null}
         </div>
       ) : null}
-      {error ? <p className="text-sm text-destructive">{error}</p> : null}
       <div ref={endRef} />
     </div>
   );

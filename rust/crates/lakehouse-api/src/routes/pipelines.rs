@@ -14,9 +14,9 @@ use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_dagster::{DgClient, DgError, DgJob, DgRun, iso_from_unix_seconds, map_run_status};
-use lakehouse_store::PgPool;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::pipelines::{self, CreatePipelineInput};
+use lakehouse_store::{PgPool, StoreError};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -237,20 +237,26 @@ fn schedule_label(job: &DgJob) -> String {
 }
 
 /// `GET /api/pipelines/{id}/runs` — up to 30 recent runs of one job.
+///
+/// An unreachable orchestrator answers 200 with an empty list and
+/// `unavailable` set, not 503: "there are no runs" and "nobody could be
+/// asked" are different answers, and the page that shows them should be
+/// able to say which one it got.
 pub async fn runs(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    match state.dagster.list_runs_for_job(&id, 30).await {
-        Ok(runs) => {
-            let body =
-                json!({ "runs": runs.iter().map(|r| run_to_json(r, &id)).collect::<Vec<_>>() });
-            (StatusCode::OK, ApiJson(body)).into_response()
+    let body = runs_body(&state, &id).await;
+    (StatusCode::OK, ApiJson(body)).into_response()
+}
+
+async fn runs_body(state: &AppState, id: &str) -> Value {
+    match state.dagster.list_runs_for_job(id, 30).await {
+        Ok(runs) => json!({
+            "runs": runs.iter().map(|r| run_to_json(r, id)).collect::<Vec<_>>(),
+            "unavailable": Value::Null,
+        }),
+        Err(err) => {
+            tracing::warn!(%err, "pipeline runs: orchestrator unreachable");
+            json!({ "runs": [], "unavailable": js_error(err) })
         }
-        // `catch (e) { return NextResponse.json({ runs: [], error:
-        // String(e) }, { status: 503 }); }` in `[id]/runs/route.ts`.
-        Err(err) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "runs": [], "error": js_error(err) })),
-        )
-            .into_response(),
     }
 }
 
@@ -644,30 +650,32 @@ fn run_to_json(r: &DgRun, pipeline_id: &str) -> Value {
         "status": map_run_status(&r.status),
         "startedAt": r.start_time.map_or_else(String::new, iso_from_unix_seconds),
         "endedAt": r.end_time.map(iso_from_unix_seconds),
-        // WS1 task 1.2: Dagster's run record carries no row counts. WS4 reads
-        // them from step materializations; until then null says "not
-        // measured" rather than 0 claiming "measured none".
+        // WS1 task 1.2: Dagster's run record carries no row counts. WS4
+        // reads them from step materializations; until then null says "not
+        // measured" rather than 0 claiming "measured none". Row counts
+        // aside, `costUnits` used to carry the run's duration in seconds
+        // under a currency-sounding name, which the console then formatted
+        // as currency-like units — an honest `durationSeconds` replaces it.
         "processed": Value::Null,
         "accepted": Value::Null,
         "rejected": Value::Null,
         "retried": Value::Null,
-        "costUnits": cost_units(r.start_time, r.end_time),
+        "costUnits": Value::Null,
+        "durationSeconds": duration_seconds(r.start_time, r.end_time),
     })
 }
 
-/// `r.startTime && r.endTime ? Math.round(r.endTime - r.startTime) : 0` —
-/// note the `&&` truthiness check: a `startTime`/`endTime` of exactly `0`
-/// (Unix epoch) would also short-circuit to `0` here, same as the
-/// TypeScript.
+/// How long a finished run took, in seconds. `None` while it is still
+/// running, or when the orchestrator reported no timestamps.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "run durations here are small, non-negative second counts"
 )]
-fn cost_units(start: Option<f64>, end: Option<f64>) -> i64 {
+fn duration_seconds(start: Option<f64>, end: Option<f64>) -> Option<i64> {
     match (start, end) {
-        (Some(s), Some(e)) if s != 0.0 && e != 0.0 => (e - s).round() as i64,
-        _ => 0,
+        (Some(s), Some(e)) if s != 0.0 && e != 0.0 => Some((e - s).round() as i64),
+        _ => None,
     }
 }
 
@@ -743,6 +751,20 @@ pub async fn trigger(
     let Some(Extension(principal)) = principal else {
         return ApiRejection(ApiError::unauthorized()).into_response();
     };
+    // An authored pipeline has no job behind it, so launching one is not
+    // something that can fail transiently — it is something that cannot
+    // happen. It used to be attempted anyway and came back as a 503, which
+    // reads as "try again later".
+    if id.starts_with("pl-") {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            ApiJson(json!({
+                "error": "this pipeline is authored in the console and is not registered \
+                          with the orchestrator, so it cannot be run yet",
+            })),
+        )
+            .into_response();
+    }
     match state.dagster.launch_run(&id).await {
         Ok(outcome) => {
             if let Some(error) = outcome.error {
@@ -828,6 +850,8 @@ pub struct CreatePipelineBody {
     transforms: Vec<String>,
     #[serde(default)]
     fbic_enabled: bool,
+    #[serde(default)]
+    description: Option<String>,
     target_zone: String,
     target_table: String,
     schedule: String,
@@ -872,8 +896,9 @@ pub async fn create(
         target_table: body.target_table,
         schedule: body.schedule,
         owner: body.owner,
+        description: body.description,
     };
-    let created = pipelines::create_pipeline(pool(&state)?, &input).await?;
+    let created = create_named_pipeline(pool(&state)?, &input).await?;
     // WS5 item D4: best-effort, never turns a successful create into an
     // error. `create` has no internal (copilot tool) caller today
     // (confirmed by grepping `routes::ai::tools::pipelines` before adding
@@ -883,23 +908,29 @@ pub async fn create(
     Ok((StatusCode::CREATED, ApiJson(created)))
 }
 
+/// Create a pipeline, turning a name collision into a sentence that says
+/// what collided. The store's own message ("a record with that value
+/// already exists") was shown to the user verbatim, which explains
+/// nothing about which value or what to do next.
+async fn create_named_pipeline(
+    pool: &PgPool,
+    input: &CreatePipelineInput,
+) -> Result<pipelines::Pipeline, ApiError> {
+    match pipelines::create_pipeline(pool, input).await {
+        Ok(created) => Ok(created),
+        Err(StoreError::Conflict) => Err(ApiError::Conflict(format!(
+            "a pipeline named \"{}\" already exists — pick a different name",
+            input.name
+        ))),
+        Err(err) => Err(err.into()),
+    }
+}
+
 /// The `POST /api/pipelines/generate` body. Mirrors `GeneratePipelineInput`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GeneratePipelineBody {
-    #[serde(default)]
-    #[allow(
-        dead_code,
-        reason = "the LLM model is fixed by server config, not caller-chosen"
-    )]
-    model: Option<String>,
     instruction: String,
-    #[serde(default)]
-    #[allow(
-        dead_code,
-        reason = "accepted for contract compatibility, not yet used in the prompt"
-    )]
-    file_name: Option<String>,
     database: String,
 }
 
@@ -953,58 +984,163 @@ pub async fn generate(
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<pipelines::Pipeline>)> {
     let body: GeneratePipelineBody = parse_body(&body)?;
-    let name = llm_pipeline_name(&state, &body.instruction)
-        .await
-        .unwrap_or_else(|| derive_pipeline_name(&body.instruction));
+    // The draft used to be a name and nothing else: every generated
+    // pipeline arrived reading `source_table` → `target_table`, kind
+    // "incremental", schedule "On demand", whatever had been asked for.
+    // The model now proposes the shape too, and every field it does not
+    // give falls back to something derived rather than invented.
+    let draft = llm_pipeline_draft(&state, &body.instruction, &body.database).await;
+    let fallback_name = derive_pipeline_name(&body.instruction);
+    let name = draft
+        .as_ref()
+        .and_then(|d| d.name.clone())
+        .unwrap_or(fallback_name.clone());
+    let kind = draft
+        .as_ref()
+        .and_then(|d| d.kind.clone())
+        .filter(|k| PIPELINE_KINDS.contains(&k.as_str()))
+        .unwrap_or_else(|| "batch".to_owned());
+    let source_table = draft
+        .as_ref()
+        .and_then(|d| d.source_table.clone())
+        .unwrap_or_else(|| fallback_name.clone());
+    let target_table = draft
+        .as_ref()
+        .and_then(|d| d.target_table.clone())
+        .unwrap_or_else(|| format!("{fallback_name}_out"));
+    let schedule = draft
+        .as_ref()
+        .and_then(|d| d.schedule.clone())
+        .unwrap_or_else(|| "On demand".to_owned());
     let input = CreatePipelineInput {
         name,
-        kind: "incremental".to_owned(),
+        kind,
         source_zone: body.database.clone(),
-        source_table: "source_table".to_owned(),
-        incremental_column: None,
-        transforms: Vec::new(),
+        source_table,
+        // The draft LLM call proposes an incremental column/transforms too
+        // (see `PipelineDraft` below); nothing asks it for FBIC, so that
+        // stays the same honest "not configured" default `create` uses
+        // when a human author leaves it unset.
+        incremental_column: draft.as_ref().and_then(|d| d.incremental_column.clone()),
+        transforms: draft
+            .as_ref()
+            .map(|d| d.transforms.clone())
+            .unwrap_or_default(),
         fbic_enabled: false,
         target_zone: body.database,
-        target_table: "target_table".to_owned(),
-        schedule: "On demand".to_owned(),
+        target_table,
+        schedule,
         owner: Some("Agentic Builder".to_owned()),
+        // The instruction is kept verbatim as the description: it is the
+        // only record of what this pipeline was asked to do.
+        description: Some(body.instruction.clone()),
     };
-    let created = pipelines::create_pipeline(pool(&state)?, &input).await?;
+    let created = create_named_pipeline(pool(&state)?, &input).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
 }
 
-/// Ask the LLM for a short `snake_case` pipeline name summarizing
-/// `instruction`. Returns `None` on any failure (transport, non-2xx, empty
-/// reply) or if the sanitized reply is empty — [`generate`] falls back to
-/// the deterministic name in every such case rather than surfacing an LLM
-/// failure as a hard error.
-async fn llm_pipeline_name(state: &AppState, instruction: &str) -> Option<String> {
+/// The kinds a pipeline may be, as the database's `CHECK` constraint
+/// allows. A model is free to propose anything; only these are accepted.
+const PIPELINE_KINDS: [&str; 4] = ["batch", "incremental", "document", "vector"];
+
+/// What the model proposes for a pipeline. Every field is optional: a
+/// missing one falls back to something derived from the instruction, and a
+/// failed call falls back entirely, rather than surfacing an LLM outage as
+/// a hard error on a form the user has already filled in.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PipelineDraft {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    source_table: Option<String>,
+    #[serde(default)]
+    target_table: Option<String>,
+    #[serde(default)]
+    schedule: Option<String>,
+    #[serde(default)]
+    incremental_column: Option<String>,
+    #[serde(default)]
+    transforms: Vec<String>,
+}
+
+/// Ask the LLM to draft a pipeline for `instruction` against `database`.
+async fn llm_pipeline_draft(
+    state: &AppState,
+    instruction: &str,
+    database: &str,
+) -> Option<PipelineDraft> {
     use lakehouse_llm::{ChatMessage, ChatOptions, ChatRole};
     let messages = vec![
         ChatMessage {
             role: ChatRole::System,
-            content: "You name data pipelines. Reply with ONLY a short snake_case \
-                      identifier (2-4 words), no punctuation, no explanation."
+            content: "You draft data pipelines. Reply with ONLY a JSON object, no prose \
+                      and no code fence, with the keys: name (short snake_case), kind \
+                      (one of batch, incremental, document, vector), sourceTable, \
+                      targetTable, schedule (human readable, e.g. \"Every hour\"), \
+                      incrementalColumn (or null), transforms (array of short strings)."
                 .to_owned(),
         },
         ChatMessage {
             role: ChatRole::User,
-            content: instruction.to_owned(),
+            content: format!("Database: {database}\nRequest: {instruction}"),
         },
     ];
-    let reply = state
+    // Generous enough for a model that thinks before it answers: a reply
+    // cut off mid-JSON parses as nothing, and the caller then silently
+    // gets the fallback draft.
+    let reply = match state
         .llm
         .chat(
             &messages,
             ChatOptions {
                 temperature: Some(0.2),
-                max_tokens: Some(16),
+                max_tokens: Some(900),
             },
         )
         .await
-        .ok()?;
-    let name = derive_pipeline_name(&reply);
-    (name != "agentic_pipeline").then_some(name)
+    {
+        Ok(reply) => reply,
+        Err(err) => {
+            tracing::warn!(%err, "pipeline draft: LLM unavailable, using the derived draft");
+            return None;
+        }
+    };
+    let Some(json) = extract_json_object(&reply) else {
+        tracing::warn!(
+            reply = %reply.chars().take(200).collect::<String>(),
+            "pipeline draft: reply contained no JSON object"
+        );
+        return None;
+    };
+    let mut draft: PipelineDraft = match serde_json::from_str(json) {
+        Ok(draft) => draft,
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                json = %json.chars().take(200).collect::<String>(),
+                "pipeline draft: reply was not the expected shape"
+            );
+            return None;
+        }
+    };
+    // The name is run through the same sanitizer the fallback uses, so
+    // whatever the model returns is still a usable identifier.
+    draft.name = draft
+        .name
+        .map(|n| derive_pipeline_name(&n))
+        .filter(|n| n != "agentic_pipeline");
+    Some(draft)
+}
+
+/// The outermost `{...}` in a reply, so a model that wraps its JSON in
+/// prose or a code fence is still understood.
+fn extract_json_object(reply: &str) -> Option<&str> {
+    let start = reply.find('{')?;
+    let end = reply.rfind('}')?;
+    (end > start).then(|| &reply[start..=end])
 }
 
 /// The transitions `POST /api/pipelines/{id}/status` permits, checked
@@ -1714,12 +1850,15 @@ mod tests {
 
         // Dagster's run record carries no row counts. Emitting 0 would read as
         // "this run processed nothing", which is a different claim from "we
-        // did not measure it".
-        for key in ["processed", "accepted", "rejected", "retried"] {
+        // did not measure it". `costUnits` used to carry the run's duration
+        // under a currency-sounding name; `durationSeconds` replaced it, so
+        // `costUnits` is now null too — never a fabricated cost.
+        for key in ["processed", "accepted", "rejected", "retried", "costUnits"] {
             assert!(v[key].is_null(), "{key} must be null, got {}", v[key]);
         }
-        // costUnits IS derived from the run's own duration, so it stays real.
-        assert!(!v["costUnits"].is_null());
+        // durationSeconds IS derived from the run's own start/end time, so
+        // it stays real.
+        assert!(!v["durationSeconds"].is_null());
     }
 
     #[test]
@@ -1900,22 +2039,23 @@ mod tests {
     }
 
     #[test]
-    fn cost_units_rounds_duration_when_both_present() {
-        assert_eq!(cost_units(Some(100.0), Some(103.6)), 4);
+    fn duration_rounds_to_whole_seconds() {
+        assert_eq!(duration_seconds(Some(100.0), Some(103.6)), Some(4));
     }
 
     #[test]
-    fn cost_units_zero_when_either_missing() {
-        assert_eq!(cost_units(None, Some(10.0)), 0);
-        assert_eq!(cost_units(Some(10.0), None), 0);
-        assert_eq!(cost_units(None, None), 0);
+    fn duration_is_unknown_while_a_timestamp_is_missing() {
+        // A running job has no end time, and "still running" is not "took
+        // zero seconds" — the difference is why this returns an Option.
+        assert_eq!(duration_seconds(None, Some(10.0)), None);
+        assert_eq!(duration_seconds(Some(10.0), None), None);
+        assert_eq!(duration_seconds(None, None), None);
     }
 
     #[test]
-    fn cost_units_zero_when_start_or_end_is_epoch() {
-        // `r.startTime && r.endTime` is falsy for exactly 0.
-        assert_eq!(cost_units(Some(0.0), Some(10.0)), 0);
-        assert_eq!(cost_units(Some(10.0), Some(0.0)), 0);
+    fn duration_is_unknown_when_a_timestamp_is_the_epoch() {
+        assert_eq!(duration_seconds(Some(0.0), Some(10.0)), None);
+        assert_eq!(duration_seconds(Some(10.0), Some(0.0)), None);
     }
 
     /// WS4 item C1 — `GET /api/pipelines/{id}` for a `Dagster`-native job:

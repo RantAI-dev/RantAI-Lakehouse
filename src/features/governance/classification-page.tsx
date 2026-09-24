@@ -1,15 +1,12 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
 import { PlusIcon } from "lucide-react"
 import { CreateSheet } from "@/components/patterns/create-sheet"
+import { DetailDrawer } from "@/components/patterns/detail-drawer"
+import { MetadataList } from "@/components/patterns/metadata-list"
 import { PageHeader } from "@/components/patterns/page-header"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
-import {
-  FilterSelect,
-  FilterToolbar,
-  SearchField,
-} from "@/components/patterns/filter-toolbar"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import {
   ClassificationBadge,
@@ -18,74 +15,91 @@ import {
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { useService, useServiceAction } from "@/hooks/use-service"
+import { DataTable } from "@/components/data-table/data-table"
+import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
+import { DataTableSearch } from "@/components/data-table/data-table-search"
+import { useDataTable } from "@/hooks/use-data-table"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
+import { filterDataClientSide } from "@/lib/data-table"
 import { formatPercent } from "@/lib/format"
-import { CLASSIFICATION_LABEL, type Classification } from "@/lib/status"
+import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
+import type { Classification } from "@/lib/status"
 import { governanceService } from "@/services"
 import type { ClassificationRule } from "@/services/contracts/governance"
-
-type ReviewStatus = ClassificationRule["reviewStatus"]
-
-const REVIEW_META: Record<
-  ReviewStatus,
-  { tone: "success" | "info" | "warning"; label: string }
-> = {
-  reviewed: { tone: "success", label: "Reviewed" },
-  auto: { tone: "info", label: "Auto" },
-  "needs-review": { tone: "warning", label: "Needs review" },
-}
-
-const REVIEW_OPTIONS = (Object.keys(REVIEW_META) as ReviewStatus[]).map((s) => ({
-  value: s,
-  label: REVIEW_META[s].label,
-}))
-
-const CLASSIFICATION_OPTIONS = (
-  Object.keys(CLASSIFICATION_LABEL) as Classification[]
-).map((c) => ({ value: c, label: CLASSIFICATION_LABEL[c] }))
+import {
+  CLASSIFICATION_OPTIONS,
+  REVIEW_META,
+  getClassificationColumns,
+} from "./classification-columns"
 
 const selectClassName =
   "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
-const columns: ColumnDef<ClassificationRule>[] = [
-  { key: "asset", header: "Asset", render: (r) => r.asset },
-  { key: "col", header: "Column", className: "font-mono text-xs", render: (r) => r.column ?? "—" },
-  { key: "class", header: "Classification", render: (r) => <ClassificationBadge classification={r.classification} /> },
-  { key: "conf", header: "Confidence", render: (r) => formatPercent(r.confidence) },
-  { key: "review", header: "Review", render: (r) => (
-    <Pill tone={REVIEW_META[r.reviewStatus].tone}>{REVIEW_META[r.reviewStatus].label}</Pill>
-  )},
-  { key: "mask", header: "Masking", render: (r) => r.maskingRule ?? "—" },
-]
-
 export function ClassificationPage() {
   const state = useService((s) => governanceService.listClassifications(s), [])
-  const [search, setSearch] = React.useState("")
-  const [classification, setClassification] = React.useState("all")
-  const [review, setReview] = React.useState("all")
+  const [selected, setSelected] = React.useState<ClassificationRule | null>(null)
   const [createOpen, setCreateOpen] = React.useState(false)
   const [asset, setAsset] = React.useState("")
   const [column, setColumn] = React.useState("")
   const [formClassification, setFormClassification] =
     React.useState<Classification>("internal")
   const [maskingRule, setMaskingRule] = React.useState("")
+  const tableUrlState = useTableUrlState()
+
   const create = useServiceAction(
-    (
-      signal,
-      input: Parameters<typeof governanceService.createClassificationRule>[0]
-    ) => governanceService.createClassificationRule(input, signal)
+    withNotify(
+      {
+        success: "Classification rule created",
+        error: "Failed to create classification rule",
+      },
+      (
+        signal,
+        input: Parameters<typeof governanceService.createClassificationRule>[0]
+      ) => governanceService.createClassificationRule(input, signal)
+    )
   )
 
-  const filtered = React.useMemo(() => {
-    const q = search.trim().toLowerCase()
-    return (state.data ?? []).filter((r) => {
-      if (classification !== "all" && r.classification !== classification)
-        return false
-      if (review !== "all" && r.reviewStatus !== review) return false
-      if (!q) return true
-      return [r.asset, r.column ?? ""].some((v) => v.toLowerCase().includes(q))
+  const columns = React.useMemo(
+    () => getClassificationColumns({ onSelect: setSelected }),
+    []
+  )
+
+  const filteredData = React.useMemo(() => {
+    if (state.status !== "success" || !state.data) return []
+    return filterDataClientSide(state.data, {
+      search: tableUrlState.search,
+      searchFields: [
+        (r) => r.asset,
+        (r) => r.column ?? "",
+        (r) => r.maskingRule ?? "",
+        (r) => r.classification,
+        (r) => r.reviewStatus,
+      ],
+      filters: tableUrlState.filters,
+      joinOperator: tableUrlState.joinOperator,
     })
-  }, [state.data, search, classification, review])
+  }, [
+    state.status,
+    state.data,
+    tableUrlState.search,
+    tableUrlState.filters,
+    tableUrlState.joinOperator,
+  ])
+
+  const { table } = useDataTable({
+    data: filteredData,
+    columns,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/governance/classification",
+    initialState: {
+      columnPinning: { right: ["actions"] },
+    },
+  })
 
   function resetForm() {
     setAsset("")
@@ -120,32 +134,69 @@ export function ClassificationPage() {
           </Button>
         }
       />
-      <FilterToolbar>
-        <SearchField
-          value={search}
-          onChange={setSearch}
-          placeholder="Search asset or column..."
-        />
-        <FilterSelect
-          value={classification}
-          onChange={setClassification}
-          options={CLASSIFICATION_OPTIONS}
-          allLabel="All classifications"
-          ariaLabel="Filter by classification"
-        />
-        <FilterSelect
-          value={review}
-          onChange={setReview}
-          options={REVIEW_OPTIONS}
-          allLabel="All review statuses"
-          ariaLabel="Filter by review status"
-        />
-      </FilterToolbar>
+
       {state.status === "loading" ? <LoadingSkeleton /> : null}
-      {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
-      {state.status === "success" ? (
-        <DataTable columns={columns} rows={filtered} rowKey={(r) => r.id} />
+      {state.status === "error" ? (
+        <ErrorState error={state.error} onRetry={state.reload} />
       ) : null}
+      {state.status === "success" ? (
+        <div className="flex flex-col gap-4">
+          <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
+            <DataTableSearch placeholder="Search asset or column…" />
+          </DataTableAdvancedToolbar>
+          <DataTable table={table} onRowClick={setSelected} />
+        </div>
+      ) : null}
+
+      <DetailDrawer
+        open={selected !== null}
+        onOpenChange={(open) => {
+          if (!open) setSelected(null)
+        }}
+        title={
+          selected
+            ? selected.column
+              ? `${selected.asset}.${selected.column}`
+              : selected.asset
+            : ""
+        }
+      >
+        {selected ? (
+          <>
+            <div className="flex items-center gap-2">
+              <ClassificationBadge classification={selected.classification} />
+              <Pill tone={REVIEW_META[selected.reviewStatus].tone}>
+                {REVIEW_META[selected.reviewStatus].label}
+              </Pill>
+            </div>
+            <MetadataList
+              items={[
+                { label: "Asset", value: selected.asset },
+                { label: "Column", value: selected.column ?? "—" },
+                {
+                  label: "Confidence",
+                  value: formatPercent(selected.confidence),
+                },
+                {
+                  label: "Masking rule",
+                  value: selected.maskingRule ?? "None",
+                },
+              ]}
+            />
+            <Button
+              variant="outline"
+              size="sm"
+              className="self-start"
+              render={
+                <Link href={`/data?q=${encodeURIComponent(selected.asset)}`} />
+              }
+            >
+              Inspect in Data Explorer
+            </Button>
+          </>
+        ) : null}
+      </DetailDrawer>
+
       <CreateSheet
         open={createOpen}
         onOpenChange={(open) => {
@@ -160,7 +211,11 @@ export function ClassificationPage() {
       >
         <div className="space-y-1.5">
           <Label htmlFor="cr-asset">Asset</Label>
-          <Input id="cr-asset" value={asset} onChange={(e) => setAsset(e.target.value)} />
+          <Input
+            id="cr-asset"
+            value={asset}
+            onChange={(e) => setAsset(e.target.value)}
+          />
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="cr-column">Column (optional)</Label>
@@ -182,7 +237,9 @@ export function ClassificationPage() {
             }
           >
             {CLASSIFICATION_OPTIONS.map((o) => (
-              <option key={o.value} value={o.value}>{o.label}</option>
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
             ))}
           </select>
         </div>
@@ -199,3 +256,4 @@ export function ClassificationPage() {
     </div>
   )
 }
+

@@ -25,13 +25,22 @@ use lakehouse_store::queries::{
 };
 use sqlx::PgPool;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
-/// The seed lands the two `mock/queries.ts` saved-query fixtures.
+/// The seed lands two saved queries, pointed at marts this lakehouse
+/// actually serves (`0027_query_ownership.sql` repointed them — the
+/// original fixtures named tables that do not exist here, so the only two
+/// examples a new user could open both failed on Run).
 #[sqlx::test(migrations = "../../migrations")]
 async fn seed_populates_saved_queries(pool: PgPool) -> sqlx::Result<()> {
     let saved = list_saved(&pool).await.unwrap();
     assert_eq!(saved.len(), 2);
-    assert!(saved.iter().any(|q| q.title == "Revenue by region"));
+    assert!(
+        saved
+            .iter()
+            .any(|q| q.title == "Top destinations by visitors")
+    );
+    assert!(saved.iter().all(|q| q.sql.contains("serving.mart_")));
     Ok(())
 }
 
@@ -39,14 +48,16 @@ async fn seed_populates_saved_queries(pool: PgPool) -> sqlx::Result<()> {
 /// first — the round trip `routes::query::run` depends on.
 #[sqlx::test(migrations = "../../migrations")]
 async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<()> {
-    assert!(list_history(&pool).await.unwrap().is_empty());
+    let owner = Uuid::new_v4();
+    assert!(list_history(&pool, owner).await.unwrap().is_empty());
 
     record_history(
         &pool,
         &RecordHistoryInput {
             id: "q-1",
             sql: "SELECT 1",
-            user: "anonymous",
+            user: "Bootstrap Admin",
+            owner_id: Some(owner),
             status: "completed",
             duration_ms: 42,
             scanned_bytes: 1024,
@@ -59,12 +70,21 @@ async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<(
     .await
     .unwrap();
 
-    let history = list_history(&pool).await.unwrap();
+    let history = list_history(&pool, owner).await.unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].id, "q-1");
     assert_eq!(history[0].sql, "SELECT 1");
     assert_eq!(history[0].status, "completed");
     assert!(history[0].at.ends_with('Z'));
+
+    // Another user's history is not this user's: the rows are private to
+    // whoever ran them.
+    assert!(
+        list_history(&pool, Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -74,10 +94,12 @@ async fn record_history_round_trips_through_list(pool: PgPool) -> sqlx::Result<(
 /// surface to the caller, but would spam logs unnecessarily.
 #[sqlx::test(migrations = "../../migrations")]
 async fn record_history_is_idempotent_per_id(pool: PgPool) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
     let input = RecordHistoryInput {
         id: "q-dup",
         sql: "SELECT 1",
-        user: "anonymous",
+        user: "Bootstrap Admin",
+        owner_id: Some(owner),
         status: "completed",
         duration_ms: 1,
         scanned_bytes: 1,
@@ -89,7 +111,7 @@ async fn record_history_is_idempotent_per_id(pool: PgPool) -> sqlx::Result<()> {
     record_history(&pool, &input).await.unwrap();
     record_history(&pool, &input).await.unwrap();
 
-    let history = list_history(&pool).await.unwrap();
+    let history = list_history(&pool, owner).await.unwrap();
     assert_eq!(history.len(), 1);
     Ok(())
 }
@@ -112,12 +134,14 @@ fn query_history_audit_event(resource_id: &str, action: &str) -> NewAuditEvent {
 /// real `audit_event` row exists for the query-history resource.
 #[sqlx::test(migrations = "../../migrations")]
 async fn history_item_has_no_audit_id_without_a_real_event(pool: PgPool) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
     record_history(
         &pool,
         &RecordHistoryInput {
             id: "q-no-audit",
             sql: "SELECT 1",
             user: "anonymous",
+            owner_id: Some(owner),
             status: "completed",
             duration_ms: 1,
             scanned_bytes: 1,
@@ -130,7 +154,7 @@ async fn history_item_has_no_audit_id_without_a_real_event(pool: PgPool) -> sqlx
     .await
     .unwrap();
 
-    let history = list_history(&pool).await.unwrap();
+    let history = list_history(&pool, owner).await.unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].audit_event_id, None);
     Ok(())
@@ -141,12 +165,14 @@ async fn history_item_has_no_audit_id_without_a_real_event(pool: PgPool) -> sqlx
 /// this task is fixing.
 #[sqlx::test(migrations = "../../migrations")]
 async fn history_item_resolves_the_real_audit_event_id(pool: PgPool) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
     record_history(
         &pool,
         &RecordHistoryInput {
             id: "q-audit",
             sql: "SELECT 1",
             user: "anonymous",
+            owner_id: Some(owner),
             status: "completed",
             duration_ms: 1,
             scanned_bytes: 1,
@@ -163,7 +189,7 @@ async fn history_item_resolves_the_real_audit_event_id(pool: PgPool) -> sqlx::Re
         .await
         .unwrap();
 
-    let history = list_history(&pool).await.unwrap();
+    let history = list_history(&pool, owner).await.unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(
         history[0].audit_event_id.as_deref(),
@@ -200,12 +226,14 @@ async fn insert_audit_event_at(pool: &PgPool, id: &str, resource_id: &str, at: O
 async fn history_item_uses_the_newest_of_several_events_without_duplicating_the_row(
     pool: PgPool,
 ) -> sqlx::Result<()> {
+    let owner = Uuid::new_v4();
     record_history(
         &pool,
         &RecordHistoryInput {
             id: "q-multi",
             sql: "SELECT 1",
             user: "anonymous",
+            owner_id: Some(owner),
             status: "completed",
             duration_ms: 1,
             scanned_bytes: 1,
@@ -228,7 +256,7 @@ async fn history_item_uses_the_newest_of_several_events_without_duplicating_the_
     )
     .await;
 
-    let history = list_history(&pool).await.unwrap();
+    let history = list_history(&pool, owner).await.unwrap();
     assert_eq!(history.len(), 1, "the lateral join must not duplicate rows");
     assert_eq!(
         history[0].audit_event_id.as_deref(),
@@ -237,20 +265,24 @@ async fn history_item_uses_the_newest_of_several_events_without_duplicating_the_
     Ok(())
 }
 
-/// WS2 §4 — `record_history` now carries the real principal uuid and the
-/// real engine, not the pre-WS2 `"anonymous"`/`"hot-store"` placeholders;
-/// `list_history` returns exactly what was written for both fields.
+/// WS2 §4 — `record_history` carries the real engine and a display-name
+/// `user`; ownership scoping lives in the separate `owner_id` column
+/// (`0046_query_ownership.sql`), which is what `list_history`'s `owner_id`
+/// argument filters on — rewritten from the pre-0046 version of this test,
+/// which asserted `user` itself held the principal's uuid (superseded once
+/// `owner_id` became its own column).
 #[sqlx::test(migrations = "../../migrations")]
-async fn record_history_carries_the_real_principal_uuid_and_engine(
+async fn record_history_carries_the_real_engine_and_is_scoped_by_owner_id(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let principal_uuid = "8f14e45f-ceea-467e-bd0d-8fbcae0b0000";
+    let owner = Uuid::new_v4();
     record_history(
         &pool,
         &RecordHistoryInput {
             id: "q-real-user",
             sql: "SELECT 1",
-            user: principal_uuid,
+            user: "Real User",
+            owner_id: Some(owner),
             status: "completed",
             duration_ms: 1,
             scanned_bytes: 1,
@@ -263,9 +295,9 @@ async fn record_history_carries_the_real_principal_uuid_and_engine(
     .await
     .unwrap();
 
-    let history = list_history(&pool).await.unwrap();
+    let history = list_history(&pool, owner).await.unwrap();
     assert_eq!(history.len(), 1);
-    assert_eq!(history[0].user, principal_uuid);
+    assert_eq!(history[0].user, "Real User");
     assert_eq!(history[0].engine, "trino");
     Ok(())
 }
@@ -280,6 +312,7 @@ async fn get_history_item_fetches_one_row_by_id(pool: PgPool) -> sqlx::Result<()
             id: "q-get-one",
             sql: "SELECT 1",
             user: "8f14e45f-ceea-467e-bd0d-8fbcae0b0000",
+            owner_id: Some(Uuid::new_v4()),
             status: "completed",
             duration_ms: 1,
             scanned_bytes: 1,

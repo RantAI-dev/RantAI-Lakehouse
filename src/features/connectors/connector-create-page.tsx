@@ -20,6 +20,7 @@ import { SftpDialForm } from "@/features/connectors/dial-forms/sftp-dial-form"
 import { SheetsDialForm } from "@/features/connectors/dial-forms/sheets-dial-form"
 import { SqlDialForm } from "@/features/connectors/dial-forms/sql-dial-form"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import { connectorService } from "@/services"
 import { CREDENTIAL_KIND_OPTIONS } from "./credential-options"
@@ -271,8 +272,12 @@ export function ConnectorCreatePage() {
     setCredentialSecondary(defaults.secondary)
   }, [adapter, selectedTypeName])
 
-  const create = useServiceAction((signal, input: Parameters<typeof connectorService.createConnector>[0]) =>
-    connectorService.createConnector(input, signal)
+  const create = useServiceAction(
+    withNotify(
+      { success: "Connector created", error: "Failed to create connector" },
+      (signal, input: Parameters<typeof connectorService.createConnector>[0]) =>
+        connectorService.createConnector(input, signal)
+    )
   )
   // The real probe (POST /api/connectors/{id}/test) needs a connector id, so
   // it can only run after `create` succeeds.

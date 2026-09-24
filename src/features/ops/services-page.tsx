@@ -1,30 +1,25 @@
 "use client"
 
 import * as React from "react"
-import { PageHeader } from "@/components/patterns/page-header"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
+import { DataTable } from "@/components/data-table/data-table"
+import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
+import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
-import {
-  FilterSelect,
-  FilterToolbar,
-  SearchField,
-} from "@/components/patterns/filter-toolbar"
 import { MetadataList } from "@/components/patterns/metadata-list"
+import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { HealthBadge, Pill } from "@/components/patterns/status-badge"
+import { useDataTable } from "@/hooks/use-data-table"
+import { filterDataClientSide } from "@/lib/data-table"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService } from "@/hooks/use-service"
 import { formatPercent } from "@/lib/format"
 import { fmtMeasured } from "@/lib/measured"
-import { HEALTH_LABEL, type Health } from "@/lib/status"
 import { opsService } from "@/services"
 import type { PlatformService } from "@/services/contracts/ops"
+import { getServiceColumns } from "./services-columns"
 
-const HEALTH_OPTIONS = (Object.keys(HEALTH_LABEL) as Health[]).map((h) => ({
-  value: h,
-  label: HEALTH_LABEL[h],
-}))
-
-function DependencyPills({ dependencies }: { dependencies: string[] }) {
+function DependencyPills({ dependencies }: { readonly dependencies: readonly string[] }) {
   if (dependencies.length === 0) return <span>—</span>
   return (
     <div className="flex flex-wrap gap-1">
@@ -37,71 +32,45 @@ function DependencyPills({ dependencies }: { dependencies: string[] }) {
   )
 }
 
-const columns: ColumnDef<PlatformService>[] = [
-  {
-    key: "name",
-    header: "Service",
-    render: (r) => (
-      <div>
-        <p className="font-medium">{r.name}</p>
-        <p className="text-xs text-muted-foreground">
-          {r.version === null ? "—" : `v${r.version}`} · {r.site}
-        </p>
-      </div>
-    ),
-  },
-  {
-    key: "health",
-    header: "Health",
-    render: (r) => (
-      <div className="flex items-center gap-1">
-        <HealthBadge health={r.health} />
-        {!r.checked ? (
-          <span className="text-xs text-muted-foreground">(not probed)</span>
-        ) : null}
-      </div>
-    ),
-  },
-  {
-    key: "replicas",
-    header: "Replicas",
-    render: (r) => fmtMeasured(r.replicas),
-  },
-  {
-    key: "err",
-    header: "Error rate",
-    render: (r) => fmtMeasured(r.errorRate, formatPercent),
-  },
-  {
-    key: "lat",
-    header: "Latency",
-    render: (r) => (
-      <span className="font-mono text-xs">
-        {fmtMeasured(r.latencyMs, (n) => `${n} ms`)}
-      </span>
-    ),
-  },
-  {
-    key: "deps",
-    header: "Dependencies",
-    render: (r) => <DependencyPills dependencies={r.dependencies} />,
-  },
-]
-
 export function ServicesPage() {
   const state = useService((s) => opsService.listServices(s), [])
-  const [search, setSearch] = React.useState("")
-  const [health, setHealth] = React.useState("all")
   const [selected, setSelected] = React.useState<PlatformService | null>(null)
 
-  const filtered = React.useMemo(() => {
-    const q = search.trim().toLowerCase()
-    return (state.data ?? []).filter((svc) => {
-      if (health !== "all" && svc.health !== health) return false
-      if (!q) return true
-      return [svc.name, svc.site].some((v) => v.toLowerCase().includes(q))
-    })
-  }, [state.data, search, health])
+  const columns = React.useMemo(
+    () => getServiceColumns({ onSelect: setSelected }),
+    []
+  )
+
+  const tableUrlState = useTableUrlState()
+  const filteredData = React.useMemo(
+    () =>
+      filterDataClientSide(state.data ?? [], {
+        search: tableUrlState.search,
+        searchFields: [
+          (r) => r.name,
+          (r) => r.site,
+          (r) => r.version,
+        ],
+        filters: tableUrlState.filters,
+        joinOperator: tableUrlState.joinOperator,
+      }),
+    [state.data, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
+  )
+
+  const { table } = useDataTable({
+    data: filteredData,
+    columns,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/services",
+    initialState: {
+      columnPinning: { right: ["actions"] },
+    },
+    getRowId: (row) => row.id,
+  })
 
   return (
     <div className="flex flex-col gap-4">
@@ -109,31 +78,21 @@ export function ServicesPage() {
         title="Services"
         description="Platform service health, versions, sites, and dependencies."
       />
-      <FilterToolbar>
-        <SearchField
-          value={search}
-          onChange={setSearch}
-          placeholder="Search name, site..."
-        />
-        <FilterSelect
-          value={health}
-          onChange={setHealth}
-          options={HEALTH_OPTIONS}
-          allLabel="All health states"
-          ariaLabel="Filter by health"
-        />
-      </FilterToolbar>
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? (
         <ErrorState error={state.error} onRetry={state.reload} />
       ) : null}
       {state.status === "success" ? (
-        <DataTable
-          columns={columns}
-          rows={filtered}
-          rowKey={(r) => r.id}
-          onRowClick={setSelected}
-        />
+        <div className="space-y-4">
+          <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
+            <DataTableSearch
+              placeholder="Search name, site..."
+            />
+          </DataTableAdvancedToolbar>
+          <div className="rounded-md border">
+            <DataTable table={table} />
+          </div>
+        </div>
       ) : null}
       <DetailDrawer
         open={selected !== null}

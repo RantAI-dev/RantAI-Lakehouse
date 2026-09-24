@@ -56,6 +56,7 @@ use crate::bronze_stats_cache::{BronzeStatsCache, CachedTableStats};
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::lakehouse_catalog::{self, CatalogAccessError};
+use crate::routes::catalog_query;
 use crate::routes::support::{js_error, js_string, num_or_zero, prettify, str_col};
 use crate::state::AppState;
 
@@ -252,6 +253,168 @@ pub async fn list(
     }
 }
 
+/// Query string for [`query`]. Mirrors the params the Advanced Data Table
+/// serialises; see `services/contracts/pagination.ts` for the other half.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogQuery {
+    #[serde(default)]
+    pub page: Option<u32>,
+    #[serde(default)]
+    pub page_size: Option<u32>,
+    #[serde(default)]
+    pub search: Option<String>,
+    /// JSON `[{ "id": ..., "desc": ... }]`.
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// JSON `[{ "id": ..., "value": ..., "operator": ... }]`.
+    #[serde(default)]
+    pub filters: Option<String>,
+    #[serde(default)]
+    pub join_operator: Option<String>,
+    #[serde(default)]
+    pub group_by: Option<String>,
+    /// Infinite scroll sets this past page 1; see [`CatalogQuery::page_size`]
+    /// note in the contract about why `items.len()` must stay exact.
+    #[serde(default)]
+    pub skip_list_meta: Option<bool>,
+}
+
+/// Largest page a client may request. Caps the response size regardless of
+/// what the URL asks for — `pageSize=100000` should not be a way to make
+/// the server serialise the entire catalog into one body.
+const MAX_PAGE_SIZE: u32 = 200;
+const DEFAULT_PAGE_SIZE: u32 = 50;
+
+/// `GET /api/catalog/query` — the catalog, searched/filtered/sorted/grouped
+/// and returned one page at a time.
+///
+/// Additive: `GET /api/catalog` still returns the whole registry and is
+/// what Query Studio and the older tables use. This endpoint exists so the
+/// Data Explorer can push its table state to the server instead of pulling
+/// everything down and filtering in the browser.
+///
+/// The filtering itself is pure and lives in [`super::catalog_query`] —
+/// see that module for why it cannot be done in SQL.
+///
+/// # Tenant scoping
+///
+/// Gated by the SAME [`catalog_tenant_refusal`] check [`list`] runs — this
+/// is still a read over the one shared, un-tenanted catalog, just paged
+/// differently. A refusal answers the paged-response shape with an empty
+/// page rather than the whole-registry shape [`list`] uses, so the client
+/// never has to special-case which endpoint it called.
+pub async fn query(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<CatalogQuery>,
+) -> Result<Response, ApiRejection> {
+    let page = params.page.unwrap_or(1).max(1);
+    let page_size = params
+        .page_size
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+
+    match catalog_tenant_refusal(&state, &principal, &headers).await {
+        Ok(Some(reason)) => {
+            return Ok((
+                StatusCode::OK,
+                ApiJson(json!({
+                    "items": [],
+                    "totalItems": 0,
+                    "totalPages": 0,
+                    "page": page,
+                    "pageSize": page_size,
+                    "supported": false,
+                    "reason": reason,
+                })),
+            )
+                .into_response());
+        }
+        Ok(None) => {}
+        Err(err) => return Err(ApiRejection(err)),
+    }
+
+    // Parse and validate before touching ClickHouse: a bad field name
+    // should cost a 400, not a catalog assembly.
+    let filters = catalog_query::parse_filters(params.filters.as_deref())?;
+    let sort = catalog_query::parse_sort(params.sort.as_deref())?;
+    let group_by = catalog_query::parse_group_by(params.group_by.as_deref())?;
+    let join = catalog_query::JoinOperator::parse(params.join_operator.as_deref());
+
+    let (mut body, bronze_pairs) = match list_body(&state.clickhouse).await {
+        Ok(v) => v,
+        // Matches `list`'s contract: the catalog being unreachable is a
+        // 503 with an empty result, not a 500.
+        Err(err) => {
+            return Ok((
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiJson(json!({
+                    "error": js_error(err),
+                    "items": [],
+                    "totalItems": 0,
+                    "totalPages": 0,
+                    "page": page,
+                    "pageSize": page_size,
+                })),
+            )
+                .into_response());
+        }
+    };
+    enrich_bronze_assets(&state, &mut body, bronze_pairs).await;
+
+    let assets = body
+        .get("assets")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let searched = catalog_query::apply_search(&assets, params.search.as_deref().unwrap_or(""));
+    let mut filtered = catalog_query::apply_filters(&searched, &filters, join);
+    catalog_query::apply_sort(&mut filtered, &sort);
+
+    let (ordered, summaries) = match group_by.as_deref() {
+        Some(field) => catalog_query::apply_grouping(&filtered, field),
+        None => (filtered, Vec::new()),
+    };
+
+    let total_items = ordered.len();
+    let page_items = catalog_query::paginate(&ordered, page, page_size);
+    let keys = group_by
+        .as_deref()
+        .map(|field| catalog_query::item_group_keys(&page_items, field));
+
+    // `skipListMeta` lets infinite scroll drop the group summaries from
+    // follow-up pages — the client keeps the ones page 1 gave it, and
+    // re-sending the full list on every scroll is just wasted bytes.
+    //
+    // `totalItems` stays honest regardless. It is cheap here (the filtered
+    // set is already in memory) and the count feeds the "N assets" label,
+    // which should not blank out as the user scrolls. What must never be
+    // approximated either way is `items.len()`, since that is what tells
+    // the client whether another page exists.
+    let summaries = if params.skip_list_meta.unwrap_or(false) && page > 1 {
+        Vec::new()
+    } else {
+        summaries
+    };
+
+    Ok((
+        StatusCode::OK,
+        ApiJson(catalog_query::build_response(
+            page_items,
+            total_items,
+            page,
+            page_size,
+            group_by.as_deref(),
+            &summaries,
+            keys,
+        )),
+    )
+        .into_response())
+}
+
 /// Case-insensitive substring match over each asset's `name`, `description`,
 /// and `id` — the SAME fields and case rule
 /// `src/services/clients/assets.ts`'s `clickhouseAssetService.listAssets`
@@ -310,9 +473,13 @@ fn filter_assets_by_query(assets: &[Value], q: &str, annotations: &[AnnotationRo
 async fn list_body(ch: &ChClient) -> Result<(Value, Vec<(String, String)>), ChError> {
     let cat = ch
         .rows(
-            "SELECT slug, title, description, tier, updated_at, table_name FROM lake.`bronze_meta.dataset_catalog`
+            "SELECT slug, title, description, tier, updated_at, table_name,
+              toString(dateDiff('second', parseDateTimeBestEffortOrNull(updated_at), now())) lag
+       FROM lake.`bronze_meta.dataset_catalog`
        UNION ALL
-       SELECT slug, title, description, tier, updated_at, table_name FROM lake.`bronze_meta_sec.dataset_catalog`",
+       SELECT slug, title, description, tier, updated_at, table_name,
+              toString(dateDiff('second', parseDateTimeBestEffortOrNull(updated_at), now())) lag
+       FROM lake.`bronze_meta_sec.dataset_catalog`",
             None,
         )
         .await?;
@@ -400,8 +567,10 @@ async fn list_body(ch: &ChClient) -> Result<(Value, Vec<(String, String)>), ChEr
             None,
         ),
         ch.rows(
-            "SELECT table, toString(sum(rows)) r FROM system.parts
-         WHERE database='serving' AND active GROUP BY table",
+            "SELECT database db, table, toString(sum(rows)) r, toString(sum(bytes_on_disk)) b,
+              toString(dateDiff('second', max(modification_time), now())) lag
+         FROM system.parts WHERE database IN ('silver','serving') AND active
+         GROUP BY database, table",
             None,
         ),
     )?;
@@ -412,12 +581,16 @@ async fn list_body(ch: &ChClient) -> Result<(Value, Vec<(String, String)>), ChEr
             .find(|c| str_col(c, "db") == db && str_col(c, "table") == table)
             .map_or(0, |c| num_or_zero(Some(c), "n"))
     };
-    let gold_rows_of = |table: &str| -> i64 {
+    // Real size and last-write time, straight from the parts the table is
+    // made of. Before this, size was `rows * 220` and freshness was always
+    // 0 — a guess and a fiction, shown with two decimals of confidence.
+    let part_of = |db: &str, table: &str| {
         part_rows
             .iter()
-            .find(|p| str_col(p, "table") == table)
-            .map_or(0, |p| num_or_zero(Some(p), "r"))
+            .find(|p| str_col(p, "db") == db && str_col(p, "table") == table)
     };
+    let gold_rows_of =
+        |table: &str| -> i64 { part_of("serving", table).map_or(0, |p| num_or_zero(Some(p), "r")) };
 
     for t in &tbl_rows {
         let db = str_col(t, "db");
@@ -979,7 +1152,9 @@ async fn clickhouse_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response>
     // above, so this is safe despite the raw interpolation, matching the
     // TypeScript exactly.
     let rows_sql = format!(
-        "SELECT toString(sum(rows)) r FROM system.parts WHERE database='{db}' AND table='{table}' AND active"
+        "SELECT toString(sum(rows)) r, toString(sum(bytes_on_disk)) b,
+           toString(dateDiff('second', max(modification_time), now())) lag
+         FROM system.parts WHERE database='{db}' AND table='{table}' AND active"
     );
     let rows = match ch.rows(&rows_sql, None).await {
         Ok(rr) => num_or_zero(rr.first(), "r"),
@@ -1015,10 +1190,18 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
     let escaped_id = SqlLiteral::from(id);
     let sync_sql = format!(
         "SELECT slug, title, description, tier, table_name, toString(total) total,
-                author, frekuensi, satuan, klasifikasi, updated_at FROM (
-           SELECT slug,title,description,'primer' tier,table_name,total,author,frekuensi,satuan,klasifikasi,'' updated_at FROM lake.`bronze_meta.dataset_sync` s
+                author, frekuensi, satuan, klasifikasi, updated_at,
+                toString(dateDiff('second', parseDateTimeBestEffortOrNull(updated_at), now())) lag FROM (
+           SELECT s.slug slug, s.title title, s.description description, 'primer' tier, s.table_name table_name,
+                  s.total total, s.author author, s.frekuensi frekuensi, s.satuan satuan, s.klasifikasi klasifikasi,
+                  c.updated_at updated_at
+             FROM lake.`bronze_meta.dataset_sync` s
+             LEFT JOIN lake.`bronze_meta.dataset_catalog` c ON c.slug = s.slug
            UNION ALL
-           SELECT slug,title,description,'sekunder' tier,table_name,total,author,frekuensi,satuan,klasifikasi,'' updated_at FROM lake.`bronze_meta_sec.dataset_sync`
+           SELECT s.slug, s.title, s.description, 'sekunder', s.table_name,
+                  s.total, s.author, s.frekuensi, s.satuan, s.klasifikasi, c.updated_at
+             FROM lake.`bronze_meta_sec.dataset_sync` s
+             LEFT JOIN lake.`bronze_meta_sec.dataset_catalog` c ON c.slug = s.slug
          ) WHERE slug = {escaped_id} LIMIT 1"
     );
     let sync_rows = ch.rows(&sync_sql, None).await?;

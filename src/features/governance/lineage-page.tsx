@@ -2,40 +2,78 @@
 
 import * as React from "react"
 import { PageHeader } from "@/components/patterns/page-header"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
+import { DataTable } from "@/components/data-table/data-table"
+import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
+import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { FlowCanvas } from "@/components/patterns/flow-canvas"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
-import { Pill } from "@/components/patterns/status-badge"
 import { Input } from "@/components/ui/input"
+import { useDataTable } from "@/hooks/use-data-table"
 import { useService } from "@/hooks/use-service"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
+import { filterDataClientSide } from "@/lib/data-table"
 import { governanceService } from "@/services"
-import type { LineageEdge, LineageGraph } from "@/services/contracts/governance"
+import type { LineageGraph } from "@/services/contracts/governance"
+import { getLineageColumns } from "./lineage-columns"
 
-function ConnectionsTable({ graph }: { graph: LineageGraph }) {
-  const labelById = React.useMemo(() => {
-    const map = new Map(graph.nodes.map((n) => [n.id, n.label]))
-    return (id: string) => map.get(id) ?? id
-  }, [graph.nodes])
+function ConnectionsTable({ graph }: { readonly graph: LineageGraph }) {
+  const tableUrlState = useTableUrlState()
+  const columns = React.useMemo(
+    () => getLineageColumns({ nodes: graph.nodes }),
+    [graph.nodes]
+  )
 
-  const columns: ColumnDef<LineageEdge>[] = [
-    { key: "from", header: "From", render: (r) => labelById(r.from) },
-    { key: "to", header: "To", render: (r) => labelById(r.to) },
-    { key: "via", header: "Via", render: (r) => <Pill tone="neutral">{r.kind}</Pill> },
-  ]
+  const nodeMap = React.useMemo(
+    () => new Map(graph.nodes.map((n) => [n.id, n.label])),
+    [graph.nodes]
+  )
+
+  const filteredData = React.useMemo(() => {
+    return filterDataClientSide(graph.edges, {
+      search: tableUrlState.search,
+      searchFields: [
+        (r) => nodeMap.get(r.from) ?? r.from,
+        (r) => nodeMap.get(r.to) ?? r.to,
+        (r) => r.kind,
+      ],
+      filters: tableUrlState.filters,
+      joinOperator: tableUrlState.joinOperator,
+    })
+  }, [
+    graph.edges,
+    nodeMap,
+    tableUrlState.search,
+    tableUrlState.filters,
+    tableUrlState.joinOperator,
+  ])
+
+  const { table } = useDataTable({
+    data: filteredData,
+    columns,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/governance/lineage",
+    initialState: {
+      columnPinning: { right: ["actions"] },
+    },
+  })
 
   return (
-    <DataTable
-      columns={columns}
-      rows={graph.edges}
-      rowKey={(r) => r.id}
-      emptyMessage="No connections for this asset."
-    />
+    <div className="flex flex-col gap-4">
+      <DataTableAdvancedToolbar table={table}>
+        <DataTableSearch placeholder="Search source, target, kind…" />
+      </DataTableAdvancedToolbar>
+      <DataTable table={table} />
+    </div>
   )
 }
 
 export function LineagePage() {
-  const [focus, setFocus] = React.useState("tbl-orders-events")
+  const [focus, setFocus] = React.useState("event-pariwisata")
   const state = useService((s) => governanceService.getLineage(focus, s), [focus])
   return (
     <div className="flex flex-col gap-4">
@@ -78,8 +116,8 @@ export function LineagePage() {
           </SectionCard>
           <SectionCard title="Column mappings">
             <ul className="space-y-2 text-sm">
-              {state.data.columnMappings.map((m, i) => (
-                <li key={i} className="font-mono text-xs">
+              {state.data.columnMappings.map((m) => (
+                <li key={`${m.source}-${m.target}`} className="font-mono text-xs">
                   {m.source} → {m.target}{" "}
                   <span className="text-muted-foreground">({m.transform})</span>
                 </li>
@@ -91,3 +129,4 @@ export function LineagePage() {
     </div>
   )
 }
+

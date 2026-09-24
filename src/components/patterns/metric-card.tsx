@@ -1,8 +1,10 @@
+import Link from "next/link"
 import { cn } from "@/lib/utils"
 
 /**
  * Compact KPI card used in summary strips.
  * `hint` explains the metric; `trend` is short delta copy like "+4.2% 7d".
+ * With `href` the whole card is a link to the page the metric comes from.
  */
 export function MetricCard({
   label,
@@ -11,6 +13,7 @@ export function MetricCard({
   trend,
   trendTone = "neutral",
   icon,
+  href,
   className,
 }: {
   label: string
@@ -19,15 +22,16 @@ export function MetricCard({
   trend?: string
   trendTone?: "positive" | "negative" | "neutral"
   icon?: React.ReactNode
+  href?: string
   className?: string
 }) {
-  return (
-    <div
-      className={cn(
-        "rounded-lg border border-border bg-card p-4 shadow-[0px_1px_2px_0px_rgba(0,0,0,0.05)]",
-        className
-      )}
-    >
+  const cardClass = cn(
+    "block rounded-lg border border-border bg-card p-4 shadow-[0px_1px_2px_0px_rgba(0,0,0,0.05)]",
+    href && "transition-colors hover:border-primary/40 hover:bg-muted/30",
+    className
+  )
+  const body = (
+    <>
       <div className="flex items-center justify-between gap-2">
         <p className="truncate text-xs font-medium text-muted-foreground">
           {label}
@@ -55,7 +59,14 @@ export function MetricCard({
       {hint ? (
         <p className="mt-1 truncate text-xs text-muted-foreground">{hint}</p>
       ) : null}
-    </div>
+    </>
+  )
+  return href ? (
+    <Link href={href} className={cardClass}>
+      {body}
+    </Link>
+  ) : (
+    <div className={cardClass}>{body}</div>
   )
 }
 

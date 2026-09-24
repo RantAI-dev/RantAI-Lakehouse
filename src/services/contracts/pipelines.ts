@@ -28,6 +28,23 @@ export type Pipeline = {
   slaOk: boolean | null
   /** Null until WS2 derives freshness from Iceberg snapshot timestamps. */
   freshnessLagSeconds: Measured
+  incrementalColumn?: string
+  transforms?: string[]
+  fbicEnabled?: boolean
+}
+
+/**
+ * `GET /api/pipelines` response. The Dagster half is a shared,
+ * un-tenanted resource (`routes::pipelines::list_body`): a tenant-scoped
+ * caller the shared-catalog rule refuses gets the authored half only,
+ * plus `dagsterJobs: {supported:false, reason}` rather than a shorter
+ * list that looks complete. `error` is set instead, with an empty
+ * `pipelines`, when the whole call 503s (Dagster unreachable).
+ */
+export type PipelineList = {
+  pipelines: Pipeline[]
+  dagsterJobs?: { supported: false; reason: string }
+  error?: string
 }
 
 export type PipelineRun = {
@@ -41,8 +58,15 @@ export type PipelineRun = {
   accepted: Measured
   rejected: Measured
   retried: Measured
-  /** Null for a just-launched run and for cancel/retry responses. */
+  /**
+   * ALWAYS null now: `costUnits` used to carry the run's duration under a
+   * currency-sounding name; `durationSeconds` replaced it honestly, so
+   * this field is never a fabricated cost (`routes::pipelines`, the
+   * `duration_seconds` rename).
+   */
   costUnits: Measured
+  /** Derived from the run's own start/end time; null while it is still running. */
+  durationSeconds?: number | null
   error?: string
   checkpoint?: string
   auditEventId?: string
@@ -78,10 +102,15 @@ export type AuthoredDefinition = {
   connectorId: string | null
 }
 
-export type PipelineDetail = Pipeline & {
+export type PipelineDetail = Omit<Pipeline, "description"> & {
   /** `"dagster"` for a Dagster-native job, `"authored"` for a Postgres-defined pipeline. */
   engine: "dagster" | "authored"
-  /** No free-text description exists for a Dagster job today (WS4 item C1); null for both engines. */
+  /**
+   * Unlike `Pipeline.description` (omitted from the wire body when unset),
+   * the detail route always sends this key — `Value::Null` for a Dagster
+   * job (no free-text description exists for one today), the real value
+   * or `null` for an authored pipeline.
+   */
   description: string | null
   /** Null: no graph is knowable — an authored pipeline with no run yet, or a
    * Dagster job Dagster itself could not resolve. Real (populated from
@@ -139,10 +168,23 @@ export type CreatePipelineInput = {
   owner?: string
   /** Optional ingress connector this pipeline reads through (WS4 item F5) — mirrors `Pipeline.connectorId`. */
   connectorId?: string
+  description?: string
+}
+
+/**
+ * `POST /api/pipelines/generate`'s body — ask the LLM to name/scaffold a
+ * pipeline from a natural-language instruction; the rest of the pipeline
+ * is filled in deterministically (`routes::pipelines::generate`). Real,
+ * not a mock: the route stays registered for the copilot/Agentic Builder
+ * to call.
+ */
+export type GeneratePipelineInput = {
+  instruction: string
+  database: string
 }
 
 export interface PipelineService {
-  listPipelines(signal?: AbortSignal): Promise<Pipeline[]>
+  listPipelines(signal?: AbortSignal): Promise<PipelineList>
   getPipeline(id: string, signal?: AbortSignal): Promise<PipelineDetail>
   listRuns(pipelineId: string, signal?: AbortSignal): Promise<PipelineRun[]>
   createPipeline(input: CreatePipelineInput, signal?: AbortSignal): Promise<Pipeline>
@@ -167,4 +209,7 @@ export interface PipelineService {
    * F4's "Activate" action, moving a draft authored pipeline to `"ready"`
    * (WS4 item F1, judge review V10). */
   setPipelineStatus(id: string, status: string, signal?: AbortSignal): Promise<Pipeline>
+  /** `POST /api/pipelines/generate` — the Agentic Builder's real (non-mock)
+   * draft-from-instruction call. */
+  generatePipeline(input: GeneratePipelineInput, signal?: AbortSignal): Promise<Pipeline>
 }

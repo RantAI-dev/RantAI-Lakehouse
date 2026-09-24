@@ -217,13 +217,25 @@ const SEVERITY_TONE: Record<Severity, Tone> = {
 }
 
 /** Severity pill for alerts, quality results, and policy violations. */
+/**
+ * `null` when the firing rule was saved with no severity (a fired instance
+ * copies the rule's own severity verbatim, never invents one) — a neutral
+ * pill, never a fabricated level.
+ */
 export function SeverityBadge({
   severity,
   className,
 }: {
-  severity: Severity
+  severity: Severity | null
   className?: string
 }) {
+  if (severity === null) {
+    return (
+      <Pill tone="neutral" className={className}>
+        Unset
+      </Pill>
+    )
+  }
   return (
     <Pill tone={SEVERITY_TONE[severity]} className={className}>
       {SEVERITY_LABEL[severity]}
@@ -237,14 +249,25 @@ const CHECK_TONE: Record<CheckStatus, Tone> = {
   failed: "destructive",
 }
 
-/** Check-result pill for quality rules, validations, and asset checks. */
+/**
+ * Check-result pill for quality rules, validations, and asset checks.
+ * `null` means the check has never run — a neutral "Not measured" pill,
+ * never a fabricated status.
+ */
 export function CheckBadge({
   status,
   className,
 }: {
-  status: CheckStatus
+  status: CheckStatus | null
   className?: string
 }) {
+  if (status === null) {
+    return (
+      <Pill tone="neutral" className={className}>
+        Not measured
+      </Pill>
+    )
+  }
   return (
     <Pill tone={CHECK_TONE[status]} className={className}>
       {CHECK_STATUS_LABEL[status]}

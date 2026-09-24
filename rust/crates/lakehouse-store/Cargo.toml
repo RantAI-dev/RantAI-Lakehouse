@@ -17,6 +17,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+uuid = { workspace = true }
 lakehouse-test-support = { path = "../lakehouse-test-support" }
 
 [lints]

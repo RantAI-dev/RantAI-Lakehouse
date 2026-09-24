@@ -71,7 +71,11 @@ export type ActionState<T> =
  */
 export function useServiceAction<Args extends unknown[], T>(
   action: (signal: AbortSignal, ...args: Args) => Promise<T>
-): ActionState<T> & { run: (...args: Args) => Promise<T | null>; reset: () => void } {
+): ActionState<T> & {
+  run: (...args: Args) => Promise<T | null>
+  reset: () => void
+  cancel: () => void
+} {
   const [state, setState] = React.useState<ActionState<T>>({
     status: "idle",
     data: null,
@@ -110,5 +114,16 @@ export function useServiceAction<Args extends unknown[], T>(
     setState({ status: "idle", data: null, error: null })
   }, [])
 
-  return { ...state, run, reset }
+  // Stop what is in flight but keep what is on screen — the user who
+  // cancels a slow query still wants the last result they were reading.
+  const cancel = React.useCallback(() => {
+    controllerRef.current?.abort()
+    setState((prev) =>
+      prev.data === null
+        ? { status: "idle", data: null, error: null }
+        : { status: "success", data: prev.data, error: null }
+    )
+  }, [])
+
+  return { ...state, run, reset, cancel }
 }

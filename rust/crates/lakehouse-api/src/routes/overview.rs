@@ -27,7 +27,7 @@ use lakehouse_dagster::{
 use time::OffsetDateTime;
 
 /// Errors surfaced while building the overview: either `ClickHouse` or
-/// `Dagster` can fail, and — matching the TypeScript's single `try/catch`
+/// `Dagster` can fail, and — matching the `TypeScript`'s single `try/catch`
 /// around both — either failure produces the same 503 body.
 #[derive(Debug, thiserror::Error)]
 enum OverviewError {
@@ -40,14 +40,12 @@ enum OverviewError {
 }
 
 /// `GET /api/overview` — aggregate counts across catalog, storage,
-/// queries, and pipelines.
+/// queries, pipelines, governance and service health.
 pub async fn get(State(state): State<AppState>) -> Response {
     let probes = crate::health::cached_probe_all(&state).await;
     let pg = state.pg.as_deref();
     match get_body(&state.clickhouse, &state.dagster, pg, &probes).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
-        // `catch (e) { return NextResponse.json({ error: String(e) }, {
-        // status: 503 }); }` in `overview/route.ts` GET.
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
             ApiJson(json!({ "error": js_error(err) })),
@@ -336,10 +334,22 @@ async fn count_delayed_schedules(
     Some(delayed)
 }
 
-/// `POST /api/overview` — recent activity, sourced entirely from `Dagster`
-/// run history. Despite the verb this reads only; there is no request
-/// body and nothing is mutated.
+/// `POST /api/overview` — the recent-activity feed, from the audit trail
+/// (every console and Copilot action lands there). Despite the verb this
+/// reads only; there is no request body and nothing is mutated.
+///
+/// `Dagster` run history is the fallback for deployments whose console
+/// Postgres is not configured.
 pub async fn refresh(State(state): State<AppState>) -> Response {
+    if let Some(pool) = state.pg.as_deref() {
+        match overview::recent_activity(pool, 20).await {
+            Ok(activity) => {
+                return (StatusCode::OK, ApiJson(json!({ "activity": activity }))).into_response();
+            }
+            // Say so rather than silently falling back to the orchestrator.
+            Err(err) => tracing::warn!(error = %err, "audit activity read failed; trying Dagster"),
+        }
+    }
     match state.dagster.list_runs(20).await {
         Ok(runs) => {
             let activity: Vec<Value> = runs
@@ -358,8 +368,6 @@ pub async fn refresh(State(state): State<AppState>) -> Response {
                 .collect();
             (StatusCode::OK, ApiJson(json!({ "activity": activity }))).into_response()
         }
-        // `catch (e) { return NextResponse.json({ activity: [], error:
-        // String(e) }, { status: 503 }); }` in `overview/route.ts` POST.
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
             ApiJson(json!({ "activity": [], "error": js_error(err) })),

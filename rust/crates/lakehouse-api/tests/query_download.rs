@@ -39,13 +39,17 @@ async fn seeded_user_id(pool: &PgPool, email: &str) -> Uuid {
 
 /// Insert a `query_history` row directly through the store — the same
 /// write `routes::query::run` performs on a successful execution — with
-/// `user_name` set to whatever `owner` names (a real principal id string,
-/// or the legacy `"anonymous"` placeholder).
-async fn insert_history_row(pool: &PgPool, id: &str, sql: &str, owner: &str, engine: &str) {
+/// `owner_id` set to `owner` (`None` stands in for a legacy pre-`0046`
+/// row, which `download`'s ownership check must match nobody). `download`
+/// now checks `owner_id`, not the `user` display name — see
+/// `routes::query::download`'s doc comment.
+async fn insert_history_row(pool: &PgPool, id: &str, sql: &str, owner: Option<Uuid>, engine: &str) {
+    let user = owner.map_or_else(|| "anonymous".to_owned(), |id| id.to_string());
     let input = RecordHistoryInput {
         id,
         sql,
-        user: owner,
+        user: &user,
+        owner_id: owner,
         status: "completed",
         duration_ms: 12,
         scanned_bytes: 34,
@@ -95,14 +99,7 @@ async fn a_different_owner_gets_404() {
 
     let owner_id = seeded_user_id(&pool, "rina@meridian.example").await;
     let stranger_cookie = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
-    insert_history_row(
-        &pool,
-        "q-1",
-        "SELECT 1",
-        &owner_id.to_string(),
-        "clickhouse",
-    )
-    .await;
+    insert_history_row(&pool, "q-1", "SELECT 1", Some(owner_id), "clickhouse").await;
 
     let resp = download_with_cookie(&router, "q-1", "csv", &stranger_cookie).await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
@@ -121,7 +118,7 @@ async fn a_legacy_anonymous_row_gets_404_even_for_an_authenticated_caller() {
     let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
 
     let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
-    insert_history_row(&pool, "q-2", "SELECT 1", "anonymous", "clickhouse").await;
+    insert_history_row(&pool, "q-2", "SELECT 1", None, "clickhouse").await;
 
     let resp = download_with_cookie(&router, "q-2", "csv", &cookie).await;
     assert_eq!(
@@ -148,14 +145,7 @@ async fn stored_sql_that_is_not_read_only_is_refused_with_zero_clickhouse_reques
     // time, but a row could in principle exist another way (a hand-rolled
     // fixture, a future writer) — download must re-check, not trust the
     // stored row.
-    insert_history_row(
-        &pool,
-        "q-3",
-        "DELETE FROM t",
-        &owner_id.to_string(),
-        "clickhouse",
-    )
-    .await;
+    insert_history_row(&pool, "q-3", "DELETE FROM t", Some(owner_id), "clickhouse").await;
 
     let resp = download_with_cookie(&router, "q-3", "csv", &cookie).await;
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -175,7 +165,7 @@ async fn a_non_clickhouse_engine_is_refused_with_422() {
 
     let owner_id = seeded_user_id(&pool, "rina@meridian.example").await;
     let cookie = session_cookie_for_seeded_user(&pool, "rina@meridian.example").await;
-    insert_history_row(&pool, "q-4", "SELECT 1", &owner_id.to_string(), "trino").await;
+    insert_history_row(&pool, "q-4", "SELECT 1", Some(owner_id), "trino").await;
 
     let resp = download_with_cookie(&router, "q-4", "csv", &cookie).await;
     assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
@@ -206,7 +196,7 @@ async fn the_happy_path_returns_bytes_and_download_headers() {
         &pool,
         "q-5",
         "SELECT n FROM t",
-        &owner_id.to_string(),
+        Some(owner_id),
         "clickhouse",
     )
     .await;
@@ -239,7 +229,7 @@ async fn the_happy_path_returns_bytes_and_download_headers() {
 async fn an_unauthenticated_request_is_401_before_touching_clickhouse() {
     let ch = MockServer::start().await;
     let TestApp { router, pool } = spin_up_with_clickhouse(&ch.uri()).await;
-    insert_history_row(&pool, "q-6", "SELECT 1", "anonymous", "clickhouse").await;
+    insert_history_row(&pool, "q-6", "SELECT 1", None, "clickhouse").await;
 
     let resp = router
         .oneshot(

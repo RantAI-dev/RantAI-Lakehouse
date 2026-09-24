@@ -807,6 +807,12 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dashboard_specs_preview_route_is_registered() {
+        let resp = post(test_router(), "/api/dashboard/specs/preview").await;
+        assert_ne!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn dashboard_boards_route_is_registered() {
         let resp = get(test_router(), "/api/dashboard/boards").await;
         assert_ne!(resp.status(), StatusCode::NOT_FOUND);
@@ -896,11 +902,12 @@ mod tests {
     /// captures so the request actually resolves to a handler, not just
     /// "some path"). A tripwire against silently dropping a route during a
     /// future refactor of `routes::router` — every path here must yield a
-    /// non-404 status, and the list itself must have exactly 30 entries.
+    /// non-404 status, and the list itself must have exactly 32 entries.
     #[tokio::test]
-    async fn router_exposes_all_thirty_route_paths() {
-        const EXPECTED_PATHS: [&str; 30] = [
+    async fn router_exposes_all_thirty_two_route_paths() {
+        const EXPECTED_PATHS: [&str; 32] = [
             "/api/catalog",
+            "/api/catalog/query",
             "/api/catalog/some-id",
             "/api/overview",
             "/api/ops/workloads",
@@ -916,6 +923,7 @@ mod tests {
             "/api/pipelines/refresh_lakehouse/trigger",
             "/api/dashboard",
             "/api/dashboard/specs",
+            "/api/dashboard/specs/preview",
             "/api/dashboard/boards",
             "/api/dashboard/fields",
             "/api/dashboard/records",
@@ -931,7 +939,7 @@ mod tests {
             "/api/ai/sessions",
             "/api/ai/build-status",
         ];
-        assert_eq!(EXPECTED_PATHS.len(), 30);
+        assert_eq!(EXPECTED_PATHS.len(), 32);
         for uri in EXPECTED_PATHS {
             // GET is enough to prove a path is mounted: axum returns 405
             // Method Not Allowed (not 404) for a registered path hit with

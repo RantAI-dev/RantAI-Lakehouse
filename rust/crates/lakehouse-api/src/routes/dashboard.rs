@@ -124,7 +124,21 @@ async fn get_body(
             }
         };
 
-    let board_obj = boards.iter().find(|b| b.id == board);
+    // The built-in board's layout row is kept out of `list_boards`.
+    let default_row = if board == store::DEFAULT_BOARD_ID {
+        store::get_board(ch, store::DEFAULT_BOARD_ID)
+            .await
+            .unwrap_or_else(|err| {
+                store_error.get_or_insert_with(|| format!("Error: {err}"));
+                None
+            })
+    } else {
+        None
+    };
+    let board_obj = boards
+        .iter()
+        .find(|b| b.id == board)
+        .or(default_row.as_ref());
     let layout = board_obj.and_then(|b| b.layout.clone()).unwrap_or_default();
     let filters = param_filters
         .or_else(|| board_obj.and_then(|b| b.filters.clone()))
@@ -287,6 +301,47 @@ pub async fn specs_create(State(state): State<AppState>, body: Bytes) -> ApiResu
     ))
 }
 
+/// `POST /api/dashboard/specs/preview` — validate and execute a chart input
+/// without persisting it. The builder uses this to show the user the actual
+/// result before the chart is added to a dashboard.
+///
+/// Same posture as [`get`]: `Policy::RequiresPermission
+/// ("dashboard:read")` guarantees a real `Extension<Principal>`, whose
+/// `role_names`/id/tenant ids are threaded into [`run_spec_sql`] so a
+/// preview is masked/row-filtered exactly like the persisted tile would be.
+pub async fn specs_preview(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    let input = parse_chart_input(&body)?;
+    let spec = store::spec_from_input(&state.clickhouse, &input, ChartSource::Ui, "ui", None)
+        .await
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    let placeholders = crate::sql_rewrite::PlaceholderValues {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_tenant_ids: principal
+            .tenant_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    };
+    let obligations = PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
+    let (_, result) = run_spec_sql(
+        &state.clickhouse,
+        &spec.spec.id,
+        &spec.spec.sql,
+        &principal.role_names,
+        &placeholders,
+        &obligations,
+    )
+    .await;
+    Ok(ApiJson(json!({
+        "spec": render_stored_spec(&spec.spec, ChartSource::Ui),
+        "result": result,
+    })))
+}
+
 /// `PUT /api/dashboard/specs` — edit a stored chart, keeping its id.
 ///
 /// The `TypeScript` handler (`specs/route.ts::PUT`) parses the body as
@@ -428,13 +483,31 @@ struct BoardEditBody {
     embed: Option<bool>,
 }
 
+/// Whether a `PUT /api/dashboard/boards` body may be applied: it names a
+/// board, and the built-in board is sent nothing but a layout.
+fn board_edit_allowed(body: &BoardEditBody) -> bool {
+    match body.id.as_deref() {
+        None | Some("") => false,
+        Some(store::DEFAULT_BOARD_ID) => {
+            body.name.is_none()
+                && body.filters.is_none()
+                && body.public.is_none()
+                && body.embed.is_none()
+        }
+        Some(_) => true,
+    }
+}
+
 /// `PUT /api/dashboard/boards` — rename/relayout/re-filter/publish/embed a
 /// board.
 ///
+/// The built-in `"default"` board accepts a layout only: it has no name,
+/// filters, share link or embed of its own to change.
+///
 /// # Errors
 ///
-/// 400 when `id` is missing/`"default"`, or on a validation/`ClickHouse`
-/// failure.
+/// 400 when `id` is missing, when `"default"` is sent anything but a
+/// layout, or on a validation/`ClickHouse` failure.
 pub async fn boards_update(
     State(state): State<AppState>,
     body: Bytes,
@@ -445,10 +518,10 @@ pub async fn boards_update(
         serde_json::from_slice(&body)
             .map_err(|err| ApiError::BadRequest(format!("JSON is invalid: {err}")))?
     };
-    let id = parsed.id.unwrap_or_default();
-    if id.is_empty() || id == "default" {
+    if !board_edit_allowed(&parsed) {
         return Err(ApiError::BadRequest("invalid dashboard".to_owned()).into());
     }
+    let id = parsed.id.clone().unwrap_or_default();
     let ch = &state.clickhouse;
     if let Some(name) = &parsed.name {
         store::rename_board(ch, &id, name)
@@ -728,9 +801,10 @@ pub async fn values(
 /// hand-rolled `YAML` document. The only non-`JSON` response in this crate:
 /// returned directly as `text/yaml`, bypassing [`ApiJson`].
 pub async fn export(State(state): State<AppState>) -> ApiResult<Response> {
-    let (charts, boards) = tokio::try_join!(
+    let (charts, boards, default_row) = tokio::try_join!(
         store::list_stored_charts(&state.clickhouse),
-        store::list_boards(&state.clickhouse)
+        store::list_boards(&state.clickhouse),
+        store::get_board(&state.clickhouse, store::DEFAULT_BOARD_ID)
     )
     .map_err(|err| ApiError::Internal(err.to_string()))?;
 
@@ -738,7 +812,11 @@ pub async fn export(State(state): State<AppState>) -> ApiResult<Response> {
     out.push_str("# RantAI Lakehouse — dashboard as code\n");
     out.push_str("# boards & chart specs, exported from console.bi_chart\n\n");
     out.push_str("boards:\n");
-    out.push_str(&yaml_board("default", "Main", None));
+    out.push_str(&yaml_board(
+        store::DEFAULT_BOARD_ID,
+        "Main",
+        default_row.as_ref().and_then(|b| b.layout.as_ref()),
+    ));
     for b in &boards {
         out.push_str(&yaml_board(&b.id, &b.name, b.layout.as_ref()));
     }
@@ -1057,6 +1135,23 @@ mod tests {
         );
         assert_eq!(yaml_value(&json!(null)), "~");
         assert_eq!(yaml_value(&json!(3_000_000)), "3000000");
+    }
+
+    #[test]
+    fn board_edit_allows_only_a_layout_on_the_default_board() {
+        let body = |json: &str| serde_json::from_str::<BoardEditBody>(json).unwrap();
+        assert!(board_edit_allowed(&body(r#"{"id":"default","layout":{}}"#)));
+        assert!(!board_edit_allowed(&body(r#"{"id":"default","name":"x"}"#)));
+        assert!(!board_edit_allowed(&body(
+            r#"{"id":"default","public":true}"#
+        )));
+        assert!(!board_edit_allowed(&body(
+            r#"{"id":"default","layout":{},"embed":true}"#
+        )));
+        assert!(board_edit_allowed(&body(
+            r#"{"id":"b_1","name":"x","public":true}"#
+        )));
+        assert!(!board_edit_allowed(&body(r#"{"layout":{}}"#)));
     }
 
     #[test]

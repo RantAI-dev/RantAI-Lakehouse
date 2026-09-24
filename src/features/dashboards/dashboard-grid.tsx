@@ -1,18 +1,41 @@
 "use client";
 
 import * as React from "react";
-import { GripVertical, Pencil, Trash2 } from "lucide-react";
+import { GripVertical, MoreHorizontal } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuGroupLabel,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { settleLayout } from "@/lib/grid-layout";
 import { cn } from "@/lib/utils";
 import type { LayoutMap, TileBox } from "@/services/clients/bi-store";
+
+export type TileMenuItem = {
+  label: string;
+  icon: React.ReactNode;
+  onSelect: () => void;
+  destructive?: boolean;
+  /** Start a new group: a separator is drawn above this item. */
+  separatorBefore?: boolean;
+};
 
 export type GridItem = {
   id: string;
   title: string;
   subtitle?: string;
   badge?: React.ReactNode;
+  /** Small affordance beside the title, e.g. that the chart is clickable. */
+  hint?: React.ReactNode;
   body: React.ReactNode;
-  onEdit?: () => void;
-  onRemove?: () => void;
+  /** Heading of the ⋯ menu (e.g. where the data comes from). */
+  menuLabel?: string;
+  menu?: TileMenuItem[];
 };
 
 const COLS = 12;
@@ -20,7 +43,10 @@ const MARGIN = 12;
 const ROW_H = 44;
 const DEFAULT: TileBox = { x: 0, y: 0, w: 6, h: 6 };
 
-/** Ensure every item has a box; items without one get placed 2-per-row below. */
+/**
+ * Ensure every item has a box; items without one get placed 2-per-row
+ * below. A stored layout that already overlaps gets tidied up too.
+ */
 function resolve(items: GridItem[], layout: LayoutMap): LayoutMap {
   const out: LayoutMap = {};
   const ids = new Set(items.map((i) => i.id));
@@ -34,7 +60,7 @@ function resolve(items: GridItem[], layout: LayoutMap): LayoutMap {
     col += DEFAULT.w;
     if (col >= COLS) { col = 0; maxY += DEFAULT.h; }
   }
-  return out;
+  return settleLayout(out);
 }
 
 type Drag = { id: string; mode: "move" | "resize"; px: number; py: number; box: TileBox };
@@ -73,19 +99,23 @@ export function DashboardGrid({
   const base = React.useMemo(() => resolve(items, layout), [items, layout]);
   const view = preview ?? base;
 
-  const colW = width > 0 ? (width - MARGIN * (COLS + 1)) / COLS : 0;
+  // Margin hanya menjadi gap ANTAR kolom/baris. Kanvas tidak menambahkan
+  // inset luar agar tepi tile sejajar dengan KPI dan konten dashboard lain.
+  const colW = width > 0 ? (width - MARGIN * (COLS - 1)) / COLS : 0;
   const unitX = colW + MARGIN;
   const unitY = ROW_H + MARGIN;
   const boxStyle = (b: TileBox): React.CSSProperties => ({
     position: "absolute",
-    left: MARGIN + b.x * unitX,
-    top: MARGIN + b.y * unitY,
+    left: b.x * unitX,
+    top: b.y * unitY,
     width: b.w * colW + (b.w - 1) * MARGIN,
     height: b.h * ROW_H + (b.h - 1) * MARGIN,
   });
 
   const maxY = Math.max(0, ...Object.values(view).map((b) => b.y + b.h));
-  const canvasH = MARGIN + maxY * unitY + (editable ? unitY : 0);
+  const canvasH = maxY > 0
+    ? maxY * ROW_H + (maxY - 1) * MARGIN + (editable ? unitY : 0)
+    : 0;
 
   // Attach move/up listeners DIRECTLY (imperatively) in startDrag so it does not
   // depend on a re-render/effect — even the first pointermove event is caught.
@@ -104,7 +134,8 @@ export function DashboardGrid({
       const nb: TileBox = mode === "move"
         ? { x: Math.min(Math.max(0, b.x + dCols), COLS - b.w), y: Math.max(0, b.y + dRows), w: b.w, h: b.h }
         : { x: b.x, y: b.y, w: Math.min(Math.max(2, b.w + dCols), COLS - b.x), h: Math.max(3, b.h + dRows) };
-      last = { ...base, [id]: nb };
+      // Tile yang ditabrak turun ke bawah, jadi tidak ada yang tertimpa.
+      last = settleLayout({ ...base, [id]: nb }, id);
       setPreview(last);
     };
     const up = () => {
@@ -126,7 +157,7 @@ export function DashboardGrid({
           style={{
             backgroundImage: `linear-gradient(90deg, var(--border) 1px, transparent 1px)`,
             backgroundSize: `${unitX}px 100%`,
-            backgroundPosition: `${MARGIN}px 0`,
+            backgroundPosition: "0 0",
             opacity: 0.25,
           }}
         />
@@ -144,22 +175,47 @@ export function DashboardGrid({
                    onPointerDown={editable ? (e) => startDrag(e, it.id, "move") : undefined}>
                 {editable ? <GripVertical className="size-4 shrink-0 text-muted-foreground" /> : null}
                 <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-semibold leading-tight">{it.title}</p>
+                  <p className="flex items-center gap-1.5 truncate text-sm font-semibold leading-tight">
+                    <span className="truncate">{it.title}</span>
+                    {it.hint}
+                  </p>
                   {it.subtitle ? <p className="truncate text-[11px] text-muted-foreground">{it.subtitle}</p> : null}
                 </div>
                 {it.badge}
-                {editable ? (
-                  <div className="flex items-center gap-0.5" onPointerDown={(e) => e.stopPropagation()}>
-                    {it.onEdit ? (
-                      <button type="button" onClick={it.onEdit} aria-label="Edit" className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground">
-                        <Pencil className="size-3.5" />
-                      </button>
-                    ) : null}
-                    {it.onRemove ? (
-                      <button type="button" onClick={it.onRemove} aria-label="Delete" className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive">
-                        <Trash2 className="size-3.5" />
-                      </button>
-                    ) : null}
+                {it.menu?.length ? (
+                  <div className="print:hidden" onPointerDown={(e) => e.stopPropagation()}>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger
+                        render={
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="size-7 text-muted-foreground hover:text-foreground"
+                            aria-label={`Actions for ${it.title}`}
+                          />
+                        }
+                      >
+                        <MoreHorizontal className="size-4" />
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="w-48">
+                        {it.menuLabel ? (
+                          <DropdownMenuGroup>
+                            <DropdownMenuGroupLabel className="truncate font-mono text-[11px] font-normal">
+                              {it.menuLabel}
+                            </DropdownMenuGroupLabel>
+                          </DropdownMenuGroup>
+                        ) : null}
+                        {it.menu.map((m, i) => (
+                          <React.Fragment key={m.label}>
+                            {m.separatorBefore && i > 0 ? <DropdownMenuSeparator /> : null}
+                            <DropdownMenuItem variant={m.destructive ? "destructive" : "default"} onClick={m.onSelect}>
+                              {m.icon}
+                              {m.label}
+                            </DropdownMenuItem>
+                          </React.Fragment>
+                        ))}
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                   </div>
                 ) : null}
               </div>

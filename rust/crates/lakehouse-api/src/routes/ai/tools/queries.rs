@@ -55,7 +55,9 @@ pub(super) async fn save_query(state: &AppState, args: &Map<String, Value>) -> V
         Ok(p) => p,
         Err(err) => return err,
     };
-    match queries::create_saved_query(pool, &title, &sql, &owner, &tags).await {
+    // The copilot saves under the name it was given; it has no principal
+    // id of its own to record as the author.
+    match queries::create_saved_query(pool, &title, &sql, &owner, &tags, None).await {
         Ok(saved) => json!({ "ok": true, "query": saved }),
         Err(err) => json!({ "error": err.to_string() }),
     }
@@ -261,7 +263,7 @@ mod tests {
                 "expected a successful run, got {result}"
             );
 
-            let history = queries::list_history(&pool)
+            let history = queries::list_history(&pool, Uuid::nil())
                 .await
                 .expect("query_history is readable");
             let recorded = history

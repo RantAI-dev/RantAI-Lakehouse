@@ -1,4 +1,3 @@
-import type { Measured } from "@/lib/measured"
 import type { EngineCategory, EntityStatus, WorkloadClass } from "@/lib/status"
 
 /**
@@ -17,6 +16,9 @@ export type SavedQuery = {
   updatedAt: string
   tags: string[]
 }
+
+/** One result cell, in whatever type ClickHouse reported it as. */
+export type QueryCell = string | number | boolean | null
 
 export type QueryHistoryItem = {
   id: string
@@ -51,9 +53,12 @@ export type QueryPlanStage = {
 }
 
 export type QueryEstimate = {
-  estimatedBytes: number
-  estimatedCostMin: number
-  estimatedCostMax: number
+  /** Null when the query could not be planned — see `error`. */
+  estimatedBytes: number | null
+  estimatedCostMin: number | null
+  estimatedCostMax: number | null
+  /** Why there is no estimate, in ClickHouse's words. */
+  error?: string | null
   workloadClass: WorkloadClass
   engine: EngineCategory
   /**
@@ -61,8 +66,8 @@ export type QueryEstimate = {
    * real cache-eligibility check exists.
    */
   cacheEligible: boolean | null
-  /** No freshness-lag measurement exists yet. */
-  freshnessLagSeconds: Measured
+  /** Lag of the stalest source table (`freshness_lag`, ClickHouse `system.parts`); null when no source is known. */
+  freshnessLagSeconds: number | null
   /** No policy engine exists yet — WS7 builds one. */
   policyObligations: string[] | null
   sources: string[]
@@ -76,13 +81,18 @@ export type QueryEstimate = {
 export type QueryResult = {
   id: string
   columns: string[]
-  rows: Record<string, string>[]
+  rows: Record<string, QueryCell>[]
   /**
    * The engine this specific run actually executed against — distinct from
    * `metrics.engine` below, which is an `EngineCategory` describing the
    * ClickHouse storage tier the query hit, not which engine ran it.
    */
   engine: QueryEngine | string
+  /** How many rows the query produced, which `rows` may only be part of (`total_rows`). */
+  rowCount: number
+  /** True when `rows` was cut to `rowLimit` (2,000, `MAX_RESULT_ROWS`) before being sent. */
+  truncated: boolean
+  rowLimit: number
   metrics: {
     durationMs: number
     scannedBytes: number
@@ -115,8 +125,16 @@ export type QueryResult = {
  */
 export type QuerySchedulingCapability = { supported: false; reason: string }
 
+/** What "Save query" in Query Studio sends. */
+export type SaveQueryInput = {
+  title: string
+  sql: string
+  tags: string[]
+}
+
 export interface QueryService {
   listSaved(signal?: AbortSignal): Promise<SavedQuery[]>
+  saveQuery(input: SaveQueryInput, signal?: AbortSignal): Promise<SavedQuery>
   listHistory(signal?: AbortSignal): Promise<QueryHistoryItem[]>
   estimate(sql: string, signal?: AbortSignal): Promise<QueryEstimate>
   run(sql: string, options: { engine: QueryEngine }, signal?: AbortSignal): Promise<QueryResult>

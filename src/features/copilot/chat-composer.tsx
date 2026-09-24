@@ -1,7 +1,9 @@
 "use client";
 
 import * as React from "react";
-import { ArrowUp, SlidersHorizontal, Check } from "lucide-react";
+import { ArrowUp, SlidersHorizontal, Square } from "lucide-react";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Popover, PopoverContent, PopoverDescription, PopoverHeader, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import type { Mode } from "./use-copilot";
@@ -15,63 +17,57 @@ function ToolsMenu({
   enabledCaps: Set<string>;
   toggleCap: (key: string) => void;
 }) {
-  const [open, setOpen] = React.useState(false);
-  const ref = React.useRef<HTMLDivElement>(null);
   const avail = capsForMode(mode);
   const onCount = avail.filter((c) => enabledCaps.has(c.key)).length;
-
-  React.useEffect(() => {
-    if (!open) return;
-    const onDoc = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
-    document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
-  }, [open]);
+  const limited = onCount < avail.length;
 
   return (
-    <div className="relative" ref={ref}>
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className={cn(
-          "flex items-center gap-1.5 rounded-lg px-2 py-1 text-xs transition-colors",
-          open ? "bg-muted text-foreground" : "text-muted-foreground hover:text-foreground",
-        )}
-      >
-        <SlidersHorizontal className="size-3.5" />
-        Tools <span className="text-[10px] opacity-70">{onCount}/{avail.length}</span>
-      </button>
-      {open ? (
-        <div className="absolute bottom-full left-0 z-10 mb-1.5 w-72 overflow-hidden rounded-xl border border-border bg-card p-1.5 shadow-xl">
-          <p className="px-2 py-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-            Capabilities · {mode === "ask" ? "Ask" : "Build"}
-          </p>
+    <Popover>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          title="Choose what Copilot can use"
+          className={cn(
+            "flex items-center gap-1.5 rounded-lg px-2 py-1 text-xs transition-colors hover:text-foreground data-[state=open]:bg-muted data-[state=open]:text-foreground",
+            limited ? "text-amber-700 dark:text-amber-400" : "text-muted-foreground",
+          )}
+        >
+          <SlidersHorizontal className="size-3.5" />
+          Tools
+          {limited ? <span className="tabular-nums">{onCount}/{avail.length}</span> : null}
+        </button>
+      </PopoverTrigger>
+      <PopoverContent side="top" align="start" className="w-80 gap-2 p-2">
+        <PopoverHeader className="px-1.5 pt-1">
+          <PopoverTitle>What Copilot can use</PopoverTitle>
+          <PopoverDescription className="text-xs">
+            {mode === "build"
+              ? "Turn one off to keep Copilot away from it in this chat. Anything that changes data still asks you first."
+              : "Ask mode only reads. Turn one off to keep Copilot from looking there."}
+          </PopoverDescription>
+        </PopoverHeader>
+        <div className="flex flex-col">
           {avail.map((c) => {
-            const on = enabledCaps.has(c.key);
             const Icon = c.icon;
+            const id = `cap-${c.key}`;
             return (
-              <button
+              <label
                 key={c.key}
-                type="button"
-                onClick={() => toggleCap(c.key)}
-                className="flex w-full items-center gap-2.5 rounded-md px-2 py-2 text-left hover:bg-muted"
+                htmlFor={id}
+                className="flex cursor-pointer items-center gap-2.5 rounded-md px-1.5 py-2 hover:bg-muted"
               >
                 <Icon className="size-4 shrink-0 text-muted-foreground" />
                 <span className="min-w-0 flex-1">
                   <span className="block text-sm font-medium text-foreground">{c.label}</span>
                   <span className="block truncate text-[11px] text-muted-foreground">{c.desc}</span>
                 </span>
-                <span className={cn(
-                  "grid size-4 shrink-0 place-items-center rounded border",
-                  on ? "border-primary bg-primary text-primary-foreground" : "border-border",
-                )}>
-                  {on ? <Check className="size-3" /> : null}
-                </span>
-              </button>
+                <Checkbox id={id} checked={enabledCaps.has(c.key)} onCheckedChange={() => toggleCap(c.key)} />
+              </label>
             );
           })}
         </div>
-      ) : null}
-    </div>
+      </PopoverContent>
+    </Popover>
   );
 }
 
@@ -81,12 +77,14 @@ function ToolsMenu({
  * dock and /copilot.
  */
 export function ChatComposer({
-  mode, setMode, onSend, busy, placeholder, autoFocus, rows = 2,
+  mode, setMode, onSend, onStop, busy, placeholder, autoFocus, rows = 2,
   enabledCaps, toggleCap, onFocus, glass, compact,
 }: {
   mode: Mode;
   setMode: (m: Mode) => void;
   onSend: (text: string) => void;
+  /** Stop the answer in flight; the send button becomes Stop while busy. */
+  onStop?: () => void;
   busy: boolean;
   placeholder?: string;
   autoFocus?: boolean;
@@ -124,13 +122,22 @@ export function ChatComposer({
           aria-label="Message AI Copilot"
           className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
         />
-        <button
-          type="button" onClick={submit} disabled={busy || !input.trim()} aria-label="Send"
-          className={cn("grid size-7 shrink-0 place-items-center rounded-full transition-colors",
-            busy || !input.trim() ? "text-muted-foreground" : "bg-primary text-primary-foreground hover:bg-primary/85")}
-        >
-          <ArrowUp className="size-4" />
-        </button>
+        {busy && onStop ? (
+          <button
+            type="button" onClick={onStop} aria-label="Stop" title="Stop"
+            className="grid size-7 shrink-0 place-items-center rounded-full bg-foreground text-background hover:bg-foreground/85"
+          >
+            <Square className="size-3 fill-current" />
+          </button>
+        ) : (
+          <button
+            type="button" onClick={submit} disabled={busy || !input.trim()} aria-label="Send"
+            className={cn("grid size-7 shrink-0 place-items-center rounded-full transition-colors",
+              busy || !input.trim() ? "text-muted-foreground" : "bg-primary text-primary-foreground hover:bg-primary/85")}
+          >
+            <ArrowUp className="size-4" />
+          </button>
+        )}
       </div>
     );
   }
@@ -155,13 +162,13 @@ export function ChatComposer({
       />
       <div className="flex items-center gap-1.5 px-1 pb-0.5">
         {/* Ask/Build toggle */}
-        <div className="inline-flex rounded-lg bg-muted/60 p-0.5" role="tablist" aria-label="Copilot mode">
+        <div className="inline-flex rounded-lg bg-muted/60 p-0.5" role="group" aria-label="Copilot mode">
           {(["ask", "build"] as Mode[]).map((m) => (
             <button
               key={m}
               type="button"
-              role="tab"
-              aria-selected={mode === m}
+              aria-pressed={mode === m}
+              title={m === "ask" ? "Ask: answers questions, changes nothing" : "Build: can create and change things, asking you first"}
               onClick={() => setMode(m)}
               className={cn(
                 "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
@@ -177,18 +184,34 @@ export function ChatComposer({
           <ToolsMenu mode={mode} enabledCaps={enabledCaps} toggleCap={toggleCap} />
         ) : null}
 
-        <button
-          type="button"
-          onClick={submit}
-          disabled={busy || !input.trim()}
-          aria-label="Send"
-          className={cn(
-            "ml-auto grid size-8 place-items-center rounded-lg transition-colors",
-            busy || !input.trim() ? "bg-muted text-muted-foreground" : "bg-primary text-primary-foreground hover:bg-primary/85",
-          )}
-        >
-          <ArrowUp className="size-4" />
-        </button>
+        {busy && onStop ? (
+          <button
+            type="button"
+            onClick={onStop}
+            aria-label="Stop"
+            title="Stop"
+            className={cn(
+              "grid size-8 place-items-center rounded-lg bg-foreground text-background transition-colors hover:bg-foreground/85",
+              "ml-auto",
+            )}
+          >
+            <Square className="size-3.5 fill-current" />
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={submit}
+            disabled={busy || !input.trim()}
+            aria-label="Send"
+            className={cn(
+              "grid size-8 place-items-center rounded-lg transition-colors",
+              "ml-auto",
+              busy || !input.trim() ? "bg-muted text-muted-foreground" : "bg-primary text-primary-foreground hover:bg-primary/85",
+            )}
+          >
+            <ArrowUp className="size-4" />
+          </button>
+        )}
       </div>
     </div>
   );

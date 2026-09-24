@@ -3,22 +3,30 @@
  * helpers so dates, durations, bytes, rates, and costs read identically.
  */
 
-/** 1234567 → "1.2M"; 950 → "950". */
-export function formatCompactNumber(value: number): string {
+/**
+ * 1234567 → "1.2M"; 950 → "950".
+ * `null` means the number is not known, and reads as "—".
+ */
+export function formatCompactNumber(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "—"
   return Intl.NumberFormat("en", {
     notation: "compact",
     maximumFractionDigits: 1,
   }).format(value)
 }
 
-/** 1234567 → "1,234,567". */
-export function formatNumber(value: number): string {
+/** 1234567 → "1,234,567"; `null` → "—". */
+export function formatNumber(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "—"
   return Intl.NumberFormat("en").format(value)
 }
 
-/** Bytes → short human string, e.g. 1536 → "1.5 KB", 2.4e12 → "2.4 TB". */
-export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes < 0) return "—"
+/**
+ * Bytes → short human string, e.g. 1536 → "1.5 KB", 2.4e12 → "2.4 TB".
+ * `null` means the size is not measurable from here, and reads as "—".
+ */
+export function formatBytes(bytes: number | null | undefined): string {
+  if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return "—"
   const units = ["B", "KB", "MB", "GB", "TB", "PB"]
   let v = bytes
   let i = 0
@@ -55,8 +63,8 @@ export function formatTokens(count: number): string {
 }
 
 /** Internal cost units, e.g. 0.0421 → "0.0421 cu". */
-export function formatCost(units: number): string {
-  if (!Number.isFinite(units)) return "—"
+export function formatCost(units: number | null | undefined): string {
+  if (units == null || !Number.isFinite(units)) return "—"
   const digits = units >= 10 ? 1 : units >= 1 ? 2 : 4
   return `${units.toFixed(digits)} cu`
 }
@@ -67,9 +75,24 @@ export function formatPercent(fraction: number): string {
   return `${(fraction * 100).toFixed(1)}%`
 }
 
+/**
+ * Timestamp string → `Date`.
+ *
+ * ClickHouse's `toString(DateTime)` gives `"2026-09-13 07:09:40"`: no `T`, no
+ * zone. The server runs in UTC, but a zoneless string parses as local time, so
+ * in WIB every such stamp read 7 hours old. Treat that exact shape as UTC;
+ * anything carrying its own `T` or offset parses as written.
+ */
+export function parseTimestamp(value: string): Date {
+  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(value)) {
+    return new Date(`${value.replace(" ", "T")}Z`)
+  }
+  return new Date(value)
+}
+
 /** ISO timestamp → "12 Jun 2026, 09:41". */
 export function formatDateTime(iso: string): string {
-  const d = new Date(iso)
+  const d = parseTimestamp(iso)
   if (Number.isNaN(d.getTime())) return "—"
   return Intl.DateTimeFormat("en", {
     day: "2-digit",
@@ -81,9 +104,55 @@ export function formatDateTime(iso: string): string {
   }).format(d)
 }
 
+/**
+ * Date only, with the parts caller-selectable — used by the data table's
+ * date/date-range filter chips, which render compact labels like
+ * `"Mar 4 - Mar 18"` rather than the fixed shape [`formatDateTime`] emits.
+ *
+ * Accepts a `Date`, an ISO string, or an epoch number because filter
+ * values arrive from the URL as strings but from the calendar as `Date`s.
+ * Returns `""` (not `"—"`) for missing/invalid input: the callers here
+ * concatenate the result into a chip label, where an em dash would read as
+ * a real value.
+ */
+export function formatDate(
+  date: Date | string | number | undefined,
+  opts: Intl.DateTimeFormatOptions = {}
+): string {
+  if (!date) return ""
+  const d = new Date(date)
+  if (Number.isNaN(d.getTime())) return ""
+  return Intl.DateTimeFormat("en", {
+    month: opts.month ?? "long",
+    day: opts.day ?? "numeric",
+    year: opts.year ?? "numeric",
+    ...opts,
+  }).format(d)
+}
+
 /** ISO timestamp → relative age, e.g. "4m ago", "3h ago", "2d ago". */
-export function formatRelativeTime(iso: string, now = Date.now()): string {
-  const t = new Date(iso).getTime()
+/**
+ * Whether a timestamp has already passed.
+ *
+ * Kept here beside the formatters so components never reach for
+ * `Date.now()` in render — the same reason `formatRelativeTime` takes
+ * `now` as a defaulted parameter.
+ */
+export function isPast(
+  iso: string | null | undefined,
+  now = Date.now()
+): boolean {
+  if (!iso) return false
+  const t = parseTimestamp(iso).getTime()
+  return !Number.isNaN(t) && t < now
+}
+
+export function formatRelativeTime(
+  iso: string | null | undefined,
+  now = Date.now()
+): string {
+  if (!iso) return "—"
+  const t = parseTimestamp(iso).getTime()
   if (Number.isNaN(t)) return "—"
   const diffMs = now - t
   if (diffMs < 0) return "just now"

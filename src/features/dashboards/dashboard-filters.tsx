@@ -10,14 +10,20 @@ import { apiFetch } from "@/services/http";
  * A cross-tile dashboard filter bar, Tableau/Metabase-style. Pick a
  * dimension column → values (multi-select) → filters EVERY tile that has
  * that column. Active filters show as chips. Applies live and (on a user
- * dashboard) is saved.
+ * dashboard) is saved. The year sits here too, as its own chip, so every
+ * filter is in one place.
  */
 export function DashboardFilters({
-  columns, filters, onChange,
+  columns, filters, onChange, years, year, onYearChange,
 }: {
   columns: string[];
   filters: FilterDef[];
   onChange: (next: FilterDef[]) => void;
+  /** Years the data covers; the chip is hidden when there are none. */
+  years: number[];
+  /** `"all"` or a year. */
+  year: string;
+  onYearChange: (year: string) => void;
 }) {
   const [editing, setEditing] = React.useState<string | null>(null); // the column currently open
   const [valuesList, setValuesList] = React.useState<string[]>([]);
@@ -55,6 +61,36 @@ export function DashboardFilters({
     <div className="flex flex-wrap items-center gap-1.5" ref={ref}>
       <span className="flex items-center gap-1 text-xs text-muted-foreground"><Filter className="size-3.5" /> Filter:</span>
 
+      {years.length ? (
+        <div className="relative">
+          <button
+            onClick={() => setEditing(editing === "__year__" ? null : "__year__")}
+            className={cn(
+              "inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs",
+              year === "all" ? "border-border text-muted-foreground hover:bg-muted" : "border-primary/30 bg-primary/10 text-primary",
+            )}
+          >
+            <span className="font-medium">Year</span>
+            <span className="opacity-80">{year === "all" ? "All" : `= ${year}`}</span>
+            <ChevronDown className="size-3" />
+          </button>
+          {editing === "__year__" ? (
+            <div className="absolute left-0 top-full z-20 mt-1 max-h-64 w-36 overflow-y-auto rounded-lg border border-border bg-card p-1 shadow-xl">
+              {["all", ...[...years].sort((a, b) => b - a).map(String)].map((y) => (
+                <button
+                  key={y}
+                  onClick={() => { onYearChange(y); setEditing(null); }}
+                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-muted"
+                >
+                  <Check className={cn("size-3.5", y === year ? "opacity-100" : "opacity-0")} aria-hidden />
+                  {y === "all" ? "All years" : y}
+                </button>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
       {/* Active filter chips */}
       {filters.map((f) => (
         <div key={f.column} className="relative">
@@ -90,7 +126,7 @@ export function DashboardFilters({
               ))}
             </div>
           ) : null}
-          {editing && editing !== "__add__" && !filters.some((f) => f.column === editing) ? (
+          {editing && editing !== "__add__" && editing !== "__year__" && !filters.some((f) => f.column === editing) ? (
             <ValuePanel col={editing} loading={loading} valuesList={valuesList} picked={picked} setPicked={setPicked} onApply={() => apply(editing)} />
           ) : null}
         </div>

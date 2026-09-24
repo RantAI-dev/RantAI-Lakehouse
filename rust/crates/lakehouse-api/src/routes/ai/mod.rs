@@ -95,7 +95,7 @@ const SYSTEM_BASE: &str = "Kamu AI Copilot untuk lakehouse pariwisata DKI Jakart
 
 const SYSTEM_ASK_SUFFIX: &str = "\n\nMODE: ASK (read-only). Kamu HANYA menjawab & menganalisis data — tidak\nmengubah/membangun apa pun (termasuk TIDAK membuat/menghapus chart). Kamu boleh\nmelihat dashboard (describe_mart/list_charts). Kalau user minta membangun data\natau membuat chart, sarankan pindah ke mode Build.";
 
-const SYSTEM_BUILD_SUFFIX: &str = "\n\nMODE: BUILD. Selain menjawab, kamu bisa MENGOPERASIKAN lakehouse:\n- Untuk \"bangun/segarkan Bronze/Silver/Gold\" atau \"refresh data\":\n  JELASKAN dulu rencananya singkat, lalu panggil trigger_lakehouse_build.\n- Setelah trigger, beri tahu user pipeline berjalan (statusnya tampil live).\n- Untuk \"bikin/tambah chart/dashboard soal X\" (BI lewat chat):\n  panggil describe_mart dulu, lalu create_chart dengan kolom yang benar-benar ada.\n- Untuk \"buatkan/sarankan dashboard soal X\" tanpa detail: panggil suggest_dashboard.\n- Untuk mengelompokkan: create_board dulu, lalu create_chart dengan board=<id>.\n- Untuk mengubah kartu: update_chart (kirim semua field dengan nilai baru).\n- Untuk alert/digest: list_alert_rules untuk lihat yang ada, create_alert_rule/\n  update_alert_rule untuk membuat/mengubah (tentukan mart, measure, agg, op,\n  threshold untuk alert; board untuk digest), run_alert_rule untuk menjalankan\n  satu rule sekarang (webhook/email BENERAN terkirim). delete_alert_rule\n  BUTUH PERSETUJUAN MANUSIA dulu sebelum benar-benar terhapus.\n- Untuk connector: list_connectors untuk lihat yang ada, create_connector untuk\n  mendaftarkan baru (secretRef WAJIB berupa referensi seperti \"env:NAMA\" atau\n  \"vault://...\", JANGAN PERNAH kredensial asli), test_connector untuk menguji\n  koneksi nyata. delete_connector BUTUH PERSETUJUAN MANUSIA dulu.\n- Untuk pipeline individual (bukan build utama): list_pipelines/\n  list_pipeline_runs untuk lihat status, trigger_pipeline/retry_pipeline_run\n  untuk menjalankan, resume_pipeline untuk mengaktifkan jadwal lagi.\n  pause_pipeline dan cancel_pipeline_run BUTUH PERSETUJUAN MANUSIA dulu.\n- Untuk saved query: save_query untuk menyimpan SQL bernama, list_saved_queries\n  untuk lihat daftar, run_saved_query untuk menjalankan ulang (hanya query baca\n  yang diizinkan, sama seperti Query Studio).\n- Untuk governance: get_audit_history (riwayat audit), list_classification_rules\n  dan list_quality_rules untuk lihat aturan yang ada, get_cdc_health untuk\n  kesehatan replication slot CDC, get_maintenance_metrics untuk riwayat\n  maintenance Bronze. draft_policy/draft_classification_rule/draft_quality_rule\n  untuk MENULIS aturan/kebijakan baru — SELALU tersimpan sebagai draft/belum\n  dievaluasi, mengaktifkan tetap aksi manusia di console.\n- Untuk maintenance Bronze: run_bronze_maintenance MENERAPKAN perubahan\n  (menghapus file data/manifest Iceberg yatim) — ini BUKAN dry run, dan BUTUH\n  PERSETUJUAN MANUSIA dulu sebelum benar-benar jalan.\n- Untuk workload ClickHouse: list_workloads untuk lihat query yang sedang\n  berjalan, kill_query untuk menghentikan paksa satu query (BUTUH PERSETUJUAN\n  MANUSIA dulu — ini KILL QUERY sungguhan).\n- Untuk Gold export: export_gold_mart untuk mengekspor satu mart ke Iceberg\n  (APPEND-ONLY — menjalankan ulang menambah baris, bukan menggantikan),\n  get_gold_export untuk membaca balik jumlah baris & format version-nya.\n- Tindakan yang butuh persetujuan manusia (delete_alert_rule, delete_connector,\n  pause_pipeline, cancel_pipeline_run, delete_chart, run_bronze_maintenance,\n  kill_query) TIDAK langsung jalan — beri tahu user bahwa permintaan sudah\n  masuk antrean persetujuan di /agents/approvals.";
+const SYSTEM_BUILD_SUFFIX: &str = "\n\nMODE: BUILD. Selain menjawab, kamu bisa MENGOPERASIKAN lakehouse:\n- Untuk \"bangun/segarkan Bronze/Silver/Gold\" atau \"refresh data\":\n  JELASKAN dulu rencananya singkat, lalu panggil trigger_lakehouse_build.\n- Setelah trigger, beri tahu user pipeline berjalan (statusnya tampil live).\n- Untuk \"bikin/tambah chart/dashboard soal X\" (BI lewat chat):\n  panggil describe_mart dulu, lalu create_chart dengan kolom yang benar-benar ada.\n- Untuk \"buatkan/sarankan dashboard soal X\" tanpa detail: panggil suggest_dashboard.\n- Untuk mengelompokkan: create_board dulu, lalu create_chart dengan board=<id>.\n- Untuk mengubah kartu: update_chart (kirim semua field dengan nilai baru).\n- Untuk alert/digest: list_alert_rules untuk lihat yang ada, create_alert_rule/\n  update_alert_rule untuk membuat/mengubah (tentukan mart, measure, agg, op,\n  threshold untuk alert; board untuk digest), run_alert_rule untuk menjalankan\n  satu rule sekarang (webhook/email BENERAN terkirim). delete_alert_rule\n  BUTUH PERSETUJUAN MANUSIA dulu sebelum benar-benar terhapus.\n- Untuk connector: list_connectors untuk lihat yang ada, create_connector untuk\n  mendaftarkan baru (secretRef WAJIB berupa referensi seperti \"env:NAMA\" atau\n  \"vault://...\", JANGAN PERNAH kredensial asli), test_connector untuk menguji\n  koneksi nyata. delete_connector BUTUH PERSETUJUAN MANUSIA dulu.\n- Untuk pipeline individual (bukan build utama): list_pipelines/\n  list_pipeline_runs untuk lihat status, trigger_pipeline/retry_pipeline_run\n  untuk menjalankan, resume_pipeline untuk mengaktifkan jadwal lagi.\n  pause_pipeline dan cancel_pipeline_run BUTUH PERSETUJUAN MANUSIA dulu.\n- Untuk saved query: save_query untuk menyimpan SQL bernama, list_saved_queries\n  untuk lihat daftar, run_saved_query untuk menjalankan ulang (hanya query baca\n  yang diizinkan, sama seperti Query Studio).\n- Untuk governance: get_audit_history (riwayat audit), list_classification_rules\n  dan list_quality_rules untuk lihat aturan yang ada, get_cdc_health untuk\n  kesehatan replication slot CDC, get_maintenance_metrics untuk riwayat\n  maintenance Bronze. draft_policy/draft_classification_rule/draft_quality_rule\n  untuk MENULIS aturan/kebijakan baru — SELALU tersimpan sebagai draft/belum\n  dievaluasi, mengaktifkan tetap aksi manusia di console.\n- Untuk maintenance Bronze: run_bronze_maintenance MENERAPKAN perubahan\n  (menghapus file data/manifest Iceberg yatim) — ini BUKAN dry run, dan BUTUH\n  PERSETUJUAN MANUSIA dulu sebelum benar-benar jalan.\n- Untuk workload ClickHouse: list_workloads untuk lihat query yang sedang\n  berjalan, kill_query untuk menghentikan paksa satu query (BUTUH PERSETUJUAN\n  MANUSIA dulu — ini KILL QUERY sungguhan).\n- Untuk Gold export: export_gold_mart untuk mengekspor satu mart ke Iceberg\n  (APPEND-ONLY — menjalankan ulang menambah baris, bukan menggantikan),\n  get_gold_export untuk membaca balik jumlah baris & format version-nya.\n- Tindakan yang butuh persetujuan manusia (delete_alert_rule, delete_connector,\n  pause_pipeline, cancel_pipeline_run, delete_chart, run_bronze_maintenance,\n  kill_query) TIDAK langsung jalan — beri tahu user bahwa permintaan sudah\n  masuk antrean persetujuan di /agents/approvals.\n- Kalau hasil tool berisi needs_confirmation: jawab SATU kalimat singkat saja,\n  mis. \"The chart draft is ready — review the preview below and confirm.\"\n  JANGAN mengulang konfigurasi/argumen (tipe chart, mart, kolom, judul, span,\n  limit) dan jangan minta user mengetik konfirmasi: UI sudah menampilkan\n  pratinjau lengkap beserta tombol konfirmasinya.";
 
 const MAX_ITER: u32 = 8;
 
@@ -119,6 +119,10 @@ struct ChatBody {
     context: Option<String>,
     #[serde(default)]
     messages: Vec<IncomingMessage>,
+    /// Answer as an NDJSON progress stream instead of one JSON body; see
+    /// [`stream_chat`].
+    #[serde(default)]
+    stream: bool,
 }
 
 /// `POST /api/ai/chat` — the agentic tool-calling loop: the LLM decides
@@ -151,28 +155,48 @@ struct ChatBody {
 /// rest of the API treats a policy layer bug or a middleware gap: never
 /// silently grant, always require the narrower of "no principal" and "no
 /// permissions".
-#[allow(
-    clippy::too_many_lines,
-    reason = "one straight-line port of a single TS handler's iterative \
-              tool-calling loop; splitting it up would scatter one \
-              sequential loop across helpers with no independent reuse"
-)]
 pub async fn chat(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> Response {
-    let perms = principal.as_ref().map(|Extension(p)| &p.permissions);
-    let parsed: ChatBody = match serde_json::from_slice(&body) {
-        Ok(p) => p,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                ApiJson(json!({ "error": "Body harus JSON {messages}" })),
-            )
-                .into_response();
-        }
+    let Ok(parsed) = serde_json::from_slice::<ChatBody>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            ApiJson(json!({ "error": "Body harus JSON {messages}" })),
+        )
+            .into_response();
     };
+    let principal = principal.map(|Extension(p)| p);
+    let stream = parsed.stream;
+    let run = match prepare_chat(&state, principal.as_ref(), parsed).await {
+        Ok(run) => run,
+        Err(response) => return response,
+    };
+    if stream {
+        return stream_chat(state, principal, run);
+    }
+    match run_chat(&state, principal.as_ref(), run, None).await {
+        Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+        Err(err) => llm_unavailable(&err),
+    }
+}
+
+/// What [`run_chat`] needs: the full prompt and the tools the model may call.
+struct PreparedChat {
+    messages: Vec<LlmMessage>,
+    tools: Vec<Value>,
+    is_build: bool,
+}
+
+/// Validates the body and assembles the system prompt, history and the tool
+/// list for this principal and mode. A bad body is a ready 400 response.
+async fn prepare_chat(
+    state: &AppState,
+    principal: Option<&Principal>,
+    parsed: ChatBody,
+) -> Result<PreparedChat, Response> {
+    let perms = principal.map(|p| &p.permissions);
     let history: Vec<LlmMessage> = parsed
         .messages
         .iter()
@@ -190,11 +214,11 @@ pub async fn chat(
         })
         .collect();
     if history.is_empty() {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
             ApiJson(json!({ "error": "messages kosong" })),
         )
-            .into_response();
+            .into_response());
     }
 
     let is_build = parsed.mode.as_deref() == Some("build");
@@ -253,20 +277,63 @@ pub async fn chat(
         name: None,
     }];
     messages.extend(history);
+    Ok(PreparedChat {
+        messages,
+        tools,
+        is_build,
+    })
+}
 
+/// Progress events for `stream: true`. `None` for a plain JSON request.
+type Progress<'a> = Option<&'a tokio::sync::mpsc::UnboundedSender<Value>>;
+
+/// Sends one progress event; `false` once the client has gone (Stop, or a
+/// closed tab), so the loop can end instead of running more rounds for
+/// nobody.
+fn report(progress: Progress<'_>, event: Value) -> bool {
+    progress.is_none_or(|tx| tx.send(event).is_ok())
+}
+
+/// The agentic loop: ask the model, run the tools it calls (through
+/// [`gate::decide_by_name`]), feed the results back, until it answers
+/// without a tool call or [`MAX_ITER`] rounds pass. Returns the response
+/// body `{ answer, toolTrace, buildRunId?, chartCreated, note? }`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one straight-line port of a single TS handler's iterative \
+              tool-calling loop; splitting it up would scatter one \
+              sequential loop across helpers with no independent reuse"
+)]
+async fn run_chat(
+    state: &AppState,
+    principal: Option<&Principal>,
+    run: PreparedChat,
+    progress: Progress<'_>,
+) -> Result<Value, lakehouse_llm::LlmError> {
+    let perms = principal.map(|p| &p.permissions);
+    let PreparedChat {
+        mut messages,
+        tools,
+        is_build,
+    } = run;
     let mut tool_trace: Vec<Value> = Vec::new();
     let mut build_run_id: Option<String> = None;
     let mut chart_created = false;
 
     for _ in 0..MAX_ITER {
-        let msg = match state
+        if !report(progress, json!({ "type": "status", "phase": "thinking" })) {
+            return Ok(chat_response_body(
+                "",
+                &tool_trace,
+                build_run_id.as_deref(),
+                chart_created,
+                Some("stopped"),
+            ));
+        }
+        let msg = state
             .llm
             .chat_with_tools(&messages, &tools, ChatOptions::default())
-            .await
-        {
-            Ok(m) => m,
-            Err(err) => return llm_unavailable(&err),
-        };
+            .await?;
         messages.push(msg.clone());
 
         let mut calls: Vec<ToolCall> = msg.tool_calls.clone().unwrap_or_default();
@@ -277,23 +344,33 @@ pub async fn chat(
             let answer = strip_tool_xml(msg.content.as_deref().unwrap_or(""));
             // WS7 item F2: every number/table the model just printed is
             // checked against `tool_trace` — the actual record of what ran
-            // this turn — before it ever reaches the caller.
+            // this turn — before it ever reaches the caller. Applies the
+            // same way whether this turn's answer streams (`stream_chat`)
+            // or not: both paths return through this one `run_chat` body.
             let annotated = citations::annotate_answer(&answer, &tool_trace);
-            return (
-                StatusCode::OK,
-                ApiJson(chat_response_body(
-                    &annotated,
-                    &tool_trace,
-                    build_run_id.as_deref(),
-                    chart_created,
-                    None,
-                )),
-            )
-                .into_response();
+            return Ok(chat_response_body(
+                &annotated,
+                &tool_trace,
+                build_run_id.as_deref(),
+                chart_created,
+                None,
+            ));
         }
 
         let mut xml_feedback: Vec<String> = Vec::new();
         for call in &calls {
+            if !report(
+                progress,
+                json!({ "type": "tool", "tool": call.function.name }),
+            ) {
+                return Ok(chat_response_body(
+                    "",
+                    &tool_trace,
+                    build_run_id.as_deref(),
+                    chart_created,
+                    Some("stopped"),
+                ));
+            }
             let args: Map<String, Value> =
                 serde_json::from_str(&call.function.arguments).unwrap_or_default();
             // D3: `ask` mode filters non-Read tools, and permission
@@ -319,10 +396,8 @@ pub async fn chat(
                     let (_, resource_id) =
                         audit::resource_for(&call.function.name, &args, &json!({}));
                     let redacted = audit::redact(&Value::Object(args.clone()));
-                    let actor = principal.as_ref().map_or_else(
-                        || "unknown".to_owned(),
-                        |Extension(p)| p.display_name.clone(),
-                    );
+                    let actor =
+                        principal.map_or_else(|| "unknown".to_owned(), |p| p.display_name.clone());
                     let approval_result = gate::create_write_high_approval(
                         state.pg.as_deref(),
                         &actor,
@@ -356,13 +431,8 @@ pub async fn chat(
                 }
             } else {
                 let clean_args = gate::strip_confirmed(&args);
-                let result = tools::run_tool(
-                    &state,
-                    principal.as_ref().map(|Extension(p)| p),
-                    &call.function.name,
-                    &clean_args,
-                )
-                .await;
+                let result =
+                    tools::run_tool(state, principal, &call.function.name, &clean_args).await;
                 let ok = !matches!(&result, Value::Object(m) if m.contains_key("error"));
                 (result, if ok { "executed" } else { "failed" }, None, None)
             };
@@ -370,7 +440,7 @@ pub async fn chat(
                 audit::resource_for(&call.function.name, &args, &result);
             audit::record(
                 state.pg.as_deref(),
-                principal.as_ref().map(|Extension(p)| p),
+                principal,
                 None,
                 &call.function.name,
                 resource_kind,
@@ -426,6 +496,7 @@ pub async fn chat(
     }
 
     // Iteration budget exhausted — ask once more for a final answer, tool-free.
+    report(progress, json!({ "type": "status", "phase": "thinking" }));
     messages.push(LlmMessage {
         role: LlmMessageRole::User,
         content: Some("Beri jawaban final ringkas dari hasil di atas.".to_owned()),
@@ -433,32 +504,68 @@ pub async fn chat(
         tool_call_id: None,
         name: None,
     });
-    match state
+    let final_msg = state
         .llm
         .chat_with_tools(&messages, &[], ChatOptions::default())
-        .await
-    {
-        Ok(final_msg) => {
-            // WS7 item F2: the iteration-budget-exhausted final answer is
-            // checked the same way as the normal return path — a model
-            // that runs out of tool-calling turns is not exempt from
-            // citation checking.
-            let annotated =
-                citations::annotate_answer(&final_msg.content.unwrap_or_default(), &tool_trace);
-            (
-                StatusCode::OK,
-                ApiJson(chat_response_body(
-                    &annotated,
-                    &tool_trace,
-                    build_run_id.as_deref(),
-                    chart_created,
-                    Some("batas iterasi tool tercapai"),
-                )),
-            )
-                .into_response()
+        .await?;
+    // WS7 item F2: the iteration-budget-exhausted final answer is checked
+    // the same way as the normal return path — a model that runs out of
+    // tool-calling turns is not exempt from citation checking.
+    let annotated = citations::annotate_answer(&final_msg.content.unwrap_or_default(), &tool_trace);
+    Ok(chat_response_body(
+        &annotated,
+        &tool_trace,
+        build_run_id.as_deref(),
+        chart_created,
+        Some("batas iterasi tool tercapai"),
+    ))
+}
+
+/// `stream: true`: the same loop, answered as NDJSON — one JSON object per
+/// line. `{"type":"status","phase":"thinking"}` before each model round and
+/// `{"type":"tool","tool":…}` before each tool call let the client say what
+/// is happening; the last line is `{"type":"done","body":…}` (the plain
+/// response body) or `{"type":"error","status":…,"body":…}`. When the
+/// client disconnects, the loop stops before its next round or tool.
+fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat) -> Response {
+    use tokio::io::AsyncWriteExt as _;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let (mut writer, reader) = tokio::io::duplex(16 * 1024);
+
+    tokio::spawn(async move {
+        let last = match run_chat(&state, principal.as_ref(), run, Some(&tx)).await {
+            Ok(body) => json!({ "type": "done", "body": body }),
+            Err(err) => json!({
+                "type": "error",
+                "status": StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                "body": llm_unavailable_body(&err),
+            }),
+        };
+        let _ = tx.send(last);
+    });
+    // Dropping `rx` when a write fails (client gone) makes the loop's next
+    // `report` return false.
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            let line = format!("{event}\n");
+            if writer.write_all(line.as_bytes()).await.is_err() || writer.flush().await.is_err() {
+                break;
+            }
+            if event["type"] == "done" || event["type"] == "error" {
+                break;
+            }
         }
-        Err(err) => llm_unavailable(&err),
-    }
+    });
+
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "application/x-ndjson"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(reader)),
+    )
+        .into_response()
 }
 
 // ── POST /api/ai/tool ───────────────────────────────────────────────────
@@ -622,13 +729,17 @@ fn chat_response_body(
 fn llm_unavailable(err: &lakehouse_llm::LlmError) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
-        ApiJson(json!({
-            "error": "AI Copilot tak tersedia",
-            "detail": err.to_string(),
-            "hint": "Set LLM_KEY (MiniMax) di .env.local.",
-        })),
+        ApiJson(llm_unavailable_body(err)),
     )
         .into_response()
+}
+
+fn llm_unavailable_body(err: &lakehouse_llm::LlmError) -> Value {
+    json!({
+        "error": "AI Copilot tak tersedia",
+        "detail": err.to_string(),
+        "hint": "Set LLM_KEY (MiniMax) di .env.local.",
+    })
 }
 
 /// `MiniMax-M2` sometimes emits a tool call as XML in `content` rather than
@@ -743,21 +854,35 @@ fn strip_ci(s: &str, needle: &str) -> String {
 
 const CREATE_CHAT_SESSION_TABLE: &str = "CREATE TABLE IF NOT EXISTS console.chat_session (\
      id String, title String, mode String DEFAULT 'ask', \
-     messages_json String, updated_at DateTime DEFAULT now(), is_deleted UInt8 DEFAULT 0 \
+     messages_json String, updated_at DateTime DEFAULT now(), is_deleted UInt8 DEFAULT 0, \
+     owner_id String DEFAULT '', title_locked UInt8 DEFAULT 0 \
      ) ENGINE = ReplacingMergeTree(updated_at) ORDER BY id";
+
+/// Columns added after the table first shipped; `IF NOT EXISTS` makes them
+/// safe on both fresh and existing tables.
+const CHAT_SESSION_MIGRATIONS: [&str; 2] = [
+    "ALTER TABLE console.chat_session ADD COLUMN IF NOT EXISTS owner_id String DEFAULT ''",
+    "ALTER TABLE console.chat_session ADD COLUMN IF NOT EXISTS title_locked UInt8 DEFAULT 0",
+];
+
+/// Longest title derived from a conversation's first message.
+const TITLE_MAX_CHARS: usize = 80;
 
 static CHAT_SESSION_TABLE_ENSURED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
 /// Create the `console` database and `chat_session` table if they don't
-/// already exist (idempotent, once per process — mirroring `chat-store.ts`'s
-/// module-level `ensured` flag, and [`lakehouse_bi::store::ensure_bi_table`]'s
-/// identical pattern).
+/// already exist, and add later columns (idempotent, once per process —
+/// mirroring [`lakehouse_bi::store::ensure_bi_table`]'s pattern).
 async fn ensure_chat_session_table(ch: &ChClient) -> Result<(), lakehouse_clickhouse::ChError> {
     CHAT_SESSION_TABLE_ENSURED
         .get_or_try_init(|| async {
             ch.exec("CREATE DATABASE IF NOT EXISTS console", None)
                 .await?;
-            ch.exec(CREATE_CHAT_SESSION_TABLE, None).await
+            ch.exec(CREATE_CHAT_SESSION_TABLE, None).await?;
+            for sql in CHAT_SESSION_MIGRATIONS {
+                ch.exec(sql, None).await?;
+            }
+            Ok(())
         })
         .await
         .map(drop)
@@ -768,29 +893,88 @@ fn esc(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "''")
 }
 
-/// Query parameters for `GET /api/ai/sessions` (`?id=`) and
-/// `DELETE /api/ai/sessions` (`?id=`).
+/// The signed-in user every session operation is scoped to.
+///
+/// Sessions hold whatever was asked and answered, so they are private to
+/// their owner: before `owner_id` existed, every user listed, opened and
+/// deleted everyone else's. Rows written before then have an empty owner
+/// and belong to nobody — they are hidden rather than guessed at.
+fn session_owner(principal: Option<&Extension<Principal>>) -> Result<String, ApiError> {
+    principal
+        .map(|Extension(p)| p.id.uuid().to_string())
+        .ok_or_else(|| ApiError::Unauthorized("sign in required".to_owned()))
+}
+
+fn internal(err: &impl std::fmt::Display) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ApiJson(json!({ "error": err.to_string() })),
+    )
+        .into_response()
+}
+
+/// Query parameters for `GET /api/ai/sessions`: `?id=` for one session,
+/// otherwise a page of the list.
+#[derive(Debug, Default, Deserialize)]
+pub struct SessionsQuery {
+    #[serde(default)]
+    id: Option<String>,
+    /// Matched against the title and the conversation text.
+    #[serde(default)]
+    q: Option<String>,
+    /// `ask` or `build`; anything else lists both.
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    offset: Option<u32>,
+}
+
+/// Query parameters for `DELETE /api/ai/sessions?id=`.
 #[derive(Debug, Deserialize)]
 pub struct SessionIdQuery {
     #[serde(default)]
     id: Option<String>,
 }
 
-/// `GET /api/ai/sessions` (list) or `?id=` (one full session).
+/// The list filters as a `WHERE` clause — owner always, then mode and search.
+fn session_filter(owner: &str, mode: Option<&str>, q: Option<&str>) -> String {
+    let mut conditions = vec![
+        "is_deleted = 0".to_owned(),
+        format!("owner_id = '{}'", esc(owner)),
+    ];
+    if let Some(m) = mode.filter(|m| matches!(*m, "ask" | "build")) {
+        conditions.push(format!("mode = '{m}'"));
+    }
+    if let Some(q) = q.map(str::trim).filter(|q| !q.is_empty()) {
+        let q = esc(q);
+        conditions.push(format!(
+            "(positionCaseInsensitiveUTF8(title, '{q}') > 0 \
+             OR positionCaseInsensitiveUTF8(messages_json, '{q}') > 0)"
+        ));
+    }
+    conditions.join(" AND ")
+}
+
+/// `GET /api/ai/sessions` — a page of the caller's sessions, or `?id=` for
+/// one of them in full. Another user's session answers 404, not 403, so ids
+/// can't be probed.
 pub async fn sessions_get(
     State(state): State<AppState>,
-    Query(q): Query<SessionIdQuery>,
+    principal: Option<Extension<Principal>>,
+    Query(q): Query<SessionsQuery>,
 ) -> Response {
+    let owner = match session_owner(principal.as_ref()) {
+        Ok(owner) => owner,
+        Err(err) => return crate::error::ApiRejection::from(err).into_response(),
+    };
     let ch = &state.clickhouse;
     if let Err(err) = ensure_chat_session_table(ch).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ApiJson(json!({ "error": err.to_string() })),
-        )
-            .into_response();
+        return internal(&err);
     }
-    if let Some(id) = q.id.filter(|s| !s.is_empty()) {
-        return match session_detail(ch, &id).await {
+    if let Some(id) = q.id.as_deref().filter(|s| !s.is_empty()) {
+        return match session_detail(ch, &owner, id).await {
             Ok(Some(session)) => {
                 (StatusCode::OK, ApiJson(json!({ "session": session }))).into_response()
             }
@@ -799,63 +983,112 @@ pub async fn sessions_get(
                 ApiJson(json!({ "error": "sesi tidak ditemukan" })),
             )
                 .into_response(),
-            Err(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                ApiJson(json!({ "error": err.to_string() })),
-            )
-                .into_response(),
+            Err(err) => internal(&err),
         };
     }
-    match session_list(ch, 50).await {
-        Ok(sessions) => (StatusCode::OK, ApiJson(json!({ "sessions": sessions }))).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ApiJson(json!({ "error": err.to_string() })),
-        )
-            .into_response(),
+    match session_list(ch, &owner, &q).await {
+        Ok(page) => (StatusCode::OK, ApiJson(page)).into_response(),
+        Err(err) => internal(&err),
     }
 }
 
+/// One page of sessions, newest first, plus per-mode counts for the same
+/// search so a filter can show how many each choice holds.
 async fn session_list(
     ch: &ChClient,
-    limit: u32,
-) -> Result<Vec<Value>, lakehouse_clickhouse::ChError> {
-    let limit = limit.clamp(1, 200);
+    owner: &str,
+    q: &SessionsQuery,
+) -> Result<Value, lakehouse_clickhouse::ChError> {
+    let limit = q.limit.unwrap_or(30).clamp(1, 100);
+    let offset = q.offset.unwrap_or(0).min(100_000);
+    let filter = session_filter(owner, q.mode.as_deref(), q.q.as_deref());
+    // One row past the page says whether another page exists.
     let rows = ch
         .rows(
             &format!(
-                "SELECT id, title, mode, toString(updated_at) AS updated_at FROM console.chat_session FINAL \
-                 WHERE is_deleted = 0 ORDER BY updated_at DESC LIMIT {limit}"
+                "SELECT id, title, mode, toString(updated_at) AS updated_at, \
+                 positionCaseInsensitive(messages_json, '\"chartCreated\":true') > 0 AS chart_created, \
+                 substringUTF8(JSONExtractString(messages_json, -1, 'content'), 1, 240) AS preview \
+                 FROM console.chat_session FINAL WHERE {filter} \
+                 ORDER BY updated_at DESC LIMIT {} OFFSET {offset}",
+                limit + 1
             ),
             None,
         )
         .await?;
-    Ok(rows
+    let has_more = rows.len() > limit as usize;
+    let sessions: Vec<Value> = rows
         .iter()
+        .take(limit as usize)
         .map(|r| {
             json!({
                 "id": r.get("id"), "title": r.get("title"), "mode": r.get("mode"),
                 "updatedAt": r.get("updated_at"),
+                "chartCreated": r.get("chart_created").and_then(json_u64).unwrap_or(0) > 0,
+                "preview": r.get("preview"),
             })
         })
-        .collect())
-}
+        .collect();
 
-async fn session_detail(
-    ch: &ChClient,
-    id: &str,
-) -> Result<Option<Value>, lakehouse_clickhouse::ChError> {
-    let rows = ch
+    let count_filter = session_filter(owner, None, q.q.as_deref());
+    let count_rows = ch
         .rows(
             &format!(
-                "SELECT id, title, mode, messages_json, toString(updated_at) AS updated_at \
-                 FROM console.chat_session FINAL WHERE is_deleted = 0 AND id='{}' LIMIT 1",
-                esc(id)
+                "SELECT mode, count() AS n FROM console.chat_session FINAL \
+                 WHERE {count_filter} GROUP BY mode"
             ),
             None,
         )
         .await?;
-    let Some(row) = rows.first() else {
+    let mut counts = Map::new();
+    for r in &count_rows {
+        if let Some(mode) = r.get("mode").and_then(Value::as_str) {
+            counts.insert(
+                mode.to_owned(),
+                json!(r.get("n").and_then(json_u64).unwrap_or(0)),
+            );
+        }
+    }
+    Ok(json!({
+        "sessions": sessions,
+        "hasMore": has_more,
+        "nextOffset": has_more.then(|| offset + limit),
+        "counts": counts,
+    }))
+}
+
+/// `ClickHouse` returns `UInt64` as a JSON string and smaller ints as numbers.
+fn json_u64(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+async fn session_row(
+    ch: &ChClient,
+    owner: &str,
+    id: &str,
+) -> Result<Option<Map<String, Value>>, lakehouse_clickhouse::ChError> {
+    let rows = ch
+        .rows(
+            &format!(
+                "SELECT id, title, mode, messages_json, title_locked, toString(updated_at) AS updated_at \
+                 FROM console.chat_session FINAL \
+                 WHERE is_deleted = 0 AND id = '{}' AND owner_id = '{}' LIMIT 1",
+                esc(id),
+                esc(owner)
+            ),
+            None,
+        )
+        .await?;
+    Ok(rows.into_iter().next())
+}
+
+async fn session_detail(
+    ch: &ChClient,
+    owner: &str,
+    id: &str,
+) -> Result<Option<Value>, lakehouse_clickhouse::ChError> {
+    let Some(row) = session_row(ch, owner, id).await? else {
         return Ok(None);
     };
     let messages_json = row
@@ -880,16 +1113,71 @@ struct SaveSessionBody {
     messages: Option<Vec<Value>>,
 }
 
-/// `POST /api/ai/sessions` — save/replace a session (id optional → new).
+/// A title from the first user message: whitespace collapsed, cut at
+/// [`TITLE_MAX_CHARS`] with an ellipsis so a cut title reads as one.
+fn derive_title(messages: &[Value]) -> String {
+    let raw = messages
+        .iter()
+        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let collapsed = collapse_whitespace(raw);
+    if collapsed.is_empty() {
+        return "Percakapan".to_owned();
+    }
+    if collapsed.chars().count() <= TITLE_MAX_CHARS {
+        return collapsed;
+    }
+    let cut: String = collapsed.chars().take(TITLE_MAX_CHARS - 1).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// Insert one full version of a session row (`ReplacingMergeTree` keeps the
+/// newest by `updated_at`).
+async fn write_session(
+    ch: &ChClient,
+    row: &SessionWrite<'_>,
+) -> Result<(), lakehouse_clickhouse::ChError> {
+    let sql = format!(
+        "INSERT INTO console.chat_session \
+         (id, title, mode, messages_json, owner_id, title_locked, is_deleted) \
+         VALUES ('{}', '{}', '{}', '{}', '{}', {}, {})",
+        esc(row.id),
+        esc(row.title),
+        esc(row.mode),
+        esc(row.messages_json),
+        esc(row.owner),
+        u8::from(row.title_locked),
+        u8::from(row.deleted),
+    );
+    ch.exec(&sql, None).await
+}
+
+struct SessionWrite<'a> {
+    id: &'a str,
+    owner: &'a str,
+    title: &'a str,
+    title_locked: bool,
+    mode: &'a str,
+    messages_json: &'a str,
+    deleted: bool,
+}
+
+/// `POST /api/ai/sessions` — save/replace one of the caller's sessions (id
+/// optional → new). A renamed session keeps its title.
 ///
 /// # Errors
 ///
-/// 400 [`ApiError::BadRequest`] when `messages` is missing/empty; 500
-/// [`ApiError::Internal`] on a `ClickHouse` failure.
+/// 400 when `messages` is missing/empty; 401 without a signed-in user; 404
+/// when `id` names a session the caller doesn't own; 500 on a `ClickHouse`
+/// failure.
 pub async fn sessions_save(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
+    let owner = session_owner(principal.as_ref())?;
     let parsed: SaveSessionBody = serde_json::from_slice(&body).unwrap_or_default();
     let Some(messages) = parsed.messages.filter(|m| !m.is_empty()) else {
         return Err(ApiError::BadRequest("messages kosong".to_owned()).into());
@@ -899,22 +1187,33 @@ pub async fn sessions_save(
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))?;
 
-    let id = parsed
+    let requested = parsed
         .id
-        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-        .unwrap_or_else(new_session_id);
-    let first_user = messages
-        .iter()
-        .find(|m| m.get("role").and_then(Value::as_str) == Some("user"));
-    let title_raw = first_user
-        .and_then(|m| m.get("content"))
-        .and_then(Value::as_str)
-        .unwrap_or("Percakapan");
-    let title = collapse_whitespace(&title_raw.chars().take(80).collect::<String>());
-    let title = if title.is_empty() {
-        "Percakapan".to_owned()
+        .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    let existing = match &requested {
+        Some(id) => {
+            let row = session_row(ch, &owner, id)
+                .await
+                .map_err(|err| ApiError::Internal(err.to_string()))?;
+            // Never overwrite someone else's session under its id.
+            Some(row.ok_or_else(|| ApiError::NotFound("sesi tidak ditemukan".to_owned()))?)
+        }
+        None => None,
+    };
+    let id = requested.unwrap_or_else(new_session_id);
+    let locked = existing
+        .as_ref()
+        .and_then(|r| r.get("title_locked"))
+        .and_then(json_u64)
+        .is_some_and(|v| v > 0);
+    let title = if locked {
+        existing
+            .as_ref()
+            .and_then(|r| r.get("title"))
+            .and_then(Value::as_str)
+            .map_or_else(|| derive_title(&messages), ToOwned::to_owned)
     } else {
-        title
+        derive_title(&messages)
     };
 
     let mut json_body = serde_json::to_string(&messages).unwrap_or_else(|_| "[]".to_owned());
@@ -932,16 +1231,84 @@ pub async fn sessions_save(
     }
 
     let mode = parsed.mode.unwrap_or_else(|| "ask".to_owned());
-    let sql = format!(
-        "INSERT INTO console.chat_session (id, title, mode, messages_json) VALUES ('{}', '{}', '{}', '{}')",
-        esc(&id),
-        esc(&title),
-        esc(&mode),
-        esc(&json_body),
-    );
-    ch.exec(&sql, None)
+    write_session(
+        ch,
+        &SessionWrite {
+            id: &id,
+            owner: &owner,
+            title: &title,
+            title_locked: locked,
+            mode: &mode,
+            messages_json: &json_body,
+            deleted: false,
+        },
+    )
+    .await
+    .map_err(|err| ApiError::Internal(err.to_string()))?;
+    Ok(ApiJson(json!({ "ok": true, "id": id, "title": title })))
+}
+
+/// `PATCH /api/ai/sessions` request body.
+#[derive(Debug, Default, Deserialize)]
+struct RenameSessionBody {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+/// `PATCH /api/ai/sessions` — rename one of the caller's sessions. The new
+/// title is locked, so later saves no longer re-derive it.
+///
+/// # Errors
+///
+/// 400 when `id` or `title` is missing; 401 without a signed-in user; 404
+/// when the caller doesn't own the session; 500 on a `ClickHouse` failure.
+pub async fn sessions_rename(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    let owner = session_owner(principal.as_ref())?;
+    let parsed: RenameSessionBody = serde_json::from_slice(&body).unwrap_or_default();
+    let id = parsed
+        .id
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("id wajib".to_owned()))?;
+    let title = parsed
+        .title
+        .map(|t| collapse_whitespace(&t))
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| ApiError::BadRequest("judul wajib".to_owned()))?;
+    let title: String = title.chars().take(120).collect();
+    let ch = &state.clickhouse;
+    ensure_chat_session_table(ch)
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))?;
+    let row = session_row(ch, &owner, &id)
+        .await
+        .map_err(|err| ApiError::Internal(err.to_string()))?
+        .ok_or_else(|| ApiError::NotFound("sesi tidak ditemukan".to_owned()))?;
+    let field = |k: &str| {
+        row.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    write_session(
+        ch,
+        &SessionWrite {
+            id: &id,
+            owner: &owner,
+            title: &title,
+            title_locked: true,
+            mode: &field("mode"),
+            messages_json: &field("messages_json"),
+            deleted: false,
+        },
+    )
+    .await
+    .map_err(|err| ApiError::Internal(err.to_string()))?;
     Ok(ApiJson(json!({ "ok": true, "id": id, "title": title })))
 }
 
@@ -959,21 +1326,23 @@ fn new_session_id() -> String {
     format!("c_{hex}")
 }
 
-/// `s.slice(0,80).replace(/\s+/g, " ").trim()`.
+/// `s.replace(/\s+/g, " ").trim()`.
 fn collapse_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// `DELETE /api/ai/sessions?id=` — soft-delete a session.
+/// `DELETE /api/ai/sessions?id=` — soft-delete one of the caller's sessions.
 ///
 /// # Errors
 ///
-/// 400 [`ApiError::BadRequest`] when `id` is missing; 500
-/// [`ApiError::Internal`] on a `ClickHouse` failure.
+/// 400 when `id` is missing; 401 without a signed-in user; 404 when the
+/// caller doesn't own the session; 500 on a `ClickHouse` failure.
 pub async fn sessions_delete(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     Query(q): Query<SessionIdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    let owner = session_owner(principal.as_ref())?;
     let Some(id) = q.id.filter(|s| !s.is_empty()) else {
         return Err(ApiError::BadRequest("id wajib".to_owned()).into());
     };
@@ -981,13 +1350,27 @@ pub async fn sessions_delete(
     ensure_chat_session_table(ch)
         .await
         .map_err(|err| ApiError::Internal(err.to_string()))?;
-    let sql = format!(
-        "INSERT INTO console.chat_session (id, title, mode, messages_json, is_deleted) VALUES ('{}', '', 'ask', '[]', 1)",
-        esc(&id)
-    );
-    ch.exec(&sql, None)
+    if session_row(ch, &owner, &id)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| ApiError::Internal(err.to_string()))?
+        .is_none()
+    {
+        return Err(ApiError::NotFound("sesi tidak ditemukan".to_owned()).into());
+    }
+    write_session(
+        ch,
+        &SessionWrite {
+            id: &id,
+            owner: &owner,
+            title: "",
+            title_locked: false,
+            mode: "ask",
+            messages_json: "[]",
+            deleted: true,
+        },
+    )
+    .await
+    .map_err(|err| ApiError::Internal(err.to_string()))?;
     Ok(ApiJson(json!({ "ok": true })))
 }
 
@@ -996,6 +1379,38 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn session_filter_always_scopes_to_the_owner() {
+        let f = session_filter("u-1", None, None);
+        assert_eq!(f, "is_deleted = 0 AND owner_id = 'u-1'");
+    }
+
+    #[test]
+    fn session_filter_whitelists_mode_and_escapes_search() {
+        let f = session_filter("u-1", Some("build"), Some(" it's "));
+        assert!(f.contains("mode = 'build'"));
+        assert!(f.contains("positionCaseInsensitiveUTF8(title, 'it''s')"));
+        let f = session_filter("u-1", Some("x' OR 1=1 --"), None);
+        assert!(
+            !f.contains("mode"),
+            "unknown modes are dropped, not quoted in"
+        );
+    }
+
+    #[test]
+    fn derive_title_marks_a_cut_with_an_ellipsis() {
+        let long = "kata ".repeat(40);
+        let t = derive_title(&[json!({ "role": "user", "content": long })]);
+        assert_eq!(t.chars().count(), TITLE_MAX_CHARS);
+        assert!(t.ends_with('…'));
+        let short = derive_title(&[json!({ "role": "user", "content": "  halo   dunia " })]);
+        assert_eq!(short, "halo dunia");
+        assert_eq!(
+            derive_title(&[json!({ "role": "assistant", "content": "x" })]),
+            "Percakapan"
+        );
+    }
 
     #[test]
     fn parse_minimax_tool_calls_extracts_name_and_args() {
