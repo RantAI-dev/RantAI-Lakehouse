@@ -105,10 +105,13 @@ def step_seed_wal_alert_rule() -> None:
     (WS5 plan review Y4); `replication_metrics.py`'s own module doc names
     this exact rule shape (`mart = replication_slot_health`, `measure =
     unhealthy`). `console.alert_rule` is a `ReplacingMergeTree` keyed on
-    `id` (`lakehouse-alerts::ensure`), so re-`POST`ing the same id every
+    `id` (`lakehouse-alerts::ensure`), so re-`PUT`ing the same id every
     run is a correct, idempotent upsert, not a conditional "if missing"
-    check."""
-    resp = API.post(
+    check. `PUT`, not `POST`: `POST /api/alerts` ignores a caller's `id`
+    and mints a new `al_<hex>` every time (`lakehouse_alerts::save_rule`
+    with `id: None`), so each run added another rule under an id this gate
+    never looked for."""
+    resp = API.put(
         f"{API_URL}/api/alerts",
         json={
             "id": WAL_ALERT_RULE_ID,
@@ -181,6 +184,30 @@ def _wait_for(name: str, check, timeout_s: float, interval_s: float = 1.0):
             last_err = exc
         time.sleep(interval_s)
     raise G4Failure(f"timed out after {timeout_s}s waiting for {name}: {last_err}")
+
+
+def _dagster_job_loaded(job: str):
+    """True once a loaded Dagster repository lists `job`; None otherwise
+    (`_wait_for` keeps polling on None)."""
+    query = "{ repositoriesOrError { ... on RepositoryConnection { nodes { jobs { name } } } } }"
+    resp = requests.post(DAGSTER_URL, json={"query": query}, timeout=5)
+    resp.raise_for_status()
+    nodes = (resp.json().get("data") or {}).get("repositoriesOrError", {}).get("nodes") or []
+    return True if any(j.get("name") == job for n in nodes for j in n.get("jobs", [])) else None
+
+
+def _dagster_run_finished(run_id: str):
+    """True once the run succeeded; raises if it failed; None while it is
+    still queued or running (`_wait_for` keeps polling on None)."""
+    query = "query($id:ID!){ runOrError(runId:$id){ ... on Run { status } } }"
+    resp = requests.post(DAGSTER_URL, json={"query": query, "variables": {"id": run_id}}, timeout=5)
+    resp.raise_for_status()
+    status = ((resp.json().get("data") or {}).get("runOrError") or {}).get("status")
+    if status == "SUCCESS":
+        return True
+    if status in ("FAILURE", "CANCELED"):
+        raise G4Failure(f"replication_slot_check_job run {run_id} ended {status}")
+    return None
 
 
 def step_wait_for_services() -> None:
@@ -349,7 +376,7 @@ def step_wal_breach_produces_a_silenceable_alert_instance() -> None:
     `wal_retained_bytes` is also genuinely non-trivial, not just
     `active = false` on an idle slot.
 
-    `replication_metrics_job` reads every logical slot on the source
+    `replication_slot_check_job` reads every logical slot on the source
     (`SELECT ... FROM pg_replication_slots WHERE slot_type = 'logical'`,
     no slot-name filter), and the seeded alert rule
     (`step_seed_wal_alert_rule`) is `max(unhealthy) > 0` over ALL slots
@@ -373,24 +400,44 @@ def step_wal_breach_produces_a_silenceable_alert_instance() -> None:
     try:
         for i in range(2000):
             pg_exec(f"UPDATE p5_cdc.orders SET amount = amount + 0.01 WHERE id = {(i % 5) + 1};")
-        # replication_metrics_job writes lake.bronze_meta.replication_slot
-        # on its own 15-minute schedule (replication_metrics.py:451,
+        # The webserver answering is not the code location having loaded:
+        # compose can recreate `dagster-code-location` when this runner
+        # starts, and a launch in that window fails with
+        # PipelineNotFoundError (seen in CI). Wait until Dagster lists it.
+        _wait_for(
+            "Dagster code location (replication_slot_check_job loaded)",
+            lambda: _dagster_job_loaded("replication_slot_check_job"),
+            120,
+            2.0,
+        )
+        # replication_slot_check_job writes lake.bronze_meta.replication_slot
+        # on its own 15-minute schedule (replication_metrics.py:455,
         # cron_schedule="*/15 * * * *") — run it once, out of band, via
         # Dagster's launchRun mutation so this gate does not wait 15
         # minutes for a fresh row.
         launch = requests.post(
             DAGSTER_URL,
             json={
-                "query": "mutation($job:String!){ launchRun(executionParams:{selector:{repositoryLocationName:\"dispar_orchestrate\",repositoryName:\"__repository__\",jobName:$job}, runConfigData:\"{}\"}){ __typename ... on LaunchRunSuccess { run { id } } ... on PythonError { message } } }",
-                "variables": {"job": "replication_metrics_job"},
+                "query": "mutation($job:String!){ launchRun(executionParams:{selector:{repositoryLocationName:\"dispar_orchestrate.definitions\",repositoryName:\"__repository__\",jobName:$job}, runConfigData:\"{}\"}){ __typename ... on LaunchRunSuccess { run { id } } ... on PythonError { message } } }",
+                "variables": {"job": "replication_slot_check_job"},
             },
             timeout=30,
         )
         launch.raise_for_status()
         launched = launch.json().get("data", {}).get("launchRun", {})
         if launched.get("__typename") != "LaunchRunSuccess":
-            raise G4Failure(f"failed to launch replication_metrics_job: {launch.text}")
-        time.sleep(10)  # let the job write its row before evaluating rules
+            raise G4Failure(f"failed to launch replication_slot_check_job: {launch.text}")
+        # Wait for THIS run to finish while the breach slot still exists. A
+        # fixed sleep let the run start after this step had already
+        # evaluated and dropped the slot (seen: the run recorded only the
+        # healthy CDC slot).
+        run_id = launched["run"]["id"]
+        _wait_for(
+            f"replication_slot_check_job run {run_id} finished",
+            lambda: _dagster_run_finished(run_id),
+            180,
+            2.0,
+        )
 
         run_resp = API.post(
             f"{API_URL}/api/alerts/run",

@@ -450,7 +450,7 @@ jobs:
   # this job ALSO now needs the Dagster webserver/daemon and
   # lakehouse-api -- g4_test.py's step_wal_breach_produces_a_
   # silenceable_alert_instance (WS5 acceptance) logs into lakehouse-api,
-  # launches replication_metrics_job through the Dagster webserver's
+  # launches replication_slot_check_job through the Dagster webserver's
   # GraphQL `launchRun` (the daemon's run queue actually executes it),
   # and drives /api/alerts/run + /api/overview/alerts. Brought up with
   # the same lakehouse-api/dagster-code-location/dagster-webserver/
@@ -479,6 +479,18 @@ jobs:
           # so the gate needs a shared token here -- an obviously-fake
           # CI value, same style as AUTH_BOOTSTRAP_PASSWORD above.
           ALERTS_RUN_TOKEN=ci-alerts-run-token-not-real-123
+          # The OIDC authorization-code round trip (g4_test.py's last
+          # step) needs lakehouse-api pointed at oidc-mock; unset, the
+          # /api/auth/oidc/* routes answer 503 "not configured". The
+          # client id is oidc-mock's configured token audience.
+          OIDC_ISSUER=http://oidc-mock:8090
+          OIDC_CLIENT_ID=lakekeeper
+          OIDC_JWKS_URL=http://oidc-mock:8090/jwks.json
+          OIDC_AUTHORIZE_URL=http://oidc-mock:8090/authorize
+          OIDC_TOKEN_URL=http://oidc-mock:8090/token
+          OIDC_REDIRECT_URI=http://lakehouse-api:8080/api/auth/oidc/callback
+          OIDC_JIT_PROVISIONING=true
+          OIDC_ROLE_MAP=lakehouse-analysts=Analyst
           EOF
 
       - name: Bring up Postgres/ClickHouse/RustFS/Lakekeeper, the demo CDC source, Debezium Server, and Dagster

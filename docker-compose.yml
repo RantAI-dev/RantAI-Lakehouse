@@ -1023,13 +1023,26 @@ services:
         grant() {
           user="$$1"; shift
           writes="$$(printf '{"type":"%s","user":"oidc~'"$$user"'"},' "$$@" | sed 's/,$$//')"
-          code=$$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$$admin_auth" \
-            -H 'Content-Type: application/json' \
-            -d '{"writes":['"$$writes"']}' \
-            "$$base/management/v1/permissions/warehouse/$$wh_id/assignments")
           # 204 granted, 409 an identical tuple already exists (re-running
-          # this job against an already-granted stack) — both fine.
-          case "$$code" in 204|409) ;; *) echo "grant $$user failed: HTTP $$code" >&2; exit 1 ;; esac
+          # this job against an already-granted stack) — both fine. Retry
+          # 5xx and connection errors only (Lakekeeper answers 503 while
+          # its authorizer is still coming up, seen as a one-off "grant
+          # debezium failed: HTTP 503" that stopped the whole stack); any
+          # other status fails at once, as before.
+          attempt=0
+          while :; do
+            code=$$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$$admin_auth" \
+              -H 'Content-Type: application/json' \
+              -d '{"writes":['"$$writes"']}' \
+              "$$base/management/v1/permissions/warehouse/$$wh_id/assignments")
+            case "$$code" in
+              204|409) break ;;
+              000|5??) attempt=$$((attempt + 1))
+                if [ "$$attempt" -ge 30 ]; then echo "grant $$user failed: HTTP $$code after $$attempt tries" >&2; exit 1; fi
+                sleep 2 ;;
+              *) echo "grant $$user failed: HTTP $$code" >&2; exit 1 ;;
+            esac
+          done
         }
         grant rust-iceberg create modify select
         grant debezium create modify select
@@ -1474,11 +1487,24 @@ services:
         grant() {
           user="$$1"; shift
           writes="$$(printf '{"type":"%s","user":"oidc~'"$$user"'"},' "$$@" | sed 's/,$$//')"
-          code=$$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$$admin_auth" \
-            -H 'Content-Type: application/json' \
-            -d '{"writes":['"$$writes"']}' \
-            "$$base/management/v1/permissions/warehouse/$$wh_id/assignments")
-          case "$$code" in 204|409) ;; *) echo "grant $$user failed: HTTP $$code" >&2; exit 1 ;; esac
+          # Retry 5xx and connection errors only (Lakekeeper answers 503
+          # while its authorizer is still coming up, seen as a one-off
+          # "grant debezium failed: HTTP 503" that stopped the whole
+          # stack); any other status fails at once, as before.
+          attempt=0
+          while :; do
+            code=$$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$$admin_auth" \
+              -H 'Content-Type: application/json' \
+              -d '{"writes":['"$$writes"']}' \
+              "$$base/management/v1/permissions/warehouse/$$wh_id/assignments")
+            case "$$code" in
+              204|409) break ;;
+              000|5??) attempt=$$((attempt + 1))
+                if [ "$$attempt" -ge 30 ]; then echo "grant $$user failed: HTTP $$code after $$attempt tries" >&2; exit 1; fi
+                sleep 2 ;;
+              *) echo "grant $$user failed: HTTP $$code" >&2; exit 1 ;;
+            esac
+          done
         }
         grant rust-iceberg create modify select
         grant clickhouse-reader select modify
@@ -2312,9 +2338,15 @@ services:
   # localhost:8181" — see `docs/plans/P5-RESULT.md`'s measured trap. Put it
   # in `.env`, not a one-off prefix (same reasoning as `DAGSTER_URL`'s
   # existing warning elsewhere in this file).
+  #
+  # Re-pinned 2026-09-24: upstream overwrote the untagged image, so the
+  # digest P5 measured (`sha256:c49ebd…`) returns `manifest unknown`. This
+  # is the digest `:latest` resolved to on that date (image built
+  # 2026-09-11, revision e16f5ef). P5-RESULT.md's measurements were taken
+  # on the old image; G4 is what re-proves them on this one.
   debezium-server:
     profiles: ["dagster"]
-    image: ghcr.io/memiiso/debezium-server-iceberg@sha256:c49ebdaae01762a5509804926710d6a831e45d56f70ce98cf69bac57cc6a6bf9
+    image: ghcr.io/memiiso/debezium-server-iceberg@sha256:5281e2bdd43b1906bf4502325411d49d66ecf75d992f3d07745ff378cc92cfe4
     depends_on:
       g4-source-init:
         condition: service_completed_successfully
