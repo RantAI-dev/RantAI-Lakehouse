@@ -2830,8 +2830,6 @@ services:
         condition: service_healthy
       kafka-g6:
         condition: service_healthy
-      kafka-g6-spoofed:
-        condition: service_healthy
     environment:
       LAKEHOUSE_API_URL: http://lakehouse-api:8080
       DAGSTER_URL: http://dagster-webserver:3000/graphql
