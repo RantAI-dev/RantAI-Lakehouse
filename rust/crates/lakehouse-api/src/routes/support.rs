@@ -34,6 +34,39 @@ pub(crate) fn num_or_zero(row: Option<&Map<String, Value>>, key: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// A `ClickHouse` `Nullable(UInt64)` column, read as `Option<u64>` and
+/// NEVER defaulted to `0` — the counterpart to `support::num_or_zero` for a
+/// column where "absent" and "zero" are two different, both-real facts
+/// (WS3 plan review Z9; see [`IngestRunRow::rows`]'s doc comment).
+///
+/// `ClickHouse`'s `FORMAT JSON` renders `UInt64`/`Nullable(UInt64)` as a
+/// quoted string when the server's `output_format_json_quote_64bit_integers`
+/// is on, and as a bare JSON number when it is off (the default on the
+/// `ClickHouse` 26.8 this deployment pins) — this accepts both.
+/// Only a JSON `null` or a missing column becomes `None`; a value that
+/// fails to parse also becomes `None` rather than crashing the whole
+/// response over one bad row, matching this module's other `ClickHouse`
+/// readers' "never let one row's odd shape sink the list" posture.
+#[must_use]
+pub(crate) fn nullable_u64_col(row: &Map<String, Value>, key: &str) -> Option<u64> {
+    match row.get(key) {
+        Some(Value::Number(n)) => n.as_u64(),
+        Some(Value::String(s)) => s.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+/// The signed counterpart of [`nullable_u64_col`], for an
+/// `Int64`/`Nullable(Int64)` column (e.g. an Iceberg snapshot id): same
+/// "number or quoted string, never defaulted" contract.
+#[must_use]
+pub(crate) fn nullable_i64_col(row: &Map<String, Value>, key: &str) -> Option<i64> {
+    match row.get(key) {
+        Some(Value::Number(n)) => n.as_i64(),
+        Some(Value::String(s)) => s.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
 /// A `ClickHouse` string column, defaulting to `""` when the row or column
 /// is missing.
 #[must_use]

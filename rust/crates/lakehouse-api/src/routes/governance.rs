@@ -24,7 +24,7 @@ use serde_json::{Map, Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::routes::support::{js_error, str_col};
+use crate::routes::support::{js_error, nullable_u64_col, str_col};
 use crate::state::AppState;
 use crate::tenant::{TENANT_ID, TENANT_SITE};
 use lakehouse_dagster::{DgClient, DgError, iso_from_unix_seconds, map_run_status};
@@ -592,28 +592,6 @@ pub struct IngestRunRow {
     pub ended_at: String,
     pub status: String,
     pub error: String,
-}
-
-/// A `ClickHouse` `Nullable(UInt64)` column, read as `Option<u64>` and
-/// NEVER defaulted to `0` — the counterpart to `support::num_or_zero` for a
-/// column where "absent" and "zero" are two different, both-real facts
-/// (WS3 plan review Z9; see [`IngestRunRow::rows`]'s doc comment).
-///
-/// `ClickHouse`'s `FORMAT JSON` renders `UInt64`/`Nullable(UInt64)` as a
-/// quoted string by default (`output_format_json_quote_64bit_integers`,
-/// to avoid a JS `Number` precision loss on 64-bit values) but a bare
-/// JSON number when a server has that setting off — this accepts both.
-/// Only a JSON `null` or a missing column becomes `None`; a value that
-/// fails to parse also becomes `None` rather than crashing the whole
-/// response over one bad row, matching this module's other `ClickHouse`
-/// readers' "never let one row's odd shape sink the list" posture.
-#[must_use]
-fn nullable_u64_col(row: &Map<String, Value>, key: &str) -> Option<u64> {
-    match row.get(key) {
-        Some(Value::Number(n)) => n.as_u64(),
-        Some(Value::String(s)) => s.parse::<u64>().ok(),
-        _ => None,
-    }
 }
 
 /// Build every `bronze_meta.ingest_run` row for `connector_id`.

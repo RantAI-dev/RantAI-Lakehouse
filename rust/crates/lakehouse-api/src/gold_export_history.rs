@@ -28,6 +28,8 @@ use lakehouse_core::ident::SqlLiteral;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::routes::support::{nullable_i64_col, nullable_u64_col};
+
 /// Cached "has the table been created this process" flag, same pattern as
 /// `lakehouse_bi::store::BI_TABLE_ENSURED` (a failed attempt is not
 /// cached, so a transient `ClickHouse` outage doesn't permanently wedge
@@ -198,26 +200,16 @@ fn row_to_export_run(row: &serde_json::Map<String, Value>) -> GoldExportRunRow {
             .unwrap_or("")
             .to_owned()
     };
-    let opt_u64 = |key: &str| {
-        row.get(key)
-            .filter(|v| !v.is_null())
-            .and_then(Value::as_str)
-            .and_then(|s| s.parse::<u64>().ok())
-    };
     GoldExportRunRow {
         id: str_field("id"),
         status: str_field("status"),
-        rows_exported: opt_u64("rows_exported"),
-        format_version: row
-            .get("format_version")
-            .filter(|v| !v.is_null())
-            .and_then(Value::as_str)
-            .and_then(|s| s.parse::<u8>().ok()),
-        snapshot_id: row
-            .get("snapshot_id")
-            .filter(|v| !v.is_null())
-            .and_then(Value::as_str)
-            .and_then(|s| s.parse::<i64>().ok()),
+        rows_exported: nullable_u64_col(row, "rows_exported"),
+        // `ClickHouse` renders these integers as JSON numbers or as quoted
+        // strings depending on `output_format_json_quote_64bit_integers`
+        // (and never quotes a `UInt8`); reading only strings turned every
+        // real value into `None`.
+        format_version: nullable_u64_col(row, "format_version").and_then(|v| u8::try_from(v).ok()),
+        snapshot_id: nullable_i64_col(row, "snapshot_id"),
         error: row
             .get("error")
             .filter(|v| !v.is_null())
@@ -302,5 +294,42 @@ mod tests {
         assert!(sql.contains("ORDER BY started_at DESC"), "{sql}");
         assert!(sql.contains("LIMIT 50"), "{sql}");
         assert!(sql.contains("'sales'"), "{sql}");
+    }
+
+    /// `ClickHouse` 26.8's `FORMAT JSON` renders these integer columns as
+    /// bare JSON numbers (`output_format_json_quote_64bit_integers` is off
+    /// by default there); a server with it on sends quoted strings. Both
+    /// must round-trip, and a `NULL` must stay `None`, never `0`.
+    #[test]
+    fn row_to_export_run_reads_integers_as_numbers_or_quoted_strings() {
+        let as_numbers = serde_json::json!({
+            "id": "r1", "status": "success", "rows_exported": 7,
+            "format_version": 2, "snapshot_id": 123, "error": null,
+            "triggered_by": "t", "started_at": "s", "finished_at": "f"
+        });
+        let row = row_to_export_run(as_numbers.as_object().expect("object"));
+        assert_eq!(row.rows_exported, Some(7));
+        assert_eq!(row.format_version, Some(2));
+        assert_eq!(row.snapshot_id, Some(123));
+
+        let as_strings = serde_json::json!({
+            "id": "r2", "status": "success", "rows_exported": "7",
+            "format_version": "2", "snapshot_id": "-5", "error": null,
+            "triggered_by": "t", "started_at": "s", "finished_at": "f"
+        });
+        let row = row_to_export_run(as_strings.as_object().expect("object"));
+        assert_eq!(row.rows_exported, Some(7));
+        assert_eq!(row.format_version, Some(2));
+        assert_eq!(row.snapshot_id, Some(-5));
+
+        let as_nulls = serde_json::json!({
+            "id": "r3", "status": "failed", "rows_exported": null,
+            "format_version": null, "snapshot_id": null, "error": "e",
+            "triggered_by": "t", "started_at": "s", "finished_at": "f"
+        });
+        let row = row_to_export_run(as_nulls.as_object().expect("object"));
+        assert_eq!(row.rows_exported, None);
+        assert_eq!(row.format_version, None);
+        assert_eq!(row.snapshot_id, None);
     }
 }

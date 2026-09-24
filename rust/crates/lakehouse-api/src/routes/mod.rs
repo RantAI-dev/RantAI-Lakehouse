@@ -25,7 +25,7 @@ mod overview;
 mod pipelines;
 mod query;
 mod storage;
-mod support;
+pub(crate) mod support;
 
 use std::time::Duration;
 
