@@ -1,12 +1,14 @@
 import type {
   PipelineService,
   Pipeline,
-  PipelineRun,
   PipelineDetail,
+  PipelineList,
+  PipelineRun,
   PipelineSource,
   PipelineRunStep,
   PipelineRunLogsPage,
   CreatePipelineInput,
+  GeneratePipelineInput,
 } from "../contracts/pipelines";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
@@ -43,7 +45,19 @@ async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Pr
 
 export const dagsterPipelineService: PipelineService = {
   async listPipelines(signal) {
-    return (await getJson<{ pipelines: Pipeline[] }>("/api/pipelines", { signal })).pipelines;
+    // Unlike the other calls here, a non-ok response still carries a body
+    // worth reading: a 503 sends `{pipelines: [], error}` rather than
+    // nothing (`routes::pipelines::list`), and a refused tenant-scoped
+    // caller gets `dagsterJobs: {supported:false, reason}` on an
+    // otherwise-200 response. Both must reach the page honestly instead
+    // of throwing away the Dagster-half explanation.
+    const res = await apiFetch("/api/pipelines", { signal });
+    const body = (await res.json()) as PipelineList;
+    return {
+      pipelines: body.pipelines ?? [],
+      dagsterJobs: body.dagsterJobs,
+      error: body.error,
+    };
   },
   async listRuns(pipelineId, signal) {
     return (
@@ -53,11 +67,11 @@ export const dagsterPipelineService: PipelineService = {
   async triggerRun(id, signal) {
     return getJson<PipelineRun>(`/api/pipelines/${encodeURIComponent(id)}/trigger`, { method: "POST", signal });
   },
-  async getPipeline(id, signal) {
-    // WS4 item F1: `GET /api/pipelines/{id}` now returns the real detail
-    // (engine, op graph, config, authored definition) directly — no more
-    // reconstructing a partial detail from the list + runs endpoints, the
-    // WS1 task 1.1 placeholder this replaces.
+  // WS4 item F1: `GET /api/pipelines/{id}` now returns the real detail
+  // (engine, op graph, config, authored definition) directly — no more
+  // reconstructing a partial detail from the list + runs endpoints, the
+  // WS1 task 1.1 placeholder this replaces.
+  getPipeline(id, signal) {
     return getJson<PipelineDetail>(`/api/pipelines/${encodeURIComponent(id)}`, { signal });
   },
 
@@ -99,5 +113,8 @@ export const dagsterPipelineService: PipelineService = {
   },
   setPipelineStatus(id, status, signal) {
     return postJson<Pipeline>(`/api/pipelines/${encodeURIComponent(id)}/status`, { status }, signal);
+  },
+  generatePipeline(input: GeneratePipelineInput, signal) {
+    return postJson<Pipeline>("/api/pipelines/generate", input, signal);
   },
 };

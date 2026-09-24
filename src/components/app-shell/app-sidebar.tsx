@@ -5,25 +5,26 @@ import { createPortal } from "react-dom"
 import Image from "next/image"
 import Link from "next/link"
 import { usePathname, useRouter } from "next/navigation"
-import { CircleUserRound, Plus, MessageSquare, X, BarChart3 } from "lucide-react"
-import { useCopilot } from "@/features/copilot/use-copilot"
+import { CircleUserRound, ChevronRight } from "lucide-react"
 import { useAuth } from "@/features/auth/auth-provider"
+import { rememberTableHref } from "@/hooks/use-table-memory"
 import {
   Sidebar,
   SidebarContent,
   SidebarFooter,
   SidebarGroup,
-  SidebarGroupLabel,
   SidebarHeader,
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
+  SidebarMenuSub,
+  SidebarMenuSubItem,
   SidebarRail,
   useSidebar,
 } from "@/components/ui/sidebar"
+import { useSidebarGroups } from "@/hooks/use-sidebar-groups"
 import { cn } from "@/lib/utils"
-import { NAV_GROUPS, activeNavHref, type NavGroup, type NavItem } from "./nav-config"
-import { apiFetch } from "@/services/http"
+import { visibleNavGroups, activeNavHref, type NavGroup, type NavItem } from "./nav-config"
 
 function BrandLogo() {
   // Logo follows the theme: navy for a light sidebar, white for a dark one.
@@ -38,52 +39,53 @@ function BrandLogo() {
 type FlyoutState = { label: string; top: number; left: number } | null
 
 /**
- * Primary sidebar — a list of SECTIONs. Behavior differs by mode:
- *  · EXPANDED: clicking a section opens its first page; its sub-pages show
- *    as a BOTTOM NAV (see AppBottomNav).
- *  · COLLAPSED (icons): clicking a section icon opens a FLYOUT of sub-pages
- *    to the right (on click), since there's no room for a bottom nav.
- * A 1-item group always links directly.
+ * Primary sidebar — a list of SECTIONs, two modes:
+ *
+ *  · EXPANDED: clicking a section header OPENS/CLOSES that section in
+ *    place; its sub-pages nest below it. Several sections may be open at
+ *    once, the choice is remembered (`useSidebarGroups`), and a section
+ *    containing the active page is always open.
+ *  · COLLAPSED (icons): clicking a section icon opens a FLYOUT of
+ *    sub-pages to the right, since there is no room to show them in place.
+ *
+ * A 1-item group always links directly — nothing to open.
+ *
+ * A section whose pages are ALL still mock renders disabled with a
+ * "Soon" badge (see `comingSoon` in nav-config), not hidden.
  */
 export function AppSidebar() {
+  const router = useRouter()
   const pathname = usePathname()
   const activeHref = activeNavHref(pathname)
-  const groups = NAV_GROUPS
+  const groups = visibleNavGroups()
   const { state } = useSidebar()
   const iconMode = state === "collapsed"
   const { user } = useAuth()
   const activeGroup = groups.find((g) => g.items.some((it) => it.href === activeHref))
-  const router = useRouter()
-  const copilot = useCopilot()
-  const onCopilot = pathname.startsWith("/copilot")
-  const onDashboards = pathname.startsWith("/dashboards")
-
-  const [dashboards, setDashboards] = React.useState<{ id: string; name: string }[]>([])
-  const loadDashboards = React.useCallback(() => {
-    apiFetch("/api/dashboard/boards").then((r) => r.json()).then((j) => setDashboards(j.boards ?? [])).catch(() => {})
-  }, [])
-  React.useEffect(() => { if (onDashboards) loadDashboards() }, [onDashboards, loadDashboards])
-  React.useEffect(() => {
-    const h = () => loadDashboards()
-    window.addEventListener("dashboards:changed", h)
-    return () => window.removeEventListener("dashboards:changed", h)
-  }, [loadDashboards])
-  const newDashboard = async () => {
-    const res = await apiFetch("/api/dashboard/boards", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "New dashboard" }),
-    })
-    const j = await res.json()
-    if (j?.board?.id) { router.push(`/dashboards?board=${j.board.id}`); loadDashboards() }
-  }
-  const removeDashboard = async (id: string) => {
-    await apiFetch(`/api/dashboard/boards?id=${encodeURIComponent(id)}`, { method: "DELETE" })
-    loadDashboards(); router.push("/dashboards")
-  }
-
+  const defaultOpenLabels = React.useMemo(
+    () => groups.filter((g) => g.defaultOpen).map((g) => g.label),
+    [groups]
+  )
+  const { isOpen: isGroupOpen, toggle: toggleGroup } = useSidebarGroups({
+    activeLabel: activeGroup?.label,
+    defaultOpenLabels,
+  })
   const [flyout, setFlyout] = React.useState<FlyoutState>(null)
   const flyoutRef = React.useRef<HTMLDivElement>(null)
   const [mounted, setMounted] = React.useState(false)
   React.useEffect(() => setMounted(true), [])
+
+  const handleNavClick = React.useCallback(
+    (e: React.MouseEvent<HTMLAnchorElement>, href: string) => {
+      setFlyout(null)
+      const target = rememberTableHref(href)
+      if (target !== href) {
+        e.preventDefault()
+        router.push(target)
+      }
+    },
+    [router]
+  )
   React.useEffect(() => setFlyout(null), [pathname])
   React.useEffect(() => { if (!iconMode) setFlyout(null) }, [iconMode])
 
@@ -112,22 +114,35 @@ export function AppSidebar() {
 
   const menuBtnClass = (active: boolean) =>
     cn(
-      "h-8 rounded-md px-2.5 py-1.5 text-sm font-normal tracking-normal text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
-      active && "bg-sidebar-accent font-medium text-sidebar-primary shadow-sm ring-1 ring-sidebar-border",
+      "h-8 rounded-md px-2.5 py-1.5 text-sm tracking-normal transition-colors duration-150",
+      active
+        ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
+        : "font-normal text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
     )
 
-  const linkRow = (item: NavItem, active: boolean) => {
+  /**
+   * Satu baris halaman.
+   *
+   * `showIcon` mati di sub-menu: ikon section sudah ada di header tepat di
+   * atasnya, dan `SidebarMenuSub` menandai kedalaman dengan garis kiri —
+   * ikon per item hanya mengulang keduanya. Flyout mode ikon tetap
+   * memakainya, karena panel itu melayang lepas dari sidebar dan headernya
+   * cuma label teks kecil, jadi tanpa ikon isinya kehilangan jangkar.
+   */
+  const linkRow = (item: NavItem, active: boolean, showIcon = true) => {
     const Icon = item.icon
     return (
       <Link
         href={item.href}
-        onClick={() => setFlyout(null)}
+        onClick={(e) => handleNavClick(e, item.href)}
         className={cn(
-          "flex items-center gap-2 rounded-md px-2.5 py-1.5 text-sm text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
-          active && "bg-sidebar-accent font-medium text-sidebar-primary shadow-sm ring-1 ring-sidebar-border",
+          "flex items-center gap-2 rounded-md px-2.5 py-1.5 text-sm transition-colors duration-150",
+          active
+            ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
+            : "text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
         )}
       >
-        <Icon className="size-4 shrink-0" />
+        {showIcon ? <Icon className="size-4 shrink-0" /> : null}
         <span className="truncate">{item.title}</span>
       </Link>
     )
@@ -136,12 +151,44 @@ export function AppSidebar() {
   const renderEntry = (group: NavGroup) => {
     const single = group.items.length === 1
     const first = group.items[0]
-    const Icon = single ? first.icon : group.icon ?? first.icon
-    const label = single ? first.title : group.label
+    const Icon = group.icon ?? first.icon
+    // A group declared with one page shows that page's title, which is the
+    // more descriptive of the two ("AI Copilot" over "AI"). A group that
+    // was REDUCED to one page by the preview filter keeps its own label —
+    // otherwise "Administration" silently renames itself to "Settings"
+    // just because its other four pages are still mocks.
+    const label = single && !group.partiallyHidden ? first.title : group.label
     const active = group.items.some((it) => it.href === activeHref)
 
-    // A 1-item group, or expanded mode → a plain navigation link.
-    if (single || !iconMode) {
+    // Every page in this section is still a mock. Shown, but inert — the
+    // alternative was the whole section vanishing with no explanation.
+    if (group.comingSoon) {
+      return (
+        <SidebarMenuItem key={group.label}>
+          <div
+            title={`${group.label} — coming soon`}
+            aria-disabled
+            className={cn(
+              "flex h-8 cursor-default items-center gap-2 rounded-md px-2.5 py-1.5 text-sm text-sidebar-foreground/40",
+              iconMode && "justify-center px-0"
+            )}
+          >
+            <Icon className="size-4 shrink-0" />
+            {!iconMode ? (
+              <>
+                <span className="flex-1 truncate">{group.label}</span>
+                <span className="rounded bg-sidebar-accent px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-sidebar-foreground/50">
+                  Soon
+                </span>
+              </>
+            ) : null}
+          </div>
+        </SidebarMenuItem>
+      )
+    }
+
+    // One page, or icon mode with one page: nothing to expand.
+    if (single) {
       return (
         <SidebarMenuItem key={group.label} className="group-data-[collapsible=icon]:flex group-data-[collapsible=icon]:justify-center">
           <SidebarMenuButton
@@ -149,12 +196,56 @@ export function AppSidebar() {
             tooltip={label}
             className={menuBtnClass(active)}
             render={
-              <Link href={first.href}>
+              <Link href={first.href} onClick={(e) => handleNavClick(e, first.href)}>
                 <Icon className="size-4 shrink-0" />
                 <span className="truncate leading-5">{label}</span>
               </Link>
             }
           />
+        </SidebarMenuItem>
+      )
+    }
+
+    // Expanded mode, several pages → the header expands the section in
+    // place instead of navigating. Previously it was a link to the first
+    // page, so simply looking at what a section contained cost a page
+    // load, and only the active section could ever be seen.
+    if (!iconMode) {
+      const expanded = isGroupOpen(group.label)
+      return (
+        <SidebarMenuItem key={group.label}>
+          <SidebarMenuButton
+            isActive={active && !expanded}
+            className={menuBtnClass(active && !expanded)}
+            render={
+              <button
+                type="button"
+                aria-expanded={expanded}
+                onClick={() => toggleGroup(group.label)}
+              >
+                <Icon className="size-4 shrink-0" />
+                <span className="flex-1 truncate text-left leading-5">
+                  {label}
+                </span>
+                <ChevronRight
+                  className={cn(
+                    "size-3.5 shrink-0 text-sidebar-foreground/50 transition-transform duration-150",
+                    expanded && "rotate-90"
+                  )}
+                  aria-hidden
+                />
+              </button>
+            }
+          />
+          {expanded ? (
+            <SidebarMenuSub className="mr-0 gap-0.5 border-sidebar-border pr-0">
+              {group.items.map((item) => (
+                <SidebarMenuSubItem key={item.href}>
+                  {linkRow(item, item.href === activeHref, false)}
+                </SidebarMenuSubItem>
+              ))}
+            </SidebarMenuSub>
+          ) : null}
         </SidebarMenuItem>
       )
     }
@@ -170,9 +261,10 @@ export function AppSidebar() {
           aria-expanded={isOpen}
           onClick={(e) => openFlyout(group.label, e.currentTarget)}
           className={cn(
-            "grid size-8 place-items-center rounded-md text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
-            (active || isOpen) && "bg-sidebar-accent text-sidebar-primary",
-            active && "shadow-sm ring-1 ring-sidebar-border",
+            "grid size-8 place-items-center rounded-md transition-colors duration-150",
+            (active || isOpen)
+              ? "bg-sidebar-accent text-sidebar-accent-foreground font-medium"
+              : "text-sidebar-foreground/70 hover:bg-sidebar-accent/60 hover:text-sidebar-accent-foreground",
           )}
         >
           <Icon className="size-4" />
@@ -185,8 +277,14 @@ export function AppSidebar() {
 
   return (
     <Sidebar data-print-hide collapsible="icon" side="left" className="border-r border-sidebar-border bg-sidebar shadow-sm">
-      <SidebarHeader className="flex flex-col border-b border-sidebar-border px-3 py-2.5 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:px-2 group-data-[collapsible=icon]:py-2">
-        <div className="flex h-12 min-w-0 items-center justify-start gap-2 group-data-[collapsible=icon]:h-auto group-data-[collapsible=icon]:justify-center">
+      {/* `h-16` supaya persis setinggi navbar (`app-navbar.tsx` juga
+          `h-16`), sehingga garis bawah keduanya menyambung jadi satu
+          garis lurus di seluruh lebar layar. Sebelumnya tinggi header ini
+          dihitung dari isinya (padding + baris logo) dan jatuh di 69px —
+          5px lebih rendah dari navbar, dan patahannya terlihat tepat di
+          pertemuan sidebar dengan konten. */}
+      <SidebarHeader className="flex h-16 shrink-0 flex-col justify-center border-b border-sidebar-border px-3 py-0 group-data-[collapsible=icon]:px-2">
+        <div className="flex min-w-0 items-center justify-start gap-2 group-data-[collapsible=icon]:justify-center">
           <BrandLogo />
           <div className="grid min-w-0 flex-1 gap-0.5 leading-none group-data-[collapsible=icon]:hidden">
             <span className="text-sm font-semibold tracking-[-0.084px] text-sidebar-foreground">Rantai Lake</span>
@@ -202,91 +300,17 @@ export function AppSidebar() {
           </SidebarMenu>
         </SidebarGroup>
 
-        {/* Bottom slot — DASHBOARD LIST, chat HISTORY, or a section sub-menu. */}
-        {!iconMode && onDashboards ? (
-          <SidebarGroup className="mt-1 gap-0 border-t border-sidebar-border px-2 pb-1 pt-2">
-            <div className="flex items-center justify-between pr-1">
-              <SidebarGroupLabel className="h-6 px-2 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">Dashboards</SidebarGroupLabel>
-              <button type="button" onClick={() => void newDashboard()} aria-label="New dashboard" title="New dashboard"
-                className="grid size-6 place-items-center rounded-md text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground">
-                <Plus className="size-4" />
-              </button>
-            </div>
-            <div className="mt-0.5 flex max-h-[46vh] flex-col gap-0.5 overflow-y-auto">
-              {dashboards.map((d) => (
-                <div key={d.id} className="group/dash flex items-center gap-1.5 rounded-md px-2 py-1.5 text-sm text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground">
-                  <BarChart3 className="size-3.5 shrink-0 opacity-70" />
-                  <button onClick={() => router.push(`/dashboards?board=${d.id}`)} className="flex-1 truncate text-left" title={d.name}>{d.name}</button>
-                  {d.id !== "default" ? (
-                    <button onClick={() => void removeDashboard(d.id)} aria-label="Delete" className="shrink-0 opacity-0 hover:text-destructive group-hover/dash:opacity-100"><X className="size-3.5" /></button>
-                  ) : null}
-                </div>
-              ))}
-            </div>
-          </SidebarGroup>
-        ) : !iconMode && onCopilot ? (
-          <SidebarGroup className="mt-1 gap-0 border-t border-sidebar-border px-2 pb-1 pt-2">
-            <div className="flex items-center justify-between pr-1">
-              <SidebarGroupLabel className="h-6 px-2 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">
-                History
-              </SidebarGroupLabel>
-              <button
-                type="button"
-                onClick={() => { copilot.newChat(); router.push("/copilot") }}
-                aria-label="New chat"
-                title="New chat"
-                className="grid size-6 place-items-center rounded-md text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground"
-              >
-                <Plus className="size-4" />
-              </button>
-            </div>
-            <div className="mt-0.5 flex max-h-[46vh] flex-col gap-0.5 overflow-y-auto">
-              {copilot.sessions.length === 0 ? (
-                <p className="px-2 py-1.5 text-xs text-sidebar-foreground/50">No conversations yet.</p>
-              ) : (
-                copilot.sessions.map((s) => {
-                  const active = s.id === copilot.sessionId
-                  return (
-                    <div
-                      key={s.id}
-                      className={cn(
-                        "group/hist flex items-center gap-1.5 rounded-md px-2 py-1.5 text-sm",
-                        active ? "bg-sidebar-accent text-sidebar-primary" : "text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
-                      )}
-                    >
-                      <MessageSquare className="size-3.5 shrink-0 opacity-70" />
-                      <button
-                        onClick={() => { void copilot.loadSession(s.id); router.push("/copilot") }}
-                        className="flex-1 truncate text-left"
-                        title={s.title}
-                      >
-                        {s.title}
-                      </button>
-                      <button
-                        onClick={() => void copilot.removeSession(s.id)}
-                        aria-label="Delete"
-                        className="shrink-0 opacity-0 hover:text-destructive group-hover/hist:opacity-100"
-                      >
-                        <X className="size-3.5" />
-                      </button>
-                    </div>
-                  )
-                })
-              )}
-            </div>
-          </SidebarGroup>
-        ) : !iconMode && activeGroup && activeGroup.items.length > 1 ? (
-          <SidebarGroup className="mt-1 gap-0 border-t border-sidebar-border px-2 pb-1 pt-2">
-            <SidebarGroupLabel className="h-6 px-2 text-[11px] font-medium uppercase tracking-wide text-sidebar-foreground/60">
-              {activeGroup.label}
-            </SidebarGroupLabel>
-            <div className="mt-0.5 flex flex-col gap-0.5">
-              {activeGroup.items.map((it) => (
-                <React.Fragment key={it.href}>{linkRow(it, it.href === activeHref)}</React.Fragment>
-              ))}
-            </div>
-          </SidebarGroup>
-        ) : null}
+        {/* A dashboard list and Copilot history used to live here. Both
+            only ever appeared once you were already on their page, so
+            they could never be used to NAVIGATE there — that was page
+            content occupying navigation space, and it vanished the moment
+            the sidebar collapsed to icons. Both now live in their own
+            page's header instead (`BoardSwitcher`, `CopilotHistoryMenu`),
+            and the sidebar purely reads `nav-config` with no per-route
+            exception. */}
+        {/* The active section's pages used to be repeated down here, in a
+            separate block. They now sit inside their own group above, so
+            the section that is open is the one you are reading. */}
       </SidebarContent>
 
       {/* Flyout (icon mode only) */}

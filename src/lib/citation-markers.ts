@@ -31,6 +31,7 @@ export type InlineToken =
   | { kind: "bold"; content: string }
   | { kind: "code"; content: string }
   | { kind: "italic"; content: string }
+  | { kind: "link"; content: string; href: string }
   | { kind: "unverified"; content: string }
   | { kind: "omitted-table" };
 
@@ -51,7 +52,7 @@ export const UNVERIFIED_NUMBER_LABEL = "Could not be matched to any tool result"
 export function tokenizeInline(text: string): InlineToken[] {
   const tokens: InlineToken[] = [];
   const re =
-    /(\*\*[^*]+\*\*|`[^`]+`|\*[^*]+\*|<span data-unverified="true">[^<]+<\/span>|\[table omitted: not backed by a tool result\])/g;
+    /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\(https?:\/\/[^)\s]+\)|\*[^*\s][^*]*\*|<span data-unverified="true">[^<]+<\/span>|\[table omitted: not backed by a tool result\])/g;
   let last = 0;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text))) {
@@ -66,6 +67,9 @@ export function tokenizeInline(text: string): InlineToken[] {
       tokens.push({ kind: "unverified", content: inner });
     } else if (tok.startsWith("[table omitted")) {
       tokens.push({ kind: "omitted-table" });
+    } else if (tok.startsWith("[")) {
+      const link = /^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/.exec(tok);
+      tokens.push({ kind: "link", content: link?.[1] ?? tok, href: link?.[2] ?? "" });
     } else {
       tokens.push({ kind: "italic", content: tok.slice(1, -1) });
     }

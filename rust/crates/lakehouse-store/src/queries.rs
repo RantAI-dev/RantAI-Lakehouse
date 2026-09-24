@@ -117,15 +117,18 @@ pub async fn create_saved_query(
     sql: &str,
     owner: &str,
     tags: &[String],
+    owner_id: Option<Uuid>,
 ) -> Result<SavedQuery, StoreError> {
     let row: SavedQueryRow = sqlx::query_as(
-        "INSERT INTO saved_query (title, sql, owner, tags) VALUES ($1, $2, $3, $4) \
+        "INSERT INTO saved_query (title, sql, owner, tags, owner_id) \
+         VALUES ($1, $2, $3, $4, $5) \
          RETURNING id, title, sql, owner, updated_at, tags",
     )
     .bind(title)
     .bind(sql)
     .bind(owner)
     .bind(tags)
+    .bind(owner_id)
     .fetch_one(pool)
     .await?;
     Ok(SavedQuery::from(row))
@@ -143,11 +146,11 @@ pub struct QueryHistoryItem {
     pub id: String,
     /// The executed SQL text.
     pub sql: String,
-    /// Who ran the query, as the principal's own uuid string (WS2 §4,
-    /// `routes::query::run`). A row written before that change still
-    /// holds the earlier fixed placeholder, `"anonymous"` — this column
-    /// was never backfilled, so an old row and a new row are
-    /// distinguishable only by whether this value parses as a `Uuid`.
+    /// Who ran the query, as a display name. Ownership for scoping
+    /// [`list_history`] lives in the separate `owner_id` column
+    /// (`0046_query_ownership.sql`), not here — this stays a display
+    /// string even for a row recorded before that migration, which still
+    /// carries the earlier fixed placeholder `"anonymous"`.
     pub user: String,
     /// When the query ran, ISO 8601.
     pub at: String,
@@ -175,6 +178,13 @@ pub struct QueryHistoryItem {
     /// Serializes as `auditEventId`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_event_id: Option<String>,
+    /// The real owner (`0046_query_ownership.sql`), used by
+    /// `routes::query::download`'s ownership check. Never serialized: the
+    /// `TypeScript` contract has no `ownerId` field, and every row
+    /// `list_history` returns already belongs to the caller, so echoing it
+    /// back would be redundant at best.
+    #[serde(skip)]
+    pub owner_id: Option<Uuid>,
 }
 
 #[derive(Debug, FromRow)]
@@ -191,6 +201,7 @@ struct QueryHistoryRow {
     engine: String,
     cache_assisted: bool,
     audit_event_id: Option<String>,
+    owner_id: Option<Uuid>,
 }
 
 impl From<QueryHistoryRow> for QueryHistoryItem {
@@ -208,6 +219,7 @@ impl From<QueryHistoryRow> for QueryHistoryItem {
             engine: row.engine,
             cache_assisted: row.cache_assisted,
             audit_event_id: row.audit_event_id,
+            owner_id: row.owner_id,
         }
     }
 }
@@ -218,7 +230,12 @@ impl From<QueryHistoryRow> for QueryHistoryItem {
 /// inserting.
 const HISTORY_LIST_LIMIT: i64 = 200;
 
-/// List recorded query executions, most recent first.
+/// List one user's recorded query executions, most recent first.
+///
+/// History holds the SQL people typed, which is as private as the chat
+/// sessions in `console.chat_session`: before `owner_id` existed this
+/// listed the whole table, so everyone read everyone else's queries. Rows
+/// recorded before then have no owner and are returned to nobody.
 ///
 /// # `auditEventId` resolution (WS1 task 1.14, judge finding J12)
 ///
@@ -238,18 +255,24 @@ const HISTORY_LIST_LIMIT: i64 = 200;
 /// # Errors
 ///
 /// Returns [`StoreError::Database`] if the query fails.
-pub async fn list_history(pool: &PgPool) -> Result<Vec<QueryHistoryItem>, StoreError> {
+pub async fn list_history(
+    pool: &PgPool,
+    owner_id: Uuid,
+) -> Result<Vec<QueryHistoryItem>, StoreError> {
     let rows: Vec<QueryHistoryRow> = sqlx::query_as(
         "SELECT q.id, q.sql, q.user_name, q.at, q.status, q.duration_ms, q.scanned_bytes, \
-         q.cost_units, q.workload_class, q.engine, q.cache_assisted, ae.id AS audit_event_id \
+         q.cost_units, q.workload_class, q.engine, q.cache_assisted, ae.id AS audit_event_id, \
+         q.owner_id \
          FROM query_history q \
          LEFT JOIN LATERAL ( \
              SELECT ae.id FROM audit_event ae \
               WHERE ae.resource_kind = 'query_history' AND ae.resource_id = q.id \
               ORDER BY ae.at DESC LIMIT 1 \
          ) ae ON true \
-         ORDER BY q.at DESC LIMIT $1",
+         WHERE q.owner_id = $1 \
+         ORDER BY q.at DESC LIMIT $2",
     )
+    .bind(owner_id)
     .bind(HISTORY_LIST_LIMIT)
     .fetch_all(pool)
     .await?;
@@ -273,7 +296,8 @@ pub async fn get_history_item(
 ) -> Result<Option<QueryHistoryItem>, StoreError> {
     let row: Option<QueryHistoryRow> = sqlx::query_as(
         "SELECT q.id, q.sql, q.user_name, q.at, q.status, q.duration_ms, q.scanned_bytes, \
-         q.cost_units, q.workload_class, q.engine, q.cache_assisted, ae.id AS audit_event_id \
+         q.cost_units, q.workload_class, q.engine, q.cache_assisted, ae.id AS audit_event_id, \
+         q.owner_id \
          FROM query_history q \
          LEFT JOIN LATERAL ( \
              SELECT ae.id FROM audit_event ae \
@@ -297,8 +321,11 @@ pub struct RecordHistoryInput<'a> {
     pub id: &'a str,
     /// The executed SQL text.
     pub sql: &'a str,
-    /// Who ran the query.
+    /// Who ran the query, as a display name.
     pub user: &'a str,
+    /// The user the row belongs to. `None` for a run with no authenticated
+    /// caller, which [`list_history`] then shows to nobody.
+    pub owner_id: Option<Uuid>,
     /// `"completed" | "failed" | "cancelled" | "blocked"`.
     pub status: &'a str,
     /// Wall-clock execution time, in milliseconds.
@@ -340,8 +367,8 @@ pub async fn record_history(
     sqlx::query(
         "INSERT INTO query_history \
          (id, sql, user_name, status, duration_ms, scanned_bytes, cost_units, \
-          workload_class, engine, cache_assisted) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+          workload_class, engine, cache_assisted, owner_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(input.id)
@@ -354,6 +381,7 @@ pub async fn record_history(
     .bind(input.workload_class)
     .bind(input.engine)
     .bind(input.cache_assisted)
+    .bind(input.owner_id)
     .execute(pool)
     .await?;
     Ok(())
@@ -395,6 +423,7 @@ mod tests {
             engine: "hot-store".to_owned(),
             cache_assisted: true,
             audit_event_id: Some("aud-1".to_owned()),
+            owner_id: None,
         };
         let value = serde_json::to_value(&history).unwrap();
         for key in [
@@ -435,6 +464,7 @@ mod tests {
             engine: "hot-store".to_owned(),
             cache_assisted: false,
             audit_event_id: None,
+            owner_id: None,
         };
         let value = serde_json::to_value(&item).unwrap();
         assert!(value.get("auditEventId").is_none());

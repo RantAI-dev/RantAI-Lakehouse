@@ -9,7 +9,7 @@ use std::time::Instant;
 use axum::Extension;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::header;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_clickhouse::{ChClient, ChError};
@@ -20,6 +20,7 @@ use lakehouse_store::queries::{self, QueryHistoryItem, RecordHistoryInput, Saved
 use lakehouse_trino::{TrinoError, TrinoResult};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use uuid::Uuid;
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
@@ -43,7 +44,8 @@ struct SqlBody {
 /// Both routes share one `try { ({ sql } = await req.json()) } catch { ...
 /// "Body must be JSON {sql}" ... }` shape in the `TypeScript`: any body that
 /// doesn't parse as JSON at all — not merely a body missing `sql` — is a
-/// 400 with this exact message.
+/// 400 with this exact message (byte-for-byte parity corpus match, not
+/// merely English-language style).
 fn parse_body(body: &Bytes) -> Result<SqlBody, ApiError> {
     serde_json::from_slice(body)
         .map_err(|_err| ApiError::BadRequest("Body must be JSON {sql}".to_owned()))
@@ -52,24 +54,103 @@ fn parse_body(body: &Bytes) -> Result<SqlBody, ApiError> {
 /// Whether `sql` is a read-only statement `ClickHouse` may run from Query
 /// Studio.
 ///
-/// Ports the guard in `query/run/route.ts` verbatim, including its two
-/// quirks:
+/// Both halves of the check run against [`strip_sql_noise`]'s output
+/// rather than the raw text, which is the difference from the
+/// `query/run/route.ts` guard this was ported from. That guard tested the
+/// raw string, and so rejected two things it had no reason to:
 ///
-/// - It tests the *whole string* for smuggled DML keywords, so
-///   `SELECT 1; DELETE FROM t` is rejected even though the statement
-///   *starts* with `SELECT`.
-/// - The leading-keyword test anchors to the very start of the (trimmed)
-///   string, so a leading comment before a permitted keyword — e.g.
-///   `/* c */ SELECT 1` — fails that test and is rejected too, even though
-///   the statement contains no DML at all. This is almost certainly an
-///   accidental over-restriction upstream (comments are harmless), but the
-///   golden corpus captured this exact behavior, so it is reproduced
-///   as-is rather than "fixed".
+/// - Anything written under a leading comment — including the editor's own
+///   starter line, `-- Write SQL here…`, which made the very first query a
+///   new user typed fail with "only read queries are allowed".
+/// - Any query merely *mentioning* a DML word, e.g.
+///   `SELECT * FROM t WHERE action = 'drop'`.
+///
+/// What it still rejects is what matters: a statement that does not start
+/// with a read keyword, and smuggled DML such as `SELECT 1; DELETE FROM t`
+/// — the semicolon trick is why the denied-word test looks at the whole
+/// statement rather than just its first word.
 #[must_use]
 fn is_read_only(sql: &str) -> bool {
-    let starts_with_allowed = starts_with_allowed_keyword(sql);
-    let contains_dml = contains_denied_keyword(sql);
-    starts_with_allowed && !contains_dml
+    let code = strip_sql_noise(sql);
+    starts_with_allowed_keyword(&code) && !contains_denied_keyword(&code)
+}
+
+/// `sql` with comments and quoted literals blanked out, so the guard reads
+/// only the parts of a statement that can actually do something.
+///
+/// Removed: `-- line` and `# line` comments, `/* block */` comments, and
+/// `'single'`, `"double"` and `` `backtick` `` quoted runs (doubled quotes
+/// and backslash escapes inside them included). Each is replaced by a
+/// single space rather than deleted, so words either side of it cannot be
+/// glued into one.
+#[must_use]
+fn strip_sql_noise(sql: &str) -> String {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match c {
+            '-' if next == Some('-') => {
+                i = skip_to_line_end(&chars, i);
+                out.push(' ');
+            }
+            '#' => {
+                i = skip_to_line_end(&chars, i);
+                out.push(' ');
+            }
+            '/' if next == Some('*') => {
+                i += 2;
+                while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                    i += 1;
+                }
+                i = (i + 2).min(chars.len());
+                out.push(' ');
+            }
+            '\'' | '"' | '`' => {
+                i = skip_quoted(&chars, i, c);
+                out.push(' ');
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Index just past the end of the line starting at `from`.
+fn skip_to_line_end(chars: &[char], from: usize) -> usize {
+    let mut i = from;
+    while i < chars.len() && chars[i] != '\n' {
+        i += 1;
+    }
+    i
+}
+
+/// Index just past the quoted run that opens at `from` with `quote`.
+/// An unterminated quote consumes the rest of the statement, which is the
+/// safe reading: the guard sees less, not more.
+fn skip_quoted(chars: &[char], from: usize, quote: char) -> usize {
+    let mut i = from + 1;
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            i += 2;
+            continue;
+        }
+        if chars[i] == quote {
+            // A doubled quote is an escaped quote, not the end of the run.
+            if chars.get(i + 1) == Some(&quote) {
+                i += 2;
+                continue;
+            }
+            return i + 1;
+        }
+        i += 1;
+    }
+    chars.len()
 }
 
 /// `/^\s*(with|select|show|describe|desc|explain)\b/i.test(sql)` — leading
@@ -336,9 +417,24 @@ async fn execute_query_against_engine(
     }
 }
 
+/// The most rows one run hands back to the browser.
+///
+/// The console renders every row it receives, so an unbounded `SELECT *`
+/// used to be enough to freeze the tab. `ClickHouse`/`Trino` still compute
+/// the whole result — this caps what crosses the wire, and the response
+/// says when it did (`truncated`), so nobody reads a partial answer as the
+/// whole one.
+const MAX_RESULT_ROWS: usize = 2_000;
+
 /// `POST /api/query/run` — execute a read-only `SQL` statement against
 /// `ClickHouse` (`engine` absent or `"clickhouse"`) or `Trino`
 /// (`engine: "trino"`, WS2 §4) and return it in `QueryResult` shape.
+///
+/// Every successful run is written to the audit trail and to the caller's
+/// query history (best-effort — see `queries::record_history`'s doc
+/// comment). A refused or failed run is answered with an error and is NOT
+/// separately recorded here; the audit trail's own refusal path is what
+/// WS7 built for enforcement decisions, not this route's history write.
 ///
 /// # Errors
 ///
@@ -413,8 +509,16 @@ pub async fn run(
     let started = Instant::now();
     let started_epoch_ms = epoch_ms();
 
-    let (columns, rows, duration_ms, scanned_bytes) =
+    let (columns, mut rows, duration_ms, scanned_bytes) =
         execute_query_against_engine(&state, &engine, &sql, &user_id, started).await?;
+
+    // The console renders every row it receives, so an unbounded `SELECT *`
+    // used to be enough to freeze the tab — see `MAX_RESULT_ROWS`'s own doc
+    // comment. `ClickHouse`/`Trino` still compute the whole result; only
+    // what crosses the wire is capped, and the response says when it did.
+    let total_rows = rows.len();
+    let truncated = total_rows > MAX_RESULT_ROWS;
+    rows.truncate(MAX_RESULT_ROWS);
 
     let cost_units = std::cmp::max(1, bytes_to_cost_units(scanned_bytes));
     let id = format!("q-{started_epoch_ms}");
@@ -456,6 +560,7 @@ pub async fn run(
             id: &id,
             sql: &sql,
             user: &user_id,
+            owner_id: Some(p.id.uuid()),
             status: "completed",
             duration_ms: duration_ms as i64,
             scanned_bytes: scanned_bytes as i64,
@@ -473,6 +578,8 @@ pub async fn run(
         &id,
         &json!(columns),
         &json!(rows),
+        total_rows,
+        truncated,
         duration_ms,
         scanned_bytes,
         cost_units,
@@ -569,10 +676,16 @@ fn map_trino_error(err: TrinoError) -> ApiError {
 /// `metrics.engine`, which stays the fixed string `"hot-store"` describing
 /// `ClickHouse`'s storage tier regardless of which top-level engine ran.
 /// Neither renames nor removes the other.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one flat result row, no natural grouping"
+)]
 fn run_result_json(
     id: &str,
     columns: &Value,
     rows: &Value,
+    total_rows: usize,
+    truncated: bool,
     duration_ms: u64,
     scanned_bytes: u64,
     cost_units: u64,
@@ -583,6 +696,9 @@ fn run_result_json(
         "engine": engine,
         "columns": columns,
         "rows": rows,
+        "rowCount": total_rows,
+        "truncated": truncated,
+        "rowLimit": MAX_RESULT_ROWS,
         "metrics": {
             "durationMs": duration_ms,
             "scannedBytes": scanned_bytes,
@@ -653,17 +769,19 @@ fn bytes_to_cost_units(scanned_bytes: u64) -> u64 {
     (scanned_bytes as f64 / 1_000_000.0).round() as u64
 }
 
-/// `Math.round(estimatedBytes / divisor)`, used for both the min (÷2M) and
-/// max (÷1M) cost buckets in `query/estimate`.
+/// Four decimal places, which is the resolution the console prints.
+fn round4(value: f64) -> f64 {
+    (value * 10_000.0).round() / 10_000.0
+}
+
+/// The min (÷2M) and max (÷1M) cost buckets in `query/estimate`, to the
+/// same four decimals as [`bytes_to_cost_units`].
 #[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
     clippy::cast_precision_loss,
-    reason = "estimated byte counts here are well within f64's exact-integer \
-              range (2^53), and the ratio is always small and non-negative"
+    reason = "estimated byte counts here are well within f64's exact-integer range (2^53)"
 )]
-fn bytes_to_cost_bucket(estimated_bytes: i64, divisor: f64) -> u64 {
-    (estimated_bytes as f64 / divisor).round() as u64
+fn bytes_to_cost_bucket(estimated_bytes: i64, divisor: f64) -> f64 {
+    round4(estimated_bytes as f64 / divisor)
 }
 
 /// `POST /api/query/estimate` — a rough cost/plan estimate via `EXPLAIN
@@ -672,9 +790,11 @@ fn bytes_to_cost_bucket(estimated_bytes: i64, divisor: f64) -> u64 {
 /// # Errors
 ///
 /// Returns 400 [`ApiError::BadRequest`] on an unparseable body or a
-/// missing/blank `sql`. `EXPLAIN ESTIMATE` failures (e.g. non-`SELECT`
-/// input) are swallowed, matching the `TypeScript`'s inner `catch {}` —
-/// the response is always 200 in that case, with a zeroed estimate.
+/// missing/blank `sql`. An `EXPLAIN ESTIMATE` failure (e.g. non-`SELECT`
+/// input) still answers 200 — the console shows the estimate panel either
+/// way — but `estimatedBytes`/costs are `null` and the `ClickHouse` message
+/// is carried in `error`, rather than a zeroed estimate that looked
+/// identical to "this query reads nothing".
 pub async fn estimate(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJson<Value>> {
     let parsed = parse_body(&body)?;
     let sql = match parsed.sql {
@@ -682,10 +802,22 @@ pub async fn estimate(State(state): State<AppState>, body: Bytes) -> ApiResult<A
         _ => return Err(ApiError::BadRequest("sql is required".to_owned()).into()),
     };
 
-    let (estimated_bytes, sources) = estimate_body(&state.clickhouse, &sql).await;
+    // A failed EXPLAIN is reported, not swallowed. It used to come back as
+    // a zeroed estimate, so "this query cannot even be planned" and "this
+    // query reads nothing" looked identical — and ClickHouse's message is
+    // usually the most useful thing on the page (an unknown column, a
+    // missing table) before anyone presses Run.
+    let estimated = estimate_body(&state.clickhouse, &sql).await;
+    let (estimated_bytes, sources, estimate_error) = match estimated {
+        Ok((bytes, sources)) => (Some(bytes), sources, None),
+        Err(message) => (None, Vec::new(), Some(message)),
+    };
+    let freshness_lag_seconds = freshness_lag(&state.clickhouse, &sources).await;
 
-    let cost_min = std::cmp::max(1, bytes_to_cost_bucket(estimated_bytes, 2_000_000.0));
-    let cost_max = std::cmp::max(1, bytes_to_cost_bucket(estimated_bytes, 1_000_000.0));
+    // No floor: an estimate of nothing costs nothing. `max(1, …)` used to
+    // make an empty editor read "1.00 cu–1.00 cu".
+    let cost_min = estimated_bytes.map(|b| bytes_to_cost_bucket(b, 2_000_000.0));
+    let cost_max = estimated_bytes.map(|b| bytes_to_cost_bucket(b, 1_000_000.0));
     let sources_out: Vec<String> = if sources.is_empty() {
         vec!["clickhouse@lakehouse".to_owned()]
     } else {
@@ -697,47 +829,116 @@ pub async fn estimate(State(state): State<AppState>, body: Bytes) -> ApiResult<A
         cost_min,
         cost_max,
         &json!(sources_out),
+        freshness_lag_seconds,
+        estimate_error.as_deref(),
     )))
 }
 
 /// Build the `/api/query/estimate` response body from already-computed
 /// values. See [`run_result_json`] for why this is extracted.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one flat result row, no natural grouping"
+)]
 fn estimate_result_json(
-    estimated_bytes: i64,
-    cost_min: u64,
-    cost_max: u64,
+    estimated_bytes: Option<i64>,
+    cost_min: Option<f64>,
+    cost_max: Option<f64>,
     sources_out: &Value,
+    freshness_lag_seconds: Option<i64>,
+    error: Option<&str>,
 ) -> Value {
     json!({
         "estimatedBytes": estimated_bytes,
         "estimatedCostMin": cost_min,
         "estimatedCostMax": cost_max,
+        "error": error,
+        // True by construction: Query Studio runs everything through
+        // ClickHouse, the hot analytical store.
         "workloadClass": "hot-analytics",
         "engine": "hot-store",
-        // WS1 task 1.6: no cache-eligibility check runs and no
-        // freshness-lag measurement exists, and there is no policy engine
-        // yet (`WS7` builds one). The old `plan` marked stages that had
-        // *not run* as status "completed" with `estimatedBytes: 0` — a
-        // fabricated measurement of work that was never done. Null says
-        // "not measured".
+        // Nothing in this deployment configures ClickHouse's query cache,
+        // and no policy engine is consulted before a run (`WS7` builds
+        // one) — `cacheEligible`/`policyObligations` stay `null`, not a
+        // fabricated "Eligible"/`[]`. `freshnessLagSeconds` IS a real
+        // measurement (`freshness_lag`, ClickHouse `system.parts`), unlike
+        // the `0` it used to hardcode.
         "cacheEligible": Value::Null,
-        "freshnessLagSeconds": Value::Null,
+        "freshnessLagSeconds": freshness_lag_seconds,
         "policyObligations": Value::Null,
         "sources": sources_out,
+        // WS1 task 1.6: the old `plan` marked stages that had *not run* as
+        // status "completed" with `estimatedBytes: 0` — a fabricated
+        // measurement of work that was never done. Null until a real plan
+        // is computed.
         "plan": Value::Null,
     })
 }
 
+/// Seconds since the newest write to any table the query reads, or `None`
+/// when that cannot be established — no source tables identified, or
+/// `ClickHouse` did not answer.
+///
+/// The lag reported is the *worst* one across the sources: a join is only
+/// as fresh as its stalest side. This used to be hardcoded to 0, so the
+/// panel said "Fresh · 0 s" for every query, including one that had not
+/// been written yet.
+async fn freshness_lag(ch: &ChClient, sources: &[String]) -> Option<i64> {
+    let qualified: Vec<&String> = sources.iter().filter(|s| s.contains('.')).collect();
+    if qualified.is_empty() {
+        return None;
+    }
+    let predicate = qualified
+        .iter()
+        .filter_map(|s| s.split_once('.'))
+        .map(|(db, table)| {
+            format!(
+                "(database = '{}' AND table = '{}')",
+                escape_literal(db),
+                escape_literal(table)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    if predicate.is_empty() {
+        return None;
+    }
+    let sql = format!(
+        "SELECT toString(dateDiff('second', max(modification_time), now())) lag \
+         FROM system.parts WHERE active AND ({predicate})"
+    );
+    let rows = ch.rows(&sql, None).await.ok()?;
+    rows.first()?
+        .get("lag")
+        .and_then(Value::as_str)
+        .and_then(|v| v.parse::<i64>().ok())
+}
+
+/// Single-quote escaping for a `ClickHouse` string literal. The names come
+/// from `EXPLAIN ESTIMATE`'s own output rather than from the caller, but
+/// they are still interpolated into SQL, so they are escaped.
+fn escape_literal(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
 /// Runs `EXPLAIN ESTIMATE <sql>` (with any trailing `;` stripped) and
-/// tallies `estimatedBytes`/`sources` from the result rows. Returns
-/// `(0, [])` on any `ClickHouse` failure, matching the `TypeScript`'s inner
-/// `catch {}`.
-async fn estimate_body(ch: &ChClient, sql: &str) -> (i64, Vec<String>) {
+/// tallies `estimatedBytes`/`sources` from the result rows, or returns
+/// what `ClickHouse` said about why it could not plan the statement.
+async fn estimate_body(ch: &ChClient, sql: &str) -> Result<(i64, Vec<String>), String> {
     let trimmed = strip_trailing_semicolon(sql);
     let query = format!("EXPLAIN ESTIMATE {trimmed}");
-    let Ok(result) = ch.query(&query, None).await else {
-        return (0, Vec::new());
-    };
+    let result = ch.query(&query, None).await.map_err(|err| {
+        // Just the first line: ClickHouse follows its message with a stack
+        // of internal context nobody reading the console needs.
+        let message = err.to_string();
+        message
+            .lines()
+            .next()
+            .unwrap_or("could not plan this query")
+            .chars()
+            .take(240)
+            .collect::<String>()
+    })?;
     let mut estimated_bytes: i64 = 0;
     let mut sources = Vec::new();
     for row in &result.data {
@@ -753,7 +954,7 @@ async fn estimate_body(ch: &ChClient, sql: &str) -> (i64, Vec<String>) {
         let rows_n = row.get("rows").and_then(numeric_value).unwrap_or(0.0);
         estimated_bytes += rows_to_bytes(rows_n);
     }
-    (estimated_bytes, sources)
+    Ok((estimated_bytes, sources))
 }
 
 /// `rows * 64` — the rough byte-per-row estimate `EXPLAIN ESTIMATE` rows
@@ -814,16 +1015,80 @@ pub async fn list_saved(State(state): State<AppState>) -> ApiResult<ApiJson<Vec<
     Ok(ApiJson(queries::list_saved(pool(&state)?).await?))
 }
 
-/// `GET /api/query/history` — recent, real query executions, recorded by
-/// [`run`] on success.
+/// `GET /api/query/history` — the caller's own recent query executions,
+/// recorded by [`run`].
 ///
 /// # Errors
 ///
-/// 503 if no pool is configured; 500 on a database failure.
+/// 401 when nobody is signed in — history belongs to a person, so there is
+/// no sensible answer for "everyone's". 503 if no pool is configured; 500
+/// on a database failure.
 pub async fn list_history(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
 ) -> ApiResult<ApiJson<Vec<QueryHistoryItem>>> {
-    Ok(ApiJson(queries::list_history(pool(&state)?).await?))
+    let owner = caller_id(principal.as_ref())?;
+    Ok(ApiJson(queries::list_history(pool(&state)?, owner).await?))
+}
+
+/// The signed-in caller's id, or a 401.
+fn caller_id(principal: Option<&Extension<Principal>>) -> Result<Uuid, ApiError> {
+    principal
+        .map(|Extension(p)| p.id.uuid())
+        .ok_or_else(|| ApiError::Unauthorized("sign in required".to_owned()))
+}
+
+/// The `POST /api/query/saved` body.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSavedQueryBody {
+    title: String,
+    sql: String,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+/// `POST /api/query/saved` — save the SQL in the editor under a name.
+///
+/// Saved queries are shared: the whole team sees them, which is what makes
+/// them worth saving. The author is recorded all the same.
+///
+/// # Errors
+///
+/// 400 on a malformed body or a blank title/SQL; 401 when nobody is signed
+/// in; 422 when the SQL is not read-only — a saved query is run through the
+/// same guard as anything else, so refusing it here is better than storing
+/// something that can never run; 503/500 as above.
+pub async fn create_saved(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    body: Bytes,
+) -> ApiResult<(StatusCode, ApiJson<SavedQuery>)> {
+    let body: CreateSavedQueryBody = serde_json::from_slice(&body)
+        .map_err(|err| ApiError::BadRequest(format!("invalid JSON: {err}")))?;
+    let title = body.title.trim().to_owned();
+    let sql = body.sql.trim().to_owned();
+    if title.is_empty() || sql.is_empty() {
+        return Err(ApiError::BadRequest("title and sql are required".to_owned()).into());
+    }
+    if !is_read_only(&sql) {
+        return Err(ApiError::Unprocessable(
+            "only read queries (SELECT/SHOW/DESCRIBE/EXPLAIN) can be saved".to_owned(),
+        )
+        .into());
+    }
+    let owner_id = caller_id(principal.as_ref())?;
+    let owner = principal.map_or_else(|| "anonymous".to_owned(), |Extension(p)| p.display_name);
+    let saved = queries::create_saved_query(
+        pool(&state)?,
+        &title,
+        &sql,
+        &owner,
+        &body.tags,
+        Some(owner_id),
+    )
+    .await?;
+    Ok((StatusCode::CREATED, ApiJson(saved)))
 }
 
 // ── GET /api/query/run/{id}/download (WS2 §13, WS2 plan review W9) ─────
@@ -936,14 +1201,13 @@ fn map_download_ch_error(err: &ChError) -> ApiError {
 /// placeholder are eligible (WS2 plan review W9) — a `"trino"` row cannot
 /// be re-run through this route at all.
 ///
-/// Ownership is exact-match on `query_history.user_name` against the
-/// caller's own principal id string. Every row recorded before this
-/// workstream threaded a real principal into `routes::query::run` carries
-/// the fixed placeholder `"anonymous"`, which — by construction — never
-/// equals any authenticated caller's real id string, so those legacy rows are
-/// permanently undownloadable through this route. That is a deliberate,
-/// fail-closed consequence of scoping by identity, not an oversight to be
-/// worked around.
+/// Ownership is exact-match on `query_history.owner_id`
+/// (`0046_query_ownership.sql`) against the caller's own principal id.
+/// Every row recorded before that migration — and every row recorded with
+/// no authenticated caller — has `owner_id = NULL`, which never equals any
+/// principal's id, so those legacy rows are permanently undownloadable
+/// through this route. That is a deliberate, fail-closed consequence of
+/// scoping by identity, not an oversight to be worked around.
 ///
 /// # Errors
 ///
@@ -981,12 +1245,14 @@ pub async fn download(
     };
 
     // Fails closed identically for a stranger's row and a legacy
-    // "anonymous" row (see this function's doc comment) — a caller cannot
-    // distinguish "not yours" from "does not exist" either way.
-    let caller_id = principal
-        .as_ref()
-        .map(|Extension(p)| p.id.uuid().to_string());
-    if caller_id.as_deref() != Some(item.user.as_str()) {
+    // pre-`0046` row with no recorded `owner_id` (see this function's doc
+    // comment) — a caller cannot distinguish "not yours" from "does not
+    // exist" either way. Checked against `owner_id`
+    // (`0046_query_ownership.sql`), not the `user` display name: `user` no
+    // longer carries a principal id (`QueryHistoryItem::user`'s own doc
+    // comment).
+    let caller_id = principal.as_ref().map(|Extension(p)| p.id.uuid());
+    if caller_id.is_none() || caller_id != item.owner_id {
         return Err(ApiError::NotFound("query run not found".to_owned()).into());
     }
 
@@ -1173,12 +1439,41 @@ mod tests {
     }
 
     #[test]
-    fn rejects_leading_comment_before_select() {
-        // TS quirk: the leading-keyword regex anchors to the very start of
-        // the string, so a comment before SELECT fails it even though the
-        // statement is otherwise pure read.
-        assert!(!is_read_only("/* c */ SELECT 1"));
-        assert!(!is_read_only("-- c\nSELECT 1"));
+    fn allows_a_comment_before_the_statement() {
+        // The editor opens with exactly this shape — a starter comment,
+        // then the user's query underneath — and it used to be refused.
+        assert!(is_read_only("-- Write SQL here\nSELECT 1"));
+        assert!(is_read_only("/* c */ SELECT 1"));
+        assert!(is_read_only("# hash comment\nSELECT 1"));
+    }
+
+    #[test]
+    fn a_dml_word_inside_a_comment_or_string_is_not_dml() {
+        assert!(is_read_only("SELECT 1 -- drop this later"));
+        assert!(is_read_only("/* TODO: delete */ SELECT 1"));
+        assert!(is_read_only("SELECT * FROM t WHERE action = 'drop'"));
+        assert!(is_read_only("SELECT 'it''s an update' AS note"));
+        // …but real DML beside a decoy string still is.
+        assert!(!is_read_only("SELECT 'drop' AS a; DROP TABLE t"));
+    }
+
+    #[test]
+    fn strip_sql_noise_blanks_comments_and_literals() {
+        // Exact spacing is irrelevant to the guard — what matters is that
+        // the comment is gone and the words around it are not glued
+        // together.
+        let stripped = strip_sql_noise("SELECT 1 -- drop\nFROM t");
+        assert!(!stripped.contains("drop"), "{stripped}");
+        assert!(stripped.contains("SELECT 1"), "{stripped}");
+        assert!(stripped.contains("FROM t"), "{stripped}");
+        assert_eq!(strip_sql_noise("SELECT /* x */ 1"), "SELECT   1");
+        assert_eq!(
+            strip_sql_noise("SELECT 'a' , \"b\" , `c`"),
+            "SELECT   ,   ,  "
+        );
+        // An unterminated quote swallows the rest, which is the safe way
+        // round: the guard then sees less, never more.
+        assert_eq!(strip_sql_noise("SELECT 'unterminated"), "SELECT  ");
     }
 
     #[test]
@@ -1222,7 +1517,17 @@ mod tests {
 
     #[test]
     fn run_result_emits_null_for_unmeasured_transparency_fields() {
-        let v = run_result_json("q-1", &json!([]), &json!([]), 12, 34, 1, "clickhouse");
+        let v = run_result_json(
+            "q-1",
+            &json!([]),
+            &json!([]),
+            0,
+            false,
+            12,
+            34,
+            1,
+            "clickhouse",
+        );
 
         // The transparency panel exists to tell the reader what actually
         // happened. ClickHouse's response carries no cache-hit flag and no
@@ -1254,7 +1559,7 @@ mod tests {
 
     #[test]
     fn estimate_result_emits_null_for_unmeasured_fields() {
-        let v = estimate_result_json(100, 1, 2, &json!([]));
+        let v = estimate_result_json(Some(100), Some(1.0), Some(2.0), &json!([]), None, None);
 
         for key in [
             "cacheEligible",

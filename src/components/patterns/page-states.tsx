@@ -4,6 +4,7 @@ import { AlertTriangle, Inbox, Lock, RotateCcw } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { cn } from "@/lib/utils"
+import { buildErrorDescription } from "@/lib/notify-message"
 import type { ServiceError } from "@/services/errors"
 
 function StateShell({
@@ -62,6 +63,16 @@ export function EmptyState({
   )
 }
 
+/**
+ * Judul yang lebih spesifik daripada "Something went wrong", supaya pengguna
+ * langsung tahu jenis masalahnya sebelum membaca deskripsi.
+ */
+const ERROR_TITLES: Partial<Record<ServiceError["code"], string>> = {
+  not_found: "Not found",
+  unavailable: "Service unavailable",
+  invalid_request: "Request could not be processed",
+}
+
 /** Error state with retry. Pass the normalized ServiceError from useService. */
 export function ErrorState({
   error,
@@ -78,8 +89,12 @@ export function ErrorState({
   return (
     <StateShell
       icon={<AlertTriangle className="size-5" aria-hidden />}
-      title="Something went wrong"
-      description={error.message}
+      title={ERROR_TITLES[error.code] ?? "Something went wrong"}
+      // Pesan mentah dari server jarang memberi tahu apa yang harus
+      // dilakukan berikutnya. `buildErrorDescription` menambahkan langkah
+      // lanjut sesuai kode error, dan dipakai bersama toast agar bahasa
+      // penanganan error seragam di seluruh aplikasi.
+      description={buildErrorDescription(error) ?? error.message}
       action={
         onRetry ? (
           <Button variant="outline" size="sm" onClick={onRetry}>

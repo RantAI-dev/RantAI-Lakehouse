@@ -1,11 +1,13 @@
 import * as React from "react";
 import { OMITTED_TABLE_TEXT, UNVERIFIED_NUMBER_LABEL, tokenizeInline } from "@/lib/citation-markers";
+import { CopyButton } from "./copy-button";
 
 /**
  * A minimal, dependency-free Markdown renderer for AI Copilot answers.
- * Supports: headings, GFM tables, lists (dash/star/number), bold, italic,
- * inline code. Enough for the model's concise output; not full CommonMark
- * (e.g. no blockquotes / nested lists).
+ * Supports: headings, GFM tables, fenced code blocks (with copy), block
+ * quotes, rules, nested lists (dash/star/numbered), bold, italic, inline
+ * code and http(s) links. Enough for the model's concise output; not full
+ * CommonMark.
  *
  * Also renders the two citation states the copilot backend's
  * `annotate_answer` (WS7 item F6; `rust/crates/lakehouse-api/src/routes/ai/
@@ -35,6 +37,18 @@ function renderInline(text: string, keyBase: string): React.ReactNode[] {
         );
       case "italic":
         return <em key={key}>{tok.content}</em>;
+      case "link":
+        return (
+          <a
+            key={key}
+            href={tok.href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="font-medium text-primary underline underline-offset-2"
+          >
+            {tok.content}
+          </a>
+        );
       case "unverified":
         // Legible, not decorative: the dashed underline alone would teach
         // a reader to ignore it, so the title spells out WHY this number
@@ -72,6 +86,67 @@ function splitRow(line: string): string[] {
     .map((c) => c.trim());
 }
 
+function CodeBlock({ code, lang }: { code: string; lang: string }) {
+  return (
+    <div className="my-1 overflow-hidden rounded-lg border border-border bg-muted/40">
+      <div className="flex items-center justify-between border-b border-border px-2.5 py-1">
+        <span className="font-mono text-[11px] text-muted-foreground">{lang || "code"}</span>
+        <CopyButton text={code} label="Copy code" />
+      </div>
+      <pre className="overflow-x-auto p-2.5 text-xs leading-relaxed">
+        <code className="font-mono">{code}</code>
+      </pre>
+    </div>
+  );
+}
+
+const LIST_ITEM = /^(\s*)([-*+]|\d+\.)\s+(.*)$/;
+
+export type ListNode = { text: string; children: ListNode[]; ordered: boolean };
+
+/** List items from `lines[start]` on, nested by indentation. */
+export function parseList(lines: string[], start: number): { nodes: ListNode[]; next: number } {
+  const root: ListNode[] = [];
+  const first = LIST_ITEM.exec(lines[start]);
+  // Each level is the indentation its items share.
+  const stack: { indent: number; items: ListNode[] }[] = [{ indent: first?.[1].length ?? 0, items: root }];
+  let i = start;
+  while (i < lines.length) {
+    const m = LIST_ITEM.exec(lines[i]);
+    if (!m) break;
+    const indent = m[1].length;
+    const node: ListNode = { text: m[3], children: [], ordered: /\d/.test(m[2]) };
+    while (stack.length > 1 && indent < stack[stack.length - 1].indent) stack.pop();
+    const level = stack[stack.length - 1];
+    const prev = level.items[level.items.length - 1];
+    if (indent > level.indent && prev) {
+      prev.children.push(node);
+      stack.push({ indent, items: prev.children });
+    } else {
+      level.items.push(node);
+    }
+    i++;
+  }
+  return { nodes: root, next: i };
+}
+
+function renderList(nodes: ListNode[], keyBase: string): React.ReactNode {
+  const ordered = nodes[0]?.ordered ?? false;
+  const Tag = ordered ? "ol" : "ul";
+  return (
+    <Tag className={`${ordered ? "list-decimal" : "list-disc"} space-y-0.5 pl-5 text-sm`}>
+      {nodes.map((n, j) => (
+        <li key={j}>
+          {renderInline(n.text, `${keyBase}-${j}`)}
+          {n.children.length ? renderList(n.children, `${keyBase}-${j}c`) : null}
+        </li>
+      ))}
+    </Tag>
+  );
+}
+
+const BLOCK_START = /^(#{1,3}\s|```|>|\s*([-*+]|\d+\.)\s+|\s*\|)/;
+
 export function MiniMarkdown({ text }: { text: string }) {
   const lines = text.replace(/\r/g, "").split("\n");
   const blocks: React.ReactNode[] = [];
@@ -87,7 +162,17 @@ export function MiniMarkdown({ text }: { text: string }) {
       continue;
     }
 
-    // Heading.
+    // Fenced code block.
+    const fence = /^```\s*([\w+-]*)/.exec(line);
+    if (fence) {
+      const code: string[] = [];
+      i++;
+      while (i < lines.length && !lines[i].startsWith("```")) code.push(lines[i++]);
+      i++; // closing fence (or end of text)
+      blocks.push(<CodeBlock key={key++} code={code.join("\n")} lang={fence[1]} />);
+      continue;
+    }
+
     const h = /^(#{1,3})\s+(.*)$/.exec(line);
     if (h) {
       const level = h[1].length;
@@ -95,13 +180,30 @@ export function MiniMarkdown({ text }: { text: string }) {
       blocks.push(
         <p key={key++} className={`${cls} mt-1 text-foreground`}>
           {renderInline(h[2], `h${key}`)}
-        </p>,
+        </p>
       );
       i++;
       continue;
     }
 
-    // GFM table: a '|...|' row followed by a '|---|' separator row.
+    if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) {
+      blocks.push(<hr key={key++} className="my-2 border-border" />);
+      i++;
+      continue;
+    }
+
+    if (line.startsWith(">")) {
+      const quote: string[] = [];
+      while (i < lines.length && lines[i].startsWith(">")) quote.push(lines[i++].replace(/^>\s?/, ""));
+      blocks.push(
+        <blockquote key={key++} className="border-l-2 border-border pl-3 text-sm text-muted-foreground">
+          {renderInline(quote.join(" "), `q${key}`)}
+        </blockquote>
+      );
+      continue;
+    }
+
+    // GFM table: a '|...|' row followed by a '|---|' separator.
     if (line.trim().startsWith("|") && i + 1 < lines.length && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1])) {
       const header = splitRow(line);
       const rows: string[][] = [];
@@ -134,40 +236,28 @@ export function MiniMarkdown({ text }: { text: string }) {
               ))}
             </tbody>
           </table>
-        </div>,
+        </div>
       );
       continue;
     }
 
-    // List (-, *, or '1.').
-    if (/^\s*([-*]|\d+\.)\s+/.test(line)) {
-      const items: string[] = [];
-      const ordered = /^\s*\d+\.\s+/.test(line);
-      while (i < lines.length && /^\s*([-*]|\d+\.)\s+/.test(lines[i])) {
-        items.push(lines[i].replace(/^\s*([-*]|\d+\.)\s+/, ""));
-        i++;
-      }
-      const ListTag = ordered ? "ol" : "ul";
-      blocks.push(
-        <ListTag key={key++} className={`my-1 ${ordered ? "list-decimal" : "list-disc"} space-y-0.5 pl-5 text-sm`}>
-          {items.map((it, j) => (
-            <li key={j}>{renderInline(it, `li${key}-${j}`)}</li>
-          ))}
-        </ListTag>,
-      );
+    if (LIST_ITEM.test(line)) {
+      const { nodes, next } = parseList(lines, i);
+      blocks.push(<div key={key++} className="my-1">{renderList(nodes, `l${key}`)}</div>);
+      i = next;
       continue;
     }
 
-    // Paragraph: join lines until a blank line.
+    // Paragraph: consecutive lines up to a blank line or another block.
     const para: string[] = [];
-    while (i < lines.length && lines[i].trim() && !/^(#{1,3})\s/.test(lines[i]) && !lines[i].trim().startsWith("|") && !/^\s*([-*]|\d+\.)\s+/.test(lines[i])) {
+    while (i < lines.length && lines[i].trim() && (para.length === 0 || !BLOCK_START.test(lines[i]))) {
       para.push(lines[i]);
       i++;
     }
     blocks.push(
       <p key={key++} className="text-sm leading-relaxed">
         {renderInline(para.join(" "), `p${key}`)}
-      </p>,
+      </p>
     );
   }
 

@@ -391,12 +391,12 @@ pub async fn ask(State(state): State<AppState>, body: Bytes) -> ApiResult<ApiJso
         })?;
 
     let context = if hits.is_empty() {
-        "(tidak ada dataset yang cocok)".to_owned()
+        "(no matching dataset)".to_owned()
     } else {
         hits.iter()
             .map(|h| {
                 format!(
-                    "- {} ({}, {} baris) — {}",
+                    "- {} ({}, {} rows) — {}",
                     h.title, h.tier, h.total, h.description
                 )
             })
@@ -506,7 +506,7 @@ pub async fn query(State(state): State<AppState>, body: Bytes) -> Response {
                 ApiJson(json!({
                     "error": "Agent LLM unavailable",
                     "detail": err.to_string(),
-                    "hint": "Set LLM_KEY (MiniMax) di .env.local.",
+                    "hint": "Set LLM_KEY, or point LLM_URL/LLM_MODEL at a model that is running.",
                 })),
             )
                 .into_response();

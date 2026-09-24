@@ -4,6 +4,8 @@ import { formatLagSeconds } from "@/lib/format"
 /**
  * Freshness readout backed by table watermarks.
  * Thresholds: fresh ≤ 60 s, lagging ≤ 1 h, stale beyond that.
+ * `null` means no watermark is known, which reads as "Unknown" rather than
+ * a colored verdict we cannot back up.
  * Always includes text so color is never the only signal.
  *
  * `lagSeconds === null` means the backend has not measured freshness for

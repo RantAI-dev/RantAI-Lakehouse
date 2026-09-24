@@ -5,8 +5,8 @@ import Link from "next/link"
 import { useParams } from "next/navigation"
 import { PauseIcon, PlayIcon, RotateCcwIcon, SquareIcon } from "lucide-react"
 import { CodeView } from "@/components/patterns/code-view"
+import { DataTable } from "@/components/data-table/data-table"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
 import { FlowCanvas } from "@/components/patterns/flow-canvas"
 import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
@@ -21,13 +21,14 @@ import { SectionCard } from "@/components/patterns/section-card"
 import { StatusBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import {
   formatCompactNumber,
-  formatCost,
   formatDateTime,
-  formatDuration,
   formatRelativeTime,
+  isPast,
 } from "@/lib/format"
 import { fmtMeasured } from "@/lib/measured"
 import type { EntityStatus } from "@/lib/status"
@@ -38,39 +39,9 @@ import type {
   PipelineRunLogsPage,
 } from "@/services/contracts/pipelines"
 import { topoSortOps } from "./topo-sort-ops"
+import { getPipelineRunColumns, runDuration } from "./pipeline-run-columns"
 
-function runDuration(run: PipelineRun): string {
-  if (!run.endedAt) return "running"
-  return formatDuration(
-    new Date(run.endedAt).getTime() - new Date(run.startedAt).getTime()
-  )
-}
-
-const runColumns: ColumnDef<PipelineRun>[] = [
-  { key: "status", header: "Status", render: (r) => <StatusBadge status={r.status} /> },
-  { key: "started", header: "Started", render: (r) => formatRelativeTime(r.startedAt) },
-  { key: "duration", header: "Duration", render: (r) => runDuration(r) },
-  { key: "processed", header: "Processed", render: (r) => fmtMeasured(r.processed, formatCompactNumber) },
-  { key: "accepted", header: "Accepted", render: (r) => fmtMeasured(r.accepted, formatCompactNumber) },
-  { key: "rejected", header: "Rejected", render: (r) => (
-    <span className={r.rejected !== null && r.rejected > 0 ? "text-destructive" : undefined}>
-      {fmtMeasured(r.rejected, formatCompactNumber)}
-    </span>
-  )},
-  { key: "retried", header: "Retried", render: (r) => fmtMeasured(r.retried, formatCompactNumber) },
-  { key: "cost", header: "Cost", render: (r) => fmtMeasured(r.costUnits, formatCost) },
-  { key: "error", header: "Error", render: (r) =>
-    r.error ? (
-      <span className="block max-w-52 truncate text-destructive" title={r.error}>
-        {r.error}
-      </span>
-    ) : (
-      "—"
-    ),
-  },
-]
-
-function AssetLink({ id, label }: { id?: string; label: string }) {
+function AssetLink({ id, label }: { readonly id?: string; readonly label: string }) {
   if (!id) return <span className="font-mono text-xs">{label}</span>
   return (
     <Link
@@ -83,7 +54,7 @@ function AssetLink({ id, label }: { id?: string; label: string }) {
 }
 
 /**
- * Source tab: an op picker plus its read-only text (WS4 item F4). A 404
+ * Source tab: an op picker plus its read-only text. A 404
  * (unknown op) or 409 (commit mismatch, `pipeline_source.rs`'s
  * `check_commit`) both surface through `source.status === "error"` with
  * the SERVER's own message — never a client-fabricated string that would
@@ -153,7 +124,7 @@ function SourceViewer({ pipelineId, ops }: { pipelineId: string; ops: PipelineOp
 }
 
 /**
- * Steps + polled logs inside the run drawer (WS4 item F4). Steps are a
+ * Steps + polled logs inside the run drawer. Steps are a
  * one-shot `useService` load (they only change when the drawer re-opens
  * on a new run). Logs poll by the backend's own opaque cursor — never
  * re-requested from zero — following the exact tick()/setTimeout shape
@@ -248,22 +219,162 @@ function RunStepsAndLogs({
   )
 }
 
+function RunDrawerActions({
+  run,
+  onCancel,
+  onRetry,
+  retrying,
+}: {
+  readonly run: PipelineRun
+  readonly onCancel: () => void
+  readonly onRetry: () => void
+  readonly retrying: boolean
+}) {
+  const isRunning = run.status === "running"
+  const canRetry = run.status === "failed" || run.status === "cancelled"
+
+  return (
+    <div className="flex flex-wrap gap-2">
+      {isRunning ? (
+        <Button size="sm" variant="outline" onClick={onCancel}>
+          <SquareIcon data-icon="inline-start" />
+          Cancel run
+        </Button>
+      ) : null}
+      {canRetry ? (
+        <Button size="sm" disabled={retrying} onClick={onRetry}>
+          <RotateCcwIcon data-icon="inline-start" />
+          {retrying ? "Retrying…" : "Retry run"}
+        </Button>
+      ) : null}
+      {run.outputAssetId ? (
+        <Button
+          size="sm"
+          variant="ghost"
+          render={<Link href={`/data/assets/${run.outputAssetId}`} />}
+        >
+          Output dataset
+        </Button>
+      ) : null}
+      <Button
+        size="sm"
+        variant="ghost"
+        render={<Link href={`/lineage?focus=${run.pipelineId}`} />}
+      >
+        Lineage
+      </Button>
+      {run.auditEventId ? (
+        <Button
+          size="sm"
+          variant="ghost"
+          render={<Link href={`/audit?event=${run.auditEventId}`} />}
+        >
+          Audit
+        </Button>
+      ) : null}
+    </div>
+  )
+}
+
+function RunDrawerContent({
+  run,
+  onCancel,
+  onRetry,
+  retrying,
+}: {
+  readonly run: PipelineRun
+  readonly onCancel: () => void
+  readonly onRetry: () => void
+  readonly retrying: boolean
+}) {
+  const metadataItems = [
+    { label: "Status", value: <StatusBadge status={run.status} /> },
+    { label: "Started", value: formatDateTime(run.startedAt) },
+    {
+      label: "Ended",
+      value: run.endedAt ? formatDateTime(run.endedAt) : "running",
+    },
+    { label: "Duration", value: runDuration(run) },
+    // These read "—" unless the orchestrator reported them. They used to
+    // be zeros, which looked like a pipeline that had processed nothing.
+    { label: "Processed", value: formatCompactNumber(run.processed) },
+    { label: "Accepted", value: formatCompactNumber(run.accepted) },
+    { label: "Rejected", value: formatCompactNumber(run.rejected) },
+    { label: "Retried", value: formatCompactNumber(run.retried) },
+    {
+      label: "Checkpoint",
+      value: run.checkpoint ? (
+        <span className="font-mono text-xs">{run.checkpoint}</span>
+      ) : (
+        "—"
+      ),
+    },
+    {
+      label: "Pipeline",
+      value: <span className="font-mono text-xs">{run.pipelineId}</span>,
+    },
+  ]
+
+  return (
+    <>
+      <RunDrawerActions
+        run={run}
+        onCancel={onCancel}
+        onRetry={onRetry}
+        retrying={retrying}
+      />
+      <MetadataList items={metadataItems} />
+      {run.error ? (
+        <div>
+          <p className="text-xs font-medium text-muted-foreground">Error</p>
+          <p className="mt-1 text-sm text-destructive">{run.error}</p>
+        </div>
+      ) : null}
+    </>
+  )
+}
+
 function RunDrawer({
   run,
   onClose,
   onChanged,
 }: {
-  run: PipelineRun | null
-  onClose: () => void
-  onChanged: () => void
+  readonly run: PipelineRun | null
+  readonly onClose: () => void
+  readonly onChanged: () => void
 }) {
-  const cancelAction = useServiceAction((signal, runId: string) =>
-    pipelineService.cancelRun(runId, signal)
+  const cancelAction = useServiceAction(
+    withNotify(
+      { success: "Run cancelled", error: "Failed to cancel run" },
+      (signal, runId: string) => pipelineService.cancelRun(runId, signal)
+    )
   )
-  const retryAction = useServiceAction((signal, runId: string) =>
-    pipelineService.retryRun(runId, signal)
+  const retryAction = useServiceAction(
+    withNotify(
+      { success: "Run retried", error: "Failed to retry run" },
+      (signal, runId: string) => pipelineService.retryRun(runId, signal)
+    )
   )
   const [cancelOpen, setCancelOpen] = React.useState(false)
+
+  const handleRetry = async () => {
+    if (!run) return
+    const next = await retryAction.run(run.id)
+    if (next) {
+      onChanged()
+      onClose()
+    }
+  }
+
+  const handleConfirmCancel = async () => {
+    if (!run) return
+    const updated = await cancelAction.run(run.id)
+    if (updated) {
+      setCancelOpen(false)
+      onChanged()
+      onClose()
+    }
+  }
 
   return (
     <>
@@ -277,90 +388,13 @@ function RunDrawer({
       >
         {run ? (
           <>
-            <div className="flex flex-wrap gap-2">
-              {run.status === "running" ? (
-                <Button size="sm" variant="outline" onClick={() => setCancelOpen(true)}>
-                  <SquareIcon data-icon="inline-start" />
-                  Cancel run
-                </Button>
-              ) : null}
-              {run.status === "failed" || run.status === "cancelled" ? (
-                <Button
-                  size="sm"
-                  disabled={retryAction.status === "pending"}
-                  onClick={async () => {
-                    const next = await retryAction.run(run.id)
-                    if (next) {
-                      onChanged()
-                      onClose()
-                    }
-                  }}
-                >
-                  <RotateCcwIcon data-icon="inline-start" />
-                  {retryAction.status === "pending" ? "Retrying…" : "Retry run"}
-                </Button>
-              ) : null}
-              {run.outputAssetId ? (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  render={<Link href={`/data/assets/${run.outputAssetId}`} />}
-                >
-                  Output dataset
-                </Button>
-              ) : null}
-              <Button
-                size="sm"
-                variant="ghost"
-                render={<Link href={`/lineage?focus=${run.pipelineId}`} />}
-              >
-                Lineage
-              </Button>
-              {run.auditEventId ? (
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  render={<Link href={`/audit?event=${run.auditEventId}`} />}
-                >
-                  Audit
-                </Button>
-              ) : null}
-            </div>
-            <MetadataList
-              items={[
-                { label: "Status", value: <StatusBadge status={run.status} /> },
-                { label: "Started", value: formatDateTime(run.startedAt) },
-                {
-                  label: "Ended",
-                  value: run.endedAt ? formatDateTime(run.endedAt) : "running",
-                },
-                { label: "Duration", value: runDuration(run) },
-                { label: "Processed", value: fmtMeasured(run.processed, formatCompactNumber) },
-                { label: "Accepted", value: fmtMeasured(run.accepted, formatCompactNumber) },
-                { label: "Rejected", value: fmtMeasured(run.rejected, formatCompactNumber) },
-                { label: "Retried", value: fmtMeasured(run.retried, formatCompactNumber) },
-                { label: "Cost", value: fmtMeasured(run.costUnits, formatCost) },
-                {
-                  label: "Checkpoint",
-                  value: run.checkpoint ? (
-                    <span className="font-mono text-xs">{run.checkpoint}</span>
-                  ) : (
-                    "—"
-                  ),
-                },
-                {
-                  label: "Pipeline",
-                  value: <span className="font-mono text-xs">{run.pipelineId}</span>,
-                },
-              ]}
+            <RunDrawerContent
+              run={run}
+              onCancel={() => setCancelOpen(true)}
+              onRetry={handleRetry}
+              retrying={retryAction.status === "pending"}
             />
             <RunStepsAndLogs pipelineId={run.pipelineId} runId={run.id} isLive={run.status === "running"} />
-            {run.error ? (
-              <div>
-                <p className="text-xs font-medium text-muted-foreground">Error</p>
-                <p className="mt-1 text-sm text-destructive">{run.error}</p>
-              </div>
-            ) : null}
           </>
         ) : null}
       </DetailDrawer>
@@ -372,15 +406,7 @@ function RunDrawer({
         impact="In-flight work stops at the last checkpoint. Partial output may remain."
         confirmLabel="Cancel run"
         confirming={cancelAction.status === "pending"}
-        onConfirm={async () => {
-          if (!run) return
-          const updated = await cancelAction.run(run.id)
-          if (updated) {
-            setCancelOpen(false)
-            onChanged()
-            onClose()
-          }
-        }}
+        onConfirm={handleConfirmCancel}
       />
     </>
   )
@@ -405,15 +431,26 @@ export function PipelineDetailPage() {
   )
   const runs = runsState.status === "success" ? runsState.data : []
   const [selectedRun, setSelectedRun] = React.useState<PipelineRun | null>(null)
+  const [cancelRunTarget, setCancelRunTarget] = React.useState<PipelineRun | null>(null)
   const [pauseOpen, setPauseOpen] = React.useState(false)
-  const runAction = useServiceAction((signal, id: string) =>
-    pipelineService.triggerRun(id, signal)
+
+  const runAction = useServiceAction(
+    withNotify(
+      { success: "Run triggered", error: "Failed to trigger run" },
+      (signal, id: string) => pipelineService.triggerRun(id, signal)
+    )
   )
-  const pauseAction = useServiceAction((signal, id: string) =>
-    pipelineService.pausePipeline(id, signal)
+  const pauseAction = useServiceAction(
+    withNotify(
+      { success: "Pipeline paused", error: "Failed to pause pipeline" },
+      (signal, id: string) => pipelineService.pausePipeline(id, signal)
+    )
   )
-  const resumeAction = useServiceAction((signal, id: string) =>
-    pipelineService.resumePipeline(id, signal)
+  const resumeAction = useServiceAction(
+    withNotify(
+      { success: "Pipeline resumed", error: "Failed to resume pipeline" },
+      (signal, id: string) => pipelineService.resumePipeline(id, signal)
+    )
   )
   const activateAction = useServiceAction((signal, id: string) =>
     pipelineService.setPipelineStatus(id, "ready", signal)
@@ -432,11 +469,53 @@ export function PipelineDetailPage() {
     return stepsState.data.find((step) => step.stepKey === opName)?.status
   }
 
+  const cancelAction = useServiceAction(
+    withNotify(
+      { success: "Run cancelled", error: "Failed to cancel run" },
+      (signal, runId: string) => pipelineService.cancelRun(runId, signal)
+    )
+  )
+  const retryAction = useServiceAction(
+    withNotify(
+      { success: "Run retried", error: "Failed to retry run" },
+      (signal, runId: string) => pipelineService.retryRun(runId, signal)
+    )
+  )
+
+  const columns = React.useMemo(
+    () =>
+      getPipelineRunColumns({
+        onSelect: setSelectedRun,
+        onCancel: (run) => setCancelRunTarget(run),
+        onRetry: async (run) => {
+          const next = await retryAction.run(run.id)
+          if (next) state.reload()
+        },
+      }),
+    [retryAction, state]
+  )
+
+  const { table } = useDataTable({
+    data: runs,
+    columns,
+    pageCount: 1,
+    initialState: {
+      columnPinning: { right: ["actions"] },
+    },
+  })
+
   if (state.status === "loading") return <LoadingSkeleton rows={8} />
   if (state.status === "error") return <ErrorState error={state.error} onRetry={state.reload} />
   const p = state.data
   const isPaused = p.status === "paused"
   const isDraft = p.status === "draft"
+  // `Pipeline` carries no `origin` field — the API never sends one. An
+  // authored (console-created) pipeline's id is always `pl-<slug>-<base36
+  // millis>`; a Dagster job id is never prefixed `pl-` (same derivation
+  // as `pipelineOrigin` in `./pipeline-columns.tsx`). Pause/Resume/Run act
+  // on a schedule and engine in the orchestrator, which an authored
+  // pipeline has neither.
+  const canRun = !p.id.startsWith("pl-")
 
   return (
     <div className="flex flex-col gap-4">
@@ -458,6 +537,14 @@ export function PipelineDetailPage() {
               <PlayIcon data-icon="inline-start" />
               {activateAction.status === "pending" ? "Activating…" : "Activate"}
             </Button>
+          ) : !canRun ? (
+            // An authored, non-draft pipeline still has no job in the
+            // orchestrator, so Run/Pause/Resume have nothing to act on.
+            // They used to be shown anyway and answered 503, which reads
+            // as "try again later".
+            <span className="text-xs text-muted-foreground">
+              No engine attached — this pipeline cannot run yet.
+            </span>
           ) : (
             <>
               {isPaused ? (
@@ -515,6 +602,25 @@ export function PipelineDetailPage() {
           }
         }}
       />
+      <ConfirmActionDialog
+        open={cancelRunTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setCancelRunTarget(null)
+        }}
+        title="Cancel pipeline run"
+        description={cancelRunTarget ? `Cancel run ${cancelRunTarget.id}?` : "Cancel this run?"}
+        impact="In-flight work stops at the last checkpoint. Partial output may remain."
+        confirmLabel="Cancel run"
+        confirming={cancelAction.status === "pending"}
+        onConfirm={async () => {
+          if (!cancelRunTarget) return
+          const updated = await cancelAction.run(cancelRunTarget.id)
+          if (updated) {
+            setCancelRunTarget(null)
+            state.reload()
+          }
+        }}
+      />
       <Tabs defaultValue="overview">
         <TabsList>
           <TabsTrigger value="overview">Overview</TabsTrigger>
@@ -553,7 +659,23 @@ export function PipelineDetailPage() {
                   ),
                 },
                 { label: "Last run", value: p.lastRunAt === null ? "—" : formatRelativeTime(p.lastRunAt) },
-                { label: "Next run", value: p.nextRunAt ? formatRelativeTime(p.nextRunAt) : "—" },
+                {
+                  label: "Next run",
+                  // A scheduled time that has already passed is not a
+                  // future event: "14d ago" under "Next run" reads as a
+                  // rendering bug when it is really an overdue schedule.
+                  value: p.nextRunAt ? (
+                    isPast(p.nextRunAt) ? (
+                      <span className="text-amber-600 dark:text-amber-400">
+                        Overdue · due {formatRelativeTime(p.nextRunAt)}
+                      </span>
+                    ) : (
+                      formatRelativeTime(p.nextRunAt)
+                    )
+                  ) : (
+                    "—"
+                  ),
+                },
                 { label: "SLA", value: p.slaOk === null ? "—" : p.slaOk ? "OK" : "Breached" },
                 { label: "Freshness", value: <FreshnessIndicator lagSeconds={p.freshnessLagSeconds} /> },
               ]}
@@ -590,15 +712,20 @@ export function PipelineDetailPage() {
         <TabsContent value="runs" className="mt-3">
           {runs.length === 0 ? (
             <EmptyState
-              title="No runs yet"
+              title="No runs"
               description="Runs appear here once the pipeline executes."
             />
           ) : (
             <DataTable
-              columns={runColumns}
-              rows={runs}
-              rowKey={(r) => r.id}
+              table={table}
               onRowClick={setSelectedRun}
+              infinite={{
+                onLoadMore: () => {},
+                hasNextPage: false,
+                isFetchingNextPage: false,
+                totalItems: runs.length,
+                loadedCount: runs.length,
+              }}
             />
           )}
         </TabsContent>

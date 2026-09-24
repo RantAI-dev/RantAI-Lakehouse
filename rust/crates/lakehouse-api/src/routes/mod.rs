@@ -11,6 +11,7 @@ mod ai;
 mod alerts;
 pub mod auth;
 mod catalog;
+mod catalog_query;
 mod connectors;
 mod dashboard;
 mod embed;
@@ -466,10 +467,22 @@ fn agents_router() -> Router<AppState> {
 /// routing note; this one-liner exists only to satisfy `missing_docs` now
 /// that the `lakehouse-api` library target (`src/lib.rs`) makes `routes` a
 /// `pub mod`, and this the crate's one public router constructor.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a flat list of `.route(...)` registrations; splitting further \
+              would scatter the route table across more sub-routers with \
+              no independent reuse, hurting rather than helping the \
+              'read the whole map in one place' goal `pipelines_router`/ \
+              `storage_router`/etc. already serve for the larger groups"
+)]
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/catalog", get(catalog::list))
+        // Registered before `/{id}`: axum prefers static segments over
+        // params, but keeping them adjacent in this order makes it obvious
+        // that `query` is a literal path and not an asset called "query".
+        .route("/api/catalog/query", get(catalog::query))
         .route("/api/catalog/{id}", get(catalog::detail))
         .route(
             "/api/catalog/{id}/annotation",
@@ -511,7 +524,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/gold/export/{mart}/consumers", get(gold::consumers))
         .route("/api/query/run", axum::routing::post(query::run))
         .route("/api/query/estimate", axum::routing::post(query::estimate))
-        .route("/api/query/saved", get(query::list_saved))
+        .route(
+            "/api/query/saved",
+            get(query::list_saved).post(query::create_saved),
+        )
         .route("/api/query/history", get(query::list_history))
         .route("/api/query/run/{id}/download", get(query::download))
         .route("/api/query/scheduling", get(query::scheduling))
@@ -523,6 +539,10 @@ pub fn router(state: AppState) -> Router {
                 .post(dashboard::specs_create)
                 .put(dashboard::specs_update)
                 .delete(dashboard::specs_delete),
+        )
+        .route(
+            "/api/dashboard/specs/preview",
+            axum::routing::post(dashboard::specs_preview),
         )
         .route(
             "/api/dashboard/boards",
@@ -553,6 +573,7 @@ pub fn router(state: AppState) -> Router {
             "/api/ai/sessions",
             get(ai::sessions_get)
                 .post(ai::sessions_save)
+                .patch(ai::sessions_rename)
                 .delete(ai::sessions_delete),
         )
         .route("/api/ai/build-status", get(ai::build_status))

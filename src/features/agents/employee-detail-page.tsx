@@ -23,6 +23,7 @@ import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import {
   formatTokens,
   formatPercent,
@@ -183,14 +184,23 @@ export function EmployeeDetailPage() {
   const [confirm, setConfirm] = React.useState<"suspend" | "revoke" | null>(null)
   const [runDialogOpen, setRunDialogOpen] = React.useState(false)
   const [promptOverride, setPromptOverride] = React.useState("")
-  const suspendAction = useServiceAction((signal, id: string) =>
-    agentService.suspendEmployee(id, signal)
+  const suspendAction = useServiceAction(
+    withNotify(
+      { success: "Employee suspended", error: "Failed to suspend employee" },
+      (signal, id: string) => agentService.suspendEmployee(id, signal)
+    )
   )
-  const resumeAction = useServiceAction((signal, id: string) =>
-    agentService.resumeEmployee(id, signal)
+  const resumeAction = useServiceAction(
+    withNotify(
+      { success: "Employee resumed", error: "Failed to resume employee" },
+      (signal, id: string) => agentService.resumeEmployee(id, signal)
+    )
   )
-  const revokeAction = useServiceAction((signal, id: string) =>
-    agentService.revokeEmployee(id, signal)
+  const revokeAction = useServiceAction(
+    withNotify(
+      { success: "Employee revoked", error: "Failed to revoke employee" },
+      (signal, id: string) => agentService.revokeEmployee(id, signal)
+    )
   )
   const runAction = useServiceAction((signal, id: string, prompt: string) =>
     agentService.runEmployee(id, prompt ? { prompt } : undefined, signal)

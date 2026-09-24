@@ -59,20 +59,30 @@ pub struct Pipeline {
     pub target_asset_id: Option<String>,
     /// Schedule label.
     pub schedule: String,
-    /// Last run time, ISO 8601. `None` for every authored pipeline: nothing
-    /// executes an authored pipeline yet (`WS4` adds that), so there is no
-    /// run time to report — serialized as JSON `null`, not omitted, so a
-    /// reader sees "not measured" rather than a missing field.
+    /// Last run time, ISO 8601; `None` when it has never run. Read from the
+    /// stored column: `0048_pipeline_never_run.sql` dropped the `now()`
+    /// default that made every freshly authored pipeline lie about having
+    /// just run, so a stored `NULL` here is now an honest "never ran", not
+    /// a placeholder to override.
     pub last_run_at: Option<String>,
     /// Next scheduled run time, ISO 8601, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_run_at: Option<String>,
     /// Whether the pipeline is currently meeting its SLA. `None`: no `SLA`
-    /// is defined anywhere yet (`WS5` adds `dataset_sla`).
+    /// is defined anywhere yet (`WS5` adds `dataset_sla`) — unlike
+    /// `last_run_at`/`freshness_lag_seconds`, no migration has made this
+    /// column's `NOT NULL DEFAULT true` mean anything real, so it stays a
+    /// hardcoded `None` regardless of what is stored (would otherwise
+    /// report every pipeline "on SLA").
     pub sla_ok: Option<bool>,
-    /// Current freshness lag in seconds. `None`: nothing measures it for an
-    /// authored pipeline that has never run.
+    /// Current freshness lag in seconds, read from the stored column
+    /// (`0048_pipeline_never_run.sql` made it honestly nullable): `None`
+    /// until something measures it, never a fabricated `0`.
     pub freshness_lag_seconds: Option<i32>,
+    /// What this pipeline is for, as its author described it
+    /// (`0047_pipeline_description.sql`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// The full stored shape of an authored pipeline's definition, returned by
@@ -112,7 +122,10 @@ struct PipelineRow {
     source_asset_id: Option<String>,
     target_asset_id: Option<String>,
     schedule: String,
+    last_run_at: Option<OffsetDateTime>,
     next_run_at: Option<OffsetDateTime>,
+    freshness_lag_seconds: Option<i32>,
+    description: Option<String>,
 }
 
 /// A row shape for [`get_definition`], carrying the three columns migration
@@ -142,25 +155,26 @@ impl From<PipelineRow> for Pipeline {
             source_asset_id: row.source_asset_id,
             target_asset_id: row.target_asset_id,
             schedule: row.schedule,
-            // `last_run_at`/`sla_ok`/`freshness_lag_seconds` are deliberately
-            // not read from the row: the table's `NOT NULL DEFAULT` values
-            // (`now()` / `true` / `0`, `0007_pipelines.sql`) are legacy
-            // placeholders with no writer that ever updates them for an
-            // authored pipeline (the only post-insert write is `UPDATE ...
-            // SET status = $2`) — `WS4` executing authored pipelines and
-            // `WS5` defining SLAs are what would make them real. Surfacing
-            // the placeholder would read as a measurement, so these three
-            // are always `None` regardless of what is stored.
-            last_run_at: None,
+            // `last_run_at`/`freshness_lag_seconds` are read for real:
+            // `0048_pipeline_never_run.sql` dropped their `NOT NULL
+            // DEFAULT` (`now()` / `0`, `0007_pipelines.sql`), so a `NULL`
+            // here is now an honest "never ran" / "never measured", not a
+            // fabricated placeholder to hide. `sla_ok` is NOT read — no
+            // migration has touched its `NOT NULL DEFAULT true`, so every
+            // row would report "on SLA" — it stays a hardcoded `None`
+            // until `WS5`'s `dataset_sla` gives it real meaning.
+            last_run_at: row.last_run_at.map(iso_millis),
             next_run_at: row.next_run_at.map(iso_millis),
             sla_ok: None,
-            freshness_lag_seconds: None,
+            freshness_lag_seconds: row.freshness_lag_seconds,
+            description: row.description,
         }
     }
 }
 
 const PIPELINE_COLUMNS: &str = "id, name, kind, status, owner, source, target, connector_id, \
-     source_asset_id, target_asset_id, schedule, next_run_at";
+     source_asset_id, target_asset_id, schedule, last_run_at, next_run_at, \
+     freshness_lag_seconds, description";
 
 /// Optional narrowing for [`list_pipelines`] for tenant isolation: a caller
 /// must never see a pipeline outside its own tenant.
@@ -374,6 +388,8 @@ pub struct CreatePipelineInput {
     pub schedule: String,
     /// Owner; defaults to [`DEFAULT_OWNER`] when absent.
     pub owner: Option<String>,
+    /// What the pipeline is for, in the author's words (migration 0047).
+    pub description: Option<String>,
 }
 
 const DEFAULT_OWNER: &str = "Current user";
@@ -393,15 +409,18 @@ pub async fn create_pipeline(
     let source = format!("{}.{}", input.source_zone, input.source_table);
     let target = format!("{}.{}", input.target_zone, input.target_table);
     let owner = input.owner.as_deref().unwrap_or(DEFAULT_OWNER);
-    // `sla_ok`/`freshness_lag_seconds` are `NOT NULL` columns with no
-    // meaning yet (no writer ever updates them, see `Pipeline::from`'s doc
-    // comment) — `true`/`0` are legacy placeholders satisfying the schema,
-    // never surfaced to a caller.
+    // `sla_ok`, `last_run_at`, `freshness_lag_seconds` are deliberately
+    // absent from this INSERT's column list: `sla_ok` keeps its schema
+    // default (`NOT NULL DEFAULT true`, still a placeholder — see
+    // `Pipeline::from`'s doc comment); `last_run_at`/`freshness_lag_seconds`
+    // lost their defaults in `0048_pipeline_never_run.sql`, so omitting
+    // them here inserts `NULL` — a freshly authored pipeline has honestly
+    // never run, not a fabricated "just now".
     let transforms = serde_json::to_value(&input.transforms).unwrap_or(serde_json::Value::Null);
     let sql = format!(
         "INSERT INTO pipeline_definition (id, name, kind, status, owner, source, target, \
-         schedule, sla_ok, freshness_lag_seconds, incremental_column, fbic_enabled, transforms) \
-         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, true, 0, $8, $9, $10) \
+         schedule, description, incremental_column, fbic_enabled, transforms) \
+         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11) \
          RETURNING {PIPELINE_COLUMNS}"
     );
     let row: PipelineRow = sqlx::query_as(&sql)
@@ -412,6 +431,7 @@ pub async fn create_pipeline(
         .bind(&source)
         .bind(&target)
         .bind(&input.schedule)
+        .bind(&input.description)
         .bind(&input.incremental_column)
         .bind(input.fbic_enabled)
         .bind(&transforms)
@@ -483,6 +503,7 @@ mod tests {
             next_run_at: None,
             sla_ok: Some(true),
             freshness_lag_seconds: Some(0),
+            description: None,
         };
         let value = serde_json::to_value(&pipeline).unwrap();
         for key in [
@@ -505,12 +526,14 @@ mod tests {
     }
 
     #[test]
-    fn authored_pipelines_report_no_run_time_sla_or_freshness() {
-        // No writer updates `last_run_at`/`sla_ok`/`freshness_lag_seconds`
-        // after insert (WS1 finding J16), so `Pipeline::from` must ignore
-        // whatever the row happens to store and always report "not
-        // measured" — a fixture with plausible-looking real values proves
-        // that, rather than one that would pass by accident.
+    fn authored_pipeline_with_no_stored_run_reports_never_ran_and_no_sla() {
+        // `0048_pipeline_never_run.sql` dropped `last_run_at`/
+        // `freshness_lag_seconds`'s fabricated `now()`/`0` defaults, so a
+        // freshly authored row genuinely stores `NULL` for both — this
+        // fixture proves `Pipeline::from` reports that faithfully rather
+        // than substituting a placeholder. `sla_ok` still has no migration
+        // behind it (`WS5`), so it stays hardcoded `None` regardless of
+        // what the row would say.
         let row = PipelineRow {
             id: "pl-x".to_owned(),
             name: "n".to_owned(),
@@ -523,7 +546,10 @@ mod tests {
             source_asset_id: None,
             target_asset_id: None,
             schedule: "manual".to_owned(),
+            last_run_at: None,
             next_run_at: None,
+            freshness_lag_seconds: None,
+            description: None,
         };
         let pipeline = Pipeline::from(row);
         assert_eq!(pipeline.last_run_at, None);
@@ -537,6 +563,37 @@ mod tests {
         assert_eq!(value["lastRunAt"], serde_json::Value::Null);
         assert_eq!(value["slaOk"], serde_json::Value::Null);
         assert_eq!(value["freshnessLagSeconds"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn authored_pipeline_with_a_stored_run_reports_it_but_still_no_sla() {
+        // The mirror of the "never ran" fixture above: once something (a
+        // future `WS4` executor) has written a real `last_run_at`/
+        // `freshness_lag_seconds`, `Pipeline::from` must surface it — it is
+        // no longer a placeholder to override. `sla_ok` still is.
+        let ran_at = OffsetDateTime::from_unix_timestamp(1_735_689_600).unwrap();
+        let row = PipelineRow {
+            id: "pl-x".to_owned(),
+            name: "n".to_owned(),
+            kind: "batch".to_owned(),
+            status: "ready".to_owned(),
+            owner: "o".to_owned(),
+            source: "s".to_owned(),
+            target: "t".to_owned(),
+            connector_id: None,
+            source_asset_id: None,
+            target_asset_id: None,
+            schedule: "manual".to_owned(),
+            last_run_at: Some(ran_at),
+            next_run_at: None,
+            freshness_lag_seconds: Some(42),
+            description: Some("does a thing".to_owned()),
+        };
+        let pipeline = Pipeline::from(row);
+        assert_eq!(pipeline.last_run_at, Some(iso_millis(ran_at)));
+        assert_eq!(pipeline.sla_ok, None);
+        assert_eq!(pipeline.freshness_lag_seconds, Some(42));
+        assert_eq!(pipeline.description.as_deref(), Some("does a thing"));
     }
 
     #[test]

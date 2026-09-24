@@ -43,6 +43,7 @@ fn input() -> CreatePipelineInput {
         target_table: "orders_clean".to_owned(),
         schedule: "manual".to_owned(),
         owner: None,
+        description: None,
     }
 }
 

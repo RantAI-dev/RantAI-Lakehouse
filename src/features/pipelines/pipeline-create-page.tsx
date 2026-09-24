@@ -9,8 +9,17 @@ import { PageHeader } from "@/components/patterns/page-header"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
+import { Textarea } from "@/components/ui/textarea"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { withNotify } from "@/lib/notify"
 import {
   CAST_TYPES,
   FILTER_OPERATORS,
@@ -88,8 +97,13 @@ export function PipelineCreatePage() {
     (signal) => connectorService.listConnectors(signal),
     []
   )
-  const create = useServiceAction((signal, input: Parameters<typeof pipelineService.createPipeline>[0]) =>
-    pipelineService.createPipeline(input, signal)
+  const [description, setDescription] = React.useState("")
+  const create = useServiceAction(
+    withNotify(
+      { success: "Pipeline created", error: "Failed to create pipeline" },
+      (signal, input: Parameters<typeof pipelineService.createPipeline>[0]) =>
+        pipelineService.createPipeline(input, signal)
+    )
   )
 
   // The 400 body names the failing row as `transforms[<index>]` (see
@@ -142,6 +156,7 @@ export function PipelineCreatePage() {
       targetTable: targetTable.trim(),
       schedule: schedule.trim(),
       connectorId: connectorId || undefined,
+      description: description.trim() || undefined,
     })
     if (result) router.push("/pipelines")
   }
@@ -171,18 +186,35 @@ export function PipelineCreatePage() {
             <Field label="Pipeline name" className="sm:col-span-2">
               <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="orders_hourly_rollup" />
             </Field>
+            <Field label="Description" className="sm:col-span-2">
+              {/* Stored and shown on the pipeline's page, which used to
+                  display one fixed sentence for every pipeline. */}
+              <Textarea
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                rows={2}
+                placeholder="What this pipeline is for, and anything the next person should know."
+              />
+            </Field>
             <Field label="Kind">
-              <select
-                className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+              {/* The design system's Select, not a hand-styled native one:
+                  this was the only picker in the console that did not
+                  match the others. */}
+              <Select
                 value={kind}
-                onChange={(e) => setKind(e.target.value as PipelineKind)}
+                onValueChange={(v) => setKind((v ?? "batch") as PipelineKind)}
               >
-                {KIND_OPTIONS.map((k) => (
-                  <option key={k} value={k}>
-                    {k}
-                  </option>
-                ))}
-              </select>
+                <SelectTrigger>
+                  <SelectValue placeholder="Pick a kind" />
+                </SelectTrigger>
+                <SelectContent>
+                  {KIND_OPTIONS.map((k) => (
+                    <SelectItem key={k} value={k}>
+                      {k}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </Field>
             <Field label="Incremental column">
               <Input

@@ -6,6 +6,7 @@ import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/app-shell/app-sidebar";
 import { AppNavbar } from "@/components/app-shell/app-navbar";
 import { CopilotDock } from "@/features/copilot/copilot-dock";
+import { CopilotSidebar } from "@/features/copilot/copilot-sidebar";
 import { CopilotProvider } from "@/features/copilot/use-copilot";
 import { CommandPalette } from "@/components/command-palette";
 import { isPublicPath, useAuth } from "@/features/auth/auth-provider";
@@ -25,7 +26,7 @@ import { LoadingSkeleton } from "@/components/patterns/page-states";
  * console before `AuthProvider`'s redirect effect to `/login` has a
  * chance to run.
  */
-export function AppFrame({ children }: { children: React.ReactNode }) {
+export function AppFrame({ children }: Readonly<{ children: React.ReactNode }>) {
   const pathname = usePathname() ?? "/";
   if (isPublicPath(pathname)) return <>{children}</>;
 
@@ -38,7 +39,7 @@ export function AppFrame({ children }: { children: React.ReactNode }) {
   );
 }
 
-function AuthenticatedFrame({ children }: { children: React.ReactNode }) {
+function AuthenticatedFrame({ children }: Readonly<{ children: React.ReactNode }>) {
   const { status } = useAuth();
 
   if (status !== "authenticated") {
@@ -59,7 +60,15 @@ function AuthenticatedFrame({ children }: { children: React.ReactNode }) {
       <AppSidebar />
       <SidebarInset className="min-w-0 bg-muted/25">
         <AppNavbar />
-        <div className="flex-1 p-4 sm:p-5 lg:p-6">{children}</div>
+        <div className="flex flex-1 min-h-0 min-w-0">
+          {/* The Copilot dock is `fixed bottom-4`, so without this the
+              last thing on every page sits underneath it. Pages used to
+              add their own bottom spacing (or forget to). */}
+          <main className="flex-1 min-w-0 p-4 pb-24 sm:p-5 sm:pb-24 lg:p-6 lg:pb-28">
+            {children}
+          </main>
+          <CopilotSidebar />
+        </div>
         <CopilotDock />
       </SidebarInset>
       <CommandPalette />

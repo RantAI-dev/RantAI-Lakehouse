@@ -2,15 +2,25 @@
 
 import * as React from "react";
 import Image from "next/image";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Loader2 } from "lucide-react";
+import { Eye, EyeOff, Lock, Mail, TriangleAlert } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { Field, FieldLabel } from "@/components/ui/field";
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupButton,
+  InputGroupInput,
+} from "@/components/ui/input-group";
+import { Spinner } from "@/components/ui/spinner";
+import { Skeleton } from "@/components/ui/skeleton";
+import { ThemeToggle } from "@/components/theme-toggle";
 import * as authClient from "@/services/clients/auth";
+import { toServiceError } from "@/services/errors";
 import { useAuth } from "./auth-provider";
 import { ChangePasswordStep } from "./change-password-step";
+import { LoginHero } from "./login-hero";
 
 /**
  * Whether an SSO button should render at all.
@@ -31,19 +41,21 @@ import { ChangePasswordStep } from "./change-password-step";
  */
 const ssoEnabled = process.env.NEXT_PUBLIC_SSO_ENABLED === "true";
 
-function SsoButton() {
+function SsoButton({ disabled }: { disabled?: boolean }) {
   if (!ssoEnabled) return null;
   return (
     <>
-      <div className="relative my-2 flex items-center gap-3 text-xs text-muted-foreground">
-        <div className="h-px flex-1 bg-border" />
-        <span>or</span>
-        <div className="h-px flex-1 bg-border" />
+      <div className="flex items-center gap-3">
+        <span className="h-px flex-1 bg-border" />
+        <span className="text-xs text-muted-foreground">or</span>
+        <span className="h-px flex-1 bg-border" />
       </div>
       <Button
         type="button"
         variant="outline"
-        className="w-full"
+        size="lg"
+        disabled={disabled}
+        className="h-11 w-full"
         onClick={() => {
           // The authorization-code redirect itself is deliberately not
           // implemented here — `lakehouse-auth`'s `OidcAuthenticator` is a
@@ -81,6 +93,10 @@ export function LoginPage() {
   const [error, setError] = React.useState<string | null>(null);
   const [notice, setNotice] = React.useState<string | null>(null);
   const [pendingPasswordChange, setPendingPasswordChange] = React.useState(false);
+  const [showPassword, setShowPassword] = React.useState(false);
+  // Caps Lock silently breaks password entry more often than any other
+  // input mistake, and the field is masked so the user cannot see why.
+  const [capsLock, setCapsLock] = React.useState(false);
 
   // Already signed in (e.g. opened /login in a second tab) — bounce home
   // instead of showing the form again.
@@ -115,10 +131,21 @@ export function LoginPage() {
       }
       await refresh();
       router.replace(nextPathFromQuery());
-    } catch {
-      // One generic message regardless of cause (no such email vs. wrong
-      // password) — mirrors the backend's own non-enumeration guarantee.
-      setError("Invalid email or password.");
+    } catch (err) {
+      // Rejected credentials get ONE generic message regardless of cause
+      // (no such email vs. wrong password), mirroring the backend's own
+      // non-enumeration guarantee (see `routes/auth.rs`'s module doc).
+      //
+      // Everything else must NOT be flattened into that message: an
+      // unreachable API or a 5xx would otherwise read as "your password is
+      // wrong", sending users to reset a credential that was fine all
+      // along. `authClient.parse` already maps 401 → `permission_denied`.
+      const serviceError = toServiceError(err);
+      setError(
+        serviceError.code === "permission_denied"
+          ? "Invalid email or password."
+          : serviceError.message || "Could not sign in. Try again."
+      );
     } finally {
       setSubmitting(false);
     }
@@ -144,61 +171,183 @@ export function LoginPage() {
     );
   }
 
+  // While `/api/auth/me` is still in flight we do not yet know whether this
+  // visitor already has a session. Rendering the form now means anyone with
+  // a live cookie sees a sign-in prompt flash before the redirect above
+  // fires — so hold the column's shape with a skeleton instead.
+  const checkingSession = status === "loading";
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-muted/30 px-4">
-      <Card className="w-full max-w-sm">
-        <CardHeader className="items-center text-center">
-          <div className="relative mb-2 h-8 w-32">
-            <Image src="/logo-light.png" alt="Rantai Lake" fill sizes="128px" className="object-contain dark:hidden" priority />
-            <Image src="/logo-dark.png" alt="" fill sizes="128px" className="hidden object-contain dark:block" priority />
+    <div className="flex min-h-screen flex-col bg-background lg:flex-row">
+      <LoginHero />
+
+      <div className="flex flex-1 flex-col px-6 py-8 sm:px-12 lg:px-16 lg:py-10">
+        <header className="flex items-center justify-between">
+          <span className="flex items-center gap-2">
+            <span className="relative size-7">
+              <Image
+                src="/logo-light.png"
+                alt="Rantai Lake"
+                fill
+                sizes="28px"
+                className="object-contain dark:hidden"
+                priority
+              />
+              <Image
+                src="/logo-dark.png"
+                alt=""
+                fill
+                sizes="28px"
+                className="hidden object-contain dark:block"
+                priority
+              />
+            </span>
+            <span className="text-sm font-semibold">Rantai Lake</span>
+          </span>
+          <ThemeToggle />
+        </header>
+
+        <div className="flex flex-1 items-center justify-center py-12">
+          <div className="w-full max-w-[352px]">
+            <h1 className="text-3xl leading-[1.2] font-semibold tracking-[-0.02em] text-foreground">
+              Sign in to Rantai Lake
+            </h1>
+            <p className="mt-2 text-sm text-muted-foreground">
+              Use your account credentials to continue.
+            </p>
+
+            {checkingSession ? (
+              <div className="mt-8 flex flex-col gap-5" aria-label="Loading" role="status">
+                <Skeleton className="h-[68px] w-full" />
+                <Skeleton className="h-[68px] w-full" />
+                <Skeleton className="h-11 w-full" />
+              </div>
+            ) : (
+              <div className="mt-8 flex flex-col gap-5">
+                <form onSubmit={onSubmit} className="flex flex-col gap-5" noValidate>
+                  <Field data-invalid={!!error}>
+                    <FieldLabel htmlFor="login-email" className="text-sm">
+                      Email
+                    </FieldLabel>
+                    <InputGroup className="h-11">
+                      <InputGroupAddon className="pl-3">
+                        <Mail />
+                      </InputGroupAddon>
+                      <InputGroupInput
+                        id="login-email"
+                        type="email"
+                        autoComplete="email"
+                        autoFocus
+                        required
+                        placeholder="you@company.com"
+                        className="text-sm"
+                        aria-invalid={!!error}
+                        aria-describedby={error ? "login-error" : undefined}
+                        value={email}
+                        onChange={(e) => setEmail(e.target.value)}
+                        disabled={submitting}
+                      />
+                    </InputGroup>
+                  </Field>
+
+                  <Field data-invalid={!!error}>
+                    <FieldLabel htmlFor="login-password" className="text-sm">
+                      Password
+                    </FieldLabel>
+                    <InputGroup className="h-11">
+                      <InputGroupAddon className="pl-3">
+                        <Lock />
+                      </InputGroupAddon>
+                      <InputGroupInput
+                        id="login-password"
+                        type={showPassword ? "text" : "password"}
+                        autoComplete="current-password"
+                        required
+                        placeholder="••••••••"
+                        className="text-sm"
+                        aria-invalid={!!error}
+                        aria-describedby={error ? "login-error" : undefined}
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        disabled={submitting}
+                        // Read the modifier off real key events rather than
+                        // tracking CapsLock presses: this also catches the
+                        // case where it was already on before focus landed.
+                        onKeyDown={(e) => setCapsLock(e.getModifierState("CapsLock"))}
+                        onKeyUp={(e) => setCapsLock(e.getModifierState("CapsLock"))}
+                        onBlur={() => setCapsLock(false)}
+                      />
+                      <InputGroupAddon align="inline-end" className="pr-2">
+                        <InputGroupButton
+                          size="icon-sm"
+                          // Skipped in the tab order: between password and
+                          // submit, a reveal toggle is a detour for keyboard
+                          // users, who can still reach it via shift-tab.
+                          tabIndex={-1}
+                          disabled={submitting}
+                          onClick={() => setShowPassword((v) => !v)}
+                          aria-label={showPassword ? "Hide password" : "Show password"}
+                        >
+                          {showPassword ? <EyeOff /> : <Eye />}
+                        </InputGroupButton>
+                      </InputGroupAddon>
+                    </InputGroup>
+                    {capsLock ? (
+                      <p
+                        role="alert"
+                        className="flex items-center gap-1.5 text-sm text-amber-600 dark:text-amber-500"
+                      >
+                        <TriangleAlert className="size-3.5 shrink-0" aria-hidden />
+                        Caps Lock is on
+                      </p>
+                    ) : null}
+                  </Field>
+
+                  {notice ? (
+                    <p
+                      role="status"
+                      className="rounded-lg bg-emerald-500/10 px-3.5 py-2.5 text-sm text-emerald-600 dark:text-emerald-400"
+                    >
+                      {notice}
+                    </p>
+                  ) : null}
+
+                  {error ? (
+                    <p
+                      id="login-error"
+                      role="alert"
+                      className="rounded-lg bg-destructive/10 px-3.5 py-2.5 text-sm text-destructive"
+                    >
+                      {error}
+                    </p>
+                  ) : null}
+
+                  <Button
+                    type="submit"
+                    size="lg"
+                    className="h-11 w-full"
+                    disabled={submitting}
+                  >
+                    {submitting ? <Spinner /> : null}
+                    {submitting ? "Signing in…" : "Sign in"}
+                  </Button>
+                </form>
+
+                <SsoButton disabled={submitting} />
+              </div>
+            )}
           </div>
-          <CardTitle>Sign in</CardTitle>
-          <CardDescription>Sign in to your Rantai Lake workspace.</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <form onSubmit={onSubmit} className="flex flex-col gap-4">
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="login-email">Email</Label>
-              <Input
-                id="login-email"
-                type="email"
-                autoComplete="email"
-                required
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                disabled={submitting}
-              />
-            </div>
-            <div className="flex flex-col gap-1.5">
-              <Label htmlFor="login-password">Password</Label>
-              <Input
-                id="login-password"
-                type="password"
-                autoComplete="current-password"
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                disabled={submitting}
-              />
-            </div>
-            {notice ? (
-              <p role="status" className="text-sm text-emerald-600 dark:text-emerald-400">
-                {notice}
-              </p>
-            ) : null}
-            {error ? (
-              <p role="alert" className="text-sm text-destructive">
-                {error}
-              </p>
-            ) : null}
-            <Button type="submit" className="w-full" disabled={submitting}>
-              {submitting ? <Loader2 className="size-4 animate-spin" /> : null}
-              Sign in
-            </Button>
-          </form>
-          <SsoButton />
-        </CardContent>
-      </Card>
+        </div>
+
+        <footer className="flex flex-col gap-1 text-sm text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
+          <span>© {new Date().getFullYear()} Rantai Lake</span>
+          {/* Placeholder destination — point this at the docs site (or
+              wherever support lives) once that URL exists. */}
+          <Link href="#" className="transition-colors hover:text-foreground">
+            Documentation
+          </Link>
+        </footer>
+      </div>
     </div>
   );
 }

@@ -418,6 +418,14 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
 
 // ── Boards ──────────────────────────────────────────────────────────────
 
+/// Id of the built-in "Main" dashboard.
+///
+/// Its tiles are assembled from code, not stored, so it has no `bi_board`
+/// row until its layout is first saved — and that row exists only to carry
+/// the layout: [`list_boards`] leaves it out, so it never shows up as a
+/// second, user-made dashboard.
+pub const DEFAULT_BOARD_ID: &str = "default";
+
 const BOARD_COLS: &str = "id, name, layout_json, filters_json, public_token, embed_enabled, toString(created_at) AS created_at";
 
 fn parse_layout(s: &str) -> LayoutMap {
@@ -459,7 +467,10 @@ fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
     }
 }
 
-/// List every non-deleted board, oldest first. Ports `listBoards`.
+/// List every non-deleted user board, oldest first. Ports `listBoards`.
+///
+/// Excludes the [`DEFAULT_BOARD_ID`] layout row; read that with
+/// [`get_board`].
 ///
 /// # Errors
 ///
@@ -468,7 +479,10 @@ pub async fn list_boards(ch: &ChClient) -> Result<Vec<Board>, ChError> {
     ensure_bi_table(ch).await?;
     let rows = ch
         .rows(
-            &format!("SELECT {BOARD_COLS} FROM console.bi_board FINAL WHERE is_deleted = 0 ORDER BY created_at"),
+            &format!(
+                "SELECT {BOARD_COLS} FROM console.bi_board FINAL WHERE is_deleted = 0 AND id != {} ORDER BY created_at",
+                SqlLiteral::from(DEFAULT_BOARD_ID)
+            ),
             None,
         )
         .await?;

@@ -64,8 +64,9 @@ axum = { workspace = true }
 # correctly on its own, not only as part of the whole-workspace build.
 # `time`: `crate::bounded::run_with_budget` (WS2 §4) needs
 # `tokio::time::{timeout_at, Instant, sleep}` to bound per-table/per-namespace
-# Lakekeeper calls.
-tokio = { workspace = true, features = ["sync", "time"] }
+# Lakekeeper calls. `io-util`: `tokio::io::duplex` backs `routes::ai::stream_chat`'s
+# NDJSON progress pipe for `POST /api/ai/chat` (`stream: true`).
+tokio = { workspace = true, features = ["sync", "time", "io-util"] }
 tower = { workspace = true }
 tower-http = { workspace = true }
 reqwest = { workspace = true }
@@ -112,8 +113,10 @@ tiberius = { version = "0.12.3", default-features = false, features = ["tds73", 
 # `tiberius::Client::connect` takes a Tokio-`AsyncRead`/`AsyncWrite`
 # stream wrapped for the `futures`-crate traits tiberius itself uses
 # (tiberius's own doc comment, `src/lib.rs`'s "Connecting with Tokio"
-# example) -- `compat` is the feature gating that wrapper.
-tokio-util = { workspace = true, features = ["compat"] }
+# example) -- `compat` is the feature gating that wrapper. `io`:
+# `tokio_util::io::ReaderStream` turns `routes::ai::stream_chat`'s
+# `tokio::io::duplex` reader into the `POST /api/ai/chat` NDJSON body.
+tokio-util = { workspace = true, features = ["compat", "io"] }
 
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }

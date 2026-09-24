@@ -2,30 +2,26 @@
 
 import * as React from "react"
 import { PlusIcon } from "lucide-react"
-import { useRouter } from "next/navigation"
+import { DataTable } from "@/components/data-table/data-table"
+import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
+import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { CreateSheet } from "@/components/patterns/create-sheet"
 import { PageHeader } from "@/components/patterns/page-header"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
-import {
-  FilterSelect,
-  FilterToolbar,
-  SearchField,
-} from "@/components/patterns/filter-toolbar"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
-import { AutonomyBadge, StatusBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { useDataTable } from "@/hooks/use-data-table"
+import { filterDataClientSide } from "@/lib/data-table"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { formatPercent, formatTokens } from "@/lib/format"
-import { fmtMeasured } from "@/lib/measured"
+import { withNotify } from "@/lib/notify"
 import {
   AUTONOMY_LABEL,
-  ENTITY_STATUS_LABEL,
   type AutonomyLevel,
 } from "@/lib/status"
 import { agentService } from "@/services"
-import type { DigitalEmployee } from "@/services/contracts/agents"
+import { getEmployeeColumns } from "./employee-columns"
 
 const AUTONOMY_OPTIONS = (
   Object.keys(AUTONOMY_LABEL) as AutonomyLevel[]
@@ -34,43 +30,8 @@ const AUTONOMY_OPTIONS = (
 const selectClassName =
   "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
 
-const columns: ColumnDef<DigitalEmployee>[] = [
-  { key: "name", header: "Employee", render: (r) => (
-    <div><p className="font-medium">{r.name}</p><p className="text-xs text-muted-foreground">{r.purpose}</p></div>
-  )},
-  { key: "autonomy", header: "Autonomy", render: (r) => <AutonomyBadge level={r.autonomy} /> },
-  { key: "status", header: "Status", render: (r) => <StatusBadge status={r.status} /> },
-  { key: "budget", header: "Budget", render: (r) => {
-    // budgetSpent/budgetReserved are unmeasured (WS1 task 1.11) until WS7
-    // tracks spend per tool call — show a dash rather than a false 0/pct.
-    if (r.budgetSpent === null || r.budgetReserved === null) {
-      return (
-        <span className="tabular-nums">
-          — / {formatTokens(r.budgetLimit)}
-        </span>
-      )
-    }
-    const used = r.budgetSpent + r.budgetReserved
-    return (
-      <span className="tabular-nums">
-        {formatTokens(used)} / {formatTokens(r.budgetLimit)}{" "}
-        <span className="text-xs text-muted-foreground">
-          ({formatPercent(r.budgetLimit > 0 ? used / r.budgetLimit : 0)})
-        </span>
-      </span>
-    )
-  }},
-  { key: "success", header: "Success", render: (r) => fmtMeasured(r.successRate, formatPercent) },
-  { key: "approval", header: "Approval rate", render: (r) => fmtMeasured(r.approvalRate, formatPercent) },
-  { key: "owner", header: "Owner", render: (r) => r.owner },
-]
-
 export function EmployeesPage() {
-  const router = useRouter()
   const state = useService((s) => agentService.listEmployees(s), [])
-  const [search, setSearch] = React.useState("")
-  const [status, setStatus] = React.useState("all")
-  const [autonomy, setAutonomy] = React.useState("all")
   const [createOpen, setCreateOpen] = React.useState(false)
   const [name, setName] = React.useState("")
   const [purpose, setPurpose] = React.useState("")
@@ -78,25 +39,47 @@ export function EmployeesPage() {
   const [allowedTools, setAllowedTools] = React.useState("")
   const [dataScope, setDataScope] = React.useState("")
   const [budgetLimit, setBudgetLimit] = React.useState("")
-  const create = useServiceAction(
-    (signal, input: Parameters<typeof agentService.createEmployee>[0]) =>
-      agentService.createEmployee(input, signal)
+
+  const columns = React.useMemo(() => getEmployeeColumns(), [])
+
+  const tableUrlState = useTableUrlState()
+  const filteredData = React.useMemo(
+    () =>
+      filterDataClientSide(state.data ?? [], {
+        search: tableUrlState.search,
+        searchFields: [
+          (r) => r.name,
+          (r) => r.purpose,
+          (r) => r.owner,
+        ],
+        filters: tableUrlState.filters,
+        joinOperator: tableUrlState.joinOperator,
+      }),
+    [state.data, tableUrlState.search, tableUrlState.filters, tableUrlState.joinOperator]
   )
 
-  const statusOptions = React.useMemo(() => {
-    const present = new Set(state.data?.map((r) => r.status) ?? [])
-    return [...present].map((s) => ({ value: s, label: ENTITY_STATUS_LABEL[s] }))
-  }, [state.data])
+  const { table } = useDataTable({
+    data: filteredData,
+    columns,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/agents/employees",
+    initialState: {
+      columnPinning: { right: ["actions"] },
+    },
+    getRowId: (row) => row.id,
+  })
 
-  const filtered = React.useMemo(() => {
-    const q = search.trim().toLowerCase()
-    return (state.data ?? []).filter((r) => {
-      if (status !== "all" && r.status !== status) return false
-      if (autonomy !== "all" && r.autonomy !== autonomy) return false
-      if (!q) return true
-      return [r.name, r.purpose, r.owner].some((v) => v.toLowerCase().includes(q))
-    })
-  }, [state.data, search, status, autonomy])
+  const create = useServiceAction(
+    withNotify(
+      { success: "Employee created", error: "Failed to create employee" },
+      (signal, input: Parameters<typeof agentService.createEmployee>[0]) =>
+        agentService.createEmployee(input, signal)
+    )
+  )
 
   function resetForm() {
     setName("")
@@ -149,36 +132,17 @@ export function EmployeesPage() {
           </Button>
         }
       />
-      <FilterToolbar>
-        <SearchField
-          value={search}
-          onChange={setSearch}
-          placeholder="Search name, purpose, owner..."
-        />
-        <FilterSelect
-          value={status}
-          onChange={setStatus}
-          options={statusOptions}
-          allLabel="All statuses"
-          ariaLabel="Filter by status"
-        />
-        <FilterSelect
-          value={autonomy}
-          onChange={setAutonomy}
-          options={AUTONOMY_OPTIONS}
-          allLabel="All autonomy levels"
-          ariaLabel="Filter by autonomy level"
-        />
-      </FilterToolbar>
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
       {state.status === "success" ? (
-        <DataTable
-          columns={columns}
-          rows={filtered}
-          rowKey={(r) => r.id}
-          onRowClick={(r) => router.push(`/agents/employees/${r.id}`)}
-        />
+        <div className="space-y-4">
+          <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
+            <DataTableSearch placeholder="Search employees..." />
+          </DataTableAdvancedToolbar>
+          <div className="rounded-md border">
+            <DataTable table={table} />
+          </div>
+        </div>
       ) : null}
       <CreateSheet
         open={createOpen}

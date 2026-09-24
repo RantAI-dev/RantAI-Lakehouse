@@ -268,7 +268,19 @@ fn outcome_of(outcome: &str) -> &'static str {
 /// degrades to the pre-fix `Dagster`-only view, matching `quality`'s and
 /// `classification`'s same-shaped gap fixes.
 async fn audit(dagster: &DgClient, pg: Option<&PgPool>) -> Result<Value, GovError> {
-    let runs = dagster.list_runs(50).await?;
+    // Dagster is optional here. It used to be required, so with no
+    // orchestrator reachable — which is every local stack, since compose
+    // has no Dagster service — the whole audit trail answered 503 even
+    // though the console's own events live in Postgres and were right
+    // there. Losing the pipeline half of the trail is a gap; losing all
+    // of it is a broken page.
+    let runs = match dagster.list_runs(50).await {
+        Ok(runs) => runs,
+        Err(err) => {
+            tracing::warn!(%err, "audit: no pipeline history (Dagster unreachable)");
+            Vec::new()
+        }
+    };
     let mut audit: Vec<Value> = runs
         .iter()
         .map(|r| {

@@ -177,6 +177,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
 
     // ── Catalog: seeded Analyst permission `catalog:read`. ───────────────
     ("GET", "/api/catalog",       Policy::RequiresPermission("catalog:read")),
+    ("GET", "/api/catalog/query", Policy::RequiresPermission("catalog:read")),
     ("GET", "/api/catalog/{id}",  Policy::RequiresPermission("catalog:read")),
 
     // ── Catalog annotations (WS2 §13): console-only owner/steward/tags/
@@ -295,6 +296,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/query/run",            Policy::RequiresPermission("query:read")),
     ("POST", "/api/query/estimate",       Policy::RequiresPermission("query:read")),
     ("GET",  "/api/query/saved",          Policy::RequiresPermission("query:read")),
+    ("POST", "/api/query/saved",          Policy::RequiresPermission("query:read")),
     ("GET",  "/api/query/history",        Policy::RequiresPermission("query:read")),
     ("GET",  "/api/query/run/{id}/download", Policy::RequiresPermission("query:read")),
     ("GET",  "/api/query/scheduling",     Policy::RequiresPermission("query:read")),
@@ -325,6 +327,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     //    it in the seed (Platform Admin's `*:*` still satisfies it). ──────
     ("GET",    "/api/dashboard",              Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/specs/preview", Policy::RequiresPermission("dashboard:read")),
     ("POST",   "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:write")),
     ("PUT",    "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:write")),
     ("DELETE", "/api/dashboard/specs",        Policy::RequiresPermission("dashboard:write")),
@@ -346,6 +349,7 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/ai/tool",             Policy::RequiresAuth),
     ("GET",    "/api/ai/sessions",       Policy::RequiresAuth),
     ("POST",   "/api/ai/sessions",       Policy::RequiresAuth),
+    ("PATCH",  "/api/ai/sessions",       Policy::RequiresAuth),
     ("DELETE", "/api/ai/sessions",       Policy::RequiresAuth),
     ("GET",  "/api/ai/build-status",     Policy::RequiresAuth),
 

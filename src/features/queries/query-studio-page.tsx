@@ -1,24 +1,23 @@
 "use client"
 
 import * as React from "react"
+
 import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState } from "@/components/patterns/page-states"
-import { SectionCard } from "@/components/patterns/section-card"
-import { Button } from "@/components/ui/button"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { Textarea } from "@/components/ui/textarea"
-import { SqlEditor } from "@/components/sql-editor"
-import { useService, useServiceAction } from "@/hooks/use-service"
+import { Button } from "@/components/ui/button"
+import { useService } from "@/hooks/use-service"
 import { insertAsOfClause } from "@/lib/snapshot-picker"
-import { lakehouseService, queryService } from "@/services"
-import { askAgentSql, type AgentQueryResult } from "@/services/clients/agent-client"
-import type { QueryEngine } from "@/services/contracts/queries"
+import { lakehouseService } from "@/services"
 import { HistoryQuickList, SavedQuickList } from "./query-context-lists"
+import { NaturalLanguagePanel } from "./nl-panel"
 import { QueryResultsSection } from "./query-results-section"
 import { QueryStudioTabs } from "./query-studio-tabs"
-
-const STARTER_SQL = "-- Write SQL here, or generate it from a question"
+import { QueryTransparencyPanel } from "./query-transparency-panel"
+import { SaveQuerySheet } from "./save-query-sheet"
+import { SqlPanel } from "./sql-panel"
+import { useQueryStudio } from "./use-query-studio"
 
 /**
  * Iceberg time-travel controls: the user picks a namespace, then a table
@@ -123,72 +122,9 @@ function IcebergTimeTravelControls({
 
 /** Query Studio: natural-language ↔ SQL workspace with execution transparency. */
 export function QueryStudioPage() {
-  const [tab, setTab] = React.useState("nl")
-  const [question, setQuestion] = React.useState("")
-  const [sql, setSql] = React.useState(STARTER_SQL)
-  const [engine, setEngine] = React.useState<QueryEngine>("clickhouse")
-
-  const generateAct = useServiceAction((signal, q: string) =>
-    queryService.generateSql(q, signal)
-  )
-  const runAct = useServiceAction((signal, s: string, eng: QueryEngine) =>
-    queryService.run(s, { engine: eng }, signal)
-  )
-  const savedState = useService((s) => queryService.listSaved(s), [])
-
-  // Handoff from Saved Queries: /query-studio?saved=<id> loads that SQL.
-  // Read from window.location to avoid a useSearchParams Suspense boundary.
-  const appliedSavedRef = React.useRef(false)
-  React.useEffect(() => {
-    if (appliedSavedRef.current || savedState.status !== "success") return
-    const savedId = new URLSearchParams(window.location.search).get("saved")
-    if (!savedId) {
-      appliedSavedRef.current = true
-      return
-    }
-    const match = savedState.data.find((q) => q.id === savedId)
-    if (match) {
-      setSql(match.sql)
-      setTab("sql")
-    }
-    appliedSavedRef.current = true
-  }, [savedState])
-
-  async function handleGenerate() {
-    const out = await generateAct.run(question)
-    if (out) {
-      setSql(out.sql)
-      setTab("sql")
-    }
-  }
-
-  // Agentic ask: NL → generate SQL → RUN → self-correct on error →
-  // explain the result. One button, the whole loop runs server-side (/api/agent/query).
-  const [agentBusy, setAgentBusy] = React.useState(false)
-  const [agentResult, setAgentResult] = React.useState<AgentQueryResult | null>(null)
-  const [agentError, setAgentError] = React.useState<string | null>(null)
-  async function handleAsk() {
-    setAgentBusy(true)
-    setAgentError(null)
-    setAgentResult(null)
-    try {
-      const out = await askAgentSql(question)
-      setAgentResult(out)
-      setSql(out.sql) // load the final SQL into the editor for review/tweaking
-    } catch (e) {
-      setAgentError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setAgentBusy(false)
-    }
-  }
-
-  function loadSql(next: string) {
-    setSql(next)
-    setTab("sql")
-  }
-
-  const running = runAct.status === "pending"
-  const generating = generateAct.status === "pending"
+  // All the state lives in the hook; this file is the layout.
+  const studio = useQueryStudio()
+  const [saveOpen, setSaveOpen] = React.useState(false)
 
   return (
     <div className="flex flex-col gap-4">
@@ -199,139 +135,62 @@ export function QueryStudioPage() {
       <QueryStudioTabs />
       <div className="grid gap-4 xl:grid-cols-[1fr_320px]">
         <div className="min-w-0 space-y-4">
-          <Tabs value={tab} onValueChange={(v) => setTab(String(v))}>
+          <Tabs
+            value={studio.tab}
+            onValueChange={(v) => studio.setTab(v === "sql" ? "sql" : "nl")}
+          >
             <TabsList>
               <TabsTrigger value="nl">Natural language</TabsTrigger>
               <TabsTrigger value="sql">SQL</TabsTrigger>
             </TabsList>
-            <TabsContent value="nl" className="mt-3 space-y-3">
-              <Textarea
-                value={question}
-                onChange={(e) => setQuestion(e.target.value)}
-                rows={4}
-                placeholder="e.g. What was revenue by region last quarter?"
-                aria-label="Natural language question"
-              />
-              <div className="flex items-center gap-3">
-                <Button
-                  size="sm"
-                  onClick={handleAsk}
-                  disabled={agentBusy || !question.trim()}
-                >
-                  {agentBusy ? "Agent working…" : "✦ Ask (agentic)"}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={handleGenerate}
-                  disabled={generating || !question.trim()}
-                >
-                  {generating ? "Generating…" : "Generate SQL only"}
-                </Button>
-                {agentError ? (
-                  <p className="text-xs text-destructive">{agentError}</p>
-                ) : generateAct.status === "error" ? (
-                  <p className="text-xs text-destructive">{generateAct.error.message}</p>
-                ) : null}
-              </div>
-
-              {/* Agentic result: NL answer + step trace (plan→act→correct) + preview */}
-              {agentResult ? (
-                <SectionCard title="Agent answer">
-                  <p className="text-sm">{agentResult.answer}</p>
-                  <p className="mt-2 text-xs text-muted-foreground">
-                    {agentResult.rowCount} rows · final SQL loaded into the editor.
-                  </p>
-                  <details className="mt-3">
-                    <summary className="cursor-pointer text-xs font-medium text-muted-foreground">
-                      Agent trace ({agentResult.steps.length} steps)
-                    </summary>
-                    <ol className="mt-2 space-y-1 text-xs text-muted-foreground">
-                      {agentResult.steps.map((s, i) => (
-                        <li key={i}>
-                          <span className="font-mono text-foreground">{s.step}</span>: {s.detail}
-                        </li>
-                      ))}
-                    </ol>
-                  </details>
-                  {agentResult.rows.length ? (
-                    <div className="mt-3 overflow-x-auto rounded-md border">
-                      <table className="w-full text-xs">
-                        <thead>
-                          <tr>
-                            {agentResult.columns.map((c) => (
-                              <th key={c} className="border-b px-2 py-1 text-left font-medium">{c}</th>
-                            ))}
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {agentResult.rows.slice(0, 10).map((r, i) => (
-                            <tr key={i}>
-                              {agentResult.columns.map((c) => (
-                                <td key={c} className="border-b px-2 py-1 font-mono">
-                                  {String((r as Record<string, unknown>)[c] ?? "")}
-                                </td>
-                              ))}
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  ) : null}
-                </SectionCard>
-              ) : null}
-
-              {generateAct.data ? (
-                <SectionCard title="Explanation">
-                  <p className="text-sm">{generateAct.data.explanation}</p>
-                  {generateAct.data.assumptions.length ? (
-                    <ul className="mt-2 list-disc pl-5 text-sm text-muted-foreground">
-                      {generateAct.data.assumptions.map((a) => (
-                        <li key={a}>{a}</li>
-                      ))}
-                    </ul>
-                  ) : null}
-                </SectionCard>
-              ) : null}
+            <TabsContent value="nl" className="mt-3">
+              <NaturalLanguagePanel studio={studio} />
             </TabsContent>
             <TabsContent value="sql" className="mt-3 space-y-3">
-              <SqlEditor value={sql} onChange={setSql} />
-              <div className="flex flex-wrap items-center gap-2">
-                <Button
-                  size="sm"
-                  onClick={() => void runAct.run(sql, engine)}
-                  disabled={running || !sql.trim()}
-                >
-                  {running ? "Running…" : "Run query"}
-                </Button>
-                <Select value={engine} onValueChange={(v) => setEngine((v as QueryEngine) || "clickhouse")}>
-                  <SelectTrigger size="sm">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="clickhouse">ClickHouse</SelectItem>
-                    <SelectItem value="trino">Trino</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-              {engine === "trino" ? (
-                <IcebergTimeTravelControls sql={sql} onApply={setSql} />
-              ) : null}
+              <SqlPanel studio={studio} onSave={() => setSaveOpen(true)} />
+              {/*
+               * Iceberg time-travel: inserts a `FOR VERSION AS OF` clause
+               * into the SQL text. Kept unconditional even when the
+               * engine picker (`SqlPanel`) is set to ClickHouse — the
+               * clause is meaningless there, so running it is on the
+               * author, the same way writing any Trino-only syntax into
+               * the editor is.
+               */}
+              <IcebergTimeTravelControls sql={studio.sql} onApply={studio.setSql} />
             </TabsContent>
           </Tabs>
-          {runAct.status === "error" ? (
+          {studio.runAct.status === "error" ? (
             <ErrorState
-              error={runAct.error}
-              onRetry={() => void runAct.run(sql, engine)}
+              error={studio.runAct.error}
+              onRetry={() => void studio.runQuery()}
             />
           ) : null}
-          {runAct.data ? <QueryResultsSection result={runAct.data} /> : null}
+          {studio.runAct.data ? (
+            <QueryResultsSection result={studio.runAct.data} />
+          ) : null}
         </div>
         <div className="space-y-3">
-          <SavedQuickList state={savedState} onLoadSql={loadSql} />
-          <HistoryQuickList onLoadSql={loadSql} />
+          <QueryTransparencyPanel
+            state={studio.estimateAct}
+            estimatable={studio.estimatable}
+            onRetry={studio.reEstimate}
+          />
+          <SavedQuickList state={studio.savedState} onLoadSql={studio.loadSql} />
+          <HistoryQuickList
+            state={studio.historyState}
+            onLoadSql={studio.loadSql}
+          />
         </div>
       </div>
+
+      <SaveQuerySheet
+        open={saveOpen}
+        onOpenChange={setSaveOpen}
+        sql={studio.sql}
+        saving={studio.saveAct.status === "pending"}
+        error={studio.saveAct.error?.message ?? null}
+        onSave={studio.save}
+      />
     </div>
   )
 }

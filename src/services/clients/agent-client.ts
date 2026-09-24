@@ -20,6 +20,21 @@ export type AgentQueryResult = {
   steps: AgentStep[];
 };
 
+/**
+ * One readable sentence out of the three fields the route can send.
+ *
+ * `detail` alone was being shown, which for a transport failure is just
+ * "error sending request for url (…)" — true, but it never says what the
+ * user is looking at or what to do about it.
+ */
+function agentErrorMessage(json: unknown): string {
+  const body = (json ?? {}) as { error?: string; detail?: string; hint?: string };
+  const parts = [body.error, body.detail, body.hint].filter(
+    (part): part is string => typeof part === "string" && part.trim().length > 0
+  );
+  return parts.length > 0 ? parts.join(" — ") : "the agent failed";
+}
+
 export async function askAgentSql(question: string, signal?: AbortSignal): Promise<AgentQueryResult> {
   const res = await apiFetch("/api/agent/query", {
     method: "POST",
@@ -29,7 +44,7 @@ export async function askAgentSql(question: string, signal?: AbortSignal): Promi
   });
   const json = await res.json();
   if (!res.ok) {
-    throw new ServiceError("unavailable", json?.detail ?? json?.hint ?? json?.error ?? "Agent failed");
+    throw new ServiceError("unavailable", agentErrorMessage(json));
   }
   return json as AgentQueryResult;
 }

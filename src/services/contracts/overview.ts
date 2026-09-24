@@ -31,7 +31,9 @@ export type OverviewSummary = {
   policyViolations7d: Measured
   pendingApprovals: Measured
   agents: { activeRuns: Measured; budgetUsedRate: Measured }
-  services: { healthy: Measured; degraded: Measured; unhealthy: Measured }
+  // `healthy`/`unhealthy` are real probe counts; the API has
+  // no "degraded" probe state (only ok/not-ok), so it always reports 0.
+  services: { healthy: number; degraded: number; unhealthy: number }
 }
 
 export type ActivityCategory =

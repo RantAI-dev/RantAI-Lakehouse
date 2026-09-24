@@ -1,5 +1,6 @@
 import type {
   QueryService,
+  SaveQueryInput,
   QueryResult,
   QueryEstimate,
   SavedQuery,
@@ -84,6 +85,9 @@ export const clickhouseQueryService: QueryService = {
   // ── real (Postgres) ────────────────────────────────────────────────────
   listSaved(signal) {
     return get<SavedQuery[]>("/api/query/saved", signal);
+  },
+  saveQuery(input: SaveQueryInput, signal) {
+    return postJson<SavedQuery>("/api/query/saved", input, signal);
   },
   listHistory(signal) {
     return get<QueryHistoryItem[]>("/api/query/history", signal);

@@ -1,57 +1,28 @@
 "use client"
 
 import * as React from "react"
-import { PageHeader } from "@/components/patterns/page-header"
-import { DataTable, type ColumnDef } from "@/components/patterns/data-table"
+import { DataTable } from "@/components/data-table/data-table"
+import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
+import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
-import {
-  FilterSelect,
-  FilterToolbar,
-  SearchField,
-} from "@/components/patterns/filter-toolbar"
 import { MetadataList } from "@/components/patterns/metadata-list"
+import { PageHeader } from "@/components/patterns/page-header"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { OutcomeBadge, Pill } from "@/components/patterns/status-badge"
+import { useDataTable } from "@/hooks/use-data-table"
 import { useService } from "@/hooks/use-service"
-import { formatCost, formatDateTime, formatRelativeTime } from "@/lib/format"
+import { useTableUrlState } from "@/hooks/use-table-url-state"
+import { filterDataClientSide } from "@/lib/data-table"
+import { formatCost, formatDateTime } from "@/lib/format"
 import {
   ACTOR_KIND_LABEL,
-  AUDIT_OUTCOME_LABEL,
   ENGINE_CATEGORY_LABEL,
-  type ActorKind,
-  type AuditOutcome,
 } from "@/lib/status"
 import { governanceService } from "@/services"
 import type { AuditEvent } from "@/services/contracts/governance"
+import { getAuditColumns } from "./audit-columns"
 
-const ACTOR_KIND_OPTIONS = (Object.keys(ACTOR_KIND_LABEL) as ActorKind[]).map(
-  (k) => ({ value: k, label: ACTOR_KIND_LABEL[k] })
-)
-
-const OUTCOME_OPTIONS = (Object.keys(AUDIT_OUTCOME_LABEL) as AuditOutcome[]).map(
-  (o) => ({ value: o, label: AUDIT_OUTCOME_LABEL[o] })
-)
-
-const columns: ColumnDef<AuditEvent>[] = [
-  { key: "at", header: "When", render: (r) => formatRelativeTime(r.at) },
-  { key: "actor", header: "Actor", render: (r) => (
-    <div>
-      <p>{r.actor}</p>
-      <p className="text-xs text-muted-foreground">
-        {ACTOR_KIND_LABEL[r.actorKind]}
-        {r.delegatedActor ? ` · on behalf of ${r.delegatedActor}` : ""}
-      </p>
-    </div>
-  )},
-  { key: "tenant", header: "Tenant", className: "font-mono text-xs", render: (r) => r.tenant },
-  { key: "action", header: "Action", render: (r) => r.action },
-  { key: "resource", header: "Resource", render: (r) => r.resource },
-  { key: "outcome", header: "Outcome", render: (r) => <OutcomeBadge outcome={r.outcome} /> },
-  { key: "policy", header: "Policy", render: (r) => r.policyDecision },
-  { key: "cost", header: "Cost", render: (r) => (r.actualCost != null ? formatCost(r.actualCost) : "—") },
-]
-
-function EventDetail({ event }: { event: AuditEvent }) {
+function EventDetail({ event }: { readonly event: AuditEvent }) {
   return (
     <>
       <div className="flex flex-wrap items-center gap-2">
@@ -113,10 +84,8 @@ function EventDetail({ event }: { event: AuditEvent }) {
 
 export function AuditPage() {
   const state = useService((s) => governanceService.listAudit(s), [])
-  const [search, setSearch] = React.useState("")
-  const [actorKind, setActorKind] = React.useState("all")
-  const [outcome, setOutcome] = React.useState("all")
   const [selected, setSelected] = React.useState<AuditEvent | null>(null)
+  const tableUrlState = useTableUrlState()
 
   // Correlate ?event=<id> links from other pages: auto-open the drawer once
   // the list has loaded. Read via window.location to stay build-safe.
@@ -129,17 +98,47 @@ export function AuditPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.status])
 
-  const filtered = React.useMemo(() => {
-    const q = search.trim().toLowerCase()
-    return (state.data ?? []).filter((r) => {
-      if (actorKind !== "all" && r.actorKind !== actorKind) return false
-      if (outcome !== "all" && r.outcome !== outcome) return false
-      if (!q) return true
-      return [r.actor, r.action, r.resource].some((v) =>
-        v.toLowerCase().includes(q)
-      )
+  const columns = React.useMemo(
+    () => getAuditColumns({ onSelect: setSelected }),
+    []
+  )
+
+  const filteredData = React.useMemo(() => {
+    if (state.status !== "success" || !state.data) return []
+    return filterDataClientSide(state.data, {
+      search: tableUrlState.search,
+      searchFields: [
+        (e) => e.actor,
+        (e) => e.action,
+        (e) => e.resource,
+        (e) => e.tenant,
+        (e) => e.policyDecision,
+      ],
+      filters: tableUrlState.filters,
+      joinOperator: tableUrlState.joinOperator,
     })
-  }, [state.data, search, actorKind, outcome])
+  }, [
+    state.status,
+    state.data,
+    tableUrlState.search,
+    tableUrlState.filters,
+    tableUrlState.joinOperator,
+  ])
+
+  const { table } = useDataTable({
+    data: filteredData,
+    columns,
+    enableAdvancedFilter: true,
+    paginationMode: "infinite",
+    manualPagination: false,
+    manualSorting: false,
+    manualFiltering: true,
+    persistKey: "/audit",
+    initialState: {
+      sorting: [{ id: "at", desc: true }],
+      columnPinning: { right: ["actions"] },
+    },
+  })
 
   return (
     <div className="flex flex-col gap-4">
@@ -147,36 +146,16 @@ export function AuditPage() {
         title="Audit"
         description="Immutable events with actor chains, policy decisions, cost, and approvals."
       />
-      <FilterToolbar>
-        <SearchField
-          value={search}
-          onChange={setSearch}
-          placeholder="Search actor, action, resource..."
-        />
-        <FilterSelect
-          value={actorKind}
-          onChange={setActorKind}
-          options={ACTOR_KIND_OPTIONS}
-          allLabel="All actor kinds"
-          ariaLabel="Filter by actor kind"
-        />
-        <FilterSelect
-          value={outcome}
-          onChange={setOutcome}
-          options={OUTCOME_OPTIONS}
-          allLabel="All outcomes"
-          ariaLabel="Filter by outcome"
-        />
-      </FilterToolbar>
       {state.status === "loading" ? <LoadingSkeleton /> : null}
-      {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
+      {state.status === "error" ? (
+        <ErrorState error={state.error} onRetry={state.reload} />
+      ) : null}
       {state.status === "success" ? (
-        <DataTable
-          columns={columns}
-          rows={filtered}
-          rowKey={(r) => r.id}
-          onRowClick={setSelected}
-        />
+        <DataTable table={table}>
+          <DataTableAdvancedToolbar table={table}>
+            <DataTableSearch placeholder="Search actor, action, resource, tenant…" />
+          </DataTableAdvancedToolbar>
+        </DataTable>
       ) : null}
       <DetailDrawer
         open={selected != null}
