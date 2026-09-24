@@ -507,7 +507,7 @@ mod run_sql_delegation {
             .mount(server)
             .await;
         Mock::given(method("POST"))
-            .and(body_string_contains("replaceRegexpAll"))
+            .and(body_string_contains("replaceRegexpOne"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "meta": [
                     {"name": "id", "type": "UInt64"},
@@ -572,7 +572,7 @@ mod run_sql_delegation {
         assert!(
             requests
                 .iter()
-                .any(|r| String::from_utf8_lossy(&r.body).contains("replaceRegexpAll")),
+                .any(|r| String::from_utf8_lossy(&r.body).contains("replaceRegexpOne")),
             "expected the ACTUAL query ClickHouse received to be the rewritten/masked form, \
              never the original literal SQL — this is what closes the divergent-guard gap \
              (WS7 plan §0 item 7)"

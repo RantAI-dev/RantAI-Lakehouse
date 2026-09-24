@@ -845,8 +845,11 @@ fn substitute_table_factor(
 
 /// Builds the derived table's own SQL text — `SELECT` the projections,
 /// `FROM` the table, an optional `WHERE` filter — with a masked column
-/// wrapped in a `replaceRegexpAll(toString(...), '.*', '***') AS ...`
-/// call. This is the ONLY place a masked column's raw name and a row
+/// wrapped in a `replaceRegexpOne(toString(...), '(?s)^.*$', '***') AS ...`
+/// call: one anchored whole-value match, so a value becomes exactly
+/// `***` (and `NULL` stays `NULL`). An earlier `replaceRegexpAll(..., '.*',
+/// ...)` also matched the empty string after the value in `ClickHouse`
+/// and produced `******`. This is the ONLY place a masked column's raw name and a row
 /// filter are
 /// composed into SQL text — both are re-parsed immediately afterward
 /// (`substitute_table_factor`'s own parse of `derived_sql`), so a
@@ -875,7 +878,7 @@ fn build_masked_filtered_select(
         })?;
         if mask.iter().any(|m| m.eq_ignore_ascii_case(col)) {
             projections.push(format!(
-                "replaceRegexpAll(toString(`{safe}`), '.*', '***') AS `{safe}`"
+                "replaceRegexpOne(toString(`{safe}`), '(?s)^.*$', '***') AS `{safe}`"
             ));
         } else {
             projections.push(format!("`{safe}`"));
@@ -1261,7 +1264,7 @@ mod table_substitution {
     fn assert_only_wrapped_reads(sql: &str) {
         let out = substituted(sql);
         assert!(
-            out.contains("replaceRegexpAll(toString(`email`), '.*', '***') AS `email`"),
+            out.contains("replaceRegexpOne(toString(`email`), '(?s)^.*$', '***') AS `email`"),
             "{out}"
         );
         assert!(out.contains("WHERE tenant_id = 'tenant-a'"), "{out}");
@@ -1300,7 +1303,7 @@ mod table_substitution {
             "SELECT o.id FROM silver.orders_enriched o JOIN silver.customers c ON c.email = o.customer_email",
         );
         assert!(
-            out.contains("replaceRegexpAll(toString(`email`), '.*', '***') AS `email`"),
+            out.contains("replaceRegexpOne(toString(`email`), '(?s)^.*$', '***') AS `email`"),
             "{out}"
         );
     }
@@ -1311,7 +1314,7 @@ mod table_substitution {
             "SELECT a.id FROM silver.customers a JOIN silver.customers b ON a.email = b.email",
         );
         assert_eq!(
-            out.matches("replaceRegexpAll(toString(`email`)").count(),
+            out.matches("replaceRegexpOne(toString(`email`)").count(),
             2,
             "{out}"
         );
@@ -1337,7 +1340,7 @@ mod table_substitution {
         )
         .unwrap();
         assert_eq!(
-            out.matches("replaceRegexpAll(toString(`email`)").count(),
+            out.matches("replaceRegexpOne(toString(`email`)").count(),
             2,
             "{out}"
         );
@@ -2512,7 +2515,7 @@ mod enforce_tests {
             &NoViews,
         )
         .unwrap();
-        assert!(out.contains("replaceRegexpAll(toString(`email`)"));
+        assert!(out.contains("replaceRegexpOne(toString(`email`)"));
     }
 
     #[test]

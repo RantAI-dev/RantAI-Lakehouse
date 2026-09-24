@@ -328,7 +328,7 @@ mod run_spec_sql_enforcement {
             .mount(server)
             .await;
         Mock::given(method("POST"))
-            .and(body_string_contains("replaceRegexpAll"))
+            .and(body_string_contains("replaceRegexpOne"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "meta": [
                     {"name": "id", "type": "UInt64"},
@@ -396,7 +396,7 @@ mod run_spec_sql_enforcement {
             requests
                 .iter()
                 .any(|r| String::from_utf8_lossy(&r.body)
-                    .contains("replaceRegexpAll(toString(`email`)")),
+                    .contains("replaceRegexpOne(toString(`email`)")),
             "expected ClickHouse to receive the masked/rewritten query, never the raw one"
         );
         Ok(())

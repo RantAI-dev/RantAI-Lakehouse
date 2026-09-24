@@ -1737,7 +1737,7 @@ mod tests {
                 .mount(server)
                 .await;
             Mock::given(method("POST"))
-                .and(body_string_contains("replaceRegexpAll"))
+                .and(body_string_contains("replaceRegexpOne"))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "meta": [
                         {"name": "id", "type": "UInt64"},
@@ -1755,9 +1755,9 @@ mod tests {
         /// because `run` sent the LITERAL, unmasked `SELECT * FROM
         /// serving.mart_x` straight to `ClickHouse` — no request in
         /// `server.received_requests()` ever contained
-        /// `"replaceRegexpAll"` at all. Quoted failure text (captured
+        /// `"replaceRegexpOne"` at all. Quoted failure text (captured
         /// before Step 2's implementation): `assertion failed:
-        /// requests.iter().any(|r| ...contains("replaceRegexpAll"))`.
+        /// requests.iter().any(|r| ...contains("replaceRegexpOne"))`.
         #[sqlx::test(migrations = "../../migrations")]
         async fn run_rewrites_sql_for_a_governed_table_before_executing(
             pool: PgPool,
@@ -1803,7 +1803,7 @@ mod tests {
             assert!(
                 requests
                     .iter()
-                    .any(|r| String::from_utf8_lossy(&r.body).contains("replaceRegexpAll")),
+                    .any(|r| String::from_utf8_lossy(&r.body).contains("replaceRegexpOne")),
                 "expected the query ClickHouse actually received to be the rewritten/masked \
                  form, never the original literal SQL"
             );

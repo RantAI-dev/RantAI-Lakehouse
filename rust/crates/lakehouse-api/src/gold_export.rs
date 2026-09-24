@@ -1109,7 +1109,7 @@ mod export_batch_sql_enforcement {
         .expect("a masked batch query must be built, not refused");
 
         assert!(
-            sql.contains("replaceRegexpAll(toString(`email`)"),
+            sql.contains("replaceRegexpOne(toString(`email`)"),
             "expected the masking wrapper in the returned batch SQL: {sql}"
         );
         Ok(())
