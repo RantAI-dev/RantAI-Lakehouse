@@ -60,7 +60,7 @@ def test_build_source_refuses_an_internal_custom_endpoint() -> None:
 
 def test_build_source_reads_csv_rows_via_injected_get_object() -> None:
     result = build_source(
-        {"protocol": "s3", "bucket": "b", "format": "csv"},  # no endpoint -> RustFS default, no host to check
+        {"protocol": "s3", "bucket": "b", "format": "csv"},  # no endpoint -> provider's default S3 endpoint, no caller-chosen host to check
         secrets={"accessKey": "ak", "secretKey": "sk"},
         source_objects=[{"name": "orders.csv", "target": "orders"}],
         get_object=lambda **_: b"id,name\n1,a\n2,b\n",

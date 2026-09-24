@@ -9,10 +9,15 @@
 //! (via [`super::api_result_to_value`]) rather than re-implementing any
 //! part of it, so:
 //!
-//! - `create_connector`'s raw-credential refusal
-//!   (`lakehouse_store::connectors::looks_like_raw_secret`) is the SAME
+//! - `create_connector`'s legacy-field refusal
+//!   (`routes::connectors::reject_legacy_secret_ref_fields`) is the SAME
 //!   check `POST /api/connectors` runs — there is no second copy here that
-//!   could drift or be bypassed.
+//!   could drift or be bypassed. The tool cannot let a model choose a
+//!   credential reference NAME at all (ADR 0002 Addendum 3): the schema
+//!   (`routes::ai::registry::create_connector_schema`) only offers
+//!   `credential: { source, primary, secondary? }`, the same shape the
+//!   console sends, and the server derives the actual name from the
+//!   connector's own generated id.
 //! - `test_connector`'s real connectivity probe goes through
 //!   `crate::connector_probe::probe` with the SAME SSRF guard
 //!   (`connector_probe_allow_internal_hosts`) and the SAME
@@ -48,9 +53,9 @@ pub(super) async fn list_connectors(state: &AppState, principal: Option<&Princip
 
 /// Builds the exact `POST /api/connectors` JSON body from the tool's args
 /// (the schema's property names already match `CreateConnectorBody`'s
-/// `camelCase` fields byte-for-byte: `secretRef`, `secretRefSecondary`, ...)
-/// and calls the route handler directly — this is what applies the
-/// raw-credential refusal without a second copy of that check.
+/// `camelCase` fields byte-for-byte: `name`, `type`, `direction`, `host`,
+/// `credential`, ...) and calls the route handler directly — this is what
+/// applies the legacy-field refusal without a second copy of that check.
 ///
 /// `principal` is forwarded as `Option<Extension<Principal>>`, the same
 /// re-wrapping `routes::ai::tools::queries::run_saved_query` already does
@@ -156,11 +161,12 @@ mod tests {
         }
     }
 
-    /// A `create_connector` call carrying a raw-looking credential in
-    /// `secretRef` is refused by the SAME check `POST /api/connectors`
-    /// runs — this test proves the reuse, not just that some check exists.
+    /// A `create_connector` call that still names the removed `secretRef`
+    /// field is refused by the SAME check `POST /api/connectors` runs
+    /// (ADR 0002 Addendum 3) — this test proves the reuse, not just that
+    /// some check exists.
     #[tokio::test]
-    async fn create_connector_refuses_a_raw_looking_secret_ref() {
+    async fn create_connector_refuses_a_legacy_secret_ref_field() {
         let state = state_without_pool();
         let principal = fixture_user_principal();
         let mut args = Map::new();
@@ -175,14 +181,18 @@ mod tests {
         args.insert("environment".to_owned(), json!("production"));
         args.insert("tenant".to_owned(), json!("t"));
         let result = create_connector(&state, Some(&principal), &args).await;
-        assert!(result.get("error").is_some(), "{result}");
+        let err = result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(err.contains("ADR 0002 Addendum 3"), "{result}");
     }
 
-    /// A `secretRef` shaped like a reference (not a credential) is NOT
-    /// refused by the raw-secret check — it fails later (no Postgres pool
-    /// in this test state), but never with the raw-credential message.
+    /// A `credential` spec (the current shape) is NOT refused by the
+    /// legacy-field check — it fails later (no Postgres pool in this test
+    /// state), but never with that message.
     #[tokio::test]
-    async fn create_connector_accepts_a_secret_ref() {
+    async fn create_connector_accepts_a_credential_spec() {
         let state = state_without_pool();
         let principal = fixture_user_principal();
         let mut args = Map::new();
@@ -190,7 +200,10 @@ mod tests {
         args.insert("type".to_owned(), json!("PostgreSQL"));
         args.insert("direction".to_owned(), json!("source"));
         args.insert("host".to_owned(), json!("db:5432"));
-        args.insert("secretRef".to_owned(), json!("env:DB_PASSWORD"));
+        args.insert(
+            "credential".to_owned(),
+            json!({ "source": "env", "primary": "password" }),
+        );
         args.insert("environment".to_owned(), json!("production"));
         args.insert("tenant".to_owned(), json!("t"));
         let result = create_connector(&state, Some(&principal), &args).await;
@@ -199,8 +212,8 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(
-            !err.contains("reference to a credential"),
-            "must not be refused for looking like a raw secret: {err}"
+            !err.contains("ADR 0002 Addendum 3"),
+            "must not be refused as a legacy secretRef field: {err}"
         );
     }
 

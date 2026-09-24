@@ -333,6 +333,14 @@ fn connectors_router() -> Router<AppState> {
             axum::routing::post(connectors::test_connection),
         )
         .route(
+            "/api/connectors/{id}/probe-history",
+            get(connectors::probe_history),
+        )
+        .route(
+            "/api/connectors/{id}/secret",
+            axum::routing::put(connectors::rotate_secret),
+        )
+        .route(
             "/api/connectors/{id}/discover",
             axum::routing::post(connectors::discover),
         )

@@ -5,6 +5,7 @@ import type {
   ConnectorTestResult,
   ConnectorType,
   CreateConnectorInput,
+  CreateConnectorResponse,
   DebeziumProperties,
   DiscoverResult,
   IngestibleConnector,
@@ -12,6 +13,9 @@ import type {
   IngestRunResult,
   IngestSpec,
   IngestSpecInput,
+  ProbeHistoryResponse,
+  RotateConnectorSecretRequest,
+  RotateConnectorSecretResponse,
 } from "../contracts/connectors";
 import { apiFetch } from "../http";
 import { ServiceError } from "../errors";
@@ -20,11 +24,13 @@ import { ServiceError } from "../errors";
  * ConnectorService is real — connector definitions (source/sink) go through
  * the `/api/connectors` route, backed by Postgres (`lakehouse-store`, Task 2.7).
  *
- * CREDENTIAL NOTE: `CreateConnectorInput.secretRef` is a REFERENCE to where a
- * credential is stored (an env var name, a secret-manager path) — not the
- * credential value itself. The backend never stores, returns, logs, or
- * displays a credential value; `Connector`/`ConnectorDetail` do not even have
- * a field for one.
+ * CREDENTIAL NOTE: `CreateConnectorInput.credential` (ADR 0002 Addendum 3)
+ * chooses a source/kind, never a reference NAME — the server derives the
+ * actual reference (where a credential is stored: an env var name, a
+ * secret-manager path) from the id it generates, and returns it once in
+ * `CreateConnectorResponse.credential`. The backend never stores, returns,
+ * logs, or displays a credential VALUE; `Connector`/`ConnectorDetail` do not
+ * even have a field for one.
  *
  * `testConnection` here NOW performs a real network probe — but only for
  * PostgreSQL and S3-compatible object storage, the only two types this build
@@ -40,7 +46,7 @@ async function getJson<T>(url: string, init?: RequestInit): Promise<T> {
   const json = await res.json();
   if (!res.ok) {
     const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
-    throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`);
+    throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status);
   }
   return json as T;
 }
@@ -55,7 +61,7 @@ async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Pr
   const json = await res.json();
   if (!res.ok) {
     const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
-    throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`);
+    throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status);
   }
   return json as T;
 }
@@ -70,7 +76,7 @@ async function putJson<T>(url: string, body: unknown, signal?: AbortSignal): Pro
   const json = await res.json();
   if (!res.ok) {
     const kind = res.status === 404 ? "not_found" : res.status >= 500 ? "unavailable" : "invalid_request";
-    throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`);
+    throw new ServiceError(kind, json?.error ?? `Failed (${res.status})`, res.status);
   }
   return json as T;
 }
@@ -83,7 +89,7 @@ export const postgresConnectorService: ConnectorService = {
     return getJson<ConnectorDetail>(`/api/connectors/${encodeURIComponent(id)}`, { signal });
   },
   createConnector(input: CreateConnectorInput, signal) {
-    return postJson<Connector>("/api/connectors", input, signal);
+    return postJson<CreateConnectorResponse>("/api/connectors", input, signal);
   },
   testConnection(id, signal) {
     return postJson<ConnectorTestResult>(`/api/connectors/${encodeURIComponent(id)}/test`, undefined, signal);
@@ -116,6 +122,20 @@ export const postgresConnectorService: ConnectorService = {
     return getJson<DebeziumProperties>(
       `/api/connectors/${encodeURIComponent(id)}/debezium-properties?table=${encodeURIComponent(table)}`,
       { signal }
+    );
+  },
+  listProbeHistory(id, limit, signal) {
+    const query = limit === undefined ? "" : `?limit=${encodeURIComponent(limit)}`;
+    return getJson<ProbeHistoryResponse>(
+      `/api/connectors/${encodeURIComponent(id)}/probe-history${query}`,
+      { signal }
+    );
+  },
+  rotateSecret(id, body: RotateConnectorSecretRequest, signal) {
+    return putJson<RotateConnectorSecretResponse>(
+      `/api/connectors/${encodeURIComponent(id)}/secret`,
+      body,
+      signal
     );
   },
 };

@@ -42,7 +42,7 @@
 //! resolved value; it only ever reports whether the dial succeeded, how
 //! long it took, and a human-readable message.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -399,8 +399,12 @@ pub async fn get_connector(pool: &PgPool, id: &str) -> Result<Option<ConnectorDe
 
 /// Everything [`create_connector`] needs. Mirrors `CreateConnectorInput`.
 ///
-/// `secret_ref` is a REFERENCE NAME, never a credential value — see the
-/// module doc comment.
+/// There is no `secret_ref`/`secret_ref_secondary` field here any more
+/// (ADR 0002 Addendum 3): a client does not choose a credential reference
+/// NAME, only a [`CredentialSpec`] (source + kind per slot). The server
+/// generates the connector's id (`slug_id`, below) and derives the actual
+/// reference names from it, in [`create_connector`], after the id is
+/// known.
 #[derive(Debug, Clone)]
 pub struct CreateConnectorInput {
     /// Display name; must not collide with an existing connector.
@@ -412,17 +416,9 @@ pub struct CreateConnectorInput {
     /// Connection target (hostname/endpoint label). Never returned by any
     /// GET response — see the module doc comment.
     pub host: String,
-    /// A REFERENCE NAME to where a credential lives, never the credential
-    /// itself. See the module doc comment.
-    pub secret_ref: String,
-    /// An optional second REFERENCE NAME (e.g. the secret-access-key half
-    /// of an S3 connector's access-key/secret-key pair — see
-    /// [`ConnectorDialInfo::secret_ref_secondary`]). `None` for connector
-    /// types that need only one credential (e.g. `PostgreSQL`). Without
-    /// this, an S3 connector created through the API could never be
-    /// tested: [`get_connector_dial_info`] always reads this column, and
-    /// `lakehouse-api::connector_probe::probe_s3` requires it.
-    pub secret_ref_secondary: Option<String>,
+    /// What to derive this connector's credential reference name(s) from —
+    /// see [`derive_secret_ref`] and ADR 0002 Addendum 3.
+    pub credential: CredentialSpec,
     /// Deployment environment.
     pub environment: String,
     /// Owning tenant's display name.
@@ -440,6 +436,129 @@ pub struct CreateConnectorInput {
 }
 
 const DEFAULT_OWNER: &str = "Current user";
+
+/// Where a derived connector-credential reference name should be looked up
+/// at resolve time. Mirrors `CredentialSource` in `contracts/connectors.ts`
+/// — ADR 0002 Addendum 3's two schemes, `env:` and `file:`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialSource {
+    /// `env:CONNECTOR_<ID>_<SUFFIX>`, resolved by `EnvSecretResolver`.
+    Env,
+    /// `file:/run/secrets/connector_<id>_<suffix>`, resolved by
+    /// `FileSecretResolver`.
+    File,
+}
+
+/// Which fixed credential-name suffix a slot derives. Mirrors
+/// `CredentialKind` in `contracts/connectors.ts` — exactly the six
+/// suffixes ADR 0002 Addendum 3 and
+/// `lakehouse_api::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS` both
+/// name; adding a seventh here without adding it there would derive a name
+/// the resolver never admits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialKind {
+    /// `_PASSWORD` suffix.
+    Password,
+    /// `_SECRET_KEY` suffix.
+    SecretKey,
+    /// `_ACCESS_KEY` suffix.
+    AccessKey,
+    /// `_API_KEY` suffix.
+    ApiKey,
+    /// `_TOKEN` suffix.
+    Token,
+    /// `_PRIVATE_KEY` suffix — the `sftp` adapter's `SftpAuth::PublicKey`
+    /// auth kind needs this (a private-key PEM is not honestly any of the
+    /// five kinds above); added for that case rather than overloading
+    /// `SecretKey`, whose suffix an S3 connector's secondary slot already
+    /// uses for an unrelated shape.
+    PrivateKey,
+}
+
+impl CredentialKind {
+    /// The upper-case suffix ADR 0002 Addendum 3 names, e.g. `"PASSWORD"`.
+    /// [`derive_secret_ref`]'s `file:` form lower-cases this itself, rather
+    /// than this method offering a second casing — one source of truth for
+    /// the suffix text.
+    #[must_use]
+    pub fn suffix(self) -> &'static str {
+        match self {
+            Self::Password => "PASSWORD",
+            Self::SecretKey => "SECRET_KEY",
+            Self::AccessKey => "ACCESS_KEY",
+            Self::ApiKey => "API_KEY",
+            Self::Token => "TOKEN",
+            Self::PrivateKey => "PRIVATE_KEY",
+        }
+    }
+}
+
+/// What a client chooses for a connector's credential(s): a source scheme
+/// and a kind per slot. Never a reference NAME — the client does not know
+/// the connector's id yet (the server generates it), so it cannot name a
+/// ref itself. See [`derive_secret_ref`] and ADR 0002 Addendum 3.
+#[derive(Debug, Clone)]
+pub struct CredentialSpec {
+    /// `env:` or `file:` — which resolver scheme the derived name(s) use.
+    pub source: CredentialSource,
+    /// The primary slot's kind (`connector.secret_ref`).
+    pub primary: CredentialKind,
+    /// `None` for a connector type that needs only one credential (e.g.
+    /// `PostgreSQL`). `Some` for e.g. an S3 connector's access-key/
+    /// secret-key pair — see
+    /// [`ConnectorDialInfo::secret_ref_secondary`].
+    pub secondary: Option<CredentialKind>,
+}
+
+/// The credential reference NAMES a newly created connector's operator
+/// must provision — returned ONCE, by [`create_connector`], and never
+/// again: no GET response for this connector repeats them (this does not
+/// weaken the module doc comment's guarantees 1/2 — [`Connector`] and
+/// [`ConnectorDetail`] gain no field; this is a distinct, create-only
+/// return value). Mirrors the `credential` field of `CreateConnectorResponse`
+/// in `contracts/connectors.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectorCredentialNames {
+    /// The primary slot's derived reference name.
+    pub primary: String,
+    /// The secondary slot's derived reference name, or `None` when
+    /// [`CredentialSpec::secondary`] was `None`.
+    pub secondary: Option<String>,
+}
+
+/// Derive a user-created connector's credential reference name from ITS
+/// OWN id — ADR 0002 Addendum 3 (`docs/adr/0002-secretref-resolution.md`).
+/// For `id = "conn-orders-k3x9"`, `source = Env`, `kind = Password`:
+/// `"env:CONNECTOR_CONN_ORDERS_K3X9_PASSWORD"`.
+///
+/// `id` is always [`slug_id`]'s output, `[a-z0-9-]` only, so upper-casing
+/// (for `env:`) or lower-casing (for `file:`) and mapping `-` to `_` is a
+/// lossless, one-to-one transform: two different ids can never derive the
+/// same name, and every derived name already matches
+/// `lakehouse_api::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS` — both
+/// resolvers (the API's `AllowlistedSecretResolver` and Dagster's
+/// `secret_resolver.resolve_secret_ref`) are unchanged by this ADR; this
+/// function is the only place the invariant "every derived name matches
+/// the allowlist" has to be kept true.
+#[must_use]
+pub fn derive_secret_ref(id: &str, source: CredentialSource, kind: CredentialKind) -> String {
+    match source {
+        CredentialSource::Env => {
+            let key = id.to_ascii_uppercase().replace('-', "_");
+            format!("env:CONNECTOR_{key}_{}", kind.suffix())
+        }
+        CredentialSource::File => {
+            let key = id.replace('-', "_");
+            format!(
+                "file:/run/secrets/connector_{key}_{}",
+                kind.suffix().to_ascii_lowercase()
+            )
+        }
+    }
+}
 
 /// A caller-supplied `secret_ref` is a REFERENCE NAME (`"env:FOO"`,
 /// `"vault:secret/data/x"`), never a credential value. This heuristically
@@ -490,21 +609,41 @@ pub fn looks_like_raw_secret(value: &str) -> bool {
 /// `record_test_result` is the only function that ever moves `health` off
 /// `"unknown"` or sets `lastTestAt`.
 ///
+/// # Credential names are derived here, after the id is known (ADR 0002 Addendum 3)
+///
+/// The id is generated FIRST ([`slug_id`]), then [`derive_secret_ref`]
+/// builds `secret_ref`/`secret_ref_secondary` from it and `input.credential`
+/// — never the other way around, and never from a caller-supplied name.
+/// This is the one place that ordering has to hold, so it lives here
+/// rather than at the API layer: a route that generated the id itself and
+/// passed refs in would duplicate `slug_id`'s definition, the exact
+/// "grep for the existing helper" this module already asks of a caller
+/// (AGENTS.md rule 4).
+///
+/// The returned [`ConnectorCredentialNames`] is the ONLY time these names
+/// are ever produced — `routes::connectors::create` returns them straight
+/// through in its response, once; no other function in this crate
+/// recomputes or re-reveals them (a GET can recompute the SAME names from
+/// the connector's own `id`, since the derivation is pure, but nothing
+/// does — see [`ConnectorCredentialNames`]'s doc comment).
+///
 /// # Errors
 ///
-/// Returns [`StoreError::Conflict`] (409) if the name is taken. Returns
-/// `Err` wrapping a validation failure (via [`StoreError::Database`]'s
-/// sibling — see `routes::connectors::create` for how this is actually
-/// surfaced as a 400) is NOT done here: shape validation belongs to the API
-/// layer, which calls [`looks_like_raw_secret`] itself before invoking
-/// this function, matching the `identity`/`pipelines` modules' split
-/// (repository does persistence, route does request validation).
+/// Returns [`StoreError::Conflict`] (409) if the name is taken. Shape
+/// validation of `name`/`type`/`direction`/etc. is NOT done here — that
+/// belongs to the API layer, matching the `identity`/`pipelines` modules'
+/// split (repository does persistence, route does request validation).
 pub async fn create_connector(
     pool: &PgPool,
     input: &CreateConnectorInput,
-) -> Result<Connector, StoreError> {
+) -> Result<(Connector, ConnectorCredentialNames), StoreError> {
     let id = slug_id(&input.name);
     let owner = input.owner.as_deref().unwrap_or(DEFAULT_OWNER);
+    let secret_ref = derive_secret_ref(&id, input.credential.source, input.credential.primary);
+    let secret_ref_secondary = input
+        .credential
+        .secondary
+        .map(|kind| derive_secret_ref(&id, input.credential.source, kind));
     // `last_test_at`/`last_activity_at` are omitted: neither column has a
     // default any more (`0028_connector_health_unknown_until_tested.sql`),
     // so both come back `NULL` -- no test has run and nothing measures
@@ -523,14 +662,18 @@ pub async fn create_connector(
         .bind(&input.environment)
         .bind(&input.tenant)
         .bind(&input.host)
-        .bind(&input.secret_ref)
-        .bind(&input.secret_ref_secondary)
+        .bind(&secret_ref)
+        .bind(&secret_ref_secondary)
         .bind(&input.residency)
         .bind(&input.capabilities)
         .bind(owner)
         .fetch_one(pool)
         .await?;
-    Ok(row.into())
+    let names = ConnectorCredentialNames {
+        primary: secret_ref,
+        secondary: secret_ref_secondary,
+    };
+    Ok((row.into(), names))
 }
 
 /// The outcome of a connectivity test. Mirrors `ConnectorTestResult`.
@@ -665,11 +808,13 @@ pub struct ConnectorDialInfo {
 /// parse happens BEFORE any write.
 #[derive(Debug, Clone)]
 pub struct IngestSpecInput {
-    /// One of `sql | cdc | files | rest | sheets` — the value
-    /// [`crate::ingest_spec::Dial::parse`] dispatches on.
+    /// One of `sql | cdc | files | rest | sheets | mongodb | kafka | sftp`
+    /// — the value [`crate::ingest_spec::Dial::parse`] dispatches on.
     pub adapter: String,
-    /// `"batch" | "cdc"`, matching `connector_ingest_mode_check`
-    /// (`0033_connector_ingest_spec.sql`).
+    /// `"batch" | "cdc" | "stream"`, matching `connector_ingest_mode_check`
+    /// (`0033_connector_ingest_spec.sql`, widened by
+    /// `0043_ingest_tier2_adapters.sql` to admit `"stream"` for the
+    /// `kafka` adapter).
     pub ingest_mode: String,
     /// Validated by [`crate::ingest_spec::Dial::parse`] against the shape
     /// `adapter` names. Never free-form at the application level, even
@@ -794,7 +939,8 @@ pub async fn get_ingest_spec(pool: &PgPool, id: &str) -> Result<Option<IngestSpe
 ///
 /// Second (WS3 plan review Z6): once the `dial` shape itself is valid,
 /// this checks that the connector's declared secret refs are ENOUGH for
-/// what `spec.adapter` (and, for `rest`, `dial.auth.type`) needs —
+/// what `spec.adapter` (and, for `rest`/`kafka`/`sftp`, `dial.auth.type`)
+/// needs —
 /// [`crate::ingest_spec::secret_field_names`] names the ordered fields
 /// (mirrored by `dagster/dispar_orchestrate/secret_map.py`'s
 /// `SECRET_FIELD_NAMES`, same commit), and a two-field combination
@@ -811,7 +957,8 @@ pub async fn get_ingest_spec(pool: &PgPool, id: &str) -> Result<Option<IngestSpe
 /// [`crate::ingest_spec::Dial::parse`] for `spec.adapter`, or if the
 /// connector's secret-ref count does not match
 /// [`crate::ingest_spec::secret_field_names`] for `spec.adapter`/the
-/// dial's auth type. Returns [`StoreError::NotFound`] if `id` does not
+/// dial's auth type (`rest`, `kafka` or `sftp` — [`crate::ingest_spec::Dial::secret_map_auth_type`]).
+/// Returns [`StoreError::NotFound`] if `id` does not
 /// name a connector. Returns [`StoreError::Database`] on any other
 /// failure.
 pub async fn set_ingest_spec(
@@ -822,7 +969,7 @@ pub async fn set_ingest_spec(
     let dial = crate::ingest_spec::Dial::parse(&spec.adapter, &spec.dial)
         .map_err(|err| StoreError::Validation(err.to_string()))?;
 
-    let auth_type = dial.rest_auth_type();
+    let auth_type = dial.secret_map_auth_type();
     let fields =
         crate::ingest_spec::secret_field_names(&spec.adapter, auth_type).ok_or_else(|| {
             StoreError::Validation(format!(
@@ -872,22 +1019,43 @@ pub async fn set_ingest_spec(
 }
 
 /// Persist the outcome of a real connectivity probe and, when the probe
-/// type is supported, stamp `lastTestAt`. Called by `lakehouse-api`'s
-/// `connector_probe` module AFTER it has actually attempted (or declined to
-/// attempt, for an unsupported type) a dial — this function never decides
-/// `ok`/`supported` itself, only records what the caller measured.
+/// type is supported, stamp `lastTestAt` and append a
+/// [`crate::connector_probe_result::ConnectorProbeResult`] history row.
+/// Called by `lakehouse-api`'s `connector_probe` module AFTER it has
+/// actually attempted (or declined to attempt, for an unsupported type) a
+/// dial — this function never decides `ok`/`supported` itself, only
+/// records what the caller measured.
 ///
 /// `health` is updated to `"healthy"`/`"unhealthy"` only when `supported`
 /// is `true` — an unsupported type's last-known health is left untouched,
 /// since declining to test a connector is not evidence about whether it is
 /// healthy. `last_test_at` follows the same rule and for the same reason:
 /// an unsupported probe type was never actually dialed, so it must not
-/// claim a test time it does not have (WS1 finding J19).
+/// claim a test time it does not have (WS1 finding J19). The history row
+/// follows the exact same rule: an unsupported probe has no outcome to
+/// record, so no row is written for one.
+///
+/// The current-state `connector` UPDATE and the history insert-and-trim
+/// both run inside ONE transaction, committed together: the history row's
+/// `tested_at` is bound to the SAME value the `UPDATE ... RETURNING`
+/// produced (never a second `now()` call), so `connector.last_test_at` and
+/// the newest `connector_probe_result` row can never disagree about when
+/// the last supported probe ran.
+///
+/// `message` is stored exactly as given. `connector_probe`'s module doc
+/// comment ("Error messages never echo upstream data") guarantees every
+/// value this function is ever called with is one of a small set of fixed
+/// failure classes, the resolver's own refusal text, or a caller-supplied
+/// config-shape complaint — never raw upstream `Display` text — and
+/// `POST .../test` already returns this same string to the same
+/// `connector:manage` caller this history is later read back by, so
+/// recording it adds no new exposure.
 ///
 /// # Errors
 ///
-/// Returns [`StoreError::NotFound`] if `id` does not name a connector, or
-/// [`StoreError::Database`] on any other failure.
+/// Returns [`StoreError::NotFound`] if `id` does not name a connector (in
+/// which case nothing is written), or [`StoreError::Database`] on any
+/// other failure.
 pub async fn record_test_result(
     pool: &PgPool,
     id: &str,
@@ -896,6 +1064,7 @@ pub async fn record_test_result(
     latency_ms: Option<i64>,
     message: &str,
 ) -> Result<ConnectorTestResult, StoreError> {
+    let mut tx = pool.begin().await?;
     let sql = "UPDATE connector SET last_test_at = CASE WHEN $2 THEN now() ELSE last_test_at END, \
                health = CASE WHEN $2 THEN (CASE WHEN $3 THEN 'healthy' ELSE 'unhealthy' END) ELSE \
                health END WHERE id = $1 RETURNING last_test_at";
@@ -903,11 +1072,26 @@ pub async fn record_test_result(
         .bind(id)
         .bind(supported)
         .bind(ok)
-        .fetch_optional(pool)
+        .fetch_optional(&mut *tx)
         .await?;
     let Some((tested_at,)) = row else {
         return Err(StoreError::NotFound);
     };
+
+    if supported {
+        // `tested_at` is `Some` whenever `supported` is `true` -- the
+        // `UPDATE`'s own `CASE WHEN $2 THEN now() ...` guarantees it, so
+        // this `if let` never silently skips a history row for a
+        // supported probe.
+        if let Some(tested_at) = tested_at {
+            crate::connector_probe_result::insert_and_trim(
+                &mut tx, id, tested_at, ok, latency_ms, message,
+            )
+            .await?;
+        }
+    }
+
+    tx.commit().await?;
     Ok(ConnectorTestResult {
         ok,
         supported,
@@ -915,6 +1099,128 @@ pub async fn record_test_result(
         message: message.to_owned(),
         tested_at: iso_opt(tested_at),
     })
+}
+
+/// Which of a connector's two credential slots [`swap_secret_ref`]
+/// targets. Mirrors `RotateConnectorSecretRequest["slot"]` in
+/// `contracts/connectors.ts`.
+///
+/// `secret_ref` (primary) is `NOT NULL` (`0013_connectors.sql`);
+/// `secret_ref_secondary` is nullable (`0021_connector_dial_columns.sql`
+/// — see [`ConnectorDialInfo::secret_ref_secondary`]'s doc comment), so
+/// only [`Self::Secondary`] can ever legitimately have `None` as the
+/// "current" value [`swap_secret_ref`]'s `expected_old` compares against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SecretSlot {
+    /// `connector.secret_ref`.
+    Primary,
+    /// `connector.secret_ref_secondary`.
+    Secondary,
+}
+
+impl SecretSlot {
+    /// The lowercase label this slot is recorded under -- e.g. in an
+    /// audit event's `args` (`lakehouse-api`'s `connector_audit_event`,
+    /// action `connector.secret_rotate`). Matches this enum's own
+    /// `#[serde(rename_all = "lowercase")]` wire form; kept as an
+    /// explicit method rather than round-tripping the value through
+    /// `serde_json::to_value` at every call site that only wants the
+    /// label.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Secondary => "secondary",
+        }
+    }
+}
+
+/// Conditionally rotate one of a connector's two credential REFERENCE
+/// NAMES (never a credential value -- see the module doc comment) from
+/// `expected_old` to `new_ref`.
+///
+/// This is an optimistic-concurrency compare-and-swap: the `UPDATE` only
+/// takes effect `WHERE id = $2 AND <col> IS NOT DISTINCT FROM
+/// expected_old`, so a caller who read the connector's current ref, then
+/// lost a race with a second rotation of the same slot before this call
+/// lands, gets [`StoreError::Conflict`] instead of silently clobbering a
+/// rotation it never observed.
+///
+/// This function does NOT verify that `new_ref` resolves to a working
+/// credential -- that is the caller's job, BEFORE calling this at all.
+/// `lakehouse-api`'s `routes::connectors::rotate_secret` runs a real
+/// connectivity probe (the same one `POST .../test` uses, via the same
+/// allowlisted resolver) against a candidate built with `new_ref` in
+/// place, and only calls this function once that probe reports
+/// `supported: true, ok: true` -- see that handler's doc comment for why
+/// the probe result itself is never persisted as
+/// `connector_probe_result` history here (it tested a credential the
+/// connector was not yet using when the probe ran).
+///
+/// `<col>` is picked by matching [`SecretSlot`] between two constant SQL
+/// string literals below -- `format!` is not used at all in this
+/// function, so there is no identifier interpolation to audit against
+/// AGENTS.md's "format! only for constant identifiers" rule in the first
+/// place.
+///
+/// # Zero rows: connector gone vs. ref changed since read
+///
+/// A single conditional `UPDATE` cannot itself distinguish "no such
+/// connector" from "the connector exists but its current ref no longer
+/// equals `expected_old`" -- both leave `rows_affected() == 0`. Rather
+/// than wrapping the whole call in a `SELECT ... FOR UPDATE` transaction
+/// (which would need to hold a row lock across the caller's earlier
+/// probe too, to actually close the race, at the cost of serializing
+/// every rotation attempt against that connector behind a lock held for
+/// the probe's `DIAL_TIMEOUT`), this runs a second, cheap query ONLY on
+/// the zero-rows path: if the row is now absent, [`StoreError::NotFound`];
+/// if it is still present (so the `IS NOT DISTINCT FROM` comparison is
+/// what failed the `WHERE` clause), [`StoreError::Conflict`]. Two
+/// round-trips only on the rare zero-rows path -- the common (one-row)
+/// success path is a single statement.
+///
+/// # Errors
+///
+/// Returns [`StoreError::NotFound`] if `id` does not name a connector.
+/// Returns [`StoreError::Conflict`] if `id` names a connector but its
+/// current value in slot `slot` no longer equals `expected_old`. Returns
+/// [`StoreError::Database`] on any other failure.
+pub async fn swap_secret_ref(
+    pool: &PgPool,
+    id: &str,
+    slot: SecretSlot,
+    expected_old: Option<&str>,
+    new_ref: &str,
+) -> Result<(), StoreError> {
+    let sql = match slot {
+        SecretSlot::Primary => {
+            "UPDATE connector SET secret_ref = $1 WHERE id = $2 AND secret_ref IS NOT DISTINCT FROM $3"
+        }
+        SecretSlot::Secondary => {
+            "UPDATE connector SET secret_ref_secondary = $1 WHERE id = $2 AND secret_ref_secondary \
+             IS NOT DISTINCT FROM $3"
+        }
+    };
+    let result = sqlx::query(sql)
+        .bind(new_ref)
+        .bind(id)
+        .bind(expected_old)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() > 0 {
+        return Ok(());
+    }
+    // Zero rows: figure out which of the two honest reasons applies --
+    // see the doc comment above.
+    let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM connector WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    match exists {
+        Some(_) => Err(StoreError::Conflict),
+        None => Err(StoreError::NotFound),
+    }
 }
 
 /// Everything `dagster/dispar_orchestrate/ingest_factory.py` needs to build
@@ -940,15 +1246,16 @@ pub async fn record_test_result(
 pub struct IngestibleConnector {
     /// `connector.id`.
     pub id: String,
-    /// One of `sql | cdc | files | rest | sheets` — never `NULL` here,
-    /// since [`list_ingestible_connectors`] only selects rows where
-    /// `adapter IS NOT NULL`.
+    /// One of `sql | cdc | files | rest | sheets | mongodb | kafka | sftp`
+    /// — never `NULL` here, since [`list_ingestible_connectors`] only
+    /// selects rows where `adapter IS NOT NULL`.
     pub adapter: String,
-    /// `"batch" | "cdc"`. `set_ingest_spec` always writes this in the
-    /// same `UPDATE` as `adapter`, so a row this query selects (`adapter
-    /// IS NOT NULL`) has always had `ingest_mode` written too in
-    /// practice — but see this struct's `# Note` if that invariant is
-    /// ever weakened.
+    /// `"batch" | "cdc" | "stream"` (the last one only for a `kafka`
+    /// adapter — see [`IngestSpecInput::ingest_mode`]). `set_ingest_spec`
+    /// always writes this in the same `UPDATE` as `adapter`, so a row
+    /// this query selects (`adapter IS NOT NULL`) has always had
+    /// `ingest_mode` written too in practice — but see this struct's
+    /// `# Note` if that invariant is ever weakened.
     pub ingest_mode: String,
     /// Validated at `set_ingest_spec` time against
     /// [`crate::ingest_spec::Dial::parse`] for this row's `adapter`.
@@ -1265,5 +1572,163 @@ mod tests {
         assert_eq!(radix36(0), "0");
         assert_eq!(radix36(35), "z");
         assert_eq!(radix36(36), "10");
+    }
+
+    // ── ADR 0002 Addendum 3: derived connector-credential names ─────────
+
+    /// The exact example the addendum documents.
+    #[test]
+    fn derive_secret_ref_matches_the_documented_example() {
+        assert_eq!(
+            derive_secret_ref(
+                "conn-orders-k3x9",
+                CredentialSource::Env,
+                CredentialKind::Password
+            ),
+            "env:CONNECTOR_CONN_ORDERS_K3X9_PASSWORD"
+        );
+        assert_eq!(
+            derive_secret_ref(
+                "conn-orders-k3x9",
+                CredentialSource::File,
+                CredentialKind::Password
+            ),
+            "file:/run/secrets/connector_conn_orders_k3x9_password"
+        );
+    }
+
+    /// A pattern-match check, ported the same way
+    /// `dagster/dispar_orchestrate/secret_resolver.py`'s `_pattern_matches`
+    /// is: exactly one `*` splitting a fixed prefix and a fixed suffix.
+    /// Test-only mirror of `lakehouse_core::secret::pattern_matches` --
+    /// this crate does not depend on `lakehouse-core`'s `secret` module,
+    /// so the test reimplements the one predicate it needs rather than add
+    /// a dependency just for an assertion helper.
+    fn test_pattern_matches(pattern: &str, value: &str) -> bool {
+        let (prefix, suffix) = pattern.split_once('*').expect("every pattern has one '*'");
+        value.len() >= prefix.len() + suffix.len()
+            && value.starts_with(prefix)
+            && value.ends_with(suffix)
+    }
+
+    /// Every derived name, for every source/kind combination, matches
+    /// `lakehouse_api::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS`
+    /// (mirrored here as a literal, since `lakehouse-api` depends on
+    /// `lakehouse-store` and not the reverse — a dependency this test
+    /// cannot invert just to import the constant). If either list ever
+    /// changes, this and that crate's own
+    /// `connector_secret_resolver_admits_credential_suffixed_refs_...`
+    /// test must be updated together.
+    #[test]
+    fn every_derived_name_matches_the_connector_allowlist_patterns() {
+        let patterns = [
+            "env:CONNECTOR_*_PASSWORD",
+            "env:CONNECTOR_*_SECRET_KEY",
+            "env:CONNECTOR_*_ACCESS_KEY",
+            "env:CONNECTOR_*_API_KEY",
+            "env:CONNECTOR_*_TOKEN",
+            "env:CONNECTOR_*_PRIVATE_KEY",
+            "file:/run/secrets/connector_*",
+        ];
+        for id in ["conn-orders-k3x9", "conn-a", "conn-pg-lakehouse-2"] {
+            for source in [CredentialSource::Env, CredentialSource::File] {
+                for kind in [
+                    CredentialKind::Password,
+                    CredentialKind::SecretKey,
+                    CredentialKind::AccessKey,
+                    CredentialKind::ApiKey,
+                    CredentialKind::Token,
+                    CredentialKind::PrivateKey,
+                ] {
+                    let derived = derive_secret_ref(id, source, kind);
+                    assert!(
+                        patterns.iter().any(|p| test_pattern_matches(p, &derived)),
+                        "{derived:?} (id={id}, source={source:?}, kind={kind:?}) matches no \
+                         allowlist pattern"
+                    );
+                }
+            }
+        }
+    }
+
+    /// No seeded ref (`0014_seed_connectors.sql`, `0022_prune_connector_seed.sql`,
+    /// `0023_connector_dedicated_secret_refs.sql`) can ever be derived from
+    /// any id beginning `conn-` — every derived `env:` name begins
+    /// `CONNECTOR_CONN_`, and every seeded ref does not.
+    #[test]
+    fn no_seeded_ref_can_be_derived_from_any_connector_id() {
+        let seeded_refs = [
+            // 0014 (deleted by 0022, kept here since the assertion is
+            // about the SHAPE, not which rows are currently live).
+            "env:CLICKHOUSE_SERVING_PASSWORD",
+            "env:ERP_FINANCE_PASSWORD",
+            "env:FX_RATES_API_KEY",
+            "env:GSHEETS_OAUTH_REFRESH_TOKEN",
+            "env:ICEBERG_CATALOG_TOKEN",
+            "env:KAFKA_CLICKSTREAM_SASL",
+            "env:KAFKA_FLEET_SASL",
+            "env:KAFKA_ORDERS_SASL",
+            "env:MONGO_CATALOG_URI",
+            "env:MQTT_WAREHOUSE_PASSWORD",
+            "env:MYSQL_POS_PASSWORD",
+            "env:ORACLE_GL_PASSWORD",
+            "env:PG_OMS_CDC_PASSWORD",
+            "env:PRICE_CRAWLER_PROXY_TOKEN",
+            "env:WEATHER_API_KEY",
+            // 0022/0023 (live today).
+            "env:CONNECTOR_PG_PASSWORD",
+            "env:CONNECTOR_S3_ACCESS_KEY",
+            "env:CONNECTOR_S3_SECRET_KEY",
+        ];
+        for r in seeded_refs {
+            assert!(
+                !r.starts_with("env:CONNECTOR_CONN_"),
+                "{r:?} would collide with a derived name's fixed prefix"
+            );
+        }
+    }
+
+    /// Two distinct ids never derive the same name, for ANY pair of kinds
+    /// and either source. The collision that would matter is across kinds:
+    /// `conn-a` + `SECRET_KEY` and `conn-a-secret` + a `KEY` suffix would
+    /// both spell `..._CONN_A_SECRET_KEY`. It cannot happen because no
+    /// allowed suffix is an `_`-separated tail of another; the cross-kind
+    /// pairs below are the ids that would exploit it if one ever were.
+    #[test]
+    fn distinct_ids_never_derive_the_same_name() {
+        const KINDS: [CredentialKind; 6] = [
+            CredentialKind::Password,
+            CredentialKind::SecretKey,
+            CredentialKind::AccessKey,
+            CredentialKind::ApiKey,
+            CredentialKind::Token,
+            CredentialKind::PrivateKey,
+        ];
+        let pairs = [
+            ("conn-a-password", "conn-a"),
+            ("conn-a-b", "conn-a-b-"),
+            ("conn-ab", "conn-a-b"),
+            ("conn-x-y-z", "conn-x-y-z-"),
+            ("conn-a", "conn-a-secret"),
+            ("conn-a", "conn-a-access"),
+            ("conn-a", "conn-a-api"),
+            ("conn-a-secret-key", "conn-a"),
+        ];
+        for (left, right) in pairs {
+            assert_ne!(left, right, "test fixture bug: ids must differ");
+            for source in [CredentialSource::Env, CredentialSource::File] {
+                for left_kind in KINDS {
+                    for right_kind in KINDS {
+                        let left_ref = derive_secret_ref(left, source, left_kind);
+                        let right_ref = derive_secret_ref(right, source, right_kind);
+                        assert_ne!(
+                            left_ref, right_ref,
+                            "distinct ids {left:?} ({left_kind:?}) and {right:?} ({right_kind:?}) \
+                             derived the same name"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

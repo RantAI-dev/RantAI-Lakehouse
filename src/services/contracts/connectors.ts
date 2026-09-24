@@ -52,24 +52,143 @@ export type ConnectorTestResult = {
   testedAt: string | null
 }
 
+/**
+ * One row of `GET /api/connectors/{id}/probe-history` — a past connectivity
+ * probe's outcome. Distinct from `Connector.lastTestAt`/`health` (current
+ * state, unchanged by reading this): this is HISTORY, per-connector,
+ * newest first, bounded to the most recent 200 rows — see
+ * `rust/migrations/0044_connector_probe_result.sql`. Only ever contains
+ * SUPPORTED probes (an unsupported probe never dialed anything, so it has
+ * no outcome to record).
+ */
+export type ConnectorProbeResult = {
+  /** ISO 8601. */
+  testedAt: string
+  ok: boolean
+  /** Real measured latency in milliseconds, or `null` if the dial attempt never completed. */
+  latencyMs: number | null
+  message: string
+}
+
+export type ProbeHistoryResponse = {
+  /** Newest first. */
+  results: ConnectorProbeResult[]
+}
+
+/**
+ * Which of a connector's two credential slots a
+ * `PUT /api/connectors/{id}/secret` request targets. Mirrors Rust
+ * `SecretSlot` (`rust/crates/lakehouse-store/src/connectors.rs`)
+ * field-for-field, including its lowercase wire form
+ * (`#[serde(rename_all = "lowercase")]`).
+ */
+export type SecretSlot = "primary" | "secondary"
+
+/**
+ * Which resolver scheme a derived connector-credential name uses. Mirrors
+ * Rust `CredentialSource` (`rust/crates/lakehouse-store/src/connectors.rs`)
+ * field-for-field, including its `snake_case` wire form.
+ */
+export type CredentialSource = "env" | "file"
+
+/**
+ * The fixed suffix a derived connector-credential name ends in. Mirrors
+ * Rust `CredentialKind` — ADR 0002 Addendum 3's six allowed suffixes,
+ * `snake_case` wire form. `private_key` is for the `sftp` adapter's
+ * `SftpAuth`'s `public_key` auth kind (a private-key PEM, not any of the
+ * other five shapes).
+ */
+export type CredentialKind =
+  | "password"
+  | "secret_key"
+  | "access_key"
+  | "api_key"
+  | "token"
+  | "private_key"
+
+/**
+ * What the client chooses for a connector's credential(s): a source scheme
+ * and a kind per slot. Never a reference NAME -- the client does not know
+ * the connector's id yet (the server generates it), so it cannot name a
+ * ref itself. The server derives the actual name(s) from the id it
+ * generates and returns them once, in `CreateConnectorResponse.credential`
+ * (see `docs/adr/0002-secretref-resolution.md`'s Addendum 3).
+ */
+export type CredentialSpec = {
+  source: CredentialSource
+  primary: CredentialKind
+  /**
+   * Optional secondary slot, e.g. the secret-access-key half of an S3
+   * connector's access-key/secret-key pair. Without this, an API-created S3
+   * connector can never be tested — `connector_probe::probe_s3` requires
+   * both slots to be set.
+   */
+  secondary?: CredentialKind
+}
+
+/**
+ * The `PUT /api/connectors/{id}/secret` body. No free-text ref any more
+ * (ADR 0002 Addendum 3): the caller chooses a source/kind for the slot
+ * being rotated, and the server derives the new ref from the CONNECTOR'S
+ * OWN id (a derived `env:` name always begins `CONNECTOR_CONN_`, so a
+ * rotation can never target one of the deployment's reserved, seeded
+ * patterns). The server runs a real connectivity probe against a
+ * candidate built with the derived ref BEFORE writing anything -- see
+ * `rust/crates/lakehouse-api/src/routes/connectors.rs::rotate_secret`'s
+ * doc comment for the full probe-first contract, including why an
+ * unverifiable rotation is refused (422) rather than applied
+ * unverified.
+ */
+export type RotateConnectorSecretRequest = {
+  slot: SecretSlot
+  source: CredentialSource
+  kind: CredentialKind
+}
+
+/**
+ * The `PUT /api/connectors/{id}/secret` response body. Mirrors Rust
+ * `RotateSecretResponse` exactly.
+ */
+export type RotateConnectorSecretResponse = {
+  /** Always `true` on a successful (2xx) response -- a refused rotation
+   * is a non-2xx `ServiceError`, never this shape with `rotated: false`. */
+  rotated: boolean
+  slot: SecretSlot
+}
+
 export type CreateConnectorInput = {
   name: string
   type: string
   direction: Connector["direction"]
   host: string
-  secretRef: string
-  /**
-   * Optional secondary reference, e.g. the secret-access-key half of an S3
-   * connector's access-key/secret-key pair. Without this, an API-created S3
-   * connector can never be tested — `connector_probe::probe_s3` requires
-   * both `secretRef` and `secretRefSecondary` to be set.
-   */
-  secretRefSecondary?: string
+  /** No `secretRef`/`secretRefSecondary` field any more (ADR 0002
+   * Addendum 3) -- see `CredentialSpec`'s doc comment. */
+  credential: CredentialSpec
   environment: string
   tenant: string
   residency: string
   capabilities: string[]
   owner?: string
+}
+
+/**
+ * The credential reference NAMES a newly created connector's operator
+ * must provision -- returned ONCE, by `POST /api/connectors`, and never
+ * again (no GET response for this connector repeats them). Mirrors Rust
+ * `ConnectorCredentialNames`.
+ */
+export type ConnectorCredentialNames = {
+  primary: string
+  secondary: string | null
+}
+
+/**
+ * The `POST /api/connectors` response body: the created `Connector` plus
+ * the names the operator must provision. Mirrors Rust
+ * `CreateConnectorResponse`.
+ */
+export type CreateConnectorResponse = Connector & {
+  credential: ConnectorCredentialNames
 }
 
 /**
@@ -94,7 +213,7 @@ export type Dial = Record<string, unknown>
  * against `Dial` alone could not otherwise be checked against its own
  * adapter's real fields.
  */
-export type SqlDriver = "mysql" | "postgres" | "mssql"
+export type SqlDriver = "mysql" | "postgres" | "mssql" | "oracle"
 
 export type SqlDial = {
   driver: SqlDriver
@@ -105,6 +224,13 @@ export type SqlDial = {
    * `SqlDial::user` doc comment. */
   user: string
   sslMode: string | null
+  /**
+   * An operator-typed Distinguished Name, required whenever `sslMode`
+   * implies TLS for `driver: "oracle"` — never derived from `host` (a
+   * bare `CN=<hostname>` would not match a real certificate's full DN).
+   * Ignored for every other driver. Mirrors `SqlDial::ssl_server_cert_dn`.
+   */
+  sslServerCertDn?: string | null
 }
 
 /** `CdcDial` = `SqlDial`'s fields plus `slotName`/`publicationName`,
@@ -166,6 +292,64 @@ export type SheetsDial = {
 }
 
 /**
+ * `dial` for the `mongodb` adapter. Mirrors `MongoDial`
+ * (`ingest_spec.rs`, `#[serde(deny_unknown_fields, rename_all =
+ * "camelCase")]`) exactly. `directConnection` MUST be `true` — this build
+ * refuses `mongodb+srv` and replica-set discovery outright; there is no
+ * `srvUri` field at all (never a toggle for something the server
+ * refuses). `username` is a literal, never a `secretRef` picker, same
+ * reasoning as `SqlDial.user`.
+ */
+export type MongoDial = {
+  hosts: string[]
+  database: string
+  username: string
+  directConnection: true
+}
+
+/**
+ * `dial` for the `kafka` adapter. Mirrors `KafkaDial` (`ingest_spec.rs`)
+ * exactly.
+ */
+export type KafkaDial = {
+  bootstrapServers: string[]
+  topic: string
+  auth: KafkaAuth
+  groupId: string
+  microBatchSeconds: number
+}
+
+/**
+ * Internally tagged on `type`, mirroring `KafkaAuth`
+ * (`#[serde(tag = "type")]`) exactly — the two variants
+ * `KafkaAuth::type_tag` names. `sasl_plain`'s `username` is dial
+ * configuration, not a secret (only the password is, via the connector's
+ * `secretRef`) — see `KafkaAuth::SaslPlain`'s doc comment.
+ */
+export type KafkaAuth = { type: "sasl_plain"; username: string } | { type: "none" }
+
+/**
+ * `dial` for the `sftp` adapter. Mirrors `SftpDial` (`ingest_spec.rs`)
+ * exactly. `hostKeyFingerprint` is REQUIRED with no fallback — host-key
+ * verification, never `paramiko.AutoAddPolicy`.
+ */
+export type SftpDial = {
+  host: string
+  port: number
+  user: string
+  hostKeyFingerprint: string
+  path: string
+  fileFormat: string
+  auth: SftpAuth
+}
+
+/**
+ * Internally tagged on `type`, mirroring `SftpAuth`
+ * (`#[serde(tag = "type")]`) exactly.
+ */
+export type SftpAuth = { type: "password" } | { type: "public_key" }
+
+/**
  * One object (table, endpoint, sheet range) an ingest job targets.
  * Mirrors `SourceObject` in
  * `rust/crates/lakehouse-store/src/ingest_spec.rs` (`#[serde(deny_unknown_fields,
@@ -190,19 +374,31 @@ export type IngestSecretRefs = {
 
 /**
  * The closed set the database enforces via `connector_adapter_check`
- * (`rust/migrations/0033_connector_ingest_spec.sql`). Widened with
- * `| string` because the Rust field is a plain `Option<String>`, not a
- * closed enum — the client stays honest about a value the server might
- * send that predates this list or that a future migration adds.
+ * (`rust/migrations/0033_connector_ingest_spec.sql`, widened by
+ * `0043_ingest_tier2_adapters.sql` to add the three Tier 2 values below).
+ * Widened with `| string` because the Rust field is a plain
+ * `Option<String>`, not a closed enum — the client stays honest about a
+ * value the server might send that predates this list or that a future
+ * migration adds.
  */
-export type IngestAdapter = "sql" | "cdc" | "files" | "rest" | "sheets" | string
+export type IngestAdapter =
+  | "sql"
+  | "cdc"
+  | "files"
+  | "rest"
+  | "sheets"
+  | "mongodb"
+  | "kafka"
+  | "sftp"
+  | string
 
 /**
  * The closed set the database enforces via `connector_ingest_mode_check`
- * (`rust/migrations/0033_connector_ingest_spec.sql`). See `IngestAdapter`
- * for why this widens with `| string`.
+ * (`rust/migrations/0033_connector_ingest_spec.sql`, widened by
+ * `0043_ingest_tier2_adapters.sql` to add `"stream"` for `kafka`). See
+ * `IngestAdapter` for why this widens with `| string`.
  */
-export type IngestMode = "batch" | "cdc" | string
+export type IngestMode = "batch" | "cdc" | "stream" | string
 
 /**
  * A connector's ingest configuration, as returned by
@@ -360,7 +556,7 @@ export type IngestibleConnector = {
 export interface ConnectorService {
   listConnectors(signal?: AbortSignal): Promise<Connector[]>
   getConnector(id: string, signal?: AbortSignal): Promise<ConnectorDetail>
-  createConnector(input: CreateConnectorInput, signal?: AbortSignal): Promise<Connector>
+  createConnector(input: CreateConnectorInput, signal?: AbortSignal): Promise<CreateConnectorResponse>
   testConnection(id: string, signal?: AbortSignal): Promise<ConnectorTestResult>
   getIngestSpec(id: string, signal?: AbortSignal): Promise<IngestSpec>
   setIngestSpec(id: string, input: IngestSpecInput, signal?: AbortSignal): Promise<IngestSpec>
@@ -391,4 +587,21 @@ export interface ConnectorService {
     table: string,
     signal?: AbortSignal
   ): Promise<DebeziumProperties>
+  /**
+   * `GET /api/connectors/{id}/probe-history?limit=` — the connector's most
+   * recent connectivity-probe results, newest first. `limit` defaults to
+   * 50 server-side when omitted; the server rejects (never silently
+   * clamps) a `limit` outside `1..=200`.
+   */
+  listProbeHistory(id: string, limit?: number, signal?: AbortSignal): Promise<ProbeHistoryResponse>
+  /**
+   * `PUT /api/connectors/{id}/secret` — probe-first credential-reference
+   * rotation. Rejects (never applies) a rotation this build cannot verify
+   * -- see `RotateConnectorSecretRequest`'s doc comment.
+   */
+  rotateSecret(
+    id: string,
+    body: RotateConnectorSecretRequest,
+    signal?: AbortSignal
+  ): Promise<RotateConnectorSecretResponse>
 }

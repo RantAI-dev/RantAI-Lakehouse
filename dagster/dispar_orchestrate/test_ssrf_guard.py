@@ -19,6 +19,7 @@ import pytest
 from dispar_orchestrate.ssrf_guard import (
     ResolvedAddress,
     SsrfBlocked,
+    checking_resolver,
     pinned_resolution,
     resolve_checked,
 )
@@ -111,3 +112,58 @@ def test_pinned_resolution_leaves_other_hosts_unaffected():
     with pinned_resolution("pinned.invalid", resolved):
         with pytest.raises(socket.gaierror):
             socket.getaddrinfo("definitely-not-a-real-host.invalid", 443)
+
+
+def test_checking_resolver_allows_a_public_reconnect_mid_context():
+    with checking_resolver(getaddrinfo=_fake_getaddrinfo("93.184.216.34")):
+        infos = socket.getaddrinfo("newly-advertised.invalid", 9092, 0, socket.SOCK_STREAM)
+        assert infos[0][4][0] == "93.184.216.34"
+
+
+def test_checking_resolver_refuses_a_reconnect_to_an_internal_address_advertised_mid_batch():
+    # A broker advertised AFTER the batch started, resolving to an
+    # internal address -- this is the window a one-shot pre-check
+    # (check_all_advertised_brokers) cannot close, and checking_resolver
+    # exists specifically to close it: EVERY
+    # getaddrinfo call made anywhere during the context is checked, not
+    # just the ones made before entering it.
+    with pytest.raises(SsrfBlocked):
+        with checking_resolver(getaddrinfo=_fake_getaddrinfo("10.0.0.9")):
+            socket.getaddrinfo("re-advertised-mid-batch.invalid", 9092, 0, socket.SOCK_STREAM)
+
+
+def test_checking_resolver_restores_the_real_getaddrinfo_on_exit():
+    original = socket.getaddrinfo
+    with checking_resolver(getaddrinfo=_fake_getaddrinfo("93.184.216.34")):
+        pass
+    assert socket.getaddrinfo is original
+
+
+def test_checking_resolver_propagates_the_batchs_own_exception_instead_of_swallowing_it():
+    with pytest.raises(RuntimeError):
+        with checking_resolver(getaddrinfo=_fake_getaddrinfo("93.184.216.34")):
+            raise RuntimeError("the batch itself failed for an unrelated reason")
+
+def test_checking_resolver_refuses_a_link_local_ipv6_address_that_carries_a_zone_id():
+    """`fe80::1%eth0` is link-local — the range this guard exists to stop —
+    but `ipaddress.ip_address` cannot parse it until the zone id is
+    stripped. Before that strip it raised `ValueError` instead of a
+    refusal naming the reason."""
+    def fake(host, port, *args, **kwargs):
+        return [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("fe80::1%eth0", port, 0, 2))]
+
+    with checking_resolver(allow_internal_hosts=False, getaddrinfo=fake):
+        with pytest.raises(SsrfBlocked, match="private/internal/multicast"):
+            socket.getaddrinfo("broker.invalid", 9092)
+
+
+def test_checking_resolver_refuses_an_address_it_cannot_evaluate_at_all():
+    """An address this guard cannot parse has not been shown to be safe,
+    so it is refused — fail closed, with a message that says why, rather
+    than letting a bare `ValueError` abort the dial namelessly."""
+    def fake(host, port, *args, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("not-an-ip", port))]
+
+    with checking_resolver(allow_internal_hosts=False, getaddrinfo=fake):
+        with pytest.raises(SsrfBlocked, match="not an address this guard can evaluate"):
+            socket.getaddrinfo("broker.invalid", 9092)

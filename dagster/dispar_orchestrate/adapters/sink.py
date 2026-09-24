@@ -44,14 +44,60 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Protocol
+from datetime import datetime, timezone
+from typing import Any, Protocol
 
 import dlt
 from dlt.destinations import filesystem
 from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
+from dlt.extract.resource import DltResource
+from dlt.extract.source import DltSource
 
 logger = logging.getLogger(__name__)
+
+
+def _stamp_ingested_at(record: dict[str, Any]) -> dict[str, Any]:
+    """Bronze's system ingestion-time column (ADR 0004's
+    `bronze::INGESTED_AT_COLUMN` equivalent for the dlt write path) --
+    stamped here, the ONE place any Bronze row this sink writes gets it,
+    never read from the source: a row arriving with its own `_ingested_at`
+    (e.g. a Kafka payload that happens to carry a same-named field) is
+    OVERWRITTEN, not preserved, so partitioning never depends on a
+    source-provided timestamp existing, being non-null, or meaning what
+    this column means."""
+    record["_ingested_at"] = datetime.now(timezone.utc)
+    return record
+
+
+def _stamp_rows(rows: Iterable[dict[str, Any]]) -> Iterable[dict[str, Any]]:
+    """Lazily stamp a plain iterable of dicts (the Kafka micro-batch shape,
+    `ingest_factory.py::run_kafka_stream_batch`'s `batch.rows`) without
+    mutating the caller's own dicts -- `batch.rows` is read again by that
+    caller (`_record(rows=...)` logs a COUNT, not the rows themselves, but
+    nothing here should assume that stays true forever), so each row is
+    copied before the stamp is written rather than stamped in place."""
+    for row in rows:
+        yield _stamp_ingested_at(dict(row))
+
+
+def _stamp_for_load(source: Any) -> Any:
+    """Make `_ingested_at` land on every row `load_via_sink` writes,
+    whatever shape `source` is -- a `dlt` `DltSource` (every resource it
+    carries), a bare `DltResource`, or a plain iterable of dicts (the
+    Kafka micro-batch). This is the ADR 0004 stamp's ONE call site now:
+    `dlt_pipeline.py::run_bronze_ingest` used to call `resource.add_map`
+    itself, and `ingest_factory.py`'s other adapters never stamped at
+    all -- see this module's own docstring for why that was a bug."""
+    if isinstance(source, DltSource):
+        for resource in source.resources.values():
+            resource.add_map(_stamp_ingested_at)
+        return source
+    if isinstance(source, DltResource):
+        source.add_map(_stamp_ingested_at)
+        return source
+    return _stamp_rows(source)
 
 
 class BronzeIngestConfigLike(Protocol):
@@ -195,17 +241,32 @@ def load_via_sink(source, bronze_table_name: str, config: SinkConfig) -> SinkRes
         },
     )
 
-    # Adapters apply their own `apply_hints`/`add_map` to their resource(s)
-    # before calling this function; `iceberg_adapter` accepts a whole
-    # `DltSource` (applying to every resource it carries), which is exactly
-    # the ONE resource a single-table adapter like `run_bronze_ingest`
-    # builds -- matching the original code's `iceberg_adapter(resource,
-    # ...)` (`resource` was that source's only member) without this shared
-    # sink needing to know the source's internal resource-name key
-    # (`apply_hints(table_name=...)` does not rename that key, so this sink
-    # cannot look the resource up by `bronze_table_name` the way the
-    # pre-extraction code -- which built the source itself -- could).
-    iceberg_adapter(
+    # ADR 0004: every Bronze row carries `_ingested_at`, stamped here --
+    # the ONE owner of the column, regardless of what shape a caller
+    # handed this sink (`_stamp_for_load`, above). This used to be true
+    # only for `dlt_pipeline.py::run_bronze_ingest`'s own resource (it
+    # called `add_map` itself before reaching this function); every other
+    # caller -- `ingest_factory.py`'s batch adapters and its Kafka
+    # micro-batch -- sent rows with no `_ingested_at` at all, which fails
+    # outright for a `sql_database` source (`iceberg_adapter`'s partition
+    # spec below names a field `build_iceberg_partition_spec` cannot find)
+    # and silently under-partitions everything else. Stamping unconditionally
+    # here, before `iceberg_adapter` fixes the partition spec to that
+    # column, closes that gap for every caller at once.
+    source = _stamp_for_load(source)
+
+    # Adapters still apply their own `apply_hints` (table name, primary
+    # key, etc.) to their resource(s) before calling this function;
+    # `iceberg_adapter` accepts a whole `DltSource` (applying to every
+    # resource it carries), which is exactly the ONE resource a
+    # single-table adapter like `run_bronze_ingest` builds -- matching the
+    # original code's `iceberg_adapter(resource, ...)` (`resource` was
+    # that source's only member) without this shared sink needing to know
+    # the source's internal resource-name key (`apply_hints(table_name=...)`
+    # does not rename that key, so this sink cannot look the resource up
+    # by `bronze_table_name` the way the pre-extraction code -- which
+    # built the source itself -- could).
+    adapted = iceberg_adapter(
         source,
         partition=[iceberg_partition.day("_ingested_at")],
         # PR #29 review: format-version 2 was claimed "confirmed" without
@@ -220,6 +281,13 @@ def load_via_sink(source, bronze_table_name: str, config: SinkConfig) -> SinkRes
         # reports back.
         table_properties={"format-version": "2"},
     )
+    # For a `DltSource`/`DltResource`, `iceberg_adapter` applies the hints
+    # in place to the resource `source` already carries. For plain rows
+    # (the Kafka micro-batch) it wraps them in a NEW resource and applies
+    # the hints only to that, so running the raw rows would drop the
+    # partition spec and `format-version` above. Run what it returned.
+    if not isinstance(source, (DltSource, DltResource)):
+        source = adapted
 
     pipeline = dlt.pipeline(
         pipeline_name=f"bronze_ingest_{bronze_table_name}",

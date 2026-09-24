@@ -1553,6 +1553,21 @@ services:
       BRONZE_SOURCE_DB_PORT: "5432"
       BRONZE_SOURCE_DB_USER: ${POSTGRES_USER:-lakehouse}
       BRONZE_SOURCE_DB_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:-lakehouse}}
+      # Verification correction: `BRONZE_SOURCE_DB_PASSWORD` above
+      # only ever fed the g3a demo pipeline's OWN hardcoded credential
+      # assembly (`dlt_pipeline.py`). The SEEDED `conn-pg-lakehouse`
+      # connector's `secretRef` is the literal string
+      # `"env:CONNECTOR_PG_PASSWORD"` (`0033_connector_ingest_spec.sql`),
+      # and `secret_resolver.py::resolve_secret_ref` does
+      # `os.environ.get("CONNECTOR_PG_PASSWORD")` -- a DIFFERENT name,
+      # never previously exported here under its own name -- so
+      # `POST /api/connectors/conn-pg-lakehouse/ingest/run` always failed
+      # with `SecretRefRejected: ... allowlisted but unset in this
+      # environment` (reproduced against this stack) for every
+      # deployment of this compose file, not just the gate. Exported here
+      # under its own name, same value as above, so both readers resolve
+      # it.
+      CONNECTOR_PG_PASSWORD: ${CONNECTOR_PG_PASSWORD:-${POSTGRES_PASSWORD:-lakehouse}}
       BRONZE_SOURCE_DB_NAME: ${POSTGRES_DB:-lakehouse}
       BRONZE_SOURCE_SCHEMA: ${BRONZE_SOURCE_SCHEMA:-ingest_demo}
       BRONZE_SOURCE_TABLE: ${BRONZE_SOURCE_TABLE:-orders}
@@ -2590,12 +2605,66 @@ services:
       timeout: 5s
       retries: 20
 
+  # `adapters/sql.py::_mssql_connection_string` fixes
+  # `Encrypt=yes;TrustServerCertificate=no` (a deliberate, hardened
+  # choice -- that module's own doc comment: an injection-shaped
+  # `database`/`user` value must never be able to switch certificate
+  # verification off) and sets `HostNameInCertificate=<host>` so
+  # verification targets the real hostname even though the socket dials
+  # a pinned IP. A stock `mssql-g6` container's default self-signed
+  # certificate cannot satisfy that -- `mssql-g6-cert-init` below mints
+  # one FOR this fixture (CN/SAN `mssql-g6`, matching the name every
+  # dial in this gate connects by) so the real, unrelaxed verification
+  # path is what gets exercised end-to-end, not a weakened one.
+  mssql-g6-cert-init:
+    image: alpine:3.20
+    profiles: ["g6"]
+    restart: "no"
+    volumes:
+      - mssql_g6_tls:/out
+    entrypoint: ["/bin/sh", "-c"]
+    # Idempotent: `docker compose run --rm g6-test-runner` re-walks and
+    # re-satisfies this whole dependency graph on every invocation,
+    # re-running this already-`service_completed_successfully` one-shot
+    # job -- a second, unconditional `openssl req` would overwrite the
+    # volume with a NEW cert after `mssql-g6` (already running) has
+    # already loaded the FIRST one into its TLS listener, producing a
+    # real cert/served-cert mismatch (reproduced against this stack:
+    # `SSL routines::certificate verify failed:self-signed certificate`,
+    # NOT a real security gap, an artifact of regenerating the file out
+    # from under an already-running server). Skips regeneration when a
+    # cert already exists in the volume.
+    command:
+      - >
+        test -f /out/mssql-g6.pem ||
+        { apk add --no-cache openssl >/dev/null &&
+        openssl req -x509 -newkey rsa:2048 -nodes -days 1
+        -keyout /out/mssql-g6.key -out /out/mssql-g6.pem
+        -subj "/CN=mssql-g6" -addext "subjectAltName=DNS:mssql-g6" &&
+        chmod 644 /out/mssql-g6.key /out/mssql-g6.pem; }
+
   mssql-g6:
     image: mcr.microsoft.com/mssql/server:2022-latest
     profiles: ["g6"]
     restart: "no"
+    depends_on:
+      mssql-g6-cert-init:
+        condition: service_completed_successfully
     environment:
       ACCEPT_EULA: "Y"
+    volumes:
+      - mssql_g6_tls:/etc/mssql-tls:ro
+    # The image's real ENTRYPOINT (`launch_sqlservr.sh`, `docker image
+    # inspect`) does the first-run setup (`ACCEPT_EULA`/`MSSQL_SA_PASSWORD`
+    # handling) -- overridden here only to run `mssql-conf set` BEFORE
+    # handing off to that same script, never bypassing it.
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >
+        /opt/mssql/bin/mssql-conf set network.tlscert /etc/mssql-tls/mssql-g6.pem &&
+        /opt/mssql/bin/mssql-conf set network.tlskey /etc/mssql-tls/mssql-g6.key &&
+        /opt/mssql/bin/mssql-conf set network.forceencryption 0 &&
+        exec /opt/mssql/bin/launch_sqlservr.sh /opt/mssql/bin/sqlservr
     healthcheck:
       test: ["CMD", "/opt/mssql-tools18/bin/sqlcmd", "-C", "-S", "localhost", "-U", "sa", "-Q", "SELECT 1"]
       interval: 5s
@@ -2609,12 +2678,106 @@ services:
     profiles: ["g6"]
     restart: "no"
 
+  # Tier 2 (G6) — the mongodb-adapter fixture
+  # (dagster/dispar_orchestrate/adapters/mongodb.py). Deliberately a
+  # STANDALONE mongod, no `--replSet`: `ssrf_guard_mongo.validate_mongo_dial`
+  # refuses replica-set discovery and `mongodb+srv` outright, connecting
+  # only with `directConnection=true` (read in full before adding this
+  # fixture) — a replica set would be a fixture for a connection shape
+  # this adapter never makes, not a more realistic one. Root credentials
+  # are gate-only (`ops/g6/docker-compose.g6.override.yml`, same
+  # relocation reasoning as `mysql-g6`'s WS3 item 37 comment above);
+  # without the override this service starts with NO authentication at
+  # all, matching `mysql-g6`'s own override-free shape (no root password
+  # configured either) — neither is reachable outside this compose
+  # network regardless.
+  mongo-g6:
+    image: mongo:7
+    profiles: ["g6"]
+    restart: "no"
+    environment:
+      MONGO_INITDB_DATABASE: g6_ingest
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Tier 2 (G6) — the kafka-adapter fixture
+  # (dagster/dispar_orchestrate/adapters/kafka.py). KRaft, single node,
+  # PLAINTEXT — no ZooKeeper, no SASL/TLS: the gate's kafka connector
+  # dials with `auth.type = "none"`, and a `PLAINTEXT` broker needs
+  # nothing more from this fixture. `KAFKA_ADVERTISED_LISTENERS` names
+  # this SAME service's own compose DNS name, so the post-bootstrap
+  # advertised-broker guard (`ssrf_guard_kafka.check_all_advertised_brokers`)
+  # sees the identical, real, resolvable address the client already
+  # dialed — nothing to refuse here (that fixture is `kafka-g6-spoofed`
+  # below). No `CLUSTER_ID`: the `apache/kafka` image self-formats
+  # storage with a freshly generated cluster id on first start when none
+  # is given, which is fine for a `restart: "no"` fixture that is never
+  # expected to survive a restart with existing data.
+  kafka-g6:
+    image: apache/kafka:3.8.0
+    profiles: ["g6"]
+    restart: "no"
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka-g6:9092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-g6:9093"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # Tier 2 (G6) — the advertised-broker SSRF fixture. A client that
+  # bootstraps here (at THIS service's own, legitimately resolvable
+  # compose DNS name — the bootstrap host is operator-supplied, never
+  # checked by `ssrf_guard_kafka`, see that module's doc comment) is
+  # handed cluster metadata advertising a DIFFERENT broker address,
+  # `internal-only-g6:9092`, via the `default` network alias below.
+  # Docker's embedded DNS resolves that alias to THIS SAME container's
+  # own address — which, like every container on this compose network,
+  # is an ordinary RFC1918-private address — giving
+  # `check_all_advertised_brokers` a real, live, PRIVATE address to
+  # refuse, exactly the "broker advertises an internal address the
+  # operator never configured" scenario this guard exists for. No
+  # additional trick is needed to land the address in a private range:
+  # every compose-network container already is one.
+  kafka-g6-spoofed:
+    image: apache/kafka:3.8.0
+    profiles: ["g6"]
+    restart: "no"
+    networks:
+      default:
+        aliases:
+          - internal-only-g6
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://internal-only-g6:9092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-g6-spoofed:9093"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
   # WS3 (G6) — the ingest matrix acceptance test (ops/g6/g6_ingest_matrix_test.py).
   # Builds from the dagster-code-location image (not a bare python:3.12-slim,
-  # unlike g3a-test-runner/g4-test-runner above) because it needs pymysql/
-  # pyodbc, and the dagster-code-location image already carries the ODBC
-  # driver apt-install sequence dagster/dispar_orchestrate/adapters/sql.py
-  # needs -- avoiding a third, separate ODBC-driver install to maintain.
+  # unlike g3a-test-runner/g4-test-runner above): that image already
+  # carries `pymysql`/`pyodbc` (Python packages) AND the ODBC Driver 18 +
+  # unixodbc runtime `pyodbc` needs at import time (`dagster/Dockerfile`),
+  # so this test runner needs no separate driver install of its own.
   g6-test-runner:
     profiles: ["g6"]
     build:
@@ -2632,6 +2795,12 @@ services:
         condition: service_healthy
       rest-stub-g6:
         condition: service_started
+      mongo-g6:
+        condition: service_healthy
+      kafka-g6:
+        condition: service_healthy
+      kafka-g6-spoofed:
+        condition: service_healthy
     environment:
       LAKEHOUSE_API_URL: http://lakehouse-api:8080
       DAGSTER_URL: http://dagster-webserver:3000/graphql
@@ -2640,13 +2809,37 @@ services:
       CH_PASSWORD: ${CH_PASSWORD:-}
       CH_LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      # R1 (ADR 0011): ClickHouse's `DataLakeCatalog` engine needs these
+      # three settings on every `CREATE DATABASE ... ENGINE =
+      # DataLakeCatalog(...)` statement whenever Lakekeeper authorization
+      # is enabled (`ops/g3a/g3a_test.py`'s `ch_auth_settings`, same
+      # pattern) -- omitting them is exactly a
+      # `401 MissingAuthorizationHeader` from Lakekeeper (reproduced
+      # against this stack). `CH_OAUTH_CLIENT_ID`/`CH_OAUTH_SERVER_URI`
+      # point ClickHouse's OAuth2 client-credentials exchange at
+      # `ops/oidc-mock`'s own `/token` endpoint for the `clickhouse-reader`
+      # principal (`ADR 0011 Decision 4`), the same three values every
+      # other real ClickHouse-DataLakeCatalog caller in this file already
+      # sets (`g3a-test-runner`, `g4-test-runner`, `gold-export-test-runner`).
+      CH_RUSTFS_S3_ENDPOINT: http://rustfs:9000
+      CH_OAUTH_CLIENT_ID: clickhouse-reader
+      CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
       AUTH_BOOTSTRAP_PASSWORD: ${AUTH_BOOTSTRAP_PASSWORD:-}
-      # MYSQL_ROOT_PASSWORD, MSSQL_SA_PASSWORD: gate-only, set in
-      # ops/g6/docker-compose.g6.override.yml -- see the comment above
-      # mysql-g6/mssql-g6 in this file (WS3 item 37).
+      # Same RustFS default credentials `lakehouse-api`'s own
+      # CONNECTOR_S3_ACCESS_KEY/CONNECTOR_S3_SECRET_KEY fall back to
+      # above -- not gate-only (this is the checked-in local-stack
+      # default, not a secret), needed here so the gate can write the
+      # `g6-files` connector's derived `file:` credential (ADR 0002
+      # Addendum 3) with the value that actually unlocks this stack's
+      # RustFS.
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:-rustfsadmin}
+      # MYSQL_ROOT_PASSWORD, MSSQL_SA_PASSWORD, MONGO_G6_ROOT_PASSWORD:
+      # gate-only, set in ops/g6/docker-compose.g6.override.yml -- see
+      # the comment above mysql-g6/mssql-g6 in this file (WS3 item 37).
     entrypoint: ["/bin/sh", "-c"]
-    command: ["pip install -q requests pymysql pyodbc && python g6_ingest_matrix_test.py"]
+    command: ["pip install -q requests && python g6_ingest_matrix_test.py"]
     restart: "no"
 
   # WS3 (G6) — the override-free link-local rejection proof
@@ -2663,6 +2856,15 @@ services:
     depends_on:
       dagster-code-location:
         condition: service_started
+      # The advertised-broker spoof step
+      # (step_kafka_spoofed_advertised_broker) needs a real, running
+      # kafka-g6-spoofed to bootstrap against -- this pulls in the "g6"
+      # profile's fixture even though this service is itself "dagster"
+      # profile (see this service's own doc comment for why THAT stays
+      # true: it must remain runnable against the default compose file
+      # alone with no override needed for INGEST_ALLOW_INTERNAL_HOSTS).
+      kafka-g6-spoofed:
+        condition: service_healthy
     environment:
       LAKEHOUSE_API_URL: http://lakehouse-api:8080
       AUTH_BOOTSTRAP_EMAIL: ${AUTH_BOOTSTRAP_EMAIL:-}
@@ -2672,6 +2874,13 @@ services:
     restart: "no"
 
 volumes:
+  # The self-signed cert mssql-g6-cert-init mints for mssql-g6's TLS
+  # listener (CN/SAN mssql-g6) -- read-only from mssql-g6 itself and,
+  # gate-only via ops/g6/docker-compose.g6.override.yml, from
+  # dagster-code-location, so the mssql adapter's real, unrelaxed
+  # certificate verification (`Encrypt=yes;TrustServerCertificate=no`)
+  # has something genuine to verify against instead of being relaxed.
+  mssql_g6_tls:
   lakehouse_postgres_data:
   lakehouse_clickhouse_data:
   lakehouse_rustfs_data:

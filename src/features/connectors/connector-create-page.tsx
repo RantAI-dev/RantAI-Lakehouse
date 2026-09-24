@@ -12,17 +12,28 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { CdcDialForm } from "@/features/connectors/dial-forms/cdc-dial-form"
 import { FilesDialForm } from "@/features/connectors/dial-forms/files-dial-form"
+import { KafkaDialForm } from "@/features/connectors/dial-forms/kafka-dial-form"
+import { MongoDialForm } from "@/features/connectors/dial-forms/mongo-dial-form"
+import { OracleDialForm } from "@/features/connectors/dial-forms/oracle-dial-form"
 import { RestDialForm } from "@/features/connectors/dial-forms/rest-dial-form"
+import { SftpDialForm } from "@/features/connectors/dial-forms/sftp-dial-form"
 import { SheetsDialForm } from "@/features/connectors/dial-forms/sheets-dial-form"
 import { SqlDialForm } from "@/features/connectors/dial-forms/sql-dial-form"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { cn } from "@/lib/utils"
 import { connectorService } from "@/services"
+import { CREDENTIAL_KIND_OPTIONS } from "./credential-options"
 import type {
   CdcDial,
   Connector,
+  CredentialKind,
+  CredentialSource,
+  CredentialSpec,
   FilesDial,
+  KafkaDial,
+  MongoDial,
   RestDial,
+  SftpDial,
   SheetsDial,
   SourceObject,
   SqlDial,
@@ -55,6 +66,7 @@ function hostFromDial(adapter: string | null, dial: Record<string, unknown> | nu
   switch (adapter) {
     case "sql":
     case "cdc":
+    case "sftp":
       return typeof dial.host === "string" ? dial.host : ""
     case "files":
       return typeof dial.bucket === "string" ? dial.bucket : ""
@@ -62,20 +74,78 @@ function hostFromDial(adapter: string | null, dial: Record<string, unknown> | nu
       return typeof dial.baseUrl === "string" ? dial.baseUrl : ""
     case "sheets":
       return typeof dial.spreadsheetId === "string" ? dial.spreadsheetId : ""
+    case "mongodb":
+      return Array.isArray(dial.hosts) && typeof dial.hosts[0] === "string" ? (dial.hosts[0] as string) : ""
+    case "kafka":
+      return Array.isArray(dial.bootstrapServers) && typeof dial.bootstrapServers[0] === "string"
+        ? (dial.bootstrapServers[0] as string)
+        : ""
     default:
       return ""
   }
 }
 
+/**
+ * A sensible default primary/secondary kind per adapter -- the server
+ * derives the actual reference NAME from the connector's own id (ADR 0002
+ * Addendum 3), so this only picks which fixed suffix each slot uses.
+ * `sql`/`cdc`/`mongodb`/`sftp`/`kafka` connectors dial with a single
+ * password; a `files` (S3-shaped) connector needs an access-key/
+ * secret-key pair; a `rest` connector most commonly authenticates with an
+ * API key or bearer token. The user can still change either select --
+ * this only seeds the initial value.
+ */
+// mongodb/oracle(sql)/kafka(sasl_plain)/sftp(password) all fall into the
+// `default` "password" case below, same as the pre-Tier-2 sql/cdc
+// adapters -- no adapter-specific branch needed for them. `sftp`'s
+// `public_key` auth kind needs `private_key` instead; the user switches
+// the primary select themselves after picking that auth type in the dial
+// form (this seed only picks a starting value, per this function's own
+// doc comment above). `kafka`'s `none` auth needs no credential at all
+// (`secret_field_names` maps `("kafka", "none")` to no fields) but
+// `CreateConnectorInput.credential.primary`/`CredentialSpec::primary` is
+// a REQUIRED field server-side -- there is no honest "no credential" kind
+// to send. Rather than invent one, this seeds `password` like every other
+// adapter; the derived name is simply never provisioned for a `none`
+// Kafka connector, and "Test"/ingest never reads it (the adapter's own
+// `secret_field_names` lookup returns no fields, so nothing is resolved).
+function defaultCredentialForAdapter(adapter: string | null): { primary: CredentialKind; secondary: CredentialKind | null } {
+  switch (adapter) {
+    case "files":
+      return { primary: "access_key", secondary: "secret_key" }
+    case "rest":
+      return { primary: "api_key", secondary: null }
+    default:
+      return { primary: "password", secondary: null }
+  }
+}
+
 function DialFormFor({
   adapter,
+  typeName,
   dial,
   onChange,
 }: {
   adapter: string | null
+  /** `selectedType.name` — needed alongside `adapter` because Oracle
+   * dials with the same `sql` adapter/`SqlDial` shape every other SQL
+   * driver does (`SqlDriver::Oracle`, `ingest_spec.rs`), not a distinct
+   * `adapter` value; `adapter` alone cannot tell Oracle apart from
+   * PostgreSQL/MySQL/SQL Server. */
+  typeName: string | null
   dial: Record<string, unknown> | null
   onChange: (next: Record<string, unknown>) => void
 }) {
+  // Oracle is the one type whose dial form is picked by NAME, not by
+  // `adapter` alone -- see this function's `typeName` doc comment above.
+  if (adapter === "sql" && typeName === "Oracle") {
+    return (
+      <OracleDialForm
+        value={dial as unknown as SqlDial | null}
+        onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+      />
+    )
+  }
   switch (adapter) {
     case "sql":
       return (
@@ -112,6 +182,27 @@ function DialFormFor({
           onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
         />
       )
+    case "mongodb":
+      return (
+        <MongoDialForm
+          value={dial as unknown as MongoDial | null}
+          onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+        />
+      )
+    case "kafka":
+      return (
+        <KafkaDialForm
+          value={dial as unknown as KafkaDial | null}
+          onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+        />
+      )
+    case "sftp":
+      return (
+        <SftpDialForm
+          value={dial as unknown as SftpDial | null}
+          onChange={(next) => onChange(next as unknown as Record<string, unknown>)}
+        />
+      )
     default:
       return (
         <p className="text-sm text-muted-foreground">
@@ -128,17 +219,29 @@ export function ConnectorCreatePage() {
   const [selectedTypeName, setSelectedTypeName] = React.useState<string | null>(null)
   const [direction, setDirection] = React.useState<Connector["direction"]>("source")
   const [dial, setDial] = React.useState<Record<string, unknown> | null>(null)
-  const [secretRef, setSecretRef] = React.useState("")
+  const [credentialSource, setCredentialSource] = React.useState<CredentialSource>("env")
+  const [credentialPrimary, setCredentialPrimary] = React.useState<CredentialKind>("password")
+  const [credentialSecondary, setCredentialSecondary] = React.useState<CredentialKind | null>(null)
   const [environment, setEnvironment] = React.useState("production")
   const [tenant, setTenant] = React.useState("")
   const [residency, setResidency] = React.useState("")
   const [createdId, setCreatedId] = React.useState<string | null>(null)
+  const [createdCredential, setCreatedCredential] = React.useState<{
+    primary: string
+    secondary: string | null
+  } | null>(null)
   const [sourceObjects, setSourceObjects] = React.useState<SourceObject[]>([])
   const [scheduleCron, setScheduleCron] = React.useState("")
   const [runNow, setRunNow] = React.useState(false)
 
   const selectedType = types.data?.find((t) => t.name === selectedTypeName) ?? null
   const adapter = selectedType?.adapter ?? null
+  // An unauthenticated Kafka connector still carries a derived primary
+  // name (the create body requires one), but nothing resolves it; telling
+  // the operator to provision it would be a false instruction.
+  const usesNoCredential =
+    adapter === "kafka" &&
+    (dial?.auth as { type?: unknown } | undefined)?.type === "none"
 
   // Default the selection to the first SUPPORTED type once the list
   // loads, so the wizard never opens sitting on a disabled option a user
@@ -152,10 +255,21 @@ export function ConnectorCreatePage() {
   }, [types.status])
 
   // A new adapter means a new dial shape -- never carry the previous
-  // adapter's fields into a struct that will reject them as unknown.
+  // adapter's fields into a struct that will reject them as unknown. Also
+  // reseed the credential kind defaults for the new adapter (the user can
+  // still override either select afterward). Keyed on `selectedTypeName`
+  // too, not just `adapter`: switching PostgreSQL <-> Oracle keeps the
+  // same `sql` adapter (`DialFormFor`'s `typeName` doc comment) but
+  // renders a DIFFERENT form (`OracleDialForm`'s driver-locked shape vs.
+  // `SqlDialForm`'s driver select) -- carrying a postgres dial's `driver:
+  // "postgres"` into the Oracle form (or vice versa) would be exactly the
+  // stale-shape bug this effect exists to prevent.
   React.useEffect(() => {
     setDial(null)
-  }, [adapter])
+    const defaults = defaultCredentialForAdapter(adapter)
+    setCredentialPrimary(defaults.primary)
+    setCredentialSecondary(defaults.secondary)
+  }, [adapter, selectedTypeName])
 
   const create = useServiceAction((signal, input: Parameters<typeof connectorService.createConnector>[0]) =>
     connectorService.createConnector(input, signal)
@@ -181,18 +295,23 @@ export function ConnectorCreatePage() {
 
   const canProceed =
     (step === 0 && Boolean(name.trim() && selectedType?.supported)) ||
-    (step === 1 && Boolean(secretRef.trim())) ||
+    (step === 1 && Boolean(credentialPrimary)) ||
     (step === 2 && Boolean(environment.trim() && tenant.trim() && residency.trim())) ||
     step === 3
 
   async function handleSubmit() {
     if (!selectedType || !adapter) return
+    const credential: CredentialSpec = {
+      source: credentialSource,
+      primary: credentialPrimary,
+      ...(credentialSecondary ? { secondary: credentialSecondary } : {}),
+    }
     const result = await create.run({
       name: name.trim(),
       type: selectedType.name,
       direction,
       host: hostFromDial(adapter, dial),
-      secretRef: secretRef.trim(),
+      credential,
       environment: environment.trim(),
       tenant: tenant.trim(),
       residency: residency.trim(),
@@ -200,6 +319,7 @@ export function ConnectorCreatePage() {
     })
     if (result) {
       setCreatedId(result.id)
+      setCreatedCredential(result.credential)
       await test.run(result.id)
       const saved = await saveSpec.run(result.id, [])
       if (saved && runNow) {
@@ -230,6 +350,39 @@ export function ConnectorCreatePage() {
             </Button>
           }
         />
+        {createdCredential && usesNoCredential ? (
+          <SectionCard
+            title="No credential to provision"
+            description="This Kafka connector authenticates with no credential, so nothing reads its reserved name. Leave it unset."
+          >
+            <p className="text-sm text-muted-foreground">
+              Reserved, unused: <code className="rounded bg-muted px-1.5 py-0.5">{createdCredential.primary}</code>
+            </p>
+          </SectionCard>
+        ) : createdCredential ? (
+          <SectionCard
+            title="Provision these credentials"
+            description="Shown once, now — the server derived these names from this connector's own id (ADR 0002 Addendum 3). They are not stored or shown again; write them down before leaving this page."
+          >
+            <div className="space-y-2 text-sm">
+              <div>
+                <span className="text-muted-foreground">Primary: </span>
+                <code className="rounded bg-muted px-1.5 py-0.5">{createdCredential.primary}</code>
+              </div>
+              {createdCredential.secondary ? (
+                <div>
+                  <span className="text-muted-foreground">Secondary: </span>
+                  <code className="rounded bg-muted px-1.5 py-0.5">{createdCredential.secondary}</code>
+                </div>
+              ) : null}
+              <p className="text-xs text-muted-foreground">
+                An <code>env:</code> name needs a restart of the processes that read it; a{" "}
+                <code>file:</code> name can be replaced in place. Until provisioned, &quot;Test&quot; will
+                report the credential as unresolvable, honestly.
+              </p>
+            </div>
+          </SectionCard>
+        ) : null}
         <SectionCard
           title="Connector created"
           description={`"${name.trim()}" was created. Here is the result of the connection test.`}
@@ -457,16 +610,55 @@ export function ConnectorCreatePage() {
         ) : null}
         {step === 1 ? (
           <div className="grid gap-3">
-            <DialFormFor adapter={adapter} dial={dial} onChange={setDial} />
-            <Field label="Secret reference">
-              <Input
-                value={secretRef}
-                onChange={(e) => setSecretRef(e.target.value)}
-                placeholder="env:CONNECTOR_PG_PASSWORD"
-              />
-            </Field>
+            <DialFormFor adapter={adapter} typeName={selectedType?.name ?? null} dial={dial} onChange={setDial} />
+            <div className="grid gap-3 sm:grid-cols-2">
+              <Field label="Credential source">
+                <select
+                  className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+                  value={credentialSource}
+                  onChange={(e) => setCredentialSource(e.target.value as CredentialSource)}
+                >
+                  <option value="env">Environment variable</option>
+                  <option value="file">Mounted file</option>
+                </select>
+              </Field>
+              <Field label="Primary credential kind">
+                <select
+                  className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+                  value={credentialPrimary}
+                  onChange={(e) => setCredentialPrimary(e.target.value as CredentialKind)}
+                >
+                  {CREDENTIAL_KIND_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              {adapter === "files" ? (
+                <Field label="Secondary credential kind" className="sm:col-span-2">
+                  <select
+                    className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+                    value={credentialSecondary ?? ""}
+                    onChange={(e) =>
+                      setCredentialSecondary((e.target.value || null) as CredentialKind | null)
+                    }
+                  >
+                    <option value="">None</option>
+                    {CREDENTIAL_KIND_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              ) : null}
+            </div>
             <p className="text-xs text-muted-foreground">
-              Secrets are referenced by path only; values are never stored in the browser.
+              The server assigns the actual credential reference name from this connector&apos;s own
+              id once it is created (ADR 0002 Addendum 3) — you choose only where the value will
+              live and which kind of credential it is; the name to provision is shown after
+              creation.
             </p>
           </div>
         ) : null}
@@ -492,7 +684,10 @@ export function ConnectorCreatePage() {
                   { label: "Name", value: name },
                   { label: "Type", value: selectedType?.name ?? "" },
                   { label: "Direction", value: direction },
-                  { label: "Secret", value: secretRef },
+                  {
+                    label: "Credential",
+                    value: `${credentialSource}: ${credentialPrimary}${credentialSecondary ? ` + ${credentialSecondary}` : ""}`,
+                  },
                 ],
               },
               {

@@ -306,20 +306,23 @@ fn list_connectors_schema() -> Value {
 
 fn create_connector_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_connector",
-        "description": "Daftarkan connector baru. PENTING: secretRef HARUS berupa referensi kredensial (mis. \"env:NAMA_SECRET\" atau \"vault://path\"), JANGAN PERNAH kredensial mentah (password/token asli) — permintaan akan ditolak jika terlihat seperti kredensial asli.",
+        "description": "Daftarkan connector baru. Server yang menghasilkan id connector dan nama referensi kredensialnya (ADR 0002 Addendum 3) — pilih source (env/file) dan kind (password/secret_key/access_key/api_key/token) per slot, JANGAN kirim secretRef; nama yang harus disediakan operator dikembalikan sekali di respons.",
         "parameters": { "type": "object", "properties": {
             "name": { "type": "string" },
             "type": { "type": "string", "description": "mis. PostgreSQL, Object storage, Kafka" },
             "direction": { "type": "string", "enum": connector_direction_enum() },
             "host": { "type": "string", "description": "target koneksi (host:port atau endpoint)" },
-            "secretRef": { "type": "string", "description": "REFERENSI kredensial, mis. env:DB_PASSWORD atau vault://secret/data/x — bukan kredensial asli" },
-            "secretRefSecondary": { "type": "string", "description": "referensi kredensial kedua (mis. secret key S3), opsional" },
+            "credential": { "type": "object", "description": "spesifikasi kredensial; server yang menurunkan nama referensinya dari id connector", "properties": {
+                "source": { "type": "string", "enum": ["env", "file"] },
+                "primary": { "type": "string", "enum": ["password", "secret_key", "access_key", "api_key", "token", "private_key"] },
+                "secondary": { "type": "string", "enum": ["password", "secret_key", "access_key", "api_key", "token", "private_key"], "description": "slot kedua, mis. secret key S3, opsional" } },
+                "required": ["source", "primary"] },
             "environment": { "type": "string" },
             "tenant": { "type": "string" },
             "residency": { "type": "string" },
             "capabilities": { "type": "array", "items": { "type": "string" } },
             "owner": { "type": "string" } },
-            "required": ["name", "type", "direction", "host", "secretRef", "environment", "tenant"] } } })
+            "required": ["name", "type", "direction", "host", "credential", "environment", "tenant"] } } })
 }
 
 fn test_connector_schema() -> Value {

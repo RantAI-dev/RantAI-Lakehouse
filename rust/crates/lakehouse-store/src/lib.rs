@@ -36,6 +36,7 @@ pub mod agents;
 pub mod annotation;
 pub mod audit;
 pub mod cdc;
+pub mod connector_probe_result;
 pub mod connector_type;
 pub mod connectors;
 pub mod error;

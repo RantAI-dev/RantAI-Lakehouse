@@ -17,6 +17,30 @@ def test_resolve_secret_ref_reads_an_allowlisted_env_var(monkeypatch: pytest.Mon
     assert resolve_secret_ref("env:CONNECTOR_MYSQL_PASSWORD") == "s3cret"
 
 
+def test_resolve_secret_ref_resolves_a_derived_shaped_ref(monkeypatch: pytest.MonkeyPatch) -> None:
+    # ADR 0002 Addendum 3 (`docs/adr/0002-secretref-resolution.md`): a
+    # user-created connector's credential name is derived from its own
+    # generated id (`lakehouse_store::connectors::derive_secret_ref`,
+    # Rust-side) -- `conn-orders-k3x9` derives
+    # `env:CONNECTOR_CONN_ORDERS_K3X9_PASSWORD`, the addendum's own
+    # documented example. No production change was needed here: this
+    # name already matches `CONNECTOR_ALLOWED_SECRET_REF_PATTERNS`'
+    # existing `env:CONNECTOR_*_PASSWORD` pattern, the same way it
+    # matches the Rust-side allowlist -- this test proves that, rather
+    # than asserting it only in a comment.
+    monkeypatch.setenv("CONNECTOR_CONN_ORDERS_K3X9_PASSWORD", "derived-value")
+    assert resolve_secret_ref("env:CONNECTOR_CONN_ORDERS_K3X9_PASSWORD") == "derived-value"
+
+
+def test_resolve_secret_ref_still_resolves_a_seeded_shaped_ref(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The seeded connectors (`conn-pg-lakehouse`, `conn-s3-warehouse`)
+    # keep their pre-addendum, non-derived refs
+    # (`0022_prune_connector_seed.sql`/`0023_connector_dedicated_secret_refs.sql`)
+    # -- unaffected by Addendum 3, still resolvable the same way.
+    monkeypatch.setenv("CONNECTOR_PG_PASSWORD", "seeded-value")
+    assert resolve_secret_ref("env:CONNECTOR_PG_PASSWORD") == "seeded-value"
+
+
 def test_resolve_secret_ref_refuses_a_name_with_no_credential_suffix() -> None:
     # No pattern admits a bare CONNECTOR_* name that does not end in one
     # of the credential suffixes -- the exact class of hole Z6/X1 close:
@@ -83,3 +107,10 @@ def test_resolve_secrets_raises_when_the_secondary_slot_is_needed_but_missing() 
 def test_resolve_secrets_propagates_the_unknown_combination_error() -> None:
     with pytest.raises(ValueError):
         resolve_secrets("rest", "not-a-real-auth-type", "env:CONNECTOR_X_TOKEN", None)
+
+
+def test_resolve_secrets_returns_empty_for_kafka_none_auth_with_no_secret_ref_at_all() -> None:
+    # ("kafka", "none") maps to an empty fields tuple -- no secretRef is
+    # required for a PLAINTEXT broker, so this must not raise
+    # SecretRefRejected for a missing primary ref.
+    assert resolve_secrets("kafka", "none", None, None) == {}

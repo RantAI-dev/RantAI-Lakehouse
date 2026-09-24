@@ -183,3 +183,73 @@ def pinned_resolution(host: str, resolved: ResolvedAddress):
         yield
     finally:
         socket.getaddrinfo = real_getaddrinfo
+
+
+@contextlib.contextmanager
+def checking_resolver(*, allow_internal_hosts: bool | None = None, getaddrinfo: Callable = socket.getaddrinfo):
+    """Wraps `socket.getaddrinfo` for the WHOLE context, validating every
+    result any caller receives -- not one host pinned in advance (see
+    `pinned_resolution` above for that narrower case). Use this whenever
+    a client may resolve and connect to a SET of hosts it discovers over
+    the life of a long-running call, and the set cannot be enumerated up
+    front (Kafka's mid-batch metadata refresh; a resolver mechanism this
+    module does not control directly, such as the one `oracledb`'s thin
+    mode uses internally -- see `adapters/oracle.py`).
+
+    `allow_internal_hosts` follows the SAME env-var default
+    (`INGEST_ALLOW_INTERNAL_HOSTS`) `resolve_checked` already reads --
+    one operator-facing switch for both primitives, not two.
+
+    PROCESS-GLOBAL monkeypatch, like `pinned_resolution` above and safe
+    for the same stated reason: each `ingest_job` RUN processes exactly
+    one connector, so two batches never hold this context concurrently in
+    one process. Said here rather than assumed, because the restore in
+    `finally` puts back whatever `socket.getaddrinfo` was at ENTRY -- two
+    overlapping users would leave the later exit restoring an already
+    unwrapped resolver, silently ending the check for the one still
+    running.
+
+    Restores the real `socket.getaddrinfo` on exit unconditionally
+    (the `finally` block), including when the wrapped code itself
+    raises -- this context manager never swallows or replaces the
+    caller's own exception; `SsrfBlocked` is raised INSTEAD of a
+    result only when THIS check itself finds a blocked address."""
+    if allow_internal_hosts is None:
+        allow_internal_hosts = os.environ.get("INGEST_ALLOW_INTERNAL_HOSTS", "").strip() == "true"
+    real_getaddrinfo = socket.getaddrinfo
+
+    def _checking(host, port, *args, **kwargs):
+        infos = getaddrinfo(host, port, *args, **kwargs)
+        if not allow_internal_hosts:
+            for _family, _socktype, _proto, _canon, sockaddr in infos:
+                raw = sockaddr[0]
+                # An IPv6 result can carry a zone id (`fe80::1%eth0`), and a
+                # resolver is free to return a form `ipaddress` will not
+                # parse at all. Refusing outright is the only fail-closed
+                # answer: an address this guard cannot evaluate has not been
+                # shown to be safe, and letting `ValueError` escape instead
+                # would abort the dial with an error that names no reason.
+                # The zone id is stripped first because `fe80::1%eth0` IS
+                # parseable once it is gone, and link-local is exactly the
+                # range this guard most needs to recognise rather than
+                # discard as unparseable.
+                try:
+                    ip = ipaddress.ip_address(raw.split("%", 1)[0])
+                except ValueError as exc:
+                    raise SsrfBlocked(
+                        f"refusing to dial {host!r}: connect-time resolution returned "
+                        f"{raw!r}, which is not an address this guard can evaluate "
+                        "(checking_resolver)"
+                    ) from exc
+                if _is_blocked_ip(ip):
+                    raise SsrfBlocked(
+                        f"refusing to dial {host!r}: connect-time resolution returned {ip}, "
+                        "a private/internal/multicast address (checking_resolver)"
+                    )
+        return infos
+
+    socket.getaddrinfo = _checking
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = real_getaddrinfo

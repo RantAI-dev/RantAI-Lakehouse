@@ -7,15 +7,20 @@
 //! (`src/services/mock/connectors.ts`) that never had a server side —
 //! there is no TypeScript route handler this is bug-compatible with.
 //! Status codes are chosen to be correct: 201 on create, 404 on a missing
-//! id, 409 on a duplicate name, 400 on a malformed body or a `secretRef`
-//! that looks like a raw credential, 503 with no database pool.
+//! id, 409 on a duplicate name, 400 on a malformed body or a body that
+//! still names the removed `secretRef`/`secretRefSecondary` fields, 503
+//! with no database pool.
 //!
 //! # Credentials
 //!
 //! See `lakehouse_store::connectors`'s module doc comment for the full
 //! decision record. The short version: no endpoint here ever returns a
-//! `host` or `secretRef` — [`lakehouse_store::connectors::Connector`] and
-//! `ConnectorDetail` have no such field to serialize.
+//! `host` — [`lakehouse_store::connectors::Connector`] and
+//! `ConnectorDetail` have no such field to serialize, and no `secretRef`
+//! EXCEPT [`create`]'s response, once, at creation (ADR 0002 Addendum 3
+//! — a user-created connector no longer chooses a ref at all, only a
+//! source/kind; the server derives the name from the id it generates and
+//! returns it so the operator knows what to provision).
 
 use axum::Extension;
 use axum::body::Bytes;
@@ -26,6 +31,7 @@ use lakehouse_core::ApiError;
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::cdc::ConnectorSlug;
+use lakehouse_store::connector_probe_result::{self, ConnectorProbeResult};
 use lakehouse_store::connector_type::{self, ConnectorType};
 use lakehouse_store::connectors::{self, ConnectorDetail, ConnectorDialInfo, CreateConnectorInput};
 use lakehouse_store::ingest_spec::{Dial, SqlDriver};
@@ -168,10 +174,29 @@ pub async fn detail(
     Ok(ApiJson(detail))
 }
 
-/// The `POST /api/connectors` body. Mirrors `CreateConnectorInput`.
+/// The `POST /api/connectors` body's `credential` field. Mirrors
+/// `CreateConnectorInput["credential"]` in `contracts/connectors.ts`.
 ///
-/// `secret_ref` is a REFERENCE NAME (`"env:FOO"`, `"vault:path"`), never a
-/// credential value — see the module doc comment.
+/// There is no `secretRef`/`secretRefSecondary` field anywhere on this
+/// body (ADR 0002 Addendum 3): the client does not know the connector's
+/// id yet (the server generates it in [`connectors::create_connector`]),
+/// so it cannot name a reference itself. It chooses a source scheme and a
+/// kind per slot instead, and the server derives the actual names —
+/// returned once, in [`CreateConnectorResponse`].
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialSpecBody {
+    source: connectors::CredentialSource,
+    primary: connectors::CredentialKind,
+    /// `None` for a connector type that needs only one credential (e.g.
+    /// `PostgreSQL`). `Some` for e.g. an S3 connector's access-key/
+    /// secret-key pair — without this, an API-created S3 connector's
+    /// `/test` can never succeed, since `probe_s3` requires both.
+    #[serde(default)]
+    secondary: Option<connectors::CredentialKind>,
+}
+
+/// The `POST /api/connectors` body. Mirrors `CreateConnectorInput`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateConnectorBody {
@@ -180,14 +205,7 @@ pub struct CreateConnectorBody {
     kind: String,
     direction: String,
     host: String,
-    secret_ref: String,
-    /// Optional secondary reference, e.g. the secret-access-key half of an
-    /// S3 connector's access-key/secret-key pair (see
-    /// `lakehouse_store::connectors::ConnectorDialInfo::secret_ref_secondary`'s
-    /// doc comment). Without this, an API-created S3 connector's `/test`
-    /// can never succeed — `probe_s3` requires both.
-    #[serde(default)]
-    secret_ref_secondary: Option<String>,
+    credential: CredentialSpecBody,
     environment: String,
     tenant: String,
     #[serde(default)]
@@ -198,56 +216,60 @@ pub struct CreateConnectorBody {
     owner: Option<String>,
 }
 
+/// The `POST /api/connectors` response: the created
+/// [`connectors::Connector`] plus the credential reference NAMES the
+/// operator must provision. Mirrors `CreateConnectorResponse` in
+/// `contracts/connectors.ts`.
+///
+/// # Returned ONCE (ADR 0002 Addendum 3)
+///
+/// This is the only place these names are ever handed back. No GET
+/// response for this connector repeats them — `Connector`/`ConnectorDetail`
+/// gain no field (the module doc comment's guarantees 1/2 still hold
+/// exactly as written); this is a distinct, create-only response shape.
+/// An operator who loses these names can still recover them: they are a
+/// PURE function of the connector's own id
+/// (`lakehouse_store::connectors::derive_secret_ref`), so re-deriving them
+/// from `id` (visible on every GET) reproduces the identical string. Only
+/// the VALUE behind the name is secret; the name itself is not sensitive,
+/// which is why re-deriving it is safe even though this route does not
+/// offer a "show me again" endpoint.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateConnectorResponse {
+    #[serde(flatten)]
+    connector: connectors::Connector,
+    credential: connectors::ConnectorCredentialNames,
+}
+
 const VALID_DIRECTIONS: [&str; 3] = ["source", "sink", "bidirectional"];
 
-/// Refuse a caller-supplied `secretRef` that matches one of the deployment's
-/// reserved connector-credential patterns
-/// ([`crate::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS`]).
+/// Refuse a body that still names `secretRef`/`secretRefSecondary` — the
+/// pre-ADR-0002-Addendum-3 shape — instead of silently ignoring those
+/// fields (AGENTS.md principle 2: never silently drop what a caller sent).
+/// [`CreateConnectorBody`] has no field to deserialize either name into,
+/// so a caller sending them would otherwise get no error and no
+/// indication their `secretRef` was never used.
 ///
-/// Those patterns are the only shapes `AppState::connector_secret_resolver`
-/// will resolve, and they exist for the connectors seeded by migration — the
-/// ones this deployment operates itself. A user-created connector naming a
-/// ref that matches one would have the API authenticate to a caller-chosen
-/// `host` with the deployment's own connector credentials. `connector_probe`'s
-/// SSRF guard does not prevent that: it blocks internal address ranges, and
-/// exfiltration wants an EXTERNAL host, which is exactly what it permits.
-///
-/// So the allowlist answers "which refs may resolve at all" and this answers
-/// "who may name them". Neither alone is sufficient: without the allowlist a
-/// connector could name `env:DATABASE_URL`; without this check it could name
-/// a reserved connector-credential ref and point it anywhere. Both checks
-/// call the SAME [`lakehouse_core::secret::pattern_matches`] against the
-/// SAME pattern constant, so the two cannot drift the way
-/// `0023_connector_dedicated_secret_refs.sql`'s header describes happening to
-/// the old exact-list version.
-///
-/// # What this does NOT refuse (WS3 plan review X4/Z4)
-///
-/// A name that is not itself one of the reserved patterns — e.g.
-/// `env:CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS`, a real [`crate::config::Config`]
-/// flag, not a credential — is accepted HERE, at creation time: this check's
-/// job is narrower than "reject anything unsafe", it only refuses a caller
-/// naming one of the deployment's OWN reserved refs. Such a name still fails
-/// later, at resolve time, when [`AllowlistedSecretResolver`](lakehouse_core::secret::AllowlistedSecretResolver)
-/// independently checks the same patterns and returns `NotAllowed` the first
-/// time `POST .../test`, `POST .../discover`, or `POST .../ingest/run` tries
-/// to actually resolve it — the two-stage design this module's doc comment
-/// describes.
-///
-/// Deliberately compared after trimming, matching how the ref is stored and
-/// later handed to the resolver — a check that normalized more aggressively
-/// than the resolver would leave a gap between what this rejects and what
-/// that accepts.
-fn reject_allowlisted_secret_ref(field: &str, value: &str) -> Result<(), ApiError> {
-    let trimmed = value.trim();
-    if crate::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS
-        .iter()
-        .any(|pattern| lakehouse_core::secret::pattern_matches(pattern, trimmed))
-    {
-        return Err(ApiError::BadRequest(format!(
-            "{field} must not name a deployment connector credential; those are reserved for \
-             connectors this deployment seeds itself"
-        )));
+/// Runs on the raw JSON, before [`CreateConnectorBody`] deserialization,
+/// so the message can name the ADR and the new shape explicitly, rather
+/// than a generic "unknown field" a `#[serde(deny_unknown_fields)]` would
+/// produce (which also cannot single out these two names for a
+/// specialized message without a second copy of the field list already
+/// implied by the struct definition).
+fn reject_legacy_secret_ref_fields(body: &Bytes) -> Result<(), ApiError> {
+    let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(body) else {
+        return Ok(()); // Malformed JSON is `parse_body`'s job to report.
+    };
+    if map.contains_key("secretRef") || map.contains_key("secretRefSecondary") {
+        return Err(ApiError::BadRequest(
+            "secretRef/secretRefSecondary are no longer accepted here: a connector's credential \
+             reference name is now assigned by the server, derived from its own id (ADR 0002 \
+             Addendum 3, docs/adr/0002-secretref-resolution.md). Send `credential: { source, \
+             primary, secondary? }` instead, and read the derived names off this route's \
+             response"
+                .to_owned(),
+        ));
     }
     Ok(())
 }
@@ -311,20 +333,19 @@ fn connector_audit_event(
 /// # Errors
 ///
 /// 401 if no principal is present (see above); 400 on a malformed body, a
-/// blank required field, an unrecognized `direction`, or a `secretRef`
-/// shaped like a raw credential (see
-/// `lakehouse_store::connectors::looks_like_raw_secret`); 409 if the name
-/// is taken; 503/500 as above. Also 400 if `secretRef`/`secretRefSecondary`
-/// names a deployment connector credential — see
-/// [`reject_allowlisted_secret_ref`].
+/// blank required field, an unrecognized `direction`, or a body that still
+/// names `secretRef`/`secretRefSecondary` (see
+/// [`reject_legacy_secret_ref_fields`] — ADR 0002 Addendum 3 removed both
+/// fields); 409 if the name is taken; 503/500 as above.
 pub async fn create(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
     body: Bytes,
-) -> ApiResult<(StatusCode, ApiJson<connectors::Connector>)> {
+) -> ApiResult<(StatusCode, ApiJson<CreateConnectorResponse>)> {
     let Some(Extension(principal)) = principal else {
         return Err(ApiError::unauthorized().into());
     };
+    reject_legacy_secret_ref_fields(&body)?;
     let body: CreateConnectorBody = parse_body(&body)?;
     let direction = required("direction", &body.direction)?;
     if !VALID_DIRECTIONS.contains(&direction.as_str()) {
@@ -333,50 +354,27 @@ pub async fn create(
         ))
         .into());
     }
-    let secret_ref = required("secretRef", &body.secret_ref)?;
-    if connectors::looks_like_raw_secret(&secret_ref) {
-        return Err(ApiError::BadRequest(
-            "secretRef must be a reference to a credential (e.g. \"env:MY_SECRET\" or \
-             \"vault:secret/data/...\"), not the credential itself"
-                .to_owned(),
-        )
-        .into());
-    }
-    reject_allowlisted_secret_ref("secretRef", &secret_ref)?;
-    let secret_ref_secondary = match body.secret_ref_secondary {
-        Some(raw) if !raw.trim().is_empty() => {
-            let trimmed = raw.trim().to_owned();
-            if connectors::looks_like_raw_secret(&trimmed) {
-                return Err(ApiError::BadRequest(
-                    "secretRefSecondary must be a reference to a credential, not the credential \
-                     itself"
-                        .to_owned(),
-                )
-                .into());
-            }
-            reject_allowlisted_secret_ref("secretRefSecondary", &trimmed)?;
-            Some(trimmed)
-        }
-        _ => None,
-    };
     let input = CreateConnectorInput {
         name: required("name", &body.name)?,
         kind: required("type", &body.kind)?,
         direction,
         host: required("host", &body.host)?,
-        secret_ref,
-        secret_ref_secondary,
+        credential: connectors::CredentialSpec {
+            source: body.credential.source,
+            primary: body.credential.primary,
+            secondary: body.credential.secondary,
+        },
         environment: required("environment", &body.environment)?,
         tenant: required("tenant", &body.tenant)?,
         residency: body.residency,
         capabilities: body.capabilities,
         owner: body.owner,
     };
-    let created = connectors::create_connector(pool(&state)?, &input).await?;
+    let (created, credential) = connectors::create_connector(pool(&state)?, &input).await?;
     // WS5 item D3: best-effort, never turns a successful create into an
-    // error — name/type/direction only, never `secretRef` (a reference
-    // name, not a credential, per this module's own guarantee, but still
-    // not this row's business to repeat).
+    // error — name/type/direction only, never a credential reference name
+    // (not this row's business to repeat, even though a name alone is not
+    // a secret value).
     let event = connector_audit_event(
         &principal,
         "connector.create",
@@ -387,7 +385,13 @@ pub async fn create(
     if let Err(err) = store_audit::insert(pool(&state)?, event).await {
         tracing::warn!(%err, connector_id = %created.id, "failed to record connector.create audit event");
     }
-    Ok((StatusCode::CREATED, ApiJson(created)))
+    Ok((
+        StatusCode::CREATED,
+        ApiJson(CreateConnectorResponse {
+            connector: created,
+            credential,
+        }),
+    ))
 }
 
 /// `POST /api/connectors/{id}/test` — test a connector's connection.
@@ -459,6 +463,280 @@ pub async fn test_connection(
     }
 }
 
+/// `?limit=` query for `GET /api/connectors/{id}/probe-history`.
+#[derive(Debug, Deserialize)]
+pub struct ProbeHistoryQuery {
+    limit: Option<i64>,
+}
+
+/// The default number of history rows returned when `?limit=` is absent.
+const DEFAULT_PROBE_HISTORY_LIMIT: i64 = 50;
+
+/// The accepted range for `?limit=` -- matches
+/// [`lakehouse_store::connector_probe_result`]'s own per-connector cap of
+/// 200 rows: asking for more than this table could ever hold for one
+/// connector is refused rather than silently clamped, so a caller relying
+/// on an out-of-range `limit` learns that immediately instead of quietly
+/// getting fewer rows than it asked for.
+const PROBE_HISTORY_LIMIT_RANGE: std::ops::RangeInclusive<i64> = 1..=200;
+
+/// `GET /api/connectors/{id}/probe-history` — the connector's most recent
+/// connectivity-probe results, newest first. See
+/// `lakehouse_store::connector_probe_result`'s module doc comment: this is
+/// history distinct from `connector.health`/`lastTestAt` (current state,
+/// unchanged by this route), and only ever contains SUPPORTED probes.
+///
+/// # Errors
+///
+/// 400 if `limit` is present and outside `1..=200` (never silently
+/// clamped — a caller relying on an out-of-range value should learn that,
+/// not get a quietly-truncated result); 404 if `id` is unknown; 503/500 as
+/// every other connector route.
+pub async fn probe_history(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ProbeHistoryQuery>,
+) -> ApiResult<ApiJson<ProbeHistoryResponse>> {
+    let limit = query.limit.unwrap_or(DEFAULT_PROBE_HISTORY_LIMIT);
+    if !PROBE_HISTORY_LIMIT_RANGE.contains(&limit) {
+        return Err(ApiError::BadRequest(format!(
+            "limit must be between {} and {}, got {limit}",
+            PROBE_HISTORY_LIMIT_RANGE.start(),
+            PROBE_HISTORY_LIMIT_RANGE.end()
+        ))
+        .into());
+    }
+    let pool = pool(&state)?;
+    // `get_connector` (rather than a bare existence check) so a 404 for an
+    // unknown id matches every other `/api/connectors/{id}/*` route's
+    // wording exactly -- see `detail`'s handler, above.
+    connectors::get_connector(pool, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Connector {id} not found")))?;
+    let results = connector_probe_result::list_probe_results(pool, &id, limit).await?;
+    Ok(ApiJson(ProbeHistoryResponse { results }))
+}
+
+/// The `GET /api/connectors/{id}/probe-history` response body. Mirrors
+/// `ProbeHistoryResponse` in `contracts/connectors.ts`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeHistoryResponse {
+    /// Newest first — see [`connector_probe_result::list_probe_results`].
+    results: Vec<ConnectorProbeResult>,
+}
+
+/// The `PUT /api/connectors/{id}/secret` body. Mirrors
+/// `RotateConnectorSecretRequest` in `contracts/connectors.ts`.
+///
+/// No `newSecretRef` free-text field any more (ADR 0002 Addendum 3): the
+/// caller cannot name a ref, only a source scheme and a kind for the slot
+/// being rotated — the server derives the new ref from the CONNECTOR'S
+/// OWN id (`id` is a path parameter here, already fixed by the time this
+/// body is read), the same way [`connectors::create_connector`] does.
+/// Since a derived name always begins `CONNECTOR_CONN_`/`connector_conn_`
+/// (every id begins `conn-`), a rotation can never target a reserved,
+/// deployment-owned pattern (`CONNECTOR_PG_*`, `CONNECTOR_S3_*`) —
+/// structurally, not by a runtime check — closing the same exfiltration
+/// path a free-text `newSecretRef` would have reopened after `create`'s
+/// own equivalent fix.
+///
+/// `deny_unknown_fields`: a caller-supplied field this shape does not
+/// name (e.g. a lingering `newSecretRef`, or a typo) fails the request
+/// rather than being silently ignored — this route's whole point is
+/// precise control over which slot gets rewritten, so a misspelled or
+/// stale field should never silently no-op.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RotateSecretBody {
+    /// Which of the connector's two credential slots to rotate.
+    slot: connectors::SecretSlot,
+    /// `env:` or `file:` — see [`connectors::derive_secret_ref`].
+    source: connectors::CredentialSource,
+    /// The suffix the derived name ends in.
+    kind: connectors::CredentialKind,
+}
+
+/// The `PUT /api/connectors/{id}/secret` response body.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RotateSecretResponse {
+    /// Always `true` — this route either rotates the slot or returns an
+    /// error; there is no partial/pending state to report.
+    rotated: bool,
+    /// Echoes back which slot was rotated.
+    slot: connectors::SecretSlot,
+}
+
+/// `PUT /api/connectors/{id}/secret` — rotate one of a connector's two
+/// credential REFERENCE NAMES (never a credential value), PROBE-FIRST.
+///
+/// # Why probe before swap
+///
+/// The candidate credential reference (derived from this connector's own
+/// id, per [`RotateSecretBody`]'s doc comment) must already be
+/// provisioned (an env var, a secret-manager path) — this route never
+/// carries or accepts a secret value itself. Writing a derived name
+/// straight onto the connector row without checking it first would let a
+/// not-yet-provisioned ref silently break every future dial of this
+/// connector, discovered only the next time something tries to use it. So
+/// this handler builds an in-memory COPY of the connector's dial info
+/// with the derived ref swapped into the requested slot, runs a REAL
+/// connectivity probe against that copy using the SAME
+/// [`crate::connector_probe::probe`], the same
+/// [`AppState::connector_secret_resolver`], and the same
+/// `connector_probe_allow_internal_hosts` flag [`test_connection`]
+/// uses — nothing is written to the database until that probe reports
+/// `supported: true, ok: true`.
+///
+/// Using the SAME allowlisted resolver as `POST .../test` is deliberate,
+/// not incidental: every derived name already matches
+/// [`crate::state::CONNECTOR_ALLOWED_SECRET_REF_PATTERNS`] (ADR 0002
+/// Addendum 3), so this only ever fails as an honest "not provisioned
+/// yet" — never a resolver refusal, since a derived name can never be one
+/// of the reserved, deployment-owned patterns (`RotateSecretBody`'s doc
+/// comment explains why that is structural, not a runtime check).
+///
+/// # Why the probe result is never persisted as history
+///
+/// [`connectors::record_test_result`] (and the
+/// [`connector_probe_result`] history row it writes) exist to record
+/// what happened when the connector's CURRENT, in-use credential was
+/// dialed. The probe this handler runs dials a credential the connector
+/// is NOT using yet — recording that as connector history would make
+/// `GET .../probe-history` show a "successful test" against a ref the
+/// connector had never actually been configured with at the time,
+/// which is not what that endpoint promises its readers. So this
+/// handler calls [`crate::connector_probe::probe`] directly and never
+/// [`connectors::record_test_result`]; `connector.health`/`lastTestAt`
+/// and the probe-history table are both left exactly as they were.
+///
+/// # Errors
+///
+/// 400 on a malformed body, or one that still names a field this shape
+/// does not have (`deny_unknown_fields`, e.g. a lingering `newSecretRef`);
+/// 404 if `id` is unknown; 422 if the connector's type is either unsupported by
+/// this build's probe (a rotation can never be verified, so it is never
+/// applied) or the probe genuinely fails against the candidate credential;
+/// 409 if the connector's current ref in that slot changed between this
+/// handler's read and its write (someone else rotated it first — reload and
+/// retry); 503/500 as every other connector route.
+pub async fn rotate_secret(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<RotateSecretResponse>> {
+    let body: RotateSecretBody = parse_body(&body)?;
+    // Derived from THIS connector's own id -- see `RotateSecretBody`'s doc
+    // comment for why this can never target a reserved, deployment-owned
+    // pattern.
+    let new_secret_ref = connectors::derive_secret_ref(&id, body.source, body.kind);
+
+    let dial_info = connectors::get_connector_dial_info(pool(&state)?, &id).await?;
+    let Some(dial_info) = dial_info else {
+        return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
+    };
+
+    // The value read here, BEFORE the probe, is what `swap_secret_ref`
+    // compares against at write time — closing the race between this
+    // read and that write, not just between two callers of this route.
+    let expected_old = match body.slot {
+        connectors::SecretSlot::Primary => Some(dial_info.secret_ref.clone()),
+        connectors::SecretSlot::Secondary => dial_info.secret_ref_secondary.clone(),
+    };
+
+    let mut candidate = dial_info.clone();
+    match body.slot {
+        connectors::SecretSlot::Primary => candidate.secret_ref = new_secret_ref.clone(),
+        connectors::SecretSlot::Secondary => {
+            candidate.secret_ref_secondary = Some(new_secret_ref.clone());
+        }
+    }
+
+    let outcome = crate::connector_probe::probe(
+        &candidate,
+        state.connector_secret_resolver.as_ref(),
+        state.config.connector_probe_allow_internal_hosts,
+    )
+    .await;
+
+    if !outcome.supported {
+        // 422, not 409: nothing about this connector's STATE conflicts
+        // with the request — this build simply cannot verify ANY
+        // rotation for this connector type, so one is never applied
+        // unverified. `test_connection` reports the identical
+        // `supported: false` case as 200 (it is that route's whole
+        // successful, honest response shape); here it must fail the
+        // request instead, since the caller asked for a WRITE this
+        // handler cannot safely perform.
+        return Err(ApiError::Unprocessable(format!(
+            "connector {id}'s type cannot be probed by this build, so a secret rotation \
+             cannot be verified and was NOT applied: {}",
+            outcome.message
+        ))
+        .into());
+    }
+    if !outcome.ok {
+        // 422: the candidate credential itself does not work — the
+        // probe's own classified message is already safe to surface
+        // (see `connector_probe`'s module doc comment: never raw
+        // upstream `Display` text).
+        return Err(ApiError::Unprocessable(outcome.message).into());
+    }
+
+    match connectors::swap_secret_ref(
+        pool(&state)?,
+        &id,
+        body.slot,
+        expected_old.as_deref(),
+        &new_secret_ref,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(lakehouse_store::StoreError::NotFound) => {
+            return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
+        }
+        Err(lakehouse_store::StoreError::Conflict) => {
+            return Err(ApiError::Conflict(
+                "the secret ref changed since it was read; reload and retry".to_owned(),
+            )
+            .into());
+        }
+        Err(err) => return Err(ApiError::from(err).into()),
+    }
+
+    // Matches this file's established audit convention (`create`,
+    // `test_connection`, `delete`): only a SUCCESSFUL mutation is
+    // audited here, best-effort, never turning a completed rotation into
+    // an error response. A refused attempt (bad body, unsupported type,
+    // failed probe, stale expected_old) is reported to the caller via
+    // its error response alone, exactly as every other refusal on this
+    // file's routes is -- none of `create`/`test_connection`/`delete`
+    // record a refusal either.
+    //
+    // `args` names the slot and that the probe succeeded — NEVER the old
+    // or new ref name (WS5 item D3's rule for this whole file: a
+    // reference name is not this row's business to repeat, even though
+    // it is not itself a credential value).
+    let event = connector_audit_event(
+        &principal,
+        "connector.secret_rotate",
+        &id,
+        json!({ "slot": body.slot.as_str(), "probeOk": true }),
+        "executed",
+    );
+    if let Err(err) = store_audit::insert(pool(&state)?, event).await {
+        tracing::warn!(%err, connector_id = %id, "failed to record connector.secret_rotate audit event");
+    }
+
+    Ok(ApiJson(RotateSecretResponse {
+        rotated: true,
+        slot: body.slot,
+    }))
+}
+
 /// `?schema=` query for `POST /api/connectors/{id}/discover`. Required
 /// only for a `sql`/`cdc` adapter connector — see
 /// `crate::connector_discover::discover`'s doc comment.
@@ -516,26 +794,55 @@ pub struct DebeziumPropertiesQuery {
 }
 
 /// The response body for `GET /api/connectors/{id}/debezium-properties`.
-/// `properties` contains ONLY `${ENV_VAR_NAME}` references for every
-/// credential-shaped field — never a resolved secret — see
+///
+/// An `untagged` enum so the same route can return either:
+/// - the rendered `${ENV_VAR_NAME}`-reference template (the
+///   [`DebeziumPropertiesResponse::Rendered`] variant — every supported
+///   driver), or
+/// - the honest `{ supported: false, reason: ... }` body for an
+///   Oracle-driver CDC connector arriving with
+///   `ORACLE_CDC_LOGMINER_ENABLED=false` (the
+///   [`DebeziumPropertiesResponse::Unsupported`] variant).
+///
+/// `Rendered.properties` contains ONLY `${ENV_VAR_NAME}` references for
+/// every credential-shaped field — never a resolved secret — see
 /// [`lakehouse_store::cdc::render_debezium_properties_template`]'s doc
 /// comment. Consumed by a future `ops/debezium/render_compose.py`
 /// (WS3), which is what actually expands the references when it
 /// generates a real `debezium-server` compose service; nothing in this
 /// handler or its caller resolves them.
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DebeziumPropertiesResponse {
-    /// The `.properties` file body, with `${ENV_VAR_NAME}` references
-    /// in place of every credential value.
-    properties: String,
-    /// The `table` query parameter this response was rendered for,
-    /// echoed back so a caller does not have to track it separately.
-    table: String,
-    /// A human-readable reminder of what `properties` is and is not —
-    /// present so this is self-documenting even if read outside this
-    /// handler's own doc comment.
-    note: String,
+#[serde(untagged)]
+pub enum DebeziumPropertiesResponse {
+    /// The rendered template body.
+    Rendered {
+        /// The `.properties` file body, with `${ENV_VAR_NAME}` references
+        /// in place of every credential value.
+        properties: String,
+        /// The `table` query parameter this response was rendered for,
+        /// echoed back so a caller does not have to track it separately.
+        table: String,
+        /// A human-readable reminder of what `properties` is and is not —
+        /// present so this is self-documenting even if read outside this
+        /// handler's own doc comment.
+        note: String,
+    },
+    /// The honest `supported: false` response, carrying the REAL reason
+    /// an Oracle-driver CDC connector's `Debezium` properties template
+    /// cannot be rendered. The shape mirrors `POST .../ingest/run`'s own
+    /// `supported: false` body (`ingest_run` below), so the connector
+    /// detail page can show one canonical message for both routes.
+    Unsupported {
+        /// Always `false`; this variant exists so the field's name is
+        /// visible at the call site and in the wire shape, not to
+        /// permit a `true` future — `Debezium` CDC is either supported
+        /// (rendered) or it isn't.
+        supported: bool,
+        /// Why this connector's `Debezium` properties template is not
+        /// being rendered. Self-contained text, never carries an
+        /// upstream error (AGENTS.md rule 4).
+        reason: String,
+    },
 }
 
 /// Map a [`SqlDriver`] to the real, documented `Debezium` connector class
@@ -546,11 +853,17 @@ pub struct DebeziumPropertiesResponse {
 /// exist and the renderer always hardcoded the `PostgreSQL` class, which
 /// would have silently mislabeled a `mysql`/`mssql` connector's rendered
 /// template.
+///
+/// The `SqlDriver::Oracle` arm names `Debezium`'s real Oracle class, but no
+/// rendered template ever carries it: [`debezium_properties`] refuses every
+/// Oracle-driver connector before rendering, whatever
+/// `ORACLE_CDC_LOGMINER_ENABLED` says (see `oracle_cdc_refusal`).
 fn debezium_connector_class(driver: SqlDriver) -> &'static str {
     match driver {
         SqlDriver::Postgres => "io.debezium.connector.postgresql.PostgresConnector",
         SqlDriver::Mysql => "io.debezium.connector.mysql.MySqlConnector",
         SqlDriver::Mssql => "io.debezium.connector.sqlserver.SqlServerConnector",
+        SqlDriver::Oracle => "io.debezium.connector.oracle.OracleConnector",
     }
 }
 
@@ -564,6 +877,12 @@ struct DebeziumSourceTarget {
     database: String,
     user: String,
     connector_class: &'static str,
+    /// The original [`SqlDriver`] value the parsed `dial` carried — kept
+    /// on the target so [`debezium_properties`] can decide whether the
+    /// Oracle refusal applies, without
+    /// the route handler having to re-parse the dial just to inspect the
+    /// driver.
+    driver: SqlDriver,
 }
 
 /// Resolve `id`/`dial_info` into a [`DebeziumSourceTarget`] — see
@@ -600,19 +919,67 @@ fn resolve_debezium_source_target(
                     dial.database.clone(),
                     dial.user.clone(),
                 ),
-                Dial::Files(_) | Dial::Rest(_) | Dial::Sheets(_) => {
+                Dial::Files(_)
+                | Dial::Rest(_)
+                | Dial::Sheets(_)
+                | Dial::Mongo(_)
+                | Dial::Kafka(_)
+                | Dial::Sftp(_) => {
                     return Err(ApiError::BadRequest(format!(
                         "connector {id} is registered with adapter {adapter:?} but its parsed \
                          dial is not a sql/cdc shape"
                     )));
                 }
             };
+            // Oracle still resolves here; it is refused one step later, at
+            // the `debezium_properties` call site (`oracle_cdc_refusal`),
+            // which is why the driver is kept on the target — the route can
+            // branch on it without re-parsing the dial.
             Ok(DebeziumSourceTarget {
                 host,
                 port,
                 database,
                 user,
                 connector_class: debezium_connector_class(driver),
+                driver,
+            })
+        }
+        Some("mongodb") => {
+            // The `mongodb` adapter is NOT a `SqlDriver` variant (`MongoDB`
+            // is a document store, not a SQL/CDC source for `SqlDriver`'s
+            // purposes), so the dispatch here is on the adapter string
+            // itself. The mongo
+            // source block in `render_debezium_properties_template` only
+            // reads `source.connector_slug` (for the offset/schema-
+            // history filenames and topic prefix) and
+            // `source.schema_qualified_table` (currently a no-op for
+            // mongo, kept for parity with the postgres/mysql/mssql
+            // branches); the host/port/database/user fields of
+            // `DebeziumSourceSpec` are validated but never interpolated
+            // into the mongo branch — so we hand the resolver safe,
+            // non-empty placeholder values here rather than inventing a
+            // real host/port from `MongoDial.hosts` (the operator's
+            // real MongoDB host:port are env-var references in the
+            // rendered template, resolved by the container's shell,
+            // never by us).
+            let parsed = Dial::parse("mongodb", &dial_info.dial).map_err(|err| {
+                ApiError::BadRequest(format!(
+                    "connector {id}'s dial does not parse as a mongodb dial: {err}"
+                ))
+            })?;
+            if !matches!(parsed, Dial::Mongo(_)) {
+                return Err(ApiError::BadRequest(format!(
+                    "connector {id} is registered with adapter \"mongodb\" but its parsed \
+                     dial is not a Mongo dial"
+                )));
+            }
+            Ok(DebeziumSourceTarget {
+                host: "mongo.placeholder".to_owned(),
+                port: 27017,
+                database: "placeholder".to_owned(),
+                user: "placeholder".to_owned(),
+                connector_class: lakehouse_store::cdc::MONGO_CONNECTOR_CLASS,
+                driver: SqlDriver::Postgres,
             })
         }
         None if dial_info.kind.to_lowercase().contains("postgres") => {
@@ -628,12 +995,13 @@ fn resolve_debezium_source_target(
                 database: target.database.to_owned(),
                 user: target.user.to_owned(),
                 connector_class: debezium_connector_class(SqlDriver::Postgres),
+                driver: SqlDriver::Postgres,
             })
         }
         _ => Err(ApiError::BadRequest(format!(
             "connector {id} is type {kind:?} with adapter {adapter:?} — Debezium properties \
-             only apply to a sql/cdc adapter connector, or a legacy null-adapter PostgreSQL \
-             connector",
+             only apply to a sql/cdc/mongodb adapter connector, or a legacy null-adapter \
+             PostgreSQL connector",
             kind = dial_info.kind,
             adapter = dial_info.adapter,
         ))),
@@ -650,15 +1018,20 @@ fn resolve_debezium_source_target(
 /// expose the deployment's database password, S3 keys, and catalog
 /// token to any `connector:manage` principal) rather than a shortcut.
 ///
-/// # Adapter dispatch (WS3 item 15)
+/// # Adapter dispatch
 ///
 /// A connector whose `adapter` column (`0033_connector_ingest_spec.sql`) is
 /// `sql` or `cdc` has its connection fields read from the structured
 /// `dial` column via [`Dial::parse`] — this covers `postgres`, `mysql`,
 /// and `mssql` drivers, each rendering its own real `Debezium` connector
-/// class via [`debezium_connector_class`]. A connector with `adapter IS
-/// NULL` (a pre-WS3 row) falls back to the ORIGINAL `kind`-string check
-/// plus [`connector_probe::parse_postgres_host`]'s `host`-string parsing —
+/// class via [`debezium_connector_class`]. A connector whose `adapter` is
+/// `mongodb` is dispatched on the adapter string itself,
+/// since `MongoDB` is not a `SqlDriver` variant; its rendered template
+/// carries a single `mongodb.connection.string` env-var-reference
+/// instead of the SQL source's per-field host/port/user/password/dbname.
+/// A connector with `adapter IS NULL` (a pre-WS3 row) falls back to the
+/// ORIGINAL `kind`-string check plus
+/// [`connector_probe::parse_postgres_host`]'s `host`-string parsing —
 /// mirrors the same `adapter`-first-then-legacy-`kind` pattern
 /// `connector_probe::probe`'s own dispatch and the connector-deletion
 /// deprovision step already use (WS3 plan review X4, Z14). Every other
@@ -668,21 +1041,23 @@ fn resolve_debezium_source_target(
 ///
 /// # Errors
 ///
-/// 404 if `id` is unknown; 400 if the connector is not a `sql`/`cdc`
-/// adapter connector (nor a legacy null-adapter `PostgreSQL` connector),
-/// its dial does not parse or is not shaped `sql`/`cdc`, a legacy
-/// connector's `host` is not shaped `"<user>@<host>:<port>/<database>"`,
-/// its `secretRef` is not an `env:`-scheme reference (this template can
-/// only name an env var, so a `vault:`-scheme or other reference cannot be
-/// rendered as one — an honest 400, not a guess), `table` is missing or
-/// blank, or any field fails `DebeziumSourceSpec`/
-/// `render_debezium_properties_template`'s validation; 503/500 as every
-/// other connector route.
+/// 404 if `id` is unknown; 400 if the connector is not a
+/// `sql`/`cdc`/`mongodb` adapter connector (nor a legacy null-adapter
+/// `PostgreSQL` connector), its dial does not parse or is not shaped
+/// `sql`/`cdc`/`mongodb`, a legacy connector's `host` is not shaped
+/// `"<user>@<host>:<port>/<database>"`, its `secretRef` is not an
+/// `env:`-scheme reference (this template can only name an env var, so
+/// a `vault:`-scheme or other reference cannot be rendered as one — an
+/// honest 400, not a guess), `table` is missing or blank, or any field
+/// fails `DebeziumSourceSpec`/`render_debezium_properties_template`'s
+/// validation; 409 for an Oracle-driver CDC connector arriving with
+/// `ORACLE_CDC_LOGMINER_ENABLED=false`; 503/500 as every other
+/// connector route.
 pub async fn debezium_properties(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(query): Query<DebeziumPropertiesQuery>,
-) -> ApiResult<ApiJson<DebeziumPropertiesResponse>> {
+) -> ApiResult<(StatusCode, ApiJson<DebeziumPropertiesResponse>)> {
     let dial_info = connectors::get_connector_dial_info(pool(&state)?, &id).await?;
     let Some(dial_info) = dial_info else {
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
@@ -693,6 +1068,14 @@ pub async fn debezium_properties(
     }
 
     let target = resolve_debezium_source_target(&id, &dial_info)?;
+
+    // Oracle CDC refusal. Fires BEFORE the secretRef `env:` check on
+    // purpose: an Oracle CDC connector with a `vault:`-schemed credential
+    // should report "this build does not do LogMiner", not a
+    // downstream-shaped error about an unrenderable ref scheme.
+    if let Some(response) = oracle_cdc_refusal(&target, state.config.oracle_cdc_logminer_enabled) {
+        return Ok((StatusCode::CONFLICT, ApiJson(response)));
+    }
 
     let Some(database_password_ref) = dial_info.secret_ref.strip_prefix("env:") else {
         return Err(ApiError::BadRequest(format!(
@@ -737,13 +1120,52 @@ pub async fn debezium_properties(
     )
     .map_err(|err| ApiError::BadRequest(format!("connector {id}'s fields are invalid: {err}")))?;
 
-    Ok(ApiJson(DebeziumPropertiesResponse {
-        properties,
-        table: table.to_owned(),
-        note: "values are ${ENV_VAR_NAME} references the deployment's own shell expands at \
-               container start — never a resolved secret"
-            .to_owned(),
-    }))
+    Ok((
+        StatusCode::OK,
+        ApiJson(DebeziumPropertiesResponse::Rendered {
+            properties,
+            table: table.to_owned(),
+            note: "values are ${ENV_VAR_NAME} references the deployment's own shell expands at \
+                   container start — never a resolved secret"
+                .to_owned(),
+        }),
+    ))
+}
+
+/// The only gate between an Oracle-driver CDC connector and
+/// [`render_debezium_properties_template`] — and it always refuses.
+///
+/// This build ships no `Debezium` Oracle `LogMiner` property template. The
+/// template it can render is shaped for the Postgres/MySQL/SQL Server
+/// connectors, so rendering it for Oracle would put Oracle's connector class
+/// on properties an Oracle connector would reject — a config that looks
+/// ready and is not. `ORACLE_CDC_LOGMINER_ENABLED` names where that support
+/// will attach; it does not provide it. The two flag states therefore differ
+/// only in what the refusal tells the operator.
+fn oracle_cdc_refusal(
+    target: &DebeziumSourceTarget,
+    oracle_cdc_logminer_enabled: bool,
+) -> Option<DebeziumPropertiesResponse> {
+    if target.driver != SqlDriver::Oracle {
+        return None;
+    }
+    let reason = if oracle_cdc_logminer_enabled {
+        "ORACLE_CDC_LOGMINER_ENABLED is set, but this build ships no Debezium Oracle \
+         LogMiner property template: the template it can render is shaped for the \
+         Postgres, MySQL and SQL Server connectors, and Oracle's connector would reject \
+         it. Oracle ingestion runs through the batch sql adapter until LogMiner support \
+         is built (docs/adr/0008-initial-snapshot-backfill.md)."
+    } else {
+        "Oracle CDC via Debezium LogMiner is not enabled on this deployment \
+         (ORACLE_CDC_LOGMINER_ENABLED is unset or not \"true\"), and this build ships no \
+         LogMiner property template in any case. LogMiner capture needs ARCHIVELOG mode \
+         and supplemental logging on the source database, which the batch sql adapter \
+         neither assumes nor configures (docs/adr/0008-initial-snapshot-backfill.md)."
+    };
+    Some(DebeziumPropertiesResponse::Unsupported {
+        supported: false,
+        reason: reason.to_owned(),
+    })
 }
 
 /// `?force=true` on `DELETE /api/connectors/{id}` — see [`delete`]'s doc
@@ -1162,7 +1584,19 @@ async fn check_dial_ssrf(dial: &Dial, allow_internal_hosts: bool) -> Result<(), 
             .as_deref()
             .and_then(connector_probe::parse_endpoint_host_port),
         Dial::Rest(rest) => connector_probe::parse_endpoint_host_port(&rest.base_url),
-        Dial::Sheets(_) => None,
+        // Tier 2 adapters (`mongodb`/`kafka`/`sftp`): the authoritative
+        // SSRF check runs in Dagster (`ssrf_guard_mongo.py` /
+        // `ssrf_guard_kafka.py` / `ssrf_guard_sftp.py`) at dial time,
+        // not in this save-time pre-check; this function only fails
+        // fast on the common case (a caller pastes an obviously-internal
+        // host for a `sql`/`cdc`/`files`/`rest` connector and finds out
+        // immediately, at save time). The Rust-side
+        // `routes/connectors::check_dial_ssrf` match returns `None` for
+        // these variants by construction -- the same shape `sheets`
+        // already has (its dial names a spreadsheet id, not a
+        // caller-chosen host). The authoritative check for these
+        // adapters stays in Dagster, not here.
+        Dial::Sheets(_) | Dial::Mongo(_) | Dial::Kafka(_) | Dial::Sftp(_) => None,
     };
     let Some((host, port)) = host_port else {
         return Ok(());
@@ -1507,8 +1941,11 @@ mod tests {
             kind: "REST API".to_owned(),
             direction: "sideways".to_owned(),
             host: "h".to_owned(),
-            secret_ref: "env:X".to_owned(),
-            secret_ref_secondary: None,
+            credential: CredentialSpecBody {
+                source: connectors::CredentialSource::Env,
+                primary: connectors::CredentialKind::Token,
+                secondary: None,
+            },
             environment: "production".to_owned(),
             tenant: "t".to_owned(),
             residency: String::new(),
@@ -1518,106 +1955,103 @@ mod tests {
         assert!(!VALID_DIRECTIONS.contains(&body.direction.as_str()));
     }
 
-    /// D5/Should-fix: `secretRefSecondary` must parse through the request
-    /// body (camelCase, per the struct's `rename_all`) and reach
+    /// `credential.secondary` must parse through the request body
+    /// (camelCase, per the struct's `rename_all`) and reach
     /// `CreateConnectorInput` — otherwise an API-created S3 connector can
     /// never be tested, since `probe_s3` requires both refs.
     #[test]
-    fn secret_ref_secondary_round_trips_through_the_request_body() {
+    fn credential_secondary_round_trips_through_the_request_body() {
         let json = serde_json::json!({
             "name": "n",
             "type": "Object storage",
             "direction": "sink",
             "host": "http://rustfs:9000|bucket",
-            "secretRef": "env:AK",
-            "secretRefSecondary": "env:SK",
+            "credential": { "source": "env", "primary": "access_key", "secondary": "secret_key" },
             "environment": "production",
             "tenant": "t",
         });
         let body: CreateConnectorBody = serde_json::from_value(json).unwrap();
-        assert_eq!(body.secret_ref_secondary.as_deref(), Some("env:SK"));
+        assert_eq!(
+            body.credential.secondary,
+            Some(connectors::CredentialKind::SecretKey)
+        );
     }
 
-    /// Absent `secretRefSecondary` (e.g. a `PostgreSQL` connector, which
+    /// Absent `credential.secondary` (e.g. a `PostgreSQL` connector, which
     /// only ever needs one credential) must still parse.
     #[test]
-    fn secret_ref_secondary_is_optional() {
+    fn credential_secondary_is_optional() {
         let json = serde_json::json!({
             "name": "n",
             "type": "PostgreSQL",
             "direction": "bidirectional",
             "host": "u@host:5432/db",
-            "secretRef": "env:PW",
+            "credential": { "source": "env", "primary": "password" },
             "environment": "production",
             "tenant": "t",
         });
         let body: CreateConnectorBody = serde_json::from_value(json).unwrap();
-        assert_eq!(body.secret_ref_secondary, None);
+        assert_eq!(body.credential.secondary, None);
     }
 
-    /// The defense-in-depth check from `looks_like_raw_secret` is wired
-    /// into this handler, not just unit-tested in isolation.
+    /// The regression guard this check exists for (ADR 0002 Addendum 3):
+    /// a body still naming the pre-addendum `secretRef`/`secretRefSecondary`
+    /// fields is refused, citing the ADR, rather than silently ignored
+    /// (`CreateConnectorBody` has no field to deserialize either name
+    /// into, so without this check they would simply vanish).
     #[test]
-    fn secret_looking_secret_ref_is_rejected_by_the_shared_check() {
-        assert!(connectors::looks_like_raw_secret(
-            "postgres://admin:hunter2@db.internal:5432/oms"
-        ));
-        assert!(!connectors::looks_like_raw_secret("env:MY_SECRET"));
+    fn create_refuses_a_body_still_naming_legacy_secret_ref_fields() {
+        let body = Bytes::from(
+            serde_json::json!({
+                "name": "n",
+                "type": "PostgreSQL",
+                "direction": "source",
+                "host": "h",
+                "secretRef": "env:MY_SECRET",
+                "environment": "production",
+                "tenant": "t",
+            })
+            .to_string(),
+        );
+        let err = reject_legacy_secret_ref_fields(&body).unwrap_err();
+        assert!(err.to_string().contains("ADR 0002 Addendum 3"), "{err}");
     }
 
-    /// The exfiltration path this check exists to close: a
-    /// `connector:manage` principal naming a deployment connector credential
-    /// on a connector whose `host` they choose. A representative instance of
-    /// EVERY allowlisted pattern must be refused, so widening the pattern
-    /// list without widening this check fails here rather than silently
-    /// opening the hole again.
+    /// Same refusal for the secondary field alone.
     #[test]
-    fn user_created_connector_cannot_name_a_deployment_connector_credential() {
-        for r in [
-            "env:CONNECTOR_MYSQL_PASSWORD",
-            "env:CONNECTOR_S3_SECRET_KEY",
-            "env:CONNECTOR_S3_ACCESS_KEY",
-            "env:CONNECTOR_REST_API_KEY",
-            "env:CONNECTOR_OAUTH_TOKEN",
-            "file:/run/secrets/connector_mysql_password",
-        ] {
-            assert!(
-                reject_allowlisted_secret_ref("secretRef", r).is_err(),
-                "pattern-matching ref {r:?} must be refused on a user-created connector"
-            );
-            // Whitespace must not be a bypass: the value is trimmed before
-            // storage, so a padded ref would reach the resolver identically.
-            assert!(
-                reject_allowlisted_secret_ref("secretRef", &format!("  {r}  ")).is_err(),
-                "padded {r:?} must be refused too"
-            );
-        }
+    fn create_refuses_a_body_still_naming_legacy_secret_ref_secondary_field() {
+        let body = Bytes::from(
+            serde_json::json!({
+                "name": "n",
+                "type": "Object storage",
+                "direction": "sink",
+                "host": "h",
+                "credential": { "source": "env", "primary": "access_key" },
+                "secretRefSecondary": "env:MY_SECRET_2",
+                "environment": "production",
+                "tenant": "t",
+            })
+            .to_string(),
+        );
+        assert!(reject_legacy_secret_ref_fields(&body).is_err());
     }
 
-    /// The check must not over-reach: an ordinary `env:` ref that does not
-    /// match a reserved pattern is still accepted here. It will fail later
-    /// at resolution (it is not on the allowlist), which is a different,
-    /// honest error — "this deployment will not resolve that", not "you may
-    /// not say that". Includes `env:CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS`
-    /// (WS3 plan review X4/Z4): a real config flag, not a credential, so it
-    /// matches none of the credential-suffix patterns and must pass THIS
-    /// check even though `AllowlistedSecretResolver::resolve` refuses it
-    /// with `NotAllowed` at resolve time — see this function's doc comment
-    /// for the full two-stage explanation.
+    /// An ordinary body with no legacy field passes this check.
     #[test]
-    fn ordinary_secret_refs_are_still_accepted_by_this_check() {
-        for r in [
-            "env:MY_SECRET",
-            "vault:secret/data/x",
-            "env:POSTGRES_PASSWORD_2",
-            "env:CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS",
-        ] {
-            assert!(
-                reject_allowlisted_secret_ref("secretRef", r).is_ok(),
-                "{r:?} does not match a reserved connector-credential pattern and must pass \
-                 this check"
-            );
-        }
+    fn create_accepts_a_body_with_no_legacy_secret_ref_fields() {
+        let body = Bytes::from(
+            serde_json::json!({
+                "name": "n",
+                "type": "PostgreSQL",
+                "direction": "source",
+                "host": "h",
+                "credential": { "source": "env", "primary": "password" },
+                "environment": "production",
+                "tenant": "t",
+            })
+            .to_string(),
+        );
+        assert!(reject_legacy_secret_ref_fields(&body).is_ok());
     }
 
     /// The allowlist must never admit one of the API's own secrets again.
@@ -1911,8 +2345,11 @@ mod tests {
                     kind: "PostgreSQL CDC".to_owned(),
                     direction: "source".to_owned(),
                     host: "db.internal:5432".to_owned(),
-                    secret_ref: "env:TEST_SECRET".to_owned(),
-                    secret_ref_secondary: None,
+                    credential: connectors::CredentialSpec {
+                        source: connectors::CredentialSource::Env,
+                        primary: connectors::CredentialKind::Password,
+                        secondary: None,
+                    },
                     environment: "staging".to_owned(),
                     tenant: "Acme Co".to_owned(),
                     residency: "US".to_owned(),
@@ -1922,7 +2359,8 @@ mod tests {
             )
             .await
             .expect("create a test connector");
-            created.id
+            let (connector, _credential_names) = created;
+            connector.id
         }
 
         fn assign_body(tenant_id: uuid::Uuid) -> Bytes {
@@ -1991,5 +2429,141 @@ mod tests {
             .expect_err("an unknown connector id must be refused");
             assert_eq!(err.0.status(), 404);
         }
+    }
+
+    // ---- mongodb adapter dispatch tests ----
+
+    /// The `mongodb` adapter's dispatch lives in
+    /// [`resolve_debezium_source_target`] (not on [`SqlDriver`], since
+    /// `MongoDB` is not a SQL/CDC source) and returns a target carrying
+    /// the real `Debezium` `MongoDB` connector class — `Some("mongodb")`
+    /// is a dispatch arm alongside the existing `sql`/`cdc` arms. The
+    /// test passes through
+    /// `resolve_debezium_source_target` directly (no router, no DB) so it
+    /// stays inside `cargo test -p lakehouse-api --lib`, never the
+    /// `tests/` directory's `#[sqlx::test]`-backed harness.
+    #[test]
+    fn mongodb_adapter_dispatch_returns_the_mongo_connector_class() {
+        let info = ConnectorDialInfo {
+            kind: "MongoDB CDC".to_owned(),
+            host: "mongo.internal:27017".to_owned(),
+            secret_ref: "env:CONNECTOR_MONGO_PASSWORD".to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some("mongodb".to_owned()),
+            dial: serde_json::json!({
+                "hosts": ["mongo-a.internal:27017"],
+                "database": "oms",
+                "username": "cdc_reader",
+                "directConnection": true,
+            }),
+        };
+        let target = resolve_debezium_source_target("conn-mongo-1", &info)
+            .expect("a mongodb adapter with a Mongo-shaped dial must dispatch");
+        assert_eq!(
+            target.connector_class,
+            lakehouse_store::cdc::MONGO_CONNECTOR_CLASS
+        );
+        assert_eq!(
+            target.connector_class,
+            "io.debezium.connector.mongodb.MongoDbConnector"
+        );
+    }
+
+    // ---- the Oracle CDC gate ----
+
+    fn target_with_driver(driver: SqlDriver) -> DebeziumSourceTarget {
+        DebeziumSourceTarget {
+            host: "unused".to_owned(),
+            port: 0,
+            database: "unused".to_owned(),
+            user: "unused".to_owned(),
+            connector_class: "unused",
+            driver,
+        }
+    }
+
+    fn refusal_reason(response: Option<DebeziumPropertiesResponse>) -> String {
+        match response.expect("an Oracle-driver connector must be refused") {
+            DebeziumPropertiesResponse::Unsupported { supported, reason } => {
+                assert!(!supported);
+                reason
+            }
+            DebeziumPropertiesResponse::Rendered { .. } => {
+                panic!("an Oracle-driver connector must never get a rendered template")
+            }
+        }
+    }
+
+    /// Flag off (the default): refused, and the reason names the setting and
+    /// what `LogMiner` capture would need from the source database.
+    #[test]
+    fn an_oracle_connector_is_refused_when_the_logminer_flag_is_off() {
+        let reason = refusal_reason(oracle_cdc_refusal(
+            &target_with_driver(SqlDriver::Oracle),
+            false,
+        ));
+        assert!(reason.contains("ORACLE_CDC_LOGMINER_ENABLED"), "{reason}");
+        assert!(reason.contains("ARCHIVELOG"), "{reason}");
+    }
+
+    /// Flag ON: still refused. The only template this build can render is
+    /// shaped for the Postgres/MySQL/SQL Server connectors; handing it back
+    /// with Oracle's connector class on it would be a config that looks ready
+    /// and that Oracle's connector rejects. The reason says the flag is set
+    /// and why that is not enough, rather than repeating "not enabled".
+    #[test]
+    fn an_oracle_connector_is_refused_even_when_the_logminer_flag_is_on() {
+        let reason = refusal_reason(oracle_cdc_refusal(
+            &target_with_driver(SqlDriver::Oracle),
+            true,
+        ));
+        assert!(reason.contains("is set"), "{reason}");
+        assert!(reason.contains("no Debezium Oracle"), "{reason}");
+    }
+
+    /// The gate touches Oracle only: the drivers that have a real template
+    /// render it whatever the flag says.
+    #[test]
+    fn the_oracle_gate_never_touches_the_drivers_that_have_a_template() {
+        for driver in [SqlDriver::Postgres, SqlDriver::Mysql, SqlDriver::Mssql] {
+            for flag in [false, true] {
+                assert!(
+                    oracle_cdc_refusal(&target_with_driver(driver), flag).is_none(),
+                    "{driver:?} with flag={flag} must render"
+                );
+            }
+        }
+    }
+
+    /// An Oracle-driver CDC connector still
+    /// resolves cleanly through [`resolve_debezium_source_target`]
+    /// regardless of the gate — the gate is a separate call in the
+    /// handler. This regression-tests that the resolver does not
+    /// silently start rejecting Oracle just because the gate was added.
+    #[test]
+    fn oracle_driver_still_resolves_through_resolve_debezium_source_target() {
+        let info = ConnectorDialInfo {
+            kind: "Oracle".to_owned(),
+            host: "oracle.internal:1521".to_owned(),
+            secret_ref: "env:CONNECTOR_ORACLE_PASSWORD".to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some("cdc".to_owned()),
+            dial: serde_json::json!({
+                "driver": "oracle",
+                "host": "oracle.internal",
+                "port": 1521,
+                "database": "ORCL",
+                "user": "cdc_reader",
+                "slotName": "oracle_slot",
+                "publicationName": "oracle_pub",
+            }),
+        };
+        let target = resolve_debezium_source_target("conn-oracle-1", &info)
+            .expect("Oracle driver must still resolve, the gate fires later");
+        assert_eq!(target.driver, SqlDriver::Oracle);
+        assert_eq!(
+            target.connector_class,
+            "io.debezium.connector.oracle.OracleConnector"
+        );
     }
 }

@@ -30,6 +30,9 @@ Run with:
 
 from __future__ import annotations
 
+from datetime import timezone
+
+import dlt
 import pytest
 
 from dispar_orchestrate import ssrf_guard
@@ -164,3 +167,70 @@ def test_from_dial_requires_at_least_one_source_object() -> None:
     dial = {"driver": "postgres", "host": "postgres", "port": 5432, "database": "d", "user": "u"}
     with pytest.raises(ValueError, match="at least one source object"):
         BronzeIngestConfig.from_dial(dial, secrets={"password": "x"}, source_objects=[])
+
+
+class _FakeLoadInfo:
+    has_failed_jobs = False
+
+
+class _FakePipeline:
+    """Stand-in for `dlt.pipeline(...)` -- the same capture-what-reaches-it
+    approach `test_sink.py`'s own `_FakePipeline` uses, duplicated here
+    (not imported) since this test targets `run_bronze_ingest`'s own,
+    real, end-to-end path THROUGH the shared sink, not the sink module in
+    isolation."""
+
+    def __init__(self, **kwargs) -> None:
+        self.materialized_rows: list[dict] = []
+        self.last_trace = None
+
+    def run(self, source, table_name, table_format):
+        self.materialized_rows = list(source)
+        return _FakeLoadInfo()
+
+
+def test_run_bronze_ingest_still_produces_stamped_rows_now_via_the_shared_sink(monkeypatch) -> None:
+    # `_stamp_ingested_at` used to be called by THIS module's own
+    # `resource.add_map(...)`, before `load_via_sink` was reached. It
+    # moved into `adapters/sink.py` (ADR 0004's ONE owner of the column,
+    # for every ingest adapter, not just this one) -- this test proves the
+    # column still reaches the materialized rows end-to-end through
+    # `run_bronze_ingest` -> the REAL `load_via_sink` -> a faked
+    # `dlt.pipeline`, rather than mocking `load_via_sink` away entirely
+    # the way the hostaddr-pin test above does.
+    @dlt.resource(name="orders")
+    def orders():
+        yield {"id": 1}
+        yield {"id": 2}
+
+    def fake_sql_database(**kwargs):
+        @dlt.source(name="fake_sql_database")
+        def _src():
+            return [orders()]
+
+        return _src()
+
+    resolve_calls = []
+
+    def fake_resolve_checked(host, port):
+        resolve_calls.append((host, port))
+        return ssrf_guard.ResolvedAddress(ip="10.0.0.9", port=port, family=2)
+
+    fake_pipelines: list[_FakePipeline] = []
+
+    def fake_pipeline_factory(**kwargs):
+        pipeline = _FakePipeline(**kwargs)
+        fake_pipelines.append(pipeline)
+        return pipeline
+
+    monkeypatch.setattr("dispar_orchestrate.dlt_pipeline.sql_database", fake_sql_database)
+    monkeypatch.setattr("dispar_orchestrate.dlt_pipeline.ssrf_guard.resolve_checked", fake_resolve_checked)
+    monkeypatch.setattr("dispar_orchestrate.adapters.sink.dlt.pipeline", fake_pipeline_factory)
+
+    run_bronze_ingest(_base_config())
+
+    materialized = fake_pipelines[0].materialized_rows
+    assert len(materialized) == 2
+    for row in materialized:
+        assert "_ingested_at" in row
+        assert row["_ingested_at"].tzinfo == timezone.utc

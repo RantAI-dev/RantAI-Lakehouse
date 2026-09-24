@@ -12,11 +12,24 @@ export type ServiceErrorCode =
 
 export class ServiceError extends Error {
   readonly code: ServiceErrorCode
+  /**
+   * The raw HTTP status a client adapter received, when there was one (a
+   * mock adapter or a thrown non-HTTP failure leaves this `undefined`).
+   * `code` alone collapses 400/409/422 into one `"invalid_request"` bucket
+   * — too coarse for a caller that must react differently to a 409
+   * (someone else changed the resource first; reload and retry) than a
+   * 422 (the request was well-formed but the server could not carry it
+   * out, e.g. `connector-credential-rotation.tsx`'s probe-first rotation).
+   * Callers needing that distinction read `status` directly instead of
+   * parsing `message` text.
+   */
+  readonly status?: number
 
-  constructor(code: ServiceErrorCode, message: string) {
+  constructor(code: ServiceErrorCode, message: string, status?: number) {
     super(message)
     this.name = "ServiceError"
     this.code = code
+    this.status = status
   }
 }
 

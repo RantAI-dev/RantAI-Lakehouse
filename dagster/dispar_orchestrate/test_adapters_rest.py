@@ -13,15 +13,17 @@ from dispar_orchestrate.adapters.rest import _auth_headers_and_params, build_sou
 from dispar_orchestrate.ssrf_guard import ResolvedAddress, SsrfBlocked
 
 
-def test_build_source_paginates_by_offset_until_an_empty_page():
+def test_build_source_reads_the_bare_array_body_when_no_records_path_is_set():
+    """`RestPagination::None` + no `recordsPath` -- the shape
+    `ops/g6/rest_stub.py` actually exercises end-to-end, and the only
+    combination valid on both the Rust contract and this adapter."""
     spec = {
-        "baseUrl": "https://example.invalid", "auth": {"type": "api_key", "header": "X-Api-Key"},
-        "pagination": {"type": "offset", "param": "offset", "pageSize": 2},
-        "endpoints": [{"path": "/items", "dataPath": "items"}],
+        "baseUrl": "https://example.invalid", "auth": {"type": "bearer"},
+        "pagination": {"type": "none"},
+        "endpoints": [{"path": "/items"}],
     }
-    pages = iter([{"items": [{"id": 1}, {"id": 2}]}, {"items": []}])
     result = build_source(
-        spec, secrets={"apiKey": "k"}, http_get=lambda *a, **k: next(pages),
+        spec, secrets={"token": "t"}, http_get=lambda *a, **k: [{"id": 1}, {"id": 2}],
         resolve_checked=lambda host, port: ResolvedAddress(ip="93.184.216.34", port=port, family=2),
     )
     assert list(result.source) == [{"id": 1}, {"id": 2}]
@@ -31,7 +33,7 @@ def test_build_source_paginates_by_page_number():
     spec = {
         "baseUrl": "https://example.invalid", "auth": {"type": "bearer"},
         "pagination": {"type": "page", "param": "page"},
-        "endpoints": [{"path": "/items", "dataPath": "items"}],
+        "endpoints": [{"path": "/items", "recordsPath": "items"}],
     }
     pages = iter([{"items": [{"id": 1}]}, {"items": []}])
     result = build_source(
@@ -42,20 +44,49 @@ def test_build_source_paginates_by_page_number():
 
 
 def test_build_source_paginates_by_cursor_until_none_returned():
+    """`RestPagination::Cursor` carries only `cursorField` -- no separate
+    outgoing-parameter name -- so the adapter must re-send the cursor
+    under that SAME key it read it from (asserted below via the second
+    `http_get` call's params)."""
     spec = {
         "baseUrl": "https://example.invalid", "auth": {"type": "basic"},
-        "pagination": {"type": "cursor", "param": "cursor", "cursorPath": "nextCursor"},
-        "endpoints": [{"path": "/items", "dataPath": "items"}],
+        "pagination": {"type": "cursor", "cursorField": "nextCursor"},
+        "endpoints": [{"path": "/items", "recordsPath": "items"}],
     }
     pages = iter([
         {"items": [{"id": 1}], "nextCursor": "c2"},
         {"items": [{"id": 2}], "nextCursor": None},
     ])
+    calls = []
+
+    def fake_http_get(*a, **k):
+        calls.append(k.get("params"))
+        return next(pages)
+
     result = build_source(
-        spec, secrets={"username": "u", "password": "p"}, http_get=lambda *a, **k: next(pages),
+        spec, secrets={"username": "u", "password": "p"}, http_get=fake_http_get,
         resolve_checked=lambda host, port: ResolvedAddress(ip="93.184.216.34", port=port, family=2),
     )
     assert list(result.source) == [{"id": 1}, {"id": 2}]
+    assert calls == [{}, {"nextCursor": "c2"}]
+
+
+def test_build_source_refuses_an_offset_pagination_type_the_contract_does_not_admit():
+    """`RestPagination` has no `offset` variant -- `Dial::parse` rejects
+    `pagination.type = "offset"` before an ingest-spec is ever stored, so
+    this adapter must never implement a branch nothing on the contract
+    side can select."""
+    spec = {
+        "baseUrl": "https://example.invalid", "auth": {"type": "bearer"},
+        "pagination": {"type": "offset", "param": "offset"},
+        "endpoints": [{"path": "/items"}],
+    }
+    result = build_source(
+        spec, secrets={"token": "t"}, http_get=lambda *a, **k: pytest.fail("must not be called"),
+        resolve_checked=lambda host, port: ResolvedAddress(ip="93.184.216.34", port=port, family=2),
+    )
+    with pytest.raises(ValueError, match="offset"):
+        list(result.source)
 
 
 def test_build_source_refuses_an_internal_base_url():
@@ -133,7 +164,7 @@ def test_build_source_refuses_a_redirect_response_with_exactly_one_request(monke
     monkeypatch.setattr("dispar_orchestrate.adapters.rest.requests.get", fake_requests_get)
     spec = {
         "baseUrl": "https://example.invalid", "auth": {"type": "bearer"},
-        "pagination": {"type": "none"}, "endpoints": [{"path": "/items", "dataPath": "items"}],
+        "pagination": {"type": "none"}, "endpoints": [{"path": "/items", "recordsPath": "items"}],
     }
     result = build_source(
         spec, secrets={"token": "t"},
@@ -180,7 +211,7 @@ def test_oauth2_token_url_must_be_https():
 def test_build_source_accepts_a_positional_source_objects_argument():
     spec = {
         "baseUrl": "https://example.invalid", "auth": {"type": "bearer"},
-        "pagination": {"type": "none"}, "endpoints": [{"path": "/items", "dataPath": "items"}],
+        "pagination": {"type": "none"}, "endpoints": [{"path": "/items", "recordsPath": "items"}],
     }
     result = build_source(
         spec, {"token": "t"}, [{"name": "ignored"}],
