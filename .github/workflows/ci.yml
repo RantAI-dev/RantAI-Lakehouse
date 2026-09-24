@@ -535,12 +535,45 @@ jobs:
           EOF
 
       - name: Bring up the g6 matrix (gate-only INGEST_ALLOW_INTERNAL_HOSTS override)
+        # Explicit service list, not a bare `up` on the activated
+        # profiles: this project also activates "dagster" (for
+        # dagster-webserver/-daemon, which g6_ingest_matrix_test.py polls
+        # while a triggered connector run executes), and that profile
+        # also contains `debezium-server`, pinned to a Debezium image
+        # digest no longer resolvable upstream (g4-cdc's own known,
+        # unrepinned gap — a human decision, out of this job's scope). A
+        # bare `up` with no service names starts every service in an
+        # active profile, including that one, and fails the whole step;
+        # naming exactly what `ops/g6/g6_ingest_matrix_test.py` and
+        # `g6-test-runner`'s own depends_on chain need (docker-compose.yml)
+        # starts only those services' own dependency closures, which does
+        # not reach `debezium-server`.
         run: >
           docker compose -p g6ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
           --profile g6 --profile dagster up -d --build
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon
+          g3a-source-init mysql-g6 mssql-g6 mssql-g6-cert-init rest-stub-g6
+          mongo-g6 kafka-g6 kafka-g6-spoofed
 
       - name: Run the G6 ingest matrix test inside the compose network
-        run: docker compose -p g6ci --profile g6 run --rm g6-test-runner
+        # Same `-f` pair as the "up" step above -- `g6-test-runner`'s OWN
+        # `MYSQL_ROOT_PASSWORD`/`CONNECTOR_MYSQL_PASSWORD`/`MSSQL_SA_PASSWORD`/
+        # `MONGO_G6_ROOT_USER`/`MONGO_G6_ROOT_PASSWORD` env and its
+        # `g6_secrets` volume mount (the REST/mysql/mssql connectors'
+        # `file:`-derived credentials) are added by the override, not the
+        # base file; omitting `-f` here would run this service from the
+        # base file's definition alone, missing all of that. Also
+        # `--profile dagster`, not only `--profile g6`: `g6-test-runner`
+        # depends on `dagster-code-location`, which is profile "dagster"
+        # -- the same "compose validates depends_on against the active
+        # profile set" mechanism the kafka-g6-spoofed/g6-test-runner-
+        # linklocal fix above explains, here on the other side of the
+        # same edge. `dagster-code-location` is already running from the
+        # "up" step above; activating its profile for this `run` only
+        # satisfies validation, it does not start anything new.
+        run: >
+          docker compose -p g6ci -f docker-compose.yml -f ops/g6/docker-compose.g6.override.yml
+          --profile g6 --profile dagster run --rm g6-test-runner
 
       - name: Compose logs (on failure)
         if: failure()
@@ -550,11 +583,34 @@ jobs:
         if: always()
         run: docker compose -p g6ci down -v
 
-      - name: Bring up a SEPARATE, override-free project for the link-local assertion
-        run: docker compose -p g6ci-linklocal --profile dagster up -d --build
+      - name: Bring up a SEPARATE, override-free (for INGEST_ALLOW_INTERNAL_HOSTS) project for the link-local assertion
+        # "Override-free" means no `ops/g6/docker-compose.g6.override.yml`
+        # (that is the file that sets INGEST_ALLOW_INTERNAL_HOSTS=true —
+        # exactly the property this test proves is false by default).
+        # `ops/g6/docker-compose.g6-linklocal-secrets.override.yml` is a
+        # SEPARATE, narrower file that widens nothing this test checks —
+        # see its own header — and is required: without it, neither
+        # `dagster-code-location` nor `g6-test-runner-linklocal` has the
+        # `g6_linklocal_secrets` mount the REST connector's credential
+        # write needs. Explicit service list, same "debezium-server is
+        # profile dagster too" reason as the g6 matrix `up` step above —
+        # a bare `up` here would try to start it and fail. `dagster-
+        # webserver`/`dagster-daemon` are both needed too, same as the g6
+        # matrix half above: `POST /api/connectors/{id}/ingest/run`
+        # launches the run through `lakehouse-api`'s own `DAGSTER_URL`
+        # (this job's `.env`), and the daemon is what actually executes a
+        # queued run — without them the script's very first launch call
+        # fails outright ("fetch failed"), never reaching the link-local
+        # assertion at all.
+        run: >
+          docker compose -p g6ci-linklocal -f docker-compose.yml -f ops/g6/docker-compose.g6-linklocal-secrets.override.yml
+          --profile dagster up -d --build
+          lakehouse-api dagster-code-location dagster-webserver dagster-daemon kafka-g6-spoofed
 
       - name: Run the link-local rejection test (default compose, flag unset)
-        run: docker compose -p g6ci-linklocal --profile dagster run --rm g6-test-runner-linklocal
+        run: >
+          docker compose -p g6ci-linklocal -f docker-compose.yml -f ops/g6/docker-compose.g6-linklocal-secrets.override.yml
+          --profile dagster run --rm g6-test-runner-linklocal
 
       - name: Compose logs (on failure)
         if: failure()
