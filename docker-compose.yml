@@ -2692,10 +2692,13 @@ services:
     # NOT a real security gap, an artifact of regenerating the file out
     # from under an already-running server). Skips regeneration when a
     # cert already exists in the volume.
+    # `apk add` is retried: a one-off package-mirror error failed this
+    # job and, through `depends_on`, the whole gate stack.
     command:
       - >
         test -f /out/mssql-g6.pem ||
-        { apk add --no-cache openssl >/dev/null &&
+        { for i in 1 2 3 4 5; do apk add --no-cache openssl >/dev/null && break; sleep 3; done;
+        command -v openssl >/dev/null &&
         openssl req -x509 -newkey rsa:2048 -nodes -days 1
         -keyout /out/mssql-g6.key -out /out/mssql-g6.pem
         -subj "/CN=mssql-g6" -addext "subjectAltName=DNS:mssql-g6" &&

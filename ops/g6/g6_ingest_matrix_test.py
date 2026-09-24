@@ -269,7 +269,7 @@ def _seed_mongo_fixture() -> str:
     return reader_password
 
 
-def _produce_kafka_fixture(topic: str, *, count: int = 30, interval_s: float = 1.5) -> None:
+def _produce_kafka_fixture(topic: str, *, run_id: str, interval_s: float = 1.5, max_s: float = 240.0) -> None:
     """Produces `count` JSON messages onto `kafka-g6`, one per
     `interval_s`, spread out AFTER the caller has already launched the
     kafka connector's run -- never before. `adapters/kafka.py`'s
@@ -285,14 +285,28 @@ def _produce_kafka_fixture(topic: str, *, count: int = 30, interval_s: float = 1
     not synchronously from this script)."""
     from kafka import KafkaProducer
     producer = KafkaProducer(bootstrap_servers=["kafka-g6:9092"], security_protocol="PLAINTEXT")
+    # Keep producing until THIS run has finished, not for a fixed count: in
+    # CI the kafka run sat queued behind the other adapters' runs, first
+    # polled after a fixed 45 s burst had ended, consumed nothing under
+    # "latest", and so never created its Bronze table.
+    query = "query($rid:ID!){ pipelineRunOrError(runId:$rid){ __typename ... on Run { status } } }"
+    deadline = time.time() + max_s
+    i = 0
     try:
-        for i in range(count):
+        while time.time() < deadline:
             row = {"id": i, "amount": 10.0 + i}
             producer.send(topic, json.dumps(row).encode("utf-8"))
             producer.flush()
+            i += 1
             time.sleep(interval_s)
+            resp = requests.post(DAGSTER_URL, json={"query": query, "variables": {"rid": run_id}}, timeout=10)
+            resp.raise_for_status()
+            status = ((resp.json().get("data") or {}).get("pipelineRunOrError") or {}).get("status")
+            if status in ("SUCCESS", "FAILURE", "CANCELED"):
+                break
     finally:
         producer.close()
+    print(f"[g6] produced {i} kafka messages while run {run_id} was live")
 
 
 def _write_credential_file(ref_name: str, value: str) -> None:
@@ -543,7 +557,7 @@ def step_ingest_matrix() -> None:
         # Produced AFTER the run launches (see _produce_kafka_fixture's
         # own docstring for why "before" would race kafka-python's
         # default "latest" auto_offset_reset).
-        _produce_kafka_fixture(kafka_topic)
+        _produce_kafka_fixture(kafka_topic, run_id=kafka_run_id)
 
     for name, run_id in run_ids.items():
         step_wait_for_run_success(run_id)
