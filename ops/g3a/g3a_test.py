@@ -319,7 +319,7 @@ def step_verify_format_version_2() -> None:
 def step_verify_run_audited() -> None:
     """The run is recorded via the governance/audit surface (Dagster run
     history) — a run-list check, distinct from lineage (see
-    `step_verify_lineage_recorded` below). PR #29 review: this step used
+    `step_verify_lineage_is_honestly_unsupported` below). PR #29 review: this step used
     to be labeled "lineage recorded" while reading `/api/governance/audit`
     (a run list), never `/api/governance/lineage` — that claim is corrected
     here by naming this step for what it actually checks, and adding a
@@ -337,32 +337,28 @@ def step_verify_run_audited() -> None:
     print("[g3a] run recorded in GET /api/governance/audit")
 
 
-def step_verify_lineage_recorded() -> None:
-    """The REAL lineage surface (PR #29 review): `GET
-    /api/governance/lineage?focus=<slug>` — `rust/crates/lakehouse-api/src/
-    routes/governance.rs::lineage_body` builds a source -> Bronze -> Silver
-    -> Gold graph from `lake.bronze_meta.dataset_catalog`, which
-    `dagster/dispar_orchestrate/bronze_catalog.py::register_bronze_table`
-    populates as part of this same G3a run (`assets.py`'s
-    `bronze_ingest_job` calls it after the dlt load succeeds). An empty
-    lineage graph for this slug means the dataset never actually became
-    traceable, whatever the audit run-list above says."""
+def step_verify_lineage_is_honestly_unsupported() -> None:
+    """`GET /api/governance/lineage?focus=<slug>` must report lineage as
+    unsupported, not draw a graph. `routes/governance.rs::lineage_unsupported`
+    replaced a source -> Bronze -> Silver chain that was derived from naming
+    conventions rather than captured, so it read as fact without being one.
+    Until real lineage capture exists, the only honest answer is
+    `supported: false` with a reason, the focus node alone and no edges;
+    this step fails if a guessed graph ever comes back."""
     slug = BRONZE_TABLE_NAME.replace("_", "-")
     resp = API.get(f"{API_URL}/api/governance/lineage", params={"focus": slug}, timeout=10)
     if not resp.ok:
         raise G3aFailure(f"GET /api/governance/lineage failed: {resp.status_code} {resp.text}")
     body = resp.json()
-    nodes = body.get("nodes", [])
-    if not nodes:
-        raise G3aFailure(f"GET /api/governance/lineage?focus={slug} returned an empty graph: {body}")
-    node_ids = [n.get("id") for n in nodes]
-    bronze_node = f"bronze.{BRONZE_TABLE_NAME}"
-    if bronze_node not in node_ids:
+    if body.get("supported") is not False or not body.get("reason"):
+        raise G3aFailure(f"lineage must say supported:false with a reason, got: {body}")
+    node_ids = [n.get("id") for n in body.get("nodes", [])]
+    if node_ids != [slug] or body.get("edges"):
         raise G3aFailure(
-            f"GET /api/governance/lineage?focus={slug} nodes {node_ids} do not "
-            f"include the Bronze node {bronze_node!r}"
+            f"unsupported lineage must carry only the focus node and no edges, got nodes "
+            f"{node_ids} edges {body.get('edges')}"
         )
-    print(f"[g3a] GET /api/governance/lineage?focus={slug} shows nodes: {node_ids}")
+    print(f"[g3a] GET /api/governance/lineage?focus={slug}: supported=false ({body['reason']})")
 
 
 def main() -> int:
@@ -376,7 +372,7 @@ def main() -> int:
         step_verify_format_version_2()
         step_verify_catalog_visibility()
         step_verify_run_audited()
-        step_verify_lineage_recorded()
+        step_verify_lineage_is_honestly_unsupported()
     except G3aFailure as exc:
         print(f"[g3a] FAILED: {exc}", file=sys.stderr)
         return 1
