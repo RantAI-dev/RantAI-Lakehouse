@@ -1539,7 +1539,7 @@ services:
           subpath: dlt.jwt
         read_only: true
     environment:
-      # WS3 item 20 (`dlt_pipeline.py::run_bronze_ingest`) — the `dlt`
+      # `dlt_pipeline.py::run_bronze_ingest`: the `dlt`
       # SSRF guard fail-closed refuses to dial an RFC1918/private
       # address unless this is set; `BRONZE_SOURCE_DB_HOST` below is
       # hardcoded to this SAME compose network's own `postgres` service,
@@ -2777,22 +2777,12 @@ services:
   # every compose-network container already is one.
   kafka-g6-spoofed:
     image: apache/kafka:3.8.0
-    # Also "dagster", not only "g6": `g6-test-runner-linklocal` below is
-    # deliberately profile "dagster" (its own comment explains why — it
-    # must run against the default compose file with no override), and
-    # its `depends_on: kafka-g6-spoofed` makes this fixture part of that
-    # service's dependency graph. Compose validates every depends_on
-    # target against the ACTIVE profile set at model-build time, before
-    # deciding what to actually start — `docker compose --profile
-    # dagster config` refused the whole project with "depends on
-    # undefined service kafka-g6-spoofed" until this fixture carried the
-    # same profile, breaking every job that activates "dagster" alone
-    # (g3a-dagster, g3-maintenance, g4-cdc), not only g6-ingest's own
-    # link-local step. Widening the profile does not start this
-    # container in those other jobs: none of them names it or
-    # `g6-test-runner-linklocal` explicitly, and `up` with explicit
-    # service names starts only those services' own dependency chains.
-    profiles: ["g6", "dagster"]
+    # Its own profile, "g6-linklocal", shared only with
+    # `g6-test-runner-linklocal` (whose `depends_on` names it: compose
+    # validates every depends_on target against the active profile set).
+    # Never "dagster": that is a deployment profile, and a bare
+    # `--profile dagster up` must not start a deliberately spoofed broker.
+    profiles: ["g6-linklocal"]
     restart: "no"
     networks:
       default:
@@ -2883,13 +2873,15 @@ services:
     command: ["pip install -q requests && python g6_ingest_matrix_test.py"]
     restart: "no"
 
-  # WS3 (G6) — the override-free link-local rejection proof
-  # (ops/g6/g6_linklocal_test.py). Deliberately "dagster", NOT "g6": this
-  # service must be runnable against the DEFAULT compose file alone (no
-  # -f ops/g6/docker-compose.g6.override.yml), so its own profile
-  # membership cannot accidentally pull in the override-only fixtures.
+  # The override-free link-local rejection proof
+  # (ops/g6/g6_linklocal_test.py). Its own "g6-linklocal" profile, NOT
+  # "g6": it must run against the DEFAULT compose file (no
+  # -f ops/g6/docker-compose.g6.override.yml), so its profile cannot pull
+  # in the override-only fixtures. Not "dagster" either, a deployment
+  # profile that must not carry gate services. Run it with
+  # `--profile g6-linklocal --profile dagster`.
   g6-test-runner-linklocal:
-    profiles: ["dagster"]
+    profiles: ["g6-linklocal"]
     image: python:3.12-slim
     working_dir: /work
     volumes:

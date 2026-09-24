@@ -604,13 +604,13 @@ jobs:
         # assertion at all.
         run: >
           docker compose -p g6ci-linklocal -f docker-compose.yml -f ops/g6/docker-compose.g6-linklocal-secrets.override.yml
-          --profile dagster up -d --build
+          --profile g6-linklocal --profile dagster up -d --build
           lakehouse-api dagster-code-location dagster-webserver dagster-daemon kafka-g6-spoofed
 
       - name: Run the link-local rejection test (default compose, flag unset)
         run: >
           docker compose -p g6ci-linklocal -f docker-compose.yml -f ops/g6/docker-compose.g6-linklocal-secrets.override.yml
-          --profile dagster run --rm g6-test-runner-linklocal
+          --profile g6-linklocal --profile dagster run --rm g6-test-runner-linklocal
 
       - name: Compose logs (on failure)
         if: failure()
