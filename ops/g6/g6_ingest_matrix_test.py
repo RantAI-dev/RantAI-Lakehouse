@@ -135,6 +135,22 @@ def step_wait_for_services() -> None:
         lambda: requests.get(DAGSTER_URL.replace("/graphql", "/server_info"), timeout=5).status_code == 200,
         90,
     )
+    # The webserver answering is not the code location having loaded:
+    # compose can recreate `dagster-code-location` when this runner starts,
+    # and an `ingest/run` in that window fails with PipelineNotFoundError
+    # (seen in CI). Wait until Dagster itself lists `ingest_job`.
+    _wait_for("Dagster code location (ingest_job loaded)", _ingest_job_is_loaded, 120)
+
+
+def _ingest_job_is_loaded() -> bool:
+    query = (
+        "{ repositoriesOrError { ... on RepositoryConnection "
+        "{ nodes { jobs { name } } } } }"
+    )
+    resp = requests.post(DAGSTER_URL, json={"query": query}, timeout=5)
+    resp.raise_for_status()
+    nodes = (resp.json().get("data") or {}).get("repositoriesOrError", {}).get("nodes") or []
+    return any(job.get("name") == "ingest_job" for node in nodes for job in node.get("jobs", []))
 
 
 def step_login() -> None:
