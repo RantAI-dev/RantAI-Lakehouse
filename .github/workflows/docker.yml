@@ -32,6 +32,12 @@ jobs:
         with:
           context: rust
           file: rust/Dockerfile
+          # The Dockerfile copies the Dagster pipeline source from a named
+          # build context, as docker-compose.yml's `additional_contexts`
+          # provides it. Without this, buildx resolves `pipeline_src` as an
+          # image on Docker Hub and the build fails.
+          build-contexts: |
+            pipeline_src=dagster/dispar_orchestrate
           push: false
           load: true
           tags: lakehouse-api:ci
