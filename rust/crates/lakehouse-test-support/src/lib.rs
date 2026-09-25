@@ -111,7 +111,11 @@ fn start_postgres_container() {
     }
 }
 
-#[ctor::ctor]
+// `ctor` 1.0 requires an explicit acknowledgement that a pre-`main`
+// constructor may do something unsafe (here: `set_var` in
+// `start_postgres_container`, safe only because nothing else has started
+// yet); see the SAFETY comment above.
+#[ctor::ctor(unsafe)]
 fn init() {
     start_postgres_container();
 }

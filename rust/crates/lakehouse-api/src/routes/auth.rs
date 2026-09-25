@@ -1352,7 +1352,11 @@ mod tests {
             use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding};
             use rsa::traits::PublicKeyParts;
 
-            let mut rng = rand::thread_rng();
+            // `rsa` 0.9 still requires a `rand_core` 0.6 `CryptoRngCore`,
+            // one major behind this workspace's `rand` 0.10 (#9) — use
+            // `rsa`'s own re-exported `OsRng` here rather than `rand::rng()`,
+            // which no longer implements that trait.
+            let mut rng = rsa::rand_core::OsRng;
             let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("keygen");
             let public_key = private_key.to_public_key();
             let pem = private_key.to_pkcs1_pem(LineEnding::LF).expect("pkcs1 pem");
