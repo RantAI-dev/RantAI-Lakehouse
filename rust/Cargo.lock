@@ -2407,7 +2407,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "croner",
  "iceberg",
@@ -2455,7 +2455,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "jsonwebtoken",
  "lakehouse-core",
  "lakehouse-store",
@@ -2535,7 +2535,7 @@ dependencies = [
 name = "lakehouse-embed"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "hmac",
  "lakehouse-clickhouse",
  "rand 0.8.8",
