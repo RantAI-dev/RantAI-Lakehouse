@@ -36,6 +36,9 @@ export function EmbedView({ token, jwt, chartId }: { token?: string; jwt?: strin
     let alive = true;
     (async () => {
       try {
+        // Deliberately NOT `apiFetch`: embed/public views are unauthenticated
+        // by design (a signed JWT or a share token, never a session), so a
+        // 401/403/404 is "not found" for the viewer, not a login prompt.
         const res = jwt
           ? await fetch(`/api/embed/data`, {
               method: "POST", headers: { "Content-Type": "application/json" },
