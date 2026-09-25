@@ -24,8 +24,12 @@ export type Msg = {
   chartCreated?: boolean;
   /** Wall time from send to answer, measured in this browser. */
   elapsedMs?: number;
-  /** When the answer arrived (ISO). Older saved messages have neither. */
+  /** When the message was sent or the answer arrived (ISO). Older saved messages have none. */
   at?: string;
+  /** The model's reasoning for this answer (`reasoning` stream events), never part of `content`. */
+  reasoning?: string;
+  /** How long the model reasoned, from its first reasoning piece to its first answer text or the end. */
+  reasoningMs?: number;
 };
 export type SessionMeta = {
   id: string;
@@ -205,6 +209,8 @@ function useCopilotState() {
    * results on the server, replaces it.
    */
   const [draft, setDraft] = React.useState("");
+  /** The model's reasoning so far in this answer, across rounds. */
+  const [liveReasoning, setLiveReasoning] = React.useState("");
 
   /**
    * Sends `text` after `history` (default: the current conversation) and
@@ -214,11 +220,17 @@ function useCopilotState() {
     const q = text.trim();
     if (!q || busy) return;
     setError(null);
-    const next: Msg[] = [...(history ?? messagesRef.current), { id: newMsgId(), role: "user", content: q }];
+    const next: Msg[] = [
+      ...(history ?? messagesRef.current),
+      { id: newMsgId(), role: "user", content: q, at: new Date().toISOString() },
+    ];
     setMessages(next);
     setBusy(true);
     const startedAt = Date.now();
     setProgress({ phase: "thinking", startedAt });
+    let reasoning = "";
+    let reasoningStart: number | null = null;
+    let reasoningEnd: number | null = null;
     const controller = new AbortController();
     abortRef.current = controller;
     try {
@@ -240,7 +252,18 @@ function useCopilotState() {
         const event = raw as { type?: string; tool?: string; body?: unknown };
         if (event.type === "delta") {
           const piece = (raw as { text?: unknown }).text;
-          if (typeof piece === "string") setDraft((d) => d + piece);
+          if (typeof piece === "string") {
+            if (reasoningStart !== null && reasoningEnd === null) reasoningEnd = Date.now();
+            setDraft((d) => d + piece);
+          }
+        } else if (event.type === "reasoning") {
+          const piece = (raw as { text?: unknown }).text;
+          if (typeof piece === "string") {
+            reasoningStart ??= Date.now();
+            reasoningEnd = null;
+            reasoning += piece;
+            setLiveReasoning(reasoning);
+          }
         } else if (event.type === "status") {
           setDraft("");
           setProgress((p) => ({ phase: "thinking", startedAt: p?.startedAt ?? Date.now(), steps: p?.steps }));
@@ -278,6 +301,9 @@ function useCopilotState() {
           chartCreated,
           elapsedMs: Date.now() - startedAt,
           at: new Date().toISOString(),
+          ...(reasoning.trim()
+            ? { reasoning: reasoning.trim(), reasoningMs: (reasoningEnd ?? Date.now()) - (reasoningStart ?? startedAt) }
+            : {}),
         },
       ];
       setMessages(full);
@@ -299,11 +325,26 @@ function useCopilotState() {
       setBusy(false);
       setProgress(null);
       setDraft("");
+      setLiveReasoning("");
     }
   }, [busy, mode, sessionId, persist, enabledCaps]);
 
   /** Stop waiting for the answer in flight; the server stops before its next step. */
   const stop = React.useCallback(() => abortRef.current?.abort(), []);
+
+  /** Replace the user message at `index` with `text` and ask again from there (later messages are dropped). */
+  const editAndResend = React.useCallback((index: number, text: string) => {
+    void send(text, messagesRef.current.slice(0, index));
+  }, [send]);
+
+  /** Remove one message from the conversation and save it. */
+  const deleteMessage = React.useCallback((index: number) => {
+    const left = messagesRef.current.filter((_, i) => i !== index);
+    setMessages(left);
+    void persist(left, mode, sessionId);
+  }, [persist, mode, sessionId]);
+
+  const clearError = React.useCallback(() => setError(null), []);
 
   /** Send the last question again, dropping the failed or stopped attempt. */
   const retry = React.useCallback(() => {
@@ -444,7 +485,7 @@ function useCopilotState() {
     mode, setMode, messages, busy, error, sessionId, sessions,
     enabledCaps, toggleCap, pageContext, setPageContext,
     send, newChat, loadSession, removeSession, renameSession, refreshSessions,
-    progress, draft, stop, retry,
+    progress, draft, liveReasoning, stop, retry, editAndResend, deleteMessage, clearError,
     confirmTool, cancelTool, completeToolStep, confirmingKey,
     dockPosition, setDockPosition, expanded, setExpanded,
     sidebarWidth, setSidebarWidth,

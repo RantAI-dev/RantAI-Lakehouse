@@ -8,7 +8,7 @@
 
 mod stream;
 
-pub use stream::HiddenSpans;
+pub use stream::{HiddenSpans, StreamPiece};
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};

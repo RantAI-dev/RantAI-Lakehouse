@@ -104,7 +104,7 @@ export function CopilotDock() {
               </div>
             ) : (
               <ChatMessages
-                messages={c.messages} draft={c.draft}
+                messages={c.messages} draft={c.draft} liveReasoning={c.liveReasoning} onEdit={c.editAndResend} onDelete={c.deleteMessage} onDismissError={c.clearError}
                 busy={c.busy}
                 error={c.error} progress={c.progress} onRetry={c.retry}
                 onConfirmTool={c.confirmTool}

@@ -59,13 +59,22 @@ impl HiddenSpans {
 
     /// Feeds the next piece of text and returns what can be shown now.
     pub fn push(&mut self, text: &str) -> String {
+        self.push_split(text).0
+    }
+
+    /// Like [`HiddenSpans::push`], but also returns the text found inside
+    /// hidden spans (tags themselves excluded) — for `<think>`, the model's
+    /// reasoning, which the console shows apart from the answer.
+    pub fn push_split(&mut self, text: &str) -> (String, String) {
         self.buf.push_str(text);
         let mut out = String::new();
+        let mut hidden = String::new();
         loop {
             let lower = self.buf.to_ascii_lowercase();
             if let Some(i) = self.inside {
                 let close = &self.pairs[i].1;
                 if let Some(at) = lower.find(close.as_str()) {
+                    hidden.push_str(&self.buf[..at]);
                     self.buf.drain(..at + close.len());
                     self.inside = None;
                     continue;
@@ -75,8 +84,9 @@ impl HiddenSpans {
                 while !self.buf.is_char_boundary(cut) {
                     cut -= 1;
                 }
+                hidden.push_str(&self.buf[..cut]);
                 self.buf.drain(..cut);
-                return out;
+                return (out, hidden);
             }
             // The earliest tag of either kind. A closing tag with no opening
             // one before it is dropped on its own: `MiniMax` streams its
@@ -121,7 +131,7 @@ impl HiddenSpans {
             let cut = self.buf.len() - hold;
             out.push_str(&self.buf[..cut]);
             self.buf.drain(..cut);
-            return out;
+            return (out, hidden);
         }
     }
 
@@ -132,6 +142,16 @@ impl HiddenSpans {
             .max()
             .unwrap_or(0)
     }
+}
+
+/// A piece of a streamed reply, as handed to the caller's callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamPiece<'a> {
+    /// Answer text, safe to show (no `<think>` content).
+    Text(&'a str),
+    /// The model's reasoning: `reasoning_content` deltas, or what was
+    /// inside `<think>…</think>` in `content`.
+    Reasoning(&'a str),
 }
 
 /// One tool call being reassembled from its streamed fragments.
@@ -170,15 +190,15 @@ fn merge_call(calls: &mut Vec<PartialCall>, part: &Value) {
     }
 }
 
-/// Reads the SSE body to its end (or `[DONE]`, or until `on_text` says
-/// stop), handing visible text over as it comes. Returns the raw content
-/// and the reassembled tool-call fragments.
+/// Reads the SSE body to its end (or `[DONE]`, or until `on_piece` says
+/// stop), handing answer text and reasoning over as they come. Returns the
+/// raw content and the reassembled tool-call fragments.
 async fn read_events<F>(
     resp: &mut reqwest::Response,
-    on_text: &mut F,
+    on_piece: &mut F,
 ) -> Result<(String, Vec<PartialCall>), LlmError>
 where
-    F: FnMut(&str) -> bool,
+    F: FnMut(StreamPiece<'_>) -> bool,
 {
     let mut think = HiddenSpans::new(&[("<think>", "</think>")]);
     let mut content = String::new();
@@ -207,10 +227,19 @@ where
             let Some(delta) = event.pointer("/choices/0/delta") else {
                 continue;
             };
+            if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str)
+                && !text.is_empty()
+                && !on_piece(StreamPiece::Reasoning(text))
+            {
+                break 'read;
+            }
             if let Some(text) = delta.get("content").and_then(Value::as_str) {
                 content.push_str(text);
-                let visible = think.push(text);
-                if !visible.is_empty() && !on_text(&visible) {
+                let (visible, reasoning) = think.push_split(text);
+                if !reasoning.is_empty() && !on_piece(StreamPiece::Reasoning(&reasoning)) {
+                    break 'read;
+                }
+                if !visible.is_empty() && !on_piece(StreamPiece::Text(&visible)) {
                     break 'read;
                 }
             }
@@ -226,10 +255,10 @@ where
 }
 
 impl LlmClient {
-    /// [`LlmClient::chat_with_tools`] with `stream: true`: `on_text` gets
-    /// each piece of visible answer text (never `<think>` content) as it
-    /// arrives, and returns `false` to stop reading — the caller's client
-    /// has gone. The returned message is built exactly like the
+    /// [`LlmClient::chat_with_tools`] with `stream: true`: `on_piece` gets
+    /// each piece of answer text and of reasoning as it arrives (see
+    /// [`StreamPiece`]), and returns `false` to stop reading — the caller's
+    /// client has gone. The returned message is built exactly like the
     /// non-streamed one, from everything received.
     ///
     /// Text streamed during a round that ends in tool calls is the model's
@@ -246,10 +275,10 @@ impl LlmClient {
         messages: &[LlmMessage],
         tools: &[Value],
         opts: ChatOptions,
-        mut on_text: F,
+        mut on_piece: F,
     ) -> Result<LlmMessage, LlmError>
     where
-        F: FnMut(&str) -> bool,
+        F: FnMut(StreamPiece<'_>) -> bool,
     {
         let body = ChatWithToolsRequest {
             model: &self.model,
@@ -278,12 +307,12 @@ impl LlmClient {
             let parsed: Value = resp.json().await.unwrap_or_default();
             let msg = reply_from_json(&parsed);
             if let Some(content) = msg.content.as_deref().filter(|c| !c.is_empty()) {
-                on_text(content);
+                on_piece(StreamPiece::Text(content));
             }
             return Ok(msg);
         }
 
-        let (content, calls) = read_events(&mut resp, &mut on_text).await?;
+        let (content, calls) = read_events(&mut resp, &mut on_piece).await?;
         let tool_calls: Vec<ToolCall> = calls
             .into_iter()
             .enumerate()
@@ -414,16 +443,53 @@ mod tests {
 
         let client = LlmClient::new(server.uri(), "m".to_owned(), "k".to_owned());
         let mut seen = String::new();
+        let mut thought = String::new();
         let msg = client
-            .chat_with_tools_streamed(&[user("hi")], &[], ChatOptions::default(), |t| {
-                seen.push_str(t);
+            .chat_with_tools_streamed(&[user("hi")], &[], ChatOptions::default(), |p| {
+                match p {
+                    StreamPiece::Text(t) => seen.push_str(t),
+                    StreamPiece::Reasoning(r) => thought.push_str(r),
+                }
                 true
             })
             .await
             .unwrap();
         assert_eq!(seen, "Hello, **world**");
+        assert_eq!(thought, "plan");
         assert_eq!(msg.content.as_deref(), Some("Hello, **world**"));
         assert!(msg.tool_calls.is_none());
+    }
+
+    #[tokio::test]
+    async fn reasoning_content_deltas_arrive_as_reasoning_not_answer_text() {
+        let server = MockServer::start().await;
+        let body = sse(&[
+            json!({ "choices": [ { "delta": { "reasoning_content": "Check the catalog." } } ] }),
+            content_delta("</think>Six datasets."),
+        ]);
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+            .mount(&server)
+            .await;
+
+        let client = LlmClient::new(server.uri(), "m".to_owned(), "k".to_owned());
+        let mut pieces = Vec::new();
+        let msg = client
+            .chat_with_tools_streamed(&[user("hi")], &[], ChatOptions::default(), |p| {
+                pieces.push(match p {
+                    StreamPiece::Text(t) => format!("text:{t}"),
+                    StreamPiece::Reasoning(r) => format!("reasoning:{r}"),
+                });
+                true
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            pieces,
+            vec!["reasoning:Check the catalog.", "text:Six datasets."]
+        );
+        assert_eq!(msg.content.as_deref(), Some("</think>Six datasets."));
     }
 
     #[tokio::test]
@@ -469,8 +535,10 @@ mod tests {
         let client = LlmClient::new(server.uri(), "m".to_owned(), "k".to_owned());
         let mut seen = Vec::new();
         let msg = client
-            .chat_with_tools_streamed(&[user("hi")], &[], ChatOptions::default(), |t| {
-                seen.push(t.to_owned());
+            .chat_with_tools_streamed(&[user("hi")], &[], ChatOptions::default(), |p| {
+                if let StreamPiece::Text(t) = p {
+                    seen.push(t.to_owned());
+                }
                 true
             })
             .await

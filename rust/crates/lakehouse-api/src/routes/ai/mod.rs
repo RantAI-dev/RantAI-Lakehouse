@@ -33,7 +33,7 @@ use lakehouse_auth::Principal;
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ApiError;
 use lakehouse_llm::{
-    ChatOptions, HiddenSpans, LlmMessage, LlmMessageRole, ToolCall, ToolCallFunction,
+    ChatOptions, HiddenSpans, LlmMessage, LlmMessageRole, StreamPiece, ToolCall, ToolCallFunction,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -298,8 +298,10 @@ fn report(progress: Progress<'_>, event: Value) -> bool {
 
 /// One model round. For a streaming client (`progress` set) the answer
 /// text goes out as `{"type":"delta","text":…}` events while the model
-/// writes it, with `MiniMax`'s tool-call XML held back so it never shows
-/// (`<think>` is already dropped by the client library). Text streamed in
+/// writes it, with `MiniMax`'s tool-call XML held back so it never shows,
+/// and the model's reasoning (`<think>` content or `reasoning_content`) as
+/// `{"type":"reasoning","text":…}` for the console's "Thinking" box. The
+/// reasoning is never part of the answer or the saved `done` body. Text streamed in
 /// a round that ends in tool calls is only preamble: the client drops its
 /// draft on the next `tool`/`status` event, and the `done` body — checked
 /// by `citations::annotate_answer` — replaces whatever was streamed.
@@ -321,10 +323,21 @@ async fn model_round(
     ]);
     state
         .llm
-        .chat_with_tools_streamed(messages, tools, ChatOptions::default(), |text| {
-            let visible = tool_xml.push(text);
-            visible.is_empty() || report(progress, json!({ "type": "delta", "text": visible }))
-        })
+        .chat_with_tools_streamed(
+            messages,
+            tools,
+            ChatOptions::default(),
+            |piece| match piece {
+                StreamPiece::Text(text) => {
+                    let visible = tool_xml.push(text);
+                    visible.is_empty()
+                        || report(progress, json!({ "type": "delta", "text": visible }))
+                }
+                StreamPiece::Reasoning(text) => {
+                    report(progress, json!({ "type": "reasoning", "text": text }))
+                }
+            },
+        )
         .await
 }
 
@@ -552,8 +565,9 @@ async fn run_chat(
 /// `stream: true`: the same loop, answered as NDJSON — one JSON object per
 /// line. `{"type":"status","phase":"thinking"}` before each model round and
 /// `{"type":"tool","tool":…}` before each tool call let the client say what
-/// is happening, and `{"type":"delta","text":…}` carries answer text as the
-/// model writes it ([`model_round`]); the last line is `{"type":"done","body":…}` (the plain
+/// is happening, `{"type":"delta","text":…}` carries answer text as the
+/// model writes it and `{"type":"reasoning","text":…}` its reasoning
+/// ([`model_round`]); the last line is `{"type":"done","body":…}` (the plain
 /// response body) or `{"type":"error","status":…,"body":…}`. When the
 /// client disconnects, the loop stops before its next round or tool.
 fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat) -> Response {

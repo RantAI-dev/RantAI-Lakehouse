@@ -156,6 +156,16 @@ async fn a_streamed_chat_sends_deltas_then_the_checked_answer() {
         "reasoning never streams, even with its tag split across events: {streamed:?}"
     );
 
+    let reasoning: String = events
+        .iter()
+        .filter(|e| e["type"] == "reasoning")
+        .filter_map(|e| e["text"].as_str())
+        .collect();
+    assert_eq!(
+        reasoning, "draft reasoning",
+        "the think block streams as reasoning, apart from the answer"
+    );
+
     let last = events.last().expect("at least one event");
     assert_eq!(last["type"], "done", "the stream ends with the done body");
     let answer = last["body"]["answer"].as_str().expect("answer is a string");
