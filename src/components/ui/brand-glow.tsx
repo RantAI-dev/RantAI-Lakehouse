@@ -1,9 +1,9 @@
-"use client";
+"use client"
 
-import * as React from "react";
-import { motion, useReducedMotion } from "motion/react";
+import * as React from "react"
+import { motion, useReducedMotion } from "motion/react"
 
-import { cn } from "@/lib/utils";
+import { cn } from "@/lib/utils"
 
 /**
  * The console's "light through water" treatment, shared by Home and the
@@ -18,7 +18,7 @@ import { cn } from "@/lib/utils";
  * `relative isolate overflow-hidden` container; it sits behind the content.
  */
 export function BrandBackdrop({ className }: { className?: string }) {
-  const reduce = useReducedMotion() ?? false;
+  const reduce = useReducedMotion() ?? false
   const drift = (x: number[], y: number[], duration: number) =>
     reduce
       ? {}
@@ -30,7 +30,7 @@ export function BrandBackdrop({ className }: { className?: string }) {
             repeatType: "mirror" as const,
             ease: "easeInOut" as const,
           },
-        };
+        }
   return (
     <div
       aria-hidden
@@ -53,7 +53,7 @@ export function BrandBackdrop({ className }: { className?: string }) {
         }}
       />
     </div>
-  );
+  )
 }
 
 /**
@@ -66,19 +66,19 @@ export function GlowFrame({
   className,
   innerClassName,
 }: {
-  children: React.ReactNode;
-  className?: string;
-  innerClassName?: string;
+  children: React.ReactNode
+  className?: string
+  innerClassName?: string
 }) {
-  const reduce = useReducedMotion() ?? false;
-  const [focused, setFocused] = React.useState(false);
+  const reduce = useReducedMotion() ?? false
+  const [focused, setFocused] = React.useState(false)
   return (
     <div
       onFocus={() => setFocused(true)}
       onBlur={(e) => {
         // Moving focus between the textarea and the toolbar stays "focused".
         if (!e.currentTarget.contains(e.relatedTarget as Node | null))
-          setFocused(false);
+          setFocused(false)
       }}
       className={cn("relative rounded-2xl p-px", className)}
     >
@@ -111,5 +111,5 @@ export function GlowFrame({
         {children}
       </div>
     </div>
-  );
+  )
 }

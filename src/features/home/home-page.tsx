@@ -1,8 +1,8 @@
-"use client";
+"use client"
 
-import * as React from "react";
-import Link from "next/link";
-import { useRouter } from "next/navigation";
+import * as React from "react"
+import Link from "next/link"
+import { useRouter } from "next/navigation"
 import {
   AnimatePresence,
   motion,
@@ -11,7 +11,7 @@ import {
   useSpring,
   useTransform,
   type Variants,
-} from "motion/react";
+} from "motion/react"
 import {
   ArrowRight,
   ArrowUp,
@@ -21,18 +21,18 @@ import {
   MessageSquare,
   Plug,
   Sparkles,
-} from "lucide-react";
+} from "lucide-react"
 
-import { BrandBackdrop, GlowFrame } from "@/components/ui/brand-glow";
-import { Sheen } from "@/components/ui/sheen";
-import { Skeleton } from "@/components/ui/skeleton";
-import { useAuth } from "@/features/auth/auth-provider";
-import { ModeToggle, ToolsMenu } from "@/features/copilot/chat-composer";
-import { useCopilot, type Mode } from "@/features/copilot/use-copilot";
-import { useService } from "@/hooks/use-service";
-import { formatRelativeTime } from "@/lib/format";
-import { cn } from "@/lib/utils";
-import { connectorService, overviewService, pipelineService } from "@/services";
+import { BrandBackdrop, GlowFrame } from "@/components/ui/brand-glow"
+import { Sheen } from "@/components/ui/sheen"
+import { Skeleton } from "@/components/ui/skeleton"
+import { useAuth } from "@/features/auth/auth-provider"
+import { ModeToggle, ToolsMenu } from "@/features/copilot/chat-composer"
+import { useCopilot, type Mode } from "@/features/copilot/use-copilot"
+import { useService } from "@/hooks/use-service"
+import { formatRelativeTime } from "@/lib/format"
+import { cn } from "@/lib/utils"
+import { connectorService, overviewService, pipelineService } from "@/services"
 
 /**
  * AI-first landing page. The console is agentic-first, so the first thing
@@ -60,49 +60,49 @@ import { connectorService, overviewService, pipelineService } from "@/services";
  * under `prefers-reduced-motion`.
  */
 export function HomePage() {
-  const router = useRouter();
-  const { user } = useAuth();
-  const copilot = useCopilot();
-  const reduce = useReducedMotion() ?? false;
+  const router = useRouter()
+  const { user } = useAuth()
+  const copilot = useCopilot()
+  const reduce = useReducedMotion() ?? false
   const [pending, setPending] = React.useState<{
-    text: string;
-    mode: Mode;
-  } | null>(null);
+    text: string
+    mode: Mode
+  } | null>(null)
 
   // `send` closes over the current mode, so a prompt that needs Build mode
   // waits one render for `setMode` to land before it is sent.
-  const { mode, send } = copilot;
+  const { mode, send } = copilot
   React.useEffect(() => {
-    if (!pending || mode !== pending.mode) return;
-    setPending(null);
-    void send(pending.text, []);
-  }, [pending, mode, send]);
+    if (!pending || mode !== pending.mode) return
+    setPending(null)
+    void send(pending.text, [])
+  }, [pending, mode, send])
 
   const ask = React.useCallback(
     (text: string, wanted: Mode = "ask") => {
-      const q = text.trim();
-      if (!q) return;
-      copilot.newChat();
-      copilot.setMode(wanted);
-      setPending({ text: q, mode: wanted });
-      router.push("/copilot");
+      const q = text.trim()
+      if (!q) return
+      copilot.newChat()
+      copilot.setMode(wanted)
+      setPending({ text: q, mode: wanted })
+      router.push("/copilot")
     },
     [copilot, router],
-  );
+  )
 
   const pipelines = useService(
     (signal) => pipelineService.listPipelines(signal),
     [],
-  );
-  const alerts = useService((signal) => overviewService.listAlerts(signal), []);
+  )
+  const alerts = useService((signal) => overviewService.listAlerts(signal), [])
   const connectors = useService(
     (signal) => connectorService.listConnectors(signal),
     [],
-  );
+  )
 
-  const firstName = user?.name?.split(" ")[0];
-  const list = reduce ? undefined : STAGGER;
-  const item = reduce ? undefined : RISE;
+  const firstName = user?.name?.split(" ")[0]
+  const list = reduce ? undefined : STAGGER
+  const item = reduce ? undefined : RISE
 
   const attention: AttentionItem[] = [
     ...(pipelines.data?.pipelines ?? [])
@@ -135,7 +135,7 @@ export function HomePage() {
         href: "/connectors",
         prompt: `Source "${c.name}" is ${c.health}. Test it and tell me what is wrong.`,
       })),
-  ];
+  ]
 
   return (
     <motion.div
@@ -297,13 +297,13 @@ export function HomePage() {
         </Panel>
       </motion.div>
     </motion.div>
-  );
+  )
 }
 
 const STAGGER: Variants = {
   hidden: {},
   show: { transition: { staggerChildren: 0.08, delayChildren: 0.05 } },
-};
+}
 
 const RISE: Variants = {
   hidden: { opacity: 0, y: 14 },
@@ -312,7 +312,7 @@ const RISE: Variants = {
     y: 0,
     transition: { type: "spring", stiffness: 170, damping: 26 },
   },
-};
+}
 
 /** Placeholder examples per mode: Build ones are things Build mode can actually do. */
 const EXAMPLES: Record<Mode, string[]> = {
@@ -328,7 +328,7 @@ const EXAMPLES: Record<Mode, string[]> = {
     "Add an alert when a mart measure crosses a threshold",
     "Export a gold mart to Iceberg",
   ],
-};
+}
 
 /**
  * The main input. A rotating conic ring lights up while it has focus, and
@@ -345,37 +345,37 @@ function PromptBox({
   enabledCaps,
   toggleCap,
 }: {
-  onAsk: (q: string) => void;
-  reduce: boolean;
-  mode: Mode;
-  setMode: (m: Mode) => void;
-  enabledCaps: Set<string>;
-  toggleCap: (key: string) => void;
+  onAsk: (q: string) => void
+  reduce: boolean
+  mode: Mode
+  setMode: (m: Mode) => void
+  enabledCaps: Set<string>
+  toggleCap: (key: string) => void
 }) {
-  const [draft, setDraft] = React.useState("");
-  const [hint, setHint] = React.useState(0);
-  const ref = React.useRef<HTMLTextAreaElement>(null);
+  const [draft, setDraft] = React.useState("")
+  const [hint, setHint] = React.useState(0)
+  const ref = React.useRef<HTMLTextAreaElement>(null)
 
   React.useEffect(() => {
-    ref.current?.focus();
-  }, []);
+    ref.current?.focus()
+  }, [])
 
   React.useEffect(() => {
-    if (reduce || draft) return;
-    const t = window.setInterval(() => setHint((h) => h + 1), 3500);
-    return () => window.clearInterval(t);
-  }, [reduce, draft]);
+    if (reduce || draft) return
+    const t = window.setInterval(() => setHint((h) => h + 1), 3500)
+    return () => window.clearInterval(t)
+  }, [reduce, draft])
 
   const submit = () => {
-    if (!draft.trim()) return;
-    onAsk(draft);
-  };
+    if (!draft.trim()) return
+    onAsk(draft)
+  }
 
   return (
     <form
       onSubmit={(e) => {
-        e.preventDefault();
-        submit();
+        e.preventDefault()
+        submit()
       }}
     >
       <GlowFrame>
@@ -389,8 +389,8 @@ function PromptBox({
               !e.shiftKey &&
               !e.nativeEvent.isComposing
             ) {
-              e.preventDefault();
-              submit();
+              e.preventDefault()
+              submit()
             }
           }}
           aria-label="Ask AI"
@@ -458,7 +458,7 @@ function PromptBox({
         </div>
       </GlowFrame>
     </form>
-  );
+  )
 }
 
 /**
@@ -479,19 +479,19 @@ function StartCard({
   onAi,
   reduce,
 }: {
-  icon: React.ComponentType<{ className?: string }>;
-  title: string;
-  description: string;
-  href: string;
-  onAi: () => void;
-  reduce: boolean;
+  icon: React.ComponentType<{ className?: string }>
+  title: string
+  description: string
+  href: string
+  onAi: () => void
+  reduce: boolean
 }) {
-  const ref = React.useRef<HTMLDivElement>(null);
-  const px = useMotionValue(0.5);
-  const py = useMotionValue(0.5);
-  const spring = { stiffness: 170, damping: 22, mass: 0.6 };
-  const rotateX = useSpring(useTransform(py, [0, 1], [5, -5]), spring);
-  const rotateY = useSpring(useTransform(px, [0, 1], [-6, 6]), spring);
+  const ref = React.useRef<HTMLDivElement>(null)
+  const px = useMotionValue(0.5)
+  const py = useMotionValue(0.5)
+  const spring = { stiffness: 170, damping: 22, mass: 0.6 }
+  const rotateX = useSpring(useTransform(py, [0, 1], [5, -5]), spring)
+  const rotateY = useSpring(useTransform(px, [0, 1], [-6, 6]), spring)
 
   return (
     <motion.div
@@ -502,19 +502,19 @@ function StartCard({
       whileHover={reduce ? undefined : { y: -4 }}
       transition={{ type: "spring", stiffness: 260, damping: 22 }}
       onPointerMove={(e) => {
-        const el = ref.current;
-        if (!el) return;
-        const r = el.getBoundingClientRect();
-        const x = e.clientX - r.left;
-        const y = e.clientY - r.top;
-        el.style.setProperty("--mx", `${x}px`);
-        el.style.setProperty("--my", `${y}px`);
-        px.set(x / r.width);
-        py.set(y / r.height);
+        const el = ref.current
+        if (!el) return
+        const r = el.getBoundingClientRect()
+        const x = e.clientX - r.left
+        const y = e.clientY - r.top
+        el.style.setProperty("--mx", `${x}px`)
+        el.style.setProperty("--my", `${y}px`)
+        px.set(x / r.width)
+        py.set(y / r.height)
       }}
       onPointerLeave={() => {
-        px.set(0.5);
-        py.set(0.5);
+        px.set(0.5)
+        py.set(0.5)
       }}
       className="group/card relative flex flex-col rounded-2xl p-px will-change-transform"
     >
@@ -566,7 +566,7 @@ function StartCard({
         </div>
       </div>
     </motion.div>
-  );
+  )
 }
 
 /**
@@ -579,10 +579,10 @@ function AiButton({
   children,
   className,
 }: {
-  onClick: () => void;
-  reduce: boolean;
-  children: React.ReactNode;
-  className?: string;
+  onClick: () => void
+  reduce: boolean
+  children: React.ReactNode
+  className?: string
 }) {
   return (
     <motion.button
@@ -600,7 +600,7 @@ function AiButton({
       <Sparkles className="size-3 transition-transform duration-500 group-hover/ai:rotate-[72deg] group-hover/ai:scale-125 motion-reduce:transition-none" />
       {children}
     </motion.button>
-  );
+  )
 }
 
 function SectionTitle({ children }: { children: React.ReactNode }) {
@@ -608,7 +608,7 @@ function SectionTitle({ children }: { children: React.ReactNode }) {
     <h2 className="px-1 text-xs font-semibold tracking-[0.08em] text-muted-foreground uppercase">
       {children}
     </h2>
-  );
+  )
 }
 
 function Panel({
@@ -617,10 +617,10 @@ function Panel({
   className,
   children,
 }: {
-  title: string;
-  count?: number;
-  className?: string;
-  children: React.ReactNode;
+  title: string
+  count?: number
+  className?: string
+  children: React.ReactNode
 }) {
   return (
     <section
@@ -639,17 +639,17 @@ function Panel({
       </div>
       {children}
     </section>
-  );
+  )
 }
 
 type AttentionItem = {
-  key: string;
-  kind: string;
-  label: string;
-  state: string;
-  href: string;
-  prompt: string;
-};
+  key: string
+  kind: string
+  label: string
+  state: string
+  href: string
+  prompt: string
+}
 
 function AttentionList({
   loading,
@@ -658,11 +658,11 @@ function AttentionList({
   onAsk,
   reduce,
 }: {
-  loading: boolean;
-  failedReads: string[];
-  items: AttentionItem[];
-  onAsk: (prompt: string) => void;
-  reduce: boolean;
+  loading: boolean
+  failedReads: string[]
+  items: AttentionItem[]
+  onAsk: (prompt: string) => void
+  reduce: boolean
 }) {
   if (loading) {
     return (
@@ -670,7 +670,7 @@ function AttentionList({
         <Skeleton className="h-9 w-full" />
         <Skeleton className="h-9 w-4/5" />
       </div>
-    );
+    )
   }
   return (
     <div className="flex flex-col">
@@ -721,14 +721,14 @@ function AttentionList({
         </p>
       ) : null}
     </div>
-  );
+  )
 }
 
 function greeting(): string {
-  const h = new Date().getHours();
-  if (h < 12) return "Good morning";
-  if (h < 18) return "Good afternoon";
-  return "Good evening";
+  const h = new Date().getHours()
+  if (h < 12) return "Good morning"
+  if (h < 18) return "Good afternoon"
+  return "Good evening"
 }
 
 /**
@@ -736,11 +736,11 @@ function greeting(): string {
  * generic starters that every workspace can answer from its own catalog.
  */
 function suggestions(pipelines: { name: string; status: string }[]): string[] {
-  const failed = pipelines.find((p) => p.status === "failed");
+  const failed = pipelines.find((p) => p.status === "failed")
   const base = [
     "What data do we have?",
     "Which tables changed in the last day?",
     "Show the top rows of the busiest mart",
-  ];
-  return failed ? [`Why did ${failed.name} fail?`, ...base.slice(0, 2)] : base;
+  ]
+  return failed ? [`Why did ${failed.name} fail?`, ...base.slice(0, 2)] : base
 }

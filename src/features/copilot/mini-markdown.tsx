@@ -1,5 +1,6 @@
 import * as React from "react";
 import { OMITTED_TABLE_TEXT, UNVERIFIED_NUMBER_LABEL, tokenizeInline } from "@/lib/citation-markers";
+import { plainPreview } from "@/lib/copilot-sessions";
 import { CopyButton } from "./copy-button";
 
 /**
@@ -31,7 +32,7 @@ function renderInline(text: string, keyBase: string): React.ReactNode[] {
         return <strong key={key}>{tok.content}</strong>;
       case "code":
         return (
-          <code key={key} className="rounded bg-muted px-1 py-0.5 font-mono text-[0.85em]">
+          <code key={key} className="rounded-md border border-border/70 bg-muted/70 px-1.5 py-px font-mono text-[0.85em] text-foreground">
             {tok.content}
           </code>
         );
@@ -79,6 +80,16 @@ function renderInline(text: string, keyBase: string): React.ReactNode[] {
   });
 }
 
+/**
+ * A table as tab-separated text, so pasting into a spreadsheet fills cells.
+ * Cells go through `plainPreview` so markdown and citation markers become
+ * the plain values a reader sees.
+ */
+export function tableTsv(header: string[], rows: string[][]): string {
+  const cell = (c: string) => plainPreview(c, Number.MAX_SAFE_INTEGER).replace(/\t/g, " ");
+  return [header, ...rows].map((r) => r.map(cell).join("\t")).join("\n");
+}
+
 function splitRow(line: string): string[] {
   return line
     .replace(/^\||\|$/g, "")
@@ -88,12 +99,12 @@ function splitRow(line: string): string[] {
 
 function CodeBlock({ code, lang }: { code: string; lang: string }) {
   return (
-    <div className="my-1 overflow-hidden rounded-lg border border-border bg-muted/40">
-      <div className="flex items-center justify-between border-b border-border px-2.5 py-1">
+    <div className="my-2 overflow-hidden rounded-xl border border-border bg-muted/40">
+      <div className="flex items-center justify-between border-b border-border bg-muted/40 px-3 py-1">
         <span className="font-mono text-[11px] text-muted-foreground">{lang || "code"}</span>
         <CopyButton text={code} label="Copy code" />
       </div>
-      <pre className="overflow-x-auto p-2.5 text-xs leading-relaxed">
+      <pre className="overflow-x-auto p-3 text-xs leading-relaxed">
         <code className="font-mono">{code}</code>
       </pre>
     </div>
@@ -134,9 +145,9 @@ function renderList(nodes: ListNode[], keyBase: string): React.ReactNode {
   const ordered = nodes[0]?.ordered ?? false;
   const Tag = ordered ? "ol" : "ul";
   return (
-    <Tag className={`${ordered ? "list-decimal" : "list-disc"} space-y-0.5 pl-5 text-sm`}>
+    <Tag className={`${ordered ? "list-decimal" : "list-disc"} space-y-1 pl-5 text-sm leading-relaxed marker:font-semibold marker:text-muted-foreground`}>
       {nodes.map((n, j) => (
-        <li key={j}>
+        <li key={j} className="pl-1">
           {renderInline(n.text, `${keyBase}-${j}`)}
           {n.children.length ? renderList(n.children, `${keyBase}-${j}c`) : null}
         </li>
@@ -176,9 +187,10 @@ export function MiniMarkdown({ text }: { text: string }) {
     const h = /^(#{1,3})\s+(.*)$/.exec(line);
     if (h) {
       const level = h[1].length;
-      const cls = level === 1 ? "text-base font-semibold" : level === 2 ? "text-sm font-semibold" : "text-sm font-medium";
+      // Every level stays above the 14px body text; h2/h3 used to match it.
+      const cls = level === 1 ? "text-lg font-semibold tracking-[-0.01em]" : level === 2 ? "text-base font-semibold" : "text-[15px] font-semibold";
       blocks.push(
-        <p key={key++} className={`${cls} mt-1 text-foreground`}>
+        <p key={key++} className={`${cls} mt-3 mb-0.5 text-foreground first:mt-0`}>
           {renderInline(h[2], `h${key}`)}
         </p>
       );
@@ -196,7 +208,7 @@ export function MiniMarkdown({ text }: { text: string }) {
       const quote: string[] = [];
       while (i < lines.length && lines[i].startsWith(">")) quote.push(lines[i++].replace(/^>\s?/, ""));
       blocks.push(
-        <blockquote key={key++} className="border-l-2 border-border pl-3 text-sm text-muted-foreground">
+        <blockquote key={key++} className="my-1 border-l-2 border-[color-mix(in_oklch,var(--brand-1),transparent_50%)] py-0.5 pl-3 text-sm text-muted-foreground">
           {renderInline(quote.join(" "), `q${key}`)}
         </blockquote>
       );
@@ -213,29 +225,35 @@ export function MiniMarkdown({ text }: { text: string }) {
         i++;
       }
       blocks.push(
-        <div key={key++} className="my-1 overflow-x-auto">
-          <table className="w-full border-collapse text-xs">
-            <thead>
-              <tr className="border-b border-border">
-                {header.map((c, j) => (
-                  <th key={j} className="px-2 py-1 text-left font-medium text-muted-foreground">
-                    {renderInline(c, `th${key}-${j}`)}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r, ri) => (
-                <tr key={ri} className="border-b border-border/50 last:border-0">
-                  {r.map((c, ci) => (
-                    <td key={ci} className="px-2 py-1 tabular-nums">
-                      {renderInline(c, `td${key}-${ri}-${ci}`)}
-                    </td>
+        <div key={key++} className="my-2 overflow-hidden rounded-xl border border-border">
+          <div className="flex items-center justify-between border-b border-border bg-muted/40 py-0.5 pr-1 pl-3 text-[11px] text-muted-foreground">
+            <span>Table · {rows.length} {rows.length === 1 ? "row" : "rows"}</span>
+            <CopyButton text={tableTsv(header, rows)} label="Copy table (paste into a spreadsheet)" />
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse text-xs">
+              <thead>
+                <tr className="border-b border-border bg-muted/20">
+                  {header.map((c, j) => (
+                    <th key={j} className="px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wide whitespace-nowrap text-muted-foreground">
+                      {renderInline(c, `th${key}-${j}`)}
+                    </th>
                   ))}
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {rows.map((r, ri) => (
+                  <tr key={ri} className="border-b border-border/50 transition-colors last:border-0 hover:bg-muted/40">
+                    {r.map((c, ci) => (
+                      <td key={ci} className="px-3 py-1.5 align-top tabular-nums">
+                        {renderInline(c, `td${key}-${ri}-${ci}`)}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       );
       continue;
@@ -255,11 +273,11 @@ export function MiniMarkdown({ text }: { text: string }) {
       i++;
     }
     blocks.push(
-      <p key={key++} className="text-sm leading-relaxed">
+      <p key={key++} className="text-sm leading-relaxed text-foreground/90">
         {renderInline(para.join(" "), `p${key}`)}
       </p>
     );
   }
 
-  return <div className="space-y-1.5">{blocks}</div>;
+  return <div className="space-y-2">{blocks}</div>;
 }

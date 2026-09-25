@@ -3,33 +3,60 @@
 import * as React from "react";
 import Link from "next/link";
 import { motion, useReducedMotion } from "motion/react";
-import { AlertCircle, BarChart3, RotateCcw, Sparkles } from "lucide-react";
+import { AlertCircle, ArrowDown, BarChart3, Check, ChevronRight, RotateCcw, Sparkles, Wrench } from "lucide-react";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { BuildTree } from "./build-tree";
 import { CopyButton } from "./copy-button";
 import { MiniMarkdown } from "./mini-markdown";
 import { PendingActionCard } from "./pending-action-card";
-import { TOOL_LABEL, ToolStepCard, asObj } from "./tool-step";
+import { TOOL_LABEL, ToolStepCard, asObj, type ToolStep } from "./tool-step";
 import type { ChatProgress, Msg } from "./use-copilot";
 
-/** What Copilot is doing right now, with the time it has taken so far. */
+/**
+ * What Copilot is doing right now: a pill with the current step and the
+ * time so far, and under it the steps already finished in this answer.
+ * Built only from the events `/api/ai/chat` really sends (`status` before
+ * each model round, `tool` before each tool call) — no invented stages.
+ */
 function ProgressLine({ progress }: { progress: ChatProgress | null }) {
   const [now, setNow] = React.useState(() => Date.now());
   React.useEffect(() => {
-    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    const t = window.setInterval(() => setNow(Date.now()), 250);
     return () => window.clearInterval(t);
   }, []);
   const label =
     progress?.phase === "tool" && progress.tool
       ? `Running ${TOOL_LABEL[progress.tool] ?? progress.tool}…`
-      : "Thinking…";
-  const seconds = progress ? Math.max(0, Math.floor((now - progress.startedAt) / 1000)) : 0;
+      : progress?.steps?.length
+        ? "Writing the answer…"
+        : "Thinking…";
+  const seconds = progress ? Math.max(0, (now - progress.startedAt) / 1000) : 0;
+  const steps = progress?.steps ?? [];
+  // While a tool runs it is the pill; only the ones before it are done.
+  const done = progress?.phase === "tool" ? steps.slice(0, -1) : steps;
   return (
-    <div className="flex items-center gap-2 text-sm text-muted-foreground" role="status">
-      <Sparkles className="size-4 animate-pulse text-[var(--brand-1)]" aria-hidden />
-      <span>{label}</span>
-      {seconds >= 2 ? <span className="text-xs tabular-nums">{seconds}s</span> : null}
+    <div className="flex flex-col items-start gap-1.5" role="status">
+      <div className="inline-flex items-center gap-2.5 rounded-full border border-[color-mix(in_oklch,var(--brand-1),transparent_70%)] bg-[color-mix(in_oklch,var(--brand-1),transparent_92%)] py-1.5 pr-3.5 pl-3 text-sm text-foreground/85">
+        <span className="relative flex size-2">
+          <span className="absolute inline-flex size-full rounded-full bg-[var(--brand-1)] opacity-60 motion-safe:animate-ping" />
+          <span className="relative inline-flex size-2 rounded-full bg-[var(--brand-1)]" />
+        </span>
+        <span>{label}</span>
+        {seconds >= 1 ? (
+          <span className="text-xs tabular-nums text-muted-foreground">· {seconds.toFixed(0)}s</span>
+        ) : null}
+      </div>
+      {done.length ? (
+        <ul className="flex flex-wrap gap-x-3 gap-y-1 pl-1 text-xs text-muted-foreground">
+          {done.map((t, i) => (
+            <li key={`${t}-${i}`} className="inline-flex items-center gap-1">
+              <Check className="size-3 text-emerald-500" aria-hidden />
+              {TOOL_LABEL[t] ?? t}
+            </li>
+          ))}
+        </ul>
+      ) : null}
     </div>
   );
 }
@@ -77,15 +104,15 @@ export function ChatMessages({
   const enter = reduce
     ? {}
     : { initial: { opacity: 0, y: 8 }, animate: { opacity: 1, y: 0 }, transition: { type: "spring" as const, stiffness: 220, damping: 26 } };
-  const endRef = React.useRef<HTMLDivElement>(null);
-  React.useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, busy, error]);
+  const rootRef = React.useRef<HTMLDivElement>(null);
+  // Changes whenever something new lands at the bottom of the list.
+  const tail = `${messages.length}:${messages[messages.length - 1]?.content.length ?? 0}:${busy}:${error ?? ""}:${progress?.phase}:${progress?.steps?.length ?? 0}`;
+  const { pinned, jumpToLatest } = useStickToBottom(rootRef, tail);
 
   const lastIndex = messages.length - 1;
 
   return (
-    <div className={cn("space-y-4", className)}>
+    <div ref={rootRef} className={cn("space-y-4", className)}>
       {messages.map((m, i) => {
         const key = m.id ?? `m${i}`;
         if (m.role === "user") {
@@ -103,13 +130,7 @@ export function ChatMessages({
           <motion.div key={key} {...enter} className={cn("min-w-0", avatars && "flex gap-3")}>
             {avatars ? <CopilotAvatar /> : null}
             <div className="min-w-0 flex-1 space-y-2">
-            {m.tools?.length ? (
-              <div className="space-y-1.5">
-                {m.tools.map((t, j) => (
-                  <ToolStepCard key={j} step={t} />
-                ))}
-              </div>
-            ) : null}
+            {m.tools?.length ? <StepsDisclosure tools={m.tools} /> : null}
             {m.buildRunId ? <BuildTree runId={m.buildRunId} /> : null}
             {m.content ? <MiniMarkdown text={m.content} /> : null}
             {m.stopped ? (
@@ -140,9 +161,10 @@ export function ChatMessages({
               </Link>
             ) : null}
             {m.content ? (
-              <div className="flex items-center gap-1">
-                <CopyButton text={m.content} label="Copy answer" />
-              </div>
+              <AnswerActions
+                msg={m}
+                onRegenerate={i === lastIndex && onRetry && !busy ? onRetry : undefined}
+              />
             ) : null}
             </div>
           </motion.div>
@@ -150,7 +172,7 @@ export function ChatMessages({
       })}
       {busy ? (
         avatars ? (
-          <div className="flex items-center gap-3">
+          <div className="flex items-start gap-3">
             <CopilotAvatar thinking />
             <ProgressLine progress={progress ?? null} />
           </div>
@@ -169,7 +191,152 @@ export function ChatMessages({
           ) : null}
         </div>
       ) : null}
-      <div ref={endRef} />
+      {!pinned ? (
+        <div className="pointer-events-none sticky bottom-2 flex justify-center">
+          <button
+            type="button"
+            onClick={jumpToLatest}
+            className="pointer-events-auto inline-flex items-center gap-1.5 rounded-full border border-border bg-background/90 px-3 py-1.5 text-xs font-medium text-foreground shadow-lg backdrop-blur transition-all hover:-translate-y-0.5 hover:border-[color-mix(in_oklch,var(--brand-1),transparent_50%)]"
+          >
+            <ArrowDown className="size-3.5" /> Jump to latest
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** The nearest ancestor that scrolls vertically (the chat's own list). */
+function scrollParent(el: HTMLElement | null): HTMLElement | null {
+  for (let p = el?.parentElement ?? null; p; p = p.parentElement) {
+    const { overflowY } = getComputedStyle(p);
+    if (overflowY === "auto" || overflowY === "scroll") return p;
+  }
+  return null;
+}
+
+/**
+ * Follows new content only while the reader is at the bottom. Scrolling up
+ * to reread detaches it (a "Jump to latest" button appears); coming back
+ * within 80px of the end re-attaches. Scrolls the chat's own container, so
+ * the page around it never moves.
+ */
+function useStickToBottom(rootRef: React.RefObject<HTMLDivElement | null>, tail: string) {
+  const [pinned, setPinned] = React.useState(true);
+  const pinnedRef = React.useRef(true);
+
+  React.useEffect(() => {
+    const scroller = scrollParent(rootRef.current);
+    if (!scroller) return;
+    const onScroll = () => {
+      const atEnd = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
+      pinnedRef.current = atEnd;
+      setPinned(atEnd);
+    };
+    scroller.addEventListener("scroll", onScroll, { passive: true });
+    return () => scroller.removeEventListener("scroll", onScroll);
+  }, [rootRef]);
+
+  React.useEffect(() => {
+    if (!pinnedRef.current) return;
+    const scroller = scrollParent(rootRef.current);
+    scroller?.scrollTo({ top: scroller.scrollHeight, behavior: "smooth" });
+  }, [rootRef, tail]);
+
+  const jumpToLatest = React.useCallback(() => {
+    const scroller = scrollParent(rootRef.current);
+    pinnedRef.current = true;
+    setPinned(true);
+    scroller?.scrollTo({ top: scroller.scrollHeight, behavior: "smooth" });
+  }, [rootRef]);
+
+  return { pinned, jumpToLatest };
+}
+
+/**
+ * An answer's tool steps, folded into one line ("4 steps · 2 failed ·
+ * Search datasets, SQL query…") so the answer, not the plumbing, is what
+ * the reader sees first. It opens by itself only when a step waits on the
+ * user (approval or confirmation); failures are counted in the summary
+ * rather than spread open above the answer.
+ */
+function StepsDisclosure({ tools }: { tools: ToolStep[] }) {
+  const waiting = tools.some((t) => {
+    const r = asObj(t.result);
+    return Boolean(r.needs_approval || r.needs_confirmation);
+  });
+  const [open, setOpen] = React.useState(waiting);
+  const failed = tools.filter((t) => !t.ok || "error" in asObj(t.result)).length;
+  const names = [...new Set(tools.map((t) => TOOL_LABEL[t.tool] ?? t.tool))];
+  return (
+    <div className="rounded-xl border border-border/70 bg-background/40">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        className="group/steps flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+      >
+        <Wrench className="size-3.5 shrink-0 transition-transform duration-300 group-hover/steps:-rotate-12" aria-hidden />
+        <span className="font-medium text-foreground/85">
+          {tools.length} {tools.length === 1 ? "step" : "steps"}
+        </span>
+        {failed ? (
+          <span className="rounded-full bg-destructive/10 px-1.5 py-0.5 text-[10px] font-medium text-destructive">
+            {failed} failed
+          </span>
+        ) : null}
+        <span className="min-w-0 flex-1 truncate">· {names.join(", ")}</span>
+        <ChevronRight className={cn("size-3.5 shrink-0 transition-transform", open && "rotate-90")} aria-hidden />
+      </button>
+      {open ? (
+        <div className="space-y-1.5 border-t border-border/70 p-2">
+          {tools.map((t, j) => (
+            <ToolStepCard key={j} step={t} />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** "3.2s", "1m 04s". */
+function formatElapsed(ms: number): string {
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(1)}s`;
+  const m = Math.floor(s / 60);
+  return `${m}m ${String(Math.round(s % 60)).padStart(2, "0")}s`;
+}
+
+/**
+ * Under a finished answer: copy, regenerate (latest answer only) and how
+ * long it took. No rating buttons: nothing on the backend would record a
+ * rating, and a button that goes nowhere is worse than none.
+ */
+function AnswerActions({ msg, onRegenerate }: { msg: Msg; onRegenerate?: () => void }) {
+  const time = msg.at ? new Date(msg.at) : null;
+  return (
+    <div className="flex items-center gap-0.5 text-muted-foreground">
+      <CopyButton text={msg.content} label="Copy answer" className="p-1.5" />
+      {onRegenerate ? (
+        <button
+          type="button"
+          onClick={onRegenerate}
+          aria-label="Regenerate"
+          title="Regenerate"
+          className="group/regen inline-flex items-center rounded-md p-1.5 transition-colors hover:bg-muted hover:text-foreground"
+        >
+          <RotateCcw className="size-3.5 transition-transform duration-500 group-hover/regen:-rotate-180 motion-reduce:transition-none" />
+        </button>
+      ) : null}
+      {msg.elapsedMs != null || time ? (
+        <span className="pl-1.5 text-[11px] tabular-nums">
+          {msg.elapsedMs != null ? `Answered in ${formatElapsed(msg.elapsedMs)}` : null}
+          {msg.elapsedMs != null && time ? " · " : null}
+          {time ? (
+            <time dateTime={msg.at}>{time.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>
+          ) : null}
+        </span>
+      ) : null}
     </div>
   );
 }

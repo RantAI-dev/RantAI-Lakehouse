@@ -1,6 +1,6 @@
 import { render, within } from "@testing-library/react"
 import { describe, expect, it } from "bun:test"
-import { MiniMarkdown } from "./mini-markdown"
+import { MiniMarkdown, tableTsv } from "./mini-markdown"
 
 // WS7 item F6: a reader must be able to see WHY an unverified number is
 // marked, and an omitted table must read as deliberate product behaviour,
@@ -45,5 +45,15 @@ describe("MiniMarkdown citation rendering (WS7 item F6)", () => {
     const marked = within(container).getByText("998")
     expect(marked.getAttribute("data-unverified")).toBe("true")
     expect(container.querySelector("table")).not.toBeNull()
+  })
+})
+
+describe("tableTsv", () => {
+  it("copies a table as tab-separated plain values, dropping markdown and citation markers", () => {
+    const tsv = tableTsv(
+      ["Mart", "**Rows**"],
+      [["`serving.mart_event`", '<span data-unverified="true">998</span>']],
+    )
+    expect(tsv).toBe("Mart\tRows\nserving.mart_event\t998")
   })
 })

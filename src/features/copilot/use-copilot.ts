@@ -22,6 +22,10 @@ export type Msg = {
   tools?: ToolStep[];
   buildRunId?: string;
   chartCreated?: boolean;
+  /** Wall time from send to answer, measured in this browser. */
+  elapsedMs?: number;
+  /** When the answer arrived (ISO). Older saved messages have neither. */
+  at?: string;
 };
 export type SessionMeta = {
   id: string;
@@ -34,7 +38,13 @@ export type SessionMeta = {
 };
 
 /** What Copilot is doing while an answer is on its way. */
-export type ChatProgress = { phase: "thinking" | "tool"; tool?: string; startedAt: number };
+export type ChatProgress = {
+  phase: "thinking" | "tool";
+  tool?: string;
+  startedAt: number;
+  /** Tools already started in this answer, oldest first (the current one last). */
+  steps?: string[];
+};
 
 function newMsgId(): string {
   return typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -200,7 +210,8 @@ function useCopilotState() {
     const next: Msg[] = [...(history ?? messagesRef.current), { id: newMsgId(), role: "user", content: q }];
     setMessages(next);
     setBusy(true);
-    setProgress({ phase: "thinking", startedAt: Date.now() });
+    const startedAt = Date.now();
+    setProgress({ phase: "thinking", startedAt });
     const controller = new AbortController();
     abortRef.current = controller;
     try {
@@ -221,9 +232,14 @@ function useCopilotState() {
       for await (const raw of readNdjson(res)) {
         const event = raw as { type?: string; tool?: string; body?: unknown };
         if (event.type === "status") {
-          setProgress((p) => ({ phase: "thinking", startedAt: p?.startedAt ?? Date.now() }));
+          setProgress((p) => ({ phase: "thinking", startedAt: p?.startedAt ?? Date.now(), steps: p?.steps }));
         } else if (event.type === "tool") {
-          setProgress((p) => ({ phase: "tool", tool: event.tool, startedAt: p?.startedAt ?? Date.now() }));
+          setProgress((p) => ({
+            phase: "tool",
+            tool: event.tool,
+            startedAt: p?.startedAt ?? Date.now(),
+            steps: event.tool ? [...(p?.steps ?? []), event.tool] : p?.steps,
+          }));
         } else if (event.type === "done") {
           result = event.body as ChatResult;
         } else if (event.type === "error") {
@@ -248,6 +264,8 @@ function useCopilotState() {
           tools,
           buildRunId: result.buildRunId,
           chartCreated,
+          elapsedMs: Date.now() - startedAt,
+          at: new Date().toISOString(),
         },
       ];
       setMessages(full);
