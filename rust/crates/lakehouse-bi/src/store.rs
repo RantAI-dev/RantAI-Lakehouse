@@ -305,9 +305,9 @@ pub struct FilterDef {
 fn random_hex(n_bytes: usize) -> String {
     use std::fmt::Write as _;
 
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = vec![0_u8; n_bytes];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let mut out = String::with_capacity(n_bytes * 2);
     for b in bytes {
         let _ = write!(out, "{b:02x}");

@@ -512,9 +512,9 @@ fn normalize_digest(
 fn random_hex8() -> String {
     use std::fmt::Write as _;
 
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0_u8; 4];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let mut out = String::with_capacity(8);
     for b in bytes {
         let _ = write!(out, "{b:02x}");

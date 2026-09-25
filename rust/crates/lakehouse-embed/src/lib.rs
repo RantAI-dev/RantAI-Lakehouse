@@ -15,7 +15,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::{Hmac, KeyInit, Mac};
 use lakehouse_clickhouse::{ChClient, ChError};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
@@ -150,7 +150,7 @@ fn generate_hex_secret() -> String {
     use std::fmt::Write as _;
 
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     bytes.iter().fold(String::with_capacity(64), |mut acc, b| {
         let _ = write!(acc, "{b:02x}");
         acc
