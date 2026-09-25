@@ -6,7 +6,10 @@ import { useRouter } from "next/navigation"
 import {
   AnimatePresence,
   motion,
+  useMotionValue,
   useReducedMotion,
+  useSpring,
+  useTransform,
   type Variants,
 } from "motion/react"
 import {
@@ -136,8 +139,9 @@ export function HomePage() {
       >
         <HeroBackdrop reduce={reduce} />
         <div className="mx-auto flex max-w-2xl flex-col items-center gap-2 text-center">
-          <span className="inline-flex items-center gap-1.5 rounded-full border border-[color-mix(in_oklch,var(--brand-1),transparent_60%)] bg-[color-mix(in_oklch,var(--brand-1),transparent_88%)] px-3 py-1 text-xs font-medium text-[var(--brand-1)]">
-            <Sparkles className="size-3" /> Copilot
+          <span className="group/badge relative inline-flex cursor-default items-center gap-1.5 overflow-hidden rounded-full border border-[color-mix(in_oklch,var(--brand-1),transparent_60%)] bg-[color-mix(in_oklch,var(--brand-1),transparent_88%)] px-3 py-1 text-xs font-medium text-[var(--brand-1)] transition-shadow duration-300 hover:shadow-[0_0_24px_-6px_var(--brand-1)]">
+            <Sheen className="group-hover/badge:translate-x-[400%]" />
+            <Sparkles className="size-3 transition-transform duration-700 group-hover/badge:rotate-180 motion-reduce:transition-none" /> Copilot
           </span>
           <h1 className="text-3xl font-semibold tracking-[-0.03em] text-balance text-foreground sm:text-4xl">
             {greeting()}
@@ -156,10 +160,12 @@ export function HomePage() {
                 key={s}
                 type="button"
                 onClick={() => ask(s)}
-                className="group/chip inline-flex items-center gap-1.5 rounded-full border border-border/70 bg-background/60 px-3 py-1.5 text-xs text-muted-foreground backdrop-blur transition-all duration-200 hover:-translate-y-0.5 hover:border-[color-mix(in_oklch,var(--brand-1),transparent_40%)] hover:text-foreground hover:shadow-[0_6px_20px_-8px_var(--brand-1)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 active:translate-y-0 motion-reduce:transition-none motion-reduce:hover:translate-y-0"
+                className="group/chip relative inline-flex items-center gap-1.5 overflow-hidden rounded-full border border-border/70 bg-background/60 px-3 py-1.5 text-xs text-muted-foreground backdrop-blur transition-all duration-200 hover:-translate-y-0.5 hover:bg-[color-mix(in_oklch,var(--brand-1),transparent_90%)] hover:border-[color-mix(in_oklch,var(--brand-1),transparent_40%)] hover:text-foreground hover:shadow-[0_6px_20px_-8px_var(--brand-1)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 active:translate-y-0 motion-reduce:transition-none motion-reduce:hover:translate-y-0"
               >
-                <Sparkles className="size-3 text-[var(--brand-1)] transition-transform duration-300 group-hover/chip:rotate-12 group-hover/chip:scale-110" />
+                <Sheen className="group-hover/chip:translate-x-[400%]" />
+                <Sparkles className="size-3 text-[var(--brand-1)] transition-transform duration-500 group-hover/chip:rotate-[72deg] group-hover/chip:scale-125 motion-reduce:transition-none" />
                 {s}
+                <ArrowRight className="-ml-1 size-3 w-0 opacity-0 transition-all duration-200 group-hover/chip:ml-0 group-hover/chip:w-3 group-hover/chip:opacity-100" />
               </button>
             ))}
           </div>
@@ -175,6 +181,7 @@ export function HomePage() {
             title="Connect a source"
             description="Register a database, stream or bucket. Credentials stay as secret references."
             href="/connectors/create"
+            reduce={reduce}
             onAi={() => ask("Guide me through connecting a new data source.", "build")}
           />
           <StartCard
@@ -182,6 +189,7 @@ export function HomePage() {
             title="Create a pipeline"
             description="Choose a source and a target layer, then review before it runs."
             href="/pipelines/create"
+            reduce={reduce}
             onAi={() => ask("Help me create a new pipeline. Ask me what to ingest and where it should land.", "build")}
           />
           <StartCard
@@ -189,6 +197,7 @@ export function HomePage() {
             title="Build a dashboard"
             description="Pick a mart and chart it. Every chart is added only after you confirm."
             href="/dashboards"
+            reduce={reduce}
             onAi={() => ask("Suggest a dashboard for the data we have.", "build")}
           />
         </div>
@@ -209,6 +218,7 @@ export function HomePage() {
             ].filter((x): x is string => x !== null)}
             items={attention}
             onAsk={(prompt) => ask(prompt)}
+            reduce={reduce}
           />
         </Panel>
 
@@ -223,10 +233,11 @@ export function HomePage() {
                 <li key={s.id}>
                   <Link
                     href={`/copilot?id=${encodeURIComponent(s.id)}`}
-                    className="group/row flex items-center gap-3 rounded-lg px-2 py-2 text-sm transition-colors hover:bg-muted/60"
+                    className="group/row relative flex items-center gap-3 rounded-lg px-2 py-2 text-sm transition-colors hover:bg-muted/60"
                   >
-                    <MessageSquare className="size-4 shrink-0 text-muted-foreground transition-colors group-hover/row:text-[var(--brand-1)]" />
-                    <span className="min-w-0 flex-1 truncate">
+                    <span aria-hidden className="absolute top-1/2 left-0 h-0 w-0.5 -translate-y-1/2 rounded-full bg-[var(--brand-1)] transition-all duration-300 group-hover/row:h-5" />
+                    <MessageSquare className="size-4 shrink-0 text-muted-foreground transition-all duration-300 group-hover/row:translate-x-1 group-hover/row:text-[var(--brand-1)]" />
+                    <span className="min-w-0 flex-1 truncate transition-transform duration-300 group-hover/row:translate-x-1">
                       {s.title || "Untitled conversation"}
                     </span>
                     {s.updatedAt ? (
@@ -234,6 +245,7 @@ export function HomePage() {
                         {formatRelativeTime(s.updatedAt)}
                       </span>
                     ) : null}
+                    <ArrowRight className="size-3.5 shrink-0 -translate-x-1 text-[var(--brand-1)] opacity-0 transition-all duration-300 group-hover/row:translate-x-0 group-hover/row:opacity-100" />
                   </Link>
                 </li>
               ))}
@@ -397,9 +409,13 @@ function PromptBox({ onAsk, reduce }: { onAsk: (q: string) => void; reduce: bool
             disabled={!draft.trim()}
             whileHover={reduce || !draft.trim() ? undefined : { scale: 1.08 }}
             whileTap={reduce || !draft.trim() ? undefined : { scale: 0.94 }}
-            className="ml-auto inline-flex size-9 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-[0_8px_24px_-10px_var(--brand-1)] transition-[opacity,box-shadow] hover:shadow-[0_10px_30px_-8px_var(--brand-1)] disabled:opacity-35 disabled:shadow-none"
+            className="group/send relative ml-auto inline-flex size-9 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-[0_8px_24px_-10px_var(--brand-1)] transition-[opacity,box-shadow] hover:shadow-[0_10px_30px_-6px_var(--brand-1)] disabled:opacity-35 disabled:shadow-none"
           >
-            <ArrowUp className="size-4" />
+            {/* Halo pulses only once there is something to send. */}
+            {draft.trim() && !reduce ? (
+              <span aria-hidden className="absolute inset-0 animate-ping rounded-xl bg-[var(--brand-1)] opacity-20 [animation-duration:1.8s]" />
+            ) : null}
+            <ArrowUp className="relative size-4 transition-transform duration-200 group-hover/send:-translate-y-0.5" />
           </motion.button>
         </div>
       </div>
@@ -408,10 +424,32 @@ function PromptBox({ onAsk, reduce }: { onAsk: (q: string) => void; reduce: bool
 }
 
 /**
+ * A light band that sweeps across its parent once per hover. The parent
+ * must be `relative overflow-hidden` and name its group; the caller passes
+ * the matching `group-hover/<name>:translate-x-full` class, since Tailwind
+ * only sees literal class names.
+ */
+function Sheen({ className }: { className: string }) {
+  return (
+    <span
+      aria-hidden
+      className={cn(
+        "pointer-events-none absolute inset-y-0 -left-1/2 w-1/2 -translate-x-full skew-x-[-20deg] bg-gradient-to-r from-transparent via-white/25 to-transparent transition-transform duration-700 ease-out motion-reduce:hidden dark:via-white/10",
+        className
+      )}
+    />
+  )
+}
+
+/**
  * A start card: the card itself opens the manual flow; "Let AI do it" is
- * a separate button that hands the same task to Copilot in Build mode. A
- * spotlight follows the cursor, driven by CSS variables so hover costs no
- * React renders.
+ * a separate button that hands the same task to Copilot in Build mode.
+ *
+ * Hover: a slight 3D tilt toward the cursor (spring-smoothed), a spotlight
+ * and a glowing border that follow it, a sheen sweep, and the icon tile
+ * lifting. The spotlight position is set as CSS variables so pointer
+ * movement costs no React renders; the tilt runs on motion values for the
+ * same reason.
  */
 function StartCard({
   icon: Icon,
@@ -419,59 +457,125 @@ function StartCard({
   description,
   href,
   onAi,
+  reduce,
 }: {
   icon: React.ComponentType<{ className?: string }>
   title: string
   description: string
   href: string
   onAi: () => void
+  reduce: boolean
 }) {
   const ref = React.useRef<HTMLDivElement>(null)
+  const px = useMotionValue(0.5)
+  const py = useMotionValue(0.5)
+  const spring = { stiffness: 170, damping: 22, mass: 0.6 }
+  const rotateX = useSpring(useTransform(py, [0, 1], [5, -5]), spring)
+  const rotateY = useSpring(useTransform(px, [0, 1], [-6, 6]), spring)
+
   return (
-    <div
+    <motion.div
       ref={ref}
+      style={reduce ? undefined : { rotateX, rotateY, transformPerspective: 900 }}
+      whileHover={reduce ? undefined : { y: -4 }}
+      transition={{ type: "spring", stiffness: 260, damping: 22 }}
       onPointerMove={(e) => {
         const el = ref.current
         if (!el) return
         const r = el.getBoundingClientRect()
-        el.style.setProperty("--mx", `${e.clientX - r.left}px`)
-        el.style.setProperty("--my", `${e.clientY - r.top}px`)
+        const x = e.clientX - r.left
+        const y = e.clientY - r.top
+        el.style.setProperty("--mx", `${x}px`)
+        el.style.setProperty("--my", `${y}px`)
+        px.set(x / r.width)
+        py.set(y / r.height)
       }}
-      className="group/card relative flex flex-col overflow-hidden rounded-2xl border border-border bg-card transition-all duration-300 hover:-translate-y-1 hover:border-[color-mix(in_oklch,var(--brand-1),transparent_55%)] hover:shadow-[0_18px_40px_-24px_var(--brand-canvas-dark)] motion-reduce:transition-none motion-reduce:hover:translate-y-0"
+      onPointerLeave={() => {
+        px.set(0.5)
+        py.set(0.5)
+      }}
+      className="group/card relative flex flex-col rounded-2xl p-px will-change-transform"
     >
+      {/* Border glow: a cursor-following gradient under a 1px inset. */}
       <div
         aria-hidden
-        className="pointer-events-none absolute inset-0 opacity-0 transition-opacity duration-300 group-hover/card:opacity-100"
+        className="absolute inset-0 rounded-2xl bg-border transition-opacity duration-300"
+      />
+      <div
+        aria-hidden
+        className="absolute inset-0 rounded-2xl opacity-0 transition-opacity duration-300 group-hover/card:opacity-100"
         style={{
           background:
-            "radial-gradient(260px circle at var(--mx, 50%) var(--my, 0%), color-mix(in oklch, var(--brand-1), transparent 86%), transparent 70%)",
+            "radial-gradient(220px circle at var(--mx, 50%) var(--my, 0%), var(--brand-1), transparent 70%)",
         }}
       />
-      <Link
-        href={href}
-        className="relative flex flex-1 flex-col gap-3 p-5 outline-none after:absolute after:inset-0 after:rounded-2xl focus-visible:after:ring-2 focus-visible:after:ring-ring/50"
-      >
-        <span className="inline-flex size-10 items-center justify-center rounded-xl border border-border bg-muted/60 text-foreground transition-all duration-300 group-hover/card:scale-105 group-hover/card:border-[color-mix(in_oklch,var(--brand-1),transparent_50%)] group-hover/card:text-[var(--brand-1)]">
-          <Icon className="size-5" />
-        </span>
-        <span className="flex items-center gap-1 text-sm font-semibold">
-          {title}
-          <ArrowRight className="size-4 -translate-x-1 opacity-0 transition-all duration-300 group-hover/card:translate-x-0 group-hover/card:opacity-100" />
-        </span>
-        <span className="text-xs leading-relaxed text-muted-foreground">{description}</span>
-      </Link>
-      <div className="relative flex items-center justify-between border-t border-border/70 px-5 py-2.5">
-        <span className="text-[11px] text-muted-foreground">Or hand it to Copilot</span>
-        <button
-          type="button"
-          onClick={onAi}
-          className="group/ai inline-flex items-center gap-1 rounded-full px-2 py-1 text-xs font-medium text-[var(--brand-1)] transition-colors hover:bg-[color-mix(in_oklch,var(--brand-1),transparent_88%)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+      <div className="relative flex flex-1 flex-col overflow-hidden rounded-[15px] bg-card transition-shadow duration-300 group-hover/card:shadow-[0_22px_45px_-26px_var(--brand-canvas-dark)]">
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 opacity-0 transition-opacity duration-300 group-hover/card:opacity-100"
+          style={{
+            background:
+              "radial-gradient(280px circle at var(--mx, 50%) var(--my, 0%), color-mix(in oklch, var(--brand-1), transparent 86%), transparent 70%)",
+          }}
+        />
+        <Sheen className="group-hover/card:translate-x-[400%]" />
+        <Link
+          href={href}
+          className="relative flex flex-1 flex-col gap-3 p-5 outline-none after:absolute after:inset-0 after:rounded-[15px] focus-visible:after:ring-2 focus-visible:after:ring-ring/50"
         >
-          <Sparkles className="size-3 transition-transform duration-300 group-hover/ai:rotate-12" />
-          Let AI do it
-        </button>
+          <span className="relative inline-flex size-10 items-center justify-center rounded-xl border border-border bg-muted/60 text-foreground transition-all duration-300 group-hover/card:-translate-y-0.5 group-hover/card:-rotate-6 group-hover/card:border-[color-mix(in_oklch,var(--brand-1),transparent_50%)] group-hover/card:bg-[color-mix(in_oklch,var(--brand-1),transparent_88%)] group-hover/card:text-[var(--brand-1)] group-hover/card:shadow-[0_8px_20px_-8px_var(--brand-1)] motion-reduce:group-hover/card:rotate-0">
+            <Icon className="size-5 transition-transform duration-300 group-hover/card:scale-110" />
+          </span>
+          <span className="flex items-center gap-1 text-sm font-semibold">
+            {title}
+            <ArrowRight className="size-4 -translate-x-2 opacity-0 transition-all duration-300 group-hover/card:translate-x-0 group-hover/card:opacity-100" />
+          </span>
+          <span className="text-xs leading-relaxed text-muted-foreground transition-colors duration-300 group-hover/card:text-foreground/80">
+            {description}
+          </span>
+        </Link>
+        <div className="relative flex items-center justify-between border-t border-border/70 px-5 py-2.5">
+          <span className="text-[11px] text-muted-foreground">Or hand it to Copilot</span>
+          <AiButton onClick={onAi} reduce={reduce}>
+            Let AI do it
+          </AiButton>
+        </div>
       </div>
-    </div>
+    </motion.div>
+  )
+}
+
+/**
+ * The small "hand it to Copilot" pill used on cards and attention rows:
+ * springs up on hover, its sparkle spins, and a sheen crosses it.
+ */
+function AiButton({
+  onClick,
+  reduce,
+  children,
+  className,
+}: {
+  onClick: () => void
+  reduce: boolean
+  children: React.ReactNode
+  className?: string
+}) {
+  return (
+    <motion.button
+      type="button"
+      onClick={onClick}
+      whileHover={reduce ? undefined : { scale: 1.06 }}
+      whileTap={reduce ? undefined : { scale: 0.95 }}
+      transition={{ type: "spring", stiffness: 400, damping: 18 }}
+      className={cn(
+        "group/ai relative inline-flex shrink-0 items-center gap-1 overflow-hidden rounded-full border border-transparent px-2.5 py-1 text-xs font-medium text-[var(--brand-1)] transition-[background-color,border-color,box-shadow] duration-200 hover:border-[color-mix(in_oklch,var(--brand-1),transparent_55%)] hover:bg-[color-mix(in_oklch,var(--brand-1),transparent_86%)] hover:shadow-[0_6px_18px_-8px_var(--brand-1)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
+        className
+      )}
+    >
+      <Sheen className="group-hover/ai:translate-x-[400%]" />
+      <Sparkles className="size-3 transition-transform duration-500 group-hover/ai:rotate-[72deg] group-hover/ai:scale-125 motion-reduce:transition-none" />
+      {children}
+    </motion.button>
   )
 }
 
@@ -495,7 +599,12 @@ function Panel({
   children: React.ReactNode
 }) {
   return (
-    <section className={cn("flex min-w-0 flex-col gap-2 rounded-2xl border border-border bg-card p-3", className)}>
+    <section
+      className={cn(
+        "flex min-w-0 flex-col gap-2 rounded-2xl border border-border bg-card p-3 transition-[border-color,box-shadow] duration-300 hover:border-[color-mix(in_oklch,var(--brand-1),transparent_70%)] hover:shadow-[0_16px_40px_-28px_var(--brand-canvas-dark)]",
+        className
+      )}
+    >
       <div className="flex items-center justify-between px-2 pt-1">
         <h2 className="text-sm font-semibold">{title}</h2>
         {count ? (
@@ -523,11 +632,13 @@ function AttentionList({
   failedReads,
   items,
   onAsk,
+  reduce,
 }: {
   loading: boolean
   failedReads: string[]
   items: AttentionItem[]
   onAsk: (prompt: string) => void
+  reduce: boolean
 }) {
   if (loading) {
     return (
@@ -549,24 +660,25 @@ function AttentionList({
         {items.slice(0, 6).map((it) => (
           <li
             key={it.key}
-            className="group/row flex items-center gap-3 rounded-lg px-2 py-2 transition-colors hover:bg-muted/60"
+            className="group/row relative flex items-center gap-3 rounded-lg px-2 py-2 transition-colors hover:bg-destructive/5"
           >
+            <span aria-hidden className="absolute top-1/2 left-0 h-0 w-0.5 -translate-y-1/2 rounded-full bg-destructive transition-all duration-300 group-hover/row:h-5" />
             <span className="relative flex size-2.5 shrink-0">
               <span className="absolute inline-flex size-full animate-ping rounded-full bg-destructive/60 motion-reduce:animate-none" />
               <span className="relative inline-flex size-2.5 rounded-full bg-destructive" />
             </span>
-            <Link href={it.href} className="min-w-0 flex-1 text-sm hover:underline">
+            <Link href={it.href} className="min-w-0 flex-1 text-sm underline-offset-4 transition-transform duration-300 group-hover/row:translate-x-1 hover:underline">
               <span className="text-muted-foreground">{it.kind} · </span>
               <span className="font-medium">{it.label}</span>
               <span className="text-muted-foreground"> is {it.state}</span>
             </Link>
-            <button
-              type="button"
+            <AiButton
               onClick={() => onAsk(it.prompt)}
-              className="inline-flex shrink-0 items-center gap-1 rounded-full border border-transparent px-2 py-1 text-xs font-medium text-[var(--brand-1)] transition-all hover:border-[color-mix(in_oklch,var(--brand-1),transparent_60%)] hover:bg-[color-mix(in_oklch,var(--brand-1),transparent_88%)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 sm:opacity-60 sm:group-hover/row:opacity-100"
+              reduce={reduce}
+              className="sm:opacity-70 sm:group-hover/row:opacity-100"
             >
-              <Sparkles className="size-3" /> Ask AI
-            </button>
+              Ask AI
+            </AiButton>
           </li>
         ))}
       </ul>
