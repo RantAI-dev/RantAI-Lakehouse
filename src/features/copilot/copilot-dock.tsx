@@ -22,7 +22,9 @@ export function CopilotDock() {
   const pathname = usePathname();
   const c = useCopilot();
 
-  if (pathname?.startsWith("/copilot") || c.dockPosition === "right") {
+  // Home's own prompt is the entry point there; a second input under it
+  // would be two boxes doing the same thing.
+  if (pathname === "/" || pathname?.startsWith("/copilot") || c.dockPosition === "right") {
     return null;
   }
 

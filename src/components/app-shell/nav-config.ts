@@ -12,9 +12,10 @@ import {
   FileSearch,
   FileText,
   GitBranch,
+  HeartPulse,
   History,
+  Home,
   KeyRound,
-  LayoutDashboard,
   Layers,
   Library,
   ListChecks,
@@ -82,57 +83,42 @@ export type NavGroup = {
  * The sidebar and navbar page titles are both derived from this config.
  * To add a top-level page, add an entry to the appropriate group.
  *
- * Grouping rationale:
- * - Overview: monitor the whole platform (dashboard, feed, alerts).
- * - Data: where data lives (explore, catalog, ingress).
- * - Build: author and operate data movement and queries.
- * - Intelligence: digital employees, their runs and approvals.
- * - Governance: control and evidence.
- * - Operations: platform runtime health and spend.
+ * Grouping rationale (the console is agentic-first, so it opens on the
+ * AI-first Home and "Ask AI" sits right under it, not in a section):
+ * - Home / Ask AI: where work starts — ask or instruct, see what needs you.
+ * - Data: where data lives and how it is read (catalog, queries, boards).
+ * - Build: author and operate data movement and outbound exports.
+ * - Governance: the rules applied to the data (policies, quality, lineage).
+ * - Monitoring: whether the platform is healthy, and what happened — the
+ *   old "Overview" dashboard lives here as Health, next to alerts and the
+ *   audit trail, instead of being the landing page.
+ * - Intelligence: digital employees and their runs. Still `preview`: they
+ *   have not been proven end-to-end, so the group renders as "Soon" rather
+ *   than as working pages. Their approvals inbox is under Governance.
  * - Administration: identity and workspace configuration.
  */
 export const NAV_GROUPS: NavGroup[] = [
   {
-    label: "AI",
+    label: "Home",
+    icon: Home,
+    items: [{ title: "Home", href: "/", icon: Home }],
+  },
+  {
+    label: "Ask AI",
     icon: Sparkles,
-    items: [
-      { title: "AI Copilot", href: "/copilot", icon: Sparkles },
-    ],
-  },
-  {
-    label: "Dashboards",
-    icon: BarChart3,
-    items: [
-      { title: "Dashboards", href: "/dashboards", icon: BarChart3 },
-    ],
-  },
-  {
-    label: "Overview",
-    icon: LayoutDashboard,
-    defaultOpen: true,
-    items: [
-      { title: "Overview", href: "/", icon: LayoutDashboard },
-      { title: "Activity", href: "/activity", icon: Activity },
-      { title: "Alerts", href: "/alerts", icon: BellRing },
-    ],
+    items: [{ title: "Ask AI", href: "/copilot", icon: Sparkles }],
   },
   {
     label: "Data",
     icon: Database,
     defaultOpen: true,
     items: [
-      { title: "Data Explorer", href: "/data", icon: Database },
       { title: "Catalog", href: "/catalog", icon: Library },
-      { title: "Connectors", href: "/connectors", icon: Plug },
-      { title: "Gold Exports", href: "/gold-exports", icon: PackageCheck },
-    ],
-  },
-  {
-    label: "Lakehouse",
-    icon: Layers,
-    items: [
+      { title: "Data Explorer", href: "/data", icon: Database },
       { title: "Tables", href: "/lakehouse/tables", icon: Layers },
-      { title: "Capacity", href: "/lakehouse/capacity", icon: BarChart3 },
+      { title: "Query Studio", href: "/query-studio", icon: SearchCode },
+      { title: "Dashboards", href: "/dashboards", icon: BarChart3 },
+      { title: "Sources", href: "/connectors", icon: Plug },
     ],
   },
   {
@@ -140,16 +126,7 @@ export const NAV_GROUPS: NavGroup[] = [
     icon: GitBranch,
     items: [
       { title: "Pipelines", href: "/pipelines", icon: GitBranch },
-      { title: "Query Studio", href: "/query-studio", icon: SearchCode },
-    ],
-  },
-  {
-    label: "Intelligence",
-    icon: Bot,
-    items: [
-      { title: "Digital Employees", href: "/agents/employees", icon: Bot },
-      { title: "Agent Runs", href: "/agents/runs", icon: History },
-      { title: "Approvals", href: "/agents/approvals", icon: ClipboardCheck },
+      { title: "Exports", href: "/gold-exports", icon: PackageCheck },
     ],
   },
   {
@@ -168,7 +145,24 @@ export const NAV_GROUPS: NavGroup[] = [
         icon: ListChecks,
       },
       { title: "Lineage", href: "/lineage", icon: Waypoints },
-      { title: "Audit", href: "/audit", icon: FileText },
+      // Not under Intelligence: Copilot's destructive tools and data access
+      // requests queue here, so it must stay reachable while the digital
+      // employee pages are hidden.
+      { title: "Approvals", href: "/agents/approvals", icon: ClipboardCheck },
+    ],
+  },
+  {
+    label: "Monitoring",
+    icon: HeartPulse,
+    items: [
+      { title: "Health", href: "/health", icon: HeartPulse },
+      { title: "Alerts", href: "/alerts", icon: BellRing },
+      { title: "Audit Log", href: "/audit", icon: FileText },
+      { title: "Activity", href: "/activity", icon: Activity },
+      { title: "Workloads", href: "/workloads", icon: CircleGauge },
+      { title: "Observability", href: "/observability", icon: FileSearch },
+      { title: "Services", href: "/services", icon: Server },
+      { title: "Capacity", href: "/lakehouse/capacity", icon: BarChart3 },
       {
         title: "Bronze Maintenance",
         href: "/governance/maintenance",
@@ -182,12 +176,16 @@ export const NAV_GROUPS: NavGroup[] = [
     ],
   },
   {
-    label: "Operations",
-    icon: Server,
+    label: "Intelligence",
+    icon: Bot,
     items: [
-      { title: "Workloads", href: "/workloads", icon: CircleGauge },
-      { title: "Observability", href: "/observability", icon: FileSearch },
-      { title: "Services", href: "/services", icon: Server },
+      {
+        title: "Digital Employees",
+        href: "/agents/employees",
+        icon: Bot,
+        preview: true,
+      },
+      { title: "Agent Runs", href: "/agents/runs", icon: History, preview: true },
     ],
   },
   {
