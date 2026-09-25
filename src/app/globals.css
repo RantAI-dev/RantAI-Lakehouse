@@ -6,6 +6,16 @@
  */
 @import "../../design-system/globals.css";
 
+/*
+ * Tailwind v4 wraps every `hover:` (and so `group-hover:`) in
+ * `@media (hover: hover)`, so browsers that report no hover capability,
+ * such as touchscreen laptops and some Linux or remote-desktop setups, get
+ * no hover feedback anywhere even with a mouse. This console is used with a
+ * pointer, so hover applies whenever the element is actually hovered. On
+ * phones a tapped element may keep its hover style until the next tap.
+ */
+@custom-variant hover (&:hover);
+
 /* Legacy brand-font alias: pages using `var(--font-montserrat)` now render Geist. */
 :root {
   --font-montserrat: var(--font-sans);

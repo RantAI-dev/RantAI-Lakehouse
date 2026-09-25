@@ -204,7 +204,7 @@ export function HomePage() {
         </div>
       </motion.section>
 
-      <motion.div variants={item} className="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-5">
+      <motion.div variants={item} className="grid min-w-0 grid-cols-1 items-start gap-4 lg:grid-cols-5">
         <Panel className="lg:col-span-3" title="Needs attention" count={attention.length}>
           <AttentionList
             loading={
