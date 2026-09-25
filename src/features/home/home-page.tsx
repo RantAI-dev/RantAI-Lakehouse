@@ -26,6 +26,7 @@ import {
 import { Sheen } from "@/components/ui/sheen"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useAuth } from "@/features/auth/auth-provider"
+import { ModeToggle, ToolsMenu } from "@/features/copilot/chat-composer"
 import { useCopilot, type Mode } from "@/features/copilot/use-copilot"
 import { useService } from "@/hooks/use-service"
 import { formatRelativeTime } from "@/lib/format"
@@ -154,13 +155,21 @@ export function HomePage() {
         </div>
 
         <div className="mx-auto mt-7 max-w-2xl">
-          <PromptBox onAsk={(q) => ask(q)} reduce={reduce} />
+          <PromptBox
+            onAsk={(q) => ask(q, copilot.mode)}
+            reduce={reduce}
+            mode={copilot.mode}
+            setMode={copilot.setMode}
+            enabledCaps={copilot.enabledCaps}
+            toggleCap={copilot.toggleCap}
+          />
           <div className="mt-4 flex flex-wrap justify-center gap-2 lg:-mx-24">
             {suggestions(pipelines.data?.pipelines ?? []).map((s) => (
               <button
                 key={s}
                 type="button"
-                onClick={() => ask(s)}
+                // Chips follow the Ask/Build switch above them.
+                onClick={() => ask(s, copilot.mode)}
                 className="group/chip relative inline-flex items-center gap-1.5 overflow-hidden rounded-full border border-border/70 bg-background/60 px-3 py-1.5 text-xs text-muted-foreground backdrop-blur transition-all duration-200 ease-out hover:-translate-y-1 hover:scale-[1.04] hover:border-[var(--brand-1)] hover:bg-[color-mix(in_oklch,var(--brand-1),transparent_82%)] hover:text-foreground hover:shadow-[0_10px_28px_-8px_var(--brand-1)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 active:translate-y-0 active:scale-100 motion-reduce:transition-none motion-reduce:hover:translate-y-0 motion-reduce:hover:scale-100"
               >
                 <Sheen className="group-hover/chip:translate-x-[400%]" />
@@ -306,18 +315,44 @@ function HeroBackdrop({ reduce }: { reduce: boolean }) {
   )
 }
 
-const EXAMPLES = [
-  "Which tables changed in the last day?",
-  "Summarize yesterday's pipeline runs",
-  "Row counts for every gold mart",
-  "Is any source unhealthy right now?",
-]
+/** Placeholder examples per mode: Build ones are things Build mode can actually do. */
+const EXAMPLES: Record<Mode, string[]> = {
+  ask: [
+    "Which tables changed in the last day?",
+    "Summarize yesterday's pipeline runs",
+    "Row counts for every gold mart",
+    "Is any source unhealthy right now?",
+  ],
+  build: [
+    "Chart the busiest gold mart by month",
+    "Refresh the lakehouse from Bronze to Gold",
+    "Add an alert when a mart measure crosses a threshold",
+    "Export a gold mart to Iceberg",
+  ],
+}
 
 /**
  * The main input. A rotating conic ring lights up while it has focus, and
- * the placeholder cycles through example asks until the user types.
+ * the placeholder cycles through examples for the current mode until the
+ * user types. The Ask/Build switch and Tools menu are the Copilot
+ * composer's own, bound to the shared `useCopilot` state, so a mode or tool
+ * chosen here is the one the conversation opens with.
  */
-function PromptBox({ onAsk, reduce }: { onAsk: (q: string) => void; reduce: boolean }) {
+function PromptBox({
+  onAsk,
+  reduce,
+  mode,
+  setMode,
+  enabledCaps,
+  toggleCap,
+}: {
+  onAsk: (q: string) => void
+  reduce: boolean
+  mode: Mode
+  setMode: (m: Mode) => void
+  enabledCaps: Set<string>
+  toggleCap: (key: string) => void
+}) {
   const [draft, setDraft] = React.useState("")
   const [focused, setFocused] = React.useState(false)
   const [hint, setHint] = React.useState(0)
@@ -329,7 +364,7 @@ function PromptBox({ onAsk, reduce }: { onAsk: (q: string) => void; reduce: bool
 
   React.useEffect(() => {
     if (reduce || draft) return
-    const t = window.setInterval(() => setHint((h) => (h + 1) % EXAMPLES.length), 3500)
+    const t = window.setInterval(() => setHint((h) => h + 1), 3500)
     return () => window.clearInterval(t)
   }, [reduce, draft])
 
@@ -390,21 +425,26 @@ function PromptBox({ onAsk, reduce }: { onAsk: (q: string) => void; reduce: bool
           <div aria-hidden className="pointer-events-none absolute top-4 left-5 right-16 text-base text-muted-foreground">
             <AnimatePresence mode="wait" initial={false}>
               <motion.span
-                key={hint}
+                key={`${mode}-${hint}`}
                 initial={reduce ? false : { opacity: 0, y: 6 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={reduce ? undefined : { opacity: 0, y: -6 }}
                 transition={{ duration: 0.25 }}
                 className="block truncate"
               >
-                {EXAMPLES[hint]}
+                {EXAMPLES[mode][hint % EXAMPLES[mode].length]}
               </motion.span>
             </AnimatePresence>
           </div>
         ) : null}
         <div className="absolute inset-x-3 bottom-3 flex items-center justify-between">
-          <span className="hidden pl-2 text-xs text-muted-foreground sm:inline">
-            <kbd className="rounded border border-border bg-muted px-1 font-mono text-[10px]">Enter</kbd> to ask ·{" "}
+          <div className="flex items-center gap-1.5">
+            <ModeToggle mode={mode} setMode={setMode} />
+            <ToolsMenu mode={mode} enabledCaps={enabledCaps} toggleCap={toggleCap} />
+          </div>
+          <div className="ml-auto flex items-center gap-3">
+          <span className="hidden text-xs text-muted-foreground lg:inline">
+            <kbd className="rounded border border-border bg-muted px-1 font-mono text-[10px]">Enter</kbd> to send ·{" "}
             <kbd className="rounded border border-border bg-muted px-1 font-mono text-[10px]">Shift + Enter</kbd> new line
           </span>
           <motion.button
@@ -413,7 +453,7 @@ function PromptBox({ onAsk, reduce }: { onAsk: (q: string) => void; reduce: bool
             disabled={!draft.trim()}
             whileHover={reduce || !draft.trim() ? undefined : { scale: 1.08 }}
             whileTap={reduce || !draft.trim() ? undefined : { scale: 0.94 }}
-            className="group/send relative ml-auto inline-flex size-9 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-[0_8px_24px_-10px_var(--brand-1)] transition-[opacity,box-shadow] hover:shadow-[0_10px_30px_-6px_var(--brand-1)] disabled:opacity-35 disabled:shadow-none"
+            className="group/send relative inline-flex size-9 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-[0_8px_24px_-10px_var(--brand-1)] transition-[opacity,box-shadow] hover:shadow-[0_10px_30px_-6px_var(--brand-1)] disabled:opacity-35 disabled:shadow-none"
           >
             {/* Halo pulses only once there is something to send. */}
             {draft.trim() && !reduce ? (
@@ -421,6 +461,7 @@ function PromptBox({ onAsk, reduce }: { onAsk: (q: string) => void; reduce: bool
             ) : null}
             <ArrowUp className="relative size-4 transition-transform duration-200 group-hover/send:-translate-y-0.5" />
           </motion.button>
+          </div>
         </div>
       </div>
     </form>

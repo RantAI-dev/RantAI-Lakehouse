@@ -10,7 +10,7 @@ import type { Mode } from "./use-copilot";
 import { capsForMode } from "./capabilities";
 
 /** The "Tools" menu — pick the (menu-facing) CAPABILITIES the agent may use. */
-function ToolsMenu({
+export function ToolsMenu({
   mode, enabledCaps, toggleCap,
 }: {
   mode: Mode;
@@ -68,6 +68,32 @@ function ToolsMenu({
         </div>
       </PopoverContent>
     </Popover>
+  );
+}
+
+/**
+ * The Ask/Build switch. Shared by the composer and Home's prompt so both
+ * drive the same `useCopilot` mode.
+ */
+export function ModeToggle({ mode, setMode }: { mode: Mode; setMode: (m: Mode) => void }) {
+  return (
+    <div className="inline-flex rounded-lg bg-muted/60 p-0.5" role="group" aria-label="Copilot mode">
+      {(["ask", "build"] as Mode[]).map((m) => (
+        <button
+          key={m}
+          type="button"
+          aria-pressed={mode === m}
+          title={m === "ask" ? "Ask: answers questions, changes nothing" : "Build: can create and change things, asking you first"}
+          onClick={() => setMode(m)}
+          className={cn(
+            "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
+            mode === m ? "bg-primary/10 text-primary" : "text-muted-foreground hover:text-foreground",
+          )}
+        >
+          {m === "ask" ? "Ask" : "Build"}
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -161,24 +187,7 @@ export function ChatComposer({
         className="resize-none border-0 bg-transparent px-2 py-1.5 shadow-none focus-visible:ring-0 dark:bg-transparent"
       />
       <div className="flex items-center gap-1.5 px-1 pb-0.5">
-        {/* Ask/Build toggle */}
-        <div className="inline-flex rounded-lg bg-muted/60 p-0.5" role="group" aria-label="Copilot mode">
-          {(["ask", "build"] as Mode[]).map((m) => (
-            <button
-              key={m}
-              type="button"
-              aria-pressed={mode === m}
-              title={m === "ask" ? "Ask: answers questions, changes nothing" : "Build: can create and change things, asking you first"}
-              onClick={() => setMode(m)}
-              className={cn(
-                "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
-                mode === m ? "bg-primary/10 text-primary" : "text-muted-foreground hover:text-foreground",
-              )}
-            >
-              {m === "ask" ? "Ask" : "Build"}
-            </button>
-          ))}
-        </div>
+        <ModeToggle mode={mode} setMode={setMode} />
 
         {enabledCaps && toggleCap ? (
           <ToolsMenu mode={mode} enabledCaps={enabledCaps} toggleCap={toggleCap} />
