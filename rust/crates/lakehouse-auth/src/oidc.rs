@@ -309,6 +309,12 @@ fn decoding_key_from_jwk(jwk: &Jwk) -> Result<DecodingKey, AuthError> {
         AlgorithmParameters::OctetKey(_) | AlgorithmParameters::OctetKeyPair(_) => {
             Err(AuthError::InvalidCredentials)
         }
+        // `jsonwebtoken` 11 marked `AlgorithmParameters` `#[non_exhaustive]`
+        // (PR #15 dep bump) so any JWK key family this crate doesn't
+        // already know about compiles instead of erroring — fail closed
+        // the same way OctetKey/OctetKeyPair already do, rather than
+        // silently accepting an unrecognized key type.
+        _ => Err(AuthError::InvalidCredentials),
     }
 }
 

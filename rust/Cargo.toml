@@ -45,7 +45,14 @@ uuid = { version = "1", features = ["v4", "serde"] }
 async-trait = "0.1"
 argon2 = "0.6"
 subtle = "2"
-jsonwebtoken = "9"
+# `jsonwebtoken` 11 (PR #15) made its crypto backend pluggable and ships
+# with NEITHER backend enabled by default; `CryptoProvider::get_default()`
+# panics at runtime ("Could not automatically determine the process-level
+# CryptoProvider...") unless exactly one of `rust_crypto`/`aws_lc_rs` is
+# selected. Chose `rust_crypto` (pure-Rust, no new C dependency) to match
+# every other crypto crate already in this workspace (sha2, hmac, argon2,
+# rand are all RustCrypto-ecosystem).
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
 # `lakehouse-api::next_run` (WS4 item G2) is the first workstream to land
 # this dependency -- WS5 also needs cron-next-occurrence computation and
 # reuses this same entry rather than adding a second one (programme rule:
