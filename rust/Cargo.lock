@@ -1563,7 +1563,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee93edf3c501f0035bbeffeccfed0b79e14c311f12195ec0e661e114a0f60da4"
 dependencies = [
  "portable-atomic",
- "rand 0.10.2",
+ "rand 0.10.3",
  "web-time",
 ]
 
@@ -2562,7 +2562,7 @@ dependencies = [
  "lakehouse-clickhouse",
  "lakehouse-core",
  "lakehouse-notify",
- "rand 0.10.2",
+ "rand 0.10.3",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -2599,7 +2599,7 @@ dependencies = [
  "lakehouse-test-support",
  "lakehouse-trino",
  "object_store",
- "rand 0.10.2",
+ "rand 0.10.3",
  "reqwest 0.12.28",
  "rsa",
  "serde",
@@ -2633,7 +2633,7 @@ dependencies = [
  "lakehouse-core",
  "lakehouse-store",
  "lakehouse-test-support",
- "rand 0.10.2",
+ "rand 0.10.3",
  "reqwest 0.12.28",
  "rsa",
  "serde",
@@ -2656,7 +2656,7 @@ dependencies = [
  "indexmap 2.14.2",
  "lakehouse-clickhouse",
  "lakehouse-core",
- "rand 0.10.2",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -2711,7 +2711,7 @@ dependencies = [
  "base64 0.23.1",
  "hmac 0.13.0",
  "lakehouse-clickhouse",
- "rand 0.10.2",
+ "rand 0.10.3",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -3291,7 +3291,7 @@ dependencies = [
  "parking_lot",
  "percent-encoding",
  "quick-xml",
- "rand 0.10.2",
+ "rand 0.10.3",
  "reqwest 0.13.4",
  "rustls-pki-types",
  "serde",
@@ -3747,7 +3747,7 @@ dependencies = [
  "bytes",
  "getrandom 0.4.3",
  "lru-slab",
- "rand 0.10.2",
+ "rand 0.10.3",
  "rand_pcg",
  "ring",
  "rustc-hash",
@@ -3824,9 +3824,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.2"
+version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
+checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
 dependencies = [
  "chacha20",
  "getrandom 0.4.3",
@@ -5039,7 +5039,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
