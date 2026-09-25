@@ -15,7 +15,7 @@ publish = false
 [dependencies]
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres"] }
-ctor = "0.2"
+ctor = "1.0"
 tokio = { workspace = true }
 tracing = { workspace = true }
 
