@@ -75,6 +75,6 @@
     "eslint-config-next": "16.1.6",
     "react-grab": "^0.2.0",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^7"
   }
 }
