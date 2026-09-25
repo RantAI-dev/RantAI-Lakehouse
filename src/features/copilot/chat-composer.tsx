@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { ArrowUp, SlidersHorizontal, Square } from "lucide-react";
+import { GlowFrame } from "@/components/ui/brand-glow";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Popover, PopoverContent, PopoverDescription, PopoverHeader, PopoverTitle, PopoverTrigger } from "@/components/ui/popover";
 import { Textarea } from "@/components/ui/textarea";
@@ -104,7 +105,7 @@ export function ModeToggle({ mode, setMode }: { mode: Mode; setMode: (m: Mode) =
  */
 export function ChatComposer({
   mode, setMode, onSend, onStop, busy, placeholder, autoFocus, rows = 2,
-  enabledCaps, toggleCap, onFocus, glass, compact,
+  enabledCaps, toggleCap, onFocus, glass, compact, glow,
 }: {
   mode: Mode;
   setMode: (m: Mode) => void;
@@ -122,6 +123,8 @@ export function ChatComposer({
   glass?: boolean;
   /** Compact single-line pill (collapsed dock, Google-style). */
   compact?: boolean;
+  /** Brand focus ring (`GlowFrame`) — the full /copilot page. */
+  glow?: boolean;
 }) {
   const [input, setInput] = React.useState("");
   const submit = () => {
@@ -168,11 +171,8 @@ export function ChatComposer({
     );
   }
 
-  return (
-    <div className={cn(
-      "rounded-2xl border p-1.5 transition-all",
-      glass ? `${glassCls} focus-within:bg-background/60` : `${glassCls} focus-within:border-foreground/20 focus-within:bg-muted/40 focus-within:shadow-md`,
-    )}>
+  const body = (
+    <>
       <Textarea
         value={input}
         onChange={(e) => setInput(e.target.value)}
@@ -222,6 +222,18 @@ export function ChatComposer({
           </button>
         )}
       </div>
+    </>
+  );
+
+  // The /copilot page's composer: Home's spinning brand ring on focus.
+  if (glow) return <GlowFrame innerClassName="p-1.5">{body}</GlowFrame>;
+
+  return (
+    <div className={cn(
+      "rounded-2xl border p-1.5 transition-all",
+      glass ? `${glassCls} focus-within:bg-background/60` : `${glassCls} focus-within:border-foreground/20 focus-within:bg-muted/40 focus-within:shadow-md`,
+    )}>
+      {body}
     </div>
   );
 }

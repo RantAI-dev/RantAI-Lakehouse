@@ -1,8 +1,8 @@
-"use client"
+"use client";
 
-import * as React from "react"
-import Link from "next/link"
-import { useRouter } from "next/navigation"
+import * as React from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   AnimatePresence,
   motion,
@@ -11,7 +11,7 @@ import {
   useSpring,
   useTransform,
   type Variants,
-} from "motion/react"
+} from "motion/react";
 import {
   ArrowRight,
   ArrowUp,
@@ -21,17 +21,18 @@ import {
   MessageSquare,
   Plug,
   Sparkles,
-} from "lucide-react"
+} from "lucide-react";
 
-import { Sheen } from "@/components/ui/sheen"
-import { Skeleton } from "@/components/ui/skeleton"
-import { useAuth } from "@/features/auth/auth-provider"
-import { ModeToggle, ToolsMenu } from "@/features/copilot/chat-composer"
-import { useCopilot, type Mode } from "@/features/copilot/use-copilot"
-import { useService } from "@/hooks/use-service"
-import { formatRelativeTime } from "@/lib/format"
-import { cn } from "@/lib/utils"
-import { connectorService, overviewService, pipelineService } from "@/services"
+import { BrandBackdrop, GlowFrame } from "@/components/ui/brand-glow";
+import { Sheen } from "@/components/ui/sheen";
+import { Skeleton } from "@/components/ui/skeleton";
+import { useAuth } from "@/features/auth/auth-provider";
+import { ModeToggle, ToolsMenu } from "@/features/copilot/chat-composer";
+import { useCopilot, type Mode } from "@/features/copilot/use-copilot";
+import { useService } from "@/hooks/use-service";
+import { formatRelativeTime } from "@/lib/format";
+import { cn } from "@/lib/utils";
+import { connectorService, overviewService, pipelineService } from "@/services";
 
 /**
  * AI-first landing page. The console is agentic-first, so the first thing
@@ -59,40 +60,49 @@ import { connectorService, overviewService, pipelineService } from "@/services"
  * under `prefers-reduced-motion`.
  */
 export function HomePage() {
-  const router = useRouter()
-  const { user } = useAuth()
-  const copilot = useCopilot()
-  const reduce = useReducedMotion() ?? false
-  const [pending, setPending] = React.useState<{ text: string; mode: Mode } | null>(null)
+  const router = useRouter();
+  const { user } = useAuth();
+  const copilot = useCopilot();
+  const reduce = useReducedMotion() ?? false;
+  const [pending, setPending] = React.useState<{
+    text: string;
+    mode: Mode;
+  } | null>(null);
 
   // `send` closes over the current mode, so a prompt that needs Build mode
   // waits one render for `setMode` to land before it is sent.
-  const { mode, send } = copilot
+  const { mode, send } = copilot;
   React.useEffect(() => {
-    if (!pending || mode !== pending.mode) return
-    setPending(null)
-    void send(pending.text, [])
-  }, [pending, mode, send])
+    if (!pending || mode !== pending.mode) return;
+    setPending(null);
+    void send(pending.text, []);
+  }, [pending, mode, send]);
 
   const ask = React.useCallback(
     (text: string, wanted: Mode = "ask") => {
-      const q = text.trim()
-      if (!q) return
-      copilot.newChat()
-      copilot.setMode(wanted)
-      setPending({ text: q, mode: wanted })
-      router.push("/copilot")
+      const q = text.trim();
+      if (!q) return;
+      copilot.newChat();
+      copilot.setMode(wanted);
+      setPending({ text: q, mode: wanted });
+      router.push("/copilot");
     },
-    [copilot, router]
-  )
+    [copilot, router],
+  );
 
-  const pipelines = useService((signal) => pipelineService.listPipelines(signal), [])
-  const alerts = useService((signal) => overviewService.listAlerts(signal), [])
-  const connectors = useService((signal) => connectorService.listConnectors(signal), [])
+  const pipelines = useService(
+    (signal) => pipelineService.listPipelines(signal),
+    [],
+  );
+  const alerts = useService((signal) => overviewService.listAlerts(signal), []);
+  const connectors = useService(
+    (signal) => connectorService.listConnectors(signal),
+    [],
+  );
 
-  const firstName = user?.name?.split(" ")[0]
-  const list = reduce ? undefined : STAGGER
-  const item = reduce ? undefined : RISE
+  const firstName = user?.name?.split(" ")[0];
+  const list = reduce ? undefined : STAGGER;
+  const item = reduce ? undefined : RISE;
 
   const attention: AttentionItem[] = [
     ...(pipelines.data?.pipelines ?? [])
@@ -125,7 +135,7 @@ export function HomePage() {
         href: "/connectors",
         prompt: `Source "${c.name}" is ${c.health}. Test it and tell me what is wrong.`,
       })),
-  ]
+  ];
 
   return (
     <motion.div
@@ -139,11 +149,12 @@ export function HomePage() {
         variants={item}
         className="relative isolate overflow-hidden rounded-3xl border border-border/60 bg-card/40 px-5 pt-10 pb-6 sm:px-10 sm:pt-14 sm:pb-8"
       >
-        <HeroBackdrop reduce={reduce} />
+        <BrandBackdrop />
         <div className="mx-auto flex max-w-2xl flex-col items-center gap-2 text-center">
           <span className="group/badge relative inline-flex cursor-default items-center gap-1.5 overflow-hidden rounded-full border border-[color-mix(in_oklch,var(--brand-1),transparent_60%)] bg-[color-mix(in_oklch,var(--brand-1),transparent_88%)] px-3 py-1 text-xs font-medium text-[var(--brand-1)] transition-shadow duration-300 hover:shadow-[0_0_24px_-6px_var(--brand-1)]">
             <Sheen className="group-hover/badge:translate-x-[400%]" />
-            <Sparkles className="size-3 transition-transform duration-700 group-hover/badge:rotate-180 motion-reduce:transition-none" /> Copilot
+            <Sparkles className="size-3 transition-transform duration-700 group-hover/badge:rotate-180 motion-reduce:transition-none" />{" "}
+            Copilot
           </span>
           <h1 className="text-3xl font-semibold tracking-[-0.03em] text-balance text-foreground sm:text-4xl">
             {greeting()}
@@ -193,7 +204,9 @@ export function HomePage() {
             description="Register a database, stream or bucket. Credentials stay as secret references."
             href="/connectors/create"
             reduce={reduce}
-            onAi={() => ask("Guide me through connecting a new data source.", "build")}
+            onAi={() =>
+              ask("Guide me through connecting a new data source.", "build")
+            }
           />
           <StartCard
             icon={GitBranch}
@@ -201,7 +214,12 @@ export function HomePage() {
             description="Choose a source and a target layer, then review before it runs."
             href="/pipelines/create"
             reduce={reduce}
-            onAi={() => ask("Help me create a new pipeline. Ask me what to ingest and where it should land.", "build")}
+            onAi={() =>
+              ask(
+                "Help me create a new pipeline. Ask me what to ingest and where it should land.",
+                "build",
+              )
+            }
           />
           <StartCard
             icon={BarChart3}
@@ -209,13 +227,22 @@ export function HomePage() {
             description="Pick a mart and chart it. Every chart is added only after you confirm."
             href="/dashboards"
             reduce={reduce}
-            onAi={() => ask("Suggest a dashboard for the data we have.", "build")}
+            onAi={() =>
+              ask("Suggest a dashboard for the data we have.", "build")
+            }
           />
         </div>
       </motion.section>
 
-      <motion.div variants={item} className="grid min-w-0 grid-cols-1 items-start gap-4 lg:grid-cols-5">
-        <Panel className="lg:col-span-3" title="Needs attention" count={attention.length}>
+      <motion.div
+        variants={item}
+        className="grid min-w-0 grid-cols-1 items-start gap-4 lg:grid-cols-5"
+      >
+        <Panel
+          className="lg:col-span-3"
+          title="Needs attention"
+          count={attention.length}
+        >
           <AttentionList
             loading={
               pipelines.status === "loading" ||
@@ -246,7 +273,10 @@ export function HomePage() {
                     href={`/copilot?id=${encodeURIComponent(s.id)}`}
                     className="group/row relative flex items-center gap-3 rounded-xl px-2 py-2 text-sm ring-1 ring-transparent transition-all duration-200 hover:bg-[color-mix(in_oklch,var(--brand-1),transparent_88%)] hover:ring-[color-mix(in_oklch,var(--brand-1),transparent_55%)] hover:shadow-[0_8px_22px_-14px_var(--brand-1)]"
                   >
-                    <span aria-hidden className="absolute top-1/2 left-0 h-0 w-0.5 -translate-y-1/2 rounded-full bg-[var(--brand-1)] transition-all duration-300 group-hover/row:h-5" />
+                    <span
+                      aria-hidden
+                      className="absolute top-1/2 left-0 h-0 w-0.5 -translate-y-1/2 rounded-full bg-[var(--brand-1)] transition-all duration-300 group-hover/row:h-5"
+                    />
                     <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-muted/60 text-muted-foreground transition-all duration-300 group-hover/row:translate-x-1 group-hover/row:-rotate-6 group-hover/row:bg-[var(--brand-1)] group-hover/row:text-[var(--brand-2)] group-hover/row:shadow-[0_6px_16px_-6px_var(--brand-1)] motion-reduce:group-hover/row:rotate-0">
                       <MessageSquare className="size-3.5" />
                     </span>
@@ -267,13 +297,13 @@ export function HomePage() {
         </Panel>
       </motion.div>
     </motion.div>
-  )
+  );
 }
 
 const STAGGER: Variants = {
   hidden: {},
   show: { transition: { staggerChildren: 0.08, delayChildren: 0.05 } },
-}
+};
 
 const RISE: Variants = {
   hidden: { opacity: 0, y: 14 },
@@ -282,38 +312,7 @@ const RISE: Variants = {
     y: 0,
     transition: { type: "spring", stiffness: 170, damping: 26 },
   },
-}
-
-/** Two slow-drifting brand glows and a faint grid — the `/login` water, calmed down. */
-function HeroBackdrop({ reduce }: { reduce: boolean }) {
-  const drift = (x: number[], y: number[], duration: number) =>
-    reduce
-      ? {}
-      : {
-          animate: { x, y },
-          transition: { duration, repeat: Infinity, repeatType: "mirror" as const, ease: "easeInOut" as const },
-        }
-  return (
-    <div aria-hidden className="pointer-events-none absolute inset-0 -z-10">
-      <motion.div
-        {...drift([0, 60, -20], [0, 20, -10], 18)}
-        className="absolute -top-24 left-[8%] size-72 rounded-full bg-[var(--brand-canvas-light)] opacity-25 blur-[90px] dark:opacity-20"
-      />
-      <motion.div
-        {...drift([0, -50, 30], [0, -15, 25], 22)}
-        className="absolute -right-10 top-10 size-80 rounded-full bg-[var(--brand-canvas-dark)] opacity-30 blur-[100px] dark:opacity-40"
-      />
-      <div
-        className="absolute inset-0 opacity-[0.35] [mask-image:radial-gradient(ellipse_at_center,black_20%,transparent_70%)] dark:opacity-[0.18]"
-        style={{
-          backgroundImage:
-            "linear-gradient(to right, var(--border) 1px, transparent 1px), linear-gradient(to bottom, var(--border) 1px, transparent 1px)",
-          backgroundSize: "32px 32px",
-        }}
-      />
-    </div>
-  )
-}
+};
 
 /** Placeholder examples per mode: Build ones are things Build mode can actually do. */
 const EXAMPLES: Record<Mode, string[]> = {
@@ -329,7 +328,7 @@ const EXAMPLES: Record<Mode, string[]> = {
     "Add an alert when a mart measure crosses a threshold",
     "Export a gold mart to Iceberg",
   ],
-}
+};
 
 /**
  * The main input. A rotating conic ring lights up while it has focus, and
@@ -346,74 +345,52 @@ function PromptBox({
   enabledCaps,
   toggleCap,
 }: {
-  onAsk: (q: string) => void
-  reduce: boolean
-  mode: Mode
-  setMode: (m: Mode) => void
-  enabledCaps: Set<string>
-  toggleCap: (key: string) => void
+  onAsk: (q: string) => void;
+  reduce: boolean;
+  mode: Mode;
+  setMode: (m: Mode) => void;
+  enabledCaps: Set<string>;
+  toggleCap: (key: string) => void;
 }) {
-  const [draft, setDraft] = React.useState("")
-  const [focused, setFocused] = React.useState(false)
-  const [hint, setHint] = React.useState(0)
-  const ref = React.useRef<HTMLTextAreaElement>(null)
+  const [draft, setDraft] = React.useState("");
+  const [hint, setHint] = React.useState(0);
+  const ref = React.useRef<HTMLTextAreaElement>(null);
 
   React.useEffect(() => {
-    ref.current?.focus()
-  }, [])
+    ref.current?.focus();
+  }, []);
 
   React.useEffect(() => {
-    if (reduce || draft) return
-    const t = window.setInterval(() => setHint((h) => h + 1), 3500)
-    return () => window.clearInterval(t)
-  }, [reduce, draft])
+    if (reduce || draft) return;
+    const t = window.setInterval(() => setHint((h) => h + 1), 3500);
+    return () => window.clearInterval(t);
+  }, [reduce, draft]);
 
   const submit = () => {
-    if (!draft.trim()) return
-    onAsk(draft)
-  }
+    if (!draft.trim()) return;
+    onAsk(draft);
+  };
 
   return (
     <form
       onSubmit={(e) => {
-        e.preventDefault()
-        submit()
+        e.preventDefault();
+        submit();
       }}
-      className="relative rounded-2xl p-px"
     >
-      {/* Focus ring: a conic gradient spun behind a 1px gap. */}
-      <div
-        aria-hidden
-        className={cn(
-          "absolute inset-0 overflow-hidden rounded-2xl bg-border transition-opacity duration-300",
-          focused ? "opacity-100" : "opacity-60"
-        )}
-      >
-        <motion.div
-          className={cn(
-            "absolute top-1/2 left-1/2 aspect-square w-[200%] -translate-x-1/2 -translate-y-1/2 transition-opacity duration-500",
-            focused ? "opacity-100" : "opacity-0"
-          )}
-          style={{
-            background:
-              "conic-gradient(from 0deg, transparent 0deg, var(--brand-1) 60deg, var(--brand-canvas-dark) 120deg, transparent 180deg, transparent 360deg)",
-          }}
-          animate={reduce ? undefined : { rotate: 360 }}
-          transition={{ duration: 6, repeat: Infinity, ease: "linear" }}
-        />
-      </div>
-
-      <div className="relative rounded-[15px] bg-background/90 shadow-[0_20px_60px_-30px_var(--brand-canvas-dark)] backdrop-blur-xl">
+      <GlowFrame>
         <textarea
           ref={ref}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          onFocus={() => setFocused(true)}
-          onBlur={() => setFocused(false)}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-              e.preventDefault()
-              submit()
+            if (
+              e.key === "Enter" &&
+              !e.shiftKey &&
+              !e.nativeEvent.isComposing
+            ) {
+              e.preventDefault();
+              submit();
             }
           }}
           aria-label="Ask AI"
@@ -422,7 +399,10 @@ function PromptBox({
         />
         {/* Animated placeholder: a native one can't cross-fade. */}
         {!draft ? (
-          <div aria-hidden className="pointer-events-none absolute top-4 left-5 right-16 text-base text-muted-foreground">
+          <div
+            aria-hidden
+            className="pointer-events-none absolute top-4 left-5 right-16 text-base text-muted-foreground"
+          >
             <AnimatePresence mode="wait" initial={false}>
               <motion.span
                 key={`${mode}-${hint}`}
@@ -440,32 +420,45 @@ function PromptBox({
         <div className="absolute inset-x-3 bottom-3 flex items-center justify-between">
           <div className="flex items-center gap-1.5">
             <ModeToggle mode={mode} setMode={setMode} />
-            <ToolsMenu mode={mode} enabledCaps={enabledCaps} toggleCap={toggleCap} />
+            <ToolsMenu
+              mode={mode}
+              enabledCaps={enabledCaps}
+              toggleCap={toggleCap}
+            />
           </div>
           <div className="ml-auto flex items-center gap-3">
-          <span className="hidden text-xs text-muted-foreground lg:inline">
-            <kbd className="rounded border border-border bg-muted px-1 font-mono text-[10px]">Enter</kbd> to send ·{" "}
-            <kbd className="rounded border border-border bg-muted px-1 font-mono text-[10px]">Shift + Enter</kbd> new line
-          </span>
-          <motion.button
-            type="submit"
-            aria-label="Send to AI"
-            disabled={!draft.trim()}
-            whileHover={reduce || !draft.trim() ? undefined : { scale: 1.08 }}
-            whileTap={reduce || !draft.trim() ? undefined : { scale: 0.94 }}
-            className="group/send relative inline-flex size-9 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-[0_8px_24px_-10px_var(--brand-1)] transition-[opacity,box-shadow] hover:shadow-[0_10px_30px_-6px_var(--brand-1)] disabled:opacity-35 disabled:shadow-none"
-          >
-            {/* Halo pulses only once there is something to send. */}
-            {draft.trim() && !reduce ? (
-              <span aria-hidden className="absolute inset-0 animate-ping rounded-xl bg-[var(--brand-1)] opacity-20 [animation-duration:1.8s]" />
-            ) : null}
-            <ArrowUp className="relative size-4 transition-transform duration-200 group-hover/send:-translate-y-0.5" />
-          </motion.button>
+            <span className="hidden text-xs text-muted-foreground lg:inline">
+              <kbd className="rounded border border-border bg-muted px-1 font-mono text-[10px]">
+                Enter
+              </kbd>{" "}
+              to send ·{" "}
+              <kbd className="rounded border border-border bg-muted px-1 font-mono text-[10px]">
+                Shift + Enter
+              </kbd>{" "}
+              new line
+            </span>
+            <motion.button
+              type="submit"
+              aria-label="Send to AI"
+              disabled={!draft.trim()}
+              whileHover={reduce || !draft.trim() ? undefined : { scale: 1.08 }}
+              whileTap={reduce || !draft.trim() ? undefined : { scale: 0.94 }}
+              className="group/send relative inline-flex size-9 items-center justify-center rounded-xl bg-primary text-primary-foreground shadow-[0_8px_24px_-10px_var(--brand-1)] transition-[opacity,box-shadow] hover:shadow-[0_10px_30px_-6px_var(--brand-1)] disabled:opacity-35 disabled:shadow-none"
+            >
+              {/* Halo pulses only once there is something to send. */}
+              {draft.trim() && !reduce ? (
+                <span
+                  aria-hidden
+                  className="absolute inset-0 animate-ping rounded-xl bg-[var(--brand-1)] opacity-20 [animation-duration:1.8s]"
+                />
+              ) : null}
+              <ArrowUp className="relative size-4 transition-transform duration-200 group-hover/send:-translate-y-0.5" />
+            </motion.button>
           </div>
         </div>
-      </div>
+      </GlowFrame>
     </form>
-  )
+  );
 }
 
 /**
@@ -486,40 +479,42 @@ function StartCard({
   onAi,
   reduce,
 }: {
-  icon: React.ComponentType<{ className?: string }>
-  title: string
-  description: string
-  href: string
-  onAi: () => void
-  reduce: boolean
+  icon: React.ComponentType<{ className?: string }>;
+  title: string;
+  description: string;
+  href: string;
+  onAi: () => void;
+  reduce: boolean;
 }) {
-  const ref = React.useRef<HTMLDivElement>(null)
-  const px = useMotionValue(0.5)
-  const py = useMotionValue(0.5)
-  const spring = { stiffness: 170, damping: 22, mass: 0.6 }
-  const rotateX = useSpring(useTransform(py, [0, 1], [5, -5]), spring)
-  const rotateY = useSpring(useTransform(px, [0, 1], [-6, 6]), spring)
+  const ref = React.useRef<HTMLDivElement>(null);
+  const px = useMotionValue(0.5);
+  const py = useMotionValue(0.5);
+  const spring = { stiffness: 170, damping: 22, mass: 0.6 };
+  const rotateX = useSpring(useTransform(py, [0, 1], [5, -5]), spring);
+  const rotateY = useSpring(useTransform(px, [0, 1], [-6, 6]), spring);
 
   return (
     <motion.div
       ref={ref}
-      style={reduce ? undefined : { rotateX, rotateY, transformPerspective: 900 }}
+      style={
+        reduce ? undefined : { rotateX, rotateY, transformPerspective: 900 }
+      }
       whileHover={reduce ? undefined : { y: -4 }}
       transition={{ type: "spring", stiffness: 260, damping: 22 }}
       onPointerMove={(e) => {
-        const el = ref.current
-        if (!el) return
-        const r = el.getBoundingClientRect()
-        const x = e.clientX - r.left
-        const y = e.clientY - r.top
-        el.style.setProperty("--mx", `${x}px`)
-        el.style.setProperty("--my", `${y}px`)
-        px.set(x / r.width)
-        py.set(y / r.height)
+        const el = ref.current;
+        if (!el) return;
+        const r = el.getBoundingClientRect();
+        const x = e.clientX - r.left;
+        const y = e.clientY - r.top;
+        el.style.setProperty("--mx", `${x}px`);
+        el.style.setProperty("--my", `${y}px`);
+        px.set(x / r.width);
+        py.set(y / r.height);
       }}
       onPointerLeave={() => {
-        px.set(0.5)
-        py.set(0.5)
+        px.set(0.5);
+        py.set(0.5);
       }}
       className="group/card relative flex flex-col rounded-2xl p-px will-change-transform"
     >
@@ -562,14 +557,16 @@ function StartCard({
           </span>
         </Link>
         <div className="relative flex items-center justify-between border-t border-border/70 px-5 py-2.5">
-          <span className="text-[11px] text-muted-foreground">Or hand it to Copilot</span>
+          <span className="text-[11px] text-muted-foreground">
+            Or hand it to Copilot
+          </span>
           <AiButton onClick={onAi} reduce={reduce}>
             Let AI do it
           </AiButton>
         </div>
       </div>
     </motion.div>
-  )
+  );
 }
 
 /**
@@ -582,10 +579,10 @@ function AiButton({
   children,
   className,
 }: {
-  onClick: () => void
-  reduce: boolean
-  children: React.ReactNode
-  className?: string
+  onClick: () => void;
+  reduce: boolean;
+  children: React.ReactNode;
+  className?: string;
 }) {
   return (
     <motion.button
@@ -596,14 +593,14 @@ function AiButton({
       transition={{ type: "spring", stiffness: 400, damping: 18 }}
       className={cn(
         "group/ai relative inline-flex shrink-0 items-center gap-1 overflow-hidden rounded-full border border-transparent px-2.5 py-1 text-xs font-medium text-[var(--brand-1)] transition-[background-color,border-color,box-shadow] duration-200 hover:border-[color-mix(in_oklch,var(--brand-1),transparent_55%)] hover:bg-[color-mix(in_oklch,var(--brand-1),transparent_86%)] hover:shadow-[0_6px_18px_-8px_var(--brand-1)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50",
-        className
+        className,
       )}
     >
       <Sheen className="group-hover/ai:translate-x-[400%]" />
       <Sparkles className="size-3 transition-transform duration-500 group-hover/ai:rotate-[72deg] group-hover/ai:scale-125 motion-reduce:transition-none" />
       {children}
     </motion.button>
-  )
+  );
 }
 
 function SectionTitle({ children }: { children: React.ReactNode }) {
@@ -611,7 +608,7 @@ function SectionTitle({ children }: { children: React.ReactNode }) {
     <h2 className="px-1 text-xs font-semibold tracking-[0.08em] text-muted-foreground uppercase">
       {children}
     </h2>
-  )
+  );
 }
 
 function Panel({
@@ -620,16 +617,16 @@ function Panel({
   className,
   children,
 }: {
-  title: string
-  count?: number
-  className?: string
-  children: React.ReactNode
+  title: string;
+  count?: number;
+  className?: string;
+  children: React.ReactNode;
 }) {
   return (
     <section
       className={cn(
         "flex min-w-0 flex-col gap-2 rounded-2xl border border-border bg-card p-3 transition-[border-color,box-shadow] duration-300 hover:border-[color-mix(in_oklch,var(--brand-1),transparent_70%)] hover:shadow-[0_16px_40px_-28px_var(--brand-canvas-dark)]",
-        className
+        className,
       )}
     >
       <div className="flex items-center justify-between px-2 pt-1">
@@ -642,17 +639,17 @@ function Panel({
       </div>
       {children}
     </section>
-  )
+  );
 }
 
 type AttentionItem = {
-  key: string
-  kind: string
-  label: string
-  state: string
-  href: string
-  prompt: string
-}
+  key: string;
+  kind: string;
+  label: string;
+  state: string;
+  href: string;
+  prompt: string;
+};
 
 function AttentionList({
   loading,
@@ -661,11 +658,11 @@ function AttentionList({
   onAsk,
   reduce,
 }: {
-  loading: boolean
-  failedReads: string[]
-  items: AttentionItem[]
-  onAsk: (prompt: string) => void
-  reduce: boolean
+  loading: boolean;
+  failedReads: string[];
+  items: AttentionItem[];
+  onAsk: (prompt: string) => void;
+  reduce: boolean;
 }) {
   if (loading) {
     return (
@@ -673,14 +670,16 @@ function AttentionList({
         <Skeleton className="h-9 w-full" />
         <Skeleton className="h-9 w-4/5" />
       </div>
-    )
+    );
   }
   return (
     <div className="flex flex-col">
       {items.length === 0 && failedReads.length === 0 ? (
         <div className="flex flex-col items-center gap-2 px-2 py-6 text-center">
           <CheckCircle2 className="size-6 text-emerald-500" />
-          <p className="text-sm text-muted-foreground">Nothing needs you right now.</p>
+          <p className="text-sm text-muted-foreground">
+            Nothing needs you right now.
+          </p>
         </div>
       ) : null}
       <ul className="flex flex-col">
@@ -689,12 +688,18 @@ function AttentionList({
             key={it.key}
             className="group/row relative flex items-center gap-3 rounded-xl px-2 py-2 ring-1 ring-transparent transition-all duration-200 hover:bg-destructive/10 hover:ring-destructive/30 hover:shadow-[0_8px_22px_-14px_var(--destructive)]"
           >
-            <span aria-hidden className="absolute top-1/2 left-0 h-0 w-0.5 -translate-y-1/2 rounded-full bg-destructive transition-all duration-300 group-hover/row:h-5" />
+            <span
+              aria-hidden
+              className="absolute top-1/2 left-0 h-0 w-0.5 -translate-y-1/2 rounded-full bg-destructive transition-all duration-300 group-hover/row:h-5"
+            />
             <span className="relative flex size-2.5 shrink-0">
               <span className="absolute inline-flex size-full animate-ping rounded-full bg-destructive/60 motion-reduce:animate-none" />
               <span className="relative inline-flex size-2.5 rounded-full bg-destructive" />
             </span>
-            <Link href={it.href} className="min-w-0 flex-1 text-sm underline-offset-4 transition-transform duration-300 group-hover/row:translate-x-1 hover:underline">
+            <Link
+              href={it.href}
+              className="min-w-0 flex-1 text-sm underline-offset-4 transition-transform duration-300 group-hover/row:translate-x-1 hover:underline"
+            >
               <span className="text-muted-foreground">{it.kind} · </span>
               <span className="font-medium">{it.label}</span>
               <span className="text-muted-foreground"> is {it.state}</span>
@@ -711,18 +716,19 @@ function AttentionList({
       </ul>
       {failedReads.length > 0 ? (
         <p className="px-2 pt-2 text-xs text-muted-foreground">
-          Couldn&apos;t load {failedReads.join(", ")}. This list may be incomplete.
+          Couldn&apos;t load {failedReads.join(", ")}. This list may be
+          incomplete.
         </p>
       ) : null}
     </div>
-  )
+  );
 }
 
 function greeting(): string {
-  const h = new Date().getHours()
-  if (h < 12) return "Good morning"
-  if (h < 18) return "Good afternoon"
-  return "Good evening"
+  const h = new Date().getHours();
+  if (h < 12) return "Good morning";
+  if (h < 18) return "Good afternoon";
+  return "Good evening";
 }
 
 /**
@@ -730,11 +736,11 @@ function greeting(): string {
  * generic starters that every workspace can answer from its own catalog.
  */
 function suggestions(pipelines: { name: string; status: string }[]): string[] {
-  const failed = pipelines.find((p) => p.status === "failed")
+  const failed = pipelines.find((p) => p.status === "failed");
   const base = [
     "What data do we have?",
     "Which tables changed in the last day?",
     "Show the top rows of the busiest mart",
-  ]
-  return failed ? [`Why did ${failed.name} fail?`, ...base.slice(0, 2)] : base
+  ];
+  return failed ? [`Why did ${failed.name} fail?`, ...base.slice(0, 2)] : base;
 }

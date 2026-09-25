@@ -2,7 +2,9 @@
 
 import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { motion, useReducedMotion, type Variants } from "motion/react";
 import { Sparkles } from "lucide-react";
+import { BrandBackdrop } from "@/components/ui/brand-glow";
 import { SuggestionButton } from "@/features/copilot/suggestion-button";
 import { useCopilot } from "./use-copilot";
 import { ChatMessages } from "./chat-messages";
@@ -53,6 +55,9 @@ function SessionUrlSync() {
  * The AI Copilot page — a RantAI-Agents-style chat view: a per-message
  * avatar, a centered welcome with suggestion pills, a soft composer.
  *
+ * Styled like Home (`BrandBackdrop`, `GlowFrame`, the Copilot badge) so
+ * moving from Home's prompt into the conversation feels like one surface.
+ *
  * History renders above the chat (`CopilotHistoryMenu`), not in the left
  * sidebar: that list used to appear only once already on /copilot, so it
  * spent navigation space on page content, and disappeared along with the
@@ -61,53 +66,90 @@ function SessionUrlSync() {
  */
 export function CopilotPage() {
   const c = useCopilot();
+  const reduce = useReducedMotion() ?? false;
 
   // Viewport minus the 4rem navbar and `AppFrame`'s vertical padding, so the
   // message list scrolls on its own and the composer stays on the bottom edge.
   return (
-    <div className="flex h-[calc(100svh-6rem)] flex-col gap-3 sm:h-[calc(100svh-6.5rem)] lg:h-[calc(100svh-7rem)]">
+    <div className="relative isolate flex h-[calc(100svh-6rem)] flex-col overflow-hidden rounded-3xl border border-border/60 bg-card/40 sm:h-[calc(100svh-6.5rem)] lg:h-[calc(100svh-7rem)]">
+      <BrandBackdrop />
       <React.Suspense fallback={null}>
         <SessionUrlSync />
       </React.Suspense>
 
       {/* Conversation history — shows the active conversation, last update, and a link to the history page */}
-      <CopilotHistoryMenu
-        sessions={c.sessions}
-        activeId={c.sessionId}
-        onSelect={(id) => void c.loadSession(id)}
-        onNew={() => c.newChat()}
-      />
-      <div className="mx-auto flex min-h-0 w-full max-w-3xl flex-1 flex-col">
-        <div className="min-h-0 flex-1 overflow-y-auto pr-0.5">
+      <div className="shrink-0 border-b border-border/50 bg-background/40 px-3 py-2 backdrop-blur-md">
+        <CopilotHistoryMenu
+          sessions={c.sessions}
+          activeId={c.sessionId}
+          onSelect={(id) => void c.loadSession(id)}
+          onNew={() => c.newChat()}
+        />
+      </div>
+
+      <div className="mx-auto flex min-h-0 w-full max-w-3xl flex-1 flex-col px-3 sm:px-4">
+        <div className="min-h-0 flex-1 overflow-y-auto py-6 pr-0.5">
           {c.messages.length === 0 ? (
-            <div className="flex flex-col items-center justify-center px-4 py-16 text-center">
-              <div className="mb-4 grid size-12 place-items-center rounded-2xl border border-violet-500/20 bg-gradient-to-br from-violet-500/15 to-purple-600/15 text-violet-600 dark:text-violet-400">
-                <Sparkles className="size-6" />
-              </div>
-              <h2 className="text-xl font-semibold text-foreground">Hi 👋 {c.pageContext.title}</h2>
-              <p className="mt-1.5 max-w-md text-sm text-muted-foreground">{c.pageContext.hint}</p>
-              <div className="mt-5 flex flex-wrap justify-center gap-2">
+            <motion.div
+              key={c.mode}
+              variants={reduce ? undefined : STAGGER}
+              initial="hidden"
+              animate="show"
+              className="flex min-h-full flex-col items-center justify-center px-2 py-10 text-center"
+            >
+              <motion.span
+                variants={reduce ? undefined : RISE}
+                className="mb-3 inline-flex items-center gap-1.5 rounded-full border border-[color-mix(in_oklch,var(--brand-1),transparent_60%)] bg-[color-mix(in_oklch,var(--brand-1),transparent_88%)] px-3 py-1 text-xs font-medium text-[var(--brand-1)]"
+              >
+                <Sparkles className="size-3" /> Copilot · {c.mode === "build" ? "Build mode" : "Ask mode"}
+              </motion.span>
+              <motion.h2
+                variants={reduce ? undefined : RISE}
+                className="text-3xl font-semibold tracking-[-0.03em] text-balance text-foreground sm:text-4xl"
+              >
+                {c.pageContext.title}
+              </motion.h2>
+              <motion.p variants={reduce ? undefined : RISE} className="mt-2 max-w-md text-sm text-muted-foreground sm:text-base">
+                {c.pageContext.hint}
+              </motion.p>
+              <div className="mt-7 flex flex-wrap justify-center gap-2">
                 {c.pageContext.suggest[c.mode].map((s) => (
-                  <SuggestionButton key={s} text={s} variant="pill" onClick={() => c.send(s)} disabled={c.busy} />
+                  <motion.div key={s} variants={reduce ? undefined : RISE}>
+                    <SuggestionButton text={s} variant="pill" onClick={() => c.send(s)} disabled={c.busy} />
+                  </motion.div>
                 ))}
               </div>
-            </div>
+            </motion.div>
           ) : (
             <ChatMessages
+              avatars
               messages={c.messages} busy={c.busy} error={c.error} progress={c.progress} onRetry={c.retry}
               onConfirmTool={c.confirmTool} onCancelTool={c.cancelTool} onCompleteTool={c.completeToolStep} confirmingKey={c.confirmingKey}
             />
           )}
         </div>
 
-        <div className="shrink-0 pt-3">
-          <ChatComposer onStop={c.stop}
+        <div className="shrink-0 pb-3 sm:pb-4">
+          <ChatComposer onStop={c.stop} glow
             mode={c.mode} setMode={c.setMode} onSend={c.send} busy={c.busy}
             enabledCaps={c.enabledCaps} toggleCap={c.toggleCap}
-            placeholder="Ask anything about your lakehouse data…"
+            placeholder={c.mode === "build" ? "Tell Copilot what to build or change…" : "Ask anything about your lakehouse data…"}
           />
+          <p className="mt-2 text-center text-[11px] text-muted-foreground">
+            Copilot can be wrong. Check its answers; anything that changes data asks you first.
+          </p>
         </div>
       </div>
     </div>
   );
 }
+
+const STAGGER: Variants = {
+  hidden: {},
+  show: { transition: { staggerChildren: 0.07, delayChildren: 0.05 } },
+};
+
+const RISE: Variants = {
+  hidden: { opacity: 0, y: 12 },
+  show: { opacity: 1, y: 0, transition: { type: "spring", stiffness: 170, damping: 26 } },
+};

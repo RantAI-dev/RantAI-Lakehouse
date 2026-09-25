@@ -10,6 +10,16 @@ import { ChatComposer } from "./chat-composer";
 import { CopilotHistoryButton } from "./history-menu";
 
 /**
+ * Pages that never show the floating dock: Home's own prompt is the entry
+ * point there, and /copilot is the full conversation, so a second input
+ * would be two boxes doing the same thing. `AppFrame` reads this too, to
+ * drop the bottom padding it keeps free for the dock.
+ */
+export function dockHiddenOn(pathname: string | null): boolean {
+  return pathname === "/" || Boolean(pathname?.startsWith("/copilot"));
+}
+
+/**
  * The GLOBAL chat dock — a bar at the BOTTOM-CENTER of every page (Google
  * Cloud Assist style). The input bar stays visible while the dock position
  * is bottom; when there's a conversation / it's focused, the chat panel
@@ -23,9 +33,7 @@ export function CopilotDock() {
   const pathname = usePathname();
   const c = useCopilot();
 
-  // Home's own prompt is the entry point there; a second input under it
-  // would be two boxes doing the same thing.
-  if (pathname === "/" || pathname?.startsWith("/copilot") || c.dockPosition === "right") {
+  if (dockHiddenOn(pathname) || c.dockPosition === "right") {
     return null;
   }
 
