@@ -1078,7 +1078,15 @@ fn build_namespaces(assets: &[Value]) -> Vec<Value> {
 /// # Tenant scoping
 ///
 /// Applies the exact same [`catalog_tenant_refusal`] gate as [`list`] —
-/// see its doc comment.
+/// see its doc comment. A refused caller gets `200` with
+/// `{"supported": false, "reason": …}`, not an error.
+///
+/// # Errors
+///
+/// Whatever `catalog_tenant_refusal` returns (a Postgres failure while
+/// counting tenants), or whatever `clickhouse_asset_detail`/
+/// `bronze_asset_detail` return: 404 for an unknown asset, otherwise the
+/// `ClickHouse` failure mapped through `ApiError`.
 pub async fn detail(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,

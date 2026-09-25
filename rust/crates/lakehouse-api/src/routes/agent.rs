@@ -49,6 +49,11 @@ fn system_msg(content: &str) -> ChatMessage {
 /// `text-to-sql/route.ts`): a plain-text description of every `serving.mart_*`
 /// table's columns, plus the list of `silver.*` table names, so the LLM
 /// never invents a table/column that doesn't exist.
+///
+/// # Errors
+///
+/// The `ClickHouse` error from either `SHOW TABLES`/`DESCRIBE` round trip,
+/// unchanged — callers decide how it surfaces.
 pub(crate) async fn schema_context(ch: &ChClient) -> Result<String, lakehouse_clickhouse::ChError> {
     let mart_rows = ch.rows("SHOW TABLES FROM serving", None).await?;
     let mart_tables: Vec<String> = mart_rows
