@@ -155,7 +155,7 @@ export function HomePage() {
 
         <div className="mx-auto mt-7 max-w-2xl">
           <PromptBox onAsk={(q) => ask(q)} reduce={reduce} />
-          <div className="mt-4 flex flex-wrap justify-center gap-2">
+          <div className="mt-4 flex flex-wrap justify-center gap-2 lg:-mx-24">
             {suggestions(pipelines.data?.pipelines ?? []).map((s) => (
               <button
                 key={s}
@@ -166,7 +166,8 @@ export function HomePage() {
                 <Sheen className="group-hover/chip:translate-x-[400%]" />
                 <Sparkles className="size-3 text-[var(--brand-1)] transition-transform duration-500 group-hover/chip:rotate-[72deg] group-hover/chip:scale-125 motion-reduce:transition-none" />
                 {s}
-                <ArrowRight className="-ml-1 size-3 w-0 opacity-0 transition-all duration-200 group-hover/chip:ml-0 group-hover/chip:w-3 group-hover/chip:opacity-100" />
+                {/* Space is always reserved: growing the chip on hover re-wrapped the row. */}
+                <ArrowRight className="size-3 -translate-x-1 opacity-0 transition-all duration-200 group-hover/chip:translate-x-0 group-hover/chip:opacity-100" />
               </button>
             ))}
           </div>

@@ -16,6 +16,22 @@
  */
 @custom-variant hover (&:hover);
 
+/*
+ * Tailwind v4's preflight leaves buttons on the default arrow cursor.
+ * Everything clickable in the console shows a pointer instead.
+ */
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  [role="menuitem"]:not([data-disabled]),
+  [role="option"]:not([data-disabled]),
+  [role="tab"]:not([data-disabled]),
+  summary,
+  label[for] {
+    cursor: pointer;
+  }
+}
+
 /* Legacy brand-font alias: pages using `var(--font-montserrat)` now render Geist. */
 :root {
   --font-montserrat: var(--font-sans);
