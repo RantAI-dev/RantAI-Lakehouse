@@ -6,6 +6,10 @@
 //! changes — the TypeScript makes the same promise via
 //! `LLM_URL`/`LLM_MODEL`/`LLM_KEY`.
 
+mod stream;
+
+pub use stream::HiddenSpans;
+
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -175,15 +179,7 @@ impl LlmClient {
             .json(&body)
             .send()
             .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            let truncated: String = text.chars().take(200).collect();
-            return Err(LlmError::Api(format!(
-                "LLM {}: {truncated}",
-                status.as_u16()
-            )));
-        }
+        let resp = error_for_status(resp).await?;
         let parsed: ChatResponse = resp.json().await.unwrap_or_default();
         let msg = parsed
             .choices
@@ -339,38 +335,57 @@ impl LlmClient {
             .json(&body)
             .send()
             .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            let truncated: String = text.chars().take(200).collect();
-            return Err(LlmError::Api(format!(
-                "LLM {}: {truncated}",
-                status.as_u16()
-            )));
-        }
+        let resp = error_for_status(resp).await?;
         let parsed: Value = resp.json().await.unwrap_or_default();
-        let msg_value = parsed
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({ "role": "assistant", "content": "" }));
-        let mut msg: LlmMessage = serde_json::from_value(msg_value).unwrap_or(LlmMessage {
-            role: LlmMessageRole::Assistant,
-            content: Some(String::new()),
-            tool_calls: None,
-            tool_call_id: None,
-            name: None,
-        });
-        if let Some(content) = &msg.content {
-            let stripped = strip_think_blocks(content).trim().to_owned();
-            msg.content = Some(stripped);
-        }
+        let msg = reply_from_json(&parsed);
         let usage = parsed
             .get("usage")
             .and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok());
         Ok((msg, usage))
     }
+}
+
+/// Passes a 2xx response through; anything else becomes
+/// [`LlmError::Api`] with the status and the body cut to 200 characters,
+/// matching the TypeScript's `` `LLM ${res.status}: ${text.slice(0, 200)}` ``.
+async fn error_for_status(resp: reqwest::Response) -> Result<reqwest::Response, LlmError> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let text = resp.text().await.unwrap_or_default();
+    let truncated: String = text.chars().take(200).collect();
+    Err(LlmError::Api(format!(
+        "LLM {}: {truncated}",
+        status.as_u16()
+    )))
+}
+
+/// The assistant message of a non-streamed tool-calling reply, with
+/// `<think>` blocks stripped from `content` and the rest trimmed. A reply
+/// with no `choices` becomes an empty assistant message, not an error —
+/// the same leniency as [`LlmClient::chat`]. Shared with the streamed
+/// path's fallback for endpoints that answer `stream: true` with plain
+/// JSON.
+fn reply_from_json(parsed: &Value) -> LlmMessage {
+    let msg_value = parsed
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({ "role": "assistant", "content": "" }));
+    let mut msg: LlmMessage = serde_json::from_value(msg_value).unwrap_or(LlmMessage {
+        role: LlmMessageRole::Assistant,
+        content: Some(String::new()),
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+    });
+    if let Some(content) = &msg.content {
+        let stripped = strip_think_blocks(content).trim().to_owned();
+        msg.content = Some(stripped);
+    }
+    msg
 }
 
 /// Strip every `<think>...</think>` block (case-insensitive, `.` matching

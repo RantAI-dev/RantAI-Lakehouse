@@ -32,7 +32,9 @@ use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ApiError;
-use lakehouse_llm::{ChatOptions, LlmMessage, LlmMessageRole, ToolCall, ToolCallFunction};
+use lakehouse_llm::{
+    ChatOptions, HiddenSpans, LlmMessage, LlmMessageRole, ToolCall, ToolCallFunction,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -294,6 +296,38 @@ fn report(progress: Progress<'_>, event: Value) -> bool {
     progress.is_none_or(|tx| tx.send(event).is_ok())
 }
 
+/// One model round. For a streaming client (`progress` set) the answer
+/// text goes out as `{"type":"delta","text":…}` events while the model
+/// writes it, with `MiniMax`'s tool-call XML held back so it never shows
+/// (`<think>` is already dropped by the client library). Text streamed in
+/// a round that ends in tool calls is only preamble: the client drops its
+/// draft on the next `tool`/`status` event, and the `done` body — checked
+/// by `citations::annotate_answer` — replaces whatever was streamed.
+async fn model_round(
+    state: &AppState,
+    messages: &[LlmMessage],
+    tools: &[Value],
+    progress: Progress<'_>,
+) -> Result<LlmMessage, lakehouse_llm::LlmError> {
+    if progress.is_none() {
+        return state
+            .llm
+            .chat_with_tools(messages, tools, ChatOptions::default())
+            .await;
+    }
+    let mut tool_xml = HiddenSpans::new(&[
+        ("<minimax:tool_call>", "</minimax:tool_call>"),
+        ("<invoke ", "</invoke>"),
+    ]);
+    state
+        .llm
+        .chat_with_tools_streamed(messages, tools, ChatOptions::default(), |text| {
+            let visible = tool_xml.push(text);
+            visible.is_empty() || report(progress, json!({ "type": "delta", "text": visible }))
+        })
+        .await
+}
+
 /// The agentic loop: ask the model, run the tools it calls (through
 /// [`gate::decide_by_name`]), feed the results back, until it answers
 /// without a tool call or [`MAX_ITER`] rounds pass. Returns the response
@@ -330,10 +364,7 @@ async fn run_chat(
                 Some("stopped"),
             ));
         }
-        let msg = state
-            .llm
-            .chat_with_tools(&messages, &tools, ChatOptions::default())
-            .await?;
+        let msg = model_round(state, &messages, &tools, progress).await?;
         messages.push(msg.clone());
 
         let mut calls: Vec<ToolCall> = msg.tool_calls.clone().unwrap_or_default();
@@ -504,10 +535,7 @@ async fn run_chat(
         tool_call_id: None,
         name: None,
     });
-    let final_msg = state
-        .llm
-        .chat_with_tools(&messages, &[], ChatOptions::default())
-        .await?;
+    let final_msg = model_round(state, &messages, &[], progress).await?;
     // WS7 item F2: the iteration-budget-exhausted final answer is checked
     // the same way as the normal return path — a model that runs out of
     // tool-calling turns is not exempt from citation checking.
@@ -524,7 +552,8 @@ async fn run_chat(
 /// `stream: true`: the same loop, answered as NDJSON — one JSON object per
 /// line. `{"type":"status","phase":"thinking"}` before each model round and
 /// `{"type":"tool","tool":…}` before each tool call let the client say what
-/// is happening; the last line is `{"type":"done","body":…}` (the plain
+/// is happening, and `{"type":"delta","text":…}` carries answer text as the
+/// model writes it ([`model_round`]); the last line is `{"type":"done","body":…}` (the plain
 /// response body) or `{"type":"error","status":…,"body":…}`. When the
 /// client disconnects, the loop stops before its next round or tool.
 fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat) -> Response {

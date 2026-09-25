@@ -152,7 +152,7 @@ export function CopilotSidebar() {
           </div>
         ) : (
           <ChatMessages
-            messages={c.messages}
+            messages={c.messages} draft={c.draft}
             busy={c.busy}
             error={c.error} progress={c.progress} onRetry={c.retry}
             onConfirmTool={c.confirmTool}

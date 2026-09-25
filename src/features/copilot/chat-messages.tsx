@@ -8,6 +8,7 @@ import { Button, buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { BuildTree } from "./build-tree";
 import { CopyButton } from "./copy-button";
+import { settleStreamingMarkdown } from "@/lib/stream-markdown";
 import { MiniMarkdown } from "./mini-markdown";
 import { PendingActionCard } from "./pending-action-card";
 import { TOOL_LABEL, ToolStepCard, asObj, type ToolStep } from "./tool-step";
@@ -79,7 +80,7 @@ function CopilotAvatar({ thinking }: { thinking?: boolean }) {
 /** The Copilot message list — rich rendering (tool cards, build tree, markdown). */
 export function ChatMessages({
   messages, busy, progress, error, className, onRetry,
-  onConfirmTool, onCancelTool, onCompleteTool, confirmingKey, avatars,
+  onConfirmTool, onCancelTool, onCompleteTool, confirmingKey, avatars, draft,
 }: {
   messages: Msg[];
   busy: boolean;
@@ -98,6 +99,8 @@ export function ChatMessages({
   confirmingKey?: string | null;
   /** Show Copilot's avatar beside answers — the wide /copilot page only. */
   avatars?: boolean;
+  /** Answer text streamed so far (`useCopilot().draft`). */
+  draft?: string;
 }) {
   const reduce = useReducedMotion() ?? false;
   // New messages rise in; skipped under reduced motion.
@@ -106,7 +109,7 @@ export function ChatMessages({
     : { initial: { opacity: 0, y: 8 }, animate: { opacity: 1, y: 0 }, transition: { type: "spring" as const, stiffness: 220, damping: 26 } };
   const rootRef = React.useRef<HTMLDivElement>(null);
   // Changes whenever something new lands at the bottom of the list.
-  const tail = `${messages.length}:${messages[messages.length - 1]?.content.length ?? 0}:${busy}:${error ?? ""}:${progress?.phase}:${progress?.steps?.length ?? 0}`;
+  const tail = `${messages.length}:${messages[messages.length - 1]?.content.length ?? 0}:${busy}:${error ?? ""}:${progress?.phase}:${progress?.steps?.length ?? 0}:${draft?.length ?? 0}`;
   const { pinned, jumpToLatest } = useStickToBottom(rootRef, tail);
 
   const lastIndex = messages.length - 1;
@@ -171,14 +174,12 @@ export function ChatMessages({
         );
       })}
       {busy ? (
-        avatars ? (
-          <div className="flex items-start gap-3">
-            <CopilotAvatar thinking />
-            <ProgressLine progress={progress ?? null} />
+        <div className={cn("min-w-0", avatars && "flex items-start gap-3")}>
+          {avatars ? <CopilotAvatar thinking /> : null}
+          <div className="min-w-0 flex-1">
+            {draft ? <StreamingAnswer text={draft} /> : <ProgressLine progress={progress ?? null} />}
           </div>
-        ) : (
-          <ProgressLine progress={progress ?? null} />
-        )
+        </div>
       ) : null}
       {error ? (
         <div className="flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm" role="alert">
@@ -202,6 +203,59 @@ export function ChatMessages({
           </button>
         </div>
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * Reveals `target` at a steady pace instead of in network-sized jumps, and
+ * catches up faster the further behind it is (the RantAI-Agents chat's
+ * pacing: ~25 chars/s, 60 when 100+ behind, 180 when 300+ behind). Shows
+ * everything at once under reduced motion. When `target` restarts (a new
+ * model round), so does the reveal.
+ */
+function useSmoothText(target: string): string {
+  const reduce = useReducedMotion() ?? false;
+  const [shown, setShown] = React.useState(0);
+  const shownRef = React.useRef(0);
+
+  React.useEffect(() => {
+    if (reduce) return;
+    // The draft started over (a new model round): so does the reveal.
+    if (shownRef.current > target.length) shownRef.current = 0;
+    let raf = 0;
+    let last = performance.now();
+    const tick = (now: number) => {
+      const behind = target.length - shownRef.current;
+      if (behind > 0) {
+        const rate = behind > 300 ? 180 : behind > 100 ? 60 : 25;
+        const step = Math.max(1, Math.round(((now - last) / 1000) * rate));
+        shownRef.current = Math.min(target.length, shownRef.current + step);
+        setShown(shownRef.current);
+      }
+      last = now;
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [target, reduce]);
+
+  if (reduce) return target;
+  return target.slice(0, shown <= target.length ? shown : 0);
+}
+
+/**
+ * The answer while it is being written: paced, made safe to render
+ * mid-token (`settleStreamingMarkdown`), with a caret. Numbers are only
+ * checked against tool results once the answer is complete, so the draft
+ * says so; the checked answer replaces it.
+ */
+function StreamingAnswer({ text }: { text: string }) {
+  const shown = useSmoothText(text.trimStart());
+  return (
+    <div className="space-y-1.5" aria-live="polite" aria-busy="true">
+      <MiniMarkdown text={settleStreamingMarkdown(shown)} caret />
+      <p className="text-[11px] text-muted-foreground">Writing… numbers are checked against the data when the answer is done.</p>
     </div>
   );
 }

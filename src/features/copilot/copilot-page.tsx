@@ -123,7 +123,7 @@ export function CopilotPage() {
           ) : (
             <ChatMessages
               avatars
-              messages={c.messages} busy={c.busy} error={c.error} progress={c.progress} onRetry={c.retry}
+              messages={c.messages} draft={c.draft} busy={c.busy} error={c.error} progress={c.progress} onRetry={c.retry}
               onConfirmTool={c.confirmTool} onCancelTool={c.cancelTool} onCompleteTool={c.completeToolStep} confirmingKey={c.confirmingKey}
             />
           )}

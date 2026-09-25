@@ -198,6 +198,13 @@ function useCopilotState() {
     abortRef.current?.abort();
   }, []);
   const [progress, setProgress] = React.useState<ChatProgress | null>(null);
+  /**
+   * Answer text streamed so far in the current model round (`delta`
+   * events). A new round (`status`/`tool`) starts it over: text before a
+   * tool call is only preamble. The `done` body, checked against tool
+   * results on the server, replaces it.
+   */
+  const [draft, setDraft] = React.useState("");
 
   /**
    * Sends `text` after `history` (default: the current conversation) and
@@ -231,9 +238,14 @@ function useCopilotState() {
       let result: ChatResult | null = null;
       for await (const raw of readNdjson(res)) {
         const event = raw as { type?: string; tool?: string; body?: unknown };
-        if (event.type === "status") {
+        if (event.type === "delta") {
+          const piece = (raw as { text?: unknown }).text;
+          if (typeof piece === "string") setDraft((d) => d + piece);
+        } else if (event.type === "status") {
+          setDraft("");
           setProgress((p) => ({ phase: "thinking", startedAt: p?.startedAt ?? Date.now(), steps: p?.steps }));
         } else if (event.type === "tool") {
+          setDraft("");
           setProgress((p) => ({
             phase: "tool",
             tool: event.tool,
@@ -286,6 +298,7 @@ function useCopilotState() {
       abortRef.current = null;
       setBusy(false);
       setProgress(null);
+      setDraft("");
     }
   }, [busy, mode, sessionId, persist, enabledCaps]);
 
@@ -431,7 +444,7 @@ function useCopilotState() {
     mode, setMode, messages, busy, error, sessionId, sessions,
     enabledCaps, toggleCap, pageContext, setPageContext,
     send, newChat, loadSession, removeSession, renameSession, refreshSessions,
-    progress, stop, retry,
+    progress, draft, stop, retry,
     confirmTool, cancelTool, completeToolStep, confirmingKey,
     dockPosition, setDockPosition, expanded, setExpanded,
     sidebarWidth, setSidebarWidth,

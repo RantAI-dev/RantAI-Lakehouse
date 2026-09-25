@@ -158,7 +158,17 @@ function renderList(nodes: ListNode[], keyBase: string): React.ReactNode {
 
 const BLOCK_START = /^(#{1,3}\s|```|>|\s*([-*+]|\d+\.)\s+|\s*\|)/;
 
-export function MiniMarkdown({ text }: { text: string }) {
+/** The blinking bar at the end of an answer that is still being written. */
+function Caret() {
+  return (
+    <span
+      aria-hidden
+      className="ml-0.5 inline-block h-[1.05em] w-[0.45em] translate-y-[0.15em] rounded-[2px] bg-[var(--brand-1)] motion-safe:animate-pulse"
+    />
+  );
+}
+
+export function MiniMarkdown({ text, caret }: { text: string; caret?: boolean }) {
   const lines = text.replace(/\r/g, "").split("\n");
   const blocks: React.ReactNode[] = [];
   let i = 0;
@@ -279,5 +289,15 @@ export function MiniMarkdown({ text }: { text: string }) {
     );
   }
 
+  if (caret) {
+    // Inside the last paragraph or heading when there is one, so the caret
+    // sits after the last word rather than on a line of its own.
+    const last = blocks[blocks.length - 1];
+    if (React.isValidElement<{ children?: React.ReactNode }>(last) && last.type === "p") {
+      blocks[blocks.length - 1] = React.cloneElement(last, undefined, last.props.children, <Caret key="caret" />);
+    } else {
+      blocks.push(<Caret key="caret" />);
+    }
+  }
   return <div className="space-y-2">{blocks}</div>;
 }
