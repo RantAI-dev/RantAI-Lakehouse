@@ -324,6 +324,10 @@
         "properties": {
           "name": {
             "type": "string"
+          },
+          "description": {
+            "type": "string",
+            "description": "Satu kalimat tujuan board, tampil di halaman daftar dashboard."
           }
         },
         "required": [

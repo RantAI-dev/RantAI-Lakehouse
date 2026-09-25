@@ -69,7 +69,17 @@ pub(super) async fn update_chart(ch: &ChClient, args: &Map<String, Value>) -> Va
 }
 
 pub(super) async fn create_board(ch: &ChClient, args: &Map<String, Value>) -> Value {
-    match store::create_board(ch, &arg_str(args, "name")).await {
+    // `created_by` is left empty: the assistant is not a person, and naming
+    // it as the author would put a non-account into a column the UI shows
+    // as an owner.
+    match store::create_board(
+        ch,
+        &arg_str(args, "name"),
+        &arg_str(args, "description"),
+        "",
+    )
+    .await
+    {
         Ok(board) => json!({
             "created": true, "id": board.id, "name": board.name,
             "note": "Pakai id ini di create_chart.board.",

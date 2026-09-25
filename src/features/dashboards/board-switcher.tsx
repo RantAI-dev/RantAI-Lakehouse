@@ -1,6 +1,7 @@
 "use client";
 
-import { BarChart3, Check, ChevronDown, Plus } from "lucide-react";
+import { BarChart3, Check, ChevronDown, LayoutGrid, Plus } from "lucide-react";
+import Link from "next/link";
 
 import {
   DropdownMenu,
@@ -77,6 +78,15 @@ export function BoardSwitcher({
           ))}
         </DropdownMenuGroup>
         <DropdownMenuSeparator />
+        {/* The menu only lists names; managing them (rename, share, delete)
+            lives on `/dashboards/browse`, so the switcher needs a way out
+            to it. */}
+        <DropdownMenuItem asChild>
+          <Link href="/dashboards/browse">
+            <LayoutGrid className="size-4" aria-hidden />
+            Browse all dashboards
+          </Link>
+        </DropdownMenuItem>
         <DropdownMenuItem onClick={onCreate}>
           <Plus className="size-4" aria-hidden />
           New dashboard

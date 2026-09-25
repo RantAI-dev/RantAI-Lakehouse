@@ -11,7 +11,9 @@
       {
         "id": "default",
         "name": "Main",
-        "layout": {}
+        "layout": {},
+        "chartCount": 13,
+        "builtin": true
       },
       {
         "id": "b_5cbfb279",
@@ -20,7 +22,12 @@
         "filters": [],
         "createdAt": "2026-08-19 09:59:39",
         "publicToken": "",
-        "embedEnabled": false
+        "embedEnabled": false,
+        "description": "",
+        "createdBy": "",
+        "updatedAt": "2026-08-19 09:59:39",
+        "chartCount": 11,
+        "builtin": false
       },
       {
         "id": "b_73c6fcc1",
@@ -54,7 +61,12 @@
         "filters": [],
         "createdAt": "2026-08-19 10:52:19",
         "publicToken": "__PUBLIC_DASH_TOKEN__",
-        "embedEnabled": true
+        "embedEnabled": true,
+        "description": "",
+        "createdBy": "",
+        "updatedAt": "2026-08-19 10:52:19",
+        "chartCount": 4,
+        "builtin": false
       }
     ]
   }

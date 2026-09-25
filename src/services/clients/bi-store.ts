@@ -47,9 +47,28 @@ export type FilterDef = { column: string; values: string[] };
 export type Board = {
   id: string;
   name: string;
+  /** Satu kalimat tujuan board, tampil di halaman daftar dashboard. */
+  description?: string;
+  /** Nama tampilan pembuat board. Kosong untuk board lama / tanpa login. */
+  createdBy?: string;
   layout?: LayoutMap;
   filters?: FilterDef[];
   createdAt?: string;
+  /**
+   * Kapan board terakhir ditulis.
+   *
+   * Nilainya sama dengan `createdAt`, dan itu disengaja: tabelnya
+   * `ReplacingMergeTree(created_at)`, jadi `created_at` adalah kolom versi
+   * yang ditulis ulang `now()` setiap kali board di-rename / layout
+   * disimpan / filter diubah. Jadi sejak awal isinya memang "terakhir
+   * diubah", cuma namanya saja "created". Di UI, labeli **"Updated"** —
+   * jangan pernah "Created", karena itu klaim yang tidak benar.
+   */
+  updatedAt?: string;
+  /** Jumlah tile di board ini; dihitung server, bukan kolom tersimpan. */
+  chartCount?: number;
+  /** `true` hanya untuk board bawaan (`default`) yang tidak bisa dihapus. */
+  builtin?: boolean;
   publicToken?: string;
   embedEnabled?: boolean;
 };

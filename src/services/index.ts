@@ -11,6 +11,7 @@ import { clickhouseOverviewService } from "./clients/overview"
 import { clickhouseGovernanceService } from "./clients/governance"
 import { postgresIdentityService } from "./clients/identity"
 import { postgresConnectorService } from "./clients/connectors"
+import { clickhouseDashboardService } from "./clients/dashboards"
 import { postgresAgentService } from "./clients/agents"
 import { clickhouseAlertRuleService } from "./clients/alerts"
 import { icebergLakehouseService } from "./clients/lakehouse"
@@ -53,6 +54,10 @@ export const identityService = postgresIdentityService
 // `rust/crates/lakehouse-store/src/connectors.rs` for the design rationale.
 // mock/connectors.ts has been deleted.
 export const connectorService = postgresConnectorService
+// Dashboards: boards live in ClickHouse (`console.bi_board`). Only
+// list-level operations go through here; the dashboard canvas itself still
+// calls `/api/dashboard/*` directly.
+export const dashboardService = clickhouseDashboardService
 // Alert rules (WS1 task 1.15) — CRUD + run over `console.alert_rule` in
 // ClickHouse, ported by `lakehouse_alerts`. No mock ever existed for this
 // service; the feature previously fetched `/api/alerts` directly with no

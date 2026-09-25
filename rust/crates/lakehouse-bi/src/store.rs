@@ -248,6 +248,14 @@ pub struct Board {
     pub id: String,
     /// Display name.
     pub name: String,
+    /// One-line purpose, shown wherever a dashboard is listed rather than
+    /// opened. Empty when never set.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub description: Option<String>,
+    /// Display name of whoever created this board (`""` for boards made
+    /// before the column existed, or by an unauthenticated caller).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub created_by: Option<String>,
     /// Tile layout, by chart id.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub layout: Option<LayoutMap>,
@@ -257,6 +265,18 @@ pub struct Board {
     /// `ClickHouse`-formatted creation timestamp.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub created_at: Option<String>,
+    /// When this board was last written, `ClickHouse`-formatted.
+    ///
+    /// Same underlying column as [`Self::created_at`], deliberately: the
+    /// table is a `ReplacingMergeTree(created_at)`, so `created_at` is the
+    /// VERSION column and every upsert (rename, layout save, filter
+    /// change) rewrites it with `now()`. It has therefore always been a
+    /// last-modified value wearing a "created" name. Exposing it under
+    /// both names lets a list view label it truthfully as "Updated"
+    /// without breaking the existing `createdAt` field that the share
+    /// dialog and the parity corpus already read.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub updated_at: Option<String>,
     /// Public read-only share token, when enabled.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub public_token: Option<String>,
@@ -413,6 +433,20 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
+    // Both `String DEFAULT ''`, not `DateTime DEFAULT now()`: a default is
+    // evaluated at READ time for rows written before the column existed, so
+    // a `now()` default would hand back a different value on every SELECT.
+    // A constant empty string is stable for old rows.
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS description String DEFAULT ''",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS created_by String DEFAULT ''",
+        None,
+    )
+    .await?;
     Ok(())
 }
 
@@ -426,7 +460,7 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
 /// second, user-made dashboard.
 pub const DEFAULT_BOARD_ID: &str = "default";
 
-const BOARD_COLS: &str = "id, name, layout_json, filters_json, public_token, embed_enabled, toString(created_at) AS created_at";
+const BOARD_COLS: &str = "id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled, toString(created_at) AS created_at";
 
 fn parse_layout(s: &str) -> LayoutMap {
     if s.is_empty() {
@@ -456,12 +490,16 @@ fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
         .and_then(|s| s.parse::<i64>().ok())
         .or_else(|| row.get("embed_enabled").and_then(Value::as_i64))
         .unwrap_or(0);
+    let stamp = row_str(row, "created_at").to_owned();
     Board {
         id: row_str(row, "id").to_owned(),
         name: row_str(row, "name").to_owned(),
+        description: Some(row_str(row, "description").to_owned()),
+        created_by: Some(row_str(row, "created_by").to_owned()),
         layout: Some(parse_layout(layout_json)),
         filters: Some(parse_filters(filters_json)),
-        created_at: Some(row_str(row, "created_at").to_owned()),
+        created_at: Some(stamp.clone()),
+        updated_at: Some(stamp),
         public_token: Some(public_token.to_owned()),
         embed_enabled: Some(embed_enabled == 1),
     }
@@ -510,7 +548,12 @@ pub async fn get_board(ch: &ChClient, id: &str) -> Result<Option<Board>, ChError
 ///
 /// Returns [`BiError::Validation`] when `name` is blank after trimming, or
 /// [`BiError::Clickhouse`] on a `ClickHouse` failure.
-pub async fn create_board(ch: &ChClient, name: &str) -> Result<Board, BiError> {
+pub async fn create_board(
+    ch: &ChClient,
+    name: &str,
+    description: &str,
+    created_by: &str,
+) -> Result<Board, BiError> {
     ensure_bi_table(ch).await?;
     let clean = name.trim();
     if clean.is_empty() {
@@ -518,29 +561,39 @@ pub async fn create_board(ch: &ChClient, name: &str) -> Result<Board, BiError> {
             "dashboard name is required.".to_owned(),
         ));
     }
+    let desc = description.trim();
+    let author = created_by.trim();
     let id = new_board_id();
     let sql = format!(
-        "INSERT INTO console.bi_board (id, name) VALUES ({}, {})",
+        "INSERT INTO console.bi_board (id, name, description, created_by) VALUES ({}, {}, {}, {})",
         SqlLiteral::from(id.as_str()),
-        SqlLiteral::from(clean)
+        SqlLiteral::from(clean),
+        SqlLiteral::from(desc),
+        SqlLiteral::from(author)
     );
     ch.exec(&sql, None).await?;
     Ok(Board {
         id,
         name: clean.to_owned(),
+        description: Some(desc.to_owned()),
+        created_by: Some(author.to_owned()),
         layout: Some(LayoutMap::new()),
         filters: Some(Vec::new()),
         created_at: None,
+        updated_at: None,
         public_token: None,
         embed_enabled: None,
     })
 }
 
 /// INSERT (not `ALTER ... UPDATE`) — `ReplacingMergeTree`, instant & consistent.
+#[allow(clippy::too_many_arguments)]
 async fn upsert_board(
     ch: &ChClient,
     id: &str,
     name: &str,
+    description: &str,
+    created_by: &str,
     layout: &LayoutMap,
     filters: &[FilterDef],
     public_token: &str,
@@ -549,10 +602,12 @@ async fn upsert_board(
     let layout_json = serde_json::to_string(layout).unwrap_or_else(|_| "{}".to_owned());
     let filters_json = serde_json::to_string(filters).unwrap_or_else(|_| "[]".to_owned());
     let sql = format!(
-        "INSERT INTO console.bi_board (id, name, layout_json, filters_json, public_token, embed_enabled) VALUES \
-         ({}, {}, {}, {}, {}, {})",
+        "INSERT INTO console.bi_board (id, name, description, created_by, layout_json, filters_json, public_token, embed_enabled) VALUES \
+         ({}, {}, {}, {}, {}, {}, {}, {})",
         SqlLiteral::from(id),
         SqlLiteral::from(name),
+        SqlLiteral::from(description),
+        SqlLiteral::from(created_by),
         SqlLiteral::from(layout_json),
         SqlLiteral::from(filters_json),
         SqlLiteral::from(public_token),
@@ -568,6 +623,18 @@ async fn save_board_patch(
 ) -> Result<(), ChError> {
     let name = patch.name.unwrap_or(board.name.as_str());
     let name = if name.is_empty() { "Dashboard" } else { name };
+    // `created_by` is never patched: it records who made the board, which
+    // does not change when somebody else edits it. It must still be
+    // re-written on every upsert, or the ReplacingMergeTree row that wins
+    // would carry an empty author.
+    let description = patch
+        .description
+        .or(board.description.as_deref())
+        .unwrap_or("");
+    let created_by = patch
+        .created_by
+        .or(board.created_by.as_deref())
+        .unwrap_or("");
     let empty_layout = LayoutMap::new();
     let layout = patch
         .layout
@@ -589,6 +656,8 @@ async fn save_board_patch(
         ch,
         &board.id,
         name,
+        description,
+        created_by,
         layout,
         filters,
         public_token,
@@ -602,6 +671,8 @@ async fn save_board_patch(
 #[derive(Default)]
 struct BoardPatch<'a> {
     name: Option<&'a str>,
+    description: Option<&'a str>,
+    created_by: Option<&'a str>,
     layout: Option<&'a LayoutMap>,
     filters: Option<&'a [FilterDef]>,
     public_token: Option<&'a str>,
@@ -635,6 +706,29 @@ pub async fn rename_board(ch: &ChClient, id: &str, name: &str) -> Result<(), BiE
     Ok(())
 }
 
+/// Set a board's one-line description. Blank clears it. No-op if the board
+/// does not exist, matching [`rename_board`].
+///
+/// # Errors
+///
+/// Returns [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn describe_board(ch: &ChClient, id: &str, description: &str) -> Result<(), BiError> {
+    ensure_bi_table(ch).await?;
+    let clean = description.trim();
+    if let Some(board) = get_board(ch, id).await? {
+        save_board_patch(
+            ch,
+            &board,
+            BoardPatch {
+                description: Some(clean),
+                ..Default::default()
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// Update a board's tile layout, creating a bare `Board { id, name:
 /// "Dashboard" }` shell if it does not exist yet. Ports `updateBoardLayout`.
 ///
@@ -650,9 +744,12 @@ pub async fn update_board_layout(
     let board = get_board(ch, id).await?.unwrap_or_else(|| Board {
         id: id.to_owned(),
         name: "Dashboard".to_owned(),
+        description: None,
+        created_by: None,
         layout: None,
         filters: None,
         created_at: None,
+        updated_at: None,
         public_token: None,
         embed_enabled: None,
     });
@@ -682,9 +779,12 @@ pub async fn update_board_filters(
     let board = get_board(ch, id).await?.unwrap_or_else(|| Board {
         id: id.to_owned(),
         name: "Dashboard".to_owned(),
+        description: None,
+        created_by: None,
         layout: None,
         filters: None,
         created_at: None,
+        updated_at: None,
         public_token: None,
         embed_enabled: None,
     });
@@ -806,14 +906,23 @@ pub async fn delete_board(ch: &ChClient, id: &str) -> Result<(), ChError> {
 ///
 /// Returns [`BiError::Validation`] if the source board does not exist, or
 /// [`BiError::Clickhouse`] on a `ClickHouse` failure.
-pub async fn duplicate_board(ch: &ChClient, id: &str) -> Result<Board, BiError> {
+pub async fn duplicate_board(ch: &ChClient, id: &str, created_by: &str) -> Result<Board, BiError> {
     ensure_bi_table(ch).await?;
     let src = get_board(ch, id)
         .await?
         .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
     let charts = list_stored_charts(ch).await?;
     let charts: Vec<_> = charts.into_iter().filter(|c| c.board == id).collect();
-    let new_board = create_board(ch, &format!("{} (salinan)", src.name)).await?;
+    // The copy carries the original's description — it describes the same
+    // thing — but is authored by whoever pressed Duplicate, not by the
+    // person who made the original.
+    let new_board = create_board(
+        ch,
+        &format!("{} (salinan)", src.name),
+        src.description.as_deref().unwrap_or(""),
+        created_by,
+    )
+    .await?;
     let mut id_map: HashMap<String, String> = HashMap::new();
     for c in &charts {
         let new_id = new_chart_id();
@@ -1728,7 +1837,7 @@ mod tests {
         ChClient::new(url.to_owned(), "default".to_owned(), String::new())
     }
 
-    /// Regression test for H1 (`ensure_bi_table` re-issuing all 8 DDL
+    /// Regression test for H1 (`ensure_bi_table` re-issuing all 10 DDL
     /// statements on every call): the first call to any public function
     /// must run the DDL bootstrap, but every call after that — across the
     /// whole process, matching the TS's module-level `ensured` flag — must
@@ -1748,9 +1857,11 @@ mod tests {
         let ch = client(&server.uri());
         ensure_bi_table(&ch).await.unwrap();
         let first_call_requests = server.received_requests().await.unwrap().len();
+        // 10 = the original 8 plus the `description` and `created_by`
+        // `ADD COLUMN` statements added for the dashboard list page.
         assert_eq!(
-            first_call_requests, 8,
-            "first call should issue all 8 DDL statements"
+            first_call_requests, 10,
+            "first call should issue all 10 DDL statements"
         );
 
         ensure_bi_table(&ch).await.unwrap();
@@ -1868,17 +1979,25 @@ mod tests {
         let board = Board {
             id: "b_1".to_owned(),
             name: "Dash".to_owned(),
+            description: Some("Ringkasan kunjungan".to_owned()),
+            created_by: Some("Bootstrap Admin".to_owned()),
             layout: None,
             filters: None,
             created_at: Some("2026-01-01 00:00:00".to_owned()),
+            updated_at: Some("2026-01-02 00:00:00".to_owned()),
             public_token: Some("p_abc".to_owned()),
             embed_enabled: Some(true),
         };
         let json = serde_json::to_value(&board).unwrap();
         assert_eq!(json.get("createdAt").unwrap(), "2026-01-01 00:00:00");
+        assert_eq!(json.get("updatedAt").unwrap(), "2026-01-02 00:00:00");
+        assert_eq!(json.get("createdBy").unwrap(), "Bootstrap Admin");
+        assert_eq!(json.get("description").unwrap(), "Ringkasan kunjungan");
         assert_eq!(json.get("publicToken").unwrap(), "p_abc");
         assert_eq!(json.get("embedEnabled").unwrap(), true);
         assert!(json.get("created_at").is_none());
+        assert!(json.get("updated_at").is_none());
+        assert!(json.get("created_by").is_none());
         assert!(json.get("public_token").is_none());
         assert!(json.get("embed_enabled").is_none());
     }

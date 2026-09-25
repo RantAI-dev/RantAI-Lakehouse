@@ -1,7 +1,7 @@
 "use client";
 
 import * as React from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { useTheme } from "next-themes";
 import { ChartColumn, Download, Eye, Maximize2, MousePointerClick, Move, Pencil, Sparkles, Table2, Trash2 } from "lucide-react";
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog";
@@ -23,6 +23,7 @@ import { notifyDashboardsChanged, useDashboardsChanged } from "./dashboard-event
 import { DashboardFilters } from "./dashboard-filters";
 import { DashboardGrid, type GridItem, type TileMenuItem } from "./dashboard-grid";
 import { DrillMenu, RecordsDialog, fetchRecords, type DrillTarget, type RecordsState } from "./drill";
+import { forgetLastBoard, rememberLastBoard } from "./last-board";
 import { ShareDialog } from "./share-dialog";
 import { TileBody } from "./tile-body";
 import { TileDataDialog, TileExpandDialog, downloadRowsCsv, hasRows, type Cell } from "./tile-dialogs";
@@ -57,14 +58,16 @@ function drillColumn(spec: ChartCard): string | undefined {
 
 /**
  * A Tableau/Metabase-style dashboard — a drag/resize tile canvas, multiple
- * dashboards (chosen via ?board=, managed from the sidebar). Edit mode
- * arranges the layout (saved to the lakehouse); View mode is a clean
- * presentation. Built-in, manual, and AI-built cards.
+ * dashboards. Edit mode arranges the layout (saved to the lakehouse); View
+ * mode is a clean presentation. Built-in, manual, and AI-built cards.
+ *
+ * The open board arrives as a prop from the `/dashboards/[id]` route segment
+ * rather than being read from the URL here: `/dashboards` now resolves to a
+ * board, so this canvas no longer has a URL without one.
  */
-export function DashboardPage() {
+export function DashboardPage({ boardId }: { boardId: string }) {
   const router = useRouter();
-  const params = useSearchParams();
-  const board = params.get("board") || "default";
+  const board = boardId || "default";
   const isDefault = board === "default";
 
   const { resolvedTheme } = useTheme();
@@ -132,6 +135,10 @@ export function DashboardPage() {
   React.useEffect(() => {
     adoptingRef.current = true; filtersRef.current = []; setFilters([]); setEdit(false);
   }, [board]);
+  // `/dashboards` meneruskan ke board terakhir, jadi membukanya di sinilah
+  // yang menentukan "terakhir" — bukan klik di daftar, karena kanvas juga
+  // dicapai lewat switcher, tautan bersama dan Copilot.
+  React.useEffect(() => { rememberLastBoard(board); }, [board]);
   React.useEffect(() => { void load(); }, [load]);
   // Charts added or removed elsewhere (Copilot, board menus).
   useDashboardsChanged(React.useCallback(() => { void load(); }, [load]));
@@ -221,18 +228,20 @@ export function DashboardPage() {
   async function duplicateDashboard() {
     const json = await boardRequest("POST", { duplicate: board });
     notifyDashboardsChanged();
-    if (json.board?.id) router.push(`/dashboards?board=${json.board.id}`);
+    if (json.board?.id) router.push(`/dashboards/${json.board.id}`);
   }
   async function createDashboard() {
     const json = await boardRequest("POST", { name: "New dashboard" });
     notifyDashboardsChanged();
-    if (json.board?.id) router.push(`/dashboards?board=${json.board.id}`);
+    if (json.board?.id) router.push(`/dashboards/${json.board.id}`);
   }
   async function deleteDashboard() {
     if (isDefault) return;
     await apiFetch(`/api/dashboard/boards?id=${encodeURIComponent(board)}`, { method: "DELETE" });
     notifyDashboardsChanged();
-    router.push("/dashboards");
+    // Lupakan sebelum pergi, kalau tidak `/dashboards` menuntun balik ke sini.
+    forgetLastBoard(board);
+    router.push("/dashboards/browse");
   }
   async function renameDashboard(name: string) {
     if (isDefault) return;
@@ -341,25 +350,13 @@ export function DashboardPage() {
     <div className={cn("flex flex-col gap-4", fullscreen && "fixed inset-0 z-40 overflow-auto bg-background p-4 sm:p-6")}>
       <PageHeader
         title={
-          <div className="flex items-center gap-2">
-            <BoardSwitcher
-              boards={boards}
-              activeId={board}
-              activeName={dashName}
-              onSelect={(id) => router.push(`/dashboards?board=${id}`)}
-              onCreate={() => void createDashboard()}
-            />
-            {isDefault ? (
-              <Tooltip>
-                <TooltipTrigger render={<span className="rounded-full border border-border px-2 py-0.5 text-[11px] font-medium text-muted-foreground" />}>
-                  Demo
-                </TooltipTrigger>
-                <TooltipContent className="max-w-64">
-                  The built-in dashboard. Its layout can be rearranged; for filters and sharing, create your own from the title menu.
-                </TooltipContent>
-              </Tooltip>
-            ) : null}
-          </div>
+          <BoardSwitcher
+            boards={boards}
+            activeId={board}
+            activeName={dashName}
+            onSelect={(id) => router.push(`/dashboards/${id}`)}
+            onCreate={() => void createDashboard()}
+          />
         }
         actions={
           <span data-print-hide className="contents">

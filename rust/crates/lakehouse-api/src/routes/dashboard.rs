@@ -414,32 +414,74 @@ pub async fn specs_delete(
 // ── /api/dashboard/boards ───────────────────────────────────────────────
 
 /// `GET /api/dashboard/boards` — every dashboard, `default` first.
+///
+/// Each board carries a `chartCount`. It is computed here rather than
+/// stored: the number of tiles on a board is derived from `console.bi_chart`
+/// and would go stale the moment a chart is added, moved between boards, or
+/// deleted. The built-in board's count comes from the compiled-in specs,
+/// which is where its tiles actually come from.
 pub async fn boards_list(State(state): State<AppState>) -> Response {
-    match store::list_boards(&state.clickhouse).await {
-        Ok(boards) => {
-            let mut out = vec![json!({ "id": "default", "name": "Main", "layout": {} })];
-            out.extend(
-                boards
-                    .iter()
-                    .map(|b| serde_json::to_value(b).unwrap_or_else(|_| json!({}))),
-            );
-            (StatusCode::OK, ApiJson(json!({ "boards": out }))).into_response()
-        }
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            ApiJson(json!({ "error": err.to_string() })),
-        )
-            .into_response(),
+    let ch = &state.clickhouse;
+    let (boards, stored) =
+        match tokio::try_join!(store::list_boards(ch), store::list_stored_charts(ch)) {
+            Ok(pair) => pair,
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    ApiJson(json!({ "error": err.to_string() })),
+                )
+                    .into_response();
+            }
+        };
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for c in &stored {
+        *counts.entry(c.board.as_str()).or_default() += 1;
     }
+    // Counted the same way the payload decides to serve them: an empty
+    // catalogue means this tenant's BUILTIN_DASHBOARD_SPEC never loaded, so
+    // the built-in board has no tiles to report.
+    let builtin_tiles = CHARTS.len() + KPIS.len();
+    let mut out = vec![json!({
+        "id": store::DEFAULT_BOARD_ID,
+        "name": "Main",
+        "layout": {},
+        "chartCount": builtin_tiles + counts.get(store::DEFAULT_BOARD_ID).copied().unwrap_or(0),
+        "builtin": true,
+    })];
+    out.extend(boards.iter().map(|b| {
+        let mut value = serde_json::to_value(b).unwrap_or_else(|_| json!({}));
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "chartCount".to_owned(),
+                json!(counts.get(b.id.as_str()).copied().unwrap_or(0)),
+            );
+            obj.insert("builtin".to_owned(), json!(false));
+        }
+        value
+    }));
+    (StatusCode::OK, ApiJson(json!({ "boards": out }))).into_response()
 }
 
-/// `{name?, duplicate?}` — the `POST /api/dashboard/boards` body shape.
+/// `{name?, description?, duplicate?}` — the `POST /api/dashboard/boards`
+/// body shape.
 #[derive(Debug, Deserialize, Default)]
 struct BoardCreateBody {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
     duplicate: Option<String>,
+}
+
+/// The signed-in caller's display name, for the `created_by` column.
+///
+/// Empty when nobody is attached — the AI tool surface creates boards with
+/// no principal, and an empty author is the honest answer there. This is
+/// recorded for display only; it grants nothing and is never read back as
+/// an authorization input.
+fn author_name(principal: Option<&Extension<Principal>>) -> String {
+    principal.map_or_else(String::new, |Extension(p)| p.display_name.clone())
 }
 
 /// `POST /api/dashboard/boards` — create a board, or duplicate one.
@@ -449,6 +491,7 @@ struct BoardCreateBody {
 /// 400 on an unparseable body or a `ClickHouse`/validation failure.
 pub async fn boards_create(
     State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
     body: Bytes,
 ) -> ApiResult<ApiJson<Value>> {
     let parsed: BoardCreateBody = if body.is_empty() {
@@ -457,10 +500,17 @@ pub async fn boards_create(
         serde_json::from_slice(&body)
             .map_err(|err| ApiError::BadRequest(format!("JSON is invalid: {err}")))?
     };
+    let author = author_name(principal.as_ref());
     let board = if let Some(dup) = parsed.duplicate {
-        store::duplicate_board(&state.clickhouse, &dup).await
+        store::duplicate_board(&state.clickhouse, &dup, &author).await
     } else {
-        store::create_board(&state.clickhouse, &parsed.name.unwrap_or_default()).await
+        store::create_board(
+            &state.clickhouse,
+            &parsed.name.unwrap_or_default(),
+            &parsed.description.unwrap_or_default(),
+            &author,
+        )
+        .await
     }
     .map_err(|err| ApiError::BadRequest(err.to_string()))?;
     Ok(ApiJson(json!({ "ok": true, "board": board })))
@@ -473,6 +523,8 @@ struct BoardEditBody {
     id: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
     #[serde(default)]
     layout: Option<LayoutMap>,
     #[serde(default)]
@@ -490,6 +542,7 @@ fn board_edit_allowed(body: &BoardEditBody) -> bool {
         None | Some("") => false,
         Some(store::DEFAULT_BOARD_ID) => {
             body.name.is_none()
+                && body.description.is_none()
                 && body.filters.is_none()
                 && body.public.is_none()
                 && body.embed.is_none()
@@ -528,6 +581,11 @@ pub async fn boards_update(
             .await
             .map_err(|err| ApiError::BadRequest(err.to_string()))?;
     }
+    if let Some(description) = &parsed.description {
+        store::describe_board(ch, &id, description)
+            .await
+            .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    }
     if let Some(layout) = &parsed.layout {
         store::update_board_layout(ch, &id, layout)
             .await
@@ -563,7 +621,7 @@ pub async fn boards_delete(
     Query(q): Query<IdQuery>,
 ) -> ApiResult<ApiJson<Value>> {
     let id = q.id.unwrap_or_default();
-    if id.is_empty() || id == "default" {
+    if id.is_empty() || id == store::DEFAULT_BOARD_ID {
         return Err(ApiError::BadRequest("invalid dashboard".to_owned()).into());
     }
     store::delete_board(&state.clickhouse, &id)

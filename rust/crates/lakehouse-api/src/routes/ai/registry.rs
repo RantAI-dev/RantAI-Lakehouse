@@ -191,7 +191,9 @@ fn update_chart_schema() -> Value {
 fn create_board_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_board",
         "description": "Buat board (dashboard bernama) baru. Kembalikan id-nya untuk dipakai di create_chart.",
-        "parameters": { "type": "object", "properties": { "name": { "type": "string" } },
+        "parameters": { "type": "object", "properties": {
+            "name": { "type": "string" },
+            "description": { "type": "string", "description": "Satu kalimat tujuan board, tampil di halaman daftar dashboard." } },
             "required": ["name"] } } })
 }
 

@@ -258,6 +258,7 @@ export function subNavItems(pathname: string): NavItem[] {
  */
 const SECONDARY_ROUTES: { title: string; href: string }[] = [
   { title: "Saved Queries", href: "/query-studio/saved" },
+  { title: "All Dashboards", href: "/dashboards/browse" },
 ]
 
 function bestMatch<T extends { href: string }>(
