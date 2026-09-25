@@ -86,7 +86,9 @@ export type NavGroup = {
  * Grouping rationale (the console is agentic-first, so it opens on the
  * AI-first Home and "Ask AI" sits right under it, not in a section):
  * - Home / Ask AI: where work starts — ask or instruct, see what needs you.
- * - Data: where data lives and how it is read (catalog, queries, boards).
+ * - Dashboards: always top level, right under Ask AI — it is where most
+ *   people spend their time, not a sub-page of Data.
+ * - Data: where data lives and how it is read (catalog, queries).
  * - Build: author and operate data movement and outbound exports.
  * - Governance: the rules applied to the data (policies, quality, lineage).
  * - Monitoring: whether the platform is healthy, and what happened — the
@@ -109,6 +111,11 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [{ title: "Ask AI", href: "/copilot", icon: Sparkles }],
   },
   {
+    label: "Dashboards",
+    icon: BarChart3,
+    items: [{ title: "Dashboards", href: "/dashboards", icon: BarChart3 }],
+  },
+  {
     label: "Data",
     icon: Database,
     defaultOpen: true,
@@ -117,7 +124,6 @@ export const NAV_GROUPS: NavGroup[] = [
       { title: "Data Explorer", href: "/data", icon: Database },
       { title: "Tables", href: "/lakehouse/tables", icon: Layers },
       { title: "Query Studio", href: "/query-studio", icon: SearchCode },
-      { title: "Dashboards", href: "/dashboards", icon: BarChart3 },
       { title: "Sources", href: "/connectors", icon: Plug },
     ],
   },
