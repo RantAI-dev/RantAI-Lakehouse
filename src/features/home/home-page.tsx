@@ -161,7 +161,7 @@ export function HomePage() {
                 key={s}
                 type="button"
                 onClick={() => ask(s)}
-                className="group/chip relative inline-flex items-center gap-1.5 overflow-hidden rounded-full border border-border/70 bg-background/60 px-3 py-1.5 text-xs text-muted-foreground backdrop-blur transition-all duration-200 hover:-translate-y-0.5 hover:bg-[color-mix(in_oklch,var(--brand-1),transparent_90%)] hover:border-[color-mix(in_oklch,var(--brand-1),transparent_40%)] hover:text-foreground hover:shadow-[0_6px_20px_-8px_var(--brand-1)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 active:translate-y-0 motion-reduce:transition-none motion-reduce:hover:translate-y-0"
+                className="group/chip relative inline-flex items-center gap-1.5 overflow-hidden rounded-full border border-border/70 bg-background/60 px-3 py-1.5 text-xs text-muted-foreground backdrop-blur transition-all duration-200 ease-out hover:-translate-y-1 hover:scale-[1.04] hover:border-[var(--brand-1)] hover:bg-[color-mix(in_oklch,var(--brand-1),transparent_82%)] hover:text-foreground hover:shadow-[0_10px_28px_-8px_var(--brand-1)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 active:translate-y-0 active:scale-100 motion-reduce:transition-none motion-reduce:hover:translate-y-0 motion-reduce:hover:scale-100"
               >
                 <Sheen className="group-hover/chip:translate-x-[400%]" />
                 <Sparkles className="size-3 text-[var(--brand-1)] transition-transform duration-500 group-hover/chip:rotate-[72deg] group-hover/chip:scale-125 motion-reduce:transition-none" />
@@ -234,10 +234,12 @@ export function HomePage() {
                 <li key={s.id}>
                   <Link
                     href={`/copilot?id=${encodeURIComponent(s.id)}`}
-                    className="group/row relative flex items-center gap-3 rounded-lg px-2 py-2 text-sm transition-colors hover:bg-muted/60"
+                    className="group/row relative flex items-center gap-3 rounded-xl px-2 py-2 text-sm ring-1 ring-transparent transition-all duration-200 hover:bg-[color-mix(in_oklch,var(--brand-1),transparent_88%)] hover:ring-[color-mix(in_oklch,var(--brand-1),transparent_55%)] hover:shadow-[0_8px_22px_-14px_var(--brand-1)]"
                   >
                     <span aria-hidden className="absolute top-1/2 left-0 h-0 w-0.5 -translate-y-1/2 rounded-full bg-[var(--brand-1)] transition-all duration-300 group-hover/row:h-5" />
-                    <MessageSquare className="size-4 shrink-0 text-muted-foreground transition-all duration-300 group-hover/row:translate-x-1 group-hover/row:text-[var(--brand-1)]" />
+                    <span className="grid size-7 shrink-0 place-items-center rounded-lg bg-muted/60 text-muted-foreground transition-all duration-300 group-hover/row:translate-x-1 group-hover/row:-rotate-6 group-hover/row:bg-[var(--brand-1)] group-hover/row:text-[var(--brand-2)] group-hover/row:shadow-[0_6px_16px_-6px_var(--brand-1)] motion-reduce:group-hover/row:rotate-0">
+                      <MessageSquare className="size-3.5" />
+                    </span>
                     <span className="min-w-0 flex-1 truncate transition-transform duration-300 group-hover/row:translate-x-1">
                       {s.title || "Untitled conversation"}
                     </span>
@@ -643,7 +645,7 @@ function AttentionList({
         {items.slice(0, 6).map((it) => (
           <li
             key={it.key}
-            className="group/row relative flex items-center gap-3 rounded-lg px-2 py-2 transition-colors hover:bg-destructive/5"
+            className="group/row relative flex items-center gap-3 rounded-xl px-2 py-2 ring-1 ring-transparent transition-all duration-200 hover:bg-destructive/10 hover:ring-destructive/30 hover:shadow-[0_8px_22px_-14px_var(--destructive)]"
           >
             <span aria-hidden className="absolute top-1/2 left-0 h-0 w-0.5 -translate-y-1/2 rounded-full bg-destructive transition-all duration-300 group-hover/row:h-5" />
             <span className="relative flex size-2.5 shrink-0">
