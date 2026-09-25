@@ -10,6 +10,11 @@ test("plainPreview membuang markdown dan memotong dengan elipsis", () => {
   assert.ok(cut.endsWith("…"))
 })
 
+test("plainPreview keeps an unverified number but drops its citation-marker span", () => {
+  const md = 'I need two things: <span data-unverified="true">1</span>. What to ingest'
+  assert.equal(plainPreview(md), "I need two things: 1. What to ingest")
+})
+
 test("sessionGroup mengelompokkan per hari kalender lokal", () => {
   const now = new Date(2026, 8, 19, 9, 0)
   const at = (d: number, h = 12) => new Date(2026, 8, d, h).toISOString()

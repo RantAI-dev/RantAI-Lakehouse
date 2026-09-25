@@ -3,6 +3,7 @@
 import * as React from "react";
 import { usePathname } from "next/navigation";
 import { Sparkles, Plus, ChevronDown, PanelRight } from "lucide-react";
+import { SuggestionButton } from "@/features/copilot/suggestion-button";
 import { useCopilot } from "./use-copilot";
 import { ChatMessages } from "./chat-messages";
 import { ChatComposer } from "./chat-composer";
@@ -89,14 +90,7 @@ export function CopilotDock() {
                 </div>
                 <div className="grid gap-1.5 sm:grid-cols-2">
                   {c.pageContext.suggest[c.mode].map((s) => (
-                    <button
-                      key={s}
-                      onClick={() => c.send(s)}
-                      disabled={c.busy}
-                      className="rounded-lg border border-border/70 bg-muted/20 px-3 py-2 text-left text-xs text-foreground transition-colors hover:bg-muted hover:border-primary/40 disabled:opacity-50"
-                    >
-                      {s}
-                    </button>
+                    <SuggestionButton key={s} text={s} onClick={() => c.send(s)} disabled={c.busy} />
                   ))}
                 </div>
               </div>

@@ -23,6 +23,7 @@ import {
   Sparkles,
 } from "lucide-react"
 
+import { Sheen } from "@/components/ui/sheen"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useAuth } from "@/features/auth/auth-provider"
 import { useCopilot, type Mode } from "@/features/copilot/use-copilot"
@@ -420,24 +421,6 @@ function PromptBox({ onAsk, reduce }: { onAsk: (q: string) => void; reduce: bool
         </div>
       </div>
     </form>
-  )
-}
-
-/**
- * A light band that sweeps across its parent once per hover. The parent
- * must be `relative overflow-hidden` and name its group; the caller passes
- * the matching `group-hover/<name>:translate-x-full` class, since Tailwind
- * only sees literal class names.
- */
-function Sheen({ className }: { className: string }) {
-  return (
-    <span
-      aria-hidden
-      className={cn(
-        "pointer-events-none absolute inset-y-0 -left-1/2 w-1/2 -translate-x-full skew-x-[-20deg] bg-gradient-to-r from-transparent via-white/25 to-transparent transition-transform duration-700 ease-out motion-reduce:hidden dark:via-white/10",
-        className
-      )}
-    />
   )
 }
 

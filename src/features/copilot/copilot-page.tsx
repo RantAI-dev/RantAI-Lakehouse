@@ -3,6 +3,7 @@
 import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Sparkles } from "lucide-react";
+import { SuggestionButton } from "@/features/copilot/suggestion-button";
 import { useCopilot } from "./use-copilot";
 import { ChatMessages } from "./chat-messages";
 import { ChatComposer } from "./chat-composer";
@@ -87,14 +88,7 @@ export function CopilotPage() {
               <p className="mt-1.5 max-w-md text-sm text-muted-foreground">{c.pageContext.hint}</p>
               <div className="mt-5 flex flex-wrap justify-center gap-2">
                 {c.pageContext.suggest[c.mode].map((s) => (
-                  <button
-                    key={s}
-                    onClick={() => c.send(s)}
-                    disabled={c.busy}
-                    className="inline-flex items-center gap-2 rounded-full border border-border bg-background px-4 py-2 text-sm font-medium text-foreground/80 transition-all hover:border-primary/40 hover:bg-muted/50 hover:text-foreground disabled:opacity-50"
-                  >
-                    {s}
-                  </button>
+                  <SuggestionButton key={s} text={s} variant="pill" onClick={() => c.send(s)} disabled={c.busy} />
                 ))}
               </div>
             </div>

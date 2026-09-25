@@ -68,12 +68,17 @@ export function RecentSessionsMenuContent({
       {sessions.length > 0 ? (
         <DropdownMenuGroup className="max-h-72 overflow-y-auto">
           {sessions.slice(0, limit).map((s) => (
-            <DropdownMenuItem key={s.id} onClick={() => onSelect(s.id)} className="items-start gap-2 py-2">
+            <DropdownMenuItem key={s.id} onClick={() => onSelect(s.id)} className="group/hist relative items-start gap-2 py-2">
+              {/* Highlight (hover or arrow keys): accent bar and a small slide. */}
+              <span
+                aria-hidden
+                className="absolute top-1/2 left-0 h-0 w-0.5 -translate-y-1/2 rounded-full bg-[var(--brand-1)] transition-all duration-200 group-data-highlighted/hist:h-5"
+              />
               <Check
                 className={cn("mt-0.5 size-3.5 shrink-0", s.id === activeId ? "text-primary" : "opacity-0")}
                 aria-hidden
               />
-              <span className="flex min-w-0 flex-1 flex-col">
+              <span className="flex min-w-0 flex-1 flex-col transition-transform duration-200 group-data-highlighted/hist:translate-x-0.5 motion-reduce:transition-none">
                 <span className="truncate text-xs font-medium text-foreground">{s.title}</span>
                 <span className="text-[11px] text-muted-foreground">
                   {s.mode === "build" ? "Build" : "Ask"}
