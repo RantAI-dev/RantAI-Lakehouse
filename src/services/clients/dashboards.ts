@@ -1,4 +1,5 @@
 import type {
+  DashboardFolder,
   DashboardService,
   SaveSqlSourceInput,
   SqlSource,
@@ -78,6 +79,49 @@ export const clickhouseDashboardService: DashboardService = {
       "/api/dashboard/sources/preview",
       { method: "POST", headers: JSON_HEADERS, body: JSON.stringify({ sql }), signal },
       "SQL source preview failed"
+    )
+  },
+  async listFolders(signal) {
+    const json = await request<{ folders: DashboardFolder[] }>(
+      "/api/dashboard/folders",
+      { cache: "no-store", signal },
+      "Folders could not be loaded"
+    )
+    return json.folders
+  },
+  async createFolder(input, signal) {
+    const json = await request<{ ok: true; folder: DashboardFolder }>(
+      "/api/dashboard/folders",
+      { method: "POST", headers: JSON_HEADERS, body: JSON.stringify(input), signal },
+      "Folder could not be created"
+    )
+    return json.folder
+  },
+  async updateFolder(input, signal) {
+    const json = await request<{ ok: true; folder: DashboardFolder }>(
+      "/api/dashboard/folders",
+      { method: "PUT", headers: JSON_HEADERS, body: JSON.stringify(input), signal },
+      "Folder could not be saved"
+    )
+    return json.folder
+  },
+  async deleteFolder(id, signal) {
+    await request<{ ok: true }>(
+      `/api/dashboard/folders?id=${encodeURIComponent(id)}`,
+      { method: "DELETE", signal },
+      "Folder could not be deleted"
+    )
+  },
+  async moveBoard(boardId, folderId, signal) {
+    await request<{ ok: true }>(
+      "/api/dashboard/boards",
+      {
+        method: "PUT",
+        headers: JSON_HEADERS,
+        body: JSON.stringify({ id: boardId, folderId }),
+        signal,
+      },
+      "Dashboard could not be moved"
     )
   },
 }

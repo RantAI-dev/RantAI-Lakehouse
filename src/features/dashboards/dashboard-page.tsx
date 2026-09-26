@@ -13,6 +13,9 @@ import { cn } from "@/lib/utils";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import type { LayoutMap, FilterDef } from "@/services/clients/bi-store";
 import { useCopilot } from "@/features/copilot/use-copilot";
+import { useAuth } from "@/features/auth/auth-provider";
+import { useService } from "@/hooks/use-service";
+import { dashboardService } from "@/services";
 import { apiFetch } from "@/services/http";
 import { useAutoRefresh } from "./auto-refresh";
 import { BoardSwitcher } from "./board-switcher";
@@ -23,12 +26,13 @@ import { notifyDashboardsChanged, useDashboardsChanged } from "./dashboard-event
 import { DashboardFilters } from "./dashboard-filters";
 import { DashboardGrid, type GridItem, type TileMenuItem } from "./dashboard-grid";
 import { DrillMenu, RecordsDialog, fetchRecords, type DrillTarget, type RecordsState } from "./drill";
+import { ManageFoldersDialog, MoveBoardDialog } from "./folder-dialogs";
 import { ShareDialog } from "./share-dialog";
 import { TileBody } from "./tile-body";
 import { TileDataDialog, TileExpandDialog, downloadRowsCsv, hasRows, type Cell } from "./tile-dialogs";
 
 type KpiMeta = { id: string; title: string; caption?: string; format: string };
-type BoardOpt = { id: string; name: string };
+type BoardOpt = { id: string; name: string; folderId?: string | null };
 type ChartCard = ChartRenderSpec & { board?: string; def?: ChartDef };
 type Payload = {
   board: string; years: number[]; layout: LayoutMap; filters: FilterDef[]; filterColumns: string[];
@@ -83,6 +87,14 @@ export function DashboardPage() {
   const [removing, setRemoving] = React.useState<{ id: string; title: string } | null>(null);
   const [removeBusy, setRemoveBusy] = React.useState(false);
   const [renameOpen, setRenameOpen] = React.useState(false);
+  const [foldersOpen, setFoldersOpen] = React.useState(false);
+  const [moveOpen, setMoveOpen] = React.useState(false);
+  // Folders are listed to everyone who can see dashboards; filing needs
+  // dashboard:write, which the API enforces (policy.rs).
+  const { hasPermission } = useAuth();
+  const canFile = hasPermission("dashboard:write");
+  const foldersState = useService((signal) => dashboardService.listFolders(signal), []);
+  const folders = foldersState.data ?? [];
   const [shareOpen, setShareOpen] = React.useState(false);
   const [newChartOpen, setNewChartOpen] = React.useState(false);
   const [fullscreen, setFullscreen] = React.useState(false);
@@ -133,8 +145,10 @@ export function DashboardPage() {
     adoptingRef.current = true; filtersRef.current = []; setFilters([]); setEdit(false);
   }, [board]);
   React.useEffect(() => { void load(); }, [load]);
-  // Charts added or removed elsewhere (Copilot, board menus).
-  useDashboardsChanged(React.useCallback(() => { void load(); }, [load]));
+  // Charts added or removed elsewhere (Copilot, board menus); folders are
+  // reloaded too, since the same event covers filing a dashboard.
+  const reloadFolders = foldersState.reload;
+  useDashboardsChanged(React.useCallback(() => { void load(); reloadFolders(); }, [load, reloadFolders]));
   // Periodic refresh for presenting; pauses while the tab is hidden.
   useAutoRefresh(Number(autoSec) * 1000, load);
   // Esc exits fullscreen.
@@ -348,6 +362,8 @@ export function DashboardPage() {
               activeName={dashName}
               onSelect={(id) => router.push(`/dashboards?board=${id}`)}
               onCreate={() => void createDashboard()}
+              folders={folders}
+              onManageFolders={canFile ? () => setFoldersOpen(true) : undefined}
             />
             {isDefault ? (
               <Tooltip>
@@ -375,6 +391,7 @@ export function DashboardPage() {
               onToggleFullscreen={() => setFullscreen((f) => !f)}
               onAutoSec={setAutoSec}
               onRename={() => setRenameOpen(true)}
+              onMove={canFile ? () => setMoveOpen(true) : undefined}
               onShare={() => setShareOpen(true)}
               onExportPdf={exportPdf}
               onDuplicate={() => void duplicateDashboard()}
@@ -504,6 +521,24 @@ export function DashboardPage() {
       {!isDefault ? <ShareDialog board={board} dashName={dashName} open={shareOpen} onOpenChange={setShareOpen} /> : null}
       {renameOpen ? (
         <RenameDashboardDialog open={renameOpen} onOpenChange={setRenameOpen} currentName={dashName} onSave={(n) => void renameDashboard(n)} />
+      ) : null}
+      {canFile ? (
+        <ManageFoldersDialog
+          open={foldersOpen}
+          onOpenChange={setFoldersOpen}
+          folders={folders}
+          onChanged={notifyDashboardsChanged}
+        />
+      ) : null}
+      {canFile && !isDefault ? (
+        <MoveBoardDialog
+          open={moveOpen}
+          onOpenChange={setMoveOpen}
+          folders={folders}
+          boardId={board}
+          currentFolderId={boards.find((b) => b.id === board)?.folderId ?? ""}
+          onMoved={notifyDashboardsChanged}
+        />
       ) : null}
     </div>
   );

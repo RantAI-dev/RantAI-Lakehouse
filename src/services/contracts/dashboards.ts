@@ -42,6 +42,19 @@ export type SqlSourcePreview = {
   rows: Record<string, unknown>[]
 }
 
+/**
+ * A dashboard folder — `lakehouse_bi::folders::Folder`. The API returns a
+ * flat list; `lib/folder-tree.ts` builds the tree from `parentId`.
+ */
+export type DashboardFolder = {
+  id: string
+  name: string
+  /** Empty string = root. */
+  parentId: string
+  createdBy: string
+  updatedAt?: string
+}
+
 export interface DashboardService {
   listSqlSources(signal?: AbortSignal): Promise<SqlSource[]>
   createSqlSource(input: SaveSqlSourceInput, signal?: AbortSignal): Promise<SqlSource>
@@ -51,4 +64,14 @@ export interface DashboardService {
   ): Promise<SqlSource>
   deleteSqlSource(id: string, signal?: AbortSignal): Promise<void>
   previewSqlSource(sql: string, signal?: AbortSignal): Promise<SqlSourcePreview>
+  listFolders(signal?: AbortSignal): Promise<DashboardFolder[]>
+  createFolder(input: { name: string; parentId?: string }, signal?: AbortSignal): Promise<DashboardFolder>
+  updateFolder(
+    input: { id: string; name?: string; parentId?: string },
+    signal?: AbortSignal
+  ): Promise<DashboardFolder>
+  /** 409 (as `invalid_request`) while the folder still holds anything. */
+  deleteFolder(id: string, signal?: AbortSignal): Promise<void>
+  /** `folderId` "" = root. */
+  moveBoard(boardId: string, folderId: string, signal?: AbortSignal): Promise<void>
 }

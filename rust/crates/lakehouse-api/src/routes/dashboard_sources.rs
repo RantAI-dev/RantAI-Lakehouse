@@ -182,6 +182,8 @@ async fn save(
     id: String,
 ) -> Result<SqlSource, ApiError> {
     let title = clean_title(&body.title)?;
+    let folder_id = body.folder_id.unwrap_or_default().trim().to_owned();
+    crate::routes::dashboard_folders::ensure_folder_exists(&state.clickhouse, &folder_id).await?;
     let (normalized, rewritten) = checked_and_rewritten(state, principal, &body.sql).await?;
     let columns = probe_columns(&state.clickhouse, &rewritten).await?;
     let source = SqlSource {
@@ -189,7 +191,7 @@ async fn save(
         title,
         sql: normalized,
         columns,
-        folder_id: body.folder_id.unwrap_or_default().trim().to_owned(),
+        folder_id,
         created_by: principal.id.uuid().to_string(),
         updated_at: None,
     };

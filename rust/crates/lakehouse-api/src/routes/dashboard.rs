@@ -208,7 +208,7 @@ async fn get_body(
 
     let mut boards_out = vec![json!({ "id": "default", "name": "Main" })];
     for b in &boards {
-        boards_out.push(json!({ "id": b.id, "name": b.name }));
+        boards_out.push(json!({ "id": b.id, "name": b.name, "folderId": b.folder_id }));
     }
 
     let kpis_out: Vec<Value> = if on_default {
@@ -447,6 +447,9 @@ struct BoardCreateBody {
     name: Option<String>,
     #[serde(default)]
     duplicate: Option<String>,
+    /// Folder to create the board in (`""`/absent = root).
+    #[serde(default, rename = "folderId")]
+    folder_id: Option<String>,
 }
 
 /// `POST /api/dashboard/boards` — create a board, or duplicate one.
@@ -464,12 +467,21 @@ pub async fn boards_create(
         serde_json::from_slice(&body)
             .map_err(|err| ApiError::BadRequest(format!("JSON is invalid: {err}")))?
     };
-    let board = if let Some(dup) = parsed.duplicate {
+    let folder_id = parsed.folder_id.unwrap_or_default().trim().to_owned();
+    // Checked first, so an unknown folder creates nothing.
+    crate::routes::dashboard_folders::ensure_folder_exists(&state.clickhouse, &folder_id).await?;
+    let mut board = if let Some(dup) = parsed.duplicate {
         store::duplicate_board(&state.clickhouse, &dup).await
     } else {
         store::create_board(&state.clickhouse, &parsed.name.unwrap_or_default()).await
     }
     .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    if !folder_id.is_empty() {
+        store::move_board(&state.clickhouse, &board.id, &folder_id)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
+        board.folder_id = Some(folder_id);
+    }
     Ok(ApiJson(json!({ "ok": true, "board": board })))
 }
 
@@ -488,6 +500,9 @@ struct BoardEditBody {
     public: Option<bool>,
     #[serde(default)]
     embed: Option<bool>,
+    /// Move the board to this folder (`""` = root).
+    #[serde(default, rename = "folderId")]
+    folder_id: Option<String>,
 }
 
 /// Whether a `PUT /api/dashboard/boards` body may be applied: it names a
@@ -500,6 +515,7 @@ fn board_edit_allowed(body: &BoardEditBody) -> bool {
                 && body.filters.is_none()
                 && body.public.is_none()
                 && body.embed.is_none()
+                && body.folder_id.is_none()
         }
         Some(_) => true,
     }
@@ -544,6 +560,13 @@ pub async fn boards_update(
         store::update_board_filters(ch, &id, filters)
             .await
             .map_err(|err| ApiError::BadRequest(err.to_string()))?;
+    }
+    if let Some(folder_id) = &parsed.folder_id {
+        let folder_id = folder_id.trim();
+        crate::routes::dashboard_folders::ensure_folder_exists(ch, folder_id).await?;
+        store::move_board(ch, &id, folder_id)
+            .await
+            .map_err(|err| crate::routes::dashboard_folders::classify_bi_error(&err))?;
     }
     if let Some(public) = parsed.public {
         let token = store::set_board_public(ch, &id, public)
@@ -1279,6 +1302,13 @@ mod tests {
             r#"{"id":"b_1","name":"x","public":true}"#
         )));
         assert!(!board_edit_allowed(&body(r#"{"layout":{}}"#)));
+        // The built-in board lives outside the folder tree.
+        assert!(!board_edit_allowed(&body(
+            r#"{"id":"default","folderId":"f_1"}"#
+        )));
+        assert!(board_edit_allowed(&body(
+            r#"{"id":"b_1","folderId":"f_1"}"#
+        )));
     }
 
     #[test]

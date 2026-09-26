@@ -274,6 +274,10 @@ pub struct Board {
     /// Whether signed (JWT) embedding is enabled.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub embed_enabled: Option<bool>,
+    /// Dashboard folder id (`crate::folders`); empty = root. `None` only on
+    /// a board value built in code before it is saved.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub folder_id: Option<String>,
 }
 
 /// A tile's position on the 12-column grid canvas.
@@ -424,6 +428,22 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
+    // Dashboard folders (`crate::folders`): boards and SQL sources carry a
+    // `folder_id`, `''` meaning the root.
+    ch.exec(
+        "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS folder_id String DEFAULT ''",
+        None,
+    )
+    .await?;
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_folder (\n\
+           id String, name String, parent_id String DEFAULT '',\n\
+           created_by String DEFAULT '', created_at DateTime DEFAULT now(),\n\
+           is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id",
+        None,
+    )
+    .await?;
     // Dashboard SQL sources (`crate::sources`). Same versioned-insert shape
     // as the two tables above: every save is an INSERT, `created_at` is the
     // version, a delete is an `is_deleted = 1` tombstone.
@@ -449,7 +469,7 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
 /// second, user-made dashboard.
 pub const DEFAULT_BOARD_ID: &str = "default";
 
-const BOARD_COLS: &str = "id, name, layout_json, filters_json, public_token, embed_enabled, toString(created_at) AS created_at";
+const BOARD_COLS: &str = "id, name, layout_json, filters_json, public_token, embed_enabled, folder_id, toString(created_at) AS created_at";
 
 fn parse_layout(s: &str) -> LayoutMap {
     if s.is_empty() {
@@ -487,6 +507,7 @@ fn row_to_board(row: &serde_json::Map<String, Value>) -> Board {
         created_at: Some(row_str(row, "created_at").to_owned()),
         public_token: Some(public_token.to_owned()),
         embed_enabled: Some(embed_enabled == 1),
+        folder_id: Some(row_str(row, "folder_id").to_owned()),
     }
 }
 
@@ -556,6 +577,7 @@ pub async fn create_board(ch: &ChClient, name: &str) -> Result<Board, BiError> {
         created_at: None,
         public_token: None,
         embed_enabled: None,
+        folder_id: None,
     })
 }
 
@@ -568,18 +590,20 @@ async fn upsert_board(
     filters: &[FilterDef],
     public_token: &str,
     embed_enabled: bool,
+    folder_id: &str,
 ) -> Result<(), ChError> {
     let layout_json = serde_json::to_string(layout).unwrap_or_else(|_| "{}".to_owned());
     let filters_json = serde_json::to_string(filters).unwrap_or_else(|_| "[]".to_owned());
     let sql = format!(
-        "INSERT INTO console.bi_board (id, name, layout_json, filters_json, public_token, embed_enabled) VALUES \
-         ({}, {}, {}, {}, {}, {})",
+        "INSERT INTO console.bi_board (id, name, layout_json, filters_json, public_token, embed_enabled, folder_id) VALUES \
+         ({}, {}, {}, {}, {}, {}, {})",
         SqlLiteral::from(id),
         SqlLiteral::from(name),
         SqlLiteral::from(layout_json),
         SqlLiteral::from(filters_json),
         SqlLiteral::from(public_token),
         i32::from(embed_enabled),
+        SqlLiteral::from(folder_id),
     );
     ch.exec(&sql, None).await
 }
@@ -608,6 +632,10 @@ async fn save_board_patch(
     let embed_enabled = patch
         .embed_enabled
         .unwrap_or_else(|| board.embed_enabled.unwrap_or(false));
+    // Every save is a full-row INSERT, so a patch that does not touch the
+    // folder must carry the current one forward or the board would fall
+    // back to the root.
+    let folder_id = patch.folder_id.or(board.folder_id.as_deref()).unwrap_or("");
     upsert_board(
         ch,
         &board.id,
@@ -616,6 +644,7 @@ async fn save_board_patch(
         filters,
         public_token,
         embed_enabled,
+        folder_id,
     )
     .await
 }
@@ -629,6 +658,7 @@ struct BoardPatch<'a> {
     filters: Option<&'a [FilterDef]>,
     public_token: Option<&'a str>,
     embed_enabled: Option<bool>,
+    folder_id: Option<&'a str>,
 }
 
 /// Rename a board. No-op if the board does not exist (matches the TS `if
@@ -658,6 +688,30 @@ pub async fn rename_board(ch: &ChClient, id: &str, name: &str) -> Result<(), BiE
     Ok(())
 }
 
+/// Move a board into folder `folder_id` (`""` = root). The caller has
+/// already checked that the folder exists.
+///
+/// # Errors
+///
+/// Returns [`BiError::Validation`] if the board does not exist, or
+/// [`BiError::Clickhouse`] on a `ClickHouse` failure.
+pub async fn move_board(ch: &ChClient, id: &str, folder_id: &str) -> Result<(), BiError> {
+    ensure_bi_table(ch).await?;
+    let board = get_board(ch, id)
+        .await?
+        .ok_or_else(|| BiError::Validation("dashboard not found.".to_owned()))?;
+    save_board_patch(
+        ch,
+        &board,
+        BoardPatch {
+            folder_id: Some(folder_id),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 /// Update a board's tile layout, creating a bare `Board { id, name:
 /// "Dashboard" }` shell if it does not exist yet. Ports `updateBoardLayout`.
 ///
@@ -678,6 +732,7 @@ pub async fn update_board_layout(
         created_at: None,
         public_token: None,
         embed_enabled: None,
+        folder_id: None,
     });
     save_board_patch(
         ch,
@@ -710,6 +765,7 @@ pub async fn update_board_filters(
         created_at: None,
         public_token: None,
         embed_enabled: None,
+        folder_id: None,
     });
     save_board_patch(
         ch,
@@ -855,8 +911,14 @@ pub async fn duplicate_board(ch: &ChClient, id: &str) -> Result<Board, BiError> 
         }
     }
     update_board_layout(ch, &new_board.id, &new_layout).await?;
+    // The copy lands next to the original, not at the root.
+    let folder_id = src.folder_id.clone().unwrap_or_default();
+    if !folder_id.is_empty() {
+        move_board(ch, &new_board.id, &folder_id).await?;
+    }
     Ok(Board {
         layout: Some(new_layout),
+        folder_id: Some(folder_id),
         ..new_board
     })
 }
@@ -1828,12 +1890,12 @@ mod tests {
         let ch = client(&server.uri());
         ensure_bi_table(&ch).await.unwrap();
         let first_call_requests = server.received_requests().await.unwrap().len();
-        // 9 since `console.bi_source` (dashboard SQL sources) joined the
-        // bootstrap; the property under test — every later call is free —
-        // is unchanged.
+        // 11 since dashboard SQL sources (`bi_source`) and folders
+        // (`bi_folder` + `bi_board.folder_id`) joined the bootstrap; the
+        // property under test — every later call is free — is unchanged.
         assert_eq!(
-            first_call_requests, 9,
-            "first call should issue all 9 DDL statements"
+            first_call_requests, 11,
+            "first call should issue all 11 DDL statements"
         );
 
         ensure_bi_table(&ch).await.unwrap();
@@ -1956,11 +2018,13 @@ mod tests {
             created_at: Some("2026-01-01 00:00:00".to_owned()),
             public_token: Some("p_abc".to_owned()),
             embed_enabled: Some(true),
+            folder_id: Some("f_1".to_owned()),
         };
         let json = serde_json::to_value(&board).unwrap();
         assert_eq!(json.get("createdAt").unwrap(), "2026-01-01 00:00:00");
         assert_eq!(json.get("publicToken").unwrap(), "p_abc");
         assert_eq!(json.get("embedEnabled").unwrap(), true);
+        assert_eq!(json.get("folderId").unwrap(), "f_1");
         assert!(json.get("created_at").is_none());
         assert!(json.get("public_token").is_none());
         assert!(json.get("embed_enabled").is_none());

@@ -1,6 +1,6 @@
 # Dashboard: SQL sources, folders, page-aware Copilot — plan
 
-Status: **in progress** on `feat/uiux` — step 0 and SQL sources backend done.
+Status: **in progress** on `feat/uiux` — step 0, SQL sources (backend, console, Copilot) and folders stage 1 done; page-aware Copilot next.
 Scope decided 2026-09-26: SQL sources (custom SQL + multi-mart charts),
 dashboard folders (stage 1), page-aware Copilot (text context). Out of
 scope this round: new chart kinds, vision, folder permissions, revision
