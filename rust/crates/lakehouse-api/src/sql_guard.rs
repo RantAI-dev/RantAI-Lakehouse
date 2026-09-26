@@ -232,3 +232,202 @@ fn contains_trino_denied_keyword(sql: &str) -> bool {
     let chars: Vec<char> = lower.chars().collect();
     TRINO_DENIED.iter().any(|kw| word_occurs(&chars, kw))
 }
+
+/// Longest SQL source text accepted. Generous for a hand-written join; the
+/// bound only keeps a pasted dump from being stored and re-sent per tile.
+const SQL_SOURCE_MAX_CHARS: usize = 20_000;
+
+/// Why a statement cannot become a dashboard SQL source. Every message is
+/// fixed text written here, never parser or engine output, so it is safe to
+/// return to the caller as-is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqlSourceRefusal {
+    /// Blank after trimming.
+    Empty,
+    /// Over [`SQL_SOURCE_MAX_CHARS`].
+    TooLong,
+    /// Not a `SELECT`/`WITH` query, or [`is_read_only`] refused it.
+    NotASelect,
+    /// More than one statement.
+    MultipleStatements,
+    /// A `SETTINGS`/`FORMAT` clause, which would break the wrapper the
+    /// builder puts around the source (its own `SETTINGS` must be last).
+    SettingsOrFormat,
+    /// `sqlparser` could not parse it, so the tables it reads are unknown.
+    Unparseable,
+    /// It reads a table outside `serving` (including `console.*` and
+    /// `system.*`), or a bare table name.
+    OutsideServing,
+}
+
+impl SqlSourceRefusal {
+    /// The caller-facing message.
+    #[must_use]
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::Empty => "SQL is required.",
+            Self::TooLong => "SQL source is too long (max 20000 characters).",
+            Self::NotASelect => "a SQL source must be a single read-only SELECT or WITH query.",
+            Self::MultipleStatements => "a SQL source must be a single statement.",
+            Self::SettingsOrFormat => {
+                "remove the SETTINGS/FORMAT clause; dashboard limits are applied automatically."
+            }
+            Self::Unparseable => "the SQL could not be parsed, so the tables it reads are unknown.",
+            Self::OutsideServing => {
+                "a SQL source may only read Gold tables, written as serving.<table>."
+            }
+        }
+    }
+}
+
+/// Decide whether `sql` may be stored as a dashboard SQL source, returning
+/// the normalized text (trimmed, one trailing `;` dropped) when it may.
+///
+/// Fail closed at every step (AGENTS.md principle 3): a statement this
+/// function cannot fully account for is refused, not passed along. It is
+/// the lexical gate only; table functions, sensitive `system.*` reads and
+/// governed tables are then handled by the same
+/// `policy_engine::rewrite_sql_for_roles` pass every execution goes through,
+/// which runs before the source is probed or stored.
+///
+/// # Errors
+///
+/// The [`SqlSourceRefusal`] naming the first rule `sql` breaks.
+pub(crate) fn check_sql_source(sql: &str) -> Result<String, SqlSourceRefusal> {
+    let trimmed = sql.trim();
+    let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
+    if trimmed.is_empty() {
+        return Err(SqlSourceRefusal::Empty);
+    }
+    if trimmed.chars().count() > SQL_SOURCE_MAX_CHARS {
+        return Err(SqlSourceRefusal::TooLong);
+    }
+    let code = strip_sql_noise(trimmed);
+    let lower = code.trim_start().to_ascii_lowercase();
+    let starts_select = ["select", "with"].iter().any(|kw| {
+        lower
+            .strip_prefix(kw)
+            .is_some_and(|rest| rest.chars().next().is_none_or(|c| !is_word_char(c)))
+    });
+    // `is_read_only` also admits SHOW/DESCRIBE/EXPLAIN, which cannot be a
+    // derived table, hence the narrower first-word check.
+    if !starts_select || !is_read_only(trimmed) {
+        return Err(SqlSourceRefusal::NotASelect);
+    }
+    if code.contains(';') {
+        return Err(SqlSourceRefusal::MultipleStatements);
+    }
+    let chars: Vec<char> = lower.chars().collect();
+    if word_occurs(&chars, "settings") || word_occurs(&chars, "format") {
+        return Err(SqlSourceRefusal::SettingsOrFormat);
+    }
+    let tables =
+        crate::sql_rewrite::referenced_tables(trimmed, &sqlparser::dialect::ClickHouseDialect {})
+            .ok_or(SqlSourceRefusal::Unparseable)?;
+    let all_serving = tables.iter().all(|t| {
+        t.split_once('.')
+            .is_some_and(|(schema, table)| schema == "serving" && !table.is_empty())
+    });
+    if !all_serving {
+        return Err(SqlSourceRefusal::OutsideServing);
+    }
+    Ok(trimmed.to_owned())
+}
+
+#[cfg(test)]
+mod sql_source_rules {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::{SqlSourceRefusal, check_sql_source};
+
+    #[test]
+    fn a_join_across_two_serving_marts_is_accepted_and_normalized() {
+        let sql = "  SELECT g.material_group, t.material_type\n\
+                   FROM serving.mart_material_by_group AS g\n\
+                   JOIN serving.mart_material_by_type AS t USING (material_group);  ";
+        let ok = check_sql_source(sql).expect("a serving join is a valid source");
+        assert!(ok.starts_with("SELECT"));
+        assert!(!ok.ends_with(';'));
+    }
+
+    #[test]
+    fn a_cte_over_serving_is_accepted() {
+        let sql = "WITH x AS (SELECT * FROM serving.mart_a) SELECT * FROM x";
+        assert!(check_sql_source(sql).is_ok());
+    }
+
+    #[test]
+    fn a_trailing_comment_is_allowed() {
+        assert!(check_sql_source("SELECT * FROM serving.mart_a -- note").is_ok());
+    }
+
+    #[test]
+    fn tables_outside_serving_are_refused() {
+        for sql in [
+            "SELECT * FROM console.bi_chart",
+            "SELECT * FROM system.users",
+            "SELECT * FROM silver.customers",
+            "SELECT * FROM mart_a",
+            "SELECT * FROM serving.mart_a JOIN console.bi_board USING (id)",
+            "SELECT (SELECT count() FROM system.tables) AS n FROM serving.mart_a",
+        ] {
+            assert_eq!(
+                check_sql_source(sql),
+                Err(SqlSourceRefusal::OutsideServing),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn writes_and_non_select_statements_are_refused() {
+        for sql in [
+            "INSERT INTO serving.mart_a VALUES (1)",
+            "DROP TABLE serving.mart_a",
+            "SHOW TABLES",
+            "DESCRIBE serving.mart_a",
+            "EXPLAIN SELECT 1",
+        ] {
+            assert_eq!(
+                check_sql_source(sql),
+                Err(SqlSourceRefusal::NotASelect),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_statement_is_refused() {
+        let err = check_sql_source("SELECT 1 FROM serving.a; SELECT 2 FROM serving.b").unwrap_err();
+        assert_eq!(err, SqlSourceRefusal::MultipleStatements);
+    }
+
+    #[test]
+    fn settings_and_format_clauses_are_refused() {
+        for sql in [
+            "SELECT * FROM serving.a SETTINGS max_threads = 1",
+            "SELECT * FROM serving.a FORMAT JSON",
+        ] {
+            assert_eq!(
+                check_sql_source(sql),
+                Err(SqlSourceRefusal::SettingsOrFormat),
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_and_oversized_text_is_refused() {
+        assert_eq!(check_sql_source("  ;  "), Err(SqlSourceRefusal::Empty));
+        let long = format!("SELECT * FROM serving.a WHERE x = '{}'", "a".repeat(20_001));
+        assert_eq!(check_sql_source(&long), Err(SqlSourceRefusal::TooLong));
+    }
+
+    #[test]
+    fn unparseable_sql_is_refused_not_passed_through() {
+        assert_eq!(
+            check_sql_source("SELECT * FROM serving.a WHERE ((("),
+            Err(SqlSourceRefusal::Unparseable)
+        );
+    }
+}

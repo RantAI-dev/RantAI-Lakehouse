@@ -12,7 +12,6 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use lakehouse_bi::builder::sql_with_filters;
 use lakehouse_bi::store::{self, Board, FilterDef, StoredChartSpec};
 use lakehouse_clickhouse::ChClient;
 use serde::Deserialize;
@@ -20,7 +19,9 @@ use serde_json::{Value, json};
 
 use crate::json::ApiJson;
 use crate::policy_engine::PolicyEngineObligations;
-use crate::routes::support::{mart_columns, render_stored_spec, run_spec_sql};
+use crate::routes::support::{
+    mart_columns, render_stored_spec, run_spec_sql, sources_for, stored_chart_sql,
+};
 use crate::state::AppState;
 
 /// WS7 item D1: neither `POST /api/embed/data` nor
@@ -215,11 +216,18 @@ async fn render_board_payload(
 
     let mut results = serde_json::Map::new();
     let mut charts_out = Vec::with_capacity(stored_for_board.len());
+    let sources = sources_for(ch, stored_for_board.iter().copied()).await?;
     for c in &stored_for_board {
-        let sql = sql_with_filters(c, &[], filters, &cols);
-        let (id, val) =
-            run_spec_sql(ch, &c.spec.id, &sql, &roles, &placeholders, &obligations).await;
-        results.insert(id, val);
+        match stored_chart_sql(c, &[], filters, &cols, &sources) {
+            Ok(sql) => {
+                let (id, val) =
+                    run_spec_sql(ch, &c.spec.id, &sql, &roles, &placeholders, &obligations).await;
+                results.insert(id, val);
+            }
+            Err(msg) => {
+                results.insert(c.spec.id.clone(), json!({ "error": msg }));
+            }
+        }
 
         let mut rendered = render_stored_spec(&c.spec, c.source);
         rendered["board"] = json!(c.board);

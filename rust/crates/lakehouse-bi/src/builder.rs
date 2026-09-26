@@ -27,15 +27,59 @@ pub struct NeedsProjection;
 /// accept filters and be built.
 pub struct Ready;
 
+/// `SETTINGS` appended to every statement built over a [`Relation::Sql`]:
+/// the same 2 000-row cap as Query Studio (`routes/query.rs`
+/// `MAX_RESULT_ROWS`), enforced by `ClickHouse` rather than by truncating
+/// afterwards, and a 30 s execution limit. Why 30 s: Superset's SQL Lab
+/// default (`SQLLAB_TIMEOUT`), and below the API's 60 s route/HTTP timeout,
+/// so `ClickHouse` cancels the query itself instead of it running on after
+/// the client gave up (measured: `max_execution_time = 1` on a 1e11-row
+/// scan fails with `TIMEOUT_EXCEEDED` after 1.00 s on `ClickHouse` 26.8).
+pub const SQL_SOURCE_SETTINGS: &str =
+    " SETTINGS max_result_rows = 2000, result_overflow_mode = 'break', max_execution_time = 30";
+
+/// Where a chart's rows come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Relation {
+    /// A Gold mart, unqualified (`mart_x`); rendered as `serving.mart_x`.
+    Mart(Ident),
+    /// A dashboard SQL source's text. The API validates it (read-only,
+    /// `serving.*` tables only, no `;`/`SETTINGS`/`FORMAT`) before storing
+    /// it; here it is only ever wrapped as a derived table so this
+    /// builder's own `WHERE`/`GROUP BY`/`LIMIT` apply outside it. The
+    /// newline before `)` keeps a trailing `-- comment` from swallowing
+    /// the closing parenthesis.
+    Sql(String),
+}
+
+impl Relation {
+    /// The `FROM` target.
+    fn render(&self) -> String {
+        match self {
+            Self::Mart(mart) => format!("serving.{mart}"),
+            Self::Sql(sql) => format!("(\n{}\n) AS src", sql.trim()),
+        }
+    }
+
+    /// Trailing `SETTINGS` for this relation (empty for a mart, whose
+    /// SQL is assembled entirely from validated identifiers).
+    fn settings(&self) -> &'static str {
+        match self {
+            Self::Mart(_) => "",
+            Self::Sql(_) => SQL_SOURCE_SETTINGS,
+        }
+    }
+}
+
 /// Builder for the general (non-KPI) chart SQL: `SELECT dimension, agg(measure)
-/// ... FROM serving.<mart> [WHERE ...] GROUP BY ... ORDER BY ... LIMIT ...`.
+/// ... FROM <relation> [WHERE ...] GROUP BY ... ORDER BY ... LIMIT ...`.
 ///
 /// Ports the `buildSql` free function in `bi-store.ts` as a typestate
 /// builder: [`QueryBuilder::measures`] must be called before
 /// [`QueryBuilder::filter_in`] or [`QueryBuilder::build`] are available,
 /// enforced at compile time rather than by convention.
 pub struct QueryBuilder<S> {
-    mart: Ident,
+    from: Relation,
     dimension: Option<Ident>,
     measures: Vec<Ident>,
     agg: Aggregate,
@@ -51,8 +95,15 @@ impl QueryBuilder<NeedsProjection> {
     /// `mart_wisman` — the `serving.` prefix is added by [`Self::build`]).
     #[must_use]
     pub fn new(mart: Ident) -> Self {
+        Self::over(Relation::Mart(mart))
+    }
+
+    /// Start building a query over any [`Relation`] (a mart or a SQL
+    /// source).
+    #[must_use]
+    pub fn over(from: Relation) -> Self {
         Self {
-            mart,
+            from,
             dimension: None,
             measures: Vec::new(),
             agg: Aggregate::Sum,
@@ -105,7 +156,7 @@ impl QueryBuilder<NeedsProjection> {
     #[must_use]
     pub fn measures(self, measures: Vec<Ident>) -> QueryBuilder<Ready> {
         QueryBuilder {
-            mart: self.mart,
+            from: self.from,
             dimension: self.dimension,
             measures,
             agg: self.agg,
@@ -138,7 +189,8 @@ impl QueryBuilder<Ready> {
     /// Render the final SQL. Ports `buildSql` in `bi-store.ts`.
     #[must_use]
     pub fn build(&self) -> String {
-        let mart = &self.mart;
+        let from = self.from.render();
+        let settings = self.from.settings();
         let where_sql = if self.where_clauses.is_empty() {
             String::new()
         } else {
@@ -175,10 +227,10 @@ impl QueryBuilder<Ready> {
                 format!("{}({measure})", self.agg)
             };
             return format!(
-                "SELECT {dimension}, {breakdown}, {agg_expr} FROM serving.{mart} \
-                 {outer} {dimension} IN (SELECT {dimension} FROM serving.{mart} {inner}\
+                "SELECT {dimension}, {breakdown}, {agg_expr} FROM {from} \
+                 {outer} {dimension} IN (SELECT {dimension} FROM {from} {inner}\
                  GROUP BY {dimension} ORDER BY {order_expr} DESC LIMIT {limit}) \
-                 GROUP BY {dimension}, {breakdown} ORDER BY {dimension}, {breakdown}",
+                 GROUP BY {dimension}, {breakdown} ORDER BY {dimension}, {breakdown}{settings}",
                 limit = self.limit,
             );
         }
@@ -201,7 +253,7 @@ impl QueryBuilder<Ready> {
             )
         };
         format!(
-            "SELECT {dimension}, {sel} FROM serving.{mart} {where_sql}GROUP BY {dimension} ORDER BY {order_clause} LIMIT {limit}",
+            "SELECT {dimension}, {sel} FROM {from} {where_sql}GROUP BY {dimension} ORDER BY {order_clause} LIMIT {limit}{settings}",
             limit = self.limit,
         )
     }
@@ -219,7 +271,7 @@ impl QueryBuilder<Ready> {
 /// `buildKpiSql` in `bi-store.ts`.
 #[must_use]
 pub fn build_kpi_sql(
-    mart: &Ident,
+    from: &Relation,
     measure: &Ident,
     agg: Aggregate,
     where_clauses: &[String],
@@ -234,7 +286,11 @@ pub fn build_kpi_sql(
     } else {
         format!(" WHERE {}", where_clauses.join(" AND "))
     };
-    format!("SELECT {val} AS v FROM serving.{mart}{where_sql}")
+    format!(
+        "SELECT {val} AS v FROM {}{where_sql}{}",
+        from.render(),
+        from.settings()
+    )
 }
 
 /// SQL for a stored spec with runtime filters applied (year filter + the
@@ -278,7 +334,63 @@ where
     }
     let empty_cols: HashSet<String, HSet> = HashSet::default();
     let cols = mart_cols.get(&def.mart).unwrap_or(&empty_cols);
+    let where_clauses = filter_predicates(cols, years, filters);
+    if where_clauses.is_empty() {
+        return spec.spec.sql.clone();
+    }
+    // `mart` was already validated as a well-formed identifier when the
+    // spec was created via `specFromInput`, so re-validating here would
+    // only ever fail on data corruption; fall back to the stored SQL rather
+    // than panicking, matching "SQL never comes raw from untrusted input"
+    // without introducing a new failure mode.
+    let Ok(mart) = Ident::new(def.mart.clone()) else {
+        return spec.spec.sql.clone();
+    };
+    rebuild(spec, &Relation::Mart(mart), where_clauses).unwrap_or_else(|| spec.spec.sql.clone())
+}
 
+/// SQL for a stored chart built on a dashboard SQL source, with runtime
+/// filters applied. Unlike [`sql_with_filters`] this ALWAYS rebuilds from
+/// `source_sql` (the source's current text), never returning the SQL stored
+/// with the chart, so editing a source updates every chart built on it —
+/// the Metabase-model behaviour the plan chose. Filters apply to columns the
+/// source actually returns (`source_cols`, probed when it was saved).
+///
+/// Returns `None` when the stored definition no longer yields valid
+/// identifiers (data corruption); the caller reports that tile as an error
+/// rather than running something else.
+#[must_use]
+pub fn sql_for_sql_source<HSet>(
+    spec: &StoredChartSpec,
+    source_sql: &str,
+    source_cols: &HashSet<String, HSet>,
+    years: &[i64],
+    filters: &[FilterDef],
+) -> Option<String>
+where
+    HSet: std::hash::BuildHasher,
+{
+    if spec.spec.kind == crate::specs::ChartKind::Text {
+        return Some(String::new());
+    }
+    let where_clauses = filter_predicates(source_cols, years, filters);
+    rebuild(spec, &Relation::Sql(source_sql.to_owned()), where_clauses)
+}
+
+/// The `tahun IN (...)` and dashboard-filter predicates that apply to a
+/// relation with columns `cols`.
+///
+/// A dashboard filter applies only when its column is *both* a valid
+/// identifier *and* present in `cols` — see [`sql_with_filters`]'s
+/// fidelity notes for why both checks are needed.
+fn filter_predicates<HSet>(
+    cols: &HashSet<String, HSet>,
+    years: &[i64],
+    filters: &[FilterDef],
+) -> Vec<String>
+where
+    HSet: std::hash::BuildHasher,
+{
     let mut where_clauses: Vec<String> = Vec::new();
     if !years.is_empty() && cols.contains("tahun") {
         let years_csv = years
@@ -292,7 +404,6 @@ where
         if f.values.is_empty() {
             continue;
         }
-        // Both checks are required — see the "Fidelity notes" doc above.
         let Ok(column) = Ident::new(f.column.clone()) else {
             continue;
         };
@@ -307,55 +418,40 @@ where
             .join(",");
         where_clauses.push(format!("{column} IN ({list})"));
     }
+    where_clauses
+}
 
-    if where_clauses.is_empty() {
-        return spec.spec.sql.clone();
-    }
-
+/// Rebuild a stored chart's SQL over `from` with `where_clauses`, from its
+/// structured definition. `None` if the definition's identifiers no longer
+/// validate (only possible through data corruption).
+fn rebuild(spec: &StoredChartSpec, from: &Relation, where_clauses: Vec<String>) -> Option<String> {
+    let def: &ChartInput = &spec.def;
     // `Aggregate::from_str_lossy` falls back to `Sum` for a missing OR
     // unrecognized value — this is the untrusted path named in the H4
     // finding (`def.aggregate` comes straight from stored `spec_json`, never
     // re-checked against an allowlist), so it must never hand raw text to
     // the SQL builder below.
     let agg = Aggregate::from_str_lossy(def.aggregate.as_deref().unwrap_or("sum"));
-    // `mart` was already validated as a well-formed identifier when the
-    // spec was created via `specFromInput`, so re-validating here would
-    // only ever fail on data corruption; fall back to the stored SQL rather
-    // than panicking, matching "SQL never comes raw from untrusted input"
-    // without introducing a new failure mode.
-    let Ok(mart) = Ident::new(def.mart.clone()) else {
-        return spec.spec.sql.clone();
-    };
 
     if matches!(
         spec.spec.kind,
         crate::specs::ChartKind::Kpi | crate::specs::ChartKind::Gauge
     ) {
-        let Some(measure_raw) = def.measures.first() else {
-            return spec.spec.sql.clone();
-        };
-        let Ok(measure) = Ident::new(measure_raw.clone()) else {
-            return spec.spec.sql.clone();
-        };
-        return build_kpi_sql(&mart, &measure, agg, &where_clauses);
+        let measure = Ident::new(def.measures.first()?.clone()).ok()?;
+        return Some(build_kpi_sql(from, &measure, agg, &where_clauses));
     }
 
-    let Ok(dimension) = Ident::new(def.dimension.clone()) else {
-        return spec.spec.sql.clone();
-    };
+    let dimension = Ident::new(def.dimension.clone()).ok()?;
     let mut measures = Vec::with_capacity(def.measures.len());
     for m in &def.measures {
-        let Ok(m) = Ident::new(m.clone()) else {
-            return spec.spec.sql.clone();
-        };
-        measures.push(m);
+        measures.push(Ident::new(m.clone()).ok()?);
     }
     let breakdown = def
         .breakdown
         .as_ref()
         .and_then(|b| Ident::new(b.clone()).ok());
 
-    let mut builder = QueryBuilder::new(mart)
+    let mut builder = QueryBuilder::over(from.clone())
         .dimension(dimension)
         .aggregate(agg)
         .order(def.order.clone().unwrap_or_else(|| "none".to_owned()))
@@ -364,13 +460,11 @@ where
         .measures(measures);
     for clause in where_clauses {
         // The predicates were already assembled as complete SQL fragments
-        // above (to preserve `buildSql`'s literal WHERE-joining behavior);
-        // route them through as a single pre-built filter rather than
-        // re-deriving column/values, by pushing directly onto the builder's
-        // internal list via a raw passthrough.
+        // (through `SqlLiteral`) by `filter_predicates`; pass them through
+        // as-is rather than re-deriving column/values.
         builder = builder.raw_where(clause);
     }
-    builder.build()
+    Some(builder.build())
 }
 
 impl QueryBuilder<Ready> {
@@ -734,6 +828,121 @@ mod tests {
         assert_eq!(
             apply_builtin_year_filter(sql, "mart_wisman", &[2024], &cols),
             sql
+        );
+    }
+
+    const SOURCE_SQL: &str = "SELECT g.material_group, g.materials, t.material_type\n\
+        FROM serving.mart_material_by_group AS g\n\
+        JOIN serving.mart_material_by_type AS t USING (material_group) -- joined";
+
+    fn source_spec(kind: ChartKind, dimension: &str, measures: &[&str]) -> StoredChartSpec {
+        let mut spec = stored_spec(kind, "", dimension, measures);
+        spec.def.sql_source = Some("s_1234abcd".to_owned());
+        spec.spec.sql_source = Some("s_1234abcd".to_owned());
+        spec
+    }
+
+    fn source_cols() -> HashSet<String> {
+        ["material_group", "materials", "material_type"]
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn a_sql_source_is_wrapped_as_a_derived_table_with_the_caps_appended() {
+        let sql = QueryBuilder::over(Relation::Sql(SOURCE_SQL.to_owned()))
+            .dimension(Ident::new("material_group").unwrap())
+            .aggregate(Aggregate::Sum)
+            .order("desc")
+            .limit(10)
+            .measures(vec![Ident::new("materials").unwrap()])
+            .build();
+        assert!(
+            sql.contains(&format!("FROM (\n{SOURCE_SQL}\n) AS src ")),
+            "the source must be a derived table, closed on its own line so a trailing comment cannot swallow the parenthesis: {sql}"
+        );
+        assert!(sql.ends_with(SQL_SOURCE_SETTINGS), "{sql}");
+        assert!(!sql.contains("serving.material_group"), "{sql}");
+    }
+
+    #[test]
+    fn a_mart_query_gets_no_settings_suffix() {
+        let sql = QueryBuilder::new(Ident::new("mart_x").unwrap())
+            .dimension(Ident::new("d").unwrap())
+            .measures(vec![Ident::new("m").unwrap()])
+            .build();
+        assert!(sql.contains("FROM serving.mart_x "), "{sql}");
+        assert!(!sql.contains("SETTINGS"), "{sql}");
+    }
+
+    #[test]
+    fn a_kpi_over_a_sql_source_is_capped_too() {
+        let sql = build_kpi_sql(
+            &Relation::Sql("SELECT 1 AS n".to_owned()),
+            &Ident::new("n").unwrap(),
+            Aggregate::Sum,
+            &[],
+        );
+        assert_eq!(
+            sql,
+            format!(
+                "SELECT round(sum(n)) AS v FROM (\nSELECT 1 AS n\n) AS src{SQL_SOURCE_SETTINGS}"
+            )
+        );
+    }
+
+    #[test]
+    fn a_breakdown_over_a_sql_source_wraps_both_references() {
+        let sql = QueryBuilder::over(Relation::Sql("SELECT a, b, v FROM serving.t".to_owned()))
+            .dimension(Ident::new("a").unwrap())
+            .breakdown(Some(Ident::new("b").unwrap()))
+            .measures(vec![Ident::new("v").unwrap()])
+            .build();
+        assert_eq!(sql.matches("AS src").count(), 2, "{sql}");
+        assert_eq!(sql.matches("SETTINGS").count(), 1, "{sql}");
+    }
+
+    #[test]
+    fn a_source_chart_is_rebuilt_from_the_current_source_even_without_filters() {
+        let spec = source_spec(ChartKind::Bar, "material_group", &["materials"]);
+        let sql = sql_for_sql_source(&spec, "SELECT 2 AS edited", &source_cols(), &[], &[])
+            .expect("a valid definition rebuilds");
+        assert!(sql.contains("SELECT 2 AS edited"), "{sql}");
+        assert_ne!(
+            sql, spec.spec.sql,
+            "the SQL stored with the chart is never reused"
+        );
+    }
+
+    #[test]
+    fn dashboard_filters_apply_only_to_columns_the_source_returns() {
+        let spec = source_spec(ChartKind::Bar, "material_group", &["materials"]);
+        let filters = vec![
+            FilterDef {
+                column: "material_type".to_owned(),
+                values: vec!["ROH".to_owned()],
+            },
+            FilterDef {
+                column: "not_in_source".to_owned(),
+                values: vec!["x".to_owned()],
+            },
+        ];
+        let sql = sql_for_sql_source(&spec, SOURCE_SQL, &source_cols(), &[2024], &filters).unwrap();
+        assert!(sql.contains("material_type IN ('ROH')"), "{sql}");
+        assert!(!sql.contains("not_in_source"), "{sql}");
+        assert!(
+            !sql.contains("tahun"),
+            "the source has no tahun column: {sql}"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_source_chart_definition_yields_none_not_other_sql() {
+        let spec = source_spec(ChartKind::Bar, "bad column", &["materials"]);
+        assert_eq!(
+            sql_for_sql_source(&spec, SOURCE_SQL, &source_cols(), &[], &[]),
+            None
         );
     }
 }

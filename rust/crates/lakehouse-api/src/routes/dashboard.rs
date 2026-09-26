@@ -17,7 +17,6 @@ use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
-use lakehouse_bi::builder::sql_with_filters;
 use lakehouse_bi::specs::{CHARTS, ChartKind, ChartSource, KPIS, to_render_spec};
 use lakehouse_bi::store::{self, ChartInput, FilterDef, LayoutMap, StoredChartSpec};
 use lakehouse_clickhouse::ChClient;
@@ -29,7 +28,8 @@ use crate::error::ApiResult;
 use crate::json::ApiJson;
 use crate::policy_engine::PolicyEngineObligations;
 use crate::routes::support::{
-    is_numeric_type, mart_columns, render_stored_spec, run_spec_sql, strip_non_ident,
+    is_numeric_type, mart_columns, render_stored_spec, run_spec_sql, sources_for, stored_chart_sql,
+    strip_non_ident,
 };
 use crate::state::AppState;
 
@@ -181,8 +181,15 @@ async fn get_body(
             results.insert(id, val);
         }
     }
+    let sources = sources_for(ch, stored_for_board.iter().copied()).await?;
     for c in &stored_for_board {
-        let sql = sql_with_filters(c, &years, &filters, &cols);
+        let sql = match stored_chart_sql(c, &years, &filters, &cols, &sources) {
+            Ok(sql) => sql,
+            Err(msg) => {
+                results.insert(c.spec.id.clone(), json!({ "error": msg }));
+                continue;
+            }
+        };
         let (id, val) = run_spec_sql(ch, &c.spec.id, &sql, roles, placeholders, obligations).await;
         results.insert(id, val);
     }
@@ -579,11 +586,21 @@ pub async fn boards_delete(
 pub struct FieldsQuery {
     #[serde(default)]
     mart: Option<String>,
+    /// A dashboard SQL source id; answers with its probed columns instead
+    /// of a mart's.
+    #[serde(default)]
+    source: Option<String>,
 }
 
 /// `GET /api/dashboard/fields` — mart list, or one mart's columns split
 /// into dimensions/measures.
 pub async fn fields(State(state): State<AppState>, Query(q): Query<FieldsQuery>) -> Response {
+    if let Some(id) = q.source.as_deref() {
+        return match source_fields_body(&state.clickhouse, id).await {
+            Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
+            Err(err) => crate::error::ApiRejection(err).into_response(),
+        };
+    }
     match fields_body(&state.clickhouse, q.mart.as_deref()).await {
         Ok(body) => (StatusCode::OK, ApiJson(body)).into_response(),
         Err(err) => (
@@ -592,6 +609,32 @@ pub async fn fields(State(state): State<AppState>, Query(q): Query<FieldsQuery>)
         )
             .into_response(),
     }
+}
+
+/// `?source=` branch of [`fields`]: the SQL source's columns, split the same
+/// way a mart's are. New shape (no parity corpus); errors are classified,
+/// never `ClickHouse` text.
+async fn source_fields_body(ch: &ChClient, id: &str) -> Result<Value, ApiError> {
+    let source = lakehouse_bi::sources::get_source(ch, id.trim())
+        .await
+        .map_err(|err| classify_records_ch_error(&err))?
+        .ok_or_else(|| ApiError::NotFound(format!("SQL source '{}' not found.", id.trim())))?;
+    let mut dimensions = Vec::new();
+    let mut measures = Vec::new();
+    for c in &source.columns {
+        if is_numeric_type(&c.ty) {
+            measures.push(c.name.clone());
+        } else {
+            dimensions.push(c.name.clone());
+        }
+    }
+    Ok(json!({
+        "source": source.id,
+        "title": source.title,
+        "dimensions": dimensions,
+        "measures": measures,
+        "columns": source.columns,
+    }))
 }
 
 async fn fields_body(
@@ -655,6 +698,11 @@ async fn fields_body(
 pub struct RecordsQuery {
     #[serde(default)]
     mart: Option<String>,
+    /// Set by a tile built on a dashboard SQL source. Drill-down over a
+    /// source is not supported yet (plan §3.4); answered honestly instead of
+    /// being treated as a missing mart.
+    #[serde(default)]
+    source: Option<String>,
     #[serde(default)]
     column: Option<String>,
     #[serde(default)]
@@ -741,6 +789,14 @@ async fn records_for_roles(
     placeholders: &crate::sql_rewrite::PlaceholderValues,
     obligations: &PolicyEngineObligations<'_>,
 ) -> Result<Value, ApiError> {
+    if q.source.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+        return Ok(json!({
+            "supported": false,
+            "message": "Drill-down is not available yet for charts built on a SQL source.",
+            "columns": [],
+            "rows": [],
+        }));
+    }
     let mart_raw = q.mart.unwrap_or_default();
     let mart = mart_raw
         .strip_prefix("serving.")
@@ -1276,6 +1332,7 @@ mod records_enforcement {
             column: Some(column.to_owned()),
             value: Some(value.to_owned()),
             limit: None,
+            source: None,
         }
     }
 
@@ -1372,6 +1429,26 @@ mod records_enforcement {
                 .all(|b| b.contains("replaceRegexpOne(toString(`email`)")),
             "every drill-down row query must be the masked rewrite, never the raw SELECT *: {row_queries:?}"
         );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drill_down_on_a_sql_source_tile_is_unsupported_and_never_queries(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        // No mocks: any ClickHouse request would fail the call.
+        let server = MockServer::start().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+        let mut q = drill("", "material_group", "x");
+        q.source = Some("s_1234abcd".to_owned());
+
+        let body = records_for_roles(&ch, q, &[], &PlaceholderValues::none(), &obligations)
+            .await
+            .expect("an honest unsupported answer, not an error");
+
+        assert_eq!(body["supported"], false);
+        assert!(server.received_requests().await.unwrap().is_empty());
         Ok(())
     }
 

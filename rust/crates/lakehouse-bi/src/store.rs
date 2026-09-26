@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::builder::{QueryBuilder, build_kpi_sql};
+use crate::builder::{QueryBuilder, Relation, build_kpi_sql};
 use crate::specs::{Aggregate, ChartKind, ChartSource, ChartY, NumFmt};
 
 /// Errors produced while validating input or talking to `ClickHouse` through
@@ -97,8 +97,14 @@ pub struct ChartSpec {
     pub subtitle: Option<String>,
     /// How to render the data.
     pub kind: ChartKind,
-    /// Source mart (unqualified, e.g. `mart_wisman`), empty for `text`.
+    /// Source mart (unqualified, e.g. `mart_wisman`), empty for `text` and
+    /// for a chart built on a SQL source.
     pub mart: String,
+    /// Dashboard SQL source id (`s_…`) when the chart reads a SQL source
+    /// instead of a mart. `None` for every chart stored before SQL sources
+    /// existed, which is why it defaults.
+    #[serde(rename = "sqlSource", skip_serializing_if = "Option::is_none", default)]
+    pub sql_source: Option<String>,
     /// `ClickHouse` SQL that returns the chart's rows, empty for `text`.
     pub sql: String,
     /// Column name for the X axis / category.
@@ -192,6 +198,11 @@ pub struct ChartInput {
     /// of failing at deserialization with "missing field `mart`".
     #[serde(default)]
     pub mart: String,
+    /// Dashboard SQL source id, the alternative to `mart` (exactly one of
+    /// the two for every kind but `text`). `camelCase` on the wire like the
+    /// rest of the console's JSON.
+    #[serde(rename = "sqlSource", skip_serializing_if = "Option::is_none", default)]
+    pub sql_source: Option<String>,
     /// How to render the data.
     pub kind: ChartKind,
     /// X-axis / category column.
@@ -302,7 +313,7 @@ pub struct FilterDef {
 // first group, which carries no version/variant bits and is therefore
 // uniformly random) / `randomUUID().replace(/-/g, "")` (32 hex chars).
 
-fn random_hex(n_bytes: usize) -> String {
+pub(crate) fn random_hex(n_bytes: usize) -> String {
     use std::fmt::Write as _;
 
     use rand::Rng;
@@ -410,6 +421,18 @@ async fn ensure_bi_table_uncached(ch: &ChClient) -> Result<(), ChError> {
     .await?;
     ch.exec(
         "ALTER TABLE console.bi_board ADD COLUMN IF NOT EXISTS embed_enabled UInt8 DEFAULT 0",
+        None,
+    )
+    .await?;
+    // Dashboard SQL sources (`crate::sources`). Same versioned-insert shape
+    // as the two tables above: every save is an INSERT, `created_at` is the
+    // version, a delete is an `is_deleted = 1` tombstone.
+    ch.exec(
+        "CREATE TABLE IF NOT EXISTS console.bi_source (\n\
+           id String, title String, sql String, columns_json String DEFAULT '[]',\n\
+           folder_id String DEFAULT '', created_by String DEFAULT '',\n\
+           created_at DateTime DEFAULT now(), is_deleted UInt8 DEFAULT 0\n\
+         ) ENGINE = ReplacingMergeTree(created_at) ORDER BY id",
         None,
     )
     .await?;
@@ -959,6 +982,7 @@ fn empty_chart_input() -> ChartInput {
         title: String::new(),
         subtitle: None,
         mart: String::new(),
+        sql_source: None,
         kind: ChartKind::Table,
         dimension: String::new(),
         measures: Vec::new(),
@@ -1023,6 +1047,8 @@ struct KpiCtx<'a> {
     subtitle: Option<String>,
     kind: ChartKind,
     mart: String,
+    sql_source: Option<String>,
+    from: Relation,
     agg: String,
     measures: Vec<String>,
     span: u8,
@@ -1041,6 +1067,8 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         subtitle,
         kind,
         mart,
+        sql_source,
+        from,
         agg,
         measures,
         span,
@@ -1066,6 +1094,7 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
         title: title.clone(),
         subtitle: None,
         mart: mart.clone(),
+        sql_source: sql_source.clone(),
         kind,
         dimension: String::new(),
         measures: vec![m.clone()],
@@ -1081,22 +1110,16 @@ fn spec_from_kpi_input(input: &ChartInput, ctx: KpiCtx<'_>) -> Result<StoredChar
     };
     let measure_ident = Ident::new(m.as_str())
         .map_err(|_| BiError::Validation("invalid or missing measure column.".to_owned()))?;
-    let mart_ident = Ident::new(mart.as_str())
-        .map_err(|_| BiError::Validation(format!("invalid mart name: {mart}")))?;
     // `agg` was already checked against `aggregate_allowed` above, so this
     // conversion is exact (never hits the `Sum` fallback).
-    let sql = build_kpi_sql(
-        &mart_ident,
-        &measure_ident,
-        Aggregate::from_str_lossy(&agg),
-        &[],
-    );
+    let sql = build_kpi_sql(&from, &measure_ident, Aggregate::from_str_lossy(&agg), &[]);
     let spec = ChartSpec {
         id: new_id,
         title,
         subtitle,
         kind,
         mart,
+        sql_source,
         sql,
         x: String::new(),
         y: ChartY::Single("v".to_owned()),
@@ -1153,6 +1176,7 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         title: title.clone(),
         subtitle: None,
         mart: String::new(),
+        sql_source: None,
         kind,
         dimension: String::new(),
         measures: Vec::new(),
@@ -1172,6 +1196,7 @@ fn spec_from_text_input(input: &ChartInput, ctx: TextCtx<'_>) -> Result<StoredCh
         subtitle,
         kind,
         mart: String::new(),
+        sql_source: None,
         sql: String::new(),
         x: String::new(),
         y: ChartY::Single(String::new()),
@@ -1201,6 +1226,8 @@ struct ChartCtx<'a> {
     subtitle: Option<String>,
     kind: ChartKind,
     mart: String,
+    sql_source: Option<String>,
+    from: Relation,
     agg: String,
     measures: Vec<String>,
     span: u8,
@@ -1283,7 +1310,7 @@ fn validate_chart_shape(
 /// [`QueryBuilder`]. Split out of `spec_from_chart_input` to keep it under
 /// clippy's line-count limit.
 fn build_chart_sql(
-    mart: &str,
+    from: &Relation,
     dimension: &str,
     measures: &[String],
     agg: &str,
@@ -1291,8 +1318,6 @@ fn build_chart_sql(
     limit: u32,
     breakdown: Option<&str>,
 ) -> Result<String, BiError> {
-    let mart_ident =
-        Ident::new(mart).map_err(|_| BiError::Validation(format!("invalid mart name: {mart}")))?;
     let dimension_ident = Ident::new(dimension).map_err(|_| {
         BiError::Validation(format!(
             "invalid or missing dimension column '{dimension}'."
@@ -1314,7 +1339,7 @@ fn build_chart_sql(
     };
     // `agg` was already checked against `aggregate_allowed` by the caller
     // (`spec_from_chart_input`), so this conversion is exact.
-    Ok(QueryBuilder::new(mart_ident)
+    Ok(QueryBuilder::over(from.clone())
         .dimension(dimension_ident)
         .aggregate(Aggregate::from_str_lossy(agg))
         .order(order)
@@ -1336,6 +1361,8 @@ fn spec_from_chart_input(
         subtitle,
         kind,
         mart,
+        sql_source,
+        from,
         agg,
         measures,
         span,
@@ -1368,6 +1395,7 @@ fn spec_from_chart_input(
         title: title.clone(),
         subtitle: subtitle.clone(),
         mart: mart.clone(),
+        sql_source: sql_source.clone(),
         kind,
         dimension: dimension.clone(),
         measures: measures.clone(),
@@ -1383,7 +1411,7 @@ fn spec_from_chart_input(
     };
 
     let sql = build_chart_sql(
-        &mart,
+        &from,
         &dimension,
         &measures,
         &agg,
@@ -1403,6 +1431,7 @@ fn spec_from_chart_input(
         subtitle,
         kind,
         mart,
+        sql_source,
         sql,
         x: dimension,
         y,
@@ -1478,6 +1507,57 @@ fn derive_common_fields(input: &ChartInput, id: Option<String>) -> Result<Common
     })
 }
 
+/// Where a chart's rows come from, resolved and validated against the real
+/// schema: a `serving` mart's columns from `system.columns`, or a SQL
+/// source's columns as probed when it was saved.
+struct Resolved {
+    mart: String,
+    sql_source: Option<String>,
+    from: Relation,
+    cols: std::collections::HashSet<String>,
+}
+
+/// Resolve `input.mart` / `input.sql_source` (exactly one) into a
+/// [`Resolved`] relation.
+async fn resolve_relation(ch: &ChClient, input: &ChartInput) -> Result<Resolved, BiError> {
+    let source_id = input
+        .sql_source
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(id) = source_id {
+        if !input.mart.trim().is_empty() {
+            return Err(BiError::Validation(
+                "choose either a mart or a SQL source, not both.".to_owned(),
+            ));
+        }
+        let source = crate::sources::get_source(ch, id)
+            .await?
+            .ok_or_else(|| BiError::Validation(format!("SQL source '{id}' not found.")))?;
+        let cols = source.column_names();
+        return Ok(Resolved {
+            mart: String::new(),
+            sql_source: Some(source.id),
+            from: Relation::Sql(source.sql),
+            cols,
+        });
+    }
+    let mart = input
+        .mart
+        .strip_prefix("serving.")
+        .unwrap_or(&input.mart)
+        .to_owned();
+    let mart_ident = Ident::new(mart.as_str())
+        .map_err(|_| BiError::Validation(format!("invalid mart name: {}", input.mart)))?;
+    let cols = validated_mart_columns(ch, &mart).await?;
+    Ok(Resolved {
+        mart,
+        sql_source: None,
+        from: Relation::Mart(mart_ident),
+        cols,
+    })
+}
+
 /// Validate `input` against the REAL `ClickHouse` schema, then assemble a
 /// [`StoredChartSpec`]. Throws a friendly error when the mart/columns are
 /// invalid. `id` is optional — supplied for EDIT. Branches per kind: `text`
@@ -1521,19 +1601,13 @@ pub async fn spec_from_input(
         );
     }
 
-    // ── kpi/table/chart need a mart ──────────────────────────────────
-    let mart = input
-        .mart
-        .strip_prefix("serving.")
-        .unwrap_or(&input.mart)
-        .to_owned();
-    if !IDENT_ALLOWED(&mart) {
-        return Err(BiError::Validation(format!(
-            "invalid mart name: {}",
-            input.mart
-        )));
-    }
-    let cols = validated_mart_columns(ch, &mart).await?;
+    // ── kpi/table/chart need a mart OR a SQL source ─────────────────
+    let Resolved {
+        mart,
+        sql_source,
+        from,
+        cols,
+    } = resolve_relation(ch, input).await?;
     let has_year = cols.contains("tahun");
     let agg = input
         .aggregate
@@ -1567,6 +1641,8 @@ pub async fn spec_from_input(
                 subtitle,
                 kind,
                 mart,
+                sql_source,
+                from,
                 agg,
                 measures,
                 span,
@@ -1587,6 +1663,8 @@ pub async fn spec_from_input(
             subtitle,
             kind,
             mart,
+            sql_source,
+            from,
             agg,
             measures,
             span,
@@ -1679,6 +1757,7 @@ impl StoredChartSpec {
                 subtitle: None,
                 kind,
                 mart: mart.to_owned(),
+                sql_source: None,
                 sql,
                 x: dimension.to_owned(),
                 y,
@@ -1695,6 +1774,7 @@ impl StoredChartSpec {
                 title: "Test".to_owned(),
                 subtitle: None,
                 mart: mart.to_owned(),
+                sql_source: None,
                 kind,
                 dimension: dimension.to_owned(),
                 measures,
@@ -1748,9 +1828,12 @@ mod tests {
         let ch = client(&server.uri());
         ensure_bi_table(&ch).await.unwrap();
         let first_call_requests = server.received_requests().await.unwrap().len();
+        // 9 since `console.bi_source` (dashboard SQL sources) joined the
+        // bootstrap; the property under test — every later call is free —
+        // is unchanged.
         assert_eq!(
-            first_call_requests, 8,
-            "first call should issue all 8 DDL statements"
+            first_call_requests, 9,
+            "first call should issue all 9 DDL statements"
         );
 
         ensure_bi_table(&ch).await.unwrap();
