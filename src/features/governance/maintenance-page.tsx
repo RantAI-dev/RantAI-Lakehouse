@@ -6,6 +6,8 @@ import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { IcebergTablesSection } from "@/features/lakehouse/iceberg-tables-section"
 import { useDataTable } from "@/hooks/use-data-table"
 import { useService } from "@/hooks/use-service"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
@@ -14,19 +16,23 @@ import { governanceService } from "@/services"
 import { getMaintenanceColumns } from "./maintenance-columns"
 
 /**
- * Bronze Iceberg maintenance runs (P4/P6). Reads `GET
- * /api/governance/maintenance`, which surfaces `lake.bronze_meta.
- * maintenance_run` — written by `dagster/dispar_orchestrate/
- * maintenance.py`'s `bronze_maintenance_job`.
+ * Table Maintenance: the Iceberg tables in the tenant's warehouse (each
+ * links to its detail page, where the per-table maintenance policy is
+ * set) and the maintenance runs that policy drives. The table list used to
+ * be a separate "Tables" page under Data, where it read as a duplicate of
+ * Data Explorer; setting a policy and seeing its runs now happen in one
+ * place.
  *
- * Only `expire_snapshots` runs in-engine on this ClickHouse version:
- * `remove_orphan_files` does not exist for Iceberg tables and `OPTIMIZE`
- * fails at runtime with an HTTP 403 against a catalog-registered table
- * (measured in `docs/plans/G3-RESULT.md`). Small-file compaction for Bronze
- * runs out-of-band via the Trino-as-cron escape hatch (ADR 0009) — this
- * page does not surface Trino's run history because it has no `bronze_
- * meta.*` record of its own; only the in-engine `expire_snapshots` chain
- * (dry-run + applied) is tracked here, honestly.
+ * Runs come from `GET /api/governance/maintenance`, which surfaces
+ * `lake.bronze_meta.maintenance_run`, written by `dagster/dispar_orchestrate/
+ * maintenance.py`'s `bronze_maintenance_job`. On ClickHouse 26.8 the one
+ * in-engine verb that works is `remove_orphan_files` (dry-run, then
+ * applied); `expire_snapshots` is refused for tables behind a REST catalog
+ * and is recorded as a skipped verb every run; `OPTIMIZE` returns OK but
+ * does not bin-pack, so it is not invoked (measured in
+ * `docs/plans/CLICKHOUSE-26.8-REMEASUREMENT.md`). Small-file compaction
+ * runs out-of-band via the Trino-as-cron escape hatch (ADR 0009), which has
+ * no `bronze_meta.*` record of its own and so is not shown here.
  */
 export function MaintenancePage() {
   const state = useService((s) => governanceService.listMaintenanceRuns(s), [])
@@ -70,22 +76,32 @@ export function MaintenancePage() {
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
-        title="Bronze Maintenance"
-        description="expire_snapshots dry-run and applied metrics per Bronze Iceberg table. remove_orphan_files and in-engine OPTIMIZE do not work on this ClickHouse version — see the Trino-as-cron escape hatch (ADR 0009) for small-file compaction."
+        title="Table Maintenance"
+        description="Iceberg tables in your warehouse, their maintenance policy, and what each nightly maintenance run did. The run removes orphan files (dry run, then applied); snapshot expiry is refused on this ClickHouse version and shows as a skipped verb; small-file compaction runs through Trino (ADR 0009)."
       />
-      {state.status === "loading" ? <LoadingSkeleton /> : null}
-      {state.status === "error" ? (
-        <ErrorState error={state.error} onRetry={state.reload} />
-      ) : null}
-      {state.status === "success" ? (
-        <div className="flex flex-col gap-4">
-          <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
-            <DataTableSearch placeholder="Search Bronze table, skipped verbs…" />
-          </DataTableAdvancedToolbar>
-          <DataTable table={table} />
-        </div>
-      ) : null}
+      <Tabs defaultValue="tables">
+        <TabsList>
+          <TabsTrigger value="tables">Tables</TabsTrigger>
+          <TabsTrigger value="runs">Maintenance runs</TabsTrigger>
+        </TabsList>
+        <TabsContent value="tables" className="mt-4">
+          <IcebergTablesSection />
+        </TabsContent>
+        <TabsContent value="runs" className="mt-4">
+          {state.status === "loading" ? <LoadingSkeleton /> : null}
+          {state.status === "error" ? (
+            <ErrorState error={state.error} onRetry={state.reload} />
+          ) : null}
+          {state.status === "success" ? (
+            <div className="flex flex-col gap-4">
+              <DataTableAdvancedToolbar table={table} onRefresh={state.reload}>
+                <DataTableSearch placeholder="Search Bronze table, skipped verbs…" />
+              </DataTableAdvancedToolbar>
+              <DataTable table={table} />
+            </div>
+          ) : null}
+        </TabsContent>
+      </Tabs>
     </div>
   )
 }
-

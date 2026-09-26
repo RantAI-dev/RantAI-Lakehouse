@@ -16,7 +16,6 @@ import {
   History,
   Home,
   KeyRound,
-  Layers,
   Library,
   ListChecks,
   LogIn,
@@ -122,7 +121,6 @@ export const NAV_GROUPS: NavGroup[] = [
     items: [
       { title: "Catalog", href: "/catalog", icon: Library },
       { title: "Data Explorer", href: "/data", icon: Database },
-      { title: "Tables", href: "/lakehouse/tables", icon: Layers },
       { title: "Query Studio", href: "/query-studio", icon: SearchCode },
       { title: "Sources", href: "/connectors", icon: Plug },
     ],
@@ -169,8 +167,11 @@ export const NAV_GROUPS: NavGroup[] = [
       { title: "Observability", href: "/observability", icon: FileSearch },
       { title: "Services", href: "/services", icon: Server },
       { title: "Capacity", href: "/lakehouse/capacity", icon: BarChart3 },
+      // Also holds the Iceberg table list that used to be "Tables" under
+      // Data: next to Data Explorer it read as a duplicate, and its only
+      // unique job, the per-table maintenance policy, belongs here.
       {
-        title: "Bronze Maintenance",
+        title: "Table Maintenance",
         href: "/governance/maintenance",
         icon: Wrench,
       },
@@ -262,6 +263,10 @@ export function subNavItems(pathname: string): NavItem[] {
  */
 const SECONDARY_ROUTES: { title: string; href: string }[] = [
   { title: "Saved Queries", href: "/query-studio/saved" },
+  // Table detail pages, opened from Table Maintenance or an asset's
+  // Snapshots tab. Their nav entry was removed, so without this the
+  // title would fall back to the product name.
+  { title: "Iceberg Table", href: "/lakehouse/tables" },
 ]
 
 function bestMatch<T extends { href: string }>(
