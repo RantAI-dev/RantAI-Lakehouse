@@ -1,6 +1,6 @@
 # Dashboard: SQL sources, folders, page-aware Copilot — plan
 
-Status: **in progress** on `feat/uiux` — step 0, SQL sources (backend, console, Copilot) and folders stage 1 done; page-aware Copilot next.
+Status: **implemented** on `feat/uiux` (step 0, SQL sources, folders stage 1, page-aware Copilot); browser QA pending.
 Scope decided 2026-09-26: SQL sources (custom SQL + multi-mart charts),
 dashboard folders (stage 1), page-aware Copilot (text context). Out of
 scope this round: new chart kinds, vision, folder permissions, revision
@@ -154,9 +154,10 @@ refactored wholesale in this PR.
 
 ## 6. Page-aware Copilot (text, no vision)
 
-- Backend: raise the 800-char context cap to a named constant sized from
-  the model's budget (`max_tokens` is 1200 today; measure before choosing),
-  with a why-comment.
+- Backend: the 800-char context cap became `PAGE_CONTEXT_MAX_CHARS` =
+  6 000 (the console bounds its summaries to 5 000 plus a preamble). Not
+  measured against the model's context window — recorded as such at the
+  constant.
 - Dashboard page: context includes, per tile, kind, source/mart, active
   filters and the first few rows of its already-loaded result (no extra
   queries). Summariser is a pure function in `src/lib` with tests.
@@ -202,3 +203,12 @@ server on 3100 points `RUST_API_URL` at 18081.
 5. Known test failure on `main`, not caused here:
    `state::tests::connector_secret_resolver_admits_...` fails in the full
    `lakehouse-api` run and passes alone (order-dependent environment).
+6. Follow-up finding (dev environment, not this feature):
+   `lakehouse-test-support` starts one Postgres testcontainer per test
+   binary and leaks the handle, so nothing ever stops it — every
+   `cargo test --workspace` leaves dozens of `postgres:16-alpine`
+   containers running. On the shared dev VM 245 had accumulated
+   (2026-09-22 → 26); removing them took used memory from 18 GiB to
+   4.4 GiB. Needs a real teardown (or testcontainers' reaper) in the
+   harness; until then, remove `label=org.testcontainers.managed-by=testcontainers`
+   containers after a run.

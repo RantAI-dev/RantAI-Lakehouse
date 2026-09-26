@@ -191,6 +191,31 @@ struct PreparedChat {
 
 /// Validates the body and assembles the system prompt, history and the tool
 /// list for this principal and mode. A bad body is a ready 400 response.
+/// Hard cap on the page context a client may add to the system prompt, in
+/// characters.
+///
+/// It was 800, enough for tile titles only. Page-aware Copilot (plan §6)
+/// sends the data on screen — each dashboard tile's first rows, or Query
+/// Studio's SQL and last result — which the console itself bounds to 5 000
+/// characters (`src/lib/page-context-summary.ts`) plus a short preamble.
+/// 6 000 leaves room for that preamble. It is a guard against an oversized
+/// or hostile context crowding out the conversation, not a figure measured
+/// against the model's window (not measured; at the usual ~4 characters per
+/// token it is roughly 1 500 tokens).
+const PAGE_CONTEXT_MAX_CHARS: usize = 6_000;
+
+/// The system-prompt line carrying the client's page context, cut to
+/// [`PAGE_CONTEXT_MAX_CHARS`]; empty when there is none.
+fn page_context_line(raw: &str) -> String {
+    let page_ctx: String = raw.chars().take(PAGE_CONTEXT_MAX_CHARS).collect();
+    if page_ctx.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\nCURRENT PAGE CONTEXT: {page_ctx}\nTailor your help, wording, and suggestions to where the user currently is."
+    )
+}
+
 async fn prepare_chat(
     state: &AppState,
     principal: Option<&Principal>,
@@ -228,19 +253,7 @@ async fn prepare_chat(
     } else {
         format!("{SYSTEM_BASE}{SYSTEM_ASK_SUFFIX}")
     };
-    let page_ctx: String = parsed
-        .context
-        .unwrap_or_default()
-        .chars()
-        .take(800)
-        .collect();
-    let ctx_line = if page_ctx.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\nCURRENT PAGE CONTEXT: {page_ctx}\nTailor your help, wording, and suggestions to where the user currently is."
-        )
-    };
+    let ctx_line = page_context_line(parsed.context.as_deref().unwrap_or_default());
     let sys = if schema.is_empty() {
         base
     } else {
@@ -1379,6 +1392,22 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn page_context_carries_on_screen_data_up_to_the_cap() {
+        assert_eq!(page_context_line(""), "");
+        assert_eq!(page_context_line("   "), "");
+        // A real dashboard summary is well past the old 800-char cut.
+        let summary = "- \"Sales\" (bar, id u_1; mart_x): rows: a=1\n".repeat(40);
+        let line = page_context_line(&summary);
+        assert!(
+            line.contains(summary.trim_end()),
+            "nothing under the cap is dropped"
+        );
+        let huge = "x".repeat(PAGE_CONTEXT_MAX_CHARS * 2);
+        let capped = page_context_line(&huge);
+        assert_eq!(capped.matches('x').count(), PAGE_CONTEXT_MAX_CHARS);
+    }
 
     #[test]
     fn session_filter_always_scopes_to_the_owner() {

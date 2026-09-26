@@ -10,6 +10,7 @@ import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTi
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { summarizeFilters, summarizeTiles } from "@/lib/page-context-summary";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import type { LayoutMap, FilterDef } from "@/services/clients/bi-store";
 import { useCopilot } from "@/features/copilot/use-copilot";
@@ -47,6 +48,7 @@ const SOURCE_BADGE: Record<ChartSource, { label: string; cls: string } | null> =
 };
 const NO_CHARTS: ChartCard[] = [];
 const NO_KPIS: KpiMeta[] = [];
+const NO_RESULTS: Record<string, Cell> = {};
 
 /**
  * The column a click on this tile's data drills into, if any: category
@@ -268,13 +270,21 @@ export function DashboardPage() {
   // context effect, which re-rendered this page, forever, while loading.
   const kpis = data?.kpis ?? NO_KPIS;
   const charts = data?.charts ?? NO_CHARTS;
+  const results = data?.results ?? NO_RESULTS;
 
   // Tell Copilot what is on this dashboard — the built-in one included.
   const { setPageContext, setMode: setCopilotMode, setExpanded: setCopilotExpanded } = useCopilot();
   React.useEffect(() => {
-    const tiles = charts
-      .map((c) => `"${c.title}" (${c.kind}${c.source !== "builtin" ? `, id ${c.id}` : ", built-in, not editable"})`)
-      .join("; ");
+    // The numbers on screen, not just tile titles (plan §6): KPIs and tiles
+    // with their first rows, and the filters in force. Built from data this
+    // page already loaded; nothing extra is queried.
+    const tiles = summarizeTiles(
+      [
+        ...kpis.map((k) => ({ id: k.id, title: k.title, kind: "kpi", source: "builtin" })),
+        ...charts,
+      ],
+      results,
+    );
     setPageContext({
       key: "dashboard-view",
       title: `Working on "${dashName}"`,
@@ -285,12 +295,13 @@ export function DashboardPage() {
       },
       system:
         `The user is viewing the dashboard "${dashName}" (board id: ${board}). ` +
-        `Tiles: ${tiles || "none yet"}. ` +
+        `Active filters: ${summarizeFilters(filters, year)}. ` +
+        `Tiles and the data they currently show (built-in tiles are not editable):\n${tiles || "none yet"}\n` +
         `When creating a chart use board="${board}". To change a tile you created, use update_chart with its id. ` +
         `You can also explain what the charts show.`,
     });
     return () => setPageContext(null);
-  }, [board, dashName, charts, setPageContext]);
+  }, [board, dashName, charts, kpis, results, filters, year, setPageContext]);
 
   // Build the tiles for the grid.
   const items: GridItem[] = charts.map((spec) => {

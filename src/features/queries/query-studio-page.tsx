@@ -18,6 +18,8 @@ import { QueryTransparencyPanel } from "./query-transparency-panel"
 import { SaveQuerySheet } from "./save-query-sheet"
 import { SaveSqlSourceSheet } from "./save-sql-source-sheet"
 import { useAuth } from "@/features/auth/auth-provider"
+import { useCopilot } from "@/features/copilot/use-copilot"
+import { summarizeQuery } from "@/lib/page-context-summary"
 import { SqlPanel } from "./sql-panel"
 import { useQueryStudio } from "./use-query-studio"
 
@@ -130,6 +132,28 @@ export function QueryStudioPage() {
   const [sourceOpen, setSourceOpen] = React.useState(false)
   const { hasPermission } = useAuth()
   const canAuthorSources = hasPermission("dashboard:sql")
+
+  // Page-aware Copilot (plan §6): the SQL being written and the first rows
+  // of its last result. Deferred so typing is not slowed by re-sending the
+  // context on every keystroke.
+  const { setPageContext } = useCopilot()
+  const deferredSql = React.useDeferredValue(studio.sql)
+  const lastResult = studio.runAct.data
+  React.useEffect(() => {
+    setPageContext({
+      key: "query",
+      title: "Write and run SQL",
+      hint: "Ask about this query or its result, or have Copilot write SQL.",
+      suggest: {
+        ask: ["Explain this query", "What does this result show?", "Why might this query be slow?"],
+        build: ["Turn this into a chart on a dashboard"],
+      },
+      system:
+        "The user is in Query Studio. Prefer run_sql; offer to turn results into a chart.\n" +
+        summarizeQuery(deferredSql, lastResult),
+    })
+    return () => setPageContext(null)
+  }, [deferredSql, lastResult, setPageContext])
 
   return (
     <div className="flex flex-col gap-4">
