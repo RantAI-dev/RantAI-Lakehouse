@@ -88,7 +88,7 @@ export function DashboardPage() {
   const [fullscreen, setFullscreen] = React.useState(false);
   const [autoSec, setAutoSec] = React.useState("0");
   // Drill / cross-filter: menu on data-point click + a modal of raw rows.
-  const [drill, setDrill] = React.useState<(DrillTarget & { builtin: boolean }) | null>(null);
+  const [drill, setDrill] = React.useState<(DrillTarget & { builtin: boolean; sqlSource: boolean }) | null>(null);
   const [records, setRecords] = React.useState<RecordsState | null>(null);
   const [tileDialog, setTileDialog] = React.useState<{ kind: "data" | "expand"; id: string } | null>(null);
   // Years the Gold data actually covers (the payload's `years` is only the
@@ -322,14 +322,14 @@ export function DashboardPage() {
             </span>
           ) : null}
           {/* The source table is detail for whoever arranges the board. */}
-          {edit ? <span className="hidden rounded-full border px-2 py-0.5 font-mono text-[10px] text-muted-foreground sm:inline">{spec.mart}</span> : null}
+          {edit ? <span className="hidden rounded-full border px-2 py-0.5 font-mono text-[10px] text-muted-foreground sm:inline">{spec.sqlSource ? "SQL source" : spec.mart}</span> : null}
         </div>
       ),
-      menuLabel: spec.mart ? `Source: ${spec.mart}` : undefined,
+      menuLabel: spec.sqlSource ? "Source: SQL source" : spec.mart ? `Source: ${spec.mart}` : undefined,
       menu,
       body: (
         <TileBody spec={spec} cell={cell} dark={dark} loading={loading} year={year}
-          onDataClick={dim ? (name, pos) => setDrill({ name, column: dim, mart: spec.mart, x: pos.x, y: pos.y, builtin: spec.source === "builtin" }) : undefined} />
+          onDataClick={dim ? (name, pos) => setDrill({ name, column: dim, mart: spec.mart, x: pos.x, y: pos.y, builtin: spec.source === "builtin", sqlSource: !!spec.sqlSource }) : undefined} />
       ),
     };
   });
@@ -487,7 +487,9 @@ export function DashboardPage() {
           drill={drill}
           onClose={() => setDrill(null)}
           onFilter={drill.builtin ? undefined : () => crossFilter(drill.column, drill.name)}
-          onRecords={() => void openRecords(drill.mart, drill.column, drill.name)}
+          // Records drill-down over a SQL source is not supported yet (the API
+          // answers `supported: false`); offer only the cross-filter there.
+          onRecords={drill.sqlSource ? undefined : () => void openRecords(drill.mart, drill.column, drill.name)}
         />
       ) : null}
       <RecordsDialog records={records} onClose={() => setRecords(null)} />

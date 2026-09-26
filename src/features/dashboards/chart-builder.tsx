@@ -18,12 +18,17 @@ import {
   Select, SelectContent, SelectGroup, SelectLabel, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import type { ChartKind, ChartRenderSpec } from "@/lib/dashboard-specs";
+import {
+  decodeSourceChoice, encodeSourceChoice, fieldsQuery, sourcePayload, sourceValueFromDef,
+} from "@/lib/chart-source";
+import { dashboardService } from "@/services";
+import type { SqlSource } from "@/services/contracts/dashboards";
 import { apiFetch } from "@/services/http";
 import { TileBody } from "./tile-body";
 
 type Fields = { dimensions: string[]; measures: string[] };
 export type ChartDef = {
-  title?: string; subtitle?: string; mart?: string; kind?: ChartKind;
+  title?: string; subtitle?: string; mart?: string; sqlSource?: string; kind?: ChartKind;
   dimension?: string; measures?: string[]; breakdown?: string;
   aggregate?: string; span?: 1 | 2; board?: string; text?: string; caption?: string;
   order?: "desc" | "asc" | "none"; limit?: number; target?: number;
@@ -132,6 +137,7 @@ export function ChartBuilder({
   const setOpen = (o: boolean) => { onOpenChange?.(o); if (!controlled) setOpenState(o); };
 
   const [marts, setMarts] = React.useState<{ name: string; rows: number }[]>([]);
+  const [sqlSources, setSqlSources] = React.useState<SqlSource[]>([]);
   const [fields, setFields] = React.useState<Fields | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
@@ -142,7 +148,9 @@ export function ChartBuilder({
   const { resolvedTheme } = useTheme();
 
   const [title, setTitle] = React.useState("");
-  const [mart, setMart] = React.useState("");
+  // Encoded data-source choice (`mart:<name>` / `sql:<id>`, lib/chart-source).
+  const [source, setSource] = React.useState("");
+  const choice = decodeSourceChoice(source);
   const [kind, setKind] = React.useState<ChartKind>("hbar");
   const [dimension, setDimension] = React.useState("");
   const [measure, setMeasure] = React.useState("");
@@ -168,8 +176,10 @@ export function ChartBuilder({
   const mLabels = MEASURE_LABELS[kind] ?? ["Measure (Y)"];
   const isEdit = !!editId;
 
-  async function loadFields(m: string): Promise<Fields> {
-    const j = await apiFetch(`/api/dashboard/fields?mart=${encodeURIComponent(m)}`).then((r) => r.json());
+  async function loadFields(value: string): Promise<Fields> {
+    const picked = decodeSourceChoice(value);
+    if (!picked) { setFields(null); return { dimensions: [], measures: [] }; }
+    const j = await apiFetch(`/api/dashboard/fields?${fieldsQuery(picked)}`).then((r) => r.json());
     const f = { dimensions: j.dimensions ?? [], measures: j.measures ?? [] };
     setFields(f);
     return f;
@@ -182,6 +192,8 @@ export function ChartBuilder({
     if (!open) return;
     setStep(isEdit || initial?.kind ? "configure" : "gallery");
     void apiFetch("/api/dashboard/fields").then((r) => r.json()).then((j) => setMarts(j.marts ?? [])).catch(() => setMarts([]));
+    // A viewer without the list (or with the API down) still gets marts.
+    void dashboardService.listSqlSources().then(setSqlSources).catch(() => setSqlSources([]));
     if (initial) {
       setTitle(initial.title ?? "");
       setKind((initial.kind as ChartKind) ?? "hbar");
@@ -194,8 +206,8 @@ export function ChartBuilder({
       setOrder((initial.order as "desc" | "asc" | "none") ?? "desc");
       setLimit(initial.limit ?? 20);
       setTargetBoard(initial.board ?? board);
-      const m = initial.mart ?? "";
-      setMart(m);
+      const m = sourceValueFromDef(initial);
+      setSource(m);
       if (m) {
         void loadFields(m).then(() => {
           setDimension(initial.dimension ?? "");
@@ -211,17 +223,17 @@ export function ChartBuilder({
   }, [open]);
 
   function reset() {
-    setTitle(""); setMart(""); setKind("hbar"); setDimension("");
+    setTitle(""); setSource(""); setKind("hbar"); setDimension("");
     setMeasure(""); setMeasure2(""); setMeasure3(""); setBreakdown(""); setAggregate("sum"); setSpan(1);
     setCaption(""); setTarget(""); setText(""); setOrder("desc"); setLimit(20);
     setTargetBoard(board); setFields(null); setError(null); setPreview(null); setPreviewError(null);
     setStep("gallery");
   }
 
-  // User changes the mart → reset the column selections and reload.
-  function onMartChange(m: string) {
-    setMart(m); setDimension(""); setMeasure(""); setMeasure2(""); setMeasure3(""); setBreakdown("");
-    if (m) void loadFields(m); else setFields(null);
+  // User changes the data source → reset the column selections and reload.
+  function onSourceChange(value: string) {
+    setSource(value); setDimension(""); setMeasure(""); setMeasure2(""); setMeasure3(""); setBreakdown("");
+    if (value) void loadFields(value); else setFields(null);
   }
 
   function buildPayload(forPreview = false): Record<string, unknown> {
@@ -232,20 +244,20 @@ export function ChartBuilder({
       if (!text.trim()) throw new Error("Enter text/note.");
       payload = { title: payloadTitle, kind, text, span, board: targetBoard };
     } else if (isSingle) {
-      if (!mart || !measure) throw new Error("Pick a mart & measure.");
+      if (!choice || !measure) throw new Error("Pick a data source & measure.");
       payload = {
-        title: payloadTitle, kind, mart, measures: [measure], aggregate, span, board: targetBoard,
+        title: payloadTitle, kind, ...sourcePayload(choice), measures: [measure], aggregate, span, board: targetBoard,
         caption: isKpi && caption ? caption : undefined,
         target: isGauge && Number(target) > 0 ? Number(target) : undefined,
       };
     } else {
       const measures = (needsM3 ? [measure, measure2, measure3] : needsM2 ? [measure, measure2] : [measure]).filter(Boolean);
-      if (!mart || !dimension || measures.length === 0) throw new Error("Fill in mart, dimension, and measure.");
+      if (!choice || !dimension || measures.length === 0) throw new Error("Fill in data source, dimension, and measure.");
       if (needsM3 && measures.length < 3) throw new Error(`${mLabels.join(", ")} — need all 3.`);
       if (needsM2 && measures.length < 2) throw new Error(`${mLabels.join(" & ")} — need both.`);
       if (isHeatmap && !breakdown) throw new Error("Heatmap needs a breakdown (2nd dimension).");
       payload = {
-        title: payloadTitle, mart, kind, dimension, measures, aggregate, span, board: targetBoard,
+        title: payloadTitle, ...sourcePayload(choice), kind, dimension, measures, aggregate, span, board: targetBoard,
         breakdown: canBreakdown && breakdown ? breakdown : undefined,
         order, limit,
       };
@@ -283,7 +295,7 @@ export function ChartBuilder({
     return () => { window.clearTimeout(timer); controller.abort(); };
     // Every field below affects the generated SQL or render spec.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, step, title, mart, kind, dimension, measure, measure2, measure3, breakdown, aggregate, span, caption, target, text, order, limit, targetBoard]);
+  }, [open, step, title, source, kind, dimension, measure, measure2, measure3, breakdown, aggregate, span, caption, target, text, order, limit, targetBoard]);
 
   async function save() {
     setError(null);
@@ -407,13 +419,44 @@ export function ChartBuilder({
           ) : (
             <>
               <div className="grid gap-1.5">
-                <Label>Mart (Gold)</Label>
-                <Select value={mart} onValueChange={(v) => onMartChange(v ?? "")}>
-                  <SelectTrigger><SelectValue placeholder="pick a mart" /></SelectTrigger>
+                <Label>Data source</Label>
+                <Select value={source} onValueChange={(v) => onSourceChange(v ?? "")}>
+                  <SelectTrigger>
+                    {/* The value is encoded (lib/chart-source); show a human label. */}
+                    <SelectValue placeholder="pick a mart or SQL source">
+                      {choice
+                        ? choice.kind === "mart"
+                          ? choice.name
+                          : `SQL · ${sqlSources.find((s) => s.id === choice.id)?.title ?? choice.id}`
+                        : undefined}
+                    </SelectValue>
+                  </SelectTrigger>
                   <SelectContent>
-                    {marts.map((m) => <SelectItem key={m.name} value={m.name}>{m.name} · {m.rows.toLocaleString("id-ID")}</SelectItem>)}
+                    <SelectGroup>
+                      <SelectLabel>Gold marts</SelectLabel>
+                      {marts.map((m) => (
+                        <SelectItem key={m.name} value={encodeSourceChoice({ kind: "mart", name: m.name })}>
+                          {m.name} · {m.rows.toLocaleString("id-ID")}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                    {sqlSources.length ? (
+                      <SelectGroup>
+                        <SelectLabel>SQL sources</SelectLabel>
+                        {sqlSources.map((s) => (
+                          <SelectItem key={s.id} value={encodeSourceChoice({ kind: "sql", id: s.id })}>
+                            {s.title}
+                          </SelectItem>
+                        ))}
+                      </SelectGroup>
+                    ) : null}
                   </SelectContent>
                 </Select>
+                {choice?.kind === "sql" ? (
+                  <p className="text-xs text-muted-foreground">
+                    Custom SQL, edited in Query Studio. Drill-down to records is not available for SQL sources yet.
+                  </p>
+                ) : null}
               </div>
 
               {!isSingle ? (
@@ -421,7 +464,7 @@ export function ChartBuilder({
                   <div className="grid gap-1.5">
                     <Label>Dimension (X)</Label>
                     <Select value={dimension} onValueChange={(v) => setDimension(v ?? "")} disabled={!fields}>
-                      <SelectTrigger><SelectValue placeholder={fields ? "pick a column" : "pick a mart first"} /></SelectTrigger>
+                      <SelectTrigger><SelectValue placeholder={fields ? "pick a column" : "pick a source first"} /></SelectTrigger>
                       <SelectContent>{fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}</SelectContent>
                     </Select>
                   </div>
@@ -439,7 +482,7 @@ export function ChartBuilder({
                 <div className="grid gap-1.5">
                   <Label>{mLabels[0]}</Label>
                   <Select value={measure} onValueChange={(v) => setMeasure(v ?? "")} disabled={!fields}>
-                    <SelectTrigger><SelectValue placeholder={fields ? "pick a column" : "pick a mart first"} /></SelectTrigger>
+                    <SelectTrigger><SelectValue placeholder={fields ? "pick a column" : "pick a source first"} /></SelectTrigger>
                     <SelectContent>{fields?.measures.map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
                   </Select>
                 </div>
@@ -523,7 +566,7 @@ export function ChartBuilder({
           <aside className="grid min-h-80 content-start gap-2 rounded-lg border border-border bg-muted/20 p-3">
             <div>
               <p className="text-sm font-medium">Preview</p>
-              <p className="text-xs text-muted-foreground">Updates automatically from the selected mart and columns.</p>
+              <p className="text-xs text-muted-foreground">Updates automatically from the selected data source and columns.</p>
             </div>
             <div className="h-[320px] overflow-hidden rounded-md border border-border bg-card p-3">
               {preview ? (
@@ -532,7 +575,7 @@ export function ChartBuilder({
                 <div className="h-full animate-pulse rounded bg-muted/50" />
               ) : (
                 <div className="grid h-full place-content-center px-5 text-center text-xs text-muted-foreground">
-                  {previewError ?? (isText ? "Enter content to preview this note." : "Choose a mart and the required columns to see real data here.")}
+                  {previewError ?? (isText ? "Enter content to preview this note." : "Choose a data source and the required columns to see real data here.")}
                 </div>
               )}
             </div>

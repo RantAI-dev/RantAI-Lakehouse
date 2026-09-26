@@ -16,6 +16,8 @@ import { QueryResultsSection } from "./query-results-section"
 import { QueryStudioTabs } from "./query-studio-tabs"
 import { QueryTransparencyPanel } from "./query-transparency-panel"
 import { SaveQuerySheet } from "./save-query-sheet"
+import { SaveSqlSourceSheet } from "./save-sql-source-sheet"
+import { useAuth } from "@/features/auth/auth-provider"
 import { SqlPanel } from "./sql-panel"
 import { useQueryStudio } from "./use-query-studio"
 
@@ -125,6 +127,9 @@ export function QueryStudioPage() {
   // All the state lives in the hook; this file is the layout.
   const studio = useQueryStudio()
   const [saveOpen, setSaveOpen] = React.useState(false)
+  const [sourceOpen, setSourceOpen] = React.useState(false)
+  const { hasPermission } = useAuth()
+  const canAuthorSources = hasPermission("dashboard:sql")
 
   return (
     <div className="flex flex-col gap-4">
@@ -147,7 +152,11 @@ export function QueryStudioPage() {
               <NaturalLanguagePanel studio={studio} />
             </TabsContent>
             <TabsContent value="sql" className="mt-3 space-y-3">
-              <SqlPanel studio={studio} onSave={() => setSaveOpen(true)} />
+              <SqlPanel
+                studio={studio}
+                onSave={() => setSaveOpen(true)}
+                onSaveAsSource={canAuthorSources ? () => setSourceOpen(true) : undefined}
+              />
               {/*
                * Iceberg time-travel: inserts a `FOR VERSION AS OF` clause
                * into the SQL text. Kept unconditional even when the
@@ -191,6 +200,9 @@ export function QueryStudioPage() {
         error={studio.saveAct.error?.message ?? null}
         onSave={studio.save}
       />
+      {canAuthorSources ? (
+        <SaveSqlSourceSheet open={sourceOpen} onOpenChange={setSourceOpen} sql={studio.sql} />
+      ) : null}
     </div>
   )
 }
