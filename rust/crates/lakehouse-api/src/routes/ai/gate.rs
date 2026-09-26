@@ -228,12 +228,20 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
         "trigger_lakehouse_build" => {
             "Menjalankan build ulang lakehouse (Bronze → Silver → Gold).".to_owned()
         }
-        "create_chart" => format!(
-            "Membuat chart baru \"{}\" ({}) dari mart {}.",
-            s("title"),
-            s("kind"),
-            s("mart")
-        ),
+        "create_chart" => {
+            // A chart reads either a mart or a dashboard SQL source; name
+            // whichever one the call actually uses.
+            let from = if s("sqlSource").is_empty() {
+                format!("mart {}", s("mart"))
+            } else {
+                format!("SQL source {}", s("sqlSource"))
+            };
+            format!(
+                "Membuat chart baru \"{}\" ({}) dari {from}.",
+                s("title"),
+                s("kind")
+            )
+        }
         "update_chart" => format!(
             "Mengubah chart {} menjadi \"{}\" ({}).",
             s("id"),
@@ -409,6 +417,24 @@ mod tests {
 
     fn spec(name: &str) -> &'static registry::ToolSpec {
         registry::find(name).expect("registered tool")
+    }
+
+    #[test]
+    fn create_chart_confirmation_names_the_sql_source_when_one_is_used() {
+        let mut args = Map::new();
+        args.insert("title".to_owned(), Value::from("T"));
+        args.insert("kind".to_owned(), Value::from("bar"));
+        args.insert("sqlSource".to_owned(), Value::from("s_1234abcd"));
+        assert_eq!(
+            summary_for(spec("create_chart"), &args),
+            "Membuat chart baru \"T\" (bar) dari SQL source s_1234abcd."
+        );
+        args.remove("sqlSource");
+        args.insert("mart".to_owned(), Value::from("mart_x"));
+        assert_eq!(
+            summary_for(spec("create_chart"), &args),
+            "Membuat chart baru \"T\" (bar) dari mart mart_x."
+        );
     }
 
     /// An empty args map — the common case for tests that don't care about

@@ -158,10 +158,11 @@ fn describe_mart_schema() -> Value {
 
 fn create_chart_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_chart",
-        "description": "Buat kartu chart baru di dashboard (/dashboards) dari mart Gold. Server menyusun SQL-nya sendiri dari kolom yang kamu pilih (agregasi per dimensi) — kamu TIDAK menulis SQL. Panggil describe_mart dulu untuk tahu kolom valid. Chart langsung tersimpan & tampil.",
+        "description": "Buat kartu chart baru di dashboard (/dashboards) dari mart Gold ATAU dari SQL source tersimpan (sqlSource, untuk data gabungan beberapa mart). Server menyusun SQL-nya sendiri dari kolom yang kamu pilih (agregasi per dimensi) — kamu TIDAK menulis SQL. Panggil describe_mart (atau list_sql_sources) dulu untuk tahu kolom valid. Chart langsung tersimpan & tampil.",
         "parameters": { "type": "object", "properties": {
             "title": { "type": "string" }, "subtitle": { "type": "string" },
             "mart": { "type": "string" }, "kind": { "type": "string", "enum": chart_kind_enum() },
+            "sqlSource": { "type": "string", "description": "id SQL source (s_…) dari list_sql_sources — alternatif mart untuk chart gabungan beberapa mart; isi mart ATAU sqlSource, bukan keduanya" },
             "text": { "type": "string" }, "caption": { "type": "string" },
             "target": { "type": "number" }, "dimension": { "type": "string" },
             "measures": { "type": "array", "items": { "type": "string" } },
@@ -178,6 +179,7 @@ fn update_chart_schema() -> Value {
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string" }, "title": { "type": "string" }, "subtitle": { "type": "string" },
             "mart": { "type": "string" }, "kind": { "type": "string", "enum": chart_kind_enum() },
+            "sqlSource": { "type": "string", "description": "id SQL source (s_…) dari list_sql_sources — alternatif mart untuk chart gabungan beberapa mart; isi mart ATAU sqlSource, bukan keduanya" },
             "dimension": { "type": "string" },
             "measures": { "type": "array", "items": { "type": "string" } },
             "breakdown": { "type": "string" }, "caption": { "type": "string" },
@@ -210,6 +212,12 @@ fn suggest_dashboard_schema() -> Value {
 fn list_charts_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_charts",
         "description": "Daftar kartu chart tersimpan di dashboard (yang dibuat lewat chat/UI).",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn list_sql_sources_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_sql_sources",
+        "description": "Daftar SQL source dashboard (SQL tersimpan, biasanya gabungan beberapa mart Gold) beserta dimensi & measure-nya. Pakai id-nya sebagai sqlSource di create_chart. SQL source dibuat pengguna di Query Studio, bukan lewat chat.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
@@ -656,6 +664,14 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "dashboard:read",
     },
+    // Read-only: authoring SQL sources needs `dashboard:sql` and happens in
+    // Query Studio; chat can only list them and build charts on them.
+    ToolSpec {
+        name: "list_sql_sources",
+        schema: list_sql_sources_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
     ToolSpec {
         name: "delete_chart",
         schema: delete_chart_schema,
@@ -940,12 +956,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_has_forty_seven_entries() {
+    fn tool_schemas_has_forty_eight_entries() {
         // 15 pre-T1 tools + 19 Tier 1 operations tools (5 alerts + 4
         // connectors + 7 pipelines + 3 saved queries) + 13 Tier 2 tools
         // (5 governance reads + 1 maintenance + 2 workloads + 2 gold
-        // export + 3 governance drafts).
-        assert_eq!(tool_schemas().len(), 47);
+        // export + 3 governance drafts) + `list_sql_sources` (dashboard
+        // SQL sources).
+        assert_eq!(tool_schemas().len(), 48);
+    }
+
+    /// One-off fixture writer, run by hand only after an intentional schema
+    /// change: `cargo test -p lakehouse-api --lib write_tool_schema_fixture
+    /// -- --ignored`.
+    #[test]
+    #[ignore = "writes tests/fixtures/tool_schemas.json; run only for a reviewed schema change"]
+    fn write_tool_schema_fixture() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/tool_schemas.json"
+        );
+        std::fs::write(path, serde_json::to_string_pretty(&tool_schemas()).unwrap()).unwrap();
     }
 
     /// Characterization snapshot (T0.1): `tool_schemas()`, now derived

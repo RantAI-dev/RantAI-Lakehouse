@@ -4,7 +4,8 @@
 //! - [`data`] — `run_sql`, `list_datasets`, `describe_dataset`,
 //!   `get_lineage`, `get_quality`, `describe_mart`.
 //! - [`dashboards`] — `create_chart`, `update_chart`, `delete_chart`,
-//!   `create_board`, `list_boards`, `list_charts`, `suggest_dashboard`.
+//!   `create_board`, `list_boards`, `list_charts`, `list_sql_sources`,
+//!   `suggest_dashboard`.
 //! - [`pipelines`] — `trigger_lakehouse_build`, `get_build_status`, plus
 //!   the Tier 1 pipeline-operations tools (T1.3).
 //! - [`alerts`] — Tier 1 alert-rule tools (T1.1).
@@ -112,6 +113,7 @@ pub(in crate::routes) async fn run_tool(
         "list_boards" => dashboards::list_boards(ch).await,
         "suggest_dashboard" => dashboards::suggest_dashboard(ch).await,
         "list_charts" => dashboards::list_charts(ch).await,
+        "list_sql_sources" => dashboards::list_sql_sources(ch).await,
         "delete_chart" => dashboards::delete_chart(ch, args).await,
         "list_alert_rules" => alerts::list_alert_rules(ch).await,
         "create_alert_rule" => alerts::create_alert_rule(ch, args).await,

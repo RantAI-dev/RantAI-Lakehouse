@@ -129,7 +129,7 @@
     "type": "function",
     "function": {
       "name": "create_chart",
-      "description": "Buat kartu chart baru di dashboard (/dashboards) dari mart Gold. Server menyusun SQL-nya sendiri dari kolom yang kamu pilih (agregasi per dimensi) — kamu TIDAK menulis SQL. Panggil describe_mart dulu untuk tahu kolom valid. Chart langsung tersimpan & tampil.",
+      "description": "Buat kartu chart baru di dashboard (/dashboards) dari mart Gold ATAU dari SQL source tersimpan (sqlSource, untuk data gabungan beberapa mart). Server menyusun SQL-nya sendiri dari kolom yang kamu pilih (agregasi per dimensi) — kamu TIDAK menulis SQL. Panggil describe_mart (atau list_sql_sources) dulu untuk tahu kolom valid. Chart langsung tersimpan & tampil.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -166,6 +166,10 @@
               "table",
               "text"
             ]
+          },
+          "sqlSource": {
+            "type": "string",
+            "description": "id SQL source (s_…) dari list_sql_sources — alternatif mart untuk chart gabungan beberapa mart; isi mart ATAU sqlSource, bukan keduanya"
           },
           "text": {
             "type": "string"
@@ -264,6 +268,10 @@
               "text"
             ]
           },
+          "sqlSource": {
+            "type": "string",
+            "description": "id SQL source (s_…) dari list_sql_sources — alternatif mart untuk chart gabungan beberapa mart; isi mart ATAU sqlSource, bukan keduanya"
+          },
           "dimension": {
             "type": "string"
           },
@@ -359,6 +367,17 @@
     "function": {
       "name": "list_charts",
       "description": "Daftar kartu chart tersimpan di dashboard (yang dibuat lewat chat/UI).",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_sql_sources",
+      "description": "Daftar SQL source dashboard (SQL tersimpan, biasanya gabungan beberapa mart Gold) beserta dimensi & measure-nya. Pakai id-nya sebagai sqlSource di create_chart. SQL source dibuat pengguna di Query Studio, bukan lewat chat.",
       "parameters": {
         "type": "object",
         "properties": {}

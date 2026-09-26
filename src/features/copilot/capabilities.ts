@@ -31,7 +31,7 @@ export const CAPABILITIES: Capability[] = [
     desc: "Create & manage charts / boards",
     icon: BarChart3,
     write: true,
-    tools: ["describe_mart", "list_charts", "list_boards", "suggest_dashboard", "create_chart", "update_chart", "delete_chart", "create_board"],
+    tools: ["describe_mart", "list_sql_sources", "list_charts", "list_boards", "suggest_dashboard", "create_chart", "update_chart", "delete_chart", "create_board"],
   },
   {
     key: "pipeline",
