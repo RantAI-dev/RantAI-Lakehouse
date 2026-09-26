@@ -682,10 +682,65 @@ fn esc(s: &str) -> String {
 
 /// `GET /api/dashboard/records` — drill-down: raw Gold rows behind one
 /// category value.
+///
+/// Same posture as [`get`]: `Policy::RequiresPermission("dashboard:read")`
+/// guarantees a real `Extension<Principal>`, and the row query goes through
+/// `policy_engine::rewrite_sql_for_roles` before it reaches `ClickHouse`.
+/// Drill-down review fix: this route used to run
+/// `SELECT * FROM serving.<mart>` with plain `ch.query`, so a column masked
+/// (or rows filtered) on the tile came back unmasked one click later.
 pub async fn records(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<RecordsQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    let placeholders = crate::sql_rewrite::PlaceholderValues {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_tenant_ids: principal
+            .tenant_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    };
+    let obligations = PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
+    records_for_roles(
+        &state.clickhouse,
+        q,
+        &principal.role_names,
+        &placeholders,
+        &obligations,
+    )
+    .await
+    .map(ApiJson)
+    .map_err(Into::into)
+}
+
+/// Classifies a drill-down `ClickHouse` failure without forwarding its text
+/// (AGENTS.md principle 4): a server-side error is a fixed 422, anything
+/// else a fixed 503; the real detail is only logged.
+fn classify_records_ch_error(err: &lakehouse_clickhouse::ChError) -> ApiError {
+    match err {
+        lakehouse_clickhouse::ChError::Server(_) => {
+            tracing::warn!(%err, "drill-down query failed");
+            ApiError::Unprocessable("drill-down query failed".to_owned())
+        }
+        lakehouse_clickhouse::ChError::Transport(_) | lakehouse_clickhouse::ChError::Cancelled => {
+            tracing::warn!(%err, "clickhouse unreachable during drill-down");
+            ApiError::Unavailable("clickhouse unavailable".to_owned())
+        }
+    }
+}
+
+/// [`records`]' body, taking the principal's roles and placeholders
+/// explicitly so the enforcement path can be tested against a mock
+/// `ClickHouse` and a real policy row.
+async fn records_for_roles(
+    ch: &ChClient,
+    q: RecordsQuery,
+    roles: &[String],
+    placeholders: &crate::sql_rewrite::PlaceholderValues,
+    obligations: &PolicyEngineObligations<'_>,
+) -> Result<Value, ApiError> {
     let mart_raw = q.mart.unwrap_or_default();
     let mart = mart_raw
         .strip_prefix("serving.")
@@ -702,10 +757,9 @@ pub async fn records(
         .clamp(1, 200);
 
     if !is_strict_ident(&mart) || !is_strict_ident(&column) {
-        return Err(ApiError::BadRequest("invalid mart/column".to_owned()).into());
+        return Err(ApiError::BadRequest("invalid mart/column".to_owned()));
     }
 
-    let ch = &state.clickhouse;
     let cols_sql = format!(
         "SELECT name FROM system.columns WHERE database='serving' AND table='{}'",
         esc(&mart)
@@ -713,33 +767,46 @@ pub async fn records(
     let cols = ch
         .rows(&cols_sql, None)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| classify_records_ch_error(&err))?;
     if cols.is_empty() {
-        return Err(ApiError::NotFound(format!("mart '{mart}' does not exist")).into());
+        return Err(ApiError::NotFound(format!("mart '{mart}' does not exist")));
     }
     let has_column = cols
         .iter()
         .any(|c| c.get("name").and_then(Value::as_str) == Some(column.as_str()));
     if !has_column {
-        return Err(ApiError::BadRequest(format!("column '{column}' does not exist")).into());
+        return Err(ApiError::BadRequest(format!(
+            "column '{column}' does not exist"
+        )));
     }
 
     let sql = format!(
         "SELECT * FROM serving.{mart} WHERE {column} = '{}' LIMIT {limit}",
         esc(&value)
     );
+    let rewritten = crate::policy_engine::rewrite_sql_for_roles(
+        &sql,
+        &sqlparser::dialect::ClickHouseDialect {},
+        roles,
+        placeholders,
+        obligations,
+    )
+    .await
+    .map_err(|err| {
+        ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
+    })?;
     let result = ch
-        .query(&sql, None)
+        .query(&rewritten, None)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| classify_records_ch_error(&err))?;
     let columns: Vec<String> = result.meta.iter().map(|m| m.name.clone()).collect();
-    Ok(ApiJson(json!({
+    Ok(json!({
         "columns": columns,
         "rows": result.data,
         "mart": mart,
         "column": column,
         "value": value,
-    })))
+    }))
 }
 
 // ── /api/dashboard/values ───────────────────────────────────────────────
@@ -1179,5 +1246,171 @@ mod tests {
         let out = yaml_board("b1", "Board 1", Some(&layout));
         assert!(out.contains("    layout:\n"));
         assert!(out.contains("      c1: { x: 0, y: 0, w: 3, h: 5 }"));
+    }
+}
+
+#[cfg(test)]
+mod records_enforcement {
+    //! Drill-down review fix: `/api/dashboard/records` must go through the
+    //! same `policy_engine::rewrite_sql_for_roles` path as the tiles. Same
+    //! two-harness shape as `support::run_spec_sql_enforcement`: a real
+    //! (ephemeral) Postgres with a real policy row, and a wiremock
+    //! `ClickHouse`.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_clickhouse::ChClient;
+    use lakehouse_core::ApiError;
+    use lakehouse_store::PgPool;
+    use lakehouse_store::governance::{self, CreatePolicyInput};
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{RecordsQuery, records_for_roles};
+    use crate::policy_engine::PolicyEngineObligations;
+    use crate::sql_rewrite::PlaceholderValues;
+
+    fn drill(mart: &str, column: &str, value: &str) -> RecordsQuery {
+        RecordsQuery {
+            mart: Some(mart.to_owned()),
+            column: Some(column.to_owned()),
+            value: Some(value.to_owned()),
+            limit: None,
+        }
+    }
+
+    /// Answers both `system.columns` lookups the drill-down makes: the
+    /// route's own column check (reads `name`) and the policy engine's
+    /// column resolution (reads `name`/`default_*`).
+    async fn mount_mart_columns(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(body_string_contains("system.columns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "name", "type": "String"},
+                    {"name": "default_kind", "type": "String"},
+                    {"name": "default_expression", "type": "String"},
+                ],
+                "data": [
+                    {"name": "id", "default_kind": "", "default_expression": ""},
+                    {"name": "email", "default_kind": "", "default_expression": ""},
+                    {"name": "region", "default_kind": "", "default_expression": ""},
+                ],
+                "rows": 3,
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drill_down_rows_are_masked_like_the_tile_they_came_from(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        governance::create_policy(
+            &pool,
+            &CreatePolicyInput {
+                name: "drill-down-masking-test".to_owned(),
+                kind: "Row filter".to_owned(),
+                subjects: "Analyst".to_owned(),
+                resources: "serving.mart_x".to_owned(),
+                effect: "Permit with obligation".to_owned(),
+                conditions: Some(
+                    r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}"#.to_owned(),
+                ),
+                activate: true,
+                owner: None,
+            },
+        )
+        .await
+        .expect("seeding the governing policy must succeed");
+
+        let server = MockServer::start().await;
+        mount_mart_columns(&server).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("replaceRegexpOne"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "id", "type": "UInt64"},
+                    {"name": "email", "type": "String"},
+                    {"name": "region", "type": "String"},
+                ],
+                "data": [{"id": "1", "email": "***", "region": "north"}],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+
+        let body = records_for_roles(
+            &ch,
+            drill("mart_x", "region", "north"),
+            &["Analyst".to_owned()],
+            &PlaceholderValues::none(),
+            &obligations,
+        )
+        .await
+        .expect("a masked drill-down still answers");
+
+        assert_eq!(body["rows"][0]["email"], "***");
+        let requests = server
+            .received_requests()
+            .await
+            .expect("mock server records requests");
+        let row_queries: Vec<String> = requests
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("north"))
+            .collect();
+        assert!(
+            !row_queries.is_empty(),
+            "the row query must reach ClickHouse"
+        );
+        assert!(
+            row_queries
+                .iter()
+                .all(|b| b.contains("replaceRegexpOne(toString(`email`)")),
+            "every drill-down row query must be the masked rewrite, never the raw SELECT *: {row_queries:?}"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn drill_down_clickhouse_error_text_never_reaches_the_response(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let server = MockServer::start().await;
+        mount_mart_columns(&server).await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("north"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string("Code: 60. DB::Exception: upstream-secret-detail"),
+            )
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+
+        let err = records_for_roles(
+            &ch,
+            drill("mart_x", "region", "north"),
+            &[],
+            &PlaceholderValues::none(),
+            &obligations,
+        )
+        .await
+        .expect_err("a failing row query is an error");
+
+        let text = format!("{err:?}");
+        assert!(
+            !text.contains("upstream-secret-detail"),
+            "ClickHouse's own text leaked: {text}"
+        );
+        assert!(
+            matches!(err, ApiError::Unprocessable(ref m) if m == "drill-down query failed"),
+            "expected the fixed 422, got {err:?}"
+        );
+        Ok(())
     }
 }
