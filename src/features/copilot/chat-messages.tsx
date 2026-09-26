@@ -67,7 +67,9 @@ function StatusPill({ progress }: { progress: ChatProgress | null }) {
   const label =
     progress?.phase === "tool" && progress.tool
       ? `Running ${toolLabel(progress.tool)}…`
-      : progress?.steps?.length
+      : progress?.phase === "verifying"
+        ? "Checking the figures…"
+        : progress?.steps?.length
         ? "Writing the answer…"
         : "Thinking…";
   const seconds = progress ? Math.max(0, (now - progress.startedAt) / 1000) : 0;

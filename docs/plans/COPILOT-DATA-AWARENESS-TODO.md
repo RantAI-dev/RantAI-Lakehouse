@@ -1,7 +1,10 @@
 # TODO — Copilot answers in Bronze / Silver / Gold terms
 
-Status: **not started**. Found on 2026-09-25 while reviewing the Copilot chat
-UI; left for a separate piece of work. Everything below is in the Rust API
+Status: **done** on 2026-09-27, except for the seed-data item under
+"Related". Items 1-6 below are implemented and measured: see
+`docs/plans/COPILOT-EVAL-RESULT.md`. The rest of this file is kept as the
+record of what was found. Found on 2026-09-25 while reviewing the Copilot
+chat UI. Everything below is in the Rust API
 (`rust/crates/lakehouse-api/src/routes/ai/`); no frontend change is needed.
 
 ## The symptom

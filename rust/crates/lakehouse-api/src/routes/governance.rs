@@ -24,7 +24,7 @@ use serde_json::{Map, Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::routes::support::{js_error, nullable_u64_col, str_col};
+use crate::routes::support::{nullable_u64_col, str_col};
 use crate::state::AppState;
 use crate::tenant::{TENANT_ID, TENANT_SITE};
 use lakehouse_dagster::{DgClient, DgError, iso_from_unix_seconds, map_run_status};
@@ -122,10 +122,35 @@ pub async fn get(State(state): State<AppState>, Path(kind): Path<String>) -> Res
             // `{ error: String(e) }` at 503.
             Err(err) => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                ApiJson(json!({ "error": js_error(err) })),
+                ApiJson(json!({ "error": gov_error_message(&err) })),
             )
                 .into_response(),
         },
+    }
+}
+
+/// A fixed, classified message for a failed governance read. The raw
+/// upstream text used to be returned as `"Error: …"`: the Data Quality
+/// page and the copilot showed `DB::Exception: Database _silver_meta does
+/// not exist … (version …)` to users (`AGENTS.md` principle 4). A missing
+/// database or table is the normal state before a quality or maintenance
+/// job has ever written results, so it is named as that.
+fn gov_error_message(err: &GovError) -> String {
+    match err {
+        GovError::ClickHouse(ch) => ch_error_message(ch),
+        GovError::Dagster(_) => "Dagster could not be reached to read run history".to_owned(),
+        GovError::Store(_) => "database error".to_owned(),
+    }
+}
+
+/// [`gov_error_message`]'s `ClickHouse` half, shared with
+/// [`ingest_runs`].
+fn ch_error_message(err: &ChError) -> String {
+    let text = err.to_string();
+    if text.contains("UNKNOWN_DATABASE") || text.contains("UNKNOWN_TABLE") {
+        "no results yet: the job that records them has not run in this deployment".to_owned()
+    } else {
+        "ClickHouse could not answer this governance query".to_owned()
     }
 }
 
@@ -650,7 +675,7 @@ pub async fn ingest_runs(
         Ok(rows) => (StatusCode::OK, ApiJson(rows)).into_response(),
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
+            ApiJson(json!({ "error": ch_error_message(&err) })),
         )
             .into_response(),
     }

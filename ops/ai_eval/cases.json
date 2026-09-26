@@ -1,0 +1,390 @@
+[
+  {
+    "id": "inventory",
+    "turns": [
+      "What data do we have in the lakehouse? Give me an overview."
+    ],
+    "facts": [
+      {
+        "label": "dataset",
+        "kind": "text",
+        "sql": "SELECT title FROM (SELECT title FROM lake.`bronze_meta.dataset_catalog` UNION ALL SELECT title FROM lake.`bronze_meta_sec.dataset_catalog`)"
+      },
+      {
+        "label": "layer",
+        "kind": "text",
+        "values": [
+          "bronze",
+          "silver",
+          "gold"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "total_foreign_2024",
+    "turns": [
+      "How many foreign tourist visits were recorded in 2024?"
+    ],
+    "facts": [
+      {
+        "label": "total",
+        "kind": "number",
+        "sql": "SELECT sum(jumlah) FROM serving.mart_wisman WHERE tahun = 2024",
+        "tol": 0.006
+      }
+    ]
+  },
+  {
+    "id": "top3_countries",
+    "turns": [
+      "Which three countries sent the most foreign tourists over the whole period, and how many each?"
+    ],
+    "facts": [
+      {
+        "label": "country",
+        "kind": "text",
+        "sql": "SELECT negara FROM serving.mart_wisman GROUP BY negara ORDER BY sum(jumlah) DESC LIMIT 3"
+      },
+      {
+        "label": "visits",
+        "kind": "number",
+        "sql": "SELECT sum(jumlah) s FROM serving.mart_wisman GROUP BY negara ORDER BY s DESC LIMIT 3",
+        "tol": 0.006
+      }
+    ]
+  },
+  {
+    "id": "yoy_growth",
+    "turns": [
+      "By what percentage did foreign tourist visits grow from 2023 to 2024?"
+    ],
+    "facts": [
+      {
+        "label": "growth %",
+        "kind": "number",
+        "sql": "SELECT round(100 * (sumIf(jumlah, tahun = 2024) - sumIf(jumlah, tahun = 2023)) / sumIf(jumlah, tahun = 2023), 2) FROM serving.mart_wisman",
+        "tol": 0.02
+      }
+    ]
+  },
+  {
+    "id": "peak_month_2024",
+    "turns": [
+      "Which month of 2024 had the most foreign tourist visits, and how many were there?"
+    ],
+    "facts": [
+      {
+        "label": "visits",
+        "kind": "number",
+        "sql": "SELECT sum(jumlah) s FROM serving.mart_wisman WHERE tahun = 2024 GROUP BY bulan_no ORDER BY s DESC LIMIT 1",
+        "tol": 0.006
+      },
+      {
+        "label": "month",
+        "kind": "text",
+        "sql": "SELECT arrayElement(['January','February','March','April','May','June','July','August','September','October','November','December'], toUInt8(bulan_no)) FROM (SELECT bulan_no, sum(jumlah) s FROM serving.mart_wisman WHERE tahun = 2024 GROUP BY bulan_no ORDER BY s DESC LIMIT 1)",
+        "aliases": {
+          "January": [
+            "januari",
+            "jan"
+          ],
+          "February": [
+            "februari",
+            "feb"
+          ],
+          "March": [
+            "maret",
+            "mar"
+          ],
+          "April": [
+            "apr"
+          ],
+          "May": [
+            "mei"
+          ],
+          "June": [
+            "juni",
+            "jun"
+          ],
+          "July": [
+            "juli",
+            "jul"
+          ],
+          "August": [
+            "agustus",
+            "aug"
+          ],
+          "September": [
+            "sep"
+          ],
+          "October": [
+            "oktober",
+            "oct"
+          ],
+          "November": [
+            "nov"
+          ],
+          "December": [
+            "desember",
+            "dec"
+          ]
+        }
+      }
+    ]
+  },
+  {
+    "id": "top_attraction",
+    "turns": [
+      "Which tourist attraction had the highest total number of visits, and what was the total?"
+    ],
+    "facts": [
+      {
+        "label": "attraction",
+        "kind": "text",
+        "sql": "SELECT destinasi FROM serving.mart_kunjungan_dtw ORDER BY total DESC LIMIT 1"
+      },
+      {
+        "label": "total",
+        "kind": "number",
+        "sql": "SELECT total FROM serving.mart_kunjungan_dtw ORDER BY total DESC LIMIT 1",
+        "tol": 0.006
+      }
+    ]
+  },
+  {
+    "id": "foreign_share",
+    "turns": [
+      "Which tourist attraction has the highest share of foreign visitors, and what is that share as a percentage?"
+    ],
+    "facts": [
+      {
+        "label": "attraction",
+        "kind": "text",
+        "sql": "SELECT destinasi FROM serving.mart_kunjungan_dtw ORDER BY wisman / total DESC LIMIT 1"
+      },
+      {
+        "label": "share %",
+        "kind": "number",
+        "sql": "SELECT round(100 * wisman / total, 1) FROM serving.mart_kunjungan_dtw ORDER BY wisman / total DESC LIMIT 1",
+        "tol": 0.01
+      }
+    ]
+  },
+  {
+    "id": "events_trend",
+    "turns": [
+      "How did the number of tourism events change between 2020 and 2024?"
+    ],
+    "facts": [
+      {
+        "label": "events",
+        "kind": "number",
+        "sql": "SELECT jumlah_event FROM serving.mart_event WHERE tahun IN (2020, 2024) ORDER BY tahun",
+        "tol": 0.001
+      }
+    ]
+  },
+  {
+    "id": "gci_missing",
+    "turns": [
+      "Which tourism competitiveness readiness indicators have no data available yet? How many are there?"
+    ],
+    "facts": [
+      {
+        "label": "indicator",
+        "kind": "text",
+        "sql": "SELECT indikator FROM serving.mart_gci_readiness WHERE data_tersedia = 0"
+      },
+      {
+        "label": "count",
+        "kind": "number",
+        "sql": "SELECT count() FROM serving.mart_gci_readiness WHERE data_tersedia = 0",
+        "tol": 0
+      }
+    ]
+  },
+  {
+    "id": "culinary_top_id",
+    "lang": "id",
+    "turns": [
+      "Provinsi mana yang punya usaha kuliner terdaftar paling banyak, dan berapa jumlahnya?"
+    ],
+    "facts": [
+      {
+        "label": "province",
+        "kind": "text",
+        "sql": "SELECT wilayah FROM serving.mart_kuliner ORDER BY jumlah_usaha DESC LIMIT 1"
+      },
+      {
+        "label": "count",
+        "kind": "number",
+        "sql": "SELECT jumlah_usaha FROM serving.mart_kuliner ORDER BY jumlah_usaha DESC LIMIT 1",
+        "tol": 0.001
+      }
+    ]
+  },
+  {
+    "id": "schema_foreign",
+    "turns": [
+      "What columns does the monthly foreign tourist data have, and what does each one mean?"
+    ],
+    "facts": [
+      {
+        "label": "column",
+        "kind": "text",
+        "sql": "SELECT name FROM system.columns WHERE database = 'serving' AND table = 'mart_wisman' AND name NOT LIKE '\\_%'"
+      }
+    ]
+  },
+  {
+    "id": "poi_atlas",
+    "turns": [
+      "How many points of interest are in the tourism atlas in total, and which category has the most?"
+    ],
+    "facts": [
+      {
+        "label": "total",
+        "kind": "number",
+        "sql": "SELECT sum(jumlah_poi) FROM serving.mart_atlas",
+        "tol": 0.001
+      },
+      {
+        "label": "category",
+        "kind": "text",
+        "sql": "SELECT kategori FROM serving.mart_atlas ORDER BY jumlah_poi DESC LIMIT 1"
+      }
+    ]
+  },
+  {
+    "id": "neg_hotel_revenue",
+    "turns": [
+      "What was the total hotel revenue in 2024?"
+    ],
+    "expect_refusal": true,
+    "forbid": [
+      "(Rp|IDR|USD|\\$)\\s?\\d"
+    ]
+  },
+  {
+    "id": "neg_year_out_of_range",
+    "turns": [
+      "How many foreign tourists came from Malaysia in 2019?"
+    ],
+    "expect_refusal": true
+  },
+  {
+    "id": "lineage_foreign",
+    "turns": [
+      "Where does the monthly foreign tourist data come from, and which lakehouse layers does it pass through?"
+    ],
+    "facts": [
+      {
+        "label": "layer",
+        "kind": "text",
+        "values": [
+          "bronze",
+          "silver",
+          "gold"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "quality_status",
+    "turns": [
+      "What is the data quality status of our datasets?"
+    ],
+    "forbid": [
+      "_silver_meta"
+    ]
+  },
+  {
+    "id": "failing_pipelines",
+    "turns": [
+      "Are any of our pipelines failing right now? Which ones?"
+    ],
+    "facts": [
+      {
+        "label": "failed pipeline",
+        "kind": "text",
+        "api": "/api/pipelines",
+        "path": "pipelines[]",
+        "where": {
+          "status": "failed"
+        },
+        "field": "name"
+      }
+    ]
+  },
+  {
+    "id": "connectors_empty",
+    "turns": [
+      "Which data source connectors are registered?"
+    ],
+    "expect_refusal": true
+  },
+  {
+    "id": "alert_rules_empty",
+    "turns": [
+      "Do we have any alert rules configured?"
+    ],
+    "expect_refusal": true
+  },
+  {
+    "id": "dashboards_list",
+    "turns": [
+      "What dashboards do we have?"
+    ],
+    "facts": [
+      {
+        "label": "board",
+        "kind": "text",
+        "api": "/api/dashboard/boards",
+        "path": "boards[]",
+        "field": "name"
+      }
+    ]
+  },
+  {
+    "id": "followup_compare",
+    "turns": [
+      "How many foreign tourist visits were there in 2023?",
+      "And how does that compare with 2022?"
+    ],
+    "facts": [
+      {
+        "label": "visits",
+        "kind": "number",
+        "sql": "SELECT sum(jumlah) FROM serving.mart_wisman WHERE tahun IN (2022, 2023) GROUP BY tahun ORDER BY tahun",
+        "tol": 0.006
+      }
+    ]
+  },
+  {
+    "id": "cdc_health",
+    "turns": [
+      "Is our CDC replication healthy? Give me the slot status and lag."
+    ],
+    "facts": [
+      {
+        "label": "slot",
+        "kind": "text",
+        "sql": "SELECT DISTINCT slot_name FROM lake.`bronze_meta.replication_slot`"
+      }
+    ]
+  },
+  {
+    "id": "build_chart",
+    "mode": "build",
+    "turns": [
+      "Create a bar chart of the number of tourism events per year."
+    ],
+    "expect_tool": {
+      "name": "create_chart",
+      "args_contains": {
+        "mart": "mart_event"
+      }
+    }
+  }
+]

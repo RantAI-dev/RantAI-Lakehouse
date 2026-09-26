@@ -28,6 +28,7 @@ export type ToolStep = { tool: string; args: unknown; ok: boolean; result: unkno
 export const TOOL_LABEL: Record<string, string> = {
   run_sql: "SQL query",
   list_datasets: "Search datasets",
+  lakehouse_overview: "Lakehouse overview",
   describe_dataset: "Dataset schema",
   get_lineage: "Data lineage",
   get_quality: "Data quality",
@@ -171,6 +172,7 @@ function StepBody({ step }: { step: ToolStep }) {
         ) : null}
         {columns.length ? <ResultTable columns={columns} rows={rows} /> : null}
         {columns.length ? <MiniBar columns={columns} rows={rows} /> : null}
+        {typeof res.note === "string" ? <p className="mt-1 text-[11px] text-muted-foreground">{res.note}</p> : null}
       </div>
     );
   }
@@ -180,15 +182,29 @@ function StepBody({ step }: { step: ToolStep }) {
   }
 
   if (step.tool === "list_datasets" && Array.isArray(res.datasets)) {
-    const ds = res.datasets as { slug: string; title: string; tier: string }[];
+    // `sourceKind` replaced `tier` (primer/sekunder is where data comes
+    // from, not a layer); `tier` is still read for sessions saved before.
+    const ds = res.datasets as { slug: string; title: string; sourceKind?: string; tier?: string }[];
     return (
       <ul className="mt-1 space-y-0.5 text-[11px]">
         {ds.slice(0, 10).map((d) => (
           <li key={d.slug} className="truncate">
-            <span className="text-muted-foreground">[{d.tier}]</span> {d.title}
+            <span className="text-muted-foreground">[{d.sourceKind ?? d.tier}]</span> {d.title}
           </li>
         ))}
         {ds.length > 10 ? <li className="text-muted-foreground">+{ds.length - 10} more…</li> : null}
+      </ul>
+    );
+  }
+
+  if (step.tool === "lakehouse_overview") {
+    const layer = (key: string) => asObj(res[key]);
+    const count = (v: unknown) => (Array.isArray(v) ? v.length : 0);
+    return (
+      <ul className="mt-1 space-y-0.5 text-[11px]">
+        <li><span className="font-medium">Bronze</span> <span className="text-muted-foreground">· {count(layer("bronze").datasets)} datasets</span></li>
+        <li><span className="font-medium">Silver</span> <span className="text-muted-foreground">· {count(layer("silver").tables)} tables</span></li>
+        <li><span className="font-medium">Gold</span> <span className="text-muted-foreground">· {count(layer("gold").tables)} tables</span></li>
       </ul>
     );
   }
@@ -212,12 +228,12 @@ function StepBody({ step }: { step: ToolStep }) {
   if (step.tool === "describe_mart") {
     const dims = Array.isArray(res.dimensions) ? (res.dimensions as string[]) : null;
     const meas = Array.isArray(res.measures) ? (res.measures as string[]) : null;
-    const marts = Array.isArray(res.marts) ? (res.marts as { mart: string; rows: number }[]) : null;
+    const marts = Array.isArray(res.marts) ? (res.marts as { mart: string; rows: number | null }[]) : null;
     if (marts) {
       return (
         <ul className="mt-1 space-y-0.5 text-[11px]">
           {marts.map((m) => (
-            <li key={m.mart} className="truncate"><span className="font-mono">{m.mart}</span> <span className="text-muted-foreground">· {m.rows.toLocaleString("id-ID")} rows</span></li>
+            <li key={m.mart} className="truncate"><span className="font-mono">{m.mart}</span> <span className="text-muted-foreground">· {m.rows === null ? "row count unknown" : `${m.rows.toLocaleString("id-ID")} rows`}</span></li>
           ))}
         </ul>
       );

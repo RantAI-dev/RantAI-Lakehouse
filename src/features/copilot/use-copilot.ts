@@ -43,7 +43,8 @@ export type SessionMeta = {
 
 /** What Copilot is doing while an answer is on its way. */
 export type ChatProgress = {
-  phase: "thinking" | "tool";
+  /** `verifying`: the server is having the model re-check figures its draft could not back with a tool result. */
+  phase: "thinking" | "tool" | "verifying";
   tool?: string;
   startedAt: number;
   /** Tools already started in this answer, oldest first (the current one last). */
@@ -266,7 +267,8 @@ function useCopilotState() {
           }
         } else if (event.type === "status") {
           setDraft("");
-          setProgress((p) => ({ phase: "thinking", startedAt: p?.startedAt ?? Date.now(), steps: p?.steps }));
+          const phase = (raw as { phase?: unknown }).phase === "verifying" ? "verifying" : "thinking";
+          setProgress((p) => ({ phase, startedAt: p?.startedAt ?? Date.now(), steps: p?.steps }));
         } else if (event.type === "tool") {
           setDraft("");
           setProgress((p) => ({

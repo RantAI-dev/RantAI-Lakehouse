@@ -395,6 +395,7 @@ fn strip_think_blocks(content: &str) -> String {
     let lower = content.to_ascii_lowercase();
     let mut result = String::with_capacity(content.len());
     let mut pos = 0usize;
+    let mut last_thought = "";
     loop {
         let Some(open_rel) = lower[pos..].find("<think>") else {
             result.push_str(&content[pos..]);
@@ -408,9 +409,51 @@ fn strip_think_blocks(content: &str) -> String {
         };
         let close_end = after_open + close_rel + "</think>".len();
         result.push_str(&content[pos..open]);
+        last_thought = &content[after_open..after_open + close_rel];
         pos = close_end;
     }
-    result
+    recover_answer_lead(last_thought, &result)
+}
+
+/// Longest fragment [`recover_answer_lead`] will move out of a thought.
+const MAX_LEAD_CHARS: usize = 48;
+
+/// Puts back the first words of an answer that the model wrote inside its
+/// `<think>` block.
+///
+/// `MiniMax-M3` sometimes closes its reasoning one or two words late:
+/// `…Let me report this honestly.No data</think>\n\nsource connectors are
+/// registered.` Stripping the block as written deletes "No data" and turns
+/// the answer into its opposite. Measured on the local stack: two of five
+/// identical "which connectors are registered?" turns came back that way.
+///
+/// The repair is deliberately narrow, so ordinary reasoning is never
+/// promoted into the answer: the visible answer must start with a
+/// lowercase letter (a sentence cut mid-way), and the reasoning must end
+/// in a short capitalised fragment after its last sentence break. Anything
+/// else is returned unchanged.
+fn recover_answer_lead(thought: &str, answer: &str) -> String {
+    let body = answer.trim_start();
+    let Some(first) = body.chars().next() else {
+        return answer.to_owned();
+    };
+    let tail = thought.trim_end();
+    let start = tail.rfind(['.', '!', '?', '\n', ':']).map_or(0, |i| i + 1);
+    let lead = tail[start..].trim();
+    if lead.is_empty() || lead.chars().count() > MAX_LEAD_CHARS {
+        return answer.to_owned();
+    }
+    // A sentence cut mid-way: the lead is its capitalised start.
+    if first.is_lowercase() && lead.chars().next().is_some_and(char::is_uppercase) {
+        return format!("{lead} {body}");
+    }
+    // A number cut mid-way (`202` + `2 had`): the lead is only digits, and
+    // joins with no space. Reasoning that merely ends in a number ("the
+    // total is 5") has words in its lead and never matches.
+    if first.is_ascii_digit() && lead.chars().all(|c| c.is_ascii_digit()) {
+        return format!("{lead}{body}");
+    }
+    answer.to_owned()
 }
 
 #[cfg(test)]
@@ -705,5 +748,36 @@ mod tests {
             .chat_with_tools(&[], &[], ChatOptions::default())
             .await
             .unwrap();
+    }
+
+    #[test]
+    fn an_answer_lead_written_inside_the_thought_is_put_back() {
+        let content = "<think>The list is empty. Let me report this honestly.No data\n</think>\n\nsource connectors are registered.";
+        assert_eq!(
+            strip_think_blocks(content).trim(),
+            "No data source connectors are registered."
+        );
+    }
+
+    #[test]
+    fn ordinary_reasoning_is_never_promoted_into_the_answer() {
+        // A capitalised answer is complete: nothing is moved.
+        let content = "<think>Check the catalog.\nSix</think>Six datasets are registered.";
+        assert_eq!(strip_think_blocks(content), "Six datasets are registered.");
+        // The thought ends in a full sentence: no fragment to move.
+        let content = "<think>The list is empty.</think>\nsee the table below.";
+        assert_eq!(strip_think_blocks(content), "\nsee the table below.");
+        // A long trailing clause is reasoning, not a missing lead.
+        let content = "<think>Hmm.\nThis long tail of reasoning keeps going for far more words than any lead</think>and so on";
+        assert_eq!(strip_think_blocks(content), "and so on");
+    }
+
+    #[test]
+    fn digits_of_a_number_written_inside_the_thought_are_put_back() {
+        let content = "<think>Answer from the last turn.\n202</think>2 had 1,827,521 visits.";
+        assert_eq!(strip_think_blocks(content), "2022 had 1,827,521 visits.");
+        // Reasoning that ends in a sentence with a number is left alone.
+        let content = "<think>The total is 5</think>5 datasets are registered.";
+        assert_eq!(strip_think_blocks(content), "5 datasets are registered.");
     }
 }

@@ -156,14 +156,24 @@ async fn a_streamed_chat_sends_deltas_then_the_checked_answer() {
         "reasoning never streams, even with its tag split across events: {streamed:?}"
     );
 
+    // The draft's table is backed by no tool result, so the loop runs one
+    // repair round (`routes::ai::run_chat`): a `verifying` status, then the
+    // model is asked again. This mock answers the same way both times, so
+    // its reasoning streams once per round.
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"] == "status" && e["phase"] == "verifying"),
+        "a draft with unbacked figures gets one repair round: {events:?}"
+    );
     let reasoning: String = events
         .iter()
         .filter(|e| e["type"] == "reasoning")
         .filter_map(|e| e["text"].as_str())
         .collect();
     assert_eq!(
-        reasoning, "draft reasoning",
-        "the think block streams as reasoning, apart from the answer"
+        reasoning, "draft reasoningdraft reasoning",
+        "the think block streams as reasoning, apart from the answer, once per round"
     );
 
     let last = events.last().expect("at least one event");

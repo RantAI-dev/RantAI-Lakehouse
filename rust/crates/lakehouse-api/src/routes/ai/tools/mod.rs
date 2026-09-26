@@ -100,6 +100,7 @@ pub(in crate::routes) async fn run_tool(
     match name {
         "run_sql" => data::run_sql(state, principal, args).await,
         "list_datasets" => data::list_datasets(ch, args).await,
+        "lakehouse_overview" => data::lakehouse_overview(ch).await,
         "describe_dataset" => data::describe_dataset(ch, args).await,
         "get_lineage" => data::get_lineage(ch, args).await,
         "get_quality" => data::get_quality(ch).await,
