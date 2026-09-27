@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert"
 import { test } from "node:test"
-import { toBoxplot, toCalendar, toSankey, toSunburst } from "./chart-transforms"
+import { boxplotNeedsLogAxis, toBoxplot, toCalendar, toSankey, toSunburst } from "./chart-transforms"
 
 test("toSankey keeps a value that appears on both sides as two nodes and sums repeated links", () => {
   const rows = [
@@ -42,7 +42,27 @@ test("toBoxplot takes five-number arrays and drops anything else", () => {
     "g",
     "m"
   )
-  assert.deepEqual(out, { categories: ["A"], data: [[1, 9, 17, 264, 34421]] })
+  assert.deepEqual(out, { categories: ["A"], data: [[1, 9, 17, 264, 34421]], counts: [null] })
+})
+
+test("toBoxplot reads the row count, which ClickHouse sends as a string", () => {
+  const out = toBoxplot(
+    [
+      { g: "Grup", m: [1, 9, 17, 264, 34421], __n: "16" },
+      { g: "Tipe", m: [35808, 35808, 35808, 35808, 35808], __n: 1 },
+    ],
+    "g",
+    "m"
+  )
+  assert.deepEqual(out.counts, [16, 1])
+})
+
+test("a log axis only for all-positive values spanning three orders of magnitude", () => {
+  assert.equal(boxplotNeedsLogAxis([[1, 9, 17, 264, 34421], [35808, 35808, 35808, 35808, 35808]]), true)
+  assert.equal(boxplotNeedsLogAxis([[10, 20, 30, 40, 900]]), false)
+  assert.equal(boxplotNeedsLogAxis([[0, 9, 17, 264, 34421]]), false, "log cannot draw zero")
+  assert.equal(boxplotNeedsLogAxis([[-5, 1, 2, 3, 5000]]), false)
+  assert.equal(boxplotNeedsLogAxis([]), false)
 })
 
 test("toCalendar keeps dated rows and reports the range they span", () => {

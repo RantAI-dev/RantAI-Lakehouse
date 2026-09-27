@@ -66,15 +66,18 @@ export function toSunburst(rows: Row[], x: string, series: string, y: string): S
 /**
  * Boxplot data: categories and `[min, q1, median, q3, max]` per category.
  * A row whose value is not a five-number array is dropped rather than
- * drawn wrong.
+ * drawn wrong. `counts` is the row count behind each summary (the `__n`
+ * column of the boxplot SQL; null when the result has none), so a
+ * category built from one row can be told apart from a missing one.
  */
 export function toBoxplot(
   rows: Row[],
   x: string,
   y: string
-): { categories: string[]; data: number[][] } {
+): { categories: string[]; data: number[][]; counts: (number | null)[] } {
   const categories: string[] = []
   const data: number[][] = []
+  const counts: (number | null)[] = []
   for (const r of rows) {
     const v = r[y]
     if (!Array.isArray(v) || v.length !== 5) continue
@@ -82,8 +85,23 @@ export function toBoxplot(
     if (five.some((n) => !Number.isFinite(n))) continue
     categories.push(str(r[x]))
     data.push(five)
+    // ClickHouse sends a UInt64 count as a string in JSON.
+    const n = Number(r.__n)
+    counts.push(r.__n != null && Number.isFinite(n) ? n : null)
   }
-  return { categories, data }
+  return { categories, data, counts }
+}
+
+/**
+ * Whether a boxplot needs a log value axis: every value is positive and they
+ * span three orders of magnitude or more. On a linear axis such data squashes
+ * most boxes flat against zero (one outlier sets the scale); a log axis
+ * cannot show zero or negatives, so those keep the linear one.
+ */
+export function boxplotNeedsLogAxis(data: number[][]): boolean {
+  const all = data.flat()
+  if (!all.length || all.some((v) => v <= 0)) return false
+  return Math.max(...all) / Math.min(...all) >= 1000
 }
 
 /**

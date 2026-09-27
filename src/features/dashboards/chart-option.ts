@@ -1,7 +1,7 @@
 import type { EChartsOption } from "echarts";
 import { formatCompactNumber, monthlyAxisLabel } from "@/lib/chart-axis";
 import type { ChartSpec } from "@/lib/dashboard-specs";
-import { toBoxplot, toCalendar, toSankey, toSunburst } from "@/lib/chart-transforms";
+import { boxplotNeedsLogAxis, toBoxplot, toCalendar, toSankey, toSunburst } from "@/lib/chart-transforms";
 import { JAKARTA_MAP, normalizeJakartaArea } from "./echarts-maps";
 
 /** buildOption only needs how to render (not the SQL) — fits ChartSpec & ChartRenderSpec. */
@@ -261,17 +261,33 @@ export function buildOption(
   }
 
   if (spec.kind === "boxplot") {
-    const { categories, data } = toBoxplot(rows, spec.x, y0);
+    const { categories, data, counts } = toBoxplot(rows, spec.x, y0);
+    const log = boxplotNeedsLogAxis(data);
+    // "(n=…)" under each category: a box from one row is a flat line, and
+    // the count says why rather than leaving it looking empty.
+    const labels = categories.map((c, i) => (counts[i] != null ? `${c} (n=${counts[i]})` : c));
+    const nText = (i: number) => (counts[i] != null ? `<br/>${counts[i]} rows` : "");
+    // A category whose five numbers are equal gets a dot on top of its line.
+    const flat = data.flatMap((d, i) => (d[0] === d[4] ? [[i, d[0]]] : []));
     return { ...base,
       tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => {
-        // `data` is the five-number array we passed (toBoxplot); `value`
-        // may carry the category index in front, depending on the version.
-        const o = p as { name: string; data: number[] };
+        const o = p as { name: string; data: number[]; seriesType: string; dataIndex: number };
+        if (o.seriesType === "scatter") {
+          const i = o.data[0];
+          return `${categories[i]}${nText(i)}<br/>every value <b>${fmtInt(o.data[1])}</b>`;
+        }
+        // `data` is the five-number array we passed (toBoxplot).
         const [min, q1, med, q3, max] = o.data;
-        return `${o.name}<br/>max <b>${fmtInt(max)}</b><br/>Q3 ${fmtInt(q3)}<br/>median <b>${fmtInt(med)}</b><br/>Q1 ${fmtInt(q1)}<br/>min <b>${fmtInt(min)}</b>`;
+        return `${categories[o.dataIndex]}${nText(o.dataIndex)}<br/>max <b>${fmtInt(max)}</b><br/>Q3 ${fmtInt(q3)}<br/>median <b>${fmtInt(med)}</b><br/>Q1 ${fmtInt(q1)}<br/>min <b>${fmtInt(min)}</b>`;
       } },
-      xAxis: catAxis(categories), yAxis: valAxis(),
-      series: [{ type: "boxplot", data, itemStyle: { color: dark ? "rgba(99,102,241,0.25)" : "rgba(99,102,241,0.15)", borderColor: PALETTE[0] } }],
+      xAxis: catAxis(labels),
+      // Log only when the values span 1000× or more (boxplotNeedsLogAxis),
+      // and the axis says so, so the spacing is not read as linear.
+      yAxis: log ? { ...valAxis("log scale"), type: "log" as const, logBase: 10 } : valAxis(),
+      series: [
+        { type: "boxplot", data, itemStyle: { color: dark ? "rgba(99,102,241,0.25)" : "rgba(99,102,241,0.15)", borderColor: PALETTE[0] } },
+        ...(flat.length ? [{ type: "scatter" as const, data: flat, symbolSize: 9, itemStyle: { color: PALETTE[0] } }] : []),
+      ],
     } as EChartsOption;
   }
 

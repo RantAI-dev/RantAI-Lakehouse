@@ -296,7 +296,9 @@ pub fn build_kpi_sql(
 /// Boxplot SQL: per `dimension`, the five-number summary of `measure`
 /// (`min`, quartiles, `max` via `quantilesExact`, returned as one array
 /// column named after the measure), ordered by dimension. No aggregate
-/// applies — the distribution is the point.
+/// applies — the distribution is the point. `__n` is the row count behind
+/// each summary: a category with one row collapses to a flat line, and the
+/// renderer needs the count to say so instead of looking empty.
 #[must_use]
 pub fn build_boxplot_sql(
     from: &Relation,
@@ -311,8 +313,8 @@ pub fn build_boxplot_sql(
         format!("WHERE {} ", where_clauses.join(" AND "))
     };
     format!(
-        "SELECT {dimension}, quantilesExact(0, 0.25, 0.5, 0.75, 1)(toFloat64({measure})) AS {measure} \
-         FROM {} {where_sql}GROUP BY {dimension} ORDER BY {dimension} LIMIT {limit}{}",
+        "SELECT {dimension}, quantilesExact(0, 0.25, 0.5, 0.75, 1)(toFloat64({measure})) AS {measure}, \
+         count() AS __n FROM {} {where_sql}GROUP BY {dimension} ORDER BY {dimension} LIMIT {limit}{}",
         from.render(),
         from.settings()
     )
@@ -992,8 +994,8 @@ mod tests {
         );
         assert_eq!(
             sql,
-            "SELECT region, quantilesExact(0, 0.25, 0.5, 0.75, 1)(toFloat64(amount)) AS amount \
-             FROM serving.mart_x WHERE tahun IN (2024) GROUP BY region ORDER BY region LIMIT 10"
+            "SELECT region, quantilesExact(0, 0.25, 0.5, 0.75, 1)(toFloat64(amount)) AS amount, \
+             count() AS __n FROM serving.mart_x WHERE tahun IN (2024) GROUP BY region ORDER BY region LIMIT 10"
         );
     }
 
