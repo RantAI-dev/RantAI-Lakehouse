@@ -1555,9 +1555,11 @@ mod refuses_unparseable_shapes {
 
 /// Real `ClickHouse` system table names that can leak information about
 /// OTHER principals' activity (queries they ran, sessions, in-flight
-/// processes) — reading these requires `audit:read`, unlike an
-/// ordinary `system.*` catalog table (`system.columns`, `system.tables`)
-/// which stays open to any authenticated caller.
+/// processes). [`classify_statement_for_principal`] admits them only to a
+/// caller holding `audit:read`, but [`enforce`] — the path every governed
+/// SQL surface takes — passes no permissions, so through those surfaces
+/// they are never readable; an ordinary `system.*` catalog table
+/// (`system.columns`, `system.tables`) stays open.
 const SENSITIVE_SYSTEM_TABLES: &[&str] = &[
     "system.query_log",
     "system.query_thread_log",
@@ -2447,7 +2449,15 @@ pub fn enforce(
     views_catalog: &dyn SystemTablesCatalog,
 ) -> Result<String, RewriteError> {
     let has_any_obligation = obligations_source.has_any_obligation(principal_roles);
-    classify_statement_for_principal(sql, dialect, principal_roles, has_any_obligation)?;
+    // No permissions, explicitly: the governed SQL surfaces (Query Studio,
+    // dashboards, embeds, alerts, Gold export) never read the
+    // SENSITIVE_SYSTEM_TABLES — the audit pages are the path to that data.
+    // This used to pass `principal_roles` here, into a parameter that
+    // compares entries with the literal permission "audit:read"; a role
+    // name never equals that, so the tables were always refused anyway.
+    // Passing an empty list states the rule instead of relying on a type
+    // mix-up (decision 2026-09-27, plan §8 item 3).
+    classify_statement_for_principal(sql, dialect, &[], has_any_obligation)?;
     let tables = referenced_tables(sql, dialect).ok_or(RewriteError::Unparseable)?;
     let mut obligations = HashMap::new();
     for table in &tables {
@@ -2501,6 +2511,34 @@ mod enforce_tests {
         )
         .unwrap();
         assert_eq!(out, "SELECT 1");
+    }
+
+    /// Decision 2026-09-27: governed surfaces never read the sensitive
+    /// system tables. Before, `enforce` passed ROLE names where the
+    /// classifier expects PERMISSIONS, so a role literally named
+    /// "audit:read" would have been let through; now it is not.
+    #[test]
+    fn a_sensitive_system_table_is_refused_whatever_the_role_names() {
+        let src = FakeObligations { any: false };
+        for roles in [
+            vec![],
+            vec!["audit:read".to_owned()],
+            vec!["Platform Admin".to_owned()],
+        ] {
+            let err = enforce(
+                "SELECT * FROM system.query_log",
+                &ClickHouseDialect {},
+                &roles,
+                &PlaceholderValues::none(),
+                &src,
+                &NoViews,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, RewriteError::SensitiveSystemTable { .. }),
+                "{roles:?}: {err:?}"
+            );
+        }
     }
 
     #[test]

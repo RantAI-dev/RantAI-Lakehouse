@@ -192,14 +192,17 @@ server on 3100 points `RUST_API_URL` at 18081.
 1. Measure a heavy join over the largest marts to confirm the 30 s cap.
 2. Should saved Query Studio queries and SQL sources merge later (one
    object, Metabase-style), or stay separate? Separate for now.
-3. Follow-up findings to file: `/values` + `/fields` without rewrite; the
-   report that `enforce` passes role names where permissions are expected
-   (`sql_rewrite.rs:1913-1916`, `2444-2450`) — unverified.
-4. Follow-up finding: the alerts digest (`lakehouse-alerts` `digest_text`)
-   runs each KPI tile's stored `spec.sql` with plain `ch.rows`, without the
-   policy rewrite — for every chart, not only SQL-source ones. For a
-   SQL-source KPI it also uses the SQL stored with the chart rather than
-   the source's current text. Not changed in this plan.
+3. RESOLVED (2026-09-27): `/api/dashboard/values` now goes through the
+   policy rewrite (it reads data). `/fields` reads schema metadata only and
+   stays unrewritten, stated at the function. The suspected role/permission
+   mix-up was real: `enforce` passed role names where the classifier checks
+   the permission `audit:read`, so the sensitive `system.*` tables were
+   always refused (fail-closed, no exposure). Decision: keep refusing them
+   on every governed surface; `enforce` now passes no permissions
+   explicitly and the docs/message say so (the audit pages are the path).
+4. RESOLVED (2026-09-27): alert values and digests go through a required
+   `SqlGate` (policy rewrite as "Dashboard Viewer", like embeds); digest
+   tiles on a SQL source are rebuilt from the current source.
 5. RESOLVED (2026-09-27): `state::tests::connector_secret_resolver_...`
    failed in the full `lakehouse-api` run on machines with a repo-root
    `.env` setting `CONNECTOR_*`: `sqlx::test`'s harness calls
@@ -218,7 +221,7 @@ server on 3100 points `RUST_API_URL` at 18081.
 8. RESOLVED (2026-09-27): in Ask mode the model re-queried numbers already
    in the page context; the context line now tells it to answer on-screen
    questions from the context (checked against DeepSeek: no tool calls).
-9. Open, design decision: the citation layer marks numbers taken from the
+9. Open, design decision (deferred to the team, 2026-09-27): the citation layer marks numbers taken from the
    page context as unverified and drops tables built from it ("table
    omitted: not backed by a tool result"), because the context is
    client-supplied. Treating it as a separate, labelled evidence source is
