@@ -92,6 +92,24 @@ export function getLineageColumns({
       },
     },
     {
+      id: "evidence",
+      accessorFn: (r) => r.evidence ?? "",
+      header: ({ column }) => (
+        <DataTableColumnHeader column={column} label="Recorded in" />
+      ),
+      cell: ({ row }) => (
+        <span className="text-xs text-muted-foreground">{row.original.evidence ?? "—"}</span>
+      ),
+      enableColumnFilter: true,
+      enableSorting: false,
+      meta: {
+        label: "Recorded in",
+        variant: "text",
+        placeholder: "Filter record…",
+        icon: GitCommit,
+      },
+    },
+    {
       id: "actions",
       header: () => null,
       cell: ({ row }) => {

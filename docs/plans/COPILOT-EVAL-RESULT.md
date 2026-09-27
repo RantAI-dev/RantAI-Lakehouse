@@ -151,6 +151,72 @@ citation check and repair round, plain rules) also carry a 4B model to
 correct answers. For interactive use, serve it on a GPU or a hosted
 small-model endpoint: on CPU it answers in minutes.
 
+## Lakehouse operations added (2026-09-27)
+
+The copilot went from 48 to 62 tools. Every new tool calls the console's
+own route handler, so validation, SSRF checks, credential derivation and
+tenancy are the console's, not a copy.
+
+| Area | Tools | Risk |
+| --- | --- | --- |
+| Ingest | `get_ingest_spec`, `discover_source`, `list_ingest_runs` (read); `set_ingest_spec`, `run_ingest` (confirm); `rotate_connector_credential` (approval) | as the console route |
+| Pipeline authoring | `get_pipeline` (read); `create_pipeline`, `mark_pipeline_ready` (confirm) | transforms re-validated by `transform_grammar` |
+| Iceberg tables | `list_iceberg_tables`, `describe_iceberg_table`, `get_table_maintenance` (read); `set_table_maintenance` (confirm) | |
+| Storage | `get_capacity` (read) | |
+
+**Fixed along the way:**
+
+- **`trigger_lakehouse_build` failed on every product stack.** It launched
+  `refresh_lakehouse`, a job only the demo code location has. It now uses
+  that job when it exists; otherwise it runs the product's own steps in
+  layer order:
+  1. an ingest run for every connector with a batch or stream spec;
+  2. every authored pipeline job;
+  3. `gold_export_job`.
+
+  It reports what it launched and what it skipped, and why.
+- **Lineage was "not implemented".** `GET /api/governance/lineage` and
+  `get_lineage` now share one graph (`routes/lineage.rs`). It is built
+  only from recorded facts, and every edge names its record:
+  - ingest specs;
+  - the catalog registry;
+  - dataset publishers;
+  - authored pipelines;
+  - view definitions;
+  - Gold exports.
+
+  Tenant-owned edges follow `tenant_scope`; the shared catalog follows
+  `catalog_tenant_refusal`. The Lineage page now reads `?focus=`, offers
+  the catalog's datasets, and shows each edge's record.
+- **`GET /api/lakehouse/capacity` always returned "unavailable".** An output
+  alias shadowed the `measured_at` column, so ClickHouse 26.8 rejected the
+  query. The Capacity page now shows numbers.
+- **The DATA MAP and `lakehouse_overview` were not tenant-gated.** They
+  now follow the same shared-catalog rule as the catalog route. The map
+  carries sample values, so a refused tenant must not get it through chat.
+- **Gate messages were Indonesian.** They are now English, and a
+  confirmation is worded so it cannot be mistaken for an approval: one
+  answer had told the user to confirm a rebuild in Approvals.
+
+**Live smoke test through `POST /api/ai/tool`.** Run with a throwaway
+connector and pipeline, all removed afterwards:
+
+- **Correct:** the Iceberg list and detail, capacity, lineage (catalog,
+  publisher, view and export edges), ingest-spec set and read, `run_ingest`
+  launching a real Dagster run, rotation going to Approvals, pipeline create
+  and ready, and the rebuild reporting launched and skipped steps.
+- **Refused as expected:** a malicious transform, and a write in Ask mode.
+- **Accepted by configuration:** a link-local ingest host, because this dev
+  stack runs with `CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true`, the compose
+  default. The same route refuses it when the flag is off.
+
+**Eval.** Five cases were added for these areas: Iceberg tables, capacity,
+the lineage of a Gold table, a rebuild request and pipeline authoring. On
+MiniMax-M3 all 28 cases scored 1.000 (run v9). After the confirmation
+wording fix, run v10 scored completeness 1.000, accuracy 1.000 and overall
+0.999; the only deduction is one 36 s answer. The small model was not re-run
+for this round.
+
 ## Known gaps
 
 - **Latency.** On CPU, a 4B model takes minutes per turn; that is a hardware

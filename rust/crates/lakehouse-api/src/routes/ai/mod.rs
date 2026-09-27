@@ -155,6 +155,7 @@ struct ChatBody {
 pub async fn chat(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
     let Ok(parsed) = serde_json::from_slice::<ChatBody>(&body) else {
@@ -166,7 +167,7 @@ pub async fn chat(
     };
     let principal = principal.map(|Extension(p)| p);
     let stream = parsed.stream;
-    let run = match prepare_chat(&state, principal.as_ref(), parsed).await {
+    let run = match prepare_chat(&state, principal.as_ref(), &headers, parsed).await {
         Ok(run) => run,
         Err(response) => return response,
     };
@@ -199,9 +200,57 @@ async fn masked_columns(state: &AppState) -> Option<std::collections::HashSet<(S
     Some(data_map::masked_columns(&conditions))
 }
 
+/// The system prompt: the rules for the mode, the DATA MAP (when the
+/// caller may read the shared catalog), the page the user is on, and the
+/// reply-language line last.
+async fn system_prompt(
+    state: &AppState,
+    principal: Option<&Principal>,
+    headers: &axum::http::HeaderMap,
+    is_build: bool,
+    context: &str,
+    latest_user: &str,
+) -> String {
+    let masked = masked_columns(state).await;
+    // The DATA MAP describes the shared, one-per-deployment catalog and
+    // carries sample values, so it follows the catalog route's own rule
+    // (`catalog::catalog_tenant_refusal`): a caller that route refuses gets
+    // no map, and one it cannot evaluate gets none either (fail closed).
+    let refusal = match principal {
+        Some(p) => crate::routes::catalog::catalog_tenant_refusal(state, p, headers)
+            .await
+            .unwrap_or(Some("the shared-catalog rule could not be evaluated")),
+        None => Some("no signed-in user"),
+    };
+    let schema = match refusal {
+        None => data_map::data_map(&state.clickhouse, masked.as_ref()).await,
+        Some(reason) => format!("(withheld: {reason})"),
+    };
+    let base = if is_build {
+        format!("{}{}", prompt::SYSTEM_BASE, prompt::SYSTEM_BUILD_SUFFIX)
+    } else {
+        format!("{}{}", prompt::SYSTEM_BASE, prompt::SYSTEM_ASK_SUFFIX)
+    };
+    let page_ctx: String = context.chars().take(800).collect();
+    let ctx_line = if page_ctx.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nCURRENT PAGE CONTEXT: {page_ctx}\nTailor your help, wording, and suggestions to where the user currently is."
+        )
+    };
+    (if schema.is_empty() {
+        base + "\n\nDATA MAP: unavailable right now (ClickHouse did not answer). Use describe_mart and run_sql to explore."
+    } else {
+        format!("{base}\n\nDATA MAP\n{schema}")
+    } + &ctx_line
+        + &prompt::closing(latest_user))
+}
+
 async fn prepare_chat(
     state: &AppState,
     principal: Option<&Principal>,
+    headers: &axum::http::HeaderMap,
     parsed: ChatBody,
 ) -> Result<PreparedChat, Response> {
     let perms = principal.map(|p| &p.permissions);
@@ -230,39 +279,21 @@ async fn prepare_chat(
     }
 
     let is_build = parsed.mode.as_deref() == Some("build");
-    let masked = masked_columns(state).await;
-    let schema = data_map::data_map(&state.clickhouse, masked.as_ref()).await;
-    let base = if is_build {
-        format!("{}{}", prompt::SYSTEM_BASE, prompt::SYSTEM_BUILD_SUFFIX)
-    } else {
-        format!("{}{}", prompt::SYSTEM_BASE, prompt::SYSTEM_ASK_SUFFIX)
-    };
-    let page_ctx: String = parsed
-        .context
-        .unwrap_or_default()
-        .chars()
-        .take(800)
-        .collect();
-    let ctx_line = if page_ctx.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\nCURRENT PAGE CONTEXT: {page_ctx}\nTailor your help, wording, and suggestions to where the user currently is."
-        )
-    };
-    let sys = if schema.is_empty() {
-        base + "\n\nDATA MAP: unavailable right now (ClickHouse did not answer). Use describe_mart and run_sql to explore."
-    } else {
-        format!("{base}\n\nDATA MAP\n{schema}")
-    } + &ctx_line
-        + &prompt::closing(
-            parsed
-                .messages
-                .iter()
-                .rev()
-                .find(|m| m.role == "user")
-                .map_or("", |m| m.content.as_str()),
-        );
+    let latest_user = parsed
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map_or("", |m| m.content.as_str());
+    let sys = system_prompt(
+        state,
+        principal,
+        headers,
+        is_build,
+        parsed.context.as_deref().unwrap_or_default(),
+        latest_user,
+    )
+    .await;
 
     let recent_user: Vec<&str> = parsed
         .messages
@@ -869,7 +900,7 @@ pub async fn tool_call(
     let Some(spec) = registry::find(&parsed.tool) else {
         return (
             StatusCode::BAD_REQUEST,
-            ApiJson(json!({ "error": format!("tool tak dikenal: {}", parsed.tool) })),
+            ApiJson(json!({ "error": format!("unknown tool: {}", parsed.tool) })),
         )
             .into_response();
     };

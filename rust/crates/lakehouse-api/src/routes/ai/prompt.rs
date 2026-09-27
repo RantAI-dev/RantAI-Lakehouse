@@ -52,7 +52,7 @@ ANSWERING QUESTIONS ABOUT DATA
 6. Answer every part of the question. Start with the direct answer and its number. Add a short table only when comparing several items. End with one short line naming the table you used.
 
 ANSWERING QUESTIONS ABOUT THE PLATFORM
-- For pipelines, connectors, dashboards, alerts, data quality, audit, CDC replication, maintenance and running queries, call the matching tool. Never answer these from memory.
+- For pipelines, connectors and ingest, Iceberg tables, storage capacity, lineage, dashboards, alerts, data quality, audit, CDC replication, maintenance and running queries, call the matching tool. Never answer these from memory.
 - Name the specific items you report on (the pipeline, connector, slot, table or rule), not only their status.
 - Which pipelines are failing or healthy: list_pipelines (each pipeline's latest status). get_build_status is only a log of the latest runs across all jobs.
 - If a tool returns an empty list, the answer is that there are none (say so directly, e.g. \"There are no connectors registered.\"). If a tool fails, say it could not be checked and why, in one sentence.
@@ -165,11 +165,14 @@ MODE: BUILD. Besides answering, you can operate the lakehouse:
 - Charts and dashboards: call describe_mart first, then create_chart using only columns that exist. For a request without details, call suggest_dashboard. To group charts, create_board first, then create_chart with board=<id>. To change a chart, update_chart with every field.
 - Alerts and digests: list_alert_rules to see existing rules; create_alert_rule / update_alert_rule (alert: mart, measure, agg, op, threshold; digest: board); run_alert_rule sends the webhook or email for real.
 - Connectors: list_connectors, create_connector (credentials are only ever a reference the server derives, never a real secret), test_connector for a real connection test.
-- Pipelines: list_pipelines / list_pipeline_runs for status; trigger_pipeline, retry_pipeline_run, resume_pipeline to run; trigger_lakehouse_build rebuilds Bronze -> Silver -> Gold (explain the plan in one line first).
+- Ingest into Bronze: get_ingest_spec to see what a connector ingests, discover_source to list the source's tables, set_ingest_spec to choose tables and their Bronze targets, run_ingest to run it now, list_ingest_runs for results. rotate_connector_credential points a connector at a new credential.
+- Pipelines: list_pipelines / get_pipeline / list_pipeline_runs for status; create_pipeline to author one (saved as draft), mark_pipeline_ready to make it runnable; trigger_pipeline, retry_pipeline_run, resume_pipeline to run; trigger_lakehouse_build rebuilds every layer from what the deployment has (explain the plan in one line first, then report what was launched and what was skipped).
+- Iceberg tables: list_iceberg_tables, describe_iceberg_table, get_table_maintenance, set_table_maintenance. Storage: get_capacity.
 - Saved queries: save_query, list_saved_queries, run_saved_query.
 - Governance: draft_policy, draft_classification_rule, draft_quality_rule always save a draft; activating it stays a human action in the console.
 - Gold export: export_gold_mart appends a mart to its Iceberg table (running it again appends again); get_gold_export reads it back.
-- These need human approval and do not run immediately: delete_alert_rule, delete_connector, pause_pipeline, cancel_pipeline_run, delete_chart, run_bronze_maintenance, kill_query. Tell the user the request is waiting in Approvals (/agents/approvals).
+- These need human approval and do not run immediately: delete_alert_rule, delete_connector, rotate_connector_credential, pause_pipeline, cancel_pipeline_run, delete_chart, run_bronze_maintenance, kill_query. Tell the user the request is waiting in Approvals (/agents/approvals).
+- needs_confirmation and needs_approval are different. needs_confirmation: the user confirms in this chat, with the Confirm button under your reply; never mention Approvals for it. needs_approval: a human must approve it in Approvals (/agents/approvals).
 - When a tool result says needs_confirmation, reply with ONE short sentence such as \"The chart draft is ready — review the preview below and confirm.\" Do not repeat the arguments and do not ask the user to type a confirmation: the console shows the preview with a confirm button.";
 
 /// Tools offered on every turn: the data tools, and the read-only listings
@@ -327,6 +330,76 @@ const DOMAINS: &[Domain] = &[
     Domain {
         words: &["export", "ekspor"],
         tools: &["export_gold_mart", "get_gold_export"],
+    },
+    Domain {
+        words: &[
+            "pipeline",
+            "transform",
+            "buat pipeline",
+            "create a pipeline",
+        ],
+        tools: &["get_pipeline", "create_pipeline", "mark_pipeline_ready"],
+    },
+    Domain {
+        words: &[
+            "ingest",
+            "discover",
+            "tarik",
+            "sync",
+            "load",
+            "credential",
+            "kredensial",
+            "password",
+            "secret",
+            "rotate",
+            "rotasi",
+            "connector",
+            "konektor",
+            "source table",
+            "sumber",
+        ],
+        tools: &[
+            "get_ingest_spec",
+            "set_ingest_spec",
+            "discover_source",
+            "run_ingest",
+            "list_ingest_runs",
+            "rotate_connector_credential",
+        ],
+    },
+    Domain {
+        words: &[
+            "iceberg",
+            "snapshot",
+            "partition",
+            "namespace",
+            "warehouse",
+            "lakekeeper",
+            "bronze",
+            "maintenance",
+            "compaction",
+            "orphan",
+            "perawatan",
+        ],
+        tools: &[
+            "list_iceberg_tables",
+            "describe_iceberg_table",
+            "get_table_maintenance",
+            "set_table_maintenance",
+        ],
+    },
+    Domain {
+        words: &[
+            "capacity",
+            "kapasitas",
+            "storage",
+            "penyimpanan",
+            "disk",
+            "bucket",
+            "size",
+            "ukuran",
+        ],
+        tools: &["get_capacity"],
     },
 ];
 

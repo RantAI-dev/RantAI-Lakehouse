@@ -9,11 +9,12 @@ import { FlowCanvas } from "@/components/patterns/flow-canvas"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Input } from "@/components/ui/input"
+import { useSearchParams } from "next/navigation"
 import { useDataTable } from "@/hooks/use-data-table"
 import { useService } from "@/hooks/use-service"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { filterDataClientSide } from "@/lib/data-table"
-import { governanceService } from "@/services"
+import { assetService, governanceService } from "@/services"
 import type { LineageGraph } from "@/services/contracts/governance"
 import { getLineageColumns } from "./lineage-columns"
 
@@ -73,21 +74,35 @@ function ConnectionsTable({ graph }: { readonly graph: LineageGraph }) {
 }
 
 export function LineagePage() {
-  const [focus, setFocus] = React.useState("event-pariwisata")
+  // An asset page links here with `?focus=<asset id>`; with no focus the
+  // page starts empty and offers the catalog's datasets to pick from,
+  // rather than a hardcoded dataset.
+  const searchParams = useSearchParams()
+  const [focus, setFocus] = React.useState(searchParams.get("focus") ?? "")
   const state = useService((s) => governanceService.getLineage(focus, s), [focus])
+  const assets = useService((s) => assetService.listAssets({}, s), [])
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Lineage"
-        description="Dataset, pipeline, query, and agent-action lineage with column mappings."
+        description="What feeds a dataset or table and what it feeds: connector ingest, catalog registry, authored pipelines, views and Gold exports. Every connection comes from a platform record."
       />
       <Input
         value={focus}
         onChange={(e) => setFocus(e.target.value)}
         className="max-w-sm"
-        aria-label="Focus asset id"
-        placeholder="Focus asset id"
+        aria-label="Dataset or table"
+        placeholder="Dataset slug or table, e.g. serving.<table>"
+        list="lineage-focus-options"
       />
+      <datalist id="lineage-focus-options">
+        {assets.status === "success"
+          ? assets.data.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)
+          : null}
+      </datalist>
+      {state.status === "success" && state.data.supported && state.data.nodes.length === 0 ? (
+        <EmptyState title="No lineage to show" description={state.data.note} />
+      ) : null}
       {state.status === "loading" ? <LoadingSkeleton /> : null}
       {state.status === "error" ? <ErrorState error={state.error} onRetry={state.reload} /> : null}
       {state.status === "success" && !state.data.supported ? (
@@ -97,7 +112,7 @@ export function LineagePage() {
         // capture is not implemented".
         <EmptyState title="Lineage not available" description={state.data.reason} />
       ) : null}
-      {state.status === "success" && state.data.supported ? (
+      {state.status === "success" && state.data.supported && state.data.nodes.length > 0 ? (
         <>
           <SectionCard title="Graph">
             <FlowCanvas
@@ -114,16 +129,27 @@ export function LineagePage() {
           >
             <ConnectionsTable graph={state.data} />
           </SectionCard>
-          <SectionCard title="Column mappings">
-            <ul className="space-y-2 text-sm">
-              {state.data.columnMappings.map((m) => (
-                <li key={`${m.source}-${m.target}`} className="font-mono text-xs">
-                  {m.source} → {m.target}{" "}
-                  <span className="text-muted-foreground">({m.transform})</span>
-                </li>
-              ))}
-            </ul>
-          </SectionCard>
+          {state.data.columnMappings.length > 0 ? (
+            <SectionCard title="Column mappings">
+              <ul className="space-y-2 text-sm">
+                {state.data.columnMappings.map((m) => (
+                  <li key={`${m.source}-${m.target}`} className="font-mono text-xs">
+                    {m.source} → {m.target}{" "}
+                    <span className="text-muted-foreground">({m.transform})</span>
+                  </li>
+                ))}
+              </ul>
+            </SectionCard>
+          ) : null}
+          {state.data.coverage?.length ? (
+            <SectionCard title="What this graph covers">
+              <ul className="list-disc space-y-1 pl-5 text-sm text-muted-foreground">
+                {state.data.coverage.map((c) => (
+                  <li key={c}>{c}</li>
+                ))}
+              </ul>
+            </SectionCard>
+          ) : null}
         </>
       ) : null}
     </div>

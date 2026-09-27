@@ -18,22 +18,154 @@ use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use lakehouse_auth::Principal;
 
-use super::{arg_str, response_to_value};
+use axum::response::IntoResponse;
+
+use super::{api_result_to_value, arg_str, response_to_value};
 use crate::state::AppState;
 
-pub(super) async fn trigger_build(dagster: &lakehouse_dagster::DgClient) -> Value {
-    match dagster.launch_run("refresh_lakehouse").await {
-        Ok(outcome) => {
-            if let Some(error) = outcome.error {
-                return json!({ "error": error });
+/// The Dagster job the demo code location builds the whole lakehouse with.
+/// The product code location (`dagster/dispar_orchestrate`) has no such
+/// job: it ingests per connector, runs authored pipelines as their own
+/// jobs, and exports Gold on its own schedule.
+const DEMO_BUILD_JOB: &str = "refresh_lakehouse";
+
+/// Rebuilds the lakehouse from what this deployment actually has.
+///
+/// This tool used to launch `refresh_lakehouse` unconditionally, a job
+/// that exists only in the demo code location; on the product stack every
+/// call failed. It now launches `refresh_lakehouse` when that job exists,
+/// and otherwise runs the product's own steps in layer order:
+///
+/// 1. **Bronze**: an ingest run for every connector with a batch or
+///    stream ingest spec the caller can see (CDC connectors are streamed
+///    continuously by Debezium and have nothing to launch). Needs
+///    `connector:manage`, like "Run now" in the console.
+/// 2. **Silver/Gold**: every authored pipeline job (`authored__*`).
+/// 3. **Gold Iceberg**: `gold_export_job`.
+///
+/// Every step reports what it launched or why it did not; nothing is
+/// claimed that was not launched.
+pub(super) async fn trigger_build(state: &AppState, principal: Option<&Principal>) -> Value {
+    let Ok(jobs) = state.dagster.list_jobs().await else {
+        return json!({ "error": "Dagster could not be reached to list its jobs" });
+    };
+    if jobs.iter().any(|j| j == DEMO_BUILD_JOB) {
+        return match state.dagster.launch_run(DEMO_BUILD_JOB).await {
+            Ok(outcome) => match outcome.error {
+                Some(error) => json!({ "error": error }),
+                None => json!({
+                    "launched": true,
+                    "runId": outcome.run_id,
+                    "note": "The Bronze -> Silver -> Gold build is running. Check it with get_build_status.",
+                }),
+            },
+            Err(_) => json!({ "error": "Dagster did not accept the build run" }),
+        };
+    }
+
+    let mut launched: Vec<Value> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+
+    ingest_step(state, principal, &mut launched, &mut skipped).await;
+
+    // 2 and 3: authored pipelines, then the Gold export.
+    let mut ordered: Vec<&String> = jobs
+        .iter()
+        .filter(|j| j.starts_with("authored__"))
+        .collect();
+    if ordered.is_empty() {
+        skipped
+            .push(json!({ "step": "pipelines", "reason": "no authored pipeline is ready to run" }));
+    }
+    if let Some(export) = jobs.iter().find(|j| *j == "gold_export_job") {
+        ordered.push(export);
+    } else {
+        skipped.push(json!({ "step": "gold_export", "reason": "gold_export_job is not in this code location" }));
+    }
+    for job in ordered {
+        let step = if job == "gold_export_job" {
+            "gold_export"
+        } else {
+            "pipeline"
+        };
+        match state.dagster.launch_run(job).await {
+            Ok(outcome) if outcome.error.is_none() => {
+                launched.push(json!({ "step": step, "job": job, "runId": outcome.run_id }));
             }
-            json!({
-                "launched": true,
-                "runId": outcome.run_id,
-                "note": "Pipeline Bronze→Silver→Gold dijalankan. Cek status dengan get_build_status.",
-            })
+            Ok(outcome) => {
+                skipped.push(json!({ "step": step, "job": job, "error": outcome.error }));
+            }
+            Err(_) => skipped.push(
+                json!({ "step": step, "job": job, "error": "Dagster did not accept the run" }),
+            ),
         }
-        Err(err) => json!({ "error": err.to_string() }),
+    }
+
+    let first_run = launched
+        .iter()
+        .find_map(|l| l.get("runId").and_then(Value::as_str).map(str::to_owned));
+    json!({
+        "launched": launched,
+        "skipped": skipped,
+        "runId": first_run,
+        "note": "Silver and Gold tables loaded by jobs outside this platform are not rebuilt by this step.",
+    })
+}
+
+/// Step 1 of [`trigger_build`]: an ingest run for every visible connector
+/// with a batch or stream ingest spec.
+async fn ingest_step(
+    state: &AppState,
+    principal: Option<&Principal>,
+    launched: &mut Vec<Value>,
+    skipped: &mut Vec<Value>,
+) {
+    let may_ingest = principal.is_some_and(|p| p.has("connector:manage"));
+    if may_ingest {
+        let visible = super::connectors::list_connectors(state, principal).await;
+        let visible_ids: Vec<String> = visible
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c.get("id").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        let ingestible = match state.pg.as_deref() {
+            Some(pool) => lakehouse_store::connectors::list_ingestible_connectors(pool)
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let mut any = false;
+        for connector in ingestible.iter().filter(|c| visible_ids.contains(&c.id)) {
+            any = true;
+            if connector.ingest_mode == "cdc" {
+                skipped.push(json!({ "step": "ingest", "connector": connector.id,
+                    "reason": "CDC connector: Debezium streams it continuously" }));
+                continue;
+            }
+            let result = response_to_value(
+                crate::routes::connectors::ingest_run(
+                    State(state.clone()),
+                    Path(connector.id.clone()),
+                )
+                .await
+                .into_response(),
+            )
+            .await;
+            if result.get("error").is_some() || result.get("supported") == Some(&json!(false)) {
+                skipped
+                    .push(json!({ "step": "ingest", "connector": connector.id, "result": result }));
+            } else {
+                launched
+                    .push(json!({ "step": "ingest", "connector": connector.id, "result": result }));
+            }
+        }
+        if !any {
+            skipped.push(json!({ "step": "ingest", "reason": "no connector has an ingest spec" }));
+        }
+    } else {
+        skipped.push(json!({ "step": "ingest",
+            "reason": "running connector ingest needs connector:manage, which this user does not have" }));
     }
 }
 
@@ -101,7 +233,7 @@ pub(super) async fn list_pipelines(state: &AppState, principal: Option<&Principa
 pub(super) async fn list_pipeline_runs(state: &AppState, args: &Map<String, Value>) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
-        return json!({ "error": "id wajib diisi" });
+        return json!({ "error": "id is required" });
     }
     response_to_value(crate::routes::pipelines::runs(State(state.clone()), Path(id)).await).await
 }
@@ -120,7 +252,7 @@ pub(super) async fn trigger_pipeline(
 ) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
-        return json!({ "error": "id wajib diisi" });
+        return json!({ "error": "id is required" });
     }
     let extension = principal.cloned().map(Extension);
     response_to_value(
@@ -132,7 +264,7 @@ pub(super) async fn trigger_pipeline(
 pub(super) async fn retry_pipeline_run(state: &AppState, args: &Map<String, Value>) -> Value {
     let run_id = arg_str(args, "runId");
     if run_id.is_empty() {
-        return json!({ "error": "runId wajib diisi" });
+        return json!({ "error": "runId is required" });
     }
     response_to_value(crate::routes::pipelines::retry_run(State(state.clone()), Path(run_id)).await)
         .await
@@ -145,7 +277,7 @@ pub(super) async fn pause_pipeline(
 ) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
-        return json!({ "error": "id wajib diisi" });
+        return json!({ "error": "id is required" });
     }
     let extension = principal.cloned().map(Extension);
     response_to_value(
@@ -161,7 +293,7 @@ pub(super) async fn resume_pipeline(
 ) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
-        return json!({ "error": "id wajib diisi" });
+        return json!({ "error": "id is required" });
     }
     let extension = principal.cloned().map(Extension);
     response_to_value(
@@ -173,10 +305,56 @@ pub(super) async fn resume_pipeline(
 pub(super) async fn cancel_pipeline_run(state: &AppState, args: &Map<String, Value>) -> Value {
     let run_id = arg_str(args, "runId");
     if run_id.is_empty() {
-        return json!({ "error": "runId wajib diisi" });
+        return json!({ "error": "runId is required" });
     }
     response_to_value(
         crate::routes::pipelines::cancel_run(State(state.clone()), Path(run_id)).await,
+    )
+    .await
+}
+
+pub(super) async fn create_pipeline(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    let Some(principal) = principal else {
+        return json!({ "error": "creating a pipeline needs a signed-in user" });
+    };
+    let mut body = args.clone();
+    body.entry("kind").or_insert(json!("batch"));
+    body.entry("schedule").or_insert(json!("manual"));
+    api_result_to_value(
+        crate::routes::pipelines::create(
+            State(state.clone()),
+            Extension(principal.clone()),
+            axum::body::Bytes::from(Value::Object(body).to_string()),
+        )
+        .await,
+    )
+    .await
+}
+
+pub(super) async fn get_pipeline(state: &AppState, args: &Map<String, Value>) -> Value {
+    let id = arg_str(args, "id");
+    if id.is_empty() {
+        return json!({ "error": "id is required" });
+    }
+    response_to_value(crate::routes::pipelines::detail(State(state.clone()), Path(id)).await).await
+}
+
+pub(super) async fn mark_pipeline_ready(state: &AppState, args: &Map<String, Value>) -> Value {
+    let id = arg_str(args, "id");
+    if id.is_empty() {
+        return json!({ "error": "id is required" });
+    }
+    api_result_to_value(
+        crate::routes::pipelines::set_status_route(
+            State(state.clone()),
+            Path(id),
+            axum::body::Bytes::from(json!({ "status": "ready" }).to_string()),
+        )
+        .await,
     )
     .await
 }
@@ -199,27 +377,27 @@ mod t1_3_tests {
         let s = state();
         assert_eq!(
             list_pipeline_runs(&s, &Map::new()).await,
-            json!({ "error": "id wajib diisi" })
+            json!({ "error": "id is required" })
         );
         assert_eq!(
             trigger_pipeline(&s, None, &Map::new()).await,
-            json!({ "error": "id wajib diisi" })
+            json!({ "error": "id is required" })
         );
         assert_eq!(
             pause_pipeline(&s, None, &Map::new()).await,
-            json!({ "error": "id wajib diisi" })
+            json!({ "error": "id is required" })
         );
         assert_eq!(
             resume_pipeline(&s, None, &Map::new()).await,
-            json!({ "error": "id wajib diisi" })
+            json!({ "error": "id is required" })
         );
         assert_eq!(
             retry_pipeline_run(&s, &Map::new()).await,
-            json!({ "error": "runId wajib diisi" })
+            json!({ "error": "runId is required" })
         );
         assert_eq!(
             cancel_pipeline_run(&s, &Map::new()).await,
-            json!({ "error": "runId wajib diisi" })
+            json!({ "error": "runId is required" })
         );
     }
 }

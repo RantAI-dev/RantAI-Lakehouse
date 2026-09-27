@@ -363,7 +363,24 @@ pub(super) async fn describe_dataset(ch: &ChClient, args: &Map<String, Value>) -
 /// datasets, and every Silver and Gold table with its row count. The
 /// question "what data do we have?" is answered from this, in layer terms,
 /// instead of from a dataset list that only knows source kinds.
-pub(super) async fn lakehouse_overview(ch: &ChClient) -> Value {
+pub(super) async fn lakehouse_overview(state: &AppState, principal: Option<&Principal>) -> Value {
+    // The same shared-catalog rule the catalog route and the DATA MAP
+    // apply: this tool lists the shared catalog and every table in it.
+    let Some(principal) = principal else {
+        return json!({ "error": "the lakehouse overview needs a signed-in user" });
+    };
+    match crate::routes::catalog::catalog_tenant_refusal(
+        state,
+        principal,
+        &axum::http::HeaderMap::new(),
+    )
+    .await
+    {
+        Ok(None) => {}
+        Ok(Some(reason)) => return json!({ "supported": false, "reason": reason }),
+        Err(_) => return json!({ "error": "the shared-catalog rule could not be evaluated" }),
+    }
+    let ch = &state.clickhouse;
     let counts = match table_rows(ch).await {
         Ok(c) => c,
         Err(err) => return json!({ "error": err }),
@@ -409,82 +426,68 @@ pub(super) async fn lakehouse_overview(ch: &ChClient) -> Value {
     })
 }
 
-pub(super) async fn get_lineage(ch: &ChClient, args: &Map<String, Value>) -> Value {
-    let slug_raw = arg_str(args, "slug");
-    let slug = SqlLiteral::from(slug_raw.as_str());
-    let Ok(meta_rows) = ch
-        .rows(
-            &format!("SELECT table_name, tier FROM {CATALOG_UNION} WHERE slug={slug} LIMIT 1"),
-            None,
-        )
-        .await
+/// The recorded lineage around a dataset or table: the same graph
+/// `GET /api/governance/lineage` serves (`routes::lineage`), so the
+/// copilot and the Lineage page can never disagree. `chain` lists every
+/// edge as one line for the model; `nodes`/`edges` carry the graph.
+pub(super) async fn get_lineage(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    let focus = {
+        let slug = arg_str(args, "slug");
+        if slug.is_empty() {
+            arg_str(args, "focus")
+        } else {
+            slug
+        }
+    };
+    if focus.is_empty() {
+        return json!({ "error": "slug is required: a dataset slug or a table name such as serving.<table>" });
+    }
+    let Some(principal) = principal else {
+        return json!({ "error": "lineage needs a signed-in user" });
+    };
+    let Ok(graph) =
+        crate::routes::lineage::build(state, principal, &axum::http::HeaderMap::new(), &focus)
+            .await
     else {
-        return json!({ "error": "the dataset catalog could not be read" });
+        return json!({ "error": "lineage could not be built for this user" });
     };
-    let Some(meta) = meta_rows.first() else {
-        return json!({ "error": format!("no dataset with slug '{slug_raw}'; call list_datasets for the slugs") });
-    };
-    let table = meta
-        .get("table_name")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_owned();
-    // The publisher recorded for the dataset, when the sync registry has
-    // one. The source used to be a hardcoded name of one tenant's data
-    // portal for every primary dataset, whoever the tenant was.
-    let publisher = ch
-        .rows(
-            &format!(
-                "SELECT author FROM lake.`bronze_meta.dataset_sync` WHERE slug={slug} \
-                 UNION ALL SELECT author FROM lake.`bronze_meta_sec.dataset_sync` WHERE slug={slug} LIMIT 1"
-            ),
-            None,
-        )
-        .await
-        .ok()
-        .and_then(|r| r.first().and_then(|row| row.get("author").and_then(Value::as_str)).map(str::to_owned))
-        .filter(|a| !a.is_empty());
-    let source = publisher.unwrap_or_else(|| {
-        format!(
-            "{} (publisher not recorded)",
-            source_kind(meta.get("tier").and_then(Value::as_str).unwrap_or(""))
-        )
-    });
-    let counts = table_rows(ch).await.unwrap_or_default();
-    let layers = layers_for(&slug_raw, &table, &counts);
-    let silver = if layers["silver"]["present"] == json!(true) {
-        format!("Silver silver.{table}")
-    } else {
-        "Silver (no Silver table is linked to this dataset)".to_owned()
-    };
-    let gold = if layers["gold"]["present"] == json!(true) {
-        format!("Gold serving.{table}")
-    } else {
-        "Gold (no Gold table found)".to_owned()
-    };
-    // Column-level mappings exist only where the transform recorded them.
-    let escaped_table = SqlLiteral::from(table.as_str());
-    let mappings: Vec<String> = ch
-        .rows(
-            &format!("SELECT kolom, tipe FROM _silver_meta.kolom_tipe WHERE tabel={escaped_table} LIMIT 100"),
-            None,
-        )
-        .await
-        .unwrap_or_default()
-        .iter()
-        .map(|c| {
-            format!(
-                "{} → {}",
-                c.get("kolom").and_then(Value::as_str).unwrap_or(""),
-                c.get("tipe").and_then(Value::as_str).unwrap_or("")
-            )
+    let labels: std::collections::HashMap<&str, &str> = graph["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| Some((n.get("id")?.as_str()?, n.get("label")?.as_str()?)))
+        .collect();
+    let chain: Vec<String> = graph["edges"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let from = e.get("from")?.as_str()?;
+            let to = e.get("to")?.as_str()?;
+            Some(format!(
+                "{} -[{}]-> {}",
+                labels.get(from).unwrap_or(&from),
+                e.get("kind")?.as_str()?,
+                labels.get(to).unwrap_or(&to)
+            ))
         })
         .collect();
-    json!({
-        "chain": format!("{source} → Bronze (dataset {slug_raw}) → {silver} → {gold}"),
-        "layers": layers,
-        "columnMappings": if mappings.is_empty() { json!("not recorded for this dataset") } else { json!(mappings) },
-    })
+    let mut out = graph.clone();
+    out["chain"] = if chain.is_empty() {
+        json!(
+            graph
+                .get("note")
+                .and_then(Value::as_str)
+                .unwrap_or("no recorded lineage")
+        )
+    } else {
+        json!(chain.join("\n"))
+    };
+    out
 }
 
 pub(super) async fn get_quality(ch: &ChClient) -> Value {

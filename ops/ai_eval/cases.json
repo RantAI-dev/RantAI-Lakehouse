@@ -418,6 +418,96 @@
       "args_contains": {
         "mart": "mart_event"
       }
-    }
+    },
+    "forbid": [
+      "approvals"
+    ]
+  },
+  {
+    "id": "iceberg_tables",
+    "turns": [
+      "Which Iceberg namespaces and tables do we have in the lakehouse warehouse?"
+    ],
+    "facts": [
+      {
+        "label": "namespace",
+        "kind": "text",
+        "api": "/api/lakehouse/namespaces",
+        "path": "namespaces[]",
+        "field": "name"
+      },
+      {
+        "label": "gold iceberg table",
+        "kind": "text",
+        "api": "/api/lakehouse/tables?namespace=gold",
+        "path": "tables[]",
+        "field": "name"
+      }
+    ]
+  },
+  {
+    "id": "storage_capacity",
+    "turns": [
+      "How much object storage are we using, per bucket?"
+    ],
+    "facts": [
+      {
+        "label": "bucket",
+        "kind": "text",
+        "api": "/api/lakehouse/capacity",
+        "path": "buckets[]",
+        "field": "name"
+      }
+    ]
+  },
+  {
+    "id": "lineage_gold_mart",
+    "turns": [
+      "What feeds the serving.mart_event table, and where does it go after that?"
+    ],
+    "facts": [
+      {
+        "label": "dataset",
+        "kind": "text",
+        "sql": "SELECT title FROM (SELECT title, table_name FROM lake.`bronze_meta.dataset_catalog` UNION ALL SELECT title, table_name FROM lake.`bronze_meta_sec.dataset_catalog`) WHERE table_name = 'mart_event'"
+      },
+      {
+        "label": "export",
+        "kind": "text",
+        "values": [
+          "iceberg"
+        ]
+      }
+    ]
+  },
+  {
+    "id": "build_rebuild",
+    "mode": "build",
+    "turns": [
+      "Rebuild the whole lakehouse from the sources, all layers."
+    ],
+    "expect_tool": {
+      "name": "trigger_lakehouse_build",
+      "args_contains": {}
+    },
+    "forbid": [
+      "approvals"
+    ]
+  },
+  {
+    "id": "build_pipeline_draft",
+    "mode": "build",
+    "turns": [
+      "Create a pipeline named ai_eval_top_events that reads silver.event_tahunan, removes duplicate rows by nama_event, and writes gold.ai_eval_events. Keep it manual."
+    ],
+    "expect_tool": {
+      "name": "create_pipeline",
+      "args_contains": {
+        "sourceTable": "event_tahunan"
+      }
+    },
+    "forbid": [
+      "approvals"
+    ]
   }
 ]

@@ -20,6 +20,7 @@ mod governance;
 mod identity;
 mod knowledge;
 mod lakehouse;
+mod lineage;
 mod notifications;
 mod ops;
 mod overview;

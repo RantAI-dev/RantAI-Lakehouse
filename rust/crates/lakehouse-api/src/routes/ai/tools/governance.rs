@@ -130,7 +130,7 @@ pub(super) async fn draft_classification_rule(
 ) -> Value {
     let asset = arg_str(args, "asset");
     if asset.is_empty() {
-        return json!({ "error": "asset wajib diisi" });
+        return json!({ "error": "asset is required" });
     }
     let bytes = match serde_json::to_vec(&Value::Object(args.clone())) {
         Ok(bytes) => bytes,
@@ -149,7 +149,7 @@ pub(super) async fn draft_classification_rule(
 pub(super) async fn draft_quality_rule(state: &AppState, args: &Map<String, Value>) -> Value {
     let name = arg_str(args, "name");
     if name.is_empty() {
-        return json!({ "error": "name wajib diisi" });
+        return json!({ "error": "name is required" });
     }
     let bytes = match serde_json::to_vec(&Value::Object(args.clone())) {
         Ok(bytes) => bytes,
@@ -195,11 +195,11 @@ mod tests {
         let s = state();
         assert_eq!(
             draft_classification_rule(&s, &Map::new()).await,
-            json!({ "error": "asset wajib diisi" })
+            json!({ "error": "asset is required" })
         );
         assert_eq!(
             draft_quality_rule(&s, &Map::new()).await,
-            json!({ "error": "name wajib diisi" })
+            json!({ "error": "name is required" })
         );
     }
 

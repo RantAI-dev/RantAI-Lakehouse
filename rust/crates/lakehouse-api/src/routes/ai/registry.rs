@@ -132,8 +132,8 @@ fn describe_dataset_schema() -> Value {
 
 fn get_lineage_schema() -> Value {
     json!({ "type": "function", "function": { "name": "get_lineage",
-        "description": "Where one dataset (by slug) comes from and how it flows: publisher -> Bronze -> Silver -> Gold, with column mappings where recorded.",
-        "parameters": { "type": "object", "properties": { "slug": { "type": "string" } },
+        "description": "Recorded lineage of a dataset or table: what feeds it and what it feeds (publisher, connector ingest, catalog registry, authored pipelines, views, Gold export). Every edge comes from a platform record; nothing is inferred from names.",
+        "parameters": { "type": "object", "properties": { "slug": { "type": "string", "description": "a dataset slug, or a table name such as serving.<table> or bronze.<table>" } },
             "required": ["slug"] } } })
 }
 
@@ -145,7 +145,7 @@ fn get_quality_schema() -> Value {
 
 fn trigger_lakehouse_build_schema() -> Value {
     json!({ "type": "function", "function": { "name": "trigger_lakehouse_build",
-        "description": "Rebuild the lakehouse end to end (runs the Dagster job 'refresh_lakehouse': Bronze -> Silver -> Gold). Use only when the user asks to rebuild or refresh the data. If the job does not exist in this deployment the result says so.",
+        "description": "Rebuild the lakehouse layer by layer from what this deployment has: ingest every connector with an ingest spec into Bronze, run every authored pipeline, then export Gold to Iceberg (or the deployment's own build job when it has one). The result lists what was launched and what was skipped and why. Use only when the user asks to rebuild or refresh everything.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
@@ -562,6 +562,143 @@ fn draft_quality_rule_schema() -> Value {
             "required": ["name", "asset", "dimension", "threshold", "severity"] } } })
 }
 
+fn get_ingest_spec_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "get_ingest_spec",
+        "description": "Read a connector's ingest spec: its adapter (sql, cdc, files, rest, sheets, mongodb, kafka, sftp), ingest mode, dial (how to reach the source), the source objects it ingests and the Bronze table each lands in, and its schedule. Null fields mean ingest was never set up.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "connector id, from list_connectors" } },
+            "required": ["id"] } } })
+}
+
+fn set_ingest_spec_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "set_ingest_spec",
+        "description": "Set what a connector ingests into Bronze. Call get_ingest_spec and discover_source first. adapter and dial must match the connector's type; each source object names a source table (or endpoint, file) and the Bronze table it lands in. Example for a Postgres table: adapter \"sql\", ingestMode \"batch\", dial {\"driver\":\"postgres\",\"host\":\"db\",\"port\":5432,\"database\":\"shop\",\"user\":\"reader\"}, sourceObjects [{\"name\":\"public.orders\",\"target\":\"orders\"}], scheduleCron \"0 * * * *\". The server validates the dial and refuses internal addresses.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "connector id" },
+            "adapter": { "type": "string", "enum": ["sql", "cdc", "files", "rest", "sheets", "mongodb", "kafka", "sftp"] },
+            "ingestMode": { "type": "string", "enum": ["batch", "cdc", "stream"] },
+            "dial": { "type": "object", "description": "how to reach the source; fields depend on the adapter" },
+            "sourceObjects": { "type": "array", "items": { "type": "object", "properties": {
+                "name": { "type": "string", "description": "source table (schema.table), endpoint or file" },
+                "incrementalKey": { "type": "string", "description": "optional column for incremental reads" },
+                "target": { "type": "string", "description": "Bronze table name it lands in" } },
+                "required": ["name", "target"] } },
+            "scheduleCron": { "type": "string", "description": "cron schedule for batch ingest, optional" } },
+            "required": ["id", "adapter", "ingestMode", "dial", "sourceObjects"] } } })
+}
+
+fn discover_source_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "discover_source",
+        "description": "Connect to a connector's source and list the tables (and their columns) that could be ingested. Read-only on the source. Returns supported:false for source types this build cannot list.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "connector id" },
+            "schema": { "type": "string", "description": "optional schema to list, e.g. public" } },
+            "required": ["id"] } } })
+}
+
+fn run_ingest_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "run_ingest",
+        "description": "Run one connector's ingest now: reads its source objects into Bronze (the same as Run now in the console). The connector needs an ingest spec first. A CDC connector returns supported:false: Debezium streams it continuously.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "connector id" } },
+            "required": ["id"] } } })
+}
+
+fn list_ingest_runs_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_ingest_runs",
+        "description": "Recent ingest runs of one connector: when each ran, which object, rows written, and success or the reason it failed.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "connector id" } },
+            "required": ["id"] } } })
+}
+
+fn rotate_connector_credential_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "rotate_connector_credential",
+        "description": "Point a connector's credential slot at a new credential. The server derives the credential name from the connector id; you choose only the slot, where it is read from (env or file) and its kind. The new credential is tested before it is saved. Needs human approval before it runs.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "connector id" },
+            "slot": { "type": "string", "enum": ["primary", "secondary"] },
+            "source": { "type": "string", "enum": ["env", "file"] },
+            "kind": { "type": "string", "enum": ["password", "secret_key", "access_key", "api_key", "token", "private_key"] } },
+            "required": ["id", "slot", "source", "kind"] } } })
+}
+
+fn create_pipeline_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "create_pipeline",
+        "description": "Author a new pipeline that reads a source table, applies transforms and writes a target table. It is saved as a draft; mark_pipeline_ready makes it runnable. Zones: bronze, silver, gold. Transforms use a fixed vocabulary, one per entry: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
+        "parameters": { "type": "object", "properties": {
+            "name": { "type": "string" },
+            "description": { "type": "string" },
+            "sourceZone": { "type": "string", "enum": ["bronze", "silver", "gold"] },
+            "sourceTable": { "type": "string" },
+            "targetZone": { "type": "string", "enum": ["bronze", "silver", "gold"] },
+            "targetTable": { "type": "string" },
+            "transforms": { "type": "array", "items": { "type": "string" } },
+            "incrementalColumn": { "type": "string", "description": "optional column for incremental loads" },
+            "schedule": { "type": "string", "description": "\"manual\" or a cron expression" } },
+            "required": ["name", "sourceZone", "sourceTable", "targetZone", "targetTable"] } } })
+}
+
+fn get_pipeline_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "get_pipeline",
+        "description": "One pipeline's detail: its definition (source, transforms, target), op graph, schedule and recent runs.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "pipeline id from list_pipelines (pl-… for an authored pipeline, or a Dagster job name)" } },
+            "required": ["id"] } } })
+}
+
+fn mark_pipeline_ready_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "mark_pipeline_ready",
+        "description": "Move an authored pipeline (pl-…) from draft to ready, so the orchestrator builds a job for it and trigger_pipeline can run it.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "authored pipeline id (pl-…)" } },
+            "required": ["id"] } } })
+}
+
+fn list_iceberg_tables_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_iceberg_tables",
+        "description": "The Iceberg tables in the lakehouse warehouse (Lakekeeper): with namespace, that namespace's tables; without, every namespace with its tables, including Bronze and exported Gold. Each table has its format version, current snapshot, last update, files, records and size.",
+        "parameters": { "type": "object", "properties": {
+            "namespace": { "type": "string", "description": "optional, e.g. bronze or gold" } } } } })
+}
+
+fn describe_iceberg_table_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "describe_iceberg_table",
+        "description": "One Iceberg table: schema (columns and types), partition spec, and recent snapshots with their operation, time and record counts.",
+        "parameters": { "type": "object", "properties": {
+            "namespace": { "type": "string" },
+            "table": { "type": "string" } },
+            "required": ["namespace", "table"] } } })
+}
+
+fn get_table_maintenance_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "get_table_maintenance",
+        "description": "One Iceberg table's maintenance policy (snapshots to keep, orphan-file age, small-file compaction, schedule) and its last maintenance status.",
+        "parameters": { "type": "object", "properties": {
+            "namespace": { "type": "string" },
+            "table": { "type": "string" } },
+            "required": ["namespace", "table"] } } })
+}
+
+fn set_table_maintenance_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "set_table_maintenance",
+        "description": "Set one Iceberg table's maintenance policy, read by the nightly maintenance job. Send the whole policy.",
+        "parameters": { "type": "object", "properties": {
+            "namespace": { "type": "string" },
+            "table": { "type": "string" },
+            "snapshotsToKeep": { "type": "integer", "description": "newest snapshots to keep, optional" },
+            "orphanAgeHours": { "type": "integer", "description": "remove orphan files older than this, optional" },
+            "compactSmallFiles": { "type": "boolean" },
+            "schedule": { "type": "string", "description": "cron schedule, optional" } },
+            "required": ["namespace", "table", "compactSmallFiles"] } } })
+}
+
+fn get_capacity_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "get_capacity",
+        "description": "Storage capacity: each object-storage bucket's size and growth from the daily capacity snapshot, and ClickHouse's bytes on disk.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
 /// The AI Copilot's full tool table, in the exact order the LLM sees them
 /// in — [`tool_schemas`] preserves this order verbatim, and it is
 /// load-bearing for the committed snapshot in
@@ -902,6 +1039,90 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::WriteLow,
         permission: "",
     },
+    ToolSpec {
+        name: "get_ingest_spec",
+        schema: get_ingest_spec_schema,
+        risk: Risk::Read,
+        permission: "ingest:read",
+    },
+    ToolSpec {
+        name: "set_ingest_spec",
+        schema: set_ingest_spec_schema,
+        risk: Risk::WriteLow,
+        permission: "connector:manage",
+    },
+    ToolSpec {
+        name: "discover_source",
+        schema: discover_source_schema,
+        risk: Risk::Read,
+        permission: "connector:manage",
+    },
+    ToolSpec {
+        name: "run_ingest",
+        schema: run_ingest_schema,
+        risk: Risk::WriteLow,
+        permission: "connector:manage",
+    },
+    ToolSpec {
+        name: "list_ingest_runs",
+        schema: list_ingest_runs_schema,
+        risk: Risk::Read,
+        permission: "connector:manage",
+    },
+    ToolSpec {
+        name: "rotate_connector_credential",
+        schema: rotate_connector_credential_schema,
+        risk: Risk::WriteHigh,
+        permission: "connector:manage",
+    },
+    ToolSpec {
+        name: "create_pipeline",
+        schema: create_pipeline_schema,
+        risk: Risk::WriteLow,
+        permission: "pipeline:write",
+    },
+    ToolSpec {
+        name: "get_pipeline",
+        schema: get_pipeline_schema,
+        risk: Risk::Read,
+        permission: "pipeline:read",
+    },
+    ToolSpec {
+        name: "mark_pipeline_ready",
+        schema: mark_pipeline_ready_schema,
+        risk: Risk::WriteLow,
+        permission: "pipeline:write",
+    },
+    ToolSpec {
+        name: "list_iceberg_tables",
+        schema: list_iceberg_tables_schema,
+        risk: Risk::Read,
+        permission: "catalog:read",
+    },
+    ToolSpec {
+        name: "describe_iceberg_table",
+        schema: describe_iceberg_table_schema,
+        risk: Risk::Read,
+        permission: "catalog:read",
+    },
+    ToolSpec {
+        name: "get_table_maintenance",
+        schema: get_table_maintenance_schema,
+        risk: Risk::Read,
+        permission: "catalog:read",
+    },
+    ToolSpec {
+        name: "set_table_maintenance",
+        schema: set_table_maintenance_schema,
+        risk: Risk::WriteLow,
+        permission: "governance:write",
+    },
+    ToolSpec {
+        name: "get_capacity",
+        schema: get_capacity_schema,
+        risk: Risk::Read,
+        permission: "catalog:read",
+    },
 ];
 
 /// The `OpenAI`-compatible `tools` schema array, matching
@@ -915,7 +1136,7 @@ pub fn tool_schemas() -> Vec<Value> {
 }
 
 /// Looks up a tool by name. `None` means the name is not a registered
-/// tool at all (the "tool tak dikenal" case in
+/// tool at all (the "unknown tool" case in
 /// [`super::tools::run_tool`]), as distinct from a registered tool this
 /// mode/principal is not allowed to call.
 #[must_use]
@@ -952,12 +1173,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_has_forty_eight_entries() {
+    fn tool_schemas_has_sixty_two_entries() {
         // 15 pre-T1 tools + 19 Tier 1 operations tools (5 alerts + 4
         // connectors + 7 pipelines + 3 saved queries) + 13 Tier 2 tools
         // (5 governance reads + 1 maintenance + 2 workloads + 2 gold
-        // export + 3 governance drafts) + `lakehouse_overview`.
-        assert_eq!(tool_schemas().len(), 48);
+        // export + 3 governance drafts) + `lakehouse_overview` + 14
+        // lakehouse-operation tools (6 ingest, 3 pipeline authoring, 4
+        // Iceberg table, 1 capacity).
+        assert_eq!(tool_schemas().len(), 62);
     }
 
     /// Characterization snapshot (T0.1): `tool_schemas()`, now derived
