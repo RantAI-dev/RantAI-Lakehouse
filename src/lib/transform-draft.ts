@@ -77,3 +77,35 @@ export function transformErrorRowIndex(message: string): number | null {
   if (!match) return null
   return Number(match[1])
 }
+
+/**
+ * A stored transform string read back for display: its verb and a short
+ * phrase of its arguments ("on nama_event", "tahun, nama_event"). Returns
+ * `null` for a string outside the five verbs, and the page shows it raw.
+ * This only splits the text for reading; `parse_transform` on the server
+ * is still the only validator.
+ */
+export function describeTransform(
+  raw: string
+): { verb: TransformDraft["verb"]; detail: string } | null {
+  const match = /^\s*(dedupe|filter|rename|cast|select)\((.*)\)\s*$/.exec(raw)
+  if (!match) return null
+  const verb = match[1] as TransformDraft["verb"]
+  const args = match[2].trim()
+  switch (verb) {
+    case "dedupe":
+      return { verb, detail: `one row per ${args}` }
+    case "rename": {
+      const [from, to] = args.split(",").map((s) => s.trim())
+      return { verb, detail: to ? `${from} → ${to}` : args }
+    }
+    case "cast": {
+      const [column, type] = args.split(",").map((s) => s.trim())
+      return { verb, detail: type ? `${column} as ${type}` : args }
+    }
+    case "select":
+      return { verb, detail: args.split(",").map((s) => s.trim()).join(", ") }
+    case "filter":
+      return { verb, detail: args }
+  }
+}

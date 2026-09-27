@@ -2,748 +2,452 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { useParams } from "next/navigation"
-import { PauseIcon, PlayIcon, RotateCcwIcon, SquareIcon } from "lucide-react"
-import { CodeView } from "@/components/patterns/code-view"
-import { DataTable } from "@/components/data-table/data-table"
+import { useParams, usePathname, useRouter, useSearchParams } from "next/navigation"
+import { CalendarClockIcon, HandIcon, PauseIcon, PlayIcon, RadarIcon, RotateCcwIcon } from "lucide-react"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
-import { DetailDrawer } from "@/components/patterns/detail-drawer"
-import { FlowCanvas } from "@/components/patterns/flow-canvas"
 import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
 import { MetadataList } from "@/components/patterns/metadata-list"
-import { EntityHeader } from "@/components/patterns/page-header"
-import {
-  EmptyState,
-  ErrorState,
-  LoadingSkeleton,
-} from "@/components/patterns/page-states"
-import { SectionCard } from "@/components/patterns/section-card"
-import { StatusBadge } from "@/components/patterns/status-badge"
+import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
+import { formatDateTime, formatDuration, formatRelativeTime } from "@/lib/format"
 import { withNotify } from "@/lib/notify"
-import {
-  formatCompactNumber,
-  formatDateTime,
-  formatRelativeTime,
-  isPast,
-} from "@/lib/format"
-import { fmtMeasured } from "@/lib/measured"
 import type { EntityStatus } from "@/lib/status"
+import { cn } from "@/lib/utils"
 import { pipelineService } from "@/services"
-import type {
-  PipelineOpNode,
-  PipelineRun,
-  PipelineRunLogsPage,
-} from "@/services/contracts/pipelines"
-import { topoSortOps } from "./topo-sort-ops"
-import { getPipelineRunColumns, runDuration } from "./pipeline-run-columns"
+import type { PipelineDetail, PipelineRun } from "@/services/contracts/pipelines"
+import { AuthoredFlow, DagsterDefinition } from "./pipeline-definition"
+import { PipelineMasthead, PipelineVitals } from "./pipeline-detail-header"
+import { isLiveRun, runDurationMs, summarizeRuns } from "./pipeline-run-stats"
+import { describeCron, isScheduleRunning, localizeScheduleTime, parseSchedule } from "./pipeline-schedule"
+import { RunHistoryStrip, runFill, statusLabel } from "./run-history-strip"
+import { RunInspector } from "./run-inspector"
 
-function AssetLink({ id, label }: { readonly id?: string; readonly label: string }) {
-  if (!id) return <span className="font-mono text-xs">{label}</span>
-  return (
-    <Link
-      href={`/data/assets/${id}`}
-      className="font-mono text-xs text-primary hover:underline"
-    >
-      {label}
-    </Link>
-  )
+/** Poll cadence: fast while a run is live or one was just launched, slow otherwise. */
+const LIVE_POLL_MS = 4000
+const IDLE_POLL_MS = 30_000
+/** How long after a launch to keep polling fast: the new run may take a few seconds to be listed. */
+const LAUNCH_WINDOW_MS = 20_000
+
+type TabId = "runs" | "definition" | "settings"
+
+function TriggerGlyph({ run }: { run: PipelineRun }) {
+  const kind = run.trigger?.kind
+  const Icon =
+    kind === "schedule" ? CalendarClockIcon : kind === "sensor" ? RadarIcon : kind === "retry" ? RotateCcwIcon : HandIcon
+  return <Icon className="size-3.5 shrink-0 text-muted-foreground" aria-label={kind ?? "manual"} />
 }
 
-/**
- * Source tab: an op picker plus its read-only text. A 404
- * (unknown op) or 409 (commit mismatch, `pipeline_source.rs`'s
- * `check_commit`) both surface through `source.status === "error"` with
- * the SERVER's own message — never a client-fabricated string that would
- * hide which of the two real reasons applies.
- *
- * Ops with no `sourceRef` are left out of the picker entirely, and a
- * pipeline where NO op declares one says so instead of offering a choice
- * that cannot resolve: `GET /api/pipelines/{id}/source` matches its `op=`
- * against the op's `sourceRef`, so an op whose code location publishes no
- * provenance metadata has nothing to look up.
- */
-function SourceTab({ pipelineId, ops }: { pipelineId: string; ops: PipelineOpNode[] }) {
-  const withSource = ops.filter((op) => op.sourceRef !== null)
-  if (withSource.length === 0) {
-    return (
-      <EmptyState
-        title="No source provenance"
-        description="No op in this pipeline declares where its code lives, so there is nothing to show. A code location publishes this as op metadata (source_ref/commit)."
-      />
-    )
-  }
-  return <SourceViewer pipelineId={pipelineId} ops={withSource} />
-}
-
-/**
- * The picker itself, split out so [`SourceTab`]'s "nothing declares
- * provenance" branch can return before any hook runs — and so the
- * selected value is the op's `sourceRef` (what the route matches on),
- * while the label stays the op NAME the reader recognises from the graph.
- * Sending the name instead was why every op answered "source provenance
- * is unavailable for this build": no op's `sourceRef` equals its name, so
- * the lookup found no op at all and `check_commit` saw `None`.
- */
-function SourceViewer({ pipelineId, ops }: { pipelineId: string; ops: PipelineOpNode[] }) {
-  const [selectedRef, setSelectedRef] = React.useState(ops[0]?.sourceRef ?? "")
-  const source = useService(
-    (s) => pipelineService.getPipelineSource(pipelineId, selectedRef, s),
-    [pipelineId, selectedRef]
-  )
-  return (
-    <div className="flex flex-col gap-3">
-      <select
-        className="h-8 w-64 rounded-lg border border-input bg-transparent px-2.5 text-sm"
-        value={selectedRef}
-        onChange={(e) => setSelectedRef(e.target.value)}
-      >
-        {ops.map((op) => (
-          <option key={op.name} value={op.sourceRef ?? ""}>
-            {op.name}
-          </option>
-        ))}
-      </select>
-      {source.status === "loading" ? <LoadingSkeleton rows={6} /> : null}
-      {source.status === "error" ? (
-        <ErrorState error={source.error} onRetry={source.reload} />
-      ) : null}
-      {source.status === "success" ? (
-        <div className="flex flex-col gap-2">
-          <p className="text-xs text-muted-foreground">
-            {source.data.sourceRef} · commit {source.data.commit.slice(0, 12)}
-          </p>
-          <CodeView text={source.data.text} />
-        </div>
-      ) : null}
-    </div>
-  )
-}
-
-/**
- * Steps + polled logs inside the run drawer. Steps are a
- * one-shot `useService` load (they only change when the drawer re-opens
- * on a new run). Logs poll by the backend's own opaque cursor — never
- * re-requested from zero — following the exact tick()/setTimeout shape
- * `src/features/copilot/build-tree.tsx`'s `BuildTree` already uses (the
- * only other polling precedent in this codebase): re-arm only while
- * `isLive`, clear the timer on unmount, never let a caught error stop
- * future attempts (it backs off to 5s instead).
- */
-function RunStepsAndLogs({
-  pipelineId,
-  runId,
-  isLive,
+/** The run list beside the inspector: newest first, retries marked with the run they repeat. */
+function RunList({
+  runs,
+  selectedId,
+  onSelect,
+  now,
 }: {
-  pipelineId: string
-  runId: string
-  isLive: boolean
+  runs: readonly PipelineRun[]
+  selectedId: string | null
+  onSelect: (id: string) => void
+  now: number
 }) {
-  const stepsState = useService((s) => pipelineService.getRunSteps(pipelineId, runId, s), [pipelineId, runId])
-  const [logs, setLogs] = React.useState<PipelineRunLogsPage["lines"]>([])
-  const [logsError, setLogsError] = React.useState<string | null>(null)
-
-  React.useEffect(() => {
-    let alive = true
-    let cursor: string | undefined
-    let timer: ReturnType<typeof setTimeout>
-
-    async function tick() {
-      try {
-        const page = await pipelineService.getRunLogs(pipelineId, runId, cursor)
-        if (!alive) return
-        // Append-only: the backend's cursor is monotonic and opaque, so a
-        // page never re-includes an already-returned line — appending
-        // (never replacing) `logs` is what keeps polling from dropping or
-        // duplicating lines.
-        setLogs((prev) => [...prev, ...page.lines])
-        cursor = page.cursor
-        setLogsError(null)
-        if (isLive) timer = setTimeout(tick, 3000)
-      } catch (err) {
-        if (alive) {
-          setLogsError(err instanceof Error ? err.message : "failed to fetch logs")
-          if (isLive) timer = setTimeout(tick, 5000)
-        }
-      }
-    }
-    setLogs([])
-    tick()
-    return () => {
-      alive = false
-      clearTimeout(timer)
-    }
-  }, [pipelineId, runId, isLive])
-
   return (
-    <div className="flex flex-col gap-3">
-      <div>
-        <p className="mb-1 text-xs font-medium text-muted-foreground">Steps</p>
-        {stepsState.status === "loading" ? <LoadingSkeleton rows={3} /> : null}
-        {stepsState.status === "error" ? (
-          <ErrorState error={stepsState.error} onRetry={stepsState.reload} />
-        ) : null}
-        {stepsState.status === "success" && stepsState.data.length === 0 ? (
-          <p className="text-xs text-muted-foreground">No steps recorded for this run yet.</p>
-        ) : null}
-        {stepsState.status === "success" && stepsState.data.length > 0 ? (
-          <ul className="flex flex-col gap-1">
-            {stepsState.data.map((step) => (
-              <li key={step.stepKey} className="flex items-center justify-between text-xs">
-                <span className="font-mono">{step.stepKey}</span>
-                <span className="flex items-center gap-2">
-                  <StatusBadge status={step.status} />
-                  {fmtMeasured(
-                    step.materializations.find((m) => m.rows !== null)?.rows ?? null,
-                    formatCompactNumber
-                  )}
+    <ol className="flex max-h-[44rem] flex-col gap-0.5 overflow-y-auto pr-1" aria-label="Runs">
+      {runs.map((run) => {
+        const selected = run.id === selectedId
+        const d = runDurationMs(run, now)
+        return (
+          <li key={run.id}>
+            <button
+              type="button"
+              onClick={() => onSelect(run.id)}
+              aria-current={selected ? "true" : undefined}
+              className={cn(
+                "group relative grid w-full grid-cols-[auto_1fr_auto] items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors",
+                selected ? "bg-primary/8" : "hover:bg-muted/60"
+              )}
+            >
+              {selected ? <span aria-hidden className="absolute inset-y-1.5 left-0 w-0.5 rounded-full bg-primary" /> : null}
+              <span
+                aria-hidden
+                className={cn("size-2.5 rounded-full ring-4 ring-transparent", runFill(run.status), isLiveRun(run) && "animate-pulse")}
+              />
+              <span className="min-w-0">
+                <span className="flex items-center gap-1.5 text-sm font-medium">
+                  <span className="truncate">{formatRelativeTime(run.startedAt, now)}</span>
+                  <TriggerGlyph run={run} />
                 </span>
-              </li>
-            ))}
-          </ul>
-        ) : null}
-      </div>
-      <div>
-        <p className="mb-1 text-xs font-medium text-muted-foreground">Logs</p>
-        {logsError ? <p className="mb-1 text-xs text-destructive">{logsError}</p> : null}
-        <pre className="max-h-48 overflow-y-auto rounded-md border border-border bg-muted/30 p-2 font-mono text-xs">
-          {logs.length > 0
-            ? logs.map((line) => `[${line.level}] ${line.message}`).join("\n")
-            : "No log lines yet."}
-        </pre>
-      </div>
+                <span className="block truncate font-mono text-[11px] text-muted-foreground">
+                  {run.parentRunId ? `↳ retry of ${run.parentRunId.slice(0, 8)}` : run.id.slice(0, 8)}
+                </span>
+              </span>
+              <span className="flex flex-col items-end gap-0.5">
+                <span className="font-mono text-xs tabular-nums text-muted-foreground">{d === null ? "—" : formatDuration(d)}</span>
+                <span className="sr-only">{statusLabel(run.status)}</span>
+              </span>
+            </button>
+          </li>
+        )
+      })}
+    </ol>
+  )
+}
+
+function SettingsTab({ p, scheduleText }: { p: PipelineDetail; scheduleText: string }) {
+  return (
+    <div className="flex flex-col gap-4">
+      <section className="rounded-xl border border-border bg-card p-4">
+        <h3 className="mb-3 font-mono text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground">Pipeline</h3>
+        <MetadataList
+          columns={3}
+          items={[
+            { label: "Id", value: <span className="font-mono text-xs">{p.id}</span> },
+            { label: "Engine", value: p.engine === "authored" ? "Authored (Postgres definition)" : "Dagster job" },
+            { label: "Kind", value: p.kind },
+            { label: "Owner", value: p.owner },
+            { label: "Schedule", value: scheduleText },
+            { label: "Next run", value: p.nextRunAt ? formatDateTime(p.nextRunAt) : "—" },
+            { label: "Last run", value: p.lastRunAt ? formatDateTime(p.lastRunAt) : "—" },
+            // No SLA is defined per job: `dataset_sla` is keyed by table,
+            // so one job-level boolean would not be honest (routes::pipelines).
+            { label: "SLA", value: p.slaOk === null ? "Not defined per pipeline" : p.slaOk ? "OK" : "Breached" },
+            { label: "Freshness", value: <FreshnessIndicator lagSeconds={p.freshnessLagSeconds} /> },
+          ]}
+        />
+      </section>
+      <section className="rounded-xl border border-border bg-card p-4">
+        <h3 className="mb-3 font-mono text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground">Run configuration</h3>
+        {p.config.length === 0 ? (
+          <p className="text-sm text-muted-foreground">This pipeline has no recorded run configuration.</p>
+        ) : (
+          <MetadataList columns={2} items={p.config.map((c) => ({ label: c.key, value: <span className="font-mono text-xs">{c.value}</span> }))} />
+        )}
+      </section>
     </div>
   )
 }
 
-function RunDrawerActions({
-  run,
-  onCancel,
-  onRetry,
-  retrying,
-}: {
-  readonly run: PipelineRun
-  readonly onCancel: () => void
-  readonly onRetry: () => void
-  readonly retrying: boolean
-}) {
-  const isRunning = run.status === "running"
-  const canRetry = run.status === "failed" || run.status === "cancelled"
-
-  return (
-    <div className="flex flex-wrap gap-2">
-      {isRunning ? (
-        <Button size="sm" variant="outline" onClick={onCancel}>
-          <SquareIcon data-icon="inline-start" />
-          Cancel run
-        </Button>
-      ) : null}
-      {canRetry ? (
-        <Button size="sm" disabled={retrying} onClick={onRetry}>
-          <RotateCcwIcon data-icon="inline-start" />
-          {retrying ? "Retrying…" : "Retry run"}
-        </Button>
-      ) : null}
-      {run.outputAssetId ? (
-        <Button
-          size="sm"
-          variant="ghost"
-          render={<Link href={`/data/assets/${run.outputAssetId}`} />}
-        >
-          Output dataset
-        </Button>
-      ) : null}
-      <Button
-        size="sm"
-        variant="ghost"
-        render={<Link href={`/lineage?focus=${run.pipelineId}`} />}
-      >
-        Lineage
-      </Button>
-      {run.auditEventId ? (
-        <Button
-          size="sm"
-          variant="ghost"
-          render={<Link href={`/audit?event=${run.auditEventId}`} />}
-        >
-          Audit
-        </Button>
-      ) : null}
-    </div>
-  )
-}
-
-function RunDrawerContent({
-  run,
-  onCancel,
-  onRetry,
-  retrying,
-}: {
-  readonly run: PipelineRun
-  readonly onCancel: () => void
-  readonly onRetry: () => void
-  readonly retrying: boolean
-}) {
-  const metadataItems = [
-    { label: "Status", value: <StatusBadge status={run.status} /> },
-    { label: "Started", value: formatDateTime(run.startedAt) },
-    {
-      label: "Ended",
-      value: run.endedAt ? formatDateTime(run.endedAt) : "running",
-    },
-    { label: "Duration", value: runDuration(run) },
-    // These read "—" unless the orchestrator reported them. They used to
-    // be zeros, which looked like a pipeline that had processed nothing.
-    { label: "Processed", value: formatCompactNumber(run.processed) },
-    { label: "Accepted", value: formatCompactNumber(run.accepted) },
-    { label: "Rejected", value: formatCompactNumber(run.rejected) },
-    { label: "Retried", value: formatCompactNumber(run.retried) },
-    {
-      label: "Checkpoint",
-      value: run.checkpoint ? (
-        <span className="font-mono text-xs">{run.checkpoint}</span>
-      ) : (
-        "—"
-      ),
-    },
-    {
-      label: "Pipeline",
-      value: <span className="font-mono text-xs">{run.pipelineId}</span>,
-    },
-  ]
-
-  return (
-    <>
-      <RunDrawerActions
-        run={run}
-        onCancel={onCancel}
-        onRetry={onRetry}
-        retrying={retrying}
-      />
-      <MetadataList items={metadataItems} />
-      {run.error ? (
-        <div>
-          <p className="text-xs font-medium text-muted-foreground">Error</p>
-          <p className="mt-1 text-sm text-destructive">{run.error}</p>
-        </div>
-      ) : null}
-    </>
-  )
-}
-
-function RunDrawer({
-  run,
-  onClose,
-  onChanged,
-}: {
-  readonly run: PipelineRun | null
-  readonly onClose: () => void
-  readonly onChanged: () => void
-}) {
-  const cancelAction = useServiceAction(
-    withNotify(
-      { success: "Run cancelled", error: "Failed to cancel run" },
-      (signal, runId: string) => pipelineService.cancelRun(runId, signal)
-    )
-  )
-  const retryAction = useServiceAction(
-    withNotify(
-      { success: "Run retried", error: "Failed to retry run" },
-      (signal, runId: string) => pipelineService.retryRun(runId, signal)
-    )
-  )
-  const [cancelOpen, setCancelOpen] = React.useState(false)
-
-  const handleRetry = async () => {
-    if (!run) return
-    const next = await retryAction.run(run.id)
-    if (next) {
-      onChanged()
-      onClose()
-    }
-  }
-
-  const handleConfirmCancel = async () => {
-    if (!run) return
-    const updated = await cancelAction.run(run.id)
-    if (updated) {
-      setCancelOpen(false)
-      onChanged()
-      onClose()
-    }
-  }
-
-  return (
-    <>
-      <DetailDrawer
-        open={run !== null}
-        onOpenChange={(open) => {
-          if (!open) onClose()
-        }}
-        title="Run details"
-        description={run ? `Run ${run.id}` : undefined}
-      >
-        {run ? (
-          <>
-            <RunDrawerContent
-              run={run}
-              onCancel={() => setCancelOpen(true)}
-              onRetry={handleRetry}
-              retrying={retryAction.status === "pending"}
-            />
-            <RunStepsAndLogs pipelineId={run.pipelineId} runId={run.id} isLive={run.status === "running"} />
-          </>
-        ) : null}
-      </DetailDrawer>
-      <ConfirmActionDialog
-        open={cancelOpen}
-        onOpenChange={setCancelOpen}
-        title="Cancel pipeline run"
-        description={run ? `Cancel run ${run.id}?` : "Cancel this run?"}
-        impact="In-flight work stops at the last checkpoint. Partial output may remain."
-        confirmLabel="Cancel run"
-        confirming={cancelAction.status === "pending"}
-        onConfirm={handleConfirmCancel}
-      />
-    </>
-  )
-}
-
+/**
+ * `/pipelines/[pipelineId]`: one pipeline, operated.
+ *
+ * Built around the run, the way the Dagster, Airflow and Databricks run
+ * pages are: a masthead with the trigger and schedule, four vitals
+ * computed from the run history, a strip of the last 30 runs, and an
+ * inspector for the selected run (the error first, then the step timeline
+ * and the log). The selected run and tab live in the URL (`?run=`,
+ * `?tab=`), so a link opens the same view.
+ *
+ * Runs poll every 4 s while one is live, or for 20 s after a launch, since
+ * a new run takes a few seconds to be listed, and every 30 s otherwise.
+ * Polls keep the page on screen (`keepDataOnReload`); they never flash a
+ * skeleton.
+ */
 export function PipelineDetailPage() {
   const { pipelineId } = useParams<{ pipelineId: string }>()
-  const state = useService(
-    (s) => pipelineService.getPipeline(pipelineId, s),
-    [pipelineId]
+  const router = useRouter()
+  const pathname = usePathname()
+  const search = useSearchParams()
+
+  const state = useService((s) => pipelineService.getPipeline(pipelineId, s), [pipelineId], { keepDataOnReload: true })
+  const runsState = useService((s) => pipelineService.listRuns(pipelineId, s), [pipelineId], { keepDataOnReload: true })
+  const runs = React.useMemo(() => (runsState.status === "success" ? runsState.data : []), [runsState])
+  const summary = React.useMemo(() => summarizeRuns(runs), [runs])
+  const anyLive = runs.some(isLiveRun)
+
+  const [now, setNow] = React.useState(() => Date.now())
+  const fastUntil = React.useRef(0)
+  const reloadRuns = runsState.reload
+  React.useEffect(() => {
+    const fast = anyLive || Date.now() < fastUntil.current
+    const t = setTimeout(
+      () => {
+        setNow(Date.now())
+        reloadRuns()
+      },
+      fast ? LIVE_POLL_MS : IDLE_POLL_MS
+    )
+    return () => clearTimeout(t)
+  }, [anyLive, reloadRuns, runsState])
+  // A live run's clock ticks every second; the rest of the page does not need it.
+  React.useEffect(() => {
+    if (!anyLive) return
+    const t = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [anyLive])
+
+  const setParam = React.useCallback(
+    (key: string, value: string | null) => {
+      const next = new URLSearchParams(search.toString())
+      if (value === null) next.delete(key)
+      else next.set(key, value)
+      const qs = next.toString()
+      router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false })
+    },
+    [pathname, router, search]
   )
-  // Runs come from `GET /api/pipelines/{id}/runs`, NOT from the detail
-  // payload: `routes::pipelines::detail` (WS4 item C1) returns id/name/
-  // graph/config/definition and no `runs` field at all. Reading
-  // `state.data.runs[0]` crashed every detail page with "Cannot read
-  // properties of undefined (reading '0')" -- the contract declared a field
-  // the route never sends, and a hand-written contract type cannot catch
-  // that at compile time.
-  const runsState = useService(
-    (s) => pipelineService.listRuns(pipelineId, s),
-    [pipelineId]
+  const requestedRun = search.get("run")
+  const selectedRun = runs.find((r) => r.id === requestedRun) ?? runs[0] ?? null
+  const selectRun = (id: string) => setParam("run", id)
+
+  const runNow = useServiceAction(
+    withNotify({ success: "Run launched", error: "The run could not be launched" }, (signal, id: string) =>
+      pipelineService.triggerRun(id, signal)
+    )
   )
-  const runs = runsState.status === "success" ? runsState.data : []
-  const [selectedRun, setSelectedRun] = React.useState<PipelineRun | null>(null)
-  const [cancelRunTarget, setCancelRunTarget] = React.useState<PipelineRun | null>(null)
+  const pause = useServiceAction(
+    withNotify({ success: "Schedule paused", error: "The schedule could not be paused" }, (signal, id: string) =>
+      pipelineService.pausePipeline(id, signal)
+    )
+  )
+  const resume = useServiceAction(
+    withNotify({ success: "Schedule resumed", error: "The schedule could not be resumed" }, (signal, id: string) =>
+      pipelineService.resumePipeline(id, signal)
+    )
+  )
+  const activate = useServiceAction(
+    withNotify({ success: "Pipeline marked ready", error: "The pipeline could not be marked ready" }, (signal, id: string) =>
+      pipelineService.setPipelineStatus(id, "ready", signal)
+    )
+  )
   const [pauseOpen, setPauseOpen] = React.useState(false)
 
-  const runAction = useServiceAction(
-    withNotify(
-      { success: "Run triggered", error: "Failed to trigger run" },
-      (signal, id: string) => pipelineService.triggerRun(id, signal)
-    )
-  )
-  const pauseAction = useServiceAction(
-    withNotify(
-      { success: "Pipeline paused", error: "Failed to pause pipeline" },
-      (signal, id: string) => pipelineService.pausePipeline(id, signal)
-    )
-  )
-  const resumeAction = useServiceAction(
-    withNotify(
-      { success: "Pipeline resumed", error: "Failed to resume pipeline" },
-      (signal, id: string) => pipelineService.resumePipeline(id, signal)
-    )
-  )
-  const activateAction = useServiceAction((signal, id: string) =>
-    pipelineService.setPipelineStatus(id, "ready", signal)
-  )
-
-  // Latest run's real step statuses color the graph tab's nodes — `runs`
-  // is returned most-recent-first (`list_runs_for_job`/`run_to_json`
-  // ordering, unchanged by WS4).
-  const latestRun = runs[0]
-  const stepsState = useService(
-    (s) => (latestRun ? pipelineService.getRunSteps(pipelineId, latestRun.id, s) : Promise.resolve([])),
-    [pipelineId, latestRun?.id]
-  )
-  function latestRunStepStatus(opName: string): EntityStatus | undefined {
-    if (stepsState.status !== "success") return undefined
-    return stepsState.data.find((step) => step.stepKey === opName)?.status
-  }
-
-  const cancelAction = useServiceAction(
-    withNotify(
-      { success: "Run cancelled", error: "Failed to cancel run" },
-      (signal, runId: string) => pipelineService.cancelRun(runId, signal)
-    )
-  )
-  const retryAction = useServiceAction(
-    withNotify(
-      { success: "Run retried", error: "Failed to retry run" },
-      (signal, runId: string) => pipelineService.retryRun(runId, signal)
-    )
-  )
-
-  const columns = React.useMemo(
-    () =>
-      getPipelineRunColumns({
-        onSelect: setSelectedRun,
-        onCancel: (run) => setCancelRunTarget(run),
-        onRetry: async (run) => {
-          const next = await retryAction.run(run.id)
-          if (next) state.reload()
-        },
-      }),
-    [retryAction, state]
-  )
-
-  const { table } = useDataTable({
-    data: runs,
-    columns,
-    pageCount: 1,
-    initialState: {
-      columnPinning: { right: ["actions"] },
+  const afterLaunch = React.useCallback(
+    (focusNewest: boolean) => {
+      fastUntil.current = Date.now() + LAUNCH_WINDOW_MS
+      // Follow the new run: dropping `?run=` selects the newest one.
+      if (focusNewest) setParam("run", null)
+      reloadRuns()
+      state.reload()
     },
-  })
+    [reloadRuns, setParam, state]
+  )
+
+  // Step statuses for the Definition tab's graph come from the selected run.
+  const stepsState = useService(
+    (s) => (selectedRun ? pipelineService.getRunSteps(pipelineId, selectedRun.id, s) : Promise.resolve([])),
+    [pipelineId, selectedRun?.id, selectedRun?.status],
+    { keepDataOnReload: true }
+  )
 
   if (state.status === "loading") return <LoadingSkeleton rows={8} />
   if (state.status === "error") return <ErrorState error={state.error} onRetry={state.reload} />
   const p = state.data
-  const isPaused = p.status === "paused"
+  const authored = p.engine === "authored"
+  const schedule = parseSchedule(p.schedule)
+  // A Dagster job's status is its newest run's, never "paused": whether it
+  // is paused lives in its schedule's state. An authored pipeline carries
+  // "paused" in its own status.
+  const schedulePaused = authored
+    ? p.status === "paused"
+    : schedule.kind === "cron" && schedule.state !== null && !isScheduleRunning(schedule.state)
   const isDraft = p.status === "draft"
-  // `Pipeline` carries no `origin` field — the API never sends one. An
-  // authored (console-created) pipeline's id is always `pl-<slug>-<base36
-  // millis>`; a Dagster job id is never prefixed `pl-` (same derivation
-  // as `pipelineOrigin` in `./pipeline-columns.tsx`). Pause/Resume/Run act
-  // on a schedule and engine in the orchestrator, which an authored
-  // pipeline has neither.
-  const canRun = !p.id.startsWith("pl-")
+  const scheduleText =
+    schedule.kind === "manual"
+      ? "Manual only"
+      : schedule.kind === "cron"
+        ? `${localizeScheduleTime(describeCron(schedule.cron) ?? "Cron", p.nextRunAt)} (cron ${schedule.cron})${schedule.state ? `, ${schedule.state.toLowerCase()}` : ""}`
+        : schedule.raw
+
+  const tabParam = search.get("tab")
+  const tab: TabId =
+    tabParam === "definition" || tabParam === "settings" || tabParam === "runs" ? tabParam : authored ? "definition" : "runs"
+
+  const actions = isDraft ? (
+    <Button
+      size="sm"
+      disabled={activate.status === "pending"}
+      onClick={async () => {
+        if (await activate.run(pipelineId)) state.reload()
+      }}
+    >
+      <PlayIcon data-icon="inline-start" />
+      {activate.status === "pending" ? "Marking ready…" : "Mark ready"}
+    </Button>
+  ) : authored ? (
+    // An authored pipeline has no job in the orchestrator, so there is
+    // nothing to run or pause; the buttons used to be shown and answered
+    // 503, which reads as "try again later".
+    <span className="max-w-60 text-right text-xs text-muted-foreground">
+      No engine attached: this pipeline cannot run from the console yet.
+    </span>
+  ) : (
+    <>
+      {schedule.kind === "cron" ? (
+        schedulePaused ? (
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={resume.status === "pending"}
+            onClick={async () => {
+              if (await resume.run(pipelineId)) state.reload()
+            }}
+          >
+            <PlayIcon data-icon="inline-start" />
+            {resume.status === "pending" ? "Resuming…" : "Resume schedule"}
+          </Button>
+        ) : (
+          <Button variant="outline" size="sm" disabled={pause.status === "pending"} onClick={() => setPauseOpen(true)}>
+            <PauseIcon data-icon="inline-start" />
+            Pause schedule
+          </Button>
+        )
+      ) : null}
+      <Button
+        size="sm"
+        disabled={runNow.status === "pending"}
+        onClick={async () => {
+          if (await runNow.run(pipelineId)) afterLaunch(true)
+        }}
+      >
+        <PlayIcon data-icon="inline-start" />
+        {runNow.status === "pending" ? "Launching…" : "Run now"}
+      </Button>
+    </>
+  )
 
   return (
     <div className="flex flex-col gap-4">
-      <EntityHeader
-        eyebrow={<Link href="/pipelines" className="hover:underline">Pipelines</Link>}
-        title={p.name}
-        titleAccessory={<StatusBadge status={p.status} />}
-        description={p.description ?? undefined}
-        actions={
-          isDraft ? (
-            <Button
-              size="sm"
-              disabled={activateAction.status === "pending"}
-              onClick={async () => {
-                const updated = await activateAction.run(pipelineId)
-                if (updated) state.reload()
-              }}
-            >
-              <PlayIcon data-icon="inline-start" />
-              {activateAction.status === "pending" ? "Activating…" : "Activate"}
-            </Button>
-          ) : !canRun ? (
-            // An authored, non-draft pipeline still has no job in the
-            // orchestrator, so Run/Pause/Resume have nothing to act on.
-            // They used to be shown anyway and answered 503, which reads
-            // as "try again later".
-            <span className="text-xs text-muted-foreground">
-              No engine attached — this pipeline cannot run yet.
-            </span>
-          ) : (
-            <>
-              {isPaused ? (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={resumeAction.status === "pending"}
-                  onClick={async () => {
-                    const updated = await resumeAction.run(pipelineId)
-                    if (updated) state.reload()
-                  }}
-                >
-                  <PlayIcon data-icon="inline-start" />
-                  {resumeAction.status === "pending" ? "Resuming…" : "Resume"}
-                </Button>
-              ) : (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={pauseAction.status === "pending"}
-                  onClick={() => setPauseOpen(true)}
-                >
-                  <PauseIcon data-icon="inline-start" />
-                  Pause
-                </Button>
-              )}
-              <Button
-                size="sm"
-                disabled={isPaused || runAction.status === "pending"}
-                onClick={async () => {
-                  const run = await runAction.run(pipelineId)
-                  if (run) state.reload()
-                }}
-              >
-                <PlayIcon data-icon="inline-start" />
-                {runAction.status === "pending" ? "Starting…" : "Run now"}
-              </Button>
-            </>
-          )
-        }
+      <PipelineMasthead
+        pipeline={p}
+        latest={runs[0] ?? null}
+        schedule={schedule}
+        schedulePaused={schedulePaused}
+        actions={actions}
       />
+
+      {!authored ? (
+        <PipelineVitals
+          summary={summary}
+          latest={runs[0] ?? null}
+          nextRunAt={p.nextRunAt}
+          schedule={schedule}
+          schedulePaused={schedulePaused}
+          now={now}
+        />
+      ) : null}
+
+      <Tabs value={tab} onValueChange={(v) => setParam("tab", String(v))}>
+        <TabsList variant="line" className="gap-4 border-b border-border pb-1">
+          <TabsTrigger value="runs">
+            Runs
+            {runs.length > 0 ? <span className="font-mono text-[11px] text-muted-foreground">{runs.length}</span> : null}
+          </TabsTrigger>
+          <TabsTrigger value="definition">Definition</TabsTrigger>
+          <TabsTrigger value="settings">Settings</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="runs" className="mt-3">
+          {runsState.status === "loading" ? (
+            <LoadingSkeleton rows={6} />
+          ) : runsState.status === "error" ? (
+            <ErrorState error={runsState.error} onRetry={runsState.reload} />
+          ) : runs.length === 0 ? (
+            <EmptyState
+              title={authored ? "Authored pipelines do not run from here yet" : "No runs yet"}
+              description={
+                authored
+                  ? "This pipeline is a stored definition with no job in the orchestrator, so it has no run history."
+                  : "The orchestrator has no run of this job. Run it now, or wait for its schedule."
+              }
+            />
+          ) : (
+            <div className="flex flex-col gap-4">
+              <section className="rounded-xl border border-border bg-card px-4 pb-3 pt-3.5">
+                <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+                  <h2 className="font-mono text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground">
+                    Run history
+                  </h2>
+                  <div className="flex flex-wrap items-center gap-3 text-[11px] text-muted-foreground">
+                    {(
+                      [
+                        ["completed", "Completed"],
+                        ["failed", "Failed"],
+                        ["running", "Running"],
+                        ["cancelled", "Cancelled"],
+                      ] as [EntityStatus, string][]
+                    ).map(([status, label]) => (
+                      <span key={status} className="inline-flex items-center gap-1.5">
+                        <span className={cn("size-2 rounded-sm", runFill(status))} aria-hidden />
+                        {label}
+                      </span>
+                    ))}
+                    <span className="hidden sm:inline">bar height is wall time</span>
+                  </div>
+                </div>
+                <RunHistoryStrip
+                  runs={runs}
+                  selectedId={selectedRun?.id ?? null}
+                  onSelect={(r) => selectRun(r.id)}
+                  p50Ms={summary.p50Ms}
+                />
+              </section>
+
+              {requestedRun && !runs.some((r) => r.id === requestedRun) ? (
+                <p className="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
+                  Run <span className="font-mono">{requestedRun.slice(0, 8)}</span> is older than the last {runs.length} runs
+                  this page reads; showing the newest run instead.
+                </p>
+              ) : null}
+
+              <div className="grid gap-4 lg:grid-cols-[17rem_minmax(0,1fr)]">
+                <aside className="rounded-xl border border-border bg-card p-1.5 lg:sticky lg:top-4 lg:self-start">
+                  <RunList runs={runs} selectedId={selectedRun?.id ?? null} onSelect={selectRun} now={now} />
+                </aside>
+                <div className="min-w-0 rounded-xl border border-border bg-card p-4">
+                  {selectedRun ? (
+                    <RunInspector
+                      key={selectedRun.id}
+                      run={selectedRun}
+                      now={now}
+                      onSelectRun={selectRun}
+                      onChanged={afterLaunch}
+                    />
+                  ) : null}
+                </div>
+              </div>
+            </div>
+          )}
+        </TabsContent>
+
+        <TabsContent value="definition" className="mt-3">
+          {authored ? (
+            <AuthoredFlow pipeline={p} />
+          ) : (
+            <DagsterDefinition
+              pipeline={p}
+              runLabel={selectedRun ? `run ${selectedRun.id.slice(0, 8)} (${formatRelativeTime(selectedRun.startedAt, now)})` : null}
+              stepStatus={(op) =>
+                stepsState.status === "success" ? stepsState.data.find((s) => s.stepKey === op)?.status : undefined
+              }
+            />
+          )}
+        </TabsContent>
+
+        <TabsContent value="settings" className="mt-3">
+          <SettingsTab p={p} scheduleText={scheduleText} />
+          <p className="mt-3 text-xs text-muted-foreground">
+            Lineage for this pipeline:{" "}
+            <Link href={`/lineage?focus=${encodeURIComponent(p.id)}`} className="text-primary hover:underline">
+              open in Lineage
+            </Link>
+          </p>
+        </TabsContent>
+      </Tabs>
+
       <ConfirmActionDialog
         open={pauseOpen}
         onOpenChange={setPauseOpen}
-        title="Pause pipeline"
-        description={`Pause ${p.name}? Scheduled runs will stop until resumed.`}
-        impact="In-flight runs continue; new triggers are held."
-        confirmLabel="Pause pipeline"
-        confirming={pauseAction.status === "pending"}
+        title="Pause schedule"
+        description={`Pause ${p.name}'s schedule? It will not fire until resumed.`}
+        impact="Runs already in flight continue. Run now still works while paused."
+        confirmLabel="Pause schedule"
+        confirming={pause.status === "pending"}
         onConfirm={async () => {
-          const updated = await pauseAction.run(pipelineId)
-          if (updated) {
+          if (await pause.run(pipelineId)) {
             setPauseOpen(false)
             state.reload()
           }
         }}
-      />
-      <ConfirmActionDialog
-        open={cancelRunTarget !== null}
-        onOpenChange={(open) => {
-          if (!open) setCancelRunTarget(null)
-        }}
-        title="Cancel pipeline run"
-        description={cancelRunTarget ? `Cancel run ${cancelRunTarget.id}?` : "Cancel this run?"}
-        impact="In-flight work stops at the last checkpoint. Partial output may remain."
-        confirmLabel="Cancel run"
-        confirming={cancelAction.status === "pending"}
-        onConfirm={async () => {
-          if (!cancelRunTarget) return
-          const updated = await cancelAction.run(cancelRunTarget.id)
-          if (updated) {
-            setCancelRunTarget(null)
-            state.reload()
-          }
-        }}
-      />
-      <Tabs defaultValue="overview">
-        <TabsList>
-          <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="graph">Graph</TabsTrigger>
-          <TabsTrigger value="source">Source</TabsTrigger>
-          <TabsTrigger value="runs">Runs</TabsTrigger>
-          <TabsTrigger value="config">Config</TabsTrigger>
-        </TabsList>
-        <TabsContent value="overview" className="mt-3">
-          <SectionCard title="Configuration">
-            <MetadataList
-              columns={3}
-              items={[
-                { label: "Owner", value: p.owner },
-                { label: "Kind", value: p.kind },
-                { label: "Schedule", value: <span className="font-mono text-xs">{p.schedule}</span> },
-                {
-                  label: "Source",
-                  value: <AssetLink id={p.sourceAssetId} label={p.source ?? "—"} />,
-                },
-                {
-                  label: "Target",
-                  value: <AssetLink id={p.targetAssetId} label={p.target ?? "—"} />,
-                },
-                {
-                  label: "Connector",
-                  value: p.connectorId ? (
-                    <Link
-                      href={`/connectors`}
-                      className="font-mono text-xs text-primary hover:underline"
-                    >
-                      {p.connectorId}
-                    </Link>
-                  ) : (
-                    "—"
-                  ),
-                },
-                { label: "Last run", value: p.lastRunAt === null ? "—" : formatRelativeTime(p.lastRunAt) },
-                {
-                  label: "Next run",
-                  // A scheduled time that has already passed is not a
-                  // future event: "14d ago" under "Next run" reads as a
-                  // rendering bug when it is really an overdue schedule.
-                  value: p.nextRunAt ? (
-                    isPast(p.nextRunAt) ? (
-                      <span className="text-amber-600 dark:text-amber-400">
-                        Overdue · due {formatRelativeTime(p.nextRunAt)}
-                      </span>
-                    ) : (
-                      formatRelativeTime(p.nextRunAt)
-                    )
-                  ) : (
-                    "—"
-                  ),
-                },
-                { label: "SLA", value: p.slaOk === null ? "—" : p.slaOk ? "OK" : "Breached" },
-                { label: "Freshness", value: <FreshnessIndicator lagSeconds={p.freshnessLagSeconds} /> },
-              ]}
-            />
-          </SectionCard>
-        </TabsContent>
-        <TabsContent value="graph" className="mt-3">
-          {p.graph && p.graph.ops.length > 0 ? (
-            <FlowCanvas
-              nodes={topoSortOps(p.graph.ops, p.graph.edges).map(({ node, upstream }) => ({
-                id: node.name,
-                label: node.name,
-                sublabel: upstream.length > 0 ? `after: ${upstream.join(", ")}` : undefined,
-                status: latestRunStepStatus(node.name),
-              }))}
-            />
-          ) : (
-            <EmptyState
-              title="This pipeline has no graph yet"
-              description="The op graph is read from Dagster and is not available for this build."
-            />
-          )}
-        </TabsContent>
-        <TabsContent value="source" className="mt-3">
-          {p.graph && p.graph.ops.length > 0 ? (
-            <SourceTab pipelineId={pipelineId} ops={p.graph.ops} />
-          ) : (
-            <EmptyState
-              title="No source to show"
-              description="This pipeline has no op graph yet, so there is nothing to pick an op from."
-            />
-          )}
-        </TabsContent>
-        <TabsContent value="runs" className="mt-3">
-          {runs.length === 0 ? (
-            <EmptyState
-              title="No runs"
-              description="Runs appear here once the pipeline executes."
-            />
-          ) : (
-            <DataTable
-              table={table}
-              onRowClick={setSelectedRun}
-              infinite={{
-                onLoadMore: () => {},
-                hasNextPage: false,
-                isFetchingNextPage: false,
-                totalItems: runs.length,
-                loadedCount: runs.length,
-              }}
-            />
-          )}
-        </TabsContent>
-        <TabsContent value="config" className="mt-3">
-          {p.config.length === 0 ? (
-            <EmptyState
-              title="No configuration recorded"
-              description="This pipeline has no recorded run configuration."
-            />
-          ) : (
-            <MetadataList columns={2} items={p.config.map((c) => ({ label: c.key, value: c.value }))} />
-          )}
-        </TabsContent>
-      </Tabs>
-      <RunDrawer
-        run={selectedRun}
-        onClose={() => setSelectedRun(null)}
-        onChanged={state.reload}
       />
     </div>
   )
