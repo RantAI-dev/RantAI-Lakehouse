@@ -82,6 +82,19 @@ export const KIND_GROUPS: { group: string; items: { value: ChartKind; label: str
   ] },
 ];
 const AGGS = ["sum", "avg", "max", "min", "count"];
+/**
+ * Value → label maps for the base-ui selects below. Without `items`, a
+ * base-ui `Select.Value` renders the raw value (`hbar`, `b_54e05896`,
+ * `desc`, `__none__`) in the closed trigger even though the open list shows
+ * labels.
+ */
+const KIND_LABELS: Record<string, string> = Object.fromEntries(
+  KIND_GROUPS.flatMap((g) => g.items.map((i) => [i.value, i.label]))
+);
+const ORDER_LABELS: Record<string, string> = {
+  desc: "Highest first", asc: "Lowest first", none: "Natural (by dimension)",
+};
+const NO_BREAKDOWN = "__none__";
 const KIND_DESCRIPTIONS: Record<ChartKind, string> = {
   bar: "Compare values across categories", hbar: "Rank categories clearly",
   stacked: "Compare totals and their parts", combo: "Compare two metrics on different scales",
@@ -175,6 +188,14 @@ export function ChartBuilder({
   const canBreakdown = kind === "bar" || kind === "hbar" || kind === "line" || kind === "area" || isHeatmap;
   const mLabels = MEASURE_LABELS[kind] ?? ["Measure (Y)"];
   const isEdit = !!editId;
+  const boardOptions = boards.length ? boards : [{ id: "default", name: "Main" }];
+  const boardLabels: Record<string, string> = Object.fromEntries(boardOptions.map((b) => [b.id, b.name]));
+  // The data-source value is encoded (lib/chart-source); label it by name.
+  const sourceLabels: Record<string, string> = Object.fromEntries([
+    ...marts.map((m) => [encodeSourceChoice({ kind: "mart", name: m.name }), m.name]),
+    ...sqlSources.map((s) => [encodeSourceChoice({ kind: "sql", id: s.id }), `SQL · ${s.title}`]),
+  ]);
+  const breakdownLabels: Record<string, string> = { [NO_BREAKDOWN]: "— no breakdown —" };
 
   async function loadFields(value: string): Promise<Fields> {
     const picked = decodeSourceChoice(value);
@@ -386,8 +407,8 @@ export function ChartBuilder({
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div className="grid gap-1.5">
               <Label>Type</Label>
-              <Select value={kind} onValueChange={(v) => setKind(v as ChartKind)}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
+              <Select value={kind} items={KIND_LABELS} onValueChange={(v) => setKind(v as ChartKind)}>
+                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
                 <SelectContent>
                   {KIND_GROUPS.map((g) => (
                     <SelectGroup key={g.group}>
@@ -400,10 +421,10 @@ export function ChartBuilder({
             </div>
             <div className="grid gap-1.5">
               <Label>Dashboard</Label>
-              <Select value={targetBoard} onValueChange={(v) => setTargetBoard(v ?? "default")}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
+              <Select value={targetBoard} items={boardLabels} onValueChange={(v) => setTargetBoard(v ?? "default")}>
+                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  {(boards.length ? boards : [{ id: "default", name: "Main" }]).map((b) => (
+                  {boardOptions.map((b) => (
                     <SelectItem key={b.id} value={b.id}>{b.name}</SelectItem>
                   ))}
                 </SelectContent>
@@ -420,17 +441,8 @@ export function ChartBuilder({
             <>
               <div className="grid gap-1.5">
                 <Label>Data source</Label>
-                <Select value={source} onValueChange={(v) => onSourceChange(v ?? "")}>
-                  <SelectTrigger>
-                    {/* The value is encoded (lib/chart-source); show a human label. */}
-                    <SelectValue placeholder="pick a mart or SQL source">
-                      {choice
-                        ? choice.kind === "mart"
-                          ? choice.name
-                          : `SQL · ${sqlSources.find((s) => s.id === choice.id)?.title ?? choice.id}`
-                        : undefined}
-                    </SelectValue>
-                  </SelectTrigger>
+                <Select value={source} items={sourceLabels} onValueChange={(v) => onSourceChange(v ?? "")}>
+                  <SelectTrigger className="w-full"><SelectValue placeholder="pick a mart or SQL source" /></SelectTrigger>
                   <SelectContent>
                     <SelectGroup>
                       <SelectLabel>Gold marts</SelectLabel>
@@ -464,14 +476,14 @@ export function ChartBuilder({
                   <div className="grid gap-1.5">
                     <Label>Dimension (X)</Label>
                     <Select value={dimension} onValueChange={(v) => setDimension(v ?? "")} disabled={!fields}>
-                      <SelectTrigger><SelectValue placeholder={fields ? "pick a column" : "pick a source first"} /></SelectTrigger>
+                      <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : "pick a source first"} /></SelectTrigger>
                       <SelectContent>{fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}</SelectContent>
                     </Select>
                   </div>
                   <div className="grid gap-1.5">
                     <Label>Aggregation</Label>
                     <Select value={aggregate} onValueChange={(v) => setAggregate(v ?? "")}>
-                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
                       <SelectContent>{AGGS.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}</SelectContent>
                     </Select>
                   </div>
@@ -482,7 +494,7 @@ export function ChartBuilder({
                 <div className="grid gap-1.5">
                   <Label>{mLabels[0]}</Label>
                   <Select value={measure} onValueChange={(v) => setMeasure(v ?? "")} disabled={!fields}>
-                    <SelectTrigger><SelectValue placeholder={fields ? "pick a column" : "pick a source first"} /></SelectTrigger>
+                    <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : "pick a source first"} /></SelectTrigger>
                     <SelectContent>{fields?.measures.map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
                   </Select>
                 </div>
@@ -490,7 +502,7 @@ export function ChartBuilder({
                   <div className="grid gap-1.5">
                     <Label>Aggregation</Label>
                     <Select value={aggregate} onValueChange={(v) => setAggregate(v ?? "")}>
-                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
                       <SelectContent>{AGGS.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}</SelectContent>
                     </Select>
                   </div>
@@ -498,7 +510,7 @@ export function ChartBuilder({
                   <div className="grid gap-1.5">
                     <Label>{mLabels[1] ?? "2nd measure"}</Label>
                     <Select value={measure2} onValueChange={(v) => setMeasure2(v ?? "")} disabled={!fields}>
-                      <SelectTrigger><SelectValue placeholder="pick a column" /></SelectTrigger>
+                      <SelectTrigger className="w-full"><SelectValue placeholder="pick a column" /></SelectTrigger>
                       <SelectContent>{fields?.measures.filter((m) => m !== measure).map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
                     </Select>
                   </div>
@@ -509,7 +521,7 @@ export function ChartBuilder({
                 <div className="grid gap-1.5">
                   <Label>{mLabels[2] ?? "3rd measure"}</Label>
                   <Select value={measure3} onValueChange={(v) => setMeasure3(v ?? "")} disabled={!fields}>
-                    <SelectTrigger><SelectValue placeholder="pick a column" /></SelectTrigger>
+                    <SelectTrigger className="w-full"><SelectValue placeholder="pick a column" /></SelectTrigger>
                     <SelectContent>{fields?.measures.filter((m) => m !== measure && m !== measure2).map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
                   </Select>
                 </div>
@@ -529,8 +541,8 @@ export function ChartBuilder({
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <div className="grid gap-1.5">
                     <Label>Sort</Label>
-                    <Select value={order} onValueChange={(v) => setOrder((v as "desc" | "asc" | "none") ?? "desc")}>
-                      <SelectTrigger><SelectValue /></SelectTrigger>
+                    <Select value={order} items={ORDER_LABELS} onValueChange={(v) => setOrder((v as "desc" | "asc" | "none") ?? "desc")}>
+                      <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
                       <SelectContent>
                         <SelectItem value="desc">Highest first</SelectItem>
                         <SelectItem value="asc">Lowest first</SelectItem>
@@ -548,10 +560,10 @@ export function ChartBuilder({
               {canBreakdown ? (
                 <div className="grid gap-1.5">
                   <Label>{isHeatmap ? "2nd dimension (Y) — required" : "Breakdown / series (optional)"}</Label>
-                  <Select value={breakdown || "__none__"} onValueChange={(v) => setBreakdown(v === "__none__" ? "" : v ?? "")} disabled={!fields}>
-                    <SelectTrigger><SelectValue placeholder={isHeatmap ? "pick a 2nd column" : "no breakdown"} /></SelectTrigger>
+                  <Select value={breakdown || NO_BREAKDOWN} items={breakdownLabels} onValueChange={(v) => setBreakdown(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields}>
+                    <SelectTrigger className="w-full"><SelectValue placeholder={isHeatmap ? "pick a 2nd column" : "no breakdown"} /></SelectTrigger>
                     <SelectContent>
-                      {isHeatmap ? null : <SelectItem value="__none__">— no breakdown —</SelectItem>}
+                      {isHeatmap ? null : <SelectItem value={NO_BREAKDOWN}>— no breakdown —</SelectItem>}
                       {fields?.dimensions.filter((d) => d !== dimension).map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
                     </SelectContent>
                   </Select>
