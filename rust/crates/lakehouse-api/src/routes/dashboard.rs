@@ -640,7 +640,7 @@ pub async fn fields(State(state): State<AppState>, Query(q): Query<FieldsQuery>)
 async fn source_fields_body(ch: &ChClient, id: &str) -> Result<Value, ApiError> {
     let source = lakehouse_bi::sources::get_source(ch, id.trim())
         .await
-        .map_err(|err| classify_records_ch_error(&err))?
+        .map_err(|err| classify_dashboard_ch_error(&err))?
         .ok_or_else(|| ApiError::NotFound(format!("SQL source '{}' not found.", id.trim())))?;
     let mut dimensions = Vec::new();
     let mut measures = Vec::new();
@@ -660,6 +660,11 @@ async fn source_fields_body(ch: &ChClient, id: &str) -> Result<Value, ApiError> 
     }))
 }
 
+/// Schema metadata only — mart names, column names/types, row counts from
+/// `system.tables`/`system.columns`, never row values — so no policy
+/// rewrite: governance here masks and filters DATA, and the builder needs
+/// the column list to exist at all. (`/values`, which reads data, is
+/// rewritten.)
 async fn fields_body(
     ch: &ChClient,
     mart: Option<&str>,
@@ -786,17 +791,18 @@ pub async fn records(
     .map_err(Into::into)
 }
 
-/// Classifies a drill-down `ClickHouse` failure without forwarding its text
-/// (AGENTS.md principle 4): a server-side error is a fixed 422, anything
-/// else a fixed 503; the real detail is only logged.
-fn classify_records_ch_error(err: &lakehouse_clickhouse::ChError) -> ApiError {
+/// Classifies a `ClickHouse` failure on the dashboard's data routes
+/// (drill-down, filter values, SQL-source fields) without forwarding its
+/// text (AGENTS.md principle 4): a server-side error is a fixed 422,
+/// anything else a fixed 503; the real detail is only logged.
+fn classify_dashboard_ch_error(err: &lakehouse_clickhouse::ChError) -> ApiError {
     match err {
         lakehouse_clickhouse::ChError::Server(_) => {
-            tracing::warn!(%err, "drill-down query failed");
-            ApiError::Unprocessable("drill-down query failed".to_owned())
+            tracing::warn!(%err, "dashboard query failed");
+            ApiError::Unprocessable("dashboard query failed".to_owned())
         }
         lakehouse_clickhouse::ChError::Transport(_) | lakehouse_clickhouse::ChError::Cancelled => {
-            tracing::warn!(%err, "clickhouse unreachable during drill-down");
+            tracing::warn!(%err, "clickhouse unreachable for a dashboard query");
             ApiError::Unavailable("clickhouse unavailable".to_owned())
         }
     }
@@ -846,7 +852,7 @@ async fn records_for_roles(
     let cols = ch
         .rows(&cols_sql, None)
         .await
-        .map_err(|err| classify_records_ch_error(&err))?;
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
     if cols.is_empty() {
         return Err(ApiError::NotFound(format!("mart '{mart}' does not exist")));
     }
@@ -877,7 +883,7 @@ async fn records_for_roles(
     let result = ch
         .query(&rewritten, None)
         .await
-        .map_err(|err| classify_records_ch_error(&err))?;
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
     let columns: Vec<String> = result.meta.iter().map(|m| m.name.clone()).collect();
     Ok(json!({
         "columns": columns,
@@ -897,17 +903,54 @@ pub struct ValuesQuery {
     column: Option<String>,
 }
 
-/// `GET /api/dashboard/values` — distinct values of one column, across
-/// every Gold mart that has it (for a dashboard filter dropdown).
+/// `GET /api/dashboard/values?column=` — the distinct values of `column`
+/// across every `serving` mart that has it (the dashboard filter picker).
+///
+/// Unlike `/fields` (schema metadata only), this reads DATA, so it goes
+/// through `policy_engine::rewrite_sql_for_roles` for the caller's roles
+/// like the tiles do: a masked column's values, or rows a row filter hides,
+/// used to be listed here in the clear (plan §8 item 3). `ClickHouse`
+/// errors are classified, never forwarded.
 pub async fn values(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
     Query(q): Query<ValuesQuery>,
 ) -> ApiResult<ApiJson<Value>> {
+    let placeholders = crate::sql_rewrite::PlaceholderValues {
+        principal_id: Some(principal.id.uuid().to_string()),
+        principal_tenant_ids: principal
+            .tenant_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    };
+    let obligations = PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
+    values_for_roles(
+        &state.clickhouse,
+        q,
+        &principal.role_names,
+        &placeholders,
+        &obligations,
+    )
+    .await
+    .map(ApiJson)
+    .map_err(Into::into)
+}
+
+/// [`values`]' body, taking roles and placeholders explicitly so the
+/// enforcement path can be tested against a mock `ClickHouse` and a real
+/// policy row.
+async fn values_for_roles(
+    ch: &ChClient,
+    q: ValuesQuery,
+    roles: &[String],
+    placeholders: &crate::sql_rewrite::PlaceholderValues,
+    obligations: &PolicyEngineObligations<'_>,
+) -> Result<Value, ApiError> {
     let column = strip_non_ident(q.column.as_deref().unwrap_or(""));
     if column.is_empty() {
-        return Err(ApiError::BadRequest("column is required".to_owned()).into());
+        return Err(ApiError::BadRequest("column is required".to_owned()));
     }
-    let ch = &state.clickhouse;
     let marts_sql = format!(
         "SELECT table FROM system.columns WHERE database='serving' AND name='{column}' AND \
          table NOT LIKE '%\\_baru'"
@@ -915,11 +958,9 @@ pub async fn values(
     let marts = ch
         .rows(&marts_sql, None)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
     if marts.is_empty() {
-        return Ok(ApiJson(
-            json!({ "column": column, "values": Vec::<String>::new() }),
-        ));
+        return Ok(json!({ "column": column, "values": Vec::<String>::new() }));
     }
     let union = marts
         .iter()
@@ -930,15 +971,26 @@ pub async fn values(
         .collect::<Vec<_>>()
         .join(" UNION DISTINCT ");
     let sql = format!("SELECT v FROM ({union}) WHERE v != '' ORDER BY v LIMIT 200");
+    let rewritten = crate::policy_engine::rewrite_sql_for_roles(
+        &sql,
+        &sqlparser::dialect::ClickHouseDialect {},
+        roles,
+        placeholders,
+        obligations,
+    )
+    .await
+    .map_err(|err| {
+        ApiError::Unprocessable(crate::policy_engine::enforcement_error_message(&err).to_owned())
+    })?;
     let rows = ch
-        .rows(&sql, None)
+        .rows(&rewritten, None)
         .await
-        .map_err(|err| ApiError::Internal(err.to_string()))?;
+        .map_err(|err| classify_dashboard_ch_error(&err))?;
     let values: Vec<String> = rows
         .iter()
         .filter_map(|r| r.get("v").and_then(Value::as_str).map(ToOwned::to_owned))
         .collect();
-    Ok(ApiJson(json!({ "column": column, "values": values })))
+    Ok(json!({ "column": column, "values": values }))
 }
 
 // ── /api/dashboard/export ───────────────────────────────────────────────
@@ -1515,8 +1567,116 @@ mod records_enforcement {
             "ClickHouse's own text leaked: {text}"
         );
         assert!(
-            matches!(err, ApiError::Unprocessable(ref m) if m == "drill-down query failed"),
+            matches!(err, ApiError::Unprocessable(ref m) if m == "dashboard query failed"),
             "expected the fixed 422, got {err:?}"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod values_enforcement {
+    //! `/api/dashboard/values` reads data, so it is governed like the tiles
+    //! (plan §8 item 3). Same two-harness shape as `records_enforcement`.
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_clickhouse::ChClient;
+    use lakehouse_store::PgPool;
+    use lakehouse_store::governance::{self, CreatePolicyInput};
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{ValuesQuery, values_for_roles};
+    use crate::policy_engine::PolicyEngineObligations;
+    use crate::sql_rewrite::PlaceholderValues;
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn filter_values_of_a_masked_column_are_masked(pool: PgPool) -> sqlx::Result<()> {
+        governance::create_policy(
+            &pool,
+            &CreatePolicyInput {
+                name: "values-masking-test".to_owned(),
+                kind: "Row filter".to_owned(),
+                subjects: "Analyst".to_owned(),
+                resources: "serving.mart_x".to_owned(),
+                effect: "Permit with obligation".to_owned(),
+                conditions: Some(
+                    r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}"#.to_owned(),
+                ),
+                activate: true,
+                owner: None,
+            },
+        )
+        .await
+        .expect("seeding the governing policy must succeed");
+        let server = MockServer::start().await;
+        // Which marts have the column.
+        Mock::given(method("POST"))
+            .and(body_string_contains("SELECT table FROM system.columns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "table", "type": "String"}],
+                "data": [{"table": "mart_x"}],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        // The policy engine's column resolution.
+        Mock::given(method("POST"))
+            .and(body_string_contains("default_kind"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "name", "type": "String"},
+                    {"name": "default_kind", "type": "String"},
+                    {"name": "default_expression", "type": "String"},
+                ],
+                "data": [
+                    {"name": "email", "default_kind": "", "default_expression": ""},
+                    {"name": "region", "default_kind": "", "default_expression": ""},
+                ],
+                "rows": 2,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("replaceRegexpOne"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "v", "type": "String"}],
+                "data": [{"v": "***"}],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let obligations = PolicyEngineObligations::new(Some(&pool), &ch);
+
+        let body = values_for_roles(
+            &ch,
+            ValuesQuery {
+                column: Some("email".to_owned()),
+            },
+            &["Analyst".to_owned()],
+            &PlaceholderValues::none(),
+            &obligations,
+        )
+        .await
+        .expect("masked values still answer");
+
+        assert_eq!(body["values"], serde_json::json!(["***"]));
+        let distinct_queries: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("DISTINCT"))
+            .collect();
+        assert!(!distinct_queries.is_empty());
+        assert!(
+            distinct_queries
+                .iter()
+                .all(|b| b.contains("replaceRegexpOne(toString(`email`)")),
+            "every DISTINCT read must be the masked rewrite: {distinct_queries:?}"
         );
         Ok(())
     }
