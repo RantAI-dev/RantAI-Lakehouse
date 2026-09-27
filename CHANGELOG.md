@@ -10,6 +10,23 @@ once a first release is tagged.
 
 ### Added
 
+- Dashboard SQL sources: a saved read-only `SELECT` (e.g. a join across
+  several `serving` marts) that a chart can use instead of one mart.
+  Authored from Query Studio ("Save as SQL source") with the new
+  `dashboard:sql` permission (only `*:*` holds it today); restricted to
+  one `SELECT`/`WITH` over `serving.*` tables, run through the policy
+  rewrite, capped at 2,000 rows and 30 s. Charts on a source follow its
+  current SQL, dashboard filters apply, and the Copilot can list sources
+  and build charts on them (`list_sql_sources`, `sqlSource`).
+- Dashboard folders (stage 1): nested up to four levels, holding
+  dashboards and SQL sources; only empty folders can be deleted. Managed
+  from the dashboard title menu; "Move to folder…" in the ⋯ menu.
+- Page-aware Copilot: the dashboard's tiles with their first rows and the
+  active filters, or Query Studio's SQL and last result, are sent as page
+  context (bounded; the API cap is now 6,000 characters).
+- Chart builder: chart types in a sidebar next to the form and live
+  preview, replacing the separate gallery step.
+
 - Gold Exports console page: per-mart last export (`snapshotId`/
   `exportedAt`, read straight off the Iceberg table's own snapshot), an
   "Export now" action, export history from a new `console.gold_export_run`
@@ -76,6 +93,25 @@ once a first release is tagged.
   the model is intentionally left unchanged.
 - The alerts table now distinguishes an API failure from having no alerts,
   instead of showing an empty state for both.
+
+### Fixed
+
+- Dashboard drill-down, filter values (`/api/dashboard/values`), alert
+  values and digests now go through the policy rewrite like dashboard
+  tiles, so masking and row filters apply there too (alerts and digests as
+  the least-privileged "Dashboard Viewer" role, like embeds).
+- LLM failures no longer show the provider's raw response text in the
+  Copilot or the text-to-SQL agent.
+- `enforce` passes no permissions to the statement classifier (it passed
+  role names); sensitive `system.*` tables stay unreadable from governed
+  SQL surfaces, now stated explicitly.
+- A new dashboard no longer shows the previous board's charts (a stale
+  load response won the race); closed selects in the chart builder show
+  labels instead of raw ids; Copilot chart drafts on a SQL source preview
+  correctly.
+- Tests: `lakehouse-test-support` reuses one labelled Postgres container
+  instead of leaking one per test binary; the connector secret allowlist
+  test no longer depends on a developer `.env` (loaded by `sqlx::test`).
 
 ### Removed
 
