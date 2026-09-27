@@ -36,7 +36,7 @@ use crate::state::AppState;
 /// these two routes. This is a deliberate mapping, documented here, not
 /// an accidental "no principal, so no obligations" fail-open path (WS7
 /// plan Hard Requirement 2).
-const EMBED_VIEWER_ROLE: &str = "Dashboard Viewer";
+pub(crate) const EMBED_VIEWER_ROLE: &str = "Dashboard Viewer";
 
 /// `{ jwt }` — the `POST /api/embed/data` body shape.
 #[derive(Debug, Default, Deserialize)]

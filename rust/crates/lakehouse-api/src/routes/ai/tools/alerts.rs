@@ -114,6 +114,10 @@ pub(super) async fn run_alert_rule(state: &AppState, args: &Map<String, Value>) 
         silence_source
             .as_ref()
             .map(|s| s as &dyn lakehouse_alerts::SilenceSource),
+        &crate::routes::alerts::ApiSqlGate {
+            pg: state.pg.as_deref(),
+            ch: &state.clickhouse,
+        },
     )
     .await
     {

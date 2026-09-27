@@ -10,7 +10,9 @@ use axum::body::Bytes;
 use axum::extract::{Extension, Query, State};
 use axum::http::HeaderMap;
 use iceberg::{NamespaceIdent, TableIdent};
-use lakehouse_alerts::{AlertKind, AlertRule, AlertRuleInput, FreshnessSource, SilenceSource};
+use lakehouse_alerts::{
+    AlertKind, AlertRule, AlertRuleInput, FreshnessSource, SilenceSource, SqlGate,
+};
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
 use lakehouse_iceberg::IcebergClient;
@@ -247,6 +249,37 @@ impl SilenceSource for ApiSilenceSource<'_> {
     }
 }
 
+/// [`SqlGate`] over the shared policy engine
+/// (`policy_engine::rewrite_sql_for_roles`, the path tiles, embeds and
+/// Query Studio use).
+///
+/// Governed as the least-privileged "Dashboard Viewer" role, the same
+/// mapping `embed.rs` documents for public/embedded dashboards: an alert
+/// value or a digest is delivered outside the console (webhook, email) to
+/// whoever the rule targets, so no rule author's or caller's own grants
+/// apply to what the recipient sees. A refusal is the engine's fixed,
+/// non-leaking message.
+pub(in crate::routes) struct ApiSqlGate<'a> {
+    pub(in crate::routes) pg: Option<&'a PgPool>,
+    pub(in crate::routes) ch: &'a lakehouse_clickhouse::ChClient,
+}
+
+#[async_trait::async_trait]
+impl SqlGate for ApiSqlGate<'_> {
+    async fn gate(&self, sql: &str) -> Result<String, String> {
+        let obligations = crate::policy_engine::PolicyEngineObligations::new(self.pg, self.ch);
+        crate::policy_engine::rewrite_sql_for_roles(
+            sql,
+            &sqlparser::dialect::ClickHouseDialect {},
+            &[crate::routes::embed::EMBED_VIEWER_ROLE.to_owned()],
+            &crate::sql_rewrite::PlaceholderValues::none(),
+            &obligations,
+        )
+        .await
+        .map_err(|err| crate::policy_engine::enforcement_error_message(&err).to_owned())
+    }
+}
+
 /// A fixed, kind-derived `AlertItem.source` label for a fired rule's
 /// persisted instance — never invented per-rule text, just which engine
 /// produced it.
@@ -408,6 +441,10 @@ pub async fn run(
         _ => None,
     };
     let silence_source = state.pg.as_deref().map(|pg| ApiSilenceSource { pg });
+    let gate = ApiSqlGate {
+        pg: state.pg.as_deref(),
+        ch: &state.clickhouse,
+    };
 
     let results = lakehouse_alerts::run_rules(
         &state.clickhouse,
@@ -416,6 +453,7 @@ pub async fn run(
         query.id.as_deref(),
         freshness_source.as_ref().map(|s| s as &dyn FreshnessSource),
         silence_source.as_ref().map(|s| s as &dyn SilenceSource),
+        &gate,
     )
     .await
     .map_err(|err| ApiError::Internal(err.to_string()))?;
@@ -694,5 +732,101 @@ mod tests {
                 "still only the original silenced row — no fresh instance while silenced"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sql_gate_enforcement {
+    //! Alerts/digests must be governed like the dashboards they summarize:
+    //! same two-harness shape as `support::run_spec_sql_enforcement` (a real
+    //! ephemeral Postgres policy row + a wiremock `ClickHouse`).
+
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use lakehouse_alerts::SqlGate;
+    use lakehouse_clickhouse::ChClient;
+    use lakehouse_store::PgPool;
+    use lakehouse_store::governance::{self, CreatePolicyInput};
+    use wiremock::matchers::{body_string_contains, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::ApiSqlGate;
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_digest_or_alert_statement_is_masked_for_the_dashboard_viewer_role(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        governance::create_policy(
+            &pool,
+            &CreatePolicyInput {
+                name: "alert-masking-test".to_owned(),
+                kind: "Row filter".to_owned(),
+                subjects: "Dashboard Viewer".to_owned(),
+                resources: "serving.mart_x".to_owned(),
+                effect: "Permit with obligation".to_owned(),
+                conditions: Some(
+                    r#"{"roles":["Dashboard Viewer"],"table":"serving.mart_x","mask":["email"]}"#
+                        .to_owned(),
+                ),
+                activate: true,
+                owner: None,
+            },
+        )
+        .await
+        .expect("seeding the governing policy must succeed");
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("system.columns"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [
+                    {"name": "name", "type": "String"},
+                    {"name": "default_kind", "type": "String"},
+                    {"name": "default_expression", "type": "String"},
+                ],
+                "data": [
+                    {"name": "email", "default_kind": "", "default_expression": ""},
+                    {"name": "amount", "default_kind": "", "default_expression": ""},
+                ],
+                "rows": 2,
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let gate = ApiSqlGate {
+            pg: Some(&pool),
+            ch: &ch,
+        };
+
+        let governed = gate
+            .gate("SELECT email, sum(amount) AS v FROM serving.mart_x GROUP BY email")
+            .await
+            .expect("a governed table is rewritten, not refused");
+
+        assert!(
+            governed.contains("replaceRegexpOne(toString(`email`)"),
+            "the masked column must be rewritten: {governed}"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrations = "../../migrations")]
+    async fn a_statement_the_engine_refuses_is_refused_with_a_fixed_message(
+        pool: PgPool,
+    ) -> sqlx::Result<()> {
+        let server = MockServer::start().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        let gate = ApiSqlGate {
+            pg: Some(&pool),
+            ch: &ch,
+        };
+
+        let err = gate
+            .gate("SELECT * FROM url('http://example.com/x.csv', 'CSV')")
+            .await
+            .expect_err("a table function is refused");
+
+        assert!(!err.contains("example.com"), "{err}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+        Ok(())
     }
 }

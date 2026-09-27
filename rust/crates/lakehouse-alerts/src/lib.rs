@@ -791,6 +791,7 @@ fn coerce_number(v: Option<&Value>) -> f64 {
 /// written by another process.
 async fn current_value(
     ch: &ChClient,
+    gate: &dyn SqlGate,
     mart: &str,
     measure: &str,
     agg: &str,
@@ -808,6 +809,7 @@ async fn current_value(
         format!("round({agg}({measure_ident}))")
     };
     let sql = format!("SELECT {expr} AS v FROM serving.{mart_ident}");
+    let sql = gate.gate(&sql).await.map_err(AlertError::Validation)?;
     let rows = ch.rows(&sql, None).await?;
     Ok(coerce_number(rows.first().and_then(|r| r.get("v"))))
 }
@@ -846,12 +848,20 @@ fn fmt_id_id(n: f64) -> String {
 }
 
 /// Digest text for a board's `KPI`/gauge tiles. Ports `digestText`.
-async fn digest_text(ch: &ChClient, board_id: &str) -> Result<String, ChError> {
+async fn digest_text(ch: &ChClient, gate: &dyn SqlGate, board_id: &str) -> Result<String, ChError> {
     let Some(board) = lakehouse_bi::store::get_board(ch, board_id).await? else {
         return Ok("Dashboard not found.".to_owned());
     };
     let charts = lakehouse_bi::store::list_stored_charts(ch).await?;
     let on_board: Vec<_> = charts.iter().filter(|c| c.board == board_id).collect();
+    // A tile on a dashboard SQL source is rebuilt from the source's current
+    // text, as the dashboard itself does; the SQL stored with the chart may
+    // be stale.
+    let sources = if on_board.iter().any(|c| c.def.sql_source.is_some()) {
+        lakehouse_bi::sources::list_sources(ch).await?
+    } else {
+        Vec::new()
+    };
     let mut lines = vec![format!(
         "Dashboard: {} — {} tile",
         board.name,
@@ -865,9 +875,27 @@ async fn digest_text(ch: &ChClient, board_id: &str) -> Result<String, ChError> {
         if !is_kpi_or_gauge || chart.spec.sql.is_empty() {
             continue;
         }
+        let sql = match chart.def.sql_source.as_deref() {
+            None => Some(chart.spec.sql.clone()),
+            Some(id) => sources.iter().find(|s| s.id == id).and_then(|s| {
+                lakehouse_bi::builder::sql_for_sql_source(
+                    chart,
+                    &s.sql,
+                    &s.column_names(),
+                    &[],
+                    &[],
+                )
+            }),
+        };
         // `try { ... } catch { /* skip */ }` in the TypeScript: a failing
         // tile query is silently omitted from the digest, not propagated.
-        if let Ok(rows) = ch.rows(&chart.spec.sql, None).await {
+        // A tile the gate refuses, or whose SQL source is gone, is omitted
+        // the same way — never run ungoverned.
+        let Some(sql) = sql else { continue };
+        let Ok(sql) = gate.gate(&sql).await else {
+            continue;
+        };
+        if let Ok(rows) = ch.rows(&sql, None).await {
             let v = coerce_number(rows.first().and_then(|r| r.get("v")));
             lines.push(format!("• {}: {}", chart.spec.title, fmt_id_id(v)));
         }
@@ -939,6 +967,24 @@ pub trait SilenceSource: Send + Sync {
     async fn is_silenced(&self, rule_id: &str) -> bool;
 }
 
+/// Governance gate every statement this crate runs goes through, injected
+/// by the caller like [`SilenceSource`] so this crate stays free of the
+/// API's policy engine. Required, not optional: an alert value or a digest
+/// leaves the console by webhook or email, so an ungoverned read would
+/// deliver masked or row-filtered data to whoever the rule targets. The
+/// digest used to run each tile's stored SQL with plain `ch.rows`
+/// (`docs/plans/DASHBOARD-SQL-SOURCES-FOLDERS-PLAN.md` §8, item 4).
+#[async_trait::async_trait]
+pub trait SqlGate: Send + Sync {
+    /// The statement to execute in place of `sql`.
+    ///
+    /// # Errors
+    ///
+    /// A fixed, non-leaking refusal message when `sql` may not run; the
+    /// caller skips that value rather than running anything else.
+    async fn gate(&self, sql: &str) -> Result<String, String>;
+}
+
 /// Evaluate every enabled rule (or just `only`, if given), delivering
 /// alerts/digests/freshness breaches that fire. Ports `runRules`.
 ///
@@ -963,6 +1009,7 @@ pub async fn run_rules(
     only: Option<&str>,
     freshness: Option<&dyn FreshnessSource>,
     silence: Option<&dyn SilenceSource>,
+    gate: &dyn SqlGate,
 ) -> Result<Vec<RunResult>, ChError> {
     let rules: Vec<AlertRule> = list_rules(ch)
         .await?
@@ -972,7 +1019,7 @@ pub async fn run_rules(
 
     let mut out = Vec::with_capacity(rules.len());
     for rule in &rules {
-        out.push(run_one(ch, http, email, freshness, silence, rule).await);
+        out.push(run_one(ch, http, email, freshness, silence, gate, rule).await);
     }
     Ok(out)
 }
@@ -983,11 +1030,12 @@ async fn run_one(
     email: &EmailSender,
     freshness: Option<&dyn FreshnessSource>,
     silence: Option<&dyn SilenceSource>,
+    gate: &dyn SqlGate,
     rule: &AlertRule,
 ) -> RunResult {
     match rule.kind {
-        AlertKind::Alert => run_alert(ch, http, email, silence, rule).await,
-        AlertKind::Digest => run_digest(ch, http, email, silence, rule).await,
+        AlertKind::Alert => run_alert(ch, http, email, silence, gate, rule).await,
+        AlertKind::Digest => run_digest(ch, http, email, silence, gate, rule).await,
         AlertKind::Freshness => {
             run_freshness(freshness, http, email, silence, rule, now_millis()).await
         }
@@ -1046,11 +1094,12 @@ async fn run_alert(
     http: &reqwest::Client,
     email: &EmailSender,
     silence: Option<&dyn SilenceSource>,
+    gate: &dyn SqlGate,
     rule: &AlertRule,
 ) -> RunResult {
     let mart = rule.mart.as_deref().unwrap_or("");
     let measure = rule.measure.as_deref().unwrap_or("");
-    let value = match current_value(ch, mart, measure, &rule.agg).await {
+    let value = match current_value(ch, gate, mart, measure, &rule.agg).await {
         Ok(v) => v,
         Err(err) => return skipped(rule, err.to_string()),
     };
@@ -1091,10 +1140,11 @@ async fn run_digest(
     http: &reqwest::Client,
     email: &EmailSender,
     silence: Option<&dyn SilenceSource>,
+    gate: &dyn SqlGate,
     rule: &AlertRule,
 ) -> RunResult {
     let board = rule.board.as_deref().unwrap_or("");
-    match digest_text(ch, board).await {
+    match digest_text(ch, gate, board).await {
         Ok(text) => {
             let title = format!("📊 Digest: {}", rule.name);
             let delivered =
@@ -1206,6 +1256,71 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
 
     use super::*;
+
+    // ── SqlGate ──────────────────────────────────────────────────────────
+
+    struct RewriteGate;
+    #[async_trait::async_trait]
+    impl SqlGate for RewriteGate {
+        async fn gate(&self, sql: &str) -> Result<String, String> {
+            Ok(format!("{sql} /* GOVERNED */"))
+        }
+    }
+
+    struct RefuseGate;
+    #[async_trait::async_trait]
+    impl SqlGate for RefuseGate {
+        async fn gate(&self, _sql: &str) -> Result<String, String> {
+            Err("refused by policy".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_alert_value_is_read_through_the_gate() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("GOVERNED"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "meta": [{"name": "v", "type": "Float64"}],
+                "data": [{"v": 7}],
+                "rows": 1,
+            })))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        let v = current_value(&ch, &RewriteGate, "mart_x", "amount", "sum")
+            .await
+            .expect("the governed statement answers");
+
+        assert_eq!(v, 7.0);
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert!(
+            bodies.iter().all(|b| b.contains("GOVERNED")),
+            "only the gated statement may reach ClickHouse: {bodies:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_alert_value_never_reaches_clickhouse() {
+        let server = wiremock::MockServer::start().await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        let err = current_value(&ch, &RefuseGate, "mart_x", "amount", "sum")
+            .await
+            .expect_err("a refusal is an error, not a value");
+
+        assert!(matches!(err, AlertError::Validation(ref m) if m == "refused by policy"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
 
     // ── compare / AlertOp ──────────────────────────────────────────────
 
