@@ -10,7 +10,7 @@ import { CopilotSidebar } from "@/features/copilot/copilot-sidebar";
 import { CopilotProvider } from "@/features/copilot/use-copilot";
 import { CommandPalette } from "@/components/command-palette";
 import { isPublicPath, useAuth } from "@/features/auth/auth-provider";
-import { LoadingSkeleton } from "@/components/patterns/page-states";
+import { AppShellSkeleton } from "@/components/app-shell/app-shell-skeleton";
 
 /**
  * The app frame (sidebar + navbar + AI dock + command palette). For PUBLIC
@@ -41,18 +41,15 @@ export function AppFrame({ children }: Readonly<{ children: React.ReactNode }>) 
 
 function AuthenticatedFrame({ children }: Readonly<{ children: React.ReactNode }>) {
   const { status } = useAuth();
+  const pathname = usePathname() ?? "/";
 
   if (status !== "authenticated") {
     // `status === "unauthenticated"` still renders this (rather than
     // `null`) for one tick while `AuthProvider`'s redirect effect fires —
-    // a bare loading skeleton is a better transient state than a blank
+    // a frame-shaped skeleton is a better transient state than a blank
     // page, and it never lingers since the redirect is synchronous with
     // the status flip.
-    return (
-      <div className="flex-1 p-4 sm:p-5 lg:p-6">
-        <LoadingSkeleton rows={8} />
-      </div>
-    );
+    return <AppShellSkeleton pathname={pathname} />;
   }
 
   return (

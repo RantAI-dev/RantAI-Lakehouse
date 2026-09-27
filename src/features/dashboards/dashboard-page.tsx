@@ -26,6 +26,7 @@ import { DashboardActionsMenu, RenameDashboardDialog } from "./dashboard-actions
 import { notifyDashboardsChanged, useDashboardsChanged } from "./dashboard-events";
 import { DashboardFilters } from "./dashboard-filters";
 import { DashboardGrid, type GridItem, type TileMenuItem } from "./dashboard-grid";
+import { DashboardTilesSkeleton } from "./dashboard-skeleton";
 import { DrillMenu, RecordsDialog, fetchRecords, type DrillTarget, type RecordsState } from "./drill";
 import { ManageFoldersDialog, MoveBoardDialog } from "./folder-dialogs";
 import { ShareDialog } from "./share-dialog";
@@ -458,7 +459,9 @@ export function DashboardPage() {
       ) : null}
 
       {/* Canvas */}
-      {!loading && charts.length === 0 ? (
+      {loading && charts.length === 0 ? (
+        <DashboardTilesSkeleton />
+      ) : !loading && charts.length === 0 ? (
         <Empty className="border border-dashed">
           <EmptyHeader>
             <EmptyMedia variant="icon">
