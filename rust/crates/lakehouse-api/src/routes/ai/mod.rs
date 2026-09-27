@@ -211,8 +211,16 @@ fn page_context_line(raw: &str) -> String {
     if page_ctx.trim().is_empty() {
         return String::new();
     }
+    // Found in QA: asked "which filter is active?" or "which type is
+    // largest here?", the model re-ran SQL for numbers already in this
+    // context. The values below are what the user is looking at, so a
+    // question about them is answered from here; tools are for data that
+    // is not on the page or when the user asks to check.
     format!(
-        "\n\nCURRENT PAGE CONTEXT: {page_ctx}\nTailor your help, wording, and suggestions to where the user currently is."
+        "\n\nCURRENT PAGE CONTEXT: {page_ctx}\nTailor your help, wording, and suggestions to where the user currently is. \
+         For questions about what is on this page (its tiles, the values they show, the active filters, the SQL and its result), \
+         answer from this context directly and say the numbers are from the screen; do not call tools for them. \
+         Call tools only for data that is not shown here, or when the user asks you to verify or refresh it."
     )
 }
 
@@ -747,11 +755,37 @@ fn llm_unavailable(err: &lakehouse_llm::LlmError) -> Response {
         .into_response()
 }
 
+/// Caller-facing text for an LLM failure, shared by the Copilot and the
+/// text-to-SQL agent. It used to be `err.to_string()` — the provider's own
+/// response text (e.g. Cloudflare's `error code: 1016` page, seen in QA when
+/// the configured tunnel was down), shown verbatim (AGENTS.md principle 4).
+/// It is now fixed text; the only thing carried over is the HTTP status,
+/// which `lakehouse-llm` formatted itself (`LLM <status>: …`), and the full
+/// error is logged.
+pub(crate) fn llm_error_detail(err: &lakehouse_llm::LlmError) -> String {
+    tracing::warn!(%err, "LLM call failed");
+    match err {
+        lakehouse_llm::LlmError::Transport(_) => {
+            "The AI service could not be reached. Try again later.".to_owned()
+        }
+        lakehouse_llm::LlmError::Api(msg) => msg
+            .strip_prefix("LLM ")
+            .and_then(|rest| rest.split(':').next())
+            .and_then(|code| code.trim().parse::<u16>().ok())
+            .map_or_else(
+                || "The AI service returned an error. Try again later.".to_owned(),
+                |code| format!("The AI service returned an error (HTTP {code}). Try again later."),
+            ),
+    }
+}
+
+/// The fixed 503 body for a Copilot LLM failure.
 fn llm_unavailable_body(err: &lakehouse_llm::LlmError) -> Value {
+    let detail = llm_error_detail(err);
     json!({
         "error": "AI Copilot tak tersedia",
-        "detail": err.to_string(),
-        "hint": "Set LLM_KEY (MiniMax) di .env.local.",
+        "detail": detail,
+        "hint": "Check LLM_URL, LLM_KEY and LLM_MODEL in the API's environment.",
     })
 }
 
@@ -1394,6 +1428,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_llm_error_body_never_carries_the_providers_text() {
+        let err = lakehouse_llm::LlmError::Api(
+            "LLM 530: <html>error code: 1016 upstream-secret-detail</html>".to_owned(),
+        );
+        let body = llm_unavailable_body(&err);
+        let text = body.to_string();
+        assert!(!text.contains("1016"), "{text}");
+        assert!(!text.contains("upstream-secret-detail"), "{text}");
+        assert_eq!(
+            body["detail"],
+            "The AI service returned an error (HTTP 530). Try again later."
+        );
+        let odd = lakehouse_llm::LlmError::Api("something else entirely".to_owned());
+        assert_eq!(
+            llm_unavailable_body(&odd)["detail"],
+            "The AI service returned an error. Try again later."
+        );
+    }
+
+    #[test]
     fn page_context_carries_on_screen_data_up_to_the_cap() {
         assert_eq!(page_context_line(""), "");
         assert_eq!(page_context_line("   "), "");
@@ -1406,7 +1460,10 @@ mod tests {
         );
         let huge = "x".repeat(PAGE_CONTEXT_MAX_CHARS * 2);
         let capped = page_context_line(&huge);
-        assert_eq!(capped.matches('x').count(), PAGE_CONTEXT_MAX_CHARS);
+        assert!(capped.contains(&"x".repeat(PAGE_CONTEXT_MAX_CHARS)));
+        assert!(!capped.contains(&"x".repeat(PAGE_CONTEXT_MAX_CHARS + 1)));
+        // What is on the screen is answered from the screen, not re-queried.
+        assert!(line.contains("do not call tools for them"), "{line}");
     }
 
     #[test]

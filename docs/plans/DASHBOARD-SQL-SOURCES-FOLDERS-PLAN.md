@@ -200,15 +200,26 @@ server on 3100 points `RUST_API_URL` at 18081.
    policy rewrite — for every chart, not only SQL-source ones. For a
    SQL-source KPI it also uses the SQL stored with the chart rather than
    the source's current text. Not changed in this plan.
-5. Known test failure on `main`, not caused here:
-   `state::tests::connector_secret_resolver_admits_...` fails in the full
-   `lakehouse-api` run and passes alone (order-dependent environment).
-6. Follow-up finding (dev environment, not this feature):
-   `lakehouse-test-support` starts one Postgres testcontainer per test
-   binary and leaks the handle, so nothing ever stops it — every
-   `cargo test --workspace` leaves dozens of `postgres:16-alpine`
-   containers running. On the shared dev VM 245 had accumulated
-   (2026-09-22 → 26); removing them took used memory from 18 GiB to
-   4.4 GiB. Needs a real teardown (or testcontainers' reaper) in the
-   harness; until then, remove `label=org.testcontainers.managed-by=testcontainers`
-   containers after a run.
+5. RESOLVED (2026-09-27): `state::tests::connector_secret_resolver_...`
+   failed in the full `lakehouse-api` run on machines with a repo-root
+   `.env` setting `CONNECTOR_*`: `sqlx::test`'s harness calls
+   `dotenvy::var`, which loads that `.env` into the process environment.
+   The test now builds the same resolver chain over an explicit empty
+   environment.
+6. RESOLVED (2026-09-27): `lakehouse-test-support` started one Postgres
+   testcontainer per test binary and leaked the handle, so every
+   `cargo test --workspace` left dozens running (245 on the shared dev VM,
+   ~14 GiB). It now uses ONE labelled, reused container
+   (`reusable-containers`); removing it at exit instead was tried and
+   aborts the test process (tokio cannot run after `main`).
+7. RESOLVED (2026-09-27): LLM failures showed the provider's raw text
+   (`LLM 530: error code: 1016`) in the Copilot and the text-to-SQL agent;
+   both now return fixed text with only the HTTP status.
+8. RESOLVED (2026-09-27): in Ask mode the model re-queried numbers already
+   in the page context; the context line now tells it to answer on-screen
+   questions from the context (checked against DeepSeek: no tool calls).
+9. Open, design decision: the citation layer marks numbers taken from the
+   page context as unverified and drops tables built from it ("table
+   omitted: not backed by a tool result"), because the context is
+   client-supplied. Treating it as a separate, labelled evidence source is
+   possible but changes that guard's meaning — needs a decision.
