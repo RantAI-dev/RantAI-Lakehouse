@@ -151,7 +151,7 @@ fn trigger_lakehouse_build_schema() -> Value {
 
 fn get_build_status_schema() -> Value {
     json!({ "type": "function", "function": { "name": "get_build_status",
-        "description": "Recent Dagster runs across all pipelines, with their status and start time.",
+        "description": "A log of the 10 most recent Dagster runs across all jobs, with status and start time. It does NOT give each pipeline's current state: to find failing pipelines use list_pipelines.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
@@ -349,7 +349,7 @@ fn delete_connector_schema() -> Value {
 
 fn list_pipelines_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_pipelines",
-        "description": "List every pipeline (Dagster jobs and pipelines authored in the console) with its latest status, schedule, and last and next run.",
+        "description": "List every pipeline (Dagster jobs and pipelines authored in the console) with its latest status (e.g. failed, completed), schedule, and last and next run. Use it to answer which pipelines are failing or healthy.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 

@@ -377,6 +377,41 @@ async fn column_stats(
     out
 }
 
+/// Whether a numeric column identifies a row (a year, a month number, an
+/// id or code) rather than being a measure to add up.
+fn is_key_like(name: &str) -> bool {
+    let n = name.to_lowercase();
+    [
+        "year", "tahun", "month", "bulan", "day", "hari", "week", "minggu", "quarter", "kuartal",
+        "_no", "_id", "kode", "code",
+    ]
+    .iter()
+    .any(|k| n == k.trim_start_matches('_') || n.contains(k))
+        || n == "id"
+}
+
+/// The table's grain and its measures, for the small-model mistake this
+/// was added for: `qwen3:4b` answered "the peak month's visits" with one
+/// country's row (`ORDER BY jumlah DESC LIMIT 1`) instead of the month's
+/// total, because nothing said a row is one combination of several
+/// columns. `None` when the table has no numeric measure.
+fn grain_line(table: &Table) -> Option<String> {
+    let (measures, keys): (Vec<&Column>, Vec<&Column>) = table
+        .columns
+        .iter()
+        .partition(|c| is_numeric_type(&c.ty) && !is_key_like(&c.name));
+    if measures.is_empty() || keys.is_empty() {
+        return None;
+    }
+    let keys: Vec<&str> = keys.iter().map(|c| c.name.as_str()).collect();
+    let measures: Vec<&str> = measures.iter().map(|c| c.name.as_str()).collect();
+    Some(format!(
+        "    grain: one row per {}; measures: {} (SUM them over rows for any total)\n",
+        keys.join(" x "),
+        measures.join(", ")
+    ))
+}
+
 /// One table's entry: its line (row count, and the catalog dataset it
 /// serves, if any) and one line per column with its description and
 /// stats.
@@ -412,6 +447,9 @@ fn render_table(
         }
     }
     out.push('\n');
+    if let Some(grain) = grain_line(table) {
+        out.push_str(&grain);
+    }
     for col in &table.columns {
         let _ = write!(out, "    {} {}", col.name, col.ty);
         if let Some(d) = dataset
@@ -540,5 +578,35 @@ mod tests {
         assert!(is_text_type("LowCardinality(String)"));
         assert!(is_text_type("Enum8('a' = 1)"));
         assert!(!is_text_type("UInt8"));
+    }
+
+    #[test]
+    fn a_table_states_its_grain_and_which_columns_to_sum() {
+        let col = |name: &str, ty: &str| Column {
+            name: name.to_owned(),
+            ty: ty.to_owned(),
+        };
+        let table = Table {
+            db: "serving".to_owned(),
+            name: "mart_visits".to_owned(),
+            rows: Some(720),
+            columns: vec![
+                col("tahun", "UInt16"),
+                col("bulan_no", "UInt8"),
+                col("negara", "String"),
+                col("jumlah", "UInt32"),
+            ],
+        };
+        assert_eq!(
+            grain_line(&table).as_deref(),
+            Some(
+                "    grain: one row per tahun x bulan_no x negara; measures: jumlah (SUM them over rows for any total)\n"
+            )
+        );
+        let only_labels = Table {
+            columns: vec![col("indikator", "String")],
+            ..table
+        };
+        assert_eq!(grain_line(&only_labels), None);
     }
 }

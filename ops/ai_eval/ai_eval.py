@@ -99,6 +99,10 @@ REFUSAL_CUES = (
     "doesn't cover",
     "tidak tercakup",
     "di luar",
+    "does not include",
+    "doesn't include",
+    "not included",
+    "tidak termasuk",
     "tidak ada",
     "tidak tersedia",
     "belum ada",
@@ -321,6 +325,30 @@ def run_case(cfg: Config, session: requests.Session, case: dict[str, Any]) -> di
         body = ask(cfg, session, mode, messages)
         bodies.append(body)
         messages.append({"role": "assistant", "content": plain_text(body.get("answer", ""))})
+    return score_case(cfg, session, case, bodies)
+
+
+def bodies_from_saved(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """The response bodies a saved result was scored from, rebuilt for
+    `--rescore`: the tool trace per turn and the final answer, status and
+    latency. Earlier turns' answers are not saved and are not scored."""
+    traces = result.get("trace") or [[]]
+    status = 200
+    for problem in result.get("problems", []):
+        match = re.search(r"no answer \(HTTP (\d+)", problem)
+        if match:
+            status = int(match.group(1))
+    bodies = [{"toolTrace": t, "answer": "", "_status": 200, "_elapsed_s": result.get("elapsed_s", 0)} for t in traces]
+    bodies[-1].update({"answer": result.get("answer", ""), "_status": status})
+    note = next((p[len("note: "):] for p in result.get("problems", []) if p.startswith("note: ")), None)
+    if note:
+        bodies[-1]["note"] = note
+    return bodies
+
+
+def score_case(
+    cfg: Config, session: requests.Session, case: dict[str, Any], bodies: list[dict[str, Any]]
+) -> dict[str, Any]:
     final = bodies[-1]
     raw_answer = final.get("answer", "") or ""
     answer = plain_text(raw_answer)
@@ -357,7 +385,14 @@ def run_case(cfg: Config, session: requests.Session, case: dict[str, Any]) -> di
             missing.append(f"tool={expect_tool['name']}{want}")
 
     refused = any(cue in lowered for cue in REFUSAL_CUES)
-    completeness = hit / required if required else (1.0 if refused else 0.0)
+    # No expected facts (e.g. no pipeline is failing right now): completeness
+    # is about declining only when the case expects that.
+    if required:
+        completeness = hit / required
+    elif case.get("expect_refusal"):
+        completeness = 1.0 if refused else 0.0
+    else:
+        completeness = 1.0
 
     accuracy = 1.0
     problems: list[str] = []
@@ -411,6 +446,11 @@ def main() -> int:
     parser.add_argument("--cases", default=str(HERE / "cases.json"))
     parser.add_argument("--only", default="")
     parser.add_argument("--out", default="")
+    parser.add_argument(
+        "--rescore",
+        default="",
+        help="score the answers saved in this results file again, without asking the API",
+    )
     args = parser.parse_args()
 
     cfg = Config.from_env()
@@ -427,10 +467,18 @@ def main() -> int:
     )
     login.raise_for_status()
 
+    saved = {}
+    if args.rescore:
+        saved = {r["id"]: r for r in json.loads(Path(args.rescore).read_text())["results"]}
+        cases = [c for c in cases if c["id"] in saved]
+
     results = []
     for case in cases:
         try:
-            result = run_case(cfg, session, case)
+            if saved:
+                result = score_case(cfg, session, case, bodies_from_saved(saved[case["id"]]))
+            else:
+                result = run_case(cfg, session, case)
         except requests.RequestException as err:
             result = {"id": case["id"], "completeness": 0, "accuracy": 0, "experience": 0,
                       "overall": 0, "problems": [f"request failed: {type(err).__name__}"]}

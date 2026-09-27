@@ -381,6 +381,22 @@ fn is_transient(err: &lakehouse_llm::LlmError) -> bool {
     }
 }
 
+/// Output-token cap for one model round.
+///
+/// The client's default (1,200) counts the model's reasoning too. Measured
+/// with `qwen3:4b`: a turn spent all 1,200 tokens reasoning and returned an
+/// empty answer after six minutes. A hosted model is billed only for the
+/// tokens it actually generates, so a higher cap costs nothing unless a
+/// round needs it.
+const ROUND_MAX_TOKENS: u32 = 4096;
+
+fn round_options() -> ChatOptions {
+    ChatOptions {
+        max_tokens: Some(ROUND_MAX_TOKENS),
+        ..ChatOptions::default()
+    }
+}
+
 async fn model_round_once(
     state: &AppState,
     messages: &[LlmMessage],
@@ -390,7 +406,7 @@ async fn model_round_once(
     if progress.is_none() {
         return state
             .llm
-            .chat_with_tools(messages, tools, ChatOptions::default())
+            .chat_with_tools(messages, tools, round_options())
             .await;
     }
     let mut tool_xml = HiddenSpans::new(&[
@@ -399,21 +415,15 @@ async fn model_round_once(
     ]);
     state
         .llm
-        .chat_with_tools_streamed(
-            messages,
-            tools,
-            ChatOptions::default(),
-            |piece| match piece {
-                StreamPiece::Text(text) => {
-                    let visible = tool_xml.push(text);
-                    visible.is_empty()
-                        || report(progress, json!({ "type": "delta", "text": visible }))
-                }
-                StreamPiece::Reasoning(text) => {
-                    report(progress, json!({ "type": "reasoning", "text": text }))
-                }
-            },
-        )
+        .chat_with_tools_streamed(messages, tools, round_options(), |piece| match piece {
+            StreamPiece::Text(text) => {
+                let visible = tool_xml.push(text);
+                visible.is_empty() || report(progress, json!({ "type": "delta", "text": visible }))
+            }
+            StreamPiece::Reasoning(text) => {
+                report(progress, json!({ "type": "reasoning", "text": text }))
+            }
+        })
         .await
 }
 
@@ -443,6 +453,7 @@ async fn run_chat(
     let mut build_run_id: Option<String> = None;
     let mut chart_created = false;
     let mut repaired = false;
+    let mut nudged = false;
     // The conversation so far, which the citation check accepts as
     // evidence (`citations::Evidence`): the system prompt, whose DATA MAP
     // row counts, ranges and distinct counts were read from the data
@@ -478,12 +489,31 @@ async fn run_chat(
             calls.extend(parse_minimax_tool_calls(content));
         }
         if calls.is_empty() {
-            let answer = strip_tool_xml(msg.content.as_deref().unwrap_or(""));
+            let answer =
+                strip_repair_preamble(&strip_tool_xml(msg.content.as_deref().unwrap_or("")));
             // WS7 item F2: every number/table the model just printed is
             // checked against `tool_trace` — the actual record of what ran
             // this turn — before it ever reaches the caller. Applies the
             // same way whether this turn's answer streams (`stream_chat`)
             // or not: both paths return through this one `run_chat` body.
+            if answer.trim().is_empty() && !nudged {
+                // A round with neither text nor a tool call (a small model
+                // that ran out of tokens while reasoning, or stopped early):
+                // ask once for the answer instead of returning a blank one.
+                nudged = true;
+                messages.push(LlmMessage {
+                    role: LlmMessageRole::User,
+                    content: Some(
+                        "Your last reply was empty. Answer the question now, from the tool \
+                         results above; call a tool first only if you still need data."
+                            .to_owned(),
+                    ),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+                continue;
+            }
             let annotated = citations::annotate_answer_in(&answer, &tool_trace, &conversation);
             let (numbers, omitted) = citations::flagged(&annotated);
             if !repaired && (!numbers.is_empty() || omitted) {
@@ -687,6 +717,33 @@ async fn run_chat(
     ))
 }
 
+/// Drops a narrated preamble before a `Final answer:` line. After a repair
+/// round a model sometimes explains its own correction first ("Now I have
+/// everything from a tool result… Final answer:"), measured on the local
+/// stack; the user should only see the answer. Text with no such line is
+/// returned unchanged.
+fn strip_repair_preamble(answer: &str) -> String {
+    let mut offset = 0;
+    for line in answer.split_inclusive('\n') {
+        let label = line
+            .trim()
+            .trim_matches(|c: char| c == '*' || c == '#' || c.is_whitespace())
+            .to_lowercase();
+        if label.starts_with("final answer") {
+            let rest = &line[line
+                .to_lowercase()
+                .find("answer")
+                .map_or(0, |i| i + "answer".len())..];
+            let rest = rest.trim_start_matches(|c: char| c == ':' || c == '*' || c.is_whitespace());
+            return format!("{rest}{}", &answer[offset + line.len()..])
+                .trim()
+                .to_owned();
+        }
+        offset += line.len();
+    }
+    answer.to_owned()
+}
+
 /// The message that asks the model to back or drop the figures the
 /// citation check flagged in its draft (see [`run_chat`]'s repair round).
 fn repair_request(numbers: &[String], table_omitted: bool) -> String {
@@ -704,9 +761,10 @@ fn repair_request(numbers: &[String], table_omitted: bool) -> String {
         text.push_str(" One of its tables has no figure backed by a tool result.");
     }
     text.push_str(
-        " For each figure: get it with run_sql (compute totals, differences, shares and \
-         percentages in the SQL itself), or remove it. Then write the complete final answer \
-         again, in the language of the user's question. Do not mention this check.",
+        " Start by calling run_sql to check each figure (compute totals, differences, shares \
+         and percentages in the SQL itself). Remove any figure you cannot back with a tool \
+         result. Then reply with the complete final answer only, in the language of the \
+         user's question: no preamble, no mention of this check, no \"Final answer:\" label.",
     );
     text
 }
@@ -1755,6 +1813,20 @@ mod tests {
                 "{status}"
             );
         }
+    }
+
+    #[test]
+    fn a_narrated_preamble_before_final_answer_is_dropped() {
+        let answer = "Now I have everything. I will remove the growth claim.\n\nFinal answer:\n\n**CDC is healthy.**";
+        assert_eq!(strip_repair_preamble(answer), "**CDC is healthy.**");
+        assert_eq!(
+            strip_repair_preamble("**Final answer:** 42 rows."),
+            "42 rows."
+        );
+        assert_eq!(
+            strip_repair_preamble("Plain answer, 42 rows."),
+            "Plain answer, 42 rows."
+        );
     }
 
     #[test]

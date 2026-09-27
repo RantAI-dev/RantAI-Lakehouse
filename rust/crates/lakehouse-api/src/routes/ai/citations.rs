@@ -700,11 +700,11 @@ fn read_number(word: &str, next: Option<&str>) -> Option<Printed> {
             consumed_next = true;
         }
     }
-    let slack = if decimals > 0 || factor > 1.0 {
-        0.5 * step * factor
-    } else {
-        0.0
-    };
+    // Half of the last printed digit: `43 MB` stands for 42.5-43.5 MB, as
+    // `2.64 million` stands for 2,635,000-2,645,000. A whole number used to
+    // get only the fixed tolerance, so a correctly rounded `43 MB` for
+    // 42.9 MB was flagged.
+    let slack = 0.5 * step * factor;
     let alt = (unit == Unit::None && is_dot_thousands(token)).then_some(value * 1000.0 * factor);
     Some(Printed {
         value: value * factor,

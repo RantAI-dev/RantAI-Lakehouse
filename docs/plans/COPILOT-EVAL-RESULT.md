@@ -1,10 +1,14 @@
 # Copilot evaluation: completeness, accuracy, experience
 
 Measured on the local `lakehouse-run` stack between 2026-09-26 and
-2026-09-27, with the harness in `ops/ai_eval/` (23 cases). On MiniMax-M3,
-the overall score went from **0.772 to 0.974**. Accuracy went from **0.578 to
-1.000**, with no unverified number left in any answer. The small-model result
-(`qwen3:4b` on CPU) is in its own section below.
+2026-09-27, with the harness in `ops/ai_eval/` (23 cases). On MiniMax-M3 the
+overall score went from **0.772 to 0.998**: completeness 0.882 to **1.000**,
+accuracy 0.578 to **0.996**, with 22 of 23 answers perfect. The one
+remaining flag is a real one-digit slip the checker caught.
+
+A 4-billion-parameter model (`qwen3:4b`, CPU only) answered correctly
+whenever it finished. After the fixes it made no wrong claims on the
+cases re-run, but on a CPU it takes minutes per answer.
 
 ## How it is measured
 
@@ -44,11 +48,16 @@ reading the saved answers.
 | v1 | 0.949 | 0.843 | 0.948 | 0.907 | 11 / 23 | 16 | 4.0 s |
 | v2 | 0.935 | 0.930 | 0.957 | 0.937 | 16 / 23 | 16 | 4.9 s |
 | v3 | 0.957 | 0.991 | 0.965 | 0.972 | 19 / 23 | 2 | 4.0 s |
-| v4 | 0.957 | **1.000** | 0.957 | **0.974** | 22 / 23 | 0 | 5.0 s |
+| v4 | 0.957 | 1.000 | 0.957 | 0.974 | 22 / 23 | 0 | 5.0 s |
+| v7 | 0.935 | 0.978 | 0.991 | 0.963 | 20 / 23 | 5 | 4.8 s |
+| **v8 (final)** | **1.000** | **0.996** | **1.000** | **0.998** | 22 / 23 | 1 | 4.0 s |
 
-The one v4 case below 1.00 is a MiniMax HTTP 5xx. The API now retries
-that (see the last row of the table below), but the fix landed after the
-v4 run.
+- **v4:** the case below 1.00 is a MiniMax HTTP 5xx; the retry landed after it.
+- **v7 found two problems:**
+  - An invented follow-up figure survived the repair round, because the model answered it without a tool call.
+  - The repair round's own narration ("Final answer: …") leaked into an answer.
+- **v8 fixed both.** Its one flag is a real mistake the checker caught: 2,643,888 printed as 2,648,888.
+- **Re-scoring.** Scores after v4 use the harness's re-score fixes: "does not include" counts as declining, and a case with no expected facts is not scored as declining. `--rescore` re-scores saved answers; v4 re-scores to the same 0.974.
 
 In the baseline, most of the 175 unverified numbers were correct values
 the citation checker could not match (see "Citation checker" below). The
@@ -69,6 +78,10 @@ false alarms users saw. Both were real problems for users.
 | Raw `DB::Exception … _silver_meta does not exist` in answers and on the Data Quality page | Tools and `GET /api/governance/{kind}` returned upstream text | Classified messages ("no results yet: the job that records them has not run"). The same applies to `run_sql` errors (message kept for self-correction, boilerplate removed) and to the LLM-unavailable body. |
 | `describe_dataset` reported `rows: 0` for a 720-row table | It counted a Silver table that did not exist | Per-layer `present: true/false`, never an invented 0. `describe_mart` reports an unknown count as null. |
 | One model 5xx cost the user the whole answer | No retry | Transient failures (connection, 408, 429, 5xx) are retried twice (1.5 s, 4 s). A 4xx such as a bad key is not retried. |
+| A small model's answer came back empty | Reasoning used the whole 1,200-token cap | 4,096 tokens per round, and one "answer now" nudge for an empty round. |
+| A small model read one row as a total | The prompt never said a row is one combination of dimensions | Grain line per table in the DATA MAP ("one row per tahun x bulan_no x negara; SUM jumlah"), plus a rule in the prompt. |
+| The repair round's narration reached the user | The model explained its correction | A preamble before a "Final answer:" line is dropped, and the repair request says to reply with the answer only. |
+| Providers ignore forced tool choice | Tested: neither MiniMax nor Ollama honours `tool_choice: "required"` or a named function | The repair request tells the model to start with `run_sql`. A figure it still cannot back stays flagged. |
 
 ## Built for small models
 
@@ -90,8 +103,53 @@ The changes follow that:
 
 ## Small model: `qwen3:4b` (Ollama, CPU only)
 
-Pending: the full run is in progress. Only `inventory` has finished so far:
-complete and accurate, 517 s.
+`qwen3:4b` ran under Ollama on this machine's 8-core CPU with no GPU, with
+`AI_CHAT_TIMEOUT_SECS=1800`. Latency is a property of this hardware, so it
+is reported apart from correctness.
+
+**Full run (v5, 23 cases, re-scored with the fixed harness).**
+
+| Score | Value |
+| --- | ---: |
+| Completeness | 0.848 |
+| Accuracy | 1.000 |
+| Experience | 0.191 |
+| Overall | 0.777 |
+
+**Latency.** Median about 10 minutes per answer, range 100 s to 30 min.
+
+**Where it was right.** 19 of 23 cases were complete and correct:
+
+- the layer overview;
+- totals, rankings, shares and growth;
+- the Indonesian question, answered in Indonesian;
+- the schema question;
+- lineage and quality;
+- the empty connector and alert lists;
+- dashboards;
+- the two-turn follow-up;
+- both questions the data cannot answer, declined correctly;
+- the build-mode chart request.
+
+**What went wrong, and what was done about it:**
+
+| Case | What happened | Fix, and the re-run on `qwen3:4b` |
+| --- | --- | --- |
+| Peak month | Returned one country's row as the month total (a real error, invisible to number matching: the value was in the result) | Each table's grain and "SUM the measure" added to the DATA MAP and prompt. Re-run: correct month and total. |
+| Failing pipelines | Read the run log (`get_build_status`) and said nothing was failing | The two tool descriptions now say which question each answers. Re-run: used `list_pipelines`, answer matched the live state. |
+| Two-part atlas question | Timed out at 30 min in both runs | None: CPU speed. |
+| CDC health | True status and lag, but no slot name | `get_cdc_health` now returns each slot's latest check (40 samples became 1). The answer still omitted the name. Open. |
+
+**Hidden failure: empty answers.** One earlier (v4) answer came back empty:
+the model spent the whole 1,200-token output cap on reasoning. The cap is
+now 4,096 per round, and an empty round gets one "answer now" nudge; no
+empty answer occurred after that.
+
+**Conclusion.** The mechanisms that raised the large model's accuracy (the
+DATA MAP with stored values and grain, per-turn tool selection, the
+citation check and repair round, plain rules) also carry a 4B model to
+correct answers. For interactive use, serve it on a GPU or a hosted
+small-model endpoint: on CPU it answers in minutes.
 
 ## Known gaps
 
@@ -104,7 +162,12 @@ complete and accurate, 517 s.
   shapes.
 - **Repair round.** It is one extra model call, taken only when a draft
   has unbacked figures. The second answer is shown as it is, flags
-  included.
+  included; a model that ignores the request (no tool call) keeps its
+  flags.
+- **Number matching is not meaning checking.** A number that is in the
+  tool result but answers the wrong question (one row read as a total)
+  passes the citation check. The grain rule reduces this; reading answers
+  is still part of evaluating a change.
 - **Unrelated test failure.**
   `state::tests::connector_secret_resolver_admits_credential_suffixed_refs…`
   fails whenever the tests run in a checkout that has a local `.env` with

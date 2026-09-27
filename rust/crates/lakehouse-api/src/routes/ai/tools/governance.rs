@@ -48,7 +48,55 @@ pub(super) async fn list_quality_rules(state: &AppState) -> Value {
 }
 
 pub(super) async fn get_cdc_health(state: &AppState) -> Value {
-    governance_kind(state, "replication").await
+    latest_per_slot(governance_kind(state, "replication").await)
+}
+
+/// The replication route returns every 15-minute sample (40 rows for one
+/// slot on the local stack). The model needs each slot's current state:
+/// measured with `qwen3:4b`, the full history produced "the slot is
+/// healthy" without ever naming the slot. Each slot's newest sample is
+/// kept, with how many samples were seen; an error or an unexpected shape
+/// passes through untouched.
+fn latest_per_slot(result: Value) -> Value {
+    let Some(Value::Array(samples)) = result.get("replicationSlots") else {
+        return result;
+    };
+    let mut latest: Vec<(String, Value, usize)> = Vec::new();
+    for sample in samples {
+        let slot = sample
+            .get("slotName")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let checked = sample
+            .get("checkedAt")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if let Some(entry) = latest.iter_mut().find(|(s, _, _)| *s == slot) {
+            entry.2 += 1;
+            let newer = checked
+                > entry
+                    .1
+                    .get("checkedAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+            if newer {
+                entry.1 = sample.clone();
+            }
+        } else {
+            latest.push((slot, sample.clone(), 1));
+        }
+    }
+    let slots: Vec<Value> = latest
+        .into_iter()
+        .map(|(_, mut sample, n)| {
+            if let Value::Object(map) = &mut sample {
+                map.insert("samplesSeen".to_owned(), json!(n));
+            }
+            sample
+        })
+        .collect();
+    json!({ "slots": slots, "note": "each slot's most recent check" })
 }
 
 pub(super) async fn get_maintenance_metrics(state: &AppState) -> Value {
@@ -174,5 +222,33 @@ mod tests {
         args.insert("activate".to_owned(), json!(true));
         let result = draft_policy(&s, &args).await;
         assert!(result.get("error").is_some(), "{result}");
+    }
+}
+
+#[cfg(test)]
+mod latest_slot {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn keeps_each_slots_newest_sample_and_counts_the_rest() {
+        let result = json!({ "replicationSlots": [
+            { "slotName": "a", "checkedAt": "2026-09-27T01:00:00Z", "status": "ok" },
+            { "slotName": "a", "checkedAt": "2026-09-27T01:15:00Z", "status": "lagging" },
+            { "slotName": "b", "checkedAt": "2026-09-27T01:10:00Z", "status": "ok" },
+        ]});
+        let out = latest_per_slot(result);
+        let slots = out["slots"].as_array().unwrap();
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[0]["status"], "lagging");
+        assert_eq!(slots[0]["samplesSeen"], 2);
+        assert_eq!(slots[1]["slotName"], "b");
+    }
+
+    #[test]
+    fn an_error_passes_through() {
+        let err = json!({ "error": "no results yet" });
+        assert_eq!(latest_per_slot(err.clone()), err);
     }
 }

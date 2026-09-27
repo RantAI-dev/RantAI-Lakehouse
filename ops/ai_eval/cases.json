@@ -44,7 +44,40 @@
       {
         "label": "country",
         "kind": "text",
-        "sql": "SELECT negara FROM serving.mart_wisman GROUP BY negara ORDER BY sum(jumlah) DESC LIMIT 3"
+        "sql": "SELECT negara FROM serving.mart_wisman GROUP BY negara ORDER BY sum(jumlah) DESC LIMIT 3",
+        "aliases": {
+          "Singapura": [
+            "Singapore"
+          ],
+          "Tiongkok": [
+            "China"
+          ],
+          "Jepang": [
+            "Japan"
+          ],
+          "Korea Selatan": [
+            "South Korea"
+          ],
+          "Belanda": [
+            "Netherlands"
+          ],
+          "Jerman": [
+            "Germany"
+          ],
+          "Inggris": [
+            "United Kingdom",
+            "UK",
+            "Britain"
+          ],
+          "Prancis": [
+            "France"
+          ],
+          "Amerika Serikat": [
+            "United States",
+            "USA",
+            "US"
+          ]
+        }
       },
       {
         "label": "visits",
