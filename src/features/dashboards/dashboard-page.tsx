@@ -119,7 +119,13 @@ export function DashboardPage() {
     return () => { cancelled = true; };
   }, []);
 
+  // Only the newest load may write state. Creating a dashboard fires a
+  // reload of the board being left and then navigates to the new one; the
+  // old board's response (slower: it runs the built-in tiles) used to land
+  // last and paint its charts under the new dashboard's name.
+  const loadSeq = React.useRef(0);
   const load = React.useCallback(async () => {
+    const seq = ++loadSeq.current;
     setLoading(true); setError(null);
     try {
       const q = new URLSearchParams({ board });
@@ -127,6 +133,7 @@ export function DashboardPage() {
       if (!adoptingRef.current && filtersRef.current.length) q.set("filters", JSON.stringify(filtersRef.current));
       const res = await apiFetch(`/api/dashboard?${q.toString()}`, { cache: "no-store" });
       const json = (await res.json()) as Payload;
+      if (seq !== loadSeq.current) return;
       if (!res.ok) throw new Error((json as { error?: string }).error ?? "Failed to load dashboard");
       setData(json);
       setLayout(json.layout ?? {});
@@ -136,9 +143,9 @@ export function DashboardPage() {
         adoptingRef.current = false;
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (seq === loadSeq.current) setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      if (seq === loadSeq.current) setLoading(false);
     }
   }, [board, year]);
 
