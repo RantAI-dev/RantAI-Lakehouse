@@ -26,6 +26,11 @@ once a first release is tagged.
   context (bounded; the API cap is now 6,000 characters).
 - Chart builder: chart types in a sidebar next to the form and live
   preview, replacing the separate gallery step.
+- Four chart kinds: sankey and sunburst (flow / two-level hierarchy over
+  a dimension and a required breakdown), box plot (min, quartiles, max per
+  category via `quantilesExact`), and calendar heatmap (daily values, up
+  to the last year of data). Available in the builder, to the Copilot, and
+  on SQL sources.
 
 - Gold Exports console page: per-mart last export (`snapshotId`/
   `exportedAt`, read straight off the Iceberg table's own snapshot), an

@@ -18,6 +18,8 @@ export type ChartKind =
   | "scatter" | "bubble" | "heatmap" | "radar" | "waterfall"
   // geographic
   | "geomap"
+  // flow, hierarchy, distribution, time grid (chart-transforms.ts)
+  | "sankey" | "sunburst" | "boxplot" | "calendar"
   // single number
   | "kpi" | "gauge"
   // non-chart

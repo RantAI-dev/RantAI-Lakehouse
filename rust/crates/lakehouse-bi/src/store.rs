@@ -63,18 +63,37 @@ const KINDS: &[ChartKind] = &[
     ChartKind::Radar,
     ChartKind::Waterfall,
     ChartKind::Geomap,
+    ChartKind::Sankey,
+    ChartKind::Sunburst,
+    ChartKind::Boxplot,
+    ChartKind::Calendar,
     ChartKind::Kpi,
     ChartKind::Gauge,
     ChartKind::Table,
     ChartKind::Text,
 ];
 
-/// Kinds allowed to carry a breakdown (2nd dimension). `heatmap` REQUIRES one.
-/// Mirrors the TS `BREAKDOWN_KINDS` set.
+/// Kinds allowed to carry a breakdown (2nd dimension). `heatmap`, `sankey`
+/// and `sunburst` REQUIRE one ([`breakdown_required`]). Mirrors the TS
+/// `BREAKDOWN_KINDS` set.
 fn breakdown_allowed(kind: ChartKind) -> bool {
     matches!(
         kind,
-        ChartKind::Bar | ChartKind::Hbar | ChartKind::Line | ChartKind::Area | ChartKind::Heatmap
+        ChartKind::Bar
+            | ChartKind::Hbar
+            | ChartKind::Line
+            | ChartKind::Area
+            | ChartKind::Heatmap
+            | ChartKind::Sankey
+            | ChartKind::Sunburst
+    )
+}
+
+/// Kinds that only make sense with a 2nd dimension.
+fn breakdown_required(kind: ChartKind) -> bool {
+    matches!(
+        kind,
+        ChartKind::Heatmap | ChartKind::Sankey | ChartKind::Sunburst
     )
 }
 
@@ -1349,7 +1368,7 @@ fn validate_chart_shape(
         }
         if !breakdown_allowed(kind) {
             return Err(BiError::Validation(
-                "breakdown is only for bar/hbar/line/area/heatmap.".to_owned(),
+                "breakdown is only for bar/hbar/line/area/heatmap/sankey/sunburst.".to_owned(),
             ));
         }
         if measures.len() > 1 {
@@ -1358,9 +1377,18 @@ fn validate_chart_shape(
             ));
         }
     }
-    if kind == ChartKind::Heatmap && breakdown.is_empty() {
+    if breakdown_required(kind) && breakdown.is_empty() {
+        let label = serde_json::to_value(kind)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        return Err(BiError::Validation(format!(
+            "{label} needs a breakdown (2nd dimension)."
+        )));
+    }
+    if kind == ChartKind::Boxplot && measures.len() != 1 {
         return Err(BiError::Validation(
-            "heatmap needs a breakdown (2nd dimension).".to_owned(),
+            "a 'boxplot' chart needs exactly one measure.".to_owned(),
         ));
     }
     Ok(())
@@ -1372,6 +1400,7 @@ fn validate_chart_shape(
 /// [`QueryBuilder`]. Split out of `spec_from_chart_input` to keep it under
 /// clippy's line-count limit.
 fn build_chart_sql(
+    kind: ChartKind,
     from: &Relation,
     dimension: &str,
     measures: &[String],
@@ -1399,6 +1428,19 @@ fn build_chart_sql(
         })?),
         None => None,
     };
+    if kind == ChartKind::Boxplot {
+        // One measure, checked by `validate_chart_shape`; no aggregate.
+        let measure = measure_idents
+            .first()
+            .ok_or_else(|| BiError::Validation("invalid or missing measure column.".to_owned()))?;
+        return Ok(crate::builder::build_boxplot_sql(
+            from,
+            &dimension_ident,
+            measure,
+            &[],
+            limit,
+        ));
+    }
     // `agg` was already checked against `aggregate_allowed` by the caller
     // (`spec_from_chart_input`), so this conversion is exact.
     Ok(QueryBuilder::over(from.clone())
@@ -1437,9 +1479,18 @@ fn spec_from_chart_input(
     } = ctx;
 
     let dimension = input.dimension.clone();
-    let limit = input.limit.unwrap_or(20).clamp(1, 100);
+    // A calendar shows one cell per day, so up to a year of rows; every
+    // other kind keeps the Top-N range the builder offers (1–100).
+    let limit = if kind == ChartKind::Calendar {
+        input.limit.unwrap_or(366).clamp(1, 366)
+    } else {
+        input.limit.unwrap_or(20).clamp(1, 100)
+    };
     let order = input.order.clone().unwrap_or_else(|| {
-        if matches!(kind, ChartKind::Line | ChartKind::Area) {
+        if matches!(
+            kind,
+            ChartKind::Line | ChartKind::Area | ChartKind::Calendar
+        ) {
             "none".to_owned()
         } else {
             "desc".to_owned()
@@ -1473,6 +1524,7 @@ fn spec_from_chart_input(
     };
 
     let sql = build_chart_sql(
+        kind,
         &from,
         &dimension,
         &measures,
@@ -1903,6 +1955,26 @@ mod tests {
         assert_eq!(
             after_second_call, first_call_requests,
             "second call must be a no-op (cached), matching the TS's once-per-process guard"
+        );
+    }
+
+    #[test]
+    fn sankey_and_sunburst_need_a_breakdown_and_a_boxplot_one_measure() {
+        let cols: std::collections::HashSet<String> = ["region", "channel", "amount", "qty"]
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let m1 = vec!["amount".to_owned()];
+        let m2 = vec!["amount".to_owned(), "qty".to_owned()];
+        for kind in [ChartKind::Sankey, ChartKind::Sunburst] {
+            assert!(validate_chart_shape(kind, "region", &m1, "", &cols).is_err());
+            assert!(validate_chart_shape(kind, "region", &m1, "channel", &cols).is_ok());
+        }
+        assert!(validate_chart_shape(ChartKind::Boxplot, "region", &m1, "", &cols).is_ok());
+        assert!(validate_chart_shape(ChartKind::Boxplot, "region", &m2, "", &cols).is_err());
+        assert!(
+            validate_chart_shape(ChartKind::Calendar, "region", &m1, "channel", &cols).is_err(),
+            "a calendar takes no breakdown"
         );
     }
 

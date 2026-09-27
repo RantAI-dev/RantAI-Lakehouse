@@ -293,6 +293,31 @@ pub fn build_kpi_sql(
     )
 }
 
+/// Boxplot SQL: per `dimension`, the five-number summary of `measure`
+/// (`min`, quartiles, `max` via `quantilesExact`, returned as one array
+/// column named after the measure), ordered by dimension. No aggregate
+/// applies — the distribution is the point.
+#[must_use]
+pub fn build_boxplot_sql(
+    from: &Relation,
+    dimension: &Ident,
+    measure: &Ident,
+    where_clauses: &[String],
+    limit: u32,
+) -> String {
+    let where_sql = if where_clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {} ", where_clauses.join(" AND "))
+    };
+    format!(
+        "SELECT {dimension}, quantilesExact(0, 0.25, 0.5, 0.75, 1)(toFloat64({measure})) AS {measure} \
+         FROM {} {where_sql}GROUP BY {dimension} ORDER BY {dimension} LIMIT {limit}{}",
+        from.render(),
+        from.settings()
+    )
+}
+
 /// SQL for a stored spec with runtime filters applied (year filter + the
 /// dashboard's dimension filters). `mart_cols` maps mart name to its column
 /// set, so we know which filters actually apply. Ports `sqlWithFilters` in
@@ -442,6 +467,16 @@ fn rebuild(spec: &StoredChartSpec, from: &Relation, where_clauses: Vec<String>) 
     }
 
     let dimension = Ident::new(def.dimension.clone()).ok()?;
+    if spec.spec.kind == crate::specs::ChartKind::Boxplot {
+        let measure = Ident::new(def.measures.first()?.clone()).ok()?;
+        return Some(build_boxplot_sql(
+            from,
+            &dimension,
+            &measure,
+            &where_clauses,
+            def.limit.unwrap_or(20),
+        ));
+    }
     let mut measures = Vec::with_capacity(def.measures.len());
     for m in &def.measures {
         measures.push(Ident::new(m.clone()).ok()?);
@@ -944,5 +979,32 @@ mod tests {
             sql_for_sql_source(&spec, SOURCE_SQL, &source_cols(), &[], &[]),
             None
         );
+    }
+
+    #[test]
+    fn a_boxplot_is_five_quantiles_per_category_with_no_aggregate() {
+        let sql = build_boxplot_sql(
+            &Relation::Mart(Ident::new("mart_x").unwrap()),
+            &Ident::new("region").unwrap(),
+            &Ident::new("amount").unwrap(),
+            &["tahun IN (2024)".to_owned()],
+            10,
+        );
+        assert_eq!(
+            sql,
+            "SELECT region, quantilesExact(0, 0.25, 0.5, 0.75, 1)(toFloat64(amount)) AS amount \
+             FROM serving.mart_x WHERE tahun IN (2024) GROUP BY region ORDER BY region LIMIT 10"
+        );
+    }
+
+    #[test]
+    fn a_boxplot_on_a_sql_source_is_rebuilt_as_quantiles_with_the_caps() {
+        let spec = source_spec(ChartKind::Boxplot, "material_group", &["materials"]);
+        let sql = sql_for_sql_source(&spec, SOURCE_SQL, &source_cols(), &[], &[]).unwrap();
+        assert!(
+            sql.contains("quantilesExact(0, 0.25, 0.5, 0.75, 1)(toFloat64(materials))"),
+            "{sql}"
+        );
+        assert!(sql.ends_with(SQL_SOURCE_SETTINGS), "{sql}");
     }
 }

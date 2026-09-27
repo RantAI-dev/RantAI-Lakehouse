@@ -3,7 +3,7 @@
 import * as React from "react";
 import { useTheme } from "next-themes";
 import {
-  ChartBar, ChartColumn, ChartLine, ChartPie, ChevronRight, Gauge,
+  CalendarDays, ChartBar, ChartCandlestick, ChartColumn, ChartLine, ChartPie, ChevronRight, Gauge, Workflow,
   Map, Plus, ScatterChart, Table2, Type, type LucideIcon,
 } from "lucide-react";
 import {
@@ -57,18 +57,24 @@ export const KIND_GROUPS: { group: string; items: { value: ChartKind; label: str
     { value: "line", label: "Line" },
     { value: "area", label: "Area" },
     { value: "waterfall", label: "Waterfall (cumulative)" },
+    { value: "calendar", label: "Calendar heatmap (daily)" },
   ] },
   { group: "Composition", items: [
     { value: "pie", label: "Donut / pie" },
     { value: "rose", label: "Rose (nightingale)" },
     { value: "funnel", label: "Funnel" },
     { value: "treemap", label: "Treemap" },
+    { value: "sunburst", label: "Sunburst (2 levels)" },
   ] },
   { group: "Relationship / distribution", items: [
     { value: "scatter", label: "Scatter (X vs Y)" },
     { value: "bubble", label: "Bubble (X, Y, size)" },
     { value: "heatmap", label: "Heatmap (2 dimensions)" },
     { value: "radar", label: "Radar" },
+    { value: "boxplot", label: "Box plot (distribution)" },
+  ] },
+  { group: "Flow", items: [
+    { value: "sankey", label: "Sankey (flow between 2 dimensions)" },
   ] },
   { group: "Geographic", items: [
     { value: "geomap", label: "Map — Jakarta regions (choropleth)" },
@@ -107,6 +113,10 @@ const KIND_DESCRIPTIONS: Record<ChartKind, string> = {
   radar: "Compare profiles across metrics", geomap: "Compare values across Jakarta regions",
   kpi: "Highlight one important number", gauge: "Track a value against a target",
   table: "Inspect detailed rows and values", text: "Add context, notes, or instructions",
+  sankey: "Show how a total flows from one dimension to another",
+  sunburst: "Break each category into its parts, as rings",
+  boxplot: "Compare the spread of a measure across categories",
+  calendar: "Spot daily patterns on a calendar",
 };
 function kindIcon(kind: ChartKind): LucideIcon {
   if (["bar", "hbar", "stacked", "combo"].includes(kind)) return kind === "bar" ? ChartColumn : ChartBar;
@@ -114,6 +124,10 @@ function kindIcon(kind: ChartKind): LucideIcon {
   if (["pie", "rose", "funnel", "treemap"].includes(kind)) return ChartPie;
   if (["scatter", "bubble", "heatmap", "radar"].includes(kind)) return ScatterChart;
   if (kind === "geomap") return Map;
+  if (kind === "sankey") return Workflow;
+  if (kind === "sunburst") return ChartPie;
+  if (kind === "boxplot") return ChartCandlestick;
+  if (kind === "calendar") return CalendarDays;
   if (kind === "kpi" || kind === "gauge") return Gauge;
   return kind === "table" ? Table2 : Type;
 }
@@ -183,9 +197,22 @@ export function ChartBuilder({
   const isGauge = kind === "gauge";
   const isSingle = isKpi || isGauge;         // no dimension (single number)
   const isHeatmap = kind === "heatmap";
+  // Kinds drawn from the breakdown shape (x, series, value): a 2nd
+  // dimension is required (lakehouse_bi::store::breakdown_required).
+  const needsBreakdown = isHeatmap || kind === "sankey" || kind === "sunburst";
+  const isBoxplot = kind === "boxplot";
+  const isCalendar = kind === "calendar";
+  // A calendar is one cell per day, so up to a year of rows.
+  const maxLimit = isCalendar ? 366 : 100;
+  // Switching to a calendar starts from a full year; leaving it brings the
+  // Top-N back inside 1–100.
+  React.useEffect(() => {
+    if (isCalendar) setLimit((l) => (l === 20 ? 366 : l));
+    else setLimit((l) => Math.min(l, 100));
+  }, [isCalendar]);
   const needsM2 = kind === "stacked" || kind === "scatter" || kind === "combo" || kind === "bubble";
   const needsM3 = kind === "bubble";
-  const canBreakdown = kind === "bar" || kind === "hbar" || kind === "line" || kind === "area" || isHeatmap;
+  const canBreakdown = kind === "bar" || kind === "hbar" || kind === "line" || kind === "area" || needsBreakdown;
   const mLabels = MEASURE_LABELS[kind] ?? ["Measure (Y)"];
   const isEdit = !!editId;
   const boardOptions = boards.length ? boards : [{ id: "default", name: "Main" }];
@@ -273,11 +300,11 @@ export function ChartBuilder({
       if (!choice || !dimension || measures.length === 0) throw new Error("Fill in data source, dimension, and measure.");
       if (needsM3 && measures.length < 3) throw new Error(`${mLabels.join(", ")} — need all 3.`);
       if (needsM2 && measures.length < 2) throw new Error(`${mLabels.join(" & ")} — need both.`);
-      if (isHeatmap && !breakdown) throw new Error("Heatmap needs a breakdown (2nd dimension).");
+      if (needsBreakdown && !breakdown) throw new Error(`${KIND_LABELS[kind] ?? kind} needs a 2nd dimension.`);
       payload = {
         title: payloadTitle, ...sourcePayload(choice), kind, dimension, measures, aggregate, span, board: targetBoard,
         breakdown: canBreakdown && breakdown ? breakdown : undefined,
-        order, limit,
+        order: isCalendar ? "none" : order, limit: Math.min(limit, maxLimit),
       };
     }
     if (isEdit) payload.id = editId;
@@ -464,14 +491,24 @@ export function ChartBuilder({
                           <SelectContent>{fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}</SelectContent>
                         </Select>
                       </div>
-                      <div className="grid gap-1.5">
-                        <Label>Aggregation</Label>
-                        <Select value={aggregate} onValueChange={(v) => setAggregate(v ?? "")}>
-                          <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                          <SelectContent>{AGGS.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}</SelectContent>
-                        </Select>
-                      </div>
+                      {isBoxplot ? (
+                        <div className="grid gap-1.5">
+                          <Label>Aggregation</Label>
+                          <p className="flex h-8 items-center text-xs text-muted-foreground">Distribution: min, quartiles, max</p>
+                        </div>
+                      ) : (
+                        <div className="grid gap-1.5">
+                          <Label>Aggregation</Label>
+                          <Select value={aggregate} onValueChange={(v) => setAggregate(v ?? "")}>
+                            <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                            <SelectContent>{AGGS.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}</SelectContent>
+                          </Select>
+                        </div>
+                      )}
                     </div>
+                  ) : null}
+                  {isCalendar ? (
+                    <p className="text-xs text-muted-foreground">Pick a date column as the dimension; one cell per day, up to the last year of data.</p>
                   ) : null}
 
                   <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -523,6 +560,12 @@ export function ChartBuilder({
                     </div>
                   ) : (
                     <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                      {isBoxplot || isCalendar ? (
+                        <div className="grid gap-1.5">
+                          <Label>Sort</Label>
+                          <p className="flex h-8 items-center text-xs text-muted-foreground">{isCalendar ? "By date" : "By category"}</p>
+                        </div>
+                      ) : (
                       <div className="grid gap-1.5">
                         <Label>Sort</Label>
                         <Select value={order} items={ORDER_LABELS} onValueChange={(v) => setOrder((v as "desc" | "asc" | "none") ?? "desc")}>
@@ -534,20 +577,21 @@ export function ChartBuilder({
                           </SelectContent>
                         </Select>
                       </div>
+                      )}
                       <div className="grid gap-1.5">
-                        <Label>Limit (Top N)</Label>
-                        <Input type="number" min={1} max={100} value={limit} onChange={(e) => setLimit(Math.max(1, Math.min(100, Number(e.target.value) || 20)))} />
+                        <Label>{isCalendar ? "Days (max 366)" : "Limit (Top N)"}</Label>
+                        <Input type="number" min={1} max={maxLimit} value={limit} onChange={(e) => setLimit(Math.max(1, Math.min(maxLimit, Number(e.target.value) || 20)))} />
                       </div>
                     </div>
                   )}
 
                   {canBreakdown ? (
                     <div className="grid gap-1.5">
-                      <Label>{isHeatmap ? "2nd dimension (Y) — required" : "Breakdown / series (optional)"}</Label>
+                      <Label>{kind === "sankey" ? "Flows to (2nd dimension) — required" : kind === "sunburst" ? "Outer ring (2nd dimension) — required" : isHeatmap ? "2nd dimension (Y) — required" : "Breakdown / series (optional)"}</Label>
                       <Select value={breakdown || NO_BREAKDOWN} items={breakdownLabels} onValueChange={(v) => setBreakdown(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields}>
-                        <SelectTrigger className="w-full"><SelectValue placeholder={isHeatmap ? "pick a 2nd column" : "no breakdown"} /></SelectTrigger>
+                        <SelectTrigger className="w-full"><SelectValue placeholder={needsBreakdown ? "pick a 2nd column" : "no breakdown"} /></SelectTrigger>
                         <SelectContent>
-                          {isHeatmap ? null : <SelectItem value={NO_BREAKDOWN}>— no breakdown —</SelectItem>}
+                          {needsBreakdown ? null : <SelectItem value={NO_BREAKDOWN}>— no breakdown —</SelectItem>}
                           {fields?.dimensions.filter((d) => d !== dimension).map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
                         </SelectContent>
                       </Select>
