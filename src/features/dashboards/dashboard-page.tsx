@@ -333,6 +333,7 @@ export function DashboardPage() {
     ];
     return {
       id: spec.id,
+      span: spec.span,
       title: spec.title,
       subtitle: spec.subtitle,
       hint: drillable ? (
