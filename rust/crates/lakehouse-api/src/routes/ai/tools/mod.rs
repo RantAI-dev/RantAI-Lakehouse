@@ -27,6 +27,8 @@ mod dashboards;
 pub(in crate::routes) mod data;
 mod gold;
 mod governance;
+mod ingest;
+mod lakehouse;
 mod ops;
 mod pipelines;
 mod queries;
@@ -79,7 +81,7 @@ pub(super) async fn api_result_to_value<T: IntoResponse>(result: ApiResult<T>) -
 }
 
 /// Dispatch one tool call by name, matching `runTool` in `ai-tools.ts`.
-/// Unknown tool names return `{"error": "tool tak dikenal: <name>"}` rather
+/// Unknown tool names return `{"error": "unknown tool: <name>"}` rather
 /// than failing the request — the LLM sees the error and can recover.
 ///
 /// The unknown-name check goes through [`registry::find`] first — the
@@ -95,16 +97,17 @@ pub(in crate::routes) async fn run_tool(
     args: &Map<String, Value>,
 ) -> Value {
     if registry::find(name).is_none() {
-        return json!({ "error": format!("tool tak dikenal: {name}") });
+        return json!({ "error": format!("unknown tool: {name}") });
     }
     let ch = &state.clickhouse;
     match name {
         "run_sql" => data::run_sql(state, principal, args).await,
         "list_datasets" => data::list_datasets(ch, args).await,
+        "lakehouse_overview" => data::lakehouse_overview(state, principal).await,
         "describe_dataset" => data::describe_dataset(ch, args).await,
-        "get_lineage" => data::get_lineage(ch, args).await,
+        "get_lineage" => data::get_lineage(state, principal, args).await,
         "get_quality" => data::get_quality(ch).await,
-        "trigger_lakehouse_build" => pipelines::trigger_build(&state.dagster).await,
+        "trigger_lakehouse_build" => pipelines::trigger_build(state, principal).await,
         "get_build_status" => pipelines::get_build_status(&state.dagster).await,
         "describe_mart" => data::describe_mart(ch, args).await,
         "create_chart" => dashboards::create_chart(ch, args, None).await,
@@ -147,6 +150,22 @@ pub(in crate::routes) async fn run_tool(
         "draft_policy" => governance::draft_policy(state, args).await,
         "draft_classification_rule" => governance::draft_classification_rule(state, args).await,
         "draft_quality_rule" => governance::draft_quality_rule(state, args).await,
+        "get_ingest_spec" => ingest::get_ingest_spec(state, args).await,
+        "set_ingest_spec" => ingest::set_ingest_spec(state, args).await,
+        "discover_source" => ingest::discover_source(state, args).await,
+        "run_ingest" => ingest::run_ingest(state, args).await,
+        "list_ingest_runs" => ingest::list_ingest_runs(state, args).await,
+        "rotate_connector_credential" => {
+            ingest::rotate_connector_credential(state, principal, args).await
+        }
+        "create_pipeline" => pipelines::create_pipeline(state, principal, args).await,
+        "get_pipeline" => pipelines::get_pipeline(state, args).await,
+        "mark_pipeline_ready" => pipelines::mark_pipeline_ready(state, args).await,
+        "list_iceberg_tables" => lakehouse::list_iceberg_tables(state, args).await,
+        "describe_iceberg_table" => lakehouse::describe_iceberg_table(state, args).await,
+        "get_table_maintenance" => lakehouse::get_table_maintenance(state, args).await,
+        "set_table_maintenance" => lakehouse::set_table_maintenance(state, args).await,
+        "get_capacity" => lakehouse::get_capacity(state).await,
         other => {
             unreachable!(
                 "registry::find recognised {other:?} but run_tool has no dispatch arm for it"
@@ -184,7 +203,7 @@ mod tests {
 
     /// D3.5: every registered tool reaches a real dispatch arm (never the
     /// `unreachable!` in [`run_tool`]'s `other` arm, and never the
-    /// "tool tak dikenal" branch), and an unregistered name gets exactly
+    /// "unknown tool" branch), and an unregistered name gets exactly
     /// that refusal shape. See `tests/fixtures/tool_schemas.json` and the
     /// characterization test in `super::super::tests` for the pre-refactor
     /// baseline this must keep matching.
@@ -195,17 +214,14 @@ mod tests {
             let result = run_tool(&state, None, spec.name, &Map::new()).await;
             if let Some(err) = result.get("error").and_then(Value::as_str) {
                 assert!(
-                    !err.starts_with("tool tak dikenal"),
+                    !err.starts_with("unknown tool"),
                     "{} unexpectedly hit the unknown-tool dispatch arm: {err}",
                     spec.name
                 );
             }
         }
         let unknown = run_tool(&state, None, "not_a_real_tool", &Map::new()).await;
-        assert_eq!(
-            unknown,
-            json!({ "error": "tool tak dikenal: not_a_real_tool" })
-        );
+        assert_eq!(unknown, json!({ "error": "unknown tool: not_a_real_tool" }));
     }
 
     #[test]

@@ -826,13 +826,21 @@ pub async fn list_maintenance_policies(State(state): State<AppState>) -> ApiResu
 /// `buckets[].measuredAt`; `measured_at_ms` is a `toUnixTimestamp64Milli`
 /// epoch, used only internally by [`capacity_body`]'s growth-window
 /// comparison, never rendered.
+///
+/// Every read of the column goes through the table alias `s`: the output
+/// alias `toString(measured_at) measured_at` shadows the bare column name,
+/// so `toUnixTimestamp64Milli(measured_at)` received the STRING and
+/// `ClickHouse` 26.8 refused the whole query (`ILLEGAL_TYPE_OF_ARGUMENT`).
+/// Measured on the local stack: `GET /api/lakehouse/capacity` answered
+/// "capacity metrics are unavailable" for every request, so the Capacity
+/// page never showed a number.
 const CAPACITY_SNAPSHOT_QUERY: &str = "SELECT bucket_name, toString(bytes) bytes, \
     toString(objects) objects, \
-    toString(toUnixTimestamp64Milli(measured_at)) measured_at_ms, \
-    toString(measured_at) measured_at \
-    FROM lake.`bronze_meta.capacity_snapshot` \
-    WHERE measured_at >= now() - INTERVAL 8 DAY \
-    ORDER BY measured_at DESC";
+    toString(toUnixTimestamp64Milli(s.measured_at)) measured_at_ms, \
+    toString(s.measured_at) measured_at \
+    FROM lake.`bronze_meta.capacity_snapshot` AS s \
+    WHERE s.measured_at >= now() - INTERVAL 8 DAY \
+    ORDER BY s.measured_at DESC";
 
 /// Live disk usage, read fresh on every request rather than from the daily
 /// snapshot table — `system.parts` reflects merges/compaction that happen

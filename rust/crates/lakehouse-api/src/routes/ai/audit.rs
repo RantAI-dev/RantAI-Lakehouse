@@ -127,6 +127,21 @@ pub fn resource_for(
         "kill_query" => (Some("workload"), str_field("id")),
         "export_gold_mart" | "get_gold_export" => (Some("gold_mart"), str_field("mart")),
         "draft_policy" => (Some("policy"), str_field("id")),
+        "set_ingest_spec" | "run_ingest" | "discover_source" | "rotate_connector_credential" => (
+            Some("connector"),
+            args.get("id").and_then(Value::as_str).map(str::to_owned),
+        ),
+        "create_pipeline" | "mark_pipeline_ready" => (Some("pipeline"), str_field("id")),
+        "set_table_maintenance" => (
+            Some("iceberg_table"),
+            match (
+                args.get("namespace").and_then(Value::as_str),
+                args.get("table").and_then(Value::as_str),
+            ) {
+                (Some(ns), Some(t)) => Some(format!("{ns}.{t}")),
+                _ => None,
+            },
+        ),
         _ => (None, None),
     }
 }

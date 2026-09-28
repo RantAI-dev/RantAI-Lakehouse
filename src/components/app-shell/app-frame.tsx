@@ -5,7 +5,8 @@ import { usePathname } from "next/navigation";
 import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/app-shell/app-sidebar";
 import { AppNavbar } from "@/components/app-shell/app-navbar";
-import { CopilotDock } from "@/features/copilot/copilot-dock";
+import { CopilotDock, dockHiddenOn } from "@/features/copilot/copilot-dock";
+import { cn } from "@/lib/utils";
 import { CopilotSidebar } from "@/features/copilot/copilot-sidebar";
 import { CopilotProvider } from "@/features/copilot/use-copilot";
 import { CommandPalette } from "@/components/command-palette";
@@ -41,7 +42,7 @@ export function AppFrame({ children }: Readonly<{ children: React.ReactNode }>) 
 
 function AuthenticatedFrame({ children }: Readonly<{ children: React.ReactNode }>) {
   const { status } = useAuth();
-  const pathname = usePathname() ?? "/";
+  const pathname = usePathname();
 
   if (status !== "authenticated") {
     // `status === "unauthenticated"` still renders this (rather than
@@ -49,7 +50,7 @@ function AuthenticatedFrame({ children }: Readonly<{ children: React.ReactNode }
     // a frame-shaped skeleton is a better transient state than a blank
     // page, and it never lingers since the redirect is synchronous with
     // the status flip.
-    return <AppShellSkeleton pathname={pathname} />;
+    return <AppShellSkeleton pathname={pathname ?? "/"} />;
   }
 
   return (
@@ -60,8 +61,15 @@ function AuthenticatedFrame({ children }: Readonly<{ children: React.ReactNode }
         <div className="flex flex-1 min-h-0 min-w-0">
           {/* The Copilot dock is `fixed bottom-4`, so without this the
               last thing on every page sits underneath it. Pages used to
-              add their own bottom spacing (or forget to). */}
-          <main className="flex-1 min-w-0 p-4 pb-24 sm:p-5 sm:pb-24 lg:p-6 lg:pb-28">
+              add their own bottom spacing (or forget to). Where the dock
+              is hidden the space is dropped: /copilot sizes itself to the
+              viewport, and the extra padding made the window scroll. */}
+          <main
+            className={cn(
+              "flex-1 min-w-0 p-4 sm:p-5 lg:p-6",
+              !dockHiddenOn(pathname) && "pb-24 sm:pb-24 lg:pb-28",
+            )}
+          >
             {children}
           </main>
           <CopilotSidebar />

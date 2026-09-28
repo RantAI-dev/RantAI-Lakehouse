@@ -89,7 +89,7 @@ pub(super) async fn test_connector(
 ) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
-        return json!({ "error": "id wajib diisi" });
+        return json!({ "error": "id is required" });
     }
     let extension = principal.cloned().map(Extension);
     api_result_to_value(
@@ -105,7 +105,7 @@ pub(super) async fn delete_connector(
 ) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
-        return json!({ "error": "id wajib diisi" });
+        return json!({ "error": "id is required" });
     }
     let extension = principal.cloned().map(Extension);
     // `DeleteQuery::default()` is `force: false`: if CDC deprovisioning
@@ -251,11 +251,11 @@ mod tests {
         let principal = fixture_user_principal();
         assert_eq!(
             test_connector(&state, Some(&principal), &Map::new()).await,
-            json!({ "error": "id wajib diisi" })
+            json!({ "error": "id is required" })
         );
         assert_eq!(
             delete_connector(&state, Some(&principal), &Map::new()).await,
-            json!({ "error": "id wajib diisi" })
+            json!({ "error": "id is required" })
         );
     }
 }

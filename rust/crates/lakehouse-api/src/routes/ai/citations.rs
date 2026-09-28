@@ -24,6 +24,7 @@ use std::fmt::Write as _;
 
 use serde_json::Value;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NumberState {
     Verified,
@@ -60,6 +61,22 @@ impl Unit {
             Self::Seconds => raw / 1000.0,
         }
     }
+
+    /// The decimal (SI) reading of a byte unit — `MB` as 10^6 bytes — which
+    /// many answers use; `None` for every other unit. Both readings are
+    /// accepted: a model printing `19.6 MB` for 19,552,544 bytes is right
+    /// under SI and would otherwise be flagged.
+    fn transform_si(self, raw: f64) -> Option<f64> {
+        let power = match self {
+            Self::Kilobytes => 1,
+            Self::Megabytes => 2,
+            Self::Gigabytes => 3,
+            Self::Terabytes => 4,
+            Self::Petabytes => 5,
+            _ => return None,
+        };
+        Some(raw / 1000f64.powi(power))
+    }
 }
 
 /// Absolute tolerance: half of one decimal place — the coarsest real
@@ -69,43 +86,239 @@ const ABS_TOLERANCE: f64 = 0.05;
 /// `Math.round`'s own rounding on a large count/duration.
 const REL_TOLERANCE: f64 = 0.0005;
 
-/// Whether `printed`, interpreted under `unit` (WS7 item F1 rule 2 — the SAME
-/// transform the model's own suffix implies, never a broader search
-/// across every transform), is verified by any successful (`ok: true`)
-/// entry in `trace`.
+/// Everything a printed number may be matched against for one answer.
+///
+/// # What counts as evidence, and why each source is here
+///
+/// - **Every numeric leaf of every successful tool result** (rule 5: a
+///   failed call is never ground truth), including numbers carried as
+///   JSON strings. `ClickHouse` returns every value of a query result as a
+///   string (`"1571564"`), so before strings were read, a number copied
+///   exactly from `run_sql` was flagged unverified: measured on the local
+///   stack (`ops/ai_eval/ai_eval.py`), 14 of 23 answers carried false
+///   flags, most on figures that matched the query result exactly.
+/// - **Counts and totals a result's rows imply**: the length of every
+///   array, how many rows share each text value ("4 primary + 2
+///   secondary" is a count over a `list_datasets` result), and the sum of
+///   every numeric column (a "total" row). These are the derived numbers
+///   an answer legitimately states without another tool call; anything
+///   else the model computed itself (a share, a difference) still has to
+///   come from the query, and is flagged when it does not.
+/// - **Numbers already in the conversation**: the user's own messages and
+///   earlier answers, minus anything an earlier check flagged. A follow-up
+///   ("and 2022?") restates last turn's figure next to this turn's; that
+///   figure was checked when it was first shown. This is an echo check,
+///   not a fact check: a user's own wrong number repeated back is not
+///   flagged.
+pub struct Evidence {
+    values: Vec<f64>,
+    /// Arithmetic between two numbers of the same small tool result (see
+    /// [`pairwise`]), checked only after `values` fails.
+    derived: Vec<f64>,
+}
+
+impl Evidence {
+    /// Evidence from this turn's `trace` plus earlier `conversation` texts.
+    #[must_use]
+    pub fn new(trace: &[Value], conversation: &[&str]) -> Self {
+        let mut values = Vec::new();
+        let mut derived = Vec::new();
+        for entry in trace {
+            if entry.get("ok").and_then(Value::as_bool) != Some(true) {
+                continue; // rule 5: a failed call is never ground truth
+            }
+            let Some(result) = entry.get("result") else {
+                continue;
+            };
+            let leaves = numeric_leaves(result);
+            pairwise(&leaves, &mut derived);
+            values.extend(leaves);
+            derived_values(result, &mut values);
+        }
+        for text in conversation {
+            let checked = strip_unverified(text);
+            values.extend(printed_values(&checked));
+        }
+        Self { values, derived }
+    }
+
+    /// Whether `printed` under `unit` matches some evidence value. `slack`
+    /// is the rounding the printed form itself implies (`2.64 million`
+    /// stands for anything within ±5,000); the fixed tolerances below
+    /// still apply when it is smaller.
+    fn matches(&self, printed: f64, unit: Unit, slack: f64) -> bool {
+        let near = |target: f64| {
+            (printed - target).abs()
+                <= slack
+                    .max(ABS_TOLERANCE)
+                    .max(REL_TOLERANCE * printed.abs().max(target.abs()))
+        };
+        let hit = |&leaf: &f64| {
+            // A percentage may come back as a fraction (0.12) or already
+            // as a percentage (12.0, e.g. `round(100 * a / b, 1)` in SQL).
+            near(unit.transform(leaf))
+                || (unit == Unit::Percent && near(leaf))
+                || unit.transform_si(leaf).is_some_and(near)
+        };
+        self.values.iter().any(hit) || self.derived.iter().any(hit)
+    }
+}
+
+/// Whether `printed`, interpreted under `unit` (WS7 item F1 rule 2), is
+/// verified by the [`Evidence`] `trace` alone provides.
+#[cfg(test)]
 #[must_use]
 pub fn verify_number(printed: f64, unit: Unit, trace: &[Value]) -> NumberState {
-    for entry in trace {
-        if entry.get("ok").and_then(Value::as_bool) != Some(true) {
-            continue; // rule 5: a failed call is never ground truth
-        }
-        let Some(result) = entry.get("result") else {
-            continue;
-        };
-        for leaf in numeric_leaves(result) {
-            if close(printed, unit.transform(leaf)) {
-                return NumberState::Verified;
-            }
-        }
+    if Evidence::new(trace, &[]).matches(printed, unit, 0.0) {
+        NumberState::Verified
+    } else {
+        NumberState::Unverified
     }
-    NumberState::Unverified
 }
 
-fn close(a: f64, b: f64) -> bool {
-    (a - b).abs() <= ABS_TOLERANCE.max(REL_TOLERANCE * a.abs().max(b.abs()))
+/// A string that is exactly a plain decimal number (`"1571564"`,
+/// `"-3.5"`), as `ClickHouse` serialises numeric columns. Anything else (a
+/// date, an id with letters, a grouped `"1,234"`) is not read as a
+/// number.
+fn parse_plain_number(s: &str) -> Option<f64> {
+    let t = s.trim();
+    let body = t.strip_prefix('-').unwrap_or(t);
+    let mut parts = body.splitn(2, '.');
+    let int = parts.next()?;
+    let frac = parts.next();
+    let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    if !digits(int) || frac.is_some_and(|f| !digits(f)) {
+        return None;
+    }
+    t.parse().ok()
 }
 
-/// Every `f64`-representable numeric leaf in `value`, recursively through
-/// objects and arrays. Booleans and non-numeric strings are never coerced
-/// (a `"status":"ok"` string is not a number a printed digit could ever
-/// legitimately match).
+/// Every numeric leaf in `value`, recursively through objects and arrays:
+/// JSON numbers, and strings that are exactly a plain number
+/// ([`parse_plain_number`]). Booleans and other strings are never coerced.
 fn numeric_leaves(value: &Value) -> Vec<f64> {
     match value {
         Value::Number(n) => n.as_f64().into_iter().collect(),
+        Value::String(s) => parse_plain_number(s).into_iter().collect(),
         Value::Object(map) => map.values().flat_map(numeric_leaves).collect(),
         Value::Array(items) => items.iter().flat_map(numeric_leaves).collect(),
         _ => Vec::new(),
     }
+}
+
+/// The counts and totals `value`'s arrays imply (see [`Evidence`]): each
+/// array's length and, for an array of row objects, the number of rows
+/// per distinct text value of each key and the sum of each numeric key.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "row counts are far below 2^52, where f64 stops being exact"
+)]
+fn derived_values(value: &Value, out: &mut Vec<f64>) {
+    match value {
+        Value::Array(items) => {
+            out.push(items.len() as f64);
+            let mut counts: std::collections::HashMap<(&str, &str), usize> =
+                std::collections::HashMap::new();
+            let mut sums: std::collections::HashMap<&str, (f64, bool)> =
+                std::collections::HashMap::new();
+            for item in items {
+                let Value::Object(row) = item else { continue };
+                for (key, cell) in row {
+                    let number = match cell {
+                        Value::Number(n) => n.as_f64(),
+                        Value::String(s) => parse_plain_number(s),
+                        _ => None,
+                    };
+                    let entry = sums.entry(key.as_str()).or_insert((0.0, true));
+                    match number {
+                        Some(n) => entry.0 += n,
+                        None => entry.1 = false,
+                    }
+                    if number.is_none()
+                        && let Value::String(text) = cell
+                    {
+                        *counts.entry((key.as_str(), text.as_str())).or_default() += 1;
+                    }
+                }
+            }
+            out.extend(counts.values().map(|&n| n as f64));
+            out.extend(sums.values().filter(|(_, all)| *all).map(|(sum, _)| *sum));
+            for item in items {
+                derived_values(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values() {
+                derived_values(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Every number `text` prints, read the way an answer's numbers are
+/// ([`read_number`]: bold, Indonesian grouping, scale words), both readings
+/// of an ambiguous token included. Used for the conversation's evidence, so
+/// a figure an earlier answer printed as `**2,358,638**` still counts.
+fn printed_values(text: &str) -> Vec<f64> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let mut out = Vec::new();
+    for (k, word) in words.iter().enumerate() {
+        if let Some(p) = read_number(word, words.get(k + 1).copied()) {
+            out.push(p.value);
+            out.extend(p.alt);
+        }
+    }
+    out
+}
+
+/// Most numeric leaves one tool result may have for [`pairwise`] to run.
+/// With n leaves there are about 4n² derived values, and every one is a
+/// chance for an unrelated printed number to match by coincidence; forty
+/// leaves covers a comparison of a few rows while keeping that small.
+const PAIRWISE_MAX_LEAVES: usize = 40;
+
+/// The arithmetic an answer legitimately does on two numbers of one small
+/// result: the difference, the ratio, the share (`a / b * 100`) and the
+/// change (`(a - b) / b * 100`). "From 62 to 396, an increase of 334
+/// (+538.7%)" is correct and is exactly what a reader wants; before this
+/// the checker flagged both figures. A difference or change the model got
+/// wrong still matches nothing and is still flagged. Only pairs inside ONE
+/// tool result are combined, and only when it has at most
+/// [`PAIRWISE_MAX_LEAVES`] numbers.
+fn pairwise(leaves: &[f64], out: &mut Vec<f64>) {
+    if leaves.len() < 2 || leaves.len() > PAIRWISE_MAX_LEAVES {
+        return;
+    }
+    for (i, &a) in leaves.iter().enumerate() {
+        for &b in &leaves[i + 1..] {
+            out.push((a - b).abs());
+            for (x, y) in [(a, b), (b, a)] {
+                if y != 0.0 {
+                    out.push(x / y);
+                    out.push(100.0 * x / y);
+                    out.push(100.0 * (x - y) / y);
+                }
+            }
+        }
+    }
+}
+
+/// `text` with every span an earlier check flagged removed, so a flagged
+/// number is never promoted to evidence by being repeated.
+fn strip_unverified(text: &str) -> String {
+    const OPEN: &str = r#"<span data-unverified="true">"#;
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + OPEN.len()..];
+        rest = after
+            .find("</span>")
+            .map_or("", |end| &after[end + "</span>".len()..]);
+    }
+    out.push_str(rest);
+    out
 }
 
 // ── WS7 item F2: extraction and annotation ──────────────────────────────────
@@ -147,6 +360,7 @@ fn parse_bare_unit(word: &str) -> Option<Unit> {
 /// INTERNAL character, so a `,` thousands separator inside `1,234`
 /// survives untouched while trailing prose punctuation (`.`, `,`, …) is
 /// removed (WS7 item F2 Step 2, point 3).
+#[cfg(test)]
 fn trim_sentence_punct(word: &str) -> &str {
     word.trim_matches(|c: char| ".,;:!?()".contains(c))
 }
@@ -222,14 +436,8 @@ fn parse_number_token(word: &str) -> Option<(f64, Unit)> {
 /// "treat the rest of the text as code" instead of matching unboundedly
 /// past the end of the text.
 ///
-/// Only called by [`extract_numbers`] below — see that function's own
-/// `#[allow(dead_code)]` note for why the plain (non-test) build does not
-/// reach it either.
-#[allow(
-    dead_code,
-    reason = "reachable only through extract_numbers, see that function's \
-              own allow note"
-)]
+/// Only called by [`extract_numbers`] below.
+#[cfg(test)]
 fn strip_code_spans(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
@@ -257,11 +465,7 @@ fn strip_code_spans(text: &str) -> String {
 }
 
 /// The offset of the next occurrence of `` ``` `` in `chars`, if any.
-#[allow(
-    dead_code,
-    reason = "reachable only through strip_code_spans, see extract_numbers's \
-              own allow note"
-)]
+#[cfg(test)]
 fn find_triple_backtick(chars: &[char]) -> Option<usize> {
     if chars.len() < 3 {
         return None;
@@ -331,13 +535,8 @@ fn find_triple_backtick(chars: &[char]) -> Option<usize> {
 /// acceptance tests, `extraction_and_annotation` below, call it
 /// directly) — real production-reachable code, just not from
 /// `chat()`'s own call path today.
+#[cfg(test)]
 #[must_use]
-#[allow(
-    dead_code,
-    reason = "the tested reference implementation of the WS7 item F1/F2 \
-              extraction grammar; annotate_line reimplements it with byte \
-              positions rather than calling this, see the doc comment above"
-)]
 pub fn extract_numbers(text: &str) -> Vec<(f64, Unit)> {
     let stripped = strip_code_spans(text);
     let words: Vec<&str> = stripped.split_whitespace().collect();
@@ -361,42 +560,195 @@ pub fn extract_numbers(text: &str) -> Vec<(f64, Unit)> {
     out
 }
 
-/// Every `String` leaf in `value`, recursively through objects and
-/// arrays — the text-cell counterpart of [`numeric_leaves`], used to
-/// verify a table cell that carries no number at all (WS7 item F1 rule 4's
-/// extension to text cells).
-fn string_leaves(value: &Value) -> Vec<String> {
-    match value {
-        Value::String(s) => vec![s.clone()],
-        Value::Object(map) => map.values().flat_map(string_leaves).collect(),
-        Value::Array(items) => items.iter().flat_map(string_leaves).collect(),
-        _ => Vec::new(),
+/// Characters stripped from both ends of a word before it is read as a
+/// number: sentence punctuation, Markdown emphasis (`**1,234**` is still a
+/// number the model is citing; before emphasis was stripped, a bold figure
+/// was never checked at all, which is how a wrong bold total passed
+/// unflagged), brackets, quotes, and the approximate/positive markers
+/// `~`, `≈`, `+`.
+const EDGE_MARKS: &[char] = &[
+    '.', ',', ';', ':', '!', '?', '(', ')', '[', ']', '*', '_', '~', '"', '\'', '“', '”', '’', '≈',
+    '+',
+];
+
+fn trim_marks(word: &str) -> &str {
+    word.trim_matches(|c: char| EDGE_MARKS.contains(&c))
+}
+
+/// Scale words a number may be followed by, and their factor.
+fn scale_word(word: &str) -> Option<f64> {
+    match trim_marks(word).to_lowercase().as_str() {
+        "thousand" | "thousands" | "ribu" | "rb" => Some(1e3),
+        "million" | "millions" | "juta" | "jt" => Some(1e6),
+        "billion" | "billions" | "miliar" | "milyar" => Some(1e9),
+        "trillion" | "trillions" | "triliun" => Some(1e12),
+        _ => None,
     }
 }
 
-/// Whether `needle` appears verbatim as a string leaf inside any `ok:
-/// true` entry's `result` in `trace` (rule 5 applies here too — a failed
-/// call's payload is never ground truth).
-fn string_leaves_contain(trace: &[Value], needle: &str) -> bool {
-    trace.iter().any(|entry| {
-        entry.get("ok").and_then(Value::as_bool) == Some(true)
-            && entry
-                .get("result")
-                .is_some_and(|r| string_leaves(r).iter().any(|s| s == needle))
+/// `1.234.567` / `1.234,5` / `12,09` (Indonesian grouping and decimal
+/// comma), optionally with a trailing `%`. English-style tokens are
+/// [`parse_number_token`]'s; this only reads what that grammar rejects,
+/// and never an ambiguous `1,234` (three digits after one comma), which
+/// stays English.
+fn parse_indonesian(token: &str) -> Option<(f64, Unit, u32)> {
+    let (body, unit) = token
+        .strip_suffix('%')
+        .map_or((token, Unit::None), |b| (b, Unit::Percent));
+    let (int, frac) = body
+        .split_once(',')
+        .map_or((body, None), |(a, b)| (a, Some(b)));
+    let groups: Vec<&str> = int.split('.').collect();
+    let first_ok = groups
+        .first()
+        .is_some_and(|g| !g.is_empty() && g.len() <= 3 && g.bytes().all(|b| b.is_ascii_digit()));
+    let grouped = groups.len() > 1
+        && first_ok
+        && groups[1..]
+            .iter()
+            .all(|g| g.len() == 3 && g.bytes().all(|b| b.is_ascii_digit()));
+    let plain_int = groups.len() == 1 && !int.is_empty() && int.bytes().all(|b| b.is_ascii_digit());
+    let frac_ok =
+        frac.is_none_or(|f| (1..=2).contains(&f.len()) && f.bytes().all(|b| b.is_ascii_digit()));
+    if !frac_ok || !(grouped || (plain_int && frac.is_some())) {
+        return None;
+    }
+    let text = format!(
+        "{}{}",
+        groups.concat(),
+        frac.map(|f| format!(".{f}")).unwrap_or_default()
+    );
+    let decimals = frac.map_or(0, |f| u32::try_from(f.len()).unwrap_or(0));
+    Some((text.parse().ok()?, unit, decimals))
+}
+
+/// A number the answer prints, with the rounding its printed form implies.
+struct Printed {
+    value: f64,
+    unit: Unit,
+    slack: f64,
+    /// The number consumed the following word (a unit or scale word).
+    consumed_next: bool,
+    /// A second reading of an ambiguous token: `18.420` is 18.42 in
+    /// English and 18,420 in Indonesian, and an answer in Indonesian
+    /// writes thousands that way. Either reading may match.
+    alt: Option<f64>,
+}
+
+impl Printed {
+    fn verified(&self, evidence: &Evidence) -> bool {
+        evidence.matches(self.value, self.unit, self.slack)
+            || self
+                .alt
+                .is_some_and(|alt| evidence.matches(alt, self.unit, 0.0))
+    }
+}
+
+/// `18.420`-shaped: one to three digits, one dot, exactly three digits.
+fn is_dot_thousands(token: &str) -> bool {
+    token.split_once('.').is_some_and(|(a, b)| {
+        (1..=3).contains(&a.len())
+            && b.len() == 3
+            && a.bytes().chain(b.bytes()).all(|c| c.is_ascii_digit())
     })
 }
 
-/// Whether the table cell `cell` (its trimmed text, exactly as it appears
-/// between `|`s) is verified: a numeric cell is checked via
-/// [`verify_number`] under [`parse_number_token`]'s own unit reading; a
-/// non-numeric cell is checked for a VERBATIM string match via
-/// [`string_leaves_contain`] (WS7 item F1 rule 4).
-fn cell_is_verified(cell: &str, trace: &[Value]) -> bool {
-    if let Some((value, unit)) = parse_number_token(cell) {
-        verify_number(value, unit, trace) == NumberState::Verified
+/// Reads `word` (and, for a unit or scale word, `next`) as a printed
+/// number: `**1,571,564**`, `~27.6%`, `2.64 million`, `2,6 juta`,
+/// `1.571.564`, `3 GB`. `None` for anything that is not a number token.
+fn read_number(word: &str, next: Option<&str>) -> Option<Printed> {
+    let token = trim_marks(word);
+    let (value, mut unit, decimals) = if let Some((v, u)) = parse_number_token(token) {
+        let decimals = token
+            .split_once('.')
+            .map_or(0, |(_, f)| f.bytes().take_while(u8::is_ascii_digit).count());
+        (v, u, u32::try_from(decimals).unwrap_or(0))
+    } else if let Some(read) = parse_indonesian(token) {
+        read
     } else {
-        string_leaves_contain(trace, cell)
+        let (body, factor) = match token.chars().last() {
+            Some('K') => (&token[..token.len() - 1], 1e3),
+            Some('M') => (&token[..token.len() - 1], 1e6),
+            Some('B') => (&token[..token.len() - 1], 1e9),
+            _ => return None,
+        };
+        let (v, u) = parse_number_token(body)?;
+        if u != Unit::None {
+            return None;
+        }
+        let decimals = body.split_once('.').map_or(0, |(_, f)| f.len());
+        let step = 10f64.powi(-i32::try_from(decimals).unwrap_or(0));
+        return Some(Printed {
+            value: v * factor,
+            unit: u,
+            slack: 0.5 * step * factor,
+            consumed_next: false,
+            alt: None,
+        });
+    };
+    let step = 10f64.powi(-i32::try_from(decimals).unwrap_or(0));
+    let mut consumed_next = false;
+    let mut factor = 1.0;
+    if unit == Unit::None
+        && let Some(next) = next
+    {
+        if let Some(u) = parse_bare_unit(trim_marks(next)) {
+            unit = u;
+            consumed_next = true;
+        } else if let Some(f) = scale_word(next) {
+            factor = f;
+            consumed_next = true;
+        }
     }
+    // Half of the last printed digit: `43 MB` stands for 42.5-43.5 MB, as
+    // `2.64 million` stands for 2,635,000-2,645,000. A whole number used to
+    // get only the fixed tolerance, so a correctly rounded `43 MB` for
+    // 42.9 MB was flagged.
+    let slack = 0.5 * step * factor;
+    let alt = (unit == Unit::None && is_dot_thousands(token)).then_some(value * 1000.0 * factor);
+    Some(Printed {
+        value: value * factor,
+        unit,
+        slack,
+        consumed_next,
+        alt,
+    })
+}
+
+/// Whether the table cell `cell` is verified: `None` for a cell with no
+/// number in it (a label, a name, a description), which is never flagged;
+/// otherwise whether every number in it matches the [`Evidence`].
+///
+/// Text cells used to need a verbatim match against a tool result's
+/// strings. A model that labels a column in plain words (`Year of visit`
+/// for `tahun`), adds a flag emoji to a country, or translates a category
+/// fails that every time, so correct tables were flagged cell by cell.
+/// What the check exists for is fabricated figures, so only figures are
+/// checked.
+fn cell_is_verified(cell: &str, evidence: &Evidence) -> Option<bool> {
+    let words: Vec<&str> = cell.split_whitespace().collect();
+    let mut seen = false;
+    let mut all = true;
+    let mut k = 0;
+    while k < words.len() {
+        if let Some(p) = read_number(words[k], words.get(k + 1).copied()) {
+            seen = true;
+            all &= p.verified(evidence);
+            k += if p.consumed_next { 2 } else { 1 };
+        } else {
+            k += 1;
+        }
+    }
+    seen.then_some(all)
+}
+
+/// Whether a table header names a rank/ordinal column (`#`, `Rank`, `No`),
+/// whose `1, 2, 3` are positions, not figures.
+fn is_rank_header(header: &str) -> bool {
+    matches!(
+        trim_marks(header).to_lowercase().as_str(),
+        "#" | "rank" | "no" | "nr" | "peringkat" | "urutan" | "nomor"
+    )
 }
 
 /// Splits a single `| a | b |` Markdown table row into its trimmed cell
@@ -454,14 +806,15 @@ fn try_parse_table_block(lines: &[&str], i: usize) -> Option<TableBlock> {
     })
 }
 
-/// Rewrites one table block (WS7 item F1 rule 4): every data-row cell is
-/// checked via [`cell_is_verified`]. Zero verified cells across the whole
-/// block -> the header/separator/data lines are replaced by a single
-/// line, the literal `"[table omitted: not backed by a tool result]"`.
-/// At least one verified cell -> the header and separator survive
-/// unmodified and each individually-unverified data cell is wrapped
-/// `<span data-unverified="true">…</span>` in place, inside its own `|
-/// … |` cell — the table's row/column structure is never altered.
+/// Rewrites one table block (WS7 item F1 rule 4): every data-row cell
+/// that holds a number is checked via [`cell_is_verified`]; label cells and
+/// a rank column ([`is_rank_header`]) are left alone. A table with numbers
+/// and not one of them verified -> the header/separator/data lines are
+/// replaced by a single line, the literal `"[table omitted: not backed by
+/// a tool result]"`. Otherwise the header and separator survive unmodified
+/// and each unverified numeric cell is wrapped
+/// `<span data-unverified="true">…</span>` in place, inside its own `| … |`
+/// cell — the table's row/column structure is never altered.
 ///
 /// Returns the replacement lines and how many original lines (header +
 /// separator + data rows) they replace.
@@ -469,24 +822,36 @@ fn annotate_table_block(
     lines: &[&str],
     i: usize,
     block: &TableBlock,
-    trace: &[Value],
+    evidence: &Evidence,
 ) -> (Vec<String>, usize) {
     let consumed = 2 + block.data_row_count;
     let data_start = i + 2;
+    let rank_columns: Vec<bool> = split_row(lines[i])
+        .iter()
+        .map(|h| is_rank_header(h))
+        .collect();
     let rows: Vec<Vec<String>> = lines[data_start..data_start + block.data_row_count]
         .iter()
         .map(|l| split_row(l))
         .collect();
-    let states: Vec<Vec<bool>> = rows
+    let states: Vec<Vec<Option<bool>>> = rows
         .iter()
         .map(|row| {
             row.iter()
-                .map(|cell| cell_is_verified(cell, trace))
+                .enumerate()
+                .map(|(col, cell)| {
+                    if rank_columns.get(col).copied().unwrap_or(false) {
+                        None
+                    } else {
+                        cell_is_verified(cell, evidence)
+                    }
+                })
                 .collect()
         })
         .collect();
-    let any_verified = states.iter().flatten().any(|&v| v);
-    if !any_verified {
+    let any_numeric = states.iter().flatten().any(Option::is_some);
+    let any_verified = states.iter().flatten().any(|v| *v == Some(true));
+    if any_numeric && !any_verified {
         return (
             vec!["[table omitted: not backed by a tool result]".to_owned()],
             consumed,
@@ -497,11 +862,11 @@ fn annotate_table_block(
         let cells: Vec<String> = row
             .iter()
             .zip(row_states.iter())
-            .map(|(cell, &verified)| {
-                if verified {
-                    cell.clone()
-                } else {
+            .map(|(cell, state)| {
+                if *state == Some(false) {
                     format!(r#"<span data-unverified="true">{cell}</span>"#)
+                } else {
+                    cell.clone()
                 }
             })
             .collect();
@@ -553,12 +918,12 @@ fn inline_code_mask(line: &str) -> Vec<bool> {
     mask
 }
 
-/// Rewrites every UNVERIFIED bare number in `line` (outside any inline
-/// code span) to `<span data-unverified="true">…</span>`, in place — a
-/// VERIFIED number is left byte-for-byte unchanged, and no other
-/// character of `line` (spacing, punctuation, code spans) is ever
-/// touched.
-fn annotate_line(line: &str, trace: &[Value]) -> String {
+/// Rewrites every UNVERIFIED number in `line` (outside any inline code
+/// span, read by [`read_number`]) to `<span data-unverified="true">…</span>`,
+/// in place — a VERIFIED number is left byte-for-byte unchanged, and no
+/// other character of `line` (spacing, punctuation, emphasis, code spans)
+/// is ever touched.
+fn annotate_line(line: &str, evidence: &Evidence) -> String {
     let mask = inline_code_mask(line);
     let spans = word_byte_spans(line);
     let mut out = String::with_capacity(line.len());
@@ -574,36 +939,29 @@ fn annotate_line(line: &str, trace: &[Value]) -> String {
             idx += 1;
             continue;
         }
-        let trim_lead = word.len()
-            - word
-                .trim_start_matches(|c: char| ".,;:!?()".contains(c))
-                .len();
-        let trimmed = trim_sentence_punct(word);
-        if let Some((value, mut unit)) = parse_number_token(trimmed) {
-            let mut consumed_next = false;
-            if unit == Unit::None && idx + 1 < spans.len() {
-                let (nstart, nend) = spans[idx + 1];
-                if !mask[nstart] {
-                    let next_word = &line[nstart..nend];
-                    if let Some(u) = parse_bare_unit(trim_sentence_punct(next_word)) {
-                        unit = u;
-                        consumed_next = true;
-                    }
-                }
-            }
-            let state = verify_number(value, unit, trace);
-            if state == NumberState::Unverified {
-                out.push_str(&word[..trim_lead]);
-                let _ = write!(out, r#"<span data-unverified="true">{trimmed}</span>"#);
-                out.push_str(&word[trim_lead + trimmed.len()..]);
-            } else {
+        let next = spans
+            .get(idx + 1)
+            .filter(|(nstart, _)| !mask[*nstart])
+            .map(|&(nstart, nend)| &line[nstart..nend]);
+        if let Some(printed) = read_number(word, next) {
+            if printed.verified(evidence) {
                 out.push_str(word);
+            } else {
+                let lead = word.len()
+                    - word
+                        .trim_start_matches(|c: char| EDGE_MARKS.contains(&c))
+                        .len();
+                let trimmed = trim_marks(word);
+                out.push_str(&word[..lead]);
+                let _ = write!(out, r#"<span data-unverified="true">{trimmed}</span>"#);
+                out.push_str(&word[lead + trimmed.len()..]);
             }
-            if consumed_next {
-                // The unit word itself is never wrapped — only the digit
-                // token is a "number citation" — but it still must be
+            if printed.consumed_next
+                && let Some(&(nstart, nend)) = spans.get(idx + 1)
+            {
+                // The unit or scale word itself is never wrapped — only the
+                // digit token is a "number citation" — but it is still
                 // copied through unchanged, exactly like any other word.
-                let (nstart, nend) = spans[idx + 1];
                 out.push_str(&line[end..nstart]);
                 out.push_str(&line[nstart..nend]);
                 last = nend;
@@ -620,7 +978,37 @@ fn annotate_line(line: &str, trace: &[Value]) -> String {
     out
 }
 
-/// Rewrites `answer` per WS7 item F1's three-state rule set:
+/// The text of every flagged number or table cell in an answer
+/// [`annotate_answer_in`] already rewrote, in order, and whether a whole
+/// table was omitted. The chat loop hands these back to the model once, so
+/// it can look the figures up or drop them before the user sees them.
+#[must_use]
+pub fn flagged(annotated: &str) -> (Vec<String>, bool) {
+    const OPEN: &str = r#"<span data-unverified="true">"#;
+    let mut out = Vec::new();
+    let mut rest = annotated;
+    while let Some(start) = rest.find(OPEN) {
+        let after = &rest[start + OPEN.len()..];
+        let end = after.find("</span>").unwrap_or(after.len());
+        out.push(after[..end].to_owned());
+        rest = after.get(end..).unwrap_or("");
+    }
+    (
+        out,
+        annotated.contains("[table omitted: not backed by a tool result]"),
+    )
+}
+
+/// [`annotate_answer_in`] with no earlier conversation.
+#[cfg(test)]
+#[must_use]
+pub fn annotate_answer(answer: &str, trace: &[Value]) -> String {
+    annotate_answer_in(answer, trace, &[])
+}
+
+/// Rewrites `answer` per WS7 item F1's three-state rule set, checking every
+/// number against the [`Evidence`] of `trace` and the earlier
+/// `conversation` texts:
 ///
 /// - Every table (WS7 item F1 rule 4): handled by [`annotate_table_block`].
 /// - Every number OUTSIDE a table: handled by [`annotate_line`].
@@ -632,7 +1020,8 @@ fn annotate_line(line: &str, trace: &[Value]) -> String {
 /// surrounding prose — only a matched table block or individual number
 /// token is replaced in place.
 #[must_use]
-pub fn annotate_answer(answer: &str, trace: &[Value]) -> String {
+pub fn annotate_answer_in(answer: &str, trace: &[Value], conversation: &[&str]) -> String {
+    let evidence = Evidence::new(trace, conversation);
     let lines: Vec<&str> = answer.split('\n').collect();
     let mut out_lines: Vec<String> = Vec::with_capacity(lines.len());
     let mut in_fence = false;
@@ -651,12 +1040,12 @@ pub fn annotate_answer(answer: &str, trace: &[Value]) -> String {
             continue;
         }
         if let Some(block) = try_parse_table_block(&lines, i) {
-            let (rewritten, consumed) = annotate_table_block(&lines, i, &block, trace);
+            let (rewritten, consumed) = annotate_table_block(&lines, i, &block, &evidence);
             out_lines.extend(rewritten);
             i += consumed;
             continue;
         }
-        out_lines.push(annotate_line(line, trace));
+        out_lines.push(annotate_line(line, &evidence));
         i += 1;
     }
     out_lines.join("\n")
@@ -840,7 +1229,7 @@ mod number_matching {
     }
 
     #[test]
-    fn percent_unit_checks_only_the_times_100_transform() {
+    fn percent_unit_matches_a_fraction_or_a_value_already_in_percent() {
         let trace =
             vec![serde_json::json!({"tool":"describe_mart","ok":true,"result":{"pct":0.12}})];
         assert_eq!(
@@ -852,6 +1241,16 @@ mod number_matching {
         assert_eq!(
             verify_number(12.0, Unit::None, &trace),
             NumberState::Unverified
+        );
+        // SQL that already multiplied by 100 (`round(100 * a / b, 1)`)
+        // backs "27.4%" directly. Before, only the x100 reading was
+        // tried, so a share computed the recommended way was flagged.
+        let trace = vec![
+            serde_json::json!({"tool":"run_sql","ok":true,"result":{"rows":[{"share":"27.4"}]}}),
+        ];
+        assert_eq!(
+            verify_number(27.4, Unit::Percent, &trace),
+            NumberState::Verified
         );
     }
 
@@ -930,5 +1329,161 @@ mod number_matching {
             verify_number(42.0, Unit::None, &trace),
             NumberState::Unverified
         );
+    }
+}
+
+#[cfg(test)]
+mod evidence {
+    use super::*;
+    use serde_json::json;
+
+    fn run_sql(rows: &Value) -> Vec<Value> {
+        vec![json!({"tool": "run_sql", "ok": true, "result": {"columns": [], "rows": rows}})]
+    }
+
+    #[test]
+    fn a_number_clickhouse_returned_as_a_string_is_evidence() {
+        let trace = run_sql(&json!([{"negara": "Malaysia", "total": "1571564"}]));
+        assert_eq!(
+            annotate_answer("Malaysia sent 1,571,564 visitors.", &trace),
+            "Malaysia sent 1,571,564 visitors."
+        );
+    }
+
+    #[test]
+    fn a_bold_wrong_total_is_flagged_not_skipped() {
+        let trace = run_sql(&json!([{"n": "12934"}]));
+        let annotated = annotate_answer("**Total POI: 13,934**", &trace);
+        assert!(
+            annotated.contains(r#"<span data-unverified="true">13,934</span>"#),
+            "{annotated}"
+        );
+        assert_eq!(
+            annotate_answer("**Total POI: 12,934**", &trace),
+            "**Total POI: 12,934**"
+        );
+    }
+
+    #[test]
+    fn counts_and_totals_implied_by_the_rows_are_evidence() {
+        let trace = run_sql(&json!([
+            {"tier": "primer", "n": "3"}, {"tier": "primer", "n": "4"}, {"tier": "sekunder", "n": "5"}
+        ]));
+        // 2 rows share "primer", 3 rows in all, 12 is the column total.
+        assert_eq!(
+            annotate_answer("3 datasets: 2 primer, 12 rows in total.", &trace),
+            "3 datasets: 2 primer, 12 rows in total."
+        );
+    }
+
+    #[test]
+    fn scaled_and_indonesian_forms_match_within_their_printed_precision() {
+        let trace = run_sql(&json!([{"n": "2643888"}, {"n": "12.09"}]));
+        for answer in [
+            "2.64 million",
+            "2,64 juta",
+            "2.643.888",
+            "2.6M",
+            "12,09%",
+            "12.1%",
+        ] {
+            assert_eq!(
+                annotate_answer(answer, &trace),
+                answer,
+                "{answer} should verify"
+            );
+        }
+        assert!(annotate_answer("2.9 million", &trace).contains("data-unverified"));
+    }
+
+    #[test]
+    fn label_cells_and_rank_columns_are_never_flagged() {
+        let trace = run_sql(&json!([{"negara": "Malaysia", "s": "1571564"}]));
+        let answer = "| # | Country | Visits |\n|---|---|---|\n| 1 | 🇲🇾 Malaysia | **1,571,564** |";
+        assert_eq!(annotate_answer(answer, &trace), answer);
+    }
+
+    #[test]
+    fn a_table_of_labels_only_is_kept_whole() {
+        let answer = "| Column | Meaning |\n|---|---|\n| tahun | Year of visit |";
+        assert_eq!(annotate_answer(answer, &[]), answer);
+    }
+
+    #[test]
+    fn a_number_from_earlier_in_the_conversation_is_evidence_unless_it_was_flagged() {
+        let earlier = [
+            "How many visits in 2023?",
+            r#"There were 2,358,638 visits, and <span data-unverified="true">777</span> events."#,
+        ];
+        assert_eq!(
+            annotate_answer_in("2023 had 2,358,638.", &[], &earlier),
+            "2023 had 2,358,638."
+        );
+        assert!(
+            annotate_answer_in("There were 777 events.", &[], &earlier).contains("data-unverified")
+        );
+    }
+
+    #[test]
+    fn plain_number_strings_are_read_and_nothing_else_is() {
+        assert_eq!(parse_plain_number("1571564"), Some(1_571_564.0));
+        assert_eq!(parse_plain_number("-3.5"), Some(-3.5));
+        assert_eq!(parse_plain_number("2024-01-15"), None);
+        assert_eq!(parse_plain_number("1,234"), None);
+        assert_eq!(parse_plain_number("w-1"), None);
+        assert_eq!(parse_plain_number(""), None);
+    }
+
+    #[test]
+    fn an_indonesian_thousands_dot_matches_either_reading() {
+        let trace = run_sql(&json!([{"n": "18420"}]));
+        assert_eq!(
+            annotate_answer("yaitu 18.420 usaha", &trace),
+            "yaitu 18.420 usaha"
+        );
+        assert!(annotate_answer("yaitu 18.520 usaha", &trace).contains("data-unverified"));
+    }
+
+    #[test]
+    fn a_difference_or_change_between_two_numbers_of_one_result_is_verified() {
+        let trace = run_sql(&json!([{"tahun": "2020", "n": "62"}, {"tahun": "2024", "n": "396"}]));
+        let answer = "From 62 to 396, an increase of 334 events (+538.7%, 6.4x).";
+        assert_eq!(annotate_answer(answer, &trace), answer);
+        // A wrong difference is still flagged.
+        assert!(annotate_answer("an increase of 344 events", &trace).contains("data-unverified"));
+    }
+
+    #[test]
+    fn byte_units_match_the_binary_or_the_decimal_reading() {
+        let trace = run_sql(&json!([{"walRetainedBytes": "19552544"}]));
+        for answer in ["18.6 MB", "19.6 MB"] {
+            assert_eq!(annotate_answer(answer, &trace), answer, "{answer}");
+        }
+    }
+
+    #[test]
+    fn a_bold_number_in_an_earlier_answer_is_evidence() {
+        let earlier = ["There were **2,358,638** visits in 2023."];
+        assert_eq!(
+            annotate_answer_in("2023 had 2,358,638.", &[], &earlier),
+            "2023 had 2,358,638."
+        );
+    }
+
+    #[test]
+    fn a_unit_word_in_bold_is_still_a_unit() {
+        let trace = run_sql(&json!([{"walRetainedBytes": "23774528"}]));
+        let answer = "WAL retained: **23.77 MB**";
+        assert_eq!(annotate_answer(answer, &trace), answer);
+    }
+
+    #[test]
+    fn flagged_lists_every_flagged_number_and_an_omitted_table() {
+        let (numbers, omitted) = flagged(
+            "a <span data-unverified=\"true\">12</span> b <span data-unverified=\"true\">3.4%</span>\n[table omitted: not backed by a tool result]",
+        );
+        assert_eq!(numbers, vec!["12".to_owned(), "3.4%".to_owned()]);
+        assert!(omitted);
+        assert_eq!(flagged("all good"), (Vec::new(), false));
     }
 }

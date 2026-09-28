@@ -8,16 +8,10 @@
   "contentType": "application/json;charset=utf-8",
   "body": {
     "focus": "",
-    "nodes": [
-      {
-        "id": "",
-        "label": "",
-        "kind": "focus"
-      }
-    ],
-    "edges": [],
     "columnMappings": [],
-    "supported": false,
-    "reason": "lineage capture not implemented"
+    "supported": true,
+    "nodes": [],
+    "edges": [],
+    "note": "pass ?focus= with a dataset slug or a table name (e.g. serving.<table>)"
   }
 }

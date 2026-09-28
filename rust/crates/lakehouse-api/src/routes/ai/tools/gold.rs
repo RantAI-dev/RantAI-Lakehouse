@@ -77,7 +77,7 @@ pub(super) async fn export_gold_mart(
 ) -> Value {
     let mart = arg_str(args, "mart");
     if mart.is_empty() {
-        return json!({ "error": "mart wajib diisi" });
+        return json!({ "error": "mart is required" });
     }
     let Some(principal) = principal else {
         return json!({ "error": "export_gold_mart membutuhkan sesi pengguna yang sudah masuk" });
@@ -135,7 +135,7 @@ pub(super) async fn export_gold_mart(
 pub(super) async fn get_gold_export(state: &AppState, args: &Map<String, Value>) -> Value {
     let mart = arg_str(args, "mart");
     if mart.is_empty() {
-        return json!({ "error": "mart wajib diisi" });
+        return json!({ "error": "mart is required" });
     }
     let (mart_ident, iceberg_config) = match iceberg_config_for(state, &mart).await {
         Ok(pair) => pair,
@@ -192,11 +192,11 @@ mod tests {
         let principal = fixture_user_principal();
         assert_eq!(
             export_gold_mart(&s, Some(&principal), &Map::new()).await,
-            json!({ "error": "mart wajib diisi" })
+            json!({ "error": "mart is required" })
         );
         assert_eq!(
             get_gold_export(&s, &Map::new()).await,
-            json!({ "error": "mart wajib diisi" })
+            json!({ "error": "mart is required" })
         );
     }
 

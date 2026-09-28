@@ -59,7 +59,7 @@ pub(super) async fn create_alert_rule(ch: &ChClient, args: &Map<String, Value>) 
 pub(super) async fn update_alert_rule(ch: &ChClient, args: &Map<String, Value>) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
-        return json!({ "error": "id wajib diisi" });
+        return json!({ "error": "id is required" });
     }
     let input = parse_input(args);
     match lakehouse_alerts::save_rule(ch, &input, Some(&id)).await {
@@ -71,7 +71,7 @@ pub(super) async fn update_alert_rule(ch: &ChClient, args: &Map<String, Value>) 
 pub(super) async fn delete_alert_rule(ch: &ChClient, args: &Map<String, Value>) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
-        return json!({ "error": "id wajib diisi" });
+        return json!({ "error": "id is required" });
     }
     match lakehouse_alerts::delete_rule(ch, &id).await {
         Ok(()) => json!({ "ok": true }),
@@ -82,7 +82,7 @@ pub(super) async fn delete_alert_rule(ch: &ChClient, args: &Map<String, Value>) 
 pub(super) async fn run_alert_rule(state: &AppState, args: &Map<String, Value>) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
-        return json!({ "error": "id wajib diisi" });
+        return json!({ "error": "id is required" });
     }
     let http = reqwest::Client::new();
     let email = EmailSender::new(crate::routes::alerts::smtp_config(&state.config));
@@ -144,16 +144,16 @@ mod tests {
         let ch = &state().clickhouse;
         assert_eq!(
             update_alert_rule(ch, &Map::new()).await,
-            json!({ "error": "id wajib diisi" })
+            json!({ "error": "id is required" })
         );
         assert_eq!(
             delete_alert_rule(ch, &Map::new()).await,
-            json!({ "error": "id wajib diisi" })
+            json!({ "error": "id is required" })
         );
         let s = state();
         assert_eq!(
             run_alert_rule(&s, &Map::new()).await,
-            json!({ "error": "id wajib diisi" })
+            json!({ "error": "id is required" })
         );
     }
 

@@ -23,7 +23,7 @@ pub(super) async fn list_workloads(state: &AppState) -> Value {
 pub(super) async fn kill_query(state: &AppState, args: &Map<String, Value>) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
-        return json!({ "error": "id wajib diisi" });
+        return json!({ "error": "id is required" });
     }
     response_to_value(crate::routes::ops::cancel_workload(State(state.clone()), Path(id)).await)
         .await
@@ -47,7 +47,7 @@ mod tests {
         let s = state();
         assert_eq!(
             kill_query(&s, &Map::new()).await,
-            json!({ "error": "id wajib diisi" })
+            json!({ "error": "id is required" })
         );
     }
 }
