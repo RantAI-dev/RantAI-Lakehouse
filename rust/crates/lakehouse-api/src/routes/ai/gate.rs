@@ -59,7 +59,7 @@ use super::registry::{Risk, ToolSpec};
 /// non-[`Read`](Risk::Read) tool in `mode: "ask"`.
 fn ask_mode_refusal(tool_name: &str) -> Value {
     json!({
-        "error": "ditolak: mode ask tidak boleh menjalankan tool tulis",
+        "error": "refused: Ask mode cannot run a tool that changes anything; switch to Build mode",
         "refused": true,
         "tool": tool_name,
     })
@@ -71,7 +71,7 @@ fn ask_mode_refusal(tool_name: &str) -> Value {
 fn permission_refusal(tool_name: &str, required: &str) -> Value {
     json!({
         "error": format!(
-            "ditolak: kamu tidak punya izin '{required}' untuk menjalankan tool ini"
+            "refused: this user lacks the '{required}' permission this tool needs"
         ),
         "refused": true,
         "tool": tool_name,
@@ -139,7 +139,7 @@ fn reason_for_write_high(spec: &ToolSpec, args: &Map<String, Value>) -> String {
             s("id")
         ),
         _ => format!(
-            "Menjalankan tool berisiko tinggi {} yang butuh persetujuan manusia.",
+            "{} is a high-risk action; it runs only after a human approves it in Approvals.",
             spec.name
         ),
     }
@@ -177,7 +177,7 @@ pub async fn create_write_high_approval(
 ) -> Value {
     let Some(pool) = pg else {
         return json!({
-            "error": "ditolak: approval tidak tersedia (Postgres tidak dikonfigurasi)",
+            "error": "refused: approvals are unavailable (no Postgres configured)",
             "refused": true,
             "tool": spec.name,
         });
@@ -206,7 +206,7 @@ pub async fn create_write_high_approval(
                 "copilot: failed to create WriteHigh approval; refusing the call"
             );
             json!({
-                "error": "ditolak: gagal membuat approval",
+                "error": "refused: the approval request could not be created",
                 "refused": true,
                 "tool": spec.name,
             })
@@ -242,7 +242,7 @@ fn summary_for(spec: &ToolSpec, args: &Map<String, Value>) -> String {
         ),
         "create_board" => format!("Membuat board baru bernama \"{}\".", s("name")),
         _ => format!(
-            "Menjalankan tool {} dengan argumen yang diberikan.",
+            "{} is ready: the user confirms it with the Confirm button under this message. This is not an approval and does not go to Approvals.",
             spec.name
         ),
     }

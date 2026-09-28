@@ -1,7 +1,9 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
 import { useParams } from "next/navigation"
+import { ArrowLeft } from "lucide-react"
 import { PageHeader } from "@/components/patterns/page-header"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
@@ -111,6 +113,11 @@ export function LakehouseTableDetailPage() {
       <PageHeader
         title={`${params.namespace}.${params.table}`}
         description="Iceberg schema, partitioning, snapshots, and maintenance policy."
+        actions={
+          <Button variant="outline" size="sm" render={<Link href="/governance/maintenance" />}>
+            <ArrowLeft className="size-4" /> Table Maintenance
+          </Button>
+        }
       />
 
       <SectionCard size="sm" title="Schema">

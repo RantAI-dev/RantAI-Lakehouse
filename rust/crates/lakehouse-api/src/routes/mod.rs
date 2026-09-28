@@ -20,6 +20,7 @@ mod governance;
 mod identity;
 mod knowledge;
 mod lakehouse;
+mod lineage;
 mod notifications;
 mod ops;
 mod overview;
@@ -111,10 +112,33 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// non-default `maxDuration` today.
 fn route_timeout(path: &str) -> Duration {
     match path {
-        "/api/ai/chat" => Duration::from_secs(120),
+        "/api/ai/chat" => *AI_CHAT_TIMEOUT,
         "/api/agent/query" => Duration::from_secs(90),
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
+}
+
+/// `/api/ai/chat`'s timeout: `AI_CHAT_TIMEOUT_SECS` when set, else 120s.
+///
+/// 120s fits a hosted model. A small model served on CPU (an on-prem
+/// deployment without a GPU) needs several minutes for one multi-round
+/// tool loop: measured on a 8-core CPU, `qwen3:4b` under Ollama took 37s
+/// to answer "say ok" alone, so every copilot turn with that model timed
+/// out at 120s. An operator who chooses such a model can raise the bound;
+/// nothing else changes. Read once, like `tenant.rs`'s deployment labels.
+static AI_CHAT_TIMEOUT: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
+    chat_timeout_from(std::env::var("AI_CHAT_TIMEOUT_SECS").ok().as_deref())
+});
+
+/// Parses `AI_CHAT_TIMEOUT_SECS`: whole seconds, clamped to 30..=1800 so a
+/// typo can neither make every chat time out nor hold a connection for
+/// hours. Unset, empty or unparseable -> the 120s default.
+fn chat_timeout_from(raw: Option<&str>) -> Duration {
+    raw.map(str::trim)
+        .and_then(|s| s.parse::<u64>().ok())
+        .map_or(Duration::from_secs(120), |secs| {
+            Duration::from_secs(secs.clamp(30, 1800))
+        })
 }
 
 /// Build the application router with `state` threaded through every
@@ -652,6 +676,16 @@ mod tests {
     /// (120s, an 8-round LLM tool loop) and `agent/query` (90s) — a
     /// blanket 60s bound 408'd a legitimate in-flight request. Pins the
     /// per-route table to the TS `export const maxDuration` grep.
+    #[test]
+    fn chat_timeout_defaults_to_120s_and_clamps_an_operator_override() {
+        assert_eq!(chat_timeout_from(None), Duration::from_secs(120));
+        assert_eq!(chat_timeout_from(Some("")), Duration::from_secs(120));
+        assert_eq!(chat_timeout_from(Some("abc")), Duration::from_secs(120));
+        assert_eq!(chat_timeout_from(Some("600")), Duration::from_secs(600));
+        assert_eq!(chat_timeout_from(Some("5")), Duration::from_secs(30));
+        assert_eq!(chat_timeout_from(Some("99999")), Duration::from_secs(1800));
+    }
+
     #[test]
     fn route_timeout_matches_typescript_max_duration() {
         assert_eq!(route_timeout("/api/ai/chat"), Duration::from_secs(120));

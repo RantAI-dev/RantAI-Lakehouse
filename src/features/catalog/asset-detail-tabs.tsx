@@ -18,6 +18,7 @@ import { useService } from "@/hooks/use-service"
 import { formatCompactNumber, formatRelativeTime } from "@/lib/format"
 import {
   isIcebergCandidate,
+  lakehouseTableHref,
   snapshotRelativeTime,
   snapshotsNewestFirst,
 } from "@/lib/lakehouse-view"
@@ -56,6 +57,7 @@ function IcebergSnapshots({ tableName }: { tableName: string }) {
   if (snapshots.length === 0) return <QuietEmpty title="No snapshots for this asset" />
 
   return (
+    <div className="flex flex-col gap-2">
     <ul className="divide-y divide-border text-sm">
       {snapshots.map((s) => (
         <li key={s.id} className="flex justify-between gap-2 py-1.5">
@@ -67,6 +69,17 @@ function IcebergSnapshots({ tableName }: { tableName: string }) {
         </li>
       ))}
     </ul>
+      {/* Schema field ids, partition spec, the full snapshot log and the
+          maintenance policy live on the Iceberg table page, which has no
+          nav entry of its own since the Tables page folded into Table
+          Maintenance. */}
+      <Link
+        href={lakehouseTableHref("bronze", tableName)}
+        className="self-start text-sm text-primary hover:underline"
+      >
+        Iceberg details
+      </Link>
+    </div>
   )
 }
 

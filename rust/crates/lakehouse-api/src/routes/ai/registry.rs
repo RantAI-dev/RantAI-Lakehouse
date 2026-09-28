@@ -103,62 +103,68 @@ fn chart_kind_enum() -> Value {
 
 fn run_sql_schema() -> Value {
     json!({ "type": "function", "function": { "name": "run_sql",
-        "description": "Jalankan query SELECT ClickHouse (read-only) untuk menjawab pertanyaan data. Gunakan tabel serving.mart_* (Gold) untuk agregasi atau silver.`<nama>` untuk detail. Selalu SELECT saja, LIMIT wajar.",
+        "description": "Run a read-only ClickHouse SELECT and return its rows. Use it for every number you report. Query Gold marts (serving.mart_*) for totals and trends, Silver (silver.<table>) for detail rows. Compute totals, percentages, growth and rankings in the SQL itself. Tables and columns are in the DATA MAP.",
         "parameters": { "type": "object",
-            "properties": { "sql": { "type": "string", "description": "Query SELECT ClickHouse" } },
+            "properties": { "sql": { "type": "string", "description": "A ClickHouse SELECT statement" } },
             "required": ["sql"] } } })
 }
 
 fn list_datasets_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_datasets",
-        "description": "Daftar dataset di katalog lakehouse (opsional filter kata kunci / tier primer|sekunder).",
+        "description": "List the datasets registered in the lakehouse catalog: slug, title, whether it comes from a primary or secondary source, and the Gold table it is served from. Optional keyword or source filter.",
         "parameters": { "type": "object", "properties": {
-            "search": { "type": "string" },
-            "tier": { "type": "string", "enum": ["primer", "sekunder"] } } } } })
+            "search": { "type": "string", "description": "keyword to match in the title or slug" },
+            "source": { "type": "string", "enum": ["primary", "secondary"], "description": "only datasets from primary or secondary sources" } } } } })
+}
+
+fn lakehouse_overview_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "lakehouse_overview",
+        "description": "Everything in the lakehouse by layer: the registered Bronze datasets, and every Silver and Gold table with its row count. Use it for \"what data do we have?\" and other overview questions.",
+        "parameters": { "type": "object", "properties": {} } } })
 }
 
 fn describe_dataset_schema() -> Value {
     json!({ "type": "function", "function": { "name": "describe_dataset",
-        "description": "Metadata + skema kolom + jumlah baris satu dataset (by slug).",
+        "description": "Describe one dataset by slug: title, description, source kind, which layers (Bronze/Silver/Gold) it is present in with row counts, and its documented columns.",
         "parameters": { "type": "object", "properties": { "slug": { "type": "string" } },
             "required": ["slug"] } } })
 }
 
 fn get_lineage_schema() -> Value {
     json!({ "type": "function", "function": { "name": "get_lineage",
-        "description": "Silsilah sebuah dataset: source → Bronze → Silver + mapping kolom (by slug).",
-        "parameters": { "type": "object", "properties": { "slug": { "type": "string" } },
+        "description": "Recorded lineage of a dataset or table: what feeds it and what it feeds (publisher, connector ingest, catalog registry, authored pipelines, views, Gold export). Every edge comes from a platform record; nothing is inferred from names.",
+        "parameters": { "type": "object", "properties": { "slug": { "type": "string", "description": "a dataset slug, or a table name such as serving.<table> or bronze.<table>" } },
             "required": ["slug"] } } })
 }
 
 fn get_quality_schema() -> Value {
     json!({ "type": "function", "function": { "name": "get_quality",
-        "description": "Ringkasan kualitas data lakehouse (jumlah cek pass/warn/fail + contoh masalah).",
+        "description": "Summary of the latest data quality check results (how many checks passed, warned or failed). Says so when no checks have run yet.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
 fn trigger_lakehouse_build_schema() -> Value {
     json!({ "type": "function", "function": { "name": "trigger_lakehouse_build",
-        "description": "BANGUN ULANG lakehouse: tarik data SDI+berkas ke Bronze, generate Silver bertipe, build mart Gold. Menjalankan job Dagster 'refresh_lakehouse'. Pakai saat user minta membangun/menyegarkan data Bronze/Silver/Gold.",
+        "description": "Rebuild the lakehouse layer by layer from what this deployment has: ingest every connector with an ingest spec into Bronze, run every authored pipeline, then export Gold to Iceberg (or the deployment's own build job when it has one). The result lists what was launched and what was skipped and why. Use only when the user asks to rebuild or refresh everything.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
 fn get_build_status_schema() -> Value {
     json!({ "type": "function", "function": { "name": "get_build_status",
-        "description": "Status run pipeline lakehouse terakhir (Dagster).",
+        "description": "A log of the 10 most recent Dagster runs across all jobs, with status and start time. It does NOT give each pipeline's current state: to find failing pipelines use list_pipelines.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
 fn describe_mart_schema() -> Value {
     json!({ "type": "function", "function": { "name": "describe_mart",
-        "description": "Lihat mart Gold (serving.*) yang bisa divisualisasikan. Tanpa argumen: daftar semua mart. Dengan `mart`: kolom mart itu, terbagi dimensi (kategori/waktu) & measure (angka). PANGGIL INI DULU sebelum create_chart agar memilih kolom yang benar-benar ada.",
+        "description": "Gold marts (serving.*) that can be charted. With no argument: every mart with its row count. With `mart`: its columns split into dimensions (categories, time) and measures (numbers). Call this before create_chart.",
         "parameters": { "type": "object", "properties": {
-            "mart": { "type": "string", "description": "nama mart, mis. mart_wisman" } } } } })
+            "mart": { "type": "string", "description": "mart name, e.g. mart_sales" } } } } })
 }
 
 fn create_chart_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_chart",
-        "description": "Buat kartu chart baru di dashboard (/dashboards) dari mart Gold. Server menyusun SQL-nya sendiri dari kolom yang kamu pilih (agregasi per dimensi) — kamu TIDAK menulis SQL. Panggil describe_mart dulu untuk tahu kolom valid. Chart langsung tersimpan & tampil.",
+        "description": "Create a chart card on a dashboard (/dashboards) from a Gold mart. The server writes the SQL from the columns you pick; you do not write SQL. Call describe_mart first to use columns that exist.",
         "parameters": { "type": "object", "properties": {
             "title": { "type": "string" }, "subtitle": { "type": "string" },
             "mart": { "type": "string" }, "kind": { "type": "string", "enum": chart_kind_enum() },
@@ -174,7 +180,7 @@ fn create_chart_schema() -> Value {
 
 fn update_chart_schema() -> Value {
     json!({ "type": "function", "function": { "name": "update_chart",
-        "description": "Ubah chart tersimpan (by id) — mempertahankan id, mengganti definisinya. Kirim SEMUA field seperti create_chart dengan nilai baru. Pakai list_charts untuk tahu id.",
+        "description": "Change a saved chart (by id), keeping its id. Send every field, as for create_chart, with the new values. list_charts gives the ids.",
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string" }, "title": { "type": "string" }, "subtitle": { "type": "string" },
             "mart": { "type": "string" }, "kind": { "type": "string", "enum": chart_kind_enum() },
@@ -190,32 +196,32 @@ fn update_chart_schema() -> Value {
 
 fn create_board_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_board",
-        "description": "Buat board (dashboard bernama) baru. Kembalikan id-nya untuk dipakai di create_chart.",
+        "description": "Create a new named dashboard (board). Returns its id for create_chart.",
         "parameters": { "type": "object", "properties": { "name": { "type": "string" } },
             "required": ["name"] } } })
 }
 
 fn list_boards_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_boards",
-        "description": "Daftar board (dashboard bernama) yang ada.",
+        "description": "List the dashboards (boards) that exist.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
 fn suggest_dashboard_schema() -> Value {
     json!({ "type": "function", "function": { "name": "suggest_dashboard",
-        "description": "Ambil katalog SEMUA mart Gold beserta dimensi & measure-nya sekaligus — untuk MENGUSULKAN set kartu dashboard.",
+        "description": "Every Gold mart with its dimensions and measures at once, for proposing a set of dashboard charts.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
 fn list_charts_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_charts",
-        "description": "Daftar kartu chart tersimpan di dashboard (yang dibuat lewat chat/UI).",
+        "description": "List the chart cards saved on dashboards.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
 fn delete_chart_schema() -> Value {
     json!({ "type": "function", "function": { "name": "delete_chart",
-        "description": "Hapus satu kartu chart tersimpan dari dashboard (by id). Spec bawaan tak bisa dihapus.",
+        "description": "Delete one saved chart card (by id). Built-in charts cannot be deleted. Needs human approval before it runs.",
         "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
             "required": ["id"] } } })
 }
@@ -237,31 +243,31 @@ fn alert_agg_enum() -> Value {
 
 fn list_alert_rules_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_alert_rules",
-        "description": "Daftar semua aturan alert (peringatan ambang batas) dan digest (ringkasan berkala) yang terpasang, beserta status aktif/nonaktifnya.",
+        "description": "List every alert rule (threshold alerts) and digest (scheduled summaries), with whether each is enabled.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
 fn create_alert_rule_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_alert_rule",
-        "description": "Buat aturan alert atau digest baru. Untuk type=alert: isi mart, measure, agg (agregat), op (operator pembanding), threshold — rule ini akan memantau nilai agregat itu. Untuk type=digest: isi board (id dashboard yang diringkas). Pengiriman lewat channel webhook (target=URL) atau email (target=alamat).",
+        "description": "Create an alert or digest rule. Alert (type=alert): mart, measure, agg, op and threshold; it watches that aggregate. Digest (type=digest): board, the dashboard to summarise. Delivered by webhook (target=URL) or email (target=address).",
         "parameters": { "type": "object", "properties": {
             "name": { "type": "string" },
             "type": { "type": "string", "enum": ["alert", "digest"] },
-            "mart": { "type": "string", "description": "nama mart Gold, untuk type=alert" },
-            "measure": { "type": "string", "description": "kolom ukuran yang dipantau, untuk type=alert" },
+            "mart": { "type": "string", "description": "Gold mart name, for type=alert" },
+            "measure": { "type": "string", "description": "measure column to watch, for type=alert" },
             "agg": { "type": "string", "enum": alert_agg_enum() },
             "op": { "type": "string", "enum": alert_op_enum() },
             "threshold": { "type": "number" },
-            "board": { "type": "string", "description": "id board dashboard, untuk type=digest" },
+            "board": { "type": "string", "description": "dashboard board id, for type=digest" },
             "channel": { "type": "string", "enum": ["webhook", "email"] },
-            "target": { "type": "string", "description": "URL webhook atau alamat email tujuan" },
+            "target": { "type": "string", "description": "webhook URL or email address to deliver to" },
             "enabled": { "type": "boolean" } },
             "required": ["name", "type", "channel", "target"] } } })
 }
 
 fn update_alert_rule_schema() -> Value {
     json!({ "type": "function", "function": { "name": "update_alert_rule",
-        "description": "Ubah aturan alert/digest tersimpan (by id) — kirim semua field seperti create_alert_rule dengan nilai baru. Pakai list_alert_rules untuk tahu id.",
+        "description": "Change a saved alert or digest rule (by id). Send every field, as for create_alert_rule, with the new values. list_alert_rules gives the ids.",
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string" },
             "name": { "type": "string" },
@@ -280,14 +286,14 @@ fn update_alert_rule_schema() -> Value {
 
 fn delete_alert_rule_schema() -> Value {
     json!({ "type": "function", "function": { "name": "delete_alert_rule",
-        "description": "Hapus aturan alert/digest secara permanen (by id). Tindakan ini butuh persetujuan manusia sebelum dijalankan.",
+        "description": "Delete an alert or digest rule permanently (by id). Needs human approval before it runs.",
         "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
             "required": ["id"] } } })
 }
 
 fn run_alert_rule_schema() -> Value {
     json!({ "type": "function", "function": { "name": "run_alert_rule",
-        "description": "Jalankan evaluasi satu aturan alert/digest sekarang (by id) — bila kondisinya terpenuhi, webhook/email BENERAN terkirim ke target.",
+        "description": "Evaluate one alert or digest rule now (by id). If its condition holds, the webhook or email is really sent.",
         "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
             "required": ["id"] } } })
 }
@@ -300,22 +306,22 @@ fn connector_direction_enum() -> Value {
 
 fn list_connectors_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_connectors",
-        "description": "Daftar semua connector (sumber/tujuan data) yang terdaftar beserta status kesehatannya.",
+        "description": "List the registered data connectors (sources and targets) and their health.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
 fn create_connector_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_connector",
-        "description": "Daftarkan connector baru. Server yang menghasilkan id connector dan nama referensi kredensialnya (ADR 0002 Addendum 3) — pilih source (env/file) dan kind (password/secret_key/access_key/api_key/token) per slot, JANGAN kirim secretRef; nama yang harus disediakan operator dikembalikan sekali di respons.",
+        "description": "Register a new connector. The server creates the connector id and derives the credential reference names from it: choose a source (env/file) and kind per slot, never send a secret or secretRef. The names the operator must provide are returned once.",
         "parameters": { "type": "object", "properties": {
             "name": { "type": "string" },
-            "type": { "type": "string", "description": "mis. PostgreSQL, Object storage, Kafka" },
+            "type": { "type": "string", "description": "e.g. PostgreSQL, Object storage, Kafka" },
             "direction": { "type": "string", "enum": connector_direction_enum() },
-            "host": { "type": "string", "description": "target koneksi (host:port atau endpoint)" },
-            "credential": { "type": "object", "description": "spesifikasi kredensial; server yang menurunkan nama referensinya dari id connector", "properties": {
+            "host": { "type": "string", "description": "connection target (host:port or endpoint)" },
+            "credential": { "type": "object", "description": "credential spec; the server derives the reference names from the connector id", "properties": {
                 "source": { "type": "string", "enum": ["env", "file"] },
                 "primary": { "type": "string", "enum": ["password", "secret_key", "access_key", "api_key", "token", "private_key"] },
-                "secondary": { "type": "string", "enum": ["password", "secret_key", "access_key", "api_key", "token", "private_key"], "description": "slot kedua, mis. secret key S3, opsional" } },
+                "secondary": { "type": "string", "enum": ["password", "secret_key", "access_key", "api_key", "token", "private_key"], "description": "second slot, e.g. an S3 secret key; optional" } },
                 "required": ["source", "primary"] },
             "environment": { "type": "string" },
             "tenant": { "type": "string" },
@@ -327,14 +333,14 @@ fn create_connector_schema() -> Value {
 
 fn test_connector_schema() -> Value {
     json!({ "type": "function", "function": { "name": "test_connector",
-        "description": "Tes koneksi nyata ke connector (by id). Hanya PostgreSQL dan Object storage (S3-compatible) yang benar-benar bisa dites di build ini — tipe lain akan mengembalikan supported:false, bukan hasil palsu.",
+        "description": "Run a real connection test on a connector (by id). PostgreSQL, S3-compatible object storage, MySQL/MariaDB, SQL Server and REST sources can be dialled; any other type returns supported:false instead of a made-up result.",
         "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
             "required": ["id"] } } })
 }
 
 fn delete_connector_schema() -> Value {
     json!({ "type": "function", "function": { "name": "delete_connector",
-        "description": "Hapus registrasi connector secara permanen (by id). Tindakan ini butuh persetujuan manusia sebelum dijalankan.",
+        "description": "Delete a connector registration permanently (by id). Needs human approval before it runs.",
         "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
             "required": ["id"] } } })
 }
@@ -343,48 +349,48 @@ fn delete_connector_schema() -> Value {
 
 fn list_pipelines_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_pipelines",
-        "description": "Daftar semua pipeline (job Dagster + pipeline yang dibuat via chat/UI) beserta status & jadwalnya.",
+        "description": "List every pipeline (Dagster jobs and pipelines authored in the console) with its latest status (e.g. failed, completed), schedule, and last and next run. Use it to answer which pipelines are failing or healthy.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
 fn list_pipeline_runs_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_pipeline_runs",
-        "description": "Daftar run terbaru (maks 30) dari satu pipeline (by id).",
+        "description": "The latest runs (up to 30) of one pipeline (by id), with status and times.",
         "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
             "required": ["id"] } } })
 }
 
 fn trigger_pipeline_schema() -> Value {
     json!({ "type": "function", "function": { "name": "trigger_pipeline",
-        "description": "Jalankan satu pipeline tertentu sekarang (by id) — berbeda dari trigger_lakehouse_build yang selalu menjalankan pipeline utama Bronze→Silver→Gold.",
+        "description": "Run one pipeline now (by id). Different from trigger_lakehouse_build, which always runs the main Bronze -> Silver -> Gold rebuild.",
         "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
             "required": ["id"] } } })
 }
 
 fn retry_pipeline_run_schema() -> Value {
     json!({ "type": "function", "function": { "name": "retry_pipeline_run",
-        "description": "Jalankan ulang satu run pipeline yang sudah selesai dari awal (by runId).",
+        "description": "Re-run a finished pipeline run from the start (by runId).",
         "parameters": { "type": "object", "properties": { "runId": { "type": "string" } },
             "required": ["runId"] } } })
 }
 
 fn pause_pipeline_schema() -> Value {
     json!({ "type": "function", "function": { "name": "pause_pipeline",
-        "description": "Jeda jadwal terjadwal sebuah pipeline (by id). Tindakan ini butuh persetujuan manusia sebelum dijalankan.",
+        "description": "Pause a pipeline's schedule (by id). Needs human approval before it runs.",
         "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
             "required": ["id"] } } })
 }
 
 fn resume_pipeline_schema() -> Value {
     json!({ "type": "function", "function": { "name": "resume_pipeline",
-        "description": "Aktifkan kembali jadwal terjadwal sebuah pipeline yang sebelumnya dijeda (by id).",
+        "description": "Resume a paused pipeline's schedule (by id).",
         "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
             "required": ["id"] } } })
 }
 
 fn cancel_pipeline_run_schema() -> Value {
     json!({ "type": "function", "function": { "name": "cancel_pipeline_run",
-        "description": "Hentikan paksa satu run pipeline yang sedang berjalan (by runId). Tindakan ini butuh persetujuan manusia sebelum dijalankan.",
+        "description": "Stop a running pipeline run (by runId). Needs human approval before it runs.",
         "parameters": { "type": "object", "properties": { "runId": { "type": "string" } },
             "required": ["runId"] } } })
 }
@@ -393,10 +399,10 @@ fn cancel_pipeline_run_schema() -> Value {
 
 fn save_query_schema() -> Value {
     json!({ "type": "function", "function": { "name": "save_query",
-        "description": "Simpan query SQL sebagai saved query bernama, untuk dijalankan ulang lewat run_saved_query kapan saja.",
+        "description": "Save a SQL query under a name, to run again later with run_saved_query.",
         "parameters": { "type": "object", "properties": {
             "title": { "type": "string" },
-            "sql": { "type": "string", "description": "Query SELECT ClickHouse" },
+            "sql": { "type": "string", "description": "A ClickHouse SELECT statement" },
             "tags": { "type": "array", "items": { "type": "string" } },
             "owner": { "type": "string" } },
             "required": ["title", "sql"] } } })
@@ -404,13 +410,13 @@ fn save_query_schema() -> Value {
 
 fn list_saved_queries_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_saved_queries",
-        "description": "Daftar semua saved query yang tersimpan.",
+        "description": "List the saved queries.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
 fn run_saved_query_schema() -> Value {
     json!({ "type": "function", "function": { "name": "run_saved_query",
-        "description": "Jalankan satu saved query tersimpan (by id) dan kembalikan hasilnya. Hanya query baca (SELECT/WITH/SHOW/DESCRIBE/EXPLAIN) yang diizinkan, sama seperti Query Studio.",
+        "description": "Run a saved query (by id) and return its rows. Only read-only statements run, as in Query Studio.",
         "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
             "required": ["id"] } } })
 }
@@ -419,31 +425,31 @@ fn run_saved_query_schema() -> Value {
 
 fn get_audit_history_schema() -> Value {
     json!({ "type": "function", "function": { "name": "get_audit_history",
-        "description": "Riwayat audit gabungan: run pipeline Dagster + aksi copilot/console (audit_event) — siapa/apa melakukan apa, kapan, dan hasilnya.",
+        "description": "Audit history: Dagster pipeline runs plus copilot and console actions (who did what, when, and the outcome).",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
 fn list_classification_rules_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_classification_rules",
-        "description": "Daftar klasifikasi data per aset/kolom (public/internal/confidential/restricted) — hasil observasi ClickHouse digabung dengan aturan yang sudah ditulis (authored).",
+        "description": "Data classification per asset and column (public/internal/confidential/restricted): what was observed plus the rules that were written.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
 fn list_quality_rules_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_quality_rules",
-        "description": "Daftar aturan & hasil kualitas data (completeness/uniqueness/dll) — hasil observasi ClickHouse digabung dengan aturan yang sudah ditulis (authored).",
+        "description": "Data quality rules (completeness, uniqueness, ...) and their last results: what was observed plus the rules that were written.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
 fn get_cdc_health_schema() -> Value {
     json!({ "type": "function", "function": { "name": "get_cdc_health",
-        "description": "Kesehatan replication slot CDC (lag, WAL retained, status) per connector — untuk mendeteksi slot yang macet/tertinggal sebelum memenuhi disk database sumber.",
+        "description": "Health of CDC replication slots per connector: status, lag and WAL retained, to catch a stuck slot before it fills the source database's disk.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
 fn get_maintenance_metrics_schema() -> Value {
     json!({ "type": "function", "function": { "name": "get_maintenance_metrics",
-        "description": "Riwayat run maintenance Bronze (remove_orphan_files): file data/manifest yatim yang dihapus, per tabel. Catatan: expire_snapshots DITOLAK ClickHouse untuk tabel Iceberg berkatalog (Code: 48), jadi verb itu hanya tercatat sebagai skip, bukan hasil. Baca-saja — pakai run_bronze_maintenance untuk benar-benar menjalankan maintenance.",
+        "description": "History of Bronze Iceberg maintenance runs (remove_orphan_files): orphan data and manifest files removed per table. expire_snapshots is refused by ClickHouse for catalog-managed Iceberg tables and is recorded as skipped. Read-only.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
@@ -460,7 +466,7 @@ fn get_maintenance_metrics_schema() -> Value {
 
 fn run_bronze_maintenance_schema() -> Value {
     json!({ "type": "function", "function": { "name": "run_bronze_maintenance",
-        "description": "Jalankan maintenance Bronze SEKARANG (job Dagster bronze_maintenance_job). Tindakan ini MENERAPKAN perubahan — menghapus file data/manifest Iceberg yatim (orphan) yang sudah tidak dipakai snapshot mana pun. Ini BUKAN dry run: tidak ada mode dry-run terpisah di build ini (satu job selalu menjalankan dry-run lalu applied run sekaligus). Tindakan ini butuh persetujuan manusia sebelum dijalankan.",
+        "description": "Run Bronze maintenance now (Dagster bronze_maintenance_job). This APPLIES changes: orphan Iceberg data and manifest files are deleted. It is not a dry run. Needs human approval before it runs.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
@@ -468,13 +474,13 @@ fn run_bronze_maintenance_schema() -> Value {
 
 fn list_workloads_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_workloads",
-        "description": "Daftar query ClickHouse yang sedang berjalan sekarang (workload), beserta id (\"w-<n>\") yang dipakai kill_query.",
+        "description": "ClickHouse queries running right now, with the ids (\"w-<n>\") kill_query uses.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
 fn kill_query_schema() -> Value {
     json!({ "type": "function", "function": { "name": "kill_query",
-        "description": "Hentikan paksa satu query ClickHouse yang sedang berjalan (KILL QUERY sungguhan, by id dari list_workloads, mis. \"w-0\"). Tindakan ini butuh persetujuan manusia sebelum dijalankan.",
+        "description": "Stop one running ClickHouse query (a real KILL QUERY, by id from list_workloads, e.g. \"w-0\"). Needs human approval before it runs.",
         "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
             "required": ["id"] } } })
 }
@@ -483,17 +489,17 @@ fn kill_query_schema() -> Value {
 
 fn export_gold_mart_schema() -> Value {
     json!({ "type": "function", "function": { "name": "export_gold_mart",
-        "description": "Ekspor satu mart Gold (serving.<mart>) ke tabel Iceberg Gold lewat Lakekeeper. PENTING: ekspor ini APPEND-ONLY — menjalankan ulang akan MENAMBAH baris baru (dengan timestamp _exported_at baru), bukan menggantikan yang lama. Konsumen tabel Iceberg-nya harus memfilter _exported_at sendiri; tool ini tidak idempoten.",
+        "description": "Export one Gold mart (serving.<mart>) to its Iceberg Gold table through Lakekeeper. Append-only: running it again adds the rows again with a new _exported_at; it does not replace them.",
         "parameters": { "type": "object", "properties": {
-            "mart": { "type": "string", "description": "nama mart Gold, mis. mart_wisman" } },
+            "mart": { "type": "string", "description": "Gold mart name, e.g. mart_sales" } },
             "required": ["mart"] } } })
 }
 
 fn get_gold_export_schema() -> Value {
     json!({ "type": "function", "function": { "name": "get_gold_export",
-        "description": "Baca balik tabel Iceberg Gold (by mart) lewat Lakekeeper: jumlah baris & format version saat ini — bukti independen dari klaim export_gold_mart, tidak menyentuh ClickHouse sama sekali.",
+        "description": "Read a Gold Iceberg table back (by mart) through Lakekeeper: its row count and format version, independent of ClickHouse.",
         "parameters": { "type": "object", "properties": {
-            "mart": { "type": "string", "description": "nama mart Gold, mis. mart_wisman" } },
+            "mart": { "type": "string", "description": "Gold mart name, e.g. mart_sales" } },
             "required": ["mart"] } } })
 }
 
@@ -521,13 +527,13 @@ fn get_gold_export_schema() -> Value {
 
 fn draft_policy_schema() -> Value {
     json!({ "type": "function", "function": { "name": "draft_policy",
-        "description": "Buat DRAFT kebijakan (policy) governance baru — SELALU berstatus draft, tidak pernah langsung aktif. Mengaktifkan kebijakan tetap aksi manusia di console (Governance → Policies).",
+        "description": "Draft a new governance policy. It is always saved as a draft, never active; activating it stays a human action in the console (Governance -> Policies).",
         "parameters": { "type": "object", "properties": {
             "name": { "type": "string" },
-            "kind": { "type": "string", "description": "mis. \"Row filter\", \"Agent autonomy\"" },
-            "subjects": { "type": "string", "description": "siapa/apa yang dikenai kebijakan" },
-            "resources": { "type": "string", "description": "apa yang dikenai kebijakan" },
-            "effect": { "type": "string", "description": "mis. \"Permit with obligation\", \"Require approval\"" },
+            "kind": { "type": "string", "description": "e.g. \"Row filter\", \"Agent autonomy\"" },
+            "subjects": { "type": "string", "description": "who or what the policy applies to" },
+            "resources": { "type": "string", "description": "which data the policy covers" },
+            "effect": { "type": "string", "description": "e.g. \"Permit with obligation\", \"Require approval\"" },
             "conditions": { "type": "string" },
             "owner": { "type": "string" } },
             "required": ["name", "kind", "subjects", "resources", "effect"] } } })
@@ -535,7 +541,7 @@ fn draft_policy_schema() -> Value {
 
 fn draft_classification_rule_schema() -> Value {
     json!({ "type": "function", "function": { "name": "draft_classification_rule",
-        "description": "Tulis aturan klasifikasi/masking baru untuk sebuah aset (opsional kolom tertentu). Selalu masuk sebagai \"needs-review\" — tidak ada status aktif terpisah di build ini; peninjauan tetap aksi manusia di console.",
+        "description": "Write a new classification or masking rule for an asset (optionally one column). It is saved as needs-review; review stays a human action in the console.",
         "parameters": { "type": "object", "properties": {
             "asset": { "type": "string" },
             "column": { "type": "string" },
@@ -546,14 +552,151 @@ fn draft_classification_rule_schema() -> Value {
 
 fn draft_quality_rule_schema() -> Value {
     json!({ "type": "function", "function": { "name": "draft_quality_rule",
-        "description": "Tulis aturan kualitas data baru untuk sebuah aset. Rule yang baru ditulis SELALU berstatus \"warning\" (belum pernah dievaluasi) — tidak ada status aktif terpisah di build ini.",
+        "description": "Write a new data quality rule for an asset. A new rule is saved as a warning (not yet evaluated).",
         "parameters": { "type": "object", "properties": {
             "name": { "type": "string" },
             "asset": { "type": "string" },
-            "dimension": { "type": "string", "description": "mis. completeness, uniqueness, accuracy" },
-            "threshold": { "type": "string", "description": "mis. \">= 95%\"" },
+            "dimension": { "type": "string", "description": "e.g. completeness, uniqueness, accuracy" },
+            "threshold": { "type": "string", "description": "e.g. \">= 95%\"" },
             "severity": { "type": "string", "enum": ["critical", "high", "medium", "low", "info"] } },
             "required": ["name", "asset", "dimension", "threshold", "severity"] } } })
+}
+
+fn get_ingest_spec_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "get_ingest_spec",
+        "description": "Read a connector's ingest spec: its adapter (sql, cdc, files, rest, sheets, mongodb, kafka, sftp), ingest mode, dial (how to reach the source), the source objects it ingests and the Bronze table each lands in, and its schedule. Null fields mean ingest was never set up.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "connector id, from list_connectors" } },
+            "required": ["id"] } } })
+}
+
+fn set_ingest_spec_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "set_ingest_spec",
+        "description": "Set what a connector ingests into Bronze. Call get_ingest_spec and discover_source first. adapter and dial must match the connector's type; each source object names a source table (or endpoint, file) and the Bronze table it lands in. Example for a Postgres table: adapter \"sql\", ingestMode \"batch\", dial {\"driver\":\"postgres\",\"host\":\"db\",\"port\":5432,\"database\":\"shop\",\"user\":\"reader\"}, sourceObjects [{\"name\":\"public.orders\",\"target\":\"orders\"}], scheduleCron \"0 * * * *\". The server validates the dial and refuses internal addresses.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "connector id" },
+            "adapter": { "type": "string", "enum": ["sql", "cdc", "files", "rest", "sheets", "mongodb", "kafka", "sftp"] },
+            "ingestMode": { "type": "string", "enum": ["batch", "cdc", "stream"] },
+            "dial": { "type": "object", "description": "how to reach the source; fields depend on the adapter" },
+            "sourceObjects": { "type": "array", "items": { "type": "object", "properties": {
+                "name": { "type": "string", "description": "source table (schema.table), endpoint or file" },
+                "incrementalKey": { "type": "string", "description": "optional column for incremental reads" },
+                "target": { "type": "string", "description": "Bronze table name it lands in" } },
+                "required": ["name", "target"] } },
+            "scheduleCron": { "type": "string", "description": "cron schedule for batch ingest, optional" } },
+            "required": ["id", "adapter", "ingestMode", "dial", "sourceObjects"] } } })
+}
+
+fn discover_source_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "discover_source",
+        "description": "Connect to a connector's source and list the tables (and their columns) that could be ingested. Read-only on the source. Returns supported:false for source types this build cannot list.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "connector id" },
+            "schema": { "type": "string", "description": "optional schema to list, e.g. public" } },
+            "required": ["id"] } } })
+}
+
+fn run_ingest_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "run_ingest",
+        "description": "Run one connector's ingest now: reads its source objects into Bronze (the same as Run now in the console). The connector needs an ingest spec first. A CDC connector returns supported:false: Debezium streams it continuously.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "connector id" } },
+            "required": ["id"] } } })
+}
+
+fn list_ingest_runs_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_ingest_runs",
+        "description": "Recent ingest runs of one connector: when each ran, which object, rows written, and success or the reason it failed.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "connector id" } },
+            "required": ["id"] } } })
+}
+
+fn rotate_connector_credential_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "rotate_connector_credential",
+        "description": "Point a connector's credential slot at a new credential. The server derives the credential name from the connector id; you choose only the slot, where it is read from (env or file) and its kind. The new credential is tested before it is saved. Needs human approval before it runs.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "connector id" },
+            "slot": { "type": "string", "enum": ["primary", "secondary"] },
+            "source": { "type": "string", "enum": ["env", "file"] },
+            "kind": { "type": "string", "enum": ["password", "secret_key", "access_key", "api_key", "token", "private_key"] } },
+            "required": ["id", "slot", "source", "kind"] } } })
+}
+
+fn create_pipeline_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "create_pipeline",
+        "description": "Author a new pipeline that reads a source table, applies transforms and writes a target table. It is saved as a draft; mark_pipeline_ready makes it runnable. Zones: bronze, silver, gold. Transforms use a fixed vocabulary, one per entry: dedupe(col), filter(col = 'value') with = != < > <= >=, rename(old,new), cast(col,Int64) with String Int32 Int64 Float64 Boolean Date DateTime UUID, select(col1,col2).",
+        "parameters": { "type": "object", "properties": {
+            "name": { "type": "string" },
+            "description": { "type": "string" },
+            "sourceZone": { "type": "string", "enum": ["bronze", "silver", "gold"] },
+            "sourceTable": { "type": "string" },
+            "targetZone": { "type": "string", "enum": ["bronze", "silver", "gold"] },
+            "targetTable": { "type": "string" },
+            "transforms": { "type": "array", "items": { "type": "string" } },
+            "incrementalColumn": { "type": "string", "description": "optional column for incremental loads" },
+            "schedule": { "type": "string", "description": "\"manual\" or a cron expression" } },
+            "required": ["name", "sourceZone", "sourceTable", "targetZone", "targetTable"] } } })
+}
+
+fn get_pipeline_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "get_pipeline",
+        "description": "One pipeline's detail: its definition (source, transforms, target), op graph, schedule and recent runs.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "pipeline id from list_pipelines (pl-… for an authored pipeline, or a Dagster job name)" } },
+            "required": ["id"] } } })
+}
+
+fn mark_pipeline_ready_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "mark_pipeline_ready",
+        "description": "Move an authored pipeline (pl-…) from draft to ready, so the orchestrator builds a job for it and trigger_pipeline can run it.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string", "description": "authored pipeline id (pl-…)" } },
+            "required": ["id"] } } })
+}
+
+fn list_iceberg_tables_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_iceberg_tables",
+        "description": "The Iceberg tables in the lakehouse warehouse (Lakekeeper): with namespace, that namespace's tables; without, every namespace with its tables, including Bronze and exported Gold. Each table has its format version, current snapshot, last update, files, records and size.",
+        "parameters": { "type": "object", "properties": {
+            "namespace": { "type": "string", "description": "optional, e.g. bronze or gold" } } } } })
+}
+
+fn describe_iceberg_table_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "describe_iceberg_table",
+        "description": "One Iceberg table: schema (columns and types), partition spec, and recent snapshots with their operation, time and record counts.",
+        "parameters": { "type": "object", "properties": {
+            "namespace": { "type": "string" },
+            "table": { "type": "string" } },
+            "required": ["namespace", "table"] } } })
+}
+
+fn get_table_maintenance_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "get_table_maintenance",
+        "description": "One Iceberg table's maintenance policy (snapshots to keep, orphan-file age, small-file compaction, schedule) and its last maintenance status.",
+        "parameters": { "type": "object", "properties": {
+            "namespace": { "type": "string" },
+            "table": { "type": "string" } },
+            "required": ["namespace", "table"] } } })
+}
+
+fn set_table_maintenance_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "set_table_maintenance",
+        "description": "Set one Iceberg table's maintenance policy, read by the nightly maintenance job. Send the whole policy.",
+        "parameters": { "type": "object", "properties": {
+            "namespace": { "type": "string" },
+            "table": { "type": "string" },
+            "snapshotsToKeep": { "type": "integer", "description": "newest snapshots to keep, optional" },
+            "orphanAgeHours": { "type": "integer", "description": "remove orphan files older than this, optional" },
+            "compactSmallFiles": { "type": "boolean" },
+            "schedule": { "type": "string", "description": "cron schedule, optional" } },
+            "required": ["namespace", "table", "compactSmallFiles"] } } })
+}
+
+fn get_capacity_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "get_capacity",
+        "description": "Storage capacity: each object-storage bucket's size and growth from the daily capacity snapshot, and ClickHouse's bytes on disk.",
+        "parameters": { "type": "object", "properties": {} } } })
 }
 
 /// The AI Copilot's full tool table, in the exact order the LLM sees them
@@ -577,6 +720,12 @@ pub static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         name: "list_datasets",
         schema: list_datasets_schema,
+        risk: Risk::Read,
+        permission: "catalog:read",
+    },
+    ToolSpec {
+        name: "lakehouse_overview",
+        schema: lakehouse_overview_schema,
         risk: Risk::Read,
         permission: "catalog:read",
     },
@@ -890,6 +1039,90 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::WriteLow,
         permission: "",
     },
+    ToolSpec {
+        name: "get_ingest_spec",
+        schema: get_ingest_spec_schema,
+        risk: Risk::Read,
+        permission: "ingest:read",
+    },
+    ToolSpec {
+        name: "set_ingest_spec",
+        schema: set_ingest_spec_schema,
+        risk: Risk::WriteLow,
+        permission: "connector:manage",
+    },
+    ToolSpec {
+        name: "discover_source",
+        schema: discover_source_schema,
+        risk: Risk::Read,
+        permission: "connector:manage",
+    },
+    ToolSpec {
+        name: "run_ingest",
+        schema: run_ingest_schema,
+        risk: Risk::WriteLow,
+        permission: "connector:manage",
+    },
+    ToolSpec {
+        name: "list_ingest_runs",
+        schema: list_ingest_runs_schema,
+        risk: Risk::Read,
+        permission: "connector:manage",
+    },
+    ToolSpec {
+        name: "rotate_connector_credential",
+        schema: rotate_connector_credential_schema,
+        risk: Risk::WriteHigh,
+        permission: "connector:manage",
+    },
+    ToolSpec {
+        name: "create_pipeline",
+        schema: create_pipeline_schema,
+        risk: Risk::WriteLow,
+        permission: "pipeline:write",
+    },
+    ToolSpec {
+        name: "get_pipeline",
+        schema: get_pipeline_schema,
+        risk: Risk::Read,
+        permission: "pipeline:read",
+    },
+    ToolSpec {
+        name: "mark_pipeline_ready",
+        schema: mark_pipeline_ready_schema,
+        risk: Risk::WriteLow,
+        permission: "pipeline:write",
+    },
+    ToolSpec {
+        name: "list_iceberg_tables",
+        schema: list_iceberg_tables_schema,
+        risk: Risk::Read,
+        permission: "catalog:read",
+    },
+    ToolSpec {
+        name: "describe_iceberg_table",
+        schema: describe_iceberg_table_schema,
+        risk: Risk::Read,
+        permission: "catalog:read",
+    },
+    ToolSpec {
+        name: "get_table_maintenance",
+        schema: get_table_maintenance_schema,
+        risk: Risk::Read,
+        permission: "catalog:read",
+    },
+    ToolSpec {
+        name: "set_table_maintenance",
+        schema: set_table_maintenance_schema,
+        risk: Risk::WriteLow,
+        permission: "governance:write",
+    },
+    ToolSpec {
+        name: "get_capacity",
+        schema: get_capacity_schema,
+        risk: Risk::Read,
+        permission: "catalog:read",
+    },
 ];
 
 /// The `OpenAI`-compatible `tools` schema array, matching
@@ -903,7 +1136,7 @@ pub fn tool_schemas() -> Vec<Value> {
 }
 
 /// Looks up a tool by name. `None` means the name is not a registered
-/// tool at all (the "tool tak dikenal" case in
+/// tool at all (the "unknown tool" case in
 /// [`super::tools::run_tool`]), as distinct from a registered tool this
 /// mode/principal is not allowed to call.
 #[must_use]
@@ -940,12 +1173,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_has_forty_seven_entries() {
+    fn tool_schemas_has_sixty_two_entries() {
         // 15 pre-T1 tools + 19 Tier 1 operations tools (5 alerts + 4
         // connectors + 7 pipelines + 3 saved queries) + 13 Tier 2 tools
         // (5 governance reads + 1 maintenance + 2 workloads + 2 gold
-        // export + 3 governance drafts).
-        assert_eq!(tool_schemas().len(), 47);
+        // export + 3 governance drafts) + `lakehouse_overview` + 14
+        // lakehouse-operation tools (6 ingest, 3 pipeline authoring, 4
+        // Iceberg table, 1 capacity).
+        assert_eq!(tool_schemas().len(), 62);
     }
 
     /// Characterization snapshot (T0.1): `tool_schemas()`, now derived

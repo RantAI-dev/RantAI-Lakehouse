@@ -43,7 +43,7 @@ pub(super) async fn run_sql(
 ) -> Value {
     let sql = arg_str(args, "sql");
     if !crate::routes::agent::is_read_only_sql(&sql) {
-        return json!({ "error": "Hanya SELECT diizinkan." });
+        return json!({ "error": "Only a read-only SELECT is allowed." });
     }
     // Same fail-closed shape `tools::queries::run_saved_query` uses for a
     // headless (schedule/service-token) caller with no interactive
@@ -53,8 +53,8 @@ pub(super) async fn run_sql(
     // so a headless caller is refused without spending that call at all.
     let Some(principal) = principal else {
         return json!({
-            "error": "menjalankan SQL memerlukan pengguna yang terautentikasi; panggilan ini \
-                       dipicu oleh jadwal, yang tidak memiliki pengguna untuk dijalankan",
+            "error": "running SQL needs a signed-in user; this call came from a schedule, \
+                       which has no user to run as",
         });
     };
     // WS7 item F4: `is_read_only_sql` above is a regex-shaped first
@@ -72,10 +72,81 @@ pub(super) async fn run_sql(
     }
     let body = axum::body::Bytes::from(json!({ "sql": sql }).to_string());
     let extension = Some(axum::Extension(principal.clone()));
-    api_result_to_value(
+    let result = api_result_to_value(
         crate::routes::query::run(axum::extract::State(state.clone()), extension, body).await,
     )
-    .await
+    .await;
+    compact_query_result(result)
+}
+
+/// Rows a `run_sql` result hands the model.
+const MAX_RESULT_ROWS: usize = 100;
+
+/// `routes::query::run`'s response, reduced to what the model needs.
+///
+/// The full response carries an id, engine metrics and a plan the model
+/// never uses, and a 700-row result was cut at 8,000 characters in the
+/// middle of a JSON object, so the model read a broken fragment as data.
+/// Now the rows are capped at [`MAX_RESULT_ROWS`] with an explicit note
+/// saying how many more there were and what to do instead, and an error
+/// keeps its message but loses the engine boilerplate
+/// ([`clean_sql_error`]).
+fn compact_query_result(result: Value) -> Value {
+    let Value::Object(mut body) = result else {
+        return result;
+    };
+    if let Some(Value::String(err)) = body.get("error") {
+        return json!({
+            "error": clean_sql_error(err),
+            "hint": "Check table and column names against the DATA MAP and fix the query.",
+        });
+    }
+    let rows = match body.remove("rows") {
+        Some(Value::Array(rows)) => rows,
+        _ => Vec::new(),
+    };
+    let total = rows.len();
+    let shown: Vec<Value> = rows.into_iter().take(MAX_RESULT_ROWS).collect();
+    let mut out = Map::new();
+    out.insert(
+        "columns".to_owned(),
+        body.remove("columns").unwrap_or(Value::Null),
+    );
+    out.insert("rows".to_owned(), Value::Array(shown));
+    out.insert("rowCount".to_owned(), json!(total));
+    if total > MAX_RESULT_ROWS {
+        out.insert(
+            "note".to_owned(),
+            json!(format!(
+                "This display is cut off: only the first {MAX_RESULT_ROWS} of the {total} rows \
+                 the query returned are shown. The data itself is complete; do not describe it \
+                 as partial or missing. To report totals, rankings or per-period figures, run a \
+                 new query that aggregates in SQL (GROUP BY, ORDER BY … LIMIT) instead of \
+                 adding up these rows."
+            )),
+        );
+    }
+    if body.get("truncated") == Some(&Value::Bool(true)) {
+        out.insert(
+            "truncated".to_owned(),
+            json!("the engine's row limit cut this result; aggregate in SQL"),
+        );
+    }
+    Value::Object(out)
+}
+
+/// A `ClickHouse` error for the query's own author: the message and its
+/// error name, without the `Code: N. DB::Exception:` prefix, the server
+/// version suffix, or any stack trace, capped in length. The model needs
+/// the message to fix its SQL; it never needs the rest.
+pub(super) fn clean_sql_error(err: &str) -> String {
+    let first_line = err.lines().next().unwrap_or("");
+    let body = first_line
+        .find("DB::Exception:")
+        .map_or(first_line, |i| &first_line[i + "DB::Exception:".len()..])
+        .trim();
+    let body = body.find(" (version ").map_or(body, |i| &body[..i]).trim();
+    body.chars().take(400).collect()
 }
 
 /// Dry-runs `args["sql"]` via `ClickHouse`'s own `EXPLAIN AST`, refusing
@@ -110,7 +181,9 @@ pub(super) async fn dry_run_sql(ch: &ChClient, args: &Map<String, Value>) -> Val
     // body `EXPLAIN` actually produces.
     let body = match ch.raw_bytes(&format!("EXPLAIN AST {sql}"), None).await {
         Ok(b) => b,
-        Err(err) => return json!({ "error": format!("dry run gagal: {err}") }),
+        Err(err) => {
+            return json!({ "error": format!("the query could not be parsed: {}", clean_sql_error(&err.to_string())) });
+        }
     };
     let text = String::from_utf8_lossy(&body);
     let first_line = text.lines().next().unwrap_or("").trim().to_owned();
@@ -118,27 +191,108 @@ pub(super) async fn dry_run_sql(ch: &ChClient, args: &Map<String, Value>) -> Val
         return json!({});
     }
     let kind = first_line.split_whitespace().next().unwrap_or("unknown");
-    json!({ "error": format!("hanya SELECT yang diizinkan (EXPLAIN AST melaporkan {kind})") })
+    json!({ "error": format!("only SELECT is allowed (EXPLAIN AST reported {kind})") })
 }
 
-pub(super) async fn list_datasets(ch: &ChClient, args: &Map<String, Value>) -> Value {
-    let rows = match ch
+/// `primer`/`sekunder` names where a dataset comes from, not a layer. The
+/// tools used to hand the raw `tier` word to the model, which then
+/// described the lakehouse as "primer" and "sekunder" data instead of
+/// Bronze/Silver/Gold; they now say what it means.
+fn source_kind(tier: &str) -> &'static str {
+    match tier {
+        "primer" => "primary source",
+        "sekunder" => "secondary source",
+        _ => "not recorded",
+    }
+}
+
+/// `"primary"`/`"secondary"` (or the stored words) to the stored tier.
+fn tier_filter(raw: &str) -> &str {
+    match raw {
+        "primary" | "primary source" | "primer" => "primer",
+        "secondary" | "secondary source" | "sekunder" => "sekunder",
+        _ => "",
+    }
+}
+
+/// Row counts of every table in `serving` and `silver`, keyed
+/// `"db.table"`. `None` for a view (no stored row count).
+async fn table_rows(
+    ch: &ChClient,
+) -> Result<std::collections::HashMap<String, Option<u64>>, String> {
+    let rows = ch
         .rows(
-            &format!("SELECT slug, title, tier FROM {CATALOG_UNION} LIMIT 500"),
+            "SELECT database, name, toString(total_rows) AS n FROM system.tables \
+             WHERE database IN ('serving', 'silver')",
             None,
         )
         .await
-    {
-        Ok(r) => r,
-        Err(err) => return json!({ "error": err.to_string() }),
+        .map_err(|_| "the table list could not be read from ClickHouse".to_owned())?;
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let db = r.get("database").and_then(Value::as_str).unwrap_or("");
+            let name = r.get("name").and_then(Value::as_str).unwrap_or("");
+            let n = r
+                .get("n")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse().ok());
+            (format!("{db}.{name}"), n)
+        })
+        .collect())
+}
+
+/// Which layers a dataset served from Gold table `table` is present in.
+/// Bronze is where every registered dataset starts (the catalog record
+/// itself). Gold is `serving.<table>`. Silver has no recorded link to a
+/// dataset, so it is reported only when a Silver table of the same name
+/// exists; otherwise `present: false` with no row count, never a made-up
+/// zero (the old `describe_dataset` counted `silver.<table>`, found
+/// nothing, and reported `rows: 0` for data that was really there).
+fn layers_for(
+    slug: &str,
+    table: &str,
+    counts: &std::collections::HashMap<String, Option<u64>>,
+) -> Value {
+    let layer = |db: &str| {
+        let key = format!("{db}.{table}");
+        match counts.get(&key) {
+            Some(rows) => json!({ "table": key, "present": true, "rows": rows }),
+            None => json!({ "present": false }),
+        }
+    };
+    json!({
+        "bronze": { "registered": true, "dataset": slug },
+        "silver": layer("silver"),
+        "gold": layer("serving"),
+    })
+}
+
+pub(super) async fn list_datasets(ch: &ChClient, args: &Map<String, Value>) -> Value {
+    let Ok(rows) = ch
+        .rows(
+            &format!("SELECT slug, title, tier, table_name FROM {CATALOG_UNION} LIMIT 500"),
+            None,
+        )
+        .await
+    else {
+        return json!({ "error": "the dataset catalog could not be read (the catalog registry is not available)" });
     };
     let term = arg_str(args, "search").to_lowercase();
-    let tier = arg_str(args, "tier");
-    let hits: Vec<&Map<String, Value>> = rows
+    let wanted = tier_filter(&{
+        let source = arg_str(args, "source");
+        if source.is_empty() {
+            arg_str(args, "tier")
+        } else {
+            source
+        }
+    })
+    .to_owned();
+    let hits: Vec<Value> = rows
         .iter()
         .filter(|r| {
             let row_tier = r.get("tier").and_then(Value::as_str).unwrap_or("");
-            if !tier.is_empty() && row_tier != tier {
+            if !wanted.is_empty() && row_tier != wanted {
                 return false;
             }
             if term.is_empty() {
@@ -149,114 +303,191 @@ pub(super) async fn list_datasets(ch: &ChClient, args: &Map<String, Value>) -> V
             format!("{title} {slug}").to_lowercase().contains(&term)
         })
         .take(40)
+        .map(|r| {
+            let table = r.get("table_name").and_then(Value::as_str).unwrap_or("");
+            json!({
+                "slug": r.get("slug"),
+                "title": r.get("title"),
+                "sourceKind": source_kind(r.get("tier").and_then(Value::as_str).unwrap_or("")),
+                "goldTable": if table.is_empty() { Value::Null } else { json!(format!("serving.{table}")) },
+            })
+        })
         .collect();
     json!({ "total": hits.len(), "datasets": hits })
 }
 
 pub(super) async fn describe_dataset(ch: &ChClient, args: &Map<String, Value>) -> Value {
-    let slug = SqlLiteral::from(arg_str(args, "slug"));
-    let meta_rows = match ch
+    let slug_raw = arg_str(args, "slug");
+    let slug = SqlLiteral::from(slug_raw.as_str());
+    let Ok(meta_rows) = ch
         .rows(
             &format!(
-                "SELECT title, table_name, tier FROM {CATALOG_UNION} WHERE slug={slug} LIMIT 1"
+                "SELECT title, description, table_name, tier FROM {CATALOG_UNION} WHERE slug={slug} LIMIT 1"
             ),
             None,
         )
         .await
-    {
-        Ok(r) => r,
-        Err(err) => return json!({ "error": err.to_string() }),
+    else {
+        return json!({ "error": "the dataset catalog could not be read" });
     };
     let Some(meta) = meta_rows.first() else {
-        return json!({ "error": "dataset tidak ditemukan" });
-    };
-    let table = meta.get("table_name").and_then(Value::as_str).unwrap_or("");
-    let cols = match ch
-        .rows(
-            &format!(
-                "SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta.dataset_column` WHERE slug={slug} \
-                 UNION ALL SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta_sec.dataset_column` WHERE slug={slug}"
-            ),
-            None,
-        )
-        .await
-    {
-        Ok(r) => r,
-        Err(err) => return json!({ "error": err.to_string() }),
-    };
-    let rows = ch
-        .rows(
-            &format!("SELECT toString(count()) n FROM silver.`{table}`"),
-            None,
-        )
-        .await
-        .ok()
-        .and_then(|r| {
-            r.first()
-                .and_then(|row| row.get("n").and_then(Value::as_str))
-                .and_then(|s| s.parse::<i64>().ok())
-        })
-        .unwrap_or(0);
-    json!({
-        "title": meta.get("title"),
-        "tier": meta.get("tier"),
-        "table": table,
-        "rows": rows,
-        "columns": cols,
-    })
-}
-
-pub(super) async fn get_lineage(ch: &ChClient, args: &Map<String, Value>) -> Value {
-    let slug = SqlLiteral::from(arg_str(args, "slug"));
-    let meta_rows = match ch
-        .rows(
-            &format!("SELECT table_name, tier FROM {CATALOG_UNION} WHERE slug={slug} LIMIT 1"),
-            None,
-        )
-        .await
-    {
-        Ok(r) => r,
-        Err(err) => return json!({ "error": err.to_string() }),
-    };
-    let Some(meta) = meta_rows.first() else {
-        return json!({ "error": "dataset tidak ditemukan" });
+        return json!({ "error": format!("no dataset with slug '{slug_raw}'; call list_datasets for the slugs") });
     };
     let table = meta
         .get("table_name")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
-    let sekunder = meta.get("tier").and_then(Value::as_str) == Some("sekunder");
-    let escaped_table = SqlLiteral::from(table.as_str());
-    let cols = match ch
+    let cols = ch
         .rows(
-            &format!("SELECT kolom, tipe FROM _silver_meta.kolom_tipe WHERE tabel={escaped_table} LIMIT 100"),
+            &format!(
+                "SELECT key_asli AS name, tipe AS type, deskripsi AS description FROM lake.`bronze_meta.dataset_column` WHERE slug={slug} \
+                 UNION ALL SELECT key_asli, tipe, deskripsi FROM lake.`bronze_meta_sec.dataset_column` WHERE slug={slug}"
+            ),
             None,
         )
         .await
+        .unwrap_or_default();
+    let counts = table_rows(ch).await.unwrap_or_default();
+    json!({
+        "slug": slug_raw,
+        "title": meta.get("title"),
+        "description": meta.get("description"),
+        "sourceKind": source_kind(meta.get("tier").and_then(Value::as_str).unwrap_or("")),
+        "layers": layers_for(&slug_raw, &table, &counts),
+        "columns": cols,
+    })
+}
+
+/// One view of the whole lakehouse by layer: the registered Bronze
+/// datasets, and every Silver and Gold table with its row count. The
+/// question "what data do we have?" is answered from this, in layer terms,
+/// instead of from a dataset list that only knows source kinds.
+pub(super) async fn lakehouse_overview(state: &AppState, principal: Option<&Principal>) -> Value {
+    // The same shared-catalog rule the catalog route and the DATA MAP
+    // apply: this tool lists the shared catalog and every table in it.
+    let Some(principal) = principal else {
+        return json!({ "error": "the lakehouse overview needs a signed-in user" });
+    };
+    match crate::routes::catalog::catalog_tenant_refusal(
+        state,
+        principal,
+        &axum::http::HeaderMap::new(),
+    )
+    .await
     {
-        Ok(r) => r,
-        Err(err) => return json!({ "error": err.to_string() }),
+        Ok(None) => {}
+        Ok(Some(reason)) => return json!({ "supported": false, "reason": reason }),
+        Err(_) => return json!({ "error": "the shared-catalog rule could not be evaluated" }),
+    }
+    let ch = &state.clickhouse;
+    let counts = match table_rows(ch).await {
+        Ok(c) => c,
+        Err(err) => return json!({ "error": err }),
     };
-    let source_label = if sekunder {
-        "Sumber sekunder"
-    } else {
-        "Satu Data Jakarta"
+    let datasets = ch
+        .rows(
+            &format!(
+                "SELECT slug, title, tier, table_name FROM {CATALOG_UNION} ORDER BY slug LIMIT 500"
+            ),
+            None,
+        )
+        .await;
+    let (bronze, catalog_note) = match &datasets {
+        Ok(rows) => (
+            rows.iter()
+                .map(|r| {
+                    let table = r.get("table_name").and_then(Value::as_str).unwrap_or("");
+                    json!({
+                        "slug": r.get("slug"),
+                        "title": r.get("title"),
+                        "sourceKind": source_kind(r.get("tier").and_then(Value::as_str).unwrap_or("")),
+                        "servedFrom": format!("serving.{table}"),
+                    })
+                })
+                .collect::<Vec<_>>(),
+            Value::Null,
+        ),
+        Err(_) => (Vec::new(), json!("the dataset catalog could not be read, so Bronze datasets are not listed")),
     };
-    let mappings: Vec<String> = cols
-        .iter()
-        .map(|c| {
-            format!(
-                "{} → {}",
-                c.get("kolom").and_then(Value::as_str).unwrap_or(""),
-                c.get("tipe").and_then(Value::as_str).unwrap_or("")
-            )
+    let mut tables: Vec<(&String, &Option<u64>)> = counts.iter().collect();
+    tables.sort();
+    let layer = |db: &str| -> Vec<Value> {
+        tables
+            .iter()
+            .filter(|(k, _)| k.starts_with(&format!("{db}.")))
+            .map(|(k, rows)| json!({ "table": k, "rows": rows }))
+            .collect()
+    };
+    json!({
+        "bronze": { "description": "raw data landed from source systems (Iceberg)", "datasets": bronze, "note": catalog_note },
+        "silver": { "description": "cleaned, typed detail tables", "tables": layer("silver") },
+        "gold": { "description": "aggregated serving marts", "tables": layer("serving") },
+    })
+}
+
+/// The recorded lineage around a dataset or table: the same graph
+/// `GET /api/governance/lineage` serves (`routes::lineage`), so the
+/// copilot and the Lineage page can never disagree. `chain` lists every
+/// edge as one line for the model; `nodes`/`edges` carry the graph.
+pub(super) async fn get_lineage(
+    state: &AppState,
+    principal: Option<&Principal>,
+    args: &Map<String, Value>,
+) -> Value {
+    let focus = {
+        let slug = arg_str(args, "slug");
+        if slug.is_empty() {
+            arg_str(args, "focus")
+        } else {
+            slug
+        }
+    };
+    if focus.is_empty() {
+        return json!({ "error": "slug is required: a dataset slug or a table name such as serving.<table>" });
+    }
+    let Some(principal) = principal else {
+        return json!({ "error": "lineage needs a signed-in user" });
+    };
+    let Ok(graph) =
+        crate::routes::lineage::build(state, principal, &axum::http::HeaderMap::new(), &focus)
+            .await
+    else {
+        return json!({ "error": "lineage could not be built for this user" });
+    };
+    let labels: std::collections::HashMap<&str, &str> = graph["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| Some((n.get("id")?.as_str()?, n.get("label")?.as_str()?)))
+        .collect();
+    let chain: Vec<String> = graph["edges"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| {
+            let from = e.get("from")?.as_str()?;
+            let to = e.get("to")?.as_str()?;
+            Some(format!(
+                "{} -[{}]-> {}",
+                labels.get(from).unwrap_or(&from),
+                e.get("kind")?.as_str()?,
+                labels.get(to).unwrap_or(&to)
+            ))
         })
         .collect();
-    json!({
-        "chain": format!("{source_label} → bronze.{table} → silver.{table}"),
-        "columnMappings": mappings,
-    })
+    let mut out = graph.clone();
+    out["chain"] = if chain.is_empty() {
+        json!(
+            graph
+                .get("note")
+                .and_then(Value::as_str)
+                .unwrap_or("no recorded lineage")
+        )
+    } else {
+        json!(chain.join("\n"))
+    };
+    out
 }
 
 pub(super) async fn get_quality(ch: &ChClient) -> Value {
@@ -270,49 +501,57 @@ pub(super) async fn get_quality(ch: &ChClient) -> Value {
         .await
     {
         Ok(rows) => json!({ "summary": rows }),
-        Err(err) => json!({ "error": format!("quality belum tersedia: {err}") }),
+        // Measured on the local stack: the results table simply does not
+        // exist until a quality run writes it, and the raw
+        // `UNKNOWN_DATABASE` text went straight into the answer. Say what
+        // it means instead (AGENTS.md principle 4).
+        Err(err) if err.to_string().contains("UNKNOWN_DATABASE") || err.to_string().contains("UNKNOWN_TABLE") => json!({
+            "supported": false,
+            "reason": "no data quality checks have been run yet: there are no quality results to report",
+            "hint": "list_quality_rules shows the quality rules that are defined",
+        }),
+        Err(_) => json!({ "error": "the quality results could not be read from ClickHouse" }),
     }
 }
 
 pub(super) async fn describe_mart(ch: &ChClient, args: &Map<String, Value>) -> Value {
     let mart = strip_non_ident(&arg_str(args, "mart"));
     if mart.is_empty() {
-        let rows = match ch
+        let Ok(rows) = ch
             .rows(
                 "SELECT name, toString(total_rows) AS total_rows FROM system.tables \
                  WHERE database='serving' AND name NOT LIKE '%\\_baru' ORDER BY name",
                 None,
             )
             .await
-        {
-            Ok(r) => r,
-            Err(err) => return json!({ "error": err.to_string() }),
+        else {
+            return json!({ "error": "the Gold mart list could not be read from ClickHouse" });
         };
         let marts: Vec<Value> = rows
             .iter()
             .map(|r| {
-                let rows_n: i64 = r
+                // A view has no stored row count: report it as unknown,
+                // never as an empty table.
+                let rows_n: Option<i64> = r
                     .get("total_rows")
                     .and_then(Value::as_str)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
+                    .and_then(|s| s.parse().ok());
                 json!({ "mart": r.get("name"), "rows": rows_n })
             })
             .collect();
         return json!({ "marts": marts });
     }
-    let cols = match ch
+    let Ok(cols) = ch
         .rows(
             &format!("SELECT name, type FROM system.columns WHERE database='serving' AND table='{mart}' ORDER BY position"),
             None,
         )
         .await
-    {
-        Ok(r) => r,
-        Err(err) => return json!({ "error": err.to_string() }),
+    else {
+        return json!({ "error": "the mart's columns could not be read from ClickHouse" });
     };
     if cols.is_empty() {
-        return json!({ "error": format!("mart '{mart}' tidak ditemukan di serving.") });
+        return json!({ "error": format!("no Gold mart named '{mart}' in serving; call describe_mart with no argument for the list") });
     }
     let dimensions: Vec<&str> = cols
         .iter()
@@ -367,7 +606,7 @@ mod dry_run {
         args.insert("sql".to_owned(), json!("SELECT 1"));
         assert_eq!(
             dry_run_sql(&ch, &args).await,
-            json!({"error": "hanya SELECT yang diizinkan (EXPLAIN AST melaporkan unknown)"})
+            json!({"error": "only SELECT is allowed (EXPLAIN AST reported unknown)"})
         );
     }
 
@@ -381,7 +620,7 @@ mod dry_run {
         let result = dry_run_sql(&ch, &args).await;
         assert_eq!(
             result,
-            json!({"error": "hanya SELECT yang diizinkan (EXPLAIN AST melaporkan InsertQuery)"})
+            json!({"error": "only SELECT is allowed (EXPLAIN AST reported InsertQuery)"})
         );
     }
 
@@ -596,9 +835,8 @@ mod run_sql_delegation {
         assert_eq!(
             result,
             json!({
-                "error": "menjalankan SQL memerlukan pengguna yang terautentikasi; panggilan \
-                           ini dipicu oleh jadwal, yang tidak memiliki pengguna untuk \
-                           dijalankan",
+                "error": "running SQL needs a signed-in user; this call came from a schedule, \
+                           which has no user to run as",
             }),
             "expected the honest no-principal refusal, got {result}"
         );

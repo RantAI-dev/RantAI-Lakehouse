@@ -21,7 +21,9 @@
 // CREATION only ever happens from inside this module's own dispatch.
 pub(in crate::routes) mod audit;
 mod citations;
+mod data_map;
 mod gate;
+mod prompt;
 pub(in crate::routes) mod registry;
 pub(in crate::routes) mod tools;
 
@@ -32,13 +34,14 @@ use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_clickhouse::ChClient;
 use lakehouse_core::ApiError;
-use lakehouse_llm::{ChatOptions, LlmMessage, LlmMessageRole, ToolCall, ToolCallFunction};
+use lakehouse_llm::{
+    ChatOptions, HiddenSpans, LlmMessage, LlmMessageRole, StreamPiece, ToolCall, ToolCallFunction,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
-use crate::routes::agent::schema_context;
 use crate::state::AppState;
 
 // ── POST /api/ai/build-status ───────────────────────────────────────────
@@ -90,12 +93,6 @@ pub async fn build_status(
 }
 
 // ── POST /api/ai/chat ───────────────────────────────────────────────────
-
-const SYSTEM_BASE: &str = "Kamu AI Copilot untuk lakehouse pariwisata DKI Jakarta (RantAI Lakehouse).\n\nPanduan umum:\n- Untuk pertanyaan angka/data: pakai run_sql (SELECT ClickHouse). Cari tabel dulu\n  via list_datasets/describe_dataset kalau belum tahu skema. Utamakan serving.mart_*.\n- Untuk \"ada data apa / soal X\": list_datasets atau describe_dataset.\n- Untuk silsilah data: get_lineage. Untuk kualitas: get_quality.\n- Answer CONCISELY in English (Markdown allowed: tables, bold, lists),\n  berdasarkan HASIL TOOL yang nyata. JANGAN mengarang angka atau tabel.\n  Kalau tool error, katakan apa adanya.";
-
-const SYSTEM_ASK_SUFFIX: &str = "\n\nMODE: ASK (read-only). Kamu HANYA menjawab & menganalisis data — tidak\nmengubah/membangun apa pun (termasuk TIDAK membuat/menghapus chart). Kamu boleh\nmelihat dashboard (describe_mart/list_charts). Kalau user minta membangun data\natau membuat chart, sarankan pindah ke mode Build.";
-
-const SYSTEM_BUILD_SUFFIX: &str = "\n\nMODE: BUILD. Selain menjawab, kamu bisa MENGOPERASIKAN lakehouse:\n- Untuk \"bangun/segarkan Bronze/Silver/Gold\" atau \"refresh data\":\n  JELASKAN dulu rencananya singkat, lalu panggil trigger_lakehouse_build.\n- Setelah trigger, beri tahu user pipeline berjalan (statusnya tampil live).\n- Untuk \"bikin/tambah chart/dashboard soal X\" (BI lewat chat):\n  panggil describe_mart dulu, lalu create_chart dengan kolom yang benar-benar ada.\n- Untuk \"buatkan/sarankan dashboard soal X\" tanpa detail: panggil suggest_dashboard.\n- Untuk mengelompokkan: create_board dulu, lalu create_chart dengan board=<id>.\n- Untuk mengubah kartu: update_chart (kirim semua field dengan nilai baru).\n- Untuk alert/digest: list_alert_rules untuk lihat yang ada, create_alert_rule/\n  update_alert_rule untuk membuat/mengubah (tentukan mart, measure, agg, op,\n  threshold untuk alert; board untuk digest), run_alert_rule untuk menjalankan\n  satu rule sekarang (webhook/email BENERAN terkirim). delete_alert_rule\n  BUTUH PERSETUJUAN MANUSIA dulu sebelum benar-benar terhapus.\n- Untuk connector: list_connectors untuk lihat yang ada, create_connector untuk\n  mendaftarkan baru (secretRef WAJIB berupa referensi seperti \"env:NAMA\" atau\n  \"vault://...\", JANGAN PERNAH kredensial asli), test_connector untuk menguji\n  koneksi nyata. delete_connector BUTUH PERSETUJUAN MANUSIA dulu.\n- Untuk pipeline individual (bukan build utama): list_pipelines/\n  list_pipeline_runs untuk lihat status, trigger_pipeline/retry_pipeline_run\n  untuk menjalankan, resume_pipeline untuk mengaktifkan jadwal lagi.\n  pause_pipeline dan cancel_pipeline_run BUTUH PERSETUJUAN MANUSIA dulu.\n- Untuk saved query: save_query untuk menyimpan SQL bernama, list_saved_queries\n  untuk lihat daftar, run_saved_query untuk menjalankan ulang (hanya query baca\n  yang diizinkan, sama seperti Query Studio).\n- Untuk governance: get_audit_history (riwayat audit), list_classification_rules\n  dan list_quality_rules untuk lihat aturan yang ada, get_cdc_health untuk\n  kesehatan replication slot CDC, get_maintenance_metrics untuk riwayat\n  maintenance Bronze. draft_policy/draft_classification_rule/draft_quality_rule\n  untuk MENULIS aturan/kebijakan baru — SELALU tersimpan sebagai draft/belum\n  dievaluasi, mengaktifkan tetap aksi manusia di console.\n- Untuk maintenance Bronze: run_bronze_maintenance MENERAPKAN perubahan\n  (menghapus file data/manifest Iceberg yatim) — ini BUKAN dry run, dan BUTUH\n  PERSETUJUAN MANUSIA dulu sebelum benar-benar jalan.\n- Untuk workload ClickHouse: list_workloads untuk lihat query yang sedang\n  berjalan, kill_query untuk menghentikan paksa satu query (BUTUH PERSETUJUAN\n  MANUSIA dulu — ini KILL QUERY sungguhan).\n- Untuk Gold export: export_gold_mart untuk mengekspor satu mart ke Iceberg\n  (APPEND-ONLY — menjalankan ulang menambah baris, bukan menggantikan),\n  get_gold_export untuk membaca balik jumlah baris & format version-nya.\n- Tindakan yang butuh persetujuan manusia (delete_alert_rule, delete_connector,\n  pause_pipeline, cancel_pipeline_run, delete_chart, run_bronze_maintenance,\n  kill_query) TIDAK langsung jalan — beri tahu user bahwa permintaan sudah\n  masuk antrean persetujuan di /agents/approvals.\n- Kalau hasil tool berisi needs_confirmation: jawab SATU kalimat singkat saja,\n  mis. \"The chart draft is ready — review the preview below and confirm.\"\n  JANGAN mengulang konfigurasi/argumen (tipe chart, mart, kolom, judul, span,\n  limit) dan jangan minta user mengetik konfirmasi: UI sudah menampilkan\n  pratinjau lengkap beserta tombol konfirmasinya.";
 
 const MAX_ITER: u32 = 8;
 
@@ -158,6 +155,7 @@ struct ChatBody {
 pub async fn chat(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
+    headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
     let Ok(parsed) = serde_json::from_slice::<ChatBody>(&body) else {
@@ -169,7 +167,7 @@ pub async fn chat(
     };
     let principal = principal.map(|Extension(p)| p);
     let stream = parsed.stream;
-    let run = match prepare_chat(&state, principal.as_ref(), parsed).await {
+    let run = match prepare_chat(&state, principal.as_ref(), &headers, parsed).await {
         Ok(run) => run,
         Err(response) => return response,
     };
@@ -191,9 +189,68 @@ struct PreparedChat {
 
 /// Validates the body and assembles the system prompt, history and the tool
 /// list for this principal and mode. A bad body is a ready 400 response.
+/// The columns any masking policy covers, for [`data_map::data_map`]:
+/// sample values in the DATA MAP are read unmasked, so those columns are
+/// listed without samples. `None` when the policies cannot be read (no
+/// Postgres, or an error), in which case every text sample is withheld.
+async fn masked_columns(state: &AppState) -> Option<std::collections::HashSet<(String, String)>> {
+    let pg = state.pg.as_deref()?;
+    let policies = lakehouse_store::governance::list_policies(pg).await.ok()?;
+    let conditions: Vec<String> = policies.into_iter().filter_map(|p| p.conditions).collect();
+    Some(data_map::masked_columns(&conditions))
+}
+
+/// The system prompt: the rules for the mode, the DATA MAP (when the
+/// caller may read the shared catalog), the page the user is on, and the
+/// reply-language line last.
+async fn system_prompt(
+    state: &AppState,
+    principal: Option<&Principal>,
+    headers: &axum::http::HeaderMap,
+    is_build: bool,
+    context: &str,
+    latest_user: &str,
+) -> String {
+    let masked = masked_columns(state).await;
+    // The DATA MAP describes the shared, one-per-deployment catalog and
+    // carries sample values, so it follows the catalog route's own rule
+    // (`catalog::catalog_tenant_refusal`): a caller that route refuses gets
+    // no map, and one it cannot evaluate gets none either (fail closed).
+    let refusal = match principal {
+        Some(p) => crate::routes::catalog::catalog_tenant_refusal(state, p, headers)
+            .await
+            .unwrap_or(Some("the shared-catalog rule could not be evaluated")),
+        None => Some("no signed-in user"),
+    };
+    let schema = match refusal {
+        None => data_map::data_map(&state.clickhouse, masked.as_ref()).await,
+        Some(reason) => format!("(withheld: {reason})"),
+    };
+    let base = if is_build {
+        format!("{}{}", prompt::SYSTEM_BASE, prompt::SYSTEM_BUILD_SUFFIX)
+    } else {
+        format!("{}{}", prompt::SYSTEM_BASE, prompt::SYSTEM_ASK_SUFFIX)
+    };
+    let page_ctx: String = context.chars().take(800).collect();
+    let ctx_line = if page_ctx.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nCURRENT PAGE CONTEXT: {page_ctx}\nTailor your help, wording, and suggestions to where the user currently is."
+        )
+    };
+    (if schema.is_empty() {
+        base + "\n\nDATA MAP: unavailable right now (ClickHouse did not answer). Use describe_mart and run_sql to explore."
+    } else {
+        format!("{base}\n\nDATA MAP\n{schema}")
+    } + &ctx_line
+        + &prompt::closing(latest_user))
+}
+
 async fn prepare_chat(
     state: &AppState,
     principal: Option<&Principal>,
+    headers: &axum::http::HeaderMap,
     parsed: ChatBody,
 ) -> Result<PreparedChat, Response> {
     let perms = principal.map(|p| &p.permissions);
@@ -216,37 +273,35 @@ async fn prepare_chat(
     if history.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            ApiJson(json!({ "error": "messages kosong" })),
+            ApiJson(json!({ "error": "messages is empty" })),
         )
             .into_response());
     }
 
     let is_build = parsed.mode.as_deref() == Some("build");
-    let schema = schema_context(&state.clickhouse).await.unwrap_or_default();
-    let base = if is_build {
-        format!("{SYSTEM_BASE}{SYSTEM_BUILD_SUFFIX}")
-    } else {
-        format!("{SYSTEM_BASE}{SYSTEM_ASK_SUFFIX}")
-    };
-    let page_ctx: String = parsed
-        .context
-        .unwrap_or_default()
-        .chars()
-        .take(800)
-        .collect();
-    let ctx_line = if page_ctx.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\nCURRENT PAGE CONTEXT: {page_ctx}\nTailor your help, wording, and suggestions to where the user currently is."
-        )
-    };
-    let sys = if schema.is_empty() {
-        base
-    } else {
-        format!("{base}\n\nSKEMA TERSEDIA:\n{schema}")
-    } + &ctx_line;
+    let latest_user = parsed
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .map_or("", |m| m.content.as_str());
+    let sys = system_prompt(
+        state,
+        principal,
+        headers,
+        is_build,
+        parsed.context.as_deref().unwrap_or_default(),
+        latest_user,
+    )
+    .await;
 
+    let recent_user: Vec<&str> = parsed
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .map(|m| m.content.as_str())
+        .collect();
+    let relevant = prompt::select_tools(&recent_user);
     let allow: Option<std::collections::HashSet<String>> = parsed
         .tools
         .filter(|t| !t.is_empty())
@@ -260,12 +315,13 @@ async fn prepare_chat(
             if !is_build && is_write {
                 return false;
             }
-            if let Some(allow) = &allow
-                && !allow.contains(name)
-            {
-                return false;
+            if let Some(allow) = &allow {
+                // An explicit allowlist from the console's Tools menu is
+                // the user's own choice and wins over the per-turn
+                // selection.
+                return allow.contains(name);
             }
-            true
+            relevant.contains(name)
         })
         .collect();
 
@@ -294,6 +350,114 @@ fn report(progress: Progress<'_>, event: Value) -> bool {
     progress.is_none_or(|tx| tx.send(event).is_ok())
 }
 
+/// One model round. For a streaming client (`progress` set) the answer
+/// text goes out as `{"type":"delta","text":…}` events while the model
+/// writes it, with `MiniMax`'s tool-call XML held back so it never shows,
+/// and the model's reasoning (`<think>` content or `reasoning_content`) as
+/// `{"type":"reasoning","text":…}` for the console's "Thinking" box. The
+/// reasoning is never part of the answer or the saved `done` body. Text streamed in
+/// a round that ends in tool calls is only preamble: the client drops its
+/// draft on the next `tool`/`status` event, and the `done` body — checked
+/// by `citations::annotate_answer` — replaces whatever was streamed.
+async fn model_round(
+    state: &AppState,
+    messages: &[LlmMessage],
+    tools: &[Value],
+    progress: Progress<'_>,
+) -> Result<LlmMessage, lakehouse_llm::LlmError> {
+    let mut attempt = 0;
+    loop {
+        match model_round_once(state, messages, tools, progress).await {
+            Err(err) if attempt < RETRY_DELAYS.len() && is_transient(&err) => {
+                // A fresh `status` event makes the client drop whatever
+                // text the failed attempt had already streamed.
+                if !report(progress, json!({ "type": "status", "phase": "thinking" })) {
+                    return Err(err);
+                }
+                tokio::time::sleep(RETRY_DELAYS[attempt]).await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Waits before each retry of a transient LLM failure.
+///
+/// Measured on the local stack: in two full evaluation runs (23 chats
+/// each) the hosted model answered one call with a 5xx or a dropped
+/// connection, and that single failure cost the user the whole answer as
+/// "AI Copilot is unavailable". Two short retries recover from that without
+/// holding a chat much longer than the provider's own blip.
+const RETRY_DELAYS: [std::time::Duration; 2] = [
+    std::time::Duration::from_millis(1500),
+    std::time::Duration::from_secs(4),
+];
+
+/// A failure worth retrying: the connection failed, or the provider
+/// answered 408, 429 or a 5xx (529 included, some providers' "overloaded").
+/// A 4xx such as a bad key or a malformed request fails the same way every
+/// time, so it is never retried.
+fn is_transient(err: &lakehouse_llm::LlmError) -> bool {
+    match err {
+        lakehouse_llm::LlmError::Transport(_) => true,
+        lakehouse_llm::LlmError::Api(msg) => {
+            let status: u16 = msg
+                .strip_prefix("LLM ")
+                .and_then(|rest| rest.split(':').next())
+                .and_then(|code| code.trim().parse().ok())
+                .unwrap_or(0);
+            status == 408 || status == 429 || (500..=599).contains(&status)
+        }
+    }
+}
+
+/// Output-token cap for one model round.
+///
+/// The client's default (1,200) counts the model's reasoning too. Measured
+/// with `qwen3:4b`: a turn spent all 1,200 tokens reasoning and returned an
+/// empty answer after six minutes. A hosted model is billed only for the
+/// tokens it actually generates, so a higher cap costs nothing unless a
+/// round needs it.
+const ROUND_MAX_TOKENS: u32 = 4096;
+
+fn round_options() -> ChatOptions {
+    ChatOptions {
+        max_tokens: Some(ROUND_MAX_TOKENS),
+        ..ChatOptions::default()
+    }
+}
+
+async fn model_round_once(
+    state: &AppState,
+    messages: &[LlmMessage],
+    tools: &[Value],
+    progress: Progress<'_>,
+) -> Result<LlmMessage, lakehouse_llm::LlmError> {
+    if progress.is_none() {
+        return state
+            .llm
+            .chat_with_tools(messages, tools, round_options())
+            .await;
+    }
+    let mut tool_xml = HiddenSpans::new(&[
+        ("<minimax:tool_call>", "</minimax:tool_call>"),
+        ("<invoke ", "</invoke>"),
+    ]);
+    state
+        .llm
+        .chat_with_tools_streamed(messages, tools, round_options(), |piece| match piece {
+            StreamPiece::Text(text) => {
+                let visible = tool_xml.push(text);
+                visible.is_empty() || report(progress, json!({ "type": "delta", "text": visible }))
+            }
+            StreamPiece::Reasoning(text) => {
+                report(progress, json!({ "type": "reasoning", "text": text }))
+            }
+        })
+        .await
+}
+
 /// The agentic loop: ask the model, run the tools it calls (through
 /// [`gate::decide_by_name`]), feed the results back, until it answers
 /// without a tool call or [`MAX_ITER`] rounds pass. Returns the response
@@ -319,6 +483,24 @@ async fn run_chat(
     let mut tool_trace: Vec<Value> = Vec::new();
     let mut build_run_id: Option<String> = None;
     let mut chart_created = false;
+    let mut repaired = false;
+    let mut nudged = false;
+    // The conversation so far, which the citation check accepts as
+    // evidence (`citations::Evidence`): the system prompt, whose DATA MAP
+    // row counts, ranges and distinct counts were read from the data
+    // itself (a schema answer built from it had its table omitted before),
+    // the user's messages, and earlier answers restated in a follow-up.
+    let conversation: Vec<String> = messages
+        .iter()
+        .filter(|m| {
+            matches!(
+                m.role,
+                LlmMessageRole::System | LlmMessageRole::User | LlmMessageRole::Assistant
+            )
+        })
+        .filter_map(|m| m.content.clone())
+        .collect();
+    let conversation: Vec<&str> = conversation.iter().map(String::as_str).collect();
 
     for _ in 0..MAX_ITER {
         if !report(progress, json!({ "type": "status", "phase": "thinking" })) {
@@ -330,10 +512,7 @@ async fn run_chat(
                 Some("stopped"),
             ));
         }
-        let msg = state
-            .llm
-            .chat_with_tools(&messages, &tools, ChatOptions::default())
-            .await?;
+        let msg = model_round(state, &messages, &tools, progress).await?;
         messages.push(msg.clone());
 
         let mut calls: Vec<ToolCall> = msg.tool_calls.clone().unwrap_or_default();
@@ -341,13 +520,60 @@ async fn run_chat(
             calls.extend(parse_minimax_tool_calls(content));
         }
         if calls.is_empty() {
-            let answer = strip_tool_xml(msg.content.as_deref().unwrap_or(""));
+            let answer =
+                strip_repair_preamble(&strip_tool_xml(msg.content.as_deref().unwrap_or("")));
             // WS7 item F2: every number/table the model just printed is
             // checked against `tool_trace` — the actual record of what ran
             // this turn — before it ever reaches the caller. Applies the
             // same way whether this turn's answer streams (`stream_chat`)
             // or not: both paths return through this one `run_chat` body.
-            let annotated = citations::annotate_answer(&answer, &tool_trace);
+            if answer.trim().is_empty() && !nudged {
+                // A round with neither text nor a tool call (a small model
+                // that ran out of tokens while reasoning, or stopped early):
+                // ask once for the answer instead of returning a blank one.
+                nudged = true;
+                messages.push(LlmMessage {
+                    role: LlmMessageRole::User,
+                    content: Some(
+                        "Your last reply was empty. Answer the question now, from the tool \
+                         results above; call a tool first only if you still need data."
+                            .to_owned(),
+                    ),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+                continue;
+            }
+            let annotated = citations::annotate_answer_in(&answer, &tool_trace, &conversation);
+            let (numbers, omitted) = citations::flagged(&annotated);
+            if !repaired && (!numbers.is_empty() || omitted) {
+                // One repair round. Flagging a figure tells the user not to
+                // trust it, but still shows it; measured on the local stack,
+                // a follow-up answered with no tool call at all printed an
+                // invented yearly total next to a real one. The model gets
+                // the flagged figures back once and either looks them up or
+                // drops them. Its second answer is checked the same way and
+                // returned as it is, flags included.
+                repaired = true;
+                if !report(progress, json!({ "type": "status", "phase": "verifying" })) {
+                    return Ok(chat_response_body(
+                        "",
+                        &tool_trace,
+                        build_run_id.as_deref(),
+                        chart_created,
+                        Some("stopped"),
+                    ));
+                }
+                messages.push(LlmMessage {
+                    role: LlmMessageRole::User,
+                    content: Some(repair_request(&numbers, omitted)),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                });
+                continue;
+            }
             return Ok(chat_response_body(
                 &annotated,
                 &tool_trace,
@@ -470,7 +696,7 @@ async fn run_chat(
                 .take(8000)
                 .collect();
             if call.id.starts_with("mmx-") {
-                xml_feedback.push(format!("Hasil {}: {payload}", call.function.name));
+                xml_feedback.push(format!("Result of {}: {payload}", call.function.name));
             } else {
                 messages.push(LlmMessage {
                     role: LlmMessageRole::Tool,
@@ -485,7 +711,7 @@ async fn run_chat(
             messages.push(LlmMessage {
                 role: LlmMessageRole::User,
                 content: Some(format!(
-                    "HASIL TOOL:\n{}\n\nLanjutkan: pakai hasil ini untuk menjawab, atau panggil tool lain bila perlu.",
+                    "TOOL RESULTS:\n{}\n\nContinue: answer from these results, or call another tool if needed.",
                     xml_feedback.join("\n")
                 )),
                 tool_calls: None,
@@ -499,32 +725,87 @@ async fn run_chat(
     report(progress, json!({ "type": "status", "phase": "thinking" }));
     messages.push(LlmMessage {
         role: LlmMessageRole::User,
-        content: Some("Beri jawaban final ringkas dari hasil di atas.".to_owned()),
+        content: Some("Give your final answer now, concisely, from the results above.".to_owned()),
         tool_calls: None,
         tool_call_id: None,
         name: None,
     });
-    let final_msg = state
-        .llm
-        .chat_with_tools(&messages, &[], ChatOptions::default())
-        .await?;
+    let final_msg = model_round(state, &messages, &[], progress).await?;
     // WS7 item F2: the iteration-budget-exhausted final answer is checked
     // the same way as the normal return path — a model that runs out of
     // tool-calling turns is not exempt from citation checking.
-    let annotated = citations::annotate_answer(&final_msg.content.unwrap_or_default(), &tool_trace);
+    let annotated = citations::annotate_answer_in(
+        &final_msg.content.unwrap_or_default(),
+        &tool_trace,
+        &conversation,
+    );
     Ok(chat_response_body(
         &annotated,
         &tool_trace,
         build_run_id.as_deref(),
         chart_created,
-        Some("batas iterasi tool tercapai"),
+        Some("tool-call limit reached"),
     ))
+}
+
+/// Drops a narrated preamble before a `Final answer:` line. After a repair
+/// round a model sometimes explains its own correction first ("Now I have
+/// everything from a tool result… Final answer:"), measured on the local
+/// stack; the user should only see the answer. Text with no such line is
+/// returned unchanged.
+fn strip_repair_preamble(answer: &str) -> String {
+    let mut offset = 0;
+    for line in answer.split_inclusive('\n') {
+        let label = line
+            .trim()
+            .trim_matches(|c: char| c == '*' || c == '#' || c.is_whitespace())
+            .to_lowercase();
+        if label.starts_with("final answer") {
+            let rest = &line[line
+                .to_lowercase()
+                .find("answer")
+                .map_or(0, |i| i + "answer".len())..];
+            let rest = rest.trim_start_matches(|c: char| c == ':' || c == '*' || c.is_whitespace());
+            return format!("{rest}{}", &answer[offset + line.len()..])
+                .trim()
+                .to_owned();
+        }
+        offset += line.len();
+    }
+    answer.to_owned()
+}
+
+/// The message that asks the model to back or drop the figures the
+/// citation check flagged in its draft (see [`run_chat`]'s repair round).
+fn repair_request(numbers: &[String], table_omitted: bool) -> String {
+    let mut text = String::from(
+        "CHECK BEFORE ANSWERING. Your draft states figures that do not appear in any tool \
+         result in this conversation",
+    );
+    if !numbers.is_empty() {
+        let listed: Vec<&str> = numbers.iter().take(12).map(String::as_str).collect();
+        text.push_str(": ");
+        text.push_str(&listed.join("; "));
+    }
+    text.push('.');
+    if table_omitted {
+        text.push_str(" One of its tables has no figure backed by a tool result.");
+    }
+    text.push_str(
+        " Start by calling run_sql to check each figure (compute totals, differences, shares \
+         and percentages in the SQL itself). Remove any figure you cannot back with a tool \
+         result. Then reply with the complete final answer only, in the language of the \
+         user's question: no preamble, no mention of this check, no \"Final answer:\" label.",
+    );
+    text
 }
 
 /// `stream: true`: the same loop, answered as NDJSON — one JSON object per
 /// line. `{"type":"status","phase":"thinking"}` before each model round and
 /// `{"type":"tool","tool":…}` before each tool call let the client say what
-/// is happening; the last line is `{"type":"done","body":…}` (the plain
+/// is happening, `{"type":"delta","text":…}` carries answer text as the
+/// model writes it and `{"type":"reasoning","text":…}` its reasoning
+/// ([`model_round`]); the last line is `{"type":"done","body":…}` (the plain
 /// response body) or `{"type":"error","status":…,"body":…}`. When the
 /// client disconnects, the loop stops before its next round or tool.
 fn stream_chat(state: AppState, principal: Option<Principal>, run: PreparedChat) -> Response {
@@ -619,7 +900,7 @@ pub async fn tool_call(
     let Some(spec) = registry::find(&parsed.tool) else {
         return (
             StatusCode::BAD_REQUEST,
-            ApiJson(json!({ "error": format!("tool tak dikenal: {}", parsed.tool) })),
+            ApiJson(json!({ "error": format!("unknown tool: {}", parsed.tool) })),
         )
             .into_response();
     };
@@ -736,10 +1017,33 @@ fn llm_unavailable(err: &lakehouse_llm::LlmError) -> Response {
 
 fn llm_unavailable_body(err: &lakehouse_llm::LlmError) -> Value {
     json!({
-        "error": "AI Copilot tak tersedia",
-        "detail": err.to_string(),
-        "hint": "Set LLM_KEY (MiniMax) di .env.local.",
+        "error": "AI Copilot is unavailable",
+        "detail": llm_error_detail(err),
+        "hint": "Check LLM_URL, LLM_MODEL and LLM_KEY on the API service.",
     })
+}
+
+/// A fixed description of `err` for the response body. The provider's own
+/// error text (which can echo request details or account information)
+/// never reaches the caller (`AGENTS.md` principle 4); only the HTTP status
+/// it answered with is kept, since that is what an operator acts on.
+fn llm_error_detail(err: &lakehouse_llm::LlmError) -> String {
+    match err {
+        lakehouse_llm::LlmError::Transport(_) => {
+            "The language model service could not be reached.".to_owned()
+        }
+        lakehouse_llm::LlmError::Api(msg) => {
+            let status: String = msg
+                .strip_prefix("LLM ")
+                .map(|rest| rest.chars().take_while(char::is_ascii_digit).collect())
+                .unwrap_or_default();
+            if status.is_empty() {
+                "The language model stopped with an error.".to_owned()
+            } else {
+                format!("The language model answered with HTTP {status}.")
+            }
+        }
+    }
 }
 
 /// `MiniMax-M2` sometimes emits a tool call as XML in `content` rather than
@@ -1180,7 +1484,7 @@ pub async fn sessions_save(
     let owner = session_owner(principal.as_ref())?;
     let parsed: SaveSessionBody = serde_json::from_slice(&body).unwrap_or_default();
     let Some(messages) = parsed.messages.filter(|m| !m.is_empty()) else {
-        return Err(ApiError::BadRequest("messages kosong".to_owned()).into());
+        return Err(ApiError::BadRequest("messages is empty".to_owned()).into());
     };
     let ch = &state.clickhouse;
     ensure_chat_session_table(ch)
@@ -1507,12 +1811,53 @@ mod tests {
             &[],
             Some("r_1"),
             true,
-            Some("batas iterasi tool tercapai"),
+            Some("tool-call limit reached"),
         );
         let obj = body.as_object().unwrap();
         assert_eq!(obj.get("buildRunId").unwrap(), "r_1");
         assert_eq!(obj.get("chartCreated").unwrap(), true);
-        assert_eq!(obj.get("note").unwrap(), "batas iterasi tool tercapai");
+        assert_eq!(obj.get("note").unwrap(), "tool-call limit reached");
+    }
+
+    #[test]
+    fn only_connection_failures_throttling_and_server_errors_are_retried() {
+        for status in [
+            "LLM 500: x",
+            "LLM 503: busy",
+            "LLM 529: overloaded",
+            "LLM 429: slow down",
+            "LLM 408: t",
+        ] {
+            assert!(
+                is_transient(&lakehouse_llm::LlmError::Api(status.to_owned())),
+                "{status}"
+            );
+        }
+        for status in [
+            "LLM 400: bad",
+            "LLM 401: key",
+            "LLM 404: model",
+            "LLM stream: {\"error\":1}",
+        ] {
+            assert!(
+                !is_transient(&lakehouse_llm::LlmError::Api(status.to_owned())),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrated_preamble_before_final_answer_is_dropped() {
+        let answer = "Now I have everything. I will remove the growth claim.\n\nFinal answer:\n\n**CDC is healthy.**";
+        assert_eq!(strip_repair_preamble(answer), "**CDC is healthy.**");
+        assert_eq!(
+            strip_repair_preamble("**Final answer:** 42 rows."),
+            "42 rows."
+        );
+        assert_eq!(
+            strip_repair_preamble("Plain answer, 42 rows."),
+            "Plain answer, 42 rows."
+        );
     }
 
     #[test]

@@ -47,7 +47,7 @@ pub(super) async fn create_chart(
 pub(super) async fn update_chart(ch: &ChClient, args: &Map<String, Value>) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
-        return json!({ "error": "id wajib" });
+        return json!({ "error": "id is required" });
     }
     let input = match parse_chart_input(args) {
         Ok(i) => i,
@@ -157,7 +157,7 @@ pub(super) async fn list_charts(ch: &ChClient) -> Value {
 pub(super) async fn delete_chart(ch: &ChClient, args: &Map<String, Value>) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
-        return json!({ "error": "id wajib" });
+        return json!({ "error": "id is required" });
     }
     match store::delete_chart(ch, &id).await {
         Ok(()) => json!({ "deleted": true, "id": id }),

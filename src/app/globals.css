@@ -6,6 +6,32 @@
  */
 @import "../../design-system/globals.css";
 
+/*
+ * Tailwind v4 wraps every `hover:` (and so `group-hover:`) in
+ * `@media (hover: hover)`, so browsers that report no hover capability,
+ * such as touchscreen laptops and some Linux or remote-desktop setups, get
+ * no hover feedback anywhere even with a mouse. This console is used with a
+ * pointer, so hover applies whenever the element is actually hovered. On
+ * phones a tapped element may keep its hover style until the next tap.
+ */
+@custom-variant hover (&:hover);
+
+/*
+ * Tailwind v4's preflight leaves buttons on the default arrow cursor.
+ * Everything clickable in the console shows a pointer instead.
+ */
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  [role="menuitem"]:not([data-disabled]),
+  [role="option"]:not([data-disabled]),
+  [role="tab"]:not([data-disabled]),
+  summary,
+  label[for] {
+    cursor: pointer;
+  }
+}
+
 /* Legacy brand-font alias: pages using `var(--font-montserrat)` now render Geist. */
 :root {
   --font-montserrat: var(--font-sans);

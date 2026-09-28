@@ -216,9 +216,17 @@ function SessionRow({
 }) {
   const preview = s.preview ? plainPreview(s.preview) : "";
   return (
-    <li className="group relative flex items-center gap-3 px-2 py-2.5 transition-colors hover:bg-muted/50">
-      <SessionModeIcon mode={s.mode} />
-      <div className="min-w-0 flex-1">
+    <li className="group relative flex items-center gap-3 px-2 py-2.5 transition-colors duration-200 hover:bg-[color-mix(in_oklch,var(--brand-1),transparent_94%)]">
+      {/* Hover: an accent bar grows, the icon lifts, the text slides. */}
+      <span
+        aria-hidden
+        className="absolute top-1/2 left-0 h-0 w-0.5 -translate-y-1/2 rounded-full bg-[var(--brand-1)] transition-all duration-300 group-hover:h-7"
+      />
+      <SessionModeIcon
+        mode={s.mode}
+        className="transition-transform duration-300 group-hover:-translate-y-0.5 group-hover:scale-110 group-hover:shadow-[0_6px_16px_-8px_var(--brand-1)] motion-reduce:transition-none"
+      />
+      <div className="min-w-0 flex-1 transition-transform duration-300 group-hover:translate-x-1 motion-reduce:transition-none">
         <div className="flex items-center gap-2">
           {/* The link's box covers the row; the actions menu sits above it. */}
           <Link
@@ -239,7 +247,7 @@ function SessionRow({
           </span>
         ) : null}
         {s.updatedAt ? (
-          <time dateTime={s.updatedAt} title={formatDateTime(s.updatedAt)} className="w-16 text-right">
+          <time dateTime={s.updatedAt} title={formatDateTime(s.updatedAt)} className="w-16 text-right transition-colors group-hover:text-foreground">
             {formatRelativeTime(s.updatedAt)}
           </time>
         ) : null}

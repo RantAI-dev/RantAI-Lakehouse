@@ -54,7 +54,10 @@ export type LineageEdge = {
   id: string
   from: string
   to: string
-  kind: "pipeline" | "query" | "agent" | "transform"
+  /** How the connection was recorded: ingest spec, catalog registry, authored pipeline, view definition, Gold export or dataset publisher. */
+  kind: "ingest" | "catalog" | "pipeline" | "view" | "export" | "publisher" | string
+  /** The platform record this edge comes from; lineage draws nothing it cannot cite. */
+  evidence?: string
 }
 
 export type LineageGraph = {
@@ -65,6 +68,10 @@ export type LineageGraph = {
   /** False when the build has no lineage capture; `reason` says why. */
   supported: boolean
   reason?: string
+  /** Set when there is no graph to show: no focus, or nothing recorded mentions it. */
+  note?: string
+  /** What this graph can and cannot contain (e.g. tables loaded outside the platform have no incoming edge). */
+  coverage?: string[]
 }
 
 export type AuditEvent = {
