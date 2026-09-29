@@ -390,6 +390,14 @@ pub struct CreatePipelineInput {
     pub owner: Option<String>,
     /// What the pipeline is for, in the author's words (migration 0047).
     pub description: Option<String>,
+    /// The owning tenant (migration 0042). `list_pipelines` filters on it,
+    /// so a pipeline created without one is invisible to every caller —
+    /// the route resolves it from the creator before calling this.
+    pub tenant_id: Option<Uuid>,
+    /// The connector this pipeline reads from, when there is one — what
+    /// `connectors::dependent_pipelines` finds, and what stops that
+    /// connector from being deleted underneath it.
+    pub connector_id: Option<String>,
 }
 
 const DEFAULT_OWNER: &str = "Current user";
@@ -419,8 +427,9 @@ pub async fn create_pipeline(
     let transforms = serde_json::to_value(&input.transforms).unwrap_or(serde_json::Value::Null);
     let sql = format!(
         "INSERT INTO pipeline_definition (id, name, kind, status, owner, source, target, \
-         schedule, description, incremental_column, fbic_enabled, transforms) \
-         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11) \
+         schedule, description, incremental_column, fbic_enabled, transforms, tenant_id, \
+         connector_id) \
+         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
          RETURNING {PIPELINE_COLUMNS}"
     );
     let row: PipelineRow = sqlx::query_as(&sql)
@@ -435,6 +444,8 @@ pub async fn create_pipeline(
         .bind(&input.incremental_column)
         .bind(input.fbic_enabled)
         .bind(&transforms)
+        .bind(input.tenant_id)
+        .bind(&input.connector_id)
         .fetch_one(pool)
         .await?;
     Ok(row.into())

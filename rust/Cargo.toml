@@ -35,6 +35,11 @@ rand = "0.8"
 # Already present transitively (via `reqwest`, `2.5.8` in `Cargo.lock`) —
 # this is the first DIRECT use, so it needs its own workspace entry.
 url = "2"
+# `lakehouse-api::internal_hosts` parses the connector SSRF allowlist
+# (`CONNECTOR_PROBE_ALLOWED_CIDRS`) into networks. Already present
+# transitively (via `reqwest`, `2.12.1` in `Cargo.lock`) — this is the
+# first DIRECT use, so it needs its own workspace entry.
+ipnet = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "rustls-tls", "builder", "tokio1-rustls-tls"] }
 wiremock = "0.6"

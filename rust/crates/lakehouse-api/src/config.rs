@@ -47,6 +47,12 @@ pub enum ConfigError {
     /// request-time surprise.
     #[error("CATALOG_TENANT_ID must be a valid UUID, got {0:?}")]
     InvalidCatalogTenantId(String),
+    /// `CONNECTOR_PROBE_ALLOWED_CIDRS` holds an entry that is not a network
+    /// or an address. Fails config resolution for the same reason
+    /// [`ConfigError::InvalidCatalogTenantId`] does: dropping the bad entry
+    /// would quietly refuse the hosts the operator meant to allow.
+    #[error("CONNECTOR_PROBE_ALLOWED_CIDRS: {0}")]
+    MalformedAllowedCidrs(String),
 }
 
 /// Resolved application configuration.
@@ -92,6 +98,12 @@ pub struct Config {
     /// posture is what a deployment gets unless it says otherwise. `true`
     /// only when the env var is exactly `"true"`.
     pub connector_probe_allow_internal_hosts: bool,
+    /// Private networks a connector may dial even though the SSRF guard
+    /// refuses internal addresses (`CONNECTOR_PROBE_ALLOWED_CIDRS`, e.g.
+    /// `192.168.18.0/24`): the narrow alternative to
+    /// `connector_probe_allow_internal_hosts`. Empty by default. See
+    /// [`crate::internal_hosts`] for what the list can never open.
+    pub connector_probe_allowed_cidrs: Vec<ipnet::IpNet>,
     /// Whether this deployment says Oracle CDC via `Debezium`'s `LogMiner`
     /// connector is wanted. Default `false`; `true` only for the exact string
     /// `"true"`.
@@ -705,6 +717,10 @@ impl std::fmt::Debug for Config {
                 &self.connector_probe_allow_internal_hosts,
             )
             .field(
+                "connector_probe_allowed_cidrs",
+                &self.connector_probe_allowed_cidrs,
+            )
+            .field(
                 "oracle_cdc_logminer_enabled",
                 &self.oracle_cdc_logminer_enabled,
             )
@@ -929,6 +945,11 @@ impl Config {
             connector_probe_allow_internal_hosts: env
                 .get("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS")
                 .is_some_and(|v| v == "true"),
+            connector_probe_allowed_cidrs: crate::internal_hosts::parse_cidrs(
+                env.get("CONNECTOR_PROBE_ALLOWED_CIDRS")
+                    .map_or("", String::as_str),
+            )
+            .map_err(ConfigError::MalformedAllowedCidrs)?,
             oracle_cdc_logminer_enabled: env
                 .get("ORACLE_CDC_LOGMINER_ENABLED")
                 .is_some_and(|v| v == "true"),
@@ -1036,6 +1057,17 @@ impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         let env: HashMap<String, String> = std::env::vars().collect();
         Self::from_map(&env)
+    }
+
+    /// The internal addresses a connector dial may reach: every one of
+    /// them, or only the allowlisted networks. Passed to
+    /// `connector_probe`/`connector_discover`'s SSRF check.
+    #[must_use]
+    pub fn connector_internal_hosts(&self) -> crate::internal_hosts::InternalHosts {
+        crate::internal_hosts::InternalHosts {
+            allow_all: self.connector_probe_allow_internal_hosts,
+            allowed: self.connector_probe_allowed_cidrs.clone(),
+        }
     }
 }
 
@@ -1350,6 +1382,32 @@ mod tests {
         let cfg =
             Config::from_map(&map(&[("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS", "true")])).unwrap();
         assert!(cfg.connector_probe_allow_internal_hosts);
+    }
+
+    /// The narrow alternative: listed networks only, parsed at startup,
+    /// and a bad entry refuses to boot rather than being dropped.
+    #[test]
+    fn connector_probe_allowed_cidrs_parses_the_list_and_refuses_a_bad_entry() {
+        let cfg = Config::from_map(&map(&[])).unwrap();
+        assert!(cfg.connector_probe_allowed_cidrs.is_empty());
+        assert_eq!(
+            cfg.connector_internal_hosts(),
+            crate::internal_hosts::InternalHosts::NONE
+        );
+
+        let cfg = Config::from_map(&map(&[(
+            "CONNECTOR_PROBE_ALLOWED_CIDRS",
+            "192.168.18.0/24, 10.1.2.3",
+        )]))
+        .unwrap();
+        assert_eq!(cfg.connector_probe_allowed_cidrs.len(), 2);
+        assert!(
+            cfg.connector_internal_hosts()
+                .permits(&"192.168.18.205".parse().unwrap())
+        );
+
+        let err = Config::from_map(&map(&[("CONNECTOR_PROBE_ALLOWED_CIDRS", "lan")])).unwrap_err();
+        assert!(matches!(err, ConfigError::MalformedAllowedCidrs(_)));
     }
 
     /// The `ORACLE_CDC_LOGMINER_ENABLED` flag defaults to `false`: an unset

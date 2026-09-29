@@ -408,6 +408,9 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // on a route that was simply never added here. See
     // `tests/route_auth.rs::every_registered_route_has_a_policy_entry`.
     ("DELETE", "/api/connectors/{id}",      Policy::RequiresPermission("connector:manage")),
+    // The console's edit page: name/direction/environment/residency/host.
+    // Type, tenant, credential and dial each keep their own route.
+    ("PATCH", "/api/connectors/{id}",       Policy::RequiresPermission("connector:manage")),
     ("POST", "/api/connectors/{id}/test",   Policy::RequiresPermission("connector:manage")),
     // Same tier as `GET /api/connectors/{id}`: probe history is read-only
     // and carries nothing more sensitive than the `/test` route's own
@@ -419,6 +422,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // surface `/test`/`/discover` already gate on `connector:manage`,
     // not a new, narrower permission.
     ("PUT",  "/api/connectors/{id}/secret", Policy::RequiresPermission("connector:manage")),
+    // ADR 0002 Addendum 4: the user-supplied credential write path — same
+    // permission as every other connector mutation (probe-first too, see
+    // `routes::connectors::set_credential`'s doc comment).
+    ("PUT",  "/api/connectors/{id}/credential", Policy::RequiresPermission("connector:manage")),
     // Reads a connector's live schema (tables/columns), same sensitivity
     // class as `/test` (opens a real, credentialed connection to the
     // connector's own target) — not a new permission, matching every
@@ -445,6 +452,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // a READER of `/ingestible`/`ingest-spec`, it never calls this route
     // itself (WS3 item 29).
     ("POST", "/api/connectors/{id}/ingest/run", Policy::RequiresPermission("connector:manage")),
+    // The connector's own ingest runs, read from Dagster: the same
+    // audience as the per-table results (`/api/governance/ingest-runs`)
+    // and the probe history above.
+    ("GET",  "/api/connectors/{id}/ingest/runs", Policy::RequiresPermission("connector:manage")),
     // The tenant-assignment route. `identity:
     // write`, not `connector:manage` — this is a governance decision about
     // WHO may see the row, the same permission every other tenant-

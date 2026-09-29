@@ -81,8 +81,10 @@
 //! resolves to `10.0.0.5` is blocked exactly the same as a literal
 //! `10.0.0.5`, so the check cannot be bypassed by pointing DNS at an
 //! attacker-controlled name that merely LOOKS external. This is
-//! `allow_internal_hosts: bool`-gated (default: blocked — see
-//! `crate::config::Config::connector_probe_allow_internal_hosts`) because
+//! gated by [`InternalHosts`] (default: blocked — see
+//! `crate::config::Config::connector_probe_allow_internal_hosts` for every
+//! internal address and `connector_probe_allowed_cidrs` for listed
+//! networks only, and `crate::internal_hosts`) because
 //! this deployment's own seeded connectors
 //! (`rust/migrations/0022_prune_connector_seed.sql`) legitimately point at
 //! `postgres:5432` and `http://rustfs:9000`, both internal compose-network
@@ -109,6 +111,8 @@ use sqlx::Connection;
 use sqlx::mysql::{MySqlConnectOptions, MySqlConnection, MySqlSslMode};
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgSslMode};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
+
+use crate::internal_hosts::InternalHosts;
 
 /// Bound on a single dial attempt (connect + one cheap operation). Chosen
 /// to be a "few seconds" per the task brief — long enough that a healthy
@@ -195,8 +199,9 @@ fn elapsed_millis(elapsed: Duration) -> i64 {
 /// Attempt a real connectivity probe for `info`, resolving its
 /// `secret_ref`(s) via `resolver` (see the module doc comment: MUST already
 /// be scoped to a fixed allowlist, never the general-purpose resolver).
-/// `allow_internal_hosts` gates the SSRF blocklist — see the module doc
-/// comment and [`Config::connector_probe_allow_internal_hosts`]. Never
+/// `internal_hosts` lifts the SSRF blocklist for every internal address or
+/// for listed networks only — see the module doc comment and
+/// [`Config::connector_probe_allow_internal_hosts`]. Never
 /// panics on a malformed `host` or an unresolvable `secret_ref` — both
 /// become [`Outcome::misconfigured`], never a crash.
 ///
@@ -211,13 +216,13 @@ fn elapsed_millis(elapsed: Duration) -> i64 {
 pub async fn probe(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
-    allow_internal_hosts: bool,
+    internal_hosts: &InternalHosts,
 ) -> Outcome {
     match info.adapter.as_deref() {
         Some(adapter @ ("sql" | "cdc")) => {
-            probe_dial(adapter, info, resolver, allow_internal_hosts).await
+            probe_dial(adapter, info, resolver, internal_hosts).await
         }
-        Some("rest") => probe_rest_info(info, resolver, allow_internal_hosts).await,
+        Some("rest") => probe_rest_info(info, resolver, internal_hosts).await,
         Some("sheets") => probe_sheets(),
         // A `files` adapter's `dial` names an object-storage protocol (S3
         // today, per `lakehouse_store::ingest_spec::FilesProtocol`) — the
@@ -227,8 +232,8 @@ pub async fn probe(
         // `conn-s3-warehouse` row keeps that shape after
         // `0034_seed_connector_ingest_spec.sql` sets `adapter = 'files'`
         // on it) — no second S3 client is added here.
-        Some("files") => probe_s3(info, resolver, allow_internal_hosts).await,
-        _ => probe_by_kind(info, resolver, allow_internal_hosts).await,
+        Some("files") => probe_s3(info, resolver, internal_hosts).await,
+        _ => probe_by_kind(info, resolver, internal_hosts).await,
     }
 }
 
@@ -237,13 +242,13 @@ pub async fn probe(
 async fn probe_by_kind(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
-    allow_internal_hosts: bool,
+    internal_hosts: &InternalHosts,
 ) -> Outcome {
     let kind = info.kind.to_lowercase();
     if kind.contains("postgres") {
-        probe_postgres(info, resolver, allow_internal_hosts).await
+        probe_postgres(info, resolver, internal_hosts).await
     } else if kind.contains("object storage") || kind.contains("s3") {
-        probe_s3(info, resolver, allow_internal_hosts).await
+        probe_s3(info, resolver, internal_hosts).await
     } else {
         Outcome::unsupported(&info.kind)
     }
@@ -295,21 +300,22 @@ impl<'a> From<&'a CdcDial> for DialTarget<'a> {
 /// Route a `sql`/`cdc` adapter's `dial` to the right driver-specific
 /// probe.
 ///
-/// `conn-pg-lakehouse` (`0034_seed_connector_ingest_spec.sql`) seeds
-/// `adapter = 'sql'`, `dial.driver = "postgres"` on the SAME connector row
-/// [`probe_postgres`]'s legacy `host`-string parsing (`parse_postgres_host`)
-/// already dials successfully — after this task, that row's `adapter` is
-/// no longer `NULL`, so [`probe`]'s dispatch reaches this function for it,
-/// not [`probe_by_kind`]. Rather than add a second, untested
-/// Postgres-from-`dial` code path, `SqlDriver::Postgres` here simply
-/// re-enters [`probe_postgres`] via `info.host`, which is unchanged and
-/// still valid. Only `Mysql`/`Mssql` get a genuinely new probe (WS3 item
-/// 13).
+/// Every driver dials from the parsed `dial`, never from `info.host`.
+///
+/// `SqlDriver::Postgres` used to re-enter [`probe_postgres`] via
+/// `info.host`'s legacy `<user>@<host>:<port>/<database>` string. That
+/// held for the seeded `conn-pg-lakehouse` row (whose `host` and `dial`
+/// name the same target), but the connector wizard derives `host` from
+/// `dial.host` alone — a bare hostname — so every Postgres connector
+/// created through the console failed its test with "host must be shaped
+/// <user>@<host>:<port>/<database>" no matter what credential it had.
+/// Postgres now dials the same [`DialTarget`] `Mysql`/`Mssql` do, through
+/// [`dial_postgres`], the one Postgres dial both paths share.
 async fn probe_dial(
     adapter: &str,
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
-    allow_internal_hosts: bool,
+    internal_hosts: &InternalHosts,
 ) -> Outcome {
     let parsed = match Dial::parse(adapter, &info.dial) {
         Ok(dial) => dial,
@@ -330,13 +336,17 @@ async fn probe_dial(
         }
     };
     match target.driver {
-        SqlDriver::Postgres => probe_postgres(info, resolver, allow_internal_hosts).await,
-        SqlDriver::Mysql => {
-            probe_mysql(&target, &info.secret_ref, resolver, allow_internal_hosts).await
+        SqlDriver::Postgres => {
+            let target = PgDialTarget {
+                user: target.user,
+                host: target.host,
+                port: target.port,
+                database: target.database,
+            };
+            dial_postgres(&target, &info.secret_ref, resolver, internal_hosts).await
         }
-        SqlDriver::Mssql => {
-            probe_mssql(&target, &info.secret_ref, resolver, allow_internal_hosts).await
-        }
+        SqlDriver::Mysql => probe_mysql(&target, &info.secret_ref, resolver, internal_hosts).await,
+        SqlDriver::Mssql => probe_mssql(&target, &info.secret_ref, resolver, internal_hosts).await,
         SqlDriver::Oracle => Outcome::misconfigured(
             "Oracle probes run through the Dagster sql adapter, not through this Rust-side \
              probe; the connector's own health remains at whatever record_test_result has \
@@ -356,9 +366,9 @@ async fn probe_mysql(
     target: &DialTarget<'_>,
     secret_ref: &str,
     resolver: &dyn DynSecretResolver,
-    allow_internal_hosts: bool,
+    internal_hosts: &InternalHosts,
 ) -> Outcome {
-    if let Err(message) = resolve_checked(target.host, target.port, allow_internal_hosts).await {
+    if let Err(message) = resolve_checked(target.host, target.port, internal_hosts).await {
         return Outcome::misconfigured(message);
     }
     let password = match resolver.resolve_dyn(secret_ref).await {
@@ -440,9 +450,9 @@ async fn probe_mssql(
     target: &DialTarget<'_>,
     secret_ref: &str,
     resolver: &dyn DynSecretResolver,
-    allow_internal_hosts: bool,
+    internal_hosts: &InternalHosts,
 ) -> Outcome {
-    if let Err(message) = resolve_checked(target.host, target.port, allow_internal_hosts).await {
+    if let Err(message) = resolve_checked(target.host, target.port, internal_hosts).await {
         return Outcome::misconfigured(message);
     }
     let password = match resolver.resolve_dyn(secret_ref).await {
@@ -533,11 +543,18 @@ fn probe_rest_misconfigured_dial(adapter: &str) -> Outcome {
 async fn probe_rest_info(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
-    allow_internal_hosts: bool,
+    internal_hosts: &InternalHosts,
 ) -> Outcome {
     match Dial::parse("rest", &info.dial) {
         Ok(Dial::Rest(dial)) => {
-            probe_rest(&dial, &info.secret_ref, resolver, allow_internal_hosts).await
+            probe_rest(
+                &dial,
+                &info.secret_ref,
+                info.secret_ref_secondary.as_deref(),
+                resolver,
+                internal_hosts,
+            )
+            .await
         }
         Ok(_) => probe_rest_misconfigured_dial("rest"),
         Err(err) => Outcome::misconfigured(format!("connector's dial is invalid: {err}")),
@@ -551,15 +568,16 @@ async fn probe_rest_info(
 async fn probe_rest(
     dial: &RestDial,
     secret_ref: &str,
+    secret_ref_secondary: Option<&str>,
     resolver: &dyn DynSecretResolver,
-    allow_internal_hosts: bool,
+    internal_hosts: &InternalHosts,
 ) -> Outcome {
     let Some((host, port)) = parse_endpoint_host_port(&dial.base_url) else {
         return Outcome::misconfigured(
             "connector is misconfigured: a rest adapter's baseUrl must be an http(s):// URL",
         );
     };
-    if let Err(message) = resolve_checked(host, port, allow_internal_hosts).await {
+    if let Err(message) = resolve_checked(host, port, internal_hosts).await {
         return Outcome::misconfigured(message);
     }
 
@@ -588,35 +606,47 @@ async fn probe_rest(
             request.bearer_auth(token.expose_secret())
         }
         RestAuth::Basic => {
-            // The resolved secretRef is treated as the already-encoded
-            // "user:pass" credential material for this header -- a `rest`
-            // adapter's `ConnectorDialInfo` carries exactly one
-            // `secret_ref`, not a separate username field, so the operator
-            // creating the connector supplies the credential in the shape
-            // this probe sends verbatim in the Authorization header.
-            let basic = match resolver.resolve_dyn(secret_ref).await {
-                Ok(secret) => secret,
-                Err(err) => {
+            // Username in the primary slot, password in the secondary --
+            // the same two fields, in the same order, the Dagster adapter
+            // reads (`secret_field_names`' `("rest", "basic")` row;
+            // `adapters/rest.py` base64-encodes `username:password`), so a
+            // connector that passes this test is one ingest can use.
+            let Some(secondary) = secret_ref_secondary else {
+                return Outcome::misconfigured(
+                    "connector is misconfigured: REST basic auth needs a username and a \
+                     password, and this connector stores only one credential",
+                );
+            };
+            let (username, password) = match (
+                resolver.resolve_dyn(secret_ref).await,
+                resolver.resolve_dyn(secondary).await,
+            ) {
+                (Ok(username), Ok(password)) => (username, password),
+                (Err(err), _) | (_, Err(err)) => {
                     return Outcome::misconfigured(format!(
                         "could not resolve the connector's credential: {err}"
                     ));
                 }
             };
-            request.header(
-                reqwest::header::AUTHORIZATION,
-                format!("Basic {}", basic.expose_secret()),
-            )
+            request.basic_auth(username.expose_secret(), Some(password.expose_secret()))
         }
         RestAuth::Oauth2ClientCredentials { .. } => {
             // Never fabricated: an OAuth2 client-credentials exchange is a
-            // second network call this build does not implement in Tier 1
+            // second network call this build's probe does not implement
             // (mirrors probe_sheets's own "unsupported, honestly" posture
             // for a credential exchange this workspace cannot verify).
-            return Outcome::misconfigured(
-                "connector is misconfigured: OAuth2 client-credentials REST auth is not \
-                 implemented by this build's connectivity probe -- configure apiKey or bearer \
-                 auth to test this connector",
-            );
+            // `supported: false`, not misconfigured: nothing about the
+            // connector is wrong, and a misconfigured outcome would make
+            // `set_credential` refuse every OAuth2 credential outright.
+            return Outcome {
+                ok: false,
+                supported: false,
+                latency_ms: None,
+                message: "This build cannot test REST OAuth2 client-credentials auth: the probe \
+                          does not perform the token exchange. Ingest runs still use the stored \
+                          client id and secret."
+                    .to_owned(),
+            };
         }
     };
 
@@ -709,7 +739,7 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
 }
 
 /// Resolve `host:port` via DNS and refuse it if any resolved address is
-/// private/internal (unless `allow_internal_hosts`) — see the module doc
+/// private/internal and `internal_hosts` does not permit it — see the module doc
 /// comment's "SSRF" section for why this resolves rather than
 /// pattern-matching the literal `host` string. Returns `Err` with a message
 /// safe to surface directly (never includes upstream response data — there
@@ -723,7 +753,7 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
 pub(crate) async fn resolve_checked(
     host: &str,
     port: u16,
-    allow_internal_hosts: bool,
+    internal_hosts: &InternalHosts,
 ) -> Result<(), String> {
     let addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host((host, port)).await {
         Ok(iter) => iter.collect(),
@@ -732,15 +762,16 @@ pub(crate) async fn resolve_checked(
     if addrs.is_empty() {
         return Err(format!("host {host:?} did not resolve to any address"));
     }
-    if allow_internal_hosts {
+    if internal_hosts.allow_all {
         return Ok(());
     }
     for addr in &addrs {
-        if is_blocked_ip(&addr.ip()) {
+        if is_blocked_ip(&addr.ip()) && !internal_hosts.permits(&addr.ip()) {
             return Err(format!(
                 "refusing to dial {host:?}: it resolves to {}, a private/internal address this \
-                 build blocks by default (set CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true to \
-                 allow this for a trusted internal deployment)",
+                 build blocks by default (list its network in CONNECTOR_PROBE_ALLOWED_CIDRS, \
+                 e.g. 192.168.18.0/24, or set CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS=true to \
+                 allow every internal address for a trusted internal deployment)",
                 addr.ip()
             ));
         }
@@ -824,7 +855,7 @@ pub(crate) fn classify_sqlx_error(err: &sqlx::Error) -> &'static str {
 async fn probe_postgres(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
-    allow_internal_hosts: bool,
+    internal_hosts: &InternalHosts,
 ) -> Outcome {
     let Some(target) = parse_postgres_host(&info.host) else {
         return Outcome::misconfigured(
@@ -832,10 +863,23 @@ async fn probe_postgres(
              \"<user>@<host>:<port>/<database>\"",
         );
     };
-    if let Err(message) = resolve_checked(target.host, target.port, allow_internal_hosts).await {
+    dial_postgres(&target, &info.secret_ref, resolver, internal_hosts).await
+}
+
+/// The one real Postgres dial, shared by [`probe_postgres`] (a pre-WS3 row's
+/// legacy `host` string) and [`probe_dial`] (a `sql`/`cdc` adapter's
+/// `dial`). `resolve_checked` runs FIRST, before `secret_ref` is resolved —
+/// the same SSRF ordering every other probe here keeps.
+async fn dial_postgres(
+    target: &PgDialTarget<'_>,
+    secret_ref: &str,
+    resolver: &dyn DynSecretResolver,
+    internal_hosts: &InternalHosts,
+) -> Outcome {
+    if let Err(message) = resolve_checked(target.host, target.port, internal_hosts).await {
         return Outcome::misconfigured(message);
     }
-    let password = match resolver.resolve_dyn(&info.secret_ref).await {
+    let password = match resolver.resolve_dyn(secret_ref).await {
         Ok(secret) => secret,
         Err(err) => {
             return Outcome::misconfigured(format!(
@@ -969,7 +1013,7 @@ fn classify_via_reqwest_source(err: &(dyn std::error::Error + 'static)) -> &'sta
 async fn probe_s3(
     info: &ConnectorDialInfo,
     resolver: &dyn DynSecretResolver,
-    allow_internal_hosts: bool,
+    internal_hosts: &InternalHosts,
 ) -> Outcome {
     let Some((endpoint, bucket)) = parse_s3_host(&info.host) else {
         return Outcome::misconfigured(
@@ -981,8 +1025,7 @@ async fn probe_s3(
             "connector is misconfigured: S3 endpoint must be an http(s):// URL",
         );
     };
-    if let Err(message) = resolve_checked(endpoint_host, endpoint_port, allow_internal_hosts).await
-    {
+    if let Err(message) = resolve_checked(endpoint_host, endpoint_port, internal_hosts).await {
         return Outcome::misconfigured(message);
     }
     let Some(secret_ref_secondary) = info.secret_ref_secondary.as_deref() else {
@@ -1078,7 +1121,12 @@ mod tests {
     async fn unsupported_kind_never_fabricates_a_latency_or_success() {
         let resolver = EnvSecretResolver::with_map(std::collections::HashMap::new());
         for kind in ["Kafka", "MQTT", "MongoDB", "Oracle", "SAP / ERP", "SFTP"] {
-            let outcome = probe(&info(kind, "h", "env:X", None), &resolver, false).await;
+            let outcome = probe(
+                &info(kind, "h", "env:X", None),
+                &resolver,
+                &InternalHosts::NONE,
+            )
+            .await;
             assert!(!outcome.supported, "{kind} must be unsupported");
             assert!(!outcome.ok, "{kind} must never report ok=true");
             assert!(
@@ -1099,7 +1147,7 @@ mod tests {
         let outcome = probe(
             &info("PostgreSQL", "not-a-valid-host-shape", "env:X", None),
             &resolver,
-            false,
+            &InternalHosts::NONE,
         )
         .await;
         assert!(outcome.supported);
@@ -1115,7 +1163,7 @@ mod tests {
         // Port 1 on localhost: nothing listens there, so this fails fast
         // via connection-refused rather than exercising the 5s timeout —
         // keeps this test quick while still measuring a real elapsed time.
-        // `allow_internal_hosts: true` — this test is specifically about
+        // `InternalHosts::ALL` — this test is specifically about
         // the dial-failure path, not the SSRF blocklist (covered
         // separately below), and 127.0.0.1 is itself blocked by default.
         let outcome = probe(
@@ -1126,7 +1174,7 @@ mod tests {
                 None,
             ),
             &resolver,
-            true,
+            &InternalHosts::ALL,
         )
         .await;
         assert!(outcome.supported);
@@ -1150,7 +1198,7 @@ mod tests {
                 None,
             ),
             &resolver,
-            false,
+            &InternalHosts::NONE,
         )
         .await;
         assert!(outcome.supported);
@@ -1180,14 +1228,14 @@ mod tests {
                 None,
             ),
             &resolver,
-            false,
+            &InternalHosts::NONE,
         )
         .await;
         assert!(!outcome.ok);
         assert!(outcome.latency_ms.is_none());
     }
 
-    /// The documented opt-out: with `allow_internal_hosts: true`, a
+    /// The documented opt-out: with `InternalHosts::ALL`, a
     /// loopback/private host is no longer blocked and the probe proceeds
     /// to a real (here, failing) dial attempt — proving the flag actually
     /// takes effect, not just that the default blocks.
@@ -1204,14 +1252,14 @@ mod tests {
                 None,
             ),
             &resolver,
-            true,
+            &InternalHosts::ALL,
         )
         .await;
         assert!(outcome.supported);
         assert!(!outcome.ok);
         assert!(
             outcome.latency_ms.is_some(),
-            "allow_internal_hosts=true must let this reach the real dial attempt"
+            "allowing every internal host must let this reach the real dial attempt"
         );
         assert!(outcome.message.contains("PostgreSQL connection failed"));
     }
@@ -1222,7 +1270,7 @@ mod tests {
         let outcome = probe(
             &info("Object storage", "http://127.0.0.1:1|bucket", "env:X", None),
             &resolver,
-            true,
+            &InternalHosts::ALL,
         )
         .await;
         assert!(outcome.supported);
@@ -1244,7 +1292,7 @@ mod tests {
                 Some("env:SK"),
             ),
             &resolver,
-            true,
+            &InternalHosts::ALL,
         )
         .await;
         assert!(outcome.supported);
@@ -1268,7 +1316,7 @@ mod tests {
                 Some("env:SK"),
             ),
             &resolver,
-            false,
+            &InternalHosts::NONE,
         )
         .await;
         assert!(outcome.supported);
@@ -1293,7 +1341,7 @@ mod tests {
                 Some("env:SK"),
             ),
             &resolver,
-            false,
+            &InternalHosts::NONE,
         )
         .await;
         assert!(!outcome.ok);
@@ -1337,15 +1385,49 @@ mod tests {
     /// bypass the filter.
     #[tokio::test]
     async fn resolve_checked_blocks_a_hostname_that_resolves_to_loopback() {
-        let err = resolve_checked("localhost", 1, false).await.unwrap_err();
+        let err = resolve_checked("localhost", 1, &InternalHosts::NONE)
+            .await
+            .unwrap_err();
         assert!(err.contains("private/internal"), "{err}");
     }
 
     #[tokio::test]
     async fn resolve_checked_allows_a_hostname_when_internal_hosts_allowed() {
-        resolve_checked("localhost", 1, true)
+        resolve_checked("localhost", 1, &InternalHosts::ALL)
             .await
-            .expect("allow_internal_hosts=true must let a loopback-resolving host through");
+            .expect("allowing every internal host must let a loopback-resolving host through");
+    }
+
+    /// `CONNECTOR_PROBE_ALLOWED_CIDRS`: a listed private network is
+    /// reachable, an unlisted one is not, and the message names both
+    /// switches. IP literals, so no DNS is involved.
+    #[tokio::test]
+    async fn resolve_checked_allows_only_an_allowlisted_private_network() {
+        let lan = InternalHosts {
+            allow_all: false,
+            allowed: crate::internal_hosts::parse_cidrs("192.168.18.0/24").unwrap(),
+        };
+        resolve_checked("192.168.18.205", 1, &lan)
+            .await
+            .expect("an address inside the listed network is reachable");
+
+        let err = resolve_checked("10.0.0.5", 1, &lan).await.unwrap_err();
+        assert!(err.contains("CONNECTOR_PROBE_ALLOWED_CIDRS"), "{err}");
+        assert!(
+            err.contains("CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS"),
+            "{err}"
+        );
+    }
+
+    /// Listing loopback does not open it: only allowing every internal
+    /// host does.
+    #[tokio::test]
+    async fn resolve_checked_never_lets_the_allowlist_open_loopback() {
+        let listed = InternalHosts {
+            allow_all: false,
+            allowed: crate::internal_hosts::parse_cidrs("127.0.0.0/8").unwrap(),
+        };
+        assert!(resolve_checked("127.0.0.1", 1, &listed).await.is_err());
     }
 
     // -- WS3 item 13: probe_mysql/probe_mssql/probe_rest/probe_sheets --
@@ -1389,13 +1471,93 @@ mod tests {
     async fn probe_mysql_blocks_an_internal_host_before_dialing() {
         let dial = sql_dial(SqlDriver::Mysql, "127.0.0.1", 3306);
         let target = DialTarget::from(&dial);
-        let outcome = probe_mysql(&target, "env:UNUSED", &PanicIfCalledResolver, false).await;
+        let outcome = probe_mysql(
+            &target,
+            "env:UNUSED",
+            &PanicIfCalledResolver,
+            &InternalHosts::NONE,
+        )
+        .await;
         assert!(!outcome.ok);
         assert!(outcome.supported);
         assert!(
             outcome.latency_ms.is_none(),
             "a blocked host must never be dialed, so no latency exists"
         );
+        assert!(
+            outcome.message.contains("private/internal"),
+            "{}",
+            outcome.message
+        );
+    }
+
+    /// A `sql`-adapter Postgres connector as the console wizard creates it:
+    /// `host` is a BARE hostname (`hostFromDial`), and user/port/database
+    /// live only in `dial`.
+    fn wizard_postgres_info(host: &str, port: u16, secret_ref: &str) -> ConnectorDialInfo {
+        ConnectorDialInfo {
+            kind: "PostgreSQL".to_owned(),
+            host: host.to_owned(),
+            secret_ref: secret_ref.to_owned(),
+            secret_ref_secondary: None,
+            adapter: Some("sql".to_owned()),
+            dial: serde_json::json!({
+                "driver": "postgres",
+                "host": host,
+                "port": port,
+                "database": "insurance_db",
+                "user": "insurer",
+            }),
+        }
+    }
+
+    /// Regression: a wizard-created Postgres connector used to fail every
+    /// test with "host must be shaped <user>@<host>:<port>/<database>",
+    /// because `probe_dial` re-parsed `info.host` instead of using `dial`.
+    /// It must now reach a real dial attempt against `dial`'s target.
+    #[tokio::test]
+    async fn wizard_postgres_connector_dials_from_its_dial_not_its_host() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("PG_TEST_PASSWORD".to_owned(), "irrelevant".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let outcome = probe(
+            &wizard_postgres_info("127.0.0.1", 1, "env:PG_TEST_PASSWORD"),
+            &resolver,
+            &InternalHosts::ALL,
+        )
+        .await;
+        assert!(outcome.supported);
+        assert!(!outcome.ok);
+        assert!(
+            outcome.latency_ms.is_some(),
+            "must reach a real dial attempt: {}",
+            outcome.message
+        );
+        assert!(
+            outcome.message.contains("PostgreSQL connection failed"),
+            "{}",
+            outcome.message
+        );
+        assert!(
+            !outcome.message.contains("must be shaped"),
+            "{}",
+            outcome.message
+        );
+    }
+
+    /// The dial-based Postgres path keeps the SSRF ordering: an internal
+    /// host is refused before the credential is ever resolved.
+    #[tokio::test]
+    async fn wizard_postgres_connector_blocks_an_internal_host_before_resolving() {
+        let outcome = probe(
+            &wizard_postgres_info("127.0.0.1", 5432, "env:UNUSED"),
+            &PanicIfCalledResolver,
+            &InternalHosts::NONE,
+        )
+        .await;
+        assert!(outcome.supported);
+        assert!(!outcome.ok);
+        assert!(outcome.latency_ms.is_none());
         assert!(
             outcome.message.contains("private/internal"),
             "{}",
@@ -1410,7 +1572,13 @@ mod tests {
     async fn probe_mssql_blocks_an_internal_host_before_dialing() {
         let dial = sql_dial(SqlDriver::Mssql, "127.0.0.1", 1433);
         let target = DialTarget::from(&dial);
-        let outcome = probe_mssql(&target, "env:UNUSED", &PanicIfCalledResolver, false).await;
+        let outcome = probe_mssql(
+            &target,
+            "env:UNUSED",
+            &PanicIfCalledResolver,
+            &InternalHosts::NONE,
+        )
+        .await;
         assert!(!outcome.ok);
         assert!(outcome.supported);
         assert!(outcome.latency_ms.is_none());
@@ -1432,7 +1600,14 @@ mod tests {
             pagination: lakehouse_store::ingest_spec::RestPagination::None,
             endpoints: vec![],
         };
-        let outcome = probe_rest(&dial, "env:UNUSED", &PanicIfCalledResolver, false).await;
+        let outcome = probe_rest(
+            &dial,
+            "env:UNUSED",
+            None,
+            &PanicIfCalledResolver,
+            &InternalHosts::NONE,
+        )
+        .await;
         assert!(!outcome.ok);
         assert!(outcome.supported);
         assert!(outcome.latency_ms.is_none());
@@ -1459,13 +1634,20 @@ mod tests {
             pagination: lakehouse_store::ingest_spec::RestPagination::None,
             endpoints: vec![],
         };
-        // allow_internal_hosts: true -- wiremock's ephemeral server binds
+        // InternalHosts::ALL -- wiremock's ephemeral server binds
         // loopback, and this test is about the 2xx-success path, not the
         // SSRF blocklist (covered separately above).
         let mut map = std::collections::HashMap::new();
         map.insert("REST_TEST_TOKEN".to_owned(), "irrelevant".to_owned());
         let resolver = EnvSecretResolver::with_map(map);
-        let outcome = probe_rest(&dial, "env:REST_TEST_TOKEN", &resolver, true).await;
+        let outcome = probe_rest(
+            &dial,
+            "env:REST_TEST_TOKEN",
+            None,
+            &resolver,
+            &InternalHosts::ALL,
+        )
+        .await;
         assert!(outcome.ok, "{}", outcome.message);
         assert!(outcome.supported);
         assert!(outcome.latency_ms.is_some());
@@ -1489,13 +1671,80 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert("REST_TEST_TOKEN".to_owned(), "irrelevant".to_owned());
         let resolver = EnvSecretResolver::with_map(map);
-        let outcome = probe_rest(&dial, "env:REST_TEST_TOKEN", &resolver, true).await;
+        let outcome = probe_rest(
+            &dial,
+            "env:REST_TEST_TOKEN",
+            None,
+            &resolver,
+            &InternalHosts::ALL,
+        )
+        .await;
         assert!(!outcome.ok);
         assert!(outcome.supported);
         assert!(outcome.message.contains("403"));
         assert!(
             !outcome.message.contains("secret upstream detail"),
             "the response body must never be echoed: {}",
+            outcome.message
+        );
+    }
+
+    /// Basic auth sends the username (primary) and password (secondary)
+    /// as one standard `Authorization: Basic base64(user:pass)` header --
+    /// the header the Dagster adapter sends at ingest time.
+    #[tokio::test]
+    async fn probe_rest_basic_auth_sends_the_username_and_password_pair() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Basic dXNlcjpwYXNz",
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let dial = RestDial {
+            base_url: server.uri(),
+            auth: RestAuth::Basic,
+            pagination: lakehouse_store::ingest_spec::RestPagination::None,
+            endpoints: vec![],
+        };
+        let mut map = std::collections::HashMap::new();
+        map.insert("REST_TEST_USERNAME".to_owned(), "user".to_owned());
+        map.insert("REST_TEST_PASSWORD".to_owned(), "pass".to_owned());
+        let resolver = EnvSecretResolver::with_map(map);
+        let outcome = probe_rest(
+            &dial,
+            "env:REST_TEST_USERNAME",
+            Some("env:REST_TEST_PASSWORD"),
+            &resolver,
+            &InternalHosts::ALL,
+        )
+        .await;
+        assert!(outcome.ok, "{}", outcome.message);
+    }
+
+    #[tokio::test]
+    async fn probe_rest_basic_auth_without_a_password_slot_is_misconfigured() {
+        let server = wiremock::MockServer::start().await;
+        let dial = RestDial {
+            base_url: server.uri(),
+            auth: RestAuth::Basic,
+            pagination: lakehouse_store::ingest_spec::RestPagination::None,
+            endpoints: vec![],
+        };
+        let outcome = probe_rest(
+            &dial,
+            "env:UNUSED",
+            None,
+            &PanicIfCalledResolver,
+            &InternalHosts::ALL,
+        )
+        .await;
+        assert!(!outcome.ok);
+        assert!(
+            outcome.message.contains("username and a"),
+            "{}",
             outcome.message
         );
     }

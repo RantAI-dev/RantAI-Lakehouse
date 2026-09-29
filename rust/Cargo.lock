@@ -2346,6 +2346,7 @@ dependencies = [
  "chrono",
  "croner",
  "iceberg",
+ "ipnet",
  "jsonwebtoken",
  "lakehouse-alerts",
  "lakehouse-auth",

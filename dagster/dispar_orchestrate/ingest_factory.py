@@ -106,7 +106,7 @@ from dagster import DefaultScheduleStatus, Field, ScheduleDefinition, job, op
 from kafka import KafkaConsumer, TopicPartition
 from kafka.structs import OffsetAndMetadata
 
-from dispar_orchestrate import dlt_pipeline, secret_resolver, ssrf_guard
+from dispar_orchestrate import connector_catalog, dlt_pipeline, secret_resolver, ssrf_guard
 from dispar_orchestrate.adapters import files as files_adapter
 from dispar_orchestrate.adapters import mongodb as mongodb_adapter
 from dispar_orchestrate.adapters import oracle as oracle_adapter
@@ -275,6 +275,20 @@ def _resolve_object_secrets(connector: dict, adapter_name: str, dial: dict) -> d
     return dict(zip(fields, values))
 
 
+def _register_in_catalog(connector_id: str, obj: dict) -> None:
+    """Put a table that just loaded into the console catalog
+    (`connector_catalog.py`). The load itself already succeeded and is
+    recorded, so a registration failure is reported, never raised: the data
+    is in Bronze either way, and only its Catalog entry is missing."""
+    try:
+        connector_catalog.register_connector_table(connector_id, obj)
+    except Exception as exc:  # noqa: BLE001 -- see docstring: reported, never raised
+        print(
+            f"WARNING: dispar_orchestrate.ingest_factory: {obj.get('target')!r} loaded, but could not be "
+            f"registered in the catalog: {exc}"
+        )
+
+
 def _run_one_object(connector: dict, obj: dict) -> None:
     """Ingest one source object (table/endpoint/sheet range) for one
     connector, recording the outcome via `record_ingest_run` in EVERY
@@ -324,6 +338,7 @@ def _run_one_object(connector: dict, obj: dict) -> None:
                 dlt_pipeline.BronzeIngestConfig.from_dial(dial, secrets, [obj])
             )
             _record(rows=outcome["rows"], status="succeeded")
+            _register_in_catalog(connector_id, obj)
             return
 
         if adapter_name == "sql" and dial.get("driver") == "oracle":
@@ -347,6 +362,7 @@ def _run_one_object(connector: dict, obj: dict) -> None:
                 sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env()),
             )
             _record(rows=outcome.rows, status="succeeded")
+            _register_in_catalog(connector_id, obj)
             return
 
         adapter = _ADAPTERS.get(adapter_name)
@@ -399,6 +415,7 @@ def _run_one_object(connector: dict, obj: dict) -> None:
         else:
             outcome = _load()
         _record(rows=outcome.rows, status="succeeded")
+        _register_in_catalog(connector_id, obj)
     except (ssrf_guard.SsrfBlocked, UnsupportedColumnType) as exc:
         _record(rows=None, status="rejected", error=str(exc))
         raise

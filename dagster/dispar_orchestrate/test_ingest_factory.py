@@ -33,6 +33,15 @@ from dispar_orchestrate.ingest_factory import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_catalog_registration(monkeypatch):
+    """A successful load registers its table in the catalog through
+    ClickHouse (`connector_catalog.py`); no test here reaches a real one."""
+    import dispar_orchestrate.ingest_factory as f
+
+    monkeypatch.setattr(f.connector_catalog, "register_connector_table", lambda *a, **k: 0)
+
+
 def test_build_ingest_schedules_returns_empty_when_api_is_unreachable(monkeypatch) -> None:
     monkeypatch.setattr(requests, "get", lambda *a, **k: (_ for _ in ()).throw(requests.ConnectionError()))
     cfg = IngestFactoryConfig(api_url="http://x", service_token="t")
@@ -751,3 +760,56 @@ def test_an_unknown_kafka_auth_type_is_refused_by_name_without_echoing_secrets()
         kafka_security_kwargs({"auth": {"type": "sasl_scram_sha256"}}, {"password": "not-a-real-secret"})
     assert "not-a-real-secret" not in str(exc.value)
 
+
+def test_run_one_object_registers_a_loaded_table_in_the_catalog(monkeypatch) -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: None)
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+    monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_dial", staticmethod(lambda *a: object()))
+    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg: {"rows": 836})
+    registered = []
+    monkeypatch.setattr(
+        f.connector_catalog, "register_connector_table", lambda cid, obj: registered.append((cid, obj)) or 1672
+    )
+
+    connector = {
+        "id": "conn-northwind",
+        "adapter": "sql",
+        "dial": {"driver": "postgres", "host": "192.168.18.205", "port": 55432, "database": "northwind", "user": "u"},
+        "secretRef": "file:/run/secrets/connector_managed_conn_northwind_password",
+        "secretRefSecondary": None,
+    }
+    obj = {"name": "public.orders", "target": "northwind_orders"}
+    f._run_one_object(connector, obj)
+
+    assert registered == [("conn-northwind", obj)]
+
+
+def test_a_catalog_registration_failure_never_fails_a_load_that_succeeded(monkeypatch, capsys) -> None:
+    """The data is already in Bronze and recorded as succeeded; only its
+    Catalog entry is missing, and that is reported, not raised."""
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+    monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_dial", staticmethod(lambda *a: object()))
+    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg: {"rows": 836})
+
+    def _broken(*a, **k):
+        raise RuntimeError("clickhouse is down")
+
+    monkeypatch.setattr(f.connector_catalog, "register_connector_table", _broken)
+
+    connector = {
+        "id": "conn-northwind",
+        "adapter": "sql",
+        "dial": {"driver": "postgres", "host": "192.168.18.205", "port": 55432, "database": "northwind", "user": "u"},
+        "secretRef": "file:/run/secrets/connector_managed_conn_northwind_password",
+        "secretRefSecondary": None,
+    }
+    f._run_one_object(connector, {"name": "public.orders", "target": "northwind_orders"})
+
+    assert [r["status"] for r in recorded] == ["succeeded"]
+    assert "could not be registered in the catalog: clickhouse is down" in capsys.readouterr().out

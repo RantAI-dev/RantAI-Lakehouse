@@ -19,7 +19,7 @@ export class ServiceError extends Error {
    * — too coarse for a caller that must react differently to a 409
    * (someone else changed the resource first; reload and retry) than a
    * 422 (the request was well-formed but the server could not carry it
-   * out, e.g. `connector-credential-rotation.tsx`'s probe-first rotation).
+   * out, e.g. `connector-edit-page.tsx`'s probe-first credential save).
    * Callers needing that distinction read `status` directly instead of
    * parsing `message` text.
    */

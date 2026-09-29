@@ -24,9 +24,10 @@ use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::connector_probe_result::list_probe_results;
 use lakehouse_store::connectors::{
     ConnectorFilter, CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec,
-    IngestSpecInput, SecretSlot, create_connector, delete_connector, get_connector,
-    get_connector_dial_info, get_ingest_spec, list_connectors, list_ingestible_connectors,
-    record_test_result, set_ingest_spec, swap_secret_ref,
+    IngestSpecInput, SecretSlot, UpdateConnectorInput, create_connector, delete_connector,
+    get_connector, get_connector_dial_info, get_ingest_spec, list_connectors,
+    list_ingestible_connectors, record_test_result, set_ingest_spec, swap_secret_ref,
+    update_connector,
 };
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::pipelines::{CreatePipelineInput, create_pipeline};
@@ -177,16 +178,12 @@ async fn dependent_pipelines_are_derived_from_pipeline_definition(
             schedule: "manual".to_owned(),
             owner: None,
             description: None,
+            tenant_id: None,
+            connector_id: Some(connector.id.clone()),
         },
     )
     .await
     .unwrap();
-    sqlx::query("UPDATE pipeline_definition SET connector_id = $1 WHERE id = $2")
-        .bind(&connector.id)
-        .bind(&pipeline.id)
-        .execute(&pool)
-        .await
-        .unwrap();
 
     let after = get_connector(&pool, &connector.id).await.unwrap().unwrap();
     assert_eq!(after.dependent_pipelines.len(), 1);
@@ -593,6 +590,67 @@ async fn get_connector_audit_event_id_resolves_a_real_event(pool: PgPool) -> sql
         .unwrap()
         .unwrap();
     assert_eq!(after.audit_event_id.as_deref(), Some(event.id.as_str()));
+    Ok(())
+}
+
+/// `PATCH /api/connectors/{id}`'s write: only the fields given change, the
+/// rest keep their values, the detail reads the new residency back, and a
+/// rename onto a taken name is a 409-shaped conflict.
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_connector_changes_only_the_given_fields(pool: PgPool) -> sqlx::Result<()> {
+    let (created, _) = create_connector(&pool, &minimal_input("editable one"))
+        .await
+        .expect("create");
+    create_connector(&pool, &minimal_input("taken name"))
+        .await
+        .expect("create second");
+
+    let updated = update_connector(
+        &pool,
+        &created.id,
+        &UpdateConnectorInput {
+            name: Some("renamed".to_owned()),
+            residency: Some("id-jakarta".to_owned()),
+            ..UpdateConnectorInput::default()
+        },
+    )
+    .await
+    .expect("update");
+    assert_eq!(updated.name, "renamed");
+    assert_eq!(
+        updated.direction, "source",
+        "untouched field keeps its value"
+    );
+    assert_eq!(
+        updated.environment, "staging",
+        "untouched field keeps its value"
+    );
+
+    let detail = get_connector(&pool, &created.id).await.unwrap().unwrap();
+    assert_eq!(detail.residency, "id-jakarta");
+    assert_eq!(detail.tenant_id, None, "a new connector starts unassigned");
+
+    let clash = update_connector(
+        &pool,
+        &created.id,
+        &UpdateConnectorInput {
+            name: Some("taken name".to_owned()),
+            ..UpdateConnectorInput::default()
+        },
+    )
+    .await;
+    assert!(matches!(clash, Err(StoreError::Conflict)), "{clash:?}");
+
+    let missing = update_connector(
+        &pool,
+        "conn-does-not-exist",
+        &UpdateConnectorInput {
+            name: Some("x".to_owned()),
+            ..UpdateConnectorInput::default()
+        },
+    )
+    .await;
+    assert!(matches!(missing, Err(StoreError::NotFound)), "{missing:?}");
     Ok(())
 }
 

@@ -18,125 +18,27 @@ import { HealthBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { backfillTriggerMessage } from "@/lib/connectors/backfill-message"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { filterDataClientSide } from "@/lib/data-table"
 import { formatRelativeTime } from "@/lib/format"
 import { withNotify } from "@/lib/notify"
 import { connectorService } from "@/services"
-import type { Connector, IngestRun } from "@/services/contracts/connectors"
-import { ConnectorCredentialRotation } from "./connector-credential-rotation"
+import type { Connector } from "@/services/contracts/connectors"
+import { ConnectorDeleteDialog } from "./connector-delete-dialog"
+import { ConnectorIngestPanel } from "./connector-ingest-panel"
 import { ConnectorProbeHistoryPanel } from "./connector-probe-history-panel"
 import { DIRECTION_LABEL, getConnectorColumns } from "./connectors-columns"
 
-/**
- * Read-only `Debezium` `.properties` rendering for a `cdc` adapter's
- * captured table. `properties` holds ONLY `${ENV_VAR_NAME}` references —
- * labeled explicitly as such, never resolved here or anywhere in the
- * console.
- */
-function DebeziumPanel({ connectorId, table }: { connectorId: string; table: string }) {
-  const props = useService(
-    (signal) => connectorService.getDebeziumProperties(connectorId, table, signal),
-    [connectorId, table]
-  )
-
-  if (props.status === "loading") return <LoadingSkeleton rows={2} />
-  if (props.status === "error")
-    return <ErrorState error={props.error} onRetry={props.reload} />
-
-  return (
-    <div>
-      <p className="text-xs font-medium text-muted-foreground">
-        Debezium properties · {props.data.table}
-      </p>
-      <p className="mt-0.5 text-xs text-muted-foreground">{props.data.note}</p>
-      <pre className="mt-1.5 overflow-x-auto rounded-md border bg-muted p-2 font-mono text-xs">
-        {props.data.properties}
-      </pre>
-    </div>
-  )
-}
-
-/**
- * Ingest run history + a manual "Run now" trigger (WS3 item 17/36),
- * `bronze_meta.ingest_run` surfaced through
- * `GET /api/governance/ingest-runs?connectorId=`. For a `cdc` adapter,
- * additionally renders the read-only Debezium properties panel for its
- * first captured table (CDC has no separate batch trigger — see
- * `runNow.data.reason` when `supported` is `false`).
- */
-function IngestRunsPanel({ connectorId }: { connectorId: string }) {
-  const spec = useService((s) => connectorService.getIngestSpec(connectorId, s), [connectorId])
-  const runs = useService(
-    (s) => connectorService.listIngestRuns(connectorId, s),
-    [connectorId]
-  )
-  const runNow = useServiceAction((signal, id: string) => connectorService.runIngest(id, signal))
-
-  if (spec.status === "loading" || runs.status === "loading") return <LoadingSkeleton rows={3} />
-  if (spec.status === "error")
-    return <ErrorState error={spec.error} onRetry={spec.reload} />
-  if (runs.status === "error")
-    return <ErrorState error={runs.error} onRetry={runs.reload} />
-
-  const table: string | undefined = spec.data.sourceObjects[0]?.name
-  // `driver` names the CDC source for the honest, generic message below
-  // only — the dial's actual shape is validated server-side
-  // (`Dial::parse`, `rust/crates/lakehouse-store/src/ingest_spec.rs`),
-  // never re-validated here (see `Dial`'s doc comment in
-  // `@/services/contracts/connectors`).
-  const driver =
-    spec.data.adapter === "cdc" && typeof spec.data.dial.driver === "string"
-      ? spec.data.dial.driver
-      : "cdc"
-
-  return (
-    <div className="space-y-3">
-      {spec.data.adapter === "cdc" ? (
-        <p className="text-sm text-muted-foreground">{backfillTriggerMessage(driver)}</p>
-      ) : null}
-      <div className="flex items-center justify-between">
-        <p className="text-xs font-medium text-muted-foreground">Ingest runs</p>
-        <Button
-          size="sm"
-          variant="outline"
-          disabled={runNow.status === "pending"}
-          onClick={async () => {
-            await runNow.run(connectorId)
-            runs.reload()
-          }}
-        >
-          {runNow.status === "pending" ? "Running…" : "Run now"}
-        </Button>
-      </div>
-      {runNow.data && runNow.data.supported === false ? (
-        <p className="text-sm text-muted-foreground">Not runnable · {runNow.data.reason}</p>
-      ) : null}
-      {runs.data.length === 0 ? (
-        <p className="text-sm text-muted-foreground">No ingest runs yet.</p>
-      ) : (
-        <ul className="space-y-1 text-sm">
-          {runs.data.map((r: IngestRun) => (
-            <li key={`${r.job}-${r.startedAt}`}>
-              {r.object}: {r.status} ({r.rows === null ? "—" : r.rows} rows)
-              <span className="ml-2 text-xs text-muted-foreground">
-                {formatRelativeTime(r.startedAt)}
-              </span>
-            </li>
-          ))}
-        </ul>
-      )}
-      {spec.data.adapter === "cdc" && table ? (
-        <DebeziumPanel connectorId={connectorId} table={table} />
-      ) : null}
-    </div>
-  )
-}
-
 /** Drawer body — fetches full connector detail for the selected row. */
-function ConnectorDetail({ id }: { readonly id: string }) {
+function ConnectorDetail({
+  id,
+  onDeleted,
+}: {
+  readonly id: string
+  readonly onDeleted: () => void
+}) {
   const state = useService((s) => connectorService.getConnector(id, s), [id])
+  const [deleteOpen, setDeleteOpen] = useState(false)
   const testAction = useServiceAction(
     withNotify(
       { success: "Connection test passed", error: "Connection test failed" },
@@ -170,6 +72,9 @@ function ConnectorDetail({ id }: { readonly id: string }) {
         >
           {testAction.status === "pending" ? "Testing…" : "Test connection"}
         </Button>
+        <Button size="sm" variant="outline" render={<Link href={`/connectors/${id}/edit`} />}>
+          Edit
+        </Button>
         <Button size="sm" render={<Link href={`/pipelines/create?connectorId=${id}`} />}>
           Create pipeline
         </Button>
@@ -182,7 +87,22 @@ function ConnectorDetail({ id }: { readonly id: string }) {
             Audit
           </Button>
         ) : null}
+        <Button
+          size="sm"
+          variant="ghost"
+          className="text-destructive hover:text-destructive"
+          onClick={() => setDeleteOpen(true)}
+        >
+          Delete
+        </Button>
       </div>
+      <ConnectorDeleteDialog
+        connector={c}
+        dependents={c.dependentPipelines}
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        onDeleted={onDeleted}
+      />
       {testAction.data ? (
         <p
           className={
@@ -222,7 +142,6 @@ function ConnectorDetail({ id }: { readonly id: string }) {
         ]}
       />
       <ConnectorProbeHistoryPanel connectorId={id} refreshKey={historyKey} />
-      <ConnectorCredentialRotation connectorId={id} onRotated={state.reload} />
       <div>
         <p className="text-xs font-medium text-muted-foreground">Capabilities</p>
         <div className="mt-1.5 flex flex-wrap gap-1.5">
@@ -296,7 +215,9 @@ function ConnectorDetail({ id }: { readonly id: string }) {
           </ul>
         )}
       </div>
-      <IngestRunsPanel connectorId={id} />
+      <div className="border-t border-border pt-5">
+        <ConnectorIngestPanel connectorId={id} connectorName={c.name} />
+      </div>
     </>
   )
 }
@@ -389,8 +310,17 @@ export function ConnectorsPage() {
         }}
         title={selected?.name ?? ""}
         description={selected?.type}
+        wide
       >
-        {selected ? <ConnectorDetail id={selected.id} /> : null}
+        {selected ? (
+          <ConnectorDetail
+            id={selected.id}
+            onDeleted={() => {
+              setSelected(null)
+              state.reload()
+            }}
+          />
+        ) : null}
       </DetailDrawer>
     </div>
   )

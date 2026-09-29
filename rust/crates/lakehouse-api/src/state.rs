@@ -24,6 +24,7 @@ use tokio::sync::RwLock;
 
 use crate::bronze_stats_cache::BronzeStatsCache;
 use crate::config::Config;
+use crate::connector_secret_store::ConnectorSecretStore;
 use crate::gold_lock::MartLocks;
 
 /// The three [`lakehouse_auth::Authenticator`]s this service configures,
@@ -106,6 +107,12 @@ pub struct AppState {
     /// external-provider implementation swaps in (still allowlisted)
     /// without changing this field's type or any reader of it.
     pub connector_secret_resolver: Arc<dyn DynSecretResolver>,
+    /// Writes the credential files behind `managed` connector refs (ADR
+    /// 0002 Addendum 4) — see [`crate::connector_secret_store`]. Rooted at
+    /// [`CONNECTOR_SECRETS_DIR`], the same directory
+    /// [`Self::connector_secret_resolver`]'s `file:` half reads, so a value
+    /// written here is the value the next probe or ingest resolves.
+    pub connector_secret_store: Arc<ConnectorSecretStore>,
     /// The configured authenticators, or `None` under the exact same
     /// condition as [`Self::pg`] being `None` (no Postgres pool). When
     /// `None`, `crate::auth::AuthenticatedPrincipal` and every protected
@@ -290,6 +297,13 @@ impl PolicyDecisionLatencies {
     }
 }
 
+/// The fixed Docker/Compose secrets mount connector credentials live
+/// under: read by the `file:` resolver, written by
+/// [`crate::connector_secret_store`] for `managed` refs. `docker-compose.yml`
+/// mounts the `connector_secrets` volume here (writable for this service,
+/// read-only for `dagster-code-location`).
+pub const CONNECTOR_SECRETS_DIR: &str = "/run/secrets";
+
 /// The credential-suffix `secretRef` PATTERNS (see
 /// [`lakehouse_core::secret::pattern_matches`])
 /// [`AppState::connector_secret_resolver`] may resolve — see that field's
@@ -369,7 +383,7 @@ impl ConnectorSecretResolver {
             // `/run/secrets` is the fixed Docker/Compose secrets mount this
             // deployment uses — see `FileSecretResolver`'s doc comment for
             // why a fixed base directory (not caller-supplied) matters.
-            file: FileSecretResolver::new("/run/secrets"),
+            file: FileSecretResolver::new(CONNECTOR_SECRETS_DIR),
         }
     }
 }
@@ -520,6 +534,7 @@ impl AppState {
                     .map(|s| (*s).to_owned()),
                 "connector-allowlist",
             )),
+            connector_secret_store: Arc::new(ConnectorSecretStore::new(CONNECTOR_SECRETS_DIR)),
             auth,
             gold_export_locks: MartLocks::default(),
             iceberg: Arc::new(RwLock::new(None)),

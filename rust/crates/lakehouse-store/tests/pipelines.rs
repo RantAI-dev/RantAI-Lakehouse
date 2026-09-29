@@ -44,6 +44,8 @@ fn input() -> CreatePipelineInput {
         schedule: "manual".to_owned(),
         owner: None,
         description: None,
+        tenant_id: None,
+        connector_id: None,
     }
 }
 
@@ -245,6 +247,39 @@ async fn list_pipelines_filtered_by_tenant_excludes_another_tenants_row(
         !rows.iter().any(|r| r.id == pl_b.id),
         "tenant-b's pipeline must be absent, not merely unlisted-first"
     );
+    Ok(())
+}
+
+/// A pipeline created WITH a tenant is listed for that tenant straight
+/// away — no separate assignment step. Before `CreatePipelineInput` carried
+/// `tenant_id`, every console-created pipeline was stored unassigned and so
+/// never appeared in its creator's list.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_pipeline_with_a_tenant_is_listed_for_it(pool: PgPool) -> sqlx::Result<()> {
+    let tenant = create_tenant(&pool, &tenant_input("tenant-created-pipeline"))
+        .await
+        .unwrap();
+    let tenant_id: Uuid = tenant.id.parse().unwrap();
+
+    let created = pipelines::create_pipeline(
+        &pool,
+        &CreatePipelineInput {
+            tenant_id: Some(tenant_id),
+            ..named_input("pl-created-with-tenant")
+        },
+    )
+    .await
+    .unwrap();
+
+    let rows = pipelines::list_pipelines(
+        &pool,
+        &PipelineFilter {
+            tenant_id: Some(tenant_id),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(rows.iter().any(|r| r.id == created.id));
     Ok(())
 }
 

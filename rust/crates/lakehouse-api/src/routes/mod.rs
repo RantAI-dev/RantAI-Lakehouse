@@ -329,7 +329,9 @@ fn connectors_router() -> Router<AppState> {
         )
         .route(
             "/api/connectors/{id}",
-            get(connectors::detail).delete(connectors::delete),
+            get(connectors::detail)
+                .patch(connectors::update)
+                .delete(connectors::delete),
         )
         .route(
             "/api/connectors/{id}/test",
@@ -342,6 +344,10 @@ fn connectors_router() -> Router<AppState> {
         .route(
             "/api/connectors/{id}/secret",
             axum::routing::put(connectors::rotate_secret),
+        )
+        .route(
+            "/api/connectors/{id}/credential",
+            axum::routing::put(connectors::set_credential),
         )
         .route(
             "/api/connectors/{id}/discover",
@@ -358,6 +364,10 @@ fn connectors_router() -> Router<AppState> {
         .route(
             "/api/connectors/{id}/ingest/run",
             axum::routing::post(connectors::ingest_run),
+        )
+        .route(
+            "/api/connectors/{id}/ingest/runs",
+            get(connectors::ingest_run_history),
         )
         // The assignment route for connector
         // rows `0042_tenant_provisioning.sql` leaves `tenant_id = NULL`.

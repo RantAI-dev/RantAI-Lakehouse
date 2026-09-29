@@ -36,6 +36,8 @@ base64 = { workspace = true }
 # entry's comment on why this needed adding: it was not already a direct
 # dependency of this crate, only a transitive one via `reqwest`.
 url = { workspace = true }
+# `internal_hosts`: the connector SSRF allowlist's networks.
+ipnet = { workspace = true }
 # `routes::alerts::ApiFreshnessSource`/`ApiSilenceSource` (WS5 item C1)
 # implement `lakehouse_alerts::FreshnessSource`/`SilenceSource`, both
 # `#[async_trait::async_trait]` at their definition site -- any impl

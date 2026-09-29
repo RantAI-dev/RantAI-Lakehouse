@@ -292,6 +292,11 @@ services:
       # the exception visible here is the point — do NOT carry this into a
       # deployment that accepts connector definitions from untrusted callers.
       CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS: ${CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS:-true}
+      # The narrow alternative: only these networks (e.g. `192.168.18.0/24`,
+      # comma-separated; a bare address is one host) pass the guard. Takes
+      # effect when the flag above is not `true`. Never opens loopback,
+      # link-local or multicast (`lakehouse-api::internal_hosts`).
+      CONNECTOR_PROBE_ALLOWED_CIDRS: ${CONNECTOR_PROBE_ALLOWED_CIDRS:-}
       # ── ADR 0010 — Gold export to Iceberg (`routes::gold`). Points at the
       #    compose-internal Lakekeeper hostname (NOT `LAKEKEEPER_BASE_URI`,
       #    which is host-facing) — same distinction `g1-test-runner`'s env
@@ -420,6 +425,13 @@ services:
         volume:
           subpath: admin.jwt
         read_only: true
+      # ADR 0002 Addendum 4 — user-supplied connector credentials. WRITABLE
+      # here: `connector_secret_store` writes `connector_managed_*` files
+      # when a user saves a connector's password in the console, and the
+      # `file:` resolver reads every `file:/run/secrets/connector_*` ref
+      # (managed or operator-dropped) from the same directory. Mounted
+      # read-only into `dagster-code-location`, which only ever reads.
+      - lakehouse_connector_secrets:/run/secrets
     restart: unless-stopped
 
   # P1 — S3-compatible object store, the default self-hosted implementation
@@ -1605,6 +1617,14 @@ services:
         volume:
           subpath: dlt.jwt
         read_only: true
+      # ADR 0002 Addendum 4 — connector credentials the API stored for a
+      # user (`connector_managed_*`), plus any operator-dropped
+      # `connector_*` file. Read-only: `secret_resolver.resolve_secret_ref`
+      # only reads; `lakehouse-api` is the one writer.
+      - type: volume
+        source: lakehouse_connector_secrets
+        target: /run/secrets
+        read_only: true
     environment:
       # `dlt_pipeline.py::run_bronze_ingest`: the `dlt`
       # SSRF guard fail-closed refuses to dial an RFC1918/private
@@ -1619,6 +1639,11 @@ services:
       # way `ops/g6/docker-compose.g6.override.yml`'s gate-only override
       # already does for its own fixtures — never a default here.
       INGEST_ALLOW_INTERNAL_HOSTS: ${INGEST_ALLOW_INTERNAL_HOSTS:-}
+      # The narrow alternative for ingest: only these networks (e.g. a
+      # customer LAN, `192.168.18.0/24`) pass the dial-time guard, while
+      # this compose network and the host stay refused. Empty by default
+      # (`ssrf_guard.py`'s module docstring).
+      INGEST_ALLOWED_CIDRS: ${INGEST_ALLOWED_CIDRS:-}
       DAGSTER_PG_HOST: postgres
       DAGSTER_PG_PORT: "5432"
       DAGSTER_PG_USER: ${POSTGRES_USER:-lakehouse}
@@ -2990,6 +3015,11 @@ volumes:
   # has something genuine to verify against instead of being relaxed.
   mssql_g6_tls:
   lakehouse_postgres_data:
+  # ADR 0002 Addendum 4 — user-supplied connector credentials, plaintext at
+  # rest (Docker-secret posture). NOT part of a database backup: back this
+  # volume up alongside `lakehouse_postgres_data`, or restored connectors
+  # will have no credential until one is saved again.
+  lakehouse_connector_secrets:
   lakehouse_clickhouse_data:
   lakehouse_rustfs_data:
   lakehouse_seaweedfs_data:

@@ -385,7 +385,7 @@ async fn latest_maintenance_verb_runs(
 /// here, so AGENTS.md rule 4 (upstream error text never reaches a
 /// response) still holds; [`classify_ch_error`] is what actually redacts
 /// it for every case this function does not recognize.
-fn is_unknown_table_error(body: &str) -> bool {
+pub(crate) fn is_unknown_table_error(body: &str) -> bool {
     body.contains("(UNKNOWN_TABLE)") || body.contains("Code: 60.")
 }
 

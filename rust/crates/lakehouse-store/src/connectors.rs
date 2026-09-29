@@ -148,6 +148,27 @@ pub struct ConnectorDetail {
     /// recording connector audit events; see `get_connector`'s doc comment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit_event_id: Option<String>,
+    /// Whether the primary credential is one the API stores itself
+    /// ([`CredentialSource::Managed`]), so the UI can offer "replace
+    /// credential" instead of telling the user to ask an operator. A
+    /// boolean derived from the ref on read — the ref itself is still never
+    /// returned (module doc comment, guarantee 1).
+    pub credential_managed: bool,
+    /// The primary credential's kind (password, access key, …), read from
+    /// its ref's suffix so the edit page asks for the right thing. `None`
+    /// for a ref whose name does not end in a known suffix (e.g. a
+    /// hand-seeded one). A kind, never the ref or its value.
+    pub credential_kind: Option<CredentialKind>,
+    /// The secondary slot's kind, or `None` when the connector has no
+    /// secondary credential (e.g. `PostgreSQL`; an S3 connector's
+    /// secret key is `Some`).
+    pub credential_secondary_kind: Option<CredentialKind>,
+    /// Residency policy label, as stored at create/update — read back so
+    /// the edit page can show the current value.
+    pub residency: String,
+    /// The owning tenant's id, or `None` for an unassigned connector
+    /// (`0042_tenant_provisioning.sql`) — the edit page's tenant select.
+    pub tenant_id: Option<String>,
 }
 
 /// Mirrors `DiscoveredSchema`. Never populated today — see
@@ -198,16 +219,17 @@ struct ConnectorRow {
                   doc comment"
     )]
     host: String,
-    #[allow(
-        dead_code,
-        reason = "selected so it round-trips through UPDATE...RETURNING, but never read: it \
-                  is a reference name a future connectivity-resolving component would read, \
-                  not a value this crate consumes or the Debug impl prints"
-    )]
+    /// A reference name, never a value. Read only by [`get_connector`], to
+    /// derive [`ConnectorDetail::credential_managed`]; never returned and
+    /// never printed by the `Debug` impl below.
     secret_ref: String,
     last_test_at: Option<OffsetDateTime>,
     capabilities: Vec<String>,
     owner: String,
+    /// Read only by [`get_connector`], for [`ConnectorDetail::residency`].
+    residency: String,
+    /// Read only by [`get_connector`], for [`ConnectorDetail::tenant_id`].
+    tenant_id: Option<Uuid>,
 }
 
 const REDACTED: &str = "<redacted>";
@@ -230,6 +252,8 @@ impl std::fmt::Debug for ConnectorRow {
             .field("last_test_at", &self.last_test_at)
             .field("capabilities", &self.capabilities)
             .field("owner", &self.owner)
+            .field("residency", &self.residency)
+            .field("tenant_id", &self.tenant_id)
             .finish()
     }
 }
@@ -258,7 +282,7 @@ impl From<ConnectorRow> for Connector {
 // (see `Connector::last_activity_at`'s doc comment), so every read maps it
 // to `None` rather than selecting a column this crate never populates.
 const CONNECTOR_COLUMNS: &str = "id, name, type, direction, health, environment, tenant, host, \
-     secret_ref, last_test_at, capabilities, owner";
+     secret_ref, last_test_at, capabilities, owner, residency, tenant_id";
 
 /// Optional narrowing for [`list_connectors`] for tenant isolation: a
 /// caller must never see a connector outside its own tenant.
@@ -362,22 +386,22 @@ pub async fn get_connector(pool: &PgPool, id: &str) -> Result<Option<ConnectorDe
     let Some(row) = row else {
         return Ok(None);
     };
+    let credential_managed = is_managed_secret_ref(&row.secret_ref);
+    let credential_kind = credential_kind_of_ref(&row.secret_ref);
+    // Not in `CONNECTOR_COLUMNS` (list rows never need it); read here only
+    // to report its KIND — the ref itself is never returned.
+    let secondary_ref: Option<String> =
+        sqlx::query_scalar("SELECT secret_ref_secondary FROM connector WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?
+            .flatten();
+    let credential_secondary_kind = secondary_ref.as_deref().and_then(credential_kind_of_ref);
+    let residency = row.residency.clone();
+    let tenant_id = row.tenant_id.map(|id| id.to_string());
     let connector = Connector::from(row);
 
-    let dependents: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, name FROM pipeline_definition WHERE connector_id = $1 ORDER BY name",
-    )
-    .bind(id)
-    .fetch_all(pool)
-    .await?;
-    let dependent_pipelines = dependents
-        .into_iter()
-        .map(|(id, name)| ConnectorDependent {
-            id,
-            name,
-            kind: "pipeline".to_owned(),
-        })
-        .collect();
+    let dependent_pipelines = dependent_pipelines(pool, id).await?;
 
     let audit_event_id: Option<String> = sqlx::query_scalar(
         "SELECT id FROM audit_event WHERE resource_kind = 'connector' AND resource_id = $1 \
@@ -389,6 +413,11 @@ pub async fn get_connector(pool: &PgPool, id: &str) -> Result<Option<ConnectorDe
 
     Ok(Some(ConnectorDetail {
         audit_event_id,
+        credential_managed,
+        credential_kind,
+        credential_secondary_kind,
+        residency,
+        tenant_id,
         connector,
         discovered_assets: 0,
         discovered_schemas: Vec::new(),
@@ -423,11 +452,7 @@ pub struct CreateConnectorInput {
     pub environment: String,
     /// Owning tenant's display name.
     pub tenant: String,
-    #[allow(
-        dead_code,
-        reason = "accepted for contract compatibility; no residency column is read back today"
-    )]
-    /// Residency policy label, accepted for contract compatibility.
+    /// Residency policy label; read back as [`ConnectorDetail::residency`].
     pub residency: String,
     /// Feature/capability labels this connector supports.
     pub capabilities: Vec<String>,
@@ -439,15 +464,62 @@ const DEFAULT_OWNER: &str = "Current user";
 
 /// Where a derived connector-credential reference name should be looked up
 /// at resolve time. Mirrors `CredentialSource` in `contracts/connectors.ts`
-/// — ADR 0002 Addendum 3's two schemes, `env:` and `file:`.
+/// — ADR 0002 Addendum 3's two operator-provisioned schemes, `env:` and
+/// `file:`, plus Addendum 4's `managed`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialSource {
     /// `env:CONNECTOR_<ID>_<SUFFIX>`, resolved by `EnvSecretResolver`.
+    /// The operator provisions the value.
     Env,
     /// `file:/run/secrets/connector_<id>_<suffix>`, resolved by
-    /// `FileSecretResolver`.
+    /// `FileSecretResolver`. The operator provisions the value.
     File,
+    /// `file:/run/secrets/connector_managed_<id>_<suffix>` (ADR 0002
+    /// Addendum 4): the USER supplies the value through the API, which
+    /// writes it to that file (`lakehouse-api`'s `connector_secret_store`).
+    /// Still a plain `file:` ref, so both resolvers — the API's and
+    /// Dagster's — read it unchanged. The distinct `connector_managed_`
+    /// prefix is what lets [`is_managed_secret_ref`] tell it apart from an
+    /// operator's `File` ref for the same id, and it cannot collide with
+    /// one: every id begins `conn-`, so a `File` name always begins
+    /// `connector_conn_`.
+    Managed,
+}
+
+/// The fixed prefix every [`CredentialSource::Managed`] ref starts with —
+/// see that variant's doc comment.
+pub const MANAGED_SECRET_REF_PREFIX: &str = "file:/run/secrets/connector_managed_";
+
+/// Whether `secret_ref` names a credential the API itself stores
+/// ([`CredentialSource::Managed`]) rather than one an operator provisions.
+/// A pure predicate over a reference NAME, never a value — this module's
+/// credential guarantees are unaffected.
+#[must_use]
+pub fn is_managed_secret_ref(secret_ref: &str) -> bool {
+    secret_ref.starts_with(MANAGED_SECRET_REF_PREFIX)
+}
+
+/// The credential kind a reference NAME ends in, e.g.
+/// `file:/run/secrets/connector_managed_conn_x_secret_key` →
+/// [`CredentialKind::SecretKey`]. Case-insensitive, since [`derive_secret_ref`]
+/// upper-cases `env:` names and lower-cases `file:` ones. Checked longest
+/// suffix first so `_secret_key`/`_private_key`/`_access_key`/`_api_key`
+/// are never mistaken for a shorter one. `None` when no known suffix
+/// matches — a best-effort label, never an authorization input.
+#[must_use]
+pub fn credential_kind_of_ref(secret_ref: &str) -> Option<CredentialKind> {
+    let lower = secret_ref.to_ascii_lowercase();
+    [
+        CredentialKind::PrivateKey,
+        CredentialKind::SecretKey,
+        CredentialKind::AccessKey,
+        CredentialKind::Password,
+        CredentialKind::ApiKey,
+        CredentialKind::Token,
+    ]
+    .into_iter()
+    .find(|kind| lower.ends_with(&format!("_{}", kind.suffix().to_ascii_lowercase())))
 }
 
 /// Which fixed credential-name suffix a slot derives. Mirrors
@@ -554,6 +626,13 @@ pub fn derive_secret_ref(id: &str, source: CredentialSource, kind: CredentialKin
             let key = id.replace('-', "_");
             format!(
                 "file:/run/secrets/connector_{key}_{}",
+                kind.suffix().to_ascii_lowercase()
+            )
+        }
+        CredentialSource::Managed => {
+            let key = id.replace('-', "_");
+            format!(
+                "{MANAGED_SECRET_REF_PREFIX}{key}_{}",
                 kind.suffix().to_ascii_lowercase()
             )
         }
@@ -1343,6 +1422,35 @@ pub async fn list_ingestible_connectors(
         .collect())
 }
 
+/// Pipelines that read from connector `id`, by name. There is no foreign
+/// key behind `pipeline_definition.connector_id`, so this is the only
+/// thing standing between a connector delete and a pipeline left pointing
+/// at nothing (`DELETE /api/connectors/{id}` refuses while it is
+/// non-empty).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn dependent_pipelines(
+    pool: &PgPool,
+    id: &str,
+) -> Result<Vec<ConnectorDependent>, StoreError> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, name FROM pipeline_definition WHERE connector_id = $1 ORDER BY name",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, name)| ConnectorDependent {
+            id,
+            name,
+            kind: "pipeline".to_owned(),
+        })
+        .collect())
+}
+
 /// Delete a connector by id. Returns `Ok(false)` (not an error) if `id`
 /// does not name a connector — matching the idempotent-delete convention
 /// most of this codebase's `DELETE` handlers already use.
@@ -1373,6 +1481,75 @@ pub async fn delete_connector(pool: &PgPool, id: &str) -> Result<bool, StoreErro
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// The editable, non-credential fields of a connector — the write behind
+/// `PATCH /api/connectors/{id}`. `None` leaves a field unchanged.
+///
+/// Deliberately absent: `type` (it fixes the adapter, the `dial` shape and
+/// the derived credential names — changing it is a different connector),
+/// the credential (its own probe-first route), `dial` (the ingest spec's
+/// route), and the tenant (`assign_tenant`, a separately-audited
+/// governance decision).
+#[derive(Debug, Clone, Default)]
+pub struct UpdateConnectorInput {
+    /// New display name; must not collide with another connector's.
+    pub name: Option<String>,
+    /// New `"source" | "sink" | "bidirectional"`.
+    pub direction: Option<String>,
+    /// New deployment environment.
+    pub environment: Option<String>,
+    /// New residency label.
+    pub residency: Option<String>,
+    /// New connection target label — kept in step with `dial` by the
+    /// console, since the legacy probe and CDC deprovisioning still read it.
+    pub host: Option<String>,
+}
+
+impl UpdateConnectorInput {
+    /// Whether this update changes nothing at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.direction.is_none()
+            && self.environment.is_none()
+            && self.residency.is_none()
+            && self.host.is_none()
+    }
+}
+
+/// Apply an [`UpdateConnectorInput`]. Every value is bound, never
+/// interpolated; an absent field keeps its current value via `COALESCE`.
+///
+/// # Errors
+///
+/// [`StoreError::NotFound`] if no connector has `id`;
+/// [`StoreError::Conflict`] if the new name is taken;
+/// [`StoreError::Database`] otherwise.
+pub async fn update_connector(
+    pool: &PgPool,
+    id: &str,
+    input: &UpdateConnectorInput,
+) -> Result<Connector, StoreError> {
+    let sql = format!(
+        "UPDATE connector SET \
+           name = COALESCE($2, name), \
+           direction = COALESCE($3, direction), \
+           environment = COALESCE($4, environment), \
+           residency = COALESCE($5, residency), \
+           host = COALESCE($6, host) \
+         WHERE id = $1 RETURNING {CONNECTOR_COLUMNS}"
+    );
+    let row: Option<ConnectorRow> = sqlx::query_as(&sql)
+        .bind(id)
+        .bind(input.name.as_deref())
+        .bind(input.direction.as_deref())
+        .bind(input.environment.as_deref())
+        .bind(input.residency.as_deref())
+        .bind(input.host.as_deref())
+        .fetch_optional(pool)
+        .await?;
+    row.map(Connector::from).ok_or(StoreError::NotFound)
 }
 
 /// A slug-based id, same shape `pipelines::slug_id` uses
@@ -1422,6 +1599,28 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn credential_kind_of_ref_reads_every_derived_suffix() {
+        for source in [
+            CredentialSource::Env,
+            CredentialSource::File,
+            CredentialSource::Managed,
+        ] {
+            for kind in [
+                CredentialKind::Password,
+                CredentialKind::SecretKey,
+                CredentialKind::AccessKey,
+                CredentialKind::ApiKey,
+                CredentialKind::Token,
+                CredentialKind::PrivateKey,
+            ] {
+                let r = derive_secret_ref("conn-orders-k3x9", source, kind);
+                assert_eq!(credential_kind_of_ref(&r), Some(kind), "{r}");
+            }
+        }
+        assert_eq!(credential_kind_of_ref("env:SOMETHING_ELSE"), None);
+    }
     use uuid::Uuid;
 
     #[test]
@@ -1491,12 +1690,22 @@ mod tests {
             // format), not the `aud-conn-<id>` label this crate used to
             // fabricate.
             audit_event_id: Some(format!("audit-{}", Uuid::new_v4())),
+            credential_managed: true,
+            credential_kind: Some(CredentialKind::Password),
+            credential_secondary_kind: None,
+            residency: "in-region".to_owned(),
+            tenant_id: None,
         };
         let value = serde_json::to_value(&detail).unwrap();
         assert!(value.get("host").is_none());
         assert!(value.get("secretRef").is_none());
         assert!(value.get("discoveredAssets").is_some());
         assert!(value.get("dependentPipelines").is_some());
+        // A boolean only — never the ref it was derived from.
+        assert_eq!(
+            value.get("credentialManaged"),
+            Some(&serde_json::Value::Bool(true))
+        );
     }
 
     /// The `ConnectorRow::Debug` impl — the one type in this crate that
@@ -1517,6 +1726,8 @@ mod tests {
             last_test_at: Some(OffsetDateTime::now_utc()),
             capabilities: vec![],
             owner: "o".to_owned(),
+            residency: "in-region".to_owned(),
+            tenant_id: None,
         };
         let debug = format!("{row:?}");
         assert!(!debug.contains("super-secret-internal-host"));
@@ -1595,6 +1806,48 @@ mod tests {
             ),
             "file:/run/secrets/connector_conn_orders_k3x9_password"
         );
+        assert_eq!(
+            derive_secret_ref(
+                "conn-orders-k3x9",
+                CredentialSource::Managed,
+                CredentialKind::Password
+            ),
+            "file:/run/secrets/connector_managed_conn_orders_k3x9_password"
+        );
+    }
+
+    /// ADR 0002 Addendum 4: only a `Managed` ref is recognized as one the
+    /// API stores itself — never an operator's `File` or `Env` ref for the
+    /// same id, which the API must never overwrite or delete.
+    #[test]
+    fn only_a_managed_ref_is_recognized_as_managed() {
+        for kind in [
+            CredentialKind::Password,
+            CredentialKind::SecretKey,
+            CredentialKind::PrivateKey,
+        ] {
+            let id = "conn-orders-k3x9";
+            assert!(is_managed_secret_ref(&derive_secret_ref(
+                id,
+                CredentialSource::Managed,
+                kind
+            )));
+            assert!(!is_managed_secret_ref(&derive_secret_ref(
+                id,
+                CredentialSource::File,
+                kind
+            )));
+            assert!(!is_managed_secret_ref(&derive_secret_ref(
+                id,
+                CredentialSource::Env,
+                kind
+            )));
+        }
+        // The seeded, deployment-owned refs are never managed.
+        assert!(!is_managed_secret_ref("env:CONNECTOR_PG_PASSWORD"));
+        assert!(!is_managed_secret_ref(
+            "file:/run/secrets/connector_pg_password"
+        ));
     }
 
     /// A pattern-match check, ported the same way
@@ -1631,7 +1884,11 @@ mod tests {
             "file:/run/secrets/connector_*",
         ];
         for id in ["conn-orders-k3x9", "conn-a", "conn-pg-lakehouse-2"] {
-            for source in [CredentialSource::Env, CredentialSource::File] {
+            for source in [
+                CredentialSource::Env,
+                CredentialSource::File,
+                CredentialSource::Managed,
+            ] {
                 for kind in [
                     CredentialKind::Password,
                     CredentialKind::SecretKey,
@@ -1716,7 +1973,11 @@ mod tests {
         ];
         for (left, right) in pairs {
             assert_ne!(left, right, "test fixture bug: ids must differ");
-            for source in [CredentialSource::Env, CredentialSource::File] {
+            for source in [
+                CredentialSource::Env,
+                CredentialSource::File,
+                CredentialSource::Managed,
+            ] {
                 for left_kind in KINDS {
                     for right_kind in KINDS {
                         let left_ref = derive_secret_ref(left, source, left_kind);

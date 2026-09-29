@@ -34,6 +34,25 @@ export type ConnectorDetail = Connector & {
   recentErrors: { at: string; message: string }[]
   dependentPipelines: ConnectorDependent[]
   auditEventId?: string
+  /**
+   * Whether the connector's credential is one lakehouse stores itself
+   * (`source: "managed"`, ADR 0002 Addendum 4) — so the UI can offer
+   * "replace credential". A boolean only; the reference is never sent.
+   */
+  credentialManaged: boolean
+  /**
+   * The stored primary credential's kind (password, access key, …), read
+   * from its reference name — so the edit page asks for the right thing.
+   * `null` for a hand-seeded reference with no recognizable suffix. A kind
+   * only; neither the reference nor the value is ever sent.
+   */
+  credentialKind: CredentialKind | null
+  /** The secondary slot's kind; `null` when the connector has none (e.g. PostgreSQL). */
+  credentialSecondaryKind: CredentialKind | null
+  /** Residency label as stored — the edit page's current value. */
+  residency: string
+  /** Owning tenant's id; `null` for an unassigned connector. */
+  tenantId: string | null
 }
 
 export type ConnectorTestResult = {
@@ -89,7 +108,7 @@ export type SecretSlot = "primary" | "secondary"
  * Rust `CredentialSource` (`rust/crates/lakehouse-store/src/connectors.rs`)
  * field-for-field, including its `snake_case` wire form.
  */
-export type CredentialSource = "env" | "file"
+export type CredentialSource = "env" | "file" | "managed"
 
 /**
  * The fixed suffix a derived connector-credential name ends in. Mirrors
@@ -124,6 +143,64 @@ export type CredentialSpec = {
    * both slots to be set.
    */
   secondary?: CredentialKind
+  /**
+   * The credential VALUES, write-only — only with `source: "managed"` (ADR
+   * 0002 Addendum 4). The server writes them to its credential store and
+   * never returns them; the create response only says `credentialStored`.
+   */
+  values?: CredentialValues
+}
+
+/** Write-only credential values, one per declared slot. */
+export type CredentialValues = {
+  primary: string
+  secondary?: string
+}
+
+/** One slot's new credential in a `PUT /api/connectors/{id}/credential` body. */
+export type CredentialSlotValue = {
+  kind: CredentialKind
+  value: string
+}
+
+/**
+ * The `PUT /api/connectors/{id}/credential` body (ADR 0002 Addendum 4):
+ * user-supplied credential VALUES, one or both slots. Both in one request
+ * because an S3 access key and secret key only work as a pair — the server
+ * tests them together against the source and refuses (422) values the
+ * source rejects. Reference names are derived server-side, never chosen
+ * here.
+ */
+export type SetConnectorCredentialRequest = {
+  primary?: CredentialSlotValue
+  secondary?: CredentialSlotValue
+}
+
+/** The `PUT /api/connectors/{id}/credential` response. Never carries a value. */
+export type SetConnectorCredentialResponse = {
+  saved: boolean
+  slots: SecretSlot[]
+  /**
+   * Whether a real probe dialed the source with the new credential(s)
+   * before they were saved. `false` only for a type this build cannot
+   * probe — the values are saved, but unverified.
+   */
+  verified: boolean
+  message: string
+}
+
+/**
+ * The `PATCH /api/connectors/{id}` body: the editable, non-credential
+ * fields. Every field optional; an absent one is unchanged. Type is not
+ * editable; tenant, credential and connection settings (`dial`) each have
+ * their own route.
+ */
+export type UpdateConnectorInput = {
+  name?: string
+  direction?: Connector["direction"]
+  environment?: string
+  residency?: string
+  host?: string
 }
 
 /**
@@ -165,7 +242,11 @@ export type CreateConnectorInput = {
    * Addendum 3) -- see `CredentialSpec`'s doc comment. */
   credential: CredentialSpec
   environment: string
+  /** Display name — the server replaces it with the tenant row's own name
+   * whenever `tenantId` (or the caller's active tenant) resolves. */
   tenant: string
+  /** Must be one of the caller's tenants; absent = their active tenant. */
+  tenantId?: string
   residency: string
   capabilities: string[]
   owner?: string
@@ -189,6 +270,9 @@ export type ConnectorCredentialNames = {
  */
 export type CreateConnectorResponse = Connector & {
   credential: ConnectorCredentialNames
+  /** Whether the server stored the credential value(s) itself — i.e.
+   * nothing is left for an operator to provision. */
+  credentialStored: boolean
 }
 
 /**
@@ -520,6 +604,23 @@ export type IngestRun = {
 }
 
 /**
+ * One `ingest_job` run of one connector, from
+ * `GET /api/connectors/{id}/ingest/runs` (newest first). Mirrors Rust
+ * `ConnectorIngestRun` (`routes/connectors.rs`). A run that failed before
+ * reaching any table has no `IngestRun` rows at all; this is where it still
+ * shows.
+ */
+export type IngestJobRun = {
+  runId: string
+  /** The pipelines pages' vocabulary (`lakehouse_dagster::map_run_status`). */
+  status: "queued" | "running" | "completed" | "failed" | "cancelled" | "unknown"
+  /** ISO 8601; `null` until the run starts. */
+  startedAt: string | null
+  /** ISO 8601; `null` until the run ends. */
+  endedAt: string | null
+}
+
+/**
  * `GET /api/connectors/{id}/debezium-properties?table=`'s response.
  * Mirrors Rust `DebeziumPropertiesResponse`
  * (`rust/crates/lakehouse-api/src/routes/connectors.rs`). `properties`
@@ -572,9 +673,12 @@ export interface ConnectorService {
    */
   listTypes(signal?: AbortSignal): Promise<ConnectorType[]>
   listIngestible(signal?: AbortSignal): Promise<IngestibleConnector[]>
-  discoverConnector(id: string, signal?: AbortSignal): Promise<DiscoverResult>
+  /** `schema` is required for a `sql`/`cdc` connector: the server lists
+   * only that schema's tables (bound, never interpolated). */
+  discoverConnector(id: string, schema: string, signal?: AbortSignal): Promise<DiscoverResult>
   runIngest(id: string, signal?: AbortSignal): Promise<IngestRunResult>
   listIngestRuns(connectorId: string, signal?: AbortSignal): Promise<IngestRun[]>
+  listIngestJobRuns(connectorId: string, signal?: AbortSignal): Promise<IngestJobRun[]>
   /**
    * `GET /api/connectors/{id}/debezium-properties?table=` — a read-only
    * rendering of the `Debezium` `.properties` file body for a `cdc`
@@ -604,4 +708,31 @@ export interface ConnectorService {
     body: RotateConnectorSecretRequest,
     signal?: AbortSignal
   ): Promise<RotateConnectorSecretResponse>
+  /**
+   * `PUT /api/connectors/{id}/credential` — save a user-supplied credential
+   * as the connector's lakehouse-managed credential, probe-first (ADR 0002
+   * Addendum 4). See `SetConnectorCredentialRequest`.
+   */
+  setCredential(
+    id: string,
+    body: SetConnectorCredentialRequest,
+    signal?: AbortSignal
+  ): Promise<SetConnectorCredentialResponse>
+  /** `PATCH /api/connectors/{id}` — see `UpdateConnectorInput`. */
+  updateConnector(id: string, input: UpdateConnectorInput, signal?: AbortSignal): Promise<Connector>
+  /**
+   * `DELETE /api/connectors/{id}` — removes the connector and its managed
+   * credential files. Refused (409) while a pipeline still reads from it,
+   * `force` or not. A CDC connector's replication slot/publication is
+   * dropped first; when that fails the server answers 409 and keeps the
+   * connector, unless `force` is set (the slot must then be cleaned up by
+   * hand on the source database).
+   */
+  deleteConnector(id: string, options?: { force?: boolean }, signal?: AbortSignal): Promise<void>
+  /**
+   * `PUT /api/connectors/{id}/tenant` — move a connector to another tenant.
+   * A governance action: needs `identity:write`, which a connector manager
+   * may not hold (the server answers 403).
+   */
+  assignTenant(id: string, tenantId: string, signal?: AbortSignal): Promise<void>
 }

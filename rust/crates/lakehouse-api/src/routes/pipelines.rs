@@ -857,6 +857,11 @@ pub struct CreatePipelineBody {
     schedule: String,
     #[serde(default)]
     owner: Option<String>,
+    /// The connector this pipeline reads from (the console sends it from
+    /// the connector drawer's "Create pipeline" and the create form's
+    /// connector picker). Must be a connector in the creator's tenant.
+    #[serde(default)]
+    connector_id: Option<String>,
 }
 
 /// `POST /api/pipelines` — author a new pipeline definition. Returns 201.
@@ -876,6 +881,7 @@ pub struct CreatePipelineBody {
 pub async fn create(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<pipelines::Pipeline>)> {
     let body: CreatePipelineBody = parse_body(&body)?;
@@ -883,6 +889,14 @@ pub async fn create(
         crate::transform_grammar::parse_transform(transform).map_err(|err| {
             ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
         })?;
+    }
+    let tenant_id = creation_tenant(&principal, &headers)?;
+    let connector_id = body
+        .connector_id
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty());
+    if let Some(connector_id) = connector_id.as_deref() {
+        require_connector_in_tenant(pool(&state)?, connector_id, tenant_id).await?;
     }
     let input = CreatePipelineInput {
         name: body.name,
@@ -897,6 +911,8 @@ pub async fn create(
         schedule: body.schedule,
         owner: body.owner,
         description: body.description,
+        tenant_id: Some(tenant_id),
+        connector_id,
     };
     let created = create_named_pipeline(pool(&state)?, &input).await?;
     // WS5 item D4: best-effort, never turns a successful create into an
@@ -906,6 +922,40 @@ pub async fn create(
     // `pipeline:write`'s own `RequiresPermission` guarantee exactly.
     record_pipeline_audit(&state, &principal, "pipeline.create", &created.id).await;
     Ok((StatusCode::CREATED, ApiJson(created)))
+}
+
+/// The tenant a new pipeline belongs to: the creator's active tenant, the
+/// same rule `routes::connectors::create` follows. `list` shows a caller
+/// only its own tenant's authored pipelines, so a pipeline stored without
+/// one would be saved "successfully" and then never appear anywhere —
+/// exactly what every console-created pipeline did before this. A creator
+/// who belongs to no tenant is refused instead of given such a pipeline.
+fn creation_tenant(principal: &Principal, headers: &HeaderMap) -> Result<Uuid, ApiError> {
+    crate::tenant_scope::resolve(principal, headers)?.ok_or_else(|| {
+        ApiError::BadRequest(
+            "you do not belong to any tenant, so a pipeline created now would be visible to no \
+             one; ask an administrator to add you to a tenant first"
+                .to_owned(),
+        )
+    })
+}
+
+/// A pipeline may only read from a connector its own tenant owns. An
+/// unknown id, another tenant's connector and an unassigned one get the
+/// same answer, so this is no oracle for which connector ids exist.
+async fn require_connector_in_tenant(
+    pool: &PgPool,
+    connector_id: &str,
+    tenant_id: Uuid,
+) -> Result<(), ApiError> {
+    let connector = lakehouse_store::connectors::get_connector(pool, connector_id).await?;
+    let tenant = tenant_id.to_string();
+    match connector {
+        Some(c) if c.tenant_id.as_deref() == Some(tenant.as_str()) => Ok(()),
+        _ => Err(ApiError::BadRequest(format!(
+            "connector {connector_id} is not a connector in your tenant"
+        ))),
+    }
 }
 
 /// Create a pipeline, turning a name collision into a sentence that says
@@ -981,9 +1031,12 @@ fn derive_pipeline_name(text: &str) -> String {
 /// above.
 pub async fn generate(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<pipelines::Pipeline>)> {
     let body: GeneratePipelineBody = parse_body(&body)?;
+    let tenant_id = creation_tenant(&principal, &headers)?;
     // The draft used to be a name and nothing else: every generated
     // pipeline arrived reading `source_table` → `target_table`, kind
     // "incremental", schedule "On demand", whatever had been asked for.
@@ -1034,6 +1087,8 @@ pub async fn generate(
         // The instruction is kept verbatim as the description: it is the
         // only record of what this pipeline was asked to do.
         description: Some(body.instruction.clone()),
+        tenant_id: Some(tenant_id),
+        connector_id: None,
     };
     let created = create_named_pipeline(pool(&state)?, &input).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
@@ -1678,6 +1733,20 @@ mod tests {
         }
     }
 
+    /// `0002_seed_identity.sql`'s first tenant, present in every
+    /// `#[sqlx::test]` database (the full migrations directory runs).
+    pub(super) const SEED_TENANT: &str = "11111111-1111-4111-8111-000000000001";
+
+    /// [`fixture_user_principal`], as a member of [`SEED_TENANT`] — what
+    /// `create` needs: a pipeline is always created inside its author's
+    /// tenant.
+    pub(super) fn fixture_member_principal() -> Principal {
+        Principal {
+            tenant_ids: vec![SEED_TENANT.parse().unwrap()],
+            ..fixture_user_principal()
+        }
+    }
+
     /// A service-token principal — `PrincipalId::Service`.
     fn fixture_service_principal() -> Principal {
         Principal {
@@ -2191,6 +2260,112 @@ mod tests {
             AppState::new(config)
         }
 
+        fn create_body(extra: &Value) -> Bytes {
+            let mut body = json!({
+                "name": format!("tenant-route-test-{}", uuid::Uuid::new_v4()),
+                "kind": "batch",
+                "sourceZone": "bronze",
+                "sourceTable": "t",
+                "transforms": [],
+                "targetZone": "silver",
+                "targetTable": "t",
+                "schedule": "manual",
+            });
+            if let (Some(body), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+                body.extend(extra.clone());
+            }
+            Bytes::from(serde_json::to_vec(&body).expect("serialize"))
+        }
+
+        /// A console-created pipeline lands in its author's tenant and
+        /// keeps the connector it was created from. Before, both were
+        /// dropped: the pipeline was saved (the toast said so) but `list`,
+        /// which shows only the caller's tenant, never returned it, and the
+        /// connector could be deleted from under it.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_stores_the_authors_tenant_and_the_connector(pool: sqlx::PgPool) {
+            use lakehouse_test_support as _;
+
+            let state = pg_state_for(&pool);
+            let (_, ApiJson(created)) = create(
+                State(state.clone()),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                create_body(&json!({ "connectorId": "conn-pg-lakehouse" })),
+            )
+            .await
+            .expect("create should succeed");
+
+            let listed = pipelines::list_pipelines(
+                &pool,
+                &pipelines::PipelineFilter {
+                    tenant_id: Some(SEED_TENANT.parse().unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                listed.iter().any(|p| p.id == created.id),
+                "must be listed for its tenant"
+            );
+            let dependents =
+                lakehouse_store::connectors::dependent_pipelines(&pool, "conn-pg-lakehouse")
+                    .await
+                    .unwrap();
+            assert!(
+                dependents.iter().any(|d| d.id == created.id),
+                "must depend on its connector"
+            );
+        }
+
+        /// A connector outside the author's tenant (here: one that does not
+        /// exist) is refused, and nothing is stored.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_refuses_a_connector_outside_the_tenant(pool: sqlx::PgPool) {
+            use lakehouse_test_support as _;
+
+            let state = pg_state_for(&pool);
+            let err = create(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                create_body(&json!({ "connectorId": "conn-does-not-exist" })),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0.status(), 400);
+            let listed = pipelines::list_pipelines(
+                &pool,
+                &pipelines::PipelineFilter {
+                    tenant_id: Some(SEED_TENANT.parse().unwrap()),
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                listed
+                    .iter()
+                    .all(|p| !p.name.starts_with("tenant-route-test-"))
+            );
+        }
+
+        /// An author in no tenant is told so, instead of getting a pipeline
+        /// no list will ever show.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_refuses_an_author_with_no_tenant(pool: sqlx::PgPool) {
+            use lakehouse_test_support as _;
+
+            let err = create(
+                State(pg_state_for(&pool)),
+                Extension(fixture_user_principal()),
+                HeaderMap::new(),
+                create_body(&json!({})),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0.status(), 400);
+        }
+
         #[sqlx::test(migrations = "../../migrations")]
         async fn authored_detail_reports_engine_authored_null_graph_and_the_stored_definition(
             pool: sqlx::PgPool,
@@ -2213,7 +2388,8 @@ mod tests {
             );
             let (_, ApiJson(created)) = create(
                 State(state.clone()),
-                Extension(fixture_user_principal()),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
                 body,
             )
             .await
@@ -2770,7 +2946,7 @@ mod tests {
         use crate::state::AppState;
 
         use super::super::*;
-        use super::fixture_user_principal;
+        use super::fixture_member_principal;
 
         fn database_url_for(pool: &sqlx::PgPool) -> String {
             let options = pool.connect_options();
@@ -2816,9 +2992,14 @@ mod tests {
                 .expect("serialize"),
             );
 
-            let err = create(State(state), Extension(fixture_user_principal()), body)
-                .await
-                .unwrap_err();
+            let err = create(
+                State(state),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                body,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(err.0.status(), 400);
             let message = err.0.to_string();
             assert!(
@@ -2905,7 +3086,8 @@ mod tests {
             );
             let (_, ApiJson(pipeline)) = create(
                 State(state.clone()),
-                Extension(fixture_user_principal()),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
                 body,
             )
             .await
@@ -3061,7 +3243,8 @@ mod tests {
             );
             let (_, ApiJson(pipeline)) = create(
                 State(state.clone()),
-                Extension(fixture_user_principal()),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
                 body,
             )
             .await

@@ -24,6 +24,7 @@ use serde_json::{Map, Value, json};
 
 use crate::error::ApiResult;
 use crate::json::ApiJson;
+use crate::routes::lakehouse::is_unknown_table_error;
 use crate::routes::support::{js_error, nullable_u64_col, str_col};
 use crate::state::AppState;
 use crate::tenant::{TENANT_ID, TENANT_SITE};
@@ -606,7 +607,12 @@ pub struct IngestRunRow {
     pub error: String,
 }
 
-/// Build every `bronze_meta.ingest_run` row for `connector_id`.
+/// How many of a connector's most recent per-table results
+/// [`ingest_runs_for_connector`] returns.
+const INGEST_RUN_ROWS: u32 = 500;
+
+/// Build `connector_id`'s most recent `bronze_meta.ingest_run` rows, newest
+/// first.
 ///
 /// # Errors
 ///
@@ -615,9 +621,14 @@ async fn ingest_runs_for_connector(
     ch: &ChClient,
     connector_id: &str,
 ) -> Result<Vec<IngestRunRow>, ChError> {
+    // Newest first, bounded: the console groups these under the run each
+    // one belongs to, and a connector on an hourly schedule records a row
+    // per table every hour. `started_at` is ISO-8601 UTC from one writer
+    // (`record_ingest_run`), so ordering the text orders the time.
     let sql = format!(
         "SELECT connector_id, job, object, rows, started_at, ended_at, status, error \
-         FROM lake.`bronze_meta.ingest_run` WHERE connector_id = {}",
+         FROM lake.`bronze_meta.ingest_run` WHERE connector_id = {} \
+         ORDER BY started_at DESC LIMIT {INGEST_RUN_ROWS}",
         // WS3 plan review Z10: the workspace-wide literal-escaping helper,
         // used identically to `routes::ops::kill_query_sql`/`routes::catalog`
         // for a caller-supplied value in a hand-`format!`ed `ClickHouse`
@@ -641,12 +652,34 @@ async fn ingest_runs_for_connector(
         .collect())
 }
 
+/// [`ingest_runs_for_connector`], with "no run recorded yet" as the empty
+/// list it is. `bronze_meta.ingest_run` is created lazily by
+/// `dagster/dispar_orchestrate/bronze_catalog.py::record_ingest_run` on
+/// the first recorded run, so `ClickHouse` reporting the table does not
+/// exist ([`is_unknown_table_error`]) truthfully means nothing has been
+/// recorded for any connector — the same reasoning
+/// `routes::lakehouse::maintenance_verb_runs_or_empty` applies to its own
+/// lazily created table. Every other failure still surfaces.
+///
+/// # Errors
+///
+/// Returns [`ChError`] for any failure other than an unknown table.
+async fn ingest_runs_or_empty(
+    ch: &ChClient,
+    connector_id: &str,
+) -> Result<Vec<IngestRunRow>, ChError> {
+    match ingest_runs_for_connector(ch, connector_id).await {
+        Err(ChError::Server(ref body)) if is_unknown_table_error(body) => Ok(Vec::new()),
+        other => other,
+    }
+}
+
 /// `GET /api/governance/ingest-runs?connectorId=<id>`.
 pub async fn ingest_runs(
     State(state): State<AppState>,
     Query(q): Query<IngestRunsQuery>,
 ) -> Response {
-    match ingest_runs_for_connector(&state.clickhouse, &q.connector_id).await {
+    match ingest_runs_or_empty(&state.clickhouse, &q.connector_id).await {
         Ok(rows) => (StatusCode::OK, ApiJson(rows)).into_response(),
         Err(err) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1350,6 +1383,41 @@ mod tests {
             rows[0].rows, None,
             "a NULL rows column must never become a fabricated 0"
         );
+    }
+
+    /// Before any run has recorded an outcome, `bronze_meta.ingest_run`
+    /// does not exist yet: that is "no runs", not an outage.
+    #[tokio::test]
+    async fn ingest_runs_or_empty_reports_no_runs_before_the_table_exists() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(404).set_body_string(
+                "Code: 60. DB::Exception: Unknown table expression identifier \
+                 'lake.bronze_meta.ingest_run' in scope SELECT connector_id FROM \
+                 lake.`bronze_meta.ingest_run`. (UNKNOWN_TABLE)",
+            ))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        let rows = ingest_runs_or_empty(&ch, "conn-x").await.unwrap();
+
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ingest_runs_or_empty_still_surfaces_any_other_failure() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(500)
+                    .set_body_string("Code: 210. DB::NetException: Connection refused"),
+            )
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        assert!(ingest_runs_or_empty(&ch, "conn-x").await.is_err());
     }
 
     #[test]

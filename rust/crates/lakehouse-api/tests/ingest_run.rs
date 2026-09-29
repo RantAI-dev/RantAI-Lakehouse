@@ -25,7 +25,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::{TestApp, session_cookie_for_seeded_user, spin_up, spin_up_with_env};
@@ -38,6 +38,26 @@ async fn spin_up_with_dagster(dagster_graphql_url: &str) -> TestApp {
     let mut overrides = HashMap::new();
     overrides.insert("DAGSTER_URL".to_owned(), dagster_graphql_url.to_owned());
     spin_up_with_env(&overrides).await
+}
+
+/// Answers `ingest/run`'s "is a run already going?" check with `results`
+/// (`runsOrError` rows carrying `runConfig`).
+async fn mount_recent_runs(server: &MockServer, results: Value) {
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("runsOrError"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "runsOrError": { "__typename": "Runs", "results": results } }
+        })))
+        .mount(server)
+        .await;
+}
+
+fn ingest_run_for(connector_id: &str, run_id: &str, status: &str) -> Value {
+    json!({
+        "runId": run_id, "status": status, "startTime": 1_790_670_111.0, "endTime": null,
+        "runConfig": { "ops": { "run_ingest": { "config": { "connector_id": connector_id } } } }
+    })
 }
 
 async fn seed_sql_connector(pool: &sqlx::PgPool, id: &str) {
@@ -76,8 +96,10 @@ async fn seed_cdc_connector(pool: &sqlx::PgPool, id: &str) {
 #[tokio::test]
 async fn ingest_run_launches_the_static_ingest_job_with_this_connectors_id() {
     let server = MockServer::start().await;
+    mount_recent_runs(&server, json!([])).await;
     Mock::given(method("POST"))
         .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "launchRun": { "__typename": "LaunchRunSuccess", "run": { "runId": "run-ingest-1" } } }
         })))
@@ -186,8 +208,10 @@ async fn ingest_run_unknown_connector_is_404() {
 #[tokio::test]
 async fn ingest_run_dagster_launch_failure_is_422_not_200() {
     let server = MockServer::start().await;
+    mount_recent_runs(&server, json!([])).await;
     Mock::given(method("POST"))
         .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "data": { "launchRun": { "__typename": "PythonError", "message": "job not found" } }
         })))
@@ -218,4 +242,140 @@ async fn ingest_run_dagster_launch_failure_is_422_not_200() {
         .expect("read body");
     let body: Value = serde_json::from_slice(&bytes).expect("valid JSON");
     assert_eq!(body["error"], "job not found");
+}
+
+/// A second run while this connector's run is still going is refused with
+/// a 409, and nothing is launched: Bronze is append-only, so it would copy
+/// every table in a second time.
+#[tokio::test]
+async fn ingest_run_refuses_a_second_run_while_one_is_going() {
+    let server = MockServer::start().await;
+    mount_recent_runs(
+        &server,
+        json!([ingest_run_for(
+            "conn-ingest-busy",
+            "7bd3a0c4-busy",
+            "STARTED"
+        )]),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "launchRun": { "__typename": "LaunchRunSuccess", "run": { "runId": "never" } } }
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_sql_connector(&app.pool, "conn-ingest-busy").await;
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/connectors/conn-ingest-busy/ingest/run")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+    let error = body["error"].as_str().expect("error is a string");
+    assert!(error.contains("already running"), "{error}");
+    assert!(error.contains("7bd3a0c4"), "{error}");
+}
+
+/// Another connector's run does not block this one.
+#[tokio::test]
+async fn ingest_run_is_not_blocked_by_another_connectors_run() {
+    let server = MockServer::start().await;
+    mount_recent_runs(
+        &server,
+        json!([ingest_run_for("conn-someone-else", "other-run", "STARTED")]),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("launchRun"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "launchRun": { "__typename": "LaunchRunSuccess", "run": { "runId": "run-mine" } } }
+        })))
+        .mount(&server)
+        .await;
+
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+    seed_sql_connector(&app.pool, "conn-ingest-free").await;
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/connectors/conn-ingest-free/ingest/run")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// `GET .../ingest/runs` lists only this connector's runs, newest first,
+/// in the pipelines pages' status vocabulary.
+#[tokio::test]
+async fn ingest_run_history_lists_only_this_connectors_runs() {
+    let server = MockServer::start().await;
+    mount_recent_runs(
+        &server,
+        json!([
+            ingest_run_for("conn-ingest-hist", "run-2", "STARTED"),
+            ingest_run_for("conn-someone-else", "run-x", "SUCCESS"),
+            ingest_run_for("conn-ingest-hist", "run-1", "FAILURE"),
+        ]),
+    )
+    .await;
+
+    let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/connectors/conn-ingest-hist/ingest/runs")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router never fails a request outright");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let body: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+    let runs = body.as_array().expect("an array");
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0]["runId"], "run-2");
+    assert_eq!(runs[0]["status"], "running");
+    assert_eq!(runs[1]["runId"], "run-1");
+    assert_eq!(runs[1]["status"], "failed");
 }
