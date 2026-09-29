@@ -28,6 +28,8 @@ function DataIcon({ label }: { label: string }) {
   if (/^(GET|POST|PUT|DELETE) /.test(label)) return <GlobeIcon className={cls} aria-hidden />
   if (/^RustFS/i.test(label)) return <HardDriveIcon className={cls} aria-hidden />
   if (/^Op config/i.test(label)) return <SlidersHorizontalIcon className={cls} aria-hidden />
+  // A bare `zone.table`, as an authored pipeline names its tables.
+  if (/^\w+\.\w+$/.test(label)) return <DatabaseIcon className={cls} aria-hidden />
   return <BoxIcon className={cls} aria-hidden />
 }
 
@@ -56,12 +58,14 @@ function NodeCard({
   onSelect,
   durationMs,
   dataCaption,
+  runSelected,
 }: {
   node: PositionedNode
   selected: boolean
   onSelect?: (node: PositionedNode) => void
   durationMs?: number | null
   dataCaption: { source: string; sink: string }
+  runSelected: boolean
 }) {
   const style = { left: node.x, top: node.y, width: node.w, height: node.h }
   const base =
@@ -86,7 +90,7 @@ function NodeCard({
           <span className="block font-mono text-[9px] uppercase tracking-[0.16em] text-muted-foreground">
             {node.kind === "source" ? dataCaption.source : dataCaption.sink}
           </span>
-          <span className="line-clamp-2 text-xs font-medium leading-4">{node.label}</span>
+          <span className="line-clamp-2 text-xs font-medium leading-4 [overflow-wrap:anywhere]">{node.label}</span>
           {node.sublabel ? <span className="block truncate text-[10px] text-muted-foreground">{node.sublabel}</span> : null}
         </span>
       </button>
@@ -133,7 +137,9 @@ function NodeCard({
               {statusLabel(node.status)}
             </span>
           ) : (
-            <span>no run selected</span>
+            // A selected run with no step for this op: it never started,
+            // typically because an upstream op failed.
+            <span>{runSelected ? "did not run" : "no run selected"}</span>
           )}
           {durationMs != null ? <span className="font-mono tabular-nums">{formatDuration(durationMs)}</span> : null}
         </span>
@@ -155,6 +161,7 @@ export function PipelineFlowchart({
   onSelect,
   durations,
   dataCaption = { source: "reads", sink: "writes" },
+  runSelected = false,
 }: {
   nodes: FlowNodeSpec[]
   edges: FlowEdgeSpec[]
@@ -163,6 +170,8 @@ export function PipelineFlowchart({
   /** Wall time per node id, from the selected run's steps. */
   durations?: Record<string, number | null>
   dataCaption?: { source: string; sink: string }
+  /** Whether a run's steps colour the ops; an op missing from them did not run. */
+  runSelected?: boolean
 }) {
   const reduce = useReducedMotion() ?? false
   const layout = React.useMemo(() => layoutFlow(nodes, edges), [nodes, edges])
@@ -210,6 +219,7 @@ export function PipelineFlowchart({
             onSelect={onSelect}
             durationMs={durations?.[node.id]}
             dataCaption={dataCaption}
+            runSelected={runSelected}
           />
         ))}
       </div>

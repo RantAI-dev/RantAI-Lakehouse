@@ -39,20 +39,26 @@ export type FlowLayout = {
 }
 
 const SIZE: Record<FlowKind, { w: number; h: number }> = {
-  source: { w: 236, h: 58 },
-  sink: { w: 236, h: 58 },
-  op: { w: 252, h: 86 },
-  transform: { w: 228, h: 58 },
+  source: { w: 208, h: 58 },
+  sink: { w: 208, h: 58 },
+  op: { w: 224, h: 86 },
+  transform: { w: 216, h: 58 },
 }
 
-const COL_GAP = 76
+/** Sized so a two-op job (read, op, op, write) fits the content width of a 1440 px screen. */
+const COL_GAP = 56
 const ROW_GAP = 16
 const PAD = 12
 
 /** Places `nodes` in their columns, each column centred on the tallest one. */
 export function layoutFlow(nodes: readonly FlowNodeSpec[], edges: readonly FlowEdgeSpec[]): FlowLayout {
   const columns = [...new Set(nodes.map((n) => n.column))].sort((a, b) => a - b)
-  const byColumn = columns.map((c) => nodes.filter((n) => n.column === c))
+  // Within a column, ops and transforms first, then data, so a job's
+  // spine of ops lines up and its data hangs below.
+  const rank = (n: FlowNodeSpec) => (n.kind === "op" || n.kind === "transform" ? 0 : 1)
+  const byColumn = columns.map((c) =>
+    nodes.filter((n) => n.column === c).sort((a, b) => rank(a) - rank(b))
+  )
   const colWidth = byColumn.map((col) => Math.max(...col.map((n) => SIZE[n.kind].w)))
   const colHeight = byColumn.map(
     (col) => col.reduce((sum, n) => sum + SIZE[n.kind].h, 0) + ROW_GAP * (col.length - 1)
@@ -96,8 +102,10 @@ export function edgePath(from: PositionedNode, to: PositionedNode): string {
 }
 
 /**
- * A Dagster job: declared reads, then ops by dependency depth, then
- * declared writes. A phrase two ops share is one node with two edges.
+ * A Dagster job: ops by dependency depth, each op's declared reads in the
+ * column just before it and its declared writes in the column just after,
+ * so no edge has to cross another op to reach its data. A phrase two ops
+ * share is one node, placed where it first appears, with two edges.
  */
 export function dagsterFlow(
   ops: readonly PipelineOpNode[],
@@ -109,9 +117,8 @@ export function dagsterFlow(
   for (const { node, upstream } of sorted) {
     depth.set(node.name, upstream.length === 0 ? 0 : Math.max(...upstream.map((u) => (depth.get(u) ?? 0) + 1)))
   }
-  const hasReads = ops.some((op) => (op.reads ?? []).length > 0)
-  const opBase = hasReads ? 1 : 0
-  const maxDepth = Math.max(0, ...depth.values())
+  // Column 0 is kept for reads only when an entry op declares some.
+  const opBase = sorted.some(({ node, upstream }) => upstream.length === 0 && (node.reads ?? []).length > 0) ? 1 : 0
 
   const nodes: FlowNodeSpec[] = []
   const edges: FlowEdgeSpec[] = []
@@ -127,19 +134,18 @@ export function dagsterFlow(
 
   for (const { node } of sorted) {
     const id = `op:${node.name}`
+    const column = opBase + (depth.get(node.name) ?? 0)
     nodes.push({
       id,
-      column: opBase + (depth.get(node.name) ?? 0),
+      column,
       kind: "op",
       label: node.name,
       sublabel: node.sourceRef ?? undefined,
       status: stepStatus(node.name),
       ref: node.name,
     })
-    for (const phrase of node.reads ?? []) edges.push({ from: dataNode("source", phrase, 0), to: id })
-    for (const phrase of node.writes ?? []) {
-      edges.push({ from: id, to: dataNode("sink", phrase, opBase + maxDepth + 1) })
-    }
+    for (const phrase of node.reads ?? []) edges.push({ from: dataNode("source", phrase, Math.max(0, column - 1)), to: id })
+    for (const phrase of node.writes ?? []) edges.push({ from: id, to: dataNode("sink", phrase, column + 1) })
   }
   for (const e of opEdges) edges.push({ from: `op:${e.from}`, to: `op:${e.to}` })
   return { nodes, edges }

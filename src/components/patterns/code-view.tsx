@@ -37,7 +37,7 @@ export function CodeView({
   return (
     <div
       className={cn(
-        "overflow-hidden rounded-md border border-border bg-background [&_.cm-editor]:outline-none [&_.cm-scroller]:font-mono [&_.cm-scroller]:text-sm",
+        "overflow-hidden rounded-md border border-border bg-background [&_.cm-editor]:outline-none [&_.cm-scroller]:font-mono [&_.cm-scroller]:text-sm [&_.cm-scroller]:leading-5 [&_.cm-gutterElement]:leading-5 [&_.cm-line]:leading-5",
         className
       )}
     >

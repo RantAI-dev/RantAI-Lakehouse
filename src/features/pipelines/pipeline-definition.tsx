@@ -170,6 +170,7 @@ export function DagsterDefinition({
         selectedId={selectedId}
         onSelect={(n) => setSelected(n.id)}
         durations={durations}
+        runSelected={steps !== null}
       />
 
       {op ? (
@@ -277,7 +278,7 @@ export function AuthoredFlow({ pipeline }: { pipeline: PipelineDetail }) {
           </div>
           <p className="text-xs text-muted-foreground">
             The record the engine reads. An authored pipeline has no code of its own: the generic job in{" "}
-            <code className="font-mono">authored_factory.py</code> reads this and builds its SQL from the transforms.
+            <code className="font-mono text-[11px]">authored_factory.py</code> reads this and builds its SQL from the transforms.
           </p>
           <CodeView text={JSON.stringify(def, null, 2)} language="plain" />
         </section>

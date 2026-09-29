@@ -416,7 +416,7 @@ export function PipelineDetailPage() {
             <DagsterDefinition
               pipeline={p}
               runLabel={selectedRun ? `run ${selectedRun.id.slice(0, 8)} (${formatRelativeTime(selectedRun.startedAt, now)})` : null}
-              steps={stepsState.status === "success" ? stepsState.data : null}
+              steps={selectedRun && stepsState.status === "success" ? stepsState.data : null}
             />
           )}
         </TabsContent>

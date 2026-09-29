@@ -22,16 +22,17 @@ describe("dagsterFlow", () => {
     expect(nodes[0].status).toBe("completed")
   })
 
-  test("ops sit at their dependency depth and writes come after the deepest op", () => {
+  test("ops sit at their dependency depth, each op's data right beside it", () => {
     const { nodes } = dagsterFlow(
       [op("ingest", ["Postgres x"], ["Iceberg y"]), op("register", [], ["ClickHouse z"])],
       [{ from: "ingest", to: "register" }],
       () => undefined
     )
     const col = Object.fromEntries(nodes.map((n) => [n.id, n.column]))
+    expect(col["source:Postgres x"]).toBe(0)
     expect(col["op:ingest"]).toBe(1)
     expect(col["op:register"]).toBe(2)
-    expect(col["sink:Iceberg y"]).toBe(3)
+    expect(col["sink:Iceberg y"]).toBe(2)
     expect(col["sink:ClickHouse z"]).toBe(3)
   })
 
