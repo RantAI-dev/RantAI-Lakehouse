@@ -298,7 +298,7 @@ fn contains_trino_denied_keyword(sql: &str) -> bool {
 /// underlying Postgres/`sqlparser` error text never reaches the response,
 /// `AGENTS.md` rule 4) when obligations cannot be resolved or `sql` fails
 /// classification/substitution.
-async fn rewrite_sql_for_principal(
+pub(crate) async fn rewrite_sql_for_principal(
     state: &AppState,
     sql: &str,
     engine: &str,
@@ -335,8 +335,7 @@ async fn rewrite_sql_for_principal_inner(
             .map(ToString::to_string)
             .collect(),
     };
-    let obligations_source =
-        crate::policy_engine::PolicyEngineObligations::new(state.pg.as_deref(), &state.clickhouse);
+    let obligations_source = crate::policy_engine::PolicyEngineObligations::from_state(state);
 
     // WS7 item D1/D2: the actual referenced-tables/prefetch/enforce
     // sequence now lives in ONE place —

@@ -11,7 +11,9 @@ mod ai;
 mod alerts;
 pub mod auth;
 mod catalog;
+mod catalog_profile;
 mod catalog_query;
+mod catalog_source;
 mod connectors;
 mod dashboard;
 mod embed;
@@ -484,6 +486,7 @@ pub fn router(state: AppState) -> Router {
         // that `query` is a literal path and not an asset called "query".
         .route("/api/catalog/query", get(catalog::query))
         .route("/api/catalog/{id}", get(catalog::detail))
+        .route("/api/catalog/{id}/profile", get(catalog_profile::profile))
         .route(
             "/api/catalog/{id}/annotation",
             get(catalog::get_annotation).put(catalog::put_annotation),

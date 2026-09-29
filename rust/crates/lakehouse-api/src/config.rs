@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 
+use lakehouse_core::ident::Ident;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -280,6 +281,15 @@ pub struct Config {
     /// combine `tenant::TENANT_ID` with the convention ADR 0003 defines.
     /// Default `"default"`.
     pub lakekeeper_warehouse: String,
+    /// `ICEBERG_QUERY_DB` — the `ClickHouse` `DataLakeCatalog` database
+    /// this API reads Iceberg tables through (compose's
+    /// `clickhouse-iceberg-init` creates it as `icecat_api`). Used to
+    /// resolve an Iceberg table's real columns for policy enforcement
+    /// (`policy_engine`) and to read Iceberg-only catalog assets
+    /// (`routes::catalog`, `routes::catalog_profile`). `None` when unset
+    /// or not a plain identifier: Iceberg tables then stay unreadable
+    /// through those paths, and a governed one is refused, never read raw.
+    pub iceberg_query_db: Option<Ident>,
     /// Base URL of Lakekeeper's own `management/v1/*` REST API (e.g.
     /// `http://lakekeeper:8181`), used ONLY by
     /// `lakehouse_auth::openfga::LakekeeperAdminClient`
@@ -649,6 +659,7 @@ impl std::fmt::Debug for Config {
             .field("smtp_from", &self.smtp_from)
             .field("lakekeeper_catalog_uri", &self.lakekeeper_catalog_uri)
             .field("lakekeeper_warehouse", &self.lakekeeper_warehouse)
+            .field("iceberg_query_db", &self.iceberg_query_db)
             .field("lakekeeper_base_url", &self.lakekeeper_base_url)
             .field(
                 "lakekeeper_credential_secret_ref",
@@ -934,6 +945,7 @@ impl Config {
                 "http://localhost:8181/catalog",
             ),
             lakekeeper_warehouse: or_default(env, "LAKEKEEPER_WAREHOUSE", "default"),
+            iceberg_query_db: truthy(env, "ICEBERG_QUERY_DB").and_then(|v| Ident::new(v).ok()),
             lakekeeper_base_url: or_default(env, "LAKEKEEPER_BASE_URI", "http://localhost:8181"),
             lakekeeper_credential_secret_ref: truthy(env, "LAKEKEEPER_CREDENTIAL_SECRET_REF"),
             rustfs_s3_endpoint: or_default(env, "RUSTFS_S3_ENDPOINT", "http://localhost:9010"),
@@ -1040,6 +1052,19 @@ mod tests {
             .collect()
     }
 
+    /// A plain identifier is kept; anything that could not be interpolated
+    /// safely into `ClickHouse` SQL turns the feature off instead.
+    #[test]
+    fn iceberg_query_db_accepts_only_a_plain_identifier() {
+        let cfg = Config::from_map(&map(&[("ICEBERG_QUERY_DB", "icecat_api")])).unwrap();
+        assert_eq!(
+            cfg.iceberg_query_db.as_ref().map(Ident::as_str),
+            Some("icecat_api")
+        );
+        let cfg = Config::from_map(&map(&[("ICEBERG_QUERY_DB", "x`; DROP")])).unwrap();
+        assert_eq!(cfg.iceberg_query_db, None);
+    }
+
     /// H1: `{:?}` must never leak a secret value, however it's populated.
     #[test]
     fn debug_redacts_all_secret_fields() {
@@ -1106,6 +1131,7 @@ mod tests {
         );
         assert_eq!(cfg.lakekeeper_catalog_uri, "http://localhost:8181/catalog");
         assert_eq!(cfg.lakekeeper_warehouse, "default");
+        assert_eq!(cfg.iceberg_query_db, None);
         assert_eq!(cfg.lakekeeper_base_url, "http://localhost:8181");
         assert_eq!(cfg.lakekeeper_credential_secret_ref, None);
         assert_eq!(cfg.rustfs_s3_endpoint, "http://localhost:9010");

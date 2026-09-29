@@ -304,6 +304,13 @@ services:
       #    ALERTS_RUN_TOKEN). ──
       LAKEKEEPER_CATALOG_URI: http://lakekeeper:8181/catalog
       LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+      # The `DataLakeCatalog` database `clickhouse-iceberg-init` creates:
+      # how policy enforcement resolves an Iceberg table's columns and how
+      # the catalog reads Iceberg-only assets (`Config::iceberg_query_db`).
+      # Not a boot dependency, same posture as `lakekeeper-authz-init`
+      # above: until the database exists those reads degrade to "not
+      # available", and a governed Iceberg table is refused, never read raw.
+      ICEBERG_QUERY_DB: ${ICEBERG_QUERY_DB:-icecat_api}
       LAKEKEEPER_GOLD_EXPORT_TOKEN_FILE: /tokens/gold-export.jwt
       # WS2 amendment A0 — the `lakehouse-api-reader` principal
       # (`ops/oidc-mock/server.py`'s `PRINCIPALS`), read-only metadata
@@ -1099,6 +1106,40 @@ services:
   #        -e CH_RUSTFS_S3_ENDPOINT=http://seaweedfs:8333 \
   #        g1-test-runner
   # This is what `.github/workflows/ci.yml`'s `g2-seaweedfs` job does.
+  # The API's own `DataLakeCatalog` database (`ICEBERG_QUERY_DB` on
+  # `lakehouse-api`): read access to Lakekeeper's Iceberg tables through
+  # ClickHouse, for Query Studio, policy enforcement, and the catalog's
+  # sample/profile. Same settings as the `icecat_*` databases the Dagster
+  # jobs create for themselves (`maintenance.py::_ensure_catalog_database`),
+  # authenticated as the same `clickhouse-reader` principal, but owned by
+  # none of those jobs, so the API never reads through another job's
+  # database. `IF NOT EXISTS`: safe to re-run on every `up`.
+  clickhouse-iceberg-init:
+    image: clickhouse/clickhouse-server:26.8
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      lakekeeper-authz-init:
+        condition: service_completed_successfully
+    environment:
+      CH_USER: ${CH_USER:-default}
+      CH_PASSWORD: ${CH_PASSWORD:-}
+      ICEBERG_QUERY_DB: ${ICEBERG_QUERY_DB:-icecat_api}
+      LAKEKEEPER_WAREHOUSE: ${LAKEKEEPER_WAREHOUSE:-default}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        set -eu &&
+        clickhouse-client --host clickhouse --user "$$CH_USER" --password "$$CH_PASSWORD"
+        --query "CREATE DATABASE IF NOT EXISTS $$ICEBERG_QUERY_DB
+        ENGINE = DataLakeCatalog('http://lakekeeper:8181/catalog')
+        SETTINGS catalog_type = 'rest', warehouse = '$$LAKEKEEPER_WAREHOUSE',
+        storage_endpoint = 'http://rustfs:9000',
+        catalog_credential = 'clickhouse-reader:unused',
+        oauth_server_uri = 'http://oidc-mock:8090/token'
+        SETTINGS allow_database_iceberg = 1"
+    restart: "no"
+
   g1-test-runner:
     profiles: ["test"]
     image: rust:1.96.1-slim

@@ -1,5 +1,6 @@
 "use client"
 
+import * as React from "react"
 import Link from "next/link"
 import { EmptyState, ErrorState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
@@ -25,6 +26,9 @@ import { fmtMeasured } from "@/lib/measured"
 import { lakehouseService } from "@/services"
 import { cn } from "@/lib/utils"
 import type { AssetDetail } from "@/services/contracts/assets"
+import { assetQueryStudioHref } from "@/lib/asset-query"
+import { AssetColumnProfile } from "./asset-column-profile"
+import { AssetOverview, type AssetTab } from "./asset-overview"
 
 function QuietEmpty({ title }: { title: string }) {
   return <EmptyState title={title} className="py-4" />
@@ -102,13 +106,20 @@ function dependentHref(id: string, kind: string) {
   return `/data/assets/${id}`
 }
 
-/** Tab strip for the asset detail page: schema, sample, quality, and metadata. */
+/** Tab strip for the asset detail page: overview, schema, sample, quality, and metadata. */
 export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
   const sampleColumns = Object.keys(a.sample[0] ?? {})
+  // Controlled so the overview's tiles can open the tab behind each number.
+  const [tab, setTab] = React.useState<AssetTab>("overview")
 
   return (
-    <Tabs defaultValue="schema" className="gap-1.5">
+    <Tabs
+      value={tab}
+      onValueChange={(v) => setTab(v as AssetTab)}
+      className="gap-1.5"
+    >
       <TabsList>
+        <TabsTrigger value="overview">Overview</TabsTrigger>
         <TabsTrigger value="schema">
           <TabLabel label="Schema" count={a.schema.length} />
         </TabsTrigger>
@@ -143,6 +154,10 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
         <TabsTrigger value="usage">Usage</TabsTrigger>
       </TabsList>
 
+      <TabsContent value="overview" className="mt-2">
+        <AssetOverview asset={a} onNavigate={setTab} />
+      </TabsContent>
+
       <TabsContent value="schema" className="mt-2 flex flex-col gap-2">
         <SectionCard size="sm" title="Columns">
           {a.schema.length === 0 ? (
@@ -166,6 +181,7 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
             </ul>
           )}
         </SectionCard>
+        <AssetColumnProfile assetId={a.id} schema={a.schema} />
         <SectionCard
           size="sm"
           title="Schema versions"
@@ -197,7 +213,13 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
           title="Sample rows"
           description="Masked values applied where policy requires."
         >
-          {a.sample.length === 0 ? (
+          {a.sampleRestricted ? (
+            <EmptyState
+              title="Sample rows need query access"
+              description="Rows are data, so they require the query:read permission. Use Request access above to ask for it."
+              className="py-4"
+            />
+          ) : a.sample.length === 0 ? (
             <QuietEmpty title="No sample rows available" />
           ) : (
             <div className="overflow-hidden rounded-lg border border-border">
@@ -301,7 +323,13 @@ export function AssetDetailTabs({ asset: a }: { asset: AssetDetail }) {
           >
             Open lineage graph
           </Button>
-          <Button size="sm" variant="ghost" render={<Link href="/query-studio" />}>
+          <Button
+            size="sm"
+            variant="ghost"
+            render={
+              <Link href={assetQueryStudioHref(a)} />
+            }
+          >
             Query this asset
           </Button>
         </div>

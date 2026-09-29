@@ -43,15 +43,16 @@ import { AssetDetailTabs } from "./asset-detail-tabs"
 
 /**
  * Candidate permissions the "Request access" dialog offers. Not every
- * governed permission — narrowed to the two a catalog viewer would
+ * governed permission — narrowed to the three a catalog viewer would
  * plausibly need: `catalog:write` (the Phase E acceptance criterion the
- * WS7 plan names) and `lineage:read` (gates this same page's lineage
- * tab). `requestableAccessPermissions` (`@/lib/access-requests`) further
+ * WS7 plan names), `lineage:read` (gates this same page's lineage
+ * tab), and `query:read` (gates this page's sample rows and column
+ * profile). `requestableAccessPermissions` (`@/lib/access-requests`) further
  * excludes whichever of these the signed-in principal already holds — a
  * permission already granted is never offered, since requesting it 400s
  * server-side (`routes::catalog::access_request`'s own check).
  */
-const REQUESTABLE_PERMISSIONS = ["catalog:write", "lineage:read"] as const
+const REQUESTABLE_PERMISSIONS = ["catalog:write", "lineage:read", "query:read"] as const
 
 /** Asset detail with schema, freshness, lineage hops, policies, and snapshots. */
 export function AssetDetailPage() {

@@ -94,7 +94,71 @@ export type AssetDetail = Asset & {
    * does not set it. Consumers must treat `undefined` exactly like `null`.
    */
   tableName?: string | null
+  /**
+   * `true` when `sample` is empty because the caller lacks `query:read`
+   * (the API withholds rows from `catalog:read`-only callers), not
+   * because the asset has none. Absent from older API builds.
+   */
+  sampleRestricted?: boolean
+  /**
+   * What to query this asset as in Query Studio, resolved by the API
+   * (`routes::catalog_source`): e.g. an Iceberg-only Bronze dataset is
+   * `icecat_api.\`bronze.orders\`` on ClickHouse. Absent when nothing
+   * readable backs the asset, or from an older API build.
+   */
+  queryTarget?: { engine: "clickhouse" | "trino"; table: string }
+  /**
+   * Registry facts the detail route passes through from
+   * `bronze_meta.dataset_sync` (`catalog.rs`): how often the dataset is
+   * refreshed, its unit, and the publisher's own classification. Each may
+   * be an empty string; absent on assets that did not come from the sync.
+   */
+  _meta?: { frekuensi?: string; satuan?: string; klasifikasi?: string }
 }
+
+/**
+ * One column of `GET /api/catalog/{id}/profile`
+ * (`routes::catalog_profile`). Computed through the same policy rewrite as
+ * Query Studio, so a masked column is profiled in its masked form.
+ * `profiled: false` marks a column whose type (arrays, maps, …) or name
+ * the profile does not aggregate; every stat is then absent.
+ */
+export type ColumnProfile = {
+  name: string
+  dataType: string
+  profiled: boolean
+  nullCount?: number | null
+  /** 0–1 over `rowsProfiled`; `null` when no rows were read. */
+  nullFraction?: number | null
+  /** Approximate (`uniq`). */
+  distinctCount?: number | null
+  /** Numbers and dates only; free text gets none. */
+  min?: string | null
+  max?: string | null
+  /** Most frequent values, only where the count is exact. */
+  topValues?: { value: string; count: number }[]
+}
+
+/**
+ * `supported: false` is an answer, not an error: e.g. an Iceberg-only
+ * Bronze dataset has no ClickHouse table to profile, and `reason` says so.
+ */
+export type AssetProfile =
+  | { supported: false; reason: string }
+  | {
+      supported: true
+      /** The policy key of the table actually read (`silver.orders`, `bronze.orders`). */
+      source: string
+      /** Whether that table is a ClickHouse table or an Iceberg one read through ClickHouse. */
+      sourceKind?: "clickhouse" | "iceberg"
+      rowsProfiled: number
+      rowLimit: number
+      /** The row cap was reached — the table may hold more. */
+      sampled: boolean
+      /** The column cap was reached — some columns were left out. */
+      columnsCapped: boolean
+      columns: ColumnProfile[]
+    }
 
 export type AssetFilter = {
   search?: string
@@ -164,6 +228,12 @@ export interface AssetService {
     signal?: AbortSignal
   ): Promise<Pagination<Asset>>
   getAsset(id: string, signal?: AbortSignal): Promise<AssetDetail>
+  /**
+   * `GET /api/catalog/{id}/profile` — per-column stats. Needs `query:read`,
+   * since the stats are read from the data itself. Optional for the same
+   * dead-fixture reason as `requestAccess` below.
+   */
+  getAssetProfile?(id: string, signal?: AbortSignal): Promise<AssetProfile>
   listNamespaces(signal?: AbortSignal): Promise<CatalogNamespace[]>
   /**
    * `POST /api/catalog/{id}/access-request` — ask for a permission not

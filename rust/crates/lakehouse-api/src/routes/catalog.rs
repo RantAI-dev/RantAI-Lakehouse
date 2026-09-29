@@ -57,6 +57,7 @@ use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
 use crate::lakehouse_catalog::{self, CatalogAccessError};
 use crate::routes::catalog_query;
+use crate::routes::catalog_source::{self, ReadSource};
 use crate::routes::support::{js_error, js_string, num_or_zero, prettify, str_col};
 use crate::state::AppState;
 
@@ -1093,9 +1094,113 @@ pub async fn detail(
             .into_response());
     }
     if id.starts_with("silver.") || id.starts_with("serving.") {
-        return clickhouse_asset_detail(&state.clickhouse, &id).await;
+        return clickhouse_asset_detail(&state, &principal, &id).await;
     }
-    bronze_asset_detail(&state.clickhouse, &id).await
+    bronze_asset_detail(&state, &principal, &id).await
+}
+
+/// The permission reading an asset's rows needs — the same one
+/// `POST /api/query/run` and `GET /api/catalog/{id}/profile` require.
+/// `catalog:read` alone shows that a table exists and what shape it has,
+/// never what it holds.
+const SAMPLE_PERMISSION: &str = "query:read";
+
+/// Marks a detail body whose `sample` is empty because the caller lacks
+/// [`SAMPLE_PERMISSION`], so the console can say "needs access" instead of
+/// "no rows".
+fn mark_sample_restricted(body: &mut Value, principal: &Principal) {
+    if let Some(o) = body.as_object_mut() {
+        o.insert(
+            "sampleRestricted".to_owned(),
+            json!(!principal.has(SAMPLE_PERMISSION)),
+        );
+    }
+}
+
+/// Tells the console what to put after `FROM` to query this asset in
+/// Query Studio (always `ClickHouse`, including an Iceberg table read
+/// through `Config::iceberg_query_db`). Absent when no readable table was
+/// found; the console then falls back to its own guess.
+fn mark_query_table(body: &mut Value, source: Option<&ReadSource>) {
+    if let (Some(o), Some(source)) = (body.as_object_mut(), source) {
+        o.insert(
+            "queryTarget".to_owned(),
+            json!({ "engine": "clickhouse", "table": source.from }),
+        );
+    }
+}
+
+/// Sample rows of `source` exactly as `principal` could read them in
+/// Query Studio, plus the column names policy masks for them. No rows at
+/// all without [`SAMPLE_PERMISSION`]; the masked names still come back,
+/// since they describe policy, not data.
+///
+/// The sample is data, so it goes through the same
+/// `query::rewrite_sql_for_principal` as `POST /api/query/run`: masked
+/// columns come back as `***` and row filters apply. Every failure along
+/// the way — an invalid name, unresolvable obligations, a refused rewrite,
+/// a missing table — yields NO rows rather than the raw ones: an empty
+/// sample is an honest "not available", an unmasked one is a leak.
+async fn governed_sample(
+    state: &AppState,
+    principal: &Principal,
+    source: Option<&ReadSource>,
+) -> (Vec<Value>, HashSet<String>) {
+    let Some(source) = source else {
+        return (Vec::new(), HashSet::new());
+    };
+    let key = source.policy_key.as_str();
+    let obligations = crate::policy_engine::PolicyEngineObligations::from_state(state);
+    let masked: HashSet<String> = match obligations
+        .obligations_for_async(key, &principal.role_names)
+        .await
+    {
+        Ok(Some(o)) => o.mask.into_iter().collect(),
+        Ok(None) => HashSet::new(),
+        Err(err) => {
+            tracing::warn!(?err, %key, "catalog sample withheld: obligations unresolved");
+            return (Vec::new(), HashSet::new());
+        }
+    };
+    if !principal.has(SAMPLE_PERMISSION) {
+        return (Vec::new(), masked);
+    }
+    let raw_sql = format!("SELECT * FROM {} LIMIT 5", source.from);
+    let sql = match crate::routes::query::rewrite_sql_for_principal(
+        state,
+        &raw_sql,
+        "clickhouse",
+        principal,
+    )
+    .await
+    {
+        Ok(sql) => sql,
+        Err(err) => {
+            tracing::warn!(?err, %key, "catalog sample withheld: policy rewrite refused");
+            return (Vec::new(), masked);
+        }
+    };
+    let result = match state.clickhouse.query(&sql, None).await {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!(?err, %key, "catalog sample unavailable: read failed");
+            return (Vec::new(), masked);
+        }
+    };
+    let sample = result
+        .data
+        .iter()
+        .map(|row| {
+            let mut o = Map::new();
+            for m in &result.meta {
+                if !m.name.starts_with('_') {
+                    o.insert(m.name.clone(), Value::String(js_string(row.get(&m.name))));
+                }
+            }
+            Value::Object(o)
+        })
+        .collect();
+    (sample, masked)
 }
 
 /// `[db, table]` parsed from a `silver.*`/`serving.*` id, matching
@@ -1105,7 +1210,7 @@ pub async fn detail(
 /// just inserted — so a multi-segment id like `silver.a.b` yields table
 /// `"ab"`, not `"a.b"`. Reproduced here for fidelity, not because it's
 /// intentional upstream.
-fn split_db_table(id: &str) -> (String, String) {
+pub(crate) fn split_db_table(id: &str) -> (String, String) {
     let mut parts = id.split('.');
     let db = parts.next().unwrap_or("").to_owned();
     let rest = parts.collect::<Vec<_>>().join(".");
@@ -1116,32 +1221,34 @@ fn split_db_table(id: &str) -> (String, String) {
     (db, table)
 }
 
-async fn clickhouse_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response> {
+async fn clickhouse_asset_detail(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> ApiResult<Response> {
+    let ch = &state.clickhouse;
     let (db, table) = split_db_table(id);
     if (db != "silver" && db != "serving") || table.is_empty() {
         return Err(not_found());
     }
     let is_gold = db == "serving";
 
-    let query = format!("SELECT * FROM {db}.`{table}` LIMIT 5");
-    let Ok(result) = ch.query(&query, None).await else {
+    // No such table is the same 404 the old unguarded `SELECT *` failing
+    // used to produce.
+    let Ok(Some(source)) = catalog_source::clickhouse_source(ch, &db, &table).await else {
         return Err(not_found());
     };
-    let schema: Vec<Value> = result
-        .meta
+    let (sample, masked) = governed_sample(state, principal, Some(&source)).await;
+    let schema: Vec<Value> = source
+        .columns
         .iter()
-        .filter(|m| !m.name.starts_with('_'))
-        .map(|m| json!({ "name": m.name, "dataType": m.ty }))
-        .collect();
-    let sample: Vec<Value> = result
-        .data
-        .iter()
-        .map(|row| {
+        .filter(|(name, _)| !name.starts_with('_'))
+        .map(|(name, ty)| {
             let mut o = Map::new();
-            for m in &result.meta {
-                if !m.name.starts_with('_') {
-                    o.insert(m.name.clone(), Value::String(js_string(row.get(&m.name))));
-                }
+            o.insert("name".to_owned(), json!(name));
+            o.insert("dataType".to_owned(), json!(ty));
+            if masked.contains(name) {
+                o.insert("masked".to_owned(), json!(true));
             }
             Value::Object(o)
         })
@@ -1161,12 +1268,18 @@ async fn clickhouse_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response>
         Err(_) => 0, // "view: no parts" — swallowed in the TypeScript too.
     };
 
-    let body = clickhouse_detail_body(id, &table, &db, is_gold, rows, &schema, &sample);
+    let mut body = clickhouse_detail_body(id, &table, &db, is_gold, rows, &schema, &sample);
+    mark_sample_restricted(&mut body, principal);
+    mark_query_table(&mut body, Some(&source));
     Ok((StatusCode::OK, ApiJson(body)).into_response())
 }
 
-async fn bronze_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response> {
-    match bronze_asset_detail_body(ch, id).await {
+async fn bronze_asset_detail(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> ApiResult<Response> {
+    match bronze_asset_detail_body(state, principal, id).await {
         Ok(Some(body)) => Ok((StatusCode::OK, ApiJson(body)).into_response()),
         Ok(None) => Err(not_found()),
         // `catch (e) { return NextResponse.json({ error: String(e) }, {
@@ -1186,7 +1299,12 @@ async fn bronze_asset_detail(ch: &ChClient, id: &str) -> ApiResult<Response> {
               independent reuse, hurting rather than helping readability of \
               the port"
 )]
-async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Value>, ChError> {
+async fn bronze_asset_detail_body(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> Result<Option<Value>, ChError> {
+    let ch = &state.clickhouse;
     let escaped_id = SqlLiteral::from(id);
     let sync_sql = format!(
         "SELECT slug, title, description, tier, table_name, toString(total) total,
@@ -1216,32 +1334,18 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
     let cols = ch.rows(&cols_sql, None).await?;
 
     let table = str_col(sync, "table_name");
-    let (sample, type_of): (Vec<Value>, Map<String, Value>) = match ch
-        .query(&format!("SELECT * FROM silver.`{table}` LIMIT 5"), None)
+    // Silver when it exists, else the Iceberg table itself (see
+    // `catalog_source`). A lookup failure only costs the sample.
+    let source = catalog_source::bronze_source(state, table)
         .await
-    {
-        Ok(r) => {
-            let sample = r
-                .data
-                .iter()
-                .map(|row| {
-                    let mut o = Map::new();
-                    for m in &r.meta {
-                        if !m.name.starts_with('_') {
-                            o.insert(m.name.clone(), Value::String(js_string(row.get(&m.name))));
-                        }
-                    }
-                    Value::Object(o)
-                })
-                .collect();
-            let mut type_of = Map::new();
-            for m in &r.meta {
-                type_of.insert(m.name.clone(), Value::String(m.ty.clone()));
-            }
-            (sample, type_of)
-        }
-        Err(_) => (Vec::new(), Map::new()), // "silver not yet available" — swallowed in the TypeScript too.
-    };
+        .unwrap_or_default();
+    let (sample, masked) = governed_sample(state, principal, source.as_ref()).await;
+    // Declared types from whichever table was found; the registry's own
+    // `tipe` otherwise (see the `data_type` fallback below).
+    let type_of: HashMap<String, String> = source
+        .as_ref()
+        .map(|s| s.columns.iter().cloned().collect())
+        .unwrap_or_default();
 
     let schema: Vec<Value> = cols
         .iter()
@@ -1256,13 +1360,13 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
             // absent-from-`system.columns` triggers the missing-key case
             // handled by `type_of.get`), so the `"String"` literal fallback
             // is unreachable in real data and intentionally omitted here.
-            let data_type = type_of
-                .get(key_asli)
-                .and_then(Value::as_str)
-                .unwrap_or(tipe);
+            let data_type = type_of.get(key_asli).map_or(tipe, String::as_str);
             let mut o = Map::new();
             o.insert("name".to_owned(), json!(key_asli));
             o.insert("dataType".to_owned(), json!(data_type));
+            if masked.contains(key_asli) {
+                o.insert("masked".to_owned(), json!(true));
+            }
             if !deskripsi.is_empty() {
                 o.insert("description".to_owned(), json!(deskripsi));
             }
@@ -1284,7 +1388,7 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
     };
 
     let col_count = cols.len();
-    let body = bronze_detail_body(
+    let mut body = bronze_detail_body(
         slug,
         str_col(sync, "title"),
         sekunder,
@@ -1301,6 +1405,8 @@ async fn bronze_asset_detail_body(ch: &ChClient, id: &str) -> Result<Option<Valu
         str_col(sync, "klasifikasi"),
         table,
     );
+    mark_sample_restricted(&mut body, principal);
+    mark_query_table(&mut body, source.as_ref());
     Ok(Some(body))
 }
 
@@ -2581,6 +2687,226 @@ mod tests {
             let (status, body) = response_json(resp).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body["supported"], json!(false));
+        }
+    }
+
+    /// The detail route's sample rows are data, so they must go through
+    /// the same policy rewrite as `POST /api/query/run`. Before this, the
+    /// route sent a literal `SELECT * … LIMIT 5` and returned the raw
+    /// values of a masked column to anyone holding `catalog:read`.
+    mod sample_masking {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+        use lakehouse_auth::{PermissionSet, PrincipalId};
+        use lakehouse_store::governance::CreatePolicyInput;
+        use lakehouse_test_support as _;
+        use uuid::Uuid;
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::super::*;
+        use crate::config::Config;
+
+        fn database_url_for(pool: &lakehouse_store::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database"),
+            )
+        }
+
+        /// `0002_seed_identity.sql`'s first tenant — configured as the
+        /// catalog tenant below, so a member passes the tenant gate.
+        const TENANT_A: &str = "11111111-1111-4111-8111-000000000001";
+
+        /// An Analyst in the catalog tenant holding `permissions`. Masking
+        /// keys on `role_names`, so the policy below binds them either way.
+        fn analyst(permissions: &str) -> Principal {
+            Principal {
+                id: PrincipalId::User(Uuid::nil()),
+                tenant_ids: vec![TENANT_A.parse().unwrap()],
+                display_name: "alice".to_owned(),
+                permissions: PermissionSet::parse(permissions),
+                provider: "session".to_owned(),
+                must_change_password: false,
+                role_names: vec!["Analyst".to_owned()],
+            }
+        }
+
+        fn ch_json(meta: &[(&str, &str)], data: &Value) -> ResponseTemplate {
+            let meta: Vec<Value> = meta
+                .iter()
+                .map(|(n, t)| json!({ "name": n, "type": t }))
+                .collect();
+            ResponseTemplate::new(200).set_body_json(json!({
+                "meta": meta,
+                "data": data,
+                "rows": data.as_array().map_or(0, Vec::len),
+            }))
+        }
+
+        async fn mock_clickhouse(server: &MockServer) {
+            // Answers both `declared_columns` and the policy engine's own
+            // `system.columns` read.
+            Mock::given(method("POST"))
+                .and(body_string_contains("system.columns"))
+                .respond_with(ch_json(
+                    &[
+                        ("name", "String"),
+                        ("type", "String"),
+                        ("default_kind", "String"),
+                        ("default_expression", "String"),
+                    ],
+                    &json!([
+                        {"name": "id", "type": "UInt64", "default_kind": "", "default_expression": ""},
+                        {"name": "email", "type": "String", "default_kind": "", "default_expression": ""},
+                    ]),
+                ))
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("system.tables"))
+                .respond_with(ch_json(
+                    &[
+                        ("database", "String"),
+                        ("name", "String"),
+                        ("engine", "String"),
+                        ("create_table_query", "String"),
+                    ],
+                    &json!([{"database": "serving", "name": "mart_x", "engine": "MergeTree", "create_table_query": ""}]),
+                ))
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("replaceRegexpOne"))
+                .respond_with(ch_json(
+                    &[("id", "UInt64"), ("email", "String")],
+                    &json!([{"id": "1", "email": "***"}]),
+                ))
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("system.parts"))
+                .respond_with(ch_json(&[("r", "String")], &json!([{"r": "1"}])))
+                .mount(server)
+                .await;
+        }
+
+        async fn response_json(resp: Response) -> (StatusCode, Value) {
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or_default())
+        }
+
+        /// Seeds a `mask: ["email"]` policy on `serving.mart_x` for
+        /// Analysts, then calls `detail` for it as `principal`.
+        async fn detail_as(
+            pool: &lakehouse_store::PgPool,
+            server: &MockServer,
+            principal: Principal,
+        ) -> (StatusCode, Value) {
+            lakehouse_store::governance::create_policy(
+                pool,
+                &CreatePolicyInput {
+                    name: "catalog-sample-masking-test".to_owned(),
+                    kind: "Row filter".to_owned(),
+                    subjects: "Analyst".to_owned(),
+                    resources: "serving.mart_x".to_owned(),
+                    effect: "Permit with obligation".to_owned(),
+                    conditions: Some(
+                        r#"{"roles":["Analyst"],"table":"serving.mart_x","mask":["email"]}"#
+                            .to_owned(),
+                    ),
+                    activate: true,
+                    owner: None,
+                },
+            )
+            .await
+            .expect("seeding the governing policy must succeed");
+
+            mock_clickhouse(server).await;
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert("CH_URL".to_owned(), server.uri());
+            env.insert("CATALOG_TENANT_ID".to_owned(), TENANT_A.to_owned());
+            let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+
+            let resp = detail(
+                State(state),
+                Extension(principal),
+                HeaderMap::new(),
+                Path("serving.mart_x".to_owned()),
+            )
+            .await
+            .expect("detail answers");
+            response_json(resp).await
+        }
+
+        fn sample_requests(bodies: &[wiremock::Request]) -> Vec<String> {
+            bodies
+                .iter()
+                .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+                .filter(|b| b.contains("LIMIT 5"))
+                .collect()
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn detail_masks_sample_rows_and_flags_masked_columns(
+            pool: lakehouse_store::PgPool,
+        ) -> sqlx::Result<()> {
+            let server = MockServer::start().await;
+            let (status, body) =
+                detail_as(&pool, &server, analyst("catalog:read, query:read")).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["sample"], json!([{"id": "1", "email": "***"}]));
+            assert_eq!(
+                body["schema"],
+                json!([
+                    {"name": "id", "dataType": "UInt64"},
+                    {"name": "email", "dataType": "String", "masked": true},
+                ])
+            );
+            // Every row read of the table went out rewritten: no request
+            // carried the literal sample statement.
+            assert_eq!(body["sampleRestricted"], json!(false));
+            let requests = server.received_requests().await.expect("recorded");
+            assert!(
+                sample_requests(&requests)
+                    .iter()
+                    .all(|b| b.contains("replaceRegexpOne")),
+                "the sample must never reach ClickHouse unmasked"
+            );
+            Ok(())
+        }
+
+        /// `catalog:read` alone shows the table's shape, never its rows:
+        /// the sample is not even queried, and the body says why it is
+        /// empty. The masked flags still come back — they are policy.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn detail_withholds_sample_rows_without_query_read(
+            pool: lakehouse_store::PgPool,
+        ) -> sqlx::Result<()> {
+            let server = MockServer::start().await;
+            let (status, body) = detail_as(&pool, &server, analyst("catalog:read")).await;
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["sample"], json!([]));
+            assert_eq!(body["sampleRestricted"], json!(true));
+            assert_eq!(body["schema"][1]["masked"], json!(true));
+            let requests = server.received_requests().await.expect("recorded");
+            assert!(
+                sample_requests(&requests).is_empty(),
+                "no sample query may run for a caller without query:read"
+            );
+            Ok(())
         }
     }
 }

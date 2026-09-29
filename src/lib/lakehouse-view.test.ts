@@ -149,6 +149,18 @@ describe("isIcebergCandidate", () => {
     expect(isIcebergCandidate({ layer: "silver", tableName: "orders" })).toBe(false)
   })
 
+  it("is true for an iceberg-table asset in a non-bronze layer", () => {
+    expect(
+      isIcebergCandidate({ layer: "raw", type: "iceberg-table", tableName: "orders" })
+    ).toBe(true)
+  })
+
+  it("is false for an iceberg-table asset without a tableName", () => {
+    expect(isIcebergCandidate({ layer: "raw", type: "iceberg-table", tableName: null })).toBe(
+      false
+    )
+  })
+
   it("is false when tableName is null", () => {
     expect(isIcebergCandidate({ layer: "bronze", tableName: null })).toBe(false)
   })

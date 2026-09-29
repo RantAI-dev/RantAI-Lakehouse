@@ -179,6 +179,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET", "/api/catalog",       Policy::RequiresPermission("catalog:read")),
     ("GET", "/api/catalog/query", Policy::RequiresPermission("catalog:read")),
     ("GET", "/api/catalog/{id}",  Policy::RequiresPermission("catalog:read")),
+    // Column profile: aggregates over the asset's rows (a `max` IS a value),
+    // so it needs the same `query:read` as running that SELECT yourself —
+    // and goes through the same policy rewrite (`routes::catalog_profile`).
+    ("GET", "/api/catalog/{id}/profile", Policy::RequiresPermission("query:read")),
 
     // ── Catalog annotations (WS2 §13): console-only owner/steward/tags/
     //    description. PUT reuses the already-seeded `catalog:write`
