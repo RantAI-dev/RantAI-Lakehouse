@@ -97,6 +97,10 @@ export type PipelineOpNode = {
   sourceRef: string | null
   commit: string | null
   sql: string | null
+  /** What the op's own code reads, one short phrase each, as the op declares it (`op_metadata.source_metadata`). Not observed from a run. */
+  reads: string[]
+  /** What the op's own code writes; see `reads`. */
+  writes: string[]
 }
 
 /** One dependency edge: `from` runs before `to`. */

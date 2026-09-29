@@ -82,7 +82,15 @@ def export_one_mart(cfg: GoldExportConfig, mart: str) -> dict[str, Any]:
     return resp.json()
 
 
-@op(tags=source_metadata("dispar_orchestrate/gold_export.py::run_gold_export"))
+# The op itself only calls the API per mart; the API reads the ClickHouse
+# mart and writes its Iceberg copy, which is the data flow declared here.
+@op(
+    tags=source_metadata(
+        "dispar_orchestrate/gold_export.py::run_gold_export",
+        reads=["ClickHouse serving.{mart} per GOLD_EXPORT_MARTS (via the API)"],
+        writes=["Iceberg gold.{mart} (via POST /api/gold/export)", "ClickHouse lake.bronze_meta.maintenance_run"],
+    )
+)
 def run_gold_export(context) -> list[dict[str, Any]]:
     """Runs `POST /api/gold/export/{mart}` for every mart in
     `GOLD_EXPORT_MARTS` (comma-separated, default `gold_export_smoke` — the

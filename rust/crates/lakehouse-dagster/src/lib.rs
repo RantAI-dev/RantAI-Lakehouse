@@ -611,6 +611,8 @@ impl DgClient {
                 source_ref: metadata_value(&h.solid.definition.metadata, "source_ref"),
                 commit: metadata_value(&h.solid.definition.metadata, "commit"),
                 sql: metadata_value(&h.solid.definition.metadata, "sql"),
+                reads: metadata_lines(&h.solid.definition.metadata, "reads"),
+                writes: metadata_lines(&h.solid.definition.metadata, "writes"),
             })
             .collect();
         let edges = solid_handles
@@ -1106,6 +1108,12 @@ pub struct GraphOp {
     /// `sql=` to `source_metadata` (`dagster/dispar_orchestrate/op_metadata.py`),
     /// which is every op in this code location today.
     pub sql: Option<String>,
+    /// What the op's own code reads, one short phrase each, from the
+    /// newline-joined `"reads"` entry `source_metadata` writes. Declared by
+    /// the op, not observed from a run. Empty when the op declares nothing.
+    pub reads: Vec<String>,
+    /// What the op's own code writes; see [`Self::reads`].
+    pub writes: Vec<String>,
 }
 
 /// Look up `label` in `entries` (`definition.metadata`'s `{key, value}`
@@ -1114,6 +1122,21 @@ pub struct GraphOp {
 /// deviation note on why this client reads a flat key/value list instead of
 /// the plan sketch's `TextMetadataEntry` union). `None` when no entry with
 /// that key exists.
+/// A newline-joined `label` entry split back into its phrases (see
+/// `dagster/dispar_orchestrate/op_metadata.py::source_metadata`); blank
+/// lines are dropped, and an absent entry is an empty list.
+fn metadata_lines(entries: &[MetadataItem], label: &str) -> Vec<String> {
+    metadata_value(entries, label)
+        .map(|v| {
+            v.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn metadata_value(entries: &[MetadataItem], label: &str) -> Option<String> {
     entries
         .iter()
@@ -2114,6 +2137,25 @@ mod tests {
         // the real fixture carries no `sql` metadata key — `None`, not a
         // fabricated empty string.
         assert_eq!(op.sql, None);
+        // The captured fixture predates `reads`/`writes`: absent entries
+        // read as empty lists, never as a fabricated phrase.
+        assert!(op.reads.is_empty() && op.writes.is_empty());
+    }
+
+    #[test]
+    fn metadata_lines_split_a_newline_joined_entry_and_drop_blank_lines() {
+        let entries = vec![MetadataItem {
+            key: "writes".to_owned(),
+            value: "Iceberg bronze.x\n\n ClickHouse lake.y ".to_owned(),
+        }];
+        assert_eq!(
+            metadata_lines(&entries, "writes"),
+            vec![
+                "Iceberg bronze.x".to_owned(),
+                "ClickHouse lake.y".to_owned()
+            ]
+        );
+        assert!(metadata_lines(&entries, "reads").is_empty());
     }
 
     /// An op reporting metadata with none of the three recognized labels

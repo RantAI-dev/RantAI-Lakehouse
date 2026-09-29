@@ -3,7 +3,7 @@ import { topoSortOps } from "./topo-sort-ops"
 import type { PipelineOpNode } from "@/services/contracts/pipelines"
 
 function op(name: string): PipelineOpNode {
-  return { name, description: null, sourceRef: null, commit: null, sql: null }
+  return { name, description: null, sourceRef: null, commit: null, sql: null, reads: [], writes: [] }
 }
 
 describe("topoSortOps", () => {

@@ -352,6 +352,10 @@ fn graph_op_to_json(op: &lakehouse_dagster::GraphOp) -> Value {
         "sourceRef": op.source_ref,
         "commit": op.commit,
         "sql": op.sql,
+        // Declared by the op's own code (`op_metadata.source_metadata`),
+        // drawn by the console's flowchart on either side of the op.
+        "reads": op.reads,
+        "writes": op.writes,
     })
 }
 

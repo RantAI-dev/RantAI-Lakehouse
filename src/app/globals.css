@@ -174,3 +174,10 @@
     transform: none;
   }
 }
+
+/* Pipeline flowchart: edges into or out of a running op move toward the target. */
+@keyframes flow-dash {
+  to {
+    stroke-dashoffset: -12;
+  }
+}

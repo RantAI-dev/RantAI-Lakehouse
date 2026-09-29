@@ -2,251 +2,145 @@
 
 import * as React from "react"
 import Link from "next/link"
-import {
-  ArrowDownIcon,
-  ChevronDownIcon,
-  Code2Icon,
-  CopyXIcon,
-  DatabaseIcon,
-  FilterIcon,
-  ListChecksIcon,
-  PencilLineIcon,
-  ReplaceIcon,
-} from "lucide-react"
+import { ChevronDownIcon, FileCode2Icon, InfoIcon } from "lucide-react"
 import { CodeView } from "@/components/patterns/code-view"
-import { FlowCanvas } from "@/components/patterns/flow-canvas"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
-import { Button } from "@/components/ui/button"
 import { useService } from "@/hooks/use-service"
-import type { EntityStatus } from "@/lib/status"
-import { describeTransform, type TransformDraft } from "@/lib/transform-draft"
+import { describeTransform } from "@/lib/transform-draft"
 import { cn } from "@/lib/utils"
 import { pipelineService } from "@/services"
-import type { PipelineDetail, PipelineOpNode } from "@/services/contracts/pipelines"
-import { topoSortOps } from "./topo-sort-ops"
+import type { PipelineDetail, PipelineOpNode, PipelineRunStep } from "@/services/contracts/pipelines"
+import { authoredFlow, dagsterFlow } from "./pipeline-flow-layout"
+import { PipelineFlowchart } from "./pipeline-flowchart"
 
-const VERB_ICON: Record<TransformDraft["verb"], React.ComponentType<{ className?: string }>> = {
-  dedupe: CopyXIcon,
-  filter: FilterIcon,
-  rename: PencilLineIcon,
-  cast: ReplaceIcon,
-  select: ListChecksIcon,
-}
-
-function TableNode({
-  role,
-  zone,
-  table,
-  assetId,
-}: {
-  role: "Source" | "Target"
-  zone: string
-  table: string
-  assetId?: string
-}) {
-  const body = (
-    <>
-      <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-primary/10 text-primary">
-        <DatabaseIcon className="size-4" aria-hidden />
-      </span>
-      <span className="min-w-0">
-        <span className="block font-mono text-[10px] uppercase tracking-[0.14em] text-muted-foreground">{role}</span>
-        <span className="block truncate font-mono text-sm font-medium">
-          <span className="text-muted-foreground">{zone}.</span>
-          {table}
-        </span>
-      </span>
-    </>
-  )
-  const cls = "flex items-center gap-3 rounded-xl border border-border bg-card px-4 py-3 shadow-xs"
-  return assetId ? (
-    <Link href={`/data/assets/${assetId}`} className={cn(cls, "hover:border-primary/40")}>
-      {body}
-    </Link>
-  ) : (
-    <div className={cls}>{body}</div>
-  )
-}
-
-/**
- * An authored pipeline's stored definition drawn as the path its rows
- * take: source table, each transform in order, target table. The
- * transforms are the exact strings `transform_grammar::parse_transform`
- * accepted when the pipeline was saved; each is shown with its verb and
- * the raw string, so what you read is what runs.
- */
-export function AuthoredFlow({ pipeline }: { pipeline: PipelineDetail }) {
-  const def = pipeline.definition
-  if (!def) {
-    return <EmptyState title="No definition stored" description="This authored pipeline has no stored definition to show." />
-  }
+function PanelTitle({ children }: { children: React.ReactNode }) {
   return (
-    <div className="grid gap-6 lg:grid-cols-[minmax(0,26rem)_1fr]">
-      <ol className="relative flex flex-col gap-2">
-        <li>
-          <TableNode role="Source" zone={def.sourceZone} table={def.sourceTable} assetId={pipeline.sourceAssetId} />
-        </li>
-        {def.transforms.length === 0 ? (
-          <li className="flex items-center gap-2 pl-6 text-xs text-muted-foreground">
-            <ArrowDownIcon className="size-3.5" aria-hidden />
-            copied as is, no transforms
-          </li>
-        ) : (
-          def.transforms.map((raw, i) => {
-            const t = describeTransform(raw)
-            const Icon = t ? VERB_ICON[t.verb] : Code2Icon
-            return (
-              <li key={`${raw}-${i}`} className="relative pl-6">
-                <span aria-hidden className="absolute left-[1.05rem] top-0 h-full w-px bg-border" />
-                <div className="relative flex items-start gap-3 rounded-lg border border-dashed border-border bg-muted/30 px-3 py-2">
-                  <span className="mt-0.5 font-mono text-[10px] tabular-nums text-muted-foreground">{String(i + 1).padStart(2, "0")}</span>
-                  <Icon className="mt-0.5 size-4 shrink-0 text-primary" aria-hidden />
-                  <span className="min-w-0">
-                    <span className="block text-sm font-medium capitalize">{t ? t.verb : "transform"}</span>
-                    {t ? <span className="block text-xs text-muted-foreground">{t.detail}</span> : null}
-                    <code className="mt-1 block truncate text-[11px] text-muted-foreground">{raw}</code>
-                  </span>
-                </div>
-              </li>
-            )
-          })
-        )}
-        <li>
-          <TableNode role="Target" zone={def.targetZone} table={def.targetTable} assetId={pipeline.targetAssetId} />
-        </li>
-      </ol>
-      <dl className="grid content-start gap-x-6 gap-y-3 self-start rounded-xl border border-border bg-card p-4 text-sm sm:grid-cols-2">
-        <div>
-          <dt className="text-xs text-muted-foreground">Load</dt>
-          <dd className="font-medium">
-            {def.incrementalColumn ? (
-              <>
-                Incremental on <span className="font-mono">{def.incrementalColumn}</span>
-              </>
-            ) : (
-              "Full reload each run"
-            )}
-          </dd>
-        </div>
-        <div>
-          <dt className="text-xs text-muted-foreground">Change capture (FBIC)</dt>
-          <dd className="font-medium">{def.fbicEnabled ? "On" : "Off"}</dd>
-        </div>
-        <div>
-          <dt className="text-xs text-muted-foreground">Connector</dt>
-          <dd className="font-mono text-xs">
-            {def.connectorId ? (
-              <Link href="/connectors" className="text-primary hover:underline">
-                {def.connectorId}
-              </Link>
-            ) : (
-              "—"
-            )}
-          </dd>
-        </div>
-        <div>
-          <dt className="text-xs text-muted-foreground">Transforms</dt>
-          <dd className="font-medium tabular-nums">{def.transforms.length}</dd>
-        </div>
-      </dl>
+    <h4 className="font-mono text-[11px] font-medium uppercase tracking-[0.14em] text-muted-foreground">{children}</h4>
+  )
+}
+
+function PhraseList({ title, phrases }: { title: string; phrases: string[] }) {
+  return (
+    <div>
+      <p className="text-xs font-medium text-muted-foreground">{title}</p>
+      {phrases.length === 0 ? (
+        <p className="mt-1 text-xs text-muted-foreground">Nothing declared.</p>
+      ) : (
+        <ul className="mt-1 flex flex-col gap-1">
+          {phrases.map((p) => (
+            <li key={p} className="rounded-md bg-muted/50 px-2 py-1 font-mono text-[11px] leading-4">
+              {p}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   )
 }
 
-/**
- * One op's read-only source. A 404 (unknown op) or 409 (the build's
- * commit does not match, `pipeline_source.rs`'s `check_commit`) shows the
- * server's own message. The request is keyed by `sourceRef`, what the
- * route matches on, never the op name.
- */
-function OpSource({ pipelineId, sourceRef }: { pipelineId: string; sourceRef: string }) {
-  const source = useService((s) => pipelineService.getPipelineSource(pipelineId, sourceRef, s), [pipelineId, sourceRef])
-  if (source.status === "loading") return <LoadingSkeleton rows={5} />
-  if (source.status === "error") return <ErrorState error={source.error} onRetry={source.reload} />
-  return (
-    <div className="flex flex-col gap-1.5">
-      <p className="font-mono text-[11px] text-muted-foreground">commit {source.data.commit.slice(0, 12)}</p>
-      <CodeView text={source.data.text} className="max-h-[28rem] overflow-auto" />
-    </div>
-  )
-}
-
-function OpCard({ pipelineId, op, upstream }: { pipelineId: string; op: PipelineOpNode; upstream: string[] }) {
+/** A docstring's first paragraph, with the rest behind a toggle. */
+function Docstring({ text }: { text: string | null }) {
   const [open, setOpen] = React.useState(false)
-  const [showSource, setShowSource] = React.useState(false)
-  const doc = op.description?.trim() ?? ""
+  const doc = text?.trim() ?? ""
+  if (!doc) return <p className="text-xs text-muted-foreground">The op declares no description.</p>
   const [lead, ...rest] = doc.split(/\n\s*\n/)
   return (
-    <article className="rounded-xl border border-border bg-card p-4">
-      <header className="flex flex-wrap items-start justify-between gap-2">
-        <div className="min-w-0">
-          <h4 className="font-mono text-sm font-semibold">{op.name}</h4>
-          <p className="mt-0.5 text-xs text-muted-foreground">
-            {upstream.length > 0 ? `after ${upstream.join(", ")}` : "entry step"}
-            {op.sourceRef ? (
-              <>
-                {" · "}
-                <span className="font-mono">{op.sourceRef}</span>
-              </>
-            ) : null}
-          </p>
-        </div>
-        {op.sourceRef ? (
-          <Button size="xs" variant="outline" onClick={() => setShowSource((v) => !v)} aria-expanded={showSource}>
-            <Code2Icon data-icon="inline-start" />
-            {showSource ? "Hide source" : "View source"}
-          </Button>
-        ) : null}
-      </header>
-      {doc ? (
-        <div className="mt-3 text-sm leading-6 text-foreground/90">
-          <p className="whitespace-pre-line text-sm">{lead}</p>
-          {rest.length > 0 ? (
-            <>
-              {open ? <p className="mt-2 whitespace-pre-line text-sm text-muted-foreground">{rest.join("\n\n")}</p> : null}
-              <button
-                type="button"
-                onClick={() => setOpen((v) => !v)}
-                className="mt-1 inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline"
-              >
-                <ChevronDownIcon className={cn("size-3.5 transition-transform", open && "rotate-180")} aria-hidden />
-                {open ? "Less" : "Read the full description"}
-              </button>
-            </>
-          ) : null}
-        </div>
-      ) : (
-        <p className="mt-3 text-xs text-muted-foreground">The op declares no description.</p>
-      )}
-      {op.sql ? (
-        <pre className="mt-3 overflow-x-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-xs">{op.sql}</pre>
+    <div className="text-sm leading-6 text-foreground/90">
+      <p className="whitespace-pre-line">{lead}</p>
+      {rest.length > 0 ? (
+        <>
+          {open ? <p className="mt-2 whitespace-pre-line text-muted-foreground">{rest.join("\n\n")}</p> : null}
+          <button
+            type="button"
+            onClick={() => setOpen((v) => !v)}
+            className="mt-1 inline-flex items-center gap-1 text-xs font-medium text-primary hover:underline"
+          >
+            <ChevronDownIcon className={cn("size-3.5 transition-transform", open && "rotate-180")} aria-hidden />
+            {open ? "Less" : "Read the full description"}
+          </button>
+        </>
       ) : null}
-      {showSource && op.sourceRef ? (
-        <div className="mt-3">
-          <OpSource pipelineId={pipelineId} sourceRef={op.sourceRef} />
-        </div>
-      ) : null}
-    </article>
+    </div>
   )
 }
 
 /**
- * A Dagster job's op graph, coloured by the selected run's step statuses,
- * then each op with its own description and source. The description is
- * the op's docstring, published by the code location, which says what the
- * step does in the author's words.
+ * One op's source, read from the code baked into the API image. A 404
+ * (unknown op) or 409 (the op's image and the API's were built from
+ * different commits, or with no commit recorded: `check_commit`) shows the
+ * server's own message, because serving "the current file" then could
+ * show code that is not what ran. The request is keyed by `sourceRef`,
+ * which is what the route matches on.
+ */
+function OpSource({ pipelineId, op }: { pipelineId: string; op: PipelineOpNode }) {
+  const sourceRef = op.sourceRef
+  const source = useService(
+    (s) => (sourceRef ? pipelineService.getPipelineSource(pipelineId, sourceRef, s) : Promise.resolve(null)),
+    [pipelineId, sourceRef]
+  )
+  if (!sourceRef) {
+    return (
+      <p className="rounded-lg border border-dashed border-border p-4 text-sm text-muted-foreground">
+        This op declares no source location, so there is no code to show.
+      </p>
+    )
+  }
+  if (source.status === "loading") return <LoadingSkeleton rows={8} />
+  if (source.status === "error") {
+    return (
+      <div className="flex flex-col gap-2">
+        <ErrorState error={source.error} onRetry={source.reload} />
+        <p className="text-xs text-muted-foreground">
+          Source is served only when the API and the Dagster images were built from the same commit (
+          <code className="font-mono">GIT_SHA</code>); otherwise the file in the API image may not be the code that ran.
+          This op reports commit <code className="font-mono">{op.commit ?? "none"}</code>.
+        </p>
+      </div>
+    )
+  }
+  if (!source.data) return null
+  return (
+    <div className="flex flex-col gap-1.5">
+      <p className="flex flex-wrap items-center gap-x-3 font-mono text-[11px] text-muted-foreground">
+        <span>{source.data.sourceRef}</span>
+        <span>commit {source.data.commit.slice(0, 12)}</span>
+      </p>
+      <CodeView text={source.data.text} language={source.data.language} className="max-h-[34rem] overflow-auto" />
+    </div>
+  )
+}
+
+/**
+ * A Dagster job as a flowchart: what its ops declare they read, the ops in
+ * dependency order coloured by the selected run, what they declare they
+ * write. Clicking an op opens its description and its source code below.
  */
 export function DagsterDefinition({
   pipeline,
-  stepStatus,
+  steps,
   runLabel,
 }: {
   pipeline: PipelineDetail
-  stepStatus: (op: string) => EntityStatus | undefined
+  steps: PipelineRunStep[] | null
   runLabel: string | null
 }) {
   const graph = pipeline.graph
-  if (!graph || graph.ops.length === 0) {
+  const ops = React.useMemo(() => graph?.ops ?? [], [graph])
+  const [selected, setSelected] = React.useState<string | null>(null)
+  const flow = React.useMemo(
+    () =>
+      dagsterFlow(ops, graph?.edges ?? [], (name) => steps?.find((s) => s.stepKey === name)?.status),
+    [ops, graph, steps]
+  )
+  const durations = React.useMemo(() => {
+    const out: Record<string, number | null> = {}
+    for (const s of steps ?? []) {
+      out[`op:${s.stepKey}`] = s.startMs !== null && s.endMs !== null ? s.endMs - s.startMs : null
+    }
+    return out
+  }, [steps])
+
+  if (!graph || ops.length === 0) {
     return (
       <EmptyState
         title="No op graph for this job"
@@ -254,27 +148,139 @@ export function DagsterDefinition({
       />
     )
   }
-  const sorted = topoSortOps(graph.ops, graph.edges)
+  const selectedId = selected ?? `op:${ops[0].name}`
+  const op = ops.find((o) => `op:${o.name}` === selectedId)
+  const dataNode = flow.nodes.find((n) => n.id === selectedId && n.kind !== "op")
+
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-col gap-2">
-        <p className="text-xs text-muted-foreground">
-          {sorted.length} {sorted.length === 1 ? "op" : "ops"}
-          {runLabel ? ` · statuses from ${runLabel}` : ""}
-        </p>
-        <FlowCanvas
-          nodes={sorted.map(({ node, upstream }) => ({
-            id: node.name,
-            label: node.name,
-            sublabel: upstream.length > 0 ? `after: ${upstream.join(", ")}` : undefined,
-            status: stepStatus(node.name),
-          }))}
-        />
+      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+        <span>
+          {ops.length} {ops.length === 1 ? "op" : "ops"}
+          {runLabel ? ` · statuses from ${runLabel}` : " · no run selected"}
+        </span>
+        <span className="inline-flex items-center gap-1.5">
+          <InfoIcon className="size-3.5" aria-hidden />
+          Reads and writes are declared in each op&apos;s code, not observed from a run
+        </span>
       </div>
-      <div className="grid gap-3">
-        {sorted.map(({ node, upstream }) => (
-          <OpCard key={node.name} pipelineId={pipeline.id} op={node} upstream={upstream} />
-        ))}
+      <PipelineFlowchart
+        nodes={flow.nodes}
+        edges={flow.edges}
+        selectedId={selectedId}
+        onSelect={(n) => setSelected(n.id)}
+        durations={durations}
+      />
+
+      {op ? (
+        <div className="grid gap-4 lg:grid-cols-[minmax(0,22rem)_minmax(0,1fr)]">
+          <section className="flex flex-col gap-4 self-start rounded-xl border border-border bg-card p-4">
+            <div>
+              <PanelTitle>Op</PanelTitle>
+              <p className="mt-1 font-mono text-sm font-semibold">{op.name}</p>
+            </div>
+            <Docstring text={op.description} />
+            <PhraseList title="Reads" phrases={op.reads ?? []} />
+            <PhraseList title="Writes" phrases={op.writes ?? []} />
+            {op.sql ? (
+              <div>
+                <p className="text-xs font-medium text-muted-foreground">SQL</p>
+                <CodeView text={op.sql} language="sql" className="mt-1" />
+              </div>
+            ) : null}
+          </section>
+          <section className="flex min-w-0 flex-col gap-2 rounded-xl border border-border bg-card p-4">
+            <div className="flex items-center gap-2">
+              <FileCode2Icon className="size-4 text-primary" aria-hidden />
+              <PanelTitle>Source code</PanelTitle>
+            </div>
+            <OpSource pipelineId={pipeline.id} op={op} />
+          </section>
+        </div>
+      ) : dataNode ? (
+        <section className="rounded-xl border border-border bg-card p-4">
+          <PanelTitle>{dataNode.kind === "source" ? "Read by" : "Written by"}</PanelTitle>
+          <p className="mt-1 font-mono text-sm">{dataNode.label}</p>
+          <p className="mt-2 text-xs text-muted-foreground">
+            {flow.edges
+              .filter((e) => e.from === dataNode.id || e.to === dataNode.id)
+              .map((e) => (e.from === dataNode.id ? e.to : e.from).replace(/^op:/, ""))
+              .join(", ")}
+            , as declared in the op&apos;s code. Select the op to see that code.
+          </p>
+        </section>
+      ) : null}
+    </div>
+  )
+}
+
+/**
+ * An authored pipeline as a flowchart: source table, each transform in
+ * order, target table. Below it, the selected step and the stored
+ * definition itself: the exact record the engine reads, since an authored
+ * pipeline has no code of its own. Its transforms are the strings
+ * `transform_grammar::parse_transform` accepted when it was saved.
+ */
+export function AuthoredFlow({ pipeline }: { pipeline: PipelineDetail }) {
+  const def = pipeline.definition
+  const [selected, setSelected] = React.useState<string>("source")
+  const flow = React.useMemo(() => (def ? authoredFlow(def, describeTransform) : null), [def])
+  if (!def || !flow) {
+    return <EmptyState title="No definition stored" description="This authored pipeline has no stored definition to show." />
+  }
+  const node = flow.nodes.find((n) => n.id === selected) ?? flow.nodes[0]
+  const transformIndex = node.kind === "transform" && node.ref !== undefined ? Number(node.ref) : null
+  const assetId = node.id === "source" ? pipeline.sourceAssetId : node.id === "target" ? pipeline.targetAssetId : undefined
+
+  return (
+    <div className="flex flex-col gap-4">
+      <PipelineFlowchart
+        nodes={flow.nodes}
+        edges={flow.edges}
+        selectedId={node.id}
+        onSelect={(n) => setSelected(n.id)}
+        dataCaption={{ source: "source table", sink: "target table" }}
+      />
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,22rem)_minmax(0,1fr)]">
+        <section className="flex flex-col gap-3 self-start rounded-xl border border-border bg-card p-4 text-sm">
+          {transformIndex !== null ? (
+            <>
+              <PanelTitle>Transform {transformIndex + 1} of {def.transforms.length}</PanelTitle>
+              <p className="font-medium capitalize">{node.label}</p>
+              <p className="text-muted-foreground">{node.sublabel}</p>
+              <code className="rounded-md bg-muted/50 px-2 py-1 font-mono text-xs">{def.transforms[transformIndex]}</code>
+            </>
+          ) : (
+            <>
+              <PanelTitle>{node.id === "source" ? "Source table" : "Target table"}</PanelTitle>
+              <p className="font-mono">{node.label}</p>
+              {assetId ? (
+                <Link href={`/data/assets/${assetId}`} className="text-xs text-primary hover:underline">
+                  Open in the catalog
+                </Link>
+              ) : null}
+            </>
+          )}
+          <dl className="mt-1 grid grid-cols-2 gap-x-4 gap-y-2 border-t border-border pt-3 text-xs">
+            <dt className="text-muted-foreground">Load</dt>
+            <dd>{def.incrementalColumn ? `Incremental on ${def.incrementalColumn}` : "Full reload each run"}</dd>
+            <dt className="text-muted-foreground">Change capture (FBIC)</dt>
+            <dd>{def.fbicEnabled ? "On" : "Off"}</dd>
+            <dt className="text-muted-foreground">Connector</dt>
+            <dd className="font-mono">{def.connectorId ?? "—"}</dd>
+          </dl>
+        </section>
+        <section className="flex min-w-0 flex-col gap-2 rounded-xl border border-border bg-card p-4">
+          <div className="flex items-center gap-2">
+            <FileCode2Icon className="size-4 text-primary" aria-hidden />
+            <PanelTitle>Stored definition</PanelTitle>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            The record the engine reads. An authored pipeline has no code of its own: the generic job in{" "}
+            <code className="font-mono">authored_factory.py</code> reads this and builds its SQL from the transforms.
+          </p>
+          <CodeView text={JSON.stringify(def, null, 2)} language="plain" />
+        </section>
       </div>
     </div>
   )

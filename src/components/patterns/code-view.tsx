@@ -3,6 +3,7 @@
 import { useTheme } from "next-themes"
 import CodeMirror from "@uiw/react-codemirror"
 import { python } from "@codemirror/lang-python"
+import { sql } from "@codemirror/lang-sql"
 import { cn } from "@/lib/utils"
 
 /**
@@ -17,10 +18,21 @@ import { cn } from "@/lib/utils"
  *
  * @param text The op's source text (already resolved server-side).
  * @param className Optional extra wrapper classes.
+ * @param language Highlighting grammar; Python by default.
  */
-export function CodeView({ text, className }: { text: string; className?: string }) {
+export function CodeView({
+  text,
+  className,
+  language = "python",
+}: {
+  text: string
+  className?: string
+  /** Highlighting only; `"plain"` for text with no grammar (a stored JSON definition). */
+  language?: "python" | "sql" | "plain"
+}) {
   const { resolvedTheme } = useTheme()
   const cmTheme = resolvedTheme === "dark" ? "dark" : "light"
+  const extensions = language === "python" ? [python()] : language === "sql" ? [sql()] : []
 
   return (
     <div
@@ -31,7 +43,7 @@ export function CodeView({ text, className }: { text: string; className?: string
     >
       <CodeMirror
         value={text}
-        extensions={[python()]}
+        extensions={extensions}
         editable={false}
         theme={cmTheme}
         basicSetup={{ lineNumbers: true, foldGutter: true, highlightActiveLine: false }}

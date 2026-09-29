@@ -332,7 +332,7 @@ export function PipelineDetailPage() {
             Runs
             {runs.length > 0 ? <span className="font-mono text-[11px] text-muted-foreground">{runs.length}</span> : null}
           </TabsTrigger>
-          <TabsTrigger value="definition">Definition</TabsTrigger>
+          <TabsTrigger value="definition">Flow &amp; code</TabsTrigger>
           <TabsTrigger value="settings">Settings</TabsTrigger>
         </TabsList>
 
@@ -416,9 +416,7 @@ export function PipelineDetailPage() {
             <DagsterDefinition
               pipeline={p}
               runLabel={selectedRun ? `run ${selectedRun.id.slice(0, 8)} (${formatRelativeTime(selectedRun.startedAt, now)})` : null}
-              stepStatus={(op) =>
-                stepsState.status === "success" ? stepsState.data.find((s) => s.stepKey === op)?.status : undefined
-              }
+              steps={stepsState.status === "success" ? stepsState.data : null}
             />
           )}
         </TabsContent>

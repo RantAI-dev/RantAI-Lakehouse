@@ -22,20 +22,32 @@ from __future__ import annotations
 
 import unittest
 
-from dispar_orchestrate import assets, agent_runs, gold_export, maintenance
+from dispar_orchestrate import authored_factory, op_metadata
+from dispar_orchestrate.definitions import defs
 
-_OPS = [
-    assets.ingest_bronze_table,
-    assets.register_in_catalog,
-    agent_runs.run_agent_employee,
-    gold_export.run_gold_export,
-    maintenance.run_bronze_maintenance,
-]
+
+def _every_op():
+    """Every op of every job the code location registers, read from `defs`
+    itself. This list used to be written by hand, and four ops
+    (`run_alerts_op`, `run_capacity_snapshot`, `run_replication_slot_check`,
+    `run_ingest`) shipped without metadata, so the console could show
+    neither their source nor what they read and write."""
+    seen = {}
+    for job in defs.resolve_all_job_defs():
+        for node in job.graph.node_dict.values():
+            seen.setdefault(node.definition.name, node.definition)
+    return list(seen.values())
 
 
 class OpSourceMetadataTest(unittest.TestCase):
+    def test_the_walk_finds_every_registered_op(self) -> None:
+        names = {op.name for op in _every_op()}
+        self.assertGreaterEqual(len(names), 9, names)
+        self.assertIn("run_alerts_op", names)
+        self.assertIn("run_ingest", names)
+
     def test_every_op_declares_a_source_ref_matching_module_colon_colon_function(self) -> None:
-        for op in _OPS:
+        for op in _every_op():
             tags = op.tags
             self.assertIn("source_ref", tags, op.name)
             self.assertRegex(
@@ -45,6 +57,38 @@ class OpSourceMetadataTest(unittest.TestCase):
             )
 
     def test_every_op_declares_a_commit_string(self) -> None:
-        for op in _OPS:
+        for op in _every_op():
             self.assertIn("commit", op.tags, op.name)
             self.assertIsInstance(op.tags["commit"], str)
+
+    def test_every_op_declares_what_it_writes(self) -> None:
+        for op in _every_op():
+            self.assertTrue(op.tags.get("writes", "").strip(), f"{op.name} declares no writes")
+
+    def test_reads_and_writes_travel_as_newline_joined_phrases(self) -> None:
+        tags = op_metadata.source_metadata(
+            "dispar_orchestrate/x.py::y", reads=["a", "b"], writes=["c"]
+        )
+        self.assertEqual(tags["reads"], "a\nb")
+        self.assertEqual(tags["writes"], "c")
+        self.assertNotIn("reads", op_metadata.source_metadata("dispar_orchestrate/x.py::y"))
+
+    def test_a_phrase_with_a_newline_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            op_metadata.source_metadata("dispar_orchestrate/x.py::y", reads=["a\nb"])
+
+    def test_an_authored_op_declares_its_own_source_and_target_tables(self) -> None:
+        op_def = authored_factory._op_for_pipeline(
+            {
+                "id": "pl-demo-1",
+                "definition": {
+                    "sourceZone": "silver",
+                    "sourceTable": "events",
+                    "targetZone": "gold",
+                    "targetTable": "events_clean",
+                    "transforms": [],
+                },
+            }
+        )
+        self.assertEqual(op_def.tags["reads"], "ClickHouse silver.events")
+        self.assertEqual(op_def.tags["writes"], "ClickHouse gold.events_clean")

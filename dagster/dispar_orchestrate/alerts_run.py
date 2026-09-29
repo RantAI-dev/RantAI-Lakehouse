@@ -52,6 +52,8 @@ from typing import Any
 import requests
 from dagster import DefaultScheduleStatus, ScheduleDefinition, job, op
 
+from dispar_orchestrate.op_metadata import source_metadata
+
 
 def _env(name: str, default: str) -> str:
     value = os.environ.get(name, "").strip()
@@ -108,7 +110,12 @@ def run_alerts(context: Any, cfg: AlertsRunConfig) -> dict[str, Any]:
     return result
 
 
-@op
+@op(
+    tags=source_metadata(
+        "dispar_orchestrate/alerts_run.py::run_alerts_op",
+        writes=["POST /api/alerts/run (the API evaluates every rule)"],
+    )
+)
 def run_alerts_op(context) -> dict[str, Any]:
     return run_alerts(context, AlertsRunConfig.from_env())
 
