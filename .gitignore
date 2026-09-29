@@ -67,3 +67,9 @@ dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Local-only files that must never reach this public repo: a customer's raw
+# data export used for testing the upload flow, and a machine's own compose
+# overrides (per-connector credential env vars).
+/data/rawdata.xls
+docker-compose.override.yml
