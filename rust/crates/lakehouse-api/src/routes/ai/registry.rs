@@ -382,11 +382,22 @@ fn trigger_pipeline_schema() -> Value {
 }
 
 fn retry_pipeline_run_schema() -> Value {
+    // Plan 1c (R2, day-1): `stepKeys` lets the model ask for a specific
+    // subset of steps rather than "everything" or "failed only". Each
+    // key is verified against the parent run's `run_steps` by the
+    // route layer (a typo here surfaces as 400, not a silent no-op).
+    // `fromFailure` and `stepKeys` are mutually exclusive in practice
+    // — when both arrive the tool uses `stepKeys` (the more specific
+    // intent); the schema lists both as the model has to see them
+    // both to make the choice.
     json!({ "type": "function", "function": { "name": "retry_pipeline_run",
-        "description": "Re-run a finished pipeline run (by runId): every step, or with fromFailure only the steps that failed (failed runs only).",
-        "parameters": { "type": "object", "properties": { "runId": { "type": "string" },
-            "fromFailure": { "type": "boolean" } },
-            "required": ["runId"] } } })
+        "description": "Re-run a finished pipeline run (by runId): every step, only the failed steps (with fromFailure, failed runs only), or a named subset of steps (with stepKeys).",
+        "parameters": { "type": "object", "properties": {
+            "runId": { "type": "string" },
+            "fromFailure": { "type": "boolean" },
+            "stepKeys": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["runId"] } } })
 }
 
 fn pause_pipeline_schema() -> Value {

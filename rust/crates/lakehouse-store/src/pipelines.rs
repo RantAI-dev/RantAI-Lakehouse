@@ -79,6 +79,12 @@ pub struct Pipeline {
     /// (`0048_pipeline_never_run.sql` made it honestly nullable): `None`
     /// until something measures it, never a fabricated `0`.
     pub freshness_lag_seconds: Option<i32>,
+    /// Per-pipeline retry cap (Plan 1c / migration 0051): the count
+    /// `authored_factory._op_for_pipeline` passes as
+    /// `RetryPolicy.max_retries` when it builds the op. `0..=5`,
+    /// default `2`; the column's CHECK constraint is the database-level
+    /// safety net, the route layer's 400 is the user-facing one.
+    pub max_retries: i16,
     /// What this pipeline is for, as its author described it
     /// (`0047_pipeline_description.sql`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -112,6 +118,12 @@ pub struct AuthoredDefinition {
     pub target_table: String,
     /// Ingress connector id, if any.
     pub connector_id: Option<String>,
+    /// Per-pipeline retry cap (`Pipeline::max_retries`, migration 0051):
+    /// passed to `authored_factory._op_for_pipeline` so the built op's
+    /// `RetryPolicy.max_retries` overrides the count of
+    /// `op_metadata.DEFAULT_RETRY_POLICY` while keeping its delay,
+    /// backoff and jitter.
+    pub max_retries: i16,
 }
 
 #[derive(Debug, FromRow)]
@@ -130,6 +142,7 @@ struct PipelineRow {
     last_run_at: Option<OffsetDateTime>,
     next_run_at: Option<OffsetDateTime>,
     freshness_lag_seconds: Option<i32>,
+    max_retries: i16,
     description: Option<String>,
     depends_on: Vec<String>,
 }
@@ -145,6 +158,7 @@ struct DefinitionRow {
     transforms: serde_json::Value,
     fbic_enabled: bool,
     connector_id: Option<String>,
+    max_retries: i16,
 }
 
 impl From<PipelineRow> for Pipeline {
@@ -173,6 +187,7 @@ impl From<PipelineRow> for Pipeline {
             next_run_at: row.next_run_at.map(iso_millis),
             sla_ok: None,
             freshness_lag_seconds: row.freshness_lag_seconds,
+            max_retries: row.max_retries,
             description: row.description,
             depends_on: row.depends_on,
         }
@@ -181,7 +196,7 @@ impl From<PipelineRow> for Pipeline {
 
 const PIPELINE_COLUMNS: &str = "id, name, kind, status, owner, source, target, connector_id, \
      source_asset_id, target_asset_id, schedule, last_run_at, next_run_at, \
-     freshness_lag_seconds, description, depends_on";
+freshness_lag_seconds, max_retries, description, depends_on";
 
 /// Optional narrowing for [`list_pipelines`] for tenant isolation: a caller
 /// must never see a pipeline outside its own tenant.
@@ -295,8 +310,8 @@ pub async fn get_definition(
     id: &str,
 ) -> Result<Option<AuthoredDefinition>, StoreError> {
     let row: Option<DefinitionRow> = sqlx::query_as(
-        "SELECT source, target, incremental_column, transforms, fbic_enabled, connector_id \
-         FROM pipeline_definition WHERE id = $1",
+        "SELECT source, target, incremental_column, transforms, fbic_enabled, connector_id, \
+         max_retries FROM pipeline_definition WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -316,6 +331,7 @@ pub async fn get_definition(
             target_zone,
             target_table,
             connector_id: row.connector_id,
+            max_retries: row.max_retries,
         }
     }))
 }
@@ -403,6 +419,14 @@ pub struct CreatePipelineInput {
     pub owner: Option<String>,
     /// What the pipeline is for, in the author's words (migration 0047).
     pub description: Option<String>,
+    /// Per-pipeline retry cap (Plan 1c / migration 0051): passed to
+    /// `authored_factory._op_for_pipeline` as `RetryPolicy.max_retries`
+    /// when it builds the op. The route layer rejects out-of-range
+    /// values with 400, so this field is `0..=5`. `None` here resolves to
+    /// the migration's `DEFAULT 2` on insert (the SQL omits the column,
+    /// leaving the schema default in place), so a caller that does not
+    /// mention `max_retries` gets the same value as a missing column.
+    pub max_retries: Option<i16>,
     /// The tenant the pipeline belongs to: the creator's active tenant.
     /// `None` leaves the row unassigned (`0042_tenant_provisioning.sql`),
     /// which every tenant-scoped read then skips; before this field every
@@ -440,11 +464,17 @@ pub async fn create_pipeline(
     // them here inserts `NULL` — a freshly authored pipeline has honestly
     // never run, not a fabricated "just now".
     let transforms = serde_json::to_value(&input.transforms).unwrap_or(serde_json::Value::Null);
+    // `max_retries` (migration 0051): a present input is bound as-is; an
+    // absent input resolves to the migration's `DEFAULT 2` here so the
+    // row carries the same value either way (the column has no other
+    // source — there is no per-row "explicitly defaulted" distinction
+    // worth preserving).
+    let max_retries = input.max_retries.unwrap_or(2);
     let sql = format!(
         "INSERT INTO pipeline_definition (id, name, kind, status, owner, source, target, \
-         schedule, description, incremental_column, fbic_enabled, transforms, tenant_id, \
-         depends_on) \
-         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+schedule, description, incremental_column, fbic_enabled, transforms, \
+         max_retries, tenant_id, depends_on) \
+         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
          RETURNING {PIPELINE_COLUMNS}"
     );
     let row: PipelineRow = sqlx::query_as(&sql)
@@ -459,6 +489,7 @@ pub async fn create_pipeline(
         .bind(&input.incremental_column)
         .bind(input.fbic_enabled)
         .bind(&transforms)
+        .bind(max_retries)
         .bind(input.tenant_id)
         .bind(&input.depends_on)
         .fetch_one(pool)
@@ -495,6 +526,13 @@ pub struct UpdatePipelineInput {
     pub owner: Option<String>,
     /// Description; cleared when absent.
     pub description: Option<String>,
+    /// Per-pipeline retry cap (`Pipeline::max_retries`, migration 0051).
+    /// `None` leaves the stored value alone — exactly the same shape as
+    /// [`Self::owner`], and the route layer validates `0..=5` BEFORE
+    /// this function is called so this code never sees an out-of-range
+    /// value (the CHECK constraint in `0051_pipeline_max_retries.sql` is
+    /// defense in depth, not the primary safety boundary).
+    pub max_retries: Option<i16>,
     /// Upstream pipeline ids whose SUCCESS runs must precede this one's
     /// (migration `0052`). Defaults to empty (the route passes `[]` when
     /// the body omits the field, and the migration's `DEFAULT '{}'`
@@ -518,10 +556,15 @@ pub async fn update_pipeline(
     let source = format!("{}.{}", input.source_zone, input.source_table);
     let target = format!("{}.{}", input.target_zone, input.target_table);
     let transforms = serde_json::to_value(&input.transforms).unwrap_or(serde_json::Value::Null);
+    // `max_retries` (migration 0051): `COALESCE($N, max_retries)` —
+    // the route layer rejects out-of-range values with 400 first, so
+    // the CHECK constraint here is defense in depth for whatever
+    // happens to bind straight into the column.
     let sql = format!(
         "UPDATE pipeline_definition SET kind = $2, source = $3, target = $4, schedule = $5, \
          description = $6, incremental_column = $7, fbic_enabled = $8, transforms = $9, \
-         owner = COALESCE($10, owner), depends_on = $11 \
+owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
+         depends_on = $12 \
          WHERE id = $1 RETURNING {PIPELINE_COLUMNS}"
     );
     let row: Option<PipelineRow> = sqlx::query_as(&sql)
@@ -535,6 +578,7 @@ pub async fn update_pipeline(
         .bind(input.fbic_enabled)
         .bind(&transforms)
         .bind(&input.owner)
+        .bind(input.max_retries)
         .bind(&input.depends_on)
         .fetch_optional(pool)
         .await?;
@@ -848,6 +892,7 @@ mod tests {
             next_run_at: None,
             sla_ok: Some(true),
             freshness_lag_seconds: Some(0),
+            max_retries: 2,
             description: None,
             depends_on: Vec::new(),
         };
@@ -865,6 +910,7 @@ mod tests {
             "slaOk",
             "freshnessLagSeconds",
             "dependsOn",
+            "maxRetries",
         ] {
             assert!(value.get(key).is_some(), "Pipeline is missing `{key}`");
         }
@@ -896,6 +942,7 @@ mod tests {
             last_run_at: None,
             next_run_at: None,
             freshness_lag_seconds: None,
+            max_retries: 2,
             description: None,
             depends_on: Vec::new(),
         };
@@ -935,6 +982,7 @@ mod tests {
             last_run_at: Some(ran_at),
             next_run_at: None,
             freshness_lag_seconds: Some(42),
+            max_retries: 3,
             description: Some("does a thing".to_owned()),
             depends_on: vec!["pl-up".to_owned(), "ingest_job".to_owned()],
         };

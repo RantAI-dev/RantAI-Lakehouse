@@ -267,9 +267,20 @@ pub(super) async fn retry_pipeline_run(state: &AppState, args: &Map<String, Valu
     if run_id.is_empty() {
         return json!({ "error": "runId is required" });
     }
-    // `fromFailure: true` re-runs only the failed steps; the route's own
-    // strategy parsing decides, so the tool cannot drift from the console.
-    let body = if args.get("fromFailure").and_then(Value::as_bool) == Some(true) {
+    // Plan 1c (R2, day-1): the copilot tool can ask for a specific
+    // subset of steps via the `stepKeys` array — the route layer
+    // builds the body, so the tool cannot drift from the console's
+    // own contract for `{"strategy":"selected","stepKeys":[...]}`.
+    // `fromFailure: true` keeps its existing meaning (re-runs only
+    // the failed steps). When both are present, `stepKeys` wins —
+    // it is the more specific request, and a model that names keys
+    // is presumed to know what it wants.
+    let body = if let Some(step_keys) = args.get("stepKeys").and_then(Value::as_array) {
+        let keys_json = serde_json::to_string(step_keys).unwrap_or_else(|_| "[]".to_owned());
+        Bytes::from(format!(
+            r#"{{"strategy":"selected","stepKeys":{keys_json}}}"#
+        ))
+    } else if args.get("fromFailure").and_then(Value::as_bool) == Some(true) {
         Bytes::from_static(br#"{"strategy":"fromFailure"}"#)
     } else {
         Bytes::new()

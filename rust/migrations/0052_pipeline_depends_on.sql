@@ -9,12 +9,11 @@
 --
 -- # Migration numbering
 --
--- This is 0052 even though the previous migration on `main` is 0050,
--- because R2 (open PR #56) carries `0051_alert_priority.sql`. We count
--- R2's pending migration so this file does not collide with it once R2
--- merges; the executor names this fact in the PR body. The same
--- column does not appear in R2, so no migration order hazard exists
--- once both land — every read here is `pipeline_definition.depends_on`.
+-- This is 0052 because R2's `0051_pipeline_max_retries.sql` lands first
+-- via PR #56, and this file follows it in this PR. The two touch the same
+-- table but not the same column, so the order carries no hazard: 0051
+-- adds `max_retries`, this one adds `depends_on`, and every read here is
+-- `pipeline_definition.depends_on`.
 --
 -- # Why `text[]` and not a join table
 --

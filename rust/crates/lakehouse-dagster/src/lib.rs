@@ -69,6 +69,13 @@ pub struct DgRunWithRows {
 }
 
 /// How a re-execution picks the steps it runs again.
+///
+/// `Selected` is deliberately NOT a variant here: a re-execution of a
+/// chosen subset carries step keys and Dagster expresses it through
+/// `launchRunReexecution(executionParams { stepKeys })`, not through a
+/// `ReexecutionStrategy` value. Parsing that request belongs to the
+/// route layer, so this enum stays closed and the strategy mapping can
+/// never report a strategy the caller did not ask for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReexecutionStrategy {
     /// Every step of the parent run.
@@ -325,6 +332,42 @@ pub struct RunStatusInfo {
     pub end_time: Option<f64>,
 }
 
+/// One step in a runs × steps matrix row — the matrix's per-cell shape,
+/// `stepKey`/`status`/`durationMs`, sized to what the route layer renders
+/// (no `startMs`/`endMs`/materializations, since the matrix view is a
+/// grid, not a step detail view).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunStepMatrixEntry {
+    /// The step's key (e.g. `"run_bronze_maintenance"`).
+    pub step_key: String,
+    /// The step's raw `Dagster` status string (the route maps it through
+    /// [`map_run_status`] for the response, the same way every other
+    /// step status the API returns is mapped — see [`RunStep::status`]).
+    pub status: String,
+    /// `endTime - startTime` in milliseconds — `None` when either side is
+    /// missing (a step that never started, or one whose timestamps Dagster
+    /// hasn't recorded yet), never a fabricated `0`.
+    pub duration_ms: Option<i64>,
+}
+
+/// One row in a runs × steps matrix — a run plus its per-step statuses,
+/// returned by [`DgClient::list_runs_with_steps_for_job`].
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunWithSteps {
+    /// The run's id.
+    pub run_id: String,
+    /// The run's `Dagster` status string (raw, like [`DgRun::status`]).
+    pub status: String,
+    /// Unix seconds the run started, or `None` if `Dagster` hasn't
+    /// recorded one — the route layer turns this into `startedAt` and
+    /// leaves it `null` rather than fabricating `now()`.
+    pub start_time: Option<f64>,
+    /// Each step's key + status + duration, in `Dagster`'s reported order.
+    pub steps: Vec<RunStepMatrixEntry>,
+}
+
 /// One asset materialization reported by a step, matching
 /// `stepStats.materializations`.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -364,6 +407,11 @@ pub struct RunStep {
     pub end_ms: Option<i64>,
     /// Assets this step materialized, in `Dagster`'s reported order.
     pub materializations: Vec<StepMaterialization>,
+    /// How many attempts `Dagster` recorded for this step
+    /// (`stepStats.attempts`, a list of `RunMarker { startTime endTime }`).
+    /// `1` for a step that ran once, `0` for one that never started
+    /// (empty/absent list), `2+` for one that was retried.
+    pub attempts: usize,
 }
 
 /// One log line, from a `MessageEvent`-implementing event in a run's log
@@ -550,6 +598,49 @@ impl DgClient {
         );
         let data: RunsOrErrorData = self.execute(&query, None).await?;
         Ok(data.runs_or_error.results.unwrap_or_default())
+    }
+
+    /// The runs × steps matrix for `job_name` (Plan 1c, R2): up to `limit`
+    /// most-recent runs, each with its `stepStats { stepKey status
+    /// startTime endTime }`. ONE GraphQL call — the route layer MUST NOT
+    /// fan out per run (`with_materializations` would be a tempting extra
+    /// field but is read out separately by [`DgClient::run_steps`] per
+    /// single run when needed; the matrix deliberately excludes it to
+    /// keep the one-call contract). Modeled on
+    /// [`DgClient::list_runs_for_job`]'s `pipelineName` filter.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::list_runs`].
+    pub async fn list_runs_with_steps_for_job(
+        &self,
+        job_name: &str,
+        limit: u32,
+    ) -> Result<Vec<RunWithSteps>, DgError> {
+        let query = format!(
+            "{{ runsOrError(filter: {{ pipelineName: \"{job_name}\" }}, limit: {limit}) {{ \
+             __typename ... on Runs {{ results {{ runId status startTime \
+             stepStats {{ stepKey status startTime endTime }} }} }} }} }}"
+        );
+        let body = json!({ "query": query });
+        let resp = self.client.post(&self.url).json(&body).send().await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(DgError::Server(format!("Dagster HTTP {}", status.as_u16())));
+        }
+        let parsed: Value =
+            serde_json::from_str(&text).map_err(|e| DgError::Server(e.to_string()))?;
+        if let Some(errors) = parsed.get("errors") {
+            return Err(DgError::Server(truncate_300(&errors.to_string())));
+        }
+        let results = parsed
+            .pointer("/data/runsOrError/results")
+            .and_then(Value::as_array);
+        let Some(results) = results else {
+            return Ok(Vec::new());
+        };
+        Ok(results.iter().map(run_with_steps_from_value).collect())
     }
 
     /// Like [`list_runs_for_job`], but each run is paired with its summed
@@ -853,6 +944,119 @@ impl DgClient {
         Ok(launch_outcome_from(data.launch_run_reexecution))
     }
 
+    /// Re-execute a finished run, but only the named `step_keys`. Two
+    /// round trips: the parent run's `pipelineName`, `rootRunId`, and
+    /// `runConfig` are looked up first; the mutation then calls
+    /// `launchRunReexecution(executionParams: { selector, runConfigData,
+    /// stepKeys, executionMetadata: { parentRunId, rootRunId } })`.
+    ///
+    /// Why the lookup-then-mutate shape: Dagster's
+    /// `launchRunReexecution(executionParams)` requires the parent run's
+    /// config to be passed back as `runConfigData` (`dagster_graphql/
+    /// schema/inputs.py:322`, `RunConfigData` accepts the OBJECT form —
+    /// see [`DgClient::launch_run_with_config`] for the same declared
+    /// type), and the same mutation enforces EXACTLY ONE of
+    /// `executionParams` / `reexecutionParams`, so a `strategy`-based
+    /// `reexecutionParams` would lose `stepKeys`. The single source of
+    /// `runConfig` Dagster exposes is `Run.runConfig`
+    /// (`schema/pipelines/pipeline.py:646`, resolver `:811`), a generic
+    /// `RunConfigData` scalar; its JSON shape round-trips straight back
+    /// to `runConfigData` without any YAML parsing here — no
+    /// `serde_yaml` / `dump_run_config_yaml` dependency introduced.
+    ///
+    /// A parent that does not resolve to a `Run` (`RunNotFoundError`,
+    /// `__typename` other than `"Run"`) is returned as
+    /// `Ok(LaunchOutcome { error: Some(_), run_id: None })` — matching
+    /// [`DgClient::launch_reexecution`]'s posture. The route layer maps
+    /// that to a `404`.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`]. A transport-level failure on
+    /// either the lookup or the mutation becomes [`DgError::Transport`]
+    /// / [`DgError::Server`]; a Dagster-side typed refusal becomes
+    /// `Ok(LaunchOutcome { error: Some(msg), .. })`.
+    pub async fn launch_reexecution_of_steps(
+        &self,
+        parent_run_id: &str,
+        step_keys: &[&str],
+    ) -> Result<LaunchOutcome, DgError> {
+        // ── Lookup: parent run's pipelineName, rootRunId, runConfig.
+        // `runConfig` is a `RunConfigData` (`GenericScalar`) — Dagster
+        // serialises the underlying Python dict as a JSON object. We
+        // forward that object as `runConfigData` on the mutation, the
+        // same OBJECT form `launch_run_with_config` already validates
+        // (`$cfg: RunConfigData!`, body asserted in its own wiremock
+        // test). No YAML parsing is needed: re-serialising this `Value`
+        // straight through GraphQL JSON gives Dagster the exact same
+        // shape it returned.
+        let lookup_query = "query($rid: ID!) { pipelineRunOrError(runId: $rid) { \
+                            __typename \
+                            ... on Run { pipelineName rootRunId runConfig } } }";
+        // `execute<T>` unwraps `data` into `T` (see `GqlResponse`), so
+        // `lookup` is already the `{pipelineRunOrError: ...}` object
+        // — not the whole response. Same posture as
+        // [`DgClient::pipeline_run_status`], which reads
+        // `parsed.pointer("/data/...")` only because it uses a raw
+        // `Value` parse to tolerate a `Run` vs `RunNotFoundError` split.
+        let lookup: Value = self
+            .execute(lookup_query, Some(json!({ "rid": parent_run_id })))
+            .await?;
+        let parent = &lookup["pipelineRunOrError"];
+        if parent.get("__typename").and_then(Value::as_str) != Some("Run") {
+            return Ok(LaunchOutcome {
+                run_id: None,
+                error: Some("RunNotFoundError".to_owned()),
+            });
+        }
+        let pipeline_name = parent
+            .get("pipelineName")
+            .and_then(Value::as_str)
+            .ok_or_else(|| DgError::Server("parent run missing pipelineName".to_owned()))?
+            .to_owned();
+        let root_run_id = parent
+            .get("rootRunId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        // `runConfig` is `RunConfigData!` on `Run` (schema/pipelines/
+        // pipeline.py:646) — Dagster always returns it for a Run. We
+        // still tolerate its absence as an empty object rather than
+        // crashing, so a future schema change never makes this method
+        // panic on `as_object().unwrap()`.
+        let run_config = parent
+            .get("runConfig")
+            .cloned()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::default()));
+
+        // ── Mutation: launchRunReexecution with executionParams.
+        // `ExecutionParams.stepKeys` is `[String!]` (inputs.py:331-336).
+        let mutation = "mutation($sel: JobOrPipelineSelector!, \
+                         $cfg: RunConfigData!, $keys: [String!]!, \
+                         $parentRunId: String!, $rootRunId: String) { \
+                         launchRunReexecution(executionParams: { \
+                         selector: $sel, runConfigData: $cfg, stepKeys: $keys, \
+                         executionMetadata: { parentRunId: $parentRunId, \
+                         rootRunId: $rootRunId } }) { \
+                         __typename \
+                         ... on LaunchRunSuccess { run { runId } } \
+                         ... on PythonError { message } \
+                         ... on RunConfigValidationInvalid { errors { message } } \
+                         } }";
+        let variables = json!({
+            "sel": {
+                "repositoryName": self.repo,
+                "repositoryLocationName": self.location,
+                "pipelineName": pipeline_name,
+            },
+            "cfg": run_config,
+            "keys": step_keys,
+            "parentRunId": parent_run_id,
+            "rootRunId": root_run_id,
+        });
+        let data: LaunchReexecutionData = self.execute(mutation, Some(variables)).await?;
+        Ok(launch_outcome_from(data.launch_run_reexecution))
+    }
+
     /// Start (unpause) a schedule, matching `mutation { startSchedule(...) }`.
     /// Used by `resumePipeline` (Phase 2, Task 2.5).
     ///
@@ -1112,7 +1316,8 @@ impl DgClient {
         let query = "query($rid:ID!){ runOrError(runId:$rid){ __typename \
                       ... on Run { stepStats { stepKey status startTime endTime \
                       materializations { assetKey { path } metadataEntries { __typename \
-                      ... on IntMetadataEntry { label intValue } } } } } } }";
+                      ... on IntMetadataEntry { label intValue } } } \
+                      attempts { startTime endTime } } } } }";
         let body = json!({ "query": query, "variables": { "rid": run_id } });
         let resp = self.client.post(&self.url).json(&body).send().await?;
         let text = resp.text().await?;
@@ -1493,6 +1698,61 @@ struct DependsOnSolid {
     name: String,
 }
 
+/// Convert one `runsOrError.results` element into a [`RunWithSteps`] —
+/// one row of the runs × steps matrix. The `stepStats` array is mapped
+/// through [`run_step_matrix_entry_from_value`] for the per-step parse;
+/// the function reads nothing else (no `creationTime`, no `tags`, no
+/// `parentRunId`, no `rootRunId`) because the matrix view does not
+/// surface them.
+fn run_with_steps_from_value(r: &Value) -> RunWithSteps {
+    let steps = r
+        .get("stepStats")
+        .and_then(Value::as_array)
+        .map(|stats| stats.iter().map(run_step_matrix_entry_from_value).collect())
+        .unwrap_or_default();
+    RunWithSteps {
+        run_id: r
+            .get("runId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        status: r
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        start_time: r.get("startTime").and_then(Value::as_f64),
+        steps,
+    }
+}
+
+/// Convert one `stepStats` element into a [`RunStepMatrixEntry`] — the
+/// matrix's per-cell shape (`stepKey`/`status`/`durationMs`), narrower
+/// than [`RunStep`] (no materializations, no startMs/endMs, no attempts).
+/// `durationMs` is `None` when either `startTime` or `endTime` is
+/// missing on the wire — never a fabricated `0`.
+fn run_step_matrix_entry_from_value(s: &Value) -> RunStepMatrixEntry {
+    let start_ms = seconds_to_ms(s.get("startTime"));
+    let end_ms = seconds_to_ms(s.get("endTime"));
+    let duration_ms = match (start_ms, end_ms) {
+        (Some(a), Some(b)) => Some(b - a),
+        _ => None,
+    };
+    RunStepMatrixEntry {
+        step_key: s
+            .get("stepKey")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        status: s
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        duration_ms,
+    }
+}
+
 /// Convert one `stepStats` array element into a [`RunStep`] — split out
 /// from [`DgClient::run_steps`] so the per-step parse (itself several
 /// nested `Option` chains) reads as one function rather than a closure
@@ -1512,6 +1772,10 @@ fn run_step_from_value(s: &Value) -> RunStep {
                 .collect()
         })
         .unwrap_or_default();
+    let attempts = s
+        .get("attempts")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
     RunStep {
         step_key: s
             .get("stepKey")
@@ -1526,6 +1790,7 @@ fn run_step_from_value(s: &Value) -> RunStep {
         start_ms: seconds_to_ms(s.get("startTime")),
         end_ms: seconds_to_ms(s.get("endTime")),
         materializations,
+        attempts,
     }
 }
 
@@ -1923,6 +2188,98 @@ mod tests {
         assert_eq!(runs[0].end_time, Some(3.0));
     }
 
+    /// Plan 1c (R2): the runs × steps matrix comes from ONE GraphQL call
+    /// per pipeline, not one per run. This test proves the response shape
+    /// the route layer turns into `{ runs: [{ runId, status, startedAt,
+    /// steps: [{ stepKey, status, durationMs|null }] }], unavailable }`
+    /// — and that two runs in one `results[]` arrive in two `RunWithSteps`,
+    /// not one (the route never has to fan out per-run).
+    #[tokio::test]
+    async fn list_runs_with_steps_for_job_returns_step_stats_per_run_in_one_call() {
+        use wiremock::matchers::body_string_contains;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("stepStats"))
+            .and(body_string_contains("refresh_lakehouse"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runsOrError": { "__typename": "Runs", "results": [
+                    { "runId": "r1", "jobName": "refresh_lakehouse", "status": "SUCCESS",
+                      "startTime": 1.0, "endTime": 3.0,
+                      "stepStats": [
+                          { "stepKey": "extract", "status": "SUCCESS",
+                            "startTime": 1.0, "endTime": 2.0 },
+                          { "stepKey": "load", "status": "SUCCESS",
+                            "startTime": 2.0, "endTime": 3.0 }
+                      ] },
+                    { "runId": "r2", "jobName": "refresh_lakehouse", "status": "FAILURE",
+                      "startTime": 4.0, "endTime": 7.0,
+                      "stepStats": [
+                          { "stepKey": "extract", "status": "SUCCESS",
+                            "startTime": 4.0, "endTime": 5.0 },
+                          { "stepKey": "load", "status": "FAILURE",
+                            "startTime": 5.0, "endTime": 7.0 }
+                      ] }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let rows = client
+            .list_runs_with_steps_for_job("refresh_lakehouse", 30)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2, "both runs are present in one response");
+        assert_eq!(rows[0].run_id, "r1");
+        assert_eq!(rows[0].steps.len(), 2);
+        assert_eq!(rows[0].steps[0].step_key, "extract");
+        assert_eq!(
+            rows[0].steps[0].duration_ms,
+            Some(1000),
+            "durationMs is the per-step end-start diff"
+        );
+        assert_eq!(rows[1].run_id, "r2");
+        assert_eq!(rows[1].steps.len(), 2);
+        assert_eq!(rows[1].steps[1].status, "FAILURE");
+    }
+
+    /// A step whose `startTime`/`endTime` are both `null` (it never ran)
+    /// reports `durationMs: None`, not a fabricated `0` — same honesty
+    /// posture as the API layer's own "never fabricate a measurement"
+    /// rule (AGENTS.md principle 5).
+    #[tokio::test]
+    async fn list_runs_with_steps_reports_null_duration_for_a_step_that_never_started() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runsOrError": { "__typename": "Runs", "results": [
+                    { "runId": "r1", "jobName": "j", "status": "FAILURE",
+                      "startTime": 1.0, "endTime": 2.0,
+                      "stepStats": [
+                          { "stepKey": "ran", "status": "SUCCESS",
+                            "startTime": 1.0, "endTime": 2.0 },
+                          { "stepKey": "never_started", "status": "SKIPPED",
+                            "startTime": null, "endTime": null }
+                      ] }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let rows = client.list_runs_with_steps_for_job("j", 30).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let step_duration = rows[0]
+            .steps
+            .iter()
+            .find(|s| s.step_key == "never_started")
+            .map(|s| s.duration_ms);
+        assert_eq!(step_duration, Some(None));
+    }
+
     /// `list_runs_for_job_with_materializations` sums the `"rows"`
     /// metadata entries across every step's materializations, returning
     /// `None` for a run whose steps reported no row count.
@@ -2286,6 +2643,100 @@ mod tests {
         assert_eq!(outcome.error.as_deref(), Some("boom"));
     }
 
+    /// Plan 1c (R2): the selected-steps re-execution first looks up the
+    /// parent run's `pipelineName`/`rootRunId`/`runConfig`, then calls
+    /// `launchRunReexecution(executionParams: { selector, runConfigData,
+    /// stepKeys, executionMetadata: { parentRunId, rootRunId } })`. The
+    /// wiremock must see ONE GraphQL body that carries the requested
+    /// `stepKeys` AND the parent config — otherwise Dagster would launch
+    /// without its required resources (see `dagster_graphql/schema/
+    /// inputs.py:314-340`).
+    #[tokio::test]
+    async fn launch_reexecution_of_steps_sends_selector_step_keys_and_parent_config() {
+        use wiremock::matchers::{body_partial_json, body_string_contains};
+
+        let server = MockServer::start().await;
+        // Register the mutation mock FIRST so it gets the higher priority
+        // (wiremock uses "most recently mounted first" — see the docs on
+        // `MockServer`). Then mount the lookup mock so it cannot shadow the
+        // mutation on a body that contains both `pipelineRunOrError` AND
+        // `launchRunReexecution` (none of our requests do, but the order
+        // makes the intent explicit).
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("launchRunReexecution"))
+            .and(body_string_contains("$cfg: RunConfigData!"))
+            .and(body_partial_json(json!({
+                "variables": {
+                    "sel": { "repositoryName": "__repository__",
+                             "repositoryLocationName": "dispar_orchestrate.definitions",
+                             "pipelineName": "refresh_lakehouse" },
+                    "cfg": { "ops": { "run_x": { "config": { "k": "v" } } } },
+                    "keys": ["run_x", "run_y"],
+                    "parentRunId": "parent-1",
+                    "rootRunId": "root-1",
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "launchRunReexecution": { "__typename": "LaunchRunSuccess",
+                    "run": { "runId": "new-run" } } }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("pipelineRunOrError"))
+            .and(body_partial_json(json!({
+                "variables": { "rid": "parent-1" }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "pipelineRunOrError": { "__typename": "Run",
+                    "pipelineName": "refresh_lakehouse",
+                    "rootRunId": "root-1",
+                    "runConfig": { "ops": { "run_x": { "config": { "k": "v" } } } }
+                } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .launch_reexecution_of_steps("parent-1", &["run_x", "run_y"])
+            .await
+            .unwrap();
+        assert_eq!(outcome.run_id.as_deref(), Some("new-run"));
+        assert!(outcome.error.is_none());
+    }
+
+    /// The lookup of a non-`Run` parent (`RunNotFoundError`) is propagated
+    /// as `Ok(LaunchOutcome { error, .. })`, not `Err` — matching
+    /// [`DgClient::launch_run`] / [`DgClient::terminate_run`]'s posture
+    /// (`DgClient::pipeline_run_status`'s sibling returns `Ok(None)` for
+    /// the same condition; the route layer above is what maps that into a
+    /// 404).
+    #[tokio::test]
+    async fn launch_reexecution_of_steps_reports_parent_not_found_as_error_not_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(wiremock::matchers::body_string_contains(
+                "pipelineRunOrError",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "pipelineRunOrError": { "__typename": "RunNotFoundError" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .launch_reexecution_of_steps("nope", &["any"])
+            .await
+            .unwrap();
+        assert!(outcome.run_id.is_none());
+        assert!(outcome.error.is_some());
+    }
+
     #[tokio::test]
     async fn start_schedule_success() {
         let server = MockServer::start().await;
@@ -2468,6 +2919,44 @@ mod tests {
         let no_rows = &steps[1];
         assert_eq!(no_rows.materializations.len(), 1);
         assert_eq!(no_rows.materializations[0].rows, None);
+    }
+
+    /// Plan 1c (R2): each `stepStats` row carries an `attempts` list
+    /// (`RunMarker { startTime endTime }` — `dagster_graphql/schema/logs/
+    /// events.py:717`). Three attempts → `attempts: 3`. A step that
+    /// never ran carries an empty `attempts` list → `attempts: 0` (never
+    /// a fabricated `1`).
+    #[tokio::test]
+    async fn run_steps_parses_attempts_count() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runOrError": { "__typename": "Run", "stepStats": [
+                    { "stepKey": "retried_step", "status": "SUCCESS",
+                      "startTime": 1.0, "endTime": 2.0,
+                      "attempts": [
+                          { "startTime": 1.0, "endTime": 1.5 },
+                          { "startTime": 1.6, "endTime": 1.8 },
+                          { "startTime": 1.9, "endTime": 2.0 }
+                      ] },
+                    { "stepKey": "never_started", "status": "SKIPPED",
+                      "startTime": null, "endTime": null, "attempts": [] }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let steps = client.run_steps("r1").await.unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].step_key, "retried_step");
+        assert_eq!(steps[0].attempts, 3);
+        assert_eq!(steps[1].step_key, "never_started");
+        assert_eq!(
+            steps[1].attempts, 0,
+            "an empty attempts list means the step never started; never fabricate 1"
+        );
     }
 
     /// A missing run is a normal "nothing to show" case here, matching the

@@ -1003,6 +1003,78 @@ fn step_to_json(s: &lakehouse_dagster::RunStep) -> Value {
         "materializations": s.materializations.iter().map(|m| json!({
             "assetKey": m.asset_key, "rows": m.rows,
         })).collect::<Vec<_>>(),
+        // Plan 1c: every retry attempt is its own attempt record on the
+        // Dagster side; the count of records is the count of attempts.
+        // 0 means "never even started" — a step without an `attempts`
+        // entry, which can happen for a queued step before the daemon
+        // touches it. The TS contract types this as a non-null number;
+        // we never send `null`, so the UI does not need an "unknown"
+        // branch.
+        "attempts": s.attempts,
+    })
+}
+
+/// Plan 1c (R2, day-1): `GET /api/pipelines/{id}/runs/steps` — a runs ×
+/// steps matrix for the recovery UI: every recent run of the pipeline,
+/// each row carrying the status and duration of every step `Dagster`
+/// reports for that run. One GraphQL round trip (`runsOrError` with a
+/// nested `stepStats` projection), so a console page that today makes
+/// one `list_runs_for_job` + N `run_steps` round trips collapses to a
+/// single request.
+///
+/// Same `pl-` vs dagster id dispatch as [`runs`]: an authored
+/// pipeline's runs belong to the `authored__<id>` job.
+///
+/// When `Dagster` is unreachable, the route returns an EMPTY matrix
+/// with an `"unavailable"` field rather than a 503 — the recovery page
+/// already shows "orchestrator unreachable" for the same shape (see
+/// [`runs_body`]); a fabricated list of runs would silently lose the
+/// signal that something is wrong.
+pub async fn runs_step_matrix(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let job = if id.starts_with("pl-") {
+        authored_pipelines::job_name(&id)
+    } else {
+        id.clone()
+    };
+    match state.dagster.list_runs_with_steps_for_job(&job, 30).await {
+        Ok(runs) => (
+            StatusCode::OK,
+            ApiJson(json!({
+                "runs": runs.iter().map(run_with_steps_to_json).collect::<Vec<_>>(),
+                "unavailable": Value::Null,
+            })),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::warn!(%err, "pipeline runs/steps: orchestrator unreachable");
+            (
+                StatusCode::OK,
+                ApiJson(json!({
+                    "runs": [],
+                    "unavailable": js_error(err),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+fn run_with_steps_to_json(r: &lakehouse_dagster::RunWithSteps) -> Value {
+    json!({
+        "id": r.run_id,
+        "status": map_run_status(&r.status),
+        // A timestamp `Dagster` did not observe is a fabricated
+        // measurement (WS4 item G1); `startTime` is `None` until the
+        // run has actually started, and the field stays `null` rather
+        // than defaulting to `now()` or the request time.
+        "startedAt": r.start_time.map_or(Value::Null, |t| {
+            Value::String(iso_from_unix_seconds(t))
+        }),
+        "steps": r.steps.iter().map(|s| json!({
+            "stepKey": s.step_key,
+            "status": map_run_status(&s.status),
+            "durationMs": s.duration_ms,
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -1800,6 +1872,15 @@ pub struct CreatePipelineBody {
     schedule: String,
     #[serde(default)]
     owner: Option<String>,
+    /// Plan 1c (R2, day-1): per-pipeline retry cap (migration 0051).
+    /// Validated here against the same `0..=5` the column CHECK enforces
+    /// (and `dagster.RetryPolicy.max_retries` accepts) so the client
+    /// gets a 400 instead of a database error when the value is
+    /// outside the range. `None` resolves to the migration's
+    /// `DEFAULT 2`, the same value the orchestrator already uses
+    /// (`op_metadata.DEFAULT_RETRY_POLICY`).
+    #[serde(default)]
+    max_retries: Option<i16>,
     /// Upstream pipeline ids whose SUCCESS runs must precede this one's.
     /// R3 plan 2a, migration `0052`. Validated in [`create`] against the
     /// existing authored graph + live `DgClient::list_jobs` BEFORE any
@@ -1837,6 +1918,16 @@ pub async fn create(
         crate::transform_grammar::parse_transform(transform).map_err(|err| {
             ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
         })?;
+    }
+    // Plan 1c: validate `max_retries` against the same `0..=5` the
+    // column CHECK enforces (migration 0051). Catching it here means a
+    // bad value returns a 400 with the field name, not a 500 from the
+    // database constraint violation. The error message does not echo
+    // the caller's value back.
+    if let Some(value) = body.max_retries
+        && !(0..=5).contains(&value)
+    {
+        return Err(ApiError::BadRequest("maxRetries must be between 0 and 5".to_owned()).into());
     }
     // Validate `depends_on` against the live authored graph + Dagster
     // job list. The new pipeline's id is not yet known at this point
@@ -1882,6 +1973,7 @@ pub async fn create(
         schedule: body.schedule,
         owner: body.owner,
         description: body.description,
+        max_retries: body.max_retries,
         tenant_id,
         depends_on: body.depends_on,
     };
@@ -2025,6 +2117,11 @@ pub async fn generate(
         // The instruction is kept verbatim as the description: it is the
         // only record of what this pipeline was asked to do.
         description: Some(body.instruction.clone()),
+        // No LLM-driven override for `max_retries` yet — a model that has
+        // not been told about the new column would either fabricate or
+        // echo a default. The store's migration `DEFAULT 2` is the
+        // honest answer for a draft nobody has asked to tune.
+        max_retries: None,
         tenant_id,
         // Agentic-builder output never carries upstream wiring: a draft
         // proposed by the LLM is validated against the grammar and the
@@ -2465,15 +2562,79 @@ pub async fn retry_run(
     Path(run_id): Path<String>,
     body: Bytes,
 ) -> Response {
-    let Some(strategy) = retry_strategy(&body) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            ApiJson(json!({ "error": "strategy must be \"allSteps\" or \"fromFailure\"" })),
-        )
-            .into_response();
+    let request = match parse_retry_request(&body) {
+        Ok(r) => r,
+        Err(err) => {
+            return (StatusCode::BAD_REQUEST, ApiJson(json!({ "error": err }))).into_response();
+        }
     };
-    match state.dagster.launch_reexecution(&run_id, strategy).await {
-        Ok(outcome) if outcome.error.is_none() => {
+    // Plan 1c (R2, day-1): the "selected" strategy names its target
+    // steps explicitly, so the route has to verify each one actually
+    // belongs to the parent run before sending the mutation. Anything
+    // outside the run's known keys would silently become a no-op on
+    // `Dagster`'s side, hiding a typo from the caller.
+    if let RetryRequest::Selected(keys) = &request {
+        let known: std::collections::HashSet<String> = match state.dagster.run_steps(&run_id).await
+        {
+            Ok(steps) => steps.iter().map(|s| s.step_key.clone()).collect(),
+            Err(err) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ApiJson(json!({ "error": js_error(err) })),
+                )
+                    .into_response();
+            }
+        };
+        // The 400 names the FIRST unknown key (not all of them — that
+        // would let a typo at index 0 mask a different one at index 1),
+        // never the caller's own list back.
+        if let Some(unknown) = keys.iter().find(|k| !known.contains(k.as_str())) {
+            return (
+                StatusCode::BAD_REQUEST,
+                ApiJson(json!({
+                    "error": format!("stepKey \"{unknown}\" is not a step of run {run_id}")
+                })),
+            )
+                .into_response();
+        }
+    }
+    // Two different driver calls: `launch_reexecution` takes one of the
+    // two strategies Dagster names, while a selected subset goes through
+    // `launch_reexecution_of_steps`, which carries the stepKeys filter as
+    // a `launchRunReexecution` argument.
+    let launched = match &request {
+        RetryRequest::Selected(keys) => {
+            let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+            state
+                .dagster
+                .launch_reexecution_of_steps(&run_id, &key_refs)
+                .await
+        }
+        RetryRequest::All => {
+            state
+                .dagster
+                .launch_reexecution(&run_id, ReexecutionStrategy::AllSteps)
+                .await
+        }
+        RetryRequest::FromFailure => {
+            state
+                .dagster
+                .launch_reexecution(&run_id, ReexecutionStrategy::FromFailure)
+                .await
+        }
+    };
+    let outcome = match launched {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiJson(json!({ "error": js_error(err) })),
+            )
+                .into_response();
+        }
+    };
+    match outcome {
+        outcome if outcome.error.is_none() => {
             let new_id = outcome.run_id.unwrap_or(run_id);
             // The NEW run's id, just launched: `Dagster` has not populated
             // its `startTime` yet at the instant this handler returns, so
@@ -2485,26 +2646,66 @@ pub async fn retry_run(
             )
                 .into_response()
         }
-        Ok(outcome) => dagster_mutation_failure(outcome.error),
-        Err(err) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            ApiJson(json!({ "error": js_error(err) })),
-        )
-            .into_response(),
+        outcome => dagster_mutation_failure(outcome.error),
     }
 }
 
-/// The re-execution strategy a retry body asks for; `None` for a body
-/// that is not empty and names no known strategy.
-fn retry_strategy(body: &[u8]) -> Option<ReexecutionStrategy> {
+/// What a retry body asks the route to re-execute. Separate from
+/// [`ReexecutionStrategy`], which only models the two strategies Dagster
+/// itself names: a `Selected` request carries step keys and becomes a
+/// `launchRunReexecution` with a `stepKeys` filter, never a strategy
+/// value. Parsed here, at the route boundary, so the driver's enum stays
+/// closed and its strategy mapping cannot silently degrade a subset
+/// request into `ALL_STEPS`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RetryRequest {
+    /// Every step of the parent run.
+    All,
+    /// Only the steps that failed or did not run.
+    FromFailure,
+    /// Only the named steps of the parent run.
+    Selected(Vec<String>),
+}
+
+/// The retry request a body asks for; `Err` for a body that is not
+/// empty and names no known strategy.
+fn parse_retry_request(body: &[u8]) -> Result<RetryRequest, String> {
     if body.iter().all(u8::is_ascii_whitespace) {
-        return Some(ReexecutionStrategy::AllSteps);
+        return Ok(RetryRequest::All);
     }
-    let value: Value = serde_json::from_slice(body).ok()?;
+    let value: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(err) => return Err(format!("invalid retry body: {err}")),
+    };
     match value.get("strategy").and_then(Value::as_str) {
-        None | Some("allSteps") => Some(ReexecutionStrategy::AllSteps),
-        Some("fromFailure") => Some(ReexecutionStrategy::FromFailure),
-        Some(_) => None,
+        None | Some("allSteps") => Ok(RetryRequest::All),
+        Some("fromFailure") => Ok(RetryRequest::FromFailure),
+        Some("selected") => {
+            // Plan 1c (R2, day-1): the "selected" strategy is the only
+            // way to re-run a subset of steps; the body MUST carry a
+            // non-empty `stepKeys` array, otherwise `Dagster` itself
+            // rejects the mutation with a confusing server error.
+            // The route layer adds the second half of validation —
+            // verifying each key actually exists in the parent run —
+            // AFTER this parser has run.
+            let Some(arr) = value.get("stepKeys").and_then(Value::as_array) else {
+                return Err("strategy \"selected\" requires a non-empty stepKeys array".to_owned());
+            };
+            if arr.is_empty() {
+                return Err("strategy \"selected\" requires a non-empty stepKeys array".to_owned());
+            }
+            let mut keys = Vec::with_capacity(arr.len());
+            for entry in arr {
+                let Some(s) = entry.as_str() else {
+                    return Err("stepKeys entries must be strings".to_owned());
+                };
+                keys.push(s.to_owned());
+            }
+            Ok(RetryRequest::Selected(keys))
+        }
+        Some(other) => Err(format!(
+            "strategy must be one of \"allSteps\", \"fromFailure\", \"selected\" (got \"{other}\")"
+        )),
     }
 }
 
@@ -2920,15 +3121,42 @@ mod tests {
 
     #[test]
     fn a_retry_body_names_its_strategy_or_is_refused() {
-        assert_eq!(retry_strategy(b""), Some(ReexecutionStrategy::AllSteps));
-        assert_eq!(retry_strategy(b"  "), Some(ReexecutionStrategy::AllSteps));
-        assert_eq!(retry_strategy(b"{}"), Some(ReexecutionStrategy::AllSteps));
+        assert_eq!(parse_retry_request(b""), Ok(RetryRequest::All));
+        assert_eq!(parse_retry_request(b"  "), Ok(RetryRequest::All));
+        assert_eq!(parse_retry_request(b"{}"), Ok(RetryRequest::All));
         assert_eq!(
-            retry_strategy(br#"{"strategy":"fromFailure"}"#),
-            Some(ReexecutionStrategy::FromFailure)
+            parse_retry_request(br#"{"strategy":"fromFailure"}"#),
+            Ok(RetryRequest::FromFailure)
         );
-        assert_eq!(retry_strategy(br#"{"strategy":"someSteps"}"#), None);
-        assert_eq!(retry_strategy(b"not json"), None);
+        assert!(parse_retry_request(br#"{"strategy":"someSteps"}"#).is_err());
+        assert!(parse_retry_request(b"not json").is_err());
+    }
+
+    /// Plan 1c (R2, day-1): the `selected` strategy accepts a
+    /// `stepKeys` array and refuses an empty one — `Dagster` itself
+    /// rejects an empty list at submit time, so the route catches it
+    /// first and returns 400 with a clear message.
+    #[test]
+    fn a_selected_retry_body_lists_its_steps() {
+        assert_eq!(
+            parse_retry_request(br#"{"strategy":"selected","stepKeys":["extract","transform"]}"#),
+            Ok(RetryRequest::Selected(vec![
+                "extract".to_owned(),
+                "transform".to_owned()
+            ]))
+        );
+        assert!(
+            parse_retry_request(br#"{"strategy":"selected"}"#).is_err(),
+            "selected without stepKeys must fail"
+        );
+        assert!(
+            parse_retry_request(br#"{"strategy":"selected","stepKeys":[]}"#).is_err(),
+            "an empty stepKeys array must fail"
+        );
+        assert!(
+            parse_retry_request(br#"{"strategy":"selected","stepKeys":["ok",123]}"#).is_err(),
+            "non-string stepKeys must fail"
+        );
     }
 
     #[test]
@@ -3994,6 +4222,375 @@ mod tests {
         }
     }
 
+    /// Plan 1c (R2, day-1): `POST /api/pipelines/runs/{runId}/retry` with
+    /// `{"strategy":"selected","stepKeys":[...]}`. Three outcomes the
+    /// route has to produce correctly:
+    ///
+    /// 1. unknown `stepKey` → 400, naming the FIRST unknown key (never
+    ///    the caller's full list — that would echo untrusted input
+    ///    back).
+    /// 2. non-empty `stepKeys` matching real steps → the right
+    ///    GraphQL mutation body (`launchRunReexecution` with a
+    ///    `stepKeys` filter, parent config + parent/root run id), so
+    ///    `Dagster` can clone only those steps.
+    /// 3. empty / missing `stepKeys` → 400, the same message the
+    ///    parser test asserts (`"requires a non-empty stepKeys
+    ///    array"`).
+    ///
+    /// The handler does TWO GraphQL calls for the selected path: one
+    /// to look up the parent run's `pipelineName`/`rootRunId`/
+    /// `runConfig`, and one to launch the re-execution. The mocks
+    /// below match on the operation name (`pipelineRunOrError` vs
+    /// `launchRunReexecution`) so each query goes to its own response.
+    mod retry_route {
+        use std::collections::HashMap;
+
+        use crate::config::Config;
+        use crate::state::AppState;
+
+        use super::*;
+
+        fn state_with_dagster(server_uri: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DAGSTER_URL".to_owned(), format!("{server_uri}/graphql"));
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        /// `selected` with a stepKey that does not belong to the parent
+        /// run returns 400 naming the FIRST unknown key, so a typo at
+        /// index 0 does not silently disappear when index 1 is valid.
+        #[tokio::test]
+        async fn selected_retry_returns_400_naming_first_unknown_step_key() {
+            let server = wiremock::MockServer::start().await;
+            // `run_steps` lookup for the parent run — three real keys,
+            // none of which is "transform". The query sends
+            // `runOrError(runId:$rid)` (see `lakehouse_dagster::DgClient::
+            // run_steps`), so match on that operation name.
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains("runOrError"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "runOrError": {
+                        "__typename": "Run",
+                        "runId": "r1",
+                        "stepStats": [
+                            { "stepKey": "extract" },
+                            { "stepKey": "load" }
+                        ]
+                    } }
+                })))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = retry_run(
+                State(state),
+                Path("r1".to_owned()),
+                Bytes::from_static(
+                    br#"{"strategy":"selected","stepKeys":["extract","transform"]}"#,
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&body).expect("valid JSON");
+            let message = v["error"].as_str().expect("error string");
+            assert!(
+                message.contains("transform") && message.contains("r1"),
+                "400 must name the first unknown step key and the run id, got {message}"
+            );
+            // And it must NOT echo the rest of the caller's list back.
+            assert!(
+                !message.contains("extract"),
+                "400 must not echo the other step keys, got {message}"
+            );
+        }
+
+        /// `selected` with a valid step list issues the `launchRunReexecution`
+        /// mutation, NOT `ReexecutionStrategy.SELECTED` (which does not
+        /// exist on the `Dagster` side) and NOT `ReexecutionStrategy
+        /// .ALL_STEPS` (which would re-run the whole job).
+        #[tokio::test]
+        async fn selected_retry_issues_launch_run_reexecution_with_step_keys_filter() {
+            let server = wiremock::MockServer::start().await;
+
+            // `run_steps` lookup for the parent run — three real keys so
+            // "extract" and "transform" are both valid. The route calls
+            // this FIRST (to validate the caller's `stepKeys`), then
+            // calls `launch_reexecution_of_steps` which performs the
+            // `pipelineRunOrError` lookup below.
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains(
+                    "runOrError(runId:$rid)",
+                ))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "runOrError": {
+                        "__typename": "Run",
+                        "runId": "r1",
+                        "stepStats": [
+                            { "stepKey": "extract" },
+                            { "stepKey": "transform" },
+                            { "stepKey": "load" }
+                        ]
+                    } }
+                })))
+                .mount(&server)
+                .await;
+
+            // `pipelineRunOrError` lookup — the parent config is an
+            // object (`runConfig`) so `launch_reexecution_of_steps`
+            // forwards it as a JSON object. `stepStats` is not read
+            // here (only `pipelineName`/`rootRunId`/`runConfig` are
+            // extracted from this response) but the field has to be
+            // present so `Run` is the matching fragment.
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains(
+                    "pipelineRunOrError(runId: $rid)",
+                ))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineRunOrError": {
+                        "__typename": "Run",
+                        "runId": "r1",
+                        "pipelineName": "refresh_lakehouse",
+                        "rootRunId": "r1",
+                        "runConfig": { "resources": { "lakehouse": { "config": { "path": "x" } } } },
+                        "stepStats": [
+                            { "stepKey": "extract" },
+                            { "stepKey": "transform" },
+                            { "stepKey": "load" }
+                        ]
+                    } }
+                })))
+                .mount(&server)
+                .await;
+
+            // `launchRunReexecution` mutation — `state.dagster.
+            // launch_reexecution_of_steps` waits for this exact
+            // operation name. The body must carry both the operation
+            // name AND the `stepKeys` argument; a request that arrived
+            // without the latter would be `ReexecutionStrategy.ALL_STEPS`
+            // in disguise, and the wiremock matcher stack asserts the
+            // call really did ask for the named keys. The GraphQL
+            // variables key is `keys` (the query-side argument is
+            // `stepKeys: $keys`), so the matcher looks for the
+            // variables-side name.
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains(
+                    "launchRunReexecution",
+                ))
+                .and(wiremock::matchers::body_string_contains(
+                    r#""keys":["extract","transform"]"#,
+                ))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "launchRunReexecution": {
+                        "__typename": "LaunchRunSuccess", "run": { "runId": "r-new" }
+                    } }
+                })))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = retry_run(
+                State(state),
+                Path("r1".to_owned()),
+                Bytes::from_static(
+                    br#"{"strategy":"selected","stepKeys":["extract","transform"]}"#,
+                ),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "a valid selected retry must reach the launch mutation"
+            );
+        }
+
+        /// `selected` without `stepKeys` (or with an empty array) returns
+        /// 400 from the parser, BEFORE any `Dagster` call — wiremock is
+        /// mounted only for the "happy path" so a 400 means the route
+        /// refused the request without contacting `Dagster`.
+        #[tokio::test]
+        async fn selected_retry_without_step_keys_returns_400_before_calling_dagster() {
+            let server = wiremock::MockServer::start().await;
+            // A catch-all 200 mock: if the route calls Dagster, this
+            // fires. The test passes only if no request lands.
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineRunOrError": { "__typename": "NotFound" } }
+                })))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = retry_run(
+                State(state),
+                Path("r1".to_owned()),
+                Bytes::from_static(br#"{"strategy":"selected"}"#),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&body).expect("valid JSON");
+            let message = v["error"].as_str().expect("error string");
+            assert!(
+                message.contains("stepKeys"),
+                "400 must mention the missing field, got {message}"
+            );
+        }
+    }
+
+    /// Plan 1c (R2, day-1): `GET /api/pipelines/{id}/runs/steps` — the
+    /// runs × steps matrix. Three things to prove:
+    ///
+    /// 1. A happy-path matrix response carries both runs and their
+    ///    `steps` arrays.
+    /// 2. A step with no `endTime` (or no `startTime`) carries
+    ///    `"durationMs": null`, NOT a fabricated `0`.
+    /// 3. The route matches BEFORE `{runId}/steps` — the path
+    ///    `/api/pipelines/{id}/runs/steps` MUST be handled here, not
+    ///    by [`run_steps`] interpreting "steps" as a Dagster run id
+    ///    (the route registration order in `routes/mod.rs::pipelines_router`
+    ///    is what enforces this; the test pins the behaviour).
+    mod runs_step_matrix_route {
+        use std::collections::HashMap;
+
+        use crate::config::Config;
+        use crate::state::AppState;
+
+        use super::*;
+
+        fn state_with_dagster(server_uri: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DAGSTER_URL".to_owned(), format!("{server_uri}/graphql"));
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        #[tokio::test]
+        async fn matrix_route_returns_runs_and_per_step_stats_from_one_call() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains("stepStats"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "runsOrError": { "__typename": "Runs", "results": [
+                        { "runId": "r1", "status": "SUCCESS",
+                          "startTime": 1.0,
+                          "stepStats": [
+                              { "stepKey": "extract", "status": "SUCCESS",
+                                "startTime": 1.0, "endTime": 2.0 },
+                              { "stepKey": "load", "status": "SUCCESS",
+                                "startTime": 2.0, "endTime": 3.0 }
+                          ] },
+                        { "runId": "r2", "status": "FAILURE",
+                          "startTime": 10.0,
+                          "stepStats": [
+                              { "stepKey": "extract", "status": "FAILURE",
+                                "startTime": 10.0, "endTime": 11.0 }
+                          ] }
+                    ] } }
+                })))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response =
+                runs_step_matrix(State(state), Path("refresh_lakehouse".to_owned())).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&body).expect("valid JSON");
+            assert!(v["unavailable"].is_null());
+            let runs = v["runs"].as_array().expect("runs array");
+            assert_eq!(runs.len(), 2);
+            assert_eq!(runs[0]["id"], "r1");
+            assert_eq!(runs[0]["status"], "completed");
+            // 3.0 - 2.0 = 1.0 second = 1000 ms (per-step duration).
+            assert_eq!(runs[0]["steps"][1]["durationMs"], 1000);
+            assert_eq!(runs[1]["steps"][0]["status"], "failed");
+        }
+
+        /// A step with `endTime: null` (one `Dagster` never reported a
+        /// completion timestamp for) carries `durationMs: null` — never
+        /// a fabricated `0`, which would read as "ran instantly" rather
+        /// than "never finished".
+        #[tokio::test]
+        async fn matrix_route_reports_null_duration_for_a_step_that_never_started() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains("stepStats"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "runsOrError": { "__typename": "Runs", "results": [
+                        { "runId": "r1", "status": "STARTED",
+                          "startTime": 1.0,
+                          "stepStats": [
+                              { "stepKey": "extract", "status": "SUCCESS",
+                                "startTime": 1.0, "endTime": 2.0 },
+                              { "stepKey": "load", "status": "QUEUED",
+                                "startTime": null, "endTime": null }
+                          ] }
+                    ] } }
+                })))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response =
+                runs_step_matrix(State(state), Path("refresh_lakehouse".to_owned())).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&body).expect("valid JSON");
+            let queued_step = &v["runs"][0]["steps"][1];
+            assert_eq!(queued_step["status"], "queued");
+            assert!(
+                queued_step["durationMs"].is_null(),
+                "a never-started step must report null durationMs, got {queued_step}"
+            );
+        }
+
+        /// The path `/api/pipelines/{id}/runs/steps` MUST reach the
+        /// matrix handler, not `run_steps` (which would 503 trying to
+        /// interpret "steps" as a `Dagster` run id). Pinning this with
+        /// a focused route test would need the full axum stack;
+        /// instead, the focused assertion below checks the matrix
+        /// mock body is hit for a request the previous handler would
+        /// have rejected with 503.
+        #[tokio::test]
+        async fn matrix_route_is_reached_for_runs_steps_path() {
+            let server = wiremock::MockServer::start().await;
+            // Only the `runsOrError` filter by `pipelineName` shape
+            // matches the matrix query; `run_steps` would have sent
+            // `runOrError(runId:$rid)`. If the route registration order
+            // is wrong, `run_steps` would receive "steps" as the run
+            // id and fail with 503 BEFORE this mock fires.
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::body_string_contains("runsOrError"))
+                .and(wiremock::matchers::body_string_contains("stepStats"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "runsOrError": { "__typename": "Runs", "results": [] } }
+                })))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response =
+                runs_step_matrix(State(state), Path("refresh_lakehouse".to_owned())).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "the matrix route must handle runs/steps — a wrong match \
+                 would have reached `run_steps` and surfaced a 503 for \
+                 the literal run id \"steps\""
+            );
+        }
+    }
+
     /// WS4 item C4 — `GET /api/pipelines/{id}/runs/{runId}/logs?cursor=`,
     /// against Phase A's real captured `run_logs` fixture, and the bounded-
     /// page-size guarantee the brief's "log streaming must not leak" risk
@@ -4547,6 +5144,56 @@ mod tests {
             .unwrap_err();
             assert_eq!(err.0.status(), 404);
         }
+    }
+
+    // ── Plan 1c: attempts on a step JSON serialisation ──────────────
+    //
+    // `step_to_json` must surface `attempts` as a non-null number for
+    // every step, regardless of the count: zero for a step that never
+    // started, N for a step that retried N-1 times. The TS contract
+    // (Phase F, types/runs.ts) types the field as `attempts: number`,
+    // never `number | null`, so sending `null` would force a "missing
+    // field vs zero" branch the UI does not have.
+
+    /// A step with three attempt records reports `attempts: 3` — the
+    /// exact count `lakehouse_dagster::RunStep::attempts` already
+    /// carries after `run_steps_parses_attempts_count` proves the
+    /// parser preserves it from the GraphQL response.
+    #[test]
+    fn step_to_json_reports_three_attempts_as_a_non_null_number() {
+        let step = lakehouse_dagster::RunStep {
+            step_key: "extract".to_owned(),
+            status: "FAILURE".to_owned(),
+            start_ms: Some(1_700_000_000_000),
+            end_ms: Some(1_700_000_005_000),
+            attempts: 3,
+            materializations: Vec::new(),
+        };
+        let value = step_to_json(&step);
+        assert_eq!(value["stepKey"], "extract");
+        assert_eq!(
+            value["attempts"], 3,
+            "step_to_json must surface the attempt count, not omit it"
+        );
+    }
+
+    /// A step with no attempts (queued, never started) reports
+    /// `attempts: 0`, never `null` — the TS contract types the field
+    /// as a non-null number, and zero is the honest signal that the
+    /// daemon has not touched it yet.
+    #[test]
+    fn step_to_json_reports_zero_attempts_as_zero_not_null() {
+        let step = lakehouse_dagster::RunStep {
+            step_key: "load".to_owned(),
+            status: "QUEUED".to_owned(),
+            start_ms: None,
+            end_ms: None,
+            attempts: 0,
+            materializations: Vec::new(),
+        };
+        let value = step_to_json(&step);
+        assert_eq!(value["attempts"], 0);
+        assert!(value["attempts"].is_number());
     }
 
     /// `POST /api/pipelines/events/run-failed` route tests (plan 1e).

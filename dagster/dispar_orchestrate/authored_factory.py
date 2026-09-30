@@ -50,11 +50,12 @@ from typing import Any
 import requests
 from dagster import (
     AssetMaterialization,
-    DagsterRunStatus,
+DagsterRunStatus,
     DefaultScheduleStatus,
     DefaultSensorStatus,
     Failure,
     JobSelector,
+    RetryPolicy,
     RunRequest,
     RunsFilter,
     ScheduleDefinition,
@@ -307,9 +308,26 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
     pid = pipeline["id"]
     safe_name = _dagster_safe_name(pid)
 
+    # Plan 1c (R2, day-1): each authored pipeline carries a per-row
+    # `maxRetries` cap (`lakehouse-store::AuthoredDefinition.max_retries`,
+    # `0051_pipeline_max_retries.sql`). Override ONLY the count of
+    # `op_metadata.DEFAULT_RETRY_POLICY` — keep its `delay`, `backoff`,
+    # and `jitter` so a synchronised retry storm across all authored
+    # pipelines cannot return. An absent `maxRetries` (a future
+    # caller that has not read the new key) resolves to 2 here, the
+    # same value the migration's `DEFAULT 2` would have inserted at
+    # the row's storage layer.
+    base_retry = op_metadata.DEFAULT_RETRY_POLICY
+    per_pipeline_retry = RetryPolicy(
+        max_retries=int(definition.get("maxRetries", base_retry.max_retries)),
+        delay=base_retry.delay,
+        backoff=base_retry.backoff,
+        jitter=base_retry.jitter,
+    )
+
     @op(
         name=f"authored_{safe_name}",
-        retry_policy=op_metadata.DEFAULT_RETRY_POLICY,
+        retry_policy=per_pipeline_retry,
         tags=op_metadata.source_metadata(
             "dispar_orchestrate/authored_factory.py::_op_for_pipeline",
             reads=[f"ClickHouse {definition.get('sourceZone')}.{definition.get('sourceTable')}"],
