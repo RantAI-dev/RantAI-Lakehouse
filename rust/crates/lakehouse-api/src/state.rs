@@ -363,9 +363,9 @@ struct ConnectorSecretResolver {
 }
 
 impl ConnectorSecretResolver {
-    fn new() -> Self {
+    fn new(env: EnvSecretResolver) -> Self {
         Self {
-            env: EnvSecretResolver::new(),
+            env,
             // `/run/secrets` is the fixed Docker/Compose secrets mount this
             // deployment uses — see `FileSecretResolver`'s doc comment for
             // why a fixed base directory (not caller-supplied) matters.
@@ -387,6 +387,24 @@ impl SecretResolver for ConnectorSecretResolver {
             })
         }
     }
+}
+
+/// The allowlisted connector secret resolver [`AppState::new`] installs,
+/// over `env` (the real process environment in production).
+///
+/// A function of its own so the allowlist test can pass an explicit, empty
+/// environment: `sqlx::test`'s harness calls `dotenvy::var`, which loads
+/// the nearest `.env` into the process environment, so on a developer
+/// machine whose `.env` sets `CONNECTOR_*` the real environment made that
+/// test fail whenever a database test had run first in the same process.
+fn connector_secret_resolver(env: EnvSecretResolver) -> Arc<dyn DynSecretResolver> {
+    Arc::new(AllowlistedSecretResolver::new(
+        ConnectorSecretResolver::new(env),
+        CONNECTOR_ALLOWED_SECRET_REF_PATTERNS
+            .iter()
+            .map(|s| (*s).to_owned()),
+        "connector-allowlist",
+    ))
 }
 
 /// Translate [`Config`]'s flat `oidc_*` env-derived fields into
@@ -513,13 +531,7 @@ impl AppState {
             embed_secret: Arc::new(embed_secret),
             llm: Arc::new(llm),
             pg,
-            connector_secret_resolver: Arc::new(AllowlistedSecretResolver::new(
-                ConnectorSecretResolver::new(),
-                CONNECTOR_ALLOWED_SECRET_REF_PATTERNS
-                    .iter()
-                    .map(|s| (*s).to_owned()),
-                "connector-allowlist",
-            )),
+            connector_secret_resolver: connector_secret_resolver(EnvSecretResolver::new()),
             auth,
             gold_export_locks: MartLocks::default(),
             iceberg: Arc::new(RwLock::new(None)),
@@ -619,8 +631,13 @@ mod tests {
     #[tokio::test]
     async fn connector_secret_resolver_admits_credential_suffixed_refs_but_refuses_the_apis_own_secrets_and_the_probe_flag()
      {
-        let cfg = Config::from_map(&HashMap::new()).unwrap();
-        let state = AppState::new(cfg);
+        // An explicit empty environment, not the process one: see
+        // `connector_secret_resolver`'s doc comment (a `.env` loaded by
+        // `sqlx::test` made this order-dependent). Same allowlist and
+        // resolver chain `AppState::new` installs.
+        let resolver = super::connector_secret_resolver(
+            lakehouse_core::secret::EnvSecretResolver::with_map(HashMap::new()),
+        );
 
         for admitted in [
             "env:CONNECTOR_PG_PASSWORD",
@@ -628,15 +645,11 @@ mod tests {
             "env:CONNECTOR_S3_SECRET_KEY",
             "env:CONNECTOR_MYSQL_PASSWORD",
         ] {
-            let err = state
-                .connector_secret_resolver
-                .resolve_dyn(admitted)
-                .await
-                .unwrap_err();
+            let err = resolver.resolve_dyn(admitted).await.unwrap_err();
             assert!(
                 matches!(err, lakehouse_core::secret::SecretError::NotFound { .. }),
                 "{admitted} must be allowed by the pattern allowlist (NotFound, not \
-                 NotAllowed, since the env var is unset in this test process); got {err:?}"
+                 NotAllowed, since the explicit test environment is empty); got {err:?}"
             );
         }
 
@@ -646,11 +659,7 @@ mod tests {
             "env:CH_PASSWORD",
             "env:CONNECTOR_PROBE_ALLOW_INTERNAL_HOSTS",
         ] {
-            let err = state
-                .connector_secret_resolver
-                .resolve_dyn(forbidden)
-                .await
-                .unwrap_err();
+            let err = resolver.resolve_dyn(forbidden).await.unwrap_err();
             assert!(
                 matches!(err, lakehouse_core::secret::SecretError::NotAllowed { .. }),
                 "{forbidden} must be refused by the allowlist; got {err:?}"

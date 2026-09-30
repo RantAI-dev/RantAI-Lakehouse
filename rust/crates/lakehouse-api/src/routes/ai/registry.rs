@@ -94,6 +94,10 @@ fn chart_kind_enum() -> Value {
         "radar",
         "waterfall",
         "geomap",
+        "sankey",
+        "sunburst",
+        "boxplot",
+        "calendar",
         "kpi",
         "gauge",
         "table",
@@ -164,10 +168,11 @@ fn describe_mart_schema() -> Value {
 
 fn create_chart_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_chart",
-        "description": "Create a chart card on a dashboard (/dashboards) from a Gold mart. The server writes the SQL from the columns you pick; you do not write SQL. Call describe_mart first to use columns that exist.",
+        "description": "Create a chart card on a dashboard (/dashboards) from a Gold mart OR a saved SQL source (sqlSource, for data that combines several marts). The server writes the SQL from the columns you pick; you do not write SQL. Call describe_mart (or list_sql_sources) first to use columns that exist.",
         "parameters": { "type": "object", "properties": {
             "title": { "type": "string" }, "subtitle": { "type": "string" },
             "mart": { "type": "string" }, "kind": { "type": "string", "enum": chart_kind_enum() },
+            "sqlSource": { "type": "string", "description": "SQL source id (s_…) from list_sql_sources, instead of mart for a chart that combines several marts; set mart OR sqlSource, not both" },
             "text": { "type": "string" }, "caption": { "type": "string" },
             "target": { "type": "number" }, "dimension": { "type": "string" },
             "measures": { "type": "array", "items": { "type": "string" } },
@@ -184,6 +189,7 @@ fn update_chart_schema() -> Value {
         "parameters": { "type": "object", "properties": {
             "id": { "type": "string" }, "title": { "type": "string" }, "subtitle": { "type": "string" },
             "mart": { "type": "string" }, "kind": { "type": "string", "enum": chart_kind_enum() },
+            "sqlSource": { "type": "string", "description": "SQL source id (s_…) from list_sql_sources, instead of mart for a chart that combines several marts; set mart OR sqlSource, not both" },
             "dimension": { "type": "string" },
             "measures": { "type": "array", "items": { "type": "string" } },
             "breakdown": { "type": "string" }, "caption": { "type": "string" },
@@ -216,6 +222,12 @@ fn suggest_dashboard_schema() -> Value {
 fn list_charts_schema() -> Value {
     json!({ "type": "function", "function": { "name": "list_charts",
         "description": "List the chart cards saved on dashboards.",
+        "parameters": { "type": "object", "properties": {} } } })
+}
+
+fn list_sql_sources_schema() -> Value {
+    json!({ "type": "function", "function": { "name": "list_sql_sources",
+        "description": "List the dashboard SQL sources (saved SQL, usually combining several Gold marts) with their dimensions and measures. Use the id as sqlSource in create_chart. Users create SQL sources in Query Studio, not in chat.",
         "parameters": { "type": "object", "properties": {} } } })
 }
 
@@ -805,6 +817,14 @@ pub static TOOLS: &[ToolSpec] = &[
         risk: Risk::Read,
         permission: "dashboard:read",
     },
+    // Read-only: authoring SQL sources needs `dashboard:sql` and happens in
+    // Query Studio; chat can only list them and build charts on them.
+    ToolSpec {
+        name: "list_sql_sources",
+        schema: list_sql_sources_schema,
+        risk: Risk::Read,
+        permission: "dashboard:read",
+    },
     ToolSpec {
         name: "delete_chart",
         schema: delete_chart_schema,
@@ -1173,14 +1193,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_schemas_has_sixty_two_entries() {
+    fn tool_schemas_has_sixty_three_entries() {
         // 15 pre-T1 tools + 19 Tier 1 operations tools (5 alerts + 4
         // connectors + 7 pipelines + 3 saved queries) + 13 Tier 2 tools
         // (5 governance reads + 1 maintenance + 2 workloads + 2 gold
         // export + 3 governance drafts) + `lakehouse_overview` + 14
         // lakehouse-operation tools (6 ingest, 3 pipeline authoring, 4
-        // Iceberg table, 1 capacity).
-        assert_eq!(tool_schemas().len(), 62);
+        // Iceberg table, 1 capacity) + `list_sql_sources` (dashboard SQL
+        // sources).
+        assert_eq!(tool_schemas().len(), 63);
+    }
+
+    /// One-off fixture writer, run by hand only after an intentional schema
+    /// change: `cargo test -p lakehouse-api --lib write_tool_schema_fixture
+    /// -- --ignored`.
+    #[test]
+    #[ignore = "writes tests/fixtures/tool_schemas.json; run only for a reviewed schema change"]
+    fn write_tool_schema_fixture() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/tool_schemas.json"
+        );
+        std::fs::write(path, serde_json::to_string_pretty(&tool_schemas()).unwrap()).unwrap();
     }
 
     /// Characterization snapshot (T0.1): `tool_schemas()`, now derived

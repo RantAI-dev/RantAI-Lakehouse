@@ -510,7 +510,7 @@ pub async fn query(State(state): State<AppState>, body: Bytes) -> Response {
                 StatusCode::SERVICE_UNAVAILABLE,
                 ApiJson(json!({
                     "error": "Agent LLM unavailable",
-                    "detail": err.to_string(),
+                    "detail": super::ai::llm_error_detail(&err),
                     "hint": "Set LLM_KEY, or point LLM_URL/LLM_MODEL at a model that is running.",
                 })),
             )

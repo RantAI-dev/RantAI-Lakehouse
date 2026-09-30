@@ -1,6 +1,7 @@
 import type { EChartsOption } from "echarts";
 import { formatCompactNumber, monthlyAxisLabel } from "@/lib/chart-axis";
 import type { ChartSpec } from "@/lib/dashboard-specs";
+import { boxplotNeedsLogAxis, toBoxplot, toCalendar, toSankey, toSunburst } from "@/lib/chart-transforms";
 import { JAKARTA_MAP, normalizeJakartaArea } from "./echarts-maps";
 
 /** buildOption only needs how to render (not the SQL) — fits ChartSpec & ChartRenderSpec. */
@@ -226,6 +227,82 @@ export function buildOption(
       yAxis: { type: "category", data: yCats, splitArea: { show: true }, axisLabel: { color: axis, fontSize: 10 }, axisLine: { lineStyle: { color: split } }, axisTick: { show: false } },
       visualMap: { min: 0, max: maxV, calculable: false, orient: "horizontal", left: "center", bottom: 0, itemHeight: 60, textStyle: { color: axis, fontSize: 10 }, inRange: { color: dark ? ["#1e1b4b", "#6366f1", "#a5b4fc"] : ["#eef2ff", "#818cf8", "#4338ca"] } },
       series: [{ type: "heatmap", data, label: { show: false }, emphasis: { itemStyle: { shadowBlur: 6, shadowColor: "rgba(0,0,0,0.3)" } } }],
+    } as EChartsOption;
+  }
+
+  if (spec.kind === "sankey" && spec.series) {
+    const { nodes, links } = toSankey(rows, spec.x, spec.series, y0);
+    const labelOf = new Map(nodes.map((n) => [n.name, n.label]));
+    return { ...base, grid: undefined,
+      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => {
+        const o = p as { dataType?: string; name: string; value: number; data: { source?: string; target?: string } };
+        if (o.dataType === "edge") return `${labelOf.get(o.data.source ?? "")} → ${labelOf.get(o.data.target ?? "")}<br/><b>${fmtInt(o.value)}</b>`;
+        return `${labelOf.get(o.name) ?? o.name}<br/><b>${fmtInt(o.value)}</b>`;
+      } },
+      series: [{ type: "sankey", left: 8, right: 96, top: 8, bottom: 8, nodeGap: 10, draggable: false,
+        emphasis: { focus: "adjacency" },
+        label: { color: axis, fontSize: 11, formatter: (p: { name: string }) => labelOf.get(p.name) ?? p.name },
+        lineStyle: { color: "gradient", curveness: 0.5, opacity: dark ? 0.35 : 0.3 },
+        // Left side indigo, right side sky — the console palette, not
+        // ECharts' default per-node colours.
+        data: nodes.map((n) => ({ name: n.name, itemStyle: { color: n.name.startsWith("a:") ? PALETTE[0] : PALETTE[1] } })), links }],
+    } as EChartsOption;
+  }
+
+  if (spec.kind === "sunburst" && spec.series) {
+    return { ...base, grid: undefined,
+      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as { treePathInfo: { name: string }[]; value: number }; return `${o.treePathInfo.map((t) => t.name).filter(Boolean).join(" › ")}<br/><b>${fmtInt(o.value)}</b>`; } },
+      series: [{ type: "sunburst", radius: ["12%", "90%"], center: ["50%", "50%"], sort: undefined,
+        itemStyle: { borderColor: dark ? "#09090b" : "#fff", borderWidth: 1.5 },
+        label: { color: "#fff", fontSize: 10, minAngle: 10, rotate: "radial" },
+        levels: [{}, { r0: "12%", r: "45%" }, { r0: "45%", r: "90%", label: { fontSize: 9 } }],
+        data: toSunburst(rows, spec.x, spec.series, y0) }],
+    } as EChartsOption;
+  }
+
+  if (spec.kind === "boxplot") {
+    const { categories, data, counts } = toBoxplot(rows, spec.x, y0);
+    const log = boxplotNeedsLogAxis(data);
+    // "(n=…)" under each category: a box from one row is a flat line, and
+    // the count says why rather than leaving it looking empty.
+    const labels = categories.map((c, i) => (counts[i] != null ? `${c} (n=${counts[i]})` : c));
+    const nText = (i: number) => (counts[i] != null ? `<br/>${counts[i]} rows` : "");
+    // A category whose five numbers are equal gets a dot on top of its line.
+    const flat = data.flatMap((d, i) => (d[0] === d[4] ? [[i, d[0]]] : []));
+    return { ...base,
+      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => {
+        const o = p as { name: string; data: number[]; seriesType: string; dataIndex: number };
+        if (o.seriesType === "scatter") {
+          const i = o.data[0];
+          return `${categories[i]}${nText(i)}<br/>every value <b>${fmtInt(o.data[1])}</b>`;
+        }
+        // `data` is the five-number array we passed (toBoxplot).
+        const [min, q1, med, q3, max] = o.data;
+        return `${categories[o.dataIndex]}${nText(o.dataIndex)}<br/>max <b>${fmtInt(max)}</b><br/>Q3 ${fmtInt(q3)}<br/>median <b>${fmtInt(med)}</b><br/>Q1 ${fmtInt(q1)}<br/>min <b>${fmtInt(min)}</b>`;
+      } },
+      xAxis: catAxis(labels),
+      // Log only when the values span 1000× or more (boxplotNeedsLogAxis),
+      // and the axis says so, so the spacing is not read as linear.
+      yAxis: log ? { ...valAxis("log scale"), type: "log" as const, logBase: 10 } : valAxis(),
+      series: [
+        { type: "boxplot", data, itemStyle: { color: dark ? "rgba(99,102,241,0.25)" : "rgba(99,102,241,0.15)", borderColor: PALETTE[0] } },
+        ...(flat.length ? [{ type: "scatter" as const, data: flat, symbolSize: 9, itemStyle: { color: PALETTE[0] } }] : []),
+      ],
+    } as EChartsOption;
+  }
+
+  if (spec.kind === "calendar") {
+    const { data, range } = toCalendar(rows, spec.x, y0);
+    const maxV = Math.max(1, ...data.map((d) => d[1]));
+    return { ...base, grid: undefined,
+      tooltip: { ...base.tooltip, trigger: "item", formatter: (p: unknown) => { const o = p as { value: [string, number] }; return `${o.value[0]}<br/><b>${fmtInt(o.value[1])}</b>`; } },
+      visualMap: { min: 0, max: maxV, calculable: false, orient: "horizontal", left: "center", bottom: 0, itemHeight: 60, textStyle: { color: axis, fontSize: 10 }, inRange: { color: dark ? ["#1e1b4b", "#6366f1", "#a5b4fc"] : ["#eef2ff", "#818cf8", "#4338ca"] } },
+      calendar: range ? { range, top: 24, left: 36, right: 12, bottom: 44, cellSize: ["auto", "auto"],
+        itemStyle: { borderColor: dark ? "#09090b" : "#fff", borderWidth: 2, color: dark ? "#18181b" : "#fafafa" },
+        splitLine: { show: false }, yearLabel: { show: false },
+        dayLabel: { color: axis, fontSize: 9, firstDay: 1 }, monthLabel: { color: axis, fontSize: 10 } } : undefined,
+      series: range ? [{ type: "heatmap", coordinateSystem: "calendar", data }] : [],
+      title: range ? undefined : { text: "No dated rows to show", left: "center", top: "middle", textStyle: { color: axis, fontSize: 12, fontWeight: "normal" } },
     } as EChartsOption;
   }
 

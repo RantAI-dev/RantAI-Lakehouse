@@ -13,6 +13,7 @@ import { postgresIdentityService } from "./clients/identity"
 import { postgresConnectorService } from "./clients/connectors"
 import { postgresAgentService } from "./clients/agents"
 import { clickhouseAlertRuleService } from "./clients/alerts"
+import { clickhouseDashboardService } from "./clients/dashboards"
 import { icebergLakehouseService } from "./clients/lakehouse"
 import { goldService as goldClientService } from "./clients/gold"
 import { notificationsService as notificationsClientService } from "./clients/notifications"
@@ -58,6 +59,9 @@ export const connectorService = postgresConnectorService
 // service; the feature previously fetched `/api/alerts` directly with no
 // `res.ok` check.
 export const alertRuleService = clickhouseAlertRuleService
+// Dashboard SQL sources (custom SQL / multi-mart charts) over
+// `/api/dashboard/sources`. No mock ever existed for this service.
+export const dashboardService = clickhouseDashboardService
 // Lakehouse (WS2 §4) — the read-only Iceberg warehouse/namespace/table
 // surface over `/api/lakehouse/*`. No mock ever existed for this service.
 export const lakehouseService = icebergLakehouseService

@@ -18,6 +18,8 @@ export type ChartKind =
   | "scatter" | "bubble" | "heatmap" | "radar" | "waterfall"
   // geographic
   | "geomap"
+  // flow, hierarchy, distribution, time grid (chart-transforms.ts)
+  | "sankey" | "sunburst" | "boxplot" | "calendar"
   // single number
   | "kpi" | "gauge"
   // non-chart
@@ -44,6 +46,11 @@ export type ChartSpec = {
   subtitle?: string;
   kind: ChartKind;
   mart: string;
+  /**
+   * Dashboard SQL source id when the chart reads a saved SQL source instead
+   * of a mart (`mart` is then empty). Mirrors `store::ChartSpec::sql_source`.
+   */
+  sqlSource?: string;
   sql: string;
   x: string;
   /** One column (bar/line/pie) or several columns (stacked). */

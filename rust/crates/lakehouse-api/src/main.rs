@@ -27,6 +27,7 @@ mod pipeline_source;
 mod policy;
 mod policy_engine;
 mod routes;
+mod sql_guard;
 mod sql_rewrite;
 mod state;
 mod tenant;

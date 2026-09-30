@@ -335,6 +335,19 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST",   "/api/dashboard/boards",       Policy::RequiresPermission("dashboard:write")),
     ("PUT",    "/api/dashboard/boards",       Policy::RequiresPermission("dashboard:write")),
     ("DELETE", "/api/dashboard/boards",       Policy::RequiresPermission("dashboard:write")),
+    // Dashboard folders (plan §4): filing dashboards is editing them.
+    ("GET",    "/api/dashboard/folders",      Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/folders",      Policy::RequiresPermission("dashboard:write")),
+    ("PUT",    "/api/dashboard/folders",      Policy::RequiresPermission("dashboard:write")),
+    ("DELETE", "/api/dashboard/folders",      Policy::RequiresPermission("dashboard:write")),
+    // Dashboard SQL sources: listing is a read; authoring and previewing
+    // arbitrary SQL is its own permission, separate from dashboard:write
+    // (plan §1, the Metabase "native query" split).
+    ("GET",    "/api/dashboard/sources",      Policy::RequiresPermission("dashboard:read")),
+    ("POST",   "/api/dashboard/sources",      Policy::RequiresPermission("dashboard:sql")),
+    ("PUT",    "/api/dashboard/sources",      Policy::RequiresPermission("dashboard:sql")),
+    ("DELETE", "/api/dashboard/sources",      Policy::RequiresPermission("dashboard:sql")),
+    ("POST",   "/api/dashboard/sources/preview", Policy::RequiresPermission("dashboard:sql")),
     ("GET",    "/api/dashboard/fields",       Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/records",      Policy::RequiresPermission("dashboard:read")),
     ("GET",    "/api/dashboard/values",       Policy::RequiresPermission("dashboard:read")),

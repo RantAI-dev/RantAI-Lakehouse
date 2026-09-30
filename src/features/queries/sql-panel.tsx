@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { Play, Save, Square, WandSparkles } from "lucide-react"
+import { LayoutDashboard, Play, Save, Square, WandSparkles } from "lucide-react"
 
 import { SqlEditor } from "@/components/sql-editor"
 import { formatSql } from "@/lib/sql-format"
@@ -24,9 +24,12 @@ import type { useQueryStudio } from "./use-query-studio"
 export function SqlPanel({
   studio,
   onSave,
+  onSaveAsSource,
 }: {
   readonly studio: ReturnType<typeof useQueryStudio>
   readonly onSave: () => void
+  /** Present only when the principal may author dashboard SQL sources. */
+  readonly onSaveAsSource?: () => void
 }) {
   const {
     sql,
@@ -85,6 +88,12 @@ export function SqlPanel({
           <Save className="size-4" aria-hidden />
           Save query
         </Button>
+        {onSaveAsSource ? (
+          <Button size="sm" variant="outline" onClick={onSaveAsSource} disabled={!estimatable}>
+            <LayoutDashboard className="size-4" aria-hidden />
+            Save as SQL source
+          </Button>
+        ) : null}
         <Button
           size="sm"
           variant="outline"

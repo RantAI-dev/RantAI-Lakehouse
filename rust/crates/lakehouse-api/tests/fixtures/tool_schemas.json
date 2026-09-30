@@ -143,7 +143,7 @@
     "type": "function",
     "function": {
       "name": "create_chart",
-      "description": "Create a chart card on a dashboard (/dashboards) from a Gold mart. The server writes the SQL from the columns you pick; you do not write SQL. Call describe_mart first to use columns that exist.",
+      "description": "Create a chart card on a dashboard (/dashboards) from a Gold mart OR a saved SQL source (sqlSource, for data that combines several marts). The server writes the SQL from the columns you pick; you do not write SQL. Call describe_mart (or list_sql_sources) first to use columns that exist.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -175,11 +175,19 @@
               "radar",
               "waterfall",
               "geomap",
+              "sankey",
+              "sunburst",
+              "boxplot",
+              "calendar",
               "kpi",
               "gauge",
               "table",
               "text"
             ]
+          },
+          "sqlSource": {
+            "type": "string",
+            "description": "SQL source id (s_…) from list_sql_sources, instead of mart for a chart that combines several marts; set mart OR sqlSource, not both"
           },
           "text": {
             "type": "string"
@@ -272,11 +280,19 @@
               "radar",
               "waterfall",
               "geomap",
+              "sankey",
+              "sunburst",
+              "boxplot",
+              "calendar",
               "kpi",
               "gauge",
               "table",
               "text"
             ]
+          },
+          "sqlSource": {
+            "type": "string",
+            "description": "SQL source id (s_…) from list_sql_sources, instead of mart for a chart that combines several marts; set mart OR sqlSource, not both"
           },
           "dimension": {
             "type": "string"
@@ -373,6 +389,17 @@
     "function": {
       "name": "list_charts",
       "description": "List the chart cards saved on dashboards.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_sql_sources",
+      "description": "List the dashboard SQL sources (saved SQL, usually combining several Gold marts) with their dimensions and measures. Use the id as sqlSource in create_chart. Users create SQL sources in Query Studio, not in chat.",
       "parameters": {
         "type": "object",
         "properties": {}

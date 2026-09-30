@@ -14,6 +14,8 @@ mod catalog;
 mod catalog_query;
 mod connectors;
 mod dashboard;
+mod dashboard_folders;
+mod dashboard_sources;
 mod embed;
 mod gold;
 mod governance;
@@ -574,6 +576,24 @@ pub fn router(state: AppState) -> Router {
                 .post(dashboard::boards_create)
                 .put(dashboard::boards_update)
                 .delete(dashboard::boards_delete),
+        )
+        .route(
+            "/api/dashboard/folders",
+            get(dashboard_folders::list)
+                .post(dashboard_folders::create)
+                .put(dashboard_folders::update)
+                .delete(dashboard_folders::delete),
+        )
+        .route(
+            "/api/dashboard/sources",
+            get(dashboard_sources::list)
+                .post(dashboard_sources::create)
+                .put(dashboard_sources::update)
+                .delete(dashboard_sources::delete),
+        )
+        .route(
+            "/api/dashboard/sources/preview",
+            axum::routing::post(dashboard_sources::preview),
         )
         .route("/api/dashboard/fields", get(dashboard::fields))
         .route("/api/dashboard/records", get(dashboard::records))
