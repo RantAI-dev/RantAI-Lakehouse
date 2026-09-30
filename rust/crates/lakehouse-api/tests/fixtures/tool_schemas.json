@@ -354,6 +354,10 @@
         "properties": {
           "name": {
             "type": "string"
+          },
+          "description": {
+            "type": "string",
+            "description": "One-line purpose of the board, shown on the dashboard list page."
           }
         },
         "required": [

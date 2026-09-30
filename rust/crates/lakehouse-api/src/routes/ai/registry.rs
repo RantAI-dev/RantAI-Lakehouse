@@ -203,7 +203,9 @@ fn update_chart_schema() -> Value {
 fn create_board_schema() -> Value {
     json!({ "type": "function", "function": { "name": "create_board",
         "description": "Create a new named dashboard (board). Returns its id for create_chart.",
-        "parameters": { "type": "object", "properties": { "name": { "type": "string" } },
+        "parameters": { "type": "object", "properties": {
+            "name": { "type": "string" },
+            "description": { "type": "string", "description": "One-line purpose of the board, shown on the dashboard list page." } },
             "required": ["name"] } } })
 }
 

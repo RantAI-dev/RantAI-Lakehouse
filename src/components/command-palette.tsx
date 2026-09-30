@@ -6,7 +6,7 @@ import { useRouter } from "next/navigation";
 import { usePathname } from "next/navigation";
 import { useTheme } from "next-themes";
 import {
-  Search, Sparkles, BarChart3, Plus, Download, Moon, Sun, Clock, Database,
+  Search, Sparkles, BarChart3, LayoutGrid, Plus, Download, Moon, Sun, Clock, Database,
 } from "lucide-react";
 import { NAV_GROUPS, pageTitleFor } from "@/components/app-shell/nav-config";
 import { assetService } from "@/services";
@@ -139,8 +139,15 @@ export function CommandPalette() {
         {/* Quick actions */}
         <Command.Group heading="Quick actions" className="[&_[cmdk-group-heading]]:px-2 [&_[cmdk-group-heading]]:py-1 [&_[cmdk-group-heading]]:text-[11px] [&_[cmdk-group-heading]]:font-medium [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wide [&_[cmdk-group-heading]]:text-muted-foreground">
           <PaletteItem icon={Sparkles} label="Ask / build via AI Copilot" value="ai copilot chat ask build" onSelect={() => go("/copilot")} />
+          {/* "Open Dashboards" sengaja menuju `/dashboards`: itu penerus yang
+              membawa ke board terakhir, jadi label ini menepati janjinya.
+              Mengelola daftarnya adalah tujuan lain, maka barisnya sendiri. */}
           <PaletteItem icon={BarChart3} label="Open Dashboards" value="dashboards visualization chart" onSelect={() => go("/dashboards")} />
-          <PaletteItem icon={Plus} label="Create a new chart" value="new chart add dashboard" onSelect={() => go("/dashboards")} />
+          {/* Membuat chart dilakukan DI ATAS sebuah dashboard, bukan di
+              ruang kosong — jadi barisan ini sengaja menuju penerus yang
+              sama, lalu kanvasnya yang menyediakan tombol tambah tile. */}
+          <PaletteItem icon={Plus} label="Add a chart to a dashboard" value="new chart add tile dashboard" onSelect={() => go("/dashboards")} />
+          <PaletteItem icon={LayoutGrid} label="Browse all dashboards" value="dashboards list manage browse rename share" onSelect={() => go("/dashboards/browse")} />
           <PaletteItem icon={Download} label="Export dashboard (YAML)" value="export yaml dashboard" onSelect={() => run(() => window.open("/api/dashboard/export", "_blank"))} />
           <PaletteItem
             icon={resolvedTheme === "dark" ? Sun : Moon}

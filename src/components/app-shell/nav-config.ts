@@ -263,6 +263,7 @@ export function subNavItems(pathname: string): NavItem[] {
  */
 const SECONDARY_ROUTES: { title: string; href: string }[] = [
   { title: "Saved Queries", href: "/query-studio/saved" },
+  { title: "All Dashboards", href: "/dashboards/browse" },
   // Table detail pages, opened from Table Maintenance or an asset's
   // Snapshots tab. Their nav entry was removed, so without this the
   // title would fall back to the product name.

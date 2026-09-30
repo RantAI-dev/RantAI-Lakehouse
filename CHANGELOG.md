@@ -54,9 +54,34 @@ once a first release is tagged.
 - Per-tenant built-in "Main" dashboard tile catalog loaded from a JSON
   file via `BUILTIN_DASHBOARD_SPEC`, replacing the removed
   `BUILTIN_DASHBOARD_ENABLED` boolean flag (WS6).
+- Dashboard list page at `/dashboards/browse`, as a gallery of cards or a
+  table with search, filters and sorting. Each dashboard shows its tile
+  count, owner, last-updated time and whether it is shared publicly or
+  embeddable; rows offer rename, duplicate and delete. Reachable from the
+  board switcher ("Browse all dashboards"), the command palette, and the
+  navbar. Dashboards can now carry a one-line description, set when they
+  are created or renamed and shown in the list.
+- `GET /api/dashboard/boards` now returns `chartCount`, `builtin`,
+  `description`, `createdBy` and `updatedAt` per board. `chartCount` is
+  derived from `console.bi_chart` on each request rather than stored, so it
+  cannot go stale when a chart moves between boards. `updatedAt` exposes the
+  same column as the existing `createdAt` under an honest name: the table is
+  a `ReplacingMergeTree(created_at)`, so that column is the version column
+  and every save rewrites it.
+- `POST /api/dashboard/boards` accepts `description`, and records the
+  signed-in caller's display name in `created_by`.
+  `PUT /api/dashboard/boards` accepts `description`.
 
 ### Changed
 
+- `/dashboards` no longer renders a page. It resolves: to the dashboard you
+  last had open, or — when you have not created one yet — to the built-in
+  "Main" board, and only otherwise to the list at `/dashboards/browse`.
+  Returning to Dashboards from another section therefore reopens the
+  dashboard you were working on instead of making you pick it again. The
+  single-dashboard canvas moved to `/dashboards/[id]`. The last-opened
+  dashboard is remembered per browser and validated against the server on
+  every resolve, so a deleted board never leaves you on an empty canvas.
 - **Relicensed the project from Apache-2.0 to AGPL-3.0-or-later.**
   `v0.1.0` was released and remains distributed under Apache-2.0 — that
   historical release is unaffected. All source as of this change is
@@ -134,6 +159,16 @@ once a first release is tagged.
   "completed" before they had run.
 - Seeded pipeline and alert rows that were indistinguishable from real
   activity are pruned by migration.
+
+### Fixed
+
+- Sorting a table column now actually reorders the rows. `useDataTable`
+  built its column whitelist from `column.id`, but TanStack derives that id
+  from `accessorKey` inside the table rather than on the definition object,
+  so almost every column was missing from the whitelist and the URL parser
+  discarded the sort it had just written. Restoring a filter from table
+  memory failed the same way. Affects every table page, not only the
+  dashboard list.
 
 ## [0.1.0] - 2026-08-30
 
