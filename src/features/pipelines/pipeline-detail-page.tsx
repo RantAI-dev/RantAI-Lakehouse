@@ -3,12 +3,29 @@
 import * as React from "react"
 import Link from "next/link"
 import { useParams, usePathname, useRouter, useSearchParams } from "next/navigation"
-import { CalendarClockIcon, HandIcon, PauseIcon, PlayIcon, RadarIcon, RotateCcwIcon } from "lucide-react"
+import {
+  CalendarClockIcon,
+  EllipsisIcon,
+  HandIcon,
+  PauseIcon,
+  PencilIcon,
+  PlayIcon,
+  RadarIcon,
+  RotateCcwIcon,
+  Trash2Icon,
+} from "lucide-react"
 import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
 import { MetadataList } from "@/components/patterns/metadata-list"
 import { EmptyState, ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Button } from "@/components/ui/button"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatDateTime, formatDuration, formatRelativeTime } from "@/lib/format"
@@ -23,6 +40,7 @@ import { isLiveRun, runDurationMs, summarizeRuns } from "./pipeline-run-stats"
 import { describeCron, isScheduleRunning, localizeScheduleTime, parseSchedule } from "./pipeline-schedule"
 import { RunHistoryStrip, runFill, statusLabel } from "./run-history-strip"
 import { RunInspector } from "./run-inspector"
+import { ScheduleHistory } from "./schedule-history"
 
 /** Poll cadence: fast while a run is live or one was just launched, slow otherwise. */
 const LIVE_POLL_MS = 4000
@@ -210,6 +228,13 @@ export function PipelineDetailPage() {
     )
   )
   const [pauseOpen, setPauseOpen] = React.useState(false)
+  const [deleteOpen, setDeleteOpen] = React.useState(false)
+  const remove = useServiceAction(
+    withNotify({ success: "Pipeline deleted", error: "The pipeline could not be deleted" }, async (signal, id: string) => {
+      await pipelineService.deletePipeline(id, signal)
+      return true
+    })
+  )
 
   const afterLaunch = React.useCallback(
     (focusNewest: boolean) => {
@@ -252,26 +277,48 @@ export function PipelineDetailPage() {
   const tab: TabId =
     tabParam === "definition" || tabParam === "settings" || tabParam === "runs" ? tabParam : authored ? "definition" : "runs"
 
+  // Edit and delete exist only for an authored pipeline: a Dagster job is
+  // defined in its code location.
+  const authoredMenu = authored ? (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={
+          <Button variant="outline" size="icon-sm" aria-label="More actions">
+            <EllipsisIcon />
+          </Button>
+        }
+      />
+      <DropdownMenuContent align="end">
+        <DropdownMenuItem onClick={() => router.push(`/pipelines/${encodeURIComponent(p.id)}/edit`)}>
+          <PencilIcon />
+          Edit definition
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem variant="destructive" onClick={() => setDeleteOpen(true)}>
+          <Trash2Icon />
+          Delete pipeline
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  ) : null
+
   const actions = isDraft ? (
-    <Button
-      size="sm"
-      disabled={activate.status === "pending"}
-      onClick={async () => {
-        if (await activate.run(pipelineId)) state.reload()
-      }}
-    >
-      <PlayIcon data-icon="inline-start" />
-      {activate.status === "pending" ? "Marking ready…" : "Mark ready"}
-    </Button>
-  ) : authored ? (
-    // An authored pipeline has no job in the orchestrator, so there is
-    // nothing to run or pause; the buttons used to be shown and answered
-    // 503, which reads as "try again later".
-    <span className="max-w-60 text-right text-xs text-muted-foreground">
-      No engine attached: this pipeline cannot run from the console yet.
-    </span>
+    <>
+      {authoredMenu}
+      <Button
+        size="sm"
+        disabled={activate.status === "pending"}
+        onClick={async () => {
+          if (await activate.run(pipelineId)) state.reload()
+        }}
+      >
+        <PlayIcon data-icon="inline-start" />
+        {activate.status === "pending" ? "Marking ready…" : "Mark ready"}
+      </Button>
+    </>
   ) : (
     <>
+      {authoredMenu}
       {schedule.kind === "cron" ? (
         schedulePaused ? (
           <Button
@@ -315,7 +362,15 @@ export function PipelineDetailPage() {
         actions={actions}
       />
 
-      {!authored ? (
+      {authored && !isDraft && !p.orchestratorJob ? (
+        <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+          The orchestrator has not loaded this pipeline&apos;s job yet. Run now asks it to reload first; if it still has
+          no job, check that <code className="font-mono">PIPELINE_RUN_TOKEN</code> is set for both the API and the Dagster
+          code location.
+        </p>
+      ) : null}
+
+      {!isDraft ? (
         <PipelineVitals
           summary={summary}
           latest={runs[0] ?? null}
@@ -343,11 +398,11 @@ export function PipelineDetailPage() {
             <ErrorState error={runsState.error} onRetry={runsState.reload} />
           ) : runs.length === 0 ? (
             <EmptyState
-              title={authored ? "Authored pipelines do not run from here yet" : "No runs yet"}
+              title={isDraft ? "A draft has no runs" : "No runs yet"}
               description={
-                authored
-                  ? "This pipeline is a stored definition with no job in the orchestrator, so it has no run history."
-                  : "The orchestrator has no run of this job. Run it now, or wait for its schedule."
+                isDraft
+                  ? "Mark it ready: the orchestrator then builds its job, and it can run on its schedule or on demand."
+                  : "The orchestrator has no run of this pipeline. Run it now, or wait for its schedule."
               }
             />
           ) : (
@@ -423,6 +478,10 @@ export function PipelineDetailPage() {
 
         <TabsContent value="settings" className="mt-3">
           <SettingsTab p={p} scheduleText={scheduleText} />
+          <ScheduleHistory pipelineId={p.id} hasSchedule={schedule.kind === "cron"} onSelectRun={(id) => {
+            setParam("tab", "runs")
+            selectRun(id)
+          }} />
           <p className="mt-3 text-xs text-muted-foreground">
             Lineage for this pipeline:{" "}
             <Link href={`/lineage?focus=${encodeURIComponent(p.id)}`} className="text-primary hover:underline">
@@ -432,6 +491,21 @@ export function PipelineDetailPage() {
         </TabsContent>
       </Tabs>
 
+      <ConfirmActionDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        title="Delete pipeline"
+        description={`Delete ${p.name}? Its definition is removed and its job and schedule stop existing.`}
+        impact="Past runs stay in the orchestrator's history. This cannot be undone."
+        confirmLabel="Delete pipeline"
+        confirming={remove.status === "pending"}
+        onConfirm={async () => {
+          if ((await remove.run(pipelineId)) !== null) {
+            setDeleteOpen(false)
+            router.push("/pipelines")
+          }
+        }}
+      />
       <ConfirmActionDialog
         open={pauseOpen}
         onOpenChange={setPauseOpen}

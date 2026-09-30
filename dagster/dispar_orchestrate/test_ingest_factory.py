@@ -751,3 +751,25 @@ def test_an_unknown_kafka_auth_type_is_refused_by_name_without_echoing_secrets()
         kafka_security_kwargs({"auth": {"type": "sasl_scram_sha256"}}, {"password": "not-a-real-secret"})
     assert "not-a-real-secret" not in str(exc.value)
 
+
+
+def test_run_ingest_reports_each_objects_measured_rows_as_a_materialization(monkeypatch) -> None:
+    # The console reads rows per run from the run's step materializations;
+    # an object the adapter could not ingest (None) reports nothing.
+    import dispar_orchestrate.ingest_factory as f
+    from dagster import AssetMaterialization, build_op_context
+
+    rows_by_object = {"orders": 42, "sheet": None}
+    monkeypatch.setattr(f, "_run_one_object", lambda connector, obj: rows_by_object[obj["name"]])
+    connector = {
+        "id": "conn-pg",
+        "adapter": "sql",
+        "dial": {},
+        "sourceObjects": [{"name": "orders", "target": "orders"}, {"name": "sheet", "target": "sheet"}],
+    }
+    monkeypatch.setattr(f, "_fetch_one_connector", lambda cfg, connector_id: connector)
+    monkeypatch.setattr(f.IngestFactoryConfig, "from_env", staticmethod(lambda: f.IngestFactoryConfig(api_url="http://x", service_token="t")))
+    context = build_op_context(op_config={"connector_id": "conn-pg"})
+    f.run_ingest(context)
+    events = [e for e in context.get_events() if isinstance(e, AssetMaterialization)]
+    assert [(e.asset_key.to_user_string(), e.metadata["rows"].value) for e in events] == [("bronze/orders", 42)]

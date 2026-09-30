@@ -28,10 +28,17 @@ pins `rust:1.96.1-slim` to match `rust-toolchain.toml`, copies
 ## Local stack: what's in `docker-compose.yml`
 
 ```
-docker compose up --build
+scripts/compose.sh up --build
 ```
 
-brings up:
+brings up the stack below. `scripts/compose.sh` is `docker compose` with
+`GIT_SHA` set from the checkout: the API and the Dagster images must be
+built with the same `GIT_SHA`, or the pipeline page cannot show op source
+(`pipeline_source.rs::check_commit` refuses rather than show a file that
+may not be the code that ran). A plain `docker compose` works, but builds
+with `GIT_SHA=unknown`.
+
+The stack:
 
 | Service | Image | Purpose |
 | --- | --- | --- |
@@ -278,7 +285,7 @@ command:
 DAGSTER_URL=http://dagster-webserver:3000/graphql
 ```
 ```bash
-docker compose --profile dagster up -d --build \
+scripts/compose.sh --profile dagster up -d --build \
   lakehouse-api dagster-code-location dagster-webserver dagster-daemon
 ```
 

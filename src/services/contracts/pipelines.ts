@@ -143,6 +143,12 @@ export type PipelineDetail = Omit<Pipeline, "description"> & {
   /** Non-null only for an authored (`pl-`) pipeline. */
   definition: AuthoredDefinition | null
   /**
+   * Authored pipelines only: the orchestrator job built for it
+   * (`authored__<id>`), or null while it has none (a draft, or one the
+   * orchestrator has not loaded). Absent for a Dagster job.
+   */
+  orchestratorJob?: string | null
+  /**
    * NOT part of `GET /api/pipelines/{id}`. `routes::pipelines::detail`
    * (WS4 item C1) returns no `runs` field -- runs have their own route,
    * `GET /api/pipelines/{id}/runs`, reached through `listRuns`. Declaring
@@ -203,6 +209,43 @@ export type GeneratePipelineInput = {
   database: string
 }
 
+/** `PUT /api/pipelines/{id}` body: an authored pipeline's editable fields. The name is fixed at creation (the id, and the job name, derive from it). */
+export type UpdatePipelineInput = {
+  kind: PipelineKind | string
+  sourceZone: string
+  sourceTable: string
+  incrementalColumn?: string
+  transforms: string[]
+  fbicEnabled?: boolean
+  targetZone: string
+  targetTable: string
+  schedule: string
+  owner?: string
+  description?: string
+}
+
+/** One schedule evaluation (`GET /api/pipelines/{id}/schedule-ticks`). */
+export type ScheduleTick = {
+  tickId: string
+  /** `SUCCESS` (launched runs), `SKIPPED`, `FAILURE` or `STARTED`. */
+  status: string
+  /** Unix seconds. */
+  timestamp: number
+  runIds: string[]
+  /** The schedule's own reason for not launching. */
+  skipReason: string | null
+  /** The orchestrator's error text is not sent (AGENTS.md principle 4); only that it failed. */
+  failed: boolean
+}
+
+export type ScheduleTicks = {
+  /** The schedule's name, or null when the pipeline has none. */
+  schedule: string | null
+  ticks: ScheduleTick[]
+  /** Set when the orchestrator could not be asked. */
+  unavailable: string | null
+}
+
 export interface PipelineService {
   listPipelines(signal?: AbortSignal): Promise<PipelineList>
   getPipeline(id: string, signal?: AbortSignal): Promise<PipelineDetail>
@@ -233,4 +276,10 @@ export interface PipelineService {
   /** `POST /api/pipelines/generate` — the Agentic Builder's real (non-mock)
    * draft-from-instruction call. */
   generatePipeline(input: GeneratePipelineInput, signal?: AbortSignal): Promise<Pipeline>
+  /** `PUT /api/pipelines/{id}` — replace an authored pipeline's definition. */
+  updatePipeline(id: string, input: UpdatePipelineInput, signal?: AbortSignal): Promise<Pipeline>
+  /** `DELETE /api/pipelines/{id}` — delete an authored pipeline. */
+  deletePipeline(id: string, signal?: AbortSignal): Promise<void>
+  /** `GET /api/pipelines/{id}/schedule-ticks` — the schedule's recent evaluations. */
+  getScheduleTicks(id: string, signal?: AbortSignal): Promise<ScheduleTicks>
 }

@@ -26,7 +26,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { useService, useServiceAction } from "@/hooks/use-service"
-import { formatDateTime, formatDuration, parseTimestamp } from "@/lib/format"
+import { formatDateTime, formatDuration, formatNumber, parseTimestamp } from "@/lib/format"
 import { withNotify } from "@/lib/notify"
 import { pipelineService } from "@/services"
 import type { PipelineRun, PipelineRunTrigger, RetryStrategy } from "@/services/contracts/pipelines"
@@ -200,6 +200,15 @@ export function RunInspector({
   const queued = run.queuedAt ? parseTimestamp(run.queuedAt).getTime() : null
   const duration = runDurationMs(run, now)
   const canRetry = run.status === "failed" || run.status === "cancelled"
+  // Rows the run's ops reported writing (step materializations). Absent
+  // when no op reported a count: an unmeasured run shows no figure, not 0.
+  const rowsWritten = React.useMemo(() => {
+    if (steps.status !== "success") return null
+    const counts = steps.data.flatMap((s) =>
+      s.materializations.map((m) => m.rows).filter((r): r is number => typeof r === "number")
+    )
+    return counts.length > 0 ? counts.reduce((a, b) => a + b, 0) : null
+  }, [steps])
 
   const relaunch = async (strategy: RetryStrategy) => {
     if (await retry.run(strategy)) onChanged(true)
@@ -243,6 +252,12 @@ export function RunInspector({
                 {duration === null ? "—" : formatDuration(duration)}
               </dd>
             </div>
+            {rowsWritten !== null ? (
+              <div className="flex gap-1.5" title="Rows the run's ops reported writing">
+                <dt>Rows written</dt>
+                <dd className="font-mono font-medium tabular-nums text-foreground">{formatNumber(rowsWritten)}</dd>
+              </div>
+            ) : null}
             {queued !== null && !Number.isNaN(started) && started > queued ? (
               <div className="flex gap-1.5" title="From the run's creation to its start: waiting in the queue and launching its process">
                 <dt>Queued</dt>

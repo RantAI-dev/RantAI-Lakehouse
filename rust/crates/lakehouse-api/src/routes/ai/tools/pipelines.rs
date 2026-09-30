@@ -338,6 +338,10 @@ pub(super) async fn create_pipeline(
         crate::routes::pipelines::create(
             State(state.clone()),
             Extension(principal.clone()),
+            // No request headers reach a tool call, so the pipeline lands in
+            // the principal's first tenant: `tenant_scope::resolve`'s own
+            // fallback when no `x-tenant` header is sent.
+            HeaderMap::new(),
             axum::body::Bytes::from(Value::Object(body).to_string()),
         )
         .await,

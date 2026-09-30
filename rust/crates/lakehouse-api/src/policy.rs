@@ -306,6 +306,13 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("POST", "/api/pipelines",                        Policy::RequiresPermission("pipeline:write")),
     ("POST", "/api/pipelines/generate",               Policy::RequiresPermission("pipeline:write")),
     ("GET",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:read")),
+    ("PUT",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:write")),
+    ("DELETE", "/api/pipelines/{id}",                  Policy::RequiresPermission("pipeline:write")),
+    ("GET",  "/api/pipelines/{id}/schedule-ticks",     Policy::RequiresPermission("pipeline:read")),
+    // Every tenant's authored definitions, for the orchestrator's job
+    // factory. `pipeline:read` is the floor; the handler also refuses
+    // anyone but a service identity (routes::authored_pipelines).
+    ("GET",  "/api/pipelines/runnable",                Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/source",             Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs",              Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs/{runId}/steps", Policy::RequiresPermission("pipeline:read")),

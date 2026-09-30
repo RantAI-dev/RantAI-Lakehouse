@@ -101,7 +101,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import requests
-from dagster import DefaultScheduleStatus, Field, ScheduleDefinition, job, op
+from dagster import AssetMaterialization, DefaultScheduleStatus, Field, ScheduleDefinition, job, op
 
 from kafka import KafkaConsumer, TopicPartition
 from kafka.structs import OffsetAndMetadata
@@ -276,7 +276,7 @@ def _resolve_object_secrets(connector: dict, adapter_name: str, dial: dict) -> d
     return dict(zip(fields, values))
 
 
-def _run_one_object(connector: dict, obj: dict) -> None:
+def _run_one_object(connector: dict, obj: dict) -> int | None:
     """Ingest one source object (table/endpoint/sheet range) for one
     connector, recording the outcome via `record_ingest_run` in EVERY
     case -- a rejection (bad secret ref, SSRF-blocked host, an
@@ -325,7 +325,7 @@ def _run_one_object(connector: dict, obj: dict) -> None:
                 dlt_pipeline.BronzeIngestConfig.from_dial(dial, secrets, [obj])
             )
             _record(rows=outcome["rows"], status="succeeded")
-            return
+            return outcome["rows"]
 
         if adapter_name == "sql" and dial.get("driver") == "oracle":
             # adapters/oracle.py's own build_source ALREADY dials the
@@ -348,7 +348,7 @@ def _run_one_object(connector: dict, obj: dict) -> None:
                 sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env()),
             )
             _record(rows=outcome.rows, status="succeeded")
-            return
+            return outcome.rows
 
         adapter = _ADAPTERS.get(adapter_name)
         if adapter is None:
@@ -358,7 +358,7 @@ def _run_one_object(connector: dict, obj: dict) -> None:
             result = adapter.build_source(dial, secrets)
             if not result.supported:
                 _record(rows=None, status="unsupported", error=result.reason or "")
-                return
+                return None
             source, resolved = result.source, None
         elif adapter_name == "mongodb":
             # mongodb.build_source guards its OWN read: `_collection_rows`
@@ -400,6 +400,7 @@ def _run_one_object(connector: dict, obj: dict) -> None:
         else:
             outcome = _load()
         _record(rows=outcome.rows, status="succeeded")
+        return outcome.rows
     except (ssrf_guard.SsrfBlocked, UnsupportedColumnType) as exc:
         _record(rows=None, status="rejected", error=str(exc))
         raise
@@ -618,7 +619,15 @@ def run_ingest(context) -> None:
         _run_stream_connector(connector)
         return
     for obj in connector.get("sourceObjects", []):
-        _run_one_object(connector, obj)
+        rows = _run_one_object(connector, obj)
+        # The rows the sink measured, as a materialization: the run's step
+        # then carries them (`GET .../runs/{runId}/steps`), which is where
+        # the console reads rows per run. An unsupported object measured
+        # nothing and reports nothing.
+        if isinstance(rows, int):
+            context.log_event(
+                AssetMaterialization(asset_key=f"bronze.{obj['target']}", metadata={"rows": rows})
+            )
 
 
 @job(name="ingest_job")

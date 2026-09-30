@@ -44,6 +44,7 @@ fn input() -> CreatePipelineInput {
         schedule: "manual".to_owned(),
         owner: None,
         description: None,
+        tenant_id: None,
     }
 }
 
@@ -300,5 +301,158 @@ async fn list_pipelines_with_no_tenant_filter_matches_nothing(pool: PgPool) -> s
         rows.is_empty(),
         "PipelineFilter::default() (tenant_id: None) must match zero rows, not every row"
     );
+    Ok(())
+}
+
+/// A pipeline created with the creator's tenant is on that tenant's list
+/// straight away: before `tenant_id` was set at creation every
+/// console-created pipeline was unassigned and invisible to every list.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_pipeline_created_with_a_tenant_is_on_that_tenants_list(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant = create_tenant(&pool, &tenant_input("tenant-create-assign"))
+        .await
+        .unwrap();
+    let tenant_id: Uuid = tenant.id.parse().unwrap();
+    let created = pipelines::create_pipeline(
+        &pool,
+        &CreatePipelineInput {
+            tenant_id: Some(tenant_id),
+            ..named_input("assigned at creation")
+        },
+    )
+    .await
+    .unwrap();
+    let listed = pipelines::list_pipelines(
+        &pool,
+        &PipelineFilter {
+            tenant_id: Some(tenant_id),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(listed.iter().any(|p| p.id == created.id));
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_replaces_the_definition_and_keeps_the_status(pool: PgPool) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &named_input("to be edited"))
+        .await
+        .unwrap();
+    pipelines::set_status(&pool, &created.id, "ready")
+        .await
+        .unwrap();
+    let updated = pipelines::update_pipeline(
+        &pool,
+        &created.id,
+        &pipelines::UpdatePipelineInput {
+            kind: "batch".to_owned(),
+            source_zone: "silver".to_owned(),
+            source_table: "events".to_owned(),
+            incremental_column: None,
+            transforms: vec!["dedupe(id)".to_owned()],
+            fbic_enabled: false,
+            target_zone: "gold".to_owned(),
+            target_table: "events_clean".to_owned(),
+            schedule: "0 2 * * *".to_owned(),
+            owner: None,
+            description: Some("edited".to_owned()),
+        },
+    )
+    .await
+    .unwrap()
+    .expect("the pipeline exists");
+    assert_eq!(updated.status, "ready");
+    assert_eq!(updated.source, "silver.events");
+    assert_eq!(
+        updated.owner, created.owner,
+        "an absent owner leaves it unchanged"
+    );
+    let def = pipelines::get_definition(&pool, &created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(def.transforms, vec!["dedupe(id)".to_owned()]);
+    assert_eq!(def.incremental_column, None);
+
+    let missing = pipelines::update_pipeline(
+        &pool,
+        "pl-missing",
+        &pipelines::UpdatePipelineInput {
+            kind: "batch".to_owned(),
+            source_zone: "a".to_owned(),
+            source_table: "b".to_owned(),
+            incremental_column: None,
+            transforms: Vec::new(),
+            fbic_enabled: false,
+            target_zone: "c".to_owned(),
+            target_table: "d".to_owned(),
+            schedule: "manual".to_owned(),
+            owner: None,
+            description: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(missing.is_none());
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn delete_removes_the_row_once(pool: PgPool) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &named_input("to be deleted"))
+        .await
+        .unwrap();
+    assert!(
+        pipelines::delete_pipeline(&pool, &created.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !pipelines::delete_pipeline(&pool, &created.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        pipelines::get_pipeline(&pool, &created.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    Ok(())
+}
+
+/// Only `ready` and `paused` pipelines are runnable, across every tenant,
+/// each with its full definition.
+#[sqlx::test(migrations = "../../migrations")]
+async fn runnable_lists_ready_and_paused_pipelines_with_their_definitions(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let draft = pipelines::create_pipeline(&pool, &named_input("still a draft"))
+        .await
+        .unwrap();
+    let ready = pipelines::create_pipeline(&pool, &named_input("ready one"))
+        .await
+        .unwrap();
+    let paused = pipelines::create_pipeline(&pool, &named_input("paused one"))
+        .await
+        .unwrap();
+    pipelines::set_status(&pool, &ready.id, "ready")
+        .await
+        .unwrap();
+    pipelines::set_status(&pool, &paused.id, "paused")
+        .await
+        .unwrap();
+
+    let runnable = pipelines::list_runnable_pipelines(&pool).await.unwrap();
+    let ids: Vec<&str> = runnable.iter().map(|p| p.id.as_str()).collect();
+    assert!(ids.contains(&ready.id.as_str()));
+    assert!(ids.contains(&paused.id.as_str()));
+    assert!(!ids.contains(&draft.id.as_str()));
+    let one = runnable.iter().find(|p| p.id == ready.id).unwrap();
+    assert_eq!(one.definition.source_table, "orders");
+    assert_eq!(one.definition.transforms.len(), 2);
     Ok(())
 }

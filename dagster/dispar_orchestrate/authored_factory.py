@@ -1,53 +1,34 @@
-"""Builds one real Dagster job per Postgres-authored, `ready`-status
-pipeline (WS4 items E1/E3, grand plan §6): `createPipeline`/
-`generatePipelineFromPrompt` (Phase 2, Task 2.5) write a
-`pipeline_definition` row that previously sat inert forever -- no engine
-executed it. This module reads `GET /api/pipelines` at Dagster code-load
-time (same pattern `agent_runs.py` uses for digital employees) and, for
-every authored row with `status == "ready"` and a `definition` payload,
-builds an `authored__<id>` job (item E3, below) that reads its source,
-applies its `transforms`, and writes its target.
+"""Builds one real Dagster job per console-authored pipeline (WS4 items
+E1/E3, grand plan §6), plus a schedule when its authored schedule is a cron.
 
-# Verified gap: `GET /api/pipelines` does not yet carry `definition` (item E1)
+`createPipeline`/`generatePipelineFromPrompt` write a `pipeline_definition`
+row. At code-load time this module reads `GET /api/pipelines/runnable`
+(every `ready` or `paused` authored pipeline, with its definition, across
+all tenants) and builds, per pipeline:
 
-This module's filter (`_fetch_authored_pipelines`) looks for a
-`definition` key on each authored row, matching the shape
-`GET /api/pipelines/{id}` is documented to return
-(`lakehouse_store::pipelines::get_definition`,
-`rust/crates/lakehouse-store/src/pipelines.rs:184-221`, whose doc comment
-names it as "the `definition` field `GET /api/pipelines/{id}` reports").
-Read on THIS branch (WS4 items E1/E3/E4/H1 only -- the detail ROUTE is
-WS4 phase C item C1, out of this task's scope and not yet landed):
-`rust/crates/lakehouse-api/src/routes/mod.rs` registers no
-`GET /api/pipelines/{id}` route at all, and `list_body`
-(`routes/pipelines.rs:55-68`) serializes each authored row through
-`lakehouse_store::pipelines::Pipeline`, which has no `transforms`/
-`fbic_enabled`/`incremental_column` field (`lakehouse-store/src/
-pipelines.rs:34-70`). So on a real running stack built from this branch
-alone, every authored row's `definition` is genuinely absent and
-`_fetch_authored_pipelines` correctly returns it filtered out -- this is
-not a bug in this module, it is this module honestly reporting what the
-API it depends on does not (yet) expose, per `AGENTS.md`'s "never
-fabricate" rule. `build_authored_jobs()` (item E3, below) will start
-producing jobs the moment WS4 item C1's route lands and starts including
-`definition`; nothing here needs to change for that to happen.
+* an `authored__<id>` job that reads its source, applies its `transforms`,
+  and writes its target (item E3, below);
+* an `authored__<id>_schedule` when the pipeline's schedule is a five-field
+  cron. `default_status` is RUNNING for a `ready` pipeline and STOPPED for a
+  `paused` one: the schedule the author set is meant to fire, and one that
+  is not wanted is paused from the console, which also switches this
+  schedule off (`routes::pipelines::authored_status`).
 
-# Verified gap: the pipeline-run service identity cannot itself read the list (item E1)
+The API asks the webserver to reload this code location whenever a
+pipeline becomes ready, is edited, paused, resumed or deleted
+(`routes::authored_pipelines::reload_orchestrator`). The code location runs
+`dagster code-server start`, which re-imports this module on reload.
 
-`GET /api/pipelines` is `Policy::RequiresPermission("pipeline:read")`
-(`rust/crates/lakehouse-api/src/policy.rs:239`), but the
-`authored-pipeline-scheduler` service identity `PIPELINE_RUN_TOKEN`
-authenticates as (`main.rs::bootstrap_pipeline_run_service`, WS4 item G3,
-already on this branch) is deliberately scoped to `pipeline:write` ONLY --
-see that function's own doc comment ("never `*:*`"). A real
-`PIPELINE_RUN_TOKEN` therefore gets a 403 from `GET /api/pipelines`, which
-`_fetch_authored_pipelines` treats the same as any other non-2xx response:
-logged, and an empty list. This is a real, load-bearing consequence of a
-decision made in a task outside this one's scope (G3) -- broadening that
-identity's scope is a `rust/` change this task set does not make. Noted
-here rather than hidden, per `docs/superpowers/plans/2026-09-11-ws4-pipelines-detail-source-logs.md`'s
-own H1 gate script comment, which names the identical fact for the same
-reason.
+# The gaps this used to document, and how they closed
+
+Earlier this module read `GET /api/pipelines`, which (1) carried no
+`definition` on authored rows and (2) is tenant-scoped, while the
+`authored-pipeline-scheduler` service identity has no tenant, so it saw no
+authored rows at all; and (3) `PIPELINE_RUN_TOKEN` was never passed to any
+container. `GET /api/pipelines/runnable` answers (1) and (2): it returns
+definitions, across tenants, to service identities only. `docker-compose.yml`
+now passes `PIPELINE_RUN_TOKEN` to both `lakehouse-api` and this code
+location, answering (3).
 
 Authenticates the same way `agent_runs.py`/`gold_export.py` do: a bearer
 token from `PIPELINE_RUN_TOKEN`.
@@ -60,7 +41,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import requests
-from dagster import AssetMaterialization, job, op
+from dagster import AssetMaterialization, DefaultScheduleStatus, ScheduleDefinition, job, op
 
 from dispar_orchestrate import authored_transforms, op_metadata
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, _ch_exec, _ch_query_json
@@ -93,9 +74,12 @@ def _headers(cfg: AuthoredPipelineConfig) -> dict[str, str]:
     return {"Authorization": f"Bearer {cfg.run_token}", "x-run-token": cfg.run_token}
 
 
+RUNNABLE_STATUSES = ("ready", "paused")
+
+
 def _fetch_authored_pipelines(cfg: AuthoredPipelineConfig) -> list[dict[str, Any]]:
-    """Fetch every `status == "ready"` authored pipeline that carries a
-    `definition` payload, or an EMPTY list on any failure -- never raises
+    """Fetch every runnable (`ready` or `paused`) authored pipeline that
+    carries a `definition` payload, or an EMPTY list on any failure -- never raises
     (mirrors `agent_runs._fetch_schedulable_employees`; this module
     imports at Dagster code-load time, alongside every other job/schedule
     in this code location, so an uncaught exception here would take all of
@@ -105,8 +89,8 @@ def _fetch_authored_pipelines(cfg: AuthoredPipelineConfig) -> list[dict[str, Any
     are logged distinctly, per WS4 item E1: (1) `PIPELINE_RUN_TOKEN` unset
     -- authored scheduling is deliberately inert, not attempted; (2) the
     HTTP call itself failed (unreachable host, connection refused, a
-    non-2xx status including the real, expected 403 documented in this
-    module's own doc comment above) -- `lakehouse-api` was reached (or an
+    non-2xx status, e.g. a 403 when the token does not belong to a
+    service identity) -- `lakehouse-api` was reached (or an
     attempt was made) and the answer was "no" or "couldn't tell", never
     silently treated as "there are no authored pipelines"; (3) the call
     succeeded and returned valid JSON with genuinely zero rows meeting the
@@ -123,7 +107,7 @@ def _fetch_authored_pipelines(cfg: AuthoredPipelineConfig) -> list[dict[str, Any
 
     try:
         resp = requests.get(
-            f"{cfg.api_url}/api/pipelines",
+            f"{cfg.api_url}/api/pipelines/runnable",
             headers=_headers(cfg),
             timeout=10,
         )
@@ -142,7 +126,7 @@ def _fetch_authored_pipelines(cfg: AuthoredPipelineConfig) -> list[dict[str, Any
     except ValueError as exc:
         print(
             f"WARNING: dispar_orchestrate.authored_factory: lakehouse-api "
-            f"returned a non-JSON /api/pipelines body ({exc}); this is a FETCH "
+            f"returned a non-JSON /api/pipelines/runnable body ({exc}); this is a FETCH "
             "FAILURE, not evidence that no authored pipelines exist -- loading "
             "with zero authored-pipeline jobs"
         )
@@ -151,7 +135,7 @@ def _fetch_authored_pipelines(cfg: AuthoredPipelineConfig) -> list[dict[str, Any
     pipelines = body.get("pipelines", [])
     if not isinstance(pipelines, list):
         print(
-            "WARNING: dispar_orchestrate.authored_factory: /api/pipelines "
+            "WARNING: dispar_orchestrate.authored_factory: /api/pipelines/runnable "
             f"returned {type(pipelines).__name__} for 'pipelines', expected a "
             "list; this is a FETCH FAILURE, not evidence that no authored "
             "pipelines exist -- loading with zero authored-pipeline jobs"
@@ -161,7 +145,7 @@ def _fetch_authored_pipelines(cfg: AuthoredPipelineConfig) -> list[dict[str, Any
     return [
         p
         for p in pipelines
-        if isinstance(p, dict) and p.get("status") == "ready" and p.get("definition")
+        if isinstance(p, dict) and p.get("status") in RUNNABLE_STATUSES and p.get("definition")
     ]
 
 
@@ -370,13 +354,68 @@ def build_authored_job(pipeline: dict[str, Any]) -> Any:
     return _authored_job
 
 
-def build_authored_jobs(cfg: AuthoredPipelineConfig | None = None) -> list[Any]:
+def _is_five_field_cron(schedule: Any) -> bool:
+    return isinstance(schedule, str) and len(schedule.split()) == 5
+
+
+def build_authored_schedule(pipeline: dict[str, Any], authored_job: Any) -> ScheduleDefinition | None:
+    """The pipeline's schedule, or `None` when it has no cron (`"manual"`,
+    `"On demand"`, ...) or its cron is one Dagster refuses. A refused cron
+    is logged and skipped rather than raised: one bad row must not take
+    down every job in this code location."""
+    cron = pipeline.get("schedule")
+    if not _is_five_field_cron(cron):
+        return None
+    # `default_status` follows the pipeline: RUNNING for `ready` (the
+    # author set this schedule to have it fire), STOPPED for `paused`.
+    status = (
+        DefaultScheduleStatus.RUNNING
+        if pipeline.get("status") == "ready"
+        else DefaultScheduleStatus.STOPPED
+    )
+    try:
+        return ScheduleDefinition(
+            name=f"{authored_job.name}_schedule",
+            cron_schedule=cron,
+            job=authored_job,
+            default_status=status,
+        )
+    except Exception as exc:  # noqa: BLE001 -- see the docstring
+        print(
+            f"WARNING: dispar_orchestrate.authored_factory: pipeline {pipeline.get('id')!r} "
+            f"has a schedule Dagster refused ({type(exc).__name__}); building its job "
+            "without a schedule"
+        )
+        return None
+
+
+def build_authored_definitions(
+    cfg: AuthoredPipelineConfig | None = None,
+) -> tuple[list[Any], list[ScheduleDefinition]]:
+    """Every authored job and schedule, from ONE fetch, so the two lists
+    can never describe different sets of pipelines."""
     cfg = cfg or AuthoredPipelineConfig.from_env()
-    pipelines = _fetch_authored_pipelines(cfg)
-    return [build_authored_job(p) for p in pipelines]
+    jobs: list[Any] = []
+    schedules: list[ScheduleDefinition] = []
+    for pipeline in _fetch_authored_pipelines(cfg):
+        authored_job = build_authored_job(pipeline)
+        jobs.append(authored_job)
+        schedule = build_authored_schedule(pipeline, authored_job)
+        if schedule is not None:
+            schedules.append(schedule)
+    return jobs, schedules
+
+
+def build_authored_jobs(cfg: AuthoredPipelineConfig | None = None) -> list[Any]:
+    return build_authored_definitions(cfg)[0]
 
 
 # Built at Dagster code-load time, same pattern `agent_run_schedules`
 # (`agent_runs.py`) uses -- see `_fetch_authored_pipelines`'s doc comment
-# for every way this list degrades to `[]` without raising.
-authored_jobs = build_authored_jobs()
+# for every way this degrades to empty lists without raising.
+# Two plain assignments rather than tuple unpacking, so
+# `ops/lint/check_intra_package_imports.py` (which reads module-level
+# names statically) sees both names `definitions.py` imports.
+_authored_definitions = build_authored_definitions()
+authored_jobs = _authored_definitions[0]
+authored_schedules = _authored_definitions[1]

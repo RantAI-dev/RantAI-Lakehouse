@@ -125,7 +125,7 @@ const CATALOG_TENANT_REFUSAL_UNCONFIGURED: &str = "per-dataset tenant ownership 
 /// check; the whole point is "does this caller bypass every scope check",
 /// which is exactly what `"*:*"` means today, e.g. Platform Admin's seeded
 /// grant in `0002_seed_identity.sql`).
-fn is_unrestricted(principal: &Principal) -> bool {
+pub(crate) fn is_unrestricted(principal: &Principal) -> bool {
     principal
         .permissions
         .as_strings()

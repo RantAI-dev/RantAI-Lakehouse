@@ -231,6 +231,12 @@ services:
       # schedule factory's connector fetch fails visibly (401) rather than
       # silently.
       INGEST_SERVICE_TOKEN: ${INGEST_SERVICE_TOKEN:-}
+      # `main::bootstrap_pipeline_run_service` seeds the
+      # "authored-pipeline-scheduler" service identity (`pipeline:read`,
+      # `pipeline:write`) from this value; `dagster-code-location` sends the
+      # same value to read `GET /api/pipelines/runnable`. Unset: nothing is
+      # seeded and authored pipelines get no job (said in both logs).
+      PIPELINE_RUN_TOKEN: ${PIPELINE_RUN_TOKEN:-}
       # WS2 §4 — base URL for `routes::query::run`'s `engine: "trino"` path
       # (`lakehouse-trino`'s `/v1/statement` client). An internal service
       # address, not a credential, so a default is fine here — the `trino`
@@ -1729,6 +1735,14 @@ services:
       # With this unset, the API seeds no identity and the ingest schedule
       # factory's connector fetch fails visibly (401), never silently.
       INGEST_SERVICE_TOKEN: ${INGEST_SERVICE_TOKEN:-}
+      # `authored_factory.py`'s token for `GET /api/pipelines/runnable`,
+      # the list it builds one `authored__<id>` job per console-authored
+      # pipeline from. Must match `lakehouse-api`'s own `PIPELINE_RUN_TOKEN`
+      # (same single-`.env`-value reasoning as `AGENT_RUN_TOKEN` above).
+      # It was never passed to either container, so no authored pipeline
+      # ever became a job. Unset: no identity is seeded and the factory
+      # loads zero authored jobs, saying so in its log.
+      PIPELINE_RUN_TOKEN: ${PIPELINE_RUN_TOKEN:-}
       # WS2 §4 — `maintenance.py`'s own `/v1/statement` client
       # (`_trino_execute`, a deliberate duplicate of `lakehouse-trino`'s
       # polling loop: this job runs outside the Rust binary) for the
@@ -1738,7 +1752,13 @@ services:
       # under the `trino` profile; when it is unreachable the job records
       # a degraded skip in `skipped_verbs` rather than raising.
       TRINO_URL: ${TRINO_URL:-http://trino:8080}
-    command: ["dagster", "api", "grpc", "-h", "0.0.0.0", "-p", "4000", "-m", "dispar_orchestrate.definitions"]
+    # `code-server start`, not `api grpc`: it serves the same gRPC API on
+    # the same port, and it re-imports the module when the webserver is
+    # asked to reload this location. The API asks for that after every
+    # authored-pipeline change (`routes::authored_pipelines`), since
+    # authored jobs are built at import time; `api grpc` kept serving the
+    # definitions it started with.
+    command: ["dagster", "code-server", "start", "-h", "0.0.0.0", "-p", "4000", "-m", "dispar_orchestrate.definitions"]
     restart: unless-stopped
 
   # WS5 item G2 — one-shot: `pg_dump` every compose-created Postgres

@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import requests
-from dagster import DefaultScheduleStatus, Definitions, ScheduleDefinition, job, op
+from dagster import AssetMaterialization, DefaultScheduleStatus, Definitions, ScheduleDefinition, job, op
 
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, record_maintenance_run
 from dispar_orchestrate.op_metadata import source_metadata
@@ -132,6 +132,13 @@ def run_gold_export(context) -> list[dict[str, Any]]:
             skipped_verbs=[f"rows_exported={body.get('rowsExported')}"],
             target=cfg.ch,
         )
+        # The API's own count of rows it wrote to Iceberg, as a
+        # materialization, so the run's step carries it and the console
+        # can show rows per run. A body without an integer count reports
+        # nothing rather than a guessed number.
+        rows = body.get("rowsExported")
+        if isinstance(rows, int) and not isinstance(rows, bool):
+            context.log_event(AssetMaterialization(asset_key=f"gold.{mart}", metadata={"rows": rows}))
         results.append(body)
 
     context.add_output_metadata({"marts_exported": len(results)})
