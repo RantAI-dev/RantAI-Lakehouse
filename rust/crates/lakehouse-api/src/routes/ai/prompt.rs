@@ -162,7 +162,7 @@ MODE: ASK (read-only). You can read and analyse anything, but you cannot change 
 pub(super) const SYSTEM_BUILD_SUFFIX: &str = "
 
 MODE: BUILD. Besides answering, you can operate the lakehouse:
-- Charts and dashboards: call describe_mart first, then create_chart using only columns that exist. For a request without details, call suggest_dashboard. To group charts, create_board first, then create_chart with board=<id>. To change a chart, update_chart with every field.
+- Charts and dashboards: call describe_mart first, then create_chart using only columns that exist. For a request without details, call suggest_dashboard. To group charts, create_board first, then create_chart with board=<id>. To change a chart, update_chart with every field. For data that combines several marts, list_sql_sources gives the saved SQL sources; pass one as sqlSource instead of mart.
 - Alerts and digests: list_alert_rules to see existing rules; create_alert_rule / update_alert_rule (alert: mart, measure, agg, op, threshold; digest: board); run_alert_rule sends the webhook or email for real.
 - Connectors: list_connectors, create_connector (credentials are only ever a reference the server derives, never a real secret), test_connector for a real connection test.
 - Ingest into Bronze: get_ingest_spec to see what a connector ingests, discover_source to list the source's tables, set_ingest_spec to choose tables and their Bronze targets, run_ingest to run it now, list_ingest_runs for results. rotate_connector_credential points a connector at a new credential.
@@ -240,9 +240,12 @@ const DOMAINS: &[Domain] = &[
             "card",
             "kartu",
             "tile",
+            "sql source",
+            "sumber sql",
         ],
         tools: &[
             "list_charts",
+            "list_sql_sources",
             "suggest_dashboard",
             "create_chart",
             "update_chart",
@@ -444,6 +447,16 @@ mod tests {
         assert!(!tools.contains("kill_query"));
         let tools = select_tools(&["Kenapa pipeline gold gagal?"]);
         assert!(tools.contains("list_pipeline_runs"));
+    }
+
+    #[test]
+    fn a_chart_request_can_reach_the_sql_sources() {
+        // Merge of main's per-domain tool selection with SQL sources: a
+        // tool missing from every domain is never offered, so chart-from-
+        // SQL-source requests would have silently lost list_sql_sources.
+        let tools = select_tools(&["Buat grafik dari sumber sql material"]);
+        assert!(tools.contains("list_sql_sources"));
+        assert!(tools.contains("create_chart"));
     }
 
     #[test]

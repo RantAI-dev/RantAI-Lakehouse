@@ -31,7 +31,8 @@ export function DrillMenu({
   readonly onClose: () => void;
   /** Absent for built-in tiles: dashboard filters don't apply to them. */
   readonly onFilter?: () => void;
-  readonly onRecords: () => void;
+  /** Absent when records cannot be listed (a chart on a SQL source). */
+  readonly onRecords?: () => void;
 }) {
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
@@ -57,9 +58,11 @@ export function DrillMenu({
             <Filter className="size-4" /> Filter dashboard by this
           </button>
         ) : null}
-        <button role="menuitem" onClick={onRecords} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted">
-          <Table2 className="size-4" /> View records
-        </button>
+        {onRecords ? (
+          <button role="menuitem" onClick={onRecords} className="flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-sm hover:bg-muted">
+            <Table2 className="size-4" /> View records
+          </button>
+        ) : null}
       </div>
     </>
   );

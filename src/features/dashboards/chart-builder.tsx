@@ -3,27 +3,37 @@
 import * as React from "react";
 import { useTheme } from "next-themes";
 import {
-  ArrowLeft, ChartBar, ChartColumn, ChartLine, ChartPie, Gauge,
-  Map, Plus, ScatterChart, Table2, Type, type LucideIcon,
+  CalendarDays, ChartBar, ChartCandlestick, ChartColumn, ChartLine, ChartPie, ChevronRight, Gauge, Workflow,
+  Map, Plus, ScatterChart, Search, Table2, Type, type LucideIcon,
 } from "lucide-react";
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription,
   DialogFooter, DialogTrigger, DialogClose,
 } from "@/components/ui/dialog";
+import { EmptyState } from "@/components/patterns/page-states";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
+import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import {
   Select, SelectContent, SelectGroup, SelectLabel, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui/select";
 import type { ChartKind, ChartRenderSpec } from "@/lib/dashboard-specs";
+import {
+  decodeSourceChoice, encodeSourceChoice, fieldsQuery, sourcePayload, sourceValueFromDef,
+} from "@/lib/chart-source";
+import { dashboardService } from "@/services";
+import type { SqlSource } from "@/services/contracts/dashboards";
 import { apiFetch } from "@/services/http";
+import { filterKindGroups } from "@/lib/chart-kind-search";
+import { suggestChartTitle } from "@/lib/chart-title";
+import { cn } from "@/lib/utils";
 import { TileBody } from "./tile-body";
 
 type Fields = { dimensions: string[]; measures: string[] };
 export type ChartDef = {
-  title?: string; subtitle?: string; mart?: string; kind?: ChartKind;
+  title?: string; subtitle?: string; mart?: string; sqlSource?: string; kind?: ChartKind;
   dimension?: string; measures?: string[]; breakdown?: string;
   aggregate?: string; span?: 1 | 2; board?: string; text?: string; caption?: string;
   order?: "desc" | "asc" | "none"; limit?: number; target?: number;
@@ -51,18 +61,24 @@ export const KIND_GROUPS: { group: string; items: { value: ChartKind; label: str
     { value: "line", label: "Line" },
     { value: "area", label: "Area" },
     { value: "waterfall", label: "Waterfall (cumulative)" },
+    { value: "calendar", label: "Calendar heatmap (daily)" },
   ] },
   { group: "Composition", items: [
     { value: "pie", label: "Donut / pie" },
     { value: "rose", label: "Rose (nightingale)" },
     { value: "funnel", label: "Funnel" },
     { value: "treemap", label: "Treemap" },
+    { value: "sunburst", label: "Sunburst (2 levels)" },
   ] },
   { group: "Relationship / distribution", items: [
     { value: "scatter", label: "Scatter (X vs Y)" },
     { value: "bubble", label: "Bubble (X, Y, size)" },
     { value: "heatmap", label: "Heatmap (2 dimensions)" },
     { value: "radar", label: "Radar" },
+    { value: "boxplot", label: "Box plot (distribution)" },
+  ] },
+  { group: "Flow", items: [
+    { value: "sankey", label: "Sankey (flow between 2 dimensions)" },
   ] },
   { group: "Geographic", items: [
     { value: "geomap", label: "Map — Jakarta regions (choropleth)" },
@@ -77,6 +93,38 @@ export const KIND_GROUPS: { group: string; items: { value: ChartKind; label: str
   ] },
 ];
 const AGGS = ["sum", "avg", "max", "min", "count"];
+/**
+ * Value → label maps for the base-ui selects below. Without `items`, a
+ * base-ui `Select.Value` renders the raw value (`hbar`, `b_54e05896`,
+ * `desc`, `__none__`) in the closed trigger even though the open list shows
+ * labels.
+ */
+const KIND_LABELS: Record<string, string> = Object.fromEntries(
+  KIND_GROUPS.flatMap((g) => g.items.map((i) => [i.value, i.label]))
+);
+const ORDER_LABELS: Record<string, string> = {
+  desc: "Highest first", asc: "Lowest first", none: "Natural (by dimension)",
+};
+const NO_BREAKDOWN = "__none__";
+const SPAN_LABELS: Record<string, string> = { "1": "Half width", "2": "Full width" };
+/** Whether the viewport is at least `px` wide; false on the server. */
+function useMinWidth(px: number): boolean {
+  const query = `(min-width: ${px}px)`;
+  return React.useSyncExternalStore(
+    (onChange) => {
+      const mql = window.matchMedia(query);
+      mql.addEventListener("change", onChange);
+      return () => mql.removeEventListener("change", onChange);
+    },
+    () => window.matchMedia(query).matches,
+    () => false,
+  );
+}
+
+/** Marks a field the chart cannot be drawn without. */
+function Req() {
+  return <span aria-hidden className="text-destructive">*</span>;
+}
 const KIND_DESCRIPTIONS: Record<ChartKind, string> = {
   bar: "Compare values across categories", hbar: "Rank categories clearly",
   stacked: "Compare totals and their parts", combo: "Compare two metrics on different scales",
@@ -88,6 +136,10 @@ const KIND_DESCRIPTIONS: Record<ChartKind, string> = {
   radar: "Compare profiles across metrics", geomap: "Compare values across Jakarta regions",
   kpi: "Highlight one important number", gauge: "Track a value against a target",
   table: "Inspect detailed rows and values", text: "Add context, notes, or instructions",
+  sankey: "Show how a total flows from one dimension to another",
+  sunburst: "Break each category into its parts, as rings",
+  boxplot: "Compare the spread of a measure across categories",
+  calendar: "Spot daily patterns on a calendar",
 };
 function kindIcon(kind: ChartKind): LucideIcon {
   if (["bar", "hbar", "stacked", "combo"].includes(kind)) return kind === "bar" ? ChartColumn : ChartBar;
@@ -95,6 +147,10 @@ function kindIcon(kind: ChartKind): LucideIcon {
   if (["pie", "rose", "funnel", "treemap"].includes(kind)) return ChartPie;
   if (["scatter", "bubble", "heatmap", "radar"].includes(kind)) return ScatterChart;
   if (kind === "geomap") return Map;
+  if (kind === "sankey") return Workflow;
+  if (kind === "sunburst") return ChartPie;
+  if (kind === "boxplot") return ChartCandlestick;
+  if (kind === "calendar") return CalendarDays;
   if (kind === "kpi" || kind === "gauge") return Gauge;
   return kind === "table" ? Table2 : Type;
 }
@@ -132,18 +188,24 @@ export function ChartBuilder({
   const setOpen = (o: boolean) => { onOpenChange?.(o); if (!controlled) setOpenState(o); };
 
   const [marts, setMarts] = React.useState<{ name: string; rows: number }[]>([]);
+  const [sqlSources, setSqlSources] = React.useState<SqlSource[]>([]);
   const [fields, setFields] = React.useState<Fields | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
-  const [step, setStep] = React.useState<"gallery" | "configure">("gallery");
   const [preview, setPreview] = React.useState<Preview | null>(null);
   const [previewBusy, setPreviewBusy] = React.useState(false);
   const [previewError, setPreviewError] = React.useState<string | null>(null);
   const { resolvedTheme } = useTheme();
+  // Side-by-side, resizable form and preview from the `lg` breakpoint.
+  const wide = useMinWidth(1024);
 
   const [title, setTitle] = React.useState("");
-  const [mart, setMart] = React.useState("");
+  // Encoded data-source choice (`mart:<name>` / `sql:<id>`, lib/chart-source).
+  const [source, setSource] = React.useState("");
+  const choice = decodeSourceChoice(source);
   const [kind, setKind] = React.useState<ChartKind>("hbar");
+  const [kindQuery, setKindQuery] = React.useState("");
+  const kindGroups = React.useMemo(() => filterKindGroups(KIND_GROUPS, KIND_DESCRIPTIONS, kindQuery), [kindQuery]);
   const [dimension, setDimension] = React.useState("");
   const [measure, setMeasure] = React.useState("");
   const [measure2, setMeasure2] = React.useState("");
@@ -162,26 +224,67 @@ export function ChartBuilder({
   const isGauge = kind === "gauge";
   const isSingle = isKpi || isGauge;         // no dimension (single number)
   const isHeatmap = kind === "heatmap";
+  // Kinds drawn from the breakdown shape (x, series, value): a 2nd
+  // dimension is required (lakehouse_bi::store::breakdown_required).
+  const needsBreakdown = isHeatmap || kind === "sankey" || kind === "sunburst";
+  const isBoxplot = kind === "boxplot";
+  const isCalendar = kind === "calendar";
+  // A calendar is one cell per day, so up to a year of rows.
+  const maxLimit = isCalendar ? 366 : 100;
+  // Switching to a calendar starts from a full year; leaving it brings the
+  // Top-N back inside 1–100.
+  React.useEffect(() => {
+    if (isCalendar) setLimit((l) => (l === 20 ? 366 : l));
+    else setLimit((l) => Math.min(l, 100));
+  }, [isCalendar]);
   const needsM2 = kind === "stacked" || kind === "scatter" || kind === "combo" || kind === "bubble";
   const needsM3 = kind === "bubble";
-  const canBreakdown = kind === "bar" || kind === "hbar" || kind === "line" || kind === "area" || isHeatmap;
-  const mLabels = MEASURE_LABELS[kind] ?? ["Measure (Y)"];
+  const canBreakdown = kind === "bar" || kind === "hbar" || kind === "line" || kind === "area" || needsBreakdown;
+  const mLabels = isSingle ? ["Measure"] : MEASURE_LABELS[kind] ?? ["Measure (Y)"];
+  const breakdownLabel = kind === "sankey" ? "Flows to" : kind === "sunburst" ? "Outer ring" : isHeatmap ? "2nd dimension (Y)" : "Breakdown / series";
+  const suggestedTitle = suggestChartTitle({
+    kind, dimension: isSingle ? undefined : dimension,
+    measures: needsM3 ? [measure, measure2, measure3] : needsM2 ? [measure, measure2] : [measure],
+    breakdown: canBreakdown ? breakdown : undefined,
+  });
+  // Required fields still empty: listed in the preview before the user
+  // hits Create, and the same list is the save-time error.
+  const missing: string[] = isText
+    ? [...(title.trim() ? [] : ["Title"]), ...(text.trim() ? [] : ["Content"])]
+    : [
+        ...(choice ? [] : ["Data source"]),
+        ...(!isSingle && !dimension ? ["Dimension (X)"] : []),
+        ...(measure ? [] : [mLabels[0]]),
+        ...(needsM2 && !measure2 ? [mLabels[1] ?? "2nd measure"] : []),
+        ...(needsM3 && !measure3 ? [mLabels[2] ?? "3rd measure"] : []),
+        ...(needsBreakdown && !breakdown ? [breakdownLabel] : []),
+      ];
   const isEdit = !!editId;
+  const boardOptions = boards.length ? boards : [{ id: "default", name: "Main" }];
+  const boardLabels: Record<string, string> = Object.fromEntries(boardOptions.map((b) => [b.id, b.name]));
+  // The data-source value is encoded (lib/chart-source); label it by name.
+  const sourceLabels: Record<string, string> = Object.fromEntries([
+    ...marts.map((m) => [encodeSourceChoice({ kind: "mart", name: m.name }), m.name]),
+    ...sqlSources.map((s) => [encodeSourceChoice({ kind: "sql", id: s.id }), `SQL · ${s.title}`]),
+  ]);
+  const breakdownLabels: Record<string, string> = { [NO_BREAKDOWN]: "— no breakdown —" };
 
-  async function loadFields(m: string): Promise<Fields> {
-    const j = await apiFetch(`/api/dashboard/fields?mart=${encodeURIComponent(m)}`).then((r) => r.json());
+  async function loadFields(value: string): Promise<Fields> {
+    const picked = decodeSourceChoice(value);
+    if (!picked) { setFields(null); return { dimensions: [], measures: [] }; }
+    const j = await apiFetch(`/api/dashboard/fields?${fieldsQuery(picked)}`).then((r) => r.json());
     const f = { dimensions: j.dimensions ?? [], measures: j.measures ?? [] };
     setFields(f);
     return f;
   }
 
   // On open: load the marts, and prefill from initial — EDIT, or a draft
-  // (e.g. from Copilot) whose kind is already chosen, so the gallery step
-  // is skipped.
+  // (e.g. from Copilot) whose kind is already chosen.
   React.useEffect(() => {
     if (!open) return;
-    setStep(isEdit || initial?.kind ? "configure" : "gallery");
     void apiFetch("/api/dashboard/fields").then((r) => r.json()).then((j) => setMarts(j.marts ?? [])).catch(() => setMarts([]));
+    // A viewer without the list (or with the API down) still gets marts.
+    void dashboardService.listSqlSources().then(setSqlSources).catch(() => setSqlSources([]));
     if (initial) {
       setTitle(initial.title ?? "");
       setKind((initial.kind as ChartKind) ?? "hbar");
@@ -194,8 +297,8 @@ export function ChartBuilder({
       setOrder((initial.order as "desc" | "asc" | "none") ?? "desc");
       setLimit(initial.limit ?? 20);
       setTargetBoard(initial.board ?? board);
-      const m = initial.mart ?? "";
-      setMart(m);
+      const m = sourceValueFromDef(initial);
+      setSource(m);
       if (m) {
         void loadFields(m).then(() => {
           setDimension(initial.dimension ?? "");
@@ -211,43 +314,37 @@ export function ChartBuilder({
   }, [open]);
 
   function reset() {
-    setTitle(""); setMart(""); setKind("hbar"); setDimension("");
+    setTitle(""); setSource(""); setKind("hbar"); setKindQuery(""); setDimension("");
     setMeasure(""); setMeasure2(""); setMeasure3(""); setBreakdown(""); setAggregate("sum"); setSpan(1);
     setCaption(""); setTarget(""); setText(""); setOrder("desc"); setLimit(20);
     setTargetBoard(board); setFields(null); setError(null); setPreview(null); setPreviewError(null);
-    setStep("gallery");
   }
 
-  // User changes the mart → reset the column selections and reload.
-  function onMartChange(m: string) {
-    setMart(m); setDimension(""); setMeasure(""); setMeasure2(""); setMeasure3(""); setBreakdown("");
-    if (m) void loadFields(m); else setFields(null);
+  // User changes the data source → reset the column selections and reload.
+  function onSourceChange(value: string) {
+    setSource(value); setDimension(""); setMeasure(""); setMeasure2(""); setMeasure3(""); setBreakdown("");
+    if (value) void loadFields(value); else setFields(null);
   }
 
   function buildPayload(forPreview = false): Record<string, unknown> {
-    const payloadTitle = title.trim() || (forPreview ? "Chart preview" : "");
+    if (missing.length) throw new Error(`Still needed: ${missing.join(", ")}.`);
+    const payloadTitle = title.trim() || suggestedTitle || (forPreview ? "Chart preview" : "");
     if (!payloadTitle) throw new Error("Title is required.");
     let payload: Record<string, unknown>;
     if (isText) {
-      if (!text.trim()) throw new Error("Enter text/note.");
       payload = { title: payloadTitle, kind, text, span, board: targetBoard };
     } else if (isSingle) {
-      if (!mart || !measure) throw new Error("Pick a mart & measure.");
       payload = {
-        title: payloadTitle, kind, mart, measures: [measure], aggregate, span, board: targetBoard,
+        title: payloadTitle, kind, ...sourcePayload(choice), measures: [measure], aggregate, span, board: targetBoard,
         caption: isKpi && caption ? caption : undefined,
         target: isGauge && Number(target) > 0 ? Number(target) : undefined,
       };
     } else {
       const measures = (needsM3 ? [measure, measure2, measure3] : needsM2 ? [measure, measure2] : [measure]).filter(Boolean);
-      if (!mart || !dimension || measures.length === 0) throw new Error("Fill in mart, dimension, and measure.");
-      if (needsM3 && measures.length < 3) throw new Error(`${mLabels.join(", ")} — need all 3.`);
-      if (needsM2 && measures.length < 2) throw new Error(`${mLabels.join(" & ")} — need both.`);
-      if (isHeatmap && !breakdown) throw new Error("Heatmap needs a breakdown (2nd dimension).");
       payload = {
-        title: payloadTitle, mart, kind, dimension, measures, aggregate, span, board: targetBoard,
+        title: payloadTitle, ...sourcePayload(choice), kind, dimension, measures, aggregate, span, board: targetBoard,
         breakdown: canBreakdown && breakdown ? breakdown : undefined,
-        order, limit,
+        order: isCalendar ? "none" : order, limit: Math.min(limit, maxLimit),
       };
     }
     if (isEdit) payload.id = editId;
@@ -255,7 +352,7 @@ export function ChartBuilder({
   }
 
   React.useEffect(() => {
-    if (!open || step !== "configure") return;
+    if (!open) return;
     if (isText) {
       setPreview(text.trim() ? {
         spec: { id: "preview", title: title || "Chart preview", kind: "text", mart: "", x: "", y: "", source: "ui", text },
@@ -283,7 +380,7 @@ export function ChartBuilder({
     return () => { window.clearTimeout(timer); controller.abort(); };
     // Every field below affects the generated SQL or render spec.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, step, title, mart, kind, dimension, measure, measure2, measure3, breakdown, aggregate, span, caption, target, text, order, limit, targetBoard]);
+  }, [open, title, source, kind, dimension, measure, measure2, measure3, breakdown, aggregate, span, caption, target, text, order, limit, targetBoard]);
 
   async function save() {
     setError(null);
@@ -308,6 +405,219 @@ export function ChartBuilder({
     }
   }
 
+  const formFields = (
+    <div className="grid content-start gap-4 px-5 pt-1 pb-5">
+      <div className="grid gap-1.5">
+        <Label htmlFor="ch-title">Title {isText ? <Req /> : null}</Label>
+        <Input
+          id="ch-title" value={title} onChange={(e) => setTitle(e.target.value)}
+          placeholder={suggestedTitle || "e.g. Visitors by Region"}
+        />
+        {!title.trim() && suggestedTitle ? (
+          <p className="text-xs text-muted-foreground">Left empty, the chart is saved as “{suggestedTitle}”.</p>
+        ) : null}
+      </div>
+
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div className="grid gap-1.5">
+          <Label>Dashboard</Label>
+          <Select value={targetBoard} items={boardLabels} onValueChange={(v) => setTargetBoard(v ?? "default")}>
+            <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {boardOptions.map((b) => (
+                <SelectItem key={b.id} value={b.id}>{b.name}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="grid gap-1.5">
+          <Label>Width</Label>
+          <Select value={String(span)} items={SPAN_LABELS} onValueChange={(v) => setSpan(v === "2" ? 2 : 1)}>
+            <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="1">{SPAN_LABELS["1"]}</SelectItem>
+              <SelectItem value="2">{SPAN_LABELS["2"]}</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      </div>
+
+      {isText ? (
+        <div className="grid gap-1.5">
+          <Label>Content (markdown) <Req /></Label>
+          <Textarea rows={8} value={text} onChange={(e) => setText(e.target.value)} placeholder="Title **bold**, - bullets, or | table | GFM |." />
+        </div>
+      ) : (
+        <>
+          <div className="grid gap-1.5">
+            <Label>Data source <Req /></Label>
+            <Select value={source} items={sourceLabels} onValueChange={(v) => onSourceChange(v ?? "")}>
+              <SelectTrigger className="w-full"><SelectValue placeholder="pick a mart or SQL source" /></SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectLabel>Gold marts</SelectLabel>
+                  {marts.map((m) => (
+                    <SelectItem key={m.name} value={encodeSourceChoice({ kind: "mart", name: m.name })}>
+                      {m.name} · {m.rows.toLocaleString("id-ID")}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+                {sqlSources.length ? (
+                  <SelectGroup>
+                    <SelectLabel>SQL sources</SelectLabel>
+                    {sqlSources.map((s) => (
+                      <SelectItem key={s.id} value={encodeSourceChoice({ kind: "sql", id: s.id })}>
+                        {s.title}
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                ) : null}
+              </SelectContent>
+            </Select>
+            {choice?.kind === "sql" ? (
+              <p className="text-xs text-muted-foreground">
+                Custom SQL, edited in Query Studio. Drill-down to records is not available for SQL sources yet.
+              </p>
+            ) : null}
+          </div>
+
+          {/* Dimensions together, then the measure next to how it is aggregated. */}
+          {!isSingle ? (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="grid gap-1.5">
+                <Label>Dimension (X) <Req /></Label>
+                <Select value={dimension} onValueChange={(v) => setDimension(v ?? "")} disabled={!fields}>
+                  <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : "pick a source first"} /></SelectTrigger>
+                  <SelectContent>{fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}</SelectContent>
+                </Select>
+              </div>
+              {canBreakdown ? (
+                <div className="grid gap-1.5">
+                  <Label>{breakdownLabel} {needsBreakdown ? <Req /> : <span className="font-normal text-muted-foreground">(optional)</span>}</Label>
+                  <Select value={breakdown || NO_BREAKDOWN} items={breakdownLabels} onValueChange={(v) => setBreakdown(v === NO_BREAKDOWN ? "" : v ?? "")} disabled={!fields}>
+                    <SelectTrigger className="w-full"><SelectValue placeholder={needsBreakdown ? "pick a 2nd column" : "no breakdown"} /></SelectTrigger>
+                    <SelectContent>
+                      {needsBreakdown ? null : <SelectItem value={NO_BREAKDOWN}>— no breakdown —</SelectItem>}
+                      {fields?.dimensions.filter((d) => d !== dimension).map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
+                    </SelectContent>
+                  </Select>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          {isCalendar ? (
+            <p className="-mt-2 text-xs text-muted-foreground">Pick a date column as the dimension; one cell per day, up to the last year of data.</p>
+          ) : null}
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div className="grid gap-1.5">
+              <Label>{mLabels[0]} <Req /></Label>
+              <Select value={measure} onValueChange={(v) => setMeasure(v ?? "")} disabled={!fields}>
+                <SelectTrigger className="w-full"><SelectValue placeholder={fields ? "pick a column" : "pick a source first"} /></SelectTrigger>
+                <SelectContent>{fields?.measures.map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
+              </Select>
+            </div>
+            {isBoxplot ? (
+              <div className="grid gap-1.5">
+                <Label>Aggregation</Label>
+                <p className="flex h-8 items-center text-xs text-muted-foreground">Distribution: min, quartiles, max</p>
+              </div>
+            ) : (
+              <div className="grid gap-1.5">
+                <Label>Aggregation</Label>
+                <Select value={aggregate} onValueChange={(v) => setAggregate(v ?? "")}>
+                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>{AGGS.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}</SelectContent>
+                </Select>
+              </div>
+            )}
+          </div>
+
+          {needsM2 ? (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <div className="grid gap-1.5">
+                <Label>{mLabels[1] ?? "2nd measure"} <Req /></Label>
+                <Select value={measure2} onValueChange={(v) => setMeasure2(v ?? "")} disabled={!fields}>
+                  <SelectTrigger className="w-full"><SelectValue placeholder="pick a column" /></SelectTrigger>
+                  <SelectContent>{fields?.measures.filter((m) => m !== measure).map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
+                </Select>
+              </div>
+              {needsM3 ? (
+                <div className="grid gap-1.5">
+                  <Label>{mLabels[2] ?? "3rd measure"} <Req /></Label>
+                  <Select value={measure3} onValueChange={(v) => setMeasure3(v ?? "")} disabled={!fields}>
+                    <SelectTrigger className="w-full"><SelectValue placeholder="pick a column" /></SelectTrigger>
+                    <SelectContent>{fields?.measures.filter((m) => m !== measure && m !== measure2).map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
+                  </Select>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+
+          {isKpi ? (
+            <div className="grid gap-1.5">
+              <Label>Caption <span className="font-normal text-muted-foreground">(optional)</span></Label>
+              <Input value={caption} onChange={(e) => setCaption(e.target.value)} placeholder="e.g. foreign visits (cumulative)" />
+            </div>
+          ) : isGauge ? (
+            <div className="grid gap-1.5">
+              <Label>Target / max <span className="font-normal text-muted-foreground">(optional)</span></Label>
+              <Input type="number" min={0} value={target} onChange={(e) => setTarget(e.target.value)} placeholder="auto from value if empty" />
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              {isBoxplot || isCalendar ? (
+                <div className="grid gap-1.5">
+                  <Label>Sort</Label>
+                  <p className="flex h-8 items-center text-xs text-muted-foreground">{isCalendar ? "By date" : "By category"}</p>
+                </div>
+              ) : (
+                <div className="grid gap-1.5">
+                  <Label>Sort</Label>
+                  <Select value={order} items={ORDER_LABELS} onValueChange={(v) => setOrder((v as "desc" | "asc" | "none") ?? "desc")}>
+                    <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="desc">Highest first</SelectItem>
+                      <SelectItem value="asc">Lowest first</SelectItem>
+                      <SelectItem value="none">Natural (by dimension)</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+              <div className="grid gap-1.5">
+                <Label>{isCalendar ? "Days (max 366)" : "Limit (Top N)"}</Label>
+                <Input type="number" min={1} max={maxLimit} value={limit} onChange={(e) => setLimit(Math.max(1, Math.min(maxLimit, Number(e.target.value) || 20)))} />
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+  const previewPane = (
+    <section aria-label="Preview" className={cn("flex flex-col gap-3 px-5 pb-5", wide ? "h-full pt-1" : "min-h-96 border-t border-border pt-4")}>
+      <div className="flex flex-wrap items-baseline justify-between gap-x-3">
+        <p className="text-sm font-medium">Preview</p>
+        <p className="text-xs text-muted-foreground">Live data, updates as you edit</p>
+      </div>
+      <div className="relative min-h-72 flex-1">
+        <div className="absolute inset-0">
+          {preview ? (
+            <TileBody spec={preview.spec} cell={preview.result} dark={resolvedTheme === "dark"} loading={previewBusy} year="all" />
+          ) : previewBusy ? (
+            <div className="h-full animate-pulse rounded-md bg-muted/50" />
+          ) : (
+            <EmptyState
+              className="h-full py-6"
+              title={previewError ? "Preview unavailable" : missing.length ? "Nothing to preview yet" : "Loading preview…"}
+              description={previewError ?? (missing.length ? `Fill in ${missing.join(", ")} to see real data here.` : undefined)}
+            />
+          )}
+        </div>
+      </div>
+    </section>
+  );
+
   return (
     <Dialog open={open} onOpenChange={(o) => { setOpen(o); if (!o && !isEdit) reset(); }}>
       {hideTrigger ? null : (
@@ -315,238 +625,107 @@ export function ChartBuilder({
           <Plus className="size-4" /> New chart
         </DialogTrigger>
       )}
-      <DialogContent className="max-h-[90vh] overflow-hidden sm:max-w-4xl">
-        <DialogHeader>
-          <DialogTitle>{isEdit ? "Edit chart" : "New chart"}</DialogTitle>
-          <DialogDescription>
-            {step === "gallery"
-              ? "Choose the visualization that best answers your question."
-              : "Configure the chart and review live data before adding it to the dashboard."}
-          </DialogDescription>
-        </DialogHeader>
-
-        {step === "gallery" ? (
-          <div className="min-h-0 overflow-y-auto pr-1">
-            <div className="grid gap-5 pb-1">
-              {KIND_GROUPS.map((group) => (
-                <section key={group.group} className="grid gap-2">
-                  <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">{group.group}</h3>
-                  <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-                    {group.items.map((item) => {
-                      const Icon = kindIcon(item.value);
-                      return (
-                        <button
-                          key={item.value}
-                          type="button"
-                          onClick={() => { setKind(item.value); setStep("configure"); }}
-                          className="group flex min-h-24 items-start gap-3 rounded-lg border border-border bg-card p-3 text-left transition hover:border-primary/50 hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                        >
-                          <span className="grid size-9 shrink-0 place-items-center rounded-md bg-primary/10 text-primary">
-                            <Icon className="size-5" />
-                          </span>
-                          <span>
-                            <span className="block text-sm font-medium text-foreground">{item.label}</span>
-                            <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">{KIND_DESCRIPTIONS[item.value]}</span>
-                          </span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </section>
-              ))}
+      <DialogContent className="h-[min(90vh,52rem)] overflow-hidden p-0 sm:max-w-6xl">
+        {/*
+          Chart types live in a sidebar next to the form (like a settings
+          dialog) instead of a separate gallery step: switching type keeps
+          everything else filled in and the live preview follows at once.
+          The dialog has a fixed height so the actions stay at the bottom
+          edge whatever the form's length.
+        */}
+        <div className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)] md:grid-cols-[14rem_minmax(0,1fr)] md:grid-rows-1">
+          <nav aria-label="Chart type" className="flex min-h-0 flex-col border-b border-border bg-muted/30 md:border-r md:border-b-0">
+            <div className="relative p-2 md:p-3 md:pb-2">
+              <Search className="pointer-events-none absolute top-1/2 left-4 size-4 -translate-y-1/2 text-muted-foreground md:left-5" aria-hidden />
+              <Input
+                value={kindQuery}
+                onChange={(e) => setKindQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  // Enter picks the first match, so "sank⏎" is enough.
+                  const first = kindGroups[0]?.items[0];
+                  if (e.key === "Enter" && first) { e.preventDefault(); setKind(first.value); }
+                }}
+                placeholder="Search chart types"
+                aria-label="Search chart types"
+                className="h-8 bg-background pl-8"
+              />
             </div>
-          </div>
-        ) : (
-          <>
-        <div className="grid min-h-0 gap-5 overflow-y-auto py-1 lg:grid-cols-[minmax(0,1fr)_minmax(320px,1fr)]">
-          <div className="grid content-start gap-3">
-          {!isEdit ? (
-            <Button variant="ghost" size="sm" className="w-fit px-0 text-muted-foreground" onClick={() => setStep("gallery")}>
-              <ArrowLeft className="size-4" /> Change visualization
-            </Button>
-          ) : null}
-          <div className="grid gap-1.5">
-            <Label htmlFor="ch-title">Title</Label>
-            <Input id="ch-title" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Visitors by Region" />
-          </div>
-
-          {/* Type + Board */}
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            <div className="grid gap-1.5">
-              <Label>Type</Label>
-              <Select value={kind} onValueChange={(v) => setKind(v as ChartKind)}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {KIND_GROUPS.map((g) => (
-                    <SelectGroup key={g.group}>
-                      <SelectLabel>{g.group}</SelectLabel>
-                      {g.items.map((k) => <SelectItem key={k.value} value={k.value}>{k.label}</SelectItem>)}
-                    </SelectGroup>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="grid gap-1.5">
-              <Label>Dashboard</Label>
-              <Select value={targetBoard} onValueChange={(v) => setTargetBoard(v ?? "default")}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {(boards.length ? boards : [{ id: "default", name: "Main" }]).map((b) => (
-                    <SelectItem key={b.id} value={b.id}>{b.name}</SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-
-          {isText ? (
-            <div className="grid gap-1.5">
-              <Label>Content (markdown)</Label>
-              <Textarea rows={5} value={text} onChange={(e) => setText(e.target.value)} placeholder="Title **bold**, - bullets, or | table | GFM |." />
-            </div>
-          ) : (
-            <>
-              <div className="grid gap-1.5">
-                <Label>Mart (Gold)</Label>
-                <Select value={mart} onValueChange={(v) => onMartChange(v ?? "")}>
-                  <SelectTrigger><SelectValue placeholder="pick a mart" /></SelectTrigger>
-                  <SelectContent>
-                    {marts.map((m) => <SelectItem key={m.name} value={m.name}>{m.name} · {m.rows.toLocaleString("id-ID")}</SelectItem>)}
-                  </SelectContent>
-                </Select>
+            <div className="flex min-h-0 gap-1 overflow-x-auto px-2 pb-2 md:flex-col md:gap-3 md:overflow-y-auto md:px-3 md:pb-3">
+            {kindGroups.length === 0 ? (
+              <p className="px-2 py-1.5 text-xs text-muted-foreground">No chart type matches “{kindQuery.trim()}”.</p>
+            ) : null}
+            {kindGroups.map((group) => (
+              <div key={group.group} className="flex shrink-0 gap-1 md:flex-col">
+                <p className="hidden px-2 pb-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground md:block">
+                  {group.group}
+                </p>
+                {group.items.map((item) => {
+                  const Icon = kindIcon(item.value);
+                  const active = item.value === kind;
+                  return (
+                    <button
+                      key={item.value}
+                      type="button"
+                      aria-pressed={active}
+                      title={KIND_DESCRIPTIONS[item.value]}
+                      onClick={() => setKind(item.value)}
+                      className={cn(
+                        "flex shrink-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm whitespace-nowrap transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                        active ? "bg-primary/10 font-medium text-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground",
+                      )}
+                    >
+                      <Icon className={cn("size-4 shrink-0", active ? "text-primary" : "opacity-70")} />
+                      <span className="md:truncate">{item.label}</span>
+                    </button>
+                  );
+                })}
               </div>
+            ))}
+            </div>
+          </nav>
 
-              {!isSingle ? (
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  <div className="grid gap-1.5">
-                    <Label>Dimension (X)</Label>
-                    <Select value={dimension} onValueChange={(v) => setDimension(v ?? "")} disabled={!fields}>
-                      <SelectTrigger><SelectValue placeholder={fields ? "pick a column" : "pick a mart first"} /></SelectTrigger>
-                      <SelectContent>{fields?.dimensions.map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}</SelectContent>
-                    </Select>
-                  </div>
-                  <div className="grid gap-1.5">
-                    <Label>Aggregation</Label>
-                    <Select value={aggregate} onValueChange={(v) => setAggregate(v ?? "")}>
-                      <SelectTrigger><SelectValue /></SelectTrigger>
-                      <SelectContent>{AGGS.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}</SelectContent>
-                    </Select>
-                  </div>
-                </div>
-              ) : null}
-
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <div className="grid gap-1.5">
-                  <Label>{mLabels[0]}</Label>
-                  <Select value={measure} onValueChange={(v) => setMeasure(v ?? "")} disabled={!fields}>
-                    <SelectTrigger><SelectValue placeholder={fields ? "pick a column" : "pick a mart first"} /></SelectTrigger>
-                    <SelectContent>{fields?.measures.map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
-                  </Select>
-                </div>
-                {isSingle ? (
-                  <div className="grid gap-1.5">
-                    <Label>Aggregation</Label>
-                    <Select value={aggregate} onValueChange={(v) => setAggregate(v ?? "")}>
-                      <SelectTrigger><SelectValue /></SelectTrigger>
-                      <SelectContent>{AGGS.map((a) => <SelectItem key={a} value={a}>{a}</SelectItem>)}</SelectContent>
-                    </Select>
-                  </div>
-                ) : needsM2 ? (
-                  <div className="grid gap-1.5">
-                    <Label>{mLabels[1] ?? "2nd measure"}</Label>
-                    <Select value={measure2} onValueChange={(v) => setMeasure2(v ?? "")} disabled={!fields}>
-                      <SelectTrigger><SelectValue placeholder="pick a column" /></SelectTrigger>
-                      <SelectContent>{fields?.measures.filter((m) => m !== measure).map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
-                    </Select>
-                  </div>
-                ) : <div />}
+          <div className="flex min-h-0 flex-col">
+            <div className="px-5 pt-5 pb-4">
+              <DialogHeader>
+                <DialogTitle className="flex items-center gap-1.5 text-base">
+                  <span className="text-muted-foreground">{isEdit ? "Edit chart" : "New chart"}</span>
+                  <ChevronRight className="size-4 text-muted-foreground" aria-hidden />
+                  <span>{KIND_LABELS[kind]}</span>
+                </DialogTitle>
+                <DialogDescription>{KIND_DESCRIPTIONS[kind]}. Review live data before adding it to the dashboard.</DialogDescription>
+              </DialogHeader>
+            </div>
+            {/*
+              Form and preview are split by a divider rather than a card
+              around the preview, so the chart gets the whole column height.
+              On a wide screen the divider is a drag handle (double-click
+              resets it); a narrow one stacks them and scrolls instead.
+            */}
+            {wide ? (
+              <ResizablePanelGroup className="min-h-0 flex-1">
+                <ResizablePanel defaultSize="50" minSize="30">
+                  <div className="h-full overflow-y-auto">{formFields}</div>
+                </ResizablePanel>
+                <ResizableHandle withHandle />
+                <ResizablePanel defaultSize="50" minSize="30">{previewPane}</ResizablePanel>
+              </ResizablePanelGroup>
+            ) : (
+              <div className="min-h-0 flex-1 overflow-y-auto">
+                {formFields}
+                {previewPane}
               </div>
+            )}
 
-              {needsM3 ? (
-                <div className="grid gap-1.5">
-                  <Label>{mLabels[2] ?? "3rd measure"}</Label>
-                  <Select value={measure3} onValueChange={(v) => setMeasure3(v ?? "")} disabled={!fields}>
-                    <SelectTrigger><SelectValue placeholder="pick a column" /></SelectTrigger>
-                    <SelectContent>{fields?.measures.filter((m) => m !== measure && m !== measure2).map((m) => <SelectItem key={m} value={m}>{m}</SelectItem>)}</SelectContent>
-                  </Select>
-                </div>
-              ) : null}
-
-              {isKpi ? (
-                <div className="grid gap-1.5">
-                  <Label>Caption (optional)</Label>
-                  <Input value={caption} onChange={(e) => setCaption(e.target.value)} placeholder="e.g. foreign visits (cumulative)" />
-                </div>
-              ) : isGauge ? (
-                <div className="grid gap-1.5">
-                  <Label>Target / max (optional)</Label>
-                  <Input type="number" min={0} value={target} onChange={(e) => setTarget(e.target.value)} placeholder="auto from value if empty" />
-                </div>
-              ) : (
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  <div className="grid gap-1.5">
-                    <Label>Sort</Label>
-                    <Select value={order} onValueChange={(v) => setOrder((v as "desc" | "asc" | "none") ?? "desc")}>
-                      <SelectTrigger><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="desc">Highest first</SelectItem>
-                        <SelectItem value="asc">Lowest first</SelectItem>
-                        <SelectItem value="none">Natural (by dimension)</SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="grid gap-1.5">
-                    <Label>Limit (Top N)</Label>
-                    <Input type="number" min={1} max={100} value={limit} onChange={(e) => setLimit(Math.max(1, Math.min(100, Number(e.target.value) || 20)))} />
-                  </div>
-                </div>
-              )}
-
-              {canBreakdown ? (
-                <div className="grid gap-1.5">
-                  <Label>{isHeatmap ? "2nd dimension (Y) — required" : "Breakdown / series (optional)"}</Label>
-                  <Select value={breakdown || "__none__"} onValueChange={(v) => setBreakdown(v === "__none__" ? "" : v ?? "")} disabled={!fields}>
-                    <SelectTrigger><SelectValue placeholder={isHeatmap ? "pick a 2nd column" : "no breakdown"} /></SelectTrigger>
-                    <SelectContent>
-                      {isHeatmap ? null : <SelectItem value="__none__">— no breakdown —</SelectItem>}
-                      {fields?.dimensions.filter((d) => d !== dimension).map((d) => <SelectItem key={d} value={d}>{d}</SelectItem>)}
-                    </SelectContent>
-                  </Select>
-                </div>
-              ) : null}
-            </>
-          )}
-
-          {error ? <p className="text-sm text-destructive">{error}</p> : null}
+            {/* Error sits beside the button that caused it, not at the end of a long form. */}
+            <DialogFooter className="items-center border-t border-border px-5 py-3">
+              {error ? <p role="alert" className="text-sm text-destructive sm:mr-auto">{error}</p> : null}
+              <DialogClose render={<Button variant="ghost" size="sm" />}>Cancel</DialogClose>
+              <Button size="sm" onClick={() => void save()} disabled={busy}>
+                {busy ? "Saving…" : isEdit ? "Save changes" : "Create chart"}
+              </Button>
+            </DialogFooter>
           </div>
-
-          <aside className="grid min-h-80 content-start gap-2 rounded-lg border border-border bg-muted/20 p-3">
-            <div>
-              <p className="text-sm font-medium">Preview</p>
-              <p className="text-xs text-muted-foreground">Updates automatically from the selected mart and columns.</p>
-            </div>
-            <div className="h-[320px] overflow-hidden rounded-md border border-border bg-card p-3">
-              {preview ? (
-                <TileBody spec={preview.spec} cell={preview.result} dark={resolvedTheme === "dark"} loading={previewBusy} year="all" />
-              ) : previewBusy ? (
-                <div className="h-full animate-pulse rounded bg-muted/50" />
-              ) : (
-                <div className="grid h-full place-content-center px-5 text-center text-xs text-muted-foreground">
-                  {previewError ?? (isText ? "Enter content to preview this note." : "Choose a mart and the required columns to see real data here.")}
-                </div>
-              )}
-            </div>
-          </aside>
         </div>
-
-        <DialogFooter>
-          <DialogClose render={<Button variant="ghost" size="sm" />}>Cancel</DialogClose>
-          <Button size="sm" onClick={() => void save()} disabled={busy}>
-            {busy ? "Saving…" : isEdit ? "Save changes" : "Create chart"}
-          </Button>
-        </DialogFooter>
-          </>
-        )}
       </DialogContent>
     </Dialog>
   );
