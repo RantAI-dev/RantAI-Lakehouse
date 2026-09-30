@@ -541,3 +541,74 @@ async fn list_pipelines_for_all_tenants_includes_unassigned_and_tenanted_rows(
     assert!(ids.contains(&tenanted.id.as_str()));
     Ok(())
 }
+
+// ── Pipeline SLA CRUD (plan 1f, migration `0050_pipeline_sla.sql`) ──────
+
+/// Reading a pipeline with no SLA returns `None`, not an empty struct.
+/// This is the contract `routes::pipelines::get_sla` relies on to decide
+/// between `200 {}` and `404`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_pipeline_sla_is_none_when_no_row_exists(pool: PgPool) -> sqlx::Result<()> {
+    let got = pipelines::get_pipeline_sla(&pool, "pl-never-set")
+        .await
+        .unwrap();
+    assert!(
+        got.is_none(),
+        "an unset SLA must read as None, not Some(empty)"
+    );
+    Ok(())
+}
+
+/// Upserting twice updates the row in place rather than appending, and
+/// `updated_at` moves forward. The PUT route calls this idempotently, so
+/// the audit trail records who set what last.
+#[sqlx::test(migrations = "../../migrations")]
+async fn upsert_pipeline_sla_round_trips_and_updates_in_place(pool: PgPool) -> sqlx::Result<()> {
+    let actor = Uuid::new_v4();
+
+    let first = pipelines::upsert_pipeline_sla(&pool, "pl-x", Some(600), Some(3_600), actor)
+        .await
+        .expect("first upsert should succeed");
+    assert_eq!(first.pipeline_id, "pl-x");
+    assert_eq!(first.max_duration_seconds, Some(600));
+    assert_eq!(first.late_after_seconds, Some(3_600));
+    assert_eq!(first.updated_by, actor);
+
+    let second = pipelines::upsert_pipeline_sla(&pool, "pl-x", Some(1_200), None, actor)
+        .await
+        .expect("second upsert should succeed");
+    assert_eq!(second.max_duration_seconds, Some(1_200));
+    assert_eq!(
+        second.late_after_seconds, None,
+        "passing None for late_after_seconds must clear the column"
+    );
+
+    let got = pipelines::get_pipeline_sla(&pool, "pl-x")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.max_duration_seconds, Some(1_200));
+    assert_eq!(got.late_after_seconds, None);
+    Ok(())
+}
+
+/// The CHECK constraints on `0050_pipeline_sla.sql` reject a zero
+/// threshold at the database, not just at the route. A SQL-level test
+/// pin guarantees that the constraint does not get dropped in a future
+/// migration — the route-level guard is defense in depth, not the only
+/// guarantee. We do not assert on the constraint name in the error
+/// message: `StoreError::Database` deliberately classifies the upstream
+/// text away (AGENTS.md rule 4), so the only honest check is "this
+/// operation failed at all."
+#[sqlx::test(migrations = "../../migrations")]
+async fn upsert_pipeline_sla_rejects_zero_thresholds_at_the_check_constraint(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let actor = Uuid::new_v4();
+    let result = pipelines::upsert_pipeline_sla(&pool, "pl-zero", Some(0), None, actor).await;
+    assert!(
+        result.is_err(),
+        "a zero max_duration_seconds must fail the CHECK constraint"
+    );
+    Ok(())
+}

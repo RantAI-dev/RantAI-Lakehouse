@@ -145,6 +145,24 @@ pub enum AlertKind {
     /// orchestrator's `run_failure_sensor` posting to the API, not a
     /// periodic `run_rules` evaluation. WS6 plan §3 (1e).
     PipelineFailure,
+    /// Fires when a successful pipeline run exceeded the pipeline's
+    /// `pipeline_sla.max_duration_seconds` (plan 1f). Evaluated by
+    /// [`evaluate_pipeline_run_finished`] from `run-finished` event
+    /// route, not by `run_rules`. No periodic trigger; one alert per
+    /// over-duration run.
+    PipelineSlow,
+    /// Fires when the pipeline's `pipeline_sla.late_after_seconds`
+    /// threshold is breached (no successful run within the window, or
+    /// never a success at all). Evaluated by `run_rules` from the
+    /// `/api/alerts/run` 15-minute pass, the same posture `freshness`
+    /// rules already take. Plan 1f.
+    PipelineLate,
+    /// Fires when a successful run reported a row count below half the
+    /// median of prior completed runs (with at least 5 prior samples;
+    /// fewer samples and the alert is skipped, never silently `false`).
+    /// Evaluated by [`evaluate_pipeline_run_finished`] from the
+    /// `run-finished` event route. Plan 1f.
+    PipelineVolumeDrop,
 }
 
 impl AlertKind {
@@ -156,6 +174,9 @@ impl AlertKind {
             Self::Digest => "digest",
             Self::Freshness => "freshness",
             Self::PipelineFailure => "pipeline_failure",
+            Self::PipelineSlow => "pipeline_slow",
+            Self::PipelineLate => "pipeline_late",
+            Self::PipelineVolumeDrop => "pipeline_volume_drop",
         }
     }
 }
@@ -352,6 +373,9 @@ fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError>
         Some("digest") => AlertKind::Digest,
         Some("freshness") => AlertKind::Freshness,
         Some("pipeline_failure") => AlertKind::PipelineFailure,
+        Some("pipeline_slow") => AlertKind::PipelineSlow,
+        Some("pipeline_late") => AlertKind::PipelineLate,
+        Some("pipeline_volume_drop") => AlertKind::PipelineVolumeDrop,
         _ => AlertKind::Alert,
     };
     let channel = if input.channel.as_deref() == Some("email") {
@@ -401,6 +425,12 @@ fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError>
         normalize_freshness(input, common)
     } else if kind == AlertKind::PipelineFailure {
         normalize_pipeline_failure(input, common)
+    } else if kind == AlertKind::PipelineSlow {
+        normalize_pipeline_scoped(input, common, "pipeline_slow")
+    } else if kind == AlertKind::PipelineLate {
+        normalize_pipeline_scoped(input, common, "pipeline_late")
+    } else if kind == AlertKind::PipelineVolumeDrop {
+        normalize_pipeline_scoped(input, common, "pipeline_volume_drop")
     } else {
         normalize_digest(input, common)
     }
@@ -519,17 +549,7 @@ fn normalize_pipeline_failure(
     input: &AlertRuleInput,
     common: NormalizedCommon,
 ) -> Result<NormalizedRule, AlertError> {
-    let raw = input.pipeline.as_deref().unwrap_or("").trim().to_owned();
-    if raw.is_empty() {
-        return Err(AlertError::Validation(
-            "pipeline_failure requires a pipeline id or \"*\".".to_owned(),
-        ));
-    }
-    if raw != "*" && !raw.starts_with("pl-") {
-        return Err(AlertError::Validation(
-            "pipeline_failure pipeline must be a pl-... id or \"*\".".to_owned(),
-        ));
-    }
+    let raw = validate_pipeline_scoped(input, "pipeline_failure")?;
     Ok(NormalizedRule {
         name: common.name,
         kind: common.kind,
@@ -544,6 +564,50 @@ fn normalize_pipeline_failure(
         severity: common.severity,
         pipeline: raw,
     })
+}
+
+/// Plan 1f: `pipeline_slow`, `pipeline_late`, and `pipeline_volume_drop`
+/// rules share the same pipeline-id contract as `pipeline_failure` —
+/// either a `pl-...` id (scoped to one pipeline) or `"*"` (every
+/// pipeline) — so they share this validator.
+fn normalize_pipeline_scoped(
+    input: &AlertRuleInput,
+    common: NormalizedCommon,
+    kind_label: &str,
+) -> Result<NormalizedRule, AlertError> {
+    let raw = validate_pipeline_scoped(input, kind_label)?;
+    Ok(NormalizedRule {
+        name: common.name,
+        kind: common.kind,
+        channel: common.channel,
+        target: common.target,
+        mart: String::new(),
+        measure: String::new(),
+        agg: "sum".to_owned(),
+        op: AlertOp::Gt,
+        threshold: 0.0,
+        board: String::new(),
+        severity: common.severity,
+        pipeline: raw,
+    })
+}
+
+fn validate_pipeline_scoped(
+    input: &AlertRuleInput,
+    kind_label: &str,
+) -> Result<String, AlertError> {
+    let raw = input.pipeline.as_deref().unwrap_or("").trim().to_owned();
+    if raw.is_empty() {
+        return Err(AlertError::Validation(format!(
+            "{kind_label} requires a pipeline id or \"*\"."
+        )));
+    }
+    if raw != "*" && !raw.starts_with("pl-") {
+        return Err(AlertError::Validation(format!(
+            "{kind_label} pipeline must be a pl-... id or \"*\"."
+        )));
+    }
+    Ok(raw)
 }
 
 /// Unchanged from today's behavior.
@@ -683,6 +747,9 @@ fn row_to_rule(row: &Map<String, Value>) -> AlertRule {
         "digest" => AlertKind::Digest,
         "freshness" => AlertKind::Freshness,
         "pipeline_failure" => AlertKind::PipelineFailure,
+        "pipeline_slow" => AlertKind::PipelineSlow,
+        "pipeline_late" => AlertKind::PipelineLate,
+        "pipeline_volume_drop" => AlertKind::PipelineVolumeDrop,
         _ => AlertKind::Alert,
     };
     let channel = if row_str(row, "channel") == "email" {
@@ -1049,6 +1116,41 @@ pub trait SilenceSource: Send + Sync {
     async fn is_silenced(&self, rule_id: &str) -> bool;
 }
 
+/// Plan 1f source for the "is this pipeline currently late" decision:
+/// the `late_after_seconds` from `pipeline_sla` for `pipeline_id`, and
+/// the Unix-epoch seconds of its most recent successful run (`None` when
+/// it has never succeeded). Injected by the caller
+/// (`routes::alerts::run`) so this crate stays free of Postgres: the
+/// real implementation is `routes::alerts::ApiLateSource`.
+///
+/// Return shape: a `Result<Option<(i32, Option<f64>)>, String>` where:
+/// * the inner `Option` is `Some` only when a SLA row exists for this
+///   pipeline — a missing row is a config gap, NOT a "not late" claim;
+/// * the `i32` is the SLA's `late_after_seconds` (already validated as
+///   positive at the API layer);
+/// * the `Option<f64>` is the last successful run's epoch seconds, or
+///   `None` when no SUCCESS run is on record yet — the [`late`] helper
+///   treats that as "definitely late, threshold set".
+///
+/// # Errors
+///
+/// A classified error string (e.g. a Postgres connection failure
+/// already mapped to "database error") — never an upstream detail;
+/// implementations classify before returning.
+#[async_trait::async_trait]
+pub trait LateSource: Send + Sync {
+    /// `Some((threshold, last_success_seconds))` when a `pipeline_sla`
+    /// row exists for `pipeline_id`; `None` when it does not (a config
+    /// gap, not a "not late" claim).
+    ///
+    /// # Errors
+    ///
+    /// A classified error string (e.g. a Postgres connection failure
+    /// already mapped to "database error") — never an upstream detail;
+    /// implementations classify before returning.
+    async fn late_inputs(&self, pipeline_id: &str) -> Result<Option<(i32, Option<f64>)>, String>;
+}
+
 /// Governance gate every statement this crate runs goes through, injected
 /// by the caller like [`SilenceSource`] so this crate stays free of the
 /// API's policy engine. Required, not optional: an alert value or a digest
@@ -1065,6 +1167,237 @@ pub trait SqlGate: Send + Sync {
     /// A fixed, non-leaking refusal message when `sql` may not run; the
     /// caller skips that value rather than running anything else.
     async fn gate(&self, sql: &str) -> Result<String, String>;
+}
+
+/// Plan 1f pure helper: "is this pipeline currently late?" Lives here
+/// (in the `lakehouse-alerts` crate) because both the routes API
+/// (`routes::pipelines::dagster_pipeline_row`) and this crate's
+/// [`evaluate_pipeline_late`] need the exact same logic. STRICT
+/// inequality: `gap == late_after_seconds` is NOT late — same rule
+/// the runs route enforces, mutation-tested by the
+/// `late_is_false_when_gap_is_exactly_the_threshold` test below.
+///
+/// * `now_seconds = None` — returns `None`: without a clock, "late"
+///   is not a claim this function can make.
+/// * `late_after_seconds = None` — returns `None`: no threshold set,
+///   so "late" is undefined for this pipeline.
+/// * `last_success_seconds = None` AND a threshold IS set — returns
+///   `Some(true)`: the pipeline has a threshold and has never had a
+///   successful run, so it is by definition late.
+#[must_use]
+pub fn late(
+    now_seconds: Option<f64>,
+    last_success_seconds: Option<f64>,
+    late_after_seconds: Option<i32>,
+) -> Option<bool> {
+    let late_after = late_after_seconds?;
+    let now = now_seconds?;
+    match last_success_seconds {
+        None => Some(true),
+        Some(last) => {
+            // Strict `>`: gap == threshold is *not* late.
+            let gap = now - last;
+            Some(gap > f64::from(late_after))
+        }
+    }
+}
+
+/// Plan 1f entry point: deliver every enabled [`AlertKind::PipelineLate`]
+/// rule whose `pipeline` matches `pipeline_id` (or `*`). Unlike
+/// [`evaluate_pipeline_failure`] and [`evaluate_pipeline_run_finished`],
+/// this is called by `/api/alerts/run` (the 15-minute pass) rather than
+/// an event route — "late" is a clock-relative claim, and the clock
+/// ticks on the schedule of the op, not the orchestrator.
+///
+/// The route handler provides a [`LateSource`] (a Postgres-backed
+/// implementation) that returns `(late_after_seconds, last_success_seconds)`
+/// for the pipeline id. With `None` returned by the source (no SLA row),
+/// the matching rules are skipped with an honest `unsupported` reason —
+/// a missing SLA is a config gap, not a "not late" claim. With
+/// `Some(threshold, last)` and [`late`] returning `None` (the function
+/// could not decide), the rules are also skipped.
+///
+/// # Errors
+///
+/// Returns [`ChError`] only if [`list_rules`] itself fails (e.g.
+/// `ClickHouse` unreachable). A classified error from the [`LateSource`]
+/// (e.g. a Postgres failure already mapped to "database error" by the
+/// caller) is propagated as [`AlertError::Validation`], because the
+/// message is already classified at the source and never reaches the
+/// response body raw — the route handler renders it as a 500 with that
+/// fixed message. Per-rule delivery failures are reported via
+/// [`DeliverResult`] inside `deliver_unless_silenced`, never propagated.
+pub async fn evaluate_pipeline_late(
+    ch: &ChClient,
+    http: &reqwest::Client,
+    email: &EmailSender,
+    pipeline_id: &str,
+    late_source: Option<&dyn LateSource>,
+    silence: Option<&dyn SilenceSource>,
+    now_seconds: Option<f64>,
+) -> Result<usize, PipelineLateError> {
+    // Resolve the "is this pipeline late?" inputs from the source.
+    // `None` source means the route handler could not provide one (e.g.
+    // Postgres unconfigured) — every `pipeline_late` rule is skipped
+    // rather than silently dropped.
+    let inputs = match late_source {
+        None => return Ok(0),
+        Some(src) => match src.late_inputs(pipeline_id).await {
+            Ok(Some(inputs)) => Some(inputs),
+            Ok(None) => None, // No SLA row — every rule is unsupported.
+            Err(err) => {
+                // Classified upstream error from the source — propagate
+                // to the caller so it surfaces a 500 (not a false-skip).
+                return Err(PipelineLateError::Source(err));
+            }
+        },
+    };
+    let late_decision = match inputs {
+        Some((threshold, last_success)) => late(now_seconds, last_success, Some(threshold)),
+        None => None,
+    };
+
+    let rules: Vec<AlertRule> = list_rules(ch)
+        .await?
+        .into_iter()
+        .filter(|r| {
+            r.enabled
+                && r.kind == AlertKind::PipelineLate
+                && r.pipeline
+                    .as_deref()
+                    .is_some_and(|p| p == pipeline_id || p == "*")
+        })
+        .collect();
+
+    let mut delivered = 0_usize;
+    for rule in &rules {
+        let text = match late_decision {
+            Some(true) => format!(
+                "Pipeline {pipeline_id} has not had a successful run within its late \
+                 threshold. View: /pipelines/{pipeline_id}"
+            ),
+            // `Some(false)` and `None` both skip: a missing SLA, or a
+            // successful run within the threshold, is not a "late"
+            // claim. Same `skipped` posture [`run_freshness`] takes for
+            // a missing dataset SLA — honest, not silent.
+            Some(false) | None => continue,
+        };
+        let title = format!("⏰ Pipeline late: {}", rule.name);
+        if let Some(DeliverResult { .. }) =
+            deliver_unless_silenced(http, email, silence, rule, &title, &text).await
+        {
+            delivered += 1;
+        }
+    }
+    Ok(delivered)
+}
+
+/// Errors [`evaluate_pipeline_late`] can return. Two flavours:
+/// * `ListRules(ChError)` — `ClickHouse` unreachable while listing
+///   alert rules (mirrors the sibling functions' `ChError` return);
+/// * `Source(String)` — a classified error from the [`LateSource`]
+///   implementation (the message is already classified by the source
+///   before this crate sees it).
+#[derive(Debug, Error)]
+pub enum PipelineLateError {
+    /// `ClickHouse` unreachable while listing alert rules (mirrors the
+    /// sibling functions' `ChError` return).
+    #[error(transparent)]
+    ListRules(#[from] ChError),
+    /// A classified error from the [`LateSource`] implementation — the
+    /// message is already classified by the source before this crate
+    /// sees it, so it is safe to surface through the route handler.
+    #[error("{0}")]
+    Source(String),
+}
+
+/// Plan 1f entry point: deliver every enabled [`AlertKind::PipelineSlow`]
+/// and [`AlertKind::PipelineVolumeDrop`] rule whose `pipeline` matches
+/// `pipeline_id`. The route handler (mirroring `evaluate_pipeline_failure`'s
+/// flow) computes the two per-run outcomes itself — `slow` from the run's
+/// own `durationSeconds` vs the pipeline's `pipeline_sla.max_duration_seconds`,
+/// `volume_drop` from the row count vs the median of the prior 5+ completed
+/// runs — and passes the booleans in. A `None` for either outcome means the
+/// rule kind cannot decide (e.g. `volume_drop` with fewer than 5 prior
+/// samples): the matching rules are SKIPPED in that case, never fired or
+/// silently dropped. `slow` can never be `None` once a `max_duration_seconds`
+/// exists, so it is required.
+///
+/// # Errors
+///
+/// Returns [`ChError`] only if [`list_rules`] itself fails (e.g.
+/// `ClickHouse` unreachable). Per-rule delivery failures are reported via
+/// [`DeliverResult`] inside `deliver_unless_silenced`, never propagated.
+pub async fn evaluate_pipeline_run_finished(
+    ch: &ChClient,
+    http: &reqwest::Client,
+    email: &EmailSender,
+    pipeline_id: &str,
+    run_id: &str,
+    slow: Option<bool>,
+    volume_drop: Option<bool>,
+    silence: Option<&dyn SilenceSource>,
+) -> Result<usize, ChError> {
+    let console_link = format!("/pipelines/{pipeline_id}?run={run_id}");
+    // Build one message per kind that fired. Rules that don't match
+    // `pipeline_id` (or `*`) are filtered below; here we only need the
+    // per-rule delivery text.
+    let slow_text = if slow == Some(true) {
+        Some(format!(
+            "Pipeline {pipeline_id} run {run_id} exceeded its duration SLA. View: {console_link}"
+        ))
+    } else {
+        None
+    };
+    let volume_drop_text = if volume_drop == Some(true) {
+        Some(format!(
+            "Pipeline {pipeline_id} run {run_id} processed fewer than half the median \
+             rows of its prior runs. View: {console_link}"
+        ))
+    } else {
+        None
+    };
+    let rules: Vec<AlertRule> = list_rules(ch)
+        .await?
+        .into_iter()
+        .filter(|r| {
+            r.enabled
+                && matches!(
+                    r.kind,
+                    AlertKind::PipelineSlow | AlertKind::PipelineVolumeDrop
+                )
+                && r.pipeline
+                    .as_deref()
+                    .is_some_and(|p| p == pipeline_id || p == "*")
+        })
+        .collect();
+    let mut delivered = 0_usize;
+    for rule in &rules {
+        let text = match rule.kind {
+            AlertKind::PipelineSlow => slow_text.as_deref(),
+            AlertKind::PipelineVolumeDrop => volume_drop_text.as_deref(),
+            _ => None,
+        };
+        // `text == None` means "this rule's kind could not decide on this
+        // run" (no SLA for slow; fewer than 5 prior samples for
+        // volume_drop). Skip rather than fire or silently drop — same
+        // posture [`run_freshness`] takes for a missing dataset SLA.
+        let Some(text) = text else {
+            continue;
+        };
+        let title = match rule.kind {
+            AlertKind::PipelineSlow => format!("🐢 Pipeline slow: {}", rule.name),
+            AlertKind::PipelineVolumeDrop => format!("📉 Pipeline volume drop: {}", rule.name),
+            // Unreachable: `rules` is filtered to the two kinds above.
+            _ => continue,
+        };
+        if let Some(DeliverResult { .. }) =
+            deliver_unless_silenced(http, email, silence, rule, &title, text).await
+        {
+            delivered += 1;
+        }
+    }
+    Ok(delivered)
 }
 
 /// Plan 1e entry point: deliver every enabled [`AlertKind::PipelineFailure`]
@@ -1201,6 +1534,26 @@ async fn run_one(
         AlertKind::PipelineFailure => skipped(
             rule,
             "pipeline_failure rules are evaluated by the run-failed event route, not run_rules"
+                .to_owned(),
+        ),
+        AlertKind::PipelineSlow | AlertKind::PipelineVolumeDrop => skipped(
+            rule,
+            "pipeline_slow / pipeline_volume_drop rules are evaluated by the run-finished \
+             event route, not run_rules"
+                .to_owned(),
+        ),
+        // Plan 1f: `pipeline_late` is evaluated by the `/api/alerts/run`
+        // 15-minute pass, but the "is this pipeline currently late"
+        // check needs Postgres access (SLA + last-success timestamp),
+        // which `run_one` does not have. The route handler runs the
+        // pipeline-specific evaluation directly and skips the rule here
+        // so `run_rules`'s count stays an honest count of *its own*
+        // work. The matching arm in `routes::alerts::run` is wired to
+        // deliver on every `pipeline_late` rule whose pipeline is
+        // currently late.
+        AlertKind::PipelineLate => skipped(
+            rule,
+            "pipeline_late rules are evaluated by /api/alerts/run after run_rules returns"
                 .to_owned(),
         ),
     }
@@ -1420,6 +1773,50 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
 
     use super::*;
+
+    // ── `late` helper (plan 1f) ─────────────────────────────────────────
+    //
+    // These tests live here because the helper now does. They used to
+    // live in `lakehouse-api::routes::pipelines::tests::sla_volume_helpers`;
+    // moving the implementation here means moving the tests too — and
+    // keeping them under the helper keeps the mutation check (strict
+    // `>`) honest.
+
+    #[test]
+    fn late_is_none_when_no_late_threshold_is_set() {
+        assert_eq!(late(Some(1_000.0), Some(900.0), None), None);
+    }
+
+    #[test]
+    fn late_is_none_without_a_clock_to_measure_against() {
+        assert_eq!(late(None, Some(900.0), Some(60)), None);
+    }
+
+    #[test]
+    fn late_is_none_when_neither_threshold_nor_clock_anchors_the_decision() {
+        assert_eq!(late(None, None, None), None);
+    }
+
+    #[test]
+    fn late_is_true_when_a_threshold_is_set_but_no_run_has_ever_succeeded() {
+        assert_eq!(late(Some(1_000.0), None, Some(60)), Some(true));
+    }
+
+    #[test]
+    fn late_is_false_when_gap_is_under_the_threshold() {
+        assert_eq!(late(Some(1_000.0), Some(950.0), Some(60)), Some(false));
+    }
+
+    #[test]
+    fn late_is_true_when_gap_is_over_the_threshold() {
+        assert_eq!(late(Some(1_000.0), Some(700.0), Some(200)), Some(true));
+    }
+
+    #[test]
+    fn late_is_false_when_gap_is_exactly_the_threshold() {
+        // Strict `>`: gap == threshold is NOT late.
+        assert_eq!(late(Some(1_000.0), Some(800.0), Some(200)), Some(false));
+    }
 
     // ── SqlGate ──────────────────────────────────────────────────────────
 
@@ -2260,6 +2657,359 @@ mod tests {
             }],
             "rows": 1,
         })
+    }
+
+    // ── `evaluate_pipeline_late` (plan 1f) ───────────────────────────────
+
+    /// A small in-process [`LateSource`] the tests below drive: a
+    /// pre-built map of `(threshold_seconds, last_success_epoch_seconds)`
+    /// keyed by pipeline id. Anything not in the map returns
+    /// `Ok(None)` — the "no SLA row" path that [`evaluate_pipeline_late`]
+    /// treats as `unsupported` for every matching rule.
+    struct FixedLateSource(std::collections::HashMap<String, (i32, Option<f64>)>);
+
+    #[async_trait::async_trait]
+    impl LateSource for FixedLateSource {
+        async fn late_inputs(
+            &self,
+            pipeline_id: &str,
+        ) -> Result<Option<(i32, Option<f64>)>, String> {
+            Ok(self.0.get(pipeline_id).map(|(t, l)| (*t, *l)))
+        }
+    }
+
+    fn pipeline_late_rule_row_json(
+        id: &str,
+        name: &str,
+        pipeline: &str,
+        target: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "meta": [],
+            "data": [{
+                "id": id,
+                "name": name,
+                "type": "pipeline_late",
+                "mart": "",
+                "measure": "",
+                "agg": "",
+                "op": "",
+                "threshold": "0",
+                "board": "",
+                "channel": "webhook",
+                "target": target,
+                "enabled": "1",
+                "created_at": "",
+                "severity": "",
+                "pipeline": pipeline,
+            }],
+            "rows": 1,
+        })
+    }
+
+    /// A late pipeline (no last-success within the threshold) DOES fire
+    /// the matching rule with the route's text shape — no Dagster
+    /// details, a relative console link.
+    #[tokio::test]
+    async fn evaluate_pipeline_late_delivers_when_threshold_is_breached() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let webhook = format!("{}/hooks/late", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/hooks/late"))
+            .and(body_string_contains("pl-orders"))
+            .and(body_string_contains("/pipelines/pl-orders"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(pipeline_late_rule_row_json(
+                    "al_pl1",
+                    "Orders late",
+                    "pl-orders",
+                    &webhook,
+                )),
+            )
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        save_rule(
+            &ch,
+            &AlertRuleInput {
+                name: Some("Orders late".to_owned()),
+                kind: Some("pipeline_late".to_owned()),
+                target: Some(webhook.clone()),
+                channel: Some("webhook".to_owned()),
+                pipeline: Some("pl-orders".to_owned()),
+                ..AlertRuleInput::default()
+            },
+            Some("al_pl1"),
+        )
+        .await
+        .unwrap();
+
+        // Threshold 60 s, last success 600 s ago → definitely late.
+        let mut map = std::collections::HashMap::new();
+        map.insert("pl-orders".to_owned(), (60_i32, Some(1_000.0_f64 - 600.0)));
+        let source = FixedLateSource(map);
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let matched = evaluate_pipeline_late(
+            &ch,
+            &http,
+            &email,
+            "pl-orders",
+            Some(&source),
+            None,
+            Some(1_000.0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(matched, 1);
+    }
+
+    /// A pipeline with a SUCCESS run inside the threshold does NOT
+    /// fire — the route handler must skip rather than silently
+    /// passing.
+    #[tokio::test]
+    async fn evaluate_pipeline_late_does_not_fire_when_within_threshold() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let webhook = format!("{}/never", server.uri());
+        // Only the catch-all ClickHouse mock; no webhook matcher.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(pipeline_late_rule_row_json(
+                    "al_pl2",
+                    "Within threshold",
+                    "pl-orders",
+                    &webhook,
+                )),
+            )
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        save_rule(
+            &ch,
+            &AlertRuleInput {
+                name: Some("Within threshold".to_owned()),
+                kind: Some("pipeline_late".to_owned()),
+                target: Some(webhook),
+                channel: Some("webhook".to_owned()),
+                pipeline: Some("pl-orders".to_owned()),
+                ..AlertRuleInput::default()
+            },
+            Some("al_pl2"),
+        )
+        .await
+        .unwrap();
+
+        // Last success 30 s ago, threshold 60 s → not late.
+        let mut map = std::collections::HashMap::new();
+        map.insert("pl-orders".to_owned(), (60_i32, Some(1_000.0_f64 - 30.0)));
+        let source = FixedLateSource(map);
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let matched = evaluate_pipeline_late(
+            &ch,
+            &http,
+            &email,
+            "pl-orders",
+            Some(&source),
+            None,
+            Some(1_000.0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(matched, 0);
+    }
+
+    /// A pipeline with NO SLA row (`late_inputs` returns `None`) does
+    /// not fire — the "config gap" path. Plan 1f rule: never silently
+    /// fire on missing config.
+    #[tokio::test]
+    async fn evaluate_pipeline_late_does_not_fire_when_no_sla_row_exists() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let webhook = format!("{}/never", server.uri());
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(pipeline_late_rule_row_json(
+                    "al_pl3",
+                    "No SLA",
+                    "pl-orders",
+                    &webhook,
+                )),
+            )
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        save_rule(
+            &ch,
+            &AlertRuleInput {
+                name: Some("No SLA".to_owned()),
+                kind: Some("pipeline_late".to_owned()),
+                target: Some(webhook),
+                channel: Some("webhook".to_owned()),
+                pipeline: Some("pl-orders".to_owned()),
+                ..AlertRuleInput::default()
+            },
+            Some("al_pl3"),
+        )
+        .await
+        .unwrap();
+
+        let source = FixedLateSource(std::collections::HashMap::new());
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let matched = evaluate_pipeline_late(
+            &ch,
+            &http,
+            &email,
+            "pl-orders",
+            Some(&source),
+            None,
+            Some(1_000.0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(matched, 0);
+    }
+
+    /// A pipeline with no recorded SUCCESS run AND a threshold IS
+    /// set IS late — same posture as the runs route's
+    /// `late_is_true_when_a_threshold_is_set_but_no_run_has_ever_succeeded`.
+    #[tokio::test]
+    async fn evaluate_pipeline_late_fires_when_no_success_run_with_a_threshold() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let webhook = format!("{}/hooks/late-no-success", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/hooks/late-no-success"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(pipeline_late_rule_row_json(
+                    "al_pl4",
+                    "Never succeeded",
+                    "pl-orders",
+                    &webhook,
+                )),
+            )
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        save_rule(
+            &ch,
+            &AlertRuleInput {
+                name: Some("Never succeeded".to_owned()),
+                kind: Some("pipeline_late".to_owned()),
+                target: Some(webhook.clone()),
+                channel: Some("webhook".to_owned()),
+                pipeline: Some("pl-orders".to_owned()),
+                ..AlertRuleInput::default()
+            },
+            Some("al_pl4"),
+        )
+        .await
+        .unwrap();
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("pl-orders".to_owned(), (60_i32, None));
+        let source = FixedLateSource(map);
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let matched = evaluate_pipeline_late(
+            &ch,
+            &http,
+            &email,
+            "pl-orders",
+            Some(&source),
+            None,
+            Some(1_000.0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(matched, 1);
+    }
+
+    /// Wildcard `*` rules DO match — same convention every other
+    /// pipeline-scoped kind uses. Plan 1f does not differentiate.
+    #[tokio::test]
+    async fn evaluate_pipeline_late_matches_the_wildcard_star_rule() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let webhook = format!("{}/hooks/wildcard-late", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/hooks/wildcard-late"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(pipeline_late_rule_row_json(
+                    "al_pl5", "Any late", "*", &webhook,
+                )),
+            )
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        save_rule(
+            &ch,
+            &AlertRuleInput {
+                name: Some("Any late".to_owned()),
+                kind: Some("pipeline_late".to_owned()),
+                target: Some(webhook.clone()),
+                channel: Some("webhook".to_owned()),
+                pipeline: Some("*".to_owned()),
+                ..AlertRuleInput::default()
+            },
+            Some("al_pl5"),
+        )
+        .await
+        .unwrap();
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "pl-some-other".to_owned(),
+            (60_i32, Some(1_000.0_f64 - 600.0)),
+        );
+        let source = FixedLateSource(map);
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let matched = evaluate_pipeline_late(
+            &ch,
+            &http,
+            &email,
+            "pl-some-other",
+            Some(&source),
+            None,
+            Some(1_000.0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(matched, 1);
     }
 
     // ── run_freshness (WS5 item C1, Step 6) ─────────────────────────────

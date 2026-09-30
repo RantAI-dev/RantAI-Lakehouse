@@ -4,6 +4,7 @@
 //! Ports `src/app/api/alerts/route.ts` and
 //! `src/app/api/alerts/run/route.ts`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -11,7 +12,7 @@ use axum::extract::{Extension, Query, State};
 use axum::http::HeaderMap;
 use iceberg::{NamespaceIdent, TableIdent};
 use lakehouse_alerts::{
-    AlertKind, AlertRule, AlertRuleInput, FreshnessSource, SilenceSource, SqlGate,
+    AlertKind, AlertRule, AlertRuleInput, FreshnessSource, LateSource, SilenceSource, SqlGate,
 };
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
@@ -264,6 +265,50 @@ pub(in crate::routes) struct ApiSqlGate<'a> {
     pub(in crate::routes) ch: &'a lakehouse_clickhouse::ChClient,
 }
 
+/// Plan 1f: [`LateSource`] backed by Postgres (for the SLA row) and a
+/// pre-fetched map of last-success epoch seconds per pipeline id
+/// (populated by the route handler from the Dagster client, so this
+/// crate stays free of the Dagster SDK). When Postgres is not
+/// configured, or when either query fails, the error message is
+/// classified ("database error") before returning — never an upstream
+/// detail, matching AGENTS.md rule 4.
+pub(in crate::routes) struct ApiLateSource<'a> {
+    pub(in crate::routes) pg: &'a PgPool,
+    /// `pipeline_id → last successful run's Unix-epoch seconds`. `None`
+    /// entry means "no SUCCESS run on record yet" — the [`late`] helper
+    /// treats that as "definitely late, threshold set".
+    pub(in crate::routes) last_success: HashMap<String, Option<f64>>,
+}
+
+#[async_trait::async_trait]
+impl LateSource for ApiLateSource<'_> {
+    async fn late_inputs(&self, pipeline_id: &str) -> Result<Option<(i32, Option<f64>)>, String> {
+        // SLA row first: without a threshold the answer is "config gap",
+        // not "not late". `get_pipeline_sla` already classifies its
+        // error → `Ok(None)` for missing rows, `Err("database error")`
+        // for transport failures.
+        let sla = match lakehouse_store::pipelines::get_pipeline_sla(self.pg, pipeline_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return Ok(None),
+            Err(_) => return Err("database error".to_owned()),
+        };
+        let threshold = match sla.late_after_seconds {
+            Some(t) if t > 0 => t,
+            // `late_after_seconds = NULL` (only `max_duration_seconds`
+            // set) — there is no "late" claim to make for this
+            // pipeline.
+            _ => return Ok(None),
+        };
+        // The route handler pre-fetches last-success epoch seconds
+        // per pipeline. A missing key means the Dagster round-trip
+        // didn't include this pipeline id — treat it as "no SUCCESS
+        // run on record," not as an error: that's the same posture a
+        // missing key would have if Dagster had no runs for the job.
+        let last = self.last_success.get(pipeline_id).copied().unwrap_or(None);
+        Ok(Some((threshold, last)))
+    }
+}
+
 #[async_trait::async_trait]
 impl SqlGate for ApiSqlGate<'_> {
     async fn gate(&self, sql: &str) -> Result<String, String> {
@@ -289,6 +334,9 @@ fn fired_source(kind: AlertKind) -> &'static str {
         AlertKind::Freshness => "Freshness monitoring",
         AlertKind::Digest => "Digest", // never reached: callers filter Digest out before this
         AlertKind::PipelineFailure => "Pipeline failures", // never reached: callers filter PipelineFailure out before this
+        AlertKind::PipelineSlow => "Pipeline SLA: duration",
+        AlertKind::PipelineLate => "Pipeline SLA: late",
+        AlertKind::PipelineVolumeDrop => "Pipeline SLA: volume drop",
     }
 }
 
@@ -310,9 +358,17 @@ fn fired_detail(rule: &AlertRule, value: Option<f64>) -> String {
             rule.op.as_str(),
             rule.threshold
         ),
-        // PipelineFailure rules fire from the `run-failed` event route,
-        // never `run_rules`; the detail isn't used for them.
+        // PipelineFailure / PipelineSlow / PipelineVolumeDrop rules fire
+        // from the event routes, never `run_rules`; the detail isn't
+        // used for them.
         AlertKind::PipelineFailure => "pipeline failure".to_owned(),
+        AlertKind::PipelineSlow => "pipeline run exceeded its duration SLA".to_owned(),
+        AlertKind::PipelineLate => {
+            "pipeline is late (no successful run within the SLA window)".to_owned()
+        }
+        AlertKind::PipelineVolumeDrop => {
+            "pipeline run processed fewer than half the median rows of prior runs".to_owned()
+        }
     }
 }
 
@@ -469,7 +525,134 @@ pub async fn run(
         persist_fired_results(pg, &state.clickhouse, &results).await;
     }
 
+    // Plan 1f: `pipeline_late` rules fire from this op, not from the
+    // orchestrator event path. A "late" claim depends on the clock at
+    // evaluation time, not at run time. The route handler iterates
+    // every enabled `pipeline_late` rule whose `pipeline` names a
+    // specific pipeline id (the `*` wildcard is not yet wired for
+    // pipeline_late — it would require enumerating every runnable
+    // pipeline here, which is the plan's next-step scope, not this
+    // commit's) and calls [`evaluate_pipeline_late`] per pipeline.
+    // The matching `run_rules` entries (each a `skipped` with the
+    // reason "pipeline_late rules are evaluated by /api/alerts/run...")
+    // stay in the response, so the user sees both the rule list and
+    // the per-pipeline deliveries.
+    if let Some(pg) = state.pg.as_deref() {
+        let late_rule_pipelines = list_late_rule_pipelines(&state.clickhouse).await?;
+        if !late_rule_pipelines.is_empty() {
+            let last_success =
+                fetch_last_success_per_pipeline(&state.dagster, &late_rule_pipelines).await;
+            let late_source = ApiLateSource { pg, last_success };
+            let now_seconds = now_unix_seconds();
+            for pipeline_id in &late_rule_pipelines {
+                lakehouse_alerts::evaluate_pipeline_late(
+                    &state.clickhouse,
+                    &http,
+                    &email,
+                    pipeline_id,
+                    Some(&late_source as &dyn lakehouse_alerts::LateSource),
+                    silence_source.as_ref().map(|s| s as &dyn SilenceSource),
+                    Some(now_seconds),
+                )
+                .await
+                .map_err(|err| ApiError::Internal(format!("{err}")))?;
+            }
+        }
+    }
+
     Ok(ApiJson(json!({ "ran": results.len(), "results": results })))
+}
+
+/// Plan 1f: list every distinct `pipeline_id` referenced by an enabled
+/// `pipeline_late` rule with a non-`None`, non-`"*"` `pipeline` field.
+/// Used by [`run`] to drive [`evaluate_pipeline_late`]. Filters
+/// in-process from `list_rules` to avoid a second `ClickHouse`
+/// round-trip and a second schema surface
+/// (`pipeline_late_rule_pipelines`) — the underlying query is the same
+/// `console.alert_rule` SELECT.
+///
+/// # Errors
+///
+/// Returns `Err("database error")` on a `ClickHouse` failure — never an
+/// upstream detail, matching AGENTS.md rule 4.
+async fn list_late_rule_pipelines(
+    ch: &lakehouse_clickhouse::ChClient,
+) -> Result<Vec<String>, ApiError> {
+    let rules = lakehouse_alerts::list_rules(ch)
+        .await
+        .map_err(|_| ApiError::Internal("database error".to_owned()))?;
+    let mut out: Vec<String> = rules
+        .into_iter()
+        .filter(|r| {
+            r.enabled
+                && r.kind == lakehouse_alerts::AlertKind::PipelineLate
+                && r.pipeline
+                    .as_deref()
+                    .is_some_and(|p| !p.is_empty() && p != "*")
+        })
+        .filter_map(|r| r.pipeline)
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Plan 1f: pull `last_success_epoch_seconds` for every pipeline id in
+/// `pipeline_ids` from the Dagster client (one round-trip per id, the
+/// same call [`routes::pipelines`] uses for the runs/detail rows). A
+/// per-pipeline failure (e.g. Dagster temporarily unreachable) is
+/// captured as `None` for that id, matching the same posture
+/// `routes::pipelines::last_success_for` takes for a missing run — a
+/// missing last-success is then treated by [`late`] as "definitely
+/// late, threshold set," which is the honest answer when a pipeline's
+/// orchestrator is silent.
+async fn fetch_last_success_per_pipeline(
+    dagster: &lakehouse_dagster::DgClient,
+    pipeline_ids: &[String],
+) -> HashMap<String, Option<f64>> {
+    let mut out = HashMap::new();
+    for id in pipeline_ids {
+        let job_name = job_name_for_pipeline_id(id);
+        let last = dagster
+            .list_runs_for_job(&job_name, 30)
+            .await
+            .ok()
+            .and_then(|runs| last_success_epoch_for(&runs, &job_name));
+        out.insert(id.clone(), last);
+    }
+    out
+}
+
+/// Plan 1f: the Dagster job name for `pipeline_id`. Mirrors
+/// `routes::pipelines::list_body`'s own `authored__<id>` mapping —
+/// `evaluate_pipeline_late` runs against the same `authored__*` jobs
+/// the orchestrator launches. `*` is not supported here (see
+/// [`list_late_rule_pipelines`]).
+fn job_name_for_pipeline_id(pipeline_id: &str) -> String {
+    format!("authored__{pipeline_id}")
+}
+
+/// Plan 1f: the most recent SUCCESS run's epoch seconds for `job_name`
+/// in `runs`. `None` when no SUCCESS run is present. Mirrors the same
+/// pattern as `routes::pipelines::last_success_for` but returns the
+/// epoch seconds directly.
+fn last_success_epoch_for(runs: &[lakehouse_dagster::DgRun], job_name: &str) -> Option<f64> {
+    runs.iter()
+        .filter(|r| r.job_name == job_name && r.status == "SUCCESS")
+        .filter_map(|r| r.start_time)
+        .fold(None, |best, t| {
+            Some(best.map_or(t, |b: f64| if t > b { t } else { b }))
+        })
+}
+
+/// Plan 1f: Unix-epoch seconds right now, for the `now_seconds`
+/// argument to [`evaluate_pipeline_late`]. Reuses the same shape
+/// `routes::pipelines::now_unix_seconds` exposes; defined here so
+/// `routes::alerts` does not have to re-export it.
+fn now_unix_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
 }
 
 #[cfg(test)]

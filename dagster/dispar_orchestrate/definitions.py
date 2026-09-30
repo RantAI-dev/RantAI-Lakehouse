@@ -23,7 +23,10 @@ from dispar_orchestrate.maintenance import (
     bronze_maintenance_job,
     bronze_maintenance_schedule,
 )
-from dispar_orchestrate.pipeline_events import pipeline_run_failed_sensor
+from dispar_orchestrate.pipeline_events import (
+    pipeline_run_failed_sensor,
+    pipeline_run_finished_sensor,
+)
 from dispar_orchestrate.replication_metrics import (
     replication_slot_check_job,
     replication_slot_check_schedule,
@@ -92,5 +95,5 @@ defs = Definitions(
         *ingest_schedules,
         *authored_schedules,
     ],
-    sensors=[pipeline_run_failed_sensor],
+    sensors=[pipeline_run_failed_sensor, pipeline_run_finished_sensor],
 )

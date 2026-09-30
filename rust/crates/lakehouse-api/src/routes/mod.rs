@@ -232,6 +232,30 @@ fn pipelines_router() -> Router<AppState> {
             "/api/pipelines/events/run-failed",
             axum::routing::post(pipelines::run_failed_event),
         )
+        // Plan 1f: Dagster `run_status_sensor(SUCCESS)` posts here once
+        // per successful run. Same posture as the run-failed route — the
+        // handler enforces a service identity on top of the `pipeline:write`
+        // gate. Computes the run's `slow`/`volume_drop` outcomes and hands
+        // them to `evaluate_pipeline_run_finished`.
+        .route(
+            "/api/pipelines/events/run-finished",
+            axum::routing::post(pipelines::run_finished_event),
+        )
+        // Plan 1f: per-pipeline SLA. `GET` returns 404 when no SLA is
+        // configured (so the UI can distinguish "no SLA yet" from a
+        // degraded backend); `PUT` upserts and writes a `pipeline.sla_set`
+        // audit event. The route validates the body (positive thresholds
+        // only) — the database CHECK is defense in depth.
+        .route(
+            "/api/pipelines/{id}/sla",
+            get(pipelines::get_sla).put(pipelines::put_sla),
+        )
+        // Plan 1f: volume history (last 30 runs + their row counts and the
+        // `drop` decision per run). Same 30-run window as `/runs`.
+        .route(
+            "/api/pipelines/{id}/volume",
+            axum::routing::get(pipelines::volume),
+        )
 }
 
 /// The `/api/storage/*` sub-router (Task 2.6), split out for the same
