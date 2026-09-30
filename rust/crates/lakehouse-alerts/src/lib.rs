@@ -522,7 +522,7 @@ fn normalize_pipeline_failure(
     let raw = input.pipeline.as_deref().unwrap_or("").trim().to_owned();
     if raw.is_empty() {
         return Err(AlertError::Validation(
-            "pipeline_failure requires a pipeline id or \"*\".\"".to_owned(),
+            "pipeline_failure requires a pipeline id or \"*\".".to_owned(),
         ));
     }
     if raw != "*" && !raw.starts_with("pl-") {
