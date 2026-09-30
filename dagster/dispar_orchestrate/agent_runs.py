@@ -140,7 +140,14 @@ def post_run(cfg: AgentRunConfig, employee_id: str) -> requests.Response:
             ),
         )
     },
-    tags=source_metadata("dispar_orchestrate/agent_runs.py::run_agent_employee"),
+    tags=source_metadata(
+        "dispar_orchestrate/agent_runs.py::run_agent_employee",
+        reads=["Op config employee_id"],
+        writes=[
+            "POST /api/agents/employees/{employee_id}/run",
+            "ClickHouse lake.bronze_meta.maintenance_run",
+        ],
+    ),
 )
 def run_agent_employee(context) -> dict[str, Any]:
     """Runs `POST /api/agents/employees/{employee_id}/run` for the employee

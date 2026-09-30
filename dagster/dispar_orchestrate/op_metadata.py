@@ -17,9 +17,15 @@ dict is passed as `@op(tags=source_metadata(...))` at each call site.
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 
 
-def source_metadata(source_ref: str, sql: str | None = None) -> dict[str, str]:
+def source_metadata(
+    source_ref: str,
+    sql: str | None = None,
+    reads: Sequence[str] = (),
+    writes: Sequence[str] = (),
+) -> dict[str, str]:
     """Build the `tags=` dict every `@op` decorator passes.
 
     `source_ref` must be `"dispar_orchestrate/<file>.py::<function>"` —
@@ -28,6 +34,15 @@ def source_metadata(source_ref: str, sql: str | None = None) -> dict[str, str]:
     executes one (e.g. `run_bronze_maintenance`'s `REMOVE ORPHAN FILES`
     call) — omitted (not empty string) for ops with no single SQL
     statement to show.
+
+    `reads`/`writes` are the data the op's own code reads and writes, one
+    short phrase each ("Iceberg bronze.* (every table)", "POST
+    /api/alerts/run"). They are what the console's pipeline flowchart
+    draws on either side of the op, labelled as declared by the op, not
+    observed from a run. Keep them next to the code they describe, so a
+    change to what an op touches changes its declaration in the same diff.
+    Dagster tags are strings, so each list travels newline-joined; a phrase
+    must therefore not contain a newline.
     """
     metadata = {
         "source_ref": source_ref,
@@ -35,4 +50,9 @@ def source_metadata(source_ref: str, sql: str | None = None) -> dict[str, str]:
     }
     if sql is not None:
         metadata["sql"] = sql
+    for key, phrases in (("reads", reads), ("writes", writes)):
+        if any("\n" in phrase for phrase in phrases):
+            raise ValueError(f"a {key} phrase must not contain a newline")
+        if phrases:
+            metadata[key] = "\n".join(phrases)
     return metadata

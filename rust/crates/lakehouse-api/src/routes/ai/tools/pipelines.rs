@@ -14,6 +14,7 @@
 use serde_json::{Map, Value, json};
 
 use axum::Extension;
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use lakehouse_auth::Principal;
@@ -266,8 +267,17 @@ pub(super) async fn retry_pipeline_run(state: &AppState, args: &Map<String, Valu
     if run_id.is_empty() {
         return json!({ "error": "runId is required" });
     }
-    response_to_value(crate::routes::pipelines::retry_run(State(state.clone()), Path(run_id)).await)
-        .await
+    // `fromFailure: true` re-runs only the failed steps; the route's own
+    // strategy parsing decides, so the tool cannot drift from the console.
+    let body = if args.get("fromFailure").and_then(Value::as_bool) == Some(true) {
+        Bytes::from_static(br#"{"strategy":"fromFailure"}"#)
+    } else {
+        Bytes::new()
+    };
+    response_to_value(
+        crate::routes::pipelines::retry_run(State(state.clone()), Path(run_id), body).await,
+    )
+    .await
 }
 
 pub(super) async fn pause_pipeline(

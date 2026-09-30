@@ -60,9 +60,15 @@ export const dagsterPipelineService: PipelineService = {
     };
   },
   async listRuns(pipelineId, signal) {
-    return (
-      await getJson<{ runs: PipelineRun[] }>(`/api/pipelines/${encodeURIComponent(pipelineId)}/runs`, { signal })
-    ).runs;
+    const body = await getJson<{ runs: PipelineRun[]; unavailable?: string | null }>(
+      `/api/pipelines/${encodeURIComponent(pipelineId)}/runs`,
+      { signal }
+    );
+    // The route answers 200 with `unavailable` set when the orchestrator
+    // could not be asked (`routes::pipelines::runs`). Returning the empty
+    // list would read as "this job has never run".
+    if (body.unavailable) throw new ServiceError("unavailable", body.unavailable);
+    return body.runs;
   },
   async triggerRun(id, signal) {
     return getJson<PipelineRun>(`/api/pipelines/${encodeURIComponent(id)}/trigger`, { method: "POST", signal });
@@ -81,8 +87,12 @@ export const dagsterPipelineService: PipelineService = {
   cancelRun(runId, signal) {
     return postJson<PipelineRun>(`/api/pipelines/runs/${encodeURIComponent(runId)}/cancel`, undefined, signal);
   },
-  retryRun(runId, signal) {
-    return postJson<PipelineRun>(`/api/pipelines/runs/${encodeURIComponent(runId)}/retry`, undefined, signal);
+  retryRun(runId, signal, strategy) {
+    return postJson<PipelineRun>(
+      `/api/pipelines/runs/${encodeURIComponent(runId)}/retry`,
+      strategy ? { strategy } : undefined,
+      signal
+    );
   },
   pausePipeline(id, signal) {
     return postJson<Pipeline>(`/api/pipelines/${encodeURIComponent(id)}/pause`, undefined, signal);

@@ -304,7 +304,11 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
 
     @op(
         name=f"authored_{safe_name}",
-        tags=op_metadata.source_metadata("dispar_orchestrate/authored_factory.py::_op_for_pipeline"),
+        tags=op_metadata.source_metadata(
+            "dispar_orchestrate/authored_factory.py::_op_for_pipeline",
+            reads=[f"ClickHouse {definition.get('sourceZone')}.{definition.get('sourceTable')}"],
+            writes=[f"ClickHouse {definition.get('targetZone')}.{definition.get('targetTable')}"],
+        ),
     )
     def _run(context) -> dict[str, Any]:
         # Re-validate every transform against this module's own grammar

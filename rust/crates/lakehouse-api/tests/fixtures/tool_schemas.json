@@ -817,12 +817,15 @@
     "type": "function",
     "function": {
       "name": "retry_pipeline_run",
-      "description": "Re-run a finished pipeline run from the start (by runId).",
+      "description": "Re-run a finished pipeline run (by runId): every step, or with fromFailure only the steps that failed (failed runs only).",
       "parameters": {
         "type": "object",
         "properties": {
           "runId": {
             "type": "string"
+          },
+          "fromFailure": {
+            "type": "boolean"
           }
         },
         "required": [

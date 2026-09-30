@@ -162,3 +162,22 @@
     box-shadow: none !important;
   }
 }
+
+/* Pipeline detail: the vitals strip's staggered entrance. */
+@keyframes vital-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Pipeline flowchart: edges into or out of a running op move toward the target. */
+@keyframes flow-dash {
+  to {
+    stroke-dashoffset: -12;
+  }
+}

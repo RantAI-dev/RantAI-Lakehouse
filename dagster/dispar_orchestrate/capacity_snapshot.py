@@ -58,6 +58,7 @@ from dagster import DefaultScheduleStatus, Failure, ScheduleDefinition, job, op
 from s3fs import S3FileSystem
 
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, record_capacity_snapshot
+from dispar_orchestrate.op_metadata import source_metadata
 
 
 def _env(name: str, default: str) -> str:
@@ -136,7 +137,13 @@ def measure_bucket(cfg: CapacityConfig) -> BucketMeasurement:
     )
 
 
-@op
+@op(
+    tags=source_metadata(
+        "dispar_orchestrate/capacity_snapshot.py::run_capacity_snapshot",
+        reads=["RustFS warehouse bucket (every object)"],
+        writes=["ClickHouse lake.bronze_meta.capacity_snapshot"],
+    )
+)
 def run_capacity_snapshot(context) -> None:
     """P6 op: measure `cfg.bucket_name`'s live object count/bytes via
     `measure_bucket` and record one row per run into

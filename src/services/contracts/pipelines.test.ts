@@ -44,8 +44,8 @@ describe("WS4 pipelines contracts", () => {
 
   it("PipelineDetail.graph carries real ops+edges for a Dagster job, each op nullable field-by-field", () => {
     const ops: PipelineOpNode[] = [
-      { name: "ingest_bronze_table", description: "ingest", sourceRef: "dispar_orchestrate/assets.py::ingest_bronze_table", commit: "abc123", sql: null },
-      { name: "register_in_catalog", description: null, sourceRef: null, commit: null, sql: null },
+      { name: "ingest_bronze_table", description: "ingest", sourceRef: "dispar_orchestrate/assets.py::ingest_bronze_table", commit: "abc123", sql: null, reads: [], writes: [] },
+      { name: "register_in_catalog", description: null, sourceRef: null, commit: null, sql: null, reads: [], writes: [] },
     ]
     const edges: PipelineOpEdge[] = [{ from: "ingest_bronze_table", to: "register_in_catalog" }]
     const fixture: PipelineDetail = {

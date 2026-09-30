@@ -119,6 +119,7 @@ from dispar_orchestrate.adapters.kafka import consume_one_batch
 from dispar_orchestrate.adapters.sink import load_via_sink
 from dispar_orchestrate.bronze_catalog import record_ingest_offset, record_ingest_run
 from dispar_orchestrate.column_gate import UnsupportedColumnType, reject_unsupported_column_types
+from dispar_orchestrate.op_metadata import source_metadata
 from dispar_orchestrate.secret_map import secret_field_names
 from dispar_orchestrate.secret_resolver import SecretRefRejected
 
@@ -590,7 +591,14 @@ def _run_stream_connector(connector: dict) -> None:
     )
 
 
-@op(config_schema={"connector_id": Field(str, description="The connector.id (adapter IS NOT NULL) to ingest.")})
+@op(
+    config_schema={"connector_id": Field(str, description="The connector.id (adapter IS NOT NULL) to ingest.")},
+    tags=source_metadata(
+        "dispar_orchestrate/ingest_factory.py::run_ingest",
+        reads=["Connector source objects (per its ingest spec)"],
+        writes=["Iceberg bronze.{target} per source object", "ClickHouse lake.bronze_meta.ingest_run"],
+    ),
+)
 def run_ingest(context) -> None:
     connector_id: str = context.op_config["connector_id"]
     cfg = IngestFactoryConfig.from_env()

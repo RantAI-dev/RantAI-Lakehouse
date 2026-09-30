@@ -25,6 +25,50 @@ pub struct DgRun {
     /// Unix seconds the run ended, or `None` if it hasn't finished yet.
     #[serde(default)]
     pub end_time: Option<f64>,
+    /// Unix seconds the run was created (queued). The gap to `start_time`
+    /// is time spent queued and launching. Only the per-job query asks for
+    /// it; `None` elsewhere.
+    #[serde(default)]
+    pub creation_time: Option<f64>,
+    /// The run this one re-executes, when it is a retry.
+    #[serde(default)]
+    pub parent_run_id: Option<String>,
+    /// The first run of a retry chain, when this is a retry.
+    #[serde(default)]
+    pub root_run_id: Option<String>,
+    /// The run's tags. `Dagster` records what launched a run here
+    /// (`dagster/schedule_name`, `dagster/sensor_name`, `dagster/backfill`).
+    #[serde(default)]
+    pub tags: Vec<DgTag>,
+}
+
+/// One `key`/`value` tag on a [`DgRun`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct DgTag {
+    /// The tag's key, e.g. `dagster/schedule_name`.
+    pub key: String,
+    /// The tag's value.
+    pub value: String,
+}
+
+/// How a re-execution picks the steps it runs again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReexecutionStrategy {
+    /// Every step of the parent run.
+    AllSteps,
+    /// Only the steps that failed or did not run, reusing the outputs of
+    /// the steps that succeeded. `Dagster` refuses it for a run that did
+    /// not fail.
+    FromFailure,
+}
+
+impl ReexecutionStrategy {
+    const fn graphql(self) -> &'static str {
+        match self {
+            Self::AllSteps => "ALL_STEPS",
+            Self::FromFailure => "FROM_FAILURE",
+        }
+    }
 }
 
 /// One `Dagster` schedule attached to a job, as returned by
@@ -478,7 +522,8 @@ impl DgClient {
         // against known job names by the caller.
         let query = format!(
             "{{ runsOrError(filter: {{ pipelineName: \"{job_name}\" }}, limit: {limit}) {{ \
-             __typename ... on Runs {{ results {{ runId jobName status startTime endTime }} }} \
+             __typename ... on Runs {{ results {{ runId jobName status startTime endTime \
+             creationTime parentRunId rootRunId tags {{ key value }} }} }} \
              }} }}"
         );
         let data: RunsOrErrorData = self.execute(&query, None).await?;
@@ -566,6 +611,8 @@ impl DgClient {
                 source_ref: metadata_value(&h.solid.definition.metadata, "source_ref"),
                 commit: metadata_value(&h.solid.definition.metadata, "commit"),
                 sql: metadata_value(&h.solid.definition.metadata, "sql"),
+                reads: metadata_lines(&h.solid.definition.metadata, "reads"),
+                writes: metadata_lines(&h.solid.definition.metadata, "writes"),
             })
             .collect();
         let edges = solid_handles
@@ -705,27 +752,35 @@ impl DgClient {
         })
     }
 
-    /// Re-execute a finished (failed/cancelled) run from the start, matching
+    /// Re-execute a finished (failed/cancelled) run, matching
     /// `mutation { launchRunReexecution(reexecutionParams: { parentRunId,
-    /// strategy: ALL_STEPS }) }`. Used by `retryRun` (Phase 2, Task 2.5).
-    /// `ALL_STEPS`, not `FROM_FAILURE`: the mock's `retryRun` restarts the
-    /// whole run (`processed`/`accepted`/... reset to 0), which
-    /// `ALL_STEPS` is the closer match for.
+    /// strategy }) }`. Used by `retryRun` (Phase 2, Task 2.5), which
+    /// defaults to [`ReexecutionStrategy::AllSteps`] and offers
+    /// [`ReexecutionStrategy::FromFailure`] for a failed run.
     ///
     /// # Errors
     ///
     /// See [`DgClient::launch_run`].
-    pub async fn launch_reexecution(&self, parent_run_id: &str) -> Result<LaunchOutcome, DgError> {
-        let query = "mutation($parentRunId: String!) { \
-                      launchRunReexecution(reexecutionParams: { parentRunId: $parentRunId, \
-                      strategy: ALL_STEPS }) { \
-                      __typename \
-                      ... on LaunchRunSuccess { run { runId } } \
-                      ... on PythonError { message } \
-                      ... on RunConfigValidationInvalid { errors { message } } \
-                      } }";
+    pub async fn launch_reexecution(
+        &self,
+        parent_run_id: &str,
+        strategy: ReexecutionStrategy,
+    ) -> Result<LaunchOutcome, DgError> {
+        // `strategy` is an enum literal from a closed Rust enum, never
+        // caller text, so it is safe to place in the query string.
+        let query = format!(
+            "mutation($parentRunId: String!) {{ \
+             launchRunReexecution(reexecutionParams: {{ parentRunId: $parentRunId, \
+             strategy: {} }}) {{ \
+             __typename \
+             ... on LaunchRunSuccess {{ run {{ runId }} }} \
+             ... on PythonError {{ message }} \
+             ... on RunConfigValidationInvalid {{ errors {{ message }} }} \
+             }} }}",
+            strategy.graphql()
+        );
         let data: LaunchReexecutionData = self
-            .execute(query, Some(json!({ "parentRunId": parent_run_id })))
+            .execute(&query, Some(json!({ "parentRunId": parent_run_id })))
             .await?;
         Ok(launch_outcome_from(data.launch_run_reexecution))
     }
@@ -1053,6 +1108,12 @@ pub struct GraphOp {
     /// `sql=` to `source_metadata` (`dagster/dispar_orchestrate/op_metadata.py`),
     /// which is every op in this code location today.
     pub sql: Option<String>,
+    /// What the op's own code reads, one short phrase each, from the
+    /// newline-joined `"reads"` entry `source_metadata` writes. Declared by
+    /// the op, not observed from a run. Empty when the op declares nothing.
+    pub reads: Vec<String>,
+    /// What the op's own code writes; see [`Self::reads`].
+    pub writes: Vec<String>,
 }
 
 /// Look up `label` in `entries` (`definition.metadata`'s `{key, value}`
@@ -1061,6 +1122,21 @@ pub struct GraphOp {
 /// deviation note on why this client reads a flat key/value list instead of
 /// the plan sketch's `TextMetadataEntry` union). `None` when no entry with
 /// that key exists.
+/// A newline-joined `label` entry split back into its phrases (see
+/// `dagster/dispar_orchestrate/op_metadata.py::source_metadata`); blank
+/// lines are dropped, and an absent entry is an empty list.
+fn metadata_lines(entries: &[MetadataItem], label: &str) -> Vec<String> {
+    metadata_value(entries, label)
+        .map(|v| {
+            v.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn metadata_value(entries: &[MetadataItem], label: &str) -> Option<String> {
     entries
         .iter()
@@ -1746,8 +1822,34 @@ mod tests {
             .await;
 
         let client = DgClient::new(format!("{}/graphql", server.uri()));
-        let outcome = client.launch_reexecution("r1").await.unwrap();
+        let outcome = client
+            .launch_reexecution("r1", ReexecutionStrategy::AllSteps)
+            .await
+            .unwrap();
         assert_eq!(outcome.run_id.as_deref(), Some("r2"));
+    }
+
+    #[tokio::test]
+    async fn launch_reexecution_from_failure_sends_that_strategy() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(wiremock::matchers::body_string_contains(
+                "strategy: FROM_FAILURE",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "launchRunReexecution": { "__typename": "LaunchRunSuccess",
+                    "run": { "runId": "r3" } } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .launch_reexecution("r1", ReexecutionStrategy::FromFailure)
+            .await
+            .unwrap();
+        assert_eq!(outcome.run_id.as_deref(), Some("r3"));
     }
 
     #[tokio::test]
@@ -1763,7 +1865,10 @@ mod tests {
             .await;
 
         let client = DgClient::new(format!("{}/graphql", server.uri()));
-        let outcome = client.launch_reexecution("r1").await.unwrap();
+        let outcome = client
+            .launch_reexecution("r1", ReexecutionStrategy::AllSteps)
+            .await
+            .unwrap();
         assert!(outcome.run_id.is_none());
         assert_eq!(outcome.error.as_deref(), Some("boom"));
     }
@@ -2032,6 +2137,25 @@ mod tests {
         // the real fixture carries no `sql` metadata key — `None`, not a
         // fabricated empty string.
         assert_eq!(op.sql, None);
+        // The captured fixture predates `reads`/`writes`: absent entries
+        // read as empty lists, never as a fabricated phrase.
+        assert!(op.reads.is_empty() && op.writes.is_empty());
+    }
+
+    #[test]
+    fn metadata_lines_split_a_newline_joined_entry_and_drop_blank_lines() {
+        let entries = vec![MetadataItem {
+            key: "writes".to_owned(),
+            value: "Iceberg bronze.x\n\n ClickHouse lake.y ".to_owned(),
+        }];
+        assert_eq!(
+            metadata_lines(&entries, "writes"),
+            vec![
+                "Iceberg bronze.x".to_owned(),
+                "ClickHouse lake.y".to_owned()
+            ]
+        );
+        assert!(metadata_lines(&entries, "reads").is_empty());
     }
 
     /// An op reporting metadata with none of the three recognized labels

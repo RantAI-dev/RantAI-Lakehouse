@@ -838,7 +838,15 @@ def _optimize_result(
 @op(
     # sql=None: this op runs one REMOVE/EXPIRE statement per discovered
     # table, not one fixed template.
-    tags=source_metadata("dispar_orchestrate/maintenance.py::run_bronze_maintenance", sql=None)
+    tags=source_metadata(
+        "dispar_orchestrate/maintenance.py::run_bronze_maintenance",
+        sql=None,
+        reads=["Iceberg bronze.* (every table)", "GET /api/lakehouse/maintenance-policies"],
+        writes=[
+            "Iceberg bronze.* (orphan files, snapshots, compaction)",
+            "ClickHouse lake.bronze_meta.maintenance_run",
+        ],
+    )
 )
 def run_bronze_maintenance(context) -> list[dict[str, Any]]:
     """The P4 maintenance chain, per Bronze table: `remove_orphan_files`
