@@ -48,6 +48,7 @@ fn input() -> CreatePipelineInput {
         // The per-row tests that need a specific count set it explicitly.
         max_retries: None,
         tenant_id: None,
+        depends_on: Vec::new(),
     }
 }
 
@@ -106,6 +107,99 @@ async fn get_definition_reports_absent_optional_fields_honestly(pool: PgPool) ->
     assert_eq!(definition.incremental_column, None);
     assert!(definition.transforms.is_empty());
     assert!(!definition.fbic_enabled);
+    Ok(())
+}
+
+// ── R3 plan 2a: depends_on (migration 0052) ───────────────────────────────
+
+/// A pipeline created with a non-empty `depends_on` reads back the same
+/// list, in order, on `get_pipeline`/`list_pipelines`/`list_runnable_pipelines`
+/// (the factory's import-time round-trip). The column is a `text[]`, bound
+/// end-to-end — no SQL interpolation anywhere in this path.
+#[sqlx::test(migrations = "../../migrations")]
+async fn depends_on_round_trips_through_create_and_runnable(pool: PgPool) -> sqlx::Result<()> {
+    let mut with_deps = input();
+    with_deps.name = "with-deps".to_owned();
+    with_deps.depends_on = vec!["pl-up-1".to_owned(), "ingest_job".to_owned()];
+    let created = pipelines::create_pipeline(&pool, &with_deps)
+        .await
+        .expect("create should succeed");
+
+    let read = pipelines::get_pipeline(&pool, &created.id)
+        .await
+        .expect("get_pipeline should succeed")
+        .expect("pipeline should exist");
+    assert_eq!(read.depends_on, vec!["pl-up-1", "ingest_job"]);
+
+    pipelines::set_status(&pool, &created.id, "ready")
+        .await
+        .expect("set_status should succeed");
+    let runnable = pipelines::list_runnable_pipelines(&pool)
+        .await
+        .expect("list_runnable should succeed");
+    let one = runnable
+        .iter()
+        .find(|p| p.id == created.id)
+        .expect("pipeline should appear in the runnable list");
+    assert_eq!(one.depends_on, vec!["pl-up-1", "ingest_job"]);
+    Ok(())
+}
+
+/// `update_pipeline` replaces `depends_on` wholesale — the same shape as
+/// every other editable column the PUT route owns (`source`, `target`,
+/// `transforms`, ...).
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_replaces_depends_on_wholesale(pool: PgPool) -> sqlx::Result<()> {
+    let mut with_deps = input();
+    with_deps.name = "edit-deps".to_owned();
+    with_deps.depends_on = vec!["pl-old".to_owned()];
+    let created = pipelines::create_pipeline(&pool, &with_deps)
+        .await
+        .expect("create should succeed");
+    assert_eq!(created.depends_on, vec!["pl-old"]);
+
+    let updated = pipelines::update_pipeline(
+        &pool,
+        &created.id,
+        &pipelines::UpdatePipelineInput {
+            depends_on: vec!["pl-new-1".to_owned(), "pl-new-2".to_owned()],
+            ..pipelines::UpdatePipelineInput {
+                kind: input().kind,
+                source_zone: input().source_zone,
+                source_table: input().source_table,
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: input().target_zone,
+                target_table: input().target_table,
+                schedule: input().schedule,
+                owner: None,
+                description: None,
+                max_retries: None,
+                depends_on: Vec::new(),
+            }
+        },
+    )
+    .await
+    .expect("update should succeed")
+    .expect("pipeline should exist");
+    assert_eq!(updated.depends_on, vec!["pl-new-1", "pl-new-2"]);
+    Ok(())
+}
+
+/// `depends_on` defaults to an empty list when the input omits it — the
+/// migration's `DEFAULT '{}'` plus the `Vec<String>` default. This is the
+/// regression guard for a freshly authored pipeline that the UI hasn't yet
+/// edited.
+#[sqlx::test(migrations = "../../migrations")]
+async fn depends_on_defaults_to_empty_when_unset(pool: PgPool) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input())
+        .await
+        .expect("create should succeed");
+    assert!(
+        created.depends_on.is_empty(),
+        "a pipeline created without depends_on must read back as []"
+    );
     Ok(())
 }
 
@@ -366,6 +460,7 @@ async fn update_replaces_the_definition_and_keeps_the_status(pool: PgPool) -> sq
             owner: None,
             description: Some("edited".to_owned()),
             max_retries: None,
+            depends_on: Vec::new(),
         },
     )
     .await
@@ -400,6 +495,7 @@ async fn update_replaces_the_definition_and_keeps_the_status(pool: PgPool) -> sq
             owner: None,
             description: None,
             max_retries: None,
+            depends_on: Vec::new(),
         },
     )
     .await
@@ -599,6 +695,7 @@ fn update_input_for(p: &pipelines::Pipeline) -> pipelines::UpdatePipelineInput {
         owner: None,
         description: None,
         max_retries: None,
+        depends_on: Vec::new(),
     }
 }
 

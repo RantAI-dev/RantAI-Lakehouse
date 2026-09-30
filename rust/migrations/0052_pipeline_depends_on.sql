@@ -1,0 +1,37 @@
+-- R3 plan 2a: pipeline dependencies. An authored pipeline can list other
+-- pipelines (authored or Dagster-native, e.g. `ingest_job`) in
+-- `depends_on`, and a per-downstream `run_status_sensor(SUCCESS)` fires
+-- the downstream only when every upstream has a successful run that
+-- finished after the downstream's own last run started (the "ALL"
+-- semantics — see `dagster/dispar_orchestrate/authored_factory.py`'s
+-- dependency sensor doc for the full rule, and the unit tests for the
+-- staleness check).
+--
+-- # Migration numbering
+--
+-- This is 0052 because R2's `0051_pipeline_max_retries.sql` lands first
+-- via PR #56, and this file follows it in this PR. The two touch the same
+-- table but not the same column, so the order carries no hazard: 0051
+-- adds `max_retries`, this one adds `depends_on`, and every read here is
+-- `pipeline_definition.depends_on`.
+--
+-- # Why `text[]` and not a join table
+--
+-- A join table would model the dependency direction precisely
+-- (`pipeline_dependency(downstream, upstream)`), but every reader
+-- (`validate_depends_on_graph`, the detail route's `upstream`/`downstream`
+-- payload, the factory's import-time `depends_on` pass-through) wants the
+-- full list in one round trip; a join means either a subquery per row or
+-- a row-per-dependency flatten the route then re-groups. `text[]` is the
+-- shape Dagster itself uses for its sensor `monitored_jobs` argument and
+-- is bound end-to-end here, never interpolated into SQL.
+--
+-- # Why DEFAULT '{}' and NOT NULL
+--
+-- A pipeline written before this migration lands has no dependencies,
+-- which is the honest default and what the route returns when `depends_on`
+-- is omitted from the POST/PUT body. `NOT NULL` makes the
+-- "this pipeline declares zero upstream runs must finish first" invariant
+-- explicit at the column, rather than discoverable by a `NULL OR '{}' =
+-- '{}'` coalesce at every read.
+ALTER TABLE pipeline_definition ADD COLUMN depends_on TEXT[] NOT NULL DEFAULT '{}';

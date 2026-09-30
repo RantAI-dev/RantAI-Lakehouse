@@ -1177,6 +1177,50 @@ impl DgClient {
         Ok(schedule_ticks_from(&data["scheduleOrError"]))
     }
 
+    /// The most recent ticks of one sensor, newest first: when it evaluated,
+    /// whether it launched a run, was skipped, or failed. A sensor that does
+    /// not exist reads as an empty list (R3 plan 2a — `authored__<id>_after`
+    /// sensors only exist once their pipeline has `depends_on`; before that,
+    /// the route merges in `[]` rather than failing).
+    ///
+    /// The query path is `sensorOrError(sensorSelector)` (note: the
+    /// singular `SensorSelector`, NOT `SensorOrError.sensors(...)`) —
+    /// `Dagster`'s `1.13.20` GraphQL schema names the selector type
+    /// `SensorSelector` and the matching field `sensorOrError`. Verified
+    /// live against this repository's Dagster stack; see the
+    /// `schedule_ticks_from`-style unit test in this file.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`].
+    pub async fn sensor_ticks(
+        &self,
+        sensor_name: &str,
+        limit: u32,
+    ) -> Result<Vec<ScheduleTick>, DgError> {
+        let query = "query($sel: SensorSelector!, $limit: Int!) { sensorOrError(sensorSelector: $sel) { \
+                      __typename \
+                      ... on Sensor { sensorState { ticks(limit: $limit) { \
+                        tickId status timestamp runIds skipReason error { message } } } } \
+                      } }";
+        let variables = json!({
+            "sel": {
+                "repositoryName": self.repo,
+                "repositoryLocationName": self.location,
+                "sensorName": sensor_name,
+            },
+            "limit": limit,
+        });
+        let data: Value = self.execute(query, Some(variables)).await?;
+        // The schedule and sensor tick payloads share the same
+        // `{ tickId, status, timestamp, runIds, skipReason, error }`
+        // shape; a shared `ticks_from_state` helper parses both — only
+        // the parent key differs (`scheduleState` vs `sensorState`). A
+        // `SensorNotFoundError` typename has no `sensorState`, so the
+        // helper returns `[]`.
+        Ok(sensor_ticks_from(&data["sensorOrError"]))
+    }
+
     /// A single run's live status + per-step status, matching
     /// `GET /api/ai/build-status`'s inline query (`pipelineRunOrError` on
     /// `Run`).
@@ -1507,7 +1551,15 @@ pub struct ScheduleTick {
 }
 
 fn schedule_ticks_from(v: &Value) -> Vec<ScheduleTick> {
-    v["scheduleState"]["ticks"]
+    ticks_from_state(&v["scheduleState"])
+}
+
+fn sensor_ticks_from(v: &Value) -> Vec<ScheduleTick> {
+    ticks_from_state(&v["sensorState"])
+}
+
+fn ticks_from_state(state: &Value) -> Vec<ScheduleTick> {
+    state["ticks"]
         .as_array()
         .into_iter()
         .flatten()
@@ -2509,6 +2561,42 @@ mod tests {
         );
         // A schedule that does not exist has no ticks, not an error.
         assert!(schedule_ticks_from(&json!({ "__typename": "ScheduleNotFoundError" })).is_empty());
+    }
+
+    /// R3 plan 2a BLOCKER regression: `sensor_ticks` selects
+    /// `sensorState { ticks { ... } }`, but the parser used to read
+    /// `scheduleState`. A `Sensor` has no `scheduleState`, so the call
+    /// returned `[]` for every sensor regardless of data — the
+    /// `authored__<id>_after` dependency ticks the UI was supposed to
+    /// merge in were silently dropped. The fixture mirrors the shape the
+    /// `sensor_ticks` query actually selects, including the
+    /// `SensorNotFoundError` typename the route treats as "no ticks".
+    #[test]
+    fn sensor_ticks_extract_ticks_from_sensor_state_not_schedule_state() {
+        let v = json!({ "__typename": "Sensor", "sensorState": { "ticks": [
+            { "tickId": "s1", "status": "SUCCESS", "timestamp": 10.0, "runIds": ["r1"],
+              "skipReason": null, "error": null },
+            { "tickId": "s2", "status": "SKIPPED", "timestamp": 5.0, "runIds": [],
+              "skipReason": "upstream not ready", "error": null },
+            { "tickId": "s3", "status": "FAILURE", "timestamp": 1.0, "runIds": [],
+              "skipReason": null, "error": { "message": "Traceback ... secret" } }
+        ] } });
+        let ticks = sensor_ticks_from(&v);
+        assert_eq!(
+            ticks.len(),
+            3,
+            "sensor ticks must be parsed from sensorState.ticks"
+        );
+        assert_eq!(ticks[0].run_ids, vec!["r1".to_owned()]);
+        assert_eq!(ticks[1].skip_reason.as_deref(), Some("upstream not ready"));
+        assert!(ticks[2].failed);
+        let serialized = serde_json::to_string(&ticks).unwrap();
+        assert!(
+            !serialized.contains("Traceback"),
+            "Dagster error text must not be carried in the response"
+        );
+        // A sensor that does not exist has no ticks, not an error.
+        assert!(sensor_ticks_from(&json!({ "__typename": "SensorNotFoundError" })).is_empty());
     }
 
     #[tokio::test]

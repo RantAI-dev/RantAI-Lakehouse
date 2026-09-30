@@ -12,7 +12,11 @@ from dagster import Definitions
 from dispar_orchestrate.agent_runs import agent_run_job, agent_run_schedules
 from dispar_orchestrate.alerts_run import alerts_run_job, alerts_run_schedule
 from dispar_orchestrate.assets import bronze_ingest_job
-from dispar_orchestrate.authored_factory import authored_jobs, authored_schedules
+from dispar_orchestrate.authored_factory import (
+    authored_dependency_sensors,
+    authored_jobs,
+    authored_schedules,
+)
 from dispar_orchestrate.capacity_snapshot import (
     capacity_snapshot_job,
     capacity_snapshot_schedule,
@@ -95,5 +99,17 @@ defs = Definitions(
         *ingest_schedules,
         *authored_schedules,
     ],
-    sensors=[pipeline_run_failed_sensor, pipeline_run_finished_sensor],
+    sensors=[
+        pipeline_run_failed_sensor,
+        pipeline_run_finished_sensor,
+        # R3 plan 2a: one `run_status_sensor` per authored pipeline with
+        # non-empty `depends_on`, named `authored__<safe_id>_after` (the
+        # same name the API layer fetches ticks for via
+        # `GET /api/pipelines/{id}/schedule-ticks`). Pipelines without
+        # `depends_on` contribute no entry, so the sensor list is empty
+        # until an author wires a chain. See `authored_factory.py`'s
+        # module doc for the ALL-semantics and run_key = upstream run id
+        # design choices.
+        *authored_dependency_sensors,
+    ],
 )

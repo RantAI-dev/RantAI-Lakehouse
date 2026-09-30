@@ -9,6 +9,16 @@ exceptions, the same style `test_agent_runs.py` uses. No real ClickHouse:
 `authored_factory._ch_exec`/`_ch_query_json` are monkeypatched, the same
 style `test_maintenance.py` uses for `_ch_query`.
 
+The final class, `TestDependencySensor`, exercises R3 plan 2a
+(`build_authored_dependency_sensor`): a `run_status_sensor` per pipeline
+with non-empty `depends_on` that applies ALL semantics ("has every
+upstream had a SUCCESS run that finished AFTER this downstream's
+most-recent start?") and yields either a `RunRequest(run_key=<upstream
+run id>)` or a `SkipReason` naming the upstream that is still behind.
+`context.instance` is replaced by a stub that records the `RunsFilter`s
+the sensor builds and returns a fixed `DagsterRun` per call; no real
+Dagster instance, no real run storage.
+
 Run with: `~/.cache/rantai-dagster-venv/bin/python -m pytest
 dagster/dispar_orchestrate/test_authored_factory.py -v`
 """
@@ -16,12 +26,30 @@ dagster/dispar_orchestrate/test_authored_factory.py -v`
 from __future__ import annotations
 
 import unittest
+from typing import Any, Sequence
 from unittest import mock
 
 import requests
-from dagster import Backoff, DefaultScheduleStatus, Jitter, RetryPolicy, build_op_context
+from dagster import (
+    Backoff,
+    DagsterRunStatus,
+    DefaultScheduleStatus,
+    Jitter,
+    JobSelector,
+    RetryPolicy,
+    RunRequest,
+    RunsFilter,
+    build_op_context,
+    job,
+)
 
 from dispar_orchestrate import authored_factory, authored_transforms
+from dispar_orchestrate.authored_factory import (
+    DAGSTER_LOCATION,
+    DAGSTER_REPO,
+    _upstream_job_selector,
+    build_authored_dependency_sensor,
+)
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget
 
 
@@ -309,6 +337,386 @@ class AuthoredScheduleTest(unittest.TestCase):
         self.assertEqual(mocked_get.call_count, 1)
         self.assertEqual(len(jobs), 2)
         self.assertEqual([s.name for s in schedules], ["authored__pl_dedupe_select_abc123_schedule"])
+
+
+# ── R3 plan 2a: dependency-sensor tests (appended below) ──────────────
+#
+# The sensor body is a closure over `pipeline["id"]` and `pipeline["dependsOn"]`;
+# every other field of the pipeline dict is irrelevant to it. These tests
+# build the minimum dict the body reads on top of HEAD's `_ready_pipeline`
+# (so the runnable-payload fixture stays the single source of truth for the
+# `definition` shape) and never call the network -- `context.instance` is
+# replaced by `StubInstance`, which records every `RunsFilter` the sensor
+# builds and returns a fixed list per call.
+
+
+class _FakeDagsterRun:
+    """Stand-in for `dagster.DagsterRun` carrying only the fields the
+    sensor body reads (`job_name`, `start_time`, `end_time`, `run_id`,
+    `status`). The factory module never constructs one of these -- it
+    only consumes whatever `context.instance.get_runs` returns -- so a
+    minimal stub is enough."""
+
+    def __init__(
+        self,
+        job_name: str,
+        run_id: str,
+        status: DagsterRunStatus,
+        start_time: float | None,
+        end_time: float | None,
+    ) -> None:
+        self.job_name = job_name
+        self.run_id = run_id
+        self.status = status
+        self.start_time = start_time
+        self.end_time = end_time
+
+
+class _StubInstance:
+    """Drop-in for `context.instance`. Records every `(filter, limit)`
+    pair the sensor asks for and returns the run list the test set up
+    for that pair. Indexed by `RunsFilter.job_name` so the sensor's
+    per-upstream query and per-downstream query can be answered
+    independently."""
+
+    def __init__(self, runs_by_job: dict[str, list[_FakeDagsterRun]]) -> None:
+        self._runs_by_job = runs_by_job
+        self.calls: list[tuple[RunsFilter | None, int | None]] = []
+
+    def get_runs(
+        self,
+        filters: RunsFilter | None = None,
+        cursor: str | None = None,
+        limit: int | None = None,
+        bucket_by: Any = None,
+        ascending: bool = False,
+    ) -> Sequence[_FakeDagsterRun]:
+        self.calls.append((filters, limit))
+        job_name = filters.job_name if filters else None
+        return list(self._runs_by_job.get(job_name, []))
+
+
+class _StubContext:
+    """Carries the two attributes the sensor body reads:
+    `dagster_run` (the upstream run that triggered THIS tick) and
+    `instance` (the run-storage stub)."""
+
+    def __init__(self, dagster_run: _FakeDagsterRun, instance: _StubInstance) -> None:
+        self.dagster_run = dagster_run
+        self.instance = instance
+
+
+def _dep_pipeline(pid: str, depends_on: list[str]) -> dict[str, Any]:
+    """A pipeline dict shaped for the sensor body. Mirrors the REAL
+    wire format the Rust `RunnablePipeline` serializes
+    (`#[serde(rename_all = "camelCase")]` in
+    `rust/crates/lakehouse-store/src/pipelines.rs`): the upstream-list
+    field is `dependsOn` on the wire, never `depends_on`. The body
+    reads `pipeline["id"]` and `pipeline["dependsOn"]`; everything
+    else is HEAD's `_ready_pipeline` shape so the `definition`
+    fixture stays the single source of truth."""
+    return {**_ready_pipeline(), "id": pid, "dependsOn": depends_on}
+
+
+def _build_dep_sensor(pid: str, depends_on: list[str]):
+    """Helper: build the pipeline dict, then build and return the
+    sensor `RunStatusSensorDefinition`. The sensor body is a closure
+    over `pid` and `depends_on`, so this is the only factory the
+    tests need. `request_job` MUST be a real `JobDefinition` (not a
+    `JobSelector`) because Dagster 1.13.20's `SensorDefinition`
+    superclass coerces it through `AutomationTarget.from_coercible`,
+    which only handles `JobDefinition`/`UnresolvedAssetJobDefinition`
+    -- a placeholder `@job` named the same way the factory would
+    name it is enough."""
+    @job(name=f"authored__{pid.replace('-', '_')}")
+    def _placeholder_job() -> None:
+        return None
+    return build_authored_dependency_sensor(
+        _dep_pipeline(pid, depends_on), authored_job=_placeholder_job
+    )
+
+
+class TestDependencySensor:
+    """Sensor-body tests for R3 plan 2a. Plain pytest class (no
+    `unittest.TestCase`) so the per-test asserts render with pytest's
+    own introspection instead of `self.assertEqual`'s."""
+
+    def test_returns_none_when_depends_on_is_empty(self) -> None:
+        """A pipeline with `depends_on=[]` produces NO `run_status_sensor`:
+        `Definitions(sensors=...)` is the union of every chain's first
+        downstream, and "no chain" means "no sensor". An empty list there
+        is the factory's whole point for pipelines without upstream wiring.
+        """
+        assert build_authored_dependency_sensor(_dep_pipeline("pl-empty", []), None) is None
+
+    def test_returns_a_sensor_when_depends_on_is_set(self) -> None:
+        """A non-empty `depends_on` produces a sensor with the
+        `authored__<safe_id>_after` name and `JobSelector`s for `monitored_jobs`
+        (verified by inspecting the `RunStatusSensorDefinition`'s internal
+        `_monitored_jobs` -- the public surface has no `monitored_jobs`
+        property in dagster 1.13.20)."""
+        sensor = _build_dep_sensor("pl-down-1", ["pl-up-a"])
+        assert sensor is not None
+        assert sensor.name == "authored__pl_down_1_after"
+        assert sensor.default_status.name == "RUNNING"
+        assert list(sensor._monitored_jobs) == [  # type: ignore[attr-defined]
+            JobSelector(
+                location_name=DAGSTER_LOCATION,
+                repository_name=DAGSTER_REPO,
+                job_name="authored__pl_up_a",
+            )
+        ]
+        assert sensor.job is not None
+        assert sensor.job.name == "authored__pl_down_1"
+
+    def test_upstream_job_selector_resolves_authored_id_through_dagster_safe_name(self) -> None:
+        """`pl-up-a` -> `authored__pl_up_a`; the same `_dagster_safe_name`
+        rule the job/schedule names use, so the `run_status_sensor`'s
+        `monitored_jobs` actually matches what the factory built."""
+        assert _upstream_job_selector("pl-up-a") == JobSelector(
+            location_name=DAGSTER_LOCATION,
+            repository_name=DAGSTER_REPO,
+            job_name="authored__pl_up_a",
+        )
+
+    def test_upstream_job_selector_passes_a_dagster_native_id_through_verbatim(self) -> None:
+        """Dagster-native upstreams (e.g. `ingest_job`) are already valid
+        job names; the factory uses the id as the `job_name` field on the
+        selector rather than re-running `_dagster_safe_name`."""
+        assert _upstream_job_selector("ingest_job") == JobSelector(
+            location_name=DAGSTER_LOCATION,
+            repository_name=DAGSTER_REPO,
+            job_name="ingest_job",
+        )
+
+    def test_yields_run_request_with_run_key_equal_to_upstream_run_id_when_all_fresh(self) -> None:
+        """Happy path: the downstream has one prior run (start_time=100);
+        upstream has one SUCCESS run that ended at 200 (>100). Yield
+        `RunRequest(run_key=<upstream run id>)`. `run_key` MUST equal the
+        triggering upstream run id -- Dagster's own dedup keeps a re-firing
+        upstream from launching the downstream twice for the same upstream
+        run; using any other key (the downstream id, the upstream job name,
+        a fresh UUID) breaks that."""
+        upstream_run = _FakeDagsterRun(
+            job_name="authored__pl_up_a",
+            run_id="upstream-1",
+            status=DagsterRunStatus.SUCCESS,
+            start_time=180.0,
+            end_time=200.0,
+        )
+        instance = _StubInstance(
+            {
+                "authored__pl_down_1": [
+                    _FakeDagsterRun(
+                        job_name="authored__pl_down_1",
+                        run_id="downstream-1",
+                        status=DagsterRunStatus.SUCCESS,
+                        start_time=100.0,
+                        end_time=120.0,
+                    ),
+                ],
+                "authored__pl_up_a": [upstream_run],
+            }
+        )
+        sensor = _build_dep_sensor("pl-down-1", ["pl-up-a"])
+        body = sensor._run_status_sensor_fn  # type: ignore[attr-defined]
+        out = list(body(_StubContext(upstream_run, instance)))
+        assert len(out) == 1
+        request = out[0]
+        assert isinstance(request, RunRequest)
+        assert request.run_key == "upstream-1"
+
+    def test_yields_skip_reason_naming_the_stale_upstream_when_one_is_behind(self) -> None:
+        """One upstream's latest SUCCESS ends at 50 (< downstream start
+        100). The chain must NOT fire; the `SkipReason` must name the
+        upstream that is behind (so the UI can render "waiting on pl-up-b").
+        A bare "wait" would force the operator to read the sensor's
+        `monitored_jobs` to figure out which dependency stalled."""
+        upstream_run = _FakeDagsterRun(
+            job_name="authored__pl_up_a",
+            run_id="upstream-1",
+            status=DagsterRunStatus.SUCCESS,
+            start_time=180.0,
+            end_time=200.0,
+        )
+        instance = _StubInstance(
+            {
+                "authored__pl_down_1": [
+                    _FakeDagsterRun(
+                        job_name="authored__pl_down_1",
+                        run_id="downstream-1",
+                        status=DagsterRunStatus.SUCCESS,
+                        start_time=100.0,
+                        end_time=120.0,
+                    ),
+                ],
+                # `pl-up-a` is fresh (200 > 100); `pl-up-b` is stale (50 <
+                # 100). The first stale upstream encountered is named in
+                # the skip reason -- the body returns immediately on the
+                # first failure to keep the per-tick work bounded.
+                "authored__pl_up_a": [upstream_run],
+                "authored__pl_up_b": [
+                    _FakeDagsterRun(
+                        job_name="authored__pl_up_b",
+                        run_id="upstream-b-1",
+                        status=DagsterRunStatus.SUCCESS,
+                        start_time=40.0,
+                        end_time=50.0,
+                    ),
+                ],
+            }
+        )
+        sensor = _build_dep_sensor("pl-down-1", ["pl-up-a", "pl-up-b"])
+        body = sensor._run_status_sensor_fn  # type: ignore[attr-defined]
+        out = list(body(_StubContext(upstream_run, instance)))
+        assert len(out) == 1
+        reason = out[0]
+        assert not isinstance(reason, RunRequest)
+        # `SkipReason.skip_message` is the documented attribute (str).
+        assert "pl-up-b" in reason.skip_message
+        # The body should have asked for the stale upstream's runs and
+        # stopped -- no need to query `pl-up-a` again on the same tick.
+        upstream_b_calls = [
+            c
+            for c in instance.calls
+            if c[0] is not None and c[0].job_name == "authored__pl_up_b"
+        ]
+        assert upstream_b_calls, "the sensor must have queried the stale upstream"
+
+    def test_yields_run_request_immediately_on_first_downstream_run(self) -> None:
+        """When the downstream has NEVER run, `downstream_start` is `None`.
+        The chain must fire on this upstream's tick: there is no prior
+        downstream start to compare against, so "after the downstream's
+        start" is trivially satisfied. Without this rule, the very first
+        run of any chained downstream would never fire -- it would always
+        see its upstream's latest SUCCESS as "before the downstream's
+        start" because there is no downstream start."""
+        upstream_run = _FakeDagsterRun(
+            job_name="authored__pl_up_a",
+            run_id="upstream-1",
+            status=DagsterRunStatus.SUCCESS,
+            start_time=10.0,
+            end_time=20.0,
+        )
+        instance = _StubInstance(
+            {
+                "authored__pl_down_1": [],
+                "authored__pl_up_a": [upstream_run],
+            }
+        )
+        sensor = _build_dep_sensor("pl-down-1", ["pl-up-a"])
+        body = sensor._run_status_sensor_fn  # type: ignore[attr-defined]
+        out = list(body(_StubContext(upstream_run, instance)))
+        assert len(out) == 1
+        assert isinstance(out[0], RunRequest)
+        assert out[0].run_key == "upstream-1"
+
+    def test_queries_only_success_runs_for_upstreams(self) -> None:
+        """The freshness walk asks `context.instance.get_runs` with
+        `statuses=[DagsterRunStatus.SUCCESS]` for every upstream. A FAILURE
+        run on the upstream does not refresh the chain -- otherwise a
+        failing upstream whose last successful run was ages ago would
+        silence the sensor into a false-green. The downstream query has no
+        status filter (it just needs the latest start)."""
+        upstream_run = _FakeDagsterRun(
+            job_name="authored__pl_up_a",
+            run_id="upstream-1",
+            status=DagsterRunStatus.SUCCESS,
+            start_time=180.0,
+            end_time=200.0,
+        )
+        instance = _StubInstance(
+            {
+                "authored__pl_down_1": [
+                    _FakeDagsterRun(
+                        job_name="authored__pl_down_1",
+                        run_id="downstream-1",
+                        status=DagsterRunStatus.SUCCESS,
+                        start_time=100.0,
+                        end_time=120.0,
+                    ),
+                ],
+                "authored__pl_up_a": [upstream_run],
+            }
+        )
+        sensor = _build_dep_sensor("pl-down-1", ["pl-up-a"])
+        body = sensor._run_status_sensor_fn  # type: ignore[attr-defined]
+        list(body(_StubContext(upstream_run, instance)))
+        upstream_queries = [
+            f
+            for f, _limit in instance.calls
+            if f is not None and f.job_name == "authored__pl_up_a"
+        ]
+        assert upstream_queries, "the sensor must have queried the upstream"
+        for f in upstream_queries:
+            assert f.statuses == [DagsterRunStatus.SUCCESS]
+
+    def test_treats_missing_upstream_success_run_as_stale(self) -> None:
+        """An upstream that has NEVER had a SUCCESS run is stale by
+        definition. The `latest is None` branch must produce a
+        `SkipReason` -- the chain cannot fire on hope."""
+        upstream_run = _FakeDagsterRun(
+            job_name="authored__pl_up_a",
+            run_id="upstream-1",
+            status=DagsterRunStatus.SUCCESS,
+            start_time=180.0,
+            end_time=200.0,
+        )
+        instance = _StubInstance(
+            {
+                "authored__pl_down_1": [
+                    _FakeDagsterRun(
+                        job_name="authored__pl_down_1",
+                        run_id="downstream-1",
+                        status=DagsterRunStatus.SUCCESS,
+                        start_time=100.0,
+                        end_time=120.0,
+                    ),
+                ],
+                # No `authored__pl_up_a` entry -> instance.get_runs
+                # returns `[]`. The walk must still treat this as stale.
+            }
+        )
+        sensor = _build_dep_sensor("pl-down-1", ["pl-up-a"])
+        body = sensor._run_status_sensor_fn  # type: ignore[attr-defined]
+        out = list(body(_StubContext(upstream_run, instance)))
+        assert len(out) == 1
+        assert "pl-up-a" in out[0].skip_message
+
+    def test_uses_job_selector_with_dagster_native_id_when_upstream_is_native(self) -> None:
+        """When `depends_on` lists a Dagster-native job (e.g. `ingest_job`,
+        not a `pl-` id), the sensor watches that job's SUCCESS runs
+        verbatim -- Dagster itself resolves the selector to a job that is
+        not in this code location, which is the whole point of
+        `JobSelector(job_name=id)` (vs the authored branch, which goes
+        through `_dagster_safe_name`)."""
+        upstream_run = _FakeDagsterRun(
+            job_name="ingest_job",
+            run_id="ingest-1",
+            status=DagsterRunStatus.SUCCESS,
+            start_time=180.0,
+            end_time=200.0,
+        )
+        instance = _StubInstance(
+            {
+                "authored__pl_down_1": [
+                    _FakeDagsterRun(
+                        job_name="authored__pl_down_1",
+                        run_id="downstream-1",
+                        status=DagsterRunStatus.SUCCESS,
+                        start_time=100.0,
+                        end_time=120.0,
+                    ),
+                ],
+                "ingest_job": [upstream_run],
+            }
+        )
+        sensor = _build_dep_sensor("pl-down-1", ["ingest_job"])
+        body = sensor._run_status_sensor_fn  # type: ignore[attr-defined]
+        out = list(body(_StubContext(upstream_run, instance)))
+        assert len(out) == 1
+        assert isinstance(out[0], RunRequest)
+        assert out[0].run_key == "ingest-1"
 
 
 class PerPipelineRetryPolicyTest(unittest.TestCase):

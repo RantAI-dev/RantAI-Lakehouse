@@ -74,6 +74,226 @@ pub fn schedule_name(id: &str) -> String {
     format!("{}_schedule", job_name(id))
 }
 
+/// The dependency-sensor name `authored_factory.py` gives pipeline `id`
+/// when `id` has `depends_on` populated. The Python factory builds one
+/// `run_status_sensor` per downstream pipeline with non-empty
+/// `depends_on`, named `authored__<safe_id>_after` so the same sanitize
+/// rule that gives `job_name` / `schedule_name` matches here. R3 plan 2a.
+#[must_use]
+pub fn sensor_name(id: &str) -> String {
+    format!("{}_after", job_name(id))
+}
+
+/// Maximum number of upstream pipelines a downstream may declare. The
+/// chosen cap is small enough that an ALL-semantics sensor's per-tick
+/// freshness walk stays cheap (10 sequential `instance.get_runs` calls
+/// against a local SQLite/Postgres instance — see the dependency sensor
+/// in `dagster/dispar_orchestrate/authored_factory.py`) and large enough
+/// that no realistic "Bronze → Silver → Gold" chain in this product
+/// needs to argue the case with the validator.
+pub const MAX_DEPENDS_ON: usize = 10;
+
+/// Load the `(id, depends_on)` for every authored pipeline so
+/// [`validate_depends_on`] can run its cycle walk. One query, regardless
+/// of how many pipelines exist — the walk is the cheap part, the fetch
+/// is the bounded part.
+///
+/// `exclude_id` lets the create/update paths omit the row they are about
+/// to write from the lookup (the validator substitutes the proposed
+/// `depends_on` for `exclude_id`); passing `None` includes every row,
+/// which is what the detail route uses to compute `downstream`.
+pub async fn collect_authored_depends_on(
+    pool: &lakehouse_store::PgPool,
+    exclude_id: Option<&str>,
+) -> Result<Vec<(String, Vec<String>)>, ApiRejection> {
+    // Routes this function is called from already wrapped the 503/500
+    // path in `crate::routes::pipelines::pool(&state)?`. A real failure
+    // here would be a database outage, classified through the same
+    // [`lakehouse_store::StoreError`] -> [`ApiError`] mapping every
+    // other store call uses (AGENTS.md rule 4: never leak upstream text
+    // into a response).
+    let rows: Vec<(String, Vec<String>)> = sqlx::query_as(
+        "SELECT id, depends_on FROM pipeline_definition \
+         WHERE ($1::text IS NULL OR id <> $1) ORDER BY created_at",
+    )
+    .bind(exclude_id)
+    .fetch_all(pool)
+    .await
+    .map_err(lakehouse_store::StoreError::from)?;
+    Ok(rows)
+}
+
+/// Validate `new_depends_on` for pipeline `this_id` against the existing
+/// authored graph and the orchestrator's live Dagster jobs. Pure
+/// function — every input is passed in by the caller, no I/O here.
+///
+/// Returns `Ok(())` when the proposed set is acceptable; the route turns
+/// `Err(ApiRejection)` into a 400 with the validator's own message,
+/// which names the offending id verbatim.
+///
+/// Rules (in this order, so the cheapest rejection wins):
+///
+/// 1. No self-reference (`this_id` listed in `new_depends_on`).
+/// 2. Each id is an authored pipeline that currently exists in `others`
+///    or a Dagster job the orchestrator lists in `dagster_jobs`.
+/// 3. At most [`MAX_DEPENDS_ON`] entries.
+/// 4. No cycle across authored pipelines (DFS over authored `depends_on`):
+///    starting from any of `new_depends_on`'s ids, the walk must never
+///    reach `this_id`. The walk treats `this_id` as having
+///    `new_depends_on` (the proposed set), not its previous value, so a
+///    sequence like `A → B`, `B → C`, `C → A` is caught when the user
+///    submits the third edit — not silently allowed by reading the
+///    pre-update graph.
+pub fn validate_depends_on(
+    this_id: &str,
+    new_depends_on: &[String],
+    others: &[(String, Vec<String>)],
+    dagster_jobs: &[String],
+) -> Result<(), ApiRejection> {
+    // Rule 1: self-reference. Not a cycle in the graph-theory sense (it
+    // terminates at `this_id`), but a pipeline that depends on itself is
+    // semantically broken: the sensor would fire only after a SUCCESS
+    // run of itself, which can never start until the sensor fires, so
+    // the chain deadlocks forever.
+    if new_depends_on.iter().any(|d| d == this_id) {
+        return Err(ApiError::BadRequest(format!(
+            "depends_on must not include the pipeline's own id ({this_id:?})"
+        ))
+        .into());
+    }
+
+    // Rule 3: count cap. Checked before "is every id valid" so an over-cap
+    // submission always gets the same error shape regardless of which id
+    // is invalid — the route does not echo caller input, but the count
+    // cap is a stable invariant every caller can compute from their own
+    // input.
+    if new_depends_on.len() > MAX_DEPENDS_ON {
+        return Err(ApiError::BadRequest(format!(
+            "depends_on has {} entries, the maximum is {MAX_DEPENDS_ON}",
+            new_depends_on.len()
+        ))
+        .into());
+    }
+
+    // Rule 2: every id resolves to an authored pipeline or a Dagster
+    // job. `others` is the full authored set with the caller's prior
+    // `depends_on` for this_id (already replaced by `new_depends_on` —
+    // see `validate_no_cycle`); the lookup is a linear scan because
+    // `others` has at most a few dozen entries and the validator is
+    // called once per write.
+    for dep in new_depends_on {
+        let is_authored = others.iter().any(|(id, _)| id == dep);
+        let is_dagster = dagster_jobs.iter().any(|j| j == dep);
+        if !is_authored && !is_dagster {
+            return Err(ApiError::BadRequest(format!(
+                "depends_on references unknown pipeline {dep:?} \
+                 (must be an existing authored pipeline id or a Dagster job name)"
+            ))
+            .into());
+        }
+    }
+
+    // Rule 4: cycle detection. Build an "effective" view of the graph
+    // where `this_id`'s `depends_on` is the proposed new set, then DFS
+    // from every proposed upstream; any path that reaches `this_id` is a
+    // cycle (a→b→…→a).
+    validate_no_cycle(this_id, new_depends_on, others)
+}
+
+/// Reverse-reference lookup for the delete guard: every authored
+/// pipeline whose `depends_on` lists `target_id`. Used by
+/// [`delete`] to refuse removal of an upstream that another pipeline
+/// still references (final-review fix, "dangling `depends_on` after
+/// upstream deletion"). Pure function, no I/O — extracted from the
+/// route so the reverse walk is unit-tested directly: the route
+/// itself cannot be tested at this seam without a real pool (the
+/// existing `state_without_pool()` test fixture returns 503 before
+/// any guard runs), so the guard's correctness lives here.
+///
+/// Order is preserved from `pairs` (the SQL query behind
+/// [`collect_authored_depends_on`] returns `ORDER BY created_at`,
+/// which is also the order the user sees them in the UI's pipeline
+/// list); a stable, predictable order makes the 400 message
+/// diff-friendly across runs.
+#[must_use]
+pub fn referencing_downstreams(pairs: &[(String, Vec<String>)], target_id: &str) -> Vec<String> {
+    pairs
+        .iter()
+        .filter(|(_, deps)| deps.contains(&target_id.to_owned()))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// DFS over the authored `depends_on` graph with `this_id`'s edges
+/// overridden to `new_depends_on`. Pure function, no I/O — extracted
+/// from [`validate_depends_on`] so the cycle rule has its own unit
+/// tests (the 3-cycle fixture is the regression that proves the
+/// "treat the edited row as having the proposed edges" rule is
+/// applied at the cycle walk, not at the input check).
+///
+/// Dagster-native jobs are excluded from the walk: they have no
+/// declared `depends_on` and cannot, therefore, be part of a cycle —
+/// including them here would either over-restrict or under-restrict
+/// depending on whether the walk treated their empty `depends_on` as
+/// "dead end" or "self".
+fn validate_no_cycle(
+    this_id: &str,
+    new_depends_on: &[String],
+    others: &[(String, Vec<String>)],
+) -> Result<(), ApiRejection> {
+    fn visit(
+        current: &str,
+        this_id: &str,
+        new_depends_on: &[String],
+        others: &[(String, Vec<String>)],
+        on_stack: &mut Vec<String>,
+    ) -> Result<(), String> {
+        if on_stack.iter().any(|n| n == current) {
+            // `current` is being visited on the current DFS path.
+            // When `current == this_id`, the cycle closes back to the
+            // pipeline being edited — the exact condition we are
+            // guarding against.
+            return Err(current.to_owned());
+        }
+        on_stack.push(current.to_owned());
+        // The current node's outgoing edges: the NEW set for `this_id`,
+        // every other pipeline's stored set.
+        let edges: Vec<String> = if current == this_id {
+            new_depends_on.to_vec()
+        } else {
+            others
+                .iter()
+                .find(|(id, _)| id == current)
+                .map(|(_, deps)| deps.clone())
+                .unwrap_or_default()
+        };
+        for next in edges {
+            // Skip Dagster jobs — they cannot be part of a cycle (no
+            // `depends_on`), so walking them is wasted work that would
+            // also treat their empty edge list as a terminal node and
+            // never report a cycle that actually terminates in them.
+            if others.iter().all(|(id, _)| id != &next) {
+                continue;
+            }
+            visit(&next, this_id, new_depends_on, others, on_stack)?;
+        }
+        on_stack.pop();
+        Ok(())
+    }
+    let mut on_stack = Vec::new();
+    for start in new_depends_on {
+        visit(start, this_id, new_depends_on, others, &mut on_stack).map_err(
+            |cycle_back_to| -> ApiRejection {
+                ApiError::BadRequest(format!(
+                    "depends_on would create a cycle back to pipeline {cycle_back_to:?}"
+                ))
+                .into()
+            },
+        )?;
+    }
+    Ok(())
+}
+
 /// Ask the orchestrator to rebuild its authored jobs. Best effort: the
 /// write that called this has already succeeded, and a failed reload is
 /// reported as `false`, never as the write failing. The reason is logged,
@@ -159,6 +379,14 @@ pub struct UpdateBody {
     /// leave it alone" convention).
     #[serde(default)]
     max_retries: Option<i16>,
+    /// Upstream pipeline ids (authored `pl-…` or Dagster job names). R3
+    /// plan 2a, migration `0052`. Empty list when omitted, matching the
+    /// column's `DEFAULT '{}'`. The route validates every id and the
+    /// resulting graph BEFORE calling the store (see
+    /// [`validate_depends_on`]); an invalid list is refused with 400
+    /// and writes nothing.
+    #[serde(default)]
+    depends_on: Vec<String>,
 }
 
 fn authored_only(id: &str) -> Result<(), ApiRejection> {
@@ -210,6 +438,30 @@ pub async fn update(
     {
         return Err(ApiError::BadRequest("maxRetries must be between 0 and 5".to_owned()).into());
     }
+    let pool = crate::routes::pipelines::pool(&state)?;
+    // Validate `depends_on` against the existing authored graph and the
+    // live Dagster job list — the pipeline itself does not yet have to
+    // exist for validation (the create-time path runs before the row is
+    // committed; the update path runs against its current state). Both
+    // paths refuse an invalid set with 400 BEFORE the store is touched.
+    //
+    // Dagster unreachable degrades to "no Dagster upstreams accepted"
+    // (empty list) rather than 500ing the update — see
+    // `routes::pipelines::create`'s identical treatment. The rule
+    // "no-cycle through authored pipelines" still fires; the rule
+    // "every id is a real Dagster job" cannot, so a submitted Dagster
+    // name that does not match the (unreachable) live list is treated
+    // as if no live list exists, which means the submitter will see
+    // "unknown pipeline" once Dagster is back and the rule fires again.
+    let dagster_jobs = match state.dagster.list_jobs().await {
+        Ok(j) => j,
+        Err(err) => {
+            tracing::warn!(%err, "update: dagster unreachable, depends_on accepts authored upstreams only");
+            Vec::new()
+        }
+    };
+    let others = collect_authored_depends_on(pool, Some(&id)).await?;
+    validate_depends_on(&id, &body.depends_on, &others, &dagster_jobs)?;
     let input = UpdatePipelineInput {
         kind: body.kind,
         source_zone: body.source_zone,
@@ -223,8 +475,8 @@ pub async fn update(
         owner: body.owner.filter(|o| !o.trim().is_empty()),
         description: body.description.filter(|d| !d.trim().is_empty()),
         max_retries: body.max_retries,
+        depends_on: body.depends_on,
     };
-    let pool = crate::routes::pipelines::pool(&state)?;
     let updated = pipelines::update_pipeline(pool, &id, &input)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
@@ -242,9 +494,20 @@ pub async fn update(
 /// runs stay in the orchestrator's history; its job and schedule go away
 /// on the reload that follows.
 ///
+/// Refused with 400 when another authored pipeline lists `id` in its
+/// `depends_on` — that downstream keeps the id in its graph, so
+/// deleting the upstream would leave a dangling reference the validator
+/// refuses the next time the downstream is edited, AND a sensor that
+/// watches a job that no longer exists. Better to fail closed and let
+/// the author remove the references first (final-review fix, "dangling
+/// `depends_on` after upstream deletion"). The 400 names every
+/// downstream id verbatim so the UI can highlight what to edit.
+///
 /// # Errors
 ///
-/// 404 for an unknown or non-authored id; 503/500 from the store.
+/// 404 for an unknown or non-authored id; 400 when `id` is still
+/// referenced as an upstream by another authored pipeline; 503/500
+/// from the store.
 pub async fn delete(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -257,6 +520,24 @@ pub async fn delete(
         Ok(pool) => pool,
         Err(err) => return ApiRejection(err).into_response(),
     };
+    // `exclude_id = Some(&id)` skips the row being deleted (which
+    // cannot list itself anyway — `validate_depends_on` already
+    // refuses a self-reference — but excluding it costs nothing and
+    // keeps the query bounded).
+    let others = match collect_authored_depends_on(pool, Some(&id)).await {
+        Ok(others) => others,
+        Err(err) => return err.into_response(),
+    };
+    let referencing = referencing_downstreams(&others, &id);
+    if !referencing.is_empty() {
+        return ApiRejection(ApiError::BadRequest(format!(
+            "cannot delete pipeline {id:?}: it is still referenced as an \
+             upstream by {} other pipeline(s): {referencing:?}; remove \
+             those references before deleting",
+            referencing.len()
+        )))
+        .into_response();
+    }
     match pipelines::delete_pipeline(pool, &id).await {
         Ok(true) => {
             record_pipeline_audit(&state, &principal, "pipeline.delete", &id).await;
@@ -277,8 +558,13 @@ pub async fn delete(
 /// `GET /api/pipelines/{id}/schedule-ticks` — the schedule's recent
 /// evaluations, newest first. A Dagster job's schedule is its first one
 /// (the same rule `schedule_label` follows); an authored pipeline's is
-/// `authored__<id>_schedule`. No schedule reads as an empty list with
-/// `schedule: null`; an unreachable orchestrator as `unavailable`.
+/// `authored__<id>_schedule`. R3 plan 2a also merges in the
+/// `authored__<id>_after` sensor's ticks when the pipeline has
+/// `depends_on`; each tick is tagged `kind:"schedule"` or `kind:"sensor"`
+/// so the UI can render the dependency sensor's `SkipReason` separately
+/// from the schedule's launch / skip / fail outcomes. No schedule reads
+/// as an empty list with `schedule: null`; an unreachable orchestrator as
+/// `unavailable`.
 pub async fn schedule_ticks(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let schedule = if id.starts_with("pl-") {
         Some(schedule_name(&id))
@@ -302,17 +588,61 @@ pub async fn schedule_ticks(State(state): State<AppState>, Path(id): Path<String
         )
             .into_response();
     };
-    match state.dagster.schedule_ticks(&schedule, MAX_TICKS).await {
-        Ok(ticks) => (
-            StatusCode::OK,
-            ApiJson(json!({ "schedule": schedule, "ticks": ticks, "unavailable": Value::Null })),
-        )
-            .into_response(),
+    // Fetch the schedule ticks and, for authored pipelines with
+    // `depends_on`, the dependency sensor ticks in parallel — the UI
+    // would otherwise show "no upstream checks" until the schedule's
+    // own ticks returned. A missing sensor (no `depends_on`, or one not
+    // yet rebuilt) is normal: empty list, no warning.
+    let is_authored = id.starts_with("pl-");
+    let sensor = is_authored.then(|| sensor_name(&id));
+    let (schedule_ticks, sensor_ticks) =
+        tokio::join!(state.dagster.schedule_ticks(&schedule, MAX_TICKS), async {
+            match sensor {
+                Some(name) => state
+                    .dagster
+                    .sensor_ticks(&name, MAX_TICKS)
+                    .await
+                    .map_err(|err| {
+                        tracing::warn!(
+                            %err,
+                            sensor = %name,
+                            "schedule ticks: orchestrator sensor unreachable"
+                        );
+                        err
+                    })
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            }
+        },);
+    let mut ticks: Vec<Value> =
+        Vec::with_capacity(schedule_ticks.as_ref().map_or(0, Vec::len) + sensor_ticks.len());
+    match schedule_ticks {
+        Ok(t) => ticks.extend(t.into_iter().map(|t| {
+            let mut v = serde_json::to_value(&t).unwrap_or_else(|_| json!({}));
+            if let Value::Object(obj) = &mut v {
+                obj.insert("kind".to_owned(), json!("schedule"));
+            }
+            v
+        })),
         Err(err) => {
             tracing::warn!(%err, "schedule ticks: orchestrator unreachable");
-            unavailable()
+            return unavailable();
         }
     }
+    // Sensor ticks already carry `kind:"sensor"` in the merged shape;
+    // merge in the rest, each tagged so the UI can distinguish them.
+    ticks.extend(sensor_ticks.into_iter().map(|t| {
+        let mut v = serde_json::to_value(&t).unwrap_or_else(|_| json!({}));
+        if let Value::Object(obj) = &mut v {
+            obj.insert("kind".to_owned(), json!("sensor"));
+        }
+        v
+    }));
+    (
+        StatusCode::OK,
+        ApiJson(json!({ "schedule": schedule, "ticks": ticks, "unavailable": Value::Null })),
+    )
+        .into_response()
 }
 
 fn unavailable() -> Response {
@@ -365,6 +695,221 @@ mod tests {
             "authored__pl_ui_check_flow_mumidzub"
         );
         assert_eq!(schedule_name("pl-a-1"), "authored__pl_a_1_schedule");
+    }
+
+    /// R3 plan 2a: a 3-cycle `A → B → C → A` is caught when the user
+    /// edits C's `depends_on` to `[A]`, not silently allowed because the
+    /// pre-edit `depends_on` of C is read instead. The cycle walk treats
+    /// the edited row as having the proposed edges; this is the
+    /// regression that proves the override is at the cycle walk, not at
+    /// the input check.
+    #[test]
+    fn validate_depends_on_detects_a_three_cycle_when_editing_the_closing_edge() {
+        // Pre-edit authored state: A→B, B→C; C has no `depends_on` yet.
+        let others = vec![
+            ("pl-a".to_owned(), vec!["pl-b".to_owned()]),
+            ("pl-b".to_owned(), vec!["pl-c".to_owned()]),
+            ("pl-c".to_owned(), Vec::new()),
+        ];
+        let dagster = vec!["ingest_job".to_owned()];
+        // The edit: C depends on A → A→B→C→A is a cycle. The walk
+        // returns the cycle's entry node (A, which the DFS first
+        // visited), not the edited pipeline (C, which is on the cycle
+        // path but not the node the walk re-enters through).
+        let err = validate_depends_on("pl-c", &["pl-a".to_owned()], &others, &dagster).unwrap_err();
+        let message = err.0.to_string();
+        assert!(
+            message.contains("cycle"),
+            "error must name the rule that fired: {message:?}"
+        );
+        assert!(
+            message.contains("pl-a"),
+            "error must name the cycle's entry node (the first node visited twice): {message:?}"
+        );
+    }
+
+    /// A pipeline that lists itself in its own `depends_on` is refused
+    /// before the cycle walk, with a message that names the offending
+    /// id (not a generic "invalid input" — see the route's 400 contract
+    /// for cycle/unknown-id/cap cases, all of which name the id).
+    #[test]
+    fn validate_depends_on_refuses_self_reference() {
+        let others = vec![("pl-a".to_owned(), Vec::new())];
+        let dagster: Vec<String> = Vec::new();
+        let err = validate_depends_on("pl-a", &["pl-a".to_owned()], &others, &dagster).unwrap_err();
+        let message = err.0.to_string();
+        assert!(
+            message.contains("own id") && message.contains("pl-a"),
+            "self-reference must be named plainly: {message:?}"
+        );
+    }
+
+    /// An upstream id that names neither an authored pipeline nor a
+    /// Dagster job is refused with a 400 that quotes the offending id
+    /// verbatim (the route's contract — see the spec for the "400 naming
+    /// the offending id" requirement).
+    #[test]
+    fn validate_depends_on_refuses_unknown_id_naming_it() {
+        let others = vec![("pl-a".to_owned(), Vec::new())];
+        let dagster = vec!["ingest_job".to_owned()];
+        let err =
+            validate_depends_on("pl-a", &["pl-ghost".to_owned()], &others, &dagster).unwrap_err();
+        let message = err.0.to_string();
+        assert!(
+            message.contains("pl-ghost"),
+            "unknown id must appear verbatim in the error: {message:?}"
+        );
+    }
+
+    /// At most [`MAX_DEPENDS_ON`] upstreams. The cap is the cheap,
+    /// upfront rejection — tested here against the boundary (`>10`) so
+    /// the validator's behavior at the limit is also exercised below.
+    #[test]
+    fn validate_depends_on_refuses_more_than_max_upstreams() {
+        let others = vec![("pl-a".to_owned(), Vec::new())];
+        let dagster: Vec<String> = Vec::new();
+        let too_many: Vec<String> = (0..=MAX_DEPENDS_ON).map(|i| format!("pl-up-{i}")).collect();
+        let err = validate_depends_on("pl-a", &too_many, &others, &dagster).unwrap_err();
+        let message = err.0.to_string();
+        assert!(
+            message.contains(&format!("maximum is {MAX_DEPENDS_ON}")),
+            "cap error must name the limit: {message:?}"
+        );
+    }
+
+    /// Exactly `MAX_DEPENDS_ON` upstreams is accepted — the boundary
+    /// belongs to `MAX_DEPENDS_ON`, not to `< MAX_DEPENDS_ON - 1`.
+    #[test]
+    fn validate_depends_on_accepts_exactly_max_upstreams() {
+        let mut others: Vec<(String, Vec<String>)> = (0..MAX_DEPENDS_ON)
+            .map(|i| (format!("pl-up-{i}"), Vec::<String>::new()))
+            .collect();
+        others.push(("pl-a".to_owned(), Vec::new()));
+        let at_limit: Vec<String> = (0..MAX_DEPENDS_ON).map(|i| format!("pl-up-{i}")).collect();
+        assert!(
+            validate_depends_on("pl-a", &at_limit, &others, &[]).is_ok(),
+            "exactly {MAX_DEPENDS_ON} upstreams must be accepted"
+        );
+    }
+
+    /// A Dagster-native upstream is accepted alongside authored ones; the
+    /// cycle walk skips Dagster jobs because they have no `depends_on`
+    /// (they cannot close a cycle).
+    #[test]
+    fn validate_depends_on_accepts_a_dagster_native_upstream() {
+        let others = vec![("pl-a".to_owned(), Vec::new())];
+        let dagster = vec!["ingest_job".to_owned()];
+        assert!(
+            validate_depends_on("pl-a", &["ingest_job".to_owned()], &others, &dagster).is_ok(),
+            "a Dagster job from list_jobs must be a valid upstream"
+        );
+    }
+
+    /// A chain `A → B → C` (C depends on nothing yet, A depends on B,
+    /// B depends on C) is acyclic when the user edits A's `depends_on`
+    /// to `[B, ingest_job]` — the validator must not report a cycle.
+    /// This is the negative test paired with the 3-cycle case above:
+    /// the validator doesn't false-positive on every DAG that happens
+    /// to mention C twice.
+    #[test]
+    fn validate_depends_on_accepts_a_valid_chain() {
+        let others = vec![
+            ("pl-b".to_owned(), vec!["pl-c".to_owned()]),
+            ("pl-c".to_owned(), Vec::new()),
+        ];
+        let dagster = vec!["ingest_job".to_owned()];
+        assert!(
+            validate_depends_on(
+                "pl-a",
+                &["pl-b".to_owned(), "ingest_job".to_owned()],
+                &others,
+                &dagster,
+            )
+            .is_ok(),
+            "A -> [B, ingest_job] with B -> C is not a cycle"
+        );
+    }
+
+    /// The delete guard refuses removal of an upstream that is still
+    /// referenced. With no downstreams, the helper returns an empty
+    /// list — the guard would let the delete through. Without this
+    /// negative case the helper would never be proven to handle "no
+    /// match" cleanly (a helper that always returned empty would pass
+    /// no test until the multi-downstream case was added).
+    #[test]
+    fn referencing_downstreams_returns_empty_when_no_pipeline_references_the_target() {
+        let others = vec![
+            ("pl-a".to_owned(), Vec::new()),
+            ("pl-b".to_owned(), vec!["pl-c".to_owned()]),
+        ];
+        assert!(
+            referencing_downstreams(&others, "pl-zzz").is_empty(),
+            "no pipeline lists pl-zzz in its depends_on"
+        );
+    }
+
+    /// A single pipeline that lists the target in its `depends_on`
+    /// is returned verbatim. This is the basic positive case the
+    /// delete guard's 400 message will quote.
+    #[test]
+    fn referencing_downstreams_returns_a_pipeline_that_depends_on_the_target() {
+        let others = vec![
+            ("pl-a".to_owned(), vec!["pl-up".to_owned()]),
+            ("pl-b".to_owned(), Vec::new()),
+        ];
+        assert_eq!(
+            referencing_downstreams(&others, "pl-up"),
+            vec!["pl-a".to_owned()],
+            "only pl-a lists pl-up in its depends_on"
+        );
+    }
+
+    /// Several pipelines may reference the same upstream (a "fan-in"
+    /// pattern); the helper returns every downstream in input order,
+    /// which is `ORDER BY created_at` from the SQL behind
+    /// [`collect_authored_depends_on`]. Stable order keeps the 400
+    /// message diff-friendly across runs.
+    #[test]
+    fn referencing_downstreams_returns_every_referencing_pipeline_in_input_order() {
+        let others = vec![
+            ("pl-down-1".to_owned(), vec!["pl-up".to_owned()]),
+            ("pl-down-2".to_owned(), vec!["pl-up".to_owned()]),
+            ("pl-other".to_owned(), vec!["pl-elsewhere".to_owned()]),
+            (
+                "pl-down-3".to_owned(),
+                vec!["pl-up".to_owned(), "pl-other".to_owned()],
+            ),
+        ];
+        assert_eq!(
+            referencing_downstreams(&others, "pl-up"),
+            vec![
+                "pl-down-1".to_owned(),
+                "pl-down-2".to_owned(),
+                "pl-down-3".to_owned(),
+            ],
+            "three downstreams list pl-up; pl-other does not"
+        );
+    }
+
+    /// A pipeline that lists the target alongside other upstreams
+    /// (its own fan-in graph) still counts as a downstream. Without
+    /// this case, a helper that bailed out on first-found-match or
+    /// only checked singleton `depends_on` lists would pass the
+    /// singleton test above and fail here.
+    #[test]
+    fn referencing_downstreams_includes_a_pipeline_with_a_mixed_depends_on() {
+        let others = vec![
+            (
+                "pl-down-1".to_owned(),
+                vec!["pl-up-a".to_owned(), "pl-up-b".to_owned()],
+            ),
+            ("pl-down-2".to_owned(), vec!["pl-up-b".to_owned()]),
+        ];
+        assert_eq!(
+            referencing_downstreams(&others, "pl-up-b"),
+            vec!["pl-down-1".to_owned(), "pl-down-2".to_owned()],
+            "both pipelines list pl-up-b among their upstreams"
+        );
     }
 
     /// A person holding `pipeline:read` must not read every tenant's

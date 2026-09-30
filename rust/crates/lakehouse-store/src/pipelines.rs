@@ -89,6 +89,11 @@ pub struct Pipeline {
     /// (`0047_pipeline_description.sql`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// The pipeline ids (authored `pl-…` or Dagster job names) whose
+    /// successful runs must precede this one's (migration `0052`); empty
+    /// for a pipeline that runs only on its own trigger. The factory's
+    /// `authored__<id>_after` sensor is built only when this is non-empty.
+    pub depends_on: Vec<String>,
 }
 
 /// The full stored shape of an authored pipeline's definition, returned by
@@ -139,6 +144,7 @@ struct PipelineRow {
     freshness_lag_seconds: Option<i32>,
     max_retries: i16,
     description: Option<String>,
+    depends_on: Vec<String>,
 }
 
 /// A row shape for [`get_definition`], carrying the three columns migration
@@ -183,13 +189,14 @@ impl From<PipelineRow> for Pipeline {
             freshness_lag_seconds: row.freshness_lag_seconds,
             max_retries: row.max_retries,
             description: row.description,
+            depends_on: row.depends_on,
         }
     }
 }
 
 const PIPELINE_COLUMNS: &str = "id, name, kind, status, owner, source, target, connector_id, \
      source_asset_id, target_asset_id, schedule, last_run_at, next_run_at, \
-     freshness_lag_seconds, max_retries, description";
+freshness_lag_seconds, max_retries, description, depends_on";
 
 /// Optional narrowing for [`list_pipelines`] for tenant isolation: a caller
 /// must never see a pipeline outside its own tenant.
@@ -426,6 +433,10 @@ pub struct CreatePipelineInput {
     /// console-created pipeline landed there and never appeared on the
     /// Pipelines list, the page the create form returns to.
     pub tenant_id: Option<Uuid>,
+    /// Upstream pipeline ids whose SUCCESS runs must precede this one's.
+    /// Defaults to empty when the field is absent (route omits it, the
+    /// migration's `DEFAULT '{}'` fills the column). Migration `0052`.
+    pub depends_on: Vec<String>,
 }
 
 const DEFAULT_OWNER: &str = "Current user";
@@ -461,9 +472,9 @@ pub async fn create_pipeline(
     let max_retries = input.max_retries.unwrap_or(2);
     let sql = format!(
         "INSERT INTO pipeline_definition (id, name, kind, status, owner, source, target, \
-         schedule, description, incremental_column, fbic_enabled, transforms, \
-         max_retries, tenant_id) \
-         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+schedule, description, incremental_column, fbic_enabled, transforms, \
+         max_retries, tenant_id, depends_on) \
+         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
          RETURNING {PIPELINE_COLUMNS}"
     );
     let row: PipelineRow = sqlx::query_as(&sql)
@@ -480,6 +491,7 @@ pub async fn create_pipeline(
         .bind(&transforms)
         .bind(max_retries)
         .bind(input.tenant_id)
+        .bind(&input.depends_on)
         .fetch_one(pool)
         .await?;
     Ok(row.into())
@@ -521,6 +533,11 @@ pub struct UpdatePipelineInput {
     /// value (the CHECK constraint in `0051_pipeline_max_retries.sql` is
     /// defense in depth, not the primary safety boundary).
     pub max_retries: Option<i16>,
+    /// Upstream pipeline ids whose SUCCESS runs must precede this one's
+    /// (migration `0052`). Defaults to empty (the route passes `[]` when
+    /// the body omits the field, and the migration's `DEFAULT '{}'`
+    /// accepts the empty value).
+    pub depends_on: Vec<String>,
 }
 
 /// Replace an authored pipeline's definition. Its status is left as it
@@ -546,7 +563,8 @@ pub async fn update_pipeline(
     let sql = format!(
         "UPDATE pipeline_definition SET kind = $2, source = $3, target = $4, schedule = $5, \
          description = $6, incremental_column = $7, fbic_enabled = $8, transforms = $9, \
-         owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries) \
+owner = COALESCE($10, owner), max_retries = COALESCE($11, max_retries), \
+         depends_on = $12 \
          WHERE id = $1 RETURNING {PIPELINE_COLUMNS}"
     );
     let row: Option<PipelineRow> = sqlx::query_as(&sql)
@@ -561,6 +579,7 @@ pub async fn update_pipeline(
         .bind(&transforms)
         .bind(&input.owner)
         .bind(input.max_retries)
+        .bind(&input.depends_on)
         .fetch_optional(pool)
         .await?;
     Ok(row.map(Pipeline::from))
@@ -596,6 +615,14 @@ pub struct RunnablePipeline {
     pub schedule: String,
     /// The stored definition the job is built from.
     pub definition: AuthoredDefinition,
+    /// Upstream pipeline ids whose SUCCESS runs must precede this one's
+    /// (migration `0052`). The factory's import-time `GET
+    /// /api/pipelines/runnable` call must carry it, otherwise the
+    /// `authored__<id>_after` sensor would have to make a second
+    /// round-trip per pipeline to read it — see `authored_factory.py`'s
+    /// docstring on "every way this degrades to empty lists without
+    /// raising" for why a second fetch would defeat that.
+    pub depends_on: Vec<String>,
 }
 
 /// Every authored pipeline in status `ready` or `paused`, across all
@@ -608,14 +635,14 @@ pub struct RunnablePipeline {
 ///
 /// Returns [`StoreError::Database`] if a query fails.
 pub async fn list_runnable_pipelines(pool: &PgPool) -> Result<Vec<RunnablePipeline>, StoreError> {
-    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
-        "SELECT id, name, status, schedule FROM pipeline_definition \
+    let rows: Vec<(String, String, String, String, Vec<String>)> = sqlx::query_as(
+        "SELECT id, name, status, schedule, depends_on FROM pipeline_definition \
          WHERE status IN ('ready', 'paused') ORDER BY created_at",
     )
     .fetch_all(pool)
     .await?;
     let mut out = Vec::with_capacity(rows.len());
-    for (id, name, status, schedule) in rows {
+    for (id, name, status, schedule, depends_on) in rows {
         // A row deleted between the two reads simply drops out.
         if let Some(definition) = get_definition(pool, &id).await? {
             out.push(RunnablePipeline {
@@ -624,6 +651,7 @@ pub async fn list_runnable_pipelines(pool: &PgPool) -> Result<Vec<RunnablePipeli
                 status,
                 schedule,
                 definition,
+                depends_on,
             });
         }
     }
@@ -866,6 +894,7 @@ mod tests {
             freshness_lag_seconds: Some(0),
             max_retries: 2,
             description: None,
+            depends_on: Vec::new(),
         };
         let value = serde_json::to_value(&pipeline).unwrap();
         for key in [
@@ -880,6 +909,7 @@ mod tests {
             "lastRunAt",
             "slaOk",
             "freshnessLagSeconds",
+            "dependsOn",
             "maxRetries",
         ] {
             assert!(value.get(key).is_some(), "Pipeline is missing `{key}`");
@@ -914,6 +944,7 @@ mod tests {
             freshness_lag_seconds: None,
             max_retries: 2,
             description: None,
+            depends_on: Vec::new(),
         };
         let pipeline = Pipeline::from(row);
         assert_eq!(pipeline.last_run_at, None);
@@ -953,12 +984,18 @@ mod tests {
             freshness_lag_seconds: Some(42),
             max_retries: 3,
             description: Some("does a thing".to_owned()),
+            depends_on: vec!["pl-up".to_owned(), "ingest_job".to_owned()],
         };
         let pipeline = Pipeline::from(row);
         assert_eq!(pipeline.last_run_at, Some(iso_millis(ran_at)));
         assert_eq!(pipeline.sla_ok, None);
         assert_eq!(pipeline.freshness_lag_seconds, Some(42));
         assert_eq!(pipeline.description.as_deref(), Some("does a thing"));
+        assert_eq!(
+            pipeline.depends_on,
+            vec!["pl-up".to_owned(), "ingest_job".to_owned()],
+            "depends_on must round-trip the text[] column verbatim",
+        );
     }
 
     #[test]

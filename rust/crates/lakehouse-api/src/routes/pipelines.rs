@@ -719,6 +719,30 @@ async fn authored_detail(state: &AppState, id: &str) -> Response {
     } else {
         state.dagster.job_graph(&job).await.ok()
     };
+    // R3 plan 2a: surface the dependency graph on the detail payload.
+    // Upstream is `id, name, lastSuccessAt` for every entry in
+    // `pipeline.depends_on` — the freshness field is what the user looks
+    // at to read the dependency sensor's skip reason ("upstream X has not
+    // had a successful run since this pipeline's last start"). Downstream
+    // is every authored pipeline whose `depends_on` contains this id.
+    // Dagster-native jobs are not in this DB, so downstream is scoped to
+    // authored pipelines; Dagster jobs that happen to be triggered by an
+    // authored pipeline are visible via that pipeline's upstream list,
+    // not here.
+    let upstream = match detail_upstream(state, pool, &pipeline.depends_on).await {
+        Ok(u) => u,
+        Err(err) => {
+            tracing::warn!(error = %err.0, "authored_detail: upstream lookup failed");
+            return err.into_response();
+        }
+    };
+    let downstream = match detail_downstream(pool, id).await {
+        Ok(d) => d,
+        Err(err) => {
+            tracing::warn!(error = %err.0, "authored_detail: downstream lookup failed");
+            return err.into_response();
+        }
+    };
     let mut body = serde_json::to_value(&pipeline).unwrap_or_else(|_| json!({}));
     if let Value::Object(obj) = &mut body {
         obj.insert("engine".to_owned(), json!("authored"));
@@ -749,8 +773,95 @@ async fn authored_detail(state: &AppState, id: &str) -> Response {
                 serde_json::to_value(d).unwrap_or(Value::Null)
             }),
         );
+        obj.insert("upstream".to_owned(), json!(upstream));
+        obj.insert("downstream".to_owned(), json!(downstream));
     }
     (StatusCode::OK, ApiJson(body)).into_response()
+}
+
+/// Build the `upstream` array for `authored_detail`: one entry per id
+/// in `depends_on`, each with its display name and the timestamp of the
+/// most recent `SUCCESS` run, or `null` when there has never been one.
+/// Dagster-native upstreams and authored upstreams go through the same
+/// `list_runs_for_job` path; authored ids are first mapped through
+/// `authored_pipelines::job_name` because the orchestrator's `runsOrError`
+/// filter matches on `pipelineName`, which is the safe name the factory
+/// gives the job. R3 plan 2a.
+async fn detail_upstream(
+    state: &AppState,
+    pool: &PgPool,
+    depends_on: &[String],
+) -> Result<Value, ApiRejection> {
+    let mut upstream = Vec::with_capacity(depends_on.len());
+    for dep in depends_on {
+        let (display_name, job_lookup_name) = if dep.starts_with("pl-") {
+            // `get_pipeline` on an unknown id returns `Ok(None)`; we
+            // emit `name = null` rather than 500ing the whole detail
+            // route — a missing upstream is a configuration drift (an
+            // id renamed out from under `depends_on`) and the user
+            // needs to see the rest of the page to diagnose it.
+            let display = match pipelines::get_pipeline(pool, dep).await? {
+                Some(p) => p.name,
+                None => String::new(),
+            };
+            (display, authored_pipelines::job_name(dep))
+        } else {
+            (dep.clone(), dep.clone())
+        };
+        // `list_runs_for_job(limit=50)` is what `runs.rs` already uses
+        // for the per-pipeline runs list — the smallest bound where a
+        // skipped upstream (no runs in the last 30 days) reliably
+        // returns the most recent SUCCESS instead of paging the full
+        // history. The sensor itself uses `limit=1`; the detail view
+        // wants more context than that.
+        let last_success_at = match state.dagster.list_runs_for_job(&job_lookup_name, 50).await {
+            Ok(runs) => runs
+                .iter()
+                .find(|r| r.status == "SUCCESS")
+                .and_then(|r| r.end_time),
+            Err(err) => {
+                tracing::warn!(%err, job=%job_lookup_name, "upstream runs lookup failed");
+                // Orchestrator unreachable is a degraded-but-not-fatal
+                // condition here; surface `null` and let the page render
+                // with the freshness field missing rather than 500 the
+                // whole detail page.
+                None
+            }
+        };
+        upstream.push(json!({
+            "id": dep,
+            "name": display_name,
+            "lastSuccessAt": last_success_at,
+        }));
+    }
+    Ok(json!(upstream))
+}
+
+/// Build the `downstream` array for `authored_detail`: every authored
+/// pipeline whose `depends_on` contains `this_id`, with its display
+/// name. R3 plan 2a.
+async fn detail_downstream(pool: &PgPool, this_id: &str) -> Result<Value, ApiRejection> {
+    let others = authored_pipelines::collect_authored_depends_on(pool, None).await?;
+    let mut downstream = Vec::new();
+    for (id, deps) in others {
+        if !deps.iter().any(|d| d == this_id) {
+            continue;
+        }
+        // Same `display_name` rule as upstream: empty when the row has
+        // been deleted between `collect_authored_depends_on` and
+        // `get_pipeline` (drift, not 500). Authored pipelines are the
+        // only kind that can appear here — Dagster jobs' dependency
+        // relationships live in code, not in the DB.
+        let display_name = match pipelines::get_pipeline(pool, &id).await? {
+            Some(p) => p.name,
+            None => String::new(),
+        };
+        downstream.push(json!({
+            "id": id,
+            "name": display_name,
+        }));
+    }
+    Ok(json!(downstream))
 }
 
 /// `GET /api/pipelines/{id}/source?op=<sourceRef>` — read-only op source
@@ -1770,6 +1881,12 @@ pub struct CreatePipelineBody {
     /// (`op_metadata.DEFAULT_RETRY_POLICY`).
     #[serde(default)]
     max_retries: Option<i16>,
+    /// Upstream pipeline ids whose SUCCESS runs must precede this one's.
+    /// R3 plan 2a, migration `0052`. Validated in [`create`] against the
+    /// existing authored graph + live `DgClient::list_jobs` BEFORE any
+    /// write happens — same posture as `transforms` above.
+    #[serde(default)]
+    depends_on: Vec<String>,
 }
 
 /// `POST /api/pipelines` — author a new pipeline definition. Returns 201.
@@ -1812,6 +1929,37 @@ pub async fn create(
     {
         return Err(ApiError::BadRequest("maxRetries must be between 0 and 5".to_owned()).into());
     }
+    // Validate `depends_on` against the live authored graph + Dagster
+    // job list. The new pipeline's id is not yet known at this point
+    // (slug_id derives it from `name` inside `create_pipeline`), so the
+    // validator cannot substitute the row's own `depends_on`; the
+    // pipeline is treated as "id = body.name" for self-reference and
+    // cycle purposes — the same id the slug will produce for a
+    // well-formed slug, and a safe-enough unique string for a name
+    // collision case (the store rejects that with 409 downstream, the
+    // validator refuses a self-reference against `body.name` regardless).
+    //
+    // Dagster unreachable degrades to "no Dagster upstreams accepted"
+    // (empty list) rather than 500ing the create. The schedule-ticks
+    // route uses the same pattern — a missing orchestrator on a write
+    // path is a configuration problem the operator reads about in the
+    // logs, not a reason to refuse a create that the rest of the store
+    // would happily accept.
+    let dagster_jobs = match state.dagster.list_jobs().await {
+        Ok(j) => j,
+        Err(err) => {
+            tracing::warn!(%err, "create: dagster unreachable, depends_on accepts authored upstreams only");
+            Vec::new()
+        }
+    };
+    let others =
+        crate::routes::authored_pipelines::collect_authored_depends_on(pool(&state)?, None).await?;
+    crate::routes::authored_pipelines::validate_depends_on(
+        &body.name,
+        &body.depends_on,
+        &others,
+        &dagster_jobs,
+    )?;
     let input = CreatePipelineInput {
         name: body.name,
         kind: body.kind,
@@ -1827,6 +1975,7 @@ pub async fn create(
         description: body.description,
         max_retries: body.max_retries,
         tenant_id,
+        depends_on: body.depends_on,
     };
     let created = create_named_pipeline(pool(&state)?, &input).await?;
     // WS5 item D4: best-effort, never turns a successful create into an
@@ -1974,6 +2123,11 @@ pub async fn generate(
         // honest answer for a draft nobody has asked to tune.
         max_retries: None,
         tenant_id,
+        // Agentic-builder output never carries upstream wiring: a draft
+        // proposed by the LLM is validated against the grammar and the
+        // table schema, never the chain semantics — those are an
+        // author's deliberate call, not an LLM's. R3 plan 2a.
+        depends_on: Vec::new(),
     };
     let created = create_named_pipeline(pool(&state)?, &input).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
