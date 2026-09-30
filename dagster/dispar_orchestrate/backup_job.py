@@ -83,11 +83,25 @@ def resolve_secret_ref(ref: str) -> str:
     so there is no allowlist to bypass, unlike `lakehouse-api`'s
     `AllowlistedSecretResolver` (see module doc)."""
     if not ref.startswith("env:"):
-        raise Failure(f"unsupported secret ref scheme: {ref!r}")
+        # PART D: this is a config-shaped failure (the ref shape is
+        # wrong) -- retrying with the same input gets the same answer.
+        # `allow_retries=False` keeps the FAILURE in the same shape
+        # Dagster uses for config problems elsewhere (this script is
+        # not itself a Dagster op today, but the contract is uniform).
+        raise Failure(
+            f"unsupported secret ref scheme: {ref!r}", allow_retries=False
+        )
     var = ref.removeprefix("env:")
     value = os.environ.get(var)
     if not value:
-        raise Failure(f"secret ref {ref!r} points at unset env var {var!r}")
+        # PART D: an unset env var the ref points at is a deployment
+        # configuration problem -- retrying with the same input cannot
+        # make the env var appear. `allow_retries=False` short-circuits
+        # the retry contract for the same reason.
+        raise Failure(
+            f"secret ref {ref!r} points at unset env var {var!r}",
+            allow_retries=False,
+        )
     return value
 
 
@@ -110,9 +124,18 @@ class BackupConfig:
         access_ref = os.environ.get("BACKUP_S3_ACCESS_KEY_SECRET_REF")
         secret_ref = os.environ.get("BACKUP_S3_SECRET_KEY_SECRET_REF")
         if not (endpoint and bucket and access_ref and secret_ref):
+            # PART D: missing required env vars is a deployment
+            # configuration problem -- retrying cannot make an unset
+            # env var appear. `allow_retries=False` is the canonical
+            # non-retryable marking for this shape. (`backup_job` is a
+            # CLI script today, not a Dagster op; the `allow_retries`
+            # flag is set for consistency with the rest of the code
+            # location's config-failure contract and so the contract is
+            # already correct if this script is ever wired as an op.)
             raise Failure(
                 "BACKUP_S3_ENDPOINT/BACKUP_S3_BUCKET/BACKUP_S3_ACCESS_KEY_SECRET_REF/"
-                "BACKUP_S3_SECRET_KEY_SECRET_REF must all be set"
+                "BACKUP_S3_SECRET_KEY_SECRET_REF must all be set",
+                allow_retries=False,
             )
         return cls(
             endpoint=endpoint,

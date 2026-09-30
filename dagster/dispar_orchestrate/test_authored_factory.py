@@ -192,25 +192,60 @@ class OpForPipelineTest(unittest.TestCase):
 
         self.assertEqual(result["skipped_verbs"], [authored_factory.FBIC_UNSUPPORTED_REASON])
 
-    def test_a_rejected_transform_raises_rather_than_being_dropped(self) -> None:
+    def test_a_rejected_transform_raises_a_non_retryable_failure_wrapping_transform_error(
+        self,
+    ) -> None:
+        """PART D: `TransformError` from `parse_transform` is a config
+        rejection -- the transform string is wrong, retrying with the
+        same string gets the same answer. The `_run` op body wraps it
+        in `Failure(allow_retries=False)`, the original `TransformError`
+        is preserved as `__cause__` (the message names the offending
+        field), and the run fails on the first attempt without burning
+        60s on retries that cannot succeed."""
+        from dagster import Failure
+
         pipeline = _ready_pipeline(transforms=["exec(rm -rf /)"])
         run_fn = authored_factory._op_for_pipeline(pipeline)
-        with self.assertRaises(authored_transforms.TransformError):
+        with self.assertRaises(Failure) as ctx:
             run_fn(build_op_context())
+        self.assertFalse(ctx.exception.allow_retries)
+        self.assertIsInstance(ctx.exception.__cause__, authored_transforms.TransformError)
 
-    def test_connector_sourced_pipeline_raises_an_honest_unsupported_error(self) -> None:
+    def test_connector_sourced_pipeline_raises_a_non_retryable_failure_wrapping_authored_job_error(
+        self,
+    ) -> None:
+        """PART D: an authored pipeline that names a `connectorId` is
+        not implemented by this build (see `CONNECTOR_SOURCE_UNSUPPORTED_REASON`)
+        -- a missing-feature gap, never a transient failure. Wrapped in
+        `Failure(allow_retries=False)` so the run fails loudly on the
+        first attempt."""
+        from dagster import Failure
+
         pipeline = _ready_pipeline(connectorId="conn-1")
         run_fn = authored_factory._op_for_pipeline(pipeline)
-        with self.assertRaises(authored_factory.AuthoredJobError) as ctx:
+        with self.assertRaises(Failure) as ctx:
             run_fn(build_op_context())
+        self.assertFalse(ctx.exception.allow_retries)
         self.assertIn("connector-sourced", str(ctx.exception))
+        self.assertIsInstance(ctx.exception.__cause__, authored_factory.AuthoredJobError)
 
-    def test_an_unsafe_identifier_raises_rather_than_reaching_sql(self) -> None:
+    def test_an_unsafe_identifier_raises_a_non_retryable_failure_and_reaches_no_sql(
+        self,
+    ) -> None:
+        """PART D: an unsafe ClickHouse identifier in any of the four
+        identifier fields is a config rejection -- retrying with the
+        same string gets the same answer. Wrapped in
+        `Failure(allow_retries=False)`, and `_ch_exec` is never
+        called (the guard fires before any SQL is built)."""
+        from dagster import Failure
+
         pipeline = _ready_pipeline(targetTable="orders; DROP TABLE x")
         run_fn = authored_factory._op_for_pipeline(pipeline)
         with mock.patch.object(authored_factory, "_ch_exec") as mocked_exec:
-            with self.assertRaises(authored_factory.AuthoredJobError):
+            with self.assertRaises(Failure) as ctx:
                 run_fn(build_op_context())
+        self.assertFalse(ctx.exception.allow_retries)
+        self.assertIsInstance(ctx.exception.__cause__, authored_factory.AuthoredJobError)
         mocked_exec.assert_not_called()
 
 

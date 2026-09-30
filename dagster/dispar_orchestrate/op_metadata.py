@@ -3,6 +3,15 @@ in this code location declares where its own source lives and which
 commit it was built from, so `GET /api/pipelines/{id}/source?op=` can
 serve real text and detect a stale build (`GIT_SHA` mismatch -> 409).
 
+Also exposes `DEFAULT_RETRY_POLICY`: the single `dagster.RetryPolicy`
+every `@op` in this code location is wired with. Transient blips — a
+network hiccup, a busy ClickHouse — deserve two self-healing attempts
+with exponential backoff and jitter (so synchronized retries do not
+arrive as a single thundering herd); config, auth, SSRF, and
+column-type failures are exempted at the call site via
+`dagster.Failure(allow_retries=False)`, so this policy never masks a
+real misconfiguration as a silent retry.
+
 # Deviation from the plan sketch (see `test_op_source_metadata.py`)
 
 The plan's sketch attaches this dict via `@op(metadata=...)`. Against the
@@ -19,6 +28,15 @@ from __future__ import annotations
 import os
 from collections.abc import Sequence
 
+from dagster import Backoff, Jitter, RetryPolicy
+
+DEFAULT_RETRY_POLICY = RetryPolicy(
+    max_retries=2,
+    delay=30,
+    backoff=Backoff.EXPONENTIAL,
+    jitter=Jitter.PLUS_MINUS,
+)
+
 
 def source_metadata(
     source_ref: str,
@@ -31,7 +49,7 @@ def source_metadata(
     `source_ref` must be `"dispar_orchestrate/<file>.py::<function>"` —
     the exact shape `pipeline_source.rs` (Phase C) validates against its
     allowlist. `sql` is the literal statement template for an op that
-    executes one (e.g. `run_bronze_maintenance`'s `REMOVE ORPHAN FILES`
+    executes one (e.g. `maintain_bronze_table`'s `REMOVE ORPHAN FILES`
     call) — omitted (not empty string) for ops with no single SQL
     statement to show.
 

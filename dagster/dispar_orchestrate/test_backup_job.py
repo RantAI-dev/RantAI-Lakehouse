@@ -59,6 +59,42 @@ def test_resolve_secret_ref_rejects_anything_but_the_env_scheme():
         resolve_secret_ref("vault:some/path")
 
 
+def test_resolve_secret_ref_config_rejections_mark_the_failure_non_retryable():
+    """PART D witness: `backup_job.resolve_secret_ref`'s config-shape
+    rejections (unsupported scheme, unset env var) raise
+    `Failure(allow_retries=False)` so a future wiring of this script
+    as a Dagster op inherits the canonical non-retryable contract
+    without a separate patch. `pg_dump` failures stay retryable
+    (default `allow_retries=True`) -- a transient database-side
+    problem, not a config rejection. `backup_job.py:158` is left
+    alone for that reason (see the in-file PART D comment)."""
+    with pytest.raises(Failure) as ctx:
+        resolve_secret_ref("vault:some/path")
+    assert ctx.value.allow_retries is False
+
+
+def test_backup_config_from_env_missing_required_envs_marks_the_failure_non_retryable(
+    monkeypatch,
+):
+    """PART D witness: `backup_job.BackupConfig.from_env` (lines 135-138)
+    raises `Failure(allow_retries=False)` when ANY of the four required
+    env vars is missing -- a deployment-config problem the operator
+    must fix out-of-band, not a transient condition. This is a
+    DIFFERENT raise site from `resolve_secret_ref` (lines 91, 101):
+    it fires when `BACKUP_S3_ENDPOINT` / `BACKUP_S3_BUCKET` /
+    `BACKUP_S3_ACCESS_KEY_SECRET_REF` / `BACKUP_S3_SECRET_KEY_SECRET_REF`
+    are unset, before `resolve_secret_ref` is ever called. The two
+    sites share the canonical `Failure(allow_retries=False)` shape but
+    sit on different code paths, so each gets its own witness."""
+    monkeypatch.delenv("BACKUP_S3_ENDPOINT", raising=False)
+    monkeypatch.delenv("BACKUP_S3_BUCKET", raising=False)
+    monkeypatch.delenv("BACKUP_S3_ACCESS_KEY_SECRET_REF", raising=False)
+    monkeypatch.delenv("BACKUP_S3_SECRET_KEY_SECRET_REF", raising=False)
+    with pytest.raises(Failure, match="must all be set") as ctx:
+        BackupConfig.from_env()
+    assert ctx.value.allow_retries is False
+
+
 def test_resolve_secret_ref_rejects_an_unset_target_env_var(monkeypatch):
     monkeypatch.delenv("BACKUP_MISSING", raising=False)
     with pytest.raises(Failure):

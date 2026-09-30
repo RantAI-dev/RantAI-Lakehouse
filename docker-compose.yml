@@ -2367,13 +2367,19 @@ services:
     restart: "no"
 
   # P5 (G4) — Debezium Server + `debezium-server-iceberg` (memiiso), pinned
-  # by digest (R4: community-maintained, no versioned tag exists upstream —
-  # see `docs/plans/P5-RESULT.md`). Captures `p5_cdc.orders` via Postgres
-  # logical replication (`pgoutput`), upsert mode, initial snapshot then
-  # streaming, straight into Bronze through the SAME Lakekeeper/RustFS
-  # stack every other Bronze writer in this repo uses. This is a single,
-  # statically-configured demo connector (ADR 0007: "no dynamic
-  # per-connector provisioning" this phase) — it proves the config shape
+  # by tag + digest (R4: community-maintained). The tag names the release
+  # so a future failure is diagnosable, the digest keeps the image
+  # immutable. A bare digest pin dies silently when upstream overwrites
+  # the untagged image — this is the second time: `c49ebd…` on 2026-09-24,
+  # `5281e2bd…` on 2026-09-30. Upstream's 1.1.1.Final release notes say
+  # attestations are disabled so released images stay pullable (upstream
+  # PR #732). Captures
+  # `p5_cdc.orders` via Postgres logical replication (`pgoutput`), upsert
+  # mode, initial snapshot then streaming, straight into Bronze through
+  # the SAME Lakekeeper/RustFS stack every other Bronze writer in this
+  # repo uses. This is a single, statically-configured demo connector
+  # (ADR 0007: "no dynamic per-connector provisioning" this phase) — it
+  # proves the config shape
   # `lakehouse_store::cdc::render_debezium_properties` designs, not a
   # production connector-management control plane.
   #
@@ -2384,14 +2390,15 @@ services:
   # in `.env`, not a one-off prefix (same reasoning as `DAGSTER_URL`'s
   # existing warning elsewhere in this file).
   #
-  # Re-pinned 2026-09-24: upstream overwrote the untagged image, so the
-  # digest P5 measured (`sha256:c49ebd…`) returns `manifest unknown`. This
-  # is the digest `:latest` resolved to on that date (image built
-  # 2026-09-11, revision e16f5ef). P5-RESULT.md's measurements were taken
-  # on the old image; G4 is what re-proves them on this one.
+  # Re-pinned 2026-09-30: the prior pin was
+  # `ghcr.io/memiiso/debezium-server-iceberg@sha256:5281e2bd…` (the
+  # digest `:latest` had resolved to on 2026-09-24). CI run 36680491360's
+  # `G4` job logs `manifest unknown` for that digest — the registry no
+  # longer has it. P5-RESULT.md's measurements were taken on the earlier
+  # `c49ebd…` image; G4 is what re-proves them on this one.
   debezium-server:
     profiles: ["dagster"]
-    image: ghcr.io/memiiso/debezium-server-iceberg@sha256:5281e2bdd43b1906bf4502325411d49d66ecf75d992f3d07745ff378cc92cfe4
+    image: ghcr.io/memiiso/debezium-server-iceberg:1.1.1.Final@sha256:2ad14b158914097985e98933e6f541e2f4e34fabd1c5d47d655067b9db0282b8
     depends_on:
       g4-source-init:
         condition: service_completed_successfully

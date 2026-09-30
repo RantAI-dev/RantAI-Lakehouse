@@ -79,6 +79,10 @@ once a first release is tagged.
 
 ### Changed
 
+- `gold_export_job` is rebuilt as `list_gold_marts` (fan-out, one `DynamicOutput` per configured mart) -> `export_gold_mart[<key>]` (mapped, one step per Gold mart) -> `summarize_gold_export` (collect), per PART A of `parts/1b-dagster-one-op-per-unit-and-retries.md`. One mart's HTTP error fails only that mapped step (the others still record their `maintenance_run` success rows); the failure row for the failed mart is written before the bare re-raise, so the governance surface sees the failure immediately, not only after the retry policy's attempts have all come up empty. The console's pipeline detail log parsing is unchanged: the log shape (`Execution of step "<key>" failed.`) is unchanged, and the console fixture now references the mapped-step names (`export_gold_mart[<key>]`) instead of the old single `run_gold_export`.
+- `ingest_job` is rebuilt as `run_ingest` (fan-out, batch connectors only — `cdc` and `kafka`/stream connectors yield no mapped steps) -> `ingest_source_object[<key>]` (mapped per `sourceObjects` entry) -> collect, per PART B of `parts/1b-dagster-one-op-per-unit-and-retries.md`. The mapped step's input carries the connector with its `secretRef` STRING REFERENCES only — the secrets are resolved INSIDE the mapped op, never on the `DynamicOutput` payload, because Dagster's IO manager persists op outputs and a resolved secret on one would leak. `SecretRefRejected`, `UnknownAdapter`, `ssrf_guard.SsrfBlocked`, and `UnsupportedColumnType` are wrapped as `Failure(allow_retries=False)` at the mapped op's boundary so a config-shaped failure is never retried.
+- `bronze_maintenance_job` is rebuilt as `list_bronze_tables` (fan-out, runs catalog-database creation and the policy-list fetch once per run, not once per table) -> `maintain_bronze_table[<key>]` (mapped, per-table body) -> `summarize_bronze_maintenance` (collect), per PART C of `parts/1b-dagster-one-op-per-unit-and-retries.md`. A failed table's mapped step fails without taking the others down, and a fresh catalog with zero tables yields a still-successful run (`summarize_bronze_maintenance` collects an empty list). Mapping-key collisions (two tables whose names sanitize to the same Dagster step key) raise `Failure(allow_retries=False)` naming both.
+- A shared `DEFAULT_RETRY_POLICY` (max_retries=2, delay=30s, exponential backoff with ±jitter) is wired on every op in the Dagster code location, and every `Failure` raised on a config, auth, SSRF, secret-ref, or column-type problem sets `allow_retries=False`, per PART D of `parts/1b-dagster-one-op-per-unit-and-retries.md`. Gold export HTTP errors are NOT wrapped in `Failure(allow_retries=False)` — they are bare re-raised so the default policy retries a transient 5xx (busy ClickHouse on the `lakehouse-api` side, the canonical case the plan names), and a persistent 4xx/5xx fails after the policy's two attempts. The sanitize helpers (`gold_export._sanitize_mapping_key`, `ingest_factory._sanitize_target`, `maintenance._sanitize_mapping_key`) now use the exact ASCII `[A-Za-z0-9_]` rule via a precompiled `re`, replacing the previous `str.isalnum()`-based rule that would silently accept non-ASCII letters as Dagster mapping keys.
 - `/dashboards` no longer renders a page. It resolves: to the dashboard you
   last had open, or — when you have not created one yet — to the built-in
   "Main" board, and only otherwise to the list at `/dashboards/browse`.
@@ -151,6 +155,11 @@ once a first release is tagged.
 - Tests: `lakehouse-test-support` reuses one labelled Postgres container
   instead of leaking one per test binary; the connector secret allowlist
   test no longer depends on a developer `.env` (loaded by `sqlx::test`).
+- `debezium-server` re-pinned to `:1.1.1.Final@sha256:2ad14b1…` so the
+  `Rust · G4 Debezium CDC into Bronze` job pulls again — the prior
+  digest-only pin (`…5281e2bd…`, what `:latest` resolved to on 2026-09-24)
+  now 404s (`manifest unknown`, CI run 36680491360), and a bare digest
+  pin dies silently whenever upstream overwrites the untagged image.
 
 ### Removed
 

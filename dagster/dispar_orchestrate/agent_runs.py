@@ -75,7 +75,7 @@ import requests
 
 from dagster import Definitions, Field, ScheduleDefinition, job, op
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, record_maintenance_run
-from dispar_orchestrate.op_metadata import source_metadata
+from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 
 def _env(name: str, default: str) -> str:
@@ -140,6 +140,7 @@ def post_run(cfg: AgentRunConfig, employee_id: str) -> requests.Response:
             ),
         )
     },
+    retry_policy=DEFAULT_RETRY_POLICY,
     tags=source_metadata(
         "dispar_orchestrate/agent_runs.py::run_agent_employee",
         reads=["Op config employee_id"],
@@ -182,7 +183,7 @@ def run_agent_employee(context) -> dict[str, Any]:
       `HTTPError` string is the method/URL/status, not headers, so this is
       safe by construction, not by redaction). `record_maintenance_run`
       still gets a row so the failure is visible in the governance surface,
-      exactly like `gold_export.py`'s `run_gold_export` does on export
+      exactly like `gold_export.py`'s `export_gold_mart` does on export
       failure."""
     employee_id: str = context.op_config["employee_id"]
     cfg = AgentRunConfig.from_env()
