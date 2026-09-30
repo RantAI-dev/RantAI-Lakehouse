@@ -14,7 +14,7 @@ all tenants) and builds, per pipeline:
   is not wanted is paused from the console, which also switches this
   schedule off (`routes::pipelines::authored_status`);
 * an `authored__<id>_after` run_status_sensor when the pipeline's
-  `depends_on` is non-empty (R3 plan 2a). The sensor fires after a SUCCESS
+  `dependsOn` is non-empty (R3 plan 2a). The sensor fires after a SUCCESS
   run of any of its upstreams; it yields a `RunRequest` only when EVERY
   upstream has had a SUCCESS run that finished AFTER this pipeline's
   most-recent start time (ALL semantics — see `build_authored_dependency_sensor`
@@ -511,11 +511,14 @@ def build_authored_dependency_sensor(
     pipeline: dict[str, Any], authored_job: Any
 ) -> Any | None:
     """One `run_status_sensor` for `pipeline`, or `None` when it has no
-    `depends_on`. The sensor watches every upstream's SUCCESS run; on a
-    firing tick it computes "has every upstream had a SUCCESS that
-    finished after this pipeline's most-recent start?" -- ALL semantics
-    (R3 plan 2a). When yes, yield `RunRequest(run_key=<upstream run id>)`
-    so Dagster's own dedup keeps a re-firing upstream from launching the
+    `dependsOn`. Reads `dependsOn` (camelCase), matching the wire
+    format the Rust `RunnablePipeline` serializes under
+    `#[serde(rename_all = "camelCase")]` — R3 plan 2a wire-format fix.
+    The sensor watches every upstream's SUCCESS run; on a firing tick
+    it computes "has every upstream had a SUCCESS that finished after
+    this pipeline's most-recent start?" -- ALL semantics (R3 plan 2a).
+    When yes, yield `RunRequest(run_key=<upstream run id>)` so
+    Dagster's own dedup keeps a re-firing upstream from launching the
     downstream twice for the same upstream run; when no, yield a
     `SkipReason` naming the upstream that is still behind.
 
@@ -527,7 +530,7 @@ def build_authored_dependency_sensor(
     `JobDefinition`/`UnresolvedAssetJobDefinition` (not selectors).
     Verified against dagster 1.13.20's `run_status_sensor` signature.
     """
-    depends_on = pipeline.get("depends_on") or []
+    depends_on = pipeline.get("dependsOn") or []
     if not depends_on:
         return None
     monitored = [_upstream_job_selector(dep) for dep in depends_on]

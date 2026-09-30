@@ -399,11 +399,15 @@ class _StubContext:
 
 
 def _dep_pipeline(pid: str, depends_on: list[str]) -> dict[str, Any]:
-    """A pipeline dict shaped for the sensor body. The body reads
-    `pipeline["id"]` and `pipeline["depends_on"]`; everything else is
-    HEAD's `_ready_pipeline` shape so the `definition` fixture stays
-    the single source of truth."""
-    return {**_ready_pipeline(), "id": pid, "depends_on": depends_on}
+    """A pipeline dict shaped for the sensor body. Mirrors the REAL
+    wire format the Rust `RunnablePipeline` serializes
+    (`#[serde(rename_all = "camelCase")]` in
+    `rust/crates/lakehouse-store/src/pipelines.rs`): the upstream-list
+    field is `dependsOn` on the wire, never `depends_on`. The body
+    reads `pipeline["id"]` and `pipeline["dependsOn"]`; everything
+    else is HEAD's `_ready_pipeline` shape so the `definition`
+    fixture stays the single source of truth."""
+    return {**_ready_pipeline(), "id": pid, "dependsOn": depends_on}
 
 
 def _build_dep_sensor(pid: str, depends_on: list[str]):

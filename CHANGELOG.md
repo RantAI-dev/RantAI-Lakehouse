@@ -166,6 +166,8 @@ once a first release is tagged.
   digest-only pin (`…5281e2bd…`, what `:latest` resolved to on 2026-09-24)
   now 404s (`manifest unknown`, CI run 36680491360), and a bare digest
   pin dies silently whenever upstream overwrites the untagged image.
+- The Dagster dependency sensor (`authored__<id>_after`) is now actually built. The Rust `RunnablePipeline` serializes `depends_on` as `dependsOn` (`#[serde(rename_all = "camelCase")]` in `lakehouse-store/src/pipelines.rs`), but the factory read `pipeline.get("depends_on")` which always returned `None`, so every chain was silently dead. The factory now reads `dependsOn`, matching the wire format, and the test fixture mirrors the live JSON. The existing pre-fix tests for `schedule`/`status`/`definition`/`sourceZone`/... already proved the rest of the factory's reads were on the camelCase wire.
+- `DELETE /api/pipelines/{id}` refuses to delete an authored pipeline that is still listed as an upstream by another authored pipeline's `depends_on`, naming every downstream id verbatim in a 400. Without this, deleting the upstream left a dangling reference the validator refuses the next time the downstream is edited, AND a sensor that watched a job that no longer existed. Pure helper `referencing_downstreams(pairs, target_id)` extracted from the route so the reverse walk is unit-tested directly (the route handler cannot be tested at this seam without a real pool).
 
 ### Removed
 

@@ -200,6 +200,30 @@ pub fn validate_depends_on(
     validate_no_cycle(this_id, new_depends_on, others)
 }
 
+/// Reverse-reference lookup for the delete guard: every authored
+/// pipeline whose `depends_on` lists `target_id`. Used by
+/// [`delete`] to refuse removal of an upstream that another pipeline
+/// still references (final-review fix, "dangling `depends_on` after
+/// upstream deletion"). Pure function, no I/O — extracted from the
+/// route so the reverse walk is unit-tested directly: the route
+/// itself cannot be tested at this seam without a real pool (the
+/// existing `state_without_pool()` test fixture returns 503 before
+/// any guard runs), so the guard's correctness lives here.
+///
+/// Order is preserved from `pairs` (the SQL query behind
+/// [`collect_authored_depends_on`] returns `ORDER BY created_at`,
+/// which is also the order the user sees them in the UI's pipeline
+/// list); a stable, predictable order makes the 400 message
+/// diff-friendly across runs.
+#[must_use]
+pub fn referencing_downstreams(pairs: &[(String, Vec<String>)], target_id: &str) -> Vec<String> {
+    pairs
+        .iter()
+        .filter(|(_, deps)| deps.contains(&target_id.to_owned()))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
 /// DFS over the authored `depends_on` graph with `this_id`'s edges
 /// overridden to `new_depends_on`. Pure function, no I/O — extracted
 /// from [`validate_depends_on`] so the cycle rule has its own unit
@@ -449,9 +473,20 @@ pub async fn update(
 /// runs stay in the orchestrator's history; its job and schedule go away
 /// on the reload that follows.
 ///
+/// Refused with 400 when another authored pipeline lists `id` in its
+/// `depends_on` — that downstream keeps the id in its graph, so
+/// deleting the upstream would leave a dangling reference the validator
+/// refuses the next time the downstream is edited, AND a sensor that
+/// watches a job that no longer exists. Better to fail closed and let
+/// the author remove the references first (final-review fix, "dangling
+/// `depends_on` after upstream deletion"). The 400 names every
+/// downstream id verbatim so the UI can highlight what to edit.
+///
 /// # Errors
 ///
-/// 404 for an unknown or non-authored id; 503/500 from the store.
+/// 404 for an unknown or non-authored id; 400 when `id` is still
+/// referenced as an upstream by another authored pipeline; 503/500
+/// from the store.
 pub async fn delete(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -464,6 +499,24 @@ pub async fn delete(
         Ok(pool) => pool,
         Err(err) => return ApiRejection(err).into_response(),
     };
+    // `exclude_id = Some(&id)` skips the row being deleted (which
+    // cannot list itself anyway — `validate_depends_on` already
+    // refuses a self-reference — but excluding it costs nothing and
+    // keeps the query bounded).
+    let others = match collect_authored_depends_on(pool, Some(&id)).await {
+        Ok(others) => others,
+        Err(err) => return err.into_response(),
+    };
+    let referencing = referencing_downstreams(&others, &id);
+    if !referencing.is_empty() {
+        return ApiRejection(ApiError::BadRequest(format!(
+            "cannot delete pipeline {id:?}: it is still referenced as an \
+             upstream by {} other pipeline(s): {referencing:?}; remove \
+             those references before deleting",
+            referencing.len()
+        )))
+        .into_response();
+    }
     match pipelines::delete_pipeline(pool, &id).await {
         Ok(true) => {
             record_pipeline_audit(&state, &principal, "pipeline.delete", &id).await;
@@ -753,6 +806,88 @@ mod tests {
             )
             .is_ok(),
             "A -> [B, ingest_job] with B -> C is not a cycle"
+        );
+    }
+
+    /// The delete guard refuses removal of an upstream that is still
+    /// referenced. With no downstreams, the helper returns an empty
+    /// list — the guard would let the delete through. Without this
+    /// negative case the helper would never be proven to handle "no
+    /// match" cleanly (a helper that always returned empty would pass
+    /// no test until the multi-downstream case was added).
+    #[test]
+    fn referencing_downstreams_returns_empty_when_no_pipeline_references_the_target() {
+        let others = vec![
+            ("pl-a".to_owned(), Vec::new()),
+            ("pl-b".to_owned(), vec!["pl-c".to_owned()]),
+        ];
+        assert!(
+            referencing_downstreams(&others, "pl-zzz").is_empty(),
+            "no pipeline lists pl-zzz in its depends_on"
+        );
+    }
+
+    /// A single pipeline that lists the target in its `depends_on`
+    /// is returned verbatim. This is the basic positive case the
+    /// delete guard's 400 message will quote.
+    #[test]
+    fn referencing_downstreams_returns_a_pipeline_that_depends_on_the_target() {
+        let others = vec![
+            ("pl-a".to_owned(), vec!["pl-up".to_owned()]),
+            ("pl-b".to_owned(), Vec::new()),
+        ];
+        assert_eq!(
+            referencing_downstreams(&others, "pl-up"),
+            vec!["pl-a".to_owned()],
+            "only pl-a lists pl-up in its depends_on"
+        );
+    }
+
+    /// Several pipelines may reference the same upstream (a "fan-in"
+    /// pattern); the helper returns every downstream in input order,
+    /// which is `ORDER BY created_at` from the SQL behind
+    /// [`collect_authored_depends_on`]. Stable order keeps the 400
+    /// message diff-friendly across runs.
+    #[test]
+    fn referencing_downstreams_returns_every_referencing_pipeline_in_input_order() {
+        let others = vec![
+            ("pl-down-1".to_owned(), vec!["pl-up".to_owned()]),
+            ("pl-down-2".to_owned(), vec!["pl-up".to_owned()]),
+            ("pl-other".to_owned(), vec!["pl-elsewhere".to_owned()]),
+            (
+                "pl-down-3".to_owned(),
+                vec!["pl-up".to_owned(), "pl-other".to_owned()],
+            ),
+        ];
+        assert_eq!(
+            referencing_downstreams(&others, "pl-up"),
+            vec![
+                "pl-down-1".to_owned(),
+                "pl-down-2".to_owned(),
+                "pl-down-3".to_owned(),
+            ],
+            "three downstreams list pl-up; pl-other does not"
+        );
+    }
+
+    /// A pipeline that lists the target alongside other upstreams
+    /// (its own fan-in graph) still counts as a downstream. Without
+    /// this case, a helper that bailed out on first-found-match or
+    /// only checked singleton `depends_on` lists would pass the
+    /// singleton test above and fail here.
+    #[test]
+    fn referencing_downstreams_includes_a_pipeline_with_a_mixed_depends_on() {
+        let others = vec![
+            (
+                "pl-down-1".to_owned(),
+                vec!["pl-up-a".to_owned(), "pl-up-b".to_owned()],
+            ),
+            ("pl-down-2".to_owned(), vec!["pl-up-b".to_owned()]),
+        ];
+        assert_eq!(
+            referencing_downstreams(&others, "pl-up-b"),
+            vec!["pl-down-1".to_owned(), "pl-down-2".to_owned()],
+            "both pipelines list pl-up-b among their upstreams"
         );
     }
 
