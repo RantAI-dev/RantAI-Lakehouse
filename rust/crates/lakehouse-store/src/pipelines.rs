@@ -586,6 +586,177 @@ pub async fn list_runnable_pipelines(pool: &PgPool) -> Result<Vec<RunnablePipeli
     Ok(out)
 }
 
+/// Recorded dedup of a single orchestrator-emitted pipeline-run event
+/// (the `run_failure_sensor` in `dagster/dispar_orchestrate/pipeline_events.py`
+/// posts each one to `POST /api/pipelines/events/run-failed`, which calls
+/// this BEFORE evaluating alert rules). Keyed by `(run_id, kind)` so a
+/// sensor retry never double-alerts: a second INSERT for the same row is
+/// a no-op, and the bool returned is `true` only when a row was newly
+/// inserted. The same table backs the kinds 1f adds (`slow`,
+/// `volume_drop`, `late`) — `record_pipeline_run_event` is the only writer
+/// for them too.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the INSERT itself fails.
+pub async fn record_pipeline_run_event(
+    pool: &PgPool,
+    run_id: &str,
+    pipeline_id: &str,
+    kind: &str,
+) -> Result<bool, StoreError> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "INSERT INTO pipeline_run_event (run_id, pipeline_id, kind) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (run_id, kind) DO NOTHING \
+         RETURNING run_id",
+    )
+    .bind(run_id)
+    .bind(pipeline_id)
+    .bind(kind)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+/// Per-pipeline service-level agreement (plan 1f, migration
+/// `0050_pipeline_sla.sql`).
+///
+/// The detail route, the runs route, and the alert pipeline read this to
+/// decide whether a run was over its duration SLA, whether the pipeline is
+/// late (no successful run inside `late_after_seconds`), and whether to
+/// fire `pipeline_slow` / `pipeline_late` / `pipeline_volume_drop` alerts.
+/// Mirrors the camelCase shape returned by `GET /api/pipelines/{id}/sla`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineSla {
+    /// Pipeline identifier (Dagster job name or upstream `pl-` slug).
+    pub pipeline_id: String,
+    /// Per-run duration ceiling, in whole seconds. `None` = no duration
+    /// SLA; the runs route emits `overDuration: null` for every run.
+    pub max_duration_seconds: Option<i32>,
+    /// Late threshold, in whole seconds since the last successful run.
+    /// `None` = no late threshold; the detail route emits `late: null`.
+    pub late_after_seconds: Option<i32>,
+    /// Who last wrote this row.
+    pub updated_by: Uuid,
+    /// ISO 8601 (millisecond precision, UTC).
+    pub updated_at: String,
+}
+
+/// Read the SLA for a single pipeline, or `None` if none has been set.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on any query failure.
+pub async fn get_pipeline_sla(
+    pool: &PgPool,
+    pipeline_id: &str,
+) -> Result<Option<PipelineSla>, StoreError> {
+    let row: Option<SlaRow> = sqlx::query_as(
+        "SELECT pipeline_id, max_duration_seconds, late_after_seconds, \
+                updated_by, updated_at \
+           FROM pipeline_sla WHERE pipeline_id = $1",
+    )
+    .bind(pipeline_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(PipelineSla::from))
+}
+
+/// Read SLAs for many pipelines in one query (plan 1f). Used by the list
+/// route to avoid N+1 round trips when the page holds 100+ jobs. Pipelines
+/// without an SLA row are simply absent from the returned map.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on any query failure.
+pub async fn list_pipeline_slas(
+    pool: &PgPool,
+    pipeline_ids: &[&str],
+) -> Result<std::collections::HashMap<String, PipelineSla>, StoreError> {
+    if pipeline_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows: Vec<SlaRow> = sqlx::query_as(
+        "SELECT pipeline_id, max_duration_seconds, late_after_seconds, \
+                updated_by, updated_at \
+           FROM pipeline_sla WHERE pipeline_id = ANY($1)",
+    )
+    .bind(pipeline_ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let sla = PipelineSla::from(r);
+            (sla.pipeline_id.clone(), sla)
+        })
+        .collect())
+}
+
+/// Upsert the SLA for a single pipeline.
+///
+/// `None` for either threshold clears that column (an empty PUT body is a
+/// "no SLA at all" request; `Some(0)` is rejected by the CHECK constraint
+/// in `0050_pipeline_sla.sql` and surfaces as [`StoreError::Database`]).
+/// Idempotent: the PUT route calls this with the authenticated principal
+/// so the audit trail records who set what.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on any query failure, including a
+/// CHECK-constraint violation when the caller somehow bypassed the
+/// route-level guard.
+pub async fn upsert_pipeline_sla(
+    pool: &PgPool,
+    pipeline_id: &str,
+    max_duration_seconds: Option<i32>,
+    late_after_seconds: Option<i32>,
+    updated_by: Uuid,
+) -> Result<PipelineSla, StoreError> {
+    let row: SlaRow = sqlx::query_as(
+        "INSERT INTO pipeline_sla \
+            (pipeline_id, max_duration_seconds, late_after_seconds, updated_by) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (pipeline_id) DO UPDATE SET \
+            max_duration_seconds = EXCLUDED.max_duration_seconds, \
+            late_after_seconds   = EXCLUDED.late_after_seconds, \
+            updated_by           = EXCLUDED.updated_by, \
+            updated_at           = now() \
+         RETURNING pipeline_id, max_duration_seconds, late_after_seconds, \
+                   updated_by, updated_at",
+    )
+    .bind(pipeline_id)
+    .bind(max_duration_seconds)
+    .bind(late_after_seconds)
+    .bind(updated_by)
+    .fetch_one(pool)
+    .await?;
+    Ok(PipelineSla::from(row))
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct SlaRow {
+    pipeline_id: String,
+    max_duration_seconds: Option<i32>,
+    late_after_seconds: Option<i32>,
+    updated_by: Uuid,
+    updated_at: OffsetDateTime,
+}
+
+impl From<SlaRow> for PipelineSla {
+    fn from(row: SlaRow) -> Self {
+        Self {
+            pipeline_id: row.pipeline_id,
+            max_duration_seconds: row.max_duration_seconds,
+            late_after_seconds: row.late_after_seconds,
+            updated_by: row.updated_by,
+            updated_at: iso_millis(row.updated_at),
+        }
+    }
+}
+
 /// Update an authored pipeline's status (`pausePipeline`/`resumePipeline`
 /// for a pipeline that has no backing Dagster job — see
 /// `routes::pipelines::pause`/`resume`; and `routes::pipelines::
@@ -760,5 +931,27 @@ mod tests {
         assert_eq!(radix36(35), "z");
         assert_eq!(radix36(36), "10");
         assert_eq!(radix36(1_787_803_210_075), "mtazvdjv");
+    }
+
+    #[test]
+    fn pipeline_sla_serializes_camel_case_with_null_for_unset_thresholds() {
+        // Mirrors `DatasetSla` in `contracts/pipelines.ts`: the GET
+        // response shape must surface both thresholds as nullable so the
+        // UI can render `maxDurationSeconds: null` rather than `0`. A
+        // `Some(0)` would be an "always over" SLA and the route rejects
+        // it; this fixture just proves the NULL case serializes cleanly.
+        let sla = PipelineSla {
+            pipeline_id: "silver_orders".to_owned(),
+            max_duration_seconds: None,
+            late_after_seconds: Some(3_600),
+            updated_by: Uuid::from_u128(1),
+            updated_at: "2026-01-01T00:00:00.000Z".to_owned(),
+        };
+        let value = serde_json::to_value(&sla).unwrap();
+        assert_eq!(value["pipelineId"], "silver_orders");
+        assert!(value["maxDurationSeconds"].is_null());
+        assert_eq!(value["lateAfterSeconds"], 3_600);
+        assert_eq!(value["updatedBy"], Uuid::from_u128(1).to_string());
+        assert_eq!(value["updatedAt"], "2026-01-01T00:00:00.000Z");
     }
 }

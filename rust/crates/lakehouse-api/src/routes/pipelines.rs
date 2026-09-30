@@ -11,11 +11,13 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use lakehouse_auth::Principal;
+use lakehouse_alerts::SilenceSource;
+use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
 use lakehouse_dagster::{
     DgClient, DgError, DgJob, DgRun, ReexecutionStrategy, iso_from_unix_seconds, map_run_status,
 };
+use lakehouse_notify::EmailSender;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::pipelines::{self, CreatePipelineInput};
 use lakehouse_store::{PgPool, StoreError};
@@ -26,6 +28,7 @@ use uuid::Uuid;
 
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
+use crate::routes::alerts::{ApiSilenceSource, smtp_config};
 use crate::routes::authored_pipelines;
 use crate::routes::support::js_error;
 use crate::state::AppState;
@@ -136,14 +139,40 @@ async fn list_body(
     if dagster_jobs_refused.is_none() {
         let (jobs, runs) =
             tokio::try_join!(dagster.list_jobs_with_schedules(), dagster.list_runs(100))?;
-        pipelines = jobs
+        // Plan 1f: the "late" / "slaOk" cells need an SLA row per job.
+        // SLAs are fetched in one batched query (`list_pipeline_slas`,
+        // ANY($1) on the primary key) rather than N round trips — a list
+        // page can hold 100+ jobs and a sequential walk would balloon
+        // the request. `now_seconds` is read once for the whole response
+        // so every row in a single `GET` agrees on the clock. A
+        // Postgres-less deployment skips the fetch entirely and the row
+        // reports `late: null` / `slaOk: null` — the same honest-null
+        // posture as every other measured-but-unknown field on this row.
+        let sla_jobs: Vec<&DgJob> = jobs
             .iter()
             // An authored pipeline's `authored__<id>` job is listed once, as
             // its own `pl-` row below, never a second time as a Dagster job.
             .filter(|j| !j.name.starts_with("authored__"))
+            .collect();
+        let sla_map = match pg {
+            Some(pool) => {
+                let names: Vec<&str> = sla_jobs.iter().map(|j| j.name.as_str()).collect();
+                pipelines::list_pipeline_slas(pool, &names)
+                    .await
+                    .unwrap_or_default()
+            }
+            None => std::collections::HashMap::new(),
+        };
+        let now_seconds = now_unix_seconds();
+        pipelines = sla_jobs
+            .into_iter()
             .map(|j| {
                 let last = last_run_for(&runs, &j.name);
-                dagster_pipeline_row(j, last)
+                let last_success_seconds = last_success_for(&runs, &j.name)
+                    .and_then(|r| r.start_time)
+                    .filter(|t| *t != 0.0);
+                let sla = sla_map.get(&j.name);
+                dagster_pipeline_row(j, last, last_success_seconds, sla, now_seconds)
             })
             .collect();
     }
@@ -172,18 +201,37 @@ async fn list_body(
 /// derives that from Iceberg snapshot timestamps) — `source`, `target`, and
 /// `freshnessLagSeconds` are therefore reported as `null` rather than a
 /// stamped-on default that every job would share (`WS1` finding J16).
-/// `slaOk` stays `null` permanently, not "until `WS5`": `dataset_sla`
-/// (`WS5` item E1) is keyed by warehouse *table*, `slaOk` by `Dagster`
-/// *job* — a pipeline can write many tables, and a table can be written by
-/// many jobs, so no single `dataset_sla` row could honestly summarize a
-/// `slaOk` boolean for one job. `WS5` deliberately does not wire the two
-/// together (`docs/superpowers/plans/2026-09-11-ws5-platform-signals.md`,
-/// WS5 item E2 Step 1). `lastRunAt` is `null` when the job has never run
-/// instead of an empty string standing in for "never ran". `nextRunAt`
-/// (WS4 item G2) is computed server-side from the job's first schedule's
-/// cron expression; `null` for a manual job or an uncomputable cron —
-/// never a guess.
-fn dagster_pipeline_row(j: &DgJob, last: Option<&DgRun>) -> Value {
+/// `slaOk` is computed from the pipeline's `pipeline_sla` row plus the
+/// last successful run, NOT from `WS5`'s `dataset_sla` (which is keyed by
+/// warehouse *table* and cannot honestly summarize a single job that may
+/// write many tables). Plan 1f wires these together — both `late` and
+/// `slaOk` are `null` when no SLA has been configured. `lastRunAt` is
+/// `null` when the job has never run instead of an empty string standing
+/// in for "never ran". `nextRunAt` (WS4 item G2) is computed server-side
+/// from the job's first schedule's cron expression; `null` for a manual
+/// job or an uncomputable cron — never a guess.
+fn dagster_pipeline_row(
+    j: &DgJob,
+    last: Option<&DgRun>,
+    last_success_seconds: Option<f64>,
+    sla: Option<&pipelines::PipelineSla>,
+    now_seconds: Option<f64>,
+) -> Value {
+    let late_value =
+        sla.and_then(|s| late(now_seconds, last_success_seconds, s.late_after_seconds));
+    // `overDuration` for the most recent run (only meaningful when the run
+    // has both a `startTime` and `endTime`). `None` when there is no SLA,
+    // no last run, or the last run is still going — see [`over_duration`].
+    let last_over = last.and_then(|r| {
+        over_duration(
+            duration_seconds(r.start_time, r.end_time),
+            sla?.max_duration_seconds,
+        )
+    });
+    let sla_ok = match (late_value, last_over) {
+        (None, None) => None,
+        (late, over) => Some(!late.unwrap_or(false) && !over.unwrap_or(false)),
+    };
     json!({
         "id": j.name,
         "name": j.name,
@@ -197,7 +245,8 @@ fn dagster_pipeline_row(j: &DgJob, last: Option<&DgRun>) -> Value {
             .and_then(|r| r.start_time)
             .map_or(Value::Null, |t| Value::String(iso_from_unix_seconds(t))),
         "nextRunAt": next_run_at_json(j),
-        "slaOk": Value::Null,
+        "slaOk": sla_ok.map_or(Value::Null, Value::Bool),
+        "late": late_value.map_or(Value::Null, Value::Bool),
         "freshnessLagSeconds": Value::Null,
     })
 }
@@ -242,6 +291,27 @@ fn last_run_for<'a>(runs: &'a [DgRun], job_name: &str) -> Option<&'a DgRun> {
     best
 }
 
+/// The most recent SUCCESS run for `job_name`, or `None` if no such run
+/// has been recorded. Used by the SLA "late" decision: a pipeline whose
+/// only runs are failures / in-progress has no `lastSuccessAt` and is
+/// reported as `late: true` when a threshold exists (see [`late`]).
+/// Same strict-`>`/first-row-on-tie reduction as [`last_run_for`].
+fn last_success_for<'a>(runs: &'a [DgRun], job_name: &str) -> Option<&'a DgRun> {
+    let mut best: Option<&'a DgRun> = None;
+    for r in runs {
+        if r.job_name != job_name || r.status != "SUCCESS" {
+            continue;
+        }
+        let start = r.start_time.unwrap_or(0.0);
+        match best {
+            None => best = Some(r),
+            Some(prev) if start > prev.start_time.unwrap_or(0.0) => best = Some(r),
+            Some(_) => {}
+        }
+    }
+    best
+}
+
 /// `sched ? cron: ${sched.cronSchedule} (${sched.scheduleState.status}) :
 /// "manual"` — only the first schedule is used.
 fn schedule_label(job: &DgJob) -> String {
@@ -270,9 +340,28 @@ async fn runs_body(state: &AppState, id: &str) -> Value {
     } else {
         id.to_owned()
     };
+    // Plan 1f: each run's `overDuration` is computed against the
+    // pipeline's `pipeline_sla.max_duration_seconds`. A pool-less
+    // deployment (no Postgres) reports `overDuration: null` for every run
+    // rather than 200 with `overDuration: false` lying about a SLA that
+    // does not exist.
+    let max_duration = match state.pg.as_deref() {
+        Some(pool) => match pipelines::get_pipeline_sla(pool, id).await {
+            Ok(Some(sla)) => sla.max_duration_seconds,
+            // No row, or an error reading the SLA: the runs route must
+            // keep working (a degraded but truthful answer, per WS5's
+            // "failed-to-measure is not measured-as-zero" rule). `null`
+            // per run is the honest answer; the route does not 503.
+            Ok(None) | Err(_) => None,
+        },
+        None => None,
+    };
     match state.dagster.list_runs_for_job(&job, 30).await {
         Ok(runs) => json!({
-            "runs": runs.iter().map(|r| run_to_json(r, id)).collect::<Vec<_>>(),
+            "runs": runs
+                .iter()
+                .map(|r| run_to_json(r, id, max_duration))
+                .collect::<Vec<_>>(),
             "unavailable": Value::Null,
         }),
         Err(err) => {
@@ -280,6 +369,187 @@ async fn runs_body(state: &AppState, id: &str) -> Value {
             json!({ "runs": [], "unavailable": js_error(err) })
         }
     }
+}
+
+/// `GET /api/pipelines/{id}/sla` — read a pipeline's `pipeline_sla` row,
+/// or 404 when none has been configured (plan 1f).
+///
+/// Returning `404` here (not an empty envelope) lets the UI distinguish
+/// "this pipeline has no SLA yet" from "the SLA cell is unset because the
+/// backend is degraded" — the latter goes through the failed-`Ok(None)`
+/// path in [`runs_body`] instead.
+pub async fn get_sla(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    let pool = pool(&state)?;
+    let sla = pipelines::get_pipeline_sla(pool, &id)
+        .await
+        .map_err(ApiError::from)?;
+    match sla {
+        Some(sla) => Ok(ApiJson(json!({
+            "pipelineId": sla.pipeline_id,
+            "maxDurationSeconds": sla.max_duration_seconds,
+            "lateAfterSeconds": sla.late_after_seconds,
+            "updatedBy": sla.updated_by.to_string(),
+            "updatedAt": sla.updated_at,
+        }))),
+        None => Err(ApiError::NotFound(format!("no SLA configured for {id}")).into()),
+    }
+}
+
+/// `PUT /api/pipelines/{id}/sla` — upsert a pipeline's `pipeline_sla`
+/// row. Both thresholds are optional: `null` clears the column. A zero or
+/// negative threshold is rejected at the API boundary (and again at the
+/// database CHECK — defense in depth, see `0050_pipeline_sla.sql`).
+///
+/// The route writes a `pipeline.sla_set` audit event with the principal's
+/// own id so the audit trail records "who set what SLA when" — best-effort,
+/// a failed audit write does not turn a successful upsert into an error
+/// response.
+pub async fn put_sla(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    let req: PutSlaBody = parse_body(&body)?;
+    if let Some(max) = req.max_duration_seconds
+        && max <= 0
+    {
+        return Err(ApiError::BadRequest(
+            "maxDurationSeconds must be positive when set".to_owned(),
+        )
+        .into());
+    }
+    if let Some(late) = req.late_after_seconds
+        && late <= 0
+    {
+        return Err(
+            ApiError::BadRequest("lateAfterSeconds must be positive when set".to_owned()).into(),
+        );
+    }
+    let actor = principal.id.uuid();
+    let pool = pool(&state)?;
+    let sla = pipelines::upsert_pipeline_sla(
+        pool,
+        &id,
+        req.max_duration_seconds,
+        req.late_after_seconds,
+        actor,
+    )
+    .await
+    .map_err(ApiError::from)?;
+    // Best-effort audit: a failed audit write is logged, not propagated.
+    // Same posture as `routes::pipelines::trigger`/
+    // `routes::connectors::create` and the rest of this file.
+    record_pipeline_audit(&state, &principal, "pipeline.sla_set", &id).await;
+    Ok(ApiJson(json!({
+        "pipelineId": sla.pipeline_id,
+        "maxDurationSeconds": sla.max_duration_seconds,
+        "lateAfterSeconds": sla.late_after_seconds,
+        "updatedBy": sla.updated_by.to_string(),
+        "updatedAt": sla.updated_at,
+    })))
+}
+
+/// `PUT /api/pipelines/{id}/sla` body. Both fields nullable so an empty
+/// body is a valid "clear everything" request.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PutSlaBody {
+    #[serde(default)]
+    pub max_duration_seconds: Option<i32>,
+    #[serde(default)]
+    pub late_after_seconds: Option<i32>,
+}
+
+/// `GET /api/pipelines/{id}/volume` — up to 30 recent runs together with
+/// their row counts and the `pipeline_volume_drop` alert outcome per run
+/// (plan 1f). Same 30-run window as `/runs`; the volume-drop rule needs at
+/// least 5 prior completed runs to make a claim, so 30 gives the most
+/// recent run up to 25 samples of history.
+///
+/// Reviewer fix #3: response shape is `{ runs, medianRows, unavailable }` —
+/// `medianRows` is the median of every completed run that reported rows
+/// (the same median the drop rule uses — see [`median`]); `unavailable`
+/// is a classified non-upstream string when the orchestrator is
+/// unreachable, mirroring [`runs_body`]'s degraded branch (so the UI
+/// can show "no runs right now, but here's why" rather than confusing
+/// it with a hard 503).
+pub async fn volume(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let job = if id.starts_with("pl-") {
+        authored_pipelines::job_name(&id)
+    } else {
+        id.clone()
+    };
+    let body = match state
+        .dagster
+        .list_runs_for_job_with_materializations(&job, 30)
+        .await
+    {
+        Ok(runs) => volume_body(&runs),
+        Err(err) => {
+            // AGENTS.md rule 4: never leak upstream detail into a
+            // response body. `js_error` is `Display`, not the original
+            // error's own message — it is the routing layer's fixed
+            // string (`routes::support::js_error`).
+            tracing::warn!(%err, "pipeline volume: orchestrator unreachable");
+            json!({
+                "runs": [],
+                "medianRows": Value::Null,
+                "unavailable": js_error(err),
+            })
+        }
+    };
+    (StatusCode::OK, ApiJson(body)).into_response()
+}
+
+/// Build the volume-route body from the dagster fetch's rows. Kept
+/// pure for testability (reviewer fix #3's shape test) and shared
+/// between the success and the (degenerate) empty-history paths.
+fn volume_body(runs: &[lakehouse_dagster::DgRunWithRows]) -> Value {
+    // The volume-drop rule compares the *previous* completed runs (in
+    // their original time order — older first, so the most recent run's
+    // history is everything before it) against the current row count.
+    // `DgRunWithRows` arrives most-recent-first from `Dagster`, so reverse
+    // for history and skip non-completed runs (a `FAILURE` row with no
+    // rows is not part of the median — see the [`drop`] helper).
+    let mut history: Vec<i64> = Vec::with_capacity(runs.len());
+    let mut entries: Vec<Value> = Vec::with_capacity(runs.len());
+    let mut rows_for_median: Vec<i64> = Vec::with_capacity(runs.len());
+    for run in runs.iter().rev() {
+        let status = run.run.status.as_str();
+        let completed = matches!(status, "SUCCESS" | "FAILURE");
+        let drop_value = if completed {
+            drop(run.rows, &history)
+        } else {
+            None
+        };
+        entries.push(json!({
+            "runId": run.run.run_id,
+            "status": status,
+            "startedAt": run.run.start_time.map_or(Value::Null, |t| Value::String(iso_from_unix_seconds(t))),
+            "rows": run.rows.map_or(Value::Null, |n| Value::Number(n.into())),
+            "drop": drop_value.map_or(Value::Null, Value::Bool),
+        }));
+        if completed && let Some(rows) = run.rows {
+            history.push(rows);
+            rows_for_median.push(rows);
+        }
+    }
+    entries.reverse();
+    // Plan 1f: `medianRows` is the median of every completed run that
+    // reported rows — the same median [`drop`] uses (reviewer fix #3).
+    // `None` when no completed run reported rows: the page cannot draw
+    // a median line over an empty set, and an honest `null` keeps the
+    // chart from inventing a baseline.
+    let median_rows = median(&rows_for_median).map_or(Value::Null, |n| Value::Number(n.into()));
+    json!({
+        "runs": entries,
+        "medianRows": median_rows,
+        "unavailable": Value::Null,
+    })
 }
 
 /// `GET /api/pipelines/{id}` — full detail: op graph, config, schedule, and
@@ -335,7 +605,22 @@ async fn dagster_detail(state: &AppState, job_name: &str) -> Response {
         }
     };
     let last = last_run_for(&runs, job_name);
-    let mut body = dagster_pipeline_row(job, last);
+    let last_success_seconds = last_success_for(&runs, job_name)
+        .and_then(|r| r.start_time)
+        .filter(|t| *t != 0.0);
+    let sla = match pool(state) {
+        Ok(pg) => pipelines::get_pipeline_sla(pg, job_name)
+            .await
+            .unwrap_or(None),
+        Err(_) => None,
+    };
+    let mut body = dagster_pipeline_row(
+        job,
+        last,
+        last_success_seconds,
+        sla.as_ref(),
+        now_unix_seconds(),
+    );
     // `dagster_pipeline_row` always returns a `json!({ ... })` object
     // literal (never an array/scalar) — `if let`, not `.expect()`, so this
     // module stays panic-free even if that invariant is ever violated: a
@@ -361,6 +646,23 @@ async fn dagster_detail(state: &AppState, job_name: &str) -> Response {
         // `[]`, never fabricated.
         obj.insert("config".to_owned(), json!([]));
         obj.insert("definition".to_owned(), Value::Null);
+        // Plan 1f: the detail page surfaces the SLA envelope alongside
+        // the row. `null` for both cells when no SLA has been configured
+        // is the honest "this pipeline has no SLA yet" answer, not a
+        // fake row with `0`s.
+        obj.insert(
+            "sla".to_owned(),
+            match sla.as_ref() {
+                Some(s) => json!({
+                    "pipelineId": s.pipeline_id,
+                    "maxDurationSeconds": s.max_duration_seconds,
+                    "lateAfterSeconds": s.late_after_seconds,
+                    "updatedBy": s.updated_by.to_string(),
+                    "updatedAt": s.updated_at,
+                }),
+                None => Value::Null,
+            },
+        );
     }
     (StatusCode::OK, ApiJson(body)).into_response()
 }
@@ -695,7 +997,8 @@ pub struct LogsQuery {
     limit: Option<u32>,
 }
 
-fn run_to_json(r: &DgRun, pipeline_id: &str) -> Value {
+fn run_to_json(r: &DgRun, pipeline_id: &str, max_duration_seconds: Option<i32>) -> Value {
+    let dur = duration_seconds(r.start_time, r.end_time);
     json!({
         "id": r.run_id,
         "pipelineId": pipeline_id,
@@ -713,7 +1016,13 @@ fn run_to_json(r: &DgRun, pipeline_id: &str) -> Value {
         "rejected": Value::Null,
         "retried": Value::Null,
         "costUnits": Value::Null,
-        "durationSeconds": duration_seconds(r.start_time, r.end_time),
+        "durationSeconds": dur,
+        // Plan 1f: per-run duration SLA outcome. `null` when no SLA is
+        // configured (`maxDurationSeconds = None`) or the run is still
+        // going — the same honest-null posture [`run_to_json`] takes for
+        // every other measured-but-unknown field here.
+        "overDuration": over_duration(dur, max_duration_seconds)
+            .map_or(Value::Null, Value::Bool),
         // When the run was created. The gap to `startedAt` is queue and
         // launch time, which the console shows apart from run time.
         "queuedAt": r.creation_time.map(iso_from_unix_seconds),
@@ -758,6 +1067,90 @@ fn duration_seconds(start: Option<f64>, end: Option<f64>) -> Option<i64> {
         (Some(s), Some(e)) if s != 0.0 && e != 0.0 => Some((e - s).round() as i64),
         _ => None,
     }
+}
+
+/// Pipeline SLA "late" decision (plan 1f). Re-exported from
+/// `lakehouse_alerts::late` so the runs/detail routes and the alerts
+/// crate's `evaluate_pipeline_late` share one implementation. The
+/// strict-`>` boundary is the same rule the alerts crate enforces,
+/// mutation-tested by `late_is_false_when_gap_is_exactly_the_threshold`
+/// in `lakehouse_alerts::tests::sla_helpers`.
+fn late(
+    now_seconds: Option<f64>,
+    last_success_seconds: Option<f64>,
+    late_after_seconds: Option<i32>,
+) -> Option<bool> {
+    lakehouse_alerts::late(now_seconds, last_success_seconds, late_after_seconds)
+}
+
+/// Per-run "over its duration SLA" decision (plan 1f).
+///
+/// * `max_duration_seconds = None` — no duration SLA: returns `None`, never
+///   `false`. The runs route reports `overDuration: null` per run in this
+///   case.
+/// * `duration_seconds = None` — the run is still going (no `endTime` from
+///   `Dagster`): returns `None`. A still-running run is not "over" yet.
+/// * Both present — returns `Some(duration > max_duration_seconds)`.
+///   STRICT inequality, matching [`late`].
+fn over_duration(duration_seconds: Option<i64>, max_duration_seconds: Option<i32>) -> Option<bool> {
+    let max = max_duration_seconds?;
+    let dur = duration_seconds?;
+    Some(dur > i64::from(max))
+}
+
+/// Row-volume "drop" decision (plan 1f).
+///
+/// * `current_rows = None` — null rows: returns `None`. A run with no
+///   measured rows is not a "drop"; it is a measurement gap.
+/// * `prior_rows.len() < MIN_SAMPLES` (5) — not enough history: returns
+///   `None`. "Not enough history" is honest, never silently `false` (the
+///   test `drop_is_null_when_history_is_below_min_samples` pins this).
+/// * `prior_rows.len() >= MIN_SAMPLES` — returns
+///   `Some(current < 0.5 × median(prior_rows))` with STRICT inequality:
+///   exactly half the median is **not** a drop.
+fn drop(current_rows: Option<i64>, prior_rows: &[i64]) -> Option<bool> {
+    // Floor for "enough history" — pinned by the spec and by the test
+    // `drop_is_null_when_history_is_below_min_samples`. Lowering to 4
+    // makes that test fail.
+    const MIN_SAMPLES: usize = 5;
+    let current = current_rows?;
+    if prior_rows.len() < MIN_SAMPLES {
+        return None;
+    }
+    // Unreachable past the MIN_SAMPLES guard (a 5+ element slice always
+    // has a median), but `None` is the correct answer for an empty
+    // history anyway — the rule cannot decide, so propagate rather than
+    // assert.
+    let med = median(prior_rows)?;
+    // Compare in f64 — truncating the THRESHOLD to i64 would change the
+    // boundary (median 41, current 20: a drop at 20.5, not at 20).
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "row counts are far below f64's exact range"
+    )]
+    Some((current as f64) < half_median(med))
+}
+
+/// Median of a non-empty `i64` slice, matching the same upper-of-middle
+/// convention the `drop` rule uses (`sorted[n/2]` for even-length inputs).
+/// Plan 1f's volume route surfaces this as `medianRows` for the
+/// console's chart, so it has to be the same function (not "the same
+/// arithmetic done twice and trusted to stay in sync"). `None` for an
+/// empty slice — there is no median of nothing.
+fn median(rows: &[i64]) -> Option<i64> {
+    let mut sorted: Vec<i64> = rows.to_vec();
+    sorted.sort_unstable();
+    sorted.get(sorted.len() / 2).copied()
+}
+
+/// Half the median — the threshold the drop rule compares against.
+/// Hoisted so `drop` and the volume route's documented half-median
+/// threshold share the exact same arithmetic. `i64 → f64` cast is
+/// exact for every row count a warehouse would ever emit (the half
+/// comparison needs the float so an exact-half row is NOT a drop).
+#[allow(clippy::cast_precision_loss, reason = "row counts fit in f64")]
+fn half_median(median: i64) -> f64 {
+    (median as f64) * 0.5
 }
 
 /// The `NewAuditEvent` [`trigger`]/[`create`]/[`pause`]/[`resume`] each
@@ -882,6 +1275,314 @@ pub async fn trigger(
     }
 }
 
+/// `POST /api/pipelines/events/run-failed` — Dagster's `run_failure_sensor`
+/// (see `dagster/dispar_orchestrate/pipeline_events.py`) calls this once
+/// per failed run. The handler-side checks the `policy` table's
+/// `pipeline:write` gate could not: a `pipeline:write`-holding user is not
+/// an orchestrator. Only a service identity (the orchestrator's own) and a
+/// Platform Admin are admitted — the same posture as
+/// [`authored_pipelines::runnable`].
+///
+/// # Dedupe
+///
+/// Before evaluating rules, this calls
+/// [`pipelines::record_pipeline_run_event`]; a `false` return means the
+/// `(run_id, kind="failure")` pair was already recorded and this call is a
+/// sensor retry, so the response is `{"matched": 0}` and no rule fires
+/// again. A `true` return goes through to the alert evaluator.
+///
+/// # Failures that aren't failures
+///
+/// A body whose run reports a non-`FAILURE` `Dagster` status is rejected
+/// with 409 — the sensor should not be sending non-failed runs here, and
+/// silently treating them as failures would skew alerting. A body whose
+/// `jobName` does not map to a known pipeline is treated as "an unknown
+/// orchestrator job," not an error: `{"matched": 0}`.
+pub async fn run_failed_event(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    // The policy table gates this route on `pipeline:write`. A user with
+    // that permission is still not the orchestrator — only a service
+    // identity is allowed to deliver its events. Mirrors
+    // `authored_pipelines::runnable`.
+    if !matches!(principal.id, PrincipalId::Service(_))
+        && !crate::routes::catalog::is_unrestricted(&principal)
+    {
+        return Err(ApiError::PermissionDenied(
+            "only the orchestrator's service identity reports pipeline-run failures".to_owned(),
+        )
+        .into());
+    }
+    let req: RunFailedBody = parse_body(&body)?;
+    let pool = pool(&state)?;
+    // Reverse the `authored_pipelines::job_name` mapping to find the
+    // pipeline id behind `jobName`. The store owns the only authoritative
+    // list of runnable pipelines, so we ask it and match by `job_name`
+    // (a transformation, never a query parameter).
+    let Some(pipeline_id) = job_name_to_pipeline_id(pool, &req.job_name).await? else {
+        return Ok(ApiJson(json!({
+            "matched": 0,
+            "reason": "unknown jobName; no runnable pipeline owns it",
+        })));
+    };
+    // A `run_failure_sensor` MUST only call this on a failed run. If
+    // `Dagster` says otherwise the sensor is misconfigured, and a silent
+    // pass would alias "not failed" into "alert fired."
+    let status = state
+        .dagster
+        .pipeline_run_status(&req.run_id)
+        .await
+        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+    let Some(info) = status else {
+        return Err(ApiError::NotFound(format!("run {} not found in Dagster", req.run_id)).into());
+    };
+    if info.status != "FAILURE" {
+        return Err(ApiError::Conflict(format!(
+            "run {} is in Dagster status '{}', not FAILURE; refusing to alert",
+            req.run_id, info.status
+        ))
+        .into());
+    }
+    let failed_step_keys: Vec<String> = info
+        .steps
+        .iter()
+        .filter(|s| s.status == "FAILURE")
+        .map(|s| s.key.clone())
+        .collect();
+    // Dedupe: a sensor retry sees `false` and the handler short-circuits
+    // before any rule evaluation. The mutation check in
+    // `lakehouse-store/tests/pipelines.rs`
+    // (`record_pipeline_run_event_inserts_once_then_dedupes`) is the
+    // canonical proof that `false` means "already alerted on this run."
+    let first_seen =
+        pipelines::record_pipeline_run_event(pool, &req.run_id, &pipeline_id, "failure").await?;
+    if !first_seen {
+        return Ok(ApiJson(json!({
+            "matched": 0,
+            "reason": "run already alerted; sensor retry ignored",
+        })));
+    }
+    let http = reqwest::Client::new();
+    let email = EmailSender::new(smtp_config(&state.config));
+    let silence_source: Option<Box<dyn SilenceSource>> = state
+        .pg
+        .as_deref()
+        .map(|pg| Box::new(ApiSilenceSource { pg }) as Box<dyn SilenceSource>);
+    let matched = lakehouse_alerts::evaluate_pipeline_failure(
+        &state.clickhouse,
+        &http,
+        &email,
+        &pipeline_id,
+        &req.run_id,
+        &failed_step_keys,
+        silence_source.as_deref().map(|s| s as &dyn SilenceSource),
+    )
+    .await
+    .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+    Ok(ApiJson(json!({ "matched": matched })))
+}
+
+/// Reverse of [`authored_pipelines::job_name`]: given the `Dagster` job
+/// name (e.g. `"authored__pl_orders"`), find the pipeline id (`"pl-orders"`)
+/// that owns it. `None` when no runnable pipeline produces that job —
+/// `evaluate_pipeline_failure` is not the place to invent a match, so the
+/// caller answers `{matched: 0, reason: ...}`.
+async fn job_name_to_pipeline_id(
+    pool: &PgPool,
+    job_name: &str,
+) -> Result<Option<String>, ApiError> {
+    let list = pipelines::list_runnable_pipelines(pool)
+        .await
+        .map_err(|err| ApiError::Unavailable(err.to_string()))?;
+    Ok(list
+        .into_iter()
+        .find(|p| authored_pipelines::job_name(&p.id) == job_name)
+        .map(|p| p.id))
+}
+
+/// The `POST /api/pipelines/events/run-failed` body. The sensor posts
+/// `{"runId": "...", "jobName": "authored__<id>"}`; both fields are
+/// required — `runId` for the dedupe and `jobName` for the
+/// pipeline-id reverse lookup.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunFailedBody {
+    pub run_id: String,
+    pub job_name: String,
+}
+
+/// The `pipeline_volume_drop` decision for the run that just finished —
+/// the Dagster half of [`run_finished_event`], extracted so the handler
+/// stays under the 100-line lint. Pulls the same 30-run window the
+/// volume route uses in one query, then walks oldest-first building the
+/// history up to the current run.
+///
+/// # Errors
+///
+/// Returns `ApiError::Unavailable` (a classified, fixed string) when the
+/// `Dagster` call fails — never an upstream detail.
+async fn volume_drop_for_run(
+    state: &AppState,
+    pipeline_id: &str,
+    run_id: &str,
+) -> Result<Option<bool>, ApiError> {
+    let job = authored_pipelines::job_name(pipeline_id);
+    let runs_with_rows = state
+        .dagster
+        .list_runs_for_job_with_materializations(&job, 30)
+        .await
+        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+    let mut history: Vec<i64> = Vec::with_capacity(runs_with_rows.len());
+    let mut current_rows: Option<i64> = None;
+    let mut found_current = false;
+    // Walk oldest-first (Dagster returns most-recent first).
+    for run in runs_with_rows.iter().rev() {
+        if run.run.run_id == run_id {
+            current_rows = run.rows;
+            found_current = true;
+            break;
+        }
+        if matches!(run.run.status.as_str(), "SUCCESS" | "FAILURE")
+            && let Some(rows) = run.rows
+        {
+            history.push(rows);
+        }
+    }
+    // The current run not appearing in Dagster's recent 30 (it is older
+    // than the window, or the orchestrator's filter dropped it) means we
+    // cannot honestly compute a drop — report `None` rather than
+    // silently `false`. [`drop`] answers the question when the row is
+    // present.
+    Ok(if found_current {
+        drop(current_rows, &history)
+    } else {
+        None
+    })
+}
+
+/// `POST /api/pipelines/events/run-finished` — Dagster's `run_status_sensor`
+/// for `SUCCESS` calls this once per successful run (plan 1f). It fires
+/// the `pipeline_slow` and `pipeline_volume_drop` alerts for the run.
+/// Same posture as [`run_failed_event`]: the policy gate cannot tell that
+/// the caller is the orchestrator, so the handler enforces a service
+/// identity; the run's `pipeline_run_event` rows dedupe sensor retries.
+pub async fn run_finished_event(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    if !matches!(principal.id, PrincipalId::Service(_))
+        && !crate::routes::catalog::is_unrestricted(&principal)
+    {
+        return Err(ApiError::PermissionDenied(
+            "only the orchestrator's service identity reports pipeline-run finishes".to_owned(),
+        )
+        .into());
+    }
+    let req: RunFailedBody = parse_body(&body)?;
+    let pool = pool(&state)?;
+    let Some(pipeline_id) = job_name_to_pipeline_id(pool, &req.job_name).await? else {
+        return Ok(ApiJson(json!({
+            "matched": 0,
+            "reason": "unknown jobName; no runnable pipeline owns it",
+        })));
+    };
+    // Mirror `run_failed_event`'s posture: a SUCCESS sensor MUST only
+    // call this on a successful run. A `STARTED`/`FAILURE`/missing run
+    // is either a sensor misconfiguration (refuse with 409) or a race
+    // (the run may not exist yet — 404). Treating a non-SUCCESS as a
+    // finished run would skew the slow/volume-drop rate.
+    let status = state
+        .dagster
+        .pipeline_run_status(&req.run_id)
+        .await
+        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+    let Some(info) = status else {
+        return Err(ApiError::NotFound(format!("run {} not found in Dagster", req.run_id)).into());
+    };
+    if info.status != "SUCCESS" {
+        return Err(ApiError::Conflict(format!(
+            "run {} is in Dagster status '{}', not SUCCESS; refusing to evaluate slow/volume_drop",
+            req.run_id, info.status
+        ))
+        .into());
+    }
+    // Plan 1f: compute the two per-run outcomes from the run's own data
+    // and the pipeline's `pipeline_sla` row, then hand them to the
+    // evaluator. `slow` is `None` when no duration SLA is configured
+    // (the alert rule cannot decide); `volume_drop` is `None` for the
+    // same honest-null reasons [`drop`] takes.
+    let run_duration = duration_seconds(info.start_time, info.end_time);
+    let sla = pipelines::get_pipeline_sla(pool, &pipeline_id)
+        .await
+        .unwrap_or(None);
+    let slow = over_duration(
+        run_duration,
+        sla.as_ref().and_then(|s| s.max_duration_seconds),
+    );
+    let volume_drop = if sla.is_some() {
+        volume_drop_for_run(&state, &pipeline_id, &req.run_id).await?
+    } else {
+        // No SLA at all — the alert rule cannot decide.
+        None
+    };
+    let http = reqwest::Client::new();
+    let email = EmailSender::new(smtp_config(&state.config));
+    let silence_source: Option<Box<dyn SilenceSource>> = state
+        .pg
+        .as_deref()
+        .map(|pg| Box::new(ApiSilenceSource { pg }) as Box<dyn SilenceSource>);
+    // Reviewer fix #1: per-kind dedupe through `pipeline_run_event`,
+    // matching the `run_failed_event` posture for kind `"failure"`.
+    // Each kind is independently deduped — a run can be both slow AND
+    // a volume drop, firing both once each. `slow == Some(false)` and
+    // `volume_drop == None` (cannot decide) are short-circuited: no
+    // dedupe row, no delivery. `slow == Some(true)` and
+    // `volume_drop == Some(true)` each go through their own
+    // `record_pipeline_run_event` BEFORE delivery; a `false` return
+    // means the same `(run_id, kind)` pair was already inserted (a
+    // sensor retry) and that kind is skipped for this call.
+    let mut matched = 0_usize;
+    if slow == Some(true) {
+        let first_seen =
+            pipelines::record_pipeline_run_event(pool, &req.run_id, &pipeline_id, "slow").await?;
+        if first_seen {
+            matched += lakehouse_alerts::evaluate_pipeline_slow(
+                &state.clickhouse,
+                &http,
+                &email,
+                &pipeline_id,
+                &req.run_id,
+                true,
+                silence_source.as_deref().map(|s| s as &dyn SilenceSource),
+            )
+            .await
+            .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+        }
+    }
+    if volume_drop == Some(true) {
+        let first_seen =
+            pipelines::record_pipeline_run_event(pool, &req.run_id, &pipeline_id, "volume_drop")
+                .await?;
+        if first_seen {
+            matched += lakehouse_alerts::evaluate_pipeline_volume_drop(
+                &state.clickhouse,
+                &http,
+                &email,
+                &pipeline_id,
+                &req.run_id,
+                true,
+                silence_source.as_deref().map(|s| s as &dyn SilenceSource),
+            )
+            .await
+            .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+        }
+    }
+    Ok(ApiJson(json!({ "matched": matched })))
+}
+
 /// The job to launch for authored pipeline `id`, or the response that
 /// explains why there is none. A draft is refused (409) before the
 /// orchestrator is asked. A ready pipeline whose job the orchestrator has
@@ -926,6 +1627,21 @@ fn now_iso() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64());
     iso_from_unix_seconds(seconds)
+}
+
+/// Unix-seconds clock used by the SLA "late" computation. `None` when the
+/// system clock is unset (an unreachable NTP source on some build hosts),
+/// so [`late`] can refuse to claim rather than guess from a meaningless
+/// zero. The list route calls this once per response so every row agrees
+/// on the clock. Exposed `pub(crate)` so [`crate::routes::alerts`]'s
+/// late-evaluation pass uses the same helper — a broken clock would
+/// otherwise show up as `Some(0.0)` ("late since 1970") at one call site
+/// and honest `None` at another.
+pub(crate) fn now_unix_seconds() -> Option<f64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs_f64())
 }
 
 // ── Postgres-backed writes + Dagster mutations (Task 2.5) ──────────────
@@ -2063,7 +2779,7 @@ mod tests {
 
     #[test]
     fn run_to_json_emits_null_for_untracked_counters() {
-        let v = run_to_json(&run("j", "SUCCESS", Some(1.0), Some(61.0)), "p1");
+        let v = run_to_json(&run("j", "SUCCESS", Some(1.0), Some(61.0)), "p1", None);
 
         // Dagster's run record carries no row counts. Emitting 0 would read as
         // "this run processed nothing", which is a different claim from "we
@@ -2074,8 +2790,11 @@ mod tests {
             assert!(v[key].is_null(), "{key} must be null, got {}", v[key]);
         }
         // durationSeconds IS derived from the run's own start/end time, so
-        // it stays real.
+        // it stays real. `overDuration` is `null` when no duration SLA is
+        // configured (None here) — a never-SLA'd run is not "within SLA",
+        // it is "SLA unknown".
         assert!(!v["durationSeconds"].is_null());
+        assert!(v["overDuration"].is_null());
     }
 
     #[test]
@@ -2140,12 +2859,16 @@ mod tests {
         };
         let last = run("silver_orders", "SUCCESS", Some(100.0), Some(160.0));
 
-        let never_run_row = dagster_pipeline_row(&never_run, None);
-        let ran_row = dagster_pipeline_row(&ran_job, Some(&last));
+        // Plan 1f: with no SLA configured and no clock the row reports
+        // `slaOk: null` and `late: null` — the same honest-null posture
+        // every other measured-but-unknown field on this row takes.
+        let never_run_row = dagster_pipeline_row(&never_run, None, None, None, None);
+        let ran_row = dagster_pipeline_row(&ran_job, Some(&last), Some(100.0), None, None);
 
         for row in [&never_run_row, &ran_row] {
             assert!(row["freshnessLagSeconds"].is_null());
             assert!(row["slaOk"].is_null());
+            assert!(row["late"].is_null());
             assert!(row["source"].is_null());
             assert!(row["target"].is_null());
         }
@@ -2273,6 +2996,315 @@ mod tests {
     fn duration_is_unknown_when_a_timestamp_is_the_epoch() {
         assert_eq!(duration_seconds(Some(0.0), Some(10.0)), None);
         assert_eq!(duration_seconds(Some(10.0), Some(0.0)), None);
+    }
+
+    // ── `over_duration` / `drop` pure helpers (plan 1f) ───────────────
+    //
+    // `late` is tested in `lakehouse-alerts::tests::late_*` because the
+    // helper now lives there (shared with `evaluate_pipeline_late`).
+    // Each helper below follows the same shape: an `Option` for the SLA
+    // value and a measurement, returning `None` when the question
+    // cannot be
+    // answered, and a strict-inequality bool otherwise. The "exactly at
+    // the threshold" tests pin the strictness; the "no clock"/"below
+    // min samples" tests pin the honest-null contract. Mutation checks
+    // for `late` (flip `>` to `>=`) and `drop` (min samples 5 → 4) live
+    // in the commit message.
+    mod sla_volume_helpers {
+        use super::{drop, over_duration};
+
+        // ── `over_duration` ────────────────────────────────────────
+
+        #[test]
+        fn over_duration_is_none_when_no_duration_sla_is_set() {
+            // No max → the runs route must emit `overDuration: null`,
+            // not `false`, for every run.
+            assert_eq!(over_duration(Some(120), None), None);
+            assert_eq!(over_duration(None, None), None);
+        }
+
+        #[test]
+        fn over_duration_is_none_for_a_run_that_is_still_running() {
+            // The orchestrator reported no duration (still going): not a
+            // breach yet. Reporting `false` here would imply the run is
+            // safely within SLA, which it might not be at any moment.
+            assert_eq!(over_duration(None, Some(60)), None);
+        }
+
+        #[test]
+        fn over_duration_is_true_when_duration_is_above_the_max() {
+            assert_eq!(over_duration(Some(120), Some(60)), Some(true));
+        }
+
+        #[test]
+        fn over_duration_is_false_when_duration_is_at_or_below_the_max() {
+            // Strict `>` again: at-the-max is still within SLA.
+            assert_eq!(over_duration(Some(60), Some(60)), Some(false));
+            assert_eq!(over_duration(Some(30), Some(60)), Some(false));
+        }
+
+        // ── `drop` ─────────────────────────────────────────────────
+
+        #[test]
+        fn drop_is_none_when_current_rows_are_null() {
+            // Null rows: a measurement gap, not "no drop". Skipping a
+            // null run also keeps the median history honest.
+            assert_eq!(drop(None, &[10, 20, 30, 40, 50, 60]), None);
+        }
+
+        #[test]
+        fn drop_is_none_when_history_is_below_min_samples() {
+            // Five samples is the floor (plan 1f). Four is not enough
+            // history: report `null`, never silently `false`. Lowering
+            // the floor to 4 is the mutation this test guards against.
+            assert_eq!(drop(Some(1), &[10, 20, 30, 40]), None);
+            assert_eq!(drop(Some(1), &[10, 20, 30]), None);
+            assert_eq!(drop(Some(1), &[10, 20]), None);
+            assert_eq!(drop(Some(1), &[10]), None);
+            assert_eq!(drop(Some(1), &[]), None);
+        }
+
+        #[test]
+        fn drop_is_false_when_history_is_above_min_samples_and_current_is_at_or_above_half_median()
+        {
+            // Median of [10, 20, 30, 40, 50, 60, 70, 80, 90] is 50
+            // (upper middle of the even-length array). Half is 25.
+            // Current rows = 25 → exactly half the median → not a drop
+            // (strict `<`).
+            assert_eq!(
+                drop(Some(25), &[10, 20, 30, 40, 50, 60, 70, 80, 90]),
+                Some(false)
+            );
+            // Current rows = 50 → well above half the median.
+            assert_eq!(
+                drop(Some(50), &[10, 20, 30, 40, 50, 60, 70, 80, 90]),
+                Some(false)
+            );
+        }
+
+        #[test]
+        fn drop_is_true_when_current_is_below_half_the_median() {
+            // Same history, half-median = 25. Current rows = 24 → drop.
+            assert_eq!(
+                drop(Some(24), &[10, 20, 30, 40, 50, 60, 70, 80, 90]),
+                Some(true)
+            );
+        }
+
+        #[test]
+        fn drop_uses_upper_median_for_an_even_length_history() {
+            // History length 6, sorted: [10, 20, 30, 40, 50, 60].
+            // `sorted[n / 2]` picks index 3 → 40. Half = 20. Boundary:
+            // 20 is not a drop (strict `<`), 19 is.
+            assert_eq!(drop(Some(20), &[10, 20, 30, 40, 50, 60]), Some(false));
+            assert_eq!(drop(Some(19), &[10, 20, 30, 40, 50, 60]), Some(true));
+        }
+    }
+
+    /// Plan 1f reviewer fix #3 — the `GET /api/pipelines/{id}/volume`
+    /// response shape (`runs`/`medianRows`/`unavailable`) and the
+    /// degraded path. Pinned through the pure [`volume_body`] helper:
+    /// the route itself is a thin `(StatusCode, ApiJson)` wrapper
+    /// around the helper plus a Dagster-error branch, so testing the
+    /// helper is enough to lock the contract.
+    mod volume_route {
+        use std::collections::HashMap;
+
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use lakehouse_dagster::{DgRun, DgRunWithRows};
+        use serde_json::{Value, json};
+
+        use super::{volume, volume_body};
+        use crate::config::Config;
+        use crate::state::AppState;
+
+        /// Build a `DgRunWithRows` for the body tests — `runs` arrive
+        /// most-recent-first from `Dagster`, so each entry is a fresh
+        /// `start_time` strictly greater than the next one.
+        fn run_with_rows(
+            run_id: &str,
+            status: &str,
+            start: Option<f64>,
+            end: Option<f64>,
+            rows: Option<i64>,
+        ) -> DgRunWithRows {
+            DgRunWithRows {
+                run: DgRun {
+                    run_id: run_id.to_owned(),
+                    job_name: "j".to_owned(),
+                    status: status.to_owned(),
+                    start_time: start,
+                    end_time: end,
+                    creation_time: None,
+                    parent_run_id: None,
+                    root_run_id: None,
+                    tags: Vec::new(),
+                },
+                rows,
+            }
+        }
+
+        /// The exact shape the spec names: `runs`, `medianRows`,
+        /// `unavailable`. No `pipelineId` (the spec doesn't list it),
+        /// no other keys. `runs` is ordered newest-first to match the
+        /// graph on the console; `medianRows` is the median of every
+        /// completed run that reported rows — the same median the drop
+        /// rule uses (reviewer fix #3: "the same median the drop rule
+        /// uses").
+        #[test]
+        fn volume_body_returns_the_spec_shape_with_medianrows_and_null_unavailable() {
+            // 7 completed runs reporting rows [10, 20, 30, 40, 50, 60, 70];
+            // 1 still-running with `rows = null` (must NOT enter the
+            // median); 1 completed with `rows = null` (also excluded).
+            let runs = vec![
+                run_with_rows("r7", "SUCCESS", Some(70.0), Some(80.0), Some(70)),
+                run_with_rows("r6", "SUCCESS", Some(60.0), Some(70.0), Some(60)),
+                run_with_rows("r5", "SUCCESS", Some(50.0), Some(60.0), Some(50)),
+                run_with_rows("r4", "SUCCESS", Some(40.0), Some(50.0), Some(40)),
+                run_with_rows("r3", "SUCCESS", Some(30.0), Some(40.0), Some(30)),
+                run_with_rows("r2", "SUCCESS", Some(20.0), Some(30.0), Some(20)),
+                run_with_rows("r1", "SUCCESS", Some(10.0), Some(20.0), Some(10)),
+                run_with_rows("r0", "STARTED", Some(5.0), None, None),
+                run_with_rows("rN", "FAILURE", Some(1.0), Some(2.0), None),
+            ];
+            let body = volume_body(&runs);
+
+            assert_eq!(
+                body["unavailable"],
+                Value::Null,
+                "successful Dagster fetch: `unavailable` must be null"
+            );
+            assert_eq!(
+                body["medianRows"],
+                json!(40),
+                "sorted [10,20,30,40,50,60,70] -> index 3 -> 40; same median the drop rule uses"
+            );
+            // `runs` is ordered newest-first, identical to the input.
+            let rs = body["runs"].as_array().expect("runs is an array");
+            assert_eq!(rs.len(), 9);
+            assert_eq!(rs[0]["runId"], "r7");
+            assert_eq!(rs[8]["runId"], "rN");
+            // The two null-rows runs emit `rows: null`, not 0.
+            assert!(rs[7]["rows"].is_null());
+            assert!(rs[8]["rows"].is_null());
+            // `r0` is `STARTED` -> drop is `null` (in-progress is not
+            // a drop).
+            assert!(rs[7]["drop"].is_null(), "STARTED is not a drop");
+            // `rN` (FAILURE, no rows): `drop` is `null` per the `drop`
+            // helper — null rows is a measurement gap, not a drop.
+            assert!(rs[8]["drop"].is_null());
+            // No `pipelineId` key — the spec does not list it.
+            assert!(
+                body.get("pipelineId").is_none(),
+                "the spec shape has no pipelineId"
+            );
+        }
+
+        /// When no completed run reported any rows, the median is
+        /// `None` — `medianRows: null`, not `0`. An honest `null` keeps
+        /// the chart from inventing a baseline over an empty set.
+        #[test]
+        fn volume_body_returns_null_medianrows_when_no_run_reported_rows() {
+            let runs = vec![
+                run_with_rows("a", "STARTED", Some(2.0), None, None),
+                run_with_rows("b", "FAILURE", Some(1.0), Some(2.0), None),
+                run_with_rows("c", "SUCCESS", Some(0.5), Some(1.0), None),
+            ];
+            let body = volume_body(&runs);
+            assert!(
+                body["medianRows"].is_null(),
+                "no completed run reported rows: medianRows is null, not 0 or median([])"
+            );
+            assert_eq!(body["unavailable"], Value::Null);
+            // `drop` is `null` for every run — the drop rule has no
+            // history to compare against.
+            for r in body["runs"].as_array().unwrap() {
+                assert!(r["drop"].is_null(), "drop is null when no history");
+            }
+        }
+
+        /// `medianRows` matches the median the drop rule uses for an
+        /// even-length history (`sorted[n/2]` upper-of-middle). Six
+        /// completed runs: the chart median is 40 (`sorted[6/2]`), and
+        /// the newest run's drop rule sees exactly the 5-sample floor
+        /// of history with its own median 30 → half 15, so 60 rows is
+        /// not a drop. Pinning both numbers in one test keeps the
+        /// chart's `medianRows` and the rule's median from drifting
+        /// apart on a future refactor.
+        #[test]
+        fn volume_body_medianrows_matches_the_drop_rule_median() {
+            let runs = vec![
+                run_with_rows("r6", "SUCCESS", Some(60.0), Some(70.0), Some(60)),
+                run_with_rows("r5", "SUCCESS", Some(50.0), Some(60.0), Some(50)),
+                run_with_rows("r4", "SUCCESS", Some(40.0), Some(50.0), Some(40)),
+                run_with_rows("r3", "SUCCESS", Some(30.0), Some(40.0), Some(30)),
+                run_with_rows("r2", "SUCCESS", Some(20.0), Some(30.0), Some(20)),
+                run_with_rows("r1", "SUCCESS", Some(10.0), Some(20.0), Some(10)),
+            ];
+            let body = volume_body(&runs);
+            assert_eq!(
+                body["medianRows"],
+                json!(40),
+                "sorted [10,20,30,40,50,60] -> index 3 -> 40"
+            );
+            let rs = body["runs"].as_array().unwrap();
+            // Newest run: 5 prior samples [10,20,30,40,50], median 30,
+            // half 15; 60 < 15 is false.
+            assert_eq!(rs[0]["drop"], json!(false));
+            // Second-newest: only 4 prior samples — below the
+            // 5-sample floor, so an honest null even though 50 > 15.
+            assert!(
+                rs[1]["drop"].is_null(),
+                "4 prior samples is below the floor: drop is null"
+            );
+            // Oldest run has no history at all → null.
+            assert!(rs[5]["drop"].is_null());
+        }
+
+        /// Dagster unreachable: the route returns 200 (not 503) with
+        /// `runs: []`, `medianRows: null`, and `unavailable` set to a
+        /// classified, non-upstream reason string — mirroring
+        /// [`runs_body`]'s degraded branch so the console can show
+        /// "no runs right now, but here's why" instead of treating the
+        /// outage as a hard error.
+        #[tokio::test]
+        async fn volume_route_degrades_to_unavailable_when_dagster_is_down() {
+            // A Dagster URL on a closed local port, never the config
+            // default; a unit test must not dial whatever happens to
+            // listen there. Mirrors `list_with_a_tenantless_unrestricted_principal_still_queries_dagster`.
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+            env.insert(
+                "DAGSTER_URL".to_owned(),
+                "http://127.0.0.1:1/graphql".to_owned(),
+            );
+            let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+            let response = volume(State(state), Path("j".to_owned())).await;
+            assert_eq!(response.status(), StatusCode::OK, "200, not 503");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&body).expect("valid JSON");
+            assert_eq!(v["runs"], json!([]));
+            assert!(v["medianRows"].is_null());
+            assert!(
+                v["unavailable"].is_string(),
+                "unavailable is the classified reason string"
+            );
+            // AGENTS.md rule 4: upstream text must never reach a
+            // response body. The Dagster URL we fed the client is the
+            // most likely upstream detail to leak — assert it is
+            // absent.
+            assert!(
+                !v["unavailable"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("127.0.0.1:1"),
+                "upstream URL must not leak into the response: got {:?}",
+                v["unavailable"]
+            );
+        }
     }
 
     /// WS4 item C1 — `GET /api/pipelines/{id}` for a `Dagster`-native job:
@@ -3360,6 +4392,307 @@ mod tests {
             .await
             .unwrap_err();
             assert_eq!(err.0.status(), 404);
+        }
+    }
+
+    /// `POST /api/pipelines/events/run-failed` route tests (plan 1e).
+    /// The handler-side service-identity check (separate from the policy
+    /// gate), the unknown-jobName non-error path, the dedupe short-circuit
+    /// on a sensor retry, and the 409 on a non-failed run.
+    mod run_failed_event_route {
+        use axum::body::Bytes;
+
+        use super::*;
+        use crate::config::Config;
+
+        /// Build an `AppState` with a real Postgres pool and a stub Dagster
+        /// URL — the run-status path is mocked in each test through
+        /// `state.dagster`. Mirrors `assign_tenant_route::state_for` so
+        /// every `#[sqlx::test]`-driven test here starts from the same
+        /// baseline.
+        fn state_for(pool: &sqlx::PgPool) -> AppState {
+            let options = pool.connect_options();
+            let database_url = format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database"),
+            );
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url);
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        fn body_for(run_id: &str, job_name: &str) -> Bytes {
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "runId": run_id,
+                    "jobName": job_name,
+                }))
+                .expect("serialize"),
+            )
+        }
+
+        /// A user with `pipeline:write` is refused at the handler: the
+        /// policy gate lets them through (401/403 isn't the test), but the
+        /// `PrincipalId::Service(_)` check then returns 403. Mirrors
+        /// `authored_pipelines::runnable`'s posture.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn refuses_a_user_with_pipeline_write(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let err = run_failed_event(
+                State(state),
+                Extension(fixture_user_principal()),
+                body_for("run-1", "authored__pl_ui_check_flow"),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0.status(), StatusCode::FORBIDDEN);
+        }
+
+        /// An unknown `jobName` is *not* an error: the handler returns
+        /// `200` with `{"matched": 0, "reason": ...}`. The sensor's
+        /// contract is "best effort — try every jobName, only the ones
+        /// we know about do anything," and a hard 404 would block the
+        /// sensor on unrelated job names.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn unknown_job_name_returns_matched_zero_with_a_reason(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let resp = run_failed_event(
+                State(state),
+                Extension(fixture_service_principal()),
+                body_for("run-2", "not_a_real_job"),
+            )
+            .await
+            .expect("handler accepts an unknown jobName");
+            assert_eq!(resp.0["matched"], 0);
+            assert_eq!(
+                resp.0["reason"],
+                "unknown jobName; no runnable pipeline owns it"
+            );
+        }
+    }
+
+    /// Plan 1f reviewer fix #1 — `POST /api/pipelines/events/run-finished`
+    /// dedupes each alert kind through `pipeline_run_event` BEFORE
+    /// delivery, so a sensor retry for the same run never double-fires
+    /// `pipeline_slow` / `pipeline_volume_drop` (same posture
+    /// `run_failed_event` has for kind `"failure"`).
+    mod run_finished_event_route {
+        use axum::body::Bytes;
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+        use crate::config::Config;
+
+        /// Postgres + a wiremock `Dagster` and `ClickHouse`, wired
+        /// through the same env keys production uses.
+        fn state_for(pool: &sqlx::PgPool, dagster_url: &str, ch_url: &str) -> AppState {
+            let options = pool.connect_options();
+            let database_url = format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database"),
+            );
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url);
+            env.insert("DAGSTER_URL".to_owned(), format!("{dagster_url}/graphql"));
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        fn body_for(run_id: &str, job_name: &str) -> Bytes {
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "runId": run_id,
+                    "jobName": job_name,
+                }))
+                .expect("serialize"),
+            )
+        }
+
+        /// An authored pipeline in status `ready` (the store's own
+        /// definition of runnable), created through the real create
+        /// route. The status UPDATE bypasses the transition route's
+        /// state machine on purpose: that machine's own tests live in
+        /// `status_route`, and this fixture only needs a row
+        /// `list_runnable_pipelines` will return.
+        async fn seed_runnable_pipeline(state: &AppState, name: &str) -> String {
+            let body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "name": name,
+                    "kind": "batch",
+                    "sourceZone": "bronze",
+                    "sourceTable": "t",
+                    "targetZone": "silver",
+                    "targetTable": "t",
+                    "schedule": "manual",
+                }))
+                .expect("serialize"),
+            );
+            let (_, ApiJson(pipeline)) = create(
+                State(state.clone()),
+                Extension(fixture_user_principal()),
+                HeaderMap::new(),
+                body,
+            )
+            .await
+            .expect("create should succeed");
+            let pool = state.pg.as_deref().expect("DATABASE_URL was set");
+            sqlx::query("UPDATE pipeline_definition SET status = 'ready' WHERE id = $1")
+                .bind(&pipeline.id)
+                .execute(pool)
+                .await
+                .expect("mark the fixture runnable");
+            pipeline.id
+        }
+
+        /// A sensor retry must not re-deliver: the first
+        /// `run-finished` call for a slow run records kind `"slow"`
+        /// and delivers once; an identical second call dedupes away.
+        /// Asserted three ways — `matched` (1 then 0), the single
+        /// `pipeline_run_event` row, and the webhook receiving
+        /// exactly one POST.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_second_run_finished_event_for_the_same_run_does_not_re_deliver(
+            pool: sqlx::PgPool,
+        ) {
+            let dagster = MockServer::start().await;
+            let ch = MockServer::start().await;
+            let webhook = MockServer::start().await;
+
+            let state = state_for(&pool, &dagster.uri(), &ch.uri());
+            // Seed first: the mocks below embed the id, which
+            // `slug_id` derives from the name plus a millisecond
+            // stamp, so it is only known after the create call. The
+            // job name goes through the real `job_name` mapping (it
+            // sanitizes the id, e.g. `-` → `_`).
+            let pipeline_id = seed_runnable_pipeline(&state, "Dedupe flow").await;
+            let job = super::super::authored_pipelines::job_name(&pipeline_id);
+
+            // `pipeline_run_status`: the run is SUCCESS, lasting 1000s.
+            Mock::given(method("POST"))
+                .and(body_string_contains("pipelineRunOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineRunOrError": {
+                        "__typename": "Run", "status": "SUCCESS",
+                        "startTime": 1000.0, "endTime": 2000.0, "stepStats": []
+                    } }
+                })))
+                .mount(&dagster)
+                .await;
+            // `list_runs_for_job_with_materializations` (the volume-drop
+            // half): the same run, no materializations, so `rows` is an
+            // honest `None` and `volume_drop` cannot decide — only the
+            // `slow` kind is exercised here.
+            Mock::given(method("POST"))
+                .and(body_string_contains("runsOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "runsOrError": { "__typename": "Runs", "results": [
+                        {
+                            "runId": "run-slow",
+                            "jobName": job,
+                            "status": "SUCCESS",
+                            "startTime": 1000.0, "endTime": 2000.0,
+                            "creationTime": null,
+                            "parentRunId": null, "rootRunId": null,
+                            "tags": [], "stepStats": []
+                        }
+                    ] } }
+                })))
+                .mount(&dagster)
+                .await;
+            // `list_rules`' SELECT — one enabled `pipeline_slow` rule
+            // scoped to the pipeline, targeting the webhook server.
+            Mock::given(method("POST"))
+                .and(body_string_contains("FROM console.alert_rule"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [], "rows": 1,
+                    "data": [{
+                        "id": "al-slow-dedupe-1",
+                        "name": "Slow dedupe rule",
+                        "type": "pipeline_slow",
+                        "mart": "", "measure": "", "agg": "sum",
+                        "op": ">", "threshold": "0", "board": "",
+                        "channel": "webhook",
+                        "target": webhook.uri(),
+                        "enabled": "1", "created_at": "",
+                        "severity": "high",
+                        "pipeline": pipeline_id,
+                    }]
+                })))
+                .mount(&ch)
+                .await;
+            // `ensure()`'s DDL — anything else answers 200.
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&ch)
+                .await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&webhook)
+                .await;
+
+            // Duration SLA 60s: the mocked run ran 1000s → slow fires.
+            pipelines::upsert_pipeline_sla(&pool, &pipeline_id, Some(60), None, uuid::Uuid::nil())
+                .await
+                .expect("seed the SLA row");
+
+            let first = run_finished_event(
+                State(state.clone()),
+                Extension(fixture_service_principal()),
+                body_for("run-slow", &job),
+            )
+            .await
+            .expect("the first event must be accepted");
+            assert_eq!(
+                first.0["matched"], 1,
+                "the first event delivers to the one matching rule"
+            );
+
+            let second = run_finished_event(
+                State(state),
+                Extension(fixture_service_principal()),
+                body_for("run-slow", &job),
+            )
+            .await
+            .expect("a sensor retry must be accepted, not error");
+            assert_eq!(
+                second.0["matched"], 0,
+                "the retry for the same (run, kind) is deduped away"
+            );
+
+            let rows: Vec<(String, String, String)> =
+                sqlx::query_as("SELECT run_id, pipeline_id, kind FROM pipeline_run_event")
+                    .fetch_all(&pool)
+                    .await
+                    .expect("read the dedupe table");
+            assert_eq!(
+                rows,
+                vec![(
+                    "run-slow".to_owned(),
+                    pipeline_id.clone(),
+                    "slow".to_owned()
+                )],
+                "exactly one dedupe row for the slow kind"
+            );
+
+            let webhook_posts = webhook.received_requests().await.expect("request log");
+            assert_eq!(
+                webhook_posts.len(),
+                1,
+                "the webhook was hit exactly once across both calls"
+            );
         }
     }
 }

@@ -327,6 +327,24 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // `identity:write`, not `pipeline:write`: this is a governance
     // decision about who may see the row, not a pipeline-operation grant.
     ("PUT",  "/api/pipelines/{id}/tenant",            Policy::RequiresPermission("identity:write")),
+    // Dagster `run_failure_sensor` posts to this; the handler then
+    // refuses non-service `pipeline:write` holders, mirroring
+    // `authored_pipelines::runnable` (a `pipeline:write` user is still
+    // not the orchestrator).
+    ("POST", "/api/pipelines/events/run-failed",     Policy::RequiresPermission("pipeline:write")),
+    // Same posture as the run-failed route above: the
+    // `run_status_sensor(SUCCESS)` posts here, and the handler
+    // refuses a non-service `pipeline:write` holder. Plan 1f.
+    ("POST", "/api/pipelines/events/run-finished",   Policy::RequiresPermission("pipeline:write")),
+    // Plan 1f: per-pipeline SLA. `pipeline:write` is the floor — a
+    // `pipeline:read` holder can see the row's existence via the runs
+    // route but cannot list or set the SLA thresholds themselves.
+    ("GET",  "/api/pipelines/{id}/sla",               Policy::RequiresPermission("pipeline:write")),
+    ("PUT",  "/api/pipelines/{id}/sla",               Policy::RequiresPermission("pipeline:write")),
+    // Volume history: the same authorization posture as `/runs` (which
+    // is `pipeline:read`); a pipeline-write holder can already set the
+    // SLA, so reading the resulting row counts is `pipeline:read`.
+    ("GET",  "/api/pipelines/{id}/volume",            Policy::RequiresPermission("pipeline:read")),
 
     // ── Dashboard: seeded Dashboard Viewer permission `dashboard:read`.
     //    `dashboard:write` is the natural write counterpart — see module

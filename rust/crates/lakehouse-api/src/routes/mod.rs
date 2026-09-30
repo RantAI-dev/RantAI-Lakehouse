@@ -223,6 +223,40 @@ fn pipelines_router() -> Router<AppState> {
             "/api/pipelines/{id}/tenant",
             axum::routing::put(pipelines::assign_pipeline_tenant),
         )
+        // Dagster `run_failure_sensor` posts here once per failed run;
+        // see `dagster/dispar_orchestrate/pipeline_events.py`. Handler
+        // enforces service-identity (the route is gated by `pipeline:write`
+        // first, then the handler refuses a non-service `pipeline:write`
+        // holder, mirroring `authored_pipelines::runnable`).
+        .route(
+            "/api/pipelines/events/run-failed",
+            axum::routing::post(pipelines::run_failed_event),
+        )
+        // Plan 1f: Dagster `run_status_sensor(SUCCESS)` posts here once
+        // per successful run. Same posture as the run-failed route — the
+        // handler enforces a service identity on top of the `pipeline:write`
+        // gate. Computes the run's `slow`/`volume_drop` outcomes and hands
+        // each to its per-kind evaluator: `evaluate_pipeline_slow` /
+        // `evaluate_pipeline_volume_drop`.
+        .route(
+            "/api/pipelines/events/run-finished",
+            axum::routing::post(pipelines::run_finished_event),
+        )
+        // Plan 1f: per-pipeline SLA. `GET` returns 404 when no SLA is
+        // configured (so the UI can distinguish "no SLA yet" from a
+        // degraded backend); `PUT` upserts and writes a `pipeline.sla_set`
+        // audit event. The route validates the body (positive thresholds
+        // only) — the database CHECK is defense in depth.
+        .route(
+            "/api/pipelines/{id}/sla",
+            get(pipelines::get_sla).put(pipelines::put_sla),
+        )
+        // Plan 1f: volume history (last 30 runs + their row counts and the
+        // `drop` decision per run). Same 30-run window as `/runs`.
+        .route(
+            "/api/pipelines/{id}/volume",
+            axum::routing::get(pipelines::volume),
+        )
 }
 
 /// The `/api/storage/*` sub-router (Task 2.6), split out for the same

@@ -4,6 +4,7 @@
 //! Ports `src/app/api/alerts/route.ts` and
 //! `src/app/api/alerts/run/route.ts`.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -11,7 +12,7 @@ use axum::extract::{Extension, Query, State};
 use axum::http::HeaderMap;
 use iceberg::{NamespaceIdent, TableIdent};
 use lakehouse_alerts::{
-    AlertKind, AlertRule, AlertRuleInput, FreshnessSource, SilenceSource, SqlGate,
+    AlertKind, AlertRule, AlertRuleInput, FreshnessSource, LateSource, SilenceSource, SqlGate,
 };
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
@@ -264,6 +265,58 @@ pub(in crate::routes) struct ApiSqlGate<'a> {
     pub(in crate::routes) ch: &'a lakehouse_clickhouse::ChClient,
 }
 
+/// Plan 1f: [`LateSource`] backed by Postgres (for the SLA row) and a
+/// pre-fetched map of last-success epoch seconds per pipeline id
+/// (populated by the route handler from the Dagster client, so this
+/// crate stays free of the Dagster SDK). When Postgres is not
+/// configured, or when either query fails, the error message is
+/// classified ("database error") before returning — never an upstream
+/// detail, matching AGENTS.md rule 4.
+pub(in crate::routes) struct ApiLateSource<'a> {
+    pub(in crate::routes) pg: &'a PgPool,
+    /// `pipeline_id → last successful run's epoch seconds`. A *missing*
+    /// key means "no SUCCESS run on record yet" — the [`late`] helper
+    /// treats that as "definitely late, threshold set." The run id is
+    /// stored alongside by [`evaluate_late_pass`] for the
+    /// `pipeline_run_event` dedupe; this source only carries the epoch
+    /// seconds because [`LateSource::late_inputs`] is the only method
+    /// the alerts crate's evaluator calls.
+    pub(in crate::routes) last_success: HashMap<String, Option<LastSuccess>>,
+}
+
+#[async_trait::async_trait]
+impl LateSource for ApiLateSource<'_> {
+    async fn late_inputs(&self, pipeline_id: &str) -> Result<Option<(i32, Option<f64>)>, String> {
+        // SLA row first: without a threshold the answer is "config gap",
+        // not "not late". `get_pipeline_sla` already classifies its
+        // error → `Ok(None)` for missing rows, `Err("database error")`
+        // for transport failures.
+        let sla = match lakehouse_store::pipelines::get_pipeline_sla(self.pg, pipeline_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return Ok(None),
+            Err(_) => return Err("database error".to_owned()),
+        };
+        let threshold = match sla.late_after_seconds {
+            Some(t) if t > 0 => t,
+            // `late_after_seconds = NULL` (only `max_duration_seconds`
+            // set) — there is no "late" claim to make for this
+            // pipeline.
+            _ => return Ok(None),
+        };
+        // The route handler pre-fetches last-success epoch seconds
+        // per pipeline. A missing key means the Dagster round-trip
+        // didn't include this pipeline id — treat it as "no SUCCESS
+        // run on record," not as an error: that's the same posture a
+        // missing key would have if Dagster had no runs for the job.
+        let last = self
+            .last_success
+            .get(pipeline_id)
+            .and_then(|o| o.as_ref())
+            .map(|s| s.epoch_seconds);
+        Ok(Some((threshold, last)))
+    }
+}
+
 #[async_trait::async_trait]
 impl SqlGate for ApiSqlGate<'_> {
     async fn gate(&self, sql: &str) -> Result<String, String> {
@@ -288,6 +341,10 @@ fn fired_source(kind: AlertKind) -> &'static str {
         AlertKind::Alert => "Alert rules",
         AlertKind::Freshness => "Freshness monitoring",
         AlertKind::Digest => "Digest", // never reached: callers filter Digest out before this
+        AlertKind::PipelineFailure => "Pipeline failures", // never reached: callers filter PipelineFailure out before this
+        AlertKind::PipelineSlow => "Pipeline SLA: duration",
+        AlertKind::PipelineLate => "Pipeline SLA: late",
+        AlertKind::PipelineVolumeDrop => "Pipeline SLA: volume drop",
     }
 }
 
@@ -309,6 +366,17 @@ fn fired_detail(rule: &AlertRule, value: Option<f64>) -> String {
             rule.op.as_str(),
             rule.threshold
         ),
+        // PipelineFailure / PipelineSlow / PipelineVolumeDrop rules fire
+        // from the event routes, never `run_rules`; the detail isn't
+        // used for them.
+        AlertKind::PipelineFailure => "pipeline failure".to_owned(),
+        AlertKind::PipelineSlow => "pipeline run exceeded its duration SLA".to_owned(),
+        AlertKind::PipelineLate => {
+            "pipeline is late (no successful run within the SLA window)".to_owned()
+        }
+        AlertKind::PipelineVolumeDrop => {
+            "pipeline run processed fewer than half the median rows of prior runs".to_owned()
+        }
     }
 }
 
@@ -465,8 +533,275 @@ pub async fn run(
         persist_fired_results(pg, &state.clickhouse, &results).await;
     }
 
+    // Plan 1f: `pipeline_late` rules fire from this op, not from the
+    // orchestrator event path. A "late" claim depends on the clock at
+    // evaluation time, not at run time. The route handler iterates
+    // every enabled `pipeline_late` rule whose `pipeline` names a
+    // specific pipeline id (the `*` wildcard is not yet wired for
+    // pipeline_late — it would require enumerating every runnable
+    // pipeline here, which is the plan's next-step scope, not this
+    // commit's) and calls [`evaluate_pipeline_late`] per pipeline.
+    // The matching `run_rules` entries (each a `skipped` with the
+    // reason "pipeline_late rules are evaluated by /api/alerts/run...")
+    // stay in the response, so the user sees both the rule list and
+    // the per-pipeline deliveries.
+    if let Some(pg) = state.pg.as_deref() {
+        let late_rule_pipelines = list_late_rule_pipelines(&state.clickhouse).await?;
+        if !late_rule_pipelines.is_empty() {
+            let last_success =
+                fetch_last_success_per_pipeline(&state.dagster, &late_rule_pipelines).await;
+            // Plan 1f (reviewer fix #4): the clock helper returns `None`
+            // when the system clock is unset. Pass that `None` straight
+            // through to `evaluate_late_pass` — it skips every pipeline
+            // (a "late" claim is undecidable without a clock) rather
+            // than silently fabricating a `Some(0.0)` "late since 1970"
+            // for each one. The helper log line is the visible audit
+            // trail for the skip.
+            let now_seconds = crate::routes::pipelines::now_unix_seconds();
+            evaluate_late_pass(
+                pg,
+                &state.clickhouse,
+                &http,
+                &email,
+                late_rule_pipelines,
+                &last_success,
+                silence_source.as_ref().map(|s| s as &dyn SilenceSource),
+                now_seconds,
+            )
+            .await?;
+        }
+    }
+
     Ok(ApiJson(json!({ "ran": results.len(), "results": results })))
 }
+
+/// Plan 1f: list every distinct `pipeline_id` referenced by an enabled
+/// `pipeline_late` rule with a non-`None`, non-`"*"` `pipeline` field.
+/// Used by [`run`] to drive [`evaluate_pipeline_late`]. Filters
+/// in-process from `list_rules` to avoid a second `ClickHouse`
+/// round-trip and a second schema surface
+/// (`pipeline_late_rule_pipelines`) — the underlying query is the same
+/// `console.alert_rule` SELECT.
+///
+/// # Errors
+///
+/// Returns `Err("database error")` on a `ClickHouse` failure — never an
+/// upstream detail, matching AGENTS.md rule 4.
+async fn list_late_rule_pipelines(
+    ch: &lakehouse_clickhouse::ChClient,
+) -> Result<Vec<String>, ApiError> {
+    let rules = lakehouse_alerts::list_rules(ch)
+        .await
+        .map_err(|_| ApiError::Internal("database error".to_owned()))?;
+    let mut out: Vec<String> = rules
+        .into_iter()
+        .filter(|r| {
+            r.enabled
+                && r.kind == lakehouse_alerts::AlertKind::PipelineLate
+                && r.pipeline
+                    .as_deref()
+                    .is_some_and(|p| !p.is_empty() && p != "*")
+        })
+        .filter_map(|r| r.pipeline)
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Plan 1f: pull the last SUCCESS run (epoch seconds + run id) for every
+/// pipeline id in `pipeline_ids` from the Dagster client (one round-trip
+/// per id, the same call [`routes::pipelines`] uses for the runs/detail
+/// rows). A per-pipeline failure (e.g. Dagster temporarily unreachable)
+/// is captured as `None` for that id, matching the same posture
+/// `routes::pipelines::last_success_for` takes for a missing run — a
+/// missing last-success is then treated by [`late`] as "definitely
+/// late, threshold set," which is the honest answer when a pipeline's
+/// orchestrator is silent.
+///
+/// The run id is the dedupe key for the `pipeline_run_event` row written
+/// per late episode (reviewer fix #2); without it, two passes for the
+/// same "no new success since the threshold" state would re-deliver.
+async fn fetch_last_success_per_pipeline(
+    dagster: &lakehouse_dagster::DgClient,
+    pipeline_ids: &[String],
+) -> HashMap<String, Option<LastSuccess>> {
+    let mut out = HashMap::new();
+    for id in pipeline_ids {
+        let job_name = job_name_for_pipeline_id(id);
+        let last = dagster
+            .list_runs_for_job(&job_name, 30)
+            .await
+            .ok()
+            .and_then(|runs| last_success_for(&runs, &job_name));
+        out.insert(id.clone(), last);
+    }
+    out
+}
+
+/// The most recent SUCCESS run's `start_time` epoch seconds and its run
+/// id, for the deduplicated `pipeline_run_event` key the late pass uses
+/// (reviewer fix #2). `None` when no SUCCESS run is on record yet.
+#[derive(Debug, Clone)]
+pub(in crate::routes) struct LastSuccess {
+    pub(in crate::routes) epoch_seconds: f64,
+    pub(in crate::routes) run_id: String,
+}
+
+/// Plan 1f: the Dagster job name for `pipeline_id`. Mirrors
+/// `routes::pipelines::list_body`'s own `authored__<id>` mapping —
+/// `evaluate_pipeline_late` runs against the same `authored__*` jobs
+/// the orchestrator launches. `*` is not supported here (see
+/// [`list_late_rule_pipelines`]).
+fn job_name_for_pipeline_id(pipeline_id: &str) -> String {
+    format!("authored__{pipeline_id}")
+}
+
+/// Plan 1f: the most recent SUCCESS run for `job_name` in `runs` —
+/// `(epoch_seconds, run_id)` of the newest SUCCESS by `start_time`.
+/// `None` when no SUCCESS run is present. Mirrors the same pattern as
+/// `routes::pipelines::last_success_for` but returns both the epoch
+/// seconds (for [`late`]) and the run id (for the dedupe key).
+fn last_success_for(runs: &[lakehouse_dagster::DgRun], job_name: &str) -> Option<LastSuccess> {
+    runs.iter()
+        .filter(|r| r.job_name == job_name && r.status == "SUCCESS")
+        .filter_map(|r| r.start_time.map(|t| (t, r.run_id.clone())))
+        .fold(None, |best, (t, id)| {
+            Some(match best {
+                None => LastSuccess {
+                    epoch_seconds: t,
+                    run_id: id,
+                },
+                Some(prev) if t > prev.epoch_seconds => LastSuccess {
+                    epoch_seconds: t,
+                    run_id: id,
+                },
+                Some(prev) => prev,
+            })
+        })
+}
+
+/// Plan 1f reviewer fix #2: the `pipeline_run_event` row key for a
+/// `pipeline_late` episode. The spec says "the last success's run id as
+/// the key." When there is no last success (pipeline has never
+/// succeeded), this falls back to a per-pipeline sentinel so each
+/// pipeline's "no success yet" state still has a unique dedupe key —
+/// without it, two pipelines without a success would collide on a
+/// `None` run id and the second pipeline's first late episode would
+/// silently dedupe away.
+fn late_episode_key(pipeline_id: &str, last: Option<LastSuccess>) -> String {
+    last.map_or_else(|| format!("{pipeline_id}::no_success"), |s| s.run_id)
+}
+
+/// Plan 1f reviewer fix #4 + #2 orchestration: run the late-evaluation
+/// pass (one pass per `/api/alerts/run` invocation). Skips entirely when
+/// `now_seconds` is `None` — a "late" claim is undecidable without a
+/// clock, and the alternative (`Some(0.0)` "late since 1970") is the
+/// exact bug the single crate-wide `Option<f64>` clock helper prevents.
+/// For each `pipeline_id`, computes the late decision from
+/// `LateSource`; when it is `Some(true)`, records the dedupe row
+/// (`kind="late"`, `run_id = late_episode_key(...)`) BEFORE delivery
+/// (mirrors the run-failed route's pattern at routes/pipelines.rs:1302).
+/// `first_seen == false` short-circuits without delivery — that is the
+/// sensor-retry / repeat-pass dedupe the spec requires.
+///
+/// Returned `usize` is the number of pipelines for which delivery was
+/// attempted (one per `first_seen` true). Used by the route-level
+/// integration test as a "did we deliver at all" signal.
+///
+/// # Errors
+///
+/// Returns a 500 [`ApiError::Internal`] when the late source propagates a
+/// classified error or a delivery fails; a failed dedupe insert maps
+/// through `From<StoreError> for ApiError`.
+async fn evaluate_late_pass(
+    pg: &PgPool,
+    ch: &lakehouse_clickhouse::ChClient,
+    http: &reqwest::Client,
+    email: &EmailSender,
+    late_rule_pipelines: Vec<String>,
+    last_success: &HashMap<String, Option<LastSuccess>>,
+    silence_source: Option<&dyn SilenceSource>,
+    now_seconds: Option<f64>,
+) -> Result<usize, ApiError> {
+    // Reviewer fix #4: when the system clock is unset (an unreachable
+    // NTP source on some build hosts), `now_unix_seconds` returns
+    // `None`. Without a clock we cannot decide whether any pipeline is
+    // currently late, and "late since 1970" would be a worse answer
+    // than honest silence. Skip the whole pass with a single
+    // `warn!` so an operator can see why their `/api/alerts/run`
+    // invocation did not raise anything.
+    let Some(now) = now_seconds else {
+        tracing::warn!(
+            "pipeline_late pass skipped: system clock is unset (SystemTime::now() \
+             returned a value before the UNIX epoch)"
+        );
+        return Ok(0);
+    };
+    let late_source = ApiLateSource {
+        pg,
+        last_success: last_success.clone(),
+    };
+    let mut delivered_pipelines = 0_usize;
+    for pipeline_id in &late_rule_pipelines {
+        // Reviewer fix #2: dedupe happens BEFORE delivery, the same
+        // order `run_failed_event` uses (routes/pipelines.rs:1302).
+        // `late_decision` returns the plan 1f `late` helper's result
+        // without firing any rule.
+        let decision = lakehouse_alerts::late_decision(
+            Some(&late_source as &dyn lakehouse_alerts::LateSource),
+            pipeline_id,
+            Some(now),
+        )
+        .await
+        .map_err(|err| ApiError::Internal(format!("{err}")))?;
+        if decision != Some(true) {
+            continue;
+        }
+        let dedupe_key = late_episode_key(
+            pipeline_id,
+            // `get` yields `Option<&Option<_>>`; clone + flatten lifts
+            // the inner `Option<LastSuccess>` out in one step.
+            last_success.get(pipeline_id).cloned().flatten(),
+        );
+        // Write the dedupe row FIRST. A `false` return means the same
+        // `(run_id, kind)` pair was already inserted by a previous
+        // pass for the same episode — short-circuit so this late
+        // episode does not re-deliver.
+        let first_seen = lakehouse_store::pipelines::record_pipeline_run_event(
+            pg,
+            &dedupe_key,
+            pipeline_id,
+            "late",
+        )
+        .await
+        .map_err(ApiError::from)?;
+        if !first_seen {
+            continue;
+        }
+        // Delivery — only happens on a fresh insert.
+        lakehouse_alerts::evaluate_pipeline_late(
+            ch,
+            http,
+            email,
+            pipeline_id,
+            Some(&late_source as &dyn lakehouse_alerts::LateSource),
+            silence_source,
+            Some(now),
+        )
+        .await
+        .map_err(|err| ApiError::Internal(format!("{err}")))?;
+        delivered_pipelines += 1;
+    }
+    Ok(delivered_pipelines)
+}
+
+// Plan 1f note: `now_seconds` for the late-evaluation pass comes from
+// [`crate::routes::pipelines::now_unix_seconds`] — the single crate-wide
+// `Option<f64>` clock helper. A `None` from that helper skips the whole
+// pass (a broken clock means we cannot make a "late" claim, and the
+// alternative — `Some(0.0)` "late since 1970" — is exactly the bug this
+// helper exists to prevent).
 
 #[cfg(test)]
 mod tests {
@@ -730,6 +1065,223 @@ mod tests {
             assert_eq!(
                 row_count, 1,
                 "still only the original silenced row — no fresh instance while silenced"
+            );
+        }
+    }
+
+    /// Plan 1f reviewer fix #2 + #4 — the `pipeline_late` pass inside
+    /// `/api/alerts/run`: the clock contract (`None` skips the whole
+    /// pass without touching Postgres or `ClickHouse`) and the
+    /// per-episode dedupe (a second pass for the same last-success
+    /// run id must not re-deliver, via `pipeline_run_event`).
+    mod late_pass {
+        use lakehouse_clickhouse::ChClient;
+        use lakehouse_notify::EmailSender;
+        use wiremock::MockServer;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, ResponseTemplate};
+
+        use super::super::{LastSuccess, evaluate_late_pass};
+        use super::*;
+
+        fn no_smtp_email_sender() -> EmailSender {
+            EmailSender::new(SmtpConfig {
+                host: None,
+                port: 587,
+                secure: false,
+                user: None,
+                pass: String::new(),
+                from: String::new(),
+            })
+        }
+
+        /// A `ClickHouse` client pointed at `server`, whose only mock
+        /// answers `list_rules`' SELECT with zero rows — enough for the
+        /// pass to run to completion (with no rules, nothing is
+        /// delivered) while still recording every request it receives,
+        /// so a test can assert nobody dialed `ClickHouse` at all.
+        async fn ch_for(server: &MockServer) -> ChClient {
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [], "data": [], "rows": 0
+                })))
+                .mount(server)
+                .await;
+            ChClient::new(server.uri(), "default".to_owned(), String::new())
+        }
+
+        /// Reviewer fix #4: `now_unix_seconds()` returning `None` (no
+        /// usable system clock) must skip the ENTIRE pass — no SLA
+        /// lookup, no rule listing, no delivery attempt. The wiremock
+        /// request log is the proof: an empty log means `ClickHouse`
+        /// was never dialed, so nothing downstream of the clock check
+        /// ran.
+        ///
+        /// The fixture is deliberately load-bearing: the last success
+        /// sits at a negative epoch so the pipeline WOULD be decided
+        /// late if the pass ran under the old `Some(0.0)` fallback
+        /// (0.0 − (−3600) > 60). With a realistic "an hour ago" success
+        /// the old fallback would evaluate to not-late and this test
+        /// would pass either way — proving nothing. A negative epoch is
+        /// absurd as real data; it is exactly the value that separates
+        /// "skipped" from "evaluated", which is the contract under
+        /// test.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn late_pass_skips_entirely_when_the_clock_is_unset(pool: sqlx::PgPool) {
+            let server = MockServer::start().await;
+            let ch = ch_for(&server).await;
+            let http = reqwest::Client::new();
+            let email = no_smtp_email_sender();
+            // Threshold 60s, so under the old fallback the run at
+            // epoch −3600 is 3600 seconds late.
+            lakehouse_store::pipelines::upsert_pipeline_sla(
+                &pool,
+                "pl-clock-test",
+                None,
+                Some(60),
+                uuid::Uuid::nil(),
+            )
+            .await
+            .unwrap();
+            let mut last_success = HashMap::new();
+            last_success.insert(
+                "pl-clock-test".to_owned(),
+                Some(LastSuccess {
+                    epoch_seconds: -3600.0,
+                    run_id: "run-clock".to_owned(),
+                }),
+            );
+
+            let delivered = evaluate_late_pass(
+                &pool,
+                &ch,
+                &http,
+                &email,
+                vec!["pl-clock-test".to_owned()],
+                &last_success,
+                None,
+                None, // the broken-clock case under test
+            )
+            .await
+            .expect("a skipped pass is not an error");
+
+            assert_eq!(delivered, 0, "nothing is delivered without a clock");
+            let dialed = server.received_requests().await.unwrap();
+            assert!(
+                dialed.is_empty(),
+                "the pass must not touch ClickHouse when the clock is unset, got {} requests",
+                dialed.len()
+            );
+            let events: i64 = sqlx::query_scalar("SELECT count(*) FROM pipeline_run_event")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(events, 0, "no dedupe row is written without a clock");
+        }
+
+        /// Reviewer fix #2: the late pass dedupes per episode through
+        /// `pipeline_run_event` keyed by the last success's run id. The
+        /// first pass for an episode inserts the row and delivers (the
+        /// return counts it); a second pass for the SAME episode must
+        /// short-circuit on the dedupe row — return 0, and still
+        /// exactly one `pipeline_run_event` row.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_second_late_pass_for_the_same_episode_does_not_re_deliver(pool: sqlx::PgPool) {
+            let server = MockServer::start().await;
+            let ch = ch_for(&server).await;
+            let http = reqwest::Client::new();
+            let email = no_smtp_email_sender();
+            // The pipeline is late: threshold 60s, last success an hour
+            // before `now`.
+            lakehouse_store::pipelines::upsert_pipeline_sla(
+                &pool,
+                "pl-dedupe-test",
+                None,
+                Some(60),
+                uuid::Uuid::nil(),
+            )
+            .await
+            .unwrap();
+            let now = 1_800_000_000.0;
+            let mut last_success = HashMap::new();
+            last_success.insert(
+                "pl-dedupe-test".to_owned(),
+                Some(LastSuccess {
+                    epoch_seconds: now - 3600.0,
+                    run_id: "run-abc".to_owned(),
+                }),
+            );
+
+            let first = evaluate_late_pass(
+                &pool,
+                &ch,
+                &http,
+                &email,
+                vec!["pl-dedupe-test".to_owned()],
+                &last_success,
+                None,
+                Some(now),
+            )
+            .await
+            .expect("the first pass must succeed");
+            assert_eq!(first, 1, "the first pass delivers the episode once");
+
+            let second = evaluate_late_pass(
+                &pool,
+                &ch,
+                &http,
+                &email,
+                vec!["pl-dedupe-test".to_owned()],
+                &last_success,
+                None,
+                Some(now),
+            )
+            .await
+            .expect("a repeat pass must not error");
+            assert_eq!(
+                second, 0,
+                "the second pass for the same episode is deduped away"
+            );
+
+            // Exactly one dedupe row, keyed by the last success's run
+            // id — the spec's key choice, pinned here so a drift back
+            // to an unspecified key fails loudly.
+            let rows: Vec<(String, String, String)> =
+                sqlx::query_as("SELECT run_id, pipeline_id, kind FROM pipeline_run_event")
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                rows,
+                vec![(
+                    "run-abc".to_owned(),
+                    "pl-dedupe-test".to_owned(),
+                    "late".to_owned()
+                )],
+                "one row, keyed by the last success's run id"
+            );
+        }
+
+        /// The dedupe key for a pipeline that has never succeeded is
+        /// the per-pipeline sentinel, not an empty string or `None`:
+        /// two pipelines without a success must not collide on one key
+        /// (the second one's first late episode would silently dedupe
+        /// away).
+        #[test]
+        fn the_no_success_episode_key_is_per_pipeline() {
+            assert_eq!(
+                super::super::late_episode_key("pl-a", None),
+                "pl-a::no_success"
+            );
+            assert_eq!(
+                super::super::late_episode_key(
+                    "pl-b",
+                    Some(LastSuccess {
+                        epoch_seconds: 1.0,
+                        run_id: "r1".to_owned(),
+                    })
+                ),
+                "r1"
             );
         }
     }
