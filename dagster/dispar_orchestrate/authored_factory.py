@@ -12,7 +12,14 @@ all tenants) and builds, per pipeline:
   cron. `default_status` is RUNNING for a `ready` pipeline and STOPPED for a
   `paused` one: the schedule the author set is meant to fire, and one that
   is not wanted is paused from the console, which also switches this
-  schedule off (`routes::pipelines::authored_status`).
+  schedule off (`routes::pipelines::authored_status`);
+* an `authored__<id>_after` run_status_sensor when the pipeline's
+  `depends_on` is non-empty (R3 plan 2a). The sensor fires after a SUCCESS
+  run of any of its upstreams; it yields a `RunRequest` only when EVERY
+  upstream has had a SUCCESS run that finished AFTER this pipeline's
+  most-recent start time (ALL semantics — see `build_authored_dependency_sensor`
+  for the rule, named upstream-by-upstream in the `SkipReason` so the UI can
+  show "waiting on <id>").
 
 The API asks the webserver to reload this code location whenever a
 pipeline becomes ready, is edited, paused, resumed or deleted
@@ -41,7 +48,21 @@ from dataclasses import dataclass
 from typing import Any
 
 import requests
-from dagster import AssetMaterialization, DefaultScheduleStatus, Failure, ScheduleDefinition, job, op
+from dagster import (
+    AssetMaterialization,
+    DagsterRunStatus,
+    DefaultScheduleStatus,
+    DefaultSensorStatus,
+    Failure,
+    JobSelector,
+    RunRequest,
+    RunsFilter,
+    ScheduleDefinition,
+    SkipReason,
+    job,
+    op,
+    run_status_sensor,
+)
 
 from dispar_orchestrate import authored_transforms, op_metadata
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, _ch_exec, _ch_query_json
@@ -413,7 +434,13 @@ def build_authored_definitions(
     cfg: AuthoredPipelineConfig | None = None,
 ) -> tuple[list[Any], list[ScheduleDefinition]]:
     """Every authored job and schedule, from ONE fetch, so the two lists
-    can never describe different sets of pipelines."""
+    can never describe different sets of pipelines. R3 plan 2a: this
+    function deliberately does NOT include the chain sensors — those are
+    built by `build_authored_dependency_sensors`, so this 2-tuple shape
+    stays compatible with HEAD's `test_jobs_and_schedules_come_from_one_fetch`
+    (and with `build_authored_jobs`, which is `... [0]`). The module
+    loaders below call both builders; they pay one extra HTTP roundtrip
+    at code-load time only when `PIPELINE_RUN_TOKEN` is set."""
     cfg = cfg or AuthoredPipelineConfig.from_env()
     jobs: list[Any] = []
     schedules: list[ScheduleDefinition] = []
@@ -426,16 +453,158 @@ def build_authored_definitions(
     return jobs, schedules
 
 
+def build_authored_dependency_sensors(
+    cfg: AuthoredPipelineConfig | None = None,
+) -> list[Any]:
+    """R3 plan 2a: one `run_status_sensor` per authored pipeline with
+    non-empty `depends_on`. Built separately from
+    `build_authored_definitions` so that function can keep its HEAD
+    2-tuple return shape — the sensor list only matters at code-load
+    time when `Definitions(sensors=...)` is constructed, and it is
+    empty whenever `PIPELINE_RUN_TOKEN` is unset (so the extra fetch
+    is a no-op in that case)."""
+    cfg = cfg or AuthoredPipelineConfig.from_env()
+    sensors: list[Any] = []
+    for pipeline in _fetch_authored_pipelines(cfg):
+        authored_job = build_authored_job(pipeline)
+        sensor = build_authored_dependency_sensor(pipeline, authored_job)
+        if sensor is not None:
+            sensors.append(sensor)
+    return sensors
+
+
 def build_authored_jobs(cfg: AuthoredPipelineConfig | None = None) -> list[Any]:
     return build_authored_definitions(cfg)[0]
+
+
+# R3 plan 2a: a run_status_sensor per authored pipeline with non-empty
+# `depends_on`. Named `authored__<safe_id>_after` so the `job_name`/
+# `schedule_name` sanitize rule (`_dagster_safe_name`) matches what the
+# Rust API layer produces (see `routes::authored_pipelines::sensor_name`
+# in `lakehouse-api`, used by `GET /api/pipelines/{id}/schedule-ticks`
+# when fetching this sensor's ticks).
+#
+# Default status RUNNING — a sensor that ships STOPPED silently never
+# fires; if the author did not want chains to trigger they would have
+# left `depends_on` empty (and this function would not have been called
+# for this row). DAGSTER_REPO and DAGSTER_LOCATION match
+# `DgClient::with_repository`'s defaults so the selector targets the
+# same code location the API's launches go to.
+DAGSTER_REPO = "__repository__"
+DAGSTER_LOCATION = "dispar_orchestrate.definitions"
+
+
+def _upstream_job_selector(upstream_id: str) -> JobSelector:
+    """Map an upstream id to a `JobSelector` for the `monitored_jobs`
+    list. Authored ids become the safe job name the factory gave them
+    (`authored__<safe_id>`); Dagster-native ids are used verbatim. R3
+    plan 2a."""
+    job_name = f"authored__{_dagster_safe_name(upstream_id)}" if upstream_id.startswith("pl-") else upstream_id
+    return JobSelector(
+        location_name=DAGSTER_LOCATION,
+        repository_name=DAGSTER_REPO,
+        job_name=job_name,
+    )
+
+
+def build_authored_dependency_sensor(
+    pipeline: dict[str, Any], authored_job: Any
+) -> Any | None:
+    """One `run_status_sensor` for `pipeline`, or `None` when it has no
+    `depends_on`. The sensor watches every upstream's SUCCESS run; on a
+    firing tick it computes "has every upstream had a SUCCESS that
+    finished after this pipeline's most-recent start?" -- ALL semantics
+    (R3 plan 2a). When yes, yield `RunRequest(run_key=<upstream run id>)`
+    so Dagster's own dedup keeps a re-firing upstream from launching the
+    downstream twice for the same upstream run; when no, yield a
+    `SkipReason` naming the upstream that is still behind.
+
+    `monitored_jobs` accepts `JobSelector`s (for cross-location
+    upstreams like `ingest_job`); `request_job` must be the
+    `JobDefinition` this code location built -- Dagster 1.13.20's
+    `SensorDefinition.__init__` coerces `request_job` through
+    `AutomationTarget.from_coercible`, which only handles
+    `JobDefinition`/`UnresolvedAssetJobDefinition` (not selectors).
+    Verified against dagster 1.13.20's `run_status_sensor` signature.
+    """
+    depends_on = pipeline.get("depends_on") or []
+    if not depends_on:
+        return None
+    monitored = [_upstream_job_selector(dep) for dep in depends_on]
+    downstream_safe = _dagster_safe_name(pipeline["id"])
+    upstream_ids = list(depends_on)
+
+    @run_status_sensor(
+        run_status=DagsterRunStatus.SUCCESS,
+        name=f"authored__{downstream_safe}_after",
+        monitored_jobs=monitored,
+        request_job=authored_job,
+        default_status=DefaultSensorStatus.RUNNING,
+        description=(
+            f"Triggers pipeline {pipeline['id']!r} when every upstream in "
+            f"{upstream_ids!r} has had a SUCCESS run after this pipeline's "
+            "most-recent start (R3 plan 2a)."
+        ),
+    )
+    def _dependency_sensor(context: Any) -> Any:
+        # `context.dagster_run` is the upstream run that triggered THIS
+        # tick -- it is always SUCCESS here (`run_status=SUCCESS` on the
+        # decorator) and is the canonical id to use as `run_key`.
+        upstream_run = context.dagster_run
+        # The downstream's most-recent start, regardless of outcome:
+        # what we need to beat is "started after this point in time".
+        # `NOT_STARTED`/`QUEUED` runs have no start_time, so we filter
+        # to status groups where `start_time` is set on every row
+        # (STARTED, SUCCESS, FAILURE, CANCELING, CANCELED -- the set
+        # that owns the field). The `descending` default on
+        # `get_runs(limit=1)` gives us the most-recent start.
+        downstream_runs = context.instance.get_runs(
+            filters=RunsFilter(job_name=f"authored__{downstream_safe}"),
+            limit=1,
+        )
+        downstream_start = downstream_runs[0].start_time if downstream_runs else None
+        # No start_time on the downstream yet -> this is the first run
+        # in its chain. Allow the upstream-triggered run through
+        # regardless of when it finished: nothing else has fired the
+        # downstream yet, so there is no "stale upstream" to wait for.
+        if downstream_start is None:
+            yield RunRequest(run_key=upstream_run.run_id)
+            return
+        # Otherwise: check EVERY upstream, name the first one that
+        # is stale in the skip reason.
+        for upstream_id in upstream_ids:
+            upstream_job_name = (
+                f"authored__{_dagster_safe_name(upstream_id)}"
+                if upstream_id.startswith("pl-")
+                else upstream_id
+            )
+            upstream_runs = context.instance.get_runs(
+                filters=RunsFilter(
+                    job_name=upstream_job_name,
+                    statuses=[DagsterRunStatus.SUCCESS],
+                ),
+                limit=1,
+            )
+            latest = upstream_runs[0] if upstream_runs else None
+            if latest is None or latest.end_time is None or latest.end_time <= downstream_start:
+                yield SkipReason(
+                    f"upstream {upstream_id!r} has no SUCCESS run after the "
+                    f"downstream's most-recent start ({downstream_start}); "
+                    f"this upstream run ({upstream_run.run_id}) is stale"
+                )
+                return
+        yield RunRequest(run_key=upstream_run.run_id)
+
+    return _dependency_sensor
 
 
 # Built at Dagster code-load time, same pattern `agent_run_schedules`
 # (`agent_runs.py`) uses -- see `_fetch_authored_pipelines`'s doc comment
 # for every way this degrades to empty lists without raising.
-# Two plain assignments rather than tuple unpacking, so
+# Three plain assignments rather than tuple unpacking, so
 # `ops/lint/check_intra_package_imports.py` (which reads module-level
-# names statically) sees both names `definitions.py` imports.
-_authored_definitions = build_authored_definitions()
-authored_jobs = _authored_definitions[0]
-authored_schedules = _authored_definitions[1]
+# names statically) sees all three names `definitions.py` imports.
+_authored_jobs_and_schedules = build_authored_definitions()
+authored_jobs = _authored_jobs_and_schedules[0]
+authored_schedules = _authored_jobs_and_schedules[1]
+authored_dependency_sensors = build_authored_dependency_sensors()

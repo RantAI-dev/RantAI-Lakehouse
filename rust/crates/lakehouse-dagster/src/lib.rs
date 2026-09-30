@@ -973,6 +973,49 @@ impl DgClient {
         Ok(schedule_ticks_from(&data["scheduleOrError"]))
     }
 
+    /// The most recent ticks of one sensor, newest first: when it evaluated,
+    /// whether it launched a run, was skipped, or failed. A sensor that does
+    /// not exist reads as an empty list (R3 plan 2a — `authored__<id>_after`
+    /// sensors only exist once their pipeline has `depends_on`; before that,
+    /// the route merges in `[]` rather than failing).
+    ///
+    /// The query path is `sensorOrError(sensorSelector)` (note: the
+    /// singular `SensorSelector`, NOT `SensorOrError.sensors(...)`) —
+    /// `Dagster`'s `1.13.20` GraphQL schema names the selector type
+    /// `SensorSelector` and the matching field `sensorOrError`. Verified
+    /// live against this repository's Dagster stack; see the
+    /// `schedule_ticks_from`-style unit test in this file.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`].
+    pub async fn sensor_ticks(
+        &self,
+        sensor_name: &str,
+        limit: u32,
+    ) -> Result<Vec<ScheduleTick>, DgError> {
+        let query = "query($sel: SensorSelector!, $limit: Int!) { sensorOrError(sensorSelector: $sel) { \
+                      __typename \
+                      ... on Sensor { sensorState { ticks(limit: $limit) { \
+                        tickId status timestamp runIds skipReason error { message } } } } \
+                      } }";
+        let variables = json!({
+            "sel": {
+                "repositoryName": self.repo,
+                "repositoryLocationName": self.location,
+                "sensorName": sensor_name,
+            },
+            "limit": limit,
+        });
+        let data: Value = self.execute(query, Some(variables)).await?;
+        // The schedule and sensor tick payloads share the same
+        // `{ tickId, status, timestamp, runIds, skipReason, error }`
+        // shape; reusing `schedule_ticks_from` keeps the JSON navigation
+        // in one place. A `SensorNotFoundError` typename has no
+        // `sensorState`, so the function returns `[]`.
+        Ok(schedule_ticks_from(&data["sensorOrError"]))
+    }
+
     /// A single run's live status + per-step status, matching
     /// `GET /api/ai/build-status`'s inline query (`pipelineRunOrError` on
     /// `Run`).

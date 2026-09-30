@@ -178,6 +178,7 @@ async fn dependent_pipelines_are_derived_from_pipeline_definition(
             owner: None,
             description: None,
             tenant_id: None,
+            depends_on: Vec::new(),
         },
     )
     .await
