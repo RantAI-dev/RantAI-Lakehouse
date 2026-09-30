@@ -13,7 +13,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
-use lakehouse_dagster::{DgClient, DgError, DgJob, DgRun, iso_from_unix_seconds, map_run_status};
+use lakehouse_dagster::{
+    DgClient, DgError, DgJob, DgRun, ReexecutionStrategy, iso_from_unix_seconds, map_run_status,
+};
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::pipelines::{self, CreatePipelineInput};
 use lakehouse_store::{PgPool, StoreError};
@@ -350,6 +352,10 @@ fn graph_op_to_json(op: &lakehouse_dagster::GraphOp) -> Value {
         "sourceRef": op.source_ref,
         "commit": op.commit,
         "sql": op.sql,
+        // Declared by the op's own code (`op_metadata.source_metadata`),
+        // drawn by the console's flowchart on either side of the op.
+        "reads": op.reads,
+        "writes": op.writes,
     })
 }
 
@@ -662,7 +668,36 @@ fn run_to_json(r: &DgRun, pipeline_id: &str) -> Value {
         "retried": Value::Null,
         "costUnits": Value::Null,
         "durationSeconds": duration_seconds(r.start_time, r.end_time),
+        // When the run was created. The gap to `startedAt` is queue and
+        // launch time, which the console shows apart from run time.
+        "queuedAt": r.creation_time.map(iso_from_unix_seconds),
+        "parentRunId": r.parent_run_id,
+        "rootRunId": r.root_run_id,
+        "trigger": run_trigger(r),
     })
+}
+
+/// What launched a run, read from the tags `Dagster` itself writes. A run
+/// with none of them was launched by hand or through the API, which is
+/// what `"manual"` means here; it does not claim a particular person.
+fn run_trigger(r: &DgRun) -> Value {
+    let tag = |key: &str| {
+        r.tags
+            .iter()
+            .find(|t| t.key == key)
+            .map(|t| t.value.clone())
+    };
+    if let Some(name) = tag("dagster/schedule_name") {
+        json!({ "kind": "schedule", "name": name })
+    } else if let Some(name) = tag("dagster/sensor_name") {
+        json!({ "kind": "sensor", "name": name })
+    } else if let Some(name) = tag("dagster/backfill") {
+        json!({ "kind": "backfill", "name": name })
+    } else if r.parent_run_id.is_some() {
+        json!({ "kind": "retry", "name": Value::Null })
+    } else {
+        json!({ "kind": "manual", "name": Value::Null })
+    }
 }
 
 /// How long a finished run took, in seconds. `None` while it is still
@@ -1430,14 +1465,28 @@ pub async fn cancel_run(State(state): State<AppState>, Path(run_id): Path<String
     }
 }
 
-/// `POST /api/pipelines/runs/{runId}/retry` — re-execute a finished run
-/// from the start.
+/// `POST /api/pipelines/runs/{runId}/retry` — re-execute a finished run.
+/// An empty body re-runs every step. `{"strategy":"fromFailure"}` re-runs
+/// only the steps that failed or never ran, which `Dagster` refuses (409)
+/// for a run that did not fail.
 ///
 /// # Errors
 ///
-/// Same as [`cancel_run`].
-pub async fn retry_run(State(state): State<AppState>, Path(run_id): Path<String>) -> Response {
-    match state.dagster.launch_reexecution(&run_id).await {
+/// Same as [`cancel_run`], plus 400 for a body that names no known
+/// strategy.
+pub async fn retry_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    body: Bytes,
+) -> Response {
+    let Some(strategy) = retry_strategy(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            ApiJson(json!({ "error": "strategy must be \"allSteps\" or \"fromFailure\"" })),
+        )
+            .into_response();
+    };
+    match state.dagster.launch_reexecution(&run_id, strategy).await {
         Ok(outcome) if outcome.error.is_none() => {
             let new_id = outcome.run_id.unwrap_or(run_id);
             // The NEW run's id, just launched: `Dagster` has not populated
@@ -1456,6 +1505,20 @@ pub async fn retry_run(State(state): State<AppState>, Path(run_id): Path<String>
             ApiJson(json!({ "error": js_error(err) })),
         )
             .into_response(),
+    }
+}
+
+/// The re-execution strategy a retry body asks for; `None` for a body
+/// that is not empty and names no known strategy.
+fn retry_strategy(body: &[u8]) -> Option<ReexecutionStrategy> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Some(ReexecutionStrategy::AllSteps);
+    }
+    let value: Value = serde_json::from_slice(body).ok()?;
+    match value.get("strategy").and_then(Value::as_str) {
+        None | Some("allSteps") => Some(ReexecutionStrategy::AllSteps),
+        Some("fromFailure") => Some(ReexecutionStrategy::FromFailure),
+        Some(_) => None,
     }
 }
 
@@ -1841,7 +1904,45 @@ mod tests {
             status: status.to_owned(),
             start_time: start,
             end_time: end,
+            creation_time: None,
+            parent_run_id: None,
+            root_run_id: None,
+            tags: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_runs_trigger_comes_from_the_tags_dagster_writes() {
+        let tag = |key: &str, value: &str| lakehouse_dagster::DgTag {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        };
+        let mut r = run("j", "SUCCESS", Some(1.0), Some(2.0));
+        assert_eq!(run_trigger(&r)["kind"], "manual");
+
+        r.parent_run_id = Some("r0".to_owned());
+        assert_eq!(run_trigger(&r)["kind"], "retry");
+
+        r.tags = vec![tag("dagster/schedule_name", "gold_export_schedule")];
+        let v = run_trigger(&r);
+        assert_eq!(v["kind"], "schedule");
+        assert_eq!(v["name"], "gold_export_schedule");
+
+        r.tags = vec![tag("dagster/sensor_name", "on_bronze")];
+        assert_eq!(run_trigger(&r)["kind"], "sensor");
+    }
+
+    #[test]
+    fn a_retry_body_names_its_strategy_or_is_refused() {
+        assert_eq!(retry_strategy(b""), Some(ReexecutionStrategy::AllSteps));
+        assert_eq!(retry_strategy(b"  "), Some(ReexecutionStrategy::AllSteps));
+        assert_eq!(retry_strategy(b"{}"), Some(ReexecutionStrategy::AllSteps));
+        assert_eq!(
+            retry_strategy(br#"{"strategy":"fromFailure"}"#),
+            Some(ReexecutionStrategy::FromFailure)
+        );
+        assert_eq!(retry_strategy(br#"{"strategy":"someSteps"}"#), None);
+        assert_eq!(retry_strategy(b"not json"), None);
     }
 
     #[test]

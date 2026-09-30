@@ -383,8 +383,9 @@ fn trigger_pipeline_schema() -> Value {
 
 fn retry_pipeline_run_schema() -> Value {
     json!({ "type": "function", "function": { "name": "retry_pipeline_run",
-        "description": "Re-run a finished pipeline run from the start (by runId).",
-        "parameters": { "type": "object", "properties": { "runId": { "type": "string" } },
+        "description": "Re-run a finished pipeline run (by runId): every step, or with fromFailure only the steps that failed (failed runs only).",
+        "parameters": { "type": "object", "properties": { "runId": { "type": "string" },
+            "fromFailure": { "type": "boolean" } },
             "required": ["runId"] } } })
 }
 

@@ -1554,6 +1554,13 @@ services:
     build:
       context: ./dagster
       dockerfile: Dockerfile
+      # The SAME `GIT_SHA` the `lakehouse-api` build gets: every op stamps
+      # it as its `commit`, and the API serves op source only when that
+      # matches its own (`pipeline_source.rs::check_commit`). Without this
+      # arg every op said "unknown" and the console's source view always
+      # answered 409. Build with `GIT_SHA=$(git rev-parse HEAD)`.
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     depends_on:
       dagster-db-init:
         condition: service_completed_successfully
@@ -1794,6 +1801,13 @@ services:
     build:
       context: ./dagster
       dockerfile: Dockerfile
+      # The SAME `GIT_SHA` the `lakehouse-api` build gets: every op stamps
+      # it as its `commit`, and the API serves op source only when that
+      # matches its own (`pipeline_source.rs::check_commit`). Without this
+      # arg every op said "unknown" and the console's source view always
+      # answered 409. Build with `GIT_SHA=$(git rev-parse HEAD)`.
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     depends_on:
       dagster-code-location:
         condition: service_started
@@ -1825,6 +1839,13 @@ services:
     build:
       context: ./dagster
       dockerfile: Dockerfile
+      # The SAME `GIT_SHA` the `lakehouse-api` build gets: every op stamps
+      # it as its `commit`, and the API serves op source only when that
+      # matches its own (`pipeline_source.rs::check_commit`). Without this
+      # arg every op said "unknown" and the console's source view always
+      # answered 409. Build with `GIT_SHA=$(git rev-parse HEAD)`.
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     depends_on:
       dagster-code-location:
         condition: service_started

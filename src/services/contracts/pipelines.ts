@@ -72,7 +72,23 @@ export type PipelineRun = {
   auditEventId?: string
   /** Output dataset produced by this run when known. */
   outputAssetId?: string
+  /** When the orchestrator created (queued) the run; the gap to `startedAt` is queue and launch time. Absent on a mutation response. */
+  queuedAt?: string | null
+  /** The run this one re-executes, when it is a retry. */
+  parentRunId?: string | null
+  /** The first run of this retry chain. */
+  rootRunId?: string | null
+  /** What launched the run, read from the orchestrator's own run tags (`routes::pipelines::run_trigger`). `"manual"` means no schedule, sensor or backfill launched it. */
+  trigger?: PipelineRunTrigger
 }
+
+export type PipelineRunTrigger = {
+  kind: "schedule" | "sensor" | "backfill" | "retry" | "manual" | string
+  name: string | null
+}
+
+/** How a retry picks the steps it runs again: every step, or only the failed ones (failed runs only). */
+export type RetryStrategy = "allSteps" | "fromFailure"
 
 /** One op node in a job's dependency graph (`GET /api/pipelines/{id}`'s `graph.ops`). */
 export type PipelineOpNode = {
@@ -81,6 +97,10 @@ export type PipelineOpNode = {
   sourceRef: string | null
   commit: string | null
   sql: string | null
+  /** What the op's own code reads, one short phrase each, as the op declares it (`op_metadata.source_metadata`). Not observed from a run. */
+  reads: string[]
+  /** What the op's own code writes; see `reads`. */
+  writes: string[]
 }
 
 /** One dependency edge: `from` runs before `to`. */
@@ -190,7 +210,8 @@ export interface PipelineService {
   createPipeline(input: CreatePipelineInput, signal?: AbortSignal): Promise<Pipeline>
   triggerRun(id: string, signal?: AbortSignal): Promise<PipelineRun>
   cancelRun(runId: string, signal?: AbortSignal): Promise<PipelineRun>
-  retryRun(runId: string, signal?: AbortSignal): Promise<PipelineRun>
+  /** `POST /api/pipelines/runs/{runId}/retry`; `strategy` defaults to every step. */
+  retryRun(runId: string, signal?: AbortSignal, strategy?: RetryStrategy): Promise<PipelineRun>
   pausePipeline(id: string, signal?: AbortSignal): Promise<Pipeline>
   resumePipeline(id: string, signal?: AbortSignal): Promise<Pipeline>
   /** `GET /api/pipelines/{id}/source?op=` — one op's read-only source text (WS4 item F1). */

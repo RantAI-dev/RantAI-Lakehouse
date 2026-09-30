@@ -3,6 +3,7 @@
 import { useTheme } from "next-themes"
 import CodeMirror from "@uiw/react-codemirror"
 import { python } from "@codemirror/lang-python"
+import { sql } from "@codemirror/lang-sql"
 import { cn } from "@/lib/utils"
 
 /**
@@ -17,21 +18,32 @@ import { cn } from "@/lib/utils"
  *
  * @param text The op's source text (already resolved server-side).
  * @param className Optional extra wrapper classes.
+ * @param language Highlighting grammar; Python by default.
  */
-export function CodeView({ text, className }: { text: string; className?: string }) {
+export function CodeView({
+  text,
+  className,
+  language = "python",
+}: {
+  text: string
+  className?: string
+  /** Highlighting only; `"plain"` for text with no grammar (a stored JSON definition). */
+  language?: "python" | "sql" | "plain"
+}) {
   const { resolvedTheme } = useTheme()
   const cmTheme = resolvedTheme === "dark" ? "dark" : "light"
+  const extensions = language === "python" ? [python()] : language === "sql" ? [sql()] : []
 
   return (
     <div
       className={cn(
-        "overflow-hidden rounded-md border border-border bg-background [&_.cm-editor]:outline-none [&_.cm-scroller]:font-mono [&_.cm-scroller]:text-sm",
+        "overflow-hidden rounded-md border border-border bg-background [&_.cm-editor]:outline-none [&_.cm-scroller]:font-mono [&_.cm-scroller]:text-sm [&_.cm-scroller]:leading-5 [&_.cm-gutterElement]:leading-5 [&_.cm-line]:leading-5",
         className
       )}
     >
       <CodeMirror
         value={text}
-        extensions={[python()]}
+        extensions={extensions}
         editable={false}
         theme={cmTheme}
         basicSetup={{ lineNumbers: true, foldGutter: true, highlightActiveLine: false }}

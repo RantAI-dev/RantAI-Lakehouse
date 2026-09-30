@@ -19,7 +19,13 @@ from dispar_orchestrate.dlt_pipeline import BronzeIngestConfig, run_bronze_inges
 from dispar_orchestrate.op_metadata import source_metadata
 
 
-@op(tags=source_metadata("dispar_orchestrate/assets.py::ingest_bronze_table"))
+@op(
+    tags=source_metadata(
+        "dispar_orchestrate/assets.py::ingest_bronze_table",
+        reads=["Postgres BRONZE_SOURCE_SCHEMA.TABLE (via dlt)"],
+        writes=["Iceberg bronze.{BRONZE_TABLE_NAME}"],
+    )
+)
 def ingest_bronze_table(context) -> dict:
     """Run the dlt pipeline: Postgres -> Bronze Iceberg through Lakekeeper."""
     summary = run_bronze_ingest()
@@ -33,7 +39,13 @@ def ingest_bronze_table(context) -> dict:
     return summary
 
 
-@op(tags=source_metadata("dispar_orchestrate/assets.py::register_in_catalog"))
+@op(
+    tags=source_metadata(
+        "dispar_orchestrate/assets.py::register_in_catalog",
+        reads=["Postgres source table (row count)", "ClickHouse system.tables, system.columns"],
+        writes=["ClickHouse lake.bronze_meta.dataset_catalog", "ClickHouse lake.bronze_meta.dataset_sync"],
+    )
+)
 def register_in_catalog(context, summary: dict) -> None:
     """Make the ingested table show up on `GET /api/catalog` and the
     `governance/lineage`/`governance/classification` surfaces, by writing
