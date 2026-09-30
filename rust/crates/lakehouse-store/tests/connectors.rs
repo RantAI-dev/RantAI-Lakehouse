@@ -24,10 +24,10 @@ use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::connector_probe_result::list_probe_results;
 use lakehouse_store::connectors::{
     ConnectorFilter, CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec,
-    IngestSpecInput, SecretRefSwap, SecretSlot, UpdateConnectorInput, create_connector,
-    delete_connector, get_connector, get_connector_dial_info, get_ingest_spec, list_connectors,
-    list_ingestible_connectors, record_test_result, set_ingest_spec, swap_secret_ref,
-    swap_secret_refs, update_connector,
+    IngestSpecInput, SecretRefSwap, SecretSlot, UpdateConnectorInput, connector_in_tenants,
+    create_connector, delete_connector, get_connector, get_connector_dial_info, get_ingest_spec,
+    list_connectors, list_ingestible_connectors, record_test_result, set_ingest_spec,
+    swap_secret_ref, swap_secret_refs, update_connector,
 };
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::pipelines::{CreatePipelineInput, create_pipeline};
@@ -1531,6 +1531,46 @@ async fn swap_secret_ref_sets_a_null_secondary_slot_when_expected_old_is_none(
     assert_eq!(
         after.secret_ref_secondary.as_deref(),
         Some("env:NEW_SECONDARY_REF")
+    );
+    Ok(())
+}
+
+/// The per-connector routes' access rule: the connector's own tenant is
+/// in, any other tenant, no tenant at all and an unknown id are all out.
+#[sqlx::test(migrations = "../../migrations")]
+async fn connector_in_tenants_admits_only_the_connectors_own_tenant(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let group = Uuid::parse_str("11111111-1111-4111-8111-000000000001").expect("seeded tenant id");
+    let retail = Uuid::parse_str("11111111-1111-4111-8111-000000000002").expect("seeded tenant id");
+    assert!(
+        connector_in_tenants(&pool, "conn-pg-lakehouse", &[retail, group])
+            .await
+            .expect("query")
+    );
+    assert!(
+        !connector_in_tenants(&pool, "conn-pg-lakehouse", &[retail])
+            .await
+            .expect("query")
+    );
+    assert!(
+        !connector_in_tenants(&pool, "conn-pg-lakehouse", &[])
+            .await
+            .expect("query")
+    );
+    assert!(
+        !connector_in_tenants(&pool, "conn-does-not-exist", &[group])
+            .await
+            .expect("query")
+    );
+
+    sqlx::query("UPDATE connector SET tenant_id = NULL WHERE id = 'conn-pg-lakehouse'")
+        .execute(&pool)
+        .await?;
+    assert!(
+        !connector_in_tenants(&pool, "conn-pg-lakehouse", &[group])
+            .await
+            .expect("query")
     );
     Ok(())
 }

@@ -588,6 +588,16 @@ async fn seeded_data_engineer_may_get_and_put_ingest_spec() {
 async fn ingest_spec_put_rejects_a_dial_whose_host_resolves_internal() {
     let TestApp { router, pool } = spin_up().await;
     let user_id = create_principal_with_permissions(&pool, "connector:manage").await;
+    // Meridian Group, `conn-pg-lakehouse`'s tenant: the per-connector
+    // routes answer only for a connector in the caller's tenant.
+    sqlx::query(
+        "INSERT INTO app_user_tenant (user_id, tenant_id) \
+         VALUES ($1, '11111111-1111-4111-8111-000000000001')",
+    )
+    .bind(user_id)
+    .execute(&pool)
+    .await
+    .expect("join the connector's tenant");
     let cookie = session_cookie_for_user(&pool, user_id).await;
 
     let body = serde_json::json!({

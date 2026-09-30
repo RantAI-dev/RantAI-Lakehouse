@@ -24,8 +24,10 @@
 
 use axum::Extension;
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::Next;
+use axum::response::Response;
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
 use lakehouse_core::secret::SecretValue;
@@ -111,6 +113,60 @@ pub async fn list(
     Ok(ApiJson(
         connectors::list_connectors(pool(&state)?, &filter).await?,
     ))
+}
+
+/// The access rule of every `/api/connectors/{id}/*` route: the caller must
+/// belong to the connector's tenant. `POLICY_TABLE` only says what a
+/// caller may do to connectors in general; without this, `connector:manage`
+/// in one tenant reached every tenant's connectors by id — read their
+/// settings, change or replace their credentials, run them, delete them.
+///
+/// Refused with the same 404 an unknown id gets, so the answer is no
+/// oracle for which connector ids exist in other tenants. A connector with
+/// no tenant is refused too: `PUT .../tenant` (identity administration) is
+/// how one is assigned.
+///
+/// Applied to the routes by [`require_connector_in_tenants`]; a caller
+/// that invokes a connector handler without the router — the copilot's
+/// tools (`routes::ai::tools::connectors`) — calls this first itself.
+///
+/// # Errors
+///
+/// 404 as above; 401 with no principal; 503 if no pool is configured; 500
+/// on a database failure.
+pub async fn ensure_connector_in_tenants(
+    state: &AppState,
+    principal: Option<&Principal>,
+    id: &str,
+) -> Result<(), ApiError> {
+    let Some(principal) = principal else {
+        return Err(ApiError::unauthorized());
+    };
+    if connectors::connector_in_tenants(pool(state)?, id, &principal.tenant_ids).await? {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound(format!("Connector {id} not found")))
+    }
+}
+
+/// [`ensure_connector_in_tenants`] as the route layer of every
+/// `/api/connectors/{id}/*` route (`routes::connectors_router`), so no
+/// connector route can be added without it.
+///
+/// # Errors
+///
+/// As [`ensure_connector_in_tenants`].
+pub async fn require_connector_in_tenants(
+    State(state): State<AppState>,
+    Path(params): Path<std::collections::HashMap<String, String>>,
+    request: Request,
+    next: Next,
+) -> ApiResult<Response> {
+    let Some(id) = params.get("id") else {
+        return Err(ApiError::NotFound("Connector not found".to_owned()).into());
+    };
+    ensure_connector_in_tenants(&state, request.extensions().get::<Principal>(), id).await?;
+    Ok(next.run(request).await)
 }
 
 /// `GET /api/connectors/ingestible`'s optional window: both bounds or

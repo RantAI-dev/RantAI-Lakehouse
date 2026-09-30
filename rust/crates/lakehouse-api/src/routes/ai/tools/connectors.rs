@@ -116,6 +116,13 @@ pub(super) async fn test_connector(
     if id.is_empty() {
         return json!({ "error": "id wajib diisi" });
     }
+    // Called without the router, so without its tenant route layer: the
+    // same rule, applied here.
+    if let Err(err) =
+        crate::routes::connectors::ensure_connector_in_tenants(state, principal, &id).await
+    {
+        return api_result_to_value::<()>(Err(err.into())).await;
+    }
     let extension = principal.cloned().map(Extension);
     api_result_to_value(
         crate::routes::connectors::test_connection(State(state.clone()), extension, Path(id)).await,
@@ -131,6 +138,11 @@ pub(super) async fn delete_connector(
     let id = arg_str(args, "id");
     if id.is_empty() {
         return json!({ "error": "id wajib diisi" });
+    }
+    if let Err(err) =
+        crate::routes::connectors::ensure_connector_in_tenants(state, principal, &id).await
+    {
+        return api_result_to_value::<()>(Err(err.into())).await;
     }
     let extension = principal.cloned().map(Extension);
     // `DeleteQuery::default()` is `force: false`: if CDC deprovisioning

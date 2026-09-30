@@ -62,9 +62,11 @@ fn ingest_run_for(connector_id: &str, run_id: &str, status: &str) -> Value {
 
 async fn seed_sql_connector(pool: &sqlx::PgPool, id: &str) {
     sqlx::query(
-        "INSERT INTO connector (id, name, type, direction, host, secret_ref, environment, tenant, \
+        "INSERT INTO connector (id, tenant_id, \
+         name, type, direction, host, secret_ref, environment, tenant, \
          adapter, ingest_mode, dial) VALUES \
-         ($1, 'sql ingest test', 'PostgreSQL', 'source', 'unused', 'env:CONNECTOR_PG_PASSWORD', \
+         ($1, '11111111-1111-4111-8111-000000000001', \
+         'sql ingest test', 'PostgreSQL', 'source', 'unused', 'env:CONNECTOR_PG_PASSWORD', \
          'production', 'meridian', 'sql', 'batch', \
          '{\"driver\":\"postgres\",\"host\":\"pg-src\",\"port\":5432,\"database\":\"d\",\"user\":\"u\"}'::jsonb)",
     )
@@ -76,9 +78,11 @@ async fn seed_sql_connector(pool: &sqlx::PgPool, id: &str) {
 
 async fn seed_cdc_connector(pool: &sqlx::PgPool, id: &str) {
     sqlx::query(
-        "INSERT INTO connector (id, name, type, direction, host, secret_ref, environment, tenant, \
+        "INSERT INTO connector (id, tenant_id, \
+         name, type, direction, host, secret_ref, environment, tenant, \
          adapter, ingest_mode, dial) VALUES \
-         ($1, 'cdc ingest test', 'PostgreSQL CDC', 'source', 'unused', 'env:CONNECTOR_PG_CDC_PASSWORD', \
+         ($1, '11111111-1111-4111-8111-000000000001', \
+         'cdc ingest test', 'PostgreSQL CDC', 'source', 'unused', 'env:CONNECTOR_PG_CDC_PASSWORD', \
          'production', 'meridian', 'cdc', 'cdc', \
          '{\"driver\":\"postgres\",\"host\":\"pg-src\",\"port\":5432,\"database\":\"d\",\"user\":\"u\",\
          \"slotName\":\"orders_slot\",\"publicationName\":\"orders_pub\"}'::jsonb)",
@@ -352,6 +356,7 @@ async fn ingest_run_history_lists_only_this_connectors_runs() {
     .await;
 
     let app = spin_up_with_dagster(&format!("{}/graphql", server.uri())).await;
+    seed_sql_connector(&app.pool, "conn-ingest-hist").await;
     let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
 
     let response = app

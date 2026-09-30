@@ -304,32 +304,14 @@ fn overview_alerts_router() -> Router<AppState> {
 
 /// The `/api/connectors/*` sub-router (Task 2.7), split out for the same
 /// `clippy::too_many_lines` reason as [`pipelines_router`].
-fn connectors_router() -> Router<AppState> {
-    Router::new()
-        .route(
-            "/api/connectors",
-            get(connectors::list).post(connectors::create),
-        )
-        .route(
-            // A dedicated route (not `?ingestible=true` on `/api/connectors`):
-            // `Policy::RequiresPermission` takes one string per route, so
-            // overloading the existing `connector:manage`-gated route would
-            // need an "either permission" `Policy` variant this workstream
-            // does not otherwise need (the ingest:read scope this route is gated on, below). matchit (axum's router)
-            // matches this static segment ahead of the `{id}` param route
-            // below for the literal path `/api/connectors/ingestible`.
-            "/api/connectors/ingestible",
-            get(connectors::list_ingestible),
-        )
-        .route(
-            // Gap fix (WS3 item 33): `list_connector_types`/`listTypes` both
-            // already existed with no route between them — the wizard's
-            // connector-type list 404d. A dedicated static route, matching
-            // `/ingestible`'s shape immediately above, matched ahead of
-            // `/api/connectors/{id}` for the same reason.
-            "/api/connectors/types",
-            get(connectors::list_types),
-        )
+///
+/// Every `/api/connectors/{id}/*` route sits behind
+/// [`connectors::require_connector_in_tenants`]: the caller must belong to
+/// the connector's tenant. `PUT .../tenant` stays outside it — it is
+/// identity administration (`identity:write`), and the only way a
+/// connector with no tenant gets one.
+fn connectors_router(state: &AppState) -> Router<AppState> {
+    let per_connector = Router::new()
         .route(
             "/api/connectors/{id}",
             get(connectors::detail)
@@ -372,12 +354,42 @@ fn connectors_router() -> Router<AppState> {
             "/api/connectors/{id}/ingest/runs",
             get(connectors::ingest_run_history),
         )
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            connectors::require_connector_in_tenants,
+        ));
+    Router::new()
+        .route(
+            "/api/connectors",
+            get(connectors::list).post(connectors::create),
+        )
+        .route(
+            // A dedicated route (not `?ingestible=true` on `/api/connectors`):
+            // `Policy::RequiresPermission` takes one string per route, so
+            // overloading the existing `connector:manage`-gated route would
+            // need an "either permission" `Policy` variant this workstream
+            // does not otherwise need (the ingest:read scope this route is gated on, below). matchit (axum's router)
+            // matches this static segment ahead of the `{id}` param route
+            // below for the literal path `/api/connectors/ingestible`.
+            "/api/connectors/ingestible",
+            get(connectors::list_ingestible),
+        )
+        .route(
+            // Gap fix (WS3 item 33): `list_connector_types`/`listTypes` both
+            // already existed with no route between them — the wizard's
+            // connector-type list 404d. A dedicated static route, matching
+            // `/ingestible`'s shape immediately above, matched ahead of
+            // `/api/connectors/{id}` for the same reason.
+            "/api/connectors/types",
+            get(connectors::list_types),
+        )
         // The assignment route for connector
         // rows `0042_tenant_provisioning.sql` leaves `tenant_id = NULL`.
         .route(
             "/api/connectors/{id}/tenant",
             axum::routing::put(connectors::assign_connector_tenant),
         )
+        .merge(per_connector)
 }
 
 /// The `/api/identity/*` sub-router (Phase 2 identity domain), split out
@@ -600,7 +612,7 @@ pub fn router(state: AppState) -> Router {
         // Phase 2 identity domain.
         .merge(identity_router())
         // Phase 2, Task 2.7: connector definitions.
-        .merge(connectors_router())
+        .merge(connectors_router(&state))
         // Phase 2, Task 2.8: knowledge sources and vector jobs (metadata
         // only — no `search` route here, see `routes::knowledge`'s module
         // doc comment).

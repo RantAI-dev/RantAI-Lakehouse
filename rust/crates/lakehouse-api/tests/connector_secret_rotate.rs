@@ -135,8 +135,10 @@ async fn an_unsupported_connector_type_refuses_the_rotation_and_leaves_the_ref_u
     let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
 
     sqlx::query(
-        "INSERT INTO connector (id, name, type, direction, host, secret_ref, environment, tenant) \
-         VALUES ('conn-kafka-unsupported-test', 'kafka test', 'Kafka', 'source', 'unused', \
+        "INSERT INTO connector (id, tenant_id, \
+         name, type, direction, host, secret_ref, environment, tenant) \
+         VALUES ('conn-kafka-unsupported-test', '11111111-1111-4111-8111-000000000001', \
+         'kafka test', 'Kafka', 'source', 'unused', \
          'env:CONNECTOR_KAFKA_TOKEN', 'production', 'meridian')",
     )
     .execute(&app.pool)
@@ -304,8 +306,10 @@ async fn a_derived_secret_ref_resolves_and_the_rotation_lands() {
     // which parses the `<user>@<host>:<port>/<database>` shape straight out
     // of `host`, matching how `conn-pg-lakehouse` itself is still probed.
     sqlx::query(
-        "INSERT INTO connector (id, name, type, direction, host, secret_ref, environment, \
-         tenant) VALUES ($1, 'rotate success test', 'PostgreSQL', 'source', $2, \
+        "INSERT INTO connector (id, tenant_id, \
+         name, type, direction, host, secret_ref, environment, \
+         tenant) VALUES ($1, '11111111-1111-4111-8111-000000000001', \
+         'rotate success test', 'PostgreSQL', 'source', $2, \
          'env:PLACEHOLDER_INITIAL_REF_NEVER_RESOLVED', 'production', 'meridian')",
     )
     .bind(ROTATE_SUCCESS_CONNECTOR_ID)

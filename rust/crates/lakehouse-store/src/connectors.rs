@@ -329,6 +329,29 @@ pub async fn list_connectors(
     Ok(rows.into_iter().map(Connector::from).collect())
 }
 
+/// Whether connector `id` belongs to one of `tenant_ids`: the access rule
+/// every `/api/connectors/{id}/*` route applies
+/// (`routes::connectors::require_connector_in_tenants`). `false` for an
+/// unknown id, another tenant's connector and one with no tenant alike, so
+/// the answer says nothing about which connector ids exist.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn connector_in_tenants(
+    pool: &PgPool,
+    id: &str,
+    tenant_ids: &[Uuid],
+) -> Result<bool, StoreError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM connector WHERE id = $1 AND tenant_id = ANY($2))",
+    )
+    .bind(id)
+    .bind(tenant_ids)
+    .fetch_one(pool)
+    .await?)
+}
+
 /// Assign (or reassign) a connector to a tenant — the write behind `PUT
 /// /api/connectors/{id}/tenant`. Closes the gap
 /// `0042_tenant_provisioning.sql` deliberately leaves open: that migration
