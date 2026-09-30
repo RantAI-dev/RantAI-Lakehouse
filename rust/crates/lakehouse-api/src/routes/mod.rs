@@ -185,6 +185,16 @@ fn pipelines_router() -> Router<AppState> {
         )
         .route("/api/pipelines/{id}/source", get(pipelines::source))
         .route("/api/pipelines/{id}/runs", get(pipelines::runs))
+        // Plan 1c (R2, day-1): the runs × steps matrix endpoint is
+        // STATIC under `{id}/runs/steps`, so it is registered BEFORE the
+        // `{runId}/steps` route below — otherwise axum would match the
+        // literal path with `{runId} = "steps"` and route the matrix
+        // request to `run_steps` (which would then 503 trying to
+        // interpret "steps" as a Dagster run id). The order matters.
+        .route(
+            "/api/pipelines/{id}/runs/steps",
+            get(pipelines::runs_step_matrix),
+        )
         .route(
             "/api/pipelines/{id}/runs/{runId}/steps",
             get(pipelines::run_steps),

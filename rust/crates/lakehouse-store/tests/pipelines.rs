@@ -44,6 +44,9 @@ fn input() -> CreatePipelineInput {
         schedule: "manual".to_owned(),
         owner: None,
         description: None,
+        // None here means "use the migration's DEFAULT 2" — not "set 0".
+        // The per-row tests that need a specific count set it explicitly.
+        max_retries: None,
         tenant_id: None,
     }
 }
@@ -362,6 +365,7 @@ async fn update_replaces_the_definition_and_keeps_the_status(pool: PgPool) -> sq
             schedule: "0 2 * * *".to_owned(),
             owner: None,
             description: Some("edited".to_owned()),
+            max_retries: None,
         },
     )
     .await
@@ -395,6 +399,7 @@ async fn update_replaces_the_definition_and_keeps_the_status(pool: PgPool) -> sq
             schedule: "manual".to_owned(),
             owner: None,
             description: None,
+            max_retries: None,
         },
     )
     .await
@@ -425,6 +430,176 @@ async fn delete_removes_the_row_once(pool: PgPool) -> sqlx::Result<()> {
             .is_none()
     );
     Ok(())
+}
+
+// ── Plan 1c (R2, day-1): `pipeline_definition.max_retries` ─────────────
+//
+// Migration `0051_pipeline_max_retries.sql` adds the column with default
+// 2 and a CHECK (max_retries BETWEEN 0 AND 5). Every authored pipeline
+// carries one; the route layer rejects out-of-range values with 400
+// before they reach the store, and `RunnablePipeline` exposes it for
+// `authored_factory._op_for_pipeline` to consume.
+
+/// A freshly authored pipeline reads `max_retries = 2` (the migration's
+/// `DEFAULT 2`), matching the single source of truth in
+/// `dagster/dispar_orchestrate/op_metadata.py::DEFAULT_RETRY_POLICY`.
+/// Without `max_retries` on `CreatePipelineInput` the route's `None`
+/// resolves to this default on insert.
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_pipeline_defaults_max_retries_to_two(pool: PgPool) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input()).await.unwrap();
+    assert_eq!(
+        created.max_retries, 2,
+        "absent max_retries on insert must fall back to the column default"
+    );
+    Ok(())
+}
+
+/// The store round-trips every boundary value the route layer accepts:
+/// 0 (no retries) and 5 (the max the CHECK constraint allows).
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_pipeline_persists_max_retries_zero_and_five(pool: PgPool) -> sqlx::Result<()> {
+    let zero = pipelines::create_pipeline(
+        &pool,
+        &CreatePipelineInput {
+            max_retries: Some(0),
+            ..named_input("zero retries")
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(zero.max_retries, 0);
+    let five = pipelines::create_pipeline(
+        &pool,
+        &CreatePipelineInput {
+            max_retries: Some(5),
+            ..named_input("five retries")
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(five.max_retries, 5);
+    let reread = pipelines::get_pipeline(&pool, &five.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reread.max_retries, 5);
+    Ok(())
+}
+
+/// Out-of-range values still hit the CHECK constraint, exactly as
+/// `set_status`'s CHECK does for `status`. The route layer catches the
+/// common case with a 400 first; this proves the database is defense in
+/// depth, not the primary safety boundary (same posture as
+/// [`set_status_rejects_a_status_outside_the_check_constraint`]).
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_pipeline_rejects_max_retries_outside_zero_to_five(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let result = pipelines::create_pipeline(
+        &pool,
+        &CreatePipelineInput {
+            max_retries: Some(6),
+            ..named_input("out of range")
+        },
+    )
+    .await;
+    assert!(
+        matches!(result, Err(lakehouse_store::StoreError::Database(_))),
+        "expected StoreError::Database from the CHECK constraint, got {result:?}"
+    );
+    Ok(())
+}
+
+/// `update_pipeline` without `max_retries` in `UpdatePipelineInput`
+/// leaves the stored value alone — an absent field is "unchanged", not
+/// "set to the default". `Some(n)` overwrites.
+#[sqlx::test(migrations = "../../migrations")]
+async fn update_pipeline_keeps_max_retries_when_absent_and_overwrites_when_present(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(
+        &pool,
+        &CreatePipelineInput {
+            max_retries: Some(4),
+            ..named_input("editable retries")
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(created.max_retries, 4);
+
+    // An update that doesn't touch max_retries keeps the stored value.
+    let mut update = pipelines::UpdatePipelineInput {
+        max_retries: None,
+        ..update_input_for(&created)
+    };
+    let edited = pipelines::update_pipeline(&pool, &created.id, &update)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        edited.max_retries, 4,
+        "absent max_retries on update must leave the stored value alone"
+    );
+
+    // A present max_retries overwrites the stored value.
+    update.max_retries = Some(1);
+    let edited = pipelines::update_pipeline(&pool, &created.id, &update)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(edited.max_retries, 1);
+    Ok(())
+}
+
+/// `list_runnable_pipelines` exposes `max_retries` on every row it
+/// returns — the orchestrator factory reads it from this list, so a
+/// missing field would force the orchestrator to invent one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn runnable_pipelines_carry_their_max_retries(pool: PgPool) -> sqlx::Result<()> {
+    let ready = pipelines::create_pipeline(
+        &pool,
+        &CreatePipelineInput {
+            max_retries: Some(3),
+            ..named_input("ready with 3")
+        },
+    )
+    .await
+    .unwrap();
+    pipelines::set_status(&pool, &ready.id, "ready")
+        .await
+        .unwrap();
+
+    let runnable = pipelines::list_runnable_pipelines(&pool).await.unwrap();
+    let one = runnable.iter().find(|p| p.id == ready.id).unwrap();
+    assert_eq!(one.definition.max_retries, 3);
+    Ok(())
+}
+
+fn update_input_for(p: &pipelines::Pipeline) -> pipelines::UpdatePipelineInput {
+    // The minimal legal UpdatePipelineInput for an existing pipeline.
+    // This is a fixture helper, not a route: the test feeds its own
+    // values into `max_retries`, not derived from `p` (the UpdateInput
+    // has no name field, and the other defaults below match the
+    // `update_replaces_the_definition_and_keeps_the_status` test's own
+    // choices, so an absent `max_retries` over the same row stays a
+    // single-field change).
+    let _ = p; // helper shape only
+    pipelines::UpdatePipelineInput {
+        kind: "batch".to_owned(),
+        source_zone: "a".to_owned(),
+        source_table: "b".to_owned(),
+        incremental_column: None,
+        transforms: Vec::new(),
+        fbic_enabled: false,
+        target_zone: "c".to_owned(),
+        target_table: "d".to_owned(),
+        schedule: "manual".to_owned(),
+        owner: None,
+        description: None,
+        max_retries: None,
+    }
 }
 
 /// Only `ready` and `paused` pipelines are runnable, across every tenant,

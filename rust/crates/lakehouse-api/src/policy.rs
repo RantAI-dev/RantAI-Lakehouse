@@ -315,6 +315,14 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/pipelines/runnable",                Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/source",             Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs",              Policy::RequiresPermission("pipeline:read")),
+    // Plan 1c (R2, day-1): runs × steps matrix for the recovery UI.
+    // `pipeline:read` matches `{id}/runs` and `{runId}/steps` — the
+    // matrix is "runs for this pipeline" + "steps for each run"
+    // composed into one round trip. The static path MUST be
+    // registered BEFORE `/runs/{runId}/steps` in
+    // `routes::pipelines_router` so axum does not match `{runId} =
+    // "steps"` and route the request to the wrong handler.
+    ("GET",  "/api/pipelines/{id}/runs/steps",        Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs/{runId}/steps", Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs/{runId}/logs",  Policy::RequiresPermission("pipeline:read")),
     ("POST", "/api/pipelines/{id}/trigger",           Policy::RequiresPermission("pipeline:write")),

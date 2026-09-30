@@ -149,6 +149,16 @@ pub struct UpdateBody {
     owner: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    /// Plan 1c: per-pipeline retry cap (`max_retries`, migration 0051).
+    /// Validated here against `0..=5` — the same range the column CHECK
+    /// and `dagster.RetryPolicy.max_retries` accept — so the client
+    /// receives a 400 with the field name rather than a 500 from the
+    /// database constraint. `None` leaves the stored value alone
+    /// (`UpdatePipelineInput::max_retries` is "unchanged", matching
+    /// `owner`/`description`/`incremental_column`'s "absent means
+    /// leave it alone" convention).
+    #[serde(default)]
+    max_retries: Option<i16>,
 }
 
 fn authored_only(id: &str) -> Result<(), ApiRejection> {
@@ -190,6 +200,16 @@ pub async fn update(
             ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
         })?;
     }
+    // Plan 1c: validate `max_retries` against the same `0..=5` the
+    // column CHECK enforces (migration 0051), so the client gets a 400
+    // with the field name rather than a 500 from the database
+    // constraint. The error message does not echo the caller's value
+    // back.
+    if let Some(value) = body.max_retries
+        && !(0..=5).contains(&value)
+    {
+        return Err(ApiError::BadRequest("maxRetries must be between 0 and 5".to_owned()).into());
+    }
     let input = UpdatePipelineInput {
         kind: body.kind,
         source_zone: body.source_zone,
@@ -202,6 +222,7 @@ pub async fn update(
         schedule: body.schedule,
         owner: body.owner.filter(|o| !o.trim().is_empty()),
         description: body.description.filter(|d| !d.trim().is_empty()),
+        max_retries: body.max_retries,
     };
     let pool = crate::routes::pipelines::pool(&state)?;
     let updated = pipelines::update_pipeline(pool, &id, &input)
