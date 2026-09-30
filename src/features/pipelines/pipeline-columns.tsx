@@ -69,7 +69,7 @@ function pipelineOrigin(pipeline: Pipeline): "orchestrator" | "authored" {
  * to run an authored pipeline that is not active; saying so here beats a
  * menu item that only fails.
  */
-function triggerBlockedReason(pipeline: Pipeline): string | null {
+export function triggerBlockedReason(pipeline: Pipeline): string | null {
   if (pipelineOrigin(pipeline) === "orchestrator") return null
   if (pipeline.status === "draft") return "activate it first"
   if (pipeline.status === "paused") return "paused"
@@ -326,8 +326,12 @@ export function getPipelineColumns({
       header: ({ column }) => (
         <DataTableColumnHeader column={column} label="SLA" />
       ),
+      // `null` means no SLA is defined (the API never sets one yet), not a
+      // breach: every row used to read a red "Breached".
       cell: ({ row }) =>
-        row.original.slaOk ? (
+        row.original.slaOk === null ? (
+          <span className="text-xs text-muted-foreground">—</span>
+        ) : row.original.slaOk ? (
           <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">
             <CheckCircle2 className="size-3.5" />
             OK

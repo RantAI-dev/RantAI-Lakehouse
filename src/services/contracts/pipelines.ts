@@ -23,7 +23,14 @@ export type Pipeline = {
   schedule: string
   /** Null when the pipeline has never run — an authored draft always, a Dagster job until its first run. */
   lastRunAt: string | null
-  nextRunAt?: string
+  /** Null when there is no next run: no schedule, or a stopped one. */
+  nextRunAt?: string | null
+  /**
+   * Dagster jobs only: whether the job's schedule is stopped, `null` when it
+   * has no schedule. A Dagster job's `status` is its last run's, so it never
+   * says "paused". Authored pipelines carry pausing in `status` instead.
+   */
+  schedulePaused?: boolean | null
   /** Null: no SLA is defined anywhere yet — WS5 adds `dataset_sla`. */
   slaOk: boolean | null
   /** Null until WS2 derives freshness from Iceberg snapshot timestamps. */

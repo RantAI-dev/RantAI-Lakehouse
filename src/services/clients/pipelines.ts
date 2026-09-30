@@ -53,6 +53,13 @@ export const dagsterPipelineService: PipelineService = {
     // of throwing away the Dagster-half explanation.
     const res = await apiFetch("/api/pipelines", { signal });
     const body = (await res.json()) as PipelineList;
+    // Only a 503 is "the orchestrator could not be reached". A refusal
+    // (403, a foreign X-Tenant's 404) used to land in the same banner,
+    // which blamed Dagster for a permission problem.
+    if (!res.ok && res.status !== 503) {
+      const kind = res.status === 403 ? "permission_denied" : res.status === 404 ? "not_found" : "unavailable";
+      throw new ServiceError(kind, body.error ?? `Failed (${res.status})`, res.status);
+    }
     return {
       pipelines: body.pipelines ?? [],
       dagsterJobs: body.dagsterJobs,
@@ -60,9 +67,16 @@ export const dagsterPipelineService: PipelineService = {
     };
   },
   async listRuns(pipelineId, signal) {
-    return (
-      await getJson<{ runs: PipelineRun[] }>(`/api/pipelines/${encodeURIComponent(pipelineId)}/runs`, { signal })
-    ).runs;
+    const body = await getJson<{ runs: PipelineRun[]; unavailable?: string | null }>(
+      `/api/pipelines/${encodeURIComponent(pipelineId)}/runs`,
+      { signal }
+    );
+    // The route answers 200 with `unavailable` set when Dagster could not
+    // be asked; an empty list then means "unknown", not "no runs".
+    if (body.unavailable) {
+      throw new ServiceError("unavailable", `The orchestrator could not be reached: ${body.unavailable}`);
+    }
+    return body.runs;
   },
   async triggerRun(id, signal) {
     return getJson<PipelineRun>(`/api/pipelines/${encodeURIComponent(id)}/trigger`, { method: "POST", signal });
