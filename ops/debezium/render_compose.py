@@ -74,7 +74,7 @@ from __future__ import annotations
 
 import re
 
-# Cited verbatim from `docker-compose.yml:2400` -- the static demo
+# Cited verbatim from `docker-compose.yml:2401` -- the static demo
 # connector's own pinned image reference. A module-level constant, not
 # re-typed by hand at render time, so a copy/paste drift between the two
 # services is impossible.
