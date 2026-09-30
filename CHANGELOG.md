@@ -132,7 +132,7 @@ once a first release is tagged.
 
 ### Fixed
 
-- A pipeline created in the console now belongs to its creator's tenant and appears on the Pipelines list; it used to be stored without a tenant and was invisible to every list.
+- A pipeline created in the console now belongs to its creator's tenant and appears on the Pipelines list; it used to be stored without a tenant and was invisible to every list. A Platform Admin (`*:*`) with no tenant now sees every tenant's authored pipelines there, the rule that already showed them the Dagster jobs; before, they saw none. An authored pipeline's `authored__<id>` Dagster job is not listed a second time.
 - `PIPELINE_RUN_TOKEN` is now passed to `lakehouse-api` and `dagster-code-location`; it was passed to neither, so no authored pipeline could become a job.
 - The authored-pipeline schedule field offers cron presets and a validated custom cron; its old free-text default ("Every hour") never fired.
 - The Pipelines list shows "Never run" instead of an empty badge for a job that has never run, and schedules in words.

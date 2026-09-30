@@ -234,6 +234,7 @@ async fn list_pipelines_filtered_by_tenant_excludes_another_tenants_row(
         &pool,
         &PipelineFilter {
             tenant_id: Some(tenant_a_id),
+            all_tenants: false,
         },
     )
     .await
@@ -272,6 +273,7 @@ async fn list_pipelines_with_a_null_tenant_id_is_invisible_once_scoped(
         &pool,
         &PipelineFilter {
             tenant_id: Some(tenant_a_id),
+            all_tenants: false,
         },
     )
     .await
@@ -328,6 +330,7 @@ async fn a_pipeline_created_with_a_tenant_is_on_that_tenants_list(
         &pool,
         &PipelineFilter {
             tenant_id: Some(tenant_id),
+            all_tenants: false,
         },
     )
     .await
@@ -497,5 +500,44 @@ async fn record_pipeline_run_event_distinct_kinds_for_one_run_do_not_collide(
             .unwrap(),
         "the same run_id with a different kind must insert a new row"
     );
+    Ok(())
+}
+
+/// `all_tenants` (a tenantless Platform Admin) lists every row, including
+/// an unassigned one and one in some tenant; without it the admin saw no
+/// authored pipeline on the list at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn list_pipelines_for_all_tenants_includes_unassigned_and_tenanted_rows(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant = create_tenant(&pool, &tenant_input("tenant-all-tenants"))
+        .await
+        .unwrap();
+    let tenant_id: Uuid = tenant.id.parse().unwrap();
+    let unassigned = pipelines::create_pipeline(&pool, &named_input("all-tenants-unassigned"))
+        .await
+        .unwrap();
+    let tenanted = pipelines::create_pipeline(
+        &pool,
+        &CreatePipelineInput {
+            tenant_id: Some(tenant_id),
+            ..named_input("all-tenants-tenanted")
+        },
+    )
+    .await
+    .unwrap();
+
+    let rows = pipelines::list_pipelines(
+        &pool,
+        &PipelineFilter {
+            tenant_id: None,
+            all_tenants: true,
+        },
+    )
+    .await
+    .unwrap();
+    let ids: Vec<&str> = rows.iter().map(|p| p.id.as_str()).collect();
+    assert!(ids.contains(&unassigned.id.as_str()));
+    assert!(ids.contains(&tenanted.id.as_str()));
     Ok(())
 }

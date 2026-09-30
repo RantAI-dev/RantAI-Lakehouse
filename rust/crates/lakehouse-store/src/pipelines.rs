@@ -196,6 +196,11 @@ pub struct PipelineFilter {
     /// Restrict to this tenant, if given. `None` matches no rows at all —
     /// see the struct doc comment.
     pub tenant_id: Option<Uuid>,
+    /// Every row, whatever its tenant, unassigned rows included. Only for a
+    /// Platform Admin (`*:*`) with no tenant of their own, who otherwise
+    /// saw no authored pipeline at all; the route decides, this function
+    /// only obeys. `false` keeps the fail-closed tenant rule above.
+    pub all_tenants: bool,
 }
 
 /// List every authored pipeline definition, newest first, optionally
@@ -216,11 +221,12 @@ pub async fn list_pipelines(
 ) -> Result<Vec<Pipeline>, StoreError> {
     let sql = format!(
         "SELECT {PIPELINE_COLUMNS} FROM pipeline_definition \
-         WHERE ($1::uuid IS NOT NULL AND tenant_id = $1) \
+         WHERE ($2 OR ($1::uuid IS NOT NULL AND tenant_id = $1)) \
          ORDER BY created_at DESC"
     );
     let rows: Vec<PipelineRow> = sqlx::query_as(&sql)
         .bind(filter.tenant_id)
+        .bind(filter.all_tenants)
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(Pipeline::from).collect())
