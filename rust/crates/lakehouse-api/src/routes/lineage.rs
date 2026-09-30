@@ -318,7 +318,10 @@ async fn add_tenant_owned(state: &AppState, tenant: Option<uuid::Uuid>, g: &mut 
     }
     let pipelines = lakehouse_store::pipelines::list_pipelines(
         pool,
-        &lakehouse_store::pipelines::PipelineFilter { tenant_id: tenant },
+        &lakehouse_store::pipelines::PipelineFilter {
+            tenant_id: tenant,
+            all_tenants: false,
+        },
     )
     .await
     .unwrap_or_default();

@@ -109,3 +109,39 @@ export function describeTransform(
       return { verb, detail: args }
   }
 }
+
+/**
+ * The inverse of `renderTransformDraft`: a stored transform string back to
+ * the draft the editor shows, so an existing pipeline can be edited in the
+ * same form it was created in. `null` for a string outside the five shapes
+ * `renderTransformDraft` produces; the server's grammar is the same set,
+ * so a stored transform always parses.
+ */
+export function parseTransformDraft(raw: string): TransformDraft | null {
+  const match = /^\s*(dedupe|filter|rename|cast|select)\((.*)\)\s*$/.exec(raw)
+  if (!match) return null
+  const args = match[2].trim()
+  switch (match[1]) {
+    case "dedupe":
+      return args ? { verb: "dedupe", key: args } : null
+    case "select":
+      return args ? { verb: "select", columns: args } : null
+    case "rename": {
+      const [from, to, extra] = args.split(",").map((s) => s.trim())
+      return from && to && extra === undefined ? { verb: "rename", from, to } : null
+    }
+    case "cast": {
+      const [column, type, extra] = args.split(",").map((s) => s.trim())
+      const castType = CAST_TYPES.find((t) => t === type)
+      return column && castType && extra === undefined ? { verb: "cast", column, type: castType } : null
+    }
+    case "filter": {
+      // Longest operators first, so `>=` is not read as `>`.
+      const f = /^(\w+)\s*(!=|<=|>=|=|<|>)\s*'(.*)'$/.exec(args)
+      const operator = FILTER_OPERATORS.find((op) => op === f?.[2])
+      return f && operator ? { verb: "filter", column: f[1], operator, value: f[3] } : null
+    }
+    default:
+      return null
+  }
+}

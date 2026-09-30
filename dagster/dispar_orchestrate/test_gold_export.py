@@ -42,3 +42,25 @@ class GoldExportScheduleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GoldExportRowsTest(unittest.TestCase):
+    def test_the_apis_row_count_becomes_a_materialization_and_a_missing_one_does_not(self) -> None:
+        from unittest import mock
+
+        from dagster import AssetMaterialization, build_op_context
+
+        from dispar_orchestrate import gold_export
+
+        cfg = mock.Mock(marts=["mart_a", "mart_b"], ch=None)
+        bodies = {"mart_a": {"rowsExported": 7}, "mart_b": {"rowsExported": None}}
+        with mock.patch.object(gold_export.GoldExportConfig, "from_env", return_value=cfg), \
+                mock.patch.object(gold_export, "export_one_mart", side_effect=lambda c, m: bodies[m]), \
+                mock.patch.object(gold_export, "record_maintenance_run"):
+            context = build_op_context()
+            gold_export.run_gold_export(context)
+        events = [e for e in context.get_events() if isinstance(e, AssetMaterialization)]
+        self.assertEqual(
+            [(e.asset_key.to_user_string(), e.metadata["rows"].value) for e in events],
+            [("gold/mart_a", 7)],
+        )

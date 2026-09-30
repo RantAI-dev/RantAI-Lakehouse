@@ -10,6 +10,11 @@ once a first release is tagged.
 
 ### Added
 
+- Console-authored pipelines now run: `authored_factory.py` builds one `authored__<id>` job, and a cron schedule when the pipeline has one, per `ready` or `paused` pipeline from the new service-only `GET /api/pipelines/runnable`. The API asks the orchestrator to reload after every change, which is why the code location now runs `dagster code-server start`.
+- Edit (`PUT /api/pipelines/{id}`, `/pipelines/{id}/edit`) and delete (`DELETE /api/pipelines/{id}`) for authored pipelines, with audit events.
+- `GET /api/pipelines/{id}/schedule-ticks` and a Schedule history on the pipeline page: each time a schedule was due and whether it launched, skipped or failed. The orchestrator's error text is not sent.
+- Rows per run: gold export and ingest report the rows they wrote, shown as "Rows written" in the run inspector.
+- `scripts/compose.sh`: `docker compose` with `GIT_SHA` set from the checkout, which the pipeline page's source view needs.
 - Dashboard SQL sources: a saved read-only `SELECT` (e.g. a join across
   several `serving` marts) that a chart can use instead of one mart.
   Authored from Query Studio ("Save as SQL source") with the new
@@ -126,6 +131,10 @@ once a first release is tagged.
 
 ### Fixed
 
+- A pipeline created in the console now belongs to its creator's tenant and appears on the Pipelines list; it used to be stored without a tenant and was invisible to every list. A Platform Admin (`*:*`) with no tenant now sees every tenant's authored pipelines there, the rule that already showed them the Dagster jobs; before, they saw none. An authored pipeline's `authored__<id>` Dagster job is not listed a second time.
+- `PIPELINE_RUN_TOKEN` is now passed to `lakehouse-api` and `dagster-code-location`; it was passed to neither, so no authored pipeline could become a job.
+- The authored-pipeline schedule field offers cron presets and a validated custom cron; its old free-text default ("Every hour") never fired.
+- The Pipelines list shows "Never run" instead of an empty badge for a job that has never run, and schedules in words.
 - Dashboard drill-down, filter values (`/api/dashboard/values`), alert
   values and digests now go through the policy rewrite like dashboard
   tiles, so masking and row filters apply there too (alerts and digests as

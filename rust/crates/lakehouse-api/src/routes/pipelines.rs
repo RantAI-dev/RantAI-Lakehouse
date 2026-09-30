@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
+use crate::routes::authored_pipelines;
 use crate::routes::support::js_error;
 use crate::state::AppState;
 
@@ -81,10 +82,16 @@ pub async fn list(
             Ok(refusal) => refusal,
             Err(err) => return ApiRejection(err).into_response(),
         };
+    // A Platform Admin with no tenant sees every tenant's authored
+    // pipelines, the same rule that already shows them the shared Dagster
+    // jobs (`catalog::is_unrestricted`). Without it the admin, who has no
+    // tenant, saw no authored pipeline on this list at all.
+    let all_tenants = tenant_id.is_none() && crate::routes::catalog::is_unrestricted(&principal);
     match list_body(
         &state.dagster,
         state.pg.as_deref(),
         tenant_id,
+        all_tenants,
         dagster_jobs_refused,
     )
     .await
@@ -112,6 +119,7 @@ async fn list_body(
     dagster: &DgClient,
     pg: Option<&PgPool>,
     tenant_id: Option<Uuid>,
+    all_tenants: bool,
     dagster_jobs_refused: Option<&'static str>,
 ) -> Result<Value, ListError> {
     // The `Dagster` half is a SHARED, un-tenanted resource — a code
@@ -130,6 +138,9 @@ async fn list_body(
             tokio::try_join!(dagster.list_jobs_with_schedules(), dagster.list_runs(100))?;
         pipelines = jobs
             .iter()
+            // An authored pipeline's `authored__<id>` job is listed once, as
+            // its own `pl-` row below, never a second time as a Dagster job.
+            .filter(|j| !j.name.starts_with("authored__"))
             .map(|j| {
                 let last = last_run_for(&runs, &j.name);
                 dagster_pipeline_row(j, last)
@@ -137,10 +148,12 @@ async fn list_body(
             .collect();
     }
     // No tenant means no authored pipeline, not every tenant's: the store
-    // is not queried at all.
-    if let (Some(pg), Some(tenant_id)) = (pg, tenant_id) {
+    // is not queried at all, unless the caller is a tenantless Platform
+    // Admin (`all_tenants`, decided in `list`).
+    if let Some(pg) = pg.filter(|_| tenant_id.is_some() || all_tenants) {
         let filter = pipelines::PipelineFilter {
-            tenant_id: Some(tenant_id),
+            tenant_id,
+            all_tenants,
         };
         let authored = pipelines::list_pipelines(pg, &filter).await?;
         pipelines.extend(authored.iter().filter_map(|p| serde_json::to_value(p).ok()));
@@ -250,7 +263,14 @@ pub async fn runs(State(state): State<AppState>, Path(id): Path<String>) -> Resp
 }
 
 async fn runs_body(state: &AppState, id: &str) -> Value {
-    match state.dagster.list_runs_for_job(id, 30).await {
+    // An authored pipeline's runs belong to its `authored__<id>` job; the
+    // `pl-` id itself names no job, so asking for it always found none.
+    let job = if id.starts_with("pl-") {
+        authored_pipelines::job_name(id)
+    } else {
+        id.to_owned()
+    };
+    match state.dagster.list_runs_for_job(&job, 30).await {
         Ok(runs) => json!({
             "runs": runs.iter().map(|r| run_to_json(r, id)).collect::<Vec<_>>(),
             "unavailable": Value::Null,
@@ -389,11 +409,37 @@ async fn authored_detail(state: &AppState, id: &str) -> Response {
     // `.expect()`, keeps this route panic-free even if that ever changes:
     // a serialization failure here degrades to an empty envelope rather
     // than a crashed request.
+    // The job the orchestrator built for this pipeline, when it has one:
+    // its graph is what the flowchart and the run steps refer to.
+    let job = authored_pipelines::job_name(id);
+    let graph = if pipeline.status == "draft" {
+        None
+    } else {
+        state.dagster.job_graph(&job).await.ok()
+    };
     let mut body = serde_json::to_value(&pipeline).unwrap_or_else(|_| json!({}));
     if let Value::Object(obj) = &mut body {
         obj.insert("engine".to_owned(), json!("authored"));
-        obj.insert("description".to_owned(), Value::Null);
-        obj.insert("graph".to_owned(), Value::Null);
+        // `description` is the author's own text, already in `body`; it
+        // used to be overwritten with null here.
+        obj.entry("description").or_insert(Value::Null);
+        obj.insert(
+            "orchestratorJob".to_owned(),
+            if graph.is_some() {
+                json!(job)
+            } else {
+                Value::Null
+            },
+        );
+        obj.insert(
+            "graph".to_owned(),
+            graph.map_or(Value::Null, |g| {
+                json!({
+                    "ops": g.ops.iter().map(graph_op_to_json).collect::<Vec<_>>(),
+                    "edges": g.edges,
+                })
+            }),
+        );
         obj.insert("config".to_owned(), json!([]));
         obj.insert(
             "definition".to_owned(),
@@ -748,7 +794,12 @@ fn pipeline_audit_event(principal: &Principal, action: &str, pipeline_id: &str) 
 /// same non-fatal posture as `routes::connectors`'s call sites: a failed
 /// audit write must never turn an already-succeeded pipeline action into
 /// an error response.
-async fn record_pipeline_audit(state: &AppState, principal: &Principal, action: &str, id: &str) {
+pub(super) async fn record_pipeline_audit(
+    state: &AppState,
+    principal: &Principal,
+    action: &str,
+    id: &str,
+) {
     let Some(pool) = state.pg.as_deref() else {
         return;
     };
@@ -786,21 +837,17 @@ pub async fn trigger(
     let Some(Extension(principal)) = principal else {
         return ApiRejection(ApiError::unauthorized()).into_response();
     };
-    // An authored pipeline has no job behind it, so launching one is not
-    // something that can fail transiently — it is something that cannot
-    // happen. It used to be attempted anyway and came back as a 503, which
-    // reads as "try again later".
-    if id.starts_with("pl-") {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            ApiJson(json!({
-                "error": "this pipeline is authored in the console and is not registered \
-                          with the orchestrator, so it cannot be run yet",
-            })),
-        )
-            .into_response();
-    }
-    match state.dagster.launch_run(&id).await {
+    // An authored pipeline runs as the `authored__<id>` job
+    // `authored_factory.py` builds for it; see `authored_pipelines`.
+    let job = if id.starts_with("pl-") {
+        match authored_launch_target(&state, &id).await {
+            Ok(job) => job,
+            Err(response) => return response,
+        }
+    } else {
+        id.clone()
+    };
+    match state.dagster.launch_run(&job).await {
         Ok(outcome) => {
             if let Some(error) = outcome.error {
                 return (
@@ -835,6 +882,40 @@ pub async fn trigger(
     }
 }
 
+/// The job to launch for authored pipeline `id`, or the response that
+/// explains why there is none. A draft is refused (409) before the
+/// orchestrator is asked. A ready pipeline whose job the orchestrator has
+/// not loaded (marked ready while it was down, say) gets one reload; if
+/// the job is still missing, 409 says so rather than a launch error that
+/// reads like a bad job name.
+async fn authored_launch_target(state: &AppState, id: &str) -> Result<String, Response> {
+    let pool = pool(state).map_err(|err| ApiRejection(err).into_response())?;
+    let pipeline = pipelines::get_pipeline(pool, id)
+        .await
+        .map_err(|err| ApiRejection(err.into()).into_response())?
+        .ok_or_else(|| {
+            ApiRejection(ApiError::NotFound(format!("Pipeline {id} not found"))).into_response()
+        })?;
+    if pipeline.status == "draft" {
+        return Err(ApiRejection(ApiError::Conflict(
+            "this pipeline is a draft: mark it ready before running it".to_owned(),
+        ))
+        .into_response());
+    }
+    if !authored_pipelines::job_is_loaded(state, id).await {
+        authored_pipelines::reload_orchestrator(state).await;
+        if !authored_pipelines::job_is_loaded(state, id).await {
+            return Err(ApiRejection(ApiError::Conflict(
+                "the orchestrator has not loaded this pipeline's job; check that \
+                 PIPELINE_RUN_TOKEN is set for both the API and the Dagster code location"
+                    .to_owned(),
+            ))
+            .into_response());
+        }
+    }
+    Ok(authored_pipelines::job_name(id))
+}
+
 /// `new Date().toISOString()` at the moment a run is launched.
 fn now_iso() -> String {
     #[allow(
@@ -857,7 +938,7 @@ fn now_iso() -> String {
 
 /// Borrow the Postgres pool, or fail with a 503. Mirrors
 /// `routes::identity::pool`/`routes::governance::pool`.
-fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
+pub(super) fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
     state.pg.as_deref().ok_or_else(|| {
         ApiError::Unavailable(
             "pipeline store unavailable: no Postgres pool is configured \
@@ -867,7 +948,7 @@ fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
     })
 }
 
-fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
+pub(super) fn parse_body<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
     serde_json::from_slice(body).map_err(|err| ApiError::BadRequest(format!("invalid JSON: {err}")))
 }
 
@@ -911,8 +992,13 @@ pub struct CreatePipelineBody {
 pub async fn create(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<pipelines::Pipeline>)> {
+    // The creator's active tenant, resolved exactly as `list` resolves it,
+    // so the new pipeline is on the list the create form returns to. It
+    // used to be inserted unassigned, which no tenant-scoped read shows.
+    let tenant_id = crate::tenant_scope::resolve(&principal, &headers)?;
     let body: CreatePipelineBody = parse_body(&body)?;
     for (index, transform) in body.transforms.iter().enumerate() {
         crate::transform_grammar::parse_transform(transform).map_err(|err| {
@@ -932,6 +1018,7 @@ pub async fn create(
         schedule: body.schedule,
         owner: body.owner,
         description: body.description,
+        tenant_id,
     };
     let created = create_named_pipeline(pool(&state)?, &input).await?;
     // WS5 item D4: best-effort, never turns a successful create into an
@@ -1016,8 +1103,12 @@ fn derive_pipeline_name(text: &str) -> String {
 /// above.
 pub async fn generate(
     State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<pipelines::Pipeline>)> {
+    // Same tenant rule as `create`: the draft lands in the caller's tenant.
+    let tenant_id = crate::tenant_scope::resolve(&principal, &headers)?;
     let body: GeneratePipelineBody = parse_body(&body)?;
     // The draft used to be a name and nothing else: every generated
     // pipeline arrived reading `source_table` → `target_table`, kind
@@ -1069,6 +1160,7 @@ pub async fn generate(
         // The instruction is kept verbatim as the description: it is the
         // only record of what this pipeline was asked to do.
         description: Some(body.instruction.clone()),
+        tenant_id,
     };
     let created = create_named_pipeline(pool(&state)?, &input).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
@@ -1276,6 +1368,10 @@ pub async fn set_status_route(
     let updated = pipelines::set_status(pool(&state)?, &id, &body.status)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
+    // A pipeline that just became ready needs a job: the orchestrator
+    // builds it on reload. Best effort; `trigger` reloads again if the job
+    // is still missing when someone runs it.
+    authored_pipelines::reload_orchestrator(&state).await;
     Ok(ApiJson(updated))
 }
 
@@ -1349,7 +1445,27 @@ async fn authored_status(
     paused: bool,
 ) -> Result<Option<pipelines::Pipeline>, ApiError> {
     let status = if paused { "paused" } else { "ready" };
-    Ok(pipelines::set_status(pool(state)?, id, status).await?)
+    let updated = pipelines::set_status(pool(state)?, id, status).await?;
+    if updated.is_some() {
+        // The status is the record; the orchestrator's schedule is what
+        // actually fires. Its stored on/off state outlives a reload, so it
+        // is switched directly as well as rebuilt. An authored pipeline
+        // with no cron schedule has none to switch, which is not an error.
+        let schedule = authored_pipelines::schedule_name(id);
+        let switched = if paused {
+            state.dagster.stop_schedule(&schedule).await
+        } else {
+            state.dagster.start_schedule(&schedule).await
+        };
+        if let Ok(lakehouse_dagster::ScheduleOutcome {
+            error: Some(err), ..
+        }) = switched
+        {
+            tracing::info!(%err, pipeline_id = id, "authored schedule not switched");
+        }
+        authored_pipelines::reload_orchestrator(state).await;
+    }
+    Ok(updated)
 }
 
 async fn dagster_schedule_toggle(state: &AppState, job_name: &str, paused: bool) -> Response {
@@ -2315,6 +2431,7 @@ mod tests {
             let (_, ApiJson(created)) = create(
                 State(state.clone()),
                 Extension(fixture_user_principal()),
+                HeaderMap::new(),
                 body,
             )
             .await
@@ -2917,9 +3034,14 @@ mod tests {
                 .expect("serialize"),
             );
 
-            let err = create(State(state), Extension(fixture_user_principal()), body)
-                .await
-                .unwrap_err();
+            let err = create(
+                State(state),
+                Extension(fixture_user_principal()),
+                HeaderMap::new(),
+                body,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(err.0.status(), 400);
             let message = err.0.to_string();
             assert!(
@@ -3007,6 +3129,7 @@ mod tests {
             let (_, ApiJson(pipeline)) = create(
                 State(state.clone()),
                 Extension(fixture_user_principal()),
+                HeaderMap::new(),
                 body,
             )
             .await
@@ -3163,6 +3286,7 @@ mod tests {
             let (_, ApiJson(pipeline)) = create(
                 State(state.clone()),
                 Extension(fixture_user_principal()),
+                HeaderMap::new(),
                 body,
             )
             .await
@@ -3196,6 +3320,7 @@ mod tests {
                 &pool,
                 &pipelines::PipelineFilter {
                     tenant_id: Some(tenant_id),
+                    all_tenants: false,
                 },
             )
             .await

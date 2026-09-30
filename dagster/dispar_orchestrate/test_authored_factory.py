@@ -19,7 +19,7 @@ import unittest
 from unittest import mock
 
 import requests
-from dagster import build_op_context
+from dagster import DefaultScheduleStatus, build_op_context
 
 from dispar_orchestrate import authored_factory, authored_transforms
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget
@@ -56,7 +56,7 @@ class FetchAuthoredPipelinesTest(unittest.TestCase):
         self.assertEqual(result, [])
 
     def test_non_200_returns_empty_list(self) -> None:
-        """Covers the real, documented 403 the `authored-pipeline-scheduler`
+        """Covers a 403 the `authored-pipeline-scheduler`
         identity (`pipeline:write` only) gets from `pipeline:read`-gated
         `GET /api/pipelines` -- see `authored_factory.py`'s module doc."""
         resp = mock.Mock(status_code=403)
@@ -212,3 +212,60 @@ class OpForPipelineTest(unittest.TestCase):
             with self.assertRaises(authored_factory.AuthoredJobError):
                 run_fn(build_op_context())
         mocked_exec.assert_not_called()
+
+
+class RunnableFetchTest(unittest.TestCase):
+    def test_the_factory_reads_the_runnable_route_and_keeps_paused_pipelines(self) -> None:
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {"pipelines": [
+            _ready_pipeline(),
+            {**_ready_pipeline(), "id": "pl-paused-1", "status": "paused"},
+            {**_ready_pipeline(), "id": "pl-draft-1", "status": "draft"},
+        ]}
+        resp.raise_for_status.return_value = None
+        with mock.patch.object(authored_factory.requests, "get", return_value=resp) as mocked_get:
+            result = authored_factory._fetch_authored_pipelines(_cfg())
+        self.assertTrue(mocked_get.call_args.args[0].endswith("/api/pipelines/runnable"))
+        self.assertEqual(
+            [p["id"] for p in result], ["pl-dedupe-select-abc123", "pl-paused-1"]
+        )
+
+
+class AuthoredScheduleTest(unittest.TestCase):
+    def _job(self, pipeline: dict[str, object]) -> object:
+        return authored_factory.build_authored_job(pipeline)
+
+    def test_a_ready_pipeline_with_a_cron_gets_a_running_schedule(self) -> None:
+        pipeline = {**_ready_pipeline(), "schedule": "0 2 * * *"}
+        schedule = authored_factory.build_authored_schedule(pipeline, self._job(pipeline))
+        self.assertIsNotNone(schedule)
+        self.assertEqual(schedule.name, "authored__pl_dedupe_select_abc123_schedule")
+        self.assertEqual(schedule.cron_schedule, "0 2 * * *")
+        self.assertEqual(schedule.default_status, DefaultScheduleStatus.RUNNING)
+
+    def test_a_paused_pipeline_gets_a_stopped_schedule(self) -> None:
+        pipeline = {**_ready_pipeline(), "status": "paused", "schedule": "*/15 * * * *"}
+        schedule = authored_factory.build_authored_schedule(pipeline, self._job(pipeline))
+        self.assertEqual(schedule.default_status, DefaultScheduleStatus.STOPPED)
+
+    def test_an_on_demand_pipeline_gets_no_schedule(self) -> None:
+        for label in ("manual", "On demand", "", None):
+            pipeline = {**_ready_pipeline(), "schedule": label}
+            self.assertIsNone(authored_factory.build_authored_schedule(pipeline, self._job(pipeline)))
+
+    def test_a_cron_dagster_refuses_is_skipped_not_raised(self) -> None:
+        pipeline = {**_ready_pipeline(), "schedule": "99 99 * * *"}
+        self.assertIsNone(authored_factory.build_authored_schedule(pipeline, self._job(pipeline)))
+
+    def test_jobs_and_schedules_come_from_one_fetch(self) -> None:
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {"pipelines": [
+            {**_ready_pipeline(), "schedule": "0 2 * * *"},
+            {**_ready_pipeline(), "id": "pl-manual-1", "schedule": "manual"},
+        ]}
+        resp.raise_for_status.return_value = None
+        with mock.patch.object(authored_factory.requests, "get", return_value=resp) as mocked_get:
+            jobs, schedules = authored_factory.build_authored_definitions(_cfg())
+        self.assertEqual(mocked_get.call_count, 1)
+        self.assertEqual(len(jobs), 2)
+        self.assertEqual([s.name for s in schedules], ["authored__pl_dedupe_select_abc123_schedule"])

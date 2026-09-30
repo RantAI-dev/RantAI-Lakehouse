@@ -196,6 +196,11 @@ pub struct PipelineFilter {
     /// Restrict to this tenant, if given. `None` matches no rows at all —
     /// see the struct doc comment.
     pub tenant_id: Option<Uuid>,
+    /// Every row, whatever its tenant, unassigned rows included. Only for a
+    /// Platform Admin (`*:*`) with no tenant of their own, who otherwise
+    /// saw no authored pipeline at all; the route decides, this function
+    /// only obeys. `false` keeps the fail-closed tenant rule above.
+    pub all_tenants: bool,
 }
 
 /// List every authored pipeline definition, newest first, optionally
@@ -216,11 +221,12 @@ pub async fn list_pipelines(
 ) -> Result<Vec<Pipeline>, StoreError> {
     let sql = format!(
         "SELECT {PIPELINE_COLUMNS} FROM pipeline_definition \
-         WHERE ($1::uuid IS NOT NULL AND tenant_id = $1) \
+         WHERE ($2 OR ($1::uuid IS NOT NULL AND tenant_id = $1)) \
          ORDER BY created_at DESC"
     );
     let rows: Vec<PipelineRow> = sqlx::query_as(&sql)
         .bind(filter.tenant_id)
+        .bind(filter.all_tenants)
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(Pipeline::from).collect())
@@ -390,6 +396,12 @@ pub struct CreatePipelineInput {
     pub owner: Option<String>,
     /// What the pipeline is for, in the author's words (migration 0047).
     pub description: Option<String>,
+    /// The tenant the pipeline belongs to: the creator's active tenant.
+    /// `None` leaves the row unassigned (`0042_tenant_provisioning.sql`),
+    /// which every tenant-scoped read then skips; before this field every
+    /// console-created pipeline landed there and never appeared on the
+    /// Pipelines list, the page the create form returns to.
+    pub tenant_id: Option<Uuid>,
 }
 
 const DEFAULT_OWNER: &str = "Current user";
@@ -419,8 +431,8 @@ pub async fn create_pipeline(
     let transforms = serde_json::to_value(&input.transforms).unwrap_or(serde_json::Value::Null);
     let sql = format!(
         "INSERT INTO pipeline_definition (id, name, kind, status, owner, source, target, \
-         schedule, description, incremental_column, fbic_enabled, transforms) \
-         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11) \
+         schedule, description, incremental_column, fbic_enabled, transforms, tenant_id) \
+         VALUES ($1, $2, $3, 'draft', $4, $5, $6, $7, $8, $9, $10, $11, $12) \
          RETURNING {PIPELINE_COLUMNS}"
     );
     let row: PipelineRow = sqlx::query_as(&sql)
@@ -435,9 +447,143 @@ pub async fn create_pipeline(
         .bind(&input.incremental_column)
         .bind(input.fbic_enabled)
         .bind(&transforms)
+        .bind(input.tenant_id)
         .fetch_one(pool)
         .await?;
     Ok(row.into())
+}
+
+/// The editable half of an authored pipeline, for [`update_pipeline`].
+/// `name` is not here: the id is derived from it at creation
+/// ([`slug_id`]), and the Dagster job name is derived from the id, so a
+/// rename would leave the id describing a name the pipeline no longer has.
+#[derive(Debug, Clone)]
+pub struct UpdatePipelineInput {
+    /// Pipeline kind.
+    pub kind: String,
+    /// Source zone.
+    pub source_zone: String,
+    /// Source table.
+    pub source_table: String,
+    /// Incremental watermark column, if any.
+    pub incremental_column: Option<String>,
+    /// Grammar-validated transform steps; validated at the route layer,
+    /// exactly as for [`create_pipeline`].
+    pub transforms: Vec<String>,
+    /// Whether file-based incremental capture is enabled.
+    pub fbic_enabled: bool,
+    /// Target zone.
+    pub target_zone: String,
+    /// Target table.
+    pub target_table: String,
+    /// Schedule label.
+    pub schedule: String,
+    /// Owner; unchanged when absent.
+    pub owner: Option<String>,
+    /// Description; cleared when absent.
+    pub description: Option<String>,
+}
+
+/// Replace an authored pipeline's definition. Its status is left as it
+/// is: editing a `ready` pipeline keeps it runnable with the new
+/// definition, which the orchestrator picks up on its next reload.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on any failure. `Ok(None)` when no
+/// pipeline with `id` exists.
+pub async fn update_pipeline(
+    pool: &PgPool,
+    id: &str,
+    input: &UpdatePipelineInput,
+) -> Result<Option<Pipeline>, StoreError> {
+    let source = format!("{}.{}", input.source_zone, input.source_table);
+    let target = format!("{}.{}", input.target_zone, input.target_table);
+    let transforms = serde_json::to_value(&input.transforms).unwrap_or(serde_json::Value::Null);
+    let sql = format!(
+        "UPDATE pipeline_definition SET kind = $2, source = $3, target = $4, schedule = $5, \
+         description = $6, incremental_column = $7, fbic_enabled = $8, transforms = $9, \
+         owner = COALESCE($10, owner) \
+         WHERE id = $1 RETURNING {PIPELINE_COLUMNS}"
+    );
+    let row: Option<PipelineRow> = sqlx::query_as(&sql)
+        .bind(id)
+        .bind(&input.kind)
+        .bind(&source)
+        .bind(&target)
+        .bind(&input.schedule)
+        .bind(&input.description)
+        .bind(&input.incremental_column)
+        .bind(input.fbic_enabled)
+        .bind(&transforms)
+        .bind(&input.owner)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(Pipeline::from))
+}
+
+/// Delete an authored pipeline. `true` when a row was deleted, `false`
+/// when no pipeline with `id` existed.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on any failure.
+pub async fn delete_pipeline(pool: &PgPool, id: &str) -> Result<bool, StoreError> {
+    let done = sqlx::query("DELETE FROM pipeline_definition WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// One authored pipeline the orchestrator should build a job for.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunnablePipeline {
+    /// The pipeline id (`pl-...`).
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// `ready` or `paused`: a paused pipeline still has a job (so it can be
+    /// run by hand); only its schedule is stopped.
+    pub status: String,
+    /// Schedule label as authored: a five-field cron, or anything else for
+    /// "on demand only".
+    pub schedule: String,
+    /// The stored definition the job is built from.
+    pub definition: AuthoredDefinition,
+}
+
+/// Every authored pipeline in status `ready` or `paused`, across all
+/// tenants: the orchestrator runs every tenant's pipelines, the way
+/// `connectors::list_ingestible_connectors` feeds every tenant's ingest.
+/// Only `GET /api/pipelines/runnable` reads this, and that route refuses
+/// anyone but a service identity.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if a query fails.
+pub async fn list_runnable_pipelines(pool: &PgPool) -> Result<Vec<RunnablePipeline>, StoreError> {
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT id, name, status, schedule FROM pipeline_definition \
+         WHERE status IN ('ready', 'paused') ORDER BY created_at",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for (id, name, status, schedule) in rows {
+        // A row deleted between the two reads simply drops out.
+        if let Some(definition) = get_definition(pool, &id).await? {
+            out.push(RunnablePipeline {
+                id,
+                name,
+                status,
+                schedule,
+                definition,
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// Update an authored pipeline's status (`pausePipeline`/`resumePipeline`

@@ -10,6 +10,7 @@ mod agents;
 mod ai;
 mod alerts;
 pub mod auth;
+mod authored_pipelines;
 mod catalog;
 mod catalog_query;
 mod connectors;
@@ -170,7 +171,18 @@ fn pipelines_router() -> Router<AppState> {
             "/api/pipelines/generate",
             axum::routing::post(pipelines::generate),
         )
-        .route("/api/pipelines/{id}", get(pipelines::detail))
+        // Static, so it is matched ahead of `/api/pipelines/{id}`.
+        .route("/api/pipelines/runnable", get(authored_pipelines::runnable))
+        .route(
+            "/api/pipelines/{id}",
+            get(pipelines::detail)
+                .put(authored_pipelines::update)
+                .delete(authored_pipelines::delete),
+        )
+        .route(
+            "/api/pipelines/{id}/schedule-ticks",
+            get(authored_pipelines::schedule_ticks),
+        )
         .route("/api/pipelines/{id}/source", get(pipelines::source))
         .route("/api/pipelines/{id}/runs", get(pipelines::runs))
         .route(

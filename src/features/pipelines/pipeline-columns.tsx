@@ -22,7 +22,7 @@ import {
 import { Copyable } from "@/components/copyable"
 import { DataTableColumnHeader } from "@/components/data-table/data-table-column-header"
 import { FreshnessIndicator } from "@/components/patterns/freshness-indicator"
-import { StatusBadge } from "@/components/patterns/status-badge"
+import { Pill, StatusBadge } from "@/components/patterns/status-badge"
 import { Badge } from "@/components/ui/badge"
 import {
   DropdownMenu,
@@ -35,6 +35,8 @@ import { formatRelativeTime } from "@/lib/format"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { ENTITY_STATUS_LABEL, type EntityStatus } from "@/lib/status"
 import type { Pipeline, PipelineKind } from "@/services/contracts/pipelines"
+import { knownStatus } from "./pipeline-detail-header"
+import { describeCron, isScheduleRunning, parseSchedule } from "./pipeline-schedule"
 
 // `PipelineKind` widens to `string` on `Pipeline.kind` (rows authored
 // before WS1 may still carry `"document"`/`"vector"`, which the database
@@ -174,7 +176,13 @@ export function getPipelineColumns({
       header: ({ column }) => (
         <DataTableColumnHeader column={column} label="Status" />
       ),
-      cell: ({ row }) => <StatusBadge status={row.original.status} />,
+      // A Dagster job that has never run comes back as "unknown", outside
+      // the shared status set, and rendered an empty badge.
+      cell: ({ row }) => {
+        const status = knownStatus(row.original.status)
+        if (status) return <StatusBadge status={status} />
+        return <Pill tone="neutral">{row.original.lastRunAt === null ? "Never run" : "Unknown"}</Pill>
+      },
       enableColumnFilter: true,
       enableSorting: true,
       meta: {
@@ -258,11 +266,24 @@ export function getPipelineColumns({
       header: ({ column }) => (
         <DataTableColumnHeader column={column} label="Schedule" />
       ),
-      cell: ({ row }) => (
-        <span className="font-mono text-xs text-muted-foreground">
-          {row.original.schedule}
-        </span>
-      ),
+      cell: ({ row }) => {
+        const parsed = parseSchedule(row.original.schedule)
+        if (parsed.kind === "manual") return <span className="text-xs text-muted-foreground">On demand</span>
+        if (parsed.kind === "other") {
+          return <span className="font-mono text-xs text-muted-foreground">{parsed.raw}</span>
+        }
+        const words = describeCron(parsed.cron)
+        const paused = parsed.state !== null && !isScheduleRunning(parsed.state)
+        return (
+          <span className="flex flex-col" title={`cron ${parsed.cron}`}>
+            <span className="text-xs text-foreground">
+              {words ?? "Cron"}
+              {paused ? <span className="text-amber-600 dark:text-amber-400"> · paused</span> : null}
+            </span>
+            <span className="font-mono text-[11px] text-muted-foreground">{parsed.cron}</span>
+          </span>
+        )
+      },
       enableColumnFilter: true,
       enableSorting: true,
       meta: {

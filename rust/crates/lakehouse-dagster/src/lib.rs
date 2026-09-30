@@ -845,6 +845,66 @@ impl DgClient {
         })
     }
 
+    /// Ask the webserver to reload this client's code location, so jobs
+    /// and schedules built at import time (authored pipelines,
+    /// `authored_factory.py`) are rebuilt from the API's current data.
+    /// Only a code server started with `dagster code-server start`
+    /// re-imports its module on reload; a plain `dagster api grpc` server
+    /// would reconnect and serve the same definitions.
+    ///
+    /// A GraphQL-level refusal (`RepositoryLocationNotFound`,
+    /// `ReloadNotSupported`, a `PythonError` while loading) is returned as
+    /// `Ok` with `error` set, like [`DgClient::launch_run`].
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`].
+    pub async fn reload_location(&self) -> Result<ReloadOutcome, DgError> {
+        let query = "mutation($name: String!) { reloadRepositoryLocation(repositoryLocationName: $name) { \
+                      __typename \
+                      ... on WorkspaceLocationEntry { locationOrLoadError { __typename \
+                        ... on PythonError { message } } } \
+                      ... on RepositoryLocationNotFound { message } \
+                      ... on ReloadNotSupported { message } \
+                      ... on UnauthorizedError { message } \
+                      ... on PythonError { message } \
+                      } }";
+        let data: Value = self
+            .execute(query, Some(json!({ "name": self.location })))
+            .await?;
+        Ok(reload_outcome_from(&data["reloadRepositoryLocation"]))
+    }
+
+    /// The most recent ticks of one schedule, newest first: when it fired,
+    /// whether that launched a run, was skipped, or failed. A schedule that
+    /// does not exist reads as an empty list, so a job without one simply
+    /// has no ticks.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`].
+    pub async fn schedule_ticks(
+        &self,
+        schedule_name: &str,
+        limit: u32,
+    ) -> Result<Vec<ScheduleTick>, DgError> {
+        let query = "query($sel: ScheduleSelector!, $limit: Int!) { scheduleOrError(scheduleSelector: $sel) { \
+                      __typename \
+                      ... on Schedule { scheduleState { ticks(limit: $limit) { \
+                        tickId status timestamp runIds skipReason error { message } } } } \
+                      } }";
+        let variables = json!({
+            "sel": {
+                "repositoryName": self.repo,
+                "repositoryLocationName": self.location,
+                "scheduleName": schedule_name,
+            },
+            "limit": limit,
+        });
+        let data: Value = self.execute(query, Some(variables)).await?;
+        Ok(schedule_ticks_from(&data["scheduleOrError"]))
+    }
+
     /// A single run's live status + per-step status, matching
     /// `GET /api/ai/build-status`'s inline query (`pipelineRunOrError` on
     /// `Run`).
@@ -1114,6 +1174,84 @@ pub struct GraphOp {
     pub reads: Vec<String>,
     /// What the op's own code writes; see [`Self::reads`].
     pub writes: Vec<String>,
+}
+
+/// What [`DgClient::reload_location`] reports: `error` is `None` when the
+/// location reloaded and loaded cleanly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReloadOutcome {
+    /// Why the reload was refused or the location failed to load, as the
+    /// orchestrator said it. Server-side only: callers log it and never put
+    /// it in a response.
+    pub error: Option<String>,
+}
+
+fn reload_outcome_from(v: &Value) -> ReloadOutcome {
+    let typename = v["__typename"].as_str().unwrap_or("");
+    if typename == "WorkspaceLocationEntry" {
+        let load = &v["locationOrLoadError"];
+        if load["__typename"] == "PythonError" {
+            return ReloadOutcome {
+                error: Some(
+                    load["message"]
+                        .as_str()
+                        .unwrap_or("location failed to load")
+                        .to_owned(),
+                ),
+            };
+        }
+        return ReloadOutcome { error: None };
+    }
+    ReloadOutcome {
+        error: Some(
+            v["message"]
+                .as_str()
+                .map_or_else(|| format!("reload refused ({typename})"), str::to_owned),
+        ),
+    }
+}
+
+/// One schedule evaluation, from [`DgClient::schedule_ticks`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleTick {
+    /// The tick's id.
+    pub tick_id: String,
+    /// `SUCCESS` (launched runs), `SKIPPED`, `FAILURE` or `STARTED`.
+    pub status: String,
+    /// Unix seconds the tick was evaluated.
+    pub timestamp: f64,
+    /// Runs the tick launched.
+    pub run_ids: Vec<String>,
+    /// Why the schedule decided not to launch, in the schedule's own
+    /// words (`SkipReason` in the code location).
+    pub skip_reason: Option<String>,
+    /// Whether the tick failed with an error. The error text itself is the
+    /// orchestrator's and is not carried here (AGENTS.md principle 4).
+    pub failed: bool,
+}
+
+fn schedule_ticks_from(v: &Value) -> Vec<ScheduleTick> {
+    v["scheduleState"]["ticks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|t| ScheduleTick {
+            tick_id: t["tickId"]
+                .as_str()
+                .map_or_else(|| t["tickId"].to_string(), str::to_owned),
+            status: t["status"].as_str().unwrap_or("").to_owned(),
+            timestamp: t["timestamp"].as_f64().unwrap_or(0.0),
+            run_ids: t["runIds"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.as_str().map(str::to_owned))
+                .collect(),
+            skip_reason: t["skipReason"].as_str().map(str::to_owned),
+            failed: !t["error"].is_null(),
+        })
+        .collect()
 }
 
 /// Look up `label` in `entries` (`definition.metadata`'s `{key, value}`
@@ -1827,6 +1965,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.run_id.as_deref(), Some("r2"));
+    }
+
+    #[test]
+    fn a_reload_reports_a_clean_load_a_load_error_and_a_refusal_apart() {
+        let ok = json!({ "__typename": "WorkspaceLocationEntry",
+            "locationOrLoadError": { "__typename": "RepositoryLocation" } });
+        assert_eq!(reload_outcome_from(&ok).error, None);
+        let broken = json!({ "__typename": "WorkspaceLocationEntry",
+            "locationOrLoadError": { "__typename": "PythonError", "message": "boom" } });
+        assert_eq!(reload_outcome_from(&broken).error.as_deref(), Some("boom"));
+        let refused = json!({ "__typename": "ReloadNotSupported", "message": "no" });
+        assert_eq!(reload_outcome_from(&refused).error.as_deref(), Some("no"));
+    }
+
+    #[test]
+    fn schedule_ticks_keep_skip_reasons_but_not_error_text() {
+        let v = json!({ "__typename": "Schedule", "scheduleState": { "ticks": [
+            { "tickId": "1", "status": "SUCCESS", "timestamp": 10.0, "runIds": ["r1"],
+              "skipReason": null, "error": null },
+            { "tickId": "2", "status": "SKIPPED", "timestamp": 5.0, "runIds": [],
+              "skipReason": "nothing new", "error": null },
+            { "tickId": "3", "status": "FAILURE", "timestamp": 1.0, "runIds": [],
+              "skipReason": null, "error": { "message": "Traceback ... secret" } }
+        ] } });
+        let ticks = schedule_ticks_from(&v);
+        assert_eq!(ticks.len(), 3);
+        assert_eq!(ticks[0].run_ids, vec!["r1".to_owned()]);
+        assert_eq!(ticks[1].skip_reason.as_deref(), Some("nothing new"));
+        assert!(ticks[2].failed);
+        let serialized = serde_json::to_string(&ticks).unwrap();
+        assert!(
+            !serialized.contains("Traceback"),
+            "error text must not be carried"
+        );
+        // A schedule that does not exist has no ticks, not an error.
+        assert!(schedule_ticks_from(&json!({ "__typename": "ScheduleNotFoundError" })).is_empty());
     }
 
     #[tokio::test]

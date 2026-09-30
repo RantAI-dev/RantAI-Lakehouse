@@ -23,13 +23,15 @@ import { withNotify } from "@/lib/notify"
 import {
   CAST_TYPES,
   FILTER_OPERATORS,
+  parseTransformDraft,
   renderTransformDraft,
   transformErrorRowIndex,
   type TransformDraft,
 } from "@/lib/transform-draft"
 import { cn } from "@/lib/utils"
 import { connectorService, pipelineService } from "@/services"
-import type { PipelineKind } from "@/services/contracts/pipelines"
+import type { Pipeline, PipelineDetail, PipelineKind } from "@/services/contracts/pipelines"
+import { isSchedulable, PipelineScheduleField } from "./pipeline-schedule-field"
 
 const STEPS: FormStep[] = [
   { id: "source", label: "Source", description: "Name and source table" },
@@ -75,34 +77,76 @@ function draftIsComplete(draft: TransformDraft): boolean {
   }
 }
 
+/** `/pipelines/create`. */
 export function PipelineCreatePage() {
+  return <PipelineEditor />
+}
+
+/**
+ * The step form behind both `/pipelines/create` and
+ * `/pipelines/[pipelineId]/edit`. Editing starts from the stored definition
+ * (its transforms parsed back into drafts) and saves with
+ * `PUT /api/pipelines/{id}`; the name is shown but fixed, because the id
+ * and the orchestrator job name derive from it.
+ */
+export function PipelineEditor({ existing }: { existing?: PipelineDetail }) {
   const router = useRouter()
   const searchParams = useSearchParams()
+  const def = existing?.definition ?? null
   const [step, setStep] = React.useState(0)
-  const [name, setName] = React.useState("")
-  const [kind, setKind] = React.useState<PipelineKind>("incremental")
-  const [sourceZone, setSourceZone] = React.useState("bronze")
-  const [sourceTable, setSourceTable] = React.useState("")
-  const [incrementalColumn, setIncrementalColumn] = React.useState("updated_at")
-  const [transformDrafts, setTransformDrafts] = React.useState<TransformDraft[]>([])
+  const [name, setName] = React.useState(existing?.name ?? "")
+  const [kind, setKind] = React.useState<PipelineKind>(
+    existing?.kind === "batch" || existing?.kind === "incremental" ? existing.kind : "incremental"
+  )
+  const [sourceZone, setSourceZone] = React.useState(def?.sourceZone ?? "bronze")
+  const [sourceTable, setSourceTable] = React.useState(def?.sourceTable ?? "")
+  const [incrementalColumn, setIncrementalColumn] = React.useState(
+    existing ? (def?.incrementalColumn ?? "") : "updated_at"
+  )
+  const [transformDrafts, setTransformDrafts] = React.useState<TransformDraft[]>(() =>
+    (def?.transforms ?? [])
+      .map(parseTransformDraft)
+      .filter((d): d is TransformDraft => d !== null)
+  )
   const [pendingVerb, setPendingVerb] = React.useState<TransformDraft["verb"]>("dedupe")
   const [pendingDraft, setPendingDraft] = React.useState<TransformDraft>(emptyDraftFor("dedupe"))
-  const [fbicEnabled, setFbicEnabled] = React.useState(false)
-  const [targetZone, setTargetZone] = React.useState("silver")
-  const [targetTable, setTargetTable] = React.useState("")
-  const [schedule, setSchedule] = React.useState("Every hour")
+  const [fbicEnabled, setFbicEnabled] = React.useState(def?.fbicEnabled ?? false)
+  const [targetZone, setTargetZone] = React.useState(def?.targetZone ?? "silver")
+  const [targetTable, setTargetTable] = React.useState(def?.targetTable ?? "")
+  // A cron by default: the free-text default used to be "Every hour",
+  // which reads like a schedule but is not one the orchestrator can run.
+  const [schedule, setSchedule] = React.useState(existing?.schedule ?? "0 * * * *")
   const connectorIdFromUrl = searchParams.get("connectorId") ?? ""
-  const [connectorId, setConnectorId] = React.useState(connectorIdFromUrl)
+  const [connectorId, setConnectorId] = React.useState(def?.connectorId ?? connectorIdFromUrl)
   const connectors = useService(
     (signal) => connectorService.listConnectors(signal),
     []
   )
-  const [description, setDescription] = React.useState("")
+  const [description, setDescription] = React.useState(existing?.description ?? "")
   const create = useServiceAction(
     withNotify(
-      { success: "Pipeline created", error: "Failed to create pipeline" },
-      (signal, input: Parameters<typeof pipelineService.createPipeline>[0]) =>
-        pipelineService.createPipeline(input, signal)
+      existing
+        ? { success: "Pipeline saved", error: "Failed to save pipeline" }
+        : { success: "Pipeline created", error: "Failed to create pipeline" },
+      (signal, input: Parameters<typeof pipelineService.createPipeline>[0]): Promise<Pipeline> =>
+        existing
+          ? pipelineService.updatePipeline(
+              existing.id,
+              {
+                kind: input.kind,
+                sourceZone: input.sourceZone,
+                sourceTable: input.sourceTable,
+                incrementalColumn: input.incrementalColumn,
+                transforms: input.transforms,
+                fbicEnabled: input.fbicEnabled,
+                targetZone: input.targetZone,
+                targetTable: input.targetTable,
+                schedule: input.schedule,
+                description: input.description,
+              },
+              signal
+            )
+          : pipelineService.createPipeline(input, signal)
     )
   )
 
@@ -118,7 +162,7 @@ export function PipelineCreatePage() {
     }
     if (step === 1) return transformDrafts.length > 0 || fbicEnabled
     if (step === 2) return Boolean(targetZone.trim() && targetTable.trim())
-    if (step === 3) return Boolean(schedule.trim())
+    if (step === 3) return Boolean(schedule.trim()) && isSchedulable(schedule)
     return true
   }, [
     step,
@@ -158,16 +202,26 @@ export function PipelineCreatePage() {
       connectorId: connectorId || undefined,
       description: description.trim() || undefined,
     })
-    if (result) router.push("/pipelines")
+    // Straight to the pipeline's own page, where it can be marked ready
+    // and run; the list is one click away.
+    if (result) router.push(`/pipelines/${encodeURIComponent(existing?.id ?? result.id)}`)
   }
 
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
-        title="Create Pipeline"
-        description="Step through source, transform, target, and schedule to draft a pipeline."
+        title={existing ? `Edit ${existing.name}` : "Create Pipeline"}
+        description={
+          existing
+            ? "Change the source, transforms, target or schedule. A ready pipeline keeps running with the new definition."
+            : "Step through source, transform, target, and schedule to draft a pipeline."
+        }
         actions={
-          <Button variant="outline" size="sm" render={<Link href="/pipelines" />}>
+          <Button
+            variant="outline"
+            size="sm"
+            render={<Link href={existing ? `/pipelines/${encodeURIComponent(existing.id)}` : "/pipelines"} />}
+          >
             Cancel
           </Button>
         }
@@ -178,13 +232,19 @@ export function PipelineCreatePage() {
         onStepChange={setStep}
         canProceed={canProceed}
         onSubmit={handleSubmit}
-        submitLabel="Create pipeline"
+        submitLabel={existing ? "Save changes" : "Create pipeline"}
         submitting={create.status === "pending"}
       >
         {step === 0 ? (
           <div className="grid gap-3 sm:grid-cols-2">
             <Field label="Pipeline name" className="sm:col-span-2">
-              <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="orders_hourly_rollup" />
+              <Input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="orders_hourly_rollup"
+                disabled={Boolean(existing)}
+                title={existing ? "The name is fixed: the pipeline's id and job derive from it" : undefined}
+              />
             </Field>
             <Field label="Description" className="sm:col-span-2">
               {/* Stored and shown on the pipeline's page, which used to
@@ -226,7 +286,12 @@ export function PipelineCreatePage() {
               <Input value={sourceZone} onChange={(e) => setSourceZone(e.target.value)} />
             </Field>
             <Field label="Connector" className="sm:col-span-2">
-              {connectorIdFromUrl ? (
+              {existing ? (
+                // `PUT /api/pipelines/{id}` does not change the connector.
+                <div className="rounded-lg border border-border px-3 py-1.5 font-mono text-sm text-muted-foreground">
+                  {def?.connectorId ?? "No connector"}
+                </div>
+              ) : connectorIdFromUrl ? (
                 <div className="flex items-center justify-between rounded-lg border border-border px-3 py-1.5 text-sm">
                   <span className="font-mono">{connectorIdFromUrl}</span>
                   <Button variant="outline" size="sm" render={<Link href="/connectors" />}>
@@ -461,11 +526,7 @@ export function PipelineCreatePage() {
         {step === 3 ? (
           <div className="grid gap-3 sm:grid-cols-2">
             <Field label="Schedule" className="sm:col-span-2">
-              <Input
-                value={schedule}
-                onChange={(e) => setSchedule(e.target.value)}
-                placeholder="Every hour"
-              />
+              <PipelineScheduleField value={schedule} onChange={setSchedule} />
             </Field>
           </div>
         ) : null}
