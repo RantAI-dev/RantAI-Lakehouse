@@ -151,6 +151,11 @@ once a first release is tagged.
 - Tests: `lakehouse-test-support` reuses one labelled Postgres container
   instead of leaking one per test binary; the connector secret allowlist
   test no longer depends on a developer `.env` (loaded by `sqlx::test`).
+- `debezium-server` re-pinned to `:1.1.1.Final@sha256:2ad14b1…` so the
+  `Rust · G4 Debezium CDC into Bronze` job pulls again — the prior
+  digest-only pin (`…5281e2bd…`, what `:latest` resolved to on 2026-09-24)
+  now 404s (`manifest unknown`, CI run 36680491360), and a bare digest
+  pin dies silently whenever upstream overwrites the untagged image.
 
 ### Removed
 
