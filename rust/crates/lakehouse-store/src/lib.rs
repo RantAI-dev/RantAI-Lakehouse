@@ -44,6 +44,7 @@ pub mod governance;
 pub mod identity;
 pub mod ingest_spec;
 pub mod knowledge;
+pub mod lineage;
 pub mod maintenance_policy;
 pub mod overview;
 pub mod pipelines;

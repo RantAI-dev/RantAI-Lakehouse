@@ -24,6 +24,7 @@ mod internal_hosts;
 mod json;
 mod lakehouse_catalog;
 mod lakekeeper_token;
+mod lineage;
 mod next_run;
 mod pipeline_source;
 mod policy;

@@ -40,6 +40,7 @@ pub mod internal_hosts;
 pub mod json;
 pub mod lakehouse_catalog;
 pub mod lakekeeper_token;
+pub mod lineage;
 pub mod next_run;
 pub mod pipeline_source;
 pub mod policy;

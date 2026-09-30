@@ -133,7 +133,7 @@ struct PipelineRow {
 /// `0036` added (`incremental_column`/`fbic_enabled`/`transforms`) plus the
 /// `source`/`target` this function splits back into zone/table pairs.
 #[derive(Debug, FromRow)]
-struct DefinitionRow {
+pub(crate) struct DefinitionRow {
     source: String,
     target: String,
     incremental_column: Option<String>,
