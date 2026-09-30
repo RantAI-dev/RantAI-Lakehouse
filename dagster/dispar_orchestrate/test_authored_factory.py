@@ -1,13 +1,12 @@
-"""Unit tests for `authored_factory.py`'s job factory (WS4 items E1/E3,
-grand plan §6). Same non-negotiable property `test_agent_runs.py`
-establishes for `agent_runs.py`: an unreachable/unauthenticated
-`lakehouse-api` must leave the whole Dagster code location loadable, with
-zero authored jobs and a loud warning -- never an import-time exception.
+"""Unit tests for `authored_factory.py`'s `authored_pipeline_job`: the
+run-time definition fetch, the source/target resolution, the SQL it builds,
+and the job's run config shape (the one `POST /api/pipelines/{id}/trigger`
+sends).
 
 No real network: `requests.get` is monkeypatched with canned responses/
 exceptions, the same style `test_agent_runs.py` uses. No real ClickHouse:
-`authored_factory._ch_exec`/`_ch_query_json` are monkeypatched, the same
-style `test_maintenance.py` uses for `_ch_query`.
+`run_model`/`ensure_catalog_database` are injected, the way
+`test_connector_catalog.py` injects its ClickHouse calls.
 
 Run with: `~/.cache/rantai-dagster-venv/bin/python -m pytest
 dagster/dispar_orchestrate/test_authored_factory.py -v`
@@ -19,16 +18,36 @@ import unittest
 from unittest import mock
 
 import requests
-from dagster import build_op_context
+from dagster import DagsterInstance, build_op_context
 
 from dispar_orchestrate import authored_factory, authored_transforms
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget
+
+CH = ClickHouseTarget("http://ch", "default", "")
 
 
 def _cfg(run_token: str = "a-real-token") -> authored_factory.AuthoredPipelineConfig:
     return authored_factory.AuthoredPipelineConfig(
         api_url="http://lakehouse-api.invalid:8080", run_token=run_token,
     )
+
+
+def _pipeline(**overrides: object) -> dict[str, object]:
+    definition = {
+        "sourceZone": "bronze", "sourceTable": "orders",
+        "targetZone": "serving", "targetTable": "orders_clean",
+        "transforms": ["select(id,name)"], "fbicEnabled": False,
+        "incrementalColumn": None, "connectorId": None,
+    }
+    definition.update(overrides)
+    return {"id": "pl-orders-clean-abc123", "name": "orders_clean", "definition": definition}
+
+
+def _runnable_response(pipelines: list[dict[str, object]]) -> mock.Mock:
+    resp = mock.Mock(status_code=200)
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = pipelines
+    return resp
 
 
 class HeadersTest(unittest.TestCase):
@@ -41,98 +60,40 @@ class HeadersTest(unittest.TestCase):
         self.assertEqual(headers["x-run-token"], "tok")
 
 
-class FetchAuthoredPipelinesTest(unittest.TestCase):
-    def test_empty_token_returns_empty_list_with_no_http_call(self) -> None:
+class FetchRunnablePipelineTest(unittest.TestCase):
+    def test_an_unset_token_fails_the_run_without_an_http_call(self) -> None:
         with mock.patch.object(authored_factory.requests, "get") as mocked_get:
-            result = authored_factory._fetch_authored_pipelines(_cfg(run_token=""))
-        self.assertEqual(result, [])
+            with self.assertRaises(authored_factory.AuthoredJobError) as ctx:
+                authored_factory.fetch_runnable_pipeline(_cfg(run_token=""), "pl-a")
         mocked_get.assert_not_called()
+        self.assertIn("PIPELINE_RUN_TOKEN", str(ctx.exception))
 
-    def test_unreachable_api_returns_empty_list_and_does_not_raise(self) -> None:
+    def test_returns_the_pipeline_with_that_id(self) -> None:
+        wanted = _pipeline()
+        other = {**_pipeline(), "id": "pl-other"}
         with mock.patch.object(
-            authored_factory.requests, "get", side_effect=requests.ConnectionError("refused"),
-        ):
-            result = authored_factory._fetch_authored_pipelines(_cfg())
-        self.assertEqual(result, [])
+            authored_factory.requests, "get", return_value=_runnable_response([other, wanted]),
+        ) as mocked_get:
+            found = authored_factory.fetch_runnable_pipeline(_cfg(), wanted["id"])
+        self.assertIs(found, wanted)
+        self.assertEqual(
+            mocked_get.call_args.args[0], "http://lakehouse-api.invalid:8080/api/pipelines/runnable",
+        )
 
-    def test_non_200_returns_empty_list(self) -> None:
-        """Covers the real, documented 403 the `authored-pipeline-scheduler`
-        identity (`pipeline:write` only) gets from `pipeline:read`-gated
-        `GET /api/pipelines` -- see `authored_factory.py`'s module doc."""
+    def test_a_pipeline_that_is_not_listed_fails_as_not_ready(self) -> None:
+        """A draft or paused pipeline is not in `/runnable`; its run must
+        fail rather than execute a definition nobody activated."""
+        with mock.patch.object(authored_factory.requests, "get", return_value=_runnable_response([])):
+            with self.assertRaises(authored_factory.AuthoredJobError) as ctx:
+                authored_factory.fetch_runnable_pipeline(_cfg(), "pl-draft")
+        self.assertIn("not ready", str(ctx.exception))
+
+    def test_a_refused_call_fails_the_run(self) -> None:
         resp = mock.Mock(status_code=403)
         resp.raise_for_status.side_effect = requests.HTTPError("403")
         with mock.patch.object(authored_factory.requests, "get", return_value=resp):
-            self.assertEqual(authored_factory._fetch_authored_pipelines(_cfg()), [])
-
-    def test_non_json_body_returns_empty_list(self) -> None:
-        resp = mock.Mock(status_code=200)
-        resp.raise_for_status.return_value = None
-        resp.json.side_effect = ValueError("not json")
-        with mock.patch.object(authored_factory.requests, "get", return_value=resp):
-            self.assertEqual(authored_factory._fetch_authored_pipelines(_cfg()), [])
-
-    def test_non_list_pipelines_field_returns_empty_list(self) -> None:
-        resp = mock.Mock(status_code=200)
-        resp.raise_for_status.return_value = None
-        resp.json.return_value = {"pipelines": "not-a-list"}
-        with mock.patch.object(authored_factory.requests, "get", return_value=resp):
-            self.assertEqual(authored_factory._fetch_authored_pipelines(_cfg()), [])
-
-    def test_a_pipeline_missing_the_ready_status_is_excluded(self) -> None:
-        resp = mock.Mock(status_code=200)
-        resp.json.return_value = {"pipelines": [
-            {"id": "pl-a", "status": "draft", "definition": {}},
-            {"id": "pl-b", "status": "ready", "definition": {
-                "sourceZone": "silver", "sourceTable": "orders",
-                "targetZone": "serving", "targetTable": "orders_clean",
-                "transforms": ["select(id,name)"], "fbicEnabled": False,
-                "incrementalColumn": None, "connectorId": None,
-            }},
-        ]}
-        resp.raise_for_status.return_value = None
-        with mock.patch.object(authored_factory.requests, "get", return_value=resp):
-            result = authored_factory._fetch_authored_pipelines(_cfg())
-        self.assertEqual([p["id"] for p in result], ["pl-b"])
-
-    def test_a_ready_pipeline_with_no_definition_is_excluded(self) -> None:
-        """A Dagster-job row unioned into the same `/api/pipelines` list
-        (`dagster_pipeline_row`) has no `definition` at all -- must never
-        be mistaken for a ready authored pipeline."""
-        resp = mock.Mock(status_code=200)
-        resp.json.return_value = {"pipelines": [
-            {"id": "bronze_ingest_job", "status": "unknown", "kind": "batch"},
-        ]}
-        resp.raise_for_status.return_value = None
-        with mock.patch.object(authored_factory.requests, "get", return_value=resp):
-            result = authored_factory._fetch_authored_pipelines(_cfg())
-        self.assertEqual(result, [])
-
-
-def _ready_pipeline(**overrides: object) -> dict[str, object]:
-    definition = {
-        "sourceZone": "silver", "sourceTable": "orders",
-        "targetZone": "serving", "targetTable": "orders_clean",
-        "transforms": ["select(id,name)"], "fbicEnabled": False,
-        "incrementalColumn": None, "connectorId": None,
-    }
-    definition.update(overrides)
-    return {"id": "pl-dedupe-select-abc123", "status": "ready", "definition": definition}
-
-
-class BuildAuthoredJobsTest(unittest.TestCase):
-    def test_build_authored_jobs_produces_one_job_per_ready_pipeline(self) -> None:
-        resp = mock.Mock(status_code=200)
-        resp.json.return_value = {"pipelines": [_ready_pipeline()]}
-        resp.raise_for_status.return_value = None
-        with mock.patch.object(authored_factory.requests, "get", return_value=resp):
-            jobs = authored_factory.build_authored_jobs(_cfg())
-        self.assertEqual(len(jobs), 1)
-        self.assertEqual(jobs[0].name, "authored__pl_dedupe_select_abc123")
-
-    def test_dagster_safe_name_replaces_every_non_alnum_underscore_char(self) -> None:
-        self.assertEqual(
-            authored_factory._dagster_safe_name("pl-a.b c-1"), "pl_a_b_c_1",
-        )
+            with self.assertRaises(requests.HTTPError):
+                authored_factory.fetch_runnable_pipeline(_cfg(), "pl-a")
 
 
 class BuildSelectSqlTest(unittest.TestCase):
@@ -156,59 +117,115 @@ class BuildSelectSqlTest(unittest.TestCase):
         self.assertEqual(sql, "SELECT * FROM silver.`orders`")
 
 
-class OpForPipelineTest(unittest.TestCase):
-    """Executes the built op's own function directly (not through a full
-    Dagster job run) -- same level `test_maintenance.py` exercises its ops
-    at: a real `dagster.build_op_context()`, since `@op`-decorated
-    functions require a genuine execution context for direct invocation
-    and reject a bare mock (see `test_maintenance.py`'s own note on this).
-    `_ch_exec`/`_ch_query_json` are monkeypatched, the way
-    `test_maintenance.py` monkeypatches `_ch_query`."""
+class PipelineModelTest(unittest.TestCase):
+    def test_a_bronze_source_reads_the_iceberg_table_through_the_catalog_database(self) -> None:
+        model, reads_bronze = authored_factory.pipeline_model(_pipeline())
+        self.assertTrue(reads_bronze)
+        self.assertEqual(model.select, "SELECT id, name FROM icecat_pipelines.`bronze.orders`")
+        self.assertEqual(model.target, "serving.orders_clean")
+        self.assertEqual(model.engine, authored_factory.TARGET_ENGINE)
 
-    def test_ready_pipeline_reads_transforms_writes_and_reports_real_rows(self) -> None:
-        pipeline = _ready_pipeline()
-        run_fn = authored_factory._op_for_pipeline(pipeline)
+    def test_a_silver_source_reads_the_clickhouse_table(self) -> None:
+        model, reads_bronze = authored_factory.pipeline_model(_pipeline(sourceZone="silver"))
+        self.assertFalse(reads_bronze)
+        self.assertEqual(model.select, "SELECT id, name FROM silver.`orders`")
 
-        counts = iter([[{"n": "0"}], [{"n": "3"}]])  # before, after
-        exec_calls: list[str] = []
-        with mock.patch.object(authored_factory, "_ch_exec", side_effect=lambda t, s: exec_calls.append(s)), \
-             mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts)), \
-             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")):
-            result = run_fn(build_op_context())
+    def test_a_connector_is_lineage_and_does_not_stop_the_run(self) -> None:
+        model, _ = authored_factory.pipeline_model(_pipeline(connectorId="conn-1"))
+        self.assertEqual(model.target, "serving.orders_clean")
 
-        self.assertEqual(result["rows"], 3)
-        self.assertEqual(result["skipped_verbs"], [])
-        self.assertTrue(any("INSERT INTO serving.`orders_clean`" in c for c in exec_calls))
+    def test_an_unknown_source_zone_is_refused(self) -> None:
+        with self.assertRaises(authored_factory.AuthoredJobError) as ctx:
+            authored_factory.pipeline_model(_pipeline(sourceZone="lake"))
+        self.assertIn("source zone", str(ctx.exception))
 
-    def test_fbic_enabled_pipeline_records_a_skipped_verb_not_a_call(self) -> None:
-        pipeline = _ready_pipeline(fbicEnabled=True)
-        run_fn = authored_factory._op_for_pipeline(pipeline)
+    def test_a_target_zone_outside_the_model_schemas_is_refused(self) -> None:
+        with self.assertRaises(authored_factory.AuthoredJobError) as ctx:
+            authored_factory.pipeline_model(_pipeline(targetZone="gold"))
+        self.assertIn("target zone", str(ctx.exception))
 
-        counts = iter([[{"n": "0"}], [{"n": "1"}]])
-        with mock.patch.object(authored_factory, "_ch_exec"), \
-             mock.patch.object(authored_factory, "_ch_query_json", side_effect=lambda t, s: next(counts)), \
-             mock.patch.object(authored_factory.ClickHouseTarget, "from_env", return_value=ClickHouseTarget("http://ch", "default", "")):
-            result = run_fn(build_op_context())
-
-        self.assertEqual(result["skipped_verbs"], [authored_factory.FBIC_UNSUPPORTED_REASON])
+    def test_an_unsafe_identifier_is_refused(self) -> None:
+        with self.assertRaises(authored_factory.AuthoredJobError):
+            authored_factory.pipeline_model(_pipeline(targetTable="orders; DROP TABLE x"))
 
     def test_a_rejected_transform_raises_rather_than_being_dropped(self) -> None:
-        pipeline = _ready_pipeline(transforms=["exec(rm -rf /)"])
-        run_fn = authored_factory._op_for_pipeline(pipeline)
         with self.assertRaises(authored_transforms.TransformError):
-            run_fn(build_op_context())
+            authored_factory.pipeline_model(_pipeline(transforms=["exec(rm -rf /)"]))
 
-    def test_connector_sourced_pipeline_raises_an_honest_unsupported_error(self) -> None:
-        pipeline = _ready_pipeline(connectorId="conn-1")
-        run_fn = authored_factory._op_for_pipeline(pipeline)
+
+class ExecutePipelineTest(unittest.TestCase):
+    def test_a_bronze_pipeline_creates_the_catalog_database_before_running(self) -> None:
+        calls: list[str] = []
+        model, rows = authored_factory.execute_pipeline(
+            _pipeline(),
+            ch=CH,
+            ensure_catalog_database=lambda ch, db: calls.append(f"catalog {db}"),
+            run_model=lambda ch, m: calls.append(f"run {m.target}") or 7,
+        )
+        self.assertEqual(calls, ["catalog icecat_pipelines", "run serving.orders_clean"])
+        self.assertEqual(rows, 7)
+        self.assertEqual(model.name, "pl-orders-clean-abc123")
+
+    def test_a_silver_pipeline_needs_no_catalog_database(self) -> None:
+        ensure = mock.Mock()
+        authored_factory.execute_pipeline(
+            _pipeline(sourceZone="silver"), ch=CH, ensure_catalog_database=ensure, run_model=lambda ch, m: 0,
+        )
+        ensure.assert_not_called()
+
+    def test_clickhouses_own_message_reaches_the_run_log(self) -> None:
+        response = mock.Mock(text="Code: 60. DB::Exception: Unknown table expression identifier\n")
+
+        def refuse(ch, model):
+            raise requests.HTTPError("404 Client Error", response=response)
+
         with self.assertRaises(authored_factory.AuthoredJobError) as ctx:
-            run_fn(build_op_context())
-        self.assertIn("connector-sourced", str(ctx.exception))
+            authored_factory.execute_pipeline(
+                _pipeline(), ch=CH, ensure_catalog_database=lambda ch, db: None, run_model=refuse,
+            )
+        self.assertIn("Unknown table expression identifier", str(ctx.exception))
 
-    def test_an_unsafe_identifier_raises_rather_than_reaching_sql(self) -> None:
-        pipeline = _ready_pipeline(targetTable="orders; DROP TABLE x")
-        run_fn = authored_factory._op_for_pipeline(pipeline)
-        with mock.patch.object(authored_factory, "_ch_exec") as mocked_exec:
-            with self.assertRaises(authored_factory.AuthoredJobError):
-                run_fn(build_op_context())
-        mocked_exec.assert_not_called()
+
+class RunAuthoredPipelineTest(unittest.TestCase):
+    def test_the_op_runs_its_configured_pipeline(self) -> None:
+        pipeline = _pipeline(fbicEnabled=True)
+        model = authored_factory.pipeline_model(pipeline)[0]
+        with mock.patch.object(authored_factory, "fetch_runnable_pipeline", return_value=pipeline) as fetch, \
+             mock.patch.object(authored_factory, "execute_pipeline", return_value=(model, 3)):
+            result = authored_factory.run_authored_pipeline(
+                build_op_context(op_config={"pipeline_id": pipeline["id"]}),
+            )
+        self.assertEqual(fetch.call_args.args[1], pipeline["id"])
+        self.assertEqual(result["rows"], 3)
+        self.assertEqual(result["skipped_verbs"], [authored_factory.FBIC_UNSUPPORTED_REASON])
+
+    def test_the_job_accepts_the_run_config_the_api_sends(self) -> None:
+        """The exact config `authored_run_config` builds in
+        `rust/crates/lakehouse-api/src/routes/pipelines.rs`; a mismatch
+        would make every launch a `RunConfigValidationInvalid`."""
+        pipeline = _pipeline()
+        model = authored_factory.pipeline_model(pipeline)[0]
+        run_config = {"ops": {"run_authored_pipeline": {"config": {"pipeline_id": pipeline["id"]}}}}
+        with mock.patch.object(authored_factory, "fetch_runnable_pipeline", return_value=pipeline), \
+             mock.patch.object(authored_factory, "execute_pipeline", return_value=(model, 1)):
+            result = authored_factory.authored_pipeline_job.execute_in_process(run_config=run_config)
+        self.assertTrue(result.success)
+        self.assertEqual(authored_factory.authored_pipeline_job.name, "authored_pipeline_job")
+
+    def test_a_failed_run_logs_why_it_failed(self) -> None:
+        """The console shows a run's log messages, not the failed step's
+        error chain, so the reason must be a log message of its own."""
+        instance = DagsterInstance.ephemeral()
+        refusal = authored_factory.AuthoredJobError("pipeline 'pl-x' is not ready to run")
+        run_config = {"ops": {"run_authored_pipeline": {"config": {"pipeline_id": "pl-x"}}}}
+        with mock.patch.object(authored_factory, "fetch_runnable_pipeline", side_effect=refusal):
+            result = authored_factory.authored_pipeline_job.execute_in_process(
+                run_config=run_config, instance=instance, raise_on_error=False,
+            )
+        self.assertFalse(result.success)
+        messages = [entry.user_message for entry in instance.all_logs(result.run_id)]
+        self.assertIn("AuthoredJobError: pipeline 'pl-x' is not ready to run", messages)
+
+
+if __name__ == "__main__":
+    unittest.main()

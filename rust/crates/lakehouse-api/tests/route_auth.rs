@@ -418,6 +418,30 @@ async fn ingest_read_scope_can_call_ingestible_but_not_the_base_connectors_route
     );
 }
 
+/// `GET /api/pipelines/runnable` lists every tenant's definitions, so the
+/// console's own `pipeline:read`/`pipeline:write` grants must not reach
+/// it; only `pipeline:execute` (the orchestrator's service identity) does.
+#[tokio::test]
+async fn only_pipeline_execute_can_list_runnable_pipelines() {
+    let TestApp { router, pool } = spin_up().await;
+
+    let editor = create_principal_with_permissions(&pool, "pipeline:read, pipeline:write").await;
+    let editor_cookie = session_cookie_for_user(&pool, editor).await;
+    let refused =
+        request_with_cookie(&router, "GET", "/api/pipelines/runnable", &editor_cookie).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::FORBIDDEN,
+        "pipeline:read/write must NOT be enough to list every tenant's definitions"
+    );
+
+    let executor = create_principal_with_permissions(&pool, "pipeline:execute").await;
+    let executor_cookie = session_cookie_for_user(&pool, executor).await;
+    let allowed =
+        request_with_cookie(&router, "GET", "/api/pipelines/runnable", &executor_cookie).await;
+    assert_eq!(allowed.status(), StatusCode::OK);
+}
+
 /// A principal holding ONLY `ingest:read` (not `connector:manage`) may
 /// `GET /api/connectors/{id}/ingest-spec` and is refused `PUT` on the same
 /// route.

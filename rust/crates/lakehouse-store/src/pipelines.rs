@@ -1,7 +1,8 @@
 //! Repository layer for authored pipeline definitions: the Postgres backing
 //! for `createPipeline`, `generatePipelineFromPrompt`, and the "draft" half
-//! of `pausePipeline`/`resumePipeline` — pipelines a console user declared
-//! that no Dagster job (yet) implements.
+//! of `pausePipeline`/`resumePipeline` — pipelines a console user declared,
+//! which Dagster's one shared `authored_pipeline_job` runs from the
+//! definition stored here ([`list_runnable_pipelines`]).
 //!
 //! See `0007_pipelines.sql`'s header comment for the full "what this is /
 //! is not" reasoning: `GET /api/pipelines` stays Dagster-backed for real
@@ -288,13 +289,17 @@ pub async fn get_definition(
     .bind(id)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|row| {
+    Ok(row.map(AuthoredDefinition::from))
+}
+
+impl From<DefinitionRow> for AuthoredDefinition {
+    fn from(row: DefinitionRow) -> Self {
         // Mirrors `create_pipeline`'s own `format!("{}.{}", zone, table)`
         // construction — split back into the two halves it came from.
         let (source_zone, source_table) = split_zone_table(&row.source);
         let (target_zone, target_table) = split_zone_table(&row.target);
         let transforms: Vec<String> = serde_json::from_value(row.transforms).unwrap_or_default();
-        AuthoredDefinition {
+        Self {
             source_zone,
             source_table,
             incremental_column: row.incremental_column,
@@ -304,7 +309,82 @@ pub async fn get_definition(
             target_table,
             connector_id: row.connector_id,
         }
-    }))
+    }
+}
+
+/// An authored pipeline the orchestrator may run: its id and name plus the
+/// definition the run executes. What `GET /api/pipelines/runnable` returns.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunnablePipeline {
+    /// `pipeline_definition.id`.
+    pub id: String,
+    /// Pipeline name.
+    pub name: String,
+    /// What the run reads, transforms and writes.
+    pub definition: AuthoredDefinition,
+}
+
+#[derive(Debug, FromRow)]
+struct RunnableRow {
+    id: String,
+    name: String,
+    #[sqlx(flatten)]
+    definition: DefinitionRow,
+}
+
+/// Every `ready` authored pipeline, in every tenant, with its definition —
+/// what Dagster's `authored_pipeline_job` fetches at run time
+/// (`dagster/dispar_orchestrate/authored_factory.py`). A `draft` or
+/// `paused` pipeline is left out, so a run launched for one fails instead
+/// of executing a definition nobody activated.
+///
+/// Not tenant-scoped: the one caller is the orchestrator's own service
+/// identity, which belongs to no tenant. The route is gated on a
+/// permission no seeded human role holds (`pipeline:execute`).
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn list_runnable_pipelines(pool: &PgPool) -> Result<Vec<RunnablePipeline>, StoreError> {
+    let rows: Vec<RunnableRow> = sqlx::query_as(
+        "SELECT id, name, source, target, incremental_column, transforms, fbic_enabled, \
+         connector_id FROM pipeline_definition WHERE status = 'ready' ORDER BY created_at",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| RunnablePipeline {
+            id: row.id,
+            name: row.name,
+            definition: row.definition.into(),
+        })
+        .collect())
+}
+
+/// Fetch one authored pipeline, but only when it belongs to one of
+/// `tenant_ids`. An unknown id, another tenant's pipeline and an
+/// unassigned one all come back `None`, so a caller cannot use this to
+/// learn which ids exist.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the query fails.
+pub async fn get_pipeline_in_tenants(
+    pool: &PgPool,
+    id: &str,
+    tenant_ids: &[Uuid],
+) -> Result<Option<Pipeline>, StoreError> {
+    let sql = format!(
+        "SELECT {PIPELINE_COLUMNS} FROM pipeline_definition WHERE id = $1 AND tenant_id = ANY($2)"
+    );
+    let row: Option<PipelineRow> = sqlx::query_as(&sql)
+        .bind(id)
+        .bind(tenant_ids)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(Pipeline::from))
 }
 
 /// Split a `"<zone>.<table>"` location on its first `.`, matching

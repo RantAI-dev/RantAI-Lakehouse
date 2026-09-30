@@ -8,13 +8,13 @@ import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { useRefreshable } from "@/hooks/use-refreshable"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { backfillTriggerMessage } from "@/lib/connectors/backfill-message"
 import { formatDuration, formatRelativeTime, parseTimestamp } from "@/lib/format"
 import { withNotify } from "@/lib/notify"
 import { connectorService } from "@/services"
 import type { Dial, IngestJobRun, IngestRun, IngestSpec, SourceObject } from "@/services/contracts/connectors"
-import { toServiceError, type ServiceError } from "@/services/errors"
 
 /** A lower-case SQL-safe identifier: what a Bronze table can be called. */
 const TARGET_PATTERN = /^[a-z_][a-z0-9_]*$/
@@ -561,46 +561,6 @@ export function groupResultsByRun(runs: IngestJobRun[], results: IngestRun[]): R
   for (const group of groups) group.results.sort(byTime)
   earlier.sort((x, y) => byTime(y, x))
   return earlier.length > 0 ? [...groups, { run: null, results: earlier }] : groups
-}
-
-/**
- * The latest value of `fetcher`, refetched on `refresh()` without clearing
- * what is on screen: `useService` resets to a loading state on every
- * reload, which would flash the run history on every poll.
- */
-function useRefreshable<T>(fetcher: (signal: AbortSignal) => Promise<T>, key: string) {
-  const [data, setData] = React.useState<T | null>(null)
-  const [error, setError] = React.useState<ServiceError | null>(null)
-  const fetcherRef = React.useRef(fetcher)
-  // Declared before the fetching effect below, so it runs first.
-  React.useEffect(() => {
-    fetcherRef.current = fetcher
-  })
-  const controllerRef = React.useRef<AbortController | null>(null)
-
-  const refresh = React.useCallback(() => {
-    controllerRef.current?.abort()
-    const controller = new AbortController()
-    controllerRef.current = controller
-    fetcherRef.current(controller.signal).then(
-      (next) => {
-        if (controller.signal.aborted) return
-        setData(next)
-        setError(null)
-      },
-      (err) => {
-        const serviceError = toServiceError(err)
-        if (!controller.signal.aborted && serviceError.code !== "aborted") setError(serviceError)
-      }
-    )
-  }, [])
-
-  React.useEffect(() => {
-    refresh()
-    return () => controllerRef.current?.abort()
-  }, [key, refresh])
-
-  return { data, error, refresh }
 }
 
 /**

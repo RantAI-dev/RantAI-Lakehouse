@@ -41,6 +41,21 @@ const STEPS: FormStep[] = [
 
 const KIND_OPTIONS: PipelineKind[] = ["batch", "incremental"]
 
+/**
+ * The zones a run can read and write — the same lists `SOURCE_ZONES`/
+ * `TARGET_ZONES` in `routes/pipelines.rs` enforce on create. Gold marts
+ * live in `serving`.
+ */
+const SOURCE_ZONE_OPTIONS = [
+  { value: "bronze", label: "bronze — tables loaded by connectors and uploads" },
+  { value: "silver", label: "silver" },
+  { value: "serving", label: "serving (gold)" },
+]
+const TARGET_ZONE_OPTIONS = [
+  { value: "silver", label: "silver" },
+  { value: "serving", label: "serving (gold)" },
+]
+
 /** The five verbs `transform_grammar.rs::parse_transform` accepts — nothing else is offered. */
 const TRANSFORM_VERBS: TransformDraft["verb"][] = ["dedupe", "filter", "rename", "cast", "select"]
 
@@ -223,7 +238,7 @@ export function PipelineCreatePage() {
               />
             </Field>
             <Field label="Source zone">
-              <Input value={sourceZone} onChange={(e) => setSourceZone(e.target.value)} />
+              <ZoneSelect value={sourceZone} onChange={setSourceZone} options={SOURCE_ZONE_OPTIONS} />
             </Field>
             <Field label="Connector" className="sm:col-span-2">
               {connectorIdFromUrl ? (
@@ -239,7 +254,7 @@ export function PipelineCreatePage() {
                   value={connectorId}
                   onChange={(e) => setConnectorId(e.target.value)}
                 >
-                  <option value="">No connector (read a ClickHouse table directly)</option>
+                  <option value="">No connector</option>
                   {(connectors.data ?? []).map((c) => (
                     <option key={c.id} value={c.id}>
                       {c.name}
@@ -446,7 +461,7 @@ export function PipelineCreatePage() {
         {step === 2 ? (
           <div className="grid gap-3 sm:grid-cols-2">
             <Field label="Target zone">
-              <Input value={targetZone} onChange={(e) => setTargetZone(e.target.value)} />
+              <ZoneSelect value={targetZone} onChange={setTargetZone} options={TARGET_ZONE_OPTIONS} />
             </Field>
             <Field label="Target table">
               <Input
@@ -511,6 +526,31 @@ export function PipelineCreatePage() {
         ) : null}
       </FormStepLayout>
     </div>
+  )
+}
+
+function ZoneSelect({
+  value,
+  onChange,
+  options,
+}: {
+  value: string
+  onChange: (value: string) => void
+  options: { value: string; label: string }[]
+}) {
+  return (
+    <Select value={value} onValueChange={(v) => onChange(v ?? options[0].value)}>
+      <SelectTrigger>
+        <SelectValue placeholder="Pick a zone" />
+      </SelectTrigger>
+      <SelectContent>
+        {options.map((o) => (
+          <SelectItem key={o.value} value={o.value}>
+            {o.label}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
   )
 }
 

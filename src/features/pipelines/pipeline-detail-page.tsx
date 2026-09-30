@@ -22,6 +22,7 @@ import { StatusBadge } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useDataTable } from "@/hooks/use-data-table"
+import { useRefreshable } from "@/hooks/use-refreshable"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { withNotify } from "@/lib/notify"
 import {
@@ -40,6 +41,21 @@ import type {
 } from "@/services/contracts/pipelines"
 import { topoSortOps } from "./topo-sort-ops"
 import { getPipelineRunColumns, runDuration } from "./pipeline-run-columns"
+
+/** How often the runs list is re-read while a run is going. */
+const RUNS_POLL_MS = 3_000
+
+/** How long to wait for a just-launched run to appear in the list. */
+const LAUNCH_GRACE_MS = 60_000
+
+const NO_RUNS: PipelineRun[] = []
+
+function isRunActive(run: PipelineRun): boolean {
+  // The API reports a run that has not started yet as "queued", a status
+  // `EntityStatus` does not list.
+  const status: string = run.status
+  return status === "queued" || status === "running"
+}
 
 function AssetLink({ id, label }: { readonly id?: string; readonly label: string }) {
   if (!id) return <span className="font-mono text-xs">{label}</span>
@@ -425,14 +441,47 @@ export function PipelineDetailPage() {
   // properties of undefined (reading '0')" -- the contract declared a field
   // the route never sends, and a hand-written contract type cannot catch
   // that at compile time.
-  const runsState = useService(
-    (s) => pipelineService.listRuns(pipelineId, s),
-    [pipelineId]
-  )
-  const runs = runsState.status === "success" ? runsState.data : []
+  //
+  // Re-read without clearing the table, so it can be polled while a run is
+  // going: a run moves from queued to running to done without anyone
+  // reloading the page.
+  const {
+    data: runsData,
+    error: runsError,
+    refresh: refreshRuns,
+  } = useRefreshable((s) => pipelineService.listRuns(pipelineId, s), pipelineId)
+  const runs = runsData ?? NO_RUNS
   const [selectedRun, setSelectedRun] = React.useState<PipelineRun | null>(null)
   const [cancelRunTarget, setCancelRunTarget] = React.useState<PipelineRun | null>(null)
   const [pauseOpen, setPauseOpen] = React.useState(false)
+  // Controlled, so reloading the detail after an action keeps the tab.
+  const [tab, setTab] = React.useState("overview")
+  // A run just launched, until the orchestrator lists it.
+  const [launchedRunId, setLaunchedRunId] = React.useState<string | null>(null)
+  const awaitingLaunch = launchedRunId !== null && !runs.some((r) => r.id === launchedRunId)
+  const watching = awaitingLaunch || runs.some(isRunActive)
+  // The drawer follows the polled list, so a run that finishes while it is
+  // open stops polling its logs.
+  const drawerRun = selectedRun ? (runs.find((r) => r.id === selectedRun.id) ?? selectedRun) : null
+
+  React.useEffect(() => {
+    if (!watching) return
+    const timer = window.setInterval(refreshRuns, RUNS_POLL_MS)
+    return () => window.clearInterval(timer)
+  }, [watching, refreshRuns])
+
+  // Stop waiting for a launched run the orchestrator never lists.
+  React.useEffect(() => {
+    if (!launchedRunId) return
+    const timer = window.setTimeout(() => setLaunchedRunId(null), LAUNCH_GRACE_MS)
+    return () => window.clearTimeout(timer)
+  }, [launchedRunId])
+
+  const { reload: reloadDetail } = state
+  const reloadAll = React.useCallback(() => {
+    reloadDetail()
+    refreshRuns()
+  }, [reloadDetail, refreshRuns])
 
   const runAction = useServiceAction(
     withNotify(
@@ -489,10 +538,10 @@ export function PipelineDetailPage() {
         onCancel: (run) => setCancelRunTarget(run),
         onRetry: async (run) => {
           const next = await retryAction.run(run.id)
-          if (next) state.reload()
+          if (next) reloadAll()
         },
       }),
-    [retryAction, state]
+    [retryAction, reloadAll]
   )
 
   const { table } = useDataTable({
@@ -509,13 +558,12 @@ export function PipelineDetailPage() {
   const p = state.data
   const isPaused = p.status === "paused"
   const isDraft = p.status === "draft"
-  // `Pipeline` carries no `origin` field — the API never sends one. An
-  // authored (console-created) pipeline's id is always `pl-<slug>-<base36
-  // millis>`; a Dagster job id is never prefixed `pl-` (same derivation
-  // as `pipelineOrigin` in `./pipeline-columns.tsx`). Pause/Resume/Run act
-  // on a schedule and engine in the orchestrator, which an authored
-  // pipeline has neither.
-  const canRun = !p.id.startsWith("pl-")
+  // An authored (console-created) pipeline's id is always `pl-<slug>-<base36
+  // millis>`; a Dagster job id is never prefixed `pl-` (same derivation as
+  // `pipelineOrigin` in `./pipeline-columns.tsx`). An authored pipeline
+  // runs one run at a time — the API refuses a second while one is going —
+  // and pausing it holds its runs rather than a schedule.
+  const isAuthored = p.id.startsWith("pl-")
 
   return (
     <div className="flex flex-col gap-4">
@@ -537,14 +585,6 @@ export function PipelineDetailPage() {
               <PlayIcon data-icon="inline-start" />
               {activateAction.status === "pending" ? "Activating…" : "Activate"}
             </Button>
-          ) : !canRun ? (
-            // An authored, non-draft pipeline still has no job in the
-            // orchestrator, so Run/Pause/Resume have nothing to act on.
-            // They used to be shown anyway and answered 503, which reads
-            // as "try again later".
-            <span className="text-xs text-muted-foreground">
-              No engine attached — this pipeline cannot run yet.
-            </span>
           ) : (
             <>
               {isPaused ? (
@@ -573,14 +613,22 @@ export function PipelineDetailPage() {
               )}
               <Button
                 size="sm"
-                disabled={isPaused || runAction.status === "pending"}
+                disabled={isPaused || runAction.status === "pending" || (isAuthored && watching)}
                 onClick={async () => {
                   const run = await runAction.run(pipelineId)
-                  if (run) state.reload()
+                  if (run) {
+                    setLaunchedRunId(run.id)
+                    setTab("runs")
+                    reloadAll()
+                  }
                 }}
               >
                 <PlayIcon data-icon="inline-start" />
-                {runAction.status === "pending" ? "Starting…" : "Run now"}
+                {runAction.status === "pending"
+                  ? "Starting…"
+                  : isAuthored && watching
+                    ? "Running…"
+                    : "Run now"}
               </Button>
             </>
           )
@@ -590,7 +638,11 @@ export function PipelineDetailPage() {
         open={pauseOpen}
         onOpenChange={setPauseOpen}
         title="Pause pipeline"
-        description={`Pause ${p.name}? Scheduled runs will stop until resumed.`}
+        description={
+          isAuthored
+            ? `Pause ${p.name}? It cannot be run until resumed.`
+            : `Pause ${p.name}? Scheduled runs will stop until resumed.`
+        }
         impact="In-flight runs continue; new triggers are held."
         confirmLabel="Pause pipeline"
         confirming={pauseAction.status === "pending"}
@@ -617,11 +669,11 @@ export function PipelineDetailPage() {
           const updated = await cancelAction.run(cancelRunTarget.id)
           if (updated) {
             setCancelRunTarget(null)
-            state.reload()
+            reloadAll()
           }
         }}
       />
-      <Tabs defaultValue="overview">
+      <Tabs value={tab} onValueChange={(value) => setTab(String(value))}>
         <TabsList>
           <TabsTrigger value="overview">Overview</TabsTrigger>
           <TabsTrigger value="graph">Graph</TabsTrigger>
@@ -694,8 +746,12 @@ export function PipelineDetailPage() {
             />
           ) : (
             <EmptyState
-              title="This pipeline has no graph yet"
-              description="The op graph is read from Dagster and is not available for this build."
+              title={isAuthored ? "Runs as a single step" : "This pipeline has no graph yet"}
+              description={
+                isAuthored
+                  ? "A pipeline built in the console reads its source, applies its transforms and rebuilds its target in one step."
+                  : "The op graph is read from Dagster and is not available for this build."
+              }
             />
           )}
         </TabsContent>
@@ -710,7 +766,11 @@ export function PipelineDetailPage() {
           )}
         </TabsContent>
         <TabsContent value="runs" className="mt-3">
-          {runs.length === 0 ? (
+          {runsError && runsData === null ? (
+            <ErrorState error={runsError} onRetry={refreshRuns} />
+          ) : runsData === null ? (
+            <LoadingSkeleton rows={3} />
+          ) : runs.length === 0 ? (
             <EmptyState
               title="No runs"
               description="Runs appear here once the pipeline executes."
@@ -741,9 +801,9 @@ export function PipelineDetailPage() {
         </TabsContent>
       </Tabs>
       <RunDrawer
-        run={selectedRun}
+        run={drawerRun}
         onClose={() => setSelectedRun(null)}
-        onChanged={state.reload}
+        onChanged={reloadAll}
       />
     </div>
   )

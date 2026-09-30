@@ -13,7 +13,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lakehouse_auth::Principal;
 use lakehouse_core::ApiError;
-use lakehouse_dagster::{DgClient, DgError, DgJob, DgRun, iso_from_unix_seconds, map_run_status};
+use lakehouse_dagster::{
+    DgClient, DgConfiguredRun, DgError, DgJob, DgRun, iso_from_unix_seconds, map_run_status,
+};
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::pipelines::{self, CreatePipelineInput};
 use lakehouse_store::{PgPool, StoreError};
@@ -128,6 +130,10 @@ async fn list_body(
             tokio::try_join!(dagster.list_jobs_with_schedules(), dagster.list_runs(100))?;
         pipelines = jobs
             .iter()
+            // Its runs are the authored pipelines' runs, listed under each
+            // of them below; as a row of its own it could only fail to
+            // launch without a pipeline to run.
+            .filter(|j| j.name != AUTHORED_JOB)
             .map(|j| {
                 let last = last_run_for(&runs, &j.name);
                 dagster_pipeline_row(j, last)
@@ -141,7 +147,12 @@ async fn list_body(
             tenant_id: Some(tenant_id),
         };
         let authored = pipelines::list_pipelines(pg, &filter).await?;
-        pipelines.extend(authored.iter().filter_map(|p| serde_json::to_value(p).ok()));
+        let runs = if authored.is_empty() {
+            Vec::new()
+        } else {
+            recent_authored_runs(dagster).await
+        };
+        pipelines.extend(authored.iter().filter_map(|p| authored_row(p, &runs)));
     }
     match dagster_jobs_refused {
         None => Ok(json!({ "pipelines": pipelines })),
@@ -150,6 +161,37 @@ async fn list_body(
             "dagsterJobs": { "supported": false, "reason": reason },
         })),
     }
+}
+
+/// [`AUTHORED_JOB`]'s recent runs, or none when `Dagster` cannot be
+/// reached: an authored pipeline is still listed from Postgres then, only
+/// without its last run.
+async fn recent_authored_runs(dagster: &DgClient) -> Vec<DgConfiguredRun> {
+    dagster
+        .list_runs_for_job_with_config(AUTHORED_JOB, RECENT_AUTHORED_RUNS)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(%err, "authored pipeline runs: orchestrator unreachable");
+            Vec::new()
+        })
+}
+
+/// One authored pipeline as JSON, with `lastRunAt` taken from its newest
+/// run in `runs`. No run writes back to Postgres, so the stored column is
+/// only what is shown when `Dagster` has no run of it.
+fn authored_row(pipeline: &pipelines::Pipeline, runs: &[DgConfiguredRun]) -> Option<Value> {
+    let mut row = serde_json::to_value(pipeline).ok()?;
+    let mine = authored_runs(runs, &pipeline.id);
+    if let (Value::Object(obj), Some(start)) = (
+        &mut row,
+        last_run_for(&mine, AUTHORED_JOB).and_then(|r| r.start_time),
+    ) {
+        obj.insert(
+            "lastRunAt".to_owned(),
+            Value::String(iso_from_unix_seconds(start)),
+        );
+    }
+    Some(row)
 }
 
 /// Build one `Dagster`-job row for `GET /api/pipelines`. `Dagster`'s job/run
@@ -248,7 +290,16 @@ pub async fn runs(State(state): State<AppState>, Path(id): Path<String>) -> Resp
 }
 
 async fn runs_body(state: &AppState, id: &str) -> Value {
-    match state.dagster.list_runs_for_job(id, 30).await {
+    let runs = if id.starts_with("pl-") {
+        state
+            .dagster
+            .list_runs_for_job_with_config(AUTHORED_JOB, RECENT_AUTHORED_RUNS)
+            .await
+            .map(|runs| authored_runs(&runs, id).into_iter().take(30).collect())
+    } else {
+        state.dagster.list_runs_for_job(id, 30).await
+    };
+    match runs {
         Ok(runs) => json!({
             "runs": runs.iter().map(|r| run_to_json(r, id)).collect::<Vec<_>>(),
             "unavailable": Value::Null,
@@ -354,9 +405,9 @@ fn graph_op_to_json(op: &lakehouse_dagster::GraphOp) -> Value {
 }
 
 /// The `pl-` half of [`detail`]: an authored pipeline has no `Dagster` job
-/// graph until Phase E's `authored_factory.py` builds one from its stored
-/// definition — `"graph": null` here is the honest answer until then,
-/// exactly like WS1's T2 empty state, never a fabricated single-op stand-in.
+/// graph of its own — every one runs as the same one-op
+/// [`AUTHORED_JOB`] — so `"graph": null` is the honest answer, exactly like
+/// WS1's T2 empty state, never a fabricated single-op stand-in.
 async fn authored_detail(state: &AppState, id: &str) -> Response {
     let pool = match pool(state) {
         Ok(pool) => pool,
@@ -383,7 +434,8 @@ async fn authored_detail(state: &AppState, id: &str) -> Response {
     // `.expect()`, keeps this route panic-free even if that ever changes:
     // a serialization failure here degrades to an empty envelope rather
     // than a crashed request.
-    let mut body = serde_json::to_value(&pipeline).unwrap_or_else(|_| json!({}));
+    let runs = recent_authored_runs(&state.dagster).await;
+    let mut body = authored_row(&pipeline, &runs).unwrap_or_else(|| json!({}));
     if let Value::Object(obj) = &mut body {
         obj.insert("engine".to_owned(), json!("authored"));
         obj.insert("description".to_owned(), Value::Null);
@@ -751,19 +803,14 @@ pub async fn trigger(
     let Some(Extension(principal)) = principal else {
         return ApiRejection(ApiError::unauthorized()).into_response();
     };
-    // An authored pipeline has no job behind it, so launching one is not
-    // something that can fail transiently — it is something that cannot
-    // happen. It used to be attempted anyway and came back as a 503, which
-    // reads as "try again later".
     if id.starts_with("pl-") {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            ApiJson(json!({
-                "error": "this pipeline is authored in the console and is not registered \
-                          with the orchestrator, so it cannot be run yet",
-            })),
-        )
-            .into_response();
+        return match trigger_authored(&state, &principal, &id).await {
+            Ok(body) => {
+                record_pipeline_audit(&state, &principal, "pipeline.trigger", &id).await;
+                (StatusCode::OK, ApiJson(body)).into_response()
+            }
+            Err(err) => ApiRejection(err).into_response(),
+        };
     }
     match state.dagster.launch_run(&id).await {
         Ok(outcome) => {
@@ -800,6 +847,132 @@ pub async fn trigger(
     }
 }
 
+/// The one `Dagster` job every authored pipeline runs as
+/// (`dagster/dispar_orchestrate/authored_factory.py`). Runs are told apart
+/// by their config, the same way every connector shares `ingest_job`.
+const AUTHORED_JOB: &str = "authored_pipeline_job";
+
+/// How many of [`AUTHORED_JOB`]'s most recent runs, across every pipeline,
+/// are searched for one pipeline's runs.
+const RECENT_AUTHORED_RUNS: u32 = 100;
+
+/// The run config that points [`AUTHORED_JOB`] at one pipeline.
+fn authored_run_config(pipeline_id: &str) -> Value {
+    json!({ "ops": { "run_authored_pipeline": { "config": { "pipeline_id": pipeline_id } } } })
+}
+
+/// `pipeline_id`'s runs among `runs`, keeping `Dagster`'s newest-first
+/// order.
+fn authored_runs(runs: &[DgConfiguredRun], pipeline_id: &str) -> Vec<DgRun> {
+    runs.iter()
+        .filter(|run| {
+            run.run_config
+                .pointer("/ops/run_authored_pipeline/config/pipeline_id")
+                .and_then(Value::as_str)
+                == Some(pipeline_id)
+        })
+        .map(|run| DgRun {
+            run_id: run.run_id.clone(),
+            job_name: AUTHORED_JOB.to_owned(),
+            status: run.status.clone(),
+            start_time: run.start_time,
+            end_time: run.end_time,
+        })
+        .collect()
+}
+
+/// The `pl-` half of [`trigger`]: launch [`AUTHORED_JOB`] for one authored
+/// pipeline. The job fetches the pipeline's definition when it starts, so a
+/// pipeline activated a moment ago runs without reloading `Dagster`.
+///
+/// # Errors
+///
+/// 404 when `id` is not a pipeline in one of the caller's tenants (an
+/// unknown id and another tenant's pipeline look the same); 409 when the
+/// pipeline is not `ready`, or a run of it has not finished; 422 when
+/// `Dagster` refuses the launch; 503 when `Dagster` or Postgres cannot be
+/// reached.
+async fn trigger_authored(
+    state: &AppState,
+    principal: &Principal,
+    id: &str,
+) -> Result<Value, ApiError> {
+    let pipeline = pipelines::get_pipeline_in_tenants(pool(state)?, id, &principal.tenant_ids)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
+    if pipeline.status != "ready" {
+        let fix = match pipeline.status.as_str() {
+            "draft" => "activate it first",
+            "paused" => "resume it first",
+            _ => "only a ready pipeline can run",
+        };
+        return Err(ApiError::Conflict(format!(
+            "this pipeline is {}, so it cannot run; {fix}",
+            pipeline.status
+        )));
+    }
+    // One run at a time per pipeline, checked against Dagster's own run
+    // list. Not a lock: two requests in the same instant can both pass,
+    // which the console's disabled button covers.
+    let recent = state
+        .dagster
+        .list_runs_for_job_with_config(AUTHORED_JOB, RECENT_AUTHORED_RUNS)
+        .await
+        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+    if let Some(active) = authored_runs(&recent, id)
+        .into_iter()
+        .find(|run| matches!(map_run_status(&run.status), "queued" | "running"))
+    {
+        return Err(ApiError::Conflict(format!(
+            "a run of this pipeline is already {} (run {}); wait for it to finish before \
+             starting another",
+            map_run_status(&active.status),
+            active.run_id.get(..8).unwrap_or(&active.run_id),
+        )));
+    }
+    let outcome = state
+        .dagster
+        .launch_run_with_config(AUTHORED_JOB, &authored_run_config(id))
+        .await
+        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+    if let Some(error) = outcome.error {
+        return Err(ApiError::Unprocessable(error));
+    }
+    Ok(json!({
+        "id": outcome.run_id,
+        "pipelineId": id,
+        "status": map_run_status("STARTED"),
+        "startedAt": now_iso(),
+        // Same as run_to_json: see the note there.
+        "processed": Value::Null,
+        "accepted": Value::Null,
+        "rejected": Value::Null,
+        "retried": Value::Null,
+        "costUnits": Value::Null,
+    }))
+}
+
+/// `GET /api/pipelines/runnable` — every `ready` authored pipeline, in
+/// every tenant, with the definition its run executes. The route
+/// `authored_factory.py`'s `authored_pipeline_job` reads when a run starts,
+/// the way `ingest_job` reads `GET /api/connectors/ingestible`.
+///
+/// Gated on `pipeline:execute` (`POLICY_TABLE`), which only the
+/// orchestrator's service identity holds (`main::bootstrap_pipeline_run_
+/// service`): it is not tenant-scoped, so `pipeline:read` would let any
+/// console user read every tenant's definitions.
+///
+/// # Errors
+///
+/// 503 if no pool is configured; 500 on a database failure.
+pub async fn list_runnable(
+    State(state): State<AppState>,
+) -> ApiResult<ApiJson<Vec<pipelines::RunnablePipeline>>> {
+    Ok(ApiJson(
+        pipelines::list_runnable_pipelines(pool(&state)?).await?,
+    ))
+}
+
 /// `new Date().toISOString()` at the moment a run is launched.
 fn now_iso() -> String {
     #[allow(
@@ -815,10 +988,9 @@ fn now_iso() -> String {
 // ── Postgres-backed writes + Dagster mutations (Task 2.5) ──────────────
 //
 // createPipeline/generatePipelineFromPrompt author a `pipeline_definition`
-// row (Postgres) -- there is no generic "run an arbitrary pipeline" engine
-// behind Dagster to hand these to. cancelRun/retryRun/pausePipeline/
-// resumePipeline are real Dagster mutations against jobs/runs that already
-// exist there.
+// row (Postgres), which runs as `AUTHORED_JOB` once it is `ready` (see
+// `trigger_authored`). cancelRun/retryRun/pausePipeline/resumePipeline are
+// real Dagster mutations against jobs/runs that already exist there.
 
 /// Borrow the Postgres pool, or fail with a 503. Mirrors
 /// `routes::identity::pool`/`routes::governance::pool`.
@@ -890,6 +1062,18 @@ pub async fn create(
             ApiError::BadRequest(format!("invalid transform at transforms[{index}]: {err}"))
         })?;
     }
+    check_location(
+        "source",
+        &body.source_zone,
+        &body.source_table,
+        SOURCE_ZONES,
+    )?;
+    check_location(
+        "target",
+        &body.target_zone,
+        &body.target_table,
+        TARGET_ZONES,
+    )?;
     let tenant_id = creation_tenant(&principal, &headers)?;
     let connector_id = body
         .connector_id
@@ -922,6 +1106,35 @@ pub async fn create(
     // `pipeline:write`'s own `RequiresPermission` guarantee exactly.
     record_pipeline_audit(&state, &principal, "pipeline.create", &created.id).await;
     Ok((StatusCode::CREATED, ApiJson(created)))
+}
+
+/// Zones a pipeline may read from. `bronze` is the Iceberg layer connectors
+/// and uploads load, read through a `DataLakeCatalog` database; `silver` and
+/// `serving` are `ClickHouse` databases. `authored_factory.py` resolves each
+/// one to the table it actually reads.
+const SOURCE_ZONES: &[&str] = &["bronze", "silver", "serving"];
+
+/// Zones a pipeline may write into: the layers `ch_models.ALLOWED_SCHEMAS`
+/// lets a SQL model own. Gold marts live in `serving`. Bronze is written
+/// only by ingestion, and `console`/`lake` hold the product's own state.
+const TARGET_ZONES: &[&str] = &["silver", "serving"];
+
+/// Refuse a zone outside `zones` or a table name that is not a plain
+/// identifier, before anything is stored. The run would fail on either,
+/// but only after the pipeline had been saved and activated.
+fn check_location(side: &str, zone: &str, table: &str, zones: &[&str]) -> Result<(), ApiError> {
+    if !zones.contains(&zone) {
+        return Err(ApiError::BadRequest(format!(
+            "invalid {side} zone: pick one of {}",
+            zones.join(", ")
+        )));
+    }
+    lakehouse_core::ident::Ident::new(table).map_err(|err| {
+        ApiError::BadRequest(format!(
+            "invalid {side} table: {err} (use letters, digits and _)"
+        ))
+    })?;
+    Ok(())
 }
 
 /// The tenant a new pipeline belongs to: the creator's active tenant, the
@@ -3022,7 +3235,342 @@ mod tests {
                 "an invalid transform must write nothing to pipeline_definition"
             );
         }
+
+        /// A zone the run cannot read or write, or a table name that is not
+        /// an identifier, is refused before anything is stored — and the
+        /// refusal does not echo what was sent.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn create_pipeline_rejects_a_location_the_run_cannot_use(pool: sqlx::PgPool) {
+            for (field, value) in [
+                ("sourceZone", "lake"),
+                ("targetZone", "gold"),
+                ("targetZone", "bronze"),
+                ("sourceTable", "orders; DROP TABLE x"),
+                ("targetTable", ""),
+            ] {
+                let mut body = json!({
+                    "name": format!("create-route-test-{}", uuid::Uuid::new_v4()),
+                    "kind": "batch",
+                    "sourceZone": "bronze",
+                    "sourceTable": "t",
+                    "targetZone": "silver",
+                    "targetTable": "t",
+                    "schedule": "manual",
+                });
+                body[field] = json!(value);
+                let err = create(
+                    State(state_for(&pool)),
+                    Extension(fixture_member_principal()),
+                    HeaderMap::new(),
+                    Bytes::from(serde_json::to_vec(&body).expect("serialize")),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(err.0.status(), 400, "{field} = {value:?}");
+                assert!(
+                    !err.0.to_string().contains("DROP TABLE"),
+                    "error must not echo the untrusted payload text"
+                );
+            }
+            let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM pipeline_definition")
+                .fetch_one(&pool)
+                .await
+                .expect("count pipelines");
+            assert_eq!(count, 0, "a refused location must write nothing");
+        }
     }
+
+    /// An authored pipeline runs as the shared `authored_pipeline_job`,
+    /// pointed at it by run config: `POST /api/pipelines/{pl-id}/trigger`
+    /// launches it, `GET /api/pipelines/{pl-id}/runs` finds its runs, and
+    /// `GET /api/pipelines/runnable` is what the job reads its definition
+    /// from. Real Postgres, `wiremock` for `Dagster`.
+    mod authored_run_route {
+        use std::collections::HashMap;
+
+        use lakehouse_test_support as _;
+        use wiremock::matchers::body_string_contains;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use crate::config::Config;
+        use crate::state::AppState;
+
+        use super::*;
+
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database")
+            )
+        }
+
+        fn state_for(pool: &sqlx::PgPool, dagster_uri: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            env.insert("DAGSTER_URL".to_owned(), format!("{dagster_uri}/graphql"));
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        /// Create a pipeline in [`SEED_TENANT`], `ready` unless `draft`.
+        async fn authored_pipeline(state: &AppState, pool: &sqlx::PgPool, draft: bool) -> String {
+            let body = json!({
+                "name": format!("run-route-test-{}", uuid::Uuid::new_v4()),
+                "kind": "batch",
+                "sourceZone": "bronze",
+                "sourceTable": "orders",
+                "transforms": ["select(id,amount)"],
+                "targetZone": "silver",
+                "targetTable": "orders_clean",
+                "schedule": "manual",
+            });
+            let (_, ApiJson(created)) = create(
+                State(state.clone()),
+                Extension(fixture_member_principal()),
+                HeaderMap::new(),
+                Bytes::from(serde_json::to_vec(&body).expect("serialize")),
+            )
+            .await
+            .expect("create should succeed");
+            if !draft {
+                pipelines::set_status(pool, &created.id, "ready")
+                    .await
+                    .expect("set ready");
+            }
+            created.id
+        }
+
+        fn run(run_id: &str, status: &str, pipeline_id: &str) -> Value {
+            json!({
+                "runId": run_id,
+                "status": status,
+                "startTime": 1_790_670_111.0,
+                "endTime": if status == "SUCCESS" { json!(1_790_670_153.0) } else { Value::Null },
+                "runConfig": authored_run_config(pipeline_id),
+            })
+        }
+
+        async fn mount_runs(server: &MockServer, runs: Value) {
+            Mock::given(body_string_contains("runsOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "runsOrError": { "__typename": "Runs", "results": runs } }
+                })))
+                .mount(server)
+                .await;
+        }
+
+        /// A `launchRun` for `pipeline_id`, expected exactly `times` times
+        /// (checked when `server` drops).
+        async fn mount_launch(server: &MockServer, pipeline_id: &str, times: u64) {
+            Mock::given(body_string_contains("launchRun"))
+                .and(body_string_contains(AUTHORED_JOB))
+                .and(body_string_contains(format!(
+                    "\"pipeline_id\":\"{pipeline_id}\""
+                )))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "launchRun": {
+                        "__typename": "LaunchRunSuccess", "run": { "runId": "run-new" }
+                    } }
+                })))
+                .expect(times)
+                .mount(server)
+                .await;
+        }
+
+        async fn body_json(response: Response) -> Value {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            serde_json::from_slice(&bytes).expect("valid JSON")
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn trigger_launches_the_shared_job_pointed_at_the_pipeline(pool: sqlx::PgPool) {
+            let server = MockServer::start().await;
+            let state = state_for(&pool, &server.uri());
+            let id = authored_pipeline(&state, &pool, false).await;
+            mount_runs(&server, json!([run("old", "SUCCESS", &id)])).await;
+            mount_launch(&server, &id, 1).await;
+
+            let response = trigger(
+                State(state),
+                Some(Extension(fixture_member_principal())),
+                Path(id.clone()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            assert_eq!(body["id"], "run-new");
+            assert_eq!(body["pipelineId"], id);
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn trigger_refuses_a_draft_without_launching(pool: sqlx::PgPool) {
+            let server = MockServer::start().await;
+            let state = state_for(&pool, &server.uri());
+            let id = authored_pipeline(&state, &pool, true).await;
+            mount_launch(&server, &id, 0).await;
+
+            let response = trigger(
+                State(state),
+                Some(Extension(fixture_member_principal())),
+                Path(id),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = body_json(response).await;
+            assert!(
+                body["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("activate it first")),
+                "{body}"
+            );
+        }
+
+        /// Another tenant's pipeline answers exactly like an unknown id.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn trigger_hides_another_tenants_pipeline(pool: sqlx::PgPool) {
+            let server = MockServer::start().await;
+            let state = state_for(&pool, &server.uri());
+            let id = authored_pipeline(&state, &pool, false).await;
+            mount_launch(&server, &id, 0).await;
+
+            let outsider = principal_with_tenants(&[Uuid::from_u128(99)]);
+            let response = trigger(State(state), Some(Extension(outsider)), Path(id)).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn trigger_refuses_while_a_run_of_the_pipeline_is_active(pool: sqlx::PgPool) {
+            let server = MockServer::start().await;
+            let state = state_for(&pool, &server.uri());
+            let id = authored_pipeline(&state, &pool, false).await;
+            mount_runs(
+                &server,
+                json!([
+                    run("other", "STARTED", "pl-other"),
+                    run("mine-1234567", "STARTED", &id)
+                ]),
+            )
+            .await;
+            mount_launch(&server, &id, 0).await;
+
+            let response = trigger(
+                State(state),
+                Some(Extension(fixture_member_principal())),
+                Path(id),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = body_json(response).await;
+            assert!(
+                body["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("mine-123")),
+                "{body}"
+            );
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn runs_lists_only_this_pipelines_runs(pool: sqlx::PgPool) {
+            let server = MockServer::start().await;
+            let state = state_for(&pool, &server.uri());
+            mount_runs(
+                &server,
+                json!([
+                    run("r3", "STARTED", "pl-mine"),
+                    run("r2", "SUCCESS", "pl-other"),
+                    run("r1", "SUCCESS", "pl-mine"),
+                ]),
+            )
+            .await;
+
+            let body = body_json(runs(State(state), Path("pl-mine".to_owned())).await).await;
+            let ids: Vec<&str> = body["runs"]
+                .as_array()
+                .expect("runs array")
+                .iter()
+                .filter_map(|r| r["id"].as_str())
+                .collect();
+            assert_eq!(ids, ["r3", "r1"]);
+            assert_eq!(body["runs"][0]["status"], "running");
+            assert_eq!(body["runs"][1]["pipelineId"], "pl-mine");
+        }
+
+        /// A draft is not runnable; a ready pipeline is, with everything
+        /// its run executes.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn runnable_lists_ready_pipelines_with_their_definition(pool: sqlx::PgPool) {
+            let server = MockServer::start().await;
+            let state = state_for(&pool, &server.uri());
+            let draft = authored_pipeline(&state, &pool, true).await;
+            let ready = authored_pipeline(&state, &pool, false).await;
+
+            let ApiJson(runnable) = list_runnable(State(state)).await.expect("list runnable");
+            let value = serde_json::to_value(&runnable).expect("serialize");
+            let listed = value.as_array().expect("array");
+            assert!(listed.iter().all(|p| p["id"] != draft.as_str()));
+            let entry = listed
+                .iter()
+                .find(|p| p["id"] == ready.as_str())
+                .expect("the ready pipeline is runnable");
+            assert_eq!(entry["definition"]["sourceZone"], "bronze");
+            assert_eq!(entry["definition"]["sourceTable"], "orders");
+            assert_eq!(entry["definition"]["targetZone"], "silver");
+            assert_eq!(
+                entry["definition"]["transforms"],
+                json!(["select(id,amount)"])
+            );
+        }
+    }
+
+    /// The list shows an authored pipeline's newest run, which only
+    /// `Dagster` knows: nothing writes a run back to Postgres.
+    #[test]
+    fn authored_row_takes_last_run_from_the_newest_run_of_that_pipeline() {
+        let pipeline = pipelines::Pipeline {
+            id: "pl-mine".to_owned(),
+            name: "mine".to_owned(),
+            kind: "batch".to_owned(),
+            status: "ready".to_owned(),
+            owner: "Current user".to_owned(),
+            source: "bronze.orders".to_owned(),
+            target: "silver.orders".to_owned(),
+            connector_id: None,
+            source_asset_id: None,
+            target_asset_id: None,
+            schedule: "manual".to_owned(),
+            last_run_at: None,
+            next_run_at: None,
+            sla_ok: None,
+            freshness_lag_seconds: None,
+            description: None,
+        };
+        let configured = |run_id: &str, start: f64, pipeline_id: &str| DgConfiguredRun {
+            run_id: run_id.to_owned(),
+            status: "SUCCESS".to_owned(),
+            start_time: Some(start),
+            end_time: None,
+            run_config: authored_run_config(pipeline_id),
+        };
+        let runs = [
+            configured("r3", 1_790_670_300.0, "pl-other"),
+            configured("r2", 1_790_670_200.0, "pl-mine"),
+            configured("r1", 1_790_670_100.0, "pl-mine"),
+        ];
+        let row = authored_row(&pipeline, &runs).expect("serializes");
+        assert_eq!(row["lastRunAt"], "2026-09-29T08:23:20.000Z");
+
+        let never = authored_row(&pipeline, &[]).expect("serializes");
+        assert!(never["lastRunAt"].is_null());
+    }
+
     /// WS4 item D4 — `POST /api/pipelines/{id}/status`'s
     /// `ALLOWED_TRANSITIONS` table, exercised against a real Postgres.
     mod status_route {
