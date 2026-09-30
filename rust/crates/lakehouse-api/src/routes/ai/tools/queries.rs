@@ -32,7 +32,7 @@ pub(super) async fn save_query(state: &AppState, args: &Map<String, Value>) -> V
     let title = arg_str(args, "title");
     let sql = arg_str(args, "sql");
     if title.is_empty() || sql.is_empty() {
-        return json!({ "error": "title dan sql wajib diisi" });
+        return json!({ "error": "title and sql are required" });
     }
     let owner = {
         let o = arg_str(args, "owner");
@@ -81,7 +81,7 @@ pub(super) async fn run_saved_query(
 ) -> Value {
     let id = arg_str(args, "id");
     if id.is_empty() {
-        return json!({ "error": "id wajib diisi" });
+        return json!({ "error": "id is required" });
     }
     let pool = match pool(state) {
         Ok(p) => p,
@@ -150,7 +150,7 @@ mod tests {
         let state = state_without_pool();
         assert_eq!(
             save_query(&state, &Map::new()).await,
-            json!({ "error": "title dan sql wajib diisi" })
+            json!({ "error": "title and sql are required" })
         );
     }
 
@@ -159,7 +159,7 @@ mod tests {
         let state = state_without_pool();
         assert_eq!(
             run_saved_query(&state, None, &Map::new()).await,
-            json!({ "error": "id wajib diisi" })
+            json!({ "error": "id is required" })
         );
     }
 

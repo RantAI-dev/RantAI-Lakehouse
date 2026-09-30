@@ -7,10 +7,17 @@ import { parseTimestamp } from "@/lib/format"
 export function plainPreview(markdown: string, max = 160): string {
   const text = markdown
     .replace(/```[\s\S]*?```/g, " ")
+    // Citation markers (`lib/citation-markers.ts`) wrap an unbacked number
+    // in a span; a preview keeps the number and drops the tag.
+    .replace(/<span data-unverified="true">([^<]*)<\/span>/g, "$1")
     .replace(/`([^`]*)`/g, "$1")
     .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
     .replace(/^\s{0,3}(#{1,6}|>|[-*+]|\d+\.)\s+/gm, "")
-    .replace(/(\*\*|__|\*|_|~~)/g, "")
+    // Only paired emphasis markers go: a blanket strip of `_` turned
+    // identifiers like `serving.mart_event` into `serving.martevent`.
+    .replace(/(\*\*|__|~~)(.+?)\1/g, "$2")
+    .replace(/(^|[^\w*])\*(?!\s)([^*\n]+?)\*(?!\w)/g, "$1$2")
+    .replace(/(^|[^\w])_(?!\s)([^\n]+?)_(?!\w)/g, "$1$2")
     .replace(/\s+/g, " ")
     .trim()
   return text.length > max ? `${text.slice(0, max - 1).trimEnd()}…` : text

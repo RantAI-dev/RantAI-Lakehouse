@@ -141,6 +141,9 @@ pub(crate) fn render_stored_spec(spec: &store::ChartSpec, source: ChartSource) -
     map.insert("title".to_owned(), json!(spec.title));
     map.insert("kind".to_owned(), json!(spec.kind));
     map.insert("mart".to_owned(), json!(spec.mart));
+    if let Some(v) = &spec.sql_source {
+        map.insert("sqlSource".to_owned(), json!(v));
+    }
     map.insert("x".to_owned(), json!(spec.x));
     map.insert("y".to_owned(), json!(spec.y));
     map.insert("source".to_owned(), json!(source));
@@ -218,6 +221,60 @@ pub(crate) async fn run_spec_sql(
         }
         Err(err) => (id.to_owned(), json!({ "error": err.to_string() })),
     }
+}
+
+/// The dashboard SQL sources the given charts read, by id — one
+/// `console.bi_source` read, and none at all when no chart uses a source.
+///
+/// # Errors
+///
+/// Returns [`ChError`] on a `ClickHouse` failure.
+pub(crate) async fn sources_for<'a>(
+    ch: &ChClient,
+    charts: impl IntoIterator<Item = &'a store::StoredChartSpec>,
+) -> Result<HashMap<String, lakehouse_bi::sources::SqlSource>, ChError> {
+    if !charts.into_iter().any(|c| c.def.sql_source.is_some()) {
+        return Ok(HashMap::new());
+    }
+    Ok(lakehouse_bi::sources::list_sources(ch)
+        .await?
+        .into_iter()
+        .map(|s| (s.id.clone(), s))
+        .collect())
+}
+
+/// The SQL to run for a stored chart right now: a mart chart through
+/// `sql_with_filters` (unchanged), a SQL-source chart rebuilt from the
+/// source's CURRENT text (`sql_for_sql_source`). `Err` carries a fixed tile
+/// error when the source was deleted or the stored definition no longer
+/// validates — reported on that tile, never replaced by other SQL.
+///
+/// # Errors
+///
+/// The tile's fixed error message.
+pub(crate) fn stored_chart_sql(
+    chart: &store::StoredChartSpec,
+    years: &[i64],
+    filters: &[store::FilterDef],
+    mart_cols: &HashMap<String, HashSet<String>>,
+    sources: &HashMap<String, lakehouse_bi::sources::SqlSource>,
+) -> Result<String, &'static str> {
+    let Some(id) = chart.def.sql_source.as_deref() else {
+        return Ok(lakehouse_bi::builder::sql_with_filters(
+            chart, years, filters, mart_cols,
+        ));
+    };
+    let source = sources
+        .get(id)
+        .ok_or("this chart's SQL source no longer exists")?;
+    lakehouse_bi::builder::sql_for_sql_source(
+        chart,
+        &source.sql,
+        &source.column_names(),
+        years,
+        filters,
+    )
+    .ok_or("this chart's definition is invalid")
 }
 
 /// `SELECT table, name FROM system.columns WHERE database='serving'`,

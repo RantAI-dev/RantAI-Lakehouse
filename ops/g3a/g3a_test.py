@@ -319,7 +319,7 @@ def step_verify_format_version_2() -> None:
 def step_verify_run_audited() -> None:
     """The run is recorded via the governance/audit surface (Dagster run
     history) — a run-list check, distinct from lineage (see
-    `step_verify_lineage_is_honestly_unsupported` below). PR #29 review: this step used
+    `step_verify_lineage_is_recorded_not_guessed` below). PR #29 review: this step used
     to be labeled "lineage recorded" while reading `/api/governance/audit`
     (a run list), never `/api/governance/lineage` — that claim is corrected
     here by naming this step for what it actually checks, and adding a
@@ -337,28 +337,61 @@ def step_verify_run_audited() -> None:
     print("[g3a] run recorded in GET /api/governance/audit")
 
 
-def step_verify_lineage_is_honestly_unsupported() -> None:
-    """`GET /api/governance/lineage?focus=<slug>` must report lineage as
-    unsupported, not draw a graph. `routes/governance.rs::lineage_unsupported`
-    replaced a source -> Bronze -> Silver chain that was derived from naming
-    conventions rather than captured, so it read as fact without being one.
-    Until real lineage capture exists, the only honest answer is
-    `supported: false` with a reason, the focus node alone and no edges;
-    this step fails if a guessed graph ever comes back."""
+# Edge kinds `routes/lineage.rs` draws, each from a record it names in the
+# edge's `evidence`. Anything else is a guess.
+RECORDED_LINEAGE_EDGE_KINDS = {"publisher", "catalog", "ingest", "pipeline", "view", "export"}
+
+
+def step_verify_lineage_is_recorded_not_guessed() -> None:
+    """`GET /api/governance/lineage?focus=<slug>` must never draw a guessed
+    graph. `routes/governance.rs::lineage_unsupported` once replaced a
+    source -> Bronze -> Silver chain derived from naming conventions; since
+    `routes/lineage.rs` (recorded lineage), the route draws an edge only
+    where the platform holds a record of it (dataset sync author, catalog
+    registry, ingest spec, authored pipeline, view definition, Gold export
+    run) and names that record in the edge's `evidence`.
+
+    Two honest answers are accepted: `supported: false` with a reason, the
+    focus node alone and no edges; or `supported: true` where the focus is
+    present, every edge is one of the recorded kinds with non-empty
+    evidence, and a `coverage` note says what is not drawn. This step
+    replaces `step_verify_lineage_is_honestly_unsupported`, whose
+    "supported:false only" expectation predates recorded lineage; its guard
+    against a guessed graph is kept, not dropped."""
     slug = BRONZE_TABLE_NAME.replace("_", "-")
     resp = API.get(f"{API_URL}/api/governance/lineage", params={"focus": slug}, timeout=10)
     if not resp.ok:
         raise G3aFailure(f"GET /api/governance/lineage failed: {resp.status_code} {resp.text}")
     body = resp.json()
-    if body.get("supported") is not False or not body.get("reason"):
-        raise G3aFailure(f"lineage must say supported:false with a reason, got: {body}")
-    node_ids = [n.get("id") for n in body.get("nodes", [])]
-    if node_ids != [slug] or body.get("edges"):
-        raise G3aFailure(
-            f"unsupported lineage must carry only the focus node and no edges, got nodes "
-            f"{node_ids} edges {body.get('edges')}"
-        )
-    print(f"[g3a] GET /api/governance/lineage?focus={slug}: supported=false ({body['reason']})")
+    nodes = body.get("nodes", [])
+    edges = body.get("edges") or []
+    node_ids = [n.get("id") for n in nodes]
+    if body.get("supported") is False:
+        if not body.get("reason"):
+            raise G3aFailure(f"unsupported lineage must carry a reason, got: {body}")
+        if node_ids != [slug] or edges:
+            raise G3aFailure(
+                f"unsupported lineage must carry only the focus node and no edges, got nodes "
+                f"{node_ids} edges {edges}"
+            )
+        print(f"[g3a] GET /api/governance/lineage?focus={slug}: supported=false ({body['reason']})")
+        return
+    if body.get("supported") is not True:
+        raise G3aFailure(f"lineage must say supported true or false, got: {body}")
+    if not any(n.get("kind") == "focus" for n in nodes):
+        raise G3aFailure(f"recorded lineage must include the focus node, got nodes {node_ids}")
+    if not body.get("coverage"):
+        raise G3aFailure(f"recorded lineage must say what it does not draw (coverage), got: {body}")
+    known = set(node_ids)
+    for edge in edges:
+        if edge.get("kind") not in RECORDED_LINEAGE_EDGE_KINDS or not str(edge.get("evidence") or "").strip():
+            raise G3aFailure(f"lineage edge is not backed by a named record: {edge}")
+        if edge.get("from") not in known or edge.get("to") not in known:
+            raise G3aFailure(f"lineage edge points at a node the response does not carry: {edge}")
+    print(
+        f"[g3a] GET /api/governance/lineage?focus={slug}: supported=true, "
+        f"{len(edges)} recorded edge(s): {sorted({e['kind'] for e in edges})}"
+    )
 
 
 def main() -> int:
@@ -372,7 +405,7 @@ def main() -> int:
         step_verify_format_version_2()
         step_verify_catalog_visibility()
         step_verify_run_audited()
-        step_verify_lineage_is_honestly_unsupported()
+        step_verify_lineage_is_recorded_not_guessed()
     except G3aFailure as exc:
         print(f"[g3a] FAILED: {exc}", file=sys.stderr)
         return 1

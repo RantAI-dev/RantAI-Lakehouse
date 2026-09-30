@@ -10,9 +10,13 @@ import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTi
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { summarizeFilters, summarizeTiles } from "@/lib/page-context-summary";
 import type { ChartRenderSpec, ChartSource } from "@/lib/dashboard-specs";
 import type { LayoutMap, FilterDef } from "@/services/clients/bi-store";
 import { useCopilot } from "@/features/copilot/use-copilot";
+import { useAuth } from "@/features/auth/auth-provider";
+import { useService } from "@/hooks/use-service";
+import { dashboardService } from "@/services";
 import { apiFetch } from "@/services/http";
 import { useAutoRefresh } from "./auto-refresh";
 import { BoardSwitcher } from "./board-switcher";
@@ -22,14 +26,16 @@ import { DashboardActionsMenu, RenameDashboardDialog } from "./dashboard-actions
 import { notifyDashboardsChanged, useDashboardsChanged } from "./dashboard-events";
 import { DashboardFilters } from "./dashboard-filters";
 import { DashboardGrid, type GridItem, type TileMenuItem } from "./dashboard-grid";
+import { DashboardTilesSkeleton } from "./dashboard-skeleton";
 import { DrillMenu, RecordsDialog, fetchRecords, type DrillTarget, type RecordsState } from "./drill";
 import { forgetLastBoard, rememberLastBoard } from "./last-board";
+import { ManageFoldersDialog, MoveBoardDialog } from "./folder-dialogs";
 import { ShareDialog } from "./share-dialog";
 import { TileBody } from "./tile-body";
 import { TileDataDialog, TileExpandDialog, downloadRowsCsv, hasRows, type Cell } from "./tile-dialogs";
 
 type KpiMeta = { id: string; title: string; caption?: string; format: string };
-type BoardOpt = { id: string; name: string };
+type BoardOpt = { id: string; name: string; folderId?: string | null };
 type ChartCard = ChartRenderSpec & { board?: string; def?: ChartDef };
 type Payload = {
   board: string; years: number[]; layout: LayoutMap; filters: FilterDef[]; filterColumns: string[];
@@ -44,6 +50,7 @@ const SOURCE_BADGE: Record<ChartSource, { label: string; cls: string } | null> =
 };
 const NO_CHARTS: ChartCard[] = [];
 const NO_KPIS: KpiMeta[] = [];
+const NO_RESULTS: Record<string, Cell> = {};
 
 /**
  * The column a click on this tile's data drills into, if any: category
@@ -51,7 +58,8 @@ const NO_KPIS: KpiMeta[] = [];
  * real mart column — except on time series, whose axis is a derived period.
  */
 function drillColumn(spec: ChartCard): string | undefined {
-  if (["geomap", "table", "kpi", "gauge", "text"].includes(spec.kind)) return undefined;
+  // Nodes, rings, distributions and days are not one category value to drill into.
+  if (["geomap", "table", "kpi", "gauge", "text", "sankey", "sunburst", "boxplot", "calendar"].includes(spec.kind)) return undefined;
   if (spec.source !== "builtin") return spec.def?.dimension || undefined;
   return ["line", "area"].includes(spec.kind) ? undefined : spec.x || undefined;
 }
@@ -86,12 +94,20 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   const [removing, setRemoving] = React.useState<{ id: string; title: string } | null>(null);
   const [removeBusy, setRemoveBusy] = React.useState(false);
   const [renameOpen, setRenameOpen] = React.useState(false);
+  const [foldersOpen, setFoldersOpen] = React.useState(false);
+  const [moveOpen, setMoveOpen] = React.useState(false);
+  // Folders are listed to everyone who can see dashboards; filing needs
+  // dashboard:write, which the API enforces (policy.rs).
+  const { hasPermission } = useAuth();
+  const canFile = hasPermission("dashboard:write");
+  const foldersState = useService((signal) => dashboardService.listFolders(signal), []);
+  const folders = foldersState.data ?? [];
   const [shareOpen, setShareOpen] = React.useState(false);
   const [newChartOpen, setNewChartOpen] = React.useState(false);
   const [fullscreen, setFullscreen] = React.useState(false);
   const [autoSec, setAutoSec] = React.useState("0");
   // Drill / cross-filter: menu on data-point click + a modal of raw rows.
-  const [drill, setDrill] = React.useState<(DrillTarget & { builtin: boolean }) | null>(null);
+  const [drill, setDrill] = React.useState<(DrillTarget & { builtin: boolean; sqlSource: boolean }) | null>(null);
   const [records, setRecords] = React.useState<RecordsState | null>(null);
   const [tileDialog, setTileDialog] = React.useState<{ kind: "data" | "expand"; id: string } | null>(null);
   // Years the Gold data actually covers (the payload's `years` is only the
@@ -108,7 +124,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     return () => { cancelled = true; };
   }, []);
 
+  // Only the newest load may write state. Creating a dashboard fires a
+  // reload of the board being left and then navigates to the new one; the
+  // old board's response (slower: it runs the built-in tiles) used to land
+  // last and paint its charts under the new dashboard's name.
+  const loadSeq = React.useRef(0);
   const load = React.useCallback(async () => {
+    const seq = ++loadSeq.current;
     setLoading(true); setError(null);
     try {
       const q = new URLSearchParams({ board });
@@ -116,6 +138,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       if (!adoptingRef.current && filtersRef.current.length) q.set("filters", JSON.stringify(filtersRef.current));
       const res = await apiFetch(`/api/dashboard?${q.toString()}`, { cache: "no-store" });
       const json = (await res.json()) as Payload;
+      if (seq !== loadSeq.current) return;
       if (!res.ok) throw new Error((json as { error?: string }).error ?? "Failed to load dashboard");
       setData(json);
       setLayout(json.layout ?? {});
@@ -125,9 +148,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
         adoptingRef.current = false;
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (seq === loadSeq.current) setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      if (seq === loadSeq.current) setLoading(false);
     }
   }, [board, year]);
 
@@ -140,8 +163,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // dicapai lewat switcher, tautan bersama dan Copilot.
   React.useEffect(() => { rememberLastBoard(board); }, [board]);
   React.useEffect(() => { void load(); }, [load]);
-  // Charts added or removed elsewhere (Copilot, board menus).
-  useDashboardsChanged(React.useCallback(() => { void load(); }, [load]));
+  // Charts added or removed elsewhere (Copilot, board menus); folders are
+  // reloaded too, since the same event covers filing a dashboard.
+  const reloadFolders = foldersState.reload;
+  useDashboardsChanged(React.useCallback(() => { void load(); reloadFolders(); }, [load, reloadFolders]));
   // Periodic refresh for presenting; pauses while the tab is hidden.
   useAutoRefresh(Number(autoSec) * 1000, load);
   // Esc exits fullscreen.
@@ -263,13 +288,21 @@ export function DashboardPage({ boardId }: { boardId: string }) {
   // context effect, which re-rendered this page, forever, while loading.
   const kpis = data?.kpis ?? NO_KPIS;
   const charts = data?.charts ?? NO_CHARTS;
+  const results = data?.results ?? NO_RESULTS;
 
   // Tell Copilot what is on this dashboard — the built-in one included.
   const { setPageContext, setMode: setCopilotMode, setExpanded: setCopilotExpanded } = useCopilot();
   React.useEffect(() => {
-    const tiles = charts
-      .map((c) => `"${c.title}" (${c.kind}${c.source !== "builtin" ? `, id ${c.id}` : ", built-in, not editable"})`)
-      .join("; ");
+    // The numbers on screen, not just tile titles (plan §6): KPIs and tiles
+    // with their first rows, and the filters in force. Built from data this
+    // page already loaded; nothing extra is queried.
+    const tiles = summarizeTiles(
+      [
+        ...kpis.map((k) => ({ id: k.id, title: k.title, kind: "kpi", source: "builtin" })),
+        ...charts,
+      ],
+      results,
+    );
     setPageContext({
       key: "dashboard-view",
       title: `Working on "${dashName}"`,
@@ -280,12 +313,13 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       },
       system:
         `The user is viewing the dashboard "${dashName}" (board id: ${board}). ` +
-        `Tiles: ${tiles || "none yet"}. ` +
+        `Active filters: ${summarizeFilters(filters, year)}. ` +
+        `Tiles and the data they currently show (built-in tiles are not editable):\n${tiles || "none yet"}\n` +
         `When creating a chart use board="${board}". To change a tile you created, use update_chart with its id. ` +
         `You can also explain what the charts show.`,
     });
     return () => setPageContext(null);
-  }, [board, dashName, charts, setPageContext]);
+  }, [board, dashName, charts, kpis, results, filters, year, setPageContext]);
 
   // Build the tiles for the grid.
   const items: GridItem[] = charts.map((spec) => {
@@ -309,6 +343,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
     ];
     return {
       id: spec.id,
+      span: spec.span,
       title: spec.title,
       subtitle: spec.subtitle,
       hint: drillable ? (
@@ -331,14 +366,14 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             </span>
           ) : null}
           {/* The source table is detail for whoever arranges the board. */}
-          {edit ? <span className="hidden rounded-full border px-2 py-0.5 font-mono text-[10px] text-muted-foreground sm:inline">{spec.mart}</span> : null}
+          {edit ? <span className="hidden rounded-full border px-2 py-0.5 font-mono text-[10px] text-muted-foreground sm:inline">{spec.sqlSource ? "SQL source" : spec.mart}</span> : null}
         </div>
       ),
-      menuLabel: spec.mart ? `Source: ${spec.mart}` : undefined,
+      menuLabel: spec.sqlSource ? "Source: SQL source" : spec.mart ? `Source: ${spec.mart}` : undefined,
       menu,
       body: (
         <TileBody spec={spec} cell={cell} dark={dark} loading={loading} year={year}
-          onDataClick={dim ? (name, pos) => setDrill({ name, column: dim, mart: spec.mart, x: pos.x, y: pos.y, builtin: spec.source === "builtin" }) : undefined} />
+          onDataClick={dim ? (name, pos) => setDrill({ name, column: dim, mart: spec.mart, x: pos.x, y: pos.y, builtin: spec.source === "builtin", sqlSource: !!spec.sqlSource }) : undefined} />
       ),
     };
   });
@@ -356,7 +391,10 @@ export function DashboardPage({ boardId }: { boardId: string }) {
             activeName={dashName}
             onSelect={(id) => router.push(`/dashboards/${id}`)}
             onCreate={() => void createDashboard()}
+            folders={folders}
+            onManageFolders={canFile ? () => setFoldersOpen(true) : undefined}
           />
+
         }
         actions={
           <span data-print-hide className="contents">
@@ -372,6 +410,7 @@ export function DashboardPage({ boardId }: { boardId: string }) {
               onToggleFullscreen={() => setFullscreen((f) => !f)}
               onAutoSec={setAutoSec}
               onRename={() => setRenameOpen(true)}
+              onMove={canFile ? () => setMoveOpen(true) : undefined}
               onShare={() => setShareOpen(true)}
               onExportPdf={exportPdf}
               onDuplicate={() => void duplicateDashboard()}
@@ -418,7 +457,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       ) : null}
 
       {/* Canvas */}
-      {!loading && charts.length === 0 ? (
+      {loading && charts.length === 0 ? (
+        <DashboardTilesSkeleton />
+      ) : !loading && charts.length === 0 ? (
         <Empty className="border border-dashed">
           <EmptyHeader>
             <EmptyMedia variant="icon">
@@ -484,7 +525,9 @@ export function DashboardPage({ boardId }: { boardId: string }) {
           drill={drill}
           onClose={() => setDrill(null)}
           onFilter={drill.builtin ? undefined : () => crossFilter(drill.column, drill.name)}
-          onRecords={() => void openRecords(drill.mart, drill.column, drill.name)}
+          // Records drill-down over a SQL source is not supported yet (the API
+          // answers `supported: false`); offer only the cross-filter there.
+          onRecords={drill.sqlSource ? undefined : () => void openRecords(drill.mart, drill.column, drill.name)}
         />
       ) : null}
       <RecordsDialog records={records} onClose={() => setRecords(null)} />
@@ -499,6 +542,24 @@ export function DashboardPage({ boardId }: { boardId: string }) {
       {!isDefault ? <ShareDialog board={board} dashName={dashName} open={shareOpen} onOpenChange={setShareOpen} /> : null}
       {renameOpen ? (
         <RenameDashboardDialog open={renameOpen} onOpenChange={setRenameOpen} currentName={dashName} onSave={(n) => void renameDashboard(n)} />
+      ) : null}
+      {canFile ? (
+        <ManageFoldersDialog
+          open={foldersOpen}
+          onOpenChange={setFoldersOpen}
+          folders={folders}
+          onChanged={notifyDashboardsChanged}
+        />
+      ) : null}
+      {canFile && !isDefault ? (
+        <MoveBoardDialog
+          open={moveOpen}
+          onOpenChange={setMoveOpen}
+          folders={folders}
+          boardId={board}
+          currentFolderId={boards.find((b) => b.id === board)?.folderId ?? ""}
+          onMoved={notifyDashboardsChanged}
+        />
       ) : null}
     </div>
   );

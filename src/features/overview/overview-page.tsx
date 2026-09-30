@@ -42,7 +42,7 @@ export function OverviewPage() {
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
-        title="Overview"
+        title="Health"
         description="Platform health across storage tiers, pipelines, queries, agents, and governance."
         actions={
           <div className="flex items-center gap-2">

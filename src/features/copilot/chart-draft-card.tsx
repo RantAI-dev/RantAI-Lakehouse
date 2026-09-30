@@ -31,6 +31,9 @@ export function chartDefFromArgs(args: Record<string, unknown>): ChartDef {
     title: str(args.title) ?? str(args.caption) ?? str(args.name) ?? "",
     subtitle: str(args.subtitle),
     mart: str(args.mart),
+    // A chart on a dashboard SQL source carries this instead of `mart`;
+    // without it the draft preview and "Edit in builder" saw an empty mart.
+    sqlSource: str(args.sqlSource),
     kind: str(args.kind) as ChartKind | undefined,
     dimension: str(args.dimension),
     measures,
@@ -130,7 +133,11 @@ export function ChartDraftCard({
 
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 border-t border-border px-3 py-2 text-muted-foreground">
         {def.kind ? <span className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px]">{def.kind}</span> : null}
-        {def.mart ? <span className="font-mono text-[10px]">{def.mart}</span> : null}
+        {def.sqlSource ? (
+          <span className="text-[10px]">SQL source</span>
+        ) : def.mart ? (
+          <span className="font-mono text-[10px]">{def.mart}</span>
+        ) : null}
         {def.dimension ? <span>by {def.dimension}</span> : null}
         {def.measures?.length ? (
           <span>· {def.aggregate ?? "sum"}({def.measures.join(", ")})</span>
