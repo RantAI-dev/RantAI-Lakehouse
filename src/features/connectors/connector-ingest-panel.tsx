@@ -85,6 +85,13 @@ const SCHEDULE_PRESETS: { value: string; label: string }[] = [
   { value: "0 2 * * *", label: "Every day at 02:00 UTC" },
 ]
 
+/** A saved schedule as the console words it: a preset's own label, or the
+ * cron itself, marked UTC. */
+export function scheduleLabel(cron: string | null): string {
+  if (!cron) return "Manual only"
+  return SCHEDULE_PRESETS.find((p) => p.value === cron)?.label ?? `${cron} (UTC)`
+}
+
 const RUN_TONE: Record<string, "success" | "destructive" | "warning" | "neutral"> = {
   succeeded: "success",
   failed: "destructive",
@@ -524,7 +531,7 @@ const POLL_MS = 3_000
 /** How long a run just launched is waited for before Dagster lists it. */
 const LAUNCH_GRACE_MS = 60_000
 
-const RUN_STATUS_LABEL: Record<IngestJobRun["status"], string> = {
+export const RUN_STATUS_LABEL: Record<IngestJobRun["status"], string> = {
   queued: "Queued",
   running: "Running",
   completed: "Completed",
@@ -533,7 +540,7 @@ const RUN_STATUS_LABEL: Record<IngestJobRun["status"], string> = {
   unknown: "Unknown",
 }
 
-const RUN_STATUS_TONE: Record<IngestJobRun["status"], "success" | "destructive" | "warning" | "neutral" | "info"> = {
+export const RUN_STATUS_TONE: Record<IngestJobRun["status"], "success" | "destructive" | "warning" | "neutral" | "info"> = {
   queued: "neutral",
   running: "info",
   completed: "success",
@@ -542,7 +549,7 @@ const RUN_STATUS_TONE: Record<IngestJobRun["status"], "success" | "destructive" 
   unknown: "neutral",
 }
 
-function isActive(run: IngestJobRun): boolean {
+export function isActive(run: IngestJobRun): boolean {
   return run.status === "queued" || run.status === "running"
 }
 

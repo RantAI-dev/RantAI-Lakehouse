@@ -7,7 +7,6 @@ import { DataTable } from "@/components/data-table/data-table"
 import { DataTableAdvancedToolbar } from "@/components/data-table/data-table-advanced-toolbar"
 import { DataTableSearch } from "@/components/data-table/data-table-search"
 import { DetailDrawer } from "@/components/patterns/detail-drawer"
-import { MetadataList } from "@/components/patterns/metadata-list"
 import { PageHeader } from "@/components/patterns/page-header"
 import {
   EmptyState,
@@ -16,20 +15,28 @@ import {
 } from "@/components/patterns/page-states"
 import { HealthBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useDataTable } from "@/hooks/use-data-table"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { useTableUrlState } from "@/hooks/use-table-url-state"
 import { filterDataClientSide } from "@/lib/data-table"
-import { formatRelativeTime } from "@/lib/format"
 import { withNotify } from "@/lib/notify"
 import { connectorService } from "@/services"
 import type { Connector } from "@/services/contracts/connectors"
 import { ConnectorDeleteDialog } from "./connector-delete-dialog"
 import { ConnectorIngestPanel } from "./connector-ingest-panel"
+import { ConnectorOverview } from "./connector-overview"
 import { ConnectorProbeHistoryPanel } from "./connector-probe-history-panel"
 import { DIRECTION_LABEL, getConnectorColumns } from "./connectors-columns"
 
-/** Drawer body — fetches full connector detail for the selected row. */
+type DrawerTab = "overview" | "ingest" | "tests"
+
+/**
+ * Drawer body — fetches full connector detail for the selected row. The
+ * status and actions stay on top; below, one tab each for the overview,
+ * what the connector ingests (kept mounted, so tables picked but not yet
+ * saved survive a look at another tab) and its connection tests.
+ */
 function ConnectorDetail({
   id,
   onDeleted,
@@ -39,6 +46,7 @@ function ConnectorDetail({
 }) {
   const state = useService((s) => connectorService.getConnector(id, s), [id])
   const [deleteOpen, setDeleteOpen] = useState(false)
+  const [tab, setTab] = useState<DrawerTab>("overview")
   const testAction = useServiceAction(
     withNotify(
       { success: "Connection test passed", error: "Connection test failed" },
@@ -52,12 +60,14 @@ function ConnectorDetail({
   if (state.status === "error")
     return <ErrorState error={state.error} onRetry={state.reload} />
   const c = state.data
+  const inUse = c.dependentPipelines.length
 
   return (
     <>
       <div className="flex flex-wrap items-center gap-2">
         <HealthBadge health={c.health} />
         <Pill tone="neutral">{DIRECTION_LABEL[c.direction]}</Pill>
+        {c.environment ? <Pill tone="neutral">{c.environment}</Pill> : null}
       </div>
       <div className="flex flex-wrap gap-2">
         <Button
@@ -91,6 +101,12 @@ function ConnectorDetail({
           size="sm"
           variant="ghost"
           className="text-destructive hover:text-destructive"
+          disabled={inUse > 0}
+          title={
+            inUse > 0
+              ? `Used by ${inUse} pipeline${inUse === 1 ? "" : "s"} (see Used by); those must be deleted or moved first`
+              : undefined
+          }
           onClick={() => setDeleteOpen(true)}
         >
           Delete
@@ -123,101 +139,24 @@ function ConnectorDetail({
           )}
         </p>
       ) : null}
-      <MetadataList
-        items={[
-          { label: "Type", value: c.type },
-          { label: "Direction", value: DIRECTION_LABEL[c.direction] },
-          { label: "Environment", value: c.environment },
-          { label: "Tenant", value: c.tenant },
-          { label: "Owner", value: c.owner },
-          {
-            label: "Last test",
-            value: c.lastTestAt === null ? "Never tested" : formatRelativeTime(c.lastTestAt),
-          },
-          {
-            label: "Last activity",
-            value: c.lastActivityAt === null ? "—" : formatRelativeTime(c.lastActivityAt),
-          },
-          { label: "Discovered assets", value: c.discoveredAssets },
-        ]}
-      />
-      <ConnectorProbeHistoryPanel connectorId={id} refreshKey={historyKey} />
-      <div>
-        <p className="text-xs font-medium text-muted-foreground">Capabilities</p>
-        <div className="mt-1.5 flex flex-wrap gap-1.5">
-          {c.capabilities.map((cap) => (
-            <Pill key={cap} tone="neutral">
-              {cap}
-            </Pill>
-          ))}
-        </div>
-      </div>
-      <div>
-        <p className="text-xs font-medium text-muted-foreground">
-          Discovered schemas
-        </p>
-        {c.discoveredSchemas.length === 0 ? (
-          <p className="mt-1 text-sm text-muted-foreground">
-            No schemas discovered yet.
-          </p>
-        ) : (
-          <ul className="mt-1 space-y-1">
-            {c.discoveredSchemas.map((s) => (
-              <li key={s.name} className="font-mono text-sm">
-                {s.name}
-                <span className="ml-2 text-xs text-muted-foreground">
-                  {s.kind}
-                  {s.columnsOrFields > 0 ? ` · ${s.columnsOrFields} fields` : ""}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-      <div>
-        <p className="text-xs font-medium text-muted-foreground">Recent errors</p>
-        {c.recentErrors.length === 0 ? (
-          <p className="mt-1 text-sm text-muted-foreground">No recent errors.</p>
-        ) : (
-          <ul className="mt-1 space-y-1.5">
-            {c.recentErrors.map((err, i) => (
-              <li key={i} className="text-sm text-destructive">
-                {err.message}
-                <span className="ml-2 text-xs text-muted-foreground">
-                  {formatRelativeTime(err.at)}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-      <div>
-        <p className="text-xs font-medium text-muted-foreground">
-          Dependent workloads
-        </p>
-        {c.dependentPipelines.length === 0 ? (
-          <p className="mt-1 text-sm text-muted-foreground">
-            No dependent pipelines.
-          </p>
-        ) : (
-          <ul className="mt-1 space-y-1">
-            {c.dependentPipelines.map((p) => (
-              <li key={p.id}>
-                <Link
-                  href={`/pipelines/${p.id}`}
-                  className="font-mono text-sm text-primary hover:underline"
-                >
-                  {p.name}
-                </Link>
-                <span className="ml-2 text-xs text-muted-foreground">{p.kind}</span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-      <div className="border-t border-border pt-5">
-        <ConnectorIngestPanel connectorId={id} connectorName={c.name} />
-      </div>
+      <Tabs value={tab} onValueChange={(v) => setTab(v as DrawerTab)} className="gap-4">
+        <TabsList>
+          <TabsTrigger value="overview">Overview</TabsTrigger>
+          <TabsTrigger value="ingest">Ingest</TabsTrigger>
+          <TabsTrigger value="tests">Connection tests</TabsTrigger>
+        </TabsList>
+        <TabsContent value="overview">
+          {/* Remounted on every visit (and after a test), so it never
+              shows a schedule or a run from before a change elsewhere. */}
+          <ConnectorOverview key={historyKey} detail={c} onOpenTab={setTab} />
+        </TabsContent>
+        <TabsContent value="ingest" keepMounted>
+          <ConnectorIngestPanel connectorId={id} connectorName={c.name} />
+        </TabsContent>
+        <TabsContent value="tests">
+          <ConnectorProbeHistoryPanel connectorId={id} refreshKey={historyKey} />
+        </TabsContent>
+      </Tabs>
     </>
   )
 }
