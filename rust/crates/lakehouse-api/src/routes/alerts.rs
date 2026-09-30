@@ -708,6 +708,12 @@ fn late_episode_key(pipeline_id: &str, last: Option<LastSuccess>) -> String {
 /// Returned `usize` is the number of pipelines for which delivery was
 /// attempted (one per `first_seen` true). Used by the route-level
 /// integration test as a "did we deliver at all" signal.
+///
+/// # Errors
+///
+/// Returns a 500 [`ApiError::Internal`] when the late source propagates a
+/// classified error or a delivery fails; a failed dedupe insert maps
+/// through `From<StoreError> for ApiError`.
 async fn evaluate_late_pass(
     pg: &PgPool,
     ch: &lakehouse_clickhouse::ChClient,

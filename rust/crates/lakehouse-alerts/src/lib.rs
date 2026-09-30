@@ -147,7 +147,7 @@ pub enum AlertKind {
     PipelineFailure,
     /// Fires when a successful pipeline run exceeded the pipeline's
     /// `pipeline_sla.max_duration_seconds` (plan 1f). Evaluated by
-    /// [`evaluate_pipeline_run_finished`] from `run-finished` event
+    /// [`evaluate_pipeline_slow`] from the `run-finished` event
     /// route, not by `run_rules`. No periodic trigger; one alert per
     /// over-duration run.
     PipelineSlow,
@@ -160,7 +160,7 @@ pub enum AlertKind {
     /// Fires when a successful run reported a row count below half the
     /// median of prior completed runs (with at least 5 prior samples;
     /// fewer samples and the alert is skipped, never silently `false`).
-    /// Evaluated by [`evaluate_pipeline_run_finished`] from the
+    /// Evaluated by [`evaluate_pipeline_volume_drop`] from the
     /// `run-finished` event route. Plan 1f.
     PipelineVolumeDrop,
 }
@@ -1204,9 +1204,10 @@ pub fn late(
 
 /// Plan 1f entry point: deliver every enabled [`AlertKind::PipelineLate`]
 /// rule whose `pipeline` matches `pipeline_id` (or `*`). Unlike
-/// [`evaluate_pipeline_failure`] and [`evaluate_pipeline_run_finished`],
-/// this is called by `/api/alerts/run` (the 15-minute pass) rather than
-/// an event route — "late" is a clock-relative claim, and the clock
+/// [`evaluate_pipeline_failure`], [`evaluate_pipeline_slow`], and
+/// [`evaluate_pipeline_volume_drop`], this is called by
+/// `/api/alerts/run` (the 15-minute pass) rather than an event route —
+/// "late" is a clock-relative claim, and the clock
 /// ticks on the schedule of the op, not the orchestrator.
 ///
 /// The route handler provides a [`LateSource`] (a Postgres-backed

@@ -236,7 +236,8 @@ fn pipelines_router() -> Router<AppState> {
         // per successful run. Same posture as the run-failed route — the
         // handler enforces a service identity on top of the `pipeline:write`
         // gate. Computes the run's `slow`/`volume_drop` outcomes and hands
-        // them to `evaluate_pipeline_run_finished`.
+        // each to its per-kind evaluator: `evaluate_pipeline_slow` /
+        // `evaluate_pipeline_volume_drop`.
         .route(
             "/api/pipelines/events/run-finished",
             axum::routing::post(pipelines::run_finished_event),
