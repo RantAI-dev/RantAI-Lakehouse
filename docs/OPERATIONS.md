@@ -424,6 +424,37 @@ in the alerts run's per-rule output. Like the run-finished path,
 latest known run id), so dedupe is conservative; future work may
 attach a clock-based key.
 
+### Pipeline dependencies (plan 2a)
+
+An authored pipeline can list upstreams in its `dependsOn` field on create
+and update. Each entry must be an existing authored pipeline id or a
+`Dagster` job name the orchestrator currently lists (for example
+`ingest_job`); the list holds at most 10 entries. A self-reference or a
+cycle across authored pipelines is refused with `400`, and the message
+names the offending id. `Dagster` jobs are excluded from the cycle walk —
+they declare no `dependsOn`, so they cannot close one.
+
+Semantics are **ALL**, not any: the sensor fires after a `SUCCESS` run of
+one upstream, but the downstream is requested only when *every* upstream
+has a `SUCCESS` run that finished after the downstream's own most-recent
+run started. A downstream with no run history yet (its first-ever run)
+fires without waiting for one. Each downstream gets a run-status sensor
+named `authored__<id>_after`, `default_status=RUNNING` so a chain never
+ships silently stopped, and its `run_key` is the triggering upstream's run
+id, so a re-firing upstream cannot launch the same downstream twice.
+
+**Where the skip reason shows.** `GET /api/pipelines/{id}/schedule-ticks`
+merges the pipeline's schedule ticks with the `authored__<id>_after`
+sensor's ticks. Every tick carries `kind: "schedule"` or `kind: "sensor"`;
+a sensor tick that did not launch carries the `SkipReason`, naming the
+upstream that is still behind. This is the surface for "why hasn't my
+downstream run."
+
+**When it takes effect.** Editing `dependsOn` is picked up when the code
+location reloads — the authored update asks the orchestrator to reload, and
+the factory rebuilds the sensors from `GET /api/pipelines/runnable`. A
+draft has no job and is not rebuilt; its chain arms when it goes `ready`.
+
 ### What's deliberately NOT in the stack
 
 - **The Next.js frontend.** Its Dockerfile is untracked, ad hoc work in
