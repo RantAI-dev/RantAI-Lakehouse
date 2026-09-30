@@ -7,6 +7,7 @@
  */
 
 import * as React from "react"
+import { PencilIcon } from "lucide-react"
 import { Label } from "@/components/ui/label"
 import { CdcDialForm } from "@/features/connectors/dial-forms/cdc-dial-form"
 import { FilesDialForm } from "@/features/connectors/dial-forms/files-dial-form"
@@ -424,6 +425,44 @@ export function TenantField({
       )}
       {hint ? <p className="text-xs text-muted-foreground">{hint}</p> : null}
     </Field>
+  )
+}
+
+/** A review section's way back to the step it summarizes. */
+export function EditStepButton({ label, onClick }: { label: string; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={`Edit ${label}`}
+      className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-primary outline-none hover:bg-primary/10 focus-visible:ring-[3px] focus-visible:ring-ring/50"
+    >
+      <PencilIcon className="size-3" />
+      Edit
+    </button>
+  )
+}
+
+/** A titled part of a wizard step: an icon, a title and one line on what it is for. */
+export function StepSectionHeading({
+  icon,
+  title,
+  description,
+}: {
+  icon: React.ReactNode
+  title: string
+  description: string
+}) {
+  return (
+    <div className="flex items-start gap-2.5">
+      <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
+        {icon}
+      </span>
+      <div className="min-w-0">
+        <h3 className="text-sm font-medium">{title}</h3>
+        <p className="text-xs text-muted-foreground">{description}</p>
+      </div>
+    </div>
   )
 }
 

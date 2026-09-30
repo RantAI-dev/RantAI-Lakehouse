@@ -24,6 +24,7 @@ export function FormStepLayout({
   submitLabel = "Create",
   submitting = false,
   children,
+  below,
   className,
 }: {
   steps: FormStep[]
@@ -34,6 +35,9 @@ export function FormStepLayout({
   submitLabel?: string
   submitting?: boolean
   children: React.ReactNode
+  /** Shown under the step panel, in the same column (e.g. a page's delete
+   * section), so it lines up with the form rather than the stepper. */
+  below?: React.ReactNode
   className?: string
 }) {
   const isLast = currentIndex >= steps.length - 1
@@ -133,6 +137,7 @@ export function FormStepLayout({
           )}
         </div>
       </div>
+      {below ? <div className="lg:col-start-2">{below}</div> : null}
     </div>
   )
 }

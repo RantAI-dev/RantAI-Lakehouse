@@ -134,10 +134,13 @@ describe("ConnectorEditPage", () => {
     const page = renderPage()
     const name = (await waitFor(() => page.getByLabelText("Name"))) as HTMLInputElement
     expect(name.value).toBe("db demo")
+    // No browser suggestions from other forms' history on any field.
+    expect(name.getAttribute("autocomplete")).toBe("off")
     fireEvent.change(name, { target: { value: "renamed" } })
     next(page)
 
     expect((page.getByLabelText("Host") as HTMLInputElement).value).toBe("192.168.18.205")
+    expect(page.getByLabelText("Host").getAttribute("autocomplete")).toBe("off")
     // Blank keeps the current credential, so Next is allowed without one.
     expect((page.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(false)
     fireEvent.change(page.getByLabelText("Password"), { target: { value: "n3w-pass" } })
@@ -188,15 +191,15 @@ describe("ConnectorEditPage", () => {
     next(page)
     next(page)
     next(page)
-    expect(page.getByText("Nothing has changed yet.")).toBeDefined()
+    expect(page.getByText(/Nothing has changed yet, so there is nothing to save/)).toBeDefined()
     expect((page.getByRole("button", { name: "Save changes" }) as HTMLButtonElement).disabled).toBe(true)
   })
 
   /**
    * Changing the connection re-saves the ingest spec with the tables and
-   * schedule it already had (this page does not edit those), keeps the
-   * row's `host` label in step, and saves it BEFORE the credential — whose
-   * server-side test dials the saved settings.
+   * schedule it already had (this page does not edit those) and keeps the
+   * row's `host` label in step. The credential goes FIRST, carrying the new
+   * settings, so its server-side test dials where the connector will.
    */
   it("keeps the ingested tables and schedule when the connection changes", async () => {
     const calls = stubFetch()
@@ -212,12 +215,14 @@ describe("ConnectorEditPage", () => {
 
     const w = writes(calls)
     expect(w[0].body).toEqual({ host: "10.0.0.9" })
-    const spec = w[1].body as Record<string, unknown>
-    expect(w[1].url).toContain("/ingest-spec")
+    expect(w[1].url).toContain("/credential")
+    const credential = w[1].body as Record<string, unknown>
+    expect((credential.dial as Record<string, unknown>).host).toBe("10.0.0.9")
+    const spec = w[2].body as Record<string, unknown>
+    expect(w[2].url).toContain("/ingest-spec")
     expect(spec.sourceObjects).toEqual(SPEC.sourceObjects)
     expect(spec.scheduleCron).toBe("0 * * * *")
     expect((spec.dial as Record<string, unknown>).host).toBe("10.0.0.9")
-    expect(w[2].url).toContain("/credential")
   })
 
   it("says so plainly when moving tenants is not permitted", async () => {
@@ -228,7 +233,7 @@ describe("ConnectorEditPage", () => {
     await waitFor(() => page.getByLabelText("Name"))
     next(page)
     next(page)
-    fireEvent.change(page.getByLabelText("Tenant"), { target: { value: "t-other" } })
+    fireEvent.click(page.getByRole("radio", { name: /Other Co/ }))
     next(page)
     expect(page.getByText("Acme Co → Other Co")).toBeDefined()
     fireEvent.click(page.getByRole("button", { name: "Save changes" }))
@@ -257,7 +262,8 @@ describe("ConnectorEditPage", () => {
 
   /**
    * A connector pipelines still read from is not offered for deletion at
-   * all: the dialog names the pipelines, and no DELETE is ever sent.
+   * all: the section names the pipelines, the button is off, and no DELETE
+   * is ever sent.
    */
   it("refuses to delete a connector pipelines still use", async () => {
     const calls = stubFetch({}, {
@@ -266,10 +272,11 @@ describe("ConnectorEditPage", () => {
     })
     const page = renderPage()
     await waitFor(() => page.getByLabelText("Name"))
-    expect(page.getByText(/Used by 1 pipeline;/)).toBeDefined()
-    fireEvent.click(page.getByRole("button", { name: "Delete…" }))
-    await waitFor(() => expect(screen.getByText("Connector is still in use")).toBeDefined())
-    expect(screen.getByRole("link", { name: "orders sync" }).getAttribute("href")).toBe("/pipelines/p-orders")
+    expect(page.getByText(/Still used by the pipeline/)).toBeDefined()
+    expect(page.getByRole("link", { name: "orders sync" }).getAttribute("href")).toBe("/pipelines/p-orders")
+    const remove = page.getByRole("button", { name: "Delete connector…" }) as HTMLButtonElement
+    expect(remove.disabled).toBe(true)
+    fireEvent.click(remove)
     expect(screen.queryByRole("button", { name: "Delete" })).toBeNull()
     expect(calls.some((c) => c.method === "DELETE")).toBe(false)
   })
@@ -287,7 +294,7 @@ describe("ConnectorEditPage", () => {
     })
     const page = renderPage()
     await waitFor(() => page.getByLabelText("Name"))
-    fireEvent.click(page.getByRole("button", { name: "Delete…" }))
+    fireEvent.click(page.getByRole("button", { name: "Delete connector…" }))
     fireEvent.click(await waitFor(() => screen.getByRole("button", { name: "Delete" })))
     await waitFor(() => expect(screen.getByText(/dropping slot x_slot failed/)).toBeDefined())
     fireEvent.click(screen.getByRole("button", { name: "Force delete" }))
@@ -297,5 +304,72 @@ describe("ConnectorEditPage", () => {
         "/api/connectors/conn-a?force=true",
       ])
     )
+  })
+
+  /**
+   * A sign-in method that reads a different credential (REST bearer to
+   * basic auth) cannot keep the stored one: the new username and password
+   * are required, go first with the new settings, and only then are the
+   * settings saved.
+   */
+  it("requires a new credential when the sign-in method changes, and saves it first", async () => {
+    const restSpec = {
+      adapter: "rest",
+      ingestMode: "batch",
+      dial: {
+        baseUrl: "https://api.example.com",
+        auth: { type: "bearer" },
+        pagination: { type: "none" },
+        endpoints: [{ path: "/orders", recordsPath: null }],
+      },
+      sourceObjects: [],
+      scheduleCron: null,
+      secretRefs: { primary: "file:/run/secrets/connector_managed_conn_a_token", secondary: null },
+    }
+    const calls = stubFetch(
+      {
+        "GET /api/connectors/types": () => json([{ name: "REST API", adapter: "rest", supported: true, docsUrl: null }]),
+        "GET /api/connectors/conn-a/ingest-spec": () => json(restSpec),
+        "PUT /api/connectors/conn-a/ingest-spec": () => json(restSpec),
+      },
+      { ...DETAIL, type: "REST API", credentialManaged: true, credentialKind: "token", credentialSecondaryKind: null }
+    )
+    const page = renderPage()
+    await waitFor(() => page.getByLabelText("Name"))
+    next(page)
+    fireEvent.change(page.getByLabelText("Auth type"), { target: { value: "basic" } })
+    expect(page.getByText(/sign-in method changed/)).toBeDefined()
+    // Blank no longer means "keep": the stored token does not fit basic auth.
+    expect((page.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.change(page.getByLabelText("Username"), { target: { value: "svc" } })
+    fireEvent.change(page.getByLabelText("Password"), { target: { value: "pw" } })
+    next(page)
+    next(page)
+    fireEvent.click(page.getByRole("button", { name: "Save changes" }))
+    await waitFor(() => expect(page.getByText(/Connection test passed/)).toBeDefined())
+
+    const w = writes(calls).map((c) => c.url.replace(/^https?:\/\/[^/]+/, ""))
+    expect(w.indexOf("/api/connectors/conn-a/credential")).toBeGreaterThan(-1)
+    expect(w.indexOf("/api/connectors/conn-a/credential")).toBeLessThan(w.indexOf("/api/connectors/conn-a/ingest-spec"))
+    const credential = writes(calls).find((c) => c.url.endsWith("/credential"))!.body as Record<string, unknown>
+    expect(credential.primary).toEqual({ kind: "access_key", value: "svc" })
+    expect(credential.secondary).toEqual({ kind: "password", value: "pw" })
+    expect((credential.dial as { auth: { type: string } }).auth.type).toBe("basic")
+  })
+
+  /** A credential the build could not test is saved, and the result says so. */
+  it("says when a new credential was stored without being tested", async () => {
+    stubFetch({
+      "PUT /api/connectors/conn-a/credential": () =>
+        json({ saved: true, slots: ["primary"], verified: false, message: "SFTP cannot be probed" }),
+    })
+    const page = renderPage()
+    await waitFor(() => page.getByLabelText("Name"))
+    next(page)
+    fireEvent.change(page.getByLabelText("Password"), { target: { value: "pw" } })
+    next(page)
+    next(page)
+    fireEvent.click(page.getByRole("button", { name: "Save changes" }))
+    await waitFor(() => expect(page.getByText(/stored without a test/)).toBeDefined())
   })
 })

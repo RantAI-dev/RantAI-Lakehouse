@@ -2,7 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { KeyRoundIcon, LayersIcon, MapPinIcon, NetworkIcon, PencilIcon, UsersIcon } from "lucide-react"
+import { KeyRoundIcon, NetworkIcon } from "lucide-react"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { FormReviewSummary } from "@/components/patterns/form-review-summary"
 import { FormStepLayout, type FormStep } from "@/components/patterns/form-step-layout"
@@ -19,6 +19,8 @@ import {
   CredentialFields,
   DialFormFor,
   Field,
+  EditStepButton,
+  StepSectionHeading,
   credentialProblems,
   credentialSlotsFor,
   credentialSlotsKey,
@@ -28,7 +30,7 @@ import {
 } from "./connector-form-parts"
 import { DIRECTION_LABEL } from "./connectors-columns"
 import { connectionReviewItems } from "./connector-review"
-import { EnvironmentInput, TenantPicker } from "./connector-scope-fields"
+import { ScopeFields } from "./connector-scope-fields"
 import { ConnectorIngestPanel } from "./connector-ingest-panel"
 import { ConnectorTypePicker, DirectionPicker, SelectedTypeSummary } from "./connector-type-picker"
 
@@ -325,6 +327,7 @@ export function ConnectorCreatePage() {
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   placeholder={selectedType ? `e.g. ${selectedType.name} orders` : "e.g. core orders"}
+                  autoComplete="off"
                 />
                 <p className="text-xs text-muted-foreground">How this connector appears in lists and runs.</p>
               </Field>
@@ -365,41 +368,15 @@ export function ConnectorCreatePage() {
           </div>
         ) : null}
         {step === 2 ? (
-          <div className="space-y-6">
-            <section className="space-y-3">
-              <StepSectionHeading
-                icon={<UsersIcon className="size-4" />}
-                title="Tenant"
-                description="Who can see and use this connector. Only members of the chosen tenant see it in their connector list."
-              />
-              <TenantPicker value={tenantId} onChange={setTenantId} />
-            </section>
-            <section className="grid gap-5 border-t border-border pt-5 lg:grid-cols-2">
-              <div className="space-y-3">
-                <StepSectionHeading
-                  icon={<LayersIcon className="size-4" />}
-                  title="Environment"
-                  description="Which stage of the source system this is. Shown and filterable in the connector list."
-                />
-                <EnvironmentInput id="connector-environment" value={environment} onChange={setEnvironment} />
-              </div>
-              <div className="space-y-3">
-                <StepSectionHeading
-                  icon={<MapPinIcon className="size-4" />}
-                  title="Residency"
-                  description="Where the source's data is kept, recorded with the connector for governance."
-                />
-                <Field label="Residency label" htmlFor="connector-residency">
-                  <Input
-                    id="connector-residency"
-                    value={residency}
-                    onChange={(e) => setResidency(e.target.value)}
-                    placeholder="e.g. in-region"
-                  />
-                </Field>
-              </div>
-            </section>
-          </div>
+          <ScopeFields
+            tenantDescription="Who can see and use this connector. Only members of the chosen tenant see it in their connector list."
+            tenantId={tenantId}
+            onTenantChange={setTenantId}
+            environment={environment}
+            onEnvironmentChange={setEnvironment}
+            residency={residency}
+            onResidencyChange={setResidency}
+          />
         ) : null}
         {step === 3 ? (
           <div className="space-y-6">
@@ -465,42 +442,6 @@ export function ConnectorCreatePage() {
           <p className="text-sm text-destructive">{create.error.message}</p>
         ) : null}
       </FormStepLayout>
-    </div>
-  )
-}
-
-function EditStepButton({ label, onClick }: { label: string; onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-label={`Edit ${label}`}
-      className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium text-primary outline-none hover:bg-primary/10 focus-visible:ring-[3px] focus-visible:ring-ring/50"
-    >
-      <PencilIcon className="size-3" />
-      Edit
-    </button>
-  )
-}
-
-function StepSectionHeading({
-  icon,
-  title,
-  description,
-}: {
-  icon: React.ReactNode
-  title: string
-  description: string
-}) {
-  return (
-    <div className="flex items-start gap-2.5">
-      <span className="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
-        {icon}
-      </span>
-      <div className="min-w-0">
-        <h3 className="text-sm font-medium">{title}</h3>
-        <p className="text-xs text-muted-foreground">{description}</p>
-      </div>
     </div>
   )
 }

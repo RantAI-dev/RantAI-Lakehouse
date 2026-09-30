@@ -98,6 +98,7 @@ export function ConnectorTypePicker({
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search types"
             className="pl-8"
+            autoComplete="off"
           />
         </div>
       </div>
@@ -212,9 +213,10 @@ function TypeCard({
 
 /**
  * The chosen type as a compact strip, for the steps after the picker, with
- * a way back to change it.
+ * a way back to change it — or, without `onChange` (an existing
+ * connector, whose type is fixed), a note saying it cannot change.
  */
-export function SelectedTypeSummary({ type, onChange }: { type: ConnectorType; onChange: () => void }) {
+export function SelectedTypeSummary({ type, onChange }: { type: ConnectorType; onChange?: () => void }) {
   const meta = metaFor(type)
   const Icon = meta.icon
   return (
@@ -226,13 +228,17 @@ export function SelectedTypeSummary({ type, onChange }: { type: ConnectorType; o
         <span className="block truncate text-sm font-medium">{type.name}</span>
         <span className="block truncate text-xs text-muted-foreground">{meta.blurb}</span>
       </span>
-      <button
-        type="button"
-        onClick={onChange}
-        className="shrink-0 rounded-md px-2 py-1 text-xs font-medium text-primary outline-none hover:bg-primary/10 focus-visible:ring-[3px] focus-visible:ring-ring/50"
-      >
-        Change type
-      </button>
+      {onChange ? (
+        <button
+          type="button"
+          onClick={onChange}
+          className="shrink-0 rounded-md px-2 py-1 text-xs font-medium text-primary outline-none hover:bg-primary/10 focus-visible:ring-[3px] focus-visible:ring-ring/50"
+        >
+          Change type
+        </button>
+      ) : (
+        <span className="shrink-0 text-xs text-muted-foreground">Type is fixed</span>
+      )}
     </div>
   )
 }

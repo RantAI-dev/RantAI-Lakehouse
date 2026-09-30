@@ -1,11 +1,75 @@
 "use client"
 
 import * as React from "react"
-import { Building2Icon, CheckIcon } from "lucide-react"
+import { Building2Icon, CheckIcon, LayersIcon, MapPinIcon, UsersIcon } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { useAuth } from "@/features/auth/auth-provider"
 import { cn } from "@/lib/utils"
+import { StepSectionHeading } from "./connector-form-parts"
+
+/** The tenant cards' grid. The environment and residency fields sit in its
+ * first column, so all three controls in the step are the same width. */
+const SCOPE_GRID = "grid gap-2 sm:grid-cols-2 xl:grid-cols-3"
+
+/**
+ * The Tenant and residency step, shared by the create and edit pages: a
+ * titled section each for the tenant, the environment and the residency,
+ * stacked like the Connection step's sections.
+ */
+export function ScopeFields({
+  tenantDescription,
+  tenantId,
+  onTenantChange,
+  environment,
+  onEnvironmentChange,
+  residency,
+  onResidencyChange,
+}: {
+  tenantDescription: string
+  tenantId: string
+  onTenantChange: (tenantId: string) => void
+  environment: string
+  onEnvironmentChange: (value: string) => void
+  residency: string
+  onResidencyChange: (value: string) => void
+}) {
+  return (
+    <div className="space-y-6">
+      <section className="space-y-3">
+        <StepSectionHeading icon={<UsersIcon className="size-4" />} title="Tenant" description={tenantDescription} />
+        <TenantPicker value={tenantId} onChange={onTenantChange} />
+      </section>
+      <section className="space-y-3 border-t border-border pt-5">
+        <StepSectionHeading
+          icon={<LayersIcon className="size-4" />}
+          title="Environment"
+          description="Which stage of the source system this is. Shown and filterable in the connector list."
+        />
+        <div className={SCOPE_GRID}>
+          <EnvironmentInput id="connector-environment" value={environment} onChange={onEnvironmentChange} />
+        </div>
+      </section>
+      <section className="space-y-3 border-t border-border pt-5">
+        <StepSectionHeading
+          icon={<MapPinIcon className="size-4" />}
+          title="Residency"
+          description="Where the source's data is kept, recorded with the connector for governance."
+        />
+        <div className={SCOPE_GRID}>
+          <Input
+            id="connector-residency"
+            aria-label="Residency"
+            value={residency}
+            onChange={(e) => onResidencyChange(e.target.value)}
+            placeholder="e.g. in-region"
+            autoComplete="off"
+          />
+        </div>
+      </section>
+    </div>
+  )
+}
 
 /**
  * The tenant a new connector belongs to, as one card per tenant the user
@@ -24,7 +88,7 @@ export function TenantPicker({ value, onChange }: { value: string; onChange: (te
     )
   }
   return (
-    <div role="radiogroup" aria-label="Tenant" className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+    <div role="radiogroup" aria-label="Tenant" className={SCOPE_GRID}>
       {tenants.map((tenant) => {
         const checked = tenant.id === value
         return (
@@ -112,6 +176,7 @@ export function EnvironmentInput({
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder="production"
+        autoComplete="off"
       />
     </div>
   )

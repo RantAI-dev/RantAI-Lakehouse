@@ -2,6 +2,7 @@
 
 import * as React from "react"
 import Link from "next/link"
+import { KeyRoundIcon, NetworkIcon, Trash2Icon, TriangleAlertIcon } from "lucide-react"
 import { useRouter } from "next/navigation"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { FormReviewSummary } from "@/components/patterns/form-review-summary"
@@ -28,8 +29,9 @@ import {
   CredentialFields,
   type CredentialSlots,
   DialFormFor,
+  EditStepButton,
   Field,
-  TenantField,
+  StepSectionHeading,
   credentialProblems,
   credentialSlotsFor,
   credentialSlotsKey,
@@ -38,26 +40,32 @@ import {
   usesNoCredential as needsNoCredential,
 } from "./connector-form-parts"
 import { ConnectorDeleteDialog } from "./connector-delete-dialog"
+import { connectionReviewItems } from "./connector-review"
+import { ScopeFields } from "./connector-scope-fields"
+import { DirectionPicker, SelectedTypeSummary } from "./connector-type-picker"
+import { DIRECTION_LABEL } from "./connectors-columns"
 
 const STEPS: FormStep[] = [
-  { id: "type", label: "Type", description: "Name and direction" },
-  { id: "connection", label: "Connection", description: "Dial and secret" },
+  { id: "type", label: "Connector", description: "Name and direction" },
+  { id: "connection", label: "Connection", description: "Where and how it signs in" },
   { id: "scope", label: "Tenant and residency" },
   { id: "review", label: "Review", description: "Confirm changes" },
 ]
 
 type Loaded = { detail: ConnectorDetail; spec: IngestSpec; type: ConnectorType | null }
 
-/** One part of a save, reported back to the user in order. */
-type SaveStep = { label: string; status: "done" | "failed"; message?: string }
+/** One part of a save, reported back to the user in order. A `note` on a
+ * saved part says something the user should still know (e.g. a credential
+ * that was stored without being tested). */
+type SaveStep = { label: string; status: "done" | "failed"; message?: string; note?: string }
 
 /**
  * Edit an existing connector with the same steps as creating one. A
  * connector's parts are owned by different routes, so a save is a short
- * sequence — basic fields (`PATCH`), connection settings (ingest spec),
- * tenant, credential — followed by a connection test. It stops at the first
- * failure and reports exactly which parts were saved, rather than a bare
- * "failed".
+ * sequence — basic fields (`PATCH`), credential, connection settings
+ * (ingest spec), tenant — followed by a connection test. It stops at the
+ * first failure and reports exactly which parts were saved, rather than a
+ * bare "failed".
  *
  * The type is shown but not editable: it fixes the adapter, the shape of the
  * connection settings and the credential names, so a different type is a
@@ -99,6 +107,10 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
   // reference names, nothing to swap.
   const slots = withStoredKinds(credentialSlotsFor(adapter, dial), detail.credentialKind, detail.credentialSecondaryKind)
   const slotsKey = credentialSlotsKey(slots)
+  // A different sign-in method (REST bearer to basic, SFTP password to key)
+  // reads a different credential, so the stored one cannot be kept.
+  const signInChanged =
+    credentialSlotsKey(credentialSlotsFor(adapter, originalDial)) !== credentialSlotsKey(credentialSlotsFor(adapter, dial))
   // Write-only: sent once on save, cleared right after, never rendered back.
   const [primaryValue, setPrimaryValue] = React.useState("")
   const [secondaryValue, setSecondaryValue] = React.useState("")
@@ -117,7 +129,7 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
   const noCredential = needsNoCredential(adapter, dial)
   const problems = credentialProblems({
     noCredential,
-    optional: true,
+    optional: !signInChanged,
     slots,
     primaryValue,
     secondaryValue,
@@ -140,6 +152,7 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
   const anyChange = basicChanged || dialChanged || tenantChanged || credentialTyped
 
   const tenantNameOf = (id: string | null) => user?.tenants.find((t) => t.id === id)?.name ?? (id ? "Other tenant" : "Unassigned")
+  const typeShown: ConnectorType = type ?? { name: detail.type, adapter, supported: true, docsUrl: null }
 
   const canProceed =
     (step === 0 && Boolean(name.trim())) ||
@@ -152,10 +165,10 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
     setSaving(true)
     setTestResult(null)
     const steps: SaveStep[] = []
-    const record = (label: string, run: () => Promise<unknown>) => async () => {
+    const record = (label: string, run: () => Promise<string | void>) => async () => {
       try {
-        await run()
-        steps.push({ label, status: "done" })
+        const note = await run()
+        steps.push({ label, status: "done", ...(note ? { note } : {}) })
         return true
       } catch (error) {
         const denied = isServiceError(error) && error.status === 403
@@ -171,7 +184,7 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
         return false
       }
     }
-    const credential: SetConnectorCredentialRequest = {}
+    const credential: SetConnectorCredentialRequest = dialChanged ? { dial: (dial ?? {}) as IngestSpec["dial"] } : {}
     if (credentialTyped) {
       credential.primary = { kind: slots.primary.kind, value: normalizedCredential(slots.primary, primaryValue) }
       if (slots.secondary) {
@@ -185,18 +198,27 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
     setPrimaryValue("")
     setSecondaryValue("")
 
-    // Order matters: the connection settings are saved BEFORE the credential,
-    // because the credential route tests the new value against the source
-    // using the connector's SAVED connection settings.
+    // Order matters: the credential goes BEFORE the connection settings.
+    // It is tested with the settings this edit makes (sent along with it),
+    // and a sign-in method that needs a second credential (REST basic auth)
+    // is only accepted once that credential exists.
     const sequence: (() => Promise<boolean>)[] = []
     if (basicChanged) {
-      sequence.push(record("Name, direction, environment and residency", () =>
-        connectorService.updateConnector(detail.id, basic)
-      ))
+      sequence.push(record("Name, direction, environment and residency", async () => {
+        await connectorService.updateConnector(detail.id, basic)
+      }))
+    }
+    if (credentialTyped) {
+      sequence.push(record("Credential (tested against the source first)", async () => {
+        const saved = await connectorService.setCredential(detail.id, credential)
+        return saved.verified
+          ? undefined
+          : `stored without a test: this connector type cannot be tested yet (${saved.message})`
+      }))
     }
     if (dialChanged) {
-      sequence.push(record("Connection settings", () =>
-        connectorService.setIngestSpec(detail.id, {
+      sequence.push(record("Connection settings", async () => {
+        await connectorService.setIngestSpec(detail.id, {
           adapter: adapter as NonNullable<IngestSpec["adapter"]>,
           ingestMode: spec.ingestMode ?? (adapter === "cdc" ? "cdc" : "batch"),
           dial: (dial ?? {}) as IngestSpec["dial"],
@@ -204,15 +226,12 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
           sourceObjects: spec.sourceObjects,
           ...(spec.scheduleCron ? { scheduleCron: spec.scheduleCron } : {}),
         })
-      ))
+      }))
     }
     if (tenantChanged) {
-      sequence.push(record("Tenant", () => connectorService.assignTenant(detail.id, tenantId)))
-    }
-    if (credentialTyped) {
-      sequence.push(record("Credential (tested against the source first)", () =>
-        connectorService.setCredential(detail.id, credential)
-      ))
+      sequence.push(record("Tenant", async () => {
+        await connectorService.assignTenant(detail.id, tenantId)
+      }))
     }
 
     let allSaved = true
@@ -259,6 +278,12 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
               <li key={s.label} className={s.status === "done" ? "text-emerald-600 dark:text-emerald-400" : "text-destructive"}>
                 {s.status === "done" ? "Saved" : "Not saved"} · {s.label}
                 {s.message ? ` — ${s.message}` : ""}
+                {s.note ? (
+                  <span className="mt-0.5 flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
+                    <TriangleAlertIcon className="mt-px size-3.5 shrink-0" />
+                    {s.note}
+                  </span>
+                ) : null}
               </li>
             ))}
           </ul>
@@ -292,23 +317,46 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
     )
   }
 
-  const reviewItems: { label: string; value: string }[] = []
-  if (basic.name) reviewItems.push({ label: "Name", value: `${detail.name} → ${basic.name}` })
-  if (basic.direction) reviewItems.push({ label: "Direction", value: `${detail.direction} → ${basic.direction}` })
-  if (basic.environment) reviewItems.push({ label: "Environment", value: `${detail.environment} → ${basic.environment}` })
-  if (basic.residency !== undefined) reviewItems.push({ label: "Residency", value: `${detail.residency || "—"} → ${basic.residency}` })
-  if (dialChanged) reviewItems.push({ label: "Connection settings", value: "Changed" })
-  if (tenantChanged) {
-    reviewItems.push({ label: "Tenant", value: `${tenantNameOf(detail.tenantId)} → ${tenantNameOf(tenantId)}` })
-  }
-  if (credentialTyped) {
-    reviewItems.push({
-      label: "Credential",
-      value: `New ${slots.primary.label.toLowerCase()}${
-        slots.secondary ? ` + ${slots.secondary.label.toLowerCase()}` : ""
-      } · tested before it replaces the current one`,
-    })
-  }
+  // ── Review: what changes, before → after, grouped by step ──────────────
+  const change = (label: string, before: string, after: string) => ({ label, value: `${before || "—"} → ${after || "—"}` })
+  const connectorChanges = [
+    ...(basic.name ? [change("Name", detail.name, basic.name)] : []),
+    ...(basic.direction ? [change("Direction", DIRECTION_LABEL[detail.direction], DIRECTION_LABEL[basic.direction])] : []),
+  ]
+  const before = connectionReviewItems(adapter, originalDial)
+  const after = connectionReviewItems(adapter, dial)
+  const text = (value: React.ReactNode) => (typeof value === "string" ? value : "")
+  const connectionChanges = [
+    ...after.flatMap((item, i) =>
+      text(item.value) !== text(before[i]?.value) ? [change(item.label, text(before[i]?.value), text(item.value))] : []
+    ),
+    ...(credentialTyped
+      ? [
+          {
+            label: "Credential",
+            value: `New ${slots.primary.label.toLowerCase()}${
+              slots.secondary ? ` + ${slots.secondary.label.toLowerCase()}` : ""
+            } · tested before it replaces the current one`,
+          },
+        ]
+      : []),
+  ]
+  const scopeChanges = [
+    ...(tenantChanged ? [change("Tenant", tenantNameOf(detail.tenantId), tenantNameOf(tenantId))] : []),
+    ...(basic.environment ? [change("Environment", detail.environment, basic.environment)] : []),
+    ...(basic.residency !== undefined ? [change("Residency", detail.residency, basic.residency)] : []),
+  ]
+  const reviewSections = [
+    { title: "Connector", step: 0, items: connectorChanges },
+    { title: "Connection", step: 1, items: connectionChanges },
+    { title: "Tenant and residency", step: 2, items: scopeChanges },
+  ]
+    .filter((section) => section.items.length > 0)
+    .map((section) => ({
+      title: section.title,
+      items: section.items,
+      action: <EditStepButton label={section.title.toLowerCase()} onClick={() => setStep(section.step)} />,
+    }))
 
   return (
     <div className="flex flex-col gap-4">
@@ -321,108 +369,146 @@ function EditForm({ loaded, onReload }: { loaded: Loaded; onReload: () => void }
         onSubmit={handleSave}
         submitLabel="Save changes"
         submitting={saving}
+        below={<DeleteSection detail={detail} />}
       >
         {step === 0 ? (
-          <div className="grid gap-3 sm:grid-cols-2">
-            <Field label="Name" htmlFor="connector-name" className="sm:col-span-2">
-              <Input id="connector-name" value={name} onChange={(e) => setName(e.target.value)} />
-            </Field>
-            <Field label="Type">
-              <p className="flex h-8 items-center text-sm">{detail.type}</p>
-              <p className="text-xs text-muted-foreground">
-                Fixed — a different type is a different connector.
-              </p>
-            </Field>
-            <Field label="Direction" htmlFor="connector-direction">
-              <select
-                id="connector-direction"
-                className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
-                value={direction}
-                onChange={(e) => setDirection(e.target.value as Connector["direction"])}
-              >
-                <option value="source">Source</option>
-                <option value="sink">Sink</option>
-                <option value="bidirectional">Bidirectional</option>
-              </select>
-            </Field>
+          <div className="space-y-5">
+            <SelectedTypeSummary type={typeShown} />
+            <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
+              <Field label="Name" htmlFor="connector-name">
+                <Input
+                  id="connector-name"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  autoComplete="off"
+                />
+                <p className="text-xs text-muted-foreground">How this connector appears in lists and runs.</p>
+              </Field>
+              <Field label="Direction">
+                <DirectionPicker value={direction} onChange={setDirection} />
+              </Field>
+            </div>
           </div>
         ) : null}
         {step === 1 ? (
-          <div className="grid gap-3">
-            <DialFormFor adapter={adapter} typeName={detail.type} dial={dial} onChange={setDial} />
-            <CredentialFields
-              noCredential={noCredential}
-              optional
-              credentialManaged={detail.credentialManaged}
-              slots={slots}
-              primaryValue={primaryValue}
-              onPrimaryValueChange={setPrimaryValue}
-              secondaryValue={secondaryValue}
-              onSecondaryValueChange={setSecondaryValue}
-              problems={problems}
-            />
+          <div className="space-y-6">
+            <section className="space-y-3">
+              <StepSectionHeading
+                icon={<NetworkIcon className="size-4" />}
+                title="Connection details"
+                description="Where the source lives. It must be reachable from the lakehouse server, not only from your browser."
+              />
+              <DialFormFor adapter={adapter} typeName={detail.type} dial={dial} onChange={setDial} />
+            </section>
+            <section className="space-y-3 border-t border-border pt-5">
+              <StepSectionHeading
+                icon={<KeyRoundIcon className="size-4" />}
+                title="Credential"
+                description={
+                  signInChanged
+                    ? "The sign-in method changed, so the stored credential no longer fits. Enter the new one."
+                    : "Leave blank to keep the current credential."
+                }
+              />
+              <CredentialFields
+                noCredential={noCredential}
+                optional={!signInChanged}
+                credentialManaged={detail.credentialManaged}
+                slots={slots}
+                primaryValue={primaryValue}
+                onPrimaryValueChange={setPrimaryValue}
+                secondaryValue={secondaryValue}
+                onSecondaryValueChange={setSecondaryValue}
+                problems={problems}
+              />
+            </section>
           </div>
         ) : null}
         {step === 2 ? (
-          <div className="grid gap-3 sm:grid-cols-2">
-            <Field label="Environment" htmlFor="connector-environment">
-              <Input id="connector-environment" value={environment} onChange={(e) => setEnvironment(e.target.value)} />
-            </Field>
-            <TenantField
-              value={tenantId}
-              onChange={setTenantId}
-              hint="Moving a connector to another tenant needs the identity:write permission."
-            />
-            <Field label="Residency" htmlFor="connector-residency" className="sm:col-span-2">
-              <Input id="connector-residency" value={residency} onChange={(e) => setResidency(e.target.value)} />
-            </Field>
-          </div>
+          <ScopeFields
+            tenantDescription="Who can see and use this connector. Moving it to another tenant needs the identity:write permission."
+            tenantId={tenantId}
+            onTenantChange={setTenantId}
+            environment={environment}
+            onEnvironmentChange={setEnvironment}
+            residency={residency}
+            onResidencyChange={setResidency}
+          />
         ) : null}
         {step === 3 ? (
           anyChange ? (
-            <FormReviewSummary sections={[{ title: "Changes", items: reviewItems }]} />
+            <FormReviewSummary sections={reviewSections} />
           ) : (
-            <p className="text-sm text-muted-foreground">Nothing has changed yet.</p>
+            <p className="text-sm text-muted-foreground">
+              Nothing has changed yet, so there is nothing to save. Change something in an earlier step and it shows
+              up here as before → after.
+            </p>
           )
         ) : null}
       </FormStepLayout>
-      <DeleteSection detail={detail} />
     </div>
   )
 }
 
-/** Removing the connector, kept apart from the form it would otherwise be mistaken for part of. */
+/**
+ * Removing the connector, kept apart from the form it would otherwise be
+ * mistaken for part of. While pipelines still read from the connector the
+ * API refuses the delete whatever it is asked, so the button is off and the
+ * pipelines are named right here instead of behind it.
+ */
 function DeleteSection({ detail }: { detail: ConnectorDetail }) {
   const router = useRouter()
   const [open, setOpen] = React.useState(false)
-  const inUse = detail.dependentPipelines.length
+  const dependents = detail.dependentPipelines
   return (
     <>
-      <SectionCard
-        size="sm"
-        contentClassName="hidden"
-        title="Delete connector"
-        description={
-          inUse > 0
-            ? `Used by ${inUse} pipeline${inUse === 1 ? "" : "s"}; those must be deleted or moved first.`
-            : "Removes the connector and its stored credential. This cannot be undone."
-        }
-        action={
+      <section aria-labelledby="delete-connector-title" className="rounded-xl border border-destructive/30">
+        <div className="flex flex-col gap-3 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex min-w-0 items-start gap-3">
+            <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-destructive/10 text-destructive">
+              <Trash2Icon className="size-4" />
+            </span>
+            <div className="min-w-0">
+              <h2 id="delete-connector-title" className="text-sm font-medium">
+                Delete connector
+              </h2>
+              <p className="text-xs text-muted-foreground">
+                Removes the connector and the credential stored for it. This cannot be undone.
+              </p>
+            </div>
+          </div>
           <Button
             size="sm"
-            variant="outline"
-            className="text-destructive hover:text-destructive"
+            variant="destructive"
+            className="self-start sm:self-auto"
+            disabled={dependents.length > 0}
             onClick={() => setOpen(true)}
           >
-            Delete…
+            Delete connector…
           </Button>
-        }
-      >
-        {null}
-      </SectionCard>
+        </div>
+        {dependents.length > 0 ? (
+          <div className="flex items-start gap-2 rounded-b-xl border-t border-destructive/20 bg-destructive/5 px-5 py-2.5">
+            <TriangleAlertIcon className="mt-px size-3.5 shrink-0 text-destructive" />
+            <p className="text-xs">
+              Still used by {dependents.length === 1 ? "the pipeline" : `${dependents.length} pipelines:`}{" "}
+              {dependents.map((d, i) => (
+                <React.Fragment key={d.id}>
+                  {i > 0 ? ", " : null}
+                  <Link href={`/pipelines/${d.id}`} className="font-medium text-primary hover:underline">
+                    {d.name}
+                  </Link>
+                </React.Fragment>
+              ))}
+              . Delete {dependents.length === 1 ? "it" : "them"} or point {dependents.length === 1 ? "it" : "them"} at
+              another connector first.
+            </p>
+          </div>
+        ) : null}
+      </section>
       <ConnectorDeleteDialog
         connector={detail}
-        dependents={detail.dependentPipelines}
+        dependents={dependents}
         open={open}
         onOpenChange={setOpen}
         onDeleted={() => router.push("/connectors")}

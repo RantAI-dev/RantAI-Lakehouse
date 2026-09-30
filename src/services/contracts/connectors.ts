@@ -174,6 +174,13 @@ export type CredentialSlotValue = {
 export type SetConnectorCredentialRequest = {
   primary?: CredentialSlotValue
   secondary?: CredentialSlotValue
+  /**
+   * The connection settings this credential is for, when the same edit
+   * changes them (e.g. REST bearer to basic auth): the server tests the new
+   * credential with these instead of the saved ones. Saving them is still
+   * `setIngestSpec`'s job.
+   */
+  dial?: Dial
 }
 
 /** The `PUT /api/connectors/{id}/credential` response. Never carries a value. */

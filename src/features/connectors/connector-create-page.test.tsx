@@ -159,7 +159,14 @@ describe("ConnectorCreatePage", () => {
     expect((page.getByRole("button", { name: "Next" }) as HTMLButtonElement).disabled).toBe(true)
     const password = page.getByLabelText("Password") as HTMLInputElement
     expect(password.type).toBe("password")
+    expect(password.getAttribute("autocomplete")).toBe("new-password")
     fireEvent.change(password, { target: { value: "s3cret-pass" } })
+    // The eye button shows the typed secret to check it, and hides it again.
+    fireEvent.click(page.getByRole("button", { name: "Show password" }))
+    expect(password.type).toBe("text")
+    expect(password.getAttribute("autocomplete")).toBe("off")
+    fireEvent.click(page.getByRole("button", { name: "Hide password" }))
+    expect(password.type).toBe("password")
     fireEvent.click(page.getByRole("button", { name: "Next" }))
 
     // Tenant: one card per tenant the user belongs to, defaulting to the
@@ -172,7 +179,7 @@ describe("ConnectorCreatePage", () => {
     // Environment presets fill the free-text field.
     fireEvent.click(page.getByRole("button", { name: "staging" }))
     expect((page.getByLabelText("Environment") as HTMLInputElement).value).toBe("staging")
-    fireEvent.change(page.getByLabelText("Residency label"), { target: { value: "in-region" } })
+    fireEvent.change(page.getByLabelText("Residency"), { target: { value: "in-region" } })
     fireEvent.click(page.getByRole("button", { name: "Next" }))
 
     // Review: every step has its own section with a way back to it, and the
