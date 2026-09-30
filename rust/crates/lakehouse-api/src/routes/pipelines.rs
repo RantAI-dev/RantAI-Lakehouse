@@ -469,28 +469,55 @@ pub struct PutSlaBody {
 /// (plan 1f). Same 30-run window as `/runs`; the volume-drop rule needs at
 /// least 5 prior completed runs to make a claim, so 30 gives the most
 /// recent run up to 25 samples of history.
-pub async fn volume(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> ApiResult<ApiJson<Value>> {
+///
+/// Reviewer fix #3: response shape is `{ runs, medianRows, unavailable }` —
+/// `medianRows` is the median of every completed run that reported rows
+/// (the same median the drop rule uses — see [`median`]); `unavailable`
+/// is a classified non-upstream string when the orchestrator is
+/// unreachable, mirroring [`runs_body`]'s degraded branch (so the UI
+/// can show "no runs right now, but here's why" rather than confusing
+/// it with a hard 503).
+pub async fn volume(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let job = if id.starts_with("pl-") {
         authored_pipelines::job_name(&id)
     } else {
         id.clone()
     };
-    let runs = state
+    let body = match state
         .dagster
         .list_runs_for_job_with_materializations(&job, 30)
         .await
-        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+    {
+        Ok(runs) => volume_body(&runs),
+        Err(err) => {
+            // AGENTS.md rule 4: never leak upstream detail into a
+            // response body. `js_error` is `Display`, not the original
+            // error's own message — it is the routing layer's fixed
+            // string (`routes::support::js_error`).
+            tracing::warn!(%err, "pipeline volume: orchestrator unreachable");
+            json!({
+                "runs": [],
+                "medianRows": Value::Null,
+                "unavailable": js_error(err),
+            })
+        }
+    };
+    (StatusCode::OK, ApiJson(body)).into_response()
+}
+
+/// Build the volume-route body from the dagster fetch's rows. Kept
+/// pure for testability (reviewer fix #3's shape test) and shared
+/// between the success and the (degenerate) empty-history paths.
+fn volume_body(runs: &[lakehouse_dagster::DgRunWithRows]) -> Value {
     // The volume-drop rule compares the *previous* completed runs (in
     // their original time order — older first, so the most recent run's
     // history is everything before it) against the current row count.
     // `DgRunWithRows` arrives most-recent-first from `Dagster`, so reverse
     // for history and skip non-completed runs (a `FAILURE` row with no
-    // rows is not part of the median — see the `drop` helper).
+    // rows is not part of the median — see the [`drop`] helper).
     let mut history: Vec<i64> = Vec::with_capacity(runs.len());
     let mut entries: Vec<Value> = Vec::with_capacity(runs.len());
+    let mut rows_for_median: Vec<i64> = Vec::with_capacity(runs.len());
     for run in runs.iter().rev() {
         let status = run.run.status.as_str();
         let completed = matches!(status, "SUCCESS" | "FAILURE");
@@ -508,13 +535,21 @@ pub async fn volume(
         }));
         if completed && let Some(rows) = run.rows {
             history.push(rows);
+            rows_for_median.push(rows);
         }
     }
     entries.reverse();
-    Ok(ApiJson(json!({
-        "pipelineId": id,
+    // Plan 1f: `medianRows` is the median of every completed run that
+    // reported rows — the same median [`drop`] uses (reviewer fix #3).
+    // `None` when no completed run reported rows: the page cannot draw
+    // a median line over an empty set, and an honest `null` keeps the
+    // chart from inventing a baseline.
+    let median_rows = median(&rows_for_median).map_or(Value::Null, |n| Value::Number(n.into()));
+    json!({
         "runs": entries,
-    })))
+        "medianRows": median_rows,
+        "unavailable": Value::Null,
+    })
 }
 
 /// `GET /api/pipelines/{id}` — full detail: op graph, config, schedule, and
@@ -1082,18 +1117,40 @@ fn drop(current_rows: Option<i64>, prior_rows: &[i64]) -> Option<bool> {
     if prior_rows.len() < MIN_SAMPLES {
         return None;
     }
-    let mut sorted: Vec<i64> = prior_rows.to_vec();
+    // Unreachable past the MIN_SAMPLES guard (a 5+ element slice always
+    // has a median), but `None` is the correct answer for an empty
+    // history anyway — the rule cannot decide, so propagate rather than
+    // assert.
+    let med = median(prior_rows)?;
+    // Compare in f64 — truncating the THRESHOLD to i64 would change the
+    // boundary (median 41, current 20: a drop at 20.5, not at 20).
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "row counts are far below f64's exact range"
+    )]
+    Some((current as f64) < half_median(med))
+}
+
+/// Median of a non-empty `i64` slice, matching the same upper-of-middle
+/// convention the `drop` rule uses (`sorted[n/2]` for even-length inputs).
+/// Plan 1f's volume route surfaces this as `medianRows` for the
+/// console's chart, so it has to be the same function (not "the same
+/// arithmetic done twice and trusted to stay in sync"). `None` for an
+/// empty slice — there is no median of nothing.
+fn median(rows: &[i64]) -> Option<i64> {
+    let mut sorted: Vec<i64> = rows.to_vec();
     sorted.sort_unstable();
-    // Upper-of-middle for an even-length array (sorted[n/2]). With
-    // `n >= MIN_SAMPLES = 5` the index is always in range.
-    let median = sorted[sorted.len() / 2];
-    // Cast: `i64 → f64` for the half-median comparison. The values here
-    // are row counts, comfortably below `2^53`.
-    #[allow(clippy::cast_precision_loss)]
-    let half_median = (median as f64) * 0.5;
-    #[allow(clippy::cast_precision_loss)]
-    let current_f = current as f64;
-    Some(current_f < half_median)
+    sorted.get(sorted.len() / 2).copied()
+}
+
+/// Half the median — the threshold the drop rule compares against.
+/// Hoisted so `drop` and the volume route's documented half-median
+/// threshold share the exact same arithmetic. `i64 → f64` cast is
+/// exact for every row count a warehouse would ever emit (the half
+/// comparison needs the float so an exact-half row is NOT a drop).
+#[allow(clippy::cast_precision_loss, reason = "row counts fit in f64")]
+fn half_median(median: i64) -> f64 {
+    (median as f64) * 0.5
 }
 
 /// The `NewAuditEvent` [`trigger`]/[`create`]/[`pause`]/[`resume`] each
@@ -1356,6 +1413,55 @@ pub struct RunFailedBody {
     pub job_name: String,
 }
 
+/// The `pipeline_volume_drop` decision for the run that just finished —
+/// the Dagster half of [`run_finished_event`], extracted so the handler
+/// stays under the 100-line lint. Pulls the same 30-run window the
+/// volume route uses in one query, then walks oldest-first building the
+/// history up to the current run.
+///
+/// # Errors
+///
+/// Returns `ApiError::Unavailable` (a classified, fixed string) when the
+/// `Dagster` call fails — never an upstream detail.
+async fn volume_drop_for_run(
+    state: &AppState,
+    pipeline_id: &str,
+    run_id: &str,
+) -> Result<Option<bool>, ApiError> {
+    let job = authored_pipelines::job_name(pipeline_id);
+    let runs_with_rows = state
+        .dagster
+        .list_runs_for_job_with_materializations(&job, 30)
+        .await
+        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+    let mut history: Vec<i64> = Vec::with_capacity(runs_with_rows.len());
+    let mut current_rows: Option<i64> = None;
+    let mut found_current = false;
+    // Walk oldest-first (Dagster returns most-recent first).
+    for run in runs_with_rows.iter().rev() {
+        if run.run.run_id == run_id {
+            current_rows = run.rows;
+            found_current = true;
+            break;
+        }
+        if matches!(run.run.status.as_str(), "SUCCESS" | "FAILURE")
+            && let Some(rows) = run.rows
+        {
+            history.push(rows);
+        }
+    }
+    // The current run not appearing in Dagster's recent 30 (it is older
+    // than the window, or the orchestrator's filter dropped it) means we
+    // cannot honestly compute a drop — report `None` rather than
+    // silently `false`. [`drop`] answers the question when the row is
+    // present.
+    Ok(if found_current {
+        drop(current_rows, &history)
+    } else {
+        None
+    })
+}
+
 /// `POST /api/pipelines/events/run-finished` — Dagster's `run_status_sensor`
 /// for `SUCCESS` calls this once per successful run (plan 1f). It fires
 /// the `pipeline_slow` and `pipeline_volume_drop` alerts for the run.
@@ -1416,49 +1522,11 @@ pub async fn run_finished_event(
         run_duration,
         sla.as_ref().and_then(|s| s.max_duration_seconds),
     );
-    let volume_drop = match &sla {
-        // The volume-drop rule needs a row count and at least 5 prior
-        // completed runs. Pull them in one query (the same 30-run
-        // window the volume route uses), then walk them oldest-first
-        // building the history up to the current run.
-        Some(_) => {
-            let job = authored_pipelines::job_name(&pipeline_id);
-            let runs_with_rows = state
-                .dagster
-                .list_runs_for_job_with_materializations(&job, 30)
-                .await
-                .map_err(|err| ApiError::Unavailable(js_error(err)))?;
-            let mut history: Vec<i64> = Vec::with_capacity(runs_with_rows.len());
-            let mut current_rows: Option<i64> = None;
-            let mut found_current = false;
-            // Walk oldest-first (Dagster returns most-recent first).
-            for run in runs_with_rows.iter().rev() {
-                if run.run.run_id == req.run_id {
-                    current_rows = run.rows;
-                    found_current = true;
-                    break;
-                }
-                if matches!(run.run.status.as_str(), "SUCCESS" | "FAILURE")
-                    && let Some(rows) = run.rows
-                {
-                    history.push(rows);
-                }
-            }
-            // The current run not appearing in Dagster's recent 30
-            // (it is older than the window, or the orchestrator's
-            // filter dropped it) means we cannot honestly compute a
-            // drop — report `None` rather than silently `false`. The
-            // match against `drop(current_rows, &history)` is the only
-            // honest path, and it answers the question when the row is
-            // present.
-            if found_current {
-                drop(current_rows, &history)
-            } else {
-                None
-            }
-        }
+    let volume_drop = if sla.is_some() {
+        volume_drop_for_run(&state, &pipeline_id, &req.run_id).await?
+    } else {
         // No SLA at all — the alert rule cannot decide.
-        None => None,
+        None
     };
     let http = reqwest::Client::new();
     let email = EmailSender::new(smtp_config(&state.config));
@@ -1466,18 +1534,52 @@ pub async fn run_finished_event(
         .pg
         .as_deref()
         .map(|pg| Box::new(ApiSilenceSource { pg }) as Box<dyn SilenceSource>);
-    let matched = lakehouse_alerts::evaluate_pipeline_run_finished(
-        &state.clickhouse,
-        &http,
-        &email,
-        &pipeline_id,
-        &req.run_id,
-        slow,
-        volume_drop,
-        silence_source.as_deref().map(|s| s as &dyn SilenceSource),
-    )
-    .await
-    .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+    // Reviewer fix #1: per-kind dedupe through `pipeline_run_event`,
+    // matching the `run_failed_event` posture for kind `"failure"`.
+    // Each kind is independently deduped — a run can be both slow AND
+    // a volume drop, firing both once each. `slow == Some(false)` and
+    // `volume_drop == None` (cannot decide) are short-circuited: no
+    // dedupe row, no delivery. `slow == Some(true)` and
+    // `volume_drop == Some(true)` each go through their own
+    // `record_pipeline_run_event` BEFORE delivery; a `false` return
+    // means the same `(run_id, kind)` pair was already inserted (a
+    // sensor retry) and that kind is skipped for this call.
+    let mut matched = 0_usize;
+    if slow == Some(true) {
+        let first_seen =
+            pipelines::record_pipeline_run_event(pool, &req.run_id, &pipeline_id, "slow").await?;
+        if first_seen {
+            matched += lakehouse_alerts::evaluate_pipeline_slow(
+                &state.clickhouse,
+                &http,
+                &email,
+                &pipeline_id,
+                &req.run_id,
+                true,
+                silence_source.as_deref().map(|s| s as &dyn SilenceSource),
+            )
+            .await
+            .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+        }
+    }
+    if volume_drop == Some(true) {
+        let first_seen =
+            pipelines::record_pipeline_run_event(pool, &req.run_id, &pipeline_id, "volume_drop")
+                .await?;
+        if first_seen {
+            matched += lakehouse_alerts::evaluate_pipeline_volume_drop(
+                &state.clickhouse,
+                &http,
+                &email,
+                &pipeline_id,
+                &req.run_id,
+                true,
+                silence_source.as_deref().map(|s| s as &dyn SilenceSource),
+            )
+            .await
+            .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+        }
+    }
     Ok(ApiJson(json!({ "matched": matched })))
 }
 
@@ -1531,8 +1633,11 @@ fn now_iso() -> String {
 /// system clock is unset (an unreachable NTP source on some build hosts),
 /// so [`late`] can refuse to claim rather than guess from a meaningless
 /// zero. The list route calls this once per response so every row agrees
-/// on the clock.
-fn now_unix_seconds() -> Option<f64> {
+/// on the clock. Exposed `pub(crate)` so [`crate::routes::alerts`]'s
+/// late-evaluation pass uses the same helper — a broken clock would
+/// otherwise show up as `Some(0.0)` ("late since 1970") at one call site
+/// and honest `None` at another.
+pub(crate) fn now_unix_seconds() -> Option<f64> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -2996,6 +3101,212 @@ mod tests {
         }
     }
 
+    /// Plan 1f reviewer fix #3 — the `GET /api/pipelines/{id}/volume`
+    /// response shape (`runs`/`medianRows`/`unavailable`) and the
+    /// degraded path. Pinned through the pure [`volume_body`] helper:
+    /// the route itself is a thin `(StatusCode, ApiJson)` wrapper
+    /// around the helper plus a Dagster-error branch, so testing the
+    /// helper is enough to lock the contract.
+    mod volume_route {
+        use std::collections::HashMap;
+
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use lakehouse_dagster::{DgRun, DgRunWithRows};
+        use serde_json::{Value, json};
+
+        use super::{volume, volume_body};
+        use crate::config::Config;
+        use crate::state::AppState;
+
+        /// Build a `DgRunWithRows` for the body tests — `runs` arrive
+        /// most-recent-first from `Dagster`, so each entry is a fresh
+        /// `start_time` strictly greater than the next one.
+        fn run_with_rows(
+            run_id: &str,
+            status: &str,
+            start: Option<f64>,
+            end: Option<f64>,
+            rows: Option<i64>,
+        ) -> DgRunWithRows {
+            DgRunWithRows {
+                run: DgRun {
+                    run_id: run_id.to_owned(),
+                    job_name: "j".to_owned(),
+                    status: status.to_owned(),
+                    start_time: start,
+                    end_time: end,
+                    creation_time: None,
+                    parent_run_id: None,
+                    root_run_id: None,
+                    tags: Vec::new(),
+                },
+                rows,
+            }
+        }
+
+        /// The exact shape the spec names: `runs`, `medianRows`,
+        /// `unavailable`. No `pipelineId` (the spec doesn't list it),
+        /// no other keys. `runs` is ordered newest-first to match the
+        /// graph on the console; `medianRows` is the median of every
+        /// completed run that reported rows — the same median the drop
+        /// rule uses (reviewer fix #3: "the same median the drop rule
+        /// uses").
+        #[test]
+        fn volume_body_returns_the_spec_shape_with_medianrows_and_null_unavailable() {
+            // 7 completed runs reporting rows [10, 20, 30, 40, 50, 60, 70];
+            // 1 still-running with `rows = null` (must NOT enter the
+            // median); 1 completed with `rows = null` (also excluded).
+            let runs = vec![
+                run_with_rows("r7", "SUCCESS", Some(70.0), Some(80.0), Some(70)),
+                run_with_rows("r6", "SUCCESS", Some(60.0), Some(70.0), Some(60)),
+                run_with_rows("r5", "SUCCESS", Some(50.0), Some(60.0), Some(50)),
+                run_with_rows("r4", "SUCCESS", Some(40.0), Some(50.0), Some(40)),
+                run_with_rows("r3", "SUCCESS", Some(30.0), Some(40.0), Some(30)),
+                run_with_rows("r2", "SUCCESS", Some(20.0), Some(30.0), Some(20)),
+                run_with_rows("r1", "SUCCESS", Some(10.0), Some(20.0), Some(10)),
+                run_with_rows("r0", "STARTED", Some(5.0), None, None),
+                run_with_rows("rN", "FAILURE", Some(1.0), Some(2.0), None),
+            ];
+            let body = volume_body(&runs);
+
+            assert_eq!(
+                body["unavailable"],
+                Value::Null,
+                "successful Dagster fetch: `unavailable` must be null"
+            );
+            assert_eq!(
+                body["medianRows"],
+                json!(40),
+                "sorted [10,20,30,40,50,60,70] -> index 3 -> 40; same median the drop rule uses"
+            );
+            // `runs` is ordered newest-first, identical to the input.
+            let rs = body["runs"].as_array().expect("runs is an array");
+            assert_eq!(rs.len(), 9);
+            assert_eq!(rs[0]["runId"], "r7");
+            assert_eq!(rs[8]["runId"], "rN");
+            // The two null-rows runs emit `rows: null`, not 0.
+            assert!(rs[7]["rows"].is_null());
+            assert!(rs[8]["rows"].is_null());
+            // `r0` is `STARTED` -> drop is `null` (in-progress is not
+            // a drop).
+            assert!(rs[7]["drop"].is_null(), "STARTED is not a drop");
+            // `rN` (FAILURE, no rows): `drop` is `null` per the `drop`
+            // helper — null rows is a measurement gap, not a drop.
+            assert!(rs[8]["drop"].is_null());
+            // No `pipelineId` key — the spec does not list it.
+            assert!(
+                body.get("pipelineId").is_none(),
+                "the spec shape has no pipelineId"
+            );
+        }
+
+        /// When no completed run reported any rows, the median is
+        /// `None` — `medianRows: null`, not `0`. An honest `null` keeps
+        /// the chart from inventing a baseline over an empty set.
+        #[test]
+        fn volume_body_returns_null_medianrows_when_no_run_reported_rows() {
+            let runs = vec![
+                run_with_rows("a", "STARTED", Some(2.0), None, None),
+                run_with_rows("b", "FAILURE", Some(1.0), Some(2.0), None),
+                run_with_rows("c", "SUCCESS", Some(0.5), Some(1.0), None),
+            ];
+            let body = volume_body(&runs);
+            assert!(
+                body["medianRows"].is_null(),
+                "no completed run reported rows: medianRows is null, not 0 or median([])"
+            );
+            assert_eq!(body["unavailable"], Value::Null);
+            // `drop` is `null` for every run — the drop rule has no
+            // history to compare against.
+            for r in body["runs"].as_array().unwrap() {
+                assert!(r["drop"].is_null(), "drop is null when no history");
+            }
+        }
+
+        /// `medianRows` matches the median the drop rule uses for an
+        /// even-length history (`sorted[n/2]` upper-of-middle). Six
+        /// completed runs: the chart median is 40 (`sorted[6/2]`), and
+        /// the newest run's drop rule sees exactly the 5-sample floor
+        /// of history with its own median 30 → half 15, so 60 rows is
+        /// not a drop. Pinning both numbers in one test keeps the
+        /// chart's `medianRows` and the rule's median from drifting
+        /// apart on a future refactor.
+        #[test]
+        fn volume_body_medianrows_matches_the_drop_rule_median() {
+            let runs = vec![
+                run_with_rows("r6", "SUCCESS", Some(60.0), Some(70.0), Some(60)),
+                run_with_rows("r5", "SUCCESS", Some(50.0), Some(60.0), Some(50)),
+                run_with_rows("r4", "SUCCESS", Some(40.0), Some(50.0), Some(40)),
+                run_with_rows("r3", "SUCCESS", Some(30.0), Some(40.0), Some(30)),
+                run_with_rows("r2", "SUCCESS", Some(20.0), Some(30.0), Some(20)),
+                run_with_rows("r1", "SUCCESS", Some(10.0), Some(20.0), Some(10)),
+            ];
+            let body = volume_body(&runs);
+            assert_eq!(
+                body["medianRows"],
+                json!(40),
+                "sorted [10,20,30,40,50,60] -> index 3 -> 40"
+            );
+            let rs = body["runs"].as_array().unwrap();
+            // Newest run: 5 prior samples [10,20,30,40,50], median 30,
+            // half 15; 60 < 15 is false.
+            assert_eq!(rs[0]["drop"], json!(false));
+            // Second-newest: only 4 prior samples — below the
+            // 5-sample floor, so an honest null even though 50 > 15.
+            assert!(
+                rs[1]["drop"].is_null(),
+                "4 prior samples is below the floor: drop is null"
+            );
+            // Oldest run has no history at all → null.
+            assert!(rs[5]["drop"].is_null());
+        }
+
+        /// Dagster unreachable: the route returns 200 (not 503) with
+        /// `runs: []`, `medianRows: null`, and `unavailable` set to a
+        /// classified, non-upstream reason string — mirroring
+        /// [`runs_body`]'s degraded branch so the console can show
+        /// "no runs right now, but here's why" instead of treating the
+        /// outage as a hard error.
+        #[tokio::test]
+        async fn volume_route_degrades_to_unavailable_when_dagster_is_down() {
+            // A Dagster URL on a closed local port, never the config
+            // default; a unit test must not dial whatever happens to
+            // listen there. Mirrors `list_with_a_tenantless_unrestricted_principal_still_queries_dagster`.
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), "not a postgres url".to_owned());
+            env.insert(
+                "DAGSTER_URL".to_owned(),
+                "http://127.0.0.1:1/graphql".to_owned(),
+            );
+            let state = AppState::new(Config::from_map(&env).expect("a valid test Config"));
+            let response = volume(State(state), Path("j".to_owned())).await;
+            assert_eq!(response.status(), StatusCode::OK, "200, not 503");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&body).expect("valid JSON");
+            assert_eq!(v["runs"], json!([]));
+            assert!(v["medianRows"].is_null());
+            assert!(
+                v["unavailable"].is_string(),
+                "unavailable is the classified reason string"
+            );
+            // AGENTS.md rule 4: upstream text must never reach a
+            // response body. The Dagster URL we fed the client is the
+            // most likely upstream detail to leak — assert it is
+            // absent.
+            assert!(
+                !v["unavailable"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("127.0.0.1:1"),
+                "upstream URL must not leak into the response: got {:?}",
+                v["unavailable"]
+            );
+        }
+    }
+
     /// WS4 item C1 — `GET /api/pipelines/{id}` for a `Dagster`-native job:
     /// no Postgres needed, `state.dagster` is a `wiremock` stand-in.
     mod detail_route {
@@ -4162,6 +4473,225 @@ mod tests {
             assert_eq!(
                 resp.0["reason"],
                 "unknown jobName; no runnable pipeline owns it"
+            );
+        }
+    }
+
+    /// Plan 1f reviewer fix #1 — `POST /api/pipelines/events/run-finished`
+    /// dedupes each alert kind through `pipeline_run_event` BEFORE
+    /// delivery, so a sensor retry for the same run never double-fires
+    /// `pipeline_slow` / `pipeline_volume_drop` (same posture
+    /// `run_failed_event` has for kind `"failure"`).
+    mod run_finished_event_route {
+        use axum::body::Bytes;
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+        use crate::config::Config;
+
+        /// Postgres + a wiremock `Dagster` and `ClickHouse`, wired
+        /// through the same env keys production uses.
+        fn state_for(pool: &sqlx::PgPool, dagster_url: &str, ch_url: &str) -> AppState {
+            let options = pool.connect_options();
+            let database_url = format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database"),
+            );
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url);
+            env.insert("DAGSTER_URL".to_owned(), format!("{dagster_url}/graphql"));
+            env.insert("CH_URL".to_owned(), ch_url.to_owned());
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        fn body_for(run_id: &str, job_name: &str) -> Bytes {
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "runId": run_id,
+                    "jobName": job_name,
+                }))
+                .expect("serialize"),
+            )
+        }
+
+        /// An authored pipeline in status `ready` (the store's own
+        /// definition of runnable), created through the real create
+        /// route. The status UPDATE bypasses the transition route's
+        /// state machine on purpose: that machine's own tests live in
+        /// `status_route`, and this fixture only needs a row
+        /// `list_runnable_pipelines` will return.
+        async fn seed_runnable_pipeline(state: &AppState, name: &str) -> String {
+            let body = Bytes::from(
+                serde_json::to_vec(&json!({
+                    "name": name,
+                    "kind": "batch",
+                    "sourceZone": "bronze",
+                    "sourceTable": "t",
+                    "targetZone": "silver",
+                    "targetTable": "t",
+                    "schedule": "manual",
+                }))
+                .expect("serialize"),
+            );
+            let (_, ApiJson(pipeline)) = create(
+                State(state.clone()),
+                Extension(fixture_user_principal()),
+                HeaderMap::new(),
+                body,
+            )
+            .await
+            .expect("create should succeed");
+            let pool = state.pg.as_deref().expect("DATABASE_URL was set");
+            sqlx::query("UPDATE pipeline_definition SET status = 'ready' WHERE id = $1")
+                .bind(&pipeline.id)
+                .execute(pool)
+                .await
+                .expect("mark the fixture runnable");
+            pipeline.id
+        }
+
+        /// A sensor retry must not re-deliver: the first
+        /// `run-finished` call for a slow run records kind `"slow"`
+        /// and delivers once; an identical second call dedupes away.
+        /// Asserted three ways — `matched` (1 then 0), the single
+        /// `pipeline_run_event` row, and the webhook receiving
+        /// exactly one POST.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn a_second_run_finished_event_for_the_same_run_does_not_re_deliver(
+            pool: sqlx::PgPool,
+        ) {
+            let dagster = MockServer::start().await;
+            let ch = MockServer::start().await;
+            let webhook = MockServer::start().await;
+
+            let state = state_for(&pool, &dagster.uri(), &ch.uri());
+            // Seed first: the mocks below embed the id, which
+            // `slug_id` derives from the name plus a millisecond
+            // stamp, so it is only known after the create call. The
+            // job name goes through the real `job_name` mapping (it
+            // sanitizes the id, e.g. `-` → `_`).
+            let pipeline_id = seed_runnable_pipeline(&state, "Dedupe flow").await;
+            let job = super::super::authored_pipelines::job_name(&pipeline_id);
+
+            // `pipeline_run_status`: the run is SUCCESS, lasting 1000s.
+            Mock::given(method("POST"))
+                .and(body_string_contains("pipelineRunOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "pipelineRunOrError": {
+                        "__typename": "Run", "status": "SUCCESS",
+                        "startTime": 1000.0, "endTime": 2000.0, "stepStats": []
+                    } }
+                })))
+                .mount(&dagster)
+                .await;
+            // `list_runs_for_job_with_materializations` (the volume-drop
+            // half): the same run, no materializations, so `rows` is an
+            // honest `None` and `volume_drop` cannot decide — only the
+            // `slow` kind is exercised here.
+            Mock::given(method("POST"))
+                .and(body_string_contains("runsOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "runsOrError": { "__typename": "Runs", "results": [
+                        {
+                            "runId": "run-slow",
+                            "jobName": job,
+                            "status": "SUCCESS",
+                            "startTime": 1000.0, "endTime": 2000.0,
+                            "creationTime": null,
+                            "parentRunId": null, "rootRunId": null,
+                            "tags": [], "stepStats": []
+                        }
+                    ] } }
+                })))
+                .mount(&dagster)
+                .await;
+            // `list_rules`' SELECT — one enabled `pipeline_slow` rule
+            // scoped to the pipeline, targeting the webhook server.
+            Mock::given(method("POST"))
+                .and(body_string_contains("FROM console.alert_rule"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "meta": [], "rows": 1,
+                    "data": [{
+                        "id": "al-slow-dedupe-1",
+                        "name": "Slow dedupe rule",
+                        "type": "pipeline_slow",
+                        "mart": "", "measure": "", "agg": "sum",
+                        "op": ">", "threshold": "0", "board": "",
+                        "channel": "webhook",
+                        "target": webhook.uri(),
+                        "enabled": "1", "created_at": "",
+                        "severity": "high",
+                        "pipeline": pipeline_id,
+                    }]
+                })))
+                .mount(&ch)
+                .await;
+            // `ensure()`'s DDL — anything else answers 200.
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&ch)
+                .await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&webhook)
+                .await;
+
+            // Duration SLA 60s: the mocked run ran 1000s → slow fires.
+            pipelines::upsert_pipeline_sla(&pool, &pipeline_id, Some(60), None, uuid::Uuid::nil())
+                .await
+                .expect("seed the SLA row");
+
+            let first = run_finished_event(
+                State(state.clone()),
+                Extension(fixture_service_principal()),
+                body_for("run-slow", &job),
+            )
+            .await
+            .expect("the first event must be accepted");
+            assert_eq!(
+                first.0["matched"], 1,
+                "the first event delivers to the one matching rule"
+            );
+
+            let second = run_finished_event(
+                State(state),
+                Extension(fixture_service_principal()),
+                body_for("run-slow", &job),
+            )
+            .await
+            .expect("a sensor retry must be accepted, not error");
+            assert_eq!(
+                second.0["matched"], 0,
+                "the retry for the same (run, kind) is deduped away"
+            );
+
+            let rows: Vec<(String, String, String)> =
+                sqlx::query_as("SELECT run_id, pipeline_id, kind FROM pipeline_run_event")
+                    .fetch_all(&pool)
+                    .await
+                    .expect("read the dedupe table");
+            assert_eq!(
+                rows,
+                vec![(
+                    "run-slow".to_owned(),
+                    pipeline_id.clone(),
+                    "slow".to_owned()
+                )],
+                "exactly one dedupe row for the slow kind"
+            );
+
+            let webhook_posts = webhook.received_requests().await.expect("request log");
+            assert_eq!(
+                webhook_posts.len(),
+                1,
+                "the webhook was hit exactly once across both calls"
             );
         }
     }

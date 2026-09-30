@@ -1236,27 +1236,15 @@ pub async fn evaluate_pipeline_late(
     silence: Option<&dyn SilenceSource>,
     now_seconds: Option<f64>,
 ) -> Result<usize, PipelineLateError> {
-    // Resolve the "is this pipeline late?" inputs from the source.
-    // `None` source means the route handler could not provide one (e.g.
-    // Postgres unconfigured) — every `pipeline_late` rule is skipped
-    // rather than silently dropped.
-    let inputs = match late_source {
-        None => return Ok(0),
-        Some(src) => match src.late_inputs(pipeline_id).await {
-            Ok(Some(inputs)) => Some(inputs),
-            Ok(None) => None, // No SLA row — every rule is unsupported.
-            Err(err) => {
-                // Classified upstream error from the source — propagate
-                // to the caller so it surfaces a 500 (not a false-skip).
-                return Err(PipelineLateError::Source(err));
-            }
-        },
-    };
-    let late_decision = match inputs {
-        Some((threshold, last_success)) => late(now_seconds, last_success, Some(threshold)),
-        None => None,
-    };
-
+    let late_decision = late_decision(late_source, pipeline_id, now_seconds).await?;
+    // `evaluate_pipeline_late`'s caller (the alerts-route `/api/alerts/run`
+    // orchestration) needs the decision BEFORE delivery for the
+    // `pipeline_run_event` dedupe (reviewer fix #2). When that
+    // orchestration decides late==true and the dedupe row inserts
+    // successfully, it calls `evaluate_pipeline_late` again to deliver;
+    // redoing the decision here is wasted work but never wrong, and
+    // keeping the single-call entry point preserves the existing
+    // `evaluate_pipeline_late` test surface.
     let rules: Vec<AlertRule> = list_rules(ch)
         .await?
         .into_iter()
@@ -1292,6 +1280,57 @@ pub async fn evaluate_pipeline_late(
     Ok(delivered)
 }
 
+/// Plan 1f (reviewer fix #2): compute the "is this pipeline currently
+/// late?" decision without delivering anything. The route handler at
+/// `/api/alerts/run` calls this to decide whether to write the
+/// `pipeline_run_event` dedupe row; delivery (via
+/// [`evaluate_pipeline_late`]) only happens when this returns
+/// `Some(true)` AND the dedupe row was newly inserted.
+///
+/// Returns `Ok(None)` when no claim can be made: no source, source has
+/// no SLA row, or `late()` itself cannot decide (no `now_seconds`).
+/// Returns `Ok(Some(true))` / `Ok(Some(false))` for the genuine
+/// decisions. Propagates a [`PipelineLateError::Source`] for any
+/// classified error the [`LateSource`] implementation raises.
+///
+/// The crate has no `PgPool` by design (AGENTS.md rule 4: never leak
+/// upstream text into responses; the route layer is the one place
+/// that holds a pool and classifies messages), so this function and
+/// [`evaluate_pipeline_late`] deliberately stay free of database
+/// dependencies.
+///
+/// # Errors
+///
+/// Returns [`PipelineLateError::Source`] for any classified error the
+/// [`LateSource`] implementation propagates (the route layer maps that
+/// to a fixed "internal" message — never the upstream detail).
+pub async fn late_decision(
+    late_source: Option<&dyn LateSource>,
+    pipeline_id: &str,
+    now_seconds: Option<f64>,
+) -> Result<Option<bool>, PipelineLateError> {
+    // Resolve the "is this pipeline late?" inputs from the source.
+    // `None` source means the route handler could not provide one (e.g.
+    // Postgres unconfigured) — every `pipeline_late` rule is skipped
+    // rather than silently dropped.
+    let inputs = match late_source {
+        None => return Ok(None),
+        Some(src) => match src.late_inputs(pipeline_id).await {
+            Ok(Some(inputs)) => Some(inputs),
+            Ok(None) => None, // No SLA row — every rule is unsupported.
+            Err(err) => {
+                // Classified upstream error from the source — propagate
+                // to the caller so it surfaces a 500 (not a false-skip).
+                return Err(PipelineLateError::Source(err));
+            }
+        },
+    };
+    Ok(match inputs {
+        Some((threshold, last_success)) => late(now_seconds, last_success, Some(threshold)),
+        None => None,
+    })
+}
+
 /// Errors [`evaluate_pipeline_late`] can return. Two flavours:
 /// * `ListRules(ChError)` — `ClickHouse` unreachable while listing
 ///   alert rules (mirrors the sibling functions' `ChError` return);
@@ -1311,61 +1350,116 @@ pub enum PipelineLateError {
     Source(String),
 }
 
-/// Plan 1f entry point: deliver every enabled [`AlertKind::PipelineSlow`]
-/// and [`AlertKind::PipelineVolumeDrop`] rule whose `pipeline` matches
-/// `pipeline_id`. The route handler (mirroring `evaluate_pipeline_failure`'s
-/// flow) computes the two per-run outcomes itself — `slow` from the run's
-/// own `durationSeconds` vs the pipeline's `pipeline_sla.max_duration_seconds`,
-/// `volume_drop` from the row count vs the median of the prior 5+ completed
-/// runs — and passes the booleans in. A `None` for either outcome means the
-/// rule kind cannot decide (e.g. `volume_drop` with fewer than 5 prior
-/// samples): the matching rules are SKIPPED in that case, never fired or
-/// silently dropped. `slow` can never be `None` once a `max_duration_seconds`
-/// exists, so it is required.
+/// Plan 1f reviewer fix #1: deliver every enabled [`AlertKind::PipelineSlow`]
+/// rule whose `pipeline` matches `pipeline_id`. The route handler at
+/// `routes::pipelines::run_finished_event` is responsible for the
+/// per-kind `pipeline_run_event` dedupe BEFORE this is invoked (same
+/// pattern `run_failed_event` uses for kind `"failure"`); a `false`
+/// `is_slow` skips the kind entirely. The crate has no `PgPool` by
+/// design (AGENTS.md rule 4) — the route layer is the only place the
+/// dedupe write happens.
 ///
 /// # Errors
 ///
 /// Returns [`ChError`] only if [`list_rules`] itself fails (e.g.
 /// `ClickHouse` unreachable). Per-rule delivery failures are reported via
 /// [`DeliverResult`] inside `deliver_unless_silenced`, never propagated.
-pub async fn evaluate_pipeline_run_finished(
+pub async fn evaluate_pipeline_slow(
     ch: &ChClient,
     http: &reqwest::Client,
     email: &EmailSender,
     pipeline_id: &str,
     run_id: &str,
-    slow: Option<bool>,
-    volume_drop: Option<bool>,
+    is_slow: bool,
     silence: Option<&dyn SilenceSource>,
 ) -> Result<usize, ChError> {
+    if !is_slow {
+        // Reviewer fix #1: the route already deduped each kind before
+        // calling in — `is_slow == false` means "the rule kind did
+        // not fire on this run" (no SLA, or the run finished in time).
+        // Skip rather than re-list rules and discover the same answer.
+        return Ok(0);
+    }
     let console_link = format!("/pipelines/{pipeline_id}?run={run_id}");
-    // Build one message per kind that fired. Rules that don't match
-    // `pipeline_id` (or `*`) are filtered below; here we only need the
-    // per-rule delivery text.
-    let slow_text = if slow == Some(true) {
-        Some(format!(
-            "Pipeline {pipeline_id} run {run_id} exceeded its duration SLA. View: {console_link}"
-        ))
-    } else {
-        None
-    };
-    let volume_drop_text = if volume_drop == Some(true) {
-        Some(format!(
-            "Pipeline {pipeline_id} run {run_id} processed fewer than half the median \
-             rows of its prior runs. View: {console_link}"
-        ))
-    } else {
-        None
-    };
+    let text = format!(
+        "Pipeline {pipeline_id} run {run_id} exceeded its duration SLA. View: {console_link}"
+    );
+    let title_prefix = "🐢 Pipeline slow";
+    deliver_one_kind(
+        ch,
+        http,
+        email,
+        pipeline_id,
+        silence,
+        AlertKind::PipelineSlow,
+        title_prefix,
+        &text,
+    )
+    .await
+}
+
+/// Plan 1f reviewer fix #1: deliver every enabled
+/// [`AlertKind::PipelineVolumeDrop`] rule whose `pipeline` matches
+/// `pipeline_id`. Same posture as [`evaluate_pipeline_slow`]: the
+/// route handler dedupes per kind before calling.
+///
+/// # Errors
+///
+/// Returns [`ChError`] only if [`list_rules`] itself fails (e.g.
+/// `ClickHouse` unreachable). Per-rule delivery failures are reported via
+/// [`DeliverResult`] inside `deliver_unless_silenced`, never propagated.
+pub async fn evaluate_pipeline_volume_drop(
+    ch: &ChClient,
+    http: &reqwest::Client,
+    email: &EmailSender,
+    pipeline_id: &str,
+    run_id: &str,
+    is_volume_drop: bool,
+    silence: Option<&dyn SilenceSource>,
+) -> Result<usize, ChError> {
+    if !is_volume_drop {
+        return Ok(0);
+    }
+    let console_link = format!("/pipelines/{pipeline_id}?run={run_id}");
+    let text = format!(
+        "Pipeline {pipeline_id} run {run_id} processed fewer than half the median \
+         rows of its prior runs. View: {console_link}"
+    );
+    let title_prefix = "📉 Pipeline volume drop";
+    deliver_one_kind(
+        ch,
+        http,
+        email,
+        pipeline_id,
+        silence,
+        AlertKind::PipelineVolumeDrop,
+        title_prefix,
+        &text,
+    )
+    .await
+}
+
+/// Shared helper for [`evaluate_pipeline_slow`] and
+/// [`evaluate_pipeline_volume_drop`]: list the enabled rules for the
+/// single `kind`, deliver `text` to each, and count the deliveries.
+/// The pre-filter on `is_slow` / `is_volume_drop` happened in the
+/// caller — this never sees a "this kind didn't fire" case.
+async fn deliver_one_kind(
+    ch: &ChClient,
+    http: &reqwest::Client,
+    email: &EmailSender,
+    pipeline_id: &str,
+    silence: Option<&dyn SilenceSource>,
+    kind: AlertKind,
+    title_prefix: &str,
+    text: &str,
+) -> Result<usize, ChError> {
     let rules: Vec<AlertRule> = list_rules(ch)
         .await?
         .into_iter()
         .filter(|r| {
             r.enabled
-                && matches!(
-                    r.kind,
-                    AlertKind::PipelineSlow | AlertKind::PipelineVolumeDrop
-                )
+                && r.kind == kind
                 && r.pipeline
                     .as_deref()
                     .is_some_and(|p| p == pipeline_id || p == "*")
@@ -1373,24 +1467,7 @@ pub async fn evaluate_pipeline_run_finished(
         .collect();
     let mut delivered = 0_usize;
     for rule in &rules {
-        let text = match rule.kind {
-            AlertKind::PipelineSlow => slow_text.as_deref(),
-            AlertKind::PipelineVolumeDrop => volume_drop_text.as_deref(),
-            _ => None,
-        };
-        // `text == None` means "this rule's kind could not decide on this
-        // run" (no SLA for slow; fewer than 5 prior samples for
-        // volume_drop). Skip rather than fire or silently drop — same
-        // posture [`run_freshness`] takes for a missing dataset SLA.
-        let Some(text) = text else {
-            continue;
-        };
-        let title = match rule.kind {
-            AlertKind::PipelineSlow => format!("🐢 Pipeline slow: {}", rule.name),
-            AlertKind::PipelineVolumeDrop => format!("📉 Pipeline volume drop: {}", rule.name),
-            // Unreachable: `rules` is filtered to the two kinds above.
-            _ => continue,
-        };
+        let title = format!("{title_prefix}: {}", rule.name);
         if let Some(DeliverResult { .. }) =
             deliver_unless_silenced(http, email, silence, rule, &title, text).await
         {
