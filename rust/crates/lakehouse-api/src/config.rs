@@ -104,6 +104,13 @@ pub struct Config {
     /// `connector_probe_allow_internal_hosts`. Empty by default. See
     /// [`crate::internal_hosts`] for what the list can never open.
     pub connector_probe_allowed_cidrs: Vec<ipnet::IpNet>,
+    /// Where connector credential files physically live
+    /// (`CONNECTOR_SECRETS_DIR`, default `/run/secrets`). Refs always say
+    /// `file:/run/secrets/...`, the path Dagster reads inside its own
+    /// container; this moves only where the API itself reads and writes
+    /// them — e.g. when it runs outside Docker, where `/run/secrets` does
+    /// not exist and every stored credential would fail with a 503.
+    pub connector_secrets_dir: std::path::PathBuf,
     /// Whether this deployment says Oracle CDC via `Debezium`'s `LogMiner`
     /// connector is wanted. Default `false`; `true` only for the exact string
     /// `"true"`.
@@ -720,6 +727,7 @@ impl std::fmt::Debug for Config {
                 "connector_probe_allowed_cidrs",
                 &self.connector_probe_allowed_cidrs,
             )
+            .field("connector_secrets_dir", &self.connector_secrets_dir)
             .field(
                 "oracle_cdc_logminer_enabled",
                 &self.oracle_cdc_logminer_enabled,
@@ -950,6 +958,10 @@ impl Config {
                     .map_or("", String::as_str),
             )
             .map_err(ConfigError::MalformedAllowedCidrs)?,
+            connector_secrets_dir: truthy(env, "CONNECTOR_SECRETS_DIR").map_or_else(
+                || std::path::PathBuf::from(crate::state::CONNECTOR_SECRETS_DIR),
+                std::path::PathBuf::from,
+            ),
             oracle_cdc_logminer_enabled: env
                 .get("ORACLE_CDC_LOGMINER_ENABLED")
                 .is_some_and(|v| v == "true"),

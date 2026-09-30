@@ -374,16 +374,37 @@ pub(crate) const CONNECTOR_ALLOWED_SECRET_REF_PATTERNS: [&str; 7] = [
 struct ConnectorSecretResolver {
     env: EnvSecretResolver,
     file: FileSecretResolver,
+    /// Where `file:/run/secrets/...` refs are read from
+    /// (`Config::connector_secrets_dir`).
+    dir: std::path::PathBuf,
 }
 
 impl ConnectorSecretResolver {
-    fn new() -> Self {
+    fn new(dir: &std::path::Path) -> Self {
         Self {
             env: EnvSecretResolver::new(),
-            // `/run/secrets` is the fixed Docker/Compose secrets mount this
-            // deployment uses — see `FileSecretResolver`'s doc comment for
-            // why a fixed base directory (not caller-supplied) matters.
-            file: FileSecretResolver::new(CONNECTOR_SECRETS_DIR),
+            // A fixed base directory, never caller-supplied — see
+            // `FileSecretResolver`'s doc comment for why that matters.
+            file: FileSecretResolver::new(dir),
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    /// `secret_ref` with its `/run/secrets/` path moved to [`Self::dir`]
+    /// when the two differ. Refs name `/run/secrets` because that is where
+    /// Dagster reads them; the API may keep the same files elsewhere.
+    fn located(&self, secret_ref: &str) -> String {
+        let logical = format!(
+            "{}{CONNECTOR_SECRETS_DIR}/",
+            lakehouse_core::secret::FILE_SECRET_REF_PREFIX
+        );
+        match secret_ref.strip_prefix(&logical) {
+            Some(name) if self.dir != std::path::Path::new(CONNECTOR_SECRETS_DIR) => format!(
+                "{}{}",
+                lakehouse_core::secret::FILE_SECRET_REF_PREFIX,
+                self.dir.join(name).display()
+            ),
+            _ => secret_ref.to_owned(),
         }
     }
 }
@@ -393,7 +414,7 @@ impl SecretResolver for ConnectorSecretResolver {
         if secret_ref.starts_with(lakehouse_core::secret::ENV_SECRET_REF_PREFIX) {
             self.env.resolve(secret_ref).await
         } else if secret_ref.starts_with(lakehouse_core::secret::FILE_SECRET_REF_PREFIX) {
-            self.file.resolve(secret_ref).await
+            self.file.resolve(&self.located(secret_ref)).await
         } else {
             Err(SecretError::UnsupportedRef {
                 secret_ref: secret_ref.to_owned(),
@@ -520,6 +541,7 @@ impl AppState {
             &config.lakekeeper_base_url,
         )
         .map(Arc::new);
+        let secrets_dir = config.connector_secrets_dir.clone();
         Self {
             config: Arc::new(config),
             clickhouse,
@@ -528,13 +550,13 @@ impl AppState {
             llm: Arc::new(llm),
             pg,
             connector_secret_resolver: Arc::new(AllowlistedSecretResolver::new(
-                ConnectorSecretResolver::new(),
+                ConnectorSecretResolver::new(&secrets_dir),
                 CONNECTOR_ALLOWED_SECRET_REF_PATTERNS
                     .iter()
                     .map(|s| (*s).to_owned()),
                 "connector-allowlist",
             )),
-            connector_secret_store: Arc::new(ConnectorSecretStore::new(CONNECTOR_SECRETS_DIR)),
+            connector_secret_store: Arc::new(ConnectorSecretStore::new(secrets_dir)),
             auth,
             gold_export_locks: MartLocks::default(),
             iceberg: Arc::new(RwLock::new(None)),
@@ -556,6 +578,29 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// `CONNECTOR_SECRETS_DIR`: a `file:/run/secrets/...` ref is read from
+    /// wherever the API keeps the files, while the ref itself (what Dagster
+    /// reads, inside its container) keeps naming `/run/secrets`.
+    #[tokio::test]
+    async fn connector_secrets_are_read_from_the_configured_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("connector_managed_conn_x_password"), "pw\n").unwrap();
+        let resolver = ConnectorSecretResolver::new(dir.path());
+        let value = resolver
+            .resolve("file:/run/secrets/connector_managed_conn_x_password")
+            .await
+            .unwrap();
+        assert_eq!(value.expose_secret(), "pw");
+    }
+
+    /// The default directory leaves every ref exactly as written.
+    #[test]
+    fn the_default_secrets_directory_leaves_refs_unchanged() {
+        let resolver = ConnectorSecretResolver::new(std::path::Path::new(CONNECTOR_SECRETS_DIR));
+        let secret_ref = "file:/run/secrets/connector_managed_conn_x_password";
+        assert_eq!(resolver.located(secret_ref), secret_ref);
+    }
 
     // ── WS7 item C2: `policyDecisionP95Ms` is a real measurement ────────
 

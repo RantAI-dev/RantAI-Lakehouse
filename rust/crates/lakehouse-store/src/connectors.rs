@@ -550,6 +550,17 @@ pub enum CredentialKind {
 }
 
 impl CredentialKind {
+    /// Every kind, so a caller can name every credential a connector could
+    /// have (e.g. to clean up after one whose refs it did not read).
+    pub const ALL: [Self; 6] = [
+        Self::Password,
+        Self::SecretKey,
+        Self::AccessKey,
+        Self::ApiKey,
+        Self::Token,
+        Self::PrivateKey,
+    ];
+
     /// The upper-case suffix ADR 0002 Addendum 3 names, e.g. `"PASSWORD"`.
     /// [`derive_secret_ref`]'s `file:` form lower-cases this itself, rather
     /// than this method offering a second casing — one source of truth for
@@ -1272,34 +1283,78 @@ pub async fn swap_secret_ref(
     expected_old: Option<&str>,
     new_ref: &str,
 ) -> Result<(), StoreError> {
-    let sql = match slot {
-        SecretSlot::Primary => {
-            "UPDATE connector SET secret_ref = $1 WHERE id = $2 AND secret_ref IS NOT DISTINCT FROM $3"
+    swap_secret_refs(
+        pool,
+        id,
+        &[SecretRefSwap {
+            slot,
+            expected_old,
+            new_ref,
+        }],
+    )
+    .await
+}
+
+/// One slot's guarded ref change, for [`swap_secret_refs`].
+#[derive(Debug, Clone, Copy)]
+pub struct SecretRefSwap<'a> {
+    /// Which slot changes.
+    pub slot: SecretSlot,
+    /// What the slot must still hold for the change to apply.
+    pub expected_old: Option<&'a str>,
+    /// What the slot is set to.
+    pub new_ref: &'a str,
+}
+
+/// [`swap_secret_ref`] for several slots at once, in ONE transaction: an
+/// S3 access-key/secret-key pair changes together or not at all. Without
+/// it, the first slot could commit and the second hit a conflict, leaving
+/// the connector with a new access key and its old secret key — a pair
+/// that never authenticates.
+///
+/// # Errors
+///
+/// As [`swap_secret_ref`], for the first swap that does not apply; every
+/// swap before it is rolled back.
+pub async fn swap_secret_refs(
+    pool: &PgPool,
+    id: &str,
+    swaps: &[SecretRefSwap<'_>],
+) -> Result<(), StoreError> {
+    let mut tx = pool.begin().await?;
+    for swap in swaps {
+        let sql = match swap.slot {
+            SecretSlot::Primary => {
+                "UPDATE connector SET secret_ref = $1 WHERE id = $2 AND secret_ref IS NOT DISTINCT \
+                 FROM $3"
+            }
+            SecretSlot::Secondary => {
+                "UPDATE connector SET secret_ref_secondary = $1 WHERE id = $2 AND \
+                 secret_ref_secondary IS NOT DISTINCT FROM $3"
+            }
+        };
+        let result = sqlx::query(sql)
+            .bind(swap.new_ref)
+            .bind(id)
+            .bind(swap.expected_old)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 0 {
+            // Zero rows: figure out which of the two honest reasons
+            // applies -- see `swap_secret_ref`'s doc comment. Dropping
+            // `tx` without committing rolls back every earlier swap.
+            let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM connector WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            return Err(match exists {
+                Some(_) => StoreError::Conflict,
+                None => StoreError::NotFound,
+            });
         }
-        SecretSlot::Secondary => {
-            "UPDATE connector SET secret_ref_secondary = $1 WHERE id = $2 AND secret_ref_secondary \
-             IS NOT DISTINCT FROM $3"
-        }
-    };
-    let result = sqlx::query(sql)
-        .bind(new_ref)
-        .bind(id)
-        .bind(expected_old)
-        .execute(pool)
-        .await?;
-    if result.rows_affected() > 0 {
-        return Ok(());
     }
-    // Zero rows: figure out which of the two honest reasons applies --
-    // see the doc comment above.
-    let exists: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM connector WHERE id = $1")
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
-    match exists {
-        Some(_) => Err(StoreError::Conflict),
-        None => Err(StoreError::NotFound),
-    }
+    tx.commit().await?;
+    Ok(())
 }
 
 /// Everything `dagster/dispar_orchestrate/ingest_factory.py` needs to build

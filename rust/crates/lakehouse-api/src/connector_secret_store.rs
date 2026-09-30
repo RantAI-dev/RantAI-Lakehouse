@@ -40,6 +40,12 @@
 //!   file in the same directory, is `fsync`ed, then renamed over the final
 //!   name, so a concurrent reader sees either the old credential or the new
 //!   one, never a half-written file.
+//! - **A pair changes together or not at all.** [`ConnectorSecretStore::stage`]
+//!   writes every new value aside first; [`StagedCredentials::publish`]
+//!   puts them in place while keeping each replaced file, so
+//!   [`PublishedCredentials::rollback`] can restore the old pair exactly
+//!   when the ref change that should follow fails. Without this, an S3
+//!   access key replaced in place could end up beside the old secret key.
 //!
 //! # Honest limits
 //!
@@ -51,8 +57,9 @@
 
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lakehouse_core::secret::{DynSecretResolver, SecretError, SecretResolver, SecretValue};
 use lakehouse_store::connectors::MANAGED_SECRET_REF_PREFIX;
@@ -76,7 +83,7 @@ pub enum SecretStoreError {
     InvalidValue(&'static str),
     /// A filesystem operation failed.
     #[error(
-        "the connector credential store could not be written ({0:?}); check that the connector_secrets volume is mounted writable at /run/secrets"
+        "the connector credential store could not be written ({0:?}); check that the connector_secrets volume is mounted writable (CONNECTOR_SECRETS_DIR, /run/secrets by default)"
     )]
     Io(std::io::ErrorKind),
 }
@@ -124,6 +131,9 @@ pub fn validate_secret_value(value: &str) -> Result<(), SecretStoreError> {
 #[derive(Debug, Clone)]
 pub struct ConnectorSecretStore {
     dir: PathBuf,
+    /// Serializes credential CHANGES (see [`Self::lock`]). Shared by every
+    /// clone, so the whole process has one.
+    changes: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ConnectorSecretStore {
@@ -132,7 +142,54 @@ impl ConnectorSecretStore {
     /// must agree, or a stored credential is never found.
     #[must_use]
     pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        Self {
+            dir: dir.into(),
+            changes: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    /// Hold while changing a connector's credentials, from staging the new
+    /// values to committing or rolling them back. Two changes to the same
+    /// file interleaving could otherwise restore each other's backups.
+    /// Credential changes are rare, so one lock for every connector costs
+    /// nothing worth a finer one.
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.changes.lock().await
+    }
+
+    /// Write every `(ref, value)` aside, without touching a live
+    /// credential, ready to [`StagedCredentials::publish`] together. Refs
+    /// and values are validated before anything is written.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write`]. Nothing is left behind on failure.
+    pub async fn stage(
+        &self,
+        values: &[(String, SecretValue)],
+    ) -> Result<StagedCredentials, SecretStoreError> {
+        let mut names = Vec::with_capacity(values.len());
+        for (secret_ref, value) in values {
+            names.push(Self::file_name(secret_ref)?);
+            validate_secret_value(value.expose_secret())?;
+        }
+        let dir = self.dir.clone();
+        let values: Vec<SecretValue> = values.iter().map(|(_, value)| value.clone()).collect();
+        tokio::task::spawn_blocking(move || {
+            let mut entries = Vec::with_capacity(names.len());
+            for (name, value) in names.into_iter().zip(&values) {
+                match write_staged(&dir, &name, value) {
+                    Ok(staged) => entries.push(StagedFile { name, staged }),
+                    Err(err) => {
+                        remove_staged(&entries);
+                        return Err(err);
+                    }
+                }
+            }
+            Ok(StagedCredentials { dir, entries })
+        })
+        .await
+        .map_err(|_| SecretStoreError::Io(std::io::ErrorKind::Other))?
     }
 
     /// The bare file name a managed `secret_ref` maps to, e.g.
@@ -194,19 +251,116 @@ impl ConnectorSecretStore {
     }
 }
 
-/// Write-to-temp, `fsync`, rename. The temporary name is a dotfile no
-/// derived ref can ever name, created with `O_EXCL` so an existing file
-/// (or symlink) at that name is never followed or clobbered.
-fn write_atomically(
-    dir: &std::path::Path,
-    name: &str,
-    value: &SecretValue,
-) -> Result<(), SecretStoreError> {
-    let io = |err: std::io::Error| SecretStoreError::Io(err.kind());
+/// New values written aside by [`ConnectorSecretStore::stage`]. Not live
+/// until [`Self::publish`].
+#[must_use = "staged credentials are not live until published"]
+#[derive(Debug)]
+pub struct StagedCredentials {
+    dir: PathBuf,
+    entries: Vec<StagedFile>,
+}
+
+#[derive(Debug)]
+struct StagedFile {
+    name: String,
+    staged: PathBuf,
+}
+
+impl StagedCredentials {
+    /// Put every staged value in place. A live file being replaced is kept
+    /// (hard-linked aside first) so [`PublishedCredentials::rollback`] can
+    /// restore it; each rename is atomic, so a reader sees the old value or
+    /// the new one.
+    ///
+    /// # Errors
+    ///
+    /// [`SecretStoreError::Io`]; everything already put in place by this
+    /// call is restored first, so a failure changes nothing.
+    pub async fn publish(self) -> Result<PublishedCredentials, SecretStoreError> {
+        tokio::task::spawn_blocking(move || {
+            let Self { dir, entries } = self;
+            let mut published: Vec<PublishedFile> = Vec::with_capacity(entries.len());
+            for (i, entry) in entries.iter().enumerate() {
+                match publish_one(&dir, entry) {
+                    Ok(file) => published.push(file),
+                    Err(err) => {
+                        restore(&dir, &published);
+                        remove_staged(&entries[i..]);
+                        return Err(err);
+                    }
+                }
+            }
+            sync_dir(&dir);
+            Ok(PublishedCredentials {
+                dir,
+                entries: published,
+            })
+        })
+        .await
+        .map_err(|_| SecretStoreError::Io(std::io::ErrorKind::Other))?
+    }
+}
+
+/// Values [`StagedCredentials::publish`] put in place, with the files they
+/// replaced kept aside until [`Self::commit`] (the change stands) or
+/// [`Self::rollback`] (it does not).
+#[must_use = "published credentials keep their replaced files until committed or rolled back"]
+#[derive(Debug)]
+pub struct PublishedCredentials {
+    dir: PathBuf,
+    entries: Vec<PublishedFile>,
+}
+
+#[derive(Debug)]
+struct PublishedFile {
+    name: String,
+    /// The replaced file, when there was one.
+    backup: Option<PathBuf>,
+}
+
+impl PublishedCredentials {
+    /// The change stands: drop the replaced files.
+    pub async fn commit(self) {
+        let _ = tokio::task::spawn_blocking(move || {
+            for entry in &self.entries {
+                if let Some(backup) = &entry.backup {
+                    let _ = std::fs::remove_file(backup);
+                }
+            }
+            sync_dir(&self.dir);
+        })
+        .await;
+    }
+
+    /// The change did not happen: put every replaced file back and remove
+    /// every new one, leaving the files exactly as they were before
+    /// [`StagedCredentials::publish`].
+    pub async fn rollback(self) {
+        let _ = tokio::task::spawn_blocking(move || restore(&self.dir, &self.entries)).await;
+    }
+}
+
+/// Distinguishes temporary names made within the same nanosecond.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A dotfile name no derived ref can ever name, unique to this call.
+fn temp_path(dir: &Path, name: &str, purpose: &str) -> PathBuf {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let tmp = dir.join(format!(".{name}.{}.{nonce}.tmp", std::process::id()));
+    let count = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!(
+        ".{name}.{}.{nonce}.{count}.{purpose}",
+        std::process::id()
+    ))
+}
+
+/// Write `value` to a new `0600` temporary file and `fsync` it. Created
+/// with `O_EXCL`, so an existing file (or symlink) at that name is never
+/// followed or clobbered.
+fn write_staged(dir: &Path, name: &str, value: &SecretValue) -> Result<PathBuf, SecretStoreError> {
+    let io = |err: std::io::Error| SecretStoreError::Io(err.kind());
+    let tmp = temp_path(dir, name, "tmp");
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -216,19 +370,81 @@ fn write_atomically(
             .map_err(io)?;
         file.write_all(value.expose_secret().as_bytes())
             .map_err(io)?;
-        file.sync_all().map_err(io)?;
-        std::fs::rename(&tmp, dir.join(name)).map_err(io)?;
-        // Best-effort: persist the rename itself. A failure here leaves the
-        // new file in place and readable, so it is not reported.
-        if let Ok(handle) = std::fs::File::open(dir) {
-            let _ = handle.sync_all();
-        }
-        Ok(())
+        file.sync_all().map_err(io)
     })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    match result {
+        Ok(()) => Ok(tmp),
+        Err(err) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(err)
+        }
     }
-    result
+}
+
+/// Keep the live file (if any) aside, then rename the staged one over it.
+fn publish_one(dir: &Path, entry: &StagedFile) -> Result<PublishedFile, SecretStoreError> {
+    let io = |err: std::io::Error| SecretStoreError::Io(err.kind());
+    let live = dir.join(&entry.name);
+    let backup = match std::fs::symlink_metadata(&live) {
+        Ok(_) => {
+            let backup = temp_path(dir, &entry.name, "bak");
+            std::fs::hard_link(&live, &backup).map_err(io)?;
+            Some(backup)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(io(err)),
+    };
+    if let Err(err) = std::fs::rename(&entry.staged, &live) {
+        if let Some(backup) = &backup {
+            let _ = std::fs::remove_file(backup);
+        }
+        return Err(io(err));
+    }
+    Ok(PublishedFile {
+        name: entry.name.clone(),
+        backup,
+    })
+}
+
+/// Undo [`publish_one`] for each of `entries`, newest first.
+fn restore(dir: &Path, entries: &[PublishedFile]) {
+    for entry in entries.iter().rev() {
+        let live = dir.join(&entry.name);
+        match &entry.backup {
+            Some(backup) => {
+                let _ = std::fs::rename(backup, &live);
+            }
+            None => {
+                let _ = std::fs::remove_file(&live);
+            }
+        }
+    }
+    sync_dir(dir);
+}
+
+fn remove_staged(entries: &[StagedFile]) {
+    for entry in entries {
+        let _ = std::fs::remove_file(&entry.staged);
+    }
+}
+
+/// Best-effort: persist renames in `dir`. A failure leaves the files in
+/// place and readable, so it is not reported.
+fn sync_dir(dir: &Path) {
+    if let Ok(handle) = std::fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+}
+
+/// Write-to-temp, `fsync`, rename — one value, replacing any previous one.
+fn write_atomically(dir: &Path, name: &str, value: &SecretValue) -> Result<(), SecretStoreError> {
+    let tmp = write_staged(dir, name, value)?;
+    if let Err(err) = std::fs::rename(&tmp, dir.join(name)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(SecretStoreError::Io(err.kind()));
+    }
+    sync_dir(dir);
+    Ok(())
 }
 
 /// Resolves the CANDIDATE credentials a caller has not stored yet — one
@@ -311,6 +527,157 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "s3cret-pass");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "a stored credential must be owner-only");
+    }
+
+    fn managed(id: &str, kind: CredentialKind) -> String {
+        derive_secret_ref(id, CredentialSource::Managed, kind)
+    }
+
+    /// Every file in `dir`, sorted, so a test can assert nothing was left
+    /// behind (no staged value, no backup).
+    fn listing(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn pair(id: &str, access: &str, secret: &str) -> Vec<(String, SecretValue)> {
+        vec![
+            (
+                managed(id, CredentialKind::AccessKey),
+                SecretValue::new(access),
+            ),
+            (
+                managed(id, CredentialKind::SecretKey),
+                SecretValue::new(secret),
+            ),
+        ]
+    }
+
+    /// Staging writes nothing live; publishing puts the whole pair in
+    /// place; committing leaves exactly the two credential files.
+    #[tokio::test]
+    async fn a_committed_pair_replaces_both_values_and_leaves_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConnectorSecretStore::new(dir.path());
+        store
+            .stage(&pair("conn-s3", "old-access", "old-secret"))
+            .await
+            .unwrap()
+            .publish()
+            .await
+            .unwrap()
+            .commit()
+            .await;
+
+        let staged = store
+            .stage(&pair("conn-s3", "new-access", "new-secret"))
+            .await
+            .unwrap();
+        let access = dir.path().join("connector_managed_conn_s3_access_key");
+        assert_eq!(
+            std::fs::read_to_string(&access).unwrap(),
+            "old-access",
+            "staging must not touch the live credential"
+        );
+        staged.publish().await.unwrap().commit().await;
+
+        assert_eq!(std::fs::read_to_string(&access).unwrap(), "new-access");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("connector_managed_conn_s3_secret_key"))
+                .unwrap(),
+            "new-secret"
+        );
+        assert_eq!(
+            listing(dir.path()),
+            [
+                "connector_managed_conn_s3_access_key",
+                "connector_managed_conn_s3_secret_key"
+            ]
+        );
+    }
+
+    /// The case the pair exists for: when the ref change after publishing
+    /// fails, rollback restores BOTH old values, never a new access key
+    /// beside an old secret key.
+    #[tokio::test]
+    async fn a_rolled_back_pair_restores_both_old_values_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConnectorSecretStore::new(dir.path());
+        store
+            .stage(&pair("conn-s3", "old-access", "old-secret"))
+            .await
+            .unwrap()
+            .publish()
+            .await
+            .unwrap()
+            .commit()
+            .await;
+
+        store
+            .stage(&pair("conn-s3", "new-access", "new-secret"))
+            .await
+            .unwrap()
+            .publish()
+            .await
+            .unwrap()
+            .rollback()
+            .await;
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("connector_managed_conn_s3_access_key"))
+                .unwrap(),
+            "old-access"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("connector_managed_conn_s3_secret_key"))
+                .unwrap(),
+            "old-secret"
+        );
+        assert_eq!(
+            listing(dir.path()),
+            [
+                "connector_managed_conn_s3_access_key",
+                "connector_managed_conn_s3_secret_key"
+            ]
+        );
+    }
+
+    /// Rolling back a credential that did not exist before removes it.
+    #[tokio::test]
+    async fn rolling_back_a_new_credential_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConnectorSecretStore::new(dir.path());
+        let token = vec![(
+            managed("conn-rest", CredentialKind::Token),
+            SecretValue::new("t0ken"),
+        )];
+        store
+            .stage(&token)
+            .await
+            .unwrap()
+            .publish()
+            .await
+            .unwrap()
+            .rollback()
+            .await;
+        assert!(listing(dir.path()).is_empty());
+    }
+
+    /// A bad value anywhere in the pair stages nothing at all.
+    #[tokio::test]
+    async fn staging_refuses_the_whole_pair_when_one_value_is_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ConnectorSecretStore::new(dir.path());
+        let err = store
+            .stage(&pair("conn-s3", "fine", " padded"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SecretStoreError::InvalidValue(_)));
+        assert!(listing(dir.path()).is_empty());
     }
 
     #[tokio::test]

@@ -24,10 +24,10 @@ use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::connector_probe_result::list_probe_results;
 use lakehouse_store::connectors::{
     ConnectorFilter, CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec,
-    IngestSpecInput, SecretSlot, UpdateConnectorInput, create_connector, delete_connector,
-    get_connector, get_connector_dial_info, get_ingest_spec, list_connectors,
+    IngestSpecInput, SecretRefSwap, SecretSlot, UpdateConnectorInput, create_connector,
+    delete_connector, get_connector, get_connector_dial_info, get_ingest_spec, list_connectors,
     list_ingestible_connectors, record_test_result, set_ingest_spec, swap_secret_ref,
-    update_connector,
+    swap_secret_refs, update_connector,
 };
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::pipelines::{CreatePipelineInput, create_pipeline};
@@ -1409,6 +1409,88 @@ async fn swap_secret_ref_on_an_unknown_id_is_not_found(pool: PgPool) -> sqlx::Re
     .await
     .unwrap_err();
     assert!(matches!(err, StoreError::NotFound), "got {err:?}");
+    Ok(())
+}
+
+/// Two slots change together or not at all: when the second swap's
+/// `expected_old` is stale, the first (which on its own would apply) is
+/// rolled back too, so an S3 key pair can never end up half-changed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn swap_secret_refs_rolls_back_every_slot_when_one_conflicts(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let (created, credential_names) = create_connector(&pool, &minimal_input("rotate pair target"))
+        .await
+        .unwrap();
+
+    let err = swap_secret_refs(
+        &pool,
+        &created.id,
+        &[
+            SecretRefSwap {
+                slot: SecretSlot::Primary,
+                expected_old: Some(&credential_names.primary),
+                new_ref: "env:NEW_PRIMARY_REF",
+            },
+            SecretRefSwap {
+                slot: SecretSlot::Secondary,
+                expected_old: Some("env:NOT_THE_CURRENT_SECONDARY"),
+                new_ref: "env:NEW_SECONDARY_REF",
+            },
+        ],
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StoreError::Conflict), "got {err:?}");
+
+    let after = get_connector_dial_info(&pool, &created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.secret_ref, credential_names.primary,
+        "the primary swap must be rolled back with the failed secondary one"
+    );
+    assert_eq!(after.secret_ref_secondary, None);
+    Ok(())
+}
+
+/// Both slots change in one call when every `expected_old` holds.
+#[sqlx::test(migrations = "../../migrations")]
+async fn swap_secret_refs_applies_every_slot_together(pool: PgPool) -> sqlx::Result<()> {
+    let (created, credential_names) =
+        create_connector(&pool, &minimal_input("rotate pair applies"))
+            .await
+            .unwrap();
+
+    swap_secret_refs(
+        &pool,
+        &created.id,
+        &[
+            SecretRefSwap {
+                slot: SecretSlot::Primary,
+                expected_old: Some(&credential_names.primary),
+                new_ref: "env:PAIR_PRIMARY_REF",
+            },
+            SecretRefSwap {
+                slot: SecretSlot::Secondary,
+                expected_old: None,
+                new_ref: "env:PAIR_SECONDARY_REF",
+            },
+        ],
+    )
+    .await
+    .unwrap();
+
+    let after = get_connector_dial_info(&pool, &created.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.secret_ref, "env:PAIR_PRIMARY_REF");
+    assert_eq!(
+        after.secret_ref_secondary.as_deref(),
+        Some("env:PAIR_SECONDARY_REF")
+    );
     Ok(())
 }
 

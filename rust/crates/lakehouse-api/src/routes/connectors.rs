@@ -547,6 +547,14 @@ pub async fn create(
         .into());
     }
     let source = body.credential.source;
+    if body.credential.secondary == Some(body.credential.primary) {
+        return Err(ApiError::BadRequest(
+            "credential.primary and credential.secondary must be different kinds: both would \
+             name the same credential"
+                .to_owned(),
+        )
+        .into());
+    }
     let values = credential_values(
         source,
         body.credential.secondary.is_some(),
@@ -687,7 +695,8 @@ struct CredentialValues {
 /// 400 if values are sent with an operator-provisioned source (`env`/
 /// `file`: the API does not write those, so accepting a value would be a
 /// silent drop), if a secondary value is sent for a connector with no
-/// secondary slot, or if a value fails
+/// secondary slot or missing for one that has it (a pair stored half would
+/// be reported as stored and never authenticate), or if a value fails
 /// [`crate::connector_secret_store::validate_secret_value`].
 fn credential_values(
     source: connectors::CredentialSource,
@@ -707,6 +716,13 @@ fn credential_values(
     if values.secondary.is_some() && !has_secondary_slot {
         return Err(ApiError::BadRequest(
             "credential.values.secondary was sent, but credential.secondary (its kind) was not"
+                .to_owned(),
+        ));
+    }
+    if values.secondary.is_none() && has_secondary_slot {
+        return Err(ApiError::BadRequest(
+            "credential.values.secondary is required: this credential has two parts, and both \
+             are needed to authenticate"
                 .to_owned(),
         ));
     }
@@ -1033,6 +1049,18 @@ pub async fn rotate_secret(
         connectors::SecretSlot::Primary => Some(dial_info.secret_ref.clone()),
         connectors::SecretSlot::Secondary => dial_info.secret_ref_secondary.clone(),
     };
+    let other = match body.slot {
+        connectors::SecretSlot::Primary => dial_info.secret_ref_secondary.as_deref(),
+        connectors::SecretSlot::Secondary => Some(dial_info.secret_ref.as_str()),
+    };
+    if other == Some(new_secret_ref.as_str()) {
+        return Err(ApiError::BadRequest(
+            "that kind is already the connector's other credential: both slots would name the \
+             same one"
+                .to_owned(),
+        )
+        .into());
+    }
 
     let mut candidate = dial_info.clone();
     match body.slot {
@@ -1093,6 +1121,12 @@ pub async fn rotate_secret(
             .into());
         }
         Err(err) => return Err(ApiError::from(err).into()),
+    }
+    // Rotating away from a credential lakehouse stored (e.g. to an
+    // operator's `env:` one) leaves its file unused; a password must not
+    // outlive the only reference to it.
+    if expected_old.as_deref() != Some(new_secret_ref.as_str()) {
+        remove_managed_credentials(&state, &id, expected_old.as_deref(), None).await;
     }
 
     // Matches this file's established audit convention (`create`,
@@ -1156,6 +1190,13 @@ pub struct SetCredentialBody {
     primary: Option<CredentialSlotBody>,
     #[serde(default)]
     secondary: Option<CredentialSlotBody>,
+    /// The connection settings this credential is for, when the same edit
+    /// changes them — e.g. REST bearer to basic auth, where the new
+    /// username/password only work with the new settings. The probe tests
+    /// the credential with these instead of the saved ones. Only the probe
+    /// uses them: saving them is still `PUT .../ingest-spec`'s job.
+    #[serde(default)]
+    dial: Option<Value>,
 }
 
 /// The `PUT /api/connectors/{id}/credential` response body. Never carries
@@ -1184,13 +1225,38 @@ struct SlotChange {
     old_ref: Option<String>,
 }
 
+/// Whether a connector can have a second credential: an S3-shaped `files`
+/// connector (access key + secret key) or a `rest` one (basic auth's
+/// username + password, an `OAuth2` client id + secret). Every other adapter
+/// reads exactly one (`secret_field_names`). A pre-WS3 row with no adapter
+/// keeps whatever slots it already has.
+fn has_secondary_slot(dial_info: &ConnectorDialInfo) -> bool {
+    match dial_info.adapter.as_deref() {
+        Some("files" | "rest") => true,
+        Some(_) => false,
+        None => dial_info.secret_ref_secondary.is_some(),
+    }
+}
+
 /// Validate a [`SetCredentialBody`] into one [`SlotChange`] per slot sent,
 /// each with its managed ref derived from THIS connector's id.
+///
+/// # Errors
+///
+/// 400 for a secondary credential on a connector that reads only one, for
+/// a slot that would end up naming the same credential as the other slot
+/// (one would overwrite the other's file), or for an unusable value.
 fn slot_changes(
     id: &str,
     dial_info: &ConnectorDialInfo,
     body: SetCredentialBody,
 ) -> Result<Vec<SlotChange>, ApiError> {
+    if body.secondary.is_some() && !has_secondary_slot(dial_info) {
+        return Err(ApiError::BadRequest(
+            "this connector authenticates with one credential; there is no secondary one to set"
+                .to_owned(),
+        ));
+    }
     let mut changes = Vec::new();
     for (slot, input) in [
         (connectors::SecretSlot::Primary, body.primary),
@@ -1215,82 +1281,142 @@ fn slot_changes(
             old_ref,
         });
     }
+    // What each slot names once this change applies: both slots naming the
+    // same file would make one credential overwrite the other.
+    let after = |slot: connectors::SecretSlot, current: Option<&str>| {
+        changes
+            .iter()
+            .find(|c| c.slot == slot)
+            .map(|c| c.new_ref.clone())
+            .or_else(|| current.map(str::to_owned))
+    };
+    let primary = after(connectors::SecretSlot::Primary, Some(&dial_info.secret_ref));
+    let secondary = after(
+        connectors::SecretSlot::Secondary,
+        dial_info.secret_ref_secondary.as_deref(),
+    );
+    if primary.is_some() && primary == secondary {
+        return Err(ApiError::BadRequest(
+            "primary and secondary must be different kinds of credential: both would name the \
+             same one"
+                .to_owned(),
+        ));
+    }
     Ok(changes)
 }
 
-/// Point each changed slot at its managed ref (optimistic-concurrency
-/// guarded, like `rotate_secret`), and delete a managed file the slot no
-/// longer references (a kind change).
-async fn apply_ref_swaps(
+/// The connector as the probe should see it: each changed slot naming its
+/// new managed ref, and — when the same edit changes the connection
+/// settings — those settings instead of the saved ones.
+///
+/// # Errors
+///
+/// 400 for settings sent to a connector that has none to replace, or that
+/// do not parse as its adapter's shape.
+fn candidate_dial_info(
+    dial_info: &ConnectorDialInfo,
+    changes: &[SlotChange],
+    pending_dial: Option<Value>,
+) -> Result<ConnectorDialInfo, ApiError> {
+    let mut candidate = dial_info.clone();
+    for change in changes {
+        match change.slot {
+            connectors::SecretSlot::Primary => candidate.secret_ref.clone_from(&change.new_ref),
+            connectors::SecretSlot::Secondary => {
+                candidate.secret_ref_secondary = Some(change.new_ref.clone());
+            }
+        }
+    }
+    if let Some(dial) = pending_dial {
+        let adapter = dial_info.adapter.as_deref().ok_or_else(|| {
+            ApiError::BadRequest(
+                "dial was sent, but this connector has no connection settings to replace"
+                    .to_owned(),
+            )
+        })?;
+        Dial::parse(adapter, &dial).map_err(|err| ApiError::BadRequest(format!("dial: {err}")))?;
+        candidate.dial = dial;
+    }
+    Ok(candidate)
+}
+
+/// Map a failed [`connectors::swap_secret_refs`] to the caller's response.
+fn swap_error(id: &str, err: lakehouse_store::StoreError) -> ApiError {
+    match err {
+        lakehouse_store::StoreError::NotFound => {
+            ApiError::NotFound(format!("Connector {id} not found"))
+        }
+        lakehouse_store::StoreError::Conflict => ApiError::Conflict(
+            "the connector's credential changed since it was read; reload and retry".to_owned(),
+        ),
+        err => ApiError::from(err),
+    }
+}
+
+/// Put `changes` in place all or nothing (ADR 0002 Addendum 4): the new
+/// values are written aside, put in place with the files they replace
+/// kept, and the refs of every slot whose kind changed are swapped in ONE
+/// transaction. If that fails, the files go back exactly as they were, so
+/// a pair can never be left half-changed.
+///
+/// # Errors
+///
+/// A store failure (400/503), or the swap's 404/409; nothing changed.
+async fn replace_credentials(
     state: &AppState,
     id: &str,
     changes: &[SlotChange],
 ) -> Result<(), ApiError> {
-    for (i, change) in changes.iter().enumerate() {
-        if change.old_ref.as_deref() == Some(change.new_ref.as_str()) {
-            continue;
-        }
-        let swapped = match pool(state) {
-            Ok(pool) => {
-                connectors::swap_secret_ref(
-                    pool,
-                    id,
-                    change.slot,
-                    change.old_ref.as_deref(),
-                    &change.new_ref,
-                )
+    let store = &state.connector_secret_store;
+    let _serialized = store.lock().await;
+    let staged = store
+        .stage(
+            &changes
+                .iter()
+                .map(|c| (c.new_ref.clone(), c.value.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .map_err(|err| secret_store_error(&err))?;
+    let published = staged
+        .publish()
+        .await
+        .map_err(|err| secret_store_error(&err))?;
+    let swaps: Vec<connectors::SecretRefSwap<'_>> = changes
+        .iter()
+        .filter(|c| c.old_ref.as_deref() != Some(c.new_ref.as_str()))
+        .map(|c| connectors::SecretRefSwap {
+            slot: c.slot,
+            expected_old: c.old_ref.as_deref(),
+            new_ref: &c.new_ref,
+        })
+        .collect();
+    let swapped = if swaps.is_empty() {
+        Ok(())
+    } else {
+        match pool(state) {
+            Ok(pool) => connectors::swap_secret_refs(pool, id, &swaps)
                 .await
-            }
-            Err(err) => {
-                discard_unswapped(state, id, &changes[i..]).await;
-                return Err(err);
-            }
-        };
-        let err = match swapped {
-            Ok(()) => {
-                remove_managed_credentials(state, id, change.old_ref.as_deref(), None).await;
-                continue;
-            }
-            Err(lakehouse_store::StoreError::NotFound) => {
-                ApiError::NotFound(format!("Connector {id} not found"))
-            }
-            Err(lakehouse_store::StoreError::Conflict) => ApiError::Conflict(
-                "the connector's credential changed since it was read; reload and retry".to_owned(),
-            ),
-            Err(err) => ApiError::from(err),
-        };
-        discard_unswapped(state, id, &changes[i..]).await;
+                .map_err(|err| swap_error(id, err)),
+            Err(err) => Err(err),
+        }
+    };
+    if let Err(err) = swapped {
+        published.rollback().await;
         return Err(err);
     }
-    Ok(())
-}
-
-/// Removes the files [`set_credential`] wrote for `changes` whose ref swap
-/// never happened, so a failed swap leaves no managed file that no
-/// connector names. Skipped: a change whose new ref IS its old ref (that
-/// file was replaced in place and is still the live credential), and any
-/// ref the connector names right now — a concurrent `set_credential` may
-/// have swapped to the very same derived name, and its file must survive.
-/// When the current refs cannot be read, nothing is removed: an orphaned
-/// file is harmless, a deleted live one breaks the connector.
-async fn discard_unswapped(state: &AppState, id: &str, changes: &[SlotChange]) {
-    let live = match pool(state) {
-        Ok(pool) => connectors::get_connector_dial_info(pool, id).await.ok(),
-        Err(_) => None,
-    };
-    let Some(live) = live else {
-        return;
-    };
-    let in_use = |r: &str| {
-        live.as_ref().is_some_and(|info| {
-            info.secret_ref == r || info.secret_ref_secondary.as_deref() == Some(r)
-        })
-    };
+    published.commit().await;
+    // A slot whose kind changed no longer names its old managed file —
+    // unless that file is now the OTHER slot's (the two swapped kinds).
     for change in changes {
-        if change.old_ref.as_deref() != Some(change.new_ref.as_str()) && !in_use(&change.new_ref) {
-            remove_managed_credentials(state, id, Some(&change.new_ref), None).await;
+        let Some(old_ref) = change.old_ref.as_deref() else {
+            continue;
+        };
+        if changes.iter().all(|c| c.new_ref != old_ref) {
+            remove_managed_credentials(state, id, Some(old_ref), None).await;
         }
     }
+    Ok(())
 }
 
 /// `PUT /api/connectors/{id}/credential` — the user supplies credential
@@ -1332,7 +1458,7 @@ pub async fn set_credential(
     Path(id): Path<String>,
     body: Bytes,
 ) -> ApiResult<ApiJson<SetCredentialResponse>> {
-    let body: SetCredentialBody = parse_body(&body)?;
+    let mut body: SetCredentialBody = parse_body(&body)?;
     if body.primary.is_none() && body.secondary.is_none() {
         return Err(ApiError::BadRequest(
             "at least one of primary/secondary is required".to_owned(),
@@ -1345,16 +1471,9 @@ pub async fn set_credential(
         return Err(ApiError::NotFound(format!("Connector {id} not found")).into());
     };
 
+    let pending_dial = body.dial.take();
     let changes = slot_changes(&id, &dial_info, body)?;
-    let mut candidate = dial_info.clone();
-    for change in &changes {
-        match change.slot {
-            connectors::SecretSlot::Primary => candidate.secret_ref = change.new_ref.clone(),
-            connectors::SecretSlot::Secondary => {
-                candidate.secret_ref_secondary = Some(change.new_ref.clone());
-            }
-        }
-    }
+    let candidate = candidate_dial_info(&dial_info, &changes, pending_dial)?;
     let resolver = crate::connector_secret_store::CandidateSecretResolver::new(
         changes
             .iter()
@@ -1376,14 +1495,7 @@ pub async fn set_credential(
         .into());
     }
 
-    for change in &changes {
-        state
-            .connector_secret_store
-            .write(&change.new_ref, &change.value)
-            .await
-            .map_err(|err| secret_store_error(&err))?;
-    }
-    apply_ref_swaps(&state, &id, &changes).await?;
+    replace_credentials(&state, &id, &changes).await?;
 
     let slots: Vec<connectors::SecretSlot> = changes.iter().map(|c| c.slot).collect();
     // Same audit convention as `rotate_secret`: successful mutations only,
@@ -2202,6 +2314,15 @@ pub async fn delete(
         dial_info.secret_ref_secondary.as_deref(),
     )
     .await;
+    // Also every other name a managed credential of this connector could
+    // have: a credential change that raced this delete may have written
+    // one after the refs above were read. Every managed name is derived
+    // from the id and a kind, so this list is complete.
+    for kind in connectors::CredentialKind::ALL {
+        let secret_ref =
+            connectors::derive_secret_ref(&id, connectors::CredentialSource::Managed, kind);
+        remove_managed_credentials(&state, &id, Some(&secret_ref), None).await;
+    }
     // WS5 item D3: best-effort, after the row is already gone — a failed
     // audit write here must never resurrect the 404/409 branches above or
     // undo a delete that already succeeded.
@@ -3722,6 +3843,208 @@ mod tests {
         .err()
         .expect("must be refused");
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    /// A two-part credential stored half would be reported as stored and
+    /// never authenticate — refused before any row exists.
+    #[test]
+    fn a_declared_secondary_slot_without_its_value_is_refused() {
+        let err = credential_values(
+            connectors::CredentialSource::Managed,
+            true,
+            Some(values_body(json!({ "primary": "access-only" }))),
+        )
+        .err()
+        .expect("must be refused");
+        let ApiError::BadRequest(message) = err else {
+            panic!("expected 400");
+        };
+        assert!(message.contains("secondary is required"), "{message}");
+    }
+
+    fn credential_info(
+        adapter: Option<&str>,
+        primary: &str,
+        secondary: Option<&str>,
+    ) -> ConnectorDialInfo {
+        ConnectorDialInfo {
+            kind: "test".to_owned(),
+            host: "unused".to_owned(),
+            secret_ref: primary.to_owned(),
+            secret_ref_secondary: secondary.map(str::to_owned),
+            adapter: adapter.map(str::to_owned),
+            dial: json!({}),
+        }
+    }
+
+    fn set_body(json: serde_json::Value) -> SetCredentialBody {
+        serde_json::from_value(json).expect("valid set-credential body")
+    }
+
+    fn managed(kind: connectors::CredentialKind) -> String {
+        connectors::derive_secret_ref("conn-x", connectors::CredentialSource::Managed, kind)
+    }
+
+    /// A `PostgreSQL` connector reads one password; a second credential
+    /// would be stored and never used.
+    #[test]
+    fn slot_changes_refuses_a_secondary_for_a_one_credential_connector() {
+        let info = credential_info(
+            Some("sql"),
+            &managed(connectors::CredentialKind::Password),
+            None,
+        );
+        let err = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({
+                "primary": { "kind": "password", "value": "pw" },
+                "secondary": { "kind": "token", "value": "t" }
+            })),
+        )
+        .err()
+        .expect("must be refused");
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    /// A REST connector moving to basic auth gains a second credential.
+    #[test]
+    fn slot_changes_accepts_a_new_secondary_for_a_rest_connector() {
+        let info = credential_info(
+            Some("rest"),
+            &managed(connectors::CredentialKind::Token),
+            None,
+        );
+        let changes = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({
+                "primary": { "kind": "access_key", "value": "user" },
+                "secondary": { "kind": "password", "value": "pw" }
+            })),
+        )
+        .expect("a rest connector can have two credentials");
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[1].old_ref, None);
+    }
+
+    /// Changing one slot to the kind the other slot already has would make
+    /// both name one file, and each write overwrite the other.
+    #[test]
+    fn slot_changes_refuses_a_kind_the_other_slot_already_has() {
+        let info = credential_info(
+            Some("files"),
+            &managed(connectors::CredentialKind::AccessKey),
+            Some(&managed(connectors::CredentialKind::SecretKey)),
+        );
+        let err = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({ "primary": { "kind": "secret_key", "value": "v" } })),
+        )
+        .err()
+        .expect("must be refused");
+        let ApiError::BadRequest(message) = err else {
+            panic!("expected 400");
+        };
+        assert!(message.contains("different kinds"), "{message}");
+    }
+
+    #[test]
+    fn slot_changes_refuses_the_same_kind_for_both_slots() {
+        let info = credential_info(
+            Some("files"),
+            &managed(connectors::CredentialKind::AccessKey),
+            None,
+        );
+        let err = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({
+                "primary": { "kind": "password", "value": "a" },
+                "secondary": { "kind": "password", "value": "b" }
+            })),
+        )
+        .err()
+        .expect("must be refused");
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    /// Changing the sign-in method (REST bearer to basic) in the same edit:
+    /// the probe must test the new credential with the NEW settings.
+    #[test]
+    fn candidate_dial_info_tests_with_the_pending_connection_settings() {
+        let info = credential_info(
+            Some("rest"),
+            &managed(connectors::CredentialKind::Token),
+            None,
+        );
+        let changes = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({
+                "primary": { "kind": "access_key", "value": "user" },
+                "secondary": { "kind": "password", "value": "pw" }
+            })),
+        )
+        .unwrap();
+        let basic = json!({
+            "baseUrl": "https://api.example.com",
+            "auth": { "type": "basic" },
+            "pagination": { "type": "none" },
+            "endpoints": [{ "path": "/orders", "recordsPath": null }]
+        });
+        let candidate = candidate_dial_info(&info, &changes, Some(basic.clone())).unwrap();
+        assert_eq!(candidate.dial, basic);
+        assert_eq!(
+            candidate.secret_ref,
+            managed(connectors::CredentialKind::AccessKey)
+        );
+        assert_eq!(
+            candidate.secret_ref_secondary,
+            Some(managed(connectors::CredentialKind::Password))
+        );
+    }
+
+    #[test]
+    fn candidate_dial_info_refuses_settings_that_do_not_parse() {
+        let info = credential_info(
+            Some("rest"),
+            &managed(connectors::CredentialKind::Token),
+            None,
+        );
+        let err = candidate_dial_info(&info, &[], Some(json!({ "baseUrl": 42 })))
+            .err()
+            .expect("must be refused");
+        assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    /// Two slots trading kinds end up naming different files, so it is
+    /// allowed.
+    #[test]
+    fn slot_changes_allows_two_slots_to_trade_kinds() {
+        let info = credential_info(
+            Some("rest"),
+            &managed(connectors::CredentialKind::AccessKey),
+            Some(&managed(connectors::CredentialKind::Password)),
+        );
+        let changes = slot_changes(
+            "conn-x",
+            &info,
+            set_body(json!({
+                "primary": { "kind": "password", "value": "a" },
+                "secondary": { "kind": "access_key", "value": "b" }
+            })),
+        )
+        .expect("trading kinds is allowed");
+        assert_eq!(
+            changes[0].new_ref,
+            managed(connectors::CredentialKind::Password)
+        );
+        assert_eq!(
+            changes[1].new_ref,
+            managed(connectors::CredentialKind::AccessKey)
+        );
     }
 
     /// A value the resolvers would read back trimmed is refused before any
