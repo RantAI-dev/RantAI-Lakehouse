@@ -10,6 +10,7 @@ once a first release is tagged.
 
 ### Added
 
+- Pipeline-failure alerts: a new `pipeline_failure` kind of `alert_rule`, scoped to one pipeline or `*`, that fires when a Dagster run ends in `FAILURE`. Dagster's `run_failure_sensor` (in `dagster/dispar_orchestrate/pipeline_events.py`) posts each failure to a new service-only `POST /api/pipelines/events/run-failed`; the API dedupes by `(run_id, kind)` (new `pipeline_run_event` table, migration `0049`) so a sensor retry never double-alerts, and the alert body names the pipeline, the run id, and a relative `/pipelines/<id>?run=<runId>` link — never the orchestrator's error text.
 - Console-authored pipelines now run: `authored_factory.py` builds one `authored__<id>` job, and a cron schedule when the pipeline has one, per `ready` or `paused` pipeline from the new service-only `GET /api/pipelines/runnable`. The API asks the orchestrator to reload after every change, which is why the code location now runs `dagster code-server start`.
 - Edit (`PUT /api/pipelines/{id}`, `/pipelines/{id}/edit`) and delete (`DELETE /api/pipelines/{id}`) for authored pipelines, with audit events.
 - `GET /api/pipelines/{id}/schedule-ticks` and a Schedule history on the pipeline page: each time a schedule was due and whether it launched, skipped or failed. The orchestrator's error text is not sent.

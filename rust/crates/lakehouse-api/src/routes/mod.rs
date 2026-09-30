@@ -223,6 +223,15 @@ fn pipelines_router() -> Router<AppState> {
             "/api/pipelines/{id}/tenant",
             axum::routing::put(pipelines::assign_pipeline_tenant),
         )
+        // Dagster `run_failure_sensor` posts here once per failed run;
+        // see `dagster/dispar_orchestrate/pipeline_events.py`. Handler
+        // enforces service-identity (the route is gated by `pipeline:write`
+        // first, then the handler refuses a non-service `pipeline:write`
+        // holder, mirroring `authored_pipelines::runnable`).
+        .route(
+            "/api/pipelines/events/run-failed",
+            axum::routing::post(pipelines::run_failed_event),
+        )
 }
 
 /// The `/api/storage/*` sub-router (Task 2.6), split out for the same

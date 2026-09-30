@@ -327,6 +327,11 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // `identity:write`, not `pipeline:write`: this is a governance
     // decision about who may see the row, not a pipeline-operation grant.
     ("PUT",  "/api/pipelines/{id}/tenant",            Policy::RequiresPermission("identity:write")),
+    // Dagster `run_failure_sensor` posts to this; the handler then
+    // refuses non-service `pipeline:write` holders, mirroring
+    // `authored_pipelines::runnable` (a `pipeline:write` user is still
+    // not the orchestrator).
+    ("POST", "/api/pipelines/events/run-failed",     Policy::RequiresPermission("pipeline:write")),
 
     // ── Dashboard: seeded Dashboard Viewer permission `dashboard:read`.
     //    `dashboard:write` is the natural write counterpart — see module

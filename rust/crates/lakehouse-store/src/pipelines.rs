@@ -580,6 +580,39 @@ pub async fn list_runnable_pipelines(pool: &PgPool) -> Result<Vec<RunnablePipeli
     Ok(out)
 }
 
+/// Recorded dedup of a single orchestrator-emitted pipeline-run event
+/// (the `run_failure_sensor` in `dagster/dispar_orchestrate/pipeline_events.py`
+/// posts each one to `POST /api/pipelines/events/run-failed`, which calls
+/// this BEFORE evaluating alert rules). Keyed by `(run_id, kind)` so a
+/// sensor retry never double-alerts: a second INSERT for the same row is
+/// a no-op, and the bool returned is `true` only when a row was newly
+/// inserted. The same table backs the kinds 1f adds (`slow`,
+/// `volume_drop`, `late`) — `record_pipeline_run_event` is the only writer
+/// for them too.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the INSERT itself fails.
+pub async fn record_pipeline_run_event(
+    pool: &PgPool,
+    run_id: &str,
+    pipeline_id: &str,
+    kind: &str,
+) -> Result<bool, StoreError> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "INSERT INTO pipeline_run_event (run_id, pipeline_id, kind) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (run_id, kind) DO NOTHING \
+         RETURNING run_id",
+    )
+    .bind(run_id)
+    .bind(pipeline_id)
+    .bind(kind)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
 /// Update an authored pipeline's status (`pausePipeline`/`resumePipeline`
 /// for a pipeline that has no backing Dagster job — see
 /// `routes::pipelines::pause`/`resume`; and `routes::pipelines::

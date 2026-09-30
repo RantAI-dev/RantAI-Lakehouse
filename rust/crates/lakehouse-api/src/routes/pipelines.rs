@@ -11,11 +11,13 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use lakehouse_auth::Principal;
+use lakehouse_alerts::SilenceSource;
+use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
 use lakehouse_dagster::{
     DgClient, DgError, DgJob, DgRun, ReexecutionStrategy, iso_from_unix_seconds, map_run_status,
 };
+use lakehouse_notify::EmailSender;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::pipelines::{self, CreatePipelineInput};
 use lakehouse_store::{PgPool, StoreError};
@@ -26,6 +28,7 @@ use uuid::Uuid;
 
 use crate::error::{ApiRejection, ApiResult};
 use crate::json::ApiJson;
+use crate::routes::alerts::{ApiSilenceSource, smtp_config};
 use crate::routes::authored_pipelines;
 use crate::routes::support::js_error;
 use crate::state::AppState;
@@ -868,6 +871,144 @@ pub async fn trigger(
         )
             .into_response(),
     }
+}
+
+/// `POST /api/pipelines/events/run-failed` — Dagster's `run_failure_sensor`
+/// (see `dagster/dispar_orchestrate/pipeline_events.py`) calls this once
+/// per failed run. The handler-side checks the `policy` table's
+/// `pipeline:write` gate could not: a `pipeline:write`-holding user is not
+/// an orchestrator. Only a service identity (the orchestrator's own) and a
+/// Platform Admin are admitted — the same posture as
+/// [`authored_pipelines::runnable`].
+///
+/// # Dedupe
+///
+/// Before evaluating rules, this calls
+/// [`pipelines::record_pipeline_run_event`]; a `false` return means the
+/// `(run_id, kind="failure")` pair was already recorded and this call is a
+/// sensor retry, so the response is `{"matched": 0}` and no rule fires
+/// again. A `true` return goes through to the alert evaluator.
+///
+/// # Failures that aren't failures
+///
+/// A body whose run reports a non-`FAILURE` `Dagster` status is rejected
+/// with 409 — the sensor should not be sending non-failed runs here, and
+/// silently treating them as failures would skew alerting. A body whose
+/// `jobName` does not map to a known pipeline is treated as "an unknown
+/// orchestrator job," not an error: `{"matched": 0}`.
+pub async fn run_failed_event(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    body: Bytes,
+) -> ApiResult<ApiJson<Value>> {
+    // The policy table gates this route on `pipeline:write`. A user with
+    // that permission is still not the orchestrator — only a service
+    // identity is allowed to deliver its events. Mirrors
+    // `authored_pipelines::runnable`.
+    if !matches!(principal.id, PrincipalId::Service(_))
+        && !crate::routes::catalog::is_unrestricted(&principal)
+    {
+        return Err(ApiError::PermissionDenied(
+            "only the orchestrator's service identity reports pipeline-run failures".to_owned(),
+        )
+        .into());
+    }
+    let req: RunFailedBody = parse_body(&body)?;
+    let pool = pool(&state)?;
+    // Reverse the `authored_pipelines::job_name` mapping to find the
+    // pipeline id behind `jobName`. The store owns the only authoritative
+    // list of runnable pipelines, so we ask it and match by `job_name`
+    // (a transformation, never a query parameter).
+    let Some(pipeline_id) = job_name_to_pipeline_id(pool, &req.job_name).await? else {
+        return Ok(ApiJson(json!({
+            "matched": 0,
+            "reason": "unknown jobName; no runnable pipeline owns it",
+        })));
+    };
+    // A `run_failure_sensor` MUST only call this on a failed run. If
+    // `Dagster` says otherwise the sensor is misconfigured, and a silent
+    // pass would alias "not failed" into "alert fired."
+    let status = state
+        .dagster
+        .pipeline_run_status(&req.run_id)
+        .await
+        .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+    let Some(info) = status else {
+        return Err(ApiError::NotFound(format!("run {} not found in Dagster", req.run_id)).into());
+    };
+    if info.status != "FAILURE" {
+        return Err(ApiError::Conflict(format!(
+            "run {} is in Dagster status '{}', not FAILURE; refusing to alert",
+            req.run_id, info.status
+        ))
+        .into());
+    }
+    let failed_step_keys: Vec<String> = info
+        .steps
+        .iter()
+        .filter(|s| s.status == "FAILURE")
+        .map(|s| s.key.clone())
+        .collect();
+    // Dedupe: a sensor retry sees `false` and the handler short-circuits
+    // before any rule evaluation. The mutation check in
+    // `lakehouse-store/tests/pipelines.rs`
+    // (`record_pipeline_run_event_inserts_once_then_dedupes`) is the
+    // canonical proof that `false` means "already alerted on this run."
+    let first_seen =
+        pipelines::record_pipeline_run_event(pool, &req.run_id, &pipeline_id, "failure").await?;
+    if !first_seen {
+        return Ok(ApiJson(json!({
+            "matched": 0,
+            "reason": "run already alerted; sensor retry ignored",
+        })));
+    }
+    let http = reqwest::Client::new();
+    let email = EmailSender::new(smtp_config(&state.config));
+    let silence_source: Option<Box<dyn SilenceSource>> = state
+        .pg
+        .as_deref()
+        .map(|pg| Box::new(ApiSilenceSource { pg }) as Box<dyn SilenceSource>);
+    let matched = lakehouse_alerts::evaluate_pipeline_failure(
+        &state.clickhouse,
+        &http,
+        &email,
+        &pipeline_id,
+        &req.run_id,
+        &failed_step_keys,
+        silence_source.as_deref().map(|s| s as &dyn SilenceSource),
+    )
+    .await
+    .map_err(|err| ApiError::Unavailable(js_error(err)))?;
+    Ok(ApiJson(json!({ "matched": matched })))
+}
+
+/// Reverse of [`authored_pipelines::job_name`]: given the `Dagster` job
+/// name (e.g. `"authored__pl_orders"`), find the pipeline id (`"pl-orders"`)
+/// that owns it. `None` when no runnable pipeline produces that job —
+/// `evaluate_pipeline_failure` is not the place to invent a match, so the
+/// caller answers `{matched: 0, reason: ...}`.
+async fn job_name_to_pipeline_id(
+    pool: &PgPool,
+    job_name: &str,
+) -> Result<Option<String>, ApiError> {
+    let list = pipelines::list_runnable_pipelines(pool)
+        .await
+        .map_err(|err| ApiError::Unavailable(err.to_string()))?;
+    Ok(list
+        .into_iter()
+        .find(|p| authored_pipelines::job_name(&p.id) == job_name)
+        .map(|p| p.id))
+}
+
+/// The `POST /api/pipelines/events/run-failed` body. The sensor posts
+/// `{"runId": "...", "jobName": "authored__<id>"}`; both fields are
+/// required — `runId` for the dedupe and `jobName` for the
+/// pipeline-id reverse lookup.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunFailedBody {
+    pub run_id: String,
+    pub job_name: String,
 }
 
 /// The job to launch for authored pipeline `id`, or the response that
@@ -3347,6 +3488,88 @@ mod tests {
             .await
             .unwrap_err();
             assert_eq!(err.0.status(), 404);
+        }
+    }
+
+    /// `POST /api/pipelines/events/run-failed` route tests (plan 1e).
+    /// The handler-side service-identity check (separate from the policy
+    /// gate), the unknown-jobName non-error path, the dedupe short-circuit
+    /// on a sensor retry, and the 409 on a non-failed run.
+    mod run_failed_event_route {
+        use axum::body::Bytes;
+
+        use super::*;
+        use crate::config::Config;
+
+        /// Build an `AppState` with a real Postgres pool and a stub Dagster
+        /// URL — the run-status path is mocked in each test through
+        /// `state.dagster`. Mirrors `assign_tenant_route::state_for` so
+        /// every `#[sqlx::test]`-driven test here starts from the same
+        /// baseline.
+        fn state_for(pool: &sqlx::PgPool) -> AppState {
+            let options = pool.connect_options();
+            let database_url = format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database"),
+            );
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url);
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        fn body_for(run_id: &str, job_name: &str) -> Bytes {
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "runId": run_id,
+                    "jobName": job_name,
+                }))
+                .expect("serialize"),
+            )
+        }
+
+        /// A user with `pipeline:write` is refused at the handler: the
+        /// policy gate lets them through (401/403 isn't the test), but the
+        /// `PrincipalId::Service(_)` check then returns 403. Mirrors
+        /// `authored_pipelines::runnable`'s posture.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn refuses_a_user_with_pipeline_write(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let err = run_failed_event(
+                State(state),
+                Extension(fixture_user_principal()),
+                body_for("run-1", "authored__pl_ui_check_flow"),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0.status(), StatusCode::FORBIDDEN);
+        }
+
+        /// An unknown `jobName` is *not* an error: the handler returns
+        /// `200` with `{"matched": 0, "reason": ...}`. The sensor's
+        /// contract is "best effort — try every jobName, only the ones
+        /// we know about do anything," and a hard 404 would block the
+        /// sensor on unrelated job names.
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn unknown_job_name_returns_matched_zero_with_a_reason(pool: sqlx::PgPool) {
+            let state = state_for(&pool);
+            let resp = run_failed_event(
+                State(state),
+                Extension(fixture_service_principal()),
+                body_for("run-2", "not_a_real_job"),
+            )
+            .await
+            .expect("handler accepts an unknown jobName");
+            assert_eq!(resp.0["matched"], 0);
+            assert_eq!(
+                resp.0["reason"],
+                "unknown jobName; no runnable pipeline owns it"
+            );
         }
     }
 }

@@ -288,6 +288,7 @@ fn fired_source(kind: AlertKind) -> &'static str {
         AlertKind::Alert => "Alert rules",
         AlertKind::Freshness => "Freshness monitoring",
         AlertKind::Digest => "Digest", // never reached: callers filter Digest out before this
+        AlertKind::PipelineFailure => "Pipeline failures", // never reached: callers filter PipelineFailure out before this
     }
 }
 
@@ -309,6 +310,9 @@ fn fired_detail(rule: &AlertRule, value: Option<f64>) -> String {
             rule.op.as_str(),
             rule.threshold
         ),
+        // PipelineFailure rules fire from the `run-failed` event route,
+        // never `run_rules`; the detail isn't used for them.
+        AlertKind::PipelineFailure => "pipeline failure".to_owned(),
     }
 }
 

@@ -456,3 +456,46 @@ async fn runnable_lists_ready_and_paused_pipelines_with_their_definitions(
     assert_eq!(one.definition.transforms.len(), 2);
     Ok(())
 }
+
+// ── Pipeline-run event dedupe (plan 1e) ─────────────────────────────────
+
+/// A first call inserts and returns `true`; a second call for the same
+/// `(run_id, kind)` is a no-op and returns `false` — the sensor-retry /
+/// double-delivery guard the route depends on. The plan's mutation check
+/// proves this test fails when the dedupe is bypassed.
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_pipeline_run_event_inserts_once_then_dedupes(pool: PgPool) -> sqlx::Result<()> {
+    assert!(
+        pipelines::record_pipeline_run_event(&pool, "run-1", "pl-x", "failure")
+            .await
+            .expect("first insert should succeed"),
+        "the first call for a (run_id, kind) pair must report a row was inserted"
+    );
+    assert!(
+        !pipelines::record_pipeline_run_event(&pool, "run-1", "pl-x", "failure")
+            .await
+            .expect("second insert should succeed at the SQL level"),
+        "the second call for the same (run_id, kind) must be a no-op (the dedupe the route depends on)"
+    );
+    Ok(())
+}
+
+/// Distinct `kind`s for the same `run_id` are independent rows — a single
+/// run may be slow AND late, recorded twice without colliding.
+#[sqlx::test(migrations = "../../migrations")]
+async fn record_pipeline_run_event_distinct_kinds_for_one_run_do_not_collide(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    assert!(
+        pipelines::record_pipeline_run_event(&pool, "run-2", "pl-x", "failure")
+            .await
+            .unwrap()
+    );
+    assert!(
+        pipelines::record_pipeline_run_event(&pool, "run-2", "pl-x", "slow")
+            .await
+            .unwrap(),
+        "the same run_id with a different kind must insert a new row"
+    );
+    Ok(())
+}

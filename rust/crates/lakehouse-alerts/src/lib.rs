@@ -139,6 +139,12 @@ pub enum AlertKind {
     /// (`dagster/dispar_orchestrate/replication_metrics.py`'s own header
     /// names the exact rule to create). WS5 plan review Y4.
     Freshness,
+    /// Fires when a pipeline run fails, scoped to one pipeline id or to
+    /// `"*"` for every pipeline. Evaluated by `routes::pipelines::
+    /// run_failed_event`, not by `run_rules`: the trigger is the
+    /// orchestrator's `run_failure_sensor` posting to the API, not a
+    /// periodic `run_rules` evaluation. WS6 plan §3 (1e).
+    PipelineFailure,
 }
 
 impl AlertKind {
@@ -149,6 +155,7 @@ impl AlertKind {
             Self::Alert => "alert",
             Self::Digest => "digest",
             Self::Freshness => "freshness",
+            Self::PipelineFailure => "pipeline_failure",
         }
     }
 }
@@ -230,6 +237,15 @@ pub struct AlertRule {
     /// silently-defaulted one.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub severity: Option<String>,
+    /// Pipeline id this rule fires on (`"pl-..."`) for
+    /// [`AlertKind::PipelineFailure`] rules, or `"*"` to fire on every
+    /// pipeline. `None` for any other kind: a threshold alert or a
+    /// digest has no notion of "this pipeline", and the `pipeline` column
+    /// stores the empty string then (matches the same `mart`/`board`/
+    /// `severity` convention on this table — `non_empty()` turns `""`
+    /// back into `None` on read).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pipeline: Option<String>,
 }
 
 fn default_agg() -> String {
@@ -291,6 +307,10 @@ pub struct AlertRuleInput {
     /// to a default (WS5 plan review U12): a rule that claims a severity
     /// `alert_instance`'s `CHECK` will not actually admit must never save.
     pub severity: Option<String>,
+    /// Pipeline id (or `"*"`) this rule targets, for
+    /// [`AlertKind::PipelineFailure`] rules. Required for that kind, not
+    /// read for any other.
+    pub pipeline: Option<String>,
 }
 
 /// The validated, normalized shape [`save_rule`] persists — split out of
@@ -309,6 +329,10 @@ struct NormalizedRule {
     threshold: f64,
     board: String,
     severity: Option<String>,
+    /// Pipeline id (or `"*"`) for [`AlertKind::PipelineFailure`]; empty
+    /// string for every other kind (matches the `mart`/`board`/
+    /// `severity` "empty means absent" convention on this table).
+    pipeline: String,
 }
 
 /// Validate and normalize `input`, exactly reproducing `saveRule`'s
@@ -327,6 +351,7 @@ fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError>
     let kind = match input.kind.as_deref() {
         Some("digest") => AlertKind::Digest,
         Some("freshness") => AlertKind::Freshness,
+        Some("pipeline_failure") => AlertKind::PipelineFailure,
         _ => AlertKind::Alert,
     };
     let channel = if input.channel.as_deref() == Some("email") {
@@ -374,6 +399,8 @@ fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError>
         normalize_alert(input, common)
     } else if kind == AlertKind::Freshness {
         normalize_freshness(input, common)
+    } else if kind == AlertKind::PipelineFailure {
+        normalize_pipeline_failure(input, common)
     } else {
         normalize_digest(input, common)
     }
@@ -381,8 +408,9 @@ fn normalize_input(input: &AlertRuleInput) -> Result<NormalizedRule, AlertError>
 
 /// The fields [`normalize_input`] validates uniformly, before branching on
 /// `kind` — split out (alongside [`normalize_alert`]/[`normalize_freshness`]/
-/// [`normalize_digest`]) purely to keep [`normalize_input`] itself under
-/// `clippy::too_many_lines`; no behavior change from having it all inline.
+/// [`normalize_digest`]/[`normalize_pipeline_failure`]) purely to keep
+/// [`normalize_input`] itself under `clippy::too_many_lines`; no behavior
+/// change from having it all inline.
 struct NormalizedCommon {
     name: String,
     kind: AlertKind,
@@ -429,6 +457,7 @@ fn normalize_alert(
         threshold,
         board: String::new(),
         severity: common.severity,
+        pipeline: String::new(),
     })
 }
 
@@ -475,6 +504,45 @@ fn normalize_freshness(
         threshold: 0.0,
         board: String::new(),
         severity: common.severity,
+        pipeline: String::new(),
+    })
+}
+
+/// `pipeline_failure` rules require a non-empty `pipeline` — either a
+/// `pl-...` id (scoped to one pipeline) or the literal `"*"` (every
+/// pipeline). The id is stored verbatim in `console.alert_rule.pipeline`
+/// and matched in `evaluate_pipeline_failure` against the id the
+/// orchestrator's run-failure sensor reports. Empty / whitespace-only
+/// values are rejected — a "fire on every pipeline failure" rule is a
+/// real configuration choice (`*`), not a forgotten field.
+fn normalize_pipeline_failure(
+    input: &AlertRuleInput,
+    common: NormalizedCommon,
+) -> Result<NormalizedRule, AlertError> {
+    let raw = input.pipeline.as_deref().unwrap_or("").trim().to_owned();
+    if raw.is_empty() {
+        return Err(AlertError::Validation(
+            "pipeline_failure requires a pipeline id or \"*\".\"".to_owned(),
+        ));
+    }
+    if raw != "*" && !raw.starts_with("pl-") {
+        return Err(AlertError::Validation(
+            "pipeline_failure pipeline must be a pl-... id or \"*\".".to_owned(),
+        ));
+    }
+    Ok(NormalizedRule {
+        name: common.name,
+        kind: common.kind,
+        channel: common.channel,
+        target: common.target,
+        mart: String::new(),
+        measure: String::new(),
+        agg: "sum".to_owned(),
+        op: AlertOp::Gt,
+        threshold: 0.0,
+        board: String::new(),
+        severity: common.severity,
+        pipeline: raw,
     })
 }
 
@@ -501,6 +569,7 @@ fn normalize_digest(
         threshold: 0.0,
         board,
         severity: common.severity,
+        pipeline: String::new(),
     })
 }
 
@@ -560,10 +629,20 @@ pub async fn ensure(ch: &ChClient) -> Result<(), ChError> {
         None,
     )
     .await?;
+    // Plan 1e: the `pipeline` column carries a `pl-...` id (scoped) or
+    // "*" (every pipeline) for `pipeline_failure` rules. Same
+    // additive/`IF NOT EXISTS` convention as `severity` immediately
+    // above, asserted by the `ensure_sends_an_additive_pipeline_column_statement`
+    // test below.
+    ch.exec(
+        "ALTER TABLE console.alert_rule ADD COLUMN IF NOT EXISTS pipeline String DEFAULT ''",
+        None,
+    )
+    .await?;
     Ok(())
 }
 
-const COLS: &str = "id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,toString(created_at) AS created_at,severity";
+const COLS: &str = "id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,toString(created_at) AS created_at,severity,pipeline";
 
 fn row_str<'a>(row: &'a Map<String, Value>, key: &str) -> &'a str {
     row.get(key).and_then(Value::as_str).unwrap_or("")
@@ -603,6 +682,7 @@ fn row_to_rule(row: &Map<String, Value>) -> AlertRule {
     let kind = match row_str(row, "type") {
         "digest" => AlertKind::Digest,
         "freshness" => AlertKind::Freshness,
+        "pipeline_failure" => AlertKind::PipelineFailure,
         _ => AlertKind::Alert,
     };
     let channel = if row_str(row, "channel") == "email" {
@@ -627,6 +707,7 @@ fn row_to_rule(row: &Map<String, Value>) -> AlertRule {
         enabled: row_enabled(row),
         created_at: non_empty(row_str(row, "created_at")),
         severity: non_empty(row_str(row, "severity")),
+        pipeline: non_empty(row_str(row, "pipeline")),
     }
 }
 
@@ -688,7 +769,7 @@ pub async fn save_rule(
     // already turns `""` back into `None` on read, so the round-trip is
     // lossless).
     let sql = format!(
-        "INSERT INTO console.alert_rule (id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,severity) VALUES ({},{},{},{},{},{},{},{threshold},{},{},{},{enabled},{})",
+        "INSERT INTO console.alert_rule (id,name,type,mart,measure,agg,op,threshold,board,channel,target,enabled,severity,pipeline) VALUES ({},{},{},{},{},{},{},{threshold},{},{},{},{enabled},{},{})",
         SqlLiteral::from(rid.as_str()),
         SqlLiteral::from(normalized.name.as_str()),
         SqlLiteral::from(normalized.kind.as_str()),
@@ -700,6 +781,7 @@ pub async fn save_rule(
         SqlLiteral::from(normalized.channel.as_str()),
         SqlLiteral::from(normalized.target.as_str()),
         SqlLiteral::from(normalized.severity.as_deref().unwrap_or("")),
+        SqlLiteral::from(normalized.pipeline.as_str()),
     );
     ch.exec(&sql, None).await?;
     match get_rule(ch, &rid).await? {
@@ -985,6 +1067,75 @@ pub trait SqlGate: Send + Sync {
     async fn gate(&self, sql: &str) -> Result<String, String>;
 }
 
+/// Plan 1e entry point: deliver every enabled [`AlertKind::PipelineFailure`]
+/// rule that scopes `pipeline_id == pipeline_id_argument ||
+/// "*"`, building a body that names the pipeline, the run id, and a relative
+/// console link. Unlike [`run_rules`], this is event-driven — it is called
+/// by the `run-failed` route once per failure, and the route is responsible
+/// for the dedupe.
+///
+/// # Errors
+///
+/// Returns [`ChError`] only if [`list_rules`] itself fails (e.g.
+/// `ClickHouse` unreachable). Per-rule delivery failures are reported via
+/// [`DeliverResult`] inside `deliver_unless_silenced`, never propagated.
+pub async fn evaluate_pipeline_failure(
+    ch: &ChClient,
+    http: &reqwest::Client,
+    email: &EmailSender,
+    pipeline_id: &str,
+    run_id: &str,
+    failed_step_keys: &[String],
+    silence: Option<&dyn SilenceSource>,
+) -> Result<usize, ChError> {
+    // A failure message is the user's own run id + the orchestrator's
+    // failure metadata; never fabricates any other text. `failed_step_keys`
+    // is bounded by `run_steps`'s own step count — a typical Dagster job
+    // has at most a handful, so the message stays short even for noisy
+    // graphs. The console link is RELATIVE — no `console_base_url`
+    // configuration exists anywhere in this crate or `lakehouse-api`
+    // today, and the route hand-off spec says "use the relative link
+    // exactly as the plan specifies" rather than mint a new config key.
+    let step_keys = if failed_step_keys.is_empty() {
+        "(no failed step recorded)".to_owned()
+    } else {
+        failed_step_keys.join(", ")
+    };
+    let console_link = format!("/pipelines/{pipeline_id}?run={run_id}");
+    let text = format!(
+        "Pipeline {pipeline_id} run {run_id} failed. Failed steps: {step_keys}. View: {console_link}"
+    );
+
+    let rules: Vec<AlertRule> = list_rules(ch)
+        .await?
+        .into_iter()
+        .filter(|r| {
+            r.enabled
+                && r.kind == AlertKind::PipelineFailure
+                && r.pipeline
+                    .as_deref()
+                    .is_some_and(|p| p == pipeline_id || p == "*")
+        })
+        .collect();
+
+    let mut delivered = 0_usize;
+    for rule in &rules {
+        if let Some(DeliverResult { .. }) = deliver_unless_silenced(
+            http,
+            email,
+            silence,
+            rule,
+            &format!("🔥 Pipeline failure: {}", rule.name),
+            &text,
+        )
+        .await
+        {
+            delivered += 1;
+        }
+    }
+    Ok(delivered)
+}
+
 /// Evaluate every enabled rule (or just `only`, if given), delivering
 /// alerts/digests/freshness breaches that fire. Ports `runRules`.
 ///
@@ -1039,6 +1190,19 @@ async fn run_one(
         AlertKind::Freshness => {
             run_freshness(freshness, http, email, silence, rule, now_millis()).await
         }
+        // `pipeline_failure` rules are evaluated by
+        // [`evaluate_pipeline_failure`] (the route handler calls it
+        // directly with the per-event pipeline id and run id), never by
+        // `run_rules` — there is no periodic trigger for a failure rule,
+        // only the orchestrator's `run_failure_sensor` posting each event
+        // to the route. A `pipeline_failure` rule reaching this match arm
+        // is the wrong call site and is treated as skipped rather than
+        // silently dropped.
+        AlertKind::PipelineFailure => skipped(
+            rule,
+            "pipeline_failure rules are evaluated by the run-failed event route, not run_rules"
+                .to_owned(),
+        ),
     }
 }
 
@@ -1591,12 +1755,14 @@ mod tests {
         row.insert("target".to_owned(), Value::String("t".to_owned()));
         row.insert("enabled".to_owned(), Value::String("1".to_owned()));
         row.insert("created_at".to_owned(), Value::String(String::new()));
+        row.insert("pipeline".to_owned(), Value::String(String::new()));
 
         let rule = row_to_rule(&row);
         assert_eq!(rule.mart, None);
         assert_eq!(rule.measure, None);
         assert_eq!(rule.board, None);
         assert_eq!(rule.created_at, None);
+        assert_eq!(rule.pipeline, None);
         assert_eq!(rule.agg, "sum");
         assert_eq!(rule.op, AlertOp::Gt);
         assert!((rule.threshold - 42.0).abs() < f64::EPSILON);
@@ -1701,6 +1867,7 @@ mod tests {
         row.insert("enabled".to_owned(), Value::String("1".to_owned()));
         row.insert("created_at".to_owned(), Value::String(String::new()));
         row.insert("severity".to_owned(), Value::String("info".to_owned()));
+        row.insert("pipeline".to_owned(), Value::String(String::new()));
 
         let rule = row_to_rule(&row);
         assert_eq!(rule.kind, AlertKind::Freshness);
@@ -1755,6 +1922,346 @@ mod tests {
         assert!(normalize_input(&input).is_err());
     }
 
+    // ── AlertKind::PipelineFailure (plan 1e) ────────────────────────────
+
+    #[test]
+    fn pipeline_failure_kind_as_str_round_trips() {
+        assert_eq!(AlertKind::PipelineFailure.as_str(), "pipeline_failure");
+    }
+
+    #[test]
+    fn row_to_rule_maps_pipeline_failure_type_and_pipeline_column() {
+        let mut row = Map::new();
+        row.insert("id".to_owned(), Value::String("al_1".to_owned()));
+        row.insert("name".to_owned(), Value::String("x".to_owned()));
+        row.insert(
+            "type".to_owned(),
+            Value::String("pipeline_failure".to_owned()),
+        );
+        row.insert("mart".to_owned(), Value::String(String::new()));
+        row.insert("measure".to_owned(), Value::String(String::new()));
+        row.insert("agg".to_owned(), Value::String(String::new()));
+        row.insert("op".to_owned(), Value::String(String::new()));
+        row.insert("threshold".to_owned(), Value::String("0".to_owned()));
+        row.insert("board".to_owned(), Value::String(String::new()));
+        row.insert("channel".to_owned(), Value::String("webhook".to_owned()));
+        row.insert("target".to_owned(), Value::String("t".to_owned()));
+        row.insert("enabled".to_owned(), Value::String("1".to_owned()));
+        row.insert("created_at".to_owned(), Value::String(String::new()));
+        row.insert("severity".to_owned(), Value::String(String::new()));
+        row.insert(
+            "pipeline".to_owned(),
+            Value::String("pl-orders-hourly".to_owned()),
+        );
+
+        let rule = row_to_rule(&row);
+        assert_eq!(rule.kind, AlertKind::PipelineFailure);
+        assert_eq!(rule.pipeline.as_deref(), Some("pl-orders-hourly"));
+    }
+
+    #[test]
+    fn normalize_input_accepts_a_pipeline_failure_rule_with_star() {
+        let input = AlertRuleInput {
+            name: Some("Any pipeline failure".to_owned()),
+            kind: Some("pipeline_failure".to_owned()),
+            target: Some("https://hooks.example.com/x".to_owned()),
+            channel: Some("webhook".to_owned()),
+            pipeline: Some("*".to_owned()),
+            ..AlertRuleInput::default()
+        };
+        let normalized = normalize_input(&input).unwrap();
+        assert_eq!(normalized.kind, AlertKind::PipelineFailure);
+        assert_eq!(normalized.pipeline, "*");
+    }
+
+    #[test]
+    fn normalize_input_accepts_a_pipeline_failure_rule_with_pipeline_id() {
+        let input = AlertRuleInput {
+            name: Some("Orders failure".to_owned()),
+            kind: Some("pipeline_failure".to_owned()),
+            target: Some("https://hooks.example.com/x".to_owned()),
+            channel: Some("webhook".to_owned()),
+            pipeline: Some("pl-orders".to_owned()),
+            ..AlertRuleInput::default()
+        };
+        let normalized = normalize_input(&input).unwrap();
+        assert_eq!(normalized.kind, AlertKind::PipelineFailure);
+        assert_eq!(normalized.pipeline, "pl-orders");
+    }
+
+    #[test]
+    fn normalize_input_rejects_a_pipeline_failure_rule_with_no_pipeline() {
+        let input = AlertRuleInput {
+            name: Some("Orders failure".to_owned()),
+            kind: Some("pipeline_failure".to_owned()),
+            target: Some("https://hooks.example.com/x".to_owned()),
+            channel: Some("webhook".to_owned()),
+            pipeline: None,
+            ..AlertRuleInput::default()
+        };
+        let err = normalize_input(&input).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("pipeline_failure requires a pipeline id or"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn normalize_input_rejects_a_pipeline_failure_rule_with_garbage_pipeline() {
+        let input = AlertRuleInput {
+            name: Some("Orders failure".to_owned()),
+            kind: Some("pipeline_failure".to_owned()),
+            target: Some("https://hooks.example.com/x".to_owned()),
+            channel: Some("webhook".to_owned()),
+            pipeline: Some("gold_export_job".to_owned()),
+            ..AlertRuleInput::default()
+        };
+        let err = normalize_input(&input).unwrap_err();
+        assert!(err.to_string().contains("pl-... id or \"*\""), "{err}");
+    }
+
+    /// Plan 1e: the `pipeline` column is added via the same
+    /// `ADD COLUMN IF NOT EXISTS` convention `severity` already uses
+    /// (`ensure`'s block comment :552-557). This test pins that the new
+    /// statement is sent, so a future refactor that forgets it would not
+    /// silently leave existing deployments with a missing column on
+    /// production data.
+    #[tokio::test]
+    async fn ensure_sends_an_additive_pipeline_column_statement() {
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("ADD COLUMN IF NOT EXISTS pipeline"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+        ensure(&ch).await.unwrap();
+    }
+
+    /// Plan 1e: when a rule fires, the webhook receives a body that names
+    /// the pipeline, the run id, and a relative `/pipelines/<id>?run=<runId>`
+    /// link — never a Dagster error message (AGENTS.md rule 4). The body
+    /// shape is the wire contract the route tests assert against.
+    #[tokio::test]
+    async fn evaluate_pipeline_failure_delivers_a_message_naming_pipeline_and_run() {
+        use wiremock::matchers::{body_string_contains, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // The webhook the test expects to be hit once with the body shape
+        // this plan's contract specifies. wiremock intercepts the URL its
+        // server is bound to, so the rule's `target` is the mock's own
+        // `/hooks/example` path — the contract under test is the *body*
+        // the alert sends, not the URL it sends to.
+        let webhook = format!("{}/hooks/example", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/hooks/example"))
+            .and(body_string_contains("pl-orders"))
+            .and(body_string_contains("run-deadbeef"))
+            .and(body_string_contains(
+                "/pipelines/pl-orders?run=run-deadbeef",
+            ))
+            .and(body_string_contains("bronze_load"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Catch-all for every other ClickHouse call (`ensure`, `save_rule`
+        // INSERT, `list_rules` SELECT). Returns a rule row that round-trips
+        // back through `row_to_rule` to the kind/pipeline we just saved —
+        // a real fixture would persist this; the mock just gives the same
+        // answer on every read.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(pipeline_failure_rule_row_json(
+                    "al_pf1",
+                    "Orders failure",
+                    "pl-orders",
+                    &webhook,
+                )),
+            )
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        save_rule(
+            &ch,
+            &AlertRuleInput {
+                name: Some("Orders failure".to_owned()),
+                kind: Some("pipeline_failure".to_owned()),
+                target: Some(webhook.clone()),
+                channel: Some("webhook".to_owned()),
+                pipeline: Some("pl-orders".to_owned()),
+                ..AlertRuleInput::default()
+            },
+            Some("al_pf1"),
+        )
+        .await
+        .unwrap();
+
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let matched = evaluate_pipeline_failure(
+            &ch,
+            &http,
+            &email,
+            "pl-orders",
+            "run-deadbeef",
+            &["bronze_load".to_owned()],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(matched, 1);
+    }
+
+    /// `evaluate_pipeline_failure` matches `*` rules on every pipeline id,
+    /// the same wildcard convention every other kind of rule's "every
+    /// <thing>" mode uses.
+    #[tokio::test]
+    async fn evaluate_pipeline_failure_matches_the_wildcard_star_rule() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let webhook = format!("{}/hooks/wildcard", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/hooks/wildcard"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(pipeline_failure_rule_row_json(
+                    "al_pf2",
+                    "Any failure",
+                    "*",
+                    &webhook,
+                )),
+            )
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        save_rule(
+            &ch,
+            &AlertRuleInput {
+                name: Some("Any failure".to_owned()),
+                kind: Some("pipeline_failure".to_owned()),
+                target: Some(webhook.clone()),
+                channel: Some("webhook".to_owned()),
+                pipeline: Some("*".to_owned()),
+                ..AlertRuleInput::default()
+            },
+            Some("al_pf2"),
+        )
+        .await
+        .unwrap();
+
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let matched =
+            evaluate_pipeline_failure(&ch, &http, &email, "pl-some-other", "run-x", &[], None)
+                .await
+                .unwrap();
+        assert_eq!(matched, 1);
+    }
+
+    /// Rules scoped to a different pipeline id do NOT match — `*` and a
+    /// specific id are the only matching values, never one rule's `pipeline`
+    /// being treated as another rule's scope.
+    #[tokio::test]
+    async fn evaluate_pipeline_failure_does_not_match_a_rule_scoped_to_a_different_id() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let webhook = format!("{}/never", server.uri());
+        // Only the catch-all ClickHouse mock is mounted — no webhook path
+        // matcher, so if `evaluate_pipeline_failure` mistakenly tried to
+        // deliver to this rule wiremock would panic on the unmatched POST.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(pipeline_failure_rule_row_json(
+                    "al_pf3",
+                    "Other failure",
+                    "pl-other",
+                    &webhook,
+                )),
+            )
+            .mount(&server)
+            .await;
+        let ch = ChClient::new(server.uri(), "default".to_owned(), String::new());
+
+        save_rule(
+            &ch,
+            &AlertRuleInput {
+                name: Some("Other failure".to_owned()),
+                kind: Some("pipeline_failure".to_owned()),
+                target: Some(webhook),
+                channel: Some("webhook".to_owned()),
+                pipeline: Some("pl-other".to_owned()),
+                ..AlertRuleInput::default()
+            },
+            Some("al_pf3"),
+        )
+        .await
+        .unwrap();
+
+        let http = reqwest::Client::new();
+        let email = no_smtp_email_sender();
+        let matched =
+            evaluate_pipeline_failure(&ch, &http, &email, "pl-orders", "run-deadbeef", &[], None)
+                .await
+                .unwrap();
+        assert_eq!(
+            matched, 0,
+            "a scoped rule for another pipeline must not fire"
+        );
+    }
+
+    /// Single source of truth for the catch-all mock row shape the three
+    /// tests above need from `ClickHouse` — every field `row_to_rule` reads
+    /// populated, so a `pipeline_failure` rule survives the round-trip.
+    fn pipeline_failure_rule_row_json(
+        id: &str,
+        name: &str,
+        pipeline: &str,
+        target: &str,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "meta": [],
+            "data": [{
+                "id": id,
+                "name": name,
+                "type": "pipeline_failure",
+                "mart": "",
+                "measure": "",
+                "agg": "",
+                "op": "",
+                "threshold": "0",
+                "board": "",
+                "channel": "webhook",
+                "target": target,
+                "enabled": "1",
+                "created_at": "",
+                "severity": "",
+                "pipeline": pipeline,
+            }],
+            "rows": 1,
+        })
+    }
+
     // ── run_freshness (WS5 item C1, Step 6) ─────────────────────────────
 
     fn freshness_rule(table_name: &str) -> AlertRule {
@@ -1773,6 +2280,7 @@ mod tests {
             enabled: true,
             created_at: None,
             severity: None,
+            pipeline: None,
         }
     }
 

@@ -342,6 +342,37 @@ unaffected in the default (non-`dagster`) stack; when bringing up the
 ci.yml`'s `g1-rustfs`/`g2-seaweedfs`/`g3a-dagster` jobs already do for
 the same underlying reason.
 
+### Pipeline-failure alerts (plan 1e)
+
+`dagster/dispar_orchestrate/pipeline_events.py`'s `run_failure_sensor`
+fires on every failed run in this code location (including
+`alerts_run_job`, `bronze_ingest_job`, etc.) and POSTs
+`{"runId": "...", "jobName": "authored__<id>"}` to
+`POST /api/pipelines/events/run-failed`. The handler resolves
+`jobName` through the runnable-pipeline list, asks Dagster to confirm
+`status == "FAILURE"`, dedupes by `(run_id, kind="failure")` in the new
+`pipeline_run_event` table (migration `0049`), then evaluates
+`pipeline_failure` alert rules — each scoped to one pipeline id or `*`.
+
+**Both `lakehouse-api` and the Dagster code location must have
+`PIPELINE_RUN_TOKEN` set to the same value.** Without it the sensor
+posts nothing and no failure alert fires (degraded-honest: the sensor
+logs through `context.log.info` instead). Without it on the API side
+the orchestrator service identity is never seeded, and the handler
+refuses the request as unauthorized. This is the same
+`PIPELINE_RUN_TOKEN` gating `GET /api/pipelines/runnable` for
+`authored_factory.py` (already required for the dagster profile).
+`docker-compose.yml`'s `dagster` profile passes the same `${PIPELINE_RUN_TOKEN:?}`
+to both services — leaving it unset in `.env` makes the stack refuse to start.
+
+**Dedup guarantees** rest on the `(run_id, kind)` primary key in
+`pipeline_run_event`: a sensor retry sees `false` from
+`record_pipeline_run_event` and the handler short-circuits with
+`{"matched": 0, "reason": "run already alerted; sensor retry ignored"}`,
+so no rule fires twice. The same table is reused by the kinds plan 1f
+adds (`slow`, `volume_drop`, `late`); `record_pipeline_run_event` is
+the only writer for them.
+
 ### What's deliberately NOT in the stack
 
 - **The Next.js frontend.** Its Dockerfile is untracked, ad hoc work in
