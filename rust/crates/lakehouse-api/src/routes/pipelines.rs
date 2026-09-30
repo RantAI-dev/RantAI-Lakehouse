@@ -82,10 +82,16 @@ pub async fn list(
             Ok(refusal) => refusal,
             Err(err) => return ApiRejection(err).into_response(),
         };
+    // A Platform Admin with no tenant sees every tenant's authored
+    // pipelines, the same rule that already shows them the shared Dagster
+    // jobs (`catalog::is_unrestricted`). Without it the admin, who has no
+    // tenant, saw no authored pipeline on this list at all.
+    let all_tenants = tenant_id.is_none() && crate::routes::catalog::is_unrestricted(&principal);
     match list_body(
         &state.dagster,
         state.pg.as_deref(),
         tenant_id,
+        all_tenants,
         dagster_jobs_refused,
     )
     .await
@@ -113,6 +119,7 @@ async fn list_body(
     dagster: &DgClient,
     pg: Option<&PgPool>,
     tenant_id: Option<Uuid>,
+    all_tenants: bool,
     dagster_jobs_refused: Option<&'static str>,
 ) -> Result<Value, ListError> {
     // The `Dagster` half is a SHARED, un-tenanted resource — a code
@@ -131,6 +138,9 @@ async fn list_body(
             tokio::try_join!(dagster.list_jobs_with_schedules(), dagster.list_runs(100))?;
         pipelines = jobs
             .iter()
+            // An authored pipeline's `authored__<id>` job is listed once, as
+            // its own `pl-` row below, never a second time as a Dagster job.
+            .filter(|j| !j.name.starts_with("authored__"))
             .map(|j| {
                 let last = last_run_for(&runs, &j.name);
                 dagster_pipeline_row(j, last)
@@ -138,10 +148,12 @@ async fn list_body(
             .collect();
     }
     // No tenant means no authored pipeline, not every tenant's: the store
-    // is not queried at all.
-    if let (Some(pg), Some(tenant_id)) = (pg, tenant_id) {
+    // is not queried at all, unless the caller is a tenantless Platform
+    // Admin (`all_tenants`, decided in `list`).
+    if let Some(pg) = pg.filter(|_| tenant_id.is_some() || all_tenants) {
         let filter = pipelines::PipelineFilter {
-            tenant_id: Some(tenant_id),
+            tenant_id,
+            all_tenants,
         };
         let authored = pipelines::list_pipelines(pg, &filter).await?;
         pipelines.extend(authored.iter().filter_map(|p| serde_json::to_value(p).ok()));
@@ -3308,6 +3320,7 @@ mod tests {
                 &pool,
                 &pipelines::PipelineFilter {
                     tenant_id: Some(tenant_id),
+                    all_tenants: false,
                 },
             )
             .await
