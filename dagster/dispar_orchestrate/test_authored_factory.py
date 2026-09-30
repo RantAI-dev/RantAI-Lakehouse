@@ -333,7 +333,7 @@ class AuthoredScheduleTest(unittest.TestCase):
 
 # ── R3 plan 2a: dependency-sensor tests (appended below) ──────────────
 #
-# The sensor body is a closure over `pipeline["id"]` and `pipeline["depends_on"]`;
+# The sensor body is a closure over `pipeline["id"]` and `pipeline["dependsOn"]`;
 # every other field of the pipeline dict is irrelevant to it. These tests
 # build the minimum dict the body reads on top of HEAD's `_ready_pipeline`
 # (so the runnable-payload fixture stays the single source of truth for the
