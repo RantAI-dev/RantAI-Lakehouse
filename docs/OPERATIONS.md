@@ -342,6 +342,88 @@ unaffected in the default (non-`dagster`) stack; when bringing up the
 ci.yml`'s `g1-rustfs`/`g2-seaweedfs`/`g3a-dagster` jobs already do for
 the same underlying reason.
 
+### Pipeline-failure alerts (plan 1e)
+
+`dagster/dispar_orchestrate/pipeline_events.py`'s `run_failure_sensor`
+fires on every failed run in this code location (including
+`alerts_run_job`, `bronze_ingest_job`, etc.) and POSTs
+`{"runId": "...", "jobName": "authored__<id>"}` to
+`POST /api/pipelines/events/run-failed`. The handler resolves
+`jobName` through the runnable-pipeline list, asks Dagster to confirm
+`status == "FAILURE"`, dedupes by `(run_id, kind="failure")` in the new
+`pipeline_run_event` table (migration `0049`), then evaluates
+`pipeline_failure` alert rules — each scoped to one pipeline id or `*`.
+
+**Both `lakehouse-api` and the Dagster code location must have
+`PIPELINE_RUN_TOKEN` set to the same value.** Without it the sensor
+posts nothing and no failure alert fires (degraded-honest: the sensor
+logs through `context.log.info` instead). Without it on the API side
+the orchestrator service identity is never seeded, and the handler
+refuses the request as unauthorized. This is the same
+`PIPELINE_RUN_TOKEN` gating `GET /api/pipelines/runnable` for
+`authored_factory.py` (already required for the dagster profile).
+`docker-compose.yml`'s `dagster` profile passes the same `${PIPELINE_RUN_TOKEN:?}`
+to both services — leaving it unset in `.env` makes the stack refuse to start.
+
+**Dedup guarantees** rest on the `(run_id, kind)` primary key in
+`pipeline_run_event`: a sensor retry sees `false` from
+`record_pipeline_run_event` and the handler short-circuits with
+`{"matched": 0, "reason": "run already alerted; sensor retry ignored"}`,
+so no rule fires twice. The same table is reused by the kinds plan 1f
+adds (`slow`, `volume_drop`, `late`); `record_pipeline_run_event` is
+the only writer for them.
+
+### Pipeline SLA, Late, and Volume-drop alerts (plan 1f)
+
+`dagster/dispar_orchestrate/pipeline_events.py`'s `run_status_sensor`
+(filtered to `DagsterRunStatus.SUCCESS`, `default_status=RUNNING`,
+named `pipeline_run_finished_sensor`) fires on every successful run
+in this code location and POSTs the same `{"runId": ..., "jobName":
+...}` shape to `POST /api/pipelines/events/run-finished`. The handler
+resolves `jobName` through the runnable-pipeline list, asks Dagster
+to confirm `status == "SUCCESS"` and to return the run's
+`endTime`, dedupes by `(run_id, kind="slow")` / `(run_id,
+kind="volume_drop")`, then computes:
+
+* **slow** — `overDuration(run.duration_seconds, sla.max_duration_seconds)`.
+  `None` when the SLA is unset or the run is still in flight; `true`
+  only when the duration is strictly over `maxDurationSeconds`. Each
+  pipeline's runs are exposed as `overDuration` on the run payload.
+* **volume_drop** — for each completed run, look at the median
+  `materialization_rows` across the previous 5+ completed runs of the
+  same job. `None` when the prior sample is below 5 (the rule is
+  `skipped`, never fired or silent). `true` when the current rows are
+  strictly under half the median.
+
+Each rule of kind `pipeline_slow` / `pipeline_volume_drop` with
+`pipeline = <id>` (or `*` for the wildcard rule) is then evaluated,
+with `record_pipeline_run_event` doing the same `(run_id, kind)`
+dedupe as the failure alert above.
+
+**Per-pipeline SLA** lives in the new `pipeline_sla` table (migration
+`0050`), one row per `pipeline_id`, with optional
+`max_duration_seconds` and `late_after_seconds`. The `PUT
+/api/pipelines/{id}/sla` route is the only writer; `GET` returns the
+row or `404` (so the UI can distinguish "no SLA yet" from a degraded
+backend). Both fields are validated positive at the handler (the
+database CHECK is defense in depth). Each pipeline row's payload
+gains an `sla` block (the full record with `null` for unset
+thresholds) and a `slaOk` flag derived from `overDuration` on the
+latest run.
+
+**Late pipeline alerts** are evaluated inside the `/api/alerts/run`
+op (not the sensor path) because "now" depends on the clock at the
+moment of evaluation, not at run time. For each `pipeline_late` rule
+whose `pipeline` matches `pipeline_id`, the op loads the SLA's
+`late_after_seconds` and the pipeline's last successful run time, and
+fires `true` only when the gap is strictly over the threshold. With
+no SLA or no last success, the rule is `unsupported` and is recorded
+in the alerts run's per-rule output. Like the run-finished path,
+`record_pipeline_run_event` dedupes by `(run_id, kind="late")` — but
+"run id" here is a per-rule invariant for now (we always pass the
+latest known run id), so dedupe is conservative; future work may
+attach a clock-based key.
+
 ### What's deliberately NOT in the stack
 
 - **The Next.js frontend.** Its Dockerfile is untracked, ad hoc work in

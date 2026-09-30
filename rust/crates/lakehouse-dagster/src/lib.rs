@@ -51,6 +51,23 @@ pub struct DgTag {
     pub value: String,
 }
 
+/// A [`DgRun`] together with its summed materialization row count, for the
+/// volume route (`GET /api/pipelines/{id}/volume`) and the
+/// `pipeline_volume_drop` alert (plan 1f).
+///
+/// `rows` is `None` when no step of the run reported any `IntMetadataEntry`
+/// labelled `"rows"` — a run that did real work whose every asset
+/// materialization happens not to count rows (or whose steps failed before
+/// materialization) is not a row count of `0`; it is a measurement gap.
+#[derive(Debug, Clone)]
+pub struct DgRunWithRows {
+    /// The underlying run record (same shape [`list_runs_for_job`] returns).
+    pub run: DgRun,
+    /// Sum of every `"rows"`-labelled `IntMetadataEntry` across every
+    /// step's materializations; `None` when no step reported rows.
+    pub rows: Option<i64>,
+}
+
 /// How a re-execution picks the steps it runs again.
 ///
 /// `Selected` is deliberately NOT a variant here: a re-execution of a
@@ -308,6 +325,11 @@ pub struct RunStatusInfo {
     /// recorded one yet (WS4 item G1 — the value the API layer reports as
     /// `startedAt` when it can, rather than fabricating `now()`).
     pub start_time: Option<f64>,
+    /// Unix seconds the run ended, or `None` if `Dagster` hasn't
+    /// recorded an end yet (still running). Plan 1f: the run-finished
+    /// event route needs this to compute `durationSeconds` and decide
+    /// whether the run was over its `pipeline_sla.max_duration_seconds`.
+    pub end_time: Option<f64>,
 }
 
 /// One step in a runs × steps matrix row — the matrix's per-cell shape,
@@ -619,6 +641,52 @@ impl DgClient {
             return Ok(Vec::new());
         };
         Ok(results.iter().map(run_with_steps_from_value).collect())
+    }
+
+    /// Like [`list_runs_for_job`], but each run is paired with its summed
+    /// materialization row count (plan 1f). Backed by a single GraphQL
+    /// query that pulls `stepStats { materializations { metadataEntries } }`
+    /// alongside the run fields, so the volume route stays one round trip
+    /// rather than N+1 against `Dagster`. Rows are summed across every
+    /// step's materializations; a run with no `"rows"`-labelled metadata
+    /// reports `rows = None` (a measurement gap, never `0`).
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::list_runs`].
+    pub async fn list_runs_for_job_with_materializations(
+        &self,
+        job_name: &str,
+        limit: u32,
+    ) -> Result<Vec<DgRunWithRows>, DgError> {
+        let query = format!(
+            "{{ runsOrError(filter: {{ pipelineName: \"{job_name}\" }}, limit: {limit}) {{ \
+             __typename ... on Runs {{ results {{ runId jobName status startTime endTime \
+             creationTime parentRunId rootRunId tags {{ key value }} \
+             stepStats {{ stepKey status startTime endTime \
+             materializations {{ metadataEntries {{ __typename \
+             ... on IntMetadataEntry {{ label intValue }} }} }} \
+             }} }} }} }} }}"
+        );
+        // `metadataEntries` is a heterogeneous GraphQL union whose
+        // `serde` untag would silently drop real variants, so the run
+        // results are pulled as raw JSON and parsed with the same
+        // value-navigation approach `pipeline_run_status` already uses
+        // for `stepStats`.
+        let value: Value = self.execute(&query, None).await?;
+        let results = value
+            .pointer("/runsOrError/results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut out = Vec::with_capacity(results.len());
+        for run_value in results {
+            let run: DgRun = serde_json::from_value(run_value.clone())
+                .map_err(|e| DgError::Server(format!("Dagster run payload: {e}")))?;
+            let rows = rows_for_run(&run_value);
+            out.push(DgRunWithRows { run, rows });
+        }
+        Ok(out)
     }
 
     /// List jobs in the default repository together with each job's
@@ -1131,7 +1199,7 @@ impl DgClient {
         run_id: &str,
     ) -> Result<Option<RunStatusInfo>, DgError> {
         let query = "query($rid:ID!){ pipelineRunOrError(runId:$rid){ __typename \
-                      ... on Run { status startTime stepStats { stepKey status } } } }";
+                      ... on Run { status startTime endTime stepStats { stepKey status } } } }";
         let body = json!({ "query": query, "variables": { "rid": run_id } });
         let resp = self.client.post(&self.url).json(&body).send().await?;
         let text = resp.text().await?;
@@ -1150,6 +1218,7 @@ impl DgClient {
             .unwrap_or("unknown")
             .to_owned();
         let start_time = run.get("startTime").and_then(Value::as_f64);
+        let end_time = run.get("endTime").and_then(Value::as_f64);
         let steps = run
             .get("stepStats")
             .and_then(Value::as_array)
@@ -1174,6 +1243,7 @@ impl DgClient {
             status,
             steps,
             start_time,
+            end_time,
         }))
     }
 
@@ -1691,6 +1761,27 @@ fn rows_from_metadata_entries(entries: &Value) -> Option<i64> {
     })
 }
 
+/// Sum `rows` across every materialization of every step in `run_value`,
+/// or `None` when no step reported any. A run with a mixture of
+/// materializations (some with rows, some without) gets the sum of those
+/// that did report — partial measurements are not failures, they just
+/// aren't `0`.
+fn rows_for_run(run_value: &Value) -> Option<i64> {
+    let steps = run_value.get("stepStats")?.as_array()?;
+    let mut total: Option<i64> = None;
+    for step in steps {
+        let Some(materializations) = step.get("materializations").and_then(Value::as_array) else {
+            continue;
+        };
+        for mat in materializations {
+            if let Some(rows) = rows_from_metadata_entries(mat.get("metadataEntries")?) {
+                total = Some(total.map_or(rows, |t| t + rows));
+            }
+        }
+    }
+    total
+}
+
 /// Join `assetKey.path` (`Dagster`'s asset key is a path segment list, e.g.
 /// `["bronze", "orders"]`) with `/`, or `None` when the materialization
 /// carries no asset key at all.
@@ -2135,6 +2226,66 @@ mod tests {
             .find(|s| s.step_key == "never_started")
             .map(|s| s.duration_ms);
         assert_eq!(step_duration, Some(None));
+    }
+
+    /// `list_runs_for_job_with_materializations` sums the `"rows"`
+    /// metadata entries across every step's materializations, returning
+    /// `None` for a run whose steps reported no row count.
+    #[tokio::test]
+    async fn list_runs_for_job_with_materializations_sums_rows_across_steps() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runsOrError": { "__typename": "Runs", "results": [
+                    { "runId": "r1", "jobName": "refresh_lakehouse", "status": "SUCCESS",
+                      "startTime": 1.0, "endTime": 3.0,
+                      "stepStats": [
+                          { "stepKey": "step_a", "status": "SUCCESS",
+                            "materializations": [
+                                { "metadataEntries": [
+                                    { "__typename": "IntMetadataEntry",
+                                      "label": "rows", "intValue": 100 }
+                                ] }
+                            ] },
+                          { "stepKey": "step_b", "status": "SUCCESS",
+                            "materializations": [
+                                { "metadataEntries": [
+                                    { "__typename": "IntMetadataEntry",
+                                      "label": "rows", "intValue": 250 }
+                                ] },
+                                { "metadataEntries": [
+                                    { "__typename": "TextMetadataEntry",
+                                      "label": "note", "text": "no count here" }
+                                ] }
+                            ] }
+                      ] },
+                    { "runId": "r2", "jobName": "refresh_lakehouse", "status": "SUCCESS",
+                      "startTime": 4.0, "endTime": 5.0,
+                      "stepStats": [
+                          { "stepKey": "step_a", "status": "SUCCESS",
+                            "materializations": [
+                                { "metadataEntries": [
+                                    { "__typename": "TextMetadataEntry",
+                                      "label": "note", "text": "rows aren't tracked" }
+                                ] }
+                            ] }
+                      ] }
+                ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let runs = client
+            .list_runs_for_job_with_materializations("refresh_lakehouse", 30)
+            .await
+            .unwrap();
+        assert_eq!(runs.len(), 2);
+        // r1: 100 + 250 = 350 (the TextMetadataEntry contributes nothing).
+        assert_eq!(runs[0].rows, Some(350));
+        // r2: nothing reported rows, so the run reports None — not 0.
+        assert_eq!(runs[1].rows, None);
     }
 
     #[tokio::test]
