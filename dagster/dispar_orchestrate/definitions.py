@@ -18,7 +18,7 @@ from dispar_orchestrate.capacity_snapshot import (
     capacity_snapshot_schedule,
 )
 from dispar_orchestrate.gold_export import gold_export_job, gold_export_schedule
-from dispar_orchestrate.ingest_factory import ingest_job, ingest_schedules
+from dispar_orchestrate.ingest_factory import ingest_job, ingest_schedule_sensor
 from dispar_orchestrate.maintenance import (
     bronze_maintenance_job,
     bronze_maintenance_schedule,
@@ -88,6 +88,9 @@ defs = Definitions(
         *agent_run_schedules,
         capacity_snapshot_schedule,
         gold_export_schedule,
-        *ingest_schedules,
     ],
+    # `ingest_job`'s connector schedules: one sensor reading them from
+    # lakehouse-api, so a schedule saved in the console needs no reload --
+    # see `ingest_factory.py`'s "Schedules" section.
+    sensors=[ingest_schedule_sensor],
 )

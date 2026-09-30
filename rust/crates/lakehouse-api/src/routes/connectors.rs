@@ -113,24 +113,80 @@ pub async fn list(
     ))
 }
 
+/// `GET /api/connectors/ingestible`'s optional window: both bounds or
+/// neither, RFC 3339.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestibleQuery {
+    due_after: Option<String>,
+    due_until: Option<String>,
+}
+
 /// `GET /api/connectors/ingestible` — every connector that has an ingest
 /// spec set (`adapter IS NOT NULL`), as an
 /// [`connectors::IngestibleConnector`]. Gated on `ingest:read`
 /// (`POLICY_TABLE`), a strictly narrower grant than the base
 /// `/api/connectors` route's `connector:manage` — this is the route
 /// `dagster/dispar_orchestrate/ingest_factory.py`'s `ingest:read`-scoped
-/// service identity calls, both at code-load time (to build schedules)
-/// and at run time (`run_ingest`'s own re-fetch of its own connector).
+/// service identity calls, from its schedule sensor and at run time
+/// (`run_ingest`'s own re-fetch of its own connector).
+///
+/// With `?dueAfter=&dueUntil=`, only the batch connectors whose
+/// `scheduleCron` fires in `(dueAfter, dueUntil]` — what the schedule
+/// sensor launches. Evaluated here with the same `croner` evaluation the
+/// console's `nextRunAt` comes from ([`crate::next_run`]), so the two
+/// never disagree.
 ///
 /// # Errors
 ///
-/// 503 if no pool is configured; 500 on a database failure.
+/// 400 if only one bound is given or either is not RFC 3339; 503 if no
+/// pool is configured; 500 on a database failure.
 pub async fn list_ingestible(
     State(state): State<AppState>,
+    Query(query): Query<IngestibleQuery>,
 ) -> ApiResult<ApiJson<Vec<connectors::IngestibleConnector>>> {
-    Ok(ApiJson(
-        connectors::list_ingestible_connectors(pool(&state)?).await?,
-    ))
+    let window = due_window(&query)?;
+    let all = connectors::list_ingestible_connectors(pool(&state)?).await?;
+    Ok(ApiJson(match window {
+        Some((after, until)) => all
+            .into_iter()
+            .filter(|c| is_due(c, after, until))
+            .collect(),
+        None => all,
+    }))
+}
+
+fn due_window(
+    query: &IngestibleQuery,
+) -> Result<Option<(time::OffsetDateTime, time::OffsetDateTime)>, ApiError> {
+    let parse = |name: &str, value: &str| {
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).map_err(
+            |err| ApiError::BadRequest(format!("{name} {value:?} is not an RFC 3339 time: {err}")),
+        )
+    };
+    match (&query.due_after, &query.due_until) {
+        (None, None) => Ok(None),
+        (Some(after), Some(until)) => {
+            Ok(Some((parse("dueAfter", after)?, parse("dueUntil", until)?)))
+        }
+        _ => Err(ApiError::BadRequest(
+            "dueAfter and dueUntil go together: give both or neither".to_owned(),
+        )),
+    }
+}
+
+/// A `cdc` connector streams through its own Debezium service and is never
+/// launched on a schedule, whatever its row says.
+fn is_due(
+    connector: &connectors::IngestibleConnector,
+    after: time::OffsetDateTime,
+    until: time::OffsetDateTime,
+) -> bool {
+    connector.adapter != "cdc"
+        && connector
+            .schedule_cron
+            .as_deref()
+            .is_some_and(|cron| crate::next_run::fires_between(cron, after, until))
 }
 
 /// `GET /api/connectors/types` — every row of `connector_type`
@@ -2403,11 +2459,40 @@ pub async fn assign_connector_tenant(
 pub async fn ingest_spec_get(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> ApiResult<ApiJson<connectors::IngestSpec>> {
+) -> ApiResult<ApiJson<IngestSpecResponse>> {
     let spec = connectors::get_ingest_spec(pool(&state)?, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Connector {id} not found")))?;
-    Ok(ApiJson(spec))
+    Ok(ApiJson(IngestSpecResponse::new(
+        spec,
+        time::OffsetDateTime::now_utc(),
+    )))
+}
+
+/// A connector's ingest spec as the console reads it: the stored spec plus
+/// when its schedule next fires. Mirrors `IngestSpec` in
+/// `contracts/connectors.ts`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestSpecResponse {
+    #[serde(flatten)]
+    spec: connectors::IngestSpec,
+    /// The next time the schedule sensor launches this connector (UTC,
+    /// [`crate::next_run::next_run_at`]); `null` with no schedule, and for
+    /// `cdc`, which streams on its own.
+    #[serde(with = "time::serde::rfc3339::option")]
+    next_run_at: Option<time::OffsetDateTime>,
+}
+
+impl IngestSpecResponse {
+    fn new(spec: connectors::IngestSpec, now: time::OffsetDateTime) -> Self {
+        let next_run_at = spec
+            .schedule_cron
+            .as_deref()
+            .filter(|_| spec.adapter.as_deref() != Some("cdc"))
+            .and_then(|cron| crate::next_run::next_run_at(cron, now));
+        Self { spec, next_run_at }
+    }
 }
 
 /// The `PUT /api/connectors/{id}/ingest-spec` body. Mirrors
@@ -2514,8 +2599,17 @@ pub async fn ingest_spec_put(
     State(state): State<AppState>,
     Path(id): Path<String>,
     body: Bytes,
-) -> ApiResult<ApiJson<connectors::IngestSpec>> {
+) -> ApiResult<ApiJson<IngestSpecResponse>> {
     let body: IngestSpecBody = parse_body(&body)?;
+    // Refused here rather than at the first tick: the schedule sensor
+    // would otherwise skip a malformed cron without a word, forever.
+    if let Some(problem) = body
+        .schedule_cron
+        .as_deref()
+        .and_then(crate::next_run::ingest_cron_problem)
+    {
+        return Err(ApiError::BadRequest(problem).into());
+    }
     // Parsed here, in the route, ahead of `set_ingest_spec`'s own (later,
     // authoritative-for-persistence) `Dial::parse` call: this handler
     // needs the typed `Dial` itself to extract a host for
@@ -2531,7 +2625,10 @@ pub async fn ingest_spec_put(
         schedule_cron: body.schedule_cron,
     };
     match connectors::set_ingest_spec(pool(&state)?, &id, &input).await {
-        Ok(spec) => Ok(ApiJson(spec)),
+        Ok(spec) => Ok(ApiJson(IngestSpecResponse::new(
+            spec,
+            time::OffsetDateTime::now_utc(),
+        ))),
         Err(lakehouse_store::StoreError::NotFound) => {
             Err(ApiError::NotFound(format!("Connector {id} not found")).into())
         }
@@ -4103,5 +4200,94 @@ mod tests {
             let parsed: Result<SetCredentialBody, _> = serde_json::from_value(body.clone());
             assert!(parsed.is_err(), "{body}");
         }
+    }
+
+    fn ingestible(id: &str, adapter: &str, cron: Option<&str>) -> connectors::IngestibleConnector {
+        connectors::IngestibleConnector {
+            id: id.to_owned(),
+            adapter: adapter.to_owned(),
+            ingest_mode: if adapter == "cdc" { "cdc" } else { "batch" }.to_owned(),
+            dial: json!({}),
+            source_objects: json!([]),
+            schedule_cron: cron.map(str::to_owned),
+            secret_ref: format!("file:/run/secrets/connector_managed_{id}_password"),
+            secret_ref_secondary: None,
+        }
+    }
+
+    /// The schedule sensor's window: a connector is due when its cron
+    /// fires after `dueAfter` and no later than `dueUntil`; `cdc` and an
+    /// unscheduled connector never are.
+    #[test]
+    fn is_due_follows_the_cron_and_leaves_out_cdc_and_manual_connectors() {
+        let until = time::macros::datetime!(2026 - 09 - 30 02:00:00 UTC);
+        let after = until - time::Duration::minutes(1);
+        assert!(is_due(
+            &ingestible("a", "sql", Some("0 2 * * *")),
+            after,
+            until
+        ));
+        assert!(!is_due(
+            &ingestible("b", "sql", Some("0 3 * * *")),
+            after,
+            until
+        ));
+        assert!(!is_due(
+            &ingestible("c", "cdc", Some("0 2 * * *")),
+            after,
+            until
+        ));
+        assert!(!is_due(&ingestible("d", "sql", None), after, until));
+    }
+
+    #[test]
+    fn due_window_takes_both_bounds_or_neither() {
+        let query = |after: Option<&str>, until: Option<&str>| IngestibleQuery {
+            due_after: after.map(str::to_owned),
+            due_until: until.map(str::to_owned),
+        };
+        assert!(due_window(&query(None, None)).unwrap().is_none());
+        let (after, until) = due_window(&query(
+            Some("2026-09-30T01:59:00+00:00"),
+            Some("2026-09-30T02:00:00+00:00"),
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(until - after, time::Duration::minutes(1));
+        assert!(due_window(&query(Some("2026-09-30T01:59:00+00:00"), None)).is_err());
+        assert!(due_window(&query(Some("yesterday"), Some("2026-09-30T02:00:00+00:00"))).is_err());
+    }
+
+    fn spec(adapter: &str, cron: Option<&str>) -> connectors::IngestSpec {
+        connectors::IngestSpec {
+            adapter: Some(adapter.to_owned()),
+            ingest_mode: Some("batch".to_owned()),
+            dial: json!({}),
+            source_objects: json!([]),
+            schedule_cron: cron.map(str::to_owned),
+            secret_refs: connectors::IngestSecretRefs {
+                primary: "file:/run/secrets/x".to_owned(),
+                secondary: None,
+            },
+        }
+    }
+
+    /// `nextRunAt` sits next to the stored spec's own fields, and is `null`
+    /// where nothing is scheduled to run.
+    #[test]
+    fn ingest_spec_response_adds_the_next_run() {
+        let now = time::macros::datetime!(2026 - 09 - 30 01:30:00 UTC);
+        let body =
+            serde_json::to_value(IngestSpecResponse::new(spec("sql", Some("0 2 * * *")), now))
+                .unwrap();
+        assert_eq!(body["nextRunAt"], "2026-09-30T02:00:00Z");
+        assert_eq!(body["scheduleCron"], "0 2 * * *");
+        assert_eq!(body["adapter"], "sql");
+        let manual = serde_json::to_value(IngestSpecResponse::new(spec("sql", None), now)).unwrap();
+        assert!(manual["nextRunAt"].is_null());
+        let cdc =
+            serde_json::to_value(IngestSpecResponse::new(spec("cdc", Some("0 2 * * *")), now))
+                .unwrap();
+        assert!(cdc["nextRunAt"].is_null());
     }
 }

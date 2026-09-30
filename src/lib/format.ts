@@ -167,6 +167,23 @@ export function formatRelativeTime(
   return `${months}mo ago`
 }
 
+/** ISO timestamp in the future → "in 4m", "in 3h", "in 2d"; "now" once
+ * it has passed (a next run that is due is about to start). */
+export function formatTimeUntil(
+  iso: string | null | undefined,
+  now = Date.now()
+): string {
+  if (!iso) return "—"
+  const t = parseTimestamp(iso).getTime()
+  if (Number.isNaN(t)) return "—"
+  const mins = Math.ceil((t - now) / 60_000)
+  if (mins <= 0) return "now"
+  if (mins < 60) return `in ${mins}m`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `in ${hours}h`
+  return `in ${Math.floor(hours / 24)}d`
+}
+
 /** Freshness lag in seconds → "8 s", "4m", "3h 20m". */
 export function formatLagSeconds(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "—"

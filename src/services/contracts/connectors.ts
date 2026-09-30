@@ -493,19 +493,24 @@ export type IngestMode = "batch" | "cdc" | "stream" | string
 
 /**
  * A connector's ingest configuration, as returned by
- * `GET /api/connectors/{id}/ingest-spec`. Mirrors Rust `IngestSpec`
- * (`rust/crates/lakehouse-store/src/connectors.rs`) field-for-field,
- * including nullability: `adapter`/`ingestMode` are plain
- * `Option<String>` there (not a closed enum), `null` for a connector
- * that has never had an ingest spec set.
+ * `GET /api/connectors/{id}/ingest-spec`. Mirrors Rust `IngestSpecResponse`
+ * (`rust/crates/lakehouse-api/src/routes/connectors.rs`): the stored
+ * `IngestSpec` (`rust/crates/lakehouse-store/src/connectors.rs`)
+ * field-for-field, including nullability — `adapter`/`ingestMode` are
+ * plain `Option<String>` there (not a closed enum), `null` for a connector
+ * that has never had an ingest spec set — plus `nextRunAt`.
  */
 export type IngestSpec = {
   adapter: IngestAdapter | null
   ingestMode: IngestMode | null
   dial: Dial
   sourceObjects: SourceObject[]
+  /** Five-field cron, evaluated in UTC. */
   scheduleCron: string | null
   secretRefs: IngestSecretRefs
+  /** When the schedule next launches an ingest (ISO, UTC); `null` with no
+   * schedule, and for CDC, which streams on its own. */
+  nextRunAt: string | null
 }
 
 /**

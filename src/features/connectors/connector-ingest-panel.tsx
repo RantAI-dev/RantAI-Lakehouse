@@ -2,7 +2,16 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { ChevronRightIcon, LoaderIcon, PlayIcon, PlusIcon, SearchIcon, TableIcon, XIcon } from "lucide-react"
+import {
+  CalendarClockIcon,
+  ChevronRightIcon,
+  LoaderIcon,
+  PlayIcon,
+  PlusIcon,
+  SearchIcon,
+  TableIcon,
+  XIcon,
+} from "lucide-react"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
@@ -11,7 +20,7 @@ import { Label } from "@/components/ui/label"
 import { useRefreshable } from "@/hooks/use-refreshable"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { backfillTriggerMessage } from "@/lib/connectors/backfill-message"
-import { formatDuration, formatRelativeTime, parseTimestamp } from "@/lib/format"
+import { formatDateTime, formatDuration, formatRelativeTime, formatTimeUntil, parseTimestamp } from "@/lib/format"
 import { withNotify } from "@/lib/notify"
 import { connectorService } from "@/services"
 import type { Dial, IngestJobRun, IngestRun, IngestSpec, SourceObject } from "@/services/contracts/connectors"
@@ -68,10 +77,12 @@ export function cronProblem(cron: string): string | null {
   return null
 }
 
+// Crons are evaluated in UTC (`ingest_schedule_sensor`), so a fixed time
+// says so; the next run below is shown in the viewer's own time.
 const SCHEDULE_PRESETS: { value: string; label: string }[] = [
   { value: "", label: "Manual only" },
   { value: "0 * * * *", label: "Every hour" },
-  { value: "0 2 * * *", label: "Every day at 02:00" },
+  { value: "0 2 * * *", label: "Every day at 02:00 UTC" },
 ]
 
 const RUN_TONE: Record<string, "success" | "destructive" | "warning" | "neutral"> = {
@@ -451,11 +462,23 @@ function IngestEditor({
               autoComplete="off"
             />
           ) : null}
-          {scheduleProblem ? <p className="text-xs text-destructive">{scheduleProblem}</p> : null}
-          {cron ? (
-            <p className="text-xs text-muted-foreground">
-              The orchestrator picks up a new or changed schedule the next time it reloads its code. Until then,
-              use Run now.
+          {scheduleProblem ? (
+            <p className="text-xs text-destructive">{scheduleProblem}</p>
+          ) : cronChoice === "custom" ? (
+            <p className="text-xs text-muted-foreground">Minute, hour, day, month, weekday — in UTC.</p>
+          ) : null}
+          {cron !== savedCron ? (
+            cron ? (
+              <p className="text-xs text-muted-foreground">Runs on this schedule within a minute of saving.</p>
+            ) : null
+          ) : spec.nextRunAt ? (
+            <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <CalendarClockIcon className="size-3.5 shrink-0" />
+              <span>
+                Next run{" "}
+                <span className="font-medium text-foreground">{formatDateTime(spec.nextRunAt)}</span> your time
+                ({formatTimeUntil(spec.nextRunAt)})
+              </span>
             </p>
           ) : null}
         </div>

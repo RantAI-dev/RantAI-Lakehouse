@@ -25,8 +25,9 @@ const SPEC = {
   ingestMode: "batch",
   dial: { driver: "postgres", host: "192.168.18.205", port: 55432, database: "northwind", user: "postgres", sslMode: null },
   sourceObjects: [] as { name: string; target: string }[],
-  scheduleCron: null,
+  scheduleCron: null as string | null,
   secretRefs: { primary: "file:/run/secrets/connector_managed_x_password", secondary: null },
+  nextRunAt: null as string | null,
 }
 
 type Call = { url: string; method: string; body: unknown }
@@ -39,7 +40,10 @@ function stubFetch(spec: typeof SPEC = SPEC): Call[] {
     const body = init?.body ? JSON.parse(init.body as string) : undefined
     calls.push({ url, method, body })
     if (url.includes("/ingest-spec") && method === "GET") return json(spec)
-    if (url.includes("/ingest-spec") && method === "PUT") return json({ ...spec, ...body, scheduleCron: body.scheduleCron ?? null })
+    if (url.includes("/ingest-spec") && method === "PUT") {
+      const scheduleCron = body.scheduleCron ?? null
+      return json({ ...spec, ...body, scheduleCron, nextRunAt: scheduleCron ? "2026-10-01T02:00:00Z" : null })
+    }
     if (url.includes("/api/governance/ingest-runs")) return json([])
     if (url.includes("/ingest/runs")) return json([])
     if (url.includes("/discover")) {
@@ -100,6 +104,8 @@ describe("ConnectorIngestPanel", () => {
     expect(target.value).toBe("northwind_orders")
 
     fireEvent.change(screen.getByLabelText("Schedule"), { target: { value: "0 2 * * *" } })
+    // A saved schedule applies on its own, with no orchestrator reload.
+    expect(screen.getByText("Runs on this schedule within a minute of saving.")).toBeDefined()
     // Unsaved changes block a run.
     expect(screen.getByText("Save your changes before running.")).toBeDefined()
 
@@ -119,6 +125,8 @@ describe("ConnectorIngestPanel", () => {
       expect((screen.getByRole("button", { name: "Run now" }) as HTMLButtonElement).disabled).toBe(false)
     )
     expect(screen.getByText("public.customers")).toBeDefined()
+    // The saved schedule says when it next runs, in the viewer's time.
+    expect(screen.getByText(/Next run/).textContent).toMatch(/Next run Oct 0?1, 2026, \d\d:00 your time \((in \d+[mhd]|now)\)/)
     fireEvent.click(screen.getByRole("button", { name: "Run now" }))
     // Until Dagster lists the run, the panel waits for it and keeps Run now
     // disabled, so a second click cannot start a second run.

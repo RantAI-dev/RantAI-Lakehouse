@@ -2,14 +2,11 @@
 static `ingest_job`/`run_ingest` op pair (mirrors `agent_runs.py`'s
 `agent_run_job`/`run_agent_employee` shape exactly: a static `@job`
 wrapping a `config_schema`-driven `@op`, never a job built per connector)
-plus `build_ingest_schedules`, which reads `GET /api/connectors/ingestible`
-at Dagster code-load time and builds one `ScheduleDefinition` per
-cron-scheduled, non-`cdc` connector -- all targeting the SAME static job
-with a DIFFERENT `run_config`, mirroring `agent_runs.py::build_agent_run_schedules`.
+plus `ingest_schedule_sensor`, which asks `GET /api/connectors/ingestible`
+which connectors came due since its last evaluation and launches the SAME
+static job for each, with a DIFFERENT `run_config`.
 
-No real network: `requests.get` is always monkeypatched (the real
-`_fetch_ingestible_connectors` degrades to `[]` on any failure -- see
-`test_agent_runs.py`'s equivalent tests for the same resilience shape).
+No real network: `requests.get` is always monkeypatched.
 No real SSRF/adapter/sink call: `_ADAPTERS`/`secret_resolver`/`sink_adapter`
 are monkeypatched per test, matching `test_adapters_sql.py`'s style of
 injecting fakes rather than touching a real driver.
@@ -25,10 +22,17 @@ import requests
 
 from dispar_orchestrate.adapters.kafka import BatchResult
 from dispar_orchestrate.adapters.sink import SinkResult
+from datetime import datetime, timedelta, timezone
+
+from dagster import DagsterInstance, build_sensor_context
+
 from dispar_orchestrate.ingest_factory import (
     IngestFactoryConfig,
     UnknownAdapter,
-    build_ingest_schedules,
+    _fetch_due_connectors,
+    _window_start,
+    due_run_requests,
+    ingest_schedule_sensor,
     run_kafka_stream_batch,
 )
 
@@ -42,62 +46,101 @@ def _no_catalog_registration(monkeypatch):
     monkeypatch.setattr(f.connector_catalog, "register_connector_table", lambda *a, **k: 0)
 
 
-def test_build_ingest_schedules_returns_empty_when_api_is_unreachable(monkeypatch) -> None:
-    monkeypatch.setattr(requests, "get", lambda *a, **k: (_ for _ in ()).throw(requests.ConnectionError()))
+UNTIL = datetime(2026, 9, 30, 2, 0, tzinfo=timezone.utc)
+
+
+def _due(connector_id: str, adapter: str = "sql") -> dict:
+    return {"id": connector_id, "adapter": adapter, "scheduleCron": "0 2 * * *"}
+
+
+class _Resp:
+    def __init__(self, body) -> None:
+        self.body = body
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self):
+        return self.body
+
+
+def test_due_run_requests_launch_the_one_static_job_per_due_connector() -> None:
+    requests_, skipped = due_run_requests([_due("conn-a"), _due("conn-b", "cdc"), _due("conn-c")], UNTIL, {"conn-c"})
+    # cdc streams through its own Debezium service: never launched here.
+    # conn-c's previous ingest is still going: skipped, not stacked.
+    assert [r.run_config for r in requests_] == [{"ops": {"run_ingest": {"config": {"connector_id": "conn-a"}}}}]
+    assert skipped == ["conn-c"]
+    # The run key names the connector and the fire window, so evaluating
+    # the same window twice never launches twice.
+    assert requests_[0].run_key == "conn-a@2026-09-30T02:00:00+00:00"
+    assert requests_[0].tags["lakehouse/trigger"] == "schedule"
+
+
+def test_window_start_continues_from_the_cursor_within_the_catch_up_limit() -> None:
+    # First evaluation: only the current minute.
+    assert _window_start(None, UNTIL) == (UNTIL - timedelta(minutes=1), False)
+    assert _window_start("not a time", UNTIL) == (UNTIL - timedelta(minutes=1), False)
+    # A normal tick picks up exactly where the last one stopped.
+    previous = UNTIL - timedelta(minutes=3)
+    assert _window_start(previous.isoformat(), UNTIL) == (previous, False)
+    # After a long gap, only the last hour is caught up.
+    assert _window_start((UNTIL - timedelta(days=1)).isoformat(), UNTIL) == (UNTIL - timedelta(hours=1), True)
+
+
+def test_fetch_due_connectors_asks_for_the_window_and_refuses_a_non_list(monkeypatch) -> None:
+    calls = []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        calls.append((url, params, headers))
+        return _Resp([_due("conn-a")])
+
+    monkeypatch.setattr(requests, "get", fake_get)
     cfg = IngestFactoryConfig(api_url="http://x", service_token="t")
-    assert build_ingest_schedules(cfg) == []
-
-
-def test_build_ingest_schedules_returns_empty_when_token_is_unset() -> None:
-    cfg = IngestFactoryConfig(api_url="http://x", service_token="")
-    assert build_ingest_schedules(cfg) == []
-
-
-def test_build_ingest_schedules_skips_cdc_and_connectors_with_no_cron(monkeypatch) -> None:
-    connectors = [
-        {
-            "id": "conn-a",
-            "adapter": "sql",
-            "scheduleCron": "0 * * * *",
-            "dial": {},
-            "sourceObjects": [],
-            "secretRef": "env:CONNECTOR_MYSQL_PASSWORD",
-            "secretRefSecondary": None,
-        },
-        {
-            "id": "conn-b",
-            "adapter": "cdc",
-            "scheduleCron": "0 * * * *",
-            "dial": {},
-            "sourceObjects": [],
-            "secretRef": "env:CONNECTOR_PG_PASSWORD",
-            "secretRefSecondary": None,
-        },
-        {
-            "id": "conn-c",
-            "adapter": "sql",
-            "scheduleCron": None,
-            "dial": {},
-            "sourceObjects": [],
-            "secretRef": "env:CONNECTOR_PG_PASSWORD",
-            "secretRefSecondary": None,
-        },
+    after = UNTIL - timedelta(minutes=1)
+    assert _fetch_due_connectors(cfg, after, UNTIL) == [_due("conn-a")]
+    assert calls == [
+        (
+            "http://x/api/connectors/ingestible",
+            {"dueAfter": "2026-09-30T01:59:00+00:00", "dueUntil": "2026-09-30T02:00:00+00:00"},
+            {"Authorization": "Bearer t"},
+        )
     ]
 
-    class _Resp:
-        def raise_for_status(self) -> None:
-            return None
+    monkeypatch.setattr(requests, "get", lambda *a, **k: _Resp({"error": "nope"}))
+    with pytest.raises(RuntimeError):
+        _fetch_due_connectors(cfg, after, UNTIL)
 
-        def json(self):
-            return connectors
 
-    monkeypatch.setattr(requests, "get", lambda *a, **k: _Resp())
-    cfg = IngestFactoryConfig(api_url="http://x", service_token="t")
-    schedules = build_ingest_schedules(cfg)
-    assert [s.name for s in schedules] == ["ingest_schedule__conn_a"]
-    # Every schedule targets the SAME static job, with a DIFFERENT
-    # run_config -- never a per-connector job (mirrors `agent_runs.py`).
-    assert schedules[0].job.name == "ingest_job"
+def test_sensor_skips_with_a_reason_when_the_token_is_unset(monkeypatch) -> None:
+    monkeypatch.delenv("INGEST_SERVICE_TOKEN", raising=False)
+    with DagsterInstance.ephemeral() as instance:
+        result = ingest_schedule_sensor(build_sensor_context(instance=instance))
+    assert "INGEST_SERVICE_TOKEN" in (result.skip_reason.skip_message or "")
+
+
+def test_sensor_launches_due_connectors_and_moves_its_cursor(monkeypatch) -> None:
+    monkeypatch.setenv("INGEST_SERVICE_TOKEN", "t")
+    asked = []
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        asked.append(params)
+        return _Resp([_due("conn-a")])
+
+    monkeypatch.setattr(requests, "get", fake_get)
+    with DagsterInstance.ephemeral() as instance:
+        result = ingest_schedule_sensor(build_sensor_context(instance=instance))
+    assert [r.run_config["ops"]["run_ingest"]["config"]["connector_id"] for r in result.run_requests] == ["conn-a"]
+    # The cursor is the window's end: the next tick starts there.
+    assert result.cursor == asked[0]["dueUntil"]
+
+
+def test_sensor_fails_the_tick_when_the_api_cannot_answer(monkeypatch) -> None:
+    # A failed tick is visible in Dagster and keeps the cursor, so the
+    # same window is asked again -- a schedule is never silently lost.
+    monkeypatch.setenv("INGEST_SERVICE_TOKEN", "t")
+    monkeypatch.setattr(requests, "get", lambda *a, **k: (_ for _ in ()).throw(requests.ConnectionError()))
+    with DagsterInstance.ephemeral() as instance, pytest.raises(requests.ConnectionError):
+        ingest_schedule_sensor(build_sensor_context(instance=instance))
 
 
 def test_run_one_object_resolves_secrets_via_the_allowlisted_resolver(monkeypatch) -> None:
