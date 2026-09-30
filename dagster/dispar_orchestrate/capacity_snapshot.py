@@ -58,7 +58,7 @@ from dagster import DefaultScheduleStatus, Failure, ScheduleDefinition, job, op
 from s3fs import S3FileSystem
 
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, record_capacity_snapshot
-from dispar_orchestrate.op_metadata import source_metadata
+from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 
 def _env(name: str, default: str) -> str:
@@ -71,10 +71,19 @@ def _required_env(name: str) -> str:
     empty. Used for the RustFS S3 credentials this job authenticates
     with: an empty value here means an anonymous (and failing) bucket
     listing, a configuration problem — never a legitimate "nothing to
-    measure" case that should degrade quietly."""
+    measure" case that should degrade quietly.
+
+    PART D: this raise fires at `run_capacity_snapshot`'s op-execution
+    time (via `CapacityConfig.from_env`), so `allow_retries=False`
+    short-circuits the default retry policy and the op fails on the
+    first attempt instead of burning 60s on a problem the operator
+    must fix out-of-band."""
     value = os.environ.get(name, "").strip()
     if not value:
-        raise Failure(f"{name} is not set — capacity_snapshot cannot authenticate to RustFS")
+        raise Failure(
+            f"{name} is not set — capacity_snapshot cannot authenticate to RustFS",
+            allow_retries=False,
+        )
     return value
 
 
@@ -138,11 +147,12 @@ def measure_bucket(cfg: CapacityConfig) -> BucketMeasurement:
 
 
 @op(
+    retry_policy=DEFAULT_RETRY_POLICY,
     tags=source_metadata(
         "dispar_orchestrate/capacity_snapshot.py::run_capacity_snapshot",
         reads=["RustFS warehouse bucket (every object)"],
         writes=["ClickHouse lake.bronze_meta.capacity_snapshot"],
-    )
+    ),
 )
 def run_capacity_snapshot(context) -> None:
     """P6 op: measure `cfg.bucket_name`'s live object count/bytes via

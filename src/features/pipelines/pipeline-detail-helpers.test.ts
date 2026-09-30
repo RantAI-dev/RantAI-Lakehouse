@@ -91,10 +91,16 @@ describe("run logs", () => {
     message,
   })
   test("the op's own error comes before the engine's generic failure lines", () => {
+    // PART A of `parts/1b-dagster-one-op-per-unit-and-retries.md`:
+    // `run_gold_export` was split into `list_gold_marts` (fan-out)
+    // -> `export_gold_mart[<key>]` (mapped, one step per mart) ->
+    // `summarize_gold_export` (collect). The failure-line shape the
+    // console parses is unchanged; the per-mart mapped step is the
+    // one that fails, and its key carries the configured mart name.
     const lines = [
-      line("ERROR", "export of 'x' failed: 401 Client Error", "run_gold_export"),
-      line("ERROR", 'Execution of step "run_gold_export" failed.', "run_gold_export"),
-      line("ERROR", 'Execution of run for "gold_export_job" failed. Steps failed: [\'run_gold_export\'].'),
+      line("ERROR", "export of 'x' failed: 401 Client Error", "export_gold_mart[x]"),
+      line("ERROR", 'Execution of step "export_gold_mart[x]" failed.', "export_gold_mart[x]"),
+      line("ERROR", 'Execution of run for "gold_export_job" failed. Steps failed: [\'export_gold_mart[x]\'].'),
     ]
     expect(failureLines(lines).map((l) => l.message)).toEqual(["export of 'x' failed: 401 Client Error"])
   })

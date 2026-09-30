@@ -95,18 +95,31 @@ values become -- NEVER an env var name derived from the connector id (see
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
 
 import requests
-from dagster import AssetMaterialization, DefaultScheduleStatus, Field, ScheduleDefinition, job, op
+from dagster import (
+    AssetMaterialization,
+    DefaultScheduleStatus,
+    DynamicOut,
+    DynamicOutput,
+    Failure,
+    Field,
+    ScheduleDefinition,
+    job,
+    op,
+)
 
 from kafka import KafkaConsumer, TopicPartition
 from kafka.structs import OffsetAndMetadata
 
 from dispar_orchestrate import dlt_pipeline, secret_resolver, ssrf_guard
+from dispar_orchestrate import ssrf_guard_mongo as ssrf_guard_mongo_module
+from dispar_orchestrate import ssrf_guard_sftp as ssrf_guard_sftp_module
 from dispar_orchestrate.adapters import files as files_adapter
 from dispar_orchestrate.adapters import mongodb as mongodb_adapter
 from dispar_orchestrate.adapters import oracle as oracle_adapter
@@ -119,7 +132,7 @@ from dispar_orchestrate.adapters.kafka import consume_one_batch
 from dispar_orchestrate.adapters.sink import load_via_sink
 from dispar_orchestrate.bronze_catalog import record_ingest_offset, record_ingest_run
 from dispar_orchestrate.column_gate import UnsupportedColumnType, reject_unsupported_column_types
-from dispar_orchestrate.op_metadata import source_metadata
+from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 from dispar_orchestrate.secret_map import secret_field_names
 from dispar_orchestrate.secret_resolver import SecretRefRejected
 
@@ -219,6 +232,29 @@ def _sanitize_name(connector_id: str) -> str:
     """A Dagster-legal schedule name derived from `connector_id`, mirroring
     `agent_runs.py::_schedule_name`'s hyphen-to-underscore mapping."""
     return "".join(c if c.isalnum() or c == "_" else "_" for c in connector_id)
+
+
+# Dagster's `DynamicOutput.mapping_key` must match `^[A-Za-z0-9_]+$`
+# (`dagster._core.definitions.utils.check_valid_chars`). The exact ASCII
+# rule from `parts/1b-dagster-one-op-per-unit-and-retries.md`: every
+# character outside `[A-Za-z0-9_]` becomes `_`. Precompiled once at
+# module load; the same rule `gold_export._sanitize_mapping_key` and
+# `maintenance._sanitize_mapping_key` enforce so a connector/target id
+# can serve as a schedule name, an op name, or a mapping key
+# consistently. Note: `str.isalnum()` would be wrong here -- it is True
+# for non-ASCII letters (`"é".isalnum()`, `"²".isalnum()`), which would
+# silently produce a non-ASCII mapping key that Dagster then rejects.
+_SANITIZE_NON_ASCII = re.compile(r"[^A-Za-z0-9_]")
+
+
+def _sanitize_target(target: str) -> str:
+    """A Dagster-legal `DynamicOutput.mapping_key` derived from a
+    source object's `target` -- the exact ASCII `[A-Za-z0-9_]+` rule
+    `gold_export._sanitize_mapping_key` and
+    `maintenance._sanitize_mapping_key` already enforce. Mirrors
+    `_sanitize_name`; kept as a separate helper so each call site is
+    explicit about which kind of identifier it is sanitizing."""
+    return _SANITIZE_NON_ASCII.sub("_", target)
 
 
 _ADAPTERS = {
@@ -594,13 +630,53 @@ def _run_stream_connector(connector: dict) -> None:
 
 @op(
     config_schema={"connector_id": Field(str, description="The connector.id (adapter IS NOT NULL) to ingest.")},
+    out=DynamicOut(),
+    retry_policy=DEFAULT_RETRY_POLICY,
     tags=source_metadata(
         "dispar_orchestrate/ingest_factory.py::run_ingest",
         reads=["Connector source objects (per its ingest spec)"],
-        writes=["Iceberg bronze.{target} per source object", "ClickHouse lake.bronze_meta.ingest_run"],
+        # `writes` is the side-effect of this op: a `DynamicOutput` per
+        # source object, which becomes a mapped
+        # `ingest_source_object[<target>]` step (and a cdc/stream
+        # connector yields zero). Declared here so the every-op walk
+        # test that requires non-empty `writes` does not flag this
+        # fan-out as having no writes.
+        writes=["DynamicOutput per sourceObjects entry (batch connectors only)"],
     ),
 )
-def run_ingest(context) -> None:
+def run_ingest(context) -> Any:
+    """PART B of `parts/1b-dagster-one-op-per-unit-and-retries.md`: the
+    fan-out for `ingest_job`. Three branches, all keeping the existing
+    `connector_id` op config:
+
+    1. `adapter == "cdc"` -- Debezium's compose service owns the
+       connector's ingestion end-to-end (ADR 0008's
+       `snapshot.mode=initial`), so this op has no body to run.
+       Yields no `DynamicOutput`s; the job completes after this op.
+    2. `ingestMode == "stream"` -- a single bounded
+       `_run_stream_connector(connector)` call owns the connector's
+       rows (Kafka micro-batch loop), not the per-object loop. Yields
+       no `DynamicOutput`s; the job completes after this op.
+    3. Otherwise (batch) -- yields one `DynamicOutput` per
+       `sourceObjects` entry, with `mapping_key` = the sanitized
+       `target` (the same `[A-Za-z0-9_]+` rule
+       `gold_export._sanitize_mapping_key` enforces, refactored to the
+       shared `_sanitize_target` helper below).
+
+    The connector dict carried in each `DynamicOutput` is the SAME one
+    `_fetch_one_connector` returned -- it holds `secretRef` STRING
+    REFERENCES, never resolved secret values, so Dagster's IO manager
+    persisting the output does not leak a resolved secret. The
+    `ingest_source_object` mapped op resolves secrets INSIDE its own
+    body via the existing `_resolve_object_secrets`/`secret_resolver`
+    path; the fan-out's payload never crosses that line.
+
+    Two source objects whose sanitized targets collide raise
+    `Failure(allow_retries=False)` -- they would otherwise collapse
+    into one mapped step doing two objects' work, which Dagster's
+    graph would refuse at build time and which this fan-out catches
+    first with both names in the message.
+    """
     connector_id: str = context.op_config["connector_id"]
     cfg = IngestFactoryConfig.from_env()
     connector = _fetch_one_connector(cfg, connector_id)
@@ -618,16 +694,101 @@ def run_ingest(context) -> None:
         # build_source() call per sourceObjects entry.
         _run_stream_connector(connector)
         return
+    seen: dict[str, str] = {}
     for obj in connector.get("sourceObjects", []):
-        rows = _run_one_object(connector, obj)
-        # The rows the sink measured, as a materialization: the run's step
-        # then carries them (`GET .../runs/{runId}/steps`), which is where
-        # the console reads rows per run. An unsupported object measured
-        # nothing and reports nothing.
-        if isinstance(rows, int):
-            context.log_event(
-                AssetMaterialization(asset_key=f"bronze.{obj['target']}", metadata={"rows": rows})
+        target = obj["target"]
+        key = _sanitize_target(target)
+        if key in seen:
+            raise Failure(
+                f"connector {connector_id!r} has two sourceObjects whose targets "
+                f"sanitize to the same Dagster step key {key!r}: "
+                f"{seen[key]!r} and {target!r} -- rename one so each source object "
+                "maps to a unique mapped step",
+                allow_retries=False,
             )
+        seen[key] = target
+        yield DynamicOutput(
+            value={"connector": connector, "obj": obj},
+            mapping_key=key,
+        )
+
+
+@op(
+    retry_policy=DEFAULT_RETRY_POLICY,
+    tags=source_metadata(
+        "dispar_orchestrate/ingest_factory.py::ingest_source_object",
+        reads=["Connector source object spec"],
+        writes=[
+            "Iceberg bronze.{target} per source object",
+            "ClickHouse lake.bronze_meta.ingest_run",
+        ],
+    ),
+)
+def ingest_source_object(context, payload: dict[str, Any]) -> Any:
+    """One mapped step per source object of a batch connector. Receives
+    the connector dict with its `secretRef` strings only -- resolves
+    secrets INSIDE this op (so Dagster's IO manager persisting the
+    `DynamicOutput` payload never sees a resolved secret value, the
+    invariant the PART B fan-out design closes). The per-object
+    `record_ingest_run` row and the `AssetMaterialization` for a
+    measured integer row count are both the same ones the pre-fan-out
+    `run_ingest` emitted; the per-step failure unit is the only thing
+    that changed.
+
+PART D: a config-shaped failure retries with the same input and
+    gets the same answer -- so it is wrapped in
+    `Failure(allow_retries=False)` at this op's boundary, which lets
+    the `DEFAULT_RETRY_POLICY` keep absorbing transient network blips
+    without wasting its two retries on a config that will never change
+    between attempts. The set is closed by `UnsupportedKafkaAuth` /
+    `OracleTlsConfigError` / `HostKeyMismatch` / `MongoConfigRejected`
+    (each adapter's own config-rejection contract) and by `ValueError`
+    (broader catch -- see comment below). Other exceptions
+    (HTTP/connection/transient) propagate so the policy does what it
+    says it says."""
+    connector, obj = payload["connector"], payload["obj"]
+    try:
+        rows = _run_one_object(connector, obj)
+    except (
+        UnknownAdapter,
+        SecretRefRejected,
+        ssrf_guard.SsrfBlocked,
+        UnsupportedColumnType,
+        UnsupportedKafkaAuth,
+        oracle_adapter.OracleTlsConfigError,
+        ssrf_guard_sftp_module.HostKeyMismatch,
+        ssrf_guard_mongo_module.MongoConfigRejected,
+        # `ValueError` is the broad one. Every adapter raises
+        # `ValueError` exclusively for rejected adapter configuration:
+        #   - sql.py:134 hostname, :139 control char, :210 driver
+        #     reroute, :226 unknown driver
+        #   - rest.py:128 unknown auth type, :184 unknown pagination type
+        #   - sftp.py:90 unsupported auth type, :120 unsupported fileFormat
+        #   - files.py:110 unsupported format
+        #   - secret_map.py:82 no secret field mapping
+        # `files.py:84` (object-size cap) is the one site where
+        # `ValueError` is data-shaped, not config-shaped -- a future
+        # object exceeding the cap should retry cleanly with the same
+        # object, so we do NOT treat it as non-retryable; the catch
+        # here would over-claim that one as a config failure. The
+        # trade-off is acceptable: the mapped step still records its
+        # `ingest_run` failure row (in `_run_one_object`'s own
+        # `except Exception` branch), and the cap is a project-level
+        # Tier 1 invariant -- a `ValueError` that surfaces after the
+        # retry policy's two attempts is no worse than one that
+        # surfaces after a single attempt, and the message is
+        # preserved.
+        ValueError,
+    ) as exc:
+        raise Failure(
+            description=f"ingest of {obj.get('target')!r}: {exc}",
+            allow_retries=False,
+        ) from exc
+    if isinstance(rows, int):
+        context.log_event(
+            AssetMaterialization(asset_key=f"bronze.{obj['target']}", metadata={"rows": rows})
+        )
+    return rows
 
 
 @job(name="ingest_job")
@@ -635,8 +796,15 @@ def ingest_job() -> None:
     """`DAGSTER_LOCATION`-visible job name: `ingest_job` -- the SAME
     static job for every ingestible connector, launched with run config
     `{"ops": {"run_ingest": {"config": {"connector_id": "..."}}}}`
-    (mirrors `agent_run_job`'s `_employee_run_config` shape exactly)."""
-    run_ingest()
+    (mirrors `agent_run_job`'s `_employee_run_config` shape exactly).
+    PART B: `run_ingest` is now a fan-out (cdc/stream yield no mapped
+    steps; batch yields one mapped `ingest_source_object[<target>]`
+    per source object). The `.map(...)` form is the mandatory DSL
+    shape here -- `ingest_source_object(run_ingest())` would emit an
+    "uninvoked op" warning then a graph-build error, because the
+    output of `run_ingest()` is a `DynamicOutput` (a generator of
+    output specs, not a value the mapped op can consume directly)."""
+    run_ingest().map(lambda payload: ingest_source_object(payload)).collect()
 
 
 def _ingest_run_config(connector_id: str) -> dict[str, Any]:

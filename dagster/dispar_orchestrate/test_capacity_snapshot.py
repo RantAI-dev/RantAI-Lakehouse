@@ -126,3 +126,18 @@ def test_capacity_config_from_env_empty_credentials_raises_failure(monkeypatch):
     monkeypatch.setenv("CONNECTOR_S3_SECRET_KEY", "")
     with pytest.raises(Failure):
         capacity_snapshot.CapacityConfig.from_env()
+
+
+def test_required_env_missing_credential_marks_the_failure_non_retryable(monkeypatch):
+    """PART D witness: `_required_env` raises `Failure(allow_retries=False)`
+    when the requested env var is missing or empty -- a configuration
+    problem, not a transient network/auth blip. The op
+    (`run_capacity_snapshot`) executes this helper at runtime via
+    `CapacityConfig.from_env`; `DEFAULT_RETRY_POLICY` would otherwise
+    burn 60s on retries that cannot succeed. The companion `measure_bucket`
+    / `_ch_query_json` calls inside `record_capacity_snapshot` /
+    `CapacityConfig.from_env` propagate retryably as before."""
+    monkeypatch.delenv("CONNECTOR_S3_ACCESS_KEY", raising=False)
+    with pytest.raises(Failure) as ctx:
+        capacity_snapshot.CapacityConfig.from_env()
+    assert ctx.value.allow_retries is False

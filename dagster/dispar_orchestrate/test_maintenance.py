@@ -218,6 +218,22 @@ class FetchPolicyIndexTest(unittest.TestCase):
             with self.assertRaises(maintenance.Failure):
                 maintenance._fetch_policy_index(_cfg())
 
+    def test_a_401_response_marks_the_failure_non_retryable(self) -> None:
+        """PART D: a 401 from the maintenance-policy endpoint is a
+        configuration/auth problem (token wrong, role no longer
+        grants the endpoint) -- retrying won't help. The raise must
+        set `allow_retries=False` so `DEFAULT_RETRY_POLICY` does not
+        waste its 60s budget on a problem the operator has to fix
+        out-of-band. The 401/403 sites share one path so testing
+        401 alone covers the contract."""
+        from dagster import Failure
+
+        resp = mock.Mock(status_code=401)
+        with mock.patch("requests.get", return_value=resp):
+            with self.assertRaises(Failure) as ctx:
+                maintenance._fetch_policy_index(_cfg())
+        self.assertFalse(ctx.exception.allow_retries)
+
     def test_a_403_response_raises_a_dagster_failure(self) -> None:
         resp = mock.Mock(status_code=403)
         with mock.patch("requests.get", return_value=resp):
@@ -499,8 +515,12 @@ class OptimizeResultTest(unittest.TestCase):
 
 
 class RunBronzeMaintenanceTrinoIntegrationTest(unittest.TestCase):
-    """`run_bronze_maintenance`, exercising the per-table policy branch
-    end to end with every I/O boundary stubbed — no network."""
+    """`_run_maintenance_for_table` (the per-table body extracted from
+    the pre-PART-C `run_bronze_maintenance`), with every I/O boundary
+    stubbed — no network. The PART C fan-out (`list_bronze_tables` ->
+    `maintain_bronze_table`) drives this same helper from each mapped
+    step, so these tests cover both the pre-fan-out op and every
+    `maintain_bronze_table[<key>]` step at once."""
 
     def _fake_context(self):
         """A real `OpExecutionContext` (`dagster.build_op_context`), not a
@@ -513,16 +533,6 @@ class RunBronzeMaintenanceTrinoIntegrationTest(unittest.TestCase):
         self,
     ) -> None:
         with mock.patch.object(
-            maintenance, "discover_bronze_tables", return_value=["bronze.orders"]
-        ), mock.patch.object(
-            maintenance, "_fetch_policy_index",
-            return_value=(
-                {("bronze", "orders"): {"snapshotsToKeep": None, "compactSmallFiles": True, "schedule": None, "orphanAgeHours": None}},
-                None,
-            ),
-        ), mock.patch.object(
-            maintenance, "_ensure_catalog_database"
-        ), mock.patch.object(
             maintenance, "probe_expire_snapshots_skip", return_value="ch refuses"
         ), mock.patch.object(
             maintenance, "run_remove_orphan_files", return_value={"table_name": "bronze.orders"}
@@ -538,7 +548,12 @@ class RunBronzeMaintenanceTrinoIntegrationTest(unittest.TestCase):
         ), mock.patch.object(
             maintenance, "_trino_execute", return_value=[]
         ) as mocked_trino:
-            maintenance.run_bronze_maintenance(self._fake_context())
+            maintenance._run_maintenance_for_table(
+                cfg=maintenance.MaintenanceConfig.from_env(),
+                table_name="bronze.orders",
+                policy={"snapshotsToKeep": None, "compactSmallFiles": True, "schedule": None, "orphanAgeHours": None},
+                policy_fetch_error=None,
+            )
 
         mocked_trino.assert_called_once()
         sql = mocked_trino.call_args.args[1]
@@ -551,12 +566,6 @@ class RunBronzeMaintenanceTrinoIntegrationTest(unittest.TestCase):
 
     def test_a_table_with_no_policy_row_makes_no_trino_call(self) -> None:
         with mock.patch.object(
-            maintenance, "discover_bronze_tables", return_value=["bronze.orders"]
-        ), mock.patch.object(
-            maintenance, "_fetch_policy_index", return_value=({}, None)
-        ), mock.patch.object(
-            maintenance, "_ensure_catalog_database"
-        ), mock.patch.object(
             maintenance, "probe_expire_snapshots_skip", return_value="ch refuses"
         ), mock.patch.object(
             maintenance, "run_remove_orphan_files", return_value={"table_name": "bronze.orders"}
@@ -570,7 +579,12 @@ class RunBronzeMaintenanceTrinoIntegrationTest(unittest.TestCase):
         ) as mocked_record_verb_run, mock.patch.object(
             maintenance, "_trino_execute"
         ) as mocked_trino:
-            maintenance.run_bronze_maintenance(self._fake_context())
+            maintenance._run_maintenance_for_table(
+                cfg=maintenance.MaintenanceConfig.from_env(),
+                table_name="bronze.orders",
+                policy=None,
+                policy_fetch_error=None,
+            )
 
         mocked_trino.assert_not_called()
         mocked_record_verb_run.assert_not_called()
@@ -584,9 +598,15 @@ class RunBronzeMaintenanceTrinoIntegrationTest(unittest.TestCase):
             ],
         )
 
-    def test_a_401_policy_fetch_failure_raises_a_dagster_failure_before_any_table_runs(
+    def test_a_401_policy_fetch_failure_is_a_whole_run_failure_not_a_per_table_skip(
         self,
     ) -> None:
+        # PART C's `list_bronze_tables` raises a `Failure` from
+        # `_fetch_policy_index` BEFORE yielding any DynamicOutput -- the
+        # whole-run shape is preserved. Verify by driving the fan-out
+        # op directly with a `_fetch_policy_index` that raises and
+        # asserting `probe_expire_snapshots_skip` (the first
+        # per-table body call) is never reached.
         with mock.patch.object(
             maintenance, "discover_bronze_tables", return_value=["bronze.orders"]
         ), mock.patch.object(
@@ -599,19 +619,13 @@ class RunBronzeMaintenanceTrinoIntegrationTest(unittest.TestCase):
             side_effect=maintenance.Failure("maintenance policy fetch failed with HTTP 401"),
         ):
             with self.assertRaises(maintenance.Failure):
-                maintenance.run_bronze_maintenance(self._fake_context())
+                list(maintenance.list_bronze_tables(self._fake_context()))
         mocked_probe.assert_not_called()
 
     def test_a_5xx_policy_fetch_failure_is_recorded_and_orphan_removal_still_runs(
         self,
     ) -> None:
         with mock.patch.object(
-            maintenance, "discover_bronze_tables", return_value=["bronze.orders"]
-        ), mock.patch.object(
-            maintenance, "_fetch_policy_index", return_value=({}, "HTTPError")
-        ), mock.patch.object(
-            maintenance, "_ensure_catalog_database"
-        ), mock.patch.object(
             maintenance, "probe_expire_snapshots_skip", return_value="ch refuses"
         ), mock.patch.object(
             maintenance, "run_remove_orphan_files", return_value={"table_name": "bronze.orders"}
@@ -625,12 +639,142 @@ class RunBronzeMaintenanceTrinoIntegrationTest(unittest.TestCase):
         ), mock.patch.object(
             maintenance, "_trino_execute"
         ) as mocked_trino:
-            maintenance.run_bronze_maintenance(self._fake_context())
+            maintenance._run_maintenance_for_table(
+                cfg=maintenance.MaintenanceConfig.from_env(),
+                table_name="bronze.orders",
+                policy=None,
+                policy_fetch_error="HTTPError",
+            )
 
         self.assertEqual(mocked_rof.call_count, 2)  # dry-run + applied, unconditional
         mocked_trino.assert_not_called()
         skipped_verbs = mocked_record_run.call_args.kwargs["skipped_verbs"]
         self.assertIn("policy fetch failed: HTTPError", skipped_verbs)
+
+
+class BronzeMaintenanceFanOutTest(unittest.TestCase):
+    """PART C of `parts/1b-dagster-one-op-per-unit-and-retries.md`:
+    `bronze_maintenance_job` is rebuilt as `list_bronze_tables` (fan-out,
+    runs setup once) -> `maintain_bronze_table` (mapped, per-table body
+    in its own failure unit) -> `summarize_bronze_maintenance` (collect).
+    The setup work (`_ensure_catalog_database`, `_fetch_policy_index`)
+    stays in the fan-out op -- one network round-trip per run, not one
+    per table. A failed table's step fails without taking the others
+    down, and zero tables yields a still-successful run."""
+
+    def test_a_non_ascii_letter_is_replaced_with_an_underscore_for_dagsters_charset(self) -> None:
+        """Dagster's `check_valid_chars` requires `^[A-Za-z0-9_]+$`.
+        `str.isalnum()` is True for non-ASCII letters (`"é".isalnum()`,
+        `"²".isalnum()`), so the helper must use the exact ASCII rule
+        -- not `c.isalnum()`. This pins that contract: the helper turns
+        a non-ASCII letter into `_`, not into itself. Bronze tables
+        happen to be ASCII-clean today, but a future table name that
+        violates the rule would otherwise produce a mapping key
+        Dagster silently rejects."""
+        from dispar_orchestrate import maintenance
+
+        self.assertEqual(maintenance._sanitize_mapping_key("café"), "caf_")
+        self.assertEqual(maintenance._sanitize_mapping_key("x²"), "x_")
+        self.assertEqual(maintenance._sanitize_mapping_key("plain_ok"), "plain_ok")
+
+    def test_two_tables_yield_two_mapped_steps_with_their_keys(self) -> None:
+        with mock.patch.object(
+            maintenance, "_ensure_catalog_database"
+        ), mock.patch.object(
+            maintenance, "discover_bronze_tables",
+            return_value=["bronze.g3a_orders", "bronze.g3a_invoices"],
+        ), mock.patch.object(
+            maintenance, "_fetch_policy_index", return_value=({}, None)
+        ), mock.patch.object(
+            maintenance, "_run_maintenance_for_table",
+            return_value={"table_name": "x", "dry_run": {}, "applied": {}, "skipped_verbs": [], "snapshot_growth": {"measured": False}},
+        ):
+            result = maintenance.bronze_maintenance_job.execute_in_process(
+                raise_on_error=False,
+            )
+        self.assertTrue(result.success)
+        succeeded = {
+            e.step_key for e in result.all_events if e.event_type_value == "STEP_SUCCESS"
+        }
+        self.assertIn("maintain_bronze_table[bronze_g3a_orders]", succeeded)
+        self.assertIn("maintain_bronze_table[bronze_g3a_invoices]", succeeded)
+        # The summarize step ran with a count of 2.
+        self.assertIn("summarize_bronze_maintenance", succeeded)
+
+    def test_one_failing_table_does_not_stop_the_others_rows_being_written(
+        self,
+    ) -> None:
+        """One table's per-table body raises -> only that mapped step
+        fails; the other table's `_run_maintenance_for_table` (and
+        therefore its `record_maintenance_run` row) still runs."""
+        def fake_per_table(cfg, table_name, policy, policy_fetch_error):
+            if "orders" in table_name:
+                # `allow_retries=False` -- the canonical pattern from
+                # PART D, so the test doesn't burn the 60s default
+                # retry budget of `maintain_bronze_table`.
+                raise maintenance.Failure(
+                    "simulated per-table failure", allow_retries=False
+                )
+            return {
+                "table_name": table_name,
+                "dry_run": {},
+                "applied": {},
+                "skipped_verbs": [],
+                "snapshot_growth": {"measured": False},
+            }
+
+        with mock.patch.object(
+            maintenance, "_ensure_catalog_database"
+        ), mock.patch.object(
+            maintenance, "discover_bronze_tables",
+            return_value=["bronze.orders", "bronze.invoices"],
+        ), mock.patch.object(
+            maintenance, "_fetch_policy_index", return_value=({}, None)
+        ), mock.patch.object(
+            maintenance, "_run_maintenance_for_table", side_effect=fake_per_table
+        ):
+            result = maintenance.bronze_maintenance_job.execute_in_process(
+                raise_on_error=False,
+            )
+        self.assertFalse(result.success)
+        failed = {
+            e.step_key for e in result.all_events if e.event_type_value == "STEP_FAILURE"
+        }
+        succeeded = {
+            e.step_key for e in result.all_events if e.event_type_value == "STEP_SUCCESS"
+        }
+        # The non-orders table still succeeded; the orders step failed.
+        self.assertIn("maintain_bronze_table[bronze_orders]", failed)
+        self.assertIn("maintain_bronze_table[bronze_invoices]", succeeded)
+
+    def test_zero_tables_yields_zero_mapped_steps_and_the_job_still_succeeds(
+        self,
+    ) -> None:
+        """A fresh catalog with no Bronze tables must run the job to
+        completion (the schedule is `default_status=RUNNING`, so a
+        zero-table result is the steady-state on a brand-new stack).
+        `summarize_bronze_maintenance` collects an empty list and the
+        job succeeds -- no mapped steps appear."""
+        with mock.patch.object(
+            maintenance, "_ensure_catalog_database"
+        ), mock.patch.object(
+            maintenance, "discover_bronze_tables", return_value=[]
+        ), mock.patch.object(
+            maintenance, "_fetch_policy_index", return_value=({}, None)
+        ):
+            result = maintenance.bronze_maintenance_job.execute_in_process(
+                raise_on_error=False,
+            )
+        self.assertTrue(result.success)
+        succeeded = {
+            e.step_key for e in result.all_events if e.event_type_value == "STEP_SUCCESS"
+        }
+        self.assertIn("summarize_bronze_maintenance", succeeded)
+        self.assertIn("list_bronze_tables", succeeded)
+        # No mapped maintain_bronze_table steps ran -- zero tables in,
+        # zero mapped steps out.
+        for key in succeeded:
+            self.assertFalse(key.startswith("maintain_bronze_table["), key)
 
 
 if __name__ == "__main__":

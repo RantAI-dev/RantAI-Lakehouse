@@ -41,7 +41,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import requests
-from dagster import AssetMaterialization, DefaultScheduleStatus, ScheduleDefinition, job, op
+from dagster import AssetMaterialization, DefaultScheduleStatus, Failure, ScheduleDefinition, job, op
 
 from dispar_orchestrate import authored_transforms, op_metadata
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, _ch_exec, _ch_query_json
@@ -288,6 +288,7 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
 
     @op(
         name=f"authored_{safe_name}",
+        retry_policy=op_metadata.DEFAULT_RETRY_POLICY,
         tags=op_metadata.source_metadata(
             "dispar_orchestrate/authored_factory.py::_op_for_pipeline",
             reads=[f"ClickHouse {definition.get('sourceZone')}.{definition.get('sourceTable')}"],
@@ -295,31 +296,50 @@ def _op_for_pipeline(pipeline: dict[str, Any]) -> Any:
         ),
     )
     def _run(context) -> dict[str, Any]:
-        # Re-validate every transform against this module's own grammar
-        # port (item E2) BEFORE building any SQL from it -- a Postgres row
-        # could in principle have been written by a future/older API
-        # version with a looser grammar (authored_transforms.py's own
-        # module doc). `parse_transform` raises `TransformError`
-        # (deliberately uncaught here) on any invalid string, which fails
-        # THIS op/run loudly -- a rejected transform is never dropped.
-        transforms = [authored_transforms.parse_transform(t) for t in definition.get("transforms", [])]
+        # PART D boundary: config-shaped failures raised by the
+        # transform-grammar port (`TransformError`, a `ValueError`
+        # subclass) and by this module's own authored-pipeline guard
+        # (`AuthoredJobError`, a `RuntimeError` subclass) are wrapped in
+        # `Failure(allow_retries=False)` here so `DEFAULT_RETRY_POLICY`
+        # does not burn 60s on a config that will not change between
+        # attempts. `SchemaDriftError` from `bronze_catalog.py` does
+        # NOT reach this body (the `_ensure_target_table` path uses
+        # `_ch_exec` directly, not `_assert_or_create_all`), so it is
+        # not in the wrap tuple -- a SchemaDriftError raised elsewhere
+        # would still propagate retryably as it always has. Runtime
+        # errors from `_write_clickhouse_table` /
+        # `requests.RequestException` from any future network call are
+        # not in this tuple and propagate retryably, as the retry
+        # policy intends.
+        try:
+            transforms = [
+                authored_transforms.parse_transform(t)
+                for t in definition.get("transforms", [])
+            ]
 
-        connector_id = definition.get("connectorId")
-        if connector_id:
-            raise AuthoredJobError(CONNECTOR_SOURCE_UNSUPPORTED_REASON)
+            connector_id = definition.get("connectorId")
+            if connector_id:
+                raise AuthoredJobError(CONNECTOR_SOURCE_UNSUPPORTED_REASON)
 
-        source_zone = definition["sourceZone"]
-        source_table = definition["sourceTable"]
-        target_zone = definition["targetZone"]
-        target_table = definition["targetTable"]
-        for ident, field in (
-            (source_zone, "sourceZone"),
-            (source_table, "sourceTable"),
-            (target_zone, "targetZone"),
-            (target_table, "targetTable"),
-        ):
-            if not _is_safe_ch_identifier(ident):
-                raise AuthoredJobError(f"unsafe ClickHouse identifier in {field!r}: {ident!r}")
+            source_zone = definition["sourceZone"]
+            source_table = definition["sourceTable"]
+            target_zone = definition["targetZone"]
+            target_table = definition["targetTable"]
+            for ident, field in (
+                (source_zone, "sourceZone"),
+                (source_table, "sourceTable"),
+                (target_zone, "targetZone"),
+                (target_table, "targetTable"),
+            ):
+                if not _is_safe_ch_identifier(ident):
+                    raise AuthoredJobError(
+                        f"unsafe ClickHouse identifier in {field!r}: {ident!r}"
+                    )
+        except (authored_transforms.TransformError, AuthoredJobError) as exc:
+            raise Failure(
+                description=f"authored pipeline {pipeline['id']!r} config rejected: {exc}",
+                allow_retries=False,
+            ) from exc
 
         ch = ClickHouseTarget.from_env()
         source = f"{source_zone}.`{source_table}`"

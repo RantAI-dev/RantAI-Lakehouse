@@ -67,7 +67,7 @@ import requests
 from dagster import DefaultScheduleStatus, Definitions, ScheduleDefinition, job, op
 
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget
-from dispar_orchestrate.op_metadata import source_metadata
+from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
 
 def _env(name: str, default: str) -> str:
@@ -419,11 +419,12 @@ def record_replication_slot_metrics(
 
 
 @op(
+    retry_policy=DEFAULT_RETRY_POLICY,
     tags=source_metadata(
         "dispar_orchestrate/replication_metrics.py::run_replication_slot_check",
         reads=["Postgres pg_replication_slots (logical)", "GET /api/connectors/ingestible"],
         writes=["ClickHouse lake.bronze_meta.replication_slot", "ClickHouse view serving.replication_slot_health"],
-    )
+    ),
 )
 def run_replication_slot_check(context) -> list[dict[str, Any]]:
     cfg = ReplicationConfig.from_env()
