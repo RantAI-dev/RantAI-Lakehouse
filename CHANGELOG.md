@@ -76,6 +76,25 @@ once a first release is tagged.
 - `POST /api/dashboard/boards` accepts `description`, and records the
   signed-in caller's display name in `created_by`.
   `PUT /api/dashboard/boards` accepts `description`.
+- Pipeline recovery API (R2): `POST /api/pipelines/{id}/runs/{runId}/retry`
+  now accepts `{"strategy":"selected","stepKeys":[...]}` to re-run a chosen
+  subset of steps, with the step keys validated against the parent run's
+  step history and the first unknown key named in the 400 response; the
+  Copilot `retry_pipeline_run` tool gained a matching `stepKeys` array
+  argument. Steps now report their attempt count (`attempts`), and a new
+  `GET /api/pipelines/{id}/runs/steps` route returns every recent run of a
+  pipeline alongside per-step status, attempt count and duration (the
+  route is registered before the `/runs/{runId}/steps` catch-all so the
+  `runs/steps` path reaches it). On a Dagster transport failure the matrix
+  route reports `available: false` with the standard `unavailable` reason,
+  never a 5xx. (R2)
+- `max_retries` per authored pipeline: `POST /api/pipelines` and
+  `PUT /api/pipelines/{id}` accept `maxRetries` (0–5, rejected with a 400
+  outside the band; defaults to 2) and persist it in `lakehouse-store` via
+  the new migration `0051_pipeline_max_retries.sql`. The Dagster
+  `authored__<id>` job reads `definition["maxRetries"]` and overrides only
+  the attempt count on the shared `DEFAULT_RETRY_POLICY`; delay, backoff
+  and jitter come from the shared policy. (R2)
 
 ### Changed
 

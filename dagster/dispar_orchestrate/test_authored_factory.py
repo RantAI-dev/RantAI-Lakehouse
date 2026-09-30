@@ -19,7 +19,7 @@ import unittest
 from unittest import mock
 
 import requests
-from dagster import DefaultScheduleStatus, build_op_context
+from dagster import Backoff, DefaultScheduleStatus, Jitter, RetryPolicy, build_op_context
 
 from dispar_orchestrate import authored_factory, authored_transforms
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget
@@ -114,6 +114,11 @@ def _ready_pipeline(**overrides: object) -> dict[str, object]:
         "targetZone": "serving", "targetTable": "orders_clean",
         "transforms": ["select(id,name)"], "fbicEnabled": False,
         "incrementalColumn": None, "connectorId": None,
+        # Plan 1c (R2, day-1): the per-pipeline retry cap. Absent here
+        # so legacy callers of `_ready_pipeline()` continue to assert
+        # the migration's `DEFAULT 2` shape (matching the store's own
+        # `tests/pipelines.rs::create_pipeline_defaults_max_retries_to_two`).
+        "maxRetries": 2,
     }
     definition.update(overrides)
     return {"id": "pl-dedupe-select-abc123", "status": "ready", "definition": definition}
@@ -304,3 +309,46 @@ class AuthoredScheduleTest(unittest.TestCase):
         self.assertEqual(mocked_get.call_count, 1)
         self.assertEqual(len(jobs), 2)
         self.assertEqual([s.name for s in schedules], ["authored__pl_dedupe_select_abc123_schedule"])
+
+
+class PerPipelineRetryPolicyTest(unittest.TestCase):
+    """Plan 1c (R2, day-1): `_op_for_pipeline` reads each authored
+    pipeline's `definition.maxRetries` (migration `0051_pipeline_max_retries.sql`)
+    and passes it as `RetryPolicy.max_retries`, while keeping the
+    store-wide `delay`/`backoff`/`jitter` from `op_metadata.DEFAULT_RETRY_POLICY`.
+    Two boundaries to assert: `0` (the migration's floor; means
+    "never retry") and `5` (the `CHECK` constraint's ceiling).
+
+    The op the factory builds is itself a `dagster.OpDefinition`, and
+    `OpDefinition.retry_policy` is the seam the test pins — the
+    decorator argument is stored there verbatim and is read by
+    `dagster`'s job executor at run time, so a wrong value here would
+    surface as a real production-policy bug rather than a typing
+    mistake."""
+
+    def test_max_retries_zero_means_never_retry(self) -> None:
+        # Plan 1c floor (`0..=5`): `maxRetries=0` is "never retry",
+        # the row explicitly opts out of any self-healing. The op
+        # builder still constructs a `RetryPolicy` rather than `None`,
+        # so the rest of the policy vocabulary stays uniform.
+        pipeline = _ready_pipeline(maxRetries=0)
+        op = authored_factory._op_for_pipeline(pipeline)
+        self.assertEqual(op.retry_policy.max_retries, 0)
+
+    def test_max_retries_five_is_the_check_constraint_ceiling(self) -> None:
+        # Plan 1c ceiling: `5` is the highest value the route layer
+        # accepts (`!(0..=5).contains(...) -> 400`) and the column
+        # CHECK permits. The op builder must surface it intact, with
+        # the same `delay`/`backoff`/`jitter` as the default.
+        pipeline = _ready_pipeline(maxRetries=5)
+        op = authored_factory._op_for_pipeline(pipeline)
+        self.assertEqual(op.retry_policy.max_retries, 5)
+        base = RetryPolicy(
+            max_retries=2, delay=30, backoff=Backoff.EXPONENTIAL, jitter=Jitter.PLUS_MINUS,
+        )
+        # The 1c override is ONLY the count, not delay/backoff/jitter —
+        # a synchronised retry storm across all authored pipelines
+        # cannot return because one of them widened the policy window.
+        self.assertEqual(op.retry_policy.delay, base.delay)
+        self.assertEqual(op.retry_policy.backoff, base.backoff)
+        self.assertEqual(op.retry_policy.jitter, base.jitter)
