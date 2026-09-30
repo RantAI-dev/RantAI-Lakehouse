@@ -53,16 +53,13 @@ pub struct DgTag {
 
 /// How a re-execution picks the steps it runs again.
 ///
-/// The first two variants map onto `Dagster`'s own
-/// `ReexecutionStrategy.ALL_STEPS` / `FROM_FAILURE`. The third variant
-/// is a day-1 wrapper for the "re-run only the steps I picked" use case
-/// (R2 / Plan 1c, day-1): the route layer turns
-/// `{"strategy":"selected","stepKeys":[...]}` into this variant, and
-/// `launch_reexecution_of_steps` (NOT `launch_reexecution`) is the only
-/// function that knows how to turn it into a `Dagster` mutation — it
-/// uses `launchRunReexecution` with a `stepKeys` filter rather than
-/// `ReexecutionStrategy`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Selected` is deliberately NOT a variant here: a re-execution of a
+/// chosen subset carries step keys and Dagster expresses it through
+/// `launchRunReexecution(executionParams { stepKeys })`, not through a
+/// `ReexecutionStrategy` value. Parsing that request belongs to the
+/// route layer, so this enum stays closed and the strategy mapping can
+/// never report a strategy the caller did not ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReexecutionStrategy {
     /// Every step of the parent run.
     AllSteps,
@@ -70,29 +67,12 @@ pub enum ReexecutionStrategy {
     /// the steps that succeeded. `Dagster` refuses it for a run that did
     /// not fail.
     FromFailure,
-    /// Re-execute only the named steps from the parent run. Carries the
-    /// step keys (1 or more, validated by the caller — the DAG driver
-    /// here does not re-validate their existence, that is the route's
-    /// job, but `Dagster` itself rejects an empty list at submit time).
-    Selected(Vec<String>),
 }
 
 impl ReexecutionStrategy {
-    /// The `Dagster` `ReexecutionStrategy` value for this variant. Only
-    /// the first two variants carry a real value; `Selected` is
-    /// reported as `ALL_STEPS` because `launch_reexecution` (the only
-    /// caller of this method) refuses to send the third variant —
-    /// `Selected` reaches the driver through
-    /// `launch_reexecution_of_steps` instead. The match arm is here
-    /// only so this function stays total and the route cannot
-    /// accidentally send `"ALL_STEPS"` for a `Selected` strategy that
-    /// happened to slip past the type system.
-    fn graphql(&self) -> &'static str {
-        // `Selected` collides with `AllSteps` on purpose — only the
-        // first two variants carry a real `Dagster` value, and the
-        // route layer never lets `Selected` reach this function.
+    const fn graphql(self) -> &'static str {
         match self {
-            Self::AllSteps | Self::Selected(_) => "ALL_STEPS",
+            Self::AllSteps => "ALL_STEPS",
             Self::FromFailure => "FROM_FAILURE",
         }
     }

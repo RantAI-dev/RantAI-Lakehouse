@@ -1692,8 +1692,8 @@ pub async fn retry_run(
     Path(run_id): Path<String>,
     body: Bytes,
 ) -> Response {
-    let strategy = match retry_strategy(&body) {
-        Ok(s) => s,
+    let request = match parse_retry_request(&body) {
+        Ok(r) => r,
         Err(err) => {
             return (StatusCode::BAD_REQUEST, ApiJson(json!({ "error": err }))).into_response();
         }
@@ -1703,7 +1703,7 @@ pub async fn retry_run(
     // belongs to the parent run before sending the mutation. Anything
     // outside the run's known keys would silently become a no-op on
     // `Dagster`'s side, hiding a typo from the caller.
-    if let ReexecutionStrategy::Selected(keys) = &strategy {
+    if let RetryRequest::Selected(keys) = &request {
         let known: std::collections::HashSet<String> = match state.dagster.run_steps(&run_id).await
         {
             Ok(steps) => steps.iter().map(|s| s.step_key.clone()).collect(),
@@ -1728,39 +1728,39 @@ pub async fn retry_run(
                 .into_response();
         }
     }
-    // Two different driver calls: `launch_reexecution` only knows
-    // `ALL_STEPS` / `FROM_FAILURE`, the third variant goes through
-    // `launch_reexecution_of_steps` (which carries the stepKeys filter
-    // as a `launchRunReexecution` argument).
-    let outcome = match &strategy {
-        ReexecutionStrategy::Selected(keys) => {
+    // Two different driver calls: `launch_reexecution` takes one of the
+    // two strategies Dagster names, while a selected subset goes through
+    // `launch_reexecution_of_steps`, which carries the stepKeys filter as
+    // a `launchRunReexecution` argument.
+    let launched = match &request {
+        RetryRequest::Selected(keys) => {
             let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-            match state
+            state
                 .dagster
                 .launch_reexecution_of_steps(&run_id, &key_refs)
                 .await
-            {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        ApiJson(json!({ "error": js_error(err) })),
-                    )
-                        .into_response();
-                }
-            }
         }
-        ReexecutionStrategy::AllSteps | ReexecutionStrategy::FromFailure => {
-            match state.dagster.launch_reexecution(&run_id, strategy).await {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        ApiJson(json!({ "error": js_error(err) })),
-                    )
-                        .into_response();
-                }
-            }
+        RetryRequest::All => {
+            state
+                .dagster
+                .launch_reexecution(&run_id, ReexecutionStrategy::AllSteps)
+                .await
+        }
+        RetryRequest::FromFailure => {
+            state
+                .dagster
+                .launch_reexecution(&run_id, ReexecutionStrategy::FromFailure)
+                .await
+        }
+    };
+    let outcome = match launched {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiJson(json!({ "error": js_error(err) })),
+            )
+                .into_response();
         }
     };
     match outcome {
@@ -1780,19 +1780,36 @@ pub async fn retry_run(
     }
 }
 
-/// The re-execution strategy a retry body asks for; `None` for a body
-/// that is not empty and names no known strategy.
-fn retry_strategy(body: &[u8]) -> Result<ReexecutionStrategy, String> {
+/// What a retry body asks the route to re-execute. Separate from
+/// [`ReexecutionStrategy`], which only models the two strategies Dagster
+/// itself names: a `Selected` request carries step keys and becomes a
+/// `launchRunReexecution` with a `stepKeys` filter, never a strategy
+/// value. Parsed here, at the route boundary, so the driver's enum stays
+/// closed and its strategy mapping cannot silently degrade a subset
+/// request into `ALL_STEPS`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RetryRequest {
+    /// Every step of the parent run.
+    All,
+    /// Only the steps that failed or did not run.
+    FromFailure,
+    /// Only the named steps of the parent run.
+    Selected(Vec<String>),
+}
+
+/// The retry request a body asks for; `Err` for a body that is not
+/// empty and names no known strategy.
+fn parse_retry_request(body: &[u8]) -> Result<RetryRequest, String> {
     if body.iter().all(u8::is_ascii_whitespace) {
-        return Ok(ReexecutionStrategy::AllSteps);
+        return Ok(RetryRequest::All);
     }
     let value: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(err) => return Err(format!("invalid retry body: {err}")),
     };
     match value.get("strategy").and_then(Value::as_str) {
-        None | Some("allSteps") => Ok(ReexecutionStrategy::AllSteps),
-        Some("fromFailure") => Ok(ReexecutionStrategy::FromFailure),
+        None | Some("allSteps") => Ok(RetryRequest::All),
+        Some("fromFailure") => Ok(RetryRequest::FromFailure),
         Some("selected") => {
             // Plan 1c (R2, day-1): the "selected" strategy is the only
             // way to re-run a subset of steps; the body MUST carry a
@@ -1814,7 +1831,7 @@ fn retry_strategy(body: &[u8]) -> Result<ReexecutionStrategy, String> {
                 };
                 keys.push(s.to_owned());
             }
-            Ok(ReexecutionStrategy::Selected(keys))
+            Ok(RetryRequest::Selected(keys))
         }
         Some(other) => Err(format!(
             "strategy must be one of \"allSteps\", \"fromFailure\", \"selected\" (got \"{other}\")"
@@ -2234,15 +2251,15 @@ mod tests {
 
     #[test]
     fn a_retry_body_names_its_strategy_or_is_refused() {
-        assert_eq!(retry_strategy(b""), Ok(ReexecutionStrategy::AllSteps));
-        assert_eq!(retry_strategy(b"  "), Ok(ReexecutionStrategy::AllSteps));
-        assert_eq!(retry_strategy(b"{}"), Ok(ReexecutionStrategy::AllSteps));
+        assert_eq!(parse_retry_request(b""), Ok(RetryRequest::All));
+        assert_eq!(parse_retry_request(b"  "), Ok(RetryRequest::All));
+        assert_eq!(parse_retry_request(b"{}"), Ok(RetryRequest::All));
         assert_eq!(
-            retry_strategy(br#"{"strategy":"fromFailure"}"#),
-            Ok(ReexecutionStrategy::FromFailure)
+            parse_retry_request(br#"{"strategy":"fromFailure"}"#),
+            Ok(RetryRequest::FromFailure)
         );
-        assert!(retry_strategy(br#"{"strategy":"someSteps"}"#).is_err());
-        assert!(retry_strategy(b"not json").is_err());
+        assert!(parse_retry_request(br#"{"strategy":"someSteps"}"#).is_err());
+        assert!(parse_retry_request(b"not json").is_err());
     }
 
     /// Plan 1c (R2, day-1): the `selected` strategy accepts a
@@ -2252,22 +2269,22 @@ mod tests {
     #[test]
     fn a_selected_retry_body_lists_its_steps() {
         assert_eq!(
-            retry_strategy(br#"{"strategy":"selected","stepKeys":["extract","transform"]}"#),
-            Ok(ReexecutionStrategy::Selected(vec![
+            parse_retry_request(br#"{"strategy":"selected","stepKeys":["extract","transform"]}"#),
+            Ok(RetryRequest::Selected(vec![
                 "extract".to_owned(),
                 "transform".to_owned()
             ]))
         );
         assert!(
-            retry_strategy(br#"{"strategy":"selected"}"#).is_err(),
+            parse_retry_request(br#"{"strategy":"selected"}"#).is_err(),
             "selected without stepKeys must fail"
         );
         assert!(
-            retry_strategy(br#"{"strategy":"selected","stepKeys":[]}"#).is_err(),
+            parse_retry_request(br#"{"strategy":"selected","stepKeys":[]}"#).is_err(),
             "an empty stepKeys array must fail"
         );
         assert!(
-            retry_strategy(br#"{"strategy":"selected","stepKeys":["ok",123]}"#).is_err(),
+            parse_retry_request(br#"{"strategy":"selected","stepKeys":["ok",123]}"#).is_err(),
             "non-string stepKeys must fail"
         );
     }
