@@ -1,6 +1,9 @@
 "use client"
 
+import * as React from "react"
+import { EyeIcon, EyeOffIcon } from "lucide-react"
 import { Input } from "@/components/ui/input"
+import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from "@/components/ui/input-group"
 import { Textarea } from "@/components/ui/textarea"
 import type { CredentialKind } from "@/services/contracts/connectors"
 import type { CredentialSlot } from "./connector-form-parts"
@@ -30,8 +33,10 @@ export function credentialValueProblem(value: string): string | null {
  * the server once and is never shown again, so a secret is a password
  * input (a textarea for a PEM or JSON document) with the browser's own
  * autofill of saved passwords suppressed — the stored login for this
- * console is not the source's credential. An identifier half of a pair
- * (a username, a client id) is shown in clear.
+ * console is not the source's credential (`data-1p-ignore` and
+ * `data-lpignore` ask the common password-manager extensions to stay out
+ * too). A secret can be shown while it is typed, to check it; an
+ * identifier half of a pair (a username, a client id) is shown in clear.
  */
 export function CredentialValueInput({
   id,
@@ -44,6 +49,7 @@ export function CredentialValueInput({
   value: string
   onChange: (next: string) => void
 }) {
+  const [revealed, setRevealed] = React.useState(false)
   if (slot.multiline) {
     return (
       <Textarea
@@ -58,15 +64,42 @@ export function CredentialValueInput({
       />
     )
   }
+  if (slot.plain) {
+    return (
+      <Input
+        id={id}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={slot.placeholder}
+        autoComplete="off"
+        spellCheck={false}
+      />
+    )
+  }
+  const label = slot.label.toLowerCase()
   return (
-    <Input
-      id={id}
-      type={slot.plain ? "text" : "password"}
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-      placeholder={slot.placeholder}
-      autoComplete={slot.plain ? "off" : "new-password"}
-      spellCheck={false}
-    />
+    <InputGroup>
+      <InputGroupInput
+        id={id}
+        type={revealed ? "text" : "password"}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={slot.placeholder}
+        autoComplete={revealed ? "off" : "new-password"}
+        spellCheck={false}
+        data-1p-ignore
+        data-lpignore="true"
+      />
+      <InputGroupAddon align="inline-end">
+        <InputGroupButton
+          size="icon-xs"
+          aria-label={revealed ? `Hide ${label}` : `Show ${label}`}
+          aria-pressed={revealed}
+          onClick={() => setRevealed((shown) => !shown)}
+        >
+          {revealed ? <EyeOffIcon /> : <EyeIcon />}
+        </InputGroupButton>
+      </InputGroupAddon>
+    </InputGroup>
   )
 }

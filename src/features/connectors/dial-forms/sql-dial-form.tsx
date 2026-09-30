@@ -73,6 +73,7 @@ export function SqlDialForm({
             value={dial.host}
             onChange={(e) => set("host", e.target.value)}
             placeholder="db.internal.example.com"
+            autoComplete="off"
           />
         </div>
         <div className="space-y-1.5">
@@ -82,6 +83,7 @@ export function SqlDialForm({
             type="number"
             value={dial.port}
             onChange={(e) => set("port", Number(e.target.value))}
+            autoComplete="off"
           />
         </div>
       </div>
@@ -92,6 +94,7 @@ export function SqlDialForm({
           value={dial.database}
           onChange={(e) => set("database", e.target.value)}
           placeholder="sales"
+          autoComplete="off"
         />
       </div>
       <div className="space-y-1.5">
@@ -113,6 +116,7 @@ export function SqlDialForm({
           value={dial.sslMode ?? ""}
           onChange={(e) => set("sslMode", e.target.value === "" ? null : e.target.value)}
           placeholder={dial.driver === "postgres" ? "require" : "Leave blank for the driver default"}
+          autoComplete="off"
         />
       </div>
     </div>

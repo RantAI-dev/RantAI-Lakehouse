@@ -285,6 +285,7 @@ function IngestEditor({
                         onChange={(e) => setTarget(s.name, e.target.value)}
                         className="h-7 font-mono text-xs"
                         aria-invalid={problems[i] !== null}
+                        autoComplete="off"
                       />
                     </div>
                     {problems[i] ? <p className="text-xs text-destructive">{problems[i]}</p> : null}
@@ -307,6 +308,7 @@ function IngestEditor({
                     value={schema}
                     onChange={(e) => setSchema(e.target.value)}
                     className="h-8"
+                    autoComplete="off"
                   />
                 </div>
                 <Button
@@ -339,6 +341,7 @@ function IngestEditor({
                         onChange={(e) => setFilter(e.target.value)}
                         placeholder={`Filter ${found.length} tables`}
                         className="h-7 text-xs"
+                        autoComplete="off"
                       />
                     ) : (
                       <span className="flex-1 text-xs text-muted-foreground">{found.length} tables found</span>
@@ -404,6 +407,7 @@ function IngestEditor({
                   }}
                   placeholder={adapter === "sftp" || adapter === "files" ? "orders.csv" : "object name"}
                   className="h-8 font-mono text-xs"
+                  autoComplete="off"
                 />
                 <Button type="button" size="sm" variant="outline" disabled={!manualName.trim()} onClick={addManual}>
                   <PlusIcon data-icon="inline-start" />
@@ -444,6 +448,7 @@ function IngestEditor({
               onChange={(e) => setCustomCron(e.target.value)}
               placeholder="30 1 * * 1-5"
               className="h-8 font-mono text-xs"
+              autoComplete="off"
             />
           ) : null}
           {scheduleProblem ? <p className="text-xs text-destructive">{scheduleProblem}</p> : null}

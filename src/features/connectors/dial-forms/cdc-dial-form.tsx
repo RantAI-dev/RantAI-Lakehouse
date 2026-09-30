@@ -67,6 +67,7 @@ export function CdcDialForm({
             value={dial.host}
             onChange={(e) => set("host", e.target.value)}
             placeholder="db.internal.example.com"
+            autoComplete="off"
           />
         </div>
         <div className="space-y-1.5">
@@ -76,6 +77,7 @@ export function CdcDialForm({
             type="number"
             value={dial.port}
             onChange={(e) => set("port", Number(e.target.value))}
+            autoComplete="off"
           />
         </div>
       </div>
@@ -86,6 +88,7 @@ export function CdcDialForm({
           value={dial.database}
           onChange={(e) => set("database", e.target.value)}
           placeholder="sales"
+          autoComplete="off"
         />
       </div>
       <div className="space-y-1.5">
@@ -105,6 +108,7 @@ export function CdcDialForm({
           value={dial.slotName}
           onChange={(e) => set("slotName", e.target.value)}
           placeholder="lakehouse_slot"
+          autoComplete="off"
         />
       </div>
       <div className="space-y-1.5">
@@ -114,6 +118,7 @@ export function CdcDialForm({
           value={dial.publicationName}
           onChange={(e) => set("publicationName", e.target.value)}
           placeholder="lakehouse_pub"
+          autoComplete="off"
         />
       </div>
       <div className="space-y-1.5">
@@ -123,6 +128,7 @@ export function CdcDialForm({
           type="number"
           value={dial.serverId ?? ""}
           onChange={(e) => set("serverId", e.target.value === "" ? null : Number(e.target.value))}
+          autoComplete="off"
         />
       </div>
     </div>

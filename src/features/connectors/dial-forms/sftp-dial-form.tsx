@@ -37,7 +37,12 @@ export function SftpDialForm({
     <div className="grid gap-3 sm:grid-cols-2">
       <div className="space-y-1.5">
         <Label htmlFor="sftp-dial-host">Host</Label>
-        <Input id="sftp-dial-host" value={dial.host} onChange={(e) => set("host", e.target.value)} />
+        <Input
+          id="sftp-dial-host"
+          value={dial.host}
+          onChange={(e) => set("host", e.target.value)}
+          autoComplete="off"
+        />
       </div>
       <div className="space-y-1.5">
         <Label htmlFor="sftp-dial-port">Port</Label>
@@ -46,17 +51,28 @@ export function SftpDialForm({
           type="number"
           value={dial.port}
           onChange={(e) => set("port", Number(e.target.value))}
+          autoComplete="off"
         />
       </div>
       <div className="space-y-1.5">
         {/* A literal username, never a secretRef picker -- same
             reasoning as SqlDialForm's User field. */}
         <Label htmlFor="sftp-dial-user">User</Label>
-        <Input id="sftp-dial-user" value={dial.user} onChange={(e) => set("user", e.target.value)} />
+        <Input
+          id="sftp-dial-user"
+          value={dial.user}
+          onChange={(e) => set("user", e.target.value)}
+          autoComplete="off"
+        />
       </div>
       <div className="space-y-1.5">
         <Label htmlFor="sftp-dial-path">Remote path</Label>
-        <Input id="sftp-dial-path" value={dial.path} onChange={(e) => set("path", e.target.value)} />
+        <Input
+          id="sftp-dial-path"
+          value={dial.path}
+          onChange={(e) => set("path", e.target.value)}
+          autoComplete="off"
+        />
       </div>
       <div className="space-y-1.5 sm:col-span-2">
         <Label htmlFor="sftp-dial-host-key-fingerprint">Host key fingerprint</Label>
@@ -66,6 +82,7 @@ export function SftpDialForm({
           onChange={(e) => set("hostKeyFingerprint", e.target.value)}
           placeholder="SHA256:base64hash"
           required
+          autoComplete="off"
         />
         <p className="text-xs text-muted-foreground">
           Required — this build never auto-adds an unknown host key. Obtain it with{" "}

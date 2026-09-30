@@ -79,6 +79,7 @@ export function RestDialForm({
           value={dial.baseUrl}
           onChange={(e) => set("baseUrl", e.target.value)}
           placeholder="https://api.example.com"
+          autoComplete="off"
         />
       </div>
 
@@ -105,6 +106,7 @@ export function RestDialForm({
             value={dial.auth.header}
             onChange={(e) => set("auth", { type: "api_key", header: e.target.value })}
             placeholder="X-API-Key"
+            autoComplete="off"
           />
         </div>
       ) : null}
@@ -115,6 +117,7 @@ export function RestDialForm({
             id="rest-dial-auth-token-url"
             value={dial.auth.tokenUrl}
             onChange={(e) => set("auth", { type: "oauth2_client_credentials", tokenUrl: e.target.value })}
+            autoComplete="off"
           />
         </div>
       ) : null}
@@ -141,6 +144,7 @@ export function RestDialForm({
             id="rest-dial-pagination-param"
             value={dial.pagination.param}
             onChange={(e) => set("pagination", { type: "page", param: e.target.value })}
+            autoComplete="off"
           />
         </div>
       ) : null}
@@ -151,6 +155,7 @@ export function RestDialForm({
             id="rest-dial-pagination-cursor-field"
             value={dial.pagination.cursorField}
             onChange={(e) => set("pagination", { type: "cursor", cursorField: e.target.value })}
+            autoComplete="off"
           />
         </div>
       ) : null}
@@ -166,6 +171,7 @@ export function RestDialForm({
                 value={endpoint.path}
                 onChange={(e) => setEndpoint(index, { ...endpoint, path: e.target.value })}
                 placeholder="/v1/records"
+                autoComplete="off"
               />
             </div>
             <div className="space-y-1.5">
@@ -177,6 +183,7 @@ export function RestDialForm({
                   setEndpoint(index, { ...endpoint, recordsPath: e.target.value === "" ? null : e.target.value })
                 }
                 placeholder="data.records"
+                autoComplete="off"
               />
             </div>
             {dial.endpoints.length > 1 ? (
