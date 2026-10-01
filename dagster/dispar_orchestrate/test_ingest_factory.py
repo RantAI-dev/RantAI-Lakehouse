@@ -652,6 +652,103 @@ def test_stream_dispatch_commits_offset_only_after_a_successful_sink_write(monke
     assert recorded[0]["rows"] == 1  # the real SinkResult.rows count, never fabricated
 
 
+def _stub_stream_batch(monkeypatch, *, rows, sink) -> list:
+    """A micro-batch of `rows` whose sink write is `sink`; returns the list
+    the catalog registrations are collected in."""
+    import dispar_orchestrate.ingest_factory as f
+
+    registered: list = []
+    monkeypatch.setattr(f, "consume_one_batch", lambda *a, **k: BatchResult(rows=rows, offsets_to_commit={0: 5}))
+    monkeypatch.setattr(f, "load_via_sink", sink)
+    monkeypatch.setattr(f, "record_ingest_offset", lambda *a, **k: None)
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: None)
+    monkeypatch.setattr(
+        f.connector_catalog, "register_connector_table", lambda connector_id, obj: registered.append((connector_id, obj))
+    )
+    return registered
+
+
+def test_stream_batch_registers_its_bronze_table_in_the_catalog(monkeypatch) -> None:
+    """A topic's Bronze table gets the Catalog entry every batch adapter's
+    table gets. The source object's own name is used when it has one, the
+    topic otherwise."""
+    registered = _stub_stream_batch(
+        monkeypatch,
+        rows=[{"id": 1}],
+        sink=lambda *a, **k: SinkResult(rows=1, has_failed_jobs=False, load_info_str="ok"),
+    )
+    run_kafka_stream_batch(
+        connector_id="conn-x",
+        spec={"topic": "orders"},
+        secrets={},
+        source_objects=[{"target": "kafka_orders"}],
+        consumer=_FakeStreamConsumer(),
+    )
+    run_kafka_stream_batch(
+        connector_id="conn-x",
+        spec={"topic": "orders"},
+        secrets={},
+        source_objects=[{"name": "orders.v1", "target": "kafka_orders"}],
+        consumer=_FakeStreamConsumer(),
+    )
+    assert registered == [
+        ("conn-x", {"name": "orders", "target": "kafka_orders"}),
+        ("conn-x", {"name": "orders.v1", "target": "kafka_orders"}),
+    ]
+
+
+def test_stream_batch_registers_nothing_when_nothing_was_loaded(monkeypatch) -> None:
+    # An empty poll wrote nothing; a failed sink write wrote nothing.
+    registered = _stub_stream_batch(
+        monkeypatch, rows=[], sink=lambda *a, **k: SinkResult(rows=0, has_failed_jobs=False, load_info_str="ok")
+    )
+    run_kafka_stream_batch(
+        connector_id="conn-x",
+        spec={"topic": "orders"},
+        secrets={},
+        source_objects=[{"target": "kafka_orders"}],
+        consumer=_FakeStreamConsumer(),
+    )
+    registered = _stub_stream_batch(
+        monkeypatch, rows=[{"id": 1}], sink=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("sink unavailable"))
+    )
+    with pytest.raises(RuntimeError):
+        run_kafka_stream_batch(
+            connector_id="conn-x",
+            spec={"topic": "orders"},
+            secrets={},
+            source_objects=[{"target": "kafka_orders"}],
+            consumer=_FakeStreamConsumer(),
+        )
+    assert registered == []
+
+
+def test_stream_batch_still_succeeds_when_the_catalog_cannot_be_reached(monkeypatch) -> None:
+    # The rows are in Bronze and the offsets are committed either way: a
+    # Catalog failure is reported, never raised into a failed run.
+    import dispar_orchestrate.ingest_factory as f
+
+    _stub_stream_batch(
+        monkeypatch,
+        rows=[{"id": 1}],
+        sink=lambda *a, **k: SinkResult(rows=1, has_failed_jobs=False, load_info_str="ok"),
+    )
+    monkeypatch.setattr(
+        f.connector_catalog,
+        "register_connector_table",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("clickhouse down")),
+    )
+    consumer = _FakeStreamConsumer()
+    run_kafka_stream_batch(
+        connector_id="conn-x",
+        spec={"topic": "orders"},
+        secrets={},
+        source_objects=[{"target": "kafka_orders"}],
+        consumer=consumer,
+    )
+    assert len(consumer.commits) == 1
+
+
 def test_stream_dispatch_does_not_commit_the_offset_if_the_sink_write_fails(monkeypatch) -> None:
     committed = []
     recorded = []

@@ -485,6 +485,10 @@ def run_kafka_stream_batch(
     deliberate, documented at-least-once gap (`adapters/sink.py`'s Iceberg
     append path is not deduplicated), never a silent skip.
 
+    A micro-batch that loaded also registers (or refreshes) its Bronze
+    table in the console catalog (`_register_in_catalog`), like every batch
+    adapter's table; a registration failure is reported, never raised.
+
     An empty batch (`not batch.rows`) returns without writing or
     committing anything -- there is nothing to commit an offset FOR, and
     (mirroring `_run_one_object`'s own per-object-only recording) nothing
@@ -564,6 +568,14 @@ def run_kafka_stream_batch(
             for partition, offset in batch.offsets_to_commit.items():
                 record_ingest_offset(connector_id, topic, partition, offset)
             _record(rows=outcome.rows, status="succeeded")
+            # The same Catalog entry every batch adapter's table gets
+            # (`_run_one_object`): without it a topic's Bronze table held
+            # rows but never showed in the Catalog. An empty poll and a
+            # failed batch wrote nothing, so they register nothing.
+            _register_in_catalog(
+                connector_id,
+                {"name": source_objects[0].get("name") or topic, "target": source_objects[0]["target"]},
+            )
         except ssrf_guard.SsrfBlocked as exc:
             _record(rows=None, status="rejected", error=str(exc))
             raise
