@@ -319,7 +319,7 @@ struct ConfigValidationErrorWire {
 }
 
 /// Convert the wire union into the public [`ConfigValidationOutcome`].
-/// Dagster's `InvalidSubsetError` is collapsed to `Invalid` with no
+/// Dagster's `InvalidSubsetError` is collapsed to `NotFound` with no
 /// errors: a subset-mismatch never includes structured `path`/`reason`
 /// entries (the union uses a different shape on the `InvalidSubsetError`
 /// branch), and the route layer renders an empty `errors` array the same
@@ -2733,8 +2733,8 @@ mod tests {
     /// surfaces as `Err(DgError::Server(_))` — Dagster's own `message`
     /// text IS used here, but only inside the crate's `DgError::Server`,
     /// never forwarded to a response (the route layer translates
-    /// `DgError::Server` to a 503 with `classify_dg_error`'s generic
-    /// "Dagster error" string — see `routes::pipelines`'s call sites).
+    /// `DgError::Server` to a 503 via `js_error` (`"Error: {Display}"`)
+    /// — see `routes::pipelines`'s call sites).
     /// The test is the contract for "this is the only path that uses the
     /// message"; a regression that forwards it as a 200 would have to
     /// either change this match arm or add a new variant.
