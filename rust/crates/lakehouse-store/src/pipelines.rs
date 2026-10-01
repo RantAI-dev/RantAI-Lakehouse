@@ -1247,20 +1247,21 @@ pub async fn get_definition_version(
     let Some((value,)) = row else {
         return Ok(None);
     };
-    let snapshot: PipelineDefinitionSnapshot = serde_json::from_value(value).unwrap_or_else(|_| {
-        // A snapshot we cannot decode into the typed shape is a
-        // database corruption symptom — the migration's shape is the
-        // single source of truth, and a row that diverges from it is
-        // not safe to return as `Ok(Some(_))`. `Database` is the
-        // honest classifier for "the row exists but its payload is
-        // unreadable" — it maps to a 500, surfacing the operator
-        // action the row needs.
-        unreachable!(
-            "pipeline_definition_version.snapshot at ({pipeline_id}, {version}) \
-                 did not decode as PipelineDefinitionSnapshot — migration 0053 shape \
-                 has drifted from the Rust definition"
-        )
-    });
+    let snapshot: PipelineDefinitionSnapshot = serde_json::from_value(value).map_err(|err| {
+        // A snapshot we cannot decode into the typed shape is a database
+        // corruption symptom — the migration's shape is the single source of
+        // truth, and a row that diverges from it is not safe to return as
+        // `Ok(Some(_))`. Wrap the serde error in a `sqlx::Error::Decode` so
+        // the crate's existing `StoreError::Database` -> `ApiError::Internal`
+        // mapping is the honest classifier: "the row exists but its payload
+        // is unreadable" is a 500-class condition, not a caller error, and
+        // the `Database` variant's `Display` is the fixed `"database error"`
+        // — no upstream serde text (column/line/expected-type fragments) ever
+        // reaches the wire (see `error.rs`'s no-leak rule). The pipeline_id
+        // and version go into the [`tracing`] span at the route layer for
+        // the operator who has to reconcile the row.
+        StoreError::Database(sqlx::Error::Decode(Box::new(err)))
+    })?;
     Ok(Some(snapshot))
 }
 

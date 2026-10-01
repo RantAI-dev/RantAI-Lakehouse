@@ -1479,6 +1479,17 @@ async fn snapshot_round_trips_through_create_update_and_restore(pool: PgPool) ->
     assert_eq!(def.fbic_enabled, snap.fbic_enabled);
     assert_eq!(def.incremental_column, snap.incremental_column);
     assert_eq!(def.max_retries, snap.max_retries);
+    // `AuthoredDefinition` carries the editable fields but not
+    // `depends_on` (it lives on `Pipeline`), so re-read the live row
+    // via `get_pipeline` to assert the post-restore `depends_on` matches
+    // the snapshot. Without this, a future change that drops `depends_on`
+    // from the snapshot serializer would still round-trip the rest of
+    // the fields and pass every other assertion in this test.
+    let live = pipelines::get_pipeline(&pool, &created.id)
+        .await
+        .unwrap()
+        .expect("pipeline exists after restore");
+    assert_eq!(live.depends_on, snap.depends_on);
     // Three rows total: created (v=1), updated (v=2), restored via
     // update_pipeline (v=3). Newest-first: indices 0/1/2 are v=3/2/1.
     let versions = pipelines::list_definition_versions(&pool, &created.id)
@@ -1487,5 +1498,42 @@ async fn snapshot_round_trips_through_create_update_and_restore(pool: PgPool) ->
     assert_eq!(versions.len(), 3);
     assert_eq!(versions[0].event, "updated");
     assert_eq!(versions[2].event, "created");
+    Ok(())
+}
+
+/// `get_definition_version` must surface a snapshot row that does not
+/// decode into `PipelineDefinitionSnapshot` as `StoreError::Database`,
+/// not as a panic — the row exists but its payload is unreadable, which
+/// is the honest 500-class signal an operator needs to act on. A panic
+/// here is a review-blocker: every request that touches a corrupted
+/// `pipeline_definition_version.snapshot` would tear down the worker,
+/// and a future migration that reshapes the snapshot without a follow-up
+/// backfill would brick the whole `GET .../versions/{n}` route.
+#[sqlx::test(migrations = "../../migrations")]
+async fn get_definition_version_returns_err_when_snapshot_does_not_decode(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let created = pipelines::create_pipeline(&pool, &input(), None)
+        .await
+        .expect("create should succeed");
+    // Overwrite the v=1 snapshot with a JSON string — valid `jsonb`, but
+    // not an object, so `serde_json::from_value::<PipelineDefinitionSnapshot>`
+    // fails. Mirrors what an older migration's snapshot or a manual
+    // `UPDATE pipeline_definition_version SET snapshot = ...` could leave
+    // behind.
+    sqlx::query(
+        "UPDATE pipeline_definition_version SET snapshot = '\"not-an-object\"'::jsonb \
+          WHERE pipeline_id = $1 AND version = 1",
+    )
+    .bind(&created.id)
+    .execute(&pool)
+    .await?;
+    let err = pipelines::get_definition_version(&pool, &created.id, 1)
+        .await
+        .expect_err("undecodable snapshot must return Err, not panic and not Ok");
+    assert!(
+        matches!(err, lakehouse_store::StoreError::Database(_)),
+        "expected StoreError::Database for an undecodable snapshot, got {err:?}"
+    );
     Ok(())
 }
