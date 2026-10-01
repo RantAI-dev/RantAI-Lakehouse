@@ -349,6 +349,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // route but cannot list or set the SLA thresholds themselves.
     ("GET",  "/api/pipelines/{id}/sla",               Policy::RequiresPermission("pipeline:write")),
     ("PUT",  "/api/pipelines/{id}/sla",               Policy::RequiresPermission("pipeline:write")),
+    // Plan R4 2b: definition version history. List/get take the same
+    // floor as the runs and source routes (`pipeline:read`); restore
+    // takes `pipeline:write` because it mutates the row.
+    ("GET",  "/api/pipelines/{id}/versions",         Policy::RequiresPermission("pipeline:read")),
+    ("GET",  "/api/pipelines/{id}/versions/{version}", Policy::RequiresPermission("pipeline:read")),
+    ("POST", "/api/pipelines/{id}/versions/{version}/restore", Policy::RequiresPermission("pipeline:write")),
     // Volume history: the same authorization posture as `/runs` (which
     // is `pipeline:read`); a pipeline-write holder can already set the
     // SLA, so reading the resulting row counts is `pipeline:read`.

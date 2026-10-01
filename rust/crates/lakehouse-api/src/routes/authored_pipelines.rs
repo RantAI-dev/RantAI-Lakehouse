@@ -477,7 +477,7 @@ pub async fn update(
         max_retries: body.max_retries,
         depends_on: body.depends_on,
     };
-    let updated = pipelines::update_pipeline(pool, &id, &input)
+    let updated = pipelines::update_pipeline(pool, &id, &input, Some(principal.id.uuid()))
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
     record_pipeline_audit(&state, &principal, "pipeline.update", &id).await;
@@ -538,7 +538,7 @@ pub async fn delete(
         )))
         .into_response();
     }
-    match pipelines::delete_pipeline(pool, &id).await {
+    match pipelines::delete_pipeline(pool, &id, Some(principal.id.uuid())).await {
         Ok(true) => {
             record_pipeline_audit(&state, &principal, "pipeline.delete", &id).await;
             let reloaded = reload_orchestrator(&state).await;
@@ -553,6 +553,76 @@ pub async fn delete(
         }
         Err(err) => ApiRejection(err.into()).into_response(),
     }
+}
+
+/// `POST /api/pipelines/{id}/versions/{version}/restore` — replay a
+/// stored snapshot back into the live row (Plan R4 2b). Reads the
+/// snapshot via `pipelines::get_definition_version`, rebuilds an
+/// `UpdatePipelineInput` from it (everything except `name` and
+/// `status`, which the spec excludes from restore), and goes through
+/// `pipelines::restore_pipeline` so the write is wrapped in a single
+/// tx that also captures the resulting version row with `event =
+/// "restored"` — the governance trail records the restore as a
+/// distinct event from a plain `update`.
+///
+/// The restore does NOT change `name` or `status`: renaming or
+/// re-promoting a pipeline is a separate, deliberate action. A
+/// restore of the original `created` snapshot on a currently-`paused`
+/// pipeline leaves the pipeline paused.
+///
+/// The orchestrator is reloaded on success, like every other
+/// definition-mutating route, because the rebuilt job may differ
+/// from the one currently running.
+///
+/// # Errors
+///
+/// 404 for a non-`pl-` id or for an unknown `(id, version)` pair;
+/// 500/503 from the store or the orchestrator.
+pub async fn restore_version(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((id, version)): Path<(String, i32)>,
+) -> ApiResult<ApiJson<Value>> {
+    authored_only(&id)?;
+    let pool = crate::routes::pipelines::pool(&state)?;
+    let snapshot = pipelines::get_definition_version(pool, &id, version)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} version {version} not found")))?;
+    // Rebuild an `UpdatePipelineInput` from the snapshot. `name` and
+    // `status` are deliberately excluded: a restore is a replay of the
+    // editable fields, not a rename/re-promotion (Plan R4 2b).
+    let input = UpdatePipelineInput {
+        kind: snapshot.kind,
+        source_zone: snapshot.source_zone,
+        source_table: snapshot.source_table,
+        incremental_column: snapshot.incremental_column,
+        transforms: snapshot.transforms,
+        fbic_enabled: snapshot.fbic_enabled,
+        target_zone: snapshot.target_zone,
+        target_table: snapshot.target_table,
+        schedule: snapshot.schedule,
+        owner: Some(snapshot.owner),
+        description: snapshot.description,
+        max_retries: Some(snapshot.max_retries),
+        depends_on: snapshot.depends_on,
+    };
+    let updated = pipelines::restore_pipeline(pool, &id, &input, Some(principal.id.uuid()))
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
+    record_pipeline_audit(
+        &state,
+        &principal,
+        &format!("pipeline.restore.{version}"),
+        &id,
+    )
+    .await;
+    // Drafts have no job; only runnable pipelines need a reload.
+    let reloaded = if updated.status == "draft" {
+        false
+    } else {
+        reload_orchestrator(&state).await
+    };
+    Ok(ApiJson(with_orchestrator(&updated, reloaded)))
 }
 
 /// `GET /api/pipelines/{id}/schedule-ticks` — the schedule's recent

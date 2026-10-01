@@ -563,6 +563,61 @@ pub async fn detail(State(state): State<AppState>, Path(id): Path<String>) -> Re
     dagster_detail(&state, &id).await
 }
 
+/// `GET /api/pipelines/{id}/versions` — list metadata for the definition
+/// versions of an authored pipeline (Plan R4 2b). Newest-first, no
+/// snapshot column — the list endpoint must scale to a thousand
+/// versions without shipping every prior payload each time the UI
+/// re-fetches. 404 for non-`pl-` ids, the same posture as `delete` and
+/// `update` (`authored_pipelines`): a wrong prefix is "no such
+/// pipeline", not "wrong format".
+pub async fn list_versions(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Vec<pipelines::PipelineVersionMeta>>> {
+    if !id.starts_with("pl-") {
+        return Err(ApiError::NotFound(format!("Pipeline {id} not found")).into());
+    }
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(
+            ApiError::Internal("pipeline version history requires Postgres".to_owned()).into(),
+        );
+    };
+    let _ = &principal; // permission gate is at the policy table
+    let versions = pipelines::list_definition_versions(pool, &id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(ApiJson(versions))
+}
+
+/// `GET /api/pipelines/{id}/versions/{version}` — the editable state
+/// captured at one version. The restore route rebuilds an
+/// `UpdatePipelineInput` from this payload, so the field names here
+/// are the `UpdatePipelineInput` snake/camel wire shape (already true
+/// because [`pipelines::PipelineDefinitionSnapshot`] serializes with
+/// `rename_all = "camelCase"`). 404 for both an unknown version and a
+/// non-`pl-` id.
+pub async fn get_version(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((id, version)): Path<(String, i32)>,
+) -> ApiResult<ApiJson<pipelines::PipelineDefinitionSnapshot>> {
+    if !id.starts_with("pl-") {
+        return Err(ApiError::NotFound(format!("Pipeline {id} not found")).into());
+    }
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(
+            ApiError::Internal("pipeline version history requires Postgres".to_owned()).into(),
+        );
+    };
+    let _ = &principal; // permission gate is at the policy table
+    let snapshot = pipelines::get_definition_version(pool, &id, version)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} version {version} not found")))?;
+    Ok(ApiJson(snapshot))
+}
+
 async fn dagster_detail(state: &AppState, job_name: &str) -> Response {
     // `jobs`/`runs` are fetched (and the "does this job even exist" 404
     // decided) BEFORE `job_graph` is awaited — NOT joined together with it
@@ -1977,7 +2032,7 @@ pub async fn create(
         tenant_id,
         depends_on: body.depends_on,
     };
-    let created = create_named_pipeline(pool(&state)?, &input).await?;
+    let created = create_named_pipeline(pool(&state)?, &input, Some(principal.id.uuid())).await?;
     // WS5 item D4: best-effort, never turns a successful create into an
     // error. `create` has no internal (copilot tool) caller today
     // (confirmed by grepping `routes::ai::tools::pipelines` before adding
@@ -1991,11 +2046,20 @@ pub async fn create(
 /// what collided. The store's own message ("a record with that value
 /// already exists") was shown to the user verbatim, which explains
 /// nothing about which value or what to do next.
+///
+/// `changed_by` is the principal the route had on the
+/// `Extension<Principal>`; it lands in the `created` version row's
+/// `changed_by` column (Plan R4 2b). `routes::pipelines::generate`'s
+/// own caller passes its own principal — `generate` does not audit today
+/// (WS5 item D4), but the version row still goes through `create_pipeline`
+/// so the create is captured in history without a separate route-side
+/// write.
 async fn create_named_pipeline(
     pool: &PgPool,
     input: &CreatePipelineInput,
+    changed_by: Option<Uuid>,
 ) -> Result<pipelines::Pipeline, ApiError> {
-    match pipelines::create_pipeline(pool, input).await {
+    match pipelines::create_pipeline(pool, input, changed_by).await {
         Ok(created) => Ok(created),
         Err(StoreError::Conflict) => Err(ApiError::Conflict(format!(
             "a pipeline named \"{}\" already exists — pick a different name",
@@ -2129,7 +2193,7 @@ pub async fn generate(
         // author's deliberate call, not an LLM's. R3 plan 2a.
         depends_on: Vec::new(),
     };
-    let created = create_named_pipeline(pool(&state)?, &input).await?;
+    let created = create_named_pipeline(pool(&state)?, &input, Some(principal.id.uuid())).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
 }
 

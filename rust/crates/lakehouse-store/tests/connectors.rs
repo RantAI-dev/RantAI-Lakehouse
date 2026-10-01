@@ -181,6 +181,7 @@ async fn dependent_pipelines_are_derived_from_pipeline_definition(
             tenant_id: None,
             depends_on: Vec::new(),
         },
+        None,
     )
     .await
     .unwrap();
