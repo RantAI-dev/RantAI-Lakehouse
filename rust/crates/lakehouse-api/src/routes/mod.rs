@@ -185,6 +185,22 @@ fn pipelines_router() -> Router<AppState> {
         )
         .route("/api/pipelines/{id}/source", get(pipelines::source))
         .route("/api/pipelines/{id}/runs", get(pipelines::runs))
+        // Plan R4 2b: definition version history. Static under
+        // `{id}/versions`, so it is registered BEFORE
+        // `{id}/versions/{version}/restore` (which would otherwise
+        // match `{version}/restore` as `{version}`).
+        .route(
+            "/api/pipelines/{id}/versions",
+            get(pipelines::list_versions),
+        )
+        .route(
+            "/api/pipelines/{id}/versions/{version}",
+            get(pipelines::get_version),
+        )
+        .route(
+            "/api/pipelines/{id}/versions/{version}/restore",
+            axum::routing::post(authored_pipelines::restore_version),
+        )
         // Plan 1c (R2, day-1): the runs × steps matrix endpoint is
         // STATIC under `{id}/runs/steps`, so it is registered BEFORE the
         // `{runId}/steps` route below — otherwise axum would match the
@@ -206,6 +222,15 @@ fn pipelines_router() -> Router<AppState> {
         .route(
             "/api/pipelines/{id}/trigger",
             axum::routing::post(pipelines::trigger),
+        )
+        // R4 plan 2c: read-side companion to `/trigger`. Registered
+        // BEFORE `/api/pipelines/{id}` only matters for static sub-paths
+        // (already covered above) — `{id}/config-schema` is registered
+        // here next to `/trigger` since they share the `id` namespace
+        // and route handlers share `path = {id}`.
+        .route(
+            "/api/pipelines/{id}/config-schema",
+            get(pipelines::config_schema),
         )
         .route(
             "/api/pipelines/{id}/status",

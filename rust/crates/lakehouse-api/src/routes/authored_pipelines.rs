@@ -477,10 +477,10 @@ pub async fn update(
         max_retries: body.max_retries,
         depends_on: body.depends_on,
     };
-    let updated = pipelines::update_pipeline(pool, &id, &input)
+    let updated = pipelines::update_pipeline(pool, &id, &input, Some(principal.id.uuid()))
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
-    record_pipeline_audit(&state, &principal, "pipeline.update", &id).await;
+    record_pipeline_audit(&state, &principal, "pipeline.update", &id, Value::Null).await;
     // A draft has no job; only a runnable pipeline's job has to be rebuilt.
     let reloaded = if updated.status == "draft" {
         false
@@ -538,9 +538,9 @@ pub async fn delete(
         )))
         .into_response();
     }
-    match pipelines::delete_pipeline(pool, &id).await {
+    match pipelines::delete_pipeline(pool, &id, Some(principal.id.uuid())).await {
         Ok(true) => {
-            record_pipeline_audit(&state, &principal, "pipeline.delete", &id).await;
+            record_pipeline_audit(&state, &principal, "pipeline.delete", &id, Value::Null).await;
             let reloaded = reload_orchestrator(&state).await;
             (
                 StatusCode::OK,
@@ -553,6 +553,102 @@ pub async fn delete(
         }
         Err(err) => ApiRejection(err.into()).into_response(),
     }
+}
+
+/// `POST /api/pipelines/{id}/versions/{version}/restore` — replay a
+/// stored snapshot back into the live row (Plan R4 2b). Reads the
+/// snapshot via `pipelines::get_definition_version`, rebuilds an
+/// `UpdatePipelineInput` from it (everything except `name` and
+/// `status`, which the spec excludes from restore), and goes through
+/// `pipelines::restore_pipeline` so the write is wrapped in a single
+/// tx that also captures the resulting version row with `event =
+/// "restored"` — the governance trail records the restore as a
+/// distinct event from a plain `update`.
+///
+/// The restore does NOT change `name` or `status`: renaming or
+/// re-promoting a pipeline is a separate, deliberate action. A
+/// restore of the original `created` snapshot on a currently-`paused`
+/// pipeline leaves the pipeline paused.
+///
+/// The orchestrator is reloaded on success, like every other
+/// definition-mutating route, because the rebuilt job may differ
+/// from the one currently running.
+///
+/// # Errors
+///
+/// 404 for a non-`pl-` id or for an unknown `(id, version)` pair;
+/// 500/503 from the store or the orchestrator.
+pub async fn restore_version(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((id, version)): Path<(String, i32)>,
+) -> ApiResult<ApiJson<Value>> {
+    authored_only(&id)?;
+    let pool = crate::routes::pipelines::pool(&state)?;
+    let snapshot = pipelines::get_definition_version(pool, &id, version)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} version {version} not found")))?;
+    // Validate the snapshot's `depends_on` against the live authored
+    // graph and the orchestrator's `Dagster` job list — the same
+    // `validate_depends_on` call `update` runs (final-review
+    // should-fix, part 2b: a stored snapshot can outlive one of its
+    // declared upstreams; restoring it would persist a dangling
+    // reference identical to the one the delete guard refuses to
+    // create on the live graph — `referencing_downstreams`, same
+    // file). The snapshot itself cannot list `id`: every stored
+    // version was written through a path the validator had already
+    // cleared (or, for the original `created` snapshot, validated
+    // before insert). `exclude_id = Some(&id)` is belt-and-braces,
+    // same call shape as `update`. `Dagster` unreachable degrades
+    // to "no `Dagster` upstreams accepted" (empty list), identical
+    // to `update`'s fallback. After a successful restore the
+    // persisted state satisfies the validator by construction: we
+    // just validated the exact set we are about to write.
+    let dagster_jobs = match state.dagster.list_jobs().await {
+        Ok(j) => j,
+        Err(err) => {
+            tracing::warn!(%err, "restore_version: dagster unreachable, depends_on accepts authored upstreams only");
+            Vec::new()
+        }
+    };
+    let others = collect_authored_depends_on(pool, Some(&id)).await?;
+    validate_depends_on(&id, &snapshot.depends_on, &others, &dagster_jobs)?;
+    // Rebuild an `UpdatePipelineInput` from the snapshot. `name` and
+    // `status` are deliberately excluded: a restore is a replay of the
+    // editable fields, not a rename/re-promotion (Plan R4 2b).
+    let input = UpdatePipelineInput {
+        kind: snapshot.kind,
+        source_zone: snapshot.source_zone,
+        source_table: snapshot.source_table,
+        incremental_column: snapshot.incremental_column,
+        transforms: snapshot.transforms,
+        fbic_enabled: snapshot.fbic_enabled,
+        target_zone: snapshot.target_zone,
+        target_table: snapshot.target_table,
+        schedule: snapshot.schedule,
+        owner: Some(snapshot.owner),
+        description: snapshot.description,
+        max_retries: Some(snapshot.max_retries),
+        depends_on: snapshot.depends_on,
+    };
+    let updated = pipelines::restore_pipeline(pool, &id, &input, Some(principal.id.uuid()))
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
+    record_pipeline_audit(
+        &state,
+        &principal,
+        &format!("pipeline.restore.{version}"),
+        &id,
+        Value::Null,
+    )
+    .await;
+    // Drafts have no job; only runnable pipelines need a reload.
+    let reloaded = if updated.status == "draft" {
+        false
+    } else {
+        reload_orchestrator(&state).await
+    };
+    Ok(ApiJson(with_orchestrator(&updated, reloaded)))
 }
 
 /// `GET /api/pipelines/{id}/schedule-ticks` — the schedule's recent
@@ -977,5 +1073,152 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.into_response().status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Final-review should-fix (Part 2b): `restore_version` replays a
+    /// stored snapshot through `restore_pipeline` without first
+    /// validating the snapshot's `depends_on`. A snapshot outlives
+    /// one of its declared upstreams — the snapshot was captured
+    /// when `pl-b` existed, `pl-b` has since been removed from the
+    /// authored graph — and the restore would persist a dangling
+    /// reference, the same failure class the delete guard
+    /// (`referencing_downstreams`, same file) already refuses to
+    /// create on the live graph. The fix wires the same
+    /// `validate_depends_on` call `update` runs BEFORE the write,
+    /// so the failure case here matches the failure case `update`
+    /// returns: a 400 whose message names the dangling id verbatim.
+    ///
+    /// The route is exercised against a real Postgres so the
+    /// "stored snapshot outlives its upstream" precondition can be
+    /// built (a stored version row whose `depends_on` references an
+    /// id that has been removed from `pipeline_definition`); the
+    /// existing `state_without_pool()` fixture returns 503 from
+    /// `pool()` before any guard runs, so the validator cannot be
+    /// observed at that seam.
+    mod restore_version_validates_a_stored_snapshot {
+        // Force-link the Postgres testcontainer bootstrap (every
+        // other `#[sqlx::test]` in this crate carries the same line).
+        use lakehouse_store::pipelines::{self, CreatePipelineInput};
+        use lakehouse_test_support as _;
+
+        use super::*;
+
+        /// `DATABASE_URL` dialing the SAME per-test Postgres
+        /// `#[sqlx::test]` already handed us via `pool` — extracting
+        /// host/port/user/database from the pool's own connect
+        /// options, the same shape every other route-level
+        /// `sqlx::test` in this crate uses.
+        fn database_url_for(pool: &sqlx::PgPool) -> String {
+            let options = pool.connect_options();
+            format!(
+                "postgres://{}:postgres@{}:{}/{}",
+                options.get_username(),
+                options.get_host(),
+                options.get_port(),
+                options
+                    .get_database()
+                    .expect("#[sqlx::test] always targets a named database")
+            )
+        }
+
+        /// `AppState` pointed at the test pool. `DAGSTER_URL` is left
+        /// at `Config`'s default (`http://localhost:13030/graphql`,
+        /// nothing listening in this test environment), so
+        /// `state.dagster.list_jobs()` fails and the route falls back
+        /// to "no Dagster upstreams accepted" — the same fallback
+        /// `update` already exercises. `pl-b` is an authored id and
+        /// was never in the Dagster list, so the rejection still
+        /// fires on rule 2 ("unknown pipeline").
+        fn state_for(pool: &sqlx::PgPool) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DATABASE_URL".to_owned(), database_url_for(pool));
+            AppState::new(Config::from_map(&env).expect("a valid test Config"))
+        }
+
+        fn create_input(name: &str, depends_on: Vec<String>) -> CreatePipelineInput {
+            CreatePipelineInput {
+                name: name.to_owned(),
+                kind: "batch".to_owned(),
+                source_zone: "bronze".to_owned(),
+                source_table: "src".to_owned(),
+                incremental_column: None,
+                transforms: Vec::new(),
+                fbic_enabled: false,
+                target_zone: "silver".to_owned(),
+                target_table: "tgt".to_owned(),
+                schedule: "manual".to_owned(),
+                owner: None,
+                description: None,
+                max_retries: None,
+                tenant_id: None,
+                depends_on,
+            }
+        }
+
+        #[sqlx::test(migrations = "../../migrations")]
+        async fn restore_rejects_a_snapshot_referencing_a_now_deleted_upstream(pool: sqlx::PgPool) {
+            // 1. `pl-b` exists — it has to, when its stored snapshot
+            //    in `pl-a`'s v=1 row was captured (the store accepts
+            //    any `depends_on` value without validating it; the
+            //    validator lives at the route layer). The store
+            //    slugifies the name with a timestamp suffix, so we
+            //    read the id back from the create result rather than
+            //    hand-rolling the slug.
+            let pl_b = pipelines::create_pipeline(&pool, &create_input("pl-b", Vec::new()), None)
+                .await
+                .expect("create pl-b");
+
+            // 2. `pl-a` is created with `depends_on = ["pl-b"]`. The
+            //    store records this verbatim in v=1's snapshot,
+            //    which is exactly the payload `restore_version`
+            //    later replays.
+            let pl_a = pipelines::create_pipeline(
+                &pool,
+                &create_input("pl-a", vec![pl_b.id.clone()]),
+                None,
+            )
+            .await
+            .expect("create pl-a");
+
+            // 3. `pl-b` is removed from the live graph through the
+            //    store directly — the route's `delete` guard would
+            //    refuse here because `pl-a` still references it,
+            //    which is the same case we are testing against the
+            //    restore path. Going through the store models the
+            //    "upstream vanished out from under a stored snapshot"
+            //    precondition this fix targets.
+            let deleted = pipelines::delete_pipeline(&pool, &pl_b.id, None)
+                .await
+                .expect("delete pl-b");
+            assert!(deleted, "pl-b should have been deleted");
+
+            // 4. Restore `pl-a`'s v=1 — its stored snapshot still
+            //    lists `pl-b`, which no longer exists. Without the
+            //    validator the route happily writes a dangling
+            //    reference; with the validator it returns the same
+            //    400 `update` returns for a fresh edit against the
+            //    same graph, naming `pl-b` verbatim.
+            let err = restore_version(
+                State(state_for(&pool)),
+                Extension(principal(PrincipalId::User(Uuid::from_u128(1)))),
+                Path((pl_a.id.clone(), 1)),
+            )
+            .await
+            .expect_err("a snapshot whose upstream has been deleted must be refused");
+            let response = err.into_response();
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "the restore of a stale snapshot must be a 400, not a successful write"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let message = String::from_utf8_lossy(&body);
+            assert!(
+                message.contains(&pl_b.id),
+                "the 400 must name the dangling id verbatim: {message:?}"
+            );
+        }
     }
 }

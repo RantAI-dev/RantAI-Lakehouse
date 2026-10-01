@@ -803,12 +803,16 @@
     "type": "function",
     "function": {
       "name": "trigger_pipeline",
-      "description": "Run one pipeline now (by id). Different from trigger_lakehouse_build, which always runs the main Bronze -> Silver -> Gold rebuild.",
+      "description": "Run one pipeline now (by id). Different from trigger_lakehouse_build, which always runs the main Bronze -> Silver -> Gold rebuild. Optional runConfig (object) overrides the job's defaults — validated against the job's config schema before launch; an invalid config fails with a structured 400.",
       "parameters": {
         "type": "object",
         "properties": {
           "id": {
             "type": "string"
+          },
+          "runConfig": {
+            "type": "object",
+            "additionalProperties": true
           }
         },
         "required": [

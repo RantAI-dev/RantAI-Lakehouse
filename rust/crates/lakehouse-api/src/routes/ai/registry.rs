@@ -375,10 +375,19 @@ fn list_pipeline_runs_schema() -> Value {
 }
 
 fn trigger_pipeline_schema() -> Value {
+    // R4 plan 2c: `runConfig` is an OPTIONAL JSON object of run-time
+    // config the job accepts (the same shape `POST /api/pipelines/{id}/
+    // trigger` takes when supplied). The schema lists it as
+    // `additionalProperties: true` — Dagster's per-job schema is the
+    // source of truth for what's allowed; this is a tool definition,
+    // not a validator.
     json!({ "type": "function", "function": { "name": "trigger_pipeline",
-        "description": "Run one pipeline now (by id). Different from trigger_lakehouse_build, which always runs the main Bronze -> Silver -> Gold rebuild.",
-        "parameters": { "type": "object", "properties": { "id": { "type": "string" } },
-            "required": ["id"] } } })
+        "description": "Run one pipeline now (by id). Different from trigger_lakehouse_build, which always runs the main Bronze -> Silver -> Gold rebuild. Optional runConfig (object) overrides the job's defaults — validated against the job's config schema before launch; an invalid config fails with a structured 400.",
+        "parameters": { "type": "object", "properties": {
+            "id": { "type": "string" },
+            "runConfig": { "type": "object", "additionalProperties": true }
+        },
+        "required": ["id"] } } })
 }
 
 fn retry_pipeline_run_schema() -> Value {

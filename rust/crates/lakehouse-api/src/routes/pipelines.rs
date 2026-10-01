@@ -8,14 +8,15 @@
 
 use axum::Extension;
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Json, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use lakehouse_alerts::SilenceSource;
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
 use lakehouse_dagster::{
-    DgClient, DgError, DgJob, DgRun, ReexecutionStrategy, iso_from_unix_seconds, map_run_status,
+    ConfigValidationOutcome, DgClient, DgError, DgJob, DgRun, ReexecutionStrategy,
+    iso_from_unix_seconds, map_run_status,
 };
 use lakehouse_notify::EmailSender;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
@@ -443,7 +444,7 @@ pub async fn put_sla(
     // Best-effort audit: a failed audit write is logged, not propagated.
     // Same posture as `routes::pipelines::trigger`/
     // `routes::connectors::create` and the rest of this file.
-    record_pipeline_audit(&state, &principal, "pipeline.sla_set", &id).await;
+    record_pipeline_audit(&state, &principal, "pipeline.sla_set", &id, Value::Null).await;
     Ok(ApiJson(json!({
         "pipelineId": sla.pipeline_id,
         "maxDurationSeconds": sla.max_duration_seconds,
@@ -561,6 +562,61 @@ pub async fn detail(State(state): State<AppState>, Path(id): Path<String>) -> Re
         return authored_detail(&state, &id).await;
     }
     dagster_detail(&state, &id).await
+}
+
+/// `GET /api/pipelines/{id}/versions` — list metadata for the definition
+/// versions of an authored pipeline (Plan R4 2b). Newest-first, no
+/// snapshot column — the list endpoint must scale to a thousand
+/// versions without shipping every prior payload each time the UI
+/// re-fetches. 404 for non-`pl-` ids, the same posture as `delete` and
+/// `update` (`authored_pipelines`): a wrong prefix is "no such
+/// pipeline", not "wrong format".
+pub async fn list_versions(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Vec<pipelines::PipelineVersionMeta>>> {
+    if !id.starts_with("pl-") {
+        return Err(ApiError::NotFound(format!("Pipeline {id} not found")).into());
+    }
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(
+            ApiError::Internal("pipeline version history requires Postgres".to_owned()).into(),
+        );
+    };
+    let _ = &principal; // permission gate is at the policy table
+    let versions = pipelines::list_definition_versions(pool, &id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(ApiJson(versions))
+}
+
+/// `GET /api/pipelines/{id}/versions/{version}` — the editable state
+/// captured at one version. The restore route rebuilds an
+/// `UpdatePipelineInput` from this payload, so the field names here
+/// are the `UpdatePipelineInput` snake/camel wire shape (already true
+/// because [`pipelines::PipelineDefinitionSnapshot`] serializes with
+/// `rename_all = "camelCase"`). 404 for both an unknown version and a
+/// non-`pl-` id.
+pub async fn get_version(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Path((id, version)): Path<(String, i32)>,
+) -> ApiResult<ApiJson<pipelines::PipelineDefinitionSnapshot>> {
+    if !id.starts_with("pl-") {
+        return Err(ApiError::NotFound(format!("Pipeline {id} not found")).into());
+    }
+    let Some(pool) = state.pg.as_deref() else {
+        return Err(
+            ApiError::Internal("pipeline version history requires Postgres".to_owned()).into(),
+        );
+    };
+    let _ = &principal; // permission gate is at the policy table
+    let snapshot = pipelines::get_definition_version(pool, &id, version)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} version {version} not found")))?;
+    Ok(ApiJson(snapshot))
 }
 
 async fn dagster_detail(state: &AppState, job_name: &str) -> Response {
@@ -1346,10 +1402,23 @@ fn half_median(median: i64) -> f64 {
 /// below only calls this on ITS OWN success path, so there is no failure
 /// outcome for this helper to encode.
 ///
+/// `args` is the structured side-channel for action-specific data the
+/// generic `resource_kind`/`resource_id`/`run_id`/`approval_id`/
+/// `session_id` columns do not already capture. R4 plan 2c uses it for
+/// [`trigger`]: the TOP-LEVEL keys of the run config (NEVER the values)
+/// land in `args["configKeys"]` so a future reader can answer "this
+/// launch supplied a `connector_id` field" without the column carrying
+/// the payload. Other call sites pass `Value::Null`.
+///
 /// `principal_kind` comes from [`Principal::kind_for_audit`], never
 /// [`Principal::provider`] — same CHECK this crate's other audit sites
 /// satisfy.
-fn pipeline_audit_event(principal: &Principal, action: &str, pipeline_id: &str) -> NewAuditEvent {
+fn pipeline_audit_event(
+    principal: &Principal,
+    action: &str,
+    pipeline_id: &str,
+    args: Value,
+) -> NewAuditEvent {
     NewAuditEvent {
         principal_id: Some(principal.id.uuid().to_string()),
         principal_kind: Some(principal.kind_for_audit().to_owned()),
@@ -1357,7 +1426,7 @@ fn pipeline_audit_event(principal: &Principal, action: &str, pipeline_id: &str) 
         action: action.to_owned(),
         resource_kind: Some("pipeline".to_owned()),
         resource_id: Some(pipeline_id.to_owned()),
-        args: None,
+        args: Some(args),
         outcome: "executed".to_owned(),
         detail: None,
         run_id: None,
@@ -1375,11 +1444,12 @@ pub(super) async fn record_pipeline_audit(
     principal: &Principal,
     action: &str,
     id: &str,
+    args: Value,
 ) {
     let Some(pool) = state.pg.as_deref() else {
         return;
     };
-    let event = pipeline_audit_event(principal, action, id);
+    let event = pipeline_audit_event(principal, action, id, args);
     if let Err(err) = store_audit::insert(pool, event).await {
         tracing::warn!(%err, action, pipeline_id = id, "failed to record pipeline audit event");
     }
@@ -1409,10 +1479,52 @@ pub async fn trigger(
     State(state): State<AppState>,
     principal: Option<Extension<Principal>>,
     Path(id): Path<String>,
+    body: Option<Json<TriggerBody>>,
 ) -> Response {
     let Some(Extension(principal)) = principal else {
         return ApiRejection(ApiError::unauthorized()).into_response();
     };
+    // `Option<Json<T>>` distinguishes "no body" (`Ok(None)`) from "valid
+    // body" (`Ok(Some(_))`) without 400-ing on the missing `Content-Type`
+    // header the existing curl corpus entry uses — axum 0.8's
+    // `Option<Json<T>>` extractor (`axum-0.8.9/src/json.rs:116`) drops the
+    // header requirement and yields `None` for an empty body, the same
+    // behavior the existing `routes::connectors::test_connection` call
+    // site relies on.
+    let run_config = body.and_then(|Json(b)| b.run_config);
+    // R4 plan 2c: when the caller sent a run_config, validate it
+    // against the job's schema BEFORE launching. A `RunConfigValidation
+    // Invalid` becomes a structured 400 (see [`build_config_error_body`]).
+    // A `PipelineNotFoundError` falls through to the same `launch_run`
+    // path as the no-config case — `launch_run` already surfaces that
+    // case as `LaunchOutcome { error: ..., .. }`, which the route
+    // renders as a 422.
+    if let Some(cfg) = run_config.as_ref() {
+        match state.dagster.validate_run_config(&id, cfg).await {
+            Ok(ConfigValidationOutcome::Valid | ConfigValidationOutcome::NotFound) => {}
+            Ok(ConfigValidationOutcome::Invalid { errors }) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    ApiJson(build_config_error_body(errors)),
+                )
+                    .into_response();
+            }
+            Err(err) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    ApiJson(json!({ "error": js_error(err) })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    // `configKeys` for the audit column are the TOP-LEVEL keys of the
+    // supplied config — never the values. The audit column carries a
+    // structured side-channel for action-specific data (see
+    // [`pipeline_audit_event`]); "the run supplied a `connector_id`
+    // field" is what a future reader needs to answer, not the actual id
+    // value.
+    let config_keys: Vec<String> = run_config.as_ref().map(top_level_keys).unwrap_or_default();
     // An authored pipeline runs as the `authored__<id>` job
     // `authored_factory.py` builds for it; see `authored_pipelines`.
     let job = if id.starts_with("pl-") {
@@ -1423,7 +1535,11 @@ pub async fn trigger(
     } else {
         id.clone()
     };
-    match state.dagster.launch_run(&job).await {
+    let launch = match run_config.as_ref() {
+        Some(cfg) => state.dagster.launch_run_with_config(&job, cfg).await,
+        None => state.dagster.launch_run(&job).await,
+    };
+    match launch {
         Ok(outcome) => {
             if let Some(error) = outcome.error {
                 return (
@@ -1432,7 +1548,12 @@ pub async fn trigger(
                 )
                     .into_response();
             }
-            record_pipeline_audit(&state, &principal, "pipeline.trigger", &id).await;
+            let audit_args = if config_keys.is_empty() {
+                Value::Null
+            } else {
+                json!({ "configKeys": config_keys })
+            };
+            record_pipeline_audit(&state, &principal, "pipeline.trigger", &id, audit_args).await;
             let body = json!({
                 "id": outcome.run_id,
                 "pipelineId": id,
@@ -1456,6 +1577,145 @@ pub async fn trigger(
         )
             .into_response(),
     }
+}
+
+/// Body for `POST /api/pipelines/{id}/trigger` (R4 plan 2c). The whole
+/// type is optional (the route's `Option<Json<TriggerBody>>` accepts an
+/// empty body); `runConfig` is itself optional, so a caller may send
+/// `{ "runConfig": null }` or omit the field entirely — both mean "use
+/// Dagster's defaults for this job".
+///
+/// `runConfig` is the raw JSON object Dagster's `RunConfigData` scalar
+/// expects (NOT a YAML string — see [`DgClient::validate_run_config`]).
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct TriggerBody {
+    #[serde(default, rename = "runConfig")]
+    pub run_config: Option<Value>,
+}
+
+/// Top-level keys of a JSON object, or empty for non-objects (null,
+/// array, string, ...). Used to populate the `configKeys` audit field
+/// without forwarding the values themselves — see [`trigger`]'s
+/// `record_pipeline_audit` call.
+fn top_level_keys(value: &Value) -> Vec<String> {
+    let Some(obj) = value.as_object() else {
+        return Vec::new();
+    };
+    obj.keys().cloned().collect()
+}
+
+/// 400 body shape for a `RunConfigValidationInvalid` from
+/// [`trigger`]. Built ONLY from the structured `path` array and the
+/// enum `reason` (one of `RUNTIME_TYPE_MISMATCH`,
+/// `MISSING_REQUIRED_FIELD`, `MISSING_REQUIRED_FIELDS`,
+/// `FIELD_NOT_DEFINED`, `FIELDS_NOT_DEFINED`, `SELECTOR_FIELD_ERROR`)
+/// — `Dagster`'s own `message` / `stack` / `value_rep` / `field` /
+/// `fields` strings are deliberately NOT carried (see
+/// [`DgClient::validate_run_config`]'s doc comment and AGENTS.md
+/// principle 4). This is the regression check from the plan: passing
+/// `message` through in the body MUST fail the sentinel test, so the
+/// route cannot silently accept a future re-introduction.
+fn build_config_error_body(errors: Vec<lakehouse_dagster::ConfigValidationError>) -> Value {
+    let entries: Vec<Value> = errors
+        .into_iter()
+        .map(|e| {
+            json!({
+                "path": e.path,
+                "reason": e.reason,
+            })
+        })
+        .collect();
+    json!({ "errors": entries })
+}
+
+/// `GET /api/pipelines/{id}/config-schema` (R4 plan 2c) — the read-side
+/// companion to [`trigger`]. Returns the job's default config so a
+/// console form / copilot tool can pre-fill a config editor before the
+/// user clicks "Run".
+///
+/// Response shape:
+/// ```json
+/// {
+///   "pipelineId": "<id>",
+///   "hasConfig": true,
+///   "defaultConfig": null,
+///   "defaultConfigYaml": "<yaml-string>"
+/// }
+/// ```
+/// `defaultConfig` is intentionally `null` rather than a parsed JSON
+/// object: `Dagster` emits the default as a YAML string, the workspace
+/// has no YAML parser dep (a deliberate non-decision — see
+/// [`DgClient::run_config_schema`]'s doc comment), and a JSON Schema
+/// editor does not need the pre-filled values to begin with.
+/// `defaultConfigYaml` carries the raw string for callers that want it.
+///
+/// The `pl-…` namespace (authored pipelines) returns `hasConfig: false`
+/// without contacting Dagster — `authored_factory.py`'s default is
+/// "config is whatever the user supplied at submit time, validated
+/// client-side by the form" (R4 plan 2c, see `docs/plans/pipelines/
+/// day-1/r4-governance.md`). A non-`pl-` id is looked up in the
+/// orchestrator; an unknown id is a 404 (matching the `pipeline.runnable`
+/// route's posture for jobs Dagster doesn't know about — a 503 would
+/// be honest about "Dagster rejected this job name", but the existing
+/// `pipeline.runnable` body says "no, this id is not a job" so the
+/// behaviour is consistent across reads).
+///
+/// # Errors
+///
+/// Returns a 401 [`Response`] (same posture as [`trigger`]/[`pause`]/
+/// [`resume`]) if no principal is present. Returns a 503 with
+/// `js_error(err)` (matching [`source`]'s posture) if the GraphQL call
+/// fails for any other reason.
+pub async fn config_schema(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+) -> Response {
+    let Some(Extension(_principal)) = principal else {
+        return ApiRejection(ApiError::unauthorized()).into_response();
+    };
+    if id.starts_with("pl-") {
+        // Authored pipelines: no Dagster-side config schema (the
+        // console is the source of truth for the form). Returning
+        // `hasConfig: false` keeps the route honest about the
+        // namespace; the orchestrator only loads an `authored__<id>`
+        // job for `ready`/`paused` pipelines, and even then the
+        // `runConfig` is fully editor-driven.
+        return (
+            StatusCode::OK,
+            ApiJson(json!({
+                "pipelineId": id,
+                "hasConfig": false,
+                "defaultConfig": Value::Null,
+                "defaultConfigYaml": Value::Null,
+            })),
+        )
+            .into_response();
+    }
+    let schema = match state.dagster.run_config_schema(&id).await {
+        Ok(Some(schema)) => schema,
+        Ok(None) => {
+            return ApiRejection(ApiError::NotFound(format!("Pipeline {id} not found")))
+                .into_response();
+        }
+        Err(err) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiJson(json!({ "error": js_error(err) })),
+            )
+                .into_response();
+        }
+    };
+    (
+        StatusCode::OK,
+        ApiJson(json!({
+            "pipelineId": id,
+            "hasConfig": true,
+            "defaultConfig": Value::Null,
+            "defaultConfigYaml": schema.root_default_yaml,
+        })),
+    )
+        .into_response()
 }
 
 /// `POST /api/pipelines/events/run-failed` — Dagster's `run_failure_sensor`
@@ -1977,13 +2237,20 @@ pub async fn create(
         tenant_id,
         depends_on: body.depends_on,
     };
-    let created = create_named_pipeline(pool(&state)?, &input).await?;
+    let created = create_named_pipeline(pool(&state)?, &input, Some(principal.id.uuid())).await?;
     // WS5 item D4: best-effort, never turns a successful create into an
     // error. `create` has no internal (copilot tool) caller today
     // (confirmed by grepping `routes::ai::tools::pipelines` before adding
     // this parameter), so `Extension<Principal>`, not `Option`, matches
     // `pipeline:write`'s own `RequiresPermission` guarantee exactly.
-    record_pipeline_audit(&state, &principal, "pipeline.create", &created.id).await;
+    record_pipeline_audit(
+        &state,
+        &principal,
+        "pipeline.create",
+        &created.id,
+        Value::Null,
+    )
+    .await;
     Ok((StatusCode::CREATED, ApiJson(created)))
 }
 
@@ -1991,11 +2258,20 @@ pub async fn create(
 /// what collided. The store's own message ("a record with that value
 /// already exists") was shown to the user verbatim, which explains
 /// nothing about which value or what to do next.
+///
+/// `changed_by` is the principal the route had on the
+/// `Extension<Principal>`; it lands in the `created` version row's
+/// `changed_by` column (Plan R4 2b). `routes::pipelines::generate`'s
+/// own caller passes its own principal — `generate` does not audit today
+/// (WS5 item D4), but the version row still goes through `create_pipeline`
+/// so the create is captured in history without a separate route-side
+/// write.
 async fn create_named_pipeline(
     pool: &PgPool,
     input: &CreatePipelineInput,
+    changed_by: Option<Uuid>,
 ) -> Result<pipelines::Pipeline, ApiError> {
-    match pipelines::create_pipeline(pool, input).await {
+    match pipelines::create_pipeline(pool, input, changed_by).await {
         Ok(created) => Ok(created),
         Err(StoreError::Conflict) => Err(ApiError::Conflict(format!(
             "a pipeline named \"{}\" already exists — pick a different name",
@@ -2129,7 +2405,7 @@ pub async fn generate(
         // author's deliberate call, not an LLM's. R3 plan 2a.
         depends_on: Vec::new(),
     };
-    let created = create_named_pipeline(pool(&state)?, &input).await?;
+    let created = create_named_pipeline(pool(&state)?, &input, Some(principal.id.uuid())).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
 }
 
@@ -2365,7 +2641,7 @@ pub async fn pause(
     };
     let response = set_pipeline_paused(&state, &id, true).await;
     if response.status().is_success() {
-        record_pipeline_audit(&state, &principal, "pipeline.pause", &id).await;
+        record_pipeline_audit(&state, &principal, "pipeline.pause", &id, Value::Null).await;
     }
     response
 }
@@ -2386,7 +2662,7 @@ pub async fn resume(
     };
     let response = set_pipeline_paused(&state, &id, false).await;
     if response.status().is_success() {
-        record_pipeline_audit(&state, &principal, "pipeline.resume", &id).await;
+        record_pipeline_audit(&state, &principal, "pipeline.resume", &id, Value::Null).await;
     }
     response
 }
@@ -3063,7 +3339,7 @@ mod tests {
     #[test]
     fn pipeline_audit_event_pairs_with_pipeline_resource_kind() {
         let principal = fixture_user_principal();
-        let event = pipeline_audit_event(&principal, "pipeline.trigger", "job-1");
+        let event = pipeline_audit_event(&principal, "pipeline.trigger", "job-1", Value::Null);
         assert_eq!(event.principal_kind.as_deref(), Some("user"));
         assert_eq!(
             event.principal_id.as_deref(),
@@ -3080,7 +3356,7 @@ mod tests {
     #[test]
     fn pipeline_audit_event_records_a_service_identity_as_service_not_user() {
         let principal = fixture_service_principal();
-        let event = pipeline_audit_event(&principal, "pipeline.pause", "job-1");
+        let event = pipeline_audit_event(&principal, "pipeline.pause", "job-1", Value::Null);
         assert_eq!(event.principal_kind.as_deref(), Some("service"));
     }
 
@@ -4153,6 +4429,141 @@ mod tests {
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
             // No manual cleanup: `secret.py` now lives inside `dir`, so
             // dropping the `TempDir` removes it.
+        }
+    }
+
+    /// R4 plan 2c: `GET /api/pipelines/{id}/config-schema` — read-side
+    /// companion to `POST /api/pipelines/{id}/trigger` with the
+    /// optional `runConfig`. Returns the job's default config YAML (or
+    /// `hasConfig: false` for an `pl-…` id, with no `Dagster` call).
+    mod config_schema_route {
+        use std::collections::HashMap;
+
+        use wiremock::matchers::{body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use crate::config::Config;
+        use crate::state::AppState;
+
+        use super::*;
+
+        fn state_with_dagster(server_uri: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DAGSTER_URL".to_owned(), format!("{server_uri}/graphql"));
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        /// `pl-…` ids are authored pipelines — no `Dagster` schema, no
+        /// GraphQL call. The wiremock is set up to 500 any POST so a
+        /// regression that calls Dagster fails this test.
+        #[tokio::test]
+        async fn config_schema_for_pl_id_is_has_config_false_without_calling_dagster() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = config_schema(
+                State(state),
+                Some(Extension(fixture_user_principal())),
+                Path("pl-authored".to_owned()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&body).expect("valid JSON");
+            assert_eq!(v["pipelineId"], "pl-authored");
+            assert_eq!(v["hasConfig"], false);
+            assert!(v["defaultConfig"].is_null());
+            assert!(v["defaultConfigYaml"].is_null());
+        }
+
+        /// A non-`pl-…` id returns the YAML from Dagster's
+        /// `runConfigSchemaOrError` verbatim, alongside `hasConfig: true`
+        /// and `defaultConfig: null` (see [`config_schema`]'s doc
+        /// comment for the YAML-string-shape rationale).
+        #[tokio::test]
+        async fn config_schema_for_dagster_job_returns_yaml_and_has_config_true() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("runConfigSchemaOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "runConfigSchemaOrError": {
+                        "__typename": "RunConfigSchema",
+                        "rootDefaultYaml": "ops:\n  run_x:\n    config:\n      k: v\n"
+                    } }
+                })))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = config_schema(
+                State(state),
+                Some(Extension(fixture_user_principal())),
+                Path("ingest_job".to_owned()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&body).expect("valid JSON");
+            assert_eq!(v["pipelineId"], "ingest_job");
+            assert_eq!(v["hasConfig"], true);
+            assert!(v["defaultConfig"].is_null());
+            assert_eq!(
+                v["defaultConfigYaml"],
+                "ops:\n  run_x:\n    config:\n      k: v\n"
+            );
+        }
+
+        /// An unknown non-`pl-…` id (Dagster's
+        /// `PipelineNotFoundError`) is a 404 — the same answer
+        /// `pipeline.runnable` gives a job that doesn't exist. The
+        /// mutation check is the inverse of `trigger_with_config`: the
+        /// response MUST NOT contain a `message` field with
+        /// `Dagster`'s `Could not find pipeline named …` text.
+        #[tokio::test]
+        async fn config_schema_for_unknown_job_is_404_without_forwarding_dagster_message() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("runConfigSchemaOrError"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "runConfigSchemaOrError": { "__typename": "PipelineNotFoundError",
+                        "message": "Could not find pipeline named not_a_job" } }
+                })))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = config_schema(
+                State(state),
+                Some(Extension(fixture_user_principal())),
+                Path("not_a_job".to_owned()),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let body_text = std::str::from_utf8(&body).unwrap_or("");
+            assert!(
+                !body_text.contains("Could not find pipeline named"),
+                "404 body must NOT carry Dagster's message text, got {body_text}"
+            );
+        }
+
+        /// No principal — same 401 posture as `trigger`/`pause`/`resume`.
+        #[tokio::test]
+        async fn config_schema_without_principal_is_401() {
+            let state = state_with_dagster("http://127.0.0.1:1");
+            let response = config_schema(State(state), None, Path("ingest_job".to_owned())).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
     }
 
@@ -5275,6 +5686,263 @@ mod tests {
                 resp.0["reason"],
                 "unknown jobName; no runnable pipeline owns it"
             );
+        }
+    }
+
+    /// R4 plan 2c: `POST /api/pipelines/{id}/trigger` with the optional
+    /// `{ "runConfig": <object> }` body — validating the config BEFORE
+    /// launching, refusing with a structured 400 on `RunConfigValidation
+    /// Invalid`, and never echoing Dagster's free-form `message` text
+    /// back to the caller (AGENTS.md principle 4 + the plan's mutation
+    /// check).
+    mod trigger_with_config {
+        use wiremock::matchers::{body_partial_json, body_string_contains, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        use super::*;
+        use crate::config::Config;
+        use crate::routes::pipelines::TriggerBody;
+
+        /// Wiremock-backed `Dagster` only — no Postgres pool, so audit
+        /// writes are silently skipped (the `record_pipeline_audit`
+        /// helper's `state.pg.as_deref()` check) and the trigger can be
+        /// tested in isolation.
+        fn state_with_dagster(server_uri: &str) -> AppState {
+            let mut env = HashMap::new();
+            env.insert("DAGSTER_URL".to_owned(), format!("{server_uri}/graphql"));
+            // No DATABASE_URL — the audit best-effort path skips when
+            // there's no pool, so we don't need a real one here.
+            let config = Config::from_map(&env).expect("a valid test Config");
+            AppState::new(config)
+        }
+
+        /// No body at all (the existing curl corpus entry) MUST still
+        /// launch with no validation step — `Option<Json<TriggerBody>>`
+        /// returns `Ok(None)` on an empty body / missing content-type,
+        /// so the route falls through to `launch_run` without calling
+        /// `isPipelineConfigValid`. The wiremock is set up to fail the
+        /// request if any GraphQL call lands — the test passes only if
+        /// no `isPipelineConfigValid` mutation is sent.
+        #[tokio::test]
+        async fn trigger_with_no_body_skips_validation_and_uses_launch_run() {
+            let server = MockServer::start().await;
+            // Catch-all 200 mock for any launch mutation. If a
+            // validation call lands, this fires and the test STILL
+            // passes — the assertion below catches the difference
+            // (the wiremock body contains `launchRun` here; a
+            // validation call would have triggered `isPipelineConfigValid`
+            // instead).
+            Mock::given(method("POST"))
+                .and(body_string_contains("launchRun"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "launchRun": { "__typename": "LaunchRunSuccess",
+                        "run": { "runId": "r-no-body" } } }
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("isPipelineConfigValid"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let response = trigger(
+                State(state),
+                Some(Extension(fixture_user_principal())),
+                Path("ingest_job".to_owned()),
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&body).expect("valid JSON");
+            assert_eq!(v["id"], "r-no-body");
+        }
+
+        /// A VALID `runConfig` issues the
+        /// `launchRun(executionParams: { runConfigData: $cfg })` mutation
+        /// (NOT `launchRun` plain), and the wiremock verifies the
+        /// payload shape so a regression that drops `runConfigData`
+        /// (the caller's config never reaches Dagster) is caught here.
+        #[tokio::test]
+        async fn trigger_with_valid_run_config_calls_launch_run_with_config() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("isPipelineConfigValid"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "isPipelineConfigValid": {
+                        "__typename": "PipelineConfigValidationValid",
+                        "pipelineName": "ingest_job" } }
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("launchRun"))
+                .and(body_partial_json(json!({
+                    "variables": {
+                        "sel": { "repositoryName": "__repository__",
+                                 "repositoryLocationName": "dispar_orchestrate.definitions",
+                                 "pipelineName": "ingest_job" },
+                        "cfg": { "ops": { "run_x": { "config": { "k": 1 } } } },
+                    }
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "launchRun": { "__typename": "LaunchRunSuccess",
+                        "run": { "runId": "r-with-config" } } }
+                })))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let body = Json(TriggerBody {
+                run_config: Some(json!({ "ops": { "run_x": { "config": { "k": 1 } } } })),
+            });
+            let response = trigger(
+                State(state),
+                Some(Extension(fixture_user_principal())),
+                Path("ingest_job".to_owned()),
+                Some(body),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&body).expect("valid JSON");
+            assert_eq!(v["id"], "r-with-config");
+        }
+
+        /// An INVALID `runConfig` (Dagster returns
+        /// `RunConfigValidationInvalid` with structured `path` and
+        /// `reason` errors) returns a 400 whose body shape is exactly
+        /// `{ "errors": [{ "path": ["..."], "reason": "..." }] }`. The
+        /// mutation check from the plan is the assertion: the response
+        /// MUST NOT contain a `message` field — the `Dagster` client
+        /// deliberately does not deserialize it (see
+        /// [`lakehouse_dagster::DgClient::validate_run_config`]) and
+        /// the route body MUST NOT have one either. A regression that
+        /// adds `"message": e.message` here would silently let
+        /// `Dagster`'s free-form English text reach a response.
+        #[tokio::test]
+        async fn trigger_with_invalid_run_config_returns_400_with_path_and_reason_only() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("isPipelineConfigValid"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "isPipelineConfigValid": {
+                        "__typename": "RunConfigValidationInvalid",
+                        "errors": [
+                            { "path": ["ops", "run_x", "config", "k"],
+                              "reason": "RUNTIME_TYPE_MISMATCH",
+                              "message": "value '1' is not a String" }
+                        ] }
+                    }
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("launchRun"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let body = Json(TriggerBody {
+                run_config: Some(json!({ "ops": { "run_x": { "config": { "k": 1 } } } })),
+            });
+            let response = trigger(
+                State(state),
+                Some(Extension(fixture_user_principal())),
+                Path("ingest_job".to_owned()),
+                Some(body),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("collect body");
+            let v: Value = serde_json::from_slice(&body).expect("valid JSON");
+            // The whole response shape.
+            let errors = v["errors"].as_array().expect("errors array");
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0]["path"], json!(["ops", "run_x", "config", "k"]));
+            assert_eq!(errors[0]["reason"], "RUNTIME_TYPE_MISMATCH");
+            // MUTATION CHECK (the plan's test): no `message` field, ever.
+            assert!(
+                errors[0].get("message").is_none(),
+                "Dagster's free-form message MUST NOT be forwarded: got {}",
+                errors[0]
+            );
+        }
+
+        /// R4 plan 2c: `PipelineNotFoundError` from `isPipelineConfigValid`
+        /// is NOT a validation refusal — it's "this id is not a job".
+        /// The route falls through to `launch_run` (which surfaces the
+        /// same answer as a 422), so a typo'd id gets the same
+        /// 422-or-404 it got before this plan. The test proves the
+        /// validation step didn't 400 the request.
+        #[tokio::test]
+        async fn trigger_with_run_config_for_unknown_job_falls_through_to_launch_run() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("isPipelineConfigValid"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "isPipelineConfigValid": {
+                        "__typename": "PipelineNotFoundError" } }
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_string_contains("launchRun"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": { "launchRun": { "__typename": "LaunchRunSuccess",
+                        "run": { "runId": "r-unknown" } } }
+                })))
+                .mount(&server)
+                .await;
+
+            let state = state_with_dagster(&server.uri());
+            let body = Json(TriggerBody {
+                run_config: Some(json!({ "ops": {} })),
+            });
+            let response = trigger(
+                State(state),
+                Some(Extension(fixture_user_principal())),
+                Path("not_a_job".to_owned()),
+                Some(body),
+            )
+            .await;
+            // NOT a 400 — the validation did not refuse.
+            assert_ne!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        /// The `top_level_keys` helper used for the audit `configKeys`
+        /// field extracts only the top-level keys of a JSON object,
+        /// not the values — the audit column carries a structured
+        /// side-channel for "this run supplied a `connector_id` field",
+        /// never the field's actual id value.
+        #[test]
+        fn top_level_keys_extracts_keys_only_not_values() {
+            let v = json!({
+                "ops": { "run_x": { "config": { "secret": "real-secret" } } },
+                "resources": { "io": { "config": { "password": "real-pw" } } }
+            });
+            let mut keys = top_level_keys(&v);
+            keys.sort();
+            assert_eq!(keys, vec!["ops".to_owned(), "resources".to_owned()]);
+        }
+
+        /// `top_level_keys` for a non-object (null, array, string) is
+        /// the empty vec — the audit `configKeys` field is omitted when
+        /// the caller sent a non-object (or no body at all).
+        #[test]
+        fn top_level_keys_for_non_objects_is_empty() {
+            assert!(top_level_keys(&Value::Null).is_empty());
+            assert!(top_level_keys(&json!([])).is_empty());
+            assert!(top_level_keys(&json!("string")).is_empty());
         }
     }
 
