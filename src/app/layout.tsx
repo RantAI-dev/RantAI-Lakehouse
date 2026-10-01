@@ -52,7 +52,11 @@ export default function RootLayout({
         <link rel="icon" type="image/png" href="/icon-dark-32.png" media="(prefers-color-scheme: dark)" />
         <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
       </head>
-      <body>
+      {/* Browser extensions (Grammarly, ColorZilla, password managers) put
+          their own attributes on <body> before React hydrates; in dev that
+          showed as a permanent "1 Issue". This only covers <body>'s own
+          attributes, never a mismatch inside it. */}
+      <body suppressHydrationWarning>
         <ThemeProvider>
           <TooltipProvider>
             <AuthProvider>
