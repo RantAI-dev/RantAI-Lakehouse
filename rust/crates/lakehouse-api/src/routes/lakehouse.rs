@@ -255,13 +255,26 @@ fn snapshot_json(s: &SnapshotDetail) -> Value {
     })
 }
 
+fn field_json(f: &lakehouse_iceberg::rest::FieldDetail) -> Value {
+    json!({
+        "id": f.id,
+        "name": f.name,
+        "type": f.r#type,
+        "required": f.required,
+    })
+}
+
 fn table_detail_body(detail: &TableDetail) -> Value {
     json!({
-        "schema": detail.schema.iter().map(|f| json!({
-            "id": f.id,
-            "name": f.name,
-            "type": f.r#type,
-            "required": f.required,
+        "schema": detail.schema.iter().map(field_json).collect::<Vec<_>>(),
+        // The table's schema history, oldest first. A field keeps its `id`
+        // across versions, which is what lets a reader tell a rename from
+        // a drop-and-add.
+        "schemaVersions": detail.schema_versions.iter().map(|v| json!({
+            "schemaId": v.schema_id,
+            "sinceMs": v.since_ms,
+            "current": v.current,
+            "fields": v.fields.iter().map(field_json).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
         "partitionSpec": detail.partition_fields.iter().map(|f| json!({
             "sourceId": f.source_id,
@@ -1089,6 +1102,17 @@ mod tests {
                 total_data_files: Some(1),
                 stats: TableStats::default(),
             }],
+            schema_versions: vec![lakehouse_iceberg::rest::SchemaVersionDetail {
+                schema_id: 0,
+                fields: vec![FieldDetail {
+                    id: 1,
+                    name: "id".to_owned(),
+                    r#type: "long".to_owned(),
+                    required: true,
+                }],
+                since_ms: Some(1_700_000_000_000),
+                current: true,
+            }],
             snapshot_count: 1,
             metadata_log_count: 1,
             stats: TableStats {
@@ -1102,6 +1126,13 @@ mod tests {
 
         assert_eq!(body["schema"][0]["name"], json!("id"));
         assert_eq!(body["schema"][0]["required"], json!(true));
+        assert_eq!(body["schemaVersions"][0]["schemaId"], json!(0));
+        assert_eq!(
+            body["schemaVersions"][0]["sinceMs"],
+            json!(1_700_000_000_000_i64)
+        );
+        assert_eq!(body["schemaVersions"][0]["current"], json!(true));
+        assert_eq!(body["schemaVersions"][0]["fields"][0]["name"], json!("id"));
         assert_eq!(body["partitionSpec"][0]["sourceId"], json!(2));
         assert_eq!(body["snapshots"][0]["id"], json!("1"));
         assert_eq!(body["snapshots"][0]["parentId"], Value::Null);

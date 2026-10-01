@@ -11,6 +11,7 @@ mod ai;
 mod alerts;
 pub mod auth;
 mod catalog;
+mod catalog_governance;
 mod catalog_profile;
 mod catalog_query;
 mod catalog_source;
@@ -26,6 +27,7 @@ mod notifications;
 mod ops;
 mod overview;
 mod pipelines;
+mod quality;
 mod query;
 mod storage;
 pub(crate) mod support;
@@ -238,6 +240,12 @@ fn lakehouse_router() -> Router<AppState> {
 fn governance_static_router() -> Router<AppState> {
     Router::new()
         .route("/api/governance/lineage", get(governance::lineage))
+        // Evaluates one authored quality rule on request. Three segments
+        // deep, so it cannot collide with the `{kind}` capture.
+        .route(
+            "/api/governance/quality/{id}/run",
+            axum::routing::post(quality::run_rule),
+        )
         .route(
             // A dedicated route (WS3 item 17), mounted alongside `lineage`
             // immediately above — never a seventh `{kind}` dispatch value

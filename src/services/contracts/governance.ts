@@ -43,11 +43,27 @@ export type QualityRule = {
   dimension: string
   threshold: string
   severity: Severity
-  // `null` until something actually evaluates the rule — WS1 finding J18,
-  // no evaluator exists anywhere in the workspace yet.
+  // `null` until the rule is run (`POST /api/governance/quality/{id}/run`)
+  // — never a placeholder verdict.
   lastStatus: CheckStatus | null
   // `null` for the same reason as `lastStatus`.
   lastRunAt: string | null
+  /** What the latest run measured, e.g. "97.2% not null". Authored rules only. */
+  lastValue?: string | null
+  /**
+   * Whether the rule's threshold is written in the form the evaluator
+   * reads; `hint` says how to write one when it is not. Absent on a
+   * verdict a quality job recorded, which is not run from here.
+   */
+  evaluable?: boolean
+  hint?: string | null
+}
+
+/** What one run of a rule found (`routes::quality::run_rule`). */
+export type QualityRunResult = {
+  id: string
+  status: CheckStatus
+  value: string
 }
 
 export type LineageEdge = {
@@ -194,6 +210,8 @@ export interface GovernanceService {
     input: CreateQualityRuleInput,
     signal?: AbortSignal
   ): Promise<QualityRule>
+  /** Evaluate one authored rule now; needs `query:read`. */
+  runQualityRule(id: string, signal?: AbortSignal): Promise<QualityRunResult>
   createClassificationRule(
     input: CreateClassificationRuleInput,
     signal?: AbortSignal

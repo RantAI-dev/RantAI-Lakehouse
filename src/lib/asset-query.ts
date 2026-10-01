@@ -55,3 +55,33 @@ export function assetQueryStudioHref(a: Target & Pick<AssetDetail, "schema">) {
   })
   return `/query-studio?${params.toString()}`
 }
+
+/**
+ * Query Studio, opened on the starter query pinned to one Iceberg snapshot
+ * — the table as it was after that load. `null` when the asset is not
+ * read from its Iceberg table (a `silver.*` read has no snapshots to go
+ * back to), or when the id is not the plain number Iceberg issues.
+ *
+ * ClickHouse pins a snapshot with a query-level setting; Trino with the
+ * same `FOR VERSION AS OF` clause Query Studio's own time-travel control
+ * writes (`@/lib/snapshot-picker`).
+ */
+export function assetSnapshotQueryHref(
+  a: Target & Pick<AssetDetail, "schema">,
+  snapshotId: string
+): string | null {
+  if (!isIcebergCandidate(a) || !/^\d+$/.test(snapshotId)) return null
+  const target = assetQueryTarget(a)
+  const base = assetStarterSql(a)
+  let sql: string
+  if (target.engine === "trino") {
+    sql = base.replace(`FROM ${target.table}`, `FROM ${target.table} FOR VERSION AS OF ${snapshotId}`)
+  } else if (target.table.includes("`bronze.")) {
+    // The `DataLakeCatalog` name, e.g. icecat_api.`bronze.orders`.
+    sql = `${base}\nSETTINGS iceberg_snapshot_id = ${snapshotId}`
+  } else {
+    return null
+  }
+  const params = new URLSearchParams({ sql, engine: target.engine })
+  return `/query-studio?${params.toString()}`
+}

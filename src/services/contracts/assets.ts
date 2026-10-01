@@ -45,10 +45,35 @@ export type Asset = {
   columnCount: number
   // WS1 task 1.9 — not measured until WS2 reads Iceberg snapshot timestamps.
   freshnessLagSeconds: Measured
+  /**
+   * The age, in seconds, beyond which this asset is late, and whose word
+   * that is: `"sla"` for an authored freshness SLA (used as written),
+   * `"frequency"` for the registry's refresh cadence (one and a half
+   * intervals). Absent or `null` when nothing says how often the asset
+   * should refresh — its age is then shown without a verdict.
+   */
+  freshnessTargetSeconds?: number | null
+  freshnessTargetSource?: "sla" | "frequency" | null
   // WS1 task 1.9 — null in place of the empty-string placeholder for "unknown".
   lastUpdated: string | null
   health: Health
   residency: string
+  /**
+   * Recorded by people in the console (`asset_annotation`), not by the
+   * registry: who looks after the data day to day, and free-form tags.
+   * Absent when not set. A set annotation `owner`/`description` already
+   * replaces the registry's in `owner`/`description` above.
+   */
+  steward?: string | null
+  tags?: string[]
+}
+
+/** What `PUT /api/catalog/{id}/annotation` stores; `null` clears a field. */
+export type AssetAnnotation = {
+  owner: string | null
+  steward: string | null
+  tags: string[]
+  description: string | null
 }
 
 export type AssetColumn = {
@@ -62,18 +87,74 @@ export type AssetColumn = {
 export type AssetDetail = Asset & {
   schema: AssetColumn[]
   sample: Record<string, string>[]
+  /**
+   * Checks that name this asset: verdicts a quality job recorded
+   * (`origin: "observed"`) and rules people authored (`"rule"`). `status`
+   * and `lastRun` are `null` for a rule nobody has run — never a
+   * placeholder verdict.
+   */
   qualityChecks: {
     id: string
     name: string
     dimension: string
-    status: CheckStatus
-    lastRun: string
+    status: CheckStatus | null
+    lastRun: string | null
+    threshold?: string
+    severity?: string
+    origin?: "observed" | "rule"
+    /** What the latest run measured, e.g. "97.2% not null". */
+    value?: string | null
+    /** Authored rules: whether the threshold can be run, and how to write one that can. */
+    evaluable?: boolean
+    hint?: string | null
   }[]
-  policySummary: { id: string; name: string; effect: string }[]
-  // WS1 task 1.9 — nothing counts per-asset queries or users yet.
+  /**
+   * Policies whose condition binds one of this asset's tables
+   * (`routes::catalog_governance`). `roles` and `rowFilter` are sent only
+   * to a caller with `policy:read`; `mask` also to a caller the policy
+   * applies to, who sees those columns as `***` anyway.
+   */
+  policySummary: {
+    id: string
+    name: string
+    effect: string
+    kind?: string
+    /** `ready` is enforced; `draft` is not. */
+    status?: string
+    /** The table the policy binds, e.g. `silver.orders`. */
+    table?: string
+    /** Enforced on the caller's own reads. */
+    appliesToYou?: boolean
+    roles?: string[]
+    mask?: string[]
+    rowFilter?: string | null
+  }[]
+  /**
+   * Queries that read this asset in the last seven days, by anyone:
+   * how many, by how many people, and the average latency of the completed
+   * ones. `null` only when the query history could not be read — a table
+   * nobody queried is a measured zero.
+   */
   usage: { queries7d: number; users7d: number; avgLatencyMs: number } | null
-  recentQueries: { id: string; sql: string; user: string; at: string }[]
-  dependents: { id: string; name: string; kind: string }[]
+  /**
+   * The caller's own recent queries on this asset. Other people's query
+   * text is never sent: SQL can carry literals.
+   */
+  recentQueries: {
+    id: string
+    sql: string
+    user: string
+    at: string
+    status?: string
+    /** The audit event recorded for the run, when there is one. */
+    auditEventId?: string | null
+  }[]
+  /**
+   * Saved queries and dashboards whose SQL reads this asset
+   * (`kind`: `"saved query"`, `"dashboard"`), each only for a caller who
+   * may open it. Pipelines come from the lineage graph instead.
+   */
+  dependents: { id: string; name: string; kind: string; detail?: string }[]
   changeHistory: { id: string; at: string; actor: string; summary: string }[]
   snapshots: { id: string; committedAt: string; operation: string; records: number }[]
   schemaVersions: { version: number; at: string; change: string }[]
@@ -94,6 +175,24 @@ export type AssetDetail = Asset & {
    * does not set it. Consumers must treat `undefined` exactly like `null`.
    */
   tableName?: string | null
+  /**
+   * The asset's annotation exactly as stored — what the edit form holds —
+   * or `null` when nobody has annotated it. Absent from an older API build.
+   */
+  annotation?: AssetAnnotation | null
+  /**
+   * What the registry itself says, before any annotation replaced it: what
+   * clearing an annotated field falls back to.
+   */
+  registry?: { owner: string | null; description: string | null }
+  /**
+   * The `<namespace>.<table>` key the lineage graph, policies and quality
+   * rules name this asset by — `bronze.orders` for a Bronze dataset whose
+   * `id` is the registry slug, the id itself for `silver.*`/`serving.*`.
+   * `null` when the registry recorded no table, absent from an older API
+   * build; fall back to `id` then.
+   */
+  tableKey?: string | null
   /**
    * `true` when `sample` is empty because the caller lacks `query:read`
    * (the API withholds rows from `catalog:read`-only callers), not
@@ -234,6 +333,11 @@ export interface AssetService {
    * dead-fixture reason as `requestAccess` below.
    */
   getAssetProfile?(id: string, signal?: AbortSignal): Promise<AssetProfile>
+  /**
+   * `PUT /api/catalog/{id}/annotation` — replace the asset's annotation
+   * (needs `catalog:write`). Optional for the same dead-fixture reason.
+   */
+  updateAnnotation?(id: string, input: AssetAnnotation, signal?: AbortSignal): Promise<void>
   listNamespaces(signal?: AbortSignal): Promise<CatalogNamespace[]>
   /**
    * `POST /api/catalog/{id}/access-request` — ask for a permission not

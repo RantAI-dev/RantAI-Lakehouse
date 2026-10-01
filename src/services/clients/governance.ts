@@ -2,6 +2,7 @@ import type {
   GovernanceService,
   Policy,
   QualityRule,
+  QualityRunResult,
   LineageGraph,
   AuditEvent,
   ClassificationRule,
@@ -107,6 +108,13 @@ export const clickhouseGovernanceService: GovernanceService = {
   },
   createQualityRule(input: CreateQualityRuleInput, signal) {
     return post<QualityRule>("/api/governance/quality", input, signal);
+  },
+  runQualityRule(id, signal) {
+    return post<QualityRunResult>(
+      `/api/governance/quality/${encodeURIComponent(id)}/run`,
+      undefined,
+      signal
+    );
   },
   createClassificationRule(input: CreateClassificationRuleInput, signal) {
     return post<ClassificationRule>("/api/governance/classification", input, signal);

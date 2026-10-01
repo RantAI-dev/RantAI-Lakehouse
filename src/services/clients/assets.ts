@@ -98,6 +98,16 @@ export const clickhouseAssetService: AssetService = {
     if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to profile asset");
     return json as AssetProfile;
   },
+  async updateAnnotation(id, input, signal) {
+    const res = await apiFetch(`/api/catalog/${encodeURIComponent(id)}/annotation`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+      signal,
+    });
+    const json = await res.json().catch(() => null);
+    if (!res.ok) throw errorFor(res.status, json?.error ?? "Failed to save the asset's details");
+  },
   async listNamespaces(signal) {
     return (await loadCatalog(undefined, signal)).namespaces;
   },

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test"
-import { assetQueryStudioHref, assetQueryTarget, assetStarterSql } from "./asset-query"
+import {
+  assetQueryStudioHref,
+  assetQueryTarget,
+  assetSnapshotQueryHref,
+  assetStarterSql,
+} from "./asset-query"
 
 type Target = Parameters<typeof assetStarterSql>[0]
 
@@ -61,5 +66,32 @@ describe("assetQueryStudioHref", () => {
     expect(url.pathname).toBe("/query-studio")
     expect(url.searchParams.get("engine")).toBe("trino")
     expect(url.searchParams.get("sql")).toBe(assetStarterSql(iceberg))
+  })
+})
+
+describe("assetSnapshotQueryHref", () => {
+  const sqlOf = (href: string | null) => new URL(href ?? "", "http://x").searchParams.get("sql")
+
+  it("pins a ClickHouse read of the Iceberg table with a query setting", () => {
+    const target = { engine: "clickhouse", table: "icecat_api.`bronze.demo_orders_param`" } as const
+    const href = assetSnapshotQueryHref({ ...iceberg, queryTarget: target }, "248842615326512766")
+    expect(sqlOf(href)).toEndWith("LIMIT 100\nSETTINGS iceberg_snapshot_id = 248842615326512766")
+    expect(href).toContain("engine=clickhouse")
+  })
+
+  it("pins a Trino read with FOR VERSION AS OF", () => {
+    expect(sqlOf(assetSnapshotQueryHref(iceberg, "42"))).toContain(
+      "FROM iceberg.bronze.demo_orders_param FOR VERSION AS OF 42\nLIMIT 100"
+    )
+  })
+
+  it("offers nothing when the asset is read from Silver, or is not Iceberg", () => {
+    const silver = { engine: "clickhouse", table: "silver.`demo_orders_param`" } as const
+    expect(assetSnapshotQueryHref({ ...iceberg, queryTarget: silver }, "42")).toBeNull()
+    expect(assetSnapshotQueryHref(plain, "42")).toBeNull()
+  })
+
+  it("refuses an id that is not a plain number", () => {
+    expect(assetSnapshotQueryHref(iceberg, "42; DROP TABLE x")).toBeNull()
   })
 })

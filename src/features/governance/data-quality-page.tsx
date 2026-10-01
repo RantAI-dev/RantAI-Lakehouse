@@ -56,6 +56,12 @@ export function DataQualityPage() {
     )
   )
 
+  const runCheck = useServiceAction(
+    withNotify(
+      { success: "Check ran", error: "The check could not be run" },
+      (signal, id: string) => governanceService.runQualityRule(id, signal)
+    )
+  )
   const columns = React.useMemo(
     () => getDataQualityColumns({ onSelect: setSelected }),
     []
@@ -104,6 +110,19 @@ export function DataQualityPage() {
     setFormDimension("")
     setThreshold("")
     setSeverity("medium")
+  }
+
+  async function handleRun(rule: QualityRule) {
+    const result = await runCheck.run(rule.id)
+    if (!result) return
+    // The drawer shows what just ran; the list catches up behind it.
+    setSelected({
+      ...rule,
+      lastStatus: result.status,
+      lastValue: result.value,
+      lastRunAt: new Date().toISOString(),
+    })
+    state.reload()
   }
 
   async function handleCreate() {
@@ -158,14 +177,22 @@ export function DataQualityPage() {
           <>
             <div className="flex items-center gap-2">
               {selected.lastStatus === null ? (
-                // A rule nobody has evaluated has no verdict to badge —
-                // render that honestly instead of guessing a `CheckStatus`.
-                <span className="text-muted-foreground">Not evaluated</span>
+                // A rule nobody has run has no verdict to badge — render
+                // that honestly instead of guessing a `CheckStatus`.
+                <span className="text-muted-foreground">
+                  {selected.evaluable === false ? "Can't be run" : "Not run yet"}
+                </span>
               ) : (
                 <CheckBadge status={selected.lastStatus} />
               )}
               <SeverityBadge severity={selected.severity} />
+              {selected.lastValue ? (
+                <span className="text-sm text-muted-foreground">{selected.lastValue}</span>
+              ) : null}
             </div>
+            {selected.evaluable === false && selected.hint ? (
+              <p className="text-sm text-muted-foreground">{selected.hint}</p>
+            ) : null}
             <MetadataList
               items={[
                 { label: "Asset", value: selected.asset },
@@ -177,16 +204,26 @@ export function DataQualityPage() {
                 },
               ]}
             />
-            <Button
-              variant="outline"
-              size="sm"
-              className="self-start"
-              render={
-                <Link href={`/data?q=${encodeURIComponent(selected.asset)}`} />
-              }
-            >
-              Inspect in Data Explorer
-            </Button>
+            <div className="flex flex-wrap gap-2">
+              {selected.evaluable ? (
+                <Button
+                  size="sm"
+                  onClick={() => void handleRun(selected)}
+                  disabled={runCheck.status === "pending"}
+                >
+                  {runCheck.status === "pending" ? "Running…" : "Run check"}
+                </Button>
+              ) : null}
+              <Button
+                variant="outline"
+                size="sm"
+                render={
+                  <Link href={`/data?q=${encodeURIComponent(selected.asset)}`} />
+                }
+              >
+                Inspect in Data Explorer
+              </Button>
+            </div>
           </>
         ) : null}
       </DetailDrawer>
@@ -236,8 +273,15 @@ export function DataQualityPage() {
             id="qr-threshold"
             value={threshold}
             onChange={(e) => setThreshold(e.target.value)}
-            placeholder=">= 99%"
+            placeholder="email not null >= 99%"
           />
+          <p className="text-xs text-muted-foreground">
+            To be runnable, write it as: <span className="font-mono">rows &gt;= 1000</span>,{" "}
+            <span className="font-mono">column not null &gt;= 95%</span>,{" "}
+            <span className="font-mono">column unique</span> or{" "}
+            <span className="font-mono">column between 0 and 100</span>. Name the asset as
+            silver.table, serving.table or bronze.table.
+          </p>
         </div>
         <div className="space-y-1.5">
           <Label htmlFor="qr-severity">Severity</Label>

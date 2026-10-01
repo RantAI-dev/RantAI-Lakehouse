@@ -1,0 +1,570 @@
+// Ten tabs became seven, and the open one lives in `?tab=` so a refresh or
+// a shared link lands on it. Each tab shows what is recorded about the
+// asset rather than a list the API always sends empty: Lineage draws the
+// recorded graph (and says so when there is none), Activity lists the
+// Iceberg table's snapshots with a query for each, Schema is one table in
+// the table's own order, and Quality never invents a verdict for a rule
+// nothing has run.
+const url = { search: "" }
+mock.module("next/navigation", () => ({
+  usePathname: () => "/data/assets/demo-orders",
+  useSearchParams: () => new URLSearchParams(url.search),
+  useRouter: () => ({
+    push: () => {},
+    replace: () => {},
+    refresh: () => {},
+    back: () => {},
+    forward: () => {},
+    prefetch: () => {},
+  }),
+}))
+
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
+import { AuthProvider } from "@/features/auth/auth-provider"
+import type { AssetDetail } from "@/services/contracts/assets"
+import { AssetDetailTabs } from "./asset-detail-tabs"
+
+afterEach(() => {
+  cleanup()
+  mock.restore()
+  url.search = ""
+})
+
+const BRONZE: AssetDetail = {
+  id: "demo-orders",
+  name: "Demo Orders",
+  namespace: "primer",
+  type: "iceberg-table",
+  layer: "raw",
+  tier: "warm",
+  classification: "internal",
+  owner: "dagster",
+  domain: "pariwisata",
+  description: "Orders ingested from Postgres.",
+  format: "Apache Iceberg (Parquet)",
+  engine: "hot-store",
+  rows: 2000,
+  sizeBytes: 40287,
+  columnCount: 2,
+  freshnessLagSeconds: 3600,
+  lastUpdated: "2026-09-23T04:57:42Z",
+  health: "unknown",
+  residency: "id-jakarta",
+  // Registry order: alphabetical. The table's own order is id, amount.
+  schema: [
+    { name: "amount", dataType: "Decimal(12, 2)" },
+    { name: "id", dataType: "Int64" },
+  ],
+  sample: [{ id: "1", amount: "1.5" }],
+  qualityChecks: [],
+  policySummary: [],
+  usage: null,
+  recentQueries: [],
+  dependents: [],
+  changeHistory: [],
+  snapshots: [],
+  schemaVersions: [],
+  upstream: [],
+  downstream: [],
+  tableName: "demo_orders",
+  tableKey: "bronze.demo_orders",
+  queryTarget: { engine: "clickhouse", table: "icecat_api.`bronze.demo_orders`" },
+}
+
+const TABLE = {
+  schema: [
+    { id: 1, name: "id", type: "long", required: true },
+    { id: 2, name: "amount", type: "decimal(12, 2)", required: false },
+    { id: 3, name: "_ingested_at", type: "timestamptz", required: false },
+  ],
+  schemaVersions: [
+    {
+      schemaId: 0,
+      sinceMs: Date.parse("2026-09-20T00:00:00Z"),
+      current: false,
+      fields: [
+        { id: 1, name: "id", type: "long", required: true },
+        { id: 3, name: "_ingested_at", type: "timestamptz", required: false },
+      ],
+    },
+    {
+      schemaId: 1,
+      sinceMs: Date.parse("2026-09-23T03:37:39Z"),
+      current: true,
+      fields: [
+        { id: 1, name: "id", type: "long", required: true },
+        { id: 2, name: "amount", type: "decimal(12, 2)", required: false },
+        { id: 3, name: "_ingested_at", type: "timestamptz", required: false },
+      ],
+    },
+  ],
+  partitionSpec: [{ sourceId: 3, transform: "day", name: "_ingested_at_day" }],
+  properties: {},
+  snapshots: [
+    {
+      id: "248842615326512766",
+      parentId: null,
+      timestampMs: Date.parse("2026-09-23T03:37:39Z"),
+      operation: "append",
+      summary: { addedRecords: 2000, deletedRecords: null, totalRecords: 2000, totalDataFiles: 1 },
+    },
+  ],
+  stats: {
+    fileCount: 1,
+    smallFileCount: null,
+    smallFileThresholdBytes: null,
+    recordCount: 2000,
+    totalBytes: 40287,
+    snapshotCount: 1,
+    metadataLogCount: 1,
+  },
+}
+
+/** conn → bronze.demo_orders → pipeline → silver.orders_clean */
+const GRAPH = {
+  focus: "bronze.demo_orders",
+  focusIds: ["bronze.demo_orders"],
+  nodes: [
+    { id: "conn-pg:public.orders", label: "public.orders", kind: "source", sublabel: "Postgres", ref: "conn-pg", depth: 0 },
+    { id: "bronze.demo_orders", label: "bronze.demo_orders", kind: "bronze", sublabel: null, ref: "demo-orders", depth: 1 },
+    { id: "pl-clean", label: "orders_clean", kind: "pipeline", sublabel: "ready", ref: "pl-clean", depth: 2 },
+    { id: "silver.orders_clean", label: "silver.orders_clean", kind: "silver", sublabel: null, ref: "silver.orders_clean", depth: 3 },
+  ],
+  edges: [
+    { id: "a", from: "conn-pg:public.orders", to: "bronze.demo_orders", kind: "ingest" },
+    { id: "b", from: "bronze.demo_orders", to: "pl-clean", kind: "read" },
+    { id: "c", from: "pl-clean", to: "silver.orders_clean", kind: "write" },
+  ],
+  columnMappings: [
+    { source: "bronze.demo_orders.amount", target: "silver.orders_clean.amount_usd", transform: "renamed" },
+  ],
+  supported: true,
+  note: "Traced from connector ingest specs and pipelines built in the console.",
+}
+
+const NO_LINEAGE = { ...GRAPH, focusIds: [], nodes: [], edges: [], columnMappings: [] }
+
+const PROFILE = {
+  supported: true,
+  source: "bronze.demo_orders",
+  sourceKind: "iceberg",
+  rowsProfiled: 2000,
+  rowLimit: 100000,
+  sampled: false,
+  columnsCapped: false,
+  columns: [
+    { name: "id", dataType: "Int64", profiled: true, nullFraction: 0, distinctCount: 2000, min: "1", max: "2000", topValues: [] },
+    { name: "amount", dataType: "Decimal(12, 2)", profiled: true, nullFraction: 0.25, distinctCount: 40, min: "1.5", max: "99", topValues: [] },
+  ],
+}
+
+function json(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  })
+}
+
+function stubApi({
+  permissions = ["*:*"],
+  lineage = GRAPH,
+}: { permissions?: string[]; lineage?: unknown } = {}) {
+  return spyOn(globalThis, "fetch").mockImplementation((async (input: RequestInfo | URL, init?: RequestInit) => {
+    const path = String(input)
+    const method = init?.method ?? "GET"
+    if (method === "PUT" && path.endsWith("/annotation")) return json({ ok: true })
+    if (method === "POST" && path.endsWith("/run")) return json({ id: "q2", status: "passed", value: "0 repeated values in 50 rows" })
+    if (method === "POST" && path.endsWith("/api/governance/quality")) return json({ id: "new" }, 201)
+    if (path.includes("/api/auth/me")) {
+      return json({ id: "u1", name: "Reader", email: null, roles: ["Analyst"], permissions, tenants: [] })
+    }
+    if (path.includes("/api/governance/lineage")) return json(lineage)
+    if (path.endsWith("/profile")) return json(PROFILE)
+    if (path.endsWith("/maintenance")) return json({ configured: false })
+    if (path.includes("/api/lakehouse/tables/bronze/demo_orders")) return json(TABLE)
+    return json({ error: "not stubbed" }, 404)
+  }) as unknown as typeof fetch)
+}
+
+function renderTabs(asset: AssetDetail = BRONZE, onAssetChanged: () => void = () => {}) {
+  return render(
+    <AuthProvider>
+      <AssetDetailTabs asset={asset} onAssetChanged={onAssetChanged} />
+    </AuthProvider>
+  )
+}
+
+/** The `[method, path, body]` of every write the page sent. */
+function writes(fetchSpy: ReturnType<typeof stubApi>) {
+  return fetchSpy.mock.calls
+    .filter((c) => (c[1]?.method ?? "GET") !== "GET")
+    .map((c) => [c[1]?.method, String(c[0]), c[1]?.body ? JSON.parse(String(c[1].body)) : undefined])
+}
+
+function tabNames() {
+  return screen.getAllByRole("tab").map((t) => t.textContent)
+}
+
+describe("AssetDetailTabs", () => {
+  it("shows seven tabs, counting only what has a count", async () => {
+    stubApi()
+    renderTabs()
+
+    // Source upstream; the pipeline and its Silver table downstream.
+    await waitFor(() =>
+      expect(tabNames()).toEqual([
+        "Overview",
+        "Schema2",
+        "Sample",
+        "Quality0",
+        "Access0",
+        "Lineage3",
+        "Activity",
+      ])
+    )
+  })
+
+  it("opens the tab the URL names, and falls back to the overview for one it does not know", () => {
+    stubApi()
+    url.search = "tab=access"
+    renderTabs()
+    expect(screen.getByRole("tab", { name: /Access/ }).getAttribute("aria-selected")).toBe("true")
+    cleanup()
+
+    url.search = "tab=snapshots"
+    renderTabs()
+    expect(screen.getByRole("tab", { name: "Overview" }).getAttribute("aria-selected")).toBe("true")
+  })
+
+  it("writes the picked tab to the URL, and drops it for the overview", () => {
+    stubApi()
+    const replace = spyOn(window.history, "replaceState")
+    renderTabs()
+
+    fireEvent.click(screen.getByRole("tab", { name: /Access/ }))
+    expect(replace).toHaveBeenLastCalledWith(null, "", "/data/assets/demo-orders?tab=access")
+    expect(screen.getByText("No policy binds this asset")).toBeTruthy()
+
+    fireEvent.click(screen.getByRole("tab", { name: "Overview" }))
+    expect(replace).toHaveBeenLastCalledWith(null, "", "/data/assets/demo-orders")
+  })
+})
+
+describe("Lineage tab", () => {
+  it("draws the recorded graph around the asset, by its table key", async () => {
+    const fetchSpy = stubApi()
+    url.search = "tab=lineage"
+    renderTabs()
+
+    const graph = await screen.findByRole("list", { name: "Lineage graph" })
+    expect(within(graph).getAllByRole("listitem").map((n) => n.textContent)).toEqual([
+      "Sourcepublic.ordersPostgres",
+      "Bronzebronze.demo_orders",
+      "Pipelineorders_cleanReady",
+      "Silversilver.orders_clean",
+    ])
+    // Its neighbours open their own pages; the asset itself is not a link to itself.
+    expect(within(graph).getByText("orders_clean").closest("a")?.getAttribute("href")).toBe("/pipelines/pl-clean")
+    expect(within(graph).getByText("bronze.demo_orders").closest("a")).toBeNull()
+    expect(fetchSpy.mock.calls.some((c) => String(c[0]).endsWith("?focus=bronze.demo_orders"))).toBe(true)
+
+    expect(screen.getByText("Open lineage graph").closest("a")?.getAttribute("href")).toBe(
+      "/lineage?focus=bronze.demo_orders"
+    )
+    expect(screen.getByText("bronze.demo_orders.amount")).toBeTruthy()
+    // The pipeline that reads it is a dependent.
+    const dependents = screen.getByText("Dependents").closest("[data-slot=card]") as HTMLElement
+    expect(within(dependents).getByText("orders_clean")).toBeTruthy()
+  })
+
+  it("says nothing is recorded, and why, instead of drawing an empty graph", async () => {
+    stubApi({ lineage: NO_LINEAGE })
+    url.search = "tab=lineage"
+    renderTabs()
+
+    expect(await screen.findByText("No lineage recorded for bronze.demo_orders")).toBeTruthy()
+    expect(screen.getByText(GRAPH.note)).toBeTruthy()
+    expect(screen.getByRole("tab", { name: /Lineage/ }).textContent).toBe("Lineage0")
+  })
+
+  it("asks for nothing, and says what is missing, without lineage:read", async () => {
+    const fetchSpy = stubApi({ permissions: ["catalog:read", "query:read"] })
+    url.search = "tab=lineage"
+    renderTabs()
+
+    expect(await screen.findByText("Lineage needs lineage access")).toBeTruthy()
+    expect(fetchSpy.mock.calls.some((c) => String(c[0]).includes("/api/governance/lineage"))).toBe(false)
+  })
+})
+
+describe("Activity tab", () => {
+  it("lists the Iceberg table's snapshots, each with a query pinned to it", async () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs()
+
+    const row = (await screen.findByText("append")).closest("tr") as HTMLElement
+    expect(within(row).getByText("+2,000")).toBeTruthy()
+    expect(within(row).getByText("248842615326512766")).toBeTruthy()
+    const href = within(row).getByText("Query this version").closest("a")?.getAttribute("href") ?? ""
+    expect(decodeURIComponent(href)).toContain("iceberg_snapshot_id+=+248842615326512766")
+  })
+
+  it("says a ClickHouse table keeps no snapshots, rather than that it has none", () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({
+      ...BRONZE,
+      id: "silver.orders",
+      type: "table",
+      layer: "silver",
+      tableName: undefined,
+      tableKey: "silver.orders",
+      queryTarget: undefined,
+    })
+
+    expect(screen.getByText("Only Iceberg tables keep snapshots")).toBeTruthy()
+  })
+})
+
+describe("Schema tab", () => {
+  it("lists columns in the table's order with their statistics, and system columns apart", async () => {
+    stubApi()
+    url.search = "tab=schema"
+    renderTabs()
+
+    await screen.findByText("System columns")
+    const columns = screen.getByText("Columns").closest("[data-slot=card]") as HTMLElement
+    await waitFor(() => expect(within(columns).getByText("25.0%")).toBeTruthy())
+    const names = within(columns)
+      .getAllByRole("row")
+      .slice(1)
+      .map((r) => r.querySelector("td")?.textContent)
+    expect(names).toEqual(["id", "amount"])
+    // `amount` is optional in Iceberg; `id` is required.
+    const amount = within(columns).getByText("amount").closest("tr") as HTMLElement
+    expect(within(amount).getByText("Yes")).toBeTruthy()
+
+    const system = screen.getByText("System columns").closest("[data-slot=card]") as HTMLElement
+    expect(within(system).getByText("_ingested_at")).toBeTruthy()
+    expect(within(system).getByText("partition · day")).toBeTruthy()
+
+    // The table's own schema history, newest first, in words.
+    const versions = screen.getByText("Schema versions").closest("[data-slot=card]") as HTMLElement
+    expect(within(versions).getAllByRole("listitem").map((li) => li.textContent)).toEqual([
+      expect.stringContaining("v1currentAdded amount (decimal(12, 2))"),
+      expect.stringContaining("v0Created with 2 columns"),
+    ])
+  })
+})
+
+describe("Quality tab", () => {
+  const checks: AssetDetail["qualityChecks"] = [
+    { id: "q1", name: "row_count", dimension: "completeness", status: "failed", lastRun: "2026-09-30T00:00:00Z", origin: "observed" },
+    { id: "q2", name: "orders_uniqueness", dimension: "uniqueness", status: null, lastRun: null, threshold: "id unique", severity: "high", origin: "rule" },
+  ]
+
+  it("turns the count red when a check fails", async () => {
+    stubApi()
+    renderTabs({ ...BRONZE, qualityChecks: checks })
+
+    const count = screen.getByRole("tab", { name: /Quality/ }).querySelector("span:last-child")
+    expect(count?.textContent).toBe("2")
+    expect(count?.className).toContain("text-destructive")
+  })
+
+  it("shows a rule nothing has run as not evaluated, never as a verdict", () => {
+    stubApi()
+    url.search = "tab=quality"
+    renderTabs({ ...BRONZE, qualityChecks: checks })
+
+    const rule = screen.getByText("orders_uniqueness").closest("tr") as HTMLElement
+    expect(within(rule).getByText("Not run yet")).toBeTruthy()
+    expect(within(rule).getByText("Never")).toBeTruthy()
+    expect(screen.getByText("1 failed · 1 without a result")).toBeTruthy()
+  })
+
+  it("marks a rule the evaluator cannot read, with how to rewrite it", () => {
+    stubApi()
+    url.search = "tab=quality"
+    renderTabs({
+      ...BRONZE,
+      qualityChecks: [
+        { id: "q3", name: "email_complete", dimension: "completeness", status: null, lastRun: null, threshold: ">= 95%", origin: "rule", evaluable: false, hint: "Write the threshold as one of: …" },
+      ],
+    })
+
+    const rule = screen.getByText("email_complete").closest("tr") as HTMLElement
+    expect(within(rule).getByText("Can't be run")).toBeTruthy()
+    expect(within(rule).getByText("Write the threshold as one of: …")).toBeTruthy()
+    // Nothing runnable: no button to run nothing.
+    expect(screen.queryByText("Run checks")).toBeNull()
+  })
+
+  it("runs the authored rules that can be run, then reloads the asset", async () => {
+    const fetchSpy = stubApi()
+    const reloaded = mock(() => {})
+    url.search = "tab=quality"
+    renderTabs({ ...BRONZE, qualityChecks: checks }, reloaded)
+
+    fireEvent.click(await screen.findByText("Run checks"))
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    // The observed check (q1) is the quality job's to run, not this page's.
+    expect(writes(fetchSpy)).toEqual([["POST", "/api/governance/quality/q2/run", undefined]])
+  })
+
+  it("adds a rule in the form the evaluator reads, against the table key", async () => {
+    const fetchSpy = stubApi()
+    const reloaded = mock(() => {})
+    url.search = "tab=quality"
+    renderTabs(BRONZE, reloaded)
+
+    fireEvent.click(screen.getByText("Add rule"))
+    fireEvent.change(screen.getByLabelText("Check"), { target: { value: "unique" } })
+    fireEvent.change(screen.getByLabelText("Column"), { target: { value: "id" } })
+    expect(screen.getByText("id unique")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Add rule" }))
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)).toEqual([
+      [
+        "POST",
+        "/api/governance/quality",
+        { name: "demo_orders_id_unique", asset: "bronze.demo_orders", dimension: "uniqueness", threshold: "id unique", severity: "medium" },
+      ],
+    ])
+  })
+})
+
+describe("Access tab", () => {
+  it("shows what the reader may do and the policies bound to the asset", async () => {
+    stubApi({ permissions: ["catalog:read", "query:read"] })
+    url.search = "tab=access"
+    renderTabs({
+      ...BRONZE,
+      schema: [{ name: "email", dataType: "String", masked: true }],
+      policySummary: [
+        { id: "p1", name: "mask-email", effect: "Permit with obligation", kind: "Row filter", status: "ready", table: "bronze.demo_orders", appliesToYou: true, mask: ["email"] },
+      ],
+    })
+
+    const lineage = (await screen.findByText("lineage:read")).closest("li") as HTMLElement
+    expect(within(lineage).getByText("Not granted")).toBeTruthy()
+    await waitFor(() => {
+      const rows = screen.getByText("query:read").closest("li") as HTMLElement
+      expect(within(rows).getByText("Granted")).toBeTruthy()
+    })
+
+    const policy = screen.getByText("mask-email").closest("li") as HTMLElement
+    expect(within(policy).getByText("Applies to you")).toBeTruthy()
+    // No `policy:read`: the name is not a link into the policies page.
+    expect(screen.getByText("mask-email").closest("a")).toBeNull()
+  })
+})
+
+describe("Activity tab: usage and history", () => {
+  it("counts everyone's queries, lists only the reader's own, and shows who changed what", async () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({
+      ...BRONZE,
+      usage: { queries7d: 12, users7d: 3, avgLatencyMs: 240 },
+      recentQueries: [
+        { id: "q-9", sql: "SELECT count() FROM bronze.demo_orders", user: "Reader", at: "2026-09-30T08:00:00Z", status: "completed", auditEventId: "audit-77" },
+      ],
+      changeHistory: [{ id: "audit-1", at: "2026-09-30T09:00:00Z", actor: "Rina", summary: "Edited description, owner" }],
+    })
+
+    const usage = screen.getByText("Usage (7d)").closest("[data-slot=card]") as HTMLElement
+    expect(within(usage).getByText("12")).toBeTruthy()
+    expect(within(usage).getByText("240 ms")).toBeTruthy()
+    const mine = within(usage).getByText("SELECT count() FROM bronze.demo_orders").closest("li") as HTMLElement
+    expect(within(mine).getByText("Audit").getAttribute("href")).toBe("/audit?event=audit-77")
+
+    const history = screen.getByText("Change history").closest("[data-slot=card]") as HTMLElement
+    expect(within(history).getByText("Rina")).toBeTruthy()
+    expect(within(history).getByText("Edited description, owner")).toBeTruthy()
+  })
+
+  it("says nobody queried the table, rather than that usage is unknown", () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({ ...BRONZE, usage: { queries7d: 0, users7d: 0, avgLatencyMs: 0 } })
+    expect(screen.getByText("No queries in the last 7 days")).toBeTruthy()
+  })
+})
+
+describe("Lineage tab: dependents", () => {
+  it("links a saved query and a dashboard that read the asset", async () => {
+    stubApi({ lineage: NO_LINEAGE })
+    url.search = "tab=lineage"
+    renderTabs({
+      ...BRONZE,
+      dependents: [
+        { id: "sq-1", name: "Orders by day", kind: "saved query" },
+        { id: "b_42", name: "Sales board", kind: "dashboard", detail: "3 charts" },
+      ],
+    })
+
+    const card = (await screen.findByText("Dependents")).closest("[data-slot=card]") as HTMLElement
+    expect(within(card).getByText("Orders by day").closest("a")?.getAttribute("href")).toBe("/query-studio?saved=sq-1")
+    expect(within(card).getByText("Sales board").closest("a")?.getAttribute("href")).toBe("/dashboards?board=b_42")
+    expect(within(card).getByText("3 charts")).toBeTruthy()
+    await waitFor(() => expect(screen.getByRole("tab", { name: /Lineage/ }).textContent).toBe("Lineage2"))
+  })
+})
+
+describe("About card", () => {
+  it("lets someone with catalog:write edit the details, and reloads the asset", async () => {
+    const fetchSpy = stubApi()
+    const reloaded = mock(() => {})
+    renderTabs(
+      {
+        ...BRONZE,
+        owner: "Data Platform",
+        steward: "Rina",
+        tags: ["finance"],
+        annotation: { owner: "Data Platform", steward: "Rina", tags: ["finance"], description: null },
+        registry: { owner: "dagster", description: "Orders ingested from Postgres." },
+      },
+      reloaded
+    )
+
+    expect(screen.getByText("finance")).toBeTruthy()
+    fireEvent.click(await screen.findByText("Edit"))
+    // The form holds the annotation; the registry's words are the placeholder.
+    expect((screen.getByLabelText("Owner") as HTMLInputElement).value).toBe("Data Platform")
+    expect(screen.getByLabelText("Description").getAttribute("placeholder")).toBe("Orders ingested from Postgres.")
+    fireEvent.change(screen.getByLabelText("Description"), { target: { value: " One row per order. " } })
+    fireEvent.change(screen.getByLabelText("Tags"), { target: { value: "finance, monthly-report" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)).toEqual([
+      [
+        "PUT",
+        "/api/catalog/demo-orders/annotation",
+        { description: "One row per order.", owner: "Data Platform", steward: "Rina", tags: ["finance", "monthly-report"] },
+      ],
+    ])
+  })
+
+  it("refuses a tag the API would refuse, before sending anything", async () => {
+    const fetchSpy = stubApi()
+    renderTabs()
+
+    fireEvent.click(await screen.findByText("Edit"))
+    fireEvent.change(screen.getByLabelText("Tags"), { target: { value: "Finance Team" } })
+    expect(screen.getByText(/"Finance" is not a valid tag/)).toBeTruthy()
+    expect((screen.getByRole("button", { name: "Save" }) as HTMLButtonElement).disabled).toBe(true)
+    expect(writes(fetchSpy)).toEqual([])
+  })
+
+  it("offers no edit without catalog:write", async () => {
+    stubApi({ permissions: ["catalog:read"] })
+    renderTabs()
+    await screen.findByText("About")
+    await waitFor(() => expect(screen.queryByText("Edit")).toBeNull())
+  })
+})

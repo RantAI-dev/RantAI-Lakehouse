@@ -142,7 +142,13 @@ export function AssetDetailPage() {
           { label: "Residency", value: a.residency },
           {
             label: "Freshness",
-            value: <FreshnessIndicator lagSeconds={a.freshnessLagSeconds} />,
+            value: (
+              <FreshnessIndicator
+                lagSeconds={a.freshnessLagSeconds}
+                targetSeconds={a.freshnessTargetSeconds ?? null}
+                targetSource={a.freshnessTargetSource}
+              />
+            ),
           },
           {
             label: "Updated",
@@ -150,7 +156,7 @@ export function AssetDetailPage() {
           },
         ]}
       />
-      <AssetDetailTabs asset={a} />
+      <AssetDetailTabs asset={a} onAssetChanged={state.reload} />
 
       <Dialog open={open} onOpenChange={(next) => (next ? setOpen(true) : closeDialog())}>
         <DialogContent className="sm:max-w-md">

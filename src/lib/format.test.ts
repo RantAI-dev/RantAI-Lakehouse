@@ -29,6 +29,8 @@ test("formatCost / percent / lag / compact", () => {
   assert.equal(formatPercent(0.634), "63.4%")
   assert.equal(formatLagSeconds(8), "8 s")
   assert.equal(formatLagSeconds(125), "2m")
+  assert.equal(formatLagSeconds(36 * 3600), "36h 00m")
+  assert.equal(formatLagSeconds(194 * 3600 + 240), "8d 2h")
   assert.match(formatCompactNumber(1_234_567), /M|1\.2/)
 })
 

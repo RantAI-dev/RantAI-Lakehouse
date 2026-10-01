@@ -7,12 +7,19 @@ import { EmptyState, ErrorState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
-import { useService } from "@/hooks/use-service"
+import { Skeleton } from "@/components/ui/skeleton"
+import { useService, type ServiceState } from "@/hooks/use-service"
 import { formatBytes, formatDateTime, formatNumber } from "@/lib/format"
-import { lakehouseTableHref, msToIso, snapshotRelativeTime } from "@/lib/lakehouse-view"
+import {
+  isIcebergCandidate,
+  lakehouseTableHref,
+  msToIso,
+  snapshotRelativeTime,
+} from "@/lib/lakehouse-view"
 import { fmtMeasured } from "@/lib/measured"
 import { cn } from "@/lib/utils"
 import { lakehouseService } from "@/services"
+import type { AssetDetail } from "@/services/contracts/assets"
 import type {
   LakehouseMaintenance,
   LakehouseSnapshot,
@@ -20,11 +27,36 @@ import type {
 } from "@/services/contracts/lakehouse"
 
 /**
- * Every Iceberg candidate lives in this namespace — the same assumption
- * `IcebergSnapshots` in `asset-detail-tabs.tsx` makes (dlt writes Bronze
- * with `dataset_name="bronze"`, see the module comment in `catalog.rs`).
+ * Every Iceberg candidate lives in this namespace (dlt writes Bronze with
+ * `dataset_name="bronze"`, see the module comment in `catalog.rs`).
  */
 const BRONZE_NAMESPACE = "bronze"
+
+/**
+ * The asset's Iceberg table, loaded once for every tab that shows a part
+ * of it (Storage on the overview, Snapshots under Activity). `data` is
+ * `null` when the asset is not an Iceberg candidate at all; a candidate
+ * whose table does not exist fails with `not_found`.
+ */
+export type IcebergTableState = ServiceState<LakehouseTableDetail | null> & {
+  reload: () => void
+}
+
+export function useIcebergTable(asset: AssetDetail): IcebergTableState {
+  const tableName = isIcebergCandidate(asset) && asset.tableName ? asset.tableName : null
+  return useService(
+    (s) =>
+      tableName === null
+        ? Promise.resolve(null)
+        : lakehouseService.getTableDetail(BRONZE_NAMESPACE, tableName, s),
+    [tableName]
+  )
+}
+
+/** The loaded table, or `null` while loading, on failure, or when there is none. */
+export function icebergTableOf(state: IcebergTableState): LakehouseTableDetail | null {
+  return state.status === "success" ? state.data : null
+}
 
 /** `day(_ingested_at)` — how Iceberg itself writes a partition field. */
 function partitionLabel(detail: LakehouseTableDetail) {
@@ -61,8 +93,8 @@ const CHART_H = 96
 /**
  * Row count across snapshots: one series, so no legend — the card title
  * names it. The y-axis starts at zero because this is a magnitude, and a
- * cropped axis would turn a 1% append into a cliff. The Snapshots tab is
- * this chart's table view.
+ * cropped axis would turn a 1% append into a cliff. The Snapshots card
+ * under Activity is this chart's table view.
  */
 function VolumeTrend({ points }: { points: VolumePoint[] }) {
   const [hover, setHover] = React.useState<number | null>(null)
@@ -167,16 +199,36 @@ function VolumeTrend({ points }: { points: VolumePoint[] }) {
   )
 }
 
+/** Placeholder shaped like the loaded cards, so loading never reads as "empty". */
+function StorageSkeleton() {
+  return (
+    <div className="grid gap-2 lg:grid-cols-2" role="status" aria-label="Loading table metadata">
+      {[0, 1].map((card) => (
+        <SectionCard key={card} size="sm" title={card === 0 ? "Storage" : "Row count over snapshots"}>
+          <div className="flex flex-col gap-2.5 py-1">
+            <Skeleton className="h-4 w-2/3" />
+            <Skeleton className="h-4 w-1/2" />
+            <Skeleton className="h-4 w-3/5" />
+          </div>
+        </SectionCard>
+      ))}
+    </div>
+  )
+}
+
 /**
  * Physical side of an Iceberg-backed asset: files, bytes, partitioning,
- * maintenance, and row count over snapshots. Its own component because
- * `useService` cannot be called conditionally in the overview.
+ * maintenance, and row count over snapshots. The table itself comes in as
+ * `detail`, shared with the Snapshots card; maintenance is loaded here, as
+ * only this card shows it.
  */
-export function AssetStorage({ tableName }: { tableName: string }) {
-  const detail = useService(
-    (s) => lakehouseService.getTableDetail(BRONZE_NAMESPACE, tableName, s),
-    [tableName]
-  )
+export function AssetStorage({
+  tableName,
+  detail,
+}: {
+  tableName: string
+  detail: IcebergTableState
+}) {
   // Maintenance is a nicety here: its failure hides one row, not the card.
   const maintenance = useService(
     (s) => lakehouseService.getMaintenance(BRONZE_NAMESPACE, tableName, s),
@@ -193,13 +245,7 @@ export function AssetStorage({ tableName }: { tableName: string }) {
     </Button>
   )
 
-  if (detail.status === "loading") {
-    return (
-      <SectionCard size="sm" title="Storage">
-        <EmptyState title="Loading table metadata…" className="py-4" />
-      </SectionCard>
-    )
-  }
+  if (detail.status === "loading") return <StorageSkeleton />
   if (detail.status === "error") {
     // A missing table is expected for a candidate the catalog guessed at.
     if (detail.error.code === "not_found") return null
@@ -209,6 +255,7 @@ export function AssetStorage({ tableName }: { tableName: string }) {
       </SectionCard>
     )
   }
+  if (detail.data === null) return null
 
   const d = detail.data
   const { fileCount, totalBytes } = d.stats

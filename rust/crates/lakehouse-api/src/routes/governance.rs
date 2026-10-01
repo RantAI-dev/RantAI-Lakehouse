@@ -180,52 +180,99 @@ fn severity_of(verdict: &str) -> &'static str {
 /// rather than erroring — an authored rule simply cannot exist in that
 /// configuration.
 async fn quality(ch: &ChClient, pg: Option<&PgPool>) -> Result<Value, GovError> {
-    let rows = ch
-        .rows(
-            "SELECT tabel, cek, argMax(verdict, dibuat_pada) verdict,
-                toString(argMax(nilai, dibuat_pada)) nilai,
-                toString(max(dibuat_pada)) at
-         FROM _silver_meta.quality GROUP BY tabel, cek ORDER BY tabel, cek LIMIT 500",
-            None,
-        )
-        .await?;
-    let mut quality: Vec<Value> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let cek = str_col(r, "cek");
-            let tabel = str_col(r, "tabel");
-            let verdict = str_col(r, "verdict");
-            let at = str_col(r, "at");
-            let (name, dimension) = if let Some(col) = cek.strip_prefix("null_rate:") {
-                (format!("Column conversion {col}"), "validity")
-            } else if cek == "row_count" {
-                (cek.to_owned(), "completeness")
-            } else {
-                (cek.to_owned(), "accuracy")
-            };
-            let threshold = if cek.starts_with("null_rate") {
-                "null <5%"
-            } else {
-                "row_count > 0 & does not drop >50%"
-            };
-            json!({
-                "id": format!("q-{i}"),
-                "name": name,
-                "asset": tabel,
-                "dimension": dimension,
-                "threshold": threshold,
-                "severity": severity_of(verdict),
-                "lastStatus": status_of(verdict),
-                "lastRunAt": at,
-            })
-        })
-        .collect();
+    let mut quality = observed_quality(ch, None).await?;
     if let Some(pg) = pg {
         let authored = governance::list_quality_rules(pg).await?;
-        quality.extend(authored.iter().filter_map(|r| serde_json::to_value(r).ok()));
+        // An authored rule carries whether it can be run and what its
+        // latest run found (`routes::quality`); an observed one above
+        // already carries the verdict its job recorded.
+        let runs = crate::routes::quality::latest_runs(ch).await;
+        quality.extend(authored.iter().filter_map(|r| {
+            let mut rule = serde_json::to_value(r).ok()?;
+            crate::routes::quality::annotate_rule(&mut rule, &runs);
+            Some(rule)
+        }));
     }
     Ok(json!({ "quality": quality }))
+}
+
+/// True when `body` is `ClickHouse` saying the table, or its whole
+/// database, does not exist. `_silver_meta` is created by whatever job
+/// first records a quality verdict, so a deployment where none has run
+/// has no database at all (`Code: 81 ... (UNKNOWN_DATABASE)`), not just no
+/// table.
+fn is_missing_quality_source(body: &str) -> bool {
+    is_unknown_table_error(body)
+        || body.contains("(UNKNOWN_DATABASE)")
+        || body.contains("Code: 81.")
+}
+
+/// One observed check as a `QualityRule` (`contracts/governance.ts`): the
+/// latest verdict a quality job recorded for `(tabel, cek)`.
+fn observed_quality_json(index: usize, row: &Map<String, Value>) -> Value {
+    let cek = str_col(row, "cek");
+    let verdict = str_col(row, "verdict");
+    let (name, dimension) = if let Some(col) = cek.strip_prefix("null_rate:") {
+        (format!("Column conversion {col}"), "validity")
+    } else if cek == "row_count" {
+        (cek.to_owned(), "completeness")
+    } else {
+        (cek.to_owned(), "accuracy")
+    };
+    let threshold = if cek.starts_with("null_rate") {
+        "null <5%"
+    } else {
+        "row_count > 0 & does not drop >50%"
+    };
+    json!({
+        "id": format!("q-{index}"),
+        "name": name,
+        "asset": str_col(row, "tabel"),
+        "dimension": dimension,
+        "threshold": threshold,
+        "severity": severity_of(verdict),
+        "lastStatus": status_of(verdict),
+        "lastRunAt": str_col(row, "at"),
+    })
+}
+
+/// The latest observed verdict per `(tabel, cek)` from
+/// `_silver_meta.quality` — for every table, or only for `tables` (the
+/// catalog detail route asks about one asset) — with "nothing has recorded
+/// a verdict yet" as the empty list it is. Before this, a missing
+/// `_silver_meta` answered 503, so the Data Quality page could not even
+/// show the rules people authored. Every other failure still surfaces.
+///
+/// # Errors
+///
+/// Returns [`ChError`] for any failure other than a missing table or
+/// database.
+pub(crate) async fn observed_quality(
+    ch: &ChClient,
+    tables: Option<&[String]>,
+) -> Result<Vec<Value>, ChError> {
+    let only = tables.map_or_else(String::new, |tables| {
+        let names: Vec<String> = tables
+            .iter()
+            .map(|t| SqlLiteral::from(t.as_str()).to_string())
+            .collect();
+        format!("WHERE tabel IN ({}) ", names.join(", "))
+    });
+    let sql = format!(
+        "SELECT tabel, cek, argMax(verdict, dibuat_pada) verdict,
+                toString(argMax(nilai, dibuat_pada)) nilai,
+                toString(max(dibuat_pada)) at
+         FROM _silver_meta.quality {only}GROUP BY tabel, cek ORDER BY tabel, cek LIMIT 500"
+    );
+    match ch.rows(&sql, None).await {
+        Ok(rows) => Ok(rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| observed_quality_json(i, r))
+            .collect()),
+        Err(ChError::Server(ref body)) if is_missing_quality_source(body) => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
 }
 
 /// `principal_kind`/`outcome` on `audit_event` are a wider vocabulary than
@@ -1466,6 +1513,23 @@ mod tests {
         // this dispatch; if it somehow did, it should NOT be treated as a
         // recognized governance kind.
         assert_eq!(Kind::parse("lineage"), Kind::Unknown);
+    }
+
+    /// No quality job has run on this stack yet: the whole `_silver_meta`
+    /// database is missing, which is "no verdicts", not an outage.
+    #[test]
+    fn a_missing_quality_database_or_table_is_no_verdicts_yet() {
+        assert!(is_missing_quality_source(
+            "Code: 81. DB::Exception: Database _silver_meta does not exist. \
+             (UNKNOWN_DATABASE) (version 26.8.9.10 (official build))"
+        ));
+        assert!(is_missing_quality_source(
+            "Code: 60. DB::Exception: Unknown table expression identifier \
+             '_silver_meta.quality' in scope SELECT 1. (UNKNOWN_TABLE)"
+        ));
+        assert!(!is_missing_quality_source(
+            "Code: 241. DB::Exception: Memory limit exceeded. (MEMORY_LIMIT_EXCEEDED)"
+        ));
     }
 
     #[test]

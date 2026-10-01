@@ -111,16 +111,24 @@ pub(crate) async fn bronze_source(
     if let Some(silver) = clickhouse_source(&state.clickhouse, "silver", table).await? {
         return Ok(Some(silver));
     }
+    Ok(iceberg_source(state, table).await)
+}
+
+/// The Bronze Iceberg table `bronze.<table>` itself, when this deployment
+/// has an Iceberg query database and the table exists there — never its
+/// Silver counterpart. What a check written against `bronze.<table>`
+/// reads.
+pub(crate) async fn iceberg_source(state: &AppState, table: &str) -> Option<ReadSource> {
     let (Some(db), Ok(table)) = (state.config.iceberg_query_db.as_ref(), Ident::new(table)) else {
-        return Ok(None);
+        return None;
     };
     let columns = iceberg_columns(&state.clickhouse, db, &table).await;
-    Ok((!columns.is_empty()).then(|| ReadSource {
+    (!columns.is_empty()).then(|| ReadSource {
         from: format!("{db}.`{BRONZE_NAMESPACE}.{table}`"),
         policy_key: format!("{BRONZE_NAMESPACE}.{table}"),
         kind: SourceKind::Iceberg,
         columns,
-    }))
+    })
 }
 
 #[cfg(test)]
