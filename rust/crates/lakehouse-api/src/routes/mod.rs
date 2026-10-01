@@ -223,6 +223,15 @@ fn pipelines_router() -> Router<AppState> {
             "/api/pipelines/{id}/trigger",
             axum::routing::post(pipelines::trigger),
         )
+        // R4 plan 2c: read-side companion to `/trigger`. Registered
+        // BEFORE `/api/pipelines/{id}` only matters for static sub-paths
+        // (already covered above) — `{id}/config-schema` is registered
+        // here next to `/trigger` since they share the `id` namespace
+        // and route handlers share `path = {id}`.
+        .route(
+            "/api/pipelines/{id}/config-schema",
+            get(pipelines::config_schema),
+        )
         .route(
             "/api/pipelines/{id}/status",
             axum::routing::post(pipelines::set_status_route),

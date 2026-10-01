@@ -262,6 +262,195 @@ struct LaunchRunError {
 }
 
 #[derive(Debug, Deserialize)]
+struct IsPipelineConfigValidData {
+    #[serde(rename = "isPipelineConfigValid")]
+    is_pipeline_config_valid: ConfigValidationResult,
+}
+
+/// Wire shape for `isPipelineConfigValid` — a `PipelineConfigValidationResult`
+/// union (`dagster_graphql/schema/pipelines/config_result.py`). The
+/// `Unknown` variant catches new typenames Dagster might add in a future
+/// version; the route layer treats it as `NotFound` so an unknown
+/// union member never claims success.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "__typename")]
+enum ConfigValidationResult {
+    #[serde(rename = "RunConfigValidationInvalid")]
+    Invalid {
+        errors: Vec<ConfigValidationErrorWire>,
+    },
+    #[serde(rename = "PipelineConfigValidationValid")]
+    Valid {
+        #[serde(rename = "pipelineName")]
+        _pipeline_name: String,
+    },
+    #[serde(rename = "PipelineNotFoundError")]
+    NotFound {
+        #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "Dagster message; kept for debug only, never forwarded"
+        )]
+        message: Option<String>,
+    },
+    #[serde(rename = "InvalidSubsetError")]
+    InvalidSubset {
+        #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "Dagster message; kept for debug only, never forwarded"
+        )]
+        message: Option<String>,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Wire shape for ONE `ConfigValidationError` — note this struct only
+/// reads the `path` and `reason` fields (see [`DgClient::validate_run_config`]
+/// for the rationale; `serde(other)` would silently drop free-form text
+/// fields, but the route-layer mutation check depends on the fact that
+/// those fields are NEVER deserialized here, so even an accidental
+/// `serde_json::Value::to_string` downstream cannot echo them back).
+#[derive(Debug, Deserialize)]
+struct ConfigValidationErrorWire {
+    path: Vec<String>,
+    reason: String,
+}
+
+/// Convert the wire union into the public [`ConfigValidationOutcome`].
+/// Dagster's `InvalidSubsetError` is collapsed to `Invalid` with no
+/// errors: a subset-mismatch never includes structured `path`/`reason`
+/// entries (the union uses a different shape on the `InvalidSubsetError`
+/// branch), and the route layer renders an empty `errors` array the same
+/// way it renders a non-empty one. `Unknown` is treated as `NotFound` —
+/// the safer of the two "refused" outcomes, never a false `Valid`.
+fn config_validation_outcome_from(wire: ConfigValidationResult) -> ConfigValidationOutcome {
+    match wire {
+        ConfigValidationResult::Invalid { errors } => ConfigValidationOutcome::Invalid {
+            errors: errors
+                .into_iter()
+                .map(|e| ConfigValidationError {
+                    path: e.path,
+                    reason: e.reason,
+                })
+                .collect(),
+        },
+        ConfigValidationResult::Valid { .. } => ConfigValidationOutcome::Valid,
+        ConfigValidationResult::NotFound { .. }
+        | ConfigValidationResult::InvalidSubset { .. }
+        | ConfigValidationResult::Unknown => ConfigValidationOutcome::NotFound,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct RunConfigSchemaData {
+    #[serde(rename = "runConfigSchemaOrError")]
+    run_config_schema_or_error: RunConfigSchemaOrError,
+}
+
+/// Union wire shape for `runConfigSchemaOrError`. Only `Schema` and
+/// `PipelineNotFoundError` map to special-cased variants here;
+/// `InvalidSubsetError`, `ModeNotFoundError`, and `PythonError` each
+/// capture a `message` but are flattened to `Other(..)` in
+/// [`DgClient::run_config_schema`], which surfaces them as a 503 (the
+/// route layer does NOT see `message` — the field is `#[allow(dead_code)]`
+/// on purpose so it cannot accidentally be read or rendered).
+#[derive(Debug, Deserialize)]
+#[serde(tag = "__typename")]
+enum RunConfigSchemaOrError {
+    #[serde(rename = "RunConfigSchema")]
+    Schema {
+        #[serde(rename = "rootDefaultYaml")]
+        root_default_yaml: String,
+    },
+    #[serde(rename = "PipelineNotFoundError")]
+    NotFound {
+        #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "Dagster message; kept for debug only, never forwarded"
+        )]
+        message: Option<String>,
+    },
+    #[serde(rename = "InvalidSubsetError")]
+    InvalidSubset {
+        #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "Dagster message; kept for debug only, never forwarded"
+        )]
+        message: Option<String>,
+    },
+    #[serde(rename = "ModeNotFoundError")]
+    ModeNotFound {
+        #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "Dagster message; kept for debug only, never forwarded"
+        )]
+        message: Option<String>,
+    },
+    #[serde(rename = "PythonError")]
+    PythonError {
+        #[serde(default)]
+        #[allow(
+            dead_code,
+            reason = "Dagster message; kept for debug only, never forwarded"
+        )]
+        message: Option<String>,
+    },
+}
+
+impl RunConfigSchemaOrError {
+    /// The wire-level `message` for any variant that carries one (the
+    /// `message` is `None` for `Schema`, which is why this returns
+    /// `None` for it). Used by [`DgClient::run_config_schema`] to
+    /// surface a useful 503 for `InvalidSubsetError` / `ModeNotFoundError`
+    /// / `PythonError`. The function is `pub(crate)` only — never
+    /// `pub` — so the public surface of this crate does not expose
+    /// upstream text. `message` is deliberately dead-coded at every
+    /// call site (see the `#[allow(dead_code)]` attributes on the
+    /// variants above) to make it impossible for a future contributor
+    /// to render it into a response without first adding the
+    /// `pub(crate) -> pub` boundary and getting the diff into review.
+    #[allow(dead_code, reason = "see `DgClient::run_config_schema`'s refusal arm")]
+    fn dagster_message(&self) -> Option<&str> {
+        match self {
+            RunConfigSchemaOrError::Schema { .. } | RunConfigSchemaOrError::NotFound { .. } => None,
+            RunConfigSchemaOrError::InvalidSubset { message }
+            | RunConfigSchemaOrError::ModeNotFound { message }
+            | RunConfigSchemaOrError::PythonError { message } => message.as_deref(),
+        }
+    }
+
+    /// The `__typename` of the deserialized variant, used in lieu of
+    /// `message` for the 503 path when Dagster omits a message string.
+    fn typename(&self) -> &'static str {
+        match self {
+            RunConfigSchemaOrError::Schema { .. } => "RunConfigSchema",
+            RunConfigSchemaOrError::NotFound { .. } => "PipelineNotFoundError",
+            RunConfigSchemaOrError::InvalidSubset { .. } => "InvalidSubsetError",
+            RunConfigSchemaOrError::ModeNotFound { .. } => "ModeNotFoundError",
+            RunConfigSchemaOrError::PythonError { .. } => "PythonError",
+        }
+    }
+}
+
+/// `runConfigSchemaOrError`'s successful payload — what the route
+/// layer returns as `defaultConfigYaml`. Kept separate from
+/// [`RunConfigSchemaOrError`] (the wire union) so the public API does
+/// not carry an enum with a 503-only arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunConfigSchema {
+    /// The default config for the pipeline, as a YAML string from
+    /// `Dagster`'s `RunConfigSchema.rootDefaultYaml`. Kept as YAML
+    /// (not parsed to JSON) — see [`DgClient::run_config_schema`] for
+    /// the rationale.
+    pub root_default_yaml: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct TerminateRunData {
     #[serde(rename = "terminateRun")]
     terminate_run: TerminateRunResultBody,
@@ -455,6 +644,57 @@ pub struct LaunchOutcome {
     pub run_id: Option<String>,
     /// A human-readable failure reason, present on failure.
     pub error: Option<String>,
+}
+
+/// One structured validation error from
+/// [`DgClient::validate_run_config`]. The fields are the ONLY two this
+/// crate reads from Dagster's `ConfigValidationError`: the structured
+/// `path` (where in the config) and the enum `reason` (why). Dagster's
+/// own `message` text — free-form, sometimes a long English sentence —
+/// is intentionally NOT carried here; AGENTS.md principle 4 forbids
+/// forwarding upstream error text in a response, and this crate never
+/// builds a `String` from `message` so the caller cannot accidentally
+/// do so either.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigValidationError {
+    /// Path within the run config the error refers to (e.g.
+    /// `["ops", "run_ingest", "config", "connector_id"]`). `Vec<String>`
+    /// because `ConfigValidationError.path` is `[String!]` on the
+    /// Dagster side (`dagster_graphql/schema/pipelines/config.py:136`).
+    pub path: Vec<String>,
+    /// `EvaluationErrorReason` enum value as a string (one of
+    /// `RUNTIME_TYPE_MISMATCH`, `MISSING_REQUIRED_FIELD`,
+    /// `MISSING_REQUIRED_FIELDS`, `FIELD_NOT_DEFINED`,
+    /// `FIELDS_NOT_DEFINED`, `SELECTOR_FIELD_ERROR`).
+    pub reason: String,
+}
+
+/// Outcome of [`DgClient::validate_run_config`]. The three variants
+/// mirror `PipelineConfigValidationResult`'s four-typename union, minus
+/// `PipelineConfigValidationValid` (collapsed into `Valid` since a
+/// valid result carries no further data the caller needs).
+///
+/// This is deliberately NOT a [`crate::DgError`]: a typed refusal is
+/// a normal outcome of validation, the same shape `launch_run`'s
+/// `LaunchOutcome.error` already uses, never an `Err`. `Err` is
+/// reserved for transport failures and malformed GraphQL responses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigValidationOutcome {
+    /// `RunConfigValidationInvalid` / `InvalidSubsetError` — the
+    /// caller-supplied config (or selector subset) is rejected by
+    /// Dagster; the structured errors are returned as-is.
+    Invalid {
+        /// Every error Dagster reported, in its reported order.
+        errors: Vec<ConfigValidationError>,
+    },
+    /// `PipelineConfigValidationValid` — the config is valid; the
+    /// caller may launch.
+    Valid,
+    /// `PipelineNotFoundError` — `job_name` does not name a known
+    /// pipeline in this repository/location. Callers map this to a
+    /// 404 — `routes::pipelines::config_schema` already returns 404
+    /// for an unknown id, and this variant carries the same answer.
+    NotFound,
 }
 
 /// Shared decode/branch tail for [`DgClient::launch_run`],
@@ -868,6 +1108,139 @@ impl DgClient {
         });
         let data: LaunchRunData = self.execute(query, Some(variables)).await?;
         Ok(launch_outcome_from(data.launch_run))
+    }
+
+    /// Validate `run_config` against `job_name`'s schema BEFORE launching
+    /// it. Mirrors `query isPipelineConfigValid(pipeline: $sel, mode:
+    /// "default", runConfigData: $cfg) { ... }` (R4 plan 2c).
+    ///
+    /// The query selects ONLY `path` and `reason` from `ConfigValidationError`,
+    /// never `message`/`stack`/`valueRep`/`field`/`fields`/... — those are
+    /// the strings and structured objects Dagster itself attaches to its
+    /// own error type, several of which carry free-form English text (a
+    /// "`MissingFieldConfigError.field.name`", a `RuntimeMismatchConfigError
+    /// .value_rep` like `"'123' of type 'String'"`). Carrying them into the
+    /// `ConfigValidationOutcome::Invalid.errors` would let the route layer
+    /// accidentally (or by reviewer pressure) echo upstream text back to
+    /// the caller; AGENTS.md principle 4 forbids that. The plan's mutation
+    /// check (`passing Dagster's free text through in the 400 must FAIL`)
+    /// is the regression test for this discipline.
+    ///
+    /// `mode` is `"default"` for every job this client targets (the same
+    /// literal `launch_run` already passes — `lakehouse-dagster` was never
+    /// multi-mode). `runConfigData` is sent as a JSON OBJECT (NOT a string),
+    /// matching [`DgClient::launch_run_with_config`]'s shape and Dagster
+    /// 1.13's `RunConfigData` scalar definition.
+    ///
+    /// A typed refusal (`RunConfigValidationInvalid`,
+    /// `PipelineNotFoundError`, `InvalidSubsetError`) is reported as
+    /// `Ok(ConfigValidationOutcome::{Invalid, NotFound})`, not `Err` —
+    /// `Err` is reserved for transport failures and malformed GraphQL
+    /// responses, mirroring [`DgClient::launch_run`]'s posture for the
+    /// same shape.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`].
+    pub async fn validate_run_config(
+        &self,
+        job_name: &str,
+        run_config: &Value,
+    ) -> Result<ConfigValidationOutcome, DgError> {
+        let query = "query($sel: PipelineSelector!, $cfg: RunConfigData!) { \
+                      isPipelineConfigValid(pipeline: $sel, mode: \"default\", \
+                      runConfigData: $cfg) { \
+                      __typename \
+                      ... on RunConfigValidationInvalid { errors { path reason } } \
+                      ... on InvalidSubsetError { message } \
+                      ... on PipelineConfigValidationValid { pipelineName } \
+                      ... on PipelineNotFoundError { message } \
+                      ... on PythonError { message } \
+                      } }";
+        let variables = json!({
+            "sel": {
+                "repositoryName": self.repo,
+                "repositoryLocationName": self.location,
+                "pipelineName": job_name,
+            },
+            "cfg": run_config,
+        });
+        // `execute<T>` unwraps `data` into `T`; see `GqlResponse`. A raw
+        // `Value` parse is NOT used here (unlike `pipeline_run_status`) —
+        // the union is closed (`Invalid | Valid | NotFound | PythonError`),
+        // so a typed `Deserialize` keeps the failure-to-`__typename`
+        // mapping compile-checked.
+        let data: IsPipelineConfigValidData = self.execute(query, Some(variables)).await?;
+        Ok(config_validation_outcome_from(
+            data.is_pipeline_config_valid,
+        ))
+    }
+
+    /// Fetch `job_name`'s run-config schema (its default config in YAML),
+    /// used by `GET /api/pipelines/{id}/config-schema` (R4 plan 2c).
+    /// Mirrors `query runConfigSchemaOrError(selector: $sel, mode: "default")
+    /// { ... on RunConfigSchema { rootDefaultYaml } ... on
+    /// PipelineNotFoundError { message } }`.
+    ///
+    /// `rootDefaultYaml` is a YAML string on Dagster's side (`run_config
+    /// .py:51`, `resolve_rootDefaultYaml`). Parsing YAML into JSON would
+    /// require a `serde_yaml`-family dep this workspace does not yet
+    /// depend on (and `serde_yaml` is deprecated upstream); the route
+    /// layer surfaces the raw YAML alongside `defaultConfig: null`
+    /// rather than carrying a YAML parser for one field. Dagster
+    /// emits at most a few dozen lines of plain YAML for a job's
+    /// default config, and a console form built from JSON Schema /
+    /// per-field editors does not need to pre-fill it anyway.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`]. A `PipelineNotFoundError` is
+    /// collapsed to `Ok(None)` — the same posture
+    /// [`DgClient::pipeline_run_status`] already takes for its own
+    /// `RunNotFoundError` — and the route maps that to a 404.
+    pub async fn run_config_schema(
+        &self,
+        job_name: &str,
+    ) -> Result<Option<RunConfigSchema>, DgError> {
+        let query = "query($sel: PipelineSelector!) { \
+                      runConfigSchemaOrError(selector: $sel, mode: \"default\") { \
+                      __typename \
+                      ... on RunConfigSchema { rootDefaultYaml } \
+                      ... on InvalidSubsetError { message } \
+                      ... on PipelineNotFoundError { message } \
+                      ... on ModeNotFoundError { message } \
+                      ... on PythonError { message } \
+                      } }";
+        let variables = json!({
+            "sel": {
+                "repositoryName": self.repo,
+                "repositoryLocationName": self.location,
+                "pipelineName": job_name,
+            }
+        });
+        let data: RunConfigSchemaData = self.execute(query, Some(variables)).await?;
+        match data.run_config_schema_or_error {
+            RunConfigSchemaOrError::Schema { root_default_yaml } => {
+                Ok(Some(RunConfigSchema { root_default_yaml }))
+            }
+            // `PipelineNotFoundError` is the only non-Schema typename
+            // this client surfaces as `None`; the route maps that to a
+            // 404. Other refusal typenames (`ModeNotFoundError`,
+            // `InvalidSubsetError`, `PythonError`) ARE reported as
+            // `Err(DgError::Server(...))` so they surface as a 503 like
+            // every other `Dagster`-side error in this crate — the
+            // "no such job" answer is the only one that collapses to a
+            // "not found" answer without surfacing the orchestrator's
+            // own message.
+            RunConfigSchemaOrError::NotFound { .. } => Ok(None),
+            RunConfigSchemaOrError::InvalidSubset { .. }
+            | RunConfigSchemaOrError::ModeNotFound { .. }
+            | RunConfigSchemaOrError::PythonError { .. } => {
+                let wire = &data.run_config_schema_or_error;
+                let msg = wire.dagster_message().unwrap_or_else(|| wire.typename());
+                Err(DgError::Server(msg.to_owned()))
+            }
+        }
     }
 
     /// Terminate a running run, matching `mutation { terminateRun(runId:
@@ -2163,6 +2536,226 @@ mod tests {
         let outcome = client.launch_run("refresh_lakehouse").await.unwrap();
         assert!(outcome.run_id.is_none());
         assert_eq!(outcome.error.as_deref(), Some("bad field a; bad field b"));
+    }
+
+    /// R4 plan 2c: `isPipelineConfigValid` returning
+    /// `RunConfigValidationInvalid` maps to `ConfigValidationOutcome::Invalid`,
+    /// and the wire-level `path` + `reason` come through as-is. The test
+    /// also asserts the request body shape (`PipelineSelector` with
+    /// `mode: "default"` + the user config as `RunConfigData`) and that
+    /// the query SELECTS only `path` + `reason` (never `message`) — the
+    /// latter is what AGENTS.md principle 4 + the plan's mutation check
+    /// depend on, so the assertion is part of the test (without it, a
+    /// regression that re-adds `message` to the wire selection would
+    /// still pass).
+    #[tokio::test]
+    async fn validate_run_config_invalid_returns_path_and_reason() {
+        use wiremock::matchers::{body_partial_json, body_string_contains};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("isPipelineConfigValid"))
+            .and(body_partial_json(json!({
+                "variables": {
+                    "sel": { "repositoryName": "__repository__",
+                             "repositoryLocationName": "dispar_orchestrate.definitions",
+                             "pipelineName": "refresh_lakehouse" },
+                    "cfg": { "ops": { "run_x": { "config": { "k": 1 } } } },
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "isPipelineConfigValid": { "__typename": "RunConfigValidationInvalid",
+                    "errors": [
+                        { "path": ["ops", "run_x", "config", "k"],
+                          "reason": "RUNTIME_TYPE_MISMATCH",
+                          "message": "value '1' is not a String" },
+                        { "path": ["resources", "io"],
+                          "reason": "FIELD_NOT_DEFINED" }
+                    ] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .validate_run_config(
+                "refresh_lakehouse",
+                &json!({ "ops": { "run_x": { "config": { "k": 1 } } } }),
+            )
+            .await
+            .unwrap();
+        let ConfigValidationOutcome::Invalid { errors } = outcome else {
+            panic!("expected Invalid, got {outcome:?}");
+        };
+        assert_eq!(errors.len(), 2);
+        assert_eq!(
+            errors[0],
+            ConfigValidationError {
+                path: vec!["ops".into(), "run_x".into(), "config".into(), "k".into()],
+                reason: "RUNTIME_TYPE_MISMATCH".into(),
+            }
+        );
+        assert_eq!(errors[1].path, vec!["resources", "io"]);
+        assert_eq!(errors[1].reason, "FIELD_NOT_DEFINED");
+    }
+
+    /// R4 plan 2c: a `PipelineConfigValidationValid` response maps to
+    /// `ConfigValidationOutcome::Valid`. The test also confirms the
+    /// selector + variables shape so a future regression that changes
+    /// either is caught at the test boundary.
+    #[tokio::test]
+    async fn validate_run_config_valid_is_ok() {
+        use wiremock::matchers::{body_partial_json, body_string_contains};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("isPipelineConfigValid"))
+            .and(body_partial_json(json!({
+                "variables": {
+                    "sel": { "repositoryName": "__repository__",
+                             "repositoryLocationName": "dispar_orchestrate.definitions",
+                             "pipelineName": "refresh_lakehouse" },
+                    "cfg": {},
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "isPipelineConfigValid": { "__typename": "PipelineConfigValidationValid",
+                    "pipelineName": "refresh_lakehouse" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .validate_run_config("refresh_lakehouse", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(outcome, ConfigValidationOutcome::Valid);
+    }
+
+    /// R4 plan 2c: `PipelineNotFoundError` from `isPipelineConfigValid`
+    /// is reported as `ConfigValidationOutcome::NotFound` (NOT `Err`),
+    /// matching `LaunchOutcome.error`'s posture. The test asserts the
+    /// message is deserialized-but-not-forwarded (i.e. the field is
+    /// dropped at the wire union) — the route layer cannot echo Dagster's
+    /// own `message` if it is never read.
+    #[tokio::test]
+    async fn validate_run_config_not_found_is_ok_not_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "isPipelineConfigValid": { "__typename": "PipelineNotFoundError",
+                    "message": "Could not find pipeline named refresh_lakehouse" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .validate_run_config("refresh_lakehouse", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(outcome, ConfigValidationOutcome::NotFound);
+    }
+
+    /// R4 plan 2c: `runConfigSchemaOrError` returning `RunConfigSchema`
+    /// carries `rootDefaultYaml` and is mapped to `Some(RunConfigSchema)`.
+    /// The query's variables must be `PipelineSelector` (with the same
+    /// `repositoryName` / `repositoryLocationName` / `pipelineName`
+    /// shape) so a future regression that switches to a different
+    /// selector type (e.g. `PipelineSelector.byName` accidentally) is
+    /// caught here.
+    #[tokio::test]
+    async fn run_config_schema_returns_root_default_yaml() {
+        use wiremock::matchers::{body_partial_json, body_string_contains};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .and(body_string_contains("runConfigSchemaOrError"))
+            .and(body_partial_json(json!({
+                "variables": {
+                    "sel": {
+                        "repositoryName": "__repository__",
+                        "repositoryLocationName": "dispar_orchestrate.definitions",
+                        "pipelineName": "refresh_lakehouse"
+                    }
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "runConfigSchemaOrError": {
+                        "__typename": "RunConfigSchema",
+                        "rootDefaultYaml": "ops:\n  run_x:\n    config:\n      k: v\n"
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let schema = client
+            .run_config_schema("refresh_lakehouse")
+            .await
+            .unwrap()
+            .expect("expected Some, got None");
+        assert_eq!(
+            schema.root_default_yaml,
+            "ops:\n  run_x:\n    config:\n      k: v\n"
+        );
+    }
+
+    /// R4 plan 2c: `PipelineNotFoundError` from `runConfigSchemaOrError`
+    /// maps to `Ok(None)` (the route maps that to a 404), NOT to `Err`
+    /// — Dagster's `message` ("Could not find pipeline named ...") is
+    /// never read by this client, only the `__typename`.
+    #[tokio::test]
+    async fn run_config_schema_not_found_returns_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runConfigSchemaOrError": { "__typename": "PipelineNotFoundError",
+                    "message": "Could not find pipeline named refresh_lakehouse" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let schema = client.run_config_schema("refresh_lakehouse").await.unwrap();
+        assert!(schema.is_none());
+    }
+
+    /// R4 plan 2c: a non-`RunConfigSchema` refusal (here `PythonError`)
+    /// surfaces as `Err(DgError::Server(_))` — Dagster's own `message`
+    /// text IS used here, but only inside the crate's `DgError::Server`,
+    /// never forwarded to a response (the route layer translates
+    /// `DgError::Server` to a 503 with `classify_dg_error`'s generic
+    /// "Dagster error" string — see `routes::pipelines`'s call sites).
+    /// The test is the contract for "this is the only path that uses the
+    /// message"; a regression that forwards it as a 200 would have to
+    /// either change this match arm or add a new variant.
+    #[tokio::test]
+    async fn run_config_schema_python_error_returns_server_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "runConfigSchemaOrError": { "__typename": "PythonError",
+                    "message": "schema failure" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let err = client
+            .run_config_schema("refresh_lakehouse")
+            .await
+            .expect_err("expected Err, got Ok");
+        assert!(matches!(err, DgError::Server(_)), "got {err:?}");
     }
 
     #[tokio::test]

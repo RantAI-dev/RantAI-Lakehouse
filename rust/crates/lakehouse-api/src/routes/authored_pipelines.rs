@@ -480,7 +480,7 @@ pub async fn update(
     let updated = pipelines::update_pipeline(pool, &id, &input, Some(principal.id.uuid()))
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("Pipeline {id} not found")))?;
-    record_pipeline_audit(&state, &principal, "pipeline.update", &id).await;
+    record_pipeline_audit(&state, &principal, "pipeline.update", &id, Value::Null).await;
     // A draft has no job; only a runnable pipeline's job has to be rebuilt.
     let reloaded = if updated.status == "draft" {
         false
@@ -540,7 +540,7 @@ pub async fn delete(
     }
     match pipelines::delete_pipeline(pool, &id, Some(principal.id.uuid())).await {
         Ok(true) => {
-            record_pipeline_audit(&state, &principal, "pipeline.delete", &id).await;
+            record_pipeline_audit(&state, &principal, "pipeline.delete", &id, Value::Null).await;
             let reloaded = reload_orchestrator(&state).await;
             (
                 StatusCode::OK,
@@ -614,6 +614,7 @@ pub async fn restore_version(
         &principal,
         &format!("pipeline.restore.{version}"),
         &id,
+        Value::Null,
     )
     .await;
     // Drafts have no job; only runnable pipelines need a reload.

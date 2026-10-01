@@ -15,13 +15,14 @@ use serde_json::{Map, Value, json};
 
 use axum::Extension;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Json, Path, State};
 use axum::http::HeaderMap;
 use lakehouse_auth::Principal;
 
 use axum::response::IntoResponse;
 
 use super::{api_result_to_value, arg_str, response_to_value};
+use crate::routes::pipelines::TriggerBody;
 use crate::state::AppState;
 
 /// The Dagster job the demo code location builds the whole lakehouse with.
@@ -246,6 +247,14 @@ pub(super) async fn list_pipeline_runs(state: &AppState, args: &Map<String, Valu
 /// (which now writes a real `pipeline.trigger` `audit_event` under the real
 /// principal) gets the SAME `Principal` the copilot dispatcher was
 /// handed, and 401s honestly when there is none.
+///
+/// R4 plan 2c: `args["runConfig"]` (optional JSON object) is forwarded
+/// to the route unchanged. The route validates the config against the
+/// job's schema and either launches (on success) or returns a structured
+/// 400 (on `RunConfigValidationInvalid`) — both of which the
+/// `response_to_value` wrapper surfaces here as a 200 JSON object with
+/// `{ error }` / the route's success body, since the copilot dispatcher
+/// turns every `Response` from these tools into the same payload shape.
 pub(super) async fn trigger_pipeline(
     state: &AppState,
     principal: Option<&Principal>,
@@ -255,9 +264,12 @@ pub(super) async fn trigger_pipeline(
     if id.is_empty() {
         return json!({ "error": "id is required" });
     }
+    let run_config = args.get("runConfig").cloned();
+    let body = Json(TriggerBody { run_config });
     let extension = principal.cloned().map(Extension);
     response_to_value(
-        crate::routes::pipelines::trigger(State(state.clone()), extension, Path(id)).await,
+        crate::routes::pipelines::trigger(State(state.clone()), extension, Path(id), Some(body))
+            .await,
     )
     .await
 }

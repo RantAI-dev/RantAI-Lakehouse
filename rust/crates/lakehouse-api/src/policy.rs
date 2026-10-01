@@ -326,6 +326,12 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/pipelines/{id}/runs/{runId}/steps", Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs/{runId}/logs",  Policy::RequiresPermission("pipeline:read")),
     ("POST", "/api/pipelines/{id}/trigger",           Policy::RequiresPermission("pipeline:write")),
+    // R4 plan 2c: read-side companion to trigger. The handler refuses
+    // unknown ids and returns `{ defaultConfig: null, defaultConfigYaml:
+    // <yaml>, hasConfig: true }` for any job in Dagster — `pipeline:read`
+    // matches `list_pipelines`/`list_pipeline_runs`, the only other
+    // places a model can read pipeline state.
+    ("GET",  "/api/pipelines/{id}/config-schema",      Policy::RequiresPermission("pipeline:read")),
     ("POST", "/api/pipelines/{id}/status",            Policy::RequiresPermission("pipeline:write")),
     ("POST", "/api/pipelines/{id}/pause",             Policy::RequiresPermission("pipeline:write")),
     ("POST", "/api/pipelines/{id}/resume",            Policy::RequiresPermission("pipeline:write")),
