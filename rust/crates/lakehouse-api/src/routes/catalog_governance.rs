@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 
 use lakehouse_auth::Principal;
-use lakehouse_store::governance::{self as store, Policy, QualityRule};
+use lakehouse_store::governance::{self as store, ClassificationRule, Policy, QualityRule};
 use lakehouse_store::queries::HistoryMention;
 use serde_json::{Map, Value, json};
 use sqlparser::dialect::{ClickHouseDialect, GenericDialect};
@@ -446,35 +446,247 @@ fn observed_check(observed: &Value) -> Value {
     })
 }
 
-/// Every quality check that names the asset by one of `names`: verdicts a
-/// quality job recorded first (they carry a result), then authored rules.
-pub(crate) async fn quality_checks(state: &AppState, names: &[String]) -> Vec<Value> {
-    let mut checks: Vec<Value> = match observed_quality(&state.clickhouse, Some(names)).await {
-        Ok(observed) => observed.iter().map(observed_check).collect(),
-        Err(err) => {
-            tracing::warn!(?err, "catalog detail: observed quality unavailable");
-            Vec::new()
-        }
-    };
-    if let Some(pg) = state.pg.as_deref() {
-        match store::list_quality_rules(pg).await {
-            Ok(rules) => {
-                let rules: Vec<&QualityRule> = rules
-                    .iter()
-                    .filter(|r| is_one_of(&r.asset, names))
-                    .collect();
-                // Only worth asking `ClickHouse` when a rule names the asset.
-                let runs = if rules.is_empty() {
-                    HashMap::new()
-                } else {
-                    latest_runs(&state.clickhouse).await
-                };
-                checks.extend(rules.iter().map(|r| rule_check(r, runs.get(&r.id))));
+/// Everything quality knows, loaded once: the verdicts a quality job
+/// recorded, the authored rules, and each rule's latest run. The detail
+/// route asks it about one asset; the catalog list about every row, for
+/// their health.
+pub(crate) struct QualityIndex {
+    observed: Vec<Value>,
+    rules: Vec<QualityRule>,
+    runs: HashMap<String, LatestRun>,
+}
+
+impl QualityIndex {
+    /// Loads the index — for the assets named in `only` when given (the
+    /// detail route knows which names it will ask about), for every asset
+    /// otherwise. Each source that fails is logged and reads as empty.
+    pub(crate) async fn load(state: &AppState, only: Option<&[String]>) -> Self {
+        let observed = match observed_quality(&state.clickhouse, only).await {
+            Ok(observed) => observed,
+            Err(err) => {
+                tracing::warn!(?err, "catalog: observed quality unavailable");
+                Vec::new()
             }
-            Err(err) => tracing::warn!(?err, "catalog detail: quality rules unavailable"),
+        };
+        let rules = match state.pg.as_deref() {
+            Some(pg) => store::list_quality_rules(pg).await.unwrap_or_else(|err| {
+                tracing::warn!(?err, "catalog: quality rules unavailable");
+                Vec::new()
+            }),
+            None => Vec::new(),
+        };
+        let rules: Vec<QualityRule> = match only {
+            Some(names) => rules
+                .into_iter()
+                .filter(|r| is_one_of(&r.asset, names))
+                .collect(),
+            None => rules,
+        };
+        // Only worth asking `ClickHouse` when there is a rule to have run.
+        let runs = if rules.is_empty() {
+            HashMap::new()
+        } else {
+            latest_runs(&state.clickhouse).await
+        };
+        Self {
+            observed,
+            rules,
+            runs,
         }
     }
-    checks
+
+    /// Every quality check that names the asset by one of `names`:
+    /// verdicts a quality job recorded first (they carry a result), then
+    /// authored rules.
+    pub(crate) fn checks_for(&self, names: &[String]) -> Vec<Value> {
+        let about_asset = |v: &Value| {
+            v.get("asset")
+                .and_then(Value::as_str)
+                .is_some_and(|asset| is_one_of(asset, names))
+        };
+        self.observed
+            .iter()
+            .filter(|v| about_asset(v))
+            .map(observed_check)
+            .chain(
+                self.rules
+                    .iter()
+                    .filter(|r| is_one_of(&r.asset, names))
+                    .map(|r| rule_check(r, self.runs.get(&r.id))),
+            )
+            .collect()
+    }
+}
+
+// ── Classification ─────────────────────────────────────────────────────
+
+/// Classification levels, least to most restrictive.
+const LEVELS: [&str; 4] = ["public", "internal", "confidential", "restricted"];
+
+/// What an asset nobody classified is treated as — the same level
+/// `GET /api/governance/classification` lists every catalog asset under.
+const DEFAULT_LEVEL: &str = "internal";
+
+fn rank(level: &str) -> usize {
+    LEVELS.iter().position(|l| *l == level).unwrap_or(0)
+}
+
+/// An asset's classification, and where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Classified {
+    /// The asset's level: its own rule's, raised to its most restrictive
+    /// column's.
+    pub(crate) level: String,
+    /// `false` when no rule names the asset and the level is the default.
+    pub(crate) from_rule: bool,
+    /// `(column, level)` for each column a rule classifies.
+    pub(crate) columns: Vec<(String, String)>,
+}
+
+/// Classifies the asset known by `names` from `rules` (newest first, as
+/// the store lists them). The newest rule wins — per column, and for the
+/// asset as a whole — so a wrong classification is corrected by adding the
+/// right one. The asset is never less restrictive than a column it holds.
+pub(crate) fn classify(rules: &[ClassificationRule], names: &[String]) -> Classified {
+    let mut asset_level: Option<&str> = None;
+    let mut columns: Vec<(String, String)> = Vec::new();
+    for rule in rules.iter().filter(|r| is_one_of(&r.asset, names)) {
+        match rule.column.as_deref().filter(|c| !c.trim().is_empty()) {
+            None => {
+                asset_level.get_or_insert(rule.classification.as_str());
+            }
+            Some(column) => {
+                if !columns.iter().any(|(c, _)| c == column) {
+                    columns.push((column.to_owned(), rule.classification.clone()));
+                }
+            }
+        }
+    }
+    let level = columns
+        .iter()
+        .map(|(_, level)| level.as_str())
+        .chain(std::iter::once(asset_level.unwrap_or(DEFAULT_LEVEL)))
+        .max_by_key(|level| rank(level))
+        .unwrap_or(DEFAULT_LEVEL);
+    Classified {
+        level: level.to_owned(),
+        from_rule: asset_level.is_some() || !columns.is_empty(),
+        columns,
+    }
+}
+
+/// Every authored classification rule, newest first. A store failure is
+/// logged and reads as "no rules": assets then show the default level.
+pub(crate) async fn classification_rules(state: &AppState) -> Vec<ClassificationRule> {
+    let Some(pg) = state.pg.as_deref() else {
+        return Vec::new();
+    };
+    store::list_classification_rules(pg)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(?err, "catalog: classification rules unavailable");
+            Vec::new()
+        })
+}
+
+// ── Health ─────────────────────────────────────────────────────────────
+
+/// A duration as a person says it: `8d 3h`, `5h 30m`, `45m`.
+fn span(seconds: i64) -> String {
+    let minutes = seconds / 60;
+    let (days, hours) = (minutes / 1440, minutes / 60);
+    if days >= 2 {
+        format!("{days}d {}h", hours % 24)
+    } else if hours >= 1 {
+        format!("{hours}h {:02}m", minutes % 60)
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+/// An asset's health from what is actually measured about it, with one
+/// line per signal saying why:
+///
+/// - freshness, when the asset has a target to be judged against;
+/// - its quality checks that have a result.
+///
+/// `unhealthy` when a critical- or high-severity check failed; `degraded`
+/// when it is late, or any other check failed or could not be judged;
+/// `healthy` when every signal there is passes; `unknown`, with no
+/// reasons, when there is no signal at all — never "healthy" by default.
+pub(crate) fn health(
+    lag_seconds: Option<i64>,
+    target_seconds: Option<i64>,
+    checks: &[Value],
+) -> (&'static str, Vec<String>) {
+    let mut reasons = Vec::new();
+    let mut degraded = false;
+    let mut unhealthy = false;
+
+    if let (Some(lag), Some(target)) = (lag_seconds, target_seconds) {
+        if lag <= target {
+            reasons.push(format!(
+                "Fresh: written {} ago, within its {} target",
+                span(lag),
+                span(target)
+            ));
+        } else {
+            degraded = true;
+            reasons.push(format!(
+                "Late: written {} ago, expected within {}",
+                span(lag),
+                span(target)
+            ));
+        }
+    }
+
+    let text = |check: &Value, key: &str| {
+        check
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let evaluated: Vec<&Value> = checks
+        .iter()
+        .filter(|c| c.get("status").and_then(Value::as_str).is_some())
+        .collect();
+    if !evaluated.is_empty() {
+        let passed = evaluated
+            .iter()
+            .filter(|c| text(c, "status") == "passed")
+            .count();
+        reasons.push(format!(
+            "{passed} of {} quality checks passed",
+            evaluated.len()
+        ));
+        let failed: Vec<String> = evaluated
+            .iter()
+            .filter(|c| text(c, "status") == "failed")
+            .map(|c| text(c, "name"))
+            .collect();
+        if !failed.is_empty() {
+            reasons.push(format!("Failed: {}", failed.join(", ")));
+        }
+        if passed < evaluated.len() {
+            degraded = true;
+        }
+        unhealthy = evaluated.iter().any(|c| {
+            text(c, "status") == "failed"
+                && matches!(text(c, "severity").as_str(), "critical" | "high")
+        });
+    }
+
+    let status = if unhealthy {
+        "unhealthy"
+    } else if degraded {
+        "degraded"
+    } else if reasons.is_empty() {
+        "unknown"
+    } else {
+        "healthy"
+    };
+    (status, reasons)
 }
 
 #[cfg(test)]
@@ -756,6 +968,110 @@ mod tests {
         // An older event recorded no permission.
         let bare = change_entry(&audit_event("catalog.access_request", json!({})));
         assert_eq!(bare["summary"], "Requested access");
+    }
+
+    fn rule(asset: &str, column: Option<&str>, level: &str) -> ClassificationRule {
+        ClassificationRule {
+            id: format!("c-{asset}-{column:?}-{level}"),
+            asset: asset.to_owned(),
+            column: column.map(str::to_owned),
+            classification: level.to_owned(),
+            confidence: 1,
+            review_status: "reviewed".to_owned(),
+            masking_rule: None,
+        }
+    }
+
+    /// No rule: the default level, and it says it is the default.
+    #[test]
+    fn an_unclassified_asset_is_internal_by_default() {
+        let other = [rule("silver.other", None, "restricted")];
+        let c = classify(&other, &tables(&["silver.orders"]));
+        assert_eq!(c.level, "internal");
+        assert!(!c.from_rule);
+        assert!(c.columns.is_empty());
+    }
+
+    /// The newest rule wins, so a mistake is fixed by adding the right
+    /// rule; and the asset is at least as restrictive as its columns.
+    #[test]
+    fn the_newest_rule_wins_and_a_column_raises_the_asset() {
+        // Newest first, as the store lists them.
+        let rules = [
+            rule("silver.orders", None, "public"),
+            rule("silver.orders", Some("email"), "confidential"),
+            rule("SILVER.ORDERS", None, "restricted"),
+            rule("silver.orders", Some("email"), "restricted"),
+            rule("silver.orders", Some("card"), "restricted"),
+        ];
+        let c = classify(&rules, &tables(&["silver.orders"]));
+        assert!(c.from_rule);
+        assert_eq!(
+            c.columns,
+            vec![
+                ("email".to_owned(), "confidential".to_owned()),
+                ("card".to_owned(), "restricted".to_owned()),
+            ]
+        );
+        // The asset rule says public; the card column makes it restricted.
+        assert_eq!(c.level, "restricted");
+
+        let asset_only = classify(&rules[..1], &tables(&["silver.orders"]));
+        assert_eq!(asset_only.level, "public");
+    }
+
+    fn check(name: &str, status: Option<&str>, severity: &str) -> Value {
+        json!({ "name": name, "status": status, "severity": severity })
+    }
+
+    const DAY: i64 = 86_400;
+
+    /// Nothing measured is "unknown" — never healthy by default.
+    #[test]
+    fn health_is_unknown_without_any_signal() {
+        assert_eq!(health(None, None, &[]), ("unknown", Vec::new()));
+        // An age with no target, and a rule nobody ran, are not signals.
+        let unrun = [check("orders_unique", None, "high")];
+        assert_eq!(health(Some(9 * DAY), None, &unrun).0, "unknown");
+    }
+
+    #[test]
+    fn health_follows_freshness_and_quality() {
+        let (status, reasons) = health(Some(5 * 3600 + 1800), Some(36 * 3600), &[]);
+        assert_eq!(status, "healthy");
+        assert_eq!(
+            reasons,
+            vec!["Fresh: written 5h 30m ago, within its 36h 00m target"]
+        );
+
+        let (status, reasons) = health(Some(8 * DAY + 3 * 3600), Some(36 * 3600), &[]);
+        assert_eq!(status, "degraded");
+        assert_eq!(
+            reasons,
+            vec!["Late: written 8d 3h ago, expected within 36h 00m"]
+        );
+
+        let checks = [
+            check("rows", Some("passed"), "low"),
+            check("region_filled", Some("failed"), "medium"),
+        ];
+        let (status, reasons) = health(None, None, &checks);
+        assert_eq!(status, "degraded");
+        assert_eq!(
+            reasons,
+            vec!["1 of 2 quality checks passed", "Failed: region_filled"]
+        );
+    }
+
+    /// A failed check that matters makes the asset unhealthy, even when
+    /// it is fresh.
+    #[test]
+    fn a_failed_high_severity_check_is_unhealthy() {
+        let checks = [check("id_unique", Some("failed"), "high")];
+        assert_eq!(health(Some(60), Some(DAY), &checks).0, "unhealthy");
+        // "warning" — nothing to check — degrades, it does not fail.
+        let warned = [check("id_unique", Some("warning"), "high")];
+        assert_eq!(health(None, None, &warned).0, "degraded");
     }
 
     #[test]

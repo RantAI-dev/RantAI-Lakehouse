@@ -1,13 +1,31 @@
 "use client"
 
+import * as React from "react"
 import Link from "next/link"
-import { Check, Minus } from "lucide-react"
+import { Check, Minus, Tag } from "lucide-react"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
-import { Pill } from "@/components/patterns/status-badge"
+import { ClassificationBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import { Label } from "@/components/ui/label"
 import { useAuth } from "@/features/auth/auth-provider"
+import { useServiceAction } from "@/hooks/use-service"
+import { notifySuccess } from "@/lib/notify"
+import { CLASSIFICATION_LABEL, type Classification } from "@/lib/status"
+import { governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
+import type { CreateClassificationRuleInput } from "@/services/contracts/governance"
+import { classificationTitle } from "./asset-badges"
+import { lineageKey } from "./asset-lineage"
 
 type PolicySummary = AssetDetail["policySummary"][number]
 
@@ -70,6 +88,149 @@ function YourAccess({ asset: a }: { asset: AssetDetail }) {
   )
 }
 
+const selectClassName = "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm"
+
+/** Least to most restrictive. */
+const LEVELS: Classification[] = ["public", "internal", "confidential", "restricted"]
+
+/**
+ * Classifies the asset, or one of its columns, by adding a classification
+ * rule for its table key. The newest rule wins, so this is also how a
+ * wrong classification is corrected.
+ */
+function ClassifyDialog({
+  asset: a,
+  onClose,
+  onSaved,
+}: {
+  asset: AssetDetail
+  onClose: () => void
+  onSaved: () => void
+}) {
+  // "" is the asset as a whole.
+  const [column, setColumn] = React.useState("")
+  const [level, setLevel] = React.useState<Classification>(a.classification)
+  const save = useServiceAction((signal, input: CreateClassificationRuleInput) =>
+    governanceService.createClassificationRule(input, signal)
+  )
+
+  async function submit() {
+    const saved = await save.run({
+      asset: lineageKey(a),
+      ...(column ? { column } : {}),
+      classification: level,
+    })
+    if (saved === null) return
+    notifySuccess("Classification saved")
+    onSaved()
+  }
+
+  return (
+    <Dialog open onOpenChange={(next) => (next ? undefined : onClose())}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Classify</DialogTitle>
+          <DialogDescription>
+            How sensitive {a.name} is. An asset is never less restrictive than its most
+            restrictive column.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-3">
+          <div className="grid gap-1.5">
+            <Label htmlFor="classify-target">Applies to</Label>
+            <select
+              id="classify-target"
+              className={selectClassName}
+              value={column}
+              onChange={(e) => setColumn(e.target.value)}
+            >
+              <option value="">The whole asset</option>
+              {a.schema.map((c) => (
+                <option key={c.name} value={c.name}>
+                  Column {c.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="grid gap-1.5">
+            <Label htmlFor="classify-level">Classification</Label>
+            <select
+              id="classify-level"
+              className={selectClassName}
+              value={level}
+              onChange={(e) => setLevel(e.target.value as Classification)}
+            >
+              {LEVELS.map((l) => (
+                <option key={l} value={l}>
+                  {CLASSIFICATION_LABEL[l]}
+                </option>
+              ))}
+            </select>
+          </div>
+          {save.error ? <p className="text-sm text-destructive">{save.error.message}</p> : null}
+        </div>
+        <DialogFooter>
+          <DialogClose render={<Button variant="ghost" size="sm" />}>Cancel</DialogClose>
+          <Button size="sm" onClick={() => void submit()} disabled={save.status === "pending"}>
+            {save.status === "pending" ? "Saving…" : "Save"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+/** How sensitive the asset and its columns are, and on whose word. */
+function ClassificationCard({ asset: a, onChanged }: { asset: AssetDetail; onChanged: () => void }) {
+  const [classifying, setClassifying] = React.useState(false)
+  const columns = a.schema.filter((c) => c.classification)
+
+  return (
+    <SectionCard
+      size="sm"
+      title="Classification"
+      description={classificationTitle(a)}
+      action={
+        <Button size="sm" variant="outline" onClick={() => setClassifying(true)}>
+          <Tag />
+          Classify
+        </Button>
+      }
+    >
+      <ul className="divide-y divide-border text-sm">
+        <li className="flex items-center gap-2 py-1.5">
+          <span>This asset</span>
+          <span className="ml-auto">
+            <ClassificationBadge classification={a.classification} />
+          </span>
+        </li>
+        {columns.map((c) => (
+          <li key={c.name} className="flex items-center gap-2 py-1.5">
+            <span className="font-mono text-xs">{c.name}</span>
+            <span className="text-xs text-muted-foreground">column</span>
+            <span className="ml-auto">
+              {c.classification ? <ClassificationBadge classification={c.classification} /> : null}
+            </span>
+          </li>
+        ))}
+      </ul>
+      {columns.length === 0 ? (
+        <p className="mt-2 text-xs text-muted-foreground">No column is classified on its own.</p>
+      ) : null}
+      {classifying ? (
+        <ClassifyDialog
+          asset={a}
+          onClose={() => setClassifying(false)}
+          onSaved={() => {
+            setClassifying(false)
+            onChanged()
+          }}
+        />
+      ) : null}
+    </SectionCard>
+  )
+}
+
 function PolicyItem({ p, canOpen }: { p: PolicySummary; canOpen: boolean }) {
   return (
     <li className="flex flex-col gap-1.5 py-2.5">
@@ -128,16 +289,25 @@ function PolicyItem({ p, canOpen }: { p: PolicySummary; canOpen: boolean }) {
 }
 
 /**
- * The Access tab: what the signed-in person may do with the asset, then
- * the policies that mask its columns or filter its rows, and for whom.
+ * The Access tab: what the signed-in person may do with the asset, how
+ * sensitive it is, then the policies that mask its columns or filter its
+ * rows, and for whom.
  */
-export function AssetAccess({ asset: a }: { asset: AssetDetail }) {
+export function AssetAccess({
+  asset: a,
+  onChanged,
+}: {
+  asset: AssetDetail
+  /** Reloads the asset after it was classified. */
+  onChanged: () => void
+}) {
   const { hasPermission } = useAuth()
   const canOpen = hasPermission("policy:read")
 
   return (
     <div className="flex flex-col gap-2">
       <YourAccess asset={a} />
+      <ClassificationCard asset={a} onChanged={onChanged} />
       <SectionCard
         size="sm"
         title="Policies"

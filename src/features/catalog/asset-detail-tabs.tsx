@@ -289,7 +289,7 @@ export function AssetDetailTabs({
         </TabsContent>
 
         <TabsContent value="access">
-          <AssetAccess asset={a} />
+          <AssetAccess asset={a} onChanged={onAssetChanged} />
         </TabsContent>
 
         <TabsContent value="lineage">

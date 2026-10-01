@@ -20,6 +20,7 @@ import { notifyError, notifySuccess } from "@/lib/notify"
 import { cn } from "@/lib/utils"
 import type { AssetColumn, AssetDetail } from "@/services/contracts/assets"
 import { AssetAbout } from "./asset-about"
+import { NO_HEALTH_SIGNAL } from "./asset-badges"
 import {
   assetDependents,
   lineageSides,
@@ -151,6 +152,7 @@ export function AssetOverview({
   const quality = qualitySummary(a.qualityChecks)
   const sensitive = a.schema.filter(isSensitive)
   const maskedCount = a.schema.filter((c) => c.masked).length
+  const healthReasons = a.healthReasons ?? []
   // The Iceberg table's current schema version, once loaded; the API's
   // own list otherwise.
   const icebergSchema = icebergTableOf(iceberg)?.schemaVersions?.find((v) => v.current)
@@ -171,9 +173,17 @@ export function AssetOverview({
         <HealthTile
           label="Health"
           hint={
-            a.lastUpdated === null
-              ? "Last update not recorded"
-              : `Updated ${formatRelativeTime(a.lastUpdated)}`
+            // What the status rests on, signal by signal — or that there
+            // is nothing to judge it by.
+            healthReasons.length === 0 ? (
+              NO_HEALTH_SIGNAL
+            ) : (
+              <span className="flex flex-col gap-0.5">
+                {healthReasons.map((reason) => (
+                  <span key={reason}>{reason}</span>
+                ))}
+              </span>
+            )
           }
         >
           <HealthBadge health={a.health} />
@@ -224,7 +234,9 @@ export function AssetOverview({
         </HealthTile>
         <HealthTile
           label="Governance"
-          hint={`${maskedCount} masked column${maskedCount === 1 ? "" : "s"}`}
+          hint={`${maskedCount} masked column${maskedCount === 1 ? "" : "s"} · ${
+            a.classificationSource === "rule" ? "classified by rule" : "default level"
+          }`}
           onClick={() => onNavigate("access")}
         >
           <ClassificationBadge classification={a.classification} />

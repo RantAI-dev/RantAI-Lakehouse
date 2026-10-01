@@ -223,8 +223,9 @@ pub async fn list(
     match list_body(&state.clickhouse).await {
         Ok((mut body, bronze_pairs)) => {
             apply_sla_targets(&state, &mut body, &bronze_pairs).await;
-            enrich_bronze_assets(&state, &mut body, bronze_pairs).await;
+            enrich_bronze_assets(&state, &mut body, bronze_pairs.clone()).await;
             let annotations = apply_annotations(&state, &mut body).await;
+            apply_badges(&state, &mut body, &bronze_pairs).await;
             if let Some(q) = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty())
                 && let Some(assets) = body.get("assets").and_then(Value::as_array)
             {
@@ -353,8 +354,9 @@ pub async fn query(
         }
     };
     apply_sla_targets(&state, &mut body, &bronze_pairs).await;
-    enrich_bronze_assets(&state, &mut body, bronze_pairs).await;
+    enrich_bronze_assets(&state, &mut body, bronze_pairs.clone()).await;
     apply_annotations(&state, &mut body).await;
+    apply_badges(&state, &mut body, &bronze_pairs).await;
 
     let assets = body
         .get("assets")
@@ -1083,7 +1085,9 @@ fn silver_catalog_row(
         "namespace": "silver",
         "type": if engine == "View" { "view" } else { "table" },
         "layer": "silver",
-        "tier": "warm",
+        // Hot is what sits in `ClickHouse` parts (`routes::storage`); a
+        // view stores nothing of its own and reads the Warm Bronze data.
+        "tier": if parts.is_some() { "hot" } else { "warm" },
         "classification": "internal",
         "owner": TENANT_OWNER.as_str(),
         "domain": TENANT_DOMAIN.as_str(),
@@ -1319,6 +1323,106 @@ async fn mark_annotation_and_history(state: &AppState, body: &mut Value, id: &st
     }
 }
 
+/// Sets the header badges that are worked out rather than stored, on a
+/// list row or a detail body:
+///
+/// - `classification`, with `classificationSource` (`"rule"` when a
+///   classification rule names the asset, `"default"` otherwise), and each
+///   classified column's own level in `schema` when the row has one;
+/// - `health`, with `healthReasons` saying which signals it rests on —
+///   empty when nothing measures the asset and it is `"unknown"`.
+///
+/// Health reads the row's own `freshnessLagSeconds` and
+/// `freshnessTargetSeconds`, so this runs after both are filled in.
+fn set_badges(row: &mut Value, classified: &catalog_governance::Classified, checks: &[Value]) {
+    let Some(o) = row.as_object_mut() else {
+        return;
+    };
+    let seconds = |key: &str| o.get(key).and_then(Value::as_i64);
+    let (health, reasons) = catalog_governance::health(
+        seconds("freshnessLagSeconds"),
+        seconds("freshnessTargetSeconds"),
+        checks,
+    );
+    o.insert("health".to_owned(), json!(health));
+    o.insert("healthReasons".to_owned(), json!(reasons));
+    o.insert("classification".to_owned(), json!(classified.level));
+    o.insert(
+        "classificationSource".to_owned(),
+        json!(if classified.from_rule {
+            "rule"
+        } else {
+            "default"
+        }),
+    );
+    if let Some(schema) = o.get_mut("schema").and_then(Value::as_array_mut) {
+        for column in schema {
+            let name = column
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let level = classified.columns.iter().find(|(c, _)| c == name);
+            if let (Some((_, level)), Some(column)) = (level, column.as_object_mut()) {
+                column.insert("classification".to_owned(), json!(level));
+            }
+        }
+    }
+}
+
+/// [`set_badges`] for a detail body: classified by `names` (the asset's
+/// keys, plus its display name — a rule may be written against either),
+/// with health from the `qualityChecks` already on the body.
+async fn mark_badges(state: &AppState, body: &mut Value, names: &[String]) {
+    let mut names = names.to_vec();
+    if let Some(title) = body.get("name").and_then(Value::as_str) {
+        names.push(title.to_owned());
+    }
+    let rules = catalog_governance::classification_rules(state).await;
+    let classified = catalog_governance::classify(&rules, &names);
+    let checks = body
+        .get("qualityChecks")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    set_badges(body, &classified, &checks);
+}
+
+/// [`set_badges`] for every row of a list body, from one load of the
+/// classification rules and the quality index. A Bronze row is known by
+/// its slug, its title and its registry table (`bronze.<table>`); any
+/// other row by its id, its title and its bare table name.
+async fn apply_badges(state: &AppState, body: &mut Value, bronze_pairs: &[(String, String)]) {
+    let (rules, quality) = tokio::join!(
+        catalog_governance::classification_rules(state),
+        catalog_governance::QualityIndex::load(state, None),
+    );
+    let table_of: HashMap<&str, &str> = bronze_pairs
+        .iter()
+        .map(|(slug, table)| (slug.as_str(), table.as_str()))
+        .collect();
+    let Some(assets) = body.get_mut("assets").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for asset in assets {
+        let text = |key: &str| {
+            asset
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let id = text("id");
+        let mut names = vec![id.clone(), text("name")];
+        match table_of.get(id.as_str()).filter(|t| !t.is_empty()) {
+            Some(table) => names.extend([format!("bronze.{table}"), (*table).to_owned()]),
+            None => names.extend(id.split_once('.').map(|(_, table)| table.to_owned())),
+        }
+        let classified = catalog_governance::classify(&rules, &names);
+        let checks = quality.checks_for(&names);
+        set_badges(asset, &classified, &checks);
+    }
+}
+
 /// Fills what governs and what uses the asset — see `catalog_governance`:
 /// `policySummary` (policies bound to `tables`, qualified as policies name
 /// them), `qualityChecks` (checks naming the asset by any of `names`),
@@ -1332,7 +1436,9 @@ async fn mark_governance(
     names: &[String],
 ) {
     let policies = catalog_governance::policy_summary(state, principal, tables).await;
-    let checks = catalog_governance::quality_checks(state, names).await;
+    let checks = catalog_governance::QualityIndex::load(state, Some(names))
+        .await
+        .checks_for(names);
     let dependents = catalog_governance::dependents(state, principal, tables).await;
     let (usage, recent_queries) = catalog_governance::usage(state, principal, tables).await;
     if let Some(o) = body.as_object_mut() {
@@ -1520,6 +1626,7 @@ async fn clickhouse_asset_detail(
         &[key.clone(), table.clone()],
     )
     .await;
+    mark_badges(state, &mut body, &[id.to_owned(), key, table.clone()]).await;
     mark_annotation_and_history(state, &mut body, id).await;
     Ok((StatusCode::OK, ApiJson(body)).into_response())
 }
@@ -1707,6 +1814,7 @@ async fn bronze_asset_detail_body(
         names.push(table.to_owned());
     }
     mark_governance(state, principal, &mut body, &tables, &names).await;
+    mark_badges(state, &mut body, &names).await;
     mark_annotation_and_history(state, &mut body, slug).await;
     Ok(Some(body))
 }
@@ -2616,6 +2724,65 @@ mod tests {
             changed_annotation_fields(None, &body("", "First description", &[])),
             vec!["description"]
         );
+    }
+
+    /// A Silver table that holds data in `ClickHouse` is Hot, as a mart is;
+    /// a Silver view is not.
+    #[test]
+    fn a_silver_table_with_parts_is_hot_and_a_view_is_warm() {
+        let parts = part_stats(&parts_row("1", "60", "2026-09-30T08:00:00Z"));
+        assert_eq!(
+            silver_catalog_row("orders", "MergeTree", 4, parts.as_ref())["tier"],
+            json!("hot")
+        );
+        assert_eq!(
+            silver_catalog_row("v_orders", "View", 4, None)["tier"],
+            json!("warm")
+        );
+    }
+
+    /// The badges are worked out from the row itself: health from its
+    /// freshness against its target and its checks, classification from
+    /// the rules, down to the columns.
+    #[test]
+    fn set_badges_fills_health_and_classification_with_their_reasons() {
+        let mut row = clickhouse_detail_body(
+            "silver.orders",
+            "orders",
+            "silver",
+            "MergeTree",
+            None,
+            &[
+                json!({ "name": "email", "dataType": "String" }),
+                json!({ "name": "id", "dataType": "UInt64" }),
+            ],
+            &[],
+        );
+        // Nothing measured, nothing classified.
+        let unclassified = catalog_governance::classify(&[], &["silver.orders".to_owned()]);
+        set_badges(&mut row, &unclassified, &[]);
+        assert_eq!(row["health"], json!("unknown"));
+        assert_eq!(row["healthReasons"], json!([]));
+        assert_eq!(row["classification"], json!("internal"));
+        assert_eq!(row["classificationSource"], json!("default"));
+
+        // Late against its target, one failed high-severity check, and a
+        // column a rule calls restricted.
+        row["freshnessLagSeconds"] = json!(9 * 86_400);
+        set_freshness_target(&mut row, 129_600, "frequency");
+        let classified = catalog_governance::Classified {
+            level: "restricted".to_owned(),
+            from_rule: true,
+            columns: vec![("email".to_owned(), "restricted".to_owned())],
+        };
+        let checks = [json!({ "name": "id_unique", "status": "failed", "severity": "high" })];
+        set_badges(&mut row, &classified, &checks);
+        assert_eq!(row["health"], json!("unhealthy"));
+        assert_eq!(row["healthReasons"].as_array().map(Vec::len), Some(3));
+        assert_eq!(row["classification"], json!("restricted"));
+        assert_eq!(row["classificationSource"], json!("rule"));
+        assert_eq!(row["schema"][0]["classification"], json!("restricted"));
+        assert!(row["schema"][1].get("classification").is_none());
     }
 
     /// A row's freshness target says how old is too old, and on whose word.

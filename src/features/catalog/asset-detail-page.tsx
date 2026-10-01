@@ -39,6 +39,7 @@ import { fmtMeasured } from "@/lib/measured"
 import { DATA_LAYER_LABEL, ENGINE_CATEGORY_LABEL } from "@/lib/status"
 import { assetService } from "@/services"
 import { ASSET_TYPE_LABEL, type RequestAccessInput } from "@/services/contracts/assets"
+import { classificationTitle, healthTitle, tierTitle } from "./asset-badges"
 import { AssetDetailTabs } from "./asset-detail-tabs"
 
 /**
@@ -115,9 +116,12 @@ export function AssetDetailPage() {
         title={a.name}
         titleAccessory={
           <>
-            <TierBadge tier={a.tier} />
-            <ClassificationBadge classification={a.classification} />
-            <HealthBadge health={a.health} />
+            <TierBadge tier={a.tier} title={tierTitle(a)} />
+            <ClassificationBadge
+              classification={a.classification}
+              title={classificationTitle(a)}
+            />
+            <HealthBadge health={a.health} title={healthTitle(a)} />
             {missingPermissions.length > 0 ? (
               <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
                 Request access

@@ -176,6 +176,7 @@ function stubApi({
     if (method === "PUT" && path.endsWith("/annotation")) return json({ ok: true })
     if (method === "POST" && path.endsWith("/run")) return json({ id: "q2", status: "passed", value: "0 repeated values in 50 rows" })
     if (method === "POST" && path.endsWith("/api/governance/quality")) return json({ id: "new" }, 201)
+    if (method === "POST" && path.endsWith("/api/governance/classification")) return json({ id: "c1" }, 201)
     if (path.includes("/api/auth/me")) {
       return json({ id: "u1", name: "Reader", email: null, roles: ["Analyst"], permissions, tenants: [] })
     }
@@ -566,5 +567,67 @@ describe("About card", () => {
     renderTabs()
     await screen.findByText("About")
     await waitFor(() => expect(screen.queryByText("Edit")).toBeNull())
+  })
+})
+
+describe("Health and classification", () => {
+  it("says what the health rests on, signal by signal", async () => {
+    stubApi()
+    renderTabs({
+      ...BRONZE,
+      health: "degraded",
+      healthReasons: ["Late: written 8d 3h ago, expected within 36h 00m", "1 of 2 quality checks passed"],
+    })
+
+    const tile = (await screen.findByText("Health")).closest("div") as HTMLElement
+    expect(within(tile).getByText("Degraded")).toBeTruthy()
+    expect(within(tile).getByText("Late: written 8d 3h ago, expected within 36h 00m")).toBeTruthy()
+    expect(within(tile).getByText("1 of 2 quality checks passed")).toBeTruthy()
+  })
+
+  it("says nothing measures the asset, rather than leaving Unknown unexplained", async () => {
+    stubApi()
+    renderTabs({ ...BRONZE, health: "unknown", healthReasons: [] })
+
+    const tile = (await screen.findByText("Health")).closest("div") as HTMLElement
+    expect(within(tile).getByText(/Nothing measures this asset yet/)).toBeTruthy()
+  })
+
+  it("shows the asset's and its columns' classification, and where it comes from", () => {
+    stubApi()
+    url.search = "tab=access"
+    renderTabs({
+      ...BRONZE,
+      classification: "restricted",
+      classificationSource: "rule",
+      schema: [
+        { name: "id", dataType: "Int64" },
+        { name: "email", dataType: "String", classification: "restricted" },
+      ],
+    })
+
+    const card = screen.getByText("Classification").closest("[data-slot=card]") as HTMLElement
+    expect(within(card).getByText(/Set by a classification rule/)).toBeTruthy()
+    const email = within(card).getByText("email").closest("li") as HTMLElement
+    expect(within(email).getByText("Restricted")).toBeTruthy()
+  })
+
+  it("classifies a column by adding a rule for the table key, then reloads", async () => {
+    const fetchSpy = stubApi()
+    const reloaded = mock(() => {})
+    url.search = "tab=access"
+    renderTabs(BRONZE, reloaded)
+
+    const card = screen.getByText("Classification").closest("[data-slot=card]") as HTMLElement
+    expect(within(card).getByText(/The default level/)).toBeTruthy()
+    fireEvent.click(within(card).getByText("Classify"))
+    fireEvent.change(screen.getByLabelText("Applies to"), { target: { value: "amount" } })
+    fireEvent.change(screen.getByLabelText("Classification"), { target: { value: "confidential" } })
+    fireEvent.click(screen.getByRole("button", { name: "Save" }))
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)).toEqual([
+      ["POST", "/api/governance/classification", { asset: "bronze.demo_orders", column: "amount", classification: "confidential" }],
+    ])
   })
 })

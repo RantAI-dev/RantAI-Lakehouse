@@ -57,6 +57,18 @@ export type Asset = {
   // WS1 task 1.9 — null in place of the empty-string placeholder for "unknown".
   lastUpdated: string | null
   health: Health
+  /**
+   * The signals `health` rests on, one line each ("Late: written 8d 3h
+   * ago, expected within 36h 00m", "1 of 2 quality checks passed"). Empty
+   * when nothing measures the asset and it is `unknown`.
+   */
+  healthReasons?: string[]
+  /**
+   * `"rule"` when a classification rule names the asset or one of its
+   * columns; `"default"` when none does and `classification` is the
+   * deployment's default level.
+   */
+  classificationSource?: "rule" | "default"
   residency: string
   /**
    * Recorded by people in the console (`asset_annotation`), not by the

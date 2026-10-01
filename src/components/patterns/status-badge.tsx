@@ -131,13 +131,16 @@ const HEALTH_TONE: Record<Health, Tone> = {
 /** Health pill for services, connectors, and assets. */
 export function HealthBadge({
   health,
+  title,
   className,
 }: {
   health: Health
+  /** Why it has this status, shown on hover. */
+  title?: string
   className?: string
 }) {
   return (
-    <Pill tone={HEALTH_TONE[health]} className={className}>
+    <Pill tone={HEALTH_TONE[health]} title={title} className={className}>
       <span className="size-1.5 rounded-full bg-current" aria-hidden />
       {HEALTH_LABEL[health]}
     </Pill>
@@ -154,13 +157,15 @@ const TIER_TONE: Record<StorageTier, Tone> = {
 /** Storage tier pill (Hot / Warm / Cold / AI). */
 export function TierBadge({
   tier,
+  title,
   className,
 }: {
   tier: StorageTier
+  title?: string
   className?: string
 }) {
   return (
-    <Pill tone={TIER_TONE[tier]} className={className}>
+    <Pill tone={TIER_TONE[tier]} title={title} className={className}>
       {STORAGE_TIER_LABEL[tier]}
     </Pill>
   )
@@ -176,13 +181,15 @@ const CLASSIFICATION_TONE: Record<Classification, Tone> = {
 /** Data classification pill. */
 export function ClassificationBadge({
   classification,
+  title,
   className,
 }: {
   classification: Classification
+  title?: string
   className?: string
 }) {
   return (
-    <Pill tone={CLASSIFICATION_TONE[classification]} className={className}>
+    <Pill tone={CLASSIFICATION_TONE[classification]} title={title} className={className}>
       {CLASSIFICATION_LABEL[classification]}
     </Pill>
   )
