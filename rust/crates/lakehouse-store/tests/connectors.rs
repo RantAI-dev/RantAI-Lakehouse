@@ -24,10 +24,10 @@ use lakehouse_store::audit::{NewAuditEvent, insert as insert_audit_event};
 use lakehouse_store::connector_probe_result::list_probe_results;
 use lakehouse_store::connectors::{
     ConnectorFilter, CreateConnectorInput, CredentialKind, CredentialSource, CredentialSpec,
-    IngestSpecInput, SecretRefSwap, SecretSlot, UpdateConnectorInput, connector_in_tenants,
-    create_connector, delete_connector, get_connector, get_connector_dial_info, get_ingest_spec,
-    list_connectors, list_ingestible_connectors, record_test_result, set_ingest_spec,
-    swap_secret_ref, swap_secret_refs, update_connector,
+    IngestSpecInput, SecretRefSwap, SecretSlot, UpdateConnectorInput, any_connector_targets,
+    connector_in_tenants, create_connector, delete_connector, get_connector,
+    get_connector_dial_info, get_ingest_spec, list_connectors, list_ingestible_connectors,
+    record_test_result, set_ingest_spec, swap_secret_ref, swap_secret_refs, update_connector,
 };
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::pipelines::{CreatePipelineInput, create_pipeline};
@@ -1575,5 +1575,106 @@ async fn connector_in_tenants_admits_only_the_connectors_own_tenant(
             .await
             .expect("query")
     );
+    Ok(())
+}
+
+/// A SQL connector's ingest spec with the given `source_objects`.
+fn sql_spec_with_objects(source_objects: serde_json::Value) -> IngestSpecInput {
+    IngestSpecInput {
+        adapter: "sql".to_owned(),
+        ingest_mode: "batch".to_owned(),
+        dial: serde_json::json!({
+            "driver": "postgres",
+            "host": "source.example.internal",
+            "port": 5432,
+            "database": "orders",
+            "user": "app_reader",
+        }),
+        source_objects,
+        schedule_cron: None,
+    }
+}
+
+/// An upload may never load into a table a connector loads (ADR 0014,
+/// decision 5). `any_connector_targets` answers for every connector, by the
+/// `target` of each source object and by nothing else: not a prefix, not a
+/// different case, not the object's `name`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn any_connector_targets_matches_a_target_exactly_and_nothing_else(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let (created, _) = create_connector(&pool, &minimal_input("targets lookup"))
+        .await
+        .unwrap();
+    let spec = sql_spec_with_objects(serde_json::json!([
+        { "name": "public.orders", "target": "sales_orders", "loadMode": "replace" },
+        { "name": "public.items", "target": "sales_items" },
+    ]));
+    set_ingest_spec(&pool, &created.id, &spec).await.unwrap();
+
+    for hit in ["sales_orders", "sales_items"] {
+        assert!(
+            any_connector_targets(&pool, hit).await.unwrap(),
+            "{hit} is a target"
+        );
+    }
+    // `0034_seed_connector_ingest_spec.sql` seeds `conn-pg-lakehouse` with
+    // the target `orders`: a row no test here wrote is found too.
+    assert!(any_connector_targets(&pool, "orders").await.unwrap());
+
+    for miss in [
+        "sales_order",
+        "sales_orders_2",
+        "Sales_Orders",
+        "public.orders",
+        "public.items",
+        "customers",
+        "",
+    ] {
+        assert!(
+            !any_connector_targets(&pool, miss).await.unwrap(),
+            "{miss:?} is not a target"
+        );
+    }
+
+    // The connector goes: its targets go with it.
+    delete_connector(&pool, &created.id).await.unwrap();
+    assert!(!any_connector_targets(&pool, "sales_orders").await.unwrap());
+    Ok(())
+}
+
+/// `source_objects` is a plain JSONB with no CHECK that it is an array.
+/// A value that is not one (or holds elements that are not objects) is
+/// never a match, and never an error: one odd row must not turn every
+/// upload into a 500.
+#[sqlx::test(migrations = "../../migrations")]
+async fn any_connector_targets_ignores_a_source_objects_value_that_is_not_a_list_of_objects(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    for malformed in [
+        serde_json::json!({ "target": "sales_orders" }),
+        serde_json::json!("sales_orders"),
+        serde_json::json!(5),
+        serde_json::Value::Null,
+        serde_json::json!([1, "sales_orders", null, { "name": "no target" }]),
+        serde_json::json!([{ "target": 5 }, { "target": ["sales_orders"] }]),
+    ] {
+        sqlx::query("UPDATE connector SET source_objects = $1 WHERE id = 'conn-s3-warehouse'")
+            .bind(&malformed)
+            .execute(&pool)
+            .await?;
+        assert!(
+            !any_connector_targets(&pool, "sales_orders").await.unwrap(),
+            "{malformed} must not match"
+        );
+    }
+
+    // The same row, once it holds a real list, matches: the query is not
+    // simply answering `false`.
+    sqlx::query("UPDATE connector SET source_objects = $1 WHERE id = 'conn-s3-warehouse'")
+        .bind(serde_json::json!([{ "name": "landing/a.csv", "target": "sales_orders" }]))
+        .execute(&pool)
+        .await?;
+    assert!(any_connector_targets(&pool, "sales_orders").await.unwrap());
     Ok(())
 }

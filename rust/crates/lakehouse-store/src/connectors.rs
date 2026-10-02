@@ -1500,6 +1500,39 @@ pub async fn list_ingestible_connectors(
         .collect())
 }
 
+/// Whether any connector (of any tenant: raw table names are shared) lands
+/// rows in the table `table`, that is, whether its `source_objects` array
+/// holds an element whose `target` is exactly `table`.
+///
+/// The check an upload makes before it may load into a name: it may never
+/// load into a table a connector loads (ADR 0014, decision 5), whether or
+/// not that table exists yet.
+///
+/// `source_objects` is a JSONB array of `{ "name", "target", ... }` objects
+/// ([`crate::ingest_spec::SourceObject`], `0033_connector_ingest_spec.sql`),
+/// and `target` is the raw table the object lands in. The comparison is
+/// exact, no case folding: the caller passes the name as it will be loaded.
+/// `table` is bound, never spliced into the SQL.
+///
+/// Array containment (`@>`) does the matching, not `jsonb_array_elements`,
+/// on purpose: the column is a plain JSONB with no CHECK that it is an
+/// array, `jsonb_array_elements` raises on a value that is not one and
+/// would turn one odd row into an error for every upload, while containment
+/// answers `false` for it.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] on a database failure.
+pub async fn any_connector_targets(pool: &PgPool, table: &str) -> Result<bool, StoreError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM connector \
+         WHERE source_objects @> jsonb_build_array(jsonb_build_object('target', $1::text)))",
+    )
+    .bind(table)
+    .fetch_one(pool)
+    .await?)
+}
+
 /// Pipelines that read from connector `id`, by name. There is no foreign
 /// key behind `pipeline_definition.connector_id`, so this is the only
 /// thing standing between a connector delete and a pipeline left pointing
