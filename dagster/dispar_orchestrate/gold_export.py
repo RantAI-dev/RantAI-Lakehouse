@@ -309,6 +309,20 @@ def export_gold_mart(context, mart: str) -> dict[str, Any]:
     try:
         body = export_one_mart(cfg, mart)
     except requests.HTTPError as exc:
+        # PR slice C review C-B1: HTTP 409 — the API's single-flight lock
+        # (an export of this mart is already running) — is a skip, not a
+        # failure. Record it and return without raising; no
+        # AssetMaterialization, because nothing was written in this run.
+        if exc.response is not None and exc.response.status_code == 409:
+            context.log.info(f"skipped {mart!r}: already running (HTTP 409)")
+            record_maintenance_run(
+                table_name=f"gold.{mart}",
+                dry_run_metrics={},
+                applied_metrics={},
+                skipped_verbs=["already_running"],
+                target=cfg.ch,
+            )
+            return {"skipped": True, "reason": "already_running"}
         # Bare re-raise of the HTTPError (no `Failure` wrap) -- lets
         # `DEFAULT_RETRY_POLICY` (max_retries=2, delay=30s, exponential
         # backoff with +/- jitter) retry a transient 5xx (busy ClickHouse
@@ -437,14 +451,15 @@ def gold_export_job() -> None:
 # unset, no identity is seeded and `_headers` returns `{}` — the schedule
 # below is still registered and every run fails loudly (`401`/`503`),
 # which is the honest, visible failure mode, not a silent one.
-# gold-publish-per-mart plan T6: after an authored pipeline succeeds, launch
-# the nightly Gold export as one all-marts run. With T4's `ifChanged=true`
-# in place, unchanged marts cost one cheap check each; a mart is skipped
-# when its `max(modification_time)` last moved strictly before its last
-# successful export (PR slice B review B1). One daily run keeps the
-# accounting honest and prevents the accumulation of duplicate exports on
-# every authored pipeline success — Dagster's `run_key=<upstream run id>`
-# ensures a single pipeline success never triggers two Gold runs.
+# PR slice C review C-S1: each authored pipeline SUCCESS launches one
+# all-marts `gold_export_job` run. With T4's `ifChanged=true` in place,
+# unchanged marts cost one cheap check each and are skipped (no duplicate
+# copy); a mart is skipped when its `max(modification_time)` last moved
+# strictly before its last successful export (PR slice B review B1).
+# Dagster's `run_key=<upstream run id>` prevents a single pipeline
+# success from launching two Gold runs. The nightly 04:00 schedule is
+# the safety net, not the only trigger; with all marts already published
+# by the sensor, the nightly run produces mainly skips.
 #
 # `monitored_jobs=None` (watch every job in this code location) with a
 # filter in the body: only `authored__<id>` jobs (the same prefix

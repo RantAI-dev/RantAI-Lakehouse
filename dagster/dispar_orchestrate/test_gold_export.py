@@ -446,6 +446,31 @@ class GoldExportFanOutTest(unittest.TestCase):
         self.assertEqual(gold_export._sanitize_mapping_key("x²"), "x_")
         self.assertEqual(gold_export._sanitize_mapping_key("plain_ok"), "plain_ok")
 
+    def test_an_http_409_is_a_skip_not_a_failure(self) -> None:
+        """PR slice C review C-B1: a 409 from the API's single-flight lock
+        (export of this mart already running) is a skip — records
+        `skipped_verbs=["already_running"]`, emits no
+        `AssetMaterialization`, returns without raising."""
+        import requests
+
+        from dispar_orchestrate import gold_export
+
+        cfg = mock.Mock(marts=["mart_a"], ch=None)
+        err = requests.HTTPError("409 Conflict: export of mart_a already running")
+        resp = mock.Mock(spec=requests.Response)
+        resp.status_code = 409
+        err.response = resp
+        with mock.patch.object(gold_export.GoldExportConfig, "from_env", return_value=cfg), \
+                mock.patch.object(gold_export, "export_one_mart", side_effect=err), \
+                mock.patch.object(gold_export, "record_maintenance_run") as mocked_record:
+            body = gold_export.export_gold_mart(build_op_context(), "mart_a")
+
+        self.assertEqual(body, {"skipped": True, "reason": "already_running"})
+        self.assertEqual(mocked_record.call_count, 1)
+        self.assertEqual(
+            mocked_record.call_args.kwargs["skipped_verbs"], ["already_running"]
+        )
+
 
 class GoldExportAfterAuthoredSensorTests(unittest.TestCase):
     """gold-publish-per-mart plan T6: `gold_export_after_authored_sensor`
