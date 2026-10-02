@@ -1,19 +1,23 @@
 """Unit tests for `gold_export.py`'s scheduled trigger (WS6).
 
-`gold_export_job` has been registered without a schedule since ADR 0010
-(no route auth wiring existed for it, so a nightly 401 would have gone
-unnoticed). This module tests only the schedule's own shape: that it
-exists, fires on the documented cadence, and is registered
-`DefaultScheduleStatus.RUNNING` — the same convention
-`bronze_maintenance_schedule`, `capacity_snapshot_schedule`, and
-`alerts_run_schedule` already follow, and for the same reason: a schedule
-created stopped never fires until someone notices and toggles it in the
-Dagster UI, and from the outside a stopped schedule looks identical to a
-healthy one. `default_status` must be passed the `DefaultScheduleStatus`
-enum member, not a bare string — the installed Dagster version raises
+This module tests the schedule's own shape — that it exists, fires on
+the documented cadence, and is registered `DefaultScheduleStatus.RUNNING`
+(the same convention `bronze_maintenance_schedule`,
+`capacity_snapshot_schedule`, and `alerts_run_schedule` already follow,
+and for the same reason: a schedule created stopped never fires until
+someone notices and toggles it in the Dagster UI, and from the outside a
+stopped schedule looks identical to a healthy one. `default_status` must
+be passed the `DefaultScheduleStatus` enum member, not a bare string —
+the installed Dagster version raises
 `dagster._core.errors.ParameterCheckError` for a string (confirmed by
 running the check directly against this venv before writing this test;
-`test_alerts_run.py`'s WS0 fix hit the identical failure).
+`test_alerts_run.py`'s WS0 fix hit the identical failure) — plus the
+auth headers the scheduled request carries (gold-publish-per-mart plan
+T1: the same `GOLD_EXPORT_RUN_TOKEN` value must go out as BOTH the
+`Authorization: Bearer` credential that clears `auth_gate`'s
+`RequiresAuth` floor — `bootstrap_gold_export_service` in
+`lakehouse-api::main` mints the matching identity at API boot — and the
+`x-run-token` header that satisfies `check_export_token`'s token branch).
 
 The fan-out tests drive the rebuilt `gold_export_job` end-to-end via
 `execute_in_process` (no network, no real `lakehouse-api`), inspecting
@@ -25,10 +29,74 @@ from __future__ import annotations
 
 import unittest
 from unittest import mock
+from unittest.mock import MagicMock
+
+import requests
 
 from dagster import AssetMaterialization, DefaultScheduleStatus, build_op_context
 
-from dispar_orchestrate.gold_export import gold_export_job, gold_export_schedule
+from dispar_orchestrate import gold_export
+from dispar_orchestrate.gold_export import (
+    GoldExportConfig,
+    _headers,
+    gold_export_job,
+    gold_export_schedule,
+)
+
+
+def _cfg(run_token: str = "a-real-token") -> GoldExportConfig:
+    return GoldExportConfig(
+        ch=None,  # type: ignore[arg-type]
+        api_url="http://lakehouse-api.invalid:8080",
+        marts=[],
+        run_token=run_token,
+    )
+
+
+class _FakeContext:
+    """A minimal stand-in for Dagster's op `context`: only `log.info` is
+    exercised by `export_one_mart`."""
+
+    def __init__(self) -> None:
+        self.log = MagicMock()
+
+
+class GoldExportHeaderTests(unittest.TestCase):
+    """gold-publish-per-mart plan T1: `auth_gate`'s `RequiresAuth` floor
+    runs before `check_export_token`'s own token check, so the scheduled
+    request must carry the shared token BOTH ways (bearer credential for
+    the floor, `x-run-token` for the handler gate) — the exact shape
+    `alerts_run.py::_headers` already uses."""
+
+    def test_set_token_sends_both_bearer_and_run_token_headers(self) -> None:
+        headers = _headers(_cfg(run_token="tok-123"))
+        self.assertEqual(headers["Authorization"], "Bearer tok-123")
+        self.assertEqual(headers["x-run-token"], "tok-123")
+
+    def test_unset_token_sends_no_headers(self) -> None:
+        self.assertEqual(_headers(_cfg(run_token="")), {})
+
+    def test_export_one_mart_posts_with_both_headers_and_timeout(self) -> None:
+        """The header pair actually flows through `export_one_mart`'s
+        POST — not just through `_headers` in isolation."""
+        response = mock.Mock(spec=requests.Response)
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"rowsExported": 5}
+
+        with mock.patch.object(
+            gold_export.requests, "post", return_value=response
+        ) as mocked_post:
+            body = gold_export.export_one_mart(_cfg(run_token="tok-xyz"), "mart_a")
+
+        mocked_post.assert_called_once_with(
+            "http://lakehouse-api.invalid:8080/api/gold/export/mart_a",
+            headers={
+                "x-run-token": "tok-xyz",
+                "Authorization": "Bearer tok-xyz",
+            },
+            timeout=60,
+        )
+        self.assertEqual(body, {"rowsExported": 5})
 
 
 class GoldExportScheduleTests(unittest.TestCase):
