@@ -79,8 +79,8 @@ The modules are the groups in the console's navigation
 | **Home** | Starts work: ask, instruct, see what needs attention | Built |
 | **Ask AI** | Chats with the assistant, which answers questions and performs actions | Built; needs a model endpoint |
 | **Dashboards** | Builds and views dashboards; filters, drills, shares, embeds | Built |
-| **Data** | Browses the catalog and assets; writes SQL or asks in plain language; registers sources | Built |
-| **Build** | Creates, schedules and operates pipelines; publishes Gold tables in open format | Built; publishing is being reworked |
+| **Data** | Browses the catalog and assets; writes SQL or asks in plain language; registers sources; switches a Gold table's open-format publishing on or off from its page | Built; publishing is merged but not yet accepted |
+| **Build** | Creates, schedules and operates pipelines | Built |
 | **Governance** | Sets policies, classifies and masks data, checks quality, views lineage, approves AI actions | Built; policies and lineage are partial |
 | **Monitoring** | Checks health, alerts, audit log, workloads, services, capacity, table maintenance, ingestion | Built; some pages partial |
 | **Intelligence** | Digital employees and their runs | Parked; shown as "Soon" |
@@ -115,7 +115,7 @@ hands-on testing.
 
 | Capability | Ours | Competitors | Gap |
 | --- | --- | --- | --- |
-| Open table format | **Partial.** Raw data is Iceberg. Curated (Gold) data is in the engine's own format, with an Iceberg copy on request | Yes; most keep one open copy as the source of truth | Automatic publishing (in progress); later, open-first |
+| Open table format | **Partial.** Raw data is Iceberg. Curated (Gold) data is in the engine's own format; an Iceberg copy is kept automatically for tables switched on (merged, not yet accepted) | Yes; most keep one open copy as the source of truth | Open-first storage, later |
 | Query a table as it was at an earlier time | **Missing.** Past snapshots are listed on the table page but cannot be queried | Yes (Snowflake Time Travel and equivalents) | Yes |
 | Instant copies of a table for testing | **Missing** | Yes (zero-copy clone, branching) | Yes |
 | Share data with another organisation | **Missing** | Yes (built-in sharing) | Yes |
@@ -216,9 +216,10 @@ Stated plainly, for anyone describing the product to a customer. More detail
 in `README.md` ("Status / Known limitations").
 
 **Data**
-- Curated tables are in open format only after publishing, which is manual
-  today. A published table holds every past copy; outside readers must pick
-  the latest. Tables over 5,000,000 rows are refused.
+- Curated tables are in open format only when publishing is switched on for
+  that table; it is off by default. A published table holds every past
+  copy; outside readers must pick the latest. Tables over 5,000,000 rows
+  are refused. A background merge in the engine can cause one extra copy.
 - Raw table history is never trimmed.
 - A plain row count on a change-captured table can overcount on some engine
   versions. The product's own queries avoid this; a hand-written one may not.
@@ -296,7 +297,7 @@ customer would hit first, not matching every feature.
 
 | Item | Why |
 | --- | --- |
-| Gold tables publish in open format automatically, per table | Makes the "open" claim true without manual work. In build |
+| Accept Gold publishing: run its checklist on a real deployment | Built and merged; "open" is only proven once someone has seen it work |
 | Accept the built features one by one | Blocker 1; also gives a true picture of what works |
 | Clear blockers 2 and 4 | Small, and they are embarrassing if found |
 

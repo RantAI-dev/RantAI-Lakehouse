@@ -1061,3 +1061,48 @@ Reviewer's run on `7fa31c5`: `bun run typecheck` — 0 errors; `bun run
 lint` — 0 errors, 6 warnings; `bun run test` — **298 pass, 0 fail**.
 
 Not verified by the reviewer: the card in a running console.
+
+### PR slices C and D — re-review after fixes (reviewer, 2026-10-02)
+
+Reviewed `aae8362`, `6a85d8a` (slice C) and `c7d2c98`, `9e34936`,
+`51bc527`, `54f03b5` (slice D).
+
+- **C-B1 closed.** A `409` records `skipped_verbs=["already_running"]`,
+  emits no materialization and returns; a unit test covers it.
+- **C-B2 closed.** The branch is pushed and has its handoff entry.
+- **C-S1 closed.** The comment now describes what the sensor does.
+- **D-B1 closed.** The handoff no longer claims a PR #65 and says the card
+  was not verified in a running console.
+- **D-B2 closed.** Failed runs show their reason.
+- **D-B3 closed.** The freshness line is always shown; a mart published
+  earlier and then switched off shows its last published time, its snapshot
+  and "Publishing is off; this copy is no longer updated."
+- **D-S1 to D-S5 closed.** The existing `Switch` is used; the toggle error
+  comes from `toggle.status`; "Publish now" is hidden without `canEdit`; the
+  changelog leads with plain sentences; one shared helper parses and
+  compares the two times for the card and the overview page.
+
+**No open `BLOCKER` or `SHOULD-FIX`.**
+
+Planner's decision: slices C and D ship as one pull request, not two. Both
+are reviewed, they touch different languages, and both append to this plan
+file, so merging them one after the other would mean a second conflict
+resolution and a second full CI run for no gain in review. The sensor can
+still be switched off on its own in the orchestrator. Slice C was merged
+into the slice D branch; it merged cleanly.
+
+Verification re-run by the reviewer on the combined branch, foreground. The
+combined diff against `main` touches no Rust, so no cargo command was run:
+
+- `bun run typecheck` — 0 errors.
+- `bun run lint` — 0 errors, 6 warnings.
+- `bun run test` — **301 pass, 0 fail**, 56 files.
+- `python3 ops/lint/check_intra_package_imports.py` — pass.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` — **379 passed,
+  30 subtests passed**.
+
+Not verified by anyone: the card in a running console, and the sensor
+launching an export on a running stack. Both are what the acceptance
+checklist in `docs/core/features/gold-publish-per-mart.md` is for. The
+feature is merged, not accepted.
