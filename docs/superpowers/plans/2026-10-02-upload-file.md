@@ -343,6 +343,15 @@ Rewrite `dagster/dispar_orchestrate/file_ingest.py`.
   Re-raise after recording a failure so the run is red.
 - No `psycopg2`. Module docstring, `from __future__ import annotations`.
 - Register `file_ingest_job` in `definitions.py`.
+- From the review of slice A (section 9):
+  - `SHOULD-FIX A1`: `ch_models.py` holds a SQL-model runner (`Model`,
+    `run_model`, `run_models`, `_split_target`, `ALLOWED_SCHEMAS`) that has
+    had no caller since T2. Put the three helpers still in use
+    (`ch_target`, `ensure_catalog_database`, `ch_exec`) beside the shared
+    registration helper and delete the rest of the file.
+  - `SHOULD-FIX A2`: `connector_catalog.py`'s docstring still says raw
+    tables are append-only. Since load modes (`0941ce4`) a run replaces by
+    default. Say what is true when the helper is reshaped.
 - Tests, no network, fakes injected as in `test_connector_catalog.py`:
   every fixture of T5 parses to the same JSON; each failure reason; the row
   cap fails and writes nothing; the mode reaches `LoadPlan`; one outcome
@@ -659,3 +668,52 @@ tells the other sessions on this machine, deploys them to the development
 stack, runs `ops/g9/upload_test.py`, and hands the feature page's checklist
 to the product owner. Nothing is merged into `feat/connectors` before that
 checklist has been run.
+
+### Slice A — T1, T2 (reviewer, 2026-10-02)
+
+Reviewed `87646eb` and `46642fa` against T1 and T2.
+
+**Findings: no `BLOCKER`. Two `SHOULD-FIX`, both moved into T7.**
+
+- `SHOULD-FIX A1`: `dagster/dispar_orchestrate/ch_models.py` now carries a
+  SQL-model runner with no caller, and its docstring still introduces the
+  file as that runner. T2 was right not to prune it unasked. T7 does.
+- `SHOULD-FIX A2`: `connector_catalog.py`'s module docstring says "Bronze is
+  append-only". That stopped being true with load modes; T1 left the
+  sentence alone, correctly, since it was not in scope. T7 rewrites it.
+
+What was checked against the plan:
+
+- `cargo fmt` changed one file, one hunk, as T1 said it would.
+- The real count in `connector_catalog.py` carries `WHERE 1`, and the
+  comment says why the lint cannot enforce it there. The docstring edit is
+  what cleared the lint; the developer measured that between the two edits.
+- The test asserts the new statement and fails against the old module.
+- The fixture in `routes/catalog_governance.rs` keeps its meaning (which
+  table a query reads).
+- No lint, allowlist or threshold was changed (`git show --stat`: four
+  files in T1, five in T2).
+- Nothing imports the three removed modules; the orchestrator suite has the
+  same 402 tests before and after.
+- All three commits end with the developer model's `Co-Authored-By` line.
+
+Verification re-run by the reviewer on `05427c2`, warm shared
+`CARGO_TARGET_DIR`:
+
+- `cargo fmt --check` — pass.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` —
+  pass.
+- `cargo test -p lakehouse-api --bin lakehouse-api catalog_governance` — 18
+  passed. `cargo test -p lakehouse-api --test connector_delete_deprovision`
+  — 6 passed.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `python3 ops/lint/check_compose_init_readiness.py` — pass.
+- `python3 ops/lint/check_intra_package_imports.py` — fails on
+  `file_ingest.py:48`, as on the base. T7 clears it.
+- `python -m pytest dispar_orchestrate -q` — 402 passed, 30 subtests.
+
+Not re-run here: `cargo test --workspace` (the developer's run: 3,087
+passed, 0 failed, 8 ignored). The reviewer runs it once on the final commit
+before the trial.
+
+**Slice B starts from `feat/upload-file` at this review's commit.**
