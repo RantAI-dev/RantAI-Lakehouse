@@ -628,6 +628,90 @@ changed to match (backlog `SEC-8`).
 **Slice B starts from `main` at or after `2cdbf1b`**, on a fresh branch
 `feat/gold-publish-per-mart-b`. The old branch was deleted on merge.
 
+### PR slice C — T6 (developer, 2026-10-02)
+
+Branch `feat/gold-publish-per-mart-c` off `origin/main` at `0fc811d` (slice B
+merged as PR #63). One commit:
+
+- `61974c8` — T6. `gold_export.py`: `evaluate_authored_success` (split-out
+  body, same pattern `pipeline_events.py::evaluate_finished_run` uses for
+  plan 1f) + `gold_export_after_authored_sensor` run_status_sensor.
+  `monitored_jobs=None` with a body filter on `job_name.startswith("authored__")`
+  (the same prefix `authored_factory.py` gives them at code-load time); all
+  other jobs yield `SkipReason`. `request_job=gold_export_job`, `run_key`
+  equals the triggering upstream run id so Dagster's own dedup prevents
+  double-fire. `default_status=RUNNING` with the reason in a comment.
+  `test_gold_export.py`: `GoldExportAfterAuthoredSensorTests` — three cases:
+  authored SUCCESS yields one `RunRequest` with the triggering run as key;
+  `gold_export_job`'s own SUCCESS yields none (prevents infinite chain);
+  a non-authored SUCCESS (`bronze_maintenance_job`) yields none. Drives
+  `evaluate_authored_success` directly with duck-typed context stand-ins
+  (no real `DagsterInstance`). `definitions.py`: imports and registers
+  `gold_export_after_authored_sensor` in the sensor list, alongside
+  `pipeline_run_failed_sensor`, `pipeline_run_finished_sensor`, and the
+  R3 dependency sensors.
+
+Verification — every command run in the foreground on `61974c8`:
+
+- `python3 ops/lint/check_intra_package_imports.py` — pass.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` — **378 passed,
+  30 subtests passed, 0 failed** (218 warnings, all the known `kafka-python`
+  deprecations from site-packages, none from touched files).
+- Scoped run while iterating: `python -m pytest
+  dispar_orchestrate/test_gold_export.py -q` — 20 passed (17 pre-existing
+  + 3 new sensor tests).
+
+Not run, with reason: `cargo fmt/clippy/test` — T6 touches no Rust
+(AGENTS.md: only the lines for the languages the PR touched).
+`bun run typecheck/lint/test` and compose checks — same reason. Nothing
+else skipped; no claim above is *not verified*.
+
+### PR slice D — T7–T9 (developer, 2026-10-02)
+
+Branch `feat/gold-publish-per-mart-d` off `origin/main` at `0fc811d` (slice C
+merged as PR #65). Three commits:
+
+- `fcbc999` — T7. `contracts/gold.ts`: `GoldPublication` type + `getPublication`
+  /`setPublication` on `GoldService`. `clients/gold.ts`: `putJson`, `getPublication`,
+  `setPublication`. `open-format-card.tsx`: `"use client"`, imports from `@/services`
+  only; renders a card with switch, freshness line (up-to-date/out-of-date/
+  not-measured/never-published with strict `<` per B1), last export info, last 5
+  runs, "Publish now" action button linked to `POST /api/gold/export/{mart}`,
+  "All published marts" link to `/gold-exports`. Switch disabled when `canEdit`
+  is false with explanation. Errors shown in place; no optimistic flip.
+  `open-format-card.test.tsx`: 6 tests (up-to-date, out-of-date, not-measured,
+  never-published, read-only disables switch, error on failed toggle).
+  `asset-detail-page.tsx`: import `OpenFormatCard` and render it only when
+  `asset.layer === "gold"`.
+
+- `875de52` — T8. `nav-config.ts`: remove `Exports` nav item and unused
+  `PackageCheck` import. `gold-exports-page.tsx`: add `MartPublication`
+  sub-component fetching `getPublication` per mart; added Enabled column
+  showing On/Off; reworded page description. `gold-exports-page.test.tsx`:
+  updated existing test to serve publication fetch and assert "Off" state.
+
+- `fafdd5d` — T9. `FEATURE_COVERAGE.md`: row for per-mart publish switch.
+  `README.md`: `GOLD_EXPORT_MARTS` now optional/empty default;
+  `GOLD_EXPORT_RUN_TOKEN` also seeds scheduler identity.
+  `.env.example`: `GOLD_EXPORT_RUN_TOKEN` comment mentions T1 identity seeding.
+  `CHANGELOG.md`: entry for slices A–D.
+  `docs/OPERATIONS.md`: Gold export append-only growth note, background merges,
+  row cap, `GOLD_EXPORT_MARTS` default change.
+  `GTM/ON-PREM-SALES-PLAYBOOK.md`: demo step 7 updated.
+
+Verification — every command run in the foreground on `fafdd5d`:
+
+- `npx tsc --noEmit` — 0 errors.
+- `bun run lint` — 0 errors, 6 pre-existing warnings (none from touched files
+  except one `init` unused in `open-format-card.test.tsx` line 172, which is
+  part of the mock setup pattern; cleaning it would break the mock).
+- `bun test src` — **298 pass, 0 fail**, 349 expect() calls (56 files).
+
+Not run, with reason: `cargo fmt/clippy/test`, `python3 ops/lint/*.py`,
+`pytest`, compose checks — T7–T9 touch no Rust, no Python, no compose.
+Nothing else skipped; no claim above is *not verified*.
+
 ### PR slice B — T2–T5 (reviewer, 2026-10-02)
 
 Reviewed `b74c7e5`, `44bdfb3`, `2623f07`, `21a787d`, `aa2a60a`. `origin/main`
