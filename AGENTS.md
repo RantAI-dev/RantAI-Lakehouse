@@ -13,6 +13,50 @@ are in `docs/adr/`, phases/gates/risks in
 `docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md`, measurements in
 `docs/plans/*-RESULT.md`.
 
+## Who plans, who writes, who reviews
+
+Feature work in this repo is split across two agents, and the split is a
+rule, not a preference:
+
+- **Planner and reviewer: Claude Opus.** It researches, decides, writes the
+  plan, reviews the result, and opens and merges the pull request. It does
+  **not** write product code (`src/`,
+  `rust/`, `dagster/`, `ops/`, `docker-compose.yml`, migrations). It may
+  write plans, ADRs, this file, and review notes.
+- **Developer: a different agent** (any non-Opus coding agent). It writes
+  all product code and tests, and it does **not** change the plan's scope
+  or decisions. If the plan is wrong against the code, it stops and reports
+  the mismatch instead of improvising.
+
+The reason is independence: an author reviewing its own diff confirms its
+own assumptions. Keeping the roles in separate agents is what makes the
+review worth having.
+
+The loop, per feature:
+
+1. **Plan.** The planner writes `docs/superpowers/plans/YYYY-MM-DD-<slug>.md`:
+   decisions already made, anchors (`file:line`, verified at a named
+   commit), numbered tasks each with its acceptance check, PR slicing, and
+   what is out of scope.
+2. **Build.** The developer works on a feature branch off the named base,
+   one task per commit, in plan order. Each commit runs only the
+   scoped checks for what it touched ("Keep build time down" below); the
+   full verification block runs once, in the foreground, before handoff.
+3. **Hand off.** The developer appends a "Handoff" entry to the plan file
+   per PR slice: commits, the exact commands run with their counts, and
+   anything skipped or *not verified* with the reason (rule 7).
+4. **Review.** The planner reviews the diff against the plan and this file,
+   and writes findings into the plan under "Review", tagged `BLOCKER` or
+   `SHOULD-FIX`. It re-runs the verification itself; it does not trust the
+   handoff's "green".
+5. **Fix.** The developer fixes findings and cites them at the fix site
+   (rule 13). Steps 4–5 repeat until there is no open `BLOCKER`.
+6. **PR and merge.** The planner, as reviewer, opens the pull request from
+   the developer's branch and merges it once there is no open `BLOCKER`
+   and CI is green. The developer never opens or merges a PR. Nobody
+   pushes to `main` directly or force-pushes it; `main` only moves through
+   a merged PR.
+
 ## Five principles
 
 1. **Say why, at the code.** Module docs, migration headers, compose blocks
@@ -103,7 +147,37 @@ fixes (CHANGELOG) · `ADR NNNN` · `P5 review fix (BLOCKER|SHOULD-FIX)` /
 14. Prefer "unsupported, honestly" over "works, approximately."
 15. Don't yield to wait on a background job you have to report on.
 
-## Verification before any commit
+## Keep build time down
+
+A full Rust workspace build is the slowest thing in this repo. Do not pay
+for it on every step.
+
+- **Only build what changed.** A commit that touches no Rust runs no cargo
+  command at all. The same goes for TypeScript, Python and compose: run the
+  checks for the languages the commit touched, nothing else.
+- **Per commit, Rust is scoped to the crate.** `cargo fmt --check`, then
+  `cargo clippy -p <crate> --all-targets -- -D warnings` and
+  `cargo test -p <crate>` (add a test-name filter while iterating). Use
+  `cargo check -p <crate>` for a fast compile check between edits.
+- **The full workspace run happens once per PR slice**, by the developer
+  just before the handoff, and once more by the reviewer before merge. CI
+  runs it again on the PR. That is three full runs per PR, not one per
+  commit.
+- **Batch Rust work.** Plans order tasks so the Rust changes sit together,
+  and a migration lands in the same sitting as the code that uses it
+  (`sqlx::test` embeds migrations at compile time, so each migration edit
+  forces a rebuild).
+- **Never wipe the cache to get green.** No `cargo clean`, no per-worktree
+  `target/`; use the shared `CARGO_TARGET_DIR`.
+
+This changes how often the checks run, not what they are. Nothing is merged
+without the full block below having passed on the final commit, and rule 7
+still applies: a handoff quotes the commands and counts it actually ran, and
+says *not verified* for anything it did not.
+
+## Verification before handoff and before merge
+
+Run the lines for the languages the PR touched, on its final commit:
 
 ```bash
 cd rust && cargo fmt --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace
