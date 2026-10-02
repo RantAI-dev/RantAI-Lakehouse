@@ -300,7 +300,68 @@ The planner opens each PR from the developer's branch, reviews it, and merges it
 
 ## 7. Handoff (developer appends one entry per PR)
 
-_Empty._
+### PR slice A — T1 (developer, 2026-10-02)
+
+Commits:
+
+- `3f259ae` — `docs: add planner/developer workflow and gold publish plan`
+  (AGENTS.md + this plan file, unchanged, as instructed; the Handoff section
+  below is the only later edit to the plan).
+- `6e46c9f` — `T1: let the scheduled Gold export authenticate`. Rust
+  (`lakehouse-api`): `GOLD_EXPORT_SERVICE_IDENTITY_NAME` +
+  `bootstrap_gold_export_service` (empty scopes, from
+  `Config::gold_export_run_token`), called in `main` after
+  `bootstrap_ingest_run_service`; three unit tests mirroring the
+  `AGENT_RUN_TOKEN` seeding tests; `tests/gold_export_auth.rs` acceptance
+  test (negative control 401 before seeding; both headers clear `auth_gate`
+  and `check_export_token` after). Dagster: `_headers` sends
+  `Authorization: Bearer` + `x-run-token` (same shape as `alerts_run.py`);
+  the stale "gets `401` every night" schedule comment and the
+  `GoldExportConfig.run_token` field comment replaced with current truth;
+  `test_gold_export.py` gains both-headers/none-when-unset tests, a
+  POST-level header test, and a corrected module docstring.
+
+Verification — every command run in the foreground on `6e46c9f`, fresh
+build, counts quoted from the run:
+
+- `cd rust && cargo fmt --check` — pass.
+- `cd rust && cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` — pass, no warnings.
+- `cd rust && cargo test --workspace` — 76 suites, all `ok`: **2812 passed,
+  0 failed, 8 ignored**.
+- `python3 ops/lint/check_intra_package_imports.py` — pass.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` — **369 passed,
+  30 subtests passed, 0 failed**; the 218 warnings are all
+  `importlib.resources.read_text` deprecations from `kafka-python` in
+  site-packages, none from the touched files.
+- Scoped runs made earlier while iterating (same final content):
+  `cargo test -p lakehouse-api --bin lakehouse-api
+  agent_run_service_bootstrap` — 15 passed (12 pre-existing + 3 new);
+  `cargo test -p lakehouse-api --test gold_export_auth` — 1 passed;
+  `python -m pytest dispar_orchestrate/test_gold_export.py -q` — 11 passed
+  (8 pre-existing + 3 new).
+
+Not run, with reason: `bun run typecheck/lint/test` and
+`docker compose --profile '*' config`/`up` — T1 touches no TypeScript and
+no compose file (AGENTS.md: run only the lines for the languages the PR
+touched). Nothing else was skipped; no claim above is *not verified*.
+
+Environment notes for the reviewer:
+
+- This machine started with no Rust toolchain cache, no
+  `~/.cache/rantai-dagster-venv`, and no Docker access for this user. The
+  venv was created fresh from the exact pins in `dagster/pyproject.toml`
+  plus `pytest`; Docker became reachable after the user added this user to
+  the `docker` group (commands run under `sg docker`). Rust builds used
+  `CARGO_TARGET_DIR=/home/shiro/rantai/cargo-target` (outside the repo, no
+  `cargo clean`).
+- While this slice was in progress, the working tree gained planner-owned,
+  still-uncommitted edits (`docs/core/**`, AGENTS.md loop steps 0 and 7,
+  and a feature-page/backlog reference line near the top of this plan
+  file). They are deliberately not part of this branch's commits; the only
+  hunk staged from this file for the handoff commit is the one you are
+  reading.
 
 ## 8. Review (planner appends findings per PR)
 
