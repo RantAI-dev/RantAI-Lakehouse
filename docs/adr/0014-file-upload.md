@@ -32,6 +32,9 @@ up. Under its own prefix, so nothing an upload writes can sit next to an
 Iceberg table's files.
 
 The file is removed when the upload is deleted. Nothing else expires it.
+The upload's row is kept, hidden, when it is deleted: it is the only record
+that an upload of that tenant created the table, and decision 5 needs that
+record to let a later upload load into the same table.
 
 ## Decision 2 — the upload passes through the API, with a cap
 
@@ -77,7 +80,8 @@ the demo ingest, not for the console's database, and the two are the same
 only on the compose stack.
 
 An upload may load into a table that does not exist, or into one an upload
-of the same tenant created. It may never load into a table a connector
+of the same tenant claimed: some row of that tenant, live or deleted,
+names it. It may never load into a table a connector
 loads or that anything else created. The API checks this before launching,
 and refuses when it cannot check.
 

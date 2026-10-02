@@ -261,12 +261,65 @@ New module `upload_parse.rs` holding what `uploads.rs` has today plus:
   detection tests still pass; each `Kind` is recognised from its magic
   bytes.
 
+### T5a — Amend the store after the review of slice B, part 1
+
+Section 9 has the findings (`B1`, `B2`, `B3`). One commit, before T6.
+
+- **`0055` gains `deleted_at TIMESTAMPTZ`.** Editing `0055` is allowed
+  here and only here: it has been applied on throwaway test databases and
+  nowhere that persists. From the trial deploy on it is frozen like any
+  applied migration. Say so in its header.
+- **Deleting is soft** (`B1`). `delete` becomes `soft_delete(id)`: it sets
+  `deleted_at`, and returns whether a live row was marked. The row stays as
+  the record that an upload of that tenant created the table. `list`, `get`,
+  `upload_in_tenants`, `find_by_sha256`, `table_being_loaded`,
+  `mark_ingesting`, `mark_finished` and the new `attach_run` see live rows
+  only.
+- **Who owns a table** (`B1`). `table_created_by_upload` becomes
+  `table_claimed_by_upload(tenant_id, table)`: any row of that tenant names
+  the table, whatever its status, deleted or not. `bronze_table` is only
+  ever set by `mark_ingesting`, which runs after the "is the table free"
+  check, so a row that names a table is a claim that was allowed. Without
+  this, a load that failed after it wrote, or an upload that was deleted,
+  left a table nobody could load into again.
+- New `table_loaded_by_upload(table)`, any tenant, an `ingested` row names
+  it, deleted or not. T8 uses it.
+- **Claim, then launch** (`B2`). New `attach_run(id, run_id)`: sets
+  `run_id` on a live row that is `ingesting` with no run yet.
+  `mark_ingesting` is called with `run_id = None` before the launch.
+- **Not on the wire** (`B3`): `content_type` and `sha256` are
+  `#[serde(skip)]` like `storage_key`.
+- **Accept:** store tests for: a deleted upload is not listed, not found by
+  id, not reported as a duplicate, and still counts as the claim on its
+  table; a failed row counts as a claim; another tenant's row does not;
+  `attach_run` sets the run once and only on an `ingesting` row without
+  one; `mark_finished` with `run_id = None` settles a row that never got a
+  run.
+
 ### T6 — The routes
 
 `routes/uploads.rs`, declared in `routes/mod.rs`, mounted by a new
 `uploads_router(&state)` beside `connectors_router`. Every per-id route
 sits behind a `require_upload_in_tenants` layer shaped like the connector
 one.
+
+Where this section and T5a disagree with the table and bullets below, T5a
+and the three amendments here win:
+
+- **Order of an ingest.** Validate; check the table is free; claim the row
+  with `mark_ingesting(run_id = None)` (`None` back means 409, "This upload
+  is already being loaded."); launch; on success `attach_run`. When the
+  orchestrator cannot be reached or refuses, settle the claim with
+  `mark_finished(id, None, Some("The load could not be started."), None)`
+  and answer 503 or 422 with fixed text.
+- **A claim that never got a run.** When a row is `ingesting`, has no
+  `run_id` and its `updated_at` is more than two minutes old, reading it
+  settles it as `failed`, "The load was not started."
+- **Delete** removes the object and soft-deletes the row.
+- The workbook refusal reads: "This looks like an Excel workbook or a zip
+  archive. Only delimited text files (CSV, TSV) can be uploaded; save the
+  sheet as CSV first."
+- "Is the table free" uses `table_claimed_by_upload`.
 
 | Route | Behaviour |
 | --- | --- |
@@ -362,7 +415,8 @@ Rewrite `dagster/dispar_orchestrate/file_ingest.py`.
 ### T8 — A connector may not take an uploaded table
 
 - `routes::connectors::ingest_spec_put` (`connectors.rs:2654`): 409 when a
-  `sourceObjects[].target` is a table an upload created.
+  `sourceObjects[].target` is a table an upload loaded
+  (`uploads::table_loaded_by_upload`, T5a).
 - **Accept:** a route test for the refusal and one that an ordinary target
   still saves.
 
@@ -452,7 +506,7 @@ Rewrite `dagster/dispar_orchestrate/file_ingest.py`.
 | Slice | Tasks | Why separate |
 | --- | --- | --- |
 | A | T1–T2 | Hygiene of the base. Could merge on its own |
-| B | T3–T6, T8 | The API. Rust is confined to this slice and T1 |
+| B | T3–T5, T5a, T6, T8 | The API. Rust is confined to this slice and T1 |
 | C | T7, T9 | The job and the gate. No Rust |
 | D | T10–T12 | Console and documents. No Rust, no Python |
 
@@ -928,3 +982,63 @@ passed, 0 failed, 8 ignored). The reviewer runs it once on the final commit
 before the trial.
 
 **Slice B starts from `feat/upload-file` at this review's commit.**
+
+### Slice B, part 1 — T3, T4, T5 (reviewer, 2026-10-02)
+
+Reviewed `98ad9a2`, `8afc59d` and `5480489` against T3, T4 and T5.
+
+**Findings: no `BLOCKER`. Three `SHOULD-FIX`. All three are gaps in the
+plan, not in the code, which did what T3 said. They become T5a.**
+
+- `SHOULD-FIX B1`: ownership of a table did not survive. T3 defined "an
+  upload created the table" as "an `ingested` row names it". A load that
+  fails after it wrote the table, and an upload that is later deleted, both
+  leave a table no upload may load into again, so "Try again" could never
+  succeed. Deleting becomes soft, and any row of the tenant that names the
+  table is the claim. Raised by the developer in the handoff.
+- `SHOULD-FIX B2`: T6 said "launch, then mark". Two ingests of one upload
+  sent at the same moment would both launch. The row is claimed first, the
+  run is attached after. Raised by the developer in the handoff.
+- `SHOULD-FIX B3`: `Upload` still serializes `contentType` and `sha256`.
+  The console needs neither.
+
+What was checked against the plan:
+
+- `0055` has its why-header, drops only the free-text `tenant` column, and
+  says why nothing in it is worth keeping.
+- Every query in `uploads.rs` binds its values. `list` and
+  `find_by_sha256` cannot be called without a tenant. `mark_finished`
+  settles only a row that is `ingesting` under the named run, which the
+  plan did not ask for and is right.
+- `rustfs_client.rs` is the old probe's code moved, not rewritten; the
+  health probe reports the same three outcomes with the same words, and its
+  13 tests are unchanged.
+- `upload_store.rs` returns two fixed sentences; the classified word comes
+  from `classify_object_store_error`; the detail is logged.
+- `upload_parse.rs` states its dialect and pins it with ten fixtures. The
+  reviewer read each fixture with Python's `csv.reader` under the settings
+  the fixtures' README gives: 10 of 10 match their expected JSON.
+- The two `dead_code` attributes carry the reason and the task that removes
+  them. Nothing else is suppressed.
+- No lock file change. Four commits, each with the developer model's
+  `Co-Authored-By` line.
+
+Verification re-run by the reviewer on `89bdf54`, warm shared
+`CARGO_TARGET_DIR`:
+
+- `cargo fmt --check` — pass.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` —
+  pass.
+- `cargo test -p lakehouse-store` — 19 suites, 403 passed, 0 failed.
+- `cargo test -p lakehouse-api` — 25 suites, 2,377 passed, 0 failed, 4
+  ignored. Matches the handoff.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+
+Not verified: anything over HTTP (T6), and `0055` on the development
+database (it runs there at the trial).
+
+Noted, not a finding against this change:
+`connector_probe::classify_object_store_error` answered "connection failed"
+for a refused connection in the developer's test, so its "connection
+refused" branch may be unreachable with this version of `object_store`.
+It is existing code, used by the probes as well.
