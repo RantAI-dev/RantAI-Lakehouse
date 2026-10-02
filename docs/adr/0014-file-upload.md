@@ -136,7 +136,8 @@ shows layers.
   pipeline builder's, and is stated on the feature page.
 - The unregistered transformation modules that came with the unfinished
   code (`silver_transform.py`, `gold_transform.py`, `sap_models.py`) leave
-  the branch. `ch_models.py` stays: `connector_catalog.py` uses it.
+  the branch, and `ch_models.py` with them: the three helpers
+  `connector_catalog.py` used moved into it.
 
 ## Verification
 

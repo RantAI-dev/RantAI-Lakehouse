@@ -87,6 +87,10 @@ table once it is loaded.
   grows with every upload.
 - Adding the same file to a table twice doubles its rows. The console warns
   about a repeated file; it does not stop it.
+- Replacing a table with a file whose columns differ keeps the old
+  columns, empty, beside the new ones.
+- A table name starts with a lower-case letter and uses lower-case letters
+  and digits joined by single underscores.
 - A table name an upload has asked for stays reserved for that tenant's
   uploads. Another tenant cannot upload into it and a connector cannot load
   into it, even if the first load never wrote anything.

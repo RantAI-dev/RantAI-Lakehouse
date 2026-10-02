@@ -41,7 +41,7 @@ opened from this branch until `feat/connectors` is on `main`.
 | Types | Every column is text |
 | Original file | Kept in the warehouse bucket until the upload is deleted. Deleting an upload keeps its table |
 | Assistant | No tool in this version |
-| Transform code from `f9793cd` | `silver_transform.py`, `gold_transform.py`, `sap_models.py` leave the branch (they stay in history at `f9793cd`). `ch_models.py` stays |
+| Transform code from `f9793cd` | `silver_transform.py`, `gold_transform.py`, `sap_models.py` leave the branch (they stay in history at `f9793cd`). `ch_models.py` went as well in T7: its three helpers still in use moved into `connector_catalog.py` (review finding A1) |
 | Tenant | An upload belongs to the uploader's active tenant. Per-upload routes answer 404 outside it |
 | Outcome of a load | Recorded by the job in `lake.bronze_meta.ingest_run`, read back by the API. The job does not write to Postgres |
 
@@ -477,6 +477,37 @@ Rewrite `dagster/dispar_orchestrate/file_ingest.py`.
 - **Accept:** `check_intra_package_imports.py` passes; the new tests pass;
   the job appears in `definitions.py`.
 
+### T7a — Fixes from the review of slice C
+
+Section 9 has the findings (`C1` to `C3`). One commit. Rust and Python.
+
+- **`SHOULD-FIX C1`: a table name the writer would rename is refused where
+  the user can read why.** The rule `^[a-z_][a-z0-9_]*$` admits names dlt
+  writes under another name (`x_` as `xx`, `__x` as `x`); T7 refuses them
+  in the job, where all the user sees is "The load into the table failed."
+  The rule for an uploaded table becomes: starts with a lower-case letter;
+  lower-case letters and digits, in groups joined by single underscores; at
+  most 128 characters (`^[a-z][a-z0-9]*(_[a-z0-9]+)*$`). The reviewer
+  measured it against the writer's own naming on 2026-10-02: 59,052 names
+  that match, none renamed. The API's `table_name_problem` applies it and
+  says: "Table names start with a lower-case letter and use lower-case
+  letters and digits joined by single underscores, with at most 128
+  characters." The job's `_check_settings` applies the same pattern and
+  keeps its own question to dlt behind it. Connector targets keep their
+  rule; that is not this plan's to change.
+- **`SHOULD-FIX C2`: a header row with no cells has its own sentence.**
+  Today it is recorded as "The header row is past the end of the file.",
+  which is not what happened. A seventh reason, "The header row has no
+  columns.", in `ops/fixtures/upload_load_failure_reasons.json`, in the
+  API's constants and in the job's.
+- **`SHOULD-FIX C3`: pin the timestamp form.** A unit test that
+  `ended_after` reads what the job writes, `datetime.isoformat()` in UTC
+  with microseconds and `+00:00`. The route tests only use `Z`.
+- **Accept:** API tests refuse `x_`, `_x`, `a__b`, `1a`, `Orders` and a
+  129-character name, and accept `a`, `a1`, `a_1`, `sap_material_master`
+  and a 128-character name; the job's tests do the same; both sides' tests
+  against the reasons file pass with seven; the timestamp test.
+
 ### T8 — A connector may not take an uploaded table
 
 - `routes::connectors::ingest_spec_put` (`connectors.rs:2654`): 409 when a
@@ -505,9 +536,10 @@ Rewrite `dagster/dispar_orchestrate/file_ingest.py`.
   `FormData` and sets no `Content-Type`. Errors as `ServiceError`, as the
   connector client does. Bind `uploadService` in `src/services/index.ts`.
 - `src/lib/uploads.ts`, pure: `MAX_UPLOAD_BYTES`, `suggestTableName(file
-  name)`, `tableNameProblem` (the same rule as `targetProblem`; do not
-  write a second regex if the first can be imported), `statusLabel`,
-  `delimiterLabel`. Tests beside it with `node:test`
+  name)`, `tableNameProblem` (the rule of T7a, which is stricter than a
+  connector target's, so it is its own function and says the API's
+  sentence; `suggestTableName` only ever suggests a name that passes it),
+  `statusLabel`, `delimiterLabel`. Tests beside it with `node:test`
   (`CODE-STANDARD.md` §4.6).
 - **Accept:** `bun run typecheck`, `bun run lint`, the new tests.
 
@@ -540,7 +572,13 @@ Rewrite `dagster/dispar_orchestrate/file_ingest.py`.
   4. **Review.** A summary; the submit button is "Load".
   After "Load": the status, refreshed every 2 s while loading. Loaded: the
   row count, "Open in Data Explorer", "Upload another file". Failed: the
-  reason, "Change settings" (back to step 2), "Try again".
+  reason, "Change settings" (back to step 2), "Try again". When the reason
+  is "The table was loaded but could not be registered in the catalog.",
+  say that the rows are in the table and that loading again with "Add to
+  its rows" would add them a second time; "Try again" then loads with
+  "Replace its rows".
+  In step 2, a preview with no columns (the header row is past what was
+  read, or is an empty line) says so and keeps "Next" disabled.
 - **New Connector, first step.** Above the type cards, one link: "Have a
   file instead? Upload a CSV or TSV" to `/connectors/upload`.
 - Components in `src/features/connectors/`, `"use client"` first, imports
@@ -572,7 +610,7 @@ Rewrite `dagster/dispar_orchestrate/file_ingest.py`.
 | --- | --- | --- |
 | A | T1–T2 | Hygiene of the base. Could merge on its own |
 | B | T3–T5, T5a, T6, T6a, T8 | The API. Rust is confined to this slice and T1 |
-| C | T7, T9 | The job and the gate. No Rust |
+| C | T7, T7a, T9 | The job and the gate. T7a touches Rust again |
 | D | T10–T12 | Console and documents. No Rust, no Python |
 
 The developer appends a handoff per slice. The planner reviews each before
@@ -2002,4 +2040,73 @@ Not verified: `0055` on the development database (the trial); anything end
 to end.
 
 **Slice C starts from `feat/upload-file` at this review's commit.**
+
+### Slice C — T7, T9 (reviewer, 2026-10-02)
+
+Reviewed `6cb3351` and `c0fc23e` against T7 and T9.
+
+**Findings: no `BLOCKER`. Three `SHOULD-FIX`, which become T7a. Two of them
+are gaps the developer found in the plan by measuring.**
+
+- `SHOULD-FIX C1`: the API's table-name rule admits names the writer
+  renames. The job now refuses them, but the user is told only that the
+  load failed. The rule moves to the API and the console, stated so a
+  person can follow it.
+- `SHOULD-FIX C2`: a header row with no cells is recorded as "past the end
+  of the file". It needs its own sentence.
+- `SHOULD-FIX C3`: nothing pins that the API reads the timestamp form the
+  job writes.
+
+What was checked against the plan:
+
+- The job writes only through `load_via_sink` with `LoadPlan(mode)`;
+  `adapters/sink.py` is unchanged. It writes no Postgres and imports no
+  `psycopg2`.
+- Every column is declared `text` to dlt. The developer measured why that
+  is needed: plain rows let dlt type an ISO timestamp, and split a mixed
+  column in two.
+- The row cap is counted in a first pass and is a failure. Rows are never
+  held in memory as a list.
+- One `record_ingest_run` call per run; the recorded `error` is one of the
+  constants or empty, enforced by `LoadFailure`'s constructor; the detail
+  goes to the run log. Every failure leaves as `Failure(allow_retries=
+  False)`, so the retry policy every op must carry cannot record a second
+  row or append twice.
+- `A1` and `A2` are done: `ch_models.py` is gone, its three helpers live
+  beside `register_loaded_table`, and the docstring says what load modes
+  do.
+- `is_plain_table_name` uses `fullmatch`. With `$` a name ending in a line
+  break passed, for connector targets as well.
+- The gate counts under a `WHERE`, uses a table name of its own, has no
+  default credential, and says what it leaves behind.
+
+Verification re-run by the reviewer on `7d278f5`:
+
+- `python3 ops/lint/check_intra_package_imports.py` — pass. It was red on
+  the base and through slices A and B.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `python3 ops/lint/check_compose_init_readiness.py` — pass.
+- `python -m pytest dispar_orchestrate -q`, in the code-location image with
+  the worktree mounted read-only — 541 passed, 31 subtests. Matches the
+  handoff.
+- The code location imports with nine jobs, `file_ingest_job` among them.
+- `python3 -m py_compile ops/g9/upload_test.py` — pass.
+- The reviewer measured the naming rule of `C1` in the same image: of
+  59,052 names matching `^[a-z][a-z0-9]*(_[a-z0-9]+)*$`, the writer's
+  naming changes none.
+
+Not verified: a real load, the gate on a deployed stack, Python 3.11. They
+wait for the trial.
+
+Noted, not findings against this change:
+
+- A replace with a file whose columns differ keeps the old columns, empty
+  (the developer measured it). It is a limit of the writer; the feature
+  page now says so.
+- `ingest_factory._run_one_object` records `succeeded` with no row count
+  when a load reports failed jobs, on every path but one. Existing code.
+- The gate reads `GET /api/governance/ingest-runs`, which has no tenant
+  filter (section 5).
+
+**T7a, then slice D.**
 
