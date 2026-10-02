@@ -564,6 +564,60 @@ Not run, with reason: `bun run typecheck/lint/test` and compose checks —
 the fix commits touch Rust and Python docstrings only.
 
 
+### PR slice C — T6 (developer, 2026-10-02)
+
+Branch `feat/gold-publish-per-mart-c` off `origin/main` at `0fc811d`
+(slice B merged as PR #63). One commit:
+
+- `61974c8` — T6. Sensor, tests, registration. Described in review above.
+
+No overlap with the six open pipelines-stream branches
+(`feat/pipeline-{alerts-sla-volume,dependencies,detail-page,governance,recovery-api}`,
+`feat/pipelines-authored-runnable`): those branches touch
+`gold_export.py`/`definitions.py` too but only via the `list_gold_marts`
+and `gold_export_schedule` additions from slice B, none of the sensor
+code this commit adds. The sensor body (`evaluate_authored_success`) is
+net-new lines; `definitions.py` adds one import and one list item, away
+from the other branches' edits (those branches edit the
+`SchedulesDefinitions`/`JobsDefinitions`/`resources` constructor, not
+the sensor list).
+
+Verification — every command run in the foreground on `aae8362`:
+
+- `python3 ops/lint/check_intra_package_imports.py` — pass.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` — **379
+  passed, 30 subtests passed, 0 failed** (218 warnings, all the known
+  `kafka-python` deprecations from site-packages, none from touched files).
+
+### PR slice C — fixes (developer, 2026-10-02)
+
+Review findings C-B1, C-S1 fixed on `feat/gold-publish-per-mart-c`.
+
+- `aae8362` — C-B1 and C-S1.
+  C-B1: `export_gold_mart` catches `requests.HTTPError` with
+  `exc.response.status_code == 409`, records
+  `skipped_verbs=["already_running"]`, emits no `AssetMaterialization`,
+  returns `{"skipped": True, "reason": "already_running"}`.
+  `test_gold_export.py`: `test_an_http_409_is_a_skip_not_a_failure`
+  unit test confirms no raise, no materialization, correct skip verb.
+  C-S1: comment block above the sensor rewritten — each sentence is true
+  (the sensor launches one all-marts run per authored SUCCESS, not "one
+  daily run"; `ifChanged` prevents duplicate copies, `run_key` prevents
+  double launches).
+  Both findings cited at the fix site and in the commit body.
+
+Verification — every command run in the foreground on `aae8362`:
+
+- `python3 ops/lint/check_intra_package_imports.py` — pass.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` — **379
+  passed, 30 subtests passed, 0 failed** (218 warnings).
+
+Not run, with reason: `cargo fmt/clippy/test` — fixes touch no Rust.
+`bun run typecheck/lint/test` and compose checks — same reason. Nothing
+else skipped; no claim above is *not verified*.
+
 
 ## 8. Review (planner appends findings per PR)
 
