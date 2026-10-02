@@ -358,8 +358,8 @@ their opt-in compose profiles:
 | `CATALOG_NAMESPACE_META` | JSON object overriding catalog namespace display names/descriptions. Malformed JSON is ignored in favour of the defaults — a bad label is cosmetic, refusing to serve the catalog is an outage | unset | No |
 | `BUILTIN_DASHBOARD_SPEC` | Path to a JSON file of built-in "Main" dashboard KPI/chart tiles for this tenant (shape: `{kpis:[...], charts:[...]}`, see `rust/crates/lakehouse-bi/specs/builtin-default.json`); unset, unreadable, or invalid means no built-in tiles at all | unset | No |
 | `GOLD_SOURCE_SCHEMA` | ClickHouse schema Gold export reads marts from | `serving` | No |
-| `GOLD_EXPORT_MARTS` | Comma-separated marts the scheduled Gold export job exports | `gold_export_smoke` | No |
-| `GOLD_EXPORT_RUN_TOKEN` | Shared token required by `POST /api/gold/export/{mart}`. Generate your own | unset | No |
+| `GOLD_EXPORT_MARTS` | Optional operator override, unioned with per-mart publications the console switches on; default empty — a fresh deployment publishes only what is switched on in the console | (empty) | No |
+| `GOLD_EXPORT_RUN_TOKEN` | Shared token required by `POST /api/gold/export/{mart}`. Seeds the `gold-export-scheduler` service identity at API boot, so the nightly schedule authenticates. Generate your own | unset | No |
 | `GOLD_MART_NAME` / `GOLD_EXPORT_ROW_COUNT` | Mart name and row count the Gold export acceptance test seeds | `gold_export_smoke` / `7` | No |
 
 Debezium Server's image (`ghcr.io/memiiso/debezium-server-iceberg`) is

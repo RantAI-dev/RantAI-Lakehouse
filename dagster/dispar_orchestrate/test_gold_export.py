@@ -23,6 +23,11 @@ The fan-out tests drive the rebuilt `gold_export_job` end-to-end via
 `execute_in_process` (no network, no real `lakehouse-api`), inspecting
 the events Dagster emits so a failed mart is its own failed step and an
 HTTP error still records a `maintenance_run` failure row.
+
+The sensor tests (gold-publish-per-mart plan T6) verify that an authored
+pipeline's SUCCESS yields one `RunRequest` for `gold_export_job`, while
+non-authored jobs (`gold_export_job` itself, maintenance, alerts, etc.)
+yield nothing.
 """
 
 from __future__ import annotations
@@ -33,12 +38,18 @@ from unittest.mock import MagicMock
 
 import requests
 
-from dagster import AssetMaterialization, DefaultScheduleStatus, build_op_context
+from dagster import (
+    AssetMaterialization,
+    DefaultScheduleStatus,
+    RunRequest,
+    build_op_context,
+)
 
 from dispar_orchestrate import gold_export
 from dispar_orchestrate.gold_export import (
     GoldExportConfig,
     _headers,
+    evaluate_authored_success,
     gold_export_job,
     gold_export_schedule,
 )
@@ -434,6 +445,88 @@ class GoldExportFanOutTest(unittest.TestCase):
         self.assertEqual(gold_export._sanitize_mapping_key("café"), "caf_")
         self.assertEqual(gold_export._sanitize_mapping_key("x²"), "x_")
         self.assertEqual(gold_export._sanitize_mapping_key("plain_ok"), "plain_ok")
+
+    def test_an_http_409_is_a_skip_not_a_failure(self) -> None:
+        """PR slice C review C-B1: a 409 from the API's single-flight lock
+        (export of this mart already running) is a skip — records
+        `skipped_verbs=["already_running"]`, emits no
+        `AssetMaterialization`, returns without raising."""
+        import requests
+
+        from dispar_orchestrate import gold_export
+
+        cfg = mock.Mock(marts=["mart_a"], ch=None)
+        err = requests.HTTPError("409 Conflict: export of mart_a already running")
+        resp = mock.Mock(spec=requests.Response)
+        resp.status_code = 409
+        err.response = resp
+        with mock.patch.object(gold_export.GoldExportConfig, "from_env", return_value=cfg), \
+                mock.patch.object(gold_export, "export_one_mart", side_effect=err), \
+                mock.patch.object(gold_export, "record_maintenance_run") as mocked_record:
+            body = gold_export.export_gold_mart(build_op_context(), "mart_a")
+
+        self.assertEqual(body, {"skipped": True, "reason": "already_running"})
+        self.assertEqual(mocked_record.call_count, 1)
+        self.assertEqual(
+            mocked_record.call_args.kwargs["skipped_verbs"], ["already_running"]
+        )
+
+
+class GoldExportAfterAuthoredSensorTests(unittest.TestCase):
+    """gold-publish-per-mart plan T6: `gold_export_after_authored_sensor`
+    fires after an authored pipeline succeeds, triggering `gold_export_job`
+    so the nightly cadence is the safety net, not the only trigger. With
+    T4's `ifChanged=true` in place, unchanged marts cost one cheap check
+    each. The sensor must NOT fire on `gold_export_job` itself or on
+    maintenance, backup, alerts, capacity, agent, or ingest jobs.
+
+    The tests drive `evaluate_authored_success` directly (the split-out
+    body, same pattern `pipeline_events.py::evaluate_finished_run` uses
+    for plan 1f) with a duck-typed context stand-in — no real sensor
+    context or `DagsterInstance` needed."""
+
+    class _FakeRun:
+        def __init__(self, run_id: str, job_name: str) -> None:
+            self.run_id = run_id
+            self.job_name = job_name
+
+    class _FakeContext:
+        def __init__(self, run_id: str, job_name: str) -> None:
+            self.dagster_run = GoldExportAfterAuthoredSensorTests._FakeRun(
+                run_id, job_name
+            )
+
+    def test_an_authored_pipeline_success_yields_one_run_request_with_the_triggering_run_as_key(
+        self,
+    ) -> None:
+        """The happy path: an `authored__pl_foo` job succeeds. The sensor
+        yields one `RunRequest(run_key=<upstream run id>)` — Dagster's
+        own dedup keeps a re-firing upstream success from launching
+        `gold_export_job` twice for the same upstream run."""
+        ctx = self._FakeContext(job_name="authored__pl_foo", run_id="upstream-abc")
+        results = list(evaluate_authored_success(ctx))
+        run_requests = [r for r in results if isinstance(r, RunRequest)]
+        self.assertEqual(len(run_requests), 1)
+        self.assertEqual(run_requests[0].run_key, "upstream-abc")
+
+    def test_gold_export_job_itself_yields_nothing(self) -> None:
+        """`gold_export_job`'s own success must never trigger another
+        `gold_export_job` run — that would be an infinite chain."""
+        ctx = self._FakeContext(job_name="gold_export_job", run_id="gold-run-1")
+        results = list(evaluate_authored_success(ctx))
+        run_requests = [r for r in results if isinstance(r, RunRequest)]
+        self.assertEqual(run_requests, [])
+
+    def test_a_non_authored_job_yields_nothing(self) -> None:
+        """Every non-authored job — maintenance, alerts, capacity, agent,
+        ingest, backup — must be a no-op. Only `authored__<id>` jobs
+        trigger the export. The test drives a single representative
+        non-authored name; the `startswith("authored__")` check covers
+        all of them uniformly."""
+        ctx = self._FakeContext(job_name="bronze_maintenance_job", run_id="mt-1")
+        results = list(evaluate_authored_success(ctx))
+        run_requests = [r for r in results if isinstance(r, RunRequest)]
+        self.assertEqual(run_requests, [])
 
 
 if __name__ == "__main__":

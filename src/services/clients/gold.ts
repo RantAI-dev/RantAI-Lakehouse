@@ -5,6 +5,7 @@ import type {
   GoldReadBack,
   GoldExportRun,
   GoldConsumers,
+  GoldPublication,
 } from "../contracts/gold"
 import { apiFetch } from "../http"
 import { ServiceError } from "../errors"
@@ -33,6 +34,21 @@ async function postJson<T>(url: string, signal?: AbortSignal): Promise<T> {
   return json as T
 }
 
+async function putJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
+  const res = await apiFetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    signal,
+  })
+  const json = await res.json()
+  if (!res.ok) {
+    const kind = res.status === 404 ? "not_found" : res.status === 403 ? "permission_denied" : res.status >= 500 ? "unavailable" : "invalid_request"
+    throw new ServiceError(kind, json?.error ?? `Request failed (${res.status})`, res.status)
+  }
+  return json as T
+}
+
 export const goldService: GoldService = {
   async listMarts(signal) {
     return (await getJson<{ marts: GoldMart[] }>("/api/dashboard/fields", { signal })).marts
@@ -53,5 +69,11 @@ export const goldService: GoldService = {
   },
   async getConsumers(mart, signal) {
     return getJson<GoldConsumers>(`/api/gold/export/${encodeURIComponent(mart)}/consumers`, { signal })
+  },
+  async getPublication(mart, signal) {
+    return getJson<GoldPublication>(`/api/gold/export/${encodeURIComponent(mart)}/publication`, { signal })
+  },
+  async setPublication(mart, enabled, signal) {
+    return putJson<GoldPublication>(`/api/gold/export/${encodeURIComponent(mart)}/publication`, { enabled }, signal)
   },
 }

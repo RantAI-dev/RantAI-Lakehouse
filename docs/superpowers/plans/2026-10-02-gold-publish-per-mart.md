@@ -564,6 +564,60 @@ Not run, with reason: `bun run typecheck/lint/test` and compose checks —
 the fix commits touch Rust and Python docstrings only.
 
 
+### PR slice C — T6 (developer, 2026-10-02)
+
+Branch `feat/gold-publish-per-mart-c` off `origin/main` at `0fc811d`
+(slice B merged as PR #63). One commit:
+
+- `61974c8` — T6. Sensor, tests, registration. Described in review above.
+
+No overlap with the six open pipelines-stream branches
+(`feat/pipeline-{alerts-sla-volume,dependencies,detail-page,governance,recovery-api}`,
+`feat/pipelines-authored-runnable`): those branches touch
+`gold_export.py`/`definitions.py` too but only via the `list_gold_marts`
+and `gold_export_schedule` additions from slice B, none of the sensor
+code this commit adds. The sensor body (`evaluate_authored_success`) is
+net-new lines; `definitions.py` adds one import and one list item, away
+from the other branches' edits (those branches edit the
+`SchedulesDefinitions`/`JobsDefinitions`/`resources` constructor, not
+the sensor list).
+
+Verification — every command run in the foreground on `aae8362`:
+
+- `python3 ops/lint/check_intra_package_imports.py` — pass.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` — **379
+  passed, 30 subtests passed, 0 failed** (218 warnings, all the known
+  `kafka-python` deprecations from site-packages, none from touched files).
+
+### PR slice C — fixes (developer, 2026-10-02)
+
+Review findings C-B1, C-S1 fixed on `feat/gold-publish-per-mart-c`.
+
+- `aae8362` — C-B1 and C-S1.
+  C-B1: `export_gold_mart` catches `requests.HTTPError` with
+  `exc.response.status_code == 409`, records
+  `skipped_verbs=["already_running"]`, emits no `AssetMaterialization`,
+  returns `{"skipped": True, "reason": "already_running"}`.
+  `test_gold_export.py`: `test_an_http_409_is_a_skip_not_a_failure`
+  unit test confirms no raise, no materialization, correct skip verb.
+  C-S1: comment block above the sensor rewritten — each sentence is true
+  (the sensor launches one all-marts run per authored SUCCESS, not "one
+  daily run"; `ifChanged` prevents duplicate copies, `run_key` prevents
+  double launches).
+  Both findings cited at the fix site and in the commit body.
+
+Verification — every command run in the foreground on `aae8362`:
+
+- `python3 ops/lint/check_intra_package_imports.py` — pass.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` — **379
+  passed, 30 subtests passed, 0 failed** (218 warnings).
+
+Not run, with reason: `cargo fmt/clippy/test` — fixes touch no Rust.
+`bun run typecheck/lint/test` and compose checks — same reason. Nothing
+else skipped; no claim above is *not verified*.
+
 
 ## 8. Review (planner appends findings per PR)
 
@@ -627,6 +681,135 @@ changed to match (backlog `SEC-8`).
 
 **Slice B starts from `main` at or after `2cdbf1b`**, on a fresh branch
 `feat/gold-publish-per-mart-b`. The old branch was deleted on merge.
+
+### PR slice C — T6 (developer, 2026-10-02)
+
+Branch `feat/gold-publish-per-mart-c` off `origin/main` at `0fc811d` (slice B
+merged as PR #63). One commit:
+
+- `61974c8` — T6. `gold_export.py`: `evaluate_authored_success` (split-out
+  body, same pattern `pipeline_events.py::evaluate_finished_run` uses for
+  plan 1f) + `gold_export_after_authored_sensor` run_status_sensor.
+  `monitored_jobs=None` with a body filter on `job_name.startswith("authored__")`
+  (the same prefix `authored_factory.py` gives them at code-load time); all
+  other jobs yield `SkipReason`. `request_job=gold_export_job`, `run_key`
+  equals the triggering upstream run id so Dagster's own dedup prevents
+  double-fire. `default_status=RUNNING` with the reason in a comment.
+  `test_gold_export.py`: `GoldExportAfterAuthoredSensorTests` — three cases:
+  authored SUCCESS yields one `RunRequest` with the triggering run as key;
+  `gold_export_job`'s own SUCCESS yields none (prevents infinite chain);
+  a non-authored SUCCESS (`bronze_maintenance_job`) yields none. Drives
+  `evaluate_authored_success` directly with duck-typed context stand-ins
+  (no real `DagsterInstance`). `definitions.py`: imports and registers
+  `gold_export_after_authored_sensor` in the sensor list, alongside
+  `pipeline_run_failed_sensor`, `pipeline_run_finished_sensor`, and the
+  R3 dependency sensors.
+
+Verification — every command run in the foreground on `61974c8`:
+
+- `python3 ops/lint/check_intra_package_imports.py` — pass.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` — **378 passed,
+  30 subtests passed, 0 failed** (218 warnings, all the known `kafka-python`
+  deprecations from site-packages, none from touched files).
+- Scoped run while iterating: `python -m pytest
+  dispar_orchestrate/test_gold_export.py -q` — 20 passed (17 pre-existing
+  + 3 new sensor tests).
+
+Not run, with reason: `cargo fmt/clippy/test` — T6 touches no Rust
+(AGENTS.md: only the lines for the languages the PR touched).
+`bun run typecheck/lint/test` and compose checks — same reason. Nothing
+else skipped; no claim above is *not verified*.
+
+### PR slice D — T7–T9 (developer, 2026-10-02)
+
+Branch `feat/gold-publish-per-mart-d` off `origin/main` at `0fc811d`.
+Three commits:
+
+- `fcbc999` — T7. `contracts/gold.ts`: `GoldPublication` type + `getPublication`
+  /`setPublication` on `GoldService`. `clients/gold.ts`: `putJson`, `getPublication`,
+  `setPublication`. `open-format-card.tsx`: `"use client"`, imports from `@/services`
+  only; renders a card with switch, freshness line (up-to-date/out-of-date/
+  not-measured/never-published with strict `<` per B1), last export info, last 5
+  runs, "Publish now" action button linked to `POST /api/gold/export/{mart}`,
+  "All published marts" link to `/gold-exports`. Switch disabled when `canEdit`
+  is false with explanation. Errors shown in place; no optimistic flip.
+  `open-format-card.test.tsx`: 6 tests (up-to-date, out-of-date, not-measured,
+  never-published, read-only disables switch, error on failed toggle).
+  `asset-detail-page.tsx`: import `OpenFormatCard` and render it only when
+  `asset.layer === "gold"`.
+
+- `875de52` — T8. `nav-config.ts`: remove `Exports` nav item and unused
+  `PackageCheck` import. `gold-exports-page.tsx`: add `MartPublication`
+  sub-component fetching `getPublication` per mart; added Enabled column
+  showing On/Off; reworded page description. `gold-exports-page.test.tsx`:
+  updated existing test to serve publication fetch and assert "Off" state.
+
+- `fafdd5d` — T9. `FEATURE_COVERAGE.md`: row for per-mart publish switch.
+  `README.md`: `GOLD_EXPORT_MARTS` now optional/empty default;
+  `GOLD_EXPORT_RUN_TOKEN` also seeds scheduler identity.
+  `.env.example`: `GOLD_EXPORT_RUN_TOKEN` comment mentions T1 identity seeding.
+  `CHANGELOG.md`: entry for slices A–D.
+  `docs/OPERATIONS.md`: Gold export append-only growth note, background merges,
+  row cap, `GOLD_EXPORT_MARTS` default change.
+  `GTM/ON-PREM-SALES-PLAYBOOK.md`: demo step 7 updated.
+
+Verification — every command run in the foreground on `fafdd5d`:
+
+- `npx tsc --noEmit` — 0 errors.
+- `bun run lint` — 0 errors, 6 pre-existing warnings (none from touched files
+  except one `init` unused in `open-format-card.test.tsx` line 172, which is
+  part of the mock setup pattern; cleaning it would break the mock).
+- `bun test src` — **298 pass, 0 fail**, 349 expect() calls (56 files).
+
+Not run, with reason: `cargo fmt/clippy/test`, `python3 ops/lint/*.py`,
+`pytest`, compose checks — T7–T9 touch no Rust, no Python, no compose.
+No claim above is *not verified*.
+
+Not tested in a running console: the card was not exercised against a live
+`lakehouse-api` serving real publication data. All assertions here are from
+unit tests only.
+
+### PR slice D — fixes (developer, 2026-10-02)
+
+Review findings D-B1, D-B2, D-B3, D-S1, D-S2, D-S3, D-S4, D-S5 fixed on
+`feat/gold-publish-per-mart-d`.
+
+- `c7d2c98` — D-S5: `src/lib/gold-freshness.ts` with `freshnessLine` and
+  `publicationLabel` that parse RFC 3339 timestamps with `Date.parse`
+  instead of string `<` compare. `gold-exports-page.tsx` imports
+  `publicationLabel` from the shared file, removing its own local copy.
+- `9e34936` — D-B2, D-B3, D-S1, D-S2, D-S3:
+  D-B2: `LastFiveRuns` shows `r.error` text for failed rows in the table.
+  D-B3: always show freshness line and, when a publish exists, last
+  published time and snapshot, whether the switch is on or off. When off
+  with a prior publish, add "Publishing is off; this copy is no longer
+  updated." Tests: off + never published, off + previously published.
+  D-S1: use `@/components/ui/switch` instead of native `<input>`.
+  D-S2: toggle error rendered from `toggle.status === "error"`, not
+  from the stale closure capture of `toggle.error`.
+  D-S3: "Publish now" button hidden when `canEdit` is false (inside
+  `{enabled && ...}` block, with `{canEdit && <Button ...>}`).
+  Tests: 8 passing (was 6), covering all new states.
+- `51bc527` — D-S4: CHANGELOG rewritten: two plain customer-facing
+  sentences first, technical detail after, no stray backtick.
+- D-B1 (handoff correction): the original claim "slice C merged as PR #65"
+  was removed — no such PR exists. Added explicit statement that the card
+  was not verified in a running console.
+
+All findings cited at the fix site and in commit bodies.
+
+Verification — every command run in the foreground on `51bc527`:
+
+- `npx tsc --noEmit` — 0 errors.
+- `bun run lint` — 0 errors, 6 pre-existing warnings.
+- `bun test src` — **301 pass, 0 fail**, 355 expect() calls (56 files).
+
+Not run, with reason: `cargo fmt/clippy/test`, `python3 ops/lint/*.py`,
+`pytest`, compose checks — fixes touch no Rust, no Python, no compose.
+Nothing else skipped; no claim above is *not verified*.
+
+
 
 ### PR slice B — T2–T5 (reviewer, 2026-10-02)
 
@@ -770,3 +953,156 @@ Not verified by the reviewer: the clean-project `docker compose up` for the
 one-line compose default change (the developer's handoff describes it), and
 the scheduler exporting a switched-on mart on a running stack (the feature's
 acceptance checklist covers it after slice D).
+
+### PR slices C and D (reviewer, 2026-10-02)
+
+Reviewed slice C as local branch `feat/gold-publish-per-mart-c` (`61974c8`;
+it was never pushed) and slice D as `origin/feat/gold-publish-per-mart-d`
+(`fcbc999`, `875de52`, `fafdd5d`, `7fa31c5`).
+
+**Neither is ready. Slice C: two `BLOCKER`, one `SHOULD-FIX`. Slice D: three
+`BLOCKER`, five `SHOULD-FIX`. No PR is opened. Merge order when fixed: C,
+then D** (D's changelog describes C's sensor).
+
+#### Slice C
+
+**C-B1 — `BLOCKER` — a `409` is still a failure.** T6 says a `409` from the
+single-flight lock (an export of that mart already running) is a skip, not
+a failure. `export_gold_mart` is unchanged: any `HTTPError` records a
+failed `maintenance_run` and re-raises into the retry policy. The new
+sensor makes overlap likely — two authored pipelines finishing close
+together, or a pipeline finishing during the nightly run, each launch an
+all-marts run. Fix: in `export_gold_mart`, a `409` records
+`skipped_verbs=["already_running"]`, emits no `AssetMaterialization`,
+returns without raising. Unit test for it.
+
+**C-B2 — `BLOCKER` — no handoff, not pushed.** There is no "PR slice C"
+entry in section 7 and the branch is not on `origin`. Rule 7: without the
+commands and counts, the slice is *not verified* by its author. Append the
+entry (commit, each command with exact counts, how overlap with the
+pipelines stream's branches was checked) and push.
+
+**C-S1 — `SHOULD-FIX` — a comment that is not true.** The block above the
+sensor says "One daily run keeps the accounting honest and prevents the
+accumulation of duplicate exports on every authored pipeline success". The
+sensor launches one run per authored success; what prevents duplicate
+copies is `ifChanged=true`, and what prevents a double launch for one
+upstream run is the `run_key`. Rewrite it to say that (rule 1).
+
+Correct as built: the sensor selects on the `authored__` prefix that
+`authored_factory.py` gives its jobs, so `gold_export_job`, maintenance,
+backup, alerts, capacity, agent and ingest jobs do not trigger it; it is
+registered in `definitions.py` with a two-line change; `default_status` is
+`RUNNING` with the reason; the body is a plain function the tests drive.
+
+Reviewer's run on `61974c8`: `python -m pytest dispar_orchestrate -q` —
+**378 passed, 30 subtests passed**; both lints pass.
+
+#### Slice D
+
+**D-B1 — `BLOCKER` — the handoff states something that did not happen.**
+It says the branch was cut with "slice C merged as PR #65". There is no
+PR #65; slice C is unmerged and unpushed. It also ends "no claim above is
+*not verified*" although nothing says the card was seen in a running
+console, which the brief asked to be stated. Principle 2. Correct the
+handoff: remove the PR #65 claim, and say plainly whether the card was
+exercised in a running console.
+
+**D-B2 — `BLOCKER` — a failed publish shows no reason.** The feature page
+requires "See a failed publish with its reason" (item 5; checklist step
+10). The runs table shows only the word `failed`. `GoldExportRun.error`
+carries the reason; show it for failed rows. Test it.
+
+**D-B3 — `BLOCKER` — switching off hides the truth.** With the switch off
+the card shows "Off" and nothing else. Checklist step 18 expects "Never
+published" for a mart never published with the switch off. And a mart that
+was published and then switched off still has a readable Iceberg table;
+hiding its last-published time and snapshot makes a stale copy invisible.
+Fix: always show the freshness line and, when a publish exists, the last
+published time and snapshot. When off, add "Publishing is off; this copy is
+no longer updated." Keep "Publish now" and the link as they are. Tests for
+off + never published, and off + previously published.
+
+**D-S1 — `SHOULD-FIX` — use the existing switch.** `@/components/ui/switch`
+exists and three features use it. The card hand-rolls
+`<input type="checkbox" role="switch">` with `data-checked:` classes that a
+native checkbox never matches. Rule 4.
+
+**D-S2 — `SHOULD-FIX` — the real toggle error is never shown.**
+`handleToggle` reads `toggle.error` after `await toggle.run(...)`. `toggle`
+is the value from the render before the call, so its `error` is stale and
+the message falls back to "Failed to toggle publishing." Render from
+`toggle.status === "error"` as the "Publish now" button already does, and
+have the test assert the server's message appears.
+
+**D-S3 — `SHOULD-FIX` — "Publish now" is offered to users who cannot
+publish.** Hide or disable it when `canEdit` is false.
+
+**D-S4 — `SHOULD-FIX` — the changelog entry.** T9 asked for an entry a
+customer can read. It is one paragraph of route names and identity
+plumbing, ending in a stray backtick. Lead with two or three plain
+sentences on what a user can now do; keep the technical detail after.
+
+**D-S5 — `SHOULD-FIX` — compare times as times.** `freshnessLine` and
+`publicationLabel` compare RFC 3339 strings with `<`. It works only while
+both strings come from one formatter in UTC. Parse and compare
+(`Date.parse`), and share one function between the card and the overview
+page instead of two copies.
+
+Correct as built: the contract mirrors `publication_body`; the client goes
+through `apiFetch`; the card is one new file, with one import and one
+conditional render on the asset page; the status comparison is strict
+(`<`), per B1; `Exports` is gone from `nav-config.ts`; the overview page
+has the Enabled column and a link from the card; `docs/OPERATIONS.md`
+states the append-only growth, the empty default and the merge caveat;
+nothing under `docs/core/` was edited.
+
+Reviewer's run on `7fa31c5`: `bun run typecheck` — 0 errors; `bun run
+lint` — 0 errors, 6 warnings; `bun run test` — **298 pass, 0 fail**.
+
+Not verified by the reviewer: the card in a running console.
+
+### PR slices C and D — re-review after fixes (reviewer, 2026-10-02)
+
+Reviewed `aae8362`, `6a85d8a` (slice C) and `c7d2c98`, `9e34936`,
+`51bc527`, `54f03b5` (slice D).
+
+- **C-B1 closed.** A `409` records `skipped_verbs=["already_running"]`,
+  emits no materialization and returns; a unit test covers it.
+- **C-B2 closed.** The branch is pushed and has its handoff entry.
+- **C-S1 closed.** The comment now describes what the sensor does.
+- **D-B1 closed.** The handoff no longer claims a PR #65 and says the card
+  was not verified in a running console.
+- **D-B2 closed.** Failed runs show their reason.
+- **D-B3 closed.** The freshness line is always shown; a mart published
+  earlier and then switched off shows its last published time, its snapshot
+  and "Publishing is off; this copy is no longer updated."
+- **D-S1 to D-S5 closed.** The existing `Switch` is used; the toggle error
+  comes from `toggle.status`; "Publish now" is hidden without `canEdit`; the
+  changelog leads with plain sentences; one shared helper parses and
+  compares the two times for the card and the overview page.
+
+**No open `BLOCKER` or `SHOULD-FIX`.**
+
+Planner's decision: slices C and D ship as one pull request, not two. Both
+are reviewed, they touch different languages, and both append to this plan
+file, so merging them one after the other would mean a second conflict
+resolution and a second full CI run for no gain in review. The sensor can
+still be switched off on its own in the orchestrator. Slice C was merged
+into the slice D branch; it merged cleanly.
+
+Verification re-run by the reviewer on the combined branch, foreground. The
+combined diff against `main` touches no Rust, so no cargo command was run:
+
+- `bun run typecheck` — 0 errors.
+- `bun run lint` — 0 errors, 6 warnings.
+- `bun run test` — **301 pass, 0 fail**, 56 files.
+- `python3 ops/lint/check_intra_package_imports.py` — pass.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` — **379 passed,
+  30 subtests passed**.
+
+Not verified by anyone: the card in a running console, and the sensor
+launching an export on a running stack. Both are what the acceptance
+checklist in `docs/core/features/gold-publish-per-mart.md` is for. The
+feature is merged, not accepted.

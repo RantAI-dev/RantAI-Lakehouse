@@ -4,7 +4,7 @@
 | --- | --- |
 | Module | Build (shown on the table's page in Data); touches Monitoring and Administration |
 | Backlog | `DATA-1` |
-| Status | In build. Decisions 1–4 use defaults, not yet signed |
+| Status | Built and merged; not yet accepted. Decisions 1–4 use defaults, not yet signed |
 | Plan | `docs/superpowers/plans/2026-10-02-gold-publish-per-mart.md` |
 
 ## Problem

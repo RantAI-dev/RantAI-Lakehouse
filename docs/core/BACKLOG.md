@@ -12,7 +12,7 @@ The one list of known work. Look at it weekly; pick what is next.
 
 | ID | Item | Area | Source |
 | --- | --- | --- | --- |
-| `DATA-1` | Gold tables publish to open format automatically, as an option per table | Build | `features/gold-publish-per-mart.md` |
+| `DATA-1` | Gold tables publish to open format automatically, as an option per table. **Built and merged (PRs #60, #63 and the slice C+D PR); waiting for the product owner to run the acceptance checklist** | Build | `features/gold-publish-per-mart.md` |
 | `QA-1` | Accept each built feature with a checklist, starting with what a demo shows | All | PRODUCT §4 blocker 1 |
 | `SEC-1` | Confirm the leaked key is rotated; decide on rewriting git history | Security | `SECURITY.md` |
 | `REL-1` | Protect the main branch | Delivery | `docs/CI.md` |
