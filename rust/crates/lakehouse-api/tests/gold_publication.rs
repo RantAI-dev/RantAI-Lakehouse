@@ -1,6 +1,7 @@
-//! HTTP-level acceptance tests for gold-publish-per-mart plan T3: the
-//! per-mart publication routes (`GET /api/gold/publications`, and the
-//! detail/`PUT` pair on `/api/gold/export/{mart}/publication`).
+//! HTTP-level acceptance tests for gold-publish-per-mart plan T3 + T4:
+//! the per-mart publication routes (`GET /api/gold/publications`, and
+//! the detail/`PUT` pair on `/api/gold/export/{mart}/publication`), and
+//! `POST /api/gold/export/{mart}?ifChanged=true`'s skip.
 //!
 //! These routes have a genuinely `ClickHouse`-backed half — `PUT` must
 //! return 404 for a mart that does not exist in `system.tables`, and the
@@ -360,4 +361,154 @@ async fn detail_defaults_for_a_never_enabled_mart_are_the_off_state() {
     assert!(body["lastExportedAt"].is_null(), "{body}");
     assert!(body["lastChangedAt"].is_string(), "{body}");
     assert_eq!(body["canEdit"], Value::Bool(false), "{body}");
+}
+
+// ── T4: POST /api/gold/export/{mart}?ifChanged=true ─────────────────────
+
+use lakehouse_api::gold_export_history;
+
+/// The unix-millisecond timestamp `offset_secs` from now, for history
+/// rows seeded relative to the mart's own `modification_time`.
+fn unix_ms(offset_secs: i64) -> i64 {
+    let now_secs = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the epoch")
+            .as_secs(),
+    )
+    .expect("a plausible epoch second");
+    now_secs * 1000 + offset_secs * 1000
+}
+
+async fn seed_success_run(ch: &ChClient, mart: &str, started_ms: i64) {
+    gold_export_history::record_export_run(
+        ch,
+        &gold_export_history::NewGoldExportRun {
+            mart,
+            status: "success",
+            rows_exported: Some(5),
+            format_version: Some(2),
+            snapshot_id: None,
+            error: None,
+            triggered_by: "user:test",
+            started_at_ms: started_ms,
+            finished_at_ms: started_ms,
+        },
+    )
+    .await
+    .expect("seed a successful export history row");
+}
+
+async fn history_row_count(ch: &ChClient, mart: &str) -> u64 {
+    let rows = ch
+        .rows(
+            &format!(
+                "SELECT toString(count()) AS n FROM console.gold_export_run \
+                 WHERE mart = '{mart}'"
+            ),
+            None,
+        )
+        .await
+        .expect("count history rows");
+    rows[0]["n"]
+        .as_str()
+        .expect("toString(count()) is a string")
+        .parse::<u64>()
+        .expect("a row count")
+}
+
+/// The skip case: the mart's last write is OLDER than its last
+/// successful export, so `?ifChanged=true` must answer 200 with
+/// `skipped: true` and write NOTHING — the history row count is still
+/// exactly the one seeded row, and no export was attempted (the dead
+/// Lakekeeper is never reached: the handler returned before
+/// `read_catalog_token`).
+#[tokio::test]
+async fn if_changed_skips_an_unchanged_mart_and_writes_no_history_row() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "quiet_mart").await;
+    // The copy was refreshed "after" the mart's last write: a future
+    // started_at makes lastExportedAt strictly newer than
+    // lastChangedAt regardless of test timing.
+    seed_success_run(&ch, "quiet_mart", unix_ms(3_600)).await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/quiet_mart?ifChanged=true",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["skipped"], Value::Bool(true), "{body}");
+    let reason = body["reason"].as_str().expect("a reason string");
+    assert!(
+        reason.starts_with("unchanged since "),
+        "the reason names the export it is fresh as of: {reason}"
+    );
+
+    assert_eq!(
+        history_row_count(&ch, "quiet_mart").await,
+        1,
+        "a skip writes no console.gold_export_run row"
+    );
+}
+
+/// A mart rewritten after its last export must NOT skip: the handler
+/// proceeds into the export path, which with no Lakekeeper provisioned
+/// stops deterministically at `read_catalog_token` (503 Unavailable,
+/// fixed text) — proof it got past the skip gate and attempted the
+/// export. The failed attempt records one history row ("failed"), as
+/// every POST does.
+#[tokio::test]
+async fn if_changed_exports_a_mart_newer_than_its_last_export() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "busy_mart").await;
+    // The last copy predates the mart's last write (seed_mart's INSERT
+    // happened after this row's started_at).
+    seed_success_run(&ch, "busy_mart", unix_ms(-3_600)).await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/busy_mart?ifChanged=true",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.get("skipped").is_none(), "{body}");
+    assert_eq!(
+        history_row_count(&ch, "busy_mart").await,
+        1,
+        "still exactly the seeded row: the 503 at read_catalog_token \
+         happens before export_mart, so nothing new was recorded"
+    );
+}
+
+/// No successful export ever recorded -> lastExportedAt is unknown ->
+/// never skip: export (which again stops deterministically at the dead
+/// Lakekeeper's missing token file, 503).
+#[tokio::test]
+async fn if_changed_exports_when_the_last_export_is_unknown() {
+    let (app, ch) = spin_up_with_clickhouse().await;
+    seed_mart(&ch, "fresh_mart").await;
+    let sessions = Sessions { app };
+    let cookie = sessions.with("gold:export").await;
+
+    let (status, body) = send(
+        &sessions.app.router,
+        "POST",
+        "/api/gold/export/fresh_mart?ifChanged=true",
+        Some(&cookie),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body.get("skipped").is_none(), "{body}");
 }

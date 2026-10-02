@@ -96,6 +96,63 @@ pub struct ExportQuery {
     /// Shared token, as a query-string fallback to the `x-run-token`
     /// header — same shape as `routes::alerts::RunQuery::token`.
     token: Option<String>,
+    /// DATA-1 task 4: `?ifChanged=true` skips the export when the mart
+    /// provably has not changed since its last successful export (see
+    /// [`if_changed_skip_reason`]). Any other value is treated as absent
+    /// (booleans are parsed with `== "true"`), so the console's manual
+    /// trigger — which sends nothing — can never accidentally skip.
+    #[serde(rename = "ifChanged")]
+    if_changed: Option<String>,
+}
+
+/// DATA-1 task 4: the skip decision for `?ifChanged=true`, as a pure
+/// function so the three outcomes are unit-tested without any server.
+///
+/// Returns `Some(reason)` — skip — only when BOTH facts are measured and
+/// the mart's last write is not after its last successful export. Any
+/// unknown (`None` either side — no active parts yet, no successful
+/// export yet, or an unparseable timestamp) exports: a stale open-format
+/// copy is the worse outcome, so uncertainty fails toward publishing.
+fn if_changed_skip_reason(
+    last_changed_ms: Option<i64>,
+    last_exported_ms: Option<i64>,
+) -> Option<String> {
+    let changed_ms = last_changed_ms?;
+    let exported_ms = last_exported_ms?;
+    if changed_ms > exported_ms {
+        return None;
+    }
+    // The exported timestamp is always a real epoch-millisecond from the
+    // history row; the epoch-ms fallback keeps the reason honest even for
+    // an out-of-range value instead of printing a fabricated date.
+    let since = millis_to_rfc3339(exported_ms).unwrap_or_else(|| format!("unix ms {exported_ms}"));
+    Some(format!("unchanged since {since}"))
+}
+
+/// The skipped-response body `POST` returns when `?ifChanged=true` found
+/// nothing to do: `200`, explicitly `skipped`, with the reason the
+/// decision produced. Deliberately NOT an export record — see
+/// [`export`]'s "Skip" doc section.
+fn skipped_body(reason: &str) -> Value {
+    json!({ "skipped": true, "reason": reason })
+}
+
+/// The two freshness reads behind `?ifChanged=true`, in one place for
+/// both call-shaped uses: `Some(reason)` to skip with, `None` to export.
+/// A failed read is a classified [`ApiError`], not a silent skip — a
+/// scheduler that cannot MEASURE must not treat the mart as quiet.
+async fn unchanged_since_last_export_reason(
+    state: &AppState,
+    mart: &str,
+) -> Result<Option<String>, ApiError> {
+    let last_changed_at =
+        mart_last_changed_at(&state.clickhouse, &state.config.gold_source_schema, mart)
+            .await
+            .map_err(ApiError::from)?;
+    let last_exported_at = gold_export_history::last_success_started_at(&state.clickhouse, mart)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(if_changed_skip_reason(last_changed_at, last_exported_at))
 }
 
 /// See the module doc comment's "Auth" section. Two independent ways to
@@ -188,6 +245,18 @@ pub(crate) async fn read_catalog_token(path: &str) -> Result<SecretValue, ApiErr
 
 /// `POST /api/gold/export/{mart}` — run the export.
 ///
+/// # Skip: `?ifChanged=true` (DATA-1 task 4)
+///
+/// With that parameter, a mart whose measured last write
+/// (`max(modification_time)` over active parts) is not after its last
+/// successful export is skipped: `200` with `{"skipped": true, "reason":
+/// "unchanged since <rfc3339>"}`, and NOTHING else happens — no export,
+/// no `console.gold_export_run` row, no Iceberg snapshot. This is what
+/// the scheduler (task 5/6) sends so a quiet mart costs two cheap
+/// `ClickHouse` reads. Unknown facts never skip (see
+/// [`if_changed_skip_reason`]); the console's manual trigger does not
+/// send the parameter at all.
+///
 /// # Single-flight: only one export of a given mart runs at a time
 ///
 /// A per-mart lock (`AppState::gold_export_locks` — see
@@ -224,6 +293,20 @@ pub async fn export(
 
     let mart_ident =
         Ident::new(&mart).map_err(|e| ApiError::BadRequest(format!("invalid mart: {e}")))?;
+
+    // DATA-1 task 4 — `?ifChanged=true`: a proven-unchanged mart is
+    // skipped BEFORE the single-flight lock is taken (a skip holds
+    // nothing, writes no `console.gold_export_run` row, and commits no
+    // snapshot — the response is the only trace). The two facts cost two
+    // cheap `system.parts`/history reads and are computed only when the
+    // parameter is actually set, so the manual path gains nothing extra.
+    // Unknown facts export, per [`if_changed_skip_reason`].
+    if query.if_changed.as_deref() == Some("true")
+        && let Some(reason) =
+            unchanged_since_last_export_reason(&state, mart_ident.as_str()).await?
+    {
+        return Ok(ApiJson(skipped_body(&reason)));
+    }
 
     // Held for the rest of this handler (dropped at function return,
     // success or error alike) — see this function's "Single-flight" doc
@@ -301,34 +384,15 @@ pub async fn export(
             PrincipalId::User(_) => format!("user:{}", p.display_name),
         },
     );
-    let error_message = export_result.as_ref().err().map(ToString::to_string);
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "rows_exported is a usize from an in-memory Vec of one ClickHouse batch, \
-                  never near u64::MAX"
-    )]
-    let history_row = gold_export_history::NewGoldExportRun {
-        mart: mart_ident.as_str(),
-        status: if export_result.is_ok() {
-            "success"
-        } else {
-            "failed"
-        },
-        rows_exported: export_result.as_ref().ok().map(|r| r.rows_exported as u64),
-        format_version: export_result.as_ref().ok().map(|r| r.format_version),
-        snapshot_id: export_result.as_ref().ok().and_then(|r| r.snapshot_id),
-        error: error_message.as_deref(),
-        triggered_by: &triggered_by,
-        started_at_ms: started_at.unix_timestamp() * 1000,
-        finished_at_ms: finished_at.unix_timestamp() * 1000,
-    };
-    // Best-effort: a history-write failure must never turn an otherwise
-    // successful (or already-failed-for-a-different-reason) export into a
-    // 500 — see gold_export_history::record_export_run's doc comment.
-    if let Err(err) = gold_export_history::record_export_run(&state.clickhouse, &history_row).await
-    {
-        tracing::error!(%err, mart = mart_ident.as_str(), "failed to record gold export history");
-    }
+    record_export_history(
+        &state,
+        mart_ident.as_str(),
+        &triggered_by,
+        started_at,
+        finished_at,
+        &export_result,
+    )
+    .await;
 
     let result = export_result.map_err(ApiError::from)?;
 
@@ -340,6 +404,46 @@ pub async fn export(
         "snapshotId": result.snapshot_id,
         "exportedAt": result.exported_at_ms.and_then(millis_to_rfc3339),
     })))
+}
+
+/// Best-effort history write for one finished export attempt: every
+/// `POST` records exactly one row, success or failure (the acceptance
+/// test counts on it), but a failed write is logged, never propagated —
+/// this table is a history view, not a correctness dependency of the
+/// export itself (`gold_export_history::record_export_run`'s doc comment).
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "rows_exported is a usize from an in-memory Vec of one ClickHouse batch, \
+              never near u64::MAX"
+)]
+async fn record_export_history(
+    state: &AppState,
+    mart: &str,
+    triggered_by: &str,
+    started_at: time::OffsetDateTime,
+    finished_at: time::OffsetDateTime,
+    export_result: &Result<gold_export::GoldExportResult, GoldExportError>,
+) {
+    let error_message = export_result.as_ref().err().map(ToString::to_string);
+    let history_row = gold_export_history::NewGoldExportRun {
+        mart,
+        status: if export_result.is_ok() {
+            "success"
+        } else {
+            "failed"
+        },
+        rows_exported: export_result.as_ref().ok().map(|r| r.rows_exported as u64),
+        format_version: export_result.as_ref().ok().map(|r| r.format_version),
+        snapshot_id: export_result.as_ref().ok().and_then(|r| r.snapshot_id),
+        error: error_message.as_deref(),
+        triggered_by,
+        started_at_ms: started_at.unix_timestamp() * 1000,
+        finished_at_ms: finished_at.unix_timestamp() * 1000,
+    };
+    if let Err(err) = gold_export_history::record_export_run(&state.clickhouse, &history_row).await
+    {
+        tracing::error!(%err, mart, "failed to record gold export history");
+    }
 }
 
 /// Renders an `Iceberg` snapshot's Unix-millisecond commit time as an RFC
@@ -921,5 +1025,30 @@ mod tests {
         assert!(
             matches!(err, ApiError::Unauthorized(_)) || err.to_string().contains("unauthorized")
         );
+    }
+
+    // ── if_changed_skip_reason (DATA-1 task 4) ──────────────────────────
+
+    #[test]
+    fn unchanged_mart_since_the_last_export_is_skipped_with_a_reason() {
+        // Equal timestamps: the mart's last write is the export itself.
+        let skip = if_changed_skip_reason(Some(1_700_000_000_000), Some(1_700_000_000_000))
+            .expect("unchanged must skip");
+        assert!(skip.starts_with("unchanged since "), "{skip}");
+
+        // Strictly older mart: the copy is fresh.
+        assert!(if_changed_skip_reason(Some(1_699_999_000_000), Some(1_700_000_000_000)).is_some());
+    }
+
+    #[test]
+    fn a_mart_newer_than_its_last_export_is_exported_not_skipped() {
+        assert!(if_changed_skip_reason(Some(1_700_000_500_000), Some(1_700_000_000_000)).is_none());
+    }
+
+    #[test]
+    fn an_unknown_fact_never_skips_fail_toward_publishing() {
+        assert!(if_changed_skip_reason(None, Some(1_700_000_000_000)).is_none());
+        assert!(if_changed_skip_reason(Some(1_700_000_000_000), None).is_none());
+        assert!(if_changed_skip_reason(None, None).is_none());
     }
 }
