@@ -505,6 +505,149 @@ Commits; the exact commands run with their counts; anything skipped or
 *not verified* with the reason; every place the plan was wrong against the
 code.
 
+### Slice A — T1, T2 (developer, 2026-10-02)
+
+Branch `feat/upload-file`, from `98aaa64` plus the plan commit `41ce2ad`.
+Nothing was pushed. No file outside `/home/hv/lakehouse-upload` was edited
+(build output went to the shared `CARGO_TARGET_DIR`, logs and scratch copies
+to the session scratchpad); no `docker compose` was run, only throwaway
+`docker run --rm` containers of the existing code-location image. No
+`Cargo.lock` change.
+
+**Commits**
+
+- `87646eb` fix(lint): T1 format one test file and count raw tables under a WHERE
+- `46642fa` chore(orchestrator): T2 remove the unregistered transformation modules
+
+T1 (4 files, +21/-5): `cargo fmt` on `tests/connector_delete_deprovision.rs`
+(the only file `cargo fmt --check` refused, one hunk; `git diff --stat`
+after `cargo fmt` showed that file alone); `WHERE 1` on the Bronze total in
+`connector_catalog.py` plus a comment at the statement saying why (R11,
+`docs/plans/P5-RESULT.md`), and the docstring's "row count" before
+`dataset_sync.total` reworded to "row total"; `test_connector_catalog.py`
+asserts the new statement; `WHERE 1` on the sample query in
+`routes/catalog_governance.rs` (the test only checks which table a query
+reads). The lint, its allowlist and every threshold are untouched.
+
+T2 (5 files, +6/-446): `git rm` of `silver_transform.py`,
+`gold_transform.py`, `sap_models.py` (441 lines); the three comments that
+named `silver_transform.py` (one in `connector_catalog.py`, two in
+`ch_models.py`) now state the reason themselves. `ch_models.py` stays.
+
+**Commands run, with counts**
+
+Per commit, scoped (T1):
+
+- `cd rust && cargo fmt --check` on the base: failed, one hunk, in
+  `connector_delete_deprovision.rs:119`. After `cargo fmt` and the
+  `catalog_governance.rs` edit: exit 0.
+- `cargo clippy -p lakehouse-api --all-targets -- -D warnings`: exit 0.
+- `cargo test -p lakehouse-api --bin lakehouse-api catalog_governance`:
+  18 passed, 0 failed, 1070 filtered out (includes
+  `reads_any_needs_the_table_in_the_query_not_just_in_its_text`).
+- `cargo test -p lakehouse-api --test connector_delete_deprovision`:
+  6 passed, 0 failed.
+- `pytest dispar_orchestrate/test_connector_catalog.py -v` in the
+  code-location image: 5 passed. The same file against the pre-T1
+  `connector_catalog.py` (a scratch copy, the worktree untouched): 1 failed,
+  4 passed, so the new assertion is not vacuous.
+- `python3 ops/lint/check_bare_iceberg_count.py` after T1: reports only
+  `silver_transform.py:162`, as the plan's acceptance says.
+
+Per commit, scoped (T2):
+
+- Before deleting (a repo-wide `grep`, skipping `node_modules`, `target`,
+  `.next`, `.git`): nothing imports the three modules, and no job or op of
+  theirs (`silver_transform_job`, `gold_transform_job`, `sap_transform_job`,
+  `transform_bronze_to_silver`, `build_gold_marts`, `build_sap_models`) is
+  named outside the three modules, in `dagster/`, `ops/`, `rust/`, `src/`,
+  `docker-compose.yml` or `docs/`; `definitions.py` registers none; no test
+  file covers them. The only other mentions are the comments listed under
+  "Where the plan was wrong", the plan and ADR 0014.
+  `transform_test_vectors.json` belongs to `authored_transforms`, not to
+  them.
+- Orchestrator suite, image command from the plan, before T2 (after T1,
+  which adds no test): `402 passed, 30 subtests passed in 11.72s`;
+  `--collect-only`: 402 tests. After T2: `402 passed, 30 subtests passed in
+  11.79s`; `--collect-only`: 402 tests, and the sorted test ids are
+  identical before and after (`diff` empty).
+- `check_bare_iceberg_count.py` after T2: exit 0, "no bare count() against a
+  Bronze Iceberg table found".
+- `import dispar_orchestrate.definitions` in a throwaway container with
+  `--network none`: loads; the eight fixed jobs are `agent_run_job`,
+  `alerts_run_job`, `bronze_ingest_job`, `bronze_maintenance_job`,
+  `capacity_snapshot_job`, `gold_export_job`, `ingest_job`,
+  `replication_slot_check_job` (no authored jobs: the run tokens are unset
+  in that container).
+
+Full verification, once, in the foreground, on the final product commit
+`46642fa` (the handoff commit changes only this file):
+
+- `cd rust && cargo fmt --check`: exit 0.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  exit 0.
+- `cargo test --workspace`: exit 0. 76 `test result:` lines (62 test
+  binaries and 14 doc-test targets): **3087 passed, 0 failed, 8 ignored**.
+  The 8 ignored are `#[ignore]`s already on the base (one each in the
+  `lakehouse-api` lib and bin targets, from `routes/ai/registry.rs`; two in
+  `tests/parity.rs`; three in `lakehouse-iceberg/tests/g1_lakekeeper.rs`;
+  one doc test in `lakehouse-auth`). Their reasons, in the source, are a
+  live stack or server, a `DATABASE_URL`, or a fixture rewrite. They were
+  not run, and this slice added none (`git diff 98aaa64 HEAD -- rust` has
+  no `ignore`).
+- `python3 ops/lint/check_intra_package_imports.py`: **exit 1, red, as
+  expected**. Output: `file_ingest.py:48` imports `_install_catalog_env` and
+  `_stamp_ingested_at` from `dispar_orchestrate.dlt_pipeline`, which does not
+  define them. Measured on the untouched `98aaa64` too (a scratch
+  `git archive`): the same two lines. T7 rewrites that file; I did not touch
+  it.
+- `python3 ops/lint/check_bare_iceberg_count.py`: exit 0.
+- `python3 ops/lint/check_compose_init_readiness.py`: exit 0, no output.
+- Orchestrator pytest (the image command from the brief):
+  `402 passed, 30 subtests passed in 12.45s`.
+
+**Not verified, or not run**
+
+- No TypeScript or compose file is touched, so `bun run typecheck|lint|test`
+  and `docker compose --profile '*' config --quiet` were not run.
+- `gitleaks` (`CODE-STANDARD.md` §9) was not run: it is not installed on this
+  machine. I read the diff: it adds no secret, host, port or client name.
+- `check_intra_package_imports.py` stays red until T7 (above).
+- The cargo runs used the warm shared `CARGO_TARGET_DIR`, not a cold build
+  (no `cargo clean`, per the rules), so "from a fresh build" in rule 7 holds
+  here only in the sense that cargo recompiled what had changed.
+
+**Where the plan was wrong against the code**
+
+1. T1, `connector_catalog.py`: the plan pairs the lint's line-18 hit with
+   "the query is at `:68`". The lint never saw the query: its table name
+   arrives through the `table` variable, outside the lint's statement
+   window, so it passed over line 68 before and after. The line-18 hit was
+   the docstring alone: its prose "row count (`dataset_sync.total`)" put
+   `count` and an opening parenthesis, the lint's `count(` pattern, within
+   reach of the word `DataLakeCatalog`. Rewording that prose is what clears
+   the lint (I checked this by running the lint between the two edits). The
+   `WHERE 1` on the real statement is a correctness fix the lint cannot
+   enforce, so the comment at the statement says it is kept by hand.
+2. T2: the plan names one comment (`connector_catalog.py`). Three files name
+   the removed modules in comments: `connector_catalog.py:35` and
+   `ch_models.py:12` and `:28` (all reworded), and **`file_ingest.py:33`**
+   (`sap_models.py`, in the "Everything lands as text" paragraph of its
+   docstring). I left the last one because slice A is not to touch
+   `file_ingest.py`; it now points at a file that no longer exists until T7
+   replaces the docstring. **T7 must drop that sentence.**
+3. T2 and ADR 0014 say `ch_models.py` stays because `connector_catalog.py`
+   uses it. That holds for `ch_exec`, `ensure_catalog_database` and
+   `ch_target` only. The runner (`Model`, `run_models`, and what it calls:
+   `run_model`, `_split_target`, `ALLOWED_SCHEMAS`) had its only callers in
+   the removed modules and has none now, and the module docstring still
+   introduces the file as the "SQL-model runner" for Silver and Gold. I kept
+   the file as the plan says and changed no code in it; whether to prune it
+   is the planner's call.
+4. The handoff model named in the brief
+   (`2026-10-02-gold-publish-per-mart.md`) is not in this worktree, so this
+   entry follows the list in section 8's own intro.
+
 ## 9. Review (planner appends findings per slice), then the trial
 
 Findings are tagged `BLOCKER` or `SHOULD-FIX`. The planner re-runs the
