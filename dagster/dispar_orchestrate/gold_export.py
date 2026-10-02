@@ -33,6 +33,23 @@ in a mapped step (so each mart is its own failure unit, retryable by
 logs the count. The console now sees one mapped step per mart named
 `export_gold_mart[<key>]` where it previously saw the single
 `run_gold_export` step.
+
+# Which marts run (gold-publish-per-mart plan T5, DATA-1)
+
+Before this change the mart list came only from `GOLD_EXPORT_MARTS`
+(default `gold_export_smoke`) — a build-time constant no operator could
+change without redeploying, and one that ignored everything the console's
+per-mart switches said. Now `list_gold_marts` unions two sources, the
+API's enabled publications (`GET /api/gold/publications`, what the
+console's switches write — the database is the source of truth) and the
+env override (an operator's escape hatch, default empty), deduplicated
+by mart name; two DISTINCT marts that would collapse into one Dagster
+step key are still refused. Every scheduled POST sends `ifChanged=true`
+(T4), so a mart whose `max(modification_time)` has not moved past its
+last successful export comes back `{skipped: true}` — recorded as
+`skipped_verbs=["unchanged"]` with no `AssetMaterialization`, since
+nothing was written — and the empty union runs a zero-step job that
+still succeeds, which is the honest shape of "nothing is published."
 """
 
 from __future__ import annotations
@@ -65,7 +82,13 @@ def _env(name: str, default: str) -> str:
 
 
 def _marts_from_env() -> list[str]:
-    raw = os.environ.get("GOLD_EXPORT_MARTS", "gold_export_smoke")
+    """The operator's `GOLD_EXPORT_MARTS` override, default empty: the
+    scheduled mart list is owned by the per-mart publication setting
+    (`GET /api/gold/publications`, gold-publish-per-mart plan T5), and
+    this env is only a union-ed escape hatch for an operator who needs a
+    mart exported before anyone switched it on in the console. A fresh
+    deployment with nothing switched on exports nothing — on purpose."""
+    raw = os.environ.get("GOLD_EXPORT_MARTS", "")
     return [m.strip() for m in raw.split(",") if m.strip()]
 
 
@@ -114,11 +137,51 @@ def _headers(cfg: GoldExportConfig) -> dict[str, str]:
 
 
 def export_one_mart(cfg: GoldExportConfig, mart: str) -> dict[str, Any]:
+    """`ifChanged=true` (gold-publish-per-mart plan T4): the API skips
+    the export — 200 `{skipped: true, reason: ...}`, nothing written,
+    no history row — when the mart's `max(modification_time)` has not
+    moved past its last successful export. The manual console trigger
+    sends no such parameter; only the schedule measures before it
+    writes."""
     resp = requests.post(
-        f"{cfg.api_url}/api/gold/export/{mart}", headers=_headers(cfg), timeout=60
+        f"{cfg.api_url}/api/gold/export/{mart}",
+        params={"ifChanged": "true"},
+        headers=_headers(cfg),
+        timeout=60,
     )
     resp.raise_for_status()
     return resp.json()
+
+
+def _enabled_publication_marts(cfg: GoldExportConfig) -> list[str]:
+    """The marts switched on in the console, in the order the API lists
+    them. A failed fetch raises (bare `requests` exception ->
+    `DEFAULT_RETRY_POLICY`) — never swallowed into "zero marts", which
+    would silently skip every export; a malformed body raises a
+    non-retryable `Failure`, because a retry would read the same wrong
+    shape."""
+    resp = requests.get(
+        f"{cfg.api_url}/api/gold/publications", headers=_headers(cfg), timeout=30
+    )
+    resp.raise_for_status()
+    publications = resp.json().get("publications")
+    if not isinstance(publications, list):
+        raise Failure(
+            f"GET {cfg.api_url}/api/gold/publications returned no "
+            f"publications list -- expected {{\"publications\": [...]}}",
+            allow_retries=False,
+        )
+    marts: list[str] = []
+    for publication in publications:
+        mart = publication.get("mart") if isinstance(publication, dict) else None
+        if not isinstance(mart, str) or not mart:
+            raise Failure(
+                f"GET {cfg.api_url}/api/gold/publications returned a "
+                f"publication without a mart name: {publication!r}",
+                allow_retries=False,
+            )
+        marts.append(mart)
+    return marts
 
 
 # Dagster's `DynamicOutput.mapping_key` must match `^[A-Za-z0-9_]+$`
@@ -153,7 +216,10 @@ def _sanitize_mapping_key(name: str) -> str:
     retry_policy=DEFAULT_RETRY_POLICY,
     tags=source_metadata(
         "dispar_orchestrate/gold_export.py::list_gold_marts",
-        reads=["env GOLD_EXPORT_MARTS"],
+        reads=[
+            "GET /api/gold/publications (enabled marts, the source of truth)",
+            "env GOLD_EXPORT_MARTS (operator override, unioned in)",
+        ],
         # `writes` is the side-effect of this op: a `DynamicOutput` per
         # mart, which becomes a mapped `export_gold_mart[<key>]` step.
         # Declared here so the test that walks every op in this code
@@ -164,24 +230,38 @@ def _sanitize_mapping_key(name: str) -> str:
     ),
 )
 def list_gold_marts(context) -> Any:
-    """Yield one `DynamicOutput` per configured mart, sanitized to a
-    Dagster-legal mapping key. Two marts that sanitize to the same key
-    are refused with a non-retryable `Failure` -- they would otherwise
-    collapse into one mapped step doing two marts' work, which is a
-    failure mode that only the fan-out can detect."""
+    """Yield one `DynamicOutput` per mart to export this run: every
+    publication switched on in the console (`GET /api/gold/publications`)
+    unioned with the `GOLD_EXPORT_MARTS` override, deduplicated by exact
+    mart name — a mart listed in both places is one step, not two.
+
+    Two DISTINCT marts that sanitize to the same Dagster mapping key are
+    refused with a non-retryable `Failure` naming both and where each
+    came from -- they would otherwise collapse into one mapped step
+    doing two marts' work, which is a failure mode only the fan-out can
+    detect."""
     cfg = GoldExportConfig.from_env()
-    context.log.info(f"exporting {len(cfg.marts)} Gold mart(s): {cfg.marts}")
-    seen: dict[str, str] = {}
-    for mart in cfg.marts:
+    enabled = _enabled_publication_marts(cfg)
+    context.log.info(
+        f"enabled publications: {enabled}; GOLD_EXPORT_MARTS override: {cfg.marts}"
+    )
+    seen_names: set[str] = set()
+    seen_keys: dict[str, str] = {}
+    sources = [("publication setting", m) for m in enabled]
+    sources += [("GOLD_EXPORT_MARTS", m) for m in cfg.marts]
+    for source, mart in sources:
+        if mart in seen_names:
+            continue
         key = _sanitize_mapping_key(mart)
-        if key in seen:
+        if key in seen_keys:
             raise Failure(
-                f"GOLD_EXPORT_MARTS contains two marts that map to the same "
-                f"Dagster step key {key!r}: {seen[key]!r} and {mart!r} -- "
+                f"two Gold marts map to the same Dagster step key {key!r}: "
+                f"{seen_keys[key]!r} and {mart!r} ({source}) -- "
                 "rename one so each mart maps to a unique step",
                 allow_retries=False,
             )
-        seen[key] = mart
+        seen_names.add(mart)
+        seen_keys[key] = mart
         yield DynamicOutput(mart, mapping_key=key)
 
 
@@ -222,7 +302,7 @@ def export_gold_mart(context, mart: str) -> dict[str, Any]:
     except requests.HTTPError as exc:
         # Bare re-raise of the HTTPError (no `Failure` wrap) -- lets
         # `DEFAULT_RETRY_POLICY` (max_retries=2, delay=30s, exponential
-        # backoff with ±jitter) retry a transient 5xx (busy ClickHouse
+        # backoff with +/- jitter) retry a transient 5xx (busy ClickHouse
         # on the `lakehouse-api` side). A persistent failure exhausts
         # those attempts and Dagster surfaces it as the mapped step's
         # own failed step. The failure row is written BEFORE the
@@ -238,6 +318,22 @@ def export_gold_mart(context, mart: str) -> dict[str, Any]:
             target=cfg.ch,
         )
         raise
+    # A skip is a successful no-op, not an error: the API answered 200
+    # with `{skipped: true}` because the mart's `max(modification_time)`
+    # has not moved past its last successful export (plan T4). It gets
+    # its `maintenance_run` row -- `skipped_verbs=["unchanged"]`, the
+    # honest ledger of "looked, nothing to do" -- but no
+    # `AssetMaterialization`, because nothing was written to Iceberg.
+    if body.get("skipped") is True:
+        context.log.info(f"skipped {mart!r}: {body.get('reason')}")
+        record_maintenance_run(
+            table_name=f"gold.{mart}",
+            dry_run_metrics={},
+            applied_metrics={},
+            skipped_verbs=["unchanged"],
+            target=cfg.ch,
+        )
+        return body
     context.log.info(f"exported {mart!r}: {body}")
     # `dry_run_metrics`/`applied_metrics`' numeric fields are shaped for
     # `expire_snapshots` (data/manifest file deletion counts), which a

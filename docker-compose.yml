@@ -1678,15 +1678,20 @@ services:
       # see that module's `MaintenanceConfig.ch_auth_settings`.
       CH_OAUTH_CLIENT_ID: clickhouse-reader
       CH_OAUTH_SERVER_URI: http://oidc-mock:8090/token
-      # ADR 0010 — `gold_export.py`'s scheduled trigger: which mart(s) to
-      # export, where `lakehouse-api` lives, and the shared token
+      # ADR 0010 — `gold_export.py`'s scheduled trigger: where
+      # `lakehouse-api` lives, and the shared token
       # `routes::gold::check_export_token` requires when set (must match
       # `lakehouse-api`'s own `GOLD_EXPORT_RUN_TOKEN` — both read the same
       # host-level `.env` value; see `gold-export-test-runner`'s usage
       # comment for why a one-off override here would not reach the
       # already-running `lakehouse-api` container).
+      # gold-publish-per-mart T5 (DATA-1): which marts to export is owned
+      # by the per-mart publication setting the console writes — the
+      # scheduler reads `GET /api/gold/publications` and unions in
+      # `GOLD_EXPORT_MARTS` only as an operator override, so the default
+      # here is empty: a fresh deployment exports only what is switched on.
       LAKEHOUSE_API_URL: ${LAKEHOUSE_API_URL:-http://lakehouse-api:8080}
-      GOLD_EXPORT_MARTS: ${GOLD_EXPORT_MARTS:-gold_export_smoke}
+      GOLD_EXPORT_MARTS: ${GOLD_EXPORT_MARTS:-}
       GOLD_EXPORT_RUN_TOKEN: ${GOLD_EXPORT_RUN_TOKEN:-}
       # T3.3 (copilot-operations-handover) — `agent_runs.py`'s scheduled
       # trigger for a digital employee's headless run: which
