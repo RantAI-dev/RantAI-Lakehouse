@@ -507,6 +507,63 @@ Environment notes for the reviewer:
   argument (PUT route); `ApiResult`'s error type is `ApiRejection`, so a
   direct `Err(ApiError::x())` needs `.into()`.
 
+### PR slice B — fixes (developer, 2026-10-02)
+
+Fixes the review findings B1 (BLOCKER) and S1 (SHOULD-FIX), on
+`feat/gold-publish-per-mart-b` after the reviewer's merge of
+`origin/main` (`48b94ae`) and review commit (`ef07018`).
+
+Commits:
+
+- `de8bc5f` — B1. `if_changed_skip_reason` skips only when
+  `changed_ms < exported_ms`, strictly: `>` became `>=` in the export
+  branch, so equal timestamps export. The unit test's wrong "equal
+  timestamps" case (and its "the mart's last write is the export
+  itself" comment) is replaced by the strictly-older skip case, and a
+  new `equal_timestamps_export_fail_toward_a_fresh_copy` pins that
+  equal exports. Doc comments updated to "strictly before" on
+  `if_changed_skip_reason`, `export`'s Skip section, and — for the same
+  claim made in Python — `gold_export.py`'s module docstring T4
+  paragraph, `export_one_mart`'s docstring, and the skip-record
+  comment. The three `gold_publication.rs` integration skip tests were
+  re-checked against the strict rule and needed no change (they seed
+  runs ±3600s, never equal).
+- `5070200` — S1. New `pool(state)` in `routes/gold.rs` returning
+  `ApiError::Unavailable` with the same fixed-text shape as
+  `routes::identity::pool`/`routes::pipelines::pool`/`routes::
+  governance::pool` (checked per rule 4: those helpers are
+  per-module, none shared, so gold gets its own); the three
+  `ApiError::Internal("gold publications require Postgres")` sites in
+  `publications`/`publication`/`set_publication` now go through it,
+  and their `# Errors` sections say 503. The best-effort audit
+  writer's `as_deref() else return` is untouched — not an error path.
+
+Verification — every command run in the foreground on the final commit
+`5070200`, shared `CARGO_TARGET_DIR`, Docker via `sg docker`:
+
+- `cd rust && cargo fmt --check` — pass.
+- `cd rust && cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` — pass, no warnings.
+- `cd rust && cargo test --workspace` — 78 suites, all `ok`: **2833
+  passed, 0 failed, 8 ignored** (full log at
+  `/tmp/opencode/b1s1-workspace-test.log`; the count is 2 over the
+  reviewed 2831 because the branch also carries `main`'s post-merge
+  tests and the new equal-timestamps test; ignored is 8, matching the
+  review's count — the slice-B handoff's "2" was an under-count of the
+  same suites and is corrected here).
+- `python3 ops/lint/check_intra_package_imports.py` — pass.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` — **375
+  passed, 30 subtests passed** (B1 edits docstrings only, run for
+  completeness).
+- Scoped runs made while iterating: `cargo test -p lakehouse-api --lib
+  routes::gold` — 11 passed; `--test gold_publication` — 8 passed;
+  `--test route_auth` — 25 passed; `--test gold_export_auth` — 1 passed.
+
+Not run, with reason: `bun run typecheck/lint/test` and compose checks —
+the fix commits touch Rust and Python docstrings only.
+
+
 
 ## 8. Review (planner appends findings per PR)
 
