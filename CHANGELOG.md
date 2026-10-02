@@ -162,6 +162,10 @@ once a first release is tagged.
 
 ### Fixed
 
+- A pipeline with `dependsOn` no longer takes down the whole Dagster code location (PR #57 review F1.1): the dependency sensor re-fetched the runnable list and rebuilt the job, and Dagster refuses two job definitions with the same name at load time. One fetch now feeds both the jobs and the sensors.
+- Pausing a chained pipeline now also stops its dependency sensor, and resuming starts it again (PR #57 review F1.2): Dagster keeps a sensor's stored RUNNING state across code-location reloads, so removing the sensor alone left the chain firing; a paused pipeline also builds no sensor at all.
+- The dependency chain now holds "every upstream succeeded" (PR #57 review F1.3): the downstream launches only once every upstream has a SUCCESS run newer than the downstream's latest run, a queued or in-progress downstream never double-fires, and one round of upstream successes requests one downstream run instead of one per upstream tick.
+- An authored pipeline's write now replaces its target table atomically via a staging table and `EXCHANGE TABLES` (PR #56 review F1.4): the write was a plain `INSERT INTO … SELECT` into a `MergeTree ORDER BY tuple()` table, so a retry after the insert committed — or an ordinary second run — appended the whole result again. A run now always leaves exactly its SELECT's rows; append-per-run behaviour is gone.
 - A pipeline created in the console now belongs to its creator's tenant and appears on the Pipelines list; it used to be stored without a tenant and was invisible to every list. A Platform Admin (`*:*`) with no tenant now sees every tenant's authored pipelines there, the rule that already showed them the Dagster jobs; before, they saw none. An authored pipeline's `authored__<id>` Dagster job is not listed a second time.
 - `PIPELINE_RUN_TOKEN` is now passed to `lakehouse-api` and `dagster-code-location`; it was passed to neither, so no authored pipeline could become a job.
 - The authored-pipeline schedule field offers cron presets and a validated custom cron; its old free-text default ("Every hour") never fired.

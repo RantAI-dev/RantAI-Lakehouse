@@ -15,8 +15,8 @@ use lakehouse_alerts::SilenceSource;
 use lakehouse_auth::{Principal, PrincipalId};
 use lakehouse_core::ApiError;
 use lakehouse_dagster::{
-    ConfigValidationOutcome, DgClient, DgError, DgJob, DgRun, ReexecutionStrategy,
-    iso_from_unix_seconds, map_run_status,
+    ConfigValidationOutcome, DgClient, DgError, DgJob, DgRun, ReexecutionStrategy, ScheduleOutcome,
+    SensorOutcome, iso_from_unix_seconds, map_run_status,
 };
 use lakehouse_notify::EmailSender;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
@@ -2700,11 +2700,33 @@ async fn authored_status(
         } else {
             state.dagster.start_schedule(&schedule).await
         };
-        if let Ok(lakehouse_dagster::ScheduleOutcome {
+        if let Ok(ScheduleOutcome {
             error: Some(err), ..
         }) = switched
         {
             tracing::info!(%err, pipeline_id = id, "authored schedule not switched");
+        }
+        // F1.2 (#57): chained pipelines ALSO ship an
+        // `authored__<id>_after` run-status sensor. Like the schedule,
+        // its stored RUNNING/STOPPED state outlives a code-location
+        // reload, so a `paused` pipeline keeps firing the chain
+        // unless the sensor is switched explicitly. `default_status`
+        // on the Python side does NOT apply to stored state -- only
+        // to freshly created ones. A pipeline with no `dependsOn`
+        // has no sensor to switch; the `set_sensor_running` method
+        // treats that as already-stopped (SensorNotFoundError
+        // tolerated on `running=false`).
+        let sensor = authored_pipelines::sensor_name(id);
+        let sensor_switched = if paused {
+            state.dagster.set_sensor_running(&sensor, false).await
+        } else {
+            state.dagster.set_sensor_running(&sensor, true).await
+        };
+        if let Ok(SensorOutcome {
+            error: Some(err), ..
+        }) = &sensor_switched
+        {
+            tracing::info!(%err, pipeline_id = id, "authored sensor not switched");
         }
         authored_pipelines::reload_orchestrator(state).await;
     }

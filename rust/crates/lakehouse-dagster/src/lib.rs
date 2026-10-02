@@ -489,6 +489,25 @@ pub struct ScheduleOutcome {
     pub error: Option<String>,
 }
 
+/// Outcome of a sensor start/stop mutation (F1.2 #57).
+///
+/// Same shape as [`ScheduleOutcome`]: a sensor may be `SensorNotFoundError`
+/// at start (the sensor does not exist; F1.2 makes the route's `paused`
+/// branch not contribute one) and `UnauthorizedError`/`PythonError` at
+/// start/stop. `stopSensor` does not surface `SensorNotFoundError`
+/// (its result union has none — see Dagster schema `sensors.py`); a
+/// `stop` against a missing sensor returns `Ok(SensorOutcome { ok: true,
+/// error: None })` after the lookup step fails with `SensorNotFoundError`,
+/// which is the tolerance the plan calls out (the chain is already
+/// silent in that case, so the route's "already stopped" branch runs).
+#[derive(Debug, Clone)]
+pub struct SensorOutcome {
+    /// Whether the sensor was successfully started/stopped.
+    pub ok: bool,
+    /// A human-readable failure reason, present when `ok` is `false`.
+    pub error: Option<String>,
+}
+
 /// One `Dagster` execution step's status within a run, as reported by
 /// `stepStats`, matching `GET /api/ai/build-status`'s `{key, status}`
 /// output shape.
@@ -1485,6 +1504,139 @@ impl DgClient {
             });
         }
         Ok(ScheduleOutcome {
+            ok: false,
+            error: Some(r.message.unwrap_or(r.typename)),
+        })
+    }
+
+    /// Start (resume) or stop (pause) a sensor, matching Dagster 1.13.20
+    /// `startSensor`/`stopSensor` mutations. Wired into
+    /// `routes::pipelines::authored_status` next to the schedule toggle
+    /// (F1.2 #57): when a chained pipeline is paused/resumed, the route
+    /// must also stop/start the `authored__<id>_after` sensor so the
+    /// chain truly goes quiet across a reload (Dagster keeps sensor
+    /// state across a code-location reload; the Python module-level
+    /// `default_status=RUNNING` does NOT reach the stored sensor state).
+    ///
+    /// The two mutations have different argument shapes against the
+    /// real schema (`startSensor` takes a `SensorSelector!`; `stopSensor`
+    /// takes a `String!` *sensor-state compound id*, NOT a selector).
+    /// `stop` therefore does a two-step lookup: query the sensor's
+    /// `sensorState { id }` by selector, then call `stopSensor(id: <id>)`.
+    /// If the lookup is `SensorNotFoundError`, the sensor never existed
+    /// (e.g. the pipeline has no `dependsOn`) and `running=false` is
+    /// treated as success -- the chain was already silent.
+    ///
+    /// `start` returns the standard `SensorOrError` shape:
+    /// `Sensor | SensorNotFoundError | UnauthorizedError | PythonError`.
+    /// `stop` returns `StopSensorMutationResultOrError` which has NO
+    /// `SensorNotFoundError` member (see `dagster_graphql/schema/sensors.py`
+    /// line 245); the lookup-step check is the only path that turns
+    /// "no such sensor" into `Ok(true)`.
+    ///
+    /// # Errors
+    ///
+    /// See [`DgClient::launch_run`].
+    pub async fn set_sensor_running(
+        &self,
+        sensor_name: &str,
+        running: bool,
+    ) -> Result<SensorOutcome, DgError> {
+        let sel = json!({
+            "repositoryName": self.repo,
+            "repositoryLocationName": self.location,
+            "sensorName": sensor_name,
+        });
+        if running {
+            let query = "mutation($sel: SensorSelector!) { startSensor(sensorSelector: $sel) { \
+                         __typename \
+                         ... on Sensor { sensorState { status } } \
+                         ... on SensorNotFoundError { message } \
+                         ... on PythonError { message } \
+                         ... on UnauthorizedError { message } \
+                         } }";
+            let data: std::collections::HashMap<String, ScheduleMutationResultBody> =
+                self.execute(query, Some(json!({ "sel": sel }))).await?;
+            let r = data.into_values().next().ok_or_else(|| {
+                DgError::Server("Dagster response missing startSensor result".to_owned())
+            })?;
+            if r.typename == "Sensor" {
+                return Ok(SensorOutcome {
+                    ok: true,
+                    error: None,
+                });
+            }
+            return Ok(SensorOutcome {
+                ok: false,
+                error: Some(r.message.unwrap_or(r.typename)),
+            });
+        }
+        // Stop path: two-step. First, fetch the sensor's stored
+        // instigation-state id; `stopSensor(id:)` requires it (the
+        // schema accepts the string id of an `InstigationState`, not a
+        // selector).
+        let lookup_query = "query($sel: SensorSelector!) { sensorOrError(sensorSelector: $sel) { \
+                            __typename \
+                            ... on Sensor { sensorState { id status } } \
+                            ... on SensorNotFoundError { message } \
+                            } }";
+        let lookup: Value = self
+            .execute(lookup_query, Some(json!({ "sel": sel })))
+            .await?;
+        let sensor_block = &lookup["sensorOrError"];
+        // `sensorOrError` returns `null` when the field is missing
+        // (e.g. a sensor selector that the schema rejects outright);
+        // treat that the same as `SensorNotFoundError`.
+        let typename = sensor_block
+            .get("__typename")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if typename != "Sensor" {
+            // F1.2 tolerance: a missing sensor at `running=false` is
+            // treated as already-stopped. The route (F1.2) calls
+            // `set_sensor_running(_, false)` when pausing a pipeline
+            // that has no `dependsOn` (no sensor was built for it), and
+            // the `paused` branch in Python's `build_authored_dependency_sensor`
+            // skips the sensor for paused pipelines whose `dependsOn`
+            // has not yet been reloaded. In both cases the chain is
+            // already silent; returning `Ok(true)` keeps the route's
+            // toggle idempotent. `sensor_or_error` may also return
+            // `null` outright when the field is missing entirely; we
+            // collapse that to the same `SensorNotFoundError` shape.
+            return Ok(SensorOutcome {
+                ok: true,
+                error: None,
+            });
+        }
+        let Some(state_id) = sensor_block
+            .get("sensorState")
+            .and_then(|s| s.get("id"))
+            .and_then(Value::as_str)
+        else {
+            return Ok(SensorOutcome {
+                ok: false,
+                error: Some("sensor missing sensorState.id".to_owned()),
+            });
+        };
+        let stop_query = "mutation($id: String!) { stopSensor(id: $id) { \
+                          __typename \
+                          ... on StopSensorMutationResult { instigationState { id status } } \
+                          ... on PythonError { message } \
+                          ... on UnauthorizedError { message } \
+                          } }";
+        let data: std::collections::HashMap<String, ScheduleMutationResultBody> = self
+            .execute(stop_query, Some(json!({ "id": state_id })))
+            .await?;
+        let r = data.into_values().next().ok_or_else(|| {
+            DgError::Server("Dagster response missing stopSensor result".to_owned())
+        })?;
+        if r.typename == "StopSensorMutationResult" {
+            return Ok(SensorOutcome {
+                ok: true,
+                error: None,
+            });
+        }
+        Ok(SensorOutcome {
             ok: false,
             error: Some(r.message.unwrap_or(r.typename)),
         })
@@ -3746,5 +3898,125 @@ mod tests {
         let outcome = client.stop_schedule("nope").await.unwrap();
         assert!(!outcome.ok);
         assert_eq!(outcome.error.as_deref(), Some("no such schedule"));
+    }
+
+    // ── F1.2 #57: `set_sensor_running` (sensor start/stop for the
+    //    `authored__<id>_after` sensor that ships with chained authored
+    //    pipelines). ────────────────────────────────────────────────
+
+    /// Start path: `startSensor` returns `Sensor` (with
+    /// `sensorState { status }`); the method maps that to
+    /// `Ok(SensorOutcome { ok: true, .. })`.
+    #[tokio::test]
+    async fn set_sensor_running_start_returns_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "startSensor": { "__typename": "Sensor",
+                    "sensorState": { "status": "RUNNING" } } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .set_sensor_running("authored__pl_down_1_after", true)
+            .await
+            .unwrap();
+        assert!(outcome.ok, "start should succeed: {outcome:?}");
+        assert!(outcome.error.is_none());
+    }
+
+    /// Stop path is a two-step lookup (the `stopSensor` mutation
+    /// needs the `InstigationState.id`, NOT a `SensorSelector`). This
+    /// test mocks both steps: the lookup returns a `Sensor` with a
+    /// `sensorState.id`, and `stopSensor` returns
+    /// `StopSensorMutationResult` with the new `instigationState`.
+    #[tokio::test]
+    async fn set_sensor_running_stop_returns_ok_after_two_step_lookup() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "sensorOrError": {
+                        "__typename": "Sensor",
+                        "sensorState": { "id": "remote_origin_id:selector_id", "status": "RUNNING" }
+                    },
+                    "stopSensor": {
+                        "__typename": "StopSensorMutationResult",
+                        "instigationState": { "id": "remote_origin_id:selector_id", "status": "STOPPED" }
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .set_sensor_running("authored__pl_down_1_after", false)
+            .await
+            .unwrap();
+        assert!(outcome.ok, "stop should succeed: {outcome:?}");
+        assert!(outcome.error.is_none());
+    }
+
+    /// F1.2 tolerance: when the sensor does not exist at all (e.g. a
+    /// pipeline whose `dependsOn` is empty, so no sensor was built),
+    /// the lookup step returns `SensorNotFoundError` and the route's
+    /// `paused` branch treats `running=false` as already-stopped.
+    /// `set_sensor_running(_, false)` MUST return `Ok(true)` so the
+    /// toggle stays idempotent across reloads.
+    #[tokio::test]
+    async fn set_sensor_running_stop_is_already_silent_when_sensor_is_missing() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "sensorOrError": { "__typename": "SensorNotFoundError",
+                    "message": "no such sensor" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .set_sensor_running("authored__pl_down_1_after", false)
+            .await
+            .unwrap();
+        assert!(
+            outcome.ok,
+            "stop on missing sensor -> already silent: {outcome:?}"
+        );
+        assert!(
+            outcome.error.is_none(),
+            "missing sensor must NOT surface an error: {outcome:?}"
+        );
+    }
+
+    /// Start path: `startSensor` returning `SensorNotFoundError`
+    /// (e.g. the sensor name is wrong) maps to `Ok(false)` with the
+    /// message in `error`. The route's `resume` branch uses the
+    /// `error` field to surface a 4xx to the caller.
+    #[tokio::test]
+    async fn set_sensor_running_start_reports_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "startSensor": { "__typename": "SensorNotFoundError",
+                    "message": "no such sensor" } }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = DgClient::new(format!("{}/graphql", server.uri()));
+        let outcome = client
+            .set_sensor_running("authored__pl_down_1_after", true)
+            .await
+            .unwrap();
+        assert!(!outcome.ok);
+        assert_eq!(outcome.error.as_deref(), Some("no such sensor"));
     }
 }
