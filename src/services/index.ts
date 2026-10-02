@@ -17,6 +17,7 @@ import { clickhouseAlertRuleService } from "./clients/alerts"
 import { icebergLakehouseService } from "./clients/lakehouse"
 import { goldService as goldClientService } from "./clients/gold"
 import { notificationsService as notificationsClientService } from "./clients/notifications"
+import { uploadService as uploadClientService } from "./clients/uploads"
 import * as authClient from "./clients/auth"
 
 // Overview is now fully real — summary/activity from ClickHouse+Dagster,
@@ -76,6 +77,12 @@ export const goldService = goldClientService
 // Postgres, honest `supported: false` when no pool is configured. No mock
 // ever existed for this domain.
 export const notificationsService = notificationsClientService
+// Uploaded files (DATA-9, ADR 0014) — a delimited text file is stored in the
+// warehouse bucket, previewed, and loaded into a raw table by
+// `file_ingest_job`; rows live in Postgres, and the outcome of a load is read
+// back from `bronze_meta.ingest_run` by the API. Real from the start: no mock
+// ever existed for this domain.
+export const uploadService = uploadClientService
 // SSO admin page reads the live OIDC configuration
 // off the API process. Sessions page lists and revokes
 // live browser sessions via `GET /api/auth/sessions` and
