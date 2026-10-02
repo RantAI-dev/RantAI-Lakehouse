@@ -854,3 +854,111 @@ Not verified by the reviewer: the clean-project `docker compose up` for the
 one-line compose default change (the developer's handoff describes it), and
 the scheduler exporting a switched-on mart on a running stack (the feature's
 acceptance checklist covers it after slice D).
+
+### PR slices C and D (reviewer, 2026-10-02)
+
+Reviewed slice C as local branch `feat/gold-publish-per-mart-c` (`61974c8`;
+it was never pushed) and slice D as `origin/feat/gold-publish-per-mart-d`
+(`fcbc999`, `875de52`, `fafdd5d`, `7fa31c5`).
+
+**Neither is ready. Slice C: two `BLOCKER`, one `SHOULD-FIX`. Slice D: three
+`BLOCKER`, five `SHOULD-FIX`. No PR is opened. Merge order when fixed: C,
+then D** (D's changelog describes C's sensor).
+
+#### Slice C
+
+**C-B1 — `BLOCKER` — a `409` is still a failure.** T6 says a `409` from the
+single-flight lock (an export of that mart already running) is a skip, not
+a failure. `export_gold_mart` is unchanged: any `HTTPError` records a
+failed `maintenance_run` and re-raises into the retry policy. The new
+sensor makes overlap likely — two authored pipelines finishing close
+together, or a pipeline finishing during the nightly run, each launch an
+all-marts run. Fix: in `export_gold_mart`, a `409` records
+`skipped_verbs=["already_running"]`, emits no `AssetMaterialization`,
+returns without raising. Unit test for it.
+
+**C-B2 — `BLOCKER` — no handoff, not pushed.** There is no "PR slice C"
+entry in section 7 and the branch is not on `origin`. Rule 7: without the
+commands and counts, the slice is *not verified* by its author. Append the
+entry (commit, each command with exact counts, how overlap with the
+pipelines stream's branches was checked) and push.
+
+**C-S1 — `SHOULD-FIX` — a comment that is not true.** The block above the
+sensor says "One daily run keeps the accounting honest and prevents the
+accumulation of duplicate exports on every authored pipeline success". The
+sensor launches one run per authored success; what prevents duplicate
+copies is `ifChanged=true`, and what prevents a double launch for one
+upstream run is the `run_key`. Rewrite it to say that (rule 1).
+
+Correct as built: the sensor selects on the `authored__` prefix that
+`authored_factory.py` gives its jobs, so `gold_export_job`, maintenance,
+backup, alerts, capacity, agent and ingest jobs do not trigger it; it is
+registered in `definitions.py` with a two-line change; `default_status` is
+`RUNNING` with the reason; the body is a plain function the tests drive.
+
+Reviewer's run on `61974c8`: `python -m pytest dispar_orchestrate -q` —
+**378 passed, 30 subtests passed**; both lints pass.
+
+#### Slice D
+
+**D-B1 — `BLOCKER` — the handoff states something that did not happen.**
+It says the branch was cut with "slice C merged as PR #65". There is no
+PR #65; slice C is unmerged and unpushed. It also ends "no claim above is
+*not verified*" although nothing says the card was seen in a running
+console, which the brief asked to be stated. Principle 2. Correct the
+handoff: remove the PR #65 claim, and say plainly whether the card was
+exercised in a running console.
+
+**D-B2 — `BLOCKER` — a failed publish shows no reason.** The feature page
+requires "See a failed publish with its reason" (item 5; checklist step
+10). The runs table shows only the word `failed`. `GoldExportRun.error`
+carries the reason; show it for failed rows. Test it.
+
+**D-B3 — `BLOCKER` — switching off hides the truth.** With the switch off
+the card shows "Off" and nothing else. Checklist step 18 expects "Never
+published" for a mart never published with the switch off. And a mart that
+was published and then switched off still has a readable Iceberg table;
+hiding its last-published time and snapshot makes a stale copy invisible.
+Fix: always show the freshness line and, when a publish exists, the last
+published time and snapshot. When off, add "Publishing is off; this copy is
+no longer updated." Keep "Publish now" and the link as they are. Tests for
+off + never published, and off + previously published.
+
+**D-S1 — `SHOULD-FIX` — use the existing switch.** `@/components/ui/switch`
+exists and three features use it. The card hand-rolls
+`<input type="checkbox" role="switch">` with `data-checked:` classes that a
+native checkbox never matches. Rule 4.
+
+**D-S2 — `SHOULD-FIX` — the real toggle error is never shown.**
+`handleToggle` reads `toggle.error` after `await toggle.run(...)`. `toggle`
+is the value from the render before the call, so its `error` is stale and
+the message falls back to "Failed to toggle publishing." Render from
+`toggle.status === "error"` as the "Publish now" button already does, and
+have the test assert the server's message appears.
+
+**D-S3 — `SHOULD-FIX` — "Publish now" is offered to users who cannot
+publish.** Hide or disable it when `canEdit` is false.
+
+**D-S4 — `SHOULD-FIX` — the changelog entry.** T9 asked for an entry a
+customer can read. It is one paragraph of route names and identity
+plumbing, ending in a stray backtick. Lead with two or three plain
+sentences on what a user can now do; keep the technical detail after.
+
+**D-S5 — `SHOULD-FIX` — compare times as times.** `freshnessLine` and
+`publicationLabel` compare RFC 3339 strings with `<`. It works only while
+both strings come from one formatter in UTC. Parse and compare
+(`Date.parse`), and share one function between the card and the overview
+page instead of two copies.
+
+Correct as built: the contract mirrors `publication_body`; the client goes
+through `apiFetch`; the card is one new file, with one import and one
+conditional render on the asset page; the status comparison is strict
+(`<`), per B1; `Exports` is gone from `nav-config.ts`; the overview page
+has the Enabled column and a link from the card; `docs/OPERATIONS.md`
+states the append-only growth, the empty default and the merge caveat;
+nothing under `docs/core/` was edited.
+
+Reviewer's run on `7fa31c5`: `bun run typecheck` — 0 errors; `bun run
+lint` — 0 errors, 6 warnings; `bun run test` — **298 pass, 0 fail**.
+
+Not verified by the reviewer: the card in a running console.
