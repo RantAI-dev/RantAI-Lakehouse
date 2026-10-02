@@ -13,7 +13,11 @@ rust-version = "1.88"
 license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
-axum = { version = "0.8", features = ["macros"] }
+# `multipart`: `POST /api/uploads` reads one multipart part (`routes::uploads`,
+# ADR 0014, decision 2). It adds axum's `Multipart` extractor, which is built on
+# the `multer` crate: the one package `Cargo.lock` gained (3.1.0, MIT, allowed by
+# `deny.toml`); every dependency of `multer` was already locked.
+axum = { version = "0.8", features = ["macros", "multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["trace", "timeout"] }

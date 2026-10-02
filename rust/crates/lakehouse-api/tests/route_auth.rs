@@ -551,6 +551,52 @@ async fn seeded_data_engineer_may_get_and_put_ingest_spec() {
     assert_ne!(put_resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// The six upload routes (ADR 0014, decision 6) are gated by the existing
+/// `connector:manage`, with no new permission: a seeded Data Engineer
+/// (`bayu@meridian.example`) is never refused at the gate, a seeded Analyst
+/// (`sari@meridian.example`, no `connector:manage`) always is. The two
+/// table-driven loops above prove the zero-permission and Platform-Admin
+/// directions for these entries by construction; this pins the real roles,
+/// and `POST /api/uploads` by name.
+///
+/// What a Data Engineer's request then does is not asserted here: with no
+/// storage credentials in `spin_up`, `POST /api/uploads` answers 503, and the
+/// per-id routes answer 404 for an upload that does not exist.
+/// `tests/upload_routes.rs` covers those.
+#[tokio::test]
+async fn a_data_engineer_is_not_refused_and_an_analyst_is_on_every_upload_route() {
+    let TestApp { router, pool } = spin_up().await;
+
+    for (method, path) in [
+        ("POST", "/api/uploads"),
+        ("GET", "/api/uploads"),
+        ("GET", "/api/uploads/x"),
+        ("DELETE", "/api/uploads/x"),
+        ("GET", "/api/uploads/x/preview"),
+        ("POST", "/api/uploads/x/ingest"),
+    ] {
+        let engineer = session_cookie_for_seeded_user(&pool, "bayu@meridian.example").await;
+        let resp = request_with_cookie(&router, method, path, &engineer).await;
+        assert!(
+            !matches!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+            ),
+            "{method} {path}: a seeded Data Engineer holds connector:manage and must pass the \
+             gate, got {}",
+            resp.status()
+        );
+
+        let analyst = session_cookie_for_seeded_user(&pool, "sari@meridian.example").await;
+        let resp = request_with_cookie(&router, method, path, &analyst).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path}: a seeded Analyst lacks connector:manage and must be refused"
+        );
+    }
+}
+
 /// # SSRF: `PUT .../ingest-spec` refuses an obviously-internal dial host at
 /// save time
 ///

@@ -2023,6 +2023,28 @@ fn silver_downstream(table: &str, has_silver: bool) -> Vec<Value> {
 /// the other end of [`silver_downstream`]. Empty when the registry has no
 /// such row, or could not be read: that costs the link, never the page.
 async fn bronze_upstream(ch: &ChClient, table: &str) -> Vec<Value> {
+    registered_slug(ch, table)
+        .await
+        .ok()
+        .flatten()
+        .map(|slug| vec![json!({ "id": slug, "name": format!("bronze.{table}") })])
+        .unwrap_or_default()
+}
+
+/// The slug of the registry row whose `table_name` is `table`, from either
+/// registry (`bronze_meta`, `bronze_meta_sec`): `None` when no dataset is
+/// registered under that name.
+///
+/// One query for two readers with different needs. [`bronze_upstream`] makes
+/// a missing answer cost a link, so it drops the error. `routes::uploads`
+/// asks it to decide whether a name is taken, where an error must not read
+/// as "free", so it gets the error.
+///
+/// # Errors
+///
+/// Returns [`ChError`] when `ClickHouse` cannot answer, including when a
+/// registry table does not exist yet.
+pub(crate) async fn registered_slug(ch: &ChClient, table: &str) -> Result<Option<String>, ChError> {
     let name = SqlLiteral::from(table);
     let sql = format!(
         "SELECT slug FROM lake.`bronze_meta.dataset_catalog` WHERE table_name = {name}
@@ -2030,13 +2052,12 @@ async fn bronze_upstream(ch: &ChClient, table: &str) -> Vec<Value> {
          SELECT slug FROM lake.`bronze_meta_sec.dataset_catalog` WHERE table_name = {name}
          LIMIT 1"
     );
-    ch.rows(&sql, None)
-        .await
-        .ok()
-        .and_then(|rows| rows.first().map(|r| str_col(r, "slug").to_owned()))
-        .filter(|slug| !slug.is_empty())
-        .map(|slug| vec![json!({ "id": slug, "name": format!("bronze.{table}") })])
-        .unwrap_or_default()
+    Ok(ch
+        .rows(&sql, None)
+        .await?
+        .first()
+        .map(|r| str_col(r, "slug").to_owned())
+        .filter(|slug| !slug.is_empty()))
 }
 
 /// `sizeBytes`/`freshnessLagSeconds` on a Bronze detail body from its

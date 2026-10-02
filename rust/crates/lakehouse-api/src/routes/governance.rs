@@ -675,10 +675,14 @@ const INGEST_RUN_ROWS: u32 = 500;
 /// Build `connector_id`'s most recent `bronze_meta.ingest_run` rows, newest
 /// first.
 ///
+/// `pub(crate)`: `routes::uploads` reads a file load's recorded outcome from
+/// the same table, under the id `upload:<upload id>`, instead of carrying
+/// its own copy of this query.
+///
 /// # Errors
 ///
 /// Returns [`ChError`] on a `ClickHouse` transport or server failure.
-async fn ingest_runs_for_connector(
+pub(crate) async fn ingest_runs_for_connector(
     ch: &ChClient,
     connector_id: &str,
 ) -> Result<Vec<IngestRunRow>, ChError> {
@@ -722,10 +726,12 @@ async fn ingest_runs_for_connector(
 /// `routes::lakehouse::maintenance_verb_runs_or_empty` applies to its own
 /// lazily created table. Every other failure still surfaces.
 ///
+/// `pub(crate)` for the same reason as [`ingest_runs_for_connector`].
+///
 /// # Errors
 ///
 /// Returns [`ChError`] for any failure other than an unknown table.
-async fn ingest_runs_or_empty(
+pub(crate) async fn ingest_runs_or_empty(
     ch: &ChClient,
     connector_id: &str,
 ) -> Result<Vec<IngestRunRow>, ChError> {

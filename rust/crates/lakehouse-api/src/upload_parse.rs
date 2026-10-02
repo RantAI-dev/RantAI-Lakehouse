@@ -53,11 +53,6 @@
 //! [`preview`] reports what was detected AND what is in force, and the load
 //! uses what the user confirmed.
 
-#![allow(
-    dead_code,
-    reason = "consumed by routes::uploads, wired in T6 of docs/superpowers/plans/2026-10-02-upload-file.md"
-)]
-
 use std::iter::Peekable;
 use std::str::Chars;
 

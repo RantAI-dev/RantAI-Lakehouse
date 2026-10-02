@@ -35,11 +35,12 @@ mod quality;
 mod query;
 mod storage;
 pub(crate) mod support;
+mod uploads;
 
 use std::time::Duration;
 
 use axum::Router;
-use axum::extract::Request;
+use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::StatusCode;
 use axum::middleware::{Next, from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
@@ -98,6 +99,15 @@ fn auth_router() -> Router<AppState> {
 /// [`route_timeout`]).
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// `/api/uploads`'s timeout. `POST /api/uploads` receives up to 50 MB
+/// ([`uploads::MAX_UPLOAD_BYTES`]) before it can answer, and a request that is
+/// still sending when the deadline passes is cut off mid-file. Five minutes
+/// lets a slow link finish: it is a bound for a slow link, not a measurement
+/// (50 MiB is about 84 seconds at 5 Mbit/s, which is arithmetic, and nothing
+/// here measured any link). `GET /api/uploads` shares the path and so the
+/// bound; the per-upload routes (`/api/uploads/{id}*`) keep the default.
+const UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Per-route request timeout, mirroring each TypeScript handler's `export
 /// const maxDuration` (grep of every `src/app/api/**/route.ts`):
 ///
@@ -111,6 +121,9 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// | `/api/query/run`                | 60               |
 /// | everything else (no export)     | [`DEFAULT_REQUEST_TIMEOUT`] (60) |
 ///
+/// `/api/uploads` has no TypeScript handler to mirror and takes
+/// [`UPLOAD_REQUEST_TIMEOUT`] (300), for the reason given there.
+///
 /// The timeout is NOT uniform in the TypeScript — `ai/chat`'s 120s and
 /// `agent/query`'s 90s cover legitimate multi-round LLM tool loops that a
 /// blanket 60s bound would 408 mid-flight. Matched on `req.uri().path()`
@@ -121,6 +134,7 @@ fn route_timeout(path: &str) -> Duration {
     match path {
         "/api/ai/chat" => *AI_CHAT_TIMEOUT,
         "/api/agent/query" => Duration::from_secs(90),
+        "/api/uploads" => UPLOAD_REQUEST_TIMEOUT,
         _ => DEFAULT_REQUEST_TIMEOUT,
     }
 }
@@ -524,6 +538,42 @@ fn connectors_router(state: &AppState) -> Router<AppState> {
         .merge(per_connector)
 }
 
+/// The `/api/uploads/*` sub-router (ADR 0014, plan T6), shaped like
+/// [`connectors_router`].
+///
+/// Every `/api/uploads/{id}/*` route sits behind
+/// [`uploads::require_upload_in_tenants`]: the caller must belong to the
+/// upload's tenant, and another tenant's upload answers the 404 an unknown id
+/// gets. `POST /api/uploads` alone takes a larger body than axum's 2 MB
+/// default, up to the cap plus the multipart framing
+/// ([`uploads::MAX_REQUEST_BODY_BYTES`]); `.layer` on that one method router
+/// is what keeps the raised limit off every other route, `GET /api/uploads`
+/// included (it is added after the layer).
+fn uploads_router(state: &AppState) -> Router<AppState> {
+    let per_upload = Router::new()
+        .route(
+            "/api/uploads/{id}",
+            get(uploads::get).delete(uploads::delete),
+        )
+        .route("/api/uploads/{id}/preview", get(uploads::preview))
+        .route(
+            "/api/uploads/{id}/ingest",
+            axum::routing::post(uploads::ingest),
+        )
+        .route_layer(from_fn_with_state(
+            state.clone(),
+            uploads::require_upload_in_tenants,
+        ));
+    Router::new()
+        .route(
+            "/api/uploads",
+            axum::routing::post(uploads::create)
+                .layer(DefaultBodyLimit::max(uploads::MAX_REQUEST_BODY_BYTES))
+                .get(uploads::list),
+        )
+        .merge(per_upload)
+}
+
 /// The `/api/identity/*` sub-router (Phase 2 identity domain), split out
 /// for the same `clippy::too_many_lines` reason as [`pipelines_router`].
 ///
@@ -764,6 +814,9 @@ pub fn router(state: AppState) -> Router {
         .merge(identity_router())
         // Phase 2, Task 2.7: connector definitions.
         .merge(connectors_router(&state))
+        // ADR 0014: files uploaded from the console and loaded into raw
+        // tables. Tenant-scoped like connectors.
+        .merge(uploads_router(&state))
         // Phase 2, Task 2.8: knowledge sources and vector jobs (metadata
         // only — no `search` route here, see `routes::knowledge`'s module
         // doc comment).
@@ -861,6 +914,29 @@ mod tests {
             "no TS maxDuration export — falls back to the default"
         );
         assert_eq!(DEFAULT_REQUEST_TIMEOUT, Duration::from_secs(60));
+    }
+
+    /// `POST /api/uploads` receives up to 50 MB: it gets the longer bound
+    /// (300 s), and only on its own path. `GET /api/uploads` shares that path
+    /// by necessity; the per-upload routes, whose handlers only read a row or
+    /// start a job, keep the default.
+    #[test]
+    fn the_upload_route_takes_five_minutes_and_the_per_upload_routes_the_default() {
+        assert_eq!(route_timeout("/api/uploads"), Duration::from_secs(300));
+        assert_eq!(UPLOAD_REQUEST_TIMEOUT, Duration::from_secs(300));
+        for per_upload in [
+            "/api/uploads/up-1",
+            "/api/uploads/up-1/preview",
+            "/api/uploads/up-1/ingest",
+            "/api/uploads/",
+            "/api/uploads/x/y",
+        ] {
+            assert_eq!(
+                route_timeout(per_upload),
+                DEFAULT_REQUEST_TIMEOUT,
+                "{per_upload}"
+            );
+        }
     }
 }
 

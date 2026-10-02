@@ -49,11 +49,6 @@
 //! `user_error`, does the mapping, so no call site can return a raw error by
 //! accident.
 
-#![allow(
-    dead_code,
-    reason = "consumed by routes::uploads, wired in T6 of docs/superpowers/plans/2026-10-02-upload-file.md"
-)]
-
 use std::ops::Range;
 
 use axum::body::Bytes;

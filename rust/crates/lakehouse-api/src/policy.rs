@@ -538,6 +538,20 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // only by Platform Admin's `*:*` (`0002_seed_identity.sql`).
     ("PUT", "/api/connectors/{id}/tenant", Policy::RequiresPermission("identity:write")),
 
+    // ── Uploaded files (ADR 0014, decision 6): the existing
+    //    `connector:manage`, no new permission and no role grant — bringing a
+    //    file in is the same authority as defining a source. Every
+    //    `/api/uploads/{id}*` route additionally answers 404 for an upload
+    //    outside the caller's tenants (`routes::uploads::
+    //    require_upload_in_tenants`, mounted in `routes::uploads_router`), so
+    //    this permission alone never reaches another tenant's files. ───────
+    ("GET",  "/api/uploads",                 Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/uploads",                 Policy::RequiresPermission("connector:manage")),
+    ("GET",  "/api/uploads/{id}",            Policy::RequiresPermission("connector:manage")),
+    ("DELETE", "/api/uploads/{id}",          Policy::RequiresPermission("connector:manage")),
+    ("GET",  "/api/uploads/{id}/preview",    Policy::RequiresPermission("connector:manage")),
+    ("POST", "/api/uploads/{id}/ingest",     Policy::RequiresPermission("connector:manage")),
+
     // ── Knowledge: no seeded resource — auth only. ───────────────────────
     ("GET",  "/api/knowledge/sources",       Policy::RequiresAuth),
     ("POST", "/api/knowledge/sources",       Policy::RequiresAuth),

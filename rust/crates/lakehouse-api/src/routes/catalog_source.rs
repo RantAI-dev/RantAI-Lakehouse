@@ -74,18 +74,28 @@ async fn clickhouse_columns(
 }
 
 /// `(name, type)` of an Iceberg table via `DESCRIBE` — `system.columns`
-/// does not list `DataLakeCatalog` tables. Any failure, including "no such
-/// table" and an unreachable catalog, reads as "not available".
-async fn iceberg_columns(ch: &ChClient, db: &Ident, table: &Ident) -> Vec<(String, String)> {
+/// does not list `DataLakeCatalog` tables. The error is kept: a caller that
+/// has to tell "no such table" from "could not ask" needs it
+/// ([`iceberg_table_presence`]).
+async fn iceberg_describe(
+    ch: &ChClient,
+    db: &Ident,
+    table: &Ident,
+) -> Result<Vec<(String, String)>, ChError> {
     let sql = format!("DESCRIBE TABLE {db}.`{BRONZE_NAMESPACE}.{table}`");
-    ch.rows(&sql, None).await.map_or_else(
-        |_| Vec::new(),
-        |rows| {
-            rows.iter()
-                .map(|r| (str_col(r, "name").to_owned(), str_col(r, "type").to_owned()))
-                .collect()
-        },
-    )
+    Ok(ch
+        .rows(&sql, None)
+        .await?
+        .iter()
+        .map(|r| (str_col(r, "name").to_owned(), str_col(r, "type").to_owned()))
+        .collect())
+}
+
+/// [`iceberg_describe`] for a reader that only needs the columns. Any
+/// failure, including "no such table" and an unreachable catalog, reads as
+/// "not available".
+async fn iceberg_columns(ch: &ChClient, db: &Ident, table: &Ident) -> Vec<(String, String)> {
+    iceberg_describe(ch, db, table).await.unwrap_or_default()
 }
 
 /// A `ClickHouse` table `db.table`, when it exists.
@@ -134,6 +144,52 @@ pub(crate) async fn iceberg_source(state: &AppState, table: &str) -> Option<Read
         kind: SourceKind::Iceberg,
         columns,
     })
+}
+
+/// Why [`iceberg_table_presence`] could not say whether a table exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PresenceUnknown {
+    /// This deployment has no Iceberg query database (`ICEBERG_QUERY_DB`),
+    /// so there is nothing to ask.
+    NoQueryDatabase,
+    /// `ClickHouse` or the catalog behind it did not answer, or answered
+    /// with something other than "no such table". The detail is logged.
+    Unanswered,
+}
+
+/// Whether the Bronze Iceberg table `bronze.<table>` exists, as a question
+/// that can fail.
+///
+/// [`iceberg_source`] cannot serve a caller that must not assume a name is
+/// free: it answers `None` for "no such table" and for "the catalog is
+/// unreachable" alike. Here the first is `Ok(false)` (`ClickHouse`'s own
+/// `UNKNOWN_TABLE`, the same test `routes::lakehouse` applies to a missing
+/// results table) and everything else, including an unrecognised error, is
+/// [`PresenceUnknown`], so a doubt is never read as absence.
+///
+/// # Errors
+///
+/// [`PresenceUnknown::NoQueryDatabase`] when no Iceberg query database is
+/// configured; [`PresenceUnknown::Unanswered`] when the question got no
+/// definite answer.
+pub(crate) async fn iceberg_table_presence(
+    state: &AppState,
+    table: &str,
+) -> Result<bool, PresenceUnknown> {
+    let Some(db) = state.config.iceberg_query_db.as_ref() else {
+        return Err(PresenceUnknown::NoQueryDatabase);
+    };
+    let Ok(table) = Ident::new(table) else {
+        return Err(PresenceUnknown::Unanswered);
+    };
+    match iceberg_describe(&state.clickhouse, db, &table).await {
+        Ok(columns) => Ok(!columns.is_empty()),
+        Err(ChError::Server(body)) if super::lakehouse::is_unknown_table_error(&body) => Ok(false),
+        Err(err) => {
+            tracing::warn!(%err, "could not tell whether a Bronze Iceberg table exists");
+            Err(PresenceUnknown::Unanswered)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -287,6 +343,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(source, None);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    // ── iceberg_table_presence: a question that can fail ────────────────
+
+    async fn presence(
+        server: &MockServer,
+        iceberg_db: Option<&str>,
+    ) -> Result<bool, PresenceUnknown> {
+        iceberg_table_presence(&state(&server.uri(), iceberg_db), "orders").await
+    }
+
+    /// The table is there: `DESCRIBE` returns its columns.
+    #[tokio::test]
+    async fn presence_is_true_when_describe_returns_columns() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains(
+                "DESCRIBE TABLE icecat_api.`bronze.orders`",
+            ))
+            .respond_with(rows(&json!([{"name": "id", "type": "Int64"}])))
+            .mount(&server)
+            .await;
+
+        assert_eq!(presence(&server, Some("icecat_api")).await, Ok(true));
+    }
+
+    /// `ClickHouse`'s own "no such table" is absence, and the only error that
+    /// is. This is the body `ClickHouse` sends for a missing table.
+    #[tokio::test]
+    async fn presence_is_false_only_for_clickhouses_unknown_table_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("DESCRIBE TABLE"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(
+                "Code: 60. DB::Exception: Table icecat_api.`bronze.orders` does not exist. \
+                 (UNKNOWN_TABLE) (version 26.8.1.1 (official build))",
+            ))
+            .mount(&server)
+            .await;
+
+        assert_eq!(presence(&server, Some("icecat_api")).await, Ok(false));
+    }
+
+    /// Never "free" on a doubt: an error that is not "no such table" (the
+    /// catalog is down, a setting is wrong, `ClickHouse` answers 500) and a
+    /// `ClickHouse` that cannot be reached at all are both unknown, where
+    /// `iceberg_source` would have said `None`.
+    #[tokio::test]
+    async fn presence_is_unknown_for_any_other_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("DESCRIBE TABLE"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(
+                "Code: 1000. DB::Exception: Poco::Exception. Connection refused (POCO_EXCEPTION)",
+            ))
+            .mount(&server)
+            .await;
+        assert_eq!(
+            presence(&server, Some("icecat_api")).await,
+            Err(PresenceUnknown::Unanswered)
+        );
+        // `iceberg_source` reads the same failure as an absent table.
+        assert_eq!(
+            iceberg_source(&state(&server.uri(), Some("icecat_api")), "orders").await,
+            None
+        );
+
+        let nothing_listening = state("http://127.0.0.1:1", Some("icecat_api"));
+        assert_eq!(
+            iceberg_table_presence(&nothing_listening, "orders").await,
+            Err(PresenceUnknown::Unanswered)
+        );
+    }
+
+    /// No query database: nothing can be asked, and nothing is sent.
+    #[tokio::test]
+    async fn presence_is_unknown_without_a_query_database_and_sends_nothing() {
+        let server = MockServer::start().await;
+        assert_eq!(
+            presence(&server, None).await,
+            Err(PresenceUnknown::NoQueryDatabase)
+        );
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 }
