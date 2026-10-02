@@ -227,14 +227,6 @@ services:
       # schedule factory's connector fetch fails visibly (401) rather than
       # silently.
       INGEST_SERVICE_TOKEN: ${INGEST_SERVICE_TOKEN:-}
-      # Same shape again — `main::bootstrap_pipeline_run_service` seeds an
-      # "authored-pipeline-scheduler" service identity scoped to
-      # `pipeline:execute` ONLY from this value, which is what lets
-      # Dagster's `authored_pipeline_job` read the definition it runs from
-      # `GET /api/pipelines/runnable` — must match `dagster-code-location`'s
-      # own `PIPELINE_RUN_TOKEN`. Left unset, bootstrap seeds nothing and
-      # every console-authored pipeline run fails at its first step.
-      PIPELINE_RUN_TOKEN: ${PIPELINE_RUN_TOKEN:-}
       # WS2 §4 — base URL for `routes::query::run`'s `engine: "trino"` path
       # (`lakehouse-trino`'s `/v1/statement` client). An internal service
       # address, not a credential, so a default is fine here — the `trino`
@@ -1792,16 +1784,6 @@ services:
       # With this unset, the API seeds no identity and the ingest schedule
       # factory's connector fetch fails visibly (401), never silently.
       INGEST_SERVICE_TOKEN: ${INGEST_SERVICE_TOKEN:-}
-      # `authored_factory.py`'s `authored_pipeline_job`: the shared token it
-      # sends as `Authorization: Bearer` to `GET /api/pipelines/runnable`
-      # (to authenticate as the `authored-pipeline-scheduler` service
-      # identity `lakehouse-api`'s `main::bootstrap_pipeline_run_service`
-      # seeds from this same value, scoped to `pipeline:execute` ONLY) —
-      # must match `lakehouse-api`'s own `PIPELINE_RUN_TOKEN`, same
-      # single-`.env`-value reasoning `AGENT_RUN_TOKEN` documents above.
-      # With this unset, every console-authored pipeline run fails at its
-      # first step with a message naming this variable.
-      PIPELINE_RUN_TOKEN: ${PIPELINE_RUN_TOKEN:-}
       # WS2 §4 — `maintenance.py`'s own `/v1/statement` client
       # (`_trino_execute`, a deliberate duplicate of `lakehouse-trino`'s
       # polling loop: this job runs outside the Rust binary) for the

@@ -148,9 +148,6 @@ fn pipelines_router() -> Router<AppState> {
             "/api/pipelines/generate",
             axum::routing::post(pipelines::generate),
         )
-        // Matched ahead of `/api/pipelines/{id}` for the literal path, the
-        // same way `/api/connectors/ingestible` is.
-        .route("/api/pipelines/runnable", get(pipelines::list_runnable))
         .route("/api/pipelines/{id}", get(pipelines::detail))
         .route("/api/pipelines/{id}/source", get(pipelines::source))
         .route("/api/pipelines/{id}/runs", get(pipelines::runs))

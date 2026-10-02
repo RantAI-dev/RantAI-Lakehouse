@@ -64,18 +64,6 @@ function pipelineOrigin(pipeline: Pipeline): "orchestrator" | "authored" {
   return pipeline.id.startsWith("pl-") ? "authored" : "orchestrator"
 }
 
-/**
- * Why a row cannot be triggered, or `null` when it can. The API refuses
- * to run an authored pipeline that is not active; saying so here beats a
- * menu item that only fails.
- */
-function triggerBlockedReason(pipeline: Pipeline): string | null {
-  if (pipelineOrigin(pipeline) === "orchestrator") return null
-  if (pipeline.status === "draft") return "activate it first"
-  if (pipeline.status === "paused") return "paused"
-  return pipeline.status === "ready" ? null : "not active"
-}
-
 export function getPipelineColumns({
   onView,
   onTrigger,
@@ -150,8 +138,8 @@ export function getPipelineColumns({
       header: ({ column }) => (
         <DataTableColumnHeader column={column} label="Origin" />
       ),
-      // Where a row came from: a job defined in the orchestrator's code, or
-      // a pipeline authored here, which runs once it is active.
+      // What a row can actually do follows from where it came from: only
+      // an orchestrator job can be triggered, cancelled or retried.
       cell: ({ row }) => (
         <Tooltip>
           <TooltipTrigger
@@ -164,7 +152,7 @@ export function getPipelineColumns({
           <TooltipContent>
             {pipelineOrigin(row.original) === "orchestrator"
               ? "A job in the orchestrator: it runs, and its history is here."
-              : "Authored in the console. It runs on demand once it is active."}
+              : "Authored in the console. No engine is attached yet, so it cannot run."}
           </TooltipContent>
         </Tooltip>
       ),
@@ -371,7 +359,7 @@ export function getPipelineColumns({
                     <span>View details</span>
                   </Link>
                 </DropdownMenuItem>
-                {onTrigger && triggerBlockedReason(pipeline) === null ? (
+                {onTrigger && pipelineOrigin(pipeline) === "orchestrator" ? (
                   <DropdownMenuItem
                     onClick={() => {
                       onTrigger(pipeline)
@@ -381,12 +369,12 @@ export function getPipelineColumns({
                     <span>Trigger run</span>
                   </DropdownMenuItem>
                 ) : null}
-                {onTrigger && triggerBlockedReason(pipeline) !== null ? (
+                {onTrigger && pipelineOrigin(pipeline) === "authored" ? (
                   // Shown but disabled, with the reason: hiding it makes
                   // the menu look inconsistent between rows.
                   <DropdownMenuItem disabled>
                     <Play className="size-4" />
-                    <span>Trigger run — {triggerBlockedReason(pipeline)}</span>
+                    <span>Trigger run — no engine attached</span>
                   </DropdownMenuItem>
                 ) : null}
                 <DropdownMenuSeparator />

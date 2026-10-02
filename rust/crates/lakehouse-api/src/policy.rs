@@ -321,12 +321,6 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     ("GET",  "/api/pipelines",                        Policy::RequiresPermission("pipeline:read")),
     ("POST", "/api/pipelines",                        Policy::RequiresPermission("pipeline:write")),
     ("POST", "/api/pipelines/generate",               Policy::RequiresPermission("pipeline:write")),
-    // Every tenant's `ready` definitions, for the orchestrator to execute
-    // (`routes::pipelines::list_runnable`). Not `pipeline:read`: that is a
-    // console user's grant, and this list is not tenant-scoped. Only the
-    // pipeline-run service identity holds `pipeline:execute`
-    // (`main::bootstrap_pipeline_run_service`), plus `*:*`.
-    ("GET",  "/api/pipelines/runnable",               Policy::RequiresPermission("pipeline:execute")),
     ("GET",  "/api/pipelines/{id}",                    Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/source",             Policy::RequiresPermission("pipeline:read")),
     ("GET",  "/api/pipelines/{id}/runs",              Policy::RequiresPermission("pipeline:read")),

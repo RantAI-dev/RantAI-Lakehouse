@@ -100,7 +100,7 @@ impl Transform {
     /// Not called from Rust at runtime yet — it is the reference twin of
     /// `dagster/dispar_orchestrate/authored_transforms.py::render_clickhouse`
     /// (Phase E2), which is what actually renders a `Transform` into the
-    /// `ClickHouse` SQL `authored_factory.py`'s `authored_pipeline_job` runs.
+    /// `ClickHouse` SQL `authored_factory.py`'s generated jobs execute.
     /// `WS4` item D3/D4/G2/G3 (this commit) is the first task to add a
     /// second `mod transform_grammar;` declaration for this file (in
     /// `main.rs`, alongside `lib.rs`'s existing `pub mod`) so

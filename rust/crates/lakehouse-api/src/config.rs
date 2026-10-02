@@ -565,13 +565,13 @@ pub struct Config {
     /// `main::bootstrap_ingest_run_service`'s doc comment for why that
     /// scope, and no broader one, is granted.
     pub ingest_service_token: Option<String>,
-    /// Shared token `dagster/dispar_orchestrate`'s `authored_pipeline_job`
-    /// (`authored_factory.py`) uses to authenticate against
-    /// `GET /api/pipelines/runnable`. `None` when unset. When set,
-    /// `lakehouse-api` also seeds a service identity scoped to
-    /// `pipeline:execute` ONLY from it — see
+    /// Shared token `dagster/dispar_orchestrate`'s authored-pipeline
+    /// schedule factory (`authored_factory.py`, Phase E) uses to
+    /// authenticate against `GET /api/pipelines?engine=authored`. `None`
+    /// when unset. When set, `lakehouse-api` also seeds a service identity
+    /// scoped to `pipeline:write` ONLY from it — see
     /// `main::bootstrap_pipeline_run_service`'s doc comment for why that
-    /// scope, and no broader one, is granted.
+    /// scope, and no broader one, is granted (WS4 item G3).
     pub pipeline_run_token: Option<String>,
     /// Base URL of the `Trino` coordinator `routes::query::run` talks to
     /// for `engine: "trino"` requests (WS2 §4). Not a secret — an internal
