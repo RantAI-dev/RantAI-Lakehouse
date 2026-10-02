@@ -728,3 +728,45 @@ the compose edit. The handoff describes it; the edit is one default value.
   red, and `cargo audit` / `cargo deny` are red on `main`. Backlog `SEC-8`
   must land first (plan: `2026-10-02-sec-8-dependency-checks.md`), or the
   product owner grants an exception.
+
+### PR slice B — re-review after fixes (reviewer, 2026-10-02)
+
+Reviewed `de8bc5f` (B1) and `5070200` (S1).
+
+- **B1 closed.** `if_changed_skip_reason` now exports when
+  `changed_ms >= exported_ms`; equal timestamps export. The wrong "equal"
+  test case is gone, `equal_timestamps_export_fail_toward_a_fresh_copy` is
+  added, and the doc comments and the scheduler docstring say "strictly
+  before". Cited at the fix site.
+- **S1 closed.** One `pool` helper in `routes/gold.rs` returns
+  `ApiError::Unavailable`, mirroring `routes::pipelines::pool`; the three
+  handlers use it and their `# Errors` sections say `503`.
+
+**No open `BLOCKER` or `SHOULD-FIX`.**
+
+`SEC-8` merged first as PR #62 (`572540c`), so the dependency checks are
+green on `main`. `origin/main` was then merged into this branch. Two
+conflicts, resolved hunk by hunk: the SEC-8 plan file (both sides added it;
+`main`'s copy is this branch's plus the handoff and review) and
+`rust/Cargo.lock` (taken from `main`, then re-resolved by cargo for this
+branch's two dev-dependencies: `main`'s lockfile plus seven edges on
+packages already present, no new package).
+
+Verification re-run by the reviewer on the merged branch, foreground,
+shared `CARGO_TARGET_DIR`, Docker via `sg docker`:
+
+- `cargo fmt --check` — pass.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` —
+  pass.
+- `cargo test --workspace` — 78 suites, **2833 passed, 0 failed, 8
+  ignored**.
+- `python3 ops/lint/check_intra_package_imports.py` — pass.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` — **375 passed,
+  30 subtests passed**.
+- `docker compose --profile '*' config --quiet` — pass.
+
+Not verified by the reviewer: the clean-project `docker compose up` for the
+one-line compose default change (the developer's handoff describes it), and
+the scheduler exporting a switched-on mart on a running stack (the feature's
+acceptance checklist covers it after slice D).
