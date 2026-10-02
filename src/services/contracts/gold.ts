@@ -75,10 +75,27 @@ export type GoldConsumers = {
   reason?: string
 }
 
+/**
+ * `GET /api/gold/export/{mart}/publication` response (gold-publish-per-mart
+ * plan T7, `publication_body` in `routes/gold.rs`). `lastChangedAt` and
+ * `lastExportedAt` are RFC 3339 strings (UTC, seconds granularity) or
+ * `null` when not measurable.
+ */
+export type GoldPublication = {
+  mart: string
+  enabled: boolean
+  updatedAt: string | null
+  lastChangedAt: string | null
+  lastExportedAt: string | null
+  canEdit: boolean
+}
+
 export interface GoldService {
   listMarts(signal?: AbortSignal): Promise<GoldMart[]>
   getLastExport(mart: string, signal?: AbortSignal): Promise<GoldReadBack>
   triggerExport(mart: string, signal?: AbortSignal): Promise<GoldExportResult>
   listExportRuns(mart: string, signal?: AbortSignal): Promise<GoldExportRun[]>
   getConsumers(mart: string, signal?: AbortSignal): Promise<GoldConsumers>
+  getPublication(mart: string, signal?: AbortSignal): Promise<GoldPublication>
+  setPublication(mart: string, enabled: boolean, signal?: AbortSignal): Promise<GoldPublication>
 }
