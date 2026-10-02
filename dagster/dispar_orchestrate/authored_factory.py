@@ -299,7 +299,9 @@ def _ensure_target_table(target: ClickHouseTarget, target_zone: str, target_tabl
 
 def _write_clickhouse_table(target: ClickHouseTarget, target_zone: str, target_table: str, select_sql: str) -> int:
     """REPLACE `target_zone.target_table` with `select_sql`'s rows,
-    atomically, and return the REAL row count of the swapped-in target.
+    atomically, and return the REAL row-count DELTA between before and
+    after the swap -- what the caller records as rows written -- not
+    the absolute row count of the swapped-in target.
 
     Semantics: the function is a `REPLACE`, not an `APPEND`. The op that
     calls it (`_op_for_pipeline`) treats each run as a full snapshot of
@@ -606,13 +608,27 @@ def build_authored_dependency_sensor(
     `dependsOn`. Reads `dependsOn` (camelCase), matching the wire
     format the Rust `RunnablePipeline` serializes under
     `#[serde(rename_all = "camelCase")]` — R3 plan 2a wire-format fix.
-    The sensor watches every upstream's SUCCESS run; on a firing tick
-    it computes "has every upstream had a SUCCESS that finished after
-    this pipeline's most-recent start?" -- ALL semantics (R3 plan 2a).
-    When yes, yield `RunRequest(run_key=<upstream run id>)` so
-    Dagster's own dedup keeps a re-firing upstream from launching the
-    downstream twice for the same upstream run; when no, yield a
-    `SkipReason` naming the upstream that is still behind.
+    A `paused` pipeline gets no sensor at all (F1.2, #57): the
+    orchestrator keeps a vanished sensor's RUNNING state across a
+    reload, so a paused chain has to be stopped rather than rebuilt.
+
+    The sensor watches every upstream's SUCCESS run. On each firing
+    tick it requires ALL upstreams to have a SUCCESS run that ended
+    after the downstream's most-recent run started -- or simply a
+    SUCCESS run when the downstream has never run (R3 plan 2a ALL
+    semantics). The downstream's latest run is the freshness anchor;
+    while that run has no `start_time` (queued / not started /
+    started-but-empty) the sensor skips, so a queued launch is never
+    double-fired. When an upstream is behind, the sensor yields a
+    `SkipReason` naming it, stopping the walk at the first one to keep
+    the per-tick work bounded by the number of upstreams.
+
+    When every upstream is fresh, the sensor yields ONE
+    `RunRequest(run_key=f"authored-deps:{sorted latest upstream SUCCESS
+    run ids}")` per round of upstream successes, not one per upstream.
+    Two upstreams that succeed in the same tick ask for the same
+    sorted key, so Dagster's own dedup drops the second and the
+    downstream launches once (R3 plan 2a).
 
     `monitored_jobs` accepts `JobSelector`s (for cross-location
     upstreams like `ingest_job`); `request_job` must be the
