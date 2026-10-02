@@ -123,7 +123,10 @@ shows layers.
 
 ## Consequences
 
-- A new table, `file_upload`, and six routes under `/api/uploads`.
+- Two new tables, `file_upload` and `upload_table_claim`, and six routes
+  under `/api/uploads`.
+- A table name an upload has asked for stays reserved for that tenant's
+  uploads. A connector cannot take it.
 - A new dependency: axum's `multipart` feature. The dependency checks are
   red on `main` (`SEC-8`); a pull request with this change cannot merge
   until they are green (`AGENTS.md`, step 6).

@@ -1646,3 +1646,58 @@ Noted, not findings against this change:
 - `delete` removes the object before it marks the row. A load claimed in
   between would fail with "The stored file could not be read." That is a
   visible failure, not a wrong result.
+
+### Slice B, fixes — T6a (reviewer, 2026-10-02)
+
+Reviewed `0431d9c` against T6a.
+
+**Findings: none. `B4` to `B7` are closed. Slice B has no open `BLOCKER`.**
+
+What was checked:
+
+- `B4`: `upload_table_claim` has the table name as its primary key.
+  `claim_table` is one `INSERT … ON CONFLICT … DO UPDATE … RETURNING
+  tenant_id`, and the answer is the returned tenant compared with the
+  asking one. `ensure_table_free` reads the claim; `ingest` makes it just
+  before it marks the upload. A claim with no tenant is nobody's. Deleting
+  an upload is `DELETE … AND status <> 'ingesting'`. No `deleted_at` is
+  left in the upload code or in `0055`.
+- `B5`: an unknown run is settled by a recorded result when there is one,
+  failed after `UNKNOWN_RUN_BOUND` when there is none, and left alone
+  before that. An orchestrator that cannot be asked still leaves the
+  upload as it was.
+- `B6`: `outcome_of` returns one of the API's own six constants or "The
+  load failed."; a test reads `ops/fixtures/upload_load_failure_reasons.json`
+  and compares.
+- `B7`: no tenant name in the new code or tests.
+- The developer changed one of its own new tests rather than the code when
+  it failed: the loser of a two-tenant race can be told either of two true
+  things, and a second, deterministic test pins the claim branch. That is
+  the right call.
+
+Decisions on what the handoff asked:
+
+- `table_being_loaded` stays across tenants. All it says is that a load
+  into that name is running.
+- A claim left behind when the upload's own claim then fails is accepted:
+  a claim is never released.
+- The one-hour bound is accepted as a bound.
+
+Verification re-run by the reviewer on `e57ce66`, warm shared
+`CARGO_TARGET_DIR`:
+
+- `cargo fmt --check` — pass.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` —
+  pass.
+- `cargo test --workspace`, one command — 3,373 passed, 0 failed, 8
+  ignored. Matches the handoff.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `python3 ops/lint/check_compose_init_readiness.py` — pass.
+- `python3 ops/lint/check_intra_package_imports.py` — fails on
+  `file_ingest.py:48`, as on the base. T7 clears it.
+
+Not verified: `0055` on the development database (the trial); anything end
+to end.
+
+**Slice C starts from `feat/upload-file` at this review's commit.**
+
