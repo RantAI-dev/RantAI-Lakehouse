@@ -1458,6 +1458,65 @@ pub async fn put_sla(
     Ok(ApiJson(saved))
 }
 
+/// `DELETE /api/governance/sla/{table}` — remove one table's freshness
+/// SLA. Until this route a target, once set, could only be changed: a
+/// table judged late against a target set by mistake stayed degraded.
+/// Gated by `governance:write`, like setting one.
+///
+/// # Errors
+///
+/// 404 when the table has no SLA; 503/500 as above.
+pub async fn delete_sla(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(table): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    let removed = governance::delete_dataset_sla(pool(&state)?, &table)
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound("No freshness target is set for this table".to_owned())
+        })?;
+    audit_table_change(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        &removed.table_name,
+        "catalog.sla_remove",
+        json!({ "minutes": removed.expected_interval_minutes }),
+    )
+    .await;
+    Ok(ApiJson(
+        json!({ "ok": true, "tableName": removed.table_name }),
+    ))
+}
+
+/// `DELETE /api/governance/classification/{id}` — remove a classification
+/// rule. A classification could only be overridden by adding a newer rule,
+/// never taken back; with the rule gone, an older rule for the same asset
+/// or column applies again, or the default level. Gated by
+/// `governance:write`.
+///
+/// # Errors
+///
+/// 404 when no rule has that id; 503/500 as above.
+pub async fn delete_classification_rule(
+    State(state): State<AppState>,
+    principal: Option<Extension<Principal>>,
+    Path(id): Path<String>,
+) -> ApiResult<ApiJson<Value>> {
+    let rule = governance::delete_classification_rule(pool(&state)?, &id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Classification rule not found".to_owned()))?;
+    audit_table_change(
+        &state,
+        principal.as_ref().map(|Extension(p)| p),
+        &rule.asset,
+        "catalog.declassify",
+        json!({ "column": rule.column, "classification": rule.classification }),
+    )
+    .await;
+    Ok(ApiJson(json!({ "ok": true, "id": rule.id })))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

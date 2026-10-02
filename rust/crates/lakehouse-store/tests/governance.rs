@@ -26,10 +26,10 @@ use lakehouse_store::StoreError;
 use lakehouse_store::governance::{
     CreateClassificationRuleInput, CreatePolicyInput, CreateQualityRuleInput,
     CreateResidencyRuleInput, DatasetSla, UpdateQualityRuleInput, create_classification_rule,
-    create_policy, create_quality_rule, create_residency_rule, delete_policy, delete_quality_rule,
-    expected_interval_minutes_for, list_classification_rules, list_dataset_sla, list_policies,
-    list_quality_rules, list_residency_rules, set_policy_status, update_quality_rule,
-    upsert_dataset_sla,
+    create_policy, create_quality_rule, create_residency_rule, delete_classification_rule,
+    delete_dataset_sla, delete_policy, delete_quality_rule, expected_interval_minutes_for,
+    list_classification_rules, list_dataset_sla, list_policies, list_quality_rules,
+    list_residency_rules, set_policy_status, update_quality_rule, upsert_dataset_sla,
 };
 use sqlx::PgPool;
 
@@ -537,5 +537,95 @@ async fn delete_policy_returns_the_policy_and_only_once(pool: PgPool) -> sqlx::R
 
     assert!(delete_policy(&pool, &created.id).await.unwrap().is_none());
     assert!(delete_policy(&pool, "not-a-uuid").await.unwrap().is_none());
+    Ok(())
+}
+
+/// A classification rule can be taken back: the delete returns the rule
+/// that stopped applying, once, and leaves an older rule for the same
+/// column in place to apply again.
+#[sqlx::test(migrations = "../../migrations")]
+async fn delete_classification_rule_returns_the_rule_and_only_once(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let input = |level: &str| CreateClassificationRuleInput {
+        asset: "bronze.customers".to_owned(),
+        column: Some("phone".to_owned()),
+        classification: level.to_owned(),
+        masking_rule: None,
+    };
+    let older = create_classification_rule(&pool, &input("confidential"))
+        .await
+        .unwrap();
+    let newer = create_classification_rule(&pool, &input("restricted"))
+        .await
+        .unwrap();
+
+    let deleted = delete_classification_rule(&pool, &newer.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(deleted.classification, "restricted");
+    assert_eq!(deleted.column.as_deref(), Some("phone"));
+    let left: Vec<String> = list_classification_rules(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.asset == "bronze.customers")
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(left, vec![older.id]);
+
+    assert!(
+        delete_classification_rule(&pool, &newer.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        delete_classification_rule(&pool, "not-a-uuid")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    Ok(())
+}
+
+/// A freshness SLA can be removed, which leaves the table with none; a
+/// table that has none removes nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn delete_dataset_sla_removes_one_tables_target(pool: PgPool) -> sqlx::Result<()> {
+    for table in ["silver.orders", "serving.mart_orders"] {
+        upsert_dataset_sla(
+            &pool,
+            &DatasetSla {
+                table_name: table.to_owned(),
+                expected_interval_minutes: 60,
+                owner: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let removed = delete_dataset_sla(&pool, "silver.orders")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(removed.expected_interval_minutes, 60);
+    let left: Vec<String> = list_dataset_sla(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.table_name)
+        .collect();
+    assert!(left.contains(&"serving.mart_orders".to_owned()));
+    assert!(!left.contains(&"silver.orders".to_owned()));
+
+    assert!(
+        delete_dataset_sla(&pool, "silver.orders")
+            .await
+            .unwrap()
+            .is_none()
+    );
     Ok(())
 }

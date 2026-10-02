@@ -38,6 +38,17 @@ export function assetQueryTarget(a: Target): {
   return { engine: "clickhouse", table: `${quoteIdent(a.namespace)}.${quoteIdent(a.name)}` }
 }
 
+/**
+ * The table an asset's rows are read from when that is not the asset's
+ * own: a Bronze dataset whose Bronze table cannot be read is shown through
+ * its Silver model (`routes::catalog_source`). `null` when the page reads
+ * the asset itself, or when the API named no table at all.
+ */
+export function assetStandInTable(a: Pick<AssetDetail, "queryTarget" | "tableKey">): string | null {
+  const read = a.queryTarget?.policyTable
+  return read && a.tableKey && read !== a.tableKey ? read : null
+}
+
 /** A starter `SELECT` for this asset, with explicit columns when there are few. */
 export function assetStarterSql(a: Target & Pick<AssetDetail, "schema">) {
   const cols =

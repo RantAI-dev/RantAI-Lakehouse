@@ -44,7 +44,7 @@ import {
   snapshotsNewestFirst,
 } from "@/lib/lakehouse-view"
 import { fmtMeasured, type Measured } from "@/lib/measured"
-import { notifySuccess } from "@/lib/notify"
+import { notifyError, notifySuccess } from "@/lib/notify"
 import { schemaHistory } from "@/lib/schema-history"
 import { governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
@@ -52,6 +52,15 @@ import type { DatasetSla } from "@/services/contracts/governance"
 import type { LakehouseSchemaVersion } from "@/services/contracts/lakehouse"
 import { lineageKey } from "./asset-lineage"
 import type { IcebergTableState } from "./asset-storage"
+import { ALL, CountToggle } from "./count-toggle"
+
+/** How many snapshots, or changes, are listed before the reader asks for more. */
+const PAGE_SIZES = [10, 25, 50] as const
+
+/** The sizes that would cut a list of `total` short, then all of it. */
+function sizesFor(total: number): number[] {
+  return [...PAGE_SIZES.filter((n) => n < total), ALL]
+}
 
 function QuietEmpty({ title, description }: { title: string; description?: string }) {
   return <EmptyState title={title} description={description} className="py-4" />
@@ -69,7 +78,16 @@ function signed(value: Measured, sign: "+" | "−") {
  * `tableName` is not a real Bronze table: a quiet empty state, not an
  * error.
  */
-function IcebergSnapshots({ asset: a, state }: { asset: AssetDetail; state: IcebergTableState }) {
+function IcebergSnapshots({
+  asset: a,
+  state,
+  limit,
+}: {
+  asset: AssetDetail
+  state: IcebergTableState
+  /** How many of the newest snapshots to list. */
+  limit: number
+}) {
   if (state.status === "loading") return <QuietEmpty title="Loading snapshots…" />
   if (state.status === "error") {
     if (state.error.code === "not_found") {
@@ -78,7 +96,7 @@ function IcebergSnapshots({ asset: a, state }: { asset: AssetDetail; state: Iceb
     return <ErrorState error={state.error} onRetry={state.reload} />
   }
 
-  const snapshots = snapshotsNewestFirst(state.data?.snapshots ?? [])
+  const snapshots = snapshotsNewestFirst(state.data?.snapshots ?? []).slice(0, limit)
   if (snapshots.length === 0) return <QuietEmpty title="No snapshots for this asset" />
 
   return (
@@ -182,7 +200,23 @@ function SetTargetDialog({
   const save = useServiceAction((signal, input: DatasetSla) =>
     governanceService.putDatasetSla(input, signal)
   )
+  const remove = useServiceAction((signal, table: string) =>
+    governanceService.deleteDatasetSla(table, signal)
+  )
   const minutes = slaMinutes(amount, unit)
+  // Only an SLA can be removed: a target the registry's refresh frequency
+  // gives is not something this dialog set.
+  const hasSla = a.freshnessTargetSource === "sla"
+
+  async function removeTarget() {
+    // `run` resolves to `null` only on failure.
+    if ((await remove.run(lineageKey(a))) === null) {
+      notifyError("Failed to remove the freshness target", remove.error)
+      return
+    }
+    notifySuccess("Freshness target removed")
+    onSaved()
+  }
 
   async function submit() {
     if (minutes === null) return
@@ -229,11 +263,23 @@ function SetTargetDialog({
           {save.error ? <p className="text-sm text-destructive">{save.error.message}</p> : null}
         </div>
         <DialogFooter>
+          {hasSla ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              className="mr-auto text-destructive"
+              onClick={() => void removeTarget()}
+              disabled={remove.status === "pending" || save.status === "pending"}
+              title="The asset goes back to having no target of its own"
+            >
+              {remove.status === "pending" ? "Removing…" : "Remove target"}
+            </Button>
+          ) : null}
           <DialogClose render={<Button variant="ghost" size="sm" />}>Cancel</DialogClose>
           <Button
             size="sm"
             onClick={() => void submit()}
-            disabled={minutes === null || save.status === "pending"}
+            disabled={minutes === null || save.status === "pending" || remove.status === "pending"}
           >
             {save.status === "pending" ? "Saving…" : "Save target"}
           </Button>
@@ -341,6 +387,17 @@ export function AssetActivity({
     a.changeHistory,
     iceberg.status === "success" ? (iceberg.data?.schemaVersions ?? []) : []
   )
+  const [snapshotLimit, setSnapshotLimit] = React.useState<number>(PAGE_SIZES[0])
+  const [changeLimit, setChangeLimit] = React.useState<number>(PAGE_SIZES[0])
+  const snapshotCount = iceberg.status === "success" ? (iceberg.data?.snapshots.length ?? 0) : 0
+  // Reads by dashboards are not in the query history the usage is counted from.
+  const dashboards = a.dependents.filter((d) => d.kind.toLowerCase().includes("dashboard")).length
+  const uncounted =
+    dashboards > 0
+      ? `Not counted: reads by the ${dashboards} dashboard${dashboards === 1 ? "" : "s"} that use${
+          dashboards === 1 ? "s" : ""
+        } this asset.`
+      : null
 
   return (
     <div className="flex flex-col gap-2">
@@ -348,10 +405,23 @@ export function AssetActivity({
       <SectionCard
         size="sm"
         title="Snapshots"
-        description="One per load of an Iceberg table, newest first. Any of them can be queried as the table stood then."
+        description={`One per load of an Iceberg table, newest first. Any of them can be queried as the table stood then.${
+          snapshotCount > snapshotLimit ? ` Showing the newest ${snapshotLimit} of ${snapshotCount}.` : ""
+        }`}
+        action={
+          snapshotCount > PAGE_SIZES[0] ? (
+            <CountToggle
+              label="Show"
+              ariaLabel="Snapshots to show"
+              options={sizesFor(snapshotCount)}
+              value={snapshotLimit}
+              onChange={setSnapshotLimit}
+            />
+          ) : undefined
+        }
       >
         {isIcebergCandidate(a) && a.tableName ? (
-          <IcebergSnapshots asset={a} state={iceberg} />
+          <IcebergSnapshots asset={a} state={iceberg} limit={snapshotLimit} />
         ) : a.snapshots.length === 0 ? (
           <QuietEmpty
             title="Only Iceberg tables keep snapshots"
@@ -374,13 +444,26 @@ export function AssetActivity({
         <SectionCard
           size="sm"
           title="Change history"
-          description="Edits to its details, changes to its schema, and the rules, classifications, policies and targets added for it."
+          description={`Edits to its details, changes to its schema, and the rules, classifications, policies and targets added for it.${
+            changes.length > changeLimit ? ` Showing the newest ${changeLimit} of ${changes.length}.` : ""
+          }`}
+          action={
+            changes.length > PAGE_SIZES[0] ? (
+              <CountToggle
+                label="Show"
+                ariaLabel="Changes to show"
+                options={sizesFor(changes.length)}
+                value={changeLimit}
+                onChange={setChangeLimit}
+              />
+            ) : undefined
+          }
         >
           {changes.length === 0 ? (
             <QuietEmpty title="No changes recorded" />
           ) : (
             <ul className="divide-y divide-border text-sm">
-              {changes.map((c) => (
+              {changes.slice(0, changeLimit).map((c) => (
                 <li key={c.id} className="flex flex-wrap items-baseline gap-2 py-1.5">
                   <span className="font-medium">{c.actor}</span>
                   <span className="text-muted-foreground">{c.summary}</span>
@@ -395,12 +478,15 @@ export function AssetActivity({
         <SectionCard
           size="sm"
           title="Usage (7d)"
-          description="Queries that read this asset, by anyone. Only your own query text is shown."
+          description="Queries run in Query Studio or by the copilot that read this asset, by anyone. Only your own query text is shown."
         >
           {a.usage === null ? (
             <QuietEmpty title="Usage not measured" description="The query history could not be read." />
           ) : a.usage.queries7d === 0 ? (
-            <QuietEmpty title="No queries in the last 7 days" />
+            <QuietEmpty
+              title="No Query Studio or copilot query in the last 7 days"
+              description={uncounted ?? undefined}
+            />
           ) : (
             <div className="flex flex-col gap-3">
               <dl className="grid grid-cols-3 gap-2 text-sm">
@@ -418,6 +504,7 @@ export function AssetActivity({
                 ))}
               </dl>
               <div>
+                {uncounted ? <p className="mb-2 text-xs text-muted-foreground">{uncounted}</p> : null}
                 <div className="mb-1 text-xs font-medium text-muted-foreground">Your recent queries</div>
                 {a.recentQueries.length === 0 ? (
                   <p className="text-sm text-muted-foreground">None of them were yours.</p>

@@ -60,6 +60,13 @@ async function post<T>(url: string, body: unknown, signal?: AbortSignal): Promis
   return json as T;
 }
 
+/** A DELETE whose answer carries nothing the caller needs. */
+async function del(url: string, failure: string, signal?: AbortSignal): Promise<void> {
+  const res = await apiFetch(url, { method: "DELETE", signal });
+  const json = await res.json().catch(() => null);
+  if (!res.ok) throw errorFor(res.status, json?.error ?? failure);
+}
+
 // WS5 item E1 (judge amendment 2): the plan's `putDatasetSla` calls a
 // `put` helper this file never had — only `get`/`post` existed. Mirrors
 // `post` exactly (same `apiFetch` usage, same `errorFor` mapping) rather
@@ -147,5 +154,15 @@ export const clickhouseGovernanceService: GovernanceService = {
   },
   putDatasetSla(input: DatasetSla, signal) {
     return put<DatasetSla>("/api/governance/sla", input, signal);
+  },
+  deleteDatasetSla(tableName, signal) {
+    return del(`/api/governance/sla/${encodeURIComponent(tableName)}`, "Failed to remove the freshness target", signal);
+  },
+  deleteClassificationRule(id, signal) {
+    return del(
+      `/api/governance/classification/${encodeURIComponent(id)}`,
+      "Failed to remove the classification",
+      signal
+    );
   },
 };

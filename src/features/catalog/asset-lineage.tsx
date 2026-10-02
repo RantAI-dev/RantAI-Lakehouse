@@ -7,18 +7,14 @@ import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useAuth } from "@/features/auth/auth-provider"
-import {
-  KIND_LABEL,
-  LineageColumns,
-  focusIds,
-  type LineageNode,
-} from "@/features/governance/lineage-graph"
+import { KIND_LABEL, focusIds, type LineageNode } from "@/features/governance/lineage-graph"
 import { useService, type ServiceState } from "@/hooks/use-service"
 import { assetQueryStudioHref } from "@/lib/asset-query"
 import { isIcebergCandidate } from "@/lib/lakehouse-view"
 import { governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
 import type { LineageGraph } from "@/services/contracts/governance"
+import { LineageMindmap, edgePipeline, mindmapModel } from "./asset-lineage-map"
 
 /**
  * What the lineage graph calls this asset: its table key
@@ -83,17 +79,6 @@ export function lineageSides(graph: LineageGraph | null): {
 }
 
 /**
- * The authored pipeline a `pipeline` edge was recorded from. The graph
- * draws a pipeline as an edge from its source to its target, and names it
- * only in the edge's `evidence` (`routes/lineage.rs`: "authored pipeline
- * <name> (<id>)").
- */
-function edgePipeline(evidence: string | undefined): { id: string; name: string } | null {
-  const match = /^authored pipeline (.+) \((pl-[^()]+)\)$/.exec(evidence ?? "")
-  return match ? { id: match[2], name: match[1] } : null
-}
-
-/**
  * What reads this asset: the pipelines the graph records reading it, then
  * whatever the catalog itself lists (`dependents`), without repeats.
  */
@@ -127,10 +112,34 @@ export function assetDependents(a: AssetDetail, graph: LineageGraph | null): Rel
  * today, the Silver model built from a Bronze dataset of the same name.
  */
 export function relatedTables(a: AssetDetail, graph: LineageGraph | null): Related[] {
-  const inGraph = new Set((graph?.nodes ?? []).map((n) => n.id))
-  return [...a.upstream, ...a.downstream]
-    .filter((t) => !inGraph.has(t.id))
-    .map((t) => ({ id: t.id, name: t.name, kind: "table", href: `/data/assets/${encodeURIComponent(t.id)}` }))
+  const { upstream, downstream } = relatedSides(a, graph)
+  return [...upstream, ...downstream]
+}
+
+/** [`relatedTables`], kept apart by the side of the asset each is on. */
+function relatedSides(
+  a: AssetDetail,
+  graph: LineageGraph | null
+): { upstream: Related[]; downstream: Related[] } {
+  // A graph id carries its kind (`table:silver.orders`); the catalog's own
+  // ids do not, so a node is matched by what follows the prefix as well.
+  const inGraph = new Set(
+    (graph?.nodes ?? []).flatMap((n) => [n.id, n.id.slice(n.id.indexOf(":") + 1), n.label])
+  )
+  const outside = (tables: AssetDetail["upstream"]): Related[] =>
+    tables
+      .filter((t) => !inGraph.has(t.id))
+      .map((t) => ({ id: t.id, name: t.name, kind: "table", href: `/data/assets/${encodeURIComponent(t.id)}` }))
+  return { upstream: outside(a.upstream), downstream: outside(a.downstream) }
+}
+
+/**
+ * The asset's own node, for a map whose graph does not hold it: what the
+ * graph would call it, and the layer it is in.
+ */
+function selfNode(a: AssetDetail): { label: string; kind: string } {
+  const kind = a.layer === "silver" ? "silver" : a.layer === "gold" ? "gold" : "bronze"
+  return { label: lineageKey(a), kind }
 }
 
 /** How many things the Lineage tab has to show, for its count. */
@@ -180,10 +189,6 @@ function RelatedList({ items }: { items: Related[] }) {
   )
 }
 
-function plural(n: number, one: string) {
-  return `${n} ${one}${n === 1 ? "" : "s"}`
-}
-
 /** The recorded graph around the asset, or why there is none to draw. */
 function GraphCard({ a, state }: { a: AssetDetail; state: AssetLineageState }) {
   if (state.status === "loading") {
@@ -223,7 +228,20 @@ function GraphCard({ a, state }: { a: AssetDetail; state: AssetLineageState }) {
       </SectionCard>
     )
   }
-  if (graph.nodes.length === 0) {
+  // The map branches into more than the recorded graph: what reads the
+  // asset and what the catalog relates to it. The pipelines the graph
+  // records are its edges already, so only the catalog's own dependents
+  // are added.
+  const related = relatedSides(a, graph)
+  const model = mindmapModel({
+    graph,
+    self: selfNode(a),
+    dependents: assetDependents(a, null),
+    relatedUpstream: related.upstream,
+    relatedDownstream: related.downstream,
+  })
+  const unrecorded = graph.nodes.length === 0
+  if (unrecorded && model.nodes.length === 1) {
     return (
       <SectionCard size="sm" title="Lineage">
         <EmptyState
@@ -239,10 +257,19 @@ function GraphCard({ a, state }: { a: AssetDetail; state: AssetLineageState }) {
     <SectionCard
       size="sm"
       title="Lineage"
-      description={`${plural(upstream.length, "step")} upstream · ${plural(downstream.length, "step")} downstream. This table is outlined.`}
+      description={
+        unrecorded
+          ? `No lineage is recorded for ${lineageKey(a)}. What reads it and what the catalog ties to it is drawn around it.`
+          : `${upstream.length} upstream · ${downstream.length} downstream of this asset, by recorded lineage.`
+      }
     >
-      <LineageColumns graph={graph} />
-      {graph.note ? <p className="mt-2 text-xs text-muted-foreground">{graph.note}</p> : null}
+      <LineageMindmap model={model} />
+      {/* What the graph cannot contain, so a missing step is not read as "there is none". */}
+      {[graph.note, ...(graph.coverage ?? [])].filter(Boolean).map((caveat) => (
+        <p key={caveat} className="mt-2 text-xs text-muted-foreground">
+          {caveat}
+        </p>
+      ))}
     </SectionCard>
   )
 }

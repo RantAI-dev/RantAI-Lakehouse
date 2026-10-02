@@ -258,6 +258,10 @@ pub const POLICY_TABLE: &[(&str, &str, Policy)] = &[
     // Iceberg maintenance write above uses.
     ("GET",  "/api/governance/sla",       Policy::RequiresPermission("policy:read")),
     ("PUT",  "/api/governance/sla",       Policy::RequiresPermission("governance:write")),
+    // Taking a target or a classification back is the same decision as
+    // setting one.
+    ("DELETE", "/api/governance/sla/{table}", Policy::RequiresPermission("governance:write")),
+    ("DELETE", "/api/governance/classification/{id}", Policy::RequiresPermission("governance:write")),
     // Running a rule reads the table it names, so it takes what reading
     // that table takes — the same grant as the column profile.
     ("POST", "/api/governance/quality/{id}/run", Policy::RequiresPermission("query:read")),

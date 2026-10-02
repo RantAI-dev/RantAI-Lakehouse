@@ -1,9 +1,11 @@
 "use client"
 
+import * as React from "react"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { ClassificationBadge, Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import {
   Table,
@@ -22,6 +24,32 @@ import { assetService } from "@/services"
 import type { AssetColumn, AssetDetail, AssetProfile, ColumnProfile } from "@/services/contracts/assets"
 import type { LakehouseTableDetail } from "@/services/contracts/lakehouse"
 import { icebergTableOf, type IcebergTableState } from "./asset-storage"
+import { StandInNotice } from "./asset-stand-in"
+import { ALL, CountToggle } from "./count-toggle"
+
+/** How many columns the table shows before the reader asks for more. */
+const COLUMN_PAGE_SIZES = [25, 50, 100] as const
+
+/**
+ * The columns to list: those whose name or description contains `query`,
+ * cut to `limit`. `matched` is how many there are before the cut.
+ */
+export function visibleColumns<T extends { column: AssetColumn }>(
+  rows: T[],
+  query: string,
+  limit: number
+): { shown: T[]; matched: number } {
+  const needle = query.trim().toLowerCase()
+  const matching =
+    needle === ""
+      ? rows
+      : rows.filter(
+          (r) =>
+            r.column.name.toLowerCase().includes(needle) ||
+            (r.column.description ?? "").toLowerCase().includes(needle)
+        )
+  return { shown: matching.slice(0, limit), matched: matching.length }
+}
 
 /**
  * Null share as a thin meter plus its number. The number carries the
@@ -293,16 +321,54 @@ export function AssetSchema({ asset: a, iceberg }: { asset: AssetDetail; iceberg
   const clickhouseTyped = a.type !== "iceberg-table"
   const { rows, system } = schemaRows(a.schema, table, clickhouseTyped)
   const showStats = profile.kind === "ready" || profile.kind === "loading"
+  const [limit, setLimit] = React.useState<number>(COLUMN_PAGE_SIZES[0])
+  const [query, setQuery] = React.useState("")
+  // A table that fits the first page needs neither control.
+  const wide = rows.length > COLUMN_PAGE_SIZES[0]
+  // Only the sizes that would cut this table short, then all of it.
+  const sizes = [...COLUMN_PAGE_SIZES.filter((n) => n < rows.length), ALL]
+  const { shown, matched } = visibleColumns(rows, query, wide ? limit : ALL)
+  const total = `${rows.length} column${rows.length === 1 ? "" : "s"}`
+  const summary =
+    query.trim() !== ""
+      ? `${matched} of ${total} match "${query.trim()}"${shown.length < matched ? `, showing the first ${shown.length}` : ""}.`
+      : shown.length < rows.length
+        ? `Showing the first ${shown.length} of ${total}, in table order.`
+        : `${total}, in table order.`
 
   return (
     <div className="flex flex-col gap-2">
+      <StandInNotice asset={a} />
       <SectionCard
         size="sm"
         title="Columns"
-        description={`${rows.length} column${rows.length === 1 ? "" : "s"}, in table order.`}
+        description={summary}
+        action={
+          wide ? (
+            <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1.5">
+              <Input
+                type="search"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Filter columns…"
+                aria-label="Filter columns"
+                className="h-8 w-44"
+              />
+              <CountToggle
+                label="Show"
+                ariaLabel="Columns to show"
+                options={sizes}
+                value={limit}
+                onChange={setLimit}
+              />
+            </div>
+          ) : undefined
+        }
       >
         {rows.length === 0 ? (
           <EmptyState title="No columns registered" className="py-4" />
+        ) : shown.length === 0 ? (
+          <EmptyState title={`No column matches "${query.trim()}"`} className="py-4" />
         ) : (
           <div className="flex flex-col gap-2">
             <div className="overflow-hidden rounded-lg border border-border">
@@ -323,7 +389,7 @@ export function AssetSchema({ asset: a, iceberg }: { asset: AssetDetail; iceberg
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {rows.map((row) => (
+                  {shown.map((row) => (
                     <TableRow key={row.column.name}>
                       <ColumnCells row={row} />
                       {showStats ? <StatCells state={profile} name={row.column.name} /> : null}

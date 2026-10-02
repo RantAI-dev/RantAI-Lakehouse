@@ -318,6 +318,12 @@ fn change_entry(event: &lakehouse_store::audit::AuditEvent) -> Value {
             arg("column").map_or_else(|| "the asset".to_owned(), |c| format!("column {c}")),
             arg("classification").unwrap_or("unspecified"),
         ),
+        "catalog.declassify" => format!(
+            "Removed the classification of {} ({})",
+            arg("column").map_or_else(|| "the asset".to_owned(), |c| format!("column {c}")),
+            arg("classification").unwrap_or("unspecified"),
+        ),
+        "catalog.sla_remove" => "Removed the freshness target".to_owned(),
         "catalog.sla_set" => event
             .args
             .get("minutes")
@@ -624,6 +630,10 @@ pub(crate) struct Classified {
     pub(crate) from_rule: bool,
     /// `(column, level)` for each column a rule classifies.
     pub(crate) columns: Vec<(String, String)>,
+    /// The rules behind the above — the asset's own first, then one per
+    /// column — as `(rule id, column, level)`: what removing a
+    /// classification removes.
+    pub(crate) in_force: Vec<(String, Option<String>, String)>,
 }
 
 /// Classifies the asset known by `names` from `rules` (newest first, as
@@ -632,15 +642,25 @@ pub(crate) struct Classified {
 /// right one. The asset is never less restrictive than a column it holds.
 pub(crate) fn classify(rules: &[ClassificationRule], names: &[String]) -> Classified {
     let mut asset_level: Option<&str> = None;
+    let mut asset_rule: Option<(String, Option<String>, String)> = None;
     let mut columns: Vec<(String, String)> = Vec::new();
+    let mut column_rules: Vec<(String, Option<String>, String)> = Vec::new();
     for rule in rules.iter().filter(|r| is_one_of(&r.asset, names)) {
         match rule.column.as_deref().filter(|c| !c.trim().is_empty()) {
             None => {
-                asset_level.get_or_insert(rule.classification.as_str());
+                if asset_level.is_none() {
+                    asset_level = Some(rule.classification.as_str());
+                    asset_rule = Some((rule.id.clone(), None, rule.classification.clone()));
+                }
             }
             Some(column) => {
                 if !columns.iter().any(|(c, _)| c == column) {
                     columns.push((column.to_owned(), rule.classification.clone()));
+                    column_rules.push((
+                        rule.id.clone(),
+                        Some(column.to_owned()),
+                        rule.classification.clone(),
+                    ));
                 }
             }
         }
@@ -655,6 +675,7 @@ pub(crate) fn classify(rules: &[ClassificationRule], names: &[String]) -> Classi
         level: level.to_owned(),
         from_rule: asset_level.is_some() || !columns.is_empty(),
         columns,
+        in_force: asset_rule.into_iter().chain(column_rules).collect(),
     }
 }
 
@@ -1140,6 +1161,31 @@ mod tests {
         }
     }
 
+    /// What was taken back reads as plainly as what was added.
+    #[test]
+    fn change_entries_say_what_was_taken_back() {
+        for (action, args, summary) in [
+            (
+                "catalog.declassify",
+                json!({ "column": "email", "classification": "restricted" }),
+                "Removed the classification of column email (restricted)",
+            ),
+            (
+                "catalog.declassify",
+                json!({ "column": null, "classification": "public" }),
+                "Removed the classification of the asset (public)",
+            ),
+            (
+                "catalog.sla_remove",
+                json!({ "minutes": 2160 }),
+                "Removed the freshness target",
+            ),
+        ] {
+            let entry = change_entry(&audit_event(action, args));
+            assert_eq!(entry["summary"], summary, "{action}");
+        }
+    }
+
     fn rule(asset: &str, column: Option<&str>, level: &str) -> ClassificationRule {
         ClassificationRule {
             id: format!("c-{asset}-{column:?}-{level}"),
@@ -1185,6 +1231,24 @@ mod tests {
         );
         // The asset rule says public; the card column makes it restricted.
         assert_eq!(c.level, "restricted");
+        // The rules that won, the asset's own first: what a reader removes
+        // to take a classification back. The older rules are not among them.
+        assert_eq!(
+            c.in_force,
+            vec![
+                (rules[0].id.clone(), None, "public".to_owned()),
+                (
+                    rules[1].id.clone(),
+                    Some("email".to_owned()),
+                    "confidential".to_owned()
+                ),
+                (
+                    rules[4].id.clone(),
+                    Some("card".to_owned()),
+                    "restricted".to_owned()
+                ),
+            ]
+        );
 
         let asset_only = classify(&rules[..1], &tables(&["silver.orders"]));
         assert_eq!(asset_only.level, "public");

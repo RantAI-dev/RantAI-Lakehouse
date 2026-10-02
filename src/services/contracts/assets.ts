@@ -208,6 +208,13 @@ export type AssetDetail = Asset & {
    */
   tableKey?: string | null
   /**
+   * The classification rules in force for this asset — the asset's own
+   * first, then one per classified column — each removable by its id. An
+   * older rule a newer one overrode is not listed. Absent from an older
+   * API build.
+   */
+  classificationRules?: { id: string; column?: string; classification: Classification }[]
+  /**
    * How ClickHouse holds a Silver or Gold asset's table: its engine and
    * keys, and what its active parts add up to. A field is `null` when it
    * could not be read or, for a key, when the table has none. Absent on a

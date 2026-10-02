@@ -2,7 +2,8 @@
 
 import * as React from "react"
 import Link from "next/link"
-import { Check, Minus, Plus, Tag } from "lucide-react"
+import { Check, Minus, Plus, Tag, Trash2 } from "lucide-react"
+import { ConfirmActionDialog } from "@/components/patterns/confirm-action-dialog"
 import { EmptyState } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { ClassificationBadge, Pill } from "@/components/patterns/status-badge"
@@ -21,7 +22,7 @@ import { Label } from "@/components/ui/label"
 import { useAuth } from "@/features/auth/auth-provider"
 import { PolicyActions } from "@/features/governance/policy-actions"
 import { useServiceAction } from "@/hooks/use-service"
-import { notifySuccess } from "@/lib/notify"
+import { notifyError, notifySuccess } from "@/lib/notify"
 import { CLASSIFICATION_LABEL, type Classification } from "@/lib/status"
 import { governanceService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
@@ -185,10 +186,47 @@ function ClassifyDialog({
   )
 }
 
-/** How sensitive the asset and its columns are, and on whose word. */
+type ClassificationRuleInForce = NonNullable<AssetDetail["classificationRules"]>[number]
+
+/**
+ * How sensitive the asset and its columns are, and on whose word. A
+ * classification is a rule, and the rule in force can be removed — which
+ * is the way to take one back, where adding a newer rule only overrides.
+ */
 function ClassificationCard({ asset: a, onChanged }: { asset: AssetDetail; onChanged: () => void }) {
+  const { hasPermission } = useAuth()
   const [classifying, setClassifying] = React.useState(false)
+  const [removing, setRemoving] = React.useState<ClassificationRuleInForce | null>(null)
+  const remove = useServiceAction((signal, id: string) =>
+    governanceService.deleteClassificationRule(id, signal)
+  )
   const columns = a.schema.filter((c) => c.classification)
+  const rules = a.classificationRules ?? []
+  const canRemove = hasPermission("governance:write")
+  const ruleOf = (column?: string) => rules.find((r) => r.column === column)
+  const removeButton = (rule: ClassificationRuleInForce | undefined, what: string) =>
+    rule && canRemove ? (
+      <Button
+        size="icon-sm"
+        variant="ghost"
+        aria-label={`Remove the classification of ${what}`}
+        onClick={() => setRemoving(rule)}
+      >
+        <Trash2 />
+      </Button>
+    ) : null
+
+  async function confirmRemove() {
+    if (!removing) return
+    // `run` resolves to `null` only on failure.
+    if ((await remove.run(removing.id)) === null) {
+      notifyError("Failed to remove the classification", remove.error)
+      return
+    }
+    notifySuccess("Classification removed")
+    setRemoving(null)
+    onChanged()
+  }
 
   return (
     <SectionCard
@@ -205,20 +243,35 @@ function ClassificationCard({ asset: a, onChanged }: { asset: AssetDetail; onCha
       <ul className="divide-y divide-border text-sm">
         <li className="flex items-center gap-2 py-1.5">
           <span>This asset</span>
-          <span className="ml-auto">
+          <span className="ml-auto flex items-center gap-1">
             <ClassificationBadge classification={a.classification} />
+            {removeButton(ruleOf(undefined), "this asset")}
           </span>
         </li>
         {columns.map((c) => (
           <li key={c.name} className="flex items-center gap-2 py-1.5">
             <span className="font-mono text-xs">{c.name}</span>
             <span className="text-xs text-muted-foreground">column</span>
-            <span className="ml-auto">
+            <span className="ml-auto flex items-center gap-1">
               {c.classification ? <ClassificationBadge classification={c.classification} /> : null}
+              {removeButton(ruleOf(c.name), `column ${c.name}`)}
             </span>
           </li>
         ))}
       </ul>
+      <ConfirmActionDialog
+        open={removing !== null}
+        onOpenChange={(open) => (open ? undefined : setRemoving(null))}
+        title="Remove classification"
+        description={`Remove the ${
+          removing ? CLASSIFICATION_LABEL[removing.classification] : ""
+        } classification of ${removing?.column ? `column ${removing.column}` : "this asset"}?`}
+        impact="An older rule for it applies again if there is one. Otherwise it goes back to the default level, Internal."
+        confirmLabel="Remove"
+        confirming={remove.status === "pending"}
+        destructive
+        onConfirm={() => void confirmRemove()}
+      />
       {columns.length === 0 ? (
         <p className="mt-2 text-xs text-muted-foreground">No column is classified on its own.</p>
       ) : null}

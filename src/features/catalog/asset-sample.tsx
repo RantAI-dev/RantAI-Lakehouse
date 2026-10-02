@@ -18,9 +18,11 @@ import { assetQueryStudioHref } from "@/lib/asset-query"
 import { cn } from "@/lib/utils"
 import { assetService } from "@/services"
 import type { AssetDetail } from "@/services/contracts/assets"
+import { StandInNotice } from "./asset-stand-in"
+import { CountToggle } from "./count-toggle"
 
 /** The first is what the detail body already carries; the last is the API's cap. */
-const SIZES = [5, 25, 100] as const
+const SIZES = [5, 25, 50, 100] as const
 
 /**
  * The Sample tab: the asset's first rows as the reader would get them
@@ -44,78 +46,72 @@ export function AssetSample({ asset: a }: { asset: AssetDetail }) {
   const loading = size !== SIZES[0] && more.status === "loading"
 
   return (
-    <SectionCard
-      size="sm"
-      title="Sample rows"
-      description={
-        a.sampleRestricted || rows.length === 0
-          ? "Masking and row filters applied."
-          : `${loading ? `Loading ${size} rows… showing the` : "The"} first ${rows.length} row${
-              rows.length === 1 ? "" : "s"
-            }, as you would read them: masking and row filters applied.`
-      }
-      action={
-        <div className="flex flex-wrap items-center justify-end gap-1.5">
-          {a.sampleRestricted ? null : (
-            <div className="flex rounded-lg border border-border p-0.5" role="group" aria-label="Rows to show">
-              {SIZES.map((n) => (
-                <button
-                  key={n}
-                  type="button"
-                  aria-pressed={size === n}
-                  onClick={() => setSize(n)}
-                  className={cn(
-                    "rounded-md px-2 py-0.5 text-xs font-medium tabular-nums",
-                    size === n ? "bg-muted text-foreground" : "text-muted-foreground hover:text-foreground"
-                  )}
-                >
-                  {n}
-                </button>
-              ))}
-            </div>
-          )}
-          <Button size="sm" variant="outline" render={<Link href={assetQueryStudioHref(a)} />}>
-            Open in Query Studio
-          </Button>
-        </div>
-      }
-    >
-      {a.sampleRestricted ? (
-        <EmptyState
-          title="Sample rows need query access"
-          description="Rows are data, so they require the query:read permission. Use Request access above to ask for it."
-          className="py-4"
-        />
-      ) : more.status === "error" ? (
-        <ErrorState error={more.error} onRetry={more.reload} />
-      ) : rows.length === 0 ? (
-        <EmptyState title="No sample rows available" className="py-4" />
-      ) : (
-        <div className={cn("overflow-hidden rounded-lg border border-border", loading && "opacity-60")}>
-          <Table>
-            <TableHeader>
-              <TableRow className="hover:bg-transparent">
-                {columns.map((col) => (
-                  <TableHead key={col} className="font-mono text-xs font-medium">
-                    {col}
-                  </TableHead>
-                ))}
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {rows.map((row, i) => (
-                <TableRow key={i}>
+    <div className="flex flex-col gap-2">
+      <StandInNotice asset={a} />
+      <SectionCard
+        size="sm"
+        title="Sample rows"
+        description={
+          a.sampleRestricted || rows.length === 0
+            ? "Masking and row filters applied."
+            : `${loading ? `Loading ${size} rows… showing the` : "The"} first ${rows.length} row${
+                rows.length === 1 ? "" : "s"
+              }, as you would read them: masking and row filters applied.`
+        }
+        action={
+          <div className="flex flex-wrap items-center justify-end gap-1.5">
+            {a.sampleRestricted ? null : (
+              <CountToggle
+                label="Rows"
+                ariaLabel="Rows to show"
+                options={SIZES}
+                value={size}
+                onChange={setSize}
+              />
+            )}
+            <Button size="sm" variant="outline" render={<Link href={assetQueryStudioHref(a)} />}>
+              Open in Query Studio
+            </Button>
+          </div>
+        }
+      >
+        {a.sampleRestricted ? (
+          <EmptyState
+            title="Sample rows need query access"
+            description="Rows are data, so they require the query:read permission. Use Request access above to ask for it."
+            className="py-4"
+          />
+        ) : more.status === "error" ? (
+          <ErrorState error={more.error} onRetry={more.reload} />
+        ) : rows.length === 0 ? (
+          <EmptyState title="No sample rows available" className="py-4" />
+        ) : (
+          <div className={cn("overflow-hidden rounded-lg border border-border", loading && "opacity-60")}>
+            <Table>
+              <TableHeader>
+                <TableRow className="hover:bg-transparent">
                   {columns.map((col) => (
-                    <TableCell key={col} className="py-1.5 font-mono text-xs">
-                      {row[col] ?? "—"}
-                    </TableCell>
+                    <TableHead key={col} className="font-mono text-xs font-medium">
+                      {col}
+                    </TableHead>
                   ))}
                 </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
-      )}
-    </SectionCard>
+              </TableHeader>
+              <TableBody>
+                {rows.map((row, i) => (
+                  <TableRow key={i}>
+                    {columns.map((col) => (
+                      <TableCell key={col} className="py-1.5 font-mono text-xs">
+                        {row[col] ?? "—"}
+                      </TableCell>
+                    ))}
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </SectionCard>
+    </div>
   )
 }

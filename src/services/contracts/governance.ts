@@ -232,4 +232,11 @@ export interface GovernanceService {
   listDatasetSla(signal?: AbortSignal): Promise<DatasetSla[]>
   /** Author or replace one table's freshness SLA — `PUT /api/governance/sla`. */
   putDatasetSla(input: DatasetSla, signal?: AbortSignal): Promise<DatasetSla>
+  /** Remove a table's freshness SLA; needs `governance:write`. */
+  deleteDatasetSla(tableName: string, signal?: AbortSignal): Promise<void>
+  /**
+   * Remove a classification rule; needs `governance:write`. An older rule
+   * for the same asset or column applies again, or the default level.
+   */
+  deleteClassificationRule(id: string, signal?: AbortSignal): Promise<void>
 }

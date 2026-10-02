@@ -24,6 +24,7 @@ import { afterEach, describe, expect, it, mock, spyOn } from "bun:test"
 import { AuthProvider } from "@/features/auth/auth-provider"
 import type { AssetDetail } from "@/services/contracts/assets"
 import { AssetDetailTabs } from "./asset-detail-tabs"
+import { relatedTables } from "./asset-lineage"
 
 afterEach(() => {
   cleanup()
@@ -186,6 +187,8 @@ function stubApi({
     if (method === "PUT" && path.endsWith("/annotation")) return json({ ok: true })
     if (method === "PUT" && path.endsWith("/api/governance/sla")) return json({ ok: true })
     if (method === "DELETE" && path.includes("/api/governance/quality/")) return json({ ok: true })
+    if (method === "DELETE" && path.includes("/api/governance/sla/")) return json({ ok: true })
+    if (method === "DELETE" && path.includes("/api/governance/classification/")) return json({ ok: true })
     if (method === "PUT" && path.includes("/api/governance/quality/")) {
       return json({ id: "q3", name: "email_complete", ...JSON.parse(String(init?.body)), dimension: "completeness", lastStatus: null, lastRunAt: null, evaluable: true, hint: null })
     }
@@ -282,22 +285,29 @@ describe("Lineage tab", () => {
     renderTabs()
 
     const graph = await screen.findByRole("list", { name: "Lineage graph" })
+    // Left to right: where it comes from, the asset, then what is built
+    // from it — the pipeline as a stop of its own on the way.
+    // A name drops the schema its caption already states; the full name is its tooltip.
     expect(within(graph).getAllByRole("listitem").map((n) => n.textContent)).toEqual([
       "ConnectorPostgres",
-      "Bronzebronze.demo_orders",
-      "Silversilver.orders_clean",
+      "Bronzedemo_orders",
+      "Pipelineorders_clean",
+      "Silverorders_clean",
     ])
+    expect(within(graph).getByTitle("orders_clean").closest("a")?.getAttribute("href")).toBe("/pipelines/pl-clean")
     // Its neighbours open their own pages; the asset itself is not a link to itself.
     expect(within(graph).getByText("Postgres").closest("a")?.getAttribute("href")).toBe("/connectors/conn-pg/edit")
-    expect(within(graph).getByText("silver.orders_clean").closest("a")?.getAttribute("href")).toBe(
+    expect(within(graph).getByTitle("silver.orders_clean").closest("a")?.getAttribute("href")).toBe(
       "/data/assets/silver.orders_clean"
     )
-    expect(within(graph).getByText("bronze.demo_orders").closest("a")).toBeNull()
+    expect(within(graph).getByTitle("bronze.demo_orders").closest("a")).toBeNull()
     expect(fetchSpy.mock.calls.some((c) => String(c[0]).endsWith("?focus=bronze.demo_orders"))).toBe(true)
 
     expect(screen.getByText("Open lineage graph").closest("a")?.getAttribute("href")).toBe(
       "/lineage?focus=bronze.demo_orders"
     )
+    // What the graph cannot show is said under it.
+    expect(screen.getByText("only edges the platform recorded are drawn")).toBeTruthy()
     // The pipeline that reads it is a dependent, named by the edge's evidence.
     const dependents = screen.getByText("Dependents").closest("[data-slot=card]") as HTMLElement
     expect(within(dependents).getByText("orders_clean").closest("a")?.getAttribute("href")).toBe(
@@ -520,7 +530,23 @@ describe("Activity tab: usage and history", () => {
     stubApi()
     url.search = "tab=activity"
     renderTabs({ ...BRONZE, usage: { queries7d: 0, users7d: 0, avgLatencyMs: 0 } })
-    expect(screen.getByText("No queries in the last 7 days")).toBeTruthy()
+    expect(screen.getByText("No Query Studio or copilot query in the last 7 days")).toBeTruthy()
+    expect(screen.queryByText(/Not counted/)).toBeNull()
+  })
+
+  // A mart read only by dashboards said "No queries", as if nothing used it.
+  it("says which reads the count leaves out, when dashboards use the asset", () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({
+      ...BRONZE,
+      usage: { queries7d: 0, users7d: 0, avgLatencyMs: 0 },
+      dependents: [
+        { id: "default", name: "default", kind: "dashboard", detail: "2 charts" },
+        { id: "b_42", name: "Sales board", kind: "dashboard" },
+      ],
+    })
+    expect(screen.getByText("Not counted: reads by the 2 dashboards that use this asset.")).toBeTruthy()
   })
 })
 
@@ -732,6 +758,9 @@ describe("Sample tab", () => {
     renderTabs()
 
     const sizes = screen.getByRole("group", { name: "Rows to show" })
+    // Labelled, so the numbers read as a choice of how many rows to show.
+    expect(within(sizes).getByText("Rows")).toBeTruthy()
+    expect(within(sizes).getAllByRole("button").map((b) => b.textContent)).toEqual(["5", "25", "50", "100"])
     expect(within(sizes).getByText("5").getAttribute("aria-pressed")).toBe("true")
     expect(screen.getAllByRole("row")).toHaveLength(2)
     expect(fetchSpy.mock.calls.some((c) => String(c[0]).includes("/sample"))).toBe(false)
@@ -1010,5 +1039,259 @@ describe("Overview: storage, and saying things once", () => {
     const about = (await screen.findByText("About")).closest("[data-slot=card]") as HTMLElement
     expect(within(about).queryByText("Schema")).toBeNull()
     expect(within(about).getByText("Columns")).toBeTruthy()
+  })
+})
+
+describe("Lineage tab: related tables", () => {
+  const silver = { id: "silver.demo_orders", name: "silver.demo_orders" }
+  const graphWith = (nodes: { id: string; label: string; kind: string }[]) => ({
+    focus: "bronze.demo_orders",
+    nodes,
+    edges: [],
+    columnMappings: [],
+    supported: true,
+  })
+
+  it("leaves out a table the graph already draws, whose id there carries its kind", () => {
+    const asset = { ...BRONZE, downstream: [silver] }
+    const drawn = graphWith([
+      { id: "bronze:demo_orders", label: "bronze.demo_orders", kind: "focus" },
+      { id: "table:silver.demo_orders", label: "silver.demo_orders", kind: "silver" },
+    ])
+    expect(relatedTables(asset, drawn)).toEqual([])
+  })
+
+  it("lists a table the catalog relates to the asset when the graph does not record it", () => {
+    const asset = { ...BRONZE, downstream: [silver] }
+    const alone = graphWith([{ id: "bronze:demo_orders", label: "bronze.demo_orders", kind: "focus" }])
+    expect(relatedTables(asset, alone).map((t) => t.id)).toEqual(["silver.demo_orders"])
+    expect(relatedTables(asset, null).map((t) => t.id)).toEqual(["silver.demo_orders"])
+  })
+})
+
+describe("A Bronze dataset is shown as its own table", () => {
+  it("says nothing when the page reads the dataset's own Bronze table", async () => {
+    stubApi()
+    url.search = "tab=sample"
+    renderTabs({
+      ...BRONZE,
+      queryTarget: { engine: "clickhouse", table: "icecat_api.`bronze.demo_orders`", policyTable: "bronze.demo_orders" },
+    })
+
+    await screen.findByText("Sample rows")
+    expect(screen.queryByRole("note")).toBeNull()
+  })
+
+  it("says so when the Silver model stands in for a Bronze table that cannot be read", async () => {
+    stubApi()
+    url.search = "tab=sample"
+    renderTabs({
+      ...BRONZE,
+      queryTarget: { engine: "clickhouse", table: "silver.`demo_orders`", policyTable: "silver.demo_orders" },
+    })
+
+    const note = await screen.findByRole("note")
+    expect(note.textContent).toContain("Read from silver.demo_orders, this dataset's Silver model")
+  })
+
+  it("says the same above the columns, whose statistics come from that model", async () => {
+    stubApi()
+    url.search = "tab=schema"
+    renderTabs({
+      ...BRONZE,
+      queryTarget: { engine: "clickhouse", table: "silver.`demo_orders`", policyTable: "silver.demo_orders" },
+    })
+
+    expect((await screen.findByRole("note")).textContent).toContain("silver.demo_orders")
+  })
+
+  it("has no stand-in for a Silver asset, which is read as itself", async () => {
+    stubApi()
+    url.search = "tab=sample"
+    renderTabs({
+      ...BRONZE,
+      id: "silver.demo_orders",
+      type: "table",
+      layer: "silver",
+      tableName: undefined,
+      tableKey: "silver.demo_orders",
+      queryTarget: { engine: "clickhouse", table: "silver.`demo_orders`", policyTable: "silver.demo_orders" },
+    })
+
+    await screen.findByText("Sample rows")
+    expect(screen.queryByRole("note")).toBeNull()
+  })
+})
+
+describe("Schema tab: a wide table", () => {
+  const WIDE: AssetDetail = {
+    ...BRONZE,
+    tableName: undefined,
+    schema: Array.from({ length: 59 }, (_, i) => ({
+      name: `col_${String(i + 1).padStart(2, "0")}`,
+      dataType: "Nullable(String)",
+      ...(i === 40 ? { description: "Net weight in kilograms" } : {}),
+    })),
+  }
+  const columnRows = (card: HTMLElement) => within(card).getAllByRole("row").length - 1
+
+  it("shows the first 25 columns and says so, with the sizes that would cut this table short", async () => {
+    stubApi()
+    url.search = "tab=schema"
+    renderTabs(WIDE)
+
+    const card = (await screen.findByText("Columns")).closest("[data-slot=card]") as HTMLElement
+    expect(columnRows(card)).toBe(25)
+    expect(within(card).getByText("Showing the first 25 of 59 columns, in table order.")).toBeTruthy()
+    const sizes = within(card).getByRole("group", { name: "Columns to show" })
+    // 100 would be all 59, so it is not offered beside "All".
+    expect(within(sizes).getAllByRole("button").map((b) => b.textContent)).toEqual(["25", "50", "All"])
+
+    fireEvent.click(within(sizes).getByText("50"))
+    expect(columnRows(card)).toBe(50)
+    fireEvent.click(within(sizes).getByText("All"))
+    expect(columnRows(card)).toBe(59)
+    expect(within(card).getByText("59 columns, in table order.")).toBeTruthy()
+  })
+
+  it("filters columns by name or description, across the whole table", async () => {
+    stubApi()
+    url.search = "tab=schema"
+    renderTabs(WIDE)
+
+    const card = (await screen.findByText("Columns")).closest("[data-slot=card]") as HTMLElement
+    // col_41 is past the first 25, and is found by what it is described as.
+    fireEvent.change(within(card).getByLabelText("Filter columns"), { target: { value: "weight" } })
+    expect(columnRows(card)).toBe(1)
+    expect(within(card).getByText("col_41")).toBeTruthy()
+    expect(within(card).getByText('1 of 59 columns match "weight".')).toBeTruthy()
+
+    fireEvent.change(within(card).getByLabelText("Filter columns"), { target: { value: "nothing-like-this" } })
+    expect(within(card).getByText('No column matches "nothing-like-this"')).toBeTruthy()
+  })
+
+  it("offers neither control for a table that fits the first page", async () => {
+    stubApi()
+    url.search = "tab=schema"
+    renderTabs()
+
+    const card = (await screen.findByText("Columns")).closest("[data-slot=card]") as HTMLElement
+    expect(within(card).queryByRole("group", { name: "Columns to show" })).toBeNull()
+    expect(within(card).queryByLabelText("Filter columns")).toBeNull()
+  })
+})
+
+describe("Activity tab: taking a target back, and long lists", () => {
+  it("removes a freshness SLA, which could only be changed before", async () => {
+    const fetchSpy = stubApi()
+    const reloaded = mock(() => {})
+    url.search = "tab=activity"
+    renderTabs({ ...BRONZE, freshnessTargetSeconds: 172800, freshnessTargetSource: "sla" }, reloaded)
+
+    fireEvent.click(await screen.findByText("Change target"))
+    fireEvent.click(screen.getByRole("button", { name: "Remove target" }))
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)).toEqual([["DELETE", "/api/governance/sla/bronze.demo_orders", undefined]])
+  })
+
+  it("offers no removal for a target that is not an SLA", async () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({ ...BRONZE, freshnessTargetSeconds: 129600, freshnessTargetSource: "frequency" })
+
+    fireEvent.click(await screen.findByText("Set target"))
+    expect(screen.queryByRole("button", { name: "Remove target" })).toBeNull()
+  })
+
+  it("lists the newest ten changes of a long history, with the rest one click away", async () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({
+      ...BRONZE,
+      tableName: undefined,
+      changeHistory: Array.from({ length: 12 }, (_, i) => ({
+        id: `audit-${i}`,
+        at: `2026-09-${String(30 - i).padStart(2, "0")}T09:00:00Z`,
+        actor: "Rina",
+        summary: `Change number ${i + 1}`,
+      })),
+    })
+
+    const card = (await screen.findByText("Change history")).closest("[data-slot=card]") as HTMLElement
+    expect(within(card).getAllByRole("listitem")).toHaveLength(10)
+    expect(within(card).getByText(/Showing the newest 10 of 12\./)).toBeTruthy()
+    const sizes = within(card).getByRole("group", { name: "Changes to show" })
+    expect(within(sizes).getAllByRole("button").map((b) => b.textContent)).toEqual(["10", "All"])
+    fireEvent.click(within(sizes).getByText("All"))
+    expect(within(card).getAllByRole("listitem")).toHaveLength(12)
+  })
+
+  it("shows no size control for a short history", async () => {
+    stubApi()
+    url.search = "tab=activity"
+    renderTabs({ ...BRONZE, changeHistory: [{ id: "a1", at: "2026-09-30T09:00:00Z", actor: "Rina", summary: "Edited owner" }] })
+
+    await screen.findByText("Change history")
+    expect(screen.queryByRole("group", { name: "Changes to show" })).toBeNull()
+  })
+})
+
+describe("Access tab: taking a classification back", () => {
+  const CLASSIFIED: AssetDetail = {
+    ...BRONZE,
+    classification: "restricted",
+    classificationSource: "rule",
+    schema: [
+      { name: "amount", dataType: "Decimal(12, 2)", classification: "restricted" },
+      { name: "id", dataType: "Int64" },
+    ],
+    classificationRules: [
+      { id: "rule-asset", classification: "public" },
+      { id: "rule-amount", column: "amount", classification: "restricted" },
+    ],
+  }
+
+  it("removes the rule in force for a column, after saying what applies instead", async () => {
+    const fetchSpy = stubApi()
+    const reloaded = mock(() => {})
+    url.search = "tab=access"
+    renderTabs(CLASSIFIED, reloaded)
+
+    fireEvent.click(await screen.findByLabelText("Remove the classification of column amount"))
+    expect(screen.getByText("Remove the Restricted classification of column amount?")).toBeTruthy()
+    expect(screen.getByText(/An older rule for it applies again if there is one/)).toBeTruthy()
+    expect(writes(fetchSpy)).toEqual([])
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }))
+
+    await waitFor(() => expect(reloaded).toHaveBeenCalled())
+    expect(writes(fetchSpy)).toEqual([["DELETE", "/api/governance/classification/rule-amount", undefined]])
+  })
+
+  it("removes the asset's own rule by its own id", async () => {
+    const fetchSpy = stubApi()
+    url.search = "tab=access"
+    renderTabs(CLASSIFIED)
+
+    fireEvent.click(await screen.findByLabelText("Remove the classification of this asset"))
+    expect(screen.getByText("Remove the Public classification of this asset?")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }))
+    await waitFor(() =>
+      expect(writes(fetchSpy)).toEqual([["DELETE", "/api/governance/classification/rule-asset", undefined]])
+    )
+  })
+
+  it("offers no removal without governance:write, or for the default level", async () => {
+    stubApi({ permissions: ["catalog:read", "policy:read"] })
+    url.search = "tab=access"
+    renderTabs(CLASSIFIED)
+    await screen.findByText("Classification")
+    await waitFor(() => expect(screen.queryByLabelText(/Remove the classification/)).toBeNull())
+    cleanup()
+
+    stubApi()
+    renderTabs({ ...BRONZE, classificationRules: [] })
+    await screen.findByText("Classification")
+    expect(screen.queryByLabelText(/Remove the classification/)).toBeNull()
   })
 })

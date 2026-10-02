@@ -384,6 +384,14 @@ fn governance_static_router() -> Router<AppState> {
             "/api/governance/sla",
             get(governance::get_sla).put(governance::put_sla),
         )
+        .route(
+            "/api/governance/sla/{table}",
+            axum::routing::delete(governance::delete_sla),
+        )
+        .route(
+            "/api/governance/classification/{id}",
+            axum::routing::delete(governance::delete_classification_rule),
+        )
 }
 
 /// The `/api/catalog/{id}/access-request` +

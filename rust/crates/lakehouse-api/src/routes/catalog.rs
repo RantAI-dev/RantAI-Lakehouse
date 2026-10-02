@@ -220,7 +220,7 @@ pub async fn list(
         Ok(None) => {}
         Err(err) => return ApiRejection(err).into_response(),
     }
-    match list_body(&state.clickhouse).await {
+    match list_body(&state.clickhouse, state.config.iceberg_query_db.is_some()).await {
         Ok((mut body, bronze_pairs)) => {
             apply_sla_targets(&state, &mut body, &bronze_pairs).await;
             enrich_bronze_assets(&state, &mut body, bronze_pairs.clone()).await;
@@ -334,7 +334,8 @@ pub async fn query(
     let group_by = catalog_query::parse_group_by(params.group_by.as_deref())?;
     let join = catalog_query::JoinOperator::parse(params.join_operator.as_deref());
 
-    let (mut body, bronze_pairs) = match list_body(&state.clickhouse).await {
+    let listed = list_body(&state.clickhouse, state.config.iceberg_query_db.is_some()).await;
+    let (mut body, bronze_pairs) = match listed {
         Ok(v) => v,
         // Matches `list`'s contract: the catalog being unreachable is a
         // 503 with an empty result, not a 500.
@@ -464,7 +465,17 @@ fn filter_assets_by_query(assets: &[Value], q: &str, annotations: &[AnnotationRo
 /// Returns the catalog body plus every Bronze row's `(slug, table_name)`
 /// pair, straight from the `cat` registry rows — `list` hands these to
 /// [`enrich_bronze_assets`] rather than re-deriving slugs from table names.
-async fn list_body(ch: &ChClient) -> Result<(Value, Vec<(String, String)>), ChError> {
+///
+/// `bronze_is_readable` says whether this deployment can read a Bronze
+/// table itself (`Config::iceberg_query_db`). When it can, a Bronze
+/// dataset's page shows the Bronze table and the Silver model of the same
+/// name is listed as the asset it is. When it cannot, the dataset's page
+/// reads that Silver model (`catalog_source`), and the model stays folded
+/// into the dataset rather than listed beside it as a second copy.
+async fn list_body(
+    ch: &ChClient,
+    bronze_is_readable: bool,
+) -> Result<(Value, Vec<(String, String)>), ChError> {
     let cat = ch
         .rows(
             "SELECT slug, title, description, tier, updated_at, table_name,
@@ -599,7 +610,7 @@ async fn list_body(ch: &ChClient) -> Result<(Value, Vec<(String, String)>), ChEr
         let name = str_col(t, "name");
         let engine = str_col(t, "engine");
         if db == "silver" {
-            if bronze_table_names.contains(name) {
+            if !lists_silver_table(bronze_table_names.contains(name), bronze_is_readable) {
                 continue;
             }
             assets.push(silver_catalog_row(
@@ -1449,6 +1460,23 @@ async fn mark_badges(state: &AppState, body: &mut Value, names: &[String]) {
         .cloned()
         .unwrap_or_default();
     set_badges(body, &classified, &checks);
+    // The rules behind the classification, each removable by its id.
+    let in_force: Vec<Value> = classified
+        .in_force
+        .iter()
+        .map(|(id, column, level)| {
+            let mut rule = Map::new();
+            rule.insert("id".to_owned(), json!(id));
+            if let Some(column) = column {
+                rule.insert("column".to_owned(), json!(column));
+            }
+            rule.insert("classification".to_owned(), json!(level));
+            Value::Object(rule)
+        })
+        .collect();
+    if let Some(o) = body.as_object_mut() {
+        o.insert("classificationRules".to_owned(), Value::Array(in_force));
+    }
 }
 
 /// [`set_badges`] for every row of a list body, from one load of the
@@ -1740,6 +1768,12 @@ async fn clickhouse_asset_detail(
                 source.columns.len(),
             ),
         );
+        if db == "silver" {
+            o.insert(
+                "upstream".to_owned(),
+                json!(bronze_upstream(ch, &table).await),
+            );
+        }
     }
     mark_sample_restricted(&mut body, principal);
     mark_query_table(&mut body, Some(&source));
@@ -1825,11 +1859,21 @@ async fn bronze_asset_detail_body(
     let mut cols = ch.rows(&cols_sql, None).await?;
 
     let table = str_col(sync, "table_name");
-    // Silver when it exists, else the Iceberg table itself (see
+    // The Bronze table itself, else the Silver model of the same name (see
     // `catalog_source`). A lookup failure only costs the sample.
     let source = catalog_source::bronze_source(state, table)
         .await
         .unwrap_or_default();
+    // The Silver model is the dataset's downstream whether or not this
+    // page reads from it.
+    let has_silver = match source.as_ref() {
+        Some(s) if s.kind == SourceKind::ClickHouse => true,
+        _ => catalog_source::clickhouse_source(ch, "silver", table)
+            .await
+            .ok()
+            .flatten()
+            .is_some(),
+    };
     let (sample, masked) =
         governed_sample(state, principal, source.as_ref(), DETAIL_SAMPLE_ROWS).await;
     // Declared types from whichever table was found; the registry's own
@@ -1894,7 +1938,7 @@ async fn bronze_asset_detail_body(
     let description = str_col(sync, "description");
     let updated_at = str_col(sync, "updated_at");
 
-    let downstream = silver_downstream(table, source.as_ref());
+    let downstream = silver_downstream(table, has_silver);
 
     let col_count = cols.len();
     let mut body = bronze_detail_body(
@@ -1931,9 +1975,9 @@ async fn bronze_asset_detail_body(
     {
         set_freshness_target(&mut body, seconds, "frequency");
     }
-    // The dataset is its Bronze table and, when one exists, the Silver
-    // table its rows are read from: a policy or a check on either governs
-    // what this page shows.
+    // The dataset is its Bronze table and, when that cannot be read, the
+    // Silver model its rows are read from instead: a policy or a check on
+    // either governs what this page shows.
     let mut tables = Vec::new();
     if !table.is_empty() {
         tables.push(format!("bronze.{table}"));
@@ -1954,18 +1998,45 @@ async fn bronze_asset_detail_body(
     Ok(Some(body))
 }
 
-/// The Silver table built from a Bronze dataset, as its one downstream —
-/// only when `silver.<table>` exists, which is exactly when
-/// [`catalog_source::bronze_source`] resolved to it. This used to be
-/// listed for every non-sekunder dataset whether or not the table was
-/// there, so the Lineage tab linked to an asset that answered 404.
-fn silver_downstream(table: &str, source: Option<&ReadSource>) -> Vec<Value> {
-    match source {
-        Some(s) if s.kind == SourceKind::ClickHouse => {
-            vec![json!({ "id": format!("silver.{table}"), "name": format!("silver.{table}") })]
-        }
-        _ => Vec::new(),
+/// Whether the catalog list shows a Silver table as a row of its own. One
+/// that is the model of a Bronze dataset (`models_a_bronze_dataset`) is
+/// folded into that dataset only where the dataset's page reads the model
+/// — see [`list_body`].
+fn lists_silver_table(models_a_bronze_dataset: bool, bronze_is_readable: bool) -> bool {
+    bronze_is_readable || !models_a_bronze_dataset
+}
+
+/// The Silver model built from a Bronze dataset, as its one downstream —
+/// only when `silver.<table>` exists. This used to be listed for every
+/// non-sekunder dataset whether or not the table was there, so the
+/// Lineage tab linked to an asset that answered 404.
+fn silver_downstream(table: &str, has_silver: bool) -> Vec<Value> {
+    if has_silver {
+        vec![json!({ "id": format!("silver.{table}"), "name": format!("silver.{table}") })]
+    } else {
+        Vec::new()
     }
+}
+
+/// The Bronze dataset a Silver model is built from: the registry row whose
+/// `table_name` is the model's own name, as the model's one upstream —
+/// the other end of [`silver_downstream`]. Empty when the registry has no
+/// such row, or could not be read: that costs the link, never the page.
+async fn bronze_upstream(ch: &ChClient, table: &str) -> Vec<Value> {
+    let name = SqlLiteral::from(table);
+    let sql = format!(
+        "SELECT slug FROM lake.`bronze_meta.dataset_catalog` WHERE table_name = {name}
+         UNION ALL
+         SELECT slug FROM lake.`bronze_meta_sec.dataset_catalog` WHERE table_name = {name}
+         LIMIT 1"
+    );
+    ch.rows(&sql, None)
+        .await
+        .ok()
+        .and_then(|rows| rows.first().map(|r| str_col(r, "slug").to_owned()))
+        .filter(|slug| !slug.is_empty())
+        .map(|slug| vec![json!({ "id": slug, "name": format!("bronze.{table}") })])
+        .unwrap_or_default()
 }
 
 /// `sizeBytes`/`freshnessLagSeconds` on a Bronze detail body from its
@@ -2919,6 +2990,11 @@ mod tests {
             level: "restricted".to_owned(),
             from_rule: true,
             columns: vec![("email".to_owned(), "restricted".to_owned())],
+            in_force: vec![(
+                "rule-1".to_owned(),
+                Some("email".to_owned()),
+                "restricted".to_owned(),
+            )],
         };
         let checks = [json!({ "name": "id_unique", "status": "failed", "severity": "high" })];
         set_badges(&mut row, &classified, &checks);
@@ -2994,31 +3070,24 @@ mod tests {
         assert_eq!(skewed.lag_seconds, None);
     }
 
-    fn read_source(kind: SourceKind, from: &str, key: &str) -> ReadSource {
-        ReadSource {
-            from: from.to_owned(),
-            policy_key: key.to_owned(),
-            kind,
-            columns: Vec::new(),
-        }
-    }
-
-    /// The Silver table is a Bronze dataset's downstream only when it
-    /// exists — i.e. when the read resolved to it rather than to Iceberg.
+    /// The Silver model is a Bronze dataset's downstream only when it
+    /// exists — whichever of the two tables the page reads.
     #[test]
     fn silver_downstream_only_when_the_silver_table_exists() {
-        let silver = read_source(SourceKind::ClickHouse, "silver.`orders`", "silver.orders");
         assert_eq!(
-            silver_downstream("orders", Some(&silver)),
+            silver_downstream("orders", true),
             vec![json!({ "id": "silver.orders", "name": "silver.orders" })]
         );
-        let iceberg = read_source(
-            SourceKind::Iceberg,
-            "icecat_api.`bronze.orders`",
-            "bronze.orders",
-        );
-        assert!(silver_downstream("orders", Some(&iceberg)).is_empty());
-        assert!(silver_downstream("orders", None).is_empty());
+        assert!(silver_downstream("orders", false).is_empty());
+
+        // A Silver model is listed as its own asset once Bronze itself is
+        // readable; on a deployment where it is not, the dataset's page IS
+        // the model, and listing it too would show one table twice.
+        assert!(lists_silver_table(true, true));
+        assert!(!lists_silver_table(true, false));
+        // A Silver table with no Bronze dataset of its name is always listed.
+        assert!(lists_silver_table(false, true));
+        assert!(lists_silver_table(false, false));
     }
 
     // WS1 task 1.9 — usage was three hardcoded zeros (nothing counts

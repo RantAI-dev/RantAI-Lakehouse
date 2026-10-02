@@ -583,6 +583,31 @@ pub async fn create_classification_rule(
     Ok(row.into())
 }
 
+/// Delete the classification rule `id`, returning it — so the caller can
+/// say what stopped applying — or `None` when no rule has that id
+/// (including an id that is not a UUID at all). An older rule for the same
+/// asset or column, if there is one, is what classifies it from then on.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the delete fails.
+pub async fn delete_classification_rule(
+    pool: &PgPool,
+    id: &str,
+) -> Result<Option<ClassificationRule>, StoreError> {
+    let Ok(id) = Uuid::parse_str(id) else {
+        return Ok(None);
+    };
+    let row: Option<ClassificationRuleRow> = sqlx::query_as(
+        "DELETE FROM classification_rule WHERE id = $1 \
+         RETURNING id, asset, column_name, classification, confidence, review_status, masking_rule",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(ClassificationRule::from))
+}
+
 // ── Residency rule (create only — see module doc comment) ──────────────
 
 /// An authored residency rule. Mirrors `ResidencyRule` in
@@ -743,6 +768,26 @@ pub async fn upsert_dataset_sla(
     .bind(input.expected_interval_minutes)
     .bind(&input.owner)
     .fetch_one(pool)
+    .await
+    .map_err(StoreError::from)
+}
+
+/// Delete the SLA for `table_name`, returning it, or `None` when the table
+/// has none. The table then has no freshness target of its own again.
+///
+/// # Errors
+///
+/// Returns [`StoreError::Database`] if the delete fails.
+pub async fn delete_dataset_sla(
+    pool: &PgPool,
+    table_name: &str,
+) -> Result<Option<DatasetSla>, StoreError> {
+    sqlx::query_as(
+        "DELETE FROM dataset_sla WHERE table_name = $1 \
+         RETURNING table_name, expected_interval_minutes, owner",
+    )
+    .bind(table_name)
+    .fetch_optional(pool)
     .await
     .map_err(StoreError::from)
 }

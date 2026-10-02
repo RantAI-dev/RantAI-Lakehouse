@@ -3,11 +3,16 @@
 //! the column profile (`catalog_profile`).
 //!
 //! A `silver.*`/`serving.*` id is its own `ClickHouse` table. A Bronze
-//! registry slug is read from `silver.<table_name>` when that table exists
-//! (what the detail sample always read), and otherwise from its Iceberg
-//! table `bronze.<table_name>` through the `DataLakeCatalog` database
-//! `Config::iceberg_query_db` names — the only path to an Iceberg-only
-//! dataset.
+//! registry slug is read from its own Iceberg table `bronze.<table_name>`,
+//! through the `DataLakeCatalog` database `Config::iceberg_query_db`
+//! names. Only when that table cannot be read — the deployment has no
+//! such database, or the registry row names no Iceberg table — is it read
+//! from `silver.<table_name>`, the Silver model of the same name.
+//!
+//! It used to be the other way round: Silver whenever it existed. A
+//! Bronze page then listed the Bronze table's columns beside statistics,
+//! sample rows and a starter query of a different table — a Silver model
+//! is deduplicated and keeps only the columns it conforms.
 //!
 //! Every name that reaches SQL here is an [`Ident`], and every
 //! [`ReadSource`] carries the policy key the enforcement rewrite binds the
@@ -101,17 +106,17 @@ pub(crate) async fn clickhouse_source(
     }))
 }
 
-/// A Bronze dataset whose registry `table_name` is `table`: its Silver
-/// table when there is one, else its Iceberg table when this deployment
-/// has an Iceberg query database and the table exists there.
+/// A Bronze dataset whose registry `table_name` is `table`: its own
+/// Iceberg table when this deployment can read it, else the Silver table
+/// of the same name when there is one (see the module comment).
 pub(crate) async fn bronze_source(
     state: &AppState,
     table: &str,
 ) -> Result<Option<ReadSource>, ChError> {
-    if let Some(silver) = clickhouse_source(&state.clickhouse, "silver", table).await? {
-        return Ok(Some(silver));
+    if let Some(bronze) = iceberg_source(state, table).await {
+        return Ok(Some(bronze));
     }
-    Ok(iceberg_source(state, table).await)
+    clickhouse_source(&state.clickhouse, "silver", table).await
 }
 
 /// The Bronze Iceberg table `bronze.<table>` itself, when this deployment
@@ -190,13 +195,25 @@ mod tests {
         assert_eq!(source.columns, vec![("id".to_owned(), "Int64".to_owned())]);
     }
 
-    /// A Silver table still wins, exactly as the detail sample always read.
+    /// A Bronze dataset is read from its own table even when a Silver
+    /// model of the same name exists: the model has other columns and
+    /// other rows, and is an asset of its own.
     #[tokio::test]
-    async fn a_silver_table_is_preferred() {
+    async fn the_bronze_table_is_read_even_when_a_silver_model_exists() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(body_string_contains("system.columns"))
             .respond_with(rows(&json!([{"name": "id", "type": "UInt64"}])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains(
+                "DESCRIBE TABLE icecat_api.`bronze.orders`",
+            ))
+            .respond_with(rows(&json!([
+                {"name": "id", "type": "Int64"},
+                {"name": "note", "type": "Nullable(String)"},
+            ])))
             .mount(&server)
             .await;
 
@@ -205,8 +222,36 @@ mod tests {
             .unwrap()
             .expect("resolved");
 
-        assert_eq!(source.from, "silver.`orders`");
-        assert_eq!(source.kind, SourceKind::ClickHouse);
+        assert_eq!(source.from, "icecat_api.`bronze.orders`");
+        assert_eq!(source.policy_key, "bronze.orders");
+        assert_eq!(source.kind, SourceKind::Iceberg);
+        assert_eq!(source.columns.len(), 2);
+    }
+
+    /// The Silver model is what is left when the Bronze table cannot be
+    /// read: no such table in the query database, or no query database.
+    #[tokio::test]
+    async fn the_silver_model_is_the_fallback_when_bronze_cannot_be_read() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("system.columns"))
+            .respond_with(rows(&json!([{"name": "id", "type": "UInt64"}])))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("DESCRIBE TABLE"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("UNKNOWN_TABLE"))
+            .mount(&server)
+            .await;
+
+        for iceberg_db in [Some("icecat_api"), None] {
+            let source = bronze_source(&state(&server.uri(), iceberg_db), "orders")
+                .await
+                .unwrap()
+                .expect("resolved");
+            assert_eq!(source.from, "silver.`orders`", "{iceberg_db:?}");
+            assert_eq!(source.kind, SourceKind::ClickHouse);
+        }
     }
 
     /// Without a configured query database there is no Iceberg path, and
