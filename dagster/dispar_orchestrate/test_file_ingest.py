@@ -20,6 +20,7 @@ from __future__ import annotations
 import csv
 import dataclasses
 import inspect
+import itertools
 import json
 import random
 from pathlib import Path
@@ -35,10 +36,12 @@ from dispar_orchestrate.definitions import defs
 from dispar_orchestrate.file_ingest import (
     CONFIG_SCHEMA,
     FAILURE_REASONS,
+    HEADER_NO_COLUMNS,
     HEADER_PAST_END,
     LOAD_FAILED,
     NO_ROWS,
     NOT_REGISTERED,
+    TABLE_NAME,
     TOO_MANY_ROWS,
     UNREADABLE,
     FileIngestParams,
@@ -47,6 +50,7 @@ from dispar_orchestrate.file_ingest import (
     _checked_key,
     _column_names,
     _decode,
+    _dlt_keeps_table_name,
     file_ingest_job,
     parse_file,
     read_stored_object,
@@ -210,6 +214,15 @@ def test_the_failure_reasons_equal_the_shared_fixture_file_the_api_is_tested_aga
     assert list(FAILURE_REASONS) == json.loads(REASONS_FILE.read_text(encoding="utf-8"))
 
 
+def test_there_are_seven_different_failure_reasons_among_them_the_header_row_with_no_columns():
+    # Review finding C2 made it seven: a header row with no columns has a
+    # sentence of its own. The API counts the same seven against the same file.
+    in_file = json.loads(REASONS_FILE.read_text(encoding="utf-8"))
+    assert len(FAILURE_REASONS) == len(set(FAILURE_REASONS)) == len(in_file) == 7
+    assert HEADER_NO_COLUMNS == "The header row has no columns."
+    assert HEADER_NO_COLUMNS != HEADER_PAST_END
+
+
 def test_the_row_cap_in_the_sentence_is_the_row_cap_the_job_enforces():
     assert file_ingest.MAX_ROWS == 2_000_000
     assert f"{file_ingest.MAX_ROWS:,}" in TOO_MANY_ROWS
@@ -313,6 +326,10 @@ def test_the_header_row_counts_records_blank_ones_included():
     with pytest.raises(LoadFailure) as past:
         parse_file(text, ",", 4)
     assert past.value.reason == HEADER_PAST_END
+    for empty in (0, 1):  # the two empty records are records, with no cells in them
+        with pytest.raises(LoadFailure) as none:
+            parse_file(text, ",", empty)
+        assert none.value.reason == HEADER_NO_COLUMNS
 
 
 def test_a_header_past_the_end_of_the_file_is_that_failure():
@@ -322,11 +339,21 @@ def test_a_header_past_the_end_of_the_file_is_that_failure():
         assert caught.value.reason == HEADER_PAST_END
 
 
-def test_a_header_record_with_no_cells_is_the_same_failure_as_one_past_the_end():
-    # The preview answers both with an empty `columns`.
-    with pytest.raises(LoadFailure) as caught:
-        parse_file("\nid\n1\n", ",", 0)
-    assert caught.value.reason == HEADER_PAST_END
+def test_a_header_record_with_no_cells_has_a_sentence_of_its_own_and_is_not_one_past_the_end():
+    # Review finding C2. The preview answers both with an empty `columns`; the
+    # load says which one it is, because a record IS there in the first case.
+    for text, header_row in [("\nid\n1\n", 0), ("id\n\n1\n", 1), ("a,b\n1,2\n\n", 2)]:
+        with pytest.raises(LoadFailure) as caught:
+            parse_file(text, ",", header_row)
+        assert caught.value.reason == HEADER_NO_COLUMNS, (text, header_row)
+        assert isinstance(caught.value.__cause__, ValueError)  # what was wrong, for the run log
+    # Its neighbours keep their own: a record with a cell, and a record that is not there.
+    assert parse_file("\nid\n1\n", ",", 1).columns == ["id"]
+    with pytest.raises(LoadFailure) as past:
+        parse_file("\nid\n1\n", ",", 3)
+    assert past.value.reason == HEADER_PAST_END
+    # A cell that is only whitespace is a cell: the column gets a name, as before.
+    assert parse_file(" \nx\n", ",", 0).columns == ["col_0"]
 
 
 @pytest.mark.parametrize("text", ["a,b\n", "a,b\n\n  \n,\n", "a,b"])
@@ -495,19 +522,112 @@ def test_a_launch_the_api_would_not_have_sent_fails_before_anything_is_read(over
     assert failure.__cause__ is not None  # what was wrong, for the run log
 
 
-@pytest.mark.parametrize("table", ["orders", "g9_upload_0a1b2c3d", "t1", "a_b", "_x", "a__b", "a___b", "q1_2", "t" * 128])
-def test_a_table_name_dlt_keeps_is_accepted(table):
+# The table name, review finding C1. The rule is the API's
+# (`routes::uploads::table_name_problem`): a lower-case letter, then groups of
+# lower-case letters and digits joined by single underscores, at most 128
+# characters. The two sides' tests use the plan's names alike.
+
+
+@pytest.mark.parametrize(
+    "table",
+    ["a", "a1", "a_1", "sap_material_master", "orders", "g9_upload_0a1b2c3d", "t1", "a_b", "q1_2", "t" * 128],
+)
+def test_a_table_name_that_follows_the_upload_rule_is_loaded(table):
     harness = _Harness()
     harness.run(_params(bronze_table_name=table))
     assert harness.loads[0]["table"] == table
 
 
-@pytest.mark.parametrize("table", ["x_", "__x", "a__", "s__1", "q1__2", "_", "__", "___", "_a_", "a_1_"])
-def test_a_table_name_the_api_admits_but_dlt_would_write_under_another_name_is_refused(table):
-    # The sink would put the rows in a table nobody asked for (`x_` as `xx`).
+@pytest.mark.parametrize(
+    "table",
+    [
+        # The plan's refusals.
+        "x_",
+        "_x",
+        "a__b",
+        "1a",
+        "Orders",
+        "t" * 129,
+        # What the rule before C1 admitted: dlt keeps `_x`, `a__b` and `a___b`
+        # and renames the rest (`x_` as `xx`, `__x` as `x`, `s__1` as `s___1`).
+        "a___b",
+        "__x",
+        "a__",
+        "s__1",
+        "q1__2",
+        "_",
+        "__",
+        "___",
+        "_a_",
+        "a_1_",
+        "_staging",
+        # Never valid: the pattern has to match the whole name, not a prefix.
+        "",
+        "orders 2025",
+        "orders-raw",
+        "orders\n",
+        "orders`; DROP TABLE x",
+    ],
+)
+def test_a_table_name_that_breaks_the_upload_rule_is_refused_before_dlt_is_asked(table, monkeypatch):
+    asked: list[str] = []
+    monkeypatch.setattr(file_ingest, "_dlt_keeps_table_name", lambda name: asked.append(name) or True)
     harness = _Harness()
-    _fails_with(harness, LOAD_FAILED, _params(bronze_table_name=table))
+    failure = _fails_with(harness, LOAD_FAILED, _params(bronze_table_name=table))
+    assert harness.reads == [] and harness.loads == [] and harness.registered == []
+    assert [row["error"] for row in harness.recorded] == [LOAD_FAILED]
+    assert asked == [], "the pattern refused it; dlt is only asked about a name that passed"
+    assert "single underscores" in str(failure.__cause__)  # the pattern's problem, in the run log
+
+
+def test_a_name_that_passes_the_pattern_is_still_refused_when_dlt_would_write_it_under_another_name(monkeypatch):
+    # The guard behind the pattern. With this dlt it never refuses a name the
+    # pattern admits (the enumeration below), so it is driven by one that does.
+    asked: list[str] = []
+
+    def renames(name: str) -> bool:
+        asked.append(name)
+        return False
+
+    monkeypatch.setattr(file_ingest, "_dlt_keeps_table_name", renames)
+    harness = _Harness()
+    failure = _fails_with(harness, LOAD_FAILED, _params(bronze_table_name="orders"))
+    assert asked == ["orders"]
+    assert "dlt would write under another one" in str(failure.__cause__)
     assert harness.reads == [] and harness.loads == []
+
+
+@pytest.mark.parametrize("table", ["orders", "a_1", "sap_material_master", "_x", "a__b", "a___b"])
+def test_dlt_keeps_a_name_its_naming_leaves_alone(table):
+    # `_x`, `a__b` and `a___b` are kept by dlt and still refused by the upload
+    # rule, which is a sentence a person can follow and not dlt's own.
+    assert _dlt_keeps_table_name(table) is True
+
+
+@pytest.mark.parametrize("table", ["x_", "__x", "a__", "s__1", "q1__2", "_", "__", "___", "_a_", "a_1_"])
+def test_dlt_would_write_these_names_under_another_one(table):
+    # Measured with dlt 1.30.0: `x_` becomes `xx`, `__x` becomes `x`, `s__1`
+    # becomes `s___1`; the rows would land in a table nobody asked for.
+    assert _dlt_keeps_table_name(table) is False
+
+
+def test_no_short_name_the_upload_rule_admits_is_renamed_by_dlt():
+    # What makes the rule worth having: everything it admits is what dlt keeps.
+    # Every name of up to nine characters over `a`, `1` and `_`, which holds the
+    # cases that went wrong before (a trailing `_`, a doubled `_`, a digit after
+    # `__`). The reviewer put 59,052 names through the same question on
+    # 2026-10-02 (plan section 9, review of slice C). The naming is built once:
+    # `_dlt_keeps_table_name` builds a schema per call, which is right for one
+    # call per run and too slow for thousands.
+    naming = dlt.Schema("upload").naming
+    admitted = 0
+    for length in range(1, 10):
+        for characters in itertools.product("a1_", repeat=length):
+            name = "".join(characters)
+            if TABLE_NAME.fullmatch(name):
+                admitted += 1
+                assert naming.normalize_tables_path(name) == name, name
+    assert admitted == 3861  # the count over this alphabet, so the loop cannot quietly check nothing
 
 
 def test_every_launch_field_is_required_in_the_op_config_and_the_params_have_no_other():
@@ -630,6 +750,8 @@ def test_an_object_that_cannot_be_read_records_the_unreadable_reason_and_keeps_t
     "raw,params,reason",
     [
         (b"a,b\n1,2\n", {"header_row": 5}, HEADER_PAST_END),
+        (b"\nid\n1\n", {}, HEADER_NO_COLUMNS),  # review finding C2
+        (b"id\n\n1\n", {"header_row": 1}, HEADER_NO_COLUMNS),
         (b"a,b\n\n \n", {}, NO_ROWS),
         (b"a,b\n", {}, NO_ROWS),
     ],
@@ -700,6 +822,7 @@ def test_every_failure_leaves_one_row_and_its_error_is_always_one_of_the_closed_
     scenarios = [
         _Harness(read_error=OSError("x")),
         _Harness(raw=b"a\n"),
+        _Harness(raw=b"\nid\n1\n"),  # a header row with no columns (review finding C2)
         _Harness(load_error=RuntimeError("x")),
         _Harness(register_error=RuntimeError("x")),
     ]

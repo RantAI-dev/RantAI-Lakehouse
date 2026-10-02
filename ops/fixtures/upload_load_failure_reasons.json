@@ -1,6 +1,7 @@
 [
   "The stored file could not be read.",
   "The header row is past the end of the file.",
+  "The header row has no columns.",
   "The file has no rows below the header row.",
   "The file has more than 2,000,000 rows.",
   "The load into the table failed.",

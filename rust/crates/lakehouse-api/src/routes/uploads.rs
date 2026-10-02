@@ -39,8 +39,8 @@
 //!   error reaches a response only as the store's own fixed `database error`.
 //!   The one piece of recorded text a response can carry is a reason
 //!   `file_ingest_job` wrote into `ingest_run`, and only when it is one of the
-//!   six the API knows ([`JOB_FAILURE_REASONS`], review finding B6); anything
-//!   else the job recorded is shown as [`LOAD_FAILED`].
+//!   seven the API knows ([`JOB_FAILURE_REASONS`], review findings B6 and C2);
+//!   anything else the job recorded is shown as [`LOAD_FAILED`].
 //! * **Fail closed on a table name.** A load may target a table that does not
 //!   exist or one this tenant's uploads claimed; never a connector's table,
 //!   never anything else. Who owns a name is the claim table's to say
@@ -70,7 +70,6 @@ use axum::response::Response;
 use lakehouse_auth::Principal;
 use lakehouse_clickhouse::ChError;
 use lakehouse_core::ApiError;
-use lakehouse_core::ident::Ident;
 use lakehouse_dagster::map_run_status;
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
@@ -169,7 +168,10 @@ const PARQUET: &str =
 const OTHER_BINARY: &str =
     "This is not a delimited text file. Only delimited text files (CSV, TSV) can be uploaded.";
 const BODY_NOT_AN_OBJECT: &str = "The request body must be a JSON object.";
-const TABLE_NAME_RULE: &str = "Table names use lower-case letters, digits and _ only, do not start with a digit, and have at most 128 characters.";
+/// The sentence for a table name [`table_name_problem`] refuses, in words a
+/// person can follow (review finding C1). T10's `tableNameProblem` in the
+/// console must say the same one; it does not exist yet.
+const TABLE_NAME_RULE: &str = "Table names start with a lower-case letter and use lower-case letters and digits joined by single underscores, with at most 128 characters.";
 const MODE_RULE: &str = "mode must be replace or append.";
 const ENCODING_RULE: &str = "encoding must be utf-8 or utf-16.";
 const DELIMITER_RULE: &str = "delimiter must be a comma, a semicolon, a tab or a pipe.";
@@ -209,14 +211,17 @@ const LOAD_FAILED: &str = "The load failed.";
 const RUN_UNKNOWN: &str = "The orchestrator no longer knows this load.";
 
 // The reasons `file_ingest_job` records when a load fails (plan T7). The API
-// shows a recorded reason only when it is one of these six (review finding
+// shows a recorded reason only when it is one of these seven (review finding
 // B6): `ingest_run.error` is free text, so one `str(exc)` in the job would
 // otherwise put exception text, a host or a path into a response. These are
-// the same six as `ops/fixtures/upload_load_failure_reasons.json`, which a
+// the same seven as `ops/fixtures/upload_load_failure_reasons.json`, which a
 // test below reads and which the job's own tests assert its constants against.
 
 const JOB_FILE_UNREADABLE: &str = "The stored file could not be read.";
 const JOB_HEADER_PAST_END: &str = "The header row is past the end of the file.";
+// Review finding C2: a record at the header row that has no cells (an empty
+// line chosen as the header) used to be recorded as "past the end".
+const JOB_HEADER_NO_COLUMNS: &str = "The header row has no columns.";
 const JOB_NO_ROWS: &str = "The file has no rows below the header row.";
 const JOB_TOO_MANY_ROWS: &str = "The file has more than 2,000,000 rows.";
 const JOB_LOAD_FAILED: &str = "The load into the table failed.";
@@ -224,9 +229,10 @@ const JOB_NOT_REGISTERED: &str = "The table was loaded but could not be register
 
 /// Every reason the job may record, in the order of
 /// `ops/fixtures/upload_load_failure_reasons.json`.
-const JOB_FAILURE_REASONS: [&str; 6] = [
+const JOB_FAILURE_REASONS: [&str; 7] = [
     JOB_FILE_UNREADABLE,
     JOB_HEADER_PAST_END,
+    JOB_HEADER_NO_COLUMNS,
     JOB_NO_ROWS,
     JOB_TOO_MANY_ROWS,
     JOB_LOAD_FAILED,
@@ -958,14 +964,47 @@ struct IngestRequest {
     header_row: u64,
 }
 
-/// Why a raw table name is refused, or `None`: the rule the console's
-/// `targetProblem` applies (`^[a-z_][a-z0-9_]*$`), plus a length bound. The
-/// shared [`Ident`] is the lexical check; lower-case only is the rule for a
-/// raw table, which the name is not folded into: `Orders` is refused, not
-/// loaded as `orders`.
+/// Why a raw table name is refused, or `None` (review finding C1).
+///
+/// The rule is `^[a-z][a-z0-9]*(_[a-z0-9]+)*$` and at most
+/// [`MAX_TABLE_NAME_CHARS`] characters: a lower-case ASCII letter first, then
+/// lower-case ASCII letters and digits in groups joined by single
+/// underscores, so no leading, trailing or doubled `_`. It is checked below a
+/// character at a time, left to right, because this crate has no regex
+/// dependency to spend on it.
+///
+/// It is tighter than the console's rule for a connector's target
+/// (`^[a-z_][a-z0-9_]*$`, which connectors keep) because the writer renames
+/// some names that rule admits: `x_` is written as `xx`, `__x` as `x` and
+/// `s__1` as `s___1`. The rows then land in a table nobody asked for, and
+/// all the user would learn is that the load failed. Measured on 2026-10-02,
+/// the writer's naming changed none of the 59,052 names this rule admits
+/// (plan section 9, review of slice C); `file_ingest.py` keeps the writer's
+/// own question as a second line (`_dlt_keeps_table_name`). `Orders` is
+/// refused, not folded to `orders`.
+///
+/// The shared `Ident` is not asked as well: every name this rule admits is
+/// already one (ASCII letters, digits and `_`, no leading digit), so it would
+/// add no guarantee.
 fn table_name_problem(name: &str) -> Option<&'static str> {
-    let plain = Ident::new(name).is_ok() && !name.chars().any(|c| c.is_ascii_uppercase());
-    (!plain || name.len() > MAX_TABLE_NAME_CHARS).then_some(TABLE_NAME_RULE)
+    let mut previous: Option<char> = None;
+    for c in name.chars() {
+        let allowed = match previous {
+            None => c.is_ascii_lowercase(),
+            // After `_` only a letter or a digit: never `__`.
+            Some('_') => c.is_ascii_lowercase() || c.is_ascii_digit(),
+            Some(_) => c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_',
+        };
+        if !allowed {
+            return Some(TABLE_NAME_RULE);
+        }
+        previous = Some(c);
+    }
+    // An empty name never set `previous`, and one ending in `_` has an empty
+    // last group. Every character that got here is ASCII, so the byte length
+    // is the character count.
+    let ends_in_a_group = previous.is_some_and(|last| last != '_');
+    (!ends_in_a_group || name.len() > MAX_TABLE_NAME_CHARS).then_some(TABLE_NAME_RULE)
 }
 
 fn text_field<'a>(fields: &'a Map<String, Value>, name: &str) -> Result<&'a str, ApiError> {
@@ -1456,14 +1495,45 @@ mod tests {
 
     // ── the table name ──────────────────────────────────────────────────
 
+    /// Review finding C1: a lower-case letter, then groups of lower-case
+    /// letters and digits joined by single underscores. `_staging` was in the
+    /// accepted list before this finding; `_x`, `x_` and `a__b` are the names
+    /// the plan says must now be refused.
     #[test]
-    fn a_table_name_is_the_console_rule_and_is_never_folded_to_it() {
-        for ok in ["orders", "orders_raw", "_staging", "t2025", "a", "a_1_b"] {
+    fn a_table_name_is_a_lower_case_letter_then_groups_joined_by_single_underscores() {
+        for ok in [
+            "a",
+            "a1",
+            "a_1",
+            "sap_material_master",
+            "orders",
+            "orders_raw",
+            "t2025",
+            "a_1_b",
+            "g9_upload_0a1b2c3d",
+            "a1_b2_c3",
+        ] {
             assert_eq!(table_name_problem(ok), None, "{ok}");
         }
         for refused in [
-            "",
+            // The plan's refusals.
+            "x_",
+            "_x",
+            "a__b",
+            "1a",
             "Orders",
+            // What the rule before C1 admitted and the writer renames:
+            // `__x` as `x`, `s__1` as `s___1`, `a__` as `a`.
+            "__x",
+            "s__1",
+            "a__",
+            "_",
+            "__",
+            "_a_",
+            "a_1_",
+            "_staging",
+            // Never valid.
+            "",
             "orders 2025",
             "2025_orders",
             "orders-raw",
@@ -1472,7 +1542,9 @@ mod tests {
             "pesanan\u{e9}",
             " orders",
             "orders ",
+            "orders\n",
             "ORDERS",
+            "a\u{ff10}", // a fullwidth digit is not an ASCII digit
         ] {
             assert_eq!(
                 table_name_problem(refused),
@@ -1486,6 +1558,14 @@ mod tests {
     fn a_table_name_has_a_length_bound() {
         assert_eq!(table_name_problem(&"a".repeat(128)), None);
         assert_eq!(table_name_problem(&"a".repeat(129)), Some(TABLE_NAME_RULE));
+        // The bound counts the whole name, the underscores included.
+        let grouped = format!("{}_{}", "a".repeat(64), "b".repeat(63));
+        assert_eq!(grouped.len(), 128);
+        assert_eq!(table_name_problem(&grouped), None);
+        assert_eq!(
+            table_name_problem(&format!("{grouped}b")),
+            Some(TABLE_NAME_RULE)
+        );
     }
 
     // ── the ingest body ─────────────────────────────────────────────────
@@ -1577,6 +1657,31 @@ mod tests {
             assert_eq!(
                 refusal_of(&with("headerRow", header_row)),
                 "headerRow must be a whole number, 0 or more."
+            );
+        }
+    }
+
+    /// Review finding C1, through the validation the route runs: the names the
+    /// plan says must be refused get the plan's sentence, and the ones it says
+    /// must be accepted reach the request unchanged.
+    #[test]
+    fn the_ingest_body_refuses_and_accepts_the_table_names_the_plan_lists() {
+        let with_table = |table: &str| {
+            let mut v = valid();
+            v["bronzeTable"] = json!(table);
+            v
+        };
+        let longest = "a".repeat(128);
+        for ok in ["a", "a1", "a_1", "sap_material_master", longest.as_str()] {
+            let request = parse_ingest_request(&body(&with_table(ok))).unwrap();
+            assert_eq!(request.table, ok);
+        }
+        let too_long = "a".repeat(129);
+        for refused in ["x_", "_x", "a__b", "1a", "Orders", too_long.as_str()] {
+            assert_eq!(
+                refusal_of(&with_table(refused)),
+                "Table names start with a lower-case letter and use lower-case letters and digits joined by single underscores, with at most 128 characters.",
+                "{refused:?}"
             );
         }
     }
@@ -1685,6 +1790,49 @@ mod tests {
         }
     }
 
+    /// Review finding C3: `ended_after` reads what the job writes.
+    /// `ingest_run.ended_at` is a text column, so the API gets the characters
+    /// of Python's `datetime.now(timezone.utc).isoformat()` as they were
+    /// written: six digits of microseconds and `+00:00`, never `Z`, and no
+    /// fraction at all when the microsecond is 0. The route tests write `Z`
+    /// only. The claim's time is Postgres's `updated_at`, which has
+    /// microseconds too, so a result in the same second as the claim is
+    /// ordered by its fraction.
+    #[test]
+    fn a_timestamp_the_job_writes_is_read_to_the_microsecond() {
+        // `datetime(2026, 10, 2, 10, 0, 0, 123456, tzinfo=timezone.utc).isoformat()`
+        let written = "2026-10-02T10:00:00.123456+00:00";
+        for (claim, later) in [
+            ("2026-10-02T09:59:59.999999Z", true),
+            ("2026-10-02T10:00:00.123455Z", true),
+            ("2026-10-02T10:00:00.123456Z", false),
+            ("2026-10-02T10:00:00.123457Z", false),
+            ("2026-10-02T10:00:01Z", false),
+        ] {
+            assert_eq!(
+                ended_after(written, at(claim)),
+                later,
+                "{written} after {claim}"
+            );
+        }
+        // `datetime(2026, 10, 2, 10, 0, 5, 0, tzinfo=timezone.utc).isoformat()`:
+        // a whole second is written with no fraction.
+        let whole = "2026-10-02T10:00:05+00:00";
+        for (claim, later) in [
+            ("2026-10-02T10:00:04.999999Z", true),
+            ("2026-10-02T10:00:05Z", false),
+            ("2026-10-02T10:00:05.000001Z", false),
+        ] {
+            assert_eq!(
+                ended_after(whole, at(claim)),
+                later,
+                "{whole} after {claim}"
+            );
+        }
+        // `+00:00` and `Z` are one instant, to the microsecond.
+        assert_eq!(at(written), at("2026-10-02T10:00:00.123456Z"));
+    }
+
     fn result(status: &str, rows: Option<u64>, error: &str) -> IngestRunRow {
         IngestRunRow {
             connector_id: "upload:up-1".to_owned(),
@@ -1739,9 +1887,9 @@ mod tests {
     }
 
     /// Review finding B6: a recorded reason reaches a response only when it is
-    /// one of the six the API knows. Each of the six is kept; text that is
-    /// near one of them, text with detail added, and exception text are all
-    /// the fixed `The load failed.`.
+    /// one of the seven the API knows (six before finding C2). Each of the
+    /// seven is kept; text that is near one of them, text with detail added,
+    /// and exception text are all the fixed `The load failed.`.
     #[test]
     fn a_recorded_reason_is_shown_only_when_it_is_one_the_api_knows() {
         for known in JOB_FAILURE_REASONS {
@@ -1758,6 +1906,9 @@ mod tests {
             "the load into the table failed.",
             "The load into the table failed",
             "The stored file could not be read",
+            "The header row has no columns",
+            "the header row has no columns.",
+            "The header row is empty.",
             "The file has more than 2000000 rows.",
             "The load stopped before it recorded a result.",
             "x",
@@ -1772,11 +1923,11 @@ mod tests {
         }
     }
 
-    /// Review finding B6: the six reasons the API knows are the six in the
-    /// file the job's own tests assert its constants against too, in the same
-    /// order, so the two sides cannot drift apart unnoticed. Read here from
-    /// test code only, with `include_str!`, so the release build of the API
-    /// depends on nothing outside `rust/`.
+    /// Review findings B6 and C2: the seven reasons the API knows are the
+    /// seven in the file the job's own tests assert its constants against
+    /// too, in the same order, so the two sides cannot drift apart
+    /// unnoticed. Read here from test code only, with `include_str!`, so the
+    /// release build of the API depends on nothing outside `rust/`.
     #[test]
     fn the_reasons_the_api_knows_are_the_reasons_in_the_shared_fixture() {
         const SHARED: &str = include_str!(concat!(
@@ -1789,7 +1940,7 @@ mod tests {
         let mut distinct = JOB_FAILURE_REASONS.to_vec();
         distinct.sort_unstable();
         distinct.dedup();
-        assert_eq!(distinct.len(), 6, "six different reasons");
+        assert_eq!(distinct.len(), 7, "seven different reasons");
         assert!(
             !JOB_FAILURE_REASONS.contains(&LOAD_FAILED),
             "the fixed fallback is not one of the job's reasons"
@@ -1836,6 +1987,12 @@ mod tests {
             TABLE_NOT_FREE,
             "That table name is in use and no upload of this tenant created it, so a file cannot be loaded into it."
         );
+        // T7a, review findings C1 and C2.
+        assert_eq!(
+            TABLE_NAME_RULE,
+            "Table names start with a lower-case letter and use lower-case letters and digits joined by single underscores, with at most 128 characters."
+        );
+        assert_eq!(JOB_HEADER_NO_COLUMNS, "The header row has no columns.");
     }
 
     #[test]
@@ -1869,6 +2026,7 @@ mod tests {
             RUN_UNKNOWN,
             JOB_FILE_UNREADABLE,
             JOB_HEADER_PAST_END,
+            JOB_HEADER_NO_COLUMNS,
             JOB_NO_ROWS,
             JOB_TOO_MANY_ROWS,
             JOB_LOAD_FAILED,

@@ -1767,7 +1767,9 @@ async fn an_invalid_ingest_body_is_400_and_asks_nobody() {
     let bayu = stack.bayu().await;
     let upload = stack.upload(&bayu, "a.csv", b"a,b\n1,2\n").await;
     let id = id_of(&upload);
-    let table_rule = "Table names use lower-case letters, digits and _ only, do not start with a digit, and have at most 128 characters.";
+    // Review finding C1: the sentence of the rule a person can follow, and
+    // the names the plan says must be refused with it.
+    let table_rule = "Table names start with a lower-case letter and use lower-case letters and digits joined by single underscores, with at most 128 characters.";
     let with = |field: &str, value: Value| {
         let mut body = ingest_body("stock_raw");
         body[field] = value;
@@ -1779,6 +1781,11 @@ async fn an_invalid_ingest_body_is_400_and_asks_nobody() {
         (with("bronzeTable", json!("Orders")), table_rule),
         (with("bronzeTable", json!("2025_orders")), table_rule),
         (with("bronzeTable", json!("")), table_rule),
+        (with("bronzeTable", json!("x_")), table_rule),
+        (with("bronzeTable", json!("_x")), table_rule),
+        (with("bronzeTable", json!("a__b")), table_rule),
+        (with("bronzeTable", json!("1a")), table_rule),
+        (with("bronzeTable", json!("a".repeat(129))), table_rule),
         (
             with("mode", json!("merge")),
             "mode must be replace or append.",
@@ -3174,7 +3181,7 @@ async fn a_lost_run_whose_results_cannot_be_read_is_left_alone_however_old() {
 }
 
 /// Review finding B6: the reason a job recorded reaches a response, and the
-/// row, only when it is one of the six the API knows. Exception text, a path
+/// row, only when it is one of the seven the API knows. Exception text, a path
 /// and a marker the job might have recorded are the fixed `The load failed.`.
 #[tokio::test]
 async fn a_reason_the_job_recorded_that_the_api_does_not_know_reaches_neither_a_response_nor_the_row()

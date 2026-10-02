@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import csv
 import io
+import re
 import sys
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -74,7 +75,7 @@ from dlt.extract.resource import DltResource
 
 from dispar_orchestrate.adapters.sink import LoadPlan, SinkConfig, SinkResult, load_via_sink
 from dispar_orchestrate.bronze_catalog import record_ingest_run
-from dispar_orchestrate.connector_catalog import is_plain_table_name, register_loaded_table
+from dispar_orchestrate.connector_catalog import register_loaded_table
 from dispar_orchestrate.dlt_pipeline import BronzeIngestConfig
 from dispar_orchestrate.op_metadata import DEFAULT_RETRY_POLICY, source_metadata
 
@@ -101,6 +102,18 @@ MAX_ROWS = 2_000_000
 # The API's own bound on a table name (`routes::uploads::MAX_TABLE_NAME_CHARS`).
 MAX_TABLE_NAME_CHARS = 128
 
+# What an uploaded table may be called, `^[a-z][a-z0-9]*(_[a-z0-9]+)*$`: a
+# lower-case letter first, then lower-case letters and digits in groups joined
+# by single underscores, so no leading, trailing or doubled `_` (review finding
+# C1). The API states and applies the same rule (`TABLE_NAME_RULE` and
+# `table_name_problem` in `routes/uploads.rs`), so a name this job would refuse
+# is refused where the user can read why. It is tighter than a connector
+# target's rule (`connector_catalog.is_plain_table_name`, which connectors
+# keep) because dlt writes some names that rule admits under another name and,
+# measured, none that this one admits: see `_dlt_keeps_table_name`. Matched
+# with `fullmatch`, since a `$` would also match in front of a trailing newline.
+TABLE_NAME = re.compile(r"[a-z][a-z0-9]*(_[a-z0-9]+)*")
+
 # Exactly what the API validates before it launches the job, and so exactly
 # what this job accepts: a value outside these is a launch that did not come
 # from the API, and fails closed.
@@ -110,16 +123,28 @@ DELIMITERS = (",", ";", "\t", "|")
 
 # The reasons a failed load records, in the order of
 # `ops/fixtures/upload_load_failure_reasons.json` (review finding B6): the
-# API shows a recorded reason only when it is one of these six, and
+# API shows a recorded reason only when it is one of these seven, and
 # `test_file_ingest.py` asserts this list against that file.
 UNREADABLE = "The stored file could not be read."
 HEADER_PAST_END = "The header row is past the end of the file."
+# Review finding C2: a record at the header row that has no cells (an empty
+# line chosen as the header) used to be recorded as "past the end", which is
+# not what happened: the file has a record there.
+HEADER_NO_COLUMNS = "The header row has no columns."
 NO_ROWS = "The file has no rows below the header row."
 TOO_MANY_ROWS = "The file has more than 2,000,000 rows."
 LOAD_FAILED = "The load into the table failed."
 NOT_REGISTERED = "The table was loaded but could not be registered in the catalog."
 
-FAILURE_REASONS = (UNREADABLE, HEADER_PAST_END, NO_ROWS, TOO_MANY_ROWS, LOAD_FAILED, NOT_REGISTERED)
+FAILURE_REASONS = (
+    UNREADABLE,
+    HEADER_PAST_END,
+    HEADER_NO_COLUMNS,
+    NO_ROWS,
+    TOO_MANY_ROWS,
+    LOAD_FAILED,
+    NOT_REGISTERED,
+)
 
 
 class LoadFailure(Exception):
@@ -337,14 +362,16 @@ def parse_file(text: str, delimiter: str, header_row: int) -> ParsedFile:
 
     # Errors
 
-    Raises `LoadFailure` with `HEADER_PAST_END` (no record at `header_row`, or
-    one with no cells at all: the preview reports both as an empty `columns`),
-    `NO_ROWS` (nothing below the header that is not blank) or `TOO_MANY_ROWS`
-    (more than `MAX_ROWS`, found while counting, so nothing was cut).
+    Raises `LoadFailure` with `HEADER_PAST_END` (no record at `header_row`),
+    `HEADER_NO_COLUMNS` (a record there, with no cells at all: an empty line;
+    the preview reports it and the case above alike as an empty `columns`, and
+    the two have a sentence each since review finding C2), `NO_ROWS` (nothing
+    below the header that is not blank) or `TOO_MANY_ROWS` (more than
+    `MAX_ROWS`, found while counting, so nothing was cut).
     """
     header, records = read_table(text, delimiter, header_row)
     if not header:
-        raise LoadFailure(HEADER_PAST_END) from ValueError("the header record has no cells")
+        raise LoadFailure(HEADER_NO_COLUMNS) from ValueError("the header record has no cells")
     count = 0
     for _ in records:
         count += 1
@@ -419,16 +446,25 @@ def _text_resource(parsed: ParsedFile, table: str) -> DltResource:
 
 
 def _dlt_keeps_table_name(table: str) -> bool:
-    """Whether dlt writes the table under this name. It runs the name through
-    its naming convention, and the API's rule (`^[a-z_][a-z0-9_]*$`) admits
-    names that convention changes: `x_` is written as `xx`, `__x` as `x`,
-    `s__1` as `s___1`. The load then lands in a table nobody asked for, the
-    sink reports no row count, and registering the name that was asked for
+    """Whether dlt writes the table under this name: the guard behind
+    `TABLE_NAME`. dlt runs a name through its naming convention, and the rule
+    the API and this job had before review finding C1 (`^[a-z_][a-z0-9_]*$`)
+    admitted names that convention changes: `x_` is written as `xx`, `__x` as
+    `x`, `s__1` as `s___1`. The load then lands in a table nobody asked for,
+    the sink reports no row count, and registering the name that was asked for
     fails. Measured with dlt 1.30.0 on 2026-10-02, through `load_via_sink`
-    against a local filesystem bucket, on 25 names the API's rule admits: 14
-    were not written under the name given (one of them, `__`, failed
-    outright) and 11 were. `normalize_tables_path` agreed with the writer on
-    all 25, so it is what is asked here instead of a pattern of our own.
+    against a local filesystem bucket, on 25 names that rule admitted: 14 were
+    not written under the name given (one of them, `__`, failed outright) and
+    11 were. `normalize_tables_path` agreed with the writer on all 25, so it is
+    what is asked here instead of a second pattern of our own.
+
+    `TABLE_NAME` admits none of those. Of the 59,052 names it matches that the
+    reviewer put through the naming on 2026-10-02 (plan section 9, review of
+    slice C), the naming changed none, and a test of this module enumerates
+    short names to the same end. So with this dlt the guard refuses nothing
+    that passed the pattern; it is here for the day a newer dlt names things
+    differently, when it refuses the launch before the file is read and not
+    after the rows landed in the wrong table.
     """
     return dlt.Schema("upload").naming.normalize_tables_path(table) == table
 
@@ -441,7 +477,7 @@ def _check_settings(params: FileIngestParams) -> None:
     # Errors
 
     Raises `LoadFailure(LOAD_FAILED)`, with the problems as its cause, which
-    names no reason of its own: none of the other five describes a setting.
+    names no reason of its own: none of the other six describes a setting.
     """
     problems: list[str] = []
     if not params.upload_id.strip():
@@ -455,10 +491,14 @@ def _check_settings(params: FileIngestParams) -> None:
     if params.header_row < 0:
         problems.append(f"header_row {params.header_row} is negative")
     table = params.bronze_table_name
-    if not is_plain_table_name(table) or len(table) > MAX_TABLE_NAME_CHARS:
+    # Review finding C1: the upload rule first, the same one the API refuses
+    # with; dlt is asked only about a name that passed it. The SQL that
+    # registers the table has its own guard (`register_loaded_table`), which
+    # every name this pattern admits satisfies.
+    if not TABLE_NAME.fullmatch(table) or len(table) > MAX_TABLE_NAME_CHARS:
         problems.append(
-            f"bronze_table_name {table!r} is not a plain lower-case identifier of at most "
-            f"{MAX_TABLE_NAME_CHARS} characters"
+            f"bronze_table_name {table!r} is not a lower-case letter followed by lower-case letters and "
+            f"digits in groups joined by single underscores, at most {MAX_TABLE_NAME_CHARS} characters"
         )
     elif not _dlt_keeps_table_name(table):
         problems.append(f"bronze_table_name {table!r} is a name dlt would write under another one")
@@ -471,7 +511,13 @@ def _sink_config_from_env() -> SinkConfig:
 
 
 def _now() -> str:
-    """RFC 3339 in UTC, the form the API parses `ended_at` from."""
+    """RFC 3339 in UTC, the form the API parses `ended_at` from: six digits of
+    microseconds and `+00:00`, never `Z`, and no fraction at all when the
+    microsecond is 0 (`2026-10-02T10:00:00.123456+00:00`,
+    `2026-10-02T10:00:05+00:00`). `ingest_run.ended_at` is a text column, so
+    the API reads these exact characters back; a unit test of
+    `routes::uploads::ended_after` pins that it reads this form (review
+    finding C3)."""
     return datetime.now(timezone.utc).isoformat()
 
 
