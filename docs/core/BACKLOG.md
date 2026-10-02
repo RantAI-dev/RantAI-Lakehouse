@@ -30,7 +30,7 @@ The one list of known work. Look at it weekly; pick what is next.
 | `BI-2` | Metrics users can define once and reuse across dashboards | Dashboards | PRODUCT §2 |
 | `DATA-9` | Upload a file from the console | Data | PRODUCT §2 |
 | `OPS-8` | Usage and cost view | Monitoring | PRODUCT §2 |
-| `SEC-2` | Login rate limiting | Security | `README.md` |
+| `SEC-2` | Login rate limiting. **Planned** | Security | `features/login-protection-and-session-cleanup.md` |
 | `SEC-3` | Test single sign-on against a real identity provider; correct `README.md`, which says it is unbuilt | Security | PRODUCT §2 |
 | `SEC-7` | A monitored security contact address | Security | `SECURITY.md` |
 | `REL-2` | Adopt a version and release policy; cut a release from the unreleased work | Delivery | `reference/release-policy.md` |
@@ -42,7 +42,7 @@ The one list of known work. Look at it weekly; pick what is next.
 | `SEC-4` | Human security review | Security | PRODUCT §4 blocker 3 |
 | `SUP-1` | Decide a support commitment | Business | PRODUCT §4 blocker 5 |
 | `OPS-7` | Test and time a restore from backup | Monitoring | PRODUCT §2 |
-| `SEC-5` | Clean up old sessions and tokens | Security | `README.md` |
+| `SEC-5` | Clean up old sessions and tokens. **Planned** | Security | `features/login-protection-and-session-cleanup.md` |
 | `SEC-6` | Stop older API handlers from returning internal error text | Security | `AGENTS.md` |
 
 ## Later
