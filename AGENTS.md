@@ -11,7 +11,9 @@ RantAI Lakehouse: a Next.js console (`src/`), a Rust API workspace
 `docker-compose.yml` that is also the deployment template. Design decisions
 are in `docs/adr/`, phases/gates/risks in
 `docs/plans/LAKEHOUSE-FOUNDATION-PLAN.md`, measurements in
-`docs/plans/*-RESULT.md`.
+`docs/plans/*-RESULT.md`. Product documents are in `docs/core/`: `PRODUCT.md`
+(what the product is, has, lacks, and what is next), `BACKLOG.md`, and one
+page per feature in `docs/core/features/`.
 
 ## Who plans, who writes, who reviews
 
@@ -34,6 +36,10 @@ review worth having.
 
 The loop, per feature:
 
+0. **Ready.** The feature has a backlog ID and a page in
+   `docs/core/features/` (what the user can do, decisions, limits, acceptance
+   checklist). The planner may draft it; the product owner signs the
+   decisions.
 1. **Plan.** The planner writes `docs/superpowers/plans/YYYY-MM-DD-<slug>.md`:
    decisions already made, anchors (`file:line`, verified at a named
    commit), numbered tasks each with its acceptance check, PR slicing, and
@@ -56,6 +62,9 @@ The loop, per feature:
    and CI is green. The developer never opens or merges a PR. Nobody
    pushes to `main` directly or force-pushes it; `main` only moves through
    a merged PR.
+7. **Done.** Merged is not Done. The product owner runs the acceptance
+   checklist on the feature page, and the planner updates
+   `docs/core/PRODUCT.md` and `docs/core/BACKLOG.md`.
 
 ## Five principles
 

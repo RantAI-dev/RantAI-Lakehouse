@@ -5,6 +5,9 @@ planner (Claude Opus) for a developer agent, under the role split in
 `AGENTS.md` ("Who plans, who writes, who reviews"). No code has been written
 for this plan.
 
+**Feature page (requirements and acceptance checklist):**
+`docs/core/features/gold-publish-per-mart.md`, backlog `DATA-1`.
+
 **Base commit:** `6a2b29f` on `main`. Branch off it as
 `feat/gold-publish-per-mart`.
 
@@ -365,4 +368,54 @@ Environment notes for the reviewer:
 
 ## 8. Review (planner appends findings per PR)
 
-_Empty._
+### PR slice A — T1 (reviewer, 2026-10-02)
+
+Reviewed `6e46c9f` and `83f5c00` against T1.
+
+**Findings: no `BLOCKER`, no `SHOULD-FIX`.**
+
+What was checked against the plan:
+
+- `bootstrap_gold_export_service` goes through the shared
+  `bootstrap_service_run_identity`, with empty scopes and the
+  `GOLD_EXPORT_RUN_TOKEN` name, and is called beside the other bootstraps.
+  The doc comment gives the reason for empty scopes, as T1 asked.
+- `gold_export.py::_headers` sends `Authorization: Bearer` and
+  `x-run-token`, and returns `{}` when no token is set. The stale "gets
+  `401` every night" comment is replaced.
+- Tests: three `main.rs` unit tests (seeds one identity and credential;
+  second boot is a no-op; unset token seeds nothing), and
+  `tests/gold_export_auth.rs` with a negative control (401 before seeding)
+  and the positive case over the real router. The Python tests cover both
+  headers, none when unset, and the POST itself.
+- `docker-compose.yml` already passes `GOLD_EXPORT_RUN_TOKEN` to both
+  `lakehouse-api` and the Dagster code location; no compose change was
+  needed, so no `up` proof is owed.
+
+Verification re-run by the reviewer on `83f5c00`, foreground, shared
+`CARGO_TARGET_DIR`:
+
+- `cargo fmt --check` — pass.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` —
+  pass.
+- `cargo test --workspace` — 76 suites, **2812 passed, 0 failed, 8
+  ignored**. Matches the handoff.
+- `python3 ops/lint/check_intra_package_imports.py` — pass.
+- `python3 ops/lint/check_bare_iceberg_count.py` — pass.
+- `(cd dagster && python -m pytest dispar_orchestrate -q)` — **369 passed,
+  30 subtests passed**.
+
+Not verified: the schedule succeeding on a running stack. T1's acceptance
+is the router-level test; the end-to-end proof is the feature's acceptance
+checklist (`docs/core/features/gold-publish-per-mart.md`, step 9).
+
+Observation, not a finding against this change: several handlers accept
+"any service identity" as a fallback when their own run token is unset
+(`check_export_token`, `routes::alerts::check_run_token`). Each new
+scheduler identity therefore also satisfies those fallbacks on the other
+routes. This pattern predates T1 and T1 follows it correctly; it is worth
+its own look before more identities are added.
+
+Reviewer environment note: the first `cargo test` run aborted because the
+session's shell lacked the `docker` group, so the Postgres testcontainer
+could not start. Re-run under `sg docker`, which is the result quoted above.
