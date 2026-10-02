@@ -1204,6 +1204,269 @@ many times.
     `duplicateOf` of this version is a whole upload (without the checksum), so
     the console has the earlier name, date and table.
 
+### Slice B, fixes — T6a (developer, 2026-10-02)
+
+Branch `feat/upload-file`, from `0e0d24f`. Nothing was pushed. No file outside
+`/home/hv/lakehouse-upload` was edited (build output went to the shared
+`CARGO_TARGET_DIR`, logs and scratch files to the session scratchpad); no
+`docker compose` was run and no container of the running stack was touched.
+Docker was used only by the `lakehouse-test-support` Postgres container that the
+store and route tests start or reuse. No TypeScript, Python or compose file is
+touched, and `Cargo.lock` is unchanged. No mutation-testing rebuild loop was
+run, as instructed: "What each test proves" below is reasoning, not a
+measurement.
+
+**Commits**
+
+- `0431d9c` fix(uploads): T6a table claims, a lost run, and the reasons a
+  response may show (8 files, +1907/-548)
+
+**What changed in the routes.** Sentences are exact; statuses are as before
+unless written.
+
+- `POST /api/uploads/{id}/ingest`, 409, who owns the name. Before: "That table
+  already exists and no upload of this tenant created it, so a file cannot be
+  loaded into it." Now: "That table name is in use and no upload of this tenant
+  created it, so a file cannot be loaded into it." It is one sentence for
+  another tenant's claim (the table need not exist), for an existing table
+  nobody claimed, for a claim whose tenant is gone, and for a tenant that lost
+  the name between the check and its claim (`claim_table` false), so the answer
+  does not say which.
+- The same route, order: a connector targets the table (409 "A connector loads
+  that table, so a file cannot be loaded into it."); the claim table is read
+  (`Theirs`: the 409 above; `Ours`: free whether or not the table exists;
+  `Unclaimed`: the table must not exist, registry and Iceberg, 503 on a doubt,
+  as before); another upload loading into it (409 "Another upload is loading
+  into that table."); `claim_table` (false: the 409 above); `mark_ingesting`;
+  launch; `attach_run`.
+- The same route, effect: the first accepted ingest claims the name for the
+  caller's tenant. The claim is never released, not by a refused or failed
+  launch, not by a failed load, not by deleting the upload. A request that is
+  refused before `claim_table` claims nothing.
+- `GET /api/uploads` and `GET /api/uploads/{id}`, when they settle a loading
+  upload. Before: a recorded failure reason was shown as written, and a run
+  Dagster does not know left the upload loading for ever. Now: a recorded
+  reason is shown only if it is one of the six of T7, "The load failed."
+  otherwise; for a run Dagster does not know, a recorded result settles the
+  upload, no result and a claim more than an hour old gives `failed`, "The
+  orchestrator no longer knows this load.", and no result with a younger claim,
+  or results that cannot be read, leaves it as it is. An orchestrator that
+  cannot be asked, or does not answer in 5 s, still leaves it alone.
+- `DELETE /api/uploads/{id}`: a real delete of the row (it was soft). 204, 404,
+  409 and 503 as before; the table and the claim on its name stay.
+- `PUT /api/connectors/{id}/ingest-spec`, 409 (T8). Before: "The table <name>
+  was loaded from an uploaded file, so a connector cannot load into it. Choose
+  another target." for a name an `ingested` row held. Now: "The table <name> is
+  reserved for uploaded files, so a connector cannot load into it. Choose
+  another target." for any claimed name: a load that is running or failed, an
+  upload that was deleted, an upload loaded into another table since, a claim
+  whose tenant is gone.
+
+**The store after T6a** (`lakehouse_store::uploads`, signatures as committed)
+
+- `claim_table(pool, tenant_id: Uuid, table: &str, upload_id: &str) ->
+  Result<bool, StoreError>`: one statement, `INSERT ... ON CONFLICT
+  (bronze_table) DO UPDATE SET bronze_table = EXCLUDED.bronze_table RETURNING
+  tenant_id`, the returned tenant compared with the asking one. True when the
+  claim is the tenant's afterwards (made now or held before), false when another
+  tenant holds it or the holder's tenant is gone (a NULL tenant). The first
+  claim's upload id and tenant are kept. A tenant that does not exist is a
+  `ForeignKeyViolation` when the name was free; a held name answers false
+  without a row of that tenant being written (a test pins both).
+- `table_claim(pool, tenant_id: Uuid, table: &str) -> Result<TableClaim,
+  StoreError>`, `enum TableClaim { Unclaimed, Ours, Theirs }`. A claim with no
+  tenant is `Theirs` for every tenant.
+- `table_claimed(pool, table: &str) -> Result<bool, StoreError>`: any tenant's
+  claim, a claim with no tenant included. T8 uses it.
+- `delete(pool, id: &str) -> Result<bool, StoreError>`: `DELETE ... WHERE id =
+  $1 AND status <> 'ingesting'`.
+- Removed: `soft_delete`, `table_claimed_by_upload`, `table_loaded_by_upload`.
+  `list`, `get`, `upload_in_tenants`, `find_by_sha256`, `table_being_loaded`,
+  `mark_ingesting`, `attach_run` and `mark_finished` lost their `deleted_at`
+  filter and nothing else.
+- `0055` creates `upload_table_claim (bronze_table TEXT PRIMARY KEY, tenant_id
+  UUID REFERENCES tenant(id) ON DELETE SET NULL, upload_id TEXT NOT NULL,
+  claimed_at TIMESTAMPTZ NOT NULL DEFAULT now())` and no longer adds the
+  soft-delete column. Its header says so, says why ownership is a record of its
+  own, and still says the file is frozen from the trial deploy on.
+  `upload_bronze_table_idx` stays: `table_being_loaded` uses it.
+- `grep -rn deleted_at` over `lakehouse-store/src/uploads.rs`,
+  `lakehouse-api/src/routes/uploads.rs` and `0055_upload_tenant_mode.sql`: no
+  match. Over all of `rust/` (`*.rs`, `*.sql`, `*.toml`): no match.
+
+**Elsewhere in the change.** `ops/fixtures/upload_load_failure_reasons.json`
+(a JSON array of the six reasons of T7, in T7's order, beside
+`ops/fixtures/uploads/` and not inside it, because
+`the_fixture_directory_holds_exactly_the_listed_fixtures` asserts that
+directory's contents); in `routes/uploads.rs` the six `JOB_*` constants,
+`JOB_FAILURE_REASONS`, `RUN_UNKNOWN`, `UNKNOWN_RUN_BOUND` (one hour, with its
+reason: a bound, not a measurement) and `TABLE_NOT_FREE` reworded; the
+`storage_key` unit tests (B7) use a UUID as the tenant. Each finding is cited at
+its fix site (`B4`, `B5`, `B6`, `B7`).
+
+**Commands run, with counts**
+
+Per change, scoped:
+
+- `cd rust && cargo fmt --check`: exit 0, after `cargo fmt`. `cargo fmt` changed
+  only files of this change (`git status` showed no other file).
+- `cargo clippy -p lakehouse-store -p lakehouse-api --all-targets -- -D
+  warnings`: exit 0, run twice (before the tests and after the last edit).
+- `cargo test -p lakehouse-store --test uploads`: 35 passed (31 before).
+- `cargo test -p lakehouse-api --lib -- routes::uploads::`: 26 passed, and the
+  same with `--bin lakehouse-api`: 26 passed (23 before).
+- `cargo test -p lakehouse-api --test upload_routes`: 66 passed (56 before).
+  The first run had one failure, a test of mine that was wrong: the concurrent
+  two-tenant test asserted the loser's sentence, and the loser can also be
+  refused with "Another upload is loading into that table." when the winner's
+  upload was marked before the loser checked. I fixed the test (it accepts
+  either sentence, and a second, deterministic test pins the `claim_table`
+  branch), not the code. Six of the new route tests (the two races, B's failed
+  claim, x then y, two lost-run tests) were then run six times together: 36 of
+  36 passed.
+- `cargo test -p lakehouse-api --test connector_upload_table`: 6 passed (4
+  before). `--test route_auth`: 26 passed.
+
+Full verification, once, in the foreground, on the final product commit
+`0431d9c` (the handoff commit changes only this file), as the single command
+`cd rust && cargo fmt --check && cargo clippy --workspace --all-targets
+--all-features -- -D warnings && cargo test --workspace`: exit 0, 378 s.
+**79 `test result:` lines, 3373 passed, 0 failed, 8 ignored** (3351 passed in the
+handoff of `ec6686a`; the 22 more are 4 store tests, 6 unit tests that run in
+both the lib and the bin target, 10 route tests and 2 T8 tests). The 8 ignored
+are the ones counted in slice A's handoff; none was added (no `#[ignore]` in `git
+diff 0e0d24f HEAD -- rust`).
+
+- `python3 ops/lint/check_bare_iceberg_count.py`: exit 0.
+  `python3 ops/lint/check_compose_init_readiness.py`: exit 0.
+  `python3 ops/lint/check_intra_package_imports.py`: exit 1, as expected:
+  `file_ingest.py:48` imports `_install_catalog_env` and `_stamp_ingested_at`
+  from `dlt_pipeline`. T7 clears it; I did not touch the file.
+- `git status` after the commit: clean.
+
+**What each test proves** (reasoned, not mutation-run)
+
+- Store, `claim_table_is_true_for_the_first_asker_...`: the three answers, the
+  record keeps the first asker's tenant and upload, and a refused ask writes
+  nothing. It fails if a held name were answered true, or a refused ask
+  overwrote the claim.
+- Store, `two_tenants_claiming_one_new_name_at_the_same_moment_one_wins`: 25
+  rounds of two concurrent calls on separate connections of a 5-connection
+  pool, exactly one true per round (a unique violation would panic the
+  `unwrap`). A check followed by an insert, or an insert whose answer ignores
+  whether it won, fails it when the two interleave. It is probabilistic and
+  cannot prove atomicity: that rests on one statement and the primary key.
+- Store, `a_claim_whose_tenant_is_gone_...`: `DELETE FROM tenant` nulls the
+  claim's tenant; afterwards no tenant can claim the name, read it as its own,
+  or see it unclaimed, and `table_claimed` stays true.
+- Store, `a_claim_is_never_released_...`, `after_a_delete_...`,
+  `delete_removes_the_row_once_...`: a failed load, a load into another table
+  and a delete each leave the claim and its first upload id.
+- Store, `a_failed_claim_keeps_another_tenant_out_...` and `an_upload_loaded_into_one_table_and_then_another_...`:
+  the two failures of B4 as the reviewer described them.
+- Store, the migration tests: exactly the columns `0055` adds (`tenant_id`,
+  `load_mode`, `row_count`) and drops (`tenant`), without naming the removed
+  one; the claim table's columns; its primary key, NOT NULL and foreign key.
+- Routes, `a_failed_claim_keeps_another_tenant_out_of_the_table_...` and
+  `an_upload_loaded_into_one_table_and_then_another_...`: the same two failures
+  through the router. Under T5a's row-based ownership the first lets tenant A
+  into a table nothing ever wrote, and the second lets another tenant into
+  `x_raw`; both fail.
+- Routes, `a_tenant_that_loses_the_name_between_the_check_and_the_claim_...`:
+  the competing claim lands while the first request waits on the slowed
+  registry lookup, after it has read "nobody's". It fails if `ingest` does not
+  call `claim_table` or ignores a false (A would launch), and pins that the
+  upload is not marked, nothing is launched and A makes no claim.
+- Routes, `two_tenants_asking_for_one_new_name_at_the_same_moment_one_launches`:
+  the outcome under a real race (one launch, one claim, the loser refused with
+  a 409 and untouched). It does not by itself prove `claim_table` is called,
+  because the busy check usually refuses the loser first; the test above does.
+- Routes, `another_tenants_claim_closes_a_table_whether_or_not_it_exists`: the
+  same sentence for a table that exists and one that does not, and ClickHouse is
+  asked nothing, so the claim is read before the table. The refusal tests (an
+  invalid body, a connector's table, a registered table, an Iceberg table, the
+  four 503s) each assert that no claim was made; the launch tests assert that a
+  refused or failed launch leaves the claim.
+- Routes, B5: `a_run_the_orchestrator_does_not_know_is_settled_by_the_result_...`
+  (a result settles it, whatever the age), `a_lost_run_with_no_result_is_failed_after_an_hour_...`
+  (2 hours: failed, then deletable and loadable again; 30 minutes: left; an
+  older load's result is nobody's answer), `a_lost_run_whose_results_cannot_be_read_...`
+  (3 hours: left, and a list reads once). The two "orchestrator cannot be asked"
+  tests now use a 3-hour claim: if an error were read as a lost run they would
+  fail, where a 1-hour claim made that depend on the clock.
+- B6: the unit tests (each of the six kept; near misses, added detail and
+  exception text all "The load failed."), the test that reads
+  `upload_load_failure_reasons.json` and asserts it equals the constants in
+  order, and a route test in which the recorded text carries a marker: it is in
+  neither the response nor the row.
+- T8: every kind of claim is refused with the exact sentence (ingested, running,
+  failed, a deleted upload, an upload loaded into another table since, a tenant
+  that is gone), an unclaimed target and an empty spec still save, and the rest
+  of the validation is unchanged.
+
+**Not verified, or not run**
+
+- Mutation testing, as instructed. Every "fails if" above is reasoning; the one
+  failure I saw was my own wrong assertion.
+- From a cold build: the shared `CARGO_TARGET_DIR` was warm. In the full run
+  clippy re-checked only `lakehouse-auth` (3.6 s, the other crates were fresh
+  from the scoped runs and the reviewer's earlier workspace run on the same
+  sources) and the test profile recompiled the 14 workspace crates.
+- A load end to end (T7), the gate (T9), the console. `0055` was not run on the
+  development database (not mine to touch); the store tests run it on throwaway
+  databases over `0054` with no row and with one legacy row, and on fresh ones.
+- Real concurrency of `claim_table` beyond 25 rounds and one route race: the
+  guarantee is the statement and the primary key, not a test.
+- The one-hour bound is a bound, not a measurement: no load of a file at the
+  cap has been timed.
+- `gitleaks`, `cargo deny` and `cargo audit` (not installed). I read the diff:
+  no secret, host, port or client name.
+- No TypeScript or compose file is touched, so `bun` and `docker compose` checks
+  were not run.
+
+**Where the plan was wrong or silent against the code**
+
+1. T6a says to update "the existing settle tests that used arbitrary reason
+   text". None did: every reason in the settle tests was already one of the six
+   or empty. I added tests instead (above).
+2. "False when another tenant holds it or its tenant is gone" reads two ways. I
+   took it as the claim's tenant, as the brief says. For an asking tenant that
+   does not exist, `claim_table` is a `ForeignKeyViolation` when the name is
+   free and a plain false when it is held (Postgres does not check the
+   proposed row's foreign key on the update path); documented in `# Errors` and
+   pinned by a test.
+3. T8 pinned, in its own test, that a name an upload had only claimed does not
+   block a connector. T6a reverses that rule, so
+   `a_table_an_upload_only_claimed_does_not_block_a_connector` became
+   `a_table_an_upload_only_asked_for_is_reserved_whatever_became_of_the_load`.
+   `another_upload_loading_into_the_table_is_409` had a loading upload of
+   another tenant; that upload now holds the claim and gets the ownership
+   sentence first, so the test uses the same tenant's upload (and the
+   cross-tenant case is in `another_tenants_claim_closes_a_table_...`).
+4. ADR 0014's "Consequences" still says "A new table, `file_upload`"; there are
+   two now. I did not edit the ADR.
+
+**For the planner to decide** (not mismatches)
+
+- `table_being_loaded` still refuses on any tenant's loading upload, as before.
+  With claims it is the same-tenant case, except in the race window: a tenant
+  that passed the claim read before another tenant's claim can get "Another
+  upload is loading into that table." for that other tenant's upload. That says
+  only that someone is loading the name, which the ownership sentence says too,
+  but you may prefer the busy check scoped to the tenant.
+- The order the plan fixes, `claim_table` just before `mark_ingesting`, leaves a
+  claim behind when `mark_ingesting` then returns nothing (a second request for
+  the same upload won the row, or the upload was deleted in between). Two
+  simultaneous requests for one upload that name two tables leave both names
+  claimed and one loaded. It is "never released" working as designed, a stray
+  reserved name for a load that never happened.
+- The one-hour bound can fail a slow run that Dagster merely failed to answer
+  for: `pipeline_run_status` reads a GraphQL error as `None`. The plan accepts
+  that cost; it is written in `Settler`'s doc.
+- A name that only a failed attempt asked for now keeps a connector off it for
+  good (T8 on a claim, not on an `ingested` row). That is the reviewer's rule;
+  the feature page already says a name an upload asked for stays reserved.
+
 ## 9. Review (planner appends findings per slice), then the trial
 
 Findings are tagged `BLOCKER` or `SHOULD-FIX`. The planner re-runs the
