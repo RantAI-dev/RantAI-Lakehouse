@@ -16,15 +16,37 @@ import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatCompactNumber, formatDateTime } from "@/lib/format"
 import { fmtMeasured } from "@/lib/measured"
 import { goldService } from "@/services"
-import type { GoldExportRun, GoldMart, GoldReadBack } from "@/services/contracts/gold"
+import type { GoldExportRun, GoldMart, GoldPublication, GoldReadBack } from "@/services/contracts/gold"
+
+function publicationLabel(pub: GoldPublication): string {
+  if (!pub.enabled) return "Off"
+  if (pub.lastExportedAt === null) return "On · Never published"
+  if (pub.lastChangedAt === null) return "On · Not measured"
+  if (pub.lastChangedAt < pub.lastExportedAt) return "On · Up to date"
+  return "On · Out of date"
+}
+
+function MartPublication({ mart }: { mart: { name: string } }) {
+  const state = useService<GoldPublication>(
+    (signal) => goldService.getPublication(mart.name, signal),
+    [mart.name]
+  )
+  if (state.status === "loading") return <span className="text-muted-foreground">…</span>
+  if (state.status === "error") return <span className="text-destructive">—</span>
+  return (
+    <span className={state.data.canEdit ? "" : "text-muted-foreground"}>
+      {publicationLabel(state.data)}
+    </span>
+  )
+}
 
 /**
- * One mart's row: last export (read straight back from Iceberg), export
- * history count, best-effort consumer count, and an "Export now" trigger.
- * Each sub-fetch is independent — `getLastExport` 404/500s for a mart that
- * has never been exported (`read_back` has no table to read yet),
- * and that is rendered as "Never exported" here, not as a page-level
- * error.
+ * One mart's row: publish state, last export (read straight back from
+ * Iceberg), export history count, best-effort consumer count, and an
+ * "Export now" trigger. Each sub-fetch is independent — `getLastExport`
+ * 404/500s for a mart that has never been exported (`read_back` has no
+ * table to read yet), and that is rendered as "Never exported" here, not
+ * as a page-level error.
  */
 function MartRow({ mart }: { mart: GoldMart }) {
   const lastExport = useService<GoldReadBack | null>(async (signal) => {
@@ -48,6 +70,9 @@ function MartRow({ mart }: { mart: GoldMart }) {
     <TableRow>
       <TableCell className="font-medium">{mart.name}</TableCell>
       <TableCell>{formatCompactNumber(mart.rows)}</TableCell>
+      <TableCell>
+        <MartPublication mart={mart} />
+      </TableCell>
       <TableCell>
         {lastExport.status === "loading" ? (
           <span className="text-muted-foreground">…</span>
@@ -129,7 +154,7 @@ export function GoldExportsPage() {
     <div className="flex flex-col gap-4">
       <PageHeader
         title="Gold Exports"
-        description="Serving marts exported to the Gold Iceberg layer (ADR 0010). Each row's snapshot and export time come from reading Iceberg back, not from what the last export claimed."
+        description="Publishing is set per mart. Switch it on from the mart's page in Data. Each row's snapshot and export time come from reading Iceberg back, not from what the last export claimed."
       />
       {marts.status === "loading" ? <LoadingSkeleton /> : null}
       {marts.status === "error" ? (
@@ -141,6 +166,7 @@ export function GoldExportsPage() {
             <TableRow className="hover:bg-transparent">
               <TableHead>Mart</TableHead>
               <TableHead>Rows</TableHead>
+              <TableHead>Enabled</TableHead>
               <TableHead>Last export</TableHead>
               <TableHead>Snapshot</TableHead>
               <TableHead>History (runs)</TableHead>

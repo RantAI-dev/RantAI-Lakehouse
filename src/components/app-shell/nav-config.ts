@@ -20,7 +20,6 @@ import {
   ListChecks,
   LogIn,
   MonitorSmartphone,
-  PackageCheck,
   Plug,
   SearchCode,
   Server,
@@ -130,7 +129,6 @@ export const NAV_GROUPS: NavGroup[] = [
     icon: GitBranch,
     items: [
       { title: "Pipelines", href: "/pipelines", icon: GitBranch },
-      { title: "Exports", href: "/gold-exports", icon: PackageCheck },
     ],
   },
   {
