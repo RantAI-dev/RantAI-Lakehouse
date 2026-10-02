@@ -772,3 +772,26 @@ present.
 
 A malformed value fails startup rather than quietly disabling the check. With
 the setting unset, the API logs one warning at boot naming it.
+
+## Gold export: growth and background merges
+
+Every publish of a changed mart appends one full copy — an append-only
+Iceberg table — and nothing expires old copies yet. Storage grows by one
+copy per publish. Outside tools must select the latest export time
+(`SELECT … WHERE _exported_at = (SELECT max(_exported_at) …)`) when
+they read a published mart, or they will see every past copy.
+
+`GOLD_EXPORT_MARTS` now defaults to empty: the console owns the mart list
+through `GET /api/gold/publications`, and a fresh deployment publishes
+only what is switched on there. Keep the env var as an operator override
+for emergencies, not as the daily driver.
+
+A background `MergeTree` merge can advance `max(modification_time)` on a
+mart even when no data changed, causing one extra export. The error
+direction is a spurious "changed" → one extra copy, never a missed one.
+A merge-proof freshness signal tracks as backlog `DATA-10`.
+
+A mart over the row cap (`GOLD_EXPORT_MAX_ROWS`, default 5,000,000) is
+refused outright — the export names the mart and the cap in its error,
+never silently truncating. Raise the cap only when you have measured the
+memory pressure of a true full re-copy at the new size.

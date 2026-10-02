@@ -10,6 +10,27 @@ once a first release is tagged.
 
 ### Added
 
+- Gold publish as a per-mart option (backlog `DATA-1`): publishing is off
+  by default for every mart and switched on from the mart's asset detail
+  page by a Platform Admin holding `gold:export`. Once on, the mart is
+  published automatically — after every authored pipeline success a new
+  `run_status_sensor` triggers the daily export job (unchanged marts are
+  skipped, so the extra runs cost one cheap freshness check each), and the
+  nightly 04:00 schedule is the safety net. The card shows one of "Up to
+  date", "Out of date", "Not measured", or "Never published", plus the
+  last published time, snapshot ID, and the last five publish runs. A
+  "Publish now" action is available when publishing is on. The Gold
+  Exports page (formerly under Build as "Exports", now a linked overview)
+  gained an Enabled column. The nightly schedule now authenticates:
+  `lakehouse-api` boots a `gold-export-scheduler` service identity from
+  `GOLD_EXPORT_RUN_TOKEN`, and the Dagster job sends the same token as
+  both the bearer credential and `x-run-token` header. `POST /api/gold/
+  export/{mart}` accepts `?ifChanged=true`: when set, and both
+  `max(modification_time)` and the last successful export time are known,
+  a mart that has not changed (strictly before) is skipped with no history
+  row written. `GOLD_EXPORT_MARTS` now defaults to empty; the console owns
+  the list through `GET /api/gold/publications`.`
+
 - Run-config schema and validated trigger (plan R4 2c): `GET /api/pipelines/{id}/config-schema` returns the job's default config YAML (`pipeline:read`), `defaultConfig: null` alongside `defaultConfigYaml` since the workspace has no YAML parser dep and Dagster emits the default as a string; `pl-…` ids return `hasConfig: false` without contacting Dagster. `POST /api/pipelines/{id}/trigger` now accepts an optional `{"runConfig": <object>}` body — when supplied, the route validates against the job's schema (`isPipelineConfigValid`) and, on `RunConfigValidationInvalid`, returns a structured 400 `{ errors: [{ path: string[], reason: <EvaluationErrorReason> }] }` built only from `path` and `reason` (Dagster's free-form `message` is never forwarded, AGENTS.md principle 4); on success the config goes through `launchRun(runConfigData:)`. The audit row for `pipeline.trigger` now carries `args.configKeys` — the TOP-LEVEL keys of the supplied config, never the values. The copilot's `trigger_pipeline` tool gained the same optional `runConfig`.
 - Definition version history for authored pipelines (plan R4 2b): a new `pipeline_definition_version` row per `create`/`update`/`delete` (migration `0053`), written inside the same transaction so a failed write leaves no orphan row. The list endpoint (`GET /api/pipelines/{id}/versions`) returns metadata only, newest-first, so the list scales to many versions without shipping every prior snapshot; the get endpoint (`GET /api/pipelines/{id}/versions/{version}`) returns the editable state captured at that version; restore (`POST /api/pipelines/{id}/versions/{version}/restore`) replays a snapshot back into the live row through the existing update path, leaving `name` and `status` alone. Reads are `pipeline:read`; restore is `pipeline:write`. 404 for non-`pl-` ids and for unknown `(id, version)` pairs.
 - Pipeline duration SLA: a new `pipeline_sla` row per pipeline (`maxDurationSeconds`, `lateAfterSeconds`) edited through `GET`/`PUT /api/pipelines/{id}/sla` (plan 1f, migration `0050`). When the SLA exists, the pipeline row's payload gains `slaOk` (true while the latest run's `durationSeconds` is at or under `maxDurationSeconds`, `null` while a run is in flight or no SLA is set) and each run gains `overDuration` (true when the run finished and was over `maxDurationSeconds`).
