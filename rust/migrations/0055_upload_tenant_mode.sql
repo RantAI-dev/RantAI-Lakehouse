@@ -10,6 +10,15 @@
 -- this branch meets `main`. They are not renumbered now: `0054` is already
 -- recorded in the development database under its present name and checksum.
 --
+-- EDITED ONCE AFTER T3, FROZEN FROM THE TRIAL DEPLOY ON: T5a of the plan
+-- added `deleted_at` below, after the review of slice B part 1 (finding
+-- B1). Editing an applied migration is what section 3.5 of
+-- docs/CODE-STANDARD.md forbids, and it was allowed here only because this
+-- file had been applied on throwaway test databases and nowhere that
+-- persists: the development database has never run it. From the trial
+-- deploy on, this file is frozen like any applied migration, and a further
+-- change to `file_upload` is a new migration.
+--
 -- WHY `tenant_id`: an upload belongs to the uploader's active tenant, and
 -- every route that names an upload answers 404 outside it (ADR 0014,
 -- decision 6), the rule connectors follow on the column
@@ -44,12 +53,23 @@
 -- whose sink reported no total, a failed load, and a file not yet loaded
 -- all say so instead of showing a number nobody counted.
 --
+-- WHY `deleted_at` (T5a, finding B1): deleting an upload keeps the table it
+-- loaded (ADR 0014, decision 1), and a later upload may load into that
+-- table only if some upload of the same tenant claimed the name first
+-- (decision 5). If deleting removed the row, the table would outlive the
+-- only record that an upload made it, and nobody could load into it again.
+-- So a delete sets this column and every read of an upload filters on
+-- `deleted_at IS NULL`, except the two questions about who owns a table
+-- ("did an upload of this tenant claim it", "did an upload load it"), which
+-- count deleted rows on purpose. NULL means live. The file's bytes are gone
+-- by then (the API deletes the object first); the row is what is kept.
+--
 -- INDEXES: the listing is newest-first within a tenant, so
 -- `upload_tenant_created_idx` (on the dropped text column) is replaced by
--- one on `(tenant_id, created_at DESC)`. `bronze_table` is looked up by two
--- checks the ingest route makes before it launches a load ("did an upload
--- of this tenant create that table", "is another upload loading into it"),
--- so it gets an index of its own.
+-- one on `(tenant_id, created_at DESC)`. `bronze_table` is looked up by the
+-- checks the routes make about a table name ("did an upload of this tenant
+-- claim it", "is another upload loading into it", and, from a connector's
+-- ingest spec, "did an upload load it"), so it gets an index of its own.
 --
 -- The one destructive statement is the DROP COLUMN; see above for why there
 -- is nothing in it worth keeping.
@@ -61,7 +81,8 @@ ALTER TABLE file_upload
     ADD COLUMN tenant_id  UUID REFERENCES tenant(id) ON DELETE SET NULL,
     ADD COLUMN load_mode  TEXT
         CHECK (load_mode IN ('replace', 'append')),
-    ADD COLUMN row_count  BIGINT;
+    ADD COLUMN row_count  BIGINT,
+    ADD COLUMN deleted_at TIMESTAMPTZ;
 
 CREATE INDEX IF NOT EXISTS upload_tenant_id_created_idx
     ON file_upload (tenant_id, created_at DESC);
