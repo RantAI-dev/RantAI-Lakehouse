@@ -6,6 +6,7 @@ import { RefreshCwIcon } from "lucide-react"
 import { ErrorState, LoadingSkeleton } from "@/components/patterns/page-states"
 import { SectionCard } from "@/components/patterns/section-card"
 import { Button } from "@/components/ui/button"
+import { Switch } from "@/components/ui/switch"
 import {
   Table,
   TableBody,
@@ -16,19 +17,13 @@ import {
 } from "@/components/ui/table"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatDateTime } from "@/lib/format"
+import { freshnessLine } from "@/lib/gold-freshness"
 import { fmtMeasured } from "@/lib/measured"
 import { goldService } from "@/services"
 import type { GoldExportRun, GoldPublication, GoldReadBack } from "@/services/contracts/gold"
 
 function trimmedMart(assetId: string): string {
   return assetId.startsWith("serving.") ? assetId.slice("serving.".length) : assetId
-}
-
-function freshnessLine(pub: GoldPublication): string {
-  if (pub.lastExportedAt === null) return "Never published"
-  if (pub.lastChangedAt === null) return "Not measured"
-  if (pub.lastChangedAt < pub.lastExportedAt) return "Up to date"
-  return "Out of date"
 }
 
 function LastFiveRuns({ mart }: { mart: string }) {
@@ -55,6 +50,9 @@ function LastFiveRuns({ mart }: { mart: string }) {
           <TableRow key={r.id}>
             <TableCell className={r.status === "failed" ? "text-destructive" : ""}>
               {r.status}
+              {r.status === "failed" && r.error && (
+                <div className="text-xs text-destructive/80">{r.error}</div>
+              )}
             </TableCell>
             <TableCell className="text-muted-foreground">
               {formatDateTime(r.startedAt)}
@@ -68,6 +66,12 @@ function LastFiveRuns({ mart }: { mart: string }) {
       </TableBody>
     </Table>
   )
+}
+
+const stateLabelClass = (label: string): string => {
+  if (label === "Up to date") return "font-medium text-green-600 dark:text-green-400"
+  if (label === "Out of date") return "font-medium text-amber-600 dark:text-amber-400"
+  return "font-medium text-muted-foreground"
 }
 
 export function OpenFormatCard({ assetId }: { assetId: string }) {
@@ -86,15 +90,11 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
   const toggle = useServiceAction(
     (signal, enabled: boolean) => goldService.setPublication(mart, enabled, signal)
   )
-  const [toggleError, setToggleError] = React.useState<string | null>(null)
   const exportNow = useServiceAction((signal) => goldService.triggerExport(mart, signal))
 
   async function handleToggle(checked: boolean) {
-    setToggleError(null)
     const result = await toggle.run(checked)
-    if (result === null) {
-      setToggleError(toggle.error?.message ?? "Failed to toggle publishing.")
-    } else {
+    if (result !== null) {
       pub.reload()
     }
   }
@@ -104,9 +104,13 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
 
   const p = pub.data
   const enabled = p.enabled
-
   const canEdit = p.canEdit
-  const stateLabel = enabled ? freshnessLine(p) : "Off"
+  const line = freshnessLine(p)
+  const hasHistory = p.lastExportedAt !== null
+  // PR slice D review D-B3: always show the freshness line and,
+  // when a publish exists, the last published time and snapshot,
+  // whether the switch is on or off.
+  const showHistory = hasHistory && lastExport.status === "success" && lastExport.data
 
   return (
     <SectionCard
@@ -114,16 +118,14 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
       description="A copy in open Iceberg format that outside tools can read. Publishing adds one full copy each time; old copies stay."
       action={
         <label className="flex items-center gap-2" data-testid="open-format-switch">
-          <input
-            type="checkbox"
-            role="switch"
+          <Switch
             checked={enabled}
             disabled={!canEdit || toggle.status === "pending"}
             aria-label="Publish in open format (Iceberg)"
-            onChange={(e) => {
-              void handleToggle(e.currentTarget.checked)
+            onCheckedChange={(checked) => {
+              void handleToggle(checked)
             }}
-            className="peer relative inline-flex h-[18px] w-[32px] shrink-0 cursor-pointer items-center rounded-full border border-transparent transition-all outline-none after:absolute after:-inset-x-3 after:-inset-y-2 focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 data-disabled:cursor-not-allowed data-disabled:opacity-50 bg-input data-checked:bg-primary"
+            data-testid="open-format-toggle"
           />
           <span className="text-sm text-muted-foreground">
             {toggle.status === "pending"
@@ -141,56 +143,56 @@ export function OpenFormatCard({ assetId }: { assetId: string }) {
             You do not hold the gold:export permission. Only a Platform Admin may switch publishing on or off.
           </p>
         )}
-        {toggleError && (
-          <p role="alert" className="text-sm text-destructive">{toggleError}</p>
+        {/* PR slice D review D-S2: render toggle error from status,
+            not from the stale closure capture of toggle.error. */}
+        {toggle.status === "error" && (
+          <p role="alert" className="text-sm text-destructive">{toggle.error.message}</p>
         )}
         <div className="flex flex-wrap items-center gap-2 text-sm">
           <span>Status:</span>
-          <span className={
-            stateLabel === "Up to date"
-              ? "font-medium text-green-600 dark:text-green-400"
-              : stateLabel === "Out of date"
-                ? "font-medium text-amber-600 dark:text-amber-400"
-                : stateLabel === "Not measured"
-                  ? "font-medium text-muted-foreground"
-                  : stateLabel === "Never published"
-                    ? "font-medium text-muted-foreground"
-                    : "font-medium text-muted-foreground"
-          }>
-            {stateLabel}
+          <span className={stateLabelClass(line)}>
+            {line}
           </span>
         </div>
-        {enabled && lastExport.status === "success" && lastExport.data && (
-          <>
-            <dl className="grid grid-cols-3 gap-1 text-sm">
-              <dt className="text-muted-foreground">Last published</dt>
-              <dd className="col-span-2">{lastExport.data.exportedAt ? formatDateTime(lastExport.data.exportedAt) : "—"}</dd>
-              <dt className="text-muted-foreground">Snapshot</dt>
-              <dd className="col-span-2 font-mono text-xs">
-                {fmtMeasured(lastExport.data.snapshotId, (v) => String(v))}
-              </dd>
-            </dl>
-          </>
+        {!enabled && hasHistory && (
+          <p className="text-xs text-muted-foreground">
+            Publishing is off; this copy is no longer updated.
+          </p>
+        )}
+        {showHistory && (
+          <dl className="grid grid-cols-3 gap-1 text-sm">
+            <dt className="text-muted-foreground">Last published</dt>
+            <dd className="col-span-2">{lastExport.data!.exportedAt ? formatDateTime(lastExport.data!.exportedAt) : "—"}</dd>
+            <dt className="text-muted-foreground">Snapshot</dt>
+            <dd className="col-span-2 font-mono text-xs">
+              {fmtMeasured(lastExport.data!.snapshotId, (v) => String(v))}
+            </dd>
+          </dl>
         )}
         {enabled && (
           <>
             <div className="flex flex-col items-start gap-1">
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={exportNow.status === "pending"}
-                onClick={() => {
-                  void exportNow.run().then((result) => {
-                    if (result) {
-                      lastExport.reload()
-                      pub.reload()
-                    }
-                  })
-                }}
-              >
-                <RefreshCwIcon data-icon="inline-start" />
-                {exportNow.status === "pending" ? "Publishing…" : "Publish now"}
-              </Button>
+              {/* PR slice D review D-S3: "Publish now" when canEdit is
+                  false is confusing — a user who cannot toggle also
+                  cannot export. Show it only when they can. */}
+              {canEdit && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={exportNow.status === "pending"}
+                  onClick={() => {
+                    void exportNow.run().then((result) => {
+                      if (result) {
+                        lastExport.reload()
+                        pub.reload()
+                      }
+                    })
+                  }}
+                >
+                  <RefreshCwIcon data-icon="inline-start" />
+                  {exportNow.status === "pending" ? "Publishing…" : "Publish now"}
+                </Button>
+              )}
               {exportNow.status === "error" && (
                 <p role="alert" className="text-xs text-destructive">
                   {exportNow.error.message}
