@@ -141,7 +141,7 @@ from dispar_orchestrate.adapters import sheets as sheets_adapter
 from dispar_orchestrate.adapters import sink as sink_adapter
 from dispar_orchestrate.adapters import sql as sql_adapter
 from dispar_orchestrate.adapters.kafka import consume_one_batch
-from dispar_orchestrate.adapters.sink import load_via_sink
+from dispar_orchestrate.adapters.sink import LoadPlan, UnsupportedLoadMode, load_via_sink
 from dispar_orchestrate.bronze_catalog import record_ingest_offset, record_ingest_run
 from dispar_orchestrate.column_gate import UnsupportedColumnType, reject_unsupported_column_types
 from dispar_orchestrate.secret_map import secret_field_names
@@ -287,6 +287,29 @@ def _register_in_catalog(connector_id: str, obj: dict) -> None:
         )
 
 
+def _load_plan(adapter_name: str, obj: dict) -> LoadPlan:
+    """How this source object's rows meet its Bronze table
+    (`adapters/sink.py`'s "Load modes"). A source object saved before load
+    modes existed replaces: every run used to add the whole source again.
+
+    `incremental` is offered for the `sql` adapter only. dlt can filter any
+    resource by a cursor, but only the `sql_database` source's path (the
+    filter pushed into the query, the cursor kept across runs) has been
+    exercised; the others are refused rather than assumed to work.
+
+    # Errors
+
+    Raises `UnsupportedLoadMode`, which `_run_one_object` records as a
+    rejection.
+    """
+    plan = LoadPlan.from_source_object(obj)
+    if plan.mode == "incremental" and adapter_name != "sql":
+        raise UnsupportedLoadMode(
+            f"load mode 'incremental' is only available for SQL connectors, not adapter {adapter_name!r}"
+        )
+    return plan
+
+
 def _run_one_object(connector: dict, obj: dict) -> None:
     """Ingest one source object (table/endpoint/sheet range) for one
     connector, recording the outcome via `record_ingest_run` in EVERY
@@ -297,7 +320,8 @@ def _run_one_object(connector: dict, obj: dict) -> None:
     # Errors
 
     Re-raises whatever it catches (`SecretRefRejected`,
-    `ssrf_guard.SsrfBlocked`, `UnsupportedColumnType`, or any other
+    `ssrf_guard.SsrfBlocked`, `UnsupportedColumnType`,
+    `UnsupportedLoadMode`, or any other
     exception a driver/HTTP call/sink raises) after recording it -- this
     function's own run (the Dagster op) must still fail visibly, not just
     the governance-surface row.
@@ -326,6 +350,7 @@ def _run_one_object(connector: dict, obj: dict) -> None:
 
     try:
         reject_unsupported_column_types(obj.get("columns", []))
+        plan = _load_plan(adapter_name, obj)
 
         if adapter_name == "sql" and dial.get("driver") in _POSTGRES_DRIVERS:
             # See this module's docstring, "Postgres routing" -- pinned
@@ -333,7 +358,7 @@ def _run_one_object(connector: dict, obj: dict) -> None:
             # ssrf_guard.pinned_resolution (psycopg2/libpq does not
             # resolve through socket.getaddrinfo).
             outcome = dlt_pipeline.run_bronze_ingest(
-                dlt_pipeline.BronzeIngestConfig.from_dial(dial, secrets, [obj])
+                dlt_pipeline.BronzeIngestConfig.from_dial(dial, secrets, [obj]), plan
             )
             _record(rows=outcome["rows"], status="succeeded")
             _register_in_catalog(connector_id, obj)
@@ -358,6 +383,7 @@ def _run_one_object(connector: dict, obj: dict) -> None:
                 result.source,
                 obj["target"],
                 sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env()),
+                plan,
             )
             _record(rows=outcome.rows, status="succeeded")
             _register_in_catalog(connector_id, obj)
@@ -404,7 +430,7 @@ def _run_one_object(connector: dict, obj: dict) -> None:
 
         def _load():
             sink_config = sink_adapter.SinkConfig.from_bronze_ingest_config(dlt_pipeline.BronzeIngestConfig.from_env())
-            return sink_adapter.load_via_sink(source, obj["target"], sink_config)
+            return sink_adapter.load_via_sink(source, obj["target"], sink_config, plan)
 
         host = _host_of(dial)
         if resolved is not None and host is not None:
@@ -414,7 +440,7 @@ def _run_one_object(connector: dict, obj: dict) -> None:
             outcome = _load()
         _record(rows=outcome.rows, status="succeeded")
         _register_in_catalog(connector_id, obj)
-    except (ssrf_guard.SsrfBlocked, UnsupportedColumnType) as exc:
+    except (ssrf_guard.SsrfBlocked, UnsupportedColumnType, UnsupportedLoadMode) as exc:
         _record(rows=None, status="rejected", error=str(exc))
         raise
     except Exception as exc:  # noqa: BLE001 -- every OTHER failure still gets a row (never silently invisible)

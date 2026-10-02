@@ -276,8 +276,11 @@ def test_run_one_object_routes_a_postgres_driver_sql_connector_through_dlt_pipel
         from_dial_calls.append((dial, secrets, source_objects))
         return _StubCfg()
 
-    def fake_run_bronze_ingest(cfg):
+    plans = []
+
+    def fake_run_bronze_ingest(cfg, plan):
         assert isinstance(cfg, _StubCfg)
+        plans.append(plan)
         return {"rows": 42, "bronze_table_name": "orders", "source_schema": "public", "source_table": "orders"}
 
     monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_dial", staticmethod(fake_from_dial))
@@ -317,6 +320,49 @@ def test_run_one_object_routes_a_postgres_driver_sql_connector_through_dlt_pipel
     assert from_dial_calls == [(connector["dial"], {"password": "s3cret"}, [obj])]
     assert recorded[0]["status"] == "succeeded"
     assert recorded[0]["rows"] == 42
+    # A source object saved before load modes existed replaces: its next
+    # run leaves one copy of the table, not one more.
+    assert plans == [f.LoadPlan(mode="replace")]
+
+    f._run_one_object(connector, {**obj, "loadMode": "incremental", "incrementalKey": "order_id"})
+    assert plans[1] == f.LoadPlan(mode="incremental", cursor="order_id")
+
+
+def test_load_plan_offers_incremental_to_sql_connectors_only() -> None:
+    import dispar_orchestrate.ingest_factory as f
+
+    obj = {"name": "orders", "target": "orders", "loadMode": "incremental", "incrementalKey": "updated_at"}
+    assert f._load_plan("sql", obj) == f.LoadPlan(mode="incremental", cursor="updated_at")
+    assert f._load_plan("rest", {"name": "orders", "target": "orders", "loadMode": "append"}) == f.LoadPlan(mode="append")
+    with pytest.raises(f.UnsupportedLoadMode):
+        f._load_plan("rest", obj)
+
+
+def test_run_one_object_records_an_unrunnable_load_mode_as_rejected(monkeypatch) -> None:
+    """A mode this build cannot run as written is a rejection the run
+    history shows with its reason, and nothing is dialed or loaded."""
+    import dispar_orchestrate.ingest_factory as f
+
+    recorded = []
+    monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
+    monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
+    monkeypatch.setattr(
+        f.dlt_pipeline,
+        "run_bronze_ingest",
+        lambda cfg, plan: (_ for _ in ()).throw(AssertionError("must not load")),
+    )
+    connector = {
+        "id": "conn-pg",
+        "adapter": "sql",
+        "dial": {"driver": "postgres", "host": "db.internal", "port": 5432, "database": "d", "user": "u"},
+        "secretRef": "env:CONNECTOR_PG_PASSWORD",
+        "secretRefSecondary": None,
+    }
+    with pytest.raises(f.UnsupportedLoadMode):
+        # Incremental with no cursor column.
+        f._run_one_object(connector, {"name": "public.orders", "target": "orders", "loadMode": "incremental"})
+    assert recorded[0]["status"] == "rejected"
+    assert "incrementalKey" in recorded[0]["error"]
 
 
 def test_run_one_object_routes_an_oracle_driver_sql_connector_through_the_oracle_adapter(monkeypatch) -> None:
@@ -907,7 +953,7 @@ def test_run_one_object_registers_a_loaded_table_in_the_catalog(monkeypatch) -> 
     monkeypatch.setattr(f, "record_ingest_run", lambda **kw: None)
     monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
     monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_dial", staticmethod(lambda *a: object()))
-    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg: {"rows": 836})
+    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg, plan: {"rows": 836})
     registered = []
     monkeypatch.setattr(
         f.connector_catalog, "register_connector_table", lambda cid, obj: registered.append((cid, obj)) or 1672
@@ -935,7 +981,7 @@ def test_a_catalog_registration_failure_never_fails_a_load_that_succeeded(monkey
     monkeypatch.setattr(f, "record_ingest_run", lambda **kw: recorded.append(kw))
     monkeypatch.setattr(f.secret_resolver, "resolve_secret_ref", lambda ref: "s3cret")
     monkeypatch.setattr(f.dlt_pipeline.BronzeIngestConfig, "from_dial", staticmethod(lambda *a: object()))
-    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg: {"rows": 836})
+    monkeypatch.setattr(f.dlt_pipeline, "run_bronze_ingest", lambda cfg, plan: {"rows": 836})
 
     def _broken(*a, **k):
         raise RuntimeError("clickhouse is down")

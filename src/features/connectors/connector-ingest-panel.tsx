@@ -23,7 +23,14 @@ import { backfillTriggerMessage } from "@/lib/connectors/backfill-message"
 import { formatDateTime, formatDuration, formatRelativeTime, formatTimeUntil, parseTimestamp } from "@/lib/format"
 import { withNotify } from "@/lib/notify"
 import { connectorService } from "@/services"
-import type { Dial, IngestJobRun, IngestRun, IngestSpec, SourceObject } from "@/services/contracts/connectors"
+import type {
+  Dial,
+  IngestJobRun,
+  IngestRun,
+  IngestSpec,
+  LoadMode,
+  SourceObject,
+} from "@/services/contracts/connectors"
 
 /** A lower-case SQL-safe identifier: what a Bronze table can be called. */
 const TARGET_PATTERN = /^[a-z_][a-z0-9_]*$/
@@ -99,17 +106,64 @@ const RUN_TONE: Record<string, "success" | "destructive" | "warning" | "neutral"
   unsupported: "neutral",
 }
 
-type Selection = { name: string; target: string; incrementalKey?: string }[]
+type Selected = { name: string; target: string; loadMode: LoadMode; incrementalKey?: string }
+type Selection = Selected[]
 
-function fromSpec(spec: IngestSpec): Selection {
-  return spec.sourceObjects.map((o) => ({ name: o.name, target: o.target, incrementalKey: o.incrementalKey }))
+/** What a table gets when it is ticked: one copy of the source per run. */
+const DEFAULT_LOAD_MODE: LoadMode = "replace"
+
+const LOAD_MODE_LABEL: Record<LoadMode, string> = {
+  replace: "Replace all rows",
+  incremental: "Add only new rows",
+  append: "Add all rows again",
 }
 
-function toSourceObjects(selection: Selection): SourceObject[] {
+/** What a mode does on each run, in one line under the choice. */
+function loadModeHint(mode: LoadMode, cursor: string): string {
+  switch (mode) {
+    case "replace":
+      return "The table always holds one copy of the source."
+    case "incremental":
+      return `The first run copies everything; later runs add rows whose ${
+        cursor || "column"
+      } is higher than the last one seen. A changed row is added again as a new version.`
+    case "append":
+      return "Every run adds the whole source on top of earlier loads, so the table grows by a full copy each time."
+  }
+}
+
+/** `incremental` is pushed into a SQL query; no other adapter runs it. */
+function loadModesFor(adapter: string): LoadMode[] {
+  return adapter === "sql" ? ["replace", "incremental", "append"] : ["replace", "append"]
+}
+
+/** Why a table's load mode cannot be saved, or `null`. */
+export function loadModeProblem(selected: { loadMode: LoadMode; incrementalKey?: string }): string | null {
+  if (selected.loadMode === "incremental" && !(selected.incrementalKey ?? "").trim()) {
+    return "Pick the column that marks new rows, such as an id or an updated-at time."
+  }
+  return null
+}
+
+function fromSpec(spec: IngestSpec): Selection {
+  return spec.sourceObjects.map((o) => ({
+    name: o.name,
+    target: o.target,
+    // Saved before load modes existed: the ingest job replaces.
+    loadMode: o.loadMode ?? DEFAULT_LOAD_MODE,
+    incrementalKey: o.incrementalKey,
+  }))
+}
+
+/** `withModes: false` for CDC, whose tables stream and are never loaded by a run. */
+function toSourceObjects(selection: Selection, withModes: boolean): SourceObject[] {
   return selection.map((s) => ({
     name: s.name,
     target: s.target,
-    ...(s.incrementalKey ? { incrementalKey: s.incrementalKey } : {}),
+    ...(withModes ? { loadMode: s.loadMode } : {}),
+    ...(withModes && s.loadMode === "incremental" && s.incrementalKey?.trim()
+      ? { incrementalKey: s.incrementalKey.trim() }
+      : {}),
   }))
 }
 
@@ -201,7 +255,7 @@ function IngestEditor({
           adapter,
           ingestMode: spec.ingestMode ?? "batch",
           dial: spec.dial,
-          sourceObjects: toSourceObjects(selection),
+          sourceObjects: toSourceObjects(selection, !isCdc),
           ...(cron && !isCdc ? { scheduleCron: cron } : {}),
         },
         signal
@@ -216,32 +270,39 @@ function IngestEditor({
       selection.filter((_, j) => j !== i).map((o) => o.target)
     )
   )
+  const modeProblems = selection.map((s) => (isCdc ? null : loadModeProblem(s)))
   const scheduleProblem = !isCdc && cronChoice === "custom" ? cronProblem(customCron) : null
   const dirty =
-    JSON.stringify(toSourceObjects(selection)) !== JSON.stringify(toSourceObjects(saved)) ||
+    JSON.stringify(toSourceObjects(selection, !isCdc)) !== JSON.stringify(toSourceObjects(saved, !isCdc)) ||
     (!isCdc && cron !== savedCron)
-  const canSave = dirty && problems.every((p) => p === null) && scheduleProblem === null
+  const canSave =
+    dirty && problems.every((p) => p === null) && modeProblems.every((p) => p === null) && scheduleProblem === null
 
   function toggle(name: string) {
     setSelection((current) =>
       current.some((s) => s.name === name)
         ? current.filter((s) => s.name !== name)
-        : [...current, { name, target: defaultTarget(connectorName, name) }]
+        : [...current, { name, target: defaultTarget(connectorName, name), loadMode: DEFAULT_LOAD_MODE }]
     )
   }
 
-  function setTarget(name: string, target: string) {
-    setSelection((current) => current.map((s) => (s.name === name ? { ...s, target } : s)))
+  function change(name: string, patch: Partial<Selected>) {
+    setSelection((current) => current.map((s) => (s.name === name ? { ...s, ...patch } : s)))
   }
 
   function addManual() {
     const name = manualName.trim()
     if (!name || selectedNames.has(name)) return
-    setSelection((current) => [...current, { name, target: defaultTarget(connectorName, name) }])
+    setSelection((current) => [
+      ...current,
+      { name, target: defaultTarget(connectorName, name), loadMode: DEFAULT_LOAD_MODE },
+    ])
     setManualName("")
   }
 
   const found = discover.data?.supported ? discover.data.objects : []
+  // The columns of the tables found so far, to pick a cursor column from.
+  const columnsOf = new Map(found.map((o) => [o.name, o.columns.map((c) => c.name)]))
   const needle = filter.trim().toLowerCase()
   const shown = needle ? found.filter((o) => o.name.toLowerCase().includes(needle)) : found
   const allShownSelected = shown.length > 0 && shown.every((o) => selectedNames.has(o.name))
@@ -256,7 +317,7 @@ function IngestEditor({
         <p className="text-xs text-muted-foreground">
           {isStream
             ? "A Kafka connector reads its topic; each run takes one micro-batch."
-            : "Each table here is copied into its own Bronze table on every run. Nothing is ingested until at least one table is saved."}
+            : "Each table here lands in its own Bronze table. A run replaces its rows, or adds to them, as chosen per table. Nothing is ingested until at least one table is saved."}
         </p>
       </div>
 
@@ -300,13 +361,22 @@ function IngestEditor({
                       <Input
                         aria-label={`Bronze table for ${s.name}`}
                         value={s.target}
-                        onChange={(e) => setTarget(s.name, e.target.value)}
+                        onChange={(e) => change(s.name, { target: e.target.value })}
                         className="h-7 font-mono text-xs"
                         aria-invalid={problems[i] !== null}
                         autoComplete="off"
                       />
                     </div>
                     {problems[i] ? <p className="text-xs text-destructive">{problems[i]}</p> : null}
+                    {!isCdc ? (
+                      <LoadModeFields
+                        selected={s}
+                        modes={loadModesFor(adapter)}
+                        columns={columnsOf.get(s.name) ?? null}
+                        problem={modeProblems[i]}
+                        onChange={(patch) => change(s.name, patch)}
+                      />
+                    ) : null}
                   </li>
                 ))}
               </ul>
@@ -373,7 +443,14 @@ function IngestEditor({
                         setSelection((current) => {
                           if (allShownSelected) return current.filter((s) => !shown.some((o) => o.name === s.name))
                           const missing = shown.filter((o) => !current.some((s) => s.name === o.name))
-                          return [...current, ...missing.map((o) => ({ name: o.name, target: defaultTarget(connectorName, o.name) }))]
+                          return [
+                            ...current,
+                            ...missing.map((o) => ({
+                              name: o.name,
+                              target: defaultTarget(connectorName, o.name),
+                              loadMode: DEFAULT_LOAD_MODE,
+                            })),
+                          ]
                         })
                       }
                     >
@@ -521,6 +598,84 @@ function IngestEditor({
               : null
         }
       />
+    </div>
+  )
+}
+
+/**
+ * What a run does with one table's rows: replace them, add only new ones
+ * (by a cursor column), or add everything again. The cursor is picked from
+ * the table's columns once it has been found, and typed otherwise.
+ */
+function LoadModeFields({
+  selected,
+  modes,
+  columns,
+  problem,
+  onChange,
+}: {
+  selected: Selected
+  modes: LoadMode[]
+  columns: string[] | null
+  problem: string | null
+  onChange: (patch: Partial<Selected>) => void
+}) {
+  const cursor = selected.incrementalKey ?? ""
+  // A saved mode this adapter no longer offers still shows, rather than
+  // silently reading as another one.
+  const offered = modes.includes(selected.loadMode) ? modes : [...modes, selected.loadMode]
+  const fieldClass = "h-7 rounded-lg border border-input bg-transparent px-2 text-xs"
+  return (
+    <div className="space-y-1">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="shrink-0 text-xs text-muted-foreground">Each run</span>
+        <select
+          aria-label={`Load mode for ${selected.name}`}
+          className={fieldClass}
+          value={selected.loadMode}
+          onChange={(e) => onChange({ loadMode: e.target.value as LoadMode })}
+        >
+          {offered.map((mode) => (
+            <option key={mode} value={mode}>
+              {LOAD_MODE_LABEL[mode]}
+            </option>
+          ))}
+        </select>
+        {selected.loadMode === "incremental" ? (
+          <>
+            <span className="shrink-0 text-xs text-muted-foreground">by</span>
+            {columns && columns.length > 0 ? (
+              <select
+                aria-label={`New-row column for ${selected.name}`}
+                className={`${fieldClass} min-w-0 flex-1 font-mono`}
+                value={cursor}
+                aria-invalid={problem !== null}
+                onChange={(e) => onChange({ incrementalKey: e.target.value })}
+              >
+                <option value="">Pick a column…</option>
+                {(columns.includes(cursor) || cursor === "" ? columns : [cursor, ...columns]).map((column) => (
+                  <option key={column} value={column}>
+                    {column}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <Input
+                aria-label={`New-row column for ${selected.name}`}
+                value={cursor}
+                onChange={(e) => onChange({ incrementalKey: e.target.value })}
+                placeholder="updated_at"
+                className="h-7 min-w-0 flex-1 font-mono text-xs"
+                aria-invalid={problem !== null}
+                autoComplete="off"
+              />
+            )}
+          </>
+        ) : null}
+      </div>
+      <p className={problem ? "text-xs text-destructive" : "text-xs text-muted-foreground"}>
+        {problem ?? loadModeHint(selected.loadMode, cursor.trim())}
+      </p>
     </div>
   )
 }

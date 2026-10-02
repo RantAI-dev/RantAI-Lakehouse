@@ -6,6 +6,7 @@ import {
   defaultDiscoverSchema,
   defaultTarget,
   groupResultsByRun,
+  loadModeProblem,
   targetProblem,
 } from "./connector-ingest-panel"
 
@@ -62,6 +63,14 @@ function stubFetch(spec: typeof SPEC = SPEC): Call[] {
 }
 
 describe("ingest panel helpers", () => {
+  it("asks an incremental table for its new-row column", () => {
+    expect(loadModeProblem({ loadMode: "replace" })).toBeNull()
+    expect(loadModeProblem({ loadMode: "append", incrementalKey: "" })).toBeNull()
+    expect(loadModeProblem({ loadMode: "incremental", incrementalKey: "updated_at" })).toBeNull()
+    expect(loadModeProblem({ loadMode: "incremental", incrementalKey: "  " })).toMatch(/Pick the column/)
+    expect(loadModeProblem({ loadMode: "incremental" })).toMatch(/Pick the column/)
+  })
+
   it("names a Bronze table after the connector and the source table", () => {
     expect(defaultTarget("northwind", "public.orders")).toBe("northwind_orders")
     expect(defaultTarget("Northwind DB!", "public.Order Details")).toBe("northwind_db_order_details")
@@ -116,7 +125,8 @@ describe("ConnectorIngestPanel", () => {
       adapter: "sql",
       ingestMode: "batch",
       dial: SPEC.dial,
-      sourceObjects: [{ name: "public.orders", target: "northwind_orders" }],
+      // A ticked table replaces by default: one copy of the source per run.
+      sourceObjects: [{ name: "public.orders", target: "northwind_orders", loadMode: "replace" }],
       scheduleCron: "0 2 * * *",
     })
 
@@ -135,6 +145,60 @@ describe("ConnectorIngestPanel", () => {
     expect(calls.some((c) => c.url.endsWith("/api/connectors/conn-northwind/ingest/run") && c.method === "POST")).toBe(
       true
     )
+  })
+
+  /**
+   * "Add only new rows" needs the column that marks them. It is picked
+   * from the table's own columns once the table has been found, and the
+   * save carries both the mode and the column.
+   */
+  it("saves an incremental table with its new-row column", async () => {
+    const calls = stubFetch()
+    render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    fireEvent.click(await screen.findByRole("button", { name: /Find tables/ }))
+    fireEvent.click(await screen.findByLabelText(/public\.orders/))
+
+    const mode = screen.getByLabelText("Load mode for public.orders") as HTMLSelectElement
+    expect(mode.value).toBe("replace")
+    fireEvent.change(mode, { target: { value: "incremental" } })
+    // No column yet: the reason is shown and the save is off.
+    expect(screen.getByText(/Pick the column that marks new rows/)).toBeDefined()
+    const save = screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement
+    expect(save.disabled).toBe(true)
+
+    fireEvent.change(screen.getByLabelText("New-row column for public.orders"), { target: { value: "order_id" } })
+    expect(screen.getByText(/later runs add rows whose order_id is higher/)).toBeDefined()
+    expect(save.disabled).toBe(false)
+    fireEvent.click(save)
+    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true))
+    expect((calls.find((c) => c.method === "PUT")?.body as { sourceObjects: unknown }).sourceObjects).toEqual([
+      { name: "public.orders", target: "northwind_orders", loadMode: "incremental", incrementalKey: "order_id" },
+    ])
+  })
+
+  /**
+   * A table saved before load modes existed is run as "replace", so that
+   * is what it shows, without counting as an unsaved change. Only SQL
+   * connectors are offered "Add only new rows".
+   */
+  it("shows a table saved without a mode as replace, and offers incremental to SQL only", async () => {
+    stubFetch({ ...SPEC, sourceObjects: [{ name: "public.orders", target: "northwind_orders" }] })
+    const sql = render(<ConnectorIngestPanel connectorId="conn-northwind" connectorName="northwind" />)
+    const mode = (await screen.findByLabelText("Load mode for public.orders")) as HTMLSelectElement
+    expect(mode.value).toBe("replace")
+    expect([...mode.options].map((o) => o.value)).toEqual(["replace", "incremental", "append"])
+    expect((screen.getByRole("button", { name: "Save tables and schedule" }) as HTMLButtonElement).disabled).toBe(true)
+    sql.unmount()
+
+    stubFetch({
+      ...SPEC,
+      adapter: "rest",
+      dial: { baseUrl: "https://api.example.com" } as unknown as typeof SPEC.dial,
+      sourceObjects: [{ name: "orders", target: "api_orders" }],
+    })
+    render(<ConnectorIngestPanel connectorId="conn-api" connectorName="api" />)
+    const restMode = (await screen.findByLabelText("Load mode for orders")) as HTMLSelectElement
+    expect([...restMode.options].map((o) => o.value)).toEqual(["replace", "append"])
   })
 
   it("does not save a Bronze name that is not an identifier", async () => {

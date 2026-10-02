@@ -37,6 +37,33 @@ is genuinely absent:
 `SinkResult.load_info_str` is `str(load_info)`, dlt's own human-readable
 load summary -- used ONLY for a warning-level log line by callers, never
 surfaced to a caller's response/API, since it can contain a file path.
+
+# Load modes (`LoadPlan`)
+
+How a run's rows meet the Bronze table they land in. Each behaviour below
+was checked against `dlt` 1.30.0 writing Iceberg, not taken from its docs:
+
+- `append` adds every row the source returns. Run twice, the table holds
+  two copies. This is what every load did before `LoadPlan` existed, and
+  it stays the default of `load_via_sink` itself (a Kafka micro-batch is
+  new rows by construction).
+- `replace` overwrites the table with what the source returns now
+  (pyiceberg `overwrite`; the previous snapshot stays reachable until it
+  is expired). An empty source empties the table. dlt also forgets the
+  resource's incremental cursor on a replace.
+- `incremental` adds only rows whose cursor column is beyond the highest
+  value the previous incremental run saw (`dlt.sources.incremental`,
+  pushed into the query). Only a `sql_database` source is accepted; see
+  `_apply_cursor` for why no other resource is. dlt keeps that value
+  in the pipeline state, stored with the data in the bucket, so it
+  survives a recreated container. The FIRST incremental run for a cursor
+  has nothing to continue from, so it loads everything and replaces the
+  table: appending the full table onto rows an earlier mode left there
+  would double them. A changed row shows up again as a new version.
+
+Because `replace` forgets the cursor and an `append` run is made to
+(`_forget_cursors`), switching a table between modes never leaves a stale
+cursor behind that would skip or re-add rows.
 """
 
 from __future__ import annotations
@@ -52,10 +79,50 @@ from typing import Any, Protocol
 import dlt
 from dlt.destinations import filesystem
 from dlt.destinations.adapters import iceberg_adapter, iceberg_partition
+from dlt.extract.incremental import IncrementalResourceWrapper
 from dlt.extract.resource import DltResource
 from dlt.extract.source import DltSource
+from dlt.pipeline.helpers import pipeline_drop
 
 logger = logging.getLogger(__name__)
+
+LOAD_MODES = ("replace", "append", "incremental")
+
+
+class UnsupportedLoadMode(ValueError):
+    """A source object asks for a load mode this build cannot run as
+    written: an unknown mode, or `incremental` without a cursor column."""
+
+
+@dataclass(frozen=True)
+class LoadPlan:
+    """How one load's rows meet its Bronze table -- see this module's
+    "Load modes" section. `cursor` is the incremental cursor column and is
+    set exactly when `mode` is `incremental`."""
+
+    mode: str = "append"
+    cursor: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in LOAD_MODES:
+            raise UnsupportedLoadMode(f"load mode {self.mode!r} is not one of {', '.join(LOAD_MODES)}")
+        if self.mode == "incremental" and not self.cursor:
+            raise UnsupportedLoadMode("load mode 'incremental' needs incrementalKey, the column that marks new rows")
+
+    @classmethod
+    def from_source_object(cls, obj: dict[str, Any]) -> "LoadPlan":
+        """The plan a connector's source object asks for. One saved before
+        load modes existed has no `loadMode`; it gets `replace`, so its
+        next run leaves one copy of the source instead of adding another.
+
+        # Errors
+
+        Raises `UnsupportedLoadMode` for an unknown mode, or `incremental`
+        with no `incrementalKey`.
+        """
+        mode = obj.get("loadMode") or "replace"
+        cursor = (obj.get("incrementalKey") or "").strip() or None
+        return cls(mode=mode, cursor=cursor if mode == "incremental" else None)
 
 
 def _stamp_ingested_at(record: dict[str, Any]) -> dict[str, Any]:
@@ -92,12 +159,20 @@ def _stamp_for_load(source: Any) -> Any:
     all -- see this module's own docstring for why that was a bug."""
     if isinstance(source, DltSource):
         for resource in source.resources.values():
-            resource.add_map(_stamp_ingested_at)
+            _stamp_last(resource)
         return source
     if isinstance(source, DltResource):
-        source.add_map(_stamp_ingested_at)
+        _stamp_last(source)
         return source
     return _stamp_rows(source)
+
+
+def _stamp_last(resource: DltResource) -> None:
+    """Add the stamp as the resource's LAST step. A plain `add_map` lands
+    ahead of the resource's incremental cursor step, where the stamp would
+    change the hash dlt uses to recognise an already-loaded row -- see
+    `_apply_cursor`."""
+    resource.add_map(_stamp_ingested_at, insert_at=len(resource._pipe))
 
 
 class BronzeIngestConfigLike(Protocol):
@@ -218,17 +293,94 @@ def _extract_rows(trace, bronze_table_name: str) -> int | None:
     return trace.last_normalize_info.row_counts.get(bronze_table_name)
 
 
-def load_via_sink(source, bronze_table_name: str, config: SinkConfig) -> SinkResult:
+def _incremental_cursors(pipeline: Any) -> dict[str, dict[str, set[str]]]:
+    """Every incremental cursor this pipeline's state holds, as
+    `{schema name: {resource name: cursor columns}}`. dlt keeps resource
+    state per source schema, and one pipeline has a schema for each kind
+    of source it was ever fed."""
+    cursors: dict[str, dict[str, set[str]]] = {}
+    for schema_name, source_state in (pipeline.state.get("sources") or {}).items():
+        for resource_name, resource_state in (source_state.get("resources") or {}).items():
+            paths = set((resource_state.get("incremental") or {}).keys())
+            if paths:
+                cursors.setdefault(schema_name, {})[resource_name] = paths
+    return cursors
+
+
+def _has_cursor(pipeline: Any, cursor: str) -> bool:
+    """Whether an earlier incremental run left a value for `cursor` to
+    continue from. Reads the state stored with the data first, since a
+    recreated container starts with no local copy of it."""
+    pipeline.sync_destination()
+    return any(
+        cursor in paths for resources in _incremental_cursors(pipeline).values() for paths in resources.values()
+    )
+
+
+def _forget_cursors(pipeline: Any) -> None:
+    """Drop every incremental cursor after an `append` run. That run added
+    the whole source again, so a cursor kept from an earlier incremental
+    run would no longer describe what the table holds; the next
+    incremental run then starts over (and replaces). A no-op for a
+    pipeline that never ran incrementally, which is every Kafka one.
+
+    Schema by schema: `pipeline_drop` looks in one schema only, the
+    pipeline's first by default, which is not where the cursor lives once
+    a table has been fed by more than one kind of source."""
+    for schema_name, resources in sorted(_incremental_cursors(pipeline).items()):
+        pipeline_drop(pipeline, resources=sorted(resources), schema_name=schema_name, state_only=True)()
+
+
+def _apply_cursor(source: Any, cursor: str) -> None:
+    """Attach the incremental cursor to what `source` loads.
+
+    Only a resource that takes the cursor itself is accepted, which is what
+    a `sql_database` table is: it puts the cursor in its query, and its
+    cursor step stays where it is, so `_stamp_last` can put the
+    `_ingested_at` stamp AFTER it. That order is what makes a rerun exact.
+    dlt re-reads the rows at the cursor's last value and recognises the
+    ones it already loaded by their primary key, or by hashing the whole
+    row when the table has none. On any other resource dlt moves the
+    cursor filter behind every map step whenever hints are applied, so the
+    stamp would change that hash on every run and the boundary row would
+    be added again each time (seen against a real Iceberg table: +3 then
+    +1 rows where +2 then 0 were due).
+
+    # Errors
+
+    Raises `UnsupportedLoadMode` for plain rows and for a resource that
+    does not take a cursor itself.
+    """
+    if isinstance(source, DltSource):
+        resources = list(source.selected_resources.values())
+    elif isinstance(source, DltResource):
+        resources = [source]
+    else:
+        raise UnsupportedLoadMode("load mode 'incremental' needs a dlt source or resource, not plain rows")
+    for resource in resources:
+        if not isinstance(resource.incremental, IncrementalResourceWrapper):
+            raise UnsupportedLoadMode(
+                f"load mode 'incremental' is not available for {resource.name!r}: its source cannot filter by a "
+                "cursor before the rows are stamped, so reruns would add the last row again"
+            )
+        resource.apply_hints(incremental=dlt.sources.incremental(cursor))
+
+
+def load_via_sink(
+    source, bronze_table_name: str, config: SinkConfig, plan: LoadPlan = LoadPlan()
+) -> SinkResult:
     """Write `source` (an already-configured `dlt` source, e.g. `sql_database(...)`
     with hints/maps already applied by the calling adapter) to Bronze
     Iceberg through Lakekeeper's REST catalog, and report the real,
-    measured outcome.
+    measured outcome. `plan` says how the rows meet the table (this
+    module's "Load modes" section); the default appends.
 
     # Errors
 
     Raises whatever `pipeline.run` raises (`PipelineStepFailed`, etc.) --
     this stays a thin, unit-testable wrapper around dlt's own run, not a
-    place that swallows load failures.
+    place that swallows load failures. Raises `UnsupportedLoadMode` for an
+    incremental plan over plain rows.
     """
     _install_catalog_env(config)
 
@@ -253,6 +405,8 @@ def load_via_sink(source, bronze_table_name: str, config: SinkConfig) -> SinkRes
     # and silently under-partitions everything else. Stamping unconditionally
     # here, before `iceberg_adapter` fixes the partition spec to that
     # column, closes that gap for every caller at once.
+    if plan.mode == "incremental":
+        _apply_cursor(source, plan.cursor or "")
     source = _stamp_for_load(source)
 
     # Adapters still apply their own `apply_hints` (table name, primary
@@ -297,12 +451,28 @@ def load_via_sink(source, bronze_table_name: str, config: SinkConfig) -> SinkRes
         # Lakekeeper namespace `lakehouse-iceberg`'s Rust write path uses.
         dataset_name="bronze",
     )
-    load_info = pipeline.run(source, table_name=bronze_table_name, table_format="iceberg")
+    write_disposition = "append" if plan.mode == "incremental" else plan.mode
+    if plan.mode == "incremental" and not _has_cursor(pipeline, plan.cursor or ""):
+        # Nothing to continue from: load everything, and replace rather
+        # than stack it onto what an earlier mode left there.
+        write_disposition = "replace"
+    load_info = pipeline.run(
+        source, table_name=bronze_table_name, table_format="iceberg", write_disposition=write_disposition
+    )
 
     # A load with failed jobs never produced a trustworthy normalize count
     # for this run -- `rows` is `None` here even if `row_counts` happens to
     # carry a stale/partial number (WS3 plan review Z9, case 2 of 3).
     rows = None if load_info.has_failed_jobs else _extract_rows(pipeline.last_trace, bronze_table_name)
+    if rows is None and plan.mode == "incremental" and not load_info.has_failed_jobs and pipeline.last_trace:
+        # The one case an absent count IS a measurement: the cursor filter
+        # ran and let nothing through, so this run added zero rows.
+        rows = 0
+
+    # After the count is read: forgetting cursors is a (state-only) load of
+    # its own, which replaces `pipeline.last_trace`.
+    if plan.mode == "append" and not load_info.has_failed_jobs:
+        _forget_cursors(pipeline)
 
     if load_info.has_failed_jobs:
         # `str(load_info)` can contain a file path -- log only, never

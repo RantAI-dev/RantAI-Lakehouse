@@ -2666,6 +2666,10 @@ pub async fn ingest_spec_put(
     {
         return Err(ApiError::BadRequest(problem).into());
     }
+    // A load mode the ingest job cannot run is refused here too, rather
+    // than surfacing as a rejected run later.
+    lakehouse_store::ingest_spec::validate_load_modes(&body.adapter, &body.source_objects)
+        .map_err(|err| ApiError::BadRequest(err.to_string()))?;
     // Parsed here, in the route, ahead of `set_ingest_spec`'s own (later,
     // authoritative-for-persistence) `Dial::parse` call: this handler
     // needs the typed `Dial` itself to extract a host for

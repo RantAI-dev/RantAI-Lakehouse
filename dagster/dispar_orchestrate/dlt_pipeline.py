@@ -63,7 +63,7 @@ from typing import Any
 from dlt.sources.sql_database import sql_database
 
 from dispar_orchestrate import ssrf_guard
-from dispar_orchestrate.adapters.sink import SinkConfig, load_via_sink
+from dispar_orchestrate.adapters.sink import LoadPlan, SinkConfig, load_via_sink
 
 
 def _env(name: str, default: str) -> str:
@@ -222,7 +222,7 @@ class BronzeIngestConfig:
         )
 
 
-def run_bronze_ingest(config: BronzeIngestConfig | None = None) -> dict[str, Any]:
+def run_bronze_ingest(config: BronzeIngestConfig | None = None, plan: LoadPlan = LoadPlan()) -> dict[str, Any]:
     """Run the dlt pipeline once: build the Postgres `sql_database` source
     (SSRF-checked and `hostaddr`-pinned per WS3 item 20, the rest
     unchanged from before that pin was added), then write it through the
@@ -231,7 +231,8 @@ def run_bronze_ingest(config: BronzeIngestConfig | None = None) -> dict[str, Any
     adapter (SQL/files/REST) writes through too. Returns a small summary
     dict (row/table names, measured row count) for the caller (the
     Dagster op in `assets.py`) to attach as metadata and pass on to Bronze
-    catalog registration.
+    catalog registration. `plan` is the load mode (`adapters/sink.py`'s
+    "Load modes"); the default appends, as this function always did.
 
     # Errors
 
@@ -291,7 +292,7 @@ def run_bronze_ingest(config: BronzeIngestConfig | None = None) -> dict[str, Any
     # `resource.add_map(_stamp_ingested_at)` here, which meant the column
     # only existed on the ONE code path (this one) that remembered to add
     # it.
-    result = load_via_sink(source, cfg.bronze_table_name, SinkConfig.from_bronze_ingest_config(cfg))
+    result = load_via_sink(source, cfg.bronze_table_name, SinkConfig.from_bronze_ingest_config(cfg), plan)
     if result.has_failed_jobs:
         # `load_info_str` (`str(load_info)`) can contain a file path --
         # fine in a raised exception that stays server-side (this op is

@@ -448,9 +448,23 @@ export type SftpAuth = { type: "password" } | { type: "public_key" }
  */
 export type SourceObject = {
   name: string
+  /** The cursor column of an `incremental` object: the column whose value
+   * only grows, such as an id or an updated-at time. */
   incrementalKey?: string
+  /** How a run's rows meet the Bronze table. Absent on an object saved
+   * before load modes existed, which the ingest job runs as `replace`. */
+  loadMode?: LoadMode
   target: string
 }
+
+/**
+ * Mirrors Rust `LoadMode` (`ingest_spec.rs`) and `LOAD_MODES` in
+ * `dagster/dispar_orchestrate/adapters/sink.py`, which acts on it:
+ * `replace` overwrites the table with what the source returns now,
+ * `append` adds every row again, `incremental` adds only rows beyond the
+ * cursor column's last seen value (SQL connectors only).
+ */
+export type LoadMode = "replace" | "append" | "incremental"
 
 /**
  * Credential reference NAMES only (`env:FOO`, `file:/…`), never a

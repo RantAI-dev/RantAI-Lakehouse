@@ -384,3 +384,58 @@ async fn ingest_run_history_lists_only_this_connectors_runs() {
     assert_eq!(runs[1]["runId"], "run-1");
     assert_eq!(runs[1]["status"], "failed");
 }
+
+/// A load mode the ingest job cannot run is refused when the spec is
+/// saved, with the reason, instead of surfacing later as a rejected run.
+#[tokio::test]
+async fn ingest_spec_put_refuses_a_load_mode_the_job_cannot_run() {
+    let app = spin_up().await;
+    seed_sql_connector(&app.pool, "conn-ingest-mode").await;
+    let cookie = session_cookie_for_seeded_user(&app.pool, "bayu@meridian.example").await;
+
+    for (object, expected) in [
+        (
+            json!({ "name": "public.orders", "target": "orders", "loadMode": "incremental" }),
+            "incrementalKey",
+        ),
+        (
+            json!({ "name": "public.orders", "target": "orders", "loadMode": "merge" }),
+            "replace, append or incremental",
+        ),
+    ] {
+        let body = json!({
+            "adapter": "sql",
+            "ingestMode": "batch",
+            "dial": { "driver": "postgres", "host": "pg-src", "port": 5432, "database": "d", "user": "u" },
+            "sourceObjects": [object],
+        });
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/connectors/conn-ingest-mode/ingest-spec")
+                    .header("cookie", &cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router never fails a request outright");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(message.contains(expected), "{message}");
+    }
+
+    let stored: Value =
+        sqlx::query_scalar("SELECT source_objects FROM connector WHERE id = 'conn-ingest-mode'")
+            .fetch_one(&app.pool)
+            .await
+            .expect("read source objects");
+    assert_eq!(stored, json!([]), "nothing was saved");
+}
