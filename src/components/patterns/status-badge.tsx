@@ -86,7 +86,6 @@ const STATUS_TONE: Record<EntityStatus, Tone> = {
   validating: "info",
   ready: "success",
   scheduled: "info",
-  queued: "info",
   running: "info",
   paused: "neutral",
   degraded: "warning",
@@ -96,7 +95,6 @@ const STATUS_TONE: Record<EntityStatus, Tone> = {
   blocked: "warning",
   partial: "warning",
   archived: "neutral",
-  unknown: "neutral",
 }
 
 /** Shared lifecycle badge for pipelines, jobs, runs, policies, and agents. */

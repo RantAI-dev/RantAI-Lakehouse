@@ -51,7 +51,10 @@ const LAUNCH_GRACE_MS = 60_000
 const NO_RUNS: PipelineRun[] = []
 
 function isRunActive(run: PipelineRun): boolean {
-  return run.status === "queued" || run.status === "running"
+  // The API reports a run that has not started yet as "queued", a status
+  // `EntityStatus` does not list.
+  const status: string = run.status
+  return status === "queued" || status === "running"
 }
 
 function AssetLink({ id, label }: { readonly id?: string; readonly label: string }) {
@@ -498,11 +501,8 @@ export function PipelineDetailPage() {
       (signal, id: string) => pipelineService.resumePipeline(id, signal)
     )
   )
-  const activateAction = useServiceAction(
-    withNotify(
-      { success: "Pipeline activated", error: "Failed to activate pipeline" },
-      (signal, id: string) => pipelineService.setPipelineStatus(id, "ready", signal)
-    )
+  const activateAction = useServiceAction((signal, id: string) =>
+    pipelineService.setPipelineStatus(id, "ready", signal)
   )
 
   // Latest run's real step statuses color the graph tab's nodes — `runs`
@@ -556,19 +556,14 @@ export function PipelineDetailPage() {
   if (state.status === "loading") return <LoadingSkeleton rows={8} />
   if (state.status === "error") return <ErrorState error={state.error} onRetry={state.reload} />
   const p = state.data
+  const isPaused = p.status === "paused"
+  const isDraft = p.status === "draft"
   // An authored (console-created) pipeline's id is always `pl-<slug>-<base36
   // millis>`; a Dagster job id is never prefixed `pl-` (same derivation as
-  // `pipelineOrigin` in `./pipeline-columns.tsx`).
+  // `pipelineOrigin` in `./pipeline-columns.tsx`). An authored pipeline
+  // runs one run at a time — the API refuses a second while one is going —
+  // and pausing it holds its runs rather than a schedule.
   const isAuthored = p.id.startsWith("pl-")
-  const isDraft = p.status === "draft"
-  // Pausing an authored pipeline holds its runs, and it runs one at a time
-  // (the API refuses a second while one is going). Pausing a Dagster job
-  // stops its schedule — its `status` is its last run's, so the schedule's
-  // own state says whether it is paused — and a manual job has no schedule
-  // to pause. Run now still works while a Dagster schedule is stopped.
-  const isPaused = isAuthored ? p.status === "paused" : p.schedulePaused === true
-  const canPause = isAuthored || (p.schedulePaused !== undefined && p.schedulePaused !== null)
-  const runBlocked = isAuthored && (isPaused || watching)
 
   return (
     <div className="flex flex-col gap-4">
@@ -592,7 +587,7 @@ export function PipelineDetailPage() {
             </Button>
           ) : (
             <>
-              {!canPause ? null : isPaused ? (
+              {isPaused ? (
                 <Button
                   variant="outline"
                   size="sm"
@@ -618,7 +613,7 @@ export function PipelineDetailPage() {
               )}
               <Button
                 size="sm"
-                disabled={runAction.status === "pending" || runBlocked}
+                disabled={isPaused || runAction.status === "pending" || (isAuthored && watching)}
                 onClick={async () => {
                   const run = await runAction.run(pipelineId)
                   if (run) {
@@ -648,11 +643,7 @@ export function PipelineDetailPage() {
             ? `Pause ${p.name}? It cannot be run until resumed.`
             : `Pause ${p.name}? Scheduled runs will stop until resumed.`
         }
-        impact={
-          isAuthored
-            ? "In-flight runs continue; new runs are refused until it is resumed."
-            : "In-flight runs continue; Run now still starts a run."
-        }
+        impact="In-flight runs continue; new triggers are held."
         confirmLabel="Pause pipeline"
         confirming={pauseAction.status === "pending"}
         onConfirm={async () => {

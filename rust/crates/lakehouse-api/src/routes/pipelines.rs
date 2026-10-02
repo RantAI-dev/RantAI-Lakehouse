@@ -208,9 +208,8 @@ fn authored_row(pipeline: &pipelines::Pipeline, runs: &[DgConfiguredRun]) -> Opt
 /// WS5 item E2 Step 1). `lastRunAt` is `null` when the job has never run
 /// instead of an empty string standing in for "never ran". `nextRunAt`
 /// (WS4 item G2) is computed server-side from the job's first schedule's
-/// cron expression; `null` for a manual job, a stopped schedule or an
-/// uncomputable cron — never a guess. `schedulePaused` says whether that
-/// schedule is stopped: `status` is the last run's, so it cannot.
+/// cron expression; `null` for a manual job or an uncomputable cron —
+/// never a guess.
 fn dagster_pipeline_row(j: &DgJob, last: Option<&DgRun>) -> Value {
     json!({
         "id": j.name,
@@ -225,43 +224,24 @@ fn dagster_pipeline_row(j: &DgJob, last: Option<&DgRun>) -> Value {
             .and_then(|r| r.start_time)
             .map_or(Value::Null, |t| Value::String(iso_from_unix_seconds(t))),
         "nextRunAt": next_run_at_json(j),
-        "schedulePaused": schedule_paused(j),
         "slaOk": Value::Null,
         "freshnessLagSeconds": Value::Null,
     })
 }
 
-/// Whether `job`'s first schedule — the one [`schedule_label`] shows and
-/// [`pause`]/[`resume`] act on — is stopped. `None` for a job with no
-/// schedule, which has nothing to pause or resume.
-fn schedule_paused(job: &DgJob) -> Option<bool> {
-    job.schedules
-        .first()
-        .map(|s| s.schedule_state.status == "STOPPED")
-}
-
 /// `nextRunAt` for a `Dagster` job (WS4 item G2): the next fire time of its
 /// FIRST schedule (same "only the first schedule" rule [`schedule_label`]
 /// already follows), computed server-side via
-/// `crate::next_run::next_run_at`. `null` for a job with no schedule, a
-/// stopped schedule (it will not fire), or a cron expression `next_run_at`
-/// cannot compute a next occurrence from — never a fabricated guess.
-fn next_run_at_json(job: &DgJob) -> Value {
-    if schedule_paused(job) == Some(true) {
-        return Value::Null;
-    }
-    next_cron_fire_json(job)
-}
-
-/// The next time `job`'s first schedule's cron fires, whether or not that
-/// schedule is running.
+/// `crate::next_run::next_run_at`. `null` for a job with no schedule, or
+/// whose cron expression `next_run_at` cannot compute a next occurrence
+/// from — never a fabricated guess.
 #[allow(
     clippy::cast_precision_loss,
     reason = "a cron next-occurrence Unix timestamp (seconds since epoch) fits exactly in f64 \
               until year 285 million; iso_from_unix_seconds takes f64 for parity with Dagster's \
               own run timestamps"
 )]
-fn next_cron_fire_json(job: &DgJob) -> Value {
+fn next_run_at_json(job: &DgJob) -> Value {
     job.schedules
         .first()
         .and_then(|s| crate::next_run::next_run_at(&s.cron_schedule, OffsetDateTime::now_utc()))
@@ -458,9 +438,7 @@ async fn authored_detail(state: &AppState, id: &str) -> Response {
     let mut body = authored_row(&pipeline, &runs).unwrap_or_else(|| json!({}));
     if let Value::Object(obj) = &mut body {
         obj.insert("engine".to_owned(), json!("authored"));
-        // The author's own description (`0047_pipeline_description.sql`),
-        // which `Pipeline` leaves out when there is none.
-        obj.entry("description").or_insert(Value::Null);
+        obj.insert("description".to_owned(), Value::Null);
         obj.insert("graph".to_owned(), Value::Null);
         obj.insert("config".to_owned(), json!([]));
         obj.insert(
@@ -1271,15 +1249,6 @@ pub async fn generate(
     body: Bytes,
 ) -> ApiResult<(StatusCode, ApiJson<pipelines::Pipeline>)> {
     let body: GeneratePipelineBody = parse_body(&body)?;
-    // The one database is both the source and the target zone, so it must
-    // be a zone a run can write.
-    if !TARGET_ZONES.contains(&body.database.as_str()) {
-        return Err(ApiError::BadRequest(format!(
-            "invalid database: pick one of {}",
-            TARGET_ZONES.join(", ")
-        ))
-        .into());
-    }
     let tenant_id = creation_tenant(&principal, &headers)?;
     // The draft used to be a name and nothing else: every generated
     // pipeline arrived reading `source_table` → `target_table`, kind
@@ -1297,33 +1266,14 @@ pub async fn generate(
         .and_then(|d| d.kind.clone())
         .filter(|k| PIPELINE_KINDS.contains(&k.as_str()))
         .unwrap_or_else(|| "batch".to_owned());
-    let source_table = table_name_or(
-        draft.as_ref().and_then(|d| d.source_table.clone()),
-        &fallback_name,
-    );
-    let target_table = table_name_or(
-        draft.as_ref().and_then(|d| d.target_table.clone()),
-        &format!("{fallback_name}_out"),
-    );
-    // A model proposes transforms as free text. Only the ones inside the
-    // grammar `create` enforces are kept; the run would fail on any other.
-    let proposed = draft
+    let source_table = draft
         .as_ref()
-        .map(|d| d.transforms.clone())
-        .unwrap_or_default();
-    let (transforms, left_out): (Vec<String>, Vec<String>) = proposed
-        .into_iter()
-        .partition(|t| crate::transform_grammar::parse_transform(t).is_ok());
-    let description = if left_out.is_empty() {
-        body.instruction.clone()
-    } else {
-        format!(
-            "{}\n\n{} proposed transform step(s) were outside the transform grammar and were \
-             left out.",
-            body.instruction,
-            left_out.len()
-        )
-    };
+        .and_then(|d| d.source_table.clone())
+        .unwrap_or_else(|| fallback_name.clone());
+    let target_table = draft
+        .as_ref()
+        .and_then(|d| d.target_table.clone())
+        .unwrap_or_else(|| format!("{fallback_name}_out"));
     let schedule = draft
         .as_ref()
         .and_then(|d| d.schedule.clone())
@@ -1338,7 +1288,10 @@ pub async fn generate(
         // stays the same honest "not configured" default `create` uses
         // when a human author leaves it unset.
         incremental_column: draft.as_ref().and_then(|d| d.incremental_column.clone()),
-        transforms,
+        transforms: draft
+            .as_ref()
+            .map(|d| d.transforms.clone())
+            .unwrap_or_default(),
         fbic_enabled: false,
         target_zone: body.database,
         target_table,
@@ -1346,24 +1299,12 @@ pub async fn generate(
         owner: Some("Agentic Builder".to_owned()),
         // The instruction is kept verbatim as the description: it is the
         // only record of what this pipeline was asked to do.
-        description: Some(description),
+        description: Some(body.instruction.clone()),
         tenant_id: Some(tenant_id),
         connector_id: None,
     };
     let created = create_named_pipeline(pool(&state)?, &input).await?;
     Ok((StatusCode::CREATED, ApiJson(created)))
-}
-
-/// `proposed` when it is a plain identifier a run can name, `fallback`
-/// otherwise (made one if it is not: a name derived from free text can
-/// start with a digit).
-fn table_name_or(proposed: Option<String>, fallback: &str) -> String {
-    let is_ident = |t: &str| lakehouse_core::ident::Ident::new(t).is_ok();
-    match proposed {
-        Some(table) if is_ident(&table) => table,
-        _ if is_ident(fallback) => fallback.to_owned(),
-        _ => format!("t_{fallback}"),
-    }
 }
 
 /// The kinds a pipeline may be, as the database's `CHECK` constraint
@@ -1407,12 +1348,7 @@ async fn llm_pipeline_draft(
                       and no code fence, with the keys: name (short snake_case), kind \
                       (one of batch, incremental, document, vector), sourceTable, \
                       targetTable, schedule (human readable, e.g. \"Every hour\"), \
-                      incrementalColumn (or null), transforms (an array of steps, each \
-                      exactly one of: dedupe(col), filter(col OP 'value') with OP one of \
-                      = != < <= > >=, rename(old,new), cast(col,TYPE) with TYPE one of \
-                      String Int32 Int64 Float64 Boolean Date DateTime UUID, \
-                      select(col1,col2,...); column names are plain identifiers). \
-                      Table names are plain identifiers with no database prefix."
+                      incrementalColumn (or null), transforms (array of short strings)."
                 .to_owned(),
         },
         ChatMessage {
@@ -1702,8 +1638,6 @@ async fn dagster_schedule_toggle(state: &AppState, job_name: &str, paused: bool)
 /// Same reasoning as [`dagster_pipeline_row`]: no lineage, `SLA`, freshness,
 /// or last-run time is known here, so all five are `null` rather than the
 /// literal `true`/`""`/`0` this endpoint used to return unconditionally.
-/// `job` was read before the mutation, so the schedule's state comes from
-/// `paused`, not from `job`.
 fn schedule_mutation_body(job: &DgJob, paused: bool) -> Value {
     json!({
         "id": job.name,
@@ -1715,8 +1649,7 @@ fn schedule_mutation_body(job: &DgJob, paused: bool) -> Value {
         "target": Value::Null,
         "schedule": schedule_label(job),
         "lastRunAt": Value::Null,
-        "nextRunAt": if paused { Value::Null } else { next_cron_fire_json(job) },
-        "schedulePaused": paused,
+        "nextRunAt": next_run_at_json(job),
         "slaOk": Value::Null,
         "freshnessLagSeconds": Value::Null,
     })
@@ -2378,60 +2311,6 @@ mod tests {
         assert_eq!(schedule_label(&job), "cron: 0 3 * * * (RUNNING)");
     }
 
-    /// A stopped schedule will not fire: no next run, and `schedulePaused`
-    /// says so, which the console needs to offer Resume (`status` is the
-    /// last run's and never reads "paused" for a `Dagster` job).
-    #[test]
-    fn a_stopped_schedule_is_paused_and_has_no_next_run() {
-        let job = |status: &str| DgJob {
-            name: "j".to_owned(),
-            schedules: vec![DgSchedule {
-                name: "s1".to_owned(),
-                cron_schedule: "0 3 * * *".to_owned(),
-                schedule_state: DgScheduleState {
-                    status: status.to_owned(),
-                },
-            }],
-        };
-        let manual = DgJob {
-            name: "m".to_owned(),
-            schedules: vec![],
-        };
-
-        let stopped = dagster_pipeline_row(&job("STOPPED"), None);
-        assert_eq!(stopped["schedulePaused"], true);
-        assert!(stopped["nextRunAt"].is_null());
-
-        let running = dagster_pipeline_row(&job("RUNNING"), None);
-        assert_eq!(running["schedulePaused"], false);
-        assert!(running["nextRunAt"].is_string());
-
-        assert!(dagster_pipeline_row(&manual, None)["schedulePaused"].is_null());
-
-        // Resuming a stopped schedule: `job` still says STOPPED, the body
-        // reports what the mutation just did.
-        let resumed = schedule_mutation_body(&job("STOPPED"), false);
-        assert_eq!(resumed["schedulePaused"], false);
-        assert!(resumed["nextRunAt"].is_string());
-        let paused = schedule_mutation_body(&job("RUNNING"), true);
-        assert_eq!(paused["schedulePaused"], true);
-        assert!(paused["nextRunAt"].is_null());
-    }
-
-    #[test]
-    fn a_generated_table_name_is_kept_only_when_it_is_an_identifier() {
-        assert_eq!(
-            table_name_or(Some("orders_clean".to_owned()), "fallback"),
-            "orders_clean"
-        );
-        assert_eq!(
-            table_name_or(Some("serving.orders".to_owned()), "fallback"),
-            "fallback"
-        );
-        assert_eq!(table_name_or(None, "fallback"), "fallback");
-        assert_eq!(table_name_or(None, "2024_orders"), "t_2024_orders");
-    }
-
     #[test]
     fn schedule_label_manual_when_no_schedules() {
         let job = DgJob {
@@ -2710,7 +2589,6 @@ mod tests {
             let body = Bytes::from(
                 serde_json::to_vec(&json!({
                     "name": format!("detail-route-test-{}", uuid::Uuid::new_v4()),
-                    "description": "Clean orders for the daily report",
                     "kind": "batch",
                     "sourceZone": "bronze",
                     "sourceTable": "t",
@@ -2738,10 +2616,6 @@ mod tests {
             let v: Value = serde_json::from_slice(&response_body).expect("valid JSON");
             assert_eq!(v["id"], created.id);
             assert_eq!(v["engine"], "authored");
-            assert_eq!(
-                v["description"], "Clean orders for the daily report",
-                "the author's description must reach the detail page"
-            );
             assert!(
                 v["graph"].is_null(),
                 "authored pipelines have no job graph yet"
@@ -3360,32 +3234,6 @@ mod tests {
                 row.is_none(),
                 "an invalid transform must write nothing to pipeline_definition"
             );
-        }
-
-        /// `generate` reads and writes the one database it is given, so it
-        /// must be a zone a run can write; nothing is stored otherwise.
-        #[sqlx::test(migrations = "../../migrations")]
-        async fn generate_refuses_a_database_a_run_cannot_write(pool: sqlx::PgPool) {
-            let err = generate(
-                State(state_for(&pool)),
-                Extension(fixture_member_principal()),
-                HeaderMap::new(),
-                Bytes::from(
-                    serde_json::to_vec(&json!({
-                        "instruction": "clean the orders table",
-                        "database": "bronze",
-                    }))
-                    .expect("serialize"),
-                ),
-            )
-            .await
-            .unwrap_err();
-            assert_eq!(err.0.status(), 400);
-            let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM pipeline_definition")
-                .fetch_one(&pool)
-                .await
-                .expect("count pipelines");
-            assert_eq!(count, 0);
         }
 
         /// A zone the run cannot read or write, or a table name that is not

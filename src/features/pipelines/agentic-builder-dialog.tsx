@@ -10,19 +10,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Textarea } from "@/components/ui/textarea"
 import { Spinner } from "@/components/ui/spinner"
 import { useServiceAction } from "@/hooks/use-service"
 import { pipelineService } from "@/services"
 import type { Pipeline } from "@/services/contracts/pipelines"
-
-/**
- * The database a drafted pipeline reads and writes: one a run can write,
- * as `routes::pipelines::generate` enforces (`serving` holds gold marts).
- */
-const DATABASES = ["serving", "silver"]
 
 /**
  * Draft a pipeline from a sentence.
@@ -102,18 +96,11 @@ export function AgenticBuilderDialog({
           </div>
           <div className="grid gap-2">
             <Label htmlFor="ab-db">Database</Label>
-            <Select value={database} onValueChange={(v) => setDatabase(v ?? DATABASES[0])}>
-              <SelectTrigger id="ab-db">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {DATABASES.map((db) => (
-                  <SelectItem key={db} value={db}>
-                    {db}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <Input
+              id="ab-db"
+              value={database}
+              onChange={(e) => setDatabase(e.target.value)}
+            />
             <p className="text-xs text-muted-foreground">
               Source and target tables are proposed inside this database.
             </p>

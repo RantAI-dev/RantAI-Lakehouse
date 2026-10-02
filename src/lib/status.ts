@@ -11,7 +11,6 @@ export type EntityStatus =
   | "validating"
   | "ready"
   | "scheduled"
-  | "queued"
   | "running"
   | "paused"
   | "degraded"
@@ -21,14 +20,12 @@ export type EntityStatus =
   | "blocked"
   | "partial"
   | "archived"
-  | "unknown"
 
 export const ENTITY_STATUS_LABEL: Record<EntityStatus, string> = {
   draft: "Draft",
   validating: "Validating",
   ready: "Ready",
   scheduled: "Scheduled",
-  queued: "Queued",
   running: "Running",
   paused: "Paused",
   degraded: "Degraded",
@@ -38,7 +35,6 @@ export const ENTITY_STATUS_LABEL: Record<EntityStatus, string> = {
   blocked: "Blocked",
   partial: "Partial success",
   archived: "Archived",
-  unknown: "Unknown",
 }
 
 /**
@@ -60,7 +56,6 @@ export const ENTITY_STATUS_DESCRIPTION: Record<EntityStatus, string> = {
   validating: "Configuration checks are in progress.",
   ready: "Validated and available to run.",
   scheduled: "Waiting for its next scheduled trigger.",
-  queued: "Launched; waiting for the orchestrator to start it.",
   running: "Currently executing.",
   paused: "Stopped by an operator; can be resumed.",
   degraded: "Operating with reduced health or delayed output.",
@@ -70,7 +65,6 @@ export const ENTITY_STATUS_DESCRIPTION: Record<EntityStatus, string> = {
   blocked: "Stopped by policy, quota, or approval gate.",
   partial: "Finished with some accepted and some rejected work.",
   archived: "Retained for reference; no longer active.",
-  unknown: "No run has reported a status yet.",
 }
 
 /** Health summary for services, connectors, and assets. */
