@@ -79,9 +79,13 @@ class GoldExportConfig:
     # `GOLD_EXPORT_RUN_TOKEN` from the same compose `.env` — see
     # `docker-compose.yml`'s `gold-export-test-runner` usage comment for
     # why a one-off override here would not also reach the already-running
-    # `lakehouse-api` container). Empty means `lakehouse-api` requires a
-    # service-identity principal instead, which this job does not carry —
-    # operators wanting the schedule to actually succeed must set this.
+    # `lakehouse-api` container). The value authenticates twice:
+    # `lakehouse-api::main::bootstrap_gold_export_service` mints the
+    # `gold-export-scheduler` identity + credential from it at API boot
+    # (gold-publish-per-mart plan T1), `_headers` sends it as both the
+    # bearer credential and the `x-run-token` header. Empty means neither
+    # exists — the schedule then runs and fails loudly (`401`/`503`)
+    # instead of silently, which is the honest state to ship.
     run_token: str
 
     @classmethod
@@ -95,7 +99,18 @@ class GoldExportConfig:
 
 
 def _headers(cfg: GoldExportConfig) -> dict[str, str]:
-    return {"x-run-token": cfg.run_token} if cfg.run_token else {}
+    """Same two-header shape as `alerts_run.py::_headers` — see the
+    schedule comment below for why both are needed. Empty when no token
+    is configured, so a caller can tell "not configured" apart from
+    "configured, but Dagster forgot to send it" without inspecting the
+    response.
+    """
+    if not cfg.run_token:
+        return {}
+    return {
+        "x-run-token": cfg.run_token,
+        "Authorization": f"Bearer {cfg.run_token}",
+    }
 
 
 def export_one_mart(cfg: GoldExportConfig, mart: str) -> dict[str, Any]:
@@ -303,21 +318,19 @@ def gold_export_job() -> None:
 # (confirmed directly against this repo's `~/.cache/rantai-dagster-venv`;
 # a different task in this programme hit exactly this).
 #
-# WS0's `bootstrap_alerts_run_service`/`bootstrap_agent_run_service` shape
-# (`lakehouse-api::main`) is how `alerts_run_schedule` closed the same
-# `POST /api/gold/export/{mart}` `Policy::RequiresAuth` floor problem this
-# job still has: this job sends only `x-run-token`, and `check_export_token`
-# would accept it, but `auth_gate` enforces `RequiresAuth` — a real
-# authenticated principal — BEFORE the handler (and `check_export_token`)
-# ever runs. No `bootstrap_gold_export_service` exists in `main.rs` yet, so
-# this schedule's nightly run reaches the router and gets `401` there,
-# every night, until that Rust-side identity is provisioned. That gap is
-# real and not fixed by this change (it requires a `rust/` change outside
-# this change's scope), but per AGENTS.md rule 2 ("Never fabricate"), a
-# schedule that runs and visibly fails is the honest state to ship, not a
-# schedule withheld to hide the gap — the acceptance test for this reaches
-# the endpoint by logging in as the bootstrap admin first, which a
-# scheduled job must not do, so it does not exercise this floor.
+# Auth (gold-publish-per-mart plan T1): `POST /api/gold/export/{mart}`'s
+# `Policy::RequiresAuth` floor is enforced by `auth_gate` BEFORE the
+# handler (and `check_export_token`'s own `x-run-token` check) ever runs,
+# so a real credential is required — `_headers` sends the shared token two
+# ways, exactly like `alerts_run.py`: `Authorization: Bearer
+# <GOLD_EXPORT_RUN_TOKEN>` clears the floor via the `gold-export-scheduler`
+# identity that `lakehouse-api::main::bootstrap_gold_export_service`
+# idempotently mints from the same env value at API boot, and
+# `x-run-token: <GOLD_EXPORT_RUN_TOKEN>` satisfies `check_export_token`'s
+# token branch, which is what actually gates the export. With the token
+# unset, no identity is seeded and `_headers` returns `{}` — the schedule
+# below is still registered and every run fails loudly (`401`/`503`),
+# which is the honest, visible failure mode, not a silent one.
 gold_export_schedule = ScheduleDefinition(
     job=gold_export_job,
     cron_schedule="0 4 * * *",
