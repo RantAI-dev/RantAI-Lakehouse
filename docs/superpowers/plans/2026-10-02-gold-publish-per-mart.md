@@ -669,8 +669,8 @@ else skipped; no claim above is *not verified*.
 
 ### PR slice D — T7–T9 (developer, 2026-10-02)
 
-Branch `feat/gold-publish-per-mart-d` off `origin/main` at `0fc811d` (slice C
-merged as PR #65). Three commits:
+Branch `feat/gold-publish-per-mart-d` off `origin/main` at `0fc811d`.
+Three commits:
 
 - `fcbc999` — T7. `contracts/gold.ts`: `GoldPublication` type + `getPublication`
   /`setPublication` on `GoldService`. `clients/gold.ts`: `putJson`, `getPublication`,
@@ -710,7 +710,52 @@ Verification — every command run in the foreground on `fafdd5d`:
 
 Not run, with reason: `cargo fmt/clippy/test`, `python3 ops/lint/*.py`,
 `pytest`, compose checks — T7–T9 touch no Rust, no Python, no compose.
+No claim above is *not verified*.
+
+Not tested in a running console: the card was not exercised against a live
+`lakehouse-api` serving real publication data. All assertions here are from
+unit tests only.
+
+### PR slice D — fixes (developer, 2026-10-02)
+
+Review findings D-B1, D-B2, D-B3, D-S1, D-S2, D-S3, D-S4, D-S5 fixed on
+`feat/gold-publish-per-mart-d`.
+
+- `c7d2c98` — D-S5: `src/lib/gold-freshness.ts` with `freshnessLine` and
+  `publicationLabel` that parse RFC 3339 timestamps with `Date.parse`
+  instead of string `<` compare. `gold-exports-page.tsx` imports
+  `publicationLabel` from the shared file, removing its own local copy.
+- `9e34936` — D-B2, D-B3, D-S1, D-S2, D-S3:
+  D-B2: `LastFiveRuns` shows `r.error` text for failed rows in the table.
+  D-B3: always show freshness line and, when a publish exists, last
+  published time and snapshot, whether the switch is on or off. When off
+  with a prior publish, add "Publishing is off; this copy is no longer
+  updated." Tests: off + never published, off + previously published.
+  D-S1: use `@/components/ui/switch` instead of native `<input>`.
+  D-S2: toggle error rendered from `toggle.status === "error"`, not
+  from the stale closure capture of `toggle.error`.
+  D-S3: "Publish now" button hidden when `canEdit` is false (inside
+  `{enabled && ...}` block, with `{canEdit && <Button ...>}`).
+  Tests: 8 passing (was 6), covering all new states.
+- `51bc527` — D-S4: CHANGELOG rewritten: two plain customer-facing
+  sentences first, technical detail after, no stray backtick.
+- D-B1 (handoff correction): the original claim "slice C merged as PR #65"
+  was removed — no such PR exists. Added explicit statement that the card
+  was not verified in a running console.
+
+All findings cited at the fix site and in commit bodies.
+
+Verification — every command run in the foreground on `51bc527`:
+
+- `npx tsc --noEmit` — 0 errors.
+- `bun run lint` — 0 errors, 6 pre-existing warnings.
+- `bun test src` — **301 pass, 0 fail**, 355 expect() calls (56 files).
+
+Not run, with reason: `cargo fmt/clippy/test`, `python3 ops/lint/*.py`,
+`pytest`, compose checks — fixes touch no Rust, no Python, no compose.
 Nothing else skipped; no claim above is *not verified*.
+
+
 
 ### PR slice B — T2–T5 (reviewer, 2026-10-02)
 
