@@ -15,7 +15,7 @@ and the demo Bronze job (`assets.py`) already register theirs through
 - `row_count`: the table's TOTAL, counted through a ClickHouse
   `DataLakeCatalog` database. Not this run's rows: Bronze is append-only,
   so after a second run the table holds both loads, and the Catalog's row
-  count (`dataset_sync.total`) must say so.
+  total (`dataset_sync.total`) must say so.
 - The columns and their types, read the same way (`DESCRIBE`), minus
   dlt's own `_dlt_*` bookkeeping columns.
 
@@ -65,7 +65,15 @@ def register_connector_table(
     ensure_catalog_database(ch, CATALOG_DB)
     table = f"{CATALOG_DB}.`bronze.{target}`"
 
-    total = int(ch_exec(ch, f"SELECT count() FROM {table}") or "0")
+    # `WHERE 1`, never an unqualified row count, for every Bronze Iceberg
+    # table whether or not it carries deletes today: measured on ClickHouse
+    # 26.3, an unqualified count over a merge-on-read table is answered from
+    # metadata and does not subtract equality deletes (R11,
+    # docs/plans/P5-RESULT.md; not re-measured on 26.8). The lint
+    # `ops/lint/check_bare_iceberg_count.py` cannot see this statement,
+    # because its table name arrives through `table`, so the rule is kept by
+    # hand here.
+    total = int(ch_exec(ch, f"SELECT count() FROM {table} WHERE 1") or "0")
     columns: list[tuple[str, str, str]] = []
     for line in ch_exec(ch, f"DESCRIBE TABLE {table} FORMAT TSV").splitlines():
         name, _, rest = line.partition("\t")

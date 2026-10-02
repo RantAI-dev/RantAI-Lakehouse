@@ -40,7 +40,8 @@ def test_registers_the_tables_total_and_columns_without_dlt_bookkeeping():
 
     assert total == 1672
     assert databases == [CATALOG_DB]
-    assert statements[0] == f"SELECT count() FROM {CATALOG_DB}.`bronze.northwind_orders`"
+    # R11: the total is counted under a `WHERE`, never as a bare row count.
+    assert statements[0] == f"SELECT count() FROM {CATALOG_DB}.`bronze.northwind_orders` WHERE 1"
     [entry] = registered
     assert entry["slug"] == "northwind-orders"
     assert entry["title"] == "Northwind Orders"

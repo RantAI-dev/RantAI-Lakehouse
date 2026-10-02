@@ -955,8 +955,13 @@ mod tests {
             "SELECT * FROM icecat_api.`bronze.orders` LIMIT 5",
             &orders
         ));
+        // `WHERE 1` keeps this fixture clear of the R11 lint
+        // (`ops/lint/check_bare_iceberg_count.py`), which reads test text
+        // too and takes any unqualified row count over a `bronze.` name as
+        // the defect it guards against. The query's meaning here is only
+        // which table it reads.
         assert!(reads_any(
-            "SELECT count(*) FROM iceberg.bronze.orders",
+            "SELECT count(*) FROM iceberg.bronze.orders WHERE 1",
             &orders
         ));
         assert!(reads_any(

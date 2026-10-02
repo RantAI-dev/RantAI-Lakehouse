@@ -119,7 +119,9 @@ async fn create_connector_with_undeprovisionable_slot(pool: &PgPool, name: &str)
 /// per-connector routes answer only for a connector in the caller's tenant.
 async fn in_bayus_tenant(pool: &PgPool, id: &str) {
     let meridian_group = uuid::Uuid::from_u128(0x1111_1111_1111_4111_8111_0000_0000_0001);
-    assign_tenant(pool, id, meridian_group).await.expect("assign tenant");
+    assign_tenant(pool, id, meridian_group)
+        .await
+        .expect("assign tenant");
 }
 
 async fn connector_row_exists(pool: &PgPool, id: &str) -> bool {
