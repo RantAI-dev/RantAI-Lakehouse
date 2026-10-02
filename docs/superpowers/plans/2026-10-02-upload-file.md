@@ -922,6 +922,223 @@ lived in the scratchpad):
 - A zip that is not a workbook is also `Kind::Workbook`; T6's "looks like an
   Excel workbook" wording covers it.
 
+### Slice B, part 2 — T5a, T6, T8 (developer, 2026-10-02)
+
+Branch `feat/upload-file`, from `c431cf6`. Nothing was pushed. No file outside
+`/home/hv/lakehouse-upload` was edited; no `docker compose` was run, no
+container of the running stack was touched. Docker was used by the
+`lakehouse-test-support` Postgres container, by the store and route tests, and
+once to clean up after it (see "The disk" below). No TypeScript, Python or
+compose file is touched.
+
+**Commits**
+
+- `27c2865` feat(uploads): T5a soft delete, table claims and claim-before-launch
+  in the store (3 files, +716/-127)
+- `d05ef0f` feat(uploads): T6 the upload routes, tenant-scoped, with the load
+  launched after the claim (12 files, +4531/-341)
+- `ec6686a` feat(connectors): T8 a connector may not take a table an upload
+  loaded (2 files, +301/-1)
+
+**The routes as built.** Every route is `connector:manage` (six `POLICY_TABLE`
+entries). An error is `{"error": "<message>"}`. An upload is `{ id,
+originalFilename, sizeBytes, uploadedBy, status, createdAt, updatedAt }` and,
+when set, `parseOptions` (`{ encoding, delimiter, headerRow }`),
+`bronzeTable`, `loadMode`, `rows` (absent means not measured), `runId`,
+`error`, and `assetId` (the table name with `_` as `-`, only when `ingested`).
+There is no `storageKey`, tenant, `contentType` or `sha256` (finding B3);
+timestamps are `YYYY-MM-DDTHH:MM:SSZ`.
+
+| Route | Success | Refusals (status: fixed message) |
+| --- | --- | --- |
+| `POST /api/uploads`, multipart part `file` | 201, an upload plus `duplicateOf` (an upload) when this tenant holds the same bytes | 400: "Your account belongs to no tenant, so a file cannot be uploaded." / "The request must be a multipart form with one part named file." / "The form has no part named file." / "The upload could not be read." / "The file is empty." / "The file is larger than the 50 MB limit." / the workbook sentence of T6 / "This looks like a Parquet file. Only delimited text files (CSV, TSV) can be uploaded." / "This is not a delimited text file. Only delimited text files (CSV, TSV) can be uploaded."; 404 for an `X-Tenant` the caller is not in; 503 "Upload storage is not configured." or "Upload storage is unavailable (<word>)."; 500 "database error" |
+| `GET /api/uploads` | 200, an array of uploads, newest first, at most 100, the active tenant's; `[]` for a caller in no tenant | 404 as above |
+| `GET /api/uploads/{id}` | 200, an upload (a loading one is settled first) | 404 "Upload not found." for an unknown id, a deleted upload and another tenant's |
+| `GET /api/uploads/{id}/preview?encoding=&delimiter=&headerRow=` | 200 `{ detected, using, columns, rows, truncated }`, each of `detected` and `using` `{ encoding, delimiter, headerRow }` | 400 "encoding must be utf-8 or utf-16." / "delimiter must be a comma, a semicolon, a tab or a pipe." / "headerRow must be a whole number, 0 or more." / "The query string could not be read." (a parameter that is given must be valid, an empty one included); 404; 503 storage |
+| `POST /api/uploads/{id}/ingest`, `{ bronzeTable, mode?, encoding, delimiter, headerRow }` | 200 `{ upload, runId }`, the upload `ingesting` with its run | 400 per field ("<field> is required.", "<field> must be text.", the rule sentences above, "mode must be replace or append.", the table rule "Table names use lower-case letters, digits and _ only, do not start with a digit, and have at most 128 characters.", "The request body must be a JSON object."); 404; 409 "This upload is already being loaded." / "Another upload is loading into that table." / "A connector loads that table, so a file cannot be loaded into it." / "That table already exists and no upload of this tenant created it, so a file cannot be loaded into it."; 422 "The orchestrator refused to start the load."; 503 "Could not check whether that table already exists, so nothing was loaded." / "Uploads need ICEBERG_QUERY_DB to be set, so the API can check that a table name is free. Nothing was loaded." / "The orchestrator could not be reached, so the load was not started."; 500 "The load was started but could not be recorded." |
+| `DELETE /api/uploads/{id}` | 204 | 404; 409 "This upload is being loaded, so it cannot be deleted yet."; 503 storage (the upload stays listed) |
+
+What the load job (T7) is sent: `file_ingest_job` with `ops.ingest_uploaded_file
+.config` = `upload_id`, `storage_key`, `bronze_table_name`, `load_mode`
+(`replace` or `append`), `encoding` (`utf-8` or `utf-16`), `delimiter` (one
+character, a tab is the tab character), `header_row` (an integer, the
+zero-based index of a record). What the API reads back, which T7 must write:
+exactly one `lake.bronze_meta.ingest_run` row per run with `connector_id =
+"upload:<upload id>"`, `status = "succeeded"` for a success and anything else
+for a failure, `rows` null when not measured, `error` the fixed reason (the API
+shows it as recorded, trimmed; empty gives "The load failed."), and `ended_at`
+an RFC 3339 time (`datetime.now(timezone.utc).isoformat()` is one). The row of
+the newest `started_at` whose `ended_at` is later than the upload's claim is the
+result. When the run has ended and no such row exists the upload is failed with
+"The load stopped before it recorded a result."; a claim with no run after two
+minutes is failed with "The load was not started."; a launch that is refused or
+unreachable leaves "The load could not be started.". Dagster's status is read
+through `pipeline_run_status` and `map_run_status`: `completed`, `failed` and
+`cancelled` are ended; `queued`, `running` and anything unrecognised leave the
+upload alone.
+
+**Crates `Cargo.lock` gained: one.** `multer` 3.1.0 (MIT, which `deny.toml`
+allows), and axum's dependency list now names it. Every dependency of `multer`
+was already locked (`bytes`, `encoding_rs`, `futures-util`, `http`, `httparse`,
+`memchr`, `mime`, `spin` 0.9.9, `version_check`). `cargo deny` and `cargo audit`
+are not installed here; the advisories for `multer` were not checked.
+
+**Commands run, with counts**
+
+Per commit, scoped:
+
+- T5a: `cargo fmt --check`; `cargo clippy -p lakehouse-store --all-targets --
+  -D warnings`; `cargo test -p lakehouse-store --test uploads`: 31 passed (23
+  before); the whole `cargo test -p lakehouse-store`: 19 `test result:` lines,
+  411 passed. Thirteen single-fault mutations of the store's SQL (a deleted
+  filter dropped from each read and write, the loading guard of `soft_delete`,
+  `attach_run` moving `updated_at` or losing its `run_id IS NULL`, the claim
+  counting only `ingested` rows or ignoring the tenant, `table_loaded_by_upload`
+  counting any status): twelve were caught at once, and the thirteenth
+  (`mark_ingesting` ignoring `deleted_at`) was not, so
+  `a_deleted_upload_cannot_be_claimed_for_a_load` was added and catches it.
+- T6: `cargo fmt --check`; `cargo clippy -p lakehouse-api --all-targets -- -D
+  warnings`; `cargo test -p lakehouse-api --test upload_routes`: 56 passed (7 s);
+  `--test route_auth`: 26 passed; `--lib -- routes::uploads:: routes::
+  catalog_source:: routes::tests:: upload_ health::`: 100 passed (23 unit
+  tests in `routes::uploads`, 4 new in `catalog_source`, the timeout test
+  extended). Two batches of single-fault mutations of the
+  routes (23 faults: the connector check, an unanswered check read as free, an
+  old result matched, a missing total read as 0, no sniffing, the body limit,
+  the tenant guard, the claim not settled after a failed launch, orchestrator
+  text in an answer, the stale claim, the claim guard in SQL, a cross-tenant
+  duplicate, the results and orchestrator failure flags, the settle timeout, the
+  object not taken back out, the file-name path, `assetId`, an upper-case table,
+  the two settle-before calls, the size check): all caught, after one test was
+  rewritten. `two_simultaneous_ingests_of_one_upload_launch_once` first passed
+  with the SQL claim guard removed, because the two requests never overlapped;
+  it now slows the registry lookup both requests make between the early checks
+  and the claim, and fails (two launches) without the guard.
+- T8: `cargo fmt --check`; `cargo clippy -p lakehouse-api --all-targets -- -D
+  warnings`; `cargo test -p lakehouse-api --test connector_upload_table`: 4
+  passed; `--lib -- routes::connectors routes::ai`: 196 passed. Four
+  mutations (never refuses, always refuses, a claim counted as loaded, a
+  deleted upload ignored): all caught.
+
+Full verification, on the final product commit `ec6686a` (the handoff commit
+changes only this file):
+
+- `cd rust && cargo fmt --check`: exit 0.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`: exit 0.
+- `cargo test --workspace`, **as two commands**, because one needs another
+  10 to 20 GB of artifacts for the unified feature set and the disk had 8 to 22
+  GB free (see "The disk"): `cargo test --workspace --exclude lakehouse-api`,
+  exit 0, 52 `test result:` lines, 857 passed, 0 failed, 4 ignored; and `cargo
+  test -p lakehouse-api`, exit 0, 27 lines, 2494 passed, 0 failed, 4 ignored.
+  **Together: 79 `test result:` lines, 3351 passed, 0 failed, 8 ignored.** The
+  eight ignored are the ones counted in slice A's handoff; none was added (no
+  `#[ignore]` in `git diff c431cf6 HEAD`).
+- `python3 ops/lint/check_bare_iceberg_count.py`: exit 0.
+  `python3 ops/lint/check_compose_init_readiness.py`: exit 0.
+  `python3 ops/lint/check_intra_package_imports.py`: exit 1, as expected:
+  `file_ingest.py:48`. T7 clears it; I did not touch the file.
+
+**The disk, and what I removed.** The root disk went from 50 GB free to 8.4 GB
+during this part: the shared `CARGO_TARGET_DIR` grew from 44 GB to 72 GB (the
+mutation runs rebuilt `lakehouse-api` test binaries of 0.4 to 0.8 GB each, with
+their incremental caches), and the test Postgres container
+(`org.rantai.lakehouse-test-support`) held 1,397 databases of 9 to 10 MB each
+(13 GB): `tests/common/mod.rs::build_state_and_pool` creates a database per test
+and never drops it. I dropped every `lakehouse_api_test_*` and
+`lakehouse_api_main_test_*` database that had no connection (all of them; a
+`DROP DATABASE` without `FORCE` refuses one in use), which freed 13 GB. I did not
+clean the target directory, and the disk now has 18 GB free (94% used). The
+harness leak is not mine and not fixed here: a full `cargo test -p
+lakehouse-api` adds about 130 databases, about 1.3 GB, and this part ran it
+many times.
+
+**Not verified, or not run**
+
+- A load end to end (T7), the gate (T9), the console. Nothing here was run
+  against the development stack, and `0055` was not run on the development
+  database (the store tests run it on throwaway databases, over `0054` with no
+  row and with one legacy row, and on a fresh one).
+- **What ClickHouse says for `DESCRIBE TABLE` of an Iceberg table that is not
+  there.** `iceberg_table_presence` treats ClickHouse's `UNKNOWN_TABLE` (code
+  60) as the only "absent". That is the body ClickHouse sends for a missing
+  table in general and the one `routes::lakehouse` already relies on; it was not
+  observed against a `DataLakeCatalog` database. If it answers otherwise, a new
+  table name gets 503 "Could not check whether that table already exists" and
+  never loads: it fails closed, and the trial deploy will show it at once.
+- The routes against a real `RustFS`: the route tests use a fake bucket that
+  answers what `object_store` sends (`PUT`, `HEAD`, a ranged `GET`, the
+  multi-object delete). The T4 handoff measured those four against `RustFS`
+  1.0.0-rc.4. A 50 MB upload through the console's `/api` proxy.
+- The copilot's `set_ingest_spec` tool against T8: it calls `ingest_spec_put`
+  directly, so the check applies by construction; no test goes through the
+  tool.
+- `gitleaks`, `cargo deny` and `cargo audit` (not installed). I read the diff: no
+  secret, host, port or client name. The test credentials are the Cargo
+  variables `CARGO_PKG_NAME` and `CARGO_PKG_VERSION`.
+- `cargo test --workspace` as one command (above).
+- The mutation scripts lived in the session scratchpad and are not committed.
+
+**Where the plan was wrong or silent against the code**
+
+1. T6 points at `catalog_source::iceberg_source` for "does a raw table exist"
+   and says to answer 503 when the check cannot be made. `iceberg_source`
+   answers `None` for "no such table" and for "the catalog is unreachable"
+   alike (its `iceberg_columns` swallows the error), so it cannot tell the two
+   apart. I added `iceberg_table_presence` beside it, built on the same
+   `DESCRIBE`, and shared the registry query as `catalog::registered_slug`
+   (`bronze_upstream` calls it and drops the error, as before).
+2. **A hole in T5a's claim rule across tenants, not fixed (it changes a
+   decision).** A claim is per tenant, and a table that does not exist may be
+   claimed by two tenants. Tenant B's upload that failed before it wrote still
+   names `t`; tenant A then loads into `t` (it does not exist, so it is free)
+   and creates it; B's "Try again" passes `table_claimed_by_upload(B, t)` and
+   `replace`s A's rows. Closing it takes one more check, "another tenant's row
+   (any status, deleted or not) names the table", which refuses A at the
+   start instead; it changes "may target a table that does not exist". It is
+   yours to decide.
+3. `pipeline_run_status` returns `Ok(None)` for a run Dagster does not know and
+   also for a GraphQL error with no `data`, so the two cannot be told apart. A
+   run reported as unknown therefore leaves the upload `ingesting` (neither
+   deletable nor loadable again) until Dagster knows it again or the row is
+   fixed by hand; settling it as failed would also fail a run Dagster merely
+   did not answer for. Stated in `Settler`'s doc.
+4. The plan says the API shows the job's `error` as recorded. It does, so a job
+   that recorded `str(exc)` would put exception text into a response. T7 must
+   record only its fixed reasons.
+5. T6 gives no status for the refusals of `POST /api/uploads`, and `ApiError` has
+   no 413. All are 400 with a fixed sentence, the body-limit case included
+   (`MultipartError::status()` is 413; it is mapped to the sentence). Adding a
+   `PayloadTooLarge` variant to `lakehouse-core` is a few lines if you want 413.
+6. T10's table-name rule: the console's `^[a-z_][a-z0-9_]*$` is what the API
+   applies (no folding: `Orders` is refused, not loaded as `orders`), plus a
+   bound of 128 characters, which the console does not have. T10's
+   `tableNameProblem` should carry the same bound.
+7. The per-id guard is membership of the upload's tenant, as for connectors
+   (`principal.tenant_ids`), not the active tenant; the list is the active
+   tenant's. A caller in two tenants reaches an upload of either by id. A test
+   pins it.
+8. Beyond the plan, each for a reason in the code: `soft_delete` refuses an
+   `ingesting` row in SQL; `ingest` and `delete` settle an upload that is
+   loading before they decide it is busy (a load that has ended must not block
+   the next); a read waits at most 5 s for Dagster or ClickHouse and a list
+   stops asking after the first failure of either; `ingest` answers 503 with
+   `ICEBERG_QUERY_DB` unset when a new name has to be checked; `DELETE` answers
+   204 and `GET /api/uploads` is a bare array (the plan says neither); the
+   route timeout of 300 s is the plan's, and the test extends the existing one.
+9. A request that is cut off between the launch and `attach_run` (the 60 s
+   deadline, a dropped connection) leaves a claim with no run, which a read
+   fails after two minutes as "The load was not started." even if the run was
+   in fact created. That is the plan's rule; the window is the launch call
+   itself.
+10. A failed launch is not audited, only the actions that took effect
+    (`upload.create`, `upload.ingest`, `upload.delete`, outcome `executed`).
+11. `ended_after` compares the job's clock with the database's. They are the
+    same host's clock in the compose stack; across hosts it assumes they agree
+    to better than a load takes.
+12. The sketch's duplicate notice carried a bare id, name and status; the
+    `duplicateOf` of this version is a whole upload (without the checksum), so
+    the console has the earlier name, date and table.
+
 ## 9. Review (planner appends findings per slice), then the trial
 
 Findings are tagged `BLOCKER` or `SHOULD-FIX`. The planner re-runs the
