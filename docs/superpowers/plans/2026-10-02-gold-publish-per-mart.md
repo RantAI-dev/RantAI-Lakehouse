@@ -559,3 +559,12 @@ its own look before more identities are added.
 Reviewer environment note: the first `cargo test` run aborted because the
 session's shell lacked the `docker` group, so the Postgres testcontainer
 could not start. Re-run under `sg docker`, which is the result quoted above.
+
+Merged as PR #60 (squash, `2cdbf1b`) on 2026-10-02. CI: 24 checks passed;
+`cargo audit`, `cargo deny` and the history `gitleaks` job failed, identically
+to `main` and to PRs #58 and #59, and this PR changed no dependencies. The
+product owner approved merging on that basis and the rule in `AGENTS.md` was
+changed to match (backlog `SEC-8`).
+
+**Slice B starts from `main` at or after `2cdbf1b`**, on a fresh branch
+`feat/gold-publish-per-mart-b`. The old branch was deleted on merge.
