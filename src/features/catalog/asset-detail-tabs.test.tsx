@@ -909,3 +909,92 @@ describe("Access tab: enforcing and deleting a policy", () => {
     expect(screen.queryByLabelText("Delete policy mask-amount")).toBeNull()
   })
 })
+
+describe("Overview: storage, and saying things once", () => {
+  const GOLD: AssetDetail = {
+    ...BRONZE,
+    id: "serving.mart_orders",
+    name: "Mart Orders",
+    namespace: "serving",
+    type: "table",
+    layer: "gold",
+    tier: "hot",
+    format: "ClickHouse ReplacingMergeTree",
+    tableName: undefined,
+    tableKey: "serving.mart_orders",
+    queryTarget: undefined,
+    storage: {
+      table: "serving.mart_orders",
+      engine: "ReplacingMergeTree",
+      partitionKey: null,
+      sortingKey: "plnt, material",
+      parts: 3,
+      partitions: 1,
+      bytesOnDisk: 807944,
+      uncompressedBytes: 8000498,
+      tableColumns: 18,
+    },
+  }
+
+  it("shows how ClickHouse holds a Gold table, which used to have no storage card", async () => {
+    stubApi()
+    renderTabs(GOLD)
+
+    const card = (await screen.findByText("Storage")).closest("[data-slot=card]") as HTMLElement
+    expect(within(card).getByText("ClickHouse table serving.mart_orders")).toBeTruthy()
+    expect(within(card).getByText("ReplacingMergeTree")).toBeTruthy()
+    expect(within(card).getByText("plnt, material")).toBeTruthy()
+    expect(within(card).getByText("Unpartitioned")).toBeTruthy()
+    expect(within(card).getByText(/collapsed into the newest one when parts merge/)).toBeTruthy()
+    // One partition of an unpartitioned table is not a count worth a row.
+    expect(within(card).queryByText("Partitions")).toBeNull()
+  })
+
+  it("says a view stores nothing, rather than listing zeroes for it", async () => {
+    stubApi()
+    renderTabs({
+      ...GOLD,
+      type: "view",
+      storage: { ...GOLD.storage!, engine: "View", sortingKey: null, parts: 0, bytesOnDisk: 0, uncompressedBytes: 0 },
+    })
+
+    const card = (await screen.findByText("Storage")).closest("[data-slot=card]") as HTMLElement
+    expect(within(card).getByText(/A view stores no rows of its own/)).toBeTruthy()
+    expect(within(card).queryByText("Size on disk")).toBeNull()
+  })
+
+  it("leaves a key it could not read unknown, instead of calling the table unsorted", async () => {
+    stubApi()
+    renderTabs({ ...GOLD, storage: { ...GOLD.storage!, engine: null, sortingKey: null, parts: null, bytesOnDisk: null } })
+
+    const card = (await screen.findByText("Storage")).closest("[data-slot=card]") as HTMLElement
+    expect(within(card).queryByText("Unsorted")).toBeNull()
+    expect(within(card).queryByText("Unpartitioned")).toBeNull()
+  })
+
+  it("does not repeat the description the page header already shows", async () => {
+    stubApi()
+    renderTabs()
+
+    const about = (await screen.findByText("About")).closest("[data-slot=card]") as HTMLElement
+    expect(within(about).queryByText("Orders ingested from Postgres.")).toBeNull()
+    expect(within(about).queryByText(/No description yet/)).toBeNull()
+  })
+
+  it("asks for a description when there is none", async () => {
+    stubApi()
+    renderTabs({ ...BRONZE, description: "" })
+
+    const about = (await screen.findByText("About")).closest("[data-slot=card]") as HTMLElement
+    expect(within(about).getByText(/No description yet/)).toBeTruthy()
+  })
+
+  it("drops the schema row for a table that records no schema version", async () => {
+    stubApi()
+    renderTabs(GOLD)
+
+    const about = (await screen.findByText("About")).closest("[data-slot=card]") as HTMLElement
+    expect(within(about).queryByText("Schema")).toBeNull()
+    expect(within(about).getByText("Columns")).toBeTruthy()
+  })
+})

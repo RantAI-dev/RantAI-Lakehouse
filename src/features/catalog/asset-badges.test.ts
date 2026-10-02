@@ -1,7 +1,8 @@
 // The header's three badges used to be constants. Each now says, on hover,
 // what it rests on — including when that is nothing at all.
 import { describe, expect, it } from "bun:test"
-import { classificationTitle, healthTitle, NO_HEALTH_SIGNAL, tierTitle } from "./asset-badges"
+import { DATA_LAYER_LABEL } from "@/lib/status"
+import { classificationTitle, healthTitle, layerTitle, NO_HEALTH_SIGNAL, tierTitle } from "./asset-badges"
 
 describe("badge explanations", () => {
   it("lists the health signals, or says there are none", () => {
@@ -17,6 +18,16 @@ describe("badge explanations", () => {
     expect(classificationTitle({ classificationSource: "rule" })).toContain("classification rule")
     expect(classificationTitle({ classificationSource: "default" })).toContain("default level")
     expect(classificationTitle({})).toContain("default level")
+  })
+
+  // A connector's table was labelled "Raw" beside a description, a storage
+  // card and a lineage node that all called it Bronze.
+  it("calls raw and curated Bronze by one layer name, and says how they differ", () => {
+    expect(DATA_LAYER_LABEL.raw).toBe("Bronze (raw)")
+    expect(DATA_LAYER_LABEL.bronze).toBe("Bronze (curated)")
+    expect(layerTitle({ layer: "raw" })).toContain("as loaded")
+    expect(layerTitle({ layer: "bronze" })).toContain("curated")
+    expect(layerTitle({ layer: "gold" })).toContain("mart")
   })
 
   it("explains the tier by where the data sits", () => {

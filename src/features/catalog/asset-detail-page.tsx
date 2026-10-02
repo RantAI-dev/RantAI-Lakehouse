@@ -39,7 +39,7 @@ import { fmtMeasured } from "@/lib/measured"
 import { DATA_LAYER_LABEL, ENGINE_CATEGORY_LABEL } from "@/lib/status"
 import { assetService } from "@/services"
 import { ASSET_TYPE_LABEL, type RequestAccessInput } from "@/services/contracts/assets"
-import { classificationTitle, healthTitle, tierTitle } from "./asset-badges"
+import { classificationTitle, healthTitle, layerTitle, tierTitle } from "./asset-badges"
 import { AssetDetailTabs } from "./asset-detail-tabs"
 
 /**
@@ -137,7 +137,10 @@ export function AssetDetailPage() {
         items={[
           { label: "Namespace", value: <span className="font-mono text-xs">{a.namespace}</span> },
           { label: "Type", value: ASSET_TYPE_LABEL[a.type] },
-          { label: "Layer", value: DATA_LAYER_LABEL[a.layer] },
+          {
+            label: "Layer",
+            value: <span title={layerTitle(a)}>{DATA_LAYER_LABEL[a.layer]}</span>,
+          },
           { label: "Format", value: a.format },
           { label: "Engine", value: ENGINE_CATEGORY_LABEL[a.engine] },
           { label: "Rows", value: fmtMeasured(a.rows, formatCompactNumber) },

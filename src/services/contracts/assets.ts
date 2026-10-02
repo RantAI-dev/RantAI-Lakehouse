@@ -208,6 +208,26 @@ export type AssetDetail = Asset & {
    */
   tableKey?: string | null
   /**
+   * How ClickHouse holds a Silver or Gold asset's table: its engine and
+   * keys, and what its active parts add up to. A field is `null` when it
+   * could not be read or, for a key, when the table has none. Absent on a
+   * Bronze asset, whose Iceberg table says this itself (`useIcebergTable`),
+   * and from an older API build.
+   */
+  storage?: {
+    /** `<database>.<table>`, as ClickHouse names it. */
+    table: string
+    engine: string | null
+    partitionKey: string | null
+    sortingKey: string | null
+    parts: Measured
+    partitions: Measured
+    bytesOnDisk: Measured
+    uncompressedBytes: Measured
+    /** Every column of the table, system columns included. */
+    tableColumns: number
+  }
+  /**
    * `true` when `sample` is empty because the caller lacks `query:read`
    * (the API withholds rows from `catalog:read`-only callers), not
    * because the asset has none. Absent from older API builds.

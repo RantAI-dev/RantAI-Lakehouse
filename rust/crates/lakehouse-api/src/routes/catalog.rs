@@ -675,6 +675,14 @@ async fn list_body(ch: &ChClient) -> Result<(Value, Vec<(String, String)>), ChEr
 /// slow page. Covers the connect, the (possibly cached) namespace listing,
 /// and the per-table loads together, not each separately.
 const ICEBERG_ENRICHMENT_BUDGET: Duration = Duration::from_millis(300);
+/// The same read's budget on an asset's DETAIL page: one table, not every
+/// Bronze table, and a page whose health verdict rests on the answer — a
+/// table's freshness is one of its health signals. Cut short at the list's
+/// budget (a cold cache on a busy host is enough), the page showed no
+/// size, "Not measured" freshness and a health that left a late load out,
+/// beside a Storage card that had the real numbers. Still bounded: an
+/// unreachable Lakekeeper costs the page this long at most.
+const ICEBERG_DETAIL_BUDGET: Duration = Duration::from_secs(3);
 /// At most this many concurrent Lakekeeper `load_table` calls at once.
 const ICEBERG_ENRICHMENT_MAX_CONCURRENT: usize = 8;
 
@@ -1022,6 +1030,45 @@ const PART_STATS_COLUMNS: &str = "toString(count()) n, toString(sum(rows)) r, \
      toString(dateDiff('second', max(modification_time), now())) lag, \
      formatDateTime(max(modification_time), '%Y-%m-%dT%H:%i:%SZ', 'UTC') at";
 
+/// What the detail reads off `system.parts` beyond [`PART_STATS_COLUMNS`],
+/// for the Storage card: how many partitions the active parts span, and
+/// how large their data is before compression.
+const PART_STORAGE_COLUMNS: &str = "toString(uniqExact(partition)) partitions, \
+     toString(sum(data_uncompressed_bytes)) raw";
+
+/// How `ClickHouse` physically holds a Silver or Gold table — the Storage
+/// card of its asset page, the counterpart of what an Iceberg table's own
+/// metadata says about a Bronze one. `table_row` is the table's
+/// `system.tables` row and `parts_row` its `system.parts` aggregate; a
+/// read that failed leaves its fields `null` rather than zero. An empty
+/// key is `null`: the table is unpartitioned, or unsorted.
+fn clickhouse_storage(
+    key: &str,
+    table_row: Option<&Map<String, Value>>,
+    parts_row: Option<&Map<String, Value>>,
+    table_columns: usize,
+) -> Value {
+    let text = |column: &str| {
+        table_row
+            .map(|r| str_col(r, column).trim())
+            .filter(|v| !v.is_empty())
+            .map_or(Value::Null, |v| json!(v))
+    };
+    let count =
+        |column: &str| parts_row.map_or(Value::Null, |r| json!(num_or_zero(Some(r), column)));
+    json!({
+        "table": key,
+        "engine": text("engine"),
+        "partitionKey": text("partition_key"),
+        "sortingKey": text("sorting_key"),
+        "parts": count("n"),
+        "partitions": count("partitions"),
+        "bytesOnDisk": count("b"),
+        "uncompressedBytes": count("raw"),
+        "tableColumns": table_columns,
+    })
+}
+
 /// What a `ClickHouse` table's active parts say about it. Only a table that
 /// has parts has any of this measured: a view stores nothing, and an empty
 /// table has no newest write to date.
@@ -1108,23 +1155,25 @@ fn silver_catalog_row(
 /// `freshnessLagSeconds` and `lastUpdated` come from the table's active
 /// parts ([`PartStats`]). A mart with no parts holds zero rows; the other
 /// three are then `null`, since nothing was written to measure. `health` is
-/// not measured.
+/// not measured. A view in `serving` is said to be one, as on a Silver row:
+/// it stores nothing, so its row count is not a measured zero either.
 fn gold_catalog_row(name: &str, engine: &str, col_count: i64, parts: Option<&PartStats>) -> Value {
     let (size_bytes, freshness_lag, last_updated) = part_fields(parts);
+    let is_view = engine == "View";
     json!({
         "id": format!("serving.{name}"),
         "name": prettify(name),
         "namespace": "serving",
-        "type": "table",
+        "type": if is_view { "view" } else { "table" },
         "layer": "gold",
-        "tier": "hot",
+        "tier": if is_view { "warm" } else { "hot" },
         "classification": "internal",
         "owner": TENANT_OWNER.as_str(),
         "domain": TENANT_DOMAIN.as_str(),
         "description": "Mart Gold penyaji dashboard (agregat siap pakai).",
         "format": format!("ClickHouse {engine}"),
         "engine": "hot-store",
-        "rows": parts.map_or(0, |p| p.rows),
+        "rows": if is_view { Value::Null } else { json!(parts.map_or(0, |p| p.rows)) },
         "sizeBytes": size_bytes,
         "columnCount": col_count,
         "freshnessLagSeconds": freshness_lag,
@@ -1649,27 +1698,41 @@ async fn clickhouse_asset_detail(
     // above, so this is safe despite the raw interpolation, matching the
     // TypeScript exactly.
     let parts_sql = format!(
-        "SELECT {PART_STATS_COLUMNS}
+        "SELECT {PART_STATS_COLUMNS}, {PART_STORAGE_COLUMNS}
          FROM system.parts WHERE database='{db}' AND table='{table}' AND active"
     );
     // What kind of table this is — a view, a MergeTree — is the engine's
     // to say, exactly as on the list row. The detail used to call every
-    // Silver asset a view and every mart a MergeTree.
-    let engine_sql =
-        format!("SELECT engine FROM system.tables WHERE database='{db}' AND name='{table}'");
+    // Silver asset a view and every mart a MergeTree. Its keys come with
+    // it, for the Storage card.
+    let engine_sql = format!(
+        "SELECT engine, partition_key, sorting_key FROM system.tables \
+         WHERE database='{db}' AND name='{table}'"
+    );
     // A failed read costs the stats or the engine name, never the page.
     let (parts_rows, engine_rows) =
         tokio::join!(ch.rows(&parts_sql, None), ch.rows(&engine_sql, None));
-    let parts = parts_rows
-        .ok()
-        .and_then(|rr| rr.first().and_then(part_stats));
-    let engine = engine_rows
-        .ok()
-        .and_then(|rr| rr.first().map(|r| str_col(r, "engine").to_owned()))
+    let parts_row = parts_rows.ok().and_then(|rr| rr.into_iter().next());
+    let table_row = engine_rows.ok().and_then(|rr| rr.into_iter().next());
+    let parts = parts_row.as_ref().and_then(part_stats);
+    let engine = table_row
+        .as_ref()
+        .map(|r| str_col(r, "engine").to_owned())
         .unwrap_or_default();
 
     let mut body =
         clickhouse_detail_body(id, &table, &db, &engine, parts.as_ref(), &schema, &sample);
+    if let Some(o) = body.as_object_mut() {
+        o.insert(
+            "storage".to_owned(),
+            clickhouse_storage(
+                &format!("{db}.{table}"),
+                table_row.as_ref(),
+                parts_row.as_ref(),
+                source.columns.len(),
+            ),
+        );
+    }
     mark_sample_restricted(&mut body, principal);
     mark_query_table(&mut body, Some(&source));
     let key = format!("{db}.{table}");
@@ -1900,8 +1963,9 @@ fn silver_downstream(table: &str, source: Option<&ReadSource>) -> Vec<Value> {
 /// `sizeBytes`/`freshnessLagSeconds` on a Bronze detail body from its
 /// Iceberg table, through the same cached, time-boxed path the catalog
 /// list uses ([`enrich_bronze_stats`]), so the list and the detail page
-/// never disagree about one table. A slow or unreachable Lakekeeper leaves
-/// both `null`.
+/// never disagree about one table. It waits longer than the list does
+/// ([`ICEBERG_DETAIL_BUDGET`]); a Lakekeeper that is slower still, or
+/// unreachable, leaves both `null`.
 async fn enrich_bronze_detail(state: &AppState, body: &mut Value, slug: &str, table: &str) {
     if table.is_empty() {
         return;
@@ -1912,7 +1976,7 @@ async fn enrich_bronze_detail(state: &AppState, body: &mut Value, slug: &str, ta
     let by_slug = enrich_bronze_stats(
         vec![(slug.to_owned(), table.to_owned())],
         &state.bronze_stats_cache,
-        ICEBERG_ENRICHMENT_BUDGET,
+        ICEBERG_DETAIL_BUDGET,
         ICEBERG_ENRICHMENT_MAX_CONCURRENT,
         &bronze_ns,
         || lakehouse_catalog::client(state),
@@ -2650,6 +2714,15 @@ mod tests {
         assert_eq!(gold["freshnessLagSeconds"], Value::Null);
         assert_eq!(gold["health"], json!("unknown"));
         assert_eq!(gold["lastUpdated"], Value::Null);
+        assert_eq!(gold["type"], json!("table"));
+        assert_eq!(gold["tier"], json!("hot"));
+
+        // A view among the marts used to read "Table · Hot · 0 rows".
+        let view = gold_catalog_row("slot_health", "View", 7, None);
+        assert_eq!(view["type"], json!("view"));
+        assert_eq!(view["tier"], json!("warm"));
+        assert_eq!(view["rows"], Value::Null);
+        assert_eq!(view["format"], json!("ClickHouse View"));
     }
 
     fn parts_row(n: &str, lag: &str, at: &str) -> Map<String, Value> {
@@ -2862,6 +2935,47 @@ mod tests {
     /// Without a `GROUP BY`, no parts still yields one row — dated 1970.
     /// That must read as "not measured", never as fifty years stale; and a
     /// part dated in the future is clock skew, not a negative lag.
+    /// The Storage card's facts for a `ClickHouse` table: its engine and
+    /// keys, and what its active parts add up to. An empty key means there
+    /// is none, and a read that failed is unknown, not zero.
+    #[test]
+    fn clickhouse_storage_reports_keys_parts_and_sizes() {
+        let table = json!({ "engine": "ReplacingMergeTree", "partition_key": "", "sorting_key": "plnt, material" });
+        let parts = json!({ "n": "3", "partitions": "2", "b": "807944", "raw": "8000498" });
+        let storage = clickhouse_storage(
+            "silver.sap_material_master",
+            table.as_object(),
+            parts.as_object(),
+            18,
+        );
+        assert_eq!(
+            storage,
+            json!({
+                "table": "silver.sap_material_master",
+                "engine": "ReplacingMergeTree",
+                "partitionKey": null,
+                "sortingKey": "plnt, material",
+                "parts": 3,
+                "partitions": 2,
+                "bytesOnDisk": 807_944,
+                "uncompressedBytes": 8_000_498,
+                "tableColumns": 18,
+            })
+        );
+
+        let unread = clickhouse_storage("serving.mart_x", None, None, 4);
+        for field in [
+            "engine",
+            "partitionKey",
+            "sortingKey",
+            "parts",
+            "bytesOnDisk",
+        ] {
+            assert_eq!(unread[field], Value::Null, "{field}");
+        }
+        assert_eq!(unread["tableColumns"], 4);
+    }
+
     #[test]
     fn part_stats_is_none_without_parts_and_drops_a_negative_lag() {
         assert_eq!(
@@ -3742,6 +3856,11 @@ mod tests {
             // The policy behind the mask is listed with what it does to
             // this caller; without `policy:read`, not who else it targets.
             assert_eq!(body["tableKey"], json!("serving.mart_x"));
+            // How ClickHouse holds the table, for the Storage card.
+            assert_eq!(body["storage"]["table"], json!("serving.mart_x"));
+            assert_eq!(body["storage"]["engine"], json!("MergeTree"));
+            assert_eq!(body["storage"]["sortingKey"], Value::Null);
+            assert_eq!(body["storage"]["tableColumns"], json!(2));
             let policy = &body["policySummary"][0];
             assert_eq!(policy["name"], json!("catalog-sample-masking-test"));
             assert_eq!(policy["appliesToYou"], json!(true));

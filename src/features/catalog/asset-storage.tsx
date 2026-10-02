@@ -9,7 +9,7 @@ import { Pill } from "@/components/patterns/status-badge"
 import { Button } from "@/components/ui/button"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useService, type ServiceState } from "@/hooks/use-service"
-import { formatBytes, formatDateTime, formatNumber } from "@/lib/format"
+import { formatBytes, formatDateTime, formatNumber, formatRelativeTime } from "@/lib/format"
 import {
   isIcebergCandidate,
   lakehouseTableHref,
@@ -325,5 +325,76 @@ export function AssetStorage({
         )}
       </SectionCard>
     </div>
+  )
+}
+
+/** What an engine does that someone reading the table should know. */
+function engineNote(engine: string | null): string | null {
+  if (engine?.includes("ReplacingMergeTree")) {
+    return "Rows that share a sorting key are collapsed into the newest one when parts merge, so a query can still see duplicates until then."
+  }
+  return null
+}
+
+/** A key expression as ClickHouse writes it, or what its absence means. */
+function keyValue(key: string | null, none: string, read: boolean) {
+  if (!read) return "—"
+  if (key === null) return none
+  return (
+    <Pill tone="neutral" className="font-mono">
+      {key}
+    </Pill>
+  )
+}
+
+/**
+ * Physical side of a Silver or Gold asset: the ClickHouse table behind it.
+ * The counterpart of {@link AssetStorage}, from what the asset itself
+ * carries — a ClickHouse table is rewritten in place, so there is no
+ * history of snapshots to chart beside it.
+ */
+export function ClickHouseStorage({ asset: a }: { asset: AssetDetail }) {
+  const s = a.storage
+  if (!s) return null
+  if (s.engine === "View") {
+    return (
+      <SectionCard size="sm" title="Storage" description={`ClickHouse view ${s.table}`}>
+        <p className="text-sm text-muted-foreground">
+          A view stores no rows of its own. Each query reads them from the tables the view is
+          defined over.
+        </p>
+      </SectionCard>
+    )
+  }
+  // The engine and the keys come from one read: without it, a missing key
+  // is unknown, not "none".
+  const read = s.engine !== null
+  const note = engineNote(s.engine)
+  const partitioned = s.partitionKey !== null && s.partitions !== null && s.partitions > 0
+
+  return (
+    <SectionCard size="sm" title="Storage" description={`ClickHouse table ${s.table}`}>
+      <MetadataList
+        density="compact"
+        columns={4}
+        items={[
+          { label: "Size on disk", value: fmtMeasured(s.bytesOnDisk, formatBytes) },
+          { label: "Uncompressed", value: fmtMeasured(s.uncompressedBytes, formatBytes) },
+          { label: "Parts", value: fmtMeasured(s.parts, formatNumber) },
+          {
+            label: "Last write",
+            value: a.lastUpdated === null ? "—" : formatRelativeTime(a.lastUpdated),
+          },
+          { label: "Engine", value: s.engine ?? "—" },
+          { label: "Table columns", value: formatNumber(s.tableColumns) },
+          { label: "Partitioned by", value: keyValue(s.partitionKey, "Unpartitioned", read) },
+          { label: "Sorted by", value: keyValue(s.sortingKey, "Unsorted", read) },
+          ...(partitioned
+            ? [{ label: "Partitions", value: formatNumber(s.partitions ?? 0) }]
+            : []),
+        ]}
+      />
+      {note ? <p className="mt-3 text-xs text-muted-foreground">{note}</p> : null}
+    </SectionCard>
   )
 }

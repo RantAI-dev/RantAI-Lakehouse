@@ -171,8 +171,11 @@ export function AssetAbout({
   onChanged,
 }: {
   asset: AssetDetail
-  /** The current schema version, worked out by the overview. */
-  schemaLabel: string
+  /**
+   * The current schema version, worked out by the overview; `null` for a
+   * table that records none (only Iceberg tables do).
+   */
+  schemaLabel: string | null
   /** Called after a save, to reload the asset. */
   onChanged: () => void
 }) {
@@ -193,9 +196,13 @@ export function AssetAbout({
         ) : undefined
       }
     >
-      <p className={cn("mb-3 text-sm", !a.description && "text-muted-foreground")}>
-        {a.description || "No description yet. Ask the owner to document what one row represents."}
-      </p>
+      {/* The description itself is in the page header, above every tab;
+          repeating it here said the same sentence twice on one screen. */}
+      {a.description ? null : (
+        <p className="mb-3 text-sm text-muted-foreground">
+          No description yet. Ask the owner to document what one row represents.
+        </p>
+      )}
       <MetadataList
         density="compact"
         columns={2}
@@ -209,7 +216,7 @@ export function AssetAbout({
             ? [{ label: "Publisher classification", value: a._meta.klasifikasi }]
             : []),
           { label: "Columns", value: String(a.schema.length || a.columnCount) },
-          { label: "Schema", value: schemaLabel },
+          ...(schemaLabel ? [{ label: "Schema", value: schemaLabel }] : []),
           ...(tags.length > 0
             ? [
                 {

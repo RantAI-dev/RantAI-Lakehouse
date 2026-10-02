@@ -27,7 +27,12 @@ import {
   relatedTables,
   type AssetLineageState,
 } from "./asset-lineage"
-import { AssetStorage, icebergTableOf, type IcebergTableState } from "./asset-storage"
+import {
+  AssetStorage,
+  ClickHouseStorage,
+  icebergTableOf,
+  type IcebergTableState,
+} from "./asset-storage"
 
 /** Tabs the overview can jump to; must match the `value`s in `AssetDetailTabs`. */
 export type AssetTab =
@@ -162,7 +167,7 @@ export function AssetOverview({
       (icebergSchema.sinceMs === null ? "" : ` · since ${snapshotRelativeTime(icebergSchema.sinceMs)}`)
     : latestSchema
       ? `v${latestSchema.version} · ${formatRelativeTime(latestSchema.at)}`
-      : "—"
+      : null
   const recentChanges = a.changeHistory.slice(0, RECENT_CHANGES)
   const sql = assetStarterSql(a)
 
@@ -280,7 +285,9 @@ export function AssetOverview({
       {/* ── Where and how is it stored? ─────────────────────────────── */}
       {isIcebergCandidate(a) && a.tableName ? (
         <AssetStorage tableName={a.tableName} detail={iceberg} />
-      ) : null}
+      ) : (
+        <ClickHouseStorage asset={a} />
+      )}
 
       {/* ── How do I use it? ────────────────────────────────────────── */}
       <SectionCard
