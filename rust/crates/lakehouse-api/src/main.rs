@@ -29,12 +29,14 @@ mod pipeline_source;
 mod policy;
 mod policy_engine;
 mod routes;
+mod rustfs_client;
 mod sql_guard;
 mod sql_rewrite;
 mod state;
 mod tenant;
 mod tenant_scope;
 mod transform_grammar;
+mod upload_store;
 
 use anyhow::Context;
 use tracing_subscriber::EnvFilter;

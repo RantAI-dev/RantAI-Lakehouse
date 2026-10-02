@@ -45,15 +45,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lakehouse_clickhouse::{ChClient, ChError};
-use lakehouse_core::secret::{SecretError, SecretResolver, SecretValue};
 use object_store::ObjectStore;
-use object_store::aws::AmazonS3Builder;
 use serde::Serialize;
 use time::OffsetDateTime;
 
 use crate::config::Config;
 use crate::connector_probe::classify_object_store_error;
+use crate::rustfs_client::{self, RustfsClientError};
 use crate::state::AppState;
+
+// The exact-match resolver now lives in `rustfs_client`, the one builder this
+// probe shares with `upload_store` (T4 of the upload plan). This module's own
+// tests still prove it, unchanged, and name it through here.
+#[cfg(test)]
+use crate::rustfs_client::ExactMatchSecretResolver;
+#[cfg(test)]
+use lakehouse_core::secret::{SecretError, SecretResolver};
 
 /// Every probe in this module is bounded by this timeout, matching
 /// `DgClient::is_alive`'s existing 3 s bound — one dead service must never
@@ -367,49 +374,6 @@ async fn probe_lakekeeper(http: &reqwest::Client, base: &str) -> ServiceHealth {
     )
 }
 
-/// A `RustFS`-only secret resolver, admitting only the exact `secretRef`
-/// strings this deployment configured for
-/// `rustfs_access_key_secret_ref`/`rustfs_secret_key_secret_ref` — never
-/// `AppState::connector_secret_resolver` (allowlisted to a disjoint set of
-/// three `CONNECTOR_*` PATTERNS, which would refuse both `RustFS` refs as
-/// `NotAllowed`, WS5 plan review U5) and never
-/// [`lakehouse_core::secret::AllowlistedSecretResolver`], whose
-/// `pattern_matches` requires every allowlist entry to contain EXACTLY one
-/// `*` wildcard (see that function's own doc comment) — an ordinary
-/// `secretRef` string like `env:RUSTFS_ACCESS_KEY` has none, so handing it
-/// to that type as a literal "pattern" would trip its own
-/// `debug_assert!(false, ...)` in every debug/test build. This resolver
-/// instead does a direct equality check against the (at most two) refs it
-/// was constructed with.
-#[derive(Debug)]
-struct ExactMatchSecretResolver<R> {
-    inner: R,
-    allowed: Vec<String>,
-    name: &'static str,
-}
-
-impl<R> ExactMatchSecretResolver<R> {
-    fn new(inner: R, allowed: impl IntoIterator<Item = String>, name: &'static str) -> Self {
-        Self {
-            inner,
-            allowed: allowed.into_iter().collect(),
-            name,
-        }
-    }
-}
-
-impl<R: SecretResolver> SecretResolver for ExactMatchSecretResolver<R> {
-    async fn resolve(&self, secret_ref: &str) -> Result<SecretValue, SecretError> {
-        if !self.allowed.iter().any(|a| a == secret_ref) {
-            return Err(SecretError::NotAllowed {
-                secret_ref: secret_ref.to_owned(),
-                resolver: self.name,
-            });
-        }
-        self.inner.resolve(secret_ref).await
-    }
-}
-
 /// Never `checked: false` -> dial. When either
 /// `rustfs_access_key_secret_ref`/`rustfs_secret_key_secret_ref` is
 /// unconfigured, this returns [`unknown`] and never builds a resolver or
@@ -417,60 +381,40 @@ impl<R: SecretResolver> SecretResolver for ExactMatchSecretResolver<R> {
 /// gap, not a probed failure (WS5 plan review U5/Y1's exact posture,
 /// applied to `RustFS` too).
 ///
+/// The client, and the exact-match resolver that gates its credentials
+/// (never `AppState::connector_secret_resolver`, which refuses both refs,
+/// WS5 plan review U5), come from [`rustfs_client::build_client`], the one
+/// builder this probe shares with `upload_store`.
+///
 /// Deliberately takes only `&Config` — no `DynSecretResolver`/
 /// `connector_secret_resolver` parameter — so a future edit cannot widen
 /// this function's signature to silently reintroduce the wrong resolver
 /// (WS5 plan review U5's own regression-test ask).
 async fn probe_rustfs(config: &Config) -> ServiceHealth {
     let now = OffsetDateTime::now_utc();
-    let (Some(access_ref), Some(secret_ref)) = (
-        config.rustfs_access_key_secret_ref.as_deref(),
-        config.rustfs_secret_key_secret_ref.as_deref(),
-    ) else {
-        return unknown("rustfs", "RustFS (Object storage)", now);
-    };
-    let resolver = ExactMatchSecretResolver::new(
-        lakehouse_core::secret::EnvSecretResolver::new(),
-        [access_ref.to_owned(), secret_ref.to_owned()],
-        "rustfs-health-probe",
-    );
-    let Ok(access_key) = resolver.resolve(access_ref).await else {
-        return unhealthy(
-            "rustfs",
-            "RustFS (Object storage)",
-            now,
-            None,
-            "credential unavailable",
-        );
-    };
-    let Ok(secret_key) = resolver.resolve(secret_ref).await else {
-        return unhealthy(
-            "rustfs",
-            "RustFS (Object storage)",
-            now,
-            None,
-            "credential unavailable",
-        );
-    };
-    let built = AmazonS3Builder::new()
-        .with_endpoint(config.rustfs_s3_endpoint.clone())
-        .with_region(config.rustfs_s3_region.clone())
-        .with_bucket_name(config.lakehouse_warehouse_bucket.clone())
-        .with_access_key_id(access_key.expose_secret())
-        .with_secret_access_key(secret_key.expose_secret())
-        // Self-hosted (RustFS), not real AWS S3 — same posture
-        // `connector_probe::probe_s3` and `lakehouse-iceberg::storage` use.
-        .with_virtual_hosted_style_request(false)
-        .with_allow_http(true)
-        .build();
-    let Ok(client) = built else {
-        return unhealthy(
-            "rustfs",
-            "RustFS (Object storage)",
-            now,
-            None,
-            "misconfigured",
-        );
+    let client = match rustfs_client::build_client(config).await {
+        Ok(client) => client,
+        Err(RustfsClientError::NotConfigured) => {
+            return unknown("rustfs", "RustFS (Object storage)", now);
+        }
+        Err(RustfsClientError::CredentialUnavailable(_)) => {
+            return unhealthy(
+                "rustfs",
+                "RustFS (Object storage)",
+                now,
+                None,
+                "credential unavailable",
+            );
+        }
+        Err(RustfsClientError::Misconfigured(_)) => {
+            return unhealthy(
+                "rustfs",
+                "RustFS (Object storage)",
+                now,
+                None,
+                "misconfigured",
+            );
+        }
     };
     let started = Instant::now();
     let attempt = tokio::time::timeout(PROBE_TIMEOUT, client.list_with_delimiter(None)).await;
