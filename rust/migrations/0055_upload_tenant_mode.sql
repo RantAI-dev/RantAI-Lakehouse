@@ -1,23 +1,27 @@
 -- File upload, T3 of docs/superpowers/plans/2026-10-02-upload-file.md
 -- (ADR 0014, decisions 5 and 6): the columns `file_upload` needs before a
--- route can be written over it. `0054_upload.sql` stays as it is: the plan
--- records it as applied on the development database, and `sqlx` refuses to
--- boot when the checksum of an applied migration changes
--- (CODE-STANDARD.md section 3.5).
+-- route can be written over it, and `upload_table_claim`, the record of who
+-- owns a raw table name. `0054_upload.sql` stays as it is: the plan records
+-- it as applied on the development database, and `sqlx` refuses to boot when
+-- the checksum of an applied migration changes (CODE-STANDARD.md
+-- section 3.5).
 --
 -- MIGRATION NUMBERS: `0054` and this file are provisional. Backlog item
 -- `DATA-1` plans to use `0054` on `main`, so both files are renumbered when
 -- this branch meets `main`. They are not renumbered now: `0054` is already
 -- recorded in the development database under its present name and checksum.
 --
--- EDITED ONCE AFTER T3, FROZEN FROM THE TRIAL DEPLOY ON: T5a of the plan
--- added `deleted_at` below, after the review of slice B part 1 (finding
--- B1). Editing an applied migration is what section 3.5 of
--- docs/CODE-STANDARD.md forbids, and it was allowed here only because this
--- file had been applied on throwaway test databases and nowhere that
--- persists: the development database has never run it. From the trial
--- deploy on, this file is frozen like any applied migration, and a further
--- change to `file_upload` is a new migration.
+-- EDITED TWICE AFTER T3, FROZEN FROM THE TRIAL DEPLOY ON: T5a of the plan
+-- added a soft-delete timestamp column here, after the review of slice B
+-- part 1 (finding B1); T6a took it out again and added `upload_table_claim`,
+-- after the review of slice B part 2 (finding B4). Editing an applied
+-- migration is what section 3.5 of docs/CODE-STANDARD.md forbids, and it was
+-- allowed here only because this file had been applied on throwaway test
+-- databases and nowhere that persists: the development database has never
+-- run it, so that column was never applied anywhere that kept it and there is
+-- nothing to drop. From the trial deploy on, this file is frozen like any
+-- applied migration, and a further change to `file_upload` or
+-- `upload_table_claim` is a new migration.
 --
 -- WHY `tenant_id`: an upload belongs to the uploader's active tenant, and
 -- every route that names an upload answers 404 outside it (ADR 0014,
@@ -53,23 +57,43 @@
 -- whose sink reported no total, a failed load, and a file not yet loaded
 -- all say so instead of showing a number nobody counted.
 --
--- WHY `deleted_at` (T5a, finding B1): deleting an upload keeps the table it
--- loaded (ADR 0014, decision 1), and a later upload may load into that
--- table only if some upload of the same tenant claimed the name first
--- (decision 5). If deleting removed the row, the table would outlive the
--- only record that an upload made it, and nobody could load into it again.
--- So a delete sets this column and every read of an upload filters on
--- `deleted_at IS NULL`, except the two questions about who owns a table
--- ("did an upload of this tenant claim it", "did an upload load it"), which
--- count deleted rows on purpose. NULL means live. The file's bytes are gone
--- by then (the API deletes the object first); the row is what is kept.
+-- WHY `upload_table_claim` (T6a, finding B4): who owns a raw table name is a
+-- record of its own, because no upload row can carry it. A row names only the
+-- table of its LAST load (`bronze_table` is overwritten by the next one), it
+-- goes when the upload is deleted, and nothing stops the rows of two tenants
+-- from naming one table. T5a read ownership from those rows and two failures
+-- followed: tenant B's load into `t` fails before it writes, tenant A then
+-- creates `t`, and B's retry passes the check and replaces A's rows; and an
+-- upload that loaded `x` and was then loaded into `y` no longer names `x`, so
+-- nothing says an upload made `x`.
+--
+-- A claim is one row here, keyed by the table name. The primary key is the
+-- point: one table name has one owner and the database decides which, even
+-- when two tenants ask for the same new name in the same moment
+-- (`lakehouse_store::uploads::claim_table` is one `INSERT ... ON CONFLICT`
+-- statement). A claim is made when a load into the table is first requested,
+-- before the upload is marked as loading and before the job is launched, and
+-- it is NEVER RELEASED: not when the upload is deleted, not when the load
+-- fails (the job may have written before it failed), not when the table is
+-- left unused. The cost is that a name a tenant's upload once asked for stays
+-- that tenant's, even if the load never wrote. A connector may not take a
+-- claimed table either (plan task T8).
+--
+-- `tenant_id` has the shape of `file_upload.tenant_id`: nullable, a foreign
+-- key to `tenant(id)`, `ON DELETE SET NULL`. A claim whose tenant is gone
+-- belongs to nobody, and the store answers "not yours" to every tenant for it
+-- (fail closed), so the name stays reserved for good. `upload_id` is the
+-- upload that first asked for the name, kept for the record. It has no
+-- foreign key: the claim must outlive the upload, and a deleted upload's row
+-- is really deleted.
 --
 -- INDEXES: the listing is newest-first within a tenant, so
 -- `upload_tenant_created_idx` (on the dropped text column) is replaced by
 -- one on `(tenant_id, created_at DESC)`. `bronze_table` is looked up by the
--- checks the routes make about a table name ("did an upload of this tenant
--- claim it", "is another upload loading into it", and, from a connector's
--- ingest spec, "did an upload load it"), so it gets an index of its own.
+-- check the ingest route makes before it starts a load ("is another upload
+-- loading into this table"), so it gets an index of its own. The questions
+-- about who owns a table name ("whose claim is it", "may a connector take
+-- it") are answered by the primary key of `upload_table_claim`.
 --
 -- The one destructive statement is the DROP COLUMN; see above for why there
 -- is nothing in it worth keeping.
@@ -81,11 +105,17 @@ ALTER TABLE file_upload
     ADD COLUMN tenant_id  UUID REFERENCES tenant(id) ON DELETE SET NULL,
     ADD COLUMN load_mode  TEXT
         CHECK (load_mode IN ('replace', 'append')),
-    ADD COLUMN row_count  BIGINT,
-    ADD COLUMN deleted_at TIMESTAMPTZ;
+    ADD COLUMN row_count  BIGINT;
 
 CREATE INDEX IF NOT EXISTS upload_tenant_id_created_idx
     ON file_upload (tenant_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS upload_bronze_table_idx
     ON file_upload (bronze_table);
+
+CREATE TABLE IF NOT EXISTS upload_table_claim (
+    bronze_table TEXT        PRIMARY KEY,
+    tenant_id    UUID        REFERENCES tenant(id) ON DELETE SET NULL,
+    upload_id    TEXT        NOT NULL,
+    claimed_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);

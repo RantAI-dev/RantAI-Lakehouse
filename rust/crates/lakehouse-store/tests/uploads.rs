@@ -16,10 +16,12 @@
 //! `tests/connectors.rs`, beside the connector helpers it needs.
 //!
 //! T5a of the plan (review findings B1, B2 and B3) amended the store after
-//! these tests were first written: deleting is soft, a table is owned by any
-//! row of the tenant that names it, a load is claimed before it is launched,
-//! and `content_type` and `sha256` are not on the wire. The tests for each
-//! are named after what they pin.
+//! these tests were first written: a load is claimed before it is launched,
+//! and `content_type` and `sha256` are not on the wire. T6a (finding B4)
+//! amended it again: who owns a table name is a record of its own,
+//! `upload_table_claim`, keyed by the name, and deleting an upload is a real
+//! delete (T5a had made it soft to keep the row as that record). The tests for
+//! each are named after what they pin.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -32,9 +34,9 @@ use std::borrow::Cow;
 use lakehouse_store::StoreError;
 use lakehouse_store::identity::{CreateTenantInput, create_tenant};
 use lakehouse_store::uploads::{
-    LoadMode, NewUpload, Upload, attach_run, find_by_sha256, get, insert, list, mark_finished,
-    mark_ingesting, soft_delete, table_being_loaded, table_claimed_by_upload,
-    table_loaded_by_upload, upload_in_tenants,
+    LoadMode, NewUpload, TableClaim, Upload, attach_run, claim_table, delete, find_by_sha256, get,
+    insert, list, mark_finished, mark_ingesting, table_being_loaded, table_claim, table_claimed,
+    upload_in_tenants,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -114,25 +116,35 @@ fn ids(rows: &[Upload]) -> Vec<&str> {
     rows.iter().map(|r| r.id.as_str()).collect()
 }
 
-/// `(rows with this id, of which marked deleted)`, read around the store's
-/// own functions, which show live rows only.
-async fn rows_and_deleted(pool: &PgPool, id: &str) -> (i64, i64) {
-    sqlx::query_as("SELECT count(*), count(deleted_at) FROM file_upload WHERE id = $1")
+/// How many rows `file_upload` holds under this id, read around the store's
+/// own functions.
+async fn rows_with_id(pool: &PgPool, id: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM file_upload WHERE id = $1")
         .bind(id)
         .fetch_one(pool)
         .await
         .unwrap()
 }
 
-/// Mark a row deleted whatever its state. `soft_delete` refuses a row that
-/// is loading, so the tests that need a deleted row in another state set it
-/// with SQL, the way a row could be left by something other than the store.
-async fn force_deleted(pool: &PgPool, id: &str) {
-    sqlx::query("UPDATE file_upload SET deleted_at = now() WHERE id = $1")
-        .bind(id)
-        .execute(pool)
+/// Claim `table` for `tenant_id` the way the ingest route does before it marks
+/// an upload as loading; the claim must be allowed.
+async fn claim(pool: &PgPool, tenant_id: Uuid, table: &str, upload_id: &str) {
+    assert!(
+        claim_table(pool, tenant_id, table, upload_id)
+            .await
+            .unwrap(),
+        "{table} could not be claimed for {tenant_id}"
+    );
+}
+
+/// `(tenant, upload that asked first)` of the claim on `table`, read around
+/// the store's own functions, or `None` when nothing is claimed.
+async fn claim_row(pool: &PgPool, table: &str) -> Option<(Option<Uuid>, String)> {
+    sqlx::query_as("SELECT tenant_id, upload_id FROM upload_table_claim WHERE bronze_table = $1")
+        .bind(table)
+        .fetch_optional(pool)
         .await
-        .unwrap();
+        .unwrap()
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -242,14 +254,7 @@ async fn the_serialized_upload_hides_what_the_console_does_not_need_and_omits_wh
     assert_eq!(up.sha256, sha, "still read from the row");
     let body = serde_json::to_value(&up).unwrap();
 
-    for hidden in [
-        "storageKey",
-        "tenantId",
-        "tenant",
-        "contentType",
-        "sha256",
-        "deletedAt",
-    ] {
+    for hidden in ["storageKey", "tenantId", "tenant", "contentType", "sha256"] {
         assert!(
             body.get(hidden).is_none(),
             "{hidden} must not be serialized"
@@ -818,189 +823,425 @@ async fn an_ingested_or_failed_upload_can_be_loaded_again_from_a_clean_slate(
     Ok(())
 }
 
-/// What the ingest route asks before it loads into a table that exists: does
-/// ANY row of the SAME tenant name it. `mark_ingesting` is the only writer of
-/// `bronze_table` and the route calls it after it has allowed the name, so a
-/// row that names a table is a claim that was allowed, and its status does
-/// not matter (review finding B1): a load still running, one that failed
-/// after it had written, and one that succeeded all hold the name.
+// ── Who owns a table name (T6a, review finding B4) ─────────────────────────
+
+/// The first claim on a name is made, the same tenant's is held again, and
+/// another tenant's is refused. What `claim_table` answers is whether the claim
+/// is the asking tenant's afterwards.
 #[sqlx::test(migrations = "../../migrations")]
-async fn table_claimed_by_upload_is_true_for_any_row_of_that_tenant_that_names_the_table(
+async fn claim_table_is_true_for_the_first_asker_and_the_holder_again_and_false_for_anyone_else(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let tenant_a = tenant(&pool, "uploads-owner-a").await;
-    let tenant_b = tenant(&pool, "uploads-owner-b").await;
-    add(&pool, "up-1", tenant_a, "").await;
+    let tenant_a = tenant(&pool, "uploads-claim-a").await;
+    let tenant_b = tenant(&pool, "uploads-claim-b").await;
 
     assert!(
-        !table_claimed_by_upload(&pool, tenant_a, "stock_raw")
+        claim_table(&pool, tenant_a, "stock_raw", "up-a1")
             .await
             .unwrap(),
-        "an upload that names no table claims none"
+        "a name nobody holds is claimed"
     );
-
-    start(&pool, "up-1", "stock_raw", LoadMode::Replace, None).await;
     assert!(
-        table_claimed_by_upload(&pool, tenant_a, "stock_raw")
+        claim_table(&pool, tenant_a, "stock_raw", "up-a2")
             .await
             .unwrap(),
-        "the name is claimed when the load is claimed, before the job runs"
+        "held already: still this tenant's, whichever of its uploads asks"
     );
-
-    mark_finished(
-        &pool,
-        "up-1",
-        None,
-        Some("The load into the table failed."),
-        None,
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(get(&pool, "up-1").await.unwrap().unwrap().status, "failed");
     assert!(
-        table_claimed_by_upload(&pool, tenant_a, "stock_raw")
+        !claim_table(&pool, tenant_b, "stock_raw", "up-b1")
             .await
             .unwrap(),
-        "a failed load still holds the name: the job may have written before it failed"
+        "another tenant holds it"
+    );
+    assert!(
+        !claim_table(&pool, tenant_b, "stock_raw", "up-b2")
+            .await
+            .unwrap(),
+        "and asking again does not change that"
     );
 
-    start(&pool, "up-1", "stock_raw", LoadMode::Replace, None).await;
-    mark_finished(&pool, "up-1", None, None, Some(3))
-        .await
-        .unwrap()
-        .unwrap();
+    // The record is the first asker's, and nothing else was made.
     assert_eq!(
-        get(&pool, "up-1").await.unwrap().unwrap().status,
-        "ingested"
+        claim_row(&pool, "stock_raw").await,
+        Some((Some(tenant_a), "up-a1".to_owned())),
+        "the claim keeps the upload that asked first and the tenant that held it"
     );
+    let all: i64 = sqlx::query_scalar("SELECT count(*) FROM upload_table_claim")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(all, 1, "the refused asks made no claim");
+
+    // A claim is of one name only.
     assert!(
-        table_claimed_by_upload(&pool, tenant_a, "stock_raw")
+        claim_table(&pool, tenant_b, "other_raw", "up-b1")
             .await
             .unwrap()
     );
-
     assert!(
-        !table_claimed_by_upload(&pool, tenant_b, "stock_raw")
+        !claim_table(&pool, tenant_a, "other_raw", "up-a1")
             .await
-            .unwrap(),
-        "another tenant's upload did not claim it"
+            .unwrap()
     );
+    Ok(())
+}
+
+/// Review finding B4: two tenants asking for one new name at the same moment
+/// cannot both win. `claim_table` is one statement and the primary key is the
+/// arbiter, so in every round, each with a name of its own, exactly one of the
+/// two gets `true`. A check followed by an insert would let both through in
+/// some round, or fail one of them with a unique violation, which `unwrap`
+/// turns into a failure of this test.
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_tenants_claiming_one_new_name_at_the_same_moment_one_wins(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-race-a").await;
+    let tenant_b = tenant(&pool, "uploads-race-b").await;
+
+    for round in 0..25 {
+        let table = format!("race_{round}");
+        let (a, b) = tokio::join!(
+            claim_table(&pool, tenant_a, &table, "up-a"),
+            claim_table(&pool, tenant_b, &table, "up-b"),
+        );
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_ne!(a, b, "round {round}: exactly one claim wins (a={a}, b={b})");
+
+        let (winner, loser) = if a {
+            (tenant_a, tenant_b)
+        } else {
+            (tenant_b, tenant_a)
+        };
+        assert_eq!(
+            table_claim(&pool, winner, &table).await.unwrap(),
+            TableClaim::Ours,
+            "round {round}"
+        );
+        assert_eq!(
+            table_claim(&pool, loser, &table).await.unwrap(),
+            TableClaim::Theirs,
+            "round {round}"
+        );
+    }
+
+    // The same tenant asking twice at once is no conflict: both are told it is
+    // theirs, and the first asker's upload is the one recorded.
+    let (first, second) = tokio::join!(
+        claim_table(&pool, tenant_a, "twice_raw", "up-1"),
+        claim_table(&pool, tenant_a, "twice_raw", "up-2"),
+    );
+    assert!(first.unwrap() && second.unwrap());
+    let recorded = claim_row(&pool, "twice_raw").await.unwrap();
+    assert_eq!(recorded.0, Some(tenant_a));
+    assert!(["up-1", "up-2"].contains(&recorded.1.as_str()));
+    Ok(())
+}
+
+/// `table_claim` is the read the route makes before it asks the database to
+/// decide: nobody's, the asking tenant's, or someone else's. Reading claims
+/// nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn table_claim_answers_unclaimed_ours_or_theirs_and_claims_nothing(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-read-a").await;
+    let tenant_b = tenant(&pool, "uploads-read-b").await;
+
+    for asking in [tenant_a, tenant_b] {
+        assert_eq!(
+            table_claim(&pool, asking, "stock_raw").await.unwrap(),
+            TableClaim::Unclaimed
+        );
+    }
     assert!(
-        !table_claimed_by_upload(&pool, tenant_a, "other_raw")
-            .await
-            .unwrap(),
+        claim_row(&pool, "stock_raw").await.is_none(),
+        "asking made no claim"
+    );
+
+    claim(&pool, tenant_a, "stock_raw", "up-a1").await;
+    assert_eq!(
+        table_claim(&pool, tenant_a, "stock_raw").await.unwrap(),
+        TableClaim::Ours
+    );
+    assert_eq!(
+        table_claim(&pool, tenant_b, "stock_raw").await.unwrap(),
+        TableClaim::Theirs
+    );
+    assert_eq!(
+        table_claim(&pool, tenant_a, "other_raw").await.unwrap(),
+        TableClaim::Unclaimed,
         "a claim is of one name only"
     );
     Ok(())
 }
 
-/// Deleting an upload keeps its table (ADR 0014), so the row that proves an
-/// upload of the tenant made it must outlive the delete. Without this a
-/// deleted upload's table could never be loaded into again (finding B1).
+/// What a connector's ingest spec asks (plan task T8): does ANY tenant hold
+/// the name. No tenant is asking, so it is not `table_claim`.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_deleted_upload_still_claims_its_table_whatever_became_of_its_load(
+async fn table_claimed_is_true_for_a_claim_of_any_tenant_and_false_for_a_name_nobody_asked_for(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let tenant_a = tenant(&pool, "uploads-owner-deleted").await;
-    let tenant_b = tenant(&pool, "uploads-owner-deleted-b").await;
-    add(&pool, "up-1", tenant_a, "").await;
-    add(&pool, "up-2", tenant_a, "").await;
+    let tenant_a = tenant(&pool, "uploads-any-a").await;
+    let tenant_b = tenant(&pool, "uploads-any-b").await;
 
-    start(&pool, "up-1", "stock_raw", LoadMode::Replace, None).await;
-    mark_finished(&pool, "up-1", None, None, Some(3))
-        .await
-        .unwrap()
-        .unwrap();
-    start(&pool, "up-2", "broken_raw", LoadMode::Replace, None).await;
-    mark_finished(
+    assert!(!table_claimed(&pool, "stock_raw").await.unwrap());
+    claim(&pool, tenant_a, "stock_raw", "up-a1").await;
+    claim(&pool, tenant_b, "other_raw", "up-b1").await;
+    assert!(table_claimed(&pool, "stock_raw").await.unwrap());
+    assert!(
+        table_claimed(&pool, "other_raw").await.unwrap(),
+        "the question has no tenant: another tenant's claim counts the same"
+    );
+    assert!(!table_claimed(&pool, "third_raw").await.unwrap());
+    Ok(())
+}
+
+/// A claim whose tenant was deleted belongs to nobody (`ON DELETE SET NULL`,
+/// the shape of `file_upload.tenant_id`), and nobody may take it over: no
+/// tenant is told it is theirs, no tenant's claim succeeds, and it still counts
+/// as claimed. The name stays reserved for good (fail closed).
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_whose_tenant_is_gone_belongs_to_nobody_and_stays_reserved(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let gone = tenant(&pool, "uploads-gone").await;
+    let tenant_b = tenant(&pool, "uploads-gone-b").await;
+    let tenant_c = tenant(&pool, "uploads-gone-c").await;
+    claim(&pool, gone, "stock_raw", "up-gone").await;
+
+    sqlx::query("DELETE FROM tenant WHERE id = $1")
+        .bind(gone)
+        .execute(&pool)
+        .await?;
+
+    assert_eq!(
+        claim_row(&pool, "stock_raw").await,
+        Some((None, "up-gone".to_owned())),
+        "the claim stays, with no tenant"
+    );
+    for asking in [tenant_b, tenant_c] {
+        assert!(
+            !claim_table(&pool, asking, "stock_raw", "up-x")
+                .await
+                .unwrap(),
+            "nobody takes over a claim that has no tenant"
+        );
+        assert_eq!(
+            table_claim(&pool, asking, "stock_raw").await.unwrap(),
+            TableClaim::Theirs,
+            "it is no asking tenant's"
+        );
+    }
+    assert_eq!(
+        table_claim(&pool, gone, "stock_raw").await.unwrap(),
+        TableClaim::Theirs,
+        "not even the id of the tenant that is gone"
+    );
+    assert!(table_claimed(&pool, "stock_raw").await.unwrap());
+    assert_eq!(
+        claim_row(&pool, "stock_raw").await,
+        Some((None, "up-gone".to_owned())),
+        "and it is unchanged by the asks"
+    );
+    Ok(())
+}
+
+/// A claim is never released (review finding B4): not when the load it was
+/// made for fails (the job may have written before it failed), not when the
+/// upload is loaded into another table, and not when the upload is deleted.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claim_is_never_released_by_a_failed_load_another_load_or_a_delete(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-keep-a").await;
+    add(&pool, "up-1", tenant_a, "").await;
+
+    claim(&pool, tenant_a, "stock_raw", "up-1").await;
+    start(&pool, "up-1", "stock_raw", LoadMode::Replace, Some("run-1")).await;
+    let failed = mark_finished(
         &pool,
-        "up-2",
-        None,
+        "up-1",
+        Some("run-1"),
         Some("The load into the table failed."),
         None,
     )
     .await
     .unwrap()
     .unwrap();
+    assert_eq!(failed.status, "failed");
+    assert_eq!(
+        table_claim(&pool, tenant_a, "stock_raw").await.unwrap(),
+        TableClaim::Ours,
+        "a failed load still holds the name"
+    );
 
-    assert!(soft_delete(&pool, "up-1").await.unwrap());
-    assert!(soft_delete(&pool, "up-2").await.unwrap());
-    assert!(get(&pool, "up-1").await.unwrap().is_none());
+    claim(&pool, tenant_a, "other_raw", "up-1").await;
+    start(&pool, "up-1", "other_raw", LoadMode::Replace, Some("run-2")).await;
+    mark_finished(&pool, "up-1", Some("run-2"), None, Some(3))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        table_claim(&pool, tenant_a, "stock_raw").await.unwrap(),
+        TableClaim::Ours,
+        "loading the upload into another table does not release the first"
+    );
 
-    for table in ["stock_raw", "broken_raw"] {
-        assert!(
-            table_claimed_by_upload(&pool, tenant_a, table)
-                .await
-                .unwrap(),
-            "{table}: the deleted row is still the claim"
+    assert!(delete(&pool, "up-1").await.unwrap());
+    for table in ["stock_raw", "other_raw"] {
+        assert_eq!(
+            table_claim(&pool, tenant_a, table).await.unwrap(),
+            TableClaim::Ours,
+            "{table}: deleting the upload does not release it"
         );
-        assert!(
-            !table_claimed_by_upload(&pool, tenant_b, table)
-                .await
-                .unwrap(),
-            "{table}: and it is still only this tenant's"
+        assert!(table_claimed(&pool, table).await.unwrap(), "{table}");
+        assert_eq!(
+            claim_row(&pool, table).await,
+            Some((Some(tenant_a), "up-1".to_owned())),
+            "{table}: the record still names the upload that asked"
         );
     }
     Ok(())
 }
 
-/// What a connector's ingest spec asks (plan task T8): did an upload of ANY
-/// tenant load this table. Only an `ingested` row says so; deleting the
-/// upload does not take it back.
+/// The failure the review found (finding B4): tenant B's load into `t` fails
+/// before it writes; tenant A then asks for `t`; B retries. With ownership read
+/// from upload rows, A took `t` and B's retry replaced A's rows. With the claim
+/// recorded, B's failed claim keeps A out and B's retry still passes.
 #[sqlx::test(migrations = "../../migrations")]
-async fn table_loaded_by_upload_is_true_only_for_an_ingested_row_of_any_tenant_deleted_or_not(
+async fn a_failed_claim_keeps_another_tenant_out_and_lets_its_own_tenant_retry(
     pool: PgPool,
 ) -> sqlx::Result<()> {
-    let tenant_a = tenant(&pool, "uploads-loaded-a").await;
-    let tenant_b = tenant(&pool, "uploads-loaded-b").await;
-    add(&pool, "up-a", tenant_a, "").await;
-    add(&pool, "up-b", tenant_b, "").await;
+    let tenant_a = tenant(&pool, "uploads-retry-a").await;
+    let tenant_b = tenant(&pool, "uploads-retry-b").await;
+    add(&pool, "up-a1", tenant_a, "").await;
+    add(&pool, "up-b1", tenant_b, "").await;
 
-    assert!(
-        !table_loaded_by_upload(&pool, "stock_raw").await.unwrap(),
-        "an upload that names no table loaded none"
-    );
-    start(&pool, "up-a", "stock_raw", LoadMode::Replace, None).await;
-    assert!(
-        !table_loaded_by_upload(&pool, "stock_raw").await.unwrap(),
-        "a load still running has not loaded it"
-    );
+    claim(&pool, tenant_b, "t", "up-b1").await;
+    start(&pool, "up-b1", "t", LoadMode::Replace, None).await;
     mark_finished(
         &pool,
-        "up-a",
+        "up-b1",
         None,
-        Some("The load into the table failed."),
+        Some("The load could not be started."),
         None,
     )
     .await
     .unwrap()
     .unwrap();
+
     assert!(
-        !table_loaded_by_upload(&pool, "stock_raw").await.unwrap(),
-        "a failed load has not loaded it, as far as this record can say"
+        !claim_table(&pool, tenant_a, "t", "up-a1").await.unwrap(),
+        "B's claim stands although B's load failed"
+    );
+    assert_eq!(
+        table_claim(&pool, tenant_a, "t").await.unwrap(),
+        TableClaim::Theirs
     );
 
-    start(&pool, "up-a", "stock_raw", LoadMode::Replace, None).await;
-    mark_finished(&pool, "up-a", None, None, Some(3))
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(table_loaded_by_upload(&pool, "stock_raw").await.unwrap());
-
-    // The question has no tenant: another tenant's loaded table counts the same.
-    start(&pool, "up-b", "other_raw", LoadMode::Append, None).await;
-    mark_finished(&pool, "up-b", None, None, None)
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(table_loaded_by_upload(&pool, "other_raw").await.unwrap());
-    assert!(!table_loaded_by_upload(&pool, "third_raw").await.unwrap());
-
-    assert!(soft_delete(&pool, "up-a").await.unwrap());
     assert!(
-        table_loaded_by_upload(&pool, "stock_raw").await.unwrap(),
-        "deleting the upload keeps the table, and the record that it was loaded"
+        claim_table(&pool, tenant_b, "t", "up-b1").await.unwrap(),
+        "B's retry is B's own claim"
+    );
+    assert_eq!(
+        table_claim(&pool, tenant_b, "t").await.unwrap(),
+        TableClaim::Ours
+    );
+    start(&pool, "up-b1", "t", LoadMode::Replace, None).await;
+    Ok(())
+}
+
+/// The other failure (finding B4): an upload that loaded `x` and is then
+/// loaded into `y` names only `y`, so nothing in its row says an upload made
+/// `x`. The claim on `x` does: another upload of the tenant may load into it,
+/// another tenant may not, and `table_claimed` says a connector may not either.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_upload_loaded_into_one_table_and_then_another_leaves_the_first_claimed(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-two-tables-a").await;
+    let tenant_b = tenant(&pool, "uploads-two-tables-b").await;
+    add(&pool, "up-1", tenant_a, "").await;
+    add(&pool, "up-2", tenant_a, "").await;
+
+    claim(&pool, tenant_a, "x_raw", "up-1").await;
+    start(&pool, "up-1", "x_raw", LoadMode::Replace, Some("run-1")).await;
+    mark_finished(&pool, "up-1", Some("run-1"), None, Some(5))
+        .await
+        .unwrap()
+        .unwrap();
+    claim(&pool, tenant_a, "y_raw", "up-1").await;
+    start(&pool, "up-1", "y_raw", LoadMode::Replace, Some("run-2")).await;
+
+    let row = get(&pool, "up-1").await.unwrap().unwrap();
+    assert_eq!(
+        row.bronze_table.as_deref(),
+        Some("y_raw"),
+        "the row names only its last load"
+    );
+    for table in ["x_raw", "y_raw"] {
+        assert_eq!(
+            table_claim(&pool, tenant_a, table).await.unwrap(),
+            TableClaim::Ours,
+            "{table}"
+        );
+        assert!(table_claimed(&pool, table).await.unwrap(), "{table}");
+    }
+
+    // Another upload of the same tenant may load into the first table ...
+    claim(&pool, tenant_a, "x_raw", "up-2").await;
+    start(&pool, "up-2", "x_raw", LoadMode::Append, Some("run-3")).await;
+    assert_eq!(
+        claim_row(&pool, "x_raw").await,
+        Some((Some(tenant_a), "up-1".to_owned())),
+        "the claim is still the one the first upload made"
+    );
+    // ... another tenant may not.
+    assert!(
+        !claim_table(&pool, tenant_b, "x_raw", "up-b1")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        table_claim(&pool, tenant_b, "x_raw").await.unwrap(),
+        TableClaim::Theirs
+    );
+    Ok(())
+}
+
+/// After a delete the claim remains, and a new upload of the tenant loads into
+/// the table (finding B4; T5a's soft delete existed to keep this true).
+#[sqlx::test(migrations = "../../migrations")]
+async fn after_a_delete_the_claim_remains_and_a_new_upload_of_the_tenant_loads_into_the_table(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-after-delete-a").await;
+    let tenant_b = tenant(&pool, "uploads-after-delete-b").await;
+    add(&pool, "up-1", tenant_a, "").await;
+    claim(&pool, tenant_a, "stock_raw", "up-1").await;
+    start(&pool, "up-1", "stock_raw", LoadMode::Replace, Some("run-1")).await;
+    mark_finished(&pool, "up-1", Some("run-1"), None, Some(3))
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(delete(&pool, "up-1").await.unwrap());
+    assert_eq!(rows_with_id(&pool, "up-1").await, 0, "the row is gone");
+
+    add(&pool, "up-2", tenant_a, "").await;
+    assert_eq!(
+        table_claim(&pool, tenant_a, "stock_raw").await.unwrap(),
+        TableClaim::Ours
+    );
+    claim(&pool, tenant_a, "stock_raw", "up-2").await;
+    let again = start(&pool, "up-2", "stock_raw", LoadMode::Append, None).await;
+    assert_eq!(again.bronze_table.as_deref(), Some("stock_raw"));
+
+    assert!(
+        !claim_table(&pool, tenant_b, "stock_raw", "up-b1")
+            .await
+            .unwrap(),
+        "and it is still closed to another tenant"
     );
     Ok(())
 }
@@ -1066,43 +1307,56 @@ async fn table_being_loaded_sees_another_upload_loading_and_never_the_asker(
     Ok(())
 }
 
-/// Deleting is soft (review finding B1): the row stays, marked, and the store
-/// reports whether a live row was marked.
+/// Deleting is a real delete again (T6a; T5a had made it soft): the row goes,
+/// the store reports whether one was deleted, and what the upload became is not
+/// its to take back.
 #[sqlx::test(migrations = "../../migrations")]
-async fn soft_delete_marks_a_live_row_once_and_keeps_the_row(pool: PgPool) -> sqlx::Result<()> {
+async fn delete_removes_the_row_once_and_leaves_its_table_claim(pool: PgPool) -> sqlx::Result<()> {
     let tenant_a = tenant(&pool, "uploads-delete").await;
     add(&pool, "up-1", tenant_a, "").await;
-    assert_eq!(rows_and_deleted(&pool, "up-1").await, (1, 0));
+    add(&pool, "up-2", tenant_a, "").await;
+    claim(&pool, tenant_a, "stock_raw", "up-1").await;
+    start(&pool, "up-1", "stock_raw", LoadMode::Replace, Some("run-1")).await;
+    mark_finished(&pool, "up-1", Some("run-1"), None, Some(3))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rows_with_id(&pool, "up-1").await, 1);
 
-    assert!(soft_delete(&pool, "up-1").await.unwrap());
-    assert_eq!(
-        rows_and_deleted(&pool, "up-1").await,
-        (1, 1),
-        "the row is kept, with deleted_at set"
-    );
+    assert!(delete(&pool, "up-1").await.unwrap());
+    assert_eq!(rows_with_id(&pool, "up-1").await, 0, "the row is gone");
     assert!(get(&pool, "up-1").await.unwrap().is_none());
+    assert_eq!(
+        rows_with_id(&pool, "up-2").await,
+        1,
+        "another upload is untouched"
+    );
 
     assert!(
-        !soft_delete(&pool, "up-1").await.unwrap(),
-        "a second delete finds no live row"
+        !delete(&pool, "up-1").await.unwrap(),
+        "a second delete finds nothing"
     );
-    assert!(!soft_delete(&pool, "up-missing").await.unwrap());
-    assert_eq!(rows_and_deleted(&pool, "up-1").await, (1, 1));
+    assert!(!delete(&pool, "up-missing").await.unwrap());
+    assert_eq!(
+        table_claim(&pool, tenant_a, "stock_raw").await.unwrap(),
+        TableClaim::Ours,
+        "the claim on the table the upload loaded is not the upload's to take back"
+    );
     Ok(())
 }
 
 /// A delete cannot slip in between a request that has just claimed an upload
 /// and its launch: the row is refused in SQL while it is loading.
 #[sqlx::test(migrations = "../../migrations")]
-async fn soft_delete_refuses_an_upload_that_is_loading(pool: PgPool) -> sqlx::Result<()> {
+async fn delete_refuses_an_upload_that_is_loading(pool: PgPool) -> sqlx::Result<()> {
     let tenant_a = tenant(&pool, "uploads-delete-busy").await;
     add(&pool, "up-1", tenant_a, "").await;
     start(&pool, "up-1", "stock_raw", LoadMode::Replace, None).await;
 
-    assert!(!soft_delete(&pool, "up-1").await.unwrap(), "a bare claim");
+    assert!(!delete(&pool, "up-1").await.unwrap(), "a bare claim");
     attach_run(&pool, "up-1", "run-1").await.unwrap().unwrap();
-    assert!(!soft_delete(&pool, "up-1").await.unwrap(), "a launched run");
-    assert_eq!(rows_and_deleted(&pool, "up-1").await, (1, 0));
+    assert!(!delete(&pool, "up-1").await.unwrap(), "a launched run");
+    assert_eq!(rows_with_id(&pool, "up-1").await, 1);
     assert_eq!(
         get(&pool, "up-1").await.unwrap().unwrap().status,
         "ingesting"
@@ -1112,27 +1366,37 @@ async fn soft_delete_refuses_an_upload_that_is_loading(pool: PgPool) -> sqlx::Re
         .await
         .unwrap()
         .unwrap();
-    assert!(soft_delete(&pool, "up-1").await.unwrap());
+    assert!(delete(&pool, "up-1").await.unwrap());
     Ok(())
 }
 
-/// What "live rows only" means for the reads the console makes: a deleted
-/// upload is not listed, not found by id, and in no tenant, and its
-/// neighbours are unaffected.
+/// What a delete means for the reads the console makes: a deleted upload is
+/// not listed, not found by id, in no tenant, not a duplicate and not loading,
+/// its neighbours are unaffected, and nothing can be claimed, given a run or
+/// settled on it any more.
 #[sqlx::test(migrations = "../../migrations")]
-async fn a_deleted_upload_is_not_listed_not_found_and_in_no_tenant(
+async fn a_deleted_upload_is_not_listed_not_found_not_a_duplicate_and_cannot_be_loaded(
     pool: PgPool,
 ) -> sqlx::Result<()> {
     let tenant_a = tenant(&pool, "uploads-gone-a").await;
-    add(&pool, "up-1", tenant_a, "").await;
-    add(&pool, "up-2", tenant_a, "").await;
+    let sha = "e".repeat(64);
+    add(&pool, "up-1", tenant_a, &sha).await;
+    add(&pool, "up-2", tenant_a, &sha).await;
     set_created_at(&pool, "up-1", 1).await;
     assert_eq!(
         ids(&list(&pool, tenant_a, 100).await.unwrap()),
         ["up-2", "up-1"]
     );
+    assert_eq!(
+        find_by_sha256(&pool, tenant_a, &sha, "up-2")
+            .await
+            .unwrap()
+            .unwrap()
+            .id,
+        "up-1"
+    );
 
-    assert!(soft_delete(&pool, "up-1").await.unwrap());
+    assert!(delete(&pool, "up-1").await.unwrap());
 
     assert_eq!(ids(&list(&pool, tenant_a, 100).await.unwrap()), ["up-2"]);
     assert!(get(&pool, "up-1").await.unwrap().is_none());
@@ -1141,17 +1405,13 @@ async fn a_deleted_upload_is_not_listed_not_found_and_in_no_tenant(
         "the per-id routes answer 404 for a deleted upload"
     );
     assert!(upload_in_tenants(&pool, "up-2", &[tenant_a]).await.unwrap());
-    Ok(())
-}
-
-/// A deleted upload cannot be loaded: its file is gone, so a claim on it
-/// would launch a job that can only fail, and would name a table for nothing.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_deleted_upload_cannot_be_claimed_for_a_load(pool: PgPool) -> sqlx::Result<()> {
-    let tenant_a = tenant(&pool, "uploads-gone-claim").await;
-    add(&pool, "up-1", tenant_a, "").await;
-    assert!(soft_delete(&pool, "up-1").await.unwrap());
-
+    assert!(
+        find_by_sha256(&pool, tenant_a, &sha, "up-2")
+            .await
+            .unwrap()
+            .is_none(),
+        "a deleted upload's file is gone, so it is not an earlier copy of anything"
+    );
     assert!(
         mark_ingesting(
             &pool,
@@ -1165,42 +1425,18 @@ async fn a_deleted_upload_cannot_be_claimed_for_a_load(pool: PgPool) -> sqlx::Re
         .unwrap()
         .is_none()
     );
+    assert!(attach_run(&pool, "up-1", "run-1").await.unwrap().is_none());
     assert!(
-        !table_claimed_by_upload(&pool, tenant_a, "stock_raw")
-            .await
-            .unwrap(),
-        "a refused claim names nothing"
-    );
-    let (status, table): (String, Option<String>) =
-        sqlx::query_as("SELECT status, bronze_table FROM file_upload WHERE id = 'up-1'")
-            .fetch_one(&pool)
-            .await?;
-    assert_eq!((status.as_str(), table), ("uploaded", None));
-    Ok(())
-}
-
-/// A deleted upload's file is gone, so it is not an earlier copy of anything.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_deleted_upload_is_not_reported_as_a_duplicate(pool: PgPool) -> sqlx::Result<()> {
-    let tenant_a = tenant(&pool, "uploads-gone-dup").await;
-    let sha = "e".repeat(64);
-    add(&pool, "up-1", tenant_a, &sha).await;
-    add(&pool, "up-2", tenant_a, &sha).await;
-    assert_eq!(
-        find_by_sha256(&pool, tenant_a, &sha, "up-2")
-            .await
-            .unwrap()
-            .unwrap()
-            .id,
-        "up-1"
-    );
-
-    assert!(soft_delete(&pool, "up-1").await.unwrap());
-    assert!(
-        find_by_sha256(&pool, tenant_a, &sha, "up-2")
+        mark_finished(&pool, "up-1", None, None, Some(1))
             .await
             .unwrap()
             .is_none()
+    );
+    assert!(
+        !table_being_loaded(&pool, "stock_raw", "up-other")
+            .await
+            .unwrap(),
+        "a deleted upload holds no name"
     );
 
     add(&pool, "up-3", tenant_a, &sha).await;
@@ -1212,61 +1448,6 @@ async fn a_deleted_upload_is_not_reported_as_a_duplicate(pool: PgPool) -> sqlx::
             .id,
         "up-3",
         "a live copy is still found"
-    );
-    Ok(())
-}
-
-/// The writes and the loading check see live rows only too. `soft_delete`
-/// refuses a loading row, so this one is made with SQL.
-#[sqlx::test(migrations = "../../migrations")]
-async fn a_deleted_row_is_not_loading_and_cannot_be_claimed_given_a_run_or_settled(
-    pool: PgPool,
-) -> sqlx::Result<()> {
-    let tenant_a = tenant(&pool, "uploads-gone-busy").await;
-    add(&pool, "up-1", tenant_a, "").await;
-    start(&pool, "up-1", "stock_raw", LoadMode::Replace, None).await;
-    assert!(
-        table_being_loaded(&pool, "stock_raw", "up-other")
-            .await
-            .unwrap()
-    );
-
-    force_deleted(&pool, "up-1").await;
-
-    assert!(
-        !table_being_loaded(&pool, "stock_raw", "up-other")
-            .await
-            .unwrap(),
-        "a deleted row holds no name"
-    );
-    assert!(
-        mark_ingesting(
-            &pool,
-            "up-1",
-            &options(),
-            "other_raw",
-            LoadMode::Append,
-            None
-        )
-        .await
-        .unwrap()
-        .is_none()
-    );
-    assert!(attach_run(&pool, "up-1", "run-1").await.unwrap().is_none());
-    assert!(
-        mark_finished(&pool, "up-1", None, None, Some(1))
-            .await
-            .unwrap()
-            .is_none()
-    );
-    let (status, table): (String, Option<String>) =
-        sqlx::query_as("SELECT status, bronze_table FROM file_upload WHERE id = 'up-1'")
-            .fetch_one(&pool)
-            .await?;
-    assert_eq!(
-        (status.as_str(), table.as_deref()),
-        ("ingesting", Some("stock_raw")),
-        "none of those writes touched the row"
     );
     Ok(())
 }
@@ -1333,14 +1514,106 @@ async fn migration_0055_applies_on_a_database_that_has_0054_and_no_rows(
 
     MIGRATOR.run(&pool).await.unwrap();
 
+    // Exactly what `0055` adds to `file_upload` and exactly what it drops. T5a
+    // added a column here that T6a took out again (review finding B4); asking
+    // for the exact sets is what says it is not there.
     let after = file_upload_columns(&pool).await;
-    for added in ["tenant_id", "load_mode", "row_count", "deleted_at"] {
-        assert!(after.contains(&added.to_owned()), "{added} was not added");
-    }
-    assert!(
-        !after.contains(&"tenant".to_owned()),
-        "the free-text tenant column is gone"
+    let added: Vec<&str> = after
+        .iter()
+        .filter(|column| !before.contains(column))
+        .map(String::as_str)
+        .collect();
+    let dropped: Vec<&str> = before
+        .iter()
+        .filter(|column| !after.contains(column))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(added, ["tenant_id", "load_mode", "row_count"]);
+    assert_eq!(dropped, ["tenant"], "the free-text tenant column is gone");
+
+    // And the table of claims, empty.
+    assert_eq!(
+        table_columns(&pool, "upload_table_claim").await,
+        ["bronze_table", "tenant_id", "upload_id", "claimed_at"]
     );
+    let claims: i64 = sqlx::query_scalar("SELECT count(*) FROM upload_table_claim")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(claims, 0);
+    Ok(())
+}
+
+/// The claim table's own rules, below the store function that uses them
+/// (review finding B4): one row per table name, decided by the primary key; an
+/// upload id is always recorded; a tenant that does not exist cannot hold a
+/// claim, and `claim_table` says so as the foreign-key violation `insert`
+/// answers too.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_claim_table_has_one_row_per_table_name_and_needs_an_upload_and_a_real_tenant(
+    pool: PgPool,
+) -> sqlx::Result<()> {
+    let tenant_a = tenant(&pool, "uploads-claim-shape").await;
+    sqlx::query("INSERT INTO upload_table_claim (bronze_table, tenant_id, upload_id) VALUES ('t', $1, 'up-1')")
+        .bind(tenant_a)
+        .execute(&pool)
+        .await?;
+
+    let twice = sqlx::query(
+        "INSERT INTO upload_table_claim (bronze_table, tenant_id, upload_id) VALUES ('t', $1, 'up-2')",
+    )
+    .bind(tenant_a)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert!(
+        twice
+            .as_database_error()
+            .is_some_and(sqlx::error::DatabaseError::is_unique_violation),
+        "the table name is the primary key, got {twice:?}"
+    );
+
+    let no_upload =
+        sqlx::query("INSERT INTO upload_table_claim (bronze_table, tenant_id) VALUES ('u', $1)")
+            .bind(tenant_a)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+    assert_eq!(
+        no_upload
+            .as_database_error()
+            .map(sqlx::error::DatabaseError::kind),
+        Some(sqlx::error::ErrorKind::NotNullViolation),
+        "{no_upload:?}"
+    );
+
+    let stranger = claim_table(&pool, Uuid::new_v4(), "v_raw", "up-3")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(stranger, StoreError::ForeignKeyViolation),
+        "{stranger:?}"
+    );
+    assert!(claim_row(&pool, "v_raw").await.is_none());
+    // A name that is already held answers false without a row of the asking
+    // tenant ever being written, so there is no foreign key to violate: this is
+    // what `claim_table`'s `# Errors` says.
+    assert!(
+        !claim_table(&pool, Uuid::new_v4(), "t", "up-4")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        claim_row(&pool, "t").await,
+        Some((Some(tenant_a), "up-1".to_owned()))
+    );
+
+    let recent: bool = sqlx::query_scalar(
+        "SELECT claimed_at <= now() AND claimed_at > now() - interval '1 minute' \
+         FROM upload_table_claim WHERE bronze_table = 't'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert!(recent, "claimed_at defaults to the time of the claim");
     Ok(())
 }
 
@@ -1388,11 +1661,16 @@ fn migrations_up_to(version: i64) -> Migrator {
 }
 
 async fn file_upload_columns(pool: &PgPool) -> Vec<String> {
+    table_columns(pool, "file_upload").await
+}
+
+async fn table_columns(pool: &PgPool, table: &str) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT column_name::text FROM information_schema.columns \
-         WHERE table_schema = 'public' AND table_name = 'file_upload' \
+         WHERE table_schema = 'public' AND table_name = $1 \
          ORDER BY ordinal_position",
     )
+    .bind(table)
     .fetch_all(pool)
     .await
     .unwrap()

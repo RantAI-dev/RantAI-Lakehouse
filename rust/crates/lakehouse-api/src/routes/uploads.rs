@@ -23,8 +23,8 @@
 //!    job writes nothing to Postgres (ADR 0014, decision 5): the API reads its
 //!    result back from `lake.bronze_meta.ingest_run` and settles the row when
 //!    it is read ([`Settler`]).
-//! 5. `DELETE /api/uploads/{id}` removes the object and soft-deletes the row.
-//!    The table the upload became stays.
+//! 5. `DELETE /api/uploads/{id}` removes the object and the row. The table the
+//!    upload became stays, and so does the claim on its name.
 //!
 //! # Posture
 //!
@@ -37,13 +37,16 @@
 //!   `ClickHouse` errors are logged and answered with a fixed sentence
 //!   written here (or, for storage, in [`crate::upload_store`]); a database
 //!   error reaches a response only as the store's own fixed `database error`.
-//!   The one piece of recorded text a response carries is the reason
-//!   `file_ingest_job` itself wrote into `ingest_run` (plan T7 fixes its
-//!   wording).
+//!   The one piece of recorded text a response can carry is a reason
+//!   `file_ingest_job` wrote into `ingest_run`, and only when it is one of the
+//!   six the API knows ([`JOB_FAILURE_REASONS`], review finding B6); anything
+//!   else the job recorded is shown as [`LOAD_FAILED`].
 //! * **Fail closed on a table name.** A load may target a table that does not
-//!   exist or one an upload of the same tenant claimed; never a connector's
-//!   table, never anything else. When the API cannot tell, it answers 503 and
-//!   does not guess that the name is free ([`ensure_table_free`]).
+//!   exist or one this tenant's uploads claimed; never a connector's table,
+//!   never anything else. Who owns a name is the claim table's to say
+//!   (`lakehouse_store::uploads::claim_table`, review finding B4), not the
+//!   upload rows'. When the API cannot tell, it answers 503 and does not guess
+//!   that the name is free ([`ensure_table_free`]).
 //! * **One load per upload, and the row is claimed before the job is
 //!   launched** (review finding B2): see [`ingest`].
 //!
@@ -72,7 +75,7 @@ use lakehouse_dagster::map_run_status;
 use lakehouse_store::PgPool;
 use lakehouse_store::audit::{self as store_audit, NewAuditEvent};
 use lakehouse_store::connectors;
-use lakehouse_store::uploads::{self, LoadMode, NewUpload, Upload};
+use lakehouse_store::uploads::{self, LoadMode, NewUpload, TableClaim, Upload};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -122,6 +125,17 @@ const LIST_LIMIT: i64 = 100;
 /// past any request that could still be about to attach a run.
 const STALE_CLAIM: time::Duration = time::Duration::minutes(2);
 
+/// How old a claim must be before an upload whose run the orchestrator no
+/// longer knows, and which recorded no result, is failed ([`RUN_UNKNOWN`];
+/// review finding B5). Without an end such an upload stayed loading for ever,
+/// and a loading upload can be neither deleted nor loaded again.
+///
+/// One hour is a bound chosen to be well past any load of a file at the
+/// [`MAX_UPLOAD_BYTES`] cap, not a measurement: no load of a file that size has
+/// been timed. It only has to be long enough that a run which is merely slow,
+/// or about to start, is not failed under its own feet.
+const UNKNOWN_RUN_BOUND: time::Duration = time::Duration::hours(1);
+
 /// How long a read waits for the orchestrator or for `ClickHouse` while it
 /// settles a loading upload. A bound so that a page that polls is not held
 /// for the whole request deadline by a hung connection; not a measurement.
@@ -164,7 +178,12 @@ const QUERY_UNREADABLE: &str = "The query string could not be read.";
 const ALREADY_LOADING: &str = "This upload is already being loaded.";
 const TABLE_BUSY: &str = "Another upload is loading into that table.";
 const CONNECTOR_TABLE: &str = "A connector loads that table, so a file cannot be loaded into it.";
-const TABLE_NOT_FREE: &str = "That table already exists and no upload of this tenant created it, so a file cannot be loaded into it.";
+/// The one sentence for a table name that is not this tenant's to load into:
+/// another tenant holds the claim on it, or it exists and nobody claimed it.
+/// Deliberately the same for both, so that the answer does not tell a caller
+/// which of the two it is (review finding B4): a tenant must not be able to
+/// learn what other tenants have claimed, or which names are theirs.
+const TABLE_NOT_FREE: &str = "That table name is in use and no upload of this tenant created it, so a file cannot be loaded into it.";
 const TABLE_UNCHECKED: &str =
     "Could not check whether that table already exists, so nothing was loaded.";
 const NO_QUERY_DATABASE: &str = "Uploads need ICEBERG_QUERY_DB to be set, so the API can check that a table name is free. Nothing was loaded.";
@@ -182,8 +201,37 @@ const COULD_NOT_START: &str = "The load could not be started.";
 const NOT_STARTED: &str = "The load was not started.";
 /// The run ended and recorded nothing.
 const NO_RESULT: &str = "The load stopped before it recorded a result.";
-/// The run recorded a failure with no reason.
+/// The run recorded a failure with no reason, or with text that is not one of
+/// [`JOB_FAILURE_REASONS`].
 const LOAD_FAILED: &str = "The load failed.";
+/// A claim older than [`UNKNOWN_RUN_BOUND`] whose run the orchestrator does not
+/// know and which recorded no result (review finding B5).
+const RUN_UNKNOWN: &str = "The orchestrator no longer knows this load.";
+
+// The reasons `file_ingest_job` records when a load fails (plan T7). The API
+// shows a recorded reason only when it is one of these six (review finding
+// B6): `ingest_run.error` is free text, so one `str(exc)` in the job would
+// otherwise put exception text, a host or a path into a response. These are
+// the same six as `ops/fixtures/upload_load_failure_reasons.json`, which a
+// test below reads and which the job's own tests assert its constants against.
+
+const JOB_FILE_UNREADABLE: &str = "The stored file could not be read.";
+const JOB_HEADER_PAST_END: &str = "The header row is past the end of the file.";
+const JOB_NO_ROWS: &str = "The file has no rows below the header row.";
+const JOB_TOO_MANY_ROWS: &str = "The file has more than 2,000,000 rows.";
+const JOB_LOAD_FAILED: &str = "The load into the table failed.";
+const JOB_NOT_REGISTERED: &str = "The table was loaded but could not be registered in the catalog.";
+
+/// Every reason the job may record, in the order of
+/// `ops/fixtures/upload_load_failure_reasons.json`.
+const JOB_FAILURE_REASONS: [&str; 6] = [
+    JOB_FILE_UNREADABLE,
+    JOB_HEADER_PAST_END,
+    JOB_NO_ROWS,
+    JOB_TOO_MANY_ROWS,
+    JOB_LOAD_FAILED,
+    JOB_NOT_REGISTERED,
+];
 
 fn pool(state: &AppState) -> Result<&PgPool, ApiError> {
     state.pg.as_deref().ok_or_else(|| {
@@ -321,10 +369,11 @@ fn extension_of(filename: &str) -> String {
 
 /// The object key an upload is stored at.
 ///
-/// Built entirely from server-controlled parts — tenant and a fresh
-/// UUID — with the user's filename contributing at most a sanitised
-/// extension. A key derived from a caller-supplied name is how `../`
-/// escapes, 2 KB paths and cross-user collisions happen.
+/// Built entirely from server-controlled parts — the tenant's id (a UUID,
+/// `create` passes `tenant_id.to_string()`) and a fresh upload id — with the
+/// user's filename contributing at most a sanitised extension. A key derived
+/// from a caller-supplied name is how `../` escapes, 2 KB paths and cross-user
+/// collisions happen.
 fn storage_key(tenant: &str, id: &str, filename: &str) -> String {
     let ext = extension_of(filename);
     let tenant = tenant
@@ -567,26 +616,49 @@ fn ended_after(ended_at: &str, since: OffsetDateTime) -> bool {
 }
 
 /// What a recorded result means for the upload.
+///
+/// A failure shows the reason the job recorded only when it is one of
+/// [`JOB_FAILURE_REASONS`]; any other text, an empty one included, is
+/// [`LOAD_FAILED`] (review finding B6). `ingest_run.error` is free text, and
+/// what the job happened to write must not decide what a response says: shown
+/// as written, one `str(exc)` in the job would put exception text, a host or a
+/// path into a response. What is shown is the API's own constant, never the
+/// recorded string.
 fn outcome_of(result: &IngestRunRow) -> Outcome {
     if result.status == "succeeded" {
         return Outcome::Ingested {
             rows: result.rows.and_then(|rows| i64::try_from(rows).ok()),
         };
     }
-    let reason = result.error.trim();
-    Outcome::Failed(
-        if reason.is_empty() {
-            LOAD_FAILED
-        } else {
-            reason
-        }
-        .to_owned(),
-    )
+    let recorded = result.error.trim();
+    let reason = JOB_FAILURE_REASONS
+        .into_iter()
+        .find(|known| *known == recorded)
+        .unwrap_or(LOAD_FAILED);
+    Outcome::Failed(reason.to_owned())
 }
 
 /// Whether a claim with no run is old enough to have been abandoned.
 fn claim_is_stale(updated_at: OffsetDateTime, now: OffsetDateTime) -> bool {
     now - updated_at > STALE_CLAIM
+}
+
+/// Whether a claim whose run the orchestrator does not know has been waiting
+/// long enough to be failed ([`UNKNOWN_RUN_BOUND`], review finding B5).
+fn unknown_run_is_overdue(updated_at: OffsetDateTime, now: OffsetDateTime) -> bool {
+    now - updated_at > UNKNOWN_RUN_BOUND
+}
+
+/// What the orchestrator said about a loading upload's run, once it has said
+/// the run is not still going.
+enum RunEnd {
+    /// The run ended: completed, failed or cancelled.
+    Ended,
+    /// The orchestrator does not know the run. `pipeline_run_status` answers
+    /// `None` for a run it never had or has lost (its run storage was reset)
+    /// and also for a GraphQL error with no data, and the two cannot be told
+    /// apart.
+    Unknown,
 }
 
 /// Settles an upload that is `ingesting` when it is read, since nothing else
@@ -599,16 +671,20 @@ fn claim_is_stale(updated_at: OffsetDateTime, now: OffsetDateTime) -> bool {
 /// - A claim with a run: ask Dagster. Queued or running: leave it. Ended:
 ///   take the newest `ingest_run` result for `upload:<id>` that ended after
 ///   the claim; `succeeded` gives `ingested` with its rows, anything else
-///   `failed` with its reason, and no result gives `failed`
+///   `failed` with its reason ([`outcome_of`]), and no result gives `failed`
 ///   ([`NO_RESULT`]).
-/// - When Dagster or `ClickHouse` cannot be asked, or Dagster does not know
-///   the run, the row is returned unchanged: that is a doubt, not an
-///   outcome. The cost is that a run Dagster has lost (its run storage was
-///   reset) leaves the upload loading, and so neither deletable nor loadable
-///   again, until Dagster knows the run again or the row is fixed by hand.
-///   Settling it as failed instead would also settle a run Dagster merely
-///   failed to answer for, because `pipeline_run_status` reads a GraphQL error
-///   as "no such run".
+/// - Dagster does not know the run (review finding B5): read the recorded
+///   result all the same. A result found settles it, as above. No result and
+///   a claim older than [`UNKNOWN_RUN_BOUND`] gives `failed`
+///   ([`RUN_UNKNOWN`]); before this an upload whose run Dagster had lost
+///   stayed loading for ever, neither deletable nor loadable again. No result
+///   and a younger claim is left as it is: the run may be about to start or
+///   to record its result. The cost of the bound is that a run which Dagster
+///   merely failed to answer for (a GraphQL error reads as "no such run") and
+///   which is still loading after the bound would be failed, and a later
+///   result of that run would be lost to the row.
+/// - When Dagster or `ClickHouse` cannot be asked, or does not answer in time,
+///   the row is returned unchanged: that is a doubt, not an outcome.
 struct Settler<'a> {
     state: &'a AppState,
     pool: &'a PgPool,
@@ -641,21 +717,27 @@ impl<'a> Settler<'a> {
         if self.orchestrator_unreachable {
             return row;
         }
-        let ended = match tokio::time::timeout(
+        let end = match tokio::time::timeout(
             SETTLE_CALL_TIMEOUT,
             self.state.dagster.pipeline_run_status(&run_id),
         )
         .await
         {
             Ok(Ok(Some(info))) => {
-                matches!(
+                if !matches!(
                     map_run_status(&info.status),
                     "completed" | "failed" | "cancelled"
-                )
+                ) {
+                    return row;
+                }
+                RunEnd::Ended
             }
+            // Review finding B5: not a reason to leave the upload loading for
+            // ever. The recorded result is read below, and a claim that is
+            // old enough and has none is failed.
             Ok(Ok(None)) => {
                 tracing::warn!(upload_id = %row.id, %run_id, "Dagster does not know the run of a loading upload");
-                return row;
+                RunEnd::Unknown
             }
             Ok(Err(err)) => {
                 tracing::warn!(%err, upload_id = %row.id, "the orchestrator could not be asked about a loading upload");
@@ -668,15 +750,21 @@ impl<'a> Settler<'a> {
                 return row;
             }
         };
-        if !ended {
-            return row;
-        }
         if self.results_unreadable {
             return row;
         }
         let outcome = match self.recorded(&row).await {
             Recorded::Found(outcome) => outcome,
-            Recorded::Missing => Outcome::Failed(NO_RESULT.to_owned()),
+            Recorded::Missing => match end {
+                RunEnd::Ended => Outcome::Failed(NO_RESULT.to_owned()),
+                // Finding B5: "not found and younger" is left alone.
+                RunEnd::Unknown
+                    if unknown_run_is_overdue(row.updated_at, OffsetDateTime::now_utc()) =>
+                {
+                    Outcome::Failed(RUN_UNKNOWN.to_owned())
+                }
+                RunEnd::Unknown => return row,
+            },
             Recorded::Unreadable => {
                 self.results_unreadable = true;
                 return row;
@@ -924,14 +1012,25 @@ fn parse_ingest_request(body: &[u8]) -> Result<IngestRequest, ApiError> {
 }
 
 /// Whether `table` may be loaded into by an upload of `tenant_id`, or why
-/// not. The rule (ADR 0014, decision 5): never a table a connector loads;
-/// otherwise a table an upload of this tenant claimed, or one that does not
-/// exist. Never "free" on a doubt.
+/// not. The rule (ADR 0014, decision 5, review finding B4), in this order:
+///
+/// 1. A table a connector loads: never.
+/// 2. The claim table's answer ([`uploads::table_claim`]): the name is this
+///    tenant's, and it is free to load into, whether or not the table exists
+///    yet; or it is another tenant's, and it is not.
+/// 3. Nobody's claim: the table must not exist (a registry row or an Iceberg
+///    table). Never "free" on a doubt.
+///
+/// This only READS the claim. A tenant that passes it still has to win
+/// [`uploads::claim_table`], which [`ingest`] calls just before it marks the
+/// upload as loading: two tenants can both pass this for one new name, and the
+/// database decides between them there.
 ///
 /// # Errors
 ///
-/// 409 for a connector's table and for an existing table no upload of this
-/// tenant claimed; 503 when the question cannot be answered (Postgres,
+/// 409 for a connector's table, for a name another tenant holds, and for an
+/// existing table nobody claimed (the last two with one sentence,
+/// [`TABLE_NOT_FREE`]); 503 when the question cannot be answered (Postgres,
 /// `ClickHouse` or the Iceberg query database did not give a definite
 /// answer, or there is no Iceberg query database to ask).
 async fn ensure_table_free(
@@ -950,13 +1049,18 @@ async fn ensure_table_free(
     {
         return Err(ApiError::Conflict(CONNECTOR_TABLE.to_owned()));
     }
-    // A claim by this tenant's own upload settles it, whether or not the
-    // table exists yet: replacing or adding to one's own table is the point.
-    if uploads::table_claimed_by_upload(pool, tenant_id, table)
+    match uploads::table_claim(pool, tenant_id, table)
         .await
         .map_err(|err| unchecked(&err))?
     {
-        return Ok(());
+        // This tenant's own claim settles it, whether or not the table exists
+        // yet: replacing or adding to one's own table is the point.
+        TableClaim::Ours => return Ok(()),
+        // Another tenant's claim, or a claim whose tenant is gone. The same
+        // sentence as for an existing table nobody claimed, so the answer does
+        // not say which it is.
+        TableClaim::Theirs => return Err(ApiError::Conflict(TABLE_NOT_FREE.to_owned())),
+        TableClaim::Unclaimed => {}
     }
     match table_exists(state, table).await {
         Ok(false) => Ok(()),
@@ -1086,11 +1190,18 @@ async fn launch(
 ///
 /// Validate the body; settle the upload if it is loading (a load that
 /// finished must not block the next one); check the table is free
-/// ([`ensure_table_free`]) and not being loaded by another upload; CLAIM the
-/// row ([`uploads::mark_ingesting`], no run id); launch; attach the run
+/// ([`ensure_table_free`]) and not being loaded by another upload; CLAIM THE
+/// TABLE NAME ([`uploads::claim_table`]); CLAIM the row
+/// ([`uploads::mark_ingesting`], no run id); launch; attach the run
 /// ([`uploads::attach_run`]).
 ///
-/// The claim comes before the launch (review finding B2): two requests for
+/// The table claim comes just before the row claim (review finding B4): the
+/// checks above only read, so two tenants can both pass them for one new name,
+/// and `claim_table` is where the database lets one of them through. It stands
+/// from then on and is never released, even if the launch that follows fails
+/// or the upload is deleted.
+///
+/// The row claim comes before the launch (review finding B2): two requests for
 /// one upload sent at the same moment both pass the checks above, but only one
 /// claim succeeds, so only one launches. When the orchestrator cannot be
 /// reached or refuses, the claim is settled as failed before the answer.
@@ -1099,8 +1210,10 @@ async fn launch(
 ///
 /// 400 for a body that is not valid (each field has its own sentence); 404
 /// for an unknown upload or another tenant's; 409 when this upload is already
-/// loading, another is loading into that table, a connector loads it, or it
-/// exists and no upload of this tenant created it; 422 when the orchestrator
+/// loading, another is loading into that table, a connector loads it, or the
+/// name is in use and no upload of this tenant created it ([`TABLE_NOT_FREE`]:
+/// another tenant holds the claim, the table exists and nobody claimed it, or
+/// another tenant won the claim a moment ago); 422 when the orchestrator
 /// refuses the launch; 503 when the table check cannot be made or the
 /// orchestrator cannot be reached; 500 when a launched run could not be
 /// recorded.
@@ -1126,6 +1239,14 @@ pub async fn ingest(
     ensure_table_free(&state, pool, tenant_id, &request.table).await?;
     if uploads::table_being_loaded(pool, &request.table, &row.id).await? {
         return Err(ApiError::Conflict(TABLE_BUSY.to_owned()).into());
+    }
+    // Review finding B4: the name is claimed here, in one statement the
+    // database arbitrates, and not before. `false` is a tenant that took the
+    // name between the checks above and now, or one whose claim was always
+    // there and whose own tenant is gone: the same refusal as a claim seen
+    // earlier. Nothing is marked or launched for it.
+    if !uploads::claim_table(pool, tenant_id, &request.table, &row.id).await? {
+        return Err(ApiError::Conflict(TABLE_NOT_FREE.to_owned()).into());
     }
 
     let parse_options = json!({
@@ -1181,9 +1302,11 @@ pub async fn ingest(
 
 // ── Delete ───────────────────────────────────────────────────────────────
 
-/// `DELETE /api/uploads/{id}` — remove the object, then soft-delete the row.
-/// 204. The table the upload became is not touched, and the row stays as the
-/// record that an upload of the tenant made it ([`uploads::soft_delete`]).
+/// `DELETE /api/uploads/{id}` — remove the object, then the row. 204. The
+/// table the upload became is not touched, and neither is the claim on its
+/// name: that is a record of its own ([`uploads::claim_table`]) and is never
+/// released, so a later upload of the tenant can still load into the table and
+/// a connector still cannot take it.
 ///
 /// Object first: a failed delete leaves the row, and the file is still
 /// reachable and still listed. Deleting the row first would hide an object
@@ -1210,7 +1333,7 @@ pub async fn delete(
     }
     let store = UploadStore::connect(&state.config).await?;
     store.delete(&row.storage_key).await?;
-    if !uploads::soft_delete(pool, &row.id).await? {
+    if !uploads::delete(pool, &row.id).await? {
         // Refused because a load was claimed after the check above, or the
         // row was deleted by another request meanwhile.
         return Err(match uploads::get(pool, &row.id).await? {
@@ -1237,12 +1360,21 @@ mod tests {
 
     // ── the storage key ─────────────────────────────────────────────────
 
+    /// A tenant id, which is what `create` builds the key from
+    /// (`tenant_id.to_string()`): review finding B7, these tests used a tenant
+    /// name from this deployment's defaults, and no key is made from a name.
+    const TENANT: &str = "5f0c2b7e-9a41-4c6d-8e3b-2d7a91c4f6a0";
+
     #[test]
     fn storage_key_never_uses_the_users_filename() {
-        let key = storage_key("dispar-dki", "up-1", "../../etc/passwd");
-        assert_eq!(key, "uploads/dispar-dki/up-1");
-        let key = storage_key("dispar-dki", "up-2", "rawdata.xls");
-        assert_eq!(key, "uploads/dispar-dki/up-2.xls");
+        let key = storage_key(TENANT, "up-1", "../../etc/passwd");
+        assert_eq!(key, format!("uploads/{TENANT}/up-1"));
+        let key = storage_key(TENANT, "up-2", "rawdata.xls");
+        assert_eq!(
+            key,
+            format!("uploads/{TENANT}/up-2.xls"),
+            "a tenant id passes through the sanitiser unchanged"
+        );
     }
 
     #[test]
@@ -1585,7 +1717,7 @@ mod tests {
     }
 
     #[test]
-    fn anything_else_is_failed_with_the_recorded_reason() {
+    fn any_status_but_succeeded_is_failed_and_a_known_recorded_reason_is_kept() {
         assert_eq!(
             outcome_of(&result("failed", None, "The load into the table failed.")),
             Outcome::Failed("The load into the table failed.".to_owned())
@@ -1596,12 +1728,71 @@ mod tests {
                 None,
                 "  The file has no rows below the header row. "
             )),
-            Outcome::Failed("The file has no rows below the header row.".to_owned())
+            Outcome::Failed("The file has no rows below the header row.".to_owned()),
+            "surrounding white space does not make it another reason"
         );
         assert_eq!(
             outcome_of(&result("failed", Some(10), "")),
             Outcome::Failed("The load failed.".to_owned()),
             "no reason recorded: a fixed one, and no count"
+        );
+    }
+
+    /// Review finding B6: a recorded reason reaches a response only when it is
+    /// one of the six the API knows. Each of the six is kept; text that is
+    /// near one of them, text with detail added, and exception text are all
+    /// the fixed `The load failed.`.
+    #[test]
+    fn a_recorded_reason_is_shown_only_when_it_is_one_the_api_knows() {
+        for known in JOB_FAILURE_REASONS {
+            assert_eq!(
+                outcome_of(&result("failed", None, known)),
+                Outcome::Failed(known.to_owned()),
+                "{known}"
+            );
+        }
+        for other in [
+            "KeyError: 'amount' at /app/dagster/dispar_orchestrate/file_ingest.py:88",
+            "The load into the table failed. (OSError: [Errno 111] Connection refused)",
+            "Traceback (most recent call last):",
+            "the load into the table failed.",
+            "The load into the table failed",
+            "The stored file could not be read",
+            "The file has more than 2000000 rows.",
+            "The load stopped before it recorded a result.",
+            "x",
+            "",
+            "   ",
+        ] {
+            assert_eq!(
+                outcome_of(&result("failed", None, other)),
+                Outcome::Failed(LOAD_FAILED.to_owned()),
+                "{other:?}"
+            );
+        }
+    }
+
+    /// Review finding B6: the six reasons the API knows are the six in the
+    /// file the job's own tests assert its constants against too, in the same
+    /// order, so the two sides cannot drift apart unnoticed. Read here from
+    /// test code only, with `include_str!`, so the release build of the API
+    /// depends on nothing outside `rust/`.
+    #[test]
+    fn the_reasons_the_api_knows_are_the_reasons_in_the_shared_fixture() {
+        const SHARED: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../ops/fixtures/upload_load_failure_reasons.json"
+        ));
+        let in_file: Vec<String> = serde_json::from_str(SHARED).unwrap();
+        assert_eq!(in_file, JOB_FAILURE_REASONS);
+
+        let mut distinct = JOB_FAILURE_REASONS.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 6, "six different reasons");
+        assert!(
+            !JOB_FAILURE_REASONS.contains(&LOAD_FAILED),
+            "the fixed fallback is not one of the job's reasons"
         );
     }
 
@@ -1617,6 +1808,20 @@ mod tests {
         );
     }
 
+    /// Review finding B5: a run the orchestrator does not know is failed once
+    /// its claim is more than an hour old, and not before.
+    #[test]
+    fn a_lost_run_is_overdue_after_one_hour_and_not_before() {
+        let claimed = at("2026-10-02T10:00:00Z");
+        assert!(!unknown_run_is_overdue(claimed, at("2026-10-02T10:30:00Z")));
+        assert!(!unknown_run_is_overdue(claimed, at("2026-10-02T11:00:00Z")));
+        assert!(unknown_run_is_overdue(claimed, at("2026-10-02T11:00:01Z")));
+        assert!(
+            !unknown_run_is_overdue(claimed, at("2026-10-02T09:00:00Z")),
+            "clock behind"
+        );
+    }
+
     // ── what the wire carries ───────────────────────────────────────────
 
     #[test]
@@ -1626,6 +1831,11 @@ mod tests {
         assert_eq!(COULD_NOT_START, "The load could not be started.");
         assert_eq!(NOT_STARTED, "The load was not started.");
         assert_eq!(NO_RESULT, "The load stopped before it recorded a result.");
+        assert_eq!(RUN_UNKNOWN, "The orchestrator no longer knows this load.");
+        assert_eq!(
+            TABLE_NOT_FREE,
+            "That table name is in use and no upload of this tenant created it, so a file cannot be loaded into it."
+        );
     }
 
     #[test]
@@ -1652,6 +1862,17 @@ mod tests {
             LAUNCH_REFUSED,
             NOT_RECORDED,
             DELETE_WHILE_LOADING,
+            COULD_NOT_START,
+            NOT_STARTED,
+            NO_RESULT,
+            LOAD_FAILED,
+            RUN_UNKNOWN,
+            JOB_FILE_UNREADABLE,
+            JOB_HEADER_PAST_END,
+            JOB_NO_ROWS,
+            JOB_TOO_MANY_ROWS,
+            JOB_LOAD_FAILED,
+            JOB_NOT_REGISTERED,
         ] {
             for forbidden in ["http", "://", "uploads/", "127.0.0.1", "sqlx", "Exception"] {
                 assert!(

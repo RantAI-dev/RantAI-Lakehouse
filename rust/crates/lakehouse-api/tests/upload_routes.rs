@@ -29,6 +29,11 @@
 //! Every message asserted here is the fixed text the plan gives, or text of the
 //! same plain kind; where a test injects an upstream error it asserts that the
 //! injected text is absent from the response (principle 4).
+//!
+//! Who owns a raw table name is the claim table's to say (`upload_table_claim`,
+//! T6a, review finding B4), so the helpers that put an upload in a loading or
+//! loaded state make the claim first, as the ingest route does, and the tests
+//! that refuse a load check that the refusal claimed nothing.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -260,6 +265,23 @@ async fn mount_run_status(dagster: &MockServer, status: &str) {
         .and(path("/graphql"))
         .and(body_string_contains("pipelineRunOrError"))
         .respond_with(ResponseTemplate::new(200).set_body_json(run_status_body(status)))
+        .mount(dagster)
+        .await;
+}
+
+/// The orchestrator does not know the run: the shape its API answers for a run
+/// id it never had or has lost (`RunNotFoundError`), with `MARKER` in the
+/// message the API must not repeat.
+async fn mount_unknown_run(dagster: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .and(body_string_contains("pipelineRunOrError"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "pipelineRunOrError": {
+                "__typename": "RunNotFoundError",
+                "message": format!("Run run-1 could not be found {MARKER}")
+            } }
+        })))
         .mount(dagster)
         .await;
 }
@@ -567,8 +589,33 @@ impl Stack {
         .unwrap()
     }
 
+    /// Claim `table` for `tenant` on behalf of upload `id`, as the ingest route
+    /// does just before it marks the upload as loading. The claim must be
+    /// allowed.
+    async fn claim(&self, tenant: &str, table: &str, id: &str) {
+        let tenant_id: Uuid = tenant.parse().unwrap();
+        assert!(
+            uploads::claim_table(&self.app.pool, tenant_id, table, id)
+                .await
+                .unwrap(),
+            "{table} could not be claimed for {tenant}"
+        );
+    }
+
+    /// The rows of `upload_table_claim`: `(table, tenant, upload that asked
+    /// first)`, by table name.
+    async fn claims(&self) -> Vec<(String, Option<Uuid>, String)> {
+        sqlx::query_as(
+            "SELECT bronze_table, tenant_id, upload_id FROM upload_table_claim \
+             ORDER BY bronze_table",
+        )
+        .fetch_all(&self.app.pool)
+        .await
+        .unwrap()
+    }
+
     /// Put an upload in the state a launched load leaves it in, claimed
-    /// `age` ago.
+    /// `age` ago, with the table claimed for its tenant.
     async fn seed_loading(
         &self,
         tenant: &str,
@@ -578,6 +625,7 @@ impl Stack {
         age: &str,
     ) {
         self.seed(tenant, id, b"id,name\n1,a\n").await;
+        self.claim(tenant, table, id).await;
         let options = json!({ "encoding": "utf-8", "delimiter": ",", "headerRow": 0 });
         uploads::mark_ingesting(&self.app.pool, id, &options, table, LoadMode::Replace, None)
             .await
@@ -598,9 +646,11 @@ impl Stack {
         .unwrap();
     }
 
-    /// Put an upload in the state of a load that succeeded into `table`.
+    /// Put an upload in the state of a load that succeeded into `table`, with
+    /// the table claimed for its tenant.
     async fn seed_ingested(&self, tenant: &str, id: &str, table: &str) {
         self.seed(tenant, id, b"id,name\n1,a\n").await;
+        self.claim(tenant, table, id).await;
         let options = json!({ "encoding": "utf-8", "delimiter": ",", "headerRow": 0 });
         uploads::mark_ingesting(
             &self.app.pool,
@@ -1117,16 +1167,11 @@ async fn a_storage_failure_never_puts_the_stores_own_text_in_a_response() {
         .fetch_one(&stack.app.pool)
         .await
         .unwrap();
-    assert_eq!(rows, 1, "the failed upload wrote no row");
-    assert_eq!(stack.status_of("up-existing").await.0, "uploaded");
-    let live: i64 = sqlx::query_scalar("SELECT count(*) FROM file_upload WHERE deleted_at IS NULL")
-        .fetch_one(&stack.app.pool)
-        .await
-        .unwrap();
     assert_eq!(
-        live, 1,
-        "a delete that could not remove the object keeps the row"
+        rows, 1,
+        "the failed upload wrote no row, and a delete that could not remove the object kept the one there was"
     );
+    assert_eq!(stack.status_of("up-existing").await.0, "uploaded");
 }
 
 /// The object goes in first so that a row always has its bytes; when the row
@@ -1550,6 +1595,15 @@ async fn an_ingest_launches_the_job_with_the_confirmed_options_and_records_the_r
         (row.0.as_str(), row.1.as_deref(), row.2),
         ("ingesting", Some("run-1"), None)
     );
+    assert_eq!(
+        stack.claims().await,
+        [(
+            "sap_stock".to_owned(),
+            Some(GROUP.parse::<Uuid>().unwrap()),
+            id.clone()
+        )],
+        "the name was claimed for the caller's tenant, by this upload (finding B4)"
+    );
 
     let audit = stack.audit_actions().await;
     let ingest = audit
@@ -1784,6 +1838,7 @@ async fn an_invalid_ingest_body_is_400_and_asks_nobody() {
         "uploaded",
         "no claim was made"
     );
+    assert!(stack.claims().await.is_empty(), "no table was claimed");
 }
 
 #[tokio::test]
@@ -1810,12 +1865,47 @@ async fn a_table_a_connector_loads_is_409_and_nothing_is_claimed() {
     );
     assert_eq!(stack.status_of(&id_of(&upload)).await.0, "uploaded");
     assert!(stack.dagster.received_requests().await.unwrap().is_empty());
+    assert!(stack.claims().await.is_empty(), "no table was claimed");
 }
 
-const NOT_FREE: &str = "That table already exists and no upload of this tenant created it, so a file cannot be loaded into it.";
+/// A connector's table is refused before the claim table is asked: the
+/// connector's sentence even for a name this tenant's own upload holds (a
+/// spec saved before the name was claimed is the way to such a state).
+#[tokio::test]
+async fn a_connector_that_loads_the_table_is_refused_even_when_the_tenant_holds_the_claim() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    stack.seed_ingested(GROUP, "up-first", "orders_raw").await;
+    sqlx::query(
+        "UPDATE connector SET source_objects = '[{\"name\":\"public.orders\",\"target\":\"orders_raw\"}]'::jsonb \
+         WHERE id = 'conn-pg-lakehouse'",
+    )
+    .execute(&stack.app.pool)
+    .await
+    .unwrap();
+    let upload = stack.upload(&bayu, "a.csv", b"a,b\n1,2\n").await;
 
-/// An existing table is only loaded into again by the tenant whose upload
-/// claimed it. Registered in the catalog: refused.
+    let reply = stack
+        .ingest(&bayu, &id_of(&upload), ingest_body("orders_raw"))
+        .await;
+
+    assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.text);
+    assert_eq!(
+        reply.json["error"],
+        "A connector loads that table, so a file cannot be loaded into it."
+    );
+    assert_eq!(stack.status_of(&id_of(&upload)).await.0, "uploaded");
+    assert!(stack.dagster.received_requests().await.unwrap().is_empty());
+}
+
+/// The one sentence for a table name that is not this tenant's to load into
+/// (review finding B4): another tenant's claim, and an existing table nobody
+/// claimed, are told apart by nothing a caller can see.
+const NOT_FREE: &str = "That table name is in use and no upload of this tenant created it, so a file cannot be loaded into it.";
+
+/// An existing table is only loaded into again by the tenant that holds its
+/// claim. Registered in the catalog and claimed by nobody: refused, and no
+/// claim is made for the refused name.
 #[tokio::test]
 async fn a_registered_table_that_no_upload_of_the_tenant_claimed_is_409() {
     let stack = Stack::start().await;
@@ -1834,6 +1924,7 @@ async fn a_registered_table_that_no_upload_of_the_tenant_claimed_is_409() {
         "uploaded",
         "nothing was claimed"
     );
+    assert!(stack.claims().await.is_empty(), "no table was claimed");
     assert!(stack.dagster.received_requests().await.unwrap().is_empty());
 }
 
@@ -1866,16 +1957,70 @@ async fn an_iceberg_table_that_is_not_registered_and_not_claimed_is_409() {
     assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.text);
     assert_eq!(reply.json["error"], NOT_FREE);
     assert!(stack.dagster.received_requests().await.unwrap().is_empty());
+    assert!(stack.claims().await.is_empty(), "no table was claimed");
 }
 
-/// Another tenant's upload loaded the table: that is no claim for this
-/// tenant, and a table name is not made free by who asks.
+/// Review finding B4: another tenant's claim keeps this tenant out, and the
+/// answer is the same sentence whether the table exists or not, so a caller
+/// cannot tell a name another tenant holds from one that is merely taken. The
+/// claim is read first: the registry and the Iceberg query database are not
+/// asked at all.
 #[tokio::test]
-async fn another_tenants_claim_does_not_open_a_table() {
+async fn another_tenants_claim_closes_a_table_whether_or_not_it_exists() {
+    for (what, exists) in [
+        ("a table that exists", true),
+        ("a name not yet used", false),
+    ] {
+        let stack = Stack::start().await;
+        let bayu = stack.bayu().await;
+        if exists {
+            mount_registered(&stack.ch).await;
+        } else {
+            mount_free_table(&stack.ch).await;
+        }
+        stack.seed_ingested(RETAIL, "up-retail", "stock_raw").await;
+        let upload = stack.upload(&bayu, "a.csv", b"a,b\n1,2\n").await;
+
+        let reply = stack
+            .ingest(&bayu, &id_of(&upload), ingest_body("stock_raw"))
+            .await;
+
+        assert_eq!(reply.status, StatusCode::CONFLICT, "{what}: {}", reply.text);
+        assert_eq!(reply.json["error"], NOT_FREE, "{what}");
+        assert_eq!(
+            stack.status_of(&id_of(&upload)).await.0,
+            "uploaded",
+            "{what}"
+        );
+        assert!(
+            stack.ch.received_requests().await.unwrap().is_empty(),
+            "{what}: the claim answers before the table is looked up"
+        );
+        assert!(stack.dagster.received_requests().await.unwrap().is_empty());
+        assert_eq!(
+            stack.claims().await,
+            [(
+                "stock_raw".to_owned(),
+                Some(RETAIL.parse::<Uuid>().unwrap()),
+                "up-retail".to_owned()
+            )],
+            "{what}: the claim is still the other tenant's alone"
+        );
+    }
+}
+
+/// A claim whose tenant is gone belongs to nobody, and is closed to every
+/// tenant, with the same sentence (a claim's tenant is `ON DELETE SET NULL`).
+#[tokio::test]
+async fn a_claim_whose_tenant_is_gone_is_closed_to_every_tenant() {
     let stack = Stack::start().await;
     let bayu = stack.bayu().await;
-    mount_registered(&stack.ch).await;
-    stack.seed_ingested(RETAIL, "up-retail", "stock_raw").await;
+    mount_free_table(&stack.ch).await;
+    stack.claim(RETAIL, "stock_raw", "up-gone").await;
+    sqlx::query("UPDATE upload_table_claim SET tenant_id = NULL WHERE bronze_table = 'stock_raw'")
+        .execute(&stack.app.pool)
+        .await
+        .unwrap();
     let upload = stack.upload(&bayu, "a.csv", b"a,b\n1,2\n").await;
 
     let reply = stack
@@ -1885,14 +2030,18 @@ async fn another_tenants_claim_does_not_open_a_table() {
     assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.text);
     assert_eq!(reply.json["error"], NOT_FREE);
     assert_eq!(stack.status_of(&id_of(&upload)).await.0, "uploaded");
+    assert_eq!(
+        stack.claims().await,
+        [("stock_raw".to_owned(), None, "up-gone".to_owned())]
+    );
 }
 
-/// Review finding B1, end to end: a table the tenant's own upload claimed can
-/// be loaded into again, replacing or adding, even though it exists, and even
-/// after the upload that made it was deleted.
+/// Review findings B1 and B4, end to end: a table the tenant's own upload
+/// claimed can be loaded into again, replacing or adding, even though it
+/// exists, and even after the upload that made it was deleted. The row is
+/// really gone; the claim is what remains.
 #[tokio::test]
-async fn a_table_the_tenants_own_upload_claimed_is_loadable_again_even_after_that_upload_is_deleted()
- {
+async fn after_a_delete_the_claim_remains_and_a_new_upload_of_the_tenant_loads_into_the_table() {
     let stack = Stack::start().await;
     let bayu = stack.bayu().await;
     mount_registered(&stack.ch).await;
@@ -1904,6 +2053,12 @@ async fn a_table_the_tenants_own_upload_claimed_is_loadable_again_even_after_tha
         .send(&bayu, "DELETE", "/api/uploads/up-first", Payload::None)
         .await;
     assert_eq!(delete.status, StatusCode::NO_CONTENT, "{}", delete.text);
+    let first_rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM file_upload WHERE id = 'up-first'")
+            .fetch_one(&stack.app.pool)
+            .await
+            .unwrap();
+    assert_eq!(first_rows, 0, "a delete is a real delete");
     let append = stack
         .ingest(
             &bayu,
@@ -1917,6 +2072,15 @@ async fn a_table_the_tenants_own_upload_claimed_is_loadable_again_even_after_tha
     assert_eq!(
         requests_containing(&stack.dagster, "launchRun").await.len(),
         1
+    );
+    assert_eq!(
+        stack.claims().await,
+        [(
+            "stock_raw".to_owned(),
+            Some(GROUP.parse::<Uuid>().unwrap()),
+            "up-first".to_owned()
+        )],
+        "still the claim the first upload made"
     );
 }
 
@@ -1952,19 +2116,17 @@ async fn a_failed_load_holds_its_table_so_try_again_can_succeed() {
     );
 }
 
+/// Another upload of the same tenant is loading into the table: the tenant's
+/// own claim lets it through the ownership check and this is what stops it. (An
+/// upload of another tenant loading into it holds the claim, and gets the
+/// ownership sentence first: `another_tenants_claim_closes_a_table_whether_or_not_it_exists`.)
 #[tokio::test]
-async fn another_upload_loading_into_the_table_is_409() {
+async fn another_upload_of_the_tenant_loading_into_the_table_is_409() {
     let stack = Stack::start().await;
     let bayu = stack.bayu().await;
     mount_free_table(&stack.ch).await;
     stack
-        .seed_loading(
-            RETAIL,
-            "up-retail",
-            "stock_raw",
-            Some("run-9"),
-            "10 seconds",
-        )
+        .seed_loading(GROUP, "up-other", "stock_raw", Some("run-9"), "10 seconds")
         .await;
     let upload = stack.upload(&bayu, "a.csv", b"a,b\n1,2\n").await;
 
@@ -1978,6 +2140,281 @@ async fn another_upload_loading_into_the_table_is_409() {
         "Another upload is loading into that table."
     );
     assert_eq!(stack.status_of(&id_of(&upload)).await.0, "uploaded");
+}
+
+/// Review finding B4, the failure the reviewer found, through the routes:
+/// tenant B's load into `t_raw` fails before it writes anything; tenant A then
+/// asks for `t_raw`, a table that does not exist, and is refused; B's retry goes
+/// through and the name is still B's. With ownership read from upload rows, A
+/// took the name and B's retry replaced A's rows.
+#[tokio::test]
+async fn a_failed_claim_keeps_another_tenant_out_of_the_table_and_lets_its_own_tenant_retry() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let andi = stack.andi().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    mount_run_status(&stack.dagster, "FAILURE").await;
+    let b_upload = stack.upload(&andi, "b.csv", b"a,b\n1,2\n").await;
+    let b_id = id_of(&b_upload);
+
+    let first = stack.ingest(&andi, &b_id, ingest_body("t_raw")).await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text);
+
+    // B's load fails before it writes: the job recorded its reason and ended.
+    sqlx::query("UPDATE file_upload SET updated_at = now() - interval '1 hour' WHERE id = $1")
+        .bind(&b_id)
+        .execute(&stack.app.pool)
+        .await
+        .unwrap();
+    mount_results(
+        &stack.ch,
+        &json!([result_row(
+            &b_id,
+            "failed",
+            None,
+            "The stored file could not be read.",
+            5
+        )]),
+    )
+    .await;
+    let failed = stack.get(&andi, &format!("/api/uploads/{b_id}")).await;
+    assert_eq!(failed.json["status"], "failed", "{}", failed.text);
+
+    // A asks for the same name. Nothing was ever written to it, and it is
+    // still not A's.
+    let a_upload = stack.upload(&bayu, "a.csv", b"x,y\n3,4\n").await;
+    let refused = stack
+        .ingest(&bayu, &id_of(&a_upload), ingest_body("t_raw"))
+        .await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.text);
+    assert_eq!(refused.json["error"], NOT_FREE);
+    assert_eq!(stack.status_of(&id_of(&a_upload)).await.0, "uploaded");
+    assert_eq!(
+        requests_containing(&stack.dagster, "launchRun").await.len(),
+        1,
+        "A's refused request launched nothing"
+    );
+
+    // B retries: the claim is B's own.
+    let retry = stack.ingest(&andi, &b_id, ingest_body("t_raw")).await;
+    assert_eq!(retry.status, StatusCode::OK, "{}", retry.text);
+    assert_eq!(retry.json["upload"]["status"], "ingesting");
+    assert_eq!(
+        requests_containing(&stack.dagster, "launchRun").await.len(),
+        2
+    );
+    assert_eq!(
+        stack.claims().await,
+        [(
+            "t_raw".to_owned(),
+            Some(RETAIL.parse::<Uuid>().unwrap()),
+            b_id.clone()
+        )],
+        "the name was B's throughout"
+    );
+}
+
+/// Review finding B4: two tenants asking for one new name at the same moment,
+/// one loads and the other is refused, and one run is launched. The registry
+/// lookup both make after the ownership check is slowed down so that both are
+/// past that check before either claims, as
+/// `two_simultaneous_ingests_of_one_upload_launch_once` does.
+///
+/// What this pins is the outcome under a real race: one launch, one claim, and
+/// the loser refused with a 409 and left untouched. Which sentence the loser
+/// gets depends on how far the winner had got: the ownership sentence when it
+/// loses `claim_table`, or "Another upload is loading into that table." when
+/// the winner had already marked its upload by the time the loser checked.
+/// `a_tenant_that_loses_the_name_between_the_check_and_the_claim_is_refused_and_launches_nothing`
+/// is the one that fixes the first path.
+#[tokio::test]
+async fn two_tenants_asking_for_one_new_name_at_the_same_moment_one_launches() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let andi = stack.andi().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("dataset_catalog"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(500))
+                .set_body_json(rows_body(&json!([]))),
+        )
+        .mount(&stack.ch)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("DESCRIBE TABLE"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Code: 60. (UNKNOWN_TABLE)"))
+        .mount(&stack.ch)
+        .await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let a_id = id_of(&stack.upload(&bayu, "a.csv", b"a,b\n1,2\n").await);
+    let b_id = id_of(&stack.upload(&andi, "b.csv", b"a,b\n3,4\n").await);
+
+    let (a, b) = tokio::join!(
+        stack.ingest(&bayu, &a_id, ingest_body("shared_raw")),
+        stack.ingest(&andi, &b_id, ingest_body("shared_raw")),
+    );
+
+    let mut statuses = [a.status, b.status];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::OK, StatusCode::CONFLICT],
+        "{} / {}",
+        a.text,
+        b.text
+    );
+    let (loser, winner_tenant, winner_upload, loser_upload) = if a.status == StatusCode::OK {
+        (&b, GROUP, &a_id, &b_id)
+    } else {
+        (&a, RETAIL, &b_id, &a_id)
+    };
+    let refusal = loser.json["error"].as_str().unwrap();
+    assert!(
+        refusal == NOT_FREE || refusal == "Another upload is loading into that table.",
+        "{refusal}"
+    );
+    assert_eq!(
+        count_requests_containing(&stack.ch, "dataset_catalog").await,
+        2,
+        "both requests were past the ownership check when the claim was made"
+    );
+    assert_eq!(
+        requests_containing(&stack.dagster, "launchRun").await.len(),
+        1,
+        "launched once"
+    );
+    assert_eq!(
+        stack.claims().await,
+        [(
+            "shared_raw".to_owned(),
+            Some(winner_tenant.parse::<Uuid>().unwrap()),
+            winner_upload.clone()
+        )],
+        "the name is the winner's alone"
+    );
+    assert_eq!(stack.status_of(loser_upload).await.0, "uploaded");
+}
+
+/// Review finding B4: the ownership check only reads, so a tenant can pass it
+/// and lose the name before it claims. Here tenant A's request has read "nobody
+/// holds `shared_raw`" and is waiting on the slowed registry lookup when tenant
+/// B's claim lands. A's `claim_table` is then false: the same 409, A's upload
+/// is never marked, nothing is launched, and A makes no claim.
+#[tokio::test]
+async fn a_tenant_that_loses_the_name_between_the_check_and_the_claim_is_refused_and_launches_nothing()
+ {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("dataset_catalog"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(500))
+                .set_body_json(rows_body(&json!([]))),
+        )
+        .mount(&stack.ch)
+        .await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("DESCRIBE TABLE"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Code: 60. (UNKNOWN_TABLE)"))
+        .mount(&stack.ch)
+        .await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let a_id = id_of(&stack.upload(&bayu, "a.csv", b"a,b\n1,2\n").await);
+
+    let asking = stack.ingest(&bayu, &a_id, ingest_body("shared_raw"));
+    let rival = async {
+        // The registry is asked after the ownership check and before the
+        // claim, so once it has been asked, A has read "nobody's". The wait
+        // is bounded: if the request never comes, the rival claims anyway and
+        // the assertions below say what happened.
+        for _ in 0..500 {
+            if count_requests_containing(&stack.ch, "dataset_catalog").await > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        stack.claim(RETAIL, "shared_raw", "up-rival").await;
+    };
+    let (reply, ()) = tokio::join!(asking, rival);
+
+    assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.text);
+    assert_eq!(reply.json["error"], NOT_FREE);
+    assert_eq!(
+        stack.status_of(&a_id).await.0,
+        "uploaded",
+        "A's upload was never marked as loading"
+    );
+    assert!(
+        stack.dagster.received_requests().await.unwrap().is_empty(),
+        "nothing was launched"
+    );
+    assert_eq!(
+        stack.claims().await,
+        [(
+            "shared_raw".to_owned(),
+            Some(RETAIL.parse::<Uuid>().unwrap()),
+            "up-rival".to_owned()
+        )],
+        "the name is the rival's, and A made no claim"
+    );
+}
+
+/// Review finding B4: an upload loaded into `x_raw` and then into `y_raw`
+/// leaves `x_raw` claimed. Another upload of the tenant may load into it (the
+/// row of the first upload now names only `y_raw`), and another tenant may not.
+#[tokio::test]
+async fn an_upload_loaded_into_one_table_and_then_another_leaves_the_first_claimed() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    let andi = stack.andi().await;
+    mount_free_table(&stack.ch).await;
+    mount_launch(&stack.dagster, "run-1").await;
+    let first = id_of(&stack.upload(&bayu, "first.csv", b"a,b\n1,2\n").await);
+
+    let into_x = stack.ingest(&bayu, &first, ingest_body("x_raw")).await;
+    assert_eq!(into_x.status, StatusCode::OK, "{}", into_x.text);
+    uploads::mark_finished(&stack.app.pool, &first, Some("run-1"), None, Some(1))
+        .await
+        .unwrap()
+        .unwrap();
+    let into_y = stack.ingest(&bayu, &first, ingest_body("y_raw")).await;
+    assert_eq!(into_y.status, StatusCode::OK, "{}", into_y.text);
+    assert_eq!(into_y.json["upload"]["bronzeTable"], "y_raw");
+
+    // Another upload of the tenant loads into the first table, which no upload
+    // row names any more.
+    let second = id_of(&stack.upload(&bayu, "second.csv", b"a,b\n3,4\n").await);
+    let append = stack
+        .ingest(
+            &bayu,
+            &second,
+            json!({ "bronzeTable": "x_raw", "mode": "append", "encoding": "utf-8", "delimiter": ",", "headerRow": 0 }),
+        )
+        .await;
+    assert_eq!(append.status, StatusCode::OK, "{}", append.text);
+
+    // Another tenant may not.
+    let other = id_of(&stack.upload(&andi, "other.csv", b"a,b\n5,6\n").await);
+    let refused = stack.ingest(&andi, &other, ingest_body("x_raw")).await;
+    assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.text);
+    assert_eq!(refused.json["error"], NOT_FREE);
+
+    let group = GROUP.parse::<Uuid>().unwrap();
+    assert_eq!(
+        stack.claims().await,
+        [
+            ("x_raw".to_owned(), Some(group), first.clone()),
+            ("y_raw".to_owned(), Some(group), first.clone()),
+        ]
+    );
+    assert_eq!(
+        requests_containing(&stack.dagster, "launchRun").await.len(),
+        3,
+        "the refused request launched nothing"
+    );
 }
 
 const UNCHECKED: &str = "Could not check whether that table already exists, so nothing was loaded.";
@@ -2013,6 +2450,7 @@ async fn a_registry_that_cannot_be_read_is_503_and_assumes_the_name_is_not_free(
     assert!(!reply.text.contains(MARKER), "{}", reply.text);
     assert_eq!(stack.status_of(&id_of(&upload)).await.0, "uploaded");
     assert!(stack.dagster.received_requests().await.unwrap().is_empty());
+    assert!(stack.claims().await.is_empty(), "a doubt claims nothing");
 }
 
 /// ... nothing listens where `ClickHouse` should be.
@@ -2040,6 +2478,7 @@ async fn a_clickhouse_that_is_not_there_is_503_and_assumes_the_name_is_not_free(
     assert!(!reply.text.contains("127.0.0.1"), "{}", reply.text);
     assert!(stack.dagster.received_requests().await.unwrap().is_empty());
     assert_eq!(stack.status_of(&id_of(&upload)).await.0, "uploaded");
+    assert!(stack.claims().await.is_empty(), "a doubt claims nothing");
 }
 
 /// ... the registry says nothing, and the Iceberg query database answers with
@@ -2076,6 +2515,7 @@ async fn an_iceberg_answer_that_is_not_no_such_table_is_503_and_assumes_nothing(
     assert_eq!(reply.json["error"], UNCHECKED);
     assert!(!reply.text.contains(MARKER), "{}", reply.text);
     assert!(stack.dagster.received_requests().await.unwrap().is_empty());
+    assert!(stack.claims().await.is_empty(), "a doubt claims nothing");
 }
 
 #[tokio::test]
@@ -2113,6 +2553,7 @@ async fn without_an_iceberg_query_database_a_new_name_cannot_be_checked_and_is_5
     );
     assert!(stack.dagster.received_requests().await.unwrap().is_empty());
     assert_eq!(stack.status_of(&id_of(&upload)).await.0, "uploaded");
+    assert!(stack.claims().await.is_empty(), "a doubt claims nothing");
 }
 
 /// The orchestrator refuses the launch with a message naming its internals:
@@ -2148,6 +2589,15 @@ async fn a_refused_launch_is_a_fixed_422_and_settles_the_claim() {
     assert_eq!(shown.json["status"], "failed");
     assert_eq!(shown.json["error"], "The load could not be started.");
     assert!(!shown.text.contains(MARKER));
+    assert_eq!(
+        stack.claims().await,
+        [(
+            "stock_raw".to_owned(),
+            Some(GROUP.parse::<Uuid>().unwrap()),
+            id.clone()
+        )],
+        "a claim is never released, a refused launch included (finding B4)"
+    );
 }
 
 /// The orchestrator cannot be reached (nothing listens, and a server that
@@ -2194,6 +2644,11 @@ async fn an_unreachable_orchestrator_is_a_fixed_503_and_settles_the_claim() {
         assert_eq!(
             (row.0.as_str(), row.2.as_deref()),
             ("failed", Some("The load could not be started."))
+        );
+        assert_eq!(
+            stack.claims().await.len(),
+            1,
+            "the name stays claimed: a claim is never released"
         );
     }
 }
@@ -2400,11 +2855,14 @@ async fn an_unreachable_orchestrator_leaves_a_loading_upload_as_it_was_and_the_l
         .respond_with(ResponseTemplate::new(500).set_body_string(format!("{MARKER} down")))
         .mount(&stack.dagster)
         .await;
+    // Three hours: past the bound of finding B5, so an orchestrator that
+    // cannot be asked, read as one that does not know the run, would fail
+    // these two. It is not: the doubt leaves them loading.
     stack
-        .seed_loading(GROUP, "up-1", "stock_raw", Some("run-1"), "1 hour")
+        .seed_loading(GROUP, "up-1", "stock_raw", Some("run-1"), "3 hours")
         .await;
     stack
-        .seed_loading(GROUP, "up-2", "other_raw", Some("run-2"), "1 hour")
+        .seed_loading(GROUP, "up-2", "other_raw", Some("run-2"), "3 hours")
         .await;
 
     let list = stack.get(&bayu, "/api/uploads").await;
@@ -2448,8 +2906,9 @@ async fn a_hung_orchestrator_does_not_hold_a_read() {
         &json!([result_row("up-1", "succeeded", Some(1), "", 5)]),
     )
     .await;
+    // Three hours, for the reason given at the test above (finding B5).
     stack
-        .seed_loading(GROUP, "up-1", "stock_raw", Some("run-1"), "1 hour")
+        .seed_loading(GROUP, "up-1", "stock_raw", Some("run-1"), "3 hours")
         .await;
 
     let started = Instant::now();
@@ -2561,14 +3020,205 @@ async fn a_claim_with_no_run_is_failed_after_two_minutes_and_left_alone_before()
     assert_eq!(again.status, StatusCode::OK, "{}", again.text);
 }
 
+/// Review finding B5: a run the orchestrator does not know is not left loading
+/// for ever. When the job recorded a result, that settles the upload whatever
+/// the claim's age.
+#[tokio::test]
+async fn a_run_the_orchestrator_does_not_know_is_settled_by_the_result_the_job_recorded() {
+    for (recorded, status, rows, error) in [
+        (
+            result_row("up-1", "succeeded", Some(12), "", 5),
+            "ingested",
+            Some(12),
+            None,
+        ),
+        (
+            result_row(
+                "up-1",
+                "failed",
+                None,
+                "The file has no rows below the header row.",
+                5,
+            ),
+            "failed",
+            None,
+            Some("The file has no rows below the header row."),
+        ),
+    ] {
+        let stack = Stack::start().await;
+        let bayu = stack.bayu().await;
+        mount_unknown_run(&stack.dagster).await;
+        mount_results(&stack.ch, &json!([recorded])).await;
+        stack
+            .seed_loading(GROUP, "up-1", "stock_raw", Some("run-1"), "20 minutes")
+            .await;
+
+        let shown = stack.get(&bayu, "/api/uploads/up-1").await;
+
+        assert_eq!(shown.status, StatusCode::OK, "{}", shown.text);
+        assert_eq!(shown.json["status"], status, "{}", shown.text);
+        assert_eq!(shown.json["rows"], json!(rows));
+        assert_eq!(shown.json.get("error").and_then(Value::as_str), error);
+        assert!(!shown.text.contains(MARKER), "{}", shown.text);
+    }
+}
+
+/// Review finding B5: no result either, and the claim more than an hour old:
+/// the upload is failed, and so is no longer stuck (it could be neither deleted
+/// nor loaded again). A younger claim is left alone, because the run may be
+/// about to start or to record its result. An older load's result is nobody's
+/// answer.
+#[tokio::test]
+async fn a_lost_run_with_no_result_is_failed_after_an_hour_and_left_alone_before() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_unknown_run(&stack.dagster).await;
+    mount_results(
+        &stack.ch,
+        &json!([result_row("up-older", "succeeded", Some(99), "", 300)]),
+    )
+    .await;
+    mount_launch(&stack.dagster, "run-2").await;
+    stack
+        .seed_loading(GROUP, "up-old", "old_raw", Some("run-1"), "2 hours")
+        .await;
+    stack
+        .seed_loading(GROUP, "up-old-b", "old_b_raw", Some("run-1b"), "2 hours")
+        .await;
+    stack
+        .seed_loading(GROUP, "up-young", "young_raw", Some("run-3"), "30 minutes")
+        .await;
+
+    let old = stack.get(&bayu, "/api/uploads/up-old").await;
+    let young = stack.get(&bayu, "/api/uploads/up-young").await;
+
+    assert_eq!(old.json["status"], "failed", "{}", old.text);
+    assert_eq!(
+        old.json["error"],
+        "The orchestrator no longer knows this load."
+    );
+    assert!(old.json.get("rows").is_none() && old.json.get("assetId").is_none());
+    assert!(!old.text.contains(MARKER), "{}", old.text);
+    assert_eq!(
+        stack.status_of("up-old").await.1.as_deref(),
+        Some("run-1"),
+        "settled under its run"
+    );
+    assert_eq!(young.json["status"], "ingesting", "{}", young.text);
+    assert_eq!(stack.status_of("up-young").await.0, "ingesting");
+
+    // No longer stuck: a failed upload can be loaded again and deleted, and
+    // the young one still cannot.
+    let again = stack
+        .ingest(&bayu, "up-old-b", ingest_body("old_b_raw"))
+        .await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.text);
+    assert_eq!(again.json["runId"], "run-2");
+    let delete = stack
+        .send(&bayu, "DELETE", "/api/uploads/up-old", Payload::None)
+        .await;
+    assert_eq!(delete.status, StatusCode::NO_CONTENT, "{}", delete.text);
+    let young_delete = stack
+        .send(&bayu, "DELETE", "/api/uploads/up-young", Payload::None)
+        .await;
+    assert_eq!(
+        young_delete.status,
+        StatusCode::CONFLICT,
+        "{}",
+        young_delete.text
+    );
+}
+
+/// Review finding B5: when the results cannot be read the upload is left as it
+/// is, however old the claim, and a list does not try again for every upload.
+#[tokio::test]
+async fn a_lost_run_whose_results_cannot_be_read_is_left_alone_however_old() {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_unknown_run(&stack.dagster).await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("bronze_meta.ingest_run"))
+        .respond_with(
+            ResponseTemplate::new(500).set_body_string(format!("{MARKER} (KEEPER_EXCEPTION)")),
+        )
+        .mount(&stack.ch)
+        .await;
+    stack
+        .seed_loading(GROUP, "up-1", "stock_raw", Some("run-1"), "3 hours")
+        .await;
+    stack
+        .seed_loading(GROUP, "up-2", "other_raw", Some("run-2"), "3 hours")
+        .await;
+
+    let list = stack.get(&bayu, "/api/uploads").await;
+
+    assert_eq!(list.status, StatusCode::OK, "{}", list.text);
+    let statuses: Vec<&str> = list
+        .json
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        statuses,
+        ["ingesting", "ingesting"],
+        "a doubt is not an outcome"
+    );
+    assert_eq!(
+        count_requests_containing(&stack.ch, "bronze_meta.ingest_run").await,
+        1,
+        "stopped reading after the first failure"
+    );
+    assert!(!list.text.contains(MARKER));
+}
+
+/// Review finding B6: the reason a job recorded reaches a response, and the
+/// row, only when it is one of the six the API knows. Exception text, a path
+/// and a marker the job might have recorded are the fixed `The load failed.`.
+#[tokio::test]
+async fn a_reason_the_job_recorded_that_the_api_does_not_know_reaches_neither_a_response_nor_the_row()
+ {
+    let stack = Stack::start().await;
+    let bayu = stack.bayu().await;
+    mount_run_status(&stack.dagster, "FAILURE").await;
+    mount_results(
+        &stack.ch,
+        &json!([result_row(
+            "up-1",
+            "failed",
+            None,
+            &format!("KeyError: {MARKER} at /app/dagster/dispar_orchestrate/file_ingest.py:88"),
+            5
+        )]),
+    )
+    .await;
+    stack
+        .seed_loading(GROUP, "up-1", "stock_raw", Some("run-1"), "1 hour")
+        .await;
+
+    let shown = stack.get(&bayu, "/api/uploads/up-1").await;
+
+    assert_eq!(shown.json["status"], "failed", "{}", shown.text);
+    assert_eq!(shown.json["error"], "The load failed.");
+    assert!(!shown.text.contains(MARKER), "{}", shown.text);
+    assert_eq!(
+        stack.status_of("up-1").await.2.as_deref(),
+        Some("The load failed."),
+        "the recorded text is not written to the row either"
+    );
+    let list = stack.get(&bayu, "/api/uploads").await;
+    assert!(!list.text.contains(MARKER), "{}", list.text);
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // DELETE /api/uploads/{id}
 // ════════════════════════════════════════════════════════════════════════
 
-/// Deleting removes the file and hides the row; the table, and the record
-/// that an upload of the tenant made it, stay.
+/// Deleting removes the file and the row; the table, and the claim on its
+/// name, stay (review finding B4: the row is no longer the record of that).
 #[tokio::test]
-async fn a_delete_removes_the_object_and_soft_deletes_the_row() {
+async fn a_delete_removes_the_object_and_the_row() {
     let stack = Stack::start().await;
     let bayu = stack.bayu().await;
     let upload = stack.upload(&bayu, "a.csv", b"a,b\n1,2\n").await;
@@ -2587,13 +3237,12 @@ async fn a_delete_removes_the_object_and_soft_deletes_the_row() {
     assert_eq!(delete.status, StatusCode::NO_CONTENT, "{}", delete.text);
     assert!(delete.text.is_empty());
     assert!(stack.bucket.keys().is_empty(), "the object is gone");
-    let (rows, deleted): (i64, i64) =
-        sqlx::query_as("SELECT count(*), count(deleted_at) FROM file_upload WHERE id = $1")
-            .bind(&id)
-            .fetch_one(&stack.app.pool)
-            .await
-            .unwrap();
-    assert_eq!((rows, deleted), (1, 1), "the row is kept, marked");
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM file_upload WHERE id = $1")
+        .bind(&id)
+        .fetch_one(&stack.app.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 0, "the row is gone");
     assert_eq!(
         stack.get(&bayu, &format!("/api/uploads/{id}")).await.status,
         StatusCode::NOT_FOUND
@@ -2618,7 +3267,7 @@ async fn a_delete_removes_the_object_and_soft_deletes_the_row() {
 }
 
 #[tokio::test]
-async fn deleting_an_upload_that_loaded_a_table_records_the_table_and_keeps_the_claim() {
+async fn deleting_an_upload_that_loaded_a_table_records_the_table_and_leaves_the_claim() {
     let stack = Stack::start().await;
     let bayu = stack.bayu().await;
     stack.seed_ingested(GROUP, "up-1", "stock_raw").await;
@@ -2631,15 +3280,17 @@ async fn deleting_an_upload_that_loaded_a_table_records_the_table_and_keeps_the_
     let audit = stack.audit_actions().await;
     assert_eq!(audit.last().unwrap().3["table"], "stock_raw");
     let tenant_id: Uuid = GROUP.parse().unwrap();
-    assert!(
-        uploads::table_claimed_by_upload(&stack.app.pool, tenant_id, "stock_raw")
+    assert_eq!(
+        uploads::table_claim(&stack.app.pool, tenant_id, "stock_raw")
             .await
-            .unwrap()
+            .unwrap(),
+        uploads::TableClaim::Ours
     );
     assert!(
-        uploads::table_loaded_by_upload(&stack.app.pool, "stock_raw")
+        uploads::table_claimed(&stack.app.pool, "stock_raw")
             .await
-            .unwrap()
+            .unwrap(),
+        "a connector still cannot take it"
     );
 }
 

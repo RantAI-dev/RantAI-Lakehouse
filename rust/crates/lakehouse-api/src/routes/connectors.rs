@@ -2621,14 +2621,17 @@ async fn check_dial_ssrf(
         .map_err(ApiError::BadRequest)
 }
 
-/// Refuse a spec whose `sourceObjects` land in a raw table an uploaded file
-/// was loaded into (plan task T8, ADR 0014, decision 5).
+/// Refuse a spec whose `sourceObjects` land in a raw table name that uploaded
+/// files have reserved (plan task T8, ADR 0014, decision 5, review finding
+/// B4).
 ///
-/// "Loaded" is [`lakehouse_store::uploads::table_loaded_by_upload`]: an upload
-/// of ANY tenant (raw table names are shared) is `ingested` into that table,
-/// and deleting the upload does not take that back. A table an upload has only
-/// claimed, because its load is running or failed, is not refused: nothing
-/// says yet that an upload loaded it.
+/// "Reserved" is [`lakehouse_store::uploads::table_claimed`]: a claim on the
+/// name by an upload of ANY tenant (raw table names are shared), whatever
+/// became of the load that made it. A claim is made when a load into the table
+/// is first requested and is never released, so a table whose load is still
+/// running, whose load failed, or whose upload was deleted is refused like one
+/// that loaded; a name whose claim belongs to a tenant that is gone too. A
+/// table an upload has never asked for is not.
 ///
 /// `target` is stored unvalidated server-side (the console checks it), so a
 /// value that is not text is skipped here and left to whatever reads it
@@ -2637,7 +2640,7 @@ async fn check_dial_ssrf(
 ///
 /// # Errors
 ///
-/// 409 naming the first target an upload loaded; 503 if no pool is
+/// 409 naming the first target an upload reserved; 503 if no pool is
 /// configured; the store's fixed `database error` when the question cannot
 /// be asked.
 async fn refuse_uploaded_targets(state: &AppState, source_objects: &Value) -> Result<(), ApiError> {
@@ -2652,9 +2655,9 @@ async fn refuse_uploaded_targets(state: &AppState, source_objects: &Value) -> Re
     }
     let pool = pool(state)?;
     for target in targets {
-        if uploads::table_loaded_by_upload(pool, target).await? {
+        if uploads::table_claimed(pool, target).await? {
             return Err(ApiError::Conflict(format!(
-                "The table {target} was loaded from an uploaded file, so a connector cannot \
+                "The table {target} is reserved for uploaded files, so a connector cannot \
                  load into it. Choose another target."
             )));
         }
@@ -2686,13 +2689,13 @@ async fn refuse_uploaded_targets(state: &AppState, source_objects: &Value) -> Re
 /// pastes an obviously-internal host and finds out immediately, at save
 /// time, rather than on the next scheduled run (WS3 plan judge review Z1).
 ///
-/// # A connector may not take a table an upload loaded
+/// # A connector may not take a table uploads have reserved
 ///
-/// A `sourceObjects[].target` that is a raw table an uploaded file was loaded
-/// into is refused with a 409 ([`refuse_uploaded_targets`], ADR 0014,
-/// decision 5): an upload may never load into a connector's table, and the
-/// other direction would let a scheduled connector replace or append to what
-/// a person uploaded.
+/// A `sourceObjects[].target` that is a raw table name an upload has claimed
+/// is refused with a 409 ([`refuse_uploaded_targets`], ADR 0014, decision 5):
+/// an upload may never load into a connector's table, and the other direction
+/// would let a scheduled connector replace or append to what a person
+/// uploaded.
 ///
 /// # Errors
 ///
@@ -2700,7 +2703,8 @@ async fn refuse_uploaded_targets(state: &AppState, source_objects: &Value) -> Re
 /// `ingest_spec::Dial::parse` for `adapter`, or if [`check_dial_ssrf`]
 /// refuses `dial`'s host (`StoreError::Validation` maps to
 /// `ApiError::BadRequest`, never `Internal` — both messages are safe to
-/// surface); 409 if a target is a table an upload loaded; 503/500 as above.
+/// surface); 409 if a target is a table name uploads have reserved; 503/500 as
+/// above.
 pub async fn ingest_spec_put(
     State(state): State<AppState>,
     Path(id): Path<String>,
