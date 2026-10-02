@@ -146,4 +146,47 @@ first attempt and succeeded.
 
 ## Review (planner appends)
 
-_Empty._
+### Reviewer, 2026-10-02
+
+Reviewed `1b4b75a`, `8016be9`, `7bcdc9b`.
+
+**Findings: no `BLOCKER`, no `SHOULD-FIX`.**
+
+- S1/S2: one manifest bump (`tiberius` 0.12 → 0.13) moves the SQL Server
+  client onto `rustls` 0.23 and `rustls-webpki` 0.103, which clears the three
+  vulnerabilities and drops `rustls-pemfile` from the graph. No advisory was
+  ignored to get there. The existing `paste` and `rsa` exceptions are
+  untouched and keep their written reasons.
+- The only application change is `Box::pin` around four futures in
+  `connector_probe.rs` and `connector_discover.rs`, to stay under the
+  `large_futures` lint. No behaviour change.
+- S3: `lakehouse-trino` was the one first-party crate missing from the
+  per-crate AGPL exceptions. The allow list for third-party crates is not
+  widened.
+
+Verification re-run by the reviewer on `7bcdc9b`, foreground, shared
+`CARGO_TARGET_DIR`, Docker via `sg docker`:
+
+- `cargo fmt --check` — pass.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` —
+  pass.
+- `cargo test --workspace` — 76 suites, **2812 passed, 0 failed, 8
+  ignored**.
+
+Not verified by the reviewer:
+
+- `cargo audit` and `cargo deny` locally: neither tool is installed in the
+  reviewer's environment. CI on the pull request is the check; the PR is not
+  merged unless both jobs are green there.
+- A connection test against a real SQL Server after the client's
+  minor-version bump. No test in the repo dials one (the unit tests stop at
+  the address guard). Worth a manual check the next time a SQL Server source
+  is at hand.
+
+Correction to the handoff: it explains the test count (2812, against slice
+B's 2833) by "binary layout". The actual reason is that this branch is cut
+from `main`, which does not contain slice B's new tests; 2812 is `main`'s
+count.
+
+Noted, not acted on: the handoff reports `chacha20` 0.10.1 as yanked (a
+warning, not a failure). Left for a routine dependency update.
