@@ -90,7 +90,7 @@ table once it is loaded.
 - Replacing a table with a file whose columns differ keeps the old
   columns, empty, beside the new ones.
 - A table name starts with a lower-case letter and uses lower-case letters
-  and digits joined by single underscores.
+  and digits joined by single underscores, with at most 128 characters.
 - A table name an upload has asked for stays reserved for that tenant's
   uploads. Another tenant cannot upload into it and a connector cannot load
   into it, even if the first load never wrote anything.

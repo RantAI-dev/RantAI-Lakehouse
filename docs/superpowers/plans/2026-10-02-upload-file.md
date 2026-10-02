@@ -653,9 +653,10 @@ the next starts.
 - Console: `bun install --frozen-lockfile` once in the worktree. No
   prettier; match the file's style by hand.
 - Orchestrator tests: a throwaway container of the code-location image,
-  the worktree's `dagster/` mounted read-only:
+  the whole worktree mounted read-only (the upload tests read
+  `ops/fixtures/`, so mounting only `dagster/` stops at collection):
   `docker run --rm --entrypoint sh -e PYTHONDONTWRITEBYTECODE=1 -v
-  /home/hv/lakehouse-upload/dagster:/work/dagster:ro -w /work/dagster
+  /home/hv/lakehouse-upload:/work:ro -w /work/dagster
   lakehouse-dagster-code-location:latest -c "pip install -q --target
   /tmp/pt pytest && PYTHONPATH=/tmp/pt python -m pytest dispar_orchestrate
   -q -p no:cacheprovider"`. A test that needs a writable tree copies what
@@ -2333,4 +2334,46 @@ Noted, not findings against this change:
   filter (section 5).
 
 **T7a, then slice D.**
+
+### Slice C, fixes — T7a (reviewer, 2026-10-02)
+
+Reviewed `51221cb` against T7a.
+
+**Findings: none. `C1` to `C3` are closed. Slice C has no open `BLOCKER`.**
+
+What was checked:
+
+- `C1`: `table_name_problem` walks the name once and refuses a leading,
+  trailing or doubled `_`, an upper-case letter, a leading digit and a name
+  over 128 characters, with one sentence. The job matches the same pattern
+  with `fullmatch` and keeps its question to the writer behind it. The
+  connector target rule is untouched.
+- `C2`: seven reasons, in one order, in the file, the API and the job. A
+  header record with no cells records the new one.
+- `C3`: `ended_after` already read the form the job writes; the developer
+  said so and changed nothing in it. The new test orders two results
+  within one second, which the older test could not tell apart.
+- The plan's section 7 gave a test command that mounts only `dagster/`.
+  Since T7 the upload tests read `ops/fixtures/`, so that command stops at
+  collection. Corrected above.
+
+Verification re-run by the reviewer on `29d1cc2`:
+
+- `cargo fmt --check` — pass.
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings` —
+  pass.
+- `cargo test --workspace`, one command — 3,377 passed, 0 failed, 8
+  ignored. Matches the handoff.
+- The three lints — pass.
+- `python -m pytest dispar_orchestrate -q` — 575 passed, 31 subtests.
+
+Noted, not a finding against this change: the developer's first workspace
+run failed in `tests/lakehouse_maintenance.rs`, a suite this change does
+not touch, and passed unchanged a few minutes later. The shared test
+Postgres had run out of shared memory under about 1,500 databases the API
+test harness had created and never dropped. The reviewer dropped the 948
+that were idle and older than 30 minutes before its own run. The leak is
+on the base and needs its own change.
+
+**Slice D starts from `feat/upload-file` at this review's commit.**
 
