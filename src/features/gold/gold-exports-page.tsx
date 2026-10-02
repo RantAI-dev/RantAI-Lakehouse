@@ -14,17 +14,10 @@ import {
 } from "@/components/ui/table"
 import { useService, useServiceAction } from "@/hooks/use-service"
 import { formatCompactNumber, formatDateTime } from "@/lib/format"
+import { publicationLabel } from "@/lib/gold-freshness"
 import { fmtMeasured } from "@/lib/measured"
 import { goldService } from "@/services"
 import type { GoldExportRun, GoldMart, GoldPublication, GoldReadBack } from "@/services/contracts/gold"
-
-function publicationLabel(pub: GoldPublication): string {
-  if (!pub.enabled) return "Off"
-  if (pub.lastExportedAt === null) return "On · Never published"
-  if (pub.lastChangedAt === null) return "On · Not measured"
-  if (pub.lastChangedAt < pub.lastExportedAt) return "On · Up to date"
-  return "On · Out of date"
-}
 
 function MartPublication({ mart }: { mart: { name: string } }) {
   const state = useService<GoldPublication>(
