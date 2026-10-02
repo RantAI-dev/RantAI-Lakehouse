@@ -65,14 +65,20 @@ from typing import Any
 import requests
 from dagster import (
     AssetMaterialization,
+    DagsterRunStatus,
     DefaultScheduleStatus,
+    DefaultSensorStatus,
     Definitions,
     DynamicOut,
     DynamicOutput,
     Failure,
+    RunRequest,
+    RunStatusSensorContext,
     ScheduleDefinition,
+    SkipReason,
     job,
     op,
+    run_status_sensor,
 )
 
 from dispar_orchestrate.bronze_catalog import ClickHouseTarget, record_maintenance_run
@@ -431,6 +437,59 @@ def gold_export_job() -> None:
 # unset, no identity is seeded and `_headers` returns `{}` — the schedule
 # below is still registered and every run fails loudly (`401`/`503`),
 # which is the honest, visible failure mode, not a silent one.
+# gold-publish-per-mart plan T6: after an authored pipeline succeeds, launch
+# the nightly Gold export as one all-marts run. With T4's `ifChanged=true`
+# in place, unchanged marts cost one cheap check each; a mart is skipped
+# when its `max(modification_time)` last moved strictly before its last
+# successful export (PR slice B review B1). One daily run keeps the
+# accounting honest and prevents the accumulation of duplicate exports on
+# every authored pipeline success — Dagster's `run_key=<upstream run id>`
+# ensures a single pipeline success never triggers two Gold runs.
+#
+# `monitored_jobs=None` (watch every job in this code location) with a
+# filter in the body: only `authored__<id>` jobs (the same prefix
+# `authored_factory.py` gives them at code-load time) trigger; all other
+# jobs — `gold_export_job` itself, maintenance, backup, alerts, capacity,
+# agent, ingest — yield `SkipReason` so the sensor tick stays green.
+#
+# `default_status=RUNNING`: a sensor that ships STOPPED silently never
+# fires, and from the outside, a stopped sensor looks identical to a
+# healthy one (the same reasoning every other schedule/sensor in this
+# code location documents). With `GOLD_EXPORT_RUN_TOKEN` unset the
+# scheduled POST would still fail — but that is a loud, visible failure
+# whose run entry in the Dagster UI is the signal, not a silent one.
+
+
+def evaluate_authored_success(context: RunStatusSensorContext):
+    """The sensor body, split out from the decorator so unit tests can
+    drive it with a `RunStatusSensorContext` stub — the same pattern
+    `pipeline_events.py::evaluate_finished_run` uses (plan 1f)."""
+    job_name = context.dagster_run.job_name
+    if not job_name.startswith("authored__"):
+        yield SkipReason(
+            f"skipped {job_name!r}: sensor only fires on authored-pipeline jobs"
+        )
+        return
+    yield RunRequest(run_key=context.dagster_run.run_id)
+
+
+@run_status_sensor(
+    run_status=DagsterRunStatus.SUCCESS,
+    monitored_jobs=None,
+    request_job=gold_export_job,
+    default_status=DefaultSensorStatus.RUNNING,
+    name="gold_export_after_authored_sensor",
+)
+def gold_export_after_authored_sensor(
+    context: RunStatusSensorContext,
+):
+    """gold-publish-per-mart plan T6: after an authored pipeline succeeds,
+    triggers `gold_export_job` so the nightly cadence is the safety net,
+    not the only trigger. With T4's `ifChanged=true` in place, unchanged
+    marts cost one cheap check each."""
+    yield from evaluate_authored_success(context)
+
+
 gold_export_schedule = ScheduleDefinition(
     job=gold_export_job,
     cron_schedule="0 4 * * *",
